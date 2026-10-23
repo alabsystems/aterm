@@ -203,7 +203,7 @@ pub(crate) fn status_fields() -> String {
 /// watch's own is. `ATERM_DEV_FAST_TIMERS` would make it a `ps` every 60 ms in each
 /// live test instance and buy nothing: the judge's five minutes run on the real clock,
 /// and `program-check full` is how a development build reaches them.
-fn every() -> std::time::Duration {
+const fn every() -> std::time::Duration {
     crate::harness_host::DISK_TICK
 }
 

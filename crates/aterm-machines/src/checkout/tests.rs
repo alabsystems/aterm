@@ -29,7 +29,6 @@ pub(crate) const NEVER: [&str; 14] = [
     "branch",
 ];
 
-/// The git subcommand of `cmd`: its first word after the global `-C <dir>` and `-c <k=v>`.
 fn subcommand(cmd: &Cmd) -> Option<String> {
     let mut args = cmd
         .args
@@ -72,7 +71,6 @@ pub(crate) fn subcommands(record: &[(Cmd, Option<Vec<u8>>)]) -> Vec<String> {
 /// submodules (this home's own; nothing of the real one is read).
 pub(crate) struct Repos<'a> {
     pub(crate) live: &'a Live,
-    /// The scratch home, removed with everything in it when the fixture is dropped.
     _home: Scratch<'a>,
     pub(crate) who: User,
     pub(crate) origin: PathBuf,
@@ -181,10 +179,6 @@ impl<'a> Repos<'a> {
     }
 }
 
-/// THE FAST-FORWARD: a clean checkout behind origin's default branch moves to its tip by a
-/// fetch and `merge --ff-only`, whether or not it fetched that tip before, and reads up to
-/// date after. The spawn record holds a fetch and an ff-only merge, and no rewrite.
-/// Negative control: the same record check over a run of `git stash list` names it.
 #[test]
 fn a_clean_checkout_behind_its_origin_fast_forwards() {
     let live = Live::new();
@@ -252,12 +246,6 @@ fn a_clean_checkout_behind_its_origin_fast_forwards() {
     );
 }
 
-/// THE KEPT CHECKOUTS: dirty (a changed tracked file, or an untracked one), ahead,
-/// diverged, ahead of an origin that moved since the last fetch, detached, on another
-/// branch, with a foreign origin, or with an origin git rewrites: each reads `Ok` with its
-/// reason in `now`, and an `align` leaves its HEAD, branch and worktree exactly as they
-/// were, with no fetch, no merge and no rewrite in the spawn record. Only a checkout whose
-/// own state is fine reaches origin (one `ls-remote`) to learn it is kept.
 #[test]
 fn a_checkout_with_anything_of_its_own_is_left_as_it_is_with_its_reason() {
     type Setup = fn(&Repos<'_>);
@@ -418,8 +406,6 @@ fn a_checkout_with_anything_of_its_own_is_left_as_it_is_with_its_reason() {
     }
 }
 
-/// A URL names its GitHub repository over HTTPS or SSH; one that carries a credential, or
-/// names another repository or host, is not it. Anything else is matched only exactly.
 #[test]
 fn a_github_origin_is_matched_over_https_and_ssh_and_never_with_a_credential() {
     let aterm = Remote::of("https://github.com/alabsystems/aterm");
@@ -455,12 +441,6 @@ fn a_github_origin_is_matched_over_https_and_ssh_and_never_with_a_credential() {
     );
 }
 
-/// NO HOOK, NO SUBMODULE REMOTE: a checkout whose `core.hooksPath` is a tracked directory,
-/// into which origin's next commit adds `post-merge` and `reference-transaction` hooks, and
-/// whose populated submodule's own remote holds a commit origin's new gitlink names, is
-/// fast-forwarded without either hook running and without the submodule fetching from its
-/// remote. Negative control: a person's own `git fetch` and `git merge --ff-only` of an
-/// identical clone runs both hooks the fetched commit carries and fetches the submodule.
 #[test]
 fn align_runs_no_hook_and_fetches_from_origin_alone() {
     let live = Live::new();
@@ -554,9 +534,6 @@ fn align_runs_no_hook_and_fetches_from_origin_alone() {
     );
 }
 
-/// AN UNREACHABLE ORIGIN READS OFFLINE: an origin on a loopback port nothing listens on is
-/// read, and aligned, as `offline`, with no fetch or merge; an origin git reaches and that
-/// refuses (no such repository) is not offline. Neither line holds the URL.
 #[test]
 fn an_unreachable_origin_reads_offline_and_a_refusing_one_does_not() {
     let live = Live::new();

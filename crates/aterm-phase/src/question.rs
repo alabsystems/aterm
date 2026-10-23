@@ -51,7 +51,9 @@ pub struct QuestionText {
 pub enum Recommended {
     /// The option's own row ends ` (Recommended)`.
     Label,
-    /// A row under the option that may be the label's wrap.
+    /// A row under the option that may be the label's wrap (the row above
+    /// it ran to the dialog's edge) ends ` (Recommended)`: row `label_end`,
+    /// the label's last.
     Wrapped {
         label_end: usize,
     },
@@ -120,7 +122,7 @@ pub struct ReviewRow {
 /// What the dialog shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuestionForm {
-    /// One answer: a digit or Enter answers and moves.
+    /// One answer: a digit or Enter answers and moves on.
     Single {
         question: QuestionText,
         options: Vec<QuestionOption>,

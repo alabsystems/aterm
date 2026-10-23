@@ -42,6 +42,18 @@ enum State {
 /// Decodes a stream of Zstandard frames read from `R`: the shape of `zstd::Decoder` (a [`Read`] adapter), for what atpkg's installer reads.
 /// # Errors
 /// Nothing in the input panics the decoder.
+///
+/// ```
+/// use std::io::Read;
+/// use aterm_zstd::Decoder;
+/// use aterm_zstd::frame::{self, Checksum};
+///
+/// let mut zst = Vec::new();
+/// frame::write_raw(&mut zst, b"hello", Checksum::Xxh64).unwrap();
+/// let mut out = Vec::new();
+/// Decoder::new(&zst[..]).read_to_end(&mut out).unwrap();
+/// assert_eq!(out, b"hello");
+/// ```
 pub struct Decoder<R> {
     input: R,
     state: State,

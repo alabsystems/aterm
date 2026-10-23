@@ -274,6 +274,7 @@ fn verdict(a: &TurnEndAction, st: &State) -> Verdict {
 
 /// What the model says the decider must do at `st`.
 fn expected(m: &Model, st: &State) -> Verdict {
+    // An unseen point: waited for, then — at its deadline — decided as the
     // point after `DeadlineUnseen`.
     if st["pending"] == 3 {
         if st["waited"] < cnst(m, "Take") {

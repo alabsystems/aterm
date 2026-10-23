@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Settings control model and the chrome primitives the in-grid overlays share: the
-//! control catalogue ([`SettingsState`]), the overlay geometry and colour roles
-//! ([`SettingsGeom`], [`Roles`]), the row writers ([`blank_row`], [`write_str`]), and the
-//! aurora and rainbow-banner painters. Native Settings pixels, input and accessibility
-//! compile from [`crate::native_ui`].
+//! Settings control catalogue ([`SettingsState`]), overlay geometry and roles
+//! ([`SettingsGeom`], [`Roles`]), and row writers ([`blank_row`], [`write_str`],
+//! [`crate::native_ui`]).
 
 use aterm_core::terminal::RenderCell;
 
@@ -14,35 +12,26 @@ use crate::chrome_band;
 use crate::prefs::{self, EditField, EditKind};
 use crate::widget::{DrawPrim, TextWeight, rgba};
 
-/// Shared semantic state embedded in each native Settings tab: the editable control
-/// catalogue plus the search fields the native view reads through `legacy`.
+/// Shared semantic state embedded in each native Settings tab.
 pub(crate) struct SettingsState {
-    /// The editable controls for the live config, in row order. Native Settings rebuilds
-    /// it from its config snapshot after every persisted change.
+    /// The editable controls for the live config, in row order.
     pub(crate) fields: Vec<EditField>,
 }
 
 impl SettingsState {
-    /// Build from the current config generation. This constructor is
-    /// intentionally IO-free.
+    /// Build from the current config generation.
     pub(crate) fn from_config(cfg: &Config) -> Self {
         Self {
             fields: prefs::editable_fields(cfg),
         }
     }
 
-    /// The displayed value for a row: the configured seed, else the effective placeholder
-    /// (an unset key shows what is in effect, with its `"(default)"` / `"(follow OS)"`
-    /// note). Enum aliases project onto their canonical option so the picker does not
-    /// show a valid alias as a custom value; unknown and dynamic values stay verbatim.
+    /// The displayed value for a row.
     pub(crate) fn display_value(f: &EditField) -> &str {
         let raw = f.seed.as_deref().unwrap_or(f.placeholder.as_str());
         if let Some(seed) = f.seed.as_deref()
             && matches!(f.kind, EditKind::Enum { .. })
         {
-            // An off-roster but live value normalizes to its canonical name too
-            // — `glass bell` reads back as `music box`, the same way an
-            // offered alias reads back as its picker row.
             let token = seed.trim();
             enum_recognized(f, token)
                 .or_else(|| enum_offered_or_runtime(f.key, token))
@@ -53,18 +42,12 @@ impl SettingsState {
     }
 }
 
-/// Resolve a documented config alias to its canonical option. The loaders (`app_config`)
-/// accept aliases outside the picker's option set (cursor_style `beam` == `bar`), which
-/// native Settings would otherwise show as a custom value. `None` for a non-alias.
+/// Resolve a documented config alias to its canonical option.
 fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
-    // Trail-style aliases resolve through the shared `prefs` table that
-    // `--validate-config` and the load-time warning also read, so they never disagree.
     let token = token.trim();
     if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
         return prefs::cursor_trail_style_canonical(token);
     }
-    // Typing-sound aliases (water → droplet, mech → mechanical, …) resolve through the
-    // synth's own parser.
     if key == prefs::EDIT_TRAIL_SOUND_STYLE {
         return prefs::trail_sound_style_canonical(token);
     }
@@ -85,17 +68,14 @@ fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
     })
 }
 
-/// The canonical name of a typing-sound value the synth accepts, resolved as the runtime
-/// does (`SoundVoice::parse`), whether or not the picker offers it, so the row shows the
-/// voice that plays. `None` for an unknown value, which plays the default (`auto`).
+/// The canonical name of a typing-sound value the synth accepts.
 fn enum_offered_or_runtime(key: &str, token: &str) -> Option<&'static str> {
     (key == prefs::EDIT_TRAIL_SOUND_STYLE)
         .then(|| prefs::trail_sound_style_canonical(token))
         .flatten()
 }
 
-/// The canonical option an Enum row's `token` resolves to (directly or via the alias map),
-/// or `None` for an unrecognized spelling.
+/// The canonical option an Enum row's `token` resolves to.
 fn enum_recognized(f: &EditField, token: &str) -> Option<&'static str> {
     let EditKind::Enum { options } = f.kind else {
         return None;
@@ -107,13 +87,11 @@ fn enum_recognized(f: &EditField, token: &str) -> Option<&'static str> {
         .or_else(|| enum_alias(f.key, token).filter(|c| options.contains(c)))
 }
 
-/// Theme-derived colour roles shared by the overlay painters and native Settings
-/// chrome: the native role vocabulary itself
-/// ([`crate::native_appearance::NativeRoles`]), rebuilt from the live palette so
-/// they re-tint without a hardcoded palette.
+/// Theme-derived colour roles shared by the overlay painters and native Settings chrome
+/// ([`crate::native_appearance::NativeRoles`]).
 pub(crate) type Roles = crate::native_appearance::NativeRoles;
 
-pub(crate) fn u32_rgb(c: u32) -> [u8; 3] {
+pub(crate) const fn u32_rgb(c: u32) -> [u8; 3] {
     [
         ((c >> 16) & 0xff) as u8,
         ((c >> 8) & 0xff) as u8,
@@ -121,16 +99,13 @@ pub(crate) fn u32_rgb(c: u32) -> [u8; 3] {
     ]
 }
 
-/// The width of `s` at `px` in the mono (terminal) face, from real advances in the chrome
-/// font stack. Regular weight; measure bold runs with [`crate::tray_raster::measure_text`].
-/// UI-face chrome measures with [`crate::tray_raster::ui_text_width`].
+/// The width of `s` at `px` in the mono ([`crate::tray_raster::measure_text`],
+/// [`crate::tray_raster::ui_text_width`]).
 pub(crate) fn text_w(s: &str, px: f32) -> f32 {
     crate::tray_raster::measure_text(s, px, TextWeight::Regular)
 }
 
-/// `f32::clamp`, except that inverted bounds (where `clamp` panics), which overlay geometry
-/// produces in extreme windows (a tiny font, an ultra-narrow grid), give `hi` floored at
-/// zero: never negative, since a later `as u32` would wrap it.
+/// `f32::clamp`, except that inverted bounds.
 #[inline]
 pub(crate) fn fit(value: f32, lo: f32, hi: f32) -> f32 {
     if hi <= lo {
@@ -140,8 +115,7 @@ pub(crate) fn fit(value: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
-/// Device-pixel geometry of the in-grid overlay card slot, handed to every
-/// [`crate::overlay::OverlayModel::tray`]. Native Settings does not use it.
+/// Device-pixel geometry of the in-grid overlay card slot ([`crate::overlay::OverlayModel::tray`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SettingsGeom {
     pub cw: f32,
@@ -150,8 +124,6 @@ pub(crate) struct SettingsGeom {
     pub cols: usize,
     pub panel_rows: usize,
 }
-
-// Rainbow palette for the banner's arch and glints.
 
 const BLOB_CORAL: [u8; 3] = [0xFF, 0x51, 0x48];
 const BLOB_MARIGOLD: [u8; 3] = [0xFF, 0xC2, 0x2E];
@@ -162,21 +134,16 @@ const BLOB_VIOLET: [u8; 3] = [0xB0, 0x5C, 0xFF];
 /// The rainbow arch's sixth stripe (the blob palette covers the other five).
 const RAINBOW_TEAL: [u8; 3] = [0x21, 0xC2, 0xB7];
 
-/// The aurora's tile grid: columns, rows.
+/// The aurora's tile grid.
 const AURORA_GRID: (usize, usize) = (112, 64);
 /// How far each aurora tile is poured from the surface toward its hue.
 const AURORA_MIX: f32 = 0.30;
-/// The contrast every aurora tile keeps against the page-chrome ink drawn on
-/// it (WCAG 1.4.3 for body text).
+/// The contrast every aurora tile keeps against the page-chrome ink drawn on it.
 pub(crate) const AURORA_INK_FLOOR: f32 = 4.5;
-/// What a tile is solved to: a quarter step over [`AURORA_INK_FLOOR`], because
-/// a small glyph's antialiased strokes never reach the full ink, and the text
-/// should still measure at the floor on glass.
+/// What a tile is solved to: a quarter step over [`AURORA_INK_FLOOR`].
 const AURORA_INK_TARGET: f32 = AURORA_INK_FLOOR + 0.25;
 
-/// Tile `(i, j)` of the aurora at its full pour, before the ink hold
-/// ([`aurora_tile`]): a diagonal spectrum (`hue ∝ x + y`) with a gentle value
-/// falloff toward the bottom, so the content zone is calmer than the sky.
+/// Tile `(i, j)` of the aurora at its full pour, before the ink hold ([`aurora_tile`]).
 #[cfg(test)]
 pub(crate) fn aurora_tile_unheld(surface: [u8; 3], i: usize, j: usize) -> [u8; 3] {
     crate::native_appearance::mix_srgb(surface, aurora_hue(i, j), AURORA_MIX)
@@ -189,11 +156,7 @@ fn aurora_hue(i: usize, j: usize) -> [u8; 3] {
     crate::widget::hsv_to_rgb(hue, 0.86, v)
 }
 
-/// Tile `(i, j)` of the aurora as painted: the full pour where the page-chrome
-/// `ink` keeps [`AURORA_INK_TARGET`] on it, otherwise the deepest pour that
-/// does. The heading, subtitle, pager and empty line sit straight on the
-/// aurora, so the wash yields to them rather than the text to the wash: on a
-/// dark page the bright yellow-green band pours a little shallower.
+/// Tile `(i, j)` of the aurora as painted ([`AURORA_INK_TARGET`]).
 pub(crate) fn aurora_tile(surface: [u8; 3], ink: [u8; 3], i: usize, j: usize) -> [u8; 3] {
     use crate::native_appearance::contrast_ratio;
     let hue = aurora_hue(i, j);
@@ -201,11 +164,6 @@ pub(crate) fn aurora_tile(surface: [u8; 3], ink: [u8; 3], i: usize, j: usize) ->
     if contrast_ratio(ink, full) >= AURORA_INK_TARGET
         || contrast_ratio(ink, surface) < AURORA_INK_FLOOR
     {
-        // Either the full pour holds, or not even the bare surface reaches the
-        // floor (a palette the role contract already failed), so pouring less
-        // buys nothing. A surface between the floor and the target is not
-        // that case: the search below then pours nothing and the tile keeps
-        // the surface's own contrast.
         return full;
     }
     let (mut lo, mut hi) = (0.0_f32, AURORA_MIX);
@@ -226,22 +184,12 @@ pub(crate) fn aurora_tile(surface: [u8; 3], ink: [u8; 3], i: usize, j: usize) ->
 type AuroraTiles = (([u8; 3], [u8; 3]), Vec<[u8; 3]>);
 
 thread_local! {
-    /// The last palette's tiles: the wash is a pure function of `(surface,
-    /// ink)`, and the canvas repaints with every animated preview frame.
+    /// The last palette's tiles.
     static AURORA_TILES: std::cell::RefCell<Option<AuroraTiles>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// The Settings surface's aurora: the wallpaper treatment, procedurally — a
-/// dim DIAGONAL spectrum wash over the whole canvas, exactly the hue ramp the
-/// user's rainbow terminal wears (`hue ∝ x + y`). Painted as a coarse tile
-/// grid of opaque Panels over the theme surface: adjacent tiles differ by a
-/// whisper of hue, so the grid fuses into a smooth wash while staying a
-/// bounded, cache-friendly prim count. Deliberately STATIC.
-///
-/// `ink` is the quietest text painted straight on the canvas (the subtitle,
-/// pager and empty line; the heading's ink is stronger): every tile holds it
-/// at [`AURORA_INK_FLOOR`] ([`aurora_tile`]).
+/// The Settings surface's aurora: the wallpaper treatment ([`AURORA_INK_FLOOR`], [`aurora_tile`]).
 pub(crate) fn paint_settings_aurora(
     prims: &mut Vec<DrawPrim>,
     x: f32,
@@ -274,10 +222,6 @@ pub(crate) fn paint_settings_aurora(
         };
         for j in 0..rows {
             for i in 0..cols {
-                // OPAQUE tiles, pre-mixed into the surface: translucent
-                // neighbours double up wherever they overlap and etch a
-                // lattice into the sky; opaque paint makes the half-pixel
-                // seam bleed invisible.
                 prims.push(DrawPrim::Panel {
                     x: x + i as f32 * cw,
                     y: y + j as f32 * ch,
@@ -291,13 +235,7 @@ pub(crate) fn paint_settings_aurora(
     });
 }
 
-/// The native Settings hero banner: a pastel rainbow arch cresting through a few star
-/// glints. Static (it never asks for a frame); painted through the audited custom-node
-/// lowering (`native_ui::RAINBOW_BANNER_AUDIT`) and clipped to its rect.
-///
-/// `sky` and `rim` come resolved from the caller's role palette, so the card follows the
-/// chrome appearance. The arch and glints keep their spectrum in every theme; only their
-/// alpha follows the sky, deeper over a dark one so the wash reads the same.
+/// The native Settings hero banner.
 pub(crate) fn paint_rainbow_banner(
     prims: &mut Vec<DrawPrim>,
     x: f32,
@@ -327,7 +265,6 @@ pub(crate) fn paint_rainbow_banner(
         color: rgba(rim, 0xFF),
     });
     prims.push(DrawPrim::ClipPush { x, y, w, h });
-    // The rainbow arch, cresting inside the banner from its bottom edge.
     let stripes = [
         BLOB_CORAL,
         BLOB_MARIGOLD,
@@ -354,7 +291,6 @@ pub(crate) fn paint_rainbow_banner(
             a += step;
         }
     }
-    // A small static constellation in the sky, both sides of the arch.
     let glints: [(f32, f32, f32, [u8; 3]); 6] = [
         (0.070, 0.30, 0.16, BLOB_MARIGOLD),
         (0.155, 0.62, 0.11, BLOB_VIOLET),
@@ -388,9 +324,7 @@ pub(crate) fn paint_rainbow_banner(
     prims.push(DrawPrim::ClipPop);
 }
 
-/// The System State animated hero: a Rainbow Kitty Village & Factory where 12 kitty cottages
-/// (one per workstation/NUX stage) are assembled along a rainbow conveyor track while kitties
-/// trot across the village.
+/// The System State animated hero.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_rainbow_kitty_village(
     prims: &mut Vec<DrawPrim>,
@@ -431,7 +365,6 @@ pub(crate) fn paint_rainbow_kitty_village(
     ];
     prims.push(DrawPrim::ClipPush { x, y, w, h });
 
-    // 1. Rainbow factory conveyor belt & village lane along the bottom edge.
     let ground_h = (h * 0.16).clamp(5.0, 9.0);
     let ground_y = y + h - ground_h;
     prims.push(DrawPrim::Panel {
@@ -459,7 +392,6 @@ pub(crate) fn paint_rainbow_kitty_village(
         r_idx += 1;
     }
 
-    // 2. 12 Kitty Village Cottages / Factory Stations (one per Setting::ALL item).
     let pad_x = 14.0_f32;
     let usable_w = (w - pad_x * 2.0).max(48.0);
     let slot_w = usable_w / 12.0;
@@ -501,7 +433,6 @@ pub(crate) fn paint_rainbow_kitty_village(
         };
         let body_color = if state == 'E' { BLOB_CORAL } else { hue };
 
-        // Cottage body or blueprint frame.
         if matches!(state, 'G' | 'W' | 'E') {
             prims.push(DrawPrim::Panel {
                 x: hx,
@@ -511,7 +442,6 @@ pub(crate) fn paint_rainbow_kitty_village(
                 radius: 3.0,
                 fill: rgba(body_color, body_alpha),
             });
-            // Roof cap.
             prims.push(DrawPrim::Panel {
                 x: hx - 1.5,
                 y: hy + hh * 0.16,
@@ -523,7 +453,6 @@ pub(crate) fn paint_rainbow_kitty_village(
                     body_alpha,
                 ),
             });
-            // Kitty-ear roof peaks on left and right of the cottage roof!
             let ear_r = (house_w * 0.16).clamp(1.6, 3.2);
             for ex in [hx + ear_r * 1.1, hx + house_w - ear_r * 1.1] {
                 prims.push(DrawPrim::Dot {
@@ -533,7 +462,6 @@ pub(crate) fn paint_rainbow_kitty_village(
                     color: rgba(body_color, body_alpha),
                 });
             }
-            // Warm glowing kitty window inside the cottage.
             if hh >= 10.0 {
                 let win_w = (house_w * 0.34).clamp(2.5, 6.0);
                 let win_h = (hh * 0.28).clamp(2.5, 5.5);
@@ -553,7 +481,6 @@ pub(crate) fn paint_rainbow_kitty_village(
                     ),
                 });
             }
-            // Chimney puff / assembly spark floating above active or completed cottages.
             if state == 'G' || (state == 'W' && busy) {
                 let puff_phase =
                     ((phase_ms as f32 * 0.004 + i as f32 * 0.31) % 1.0).clamp(0.0, 1.0);
@@ -567,7 +494,6 @@ pub(crate) fn paint_rainbow_kitty_village(
                 });
             }
         } else {
-            // Blueprint outline waiting for assembly.
             prims.push(DrawPrim::Stroke {
                 x: hx,
                 y: hy + hh * 0.25,
@@ -580,7 +506,6 @@ pub(crate) fn paint_rainbow_kitty_village(
         }
     }
 
-    // 3. Animated Rainbow Kitties trotting across the village path!
     let kitty_colors: [[u8; 3]; 4] = [BLOB_CORAL, BLOB_MARIGOLD, RAINBOW_TEAL, BLOB_VIOLET];
     let kitty_speed = if busy { 0.055 } else { 0.018 };
     let path_w = (w - 36.0).max(24.0);
@@ -598,7 +523,6 @@ pub(crate) fn paint_rainbow_kitty_village(
         let ky = ground_y - 4.2 - hop;
         let coat = crate::native_appearance::mix_srgb(kcol, [0xFF, 0xFF, 0xFF], 0.28);
 
-        // Kitty body.
         prims.push(DrawPrim::Panel {
             x: kx - 4.5,
             y: ky - 2.5,
@@ -607,7 +531,6 @@ pub(crate) fn paint_rainbow_kitty_village(
             radius: 2.5,
             fill: rgba(coat, 0xFA),
         });
-        // Kitty head.
         let head_cx = kx + dir * 4.2;
         let head_cy = ky - 2.2;
         prims.push(DrawPrim::Dot {
@@ -616,7 +539,6 @@ pub(crate) fn paint_rainbow_kitty_village(
             r: 3.4,
             color: rgba(coat, 0xFF),
         });
-        // Two pointy kitty ears.
         for ear_dx in [-1.9_f32, 1.5_f32] {
             prims.push(DrawPrim::Dot {
                 cx: head_cx + ear_dx,
@@ -625,7 +547,6 @@ pub(crate) fn paint_rainbow_kitty_village(
                 color: rgba(kcol, 0xFF),
             });
         }
-        // Kitty eye & pink nose glint.
         prims.push(DrawPrim::Dot {
             cx: head_cx + dir * 1.4,
             cy: head_cy - 0.5,
@@ -638,7 +559,6 @@ pub(crate) fn paint_rainbow_kitty_village(
             r: 0.75,
             color: rgba(BLOB_CORAL, 0xFF),
         });
-        // Wagging tail behind the kitty.
         let wag = (phase_ms as f32 * 0.016 + k as f32).sin() * 1.8;
         prims.push(DrawPrim::Dot {
             cx: kx - dir * 5.6,
@@ -657,11 +577,10 @@ pub(crate) fn paint_rainbow_kitty_village(
     prims.push(DrawPrim::ClipPop);
 }
 
-/// A full-width blank row of `cols` cells in `fg`/`bg`; `seam` overlines row 0.
+/// A full-width blank row of `cols` cells in `fg`/`bg`.
 pub(crate) use aterm_render::band::blank_row;
 
-/// Write `s` into `row` from column `col`, clamped to `cols`, one char per cell (labels
-/// and values are ASCII plus a few BMP arrows, never wide glyphs).
+/// Write `s` into `row` from column `col`.
 pub(crate) fn write_str(
     row: &mut [RenderCell],
     cols: usize,
@@ -684,9 +603,6 @@ pub(crate) fn write_str(
 mod tests {
     use super::*;
 
-    /// An ink that clears the floor on the bare surface but not the solve's
-    /// quarter-step margin is still held: the wash pours less (down to none)
-    /// rather than at full strength. Control: that ink fails the full pour.
     #[test]
     fn an_ink_between_the_floor_and_the_target_still_holds_every_tile() {
         use crate::native_appearance::contrast_ratio;
@@ -777,7 +693,6 @@ mod tests {
             assert_eq!(SettingsState::display_value(&f), canonical, "{alias}");
         }
 
-        // Every synth alias reads back the voice the synth plays.
         for &(alias, voice) in aterm_effects::trail_sound::SoundVoice::ALIASES {
             let canonical = voice.name();
             let f = field(crate::prefs::EDIT_TRAIL_SOUND_STYLE, alias);

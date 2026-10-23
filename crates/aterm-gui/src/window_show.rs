@@ -87,7 +87,7 @@ pub(crate) struct ShowPlan<W> {
 
 impl<W> ShowPlan<W> {
     /// Whether the plan has nothing to do.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.minimize.is_empty() && self.raise.is_empty() && self.fullscreen.is_empty()
     }
 }
@@ -321,6 +321,7 @@ impl crate::App {
         }
         let mut performed = Vec::new();
         if !carried.stacked {
+            // The proof is owed and this is not its path: nothing else can be
             // due either (full screen waits for the stack and for Commit).
             if !may_stack {
                 return performed;

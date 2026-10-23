@@ -553,6 +553,7 @@ fn emit_light_halo(
     let share = |x0: f32, x1: f32| match letters {
         Some((l0, l1, caret_cell)) if x1 > l0 && x0 < l1 => {
             // A sample whose reach lies inside the covered caret cell alone
+            // keeps the whole glow.
             if caret_cell.is_some_and(|(c0, c1)| x0 >= c0 && x1 <= c1) {
                 1.0
             } else {

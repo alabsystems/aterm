@@ -88,11 +88,11 @@ impl TextInputState {
         &self.value
     }
 
-    pub(crate) fn selection(&self) -> &TextSelection {
+    pub(crate) const fn selection(&self) -> &TextSelection {
         &self.selection
     }
 
-    pub(crate) fn preedit(&self) -> Option<&ImePreedit> {
+    pub(crate) const fn preedit(&self) -> Option<&ImePreedit> {
         self.preedit.as_ref()
     }
 

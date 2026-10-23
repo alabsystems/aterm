@@ -372,6 +372,7 @@ fn dark_nudge_applies_gated_and_geometry_stable() {
 #[cfg(target_os = "macos")]
 #[test]
 fn sf_mono_ct_raster_ink_tracks_the_instance() {
+    // A developer who pins the portable rasterizer has no CoreText raster for
     // this test to read, by their own choice.
     if std::env::var_os("ATERM_RASTERIZER").is_some_and(|v| v == "portable" || v == "fontdue") {
         aterm_spec::host::could_not_run("ATERM_RASTERIZER pins the portable rasterizer here");

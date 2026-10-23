@@ -115,7 +115,7 @@ impl WarmHint {
     /// The zoom in the carry's shape ([`crate::app_config::CarriedZoom`]), for
     /// `app_config::launch_font_for_zoom`.
     #[must_use]
-    pub(crate) fn carried_zoom(&self) -> crate::app_config::CarriedZoom {
+    pub(crate) const fn carried_zoom(&self) -> crate::app_config::CarriedZoom {
         crate::app_config::CarriedZoom {
             size: self.size_zoom,
             device: self.zoom,

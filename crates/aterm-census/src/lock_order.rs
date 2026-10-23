@@ -353,6 +353,7 @@ fn is_raw_ptr_binding_rhs(line: &str) -> bool {
 /// with `base` in the ledger).
 fn rhs_extends_raw_ptr(line: &str, ptr_vars: &BTreeMap<String, (i32, String)>) -> bool {
     // Every `true` path needs `ptr_vars.contains_key(recv)`, and this runs on
+    // every `let` line of the corpus with an almost always empty ledger.
     if ptr_vars.is_empty() {
         return false;
     }
@@ -1049,6 +1050,8 @@ fn resolve_receiver(line: &str, dot: usize, ctx: &SiteCtx<'_>) -> Option<String>
                 && let Some(ty) = ctx.impl_ty()
             {
                 // `Ty::self` / `Ty::0` cannot collide with a plain receiver or a
+                // vendored `<crate>::<recv>` identity: plain resolution never
+                // returns `self` or a tuple index.
                 return Some(format!("{ty}::{chain}"));
             }
             if let Some((_, aliased)) = ctx.aliases.get(seg) {
@@ -1172,6 +1175,7 @@ fn guard_is_final_value(line: &str, acq: &RawAcq) -> bool {
         }
         let Some(close) = match_paren(line, open) else {
             // The adapter's argument spans lines (`unwrap_or_else(|p| {` …): the
+            // guard is bound (erring toward more tracked holds).
             return true;
         };
         i = close + 1;
@@ -1406,6 +1410,7 @@ fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
             || STANDARD_METHOD_NAMES.contains(&name)
         {
             // Guard helpers and standard acquisition methods are direct
+            // acquisitions; treating them as callees would double-count.
             continue;
         }
         let start = idx - name.len();
@@ -1657,6 +1662,9 @@ fn scan_fn(
             }
             let identity = if vocab.is_some() {
                 // A vocabulary interior keeps its unique per-site node: `self`
+                // there is every caller's lock. (Its impl self type is an
+                // UNQUALIFIABLE_SELF_TYPES wrapper anyway; the registry checks
+                // depend on this.)
                 None
             } else {
                 match (file.namespace, &r.identity) {

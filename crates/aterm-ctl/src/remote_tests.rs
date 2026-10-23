@@ -10,8 +10,6 @@ fn words(line: &str) -> Vec<String> {
     line.split_whitespace().map(String::from).collect()
 }
 
-/// A drive connection that answers what it was sent with `answer`'s reply,
-/// keeping every line written to it in `seen`.
 struct Scripted {
     sent: Vec<u8>,
     reply: Option<Cursor<Vec<u8>>>,
@@ -56,8 +54,6 @@ fn link(answer: fn(&str) -> String, seen: &'static Mutex<Vec<String>>) -> DriveL
     }
 }
 
-/// Over the fleet a session is named by its sid: `@self` unexpanded, a local
-/// number, `@.` and a list are this Mac's, and refused before any dial.
 #[test]
 fn a_drive_names_each_session_by_its_sid() {
     assert!(refuse_local_selector(&words("@s-a1 status")).is_ok());
@@ -70,9 +66,6 @@ fn a_drive_names_each_session_by_its_sid() {
     }
 }
 
-/// A turn over a drive waits 20 s when it names no `timeout=`, keeps one up to
-/// 22 s, and refuses a longer one with the way to wait instead; a `timeout=`
-/// in the turn's TEXT is the text's.
 #[test]
 fn a_turn_over_a_drive_waits_inside_its_connection() {
     let mut bare = words("@s-a1 turn fix the test");
@@ -92,11 +85,6 @@ fn a_turn_over_a_drive_waits_inside_its_connection() {
     }
 }
 
-/// THE DISPATCH'S LEADING OPTIONS STAY LEADING: the exactly-once `id=`, the
-/// `if-supervisor=` fence and a leading `cause=` come before an added
-/// `timeout=`, which the server's dispatch would otherwise stop at, typing
-/// them as the text; and a `timeout=` after them is read, so its cap holds.
-/// A `--` there ends them, and the turn's options follow it.
 #[test]
 fn a_turns_leading_options_keep_their_place_over_a_drive() {
     for (sent, wire) in [
@@ -137,9 +125,6 @@ fn a_turns_leading_options_keep_their_place_over_a_drive() {
     }
 }
 
-/// A worker's spawn over a drive ends with `-`, names a worker, leaves `len=`
-/// to the client and names a folder of THAT Mac by its absolute path or none
-/// (no folder of this one is added); its starter is its `from=`.
 #[test]
 fn a_spawn_over_a_drive_names_no_folder_of_this_mac() {
     assert_eq!(
@@ -170,8 +155,6 @@ fn a_spawn_over_a_drive_names_no_folder_of_this_mac() {
     }
 }
 
-/// `--host` with no fleet client linked says so; a stdin frame is refused
-/// before any dial.
 #[test]
 fn what_never_crosses_the_fleet_is_refused_here() {
     let none = run("lab-mini", &words("@s-a1 status"), None, &LocalVerbs::NONE)
@@ -207,8 +190,6 @@ fn what_never_crosses_the_fleet_is_refused_here() {
     assert!(aimed.contains("name no @<sel>"), "{aimed}");
 }
 
-/// One exchange: the line goes as written; an `ERR` exits 1, a turn's
-/// timeout verdict 124, an answered read 0.
 #[test]
 fn an_exchange_is_framed_as_on_one_mac() {
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -232,8 +213,6 @@ fn an_exchange_is_framed_as_on_one_mac() {
     );
 }
 
-/// A worker's task is sent only once the line is answered `GO <n>`: a refused
-/// line keeps every byte of it here.
 #[test]
 fn a_workers_task_crosses_only_after_go() {
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -265,8 +244,6 @@ fn a_workers_task_crosses_only_after_go() {
     assert_eq!(*seen, [head.clone(), head]);
 }
 
-/// `await task` over a drive: each worker by its sid, a baseline leg, then
-/// legs of at most 20 s, each its own connection, until the news.
 #[test]
 fn an_await_over_a_drive_waits_in_short_legs() {
     static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());

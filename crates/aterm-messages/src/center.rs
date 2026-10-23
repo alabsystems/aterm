@@ -182,7 +182,7 @@ impl EchoKind {
     }
 }
 
-/// A retired live row's completion echo, holding the glass slot the row.
+/// A retired live row's completion echo, holding the glass slot the row had.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Echo {
     /// The retired row's id.
@@ -254,7 +254,8 @@ pub struct Live {
     pub stale_at: Option<Instant>,
     /// `reveal_at` (or the post) + `max(hold, OVERFLOW_PATIENCE_MIN)`.
     pub patience_at: Instant,
-    /// Where the patience clock runs.
+    /// Where the patience clock runs from: the reveal (or the post), then the
+    /// last demote; a restated hold changes the span, never this anchor.
     patience_from: Instant,
     /// Details was opened.
     pub seen: bool,
@@ -272,9 +273,14 @@ pub struct Live {
     pub track: ProgressTrack,
     /// The declared heavy load, and when it began.
     pub load: Option<(Load, Instant)>,
-    /// The load words.
+    /// The load words are up: at once for a load the row was posted with (such
+    /// a row is on the glass because it is heavy), and [`LOAD_AFTER`] after it
+    /// began for a load a later restate declared; flipped by `settle`, so the
+    /// layout stays time-free.
     pub load_shown: bool,
-    /// The loads the row's slot is reserved.
+    /// The loads the row's slot is reserved for: empty until it declares a
+    /// load, then its reporter's declared kinds ([`Message::loads`], every load
+    /// when undeclared) plus each load it shows.
     pub load_slot: Loads,
     /// The fill the bar glides from, and when the glide began.
     pub glide: Option<(u16, Instant)>,
@@ -282,7 +288,9 @@ pub struct Live {
     carried_pending: bool,
     /// The mark (severity, glyph) the record's Posted line carries.
     logged_mark: (Severity, Glyph),
-    /// The wall clock at `posted_at`, the anchor [`Live::wall_at`] adds the monotonic life.
+    /// The wall clock at `posted_at`, the anchor [`Live::wall_at`] adds the
+    /// monotonic life to: the stamp for a post, the host's wall at the seed for
+    /// a carried row (whose stamp is the parent's ingress).
     wall_anchor: u64,
 }
 
@@ -368,7 +376,8 @@ impl Live {
         self.is_animated()
     }
 
-    /// The activity byte the fingerprint folds and the motion epoch keys.
+    /// The activity byte the fingerprint folds and the motion epoch keys
+    /// on: 0 no indicator, 1 a fill, 2 busy.
     #[must_use]
     pub const fn activity(&self) -> u8 {
         match &self.msg.meter {
@@ -422,7 +431,9 @@ impl Live {
         hold_span(self.msg.hold, self.msg.severity)
     }
 
-    /// The wall clock now: the wall at `posted_at`.
+    /// The wall clock now: the wall at `posted_at` (the ingress stamp, or
+    /// the seed's wall for a carried row) plus the monotonic elapsed — the
+    /// engine reads no clock of its own.
     #[must_use]
     pub(crate) fn wall_at(&self, now: Instant) -> u64 {
         let elapsed = now.saturating_duration_since(self.posted_at).as_millis();
@@ -506,7 +517,7 @@ fn hold_span(hold: Hold, severity: Severity) -> Duration {
     }
 }
 
-/// What a post.
+/// What a post did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Posted {
     /// The row's id (the existing one for a duplicate).
@@ -533,7 +544,7 @@ pub enum PostOutcome {
 /// What one family pass ([`MessageCenter::sync_digest`]).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DigestSync {
-    /// Entries that were not open and now.
+    /// Entries that were not open and now are.
     pub posted: usize,
     /// Their keys, in the order the pass named them.
     pub posted_keys: Vec<String>,
@@ -556,7 +567,7 @@ pub struct CatchUp {
     pub adopted: usize,
 }
 
-/// What a settle.
+/// What a settle did.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Settled {
     /// Something painted changed.
@@ -655,7 +666,7 @@ impl MessageCenter {
         self.refresh = period.clamp(Duration::from_micros(4_167), ANIM_FRAME);
     }
 
-    /// The display frame period the fine motion is read.
+    /// The display frame period the fine motion is read on.
     #[must_use]
     pub const fn refresh(&self) -> Duration {
         self.refresh
@@ -914,7 +925,8 @@ impl MessageCenter {
         });
     }
 
-    /// Close as fixed every problem under a key starting with `prefix` that left the glass unfixed.
+    /// Close as fixed every problem under a key starting with `prefix` that
+    /// left the glass unfixed in this process.
     pub fn fix_closed(&mut self, prefix: &str, now: Instant) -> usize {
         self.fix_closed_as(prefix, None, now)
     }
@@ -1197,7 +1209,9 @@ impl MessageCenter {
         true
     }
 
-    /// Resolve every live row.
+    /// Resolve every live row — and every exception in the digest — whose key
+    /// starts with `prefix` (`config.` on a clean reload, `privacy.` on
+    /// policy-off).
     pub fn resolve_key_prefix(&mut self, prefix: &str, outcome: Outcome, now: Instant) -> usize {
         let ids: Vec<MessageId> = self
             .live
@@ -1346,7 +1360,8 @@ impl MessageCenter {
         Some(intent)
     }
 
-    /// Perform an action only while the id and action-list revision captured by its publisher.
+    /// Perform an action only while the id and action-list revision captured
+    /// by its publisher still stand.
     pub fn act_at_revision(
         &mut self,
         id: MessageId,
@@ -1881,7 +1896,10 @@ impl MessageCenter {
         self.revision
     }
 
-    /// A center that replaces another.
+    /// A center that replaces another (the web's `messages_restore`, a fresh
+    /// center over the kept log) moves its revision past the one it replaces,
+    /// or a reader gating on the revision (the page's `rev=`) would read the
+    /// same number over a log that went from nothing to N records.
     pub fn follow_revision(&mut self, replaced: u64) {
         self.revision = self.revision.max(replaced.saturating_add(1));
     }
@@ -2260,7 +2278,8 @@ impl MessageCenter {
         closed
     }
 
-    /// Never mint an id below `raw` from now.
+    /// Never mint an id below `raw` from now on (ids only rise; a `raw` at or
+    /// past the id ceiling is ignored).
     pub fn raise_next_id(&mut self, raw: u64) {
         self.log.raise_to(raw);
     }
@@ -3043,7 +3062,7 @@ struct RowIn<'m> {
     kind: RowKind,
     msg: &'m Message,
     ind: Indicator,
-    /// The load said, and the loads the slot is reserved.
+    /// The load said, and the loads the slot is reserved for.
     load: (Option<Load>, Loads),
 }
 
@@ -3172,6 +3191,8 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
     };
     let mut layout = layout_row_with(&spec, cols, width, forms.short_time);
     if matches!(kind, RowKind::Echo(_)) {
+        // An echo is the indicator ending, not a reading: the stats were
+        // frozen at the last read before the resolve, so they go, laid out as
         // the row was, so nothing on it moves at the resolve.
         layout.stats = None;
     }
@@ -3184,6 +3205,7 @@ fn text_ticks(row: &Live, layout: &RowLayout, q: Instant, look: Look) -> [Option
         .elapsed
         .map(|_| row.started_at + e + elapsed_word_change(e));
     if layout.eta.is_some() {
+        // A hidden estimate leaves the slot blank: nothing ticks there until
         // the estimate latches.
         [elapsed, row.track.next_change(q), None]
     } else {

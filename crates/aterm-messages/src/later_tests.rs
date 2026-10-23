@@ -17,7 +17,6 @@ use crate::{Instant, LOG_CAP, WIRE_LATER_CAP, WIRE_MINTS_PER_WINDOW};
 const DAY_MS: u64 = 86_400_000;
 const T0_MS: u64 = 1_790_000_000_000;
 
-/// The line codex-alab sends for an account's security setup, as the design spells it.
 const SETUP: &str = "later codex.security-setup.0123abcd tag=codex \
                      url=https://chatgpt.com/security/setup?src=codex \
                      Set up Codex account security -- \
@@ -38,13 +37,11 @@ fn fresh(now: Instant) -> (MessageCenter, WireGate) {
     )
 }
 
-/// Parse and apply one `notice` line at wall clock `at`, as the host's two threads do.
 fn notice(c: &mut MessageCenter, g: &mut WireGate, line: &str, at: u64, now: Instant) -> Applied {
     let req = NoticeRequest::parse(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
     apply(c, g, req, wall(at), now)
 }
 
-/// `(id, how)` from an `OK later=<id> how=<word>` reply.
 fn later_reply(a: &Applied) -> (MessageId, String) {
     let rest = a
         .reply
@@ -59,12 +56,10 @@ fn later_reply(a: &Applied) -> (MessageId, String) {
     )
 }
 
-/// A one-line `later` under `key` with its own words.
 fn line(key: &str, step: &str) -> String {
     format!("later {key} Renew the signing key -- only you hold the passphrase -- {step}")
 }
 
-/// One of aterm's own exceptions, under its own family's key.
 fn own_entry(c: &mut MessageCenter, subject: &str, at: u64, now: Instant) {
     let msg = Entry::new(
         Family::Disk,
@@ -219,9 +214,6 @@ fn notice_later_parses_its_form_and_refuses_junk() {
     );
 }
 
-/// The same fact said again (another tab, another launch) is the one entry it was: a
-/// repeat folds into it and spends nothing, new words restate it in place, and the key
-/// is kept whole. Negative control: another key is another entry.
 #[test]
 fn a_repeated_later_key_folds_into_one_entry() {
     let now = Instant::now();
@@ -282,9 +274,6 @@ fn a_repeated_later_key_folds_into_one_entry() {
     assert!(keys.contains(&format!("wire.{k40}")) && keys.contains(&format!("wire.{k40b}")));
 }
 
-/// The owner's dismissal holds: the same key said again inside the week is quiet
-/// (nothing shown, nothing logged, the record that keeps it quiet named), and after the
-/// week it is a new entry. Negative control: another key is not quiet.
 #[test]
 fn the_owners_dismissal_of_a_later_entry_holds() {
     let now = Instant::now();
@@ -312,12 +301,6 @@ fn the_owners_dismissal_of_a_later_entry_holds() {
     assert_eq!(later_reply(&q).1, "quiet");
 }
 
-/// The dismissal outlasts the wire's own churn: once the log ring is full and the wire
-/// holds its share, every new record evicts the oldest retired wire record, and the
-/// dismissal of a tool's entry is one. A script's ordinary records after it (a build's
-/// `notice post`, many times a ring) must not take it, or the nag is back the next
-/// launch of the tool. Negative control: an entry the tool ended (`done`, no filing)
-/// keeps nothing quiet whatever the churn.
 #[test]
 fn a_flood_of_wire_records_never_evicts_the_owners_dismissal() {
     let now = Instant::now();
@@ -344,9 +327,6 @@ fn a_flood_of_wire_records_never_evicts_the_owners_dismissal() {
     assert_eq!(later_reply(&back).1, "new", "an end keeps nothing quiet");
 }
 
-/// The tool says the fact ended: `done` ends the entry (no row holds the key), its
-/// record keeps the words the tool finished with, and the next post is news, since an
-/// end is not the owner's dismissal.
 #[test]
 fn notice_done_ends_a_later_entry() {
     let now = Instant::now();
@@ -461,11 +441,6 @@ fn notice_done_ends_a_later_entry() {
     }
 }
 
-/// At most four wire entries are open, and none is filed into a full digest, so a flood
-/// of keys never evicts one of aterm's own entries. A refused line changes nothing; a
-/// repeat of an open key still folds past the cap. Negative control: a post let into a
-/// full digest (aterm's own) files the oldest entry, here one of aterm's, which is what
-/// the wire's refusal keeps a wire line from doing.
 #[test]
 fn the_wire_caps_its_later_entries_and_never_evicts_aterms_own() {
     let now = Instant::now();
@@ -530,8 +505,6 @@ fn the_wire_caps_its_later_entries_and_never_evicts_aterms_own() {
     );
 }
 
-/// `Open in browser` is the entry's one action: the press hands the host the link and
-/// files the entry answered, which holds like a dismissal.
 #[test]
 fn a_press_of_open_in_browser_files_the_entry_answered() {
     let now = Instant::now();
@@ -562,10 +535,6 @@ fn a_press_of_open_in_browser_files_the_entry_answered() {
     assert!(rec.later);
 }
 
-/// Across a restart or an update the entry is adopted from the log, and the tool may
-/// not say it again for days: its `Open in browser` is still the entry's own button, so
-/// the owner's press answers it and the answer holds against the tool's next post.
-/// Negative control: an entry with no link keeps its one step in words, no button.
 #[test]
 fn a_press_after_a_restart_still_answers_a_later_entry() {
     let now = Instant::now();

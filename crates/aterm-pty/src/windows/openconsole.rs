@@ -462,6 +462,7 @@ pub(crate) enum Health {
 
 /// The health check: once `client` has been started on `host`, the host must write its first byte within [`HEALTH_WINDOW`].
 pub(crate) fn await_started(host: &OpenConsoleHost, client: HANDLE, out_read: HANDLE) -> Health {
+    // The image the client really runs, an app execution alias's target
     // included (a spawn checks the program it names before it picks a host).
     if image_of(client).is_some_and(|image| is_gui_image(&image)) {
         return Health::NoClient;

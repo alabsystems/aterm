@@ -108,6 +108,7 @@ where
         // SAFETY: `caught == 0` guarantees `run_body` initialized `slot.out`.
         unsafe { Ok(slot.out.assume_init_read()) }
     } else {
+        // `body` was dropped by the unwind; `run_on_exc` cleared the flag and
         // ran `on_exc`; `out` was never written. `Drop` finds nothing live.
         Err(Contained { ordinal: 0 })
     }

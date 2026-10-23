@@ -211,7 +211,7 @@ impl Watch {
         Self::paced(now, Pace::PRODUCTION.wedge_after)
     }
 
-    fn paced(now: Instant, wedge_after: Duration) -> Self {
+    const fn paced(now: Instant, wedge_after: Duration) -> Self {
         Self {
             last: Reading {
                 progress: 0,
@@ -261,7 +261,7 @@ impl Watch {
     }
 
     /// A rebind was attempted at `now` (whether or not it completed): back off.
-    fn attempted(&mut self, now: Instant) {
+    const fn attempted(&mut self, now: Instant) {
         self.last_rebind = Some(now);
     }
 
@@ -853,7 +853,7 @@ impl AcceptThread {
         clippy::unused_self,
         reason = "the test build reads the wedge seam from self"
     )]
-    fn withheld(&self) -> bool {
+    const fn withheld(&self) -> bool {
         false
     }
 

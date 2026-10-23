@@ -1461,6 +1461,9 @@ fn apply_verdict(
     found: Option<aterm_phase::Wall>,
     named: Option<Named>,
 ) {
+    // A WALL THE SCREEN COULD NOT NAME, named by the transcript's closed
+    // notice: a wall read here, its phase `limited` for a
+    // limit as the reader reads one. Or the screen's unnamed `API Error`,
     // named by the notice that confirmed it ([`refined`]): the same row.
     if let Some(w) = found.filter(|f| {
         reading

@@ -26,7 +26,6 @@ pub(super) fn wait(pid: u32, block: bool) -> io::Result<Option<Rusage>> {
         usec: i64,
     }
 
-    // Darwin's and 64-bit Linux's rusage: two timeval, then fourteen longs.
     #[repr(C)]
     #[derive(Default)]
     struct NativeUsage {
@@ -46,8 +45,8 @@ pub(super) fn wait(pid: u32, block: bool) -> io::Result<Option<Rusage>> {
     loop {
         let mut status = 0;
         let mut usage = NativeUsage::default();
-        // SAFETY: the caller owns this unreaped child. Both outputs are live and
-        // have the native ABI's layout; wait4 retains neither pointer.
+        // SAFETY: the caller owns this unreaped child; both outputs are live with the native ABI's
+        // layout, and wait4 retains neither pointer.
         let got = unsafe { wait4(pid, &raw mut status, i32::from(!block), &raw mut usage) };
         if got == 0 {
             return Ok(None);

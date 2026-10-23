@@ -42,7 +42,6 @@ fn parse_index_impl<'a>(count: u32, s: &mut Stream<'a>) -> Option<Index<'a>> {
         offset_size,
     };
 
-    // Last offset indicates a Data Index size.
     match offsets.last() {
         Some(last_offset) => {
             let data = s.read_bytes(usize::num_from(last_offset))?;
@@ -99,8 +98,6 @@ impl<'a> VarOffsets<'a> {
             OffsetSize::Size4 => s.read::<u32>()?,
         };
 
-        // Offsets are offset by one byte in the font,
-        // so we have to shift them back.
         n.checked_sub(1)
     }
 
@@ -159,7 +156,6 @@ impl<'a> IntoIterator for Index<'a> {
 impl<'a> Index<'a> {
     #[inline]
     pub fn len(&self) -> u32 {
-        // Last offset points to the byte after the `Object data`. We should skip it.
         self.offsets.len().saturating_sub(1)
     }
 

@@ -95,7 +95,8 @@ fn forget_park_raise() {
     PARK_RAISED_FROM.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The launch variable in which a predecessor tells its successor the soft descriptor limit it.
+/// The launch variable in which a predecessor tells its successor the soft
+/// descriptor limit it held before a PARK raised it.
 pub(crate) const ENV_PARK_RAISED_FROM: HandoffName =
     HandoffName::new("ATERM_HANDOFF_PARK_RAISED_FROM");
 
@@ -112,7 +113,9 @@ const TAKES_LAUNCHER_NOFILE_FROM_BUILD: u64 = 1_790_807_622;
 /// out of its environment (ddaf83ae2f, after v0.100.0 was cut).
 const TAKES_PARK_RAISED_FROM_BUILD: u64 = 1_791_501_389;
 
-/// Name [`ENV_LAUNCHER_NOFILE`] on a successor's `command` whose image keeps this process's soft.
+/// Name [`ENV_LAUNCHER_NOFILE`] on a successor's `command` whose image keeps
+/// this process's soft descriptor limit — the fork lane's child and the cold
+/// lane's `exec` alike.
 pub(crate) fn carry_launcher_limit(
     command: &mut aterm_uds::spawnfd::StdCommand,
     target_build: u64,
@@ -250,9 +253,10 @@ pub(crate) fn raise_descriptor_limit_for_park(target_build: u64, build: u64) {
 /// The limit an older successor is started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OlderImageLimit {
-    /// The soft limit the image is started.
+    /// The soft limit the image is started at: this process's before the
+    /// park's raise.
     soft: u64,
-    /// The limits this process runs at, the hard one kept as it.
+    /// The limits this process runs at, the hard one kept as it is.
     raised: (u64, u64),
     /// One past the highest descriptor number this process can hold.
     table: libc::c_int,
@@ -357,6 +361,8 @@ pub(crate) fn start_older_image_at_its_limit(
     unsafe {
         command.pre_exec(move || {
             // A descriptor the image would keep at or above the limit, or a
+            // refused `setrlimit` (lowering a soft limit needs no privilege):
+            // the child keeps the limit it inherited, and the spawn goes on.
             if limit.inheritable_at_or_above().is_none() {
                 let _ = limit.set_soft(limit.soft);
             }
@@ -610,7 +616,8 @@ pub(crate) mod tests {
 
         let (read, _write) = pipe_for_test();
         let launchd_fd = i32::try_from(launchd).expect("a descriptor number");
-        // SAFETY: F_DUPFD duplicates a live descriptor at the first free number at or above.
+        // SAFETY: F_DUPFD duplicates a live descriptor at the first free
+        // number at or above `launchd_fd`, with close-on-exec clear.
         let high = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD, launchd_fd) };
         assert!(
             high >= launchd_fd,

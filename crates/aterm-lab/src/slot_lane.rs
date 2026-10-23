@@ -1,41 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The build slots' lanes (`docs/DESIGN-harness-occupancy-2026-10-20.md`):
-//! what `aterm_sysprobe::slots` reads, held to the real
-//! `build-slot` and to a real aterm.
-//!
-//! * `slot-capture`: the record capture (design §10 Q8's unread-format
-//!   guard). The real `build-slot` (`~/.local/bin/build-slot`, else
-//!   `$HOME/trust/scripts/build-slot`; a named skip with neither) admits `true`
-//!   into a slot directory of the lane's own scratch world (`BUILD_SLOT_DIR`,
-//!   never `BUILD_SLOTS`, no worktree lock, no memory floor); its `slot-0`
-//!   must parse ([`aterm_sysprobe::slots::Record::parse`]) as a record of
-//!   the wrapper's pid, started between the spawn and the exit, spelled as
-//!   Python's `json.dumps` spells it, `cmd` `true` and `cwd` the scratch
-//!   directory (which the lab checks and the reader drops). A mismatch is a
-//!   FAIL naming the field: `build-slot` changed its record.
-//! * `slot-capture --watch <dur>`: the slice's exit, run for a day. Every
-//!   [`aterm_sysprobe::slots::PERIOD`] the real slot directory is read with
-//!   the reader (read only, no lock) and with `lsof` (read only); a holder the
-//!   reader proves that `lsof` does not show, a record's own pid `lsof` shows
-//!   holding its slot on two reads running that the reader does not prove, and
-//!   a slot file that appeared, empty and unheld, across the reader's own read
-//!   each FAIL. An hourly line says how it stands.
-//! * `slot-lane`: the `lab instance` test of `await sys slots>=1`. A headless
-//!   instance whose scratch HOME holds one slot, `slot-0`, taken by a stand-in
-//!   (this program again, `slot-hold`: it opens, locks, truncates and writes a
-//!   Python-spelled record as `build-slot` does, says `held` and parks): the
-//!   wait times out while the slot is held, and answers `OK sys slots=1/1`
-//!   once the stand-in is `SIGKILL`ed, which happens only after the
-//!   instance's log says that wait armed the slots' cadence
-//!   ([`aterm_sysprobe::slots::ARMED_LINE`]). The stand-in starts no build, so no
-//!   orphan's witness can discount the slot whatever the machine's load.
-//!
-//! Every wait for what must happen is a one-minute hang detector (the
-//! stand-in's first exec, [`aterm_uds::deadline::FIRST_EXEC_HANG`]). Only
-//! the processes the lane started are signalled. Run by hand, never by a
-//! default test run.
+//! Lab lanes verifying `aterm_sysprobe::slots` against `build-slot` and a live aterm.
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
@@ -53,11 +19,8 @@ use crate::paths::paths;
 use crate::pyjson::J;
 use crate::{Fail, LAB, Res, stop};
 
-/// A one-minute hang detector for what must happen.
 const MUST: Duration = Duration::from_secs(60);
 
-/// An early return or unwind keeps the scratch while a child's outcome may
-/// still be unknown. Only the ordinary, fully collected path releases it.
 struct LaneWorld {
     world: World,
     settled: bool,
@@ -88,9 +51,6 @@ impl Drop for LaneWorld {
     }
 }
 
-/// A pipe drained on the calling thread, so there is no detached reader to
-/// outlive the world. Each turn reads at most one chunk and keeps a bounded
-/// tail; a busy writer cannot keep the deadline from being checked.
 struct Pipe {
     file: std::fs::File,
     bytes: Vec<u8>,
@@ -135,10 +95,6 @@ impl Pipe {
     }
 }
 
-/// Ownership is armed immediately after spawn, before pipe setup or any
-/// other fallible operation. Drop signals only the direct, unreaped child
-/// and uses the existing exit watcher for a bounded reap reserve. This is
-/// no claim that arbitrary descendants have ended.
 struct Running {
     child: Child,
     out: Option<Pipe>,
@@ -236,17 +192,13 @@ impl Drop for Running {
     }
 }
 
-/// The stand-in's line once it holds its slot.
 const HELD: &str = "held";
 
 /// The hidden verb the stand-in runs as.
 pub const HOLD_VERB: &str = "slot-hold";
 
-/// The PATH `build-slot` runs under: its `#!/usr/bin/env python3` finds the
-/// python a person's shell would before the system's.
 const CAPTURE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// Microseconds since the epoch now.
 fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -255,7 +207,6 @@ fn now_us() -> u64 {
         .unwrap_or(0)
 }
 
-/// The lane's verdict: each check named, each a pass or why not.
 #[derive(Default)]
 struct Verdict {
     failed: usize,
@@ -273,7 +224,6 @@ impl Verdict {
         }
     }
 
-    /// The verb's exit: 0 when every check passed.
     fn end(&self, verb: &str) -> i32 {
         if self.failed == 0 {
             println!("{verb}: PASS ({} checks)", self.checks);
@@ -285,7 +235,6 @@ impl Verdict {
     }
 }
 
-/// The real `build-slot`, where this host has one.
 fn find_build_slot() -> Option<PathBuf> {
     let p = paths();
     let homes = [p.caller_home.as_str(), p.real_home.as_str()];
@@ -301,7 +250,6 @@ fn find_build_slot() -> Option<PathBuf> {
         .find(|c| crate::sys::executable(&c.to_string_lossy()))
 }
 
-/// `<dur>` as `<n>s`, `<n>m` or `<n>h`.
 fn duration_of(v: &str) -> Option<Duration> {
     let (n, unit) = v.split_at_checked(v.len().checked_sub(1)?)?;
     let n: u64 = n.parse().ok()?;
@@ -315,7 +263,6 @@ fn duration_of(v: &str) -> Option<Duration> {
 }
 
 /// `slot-capture [--watch <dur>] [--dir DIR]` (the module docs).
-///
 /// # Errors
 /// Usage, or the world could not be made.
 pub fn cmd_slot_capture(args: &[String]) -> Res {
@@ -427,17 +374,13 @@ pub fn cmd_slot_capture(args: &[String]) -> Res {
     Ok(v.end("slot-capture"))
 }
 
-/// One slot file's identity and record, read without a lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SlotFile {
     path: PathBuf,
-    /// `(size, mtime ns, inode)`.
     stamp: (u64, i128, u64),
-    /// The record's pid, where it parses.
     pid: Option<u32>,
 }
 
-/// The slot files of `dir` (`slot-<digits>`, regular files), by name.
 fn slot_files(dir: &Path) -> Vec<SlotFile> {
     use std::os::unix::fs::MetadataExt as _;
     let mut out: Vec<SlotFile> = std::fs::read_dir(dir)
@@ -474,7 +417,6 @@ fn slot_files(dir: &Path) -> Vec<SlotFile> {
     out
 }
 
-/// Which pids `lsof` shows holding each of `files` open (read only).
 fn lsof_holders(files: &[SlotFile]) -> Result<Vec<(PathBuf, u32)>, String> {
     if files.is_empty() {
         return Ok(Vec::new());
@@ -483,7 +425,6 @@ fn lsof_holders(files: &[SlotFile]) -> Result<Vec<(PathBuf, u32)>, String> {
     cmd.args(["-n", "-F", "pn", "--"])
         .args(files.iter().map(|f| f.path.as_os_str()));
     let out = Running::start(&mut cmd)?.finish(MUST)?;
-    // lsof exits 1 when none of the files is open.
     if !matches!(out.status.code(), Some(0 | 1)) {
         return Err(format!(
             "lsof failed: {}",
@@ -502,7 +443,6 @@ fn lsof_holders(files: &[SlotFile]) -> Result<Vec<(PathBuf, u32)>, String> {
     Ok(held)
 }
 
-/// `--watch`: the reader beside `lsof` over the real slots for `span`.
 fn watch_slots(dir: &Path, span: Duration) -> Res {
     println!(
         "slot-capture --watch: {} for {} s, a read every {} s",
@@ -514,8 +454,6 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
     let start = Instant::now();
     let mut next_summary = start + Duration::from_secs(3600);
     let (mut reads, mut fails) = (0u64, 0u64);
-    // The slots, each with its record's pid, `lsof` showed that pid holding
-    // last read (a new holder of the same slot starts its count over).
     let mut seen_once: Vec<(PathBuf, u32)> = Vec::new();
     let mut last = SlotsRead::Unread(Unread::NotSampled);
     while start.elapsed() < span {
@@ -525,7 +463,6 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
             load5: load.map(|l| l[1]),
             ncpu: std::thread::available_parallelism().ok().map(usize::from),
         };
-        // Armed, as a wait on the slots arms the host's reader.
         let read = reader.read(Instant::now(), now_us(), &machine, true);
         let after = slot_files(dir);
         let held = lsof_holders(&after)?;
@@ -538,8 +475,6 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
             SlotsRead::Read { holders, .. } => holders.iter().map(|h| h.pid).collect(),
             SlotsRead::Unread(_) => Vec::new(),
         };
-        // A holder that ended between the reader's read and lsof's let its
-        // slot go: only one still alive after lsof is one lsof missed.
         for pid in &proven {
             if !held.iter().any(|(_, p)| p == pid) && aterm_uds::process::pid_alive(*pid) {
                 fail(format!(
@@ -549,8 +484,6 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
         }
         let mut seen_now = Vec::new();
         for f in &after {
-            // Its record stood before the reader's read (a holder that came
-            // between the read and lsof is the next read's first sighting).
             let own = f.pid.is_some_and(|pid| {
                 before.iter().any(|b| b.path == f.path && b.pid == f.pid)
                     && held.iter().any(|(path, p)| *p == pid && path == &f.path)
@@ -592,10 +525,7 @@ fn watch_slots(dir: &Path, span: Duration) -> Res {
     Ok(i32::from(fails > 0))
 }
 
-/// `slot-hold <file>` (hidden): the stand-in holder. It takes `<file>` as
-/// `build-slot` does (open, `LOCK_EX | LOCK_NB`, truncate, one write of a
-/// Python-spelled record of its pid and now), says [`HELD`], and parks until
-/// it is `SIGKILL`ed, when the kernel drops its lock.
+/// `slot-hold <file>` (hidden): the stand-in holder.
 pub fn hold_main(args: &[String]) -> i32 {
     use std::os::unix::fs::OpenOptionsExt as _;
     let [slot] = args else {
@@ -642,8 +572,6 @@ pub fn hold_main(args: &[String]) -> i32 {
     }
 }
 
-/// The stand-in on `slot`, working in `dir`; back once it holds the slot
-/// (its first exec waited under [`aterm_uds::deadline::FIRST_EXEC_HANG`]).
 fn start_holder(world: &World, slot: &Path, dir: &Path) -> Result<Running, String> {
     let env = world.env();
     let mut cmd = aterm_uds::spawnfd::command(&paths().exe);
@@ -672,7 +600,6 @@ fn start_holder(world: &World, slot: &Path, dir: &Path) -> Result<Running, Strin
 }
 
 /// `slot-lane [--aterm PATH] [--keep]` (the module docs).
-///
 /// # Errors
 /// Usage, or the world, the stand-in or the instance could not be made.
 pub fn cmd_slot_lane(args: &[String]) -> Res {
@@ -690,7 +617,6 @@ pub fn cmd_slot_lane(args: &[String]) -> Res {
     if keep {
         world.world.keep();
     }
-    // The instance's reader looks in `<HOME>/.cache/build-slot`.
     let slots = aterm_sysprobe::slots::default_dir(&world.home);
     let holder_dir = world.dir.join("holder");
     for d in [&slots, &holder_dir] {
@@ -740,8 +666,6 @@ pub fn cmd_slot_lane(args: &[String]) -> Res {
     }
 }
 
-/// The waits against the running `inst` (the module docs); `None`: a named
-/// skip.
 fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<Verdict>, String> {
     let ls = ctl(inst, world, &["ls"])?;
     let sid = ls
@@ -760,9 +684,6 @@ fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<V
         return Ok(None);
     }
     let mut v = Verdict::default();
-    // (a) Held: the wait times out. Fifteen seconds outlast the reader's
-    // first reads (one sighting is pending, the second, a period later,
-    // proves the holder).
     let held = ctl(
         inst,
         world,
@@ -784,8 +705,6 @@ fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<V
             )
         },
     );
-    // (b) Freed: the wait armed first, then the stand-in SIGKILLed. The
-    // armed lines (a)'s wait left, counted before this one is sent.
     let armed_before = crate::util::scratch_text(&world.state().join("logs/aterm.log"))
         .matches(aterm_sysprobe::slots::ARMED_LINE)
         .count();
@@ -794,10 +713,6 @@ fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<V
         world,
         &[&at, "await", "sys", "slots>=1", "timeout=60000"],
     )?;
-    // The wait is armed before the slot frees: the instance logs the slots'
-    // armed cadence when this wait, the only one, arms it. Once the stand-in
-    // dies the reader needs two reads a period apart to call the slot free,
-    // so the wait's first turn reads it held.
     let log = world.state().join("logs/aterm.log");
     let armed_lines = |text: &str| text.matches(aterm_sysprobe::slots::ARMED_LINE).count();
     let deadline = Instant::now() + MUST;
@@ -831,8 +746,6 @@ fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<V
     Ok(Some(v))
 }
 
-/// A private instance client, owned before any wait for its answer or the
-/// instance's armed witness. All pipe reads stay on this thread.
 fn ctl_start(inst: &Instance, world: &World, args: &[&str]) -> Result<Running, String> {
     let env = world.env();
     let mut cmd = aterm_uds::spawnfd::command(&inst.client);
@@ -850,9 +763,6 @@ fn ctl_start(inst: &Instance, world: &World, args: &[&str]) -> Result<Running, S
     Running::start(&mut cmd)
 }
 
-/// Readiness uses the same owned client as the lane, including when the
-/// socket exists but its version reply never arrives. The child is held to
-/// the remaining boot deadline, followed only by its cleanup reserve.
 fn await_socket(inst: &mut Instance, world: &World) -> Result<(), String> {
     let end = Instant::now() + BOOT;
     loop {

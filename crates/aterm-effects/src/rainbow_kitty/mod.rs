@@ -930,6 +930,8 @@ impl Engine {
             } else if let Some((_, _, Some(at_key))) = lift
                 && at_key == index
             {
+                // The Space that lifted the word: its blank was eaten at the
+                // end of the row above, and left of the frame's caret is the
                 // blank indent — held, with no cell.
                 self.ribbon.hold_typed(&ev, at, ctx, None);
             } else {
@@ -984,6 +986,7 @@ impl Engine {
             return None;
         }
         if to.1 <= from.1 {
+            // A retreat, a re-anchor, a rewrite landing left of its launch:
             // not an echo's shape. The presses keep waiting.
             return None;
         }
@@ -1451,7 +1454,7 @@ impl Engine {
         }
     }
 
-    /// The hand's line the last follow pass lifted with the hand, ``, taken once.
+    /// The hand's line the last follow pass lifted with the hand, `(from row, to row)`, taken once.
     #[inline]
     pub(crate) const fn take_hand_lift(&mut self) -> Option<(u16, u16)> {
         self.hand_lift.take()
@@ -1992,7 +1995,17 @@ impl Engine {
         self.companion.take()
     }
 
-    /// The resident pet's receiving end (D13).
+    /// The resident pet's receiving end (D13). The host reads it after its own
+    /// pet tick:
+    ///
+    /// ```
+    /// # use aterm_effects::{cursor_glow::Geom, kitty_pet::{PetBrain, PetFrame}, rainbow_kitty::{Engine, companion}};
+    /// # use aterm_time::Instant;
+    /// # fn offer_after_tick(v2: &mut Engine, pet: &mut PetBrain, pet_frame: &PetFrame, geom: Geom, now: Instant) {
+    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(pet_frame, geom));
+    /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
+    /// # }
+    /// ```
     #[must_use]
     pub fn pet_offer(&self, geom: Geom, pet: Option<companion::PetOnGlass>) -> companion::PetOffer {
         let perk_at = self.companion.and_then(|imp| {

@@ -226,6 +226,9 @@ impl SettingsApp {
                 None => view.land_at_top(),
             }
         } else if let Some(session) = parse_show_action(action) {
+            // Navigation writes nothing: no posture is weighed. A SESSIONS
+            // row's Show, or a DECIDED FOR YOU / TAB CONTROL row's Show tab
+            // (whose session may be one SESSIONS does not list: its agent has
             // exited or it is a plain shell tab).
             if self.harness.sessions.iter().any(|s| s.local_id == session)
                 || self
@@ -270,6 +273,10 @@ impl SettingsApp {
                 view.harness_every_timer_open = false;
                 view.reveal_pressed(timer_opening_reveal(Some(session)));
             } else {
+                // THE TIMER CLOSED GIVES BACK THE PLACE ITS OPENING SCROLLED:
+                // the list seats on its stops again, and the press's reveal
+                // keeps the Timer whole under the pointer — the closed row is
+                // drawn whole where it was, never left under the caption
                 // above it (the second review of 2026-10-20, R2).
                 view.drop_list_nudge();
             }
@@ -748,7 +755,20 @@ fn lead_lines(tokens: &[(&str, String)], width: f32) -> Vec<String> {
         .collect()
 }
 
-/// EFFECT OF EACH AUTOPILOT'S LEAD (§11.6.3, item 2; [`crate::harness_ab::ab_lead`]) as the card's first block, keyed `harness/ab/lead` and spoken whole ([`AbLead::words`]), its parts drawn only:
+/// EFFECT OF EACH AUTOPILOT'S LEAD (§11.6.3, item 2;
+/// [`crate::harness_ab::ab_lead`]) as the card's first block, keyed
+/// `harness/ab/lead` and spoken whole ([`AbLead::words`]), its parts
+/// drawn only:
+///
+/// * **Both sides**: the caption, `Working time held at a box or a
+///   question`, in the page's plain type; under it the two sides in a row —
+///   each share in Hero type (the page heading's), its working time beside
+///   it plain, on the figure's baseline — where the row is whole at the
+///   card's `inner` width. Otherwise the whole lead in plain type, `Working
+///   time held at a box or a question: <1% of 6h 10m on Cruise · 14% of 25m
+///   off`, on as many lines as it needs, broken at its joins
+///   ([`lead_lines`]): never cut, since each side is half the comparison.
+/// * **No Off time**: the note, always plain, broken between words.
 pub(super) fn ab_lead_block(lead: &AbLead, inner: f32) -> (UiNode, f32) {
     let plain_height = 28.0_f32.max(18.0 * settings_text_scale());
     let hero_height = page_heading_height();

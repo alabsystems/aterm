@@ -50,7 +50,6 @@ fn pty_keeper_custody_fires_every_committed_move() {
     );
 }
 
-/// The lifecycles a person meets.
 #[test]
 fn pty_keeper_custody_walks_the_lifecycles() {
     let m = pty_keeper_custody_model();
@@ -133,10 +132,6 @@ fn pty_keeper_custody_walks_the_lifecycles() {
     assert!(m.action_enabled("Relaunch", &mid2));
 }
 
-/// An offer is made to a connection. The relaunched window's link drops before it registered
-/// its offers: they are orphans again while it still holds them (no second offer), its
-/// reconnected link registers them, and its later quit (BYE on the new link) relaunches
-/// nothing. At `Buggy = 1` the offer stays with the dead link, and the quit reads as a crash.
 #[test]
 fn pty_keeper_custody_an_offer_returns_when_its_link_drops() {
     let m = pty_keeper_custody_model();
@@ -185,10 +180,6 @@ fn pty_keeper_custody_an_offer_returns_when_its_link_drops() {
     assert!(buggy.action_enabled("Relaunch", &quit), "{quit:?}");
 }
 
-/// A release from one of two claimants (the outgoing window of an update, read after its
-/// successor registered) must not close the custody copy the successor's shell depends on. The
-/// same schedule loses the shell with no keeper fault at `Buggy = 1` and keeps it at
-/// `Buggy = 0`, and the step that differs is the release.
 #[test]
 fn pty_keeper_custody_a_release_from_one_of_two_claimants_keeps_the_copy() {
     let base = pty_keeper_custody_model();
@@ -238,7 +229,6 @@ fn pty_keeper_custody_a_release_from_one_of_two_claimants_keeps_the_copy() {
     assert_eq!((drained["k_holds_a"], drained["orphan_a"]), (0, 0));
 }
 
-/// `Buggy = 1` is caught on every design invariant by its own schedule.
 #[test]
 fn pty_keeper_custody_the_defects_are_caught_on_every_invariant() {
     let base = pty_keeper_custody_model();
@@ -301,8 +291,6 @@ fn keeper_relaunch_brake_fires_every_committed_move() {
     }
 }
 
-/// The brake as a person meets it: three relaunches, then a hold that only a
-/// manual launch lifts; a healthy relaunch resets; a quit relaunches nothing.
 #[test]
 fn keeper_relaunch_brake_walks_the_lifecycles() {
     let m = keeper_relaunch_brake_model();
@@ -383,7 +371,6 @@ fn keeper_death_judgement_fires_every_committed_move() {
     }
 }
 
-/// The ends a person meets, judged by name.
 #[test]
 fn keeper_death_judgement_walks_the_ends() {
     let m = keeper_death_judgement_model();
@@ -423,8 +410,6 @@ fn keeper_death_judgement_walks_the_ends() {
     );
 }
 
-/// `Buggy = 1` is caught on every invariant, each by the schedule its mutant
-/// was written for.
 #[test]
 fn keeper_death_judgement_the_defects_are_caught_on_every_invariant() {
     let base = keeper_death_judgement_model();
@@ -462,8 +447,6 @@ fn keeper_death_judgement_the_defects_are_caught_on_every_invariant() {
     );
 }
 
-/// Every action of `KeeperCompanionCustody`, so a guard tightened by mistake shows up as a dead
-/// action, not a quieter proof.
 const COMPANION_ACTIONS: [&str; 10] = [
     "Release",
     "ReaderDies",
@@ -489,8 +472,6 @@ fn keeper_companion_custody_fires_every_committed_move() {
     }
 }
 
-/// Each defect breaks the invariant written for it, alone (the plan's mutant table), and holds
-/// with no defect on.
 #[test]
 fn keeper_companion_custody_each_defect_breaks_its_own_invariant() {
     let model = keeper_companion_custody_model();
@@ -513,8 +494,6 @@ fn keeper_companion_custody_each_defect_breaks_its_own_invariant() {
     }
 }
 
-/// The plan's hand-traced counterexamples, walked on each mutant: each ends where its invariant
-/// is broken, and the committed machine keeps the invariant along the same steps.
 #[test]
 fn keeper_companion_custody_the_traced_counterexamples_end_where_the_plan_says() {
     let model = keeper_companion_custody_model();
@@ -559,7 +538,6 @@ fn keeper_companion_custody_the_traced_counterexamples_end_where_the_plan_says()
     }
 }
 
-/// The lifecycles a person meets.
 #[test]
 fn keeper_companion_custody_walks_the_lifecycles() {
     let m = keeper_companion_custody_model();

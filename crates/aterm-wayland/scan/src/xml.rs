@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Just enough XML for Wayland protocol descriptions: elements, attributes,
-//! text, comments and the declaration, with the five predefined entities.
-//! The input is the checkout's own files, so an error stops the generator
-//! with its byte offset.
+//! Just enough XML for Wayland protocol descriptions.
 
 /// One element.
 #[derive(Debug, Default)]

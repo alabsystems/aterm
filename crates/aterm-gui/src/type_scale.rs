@@ -30,7 +30,7 @@ pub(crate) enum TypeStep {
 impl TypeStep {
     /// The step's multiplier on the chrome base size: the one place a text size factor is
     /// written.
-    pub(crate) fn factor(self) -> f32 {
+    pub(crate) const fn factor(self) -> f32 {
         match self {
             TypeStep::Display => 1.6,
             TypeStep::Title => 1.15,
@@ -65,7 +65,7 @@ pub(crate) struct StepPx(f32);
 
 impl StepPx {
     /// The size in px (for width measurement and layout arithmetic).
-    pub(crate) fn get(self) -> f32 {
+    pub(crate) const fn get(self) -> f32 {
         self.0
     }
 

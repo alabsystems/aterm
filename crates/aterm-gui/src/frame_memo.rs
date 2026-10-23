@@ -43,12 +43,12 @@ impl ScreenText {
     }
 
     /// FNV-1a-64 of [`Self::whole`]: the screen's `hash=`.
-    pub(crate) fn fnv(&self) -> u64 {
+    pub(crate) const fn fnv(&self) -> u64 {
         self.fnv
     }
 
     /// The number of rows: the grid's row count when this was built.
-    pub(crate) fn row_count(&self) -> usize {
+    pub(crate) const fn row_count(&self) -> usize {
         self.ends.len()
     }
 
@@ -105,7 +105,7 @@ impl StyledFrame {
     }
 
     /// Whether the body carries an image payload.
-    pub(crate) fn carries_image_payloads(&self) -> bool {
+    pub(crate) const fn carries_image_payloads(&self) -> bool {
         self.image_payloads
     }
 
@@ -114,8 +114,9 @@ impl StyledFrame {
         &self.body
     }
 
-    /// `` of [`Self::body`], computed once per serialize: the push compares ids, never bodies.
-    pub(crate) fn id(&self) -> (u64, usize) {
+    /// `(FNV-1a-64, length)` of [`Self::body`], computed once per serialize: the push compares
+    /// ids, never bodies.
+    pub(crate) const fn id(&self) -> (u64, usize) {
         self.id
     }
 }
@@ -205,7 +206,7 @@ impl Look<'_> {
     }
 
     /// Whether a `cells` watch held the slot when this look was taken.
-    pub(crate) fn keeps_styled(&self) -> bool {
+    pub(crate) const fn keeps_styled(&self) -> bool {
         self.keeps_styled
     }
 

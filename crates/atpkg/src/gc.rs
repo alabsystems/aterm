@@ -156,6 +156,9 @@ fn shim_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
     };
     for e in entries.flatten() {
         // resolve_shim, not read_link: a Windows shim is a `.cmd` file read_link errs on,
+        // which would fail open there. store_build_of, not program_build_of_target: the
+        // latter is unanchored, so a dev-link into a checkout with a `store/ay/18/` tail
+        // would fabricate a claim about our ay@18.
         if let Some(target) = crate::platform::resolve_shim(&e.path())
             && let Some((program, build)) = crate::ops::store_build_of(&layout.prefix, &target)
         {
@@ -341,6 +344,7 @@ fn interrupted_debris(
         };
         for entry in entries.flatten() {
             // A sidecar whose build is provably absent describes nothing. A build parked
+            // mid-swap is absent too, but its sidecars belong to the parked tree and stay.
             if entry.file_type().is_ok_and(|t| t.is_file())
                 && let Some(build) = entry.file_name().to_str().and_then(orphan_sidecar_build)
                 && !parked.get(&program).is_some_and(|b| b.contains(&build))
@@ -364,6 +368,8 @@ fn interrupted_debris(
                 }
                 if crate::store::build_marks_another_slice(&entry.path()) {
                     // A complete install of the universal binary's other slice:
+                    // `build_is_complete` refuses it so this slice re-stages it, but it did
+                    // finish, and nothing claims a rollback tree.
                     continue;
                 }
                 if claimed.get(&program).is_some_and(|s| s.contains(&build)) {
@@ -373,6 +379,8 @@ fn interrupted_debris(
                 out.partial.push((program.clone(), build, entry.path()));
             } else if is_stage_scratch(name) {
                 // A parked `<build>.superseded-<pid>` (nothing at `<build>`) is that build's
+                // only copy. Still swept: `.incoming-<pid>` half-extracts and superseded
+                // siblings of a build that is there.
                 if let Some((build, crate::store::Scratch::Superseded)) =
                     crate::store::stage_scratch_of(name)
                     && parked.get(&program).is_some_and(|b| b.contains(&build))
@@ -587,6 +595,7 @@ fn run_in(
             let mut gone: Vec<String> = Vec::new();
             for e in entries.filter_map(Result::ok) {
                 // Regular files only: never follow a symlink out of the prefix, and
+                // never recurse into something that is not ours to interpret.
                 if !e.file_type().is_ok_and(|t| t.is_file()) {
                     continue;
                 }

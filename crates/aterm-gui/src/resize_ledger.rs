@@ -198,7 +198,7 @@ pub(crate) struct EngineProbe {
 
 impl EngineProbe {
     /// Sample `term` (the caller holds its lock).
-    pub(crate) fn sample(term: &Terminal) -> Self {
+    pub(crate) const fn sample(term: &Terminal) -> Self {
         Self {
             lifetime: term.resize_lifetime(),
             ordinal: term.resize_ordinal(),
@@ -457,7 +457,7 @@ impl Run {
 
     /// Alternate screen, no rewrap, and content moved (either direction) or
     /// pushed off the bottom.
-    fn judged(&self) -> bool {
+    const fn judged(&self) -> bool {
         self.alt && !self.reflowed && (self.displaced != 0 || self.pushed > 0)
     }
 
@@ -477,7 +477,7 @@ impl Run {
     }
 
     /// Either heal counter advanced past the run's.
-    fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
+    const fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
     }
 
@@ -1007,7 +1007,7 @@ impl ResizeLedger {
     }
 
     /// The newest row id (0 before the first): a subscriber's high-water mark.
-    pub(crate) fn high_row(&self) -> u64 {
+    pub(crate) const fn high_row(&self) -> u64 {
         self.high_row
     }
 
@@ -2677,6 +2677,7 @@ mod tests {
         );
         for &step in schedule {
             // The model bounds the displacement at CAP; a shrink past it is
+            // outside the box, so the schedule stops there.
             if step == Step::Shrink && state["disp"] >= CAP {
                 return None;
             }

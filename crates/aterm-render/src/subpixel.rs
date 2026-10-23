@@ -1,50 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Linux subpixel-RGB text, stage 1 of `docs/RFC-linux-subpixel-text.md`: per-channel
-//! (LCD) glyph coverage for the CPU compositor path only.
+//! Per-channel (LCD) subpixel glyph coverage for the Linux CPU compositor path.
 //!
-//! As with GNOME Terminal or foot under fontconfig `rgba=rgb`, each output pixel
-//! carries three coverage samples, one per subpixel, at 3× horizontal resolution. The
-//! outline is the [`crate::hinted`] seam's (LCD hint target, FreeType's
-//! `FT_LOAD_TARGET_LCD` twin), or the unhinted one when hinting is off or the LCD
-//! hinter declines the face; [`crate::raster`] fills it at 3×, then FreeType's default
-//! FIR5 LCD filter runs and the samples fold into 3 bytes per texel.
-//!
-//! Stage 1 is deliberately narrow: CPU compositor only (the GPU keeps its R8 grayscale
-//! atlas; stage 2 is the dual-source blend), primary-family text glyphs, opaque frames
-//! (translucency and wallpaper fall back to grayscale per frame), 1× cell scale
-//! (DECDWL/DECDHL rows stay grayscale). Everything outside the gate takes the grayscale
-//! path, so the shared [`crate::GlyphImage`] store, the goldens, and macOS/Windows are
-//! byte-identical with the flag on or off.
-//!
-//! Built for `cfg(all(unix, not(target_os = "macos")))`, and for macOS unit tests,
-//! which call the raster directly with the embedded font: macOS removed subpixel
-//! rendering OS-wide and Windows has no aterm LCD path yet.
+//! Fills outlines at 3× horizontal resolution, runs FreeType's default FIR5 LCD
+//! filter, and folds samples into 3 bytes per texel.
 
 use aterm_font::autohint::{HintingInstance, Target};
 
 use crate::hinted::PathPen;
 
-/// How per-channel coverage maps onto the panel's subpixel order. Off at renderer
-/// construction and set live from the `font_subpixel` config key: opt-in while stage 1
-/// is judged on real screens (the RFC's kill criterion).
+/// Panel subpixel channel order (`font_subpixel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SubpixelMode {
-    /// Grayscale coverage everywhere: the default.
+    /// Grayscale coverage everywhere.
     #[default]
     Off,
-    /// Horizontal RGB stripes (the overwhelmingly common LCD geometry, and
-    /// what fontconfig `rgba=rgb` means).
+    /// Horizontal RGB stripes.
     Rgb,
-    /// Horizontal BGR stripes: the same coverage with the R and B channels
-    /// swapped at raster time.
+    /// Horizontal BGR stripes (R and B channels swapped at raster time).
     Bgr,
 }
 
 impl SubpixelMode {
-    /// Parse one `font_subpixel` spelling (via `Renderer::set_font_subpixel`); anything
-    /// unrecognized is [`SubpixelMode::Off`], as `font_hinting` falls back to its default.
+    /// Parses a `font_subpixel` config value, defaulting to [`SubpixelMode::Off`].
     pub(crate) fn parse(s: &str) -> Self {
         match s.trim() {
             "rgb" | "on" | "1" | "true" => Self::Rgb,
@@ -53,14 +32,13 @@ impl SubpixelMode {
         }
     }
 
-    /// The mode a renderer is built with: always [`SubpixelMode::Off`] (the
-    /// config setter opts in; the portable test path keeps it off).
+    /// Initial renderer mode (`Off`).
     #[inline]
     pub(crate) const fn initial() -> Self {
         Self::Off
     }
 
-    /// The canonical spelling the getter round-trips.
+    /// Canonical string representation.
     #[inline]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -71,24 +49,16 @@ impl SubpixelMode {
     }
 }
 
-/// The hinter target for the subpixel raster: the autohinter's LCD target (FreeType's
-/// `FT_LOAD_TARGET_LCD`), which grid-fits vertically and leaves horizontal stem phases
-/// to the 3× resolution; snapping them, as grayscale `full` does, is what subpixel
-/// rendering exists to avoid. `font_hinting = "off"` disables hinting here too (the
-/// caller passes no instance).
+/// Returns the autohinter LCD target (`Target::Lcd`) for subpixel rasterization.
 #[inline]
 pub(crate) const fn lcd_hint_options() -> Target {
     Target::Lcd
 }
 
-/// FreeType's default FIR5 LCD filter (`FT_LCD_FILTER_DEFAULT`), fixed-point over 256:
-/// spreads each subpixel sample across its neighbours so chroma fringes stay below
-/// visibility while luminance keeps the 3× resolution. Sums to 256, so solid ink stays
-/// solid.
+/// FreeType's default FIR5 LCD filter (`FT_LCD_FILTER_DEFAULT`), fixed-point over 256.
 const FIR5: [u32; 5] = [8, 77, 86, 77, 8];
 
-/// Records an aterm-font outline (design units) into a [`PathPen`] in pixels, both
-/// y up, at `px / units_per_em`: the scale the grayscale unhinted raster draws with.
+/// Scales an `aterm-font` outline from design units into pixel coordinates in a [`PathPen`].
 struct Scaled<'a> {
     pen: &'a mut PathPen,
     scale: f32,
@@ -117,18 +87,10 @@ impl aterm_font::OutlineSink for Scaled<'_> {
     }
 }
 
-/// Rasterize glyph `gid` of the face at `px` as per-channel (subpixel) coverage:
-/// `(width, height, xmin, ymin, bytes)` with 3 bytes per texel in framebuffer channel
-/// order (byte 0 → the `0x00RR0000` channel, 1 → GG, 2 → BB; `bgr` swaps which subpixel
-/// feeds R and B). Placement follows [`crate::hinted::hinted_glyph_raster`] (blit anchor
-/// `(cell_x + xmin, baseline - height - ymin)`), except the ink box is widened by 1 px
-/// each side for the FIR5 spread, so `xmin` is one less than the grayscale raster's.
+/// Rasterizes glyph `gid` at `px` into `(width, height, xmin, ymin, bytes)` with 3 bytes per texel.
 ///
-/// `hint`, when present, must be an LCD-target instance from [`lcd_hint_options`].
-/// `None` draws the unhinted outline (with `font_hinting = "off"`, or for a face the
-/// LCD instance builder declines), read through aterm-font at the face's default
-/// instance like the grayscale unhinted raster. Returns `None` for no outline (space)
-/// or a parse/draw failure, and the caller falls back to the grayscale blit.
+/// Uses `hint` when provided, or the unhinted outline otherwise; returns `None` when the
+/// glyph has no outline or cannot be rasterized.
 pub(crate) fn subpixel_glyph_raster(
     bytes: &[u8],
     index: u32,
@@ -148,8 +110,6 @@ pub(crate) fn subpixel_glyph_raster(
         None => {
             let face = aterm_font::Face::parse(bytes, index).ok()?;
             let scale = px / f32::from(face.units_per_em());
-            // `None`: no outline (space and friends), or a glyph id past the face
-            // or malformed; nothing to blit either way.
             face.outline_glyph(
                 aterm_font::GlyphId(gid),
                 &mut Scaled {
@@ -160,29 +120,18 @@ pub(crate) fn subpixel_glyph_raster(
         }
     }
     if pen.is_blank() {
-        // No outline (space and friends): nothing to blit — the grayscale
-        // path draws nothing for these either, so `None` is exact.
         return None;
     }
-    // 1 px of filter padding each side: the FIR5 spread reaches 2 subpixels (2/3 px)
-    // past the ink box. The pad is also this path's [`crate::variation::RASTER_PAD`]
-    // (3 samples of slack at 3×), keeping the outline off the rasterizer's boundary;
-    // do not narrow it to the ink box.
     let x_min = pen.min_x.floor() - 1.0;
     let x_max = pen.max_x.ceil() + 1.0;
     let y_min = pen.min_y.floor();
     let y_max = pen.max_y.ceil();
     let (w, h) = ((x_max - x_min) as i32, (y_max - y_min) as i32);
-    // Same sanity caps as the hinted raster (the +2 pad keeps a 4096-wide
-    // grayscale-legal glyph legal here too).
     if w <= 2 || h <= 0 || w > 4098 || h > 4096 {
         return None;
     }
     let (w, h) = (w as usize, h as usize);
     let w_sub = w * 3;
-    // Fill at 3× horizontal resolution: the same outline, x scaled AFTER the
-    // translate so subpixel k of pixel column i is the sample at
-    // `x_min + (3i + k)/3` — 1 texel = 1 physical subpixel.
     let mut ras = crate::raster::Rasterizer::new(w_sub, h);
     pen.fill(&mut ras, x_min, y_max, 3.0);
     let mut cov = vec![0u8; w_sub * h];
@@ -191,9 +140,6 @@ pub(crate) fn subpixel_glyph_raster(
             *slot = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
         }
     });
-    // FIR5 along the subpixel axis (per row, zero beyond the edges — the 1 px
-    // pad guarantees no ink reaches them), then fold triplets into
-    // framebuffer-channel-ordered texels.
     let mut out = vec![0u8; w * h * 3];
     let mut filtered = vec![0u8; w_sub];
     for j in 0..h {
@@ -210,9 +156,6 @@ pub(crate) fn subpixel_glyph_raster(
         }
         let orow = &mut out[j * w * 3..(j + 1) * w * 3];
         for i in 0..w {
-            // Physical subpixel order left→middle→right; on an RGB panel that
-            // IS (R, G, B). BGR panels light the same stripes under swapped
-            // colours, so R and B trade coverage.
             let (l, m, r) = (filtered[3 * i], filtered[3 * i + 1], filtered[3 * i + 2]);
             let (cr, cg, cb) = if bgr { (r, m, l) } else { (l, m, r) };
             orow[3 * i] = cr;
@@ -275,9 +218,7 @@ mod tests {
         );
     }
 
-    /// Solid ink stays solid (FIR5 sums to 256): subpixel re-encodes edges and never
-    /// thins strokes. Judged at 32px, where a DejaVu '0' stem (~3 px) has texels whose
-    /// whole 5-subpixel window is ink; at body sizes every sample sees an edge.
+    /// Solid interior texels remain 255 across all three channels after FIR5 filtering.
     #[test]
     fn solid_interior_is_full_in_every_channel() {
         let hint = lcd_instance(32.0);
@@ -293,7 +234,7 @@ mod tests {
         );
     }
 
-    /// BGR is exactly the R/B swap of RGB — same coverage, re-ordered.
+    /// BGR swaps the R and B channels of the RGB coverage.
     #[test]
     fn bgr_swaps_r_and_b() {
         let hint = lcd_instance(12.0);
@@ -308,10 +249,7 @@ mod tests {
         }
     }
 
-    /// The unhinted LCD raster fills the grayscale unhinted raster's outline at the same
-    /// scale: the 3× fill and FIR5 both conserve ink, so a glyph's LCD ink (channel sum
-    /// over 3·255) is its grayscale ink to within edge rounding. A scale slip (design
-    /// units left unscaled, or `px` applied twice) misses by a factor.
+    /// Unhinted LCD total ink matches the grayscale unhinted outline's ink within rounding.
     #[test]
     fn unhinted_subpixel_ink_is_the_unhinted_outline() {
         for px in [12.0f32, 24.0] {

@@ -73,7 +73,7 @@ pub(crate) struct MenuRect {
 impl MenuRect {
     /// Whether frame cell `(row, col)` lies within the card (including its border).
     #[must_use]
-    pub(crate) fn contains(&self, row: usize, col: usize) -> bool {
+    pub(crate) const fn contains(&self, row: usize, col: usize) -> bool {
         row >= self.row && row < self.row + self.h && col >= self.col && col < self.col + self.w
     }
 }
@@ -136,7 +136,7 @@ fn entry_text(entry: &TabMenuEntry) -> &str {
 
 /// Whether `entry` is an enabled action row that can be highlighted or activated.
 #[must_use]
-pub(crate) fn is_selectable(entry: &TabMenuEntry) -> bool {
+pub(crate) const fn is_selectable(entry: &TabMenuEntry) -> bool {
     matches!(
         entry,
         TabMenuEntry::Action { enabled: true, .. }
@@ -187,7 +187,7 @@ pub(crate) fn place(
 
 /// Number of entry rows visible inside `rect` (height minus two border rows).
 #[must_use]
-pub(crate) fn visible_entries(rect: MenuRect) -> usize {
+pub(crate) const fn visible_entries(rect: MenuRect) -> usize {
     rect.h.saturating_sub(2)
 }
 
@@ -276,7 +276,7 @@ pub(crate) enum MenuNav {
 
 /// Map an engine key press to its [`MenuNav`] action.
 #[must_use]
-pub(crate) fn nav_for_key(key: &aterm_types::keyboard::Key) -> MenuNav {
+pub(crate) const fn nav_for_key(key: &aterm_types::keyboard::Key) -> MenuNav {
     use aterm_types::keyboard::{Key, NamedKey as Nk};
     if aterm_types::keyboard::is_modifier_or_lock_key(key) {
         return MenuNav::Inert;

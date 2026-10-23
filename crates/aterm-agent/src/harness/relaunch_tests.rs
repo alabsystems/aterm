@@ -3746,7 +3746,10 @@ fn a_model_move_reads_the_launchs_model_and_never_another_flags_value() {
 
 /// A MODEL SWITCH ONTO A MODEL BILLED TO USAGE CREDITS (the owner,
 /// 2026-10-19: *"for continuing on credits, that's an optional additional
-/// feature that's off by default.
+/// feature that's off by default. use subscriptions."*): the fallback and the
+/// return whose line asks for a model of a family the profile bills to
+/// credits are refused (`refused:model-on-credits`), by id or by Claude
+/// Code's alias.
 #[test]
 fn a_model_switch_onto_a_model_billed_to_usage_credits_is_refused() {
     let billed = ["fable".to_string()];

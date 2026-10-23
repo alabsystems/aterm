@@ -19,7 +19,6 @@ pub(crate) const IVAR_NAME: &CStr = c"_atermIvars";
 #[derive(Clone, Copy, Debug)]
 pub struct MainThread {
     /// `!Send`/`!Sync`: a witness is only true on the thread that minted it.
-    /// `!Send`/`!Sync`: a witness is only true on the thread that minted it.
     _not_send: std::marker::PhantomData<*const u8>,
 }
 
@@ -182,6 +181,33 @@ impl ClassBuilder {
     }
 
     /// Add an ivar big enough for `T`, named `_atermIvars`.
+    ///
+    /// `T` may not be aligned above 16 (`S4`): `class_createInstance` allocates
+    /// with `malloc`, which guarantees only 16-byte alignment, and
+    /// `class_addIvar` aligns the ivar's offset but not the base (a 32-aligned
+    /// slot landed misaligned in 19 of 4,096 `+alloc`s). A misaligned slot
+    /// makes every `&T` undefined behaviour, so an over-aligned `T` is refused
+    /// at compile time:
+    ///
+    /// ```compile_fail
+    /// #[repr(align(32))]
+    /// struct WideIvars(u64);
+    /// aterm_objc::declare_class! {
+    ///     struct DocOverAligned: NSObject {
+    ///         const NAME: &str = "ATermDocOverAligned";
+    ///         type Ivars = WideIvars;
+    ///
+    ///         @sel(ping)
+    ///         fn ping(&self) {}
+    ///     }
+    /// }
+    /// // SAFETY: never reached — the `const` assertion above rejects the
+    /// // over-aligned `Ivars` before this line can run.
+    /// let _ = DocOverAligned::alloc_init(
+    ///     unsafe { aterm_objc::MainThread::new_unchecked() },
+    ///     WideIvars(1),
+    /// );
+    /// ```
     pub fn add_rust_ivar<T>(&mut self) {
         const {
             assert!(

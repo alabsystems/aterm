@@ -288,8 +288,7 @@ fn bin_plan(src_bin: &Path) -> io::Result<BinPlan> {
 
 /// Lay a view's `bin/` at `dst_bin` (created here, empty) from the build's `bin/`: one clone
 /// per [`BinPlan`] entry, so each stock name is byte-identical to its Trust tool and a
-/// stock-name copy the bundle shipped is never cloned.
-///
+/// stock-name copy the bundle shipped is never cloned. Returns the plan it laid.
 /// # Errors
 /// The build's `bin/` cannot be listed, or a clone cannot be made (the store on another
 /// volume: it refuses rather than byte-copy the toolchain).
@@ -808,7 +807,7 @@ fn take_down(view: &Path, at: &Path, stem: &str, pid: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Lay the view for a dev-linked `checkout` (see the module doc): the mirrored directories as
+/// Lay the view for a dev-linked `checkout`: the mirrored directories as
 /// links to the checkout's, and `bin/` staged as one exec stub per plan entry and swapped in
 /// when it differs.
 #[cfg(unix)]
@@ -1338,6 +1337,7 @@ enum Heal {
 /// ([`stale_against_store`]).
 fn unattended_heal(layout: &Layout, name: &str, entry: &Path, target: &Path) -> Heal {
     // A target that is not UTF-8 could not be recorded as it is (`status.toml` is text), and
+    // a way back recorded wrong is a hold that never matches: such a link is left.
     if name != DEFAULT_SEAM || target.to_str().is_none() || !live_build_tree(target) {
         return Heal::No;
     }
@@ -2252,6 +2252,9 @@ fn reassert_with(
         match attach_reporting(layout, rustup_home, &name, refresh, running, repair) {
             Ok((a, left)) => {
                 // Success clears the last recorded refusal, and so does a view left behind:
+                // every recorded refusal is decided before the view is touched, so this pass
+                // re-asked it, and a failed re-lay is `Io`, which is never recorded. An entry
+                // left behind is the exception: it is still the link the last pass refused.
                 if !matches!(a, Attached::LeftEntry { .. }) {
                     let _ = clear_refusal(layout, &name);
                 }
@@ -2302,6 +2305,7 @@ fn reassert_with(
             }
             Err(refusal) => {
                 // Recorded, not only returned: the GUI discards the pass's stdout. `Io` is a
+                // transient; recording it would make one EIO a standing fault in Settings.
                 if !matches!(refusal, Refusal::Io(_)) {
                     let _ = record_refusal(layout, &name, &refusal.to_string());
                     crate::quiet::clear_view_left(layout, &name);

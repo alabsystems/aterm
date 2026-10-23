@@ -48,7 +48,8 @@ struct Rig {
 impl Rig {
     fn new(raw: bool) -> Self {
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: `libc::termios` is plain integer fields and a byte array; all zeros is a valid.
+        // SAFETY: `libc::termios` is plain integer fields and a byte array; all zeros is a valid
+        // value, overwritten by `tcgetattr` below.
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: `slave` is this test's live pty slave; `t` is a valid out-param.
         assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0);

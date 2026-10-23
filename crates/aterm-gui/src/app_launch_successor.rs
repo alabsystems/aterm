@@ -19,7 +19,7 @@ pub(crate) struct LaunchedSuccessor {
 
 impl LaunchedSuccessor {
     /// The launched instance's pid, as LaunchServices reported it: positive and never this process's own (`admit_launched_pid`, the only non-test constructor, refuses both).
-    pub(crate) fn pid(self) -> i32 {
+    pub(crate) const fn pid(self) -> i32 {
         self.pid
     }
 }
@@ -556,7 +556,7 @@ fn begin_launch_validated(
     let key_ids = key_objs.iter().map(Obj::id).collect::<Vec<Id>>();
     let value_ids = value_objs.iter().map(Obj::id).collect::<Vec<Id>>();
 
-    // SAFETY: standard AppKit construction, none of it main-thread-only (module docs).
+    // SAFETY: standard AppKit construction, none of it main-thread-only.
     autoreleasepool(|_| unsafe {
         let array_with: unsafe extern "C-unwind" fn(Id, Sel, *const Id, usize) -> Id =
             aterm_objc::checked_msg();
@@ -625,7 +625,7 @@ fn begin_launch_validated(
 /// (`NSRunningApplication`'s "unknown") is no pid, and this process's own pid means
 /// LaunchServices substituted the running instance.
 #[cfg(target_os = "macos")]
-fn admit_launched_pid(pid: i32, own_pid: i32) -> Result<LaunchedSuccessor, LaunchError> {
+const fn admit_launched_pid(pid: i32, own_pid: i32) -> Result<LaunchedSuccessor, LaunchError> {
     if pid <= 0 {
         return Err(LaunchError::PidUnknown(pid));
     }

@@ -291,7 +291,7 @@ pub(crate) fn after_signal(sink: &SinkWriter, sig: libc::c_int) {
 
 /// Whether `sig` is a restart signal.
 #[cfg(unix)]
-pub(crate) fn is_restart_signal(sig: libc::c_int) -> bool {
+pub(crate) const fn is_restart_signal(sig: libc::c_int) -> bool {
     matches!(
         sig,
         libc::SIGTERM | libc::SIGKILL | libc::SIGHUP | libc::SIGQUIT
@@ -527,12 +527,12 @@ pub(crate) struct Restart {
 
 impl Restart {
     /// Whether aterm has dropped the queue of a stall published with this record.
-    pub(crate) fn dropped(&self, discards: u64) -> bool {
+    pub(crate) const fn dropped(&self, discards: u64) -> bool {
         self.leader.is_some() && discards != self.discards
     }
 
     /// Return whether a drop in the stall window was caused by a session restart.
-    pub(crate) fn restarted(&self, restarts: u64) -> bool {
+    pub(crate) const fn restarted(&self, restarts: u64) -> bool {
         self.leader.is_some() && restarts != self.restarts
     }
 }
@@ -1128,6 +1128,8 @@ impl crate::App {
                 return Vec::new();
             }
             Some(id) => {
+                // The hook first, then the take: a key landing after the
+                // rearm marks it again and wakes again, and one before it
                 // marked what this takes.
                 if let Some(session) = self.pool.get(id) {
                     session.ctx.sink.rearm_input_hook();

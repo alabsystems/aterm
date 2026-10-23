@@ -42,6 +42,7 @@ impl Probe for SystemProbe {
     }
 
     fn connect(&self, addr: SocketAddr, within: Duration) -> io::Result<TcpStream> {
+        // Not std's own: a refusal on Windows takes about 2 s there, longer than
         // a share of the budget, and would read as a timeout (aterm_http::connect).
         aterm_http::connect::connect_timeout(&addr, within)
     }

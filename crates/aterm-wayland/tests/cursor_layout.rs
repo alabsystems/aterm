@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-wayland's `struct wl_cursor` and `struct wl_cursor_image` against
-//! `wayland-cursor.h`, on the architecture the test runs on: a probe printing
-//! their sizes, alignments and field offsets, compiled with that
-//! architecture's C compiler (`CC_<target>`, else `cc`) and run in the Linux
-//! lane. Negative control: the probe must say it was built for this
-//! architecture. Without a compiler or the header the test says SKIP.
+//! `wl_cursor` and `wl_cursor_image` layout checks against `wayland-cursor.h`.
 
 #![cfg(target_os = "linux")]
 

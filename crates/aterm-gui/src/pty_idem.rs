@@ -22,7 +22,7 @@ pub(crate) enum Realm {
 
 impl Realm {
     /// The namespace a connection's marks live in.
-    pub(crate) fn of(scope: crate::control::Scope) -> Self {
+    pub(crate) const fn of(scope: crate::control::Scope) -> Self {
         match scope {
             #[cfg(any(unix, test))]
             crate::control::Scope::Bridge => Self::Bridge,
@@ -173,6 +173,11 @@ impl PtyIdem {
             return Claimed::Answer(answer);
         }
         if let Some(mark) = own {
+            // One in-flight attempt per producer. A displaced `Running` mark could
+            // not settle its own outcome (`settle` writes only while
+            // `high_water == key.seq`), and a later `release` of the displacing
+            // claim would reinstate a `Running` tip no live claim stands behind:
+            // answered `ERR busy` forever and never evicted. The refusal names the
             // running sequence and consumes nothing, so the retry is a first attempt.
             if mark.tip == Tip::Running {
                 return Claimed::Answer(format!("ERR busy idem={}\n", mark.high_water));
@@ -279,6 +284,8 @@ impl PtyIdem {
 /// producer has an attempt in flight).
 fn consumed_answer(mark: Mark, key: Key, dup: &str) -> Option<String> {
     if key.seq < mark.high_water {
+        // The producer has moved past this sequence, so it was consumed. Only the
+        // tip's outcome is remembered: a driver that advanced is not the one asking
         // to resolve an old in-doubt.
         return Some(dup.to_string());
     }
@@ -304,6 +311,7 @@ impl Drop for Claim<'_> {
 /// Whether `reply` is a refusal that cannot have followed a write. Two prefixes,
 /// deliberately: widening it is how a silent duplicate gets in.
 fn refused_before_any_write(reply: &str) -> bool {
+    // `ERR busy` (the drive lease, or a sink that accepted zero bytes) and
     // `ERR denied` (authority) are decided before any byte moves; see the module doc.
     reply.starts_with("ERR busy") || reply.starts_with("ERR denied")
 }

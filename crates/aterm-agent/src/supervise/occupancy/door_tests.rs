@@ -6,10 +6,8 @@
 use super::*;
 use crate::supervise::approvals::{Outcome, Row};
 
-/// The session every row is of.
 const SID: &str = "@s-1";
 
-/// A row of `sid`'s at `ts`.
 fn row(sid: &str, ts: i64, rule_id: &str, outcome: Outcome, reason: &str) -> String {
     Row {
         rule_id,
@@ -54,8 +52,6 @@ fn the_status_read_judges_hands_hold_and_unread_input() {
     assert_eq!(StatusSeen::of("ERR no such session\n"), None);
 }
 
-/// A word an agent prints is never a field the door reads: a plant in a later line of the
-/// reply, or as a field's value, moves nothing.
 #[test]
 fn a_planted_word_moves_no_field() {
     let planted = "OK seq=4 hold=0 human_ms=-\n\
@@ -140,8 +136,6 @@ fn the_rows_carry_the_episode_and_a_skip_its_why() {
     );
 }
 
-/// A successor reads each of the door's rows of its own session, the episode as the row names
-/// it; the hold clock's own rows, another session's and a row with no episode are passed over.
 #[test]
 fn a_successor_seeds_from_the_doors_rows_of_its_session() {
     let hold = FactKind::Hold.rule();

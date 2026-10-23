@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Cursor ink integrity: cursor rendering writes only within the cursor rect, and every
-// pixel outside it is byte-identical to the no-cursor frame. Swept over every column and
-// steady style on a row mixing a ligature, a wide lead and plain cells; the pure clip
-// seams (`clip_span`, `cursor_cutout_cols`, `glyph_quad`'s x-clip) are checked
-// exhaustively on small lattices. aterm-gpu's `ligature_parity.rs` binds the GPU frames
-// to these.
 
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{
@@ -16,8 +9,6 @@ use aterm_render::{
 
 const CURSOR: u32 = 0x0050_FA7B; // Theme::default().cursor
 
-// The ligature test font (same as tests/ligatures.rs): $ATERM_LIGATURE_TEST_FONT
-// if set and readable, else the committed JetBrains Mono fixture (compiled in).
 fn ligature_test_font() -> Vec<u8> {
     if let Ok(path) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         && let Ok(bytes) = std::fs::read(&path)
@@ -39,19 +30,14 @@ fn renderer() -> Renderer {
 
 const ROWS: usize = 1;
 const COLS: usize = 12;
-// One row exercising every cut-out shape: a ligature run ('=>' at cols 1-2), a
-// plain cell, a wide CJK lead + continuation (cols 5-6) and trailing blanks.
 const TEXT: &[u8] = "a=>b \u{65E5}x".as_bytes(); // 日 = U+65E5 (wide)
 
-/// Render TEXT with a steady-block cursor at `col` (callers reshape it through
-/// the renderer override), or hidden entirely when `col` is None.
 fn frame_with_cursor(r: &mut Renderer, col: Option<usize>) -> Frame {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"\x1b[2 q"); // steady block (override below can reshape)
     term.process(TEXT);
     match col {
         Some(c) => {
-            // CUP is 1-based; land the cursor on viewport col `c` of row 0.
             term.process(format!("\x1b[1;{}H", c + 1).as_bytes());
         }
         None => {
@@ -61,9 +47,6 @@ fn frame_with_cursor(r: &mut Renderer, col: Option<usize>) -> Frame {
     r.render_input(&term.cell_frame(ROWS, COLS))
 }
 
-/// The pixel rects the cursor paints for `style` at `col`, from the renderer's own
-/// geometry: `for_each_cursor_rect` over the cursor width (block-widened on a wide lead).
-/// `wide_lead` mirrors `draw_cursor`'s probe.
 fn cursor_rect_union(
     style: CursorStyle,
     col: usize,
@@ -84,13 +67,6 @@ fn in_rects(rects: &[[usize; 4]], x: usize, y: usize) -> bool {
         .any(|&[rx, ry, rw, rh]| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
 }
 
-/// Partition / no-bleed, swept: for every cursor column and steady style, each pixel
-/// outside the cursor rect matches the cursor-hidden frame. Non-vacuity: some cursor
-/// changes a pixel inside its rect.
-///
-/// `Bolt` is the one style that emits a strip per pixel row with a varying x and width, and
-/// it is set only through `set_cursor_style_override`, never DECSCUSR. `CursorStyle` is
-/// `#[non_exhaustive]`, so a new steady shape must be added to this list by hand.
 #[test]
 fn cursor_touches_only_its_rect_all_columns_and_styles() {
     let mut r = renderer();
@@ -113,7 +89,6 @@ fn cursor_touches_only_its_rect_all_columns_and_styles() {
                 (hidden.width, hidden.height),
                 "cursor must not change frame dimensions"
             );
-            // The wide-lead probe mirrors draw_cursor: the next cell is wide.
             let mut term = Terminal::new(ROWS as u16, COLS as u16);
             term.process(TEXT);
             let input = term.cell_frame(ROWS, COLS);
@@ -144,8 +119,6 @@ fn cursor_touches_only_its_rect_all_columns_and_styles() {
     );
 }
 
-/// A block cursor on a ligature lead cell recolours the covering glyph's slice over that
-/// cell and leaves the '>' cell untouched.
 #[test]
 fn block_on_ligature_lead_recolors_covering_slice() {
     let mut r = renderer();
@@ -169,7 +142,6 @@ fn block_on_ligature_lead_recolors_covering_slice() {
         "the covering arrow glyph's slice over the cursor cell must be recoloured \
          (cut out) — pre-W4 the empty placeholder produced no cut-out at all"
     );
-    // The rest of the arrow (the '>' cell) survives untouched.
     assert_eq!(
         band(&f, 2),
         band(&hidden, 2),
@@ -177,8 +149,6 @@ fn block_on_ligature_lead_recolors_covering_slice() {
     );
 }
 
-/// A block cursor on a wide lead fills both cells of the glyph and leaves its neighbours
-/// untouched.
 #[test]
 fn block_on_wide_lead_inverts_both_cells() {
     let mut r = renderer();
@@ -192,7 +162,6 @@ fn block_on_wide_lead_inverts_both_cells() {
         }
         out
     };
-    // Both cells of the wide glyph carry the cursor fill (the widened rect).
     assert!(
         band(&f, 5).contains(&CURSOR),
         "the wide LEAD cell must show the block cursor fill"
@@ -202,17 +171,10 @@ fn block_on_wide_lead_inverts_both_cells() {
         "the wide CONTINUATION cell must show the block cursor fill — the \
          single-cell fill left the right half of the ideograph erased pre-W4"
     );
-    // No erasure/bleed outside the 2-cell rect: neighbours byte-identical.
     assert_eq!(band(&f, 4), band(&hidden, 4), "left neighbour untouched");
     assert_eq!(band(&f, 7), band(&hidden, 7), "right neighbour untouched");
 }
 
-// Pure-seam lattice proofs (no font needed).
-
-/// Exhaustive lattice check of [`clip_span`]: the three sub-window spans tile the glyph
-/// extent exactly and the middle span never leaves the window. Includes a non-vacuity
-/// control (some case has all three slices) and a negative control (an unclipped middle
-/// bleeds).
 #[test]
 fn clip_span_slices_tile_exactly() {
     const LO: i64 = -1_000; // widened sentinels (the blit callers use i32::MIN/MAX)
@@ -238,11 +200,9 @@ fn clip_span_slices_tile_exactly() {
                              window=[{c0},{c1})) — slices must tile the extent exactly"
                         );
                     }
-                    // Every span stays inside the glyph extent…
                     for s in [left, mid, right].into_iter().flatten() {
                         assert!(s.0 >= gx0 && s.1 <= gx0 + len, "span exits the glyph");
                     }
-                    // …and the middle (the cut-out slice) never exits the window.
                     if let Some((mlo, mhi)) = mid {
                         assert!(
                             mlo >= c0.min(c1) && mhi <= c1.max(c0),
@@ -252,8 +212,6 @@ fn clip_span_slices_tile_exactly() {
                     if left.is_some() && mid.is_some() && right.is_some() {
                         three_way += 1;
                     }
-                    // Negative control: an unclipped cut-out (the whole glyph extent)
-                    // violates no-bleed somewhere on this lattice.
                     let unclipped = (len > 0).then_some((gx0, gx0 + len));
                     if let Some((ulo, uhi)) = unclipped
                         && mid != unclipped
@@ -276,15 +234,10 @@ fn clip_span_slices_tile_exactly() {
     );
 }
 
-/// Exhaustive lattice check that [`glyph_quad`]'s x-clip slices a quad with the matching
-/// UV shift: emulated NEAREST sampling of the three slices covers exactly the unclipped
-/// quad's pixels, disjointly, at identical texels. `xs = 2` covers the DECDWL path.
 #[test]
 fn glyph_quad_x_slices_tile_and_preserve_texels() {
     let (aw, ah) = (64.0f32, 64.0f32);
     let (ax, ay, gh, ymin, baseline) = (7u32, 3u32, 4u32, 0i32, 12i32);
-    // Emulated fragment NEAREST sample: the atlas texel column addressed at
-    // device pixel `x` (integer-aligned rects; fragment centre x+0.5).
     let texel_at = |rect: [f32; 4], uv: [f32; 4], x: i32| -> i32 {
         let fx = (x as f32 + 0.5 - rect[0]) / rect[2];
         ((uv[0] + fx * uv[2]) * aw).floor() as i32
@@ -330,8 +283,6 @@ fn glyph_quad_x_slices_tile_and_preserve_texels() {
                                     );
                                 }
                             }
-                            // Tiling: the slices cover exactly the unclipped quad's
-                            // pixels, and each samples the identical texel.
                             for x in full.clone() {
                                 let want = texel_at(rect0, uv0, x);
                                 match seen.remove(&x) {
@@ -365,9 +316,6 @@ fn glyph_quad_x_slices_tile_and_preserve_texels() {
     );
 }
 
-/// Exhaustive over every 9-column plan: [`cursor_cutout_cols`] returns a range containing
-/// `cc` that is the maximal all-`Ligated` run when `plan[cc]` is `Ligated`, else `{cc}`.
-/// Both renderers take their cut-out columns from this function.
 #[test]
 fn cursor_cutout_cols_exhaustive() {
     const N: usize = 9;
@@ -393,7 +341,6 @@ fn cursor_cutout_cols_exhaustive() {
                 assert_eq!((lo, hi), (cc, cc), "non-ligated cursor cuts only itself");
             }
         }
-        // Off-plan cursor columns (defensive callers): identity range.
         assert_eq!(cursor_cutout_cols(&plan, N + 3), (N + 3, N + 3));
     }
 }

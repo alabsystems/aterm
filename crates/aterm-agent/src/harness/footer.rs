@@ -1158,6 +1158,7 @@ fn rows_back(
             }
         }
         cut = if from > MAX_LINE_BYTES {
+            // The end of a row longer than any this reads, whose start is in
             // an older window: met now, in its place, and once.
             if !inside {
                 inside = true;
@@ -1902,7 +1903,8 @@ enum EffortSaid {
     /// session, and the level that stays.
     Top { on: bool, stays: Said },
     /// The key refused (`<Key> needs dynamic workflows enabled …`, `<Key>
-    /// isn't available on <model>.
+    /// isn't available on <model>. …`): it answers its command and decides
+    /// neither the effort nor the key.
     Refused,
 }
 
@@ -2162,6 +2164,8 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
                     && !answered.effort
                     && !facts.effort.decided()
                 {
+                    // No effort result under it: an answer this build cannot
+                    // read. A refused key under it answered it and moved
                     // nothing, so the older effort stands.
                     facts.decide_effort(Said::Unread);
                 }
@@ -3819,6 +3823,7 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
             Some((model.as_ref(), None, None)),
         ];
         for (model, path, branch) in steps.into_iter().flatten() {
+            // Where the account does not fit beside the whole path, the
             // tokens come back without it. With no account this pushes nothing.
             if account.is_some() {
                 push(rung(true, model, path, branch));

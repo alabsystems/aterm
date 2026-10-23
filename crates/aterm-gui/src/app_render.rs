@@ -181,6 +181,7 @@ pub(crate) fn sync_cursor_effect_coordinate_space(
     terminal_id: u64,
     alternate_screen: bool,
 ) -> bool {
+    // The pipeline's owner fence retires its engines' marks, forgets the scroll
     // baseline and re-baselines the pet's probes on the new stream.
     if !window
         .fx
@@ -239,7 +240,7 @@ pub(crate) fn sync_cursor_effect_scroll(
 #[path = "app_render_cursor_scroll_signal_tests.rs"]
 mod cursor_scroll_signal_tests;
 
-fn causal_render_cost_ns(compose_ns: u64, raster_submit_ns: u64) -> u64 {
+const fn causal_render_cost_ns(compose_ns: u64, raster_submit_ns: u64) -> u64 {
     compose_ns.saturating_add(raster_submit_ns)
 }
 
@@ -317,7 +318,7 @@ pub(crate) fn cpu_present_needs_full_copy(
 }
 
 #[inline]
-pub(crate) fn present_band_bg(default_bg: u32, theme_bg: u32) -> u32 {
+pub(crate) const fn present_band_bg(default_bg: u32, theme_bg: u32) -> u32 {
     if default_bg == aterm_core::render::COLOR_UNSET {
         theme_bg
     } else {
@@ -548,7 +549,7 @@ pub(crate) fn take_due_trail_tick(
     true
 }
 
-fn rebase_pending_trail_tick_after_present(
+const fn rebase_pending_trail_tick_after_present(
     next: &mut Option<Instant>,
     anchor: &mut Option<Instant>,
     frame_started: Instant,
@@ -990,7 +991,7 @@ mod native_damage_tests;
 
 pub(crate) const BLINK_RECENT_MAX: Duration = Duration::from_secs(1);
 
-pub(crate) fn row_probe_trust(
+pub(crate) const fn row_probe_trust(
     is_alt: bool,
     blink_recent: bool,
 ) -> aterm_effects::cursor_glow::ProbeTrust {
@@ -1003,7 +1004,7 @@ pub(crate) fn row_probe_trust(
 
 /// Whether ordinary forward-typing momentum may own the cursor cat.
 #[inline]
-pub(crate) fn ordinary_kitty_cursor_enabled(
+pub(crate) const fn ordinary_kitty_cursor_enabled(
     cursor_trail_enabled: bool,
     style: crate::cursor_glow::GlowStyle,
 ) -> bool {
@@ -1460,7 +1461,7 @@ pub(crate) enum CompanionInk {
 }
 
 impl CompanionInk {
-    fn canvas(self) -> aterm_effects::pipeline::CanvasInk {
+    const fn canvas(self) -> aterm_effects::pipeline::CanvasInk {
         match self {
             Self::Single => aterm_effects::pipeline::CanvasInk::Window,
             Self::Composed => aterm_effects::pipeline::CanvasInk::Pane,
@@ -1871,7 +1872,7 @@ pub(crate) fn project_asymmetric_pad_layout_key(key: &RepaintKey) -> usize {
 
 /// Async fallback-face convergence, pure for unit tests.
 #[must_use]
-pub(crate) fn fallback_convergence_action(pending: bool, was: bool) -> (bool, bool) {
+pub(crate) const fn fallback_convergence_action(pending: bool, was: bool) -> (bool, bool) {
     let converging = pending || was;
     (converging, converging && !pending)
 }
@@ -2010,6 +2011,9 @@ fn update_sync_frame_holds(
     let mut any_hold = false;
     let mut earliest_deadline: Option<Instant> = None;
     for (observation_index, &observation) in observations.iter().enumerate() {
+        // The same terminal can be visible through more than one view. Its
+        // protocol edge is still one event; folding it twice would turn the
+        // close+rearm Allow decision into an immediate Hold just like a second
         // extraction recheck. The first occurrence owns the state transition.
         if observations[..observation_index]
             .iter()
@@ -2038,11 +2042,17 @@ fn recheck_sync_frame_hold(
     now: Instant,
     timeout: Duration,
 ) -> bool {
+    // Re-applying an identical observation is not idempotent at the one-frame
+    // close+reopen boundary: preflight deliberately allows that completed
+    // bracket while arming the next episode, and a second transition would
+    // immediately hold the newly armed episode instead. Only a terminal state
     // that actually changed in the lock gap needs another transition.
     if preflight == current {
         return false;
     }
     if preflight.terminal_id != current.terminal_id {
+        // The pane changed terminal identity after the plan snapshot: do not
+        // authorize extraction against a different owner. The next redraw
         // rebuilds the visible set.
         return true;
     }
@@ -2483,7 +2493,7 @@ mod scaled_border_px_tests {
     }
 }
 
-fn blend_rgb(bg: u32, fg: u32, a: u32) -> u32 {
+const fn blend_rgb(bg: u32, fg: u32, a: u32) -> u32 {
     let inv = 255 - a;
     let r = (((bg >> 16) & 0xff) * inv + ((fg >> 16) & 0xff) * a) / 255;
     let g = (((bg >> 8) & 0xff) * inv + ((fg >> 8) & 0xff) * a) / 255;
@@ -3749,6 +3759,7 @@ pub(crate) fn update_rain_hidden_band(
     }
     let rows = u16::try_from(rows).unwrap_or(u16::MAX);
     for r in dmg.damaged_rows(rows) {
+        // Promote to most-recent-first; ascending iteration leaves the frame's
         // bottom-most damaged rows at the ring's head (a bottom-region bias).
         if let Some(p) = band.iter().position(|&x| x == r) {
             band.remove(p);
@@ -3820,7 +3831,7 @@ pub(crate) fn pet_frame_geom(
 }
 
 /// The window's presentability as the pet owner reads it.
-pub(crate) fn pet_visibility(focused: bool) -> aterm_effects::host::Visibility {
+pub(crate) const fn pet_visibility(focused: bool) -> aterm_effects::host::Visibility {
     if focused {
         aterm_effects::host::Visibility::Focused
     } else {
@@ -3878,7 +3889,7 @@ fn mark_end_cheered(
     }
 }
 
-fn sing_riff_event(bar: u64, gain: f32, sig: u32) -> aterm_effects::trail_sound::SoundEvent {
+const fn sing_riff_event(bar: u64, gain: f32, sig: u32) -> aterm_effects::trail_sound::SoundEvent {
     aterm_effects::trail_sound::SoundEvent {
         style: crate::cursor_glow::GlowStyle::RainbowKitty,
         voice: aterm_effects::trail_sound::SoundVoice::Style,
@@ -3906,7 +3917,7 @@ fn sing_outro_event(gain: f32, sig: u32) -> aterm_effects::trail_sound::SoundEve
 
 /// Whether the Sparkle Words engine may present (spend births rather than bank them).
 #[must_use]
-pub(crate) fn sparkle_words_presentable(word_focus: bool, suspended: bool) -> bool {
+pub(crate) const fn sparkle_words_presentable(word_focus: bool, suspended: bool) -> bool {
     word_focus && !suspended
 }
 
@@ -3940,7 +3951,7 @@ pub(crate) const fn output_streak_inert(
 }
 
 impl ComposedOutputStreakConfig {
-    fn inert(self) -> bool {
+    const fn inert(self) -> bool {
         output_streak_inert(self.enabled, self.animate, self.intensity, false)
     }
 }
@@ -4126,7 +4137,7 @@ pub(crate) enum ActivePaneEdge {
     Bottom,
 }
 
-fn active_pane_edge_ink(theme: Theme) -> [u8; 3] {
+const fn active_pane_edge_ink(theme: Theme) -> [u8; 3] {
     [
         ((theme.fg >> 16) & 0xff) as u8,
         ((theme.fg >> 8) & 0xff) as u8,
@@ -4333,6 +4344,7 @@ fn seed_seam_cells<T>(
         };
         let mut c = 0usize;
         while c < cols {
+            // `.max(c + 1)` cannot be reached by a real `PaneRect` (its width is
             // documented `>= 1`) and is here so a degenerate one cannot spin.
             if let Some(tile) = tiles.clone().find(|tile| {
                 on_this_row(tile)
@@ -4374,6 +4386,8 @@ fn seam_declared_shortfall(
     let top = usize::from(rect.row_off);
     let left = usize::from(rect.col_off);
     for dr in top..top.saturating_add(rows) {
+        // A retained row already carries this seam from the frame that wrote it:
+        // the retention gate pins the rectangle, the snapshot's dimensions and
         // the theme's seam cell.
         if row_retained(keep, dr) {
             continue;
@@ -4583,6 +4597,7 @@ fn plan_composed_retention(
     }
     let retained = keep.iter().filter(|k| **k).count();
     if retained == 0 {
+        // The whole-composite rebuild, as the empty slice every other caller
         // passes: one length compare per row over the plain fill and blit.
         keep.clear();
     }
@@ -4971,11 +4986,11 @@ mod composed_cursor_effect_projection_tests;
 #[path = "app_render_composed_cursor_effect_advance_tests.rs"]
 mod composed_cursor_effect_advance_tests;
 
-fn take_focused_pane_scratch(ws: &mut WindowState) {
+const fn take_focused_pane_scratch(ws: &mut WindowState) {
     std::mem::swap(&mut ws.pane_scratch, &mut ws.composed_focus_scratch);
 }
 
-fn return_focused_pane_scratch(ws: &mut WindowState, host_wrote: bool) {
+const fn return_focused_pane_scratch(ws: &mut WindowState, host_wrote: bool) {
     if host_wrote {
         ws.pane_scratch.snapshot_seq = ws.pane_scratch.snapshot_seq.wrapping_add(1);
     }
@@ -5214,6 +5229,7 @@ pub(crate) fn blit_pane_into_retained(
                 }
             }
             if pane_line_size.is_some() {
+                // Panes are not guaranteed to blit left-to-right, and
                 // `line_size_run_at` binary-searches by `start_col`.
                 spans.sort_unstable_by_key(|s| s.start_col);
             }
@@ -6292,7 +6308,7 @@ pub(crate) enum ComposedCursorFxClock {
 }
 
 impl ComposedCursorFxClock {
-    fn observed_at(self) -> Instant {
+    const fn observed_at(self) -> Instant {
         match self {
             Self::Advance(now) | Self::Retain { observed_at: now } => now,
         }
@@ -6311,7 +6327,7 @@ struct ComposedWitnessStamp {
 }
 
 impl ComposedWitnessStamp {
-    fn read(terminal: &Terminal) -> Self {
+    const fn read(terminal: &Terminal) -> Self {
         Self {
             terminal_id: terminal.render_identity(),
             content_seq: terminal.content_seq(),
@@ -6511,7 +6527,7 @@ pub(crate) struct SinglePaneRowProbeCache {
 }
 
 impl SinglePaneRowProbeCache {
-    fn invalidate(&mut self) {
+    const fn invalidate(&mut self) {
         self.key = None;
     }
 
@@ -6905,6 +6921,12 @@ impl App {
         let pane_cell_px = self.spawn_cell_px(wid);
         let mut targets: Vec<(usize, u64, u16, u16)> = Vec::new();
         for (ti, tab) in ws.tab_set.tabs().iter().enumerate() {
+            // Under `active_only`, skip laying out background tabs the second loop
+            // would discard anyway (`visible_plan` allocates per leaf and divider,
+            // and `redraw_window` makes this call every frame of a live drag). The
+            // predicate is the second loop's (`pool.views(id) > 1`): a background
+            // tab is laid out iff some leaf holds a shared session. The per-pane
+            // `continue` below stays, since such a tab can also hold non-shared
             // siblings.
             if active_only
                 && ti != active
@@ -7248,6 +7270,11 @@ impl App {
                     )
                 };
                 if !pulse_holds {
+                    // The PTY learns it too, with the same rows/cols and new pixels,
+                    // so `TIOCGWINSZ` is right for the boot session (spawned at 0x0
+                    // before the backend build joined) and after a font zoom or DPI
+                    // change that keeps rows/cols (where `apply_term_resize` returns
+                    // early). Memoized on `cell_px_reported`, so it cannot churn
                     // SIGWINCH.
                     aterm_pty::resize_with_cell_px(s.master, grid.0, grid.1, Some(px));
                 }
@@ -7585,6 +7612,9 @@ impl App {
         let fi = frame_interval.as_nanos() as f64;
         let before = self.perf_reduced;
         if self.perf_reduced {
+            // Re-engage only after a sustained run comfortably under budget and
+            // once the anti-flap dwell has elapsed: the post-shed cost excludes the
+            // effects' own cost, so the clear threshold is nearly always met, and
             // without the dwell that asymmetry oscillates (see PERF_SHED_DWELL_MIN).
             if ema < PERF_CLEAR_FACTOR * fi {
                 self.perf_run += 1;
@@ -7598,6 +7628,9 @@ impl App {
                 self.flip_shed_latch(now, false);
             }
         } else {
+            // Shed only after a sustained run over budget, judged on the raw
+            // sample: one huge spike (a theme switch) keeps the decaying EMA over
+            // threshold for a few frames and must not shed. The EMA still drives
             // the clear direction.
             if sample > PERF_SHED_FACTOR * fi {
                 self.perf_run += 1;
@@ -8294,6 +8327,10 @@ impl App {
 
     fn retire_composed_cursor_effects_for_history(&mut self, wid: WindowId) {
         if let Some(window) = self.windows.get_mut(&wid) {
+            // History, not a new space: the live grid the band describes has not
+            // moved, so the band is kept. This frame projects none of it
+            // (`composed_cursor_effect_valid` is dropped below), but it is still
+            // there when the live viewport returns. No one-frame hide is armed:
             // this arm advances no effect clock (see [`TornBand::Keep`]).
             retire_torn_cursor_fx_with(window, TornBand::Keep);
         }
@@ -8501,6 +8538,9 @@ impl App {
             sync_cursor_effect_coordinate_space(window, terminal_id, alt);
             let scroll_change = sync_cursor_effect_scroll(window, content_scroll_state);
             if display_offset != 0 {
+                // Scrollback is a different visible coordinate space from the
+                // active-grid anchors both engines retain, so hard-clear at the
+                // shared composed seam. Rainbow Kitty's ribbon is hidden instead:
                 // kept, not composed, and back where its clocks say.
                 if !window.fx.cursor_mut().glow.hide_v2() {
                     window.fx.cursor_mut().glow.reset();
@@ -9754,6 +9794,10 @@ impl App {
                     let row = leaf.rect.origin.y.round().max(0.0) as usize;
                     let col = leaf.rect.origin.x.round().max(0.0) as usize;
                     if let Some(window) = self.windows.get_mut(&id) {
+                        // The focused terminal owns the transient IME overlay in a
+                        // mixed split too; paint before the blit so glyphs and the
+                        // candidate anchor use its width and caret. The next fresh
+                        // extraction erases a cancelled composition; the engine is
                         // untouched.
                         if leaf.focused && preedit_on_grid && cache.staged_input.display_offset == 0
                         {
@@ -9922,6 +9966,8 @@ impl App {
             }
         }
         if abandoned {
+            // A focused terminal sampled before a later leaf failed owns the
+            // neighbour-probe allocations; return them even though no tick commits,
             // or repeated sync holds would churn allocations.
             if matches!(cursor_fx, Some(ComposedCursorFxClock::Advance(_)))
                 && let Some(sample) = focused_cursor_fx_sample
@@ -10168,6 +10214,10 @@ impl App {
             metrics::record_redraw_total(frame_started.elapsed().as_nanos() as u64);
         }
         if recovered == GpuRecoveryOutcome::BackendUnavailable {
+            // A CPU-backend construction failure gets its own typed bounded retry,
+            // even after a nominally successful GPU present. Reusing the original
+            // surface reason would double-count the frame and could park forever on
+            // a persistent GPU condition; one count per lost frame, with the final
             // diagnostic matching the CPU-recovery retry state.
             if let Some(state) = self.windows.get_mut(&id) {
                 state.on_present_dropped();
@@ -10610,6 +10660,10 @@ impl App {
         let coordinate_changed = previous.is_some_and(|previous| previous != coordinate);
         state.last_layout_coordinate_space = Some(coordinate);
         if coordinate_changed {
+            // Every coordinate-bearing cursor/companion plane crosses this boundary
+            // together; durable kitty/pet identity survives, old pane origins, hit
+            // targets and animation bodies do not. The resident pet asks which
+            // boundary it is: the same focused view re-gridded keeps its body,
             // another view crossfades.
             if previous.is_some_and(|previous| previous.focused == coordinate.focused) {
                 regrid_torn_cursor_fx(state);
@@ -10621,6 +10675,8 @@ impl App {
             state.rain_hidden_band.clear();
         }
         if composed {
+            // The scroll-pill latch belongs to single-pane viewport chrome; a
+            // composed frame does not paint it, so do not leave its erase
             // cadence armed.
             state.pill_shown = false;
         } else {
@@ -11646,6 +11702,7 @@ impl App {
                         })
                         .fp;
                     if deco_rescan {
+                        // This present supplied the birth tick; a later capture must
                         // not reuse its output stamp.
                         ws.pending_deco_birth = None;
                     }
@@ -11738,6 +11795,7 @@ impl App {
                     fp
                 }
             } else {
+                // The config-admission edge already retired word episodes; keep the
                 // shared placement and atlas warm for the cursor companion below.
                 0
             };
@@ -12064,6 +12122,7 @@ impl App {
             }
             if let Some((pmode, editing)) = single_pane_pred_mode {
                 if pmode == crate::predict::PredictMode::Off {
+                    // Switched off with guesses pending: flush them, or the stranded
                     // past deadline spins the event loop.
                     ws.predictor.reset();
                 } else {
@@ -12156,6 +12215,7 @@ impl App {
         {
             let now = frame_started;
             if scrolled {
+                // The expiry flush still runs: an in-flight guess must expire, or
                 // `next_deadline()` stays in the past and the repaint spins.
                 let _ = ws.predictor.overlay(now);
             } else {
@@ -12499,6 +12559,8 @@ impl App {
             match ensure_target(self, wid) {
                 Ok(()) => {
                     let requested = self.windows.get_mut(&wid).is_some_and(|ws| {
+                        // Replacing the swapchain is a surface stimulus: keep an
+                        // outstanding acknowledgement until a real CPU present/drop,
                         // so a suppressed winit request is re-delivered.
                         request_redraw(&mut ws.present_retry, wid, window.as_ref())
                     });
@@ -13503,6 +13565,8 @@ impl App {
                     )
                 });
                 if advance_cursor_fx {
+                    // This headless capture is the presentation boundary: consume
+                    // only the damage the snapshot represents; later writes stay
                     // pending.
                     term.take_damage();
                 }
@@ -13641,6 +13705,7 @@ impl App {
                     .clone_from(&ws.pane_scratch);
             }
             if focused {
+                // Re-probe the hover under a still pointer against this pane's own
                 // hold, as the composed route does for its focused pane.
                 self.refresh_hover_for_frame_locked(wid, &term);
             }
@@ -13883,6 +13948,8 @@ impl App {
         }
         let active = ws.fx.streak_panes().any(|engine| engine.is_active());
         if active {
+            // Composed panes share the single-pane engine's phase-locked
+            // decoration lane; refresh it while any pane has moving light (the
             // idle/Settle interval is handled by `output_streak_next_change_deadline`).
             ws.note_deco_animating(ctx.now);
         }
@@ -15449,6 +15516,7 @@ impl App {
                     && ws.fx_prefetch_pending.is_empty()
             })
         {
+            // The screen is proved unchanged: the `video` recorder's sampling
             // ledger counts this as a sample (see `redraws_proved_unchanged`).
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.redraws_proved_unchanged = ws.redraws_proved_unchanged.wrapping_add(1);
@@ -15533,6 +15601,9 @@ impl App {
             let (sub_rows, sub_cols) = (r.rows as usize, r.cols as usize);
             let focused_pane = pane_index == focus_index;
             if focused_pane {
+                // Move the focused extraction into the ordinary pane slot for
+                // host-only prediction/blit work (allocation-free; restored after
+                // this pane). The return leg must be told whether the region
                 // below wrote cells; see [`take_focused_pane_scratch`].
                 take_focused_pane_scratch(ws);
             } else {
@@ -15559,6 +15630,7 @@ impl App {
                     ws.predictor.set_mode(pmode);
                     ws.predictor.set_editing(pediting);
                     if focus_scrolled {
+                        // Scrolled into history: never paint over scrollback,
                         // but still run the expiry flush after this branch.
                         Some(false)
                     } else {
@@ -15687,6 +15759,8 @@ impl App {
                 );
                 return_focused_pane_scratch(ws, preedit_drawn || painted_pred);
             } else {
+                // Return this pane's buffer to the map with its fresh extraction,
+                // restoring `pane_scratch`'s shared identity (the entry was minted
                 // by the swap-in).
                 if let Some(buf) = ws.unfocused_pane_scratch.get_mut(&pane_index) {
                     std::mem::swap(&mut ws.pane_scratch, buf);
@@ -15761,6 +15835,7 @@ impl App {
 
     /// Splice the visible tab strip into the top `tab_strip_rows` rows of the just-composed `input_scratch` (filled at terminal size by either the single-pane or composed path), shifting content and cursor down to form the full-window frame the renderer presents.
     pub(crate) fn splice_tab_strip(&mut self, wid: WindowId) {
+        // Chrome rows, not strip rows: with the strip off (the macOS default) a
         // live status bar is still a row the capture must carry.
         if self.chrome_rows(wid) == 0 {
             self.splice_tab_strip_with(wid, 0);
@@ -15928,6 +16003,8 @@ impl App {
 
     /// Splice with the strip fingerprint `tab_strip` the caller already computed (the redraw reuses the RepaintKey's, so each tab's terminal is locked once per present).
     pub(crate) fn splice_tab_strip_with(&mut self, wid: WindowId, tab_strip: u64) {
+        // Composed panes reuse scratch without extracting a whole frame, so retire
+        // its previous chrome even when no band remains; current band rasters are
         // installed below at their new rows.
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.input_scratch.chrome_rasters.clear();
@@ -16168,6 +16245,10 @@ impl App {
                     }
                 }
                 if r + 1 == strip {
+                    // The band's bottom edge on Linux, stamped after the paint on
+                    // whatever the last row is (segments or bare chrome). On
+                    // Windows it is a rail on the last row's last pixel rows
+                    // (`tab_bar::strip_seam_rail`, installed after the prepend). A
                     // no-op on macOS.
                     tab_bar::seal_strip_bottom(&mut row, palette);
                 }
@@ -16556,6 +16637,7 @@ impl App {
                 })
             })
         else {
+            // Not searching: drop any indicator geometry a prior frame left, so a
             // click on those cells is not swallowed by a no-op toggle.
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.find_bar_hit = None;
@@ -17689,6 +17771,7 @@ impl App {
             ws.initial_frame_settle = None;
         }
         if let Some(w) = self.front().and_then(|ws| ws.os_window.clone()) {
+            // Best effort; the WM may clamp. `Some` means the backend applied
             // the size synchronously and no `Resized` follows (Wayland).
             if let Some(applied) = w.request_inner_size(size) {
                 if let Some(ws) = self.front_mut() {

@@ -81,7 +81,7 @@ pub(crate) struct WatchStatusState {
 
 impl WatchStatusState {
     #[must_use]
-    pub(crate) fn has_config_candidate(&self) -> bool {
+    pub(crate) const fn has_config_candidate(&self) -> bool {
         self.config_candidate.is_some()
     }
 
@@ -164,7 +164,7 @@ impl WatchStatusState {
     }
 }
 
-fn failure_message(kind: WatchFailureKind) -> &'static str {
+const fn failure_message(kind: WatchFailureKind) -> &'static str {
     match kind {
         WatchFailureKind::ConfigUnreadable => {
             "aterm.toml reload rejected: the file could not be read. Running settings and Manual content were kept unchanged."
@@ -235,14 +235,14 @@ impl FailureLatch {
         }
     }
 
-    fn clear_silently(&mut self) {
+    const fn clear_silently(&mut self) {
         self.kind = None;
         self.unknown = false;
     }
 
     /// Forget what the window was told: its status wakes were dropped before
     /// Commit, so the next outcome — failure or recovery — is posted.
-    fn forget(&mut self) {
+    const fn forget(&mut self) {
         self.kind = None;
         self.unknown = true;
     }
@@ -361,6 +361,8 @@ fn watch(
                         || config_file_observation(path),
                     );
                     if let Some((stamp, observation)) = candidate {
+                        // The policy first, for a refused file as for a readable one: the
+                        // window runs the newest read's `[harness]`, and a readable
                         // observation's admission reports under it.
                         if let Some(policy) = observed_harness(Some(path), &observation)
                             && !post_harness(
@@ -374,6 +376,9 @@ fn watch(
                         }
                         match observation {
                             Ok(observation) => {
+                                // Re-derive the feed set from this text and stamp it
+                                // before posting, so an edit racing the UI's read is
+                                // the next poll's edge. An unparseable config keeps
                                 // the last known set (admission rejects the text).
                                 if let Some(paths) = feed_paths_of(&observation.text) {
                                     feed_paths = paths;
@@ -429,6 +434,8 @@ fn watch(
                         },
                     ) {
                         None => {
+                            // A complete metadata scan also proves recovery from
+                            // a transient stamp failure when the generation did
                             // not otherwise change. No theme bytes are reopened.
                             if !post_status(&proxy, &mut theme_failure, WatchTarget::Themes, None) {
                                 break;
@@ -662,6 +669,8 @@ fn config_path_stamp(path: &std::path::Path) -> Result<ConfigPathStamp, WatchFai
             hash_file_metadata(&metadata, &mut hasher);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling logical binding is still a stable candidate edge. The
+            // exact capability reader decides whether it is an absent config or
             // an unsafe binding before anything is admitted.
             "followed-target-absent".hash(&mut hasher);
         }
@@ -707,7 +716,9 @@ fn config_file_observation(
     })
 }
 
-fn config_failure_kind(error: &crate::native_document_host::DocumentHostError) -> WatchFailureKind {
+const fn config_failure_kind(
+    error: &crate::native_document_host::DocumentHostError,
+) -> WatchFailureKind {
     use crate::native_document_host::DocumentHostError;
     match error {
         DocumentHostError::InvalidUtf8 => WatchFailureKind::ConfigInvalidUtf8,
@@ -879,7 +890,7 @@ fn theme_entry_failure_kind(error: std::io::Error) -> WatchFailureKind {
     }
 }
 
-fn theme_discovery_failure_kind(
+const fn theme_discovery_failure_kind(
     error: crate::app_config::ThemeCatalogWatchError,
 ) -> WatchFailureKind {
     match error {

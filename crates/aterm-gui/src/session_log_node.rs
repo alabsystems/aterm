@@ -259,7 +259,7 @@ fn process_epoch() -> u32 {
 /// A bounded fingerprint of the process identity (a launch nonce, with the
 /// existing high-resolution fallback), not a timestamp or an authority token.
 /// As with any finite u32 epoch, collisions remain possible.
-fn instance_epoch(instance: &str) -> u32 {
+const fn instance_epoch(instance: &str) -> u32 {
     let hash = aterm_hash::fnv1a_64(instance.as_bytes()).to_le_bytes();
     u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]])
 }

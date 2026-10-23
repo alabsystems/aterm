@@ -33,9 +33,6 @@ fn full_cool_down(t0: Instant, dark: bool) -> crate::aos_momentum::MomentumHost 
     host
 }
 
-/// On one captured trace (a burst and the whole cool-down, dark and light pages), replayed
-/// from the attach checkpoint: the demonstration fault fails `HotHasWake` exactly at the
-/// first query that finds the glow settling, and the shipped code passes every law.
 #[test]
 fn on_one_trace_the_demonstration_fault_strands_light_and_the_shipped_code_does_not() {
     let t0 = Instant::now();
@@ -65,8 +62,6 @@ fn on_one_trace_the_demonstration_fault_strands_light_and_the_shipped_code_does_
     }
 }
 
-/// The shipped code passes the contract on every random in-profile stream (keys, resets,
-/// ticks of both pages with varying intensity, τ and caret, queries at any instant).
 #[test]
 fn the_shipped_code_passes_the_contract_on_every_random_stream() {
     let t0 = Instant::now();
@@ -88,9 +83,6 @@ fn settling_queries(run: &Run<MomentumSchema>) -> Vec<usize> {
         .collect()
 }
 
-/// `WakeNoLaterThanClear`'s negative controls: a settle wake moved one nanosecond past
-/// `max(cold_at + margin, at + frame)`, or one nanosecond sooner than a frame out, fails
-/// that law at that query; the unmutated run passes.
 #[test]
 fn a_settle_wake_past_the_clear_or_inside_a_frame_breaks_wake_no_later_than_clear() {
     let t0 = Instant::now();
@@ -129,10 +121,6 @@ fn a_settle_wake_past_the_clear_or_inside_a_frame_breaks_wake_no_later_than_clea
     }
 }
 
-/// `ColdTickClears`'s negative control: the clearing frame (a tick at the cold forecast plus
-/// the margin, no key since, the latching tick's config) made to draw fails that law at that
-/// tick. Lifting any condition (a key in between, another intensity, a key before the
-/// forecast's query so its `cold_at` is stale) lifts the law.
 #[test]
 fn a_tick_past_the_cold_forecast_that_still_draws_breaks_cold_tick_clears() {
     let t0 = Instant::now();
@@ -199,8 +187,6 @@ fn a_tick_past_the_cold_forecast_that_still_draws_breaks_cold_tick_clears() {
     assert_eq!(contract.judge(schema, &stale_inputs, &stale), Verdict::Pass);
 }
 
-/// `RunMatchesInputs`: an observation of another kind than its input, a missing
-/// observation, or one past the inputs fails at that cursor.
 #[test]
 fn an_observation_that_is_not_its_inputs_breaks_run_matches_inputs() {
     let t0 = Instant::now();
@@ -235,9 +221,6 @@ fn an_observation_that_is_not_its_inputs_breaks_run_matches_inputs() {
     ));
 }
 
-/// A refused input changed nothing and no law judges it: a refused key slipped between the
-/// last forecast and the clearing frame neither fails the run nor lifts `ColdTickClears`
-/// (a lit clearing frame still fails it, at its own cursor).
 #[test]
 fn refused_inputs_are_judged_by_no_law() {
     let t0 = Instant::now();

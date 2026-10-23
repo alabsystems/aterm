@@ -587,11 +587,14 @@ impl<'a> RingCells<'a> {
             unit = advance_grapheme_unit_wide(&self.unit_buf, &mut scanned);
             if scanned != self.unit_buf.len() {
                 // The scan stopped early: the round trip would emit a second
+                // unit for the tail, or clip the cluster at
+                // MAX_GRAPHEME_UNIT_BYTES. Give up on the row.
                 return Err(Declined);
             }
         }
         if aterm_grapheme::char_width(base) == 0 {
             // The text walk skips a zero-width base and shifts later columns
+            // left; not modelled here.
             return Err(Declined);
         }
 
@@ -622,6 +625,7 @@ impl<'a> RingCells<'a> {
             col_u16.saturating_add(2)
         } else {
             // No progress: a wide unit cannot fit at the last column, and the
+            // text walk stops there, dropping the rest of the row.
             return Err(Declined);
         };
         self.col = end_col;
@@ -789,6 +793,8 @@ fn advance_grapheme_unit_scan(text: &str, byte_idx: &mut usize, max_chars: usize
 
     for (offset, next_c) in iter {
         // Bound the unit: `text` can come from a crafted checkpoint or injected
+        // `Line`, and an endless ZWJ/combining chain would otherwise become one
+        // huge `complex_char`. The rest forms later units.
         if end >= MAX_GRAPHEME_UNIT_BYTES || char_count >= max_chars {
             break;
         }
@@ -798,6 +804,7 @@ fn advance_grapheme_unit_scan(text: &str, byte_idx: &mut usize, max_chars: usize
             last_was_zwj = true;
         } else if next_c == '\u{FE0F}' {
             // VS16 joins the unit (zero-width) and widens a narrow emoji-capable
+            // base, as the live `widen_previous_cell_for_vs16` does.
             if !wide && aterm_grapheme::is_vs16_emoji_capable(c) {
                 wide = true;
                 vs16_widened = true;
@@ -811,13 +818,27 @@ fn advance_grapheme_unit_scan(text: &str, byte_idx: &mut usize, max_chars: usize
             last_was_zwj = false;
         } else if next_width == 0 || (last_was_zwj && !next_c.is_ascii()) {
             // Zero-width chars (combining marks, other selectors) join the
+            // unit, and so does a visible non-ASCII char after a ZWJ. Printable
+            // ASCII after a ZWJ opens its own cell, as the live grid draws it
+            // (`print_ascii_bulk` never folds) and `aterm_grapheme::GridColumns`
+            // lays it out. Known gap: under insert mode, no autowrap or a
+            // translating charset the live writer takes ASCII through
+            // `write_char`, which does fold it after a ZWJ, and a `Line` does
+            // not record the mode.
             last_was_zwj = false;
         } else if is_skin_tone_modifier(next_c) && aterm_grapheme::is_emoji_modifier_base(c) && wide
         {
             // A Fitzpatrick modifier folds onto the unit's emoji base, as the
+            // live `try_combine_skin_tone_modifier` does (gated on the previous
+            // cell being wide and `is_emoji_modifier_base(base)`). The effective
+            // width is used, so `☝️🏽` (base + widening VS16 + modifier) folds
+            // while text-presentation `☝🏽` stays split.
             last_was_zwj = false;
         } else if is_regional_indicator(next_c) && is_regional_indicator(c) && ris < 2 {
             // A regional indicator folds onto a unit whose base is a lone one,
+            // as `try_combine_regional_indicator` reads the cell's base and
+            // counts the indicators it holds: a mark between (`🇺́🇸`) does not
+            // stop the fold, as `aterm_grapheme::GridColumns` lays it out too.
             last_was_zwj = false;
         } else {
             break;
@@ -903,6 +924,7 @@ fn mirror_wide_spacer_extras(cells: &[crate::Cell], extras: &mut FxHashMap<u16, 
     }
     for idx in 1..cells.len() {
         // The same predicate the extractor used to drop this column, so the
+        // columns healed are exactly those that lost their extras.
         if !is_spacer(cells, idx) {
             continue;
         }

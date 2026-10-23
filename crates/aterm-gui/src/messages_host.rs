@@ -368,6 +368,8 @@ impl App {
                 continue;
             };
             let Some(next) = msgs.iter().find(|m| m.key.as_deref() == Some(key.as_str())) else {
+                // GONE from the reload's set: the problem is fixed, and the
+                // record takes the words this reload saw it end in, else the
                 // ones its family declared for any fix.
                 if let Some(words) = fixed_as.get(key) {
                     self.messages.restate(
@@ -686,7 +688,7 @@ impl App {
     }
 
     /// Returns whether message log persistence is frozen awaiting seamless-handoff Commit.
-    pub(crate) fn message_persist_frozen(&self) -> bool {
+    pub(crate) const fn message_persist_frozen(&self) -> bool {
         self.incoming_handoff_pending
     }
 
@@ -1277,6 +1279,8 @@ impl App {
     /// Opens the toolchain progress row when a first-run `net-starting:` marker arrives.
     pub(crate) fn announce_toolchain_pass(&mut self, detail: &str, first_run: bool) {
         if !first_run {
+            // A person's verb: its busy row takes the size the announcement names until the plan
+            // lands. While it queues, an announcement is the holder's, not the size of the
             // person's wait.
             if let Some(verb) = self.toolchain_person
                 && !self.toolchain_person_waiting
@@ -1446,6 +1450,7 @@ impl App {
 
     /// Folds any remaining live toolchain progress row when the `atpkg` child process exits.
     pub(crate) fn toolchain_pass_ended(&mut self, clean: bool) {
+        // The LANE'S row outlives its launch seed (`Self::open_first_run_ahead`): the
         // update that follows takes it over, and that child's exit is the one fold.
         if std::mem::take(&mut self.toolchain_ahead_carry) {
             return;
@@ -1462,6 +1467,8 @@ impl App {
         let first_run = std::mem::take(&mut self.toolchain_first_run);
         let short = self.toolchain_first_run_short.take();
         if let Some(verb) = self.toolchain_person {
+            // A person's verb is waiting (queued behind this child, or running beside its exit):
+            // the row is theirs. A latched lane row ends as the lane's work did, and the person's
             // row comes back after the grace if their verb is still running.
             if latched {
                 self.retire_live_toolchain(echo);
@@ -1828,6 +1835,7 @@ impl App {
                 .map(|l| l.id)
                 .collect();
             if live.is_empty() {
+                // Shown on screen and gone: its hold ran out where it was seen,
                 // or the person put it away.
                 if owed.seen {
                     return false;
@@ -2056,7 +2064,7 @@ impl App {
     }
 
     /// Returns the count of tabs repainted onto a blank screen during seamless handoff adoption.
-    pub(crate) fn seamless_repainted_tabs(&self) -> usize {
+    pub(crate) const fn seamless_repainted_tabs(&self) -> usize {
         self.handoff_repainted_tabs
     }
 
@@ -2604,7 +2612,7 @@ impl HealthProof {
         }
     }
 
-    fn needed_for(kind: update_words::HealthKind) -> Option<Self> {
+    const fn needed_for(kind: update_words::HealthKind) -> Option<Self> {
         match kind {
             update_words::HealthKind::Install => Some(Self::Installed),
             update_words::HealthKind::Download => Some(Self::Downloaded),

@@ -15,7 +15,6 @@ use crate::screen::{composer_of, has_card};
 use crate::stop::Stopped;
 use crate::util::now;
 
-/// JSON lines as the records write them (non-ASCII kept).
 const LINE: Style = Style {
     indent: None,
     compact: false,

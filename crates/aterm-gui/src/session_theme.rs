@@ -84,7 +84,7 @@ pub(crate) enum SessionDraw {
 
 impl SessionDraw {
     /// The theme it asks for, drawn or not.
-    pub(crate) fn choice(&self) -> Option<&SessionChoice> {
+    pub(crate) const fn choice(&self) -> Option<&SessionChoice> {
         match self {
             Self::Instance => None,
             Self::Own { choice, .. } | Self::Missed { choice, .. } => Some(choice),

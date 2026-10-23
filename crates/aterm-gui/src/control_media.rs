@@ -242,6 +242,8 @@ pub(crate) fn call_main_within<T>(
 
 /// Returns a [`MainHopError`] if the main thread is stalled or shutting down.
 pub(crate) fn main_thread_refusal() -> Option<MainHopError> {
+    // A verb committed to finishing input it began is the one exception
+    // ([`crate::control::CommittedInput`]: a `turn` whose text is typed still
     // gets its Enter, or the text sits unsubmitted in the composer).
     if crate::control::caller_hung_up() && !crate::control::input_committed() {
         aterm_log::debug!("control: a main-thread request was dropped; its client hung up");
@@ -653,7 +655,7 @@ const IMAGE_BYTE_ROW_OVERHEAD: usize = 64;
 const MAX_IMAGE_BYTE_REPLY_PNG_BYTES: usize =
     ((aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES - IMAGE_BYTE_ROW_OVERHEAD) / 4) * 3;
 
-fn image_byte_reply_png_fits(png_len: usize) -> bool {
+const fn image_byte_reply_png_fits(png_len: usize) -> bool {
     png_len <= MAX_IMAGE_BYTE_REPLY_PNG_BYTES
 }
 
@@ -2668,6 +2670,8 @@ fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
         if let Some(v) = tok.strip_prefix("cwd=") {
             cwd = Some(v.to_string());
         } else if let Some(v) = tok.strip_prefix("theme=") {
+            // A name or a `dark:…,light:…` split, quoted when it holds spaces;
+            // validated on the main thread against the catalog. Empty, or given
             // twice, is the usage line.
             if v.is_empty() || theme.replace(v.to_string()).is_some() {
                 return Err(());
@@ -5701,6 +5705,7 @@ mod video_parse_tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&root).unwrap();
         for index in 0..=VIDEO_RECORDING_SCAN_MAX {
+            // Invalid names count too: otherwise an attacker could hide unbounded
             // work behind entries the server later ignores.
             std::fs::create_dir(root.join(format!("junk-{index:04}"))).unwrap();
         }

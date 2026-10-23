@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The recorded corpora (tests/recorded/) and the values both sides of the
-//! oracle name: the recorder built each one in zbus/zvariant types, and these
-//! builders make the same one in aterm-dbus's.
+//! The recorded corpora (tests/recorded/) and the values both sides of the oracle name.
 
 #![allow(
     dead_code,

@@ -756,6 +756,8 @@ mod imp {
                 MARKER_NANOS.store(u64::try_from(nanos).unwrap_or(0), Ordering::SeqCst);
                 if !armed.locked {
                     // The unlocked fallback is named `Other` and must stay so: a
+                    // Commit must not rename it into a marker that reads as a
+                    // killed daily driver while its owner lives.
                     PROMOTE_ON_COMMIT.store(false, Ordering::SeqCst);
                 }
                 armed.fd

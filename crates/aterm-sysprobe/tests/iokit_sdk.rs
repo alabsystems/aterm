@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-sysprobe`'s IOKit and CoreFoundation declarations (`src/iokit.rs`)
-//! held to the SDK headers, on both arches, by aterm-objc's shared declaration
-//! probe (`crates/aterm-objc/tests/support/sdk_decls.rs`), mounted here so the
-//! declarations are checked where they live.
+//! IOKit and CoreFoundation declaration checks against the macOS SDK headers.
 
 #![cfg(target_os = "macos")]
 

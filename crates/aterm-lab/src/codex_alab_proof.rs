@@ -3197,6 +3197,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
 
 fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     // The front door lays agents/codex and the stable exec path before any
+    // tab: linked as the owner links it.
     if let Err(why) = proof.link(pkg) {
         proof.check(&format!("the package is linked ({why})"), false);
         return Ok(());

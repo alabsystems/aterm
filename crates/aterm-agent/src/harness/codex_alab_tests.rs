@@ -15,7 +15,6 @@ fn argv(words: &[&str]) -> Vec<String> {
 const T1: &str = "01a0dc36-1dc1-7ee2-be91-11bc323e377c";
 const T2: &str = "01a0dc3a-5c71-7143-bcee-58def0a15dfd";
 
-/// The atpkg store's codex 0.157.1 manifest, verbatim.
 const PACKAGE_0_157_1: &str = r#"{
   "layoutVersion": 1,
   "version": "0.157.1",
@@ -42,8 +41,6 @@ fn the_measured_manifest_parses_and_a_changed_layout_refuses() {
     }
 }
 
-/// Optional package metadata never blocks on a nonfile or accepts an
-/// oversized, otherwise valid manifest. Every path belongs to this fixture.
 #[test]
 fn package_metadata_refuses_nonfiles_and_oversized_text() {
     let d = aterm_tempfile::tempdir().expect("private package fixture");
@@ -89,13 +86,6 @@ fn package_metadata_refuses_nonfiles_and_oversized_text() {
     }
 }
 
-/// AN ALAB BUILD IS KNOWN BY ITS PACKAGE, NOT ITS VERSION: codex-alab's
-/// package carries the publication scheme's pre-release version
-/// (`X.Y.0-dev.<n>+g<sha>`), which [`Version::parse`] refuses on purpose. The
-/// proven self-claim's image fact ([`alab_bytes`]) must still see an ALab build
-/// there (measured 2026-10-16: no claim was ever proven from a real package),
-/// while [`package_version`], the only reader that orders builds, still answers
-/// nothing for it.
 #[test]
 fn an_alab_package_with_a_pre_release_version_is_alab_bytes() {
     let d = crate::supervise::ScratchDir::new("codex", "alab-pre-release");
@@ -163,9 +153,6 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
     assert_eq!(Version::parse("codex-cli"), None);
 }
 
-/// The Codex lane carries the model and only carries it: whatever model the launch named, in any
-/// spelling (`-m x`, `-mx`, `--model=x`), rides the relaunch verbatim with every other kept flag;
-/// a launch that named none gets none.
 #[test]
 fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
     let a = argv(&[
@@ -322,9 +309,6 @@ fn a_thread_id_is_a_hyphenated_uuid_and_nothing_else() {
     ));
 }
 
-/// The relaunch-on-exit readers: the thread a TUI's argv resumes and a thread id's creation
-/// instant (UUIDv7). Negative controls: a plain launch, `resume --last`, a picker and a `fork`
-/// name no thread; a non-v7 id has no instant.
 #[test]
 fn the_relaunch_on_exit_reads_a_thread_and_its_instant() {
     let argv = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();

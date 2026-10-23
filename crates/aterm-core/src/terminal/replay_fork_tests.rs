@@ -9,7 +9,6 @@ use crate::grid::ResizePolicy;
 use crate::terminal::ClockReading;
 use std::time::Duration;
 
-/// One recorded event: a PTY read, or a resize to `(rows, cols)`.
 enum Ev {
     Out(Vec<u8>),
     Resize(u16, u16),
@@ -24,12 +23,10 @@ struct Fixture {
     rows: u16,
     cols: u16,
     policy: ResizePolicy,
-    /// The engine's history cap, when not the default.
     ring: Option<usize>,
     events: Vec<Ev>,
 }
 
-/// What a fold ends with, everything a replay or a checkpoint can read.
 #[derive(Debug, PartialEq)]
 struct Seen {
     rows: Vec<String>,
@@ -51,10 +48,6 @@ fn seen(t: &Terminal) -> Seen {
     }
 }
 
-/// Where the fixture clock starts: an hour ahead of the real clock, which a
-/// copy reads until its first event. A synchronized-update window armed at the
-/// copy's own clock (re-armed, not carried) has run out by that event; the
-/// source's, armed on the fixture clock an event earlier, has not.
 fn fixture_epoch() -> aterm_time::Instant {
     ClockReading::now()
         .monotonic
@@ -62,8 +55,6 @@ fn fixture_epoch() -> aterm_time::Instant {
         .expect("clock")
 }
 
-/// Event `i`'s clock: fixed, so marks and the synchronized-update timer read
-/// the same instant in every fold.
 fn clock(epoch: aterm_time::Instant, i: usize) -> ClockReading {
     let ms = u64::try_from(i).expect("small");
     ClockReading {
@@ -73,8 +64,6 @@ fn clock(epoch: aterm_time::Instant, i: usize) -> ClockReading {
 }
 
 impl Fixture {
-    /// A replay's setup (`aterm_control`'s `ReplayEngine`): the archive off
-    /// and the policy's console-host posture.
     fn configure(&self, t: &mut Terminal) {
         t.set_alt_archive_enabled(false);
         t.set_console_host_posture(self.policy);
@@ -98,8 +87,6 @@ impl Fixture {
         }
     }
 
-    /// For every boundary `k` (after `k` events): `copy` of the engine there,
-    /// fed the rest, and what it ends with (`None` when `copy` refused).
     fn at_every_boundary(
         &self,
         copy: impl Fn(&Terminal) -> Option<Terminal>,
@@ -125,11 +112,6 @@ impl Fixture {
     }
 }
 
-/// The DECSC slot, a sync window, an open link, REP and XTPUSHSGR left across
-/// a boundary, links, wide and combining text, a ZWJ sequence and wrapped
-/// lines in a history capped at 20 lines, tab stops, a scroll region, an
-/// alternate-screen flap with output between its halves and a quiet one, a
-/// Native grow that reveals history, a reflow, and more output than the cap.
 fn session() -> Fixture {
     let mut events = Vec::new();
     for i in 0..30 {
@@ -186,9 +168,6 @@ fn session() -> Fixture {
     }
 }
 
-/// A pager entered by `?1047h` (no cursor save) dies, and the shell's prompt
-/// (`133;A`) leaves its screen keeping the pager's cursor, not the DECSC slot
-/// an earlier program left.
 fn pager_without_cursor_save() -> Fixture {
     let mut pager = String::from("\x1b[?1047h\x1b[H\x1b[2J");
     for r in 0..6 {
@@ -211,8 +190,6 @@ fn pager_without_cursor_save() -> Fixture {
     }
 }
 
-/// The fixture's reads, one per non-comment line, escapes decoded (the format
-/// of `conpty_dead_alt_screen_replay_tests`).
 fn reads(fixture: &str) -> Vec<Ev> {
     fixture
         .lines()
@@ -240,8 +217,6 @@ fn reads(fixture: &str) -> Vec<Ev> {
         .collect()
 }
 
-/// Recorded ConPTY sessions: a killed pager's screen left at the prompt, then
-/// conhost's own buffer switching over it.
 fn conpty(name: &'static str, fixture: &str) -> Fixture {
     Fixture {
         name,
@@ -266,11 +241,6 @@ fn conpty_fixtures() -> [Fixture; 2] {
     ]
 }
 
-/// A Kitty image sent under a number (`I=`, the terminal picks its id) shown
-/// and placed again by that number, every image deleted, then a new one under
-/// the same number: the store refuses forks while it holds an image, and once
-/// it is empty the placement serials and the last id assigned carry (the new
-/// image takes the next id).
 fn kitty() -> Fixture {
     let show = |row: u16| {
         let raw = [255u8, 0, 0, 255].repeat(4);
@@ -304,8 +274,6 @@ fn kitty() -> Fixture {
     }
 }
 
-/// A synchronized update the recording ends inside, opened an event before
-/// the end: the source's window has not timed out there.
 fn sync_left_open() -> Fixture {
     Fixture {
         name: "sync_left_open",
@@ -321,11 +289,6 @@ fn sync_left_open() -> Fixture {
     }
 }
 
-/// Kitty images sent without an id (the store keeps none, so each is charged
-/// to the screen) showing on more than half the live-image budget, more
-/// stamped and erased until the screen's charge reaches the budget, then one
-/// pixel more: the count that charge sets off finds more than half the budget
-/// showing and takes the oldest images off.
 fn live_images() -> Fixture {
     use crate::terminal::handler_osc_1337::MAX_LIVE_IMAGE_BYTES;
     let side = 1024;
@@ -370,10 +333,6 @@ fn fixtures() -> Vec<Fixture> {
     fixtures
 }
 
-/// Every fork, at every boundary of every fixture, ends where the straight
-/// fold ends; it refuses only where it must (an open resize undo or a standing
-/// resize hand-back, a stored Kitty image) and forks everywhere else on these
-/// fixtures.
 #[test]
 fn a_fork_folds_the_rest_as_the_straight_fold_does() {
     for fx in &fixtures() {
@@ -411,10 +370,6 @@ fn a_fork_folds_the_rest_as_the_straight_fold_does() {
     }
 }
 
-/// Negative control: the restore a fork replaces (`from_checkpoint` of the
-/// projection: an unlimited tiered history, no orphaned-screen notes, no Kitty
-/// serials), taken where a fork would be, ends elsewhere from some boundary of
-/// each fixture.
 #[test]
 fn a_restore_in_place_of_a_fork_folds_another_end() {
     let restore = |t: &Terminal| {
@@ -432,9 +387,6 @@ fn a_restore_in_place_of_a_fork_folds_another_end() {
     }
 }
 
-/// Negative control: a fork without one piece of the transient state it
-/// carries, left as a restore leaves it, ends elsewhere from some boundary of
-/// each fixture that reads that piece.
 #[test]
 fn a_fork_without_a_carried_piece_folds_another_end() {
     type Strip = fn(&mut Terminal);
@@ -496,12 +448,6 @@ fn a_fork_without_a_carried_piece_folds_another_end() {
     }
 }
 
-/// A fork continues its source's restore lineage. A restore's grids refuse a
-/// fork (their tiered store), so the lineage is set as a restore leaves it.
-/// Forked before any output and adopted, both carries are untouched; forked
-/// after output, neither is, adopted or fed more first. A fork that dropped the
-/// lineage fails the first, one that started its own (as `from_checkpoint`
-/// does) the second.
 #[test]
 fn a_fork_continues_its_sources_restore_lineage() {
     for (before, after, adopt) in [

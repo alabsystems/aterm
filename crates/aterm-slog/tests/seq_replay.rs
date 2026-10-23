@@ -1269,6 +1269,7 @@ fn laws(nested: &[(bool, Vec<Rec>)], join_states: &[State]) -> Result<(), String
     well_nested(nested).map_err(|e| format!("nesting: {e}"))?;
     let jm = transcript_join_model();
     for s in join_states {
+        // A claim, not the box the checkers walk (`bound`): a real log
         // runs past the model's small bounds (eight tools, not two).
         if let Some(inv) = jm
             .invariants

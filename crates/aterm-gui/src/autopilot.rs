@@ -565,7 +565,7 @@ pub(crate) fn land_at_field(land_at: Option<i64>) -> String {
 
 /// The `task=` word `status` and `ls` print (§9.4.1): the task's face as the session's loop last told it (`open|landed|theirs`) for a supervisable agent session (`agent`) whose face this window knows (`told_here`: its host holds the live supervisor claim, or the live claim is a proven self-claim whose own acts tell it, Autopilot Land), and `-` otherwise — another process's supervisor sends no fact here, so a face it would leave stale is never printed, and `-` too before anyone has told one.
 #[must_use]
-pub(crate) fn task_field(
+pub(crate) const fn task_field(
     face: Option<aterm_agent::harness::acts::TaskFace>,
     told_here: bool,
     agent: Option<aterm_phase::Program>,

@@ -43,7 +43,7 @@ fn pass_size_on(master: i32, inner: &mut WinSize, log: &mut Option<std::fs::File
     *inner = outer;
 }
 
-/// A take of `ptyrec` (module doc): the open log, written a line per chunk.
+/// A take of `ptyrec`: the open log, written a line per chunk.
 struct Take(std::fs::File);
 
 /// Direction of a recorded PTY chunk (`O` output, `I` input).

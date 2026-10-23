@@ -2,6 +2,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Minimal logging facade for aterm.
+//!
+//! ## Usage
+//!
+//! ```rust
+//! use aterm_log::{info, warn, error, debug, trace};
+//!
+//! info!("server started on port {}", 8080);
+//! warn!("connection pool at {}% capacity", 90);
+//! error!("failed to bind: {}", "address in use");
+//! debug!("parsed {} bytes", 1024);
+//! trace!("entering function");
+//! ```
+//!
+//! ## Installing a logger
+//!
+//! ```rust
+//! use aterm_log::{Log, Level, LevelFilter, Metadata, Record, set_logger, set_max_level};
+//!
+//! struct StderrLogger;
+//!
+//! impl Log for StderrLogger {
+//!     fn enabled(&self, metadata: &Metadata) -> bool {
+//!         metadata.level() <= Level::Info
+//!     }
+//!     fn log(&self, record: &Record<'_>) {
+//!         if self.enabled(&record.metadata()) {
+//!             eprintln!("[{}] {}: {}", record.level(), record.target(), record.args());
+//!         }
+//!     }
+//!     fn flush(&self) {}
+//! }
+//!
+//! static LOGGER: StderrLogger = StderrLogger;
+//!
+//! set_logger(&LOGGER).expect("logger already set");
+//! set_max_level(LevelFilter::Info);
+//! ```
 
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
@@ -47,7 +84,7 @@ impl Level {
         matches!(self, Self::Error | Self::Warn)
     }
 
-    /// Return the numeric rank (`1 = Error` ..
+    /// Return the numeric rank (`1 = Error` .. `5 = Trace`).
     #[inline]
     #[must_use]
     pub const fn rank(self) -> u8 {
@@ -134,6 +171,12 @@ pub enum LevelFilter {
 
 impl LevelFilter {
     /// Parse an `ATERM_LOG`-style level name (`off`, `error`, `warn`, `info`, `debug`, `trace`), ASCII case-insensitively, ignoring surrounding whitespace.
+    ///
+    /// ```rust
+    /// use aterm_log::LevelFilter;
+    /// assert_eq!(LevelFilter::parse("Warn"), Some(LevelFilter::Warn));
+    /// assert_eq!(LevelFilter::parse("verbose"), None);
+    /// ```
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();

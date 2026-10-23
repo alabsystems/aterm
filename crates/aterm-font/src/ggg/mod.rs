@@ -72,11 +72,9 @@ impl FromData for RangeRecord {
 #[derive(Clone, Copy, Debug)]
 pub enum Coverage<'a> {
     Format1 {
-        /// Array of glyph IDs. Sorted.
         glyphs: LazyArray16<'a, GlyphId>,
     },
     Format2 {
-        /// Array of glyph ranges. Ordered by `RangeRecord.start`.
         records: LazyArray16<'a, RangeRecord>,
     },
 }

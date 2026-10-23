@@ -398,6 +398,7 @@ impl io::Read for &CtlStream {
                         &inner.recv_shutdown,
                         deadline,
                     )? {
+                        // Locally shut down: EOF, as on Unix, so a relay pump
                         // parked on a clone exits cleanly.
                         return Ok(0);
                     }
@@ -435,6 +436,7 @@ impl CtlStream {
                         &inner.send_shutdown,
                         deadline,
                     )? {
+                        // Locally shut down for writing: `BrokenPipe`, as on
                         // Unix.
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,

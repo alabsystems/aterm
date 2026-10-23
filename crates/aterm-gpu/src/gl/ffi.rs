@@ -153,7 +153,8 @@ macro_rules! fn_table {
         impl $name {
             /// Fill the table from `lookup` (a symbol name to its address, null when absent).
             /// # Safety
-            /// `lookup` must return either null or the address of the named function with exactly.
+            /// `lookup` must return either null or the address of the named
+            /// function with exactly the signature declared here.
             pub(crate) unsafe fn load(
                 lookup: &mut dyn FnMut(&CStr) -> *const c_void,
             ) -> Result<Self, String> {
@@ -173,7 +174,9 @@ macro_rules! fn_table {
                                 $sym
                             ));
                         }
-                        // SAFETY: a non-null address of this symbol, whose signature the caller.
+                        // SAFETY: a non-null address of this symbol, whose
+                        // signature the caller vouches for; a data pointer and
+                        // a fn pointer have the same size on every target.
                         unsafe {
                             std::mem::transmute::<
                                 *const c_void,
@@ -335,7 +338,9 @@ pub(crate) unsafe fn c_string(p: *const c_char) -> String {
 pub(crate) mod webgl {
     #[link(wasm_import_module = "aterm_gl")]
     unsafe extern "C" {
-        /// A WebGL2 context on the canvas in object-table slot canvas (getContext.
+        /// A WebGL2 context on the canvas in object-table slot `canvas`
+        /// (`getContext('webgl2', { antialias: false })`): its id, or 0 when the canvas
+        /// gives none (no WebGL2, another context already on it, not a canvas).
         pub(crate) safe fn context_create(canvas: u32) -> u32;
         /// Forget context `ctx` (unbinding it if current).
         pub(crate) safe fn context_drop(ctx: u32);
@@ -479,7 +484,8 @@ mod egl {
             if handle.is_null() {
                 return Err("no EGL library (libEGL.so.1) on this machine".to_owned());
             }
-            // SAFETY: `dlsym` on a live handle returns the symbol's address or null; the table.
+            // SAFETY: `dlsym` on a live handle returns the symbol's address or
+            // null; the table declares each EGL 1.5 function's registry signature.
             let fns = unsafe {
                 EglFns::load(&mut |sym: &CStr| libc::dlsym(handle, sym.as_ptr()).cast_const())
             }?;
@@ -643,7 +649,8 @@ mod glx {
             let gl = open_first(&[c"libGLX.so.0", c"libGL.so.1"])
                 .ok_or("no GLX library (libGLX.so.0, libGL.so.1) on this machine")?;
             let x = open_first(&[c"libX11.so.6"]).ok_or("no libX11.so.6 on this machine")?;
-            // SAFETY: `dlsym` on live handles returns the symbol's address or null; the tables.
+            // SAFETY: `dlsym` on live handles returns the symbol's address or
+            // null; the tables declare each function's registry signature.
             let fns = unsafe {
                 GlxFns::load(&mut |sym: &CStr| libc::dlsym(gl, sym.as_ptr()).cast_const())
             }?;

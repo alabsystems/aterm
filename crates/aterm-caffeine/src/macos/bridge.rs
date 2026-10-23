@@ -31,7 +31,8 @@ const READY_WAIT: Duration = Duration::from_secs(10);
 /// The most of [`Paths::bridge_file`] read: a pid is a few digits.
 const PID_CAP: u64 = 32;
 
-/// Starts a bridge process from the current executable and waits until it holds the activity.
+/// Starts a bridge process from the current executable and waits until it holds the activity:
+/// whether it does, or found keep-awake off and so had nothing to hold.
 pub(super) fn start() -> bool {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -52,11 +53,19 @@ pub(super) fn start() -> bool {
             return false;
         }
     };
-    let held = child
+    let heard = child
         .stdout
         .take()
-        .is_some_and(|out| said_held(out, READY_WAIT));
-    if !held {
+        .map_or(Heard::Not, |out| hear(out, READY_WAIT));
+    if bridged(&heard, || child.wait()) {
+        return true;
+    }
+    if heard == Heard::Ended {
+        aterm_log::warn!(
+            "caffeine: the bridge (pid {}) ended without holding the Mac awake",
+            child.id()
+        );
+    } else {
         aterm_log::warn!(
             "caffeine: the bridge (pid {}) did not hold the Mac awake within {} s; ended",
             child.id(),
@@ -65,20 +74,45 @@ pub(super) fn start() -> bool {
         let _ = child.kill();
         let _ = child.wait();
     }
-    held
+    false
 }
 
-/// Whether `out`'s first line is [`HELD`] within `within`. The line is read on a thread of its
-/// own, which ends with the pipe: at the line, or once the child is killed.
-fn said_held(out: impl io::Read + Send + 'static, within: Duration) -> bool {
+/// Whether a bridge that said `heard` took over: it holds the Mac awake, or it ended with 0
+/// (`ended` waits for its exit) because it found keep-awake saved off (turned off while this
+/// mug was leaving) and so had nothing to hold.
+fn bridged(heard: &Heard, ended: impl FnOnce() -> io::Result<std::process::ExitStatus>) -> bool {
+    match heard {
+        Heard::Held => true,
+        Heard::Ended => ended().is_ok_and(|status| status.success()),
+        Heard::Not => false,
+    }
+}
+
+/// What a bridge's stdout said first ([`hear`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Heard {
+    /// [`HELD`]: its activity has begun.
+    Held,
+    /// Nothing before the pipe closed: the bridge ended without holding.
+    Ended,
+    /// Another line, or none in time.
+    Not,
+}
+
+/// What `out`'s first line is within `within`. The line is read on a thread of its own, which
+/// ends with the pipe: at the line, or once the child is killed.
+fn hear(out: impl io::Read + Send + 'static, within: Duration) -> Heard {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
-        let _ = io::BufReader::new(out).read_line(&mut line);
-        let _ = tx.send(line);
+        let read = io::BufReader::new(out).read_line(&mut line);
+        let _ = tx.send(read.map(|_| line));
     });
-    rx.recv_timeout(within)
-        .is_ok_and(|line| line.trim_end() == HELD)
+    match rx.recv_timeout(within) {
+        Ok(Ok(line)) if line.is_empty() => Heard::Ended,
+        Ok(Ok(line)) if line.trim_end() == HELD => Heard::Held,
+        Ok(_) | Err(_) => Heard::Not,
+    }
 }
 
 /// Runs `aterm caffeine bridge` and holds the keep-awake activity until released.
@@ -350,13 +384,39 @@ mod tests {
         assert!(!paths.bridge_file().exists());
     }
 
+    /// The mug waits for [`HELD`] alone, and tells a bridge that ended without a word (one that
+    /// found keep-awake off) from one that said something else or nothing in time.
     #[test]
     fn the_mug_waits_for_held_alone() {
-        assert!(said_held(&b"held\n"[..], SAYS));
-        assert!(!said_held(&b"error\n"[..], SAYS));
-        assert!(!said_held(&b""[..], SAYS));
+        assert_eq!(hear(&b"held\n"[..], SAYS), Heard::Held);
+        assert_eq!(hear(&b"error\n"[..], SAYS), Heard::Not);
+        assert_eq!(hear(&b""[..], SAYS), Heard::Ended);
         let (read, _write) = std::io::pipe().expect("pipe");
-        assert!(!said_held(read, Duration::from_millis(50)));
+        assert_eq!(hear(read, Duration::from_millis(50)), Heard::Not);
+        assert_eq!(hear(&b"\xff\n"[..], SAYS), Heard::Not, "not a line of text");
+    }
+
+    /// A bridge took over when it holds, or ended 0 with nothing to hold; one that ended
+    /// otherwise, or said anything else, did not, and is not waited on as an ended one.
+    #[test]
+    fn a_bridge_takes_over_by_holding_or_by_a_clean_end() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::ExitStatus;
+        let unasked = || -> io::Result<ExitStatus> { panic!("an exit read where none ended") };
+        assert!(bridged(&Heard::Held, unasked));
+        assert!(!bridged(&Heard::Not, unasked));
+        assert!(bridged(&Heard::Ended, || Ok(ExitStatus::from_raw(0))));
+        assert!(
+            !bridged(&Heard::Ended, || Ok(ExitStatus::from_raw(1 << 8))),
+            "exit 1"
+        );
+        assert!(
+            !bridged(&Heard::Ended, || Ok(ExitStatus::from_raw(9))),
+            "SIGKILL"
+        );
+        assert!(!bridged(&Heard::Ended, || Err(io::Error::other(
+            "no child"
+        ))));
     }
 
     #[test]

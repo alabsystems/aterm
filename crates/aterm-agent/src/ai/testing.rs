@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test stand-ins for the AI layer: a runner that records every child it is asked for and
-//! answers from a script, and a machine laid out in a temporary directory.
+//! Test stand-ins for the AI layer.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -116,8 +115,7 @@ impl Runner for FakeRunner {
     }
 }
 
-/// A machine in a temporary directory: `$HOME`, an atpkg prefix with shims for `installed`,
-/// and aterm's state root.
+/// Temporary machine layout with `$HOME`, an atpkg prefix, and aterm's state root.
 pub struct Box3 {
     /// Keeps the directory.
     pub dir: aterm_tempfile::TempDir,
@@ -149,8 +147,7 @@ pub fn machine(installed: &[&str]) -> Box3 {
     }
 }
 
-/// A [`super::fleet::Fetcher`] that serves fixed bodies by URL and records what it was asked;
-/// any other URL is unreachable.
+/// A [`super::fleet::Fetcher`] that serves fixed bodies by URL and records requests.
 #[derive(Default)]
 pub struct FakeFetcher {
     bodies: Mutex<Vec<(String, Vec<u8>)>>,

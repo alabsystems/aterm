@@ -372,6 +372,7 @@ fn prune_other_packages(cache: &Path, keep: &str) {
         return;
     };
     for entry in entries.flatten() {
+        // `DirEntry::file_type` does not follow links: a symlink or junction
         // to a directory is not a directory here.
         if entry.file_name() == keep || !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;

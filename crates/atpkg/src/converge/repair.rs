@@ -1,25 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm pkg repair`'s steps as converge items (docs/DESIGN-init-system-2026-10-20.md §3.2,
-//! §4.2, S5), which bare `aterm doctor` and `aterm init` run too.
-//!
-//! Each item probes what its step would change, changing nothing, and its apply is the step
-//! itself: the engine applies only a probe that is not `Ok` and judges the apply by a second
-//! probe. So `aterm doctor --read-only` reads all of them and moves nothing, and a deleted
-//! shim, a missing `~/.local/bin` link or a stale hook is restored by whichever surface runs
-//! the items in apply mode.
-//!
-//! The two repair classes are kept apart (§3.2): `relay` lays again what a pass lays and
-//! owns; `asked` moves what a person may have put there (a copied command, a rustup link
-//! to an older toolchain, a stale copy of aterm) and runs only on a surface a person
-//! started. The one act only `aterm pkg repair` takes is the rc block laid again over a
-//! recorded opt-out ([`Pass::Repair`]); bare `doctor` leaves an opted-out rc as the person
-//! left it ([`Pass::Doctor`]).
-//!
-//! Every item holds its own [`Ground`] (§3.1, "an item owns its ports"): the store
-//! layout, the account's home, the executable that runs the pass and rustup's home, so a
-//! test drives the items over a scratch prefix and home.
+//! `aterm pkg repair` steps as converge items ([`Pass::Repair`], [`Pass::Doctor`], [`Ground`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -28,35 +10,30 @@ use aterm_converge::{Class, Explain, Item, Layer, Probe, Remedy};
 
 use crate::store::Layout;
 
-/// `base.shell.copied-commands`: a copied `aterm`, `atpkg` or `aterm-ctl` in
-/// `~/.local/bin`, moved aside.
+/// `base.shell.copied-commands`.
 pub const COPIED_COMMANDS: &str = super::COPIED_COMMANDS;
-/// `base.shell.links`: the `~/.local/bin` links to the installed app, laid where absent.
+/// `base.shell.links`.
 pub const LINKS: &str = "base.shell.links";
-/// `base.shell.hooks`: the `~/.aterm/shell.d` hooks.
+/// `base.shell.hooks`.
 pub const HOOKS: &str = super::HOOKS;
-/// `base.shell.rc`: atpkg's block in each rc that exists, and in the login shell's own rc,
-/// the one file it creates when absent ([`crate::hooks::login_rc`]).
+/// `base.shell.rc` ([`crate::hooks::login_rc`]).
 pub const RC: &str = super::RC;
-/// `base.pkg.stubs`: the reroute stubs, abrew's `brew` included.
+/// `base.pkg.stubs`.
 pub const STUBS: &str = super::STUBS;
-/// `base.pkg.rustup.seam`: rustup's `trust` entry as every pass re-asserts it (relay).
+/// `base.pkg.rustup.seam`.
 pub const RUSTUP_SEAM: &str = super::RUSTUP_SEAM;
-/// `base.pkg.rustup.local`: a rustup `trust` link to nothing or to an older toolchain,
-/// re-pointed at the store (asked).
+/// `base.pkg.rustup.local`.
 pub const RUSTUP_LOCAL: &str = super::RUSTUP_LOCAL;
-/// `base.pkg.held-update`: a held toolchain update that outlived every build it moves off.
+/// `base.pkg.held-update`.
 pub const HELD_UPDATE: &str = super::HELD_UPDATE;
-/// `base.pkg.shims`: each installed program's `bin/` shims.
+/// `base.pkg.shims`.
 pub const SHIMS: &str = super::SHIMS;
-/// `base.pkg.exec-roots`: the trust build's exec root and the shims routed through it.
+/// `base.pkg.exec-roots`.
 pub const EXEC_ROOTS: &str = super::EXEC_ROOTS;
-/// `base.pkg.store`: every installed program's build on disk and not withdrawn — what no
-/// local step fixes (install class, probe only here).
+/// `base.pkg.store`: every installed program's build on disk and not withdrawn.
 pub const STORE: &str = super::STORE;
 
-/// `base.shell.rc`'s reading when every rc that exists is wired: the one reading `pkg
-/// repair` says nothing of (any other names an rc it left alone, and why).
+/// `base.shell.rc`'s reading when every rc that exists is wired.
 pub const RC_ALL_WIRED: &str = "every rc that exists sources ~/.aterm/shell.d";
 
 /// Every repair item's id, in run order.
@@ -77,39 +54,31 @@ pub const IDS: [&str; 11] = [
 /// Which surface runs the items, and so the one act that differs between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pass {
-    /// `aterm pkg repair`, the pass a person asks for: an rc block the person deleted is
-    /// laid again (and said), and the steps repair always re-ran — every program's shims,
-    /// the exec roots at `Deep`, the recorded rustup seams — run again over an `Ok` probe
-    /// ([`Item::refresh`]), as they did before they were items.
+    /// `aterm pkg repair` ([`Item::refresh`]).
     Repair,
-    /// Every other pass — bare `aterm doctor`, `aterm init`, the seed and the end of an
-    /// install or update pass (`atpkg`'s `relay_base`): each item applies only where its
-    /// probe differs, and a deleted rc block (or a deleted login rc) stays deleted (design
-    /// §5: "minus the opt-out re-lay").
+    /// Every other pass.
     Doctor,
 }
 
-/// What every repair item reads and writes: one per run, shared.
+/// What every repair item reads and writes.
 #[derive(Debug, Clone)]
 pub struct Ground {
     /// The store.
     pub layout: Layout,
-    /// The account's home (`~/.aterm`, the rc files, `~/.local/bin`); `None` when unknown.
+    /// The account's home (`~/.aterm`, the rc files, `~/.local/bin`).
     pub home: Option<PathBuf>,
-    /// The executable running the pass, canonical: the command links name its bundle.
+    /// The executable running the pass, canonical.
     pub exe: Option<PathBuf>,
-    /// rustup's home (`$RUSTUP_HOME`, else `~/.rustup`); `None` when unknown.
+    /// rustup's home (`$RUSTUP_HOME`, else `~/.rustup`).
     pub rustup_home: Option<PathBuf>,
-    /// The rc the account's login shell reads, the one rc a pass creates when it is absent
-    /// ([`crate::hooks::login_rc`]); `None` when the login shell reads no rc atpkg wires.
+    /// The rc the account's login shell reads ([`crate::hooks::login_rc`]).
     pub login_rc: Option<&'static str>,
     /// Which surface runs the items.
     pub pass: Pass,
 }
 
 impl Ground {
-    /// The ground of this process: its home, its own executable, rustup's home and the
-    /// login shell's rc (the account record's shell, never `$SHELL`).
+    /// The ground of this process.
     #[must_use]
     pub fn of_process(layout: Layout, pass: Pass) -> Self {
         let home = aterm_types::dirs::home_dir();
@@ -169,7 +138,7 @@ enum Step {
     Store,
 }
 
-/// One repair step as an item: what it reads, and what its apply said (its detail).
+/// One repair step as an item.
 struct Repair {
     step: Step,
     ground: Arc<Ground>,
@@ -189,8 +158,7 @@ impl Repair {
         &self.ground.layout
     }
 
-    /// Whether this pass re-runs the step whatever its probe reads: `pkg repair`'s shims,
-    /// exec roots and rustup seams ([`Pass::Repair`]).
+    /// Whether this pass re-runs the step whatever its probe reads ([`Pass::Repair`]).
     fn reruns(&self) -> bool {
         self.ground.pass == Pass::Repair
             && matches!(self.step, Step::Shims | Step::ExecRoots | Step::RustupSeam)
@@ -264,11 +232,8 @@ impl Item for Repair {
 
     fn class(&self) -> Class {
         match self.step {
-            // Moves a file a person may have put there, or re-points a link they made.
             Step::CopiedCommands | Step::RustupLocal => Class::Asked,
-            // Laying the block again over a recorded opt-out is the asked act (§3.2).
             Step::Rc if self.ground.pass == Pass::Repair => Class::Asked,
-            // Only an install puts a missing build back.
             Step::Store => Class::Install,
             _ => Class::Relay,
         }
@@ -305,8 +270,6 @@ impl Item for Repair {
             Step::ExecRoots => self.probe_exec_roots(),
             Step::Store => self.probe_store(),
         };
-        // `pkg repair` runs these steps whatever they read: one whose state could not be
-        // read is attempted, and the read-back judges it (still unread: `Failed`, exit 1).
         match probe {
             Probe::Unusable { why } if self.reruns() => change(why, "put in order by the step"),
             probe => probe,
@@ -341,9 +304,6 @@ impl Item for Repair {
     }
 
     fn refresh(&self) -> Option<Result<(), String>> {
-        // `aterm pkg repair` re-runs what it always re-ran, whatever the probe read: every
-        // program's shims (each build's exported environment with them), the exec roots
-        // proven at `Deep`, and every recorded rustup seam with its view.
         if !self.reruns() {
             return None;
         }
@@ -356,8 +316,6 @@ impl Item for Repair {
     }
 
     fn refresh_changes(&self) -> bool {
-        // A re-lay rewrites the shims, can rebuild a root and sweep unused build copies:
-        // the engine journals it first.
         self.reruns()
     }
 
@@ -393,8 +351,6 @@ impl Item for Repair {
     }
 
     fn after(&self) -> Vec<String> {
-        // The block never leads the hooks: an rc block naming a hook that is not on disk
-        // sources nothing, and being marker-bounded no later pass would rewrite it.
         match self.step {
             Step::Rc => vec![HOOKS.to_owned()],
             _ => Vec::new(),
@@ -410,7 +366,6 @@ impl Item for Repair {
     }
 }
 
-// The shell's half: copied commands, the command links, the hooks and the rc block.
 impl Repair {
     #[cfg(unix)]
     fn probe_copied(&self) -> Probe {
@@ -434,8 +389,6 @@ impl Repair {
             .and_then(crate::hooks::command_link_check)
         {
             Ok(_) => change(from, "moved aside, the installed app linked in its place"),
-            // On macOS the reason names what keeps this copy from replacing it; elsewhere
-            // no aterm lays these links, and the remedy alone is the way.
             Err(why) => blocked(if cfg!(target_os = "macos") {
                 format!("{from}, and this aterm does not replace it ({why})")
             } else {
@@ -488,9 +441,7 @@ impl Repair {
         Ok(())
     }
 
-    /// The links the pass would write: each with `None` where nothing stands, or the
-    /// target of a link into another `aterm.app` it re-points
-    /// ([`crate::hooks::command_links_to_write`]), and the store's absent argv0 aliases.
+    /// The links the pass would write ([`crate::hooks::command_links_to_write`]).
     #[cfg(unix)]
     fn links_to_write(&self) -> Vec<(PathBuf, Option<PathBuf>)> {
         let Some(exe) = self.ground.exe.as_deref() else {
@@ -559,7 +510,6 @@ impl Repair {
         if crate::hooks::HEALS_STORE {
             crate::hooks::heal_store_aliases(exe);
         }
-        // What stands at each name now says what was written; the read-back judges the rest.
         let written: Vec<PathBuf> = writes
             .into_iter()
             .filter(|(link, old)| {
@@ -578,10 +528,7 @@ impl Repair {
         Ok(())
     }
 
-    /// Why this pass writes nothing of the shell's: the doctor's pass run from an app
-    /// bundle that is not the release `aterm.app` (a stale dev bundle would lay its older
-    /// hook text), as the update pass's hooks stand aside for it. `pkg repair` runs from
-    /// anywhere.
+    /// Why this pass writes nothing of the shell's.
     fn other_bundle(&self) -> Option<&'static str> {
         (self.ground.pass == Pass::Doctor
             && self
@@ -596,16 +543,12 @@ impl Repair {
     }
 
     fn probe_hooks(&self) -> Probe {
-        // `Ok`, not `NotApplicable`: this pass wants the hooks as they are, and the rc
-        // item after it answers for itself.
         if let Some(why) = self.other_bundle() {
             return ok(format!("left as they are: {why}"));
         }
         let Ok(home) = self.home() else {
             return blocked("$HOME is unknown, so ~/.aterm/shell.d cannot be found");
         };
-        // The directories first: a hook current in a directory another account can write
-        // into is no hook to wire an rc to (the `after` edge holds the rc back on it).
         let loose = crate::hooks::shell_dirs_not_private(home);
         let stale = crate::hooks::hooks_not_current(self.layout(), home);
         let mut from = Vec::new();
@@ -631,16 +574,14 @@ impl Repair {
         }
     }
 
-    /// The absent login rc ([`Ground::login_rc`]) and how a pass treats it
-    /// ([`crate::hooks::absent_login_rc`]): `None` when it stands, or none is to be made.
+    /// The absent login rc ([`Ground::login_rc`], [`crate::hooks::absent_login_rc`]).
     #[cfg(unix)]
     fn absent_login_rc(&self, home: &Path) -> Option<(&'static str, crate::hooks::RcState)> {
         let rc = self.ground.login_rc?;
         crate::hooks::absent_login_rc(home, rc).map(|state| (rc, state))
     }
 
-    /// The rc files a pass of this kind would wire now, the absent login rc it would create
-    /// among them.
+    /// The rc files a pass of this kind would wire now.
     #[cfg(unix)]
     fn rc_to_wire(&self, home: &Path) -> Vec<&'static str> {
         use crate::hooks::RcState;
@@ -661,9 +602,7 @@ impl Repair {
             .collect()
     }
 
-    /// The rc block may name only the current hooks in this account's private
-    /// directories. Selection can leave the hooks item out of the run, so the rc item
-    /// enforces this itself, again immediately before its writer runs.
+    /// The rc block may name only the current hooks in this account's private directories.
     #[cfg(unix)]
     fn require_current_hooks(&self) -> Result<(), String> {
         let home = self.home()?;
@@ -769,8 +708,6 @@ impl Repair {
                 RcState::Wired | RcState::SourcedElsewhere | RcState::Unwired => {}
             }
         }
-        // An rc that stands but that no pass edits (a dangling link, a directory, other
-        // bytes than UTF-8) is not in the wiring; it is said, never touched.
         for (rc, _) in crate::hooks::RC_FILES {
             if std::fs::symlink_metadata(home.join(rc)).is_ok()
                 && !wiring.iter().any(|(wired, _)| wired == &rc)
@@ -842,7 +779,6 @@ impl Repair {
     }
 }
 
-// The store's half: the stubs, rustup, the held update, the shims, the exec roots.
 impl Repair {
     fn stubs_pending(&self) -> Vec<String> {
         crate::reroute::lay_pending(
@@ -899,13 +835,10 @@ impl Repair {
         }
         match &status.entry {
             Ok(Entry::Link(_)) if status.targets_view => ok("rustup `trust` -> the managed view"),
-            // A link into the store, not the view: every pass re-points it.
             Ok(Entry::Link(_)) if status.in_prefix => change(
                 "rustup `trust` -> inside the store, not the view atpkg lays",
                 "a link to the managed view",
             ),
-            // A link the person made, or a directory or file: theirs. A stale one is
-            // `base.pkg.rustup.local`'s; `aterm pkg doctor` names the rest.
             Ok(Entry::Link(_) | Entry::Dir | Entry::File | Entry::Other) => {
                 not_applicable(crate::doctor::seam_line(&status, layout).map_or_else(
                     || "rustup `trust` is not atpkg's; left as it stands".to_owned(),
@@ -952,8 +885,7 @@ impl Repair {
         }
     }
 
-    /// Re-assert the rustup seams, or with `stale` re-point a stale link too
-    /// ([`crate::seam::repair`]); the events are the row's detail.
+    /// Re-assert the rustup seams ([`crate::seam::repair`]).
     fn apply_seam(&self, stale: bool) -> Result<(), String> {
         let Some(rustup_home) = self.ground.rustup_home.as_deref() else {
             return Ok(());
@@ -995,13 +927,7 @@ impl Repair {
                     })
             })
             .collect();
-        // A shim an older atpkg laid under a name no shim may carry now (design S13) is the
-        // sweep's to remove, whichever program's store it forwards into.
         let refused = crate::activate::refused_name_shims(self.layout());
-        // A program whose development link cannot be read keeps its shims, and the rest
-        // are still re-laid (the apply then fails on it, naming it): one unreadable marker
-        // holds no other program's commands back. `pkg repair` re-lays every program, as
-        // it always has, so there it is a change whatever the rest read.
         if !broken.is_empty()
             || !refused.is_empty()
             || (!plan.failed.is_empty() && self.ground.pass == Pass::Repair)
@@ -1036,8 +962,6 @@ impl Repair {
     }
 
     fn apply_shims(&self) -> Result<(), String> {
-        // The refused-name shims go first: the re-lay reads the names a program's shims
-        // still carry, and would only refuse each of these again.
         let removed = crate::activate::remove_refused_name_shims(self.layout(), None);
         if !removed.is_empty() {
             self.say([format!(
@@ -1158,8 +1082,7 @@ impl Repair {
     }
 }
 
-/// One program [`relay`] re-lays: its name, the build, the build's directory and the
-/// names it exposes.
+/// One program [`relay`] re-lays.
 pub(crate) struct Planned {
     pub(crate) program: String,
     pub(crate) build: u64,
@@ -1167,14 +1090,14 @@ pub(crate) struct Planned {
     pub(crate) exposes: Vec<String>,
 }
 
-/// What a re-lay of the installed programs' shims works from: one rule for the probe and
-/// the lay ([`shim_plan`]).
+/// What a re-lay of the installed programs' shims works from: one rule for the probe and the lay
+/// ([`shim_plan`]).
 pub(crate) struct ShimPlan {
     /// The programs to re-lay.
     pub(crate) lay: Vec<Planned>,
     /// `program@build` of each whose build is gone.
     pub(crate) missing: Vec<String>,
-    /// `program@build` of each left tombstoned: only an update pass may lift that.
+    /// `program@build` of each left tombstoned.
     pub(crate) revoked: Vec<String>,
     /// What was left alone and why (a dev link).
     pub(crate) notes: Vec<String>,
@@ -1182,11 +1105,7 @@ pub(crate) struct ShimPlan {
     pub(crate) failed: Vec<String>,
 }
 
-/// Which builds a re-lay of the shims works from: the build ACTIVATION selects
-/// (`store/<program>/current`), not the highest on disk — `rollback` keeps the build it
-/// rolled off until gc, and re-laying that one silently undid the rollback and minted a
-/// LinkShimMismatch (audit K2). With no usable link, the newest complete build. A
-/// dev-linked program owns its shims, and a tombstoned one keeps its tombstone (audit K2).
+/// Which builds a re-lay of the shims works from: the build ACTIVATION selects.
 pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
     let mut builds: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
         std::collections::BTreeMap::new();
@@ -1203,9 +1122,6 @@ pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
         notes: Vec::new(),
         failed: Vec::new(),
     };
-    // A linked checkout owns its shims even when an older store build remains.
-    // Validate the bounded directory as well as each marker: malformed intent
-    // is not permission to replace a developer's active tools with store copies.
     if let Err(error) = crate::linkmode::linked_programs_checked(layout) {
         plan.failed
             .push(format!("development links could not be read: {error}"));
@@ -1242,8 +1158,6 @@ pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
             continue;
         }
         let exposes = exposes(layout, program, &build_dir);
-        // Never over a tombstone (audit K2): a revoked build keeps its tree, marker and
-        // `current` links; only its shims turn into failing notices.
         let tombstoned = recorded
             .get(program)
             .is_some_and(|r| r.state.starts_with("tombstoned:"))
@@ -1264,8 +1178,7 @@ pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
     plan
 }
 
-/// The `bin/` shims a re-lay of `planned` lays: each exposed name, and its `alab-` alias
-/// where the program's aliases are laid ([`crate::activate::Aliases::laid_for`]).
+/// The `bin/` shims a re-lay of `planned` lays ([`crate::activate::Aliases::laid_for`]).
 fn shims_of(layout: &Layout, planned: &Planned) -> Vec<PathBuf> {
     let alab = crate::activate::Aliases::laid_for(layout, &planned.program)
         == crate::activate::Aliases::Alab;
@@ -1280,8 +1193,7 @@ fn shims_of(layout: &Layout, planned: &Planned) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether the shim at `shim` forwards to something that is there. A target that cannot
-/// be checked is no evidence of a fault (the doctor's own rule for check (4)).
+/// Whether the shim at `shim` forwards to something that is there.
 fn shim_runs(shim: &Path) -> bool {
     crate::platform::resolve_shim(shim).is_some_and(|target| {
         !matches!(
@@ -1297,13 +1209,11 @@ pub(crate) struct Relaid {
     pub(crate) relaid: usize,
     /// `program@build — why` of each whose shims could not be re-laid.
     pub(crate) failed: Vec<String>,
-    /// What was said along the way: a dev link left alone, a refused shim name.
+    /// What was said along the way.
     pub(crate) notes: Vec<String>,
 }
 
-/// Re-lay every installed program's shims from the build [`shim_plan`] selects, each with
-/// the build's own `shim_env` (its sidecar, design S7): a re-lay exports what the signed
-/// manifest declared, never less — `claude`'s DISABLE_AUTOUPDATER=1 above all.
+/// Re-lay every installed program's shims from the build [`shim_plan`] selects.
 pub(crate) fn relay(layout: &Layout) -> Relaid {
     let plan = shim_plan(layout);
     let mut relaid = Relaid {
@@ -1318,8 +1228,6 @@ pub(crate) fn relay(layout: &Layout) -> Relaid {
             build_dir,
             exposes,
         } = planned;
-        // What the lay says (an exec root it laid) is the row's, never stdout's: the JSON
-        // surfaces print one document there.
         let mut said = Vec::new();
         let laid = crate::activate::install_shims_env_saying(
             layout,
@@ -1350,17 +1258,7 @@ pub(crate) fn relay(layout: &Layout) -> Relaid {
     relaid
 }
 
-/// What [`relay`] re-lays for `program` from `build_dir`: the names its own shims still
-/// carry (they resolve even when their TARGET is gone, which is the audited shape), falling
-/// back to the program's own name — the overwhelmingly common single-tool case — when none
-/// survive.
-///
-/// PLUS THE PROGRAM'S OWN NAME WHEN ONLY ITS SHIM IS GONE: the build ships `bin/<program>`
-/// and `bin/<program>` in the managed `bin/` is absent. The survivors are not a record of
-/// the signed exposes — nothing local is — so reading them alone would make a lost shim
-/// permanent (the end state a trust rollback leaves once the next trust flip prunes what
-/// it re-pointed, see `flow::rollback_may_claim`). An absent shim is the only case taken:
-/// a present one — a dev link, a tombstone, another program's shim — is never overwritten.
+/// What [`relay`] re-lays for `program` from `build_dir`: the names its own shims still carry.
 pub(crate) fn exposes(layout: &Layout, program: &str, build_dir: &Path) -> Vec<String> {
     let Some(mut exposes) = crate::installed_exposes(layout, program) else {
         return vec![program.to_string()];

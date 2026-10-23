@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A parsed annotation can be waiting for its metadata lock when its caller's
-//! deadline ends. Reconnection must not let that abandoned request undo the
-//! replacement connection's acknowledged attention state.
+//! A parsed annotation can be waiting for its metadata lock when its caller's deadline ends.
 
 use std::cell::RefCell;
 use std::os::fd::AsRawFd;
@@ -24,8 +22,7 @@ struct Preemption {
     gone: bool,
 }
 
-/// Models preemption immediately before the real metadata mutex. The latch is
-/// local to this test's serving thread; unrelated tests never wait on it.
+/// Models preemption immediately before the real metadata mutex.
 pub(super) fn before_effect() {
     if let Some(gate) = BEFORE_EFFECT.with(|slot| slot.borrow_mut().take()) {
         gate.arrived.send(false).expect("preemption observed");
@@ -33,8 +30,6 @@ pub(super) fn before_effect() {
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("preempted lane resumed");
         if gate.gone {
-            // A sibling test's fork can retain a descriptor until exec on
-            // macOS. Wait for the actual full close, never a latency budget.
             aterm_spec::wait::until_within(
                 aterm_spec::wait::MUST_HAPPEN,
                 "the serving lane observes actual caller EOF",
@@ -177,8 +172,6 @@ fn exercise(case: Case, peer: Peer) {
     arrived
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
         .expect("old parsed request reached its effect boundary");
-    // The replacement lane applies the latest desired annotation, then a
-    // person's independent owner entry. Both must survive an abandoned write.
     assert_eq!(
         super::claim_supervisor(&h.ctx, "supervisor", Some(8), None, 100),
         Ok(false),
@@ -203,8 +196,6 @@ fn exercise(case: Case, peer: Peer) {
             .expect("supported request-side half-close"),
         Peer::Live | Peer::Internal => {}
     }
-    // Release the scheduling latch while still owning the actual metadata
-    // mutex. The effect checks the peer only after acquiring that mutex.
     resume.send(()).expect("resume old lane");
     let observed_gone = arrived
         .recv_timeout(aterm_spec::wait::MUST_HAPPEN)

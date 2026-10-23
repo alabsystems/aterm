@@ -1305,7 +1305,7 @@ pub(crate) fn theme_pair_short_label(raw: &str) -> Option<String> {
     })
 }
 
-/// The `theme` value for a `` pair, in the selector grammar's spelling.
+/// The `theme` value for a `(dark, light)` pair, in the selector grammar's spelling.
 pub(crate) fn theme_split_value(dark: &str, light: &str) -> String {
     format!("dark:{dark},light:{light}")
 }
@@ -1764,6 +1764,10 @@ pub(crate) fn apply_prefs_edits(
     let cursor_before = CursorStyleFacts::of(&doc);
     fold_retired_cursor_trail(&mut doc, edits);
     for (key, value) in edits {
+        // DOTTED keys edit a nested-table leaf (`update.auto_apply`,
+        // `sparkle_words.profanity.enabled`): the writer walks the table chain
+        // — creating missing tables, refusing to clobber a non-table — instead
+        // of the top-level `doc[key]` path, which would write a literal
         // `"update.auto_apply"` ROOT key serde ignores.
         if key.contains('.') {
             let parts: Vec<&str> = key.split('.').collect();
@@ -2816,7 +2820,7 @@ impl Section {
     ];
 
     /// The header label shown above the section's controls.
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Section::Appearance => "Appearance",
             Section::Cursor => "Cursor & Motion",
@@ -2954,6 +2958,8 @@ pub(crate) fn section_of(key: &str) -> Section {
 
 /// The group box a control belongs to inside its [`Section`] pane.
 pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
+    // The Sound page, before every prefix rule below: the synth voices under the
+    // Music effects switch, then the system bell, which that switch and the
     // volume never reach.
     if key == EDIT_BELL_SOUND {
         return ("Terminal bell", 1);
@@ -3387,7 +3393,7 @@ pub(crate) enum ApplicationTiming {
 
 impl ApplicationTiming {
     /// The one plain phrase every surface says for this timing.
-    pub(crate) fn words(self) -> &'static str {
+    pub(crate) const fn words(self) -> &'static str {
         match self {
             Self::AfterRestart => "Applies after restart",
             Self::NewSessions => "Applies to new sessions",
@@ -3408,7 +3414,7 @@ impl ApplicationTiming {
     }
 
     /// Whether saving under this timing still has an effect at once.
-    pub(crate) fn has_live_effect(self) -> bool {
+    pub(crate) const fn has_live_effect(self) -> bool {
         matches!(self, Self::NewTextOnly | Self::EnablingNeedsNewWindow)
     }
 }
@@ -3441,7 +3447,7 @@ pub(crate) fn application_timing(key: &str) -> Option<ApplicationTiming> {
 }
 
 /// When a saved Universal Control `policy` takes effect.
-pub(crate) fn universal_control_timing(
+pub(crate) const fn universal_control_timing(
     policy: atpkg::config::UniversalControlPolicy,
     packages_enabled: bool,
 ) -> Option<ApplicationTiming> {
@@ -3483,6 +3489,7 @@ pub(crate) fn security_label(key: &str) -> &'static str {
                 // The manipulation half is wired on Linux.
                 "Allow programs to resize the window and read its title and size"
             } else {
+                // No host callback off Linux: reports only, which include the
                 // engine's pixel answers (CSI 14 t, CSI 16 t), hence "size".
                 "Allow programs to read the window title and size"
             }

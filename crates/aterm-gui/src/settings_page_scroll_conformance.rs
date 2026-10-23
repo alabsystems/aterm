@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for a Settings list's bounded scroll cursor.
-//!
-//! Every shipping reducer path calls `settings_page_scroll_transition`; this test
-//! projects that genuine seam onto the derived row-step, Absolute and signed
-//! multi-row actions, including limit shrink and stale-offset recovery.
 
 use crate::native_settings::{SettingsPageScrollCommand, settings_page_scroll_transition};
 use aterm_models_misc::settings_page_scroll_model;

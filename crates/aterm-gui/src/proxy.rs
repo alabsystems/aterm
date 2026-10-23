@@ -625,7 +625,7 @@ fn take_owner_lock(f: std::fs::File) -> Option<OwnerLock> {
 }
 
 #[cfg(unix)]
-fn owner_file(lock: &OwnerLock) -> &std::fs::File {
+const fn owner_file(lock: &OwnerLock) -> &std::fs::File {
     lock.file()
 }
 
@@ -709,7 +709,7 @@ pub(crate) struct ChildProxy {
 
 impl ChildProxy {
     /// Take ownership of `edge_file`.
-    pub(crate) fn new(edge_file: Option<EdgeFile>) -> Self {
+    pub(crate) const fn new(edge_file: Option<EdgeFile>) -> Self {
         Self { edge_file }
     }
 }
@@ -718,6 +718,9 @@ impl Drop for ChildProxy {
     fn drop(&mut self) {
         if let Some(file) = self.edge_file.take() {
             // Removed while still locked, so no sweep can take it in between,
+            // then unlocked: off the event loop once `spawn_prep` runs, since
+            // the removal and the close that reclaims the file are filesystem
+            // work a closing tab held the loop for (about 1 ms).
             crate::spawn_prep::retire_edge_file(file);
         }
     }

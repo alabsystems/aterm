@@ -111,6 +111,7 @@ impl<V: Host> CellWalk<V> {
         self.cell.push(c);
         let grew = V::columns(&self.cell).saturating_sub(before);
         if own == 0 || grew == 0 {
+            // Drawn in the cell before it: a zero-width character (which may
             // widen that cell), or one the grid folds into it.
             if full {
                 self.cell.pop();

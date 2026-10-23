@@ -1108,19 +1108,19 @@ impl Lane {
     }
 
     /// A new sheet's id.
-    pub(crate) fn mint_id(&mut self) -> u64 {
+    pub(crate) const fn mint_id(&mut self) -> u64 {
         self.last_id += 1;
         self.last_id
     }
 
     /// The sheet `id` went up at `now`.
-    pub(crate) fn raised(&mut self, id: u64, now: Instant) {
+    pub(crate) const fn raised(&mut self, id: u64, now: Instant) {
         self.sheet = Some((id, now));
         self.waiting = None;
     }
 
     /// Whether a sheet is up.
-    pub(crate) fn sheet_up(&self) -> bool {
+    pub(crate) const fn sheet_up(&self) -> bool {
         self.sheet.is_some()
     }
 
@@ -1135,24 +1135,24 @@ impl Lane {
     }
 
     /// The sheet went with no answer (its window closed, or `sudo`'s sheet needed it): asked again at the next quiet moment.
-    pub(crate) fn withdrawn(&mut self) {
+    pub(crate) const fn withdrawn(&mut self) {
         self.sheet = None;
         self.next_look = None;
     }
 
     /// The ask is moot for this process: nothing is raised.
-    pub(crate) fn end(&mut self) {
+    pub(crate) const fn end(&mut self) {
         self.over = true;
         self.next_look = None;
     }
 
     /// A join started (`started`) or could not.
-    pub(crate) fn join_started(&mut self, started: bool) {
+    pub(crate) const fn join_started(&mut self, started: bool) {
         self.joining = started;
     }
 
     /// The join ended.
-    pub(crate) fn join_ended(&mut self) {
+    pub(crate) const fn join_ended(&mut self) {
         self.joining = false;
     }
 

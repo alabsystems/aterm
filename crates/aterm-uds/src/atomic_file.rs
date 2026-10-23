@@ -111,7 +111,30 @@ pub const LOCK_OPEN_FLAGS: i32 = 0;
 /// How long an edit waits for the config service's write lock.
 pub const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(2);
 
-/// aterm.toml, read for one edit and written the way the config service writes a Settings save (`aterm-gui`'s `native_document_host`: read by `read_config_atomic_file` with no lock, then `commit_atomic_bytes` under it):
+/// aterm.toml, read for one edit and written the way the config service
+/// writes a Settings save (`aterm-gui`'s `native_document_host`: read by
+/// `read_config_atomic_file` with no lock, then `commit_atomic_bytes` under
+/// it):
+///
+/// - A FINAL-FILE LINK IS FOLLOWED, NOT REPLACED. aterm.toml may be a link into
+///   a dotfiles checkout, a layout the service binds and keeps. The text, the
+///   `.bak` and the rename all land at the file the link names; a rename over
+///   the link itself (what [`write`] does to a cap or key file, on purpose)
+///   would turn it into a local copy every later save went to.
+/// - THE SERVICE'S WRITE LOCK IS TAKEN FOR A WRITE, NEVER A READ
+///   ([`Self::lock`]): `.<target name>.aterm-write.lock` beside the target,
+///   opened no-follow, `flock` exclusive. A run that changes nothing creates
+///   and holds nothing, so a no-op through a link into a directory nobody may
+///   write (home-manager's into `/nix/store`) still reads `already`. A
+///   Settings save that meets the lock retries for about half a second — its
+///   25 ms lock budget inside a 500 ms preflight retry — and then fails as
+///   busy, so the hold is the write alone: the `.bak` and the text, never the
+///   parse or a line printed to a pipe nobody drains.
+/// - NOTHING IS WRITTEN OVER BYTES THAT CHANGED since they were read: checked
+///   under the lock before the `.bak` (an older `.bak` is not replaced for an
+///   edit that never lands) and again just before the rename, so a writer
+///   that ignores the lock (an editor) makes the edit refuse rather than have
+///   its change reverted.
 pub struct ConfigFile {
     /// The file the text lives in: the config path, or what a link there names.
     target: PathBuf,

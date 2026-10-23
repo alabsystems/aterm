@@ -152,7 +152,7 @@ impl SetupStatusRow {
 }
 
 /// Empty preedit clears platform composition state without any typed input.
-pub(crate) fn text_input_interacts(event: &TextInputEvent) -> bool {
+pub(crate) const fn text_input_interacts(event: &TextInputEvent) -> bool {
     !matches!(event, TextInputEvent::Preedit { text, .. } if text.is_empty())
 }
 
@@ -789,7 +789,13 @@ impl NativeAppModel for SystemStateApp {
         use crate::native_ui::{AuditedCustomNode, RAINBOW_BANNER_AUDIT};
         let width = cx.viewport.width.max(180.0);
         let compact = width < 720.0;
-        let padding = if compact { 12.0 } else { 24.0 };
+        // A short page keeps the narrow page's margin: a wide first window is as short as a
+        // narrow one, and the wide margin cost it its second checklist row.
+        let padding = if compact || cx.viewport.height < 480.0 {
+            12.0
+        } else {
+            24.0
+        };
         let inner = (width - padding * 2.0).max(1.0);
         let reviewed_plan = self.reviewed_plan();
         let summary = self.status.summary(Some(&reviewed_plan));
@@ -824,17 +830,6 @@ impl NativeAppModel for SystemStateApp {
             None,
         );
         let action_h = if compact { 80.0 } else { 36.0 };
-        let room = (cx.viewport.height
-            - padding * 2.0
-            - 48.0
-            - 40.0
-            - help_h
-            - 68.0
-            - vault_h
-            - restore_h
-            - action_h
-            - 48.0)
-            .max(34.0);
         let mut rows = Vec::new();
         for (index, setting) in Setting::ALL.iter().enumerate() {
             let key = format!("system-state/setting/{index}");
@@ -903,6 +898,26 @@ impl NativeAppModel for SystemStateApp {
         }
         let total = rows.len();
         let start = view.scroll.min(total.saturating_sub(1));
+        // The title, guidance, vault fields, Apply and Cancel, and the column's gaps. A page with
+        // no room for two checklist rows and the scroll caption gives up, in turn, the banner,
+        // the restore hint (and a narrow page's Check and Restore row), and the vault hint: a
+        // first window (80×24 under the vitals band) leaves System State 334 points.
+        let core = padding * 2.0 + 40.0 + help_h + 68.0 + 36.0 + 5.0 * 6.0;
+        let optional = [vault_h + 6.0, action_h - 36.0 + restore_h + 6.0, 48.0 + 6.0];
+        let room_with =
+            |shown: usize| cx.viewport.height - core - optional[..shown].iter().sum::<f32>();
+        let wanted = rows
+            .iter()
+            .skip(start)
+            .take(2)
+            .map(|(_, height)| height)
+            .sum::<f32>()
+            + 20.0;
+        let mut shown = optional.len();
+        while shown > 0 && room_with(shown) < wanted {
+            shown -= 1;
+        }
+        let room = room_with(shown).max(34.0);
         let page_end = |room| {
             let mut end = start;
             let mut used = 0.0;
@@ -980,25 +995,34 @@ impl NativeAppModel for SystemStateApp {
         .collect::<Vec<_>>();
         let actions = if compact {
             let second = buttons.split_off(2);
-            UiNode::new(
-                "system-state/actions",
-                UiContent::Group(GroupSpec::new("System State actions")),
-            )
-            .layout(Layout::column().gap(8.0).height(Length::Fixed(action_h)))
-            .children(vec![
+            let mut groups = vec![
                 UiNode::new(
                     "system-state/actions/main",
                     UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
                 )
                 .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
                 .children(buttons),
-                UiNode::new(
-                    "system-state/actions/maintenance",
-                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                )
-                .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
-                .children(second),
-            ])
+            ];
+            if shown >= 2 {
+                groups.push(
+                    UiNode::new(
+                        "system-state/actions/maintenance",
+                        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                    )
+                    .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
+                    .children(second),
+                );
+            }
+            UiNode::new(
+                "system-state/actions",
+                UiContent::Group(GroupSpec::new("System State actions")),
+            )
+            .layout(
+                Layout::column()
+                    .gap(8.0)
+                    .height(Length::Fixed(if shown >= 2 { action_h } else { 36.0 })),
+            )
+            .children(groups)
         } else {
             UiNode::new(
                 "system-state/actions",
@@ -1039,6 +1063,45 @@ impl NativeAppModel for SystemStateApp {
             )
             .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
         ]);
+        let mut children = Vec::new();
+        if shown >= 3 {
+            children.push(brand);
+        }
+        children.extend([
+            text("system-state/title", "System State", StyleRef::Hero, 40.0),
+            help,
+            UiNode::new(
+                "system-state/rows",
+                UiContent::Group(GroupSpec::new(format!(
+                    "Setup checklist and progress, rows {}–{} of {total}",
+                    start + 1,
+                    end
+                ))),
+            )
+            .layout(Layout::column().height(Length::Fill).clipped())
+            .children(rows),
+            self.field(
+                view,
+                "system-state/url",
+                "Secrets vault URL",
+                self.url.projection(),
+                false,
+            ),
+            self.field(
+                view,
+                "system-state/password",
+                "Vault password (optional)",
+                self.password.projection(),
+                true,
+            ),
+        ]);
+        if shown >= 1 {
+            children.push(vault_hint);
+        }
+        if shown >= 2 {
+            children.push(restore_hint);
+        }
+        children.push(actions);
         UiTree::new(
             UiNode::new(
                 "system-state/app",
@@ -1050,38 +1113,7 @@ impl NativeAppModel for SystemStateApp {
                     .gap(6.0)
                     .clipped(),
             )
-            .children(vec![
-                brand,
-                text("system-state/title", "System State", StyleRef::Hero, 40.0),
-                help,
-                UiNode::new(
-                    "system-state/rows",
-                    UiContent::Group(GroupSpec::new(format!(
-                        "Setup checklist and progress, rows {}–{} of {total}",
-                        start + 1,
-                        end
-                    ))),
-                )
-                .layout(Layout::column().height(Length::Fill).clipped())
-                .children(rows),
-                self.field(
-                    view,
-                    "system-state/url",
-                    "Secrets vault URL",
-                    self.url.projection(),
-                    false,
-                ),
-                self.field(
-                    view,
-                    "system-state/password",
-                    "Vault password (optional)",
-                    self.password.projection(),
-                    true,
-                ),
-                vault_hint,
-                restore_hint,
-                actions,
-            ]),
+            .children(children),
         )
     }
 
@@ -1673,7 +1705,6 @@ mod tests {
     fn result_and_approval_guidance_stays_visible_above_an_unscrolled_checklist() {
         use crate::native_app::ViewMotionCx;
         use crate::native_ui::LogicalRect;
-        let viewport = LogicalRect::new(0.0, 0.0, 999.0, 740.0);
         for (row, complete, busy) in [
             (
                 SetupStatusRow {
@@ -1751,6 +1782,11 @@ mod tests {
             if busy {
                 assert!(!app.presentation(&view).indicators.attention);
             }
+            for viewport in [
+                LogicalRect::new(0.0, 0.0, 999.0, 740.0),
+                LogicalRect::new(0.0, 0.0, 624.0, 334.0),
+                LogicalRect::new(0.0, 0.0, 999.0, 334.0),
+            ] {
             let compiled = app
                 .view(
                     &view,
@@ -1807,6 +1843,7 @@ mod tests {
                 let node = compiled.semantic(&UiKey::new(key)).unwrap();
                 assert!(!node.offscreen);
                 assert!(node.rect.y >= 0.0 && node.rect.bottom() <= viewport.bottom());
+            }
             }
             assert_eq!(view.scroll, 0);
         }
@@ -2115,6 +2152,79 @@ mod tests {
             runtime.remove_view(view);
             runtime.remove_instance(instance);
             assert_eq!(receive.try_recv().unwrap().decision, expected);
+        }
+    }
+
+    /// A first window is 80×24 under the vitals band: System State had 624×334 points in a
+    /// macOS 26.6 and 27.0 VM, where the page drew no checklist row and clipped Check and
+    /// Restore while its countdown ran. A short page, wide or narrow, leaves out its banner,
+    /// hints and maintenance buttons first; a tall one keeps everything.
+    #[test]
+    fn a_short_page_keeps_the_checklist_apply_and_the_vault_fields_in_view() {
+        use crate::native_app::ViewMotionCx;
+        use crate::native_ui::LogicalRect;
+        let app = SystemStateApp::new(Plan::default());
+        let view = SystemStateViewState::default();
+        let compile = |viewport: LogicalRect| {
+            app.view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    animation_phase_ms: 0,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 13.0,
+                    terminal_scale: 1.0,
+                    semantic_font: None,
+                    document: None,
+                },
+            )
+            .compile(viewport)
+            .unwrap()
+        };
+        let in_view =
+            |compiled: &crate::native_ui::CompiledUi, viewport: LogicalRect, key: &str| {
+                compiled.semantic(&UiKey::new(key)).is_some_and(|node| {
+                    !node.offscreen
+                        && node.rect.height > 0.0
+                        && node.rect.y >= 0.0
+                        && node.rect.bottom() <= viewport.bottom()
+                })
+            };
+        for width in [624.0, 999.0, 1400.0] {
+            for height in (334..=742).step_by(24) {
+                let page = LogicalRect::new(0.0, 0.0, width, height as f32);
+                let compiled = compile(page);
+                for key in [
+                    "system-state/title",
+                    "system-state/setting/0",
+                    "system-state/setting/1",
+                    "system-state/url",
+                    "system-state/password",
+                    "system-state/apply",
+                    "system-state/cancel",
+                ] {
+                    assert!(
+                        in_view(&compiled, page, key),
+                        "{key} in a {width}×{height} page"
+                    );
+                }
+            }
+            let short = LogicalRect::new(0.0, 0.0, width, 334.0);
+            assert!(
+                in_view(&compile(short), short, "system-state/scroll-caption"),
+                "the scroll caption in a {width}×334 page"
+            );
+            let tall = LogicalRect::new(0.0, 0.0, width, 740.0);
+            let compiled = compile(tall);
+            for key in [
+                "system-state/brand",
+                "system-state/vault-help",
+                "system-state/restore-help",
+                "system-state/check",
+                "system-state/restore",
+            ] {
+                assert!(in_view(&compiled, tall, key), "{key} in a {width}×740 page");
+            }
         }
     }
 

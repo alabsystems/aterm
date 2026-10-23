@@ -65,14 +65,14 @@ struct OrderKey {
 }
 
 impl OrderKey {
-    fn output(lifetime: u64, ordinal: u64) -> Self {
+    const fn output(lifetime: u64, ordinal: u64) -> Self {
         Self {
             lifetime,
             rank: ordinal.saturating_mul(2).saturating_add(1),
         }
     }
 
-    fn resize(lifetime: u64, ordinal: u64) -> Self {
+    const fn resize(lifetime: u64, ordinal: u64) -> Self {
         Self {
             lifetime,
             rank: ordinal.saturating_mul(2),
@@ -128,7 +128,7 @@ impl CastCuts {
     }
 
     /// Whether at least one `term_lock` hold processed this burst.
-    pub(crate) fn held(&self) -> bool {
+    pub(crate) const fn held(&self) -> bool {
         self.first.is_some()
     }
 
@@ -199,7 +199,7 @@ impl ResizeStamp {
     }
 
     /// [`take`](Self::take) at a given instant.
-    fn take_at(term: &Terminal, at: Instant) -> Self {
+    const fn take_at(term: &Terminal, at: Instant) -> Self {
         Self {
             at,
             lifetime: term.resize_lifetime(),
@@ -210,19 +210,19 @@ impl ResizeStamp {
 
 impl Event {
     /// The event's time since the recorder's epoch.
-    fn t(&self) -> Duration {
+    const fn t(&self) -> Duration {
         match self {
             Event::Output { t, .. } | Event::Resize { t, .. } => *t,
         }
     }
 
-    fn set_t(&mut self, to: Duration) {
+    const fn set_t(&mut self, to: Duration) {
         match self {
             Event::Output { t, .. } | Event::Resize { t, .. } => *t = to,
         }
     }
 
-    fn key(&self) -> Option<OrderKey> {
+    const fn key(&self) -> Option<OrderKey> {
         match self {
             Event::Output { key, .. } | Event::Resize { key, .. } => *key,
         }
@@ -266,11 +266,11 @@ struct EventLog {
 }
 
 impl EventLog {
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.len
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
@@ -315,6 +315,7 @@ impl EventLog {
         }
         if unsealing {
             // The unsealed run grew the deque; resealed, it gives those slots back,
+            // or they would outlive it uncharged.
             self.open.shrink_to(2 * CHUNK_EVENTS);
         }
     }
@@ -504,7 +505,7 @@ impl CastRecorder {
     }
 
     /// Marks this recording as starting at a seamless-update [`crate::session_timeline::HandoffGap`].
-    pub(crate) fn mark_handoff(&mut self, gap: crate::session_timeline::HandoffGap) {
+    pub(crate) const fn mark_handoff(&mut self, gap: crate::session_timeline::HandoffGap) {
         self.handoff = Some(gap);
     }
 
@@ -519,7 +520,7 @@ impl CastRecorder {
     }
 
     /// Monotonic epoch of this recorder's timeline.
-    pub(crate) fn epoch(&self) -> Instant {
+    pub(crate) const fn epoch(&self) -> Instant {
         self.epoch
     }
 
@@ -794,13 +795,13 @@ pub(crate) struct CastSnapshot {
 impl CastSnapshot {
     /// Number of leading events evicted before this snapshot.
     #[must_use]
-    pub(crate) fn evicted(&self) -> u64 {
+    pub(crate) const fn evicted(&self) -> u64 {
         self.evicted
     }
 
     /// Seamless-update handoff gap at the start of this recording, if any.
     #[must_use]
-    pub(crate) fn handoff(&self) -> Option<crate::session_timeline::HandoffGap> {
+    pub(crate) const fn handoff(&self) -> Option<crate::session_timeline::HandoffGap> {
         self.handoff
     }
 

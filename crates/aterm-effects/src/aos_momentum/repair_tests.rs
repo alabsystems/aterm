@@ -21,8 +21,6 @@ use crate::cursor_momentum::{MOMENTUM_GLOW_TAU_S, MomentumGlow};
 
 const TAU: f32 = MOMENTUM_GLOW_TAU_S;
 
-/// A host running the demonstration fault, typed into and run to the point its lane parks
-/// with light on glass. Returns the host, the park instant and the caret.
 fn stranded(t0: Instant, dark: bool) -> (MomentumHost, Instant, (u16, u16)) {
     let mut host = attached(t0, MomentumCode::DemoStrandedSettle);
     let c = cfg(dark);
@@ -51,12 +49,6 @@ fn stranded(t0: Instant, dark: bool) -> (MomentumHost, Instant, (u16, u16)) {
     (host, parked.at, cell)
 }
 
-/// The full M2 flow on one host with injected instants (dark and light pages): the
-/// demonstration fault strands the settling glow; the pause records a final query; the
-/// repair to the shipped code commits on a witness whose live code failed `HotHasWake`,
-/// whose candidate passed and whose same-code replay reproduced the head, graded `Tested`;
-/// after the commit the glow names its wake and the lane runs to the inert clearing frame;
-/// fresh keys then heat it and it clears again, with no reset and no further replay.
 #[test]
 fn the_stranded_glow_is_repaired_live_and_fresh_keys_heat_and_clear_with_no_reset_or_replay() {
     let t0 = Instant::now();
@@ -183,9 +175,6 @@ fn the_stranded_glow_is_repaired_live_and_fresh_keys_heat_and_clear_with_no_rese
     }
 }
 
-/// The same flow refuses a candidate that fails the corrected contract: repairing the
-/// stranded glow with the demonstration fault itself is `CandidateFailed` at the first
-/// settling query, and the pause holds, its queue intact.
 #[test]
 fn a_candidate_that_fails_the_contract_is_refused_and_the_pause_holds() {
     let t0 = Instant::now();
@@ -202,9 +191,6 @@ fn a_candidate_that_fails_the_contract_is_refused_and_the_pause_holds() {
     assert_eq!(hosted(&host).boundary.queued(), 1);
 }
 
-/// A repair without a prior pause is refused (`NotPaused`) and records nothing; a pause of a
-/// paused glow is `AlreadyPaused` and records nothing; an unattached host refuses both
-/// (`NotAttached`).
 #[test]
 fn repair_needs_a_prior_pause_and_neither_refusal_records_anything() {
     let t0 = Instant::now();
@@ -230,9 +216,6 @@ fn repair_needs_a_prior_pause_and_neither_refusal_records_anything() {
     ));
 }
 
-/// Keys typed while paused queue (the glow does not move), and after the commit each is
-/// delivered once, in order, to the new pair: the glow then holds exactly the rate a direct
-/// engine reaches with the same keys, and the keys sit in the new log in order.
 #[test]
 fn keys_while_paused_queue_and_are_delivered_once_after_the_commit() {
     let t0 = Instant::now();
@@ -289,8 +272,6 @@ fn keys_while_paused_queue_and_are_delivered_once_after_the_commit() {
     assert_eq!(control.value(now + ms(40), TAU), g.value(now + ms(40), TAU));
 }
 
-/// Rejecting the update (resume) delivers each queued key once, in order, to the old pair,
-/// which keeps running the old code.
 #[test]
 fn keys_while_paused_are_delivered_once_to_the_old_pair_on_resume() {
     let t0 = Instant::now();
@@ -330,9 +311,6 @@ fn keys_while_paused_are_delivered_once_to_the_old_pair_on_resume() {
     assert_eq!(run.observation_chain, h.chain.chain);
 }
 
-/// While paused, a tick is shown the held overlay (the last delivered tick's quads and
-/// frame, after other effects' quads) and moves nothing; the glow reads neither active nor
-/// settling and names no wake, so the host's lane parks with the held frame on glass.
 #[test]
 fn ticks_while_paused_show_the_held_overlay_and_do_not_advance_the_state() {
     let t0 = Instant::now();
@@ -361,9 +339,6 @@ fn ticks_while_paused_show_the_held_overlay_and_do_not_advance_the_state() {
     }
 }
 
-/// A key that finds the queue full rejects the update before anything is dropped: the old
-/// pair receives the queued keys and then that key, once each, in order, and the glow holds
-/// what a direct engine holds after the same keys.
 #[test]
 fn a_full_queue_rejects_the_update_and_loses_no_key() {
     let t0 = Instant::now();
@@ -405,10 +380,6 @@ fn a_full_queue_rejects_the_update_and_loses_no_key() {
     assert_eq!(run.observation_chain, h.chain.chain);
 }
 
-/// Two candidates prepared against one paused head: the first commits, and the second,
-/// prepared against the head that commit replaced, is refused as `StaleHead` when the new
-/// pair is paused again, naming the old head and the new revision; the live pair the first
-/// installed is left untouched and the pause held.
 #[test]
 fn a_second_candidate_prepared_against_the_old_head_is_refused_after_a_commit() {
     let t0 = Instant::now();
@@ -447,9 +418,6 @@ fn a_second_candidate_prepared_against_the_old_head_is_refused_after_a_commit() 
     assert_eq!(h.boundary.stats().publications, 1);
 }
 
-/// Re-attaching under the same epoch, code and build re-anchors on the same boundary (a new
-/// checkpoint whose parent is the old one, a new log epoch); another code starts a fresh
-/// boundary over the same live state.
 #[test]
 fn re_attaching_re_anchors_and_another_code_starts_afresh() {
     let t0 = Instant::now();
@@ -483,8 +451,6 @@ fn re_attaching_re_anchors_and_another_code_starts_afresh() {
     assert_eq!(MOMENTUM_QUEUE_CAP, hosted(&host).boundary.queue_cap());
 }
 
-/// The exported trace decodes: the checkpoint and the log come back under the identity they
-/// were recorded with, and the decoded log is the live one.
 #[test]
 fn the_exported_trace_decodes_to_the_live_checkpoint_and_log() {
     let t0 = Instant::now();
@@ -511,11 +477,6 @@ fn the_exported_trace_decodes_to_the_live_checkpoint_and_log() {
     );
 }
 
-/// A paused tick shows the held overlay only while its own gates allow the glow and only for
-/// the caret the overlay was drawn for: the glow switched off (Serious Mode, focus, the
-/// switch), no intensity, no cursor, another geometry, another cell, another page or caret
-/// shape each show the inert frame and append nothing, as the engine would; the tick the
-/// overlay was drawn for still shows it, and none of them is recorded.
 #[test]
 fn a_paused_tick_shows_the_held_overlay_only_for_its_own_caret_while_its_gates_allow_the_glow() {
     let t0 = Instant::now();
@@ -570,11 +531,6 @@ fn a_paused_tick_shows_the_held_overlay_only_for_its_own_caret_while_its_gates_a
     assert_eq!(hosted(&host).boundary.stats().skipped, 14);
 }
 
-/// A long attached run re-anchors its log at step boundaries (each epoch holds at most
-/// `MOMENTUM_HOST_MAX_EVENTS` inputs, so a repair replays at most that many), and the
-/// stranded demonstration after it is still caught: the pause records its final query in
-/// the current epoch, the live code fails `HotHasWake` from the re-anchored checkpoint, the
-/// shipped candidate passes, and the same-code replay reproduces the head.
 #[test]
 fn a_long_attached_run_reanchors_and_a_repair_after_it_still_produces_the_witness() {
     let t0 = Instant::now();

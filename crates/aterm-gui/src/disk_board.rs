@@ -198,7 +198,7 @@ impl FreedTally {
 }
 
 /// Short human-readable label for a supervised pass removal of `class`.
-pub(crate) fn freed_what(class: Class) -> &'static str {
+pub(crate) const fn freed_what(class: Class) -> &'static str {
     match class {
         Class::CargoTargets => BUILD_CACHES,
         Class::ClaudeStaleVersions => "old Claude Code versions",

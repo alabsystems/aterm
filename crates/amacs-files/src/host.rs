@@ -1027,6 +1027,11 @@ pub fn execute_granted_save(grant: &DocumentGrant, plan: &SavePlan) -> AtomicSav
 /// line break is CRLF is held with LF ([`Decoded::hold`]).
 fn decode_utf8(bytes: Vec<u8>) -> Result<Decoded, DocumentHostError> {
     // The BOM arm decodes the bytes after the mark into a new String rather than
+    // draining the mark out of the buffer, a range whose bound the prover cannot
+    // follow (SPECS.md §2 has the in-place forms measured). The copy briefly holds
+    // twice an n-byte file with a mark, no more than the engine's rope build then
+    // holds beside the admitted String; a file without one decodes in place. A
+    // file held as CRLF is copied once more, by `Decoded::hold`.
     if let [b0, b1, b2, text @ ..] = bytes.as_slice()
         && is_utf8_bom(*b0, *b1, *b2)
     {
@@ -1375,6 +1380,7 @@ fn normalize_process_temp_root(path: &Path) -> Result<PathBuf, DocumentHostError
     let temporary = std::env::temp_dir();
     let Ok(suffix) = path.strip_prefix(&temporary) else {
         // Not under the temporary root: nothing to normalize, and no symlink exemption
+        // is being claimed on this path's behalf.
         return Ok(path.to_path_buf());
     };
     let root = fs::canonicalize(&temporary).map_err(|error| DocumentHostError::Io {
@@ -2315,6 +2321,7 @@ pub fn sync_directory(path: &Path, flush: Flush) -> std::io::Result<()> {
 #[cfg(not(unix))]
 pub fn sync_directory(_path: &Path, _flush: Flush) -> std::io::Result<()> {
     // Windows rename durability is provided by the file replacement path; opening a
+    // directory as a normal File is not portable there.
     Ok(())
 }
 

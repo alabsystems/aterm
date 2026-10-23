@@ -91,8 +91,7 @@ pub(crate) fn encode_groups(hrp: &str, groups: &[u8]) -> String {
     text
 }
 
-/// The lowercased HRP, the 5-bit data groups (checksum removed) and whether the string was
-/// uppercase.
+/// The lowercased HRP, the 5-bit data groups (checksum removed) and whether `text` was uppercase.
 pub(crate) fn decode_groups(text: &str) -> Option<(String, Vec<u8>, bool)> {
     let bytes = text.as_bytes();
     if bytes.iter().any(|&c| !(33..=126).contains(&c)) {
@@ -290,8 +289,6 @@ mod tests {
         }
     }
 
-    /// age drops BIP 173's 90-character limit: the vector BIP 173 refuses only for its
-    /// length is accepted here.
     #[test]
     fn no_length_limit() {
         let text = "an84characterslonghumanreadablepartthatcontainsthenumber1andtheexcludedcharactersbio1569pvx";

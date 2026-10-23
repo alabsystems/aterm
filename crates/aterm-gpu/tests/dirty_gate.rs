@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// GPU dirty gate: on an unchanged frame `GpuRenderer::render_input_cached` re-presents the
-// previous frame's read-back pixels with no GPU work. Over scripted sequences on one reused
-// renderer, every frame (hit or miss) equals a fresh render on a separate renderer, unchanged
-// frames take the gate, and changes (a cell, the cursor effect shape, rain draining) miss.
-//
-// No GPU or no font: COULD NOT RUN.
 
 use crate::common;
 
@@ -20,16 +13,14 @@ use aterm_render::{RenderInput, Theme};
 const ROWS: usize = 8;
 const COLS: usize = 24;
 
-/// A fresh GpuRenderer at the suite's px/theme (no GPU: COULD NOT RUN), with
-/// fonts settled so a fallback landing between frames cannot read as a stale gate.
+/// A fresh GpuRenderer at the suite's px/theme.
 fn fresh_gpu() -> GpuRenderer {
     let mut g = common::gpu(18.0, Theme::default());
     g.debug_block_on_lazy_fallbacks();
     g
 }
 
-/// Render `input` on a brand-new GpuRenderer (full encode + readback) with the
-/// given blink/override state: the uncached oracle.
+/// Render `input` on a brand-new GpuRenderer.
 fn fresh_render(input: &RenderInput, blink: bool, override_: Option<CursorStyle>) -> Vec<u32> {
     let mut g = fresh_gpu();
     let mut win = aterm_gpu::WindowGpu::new();
@@ -43,15 +34,10 @@ fn gpu_dirty_gate_byte_identical() {
     let mut gpu = fresh_gpu();
     let mut win = aterm_gpu::WindowGpu::new();
 
-    // Scripted steps fed at fixed dims through the reused renderer's `render_input_cached`.
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
-
-    // `expect_hit`: `Some(true)` must take the gate, `Some(false)` must miss, `None` is not
-    // asserted.
 
     struct Step {
         desc: &'static str,
-        // Mutates the terminal (process bytes, move cursor, select, scroll…).
         act: Box<dyn Fn(&mut Terminal)>,
         blink: bool,
         override_: Option<CursorStyle>,
@@ -78,15 +64,11 @@ fn gpu_dirty_gate_byte_identical() {
         step("prompt", |t| t.process(b"$ "), true, None, Some(false)),
         step("idle (unchanged)", |_| {}, true, None, Some(true)),
         step("idle again", |_| {}, true, None, Some(true)),
-        // Blink toggles are not asserted: whether shown-ness changes depends on the DECSCUSR
-        // default.
         step("blink off", |_| {}, false, None, None),
         step("blink on", |_| {}, true, None, None),
         step("type 'l'", |t| t.process(b"l"), true, None, Some(false)),
         step("idle after type", |_| {}, true, None, Some(true)),
         step("type 's'", |t| t.process(b"s"), true, None, Some(false)),
-        // Enough output to reach scrollback, so a later `scroll_display` changes the display
-        // offset.
         step(
             "run output",
             |t| {
@@ -175,13 +157,11 @@ fn gpu_dirty_gate_byte_identical() {
         let hits_before = gpu.gate_hits();
         let view = gpu.render_input_cached(&mut win, &input);
 
-        // Copy the borrowed pixels out before `gpu` is used again.
         let got: Vec<u32> = view.pixels().to_vec();
         let (gw, gh) = (view.width(), view.height());
         drop(view);
         let took_gate = gpu.gate_hits() > hits_before;
 
-        // Dimensions are fixed for the whole sequence.
         assert_eq!(
             (gw, gh),
             (COLS * gpu.cell_size().0, ROWS * gpu.cell_size().1),
@@ -189,8 +169,6 @@ fn gpu_dirty_gate_byte_identical() {
             s.desc
         );
 
-        // (a) Hit or miss, the pixels must equal a fresh full render of the
-        // same input and cursor state.
         let oracle = fresh_render(&input, s.blink, s.override_);
         assert_eq!(
             got.len(),
@@ -205,7 +183,6 @@ fn gpu_dirty_gate_byte_identical() {
             if took_gate { "HIT" } else { "miss" },
         );
 
-        // (b) the gate must fire exactly where the test says it should.
         match s.expect_hit {
             Some(true) => {
                 assert!(
@@ -237,7 +214,6 @@ fn gpu_dirty_gate_byte_identical() {
         );
     }
 
-    // The gate must actually fire on real frames.
     assert!(
         hits_seen >= 1,
         "the dirty-gate never fired — optimisation not exercised"
@@ -257,8 +233,6 @@ fn gpu_dirty_gate_byte_identical() {
     );
 }
 
-/// A gate hit followed by a one-cell change: the changed frame misses and
-/// matches a fresh render (the cache does not stick on the prior frame).
 #[test]
 fn gpu_dirty_gate_one_cell_change_after_hit() {
     let mut gpu = fresh_gpu();
@@ -269,12 +243,10 @@ fn gpu_dirty_gate_one_cell_change_after_hit() {
     gpu.set_cursor_blink_phase(true);
     gpu.set_cursor_style_override(None);
 
-    // Frame 1: first paint (miss, fills the cache).
     let in1 = term.cell_frame(ROWS, COLS);
     let _ = gpu.render_input_cached(&mut win, &in1);
     assert_eq!(gpu.gate_misses(), 1, "first frame must miss");
 
-    // Frame 2: identical input hits.
     let in2 = term.cell_frame(ROWS, COLS);
     let hits_before = gpu.gate_hits();
     let v2 = gpu.render_input_cached(&mut win, &in2);
@@ -284,14 +256,11 @@ fn gpu_dirty_gate_one_cell_change_after_hit() {
         gpu.gate_hits() > hits_before,
         "second (unchanged) frame must take the gate"
     );
-    // Hit pixels equal a fresh render of the unchanged input.
     assert!(
         got2 == fresh_render(&in2, true, None),
         "gate-hit pixels diverge from fresh render"
     );
 
-    // Frame 3: one cell changes ('C' → 'D'): a miss matching a fresh render of the changed
-    // input, not the stale "ABC" frame.
     term.process(b"\x08D"); // backspace over 'C', write 'D' → "ABD"
     let in3 = term.cell_frame(ROWS, COLS);
     let misses_before = gpu.gate_misses();
@@ -306,13 +275,11 @@ fn gpu_dirty_gate_one_cell_change_after_hit() {
         got3 == fresh_render(&in3, true, None),
         "post-change pixels diverge from fresh render"
     );
-    // And the changed frame is genuinely different from the prior cached frame.
     assert!(
         got3 != got2,
         "one-cell change produced an identical framebuffer (suspicious)"
     );
 
-    // Frame 4: idle on the changed screen hits again, byte-identical.
     let in4 = term.cell_frame(ROWS, COLS);
     let hits_before = gpu.gate_hits();
     let v4 = gpu.render_input_cached(&mut win, &in4);
@@ -332,10 +299,6 @@ fn gpu_dirty_gate_one_cell_change_after_hit() {
     );
 }
 
-/// The frame-carried host/effect cursor shape is part of the GPU gate's cached
-/// input. A stationary None↔Bolt transition must miss (and repaint), while an
-/// identical settled effect frame may hit. `clear_overlays` must miss again and
-/// restore the terminal DECSCUSR pixels rather than returning the stale Bolt.
 #[test]
 fn gpu_dirty_gate_tracks_cursor_effect_style_override_and_plain_clear() {
     let mut gpu = fresh_gpu();
@@ -388,13 +351,6 @@ fn gpu_dirty_gate_tracks_cursor_effect_style_override_and_plain_clear() {
     assert_eq!(cleared_pixels, fresh_render(&plain, true, None));
 }
 
-/// Phosphor rain through the dirty gate, on one reused renderer:
-///   A. a raining frame (real `MatrixRain` emission): miss, primes;
-///   B. the same tick re-emitted (fp-stable quads, same atlas version): hit,
-///      equal to a fresh render;
-///   C. the engine drains (hidden pane): empty channels, miss, rain pixels
-///      fully erased;
-///   D. drained again (fp 0, `is_active()` false): hit, byte-identical.
 #[test]
 fn gpu_dirty_gate_settled_and_drained_rain() {
     let mut gpu = fresh_gpu();
@@ -408,13 +364,11 @@ fn gpu_dirty_gate_settled_and_drained_rain() {
     let mut scene = RainScene::new(ROWS, COLS, gpu.cell_size(), &base);
     let fp_a = scene.drive_until_raining();
 
-    // A: raining: first frame, miss, fills the gate cache.
     let mut in_a = term.cell_frame(ROWS, COLS);
     scene.apply(&mut in_a);
     let _ = gpu.render_input_cached(&mut win, &in_a);
     assert_eq!(gpu.gate_misses(), 1, "first frame must miss");
 
-    // B: settled — the same engine tick re-emits the identical field.
     let fp_b = scene.emit();
     assert_eq!(fp_b, fp_a, "same-tick re-emission must be fp-stable");
     let mut in_b = term.cell_frame(ROWS, COLS);
@@ -436,7 +390,6 @@ fn gpu_dirty_gate_settled_and_drained_rain() {
         "settled-rain gate-hit pixels diverge from a fresh full GPU render"
     );
 
-    // C: drain — a hidden pane empties the field within one tick.
     scene.engine.set_visibility(RainVisibility::Hidden);
     let fp_c = scene.tick();
     assert_eq!(fp_c, 0, "a drained field must fingerprint 0");
@@ -465,7 +418,6 @@ fn gpu_dirty_gate_settled_and_drained_rain() {
         "draining must visibly change the frame (non-vacuous)"
     );
 
-    // D: drained steady state: fp stays 0, the gate hits, bytes identical.
     let fp_d = scene.tick();
     assert_eq!(
         fp_d, 0,

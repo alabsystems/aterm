@@ -293,7 +293,7 @@ enum Identity {
 }
 
 impl OverviewState {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         window: crate::WindowId,
         groups: Vec<OverviewGroup>,
         manages: Vec<Manages>,
@@ -315,7 +315,7 @@ impl OverviewState {
     }
 
     /// Update the sibling aterm session count and return whether it changed.
-    pub(crate) fn set_elsewhere(&mut self, elsewhere: usize) -> bool {
+    pub(crate) const fn set_elsewhere(&mut self, elsewhere: usize) -> bool {
         std::mem::replace(&mut self.elsewhere, elsewhere) != elsewhere
     }
 
@@ -407,7 +407,7 @@ impl OverviewState {
 
     /// Whether the card shows the fabric group: it lists a chip, or the last
     /// read failed (its header alone then says so).
-    fn fabric_shown(&self) -> bool {
+    const fn fabric_shown(&self) -> bool {
         !self.fabric.is_empty() || self.fabric_failed.is_some()
     }
 
@@ -810,12 +810,12 @@ impl OverviewState {
     }
 
     /// Drop an armed confirm (the App refused the arm).
-    pub(crate) fn cancel_confirm(&mut self) {
+    pub(crate) const fn cancel_confirm(&mut self) {
         self.confirm = None;
     }
 
     /// Cancel an armed confirm on `Esc`, or return `true` to close the card.
-    pub(crate) fn escape(&mut self) -> bool {
+    pub(crate) const fn escape(&mut self) -> bool {
         if self.confirm.is_some() {
             self.confirm = None;
             return false;
@@ -849,7 +849,7 @@ impl OverviewState {
         (changed, idx.is_some() && armed == idx)
     }
 
-    pub(crate) fn pointer_over_item(&self) -> bool {
+    pub(crate) const fn pointer_over_item(&self) -> bool {
         self.pointer_over.is_some()
     }
 

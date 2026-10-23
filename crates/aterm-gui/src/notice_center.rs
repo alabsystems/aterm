@@ -158,12 +158,12 @@ impl NoticeCenter {
 }
 
 #[cfg(target_os = "macos")]
-fn inert_answer() -> Center {
+const fn inert_answer() -> Center {
     Center::Absent
 }
 
 #[cfg(target_os = "macos")]
-fn inert_post(_notice: &Notice<'_>) -> bool {
+const fn inert_post(_notice: &Notice<'_>) -> bool {
     false
 }
 
@@ -176,7 +176,7 @@ fn inert_ask(_then: Box<dyn FnOnce() + Send>) {
 }
 
 #[cfg(target_os = "macos")]
-fn inert_adopt_clicks() {}
+const fn inert_adopt_clicks() {}
 
 #[cfg(all(target_os = "macos", test))]
 thread_local! {
@@ -331,7 +331,7 @@ mod live {
     /// replaces another.
     static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
 
-    fn at(addr: usize) -> Id {
+    const fn at(addr: usize) -> Id {
         Id::from_ptr(std::ptr::with_exposed_provenance_mut(addr))
     }
 

@@ -16,7 +16,7 @@ pub(super) enum MacroStep {
 }
 
 impl EditorWorkspace {
-    /// `start-kbd-macro` (C-x (): record what follows as the next macro.
+    /// `start-kbd-macro` (`C-x (`): record what follows as the next macro.
     pub(super) fn start_kbd_macro(&mut self) -> Vec<EditorEffect> {
         self.recording = Some(Vec::new());
         vec![EditorEffect::Status("Defining keyboard macro…".into())]
@@ -70,9 +70,6 @@ mod tests {
     use crate::editor::{EditorWorkspace, Invocation, KeyChord, Selection, editor};
     use crate::store::DocumentStore;
 
-    /// A keyboard macro records the argument with the command that took it.
-    /// The digits after C-u replay as the argument whether they arrived as text
-    /// or as a key, and a C-u still pending at C-x ) is no part of the macro.
     #[test]
     fn a_macro_replays_each_commands_own_argument() {
         let text = (0..10)
@@ -122,12 +119,6 @@ mod tests {
         assert_eq!(view.primary_selection().head, 3);
     }
 
-    /// A macro keeps what each command's minibuffer was answered with
-    /// (goto-line's line, switch-to-buffer's and kill-buffer's buffer), so
-    /// its replay runs the command with that answer instead of asking again,
-    /// and hands the host what the commands asked of it. M-x is no step of
-    /// its own: the command it ran is. A machine's [`Invocation`] records its
-    /// answers as it passes them.
     #[test]
     fn a_macro_replays_its_prompts_answers() {
         fn press(

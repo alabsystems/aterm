@@ -813,7 +813,7 @@ fn parse_gate_records(text: &str) -> Option<Vec<GenRecord>> {
 }
 
 impl GateBook {
-    pub(crate) fn at(path: Option<PathBuf>) -> Self {
+    pub(crate) const fn at(path: Option<PathBuf>) -> Self {
         Self {
             gens: Vec::new(),
             path,
@@ -2198,7 +2198,7 @@ pub(crate) const PRE_HOLD_ZSH: u8 = 1;
 pub(crate) const PRE_HOLD_BASH: u8 = 1 << 1;
 const PRE_HOLD_UNREAD: u8 = u8::MAX;
 
-fn pre_hold_bit(shell: aterm_core::shell_integration::ShellType) -> u8 {
+const fn pre_hold_bit(shell: aterm_core::shell_integration::ShellType) -> u8 {
     use aterm_core::shell_integration::ShellType;
     match shell {
         ShellType::Zsh => PRE_HOLD_ZSH,
@@ -2797,7 +2797,7 @@ fn run_spawn(job: SpawnJob) {
 
 impl Wake {
     /// Local session id reported by a session-internal wake, if any.
-    pub(crate) fn local_session(&self) -> Option<u64> {
+    pub(crate) const fn local_session(&self) -> Option<u64> {
         match self {
             Wake::Output { session, .. } => Some(*session),
             Wake::QueuedKeyDelivered { session, .. } => Some(*session),

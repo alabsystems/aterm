@@ -8,22 +8,15 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Key {
-    /// A named special key (Enter, Tab, arrows, function keys, etc.)
+    /// A named special key (Enter, Tab, arrows, function keys, etc.).
     Named(NamedKey),
-    /// A character key (letters, numbers, symbols)
+    /// A character key (letters, numbers, symbols).
     Character(char),
 }
 
 impl Key {
-    /// The main-block key a keypad key stands in for: digits and operators fold to the glyph
-    /// they type (`'5'`, `'.'`, `','` for KP_Separator, `'='` for KP_Equal), editing and
-    /// navigation keys to their named twins (`NumpadEnter` -> `Enter`). `None` for a non-keypad
-    /// key and for `NumpadBegin`, which has no main-block twin.
-    ///
-    /// The one fold, shared by the kitty encoder's legacy rule ("all keypad keys are reported
-    /// as their equivalent non-keypad keys" until the app asks to tell them apart) and the
-    /// GUI's native pages and press classifier. The PTY encoders never fold outside kitty
-    /// legacy semantics.
+    /// The main-block key a keypad key stands in for: digits and operators fold to the glyph they
+    /// type.
     #[inline]
     #[must_use]
     pub const fn main_block_twin(&self) -> Option<Key> {
@@ -69,245 +62,237 @@ impl Key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum NamedKey {
-    // Navigation
-    /// Up arrow key
+    /// Up arrow key.
     ArrowUp,
-    /// Down arrow key
+    /// Down arrow key.
     ArrowDown,
-    /// Left arrow key
+    /// Left arrow key.
     ArrowLeft,
-    /// Right arrow key
+    /// Right arrow key.
     ArrowRight,
-    /// Home key
+    /// Home key.
     Home,
-    /// End key
+    /// End key.
     End,
-    /// Page Up key
+    /// Page Up key.
     PageUp,
-    /// Page Down key
+    /// Page Down key.
     PageDown,
 
-    // Editing
-    /// Backspace key
+    /// Backspace key.
     Backspace,
-    /// Delete key
+    /// Delete key.
     Delete,
-    /// Insert key
+    /// Insert key.
     Insert,
-    /// Enter/Return key
+    /// Enter/Return key.
     Enter,
-    /// Tab key
+    /// Tab key.
     Tab,
-    /// Escape key
+    /// Escape key.
     Escape,
-    /// Space key (when sent as named key)
+    /// Space key (when sent as named key).
     Space,
 
-    // Locks and system keys
-    /// Caps Lock key
+    /// Caps Lock key.
     CapsLock,
-    /// Num Lock key
+    /// Num Lock key.
     NumLock,
-    /// Scroll Lock key
+    /// Scroll Lock key.
     ScrollLock,
-    /// Print Screen key
+    /// Print Screen key.
     PrintScreen,
-    /// Pause/Break key
+    /// Pause/Break key.
     Pause,
-    /// Context menu key
+    /// Context menu key.
     ContextMenu,
 
-    // Function keys
-    /// F1 function key
+    /// F1 function key.
     F1,
-    /// F2 function key
+    /// F2 function key.
     F2,
-    /// F3 function key
+    /// F3 function key.
     F3,
-    /// F4 function key
+    /// F4 function key.
     F4,
-    /// F5 function key
+    /// F5 function key.
     F5,
-    /// F6 function key
+    /// F6 function key.
     F6,
-    /// F7 function key
+    /// F7 function key.
     F7,
-    /// F8 function key
+    /// F8 function key.
     F8,
-    /// F9 function key
+    /// F9 function key.
     F9,
-    /// F10 function key
+    /// F10 function key.
     F10,
-    /// F11 function key
+    /// F11 function key.
     F11,
-    /// F12 function key
+    /// F12 function key.
     F12,
-    /// F13 function key
+    /// F13 function key.
     F13,
-    /// F14 function key
+    /// F14 function key.
     F14,
-    /// F15 function key
+    /// F15 function key.
     F15,
-    /// F16 function key
+    /// F16 function key.
     F16,
-    /// F17 function key
+    /// F17 function key.
     F17,
-    /// F18 function key
+    /// F18 function key.
     F18,
-    /// F19 function key
+    /// F19 function key.
     F19,
-    /// F20 function key
+    /// F20 function key.
     F20,
-    /// F21 function key
+    /// F21 function key.
     F21,
-    /// F22 function key
+    /// F22 function key.
     F22,
-    /// F23 function key
+    /// F23 function key.
     F23,
-    /// F24 function key
+    /// F24 function key.
     F24,
-    /// F25 function key
+    /// F25 function key.
     F25,
-    /// F26 function key
+    /// F26 function key.
     F26,
-    /// F27 function key
+    /// F27 function key.
     F27,
-    /// F28 function key
+    /// F28 function key.
     F28,
-    /// F29 function key
+    /// F29 function key.
     F29,
-    /// F30 function key
+    /// F30 function key.
     F30,
-    /// F31 function key
+    /// F31 function key.
     F31,
-    /// F32 function key
+    /// F32 function key.
     F32,
-    /// F33 function key
+    /// F33 function key.
     F33,
-    /// F34 function key
+    /// F34 function key.
     F34,
-    /// F35 function key
+    /// F35 function key.
     F35,
 
-    // Media and audio keys
-    /// Media play key
+    /// Media play key.
     MediaPlay,
-    /// Media pause key
+    /// Media pause key.
     MediaPause,
-    /// Media play/pause toggle key
+    /// Media play/pause toggle key.
     MediaPlayPause,
-    /// Media reverse key
+    /// Media reverse key.
     MediaReverse,
-    /// Media stop key
+    /// Media stop key.
     MediaStop,
-    /// Media fast-forward key
+    /// Media fast-forward key.
     MediaFastForward,
-    /// Media rewind key
+    /// Media rewind key.
     MediaRewind,
-    /// Media next-track key
+    /// Media next-track key.
     MediaTrackNext,
-    /// Media previous-track key
+    /// Media previous-track key.
     MediaTrackPrevious,
-    /// Media record key
+    /// Media record key.
     MediaRecord,
-    /// Audio volume down key
+    /// Audio volume down key.
     AudioVolumeDown,
-    /// Audio volume up key
+    /// Audio volume up key.
     AudioVolumeUp,
-    /// Audio mute key
+    /// Audio mute key.
     AudioVolumeMute,
 
-    // Modifier keys reported as key events
-    /// Left Shift key
+    /// Left Shift key.
     ShiftLeft,
-    /// Right Shift key
+    /// Right Shift key.
     ShiftRight,
-    /// Left Control key
+    /// Left Control key.
     ControlLeft,
-    /// Right Control key
+    /// Right Control key.
     ControlRight,
-    /// Left Alt/Option key
+    /// Left Alt/Option key.
     AltLeft,
-    /// Right Alt/Option key
+    /// Right Alt/Option key.
     AltRight,
-    /// Left Super/Command key
+    /// Left Super/Command key.
     SuperLeft,
-    /// Right Super/Command key
+    /// Right Super/Command key.
     SuperRight,
-    /// Left Hyper key
+    /// Left Hyper key.
     HyperLeft,
-    /// Right Hyper key
+    /// Right Hyper key.
     HyperRight,
-    /// Left Meta key
+    /// Left Meta key.
     MetaLeft,
-    /// Right Meta key
+    /// Right Meta key.
     MetaRight,
 
-    // Keypad keys
-    /// Numpad 0
+    /// Numpad 0.
     Numpad0,
-    /// Numpad 1
+    /// Numpad 1.
     Numpad1,
-    /// Numpad 2
+    /// Numpad 2.
     Numpad2,
-    /// Numpad 3
+    /// Numpad 3.
     Numpad3,
-    /// Numpad 4
+    /// Numpad 4.
     Numpad4,
-    /// Numpad 5
+    /// Numpad 5.
     Numpad5,
-    /// Numpad 6
+    /// Numpad 6.
     Numpad6,
-    /// Numpad 7
+    /// Numpad 7.
     Numpad7,
-    /// Numpad 8
+    /// Numpad 8.
     Numpad8,
-    /// Numpad 9
+    /// Numpad 9.
     Numpad9,
-    /// Numpad decimal point
+    /// Numpad decimal point.
     NumpadDecimal,
-    /// Numpad divide
+    /// Numpad divide.
     NumpadDivide,
-    /// Numpad multiply
+    /// Numpad multiply.
     NumpadMultiply,
-    /// Numpad subtract
+    /// Numpad subtract.
     NumpadSubtract,
-    /// Numpad add
+    /// Numpad add.
     NumpadAdd,
-    /// Numpad enter
+    /// Numpad enter.
     NumpadEnter,
-    /// Numpad equals
+    /// Numpad equals.
     NumpadEqual,
-    /// Numpad separator (comma on some keyboards)
+    /// Numpad separator (comma on some keyboards).
     NumpadSeparator,
-    /// Numpad left arrow
+    /// Numpad left arrow.
     NumpadArrowLeft,
-    /// Numpad right arrow
+    /// Numpad right arrow.
     NumpadArrowRight,
-    /// Numpad up arrow
+    /// Numpad up arrow.
     NumpadArrowUp,
-    /// Numpad down arrow
+    /// Numpad down arrow.
     NumpadArrowDown,
-    /// Numpad Page Up
+    /// Numpad Page Up.
     NumpadPageUp,
-    /// Numpad Page Down
+    /// Numpad Page Down.
     NumpadPageDown,
-    /// Numpad Home
+    /// Numpad Home.
     NumpadHome,
-    /// Numpad End
+    /// Numpad End.
     NumpadEnd,
-    /// Numpad Insert
+    /// Numpad Insert.
     NumpadInsert,
-    /// Numpad Delete
+    /// Numpad Delete.
     NumpadDelete,
-    /// Numpad Begin (center key, KP_BEGIN)
+    /// Numpad Begin (center key, KP_BEGIN).
     NumpadBegin,
 }
 
 impl NamedKey {
-    /// A sided modifier key's modifier bit and its other-side twin (`ShiftLeft` →
-    /// `(SHIFT, ShiftRight)`); `None` for every other key. Kitty keeps a released modifier's bit
-    /// set while the twin is held ([`super::encode_key_with_event`]).
+    /// A sided modifier key's modifier bit and its other-side twin
+    /// ([`super::encode_key_with_event`]).
     #[inline]
     #[must_use]
     pub const fn modifier_twin(self) -> Option<(Modifiers, NamedKey)> {
@@ -328,14 +313,11 @@ impl NamedKey {
         })
     }
 
-    /// The Kitty keyboard protocol key code: the code point CSI u sends for this key.
-    // One exhaustive match (no table chain or panic edge for the verifier), values from kitty's
-    // functional-key table.
+    /// The Kitty keyboard protocol key code.
     #[inline]
     #[must_use]
     pub const fn kitty_code(self) -> u32 {
         match self {
-            // Control and navigation keys
             NamedKey::Escape => 27,
             NamedKey::Enter => 13,
             NamedKey::Tab => 9,
@@ -357,7 +339,6 @@ impl NamedKey {
             NamedKey::Pause => 57362,
             NamedKey::ContextMenu => 57363,
             NamedKey::Space => 32,
-            // Function keys
             NamedKey::F1 => 57364,
             NamedKey::F2 => 57365,
             NamedKey::F3 => 57366,
@@ -393,7 +374,6 @@ impl NamedKey {
             NamedKey::F33 => 57396,
             NamedKey::F34 => 57397,
             NamedKey::F35 => 57398,
-            // Numpad keys
             NamedKey::Numpad0 => 57399,
             NamedKey::Numpad1 => 57400,
             NamedKey::Numpad2 => 57401,
@@ -423,7 +403,6 @@ impl NamedKey {
             NamedKey::NumpadInsert => 57425,
             NamedKey::NumpadDelete => 57426,
             NamedKey::NumpadBegin => 57427,
-            // Media and audio keys
             NamedKey::MediaPlay => 57428,
             NamedKey::MediaPause => 57429,
             NamedKey::MediaPlayPause => 57430,
@@ -437,7 +416,6 @@ impl NamedKey {
             NamedKey::AudioVolumeDown => 57438,
             NamedKey::AudioVolumeUp => 57439,
             NamedKey::AudioVolumeMute => 57440,
-            // Modifier keys
             NamedKey::ShiftLeft => 57441,
             NamedKey::ControlLeft => 57442,
             NamedKey::AltLeft => 57443,
@@ -458,28 +436,27 @@ bitflags! {
     /// Keyboard modifier flags.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct Modifiers: u8 {
-        /// Shift modifier
+        /// Shift modifier.
         const SHIFT = 0b0000_0001;
-        /// Alt/Option modifier
+        /// Alt/Option modifier.
         const ALT = 0b0000_0010;
-        /// Control modifier
+        /// Control modifier.
         const CTRL = 0b0000_0100;
-        /// Super/Cmd/Win modifier
+        /// Super/Cmd/Win modifier.
         const SUPER = 0b0000_1000;
-        /// Hyper modifier
+        /// Hyper modifier.
         const HYPER = 0b0001_0000;
-        /// Meta modifier
+        /// Meta modifier.
         const META = 0b0010_0000;
-        /// Caps Lock modifier
+        /// Caps Lock modifier.
         const CAPS_LOCK = 0b0100_0000;
-        /// Num Lock modifier
+        /// Num Lock modifier.
         const NUM_LOCK = 0b1000_0000;
     }
 }
 
 impl Modifiers {
-    /// The Kitty keyboard protocol modifier value: `modifiers + 1` (1 = none), saturating at
-    /// 255 when all eight bits are set.
+    /// The Kitty keyboard protocol modifier value.
     #[inline]
     #[must_use]
     pub const fn kitty_encoded(self) -> u8 {
@@ -487,13 +464,9 @@ impl Modifiers {
     }
 
     /// Get the legacy xterm modifier value for CSI sequences.
-    ///
-    /// Xterm encoding: `1 + shift(1) + alt(2) + ctrl(4) + meta(8)`.
     #[inline]
     #[must_use]
     pub const fn xterm_encoded(self) -> u8 {
-        // Saturating adds are exact (the sum is at most 16); the model checker refutes plain
-        // `+=` overflow spuriously.
         let mut val = 1u8;
         if self.contains(Modifiers::SHIFT) {
             val = val.saturating_add(1);
@@ -504,7 +477,6 @@ impl Modifiers {
         if self.contains(Modifiers::CTRL) {
             val = val.saturating_add(4);
         }
-        // Super/Meta is bit 3 in xterm modifier encoding (#7475).
         if self.contains(Modifiers::SUPER) {
             val = val.saturating_add(8);
         }
@@ -516,12 +488,12 @@ impl Modifiers {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum KeyEventType {
-    /// Key press event (default)
+    /// Key press event (default).
     #[default]
     Press,
-    /// Key repeat event
+    /// Key repeat event.
     Repeat,
-    /// Key release event
+    /// Key release event.
     Release,
 }
 

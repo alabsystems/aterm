@@ -160,7 +160,7 @@ pub(crate) struct EngineRead {
 
 impl EngineRead {
     /// Read off `t`: four field loads.
-    pub(crate) fn of(t: &aterm_core::terminal::Terminal) -> EngineRead {
+    pub(crate) const fn of(t: &aterm_core::terminal::Terminal) -> EngineRead {
         EngineRead {
             integration: t.shell_integration_posture(),
             notify_total: t.notify_total(),
@@ -249,7 +249,7 @@ pub(crate) fn title_fp(title: &str) -> u64 {
 }
 
 /// The `state` word of a shell integration posture.
-fn integration_word(p: aterm_core::terminal::ShellIntegrationPosture) -> &'static str {
+const fn integration_word(p: aterm_core::terminal::ShellIntegrationPosture) -> &'static str {
     use aterm_core::terminal::ShellIntegrationPosture as P;
     match p {
         P::Off => "off",
@@ -259,7 +259,7 @@ fn integration_word(p: aterm_core::terminal::ShellIntegrationPosture) -> &'stati
 }
 
 /// The `state` word and percent of an OSC 9;4 progress (`none` for none).
-fn progress_of(p: Option<aterm_types::osc::TaskbarProgress>) -> (&'static str, Option<u8>) {
+const fn progress_of(p: Option<aterm_types::osc::TaskbarProgress>) -> (&'static str, Option<u8>) {
     use aterm_types::osc::TaskbarProgress as P;
     match p {
         None | Some(P::Hidden) => ("none", None),
@@ -615,7 +615,7 @@ impl SessionLog {
     }
 
     /// The screen saw a person stop the turn (Esc): its idle close reads `out=interrupted` (called before the verdict is published).
-    pub(crate) fn agent_interrupted(&mut self) {
+    pub(crate) const fn agent_interrupted(&mut self) {
         if let Some(a) = self.agent.as_mut() {
             a.tracker.note_interrupted();
         }
@@ -1217,7 +1217,7 @@ impl SessionLog {
     /// newer than the log's newest `program` mark (the timeline's debug
     /// cross-check reads the retention rule by it).
     #[cfg(debug_assertions)]
-    pub(crate) fn program_pending(&self) -> bool {
+    pub(crate) const fn program_pending(&self) -> bool {
         self.observed.program.pending.is_some()
     }
 }

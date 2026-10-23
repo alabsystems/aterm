@@ -119,7 +119,8 @@ pub fn co_create(clsid: &GUID, iid: &GUID, step: &'static str) -> Result<Com, St
     unsafe { Com::from_raw(out) }.ok_or((step, E_POINTER))
 }
 
-/// This thread's single-threaded COM apartment for the duration of one call (a shell dialog.
+/// This thread's single-threaded COM apartment for the duration of one call (a shell dialog,
+/// a decode through the imaging component), so an error path cannot leak it.
 pub struct Apartment {
     owned: bool,
     /// Not `Send`: it is left on the thread that entered it.

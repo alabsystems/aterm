@@ -1526,6 +1526,7 @@ unsafe fn public_window_callback_inner(
         WM_KEYUP | WM_SYSKEYUP => {
             if msg == WM_SYSKEYUP && unsafe { !GetMenu(window).is_null() } {
                 // let Windows handle event if the window has a native menu, a modal event loop
+                // is started here on Alt key up.
                 result = ProcResult::DefWindowProc(wparam);
             }
         },
@@ -1873,6 +1874,7 @@ unsafe fn public_window_callback_inner(
             let is_active = wparam != false.into();
             if is_active {
                 // The process-wide menu mode, back on this window's caption side
+                // before its system menu can open (`dark_mode::reassert_menu_theme`).
                 super::dark_mode::reassert_menu_theme(window);
             }
             let active_focus_changed = userdata.window_state_lock().set_active(is_active);
@@ -2196,6 +2198,7 @@ unsafe extern "system" fn thread_event_target_callback(
         unsafe { super::get_window_long(window, GWL_USERDATA) } as *mut ThreadMsgTargetData;
     if userdata_ptr.is_null() {
         // `userdata_ptr` will always be null for the first `WM_GETMINMAXINFO`, as well as
+        // `WM_NCCREATE` and `WM_CREATE`.
         return unsafe { DefWindowProcW(window, msg, wparam, lparam) };
     }
     let userdata = unsafe { Box::from_raw(userdata_ptr) };

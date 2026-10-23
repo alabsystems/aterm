@@ -2713,3 +2713,60 @@ fn a_fact_line_typed_counts_as_no_act_and_ends_no_wait() {
         "read as an act, it counts and ends the wait"
     );
 }
+
+/// THE FACT LINES, BY KIND (occupancy 1e, "What the harness did"): a `fact-hold@v1` row typed
+/// counts toward `facts_told`'s `hold`, a `fact-would@v1` row naming a built-in rule toward
+/// `facts_would`'s; the door's intent and skip rows and the hold's own `waiting` rows count
+/// toward neither, nor does a row before the window. NEGATIVE CONTROL: a would-be row naming
+/// no rule this build knows counts nowhere.
+#[test]
+fn the_fact_lines_count_by_kind() {
+    use crate::supervise::occupancy::door::INTENT_RULE;
+    use crate::supervise::occupancy::rules::WOULD_RULE;
+    let hold = crate::supervise::facts::FactKind::Hold.rule();
+    let lines = [
+        said(
+            500,
+            WOULD_RULE,
+            Outcome::Waiting,
+            "rule=wait-nudge@v1 episode=00000000000000aa held_ms=1800000",
+        ),
+        said(
+            1_000,
+            WOULD_RULE,
+            Outcome::Waiting,
+            "rule=wait-nudge@v1 episode=00000000000000ab held_ms=1800000",
+        ),
+        said(
+            2_000,
+            WOULD_RULE,
+            Outcome::Waiting,
+            "rule=hold-room@v1 episode=00000000000000ac held_ms=7200000",
+        ),
+        said(
+            2_500,
+            WOULD_RULE,
+            Outcome::Waiting,
+            "rule=wake@v9 episode=00000000000000ad held_ms=1",
+        ),
+        said(
+            3_000,
+            INTENT_RULE,
+            Outcome::Waiting,
+            "rule=hold-room@v1 episode=00000000000000ae held_ms=7200000",
+        ),
+        typed(3_100, hold, "the line"),
+        said(
+            3_200,
+            hold,
+            Outcome::Skipped,
+            "rule=hold-room@v1 episode=00000000000000af held_ms=7200000 why=unfenced",
+        ),
+        said(3_300, hold, Outcome::Waiting, "hold=open held_ms=600000"),
+    ];
+    let acc = fold_ledger(&lines, 1_000);
+    let one = |n: u64| std::collections::BTreeMap::from([("hold".to_string(), n)]);
+    assert_eq!(acc.facts_would, one(2), "{acc:#?}");
+    assert_eq!(acc.facts_told, one(1), "{acc:#?}");
+    assert_eq!(acc.by_rule.get(hold), None, "still no act");
+}

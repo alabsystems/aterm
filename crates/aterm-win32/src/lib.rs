@@ -10,94 +10,12 @@
 // names the upstream file it came from. See ../LICENSE-MIT and
 // ../LICENSE-APACHE for the upstream licenses.
 
-//! aterm's Win32 declarations: what aterm's Windows graph reads from
-//! `windows-sys` 0.61, at upstream's module paths, with no dependency; and
-//! the COM vocabulary and DXGI slice aterm calls, which windows-sys does not
-//! carry ([`com`], [`dxgi`]).
-//!
-//! aterm's own crates name this crate directly (`aterm_win32::`):
-//!
-//! ```text
-//! aterm-gui    COM (file picker, jump list, imaging), DXGI peak luminance,
-//!              SetFileInformationByHandle (pinned_dir.rs), GDI (the CPU
-//!              presenter, present/win32.rs)
-//! aterm-gpu    DXGI: the scRGB tag on wgpu's DX12 swap chain
-//! aterm-http   crypt32, the certificate verifier
-//! aterm-net    WinSock's WSAPoll
-//! ```
-//!
-//! `crates/aterm-windows-sys` (package `windows-sys` 0.61.2, a
-//! `[patch.crates-io]` row) re-exports [`core`] and [`Win32`], so the
-//! package that names `windows_sys` on the Windows cells compiles against
-//! this crate unchanged:
-//!
-//! ```text
-//! winit 0.30.13 (crates/aterm-window)   the Windows backend
-//! ```
-//!
-//! softbuffer 0.4.8's GDI backend was the other until linux-windowing LW.3
-//! of docs/AUDIT-third-party-2026-10-15.md replaced it with aterm-gui's
-//! `present/win32.rs`, a direct consumer.
-//!
-//! # The harvest
-//!
-//! `targo --unverified run -p aterm-win32-oracle -- gen` reads those packages' sources and
-//! resolves every `windows_sys` path and `use` tree in them against the
-//! registry crate's module tree, every `aterm_win32` path in the direct
-//! consumers', and every `crate::` path in [`com`] and [`dxgi`], then adds
-//! every declaration a kept declaration names, until nothing new is reached.
-//! What a direct consumer names enables the upstream features it is gated on.
-//! The result is the CLOSURE: about 850 of upstream's 168,401 names, each
-//! copied as upstream writes it, in upstream's order, under upstream's path.
-//! A consumer that starts naming a declaration outside it fails to compile on
-//! the Windows cells (`targo --unverified verify cells`) until `gen` is rerun,
-//! and the driver's `check` (by hand, like the oracle) fails whenever the
-//! sources and this crate disagree.
-//!
-//! # The oracle
-//!
-//! `targo --unverified run -p aterm-win32-oracle -- oracle` (its own reference workspace, with no patch
-//! table) checks every declaration against the registry windows-sys 0.61.2 on
-//! x86_64- and aarch64-pc-windows-msvc: each alias's target type, each
-//! struct's and union's size, alignment and per-field offset and type, each
-//! constant's type and value, each function's whole signature, and the symbol
-//! and DLL each import resolves to, with a planted mismatch of each kind that
-//! must fail. `tests/recorded.rs` holds the recorded layouts and values on
-//! any 64-bit host.
-//!
-//! [`com`] and [`dxgi`] are hand-written; the oracle's conformance crate
-//! holds them to `windows` 0.62.2 (`win32-oracle/conformance/src/com.rs`).
-//!
-//! # Divergences
-//!
-//! Each is deliberate and unreachable from the consumers.
-//!
-//! 1. **Only the closure.** Every other upstream module and declaration is
-//!    absent; a new consumer of one fails to compile until the harvest is
-//!    rerun.
-//! 2. **No feature gates.** Upstream gates a declaration on the features that
-//!    name its module and those its types live in. Here every kept
-//!    declaration is always present: a declaration upstream gates on a feature
-//!    the Windows cells do not resolve is not kept at all, and the facade's
-//!    features gate nothing. `target_arch` gates are kept as upstream writes
-//!    them.
-//! 3. **Linking.** [`link!`] is windows-link's macro: `raw-dylib` with
-//!    `+verbatim` (and `undecorated` import names on x86), so rustc writes the
-//!    import itself and no import library or third-party crate is needed. Its
-//!    blocks are `unsafe extern`, which changes nothing a caller sees: every
-//!    function was already unsafe to call.
-//! 4. **Off Windows** each function is declared with no link attribute, as
-//!    upstream's own non-Windows arm does, so the crate builds (and its
-//!    recorded layouts are tested) on every host; nothing calls them there.
+//! Win32, COM, and DXGI declarations for aterm's Windows targets ([`com`], [`dxgi`]).
 
 #![no_std]
-// Upstream's names are the contract: `Win32::UI::WindowsAndMessaging`, `HWND`,
-// `szOID_PKIX_KP_SERVER_AUTH`, `IID_IUnknown`.
 #![allow(non_snake_case, non_upper_case_globals, non_camel_case_types)]
 
-/// Declares one imported function, as windows-link 0.2.1's `link!` does:
-/// `link!("user32.dll" "system" fn GetMessageW(...) -> BOOL);`, with an
-/// optional import name after the ABI.
+/// Declares one imported function.
 #[cfg(all(windows, target_arch = "x86"))]
 macro_rules! link {
     ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (
@@ -109,9 +27,7 @@ macro_rules! link {
     )
 }
 
-/// Declares one imported function, as windows-link 0.2.1's `link!` does:
-/// `link!("user32.dll" "system" fn GetMessageW(...) -> BOOL);`, with an
-/// optional import name after the ABI.
+/// Declares one imported function.
 #[cfg(all(windows, not(target_arch = "x86")))]
 macro_rules! link {
     ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (
@@ -123,8 +39,7 @@ macro_rules! link {
     )
 }
 
-/// Declares one imported function with no link attribute, as windows-link
-/// 0.2.1's non-Windows arm does: it compiles, and nothing calls it.
+/// Declares one imported function with no link attribute.
 #[cfg(not(windows))]
 macro_rules! link {
     ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (

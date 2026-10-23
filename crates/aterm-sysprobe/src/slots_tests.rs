@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The build-slot reader: the record parse, the two-read judgement and the
-//! orphan rule as tables (every host), and on macOS the live reader against
-//! real flocks held by stand-ins of `build-slot` (this test binary re-run in
-//! place), each killed by `SIGKILL`. "Seen on two reads" is two explicit reads
-//! at injected clock values, never a sleep.
+//! Build-slot record parse, two-read judgement, orphan rule, and live flock tests.
 
 use std::path::PathBuf;
 
@@ -181,7 +177,6 @@ fn a_slot_is_held_only_when_the_same_holder_is_seen_on_two_reads() {
             holders: vec![holder(40)],
         }
     );
-    // Another holder: a change, pending; the same twice, held.
     let other = Sighted(Holder {
         pid: 41,
         birth_us: NOW,
@@ -191,10 +186,6 @@ fn a_slot_is_held_only_when_the_same_holder_is_seen_on_two_reads() {
     let fourth = book.judge(obs(3_000, &[other]), &CALM, &mut never);
     assert_eq!(counts_of(&fourth).held, 1);
 
-    // A path's replacement is a new physical slot even when the same
-    // process has it open: neither a new device nor a new inode borrows the
-    // old file's first sighting. The replacement's own second sighting can
-    // still prove the holder.
     for file in [(2, 100), (1, 101)] {
         let sight = Sighted(holder(40));
         let mut book = SlotBook::default();
@@ -217,10 +208,8 @@ fn a_slot_is_held_only_when_the_same_holder_is_seen_on_two_reads() {
 fn a_read_closer_than_the_gap_is_not_kept() {
     let mut book = SlotBook::default();
     let first = book.judge(obs(0, &[Sight::Sighted(holder(40))]), &CALM, &mut never);
-    // 999 ms later: the first judgement stands, and this read is not kept.
     let early = book.judge(obs(999, &[Sight::Empty]), &CALM, &mut never);
     assert_eq!(early, first);
-    // So the next read pairs with the first.
     let paired = book.judge(obs(1_000, &[Sight::Sighted(holder(40))]), &CALM, &mut never);
     assert_eq!(counts_of(&paired).held, 1, "{paired:?}");
 }
@@ -238,7 +227,6 @@ fn a_free_slot_needs_two_reads_with_no_holder() {
             ..SlotCounts::default()
         }
     );
-    // An empty record and a let-go one pair either way round.
     let second = book.judge(obs(1_000, &[Sight::Empty, gone(9, NOW)]), &CALM, &mut never);
     assert_eq!(
         counts_of(&second),
@@ -249,8 +237,6 @@ fn a_free_slot_needs_two_reads_with_no_holder() {
         }
     );
 
-    // The same index on a new device/inode has only one absence reading.
-    // Once that replacement is seen absent again, it is free as usual.
     for file in [(2, 100), (1, 101)] {
         let mut book = SlotBook::default();
         book.judge(obs(0, &[Sight::NotHeld { gone: None }]), &CALM, &mut never);
@@ -293,7 +279,6 @@ fn a_probers_single_sighting_is_never_a_holder() {
 #[test]
 fn an_unreadable_record_is_unknown_never_free() {
     let mut book = SlotBook::default();
-    // Unknown at once, on a first read too.
     let first = book.judge(obs(0, &[Sight::Bad, Sight::Empty]), &CALM, &mut never);
     assert_eq!(
         counts_of(&first),
@@ -314,20 +299,15 @@ fn an_unreadable_record_is_unknown_never_free() {
             ..SlotCounts::default()
         }
     );
-    // A slot that read Bad before and empty now has changed: pending.
     let third = book.judge(obs(2_000, &[Sight::Empty, Sight::Empty]), &CALM, &mut never);
     assert_eq!((counts_of(&third).pending, counts_of(&third).free), (1, 1));
-    // Every slot unreadable: the record changed under us.
     let all_bad = SlotBook::default().judge(obs(0, &[Sight::Bad, Sight::Bad]), &CALM, &mut never);
     assert_eq!(all_bad, SlotsRead::Unread(Unread::UnreadFormat));
-    // Unproven is unknown too, but says nothing of the format.
     let unproven = SlotBook::default().judge(obs(0, &[Sight::Unproven]), &CALM, &mut never);
     assert_eq!(counts_of(&unproven).unknown, 1);
     let none = SlotBook::default().judge(obs(0, &[]), &CALM, &mut never);
     assert_eq!(none, SlotsRead::Unread(Unread::NotSampled));
 
-    // A failed lock query is not an unlocked file. Even an empty record or
-    // a gone writer could hide a new winner stalled before its record.
     let absent = [Sight::Empty, Sight::NotHeld { gone: None }, gone(9, NOW)];
     for lock in [None, Some(true)] {
         let sights: Vec<_> = absent
@@ -349,8 +329,6 @@ fn an_unreadable_record_is_unknown_never_free() {
             "{lock:?}"
         );
     }
-    // Negative control: affirmative unlocked answers let the same absence
-    // pair free, including a writer whose descriptor read was refused.
     let unlocked: Vec<_> = absent
         .iter()
         .cloned()
@@ -369,8 +347,6 @@ fn an_unreadable_record_is_unknown_never_free() {
             ..SlotCounts::default()
         }
     );
-    // Positive descriptor evidence is retained whichever answer the lock
-    // query gave, and can still pair as the same holder.
     for lock in [None, Some(false), Some(true)] {
         let sight = lock_checked(Sight::Sighted(holder(40)), lock);
         assert_eq!(sight, Sight::Sighted(holder(40)));
@@ -381,8 +357,7 @@ fn an_unreadable_record_is_unknown_never_free() {
     }
 }
 
-/// The counts of two reads of `sights` under `m`, and the pids the witness
-/// was asked about, in order.
+/// The counts of two reads of `sights` under `m`.
 fn discounted_by(sights: &[Sight], m: Machine, witnessed: &[u32]) -> (SlotCounts, Vec<u32>) {
     let mut asked = Vec::new();
     let mut witness = |r: &Record| {
@@ -402,7 +377,6 @@ fn a_gone_writers_free_slot_is_discounted_only_past_load_horizon_and_a_witness()
         ncpu: Some(18),
     };
     let minute_ago = NOW - 60_000_000;
-    // Three slots, one held: each slot explains 6 of the 18 cores' load.
     let one = [
         Sight::Sighted(holder(40)),
         gone(10, minute_ago),
@@ -411,12 +385,9 @@ fn a_gone_writers_free_slot_is_discounted_only_past_load_horizon_and_a_witness()
     let (c, asked) = discounted_by(&one, at(12.5), &[10]);
     assert_eq!((c.held, c.free, c.discounted), (1, 2, 1));
     assert_eq!(asked, [10], "asked once, on the judging read");
-    // The load the held slot and this orphan explain: not counted.
     let (c, asked) = discounted_by(&one, at(12.0), &[10]);
     assert_eq!((c.discounted, asked.len()), (0, 0));
-    // No witness: not counted.
     assert_eq!(discounted_by(&one, at(12.5), &[]).0.discounted, 0);
-    // No load or no core count: never.
     for m in [
         Machine {
             load5: None,
@@ -438,16 +409,13 @@ fn a_gone_writers_free_slot_is_discounted_only_past_load_horizon_and_a_witness()
         let (c, asked) = discounted_by(&one, m, &[10]);
         assert_eq!((c.free, c.discounted, asked.len()), (2, 0, 0), "{m:?}");
     }
-    // Past the horizon: not even asked.
     let old = [gone(10, NOW - ORPHAN_HORIZON_US - 1), Sight::Empty];
     let (c, asked) = discounted_by(&old, BUSY, &[10]);
     assert_eq!((c.free, c.discounted, asked.len()), (2, 0, 0));
     let edge = [gone(10, NOW - ORPHAN_HORIZON_US), Sight::Empty];
     assert_eq!(discounted_by(&edge, BUSY, &[10]).0.discounted, 1);
-    // A writer that lives and let go is no candidate.
     let let_go = [Sight::NotHeld { gone: None }, Sight::Empty];
     assert_eq!(discounted_by(&let_go, BUSY, &[]).1, Vec::<u32>::new());
-    // Two candidates, the newest asked first; each counted raises the bar.
     let two = [
         gone(10, minute_ago),
         gone(11, minute_ago + 30_000_000),
@@ -467,7 +435,6 @@ fn a_gone_writers_free_slot_is_discounted_only_past_load_horizon_and_a_witness()
     );
     let (c, asked) = discounted_by(&two, at(11.0), &[10, 11]);
     assert_eq!((c.discounted, asked), (1, vec![11]));
-    // A candidate with no witness does not raise the bar for the next.
     let (c, asked) = discounted_by(&two, at(11.0), &[10]);
     assert_eq!((c.discounted, asked), (1, vec![11, 10]));
 }
@@ -543,11 +510,11 @@ mod live {
     use super::{BUSY, CALM, counts_of, never, rec};
     use crate::kproc;
 
-    /// This test, run alone in a child: the stand-in holder.
+    /// This test, run alone in a child.
     const STAND_IN: &str = "slots::tests::live::stand_in";
     /// The slot file the stand-in takes.
     const SLOT_ENV: &str = "ATERM_SLOT_STAND_IN";
-    /// `holder` asks for a build; `build` runs the same in-place image as it.
+    /// `holder` asks for a build.
     const BUILD_ENV: &str = "ATERM_SLOT_STAND_IN_BUILD";
     /// The hang detector for what must happen (a child's line, a reap).
     const HANG: Duration = Duration::from_secs(60);
@@ -592,11 +559,6 @@ mod live {
         }
     }
 
-    /// Not a test: the `build-slot` holder the live tests start in a child.
-    /// It takes the slot named by [`SLOT_ENV`] as `build-slot` does (open,
-    /// `LOCK_EX | LOCK_NB`, truncate, one write of its record), starts the
-    /// optional in-place build in a session of its own, says `held`, and
-    /// waits for its `SIGKILL`. The build waits on its inherited stop endpoint.
     #[test]
     #[ignore = "the build-slot holder the live tests start in a child; alone it returns"]
     fn stand_in() {
@@ -605,7 +567,6 @@ mod live {
         };
         let slot = Path::new(&slot);
         if std::env::var(BUILD_ENV).as_deref() == Ok("build") {
-            // This process's own proof, before the wrapper announces held.
             std::fs::write(
                 slot.with_file_name("build.pid"),
                 std::process::id().to_string(),
@@ -661,7 +622,6 @@ mod live {
             aterm_uds::deadline::prints(build.0.as_mut().expect("build"), "build-held", HANG);
             build
         });
-        // Its own line: libtest has written `test … ... ` before the body.
         println!("\nheld");
         loop {
             std::thread::park();
@@ -713,8 +673,7 @@ mod live {
     }
 
     impl Holding {
-        /// Start the stand-in on `slot`, working in `dir`, optionally with a
-        /// build; back once it holds the slot.
+        /// Start the stand-in on `slot`, working in `dir`, optionally with a build.
         fn start(dir: &Arc<aterm_tempfile::TempDir>, slot: &Path, build: bool) -> Self {
             Self::start_with(dir, slot, build, |_| {})
         }
@@ -793,9 +752,7 @@ mod live {
         }
     }
 
-    /// The adopted build stops itself on this exclusively owned endpoint's
-    /// EOF. A kernel exit watch proves its SIGKILL status; launchd reaps it.
-    /// No raw pid is used as signal authority.
+    /// The adopted build stops itself on this exclusively owned endpoint's EOF.
     struct Build {
         stop: UnixStream,
         pid: u32,
@@ -807,8 +764,6 @@ mod live {
 
     impl Build {
         fn confirm(&mut self, slot: &Path) {
-            // The wrapper's held line followed the build's own build-held
-            // proof. Its stop endpoint is still held, so it is alive here.
             self.pid = std::fs::read_to_string(slot.with_file_name("build.pid"))
                 .expect("the build's own pid")
                 .trim()
@@ -915,7 +870,6 @@ mod live {
             counts_of(&book.judge(after, &BUSY, &mut live_witness())).pending,
             1
         );
-        // Free, and at any load not occupied: the stand-in started no build.
         let freed = book.judge(look(dir.path(), 3_000), &BUSY, &mut live_witness());
         assert_eq!(
             freed,
@@ -928,8 +882,6 @@ mod live {
                 holders: vec![],
             }
         );
-        // A readiness failure unwinds through already-armed child custody.
-        // Establish actual execution before injecting it; no copy is unlinked.
         let mut watch = None;
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Holding::start_with(&dir, &slot, false, |child| {
@@ -958,7 +910,6 @@ mod live {
         let slot = dir.path().join("slot-0");
         std::fs::write(&slot, python_record(me, dir.path(), born - 10_000_000))
             .expect("a record older than this process");
-        // This process holds the file open, so only its birth rules it out.
         let _open = std::fs::File::open(&slot).expect("hold the slot open");
         let mut book = SlotBook::default();
         let first = look(dir.path(), 0);
@@ -976,7 +927,6 @@ mod live {
                 ..SlotCounts::default()
             }
         );
-        // Negative control: a record written after this process was born.
         std::fs::write(&slot, python_record(me, dir.path(), born + 1_000_000))
             .expect("a record younger than this process");
         let mut book = SlotBook::default();
@@ -1018,7 +968,6 @@ mod live {
         std::fs::remove_file(dir.path().join("slot-1")).expect("remove the empty slot");
         let only_bad = SlotBook::default().judge(look(dir.path(), 0), &CALM, &mut never);
         assert_eq!(only_bad, SlotsRead::Unread(Unread::UnreadFormat));
-        // A record past the cap, and a slot that is no regular file.
         std::fs::write(dir.path().join("slot-0"), vec![b' '; RECORD_CAP + 1]).expect("too long");
         std::fs::create_dir(dir.path().join("slot-1")).expect("a directory slot");
         let o = look(dir.path(), 0);
@@ -1097,10 +1046,6 @@ mod live {
             },
             "a load no slot explains, and the build runs on"
         );
-        // ONE WITNESS, ONE SLOT: a second gone writer's record in the same
-        // working directory (the first's, as its writer spelled it), started
-        // a second before the first (so the build was born in its window
-        // too), is not discounted by the same build again.
         let RecordRead::Rec(first) =
             Record::parse(&std::fs::read(&slot).expect("the stand-in's record"))
         else {
@@ -1130,10 +1075,8 @@ mod live {
             "one build witnesses one slot"
         );
         std::fs::remove_file(&second).expect("remove the second record");
-        // A quiet machine needs no orphan to explain it.
         let calm = book.judge(look(dir.path(), 2_000), &CALM, &mut live_witness());
         assert_eq!((counts_of(&calm).free, counts_of(&calm).discounted), (1, 0));
-        // Negative control: the build gone, the same load finds no witness.
         build
             .end()
             .expect("the build's EOF and kernel SIGKILL status");
@@ -1168,8 +1111,6 @@ mod live {
         })
         .expect("the slots read");
         assert_eq!(acquired, Some(true), "the reader holds no lock");
-        // Negative control: a reader that locks a free slot as `status` does
-        // makes the same acquirer fail.
         let mut blocked = None;
         observe_in(dir.path(), 1_000, now_us(), &mut |path| {
             let status = open(path);
@@ -1191,7 +1132,6 @@ mod live {
         })
         .expect("the slots read");
         assert_eq!(blocked, Some(true), "the control can fail");
-        // The reader created nothing and changed nothing.
         assert!(std::fs::symlink_metadata(dir.path().join("slot-1")).is_err());
         let after = std::fs::symlink_metadata(&slot).expect("the slot");
         assert_eq!(
@@ -1226,10 +1166,6 @@ mod live {
         assert!(!ids.contains(&id), "closed: {id:?} in {ids:?}");
     }
 
-    /// The reader's cadence: the last reading is handed back until a period
-    /// passes, [`PERIOD`] while a wait names the slots (`armed`), and
-    /// [`IDLE_PERIOD`] otherwise; [`SlotReader::read_at`] says when it was
-    /// read. NEGATIVE CONTROL: the same reads armed re-read at [`PERIOD`].
     #[test]
     fn a_reader_hands_back_its_reading_until_the_period_passes() {
         let dir = aterm_tempfile::tempdir().expect("scratch dir");
@@ -1255,7 +1191,6 @@ mod live {
         let free = reader.read(at(10), now_us(), &CALM, true);
         assert_eq!(counts_of(&free).free, 1, "{free:?}");
         assert_eq!(reader.read_at(), Some(at(10)));
-        // Nothing armed: the reading stands for a minute.
         std::fs::write(slots.join("slot-1"), b"").expect("a second slot");
         for s in [15, 30, 69] {
             assert_eq!(reader.read(at(s), now_us(), &CALM, false), free, "at {s} s");
@@ -1264,7 +1199,6 @@ mod live {
         let idle = reader.read(at(70), now_us(), &CALM, false);
         assert_eq!(counts_of(&idle).n, 2, "{idle:?}");
         assert_eq!(reader.read_at(), Some(at(70)));
-        // Negative control: armed, the same wait re-reads at its period.
         std::fs::write(slots.join("slot-2"), b"").expect("a third slot");
         let armed = reader.read(at(75), now_us(), &CALM, true);
         assert_eq!(counts_of(&armed).n, 3, "{armed:?}");
@@ -1274,12 +1208,6 @@ mod live {
         );
     }
 
-    /// A LOCK HELD WITH NO RECORD TO SHOW IT is never free: a winner that
-    /// took the slot's `flock` and stalls before its record (after its
-    /// truncate, or before it, over a gone writer's record) reads unknown on
-    /// every read, however long it stalls. The lock query is a query: the
-    /// file's lock is seen as this test holds it and not once it lets go.
-    /// NEGATIVE CONTROL: the lock let go, the same slots pair free.
     #[test]
     fn a_lock_held_with_no_record_to_show_it_is_never_free() {
         let me = std::process::id();
@@ -1288,7 +1216,6 @@ mod live {
         let empty = dir.path().join("slot-0");
         let stale = dir.path().join("slot-1");
         std::fs::write(&empty, b"").expect("truncated, no record yet");
-        // This process's pid, but a record older than it: a gone writer's.
         std::fs::write(&stale, python_record(me, dir.path(), born - 10_000_000))
             .expect("a gone writer's record");
         let open = |path: &Path| {
@@ -1317,7 +1244,6 @@ mod live {
         for c in &reads {
             assert_eq!((c.n, c.free, c.unknown), (2, 0, 2), "{reads:?}");
         }
-        // Negative control: let go, the same slots read free on two reads.
         for f in [&a, &b] {
             f.unlock().expect("LOCK_UN");
         }
@@ -1335,11 +1261,6 @@ mod live {
         );
     }
 
-    /// A WRITER WHOSE DESCRIPTORS ARE REFUSED (another user's: a root
-    /// daemon's, as `sudo build-slot` would leave) is never read as one that
-    /// let go on its descriptors alone: libproc answers the refusal with no
-    /// bytes, which is no list, not an empty one. The lock query has the last
-    /// word: nobody holds the lock, it let go; someone does, unproven.
     #[test]
     fn a_refused_descriptor_table_is_unproven_until_the_lock_says() {
         // SAFETY: `geteuid` reads this process's effective uid.
@@ -1351,7 +1272,6 @@ mod live {
             .expect("a root daemon");
         let table = crate::jobs::macos_vnode_ids(daemon.pid);
         assert_eq!(table, None, "a refused table read as a list");
-        // Its record, written after it was born: it is the writer, alive.
         let writer = rec(daemon.pid, now_us());
         let file = (1, 100);
         let holder = super::super::live::holder;
@@ -1364,10 +1284,6 @@ mod live {
     }
 }
 
-/// A HOLDER IS RUNNING WHILE ITS PID IS STILL THE PROCESS IT WAS PROVEN AS:
-/// this test's own process, by the birth the kernel records for it.
-/// NEGATIVE CONTROL: the same pid under another birth (taken again by a
-/// process born since) is not.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_holder_is_running_only_as_the_process_born_when_it_was_proven() {

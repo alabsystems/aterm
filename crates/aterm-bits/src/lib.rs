@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm-bits`.
+//! `aterm-bits` — minimal `Pod`/`Zeroable` traits and byte-casting helpers.
 
 #![warn(missing_docs)]
 #![warn(clippy::undocumented_unsafe_blocks)]
@@ -132,6 +132,9 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
 
     if a_size == 0 || b_size == 0 {
         if a_size == b_size {
+            // Empty slice of B. Use a fresh empty slice (dangling, aligned)
+            // rather than rebuilding one at `src`'s address: `src` need not
+            // be aligned for `B` here, and an empty slice's address is not
             // observable through the slice API.
             return Ok(&[]);
         }
@@ -151,6 +154,9 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
     let out_len = byte_len / b_size;
     let ptr_b = ptr_a.cast::<B>();
     if (ptr_b as usize) == 0 {
+        // Unreachable: a pointer derived from a reference is never null. The
+        // guard hands the verifier the non-null fact it cannot carry across
+        // the pointer cast; behavior is unchanged. (Integer compare instead
         // of `is_null()`: the latter is an unlowerable call boundary.)
         return Ok(&[]);
     }
@@ -164,6 +170,8 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
 pub const fn bytes_of<T: Pod>(value: &T) -> &[u8] {
     let ptr = core::ptr::from_ref(value).cast::<u8>();
     if ptr.is_null() {
+        // Unreachable: a pointer derived from a reference is never null. The
+        // guard hands the verifier the non-null fact it cannot carry across
         // the pointer cast; behavior is unchanged.
         return &[];
     }

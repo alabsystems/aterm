@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Parity for the cursor aurora (additive light): the GPU One/One pipeline on the Rgba8Unorm
-// offscreen matches the CPU integer `add_sat`, byte-exact over an opaque background and within
-// the base glyph tolerance (<=8) over anti-aliased text. Also the cached path, a chrome head
-// band, and bloom (GPU-only, smoke-checked).
-//
-// A host without a GPU could not run it (`common::gpu`).
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{
@@ -16,8 +9,6 @@ use aterm_render::{
 use crate::common::ByteExact;
 use crate::common::{backends_fontdue as backends, gg, max_channel_delta};
 
-/// Premultiplied light over pure background is byte-exact on both backends and equals
-/// `min(255, bg + premul)` per channel.
 #[test]
 fn glow_additive_is_byte_exact_over_background() {
     let exact = ByteExact::default();
@@ -34,7 +25,6 @@ fn glow_additive_is_byte_exact_over_background() {
     };
     input.cursor_visible = false; // isolate the glow: no cursor pixels in the mix
 
-    // A spread of premultiplied light quads at several coverages, each a full cell.
     let base = 0x0050_FA7B; // Dracula green
     for (i, a) in [40u8, 90, 160, 220, 255].iter().enumerate() {
         let col = i + 1;
@@ -45,7 +35,6 @@ fn glow_additive_is_byte_exact_over_background() {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(base, *a),
-            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(base, *a),
             alpha2: 0,
@@ -60,8 +49,6 @@ fn glow_additive_is_byte_exact_over_background() {
     );
     let delta = max_channel_delta(&cpu_frame.pixels, &gpu_frame.pixels);
     eprintln!("LUMEN additive-over-bg max per-channel delta = {delta}");
-    // Byte-exact only on native; on a downlevel sRGB offscreen the add lands in linear (see
-    // `GpuRenderer::additive_is_byte_exact`).
     if exact.holds(&gpu, "byte-exact additive gate") {
         assert_eq!(
             delta, 0,
@@ -69,8 +56,6 @@ fn glow_additive_is_byte_exact_over_background() {
         );
     }
 
-    // And the value is exactly min(255, bg + premul): sample the brightest quad's
-    // center on the CPU frame and check the math holds.
     let bg = theme.bg;
     let premul = premul_rgb(base, 255);
     let want_g = (((bg >> 8) & 0xff) + ((premul >> 8) & 0xff)).min(255) as i32;
@@ -84,8 +69,6 @@ fn glow_additive_is_byte_exact_over_background() {
     );
 }
 
-/// An aurora (a comet across a row and a crown over 3 rows) over glyphs matches within the
-/// glyph tolerance (<=8).
 #[test]
 fn glow_over_text_matches_within_tolerance() {
     let theme = Theme::default();
@@ -99,7 +82,6 @@ fn glow_over_text_matches_within_tolerance() {
     let mut input = term.cell_frame(rows, cols);
 
     let base = 0x007A_A2F7; // a blue accent
-    // Comet across row 1 (over the second command line), head-bright → tail-faint.
     for c in 0..12usize {
         let a = (40 + c * 16).min(230) as u8;
         input.cursor_glow_add.push(GlowQuad {
@@ -114,7 +96,6 @@ fn glow_over_text_matches_within_tolerance() {
             alpha2: 0,
         });
     }
-    // A crown straddling rows 0,1,2 at column 12 (each as its own single-row quad).
     for r in 0..3usize {
         input.cursor_glow_add.push(GlowQuad {
             row: r as u16,
@@ -137,10 +118,6 @@ fn glow_over_text_matches_within_tolerance() {
     assert!(delta <= 8, "glow over text diverges: max delta {delta} > 8");
 }
 
-/// Glow through the cached path (`render_input_cached` on one persistent renderer and window
-/// per backend): frame A places a glow at P1; frame B moves it to P2 (missing the GPU gate)
-/// and must be byte-exact CPU vs GPU over a glyph-free background; frame C drains the glow and
-/// must return to each backend's own bare frame.
 #[test]
 fn damaged_path_glow_parity_cpu_matches_gpu() {
     let exact = ByteExact::default();
@@ -168,8 +145,6 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
         alpha2: 0,
     };
 
-    // Frame 0: the bare frame through the cached path on a fresh window (a
-    // full repaint), the oracle for the drained frame C.
     let cpu_bare = cpu
         .render_input_cached(&mut win_cpu, &base_input)
         .pixels()
@@ -179,7 +154,6 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
         .pixels()
         .to_vec();
 
-    // Frame A: glow at P1 (col 2, row 1) — primes both caches.
     let mut in_a = base_input.clone();
     in_a.cursor_glow_add.push(quad_at(2, 1));
     let cpu_a = cpu
@@ -188,7 +162,6 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
         .to_vec();
     let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
 
-    // Frame B: move the glow to P2 (col 10, row 2), a real content change.
     let mut in_b = base_input.clone();
     in_b.cursor_glow_add.push(quad_at(10, 2));
     let misses_before = gpu.gate_misses();
@@ -201,18 +174,14 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
     let (gw, gh) = (gpu_view.width(), gpu_view.height());
     drop(gpu_view);
 
-    // The moved glow is a real change, so the GPU gate missed (a fresh re-render, not a stale
-    // hit returning frame A's pixels) ...
     assert!(
         gpu.gate_misses() > misses_before,
         "moved glow must MISS the GPU dirty gate (real re-render)"
     );
-    // ... and frame B genuinely differs from frame A (the glow actually moved).
     assert!(cpu_a != cpu_b, "glow did not move between frames A and B");
 
     assert_eq!((gw, gh), (cols * cw, rows * ch), "unexpected frame size");
 
-    // Additive light over a glyph-free background is byte-exact.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path glow CPU vs GPU max per-channel delta = {delta}");
     if exact.holds(&gpu, "damaged-path byte-exact additive gate") {
@@ -222,21 +191,16 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
         );
     }
 
-    // Frame C: drain the aurora. On a damage-tracked path drained light survives unless the
-    // dirty set covers the previous frame's rows (`compute_dirty_rows`); each backend's
-    // drained frame must return to its own bare frame.
     let in_c = base_input.clone(); // byte-equal to frame 0: empty cursor_glow_add
     assert!(
         in_c.cursor_glow_add.is_empty(),
         "frame C must carry no glow"
     );
 
-    // CPU: the row-preserving damaged path — the leg with teeth.
     let cpu_c = cpu
         .render_input_cached(&mut win_cpu, &in_c)
         .pixels()
         .to_vec();
-    // Non-vacuity: frame B was lit relative to bare, or returning to bare would prove nothing.
     assert_ne!(
         max_channel_delta(&cpu_bare, &cpu_b),
         0,
@@ -249,9 +213,6 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
          left on the rows the drained quad occupied"
     );
 
-    // GPU leg 1: `render_input_cached` is gate-or-full-repaint, so it cannot
-    // strand residue; this pins that the drained frame misses the gate. Leg 2
-    // tests the residue law.
     let misses_before_c = gpu.gate_misses();
     let gpu_c = gpu
         .render_input_cached(&mut win_gpu, &in_c)
@@ -267,9 +228,6 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
         "GPU gate path: an emptied glow must return the bare frame"
     );
 
-    // GPU leg 2: the scissored present (`present_input_readback`), where rows
-    // outside the dirty band are preserved: bare, A, B, drained; the drained
-    // frame must equal bare.
     let mut win_sc = aterm_gpu::WindowGpu::new();
     let sc_bare = gpu.present_input_readback(&mut win_sc, &base_input).pixels;
     let _ = gpu.present_input_readback(&mut win_sc, &in_a);
@@ -294,13 +252,6 @@ fn damaged_path_glow_parity_cpu_matches_gpu() {
     );
 }
 
-/// The bloom fades out on a light page: on white the halo adds nothing,
-/// so dark letters beside a bright comet keep their pixels exactly; on a
-/// light-grey page it adds less than on a mid-grey one, which keeps nearly the
-/// configured bloom (negative control: the same comet does bloom there). The
-/// CPU twin, given the page's share
-/// ([`aterm_render::hdr::light_page_bloom_share`]), adds the same light as the
-/// readback composite and the live present.
 #[test]
 fn bloom_fades_out_on_a_light_page() {
     let theme = Theme::default();
@@ -318,7 +269,6 @@ fn bloom_fades_out_on_a_light_page() {
         );
         let mut input = term.cell_frame(rows, cols);
         input.cursor_visible = false; // isolate the glow
-        // A bright comet across the middle row, ending beside the letters.
         for c in 4..11usize {
             input.cursor_glow_add.push(GlowQuad::flat(
                 3,
@@ -327,7 +277,6 @@ fn bloom_fades_out_on_a_light_page() {
                 cw as u16,
                 ch as u16,
                 premul_rgb(0x0050_FA7B, 220),
-                // ADDITIVE light (see `GlowQuad::alpha`).
                 0,
             ));
         }
@@ -337,11 +286,6 @@ fn bloom_fades_out_on_a_light_page() {
         gpu.set_bloom(false);
         let off = gpu.render_input(&mut win, &input, None);
         assert_eq!((on.width, on.height), (off.width, off.height));
-        // The twin blooms the GPU's own bloom-off frame, so the bound judges
-        // the light each law adds and nothing else. Base glyph parity is the
-        // glyph suites' (<=8): a blend unit at the target's 8-bit precision
-        // (NVIDIA, Vulkan and GL alike) leaves dark ink on a light page up to
-        // 7 codes from the CPU's with no bloom at all.
         let mut twin = off.clone();
         aterm_render::bloom::apply(
             &mut twin,
@@ -358,7 +302,6 @@ fn bloom_fades_out_on_a_light_page() {
             worst <= 2,
             "page {page:06x}: the CPU twin fades alike: {worst}"
         );
-        // The live present writes its own bloom uniform: the same light.
         gpu.set_bloom(true);
         let presented = gpu.present_input_readback(&mut aterm_gpu::WindowGpu::new(), &input);
         gpu.set_bloom(false);
@@ -392,10 +335,6 @@ fn bloom_fades_out_on_a_light_page() {
     );
 }
 
-/// Head band: with a chrome head band and interior padding on both backends, the
-/// window-absolute streams (a real `comet_beam` rising into the band, a `glow_halo` and a
-/// `glow_under` quad in the band) and a grid-space `nova_add` quad render byte-exact CPU==GPU,
-/// and band pixels carry light. The cached-path leg checks the head-tall row-0 top strip.
 #[test]
 fn glow_head_band_parity_cpu_matches_gpu() {
     let exact = ByteExact::default();
@@ -415,8 +354,6 @@ fn glow_head_band_parity_cpu_matches_gpu() {
     let (cw, ch) = cpu.cell_size();
     let grid_top = P + H;
 
-    // (a) Base (no effects): the head-band framing itself is byte-exact, and
-    // the frame carries the `head` extension (`rows·ch + 2·pad + head` tall).
     let base_input = term.cell_frame(rows, cols);
     let cpu_base = cpu.render_input(&base_input);
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
@@ -431,9 +368,6 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         "head-band base must be byte-exact so the glow delta is effect-only"
     );
 
-    // (b) A beam through the public rasterizer, clipped by the effects box
-    // (grid box plus head band), rising into the band with its above-grid quads
-    // tagged row 0.
     let clip = BeamClip {
         x0: P as i32,
         y0: 0,
@@ -468,7 +402,6 @@ fn glow_head_band_parity_cpu_matches_gpu() {
 
     let mut input = term.cell_frame(rows, cols);
     input.cursor_glow_add = quads;
-    // The radial twin, centred in the band (window-absolute, row tag 0) ...
     input.glow_halo.push(RainHalo {
         row: 0,
         x: (P + 12 * cw) as u16,
@@ -482,7 +415,6 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         ry: grid_top as u16,
         mode: HaloMode::Add,
     });
-    // ... the under-glyph stream, same window-absolute convention ...
     input.glow_under.push(GlowQuad {
         row: 0,
         x: (P + 17 * cw) as u16,
@@ -494,8 +426,6 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         color2: premul_rgb(0x00FF_8844, 160),
         alpha2: 0,
     });
-    // ... and one grid-space nova quad: pins the `pad`/`grid_top` offset the grid streams add
-    // on both backends (`grid_top16 = pad + head`).
     input.nova_add.push(GlowQuad {
         row: 1,
         x: (3 * cw) as u16,
@@ -514,8 +444,6 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         cpu_f.pixels, cpu_base.pixels,
         "the head-band streams must actually paint (non-vacuous)"
     );
-    // The band carries light on both backends: some pixel above the grid (`y < grid_top`)
-    // differs from that backend's base.
     let band_lit =
         |painted: &[u32], base: &[u32], w: usize| (0..grid_top * w).any(|i| painted[i] != base[i]);
     assert!(
@@ -535,9 +463,6 @@ fn glow_head_band_parity_cpu_matches_gpu() {
         );
     }
 
-    // (c) Cached path: prime with the base, render the glow frame through
-    // `render_input_cached`; the row-0 damage hints open the head-tall top strip
-    // and the result equals the fresh full renders.
     let mut win_cpu = WindowCpu::new();
     let mut win_gpu = aterm_gpu::WindowGpu::new();
     let _ = cpu.render_input_cached(&mut win_cpu, &base_input);
@@ -560,21 +485,12 @@ fn glow_head_band_parity_cpu_matches_gpu() {
     );
 }
 
-/// The bloom extract ramps a gradient quad across its own width. The extract
-/// draws into the half-res target with full-res uniforms, so the ramp column
-/// must be measured in the quad's own space. A red-to-blue gradient across 30
-/// cells, bloom on minus off, sampled 3 px above: the halo is red-dominant over
-/// the left end and blue-dominant over the right, like the control built from
-/// 30 flat quads. Runs on the first-party renderer and (macOS, Linux) the
-/// wgpu oracle.
 #[test]
 fn bloom_halo_follows_a_gradient_quad_s_ramp() {
     let theme = Theme::default();
     let (rows, cols) = (8usize, 40usize);
     let (c0, c1) = (0x00E0_0000u32, 0x0000_00E0u32);
     for oracle in [false, true] {
-        // The oracle pass is macOS's and Linux's wgpu arm, compiled only into
-        // the `--features wgpu-oracle` lane; elsewhere wgpu is the only arm.
         if oracle && !cfg!(all(any(target_os = "macos", target_os = "linux"), wgpu_arm)) {
             continue;
         }
@@ -601,7 +517,6 @@ fn bloom_halo_follows_a_gradient_quad_s_ramp() {
         let w = (n * cw) as u32;
         let cells: Vec<GlowQuad> = (0..n)
             .map(|k| {
-                // The column-centre colour of cell k's middle pixel.
                 let i = (k * cw + cw / 2) as u32;
                 let c = aterm_render::glow_lerp_rgb(c0, c1, i, w);
                 GlowQuad::flat(
@@ -653,12 +568,6 @@ fn bloom_halo_follows_a_gradient_quad_s_ramp() {
     }
 }
 
-/// THE CPU BLOOM IS THE GPU'S: a frame the CPU renderer draws and blooms
-/// through `aterm_render::bloom::apply` matches the GPU's bloom pass on the
-/// same input (a comet-like strip, a thin hairline that takes the half-res
-/// stability copy, and a gradient quad), within a level of float rounding
-/// per channel, and adds the same light in total. NEGATIVE CONTROL: the twin
-/// at half the strength misses the GPU frame.
 #[test]
 fn cpu_bloom_twin_matches_the_gpu_bloom() {
     let theme = Theme::default();

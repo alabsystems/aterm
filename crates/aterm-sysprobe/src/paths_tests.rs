@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows path key, held on every platform: it reads a path's text and
-//! touches nothing.
+//! Pure Windows path-key and ancestry normalization tests.
 
 use super::*;
 
@@ -14,10 +13,6 @@ fn under(p: &str, d: &str) -> Option<bool> {
     windows_under(Path::new(p), Path::new(d))
 }
 
-/// Every spelling Windows hands out for one directory keys alike: the
-/// verbatim one `canonicalize` answers, the plain one a process records
-/// (trailing separator, case as typed), `/` for `\`, the NT form a junction
-/// stores. NEGATIVE CONTROL: `Path::starts_with` places none of them.
 #[test]
 fn every_spelling_of_one_directory_keys_alike() {
     let want = Some(r"C:\USERS\M6-AN\ATERM".to_owned());
@@ -47,8 +42,6 @@ fn every_spelling_of_one_directory_keys_alike() {
     }
 }
 
-/// A UNC path keys with its server and share, verbatim or not, any case; a
-/// server alone or an empty name is not placed.
 #[test]
 fn a_unc_path_keys_by_its_server_and_share() {
     let want = Some(r"\\SRV\SHARE\X".to_owned());
@@ -69,11 +62,6 @@ fn a_unc_path_keys_by_its_server_and_share() {
     assert_eq!(under(r"\\?\UNC\srv\share\x", r"\\SRV\Share"), Some(true));
 }
 
-/// Without a table, two paths are related only under one root: across two
-/// drive letters, a letter and a share, or two shares, a `subst` letter, a
-/// volume's second mount point or a loopback share may name the same
-/// directory, so that is not placed. NEGATIVE CONTROL: under one root the
-/// rule answers both ways.
 #[test]
 fn two_roots_are_not_related_without_a_table() {
     for (p, d) in [
@@ -91,10 +79,6 @@ fn two_roots_are_not_related_without_a_table() {
     assert_eq!(under(r"C:\x", r"C:\"), Some(true));
 }
 
-/// After a verbatim prefix nothing is normalized: `/` is a character of a
-/// name, so the path is not placed; an empty name is not placed; a name
-/// ending in `.` or a space is literal. A plain path's trailing-dot name is
-/// trimmed by Win32 rules the key does not model: not placed.
 #[test]
 fn a_verbatim_path_is_read_literally() {
     assert_eq!(key(r"\\?\C:\a/b"), None, "`/` after a verbatim prefix");
@@ -111,9 +95,6 @@ fn a_verbatim_path_is_read_literally() {
     );
 }
 
-/// What is not a placed absolute path answers `None`: relative,
-/// drive-relative, root-relative, `.` and `..`, the device namespace, a
-/// volume GUID path (the table places that one), a drive's device.
 #[test]
 fn what_cannot_be_placed_answers_none() {
     for p in [
@@ -143,10 +124,6 @@ fn what_cannot_be_placed_answers_none() {
     }
 }
 
-/// Case folds character by character to a simple uppercase of one UTF-16
-/// unit, as NTFS's upcase table does: `ä` is `Ä`, `ß` (whose uppercase is two
-/// letters) stays, and a character outside the Basic Multilingual Plane keeps
-/// its case.
 #[test]
 fn case_folds_as_ntfs_upcases_a_name() {
     assert_eq!(key(r"C:\Ärger\ärger"), Some(r"C:\ÄRGER\ÄRGER".to_owned()));
@@ -157,13 +134,6 @@ fn case_folds_as_ntfs_upcases_a_name() {
     assert_eq!(under("C:\\\u{10400}", "C:\\\u{10428}"), Some(false));
 }
 
-/// The fold is Unicode's SIMPLE uppercase: each Greek letter with
-/// ypogegrammeni (`ᾀ` U+1F80) folds to its prosgegrammeni form (`ᾈ`
-/// U+1F88), as NTFS folds it — 27 characters whose full uppercase is two
-/// letters (`ἈΙ`). NEGATIVE CONTROL: `char::to_uppercase` (the full
-/// mapping) spells each of them as two characters, which a fold of one unit
-/// cannot use; a letter of the block with no simple uppercase (`ᾲ`) keeps
-/// its case.
 #[test]
 fn case_folds_by_the_simple_uppercase() {
     let pairs = (0x1F80..=0x1F87)
@@ -190,8 +160,6 @@ fn case_folds_by_the_simple_uppercase() {
     assert_eq!(key("C:\\\u{1FB2}"), Some("C:\\\u{1FB2}".to_owned()));
 }
 
-/// Under is component by component, at the directory itself too; a root
-/// holds everything on its drive and nothing on another.
 #[test]
 fn under_is_component_by_component() {
     let dir = r"C:\Users\m6-an";
@@ -219,12 +187,6 @@ fn under_is_component_by_component() {
     assert!(!key_under(r"C:\A", r"C:\A\B"));
 }
 
-/// A name shaped like a generated 8.3 short name names ANOTHER name's file
-/// (`C:\PROGRA~1` is `C:\Program Files`; this box generates them), so it is
-/// not placed — in any case, verbatim or not, with an extension, in the
-/// hashed form — rather than keyed apart from its long name: a caller that
-/// may hold one canonicalizes first or compares file ids. NEGATIVE CONTROL:
-/// a `~` in a name of any other shape is a plain character.
 #[test]
 fn a_short_name_is_not_placed() {
     assert_eq!(under(r"C:\PROGRA~1\x", r"C:\Program Files"), None);
@@ -256,17 +218,6 @@ fn a_short_name_is_not_placed() {
     }
 }
 
-/// A path refused ONLY for its short-shaped names is short-spelled, cut in
-/// three: the part before the first of them is what keys — the root, or the
-/// long names leading to it, in the path's own spelling (verbatim, a share,
-/// a doubled separator) — what the mount table places before anything opens
-/// the path; the part through the LAST of them, verbatim with Win32's own
-/// normalization (a `\??\` prefix, `/` and doubled separators), is all the
-/// file system is asked about; the names after it are kept as they are, a
-/// trailing separator dropped. NEGATIVE CONTROLS: a path the key places is
-/// not short-spelled, nor is one refused for another reason as well
-/// (relative, `..`, a trailing dot, the device namespace, a verbatim `/`),
-/// nor one with no short name.
 #[test]
 fn only_a_path_refused_for_its_short_names_is_short_spelled() {
     let lead =
@@ -343,7 +294,6 @@ fn only_a_path_refused_for_its_short_names_is_short_spelled() {
     }
 }
 
-/// The platform's rule: the key on Windows, `starts_with` elsewhere.
 #[test]
 fn is_under_takes_the_platforms_rule() {
     if cfg!(windows) {
@@ -372,9 +322,6 @@ fn is_under_takes_the_platforms_rule() {
     }
 }
 
-/// The display spelling drops a verbatim drive or UNC prefix and nothing
-/// else: a volume GUID path has no other spelling, and a `/` after a verbatim
-/// prefix would read as a separator once plain.
 #[test]
 fn plain_drops_only_a_verbatim_drive_or_unc_prefix() {
     let plain_of = |p: &str| plain(Path::new(p)).into_owned();
@@ -394,11 +341,6 @@ fn plain_drops_only_a_verbatim_drive_or_unc_prefix() {
     }
 }
 
-/// Every character of the Basic Multilingual Plane keys as the system's own
-/// upcase table (`RtlUpcaseUnicodeChar`, the table NTFS formats a volume's
-/// `$UpCase` from) folds it: two names NTFS opens as one file never key
-/// apart. Pure — no file is touched — and its own negative control: the
-/// full uppercase mapping fails it at U+1F80.
 #[cfg(windows)]
 #[test]
 fn every_bmp_character_keys_as_the_system_upcases_it() {
@@ -415,10 +357,6 @@ fn every_bmp_character_keys_as_the_system_upcases_it() {
     assert!(apart.is_empty(), "keyed apart from their upcase: {apart:?}");
 }
 
-/// NTFS itself opens each of the 27 simple-uppercase pairs as one name: a
-/// directory made with the small letter is found by the capital one, in a
-/// scratch directory on the temp volume. NEGATIVE CONTROL: `ß` and `SS`,
-/// which the key keeps apart, are two names there too.
 #[cfg(windows)]
 #[test]
 fn ntfs_opens_a_simple_uppercase_pair_as_one_name() {

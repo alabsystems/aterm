@@ -133,7 +133,7 @@ trust_contract_fn! {
 }
 
 trust_contract_fn! {
-    /// Pre-handoff exit status when no terminal is available ([`EXIT_USAGE`], [`NO_TERMINAL`]).
+    /// Whether the pre-handoff rows exit [`EXIT_USAGE`] saying [`NO_TERMINAL`].
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
@@ -234,7 +234,8 @@ pub const WAIT_REPLACED: u8 = 3;
 pub const WAIT_FAILED: u8 = 4;
 
 trust_contract_fn! {
-    /// The exit status a wait that ended as `end` ([`aterm_ctl::EXIT_REPLACED`]).
+    /// The exit status a wait that ended as `end` leaves: 0 finished or closed,
+    /// [`aterm_ctl::EXIT_REPLACED`] replaced, else 1.
     #[must_use]
     pub fn wait_status(end: u8) -> u8
     clauses [ensures result == wait_status_table(end) by wait_status_is_the_table]

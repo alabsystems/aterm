@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The C2SP CCTV age vectors that apply to an X25519-only reader (tests/cctv/README.md),
-//! each held to its exact class: `success` to the payload's SHA-256, every failure to the
-//! one `AgeError` it names.
+//! C2SP CCTV age test vectors for an X25519-only reader.
 
 use aterm_secrets::age::{AgeError, Identity, decrypt};
 use std::path::{Path, PathBuf};
 
-/// What a vector expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expect {
     Success,
@@ -76,7 +73,6 @@ fn index() -> Vec<Vector> {
         .collect()
 }
 
-/// The age file: `<name>.age` raw, or `<name>.age.zlib` as CCTV ships its large vectors.
 fn file(name: &str) -> Vec<u8> {
     let raw = dir().join(format!("{name}.age"));
     if raw.exists() {
@@ -97,8 +93,6 @@ fn every_applicable_cctv_vector_has_its_exact_class() {
     let mut failures = Vec::new();
     for vector in &vectors {
         let data = file(&vector.name);
-        // The reader takes the armor path for exactly the files CCTV marks armored: those
-        // that do not begin with the version line's fixed part (and are not empty).
         let read_as_armor = !data.is_empty() && !data.starts_with(b"age-encryption.org/");
         if vector.armored != read_as_armor {
             failures.push(format!(
@@ -144,7 +138,6 @@ fn every_applicable_cctv_vector_has_its_exact_class() {
     );
 }
 
-/// The classes the subset covers, so a vector dropped from the index shows here too.
 #[test]
 fn the_subset_covers_every_class() {
     let vectors = index();
@@ -157,7 +150,6 @@ fn the_subset_covers_every_class() {
     assert_eq!(count(Expect::Fails(AgeError::Armor)), 26);
 }
 
-/// Every `success` vector that is not armored round-trips through our own armor.
 #[test]
 fn success_vectors_round_trip_through_our_armor() {
     for vector in index() {

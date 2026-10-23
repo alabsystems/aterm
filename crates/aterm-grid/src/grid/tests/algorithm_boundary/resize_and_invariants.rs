@@ -4,7 +4,6 @@
 
 use super::super::super::reflow::ReflowMode;
 use super::*;
-// Scroll region and damage tracking
 
 #[test]
 fn reset_scroll_region_restores_full_screen_region() {
@@ -91,8 +90,6 @@ fn needs_full_redraw_distinguishes_partial_and_full_damage() {
     assert!(!grid.needs_full_redraw());
     assert!(grid.damage().has_damage());
 
-    // scroll_up(1) uses targeted row damage: only bottom N rows
-    // are marked dirty, not full screen. Full damage requires n >= rows.
     grid.scroll_up(1);
     assert!(grid.damage().has_damage());
     assert!(
@@ -100,7 +97,6 @@ fn needs_full_redraw_distinguishes_partial_and_full_damage() {
         "scroll_up(1) on 3-row grid should mark targeted damage, not full"
     );
 
-    // scroll_up(n) with n >= visible_rows marks full damage
     grid.clear_damage();
     grid.scroll_up(3);
     assert!(grid.needs_full_redraw());
@@ -130,29 +126,20 @@ fn clamp_display_offset_limits_and_marks_damage_on_clamp_only() {
     assert!(!grid.needs_full_redraw());
 }
 
-// Ring buffer + resize boundary tests
-
 #[test]
 fn row_shrink_after_scrolling_preserves_newest_content() {
-    // Verify that shrinking rows after scrolling (ring_head != 0) preserves
-    // the most recent visible rows, not the oldest.
     let mut grid = Grid::with_scrollback(5, 10, 0);
     for row in 0..5 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
-    // Two scrolls advance ring_head; with scrollback=0 each recycles the oldest row.
     grid.set_cursor(4, 0);
     grid.line_feed();
     grid.line_feed();
-    // After 2 scrolls: visible rows are C, D, E, <blank>, <blank>
     grid.set_cursor(3, 0);
     grid.write_char('X');
     grid.set_cursor(4, 0);
     grid.write_char('Y');
-    // Visible: C, D, E, X, Y (ring_head != 0), cursor on Y. Shrinking to 3 rows
-    // anchors at the cursor, so C and D are demoted toward history and, with
-    // scrollback=0, evicted: the newest content survives.
     grid.resize_with_reflow_mode(3, 10, ReflowMode::Enabled);
     assert_eq!(grid.rows(), 3);
     for row in 0..3 {
@@ -162,16 +149,12 @@ fn row_shrink_after_scrolling_preserves_newest_content() {
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'E');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'X');
     assert_eq!(grid.cell(2, 0).unwrap().char(), 'Y');
-    // The cursor followed its line up: it sat on the Y row and still does.
     assert_eq!(grid.cursor_row(), 2);
     grid.assert_invariants();
 }
 
 #[test]
 fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
-    // A rows-only shrink on a ring-only grid reclassifies instead of trimming:
-    // the demoted bottom row joins history and existing scrollback stays,
-    // bounded by the ring cap.
     let mut grid = Grid::with_scrollback(4, 10, 4);
     for row in 0..4 {
         grid.set_cursor(row, 0);
@@ -187,9 +170,6 @@ fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
     grid.write_char('Y');
     grid.set_cursor(3, 0);
     grid.write_char('Z');
-    // 4 visible + 3 scrollback: A, B, C | D, X, Y, Z, cursor on Z. Shrinking to
-    // 3 rows anchors at the cursor, so D is demoted as the newest history line:
-    // history [A, B, C, D] (the cap of 4), visible [X, Y, Z].
     grid.resize_with_reflow_mode(3, 10, ReflowMode::Enabled);
     assert_eq!(grid.rows(), 3);
     for row in 0..3 {
@@ -198,7 +178,6 @@ fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
     assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'Y');
     assert_eq!(grid.cell(2, 0).unwrap().char(), 'Z');
-    // Nothing evicted (4 lines fit the cap of 4), in write order.
     assert_eq!(grid.scrollback_lines(), 4);
     let history: Vec<String> = (0..4)
         .map(|i| {
@@ -264,9 +243,7 @@ fn multipage_grid_resize_zeroes_cells() {
     }
 }
 
-/// Reflow grow: a cursor in the trailing blank area of a continuation row
-/// stays on the same logical line (the merged row). The cursor offset uses the
-/// row width, not `row.len()`.
+/// Reflow grow keeps a cursor in the trailing blank area of a continuation row on the merged row.
 #[test]
 fn reflow_grow_cursor_in_trailing_blank_of_continuation_row() {
     let mut grid = Grid::new(4, 5);
@@ -309,11 +286,7 @@ fn reflow_grow_cursor_in_trailing_blank_of_continuation_row() {
     grid.assert_invariants();
 }
 
-// visible_to_absolute coordinate consistency
-
-/// Resize shrink while scrolled back: TotalLinesMinimum and TotalLinesValid
-/// hold with `display_offset > 0`, where `total_lines` and `visible_rows` are
-/// updated independently.
+/// Resize shrink while scrolled back preserves `TotalLinesMinimum` and `TotalLinesValid`.
 #[test]
 fn invariants_resize_shrink_while_scrolled_back() {
     let mut grid = Grid::with_scrollback(10, 20, 50);
@@ -338,8 +311,7 @@ fn invariants_resize_shrink_while_scrolled_back() {
     grid.assert_invariants();
 }
 
-/// Resize shrink to minimum (2 rows) after filling scrollback to capacity,
-/// then grow back. Exercises TotalLinesMinimum under extreme pressure.
+/// Resize shrink to 2 rows after filling scrollback to capacity and grow back.
 #[test]
 fn invariants_resize_extreme_shrink_full_scrollback() {
     let mut grid = Grid::with_scrollback(8, 10, 20);
@@ -365,8 +337,7 @@ fn invariants_resize_extreme_shrink_full_scrollback() {
     grid.assert_invariants();
 }
 
-/// Resize with simultaneous row shrink and column change while scrolled back.
-/// Column change triggers reflow, which interacts with ring buffer state.
+/// Simultaneous row shrink and column reflow while scrolled back preserves grid invariants.
 #[test]
 fn invariants_resize_reflow_while_scrolled_back() {
     let mut grid = Grid::with_scrollback(6, 20, 30);
@@ -390,9 +361,7 @@ fn invariants_resize_reflow_while_scrolled_back() {
     grid.assert_invariants();
 }
 
-/// visible_to_absolute is stable across scrolls: content at visible row R with
-/// absolute A still maps to A at row R-K after scrolling K lines, including
-/// while the ring grows.
+/// `visible_to_absolute` stays consistent across scrolls while the ring grows.
 #[test]
 fn visible_to_absolute_self_consistency_growth_phase() {
     let mut grid = Grid::with_scrollback(4, 10, 5);
@@ -404,7 +373,6 @@ fn visible_to_absolute_self_consistency_growth_phase() {
 
     let abs_before = grid.visible_to_absolute(2);
 
-    // Growth phase: the ring grows from 4 to 5 rows.
     grid.set_cursor(3, 0);
     grid.line_feed();
 
@@ -418,12 +386,11 @@ fn visible_to_absolute_self_consistency_growth_phase() {
     );
 }
 
-/// visible_to_absolute self-consistency once the ring is at capacity.
+/// `visible_to_absolute` self-consistency once the ring is at capacity.
 #[test]
 fn visible_to_absolute_self_consistency_reuse_phase() {
     let mut grid = Grid::with_scrollback(4, 10, 3);
 
-    // Fill and scroll enough to reach ring capacity (4 visible + 3 scrollback = 7 rows).
     for row in 0..4 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
@@ -490,15 +457,11 @@ fn resize_to_zero_clamps_to_one_row_and_column() {
     }
 }
 
-// ComplexCharRing invalidation on row-only resize
-
-/// A row-only resize invalidates the ComplexCharRing so emoji stored for the
-/// old geometry do not alias into new row indices.
+/// A row-only resize invalidates the `ComplexCharRing` so non-BMP glyphs do not alias into new row indices.
 #[test]
 fn row_only_resize_invalidates_complex_char_ring() {
     let mut grid = Grid::new(24, 80);
 
-    // U+1F389 is outside the BMP, so it goes through the ComplexCharRing.
     grid.set_cursor(0, 0);
     grid.write_char('\u{1F389}');
 
@@ -508,7 +471,6 @@ fn row_only_resize_invalidates_complex_char_ring() {
         "precondition: row 0 should contain party popper emoji, got: {text_before:?}"
     );
 
-    // Without invalidation the 24-row ring would alias row 30 to row 6.
     grid.resize(48, 80);
     assert_eq!(grid.rows(), 48);
 
@@ -521,7 +483,6 @@ fn row_only_resize_invalidates_complex_char_ring() {
         "row 30 should contain rocket emoji after row-only resize, got: {text_row30:?}"
     );
 
-    // Row 6 (= 30 % 24) is where a stale ring would alias it.
     let cell_row6 = grid.cell(6, 0).unwrap();
     assert!(
         cell_row6.is_empty(),

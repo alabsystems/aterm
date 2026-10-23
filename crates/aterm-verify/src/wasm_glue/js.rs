@@ -13,7 +13,8 @@
 // gone. See ../../LICENSE-MIT for the upstream license; Apache-2.0 is the
 // workspace's.
 
-//! JS, `.d.ts`, and `_bg.wasm.d.ts` glue generation for an [`Interface`].
+//! The ES module glue (wasm-bindgen's `--target web`), `.d.ts`, and `_bg.wasm.d.ts` for an
+//! [`Interface`].
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -23,16 +24,6 @@ use aterm_wasm_abi::descriptor::{Ty, kind};
 use super::model::{ALLOC, FREE, Func, Host, Interface, REALLOC, RESERVED, RET_SLOT};
 use super::templates as t;
 use super::wasm::FuncType;
-
-/// Which module system the glue is written for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Flavor {
-    /// An ES module with `init()`/`initSync()` (wasm-bindgen's `--target web`).
-    Web,
-    /// A CommonJS module that loads `<stem>_bg.wasm` beside it at `require`
-    /// (wasm-bindgen's `--target nodejs`).
-    Nodejs,
-}
 
 /// The three text files of the glue.
 pub(crate) struct Glue {
@@ -171,7 +162,7 @@ fn literal(text: &str) -> String {
 
 /// A URL path component also quotes percent/query/fragment delimiters in a
 /// literal sibling filename; JS string quoting alone does not do that.
-fn url_component(text: &str) -> String {
+pub(super) fn url_component(text: &str) -> String {
     let mut out = String::new();
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -469,9 +460,8 @@ fn body(needs: &mut Needs, f: &Func, names: &[String], indent: &str) -> String {
 }
 
 /// Write the glue for `iface`, whose module is `<stem>_bg.wasm`.
-pub(crate) fn generate(iface: &Interface, stem: &str, flavor: Flavor) -> Glue {
+pub(crate) fn generate(iface: &Interface, stem: &str) -> Glue {
     let mut needs = Needs::default();
-    let export_kw = if flavor == Flavor::Web { "export " } else { "" };
     let mut js = format!(
         "/* @ts-self-types={} */\n\n",
         literal(&format!("./{stem}.d.ts"))
@@ -480,7 +470,7 @@ pub(crate) fn generate(iface: &Interface, stem: &str, flavor: Flavor) -> Glue {
 
     for c in &iface.classes {
         jsdoc(&mut js, "", &c.docs, &[]);
-        let _ = writeln!(js, "{export_kw}class {} {{", c.name);
+        let _ = writeln!(js, "export class {} {{", c.name);
         js.push_str(
             &t::CLASS_HEAD
                 .replace("{C}", &c.name)
@@ -535,9 +525,6 @@ pub(crate) fn generate(iface: &Interface, stem: &str, flavor: Flavor) -> Glue {
         }
         js.push_str("}\n");
         js.push_str(&t::DISPOSE_ALIAS.replace("{C}", &c.name));
-        if flavor == Flavor::Nodejs {
-            let _ = writeln!(js, "exports.{0} = {0};", c.name);
-        }
         js.push('\n');
         dts.push_str("}\n\n");
     }
@@ -545,17 +532,9 @@ pub(crate) fn generate(iface: &Interface, stem: &str, flavor: Flavor) -> Glue {
     for f in &iface.functions {
         let names = param_names(f, None);
         jsdoc(&mut js, "", &f.docs, &tags(f, &names, true));
-        let _ = writeln!(
-            js,
-            "{export_kw}function {}({}) {{",
-            f.js_name,
-            names.join(", ")
-        );
+        let _ = writeln!(js, "export function {}({}) {{", f.js_name, names.join(", "));
         js.push_str(&body(&mut needs, f, &names, "    "));
         js.push_str("}\n");
-        if flavor == Flavor::Nodejs {
-            let _ = writeln!(js, "exports.{0} = {0};", f.js_name);
-        }
         js.push('\n');
 
         jsdoc(&mut dts, "", &f.docs, &[]);
@@ -580,45 +559,34 @@ pub(crate) fn generate(iface: &Interface, stem: &str, flavor: Flavor) -> Glue {
     js.push('\n');
 
     let slot_init = format!("RET_SLOT = wasm.{RET_SLOT}() >>> 0;\n");
-    js.push_str(&helpers(&mut needs, flavor));
+    js.push_str(&helpers(&mut needs));
 
-    match flavor {
-        Flavor::Nodejs => {
-            js.push_str(
-                &t::NODE_LOADER
-                    .replace("{FILE}", &literal(&format!("{stem}_bg.wasm")))
-                    .replace("{INIT}", &slot_init),
-            );
-        }
-        Flavor::Web => {
-            let mut reset = String::new();
-            if needs.data_view {
-                reset.push_str("    cachedDataViewMemory0 = null;\n");
-            }
-            for typed in &needs.views {
-                let _ = writeln!(reset, "    cached{typed}Memory0 = null;");
-            }
-            let init = format!("    {slot_init}");
-            js.push_str(
-                &t::WEB_LOADER
-                    .replace(
-                        "{FILE}",
-                        &literal(&url_component(&format!("{stem}_bg.wasm"))),
-                    )
-                    .replace("{RESET}", &reset)
-                    .replace("{INIT}", &init),
-            );
-            dts = dts.trim_end().to_string() + "\n\n";
-            dts.push_str(t::WEB_DTS_INPUT);
-            dts.push_str("\nexport interface InitOutput {\n");
-            dts.push_str("    readonly memory: WebAssembly.Memory;\n");
-            for (name, ty) in &iface.raw {
-                let _ = writeln!(dts, "    readonly {name}: {};", raw_ts(ty));
-            }
-            dts.push_str("}\n\n");
-            dts.push_str(t::WEB_DTS_INIT);
-        }
+    let mut reset = String::new();
+    if needs.data_view {
+        reset.push_str("    cachedDataViewMemory0 = null;\n");
     }
+    for typed in &needs.views {
+        let _ = writeln!(reset, "    cached{typed}Memory0 = null;");
+    }
+    let init = format!("    {slot_init}");
+    js.push_str(
+        &t::WEB_LOADER
+            .replace(
+                "{FILE}",
+                &literal(&url_component(&format!("{stem}_bg.wasm"))),
+            )
+            .replace("{RESET}", &reset)
+            .replace("{INIT}", &init),
+    );
+    dts = dts.trim_end().to_string() + "\n\n";
+    dts.push_str(t::WEB_DTS_INPUT);
+    dts.push_str("\nexport interface InitOutput {\n");
+    dts.push_str("    readonly memory: WebAssembly.Memory;\n");
+    for (name, ty) in &iface.raw {
+        let _ = writeln!(dts, "    readonly {name}: {};", raw_ts(ty));
+    }
+    dts.push_str("}\n\n");
+    dts.push_str(t::WEB_DTS_INIT);
 
     let mut bg_dts = String::from(t::DTS_HEADER);
     bg_dts.push_str("export const memory: WebAssembly.Memory;\n");
@@ -701,7 +669,7 @@ fn js_key(name: &str) -> String {
 }
 
 /// The helpers the members asked for, in a fixed order.
-fn helpers(needs: &mut Needs, flavor: Flavor) -> String {
+fn helpers(needs: &mut Needs) -> String {
     // `checkThrown` unconditionally requires `getStringFromWasm0`, `Uint32Array`, and `Uint8Array`.
     needs.get_string = true;
     needs.view("Uint32Array");
@@ -726,11 +694,7 @@ fn helpers(needs: &mut Needs, flavor: Flavor) -> String {
         out.push('\n');
     }
     if needs.get_string {
-        let decode = match flavor {
-            Flavor::Web => t::DECODE_TEXT_WEB,
-            Flavor::Nodejs => t::DECODE_TEXT_NODE,
-        };
-        out.push_str(&t::GET_STRING.replace("{DECODE}", decode));
+        out.push_str(&t::GET_STRING.replace("{DECODE}", t::DECODE_TEXT_WEB));
         out.push('\n');
     }
     for typed in &needs.views {
@@ -865,7 +829,7 @@ mod tests {
             imports: vec![Host::ObjectDrop, gl("context_create"), gl("make_current")],
             raw: BTreeMap::new(),
         };
-        let g = generate(&iface, "m", Flavor::Web);
+        let g = generate(&iface, "m");
         assert!(
             g.js.contains("wasm.init(addHeapObject(canvas), 0);"),
             "{}",
@@ -893,17 +857,14 @@ mod tests {
             }],
             ..iface
         };
-        let g = generate(&plain, "m", Flavor::Web);
+        let g = generate(&plain, "m");
         assert!(!g.js.contains("addHeapObject") && !g.js.contains("GLctx"));
     }
 
-    /// Actual generated imports retire only their context/program's owned
-    /// strings and uniform locations. The Node fixture supplies RAM GL and
-    /// Wasm-export mocks; no browser, GPU, Wasm engine or network is reached.
-    #[test]
-    fn context_strings_and_program_locations_retire_with_their_owner() {
-        use std::time::{Duration, Instant};
-
+    /// The GL-lifetime fixture's glue: the generator on the imports
+    /// `gl-lifetimes.mjs` drives.
+    #[cfg(unix)]
+    fn lifetime_glue() -> String {
         let iface = Interface {
             classes: Vec::new(),
             functions: vec![Func {
@@ -933,68 +894,89 @@ mod tests {
                 .collect(),
             raw: BTreeMap::new(),
         };
-        let generated = generate(&iface, "lifetime", Flavor::Nodejs);
+        generate(&iface, "lifetime").js
+    }
+
+    /// `gl-lifetimes.mjs` on the glue `js`, in a page: whether it held, and
+    /// what the page printed (or why it failed). A failing run keeps its
+    /// fixture root for reading when `keep` says so.
+    #[cfg(unix)]
+    fn drive_lifetimes(js: &str, keep: bool) -> (bool, String) {
         let dir = aterm_tempfile::Builder::new()
             .prefix("atv-gl-life-")
             .tempdir()
             .expect("exclusive fixture root");
-        let glue = dir.path().join("lifetime.cjs");
-        let driver = dir.path().join("driver.cjs");
-        std::fs::write(&glue, generated.js).expect("owned generated glue");
-        std::fs::write(&driver, include_str!("../../browser/gl-lifetimes.cjs"))
-            .expect("owned driver");
-        let node = std::env::var_os("ATERM_VERIFY_TEST_NODE")
-            .map(|path| {
-                let path = std::path::PathBuf::from(path);
-                assert!(path.is_absolute(), "explicit test Node must be absolute");
-                path.into_os_string()
-            })
-            .unwrap_or_else(|| "node".into());
-        let mut cmd = aterm_uds::spawnfd::command(&node);
-        cmd.arg(&driver).arg(&glue).current_dir(dir.path());
-        let mut outputs = aterm_uds::deadline::outputs_until(
-            &mut [&mut cmd],
-            Instant::now() + Duration::from_secs(60),
-            Duration::from_secs(60),
-        );
-        let output = match outputs.pop().expect("one owned child") {
-            Ok(output) => output,
-            Err(aterm_uds::deadline::RunError::Spawn(e)) => panic!(
-                "{}: node could not start ({e}); the generated glue runs under node; {}",
-                crate::libtest::COULD_NOT_RUN_SENTINEL,
-                aterm_uds::host::tool("node").remedy()
-            ),
-            Err(e) => panic!("Node fixture did not complete: {e}"),
+        std::fs::write(dir.path().join("lifetime.js"), js).expect("owned generated glue");
+        std::fs::write(
+            dir.path().join("driver.mjs"),
+            include_str!("../../browser/gl-lifetimes.mjs"),
+        )
+        .expect("owned driver");
+        let mut page = crate::wasm_page::start_for_test(dir.path());
+        let ran = page.run("driver.mjs", &aterm_json::json!({"glue": "./lifetime.js"}));
+        let console = match &ran {
+            Ok(ran) => ran.console.join("\n"),
+            Err(refused) => refused.why().to_string(),
         };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        print!("{stdout}");
-        eprint!("{stderr}");
-        let passed = output.status.success()
-            && [
-                "GL_LIFETIME_ADMITTED_CONTROLS_REACHED",
-                "GL_LIFETIME_RETIREMENT_CASES_REACHED",
-                "GL_LIFETIME_ALL_RETIRED",
-            ]
-            .iter()
-            .all(|marker| stdout.contains(marker));
-        if !passed {
+        eprintln!("{console}");
+        if ran.is_err() && keep {
+            drop(page);
             eprintln!(
                 "GL_LIFETIME_OWNED_FIXTURE_RETAINED: {}",
                 dir.keep().display()
             );
         }
+        (ran.is_ok(), console)
+    }
+
+    /// Actual generated imports retire only their context/program's owned
+    /// strings and uniform locations. The page's fixture supplies RAM GL and
+    /// Wasm-export mocks and fences the network, a real GPU, timers and the
+    /// real Wasm engine for the glue's whole run.
+    #[cfg(unix)]
+    #[test]
+    fn context_strings_and_program_locations_retire_with_their_owner() {
+        let (held, console) = drive_lifetimes(&lifetime_glue(), true);
         assert!(
-            stdout.contains("GL_LIFETIME_ADMITTED_CONTROLS_REACHED"),
-            "fixture controls not reached: {stderr}"
+            console.contains("GL_LIFETIME_ADMITTED_CONTROLS_REACHED"),
+            "fixture controls not reached: {console}"
         );
         assert!(
-            stdout.contains("GL_LIFETIME_RETIREMENT_CASES_REACHED"),
-            "retirement cases not reached: {stderr}"
+            console.contains("GL_LIFETIME_RETIREMENT_CASES_REACHED"),
+            "retirement cases not reached: {console}"
         );
         assert!(
-            output.status.success() && stdout.contains("GL_LIFETIME_ALL_RETIRED"),
-            "GL_LIFETIME_RETIREMENT_MISSING: {stderr}"
+            held && console.contains("GL_LIFETIME_ALL_RETIRED"),
+            "GL_LIFETIME_RETIREMENT_MISSING: {console}"
         );
+    }
+
+    /// NEGATIVE CONTROL for the fixture's fence: glue that reaches the
+    /// network as it is imported, or a real canvas's GPU context in
+    /// `context_create`, fails the fixture by name, as node's sandbox failed
+    /// it with a ReferenceError.
+    #[cfg(unix)]
+    #[test]
+    fn glue_that_reaches_the_network_or_a_real_gpu_fails_the_gl_fixture() {
+        let js = lifetime_glue();
+        let real_canvas = "canvas.getContext('webgl2', { antialias: false })";
+        assert!(js.contains(real_canvas), "{js}");
+        for (planted, reached) in [
+            (format!("void fetch;\n{js}"), "fetch"),
+            (
+                js.replace(
+                    real_canvas,
+                    "document.createElement('canvas').getContext('webgl2', { antialias: false })",
+                ),
+                "getContext",
+            ),
+        ] {
+            let (held, console) = drive_lifetimes(&planted, false);
+            assert!(
+                !held
+                    && console.contains(&format!("GL_LIFETIME_FENCE: the glue reached {reached}")),
+                "{reached}: {console}"
+            );
+        }
     }
 }

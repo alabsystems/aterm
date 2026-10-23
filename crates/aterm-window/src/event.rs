@@ -5,8 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! The [`Event`] enum and supporting types for [`EventLoop::run_app`].
-//!
-//! [`EventLoop::run_app`]: crate::event_loop::EventLoop::run_app
 use std::path::PathBuf;
 use std::sync::{Mutex, Weak};
 use std::time::Instant;
@@ -228,8 +226,6 @@ pub struct KeyEvent {
         allow(rustdoc::broken_intra_doc_links)
     )]
     /// Logical key value affected by all modifiers except Ctrl (see [`key_without_modifiers`]).
-    ///
-    /// [`key_without_modifiers`]: crate::platform::modifier_supplement::KeyEventExtModifierSupplement::key_without_modifiers
     pub logical_key: keyboard::Key,
 
     /// Text produced by this keypress, or `None` if non-printable.
@@ -242,38 +238,6 @@ pub struct KeyEvent {
     pub state: ElementState,
 
     /// `true` if this event is a key repeat.
-    ///
-    /// ```
-    /// use aterm_window::event::{ElementState, KeyEvent, WindowEvent};
-    /// use aterm_window::keyboard::{KeyCode, PhysicalKey};
-    /// # let window_event = WindowEvent::RedrawRequested; // To make the example compile
-    /// match window_event {
-    ///     WindowEvent::KeyboardInput {
-    ///         event:
-    ///             KeyEvent {
-    ///                 physical_key: PhysicalKey::Code(KeyCode::KeyW),
-    ///                 state: ElementState::Pressed,
-    ///                 repeat: false,
-    ///                 ..
-    ///             },
-    ///         ..
-    ///     } => {
-    ///         // The physical key `W` was pressed, and it was not a repeat
-    ///     },
-    ///     _ => {}, // Handle other events
-    /// }
-    /// ```
-    /// use aterm_window::event::{ElementState, KeyEvent, WindowEvent};
-    /// use aterm_window::keyboard::{KeyCode, PhysicalKey};
-    /// # let window_event = WindowEvent::RedrawRequested; // To make the example compile
-    /// match window_event {
-    ///     WindowEvent::KeyboardInput {
-    ///         event:
-    ///             KeyEvent {
-    ///                 physical_key: PhysicalKey::Code(KeyCode::KeyW),
-    ///                 state: ElementState::Pressed,
-    ///                 repeat: false,
-    ///                 ..
     pub repeat: bool,
 
     /// Platform-specific key event fields.
@@ -328,8 +292,6 @@ impl KeyEvent {
     }
 
     /// Sets [`text_ignoring_lock`] on X11 and Wayland; a no-op elsewhere.
-    ///
-    /// [`text_ignoring_lock`]: crate::platform::modifier_supplement::KeyEventExtModifierSupplement::text_ignoring_lock
     #[doc(hidden)]
     #[must_use]
     pub fn with_text_ignoring_lock_for_test(self, text: Option<SmolStr>) -> Self {
@@ -416,40 +378,6 @@ impl From<ModifiersState> for Modifiers {
 }
 
 /// Input method (composition) events; see [`Window::set_ime_cursor_area`].
-///
-/// ```
-/// use aterm_window::event::Ime;
-///
-/// let events = [
-///     // Press "`" key.
-///     Ime::Preedit("`".into(), Some((0, 0))),
-///     // Press "E" key; clear preedit before committing.
-///     Ime::Preedit(String::new(), None),
-///     Ime::Commit("é".into()),
-/// ];
-/// assert_eq!(events.last(), Some(&Ime::Commit("é".into())));
-/// ```
-/// use aterm_window::event::Ime;
-///
-/// ```
-/// use aterm_window::event::Ime;
-///
-/// let events = [
-///     // Press "A" key.
-///     Ime::Preedit("a".into(), Some((1, 1))),
-///     // Press "B" key.
-///     Ime::Preedit("a b".into(), Some((3, 3))),
-///     // Press left arrow key.
-///     Ime::Preedit("a b".into(), Some((1, 1))),
-///     // Press space key.
-///     Ime::Preedit("啊b".into(), Some((3, 3))),
-///     // Press space key; clear preedit before committing.
-///     Ime::Preedit(String::new(), None),
-///     Ime::Commit("啊不".into()),
-/// ];
-/// assert_eq!(events.last(), Some(&Ime::Commit("啊不".into())));
-/// ```
-/// use aterm_window::event::Ime;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ime {
     /// The IME was enabled.

@@ -57,7 +57,8 @@ pub struct Manifest {
     pub version: String,
     /// Monotonic build number, unique per published build.
     pub build_number: u64,
-    /// Full git commit hash of the source the release was built.
+    /// Full git commit hash of the source the release was built from, binding the build
+    /// number to an exact commit.
     pub commit: Option<String>,
     /// SHA-256 (lowercase hex) of the DMG asset.
     pub sha256: String,
@@ -128,7 +129,9 @@ pub struct Ready {
     /// See [`Self::machine_id`].
     #[serde(default)]
     pub roster_seq: Option<u64>,
-    /// RFC3339 UTC of when the last check that confirmed this stage's authorization read.
+    /// RFC3339 UTC of when the last check that confirmed this stage's authorization read
+    /// its machine roster ([`crate::install::confirm_roster_authorization`]): the read, not
+    /// the write, so a slow download before the publish adds nothing to the window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roster_confirmed_at: Option<String>,
 }
@@ -594,13 +597,15 @@ pub struct FailedMark {
     /// Unix seconds before which this candidate is skipped.
     #[serde(default)]
     pub retry_after: u64,
-    /// Quarantine: this artifact was swapped.
+    /// Quarantine: this artifact was swapped in, failed to confirm boot health
+    /// `MAX_BOOT_ATTEMPTS` times, and was reverted.
     #[serde(default)]
     pub quarantined: bool,
-    /// Trial markers only: the install root (`…/aterm.app`) the armed trial belongs.
+    /// Trial markers only: the install root (`…/aterm.app`) the armed trial belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_root: Option<String>,
-    /// The latest failure booked here was a moment.
+    /// The latest failure booked here was a moment (staging could not finish: a helper
+    /// past its deadline, a lock a sibling held, a full disk), not a verdict on the bytes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub moment: bool,
 }
@@ -665,13 +670,14 @@ impl FailedMark {
         self.quarantined
     }
 
-    /// Seconds until this memo stops suppressing, or 0 if it already.
+    /// Seconds until this memo stops suppressing, or 0 if it already has.
     #[must_use]
     pub const fn retry_in_secs(&self, now: u64) -> u64 {
         self.retry_after.saturating_sub(now)
     }
 
-    /// The attempt count a fresh failure of `(build_number, sha256)` should be recorded.
+    /// The attempt count a fresh failure of `(build_number, sha256)` should be recorded
+    /// with, given this memo as the prior state.
     #[must_use]
     pub fn next_attempt(&self, build_number: u64, sha256: &str) -> u32 {
         if self.matches(build_number, sha256) {
@@ -971,7 +977,10 @@ pub(crate) fn artifact_quarantined_for_gate(
 #[cfg(any(test, debug_assertions))]
 type SpecState = std::collections::BTreeMap<&'static str, i64>;
 
-/// Project one observed writer→reader round trip of [`FailedMark`] onto the bounded.
+/// Project one observed writer→reader round trip of [`FailedMark`] onto the bounded
+/// `NativeUpdateFailedMarkSuppression` machine: the picked-inputs state (phase 1), the
+/// state after the observed writer ran (phase 2), and after the observed
+/// [`FailedMark::suppresses`] probe (phase 3).
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 #[must_use]

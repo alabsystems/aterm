@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the digest's family pass (level-triggered; an entry a pass stops
-//! naming ends once it has gone unnamed for ten minutes, at a look or at the
-//! digest's own clock; words restated at most once in ten minutes) and the
-//! seamless update's overlap (a dismissal the parent made after the successor
-//! loaded the file).
+//! Tests for the digest's level-triggered family pass and seamless update overlap.
 
 use crate::Retired;
 use crate::center::{MessageCenter, Outcome, PostOutcome};
@@ -78,10 +74,7 @@ fn posted_lines(c: &MessageCenter) -> usize {
     c.log().records().filter(|r| r.later).count()
 }
 
-/// A reporter states the whole of its family each look. A new fact posts, the same fact
-/// is quiet, and a fact that stops being named ends only once it has gone unnamed for
-/// `RESOLVE_AFTER`: a look of silence is a flicker, not an end; a look that names it
-/// again clears the clock and writes no line.
+/// A family pass ends an unnamed entry only after `RESOLVE_AFTER`.
 #[test]
 fn a_family_pass_ends_an_entry_only_after_ten_minutes_unnamed() {
     let now = t0();
@@ -89,7 +82,6 @@ fn a_family_pass_ends_an_entry_only_after_ten_minutes_unnamed() {
     let s = c.sync_digest(UPGRADE, vec![own_work("s-1", 16)], stamp(), now);
     assert_eq!((s.posted, s.resolved), (1, 0));
     assert_eq!(c.digest().len(), 1);
-    // The same fact again: nothing new, nothing logged.
     let s = c.sync_digest(
         UPGRADE,
         vec![own_work("s-1", 16)],
@@ -98,15 +90,11 @@ fn a_family_pass_ends_an_entry_only_after_ten_minutes_unnamed() {
     );
     assert_eq!((s.posted, s.restated, s.resolved), (0, 0, 0));
     assert_eq!(posted_lines(&c), 1);
-    // A look that does not name it: its clock starts, it stays open.
     let s = c.sync_digest(UPGRADE, vec![], stamp(), now + ms(120_000));
     assert_eq!((s.resolved, s.pending_end), (0, 1));
     assert_eq!(c.digest().len(), 1);
-    // A second empty look inside the clock changes nothing (two looks in a
-    // burst are not two opinions).
     let s = c.sync_digest(UPGRADE, vec![], stamp(), now + ms(121_000));
     assert_eq!((s.resolved, s.pending_end), (0, 1));
-    // It comes back: the same entry, the clock cleared, no second `posted`.
     let s = c.sync_digest(
         UPGRADE,
         vec![own_work("s-1", 16)],
@@ -116,7 +104,6 @@ fn a_family_pass_ends_an_entry_only_after_ten_minutes_unnamed() {
     assert_eq!((s.posted, s.resolved), (0, 0));
     assert_eq!(posted_lines(&c), 1, "a flicker writes no line");
     assert_eq!(c.digest_deadline(), None, "a named entry arms nothing");
-    // Unnamed again, for the whole clock: ended, once, with its line.
     let _ = c.sync_digest(UPGRADE, vec![], stamp(), now + ms(240_000));
     let s = c.sync_digest(UPGRADE, vec![], stamp(), now + ms(240_000) + RESOLVE_AFTER);
     assert_eq!(s.resolved, 1);
@@ -124,25 +111,19 @@ fn a_family_pass_ends_an_entry_only_after_ten_minutes_unnamed() {
     assert_eq!(posted_lines(&c), 1);
 }
 
-/// The upgrade's looks are sent only when its rows change, so a row that leaves in one
-/// change (the owner quits Claude by hand, or closes the tab) gets one look, then
-/// silence. The entry still ends, by the digest's own clock the host arms
-/// (`digest_deadline`) and settles (`settle_digest`), and the log says when.
+/// An entry whose row left in one change ends at the digest's own clock.
 #[test]
 fn an_entry_whose_row_left_in_one_change_ends_at_the_digests_own_clock() {
     let now = t0();
     let mut c = fresh(now);
     let _ = c.sync_digest(UPGRADE, vec![own_work("s-1", 16)], stamp(), now);
-    // The one look that no longer names it.
     let gone = now + ms(60_000);
     let s = c.sync_digest(UPGRADE, vec![], stamp(), gone);
     assert_eq!((s.resolved, s.pending_end), (0, 1));
-    // The loop is told when to come back.
     let due = c
         .digest_deadline()
         .expect("a missed entry arms the digest clock");
     assert_eq!(due, gone + RESOLVE_AFTER);
-    // Before it: settling changes nothing. At it: the entry ends.
     assert!(!c.settle_digest(stamp(), due - ms(1)));
     assert_eq!(c.digest().len(), 1);
     assert!(c.settle_digest(stamp(), due));
@@ -156,9 +137,7 @@ fn an_entry_whose_row_left_in_one_change_ends_at_the_digests_own_clock() {
     );
 }
 
-/// The same fact, the same key, is news again once its cause has ended: a
-/// `Resolved` entry is not quiet (it is not a filing), so a return posts a
-/// fresh entry.
+/// A resolved entry that returns posts a fresh entry.
 #[test]
 fn a_resolved_entry_that_returns_is_news() {
     let now = t0();
@@ -175,9 +154,7 @@ fn a_resolved_entry_that_returns_is_news() {
     assert_eq!((s.posted, s.suppressed), (1, 0));
 }
 
-/// One producer, one mode: the upgrade rows' pass sweeps everything under
-/// `harness.upgrade.`, so a fact the host raises by event (the state folder it cannot
-/// use) has a prefix of its own and survives any number of the rows' passes.
+/// An event-raised sibling with its own prefix survives the rows' family pass.
 #[test]
 fn an_event_raised_sibling_survives_the_rows_family_pass() {
     let now = t0();
@@ -208,8 +185,7 @@ fn an_event_raised_sibling_survives_the_rows_family_pass() {
     assert_eq!(keys.len(), 2);
 }
 
-/// The roster: every family has one producer and one mode, and no family's prefix
-/// starts another's (a pass over one must never sweep the other).
+/// Every family has one producer and one mode, and no family prefix starts another's.
 #[test]
 fn every_family_has_one_mode_and_no_prefix_shadows_another() {
     let all = Family::ALL;
@@ -225,12 +201,6 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             }
         }
     }
-    // The level families are the ones whose reporters state their whole answer
-    // (the upgrade's and the resume loop's looks, the AI CLIs' look — each
-    // states every CLI that needs a person — the need publication's API
-    // outage, the window's long holds, the fleet glance's read, the disk
-    // walker's raised huge folders); everything else raises by event and is
-    // never swept.
     let level: Vec<Family> = all
         .into_iter()
         .filter(|f| f.mode() == Mode::Level)
@@ -249,10 +219,17 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
     );
     assert_eq!(Family::Ai.stem(), "ai");
     assert_eq!(Family::Ai.tag(), tags::HARNESS);
+    // Occupancy's two entries (the owner's `prompt`, a hold's spent lines) are raised and
+    // cleared by event, under the harness's stem, apart from the upgrade's and the others'.
+    assert!(all.contains(&Family::Occupancy));
+    assert_eq!(Family::Occupancy.stem(), "harness.occupancy");
+    assert_eq!(Family::Occupancy.mode(), Mode::Event);
+    assert_eq!(Family::Occupancy.tag(), tags::HARNESS);
+    let stems: std::collections::BTreeSet<&str> = all.iter().map(|f| f.stem()).collect();
+    assert_eq!(stems.len(), all.len(), "every stem is one family's");
 }
 
-/// A pass for one family never sees another family's entries, so a reporter
-/// that has not spoken yet (after an update) loses nothing to one that has.
+/// A pass for one family never touches another family's entries.
 #[test]
 fn a_family_pass_never_touches_another_family() {
     let now = t0();
@@ -260,20 +237,17 @@ fn a_family_pass_never_touches_another_family() {
     let _ = c.sync_digest(UPGRADE, vec![own_work("s-1", 16)], stamp(), now);
     let _ = c.sync_digest(PRIVACY, vec![fda()], stamp(), now);
     for k in 0..5u64 {
-        // Five looks three minutes apart: the fifth is past the ten-minute clock.
         let _ = c.sync_digest(UPGRADE, vec![], stamp(), now + ms(180_000 * (k + 1)));
     }
     let keys: Vec<String> = c.digest().entries.iter().map(|e| e.key.clone()).collect();
     assert_eq!(keys, vec!["privacy.fda.needed".to_string()]);
-    // A message that is not this family's exception is recorded, not posted.
     let before = c.demotions();
     let s = c.sync_digest(UPGRADE, vec![fda()], stamp(), now);
     assert_eq!(s.posted, 0);
     assert_eq!(c.demotions(), before + 1);
 }
 
-/// Holder counts and ages move every look. Words alone restate an entry at
-/// most once per ten minutes; a new severity restates at once.
+/// Words alone restate an entry at most once per ten minutes; a new severity restates at once.
 #[test]
 fn a_words_only_change_restates_at_most_once_in_ten_minutes() {
     let now = t0();
@@ -297,7 +271,6 @@ fn a_words_only_change_restates_at_most_once_in_ten_minutes() {
     assert_eq!(s.restated, 1);
     assert!(c.digest().entries[0].why.contains("15 programs"));
     assert!(c.digest_revision() > rev);
-    // A new severity is news at once.
     let mut louder = own_work("s-1", 15);
     louder.severity = Severity::Warn;
     let s = c.sync_digest(UPGRADE, vec![louder], stamp(), now + RESTATE_QUIET + ms(2));
@@ -305,10 +278,7 @@ fn a_words_only_change_restates_at_most_once_in_ten_minutes() {
     assert_eq!(posted_lines(&c), 1, "restating writes no log line");
 }
 
-/// Words that move only with their fact (`LaterAsk::restated_at_once`: the
-/// tabs an outage holds, counted as they join it) are restated at once, inside
-/// the ten minutes; the same count change on an ordinary entry waits (the
-/// negative control, `a_words_only_change_restates_at_most_once_in_ten_minutes`).
+/// Words marked `LaterAsk::restated_at_once` restate immediately inside the ten-minute window.
 #[test]
 fn words_that_move_with_their_fact_restate_at_once() {
     let now = t0();
@@ -339,11 +309,7 @@ fn words_that_move_with_their_fact_restate_at_once() {
     assert_eq!(posted_lines(&c), 1, "restating writes no log line");
 }
 
-/// A NEW STEP IS NEWS AT ONCE: the one thing an entry tells the owner to do
-/// (a renewal's command naming the next account) is never held for the ten
-/// minutes that keep a moving count quiet, so the entry never asks for what no
-/// longer helps. NEGATIVE CONTROL: the same entry whose reason alone moves
-/// inside the ten minutes stands in its first words.
+/// A new step restates at once while a reason-only change waits for the quiet window.
 #[test]
 fn a_new_step_restates_at_once_and_a_moving_reason_waits() {
     let now = t0();
@@ -366,7 +332,6 @@ fn a_new_step_restates_at_once_and_a_moving_reason_waits() {
     };
     let first = "A renewal signed in a Claude account other than its roster row's";
     let _ = c.sync_digest(UPGRADE, vec![renew(first, "pool-a")], stamp(), now);
-    // NEGATIVE CONTROL: the reason moves, the step does not.
     let s = c.sync_digest(
         UPGRADE,
         vec![renew(
@@ -378,7 +343,6 @@ fn a_new_step_restates_at_once_and_a_moving_reason_waits() {
     );
     assert_eq!(s.restated, 0, "words alone: not news yet");
     assert_eq!(c.digest().entries[0].why, first);
-    // The step moves: at once, and the entry says the new step.
     let s = c.sync_digest(
         UPGRADE,
         vec![renew(first, "pool-b")],
@@ -394,9 +358,7 @@ fn a_new_step_restates_at_once_and_a_moving_reason_waits() {
     assert_eq!(posted_lines(&c), 1, "one entry");
 }
 
-/// The owner filed the batch: the next pass names the same facts and gets
-/// quiet, and the missing-look counter does not run for a fact that never
-/// opened.
+/// A filed fact stays quiet across subsequent passes.
 #[test]
 fn a_dismissed_fact_stays_quiet_through_the_next_passes() {
     let now = t0();
@@ -429,15 +391,11 @@ fn an_explicit_clear_ends_the_entry_at_once() {
         !c.clear_digest("privacy.fda.needed", now + ms(2_000)),
         "once"
     );
-    // An ended cause is not quiet: its return is news.
     let s = c.sync_digest(PRIVACY, vec![fda()], stamp(), now + ms(3_000));
     assert_eq!(s.posted, 1);
 }
 
-/// The Full Disk Access card's normal order: the owner presses the entry's button
-/// (filed `Answered`, quiet for its span), and only then does the probe read the grant.
-/// The verified grant ends the fact, so the next regression is news, in this process
-/// and after a restart.
+/// A verified grant after an owner's answer ends the filing so a later regression is news.
 #[test]
 fn a_grant_after_the_owners_answer_makes_the_next_regression_news() {
     use crate::model::ActionIndex;
@@ -449,23 +407,18 @@ fn a_grant_after_the_owners_answer_makes_the_next_regression_news() {
             .is_some()
     );
     assert!(c.digest().is_empty(), "answered: closed");
-    // Still quiet before the grant: the same fact filed is not news.
     let quiet = c.post(fda(), stamp(), now + ms(2_000));
     assert_ne!(quiet.outcome, PostOutcome::New);
     assert!(c.digest().is_empty());
-    // The verified grant: nothing is open, and the filing ends with its cause.
     assert!(!c.clear_digest("privacy.fda.needed", now + ms(3_000)));
     assert!(c.forget_filing("privacy.fda.needed", stamp(), now + ms(3_000)));
     assert!(
         !c.forget_filing("privacy.fda.needed", stamp(), now + ms(3_500)),
         "once: the latest word is a resolution now"
     );
-    // The regression after the next update is news.
     let again = c.post(fda(), stamp(), now + ms(4_000));
     assert_eq!(again.outcome, PostOutcome::New);
     assert_eq!(c.digest().len(), 1);
-    // ... and the resolution survives a restart, so a filing the log replays
-    // does not keep a fact quiet whose cause the owner has since seen end.
     let mut c = fresh(now);
     let id = c.post(fda(), stamp(), now).id;
     let _ = c.act_digest(id, ActionIndex(0), stamp(), now + ms(1_000));
@@ -484,8 +437,6 @@ fn a_grant_after_the_owners_answer_makes_the_next_regression_news() {
     );
 }
 
-// ---- the seamless update: a dismissal made while the two processes overlap ------
-
 /// The lines a center wants on disk, encoded and decoded as the file would.
 fn on_disk(c: &mut MessageCenter) -> Vec<LogLine> {
     c.drain_new_for_persist()
@@ -495,20 +446,14 @@ fn on_disk(c: &mut MessageCenter) -> Vec<LogLine> {
         .collect()
 }
 
-/// The successor loads the file at its launch and waits for Commit; the owner presses
-/// `Dismiss all` in the parent meanwhile. At Commit the successor reads the file's tail
-/// again, so the dismissed fact stays filed. Negative controls: a successor that trusts
-/// its launch snapshot (`StaleSuccessor`) and a parent whose dismissal never reached the
-/// file (`NoFlush`) both show the fact again.
+/// At Commit the successor re-reads the log tail and honours a dismissal the parent made.
 #[test]
 fn the_successor_honours_a_dismissal_the_parent_made_while_they_overlapped() {
     let now = t0();
     let wall = stamp();
-    // The parent has one entry open; its lines are on disk.
     let mut parent = fresh(now);
     let _ = parent.sync_digest(UPGRADE, vec![own_work("s-1", 16)], wall, now);
     let file: Vec<LogLine> = on_disk(&mut parent);
-    // The successor launches: it loads the file as it is now, and adopts.
     let load = |file: &[LogLine], at: Instant| {
         let mut log = MessageLog::empty();
         log.replay_all(file.iter().cloned());
@@ -520,14 +465,12 @@ fn the_successor_honours_a_dismissal_the_parent_made_while_they_overlapped() {
     let mut successor = load(&file, now + ms(1_000));
     let mut stale = load(&file, now + ms(1_000));
     let mut lost = load(&file, now + ms(1_000));
-    // The owner dismisses in the parent while the two overlap.
     assert_eq!(parent.file_digest(wall, now + ms(2_000)), 1);
     let filed = on_disk(&mut parent);
     assert!(!filed.is_empty(), "the filing is a line");
     let mut with_filing = file.clone();
     with_filing.extend(filed);
 
-    // Commit: the successor reads the tail again and honours the filing.
     let found = successor.catch_up(with_filing.iter().cloned(), wall, now + ms(3_000));
     assert_eq!(found.closed, 1);
     assert!(
@@ -545,12 +488,10 @@ fn the_successor_honours_a_dismissal_the_parent_made_while_they_overlapped() {
         "the successor writes no second filing and no second posting"
     );
 
-    // StaleSuccessor: it trusts the snapshot it loaded and never reads the tail.
     let s = stale.sync_digest(UPGRADE, vec![own_work("s-1", 16)], wall, now + ms(4_000));
     assert_eq!(stale.digest().len(), 1, "the dismissed fact is shown again");
     assert_eq!(s.posted, 0);
 
-    // NoFlush: the parent exited without flushing, so the file never learned.
     let found = lost.catch_up(file.iter().cloned(), wall, now + ms(3_000));
     assert_eq!(found.closed, 0);
     assert_eq!(
@@ -560,8 +501,7 @@ fn the_successor_honours_a_dismissal_the_parent_made_while_they_overlapped() {
     );
 }
 
-/// The catch-up may run twice (a Commit re-read after a Commit re-read): the
-/// second finds nothing new and changes nothing.
+/// Running `catch_up` a second time is idempotent.
 #[test]
 fn catching_up_twice_changes_nothing() {
     let now = t0();
@@ -583,9 +523,7 @@ fn catching_up_twice_changes_nothing() {
     assert!(on_disk(&mut successor).is_empty(), "and it wrote nothing");
 }
 
-/// A posting is queued in the same call that makes the entry visible: no
-/// surface can count an entry whose line is not on its way to the log
-/// (`ExceptionsOnce`: `ShownImpliesQueued`).
+/// A posting is queued in the same call that makes the entry visible.
 #[test]
 fn an_entry_is_never_visible_before_its_posting_is_queued() {
     let now = t0();

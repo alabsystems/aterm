@@ -13,7 +13,6 @@ fn body(v: &str) -> Vec<u8> {
     v.as_bytes().to_vec()
 }
 
-/// A person's message, a runtime note, a call and its result, as Muse Code sends them.
 const PERSON: &str = r#"{"type":"message","role":"user","content":"toolstart"}"#;
 const NOTE: &str = r#"{"type":"message","role":"user","content":"<system-reminder source=\"x\">toolstart</system-reminder>"}"#;
 const CALL: &str =
@@ -112,7 +111,6 @@ fn a_side_call_gets_its_own_answer_by_its_role_and_tools() {
     assert_eq!(names, ["bash", "request_user_input", "flat"]);
 }
 
-/// The events of an SSE body, in order.
 fn events(sse: &str) -> Vec<J> {
     sse.lines()
         .filter_map(|l| l.strip_prefix("data: "))
@@ -126,14 +124,12 @@ fn types(ev: &[J]) -> Vec<String> {
         .collect()
 }
 
-/// Every event numbered from 0, one apart.
 fn numbered(ev: &[J]) -> bool {
     ev.iter()
         .enumerate()
         .all(|(i, e)| e.get("sequence_number").and_then(J::as_i64) == i64::try_from(i).ok())
 }
 
-/// A raw GET with the lab's bearer key: status and body.
 fn get(port: &str, path: &str) -> (u16, String) {
     let mut s = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
     s.write_all(
@@ -158,11 +154,6 @@ fn get(port: &str, path: &str) -> (u16, String) {
     (status, b)
 }
 
-/// Muse Code's routes, served for real: the catalog, a turn's numbered
-/// stream, the side calls answered in every mode, the scripted calls and the
-/// answer that quotes their result, the walls, and the log. NEGATIVE
-/// CONTROLS: Codex's `/v1/responses` keeps its own stream (no
-/// `sequence_number`), and a side call never spends a custom mode's `times`.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
@@ -377,9 +368,6 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An admitted log retains the lines already present. A deliberately
-/// expired observation cannot invent a missing line; there is no wall-clock
-/// performance assertion or scheduler-dependent late writer.
 #[test]
 fn the_log_observation_keeps_present_lines_and_refuses_missing_ones() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -397,14 +385,6 @@ fn the_log_observation_keeps_present_lines_and_refuses_missing_ones() {
     );
 }
 
-/// MUSE CODE'S SIDE CALLS ARE DUMPED APART FROM ITS TURNS, by the role it
-/// names (`x-tbh-agent-role`): a reminder observer and the prompt hint as
-/// `side-<n>.json`, a turn (`main`, or no role) as `req-<n>.json`, one count
-/// over both; the turns' reader ([`super::super::turn_dumps`]) reads the
-/// turns alone. The observer's body here carries the conversation rendered
-/// into one text, as Muse Code 1.4.10-R6427.1 sends it (the lab's `r10-cv`,
-/// 2026-10-22: read as a turn, the owner's words reached the agent with a
-/// line break). NEGATIVE CONTROL: the turns stay `req-`.
 #[test]
 fn muse_codes_side_calls_are_dumped_apart_from_its_turns() {
     let dir = aterm_tempfile::tempdir().unwrap();

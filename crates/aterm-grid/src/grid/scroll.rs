@@ -250,6 +250,8 @@ impl Grid {
 
         if self.storage.lazy_buffer.should_drain() {
             // During an off-thread reflow the store is detached and drain is
+            // suppressed (staged lines must survive), so cap the buffer here to
+            // keep heavy streaming through a long window bounded.
             if self.storage.scrollback_detached_for_reflow && self.storage.scrollback.is_none() {
                 self.bound_detached_lazy_buffer();
             } else if self.storage.compress_offload_active {
@@ -648,6 +650,9 @@ impl Grid {
             let blank_prefix = self.fresh_session_blank_prefix(n);
             if blank_prefix < n {
                 // Drop the leading fresh-session blanks with a history-free
+                // scroll, then archive from the first written row. Two
+                // sequential scrolls compose to the same visible result as one
+                // of `n`, while history gets only the transcript-bearing rows.
                 if blank_prefix > 0 {
                     self.scroll_region_up_history_free(top, bottom, blank_prefix);
                 }

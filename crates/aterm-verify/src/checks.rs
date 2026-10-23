@@ -93,8 +93,17 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::TestCompile, StageId::Test],
         reach: Reach::Selection,
         needs: &[
-            "targo", "cc", "bash", "zsh", "fish", "pwsh", "vim", "zstd", "python3", "openssl3",
-            "node",
+            "targo",
+            "cc",
+            "bash",
+            "zsh",
+            "fish",
+            "pwsh",
+            "vim",
+            "zstd",
+            "python3",
+            "openssl3",
+            "chrome-headless-shell",
         ],
         also: "",
         runs: "targo test <selection> --tests (no examples), binaries in parallel",
@@ -132,18 +141,18 @@ pub const CHECKS: [Spec; 19] = [
         name: "wasm-smoke",
         stages: &[StageId::WasmSmoke],
         reach: Reach::WholeTree,
-        needs: &["node", "rustup"],
+        needs: &["chrome-headless-shell", "rustup"],
         also: "stable's wasm32",
-        runs: "both web modules (dev) under node: their host boundary, then the CPU replay (STOCK EXCEPTION)",
+        runs: "both web modules (dev) in headless Chromium: their host boundary, then the CPU replay (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::WasmGlue,
         name: "wasm-glue",
         stages: &[StageId::WasmGlue],
         reach: Reach::WholeTree,
-        needs: &["node", "rustup", "wasm-bindgen"],
+        needs: &["chrome-headless-shell", "rustup", "wasm-bindgen"],
         also: "stable's wasm32",
-        runs: "`verify glue` on aterm-wasm-abi's toy: goldens, node, a planted bug; the wasm-bindgen oracle (STOCK EXCEPTION)",
+        runs: "`verify glue` on aterm-wasm-abi's toy: goldens, its driver in headless Chromium, a planted bug; the wasm-bindgen oracle (STOCK EXCEPTION)",
     },
     Spec {
         check: Check::Browser,
@@ -565,6 +574,24 @@ mod tests {
         assert_eq!(needs_of(Check::Census), "-");
         let table = list_table();
         assert!(!table.contains("brew"), "{table}");
+        // node is the release host's (`ship site`'s firebase-tools), never a check's: every
+        // wasm driver runs in the pinned chrome-headless-shell (init-system S10).
+        for spec in CHECKS {
+            let needs = needs_of(spec.check);
+            assert!(
+                !spec.needs.contains(&"node") && !needs.split(", ").any(|w| w.starts_with("node ")),
+                "{}: {needs}",
+                spec.name
+            );
+        }
+        assert!(!table.lines().any(|l| l.starts_with("node ")), "{table}");
+        for check in [Check::Test, Check::WasmSmoke, Check::WasmGlue] {
+            assert!(
+                needs_of(check).contains("chrome-headless-shell (verify provision)"),
+                "{}",
+                needs_of(check)
+            );
+        }
         // And each tool's reason, once: the comment the owner asked for, printed.
         let fish = aterm_uds::host::tool("fish");
         let line = table

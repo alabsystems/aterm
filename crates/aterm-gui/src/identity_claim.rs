@@ -570,7 +570,7 @@ fn is_sharing_violation(e: &std::io::Error) -> bool {
 }
 
 #[cfg(unix)]
-fn is_sharing_violation(_e: &std::io::Error) -> bool {
+const fn is_sharing_violation(_e: &std::io::Error) -> bool {
     false
 }
 

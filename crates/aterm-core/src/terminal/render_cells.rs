@@ -245,7 +245,7 @@ impl Terminal {
         }
     }
 
-    /// Resolve a visible row into render-ready cells, one per stored column, colours fully resolved through [`color_resolve`](super::color_resolve) (see the module docs).
+    /// Resolve a visible row into render-ready cells, one per stored column, colours fully resolved through [`color_resolve`](super::color_resolve).
     #[must_use]
     #[inline]
     pub fn render_row(&self, row: usize) -> Vec<RenderCell> {
@@ -510,6 +510,8 @@ impl Terminal {
 
             if let Some((clusters, combining_out)) = extras_out.as_mut() {
                 if has_emoji_marker {
+                    // Multi-codepoint emoji sequence (ZWJ, skin tone, keycap,
+                    // regional-indicator pair): surface the whole grapheme for
                     // shaping. Skip a NUL base.
                     if raw != '\0' {
                         let bytes = raw.len_utf8() + marks_utf8_bytes;
@@ -567,6 +569,7 @@ impl Terminal {
             } else if has_kitty
                 && let Some(iref) = self.placeholder_image_ref(screen_row, col, extra)
             {
+                // Kitty Unicode placeholder cell: synthesize an ImageRef so it rides
                 // the same (pixel-tested) render path as a direct placement.
                 out.push((col as usize, iref));
             }
@@ -666,6 +669,7 @@ impl Terminal {
             } else if has_kitty
                 && let Some(iref) = self.placeholder_image_ref(coord.row, coord.col, extra)
             {
+                // Kitty Unicode placeholder cell: synthesize an ImageRef so it
                 // rides the same (pixel-tested) render path as a direct placement.
                 images[r].push((usize::from(coord.col), iref));
             }
@@ -1130,6 +1134,8 @@ impl Terminal {
             let [r, g, b] = implicit_blank.bg;
             scratch.default_bg = u32::from_be_bytes([0, r, g, b]);
         } else {
+            // A pristine, unconfigured `Terminal::new`'s VT black is not a host
+            // theme decision; any host/OSC background or DECSCNM makes the
             // terminal authoritative.
             scratch.default_bg = crate::render::COLOR_UNSET;
         }
@@ -2286,6 +2292,7 @@ mod tests {
 
             term.process(b"\r\nnew one\r\nnew two\r\nnew three\r\nnew four");
             if tiered {
+                // The first row is older than the one-row ring; flush the
                 // deferred buffer so this arm genuinely reads the tier store.
                 let _ = term.grid_mut().scrollback_mut();
             }

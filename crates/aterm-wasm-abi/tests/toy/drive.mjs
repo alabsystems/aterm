@@ -1,36 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// The toy module under node (`verify wasm-glue`): every boundary type
-// aterm-wasm-abi carries, through the glue `verify glue` wrote, held to
-// the JS value wasm-bindgen gives the same Rust type, compared type-exactly
-// (BigInt, undefined, typed arrays, -0, thrown strings vs Errors). Run on
-// the glue wasm-bindgen 0.2.108 writes for a #[wasm_bindgen] twin of the
-// toy (the check's oracle row, crates/aterm-verify/src/wasm_glue/oracle.rs),
-// every check holds but the two marked STRICTER (`another class`, and the
-// misuse throws).
+// The toy module in a page of the pinned chrome-headless-shell (`verify
+// wasm-glue`): every boundary type aterm-wasm-abi carries, through the glue
+// `verify glue` wrote, held to the JS value wasm-bindgen gives the same Rust
+// type, compared type-exactly (BigInt, undefined, typed arrays, -0, thrown
+// strings vs Errors). Run on the glue wasm-bindgen 0.2.108 writes for a
+// #[wasm_bindgen] twin of the toy (the check's oracle row,
+// crates/aterm-verify/src/wasm_glue/oracle.rs), every check holds but the
+// two marked STRICTER (`another class`, and the misuse throws).
 //
-//   node --expose-gc drive.mjs <dir>
+//   run({ glue })   the ES module glue's URL (relative to this module); its
+//                   `_bg.wasm` is beside it
 //
-// <dir> holds nodejs/ and web/, the glue of both flavors. The suite runs on
-// the CommonJS module and on the ES module after `init`; the ES module's
-// init forms (init/initSync, object and deprecated positional arguments,
-// bytes, a module, a promise, a Response) each run on a fresh copy.
+// The suite runs on the module after `init`; its init forms (init/initSync,
+// object and deprecated positional arguments, bytes, a module, a promise, a
+// Response) each run on a fresh copy. The browser runs with
+// `--js-flags=--expose-gc`, for the finalizers.
 //
-// A failed check prints one line; each section prints its count; exit 0
-// only when every check held.
-
-import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
-import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
-
-const STEM = 'aterm_wasm_abi_toy'
-const dir = process.argv[2]
-if (!dir) {
-  console.error('usage: node --expose-gc drive.mjs <dir with nodejs/ and web/ glue>')
-  process.exit(2)
-}
+// A failed check prints one line; each section prints its count; it answers
+// { failures }, 0 only when every check held.
 
 let failures = 0
 let section = { name: '', checks: 0 }
@@ -39,8 +28,10 @@ function begin(name) {
   section = { name, checks: 0 }
 }
 
-function end() {
+async function end() {
   console.error(`wasm-glue: ${section.name}: ${section.checks} checks`)
+  // A yield: the page's console reaches the lane between tasks.
+  await new Promise((r) => setTimeout(r, 0))
 }
 
 function check(name, ok, detail) {
@@ -129,7 +120,7 @@ function captureConsole(method, f) {
 
 const P64 = 2n ** 64n - 1n
 
-function suite(label, m) {
+async function suite(label, m) {
   begin(`${label} scalars`)
   eq('bool true', m.echo_bool(true), true)
   eq('bool false', m.echo_bool(false), false)
@@ -161,7 +152,7 @@ function suite(label, m) {
   eq('char astral', m.echo_char('😀'), '😀')
   eq('char takes the first code point', m.echo_char('ab'), 'a')
   throwsError('char lone surrogate', () => m.echo_char('\uD800'), 'expected a valid Unicode scalar value, found 55296')
-  end()
+  await end()
 
   begin(`${label} options`)
   eq('u32 undefined', m.echo_opt_u32(undefined), undefined)
@@ -187,7 +178,7 @@ function suite(label, m) {
   eq('bytes none', m.echo_opt_vec_u8(null), undefined)
   eq('bytes', m.echo_opt_vec_u8(new Uint8Array([1, 2])), new Uint8Array([1, 2]))
   eq('empty bytes are Some', m.echo_opt_vec_u8(new Uint8Array(0)), new Uint8Array(0))
-  end()
+  await end()
 
   begin(`${label} strings`)
   for (const s of ['', 'ascii', 'héllo — ünïcödé 😀', '\0nul', 'x'.repeat(100000) + 'é']) {
@@ -196,7 +187,7 @@ function suite(label, m) {
   }
   eq('utf8 length of an astral char', m.utf8_len('😀'), 4)
   eq('utf8 length of é', m.utf8_len('é'), 2)
-  end()
+  await end()
 
   begin(`${label} buffers`)
   const input = new Uint8Array([0, 1, 255])
@@ -214,7 +205,7 @@ function suite(label, m) {
   const big = m.filled(64 * 1024 * 1024, 7)
   check('a buffer that grows the memory', big.length === 64 * 1024 * 1024 && big[0] === 7 && big[big.length - 1] === 7, `length ${big.length}`)
   eq('strings after the growth', m.echo_str('après'), 'après')
-  end()
+  await end()
 
   begin(`${label} shapes`)
   eq('mixed', m.mixed(1, undefined, 'c', true, 1.5), '1|None|c|Some(true)|1.5')
@@ -231,7 +222,7 @@ function suite(label, m) {
   eq('ok none', m.checked_opt(''), undefined)
   throwsString('err of an option', () => m.checked_opt('!'), 'bang')
   eq('unit', m.unit(), undefined)
-  end()
+  await end()
 
   begin(`${label} classes`)
   const { Counter, Snapshot } = m
@@ -272,7 +263,7 @@ function suite(label, m) {
   throwsError('another class', () => desc.get.call(s), 'an object of another class was passed to rust')
   s.free()
   seeded.free()
-  end()
+  await end()
 
   // A throw returns from the export first and waits in the return slot, so
   // no throw abandons a wasm frame or leaks the module's shadow stack: 100k
@@ -304,7 +295,7 @@ function suite(label, m) {
   check('every Err thrown as its string', errs === N, `${errs} of ${N}${lastly}`)
   check('every constructor Err thrown', ctorErrs === N, `${ctorErrs} of ${N}${lastly}`)
   alive(m)
-  end()
+  await end()
 
   // Before any trap: std still counts a panic a trap interrupted, so every
   // later panic in this instance aborts without reaching a hook.
@@ -327,7 +318,7 @@ function suite(label, m) {
   const pnow = m.performance_now()
   const q1 = performance.now()
   check('performance.now import', q0 <= pnow && pnow <= q1, `${q0} <= ${pnow} <= ${q1}`)
-  end()
+  await end()
 
   begin(`${label} poison`)
   const p = new Counter(1n)
@@ -342,7 +333,7 @@ function suite(label, m) {
   throwsError('then the handle is gone', () => p.value, 'null pointer passed to rust')
   eq('another object is untouched', c.value, 7n)
   c.free()
-  end()
+  await end()
 
 }
 
@@ -363,7 +354,7 @@ function alive(m) {
 // slot: 100k of them leak nothing either. STRICTER than wasm-bindgen, whose
 // misuse throws go through an import and leak (a wasm-bindgen 0.2.108 twin
 // of the toy is dead after these 100k), so this runs last on each instance.
-function misuse(label, m) {
+async function misuse(label, m) {
   begin(`${label} misuse throws`)
   const N = 100_000
   let misused = 0
@@ -379,7 +370,7 @@ function misuse(label, m) {
   const lastly = last === null ? '' : `, then ${last?.constructor?.name}: ${last?.message ?? show(last)}`
   check('every misuse thrown as an Error', misused === N, `${misused} of ${N}${lastly}`)
   alive(m)
-  end()
+  await end()
 }
 
 // FinalizationRegistry frees what JS drops. Collection is the engine's
@@ -387,8 +378,8 @@ function misuse(label, m) {
 async function finalizers(label, m) {
   begin(`${label} finalizers`)
   if (typeof globalThis.gc !== 'function') {
-    check('gc', false, 'run node with --expose-gc')
-    end()
+    check('gc', false, 'run the browser with --js-flags=--expose-gc')
+    await end()
     return
   }
   const before = m.drops()
@@ -401,19 +392,16 @@ async function finalizers(label, m) {
     await new Promise((r) => setTimeout(r, 10))
   }
   check('dropped objects are freed', m.drops() >= before + 32, `${m.drops() - before} of 32 freed`)
-  end()
+  await end()
 }
 
-const require = createRequire(import.meta.url)
-const cjs = require(join(dir, 'nodejs', `${STEM}.js`))
-suite('nodejs', cjs)
-await finalizers('nodejs', cjs)
-misuse('nodejs', cjs)
-
-const webUrl = pathToFileURL(join(dir, 'web', `${STEM}.js`)).href
-const bytes = readFileSync(join(dir, 'web', `${STEM}_bg.wasm`))
+export async function run({ glue }) {
+const wasmUrl = new URL(glue.replace(/\.js$/, '_bg.wasm'), import.meta.url)
+const fetched = await fetch(wasmUrl)
+if (!fetched.ok) throw new Error(`${wasmUrl}: HTTP ${fetched.status}`)
+const bytes = new Uint8Array(await fetched.arrayBuffer())
 let fresh = 0
-const load = () => import(`${webUrl}?copy=${fresh++}`)
+const load = () => import(`${glue}?copy=${fresh++}`)
 
 begin('web init')
 {
@@ -427,10 +415,10 @@ begin('web init')
   check('initSync after init is the same', m.initSync({ module: bytes }) === out, 'a second instance')
   check('no warning for the object form', warned.length === 0, warned.join('; '))
   console.warn = savedWarn
-  end()
-  suite('web', m)
+  await end()
+  await suite('web', m)
   await finalizers('web', m)
-  misuse('web', m)
+  await misuse('web', m)
 }
 begin('web init forms')
 const forms = [
@@ -462,9 +450,8 @@ for (const [name, init, warning] of forms) {
   )
   check(`${name} runs`, m.echo_str('ok') === 'ok' && m.echo_u64(P64) === P64, 'calls fail')
 }
-end()
+await end()
 
 console.error(`wasm-glue: ${failures === 0 ? 'every check held' : `${failures} checks FAILED`}`)
-// Ended by itself, never `process.exit()`, which can hang once a module ran
-// (crates/aterm-verify/perf/wasm/replay.mjs, where it was measured).
-process.exitCode = failures === 0 ? 0 : 1
+return { failures }
+}

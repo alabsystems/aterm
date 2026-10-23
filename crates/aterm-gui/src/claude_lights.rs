@@ -30,7 +30,7 @@ use crate::{App, WindowId};
 #[path = "claude_lights_drawn.rs"]
 mod drawn;
 
-/// How long a toggle that did not take keeps saying.
+/// How long a toggle that did not take keeps saying so.
 const REFUSAL_SHOWN: Duration = Duration::from_secs(4);
 
 /// One chip of aterm's span in the rule (design ).
@@ -145,7 +145,11 @@ fn land_ink(ground: [u8; 3]) -> [u8; 3] {
     floored(AMBER, ground)
 }
 
-/// The inks a block of chips is drawn.
+/// The inks a block of chips is drawn in, read once per block from its row's
+/// `blank` cell and the footer's mark `accent`: Cruise's accent, Land's
+/// amber floored on the row's ground ([`land_ink`]), the row's own ink, its
+/// dim, the titles' ink ([`title_ink`]), and the ground a light's own hue is
+/// floored on ([`floored`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Inks {
     accent: [u8; 3],
@@ -333,7 +337,7 @@ pub(crate) enum ChipFace {
     Theirs,
     /// `○ off`.
     Off,
-    /// `⊘ off`: the master switch.
+    /// `⊘ off`: the master switch is off.
     MasterOff,
     /// `⊘ off`, titled with the switch.
     AgentOff(aterm_phase::Program),
@@ -367,7 +371,7 @@ impl Keep {
     ];
 
     /// Whether this rung keeps `chip`, where it is drawn at all.
-    fn keeps(self, chip: Chip) -> bool {
+    const fn keeps(self, chip: Chip) -> bool {
         match chip {
             Chip::Autopilot => true,
             Chip::Light(_) => matches!(self, Keep::Revealed | Keep::Drawn),
@@ -383,7 +387,9 @@ enum Refusal {
     NotShown,
     /// A mode return stopped short of bypass or auto in this mode, which the light names.
     StoppedIn(Mode),
-    /// A mode return stopped in this mode because Claude stayed mid-turn past the last.
+    /// A mode return stopped in this mode because Claude stayed mid-turn past
+    /// the last press's deadline: aterm's own next press waits for a turn to
+    /// end ([`WindowLights::advance`]).
     StoppedMidTurn(Mode),
     /// The mode cycle came back round without an expected mode.
     NotInCycle(Mode),
@@ -394,7 +400,10 @@ enum Refusal {
 }
 
 impl Refusal {
-    /// Whether it names the mode a mode return stopped.
+    /// Whether it names the mode a mode return stopped in — the one thing a
+    /// return that ends short of bypass or auto must say
+    /// (`claude_mode_return_model`'s `AStopIsNamed`, projected by the
+    /// Tier-1 bind).
     #[cfg(all(test, unix))]
     fn names_mode(self) -> bool {
         matches!(
@@ -437,7 +446,7 @@ struct Pending {
     /// Every mode the cycle has shown since it began.
     seen: Vec<Mode>,
     presses: u8,
-    /// Past this, the toggle is given.
+    /// Past this, the toggle is given up.
     deadline: Instant,
     /// The loop's next look at the engine while one is armed.
     next_poll: Option<Instant>,
@@ -464,7 +473,8 @@ enum Advance {
 /// One session's lights in one window.
 #[derive(Debug, Clone, Default)]
 struct SessionLights {
-    /// The last state each light was seen.
+    /// The last state each light was seen in, kept while a box covers the
+    /// composer so the row does not flicker grey under every dialog.
     shown: Reading,
     pending: Option<Pending>,
     refused: Option<(Light, Refusal, Instant)>,
@@ -519,7 +529,7 @@ struct LightHit {
 /// What of the chips' glass the pointer is over ([`App::track_claude_light_hover`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OverChips {
-    /// Not the chips': the motion.
+    /// Not the chips': the motion is the pane's.
     No,
     /// A chip: a press acts on it.
     Chip,
@@ -529,7 +539,7 @@ pub(crate) enum OverChips {
 
 impl OverChips {
     /// What [`App::claude_glass_at`] found.
-    pub(crate) fn of_glass(at: Option<&(u64, GlassAt)>) -> Self {
+    pub(crate) const fn of_glass(at: Option<&(u64, GlassAt)>) -> Self {
         match at {
             None | Some((_, GlassAt::Mark)) => Self::No,
             Some((_, GlassAt::Chip(None))) => Self::Gap,
@@ -838,7 +848,7 @@ pub(crate) struct BorderSwitch {
     pub(crate) frame_row: usize,
     /// The same row as a window grid row, for the chrome register.
     pub(crate) term_row: usize,
-    /// Every cell a press acts.
+    /// Every cell a press acts on: the whole face, its blanks included.
     pub(crate) cols: std::ops::Range<usize>,
     /// The switch's own cells, its label and its state (`alab harness ○ off`).
     pub(crate) switch: std::ops::Range<usize>,
@@ -856,7 +866,7 @@ pub(crate) struct BorderSwitch {
 #[derive(Debug)]
 struct PanelReading {
     session: u64,
-    /// What it was built.
+    /// What it was built from: the tool, and the whole seconds in it.
     key: (aterm_agent::harness::flight::ToolName, u64),
     whole: String,
     short: String,
@@ -878,13 +888,14 @@ fn wait_title(tool: &str, secs: u64) -> (String, String) {
 #[derive(Debug)]
 struct TitleReading {
     session: u64,
-    /// The trail's generation [`Self::trail`] was built.
+    /// The trail's generation [`Self::trail`] was built at.
     generation: u64,
     /// The trail as the title lists it (`harness_glass::trail_title`).
     trail: String,
     /// The local day the trail's wall read gave, which the face's clock is read against (, item 3).
     today: Option<i64>,
-    /// What [`Self::whole`] and [`Self::short`] were built.
+    /// What [`Self::whole`] and [`Self::short`] were built from: the chip's
+    /// view and glass as the frame read them.
     built: (AutopilotView, ChipGlass),
     /// The title, whole and short ([`autopilot_title`]).
     whole: String,
@@ -940,7 +951,7 @@ struct Fitted {
     /// The pane's session and its leaf.
     session: u64,
     pane: usize,
-    /// What the block was fitted.
+    /// What the block was fitted from.
     key: FitKey,
     /// The fit's number ([`Block::fit`]).
     fit: u64,
@@ -965,7 +976,15 @@ struct FitKey {
     lights: LightsKey,
 }
 
-/// What of one session's lights ([`SessionLights`]) its chip block reads, at the instant it is laid
+/// What of one session's lights ([`SessionLights`]) its chip block reads,
+/// at the instant it is laid — every field [`WindowLights::block_into`],
+/// [`drawn_at`], [`face_of`] and the titles read: what the light shows, the
+/// light a toggle is in flight for, a refusal (its light and its reason)
+/// and a notice ON SHOW (their instants are read only against the clock,
+/// so the key holds what they show, not when they end), the session's
+/// Autopilot view, whether a click of it is in flight, its harness glass,
+/// and what its Team chip says ([`TeamFace`], by its hash: a face holds
+/// names, so the key holds the hash of one, read only where a face stands).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LightsKey {
     shown: Reading,
@@ -1221,7 +1240,7 @@ impl WindowLights {
     }
 
     /// Move the keyboard selection (a frame must paint it before it counts as off the glass).
-    fn select(&mut self, selected: Option<(u64, Target)>) {
+    const fn select(&mut self, selected: Option<(u64, Target)>) {
         self.selected = selected;
         self.selection_painted = false;
     }
@@ -2082,7 +2101,9 @@ fn team_title(face: Option<&TeamFace>, now: Instant) -> (String, String) {
     }
 }
 
-/// A harness chip's title cut to what it names, for a rule with no room for what a click.
+/// A harness chip's title cut to what it names, for a rule with no room for
+/// what a click does: up to its first ` — ` or ` · ` (`autopilot: cruise`,
+/// `harness off in Settings`), else whole.
 fn short_title(title: &str) -> &str {
     [" \u{2014} ", " \u{b7} "]
         .iter()
@@ -2114,7 +2135,7 @@ impl<'a> Face<'a> {
     }
 
     /// Whether anything follows the glyph.
-    fn worded(&self) -> bool {
+    const fn worded(&self) -> bool {
         self.word.is_some() || self.clock.is_some()
     }
 
@@ -2308,7 +2329,9 @@ impl ChipFace {
         }
     }
 
-    /// The glyph's tone.
+    /// The glyph's tone and the word's: Cruise's accent, Land's amber — the
+    /// timer's `∞` Cruise's and its `⤓18:00` Land's — and dim where the
+    /// harness types nothing (a person's own exchange) or runs nothing.
     #[must_use]
     pub(crate) const fn tones(self) -> (ChipTone, ChipTone) {
         match self {
@@ -2782,7 +2805,7 @@ impl Block {
     }
 
     /// The fit that laid it, unique in its window (`0`: none numbered it).
-    pub(crate) fn fit(&self) -> u64 {
+    pub(crate) const fn fit(&self) -> u64 {
         self.fit
     }
 }
@@ -3113,7 +3136,8 @@ impl App {
         self.chips_at_cell(wid, self.glass_cell_at(wid, x, y)?)
     }
 
-    /// [`Self::claude_chips_at`] at frame cell `(row, col)` of the grid the lists were laid.
+    /// [`Self::claude_chips_at`] at frame cell `(row, col)` of the grid the
+    /// lists were laid on.
     fn chips_at_cell(
         &self,
         wid: WindowId,
@@ -3129,7 +3153,8 @@ impl App {
         (!self.chrome_owns_terminal_row(wid, hit.term_row)).then_some((hit.session, hit.chip))
     }
 
-    /// The frame cell under window pixel `(x, y)` on the grid the glass's lists were laid.
+    /// The frame cell under window pixel `(x, y)` on the grid the glass's
+    /// lists were laid on.
     pub(crate) fn glass_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
         let drawn = self.windows.get(&wid)?.claude_lights.drawn_at;
         self.laid_cell_at(wid, drawn, x, y)
@@ -3236,7 +3261,9 @@ impl App {
         }
     }
 
-    /// Pointer motion: move the hover (repainting only on a change) and say what of the chips.
+    /// Pointer motion: move the hover (repainting only on a change) and say
+    /// what of the chips the pointer is over — a chip, or the blank between
+    /// two, which hovers none ([`OverChips`]).
     pub(crate) fn track_claude_light_hover(&mut self, wid: WindowId, x: f64, y: f64) -> OverChips {
         let at = self.claude_glass_at(wid, x, y);
         let over = at.and_then(|(session, glass)| match glass {
@@ -3554,7 +3581,11 @@ impl App {
         }
     }
 
-    /// A click on `session`'s `fact` (showing again `restores`, for a stub) while that fact.
+    /// A click on `session`'s `fact` (showing again `restores`, for a stub)
+    /// while that fact is on the window's glass and no band covers it — what
+    /// a pointer's, the keyboard's and a reader's click share — an open
+    /// in-grid rename settled first, as a click on the grid settles it
+    /// ([`App::press_claude_fact`]).
     pub(crate) fn press_visible_claude_fact(
         &mut self,
         wid: WindowId,
@@ -3636,7 +3667,7 @@ impl App {
         true
     }
 
-    /// What a click on `chip` of `session`.
+    /// What a click on `chip` of `session` does.
     pub(crate) fn press_claude_chip(&mut self, wid: WindowId, session: u64, chip: Chip) {
         match chip {
             Chip::Light(light) => self.toggle_claude_light(wid, session, light),
@@ -3952,6 +3983,8 @@ impl App {
         mods: ModifiersState,
         ev: &KeyEvent,
     ) -> bool {
+        // A bare modifier is not a keystroke (macOS delivers Ctrl and Shift
+        // pressed on their own as presses): it neither selects nor lets a
         // selection go, or every second ctrl+shift+tab would start over.
         if matches!(
             ev.logical_key,

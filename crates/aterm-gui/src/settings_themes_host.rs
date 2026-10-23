@@ -291,7 +291,9 @@ fn open(
 }
 
 impl crate::App {
-    /// Read the themes folder again off the event loop and hand the catalog to the ordinary.
+    /// Read the themes folder again off the event loop and hand the catalog
+    /// to the ordinary catalog reload ([`crate::Wake::ThemeCatalogChanged`]),
+    /// as the folder watcher does.
     pub(crate) fn rediscover_themes_now(&self) {
         let Some(proxy) = self.proxy.clone() else {
             return;

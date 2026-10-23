@@ -1,25 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The scanner's classifiers, one at a time, and whole takes over synthetic
-//! frames and the kept fixtures under `tests/fixtures/paint/`.
+//! Tests for the scanner classifiers over synthetic frames and kept paint fixtures.
 
 use super::*;
 
 const CELL: Cell = Cell { w: 7, h: 14 };
 const LIT: Rgb = [240, 80, 0];
 
-/// A pixel given in the `(b, g, r)` order the fixtures were measured in.
 fn bgr(b: u8, g: u8, r: u8) -> Rgb {
     [r, g, b]
 }
 
-/// A black `w x h` frame with `colored` points painted.
 fn frame(w: usize, h: usize, colored: &[(usize, usize, Rgb)]) -> Frame {
     ground_frame(w, h, [0, 0, 0], colored)
 }
 
-/// `frame` over a uniform ground.
 fn ground_frame(w: usize, h: usize, ground: Rgb, colored: &[(usize, usize, Rgb)]) -> Frame {
     let mut f = Frame::filled(w, h, ground);
     for &(x, y, rgb) in colored {
@@ -28,15 +24,12 @@ fn ground_frame(w: usize, h: usize, ground: Rgb, colored: &[(usize, usize, Rgb)]
     f
 }
 
-/// A filled rectangle of one colour.
 fn block(x0: usize, y0: usize, w: usize, h: usize, rgb: Rgb) -> Vec<(usize, usize, Rgb)> {
     (y0..y0 + h)
         .flat_map(|y| (x0..x0 + w).map(move |x| (x, y, rgb)))
         .collect()
 }
 
-/// Python's `colorsys.hsv_to_rgb` at full saturation and value 240/255,
-/// rounded half-to-even: a bright scanner-eligible sample at an exact hue.
 fn at_hue(degrees: f64) -> Rgb {
     let (h, v) = (degrees / 360.0, 240.0 / 255.0);
     let i = (h * 6.0).trunc();
@@ -73,7 +66,6 @@ fn rows_of(lines: &[String]) -> Vec<StatusRow> {
     lines.iter().map(|l| StatusRow::new(l.clone())).collect()
 }
 
-/// Scan in-memory frames with paired status rows (an image burst).
 fn scan_paired(frames: &[Frame], rows: Vec<StatusRow>) -> ScanReport {
     let names: Vec<String> = (0..frames.len())
         .map(|n| format!("shot_{n:04}.png"))
@@ -87,9 +79,6 @@ fn scan_paired(frames: &[Frame], rows: Vec<StatusRow>) -> ScanReport {
     scan_frames(&names, frames.iter().cloned().map(Ok), &ctx).expect("the take scans")
 }
 
-/// Status rows claiming a mature ribbon, the ledger advancing on every frame
-/// but the last, so `driven_last` is `count - 2` and frames `0..=count-4` are
-/// bound.
 fn claiming_rows(count: usize, pet: bool, body: Option<&str>) -> Vec<StatusRow> {
     let spawns: Vec<usize> = (0..count - 1).chain([count - 2]).collect();
     spawns
@@ -105,8 +94,6 @@ fn claiming_rows(count: usize, pet: bool, body: Option<&str>) -> Vec<StatusRow> 
         })
         .collect()
 }
-
-// ------------------------------------------------------------- cyan bar --
 
 fn cyan_of(hex: u32) -> usize {
     dynamic_metrics(
@@ -141,7 +128,6 @@ fn cyan_is_the_band_between_the_declared_edges() {
         (0x00BFFF, 0), // 195.1 deg, outside
         (0xB4FFFF, 0), // a pale wash
         (0x063030, 0), // a near-black teal
-        // The rainbow's own anchors.
         (0xFF0000, 0),
         (0xFF9900, 0),
         (0xFFFF00, 0),
@@ -153,23 +139,18 @@ fn cyan_is_the_band_between_the_declared_edges() {
     }
 }
 
-// ---------------------------------------------------------- colour floor --
-
 #[test]
 fn the_colour_floor_admits_the_bed_and_refuses_grey_and_fringe() {
     for (px, ink) in [
-        // The bed's dimmest stops at the ceiling and at the cold share.
         (bgr(0, 83, 83), true),
         (bgr(0, 94, 0), true),
         (bgr(90, 90, 0), true),
         (bgr(20, 75, 75), true),
         (bgr(20, 80, 18), true),
         (bgr(78, 78, 20), true),
-        // v1's brighter bed.
         (bgr(0, 236, 236), true),
         (bgr(200, 0, 0), true),
         (bgr(0, 0, 180), true),
-        // A band's tapered fringe, and grey on the glass.
         (bgr(20, 45, 45), false),
         (bgr(24, 19, 17), false),
         (bgr(150, 150, 150), false),
@@ -179,8 +160,6 @@ fn the_colour_floor_admits_the_bed_and_refuses_grey_and_fringe() {
         assert_eq!(saturated_hue_degrees(px).is_some(), ink, "{px:?}");
     }
 }
-
-// ------------------------------------------------------- band domain --
 
 #[test]
 fn a_star_on_a_long_band_s_edge_leaves_the_band_lit() {
@@ -201,8 +180,6 @@ fn a_tall_object_whose_band_rows_still_exceed_the_cap_is_dropped() {
         (0, HueSet::default())
     );
 }
-
-// -------------------------------------------------------- status rows --
 
 fn spine(spawns: u32, speed: f64) -> String {
     format!("trail licensed={spawns} spawns={spawns} speed={speed:.1}")
@@ -305,7 +282,6 @@ fn required_status_tokens_fail_closed() {
             .uint("ribbon_hue_bands")
             .is_err()
     );
-    // nan and inf parse as floats and compare false against every bound.
     for line in [
         "trail speed=fast",
         "trail speed=-1.0",
@@ -327,8 +303,6 @@ fn the_emitted_body_uses_exclusive_ends_and_refuses_malformed_geometry() {
         assert!(body(raw).is_err(), "{raw}");
     }
 }
-
-// -------------------------------------------------------- companions --
 
 #[test]
 fn cursor_row_cannot_impersonate_a_companion() {
@@ -362,12 +336,10 @@ fn compact_pet_is_allowed_only_in_isolated_endpoint_witnesses() {
             Shape::NONE
         );
     }
-    // No engine claim, no endpoint exception.
     assert_eq!(
         companion_component(&f, black, false, 9, 10, None, false),
         Shape::NONE
     );
-    // The 9 px pose is never lent to the cat: its floor is CAT_STILL_MIN_H.
     assert_eq!(
         companion_component(&f, black, false, 9, 10, None, true),
         Shape::NONE
@@ -382,7 +354,6 @@ fn two_drawn_companions_are_two_components() {
     let found = tall_components(&both, [0, 0, 0], COMP_MIN_H);
     assert_eq!(found.len(), 2);
     assert_eq!(largest_tall_component(&both), found[0]);
-    // One animal on the same plane is one component.
     assert_eq!(
         tall_components(&frame(64, 24, &left), [0, 0, 0], COMP_MIN_H).len(),
         1
@@ -411,7 +382,6 @@ fn a_charcoal_companion_is_not_rejected_for_lacking_saturation() {
     );
 }
 
-/// The momentum-zero flying head (24x16) in the cleared-plane stills.
 fn resting_head(w: usize, h: usize, frame_no: usize, pet: bool, cat: bool) -> Shape {
     let f = frame(48, 30, &block(10, 4, w, h, bgr(40, 130, 220)));
     companion_component(&f, [0, 0, 0], pet, frame_no, 10, None, cat)
@@ -433,7 +403,6 @@ fn the_resting_head_is_a_witness_only_in_the_claimed_final_stills() {
             "mid-take {frame_no}"
         );
     }
-    // No engine claim; a one-row component; the caret block.
     for (w, h, cat) in [(24, 16, false), (28, 14, true), (7, 14, true)] {
         assert_eq!(
             resting_head(w, h, 9, false, cat),
@@ -442,8 +411,6 @@ fn the_resting_head_is_a_witness_only_in_the_claimed_final_stills() {
         );
     }
 }
-
-// --------------------------------------------------------------- runs --
 
 #[test]
 fn only_interior_rainbow_blackouts_count() {
@@ -495,8 +462,6 @@ fn duplicate_capture_does_not_lengthen_an_interior_blackout() {
     let duplicates = [false, true, false, false, true, false, false];
     assert_eq!(rainbow_summary(&flags, &duplicates), (4, 2, 1));
 }
-
-// --------------------------------------------------- ribbon geometry --
 
 #[test]
 fn moving_cursor_and_colored_glyphs_are_not_ribbon_presence() {
@@ -579,8 +544,6 @@ fn remote_run_on_cursor_bottom_is_not_attached_ribbon() {
     assert!(!ribbon_present(&m));
 }
 
-/// The sandbox ground and the block cursor's pale tints, `(b, g, r)`: chroma
-/// 39 (one level under the floor), 40, and the measured hole pixel.
 const GROUND: Rgb = [17, 19, 24];
 fn pale_caret() -> Rgb {
     bgr(221, 182, 202)
@@ -592,7 +555,6 @@ fn hole_caret() -> Rgb {
     bgr(221, 182, 201)
 }
 
-/// A 7x14 block at x=2..8, y=2..15; `holes` render at the chroma-39 tint.
 fn caret_block(fill: Rgb, holes: &[(usize, usize)]) -> Vec<(usize, usize, Rgb)> {
     block(2, 2, 7, 14, fill)
         .into_iter()
@@ -610,8 +572,6 @@ fn caret_block(fill: Rgb, holes: &[(usize, usize)]) -> Vec<(usize, usize, Rgb)> 
         .collect()
 }
 
-/// The measured hole pattern: the block's last column on rows 5-13 and 15,
-/// and the third and fourth cells of rows 12 and 15.
 fn measured_holes() -> Vec<(usize, usize)> {
     (5..14)
         .map(|y| (8, y))
@@ -653,7 +613,6 @@ fn a_caret_under_the_colour_floor_still_anchors_the_attached_run() {
         );
         assert_eq!(m.ribbon_run, expected, "{label}");
         assert!(ribbon_present(&m), "{label}");
-        // The pure function on explicit sets: cursor from `changed`, run from `dynamic`.
         let changed: BTreeSet<usize> = colored.iter().map(|&(x, y, _)| y * w + x).collect();
         let dynamic: BTreeSet<usize> = colored
             .iter()
@@ -712,8 +671,6 @@ fn subthreshold_horizontal_spark_is_not_ribbon_presence() {
     assert!(!ribbon_present(&m));
 }
 
-// -------------------------------------------------------- hue diagnostic --
-
 #[test]
 fn fast_circular_max_matches_the_exact_oracle_including_wrap() {
     let brute = |d: &[f64]| {
@@ -744,10 +701,6 @@ fn fast_circular_max_matches_the_exact_oracle_including_wrap() {
     }
 }
 
-/// The row hue witness: two hues count only when they are visibly apart
-/// (not merely across a bucket edge) AND in one 4-connected, slab-height
-/// object — a seam-split slab run still is, a diagonal neighbour, a detached
-/// pixel or a tall caret block is not.
 #[test]
 fn the_row_hue_witness_needs_one_object_and_visible_separation() {
     let run = |xs: std::ops::Range<usize>, hue: f64| -> Vec<(usize, usize, Rgb)> {
@@ -833,7 +786,6 @@ fn the_row_hue_witness_needs_one_object_and_visible_separation() {
             m.row_hue_separation
         );
     }
-    // The negative controls really are two inked hues.
     for colored in [
         [(0, 0, at_hue(59.0)), (1, 0, at_hue(61.0))],
         [(0, 0, at_hue(45.0)), (5, 0, at_hue(200.0))],
@@ -842,8 +794,6 @@ fn the_row_hue_witness_needs_one_object_and_visible_separation() {
         assert_eq!((m.ink, m.row_hue_peak), (2, 2));
     }
 }
-
-// ------------------------------------------------------------ litness --
 
 #[test]
 fn a_young_tall_band_is_lit_though_it_is_not_thin_geometry() {
@@ -897,10 +847,6 @@ fn geometry_alone_still_lights_a_frame() {
     assert!(driven_lit(&m));
 }
 
-// --------------------------------------------------- claim-bound takes --
-
-/// Six frames: a blank baseline, `first` twice, then a one-pixel tail, under
-/// rows whose claim covers frames 0-2 (3-4 are the close guard, 5 the exhale).
 fn baseline_take(first: &[(usize, usize, Rgb)]) -> ScanReport {
     let tail = [(3, 2, at_hue(45.0))];
     let frames = [
@@ -947,7 +893,6 @@ fn the_exemption_stops_at_frame_zero() {
     assert_eq!(r.ribbon_dark, 2);
 }
 
-/// Six frames whose answerable bound frames are 1 and 2 (`colored` repeated).
 fn single_bound_frame(colored: &[(usize, usize, Rgb)], pet: bool) -> ScanReport {
     let mut frames = vec![frame(60, 30, &[])];
     frames.extend(std::iter::repeat_n(frame(60, 30, colored), 5));
@@ -1001,8 +946,6 @@ fn a_blanked_layer_mid_take_charges_its_full_run() {
     assert_eq!((r.ribbon_bound, r.ribbon_dark), (5, 3));
 }
 
-// ---------------------------------------------------------- animal box --
-
 const ANIMAL_W: usize = 90;
 const ANIMAL_H: usize = 30;
 const ANIMAL_BOX: PixelBox = PixelBox::new(50, 4, 71, 21);
@@ -1013,7 +956,6 @@ fn orange() -> Rgb {
     bgr(20, 65, 95)
 }
 
-/// A 22x18 charcoal pet: a 22x12 body over one 4x6 right leg (288 px).
 fn animal() -> Vec<(usize, usize, Rgb)> {
     [
         block(50, 4, 22, 12, charcoal()),
@@ -1022,7 +964,6 @@ fn animal() -> Vec<(usize, usize, Rgb)> {
     .concat()
 }
 
-/// A 12x9 coloured patch inside the body.
 fn fragment() -> Vec<(usize, usize, Rgb)> {
     block(54, 6, 12, 9, orange())
 }
@@ -1066,7 +1007,6 @@ fn body_identity_keeps_strict_and_isolated_morphology_floors() {
     assert_eq!(located(&compact, ANIMAL_BOX, 4), Shape::NONE);
     assert_eq!(located(&compact, ANIMAL_BOX, 0), Shape::new(144, 16, 9));
     assert_eq!(located(&compact, ANIMAL_BOX, 9), Shape::new(144, 16, 9));
-    // A caret or star inside the claimed body is not a pet.
     for pixels in [
         vec![],
         block(50, 4, 7, 14, orange()),
@@ -1094,7 +1034,6 @@ fn pixels_outside_the_emitted_rectangle_cannot_supply_missing_height() {
     );
 }
 
-/// Five repeats of `colored` behind a blank baseline; frames 1-2 are bound.
 fn wired(colored: &[(usize, usize, Rgb)], pet: bool, body: Option<&str>) -> ScanReport {
     let mut frames = vec![frame(ANIMAL_W, ANIMAL_H, &[])];
     frames.extend(std::iter::repeat_n(frame(ANIMAL_W, ANIMAL_H, colored), 5));
@@ -1141,7 +1080,6 @@ fn the_emitted_body_identity_separates_a_pet_from_a_larger_typed_row() {
         );
         assert_eq!(r.ribbon_dark, 0);
         assert_eq!(r.pet_missing, 1, "the blank baseline");
-        // The band's paint removed: red for both breeds.
         let dark = wired(
             &[row.clone(), animal(), coat].concat(),
             true,
@@ -1156,8 +1094,6 @@ fn the_emitted_body_identity_separates_a_pet_from_a_larger_typed_row() {
             (0, animal_ink)
         );
     }
-    // The ranking alone, as a negative control: it rejects a visible ribbon
-    // beside charcoal and accepts a gold coat with no ribbon.
     assert_eq!(
         wired(&[row.clone(), animal(), band].concat(), true, None).ribbon_dark,
         2
@@ -1258,8 +1194,6 @@ fn a_fused_companion_s_box_is_the_row_s_and_excludes_nothing() {
     }));
     assert_eq!((f1.metrics.band_ink, f1.metrics.animal_ink), (342, 0));
     assert_eq!(r.ribbon_dark, 0);
-    // Not vacuous: taken for the animal's, the fused box would refuse the
-    // ribbon itself.
     let plane = frame(ANIMAL_W, ANIMAL_H, &colored);
     let fused_box = companion_component_box(&plane, [0, 0, 0], true, 1, 6, None, false)
         .expect("the fused component");
@@ -1271,12 +1205,8 @@ fn a_fused_companion_s_box_is_the_row_s_and_excludes_nothing() {
     assert_eq!((band_ink, animal_ink), (0, 342));
 }
 
-// ------------------------------------------------------- driven window --
-
 const NOMINAL: i64 = 16_000;
 
-/// An index of `count` frames on a 16 ms clock (holes override the gaps), and
-/// the frames' names.
 fn index_of(count: usize, holes: &[i64], ticks: Option<Vec<i64>>) -> (RecordingIndex, Vec<String>) {
     let start = 1_000_000;
     let mut t = start;
@@ -1463,8 +1393,6 @@ fn a_duplicate_cannot_open_the_mature_window() {
 
 #[test]
 fn darkness_outside_the_driven_window_is_not_the_rows_business() {
-    // Frame 10 sits at 160 ms; a bracket closing at 5 ms plus the grace ends
-    // at 155 ms, so the ten lit frames are in and every dark one is out.
     let d = measure(
         &lit(&[(true, 10), (false, 20)]),
         Some((0, 5)),
@@ -1507,8 +1435,6 @@ fn the_recording_index_parses_stamps_coverage_and_integer_ticks() {
     assert!(RecordingIndex::parse(b"[]").is_err());
 }
 
-/// A recorded take's continuity reads band population, not the hue witness:
-/// a mono-hue flat band is continuous.
 fn recorded_take(band_frames: &[usize]) -> ScanReport {
     let mut frames = vec![frame(40, 4, &[])];
     let mut stamps = BTreeMap::new();
@@ -1552,8 +1478,6 @@ fn a_mono_hue_band_is_continuous_however_dark_the_hue_witness() {
 fn a_vanished_band_is_still_a_blackout_through_the_same_wiring() {
     assert_eq!(recorded_take(&[1, 2, 5, 6]).driven.dark_us, 2 * NOMINAL);
 }
-
-// --------------------------------------------------------- whole takes --
 
 #[test]
 fn a_take_scans_from_png_files_through_the_one_decoder() {
@@ -1614,9 +1538,6 @@ fn a_take_with_mismatched_rows_or_sizes_is_refused() {
     ));
 }
 
-// ------------------------------------------------------------- fixtures --
-
-/// A kept take's frames and their paired rows, from `tests/fixtures/paint/`.
 struct Fixture {
     frames: BTreeMap<&'static str, Frame>,
     rows: Vec<StatusRow>,
@@ -1667,7 +1588,6 @@ impl Fixture {
         frame_background(self.frame("shot_0000"))
     }
 
-    /// The frames at `order` composed into one take, rows rewritten.
     fn scan(&self, order: &[usize], rewrite: impl Fn(&str) -> String) -> ScanReport {
         let frames: Vec<Frame> = order
             .iter()
@@ -1707,7 +1627,6 @@ fn grey_sleeper() -> Fixture {
     )
 }
 
-/// Baseline, two mid-take sleepers, three final stills.
 const SLEEPER_ORDER: [usize; 6] = [0, 1, 1, 2, 2, 2];
 
 #[test]
@@ -1728,9 +1647,7 @@ fn the_sleeper_is_located_on_the_mid_take_frames_it_is_claimed_on() {
     assert!(mid.notes.contains(&FrameNote::RestingPoseWitness {
         pose: Some("pet_sleep_0".into())
     }));
-    // The sleeper's pink nose is the animal's, not band ink.
     assert_eq!((mid.metrics.band_ink, mid.metrics.animal_ink), (0, 6));
-    // The isolating frames read through the compact witness, not the bind.
     for (i, shape) in [(0, Shape::new(215, 24, 14)), (5, Shape::new(226, 24, 15))] {
         let f = &r.per_frame[i];
         assert_eq!(f.companion, shape, "frame {i}");
@@ -1789,7 +1706,6 @@ fn the_pose_claim_selects_the_floor_inside_the_emitted_rect() {
             "{pose:?}"
         );
     }
-    // Without the cell width the floor cannot be derived: closed, not open.
     assert_eq!(
         fx.located("shot_0011", 11, 25, Some("pet_sleep_0"), None),
         Shape::NONE
@@ -1804,8 +1720,6 @@ fn the_pose_claim_selects_the_floor_inside_the_emitted_rect() {
     );
 }
 
-/// The fixed sleeper cell of the synthetic impostor pins (the take's own
-/// `pet_body=33,73,146,170`), mid-take (frame 4 of 10).
 const SLEEPER_CELL: PixelBox = PixelBox::new(33, 146, 72, 169);
 
 fn sleeper_synthetic(colored: &[(usize, usize, Rgb)], pose: Option<&str>, cell_w: usize) -> Shape {
@@ -1891,7 +1805,6 @@ fn two_touching_cells_are_not_the_sleeper_and_the_edge_is_where_it_is_declared()
         sleeper_synthetic(&block(45, 156, 15, 14, charcoal()), sleep, 7),
         Shape::new(15 * 14, 15, 14)
     );
-    // The floor is in cells: at cell_w = 8 the same block is under two cells.
     assert_eq!(
         sleeper_synthetic(&block(45, 156, 15, 14, charcoal()), sleep, 8),
         Shape::NONE
@@ -1909,7 +1822,6 @@ fn a_row_running_through_the_cell_is_the_row_s_not_the_sleeper_s() {
     ] {
         assert_eq!(sleeper_synthetic(&clipped, sleep, 7), Shape::NONE);
     }
-    // The same 24x14 block one pixel inside each edge is a body.
     for (x, y) in [(34, 156), (48, 156), (40, 147)] {
         assert_eq!(
             sleeper_synthetic(&block(x, y, 24, 14, charcoal()), sleep, 7),

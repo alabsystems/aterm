@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-wayland's generated tables against wayland-scanner 0.31.10's,
-//! recorded in tests/recorded/wayland-scanner-0.31.10-interfaces.tsv from the
-//! same protocol files: every interface's name, version and message counts,
-//! and every message's name, signature and argument types, in order.
-//!
-//! Negative controls: the recording covers every table and nothing else; a
-//! table one signature character or one type away is told apart.
+//! Generated protocol table conformance tests against `wayland-scanner` recordings.
 
 use std::ffi::CStr;
 
@@ -94,7 +88,6 @@ fn every_table_is_wayland_scanners() {
     assert_eq!(got, want, "the same rows, in the same order");
 }
 
-/// Negative control: the comparison tells one character of one table apart.
 #[test]
 fn a_table_one_character_away_is_told_apart() {
     static WRONG_SIG: [Message; 1] = [Message::new(
@@ -116,7 +109,6 @@ fn a_table_one_character_away_is_told_apart() {
     );
 }
 
-/// A safe table refuses missing type slots before any pointer lookup can occur.
 #[test]
 fn a_message_refuses_a_types_slice_shorter_than_its_signature() {
     use aterm_wayland::iface::{NULLS, TypeRef};
@@ -140,7 +132,6 @@ fn a_message_refuses_a_types_slice_shorter_than_its_signature() {
 
     let mut accepted = Vec::new();
     for (signature, supplied) in [(c"o", 0), (c"12?os", 1), (c"iufsonah", 7), (c"sun", 2)] {
-        // Construct only: an invalid baseline table is never dereferenced.
         if std::panic::catch_unwind(|| Message::new(c"short", signature, &NULLS[..supplied]))
             .is_ok()
         {

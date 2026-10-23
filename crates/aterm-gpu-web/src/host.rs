@@ -10,7 +10,7 @@
 //! WP.8). The GL calls are aterm-gpu's own `aterm_gl` imports.
 //!
 //! Debug builds also export what `crates/aterm-verify/perf/wasm/smoke.mjs`
-//! drives under node (`verify wasm-smoke`); a release module has none of it.
+//! drives in a browser (`verify wasm-smoke`); a release module has none of it.
 
 // The clocks aterm_time reads on wasm32-unknown-unknown: link-time symbols
 // this module must define, or it does not link.
@@ -25,7 +25,7 @@ aterm_time::wasm_clock_host!(
 #[cfg(target_arch = "wasm32")]
 pub(crate) use aterm_wasm_abi::host::CONSOLE;
 
-/// Debug builds only: panic with `msg`, so the node smoke can read what the
+/// Debug builds only: panic with `msg`, so the smoke can read what the
 /// hook a constructor installed hands `console.error`.
 #[cfg(all(target_arch = "wasm32", debug_assertions))]
 #[aterm_wasm_abi::export(js_name = atermSmokePanic)]
@@ -35,7 +35,7 @@ pub fn smoke_panic(msg: &str) {
 
 /// Debug builds only: milliseconds since the first call by
 /// `aterm_time::Instant`, then milliseconds since the Unix epoch by
-/// `aterm_time::SystemTime`, so the node smoke can hold both clocks to JS's.
+/// `aterm_time::SystemTime`, so the smoke can hold both clocks to JS's.
 #[cfg(all(target_arch = "wasm32", debug_assertions))]
 #[aterm_wasm_abi::export(js_name = atermSmokeClocks)]
 pub fn smoke_clocks() -> Vec<f64> {

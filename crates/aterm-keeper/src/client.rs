@@ -1085,6 +1085,7 @@ fn link_worker(peer: &LinkPeer, rx: Receiver<Queued>, booted: Option<KeeperClien
         }
         if bye {
             // Nothing follows a quit: the window is about to `exit(0)`, and the
+            // keeper reads the BYE, then this connection's end.
             return;
         }
     }
@@ -1129,6 +1130,7 @@ fn unconfirm_companions(held: &mut Held) {
 
 fn sync_companions(c: &KeeperClient, held: &mut Held) -> io::Result<()> {
     // An older keeper gives no read evidence. Leave the receipt pending rather than
+    // treating a write, or absence of the capability, as permission to drop its region.
     if !c.keeper_journals() || !c.keeper_syncs() {
         return Ok(());
     }

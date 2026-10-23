@@ -87,9 +87,9 @@ pub(crate) fn usage_credits() -> bool {
     USAGE_CREDITS.load(Ordering::SeqCst)
 }
 
-/// Whether `cfg` supervises this instance's agent sessions: `[harness] enabled`, and — in a
-/// headless instance.
-pub(crate) fn would_supervise(cfg: &SupervisorConfig, headless: bool) -> bool {
+/// Whether `cfg` supervises this instance's agent sessions: `[harness]
+/// enabled`, and — in a headless instance — not `headless = false`.
+pub(crate) const fn would_supervise(cfg: &SupervisorConfig, headless: bool) -> bool {
     cfg.enabled && (!headless || cfg.headless)
 }
 
@@ -325,7 +325,7 @@ pub(crate) fn admitted_mask(cfg: &SupervisorConfig) -> u8 {
 
 /// `agent`'s bit of an [`Admission`] mask: one per [`Program`], by its place in the enum, so no two
 /// agents can share one.
-pub(crate) fn agent_bit(agent: Program) -> u8 {
+pub(crate) const fn agent_bit(agent: Program) -> u8 {
     const _: () = assert!(
         Program::ALL.len() <= u8::BITS as usize,
         "Admission's u8 is full"
@@ -373,7 +373,7 @@ pub(crate) struct RestoredAgent {
 
 impl RestoredAgent {
     /// Nothing says which login this agent ran under.
-    fn unread(&self) -> bool {
+    const fn unread(&self) -> bool {
         self.cold && self.snap.home.is_none() && self.snap.login.is_none()
     }
 }
@@ -397,7 +397,7 @@ struct RestoredAttempt {
 
 impl RestoredAttempt {
     /// Whether this relaunch has typed its line.
-    fn typed(&self) -> bool {
+    const fn typed(&self) -> bool {
         self.resume_wait_since.is_some() || self.landed
     }
 }
@@ -1005,8 +1005,12 @@ impl WorkerJob {
             .clone()
     }
 
-    /// The holder this worker's loop watches beside, if it watches only: the proven self-claim's
-    /// ([`Self::beside`]), else.
+    /// The holder this worker's loop watches beside, if it watches only:
+    /// the proven self-claim's ([`Self::beside`]), else — a codex-alab with
+    /// none proven yet, or one it gave back while it runs — the agent's own
+    /// name ([`UNCLAIMED_CODEX_ALAB`]): aterm supervises no Codex
+    /// ([`watches_only`]), so its loop claims nothing and its transport
+    /// refuses every write from birth.
     fn watch_beside(&self) -> Option<String> {
         self.beside()
             .or_else(|| watches_only(self.agent).then(|| UNCLAIMED_CODEX_ALAB.to_string()))
@@ -1025,8 +1029,10 @@ pub(crate) enum Word {
     /// The agent's exit is the worker's to read ([`Worker::leave`]; a worker that reads its exit
     /// alone starts so, [`exit_main`]).
     Left = 1,
-    /// A stop reached the worker ([`request_stop`]): for good — its tab closed, the policy, the
-    /// shutdown, a hand-over.
+    /// A stop reached the worker ([`request_stop`]): for good — its tab
+    /// closed, the policy, the shutdown, a hand-over — or a park's Commit's,
+    /// which [`HostHandle::suspend`] records on the session first
+    /// ([`Kept::commit`]).
     Stopped = 2,
 }
 
@@ -1036,7 +1042,7 @@ pub(crate) struct ExitWord(AtomicU8);
 
 impl ExitWord {
     /// A word with the agent's exit handed from the start ([`exit_main`]).
-    fn handed() -> Self {
+    const fn handed() -> Self {
         Self(AtomicU8::new(Word::Left as u8))
     }
 
@@ -1259,7 +1265,7 @@ enum NoReset {
 }
 
 impl NoReset {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             NoReset::Off => "off",
             NoReset::Unread => "unread",
@@ -1288,7 +1294,7 @@ impl NoReset {
     }
 
     /// What the loop is answered (`IdleHost::reset_take`).
-    fn word(self) -> ResetWord {
+    const fn word(self) -> ResetWord {
         ResetWord::No(match self {
             NoReset::Unwritten | NoReset::LockHeld => return ResetWord::Again,
             NoReset::Off => ResetNo::Off,
@@ -1983,6 +1989,13 @@ pub(crate) enum HostNote {
     /// No survey is open in the tab (the loop's first look saw none, or the card left), or its
     /// worker ended.
     SurveyEnded { sid: String },
+    /// What the tab's occupancy door says now, once a change ([`IdleHost::occupancy_said`]):
+    /// the board keeps it for the status and `occupancy why`, and a cap spent under `prompt`
+    /// raises its Entry.
+    OccupancySaid {
+        sid: String,
+        said: aterm_agent::supervise::occupancy::OccupancySaid,
+    },
     /// The tab's resume loop found a point only a person can answer ([`IdleHost::exception`]).
     ResumeException {
         sid: String,
@@ -2054,7 +2067,7 @@ pub(crate) enum AccountsSaid {
 impl AccountsSaid {
     /// Whether a line of the digest stands for this: the one a look that reads the same again still
     /// has something to say for.
-    fn stands(&self) -> bool {
+    const fn stands(&self) -> bool {
         match self {
             Self::Nothing => false,
             Self::Refused | Self::LoginsUnread => true,
@@ -2529,6 +2542,7 @@ fn end_notes(hooks: &Hooks, sid: &str, agent: Program) {
 
 /// [`worker_main`]'s life proper.
 fn worker_run(mut job: WorkerJob, hooks: &Hooks) -> WorkerExit {
+    // A worker that starts over a relaunch's word (the agent runs in the tab
     // again, the body clears the mark) ends every line that word made.
     if job.clear_badge {
         (hooks.note)(HostNote::Relaunch {
@@ -2739,12 +2753,12 @@ fn attach(job: &WorkerJob, hooks: &Hooks) {
 }
 
 /// Whether the live upgrade is written for `agent`.
-fn upgrades(agent: Program) -> bool {
+const fn upgrades(agent: Program) -> bool {
     aterm_agent::harness::lanes::lanes(agent).upgrade
 }
 
 /// Whether the relaunch on exit is written for `agent` ([`on_agent_left`]): Claude Code's.
-fn relaunches(agent: Program) -> bool {
+const fn relaunches(agent: Program) -> bool {
     aterm_agent::harness::lanes::lanes(agent).relaunch
 }
 
@@ -2765,7 +2779,7 @@ fn carries_only(agent: Program) -> Option<upgrade::Agent> {
 }
 
 /// Whether the host reads `agent`'s conversation through its transcript.
-fn reads_transcript(agent: Program) -> bool {
+const fn reads_transcript(agent: Program) -> bool {
     match agent {
         Program::Claude => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
@@ -2773,7 +2787,7 @@ fn reads_transcript(agent: Program) -> bool {
 }
 
 /// Whether accounts state is recorded for `agent` ([`WorkerIdle::account_ctx`], [`account_gone`]).
-fn accounts_for(agent: Program) -> bool {
+const fn accounts_for(agent: Program) -> bool {
     match agent {
         Program::Claude => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
@@ -2986,6 +3000,8 @@ impl UpgradeRun {
         let after = if attended {
             upgrade_drive::after_attended(self.attended, self.same, grace_s)
         } else if upgrade_drive::refused(step) {
+            // A notice its fence refused: looked at again at the first rung
+            // while the point is still the upgrade's, so it is tried again
             // there (`refused` is still the count `owns` read).
             upgrade_drive::after_refused(self.refused, self.same)
         } else {
@@ -3195,7 +3211,7 @@ enum Told {
 
 impl Told {
     /// The byte [`WorkerIdle::told`] keeps, read back.
-    fn of(byte: u8) -> Self {
+    const fn of(byte: u8) -> Self {
         match byte {
             1 => Told::Retry,
             2 => Told::Pause,
@@ -3273,6 +3289,10 @@ impl std::fmt::Debug for WorkerIdle {
 impl IdleHost for WorkerIdle {
     /// A point asked for, or a look the worker scheduled come due.
     fn wants(&self) -> bool {
+        // Beside a proven self-claim the host takes no step (§4), and while
+        // macOS's program check is stuck it takes none either
+        // ([`Self::at_idle_on`]): what it owes waits, kept, and is asked for
+        // at the first wait step after the check clears, before the loop's
         // own decision.
         if self.beside() || (self.on() && self.program_check_stuck()) {
             return false;
@@ -3316,6 +3336,15 @@ impl IdleHost for WorkerIdle {
     /// stamps it.
     fn break_taken(&self) {
         self.points.offered(crate::upgrade_host::now_s());
+    }
+
+    /// What the occupancy door says now, once a change: told the window, whose board keeps it
+    /// ([`HostNote::OccupancySaid`]). Nothing is typed from it.
+    fn occupancy_said(&self, said: &aterm_agent::supervise::occupancy::OccupancySaid) {
+        (self.hooks.note)(HostNote::OccupancySaid {
+            sid: self.sid.clone(),
+            said: said.clone(),
+        });
     }
 
     /// The upgrade's notice is due for this session, whether or not this break's look at it is
@@ -5343,6 +5372,7 @@ impl WorkerIdle {
         let enrolled = accounts::enrolled(&roster);
         let me = look.who.me(&roster);
         let claimed = self.account_transact(&seat, |state, now| {
+            // The claim's own test first, for its own word: the roster's
             // advice folds a standing claim into "nothing due".
             if accounts::probe_held(state, &label, now) {
                 return Err(CLAIMED.to_string());
@@ -5900,6 +5930,7 @@ impl WorkerIdle {
         let step = if self.can_restart() {
             self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why))
         } else {
+            // The transaction below must still undo a rotation already
             // committed before this live gate refused the restart.
             "refused:supervisor-off".to_string()
         };
@@ -6371,6 +6402,7 @@ fn follow_snapshot_guarded(
         }
         match fg {
             Foreground::Agent => {
+                // A conversation the record moved to (an in-app `/clear` or
                 // `/resume`): a fact the log keeps, rare as the move.
                 if snap.session != before.session {
                     aterm_log::info!(
@@ -7247,6 +7279,8 @@ fn relaunch_until_with(
         if wait_for(Instant::now() + (hooks.pause)(wait), || {
             !job.left.is(Word::Left)
         }) {
+            // The host read the agent back ([`Worker::back`]) or a stop came
+            // ([`request_stop`]), each its own word (`stop` says nothing: the exit's own
             // [`Worker::leave`] set it). The tab says whether its agent is back now.
             if (hooks.still_wanted)(sid, job.group.load(Ordering::SeqCst)) {
                 runs_again(job, hooks, false);
@@ -7277,6 +7311,7 @@ fn relaunch_until_with(
             return false;
         }
         if !job.left.is(Word::Left) {
+            // Read a Commit stop through the existing wait/rollback path;
             // it carries debt even though it must start no new attempt.
             continue;
         }
@@ -7416,6 +7451,7 @@ fn launch_end_read(
 /// ([`relaunch_until`]).
 fn gone_again(job: &WorkerJob) -> Option<Stop> {
     with_kept(job, |k| {
+        // Under the session's lock, which [`Worker::back`] reads the agent
         // back under: one of the two sees the other.
         if job.left.is(Word::Left) {
             return None;
@@ -7777,8 +7813,10 @@ pub(crate) fn cannot_then(step: &str) -> Option<&'static str> {
     }
 }
 
-/// Where a person resumes an agent that cannot be brought back (`step`, the refusal
-/// [`cannot_reason`] reads): in its tab.
+/// Where a person resumes an agent that cannot be brought back (`step`, the
+/// refusal [`cannot_reason`] reads): in its tab — but a tab's own program
+/// ([`tab_program`]) took its tab with it when it ended, or holds one no
+/// shell reads (`--hold`), so in a new one.
 fn resume_place(step: &str) -> &'static str {
     if tab_program(step) {
         "in a new tab"
@@ -7798,7 +7836,7 @@ fn tab_program(step: &str) -> bool {
 }
 
 /// What an agent that cannot be brought back is said to be, by whom it ended.
-fn cannot_head(restarted: bool) -> &'static str {
+const fn cannot_head(restarted: bool) -> &'static str {
     if restarted {
         "aterm ended the agent and cannot bring it back"
     } else {
@@ -8276,7 +8314,7 @@ pub(crate) struct Activations {
 const AGENT_SLOTS: usize = Program::ALL.len();
 
 /// The slot of `agent` in [`Activations::own`].
-fn agent_slot(agent: Program) -> usize {
+const fn agent_slot(agent: Program) -> usize {
     agent as usize
 }
 
@@ -8420,7 +8458,7 @@ fn held_deadline() -> Duration {
 
 impl State {
     /// The news a host thread waiting out its restart's back-off acts on at once.
-    fn news(&self) -> (u64, u64, u64) {
+    const fn news(&self) -> (u64, u64, u64) {
         (self.cfg_gen, self.resumes, self.admission_gen)
     }
 }
@@ -8600,6 +8638,8 @@ impl HostHandle {
         drop(state);
         let mut slot = self.thread.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(running) = slot.as_ref() {
+            // The host thread ends only at shutdown (checked above): a panic of its loop
+            // restarts it in place, and a policy switched off leaves it parked. One that has
             // finished ended in a panic past that restart: start it again, with no budget.
             if !running.is_finished() {
                 return;
@@ -8667,6 +8707,7 @@ impl HostHandle {
     /// The agents whose tabs the next launch reopened after aterm ended (the crash journal, or a
     /// restart's quit layout).
     pub(crate) fn relaunch_restored(&self, restored: Vec<RestoredAgent>) {
+        // A cold restore's agents, and the rollback's: neither meets a closed queue in a
         // running window.
         let _ = queue_restored(&self.shared, &self.hooks, restored);
     }
@@ -9416,6 +9457,12 @@ fn queue_restored_guarded(
         format!("{THREAD_PREFIX}restored"),
         crate::qos::Role::Background,
         move || {
+            // ONLY WHILE THIS WORKER OWNS THE QUEUE (F1-R8-G5): it lets the
+            // queue go (`running` cleared) only under the queue's lock, at
+            // the instant it ends with nothing left to say, so a panic
+            // caught here is always one of the queue it still runs — never
+            // one after a restore queued meanwhile started a worker of its
+            // own, whose attempts (the one it steps included) this would end
             // as not relaunched while that worker went on and landed them.
             if caught(
                 "the restored agents' relaunch",
@@ -9772,6 +9819,7 @@ fn restored_step_panicked(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken,
                 return;
             }
             if only {
+                // Over as a typed line is: said, unless an agent holds the tab
                 // now, whose remedy would be typed into that agent.
                 if held {
                     (Outcome::Relaunched, RESTORED_PANIC_HELD)
@@ -10670,6 +10718,9 @@ fn host_pass(
         end_exit_watches(shared, EVERY_WATCH, |sid| off.contains(sid));
         look
     } else {
+        // A Commit's hold forgets nothing the roster last named: a pass that cannot name an
+        // agent once the host supervises again is asked the same fact as any, so the exit the
+        // Commit's stop left to the host ([`Kept::unwatched`]) is not handed for an agent that
         // still holds its tab. Supervision switched off forgets it all and watches no exit.
         if !suspended {
             host.holding.clear();
@@ -10831,7 +10882,7 @@ fn follow_at_shutdown(shared: &Shared, hooks: &Hooks) {
 }
 
 /// A generic wake always owes a full follow.
-fn full_follow_due(
+const fn full_follow_due(
     timed_out: bool,
     full_before: u64,
     full_now: u64,
@@ -11173,7 +11224,7 @@ struct HeldClock {
 
 impl HeldClock {
     /// A clock started at `now` on what `read` shows.
-    fn at(read: &HeldRead, now: Instant) -> Self {
+    const fn at(read: &HeldRead, now: Instant) -> Self {
         Self {
             progress: read.progress,
             since: now,
@@ -11283,6 +11334,14 @@ fn look_at_startups(
             }
             (_, StartupSeen::Unread) => soonest(now + STARTUP_UNREAD_LOOK),
             (StartupState::Working, StartupSeen::Holds(hold)) => {
+                // The harness's own waits count no more here than at the
+                // held deadline: an agent's exit in hand for a relaunch
+                // (the shell in front through its back-off, which a
+                // successor that never saw the worker start reads as no
+                // agent) is not judged, and the deadline falls a whole one
+                // after the last look that found it so; at a screen the
+                // harness holds an act on for a hand, no sooner than a whole
+                // one after that hold ends — a driver's counted from the
                 // last look that found it standing.
                 if books.waits.relaunching.contains(&w.sid) {
                     books.off.insert(w.sid.clone(), now);
@@ -11348,6 +11407,10 @@ fn judge_held(
         .map_or(from, |until| from.max(until));
     let due = from + books.held_after;
     if now < due {
+        // Looked at again within a relook while the clock runs: a key, a
+        // transcript row, a text that keeps its verdict and a driver's hand
+        // lifting ring no host, so the clock restarts, and the hand's grace
+        // counts, within a relook of when they moved — never a whole
         // deadline late.
         return Some(due.min(now + HELD_RELOOK));
     }
@@ -12160,6 +12223,17 @@ fn visit_workers(
                 return None;
             }
             if !wanted.contains_key(sid) {
+                // Otherwise an agent that left a tab that lives on (it holds the
+                // tab no longer: [`keep_holding`] kept every one that does) is
+                // the worker's to handle; a tab that closed (or a policy that
+                // stopped) just stops it. Each is asked once: a stop rings the
+                // bell, and one asked again at each pass woke the host at once
+                // through the worker's whole wind-down. A worker handed its exit,
+                // or whose agent was back since, is still stopped when its tab
+                // closes (the stop's word ends its relaunch's pause, and says it
+                // is no exit). A step that ran at any time since the roster was
+                // read — still running, or over already — may be what the roster
+                // missed: the absence is judged by the pass the step's end rings
                 // ([`StepsSeen`]).
                 if !steps.stepping(sid, w) {
                     if active && (hooks.acts.open)(sid) {
@@ -12776,7 +12850,7 @@ fn roster_of(store: &Store) -> Vec<(String, Program, FollowStamp)> {
 }
 
 /// Whether the host admits a worker for `agent` as the roster read it with `stamp`.
-fn admits(agent: Program, stamp: FollowStamp) -> bool {
+const fn admits(agent: Program, stamp: FollowStamp) -> bool {
     match agent {
         Program::Codex => !stamp.vendor,
         Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => true,
@@ -12886,7 +12960,7 @@ pub(crate) fn admitted_as(
 }
 
 /// Whether `agent`'s worker watches only from birth: aterm supervises no Codex.
-fn watches_only(agent: Program) -> bool {
+const fn watches_only(agent: Program) -> bool {
     match agent {
         Program::Codex => true,
         Program::Claude | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
@@ -14940,7 +15014,9 @@ impl MemoryBoard {
 }
 
 /// The sampler's pressure level as the ceiling's word for it.
-fn pressure_word(level: aterm_sysprobe::MemoryLevel) -> aterm_agent::supervise::memory::Pressure {
+const fn pressure_word(
+    level: aterm_sysprobe::MemoryLevel,
+) -> aterm_agent::supervise::memory::Pressure {
     use aterm_agent::supervise::memory::Pressure;
     match level {
         aterm_sysprobe::MemoryLevel::Normal => Pressure::Normal,
@@ -14986,15 +15062,21 @@ fn live_disk(store: Store, note: Arc<NoteFn>) -> Arc<DiskFn> {
     });
     let board_store = Arc::clone(&store);
     let watch = disk_watch(store, note, &LOOKING, run);
-    let look: Arc<DiskFn> = Arc::new(move |sids: &[String]| {
+    // The minute's tick takes the facts ring's row; a poke between ticks refreshes the board
+    // alone, so the ring stays a row a minute.
+    let looked = Arc::new(move |sids: &[String], kind: crate::occupancy_host::Look| {
         *DISK_SIDS.lock().unwrap_or_else(PoisonError::into_inner) = sids.to_vec();
         let unix_ms = aterm_time::unix_millis()
             .and_then(|ms| i64::try_from(ms).ok())
             .unwrap_or(0);
-        crate::occupancy_host::look(unix_ms, &board_sessions(&board_store, sids));
+        crate::occupancy_host::look(unix_ms, &board_sessions(&board_store, sids), kind);
         watch(sids);
     });
-    let poked = Arc::clone(&look);
+    let tick = Arc::clone(&looked);
+    let look: Arc<DiskFn> =
+        Arc::new(move |sids: &[String]| tick(sids, crate::occupancy_host::Look::Tick));
+    let poked: Arc<DiskFn> =
+        Arc::new(move |sids: &[String]| looked(sids, crate::occupancy_host::Look::Poke));
     aterm_agent::harness::disk::poke::set_handler(Arc::new(move |cause| {
         static POKE_PENDING: AtomicBool = AtomicBool::new(false);
         aterm_log::info!("harness disk watch: poked, {}", cause.describe());
@@ -15317,8 +15399,10 @@ const DISK_SHORT_LOOKS: u32 = 2;
 static DISK_NOTES_SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 static DISK_PRIVATE_SAID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// What a look of a process that is not the owner's watch ([`disk_private`]: `private`, the rule
-/// that made it so) that would pass otherwise.
+/// What a look of a process that is not the owner's watch
+/// ([`disk_private`]: `private`, the rule that made it so) that would pass
+/// otherwise says of why it removes nothing, naming the rule as it is
+/// ([`DiskPrivate::why`]).
 fn disk_private_line(
     private: Option<DiskPrivate>,
     below_warn: bool,
@@ -15440,6 +15524,7 @@ fn disk_look(
     }
     disk_sightings(board, seen, level, free, &state, now);
     if level == Level::Unknown {
+        // An unreadable volume proves neither pressure nor recovery. Keep
         // the prior episode, alerts, pending poke and pass backoff intact.
         return;
     }
@@ -15509,6 +15594,7 @@ fn disk_look(
             room.unwrap_or(0),
         );
     if !due {
+        // Back above the floor with no pass due: the run of short passes
         // ends, and with it the owner's low-disk line.
         if reading.at_or_above_floor(free)
             && let Some(told) = disk_look_without_pass(&reading, free, &DISK_RUNS)
@@ -16138,7 +16224,7 @@ pub(crate) enum DiskPrivate {
 impl DiskPrivate {
     /// Why the watch removes nothing, whole:
     /// `this instance <rule>: it measures and removes nothing`.
-    pub(crate) fn why(self) -> &'static str {
+    pub(crate) const fn why(self) -> &'static str {
         match self {
             Self::StateRoot => {
                 "this instance runs under a private state root (ATERM_STATE_HOME): it measures \
@@ -17082,7 +17168,7 @@ pub(crate) fn live_accounts_upkeep() -> AccountsUpkeep {
 /// The live upkeep only where the instance runs as its account's own (`not_own` is `None`)
 /// or the development seam `accounts_sync::UPKEEP_SEAM` was admitted (`seam`); every test
 /// binary, test world, `lab instance` and isolated launch gets the inert one.
-fn accounts_upkeep_arm(not_own: Option<&str>, seam: bool) -> AccountsUpkeep {
+const fn accounts_upkeep_arm(not_own: Option<&str>, seam: bool) -> AccountsUpkeep {
     if not_own.is_none() || seam {
         AccountsUpkeep::Live
     } else {
@@ -17265,7 +17351,7 @@ enum ActivationStart {
 }
 
 impl ActivationStart {
-    fn next(&self) -> Option<Instant> {
+    const fn next(&self) -> Option<Instant> {
         match self {
             Self::Pending(pending) => Some(pending.at),
             _ => None,
@@ -17309,6 +17395,7 @@ fn try_activation_start(shared: &Arc<Shared>, hooks: &Hooks, now: Instant) -> Op
         let Some(arm) = arm else { return };
         let (trigger, wait) = arm(&host);
         if let Some(trigger) = trigger {
+            // Publish before the shutdown check: a concurrent shutdown either pulls this
             // trigger or is observed below, so the first wait cannot strand the worker.
             let _ = host.shared.wake.set(trigger);
         }

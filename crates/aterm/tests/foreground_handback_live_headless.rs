@@ -125,6 +125,8 @@ impl Job {
             }
             Job::Armed(arm, n) => {
                 // SAFETY: the default disposition, then this thread's mask: a
+                // SIGINT sent to the job's group reaches this thread whatever
+                // the inherited mask of the others.
                 unsafe {
                     libc::signal(libc::SIGINT, libc::SIG_DFL);
                     let mut set: libc::sigset_t = std::mem::zeroed();
@@ -145,6 +147,8 @@ impl Job {
             }
             Job::Vim => {
                 // Checked: a vim that did not run is never answered, so the lane cannot
+                // pass having run no vim (docs/DESIGN-init-system-2026-10-20.md §8,
+                // rule 5).
                 let ran = aterm_spec::host::find_tool("vim").map(|vim| {
                     #[expect(
                         clippy::disallowed_types,
@@ -175,7 +179,8 @@ fn kill_self() -> ! {
         libc::kill(libc::getpid(), libc::SIGKILL);
     }
     loop {
-        // SAFETY: `pause` blocks this thread until a signal arrives; the SIGKILL sent above ends.
+        // SAFETY: `pause` blocks this thread until a signal arrives; the
+        // SIGKILL sent above ends the process there.
         unsafe {
             libc::pause();
         }

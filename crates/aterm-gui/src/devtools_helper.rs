@@ -30,7 +30,7 @@ pub(crate) const COLD_START_SETTLE: Duration = Duration::from_secs(5);
 
 /// Whether now is a moment to put System Settings in front of the owner unasked: an aterm window is focused (they are looking at aterm, not at another app's work), the owner is present ([`PRESENT_WITHIN`]) but not typing or pointing ([`QUIET_FOR`]), this process has settled ([`Lane::settled`]: a successor an update just brought in is not "quiet" the second it starts), and no update hand-off is pending or in flight.
 #[must_use]
-pub(crate) fn quiet(
+pub(crate) const fn quiet(
     focused: bool,
     input_within_quiet: bool,
     input_within_presence: bool,
@@ -1728,7 +1728,7 @@ fn live_grant_stable() -> bool {
     crate::signing_identity::running_dr_class_if_warm().grant_stable()
 }
 
-fn inert_open_pane() -> bool {
+const fn inert_open_pane() -> bool {
     false
 }
 
@@ -1736,25 +1736,25 @@ fn inert_list_terminal() -> Result<(), String> {
     Err("not run on this instance".to_string())
 }
 
-fn inert_read_list(_gate: ProbeGate, _subject: &str) -> DevToolList {
+const fn inert_read_list(_gate: ProbeGate, _subject: &str) -> DevToolList {
     DevToolList::refused(DevToolListLabel::RefusedDisabled)
 }
 
-fn inert_last_opened() -> Option<(String, u64)> {
+const fn inert_last_opened() -> Option<(String, u64)> {
     None
 }
 
-fn inert_opened_within(_window_s: u64) -> Option<u64> {
+const fn inert_opened_within(_window_s: u64) -> Option<u64> {
     None
 }
 
-fn inert_note(_version: &str) {}
+const fn inert_note(_version: &str) {}
 
-fn inert_not_declined() -> Option<(u64, u64)> {
+const fn inert_not_declined() -> Option<(u64, u64)> {
     None
 }
 
-fn inert_no() -> bool {
+const fn inert_no() -> bool {
     false
 }
 
@@ -1832,7 +1832,7 @@ fn live_fda_note_declined(version: &str) {
     atpkg::devtools::FULL_DISK_ACCESS.note_declined(version);
 }
 
-fn inert_drag_bundle(_subject: Option<&str>) -> Option<PathBuf> {
+const fn inert_drag_bundle(_subject: Option<&str>) -> Option<PathBuf> {
     None
 }
 
@@ -1901,9 +1901,9 @@ fn inert_show(_content: &Content, _events: PanelEvents) -> bool {
     false
 }
 
-fn inert_update(_content: &Content) {}
+const fn inert_update(_content: &Content) {}
 
-fn inert_unit() {}
+const fn inert_unit() {}
 
 #[derive(Debug, Default)]
 struct Shared {
@@ -2128,7 +2128,7 @@ impl Lane {
     }
 
     /// This process was started by the owner, not brought in by an update: its first quiet moment may come [`COLD_START_SETTLE`] after it was made.
-    pub(crate) fn note_cold_start(&mut self) {
+    pub(crate) const fn note_cold_start(&mut self) {
         self.settle = COLD_START_SETTLE;
     }
 
@@ -2167,7 +2167,7 @@ impl Lane {
     }
 
     /// A focus gain: another process (`aterm doctor`) may have written the markers since, so the next [`Self::last_opened_at`] and [`Self::declined_marker`] read them again.
-    pub(crate) fn forget_opened(&mut self) {
+    pub(crate) const fn forget_opened(&mut self) {
         self.opened = None;
         self.declined = None;
     }
@@ -2251,7 +2251,7 @@ impl Lane {
     }
 
     /// The window answered a control verb's `now` at `now`, with its panel or without it.
-    pub(crate) fn noted_now_answered(&mut self, now: Instant) {
+    pub(crate) const fn noted_now_answered(&mut self, now: Instant) {
         self.now_answered = Some(now);
     }
 
@@ -2328,7 +2328,7 @@ impl Lane {
     }
 
     /// The probe the waiting Full Disk Access hand-over judges by is being read again: look at `at`, not now (a look on a pending read would refuse it as unknown).
-    pub(crate) fn defer_fda(&mut self, at: Instant) {
+    pub(crate) const fn defer_fda(&mut self, at: Instant) {
         if let Some(queued) = self.fda_queued.as_mut() {
             queued.next_check = at;
         }
@@ -2367,7 +2367,7 @@ impl Lane {
     }
 
     /// How the last Full Disk Access panel ended, once: the window's launch warm-up takes it.
-    pub(crate) fn take_fda_ended(&mut self) -> Option<FdaEnded> {
+    pub(crate) const fn take_fda_ended(&mut self) -> Option<FdaEnded> {
         self.fda_ended.take()
     }
 
@@ -2820,7 +2820,7 @@ pub(crate) mod live {
         })
     }
 
-    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+    const fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect {
             origin: CGPoint { x, y },
             size: CGSize {
@@ -2834,7 +2834,7 @@ pub(crate) mod live {
         rect(r.x, r.y, r.w, r.h)
     }
 
-    fn from_cg(r: CGRect) -> Rect {
+    const fn from_cg(r: CGRect) -> Rect {
         Rect {
             x: r.origin.x,
             y: r.origin.y,

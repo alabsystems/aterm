@@ -1,18 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Present-real parity: the same `RenderInput` presented through a copyable
-// swapchain with the video tap and through the headless virtual target
-// (`present_virtual`) yields byte-identical harvested frames. Both arms share
-// the `present_to_view` compose-and-blit seam; this suite catches drift
-// between them (a missing pass, a format/size divergence, a tap rewire).
-//
-// The swapchain arm is `present_swapchain_standin_for_test`: the real
-// `present_input` path after acquire, against a texture configured like a
-// copyable swapchain (`RENDER_ATTACHMENT | COPY_SRC`, the
-// `pick_surface_format` SDR default); only the pixel-free `present()` is absent.
-//
-// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};
@@ -22,13 +9,9 @@ use aterm_render::{
     premul_rgb,
 };
 
-// The wgpu present-theorem harness (its stand-in textures and taps are
-// wgpu-typed). The Metal twin is the armed differentials
-// (`metal_present_bytes_for_test` and the tap-ring differential).
 use crate::common::wgpu_oracle as gpu;
 
-/// The pixels of `rect` in a straight-RGBA8 surface `surface_w` pixels wide,
-/// rows packed: what a capture cut to that rect encodes.
+/// The pixels of `rect` in a straight-RGBA8 surface `surface_w` pixels wide, rows packed.
 fn cut_rgba8(rgba: &[u8], surface_w: usize, rect: PixelRect) -> Vec<u8> {
     (rect.y..rect.y + rect.height)
         .flat_map(|y| {
@@ -47,8 +30,7 @@ fn opts(half_res: bool) -> CaptureOpts {
     }
 }
 
-/// The two takes agree on geometry, frame count and every frame's bytes
-/// (timestamps excluded).
+/// The two takes agree on geometry, frame count and every frame's bytes (timestamps excluded).
 fn assert_takes_byte_identical(label: &str, swap: &VideoTake, virt: &VideoTake) {
     assert_eq!(
         (swap.w, swap.h, swap.device_px, swap.half_res, swap.format),
@@ -73,10 +55,7 @@ fn assert_takes_byte_identical(label: &str, swap: &VideoTake, virt: &VideoTake) 
     }
 }
 
-/// Present every input of `seq` through both arms (fresh per-window state,
-/// tap armed throughout) and require byte-identical harvests.
-/// `reset_glow_ease_for_test` runs before each arm so the SDR crown's
-/// wall-clock attack envelope starts equal.
+/// Present every input of `seq` through both arms.
 fn round(
     label: &str,
     gpu: &mut aterm_gpu::GpuRenderer,
@@ -85,7 +64,6 @@ fn round(
     h: u32,
     half_res: bool,
 ) -> (VideoTake, VideoTake) {
-    // Arm A: the copyable-swapchain present with the tap.
     let mut win_a = aterm_gpu::WindowGpu::new();
     gpu.video_begin_standin_for_test(&mut win_a, w, h, opts(half_res))
         .expect("standin tap");
@@ -96,7 +74,6 @@ fn round(
     }
     let take_a = gpu.video_finish(&mut win_a).expect("swapchain take");
 
-    // Arm B: the headless virtual present with the tap.
     let mut win_b = aterm_gpu::WindowGpu::new();
     gpu.virtual_begin(&mut win_b, w, h, opts(half_res))
         .expect("virtual tap");
@@ -119,10 +96,7 @@ fn round(
     (take_a, take_b)
 }
 
-/// Add the full fire effect stack to a base text frame: glow quads, radial
-/// halos, under-glyph flame body, charred glyph cores, a per-pixel fire patch
-/// with the glyph contrast-halo it engulfs, a comet trail and the fire
-/// block-fill override.
+/// Add the full fire effect stack to a base text frame.
 fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
     let fire = 0x00FF_6A00; // warm ember orange
     for (i, a) in [60u8, 120, 190, 240].iter().enumerate() {
@@ -133,13 +107,11 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(fire, *a),
-            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(fire, *a),
             alpha2: 0,
         });
     }
-    // A radial halo (ember) centred over the glow, spanning its row band.
     input.glow_halo.push(RainHalo {
         row: 1,
         x: (2 * cw) as u16,
@@ -153,7 +125,6 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
         ry: ch.max(1) as u16,
         mode: HaloMode::Add,
     });
-    // Under-glyph flame body + a charred core on the engulfed glyph.
     input.glow_under.push(GlowQuad {
         row: 2,
         x: (2 * cw) as u16,
@@ -161,7 +132,6 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
         w: (2 * cw) as u16,
         h: ch as u16,
         color: premul_rgb(fire, 150),
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: premul_rgb(fire, 150),
         alpha2: 0,
@@ -171,8 +141,6 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
         col: 2,
         fg: 0x0020_100A,
     });
-    // A live fire patch plus contrast-halo strength on the engulfed glyph,
-    // covering the fire-field pass and the glyph_halo pass.
     input.fire_patch.push(FirePatch {
         row: 2,
         x: (2 * cw) as u16,
@@ -194,7 +162,6 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
         col: 2,
         strength: 220,
     });
-    // The cadence-comet body and the fire block fill.
     input.cursor_trail.push(TrailCell {
         row: 1,
         col: 1,
@@ -204,8 +171,6 @@ fn add_fire_stack(input: &mut RenderInput, cw: usize, ch: usize) {
     input.cursor_fill_override = Some(fire);
 }
 
-/// A plain text frame plus a scissored second present (one changed row): the
-/// base compose, letterbox blit and dirty-row repaint agree between arms.
 #[test]
 fn present_real_theorem_text_and_scissored_present() {
     let mut gpu = gpu(16.0, Theme::default());
@@ -225,7 +190,6 @@ fn present_real_theorem_text_and_scissored_present() {
         fh as u32,
         false,
     );
-    // Non-vacuity: the scissored second present repainted the changed rows.
     let (f1, f2) = (&take_a.frames[0], &take_a.frames[1]);
     assert!(
         f1.rgba != f2.rgba,
@@ -233,11 +197,6 @@ fn present_real_theorem_text_and_scissored_present() {
     );
 }
 
-/// A raw window a few pixels larger than its integer-cell frame (common after
-/// a font zoom), driven through the production present seam: every harvested
-/// swapchain pixel equals the CPU placement reference. The OSC-11 background
-/// distinguishes the bands from the theme, and the coloured bottom-right cell
-/// makes clipping of trailing content observable.
 #[test]
 fn production_present_resolves_odd_bands_and_trailing_content() {
     let theme = Theme::default();
@@ -248,17 +207,10 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
 
     let (rows, cols) = (6usize, 28usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // A live background that is intentionally not `Theme::default().bg` pins
-    // the present bands to the frame's OSC-11 colour.
     term.process(b"\x1b]11;rgb:2222/4444/6666\x1b\\");
     term.process(b"$ production present +7px");
-    // No padding and a vivid last-cell background make the final columns and
-    // rows non-background. Wrap and cursor are off so the write neither
-    // scrolls nor covers the sentinel cell.
     term.process(b"\x1b[?7l\x1b[?25l\x1b[6;28H\x1b[48;2;255;0;255m \x1b[0m");
     let mut input = term.cell_frame(rows, cols);
-    // `cell_frame` leaves this unset; the GUI fills it from live terminal
-    // colours before presenting, so the band must follow OSC 11.
     input.default_bg = 0x0022_4466;
     let live_bg = input.default_bg & 0x00ff_ffff;
     assert_ne!(
@@ -267,8 +219,6 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
         "OSC 11 must make the live-band check non-vacuous"
     );
 
-    // Read the exact offscreen source, then let the CPU's production twin place
-    // it into a raw-window destination with an odd 3/4 remainder split.
     let mut source_win = aterm_gpu::WindowGpu::new();
     let source = gpu.render_input(&mut source_win, &input, None);
     let (fw, fh) = (source.width, source.height);
@@ -291,8 +241,6 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
         0..0,
     );
 
-    // The real swapchain present seam, not the dedicated blit helper: it includes
-    // the production viewport/scissor and video-introspection copy.
     let mut present_win = aterm_gpu::WindowGpu::new();
     gpu.video_begin_standin_for_test(&mut present_win, dw as u32, dh as u32, opts(false))
         .expect("standin tap");
@@ -337,14 +285,8 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
         &expected_rgba[..16]
     );
 
-    // Non-vacuity for the clipping sentinel: the expected bottom-right source
-    // pixel is magenta, not the live band colour.
     assert_eq!(source.pixels[fw * fh - 1] & 0x00ff_ffff, 0x00ff_00ff);
 
-    // The capture crop inverts the placement: the presented destination cut at
-    // the frame's placement is the source frame, byte for byte. Negative
-    // control: the same cut one pixel to the right misses it (the magenta
-    // sentinel makes the frame's last column differ from the band).
     let place = frame_placement(dw, dh, fw, fh);
     let cut = |place: aterm_render::FramePlacement| {
         let rect = place
@@ -364,9 +306,6 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
         "a cut one pixel off the placement is not the frame"
     );
 
-    // Tier-1 conformance: project this odd-band present onto the bounded
-    // SurfaceCoverage model (frame=4, raw surface=5). The four raw corners
-    // witness the live OSC-11 band.
     let live_rgba = [0x22, 0x44, 0x66, 0xff];
     let pixel = |x: usize, y: usize| {
         let start = (y * dw + x) * 4;
@@ -390,8 +329,6 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
         "shipping GPU pixels must implement the ty-proven full-surface transition"
     );
 
-    // Negative control: a frame-sized viewport covers only the logical frame
-    // and leaves the band stale; both invariants reject it.
     let mut old_frame_viewport = model.init_state();
     assert!(model.fire("Zoom", &mut old_frame_viewport));
     old_frame_viewport.insert("covered", 4);
@@ -401,11 +338,6 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     assert!(!model.check_invariant("RemainderUsesLiveBackground", &old_frame_viewport));
 }
 
-/// A destination smaller than its frame on both axes (a transient resize):
-/// the production present crops the frame centred, and the destination cut at
-/// the frame's placement is exactly the frame's visible intersection, the
-/// source sub-rect at the placement's leading crop. Negative control: the
-/// sub-rect one pixel further in is not what the glass shows.
 #[test]
 fn overflowing_frame_crop_is_the_visible_intersection() {
     let theme = Theme::default();
@@ -482,9 +414,6 @@ fn overflowing_frame_crop_is_the_visible_intersection() {
     );
 }
 
-/// A one-shot exact-destination capture during an active video does not
-/// perturb the recorder: both copies are appended after the final pass in
-/// the same encoder and harvest identical bytes.
 #[test]
 fn one_shot_presented_snapshot_is_independent_from_video() {
     let mut gpu = gpu(16.0, Theme::default());
@@ -527,12 +456,6 @@ fn one_shot_presented_snapshot_is_independent_from_video() {
     );
 }
 
-/// A VIRTUAL DESTINATION'S SNAPSHOT HOLDS THE BYTES ITS WINDOW REPORTS
-/// BEFORE IT IS TAKEN. `WindowGpu::virtual_snapshot_bytes`, which a capture's
-/// admission reserves for it, is the allocation of the destination
-/// `virtual_presented_snapshot_current` returns: rows padded to the copy
-/// alignment, which a nine-cell frame (no multiple of 64 texels) exercises.
-/// NEGATIVE CONTROL: a window with no virtual destination reports none.
 #[test]
 fn a_virtual_snapshot_holds_the_bytes_its_window_reports() {
     let mut gpu = gpu(16.0, Theme::default());
@@ -564,14 +487,10 @@ fn a_virtual_snapshot_holds_the_bytes_its_window_reports() {
     let _ = gpu.video_finish(&mut win);
 }
 
-/// The full fire stack at full res with GPU bloom and the SDR glow-boost crown
-/// on: every swapchain-only pass agrees byte-for-byte between the arms.
 #[test]
 fn present_real_theorem_fire_glow_bloom_halo_crown() {
     let mut gpu = gpu(16.0, Theme::default());
     gpu.set_bloom(true);
-    // Heat shimmer stays on with its wall-clock phase pinned, so both arms
-    // compose the same refraction.
     gpu.set_shimmer_phase_for_test(Some(0.40));
     gpu.set_sdr_glow_boost(0.5);
     let (rows, cols) = (6usize, 28usize);
@@ -582,7 +501,6 @@ fn present_real_theorem_fire_glow_bloom_halo_crown() {
     add_fire_stack(&mut input, cw, ch);
     let (fw, fh) = gpu.frame_size(rows, cols);
 
-    // A bare control frame first, so the fire variant provably changes pixels.
     let bare = term.cell_frame(rows, cols);
     let (bare_take, _) = round(
         "fire-control",
@@ -604,8 +522,6 @@ fn present_real_theorem_fire_glow_bloom_halo_crown() {
         bare_take.frames[0].rgba != fire_take.frames[0].rgba,
         "the fire stack must actually land in the captured bytes (non-vacuous)"
     );
-    // The fire reads warm somewhere (a pixel hotter in red than blue, the ember
-    // ramp), so the parity claim covers lit pixels.
     let warm = fire_take.frames[0]
         .rgba
         .as_chunks::<4>()

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Atomic absent-only publication. An ordinary rename can replace an empty
-//! directory, so an existence probe cannot safely admit a staged repository.
+//! Atomic absent-only directory rename.
 
 use std::io;
 use std::path::Path;

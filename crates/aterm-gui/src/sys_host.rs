@@ -936,7 +936,7 @@ fn root_size(r: &crate::diskwalk_host::RootRecord, now: Instant) -> RootSize {
 }
 
 /// A walker refusal as one of `sys`'s disk unavailable words (§13.4).
-fn refusal_word(why: aterm_diskwalk::Refusal) -> &'static str {
+const fn refusal_word(why: aterm_diskwalk::Refusal) -> &'static str {
     use aterm_diskwalk::Refusal;
     match why {
         Refusal::Protected => "protected",
@@ -1031,6 +1031,8 @@ pub(crate) fn cmd_sys(
         Err(usage) => return usage.to_owned(),
     };
     if q.name.is_some() {
+        // Tier B (§11.8) names a job's wait with one sample(1) on request;
+        // this build's host hands the engine no namings yet, so the rows'
         // `named=` stays not_sampled and so does the request.
         return "ERR unavailable name why=not_sampled\n".to_owned();
     }
@@ -1277,6 +1279,7 @@ fn await_machine(
     loop {
         let (held, freshness) = shared.fresh(AWAIT_PERIOD, false);
         if freshness != Freshness::Fresh {
+            // A failed refresh says nothing of the condition now, and a
             // hold cannot bridge the interval no fresh sample measured.
             state.latch = Latch::default();
         }

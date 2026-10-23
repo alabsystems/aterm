@@ -5,14 +5,7 @@
 
 use aterm_spec::derive::Model;
 
-/// Two always-backlogged sessions, four pages per interval. `Control` is the roster's local and
-/// addressed work, which precedes replay. `QueuePriority` is a halt, local event, addressed
-/// message or closure arriving during replay; the roster may finish one page, then must yield.
-/// `FetchA/B` choose the next sid strictly after the last served one and spend one shared page.
-/// A pushed opt-in may take one page in its event turn; a roster round takes the shared
-/// remainder after controls. `Buggy=1` is per-session replay: before control, repeated pages
-/// for one sid, more than one interval's pages at once. Tier-1 drives the shipping `SayReplay`
-/// selector, which the bridge's roster path calls after its status, topic and outbox work.
+/// Formal model of the shared Fabric `SayReplay` page budget across backlogged sessions.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn say_replay_budget_model() -> Model {

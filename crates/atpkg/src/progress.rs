@@ -435,6 +435,7 @@ impl ProgressSink {
     pub fn extract_add(&self, program: &str, n: u64) {
         self.with(|s| {
             // A download credit for this program is complete the moment extraction
+            // starts (the asset fully landed before its sha256 could pass).
             if let Some(credit) = s.dl.get_mut(program)
                 && credit.1 > 0
             {
@@ -1032,6 +1033,7 @@ pub fn watch_download(program: &str, asset_path: &Path, total: u64) -> DownloadW
                     sink.download_bytes(&program, m.len(), total);
                 } else {
                     // No .part (yet, or a dir-registry copy): still let the sink
+                    // refresh its heartbeat through the rate-cap policy.
                     sink.download_bytes(&program, 0, total);
                 }
                 tick_or_stop(&stop2, tick);

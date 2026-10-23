@@ -186,7 +186,9 @@ pub fn prune(state: &Path, name: &str, now: u64) -> bool {
 /// A stamp's file name, before its tab key: `asked-<tab>.json`.
 const FILE_PREFIX: &str = "asked-";
 
-/// The kernel's start time of `pid` in the spelling the harness's snapshot names an agent.
+/// The kernel's start time of `pid` in the spelling the harness's snapshot names an agent by
+/// (`relaunch::Snapshot::start`: `ps -o lstart=` in UTC and the C locale, whitespace squashed), so
+/// a stamp and a snapshot of the same process compare equal.
 #[must_use]
 pub fn kernel_start(pid: u32) -> Option<String> {
     #[cfg(any(target_vendor = "apple", windows))]

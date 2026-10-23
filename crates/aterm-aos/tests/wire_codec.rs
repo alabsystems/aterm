@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The canonical wire codec: every field round-trips, and every non-canonical byte string is
-//! refused with the exact fault, naming its field, without panicking.
+//! Wire codec round-trip and non-canonical rejection tests.
 
 use core::time::Duration;
 
@@ -267,16 +266,13 @@ fn every_byte_flip_of_an_identity_is_refused_or_decodes_to_another_identity() {
             bad[at] ^= mask;
             let mut d = Dec::new(&bad);
             if let Ok(other) = d.identity() {
-                // A flip inside a name, version or digest is a different identity, never
-                // the same one read from other bytes.
                 assert_ne!(other, id, "byte {at} mask {mask:#x}");
             }
         }
     }
 }
 
-/// One value written field by field into an encoder, so the same writes can go to a fresh
-/// encoder and to a reused one.
+/// Writes a composite test value into `e`.
 fn write_value(e: &mut Enc, n: u64) {
     e.u8(u8::try_from(n % 251).unwrap_or(0));
     e.u64(n.wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -286,9 +282,7 @@ fn write_value(e: &mut Enc, n: u64) {
     });
 }
 
-/// An encoder reused across values (as the replay, the trace digest and the live host reuse
-/// one) holds after `clear` exactly what a fresh encoder holds after the same writes,
-/// whether the value before it was longer or shorter, and `reserve` writes nothing.
+/// A cleared encoder produces the same bytes as a fresh encoder.
 #[test]
 fn a_cleared_encoder_writes_what_a_fresh_encoder_writes() {
     let mut reused = Enc::new();

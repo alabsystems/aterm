@@ -197,6 +197,7 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
         match (&row.restores, killed) {
             (Some(r), true) => {
                 // A recovery that refused every offer brought nothing back: its refusals
+                // count against `exact` and `no-miss`, and it is no recovered kill.
                 if r.recovered() > 0 {
                     kills_recovered = kills_recovered.saturating_add(1);
                     kills_in_flight =
@@ -214,6 +215,9 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
             }
             (None, true) if row.keeper == Some(KeeperAtLaunch::On) => {
                 // The killed run's own row, when the ledger still holds it: was its keeper
+                // link on? Then its terminals were registered with whichever keeper answered
+                // it, at boot (`on`), at its Commit (`armed`) or since (`absent`: the link
+                // registers with the first keeper that answers).
                 let Some(killed_pid) = row.prev.pid else {
                     continue;
                 };

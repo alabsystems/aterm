@@ -3079,6 +3079,7 @@ fn open_work_read_as(tail: &str, land: Option<&[LandFamily]>, defense: bool) -> 
                 let mut items: Vec<&str> = Vec::new();
                 while let Some(under) = lines.get(j) {
                     if under.block {
+                        // Land's reading: a code block right under a bare
                         // head is its item (`Still to do:` over a command).
                         if items.is_empty() {
                             items.push(&under.words);
@@ -4160,6 +4161,7 @@ fn question_open(s: &str, rest: &str, leftover: bool) -> bool {
         .collect();
     if wh {
         if second == "about" {
+            // `What about the docs? Merged with the fix.`: a thing's state,
             // which only its landing answers (the answer is read on its own).
             return leftover || !lands(&told);
         }
@@ -5903,6 +5905,8 @@ fn onto_branch(after: &[&str]) -> bool {
         return false;
     }
     if then.is_some_and(|w| matches!(w, "main" | "master")) {
+        // An integration branch's own main (`pushed to the staging main`)
+        // is off main; a repository's is main (`pushed to
         // example-org/codex-alab main`).
         return BRANCHES.contains(&name);
     }
@@ -6551,6 +6555,7 @@ fn settled(s: &str, from: usize, to: usize, st: &Stand<'_>) -> bool {
         .iter()
         .any(|p| st.word.starts_with(p))
     {
+        // A lack negates its own clause: `not all of the comments were
         // addressed` settles nothing.
         return false;
     }
@@ -6773,6 +6778,7 @@ fn settlers(st: &Stand<'_>, np: &[&str]) -> Vec<&'static str> {
     };
     let change = np.iter().any(|w| CHANGE_NOUNS.contains(w)) || CHANGE_NOUNS.contains(&st.word);
     if st.word == "stray" {
+        // A stray thing is junk, a stray commit too: gone is done (`the stray
         // debug print is removed`, `the stray debug commit was dropped`).
         out.extend(["removed", "deleted", "gone", "dropped"]);
     } else if change {
@@ -6783,6 +6789,9 @@ fn settlers(st: &Stand<'_>, np: &[&str]) -> Vec<&'static str> {
             .split(' ')
             .any(|w| matches!(w, "issue" | "issues" | "ticket" | "tickets"))
     {
+        // An issue (`the tracking issue`), or a bare number, which names
+        // one as often as a change: its fix or its close settles it (`#45
+        // is closed`); a number a change noun names (`PR #45 is closed`) is
         // a change, settled only by landing.
         out.extend(["fixed", "resolved", "closed"]);
     } else {
@@ -7481,6 +7490,7 @@ fn excepted(s: &str, st: &Stand<'_>) -> bool {
     }
     let next = s[st.end()..].split_whitespace().next().map(bare);
     if st.word == "without" {
+        // Only a thing left out after a comma: `all on main, without the
         // docs`, never `ran on main without a crash`.
         return before.ends_with(',') && next.is_some_and(|n| STRONG.contains(&n));
     }
@@ -11813,6 +11823,7 @@ impl TurnEndState {
     }
 
     pub(crate) fn park_off(&mut self) {
+        // A landing holds past the park only while its words do
         // ([`Self::off_landing`]).
         if self.landed() {
             self.off_landing = Some(self.landed_mark);
@@ -13092,6 +13103,8 @@ impl TurnEndState {
         let worked_to_wall =
             !awaited_command && reading.worked.is_some_and(|w| w >= self.timing.progress);
         if !self.point_judged(reading, now) {
+            // No point yet: the wall it shows is tracked all the same (taking up a latch a
+            // loop before this one left, as the first wall this state sees does), and an
             // act awaited is answered by it ([`Awaited::met`]).
             if let Some(kind) = reading.wall {
                 let unmade_seeded = std::mem::take(&mut self.account_unmade_seed);
@@ -13154,6 +13167,12 @@ impl TurnEndState {
         let act_taken = self.awaiting.is_some_and(|a| a.taken) || reading.worked.is_some();
         let awaited = self.awaiting.take().map(|a| a.rule);
         if awaited.is_some() || reading.worked.is_some() {
+            // THE VENDOR'S OWN CONTINUATION of the limit that cut it (Claude
+            // Code's `Usage limit reset · continuing automatically`, no `❯`
+            // row) delivers it again, as the wall's retry does: the turn
+            // that ran here, no act of this policy's awaited, is its answer
+            // (read as a turn nobody asked, its done reply
+            // was a first one — the check typed a second time, under Land a
             // nudge).
             if awaited.is_none()
                 && reading.wall.is_none()
@@ -13329,6 +13348,7 @@ impl TurnEndState {
                 if !(delivers && is_wall_retry(rule)) {
                     self.followed = Some(rule);
                 } else if self.followed.is_none() {
+                    // The check a loop before this one typed, a wall having
                     // cut it: its retry, typed here, delivers it again.
                     self.followed = self.seeded_check;
                 }
@@ -13397,6 +13417,7 @@ impl TurnEndState {
                     self.carrying = false;
                 }
                 if let Some(at) = seeded_point.filter(|_| same_point) {
+                    // The point a loop before this one judged: its streak
                     // and its time ([`Self::seed_point`]).
                     self.new_point(at);
                 } else {
@@ -13499,6 +13520,9 @@ impl TurnEndState {
                 .clone()
                 .filter(|_| (claim || unlanded_by_repo) && !repo_theirs);
             if reading.wall.is_none() && !reading.pending_input {
+                // Someone else's turn on someone's prompt (`prompted`): the
+                // person answered what stood. A turn nobody asked — Claude
+                // Code's own wake, the vendor's continuation of a limit —
                 // answered nothing.
                 if awaited.is_none() && reading.worked.is_some() && prompted {
                     self.needs = Needs::default();
@@ -13658,6 +13682,7 @@ impl TurnEndState {
                     self.wall = None;
                     self.fallback_unmade = false;
                 } else if interrupted && let Some(t) = self.wall.as_mut() {
+                    // The `/login` left: the rest of this loss is the
                     // owner's, told as a sign-in cancelled.
                     t.login.cancelled = true;
                 } else if reading.login_back
@@ -13678,6 +13703,9 @@ impl TurnEndState {
                         && limit_conversation_ours(t, reading)
                         && t.named.is_some_and(|n| n.moved_off_under(reading, &t.said))
                 }) {
+                    // A person's `/model` since the bucket's notice: the
+                    // session left the model the bucket limits, and its reset
+                    // binds nothing ([`named_class`]); the point goes at
                     // once ([`decide_turn_end`]).
                     t.named = None;
                 } else if let Some((t, seat_now)) = {
@@ -13791,6 +13819,8 @@ impl TurnEndState {
     }
 
     fn answered_unseen(&self, reading: &TurnEndReading, now: Instant) -> Option<Duration> {
+        // A common continuation/check row in another or unread conversation
+        // is not proof that this wall's awaited act ran. Actual observed work
         // is supplied independently by the caller and keeps its normal rule.
         if self
             .wall
@@ -14710,6 +14740,7 @@ fn classify_said_read(tail: &str) -> Said {
     let lower = yes_no_asks(&tail.to_lowercase().replace('’', "'"));
     let flat = lower.split_whitespace().collect::<Vec<_>>().join(" ");
     if let Some(p) = STOP_PHRASES.iter().find(|p| flat.contains(*p)) {
+        // A stop naming a destructive act anywhere asks consent to it; its
         // answer must consent to nothing irreversible.
         if let Some(w) = destructive_word(&flat) {
             return Said::Irreversible(format!("the worker said \"{p}\" of an act that would {w}"));
@@ -14967,7 +14998,8 @@ pub fn done_check_text(rules: Option<&str>, irreversible: bool) -> String {
     act_words(DONE_CHECK, &[reversible_clause(irreversible)], rules)
 }
 
-/// Whether `typed`.
+/// Whether `typed` — a prompt's words as a transcript keeps them — is the
+/// done check.
 #[must_use]
 pub fn is_done_check(typed: &str) -> bool {
     let typed = typed.trim();
@@ -15246,6 +15278,9 @@ pub fn decide_turn_end_traced(
     now: Instant,
     trace: &mut dyn Trace,
 ) -> TurnEndAction {
+    // AUTOPILOT OFF: the harness keeps its hands off the session — plain
+    // Claude Code. Nothing typed, waited for, restarted or escalated,
+    // whatever the screen shows: a wall, a memory banner, an owed act or
     // an open switch included.
     if reading.autopilot == Autopilot::Off {
         return ended_at(trace, "autopilot-off", TurnEndAction::Nothing);
@@ -15649,6 +15684,8 @@ fn act_past_walls(
     continue_as: &dyn Fn(&'static str) -> TurnEndAction,
     type_as: &dyn Fn(&'static str, &str) -> TurnEndAction,
 ) -> TurnEndAction {
+    // A command's continuation, owed once it has run: where a `/compact`
+    // owes the act a full context cut ([`TurnEndState::compact_owes`]), that
     // act again — the done check, the challenge or the land act as typed.
     if let Some(rule) = state.after {
         if let Some(text) = state.compact_owed_text(rule, reading.rules.as_deref()) {
@@ -16085,6 +16122,8 @@ fn resume_at_reset(
     kind: WallKind,
     continue_as: &dyn Fn(&'static str) -> TurnEndAction,
 ) -> TurnEndAction {
+    // A wall no reset ends and none names is an entitlement: its own, slower
+    // ladder. A usage window with no readable reset still lifts by itself, so it
     // keeps the short one.
     if entitlement_ladder(reading.reset_at.is_some(), kind) {
         let due = crate::supervise::ladder::Ladder(&state.timing.entitlement_backoff)
@@ -16382,6 +16421,8 @@ pub(super) fn renew_step(reading: &TurnEndReading, cfg: &SupervisorConfig) -> Op
         return None;
     }
     Some(if relaunch_reaches(reading, cfg) {
+        // With the composer empty the relaunch follows by itself where the
+        // host advises it; advising nothing, the renewed login ended too,
         // and it is signed in where it stands as any other.
         if !reading.composer.drafted() {
             return None;
@@ -16602,6 +16643,10 @@ fn wall_action(
             resume_limit(continue_as)
         }
         WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. } => {
+            // The notice a limit reset left on the screen: the reset's own
+            // continuation is this wall's ([`TurnEndState::reset_told`]) —
+            // after a reset that went through the notice is stale, and after
+            // one kept or failed the continuation is the wall's one try
             // before it is moved from or waited out.
             if let Some(act) = reset_continuation(state, cfg, now, continue_as) {
                 return act;
@@ -16822,6 +16867,7 @@ fn wall_own_act(
         }
         WallKind::UsageSession | WallKind::UsageWeekly | WallKind::Spend => {
             if !by_itself && !cfg.resume_limits && kind != WallKind::Spend {
+                // The limit episode tells the person (the loop's
                 // `limit_after`).
                 return TurnEndAction::Nothing;
             }
@@ -16849,6 +16895,8 @@ fn wall_own_act(
                 || !reading.restartable
                 || bucket_model(msg).as_deref() == Some(fallback.as_str())
             {
+                // Switched already, a relaunch that could not be made or no
+                // host to make one, or the fallback is the model at its
                 // limit: the reset is waited out.
                 return wait_out();
             }

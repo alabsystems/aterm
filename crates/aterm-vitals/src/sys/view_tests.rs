@@ -119,7 +119,6 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
         }),
         load: Some([2.5, 2.0, 1.5]),
         procs_truncated: false,
-        // The clocks the gap rule rates writes across (one reading a second).
         at_unix_ms: 1_760_000_000_000 + i64::try_from(at_s).unwrap_or(0) * 1000,
         mono_ms: at_s * 1000,
         cadence_ms: 1000,
@@ -207,7 +206,6 @@ fn ctx<'a>(w: &'a World, s: Option<&'a Snapshot>, owner: bool, own_tab: bool) ->
         machine: &w.machine,
         target: &w.target,
         tabs: &w.tabs,
-        // The caller is the target's own tab, or another tab's session.
         caller_panes: Some(if own_tab { &w.target.panes } else { &[99] }),
         owner_class: owner,
         volume: Some(&w.volume),
@@ -277,11 +275,6 @@ fn every_view_answers_in_both_shapes_and_the_json_keeps_the_contract() {
     }
 }
 
-/// Memory where the classes do not partition RAM (Linux, Windows; design
-/// §9.6): the remainder is memory no class names, an unread compressor is
-/// not a zero, and an enforced commit charge is said in both shapes.
-/// NEGATIVE CONTROL: macOS keeps no commit, and its remainder is "not in
-/// VM".
 #[test]
 fn memory_off_macos_says_its_remainder_unread_classes_and_commit() {
     let mut s = snapshot();
@@ -343,8 +336,6 @@ fn memory_off_macos_says_its_remainder_unread_classes_and_commit() {
         "{jt}"
     );
 
-    // A reader that supplies no paging counters never warms into rates.
-    // A real first counter sample is warming until the next interval.
     for (counters, why) in [
         (None, "not_sampled"),
         (Some(MemCounters::default()), "warming"),
@@ -366,8 +357,6 @@ fn memory_off_macos_says_its_remainder_unread_classes_and_commit() {
         assert_eq!(j.get("thrashing"), Some(&Jv::why(why)));
         assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
     }
-    // Measured intervals retain their figures, while an unknown pressure
-    // prevents a thrashing verdict rather than promising another interval.
     let measured = render_json(&query(View::Mem, true), &ctx(&win, Some(&s), true, true));
     assert_eq!(
         measured.get("per_s").and_then(|p| p.get("decompressions")),
@@ -406,16 +395,10 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
         other => panic!("{other:?}"),
     };
     assert_eq!(sum, busy, "{}", split.to_text());
-    // 2.4 cores busy: cargo 0.9 + the child 0.3 in the tab, aterm 0.2 +
-    // its helper 0.05, Safari 0.3; the services part holds the rest.
     assert_eq!(busy, 2400);
     assert_eq!(split.get("tab"), Some(&Jv::Int(1200)));
     assert_eq!(split.get("others"), Some(&Jv::Int(300)));
 
-    // A readable counter does not prove whose process it is. Exercise both
-    // a reader with no ownership support (Windows) and one missing a single
-    // outside process's UID. Tree-attributed rows and measured CPU/memory
-    // survive; the ownership split does not become a made-up zero.
     for self_uid in [None, Some(501)] {
         let input = |at, busy: &[u64], k| {
             let mut s = sample(at, busy, k);
@@ -493,8 +476,6 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
         assert_eq!(scoped.get("top"), Some(&Jv::why("needs_privilege:owner")));
     }
 
-    // Ownership and footprints do not depend on core counters. The process
-    // window still supplies them when no machine CPU split can be made.
     let mut model = Vitals::new();
     let mut known = Snapshot::default();
     for (at, k) in [(10, 0), (11, 1)] {
@@ -549,10 +530,6 @@ fn no_foreign_text_and_paths_only_for_the_callers_own_tab() {
     }
 }
 
-/// §13.3 rule 4 is decided per root, not per reply: a wide scope read from
-/// tab 1 prints tab 1's folder and only where tab 2's lies, its subtrees by
-/// rank; with no caller session every path prints. NEGATIVE CONTROL: the
-/// same reply with the caller in tab 2 prints tab 2's path and hides tab 1's.
 #[test]
 fn a_wide_disk_scope_prints_only_the_callers_own_folders() {
     let s = snapshot();
@@ -630,8 +607,6 @@ fn a_scoped_caller_sees_aggregates_and_withheld_counts_not_the_machines_rows() {
     let text = all_text(&render_text(&query(View::Global, false), &owner));
     assert!(text.contains("exe=Safari"), "{text}");
 
-    // Disk Window aggregates are a scoped read, but writer identities from
-    // another tab in that window are still owner-only in both shapes.
     let mut window = s.clone();
     let mut foreign = window.procs.iter().find(|p| p.pid == 201).unwrap().clone();
     foreign.pid = 777;
@@ -737,10 +712,6 @@ fn unmeasured_figures_read_unavailable_never_zero() {
     assert!(cores.contains("core name=P1 cpu=2 busy_pm=1000"), "{cores}");
 }
 
-/// THE WALKER SEAM: roots the walker measured print their sizes (a walking
-/// one as a lower bound with its progress), subtrees under them to `depth=`
-/// with paths only for the caller's own tab, and the scope's balance; every
-/// figure keeps the JSON's four shapes.
 #[test]
 fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
     use crate::sys::{DirSize, DiskTotals, HugeDirFact, RootSize, RootSizes};
@@ -839,7 +810,6 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
     let mut deep = query(View::Disk, false);
     deep.depth = Some(8);
     assert!(all_text(&render_text(&deep, &c)).contains("deep/er"));
-    // Another tab's caller: no path, a rank.
     let foreign = ctx(&w, Some(&s), true, false);
     let text = all_text(&render_text(&query(View::Disk, false), &foreign));
     assert!(
@@ -847,7 +817,6 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
         "{text}"
     );
     assert!(!text.contains("target"), "{text}");
-    // JSON: the four shapes, sizes and balance.
     let j = render_json(&query(View::Disk, true), &c);
     assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
     let d = j.get("disk").expect("disk");
@@ -861,7 +830,6 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
     assert_eq!(roots[0].get("alloc_bytes"), Some(&Jv::u(7_050_000_000)));
     assert_eq!(roots[0].get("complete"), Some(&Jv::Bool(true)));
     assert_eq!(roots[1].get("walked_entries"), Some(&Jv::u(12_000)));
-    // `sys tab` counts the roots and says the balance in words.
     let tab = all_text(&render_text(&query(View::Tab, false), &c));
     assert!(
         tab.contains(
@@ -906,9 +874,6 @@ fn a_repeat_reply_folds_to_one_same_line_and_events_stay() {
     }));
     assert!(again.header(&c, true).ends_with(" delta=1"));
 
-    // Machine-only readings advance the event ring and head while the host
-    // retains the last whole snapshot. Their events lie after its clock
-    // anchor; older and equal events keep their own timestamps too.
     let mut w = world();
     w.events = [
         (1, s.at_ns - 2_250_000_000),
@@ -978,10 +943,6 @@ fn a_repeat_reply_folds_to_one_same_line_and_events_stay() {
     assert_eq!(event_unix_ms(&end, &s, u64::MAX), u64::MAX);
 }
 
-/// §13.3: another tab's events (its jobs, load, orphans) and the machine's
-/// `top=` names print only for an owner-class caller; the machine's own
-/// events and the target tab's print for anyone. NEGATIVE CONTROL: the owner
-/// sees them all.
 #[test]
 fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
     use crate::events::LoadScope;
@@ -1066,7 +1027,6 @@ fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
         "{}",
         j.to_text()
     );
-    // NEGATIVE CONTROL: the owner reads every event and every name.
     let owner = events(true).join("\n");
     assert_eq!(events(true).len(), 7, "{owner}");
     assert!(
@@ -1079,9 +1039,6 @@ fn another_tabs_events_and_machine_names_print_only_for_the_owner() {
     );
 }
 
-/// The snapshot with the stuck engine's view the host hangs on it: in tab 7
-/// a stuck `curl` and a running `targo`; in a session no target holds, a
-/// stuck job and a stopped process of its own.
 fn snapshot_with_jobs() -> Snapshot {
     use crate::jobs::{Class, Demand, Findings, JobsView, Named, Verdict};
     use crate::sys::jobs_view::fixtures::{row, stuck};
@@ -1135,7 +1092,6 @@ fn sys_jobs_reads_the_engines_rows_of_the_scope_in_both_shapes() {
         text.contains("exe=targo class=running verdict=fine"),
         "{text}"
     );
-    // Only this tab's: the other session's job and its stopped process stay out.
     assert!(!text.contains("a9 "), "{text}");
     assert!(
         text.contains("finding kind=stopped pid=10 exe=vim"),
@@ -1162,8 +1118,6 @@ fn sys_jobs_reads_the_engines_rows_of_the_scope_in_both_shapes() {
             assert_eq!(rows[0].get("id"), Some(&Jv::s("a40977")));
             assert_eq!(rows[0].get("verdict"), Some(&Jv::s("stuck")));
             assert_eq!(rows[0].get("tab"), Some(&Jv::Int(1)));
-            // A waiting job's CPU is no evidence of its class: absent, as
-            // in the text row, never "warming".
             assert_eq!(rows[0].get("cpu_mc"), None);
         }
         other => panic!("{other:?}"),
@@ -1195,21 +1149,18 @@ fn sys_jobs_scope_global_is_every_row_and_finding() {
         text.contains("finding kind=stopped pid=11 exe=mail"),
         "{text}"
     );
-    // A row of a session the instance does not name carries no tab number.
     assert!(text.contains("verdict=stuck tab=1"), "{text}");
     assert!(
         text.lines()
             .any(|l| l.starts_with("job id=a9 ") && l.ends_with("verdict=stuck")),
         "{text}"
     );
-    // At the widest scope the hint offers no wider one.
     assert!(
         text.contains(
             "more=aterm ctl @self await sys job=a40977 done,stuck (wait for one) · sys procs"
         ),
         "{text}"
     );
-    // The rows top= leaves out are counted on the reply's one more= line.
     let mut q = SysQuery::parse("jobs scope=global top=1").unwrap();
     q.json = false;
     let text = all_text(&render_text(&q, &c));
@@ -1222,7 +1173,6 @@ fn sys_jobs_scope_global_is_every_row_and_finding() {
         "{text}"
     );
 
-    // A job of another tab is waited on through that tab's session.
     let mut other = snapshot_with_jobs();
     let mut view = (**other.jobs.as_ref().expect("jobs")).clone();
     view.rows.retain(|r| r.tab == 99);
@@ -1244,9 +1194,6 @@ fn sys_jobs_scope_global_is_every_row_and_finding() {
     );
 }
 
-/// A measured tab that neither ran nor waited starved 0%; only a tab whose
-/// runnable time gave no delta is not sampled. NEGATIVE CONTROL: no wait
-/// reading is `None`.
 #[test]
 fn an_idle_measured_tab_waited_for_no_core() {
     let idle = Fig {
@@ -1270,9 +1217,6 @@ fn an_idle_measured_tab_waited_for_no_core() {
     assert_eq!(unread.starved(), None);
 }
 
-/// One sweep has no interval: the procs are warming, in both shapes, never
-/// a measured "0 live". NEGATIVE CONTROL: the second sweep's total is a
-/// number.
 #[test]
 fn a_first_sweeps_procs_are_warming_never_zero() {
     let first = Vitals::new().absorb(&sample(10, &[0, 0, 0, 0], 0));

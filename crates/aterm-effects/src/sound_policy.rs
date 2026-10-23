@@ -101,7 +101,8 @@ pub const fn user_lit(resolved: &crate::cursor_glow::GlowConfig) -> bool {
     resolved.intensity > 0.0
 }
 
-/// The host's split of one resolved config into its light half and its audio half for one.
+/// The host's split of one resolved config into its light half and its
+/// audio half for one window's tick.
 #[inline]
 pub const fn fold_window_audibility(
     cfg: &mut crate::cursor_glow::GlowConfig,
@@ -185,7 +186,8 @@ mod voice_gain_tests {
     }
 }
 
-/// The per-event trail-audio policy the host resolves once per drain and stamps on every emitted.
+/// The per-event trail-audio policy the host resolves once per drain and
+/// stamps on every emitted [`crate::trail_sound::SoundEvent`], so the synth stays policy-free.
 pub struct TrailSoundPolicy {
     /// The `trail_sound_style` override (default `Style` = follow the visual trail style).
     pub voice: crate::trail_sound::SoundVoice,
@@ -277,7 +279,10 @@ pub struct CurseDrain {
     pub wince_hits: u8,
 }
 
-/// Drain every curse-bonk cue the word-decoration tick recorded and emit the enabled ones as.
+/// Drain every curse-bonk cue the word-decoration tick recorded and emit the
+/// enabled ones as namespaced [`crate::trail_sound::WordGesture::Bonk`]
+/// gestures; the sparkle-words twin of [`drain_trail_sound_cues`], so a
+/// disabled knob never leaves a backlog.
 pub fn drain_curse_bonk_cues(
     decos: &mut crate::word_decorations::WordDecorations,
     style: crate::cursor_glow::GlowStyle,

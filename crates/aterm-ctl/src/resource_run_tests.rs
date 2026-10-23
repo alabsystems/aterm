@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Real self-registration and exec controls. Only children receive fixture
-//! environment; the test harness never changes its own process environment.
+//! Real self-registration and exec controls.
 
 use super::*;
 use std::io::{BufRead, Write};
@@ -166,8 +165,8 @@ fn signal_group(pid: u32, signal: i32) {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
-    // SAFETY: the process group is led by our unreaped child, never a shared
-    // test-harness group or a recycled PID.
+    // SAFETY: the process group is led by our unreaped child, never a shared test-harness group or
+    // a recycled PID.
     assert_eq!(unsafe { kill(-i32::try_from(pid).unwrap(), signal) }, 0);
 }
 
@@ -197,8 +196,6 @@ fn group_stops_wait_for_the_actual_commands_delayed_exit() {
         }
         assert_eq!(host.peer.recv_timeout(HANG).unwrap(), child.0.id());
         signal_group(child.0.id(), signal);
-        // bash runs a trap inside `read` only once read has armed it; one
-        // taken before that waits for a command to end, so a line ends it.
         writeln!(child.0.stdin.as_mut().unwrap(), "wake").unwrap();
         loop {
             if lines.recv_timeout(HANG).unwrap() == "SIGNAL" {

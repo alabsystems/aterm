@@ -4,28 +4,14 @@
 
 //! Window operations (CSI t - XTWINOPS) for terminal control.
 
-/// Window operation requested by CSI t (XTWINOPS) escape sequences.
-///
-/// These operations allow applications to manipulate and query window state.
-/// The platform UI layer implements these operations through the `WindowCallback`.
-///
-/// # Security Considerations
-///
-/// Some operations (especially title reporting) can be used for security attacks.
-/// Platforms should:
-/// - Filter escape sequences from reported titles to prevent injection
-/// - Consider making manipulation operations opt-in
-/// - Report operations leak display information (generally safe but configurable)
+/// Window operation requested by `CSI t` (XTWINOPS) escape sequences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WindowOperation {
-    // Window state operations (1-2)
     /// De-iconify (restore from minimized) window.
     DeIconify,
     /// Iconify (minimize) window.
     Iconify,
-
-    // Window geometry operations (3-8)
     /// Move window to pixel position.
     MoveWindow {
         /// X coordinate in pixels.
@@ -53,8 +39,6 @@ pub enum WindowOperation {
         /// Width in character cells (columns).
         cols: u16,
     },
-
-    // Maximize/fullscreen operations (9-10)
     /// Restore maximized window to normal size.
     RestoreMaximized,
     /// Maximize window.
@@ -69,43 +53,28 @@ pub enum WindowOperation {
     EnterFullscreen,
     /// Toggle fullscreen mode.
     ToggleFullscreen,
-
-    // Report operations (11-21)
-    /// Request report of window state (iconified or not).
-    /// Response: CSI 1 t (not iconified) or CSI 2 t (iconified)
+    /// Request report of window state (`CSI 1 t` or `CSI 2 t`).
     ReportWindowState,
-    /// Request report of window position in pixels.
-    /// Response: CSI 3 ; x ; y t
+    /// Request report of window position in pixels (`CSI 3 ; x ; y t`).
     ReportWindowPosition,
-    /// Request report of text area position in pixels.
-    /// Response: CSI 3 ; x ; y t
+    /// Request report of text area position in pixels (`CSI 3 ; x ; y t`).
     ReportTextAreaPosition,
-    /// Request report of text area size in pixels.
-    /// Response: CSI 4 ; height ; width t
+    /// Request report of text area size in pixels (`CSI 4 ; height ; width t`).
     ReportTextAreaSizePixels,
-    /// Request report of window size in pixels.
-    /// Response: CSI 4 ; height ; width t
+    /// Request report of window size in pixels (`CSI 4 ; height ; width t`).
     ReportWindowSizePixels,
-    /// Request report of screen size in pixels.
-    /// Response: CSI 5 ; height ; width t
+    /// Request report of screen size in pixels (`CSI 5 ; height ; width t`).
     ReportScreenSizePixels,
-    /// Request report of character cell size in pixels.
-    /// Response: CSI 6 ; height ; width t
+    /// Request report of character cell size in pixels (`CSI 6 ; height ; width t`).
     ReportCellSizePixels,
-    /// Request report of text area size in character cells.
-    /// Response: CSI 8 ; rows ; cols t
+    /// Request report of text area size in character cells (`CSI 8 ; rows ; cols t`).
     ReportTextAreaSizeCells,
-    /// Request report of screen size in character cells.
-    /// Response: CSI 9 ; rows ; cols t
+    /// Request report of screen size in character cells (`CSI 9 ; rows ; cols t`).
     ReportScreenSizeCells,
-    /// Request report of icon label (title).
-    /// Response: OSC L label ST
+    /// Request report of icon label (`OSC L label ST`).
     ReportIconLabel,
-    /// Request report of window title.
-    /// Response: OSC l title ST
+    /// Request report of window title (`OSC l title ST`).
     ReportWindowTitle,
-
-    // Title stack operations (22-23)
     /// Push title(s) onto the stack.
     PushTitle {
         /// Push icon label to stack.
@@ -123,9 +92,6 @@ pub enum WindowOperation {
 }
 
 /// Response from a window operation query.
-///
-/// When the `WindowCallback` returns a response, it should contain the
-/// appropriate data to generate the terminal response sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WindowResponse {

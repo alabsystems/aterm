@@ -1,23 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! atpkg's converge items (docs/DESIGN-init-system-2026-10-20.md §4.2, S4): `aterm pkg
-//! doctor`'s checks (0)–(11) as [`aterm_converge::Item`]s.
-//!
-//! The doctor reads the machine once ([`crate::doctor::read`]): every check leaves one
-//! [`Finding`] per thing it found, under a stable id (`base.pkg.path`,
-//! `base.pkg.stubs@cargo`). [`items`] makes each an item whose probe is that reading, and
-//! [`report`] runs them through the engine in [`aterm_converge::Mode::Plan`] on a
-//! [`aterm_converge::ReadOnly`] journal, so the doctor stays a no-mutation verb. The rows
-//! it returns are the one schema `--json` prints ([`aterm_converge::Report`]), and the
-//! doctor's text is rendered from them ([`crate::doctor::render`]); nothing re-reads the
-//! text.
-//!
-//! An item is essential when, left wrong, it fails `aterm pkg doctor` (exit 1): a broken
-//! shim, a store tree gone, a fish-breaking hook, a world-writable login-sourced
-//! directory, a workspace the installed targo refuses, a diverged live build, a dead dev
-//! link, the C toolchain, and the toolset itself. Everything else is advisory. A read that
-//! could not be made is never essential: the doctor never fails because a probe failed.
+//! Converge items for `aterm pkg doctor` checks ([`aterm_converge::Item`]).
 
 use aterm_converge::{Class, Explain, Item, ItemReport, Layer, Mode, Outcome, Probe, Remedy};
 
@@ -43,14 +27,13 @@ pub const PATH: &str = "base.pkg.path";
 pub const STUBS: &str = "base.pkg.stubs";
 /// (3b) The reroute directory's place on PATH.
 pub const REROUTE: &str = "base.pkg.reroute";
-/// (4) A bin/ shim, `@<name>`: essential when its target is gone.
+/// (4) A bin/ shim, `@<name>`.
 pub const SHIMS: &str = "base.pkg.shims";
-/// (4b) The exposed names an active build was refused a shim (design S13): one row, or
-/// `@<program>` for each program the record names.
+/// (4b) The exposed names an active build was refused a shim (design S13).
 pub const REFUSED: &str = "base.pkg.refused";
 /// (4) A shim an older atpkg laid under a name no shim may carry now, `@<name>`.
 pub const REFUSED_SHIM: &str = "base.pkg.refused.shim";
-/// (5) The active builds' store trees; `@<program>` for one that is missing or incomplete.
+/// (5) The active builds' store trees.
 pub const STORE: &str = "base.pkg.store";
 /// (5c) A solver the trust bundle pins privately, `@<program>`.
 pub const SOLVER: &str = "base.pkg.solver";
@@ -64,7 +47,7 @@ pub const TRUST_CHAIN: &str = "base.pkg.trust.chain";
 pub const EXEC_ROOTS: &str = "base.pkg.exec-roots";
 /// (5f)(d) An exec root no build needs, `@<path>`.
 pub const EXEC_ROOT_STRAY: &str = "base.pkg.exec-roots.stray";
-/// (5d) The workspace's `[trust]` policy against the installed targo: essential.
+/// (5d) The workspace's `[trust]` policy against the installed targo.
 pub const WORKSPACE: &str = "base.pkg.workspace";
 /// (5e) A local toolchain behind rustup's `trust` channel.
 pub const RUSTUP_LOCAL: &str = "base.pkg.rustup.local";
@@ -72,17 +55,17 @@ pub const RUSTUP_LOCAL: &str = "base.pkg.rustup.local";
 pub const HELD_UPDATE: &str = "base.pkg.held-update";
 /// The build leases.
 pub const LEASES: &str = "base.pkg.leases";
-/// (5b) The live builds; `@<program>` for one whose witness disagrees.
+/// (5b) The live builds.
 pub const LIVE: &str = "base.pkg.live";
 /// (6) The shell.d hooks.
 pub const HOOKS: &str = "base.shell.hooks";
-/// (6) A POSIX `.sh` in shell.d, which breaks fish, `@<file>`: essential.
+/// (6) A POSIX `.sh` in shell.d, which breaks fish, `@<file>`.
 pub const FISH_SAFE: &str = "base.shell.fish-safe";
-/// (6b) The rc files' wiring; `@<file>` for one file's own state.
+/// (6b) The rc files' wiring.
 pub const RC: &str = "base.shell.rc";
 /// (6c) A copied command at a command path, `@<path>`.
 pub const COPIED_COMMANDS: &str = "base.shell.copied-commands";
-/// (6) A login-sourced directory others can write, `@<dir>`: essential.
+/// (6) A login-sourced directory others can write, `@<dir>`.
 pub const PRIVATE: &str = "base.shell.private";
 /// (7) Disk headroom.
 pub const DISK: &str = "base.pkg.disk";
@@ -122,11 +105,11 @@ pub const HELD: &str = "base.pkg.held";
 pub const SHADOW: &str = "base.pkg.shadow";
 /// (10f) A managed member's shim environment, `@<program>`.
 pub const SHIM_ENV: &str = "base.pkg.shim-env";
-/// (10h) Claude Code's defaults; `@<key>` for one key's own state.
+/// (10h) Claude Code's defaults.
 pub const CLAUDE_DEFAULTS: &str = "base.agents.claude-defaults";
-/// (11) A dev link: essential when it no longer runs.
+/// (11) A dev link.
 pub const DEV_LINK: &str = "base.pkg.dev-link";
-/// (11) The toolset against the signed index: essential.
+/// (11) The toolset against the signed index.
 pub const TOOLSET: &str = "base.pkg.toolset";
 /// (11a) The toolset on a platform no build is published for.
 pub const TOOLSET_PLATFORM: &str = "base.pkg.toolset.platform";
@@ -134,7 +117,7 @@ pub const TOOLSET_PLATFORM: &str = "base.pkg.toolset.platform";
 pub const TOOLSET_MEMBER: &str = "base.pkg.toolset.member";
 /// (11) A member removed on purpose, `@<program>`.
 pub const REMOVED: &str = "base.pkg.removed";
-/// (11) The C toolchain: essential when it answers that it cannot build.
+/// (11) The C toolchain.
 pub const CLT: &str = "base.clt";
 
 /// The `detail` of a row whose warn says a managed tool cannot run.
@@ -156,7 +139,7 @@ pub fn is(row_id: &str, id: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
 }
 
-/// One check's reading: what the doctor's read pass found, and what the item reports.
+/// One check's reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     /// Stable id, unique within a report.
@@ -171,8 +154,7 @@ pub struct Finding {
     pub probe: Probe,
     /// The row's sentence and its one remedy.
     pub explain: Explain,
-    /// What a caller acts on: the active count on the toolset row, a tool claim
-    /// ([`CANNOT_RUN`], [`UNPROVEN`]) on a warn about a managed tool.
+    /// What a caller acts on: the active count on the toolset row ([`CANNOT_RUN`], [`UNPROVEN`]).
     pub detail: Option<String>,
 }
 
@@ -198,9 +180,7 @@ impl Finding {
         }
     }
 
-    /// As it should be; `now` is the row's sentence. Every constructor takes the class of
-    /// what would fix the item (design §3.2), so no row is `relay` (the one class an
-    /// unattended lane applies) unless its check says so.
+    /// As it should be; `now` is the row's sentence.
     pub fn ok(
         id: impl Into<String>,
         class: Class,
@@ -239,7 +219,7 @@ impl Finding {
         Self::new(id, class, title, Probe::Deferred { why: why.clone() }, why)
     }
 
-    /// Could not be read: said, never essential.
+    /// Could not be read.
     pub fn unread(
         id: impl Into<String>,
         class: Class,
@@ -250,7 +230,7 @@ impl Finding {
         Self::new(id, class, title, Probe::Unusable { why: why.clone() }, why)
     }
 
-    /// Only a person changes it (System Settings): class `person`.
+    /// Only a person changes it (System Settings).
     pub fn person(
         id: impl Into<String>,
         title: impl Into<String>,
@@ -266,8 +246,7 @@ impl Finding {
         Self::new(id, Class::Person, title, probe, why).remedy(remedy)
     }
 
-    /// Not as wanted: `why` is the row's sentence, whose first clause is the value now, and
-    /// `want` the value wanted.
+    /// Not as wanted: `why` is the row's sentence.
     pub fn change(
         id: impl Into<String>,
         class: Class,
@@ -309,8 +288,7 @@ impl Finding {
         self
     }
 
-    /// From a typed doctor row ([`crate::doctor::Row`]): `ok`, a `note`, or a `warn` that
-    /// plans `want` by `remedy`.
+    /// From a typed doctor row ([`crate::doctor::Row`]).
     pub fn of_row(
         id: impl Into<String>,
         class: Class,
@@ -327,10 +305,7 @@ impl Finding {
     }
 }
 
-/// Where a sentence's first clause ends: at its first ` — `, `; ` or `. ` outside
-/// parentheses and backticks (a parenthetical's `;` is not the end of the fact), else the
-/// whole sentence. A check's own sentence, read when the finding is made (a row's `from`)
-/// and when its short form is cut ([`crate::doctor::render`]).
+/// Where a sentence's first clause ends ([`crate::doctor::render`]).
 #[must_use]
 pub fn first_clause_end(text: &str) -> usize {
     let mut depth = 0usize;
@@ -354,8 +329,7 @@ pub fn first_clause_end(text: &str) -> usize {
     text.len()
 }
 
-/// The family a doctor id belongs to: its second segment (`base.shell.rc` → `shell`), the
-/// Command Line Tools' `developer` as the machines family has it.
+/// The family a doctor id belongs to: its second segment.
 fn family_of(id: &str) -> &'static str {
     match id
         .split('.')
@@ -371,7 +345,7 @@ fn family_of(id: &str) -> &'static str {
     }
 }
 
-/// A [`Finding`] as an item: its probe is the reading, its explanation the finding's own.
+/// A [`Finding`] as an item.
 #[derive(Debug)]
 pub struct Check(Finding);
 
@@ -412,7 +386,6 @@ impl Item for Check {
     }
 
     fn essential(&self) -> bool {
-        // A read that could not be made never fails the doctor.
         self.0.essential && !matches!(self.0.probe, Probe::Unusable { .. })
     }
 
@@ -421,8 +394,7 @@ impl Item for Check {
     }
 }
 
-/// The findings as items, each id unique: a check that found the same subject twice keeps
-/// both, the later one numbered (`base.pkg.config@2`).
+/// The findings as items, each id unique.
 #[must_use]
 pub fn items(findings: Vec<Finding>) -> Vec<Box<dyn Item>> {
     let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
@@ -443,14 +415,12 @@ pub fn items(findings: Vec<Finding>) -> Vec<Box<dyn Item>> {
         .collect()
 }
 
-/// The doctor's rows: the findings through the engine, planned and never applied.
+/// The doctor's rows.
 #[must_use]
 pub fn report(findings: Vec<Finding>) -> Vec<ItemReport> {
     let items = items(findings);
     match aterm_converge::run(&items, Mode::Plan, &mut aterm_converge::ReadOnly) {
         Ok(rows) => rows,
-        // No doctor item names another, so nothing can refuse the order; were one to,
-        // the report fails rather than says less.
         Err(refusal) => vec![ItemReport {
             id: ATPKG.to_owned(),
             family: "pkg".to_owned(),
@@ -474,7 +444,7 @@ pub fn report(findings: Vec<Finding>) -> Vec<ItemReport> {
     }
 }
 
-/// Whether the rows pass `aterm pkg doctor`'s rule (exit 0): no row fails it.
+/// Whether the rows pass `aterm pkg doctor`'s rule (exit 0).
 #[must_use]
 pub fn passes(rows: &[ItemReport]) -> bool {
     !rows.iter().any(ItemReport::fails_surface)

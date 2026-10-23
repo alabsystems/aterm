@@ -735,6 +735,8 @@ fn fetch_channel_candidate(slug: &str) -> std::result::Result<Candidate, String>
     let bytes =
         curl_fetch(&release_asset_url(slug, roster::ROSTER_ASSET), 65_536).map_err(|e| {
             // Only the body's clean 404 means no roster is published yet; any other
+            // failure (429/403, a timeout, a private repo) is "cannot tell", and the mint
+            // gate refuses on it.
             if e.contains("returned error: 404") {
                 format!("{NO_CHANNEL_ROSTER}: {e}")
             } else {
@@ -1842,6 +1844,7 @@ fn profile_check(
     );
     if !path.exists() {
         // Written only when `apple_sha1.is_some()`, so with no certificate a re-run writes
+        // nothing: report the dependency, counted as waiting (it still blocks the mint).
         if apple_sha1.is_none() {
             return Check::Todo {
                 what: "not written yet: it pins the Developer ID certificate, and the \

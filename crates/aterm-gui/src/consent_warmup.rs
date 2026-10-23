@@ -124,7 +124,7 @@ impl WarmupProbe {
 }
 
 /// The inert arm.
-fn inert_read_dir(_path: &Path) -> ReadDirOutcome {
+const fn inert_read_dir(_path: &Path) -> ReadDirOutcome {
     ReadDirOutcome::Refused
 }
 
@@ -233,7 +233,7 @@ pub(crate) struct WarmupState {
 
 impl WarmupState {
     /// Wire the arm for this instance.
-    pub(crate) fn new(headless: bool) -> Self {
+    pub(crate) const fn new(headless: bool) -> Self {
         Self {
             probe: WarmupProbe::for_instance(headless),
             live: None,

@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 //
 // The wasm host-boundary smoke (`verify wasm-smoke`): drive the DEBUG
-// builds of the two web modules under node through the exports only a debug
-// build carries (each crate's src/host.rs, both through aterm-wasm-abi's
+// builds of the two web modules in a page of the pinned chrome-headless-shell
+// through the exports only a debug build carries (each crate's src/host.rs, both through aterm-wasm-abi's
 // `aterm_host` imports), and check what crosses the host boundary in each
 // direction.
 //
@@ -17,36 +17,11 @@
 //           "\n\nStack:\n\n", a JS stack that names a wasm frame, then "\n\n"
 //           (console_error_panic_hook 0.1.7's format), and the call throws.
 //
-// One line per check on stderr; exit 0 only when every check held.
+// One line per check on the console; `run({ cpu, gpu, font })` (the two
+// modules' ES module glue and the font, by URL) answers { failures }, 0 only
+// when every check held.
 
-import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
-
-const require = createRequire(import.meta.url)
-const outDir = process.argv[2]
-if (!outDir) {
-  console.error('usage: node smoke.mjs <dir with the cpu/ and gpu/ CommonJS glue>')
-  process.exit(2)
-}
-
-const FONT_CANDIDATES = [
-  '/System/Library/Fonts/Monaco.ttf',
-  '/System/Library/Fonts/Supplemental/Courier New.ttf',
-  '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
-  '/usr/share/fonts/TTF/DejaVuSansMono.ttf'
-]
-function loadFont() {
-  for (const p of FONT_CANDIDATES) {
-    try {
-      return readFileSync(p)
-    } catch {
-      /* next candidate */
-    }
-  }
-  console.error('wasm-smoke: no monospace font found among', FONT_CANDIDATES)
-  process.exit(1)
-}
-const font = loadFont()
+let font
 const THEME = [0x00e0e0e0, 0x00101010, 0x00e0e0e0, 0x00404060]
 
 let failures = 0
@@ -124,15 +99,20 @@ function panicSmoke(label, mod, Terminal) {
   check(`${label} panic trailer`, msg.endsWith('\n\n') && !rest.startsWith('\n'), JSON.stringify(msg.slice(-40)))
 }
 
-const cpu = require(`${outDir}/cpu/aterm_wasm.js`)
-const gpu = require(`${outDir}/gpu/aterm_gpu_web.js`)
-// Clocks first: a panic traps, and a module is not called again after one.
-clockSmoke('cpu', cpu)
-clockSmoke('gpu', gpu)
-panicSmoke('cpu', cpu, cpu.AtermTerminal)
-panicSmoke('gpu', gpu, gpu.AtermGpuTerminal)
-
-console.error(`wasm-smoke: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
-// Ended by itself, never `process.exit()`, which can hang once a module ran
-// (`replay.mjs`, where it was measured).
-process.exitCode = failures === 0 ? 0 : 1
+export async function run(urls) {
+  const r = await fetch(urls.font)
+  if (!r.ok) throw new Error(`${urls.font}: HTTP ${r.status}`)
+  font = new Uint8Array(await r.arrayBuffer())
+  const cpu = await import(urls.cpu)
+  const gpu = await import(urls.gpu)
+  // The default init, as a page loads each module.
+  await cpu.default()
+  await gpu.default()
+  // Clocks first: a panic traps, and a module is not called again after one.
+  clockSmoke('cpu', cpu)
+  clockSmoke('gpu', gpu)
+  panicSmoke('cpu', cpu, cpu.AtermTerminal)
+  panicSmoke('gpu', gpu, gpu.AtermGpuTerminal)
+  console.error(`wasm-smoke: ${failures === 0 ? 'PASS' : `FAIL (${failures})`}`)
+  return { failures }
+}

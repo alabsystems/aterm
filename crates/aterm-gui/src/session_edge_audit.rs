@@ -25,7 +25,7 @@ pub(crate) enum EdgeAction {
 
 impl EdgeAction {
     /// The stable `action=` field value.
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             EdgeAction::Grant => "grant",
             EdgeAction::Revoke => "revoke",

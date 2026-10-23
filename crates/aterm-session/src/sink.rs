@@ -1510,6 +1510,7 @@ impl SinkWriter {
             }
         };
         let Some(guard) = acquired else {
+            // Another writer is mid-frame (or the drainer is writing): queueing
             // behind the current holder preserves order without waiting on it.
             return self.spill_or_when_full(bytes, since, when_full);
         };
@@ -2004,6 +2005,7 @@ impl Shared {
             };
             match wrote {
                 aterm_pty::NonParkWrite::Wrote(n) => {
+                    // The hook after the spill mutex drops (it runs under the
                     // fd lock, as every landing write's does).
                     if n > 0 {
                         let _ = self.fire_input_hook();

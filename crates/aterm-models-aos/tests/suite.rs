@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The aterm-models-aos Tier-0 suite: ONE test binary for every file below, instead of one linked
-//! and started per file. Each file keeps its own `#[test]`s, named `<file>::<test>` here; none
-//! sets an environment variable, installs a hook or re-executes itself.
-//!
-//! `autotests = false`: a `tests/*.rs` file that is not a `mod` line here NEVER COMPILES. Run one
-//! file's tests with `targo --unverified test -p aterm-models-aos --test suite -- <file>::`.
+//! Combined Tier-0 model test binary for `aterm-models-aos`.
 
 mod derived_publication;

@@ -24,7 +24,7 @@ pub(crate) const PROGRAM_RECHECK: Duration = Duration::from_secs(5);
 const PROGRAM_NAME_CONFIRM: Duration = Duration::from_millis(500);
 const PROGRAM_NAMED_RECHECK_FLOOR: Duration = Duration::from_secs(4);
 
-fn unresolved_program_recheck(attempts: u8) -> Duration {
+const fn unresolved_program_recheck(attempts: u8) -> Duration {
     match attempts {
         0 | 1 => Duration::from_millis(250),
         2 => Duration::from_secs(1),
@@ -329,7 +329,7 @@ impl StatusFsm {
     }
 
     /// Returns the currently published [`Status`].
-    pub(crate) fn status(&self) -> &Status {
+    pub(crate) const fn status(&self) -> &Status {
         &self.published
     }
 
@@ -606,7 +606,7 @@ pub(crate) fn completed_block(term: &aterm_core::terminal::Terminal) -> Option<C
 
 impl CompletedBlock {
     /// Converts an [`aterm_types::OutputBlock`] into a [`CompletedBlock`].
-    pub(crate) fn of(block: &aterm_types::OutputBlock) -> CompletedBlock {
+    pub(crate) const fn of(block: &aterm_types::OutputBlock) -> CompletedBlock {
         CompletedBlock {
             id: block.id,
             exit_code: block.exit_code,
@@ -964,6 +964,7 @@ fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
     while i < bytes.len() {
         let c = bytes[i];
         if let Some(q) = quote {
+            // Inside quotes only the matching quote ends them; a backslash escapes the next
             // byte except inside single quotes.
             if c == b'\\' && q != b'\'' {
                 i += 2;
@@ -1300,7 +1301,7 @@ pub(crate) fn agent_activity_text(phase: &crate::presence::AgentPhase) -> Option
 
 /// Maps a session's [`Status`] to its tab indicator bits.
 #[must_use]
-pub(crate) fn status_indicators(status: &Status) -> crate::tab_model::TabIndicators {
+pub(crate) const fn status_indicators(status: &Status) -> crate::tab_model::TabIndicators {
     crate::tab_model::TabIndicators {
         dirty: false,
         busy: matches!(status.phase, Phase::Running | Phase::Quiet),
@@ -1311,7 +1312,10 @@ pub(crate) fn status_indicators(status: &Status) -> crate::tab_model::TabIndicat
 
 pub(crate) const STATUS_CHANGE: &str = "status-change";
 
-fn conpty_status_field(windows: bool, host: Option<aterm_pty::ConsoleHostKind>) -> &'static str {
+const fn conpty_status_field(
+    windows: bool,
+    host: Option<aterm_pty::ConsoleHostKind>,
+) -> &'static str {
     if !windows {
         return "";
     }
@@ -1453,7 +1457,7 @@ impl FailureMark {
         self.failing && self.generation > self.seen
     }
 
-    fn see(&mut self) -> bool {
+    const fn see(&mut self) -> bool {
         let quieted = self.unseen();
         self.seen = self.generation;
         quieted
@@ -1628,7 +1632,7 @@ impl StatusObserver {
     }
 
     /// Returns whether the last sweep left any pooled session unclassified.
-    pub(crate) fn has_unclassified(&self) -> bool {
+    pub(crate) const fn has_unclassified(&self) -> bool {
         !self.unclassified.is_empty()
     }
 
@@ -1648,7 +1652,7 @@ impl StatusObserver {
     }
 
     /// Returns the session-pool epoch last observed by [`Self::note_swept`].
-    pub(crate) fn swept_pool_epoch(&self) -> u64 {
+    pub(crate) const fn swept_pool_epoch(&self) -> u64 {
         self.swept_pool_epoch
     }
 
@@ -1715,7 +1719,7 @@ impl StatusObserver {
     }
 
     /// Updates the `tab_status_badge` setting and returns whether it changed.
-    pub(crate) fn set_badge(&mut self, badge: bool) -> bool {
+    pub(crate) const fn set_badge(&mut self, badge: bool) -> bool {
         std::mem::replace(&mut self.badge, badge) != badge
     }
 
@@ -1754,6 +1758,8 @@ impl StatusObserver {
             .sessions
             .values()
             .filter_map(|slot| {
+                // Clamp to `next_due`: `due()` refuses the slot until then, so an earlier
+                // deadline could only fire, be refused and re-arm. This bounds any such bug to
                 // the observation rate rather than an event-loop-rate spin.
                 slot.fsm.owed_wake().map(|owed| owed.max(slot.next_due))
             })
@@ -2089,6 +2095,7 @@ impl StatusObserver {
             w.deferred_name_recheck_at = None;
             w.name_confirmed = false;
         } else if w.deferred_name_recheck_at.take().is_some() {
+            // A confirmation was requested; another waits for screen movement and the
             // named-program floor.
             w.name_confirmed = true;
         }
@@ -2777,6 +2784,7 @@ impl crate::App {
             .is_some_and(crate::os_window_focused)
             && self.focused_session_id(wid) == Some(session);
         if looking && self.session_status.note_seen(session) {
+            // THE SESSION LOG: `mark - seen` lifts the failure's need; its
             // owed wake rings the session's watchers in the same hold.
             if let Some(s) = self.pool.get(session) {
                 let mut timeline = s.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -3077,11 +3085,18 @@ impl crate::App {
             self.session_status.input_stall(session),
             self.session_status.input_armed(session),
         );
+        let occupancy_sid = self
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .by_local(session)
+            .map(|h| h.sid.as_str().to_string());
         let input = format!(
-            "{input} {} {} {}",
+            "{input} {} {} {} {}",
             crate::disk_board::status_fields(session, reported_cwd.as_deref()),
             self.status_job_fields(session),
-            crate::program_check_watch::status_fields()
+            crate::program_check_watch::status_fields(),
+            crate::occupancy_host::status_fields(occupancy_sid.as_deref())
         );
         let (
             agent,

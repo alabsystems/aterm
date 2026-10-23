@@ -77,7 +77,7 @@ pub(crate) struct Team {
 impl Team {
     /// The strip's marks for this team.
     #[must_use]
-    pub(crate) fn strip(&self) -> crate::tab_bar::TabTeam {
+    pub(crate) const fn strip(&self) -> crate::tab_bar::TabTeam {
         crate::tab_bar::TabTeam {
             worker: self.manager.is_some(),
             workers: self.workers,

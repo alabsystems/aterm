@@ -68,6 +68,7 @@ impl Terminal {
         let (advanced, next_frame_at) = handler.advance_kitty_animations(now);
         if advanced {
             // A frame step changes what the screen shows with no output fed
+            // and no content seq moved (it damages, it does not write a cell).
             self.transient.screen_mutations = self.transient.screen_mutations.wrapping_add(1);
         }
         KittyAnimationStep {
@@ -76,7 +77,8 @@ impl Terminal {
         }
     }
 
-    /// Whether a Kitty graphics animation is running, shown on screen.
+    /// Whether a Kitty graphics animation is running, shown on screen or not;
+    /// an animation in an unshown session waits until it is drawn again.
     #[must_use]
     #[inline]
     pub fn kitty_animation_playing(&self) -> bool {
@@ -108,6 +110,9 @@ impl Terminal {
         let was_alt = self.modes.alternate_screen;
         if pinned_offset > 0 {
             // Not `scroll_to_bottom`: the motion is identical, but this is the
+            // machine forcing a precondition it undoes at the epilogue, and
+            // `reader_live_bottom_gen` must not record it as a reader gesture
+            // (downstream code uses it to tell a chosen 0 offset from a forced one).
             self.grid.pin_viewport_to_live_for_output_batch();
         }
         let damage_class: super::custody::OutputDamage;
@@ -285,6 +290,8 @@ impl Terminal {
         was_alt: bool,
     ) -> super::custody::OutputDamage {
         // Top-anchored partial scrollback inserts logical rows immediately
+        // before a protected footer. Keep every durable OSC/shell anchor paired
+        // with the footer content that stayed fixed on screen.
         if let Some(update) = self.grid.take_absolute_row_update() {
             super::handler::apply_absolute_row_update(
                 update,
@@ -371,6 +378,7 @@ impl Terminal {
                         .adjust_for_row_splice(boundary, inserted, max_rows, floor);
                 } else {
                     // A malformed/saturated grid update must never leave stale
+                    // selection coordinates attached to unrelated content.
                     self.text_selection.clear();
                 }
             }

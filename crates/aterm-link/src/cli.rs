@@ -136,6 +136,7 @@ fn run(
         }
     };
     if serve {
+        // `--attention` is an `ls` filter; `serve` refuses it by name rather
         // than parsing it and doing nothing.
         if parsed.attention {
             eprintln!("aterm-link: --attention is an `ls` filter; `serve` has no roster");
@@ -620,7 +621,7 @@ presence, and other records up to 7 days / 32 MiB (`<log>.held`).
     let mut exe_looked = std::time::Instant::now();
     let mut poison_said = false;
     loop {
-        std::thread::park_timeout(crate::broker_health::POLL);
+        std::thread::park_timeout(crate::broker_health::poll());
         // The seam's `stay` switches off the poison exit and no other: a poisoned broker it
         // keeps serving still ends with its launcher, its path and its build.
         let poisoned = match broker.poisoned() {

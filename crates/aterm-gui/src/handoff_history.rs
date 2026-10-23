@@ -364,7 +364,7 @@ pub(crate) type ExportSession = (u64, Arc<Mutex<Terminal>>);
 
 impl ExportSessions {
     #[must_use]
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.handed.len() + self.held.len()
     }
 
@@ -480,13 +480,13 @@ impl HistoryPlan {
 
 /// Whether `target_build` supports importing handed-session scrollback sidecars.
 #[must_use]
-pub(crate) fn exports_for_target(running_build: u64, target_build: u64) -> bool {
+pub(crate) const fn exports_for_target(running_build: u64, target_build: u64) -> bool {
     target_build >= running_build || target_build >= IMPORTS_HISTORY_FROM_BUILD
 }
 
 /// Whether `target_build` supports importing held-pane scrollback sidecars.
 #[must_use]
-pub(crate) fn exports_held_for_target(running_build: u64, target_build: u64) -> bool {
+pub(crate) const fn exports_held_for_target(running_build: u64, target_build: u64) -> bool {
     target_build >= running_build || target_build >= IMPORTS_HELD_HISTORY_FROM_BUILD
 }
 
@@ -677,7 +677,7 @@ impl HistoryExporter {
     }
 
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn pause_asked(&self) -> bool {
+    pub(crate) const fn pause_asked(&self) -> bool {
         self.pause_asked_at.is_some()
     }
 
@@ -783,15 +783,15 @@ struct Aggregate {
 }
 
 impl Aggregate {
-    fn room(&self) -> u64 {
+    const fn room(&self) -> u64 {
         self.cap.saturating_sub(self.written)
     }
 
-    fn fits(&self, frame: u64) -> bool {
+    const fn fits(&self, frame: u64) -> bool {
         self.written.saturating_add(frame) <= self.cap
     }
 
-    fn release(&mut self, export: &OpenExport) {
+    const fn release(&mut self, export: &OpenExport) {
         self.written = self.written.saturating_sub(export.len);
     }
 
@@ -1448,7 +1448,7 @@ pub(crate) enum Fallback {
 impl Fallback {
     /// The words the log and the successor's row use.
     #[must_use]
-    pub(crate) fn words(self) -> &'static str {
+    pub(crate) const fn words(self) -> &'static str {
         match self {
             Self::NotExported => "its history was not exported before the park",
             Self::FenceMoved => "its history was rewrapped, cleared or reset after the export",
@@ -1800,7 +1800,7 @@ impl std::fmt::Debug for HistoryCarry {
 impl HistoryCarry {
     /// A crash restore's carry: `take` lines of the history ring's `chunks` (wrapped at `cols`) after the first `skip` ([`CarrySource::Journal`]).
     #[cfg(unix)]
-    pub(crate) fn journal(
+    pub(crate) const fn journal(
         chunks: Vec<aterm_restore::HistoryChunk>,
         cols: u16,
         skip: u64,
@@ -1814,7 +1814,7 @@ impl HistoryCarry {
 
     /// How many lines the carry names — what is lost if it fails.
     #[must_use]
-    pub(crate) fn take(&self) -> u64 {
+    pub(crate) const fn take(&self) -> u64 {
         self.take
     }
 
@@ -2099,7 +2099,7 @@ pub(crate) struct ImportReport {
 impl ImportReport {
     /// Every line this handoff could not carry for the session.
     #[must_use]
-    pub(crate) fn lost(&self) -> u64 {
+    pub(crate) const fn lost(&self) -> u64 {
         self.dropped.saturating_add(self.failed_lines)
     }
 

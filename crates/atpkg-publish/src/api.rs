@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The interfaces between the producer's parts: the lanes ([`crate::lane`]) and the
-//! `rustc` group publish ([`crate::channel`]) pack through [`Packer`] / [`BundlePacker`]
-//! ([`crate::artifact`]), and the lanes publish an index through [`Indexer`]
-//! ([`crate::channel`]) with a [`Delta`] over the verified channel head. The lanes' tests
-//! drive fakes of these traits, so the decision logic is tested without a build or a
-//! network.
+//! Producer seam traits ([`Packer`], [`BundlePacker`], [`Indexer`]) and their request/outcome types.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -24,8 +19,7 @@ pub enum Signing {
     /// With the machine key (`Ctx::identity.key`).
     #[default]
     MachineKey,
-    /// Not at all: the manifest is staged for a signing ceremony on a rostered machine
-    /// (`atpkg-publish sign`). An unsigned pack is never uploaded.
+    /// Staged unsigned for a signing ceremony (`atpkg-publish sign`); never uploaded.
     Unsigned,
 }
 
@@ -49,21 +43,17 @@ pub struct PackRequest {
     pub checkout: PathBuf,
     /// The target. The build passes `--target` and the arch gate holds the bytes to it.
     pub triple: Triple,
-    /// The build number; `None` is `git rev-list --count HEAD` of the checkout. A repack
-    /// of unchanged source under a new compiler needs its own.
+    /// Build number (`None` uses `git rev-list --count HEAD` of the checkout).
     pub build: Option<Build>,
-    /// Extend this manifest (its bytes verbatim, this target's row appended) instead of
-    /// starting one: one build, every target.
+    /// Existing manifest to extend with this target's row instead of starting a new one.
     pub merge_from: Option<PathBuf>,
-    /// A Trust bin dir to build with; `None` resolves the store's (physically, leased
-    /// for the whole pack).
+    /// Trust bin dir to build with (`None` leases the store's toolchain).
     pub toolchain: Option<PathBuf>,
     /// Where the stage, the asset and the manifest go.
     pub out: PathBuf,
     /// How the manifest is signed.
     pub signing: Signing,
-    /// Upload the asset and the signed manifest to the staging owner's
-    /// `atpkg-<program>-<build>` release.
+    /// Upload the asset and signed manifest to the staging `atpkg-<program>-<build>` release.
     pub upload: bool,
     /// Extra build environment (a cross linker: `CARGO_TARGET_<TRIPLE>_LINKER`).
     pub env: Vec<(String, String)>,
@@ -96,8 +86,7 @@ pub struct PackOutcome {
 
 /// Packs plain programs ([`crate::artifact::pack`]).
 pub trait Packer {
-    /// Whether this machine can pack at all, probed before a lane builds anything: a pack
-    /// that dies deep inside a build would latch a program with nothing wrong with it.
+    /// Probes whether this machine can pack before a lane builds anything.
     ///
     /// # Errors
     ///
@@ -117,8 +106,7 @@ pub trait Packer {
 pub struct HelloGate {
     /// Run the hello-world probe (disabled only for a local debugging pack).
     pub enabled: bool,
-    /// The Trust sysroot the packed compiler was built from (trust-mc); used for
-    /// admission and the payload scan even when the probe is disabled.
+    /// Trust sysroot the packed compiler was built from (`trust-mc`), used for admission and payload scan.
     pub sysroot: Option<PathBuf>,
 }
 
@@ -198,9 +186,7 @@ pub struct TripleDrop {
     pub reason: String,
 }
 
-/// One publish's change to the channel, applied to the verified head. Everything it does
-/// not name is carried: pins, per-target pins, `min_build`, `yanked`, `valid_until`, every
-/// program's metadata.
+/// Channel changes for one publish, applied over the verified head while carrying all unmentioned state.
 #[derive(Clone, Debug, Default)]
 pub struct Delta {
     /// `pin` moves (or new programs, which must be rows of [`crate::programs::PROGRAMS`]).
@@ -230,8 +216,7 @@ pub struct Delta {
 pub enum Baseline {
     /// The channel's newest published index, fetched and verified (the default).
     ChannelHead,
-    /// A verified quad already on disk (its number must be the channel's head when
-    /// uploading).
+    /// A verified quad on disk (must match the channel head when uploading).
     Dir(PathBuf),
     /// A genuine first publish of a channel: no carry, no floors.
     First {
@@ -251,11 +236,9 @@ pub struct IndexRequest {
     pub delta: Delta,
     /// Where the signed quad is written.
     pub out: PathBuf,
-    /// Publish: make every pinned pack public, then the quad. `false` is a dry run that
-    /// still signs and self-verifies, and touches no host but to read an ALab pack it pins.
+    /// Upload pinned packs and the signed quad (`false` signs and self-verifies locally).
     pub upload: bool,
-    /// Where an ALab pack this index pins is read from for a dry run (its manifest pair and
-    /// archive), instead of the hosts: a local proof. Refused with `upload`.
+    /// Local directory for reading pinned ALab packs during a dry run (refused with `upload`).
     pub pack_dir: Option<PathBuf>,
 }
 

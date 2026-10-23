@@ -20,7 +20,11 @@ pub(crate) struct ConfirmPrompt {
 }
 
 /// Whether a close/quit gesture needs a confirmation dialog, and with what copy.
-pub(crate) fn confirm_prompt(exits_app: bool, busy: bool, reopens: bool) -> Option<ConfirmPrompt> {
+pub(crate) const fn confirm_prompt(
+    exits_app: bool,
+    busy: bool,
+    reopens: bool,
+) -> Option<ConfirmPrompt> {
     if exits_app {
         Some(ConfirmPrompt {
             title: "Are you sure you want to quit aterm?",
@@ -57,7 +61,7 @@ pub(crate) const CLOSE_TAB: &str = "Close Tab";
 pub(crate) const CLOSE_PANE: &str = "Close Pane";
 
 /// The copy for closing a tab (`pane` false) or a pane that leaves its window standing while a job runs in it.
-pub(crate) fn busy_view_close_prompt(pane: bool) -> ConfirmPrompt {
+pub(crate) const fn busy_view_close_prompt(pane: bool) -> ConfirmPrompt {
     ConfirmPrompt {
         title: if pane {
             "A process is still running in this pane."
@@ -115,7 +119,7 @@ pub(crate) fn shell_executing(term: &aterm_core::terminal::Terminal) -> bool {
 }
 
 /// Whether `term`'s shell integration has ever reported a whole COMMAND (a 133;C that a 133;D closed: the engine drops a D no C opened) rather than only its prompts.
-pub(crate) fn shell_reports_commands(term: &aterm_core::terminal::Terminal) -> bool {
+pub(crate) const fn shell_reports_commands(term: &aterm_core::terminal::Terminal) -> bool {
     term.completed_command_seq() > 0
 }
 
@@ -287,6 +291,7 @@ impl JobProbe {
         capture: impl FnOnce() -> ChildLinks,
     ) -> bool {
         // The unix answer is the per-fd `tcgetpgrp` the sweep read, never a
+        // process-table walk: take it verbatim and keep no state for it.
         if fg > 0 {
             self.keys.remove(&session);
             return fg != shell_pid;

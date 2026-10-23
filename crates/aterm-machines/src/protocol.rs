@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The wire between the controller and a host's forced-command dispatcher (design §2, §4.4).
+//! The wire between the controller and a host's forced-command dispatcher.
 //!
 //! The fleet SSH key's `authorized_keys` line forces `<agent> machines agent ssh`, which reads
 //! `SSH_ORIGINAL_COMMAND` (split on spaces, never through a shell) as one of:
@@ -19,7 +19,7 @@
 use crate::model::{HostReport, ItemReport};
 use serde::{Deserialize, Serialize};
 
-/// The agent's installed root (design §3.4).
+/// The agent's installed root.
 pub const AGENT_ROOT: &str = crate::AGENT_ROOT;
 
 /// The stable path the sudoers rule and the forced command name.
@@ -28,11 +28,7 @@ pub const AGENT_EXE: &str = "/Library/Management/aterm/bin/aterm";
 /// The SSHSIG namespace every envelope is signed in.
 pub const SIG_NAMESPACE: &str = "aterm-machines";
 
-/// The `authorized_keys` options for the fleet key (design §3.1): `restrict` and the forced
-/// command, nothing re-enabled. No forwarding of any kind: `port-forwarding` would admit
-/// `-R`, a TCP or Unix-socket listener on the host that `permitopen` does not limit (measured
-/// in the VM), and a session-less `-N` that never runs the forced command. Screen Sharing
-/// travels as the `screen` request.
+/// Format the `authorized_keys` line for the fleet key with `restrict` and the forced command.
 #[must_use]
 pub fn authorized_keys_line(public_key: &str, comment: &str) -> String {
     format!(
@@ -41,16 +37,14 @@ pub fn authorized_keys_line(public_key: &str, comment: &str) -> String {
     )
 }
 
-/// What `hello` answers: everything the controller needs before it signs anything, readable
-/// without root.
+/// Host state returned by `hello`, readable without root before signing an envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Hello {
     /// [`crate::SCHEMA`].
     pub schema: u32,
     /// The agent's version.
     pub agent_version: String,
-    /// SHA-256 (hex) of the running agent executable: `apply` upgrades a host whose agent
-    /// is not the controller's own build (design §4.5). Empty when it could not be read.
+    /// SHA-256 (hex) of the running agent executable, or empty when unreadable.
     #[serde(default)]
     pub agent_sha256: String,
     /// The item families this agent knows (`power`, `keyboard`, …).
@@ -69,10 +63,7 @@ pub struct Hello {
     pub os_build: String,
     /// `uname -m`.
     pub arch: String,
-    /// What the Mac is, in the parts `[names]` fills `{hardware}` with
-    /// (`hardware::Description::parts`: `MacBook Air`, `M5`, `32GB`, `4TB`); empty when a
-    /// fact could not be read, and from an agent older than the field. The controller finds a
-    /// Mac its baseline renamed by it (`controller::naming::renamed_address`).
+    /// Hardware description parts (`MacBook Air`, `M5`, `32GB`, `4TB`) used to fill `{hardware}`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hardware: Vec<String>,
     /// Who owns `/dev/console`.
@@ -96,8 +87,7 @@ pub struct Hello {
     pub vitals: Option<HostVitals>,
 }
 
-/// Live system telemetry snapshot reported in [`Hello::vitals`] or sampled by
-/// `aterm machines monitor` (`docs/DESIGN-fleet-monitor-2026-10-20.md` §3.1).
+/// Live system telemetry snapshot reported in [`Hello::vitals`] or sampled by `aterm machines monitor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HostVitals {
     /// Logical CPU core count (`hw.ncpu` / `nproc`).

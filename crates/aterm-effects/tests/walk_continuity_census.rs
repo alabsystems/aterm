@@ -1,32 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The walk's continuity census: the typed band's colour is smooth and continuous. A cell's
-//! colour is `Cohort::t_at(col) = walk_zero() + walk_t(walk_d(col))`; along one input,
-//! neighbouring lit cells step by exactly one walk step (`1/16` over the walk's first sixteen
-//! cells, `WALK_LAY_RATE` after), and a wrap carries both colour and distance. The designed
-//! restarts (Return, a line kill, a cross-row keyed Nav: colour kept, pace restarted) never put
-//! two lit cells of one line side by side. So per presented frame ([`walk_census::Snap::judge`]):
+//! Walk continuity census: neighboring lit cells along one input step forward by one walk step
+//! (`1/16` over the first sixteen cells, `WALK_LAY_RATE` after), with no dark gaps (`Hole`) and no
+//! recolouring across frames ([`walk_census::Snap::judge`], [`walk_census::recolours`]).
 //!
-//! * every pair of text-adjacent lit cells steps forward by one walk step, never back
-//!   (`Back`), never the same stop twice (`Repeat`), never more than one step or any other
-//!   step (`Jump`);
-//! * a `1/16` step never follows a `1/36` one to its left (`Restart`), and a line's first
-//!   sixteen cells step `1/16` (`NoFastLeg`);
-//! * no text cell between two lit ones is dark (`Hole`);
-//!
-//! and across frames ([`walk_census::recolours`]) no text cell is lit again in another colour
-//! while the text up to it stayed the same.
-//!
-//! A flag standing [`STANDING_FRAMES`] frames or more is a defect; fewer, a
-//! transient. The host is the GUI's frame seam (`tests/claude_wrap_band.rs`'s
-//! lock A) on a real `Terminal`: a line editor on the primary screen
-//! ([`walk_census::Shell`], keys stamped as `app_input.rs` stamps them) on a
-//! flat 16 ms train or the GUI's pacing, plus captured Claude Code composer
-//! takes replayed byte for byte. The shell folds as bash readline does (`<glyph>
-//! \r` on the key that fills the margin); scenarios that do not name a fold are
-//! read behind every [`Fold`] (readline, zsh zle, and the kernel's cooked-mode
-//! echo used by `cat` and `read`).
+//! A flag standing [`STANDING_FRAMES`] frames or more is a defect. Scenarios run on a primary-screen
+//! [`walk_census::Shell`] behind each [`Fold`] alongside captured Claude Code composer takes.
 
 use crate::walk_census::*;
 use aterm_effects::cursor_glow::InsertWidth;
@@ -115,12 +95,9 @@ fn coalesced_fold(echo: u64) -> Shell {
     s
 }
 
-/// Every scenario the census runs. A name starting `zle-` or `kernel-` names
-/// its fold ([`Fold`]) and is read once; every other is read behind each fold.
+/// Scenarios the census runs; `zle-` and `kernel-` name their [`Fold`], while others run behind every fold.
 #[expect(clippy::type_complexity, reason = "a test's case table")]
 const SCENARIOS: &[(&str, fn() -> Shell)] = &[
-    // Plain typing across two wraps, at 12 cps behind three echo lags, and
-    // at 25 cps.
     ("wrap2-83ms-echo2", || typed(sh(), &prose(140))),
     ("wrap2-83ms-echo0", || {
         typed(Shell::new(60, 83, Echo::After(0)), &prose(140))
@@ -132,8 +109,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     ("burst-25ms-across-wrap", || {
         typed(Shell::new(60, 25, Echo::After(2)), &prose(90))
     }),
-    // Backspace then retype: mid-row, back up through a fold, after a rest
-    // inside the grace, and held (33 ms repeat) back through the fold.
     ("bs5-retype", || {
         edited(sh(), &prose(30), "bs", |s| bs(s, 5), "abcdefgh")
     }),
@@ -171,7 +146,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
             "walking the fold again",
         )
     }),
-    // ^W and ^U then retype (^U is a new line: the pace restarts by design).
     ("ctrlw-retype", || {
         edited(
             sh(),
@@ -196,8 +170,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     ("ctrlu-wrapped-retype", || {
         edited(sh(), &prose(80), "^U", Shell::line_kill, &prose(30))
     }),
-    // Rests: past the swoosh (the rebirth, `last_walk`), inside it
-    // (retracting), twice, and past the chain window (a cold start by design).
     ("rest-rebirth", || rested(sh(), &prose(30), 2_500, ON)),
     ("rest-rebirth-echo20", || {
         rested(sh20(), &prose(30), 2_500, ON)
@@ -223,8 +195,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
         )
     }),
     ("rest-past-chain", || rested(sh(), &prose(30), 5_600, ON)),
-    // Navigation: Home, a rest, End; Home then an insert pushing the whole
-    // line; Left x3 then End.
     ("home-end-type", || {
         edited(
             sh(),
@@ -255,9 +225,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
             " on",
         )
     }),
-    // A paste burst, a Tab completing the word, a Tab whose completion
-    // REWRITES the word (a case-folding match: the shell reprints from the
-    // word's start), a Space held across the fold (auto-repeat at 33 ms).
     ("paste-burst", || {
         edited(
             sh(),
@@ -314,11 +281,9 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
             "after the held space",
         )
     }),
-    // Return: the census follows the new line (a designed restart).
     ("return-newline", || {
         edited(sh(), &prose(20), "ret", Shell::ret, &prose(30))
     }),
-    // The GUI's real pacing, the same takes.
     ("paced-wrap2-83ms", || typed(paced(), &prose(140))),
     ("paced-bs-across-wrap-retype", || {
         edited(
@@ -343,8 +308,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     }),
     ("lag60-40ms-across-wrap", || lagged(sh())),
     ("paced-lag60-40ms-across-wrap", || lagged(paced())),
-    // A long prompt (the line folds inside its fast leg), a 20-column pane
-    // (four folds).
     ("long-prompt-early-fold", || {
         let prompt = format!("{}$ ", "~".repeat(48));
         typed(
@@ -355,10 +318,6 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     ("narrow-20cols", || {
         typed(Shell::new(20, 83, Echo::After(2)), &prose(75))
     }),
-    // The same typing across two folds, and the same wrapped line revived
-    // after a rest, behind zsh's zle and behind the kernel's cooked-mode echo
-    // (`cat`, `read`); the last behind a kernel echo that lands a frame after
-    // its key (§43's order: the revive's re-lay laid before the key's cell).
     ("zle-wrap2-83ms-echo2", || {
         typed(sh().folding(Fold::Zle), &prose(140))
     }),
@@ -374,11 +333,7 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     ("kernel-rest-rebirth-wrapped-echo20", || {
         rested(sh20().folding(Fold::Kernel), &prose(80), 2_500, ON)
     }),
-    // A run no key saw standing: the hand rests right after a run's first key
-    // (one key, or behind the kernel echo the fold's own glyph), so no later
-    // key frame read the run's walk while it stood, and behind a frame-late
-    // echo the revive's re-lay is laid before the key's cell. At 60 columns
-    // behind `$ `, text 58 is the continuation row's column 0.
+    // Rest right after a run's first key or fold glyph so no later key frame saw the run standing.
     ("one-key-rest-echo20", || {
         rested(sh20(), "t", 2_500, " and on")
     }),
@@ -391,9 +346,7 @@ const SCENARIOS: &[(&str, fn() -> Shell)] = &[
     }),
 ];
 
-/// A captured Claude Code take at its recording's grid (`resize 40 120`,
-/// 7×14 px cells, the composer's text on rows 33..=37 behind a two-cell
-/// indent), with a rest inserted before the `k`-th printable key.
+/// A captured Claude Code take on a 40×120 grid (7×14 px cells, composer rows 33..=37, two-cell indent).
 const fn claude(name: &'static str, src: &'static str, pause: Option<(usize, u64)>) -> Capture {
     Capture {
         name,
@@ -410,10 +363,7 @@ const fn claude(name: &'static str, src: &'static str, pause: Option<(usize, u64
 
 const WRAP_END: &str = include_str!("fixtures/claude-wrap-2026-09-23-end.ptylog");
 
-/// The captured Claude Code takes the census replays: the wrap take with the
-/// hand resting 2.5 s before `however` (row 1) and before ` in the other`
-/// (row 2, after the box grew), and as recorded; the composer's end take; an
-/// arrow-key insert.
+/// Captured Claude Code composer takes replayed by the census.
 const CAPTURES: [Capture; 5] = [
     claude("claude-wrap-end-rest-row1", WRAP_END, Some((62, 2_500))),
     claude("claude-wrap-end-rest-row2", WRAP_END, Some((125, 2_500))),
@@ -430,10 +380,7 @@ const CAPTURES: [Capture; 5] = [
     ),
 ];
 
-/// The census: every scenario and capture lays a lit band and reads clean (no
-/// flagged run standing [`STANDING_FRAMES`] frames and no recolour). A
-/// scenario that does not name its fold is read behind every fold
-/// ([`Fold::ALL`], verdicts labelled `<name>@<fold>`).
+/// Every scenario and capture lays a lit band with no standing flagged run ([`STANDING_FRAMES`]) and no recolour.
 #[test]
 fn census() {
     enum Run<'a> {
@@ -456,9 +403,6 @@ fn census() {
     for cap in &CAPTURES {
         jobs.push((cap.name.to_string(), Run::Capture(cap)));
     }
-    // Each replay is its own shell or capture on its own `Terminal`: they run
-    // on the binary's threads, each read where it ran, and are judged in the
-    // order above.
     let read = crate::common::par_map(&jobs, |(_, run)| {
         let snaps = match run {
             Run::Scenario(build, None) => build().snaps,

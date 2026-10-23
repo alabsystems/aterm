@@ -709,7 +709,7 @@ fn a_forced_short_elapsed_slot_spends_nothing() {
     );
 }
 
-/// `keep_command`: when a `Run `…`` sentence's command cannot survive the
+/// `keep_command`: when a `` Run `…` `` sentence's command cannot survive the
 /// cut whole, as much of the command as fits is kept, never its first token
 /// alone.
 #[test]

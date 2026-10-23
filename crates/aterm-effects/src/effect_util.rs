@@ -23,6 +23,7 @@ pub(crate) fn push_grid_quad(
     premul: u32,
     alpha: u8,
 ) {
+    // Zero light is skippable only when additive: a source-over quad whose
     // premultiplied colour rounds to black still darkens the cell by `alpha`.
     if w <= 0 || h <= 0 || (premul == 0 && alpha == 0) {
         return;

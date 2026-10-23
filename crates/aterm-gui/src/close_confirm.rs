@@ -137,7 +137,7 @@ impl PendingClose {
     }
 
     /// This question's serial (never `0`).
-    pub(crate) fn serial(&self) -> u64 {
+    pub(crate) const fn serial(&self) -> u64 {
         self.serial
     }
 
@@ -147,7 +147,7 @@ impl PendingClose {
     }
 
     /// Whether the wire's `confirm yes|no` answers this question.
-    pub(crate) fn wire_may_answer(&self) -> bool {
+    pub(crate) const fn wire_may_answer(&self) -> bool {
         match &self.asked_by {
             ExitActor::Sid(_) | ExitActor::Ctl => true,
             #[cfg(any(unix, test))]

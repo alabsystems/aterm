@@ -61,22 +61,22 @@ fn inert_census(_bundle_id: &str) -> Claimants {
 }
 
 /// Inert debugger probe returning `unknown` / `refused_disabled`.
-fn inert_debugger(_gate: ProbeGate) -> DebuggerProbe {
+const fn inert_debugger(_gate: ProbeGate) -> DebuggerProbe {
     DebuggerProbe::refused(DebuggerProbeLabel::RefusedDisabled)
 }
 
 /// Inert hardening probe returning `Unknown`.
-fn inert_hardening() -> SelfHardening {
+const fn inert_hardening() -> SelfHardening {
     SelfHardening::Unknown
 }
 
 /// Inert Developer Tools log probe returning `unknown` / `refused_disabled`.
-fn inert_devtools(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
+const fn inert_devtools(_gate: ProbeGate, _subject: &str) -> DevToolProbe {
     DevToolProbe::refused(DevToolProbeLabel::RefusedDisabled)
 }
 
 /// Inert Developer Tools list probe.
-fn inert_devtools_list(_gate: ProbeGate, _subject: &str) -> DevToolList {
+const fn inert_devtools_list(_gate: ProbeGate, _subject: &str) -> DevToolList {
     DevToolList::refused(DevToolListLabel::RefusedDisabled)
 }
 
@@ -146,7 +146,7 @@ impl ConsentProbes {
     }
 }
 
-fn unsupported_fda_probe(gate: ProbeGate) -> FdaProbe {
+const fn unsupported_fda_probe(gate: ProbeGate) -> FdaProbe {
     FdaProbe::refused(if gate.permits() {
         ProbeLabel::UnsupportedPlatform
     } else {
@@ -155,7 +155,7 @@ fn unsupported_fda_probe(gate: ProbeGate) -> FdaProbe {
 }
 
 /// Unsupported debugger probe off macOS.
-fn unsupported_debugger_probe(gate: ProbeGate) -> DebuggerProbe {
+const fn unsupported_debugger_probe(gate: ProbeGate) -> DebuggerProbe {
     DebuggerProbe::refused(if gate.permits() {
         DebuggerProbeLabel::UnsupportedPlatform
     } else {
@@ -164,7 +164,7 @@ fn unsupported_debugger_probe(gate: ProbeGate) -> DebuggerProbe {
 }
 
 /// Unsupported Developer Tools log probe off macOS.
-fn unsupported_devtools_probe(gate: ProbeGate, _subject: &str) -> DevToolProbe {
+const fn unsupported_devtools_probe(gate: ProbeGate, _subject: &str) -> DevToolProbe {
     DevToolProbe::refused(if gate.permits() {
         DevToolProbeLabel::UnsupportedPlatform
     } else {
@@ -173,7 +173,7 @@ fn unsupported_devtools_probe(gate: ProbeGate, _subject: &str) -> DevToolProbe {
 }
 
 /// Unsupported Developer Tools list probe off macOS.
-fn unsupported_devtools_list(gate: ProbeGate, _subject: &str) -> DevToolList {
+const fn unsupported_devtools_list(gate: ProbeGate, _subject: &str) -> DevToolList {
     DevToolList::refused(if gate.permits() {
         DevToolListLabel::UnsupportedPlatform
     } else {
@@ -182,7 +182,7 @@ fn unsupported_devtools_list(gate: ProbeGate, _subject: &str) -> DevToolList {
 }
 
 /// Inert Full Disk Access probe returning `refused_disabled`.
-fn inert_fda_probe(_gate: ProbeGate) -> FdaProbe {
+const fn inert_fda_probe(_gate: ProbeGate) -> FdaProbe {
     FdaProbe::refused(ProbeLabel::RefusedDisabled)
 }
 
@@ -1533,7 +1533,7 @@ impl ConsentPolicy {
 }
 
 /// Compute a session's [`Attribution`] and [`FsConsent`] under `policy`.
-pub(crate) fn session_posture(
+pub(crate) const fn session_posture(
     policy: &ConsentPolicy,
     observed: Attribution,
     fda: FdaState,
@@ -1610,7 +1610,7 @@ pub(crate) fn consent_at_risk(
 }
 
 /// Session attribution from `session`'s handoff adoption record.
-pub(crate) fn session_attribution(session: &crate::Session) -> Attribution {
+pub(crate) const fn session_attribution(session: &crate::Session) -> Attribution {
     if session.handoff_local_id.is_some() {
         Attribution::Adopted
     } else {

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! NSAccessibility publishing for one real macOS content view. The same validated
-//! tree and text consumer as AT-SPI supplies roles, children, geometry and text.
-//! No application/window is created here. Construction requires a live NSView;
-//! an absent view is inert, and the first assistive read requests the full tree.
+//! NSAccessibility publishing for one real macOS content view.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,9 +33,6 @@ unsafe extern "C" {
     static NSAccessibilityFocusedUIElementChangedNotification: Id;
 }
 
-// Strong references are created and used only on the main thread. Exported
-// elements retain atomic weak counters, which may be dropped by a foreign
-// final Objective-C release without dropping or accessing Context there.
 type Shared = Arc<RefCell<Context>>;
 
 struct Context {
@@ -54,8 +48,6 @@ struct Context {
 }
 
 impl Context {
-    /// Every semantic getter shares the held object's lifetime admission,
-    /// including getters that only need the current focus, hit or window.
     fn read_live<R>(
         &self,
         handle: Option<&Handle>,
@@ -73,13 +65,10 @@ impl Context {
 
 struct ElementIvars {
     context: Weak<RefCell<Context>>,
-    /// None is the lazy host group; other elements name one model insertion.
     handle: Option<Handle>,
 }
 
 aterm_objc::declare_class! {
-    /// A retained semantic element, with all action ingress checked against its
-    /// live model insertion before being posted to the host's event loop.
     struct Element: NSAccessibilityElement {
         const NAME: &str = "ATermSemanticAccessibilityElement";
         type Ivars = ElementIvars;
@@ -357,8 +346,8 @@ aterm_objc::declare_class! {
                     let live = self.read(|cx, handle| handle.is_none() ||
                         handle.and_then(|handle| cx.publication.node(handle)).is_some()).unwrap_or(false);
                     if !live { return Bool::NO; }
-                    // SAFETY: ask the inherited NSAccessibilityElement policy for
-                    // remaining read selectors. The exact prototype is -(BOOL)(SEL).
+                    // SAFETY: ask the inherited NSAccessibilityElement policy for remaining read
+                    // selectors.
                     unsafe {
                         let send: unsafe extern "C-unwind" fn(*mut aterm_objc::ObjcSuper, Sel, Sel) -> Bool = aterm_objc::msg_super();
                         send(&mut self.super_receiver(), sel!(isAccessibilitySelectorAllowed:), selector)
@@ -422,8 +411,6 @@ aterm_objc::declare_class! {
 
 impl Element {
     fn read<R>(&self, read: impl FnOnce(&Context, Option<&Handle>) -> R) -> Option<R> {
-        // AppKit normally queries on the main thread. Refuse an unexpected foreign
-        // thread before reading any main-thread Rust ivars or ObjC object state.
         MainThread::new()?;
         let cx = self.ivars().context.upgrade()?;
         activate(&cx);
@@ -449,26 +436,21 @@ impl Element {
         else {
             return false;
         };
-        // Do not hold the tree's RefCell across a host callback.
         handler.borrow_mut().do_action(request);
         true
     }
 }
 
-/// One window's publisher. It never initializes NSApplication, registers a global
-/// observer or reads the system's accessibility preferences.
+/// One window's publisher.
 pub struct Adapter {
     context: Shared,
     host: Retained<Element>,
 }
 
 impl Adapter {
-    /// Attach to a real NSView. `None` refuses without touching AppKit, which is
-    /// also the offscreen/test arm. A non-main-thread caller is refused.
-    ///
+    /// Attach to a real NSView.
     /// # Safety
-    /// A supplied non-null `view` must be a live NSView on this thread. The
-    /// publisher keeps a zeroing weak reference, so it cannot extend its life.
+    /// A supplied non-null `view` must be a live NSView on this thread.
     pub unsafe fn new(
         view: Option<Id>,
         scale: f64,
@@ -504,8 +486,7 @@ impl Adapter {
         // SAFETY: host is retained and cannot be deallocating.
         context.borrow_mut().host = Some(unsafe { WeakObj::new(host.as_id()) });
         let view = context.borrow().view.load()?;
-        // SAFETY: live main-thread NSView; the array retains its child. Setting
-        // children does not replace the NSView or its keyboard/IME implementation.
+        // SAFETY: live main-thread NSView; the array retains its child.
         unsafe {
             let set: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             set(
@@ -536,8 +517,7 @@ impl Adapter {
         announce(&self.context, changes);
     }
 
-    /// The model's bounds stay in client pixels; screen conversion reads the
-    /// current view/window, so a move needs only an extent-change notification.
+    /// The model's bounds stay in client pixels.
     pub fn window_moved(&mut self) {
         if self.context.borrow().active {
             notify(self.host.as_id(), Notification::Layout);
@@ -547,14 +527,12 @@ impl Adapter {
 
 impl Drop for Adapter {
     fn drop(&mut self) {
-        // Close activation and invalidate model leases before touching AppKit. A
-        // retained element queried during teardown cannot restart this publisher.
         self.context.borrow_mut().closed = true;
         self.context.borrow_mut().active = false;
         self.context.borrow_mut().publication = Publication::default();
         if let Some(view) = self.context.borrow().view.load() {
-            // SAFETY: the publisher is main-thread-only and this load retains a
-            // still-live NSView; nil removes this publisher's children.
+            // SAFETY: the publisher is main-thread-only and this load retains a still-live NSView;
+            // nil removes this publisher's children.
             unsafe {
                 let set: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
                 set(view.id(), sel!(setAccessibilityChildren:), Id::NIL);
@@ -619,8 +597,8 @@ fn notify(element: Id, notification: Notification) {
     if element.is_null() {
         return;
     }
-    // SAFETY: each caller holds the live main-thread element across this call;
-    // the framework constants have static lifetime and the C signature is exact.
+    // SAFETY: each caller holds the live main-thread element across this call; the framework
+    // constants have static lifetime and the C signature is exact.
     unsafe {
         let name = match notification {
             Notification::Layout => NSAccessibilityLayoutChangedNotification,
@@ -637,8 +615,8 @@ fn announce_live(context: &Shared, live: Live, value: &str) {
         let Some(view) = cx.view.load() else {
             return;
         };
-        // SAFETY: getters on a retained live view and its window; the window's
-        // accessibility parent is the existing application, never +sharedApplication.
+        // SAFETY: getters on a retained live view and its window; the window's accessibility parent
+        // is the existing application, never +sharedApplication.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let window = get(view.id(), sel!(window));
@@ -654,8 +632,8 @@ fn announce_live(context: &Shared, live: Live, value: &str) {
     let Some(value) = ns_string(value) else {
         return;
     };
-    // SAFETY: static framework NSString keys and an existing application element;
-    // the dictionary factory copies/retains each counted key and value for the call.
+    // SAFETY: static framework NSString keys and an existing application element; the dictionary
+    // factory copies/retains each counted key and value for the call.
     unsafe {
         let keys = [NSAccessibilityAnnouncementKey, NSAccessibilityPriorityKey];
         let values = [
@@ -708,8 +686,6 @@ fn announce(context: &Shared, changes: Changes) {
             .flatten();
         (host, updated, focus)
     };
-    // OS notification delivery can call back synchronously. No tree borrow lives
-    // across these calls, and retained objects survive a reentrant update.
     if let Some(host) = host {
         notify(host.id(), Notification::Layout);
     }
@@ -736,8 +712,7 @@ fn string(value: &str) -> Id {
 }
 
 fn array(items: impl IntoIterator<Item = Id>) -> Id {
-    // SAFETY: NSMutableArray's +new returns +1; addObject: retains live, non-null
-    // objects. The array is returned autoreleased, as an ObjC getter requires.
+    // SAFETY: NSMutableArray's +new returns +1; addObject: retains live, non-null objects.
     unsafe {
         let new: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = checked_msg();
         let Some(array) = Obj::from_owned(new(class(c"NSMutableArray"), sel!(new))) else {
@@ -765,8 +740,8 @@ fn is_class(value: Id, name: &'static std::ffi::CStr) -> bool {
     if value.is_null() || MainThread::new().is_none() {
         return false;
     }
-    // SAFETY: an Objective-C setter supplies an object; NSObject's class query
-    // establishes the more specific class before any class-specific getter.
+    // SAFETY: an Objective-C setter supplies an object; NSObject's class query establishes the more
+    // specific class before any class-specific getter.
     unsafe {
         let send: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ClassPtr) -> Bool =
             checked_msg();
@@ -778,8 +753,8 @@ fn custom_action(target: Id, name: &str, selector: Sel) -> Id {
     let Some(name) = ns_string(name) else {
         return Id::NIL;
     };
-    // SAFETY: the SDK's designated initializer consumes +alloc and takes a
-    // live NSString, weak NSObject target and a BOOL-returning selector.
+    // SAFETY: the SDK's designated initializer consumes +alloc and takes a live NSString, weak
+    // NSObject target and a BOOL-returning selector.
     unsafe {
         let alloc: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = checked_msg();
         let raw = alloc(class(c"NSAccessibilityCustomAction"), sel!(alloc));
@@ -869,8 +844,6 @@ const fn role(role: Role) -> &'static str {
         Role::ListBoxOption => "AXRow",
         Role::Menu => "AXMenu",
         Role::ProgressIndicator => "AXProgressIndicator",
-        // A gauge, not a task: VoiceOver reads a level indicator's value as
-        // a level ("3.1 of 10").
         Role::Meter => "AXLevelIndicator",
         Role::Grid => "AXGrid",
         Role::Slider => "AXSlider",
@@ -938,8 +911,6 @@ mod tests {
         }
     }
 
-    /// The stats bars' gauges read as level indicators and their core
-    /// heatmap as a grid; a progress bar stays a progress indicator.
     #[test]
     fn a_meter_is_a_level_indicator_and_a_grid_a_grid() {
         assert_eq!(role(Role::Meter), "AXLevelIndicator");
@@ -953,9 +924,6 @@ mod tests {
         assert!(unsafe { Adapter::new(None, 1., Inert, Inert) }.is_none());
     }
 
-    /// Exercise the exact common getter gate without an AppKit object or view.
-    /// The closures model focus/hit/window getters, which need not themselves
-    /// inspect their element handle. A retired object must invoke none of them.
     #[test]
     fn retired_elements_cannot_read_replacement_focus_hits_or_window() {
         use crate::model::{

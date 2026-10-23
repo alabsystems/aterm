@@ -40,7 +40,6 @@ where
 }
 
 /// [`deliver`] by the background route, as a `verb`'s arm calls it for a session not on screen.
-#[cfg_attr(not(unix), allow(dead_code))] // its tests are unix-only
 fn background(
     verb: &str,
     term: &Arc<Mutex<Terminal>>,
@@ -3361,7 +3360,7 @@ fn never_listening_socket(path: &std::path::Path) {
 #[cfg(unix)]
 fn a_stale_graph_entry_answers_no_such_session_without_a_probe() {
     use std::io::{BufRead, BufReader, Write};
-    /// The read timeout a lane serves a connection.
+    /// The read timeout a lane serves a connection under.
     const LANE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
     let scratch = crate::test_scratch::short_dir("the control dir");
     let dir = scratch.path();
@@ -4226,9 +4225,9 @@ fn mouse_grammar_and_mods_refusal() {
     enum Want {
         /// Parses to exactly this event.
         Event(InputEvent),
-        /// Parses to a press whose `click_count`.
+        /// Parses to a press whose `click_count` is this.
         ClickCount(u8),
-        /// Parses to a move whose `buttons` code.
+        /// Parses to a move whose `buttons` code is this.
         DragButtons(u8),
         /// Parses (the refusal rows' positive control).
         Accepted,
@@ -5349,6 +5348,7 @@ fn test_ctx() -> Arc<crate::SessionCtx> {
 
 /// The decision the op-scope gate at the top of `serve_session_verb` makes.
 fn gate_allows(scope: Scope, verb: &str, active: &SessionCtx) -> bool {
+    // An Edge passes only if its token holds the verb's op on the now-active session, so it
     // cannot drive a session it was never granted on after the active handle moves.
     scope.is_owner_class() || cross_session_authorized(scope, verb, active)
 }
@@ -7816,7 +7816,7 @@ fn the_push_probe_enters_the_kernel_once() {
 fn subscribe_refusals_register_nothing() {
     enum Want {
         Exact(&'static str),
-        /// Starts with `ERR ` and names.
+        /// Starts with `ERR ` and names this.
         Names(&'static str),
     }
     /// (label, sessions (local id, seed) with the first active, line, owner?, want).
@@ -9888,7 +9888,8 @@ fn paste_while_the_peer_closes_mid_write() -> MidWriteClose {
         InputEvent::Paste("newer".into(), PasteFraming::AtDrain),
     ));
     closer.join().expect("peer closer");
-    // SAFETY: a one-byte write from a static buffer to this test's own live (non-blocking) write.
+    // SAFETY: a one-byte write from a static buffer to this test's own live
+    // (non-blocking) write end.
     let probe = unsafe { libc::write(handle.master, b"x".as_ptr().cast(), 1) };
     let peer_observed_dead =
         (probe, std::io::Error::last_os_error().raw_os_error()) == (-1, Some(libc::EPIPE));
@@ -13383,6 +13384,7 @@ fn fabric_attach_body() {
 
 #[test]
 fn the_bridge_verbs_refuse_every_scope_but_the_bridge_inbox_hold() {
+    // `deliver` marks the session bridge-governed in the process-wide link, so
     // this takes the shared reset guard (`fabric::with_link_reset`).
     crate::fabric::with_link_reset(the_bridge_verbs_refuse_every_scope_but_the_bridge_body);
 }
@@ -14367,6 +14369,8 @@ fn only_the_bridge_may_claim_the_fabric_lease_namespace() {
 
 #[test]
 fn dropping_the_bridge_guard_halts_the_governed_sessions_inbox_hold() {
+    // Dropping the guard moves the instance link to `disconnected`, which
+    // `status`'s `fabric=` and `post --wait` read; the reset guard serializes
     // tests that read it.
     crate::fabric::with_link_reset(dropping_the_bridge_guard_halts_the_governed_sessions_body);
 }

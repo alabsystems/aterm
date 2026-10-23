@@ -98,6 +98,42 @@ pub(crate) const MAX_OSC_DATA: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_OSC_PARAMS: usize = 16;
 
 /// VT parser state machine.
+///
+/// ## Example
+///
+/// ```
+/// use aterm_parser::{ActionSink, Parser};
+/// use aterm_provenance::{Provenance, Pty};
+///
+/// struct PrintSink;
+/// impl ActionSink for PrintSink {
+///     fn print(&mut self, c: char) { print!("{}", c); }
+///     fn execute(&mut self, _byte: u8) {}
+///     fn csi_dispatch(
+///         &mut self,
+///         _params: &Provenance<[u16], Pty>,
+///         _intermediates: &Provenance<[u8], Pty>,
+///         _final_byte: u8,
+///     ) {}
+///     fn esc_dispatch(&mut self, _intermediates: &Provenance<[u8], Pty>, _final_byte: u8) {}
+///     fn osc_dispatch(&mut self, _params: &Provenance<[&[u8]], Pty>) {}
+///     fn dcs_hook(
+///         &mut self,
+///         _params: &Provenance<[u16], Pty>,
+///         _intermediates: &Provenance<[u8], Pty>,
+///         _final_byte: u8,
+///     ) {}
+///     fn dcs_put(&mut self, _byte: u8) {}
+///     fn dcs_unhook(&mut self, _canceled: bool) {}
+///     fn apc_start(&mut self) {}
+///     fn apc_put(&mut self, _byte: u8) {}
+///     fn apc_end(&mut self, _canceled: bool) {}
+/// }
+///
+/// let mut parser = Parser::new();
+/// let mut sink = PrintSink;
+/// parser.advance_fast(b"Hello, World!", &mut sink);
+/// ```
 #[derive(Debug, Clone)]
 #[allow(
     clippy::struct_excessive_bools,

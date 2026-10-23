@@ -14,10 +14,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-CHROMIUM file.
 
-//! One node of a [`State`]: its place in the tree, what its model data
-//! means (roles that read their name from a label child or their value, the
-//! read-only defaults, selectable items and their containers), and the
-//! geometry of its transforms and bounds.
+//! One node of a [`State`]: its tree position, model semantics, and geometry.
 
 use std::fmt;
 
@@ -35,9 +32,7 @@ use super::iterators::{FilteredChildren, FollowingFilteredSiblings, PrecedingFil
 pub(crate) struct NodeId(pub(crate) LocalNodeId);
 
 impl From<NodeId> for u128 {
-    /// The number in the node's AT-SPI object path: the model's id in the
-    /// high 64 bits. The publisher adds the exported incarnation in the
-    /// low word, so an old object path cannot name a replacement node.
+    /// The model's id in the high 64 bits of the AT-SPI object path number.
     fn from(id: NodeId) -> Self {
         u128::from(id.0.0) << 64
     }
@@ -88,8 +83,6 @@ impl<'a> Node<'a> {
 
     #[inline]
     pub(crate) fn is_root(&self) -> bool {
-        // Don't check for absence of a parent node, in case a non-root node
-        // somehow gets detached from the tree.
         self.id() == self.tree_state.root_id()
     }
 
@@ -173,8 +166,7 @@ impl<'a> Node<'a> {
         PrecedingFilteredSiblings::new(*self, filter)
     }
 
-    /// Returns the transform defined directly on this node, or the identity
-    /// transform, without taking into account transforms on ancestors.
+    /// Returns the transform defined directly on this node, or the identity transform.
     #[inline]
     pub(crate) fn direct_transform(&self) -> Affine {
         self.data()
@@ -182,8 +174,7 @@ impl<'a> Node<'a> {
             .map_or(Affine::IDENTITY, |value| *value)
     }
 
-    /// Returns the combined affine transform of this node and its ancestors,
-    /// up to and including the root of this node's tree.
+    /// Returns the combined affine transform of this node and its ancestors up to the tree root.
     pub(crate) fn transform(&self) -> Affine {
         let mut acc = self.direct_transform();
         let mut current = *self;
@@ -212,8 +203,7 @@ impl<'a> Node<'a> {
         self.data().bounds()
     }
 
-    /// Returns the node's transformed bounding box relative to the tree's
-    /// container (e.g. window).
+    /// Returns the node's transformed bounding box relative to the tree's container.
     pub(crate) fn bounding_box(&self) -> Option<Rect> {
         self.raw_bounds()
             .as_ref()
@@ -231,9 +221,6 @@ impl<'a> Node<'a> {
         point: Point,
         filter: &impl Fn(&Node) -> FilterResult,
     ) -> Option<(Node<'a>, Point)> {
-        // A node's `Test` frame is pushed before its children, then children in
-        // forward order, so that children are searched last-to-first and the
-        // node's own bounds are tested only after all descendants miss.
         enum Frame<'n> {
             Visit(Node<'n>, Point),
             Test(Node<'n>, Point),
@@ -252,9 +239,6 @@ impl<'a> Node<'a> {
                 }
                 Frame::Visit(node, point) => {
                     let filter_result = filter(&node);
-                    // An off-screen node and all it holds own no point: its
-                    // bounds lie where its container would scroll it to,
-                    // over whatever is drawn there now.
                     if filter_result == FilterResult::ExcludeSubtree || node.is_offscreen() {
                         continue;
                     }
@@ -272,8 +256,7 @@ impl<'a> Node<'a> {
         None
     }
 
-    /// Returns the deepest filtered node, either this node or a descendant,
-    /// at the given point in this node's coordinate space.
+    /// Returns the deepest filtered node at `point` in this node's coordinate space.
     pub(crate) fn node_at_point(
         &self,
         point: Point,
@@ -382,15 +365,6 @@ impl<'a> Node<'a> {
         self.role() == Role::AlertDialog
     }
 
-    // When probing for supported actions as the next several functions do,
-    // it's tempting to check the role. But it's better to not assume anything
-    // beyond what the provider has explicitly told us. Rationale:
-    // if the provider developer forgot to call `add_action` for an action,
-    // an AT (or even AccessKit itself) can fall back to simulating
-    // a mouse click. But if the provider doesn't handle an action request
-    // and we assume that it will based on the role, the attempted action
-    // does nothing. This stance is a departure from Chromium.
-
     #[inline]
     pub(crate) const fn is_clickable(
         &self,
@@ -401,13 +375,10 @@ impl<'a> Node<'a> {
 
     #[inline]
     pub(crate) const fn is_selectable(&self) -> bool {
-        // It's selectable if it has the attribute, whether it's true or false.
         self.is_selected().is_some() && !self.is_disabled()
     }
 
-    /// Whether this node supports `action`. (accesskit_consumer also asked
-    /// the filtered parent for actions it grants its children; aterm's model
-    /// has no such grants, so `_parent_filter` decides nothing.)
+    /// Whether this node supports `action`.
     #[inline]
     pub(crate) const fn supports_action(
         &self,
@@ -418,7 +389,6 @@ impl<'a> Node<'a> {
     }
 }
 
-/// What may name a control that has no label of its own: a label child.
 const fn descendant_label_filter(node: &Node) -> FilterResult {
     match node.role() {
         Role::Label => FilterResult::Include,
@@ -427,8 +397,7 @@ const fn descendant_label_filter(node: &Node) -> FilterResult {
 }
 
 impl<'a> Node<'a> {
-    /// The nodes that name this one: for a control without a label, its
-    /// label children.
+    /// The label children that name a control without a label of its own.
     pub(crate) fn labelled_by(&self) -> impl DoubleEndedIterator<Item = Node<'a>> + use<'a> {
         let from_children = matches!(
             self.role(),

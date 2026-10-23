@@ -8,8 +8,6 @@ use std::path::Path;
 /// One pixel, `[r, g, b]`.
 pub type Rgb = [u8; 3];
 
-/// The largest frame edge a capture may declare: far above any window, far
-/// below an allocation bomb.
 const MAX_EDGE: u32 = 16_384;
 
 /// A decoded RGBA8 frame (`width * height * 4` bytes, row-major from top).

@@ -9,7 +9,6 @@
 pub fn unified(path: &str, old: &str, new: &str) -> Vec<String> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
-    // the longest common subsequence, by suffix lengths
     let mut lcs = vec![vec![0u32; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
         for j in (0..b.len()).rev() {
@@ -20,7 +19,6 @@ pub fn unified(path: &str, old: &str, new: &str) -> Vec<String> {
             };
         }
     }
-    // the edit script: (kind, old index, new index)
     let mut script = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() || j < b.len() {

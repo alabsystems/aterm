@@ -60,7 +60,7 @@ enum GrantShape {
     Chunked,
 }
 
-fn grant_shape(chunks: bool, sessions: usize) -> Result<GrantShape, RendezvousError> {
+const fn grant_shape(chunks: bool, sessions: usize) -> Result<GrantShape, RendezvousError> {
     let limit = grant_session_limit(chunks);
     if sessions == 0 || sessions > limit {
         return Err(RendezvousError::TooManySessions { sessions, limit });
@@ -275,6 +275,8 @@ struct BaseFacts {
 
 #[cfg(unix)]
 fn admits_temp_base(base: &Path, lstat: Option<BaseFacts>, uid: u32) -> bool {
+    // Absolute only: a relative `$TMPDIR` binds against this process's cwd, which a LaunchServices
+    // successor (cwd `/`) cannot dial, so every attempt would park for the whole readiness deadline
     // and never fall back to the fork lane.
     if !base.is_absolute() {
         return false;
@@ -414,7 +416,7 @@ pub(crate) enum CodeRefusal {
 impl CodeRefusal {
     /// Returns whether the refusal is a definitive code-signing rejection (`Self::Refused`).
     #[must_use]
-    pub(crate) fn is_verdict(&self) -> bool {
+    pub(crate) const fn is_verdict(&self) -> bool {
         matches!(self, Self::Refused(_))
     }
 }
@@ -447,7 +449,7 @@ impl DialerCode {
     }
 
     /// Requires a dialer matching the designated code requirement of the bundle at `path`.
-    pub(crate) fn code_at(path: PathBuf) -> Self {
+    pub(crate) const fn code_at(path: PathBuf) -> Self {
         Self {
             rule: DialerCodeRule::CodeAt(path),
         }
@@ -505,7 +507,7 @@ impl DialerCode {
         }
     }
 
-    fn in_line(&self) -> Duration {
+    const fn in_line(&self) -> Duration {
         match &self.rule {
             DialerCodeRule::Stated(_) | DialerCodeRule::CodeAt(_) => {
                 aterm_keeper::identity::PEER_CHECK_HANG
@@ -1012,6 +1014,7 @@ impl Rendezvous {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
                     ) =>
                 {
+                    // A peer that connected and reset before we accepted, or a
                     // signal. Neither is this attempt's dialer arriving.
                     continue;
                 }
@@ -1086,7 +1089,7 @@ impl ClaimedPeer {
 
     /// Kernel-attested PID of the accepted successor process.
     #[must_use]
-    pub(crate) fn pid(&self) -> i32 {
+    pub(crate) const fn pid(&self) -> i32 {
         self.pid
     }
 
@@ -1105,7 +1108,7 @@ impl ClaimedPeer {
 
     /// Maximum number of sessions [`Self::transfer`] may send to this peer.
     #[must_use]
-    pub(crate) fn grant_session_limit(&self) -> usize {
+    pub(crate) const fn grant_session_limit(&self) -> usize {
         grant_session_limit(self.chunks)
     }
 
@@ -1396,6 +1399,8 @@ fn parse_grant_body(body: &str, expected_nonce: &str) -> Result<GrantBody, Rende
         }
     };
     if entries.is_empty() {
+        // An overlap with no sessions is not an overlap. The lane is only ever
+        // taken with a live pool, so an empty list is a malformed grant rather
         // than a valid empty one.
         return Err(RendezvousError::Grant("no sessions".to_string()));
     }
@@ -1437,13 +1442,13 @@ pub(crate) struct ClaimedHandoff {
 impl ClaimedHandoff {
     /// Number of terminal sessions carried in the claimed handoff grant.
     #[must_use]
-    pub(crate) fn session_count(&self) -> usize {
+    pub(crate) const fn session_count(&self) -> usize {
         self.masters.len()
     }
 
     /// Elapsed duration the parent was parked before sending the grant, if reported.
     #[must_use]
-    pub(crate) fn parked_before_grant(&self) -> Option<Duration> {
+    pub(crate) const fn parked_before_grant(&self) -> Option<Duration> {
         self.parked_for
     }
 
@@ -1542,13 +1547,13 @@ pub(crate) enum DebugDeathBeforeDial {
 impl DebugDeathBeforeDial {
     /// Returns whether this mode registers with LaunchServices before terminating.
     #[must_use]
-    pub(crate) fn checks_in_first(self) -> bool {
+    pub(crate) const fn checks_in_first(self) -> bool {
         matches!(self, Self::ExitAfterCheckIn | Self::KillAfterCheckIn)
     }
 
     /// Returns whether this mode terminates via `SIGKILL` instead of `_exit`.
     #[must_use]
-    pub(crate) fn kills(self) -> bool {
+    pub(crate) const fn kills(self) -> bool {
         matches!(self, Self::Kill | Self::KillAfterCheckIn)
     }
 }
@@ -1781,6 +1786,8 @@ fn dial_and_claim(
 
     let expected = sessions.len() + RENDEZVOUS_CHANNEL_FDS;
     if let Some(count) = chunk_count {
+        // The layout is computed, not believed: the body's session count fixes how many
+        // messages there are and what each carries, every message must be exactly that under the
         // one grant deadline, and the first refusal drops (closes) everything received so far.
         if sessions.len() > MAX_CHUNKED_SESSIONS {
             return Err(RendezvousError::DescriptorCount {

@@ -250,11 +250,14 @@ impl std::fmt::Display for StoreLockError {
                 write!(
                     f,
                     "cannot take the store lock at {}: {e} — refusing to mutate the \
-                     store without it. This prefix is not writable by you; atpkg's \
-                     default prefix is under $HOME and needs no privilege, so remove \
-                     `[packages].prefix` from ~/.config/aterm/aterm.toml unless you \
-                     really want a shared multi-user store (then install as its owner)",
-                    path.display()
+                     store without it. The prefix must be yours alone. atpkg's default \
+                     prefix is under $HOME and needs no privilege; when root owns it, a \
+                     run under sudo made it so, and `sudo chown -R \"$USER\"` on {} gives \
+                     it back. A `[packages].prefix` in ~/.config/aterm/aterm.toml names a \
+                     shared multi-user store, changed only as its owner; removing that \
+                     line returns to the default",
+                    path.display(),
+                    path.parent().unwrap_or(path).display()
                 )
             }
             StoreLockError::Io(path, e) => write!(
@@ -347,6 +350,7 @@ pub(crate) fn lock_store_waiting_on(
         match attempt {
             Ok(guard) => return Ok(guard),
             Err(StoreLockError::Contended(path)) => {
+                // A waiter whose caller has gone stands down silently, grace or not: the
                 // caller's pipe is exactly what it must not print to.
                 if !still_wanted() {
                     return Err(StoreLockError::Contended(path));

@@ -299,7 +299,8 @@ pub struct LandHeld {
     pub since_ms: Option<i64>,
     /// The nudges (`land-nudge@v1`) typed since that act.
     pub nudges: u32,
-    /// A land act's yield was judged, and no other turn ran.
+    /// A land act's yield was judged, and no other turn ran since: the
+    /// legs below are that yield's.
     pub read: bool,
     /// What held the landing at that yield, a bit per [`HoldLeg`].
     pub legs: u8,

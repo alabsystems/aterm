@@ -489,6 +489,7 @@ pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant
                 };
             }
             if !(c.typed && c.text == *press.text) {
+                // The rest's echo still on its way: the text so far is the
                 // command's own head.
                 if c.typed && press.text.starts_with(c.text.as_str()) && !late {
                     return Step::Wait;
@@ -696,6 +697,7 @@ impl App {
     ) -> Result<(), SlashRefusal> {
         let result = self.begin_slash(wid, session, slash);
         if let Err(why) = result {
+            // Said where the person looks; a press already in flight keeps
             // its own words.
             if why != SlashRefusal::InFlight {
                 self.note_fact_said(wid, session, why.says("", None), REFUSAL_SHOWN);
@@ -1066,6 +1068,7 @@ impl App {
             }
         };
         if end == SlashEnd::Done {
+            // The key turned on here exists for this process: its ghost may
             // stand in for Claude's tag once it is off again.
             if press.slash == Slash::TopEffort(true) {
                 self.claude_facts.entry(session).or_default().top_seen = Some(press.pgid);

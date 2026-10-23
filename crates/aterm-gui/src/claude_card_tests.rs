@@ -1123,7 +1123,10 @@ fn the_cards_line_follows_an_armed_timer() {
         if agent == "agy" {
             assert!(cruise[0].ends_with(" \u{b7} agy v0.1"), "{cruise:?}");
         } else {
-            assert!(cruise[0].contains(&format!(" \u{b7} {agent} \u{b7} autopilot")));
+            assert!(
+                cruise[0].contains(&format!(" \u{b7} {agent} v0.1 \u{b7} autopilot")),
+                "{cruise:?}"
+            );
         }
         assert!(
             !cruise[0].contains('\u{2913}'),

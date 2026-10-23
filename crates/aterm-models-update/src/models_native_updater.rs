@@ -1,24 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! The process-global native updater (`NativeUpdater`): aterm-gui's
-//! `native_updater_service` refines it (`native_updater_conformance.rs`). It sits
-//! with the other `native_update_*` models, so a release-cutter model edit
-//! rebuilds no aterm-gui test.
+
+//! The process-global native updater (`NativeUpdater`).
 
 use aterm_spec::derive::*;
 
-/// The process-global updater is single-flight and generation-stamped. Only a
-/// current verified artifact may become Staged, and Apply additionally requires
-/// close preflight. Install-on-clean-quit is a policy bit over the same apply
-/// transition, never a second application path. Mutants stage a stale completion
-/// or re-exec twice for one accepted artifact.
-///
-/// `SingleFlight` bounds a flag: the real service holds its work as ONE
-/// `Option<UpdaterWorkTicket>` (projected `active.is_some()`), so a second worker
-/// is unrepresentable rather than refused. The single-flight law itself — a
-/// request while work is in flight joins the live ticket and moves nothing — is
-/// bound at Tier-1 on `request_check`'s real `CheckStart::Joined`.
+/// The process-global updater is single-flight and generation-stamped.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_updater_model() -> Model {
@@ -26,8 +13,6 @@ pub fn native_updater_model() -> Model {
         NativeUpdater {
             const Buggy = 0;
             const MaxGeneration = 3;
-            // phase: 0 Idle, 1 Checking, 2 Available, 3 Downloading,
-            // 4 Staged, 5 Applying, 6 Failed.
             var phase = 0;
             var request_generation = 0;
             var work_generation = 0;

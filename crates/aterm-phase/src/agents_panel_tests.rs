@@ -17,10 +17,6 @@ fn clock(ms: u64, res_ms: u32) -> Elapsed {
     Elapsed::Clock { ms, res_ms }
 }
 
-/// Every row kind 2.1.304 draws, BUILT FROM THE BUNDLE'S GRAMMAR: the main
-/// row viewed, unviewed with `↑ N more`, and selected; agent rows running,
-/// nested, queued, worded and with hidden descendants; the idle summary;
-/// the `↓ N more` row.
 #[test]
 fn reads_each_row_kind_of_the_2_1_304_grammar() {
     let main = parse("  ⏺ main");
@@ -128,9 +124,6 @@ fn reads_each_row_kind_of_the_2_1_304_grammar() {
     assert_eq!(decorated.status(), None);
 }
 
-/// The workflow row at the three bar widths and Ghostty's block glyphs
-/// (filled = ⌊done·W/total⌋), its warning, and a paused bullet — BUILT FROM
-/// THE BUNDLE'S GRAMMAR.
 #[test]
 fn reads_the_2_1_304_workflow_row_at_each_bar_width() {
     let row = "  ◯ clean-char-literals-train  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱  3/4 · 4h10m · ↓ 1.0m tokens";
@@ -200,9 +193,6 @@ fn reads_the_2_1_304_workflow_row_at_each_bar_width() {
     assert_eq!(paused.bullet.map(|b| b.1), Some(Bullet::Paused));
 }
 
-/// The captured rows of older builds: a workflow's `done/total agents done`
-/// with its description and no bar, and an agent row, read off the measured
-/// screens.
 #[test]
 fn reads_the_measured_rows_of_older_builds() {
     let line = |text: &str, row: usize| text.lines().nth(row).expect("the row").to_string();
@@ -246,12 +236,6 @@ fn reads_the_measured_rows_of_older_builds() {
     assert_eq!(parse("  ⏺ main").kind, RowKind::Main);
 }
 
-/// MEASURED on 2.1.304 (the lab, 2026-10-19: one background
-/// `general-purpose` agent whose Bash sleeps): the viewed main row `⏺ main`,
-/// the agent row with its description as activity and `Ns · ↓ 6.2k tokens`
-/// right-aligned; with the panel holding the keys, `❯ ` in column 0 on the
-/// selected row, main's or the agent's (its `pointer`); the footer
-/// hints Claude draws then are no panel rows.
 #[test]
 fn reads_the_measured_2_1_304_panel() {
     let rows = |text: &'static str| -> Vec<&'static str> { text.lines().skip(1).collect() };
@@ -309,8 +293,6 @@ fn reads_the_measured_2_1_304_panel() {
     }
 }
 
-/// NEGATIVE CONTROLS: the rows around the panel and the transcript's own
-/// rows that look like it are none of its shapes.
 #[test]
 fn rows_around_the_panel_are_no_panel_rows() {
     for row in [
@@ -341,9 +323,6 @@ fn rows_around_the_panel_are_no_panel_rows() {
     );
 }
 
-/// Spans are in the caller's columns: a wide glyph in the activity moves the
-/// status by one column under a width table that counts it two, and by none
-/// in the GUI's text, whose wide glyph's right half is a space of its own.
 #[test]
 fn spans_count_the_callers_columns() {
     fn cjk(c: char) -> usize {
@@ -358,7 +337,6 @@ fn spans_count_the_callers_columns() {
     assert_eq!(wide.activity.map(|a| a.len()), Some(3));
 }
 
-/// The segment grammars, alone, with the near misses they refuse.
 #[test]
 fn each_segment_grammar_takes_its_own_shapes_only() {
     for (text, ms, res) in [
@@ -440,8 +418,6 @@ fn each_segment_grammar_takes_its_own_shapes_only() {
     assert!(!warning("⚠ Large") && !warning("Large workflow"));
 }
 
-/// The panel holds what it was given, in order, up to its capacity, and
-/// places each row.
 #[test]
 fn the_panel_holds_its_rows_in_order_up_to_its_capacity() {
     let mut panel = AgentsPanel::EMPTY;

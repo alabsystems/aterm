@@ -68,6 +68,7 @@ impl CursorGlow {
     #[inline]
     pub(super) fn refresh_forge_band(&mut self, cfg: &GlowConfig) {
         let ground = if cfg.theme_bg & 0xFF00_0000 != 0 {
+            // No resolved page (`COLOR_UNSET`): the reference ground of the
             // ground's side.
             if cfg.dark_theme {
                 Self::STREAK_REF_GROUND

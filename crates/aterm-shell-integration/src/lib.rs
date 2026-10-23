@@ -6,6 +6,18 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 //! Shell integration injection for aterm.
+//!
+//! # Usage
+//!
+//! ```rust,no_run
+//! use aterm_shell_integration::{ShellType, prepare};
+//!
+//! let shell = ShellType::detect("/bin/zsh");
+//! if let Ok(Some(injection)) = prepare(shell) {
+//!     // Add injection.env_add to the child's environment before fork
+//!     // Use injection.argv_override if Some (bash --rcfile)
+//! }
+//! ```
 #![cfg_attr(
     test,
     allow(
@@ -600,6 +612,8 @@ fn installed_bash() -> &'static str {
 }
 
 /// Strip standalone `#` comment lines from `script` (preserving a leading `#!`
+/// and [`scripts::BODY_BEGIN`] / [`scripts::BODY_END`] markers) to reduce shell
+/// parse time at startup.
 fn strip_comment_lines(script: &str) -> String {
     let mut out = String::with_capacity(script.len());
     for (index, line) in script.split_inclusive('\n').enumerate() {
@@ -679,6 +693,7 @@ fn install_script_set(root: &Path) -> Result<PathBuf, std::io::Error> {
         return Err(e);
     }
     for _ in 0..2 {
+        // `rename(2)` over a non-empty directory fails, preventing a racing writer
         // from overwriting a completed folder.
         if std::fs::rename(&tmp, &dir).is_ok() {
             return Ok(dir);

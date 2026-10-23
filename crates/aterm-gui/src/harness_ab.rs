@@ -196,7 +196,7 @@ impl AbArmTotals {
         self.busy_ms.saturating_add(self.held_ms())
     }
 
-    fn add(&mut self, phase: AbPhase, cause: Option<AbCause>, ms: u64) {
+    const fn add(&mut self, phase: AbPhase, cause: Option<AbCause>, ms: u64) {
         let bucket = match phase {
             AbPhase::Busy => &mut self.busy_ms,
             AbPhase::AtBox => &mut self.at_box_ms,
@@ -212,7 +212,7 @@ impl AbArmTotals {
         *of_prompt = of_prompt.saturating_add(ms);
     }
 
-    fn plus(&mut self, other: Self) {
+    const fn plus(&mut self, other: Self) {
         self.busy_ms = self.busy_ms.saturating_add(other.busy_ms);
         self.at_box_ms = self.at_box_ms.saturating_add(other.at_box_ms);
         self.asked_ms = self.asked_ms.saturating_add(other.asked_ms);
@@ -559,7 +559,7 @@ impl AbTask {
 
     /// The session's mode is Land (`lands`) or not, read at `at_ms`. A mode
     /// first read as Land has no start.
-    fn mode(&mut self, lands: bool, at_ms: u64) {
+    const fn mode(&mut self, lands: bool, at_ms: u64) {
         self.land_from = match (self.lands, lands) {
             (Some(true), true) => self.land_from,
             (Some(false), true) => Some(at_ms),
@@ -647,6 +647,8 @@ impl AbBook {
         let mut hold = None;
         if let Some(open) = open {
             // The task's work: the busy piece's part after the task opened,
+            // kept apart from the clock, so the word that drops the clock (a
+            // wall's) keeps it; never under Off (`AbClock::is_task_work`).
             if open.is_task_work() {
                 self.tasks
                     .entry(session)

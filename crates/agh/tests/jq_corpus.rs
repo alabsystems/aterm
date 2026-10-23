@@ -2,11 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The jq corpus (the plan's §9.4): the 34 transcript programs, aterm's 14, one refused row
-//! per refused construct and the edge rows, each judged against the output jq 1.7.1 printed
-//! when the corpus was recorded by hand (`jq -r -c -S`). A row marked `jq_differs` is one of
-//! the divergences `agh help jq` lists: its output is what jq 1.7.1 printed for the rewrite its
-//! note names, the program that gives agh's answer in jq.
+//! Recorded differential tests for the jq corpus against `jq -r -c -S` 1.7.1.
 
 use std::path::Path;
 
@@ -14,7 +10,6 @@ use agh::Kind;
 use agh::cli::jq::{compile, render_results};
 use aterm_json::Value;
 
-/// The corpus, as recorded.
 const CORPUS: &str = include_str!("fixtures/jq/corpus.json");
 
 fn corpus() -> Value {
@@ -43,7 +38,6 @@ fn input(name: &str) -> Value {
     aterm_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-/// One row's verdict: `None` when it holds.
 fn judge(row: &Value) -> Option<String> {
     let name = text(row, "name");
     let program = text(row, "program");
@@ -60,7 +54,6 @@ fn judge(row: &Value) -> Option<String> {
     }
     let value = input(text(row, "input"));
     if row.get("fails").and_then(Value::as_bool) == Some(true) {
-        // A `fails` row must compile and then fail as it runs: a typo never passes for one.
         let compiled = match compile(program) {
             Ok(compiled) => compiled,
             Err(e) => {
@@ -156,7 +149,6 @@ fn a_bad_regex_is_usage_naming_it() {
 
 #[test]
 fn a_runtime_error_shows_a_long_input_cut_short() {
-    // 301 symbols: one past a whole quad, so @base64d fails too.
     let long = Value::from("a".repeat(301));
     for program in ["tonumber", "keys", "@base64d"] {
         let e = compile(program)
@@ -260,8 +252,6 @@ fn a_program_just_inside_the_depth_limit_runs() {
 
 #[test]
 fn a_test_that_outruns_its_step_budget_fails_rather_than_guess() {
-    // jq 1.7.1 answers true for both; aterm-regex decides the short one and runs out of
-    // steps on the long one, which is usage, never a silent false.
     let program = compile("test(\"(?:x?){2000}z\")").expect("compiles");
     let short = Value::from(format!("{}z", "x".repeat(1000)));
     let results = program.run(&short).expect("decided within the budget");

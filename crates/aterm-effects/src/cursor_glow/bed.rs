@@ -1,46 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DARK BED: on a dark ground the beam family's streak and the classic
-//! wake's mono tracer lie UNDER the letters they cross, as the rainbow
-//! kitty's ribbon does ([`crate::rainbow_kitty::ribbon::BedInkLut`]).
-//!
-//! Additive light over a letter lifts its ink and its ground together until
-//! the ink clips and only the ground keeps climbing, so a streak that reads
-//! as light over the text can keep the letters legible only by dimming until
-//! it is gone. A bed beneath the glyph ink can be as vivid as the letters
-//! allow and no more: each stop of the style's ramp is put on the most
-//! luminance at which the theme's ink still reads [`DARK_BED_BAR`] over it
-//! ([`dark_bed_ink`]), at the most chroma that luminance allows, so the bed
-//! keeps the style's hue and its time taper (a fading cell's bed thins toward
-//! the page) while the letters on it stay at the bar.
-//!
-//! A typed run's bed rises from nothing over its oldest cell, and a comet's
-//! (and sparkle's) is a wedge, whole at the caret and gone a few cells
-//! behind it ([`BedShape::wedge`]). The colour at the bar's luminance is a
-//! dark one, so the phaser keeps its bed on the night arc (blue, violet,
-//! magenta: [`night_hue`]), where a warm or green stop at the bar's
-//! luminance is an olive or a brown, and sparkle lays no body at all
-//! ([`BedShape::dim`] of nothing: any colour dark enough is a lavender dusk
-//! or a muddy brown under a gold comet): its gold rides its rail, soft at
-//! both edges ([`BedShape::rail_rise`]), its bridge and its crown. The comet, the phaser, sparkle and
-//! the classic wake's mono face lay their true hue at full value on a thin
-//! vivid rail in the leading under the row, where no letter of the row
-//! stands and the row below shows none ([`BedShape::rail`], the rainbow
-//! kitty's rail).
-//!
-//! Over cells with no text (the probe's rows, and the frame's own cells for
-//! the rows it missed: [`TextView`]), and over the bridge into the caret's
-//! own cell (kept inside that cell, [`clip_quads_to`]), the style keeps its
-//! additive beam at full strength ([`CursorGlow::emit_comet`]); a leap's bed
-//! lies only under the text it crosses, except the comet's, the beam's, the
-//! lumen's and the laser's, which lie along the whole leap
-//! ([`BedShape::leap_air`]): the comet's, the lumen's and the laser's heads
-//! rise over their tubes with no gap between them, and the beam's leap is
-//! its tube alone. Every other light that lands on a
-//! letter spends the frame's over-ink account cell by cell
-//! ([`InkLedger::admit_masked`]), whose ground for a bedded cell is the
-//! bed's composite ([`InkLedger::lay_under`]).
+//! Dark-ground cursor-glow bed and leading rail laid beneath glyph ink.
 
 use super::*;
 use aterm_render::{GlowBlend, RibbonVertex, ribbon_beam};
@@ -51,9 +12,7 @@ pub(super) const DARK_BED_BAR: f32 = 4.8;
 /// The bed's opacity over a fresh cell.
 pub(super) const DARK_BED_ALPHA_CAP: f32 = 236.0;
 
-/// The bed's luminance budget's clamp, the rainbow bed's: a theme whose ink
-/// is near black would solve a bed nobody sees, and the brightest budget is
-/// the bar's own answer at a white ink.
+/// The bed's luminance budget's clamp, the rainbow bed's.
 const DARK_BED_LUMA_MIN: f32 = 0.020;
 /// See [`DARK_BED_LUMA_MIN`].
 const DARK_BED_LUMA_MAX: f32 = 0.150;
@@ -114,7 +73,7 @@ pub(crate) fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u32 {
 pub(crate) struct BedShape {
     /// The bed's half-height at a fresh cell, as a share of the cell height.
     pub(crate) reach: f32,
-    /// The share of that reach a fading cell gives up as it fades, so a comet's tail thins to a hairline while a beam's tube keeps its girth.
+    /// The share of that reach a fading cell gives up as it fades.
     pub(crate) thin: f32,
     /// The least HSV chroma the bed's ink carries ([`dark_bed_ink`]).
     pub(crate) sat: f32,
@@ -130,20 +89,11 @@ pub(crate) struct BedShape {
     pub(crate) hue: BedHue,
     /// The share of the reach the bed's full-opacity core holds.
     pub(crate) core: f32,
-    /// The share of the bar's luminance budget the bed is solved to ([`dark_bed_ink`]; `1` at the bar).
+    /// The share of the bar's luminance budget the bed is solved to ([`dark_bed_ink`]).
     pub(crate) dim: f32,
-    /// A jump's piece of a run is a wedge as long as the path it laid, where a typing piece is the fixed [`Self::wedge`].
+    /// A jump's piece of a run is a wedge as long as the path it laid ([`Self::wedge`]).
     pub(crate) leap_path: bool,
-    /// A leap's tube runs its whole path, over air as well as text, where
-    /// otherwise it lies only under the text the leap crosses (with short
-    /// stretches of air bridged, [`LEAP_GAP_CELLS`]). The comet's white head
-    /// over air then rises over its own tube instead of standing apart from
-    /// it across a gap with a hard edge (2026-10-22, the trail gallery's
-    /// `enter-bottom`: an Enter's leap came out in two pieces), as do the
-    /// lumen's pale head and the laser's white one over their green and
-    /// violet tubes, and the beam, which lights no leap
-    /// ([`CursorGlow::split_air_runs`]), arrives and leaves as the steady
-    /// ice tube it is while typing.
+    /// A leap's tube runs its whole path ([`LEAP_GAP_CELLS`], [`CursorGlow::split_air_runs`]).
     pub(crate) leap_air: bool,
 }
 
@@ -237,10 +187,7 @@ impl BedShape {
         }
     }
 
-    /// The bed's opacity and half-height (px) over a sample of coverage
-    /// `cov` in a cell `ch` tall, its spine [`DARK_BED_DY`] below the
-    /// middle, times `k` (the wedge's and the tail's taper): the reach never
-    /// crosses the row's edges.
+    /// The bed's opacity and half-height ([`DARK_BED_DY`]).
     #[inline]
     const fn at(self, cov: u8, ch: f32, k: f32) -> (f32, f32) {
         let share = ((cov as f32) / self.full).clamp(0.0, 1.0) * k.clamp(0.0, 1.0);
@@ -253,44 +200,32 @@ impl BedShape {
     }
 }
 
-/// The bed's spine below the cell's middle, as a share of the cell height:
-/// the middle of the x-height band, where the letters' bodies sit.
+/// The bed's spine below the cell's middle, as a share of the cell height.
 const DARK_BED_DY: f32 = 0.04;
 
-/// Sparkle's gold rail's reach below the row, as a share of the cell
-/// height ([`BedShape::rail`]): its whole tail.
+/// Sparkle's gold rail's reach below the row, as a share of the cell height ([`BedShape::rail`]).
 const SPARKLE_RAIL: f32 = 0.24;
 /// Sparkle's rail's soft top ([`BedShape::rail_rise`]).
 const SPARKLE_RAIL_RISE: f32 = 0.5;
 
-/// How far a typed run's bed takes to rise from nothing at its tail, in
-/// cells: the oldest cell's bed feathers in rather than starting square on
-/// a cell edge.
+/// How far a typed run's bed takes to rise from nothing at its tail, in cells.
 const DARK_BED_TAIL_CELLS: f32 = 1.0;
 
-/// How far back from its last letter's outer edge the bed (and its rail) of
-/// a run the hand has left melts to nothing there, in cells
-/// ([`BedScratch::caret`]): while the caret stood at the run's head its body
-/// covered the end, and once it has gone (an Enter, a jump) the band stood
-/// cut square there. Inward, so the cell the caret left keeps no mark.
+/// How far back from its last letter's outer edge the bed ([`BedScratch::caret`]).
 pub(crate) const DARK_BED_HEAD_FEATHER_CELLS: f32 = 0.9;
 
 /// The knots a head feather is laid in ([`DARK_BED_HEAD_FEATHER_CELLS`]).
 const DARK_BED_HEAD_FEATHER_KNOTS: usize = 6;
 
-/// The rail's full-strength plateau as a share of its reach: the top half
-/// holds and the bottom half melts, as the rainbow kitty's rail does.
+/// The rail's full-strength plateau as a share of its reach.
 const DARK_RAIL_CORE: f32 = 0.5;
 
-/// The nested passes a leap's tube is laid in, widest first, so its cross
-/// section falls off from the spine to nothing instead of standing as a
-/// flat slab of one opacity.
+/// The nested passes a leap's tube is laid in, widest first, so its cross section falls off from
+/// the spine to nothing instead of standing as a flat slab of one opacity.
 const LEAP_LAYERS: usize = 6;
-/// The longest stretch of air, in a leap's cells, its bed tube carries on
-/// across between two lines of text ([`lay_dark_bed`]).
+/// The longest stretch of air ([`lay_dark_bed`]).
 const LEAP_GAP_CELLS: usize = 3;
-/// How much wider than the bed's own girth a leap's outermost pass reaches,
-/// so its soft edge carries past where the flat tube ended.
+/// How much wider than the bed's own girth a leap's outermost pass reaches.
 const LEAP_SPREAD: f32 = 1.4;
 
 /// The night arc's hue, degrees, for a hue `h`.
@@ -326,7 +261,7 @@ pub(crate) fn dim_budget(budget: f32, page: u32, dim: f32) -> f32 {
 /// The dark bed's reusable working buffers.
 #[derive(Default)]
 pub(crate) struct BedScratch {
-    /// The bed's ink per sample, in run order ([`lay_dark_bed`]'s `inks`), filled by the engine, which owns the colour rule.
+    /// The bed's ink per sample ([`lay_dark_bed`]).
     pub(crate) inks: Vec<u32>,
     /// The rail's ink per sample, in run order (empty for a shape with no rail).
     pub(crate) rails: Vec<u32>,
@@ -334,16 +269,14 @@ pub(crate) struct BedScratch {
     tube: Vec<BeamVertex>,
     /// Each sample's taper (the wedge's and the tail's), in run order.
     taper: Vec<f32>,
-    /// Each run's wedge length in cells, where [`wedge_runs`] laid it (a jump's wedge is as long as its path).
+    /// Each run's wedge length in cells ([`wedge_runs`]).
     pub(crate) wedges: Vec<f32>,
-    /// The caret's cell `(row, col)`, when the caller lays the bed round a
-    /// live caret: a one-row run whose head is not in it is one the hand has
-    /// left (an Enter, a jump off the row), and its head end feathers out
-    /// ([`DARK_BED_HEAD_FEATHER_CELLS`]). `None` lays every head as it is.
+    /// The caret's cell `(row, col)`, when the caller lays the bed round a live caret
+    /// ([`DARK_BED_HEAD_FEATHER_CELLS`]).
     pub(crate) caret: Option<(i32, i32)>,
 }
 
-/// Lay the dark bed under `runs` into `under` in `scratch.inks` ([`dark_bed_ink`]) and update `ledger`.
+/// Lay the dark bed under `runs` into `under` in `scratch.inks` ([`dark_bed_ink`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "the runs, the grid, the pair's page, the shape, the frame's text and the three buffers it fills"
@@ -457,10 +390,6 @@ pub(crate) fn lay_dark_bed(
             }
             let head_k = if air_head { 0.0 } else { taper_at(head_x) };
             verts.push(vertex(head_x, &last, ink[ink.len() - 1], head_k));
-            // A run the hand has left melts out over its last letter to
-            // nothing at the letter's outer edge instead of standing cut
-            // square there; the cell past it (the one the caret left) takes
-            // none of it.
             let left = caret.is_some_and(|c| c != (head_row, head_col)) && head_k > 0.0;
             let from = head_x - dir * cwf * DARK_BED_HEAD_FEATHER_CELLS;
             let feather = |j: usize| {
@@ -470,8 +399,6 @@ pub(crate) fn lay_dark_bed(
                     taper_at(from) * (1.0 - smooth(u)),
                 )
             };
-            // Lay the feather over the vertices it replaces (those past its
-            // start), keeping at least the tail's.
             let feather_over =
                 |verts: &mut Vec<RibbonVertex>, at: &dyn Fn(f32, f32) -> RibbonVertex| {
                     while verts.len() > 1 && verts.last().is_some_and(|v| (v.x - from) * dir >= 0.0)
@@ -486,7 +413,6 @@ pub(crate) fn lay_dark_bed(
             if left {
                 feather_over(verts, &|x, k| vertex(x, &last, ink[ink.len() - 1], k));
             }
-            // A shape with no share of the bar lays no body (sparkle's).
             if shape.dim > 0.0 {
                 ribbon_beam(
                     under,
@@ -551,13 +477,6 @@ pub(crate) fn lay_dark_bed(
                 );
             }
         } else {
-            // A leap: a tube through each stretch of the swept cells that
-            // crosses text (over air the beam is the leap's light, and a bed
-            // there would only outline it), or through the whole leap for a
-            // shape that lays it over air too ([`BedShape::leap_air`]), at
-            // the stretch's mean girth (`comet_beam_over` takes one
-            // thickness), each vertex at its own opacity and ink, reaching
-            // half a step past its end cells.
             let over = |s: &CometSample| {
                 let (row, col) = cell_of(s.x, s.y);
                 shape.leap_air || text.over_text(row, col)
@@ -646,13 +565,7 @@ pub(crate) fn lay_dark_bed(
     under.truncate(quad_budget);
 }
 
-/// A wedge's runs ([`BedShape::wedge`]) into the pool `out`, returning how
-/// many are live: each one-row run is laid by distance from its head, in
-/// the direction it came from, `wedge` cells long in quarter-cell knots at
-/// the run's freshest coverage and with the path position falling from the
-/// head (`1`) to the tail's tip (`0`), so the tail is a comet's whatever
-/// span of cells is still live at a typing cadence; a run across rows (a
-/// leap) is its own samples.
+/// A wedge's runs ([`BedShape::wedge`]).
 fn wedge_runs(
     runs: &[Vec<CometSample>],
     typing: &[Vec<bool>],
@@ -793,18 +706,8 @@ pub(crate) fn clip_quads_to(
     out.truncate(kept);
 }
 
-/// Split the swept `runs` into the runs the dark beam draws, into the pool
-/// `air` (returning how many are live): the stretches of each run over air,
-/// each ending where it meets text at a KNEE of zero coverage on the text
-/// cell's edge, so the beam rises from nothing at the edge of a letter's
-/// cell to its full strength at the first cell of air and never lights the
-/// letter. `text` is what the frame shows of text ([`TextView::over_text`]:
-/// a row nobody read counts as text, so the full beam lands only where the
-/// frame showed air); `caret` says the last run ends on the caret's own
-/// cell, which is air whatever the probe says (its letter, if any, is under
-/// the caret). `typed`, where given, is each run's samples' kinds (`true`
-/// for a typed sample): only typed samples are lit, and a jump's are its
-/// bed alone (the beam's leap, [`BedShape::leap_air`]).
+/// Split the swept `runs` into the runs the dark beam draws ([`TextView::over_text`],
+/// [`BedShape::leap_air`]).
 pub(crate) fn split_air_runs(
     runs: &[Vec<CometSample>],
     geom: Geom,
@@ -881,9 +784,8 @@ pub(crate) fn split_air_runs(
 }
 
 impl CursorGlow {
-    /// Lay the dark bed under the runs `self.comet_runs[..runs_len]`
-    /// ([`lay_dark_bed`]), each sample in the ink of `color(self, pos)` put on
-    /// the bar for the frame's pair ([`dark_bed_ink`]).
+    /// Lay the dark bed under the runs `self.comet_runs[..runs_len]` ([`lay_dark_bed`],
+    /// [`dark_bed_ink`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "config, geometry, the runs, their shape, colour and caret, and the stream"
@@ -980,8 +882,7 @@ impl CursorGlow {
         self.wedge_runs = wedges;
     }
 
-    /// [`dark_bed_ink`], or (a test's negative control,
-    /// [`Self::bed_unsolved`]) the stop at its full value.
+    /// [`dark_bed_ink`] ([`Self::bed_unsolved`]).
     fn bed_ink(&self, rgb: u32, page: u32, budget: f32, sat: f32) -> u32 {
         if self.bed_unsolved() {
             let rgb = crate::spectrum::spectrum_with_min_saturation(rgb & 0x00FF_FFFF, sat);
@@ -996,11 +897,8 @@ impl CursorGlow {
         }
     }
 
-    /// [`split_air_runs`] of `self.comet_runs[..runs_len]` into
-    /// `self.air_runs`, against what this frame shows of text (the probe's
-    /// lines and the frame's own cells, [`Self::text_view`]); with
-    /// `typed_only`, a jump's samples are lit by none (the beam's leap is its
-    /// tube, [`BedShape::leap_air`]).
+    /// [`split_air_runs`] of `self.comet_runs[..runs_len]` into `self.air_runs`
+    /// ([`Self::text_view`], [`BedShape::leap_air`]).
     pub(super) fn split_air_runs(
         &mut self,
         geom: Geom,
@@ -1040,7 +938,8 @@ impl CursorGlow {
         TextView::new(self.probed_text_spans(), Some(&self.frame_text))
     }
 
-    /// The caret row's letters as columns `first..end`, for the typing glow's light ink ([`crate::cursor_momentum::MomentumGlowConfig::glyph_span`]).
+    /// The caret row's letters as columns `first..end`
+    /// ([`crate::cursor_momentum::MomentumGlowConfig::glyph_span`]).
     pub(crate) fn caret_row_glyphs(&self, (row, col): (u16, u16)) -> Option<(i32, i32)> {
         let row = i32::from(row);
         let view = self.text_view();

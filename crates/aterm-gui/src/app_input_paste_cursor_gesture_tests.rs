@@ -13,9 +13,7 @@ use crate::cursor_glow::{Geom, GlowStyle};
 use crate::input::{InputEvent, Source};
 use crate::{App, WindowId};
 
-/// Drive the genuine asynchronous input seam, then present a cold one-cell
-/// program cursor delta before delivery is proven. A private sink keeps the
-/// process-global paste-order registry isolated from other parallel tests.
+/// Drive the genuine asynchronous input seam.
 fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
     let mut pipe = [0; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -69,8 +67,6 @@ fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
         || !glow.under_quads().is_empty();
 
     drop(ordering_pin);
-    // Let the tiny ordered write release its registry key before closing
-    // this fixture's descriptors.
     super::paste_order::await_drain_for_test(&sink);
     assert!(!super::paste_order::is_ordering(&sink));
     unsafe {
@@ -82,11 +78,6 @@ fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
 
 #[test]
 fn empty_or_sanitizer_empty_paste_cannot_fund_a_program_trail() {
-    // An input with no possible cursor movement arms no licence, and a
-    // movement-capable paste is swallowed at its asynchronous enqueue
-    // (enqueue is not delivery). The model side (`PressArmsLicense`,
-    // `SwallowedKeyClearsLicense` and their mutants) is proved by aterm-spec's
-    // registry sweep.
     for text in ["", "\x1b\x03\u{009b}\x7f", "\u{0301}\u{fe0f}\u{200d}"] {
         assert!(
             !program_move_after_paste(text, false),
@@ -107,10 +98,7 @@ fn empty_or_sanitizer_empty_paste_cannot_fund_a_program_trail() {
     );
 }
 
-/// Drive a real paste through `App::input`, let the FIFO writer land it,
-/// read the session's delivery register as the render prelude does, arm
-/// the engine with it, and present the echo hop `(2, 2) → (2, 2 + hop)`.
-/// Returns `(spawns, the ring's last licence token, the ticket's width)`.
+/// Drive a real paste through `App::input`.
 fn delivered_paste_then_hop(
     text: &str,
     hop: u16,
@@ -152,12 +140,8 @@ fn delivered_paste_then_hop(
         ),
         crate::input::InputOutcome::Ok
     );
-    // The FIFO drains: the writer thread's completed write is the
-    // delivery edge.
     super::paste_order::await_drain_for_test(&sink);
     assert!(!super::paste_order::is_ordering(&sink));
-    // The frame that observes the paste's delivery (see
-    // `typed_kitty_summon_tests::observing_frame`).
     let now = super::typed_kitty_summon_tests::observing_frame(
         super::typed_kitty_summon_tests::delivery_edge(&app, wid, 1),
         1,
@@ -184,10 +168,6 @@ fn delivered_paste_then_hop(
     (spawns, licence, width)
 }
 
-/// A body whose width the text cannot say (a line break, a Tab) is an
-/// insert of unknown width bounded at the engine's gesture cap, so a
-/// same-row placeholder echo (Claude Code's `[Pasted text #1 +N lines] `)
-/// no wider than that is licensed, and a wider one is not.
 #[cfg(unix)]
 #[test]
 fn a_multiline_or_tabbed_paste_is_an_insert_of_unknown_width() {
@@ -208,11 +188,6 @@ fn a_multiline_or_tabbed_paste_is_an_insert_of_unknown_width() {
     assert_eq!(spawns, 0, "…and an echo past the cap is not");
 }
 
-/// One line and the one line break after it (a link copied with its line
-/// ending) is priced as the line, `InsertWidth::Line`, whichever break ends it;
-/// a bare break, two breaks or a break inside the body stay the unknown class
-/// (`a_line_pasted_with_its_line_break_lays_the_line_on_its_own_row` in
-/// aterm-effects judges the break's own echo).
 #[test]
 fn a_line_and_its_line_break_is_priced_as_the_line() {
     let url = "https://claude.ai/artifact/XB78QX8U9sp935PNjq8FpB";
@@ -244,9 +219,6 @@ fn a_line_and_its_line_break_is_priced_as_the_line() {
     }
 }
 
-/// The line's same-row echo through the real paste lane (a host that swallowed
-/// the break): the FIFO writer's receipt carries `Line(n)`, and the hop of the
-/// line's width is the insert's.
 #[cfg(unix)]
 #[test]
 fn a_line_pasted_with_its_line_break_rides_the_receipt_as_the_line() {
@@ -255,12 +227,6 @@ fn a_line_pasted_with_its_line_break_rides_the_receipt_as_the_line() {
     assert_eq!((spawns, licence), (1, "insert"));
 }
 
-/// A queued key's receipt re-stamps only the window that typed it: the dispatch
-/// banks the press credit on the dispatching window's engine alone, so the
-/// ticket's typed half names that window and is applied there only; window B,
-/// which banked nothing, stays unlicensed. The insert half is session-wide (a
-/// paste needs no per-window credit), so B still arms a delivered paste's
-/// licence. Also run under `comet`, reading A's classic-trail typed twin.
 #[cfg(unix)]
 #[test]
 fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
@@ -285,7 +251,6 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
                 .open_active_session_in_new_window_logical()
                 .expect("a second window on the session");
             app.windows.get_mut(&wid_b).unwrap().focused = true;
-            // Both windows baseline on the register.
             for w in [wid_a, wid_b] {
                 let mut seed = CursorFxInputs::sample_for_test(Instant::now());
                 seed.cur = Some((2, 2));
@@ -311,8 +276,6 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
             drop(pin);
             super::paste_order::await_drain_for_test(&sink);
             assert!(!super::paste_order::is_ordering(&sink));
-            // The frames that observe the key: its dispatch inline, its
-            // receipt queued ([`observing_frame`]).
             let edge = if queued {
                 delivery_edge(&app, wid_a, 1)
             } else {
@@ -332,7 +295,6 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
                 "{style} queued={queued}: the classic trail too"
             );
             assert_eq!(b.fx.cursor().glow.in_flight_tally().credits, 0);
-            // …while A, which typed it, is licensed either way.
             let mut live = CursorFxInputs::sample_for_test(now);
             live.cur = Some((2, 2));
             app.cursor_frame(wid_a, live).expect("A's prelude");
@@ -340,13 +302,6 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
                 app.windows[&wid_a].fx.cursor().glow.move_licensed(now),
                 "{style} queued={queued}: window A holds the key's licence"
             );
-            // The cadence comet's typed twin is not read here: a native
-            // window runs no cadence comet under any presentation (the
-            // comet's tail is its streak, `comet_tail_is_its_streak`; the
-            // rainbow kitty never ran one), and its disabled tick clears its
-            // hints every frame. The streak's licence above is the witness.
-            // The one-shot classes are the dispatching window's too: an
-            // Enter typed in A behind a paste re-licenses A, never B.
             let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
             let pressed = Instant::now();
             assert_eq!(
@@ -385,9 +340,6 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
                 app.windows[&wid_a].fx.cursor().glow.move_licensed(now),
                 "{style} queued={queued}: window A holds the Enter's licence"
             );
-            // The insert half stays session-wide: a paste delivered on the
-            // session arms B's insert licence (Rainbow Kitty only; under
-            // `comet` it arms nothing).
             assert_eq!(
                 app.input(
                     wid_a,
@@ -421,11 +373,7 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
     }
 }
 
-/// A real paste through `App::input` and the FIFO writer, then one
-/// [`App::cursor_frame`] prelude tick presenting the echo hop
-/// `(2, 2) → (2, 2 + hop)`. Without `baselined` the window's `delivery_seen` is
-/// forgotten before the paste (a session switch, a first read). Returns
-/// `(spawns, the ring's last licence token, delivery_seen)`.
+/// A real paste through `App::input` and the FIFO writer ([`App::cursor_frame`]).
 #[cfg(unix)]
 fn prelude_paste_then_hop(
     text: &str,
@@ -446,9 +394,6 @@ fn prelude_paste_then_hop(
     app.windows.get_mut(&wid).unwrap().focused = true;
     app.frontmost_window = Some(wid);
     let session = app.front_terminal(wid).unwrap().session;
-    // The seed tick: the engines learn the caret and the prelude reads the
-    // register for the first time (nothing to apply; the window baselines
-    // at the tracker's newest serial, 0).
     let mut seed = CursorFxInputs::sample_for_test(Instant::now());
     seed.cur = Some((2, 2));
     app.cursor_frame(wid, seed).expect("seed tick");
@@ -470,9 +415,6 @@ fn prelude_paste_then_hop(
     );
     super::paste_order::await_drain_for_test(&sink);
     assert!(!super::paste_order::is_ordering(&sink));
-    // The frame that first observes the echo: the prelude reads the
-    // receipt, arms the engine, and the tick judges the hop, presented on
-    // the delivery's clock (`typed_kitty_summon_tests::observing_frame`).
     let now = super::typed_kitty_summon_tests::observing_frame(
         super::typed_kitty_summon_tests::delivery_edge(&app, wid, 1),
         1,
@@ -498,11 +440,6 @@ fn prelude_paste_then_hop(
     out
 }
 
-/// The prelude in `cursor_frame` applies a real paste's receipt on the frame
-/// observing the echo (the hop of exactly its width is `licence=insert`) and
-/// records the serial as seen. A window with no baseline baselines at the
-/// newest serial and applies nothing. Fails under an inverted freshness gate, a
-/// baseline that applies on the first read, or a `latest` that does not advance.
 #[cfg(unix)]
 #[test]
 fn the_render_prelude_applies_a_delivered_paste_and_baselines_a_fresh_window() {
@@ -525,9 +462,6 @@ fn the_render_prelude_applies_a_delivered_paste_and_baselines_a_fresh_window() {
     );
 }
 
-/// A paste followed by a frame's worth of queued keys (the glow engine holds up
-/// to 128 unpaid) keeps its oldest receipt through the real writer and render
-/// prelude, and the paste's insert receipt owns its own first visible echo.
 #[cfg(unix)]
 #[test]
 fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
@@ -580,8 +514,6 @@ fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
         drop(pin);
         super::paste_order::await_drain_for_test(&sink);
         assert!(!super::paste_order::is_ordering(&sink));
-        // The frame that observes the batch's delivery (see
-        // `typed_kitty_summon_tests::observing_frame`).
         let now = super::typed_kitty_summon_tests::observing_frame(
             super::typed_kitty_summon_tests::delivery_edge(&app, wid, queued_keys as u64 + 1),
             1,
@@ -632,11 +564,6 @@ fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
     }
 }
 
-/// The FIFO can finish a paste and its queued keys before the child
-/// repaints, and the child may then show the paste in one output frame and
-/// the keys in a second. Replaying those two writes must not spend the
-/// later keys' press credits on the paste's cells, or the second 33-cell
-/// echo falls below the typed share floor and the rainbow has a dark gap.
 #[cfg(unix)]
 #[test]
 fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
@@ -687,9 +614,6 @@ fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
     drop(pin);
     super::paste_order::await_drain_for_test(&sink);
     assert!(!super::paste_order::is_ordering(&sink));
-    // The paste's and the 33 keys' receipts: the output frames below are
-    // the first and second to observe that delivery, presented on its
-    // clock (`typed_kitty_summon_tests::observing_frame`).
     let edge = super::typed_kitty_summon_tests::delivery_edge(&app, wid, 34);
 
     let present_output = |app: &mut App, bytes: &[u8], nth: u32| {
@@ -727,9 +651,6 @@ fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
         "later queued keys have not echoed yet"
     );
 
-    // One model credit stands for this 33-key batch: project the engine's
-    // first-frame decision onto the derived licence transition; the
-    // typed-class verdict (insert still armed, keys spent) is refused.
     let model = aterm_models_effects::cursor_hint_license_model();
     let mut before = model.init_state();
     for action in [

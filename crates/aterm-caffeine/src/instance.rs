@@ -28,6 +28,8 @@ pub struct Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        // Emptied first while this description still holds it, so a lock nobody holds names
+        // no pid: a probe holding it for an instant must not make this exited mug's pid read
         // as a running one. (A mug killed outright leaves its pid; `running_mug` checks it.)
         if !self.leave_named && matches!(take(&self.file), Ok(true)) {
             let _ = self.file.set_len(0);

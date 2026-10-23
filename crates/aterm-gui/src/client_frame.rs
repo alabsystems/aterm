@@ -150,7 +150,7 @@ impl ClientFrame {
     }
 
     /// Whether the band is this frame's header ([`Self::header`]); a `fn` for `Option::is_some_and`.
-    pub(crate) fn has_header(self) -> bool {
+    pub(crate) const fn has_header(self) -> bool {
         self.header
     }
 
@@ -257,7 +257,7 @@ impl CaptionSlot {
     }
 
     /// The cells one button's slot takes.
-    pub(crate) fn button_cols(self) -> u16 {
+    pub(crate) const fn button_cols(self) -> u16 {
         self.button_cols
     }
 
@@ -333,7 +333,7 @@ impl FrameEdge {
     }
 
     /// The cursor the handle shows: GTK's (and sctk-adwaita's) directional resize icons.
-    pub(crate) fn cursor(self) -> CursorIcon {
+    pub(crate) const fn cursor(self) -> CursorIcon {
         match self {
             Self::North => CursorIcon::NResize,
             Self::NorthEast => CursorIcon::NeResize,

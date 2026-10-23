@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE AGENTS PANEL'S GLASS, pure: what colour each cell of Claude Code's agents panel (`◯ general-purpose  …  4m 28s · ↓ 115.4k tokens`, `◯ sweep ▰▰▰▰▱▱  3/4 · …`) is inked in, and what light each agent's dot wears, while the harness's theme is on (owner, 2026-10-19: "for more bling, aterm bling the subagents display at the bottom.
+//! THE AGENTS PANEL'S GLASS, pure: what colour each cell of Claude Code's agents panel
+//! (`◯ general-purpose  …  4m 28s · ↓ 115.4k tokens`, `◯ sweep ▰▰▰▰▱▱  3/4 · …`) is inked in,
+//! and what light each agent's dot wears, while the harness's theme is on (owner, 2026-10-19:
+//! "for more bling, aterm bling the subagents display at the bottom. I want to see rainbow" —
+//! "and some more informative coloring about the agent status in those dots … I want to know
+//! if the subagent is stuck or running and how much work it is doing in some visual indication
+//! of brightness and glow and maybe saturation").
 
 use aterm_render::{HaloMode, RainHalo, over_rgb, premul_rgb};
 
@@ -363,7 +369,21 @@ fn alpha_byte(share: f32) -> u8 {
     (share.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// The colour of a panel cell of kind `mark` at palette position `x` ([`name_x`], [`bar_x`], [`row_hue`]) on a dark or a light ground, Claude having drawn it in `cell_fg`:
+/// The colour of a panel cell of kind `mark` at palette position `x`
+/// ([`name_x`], [`bar_x`], [`row_hue`]) on a dark or a light ground, Claude
+/// having drawn it in `cell_fg`:
+///
+/// * TEXT ([`PanelMark::Name`], [`PanelMark::Pointer`], [`PanelMark::BarEmpty`]):
+///   the palette's legible letter ink (`CardPalette::letter`), mixed toward
+///   `cell_fg` by `1 − sat` (a quiet row's name greys with its dot), at
+///   `cell_fg`'s luminance ([`match_luminance`]). Never crested.
+/// * A FILLED BAR CELL ([`PanelMark::BarFill`]): the palette's art at full
+///   chroma — on dark lifted to the card line's floor, on light the card's
+///   one-pixel print (its luma held to the print bar) — and, where `crest`
+///   is the ripple's field at the cell (`0..=1`, [`crest`]), mixed toward
+///   white by `crest · GLINT_CREST_DARK` on dark, deepened toward black by
+///   `crest · GLINT_CREST_LIGHT / 2` on light: a crest never lowers the
+///   cell's contrast on paper.
 #[must_use]
 #[inline]
 pub fn panel_ink(
@@ -574,7 +594,22 @@ pub struct DotPlace {
     pub clip: (u16, u16),
 }
 
-/// The quads of dot light `light` at `place`, pushed onto `halos` (the light stream over the glyphs), each a [`RainHalo`] split one quad per row band it reaches (the stream's one-band rule; the bands about the bullet's row share its centre), never wider than [`DOT_RADIUS_MAX`] cell widths nor taller than [`DOT_RISE_MAX`] cell heights from the bullet's centre, nor past the pane's clip:
+/// The quads of dot light `light` at `place`, pushed onto `halos` (the
+/// light stream over the glyphs), each a [`RainHalo`] split one quad per row
+/// band it reaches (the stream's one-band rule; the bands about the bullet's
+/// row share its centre), never wider than [`DOT_RADIUS_MAX`] cell widths nor
+/// taller than [`DOT_RISE_MAX`] cell heights from the bullet's centre, nor
+/// past the pane's clip:
+///
+/// * on a dark ground one additive halo ([`HaloMode::Add`]): its peak the
+///   light's colour premultiplied by its strength, falling to nothing at its
+///   radius;
+/// * on a light ground, where added light is invisible, two source-over
+///   veils ([`HaloMode::Over`], each its ceiling in the colour's high byte,
+///   `aterm_render::halo_over_cap`): the ROUND TINT, at the light's radius
+///   (the dark halo's) and strength, then the hollow's FILL, [`FILL_RADIUS`]
+///   round, at the light's fill. A veil whose ceiling would be under
+///   `VEIL_ALPHA_FLOOR` is not drawn.
 #[inline]
 pub fn dot_light_quads(light: &DotLight, dark: bool, place: DotPlace, halos: &mut Vec<RainHalo>) {
     let (cw, ch) = (f32::from(place.cw), f32::from(place.ch));

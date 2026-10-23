@@ -872,6 +872,7 @@ impl Star {
         let age = self.age_s(now);
         let fin = self.finish.map_or(1.0, |f| f.gain(now));
         if self.lane == StarLane::Field {
+            // The field lane's one envelope — shared with the aurora's veil,
             // which rides the same cell the same way ([`Veil::envelope`]).
             return field_lane_envelope(age, self.idle_s(now), fin, reduced_motion);
         }
@@ -1677,9 +1678,11 @@ impl Stardust {
             let v0 = (dx / FAN_THROW_MS, dy / FAN_THROW_MS);
             let gold = class == StarClass::M1 && spec.hero;
             let tint = if gold {
+                // D6: the fan's own hero is gold, always — it is the mark the
                 // five rain glints are counted against.
                 TINT_GOLD_RGB
             } else {
+                // A point mark snaps (C1) to the band's stop at the column the
                 // throw rests on ([`FanSow::walk`]).
                 spectrum_snap(spec.walk.at(dx / cw))
             };
@@ -1852,6 +1855,7 @@ impl Stardust {
                 if age < EDGE_IN_S {
                     cad.tail(EDGE_IN_S - age);
                 } else if age >= field_melt_start {
+                    // The horizon's melt is moving under a hand that is
                     // still on the row.
                     cad.tail(0.0);
                 }
@@ -2480,6 +2484,7 @@ impl Stardust {
         let mut frontier = col;
         let floor_of = |frontier: i32| (g.fx_left() + frontier * g.cw as i32) as f32;
         while frontier > 0 {
+            // Already clear of the priced travel: no column further left can
             // lower `want.min(x − floor_x)`, so the walk is over.
             if x - floor_of(frontier) >= want {
                 break;
@@ -2754,6 +2759,9 @@ impl Stardust {
     }
 
     fn draw_veil(&self, ctx: &Ctx<'_>, halos: &mut Vec<RainHalo>, light_cap: usize) {
+        // On paper the aurora is not drawn: ink cannot glow, and a pale tint
+        // along the row above the ribbon read as a flat strip with hard
+        // edges and square ends (a selection's), not as light. The stars it
         // carried on dark keep their own marks.
         if !ctx.cfg.dark_theme {
             return;
@@ -2872,6 +2880,7 @@ impl Paint {
         let (env, e) = if held {
             (1.0, 1.0)
         } else {
+            // `e = (env − 0.55)/0.45 ∈ [0, 1]` — the twinkle as a unit depth,
             // which is what §5.5's per-class core-brightness rules take.
             (tw, clamp01((tw - 0.55) / 0.45))
         };
@@ -3513,7 +3522,15 @@ impl Veil {
     }
 }
 
-/// The field lane's envelope, shared by the field star ([`Star::envelope`]) and the aurora's veil ([`Veil::envelope`]), both being the cell's sky (§5.6), as the product of three alpha clocks:
+/// The field lane's envelope, shared by the field star ([`Star::envelope`])
+/// and the aurora's veil ([`Veil::envelope`]), both being the cell's sky
+/// (§5.6), as the product of three alpha clocks:
+///
+/// * the birth: the cell's 18 ms `edge-in` from [`BIRTH_EDGE_FLOOR`] (T2);
+/// * the horizon: the ribbon's `expiry_melt` over [`FIELD_LIFE_S`];
+/// * the hand: [`FIELD_HOLD_MS`] / [`FIELD_TAU_MS`] from the row's last key:
+///   full while the hand is there, half at 550 ms, culled at 880 ms, before
+///   the ribbon's retract.
 #[inline]
 #[must_use]
 pub fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bool) -> f32 {
@@ -4558,6 +4575,7 @@ mod tests {
                     band.end
                 );
                 if band.contains(&off) {
+                    // Born on the stroke: no headroom, and the rest is
                     // `settle`'s to nudge.
                     continue;
                 }
@@ -5089,6 +5107,7 @@ mod tests {
                 s.y
             );
             if s.lane == StarLane::Strike && s.v0 != (0.0, 0.0) {
+                // an m1/m2 strike — the partition's own births (grains may be
                 // the leading-edge second)
                 *strike_per_cell.entry(col_of(s)).or_insert(0) += 1;
             }

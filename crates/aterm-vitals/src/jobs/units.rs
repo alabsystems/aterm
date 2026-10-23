@@ -329,6 +329,7 @@ impl Jobs {
                     j.consumer = u.consumer;
                 }
                 if j.kind != JobKind::AgentCall {
+                    // The group in front of a block changes command by
                     // command.
                     j.pgid = u.pgid;
                 }

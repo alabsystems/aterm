@@ -2,30 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The resize journal, heal counters and render debt against flaps of a Claude-shaped
-//! alternate screen.
+//! Tests for the resize journal, heal counters, and render debt across viewport flaps.
 
 use super::{RESIZE_JOURNAL_CAP, RenderDebt, ResizeReport};
 use crate::terminal::Terminal;
 
-/// The visible rows' text, trailing blanks trimmed.
 fn screen(t: &Terminal) -> Vec<String> {
     (0..usize::from(t.rows()))
         .map(|r| t.row_text(r).unwrap_or_default().trim_end().to_string())
         .collect()
 }
 
-/// Write `L<r>` on each row in `rows` with absolute cursor moves only (the
-/// diff renderer's vocabulary: no LF, so nothing scrolls).
+/// Write `L<r>` on each row in `rows` using absolute cursor positioning.
 fn paint(t: &mut Terminal, rows: std::ops::Range<u16>) {
     for r in rows {
         t.process(format!("\x1b[{};1HL{r}", r + 1).as_bytes());
     }
 }
 
-/// A Claude-shaped screen at `rows` rows: the alternate screen, every row
-/// painted (a non-blank footer under the composer), and the cursor on the
-/// composer three rows from the bottom.
+/// Alternate screen with every row painted and the cursor three rows from the bottom.
 fn claude_shaped_alt(rows: u16) -> Terminal {
     let mut t = Terminal::new(rows, 20);
     t.process(b"\x1b[?1049h\x1b[2J");
@@ -35,8 +30,7 @@ fn claude_shaped_alt(rows: u16) -> Terminal {
     t
 }
 
-/// Run `resizes` and return the reports they journalled, asserting none was
-/// lost.
+/// Apply `resizes` and return their journalled reports.
 fn flap(t: &mut Terminal, resizes: &[u16]) -> Vec<ResizeReport> {
     let since = t.resize_ordinal();
     for &rows in resizes {
@@ -48,8 +42,7 @@ fn flap(t: &mut Terminal, resizes: &[u16]) -> Vec<ResizeReport> {
     reports
 }
 
-/// A quiet flap: the shrink demotes the top row (no blank tail), the resize undo keeps it
-/// and the grow hands it back, so the app's diff frames land on the rows it painted.
+/// Verify that a quiet alternate-screen flap with a full tail restores the demoted top row.
 #[test]
 fn a_quiet_alt_flap_with_a_full_tail_is_an_identity() {
     let mut t = claude_shaped_alt(8);
@@ -83,7 +76,6 @@ fn a_quiet_alt_flap_with_a_full_tail_is_an_identity() {
     assert_eq!(screen(&t), painted, "the app's picture survives the flap");
     assert_eq!(t.cursor(), cursor);
 
-    // The claude shape at its live size, cursor on the bottom row.
     let mut t = Terminal::new(52, 121);
     t.process(b"\x1b[?1049h\x1b[2J");
     for r in 0..52u16 {
@@ -100,8 +92,7 @@ fn a_quiet_alt_flap_with_a_full_tail_is_an_identity() {
     assert_eq!((t.cursor().row, t.cursor().col), (51, 4));
 }
 
-/// Output between the halves (the handler ran at the smaller size) drops the undo: the grow
-/// appends a blank and the screen stays one row high until the app's ED 2 repaint.
+/// Verify that output between shrink and grow drops the undo until an `ED 2` repaint heals the shift.
 #[test]
 fn alt_flap_with_output_between_the_halves_keeps_the_shift() {
     let mut t = claude_shaped_alt(8);
@@ -137,24 +128,19 @@ fn alt_flap_with_output_between_the_halves_keeps_the_shift() {
     assert_eq!(now[7], "", "a blank row where the footer was painted");
     assert_eq!(t.cursor().row, 4, "the cursor moved up with its row");
 
-    // A diff frame does not heal the shift; an ED 2 repaint does.
     t.process(b"\x1b[?2026h\x1b[6;1H\x1b[KL5*\x1b[?2026l");
     let healed = |t: &Terminal| grow.healed_by(t.full_clear_count(), t.screen_replaced_count());
     assert!(!healed(&t), "a diff frame is not a repaint");
     assert!(t.content_seq() > grow.content_seq, "the app drew on it");
-    // ED 3 alone leaves every row where the flap put it.
     t.process(b"\x1b[3J");
     assert!(!healed(&t), "ED 3 leaves the shifted rows in place");
     assert_eq!(screen(&t)[..5], painted[1..6], "still shifted");
     t.process(b"\x1b[2J");
     assert!(healed(&t));
-    // A reading taken before the flap (lower counters) is never a heal.
     assert!(!grow.healed_by(clears, 0));
 }
 
-/// A quiet flap keeps the DECSC slot (no resize moves it), puts back the scroll region every
-/// resize resets once the grow lands on the original height, and returns a combining mark
-/// on the demoted row.
+/// Verify that a quiet flap preserves DECSC, DECSTBM, and combining marks on demoted rows.
 #[test]
 fn a_quiet_alt_flap_keeps_decsc_the_scroll_region_and_extras() {
     let mut t = claude_shaped_alt(8);
@@ -169,13 +155,11 @@ fn a_quiet_alt_flap_keeps_decsc_the_scroll_region_and_extras() {
     let region = t.grid().scroll_region();
     assert_eq!((region.top, region.bottom), (1, 6), "DECSTBM put back");
 
-    // DECRC lands where DECSC saved, on the row it saved.
     t.process(b"\x1b[1;1H\x1b8");
     assert_eq!((t.cursor().row, t.cursor().col), (5, 2));
 }
 
-/// The selection comes through an undone flap as it went in, even anchored on the demoted
-/// row; one moved between the halves is the user's and stays as moved.
+/// Verify that an undone flap restores the selection unless moved or interrupted by output.
 #[test]
 fn an_undone_flap_puts_the_selection_back() {
     use crate::selection::{SelectionSide, SelectionType};
@@ -195,7 +179,6 @@ fn an_undone_flap_puts_the_selection_back() {
         assert_eq!(t.text_selection(), &before, "{heights:?}");
     }
 
-    // Moved between the halves: not put back over the user's drag.
     let mut t = claude_shaped_alt(8);
     select(&mut t);
     t.resize(7, 20);
@@ -209,7 +192,6 @@ fn an_undone_flap_puts_the_selection_back() {
     assert_ne!(t.text_selection(), &moved, "the reveal shifts it down");
     assert_eq!(t.text_selection().start().row, 3, "and only that");
 
-    // Output between the halves drops the undo: the ordinary transform applies.
     let mut t = claude_shaped_alt(8);
     let before = select(&mut t);
     t.resize(7, 20);
@@ -218,8 +200,7 @@ fn an_undone_flap_puts_the_selection_back() {
     assert_ne!(t.text_selection(), &before);
 }
 
-/// An alt-screen exit and re-entry between the halves is a screen switch, not a flap: the
-/// reused buffer hands nothing back.
+/// Verify that an alternate-screen switch between shrink and grow drops the resize undo.
 #[test]
 fn an_alt_screen_switch_between_the_halves_drops_the_undo() {
     let mut t = Terminal::new(8, 20);
@@ -233,8 +214,6 @@ fn an_alt_screen_switch_between_the_halves_drops_the_undo() {
     assert_eq!((r[0].restored_top, r[0].appended), (0, 1));
     assert_eq!(screen(&t)[0], "L1", "the switch kept today's shift");
 
-    // Parked while the primary shrinks: the parked buffer demotes its top row
-    // too, and the re-entry drops what it kept.
     let mut t = Terminal::new(8, 20);
     t.process(b"\x1b[?47h");
     paint(&mut t, 0..8);
@@ -246,8 +225,7 @@ fn an_alt_screen_switch_between_the_halves_drops_the_undo() {
     assert_eq!(screen(&t)[0], "L1");
 }
 
-/// Every engine has its own lifetime token, fixed for its life; a restored engine gets a
-/// new one and restarts its ordinals at 0.
+/// Verify that each `Terminal` has a fixed lifetime token and checkpoint restore mints a new one at ordinal 0.
 #[test]
 fn every_engine_has_its_own_lifetime_token() {
     let mut a = Terminal::new(8, 20);
@@ -267,8 +245,7 @@ fn every_engine_has_its_own_lifetime_token() {
     assert_eq!(restored.resize_ordinal(), 0);
 }
 
-/// Negative control: a blank tail below the cursor absorbs the shrink by trim, so nothing
-/// moves even with no history.
+/// Verify that an alternate-screen shrink with a blank tail below the cursor only trims.
 #[test]
 fn alt_shrink_with_a_blank_tail_only_trims() {
     let mut t = Terminal::new(8, 20);
@@ -291,8 +268,7 @@ fn alt_shrink_with_a_blank_tail_only_trims() {
     assert_eq!(t.cursor().row, 5);
 }
 
-/// On the primary screen the flap is lossless: the demoted row goes into history and the
-/// grow reveals it back.
+/// Verify that a primary-screen row flap demotes into history and reveals back losslessly.
 #[test]
 fn primary_rows_only_flap_is_lossless() {
     let mut t = Terminal::new(8, 20);
@@ -314,9 +290,7 @@ fn primary_rows_only_flap_is_lossless() {
     assert_eq!(t.cursor().row, 5);
 }
 
-/// Both halves of a flap are journalled with no `process()` between them (what a per-read
-/// watermark cannot see); the ring keeps the newest 16 and counts the rest, the ordinal
-/// stays exact.
+/// Verify that the resize journal records adjacent resizes, tracks ring overflow, and flags rewraps.
 #[test]
 fn journal_keeps_both_halves_of_a_flap() {
     let mut t = Terminal::new(8, 20);
@@ -338,7 +312,6 @@ fn journal_keeps_both_halves_of_a_flap() {
     assert_eq!(r[1].content_seq_before, r[0].content_seq);
     assert!(r[1].content_seq > r[1].content_seq_before, "the re-layout");
 
-    // Output between two resizes breaks the adjacency; a cursor move does not.
     t.process(b"\x1b[3;3H");
     t.resize(7, 20);
     t.process(b"x");
@@ -350,7 +323,6 @@ fn journal_keeps_both_halves_of_a_flap() {
     );
     assert!(!r[1].adjoins(&r[0]), "the app drew between");
 
-    // The offloading entry point journals too, and names an open 2026 frame.
     t.process(b"\x1b[?2026h");
     assert!(t.resize_offloading_scrollback(7, 20).is_none());
     let (r, lost) = t.resize_journal_since(4);
@@ -384,14 +356,12 @@ fn journal_keeps_both_halves_of_a_flap() {
         "a watermark from another engine lifetime reads as 0"
     );
 
-    // A width change on the primary screen is a rewrap, named as such.
     t.resize(8, 30);
     let (r, _) = t.resize_journal_since(22);
     assert_eq!((r[0].to, r[0].reflowed), ((8, 30), true));
 }
 
-/// A full clear is ED 2 or ED 0 from home; ED 3, EL, ED 1, DECSED and an ED 0 elsewhere are
-/// not. Claude Code's clear (`ED 2` + `ED 3`) counts once.
+/// Verify that `full_clear_count` increments only on `ED 2` and home `ED 0`.
 #[test]
 fn full_clear_count_counts_ed2_and_home_ed0_not_ed3_el_or_mid_screen_ed0() {
     let mut t = Terminal::new(8, 20);
@@ -425,9 +395,7 @@ fn full_clear_count_counts_ed2_and_home_ed0_not_ed3_el_or_mid_screen_ed0() {
     );
 }
 
-/// Screen replacements are counted apart from clears: every alternate-screen
-/// switch (47, 1047, 1049, and the repeated 1049 set that clears) and every
-/// full reset. A no-op switch is not counted.
+/// Verify that `screen_replaced_count` tracks effective alternate-screen switches and full resets.
 #[test]
 fn screen_replaced_counts_alt_screen_switches_and_resets() {
     let mut t = Terminal::new(8, 20);
@@ -455,13 +423,10 @@ fn screen_replaced_counts_alt_screen_switches_and_resets() {
     assert_eq!(t.full_clear_count(), 0, "no ED was processed");
 }
 
-// ---- render debt (`Terminal::render_debt`) ---------------------------------
-
-/// Output that draws nothing (a mode set), the first bytes of a SIGWINCH
-/// handler: it drops the resize undo and moves no row.
+/// Non-drawing mode set that drops the resize undo without moving rows.
 const MODE_SET: &[u8] = b"\x1b[?1004h";
 
-/// A flap `rows -> rows-1 -> rows` with `between` processed between the halves.
+/// Flap `rows -> rows - 1 -> rows` with `between` processed in between.
 fn flap_with(t: &mut Terminal, rows: u16, between: &[u8]) {
     t.resize(rows - 1, 20);
     if !between.is_empty() {
@@ -480,7 +445,6 @@ fn a_quiet_flap_leaves_no_debt() {
         RenderDebt::default(),
         "the undo handed the row back"
     );
-    // Two shrinks and two grows, all quiet.
     t.resize(7, 20);
     t.resize(6, 20);
     assert_eq!(
@@ -495,8 +459,6 @@ fn a_quiet_flap_leaves_no_debt() {
 
 #[test]
 fn the_push_corner_leaves_the_bottom_row_as_debt() {
-    // Cursor on row 0: the shrink pushes the bottom row off and nothing above
-    // it moves; the grow, its undo dropped, appends a blank.
     let mut t = Terminal::new(8, 20);
     t.process(b"\x1b[?1049h\x1b[2J");
     paint(&mut t, 0..8);
@@ -507,7 +469,6 @@ fn the_push_corner_leaves_the_bottom_row_as_debt() {
         RenderDebt::of_rows(0, 1),
         "the bottom row is lost, nothing moved"
     );
-    // Quiet, the same corner is an identity.
     let mut t = Terminal::new(8, 20);
     t.process(b"\x1b[?1049h\x1b[2J");
     paint(&mut t, 0..8);
@@ -521,7 +482,6 @@ fn debt_accumulates_over_a_run_of_flaps_and_is_exact_after_a_journal_overrun() {
     let mut t = claude_shaped_alt(8);
     let flaps = 20;
     for _ in 0..flaps {
-        // The program keeps painting its footer, so each shrink demotes again.
         paint(&mut t, 7..8);
         flap_with(&mut t, 8, MODE_SET);
     }
@@ -584,7 +544,6 @@ fn a_full_clear_a_screen_switch_and_ris_each_reset_the_debt() {
 
 #[test]
 fn a_primary_screen_resize_owes_nothing() {
-    // The primary screen is history-backed: its rows move with the cursor.
     let mut t = Terminal::new(8, 20);
     for r in 0..8u16 {
         t.process(format!("\x1b[{};1HL{r}", r + 1).as_bytes());
@@ -594,20 +553,13 @@ fn a_primary_screen_resize_owes_nothing() {
     assert_eq!(t.render_debt(), RenderDebt::default());
 }
 
-/// S2R-F4 (the sweep of 2026-10-15): a net-zero row flap on
-/// the PRIMARY screen with a blank row below the cursor and history above it.
-/// The shrink trimmed the blank bottom row (nothing moved) and the grow revealed
-/// the newest history line at the top, so every row and the cursor ended one
-/// lower than the program drew them. The primary screen is not judged
-/// (`render=ok`); only `cast drift` saw it. The grow hands the trimmed blank
-/// back instead (`aterm_grid`'s rows hand-back).
+/// Verify that a primary-screen row flap over a blank tail appends back a blank rather than revealing history.
 #[test]
 fn a_primary_row_flap_over_a_blank_tail_leaves_every_row_where_it_was() {
     let mut t = Terminal::new(8, 20);
     for i in 0..20 {
         t.process(format!("h{i}\r\n").as_bytes());
     }
-    // A program that clears and draws one line at the top: history stays above.
     t.process(b"\x1b[H\x1b[2Jtop\r\n");
     assert!(t.grid().scrollback_lines() > 0, "history above the screen");
     let painted = screen(&t);
@@ -628,12 +580,7 @@ fn a_primary_row_flap_over_a_blank_tail_leaves_every_row_where_it_was() {
     );
 }
 
-/// S2R-F4's other half: the same primary screen flapped by a drag that grows first
-/// (8 -> 9 -> 8) or overshoots the start on the way back (8 -> 7 -> 9 -> 8, 8 -> 5 -> 10
-/// -> 8, 8 -> 7 -> 8 -> 9 -> 8). The grow reveals history at the top; the shrink back
-/// trimmed the blank tail instead of demoting those rows, so every row and the cursor
-/// ended lower than the program drew them, with nothing judged. The shrink demotes the
-/// revealed rows first.
+/// Verify that primary-screen flaps that grow first demote revealed history rows before trimming the blank tail.
 #[test]
 fn a_primary_row_flap_that_grows_first_leaves_every_row_where_it_was() {
     for heights in [&[9u16, 8][..], &[7, 9, 8], &[5, 10, 8], &[7, 8, 9, 8]] {
@@ -661,8 +608,7 @@ fn a_primary_row_flap_that_grows_first_leaves_every_row_where_it_was() {
     }
 }
 
-/// A resize on the window's offloaded path: the visible grid now, the history's
-/// rewrap driven to its re-attach, as the host's worker does.
+/// Run an offloaded resize to completion by reflowing and re-attaching scrollback chunks.
 fn offloaded_resize(t: &mut Terminal, rows: u16, cols: u16) {
     let mut job = t.resize_offloading_scrollback(rows, cols);
     while let Some(pending) = job {
@@ -670,13 +616,7 @@ fn offloaded_resize(t: &mut Terminal, rows: u16, cols: u16) {
     }
 }
 
-/// S2R-F4 through a width change: a font zoom in then out, a zoom out then in, and a
-/// window corner dragged and brought back move the rows and the columns together. On the
-/// window's terminal (a tiered store), on the sync and the offloaded path, zsh after
-/// `clear; seq 1 120; printf '\e[H\e[2Jtop row\n'` at 144x50: the width change forgot
-/// the hand-back, its shrink trimmed the blank tail and its grow pulled history back down,
-/// so `top row` and the cursor ended five rows lower, `render=ok`. Every row stays where
-/// the program drew it.
+/// Verify that primary-screen flaps that also change width preserve row positions across sync and offloaded paths.
 #[test]
 fn a_primary_flap_that_changes_the_width_too_leaves_every_row_where_it_was() {
     let paths: [&[(u16, u16)]; 4] = [
@@ -715,7 +655,6 @@ fn a_primary_flap_that_changes_the_width_too_leaves_every_row_where_it_was() {
             );
         }
     }
-    // The small shape the rows-only flaps use.
     for path in [&[(7u16, 19u16), (8, 20)][..], &[(9, 21), (8, 20)]] {
         let mut t = Terminal::new(8, 20);
         for i in 0..20 {
@@ -731,11 +670,7 @@ fn a_primary_flap_that_changes_the_width_too_leaves_every_row_where_it_was() {
     }
 }
 
-/// A program that redraws its screen from the top after a grow (`ESC [ H` then its lines,
-/// with an erase or without one, or a cursor sent up past the top) owns the top rows: the
-/// shrink back trims under its screen, as on a terminal that never grew. The grow's
-/// revealed history line stayed owed, so the shrink demoted the program's own first line
-/// into history and every row ended one higher, with nothing judged on the primary screen.
+/// Verify that redrawing from the top after a grow claims the top rows so shrinking back trims below.
 #[test]
 fn a_redraw_from_the_top_after_a_grow_keeps_its_rows_through_the_shrink_back() {
     let build = || {
@@ -771,21 +706,17 @@ fn a_redraw_from_the_top_after_a_grow_keeps_its_rows_through_the_shrink_back() {
 
 #[test]
 fn a_conpty_resize_owes_nothing() {
-    // conhost repaints the viewport after every resize and the grid keeps no undo.
     let mut t = claude_shaped_alt(8);
     t.resize_with_policy(7, 20, crate::grid::ResizePolicy::ConPty);
     t.process(MODE_SET);
     t.resize_with_policy(8, 20, crate::grid::ResizePolicy::ConPty);
     assert_eq!(t.render_debt(), RenderDebt::default());
-    // The same flap under Native does.
     let mut t = claude_shaped_alt(8);
     flap_with(&mut t, 8, MODE_SET);
     assert_eq!(t.render_debt(), RenderDebt::of_rows(-1, 0));
 }
 
-/// S2R-F3: a column flap on the alternate screen cuts the drawn cells
-/// past the narrower width and the grow back brings blanks there, so the cut is debt as a
-/// moved row is, until the program repaints from scratch. Cutting only blanks owes nothing.
+/// Verify that narrowing an alternate screen across drawn cells records `cut` debt until a full clear.
 #[test]
 fn a_column_flap_that_cuts_drawn_cells_owes_them_until_a_full_clear() {
     let ruled = || {
@@ -807,17 +738,13 @@ fn a_column_flap_that_cuts_drawn_cells_owes_them_until_a_full_clear() {
     assert_eq!(debt.cut, 1);
     assert!(debt.owed(), "a cut cell is owed though no row moved");
 
-    // A deeper cut adds the columns it takes.
     t.resize(8, 17);
     t.resize(8, 20);
     assert_eq!(t.render_debt().cut, 3, "columns 17 and 18 too");
 
-    // Paid like the rows: a full clear, a screen switch, a reset.
     t.process(b"\x1b[2J");
     assert!(!t.render_debt().owed(), "ED 2 repaints from scratch");
 
-    // A narrowing that cuts only blanks owes nothing, and neither does the
-    // primary screen's, which rewraps.
     let mut t = ruled();
     t.process(b"\x1b[2J\x1b[1;1Hshort");
     t.resize(8, 10);
@@ -835,8 +762,6 @@ fn seeding_the_debt_survives_a_checkpoint_restore_and_a_full_clear_resets_it() {
     let mut t = claude_shaped_alt(8);
     flap_with(&mut t, 8, MODE_SET);
     assert_eq!(t.render_debt(), RenderDebt::of_rows(-1, 0));
-    // A restored engine starts at zero: the successor seeds what the
-    // predecessor owed, on the alternate screen only.
     let mut restored = claude_shaped_alt(8);
     assert_eq!(restored.render_debt(), RenderDebt::default());
     restored.seed_render_debt(RenderDebt::of_rows(-1, 0));

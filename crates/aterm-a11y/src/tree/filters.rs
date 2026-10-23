@@ -20,8 +20,7 @@ pub(crate) enum FilterResult {
     ExcludeSubtree,
 }
 
-/// The platform tree's filter: every node but a text run, which is part of
-/// its document's text (unless it holds the focus).
+/// Platform tree filter: every node except unfocused text runs.
 #[inline]
 pub(crate) fn common_filter(node: &Node) -> FilterResult {
     if node.is_focused() {

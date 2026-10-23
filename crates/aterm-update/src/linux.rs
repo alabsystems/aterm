@@ -2172,6 +2172,13 @@ fn check_locked(
         .is_some_and(|trial| trial.phase == Phase::Installed && !trial.healthy)
     {
         // No check: the channel is not read while a trial is pending. A check holds
+        // the update lock through its download and its probe of the new build, and the
+        // starts that judge the trial wait for that lock at most half a second (no
+        // start stalls on an update), so a check now would leave them uncounted: a
+        // crash loop rolled back later, a healthy start's confirmation lost
+        // (`a_trial_start_made_while_a_check_holds_the_lock_counts_nothing`). A
+        // failure streak still on record keeps its reason, which is still the last
+        // check's.
         if state.failing_checks == 0 {
             state.outcome = format!(
                 "aterm {} is installed \u{2014} the next aterm you start finishes it; update \
@@ -2529,6 +2536,7 @@ fn check_recording_in(
     let mut status = status_in(context, current_build);
     if let Err(error) = attempt {
         // A typed check's reason reaches the log its trouble line points at; the
+        // background loop logs each changed outcome itself.
         if force {
             aterm_log::warn!("aterm-update: manual update check failed: {error}");
         }

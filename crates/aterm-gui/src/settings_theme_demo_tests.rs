@@ -24,15 +24,13 @@ fn floored(scheme: &str, floor: f32) -> DemoColors {
     )
 }
 
-/// Both sessions, each with the marker of the one event that alone inks
-/// slot 14 (bright cyan).
+/// Both sessions paired with the marker of the event that inks slot 14.
 const SESSIONS: [(DemoSession, &[u8]); 2] = [
     (DemoSession::PowerShell, b"help"),
     (DemoSession::Zsh, b"link@"),
 ];
 
-/// The visible rows a whole `tape` leaves on a grid wide and tall enough that
-/// nothing wraps or scrolls away.
+/// Visible non-empty rows after running `tape` on an unwrapped grid.
 fn tape_text(tape: &[DemoEvent]) -> Vec<String> {
     let mut term = Terminal::new(64, 200);
     for event in tape {
@@ -66,9 +64,7 @@ fn palette_with_slot4(color: Rgb) -> TerminalConfig {
     }
 }
 
-/// The spike the incremental tape rests on: a cell parsed under one palette
-/// draws the new palette's colour once the baseline is rebased, so a theme
-/// change never has to replay the tape.
+/// Rebasing the baseline recolours parsed palette cells without replaying the tape.
 #[test]
 fn rebase_recolours_parsed_palette_cells() {
     let before = Rgb::new(0x11, 0x22, 0xcc);
@@ -94,8 +90,7 @@ fn rebase_recolours_parsed_palette_cells() {
     );
 }
 
-/// What a tape inks across a whole loop, on a grid tall enough that nothing
-/// scrolls away before it is read.
+/// Slots and attributes inked across a whole tape loop.
 #[derive(Debug, Default)]
 struct Inked {
     slots: [bool; 16],
@@ -171,7 +166,6 @@ fn the_tape_inks_every_slot_and_attribute() {
             Vec::<String>::new(),
             "{session:?}"
         );
-        // The check notices a slot that only one event inks.
         let without = tape_without(session, slot14);
         assert_eq!(without.len() + 1, tape.len(), "{session:?}");
         assert_eq!(
@@ -180,7 +174,6 @@ fn the_tape_inks_every_slot_and_attribute() {
             "{session:?}"
         );
     }
-    // The closing sweep selects cells.
     cold();
     let (input, _) = demo_frame(&colors("Dracula"), DEMO_LOOP_MS - 60, true, 24, 80);
     assert!(
@@ -210,14 +203,12 @@ fn demo_frame_is_a_pure_function_of_phase() {
         "fed incrementally or cold, one frame"
     );
 
-    // Wrapping back to the loop's start equals a fresh tape there.
     let _ = demo_frame(&theme, DEMO_LOOP_MS - 1, true, 16, 60);
     let (wrapped, _) = demo_frame(&theme, 0, true, 16, 60);
     cold();
     let (fresh, _) = demo_frame(&theme, 0, true, 16, 60);
     assert_eq!(*wrapped, *fresh);
 
-    // Negative control: the next event is a different frame.
     let index = event_index(phase);
     let next = u64::from(DEMO_TAPE[index + 1].at_ms);
     let (next_frame, next_key) = demo_frame(&theme, next, true, 16, 60);
@@ -242,7 +233,6 @@ fn a_theme_switch_keeps_the_phase() {
             .collect::<Vec<_>>()
     };
     assert_eq!(text(&night), text(&day), "the session goes on where it was");
-    // The rebased tape equals one built in the new theme from the start.
     cold();
     let (built, _) = demo_frame(&colors("Solarized Light"), phase, true, 20, 60);
     assert_eq!(*built, *day);
@@ -261,7 +251,6 @@ fn the_cadence_is_never_continuous() {
         assert!(after_ms >= 1, "phase {phase}");
         assert!(after_ms <= next_event - phase, "phase {phase}");
         assert!(after_ms <= next_blink - phase, "phase {phase}");
-        // The frame does not change before the wake.
         if after_ms > 1 {
             assert_eq!(
                 frame_key(phase, true),
@@ -293,7 +282,6 @@ fn the_demo_rests() {
         assert_eq!(demo(Some(pause)), PreviewAnimation::None, "{pause:?}");
     }
     assert!(demo_rests(3 * DEMO_LOOP_MS));
-    // Negative control: unpaused, inside three loops, it plays.
     assert!(!demo_rests(3 * DEMO_LOOP_MS - 1));
     assert!(matches!(demo(None), PreviewAnimation::BlinkEdge { .. }));
 }
@@ -303,8 +291,6 @@ fn the_rest_frame_is_the_settled_event() {
     for phase in [0, DEMO_LOOP_MS / 3, DEMO_LOOP_MS - 1] {
         assert_eq!(frame_key(phase, false), (DEMO_SETTLED_EVENT, true, 0));
     }
-    // The settled event is the prompt after the test run: the run's badges
-    // are the write before it, in either session.
     for (session, _) in SESSIONS {
         let (tape, settled) = (session.tape(), session.settled_event());
         assert!(
@@ -337,7 +323,6 @@ fn no_event_exceeds_256_bytes() {
             tape.windows(2).all(|w| w[0].at_ms <= w[1].at_ms),
             "{session:?}: in time order"
         );
-        // Lines measured off the parsed grid, wide enough that nothing wraps.
         let mut wrapping = 0;
         for text in tape_text(tape) {
             let width = text.chars().count();
@@ -361,13 +346,7 @@ fn no_event_exceeds_256_bytes() {
     assert_eq!(DEMO_LOOP_MS, DemoSession::PLATFORM.loop_ms());
 }
 
-/// The demo plays the shell a terminal on this platform opens: on Windows a
-/// PowerShell session under its PowerShell tab, `PS C:\src\aterm>` prompts and
-/// PSReadLine's colours on what is typed; elsewhere the zsh session. On
-/// Windows it was the zsh session, a starship prompt and `targo` under a
-/// PowerShell tab (the 2026-10-18 Fluent judge's
-/// `J4F-7-settings-samples-unix-and-light-badges`). NEGATIVE CONTROL: the zsh
-/// session is the Unix one, and macOS and Linux still play it.
+/// The demo plays this platform's shell (PowerShell on Windows, zsh elsewhere).
 #[test]
 fn the_demo_plays_this_platforms_shell() {
     assert_eq!(
@@ -393,7 +372,6 @@ fn the_demo_plays_this_platforms_shell() {
             );
         }
     }
-    // Negative control: the zsh session is the Unix one.
     let zsh = tape_text(DemoSession::Zsh.tape());
     assert!(
         zsh.iter().any(|row| row == "\u{276f} targo test -q theme"),
@@ -401,12 +379,8 @@ fn the_demo_plays_this_platforms_shell() {
     );
     assert!(zsh.iter().all(|row| !row.starts_with("PS ")));
 
-    // PSReadLine's colours: the command bright yellow, a parameter bright
-    // black, the rest the text colour; the switch rides with the character
-    // after it, so typing keeps its 55 ms beat.
     let mut term = Terminal::new(8, 80);
     let tape = DemoSession::PowerShell.tape();
-    // The clear, the prompt, then one event a typed character.
     let first_command = &tape[..2 + "git status -sb".len()];
     for event in first_command {
         term.process(event.bytes);
@@ -454,13 +428,7 @@ fn word_contrast(input: &RenderInput, word: &str) -> f32 {
     crate::native_appearance::contrast_ratio(cell.fg, cell.bg)
 }
 
-/// The demo holds its colours to the floor a terminal tab holds the same
-/// colours to: Default Light's FAIL badge (bright white on red) and PASS
-/// badge (black on green) clear 4.5:1 under Windows' default floor, where the
-/// demo drew them at 1.49:1 and 2.71:1 (the 2026-10-18 type judge's
-/// `j4t-themes-demo-light-badges-unfloored`), and the demo the Themes page
-/// paints uses the floor a tab resolves when `minimum_contrast` is unset.
-/// NEGATIVE CONTROL: with the floor off the badges are as low as before.
+/// The demo holds theme-pair badges to the terminal's contrast floor.
 #[test]
 fn the_demo_holds_theme_pairs_to_the_terminals_floor() {
     let settled = u64::from(DEMO_TAPE[DEMO_SETTLED_EVENT].at_ms);
@@ -474,13 +442,11 @@ fn the_demo_holds_theme_pairs_to_the_terminals_floor() {
         let ratio = word_contrast(&on, badge);
         assert!(ratio >= 4.5, "{badge}: {ratio:.2}:1");
     }
-    // The text on the page keeps its own colours (the floor asks 3:1 there).
     assert_eq!(
         word_contrast(&on, "notes.txt"),
         word_contrast(&off, "notes.txt")
     );
 
-    // The demo the page paints draws under the terminal's default floor.
     let painted = |appearance: crate::settings_preview::AppearancePreviewSpec| {
         let spec = demo_spec(
             "Default Light",
@@ -513,7 +479,6 @@ fn the_demo_holds_theme_pairs_to_the_terminals_floor() {
         assert_eq!(floor, 1.0);
         assert!(fail < 2.0, "macOS and Linux keep the floor off");
     }
-    // A set `minimum_contrast` turns the theme-pair floor off, as in a tab.
     let off = painted(crate::settings_preview::AppearancePreviewSpec {
         indexed_minimum_contrast: 1.0,
         ..crate::settings_preview::AppearancePreviewSpec::default()
@@ -535,8 +500,7 @@ fn the_memo_hits_and_misses() {
     assert!(!Arc::ptr_eq(&first, &other), "a new theme is a new frame");
 }
 
-/// The demo window the tests paint: 520 × 300 at the origin, wide enough that
-/// no tab title is cut.
+/// Demo window bounds (520 × 300 at the origin).
 const DEMO_RECT: crate::native_ui::LogicalRect =
     crate::native_ui::LogicalRect::new(0.0, 0.0, 520.0, 300.0);
 
@@ -551,8 +515,7 @@ fn demo_roles() -> crate::settings::Roles {
     crate::native_appearance::NativeRoles::from_theme(aterm_render::Theme::default())
 }
 
-/// The prims of `scheme`'s demo with `chrome`, resting, in `frame`, `None`
-/// for the frame this platform draws.
+/// Prims of `scheme`'s resting demo with `chrome` in `frame` (`None` for the platform frame).
 fn demo_prims(
     scheme: &str,
     chrome: aterm_messages::tokens::AuthoredChrome,
@@ -615,11 +578,7 @@ const AUTHORED: aterm_messages::tokens::AuthoredChrome = aterm_messages::tokens:
     search_match: None,
 };
 
-/// The demo is framed as aterm's own window on this platform: on Windows a
-/// Windows 11 window (no window dots, Windows shells on the tabs, the
-/// caption's glyphs at the right), elsewhere the dots window. It was the dots
-/// window with `zsh — aterm` on Windows too (the 2026-10-18 Fluent judge's
-/// `F4-themes-demo-macos-window-mock`).
+/// The demo uses this platform's window frame (Windows 11 caption vs. window dots).
 #[test]
 fn the_demo_window_is_this_platforms() {
     assert_eq!(DemoFrame::PLATFORM == DemoFrame::Windows, cfg!(windows));
@@ -643,16 +602,11 @@ fn the_demo_window_is_this_platforms() {
         assert!(labels.contains(&"zsh — aterm"), "{labels:?}");
         assert!(!maximize);
     }
-    // The platform's frame is the one painted.
     let framed = demo_prims("Dracula", none, Some(DemoFrame::PLATFORM));
     assert_eq!(format!("{prims:?}"), format!("{framed:?}"));
 }
 
-/// A Windows demo is a Windows 11 window on every platform it is painted on:
-/// minimize, maximize and close at the right edge, 40 pt apart on the strip's
-/// middle, in white on a dark band and black on a light one; no window dots;
-/// the selected tab's title semibold, the quiet one regular, both Windows
-/// shells. Negative control: the dots frame has its dots and no caption.
+/// A Windows demo draws Windows 11 caption glyphs, shell tabs, and no window dots.
 #[test]
 fn a_windows_demo_is_a_windows_11_window() {
     let none = aterm_messages::tokens::AuthoredChrome::NONE;
@@ -709,7 +663,6 @@ fn a_windows_demo_is_a_windows_11_window() {
             "{scheme}: {labels:?}"
         );
     }
-    // Negative control: the dots window.
     let prims = demo_prims("Dracula", none, Some(DemoFrame::Dots));
     assert_eq!(dots(&prims), 3);
     assert!(
@@ -724,9 +677,7 @@ fn a_windows_demo_is_a_windows_11_window() {
     );
 }
 
-/// The Windows caption stands at the right edge whenever its buttons fit, the
-/// tabs and the `+` take what it leaves, and nothing crosses the window's
-/// corners or the buttons, from a sliver to the widest demo.
+/// The Windows strip fits tabs, `+`, and caption buttons across widths without overlap.
 #[test]
 fn a_windows_demo_strip_fits_every_width() {
     for width in [
@@ -762,10 +713,7 @@ fn a_windows_demo_strip_fits_every_width() {
     }
 }
 
-/// A Windows demo's selected tab is the real strip's: the terminal's ground,
-/// its top corners rounded on the band, running on through the seam into the
-/// grid where its fill IS the ground, at 1x and 2x. Negative control: an
-/// `active_tab_color` apart from the ground stands closed on the seam.
+/// A Windows demo tab whose fill matches the ground opens into the grid across the seam.
 #[test]
 fn a_windows_demo_tab_opens_into_its_grid() {
     let ground = crate::settings::u32_rgb(colors("Dracula").theme.bg);
@@ -798,7 +746,6 @@ fn a_windows_demo_tab_opens_into_its_grid() {
             strip.band,
             "{scale}x: a rounded corner"
         );
-        // Negative control: a tab of another colour stands on the seam.
         let at = demo_pixels(
             &demo_prims("Dracula", AUTHORED, Some(DemoFrame::Windows)),
             scale,
@@ -813,10 +760,7 @@ fn a_windows_demo_tab_opens_into_its_grid() {
     }
 }
 
-/// The tab strip paints the candidate's chrome colours in either frame: the
-/// selected tab's fill and the seam; the dots frame's selected card carries
-/// the accent rule, which the Windows tab row does not draw (its selected
-/// tab is marked by its shape, as Windows Terminal's is).
+/// The tab strip paints the candidate's chrome tokens in both frames.
 #[test]
 fn the_demo_tab_strip_paints_chrome_tokens() {
     let paint = |chrome, frame: DemoFrame| {
@@ -824,11 +768,7 @@ fn the_demo_tab_strip_paints_chrome_tokens() {
         let layout = DemoStripLayout::of(DEMO_RECT, frame);
         let foot = DEMO_RECT.y + layout.strip_h;
         match frame {
-            // Inside the active tab clear of its label, on its rule, and on
-            // the seam after it (the tab spans 52..220).
             DemoFrame::Dots => (at(212.0, 12.0), at(120.0, 27.0), at(220.0, 14.0)),
-            // Inside the tab clear of its label and `✕`, where the dots frame
-            // has its rule, and on the seam under the quiet tab.
             DemoFrame::Windows => (
                 at(layout.tabs_x + layout.tab_w - 4.0, layout.tab_top + 4.0),
                 at(layout.tabs_x + 20.0, foot - 2.0),
@@ -845,8 +785,6 @@ fn the_demo_tab_strip_paints_chrome_tokens() {
     assert_eq!(tab, [0x12, 0x34, 0x56], "active_tab_color fills the tab");
     assert_eq!(rule, authored.rule, "accent_color is its rule");
     assert_eq!(seam, authored.seam, "border_color is the seam");
-    // Negative control: a theme with no chrome colours shows the derived
-    // tones, not the last theme's.
     let (tab, rule, seam) = paint(none, DemoFrame::Dots);
     assert_eq!(
         (tab, rule, seam),
@@ -854,7 +792,6 @@ fn the_demo_tab_strip_paints_chrome_tokens() {
     );
     assert_ne!(tab, [0x12, 0x34, 0x56]);
     assert_ne!(rule, authored.rule);
-    // The Windows tab row: the fill and the seam, and no rule.
     let (tab, foot, seam) = paint(AUTHORED, DemoFrame::Windows);
     assert_eq!(tab, [0x12, 0x34, 0x56], "active_tab_color fills the tab");
     assert_eq!(foot, [0x12, 0x34, 0x56], "no accent rule under it");
@@ -863,15 +800,7 @@ fn the_demo_tab_strip_paints_chrome_tokens() {
     assert_eq!((tab, seam), (derived.active, derived.seam));
 }
 
-/// A DEMO TAB SAYS A WHOLE TITLE OR NONE (audit r14 PV5): both tabs used to
-/// get one equal width, so at 2x text (or a narrow window) the selected tab
-/// painted "zsh —…" beside a whole "targo test". In either frame, at 1x and
-/// 2x text, from a sliver of a window to the widest demo, every title a tab
-/// paints is one of its authored titles, whole, never an ellipsis, inside
-/// its own tab; the quiet tab gives way first, so wherever the selected tab
-/// shows a title the longest one it can hold. NEGATIVE CONTROL: at 30
-/// columns and at 102 columns with 2x text, half the strip is too narrow for
-/// "zsh — aterm", so an equal split would cut it.
+/// Every demo tab paints a whole authored title inside its bounds or none at all.
 #[test]
 fn a_demo_tab_says_a_whole_title_or_none() {
     use crate::native_appearance::{AppearancePreferences, install_preferences};
@@ -941,10 +870,6 @@ fn a_demo_tab_says_a_whole_title_or_none() {
         "the long title is kept wherever it fits: {long_titles}"
     );
 
-    // NEGATIVE CONTROL: where the cut was seen, an equal split cannot hold
-    // the selected title, and the selected tab still says a whole one.
-    // The demo widths the audit measured: 30x24 at 1x (a 69-pt tab each) and
-    // 102x29 at 2x (a 119-pt one).
     for (scale, demo_width) in [(1.0_f32, 202.0_f32), (2.0, 302.0)] {
         let _ = install_preferences(AppearancePreferences {
             text_scale: scale,

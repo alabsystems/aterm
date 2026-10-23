@@ -11,6 +11,9 @@ use crate::text::blank;
 use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
+/// Version of the Antigravity CLI (`agy`) harness, tracked independently per harness starting at `"0.1"`.
+pub const HARNESS_VERSION: &str = "0.1";
+
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
 /// The spinner row (`is_spinner_row`) as the wire's regex: a frame in column 0, two blanks, a word — what [`crate::reader::AgyReader`]'s busy guard waits on to leave.
@@ -73,6 +76,7 @@ const FOOTERS: [(&str, Footer); 2] = [
 
 fn footer_of(row: &str) -> Footer {
     if leading_spaces(row) > 2 {
+        // The right side alone: `Gemini 4 Argon · medium`, a model with no
         // effort badge, `(initializing...)`.
         return Footer::Blank;
     }
@@ -398,6 +402,7 @@ pub fn phase(rows: &[String]) -> (Phase, bool) {
 }
 
 fn framed_phase(rows: &[String], f: Frame) -> (Phase, bool) {
+    // A subagent waiting on a person holds the turn, however long its
     // spinner runs.
     if alert(rows, f.top).is_some() {
         return (Phase::Prompt, true);
@@ -883,6 +888,7 @@ fn approval_role(label: &str) -> Role {
     if ONCE.contains(&label) {
         Role::Once
     } else if label.contains(const { anchor_text("agy.box.persisted") }) {
+        // agy's own suffix on every answer it saves to settings.json, grant or
         // refusal (its binary's labels), whatever the words before it say.
         Role::Persist
     } else if label.starts_with(const { anchor_text("agy.box.session") })

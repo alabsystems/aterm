@@ -93,9 +93,7 @@ impl Kind {
         }
     }
 
-    /// `refused`, `usage`, `could_not_run`, `unauthenticated`, `forbidden`, `not_found`,
-    /// `not_visible`, `pending`, `conflict`, `invalid`, `rate_limited`, `server`,
-    /// `outcome_unknown`, `incomplete`, `failed`, `interrupted`.
+    /// Returns the kind's snake_case slug.
     #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
@@ -284,9 +282,7 @@ pub enum Forbid {
     },
     /// A WriterRead whose identity lacks `permissions.push`.
     NoPush,
-    /// A WriterRead by a fine-grained (`github_pat_`) writer whose profile carries no
-    /// `drafts_fp` equal to its token's fingerprint (design §6.4): refused before anything is
-    /// sent, until a person vouches with `agh auth add NAME … --write --drafts`.
+    /// A `WriterRead` by a fine-grained writer whose profile lacks a matching `drafts_fp`.
     DraftsUnproven,
     /// 451.
     Blocked,
@@ -295,8 +291,7 @@ pub enum Forbid {
 }
 
 impl Forbid {
-    /// `forbid.permission`, `forbid.sso`, `forbid.no_push`, `forbid.drafts_unproven`,
-    /// `forbid.blocked`, `forbid.other`.
+    /// Returns the `forbid.<kind>` slug.
     #[inline]
     #[must_use]
     pub const fn slug(&self) -> &'static str {
@@ -311,11 +306,7 @@ impl Forbid {
     }
 }
 
-/// Why a replayed run stopped (design §21.3). Seven of astream-effects' eight
-/// `ReplayDivergence` variants map one to one; `Unreached` (a tape longer than the run, from
-/// `ReplaySeam::finish`, astream ac17049) maps to `Unconsumed`; the rest are agh's own.
-/// `#[non_exhaustive]`. `ReplayDivergence` itself is exhaustive, so `Replay::of` is an
-/// exhaustive match with no `_` arm: a ninth astream variant fails agh's build, by design.
+/// Why a replayed run stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Replay {
@@ -323,31 +314,30 @@ pub enum Replay {
     Exhausted,
     /// Another kind of effect is next on the tape.
     KindMismatch,
-    /// A file effect for another path (agh's doors never raise it).
+    /// A file effect for another path.
     PathDiverged,
     /// Another door is next on the tape.
     DoorDiverged,
-    /// The same door, another request: the run asked GitHub another question.
+    /// The same door with another request.
     RequestDiverged,
     /// stdout or the exit differs from the tape's.
     OutputDiverged,
-    /// A keyed view holds no such exchange (agh's doors never raise it).
+    /// A keyed view holds no such exchange.
     Unrecorded,
-    /// `--replay` with a verb whose command line is not the tape's (a usage error, exit 2).
+    /// `--replay` with a verb whose command line is not the tape's.
     Argv,
-    /// Records were left on the tape after the run's exit (astream's `Unreached`).
+    /// Records were left on the tape after the run's exit.
     Unconsumed,
-    /// The run reached a reply the tape holds only by digest (a body over 1 MiB).
+    /// The run reached a reply the tape holds only by digest.
     BodyNotTaped,
-    /// A streaming door, or a request with a body, under a tape (M1 tapes neither).
+    /// A streaming door or a request with a body under a tape.
     StreamNotTaped,
-    /// Not a tape in agh's subset of atape-text 1, or a header agh cannot replay.
+    /// Invalid tape format or unsupported header.
     Format,
 }
 
 impl Replay {
-    /// `exhausted`, `kind`, `path`, `door`, `request`, `output`, `unrecorded`, `argv`,
-    /// `unconsumed`, `body_not_taped`, `stream_not_taped`, `format`.
+    /// Returns the replay sub-kind slug.
     #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
@@ -367,9 +357,7 @@ impl Replay {
         }
     }
 
-    /// The variant for astream's divergence: `Exhausted`, `KindMismatch`, `PathDiverged`,
-    /// `DoorDiverged`, `RequestDiverged`, `OutputDiverged` and `Unrecorded` one to one,
-    /// `Unreached{..}` → `Unconsumed`.
+    /// Maps an `astream_effects::ReplayDivergence` to `Replay`.
     #[inline]
     #[must_use]
     pub const fn of(divergence: &astream_effects::ReplayDivergence) -> Replay {
@@ -465,12 +453,7 @@ pub enum Sub {
 }
 
 impl Sub {
-    /// `None` for `Sub::None`. Otherwise the snake_case variant name (`primary`, `secondary`,
-    /// `pre_refused`, `already_exists`, `moved`, `ambiguous_tag`, `digest_mismatch`,
-    /// `size_mismatch`, `not_uploaded`, `torn`, `capped`, `truncated_tree`, `directory_cap`,
-    /// `compare_cap`, `search_cap`, `protocol`, `local`), `forbid.<…>` from `Forbid::slug`,
-    /// `wire.<kind>` from `WireKind::slug`, `policy.<code>` from `RefusalCode::slug`, or
-    /// `replay.<what>` from `Replay::slug`.
+    /// Returns the sub-kind slug, or `None` for `Sub::None`.
     #[must_use]
     pub fn slug(&self) -> Option<String> {
         let fixed = match self {
@@ -541,10 +524,7 @@ fn cap_chars(text: &str, cap: usize) -> String {
     text.chars().take(cap).collect()
 }
 
-/// `text` cut to at most `cap` characters without cutting inside a run of non-whitespace: a
-/// run the cap would split is dropped whole, back to the ASCII whitespace before it. The cut
-/// runs before any redaction can, so a learned value with no known prefix that crossed the
-/// cap would otherwise leave a part no rule matches.
+/// Truncates `text` to at most `cap` characters without splitting a non-whitespace run.
 fn cap_whole_runs(text: &str, cap: usize) -> String {
     let Some((end, next)) = text.char_indices().nth(cap) else {
         return text.to_string();
@@ -563,10 +543,7 @@ fn string_at(value: &Value, key: &str) -> Option<String> {
 }
 
 impl GithubBody {
-    /// Never fails: a body that is not JSON gives the default. `message` is capped at 500
-    /// characters, and a run of non-whitespace the cap would split is dropped whole (it may
-    /// be a credential the redactor knows only whole). A string item of `errors` becomes
-    /// `FieldError { message: Some(it), .. }`.
+    /// Parses a GitHub JSON error body, returning the default on non-JSON input.
     #[must_use]
     pub fn parse(body: &[u8]) -> GithubBody {
         let Ok(value) = aterm_json::from_slice::<Value>(body) else {
@@ -929,14 +906,7 @@ impl Error {
         self.kind.retriable()
     }
 
-    /// The first stderr line: `agh: {kind} exit={exit} verb={verb}`, then `repo=`, `as=`,
-    /// `http="{status} {method} {path}"`, `req=`, `sub=`, `reset=` and `retry_after=` when
-    /// present, `side_effect=`, `accepted="…"`, `scopes="…"` and `accepted_scopes="…"` when
-    /// present, and `why="…" next="…"`. No trailing newline.
-    ///
-    /// Each value passes `redactor.apply` raw, before it is quoted, so a learned value that
-    /// holds `"` or `\` is still found, and a quoted value keeps its closing quote. `req=`
-    /// keeps only the request id's `A-Z a-z 0-9 :`, so a header GitHub sent cannot add a field.
+    /// Formats the first stderr line (`agh: {kind} exit={exit} verb={verb} ...`) with redacted values.
     #[must_use]
     pub fn line(&self, verb: &str, redactor: &Redactor) -> String {
         let clean = |text: &str| redactor.apply(text);
@@ -1057,7 +1027,6 @@ impl Error {
             opt_text(github.and_then(|g| g.message.as_deref())),
         );
         object.insert("next".into(), text(&self.next));
-        // The resource is the raw `x-ratelimit-resource` header, so it is redacted too.
         object.insert(
             "rate".into(),
             self.rate.as_ref().map_or(Value::Null, |rate| {

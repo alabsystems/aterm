@@ -3,6 +3,38 @@
 // Author: Andrew Yates
 
 //! The shared verification helpers for aterm's derived models and their conformance tests, in two tiers with one switch between them.
+//!
+//! ## Caller idioms
+//!
+//! ```no_run
+//! use std::collections::BTreeMap;
+//! use aterm_spec::{derive::Model, verify::{self, Covered, NotRun}};
+//!
+//! // SCALAR derived model — the common case. The interpreter always runs, so
+//! // coverage is unconditional and the returned Covered is a log line.
+//! fn check_scalar(m: &Model) -> Covered {
+//!     verify::prove_and_catch_scalar(m, "Thing non-vacuity")
+//! }
+//!
+//! // FUNCTION-VALUED derived model — only `ty` can walk it, so outside a
+//! // checker run the obligation does NOT run, and the `_tiered` forms return
+//! // `Result<Covered, NotRun>` so the caller must state a policy (a registered
+//! // one is `spec-check models`'s). Propagate NotRun; it is not coverage.
+//! fn check_function_valued(m: &Model) -> Result<Covered, NotRun> {
+//!     verify::prove_and_catch_tiered(m, "Thing Tier-0")
+//! }
+//!
+//! fn check_transition(
+//!     m: &Model,
+//!     overrides: &[(&'static str, i64)],
+//!     prev: &BTreeMap<&'static str, i64>,
+//!     next: &BTreeMap<&'static str, i64>,
+//! ) -> (bool, String) {
+//!     verify::validate_transition_tiered(
+//!         m, overrides, prev, next, Some("Push"), "Thing conformance",
+//!     )
+//! }
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -2106,6 +2138,49 @@ const CASES_TRIES: u8 = 2;
 
 type CasesSlot = std::sync::Arc<Mutex<Option<CasesChild>>>;
 
+/// The `--cases` co-processes, one per (checker, spec, cfg), oldest first. A static is never
+/// dropped, so each child still here at `exit(3)` is ended by [`end_the_pool_at_exit`]'s handler.
+static POOL: Mutex<Vec<(TyChecker, String, String, CasesSlot)>> = Mutex::new(Vec::new());
+
+/// Arm, once, the `exit(3)` handler that kills and reaps every pooled co-process. Without it a
+/// pooled child reads its stdin's EOF only once this process is gone, so it outlives it, and a
+/// stage group swept at its leader's exit (aterm-verify's `sweep_group`) finds it still exiting.
+#[cfg_attr(trust_verify, trust::skip)]
+fn end_the_pool_at_exit() {
+    #[cfg(unix)]
+    {
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        extern "C" fn at_exit() {
+            end_the_pool();
+        }
+        unsafe extern "C" {
+            /// `stdlib.h`, declared inline as `aterm-uds`'s test-binary scratch declares it.
+            fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
+        }
+        ARMED.call_once(|| {
+            // SAFETY: registers a plain `extern "C"` function with no captured state; a failed
+            // registration leaves each child to end on its stdin's EOF after this process.
+            unsafe { atexit(at_exit) };
+        });
+    }
+}
+
+/// Kill and reap every pooled co-process, except one a case on another thread holds now.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn end_the_pool() {
+    use std::sync::{PoisonError, TryLockError};
+    let pooled = std::mem::take(&mut *POOL.lock().unwrap_or_else(PoisonError::into_inner));
+    for (.., slot) in pooled {
+        let child = match slot.try_lock() {
+            Ok(mut held) => held.take(),
+            Err(TryLockError::Poisoned(held)) => held.into_inner().take(),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        drop(child);
+    }
+}
+
 #[cfg_attr(trust_verify, trust::skip)]
 fn cases_verdict(
     checker: &TyChecker,
@@ -2117,7 +2192,6 @@ fn cases_verdict(
 ) -> Option<(bool, String)> {
     use std::sync::PoisonError;
     type Failures = BTreeMap<TyChecker, BTreeMap<String, BTreeMap<String, u8>>>;
-    static POOL: Mutex<Vec<(TyChecker, String, String, CasesSlot)>> = Mutex::new(Vec::new());
     static FAILED: Mutex<Failures> = Mutex::new(BTreeMap::new());
     let ty = checker.0.as_path();
     let failures = || {
@@ -2263,6 +2337,7 @@ impl CasesChild {
             .arg("-")
             .stderr(stderr);
         let mut child = ty_child(&mut cmd).map_err(io)?;
+        end_the_pool_at_exit();
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();

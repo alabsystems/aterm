@@ -95,7 +95,7 @@ pub enum ProbeLabel {
     RefusedOutOfBundle,
     /// Refused: the running executable could not be resolved.
     RefusedNoExe,
-    /// Refused: `[privacy] enabled` or `[privacy] check`.
+    /// Refused: `[privacy] enabled` or `[privacy] check` is off.
     RefusedDisabled,
     /// Refused: `$HOME` is unset.
     RefusedNoHome,
@@ -186,7 +186,7 @@ pub struct ProbeGate {
 }
 
 impl ProbeGate {
-    /// Both switches.
+    /// Both switches on — the shipped default.
     #[must_use]
     pub const fn on() -> Self {
         Self {
@@ -409,7 +409,8 @@ pub fn path_is_in_app_bundle(exe: &Path) -> bool {
     app_bundle_root(exe).is_some()
 }
 
-/// The `.app` directory `exe` lives.
+/// The `.app` directory `exe` lives inside, if any (`/Applications/aterm.app/Contents/MacOS/aterm`
+/// ⇒ `/Applications/aterm.app`); also the cache key's bundle half.
 #[must_use]
 pub fn app_bundle_root(exe: &Path) -> Option<PathBuf> {
     bundle_root_where(exe, |dir| {
@@ -449,7 +450,8 @@ pub fn fence_exe_from(exec: Option<PathBuf>, image: &SelfImage) -> Option<PathBu
 pub enum ImageAnchor {
     /// The image sits in a `.app` bundle.
     Live,
-    /// The image sits in a bundle layout (`…/Contents/MacOS/…`) whose directory is no longer named.
+    /// The image sits in a bundle layout (`…/Contents/MacOS/…`) whose directory
+    /// is no longer named `<something>.app` — `aterm.app.rollback` after an apply.
     Displaced,
     /// The image no longer has a path.
     Deleted,
@@ -1071,7 +1073,7 @@ fn classify_signing(report: &str) -> &'static str {
 /// At most this many claimant lines on any surface.
 pub const MAX_CLAIMANT_ROWS: usize = 8;
 
-/// How much of the candidate space the census got to look.
+/// How much of the candidate space the census got to look at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Enumeration {
     /// Every source was read and every candidate classified.
@@ -1108,7 +1110,7 @@ pub struct Claimant {
     pub signing: &'static str,
     /// The Team ID, when the signature carries a real one.
     pub team: Option<String>,
-    /// Whether this is the bundle the calling process runs.
+    /// Whether this is the bundle the calling process runs from.
     pub running: bool,
     /// The links the census found that lead to this bundle.
     pub links: Vec<PathBuf>,
@@ -1126,7 +1128,9 @@ impl Claimant {
 pub enum TrashOffer {
     /// The button takes it.
     Offered,
-    /// Signed with a certificate, as a release.
+    /// Signed with a certificate, as a release is — a Developer ID copy is
+    /// never moved, whatever its requirement says — or with a signature that
+    /// could not be read, so it is not known to be a build either.
     Signature,
     /// Signed ad hoc, but its requirement does not read as its cdhash.
     Requirement,
@@ -1168,7 +1172,7 @@ impl TrashOffer {
     }
 }
 
-/// Every bundle found claiming one identifier, and how complete the look.
+/// Every bundle found claiming one identifier, and how complete the look was.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Claimants {
     /// Every claimant found, running copy first.
@@ -1178,7 +1182,8 @@ pub struct Claimants {
 }
 
 impl Claimants {
-    /// The claimants whose requirement differs from the running.
+    /// The claimants whose requirement differs from the running copy's — the
+    /// ones that can reset a grant.
     #[must_use]
     pub fn conflicting(&self) -> Vec<&Claimant> {
         let Some(running) = self.found.iter().find(|c| c.running) else {
@@ -1248,10 +1253,10 @@ pub enum Listing {
     Unreadable,
 }
 
-/// What one candidate turned out.
+/// What one candidate turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Candidate {
-    /// Not a bundle, gone, or another.
+    /// Not a bundle, gone, or another program's.
     NotOurs,
     /// A bundle that could not be read.
     Hole,
@@ -1579,7 +1584,7 @@ enum SameBundle {
 
 struct Reached {
     same: SameBundle,
-    /// The path it is read and reported.
+    /// The path it is read and reported by.
     path: PathBuf,
     /// Whether `path` is only where a link resolves.
     resolved: bool,
@@ -1795,7 +1800,9 @@ pub enum Retired {
     Failed(String),
 }
 
-/// Move to the Trash each copy in `plan` (the copies the owner was shown) that a fresh census.
+/// Move to the Trash each copy in `plan` (the copies the owner was shown) that a fresh census
+/// still offers ([`Claimants::retirable`]), that is still the same bundle right before the move
+/// (`unchanged`, see [`still_claims`]), and that no process runs from.
 pub fn retire_claimants(
     plan: &[PathBuf],
     fresh: &Claimants,
@@ -1973,7 +1980,8 @@ impl Folder {
         }
     }
 
-    /// The display name, so every surface spells it alike and none derives a sentence.
+    /// The display name, so every surface spells it alike and none derives a sentence from
+    /// the config token.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -2221,7 +2229,7 @@ impl ResetPlan {
         self.subject.as_str()
     }
 
-    /// The folders, in plan order, each appearing.
+    /// The folders, in plan order, each appearing once.
     #[must_use]
     pub fn folders(&self) -> &[Folder] {
         &self.folders
@@ -2273,7 +2281,7 @@ impl ResetStatus {
 pub struct ResetAttempt {
     /// The folder this invocation named.
     pub folder: Folder,
-    /// What that invocation.
+    /// What that invocation did.
     pub status: ResetStatus,
 }
 
@@ -2308,7 +2316,7 @@ impl ResetAttempt {
 pub enum ResetOutcome {
     /// Every invocation exited 0.
     AllReset,
-    /// At least one folder reset and at least one.
+    /// At least one folder reset and at least one did not.
     Partial,
     /// At least one invocation ran and no folder reset.
     NoneReset,
@@ -2484,7 +2492,7 @@ pub enum DebuggerProbeLabel {
     TimedOut,
     /// Its output was over the cap or not UTF-8, or its exit could not be read.
     OutputUnreadable,
-    /// Refused: `[privacy] enabled` or `[privacy] check`.
+    /// Refused: `[privacy] enabled` or `[privacy] check` is off.
     RefusedDisabled,
     /// Refused: the running executable is not inside a `.app` bundle.
     RefusedOutOfBundle,
@@ -2955,7 +2963,7 @@ pub enum DevToolProbeLabel {
     SpawnFailed,
     /// Its output was over the cap or not UTF-8, or its exit could not be read.
     OutputUnreadable,
-    /// Refused: `[privacy] enabled` or `[privacy] check`.
+    /// Refused: `[privacy] enabled` or `[privacy] check` is off.
     RefusedDisabled,
     /// Refused: `[privacy] observer = false`, which stops aterm reading tccd's log.
     RefusedObserverOff,
@@ -3424,7 +3432,7 @@ pub enum DevToolListLabel {
     SpawnFailed,
     /// Its output was over the cap or not UTF-8, or its exit could not be read.
     OutputUnreadable,
-    /// Refused: `[privacy] enabled` or `[privacy] check`.
+    /// Refused: `[privacy] enabled` or `[privacy] check` is off.
     RefusedDisabled,
     /// Refused: `[privacy] observer = false`.
     RefusedObserverOff,
@@ -3481,7 +3489,7 @@ impl DevToolListLabel {
 pub struct DevToolList {
     /// The subject's row, classified.
     pub listing: DevToolListing,
-    /// Why it reads.
+    /// Why it reads so.
     pub label: DevToolListLabel,
     /// The row's `last_modified`, unix seconds.
     pub modified_at_s: Option<i64>,
@@ -4478,7 +4486,9 @@ mod imp {
         }
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
         let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-        // SAFETY: `info` points at `size` writable bytes of exactly the structure PROC_PIDTBSDINFO.
+        // SAFETY: `info` points at `size` writable bytes of exactly the
+        // structure PROC_PIDTBSDINFO fills; libproc returns the number of bytes
+        // it wrote.
         let read = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -4615,6 +4625,7 @@ mod imp {
     pub(super) fn probe_descriptor(db: &Path) -> Result<std::os::fd::OwnedFd, i32> {
         use std::os::fd::FromRawFd as _;
         let Ok(path) = CString::new(db.as_os_str().as_bytes()) else {
+            // Unreachable: the caller already rejected interior NULs. Report
             // an errno rather than panicking in a probe.
             return Err(libc::EINVAL);
         };
@@ -4643,7 +4654,9 @@ mod imp {
         if sym.is_null() {
             return None;
         }
-        // SAFETY: dyld resolved this name to the libquarantine function whose C prototype.
+        // SAFETY: dyld resolved this name to the libquarantine function whose
+        // C prototype is `pid_t f(pid_t)`, which is exactly
+        // `ResponsibilityGetPid`.
         Some(unsafe { std::mem::transmute::<*mut libc::c_void, ResponsibilityGetPid>(sym) })
     }
 
@@ -4655,7 +4668,8 @@ mod imp {
             unsafe {
                 *libc::__error() = 0;
             }
-            // SAFETY: `func` has the signature dyld resolved it.
+            // SAFETY: `func` has the signature dyld resolved it to, and the argument is a
+            // plain `pid_t`.
             let ret = unsafe { func(pid) };
             responsible_answer(ret, errno())
         })
@@ -4725,7 +4739,7 @@ mod imp {
         let mut error: CfRef = std::ptr::null();
         // SAFETY: `id` is a valid CFString we own; `error` is a valid out slot.
         let urls = unsafe { LSCopyApplicationURLsForBundleIdentifier(id, &raw mut error) };
-        // SAFETY: `id` was created above and is released exactly.
+        // SAFETY: `id` was created above and is released exactly once.
         unsafe { CFRelease(id) };
         if urls.is_null() {
             if error.is_null() {
@@ -4733,7 +4747,7 @@ mod imp {
             }
             // SAFETY: a non-null `error` is a CFError we own (Copy rule).
             let code = unsafe { CFErrorGetCode(error) };
-            // SAFETY: released exactly.
+            // SAFETY: released exactly once.
             unsafe { CFRelease(error) };
             return (code == APPLICATION_NOT_FOUND).then(Vec::new);
         }
@@ -4796,7 +4810,7 @@ mod imp {
                 std::ptr::null_mut(),
             )
         };
-        // SAFETY: `data` was created above and is released exactly.
+        // SAFETY: `data` was created above and is released exactly once.
         unsafe { CFRelease(data) };
         if plist.is_null() {
             return None;

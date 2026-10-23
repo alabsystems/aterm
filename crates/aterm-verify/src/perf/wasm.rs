@@ -3,11 +3,13 @@
 
 //! The `wasm` lane: build the two SHIPPED renderer modules (`aterm-wasm` on
 //! the CPU canvas path, `aterm-gpu-web` on the WebGL path) for
-//! `wasm32-unknown-unknown` with the shipping `+simd128` flag, bind them for
-//! node with `verify glue`'s generator (neither module has wasm-bindgen:
+//! `wasm32-unknown-unknown` with the shipping `+simd128` flag, bind them
+//! with `verify glue`'s generator (neither module has wasm-bindgen:
 //! docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.7 and WP.8), apply
 //! the shipping `wasm-opt -O3` pass, and drive their real exports with
-//! `crates/aterm-verify/perf/wasm/bench.mjs` under node.
+//! `crates/aterm-verify/perf/wasm/bench.mjs` in a page of the pinned
+//! chrome-headless-shell ([`crate::wasm_page`]): V8 as the site's visitors
+//! run it, not node's.
 //!
 //! STOCK EXCEPTION (Trust lacks a wasm32 std: error[E0463] can't find crate
 //! for `core`): the build rides rustup's `stable`, resolved to its own
@@ -15,23 +17,28 @@
 //! ignores `RUSTUP_TOOLCHAIN`. It runs from a neutral cwd so no repo
 //! config (vendored source replacement, Trust `-Z` flags) applies.
 //!
-//! A box without node, the stable wasm32 target or `wasm-opt` SKIPs with the
-//! fix; a failure on an equipped box fails.
+//! A box without the pinned browser, rustup's stable wasm32 target or
+//! `wasm-opt` is COULD NOT RUN naming the provider, found before anything
+//! builds; a failure on an equipped box fails. The floors were recorded in the
+//! pinned shell, so a run in another browser (`ATERM_BROWSER`) is measured
+//! and not judged, and records nothing.
 //!
-//! Honest seams, on purpose: the GPU scenarios time the wasm-side frame build
-//! only (node has no WebGL, and bench.mjs asserts the seam is where it
-//! errors), and heap growth is an RSS proxy (wasm linear memory never
-//! shrinks).
+//! An honest seam, on purpose: the GPU scenarios time the wasm-side frame
+//! build only (`render()` before `init()` gave it a WebGL context, and
+//! bench.mjs asserts the seam is where it errors; the browser lane draws the
+//! frames).
 
 use aterm_uds::output::CommandOutput as _;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use aterm_json::Value;
+use aterm_json::{Value, json};
 use aterm_uds::spawnfd::command;
 
 use super::LaneRun;
 use super::floors::{self, FloorLane};
 use super::workspace_root;
+use crate::wasm_page::{self, Page, Refused};
 // The shipping `wasm-opt` pass: pre-opt numbers are not the product's, so the
 // lane never measures without it.
 use crate::wasm_glue::WASM_OPT_FLAGS;
@@ -58,9 +65,9 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
     ],
     baseline_file: "perf-baseline-wasm.json",
     comment: "aterm WASM-BENCH baseline: the SHIPPED wasm modules (CPU aterm-wasm + GPU \
-              aterm-gpu-web) driven under node by crates/aterm-verify/perf/wasm/bench.mjs. All \
-              BIGGER-IS-BETTER. Re-record with targo --unverified verify perf --record \
-              wasm.",
+              aterm-gpu-web) driven in the pinned chrome-headless-shell by \
+              crates/aterm-verify/perf/wasm/bench.mjs. All BIGGER-IS-BETTER. Re-record with \
+              targo --unverified verify perf --record wasm.",
     cli: "wasm",
 };
 
@@ -75,11 +82,6 @@ pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 5_886_685.0;
 /// CPU module's: the measured 4,901,631 B (2026-10-19) + 10%.
 pub(crate) const WASM_GPU_MODULE_BYTES_CAP: f64 = 5_391_794.0;
 
-/// The node driver, beside this crate.
-fn bench_script() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("perf/wasm/bench.mjs")
-}
-
 /// Does `program args` run and exit 0?
 fn answers(program: &Path, args: &[&str]) -> bool {
     command(program)
@@ -88,25 +90,15 @@ fn answers(program: &Path, args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// What a wasm lane needs before it builds, found or refused: node, then
-/// [`build_tools`]. `Err` is the lane's verdict: a SKIP with the fix.
-pub(crate) fn lane_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
-    if !answers(Path::new("node"), &["--version"]) {
-        return Err(LaneRun::skip(
-            "node not found; the lane runs the wasm under node",
-            aterm_uds::host::tool("node").remedy(),
-        ));
-    }
-    build_tools(wasm_opt)
-}
-
 /// What building the two modules needs, found or refused: rustup (whose
 /// `stable` carries the wasm32 std), and `wasm-opt` when `wasm_opt` asks for
-/// it: rustup's path, or a SKIP with the fix. Binding needs nothing more:
-/// `verify glue`'s generator runs in process.
+/// it: rustup's path, or COULD NOT RUN naming the provider (both are rows
+/// `verify provision` gives every develop machine). Binding needs nothing
+/// more: `verify glue`'s generator runs in process. The browser the drivers
+/// run in is found first ([`wasm_page::browser`]).
 pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
     let Some(rustup) = crate::rustup::find_rustup() else {
-        return Err(LaneRun::skip(
+        return Err(LaneRun::could_not_run(
             format!("no rustup ({})", crate::rustup::RUSTUP_LOOKED),
             format!(
                 "{}, with stable's wasm32 std",
@@ -124,13 +116,13 @@ pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
             )
         });
     if !has_target {
-        return Err(LaneRun::skip(
+        return Err(LaneRun::could_not_run(
             "no stable wasm32-unknown-unknown target",
             "rustup target add wasm32-unknown-unknown --toolchain stable",
         ));
     }
     if wasm_opt && !answers(&wasm_opt_program(), &["--version"]) {
-        return Err(LaneRun::skip(
+        return Err(LaneRun::could_not_run(
             "wasm-opt not found; the lane applies the shipping -O3 pass and never measures \
              pre-opt modules",
             aterm_uds::host::tool("wasm-opt").remedy(),
@@ -139,19 +131,26 @@ pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
     Ok(rustup)
 }
 
-/// WASM floors: the shipped modules under node, every gated key against its
-/// floor, plus the module-size ceilings.
+/// WASM floors: the shipped modules in the browser, every gated key against
+/// its floor, plus the module-size ceilings.
 pub(crate) fn gate_wasm(record: bool) -> LaneRun {
     let root = workspace_root();
-    let rustup = match lane_tools(true) {
+    let browser = match wasm_page::browser() {
+        Ok(browser) => browser,
+        Err(refused) => return refused.verdict("the wasm bench"),
+    };
+    let rustup = match build_tools(true) {
         Ok(rustup) => rustup,
         Err(verdict) => return verdict,
     };
-    let json = match build_and_bench(&root, &rustup) {
-        Ok(json) => json,
-        Err(e) => return LaneRun::fail(e),
+    let (product, json) = match build_and_bench(&root, &rustup, &browser) {
+        Ok(ran) => ran,
+        Err(refused) => return refused.verdict("the wasm bench"),
     };
-    let mut run = floors::judge_keyed(&WASM_LANE, &json, record);
+    let mut run = match floors_engine(&product, record) {
+        Ok(()) => floors::judge_keyed(&WASM_LANE, &json, record),
+        Err(other) => other,
+    };
     let findings = wasm_module_fences(&json);
     if findings.is_empty() {
         run.fence_held(WASM_LANE.cli);
@@ -162,64 +161,63 @@ pub(crate) fn gate_wasm(record: bool) -> LaneRun {
     run
 }
 
+/// Whether this run's floors can be judged or recorded: only in the browser
+/// they were recorded in, the pinned shell ([`crate::browser::chromium::pinned_product`]).
+/// Another (an `ATERM_BROWSER` override) is measured and not judged, and
+/// records nothing: V8 at another version is not the same engine.
+fn floors_engine(product: &str, record: bool) -> Result<(), LaneRun> {
+    let pinned = pinned_product();
+    if product == pinned {
+        return Ok(());
+    }
+    let why = format!("the floors were recorded in {pinned}, and this run's browser is {product}");
+    Err(if record {
+        LaneRun::could_not_run(
+            format!("--record wasm records in the pinned shell only: {why}"),
+            format!("unset ATERM_BROWSER; {}", wasm_page::browser_fix()),
+        )
+    } else {
+        LaneRun::not_judged(why)
+    })
+}
+
+/// The pinned shell's product string, where this host drives one.
+#[cfg(unix)]
+fn pinned_product() -> String {
+    crate::browser::chromium::pinned_product()
+}
+
+#[cfg(not(unix))]
+fn pinned_product() -> String {
+    String::new()
+}
+
 /// The CPU module's boundary replay recorded again (`verify glue
 /// --record-replay`): both modules built in the DEV profile and bound as the
 /// `wasm-smoke` check binds them, then [`replay`] with `record`, which
 /// rewrites the answers and checks them back. Progress goes to `log`.
 pub(crate) fn record_replay(log: &mut String) -> LaneRun {
     let root = workspace_root();
-    let rustup = match lane_tools(false) {
+    let browser = match wasm_page::browser() {
+        Ok(browser) => browser,
+        Err(refused) => return refused.verdict("the replay"),
+    };
+    let rustup = match build_tools(false) {
         Ok(rustup) => rustup,
         Err(verdict) => return verdict,
     };
-    let mut record = || -> Result<(), String> {
-        let built = build_modules(&root, &rustup, "dev", None)?;
-        let out = root.join("target/wasm-smoke");
-        bind_modules(&built, &out, false)?;
-        bind_cpu_web(&built, &out)?;
-        replay(&root, &out, true, log)
+    let mut record = || -> Result<(), Refused> {
+        let built = build_modules(&root, &rustup, "dev", None).map_err(Refused::Failed)?;
+        let site = root.join("target/wasm-smoke");
+        bind_modules(&built, &site, false).map_err(Refused::Failed)?;
+        wasm_page::lay_drivers(&root, &site).map_err(Refused::Failed)?;
+        let mut page = Page::start(&browser, &site, &std::env::temp_dir())?;
+        replay(&root, &site, &mut page, true, log)
     };
     match record() {
         Ok(()) => LaneRun::pass(),
-        Err(e) => LaneRun::fail(e),
+        Err(refused) => refused.verdict("the replay"),
     }
-}
-
-/// The CPU module's ES module glue into `out/cpu-web`, the second flavor
-/// [`replay`] drives.
-pub(crate) fn bind_cpu_web(built: &Path, out: &Path) -> Result<(), String> {
-    crate::wasm_glue::bind(
-        &built.join("aterm_wasm.wasm"),
-        &out.join("cpu-web"),
-        crate::wasm_glue::Flavor::Web,
-    )
-    .map(drop)
-}
-
-/// Run `node args…`, its stderr into `log`; `Err` unless it exits 0.
-fn node_script(args: &[&std::ffi::OsStr], log: &mut String) -> Result<(), String> {
-    let run = node_output(args)?;
-    for line in String::from_utf8_lossy(&run.stderr).lines() {
-        log.push_str("  ");
-        log.push_str(line);
-        log.push('\n');
-    }
-    if run.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "node {} exited {:?}",
-            Path::new(args.first().copied().unwrap_or_default()).display(),
-            run.status.code()
-        ))
-    }
-}
-
-fn node_output(args: &[&std::ffi::OsStr]) -> Result<std::process::Output, String> {
-    command("node")
-        .args(args)
-        .output_owned()
-        .map_err(|e| format!("could not run node: {e}"))
 }
 
 /// The CPU module's recorded boundary answers (`perf/wasm/replay.mjs`).
@@ -227,70 +225,74 @@ pub(crate) fn replay_answers(root: &Path) -> PathBuf {
     root.join("crates/aterm-wasm/tests/fixtures/abi_replay.json")
 }
 
-/// The CPU module's boundary replay: `replay.mjs` drives the debug module
-/// through the CommonJS glue in `out/cpu` and the ES module glue in
-/// `out/cpu-web`, and each run must give the recorded answers
-/// ([`replay_answers`]); `record` rewrites them from the CommonJS run first.
-/// The answers were recorded on the glue wasm-bindgen 0.2.108 wrote, so a
-/// module bound another way that reproduces them carries every value across
-/// the boundary as that one did.
+/// The CPU module's boundary replay: `replay.mjs`, in a fresh tab of `page`
+/// serving `site` (the debug module's glue in `cpu/`, [`wasm_page::lay_drivers`]'
+/// drivers and font), drives the module through its ES module glue, and the
+/// run must give the recorded answers ([`replay_answers`]); `record`
+/// rewrites them from a run first. The answers were recorded on the glue
+/// wasm-bindgen 0.2.108 wrote, so a module bound another way that reproduces
+/// them carries every value across the boundary as that one did.
 ///
 /// NEGATIVE CONTROL: the same run against a copy of the answers with one
 /// frame's hash changed must fail and name that answer, so a replay that
 /// compares nothing cannot pass.
 pub(crate) fn replay(
     root: &Path,
-    out: &Path,
+    site: &Path,
+    page: &mut Page,
     record: bool,
     log: &mut String,
-) -> Result<(), String> {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("perf/wasm/replay.mjs");
+) -> Result<(), Refused> {
+    let failed = Refused::Failed;
     let answers = replay_answers(root);
-    let (cpu, cpu_web) = (out.join("cpu"), out.join("cpu-web"));
+    let driver = format!("{}/replay.mjs", wasm_page::DRIVERS);
+    let run = |page: &mut Page, answers: Option<&str>, log: &mut String| {
+        let ran = page.run(
+            &driver,
+            &json!({"glue": "../cpu/aterm_wasm.js", "font": format!("../{}", wasm_page::FONT),
+                    "answers": answers.map(|a| format!("../{a}"))}),
+        )?;
+        for line in &ran.console {
+            let _ = writeln!(log, "  {line}");
+        }
+        Ok::<_, Refused>(ran)
+    };
     if record {
-        node_script(
-            &[
-                script.as_os_str(),
-                "record".as_ref(),
-                answers.as_os_str(),
-                cpu.as_os_str(),
-                "nodejs".as_ref(),
-            ],
-            log,
-        )?;
-    }
-    for (dir, flavor) in [(&cpu, "nodejs"), (&cpu_web, "web")] {
-        node_script(
-            &[
-                script.as_os_str(),
-                "check".as_ref(),
-                answers.as_os_str(),
-                dir.as_os_str(),
-                flavor.as_ref(),
-            ],
-            log,
-        )?;
+        let ran = run(page, None, log)?;
+        let text = ran
+            .value
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| failed("replay.mjs answered no answers to record".to_string()))?;
+        std::fs::write(&answers, text)
+            .map_err(|e| failed(format!("could not write {}: {e}", answers.display())))?;
+        let _ = writeln!(log, "  wasm-replay: recorded {}", answers.display());
     }
     let text = std::fs::read_to_string(&answers)
-        .map_err(|e| format!("could not read {}: {e}", answers.display()))?;
+        .map_err(|e| failed(format!("could not read {}: {e}", answers.display())))?;
     let (planted, hash) = plant_frame_hash(&text)
-        .ok_or_else(|| format!("{}: no frame hash to plant", answers.display()))?;
-    let copy = out.join("abi_replay.planted.json");
-    std::fs::write(&copy, planted)
-        .map_err(|e| format!("could not write {}: {e}", copy.display()))?;
-    let run = node_output(&[
-        script.as_os_str(),
-        "check".as_ref(),
-        copy.as_os_str(),
-        cpu.as_os_str(),
-        "nodejs".as_ref(),
-    ])?;
-    let stderr = String::from_utf8_lossy(&run.stderr);
-    if run.status.success() || !stderr.contains(&hash) || !stderr.contains(" 1 differ") {
-        return Err(format!(
+        .ok_or_else(|| failed(format!("{}: no frame hash to plant", answers.display())))?;
+    for (name, contents) in [("answers.json", &text), ("answers.planted.json", &planted)] {
+        let path = site.join(name);
+        std::fs::write(&path, contents)
+            .map_err(|e| failed(format!("could not write {}: {e}", path.display())))?;
+    }
+    let differ = |ran: &wasm_page::Ran| ran.value.get("failures").and_then(Value::as_u64);
+    let ran = run(page, Some("answers.json"), log)?;
+    if differ(&ran) != Some(0) {
+        return Err(failed(format!(
+            "the replay's answers differ from {} (review the change, then `targo \
+             --unverified verify glue --record-replay`)",
+            answers.display()
+        )));
+    }
+    let mut control = String::new();
+    let ran = run(page, Some("answers.planted.json"), &mut control)?;
+    if differ(&ran) != Some(1) || !control.contains(&hash) {
+        return Err(failed(format!(
             "NEGATIVE CONTROL: the replay against answers with one frame hash planted \
-             ({hash}) did not fail on exactly that answer:\n{stderr}"
-        ));
+             ({hash}) did not fail on exactly that answer:\n{control}"
+        )));
     }
     log.push_str("  wasm-replay: negative control held: a planted frame hash fails the replay\n");
     Ok(())
@@ -371,16 +373,11 @@ fn build_modules(
     Ok(root.join("target/wasm32-unknown-unknown").join(dir))
 }
 
-/// Bind both modules for node (CommonJS) into `out/cpu` and `out/gpu` with
-/// `verify glue`'s generator, then apply the shipping `wasm-opt` pass when
-/// `optimise`.
+/// Bind both modules into `out/cpu` and `out/gpu` with `verify glue`'s
+/// generator, then apply the shipping `wasm-opt` pass when `optimise`.
 pub(crate) fn bind_modules(built: &Path, out: &Path, optimise: bool) -> Result<(), String> {
     for (module, dir) in [("aterm_wasm.wasm", "cpu"), ("aterm_gpu_web.wasm", "gpu")] {
-        crate::wasm_glue::bind(
-            &built.join(module),
-            &out.join(dir),
-            crate::wasm_glue::Flavor::Nodejs,
-        )?;
+        crate::wasm_glue::bind(&built.join(module), &out.join(dir))?;
     }
     if optimise {
         for bound in [
@@ -407,31 +404,66 @@ fn wasm_opt_program() -> PathBuf {
     aterm_uds::host::find_tool("wasm-opt").unwrap_or_else(|| "wasm-opt".into())
 }
 
-/// Build, bind, optimise and bench; the bench's JSON report.
-fn build_and_bench(root: &Path, rustup: &Path) -> Result<Value, String> {
-    let built = build_modules(root, rustup, "release", Some("-C target-feature=+simd128"))?;
-    let out = root.join("target/wasm-bench");
-    bind_modules(&built, &out, true)?;
-    // --expose-gc: the bench collects before its heap reads, so the search
-    // memory proxy is not dominated by dead JS garbage.
-    let bench = command("node")
-        .arg("--expose-gc")
-        .arg(bench_script())
-        .arg(&out)
-        .output_owned()
-        .map_err(|e| format!("could not run node: {e}"))?;
-    let stderr = String::from_utf8_lossy(&bench.stderr);
-    for line in stderr.lines().filter(|l| l.contains("wasm-bench:")) {
+/// Build, bind, optimise and bench in `browser`: the browser's product
+/// string, and the bench's report with the two optimised modules' sizes.
+fn build_and_bench(
+    root: &Path,
+    rustup: &Path,
+    browser: &wasm_page::Browser,
+) -> Result<(String, Value), Refused> {
+    let failed = Refused::Failed;
+    let built = build_modules(root, rustup, "release", Some("-C target-feature=+simd128"))
+        .map_err(failed)?;
+    let site = root.join("target/wasm-bench");
+    bind_modules(&built, &site, true).map_err(failed)?;
+    wasm_page::lay_drivers(root, &site).map_err(failed)?;
+    let mut page = Page::start(browser, &site, &std::env::temp_dir())?;
+    let product = page.product().to_string();
+    eprintln!("  wasm-bench: in {product}");
+    let ran = page.run(
+        &format!("{}/bench.mjs", wasm_page::DRIVERS),
+        &json!({"cpu": "../cpu/aterm_wasm.js", "gpu": "../gpu/aterm_gpu_web.js",
+                "font": format!("../{}", wasm_page::FONT)}),
+    )?;
+    for line in ran.console.iter().filter(|l| l.contains("wasm-bench:")) {
         eprintln!("  {line}");
     }
-    if !bench.status.success() {
-        return Err(format!(
-            "bench.mjs exited {:?}\n{stderr}",
-            bench.status.code()
-        ));
+    for line in sample_lines(&ran.value) {
+        eprintln!("    {line}");
     }
-    floors::last_json_line(&String::from_utf8_lossy(&bench.stdout))
-        .ok_or_else(|| "bench.mjs printed no JSON report".to_string())
+    let mut report = ran.value;
+    let Value::Object(fields) = &mut report else {
+        return Err(failed(format!("bench.mjs answered no report: {report:?}")));
+    };
+    for (key, module) in [
+        ("wasm_cpu_module_bytes", "cpu/aterm_wasm_bg.wasm"),
+        ("wasm_gpu_module_bytes", "gpu/aterm_gpu_web_bg.wasm"),
+    ] {
+        let path = site.join(module);
+        let bytes = std::fs::metadata(&path)
+            .map_err(|e| failed(format!("could not read {}: {e}", path.display())))?
+            .len();
+        fields.insert(key.to_string(), json!(bytes));
+    }
+    Ok((product, report))
+}
+
+/// Each gated key's samples, as the bench answered them beside its median
+/// (`samples`, never gated): `key: n=5 [a b c d e]`, in the lane's order.
+fn sample_lines(report: &Value) -> Vec<String> {
+    WASM_LANE
+        .keys
+        .iter()
+        .filter_map(|key| {
+            let samples = report.get("samples")?.get(key)?.as_array()?;
+            let shown: Vec<String> = samples
+                .iter()
+                .filter_map(Value::as_f64)
+                .map(|v| format!("{v}"))
+                .collect();
+            Some(format!("{key}: n={} [{}]", shown.len(), shown.join(" ")))
+        })
+        .collect()
 }
 
 fn run_step(cmd: &mut aterm_uds::spawnfd::Command, what: &str) -> Result<(), String> {
@@ -515,6 +547,49 @@ mod tests {
             wasm_module_fences(&json("{\"wasm_gpu_module_bytes\":1}")),
             ["wasm_cpu_module_bytes missing from the bench report"]
         );
+    }
+
+    /// The floors are judged and recorded only in the pinned shell: another
+    /// browser's run is not judged and keeps no samples for the trend, and a
+    /// record in it could not run. NEGATIVE CONTROL: the pinned product is
+    /// judged.
+    #[cfg(unix)]
+    #[test]
+    fn the_floors_are_judged_only_in_the_pinned_shell() {
+        let pinned = crate::browser::chromium::pinned_product();
+        assert!(floors_engine(&pinned, false).is_ok() && floors_engine(&pinned, true).is_ok());
+        let other = "HeadlessChrome/1.0.0.0";
+        let run = floors_engine(other, false).expect_err("another browser");
+        assert!(
+            matches!(&run.status, super::super::Status::NotJudged(why)
+                if why.contains(&pinned) && why.contains(other)),
+            "{run:?}"
+        );
+        assert!(run.samples.is_empty());
+        let record = floors_engine(other, true).expect_err("no record");
+        assert!(
+            matches!(&record.status, super::super::Status::CouldNotRun { why, .. }
+                if why.contains("records in the pinned shell only")),
+            "{record:?}"
+        );
+    }
+
+    /// A key's samples print in the lane's order; a key the bench gave none
+    /// prints nothing, and an ungated key never prints.
+    #[test]
+    fn each_gated_keys_samples_print_in_lane_order() {
+        let report = json(
+            "{\"samples\":{\"wasm_gpu_frame_build_fps\":[3,4.5],\
+             \"wasm_cpu_ingest_mixed_mbps\":[1,2],\"ungated\":[9]}}",
+        );
+        assert_eq!(
+            sample_lines(&report),
+            [
+                "wasm_cpu_ingest_mixed_mbps: n=2 [1 2]",
+                "wasm_gpu_frame_build_fps: n=2 [3 4.5]"
+            ]
+        );
+        assert!(sample_lines(&json("{}")).is_empty());
     }
 
     #[test]

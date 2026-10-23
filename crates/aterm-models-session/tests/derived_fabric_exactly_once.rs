@@ -7,8 +7,6 @@ use aterm_models_session::fabric_exactly_once_model;
 use aterm_spec::interp;
 use aterm_spec::walk::{only, walk};
 
-/// Every action of the committed machine, so a guard tightened by mistake shows up as a
-/// dead action, not a quieter proof. `CommitEarly` is the defect 2's alone.
 const ACTIONS: [&str; 12] = [
     "Tell",
     "DeliverTaken",
@@ -40,7 +38,6 @@ fn fabric_exactly_once_fires_every_committed_move() {
     );
 }
 
-/// Each defect breaks the invariant written for it, and the committed machine keeps it.
 #[test]
 fn fabric_exactly_once_each_defect_breaks_its_own_invariant() {
     let model = fabric_exactly_once_model();
@@ -62,9 +59,6 @@ fn fabric_exactly_once_each_defect_breaks_its_own_invariant() {
     }
 }
 
-/// The hand-traced counterexamples, one per defect, walked on the mutant: each ends in a
-/// state its invariant forbids, and the committed machine keeps the invariant along every
-/// step of the same trace it can take.
 #[test]
 fn fabric_exactly_once_the_traced_counterexamples_end_where_the_doc_says() {
     let model = fabric_exactly_once_model();
@@ -127,9 +121,6 @@ fn fabric_exactly_once_the_traced_counterexamples_end_where_the_doc_says() {
     }
 }
 
-/// What the round buys, on the committed machine: a kill between the delivery and the
-/// commit costs a redelivery the endpoint dedups; a move that takes the record lets the
-/// next record at its offset be a row of its own.
 #[test]
 fn fabric_exactly_once_walks_the_round_a_bridge_makes() {
     let m = fabric_exactly_once_model();

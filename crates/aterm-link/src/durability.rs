@@ -230,9 +230,11 @@ pub fn describe_served(
         && info.requested == Tier::Strict
     {
         // A broker of an older build: it took the word and opened the log
+        // strict, as the build before this one did.
         "its build serves ordered as strict".to_string()
     } else {
         // Asked one tier, opened at another, and not lowered: a broker of
+        // another build — one whose default a bare argv runs.
         format!("its build opened it {}", tier_name(info.requested))
     };
     format!("served {} ({why}) — {promise}", tier_name(info.served))
@@ -538,6 +540,7 @@ pub fn open_escalating(
     let broker = astream_broker::Broker::open_opts(log, opts, prepare)?;
     let Some((mark, renewed)) = decided else {
         // astream runs `prepare` once before any open succeeds; an open that
+        // did not is one whose mark nobody judged, so it does not serve.
         return Err(io::Error::other(
             "the broker log opened without its legacy mark being judged",
         ));
@@ -1573,6 +1576,8 @@ mod tests {
         let mut opts = tier.options();
         if tier == Durability::Ordered {
             // NO HORIZON: the durable head then moves only for an escalated
+            // record, so what this answers depends on nothing but the code
+            // under test — never on how long the loop took between two acks.
             opts.durability = astream_broker::Durability::Ordered { horizon: None };
         }
         opts.escalation = table;

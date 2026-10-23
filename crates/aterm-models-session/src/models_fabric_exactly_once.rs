@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! EXACTLY ONCE ACROSS THE BRIDGE'S ROUND (`aterm-link`'s `bridge.rs`.
+//! EXACTLY ONCE ACROSS THE BRIDGE'S ROUND (`aterm-link`'s `bridge.rs`: the inbox
+//! group drained into `deliver`, committed only once a record is accounted for;
+//! aterm-gui-fabric's `cmd_deliver`, which takes one row per offset on the log it was
+//! told, and `cmd_link_log`, which forgets the offsets a move took): one OFFSET of
+//! this node's inbox lane, `O`, followed through every record that sits there, every
+//! delivery, commit, kill and relaunch of the bridge, and every move of the log's
+//! generation.
 
 use aterm_spec::derive::Model;
 

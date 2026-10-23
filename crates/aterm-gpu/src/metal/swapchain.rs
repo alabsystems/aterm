@@ -676,6 +676,7 @@ impl Frame<'_> {
     /// presentation cannot fire before the drawable's rendering is scheduled.
     pub(crate) fn present(self, session: &encoder::EncodeSession) -> Result<PresentTicket, String> {
         // The loss may land between acquire and present. Refuse before touching
+        // the queue; dropping `self` discards the drawable.
         if let Some(reason) = self.swapchain.latch.reason() {
             return Err(format!(
                 "present refused: the device-loss latch is set ({reason}); \

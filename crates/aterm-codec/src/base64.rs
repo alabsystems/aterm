@@ -5,12 +5,9 @@
 
 use std::fmt;
 
-/// Standard Base64 alphabet (A-Z, a-z, 0-9, +, /).
 const STANDARD_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Build a 256-byte decode lookup table from an alphabet.
-/// Invalid characters map to 0xFF.
 const fn build_decode_table(alphabet: &[u8; 64]) -> [u8; 256] {
     let mut table = [0xFFu8; 256];
     let mut i = 0;
@@ -28,23 +25,18 @@ const STANDARD_DECODE: [u8; 256] = build_decode_table(STANDARD_ALPHABET);
 pub enum DecodeError {
     /// An invalid character was encountered at the given position.
     InvalidByte(usize, u8),
-    /// The data length is one modulo four, or lenient input has more than two
-    /// padding bytes. The value is the length checked, after stripping at most
-    /// two trailing padding bytes in the lenient data-length check.
+    /// The data length is one modulo four, or lenient input has more than two padding bytes.
     InvalidLength(usize),
     /// The input exceeds [`crate::MAX_INPUT_LEN`] (DoS guard); value is the actual length.
     InputTooLarge(usize),
-    /// Strict decode only: the padding is not canonical — the input length is
-    /// not an exact multiple of four. Value is the input length.
+    /// Strict decode only: the padding is not canonical.
     InvalidPadding(usize),
-    /// Strict decode only: the final data symbol has nonzero discarded bits,
-    /// a non-canonical spelling (`"Zh=="` vs `"Zg=="`). Position + byte.
+    /// Strict decode only: the final data symbol has nonzero discarded bits, a non-canonical
+    /// spelling (`"Zh=="` vs `"Zg=="`).
     InvalidLastSymbol(usize, u8),
 }
 
 impl fmt::Display for DecodeError {
-    // No `write!`: its `format_args!` fails closed under Trust (see
-    // `crate::write_usize_decimal`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidByte(pos, byte) => {
@@ -104,11 +96,8 @@ impl fmt::Display for EncodeError {
 impl std::error::Error for EncodeError {}
 
 /// Encode bytes to standard Base64 with padding.
-///
 /// # Errors
-///
-/// Returns [`EncodeError::InputTooLarge`] if `input` is longer than
-/// [`crate::MAX_INPUT_LEN`].
+/// Returns [`EncodeError::InputTooLarge`] if `input` is longer than [`crate::MAX_INPUT_LEN`].
 #[inline]
 pub fn encode(input: &[u8]) -> Result<String, EncodeError> {
     let mut out = String::new();
@@ -116,18 +105,13 @@ pub fn encode(input: &[u8]) -> Result<String, EncodeError> {
     Ok(out)
 }
 
-/// Length of the padded encoding of `input_len` bytes, `4 * ceil(input_len / 3)`;
-/// `None` above [`crate::MAX_INPUT_LEN`], exactly the lengths [`encode_into`]
-/// refuses.
+/// Length of the padded encoding of `input_len` bytes, `4 * ceil(input_len / 3)`.
 #[must_use]
 #[inline]
 pub const fn encoded_len(input_len: usize) -> Option<usize> {
     if input_len > crate::MAX_INPUT_LEN {
         return None;
     }
-    // Plain arithmetic under the guard, not `div_ceil`: the verifier sees no
-    // std body, so it could not bound the multiply on its result. Here the
-    // guard bounds both steps (at most `2^26 + 2`, then `< 2^27`).
     #[expect(
         clippy::manual_div_ceil,
         reason = "the verifier bounds this arithmetic from the guard; div_ceil's result is opaque to it"
@@ -136,31 +120,22 @@ pub const fn encoded_len(input_len: usize) -> Option<usize> {
     Some(len)
 }
 
-/// The longest encoding, [`encoded_len`] of [`crate::MAX_INPUT_LEN`] (`< 2^27`).
 const MAX_ENCODED_LEN: usize = crate::MAX_INPUT_LEN.div_ceil(3) * 4;
 
 /// [`encode`] appending to `out`, a byte-level fill with no buffer of its own.
-/// It reserves [`encoded_len`] first, so a destination already sized for the
-/// encoding never reallocates.
-///
 /// # Errors
-///
-/// Returns [`EncodeError::InputTooLarge`], with `out` untouched, if `input` is
-/// longer than [`crate::MAX_INPUT_LEN`].
+/// Returns [`EncodeError::InputTooLarge`], with `out` untouched, if `input` is longer than
+/// [`crate::MAX_INPUT_LEN`].
 pub fn encode_into(out: &mut String, input: &[u8]) -> Result<(), EncodeError> {
     let Some(len) = encoded_len(input.len()) else {
         return Err(EncodeError::InputTooLarge(input.len()));
     };
-    // The verifier sees no callee's result bound, so a bare `reserve(len)` is an
-    // unbounded allocation to it; `.min` restates `encoded_len`'s bound here and
-    // never lowers `len`.
     out.reserve(len.min(MAX_ENCODED_LEN));
-    // SAFETY: every byte appended is a `STANDARD_ALPHABET` entry or `b'='`, all
-    // ASCII (`aterm-spec-models/proofs/ay/a2_codec/encoder_output_ascii.smt2`),
-    // so `out` stays UTF-8 after every push.
+    // SAFETY: every byte appended is a `STANDARD_ALPHABET` entry or `b'='`, all ASCII
+    // (`aterm-spec-models/proofs/ay/a2_codec/encoder_output_ascii.smt2`), so `out` stays UTF-8
+    // after every push.
     let bytes = unsafe { out.as_mut_vec() };
 
-    // `as_chunks` yields `&[u8; 3]`, so chunk indices are compile-time bounded.
     let (chunks, rem) = input.as_chunks::<3>();
     for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
@@ -181,40 +156,22 @@ pub fn encode_into(out: &mut String, input: &[u8]) -> Result<(), EncodeError> {
 }
 
 /// Decode standard Base64 (with or without padding).
-///
 /// # Errors
-///
-/// Returns [`DecodeError`] if the input contains invalid characters or has
-/// an invalid length.
+/// Returns [`DecodeError`] if the input contains invalid characters or has an invalid length.
 #[inline]
 pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
     decode_with_table(input.as_bytes(), &STANDARD_DECODE)
 }
 
 /// Decode standard Base64 under strict RFC 4648 canonicalisation.
-///
-/// Narrower than [`decode`]:
-///
-/// * the length must be a multiple of four (padding required);
-/// * `=` may appear only as the last one or two bytes of the final quad;
-/// * the discarded low bits of the final data symbol must be zero, so exactly
-///   one spelling maps to any byte string.
-///
-/// Signature, roster and pinned-key paths use this, since keys are compared as
-/// text (`aterm_release::publish::canonical_update_pubkey`); [`decode`] stays
-/// lenient for terminal payloads whose emitters omit padding.
-///
 /// # Errors
-///
-/// Returns [`DecodeError`] if the input is over [`crate::MAX_INPUT_LEN`],
-/// contains a byte outside the standard alphabet, is not canonically padded, or
-/// is a non-canonical spelling of its output.
+/// Returns [`DecodeError`] if the input is over [`crate::MAX_INPUT_LEN`], contains a byte outside
+/// the standard alphabet, is not canonically padded, or is a non-canonical spelling of its output.
 #[inline]
 pub fn decode_strict(input: &[u8]) -> Result<Vec<u8>, DecodeError> {
     decode_strict_with_table(input, &STANDARD_DECODE)
 }
 
-/// The four alphabet symbols of the 24-bit group `n`, high sextet first.
 #[inline]
 const fn sextets(n: u32) -> [u8; 4] {
     let alphabet = STANDARD_ALPHABET;
@@ -227,8 +184,6 @@ const fn sextets(n: u32) -> [u8; 4] {
 }
 
 fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeError> {
-    // DoS guard: bounds the input, hence the decoded length and the allocation,
-    // before any work.
     if input.len() > crate::MAX_INPUT_LEN {
         return Err(DecodeError::InputTooLarge(input.len()));
     }
@@ -236,25 +191,18 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
         return Ok(Vec::new());
     }
 
-    // Decoded length never exceeds the input length. Taken from the guarded,
-    // un-reshadowed `input` so the verifier can relate it to the guard; `.min`
-    // restates the guard locally.
     let cap = input.len().min(crate::MAX_INPUT_LEN);
 
-    // Count and validate padding (0, 1, or 2 trailing '=' allowed).
     let pad_count = input.iter().rev().take_while(|&&b| b == b'=').count();
     if pad_count > 2 {
         return Err(DecodeError::InvalidLength(input.len()));
     }
-    // Never saturates, and the `get(..).unwrap_or(input)` fallback is never
-    // taken; both remove obligations.
     let input = input
         .get(..input.len().saturating_sub(pad_count))
         .unwrap_or(input);
 
     let remainder = input.len() % 4;
 
-    // Remainder of 1 is never valid (would encode only 6 bits, less than a byte)
     if remainder == 1 {
         return Err(DecodeError::InvalidLength(input.len()));
     }
@@ -263,9 +211,6 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
 
     let mut i: usize = 0;
 
-    // `as_chunks::<4>()` gives fixed-size arrays, so no index or overflow
-    // obligations remain; `i` tracks the absolute position for errors and
-    // never saturates.
     let (chunks, rem) = input.as_chunks::<4>();
     for chunk in chunks {
         let &[c0, c1, c2, c3] = chunk;
@@ -281,7 +226,6 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
         i = i.saturating_add(4);
     }
 
-    // Remainder: 0, 2 or 3 chars (1 was rejected above); `i` is its offset.
     match *rem {
         [r0, r1] => {
             let a = decode_byte(table, r0, i)?;
@@ -304,7 +248,6 @@ fn decode_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeE
 }
 
 fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, DecodeError> {
-    // Allocation guard, as in `decode_with_table`.
     if input.len() > crate::MAX_INPUT_LEN {
         return Err(DecodeError::InputTooLarge(input.len()));
     }
@@ -312,8 +255,6 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
         return Ok(Vec::new());
     }
 
-    // Canonical encodings are whole quads. A remainder of 1 is a length error
-    // (six bits is less than a byte); any other means missing padding.
     let remainder = input.len() % 4;
     if remainder != 0 {
         return Err(if remainder == 1 {
@@ -323,24 +264,16 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
         });
     }
 
-    // Decoded length never exceeds the guarded input length; `.min` restates
-    // the guard for the verifier.
     let cap = input.len().min(crate::MAX_INPUT_LEN);
     let mut out = Vec::with_capacity(cap);
 
-    // Length is a nonzero multiple of 4, so the remainder is empty and the
-    // loop covers every byte.
     let (chunks, _rem) = input.as_chunks::<4>();
     let last = chunks.len().saturating_sub(1);
     let mut i: usize = 0;
     for (idx, chunk) in chunks.iter().enumerate() {
         let &[c0, c1, c2, c3] = chunk;
-        // Padding is legal only in the final quad; elsewhere `decode_byte`
-        // rejects `=`, so `"Zg==Zg=="` is an error.
         if idx == last && c3 == b'=' {
             if c2 == b'=' {
-                // `XX==`: 12 bits carried, 8 consumed; the second symbol's
-                // discarded low 4 bits must be zero.
                 let a = decode_byte(table, c0, i)?;
                 let b = decode_byte(table, c1, i.saturating_add(1))?;
                 if b & 0x0F != 0 {
@@ -349,8 +282,6 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
                 let n = (u32::from(a) << 18) | (u32::from(b) << 12);
                 out.push(((n >> 16) & 0xFF) as u8);
             } else {
-                // `XXX=`: 18 bits carried, 16 consumed; the third symbol's
-                // discarded low 2 bits must be zero.
                 let a = decode_byte(table, c0, i)?;
                 let b = decode_byte(table, c1, i.saturating_add(1))?;
                 let c = decode_byte(table, c2, i.saturating_add(2))?;
@@ -372,8 +303,6 @@ fn decode_strict_with_table(input: &[u8], table: &[u8; 256]) -> Result<Vec<u8>, 
             out.push(((n >> 8) & 0xFF) as u8);
             out.push((n & 0xFF) as u8);
         }
-        // Advances by 4 per consumed quad and never exceeds `input.len()`, so
-        // the saturation never actually engages; it only makes the bound local.
         i = i.saturating_add(4);
     }
 
@@ -394,8 +323,6 @@ const fn decode_byte(table: &[u8; 256], byte: u8, pos: usize) -> Result<u8, Deco
 mod tests {
     use super::*;
 
-    /// The lenient decoder still refuses a byte outside the alphabet (by
-    /// position), an impossible length, and padding that is not 0-2 `=`.
     #[test]
     fn lenient_decode_refuses_malformed_input() {
         assert_eq!(decode("SGV!bG8="), Err(DecodeError::InvalidByte(3, b'!')));

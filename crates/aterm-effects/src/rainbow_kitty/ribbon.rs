@@ -706,6 +706,7 @@ impl Phase {
         let reach_end = retract_start_s(grace);
         let retract_end = reach_end + RETRACT_DUR_S;
         if idle_s.is_nan() || idle_s <= 0.0 {
+            // NaN-refusing spelling: a non-finite idle takes the laying arm,
             // which draws the mark rather than dropping it.
             return Some(Self::Laying);
         }
@@ -1852,6 +1853,7 @@ impl Ribbon {
 
     /// Ingest one engine event at its own edge, before this frame's plan.
     pub fn on_event(&mut self, ev: &super::Event, at: Instant, ctx: &Ctx<'_>) {
+        // Under a curtain nothing is laid (§2.8): the cells on glass belong to
         // an ended coordinate space. Only the caret mirror is kept.
         if self.curtain.is_some() {
             if let Event::Move { to, .. } = *ev {
@@ -1894,6 +1896,9 @@ impl Ribbon {
         }
         match *ev {
             Event::Typed { cells, class, .. } => {
+                // A key typed while the focus ember burns (e.g. an agent typing
+                // into an unfocused window) clears the ember and comes back up
+                // from the current level through `edge-in`, as a focus regain
                 // does; otherwise cells laid under it would be born dark.
                 if self.ember_at.is_some() {
                     self.regain_focus(at);
@@ -1952,8 +1957,11 @@ impl Ribbon {
                     }
                 }
                 if licence.is_echo() {
+                    // An echo's motion is inert (its key or sweep laid the cells) except
                     // the hand leaving the row, an erase's retreat, and a re-anchor.
                     if !same_row {
+                        // A repaint's home is not a gesture: only a row change the hand
+                        // could have made ([`Ribbon::hand_changed_row`]) leaves the row;
                         // anything else under an echo licence moves only the caret mirror.
                         if Self::hand_changed_row(from, to) {
                             self.leave_row(from, to, at, licence);
@@ -1962,6 +1970,7 @@ impl Ribbon {
                         if let Some(lift) =
                             self.lift.filter(|l| l.origin == from && l.landing == to)
                         {
+                            // The word went up with its text
                             // ([`Ribbon::lift_word`]).
                             self.lift_word(lift, at);
                         } else if self.pending_erase > 0 {
@@ -2120,6 +2129,7 @@ impl Ribbon {
         }
         let hand = self.curtain_hand();
         for i in 0..self.cohorts.len() {
+            // A cohort already retracting froze its target when the hand let
             // go of it; that is the same fact, measured earlier, and it stays.
             if self.cohorts[i].retract_col.is_some() {
                 continue;
@@ -2565,6 +2575,12 @@ impl Ribbon {
             }
             self.flow_row(from.0, at);
         } else {
+            // A line the hand left downward by anything but a navigation (a
+            // Return, the line feed after it) is printed text now: its light
+            // dims to [`RETURN_PRINTED_SHARE`] over [`RETURN_DIM_S`], clear of
+            // its letters by the time the output lands, and goes on out
+            // through the swoosh's retract (at full light the band under the
+            // line's last word took it under 4.5:1 on paper for longer than
             // a sixth of a second).
             if to.0 > from.0 && licence != Licence::Nav {
                 self.print_row(from.0, at);
@@ -2696,6 +2712,7 @@ impl Ribbon {
         width: Option<u16>,
         space: Option<u16>,
     ) {
+        // The follow pass may also sample an earlier buffered move. A legacy
         // sample must not replace a queued exact-key width/Space proof.
         if width.is_none()
             && self
@@ -3310,6 +3327,9 @@ impl Ribbon {
                 }
                 None => {
                     if k >= WAKE_MAX_CELLS && k > reach && !Self::reads_as_glass_light(base_cov) {
+                        // Beyond the cap, new light is not laid past `reach`;
+                        // light the band shows there is covered and the
+                        // drained columns up to it are laid, so the corridor
                         // stays whole. The same glass bar as the reach.
                         continue;
                     }
@@ -3559,6 +3579,7 @@ impl Ribbon {
                 }
             })
             .or_else(|| {
+                // A finished swoosh's walk continues too, inside the chain window (`retire`
                 // drops the cohort with its cells).
                 self.last_walk.filter(|w| fresh(w.alive_at)).map(|w| w.end)
             })
@@ -3756,6 +3777,8 @@ impl Ribbon {
                 continue;
             }
             if cell.leaving() {
+                // Replaced content cannot restore a prior partial release,
+                // even when its visual retract has already finished. Keep
                 // that clock and count, but revoke its redraw custody.
                 if cell.released_at.take().is_some()
                     && let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cell.cohort)
@@ -4209,6 +4232,7 @@ impl Ribbon {
                 },
             );
             if lo > hi {
+                // A wholly leaving cohort keeps its existing fade until its
                 // last resident cell retires.
                 return resident;
             }
@@ -4253,6 +4277,7 @@ impl Ribbon {
         sorted.clear();
         sorted.reserve(self.cells.len());
         for (i, c) in self.cells.iter().enumerate() {
+            // Expired partial releases may remain in content custody, but
             // own neither field nor geometry until their glyphs return.
             if c.retract_at.is_some_and(|at| {
                 ctx.now.saturating_duration_since(at).as_secs_f32() >= RETRACT_FADE_S
@@ -4478,6 +4503,7 @@ impl Ribbon {
             if reduced {
                 env *= reduced_fade(coh.swoosh_total() - idle);
             } else {
+                // Farthest from the hand first ([`Cohort::drain_rank`]), each cell
                 // taking `RETRACT_FADE_S`, so the mark is drawn back into the hand.
                 if coh.flow.is_some() {
                     env *= ember_level(
@@ -4533,6 +4559,9 @@ impl Ribbon {
 
     #[inline]
     fn wipe_of(&self, ctx: &Ctx<'_>, cell: &Cell, dist: f32) -> f32 {
+        // Typed cells only: a wake's cells share one birth instant, so
+        // wiping each from its own edge would print a comb; its lay sweep is
+        // its attack. The wipe runs on the cell's visual clock (`attack_at`),
         // not its identity (`born`), so a re-wet cell keeps its wipe.
         if !cell.typing
             || !Self::comet(ctx.cfg)
@@ -5462,6 +5491,7 @@ impl Ribbon {
             }
         }
         for coh in &self.cohorts {
+            // Edges: the grace's end, the two beats after it, the retract's first frame and
             // the swoosh's end; the retract's end is a tail. A flowing cohort has no grace.
             if coh.flow.is_some() {
                 cad.edge(coh.clock() + dur(coh.swoosh_total()));

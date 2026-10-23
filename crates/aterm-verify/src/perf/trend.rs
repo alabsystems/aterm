@@ -15,6 +15,26 @@ pub(crate) const TREND_RATIO: f64 = 0.70;
 /// How many most-recent same-box entries per metric form the reference (their MAX is the floor's base).
 pub(crate) const TREND_WINDOW: usize = 10;
 
+/// How far apart one figure of two operating points may be and still be one machine
+/// state: the larger at most this many times the smaller. On an M5 Max the effects lane's
+/// reference full repaint measured within 0.2% of 535.8 us (blank 367.5 us) across six
+/// runs in one GPU state, 175.9 us (blank 117.6 us) and 195.3 us (blank 80.4 us) in two
+/// others, and its gated GPU ratios moved by up to 1.6x between states while the code did
+/// not change.
+pub(crate) const OPERATING_POINT_BAND: f64 = 1.25;
+
+/// One figure of the machine state a sample was measured in, when its number moves with a
+/// state the run does not set: a sample that names an operating point (one or more
+/// figures) is judged only against rows measured at the same point ([`same_point`]), so a
+/// state change is not read as a regression.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PointFigure {
+    /// The harness report key that measured it (`ref_gpu_p50_us`); a ledger row carries it
+    /// as a `<name>=<value>` column.
+    pub name: &'static str,
+    pub value: f64,
+}
+
 /// One measured median headed for the ledger.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrendSample {
@@ -23,6 +43,9 @@ pub(crate) struct TrendSample {
     pub value: f64,
     /// LOWER is better (worst-latency metrics, e.g. the resize `*_worst_ms` fences): the same-box bound is best(MIN)/TREND_RATIO — a ceiling — instead of best(MAX)*TREND_RATIO — a floor.
     pub inverted: bool,
+    /// The figures of the operating point it was measured at; none when its number does not
+    /// depend on one.
+    pub at: Vec<PointFigure>,
 }
 
 pub(crate) fn trend_path() -> std::path::PathBuf {
@@ -363,10 +386,38 @@ pub(crate) struct TrendRow<'a> {
     pub token: &'a str,
     pub metric: &'a str,
     pub value: f64,
+    /// What measured it ([`toolchain_lane`]); `""` on every row written
+    /// before the toolchain column existed.
+    pub toolchain: &'a str,
     /// `""` on every row written before the shape column existed.
     pub shape: &'a str,
     /// A run that re-recorded this row's lane wrote it: the lane's new level is declared, so this box's reference window for the metric starts here ([`judge_trend`]).
     pub rerecorded: bool,
+    /// The figures of the operating point it was measured at (`<name>=<value>` columns after
+    /// the shape); none on a row that names none, as every row written before them.
+    pub at: Vec<(&'a str, f64)>,
+}
+
+/// A `<name>=<value>` ledger column with a finite positive value.
+fn parse_point(col: &str) -> Option<(&str, f64)> {
+    let (name, value) = col.trim().split_once('=')?;
+    let value = value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)?;
+    (!name.is_empty()).then_some((name, value))
+}
+
+/// Whether a row measured at `row` may judge a sample measured at `sample`: any row when
+/// the sample names no point; otherwise only a row that names every figure the sample does,
+/// each within [`OPERATING_POINT_BAND`] of the sample's, so a row that names none cannot
+/// show it was measured in this state.
+pub(crate) fn same_point(sample: &[PointFigure], row: &[(&str, f64)]) -> bool {
+    sample.iter().all(|f| {
+        row.iter().any(|&(name, v)| {
+            name == f.name && v.max(f.value) <= OPERATING_POINT_BAND * v.min(f.value)
+        })
+    })
 }
 
 /// Parse the ledger into rows AND COUNT what it had to throw away.
@@ -394,12 +445,15 @@ pub(crate) fn trend_ledger_rows_counted(ledger: &str) -> (Vec<TrendRow<'_>>, Vec
             ));
             continue;
         };
+        let tags = cols.get(7..).unwrap_or_default();
         rows.push(TrendRow {
             token: cols[2],
             metric: cols[3],
             value,
+            toolchain: cols.get(5).copied().unwrap_or("").trim(),
             shape: cols.get(6).copied().unwrap_or("").trim(),
-            rerecorded: cols.get(7).is_some_and(|c| c.trim() == RERECORDED),
+            rerecorded: tags.iter().any(|c| c.trim() == RERECORDED),
+            at: tags.iter().filter_map(|c| parse_point(c)).collect(),
         });
     }
     (rows, dropped)
@@ -452,11 +506,23 @@ pub(crate) fn orphans<'a>(rows: &[TrendRow<'a>], aliases: &str) -> Vec<(&'a str,
     found
 }
 
+/// A metric with same-box history none of which was measured at this run's operating point.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Elsewhere {
+    pub metric: String,
+    pub at: Vec<PointFigure>,
+    /// The same-box rows its window could have drawn on.
+    pub rows: usize,
+}
+
 /// The trend sub-gate's pure verdict over one run's samples.
 pub(crate) struct TrendJudgment {
     pub breaches: Vec<Breach>,
     /// Metrics with NO same-box history: first run on this box.
     pub skipped: Vec<String>,
+    /// Metrics whose same-box history was all measured at another operating point, or names
+    /// none: a named skip, never a pass.
+    pub elsewhere: Vec<Elsewhere>,
     /// `(token, chip)` pairs that resolve to THIS box but were measured on a different CHIP.
     pub conflicts: Vec<(String, String)>,
 }
@@ -500,6 +566,7 @@ pub(crate) fn judge_trend(
 
     let mut breaches = Vec::new();
     let mut skipped = Vec::new();
+    let mut elsewhere = Vec::new();
     for s in samples {
         let metric_key = format!("{}/{}", s.lane, s.metric);
         let rows: Vec<&TrendRow<'_>> = mine
@@ -507,11 +574,34 @@ pub(crate) fn judge_trend(
             .copied()
             .filter(|r| r.metric == metric_key && r.value > 0.0)
             .collect();
-        let start = rows.iter().rposition(|r| r.rerecorded).unwrap_or(0);
-        let mut history: Vec<f64> = rows[start..].iter().map(|r| r.value).collect();
+        // A metric's window starts at its lane's last re-record, or after the
+        // last row another toolchain or engine measured, whichever is later:
+        // neither declares a level this run's engine is held to. A row from
+        // before the column says nothing either way.
+        let toolchain = toolchain_lane(s.lane);
+        let recorded = rows.iter().rposition(|r| r.rerecorded).unwrap_or(0);
+        let changed = rows
+            .iter()
+            .rposition(|r| !r.toolchain.is_empty() && r.toolchain != toolchain)
+            .map_or(0, |i| i + 1);
+        // Within that span, only the rows measured at this run's operating point.
+        let span = &rows[recorded.max(changed)..];
+        let mut history: Vec<f64> = span
+            .iter()
+            .filter(|r| same_point(&s.at, &r.at))
+            .map(|r| r.value)
+            .collect();
         let recent = history.split_off(history.len().saturating_sub(TREND_WINDOW));
         if recent.is_empty() {
-            skipped.push(metric_key);
+            if s.at.is_empty() || span.is_empty() {
+                skipped.push(metric_key);
+            } else {
+                elsewhere.push(Elsewhere {
+                    metric: metric_key,
+                    at: s.at.clone(),
+                    rows: span.len(),
+                });
+            }
             continue;
         }
         let (best, bound, breached) = if s.inverted {
@@ -535,15 +625,23 @@ pub(crate) fn judge_trend(
     TrendJudgment {
         breaches,
         skipped,
+        elsewhere,
         conflicts,
     }
 }
 
-/// Which toolchain builds a lane's measurement binary — recorded per ledger row so
-/// cross-toolchain drift (a Trust-toolchain bump vs an upstream-stable bump) is
-/// never misread as a same-box perf change.
+/// Which toolchain builds a lane's measurement binary, and for the wasm lane
+/// the engine that runs it: recorded per ledger row so cross-toolchain drift
+/// (a Trust-toolchain bump vs an upstream-stable bump) is never misread as a
+/// same-box perf change, and a metric's window starts after the last row
+/// another one measured ([`judge_trend`]). The wasm lane's rows before S10
+/// say `stable`: node measured them, and the pinned browser is not node.
 fn toolchain_lane(lane: &str) -> &'static str {
-    if lane == "wasm" { "stable" } else { "trust" }
+    if lane == "wasm" {
+        "stable+chrome-headless-shell"
+    } else {
+        "trust"
+    }
 }
 
 /// Render `samples` as ledger rows (one metric per line, TSV).
@@ -557,7 +655,7 @@ pub(crate) fn trend_rows(
     let mut s = String::new();
     for sample in samples {
         s.push_str(&format!(
-            "{date}\t{sha}\t{}\t{}/{}\t{:.3}\t{}\t{}{}\n",
+            "{date}\t{sha}\t{}\t{}/{}\t{:.3}\t{}\t{}{}{}\n",
             me.key,
             sample.lane,
             sample.metric,
@@ -568,7 +666,12 @@ pub(crate) fn trend_rows(
                 format!("\t{RERECORDED}")
             } else {
                 String::new()
-            }
+            },
+            sample
+                .at
+                .iter()
+                .map(|f| format!("\t{}={:.3}", f.name, f.value))
+                .collect::<String>()
         ));
     }
     s
@@ -580,7 +683,11 @@ TREND_WINDOW entries\n# (crates/aterm-verify/src/perf/trend.rs; *_worst_ms metri
 by best-MIN / TREND_RATIO).\n# The BOX column is a name from crates/aterm-verify/perf/golden/perf-boxes.tsv, \
 which is also where a\n# pre-W-1 hostname is claimed as the box it was measured on. NEVER edit a \
 box name here\n# to merge two machines — add the claim to perf-boxes.tsv, where the chip column \
-keeps it\n# honest. A row a re-record (`--record LANE`) wrote carries `rerecorded` in an eighth column:\n# that lane's new level is declared, and each of its metrics' windows starts there.\n# date\tsha\tbox\tlane/metric\tvalue\ttoolchain\tshape\trerecorded\n";
+keeps it\n# honest. A row a re-record (`--record LANE`) wrote carries `rerecorded` in an eighth column:\n# that lane's new level is declared, and each of its metrics' windows starts there. A row \
+measured\n# at an operating point carries its figures last (the effects GPU keys: \
+`ref_gpu_p50_us=<us>`,\n# `ref_blank_gpu_p50_us=<us>`); a sample that names one is judged only \
+against rows whose\n# figures are each within OPERATING_POINT_BAND of its own.\n# \
+date\tsha\tbox\tlane/metric\tvalue\ttoolchain\tshape\trerecorded\tpoint...\n";
 
 /// Whether this run's samples join the ledger, which holds only good states: every floor lane held, no alias claim merges two machines, and any trend breach is on a lane whose baseline this run re-recorded (`recorded` names those trend lanes), because a re-record declares the new level deliberate.
 pub(crate) fn may_append(lanes_ok: bool, judgment: &TrendJudgment, recorded: &[&str]) -> bool {
@@ -600,6 +707,7 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool, recorded: &[&s
     let TrendJudgment {
         breaches,
         skipped,
+        elsewhere,
         conflicts,
     } = judgment;
     let trend_ok = breaches.is_empty() && conflicts.is_empty();
@@ -653,25 +761,49 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool, recorded: &[&s
             "rows keyed `{token}` resolve to box `{bx}` but were measured on chip `{chip}`"
         ));
     }
-    let judged = samples.len() - skipped.len();
+    for e in &elsewhere {
+        let point: Vec<String> =
+            e.at.iter()
+                .map(|f| format!("{} {:.1}", f.name, f.value))
+                .collect();
+        eprintln!(
+            "  trend: SKIP — {}: none of its {} same-box row(s) on {bx} was measured at this \
+             run's operating point ({}, each within {OPERATING_POINT_BAND}x); a row from \
+             another machine state, or one that names none, is not compared, so nothing was \
+             judged.",
+            e.metric,
+            e.rows,
+            point.join(", ")
+        );
+    }
+    let judged = samples.len() - skipped.len() - elsewhere.len();
     if trend_ok && judged == 0 {
         eprintln!(
-            "  trend: SKIP — no metric had same-box history on {bx}; nothing was \
-             judged (seed run, not a pass). If this machine measured before under another \
-             name, claim that name for `{bx}` in {}.",
+            "  trend: SKIP — no metric had comparable same-box history on {bx}; nothing was \
+             judged (seed run, not a pass). If this machine measured before \
+             under another name, claim that name for `{bx}` in {}.",
             boxes_path().display()
         );
-        run = LaneRun::not_judged("seed run, no same-box history");
+        run = LaneRun::not_judged("seed run, no comparable same-box history");
     } else if trend_ok {
         eprintln!(
             "  trend: GREEN — {judged} metric(s) within same-box trend bounds of this \
-             box's ({bx}) recent best ({} skipped, no history).",
-            skipped.len()
+             box's ({bx}) recent best ({} skipped: {} with no history, {} with none at this \
+             run's operating point).",
+            skipped.len() + elsewhere.len(),
+            skipped.len(),
+            elsewhere.len()
         );
         if !skipped.is_empty() {
             run.unjudged.push(format!(
                 "trend ({} metric(s) with no history)",
                 skipped.len()
+            ));
+        }
+        if !elsewhere.is_empty() {
+            run.unjudged.push(format!(
+                "trend ({} metric(s) with no row at this run's operating point)",
+                elsewhere.len()
             ));
         }
     }
@@ -757,6 +889,30 @@ mod tests {
             metric: metric.to_string(),
             value,
             inverted: false,
+            at: Vec::new(),
+        }
+    }
+
+    /// The effects lane's GPU operating point: the reference full repaint's GPU p50 and the
+    /// blank one's, in us.
+    fn gpu_point(ref_us: f64, blank_us: f64) -> Vec<PointFigure> {
+        vec![
+            PointFigure {
+                name: "ref_gpu_p50_us",
+                value: ref_us,
+            },
+            PointFigure {
+                name: "ref_blank_gpu_p50_us",
+                value: blank_us,
+            },
+        ]
+    }
+
+    /// A sample measured at [`gpu_point`]`(ref_us, blank_us)`.
+    fn gpu_sample(metric: &str, value: f64, ref_us: f64, blank_us: f64) -> TrendSample {
+        TrendSample {
+            at: gpu_point(ref_us, blank_us),
+            ..sample("effects", metric, value)
         }
     }
 
@@ -780,6 +936,7 @@ mod tests {
         let judgment = |breaches: Vec<Breach>, conflicts: Vec<(String, String)>| TrendJudgment {
             breaches,
             skipped: Vec::new(),
+            elsewhere: Vec::new(),
             conflicts,
         };
         let clean = judgment(Vec::new(), Vec::new());
@@ -842,6 +999,158 @@ mod tests {
         let control = judged(&format!("{old}{unmarked}"), "boxA", &next);
         assert_eq!(control.breaches.len(), 2, "CONTROL: 450 < 0.70 x 1000");
         assert!(!trend_ledger_rows(&old)[0].rerecorded);
+    }
+
+    /// The box whose effects trend stayed red: its one seed row named no GPU state, and its
+    /// gated GPU ratios came from another one (episode 2.884 there; 1.80 with the reference
+    /// at 535.7 us and the blank at 367.5 us). A sample at an operating point is held only to
+    /// rows at that point, and with none it is a named skip, not a pass. NEGATIVE CONTROL:
+    /// the same sample naming no point is held to the seed row and breaches.
+    #[test]
+    fn a_gpu_ratio_is_judged_only_against_rows_at_its_operating_point() {
+        let seed =
+            "2026-10-22\ta1d868260ffb\tboxA\teffects/episode_gpu_rel\t2.884\ttrust\tTest-Chip-8c\n";
+        let fast = rows_for(
+            "2026-10-23",
+            "b",
+            "boxA",
+            &[gpu_sample("episode_gpu_rel", 2.842, 195.3, 80.4)],
+        );
+        let ledger = format!("{TREND_HEADER}{seed}{fast}");
+        let now = [gpu_sample("episode_gpu_rel", 1.80, 535.7, 367.5)];
+        let j = judged(&ledger, "boxA", &now);
+        assert!(j.breaches.is_empty(), "{:?}", j.breaches);
+        assert!(j.skipped.is_empty(), "history exists: {:?}", j.skipped);
+        assert_eq!(
+            j.elsewhere,
+            [Elsewhere {
+                metric: "effects/episode_gpu_rel".to_string(),
+                at: gpu_point(535.7, 367.5),
+                rows: 2,
+            }]
+        );
+        let control = judged(
+            &ledger,
+            "boxA",
+            &[sample("effects", "episode_gpu_rel", 1.80)],
+        );
+        assert_eq!(control.breaches.len(), 1, "CONTROL: 1.80 < 0.70 x 2.884");
+        assert!(control.elsewhere.is_empty());
+        let fresh = judged("", "boxA", &now);
+        assert_eq!(
+            fresh.skipped,
+            ["effects/episode_gpu_rel"],
+            "no history at all"
+        );
+        assert!(fresh.elsewhere.is_empty());
+    }
+
+    /// A true slowdown measured in the same GPU state still fails, against the best of the
+    /// rows at that point alone: a row whose figures are each within the band counts, and
+    /// one whose reference matches but whose blank repaint does not (175.9/117.6 us against
+    /// 195.3/80.4 us, two states this box measured) is another point. NEGATIVE CONTROL: the
+    /// state's own level passes.
+    #[test]
+    fn a_true_slowdown_at_the_same_operating_point_still_fails() {
+        let mut ledger = String::new();
+        for (value, ref_us, blank_us) in [
+            (1.80, 535.8, 367.5),
+            (1.79, 536.4, 367.3),
+            (2.842, 195.3, 80.4),
+            (1.81, 430.0, 300.0),
+            (2.9, 535.8, 250.0),
+        ] {
+            ledger.push_str(&rows_for(
+                "2026-10-23",
+                "c",
+                "boxA",
+                &[gpu_sample("episode_gpu_rel", value, ref_us, blank_us)],
+            ));
+        }
+        let slow = judged(
+            &ledger,
+            "boxA",
+            &[gpu_sample("episode_gpu_rel", 0.9, 535.9, 367.4)],
+        );
+        assert_eq!(slow.breaches.len(), 1, "0.9 < 0.70 x 1.81");
+        assert!(
+            (slow.breaches[0].best - 1.81).abs() < 1e-9,
+            "430/300 us is within 1.25x of 535.9/367.4 us; 195.3/80.4 and 535.8/250 are not: {:?}",
+            slow.breaches
+        );
+        assert!(slow.elsewhere.is_empty());
+        let level = judged(
+            &ledger,
+            "boxA",
+            &[gpu_sample("episode_gpu_rel", 1.75, 535.9, 367.4)],
+        );
+        assert!(level.breaches.is_empty(), "CONTROL: {:?}", level.breaches);
+
+        let here = gpu_point(195.3, 80.4);
+        let row = |r: f64, b: f64| [("ref_gpu_p50_us", r), ("ref_blank_gpu_p50_us", b)];
+        assert!(same_point(&here, &row(195.3 * OPERATING_POINT_BAND, 80.4)));
+        assert!(!same_point(
+            &here,
+            &row(195.3 * OPERATING_POINT_BAND * 1.01, 80.4)
+        ));
+        assert!(
+            !same_point(&here, &row(175.9, 117.6)),
+            "the reference within the band, the blank repaint not"
+        );
+        assert!(
+            !same_point(&here, &[("ref_gpu_p50_us", 195.3)]),
+            "a row that lacks a figure cannot show it"
+        );
+        assert!(
+            same_point(
+                &here,
+                &[
+                    ("ref_gpu_p50_us", 195.3),
+                    ("ref_blank_gpu_p50_us", 80.4),
+                    ("other_us", 1.0)
+                ]
+            ),
+            "a figure the sample does not name constrains nothing"
+        );
+        assert!(same_point(&[], &[]), "a sample with no point takes any row");
+    }
+
+    /// The figures are columns after the shape, after `rerecorded` when both are written, so
+    /// a parser that reads only the eighth column for `rerecorded` still reads both rows
+    /// right.
+    #[test]
+    fn a_rows_operating_point_round_trips_beside_its_re_record_mark() {
+        let me = box_id("boxA");
+        let at = [gpu_sample("episode_gpu_rel", 1.8, 535.667, 367.5)];
+        let plain = trend_rows("2026-10-23", "d", &me, &at, &[]);
+        let marked = trend_rows("2026-10-23", "d", &me, &at, &["effects"]);
+        let figures = "ref_gpu_p50_us=535.667\tref_blank_gpu_p50_us=367.500\n";
+        assert!(
+            plain.ends_with(&format!("\tTest-Chip-8c\t{figures}")),
+            "{plain:?}"
+        );
+        assert!(
+            marked.ends_with(&format!("\tTest-Chip-8c\trerecorded\t{figures}")),
+            "{marked:?}"
+        );
+        for (rows, rerecorded) in [(&plain, false), (&marked, true)] {
+            let parsed = trend_ledger_rows(rows);
+            assert_eq!(
+                parsed[0].at,
+                [("ref_gpu_p50_us", 535.667), ("ref_blank_gpu_p50_us", 367.5)]
+            );
+            assert_eq!(parsed[0].rerecorded, rerecorded);
+            assert_eq!(
+                rows.split('\t')
+                    .nth(7)
+                    .is_some_and(|c| c.trim() == RERECORDED),
+                rerecorded
+            );
+        }
+        let cpu = rows_for("2026-10-23", "d", "boxA", &[sample("effects", "m", 9.0)]);
+        assert!(trend_ledger_rows(&cpu)[0].at.is_empty());
+        let bad = "2026-10-23\td\tboxA\teffects/m\t9.0\ttrust\tTest-Chip-8c\tref_gpu_p50_us=nan\n";
+        assert!(trend_ledger_rows(bad)[0].at.is_empty());
     }
 
     #[test]
@@ -1038,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn trend_rows_record_the_wasm_stable_toolchain_lane() {
+    fn trend_rows_record_the_wasm_lanes_toolchain_and_engine() {
         let rows = rows_for(
             "2026-07-22",
             "abc",
@@ -1047,8 +1356,57 @@ mod tests {
         );
         assert_eq!(
             rows.trim_end().split('\t').nth(5),
-            Some("stable"),
+            Some("stable+chrome-headless-shell"),
             "row: {rows:?}"
+        );
+        assert_eq!(
+            trend_ledger_rows(&rows)[0].toolchain,
+            "stable+chrome-headless-shell"
+        );
+    }
+
+    /// Rows another engine measured anchor nothing: the wasm lane's node rows
+    /// (`stable`) never hold the browser's numbers, and once the browser has
+    /// rows of its own they are the window. A row from before the toolchain
+    /// column cuts no window (the trust lanes' oldest rows). NEGATIVE
+    /// CONTROL: the same history spelled as the browser's breaches.
+    #[test]
+    fn another_engines_rows_start_no_window_for_this_one() {
+        let row = |toolchain: &str, value: f64| {
+            format!("2026-10-01\tabc\tboxA\twasm/w\t{value:.3}\t{toolchain}\tTest-Chip-8c\n")
+        };
+        let node: String = (0..4).map(|_| row("stable", 1000.0)).collect();
+        let now = [sample("wasm", "w", 100.0)];
+        let fresh = judged(&node, "boxA", &now);
+        assert!(fresh.breaches.is_empty(), "{:?}", fresh.breaches);
+        assert_eq!(fresh.skipped, ["wasm/w"], "no history in this engine");
+        let browser = row("stable+chrome-headless-shell", 120.0);
+        let ledger = format!("{node}{browser}");
+        assert!(
+            judged(&ledger, "boxA", &now).breaches.is_empty(),
+            "100 >= 0.70 x 120"
+        );
+        let low = [sample("wasm", "w", 50.0)];
+        assert_eq!(
+            judged(&ledger, "boxA", &low).breaches.len(),
+            1,
+            "50 < 0.70 x 120"
+        );
+        let same: String = (0..4)
+            .map(|_| row("stable+chrome-headless-shell", 1000.0))
+            .collect();
+        assert_eq!(
+            judged(&same, "boxA", &now).breaches.len(),
+            1,
+            "CONTROL: 100 < 0.70 x 1000 in the same engine"
+        );
+        let old = "2026-07-01\tabc\tboxA\tsearch/q\t1000.000\n";
+        let trust = format!("{old}2026-07-02\tabc\tboxA\tsearch/q\t900.000\ttrust\n");
+        let held = judged(&trust, "boxA", &[sample("search", "q", 650.0)]);
+        assert_eq!(
+            held.breaches.len(),
+            1,
+            "650 < 0.70 x 1000: the old row still counts"
         );
     }
 

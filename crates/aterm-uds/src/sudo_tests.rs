@@ -5,11 +5,6 @@
 
 use super::*;
 
-/// A `Secret` gives back exactly the bytes it was built from, caps at 1023,
-/// reports empty honestly, and redacts its `Debug`. (The scrub-on-drop cannot
-/// be observed safely after the box is freed; the positive control here is
-/// that the bytes are correct while alive — the drop path is exercised, not
-/// asserted.)
 #[test]
 fn secret_round_trips_caps_and_redacts() {
     let s = Secret::from_bytes(b"hunter2");
@@ -29,10 +24,6 @@ fn secret_round_trips_caps_and_redacts() {
     assert!(!shown.contains("topsecret"), "{shown}");
 }
 
-/// The test binary's own parent is not `/usr/bin/sudo`, so attesting it refuses
-/// with a reason, never `Ok`. This is the direct-call attack: a same-uid
-/// process that is not under sudo must not pass. (On non-Apple platforms the
-/// call refuses by construction.)
 #[test]
 fn attesting_a_non_sudo_parent_refuses() {
     let ppid = parent_pid();
@@ -49,9 +40,6 @@ fn attesting_a_non_sudo_parent_refuses() {
     }
 }
 
-/// A pid that cannot be real is refused, not treated as readable: pid 0 is
-/// the kernel's (Darwin answers its short info), and no process has pid
-/// `i32::MAX`.
 #[test]
 fn attesting_a_bogus_pid_refuses() {
     assert!(attest_sudo(-1).is_err());
@@ -62,10 +50,6 @@ fn attesting_a_bogus_pid_refuses() {
     assert!(exe_path(i32::MAX).is_none());
 }
 
-/// The facts read about a live process are its own: a child's parent (this
-/// process, where a test runner's child shares its parent's group, so the
-/// parent read must not be the group), this process's effective and real
-/// uid; launchd is a valid platform binary and this test binary is not.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_facts_read_are_the_processs_own() {
@@ -92,7 +76,6 @@ fn the_facts_read_are_the_processs_own() {
     );
 }
 
-/// Every attested fact refuses alone; all of them together admit.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn each_attested_fact_refuses_alone() {
@@ -135,7 +118,6 @@ fn each_attested_fact_refuses_alone() {
     }
 }
 
-/// Only fd 1's own record decides, and only an anonymous pipe there admits.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn only_an_anonymous_pipe_at_fd_one_is_stdout() {
@@ -163,8 +145,6 @@ fn only_an_anonymous_pipe_at_fd_one_is_stdout() {
     }
 }
 
-/// The live fd table decides: a child whose fd 1 is the anonymous pipe it was
-/// handed is admitted, and one whose fd 1 is a file or a socket is refused.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn fd_one_is_read_from_the_live_table() {
@@ -196,8 +176,6 @@ fn fd_one_is_read_from_the_live_table() {
     }
 }
 
-/// This process can read its OWN executable path (a positive control that
-/// `exe_path` works), and it is not `/usr/bin/sudo`.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn exe_path_reads_our_own_and_it_is_not_sudo() {
@@ -310,7 +288,6 @@ fn guarded_wire_reader_requires_one_complete_bounded_frame() {
             .kind(),
         ErrorKind::ConnectionReset
     );
-    /// A signal before the line: the read is asked again.
     struct InterruptedOnce(bool);
     impl std::io::Read for InterruptedOnce {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {

@@ -484,7 +484,7 @@ pub(crate) struct DemoColors {
 
 impl DemoColors {
     /// The demo's colours, with the theme-pair floor `floor` (1.0 is off).
-    pub(crate) fn new(
+    pub(crate) const fn new(
         theme: PreviewTerminalTheme,
         selection_foreground: Option<u32>,
         bold_is_bright: bool,
@@ -504,7 +504,7 @@ impl DemoColors {
     }
 
     /// The theme-pair contrast floor the frame is drawn under.
-    pub(crate) fn floor(&self) -> f32 {
+    pub(crate) const fn floor(&self) -> f32 {
         f32::from_bits(self.floor_bits)
     }
 

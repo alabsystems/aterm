@@ -206,8 +206,6 @@ pub(crate) fn render<const N: usize>(r: &Record<'_>, out: &mut Text<N>) -> fmt::
 mod tests {
     use super::*;
 
-    /// A STEP MOVES THE WALL CLOCK ALWAYS, THE CLOCKS THAT COUNT A SLEEP UNDER
-    /// THE SWITCH, AND UPTIME NEVER: what a real sleep leaves alone stays.
     #[test]
     fn a_step_moves_the_wall_and_under_the_switch_the_sleep_clocks_and_never_uptime() {
         for continuous in [false, true] {
@@ -283,7 +281,6 @@ mod tests {
         assert_eq!(shift_nsec(u64::MAX - 1, 5), u64::MAX);
     }
 
-    /// Apple silicon's timebase is 125/3 (24 MHz), Intel's 1/1.
     #[test]
     fn nanoseconds_become_mach_ticks_of_the_timebase() {
         assert_eq!(ns_to_ticks(1_000_000_000, 125, 3), 24_000_000);

@@ -3,54 +3,26 @@
 // Author: Andrew Yates
 
 //! Lock-free mirror of the terminal's input-encoding modes.
-//!
-//! Publishes as atomics the fold behind
-//! [`Terminal::keyboard_mode`](super::Terminal::keyboard_mode),
-//! [`Terminal::mouse_mode`](super::Terminal::mouse_mode) and
-//! [`Terminal::focus_reporting_enabled`](super::Terminal::focus_reporting_enabled) and
-//! [`Terminal::focus_arms`](super::Terminal::focus_arms), plus the
-//! alternate-screen flag, DEC 1007 (alternate scroll) and DEC 2004 (bracketed paste). The input
-//! seam reads it on every key
-//! press without the terminal mutex; so do the DEC 1004 gate at the window's tab/pane
-//! re-stabilization point, which may not take the engine mutex, and the wheel route
-//! (`input::wheel_route_mirrored`, twin of the locked `wheel_route_for`).
-//!
-//! Refreshed under the lock at the end of every `process()` batch and by every host mutator that
-//! moves an input. A debug assertion at the start of each batch checks the mirror still equals
-//! the fold, so a mutator that forgets to refresh fails on the next output. Shared as an `Arc`
-//! because the seam holds only `&Mutex<Terminal>`; `Release` on publish, `Acquire` on read.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use aterm_types::keyboard::KeyboardMode;
 use aterm_types::mouse::MouseMode;
 
-/// The lock-free input-mode word. See the module docs.
+/// The lock-free input-mode word.
 #[derive(Debug, Default)]
 pub struct ModeMirror {
-    /// [`KeyboardMode`] bits (a `u32` bitflags word).
     keyboard: AtomicU32,
-    /// [`MouseMode`] discriminant (`repr(u8)`, `None = 0`).
     mouse: AtomicU8,
-    /// DEC 1004 (focus reporting) — `modes.focus_reporting`.
     focus: AtomicBool,
-    /// The program's DEC 1004 enables — `Terminal::focus_arms()`. Stored after `focus`,
-    /// so a reader that sees a new count sees the mode that enable left on.
     focus_arms: AtomicU32,
-    /// The alternate screen is active — `Terminal::is_alternate_screen()`.
     alternate_screen: AtomicBool,
-    /// DEC 1007 (alternate scroll) — `modes.alternate_scroll`: on the alternate
-    /// screen, a wheel nobody tracks becomes arrow keys.
     alternate_scroll: AtomicBool,
-    /// DEC 2004 (bracketed paste) — `modes.bracketed_paste`: a paste framed
-    /// by the live mode is wrapped in its markers, so it writes the program
-    /// bytes whatever its text.
     bracketed_paste: AtomicBool,
 }
 
 impl ModeMirror {
-    /// The keyboard encoding mode the terminal last published — the same value
-    /// `Terminal::keyboard_mode()` returns under the lock, without the lock.
+    /// The keyboard encoding mode the terminal last published.
     #[inline]
     #[must_use]
     pub fn keyboard_mode(&self) -> KeyboardMode {
@@ -71,18 +43,16 @@ impl ModeMirror {
         self.mouse.load(Ordering::Acquire) != 0
     }
 
-    /// Whether the published tracking mode reports a pointer motion with
-    /// `button` held (`3`: none): the rule `Terminal::encode_mouse_motion`
-    /// encodes by (`super::mouse::motion_reported`), without the lock.
+    /// Whether the published tracking mode reports a pointer motion with `button` held (`3`: none):
+    /// the rule `Terminal::encode_mouse_motion` encodes by (`super::mouse::motion_reported`),
+    /// without the lock.
     #[inline]
     #[must_use]
     pub fn reports_motion(&self, button: u8) -> bool {
         super::mouse::motion_reported(self.mouse_mode(), button)
     }
 
-    /// Whether the published tracking mode reports a wheel notch: the rule
-    /// `Terminal::encode_mouse_wheel` encodes by (`super::mouse::wheel_reported`:
-    /// not X10, which is press-only), without the lock.
+    /// Whether the published tracking mode reports a wheel notch.
     #[inline]
     #[must_use]
     pub fn reports_wheel(&self) -> bool {
@@ -97,10 +67,7 @@ impl ModeMirror {
         self.focus.load(Ordering::Acquire)
     }
 
-    /// Lock-free twin of `Terminal::focus_arms()`: the host compares it with the count it
-    /// last answered to learn that the program turned DEC 1004 on again. Read it before
-    /// [`Self::focus_reporting_enabled`]: the count is published second, so the mode read
-    /// after it is at least as new as that enable.
+    /// Lock-free twin of `Terminal::focus_arms()`.
     #[inline]
     #[must_use]
     pub fn focus_arms(&self) -> u32 {
@@ -121,17 +88,13 @@ impl ModeMirror {
         self.alternate_scroll.load(Ordering::Acquire)
     }
 
-    /// Lock-free twin of `Terminal::modes().bracketed_paste` (DEC 2004): the
-    /// framing a paste that reads the live mode gets
-    /// ([`super::Terminal::format_paste`]).
+    /// Lock-free twin of `Terminal::modes().bracketed_paste` (DEC 2004).
     #[inline]
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste.load(Ordering::Acquire)
     }
 
-    /// Publish a fresh fold of `term`. Called only by the terminal, under its
-    /// mutex ([`super::Terminal::refresh_mode_mirror`]).
     #[inline]
     fn publish(&self, term: &super::Terminal) {
         self.keyboard
@@ -149,8 +112,6 @@ impl ModeMirror {
     }
 }
 
-/// Inverse of `MouseMode as u8`. Unknown discriminants decode as `None`
-/// (tracking off) — the fail-safe direction for an encoder gate.
 #[inline]
 const fn mouse_mode_from_u8(v: u8) -> MouseMode {
     match v {
@@ -164,23 +125,19 @@ const fn mouse_mode_from_u8(v: u8) -> MouseMode {
 
 impl super::Terminal {
     /// The shared lock-free mirror of this terminal's input-encoding modes.
-    /// Clone the `Arc` once at session construction; read it on every key
-    /// press instead of taking the terminal mutex.
     #[inline]
     #[must_use]
     pub const fn mode_mirror(&self) -> &std::sync::Arc<ModeMirror> {
         &self.mode_mirror
     }
 
-    /// Re-publish the fold. Called by every site outside `process()` that can move one of its
-    /// inputs, and once per batch by `process_at` after the parser runs.
+    /// Re-publish the fold.
     #[inline]
     pub(crate) fn refresh_mode_mirror(&self) {
         self.mode_mirror.publish(self);
     }
 
-    /// Asserts the published word equals the live fold. Run at the start of every `process()`
-    /// batch in debug builds, so a missed mutation site fails on the next output byte.
+    /// Asserts the published word equals the live fold.
     #[cfg(debug_assertions)]
     pub(crate) fn debug_assert_mode_mirror_in_sync(&self) {
         debug_assert_eq!(
@@ -268,7 +225,6 @@ mod tests {
     #[test]
     fn a_fresh_terminal_publishes_its_fold_not_an_empty_word() {
         let term = Terminal::new(24, 80);
-        // The constructor publishes the fresh fold rather than relying on `Default` to match it.
         assert_in_sync(&term, "construction");
     }
 
@@ -292,7 +248,6 @@ mod tests {
             ("mouse 1003", b"\x1b[?1003h"),
             ("mouse 9 (x10)", b"\x1b[?9h"),
             ("mouse off", b"\x1b[?1003l\x1b[?9l"),
-            // Both edges: a mirror that only latched true would pass a set-only walk.
             ("focus reporting on", b"\x1b[?1004h"),
             ("focus reporting off", b"\x1b[?1004l"),
             ("focus reporting on again", b"\x1b[?1004h"),
@@ -302,7 +257,6 @@ mod tests {
             ),
             ("DECSTR on alt", b"\x1b[!p"),
             ("leave alt screen", b"\x1b[?1049l"),
-            // DEC 1007 and the screen (the wheel route's inputs), both edges, every door.
             ("alternate scroll on", b"\x1b[?1007h"),
             ("enter alt screen 1049", b"\x1b[?1049h"),
             ("alternate scroll off on alt", b"\x1b[?1007l"),
@@ -311,13 +265,11 @@ mod tests {
             ("leave alt screen 47", b"\x1b[?47l"),
             ("enter alt screen 1047", b"\x1b[?1047h"),
             ("leave alt screen 1047", b"\x1b[?1047l"),
-            // DEC 2004 (a paste's live framing), both edges, and DECSTR's reset of it.
             ("bracketed paste on", b"\x1b[?2004h"),
             ("bracketed paste off", b"\x1b[?2004l"),
             ("bracketed paste on again", b"\x1b[?2004h"),
             ("DECSTR clears bracketed paste", b"\x1b[!p"),
             ("VT52 enter", b"\x1b[?2l"),
-            // In VT52 neither CSI nor `ESC c` parse: leave it before RIS.
             ("VT52 exit", b"\x1b<"),
             ("RIS", b"\x1bc"),
         ];
@@ -325,7 +277,6 @@ mod tests {
             term.process(bytes);
             assert_in_sync(&term, what);
         }
-        // The walk carried a non-trivial word at least once.
         term.process(b"\x1b[>1u");
         assert!(
             term.mode_mirror()
@@ -338,7 +289,6 @@ mod tests {
         assert!(term.mode_mirror().focus_reporting_enabled());
         term.process(b"\x1b[?1004l");
         assert!(!term.mode_mirror().focus_reporting_enabled());
-        // ... and the wheel's screen facts: a pager on the alt screen with 1007.
         term.process(b"\x1b[?1007h\x1b[?1049h");
         assert!(term.mode_mirror().alternate_screen() && term.mode_mirror().alternate_scroll());
         term.process(b"\x1b[?1049l\x1b[?1007l");
@@ -373,13 +323,11 @@ mod tests {
         assert!(term.mode_mirror().alternate_screen());
         assert!(term.leave_alternate_screen());
         assert_in_sync(&term, "leave_alternate_screen()");
-        // `apply_config` arms DEC 1004 outside `process()`, so it must republish itself.
         let mut config = crate::config::TerminalConfig::default();
         config.focus_reporting = true;
         let _ = term.apply_config(&config);
         assert!(term.focus_reporting_enabled(), "the host armed DEC 1004");
         assert_in_sync(&term, "apply_config(focus_reporting = true)");
-        // ... and seeds DEC 2004 from the host's setting, both edges.
         config.bracketed_paste = true;
         let _ = term.apply_config(&config);
         assert!(term.modes().bracketed_paste, "the host seeded DEC 2004");
@@ -399,7 +347,6 @@ mod tests {
             "a reset disarms DEC 1004 in the lock-free word too"
         );
 
-        // Checkpoint hydration, both paths.
         let mut source = Terminal::new(24, 80);
         source.process(b"\x1b[>1u\x1b[?1002h\x1b[?1h\x1b[?1004h");
         let cp = source.checkpoint();
@@ -420,9 +367,6 @@ mod tests {
         );
     }
 
-    /// The arm count moves once per off->on edge of the program's DEC 1004 (DECSET or
-    /// XTRESTORE), never for a re-sent `?1004h`, a disable, the host's own arming or a
-    /// reset, and the lock-free word carries every value.
     #[test]
     fn the_focus_arm_count_moves_on_each_program_enable_edge_only() {
         let mut term = Terminal::new(24, 80);

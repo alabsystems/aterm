@@ -11,6 +11,9 @@ use super::Terminal;
 
 #[inline]
 fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
+    // Live-frame (screen-row) reads: the extras lookups are keyed by the live
+    // visible row, and callers pass terminal-relative rows (the renderer's
+    // `sel_row = viewport_row - display_offset`). Display-mapped cells would
     // pair scrolled cells with live extras.
     if let Some(cells) = grid.row_at_screen(row) {
         push_row_cell_text(grid, row, cells, col, out);

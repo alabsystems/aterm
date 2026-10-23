@@ -1220,7 +1220,7 @@ struct Row {
 struct Listing {
     /// Every peer this machine knows, each checked.
     rows: Vec<Row>,
-    /// Why nothing was checked, when it.
+    /// Why nothing was checked, when it was not.
     unchecked: Option<String>,
     /// What the read of the issuer's book left this machine short of ([`book_note`]).
     note: Option<String>,
@@ -1558,6 +1558,7 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
             },
             Some(Err(why)) => {
                 // A peer never dialled (a name that did not resolve) says
+                // nothing of this machine's route either way.
                 if why.dialled() {
                     unreached += 1;
                 }
@@ -1765,9 +1766,10 @@ fn drive_grants(places: &Places, words: &[String]) -> Result<Vec<DriveGrant>, Fa
 /// What a word names among the peers a drive can name ([`bound_peer`]).
 #[derive(Debug)]
 enum Bound {
-    /// The peer of a node this machine binds a key.
+    /// The peer of a node this machine binds a key to: its node and that
+    /// key are set.
     Node(Peer),
-    /// The peer of a node this machine binds no key.
+    /// The peer of a node this machine binds no key to: its node is set.
     Unbound(Peer),
     /// A peer named by hand, with no node.
     ByHand,

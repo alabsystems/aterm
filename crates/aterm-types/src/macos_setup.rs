@@ -1,22 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The selectable groups in the local Mac workstation profile. These types
-//! describe the offer and its durable plan without inspecting the operating system.
+//! Selectable groups and durable plan types for the local Mac workstation profile.
 
 /// The default ALab vault on the local network, advertised through mDNS.
 pub const DEFAULT_VAULT_URL: &str = "http://alab-secrets.local:7484/v1/alab";
 
-/// The name of setup's Secrets stage rows in its report, which System State reads to know
-/// that setup synced the vault.
+/// Report row name for setup's Secrets stage.
 pub const SECRETS_VAULT_ROW: &str = "Secrets vault";
 
-/// The name of the row that says whether the vault's subscriber runs, beside
-/// [`SECRETS_VAULT_ROW`] in a read of the vault.
+/// Report row name indicating whether the vault subscriber runs.
 pub const SECRETS_SUBSCRIBER_ROW: &str = "Secrets subscriber";
 
-/// One independently selectable part of the workstation profile.
-/// Discriminants are persisted bit positions, independent of presentation order.
+/// Independently selectable part of the workstation profile, with discriminants as bit positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Setting {
@@ -28,8 +24,7 @@ pub enum Setting {
     TrackpadScrolling = 2,
     /// Desktop icons and wallpaper clicks.
     Desktop = 3,
-    /// Desktop and Stage Manager widgets; Notification Center's widgets once the app that
-    /// runs the pass (aterm, for System State) holds Full Disk Access.
+    /// Desktop, Stage Manager, and Notification Center widgets.
     Widgets = 4,
     /// Dock pins, extras, recent applications and minimization.
     Dock = 5,
@@ -99,7 +94,7 @@ impl Setting {
 /// Every checklist row, also available as [`Setting::ALL`].
 pub const ALL: [Setting; 12] = Setting::ALL;
 
-/// The exact groups the person chose. Unknown persisted bits are refused.
+/// Bitmask of selected workstation profile groups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection(u16);
 
@@ -169,8 +164,7 @@ impl Selection {
     }
 }
 
-/// The person's complete first-launch plan. A join password travels separately
-/// in a secret buffer and is never part of this persisted value.
+/// Persisted first-launch setup plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     /// The exact checked rows.

@@ -1,111 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Effects harness: the `effects` floor of `verify perf` (lane B0 of
-// docs/DESIGN-card-engine-2026-10-19.md, §5 and §12). What a frame of today's rectangle effects
-// costs, measured on scripted scenes through the real emitters, the CPU rasterizer and the GPU
-// presenter, so the gated lanes (B5 ramps, B6 pass economy) are judged on numbers and the fx
-// layers (B1-B3) have a before.
-//
-//   targo --unverified run --release -q -p aterm-bench --features dev-seams --example effects_harness
-//   -> {"gpu_clock":"metal","cpu_counter":"instructions",...,"episode_gpu_rel":...,
-//       "episode_raster_per_ginsn":...,"episode_gpu_p95_us":...,...}
-//
-// `dev-seams` compiles in the pass-economy ablation (`GpuRenderer::set_unorm_ablation`) and the
-// GPU clock's pause (`gpu_time::set_paused`); a release build without it refuses to run rather
-// than report half a lane. On macOS, `--features dev-seams,wgpu-oracle` and `--wgpu` draw on the
-// wgpu arm (the Windows and BSD presenter, its timestamp-query clock) instead of Metal; that run
-// is a record, never the lane's (the lane builds without the oracle).
-//
-// The scenes, at the desk's cell (JetBrains Mono at 30 px: 18x40) on a 26x190 grid (the
-// 3420x1040 drawable §5's pass costs are stated at), on the shipped dark theme with bloom and
-// shimmer on:
-//   episode  the harness card's intro (`HarnessCard::draw` on its 33 ms clock, the ride-in
-//            included), every frame the card asks for, the flow's first frame (the one the
-//            intro hands over to) last;
-//   flowing  the card flowing on after its intro while a key a twelfth of a second lands in
-//            the composer under it: a frame at each key and at each of the flow's 128 ms steps
-//            (`HarnessCard::deadline`), a step drawing its palette on the fixed rim art and a
-//            key between two steps replaying that step's kept frame (`replay_step`); REPORTED,
-//            not gated: the lane's floors are the baseline its box recorded, and gating it
-//            waits for a record there (docs/DESIGN-card-engine-2026-10-19.md §4.8.1);
-//   settled  the held card (`animate` false: Reduce Motion, or its window out of focus)
-//            replayed while a key a frame lands in the composer under it, its first held frame
-//            drawn unmeasured;
-//   typing   the shipped cursor glow (Rainbow Kitty) ticked at 120 Hz while 12 keys a second
-//            land at a shell prompt, then its run-out; a tick whose fingerprint did not move
-//            presents nothing, as in the app;
-//   scroll   inline streaming under a settled card: a reply's lines, each its own, a line a
-//            frame, scroll the screen and the card with it (since lane B3 the settled frame
-//            replayed at its new origin: the same two fx contents, a new layer offset).
-// Every card scene carries the card's line in the box's last row, as the app writes it under
-// a card (`claude_card::make_line`): its text, and its ink and its `✦` laid on the frame by
-// the host (`claude_card::ink_lines`), the ink re-made only where the line moved or the card
-// is not still.
-// and, reported but not gated, the other producers the B5 rule names, each a shorter typing run:
-//   bolt     the Laser style's lightning bolts;
-//   comet    the Comet style's slabs;
-//   classic  the classic wake (`classic_wake`, its comet beams);
-//   meteor   the Rainbow Kitty's meteors (`ribbon_beam`) on its nav flights: an 80-cell
-//            Ctrl-A / Ctrl-E ping-pong every 200 ms (the frame-cost suite's §21 scenario);
-//   flood    the Rainbow Kitty's ribbon at its `RIBBON_QUAD_BUDGET`: 400 keys at 120 a second,
-//            a hot line wrapped over three rows, the frame the budget caps.
-//
-// Per frame, each on its own clock:
-//   emit     the producer: the card's replay or draw and its line's ink, or the glow's
-//            witness feed and tick;
-//   splice   the host's put: the card's two fx layers (taken back by id, laid at its origin,
-//            clipped to the pane) and its line's ink and `✦`, or the glow's quads into the
-//            frame's streams, and the effect-damage refresh;
-//   raster   the CPU presenter: `Renderer::render_input_cached` on the frame;
-//   encode   the GPU presenter's present work up to its last commit
-//            (`WindowGpu::last_present_encode_ns`), with its `build` (instances and atlas) and
-//            `stage` (instance upload) parts from the frame shape;
-//   gpu      the device's time for that present (`aterm_gpu::gpu_time`: Metal command-buffer
-//            clocks, wgpu timestamp queries; absent, with `gpu_clock` "none", on an arm with no
-//            clock); `present` is encode + gpu.
-//
-// The GPU presenter draws every frame four times, each on its own window of the one renderer
-// and in an order that rotates frame by frame: under the pass-economy seam
-// (`aterm_gpu::UnormAblation`) `off` (shipped), `thin` (every pass of the plan, each Unorm
-// item drawing one instance) and `drop` (no Unorm group: one pass), and `untimed`, the shipped
-// plan with the GPU clock paused. Paired per frame, `pass_cost` = thin - drop is what the extra
-// passes themselves cost, the figure the B6 go rule reads as `pass_cost_pct` (its p50 over the
-// present's p95), `unorm_draw` = off - thin is what the One/One draws cost, which merging the
-// passes would not save, and `clock` = off - untimed is what timing a present costs its encode
-// (the completion handlers on Metal; the timestamp writes, the deferred resolve and the
-// readback harvest on wgpu). `build_stage_pct` (instance build and upload, p50 over the
-// present's p95) is the B5 rule's.
-//
-// RUNS runs follow WARMUP unmeasured ones, each scene on fresh windows. A key's p50/p95 pools
-// every run's frames; its `_spread` is the slowest run's p50 over the fastest's.
-//
-// On a shared desk the absolute figures move together by 2-4x between invocations (another
-// session's build takes the cores; the GPU's clock follows its load), so two kinds of key are
-// built to hold still:
-//   `_rel`  CALIBRATED: every REF_EVERY frames the harness also draws a reference frame (a full
-//           repaint of a screen of plain text, alternating two so every row changes) on both
-//           presenters, and a `_rel` key is the reference's p50 over the scene's, per run, the
-//           median run reported: bigger is cheaper. The GPU one divides the device clock and
-//           holds; the CPU ones divide thread CPU time (`cpu_clock` "thread") and do not hold as
-//           well (the reference's 14.6 MB repaint follows the memory contention, a scene's
-//           small kernels do not). The reference shares the presenter's text work with every
-//           scene, so a regression there moves both sides of a scene's ratio; `ref_text_gpu_rel`
-//           calibrates the reference itself, against a blank full repaint (cell backgrounds, no
-//           glyph) drawn beside it: the text's cost over the frame every present pays.
-//   work    `_kins` is the instructions the process retired per frame in the producer, the CPU
-//           raster and the GPU present call (`cpu_counter` "instructions": Apple's
-//           `proc_pid_rusage`, the read's own cost taken out; "none" elsewhere), and
-//           `_per_ginsn` (frames per 10^9 instructions, bigger is cheaper) its gated form. The
-//           desk's load does not move it.
-// Which keys gate is the `effects` lane's call (`aterm_verify::perf::floors::EFFECTS_LANE`). The
-// `_us` figures are the record, and the reference's own (`ref_*`) say what the desk was doing.
-//
-// Fail closed: a refused present, a GPU frame that fails or never settles, a paused clock that
-// timed a present, an ablation the plan did not take (read off the plan the arm built: its mode,
-// a Unorm draw left by `drop` or an instance past one by `thin`, other passes or instances), or
-// a scene that does not do what it says (a glow that drew nothing, a card that did not scroll,
-// a flood that never reached the ribbon's budget) ends the run with exit 1.
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -122,69 +16,47 @@ use aterm_gpu::gpu_time::{self, Settled};
 use aterm_gpu::{FrameShape, GpuContext, GpuRenderer, UnormAblation, WindowGpu};
 use aterm_render::{GlowQuad, RenderInput, Renderer, Theme, WindowCpu};
 
-/// The desk's cell: JetBrains Mono at 30 px is 18x40, the "2x Retina" cell the effects frame
-/// costs are stated at (`aterm-effects/tests/cursor_bench.rs`).
 const FONT_PX: f32 = 30.0;
 const ROWS: usize = 26;
 const COLS: usize = 190;
-/// The window's interior padding, as the app's tests set it.
 const PAD: usize = 12;
 
-/// Unmeasured runs first (atlas, pipelines, the GPU's clocks up), then the measured ones.
 const WARMUP: usize = 1;
 const RUNS: usize = 5;
 
-/// Keys typed into the composer under the settled card.
 const SETTLED_KEYS: usize = 120;
-/// Keys typed into the composer under the flowing card, and their pace (the typist's, 12 a
-/// second): a key falls between two of the flow's 128 ms steps or on one.
 const FLOWING_KEYS: usize = 48;
 const FLOWING_KEYS_HZ: u32 = 12;
-/// The glow's frame clock and the typist's pace: a key every 10 ticks at 120 Hz is 12 a
-/// second (the Rainbow Kitty frame-cost gate's prose pace), then a second of run-out.
 const TYPING_HZ: u32 = 120;
 const TYPING_KEYS: usize = 48;
 const KEY_TICKS: usize = 10;
 const RUNOUT_TICKS: usize = 120;
-/// Keys typed in each of the other producers' scenes (reported, not gated).
 const PRODUCER_KEYS: usize = 24;
-/// The flood: a key every tick, long enough to wrap the hot line over three rows.
 const FLOOD_KEYS: usize = 400;
 
-/// The meteor scene's flights: hops between two columns 80 apart, one every 200 ms.
 const HOPS: usize = 15;
 const HOP_TICKS: usize = 24;
 const HOP_COLS: (u16, u16) = (20, 100);
-/// Launches per scroll run: each scrolls a fresh card from near the bottom to the top row.
 const SCROLL_CYCLES: usize = 4;
 
-/// A reference frame is drawn after every this many scene frames.
 const REF_EVERY: usize = 8;
 
-/// A wait for something that must happen (a GPU frame settling) is a hang detector.
 const HANG: Duration = Duration::from_secs(60);
 
-/// The launch card as Claude Code prints it: the mascot's block elements and two lines of
-/// text, the longest ending in column 31.
 const CARD: [&str; 3] = [
     " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C}   Claude Code v2.1.304",
     "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259B}\u{2598}  Opus 4.5 \u{00B7} Claude Max",
     "  \u{2598}\u{2598} \u{259D}\u{259D}    ~/src/aterm",
 ];
-/// The card's box: its three rows and the line's, 62 columns, the trail from past the text to
-/// the kitty, which stands three rows tall (the third card row is blank across both).
 const BOX_ROWS: u16 = 4;
 const BOX_COLS: u16 = 62;
 const TRAIL: (u16, u16) = (33, 41);
 const KITTY_COL: u16 = 41;
-/// The card's line, in the box's last row: its `✦` in the card's text column and its words
-/// two columns on (`claude_card::LINE_LEAD`), as the app writes it under the card.
 const LINE_ROW: u16 = 3;
 const LINE_STAR_COL: u16 = 12;
 const LINE_COL: u16 = LINE_STAR_COL + 2;
 const LINE_TEXT: &str = "Cruise: the kitty keeps watch while the reply streams";
 
-/// Where the card sits for the episode and settled scenes, and where a scroll launch starts it.
 const CARD_TOP: u16 = 2;
 const SCROLL_TOP: u16 = 20;
 
@@ -201,8 +73,6 @@ fn elapsed_ns(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// This thread's CPU time: what a stretch of work cost the core, with the time the scheduler
-/// gave the core to someone else left out.
 #[cfg(unix)]
 fn thread_cpu_ns() -> u64 {
     let mut stamp = libc::timespec {
@@ -217,20 +87,17 @@ fn thread_cpu_ns() -> u64 {
         + u64::try_from(stamp.tv_nsec).unwrap_or(0)
 }
 
-/// No thread CPU clock: the wall clock stands in (`cpu_clock` "wall").
 #[cfg(not(unix))]
 fn thread_cpu_ns() -> u64 {
     static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     elapsed_ns(*ORIGIN.get_or_init(Instant::now))
 }
 
-/// The process's instructions retired so far, user and kernel, every thread: Apple's
-/// `proc_pid_rusage` (`ri_instructions`, read from the cores' fixed counters).
 #[cfg(target_os = "macos")]
 fn instructions() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
     let pid = libc::c_int::try_from(std::process::id()).ok()?;
-    // SAFETY: `info` is writable for one `rusage_info_v4`, the flavor asked for; the call fills it or fails, and a zeroed one is a valid value either way.
+    // SAFETY: `info` is writable for one `rusage_info_v4` and zeroed on failure.
     let rc = unsafe {
         libc::proc_pid_rusage(
             pid,
@@ -242,18 +109,13 @@ fn instructions() -> Option<u64> {
     (rc == 0).then(|| unsafe { info.assume_init() }.ri_instructions)
 }
 
-/// No instruction counter this harness can read here: the CPU work keys are absent.
 #[cfg(not(target_os = "macos"))]
 fn instructions() -> Option<u64> {
     None
 }
 
-/// The instructions a [`Stopwatch`] counts around nothing at all (its own reads), taken out of
-/// every reading.
 static COUNTER_OVERHEAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
-/// Whether the instruction counter counts here: it reads, and a loop of known length moves it
-/// (a counter that reads a constant would report every frame as free).
 fn calibrate_counter() -> bool {
     let empty = (0..64).filter_map(|_| Stopwatch::start().stop().ins).min();
     let Some(empty) = empty else {
@@ -269,8 +131,6 @@ fn calibrate_counter() -> bool {
     watch.stop().ins.is_some_and(|n| n >= 100_000)
 }
 
-/// A stretch of work on this thread: its wall time, its CPU time and the process's
-/// instructions retired across it (`None` with no counter).
 #[derive(Clone, Copy, Debug, Default)]
 struct Spent {
     wall_ns: u64,
@@ -285,8 +145,6 @@ struct Stopwatch {
 }
 
 impl Stopwatch {
-    /// The counter first and the wall last, so each clock spans the reads inside it the same
-    /// way every time (a constant the overhead calibration takes out).
     fn start() -> Self {
         Self {
             ins: instructions(),
@@ -295,7 +153,6 @@ impl Stopwatch {
         }
     }
 
-    /// The instructions since `start`, the stopwatch's own reads included.
     fn raw_ins(&self) -> Option<u64> {
         instructions()?.checked_sub(self.ins?)
     }
@@ -312,11 +169,9 @@ impl Stopwatch {
     }
 }
 
-/// Why a release build without `dev-seams` refuses to run.
 const NO_SEAM: &str =
     "built without the ablation seam: run it with `--features dev-seams` (the `effects` lane does)";
 
-/// The pass-economy seam, compiled in by `dev-seams` (or any debug build).
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 fn set_ablation(gpu: &mut GpuRenderer, ablation: UnormAblation) {
     gpu.set_unorm_ablation(ablation);
@@ -327,7 +182,6 @@ fn set_ablation(_: &mut GpuRenderer, _: UnormAblation) {
     fail(NO_SEAM);
 }
 
-/// The GPU clock's pause, the same seam's.
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 fn set_clocked(clocked: bool) {
     gpu_time::set_paused(!clocked);
@@ -338,8 +192,6 @@ fn set_clocked(_: bool) {
     fail(NO_SEAM);
 }
 
-/// One way the GPU presenter draws a frame: a plan of the pass-economy seam, timed or with the
-/// clock paused.
 #[derive(Clone, Copy, Debug)]
 struct Way {
     ablation: UnormAblation,
@@ -347,7 +199,6 @@ struct Way {
     name: &'static str,
 }
 
-/// The four ways every frame is drawn, in [`Sample::arms`] order.
 const WAYS: [Way; 4] = [
     Way {
         ablation: UnormAblation::Off,
@@ -371,7 +222,6 @@ const WAYS: [Way; 4] = [
     },
 ];
 
-/// The host-owned effect streams the scenes fill.
 fn clear_streams(input: &mut RenderInput) {
     input.glow_under.clear();
     input.nova_add.clear();
@@ -397,35 +247,28 @@ fn fx_quads(input: &RenderInput) -> u64 {
     .sum()
 }
 
-/// One GPU present of a frame under one plan.
 #[derive(Clone, Copy, Debug, Default)]
 struct Arm {
     encode_ns: u64,
-    /// This thread's CPU time in the present call: the encode's, the waits costing none.
     call_cpu_ns: u64,
-    /// The instructions the process retired in the present call.
     call_ins: Option<u64>,
     gpu_ns: Option<u64>,
     shape: FrameShape,
 }
 
 impl Arm {
-    /// Encode plus GPU time (encode alone on an arm with no clock).
     fn present_ns(&self) -> u64 {
         self.encode_ns + self.gpu_ns.unwrap_or(0)
     }
 }
 
-/// One presented frame's figures.
 #[derive(Clone, Copy, Debug, Default)]
 struct Sample {
     emit: Spent,
     splice_ns: u64,
     raster: Spent,
     fx_quads: u64,
-    /// The `glow_under` stream's quads: the ribbon's body, the card's border and trail.
     under_quads: u64,
-    /// The GPU presents, indexed like [`WAYS`].
     arms: [Arm; 4],
 }
 
@@ -444,8 +287,6 @@ impl Sample {
     }
 }
 
-/// One reference frame's costs, the calibration the `_rel` keys divide by, and the GPU time of
-/// the blank full repaint drawn beside it (the reference's own calibration).
 #[derive(Clone, Copy, Debug, Default)]
 struct RefSample {
     raster: Spent,
@@ -456,16 +297,12 @@ struct RefSample {
     blank_gpu_ns: Option<u64>,
 }
 
-/// One scene's frames in one run, and the reference frames drawn among them.
 #[derive(Debug, Default)]
 struct Run {
     samples: Vec<Sample>,
     refs: Vec<RefSample>,
 }
 
-/// The calibration: two screens of plain text, each differing from the other in every row, so
-/// each reference frame is a full repaint, on windows of their own; and two blank screens (cell
-/// backgrounds of two shades, no glyph), each a full repaint of what every present pays.
 struct Reference {
     inputs: [RenderInput; 2],
     blanks: [RenderInput; 2],
@@ -514,7 +351,6 @@ impl Reference {
     }
 }
 
-/// One scene's windows: the CPU presenter's, and one GPU window per way in [`WAYS`].
 struct Win {
     cpu: WindowCpu,
     gpu: [WindowGpu; 4],
@@ -529,13 +365,10 @@ impl Win {
     }
 }
 
-/// Both presenters on one font and theme, and the frame's geometry.
 struct Rig {
     cpu: Renderer,
     gpu: GpuRenderer,
-    /// `metal`, `wgpu` or `none`.
     clock: &'static str,
-    /// `instructions`, or `none` where no counter counts.
     counter: &'static str,
     theme: Theme,
     cw: u16,
@@ -544,14 +377,11 @@ struct Rig {
     grid_top: u16,
     frame_w: usize,
     frame_h: usize,
-    /// Frames presented: the GPU presents' order rotates with it.
     frames: usize,
     reference: Reference,
-    /// The reference frames drawn since the scene last took them.
     refs: Vec<RefSample>,
 }
 
-/// `--wgpu`: draw on the wgpu arm, the oracle a macOS build carries under `wgpu-oracle`.
 #[cfg(all(target_os = "macos", feature = "wgpu-oracle"))]
 fn on_wgpu(gpu: &mut GpuRenderer) {
     gpu.disarm_metal_for_oracle();
@@ -564,7 +394,6 @@ fn on_wgpu(_: &mut GpuRenderer) {
     }
 }
 
-/// What `main` reports instead of a lane when the host has no GPU: the lane skips.
 fn skip(why: impl std::fmt::Display) -> ! {
     let why = why.to_string().replace(['"', '\\'], "'");
     eprintln!("effects_harness: SKIP: {why}");
@@ -635,9 +464,6 @@ impl Rig {
         }
     }
 
-    /// The card's scene with its banner on grid row `top`, as the app lays it for a pane that
-    /// fills the window: window pixels, the left border in the padding, half a row of air over
-    /// the banner and under the box, the pane as the clip.
     fn card_scene(&self, top: u16) -> CardScene {
         let origin_x = i32::from(self.pad);
         let origin_y = i32::from(self.grid_top);
@@ -672,7 +498,6 @@ impl Rig {
         }
     }
 
-    /// The grid's origin in window pixels: a grid-space layer's shift.
     fn grid(&self) -> (i32, i32) {
         (i32::from(self.pad), i32::from(self.grid_top))
     }
@@ -692,8 +517,6 @@ impl Rig {
         }
     }
 
-    /// The device time of the present this renderer just made: awaited (a hang detector, not a
-    /// budget), `None` on an arm with no clock.
     fn gpu_time(&mut self) -> Option<u64> {
         if self.clock == "none" {
             return None;
@@ -721,7 +544,6 @@ impl Rig {
         }
     }
 
-    /// Present `input` on the CPU presenter, then on the GPU presenter under each plan.
     fn present(
         &mut self,
         win: &mut Win,
@@ -792,12 +614,6 @@ impl Rig {
         }
     }
 
-    /// The three plans of one frame did what their names say, read off the plans the arm built
-    /// (`FrameShape::unorm_draws`, counted from the plan, and the mode it was built under), so
-    /// an arm that ignored the seam ends the run instead of pricing the passes at nothing:
-    /// dropped, no Unorm draw is left and the all-sRGB plan is one pass; thinned, every Unorm
-    /// draw and every pass stays, each drawing at most one instance; and no plan built other
-    /// instances than the shipped one.
     fn check_ablation(off: &FrameShape, thin: &FrameShape, dropped: &FrameShape) {
         for (shape, way) in [off, thin, dropped].into_iter().zip(WAYS) {
             if shape.ablation != way.ablation {
@@ -829,7 +645,6 @@ impl Rig {
         }
     }
 
-    /// Draw the next reference frame on both presenters.
     fn reference_frame(&mut self) -> RefSample {
         let reference = &mut self.reference;
         let input = &reference.inputs[reference.next];
@@ -867,7 +682,6 @@ impl Rig {
         }
     }
 
-    /// The scene's run: its frames, and the reference frames drawn since the last take.
     fn take_run(&mut self, samples: Vec<Sample>) -> Run {
         Run {
             samples,
@@ -875,26 +689,19 @@ impl Rig {
         }
     }
 
-    /// The frame `term` shows now, its effect streams emptied for the scene to fill.
     fn extract(term: &mut Terminal, input: &mut RenderInput) {
         let _ = term.cell_frame_damage_scoped_into(input, ROWS, COLS);
         clear_streams(input);
     }
 
-    /// An unmeasured frame: fresh windows draw it in full, so the scene's measured frames are
-    /// the ones the app would present next.
     fn settle_window(&mut self, win: &mut Win, input: &mut RenderInput) {
         input.refresh_cursor_effect_damage();
         let _ = self.present(win, input, Spent::default(), 0);
     }
 }
 
-/// The card's name in the frame's layers (the app names a card by its session).
 const CARD_ID: u64 = 1;
 
-/// The card's host: the app's replay-or-draw (`claude_card.rs`): the card's frames (its kept
-/// settled or flow frame, the ring its episode frames are built in, its arts), the frame the last
-/// emit made, which the splice lays as the card's two fx layers, and the card's line.
 #[derive(Default)]
 struct CardHost {
     card: HarnessCard,
@@ -903,10 +710,6 @@ struct CardHost {
     line: LineHost,
 }
 
-/// The card's line on the glass (`claude_card::make_line` and `ink_lines`): its ink, re-made
-/// only where the line moved or the card is not still (the app keys the line by its row and
-/// keeps a still card's settled gradient), and its `✦`, which the splice lays on the frame in
-/// place of the last splice's.
 #[derive(Default)]
 struct LineHost {
     row: Option<u16>,
@@ -916,7 +719,6 @@ struct LineHost {
 }
 
 impl LineHost {
-    /// Make the line of the card at `scene` for this frame, as the app does in the card's pass.
     fn make(&mut self, card: &HarnessCard, scene: &CardScene, now: Instant) {
         let row = scene.top + LINE_ROW;
         let still = card.is_still();
@@ -956,8 +758,6 @@ impl LineHost {
         });
     }
 
-    /// Lay the line's ink and `✦` on the frame. The bench's frames carry no other producer's,
-    /// so the last splice's are taken back by clearing the two streams.
     fn lay(&self, input: &mut RenderInput) {
         input.ink.clone_from(&self.ink);
         input.word_decorations.clear();
@@ -966,9 +766,6 @@ impl LineHost {
 }
 
 impl CardHost {
-    /// The producer, in the app's order: replayed (`true`) when the card is held at the settled
-    /// frame it keeps for a scene of this shape (an inline scroll is the same shape at a new
-    /// origin), or flows and keeps the frame of `now`'s step, else drawn on `now`.
     fn emit(&mut self, now: Instant, scene: &CardScene, animate: bool) -> (bool, Spent) {
         let watch = Stopwatch::start();
         let kept = self
@@ -984,9 +781,6 @@ impl CardHost {
         (replayed, watch.stop())
     }
 
-    /// The splice, as the app's (`claude_card.rs`) does it: the card's two layers from the last
-    /// splice taken back by id, then this frame's laid at its origin and clipped to the pane
-    /// (`scene.clip`, `CardFrame::layers`): two `Arc`s, nothing copied.
     fn splice(&mut self, scene: &CardScene, grid: (i32, i32), input: &mut RenderInput) -> u64 {
         let started = Instant::now();
         clear_streams(input);
@@ -1006,7 +800,6 @@ impl CardHost {
         elapsed_ns(started)
     }
 
-    /// Whether the last frame drew the border and the kitty.
     fn drew_whole(&self) -> bool {
         self.frame
             .as_ref()
@@ -1014,8 +807,6 @@ impl CardHost {
     }
 }
 
-/// The cursor glow's host: the content witness fed from the terminal's rows, then the tick, as
-/// the app does under its frame hold.
 struct GlowHost {
     glow: CursorGlow,
     cfg: GlowConfig,
@@ -1026,8 +817,6 @@ struct GlowHost {
 }
 
 impl GlowHost {
-    /// The shipped dark-theme glow config (the Rainbow Kitty's, as its frame-cost gate builds
-    /// it), on this theme's colours, in `style`.
     fn new(rig: &Rig, style: GlowStyle) -> Self {
         Self {
             glow: CursorGlow::default(),
@@ -1076,8 +865,6 @@ impl GlowHost {
         (fp, watch.stop())
     }
 
-    /// The app's stream map: aurora, halos, fire patches, under-light, charred glyphs and fire
-    /// halo cells.
     fn splice(&self, input: &mut RenderInput) -> u64 {
         let started = Instant::now();
         clear_streams(input);
@@ -1092,13 +879,10 @@ impl GlowHost {
     }
 }
 
-/// `CSI row;col H`, one-based.
 fn cup(row: u16, col: u16) -> String {
     format!("\x1b[{};{}H", row + 1, col + 1)
 }
 
-/// The card's three rows from `top`, with a blank row over and two under (the line's row in the
-/// box, its words as the app writes them there, then the air).
 fn print_card(term: &mut Terminal, top: u16) {
     for (i, line) in CARD.iter().enumerate() {
         term.process(format!("{}{line}", cup(top + i as u16, 0)).as_bytes());
@@ -1106,15 +890,12 @@ fn print_card(term: &mut Terminal, top: u16) {
     term.process(format!("{}{LINE_TEXT}", cup(top + LINE_ROW, LINE_COL)).as_bytes());
 }
 
-/// Whether grid row `row` of `term` shows the card's banner.
 fn banner_at(term: &Terminal, row: u16, scratch: &mut Vec<char>) -> bool {
     term.row_cols_into(usize::from(row), scratch);
     let banner: Vec<char> = CARD[0].chars().collect();
     scratch.len() >= banner.len() && scratch[..banner.len()] == banner[..]
 }
 
-/// The intro, then the flowing card under typing, then the held card under typing, on one
-/// launch.
 fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"$ claude");
@@ -1213,17 +994,13 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
     (episode, flowing, rig.take_run(settled))
 }
 
-/// What the caret does in a glow scene, on the glow's 120 Hz clock, before the run-out.
 #[derive(Clone, Copy)]
 enum Script {
-    /// `keys` keys typed, one every `every` ticks.
     Type { keys: usize, every: usize },
-    /// `hops` nav moves between [`HOP_COLS`] (a Ctrl-A or Ctrl-E), one every `every` ticks.
     Hop { hops: usize, every: usize },
 }
 
 impl Script {
-    /// Its events and their ticks.
     fn steps(self) -> (usize, usize) {
         match self {
             Self::Type { keys, every } | Self::Hop { hops: keys, every } => (keys, every),
@@ -1231,8 +1008,6 @@ impl Script {
     }
 }
 
-/// The flood measures the frame the ribbon's budget caps, or it measures nothing it names: its
-/// fullest frame spends the budget, give or take the hand's two quads.
 fn at_the_ribbon_budget(flood: &Run) {
     use aterm_effects::rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET;
     let fullest = flood
@@ -1249,7 +1024,6 @@ fn at_the_ribbon_budget(flood: &Run) {
     }
 }
 
-/// The cursor glow in `style` at a shell prompt under `script`, then its run-out.
 fn typing_scene(rig: &mut Rig, style: GlowStyle, script: Script) -> Run {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     for i in 0..10 {
@@ -1292,7 +1066,6 @@ fn typing_scene(rig: &mut Rig, style: GlowStyle, script: Script) -> Run {
         );
         let (fp, emit) = host.emit(&term, caret, now);
         if event.is_none() && fp == host.last_fp {
-            // Nothing moved: the app presents nothing.
             continue;
         }
         host.last_fp = fp;
@@ -1305,7 +1078,6 @@ fn typing_scene(rig: &mut Rig, style: GlowStyle, script: Script) -> Run {
     rig.take_run(samples)
 }
 
-/// Inline streaming that scrolls a settled card up the screen, launch after launch.
 fn scroll_scene(rig: &mut Rig) -> Run {
     let mut samples = Vec::new();
     let mut row = Vec::new();
@@ -1354,7 +1126,6 @@ fn scroll_scene(rig: &mut Rig) -> Run {
     rig.take_run(samples)
 }
 
-/// Nearest-rank percentile of `v` (sorted in place); 0 for an empty set.
 fn pct(v: &mut [f64], p: f64) -> f64 {
     if v.is_empty() {
         return 0.0;
@@ -1364,27 +1135,20 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
     v[rank.clamp(1, v.len()) - 1]
 }
 
-/// A per-frame figure in nanoseconds (signed: a paired difference can be negative), `None`
-/// where the frame has none (no GPU clock).
 type Figure = fn(&Sample) -> Option<f64>;
 
-/// The same for a reference frame.
 type RefFigure = fn(&RefSample) -> Option<f64>;
 
 fn ns(v: u64) -> f64 {
     v as f64
 }
 
-/// One scene's runs, folded into its report keys.
 struct Scene {
     name: &'static str,
     runs: Vec<Run>,
-    /// The producer is a replay: well under a microsecond and about 500 instructions, beside
-    /// the counter's own read of about 6,200 it is taken from, so it is reported, not rated.
     rate_emit: bool,
 }
 
-/// The flat JSON report, in insertion order.
 #[derive(Default)]
 struct Report(Vec<(String, String)>);
 
@@ -1418,8 +1182,6 @@ impl Report {
 }
 
 impl Scene {
-    /// A counted report describes every frame, not just the counter reads
-    /// that happened to succeed.
     fn require_cpu_samples(&self) -> Result<(), String> {
         for (run_index, run) in self.runs.iter().enumerate() {
             let frames_complete = run.samples.iter().all(|sample| {
@@ -1450,7 +1212,6 @@ impl Scene {
             .collect()
     }
 
-    /// Each run's p50 of `f`.
     fn run_p50s(&self, f: Figure) -> Vec<f64> {
         self.runs
             .iter()
@@ -1463,8 +1224,6 @@ impl Scene {
             .collect()
     }
 
-    /// Each run's reference p50 over its scene p50 of `f`; `None` for a run with no reference
-    /// frame or no reading.
     fn run_rels(&self, f: Figure, reference: RefFigure) -> Vec<Option<f64>> {
         self.runs
             .iter()
@@ -1673,7 +1432,6 @@ impl Scene {
     }
 }
 
-/// The reference frames' own costs, pooled over every scene and run: what the desk was doing.
 fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bool) {
     let all = || {
         scenes

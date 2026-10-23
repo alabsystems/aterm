@@ -590,8 +590,7 @@ pub fn await_granted(flow: &Flow<'_>, step: &PersonStep) -> Result<String, Strin
 /// again every [`POLL`], as the walk's readings are: right after a login over the relay the
 /// host can be too busy to answer for a while (VM, 27.0: `Connection timed out during banner
 /// exchange` on the walk's first two requests after the login, and the walk ended with the
-/// step not granted).
-///
+/// step not granted). One that ran and failed is final.
 /// # Errors
 /// How the open ran, when it failed; the last reason it did not run once [`Flow::hang`]
 /// passes; or the signal that stopped the walk ([`System::stopped`]).

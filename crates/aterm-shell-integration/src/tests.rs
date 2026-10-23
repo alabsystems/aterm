@@ -43,7 +43,7 @@ struct ShellCommand {
 
 #[cfg(unix)]
 impl ShellCommand {
-    /// The hermetic home every `HOME`/`XDG_*` of this command points.
+    /// The hermetic home every `HOME`/`XDG_*` of this command points into.
     fn home(&self) -> &std::path::Path {
         self.home.path()
     }
@@ -146,7 +146,8 @@ fn a_lane_shell_inherits_no_start_pointer() {
     );
 }
 
-/// The hermetic home's data dir (`XDG_DATA_HOME`), which `XDG_DATA_DIRS` is narrowed.
+/// The hermetic home's data dir (`XDG_DATA_HOME`), which `XDG_DATA_DIRS` is
+/// narrowed to.
 #[cfg(unix)]
 fn hermetic_data(home: &std::path::Path) -> std::path::PathBuf {
     aterm_spec::host::hermetic_env(home)
@@ -2274,7 +2275,8 @@ struct LiveShell {
     stdin: std::process::ChildStdin,
     stdout: std::sync::Arc<Pumped>,
     stderr: std::sync::Arc<Pumped>,
-    /// The hermetic home the shell's environment points.
+    /// The hermetic home the shell's environment points into, when the
+    /// [`ShellCommand`] that made it is gone ([`Self::holding`]).
     home: Option<aterm_tempfile::TempDir>,
     /// An rc's background job, armed before any wait/assertion can unwind.
     job: Option<ShellJob>,
@@ -2459,7 +2461,8 @@ impl LiveShell {
         }
     }
 
-    /// Keep `home` — the [`ShellCommand`]'s, which this shell's environment points.
+    /// Keep `home` — the [`ShellCommand`]'s, which this shell's environment
+    /// points into — for as long as this shell is held.
     fn holding(mut self, home: aterm_tempfile::TempDir) -> Self {
         self.home = Some(home);
         self
@@ -2663,6 +2666,8 @@ impl Drop for LiveShell {
             eprintln!("{}: {error}", self.label);
         }
         if owns_job {
+            // Its bounded cleanup already reaped the direct child, or kept
+            // every directory on an unconfirmed result. Do not enter a second,
             // unbounded wait during unwinding.
             return;
         }

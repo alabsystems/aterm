@@ -373,6 +373,8 @@ impl<C: Ctl> Session<'_, C> {
                 self.task_point = self.turn_end.point_number();
                 self.task_done_said = true;
             } else if !self.turn_end.act_in_flight() {
+                // The done stood before this point, and the point (a wall)
+                // ends a turn after it: someone else's, where it follows no
                 // act of this loop's, and the record is opened again.
                 self.task_done_said = true;
             }

@@ -191,7 +191,7 @@ struct Journal {
 }
 
 impl Journal {
-    /// A FULL FLUSH OF DIRECTORY `dir` (the module doc): each file in it keeps
+    /// A FULL FLUSH OF DIRECTORY `dir`: each file in it keeps
     /// its newest ENTRY change, and the versions before it can no longer come
     /// back; the appends after it are data, and still may be lost.
     fn flush_dir(&mut self, dir: &Path) {
@@ -606,7 +606,7 @@ impl Device {
         }
     }
 
-    /// A POWER CUT: every file under the state dir rewritten to one image the media may hold (the module doc), drawn from `rng`.
+    /// A POWER CUT: every file under the state dir rewritten to one image the media may hold, drawn from `rng`.
     pub(crate) fn power_cut(&self, rng: &mut Rng) -> Vec<String> {
         let mut j = lock(&self.journal);
         let open = j.points - j.persisted;

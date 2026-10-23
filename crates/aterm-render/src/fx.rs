@@ -341,6 +341,8 @@ pub fn cover(art: &FxArt, max: usize) -> Box<[PxRect]> {
         match bands.last_mut() {
             Some(b) if b.y1 == y as u32 && b.runs == runs => b.y1 += 1,
             _ => {
+                // The exact count only grows: a later row can extend the last
+                // band but cannot retire an earlier band. Switch to the hull
                 // before keeping more, with only this one row of scratch live.
                 if count + runs.len() > COVER_EXACT_MAX {
                     return drawing_hull(art);
@@ -667,6 +669,8 @@ mod tests {
                                 crate::add_sat(s, inks[usize::from(id)].color) & 0x00FF_FFFF
                             }))
                         } else {
+                            // A fold of over inks has no exact class ink:
+                            // the last member's stands in, as a careless
                             // fold would.
                             inks[usize::from(*m.last().expect("a member"))]
                         }

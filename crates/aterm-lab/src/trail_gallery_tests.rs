@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The gallery's arguments, its per-instance settings and names, and the rule
-//! that its output never lands inside a checkout, on directories made here.
+//! Tests for `trail-gallery` argument parsing, per-instance configuration, and checkout output path guards.
 
 use super::*;
 
@@ -213,7 +212,6 @@ fn the_checkouts_are_read_from_gits_own_files() {
     assert!(from_wt.contains(&wt), "{from_wt:?}");
     let from_main = checkouts(&main);
     assert!(from_main.contains(&wt), "{from_main:?}");
-    // A directory with no git files at all is its own only checkout.
     assert_eq!(checkouts(&root), vec![root.clone()]);
     let _ = std::fs::remove_dir_all(&root);
 }

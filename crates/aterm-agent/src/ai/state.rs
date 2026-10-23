@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ONE WORD PER CLI, AND THE HEALTH (design §4): a pure function of [`Facts`], whether the
-//! CLI is wanted here, and the clock. Nothing here reads the machine.
+//! Pure state and health classification for each AI CLI from its [`Facts`].
 
 use super::connector::Connector;
 use super::facts::{Facts, Kept};
@@ -16,7 +15,7 @@ pub const OK_FRESH_S: i64 = 6 * 3600;
 pub enum State {
     /// A login exists and was used within [`OK_FRESH_S`].
     Ok,
-    /// A login exists; nothing used it lately. Its next use is its check.
+    /// A login exists and nothing has used it lately.
     Idle,
     /// The usage limit is reached until this time.
     Limited(i64),
@@ -60,7 +59,6 @@ impl State {
     }
 
     /// Whether a wanted CLI has a definite install or sign-in action.
-    /// Unknown login evidence and intentional exclusions need no action.
     #[inline]
     #[must_use]
     pub const fn needs_person(self, wanted: bool) -> bool {
@@ -100,7 +98,7 @@ impl Mark {
 pub struct Row {
     /// The row.
     pub connector: &'static Connector,
-    /// Whether it is wanted here (`[ai.<id>] use`).
+    /// Whether it is wanted here.
     pub wanted: bool,
     /// Its state.
     pub state: State,
@@ -147,8 +145,7 @@ pub fn when(t: i64) -> String {
     }
 }
 
-/// What shows a login exists, if anything does: `Some(true)` signed in, `Some(false)` no
-/// login, `None` nothing aterm can see says either way.
+/// Whether a login is known to exist (`Some(true)`), known absent (`Some(false)`), or unknown (`None`).
 const fn login_seen(f: &Facts) -> Option<bool> {
     if let Some(a) = &f.accounts
         && a.login.is_some()
@@ -254,7 +251,6 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         .into_iter()
         .flatten()
         .max();
-    // An end counts when nothing newer than it shows the login working.
     let ended = f
         .record
         .ended_at
@@ -264,7 +260,6 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
             (at, why)
         });
     let expired = f.accounts.as_ref().and_then(|a| a.state) == Some("expired");
-    // The newest proof, named by what it was.
     row.used = [
         f.record
             .used_at
@@ -322,7 +317,6 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         }
         _ => {}
     }
-    // Signed in.
     let mut words = vec![match &f.plan {
         Some(plan) => format!("signed in ({plan})"),
         None => "signed in".to_string(),

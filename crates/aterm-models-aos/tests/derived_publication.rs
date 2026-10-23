@@ -30,8 +30,6 @@ fn walk(model: &Model, steps: &[&str]) -> State {
     state
 }
 
-/// The healthy laws hold everywhere, every action fires with no mutant on, and each dial breaks
-/// exactly the one law it names, so no law is a ghost and no dial carries another's catch.
 #[test]
 fn publication_holds_and_each_law_has_its_own_mutant() {
     let model = aos_boundary_publication_model();
@@ -58,9 +56,6 @@ fn publication_holds_and_each_law_has_its_own_mutant() {
     }
 }
 
-/// Commit publishes code, replayed state and a new revision together, then hands the queue to the
-/// new pair; a reject that delivered nothing leaves the head where it was, so a candidate kept
-/// across it is still current.
 #[test]
 fn a_candidate_prepared_against_the_paused_head_publishes_code_and_state_together() {
     let model = aos_boundary_publication_model();
@@ -79,8 +74,6 @@ fn a_candidate_prepared_against_the_paused_head_publishes_code_and_state_togethe
     assert!(model.action_enabled("CommitA", &s));
 }
 
-/// Two candidates prepared against one head: the first commits, and the second is stale from that
-/// moment (the revision moved though no input did). Only the revision-blind dial publishes it.
 #[test]
 fn a_second_candidate_against_the_same_head_cannot_commit_after_the_first() {
     let model = aos_boundary_publication_model();
@@ -98,8 +91,6 @@ fn a_second_candidate_against_the_same_head_cannot_commit_after_the_first() {
     assert!(!model.check_invariant("StaleNeverCommitted", &next));
 }
 
-/// A candidate kept while an input reached the live pair (delivered from the queue by a reject,
-/// or run while the task was not paused) is stale, under the revision-blind dial too.
 #[test]
 fn a_candidate_cannot_commit_once_an_input_moved_the_head() {
     let model = aos_boundary_publication_model();
@@ -116,9 +107,6 @@ fn a_candidate_cannot_commit_once_an_input_moved_the_head() {
     }
 }
 
-/// An input that finds the queue full rejects the update before anything is dropped: the queue,
-/// then that input, reach the old pair, and the candidate left behind is stale. With no queue at
-/// all (`Cap = 0`) the first input while paused does the same.
 #[test]
 fn a_full_queue_rejects_the_update_and_delivers_everything_to_the_old_pair() {
     let model = aos_boundary_publication_model();

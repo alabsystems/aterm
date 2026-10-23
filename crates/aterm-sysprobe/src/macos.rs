@@ -527,6 +527,8 @@ struct Cf(CFTypeRef);
 impl Cf {
     /// Adopt a +1 reference; `None` for NULL.
     fn adopt(object: CFTypeRef) -> Option<Self> {
+        // Lazy, never `then_some`: its argument is built before the test, so
+        // a NULL would become a `Cf(NULL)` dropped on the spot, and
         // `CFRelease(NULL)` traps (an absent registry property is NULL).
         (!object.is_null()).then(|| Self(object))
     }

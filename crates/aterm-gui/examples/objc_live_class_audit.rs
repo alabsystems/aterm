@@ -1,23 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live Objective-C runtime class auditor for `aterm-window`'s macOS classes.
-//!
-//! Queries [`aterm_objc::class_methods`] on live `WinitWindowDelegate`, `WinitView`,
-//! `WinitApplicationDelegate`, `WinitWindow`, and `NSApplication` instances, verifying method
-//! encodings and protocol conformance against runtime protocol tables and superclass chains.
+//! Live Objective-C runtime class auditor for `aterm-window`'s macOS classes ([`aterm_objc::class_methods`]).
 
 /// Every row agreed with the runtime's own authority.
 #[cfg(target_os = "macos")]
 const PASS: i32 = 0;
-/// At least one finding. See the transcript.
+/// At least one finding.
 #[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
-/// The audit could not execute here. Not a pass.
+/// The audit could not execute here.
 const NOT_RUN: i32 = 2;
-/// Every row agreed, and at least one was checked against this fork's own
-/// declaration because this host's AppKit does not register its protocol
-/// ([`HostLacks`]).
+/// Every row agreed ([`HostLacks`]).
 #[cfg(target_os = "macos")]
 const FORK_DECLARED: i32 = 3;
 
@@ -74,8 +68,7 @@ mod macos {
         rows: Rows,
     }
 
-    /// Whose method table a [`Target`] is reading. For a class the fork declares,
-    /// all of it.
+    /// Whose method table a [`Target`] is reading.
     #[derive(Clone, Copy)]
     enum Rows {
         /// A class the fork declares.
@@ -84,8 +77,7 @@ mod macos {
         Patched(&'static [&'static str]),
     }
 
-    /// `window_delegate.rs`'s class. 21 declared rows plus `-dealloc`, all resolved
-    /// by the runtime.
+    /// `window_delegate.rs`'s class.
     const DELEGATE: Target = Target {
         class_name: "WinitWindowDelegate",
         claimed: &[c"NSObject", c"NSWindowDelegate", c"NSDraggingDestination"],
@@ -97,8 +89,7 @@ mod macos {
         rows: Rows::Declared,
     };
 
-    /// `view.rs`'s class. 39 declared rows plus `-dealloc`. It claims only
-    /// `NSTextInputClient`, as the objc2 class did.
+    /// `view.rs`'s class.
     const VIEW: Target = Target {
         class_name: "WinitView",
         claimed: &[c"NSTextInputClient"],
@@ -110,11 +101,7 @@ mod macos {
         rows: Rows::Declared,
     };
 
-    /// `app_state.rs`'s class: the `NSApplicationDelegate` on `NSApp`. Three
-    /// declared rows plus `-dealloc`, all `@optional`, so reading the registered
-    /// table matters most here: AppKit reaches an `@optional` row only after
-    /// `-respondsToSelector:`, so one that never registered fails silently (no
-    /// activation policy, no clean termination) and no send would notice.
+    /// `app_state.rs`'s class.
     const APP_DELEGATE_HOST_LACKS: &[HostLacks] = &[
         HostLacks {
             sel: "applicationDidFinishLaunching:",
@@ -157,8 +144,7 @@ mod macos {
         rows: Rows::Declared,
     };
 
-    /// `window.rs`'s class: the `NSWindow` every winit window is. Two declared rows
-    /// plus `-dealloc`, no ivars and no protocols, so `claimed` is empty.
+    /// `window.rs`'s class.
     const WINDOW: Target = Target {
         class_name: "WinitWindow",
         claimed: &[],
@@ -182,10 +168,7 @@ mod macos {
         rows: Rows::Patched(&["sendEvent:"]),
     };
 
-    /// One informal protocol. AppKit declares `NSStandardKeyBindingResponding` so
-    /// the signatures exist, and dispatches `insertTab:`/`cancelOperation:` by
-    /// `-respondsToSelector:`; nothing on `WinitView`'s chain conforms to it (of the
-    /// 26,318 classes loaded with AppKit only `NSTextView` claims it).
+    /// One informal protocol.
     const VIEW_INFORMAL: &[(&str, &str)] = &[(
         "NSStandardKeyBindingResponding",
         "informal ON THIS CHAIN: neither WinitView nor NSView nor NSResponder \
@@ -197,8 +180,7 @@ mod macos {
          superclass chain and not a statement about the runtime",
     )];
 
-    /// A row nothing in the runtime declares, and the shape part D holds it to
-    /// anyway.
+    /// A row nothing in the runtime declares, and the shape part D holds it to anyway.
     struct Unchecked {
         /// The selector, as the fork's `@sel(…)` spells it.
         sel: &'static str,
@@ -210,9 +192,7 @@ mod macos {
         expected: fn() -> String,
     }
 
-    /// A row whose authority is a protocol this host may not register, with the
-    /// fork's declared shape written down so the row is still checked where the
-    /// protocol is absent, and held to the protocol where it is present.
+    /// A row whose authority is a protocol this host may not register.
     struct HostLacks {
         /// The selector, as the fork's `@sel(…)` spells it.
         sel: &'static str,
@@ -226,8 +206,7 @@ mod macos {
         why: &'static str,
     }
 
-    /// A row nothing declares whose shape is derived from siblings that something
-    /// does.
+    /// A row nothing declares whose shape is derived from siblings that something does.
     struct Family {
         /// The row with no declaration of its own.
         sel: &'static str,
@@ -268,12 +247,10 @@ mod macos {
         expected: || aterm_objc::method_encoding!(() ; Id),
     }];
 
-    /// Foundation's `NSNotFound` (`NSIntegerMax`), which `NSTextInputClient`
-    /// documents `markedRange` to answer when there is none.
+    /// Foundation's `NSNotFound`.
     const NS_NOT_FOUND: usize = isize::MAX as usize;
 
-    /// Long enough for macOS to launch its `NSApplication` and hand back a
-    /// window; past it the audit reports NOT RUN rather than passing.
+    /// Long enough for macOS to launch its `NSApplication` and hand back a window.
     const BUDGET: Duration = Duration::from_secs(30);
 
     /// Where one row's encoding came from.
@@ -290,8 +267,7 @@ mod macos {
     }
 
     impl Source {
-        /// `sel` is the row this source was found for: [`Self::Class`] prints the
-        /// class it asked and, when they differ, the class that defines the method.
+        /// Formats the class or protocol authority for `sel`.
         fn label(self, sel: Sel) -> String {
             match self {
                 Self::Protocol(p) => format!("proto {}", p.to_string_lossy()),
@@ -323,9 +299,7 @@ mod macos {
         None
     }
 
-    /// Intern a selector whose name is known only as a `&str`. `sel_uncached`
-    /// takes a `&'static CStr`, so each name leaks one small allocation, in a
-    /// process that audits one window and exits.
+    /// Intern a selector whose name is known only as a `&str`.
     fn sel_named(name: &str) -> Sel {
         let owned: &'static CStr = Box::leak(
             std::ffi::CString::new(name)
@@ -335,9 +309,7 @@ mod macos {
         aterm_objc::sel_uncached(owned)
     }
 
-    /// Intern a class or protocol name known only as a `&str` (the derived
-    /// authority list's names come out of the runtime), leaking it as
-    /// [`sel_named`] does.
+    /// Intern a class or protocol name known only as a `&str` ([`sel_named`]).
     fn cstr_named(name: &str) -> &'static CStr {
         Box::leak(
             std::ffi::CString::new(name)
@@ -346,8 +318,7 @@ mod macos {
         )
     }
 
-    /// Every protocol reachable from `seed` through protocol inheritance, in seed
-    /// order without duplicates.
+    /// Every protocol reachable from `seed` through protocol inheritance.
     fn expand_protocols(into: &mut Vec<String>, seed: impl IntoIterator<Item = String>) {
         for name in seed {
             let mut stack = vec![name];
@@ -390,18 +361,13 @@ mod macos {
         names.iter().map(|n| cstr_named(n)).collect()
     }
 
-    /// Whether a [`HostLacks`] entry is the authority for its row on this host:
-    /// the target still claims the protocol (else dropping the name from the fork's
-    /// `protocols:` list would pass), and the object under that name is this
-    /// process's own stand-in, not the framework's (a nil check on
-    /// `objc_getProtocol` would read a stand-in as AppKit).
+    /// Whether a [`HostLacks`] entry is the authority for its row on this host.
     fn host_lacks_is_active(target: &Target, pin: &HostLacks) -> bool {
         target.claimed.contains(&pin.protocol)
             && aterm_objc::protocols_registered_by_aterm().contains(&pin.protocol)
     }
 
-    /// Every protocol loaded in this process that declares `sel`, with its
-    /// encoding: what turns "nothing declares it" into a measurement.
+    /// Every protocol loaded in this process that declares `sel`, with its encoding.
     fn protocols_declaring(sel: Sel) -> Vec<(String, String)> {
         let mut found = Vec::new();
         for (name, proto) in loaded_protocols() {
@@ -418,8 +384,7 @@ mod macos {
         loaded_protocols().len()
     }
 
-    /// The runtime's whole protocol table (declared here, as for
-    /// [`protocol_parents`]).
+    /// The runtime's whole protocol table (declared here, as for [`protocol_parents`]).
     fn loaded_protocols() -> Vec<(String, aterm_objc::ProtocolPtr)> {
         unsafe extern "C" {
             fn objc_copyProtocolList(count: *mut std::ffi::c_uint) -> *mut aterm_objc::ProtocolPtr;
@@ -445,9 +410,7 @@ mod macos {
         out
     }
 
-    /// The protocols a protocol itself inherits. `aterm-objc` grows only for the
-    /// port, and no shipping call site needs `protocol_copyProtocolList`, so it is
-    /// declared here.
+    /// The protocols a protocol itself inherits.
     fn protocol_parents(proto: aterm_objc::ProtocolPtr) -> Vec<String> {
         unsafe extern "C" {
             fn protocol_copyProtocolList(
@@ -477,11 +440,9 @@ mod macos {
         names
     }
 
-    /// Which loaded image a code address belongs to, per the dynamic loader: the
-    /// one answer to "is this function ours or AppKit's?".
+    /// Which loaded image a code address belongs to, per the dynamic loader.
     fn image_of(imp: *const std::ffi::c_void) -> Option<String> {
-        /// `<dlfcn.h>`'s `Dl_info`: four pointer-sized fields, the first the image
-        /// path.
+        /// `<dlfcn.h>`'s `Dl_info`.
         #[repr(C)]
         struct DlInfo {
             dli_fname: *const std::ffi::c_char,
@@ -514,9 +475,7 @@ mod macos {
         types.map(|t| strip_method_offsets(&t))
     }
 
-    /// Split a method type encoding into its return type and its arguments,
-    /// balancing braces (`{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}`
-    /// is four types).
+    /// Split a method type encoding into its return type and its arguments.
     fn split_encoding(enc: &str) -> Option<(String, Vec<String>)> {
         let mut rest = enc;
         let ret = next_type(&mut rest)?;
@@ -548,7 +507,6 @@ mod macos {
                 let mut depth = 0_usize;
                 loop {
                     if i >= b.len() {
-                        // An unbalanced opener: the string is not an encoding.
                         return None;
                     }
                     if b[i] == open {
@@ -576,8 +534,7 @@ mod macos {
         Some(token.to_owned())
     }
 
-    /// The rectangle part E's rect rows return: four distinct non-zero doubles, so
-    /// neither a misread frame nor a zeroed one can produce it.
+    /// The rectangle part E's rect rows return.
     const PROBE_RECT: aterm_objc::CGRect = aterm_objc::CGRect {
         origin: aterm_objc::CGPoint { x: 704.0, y: 839.0 },
         size: aterm_objc::CGSize {
@@ -591,13 +548,10 @@ mod macos {
         PROBE_RECT
     }
 
-    /// The lying encoding: a 32-byte struct of four `long long`s, the size of an
-    /// `NSRect` but not an HFA, so arm64 returns it through `x8` while the IMP
-    /// answers in `d0`-`d3`.
+    /// The lying encoding.
     const PROBE_LIE: &str = "{_ATermAuditLie=qqqq}@:";
 
-    /// The register-class probe: a `CGPoint`, which both ABIs return in float
-    /// registers (`xmm0`/`xmm1`, `d0`/`d1`), never through a hidden pointer.
+    /// The register-class probe.
     const PROBE_POINT: aterm_objc::CGPoint = aterm_objc::CGPoint { x: 12.5, y: -3.25 };
 
     /// The IMP behind part E's point rows, returning [`PROBE_POINT`] in registers.
@@ -605,12 +559,10 @@ mod macos {
         PROBE_POINT
     }
 
-    /// The register-class lie: a 16-byte struct of two `long long`s, the size of a
-    /// `CGPoint` but integer class (`rax`:`rdx`, `x0`:`x1`) while the IMP answers in
-    /// float registers.
+    /// The register-class lie.
     const PROBE_LIE_POINT: &str = "{_ATermAuditLie=qq}@:";
 
-    /// The audit's state: the findings it exits on and the host-limited rows.
+    /// The audit's state.
     #[derive(Default)]
     struct Audit {
         findings: Vec<String>,
@@ -628,9 +580,7 @@ mod macos {
             self.findings.push(what);
         }
 
-        /// Find `sel`'s authority by asking the runtime: protocols first, then the
-        /// superclass chain, then the [`Target::families`] derivation, whose
-        /// siblings must still be declared and agree.
+        /// Find `sel`'s authority by asking the runtime ([`Target::families`]).
         fn authority_of(
             &mut self,
             target: &Target,
@@ -900,8 +850,7 @@ mod macos {
             (used, registered_rows)
         }
 
-        /// Part B: the conformance claim, derived and declared, asked of the
-        /// instance.
+        /// Part B: the conformance claim, derived and declared, asked of the instance.
         fn protocols(
             &mut self,
             target: &Target,
@@ -996,8 +945,7 @@ mod macos {
             }
         }
 
-        /// Part C for the window delegate: a live send through the `BOOL` return
-        /// shape.
+        /// Part C for the window delegate.
         fn delegate_live_sends(
             &mut self,
             delegate: Id,
@@ -1028,9 +976,7 @@ mod macos {
             }
         }
 
-        /// Part C for the application delegate: one live send through
-        /// `applicationShouldTerminate:`, the one row whose return is not `void`,
-        /// registered `Q@:@` (an eight-byte `NSApplicationTerminateReply`).
+        /// Part C for the application delegate.
         fn app_delegate_live_sends(
             &mut self,
             app_delegate: Id,
@@ -1063,7 +1009,7 @@ mod macos {
             }
         }
 
-        /// Part C for the view: the struct shapes `view.rs` registers, sent for real.
+        /// Part C for the view.
         fn view_live_sends(&mut self, view: Id, registered: &BTreeMap<String, String>) {
             println!("\n=== C. LIVE SENDS THROUGH THE REGISTERED IMPS (WinitView) ===");
             let mut absent = false;
@@ -1163,7 +1109,7 @@ mod macos {
                 ));
                 return;
             };
-            // SAFETY: `-methodReturnLength` and `-numberOfArguments` are `-(NSUInteger)` on a live.
+            // SAFETY: `-methodReturnLength`.
             let (ret_len, argc, foundation_ret) = unsafe {
                 let n: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
                 let t: unsafe extern "C-unwind" fn(Id, Sel) -> *const std::ffi::c_char =
@@ -1220,7 +1166,7 @@ mod macos {
             );
         }
 
-        /// Part D: the rows the runtime declares nowhere ([`Unchecked`]). Per row:
+        /// Part D: the rows the runtime declares nowhere ([`Unchecked`]).
         fn unchecked_rows(
             &mut self,
             target: &Target,
@@ -1256,8 +1202,7 @@ mod macos {
             }
         }
 
-        /// Foundation's parse of one row's registered string, compared against that
-        /// string.
+        /// Foundation's parse of one row's registered string, compared against that string.
         fn foundation_reads_our_string(&mut self, instance: Id, name: &str, registered: &str) {
             let sel = sel_named(name);
             // SAFETY: `instance` is live and `-methodSignatureForSelector:` is `-(id)(SEL)`.
@@ -1323,8 +1268,7 @@ mod macos {
             }
         }
 
-        /// Part E: the instrument's own teeth, drawn on control classes this
-        /// function builds before they are trusted on the fork.
+        /// Part E: the instrument's own teeth.
         fn teeth_are_live(&mut self) {
             println!("\n########## E. THE INSTRUMENT'S OWN TEETH ##########");
             let honest = format!("{}@:", <aterm_objc::CGRect as aterm_objc::Encode>::ENCODING);
@@ -1513,8 +1457,7 @@ mod macos {
             }
         }
 
-        /// [`Self::probe_row`] over a `CGPoint`, whose honest and lying encodings
-        /// differ in register class rather than indirection.
+        /// [`Self::probe_row`] over a `CGPoint`.
         fn probe_point_row(
             &mut self,
             obj: Id,
@@ -1600,8 +1543,7 @@ mod macos {
             true
         }
 
-        /// One probe row, sent directly and through `NSInvocation`. An honest row
-        /// must round-trip and a lying one must not; answers whether it behaved so.
+        /// One probe row, sent directly and through `NSInvocation`.
         fn probe_row(&mut self, obj: Id, sel: Sel, encoding: &str, expect_agreement: bool) -> bool {
             let name = sel.name().to_string_lossy().into_owned();
             // SAFETY: `probe_rect` really is `(id, SEL) -> CGRect`, correct.
@@ -1682,8 +1624,7 @@ mod macos {
             true
         }
 
-        /// The class whose registered table describes `instance`, plus the isa's
-        /// name when the two differ (see the call site).
+        /// The class whose registered table describes `instance`.
         fn audited_class(&mut self, instance: Id) -> (aterm_objc::ClassPtr, Option<String>) {
             // SAFETY: `instance` is a live object.
             let (reported, isa) = unsafe {
@@ -1692,7 +1633,6 @@ mod macos {
                 (send(instance, sel!(class)), class_of(instance))
             };
             if reported.is_null() {
-                // Nothing can be audited from a nil class; the caller's name
                 return (isa, None);
             }
             if reported == isa {
@@ -1725,9 +1665,7 @@ mod macos {
             (reported, Some(isa_name))
         }
 
-        /// Parts A, B and F for one target, given a live instance of it. Answers
-        /// the registered rows, or `None` if the instance is not of the target's
-        /// class (a finding).
+        /// Parts A, B and F for one target, given a live instance of it.
         fn table_and_conformance(
             &mut self,
             target: &Target,
@@ -1769,8 +1707,7 @@ mod macos {
             Some(registered)
         }
 
-        /// Part F: the written [`HostLacks`] shapes, held to the runtime wherever it
-        /// has the protocol (the release-cutting host does).
+        /// Part F: the written [`HostLacks`] shapes.
         fn host_lacks_pins(&mut self, target: &Target, registered: &BTreeMap<String, String>) {
             if target.host_lacks.is_empty() {
                 return;

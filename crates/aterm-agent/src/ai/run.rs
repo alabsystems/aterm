@@ -84,7 +84,6 @@ impl Drop for RunDir {
     }
 }
 
-/// Removes every run directory whose process is gone.
 fn sweep(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;

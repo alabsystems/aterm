@@ -339,6 +339,7 @@ fn find_non_printable_simd(input: &[u8]) -> Option<usize> {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        // AVX2 only pays off once a full 32-byte chunk exists; shorter inputs
         // go straight to the inlined SSE2 path with no detection branch.
         if input.len() >= 32 && x86_simd::has_avx2() {
             // SAFETY: AVX2 availability was just checked.

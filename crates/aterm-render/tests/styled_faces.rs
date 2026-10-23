@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Per-style fonts and the config fallback chain, checked on the shipping
-// code: `resolve_styled_face` over its whole 2^6 input space, and rendered ink
-// for the styled-run routing and the config-headed fallback chains.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{FaceId, FacePick, Renderer, StyleBits, Theme, resolve_styled_face};
@@ -20,10 +16,6 @@ fn dejavu_path() -> String {
 
 const BOLD_ITALIC: StyleBits = StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0);
 
-/// The styled-face policy is total and well-formed over its whole 2^6 input
-/// space: every pick is in range and available, the synthetic residual never
-/// re-synthesizes a bit the face supplies nor adds one the cell did not ask
-/// for, and REGULAR is always Primary.
 #[test]
 fn resolve_styled_face_is_total_and_wellformed() {
     let styles = [
@@ -37,7 +29,6 @@ fn resolve_styled_face_is_total_and_wellformed() {
         for mask in 0u8..16 {
             let injected = mask & 8 != 0;
             let covers = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
-            // Totality: no input panics.
             let pick = resolve_styled_face(style, injected, covers);
             match pick {
                 FacePick::Primary => seen_primary = true,
@@ -63,7 +54,6 @@ fn resolve_styled_face_is_total_and_wellformed() {
                     assert!(slot < 3, "slot in range");
                     assert!(covers[slot], "a picked slot must be available");
                     assert_eq!(synthetic.0 & !style.0, 0, "synthetic ⊆ requested style");
-                    // The face's own bits are never also synthesized.
                     match slot {
                         0 => assert!(!synthetic.contains(StyleBits::BOLD)),
                         1 => assert!(!synthetic.contains(StyleBits::ITALIC)),
@@ -78,10 +68,6 @@ fn resolve_styled_face_is_total_and_wellformed() {
                     "an unstyled cell never routes to a styled face"
                 );
             }
-            // Real bold is never dilated: when a face can serve the request's
-            // real boldness (the injection or slot 0; slot 2 only for
-            // bold-italic, so a plain bold cell is never slanted), the
-            // resolution never synthesizes bold.
             let bold_capable =
                 injected || covers[0] || (style.contains(StyleBits::ITALIC) && covers[2]);
             if style.contains(StyleBits::BOLD) && bold_capable {
@@ -99,16 +85,11 @@ fn resolve_styled_face_is_total_and_wellformed() {
             }
         }
     }
-    // Non-vacuity: every variant is reachable.
     assert!(seen_primary && seen_injected && seen_styled);
 }
 
-/// Precedence pins (the `resolve_styled_face` doc order): a real bold-italic
-/// face beats the injected bold for BOLD|ITALIC; the injected bold beats the
-/// discovered bold sibling for plain BOLD.
 #[test]
 fn resolve_styled_face_precedence_pins() {
-    // Exact bold-italic face wins over injected-bold + synthetic shear.
     assert_eq!(
         resolve_styled_face(BOLD_ITALIC, true, [true, true, true]),
         FacePick::Styled {
@@ -116,21 +97,18 @@ fn resolve_styled_face_precedence_pins() {
             synthetic: StyleBits::REGULAR
         }
     );
-    // No exact face: the explicit injection wins, shear synthesized.
     assert_eq!(
         resolve_styled_face(BOLD_ITALIC, true, [true, true, false]),
         FacePick::InjectedBold {
             synthetic: StyleBits::ITALIC
         }
     );
-    // Plain bold: injection outranks the discovered sibling.
     assert_eq!(
         resolve_styled_face(StyleBits::BOLD, true, [true, false, false]),
         FacePick::InjectedBold {
             synthetic: StyleBits::REGULAR
         }
     );
-    // Partial fallbacks for bold-italic without an exact face or injection.
     assert_eq!(
         resolve_styled_face(BOLD_ITALIC, false, [true, false, false]),
         FacePick::Styled {
@@ -164,17 +142,12 @@ fn fixture_renderer(bytes: &[u8]) -> Renderer {
     r
 }
 
-/// A bold `=>` ligature run draws from the real bold face when one is
-/// installed, not the regular glyph dilated by synthetic embolden. The "bold"
-/// face is the same JetBrains Mono file, so bold ink equals regular ink only
-/// when the run is shaped and rasterized from that face with no synthesis.
 #[test]
 fn bold_ligature_run_draws_from_real_styled_face() {
     let bytes = ligature_test_font();
     let text_reg: &[u8] = b"a => b";
     let text_bold: &[u8] = b"\x1b[1ma => b";
 
-    // Negative control: with no real bold face, bold dilates and differs.
     let mut plain = fixture_renderer(&bytes);
     let reg = render_row(&mut plain, text_reg);
     let bold_synth = render_row(&mut plain, text_bold);
@@ -183,7 +156,6 @@ fn bold_ligature_run_draws_from_real_styled_face() {
         "without a real bold face, bold must be synthesized (differs from regular)"
     );
 
-    // A real styled slot 0: bold run and cells rasterize from it, identical ink.
     let mut styled = fixture_renderer(&bytes);
     styled
         .set_styled_font_bytes(0, &bytes)
@@ -195,8 +167,6 @@ fn bold_ligature_run_draws_from_real_styled_face() {
          not the dilated regular"
     );
 
-    // Injected bold (`set_bold_font`, config `font_family_bold`): the same law
-    // through `FacePick::InjectedBold`.
     let mut injected = fixture_renderer(&bytes);
     injected.set_bold_font(&bytes).expect("bold face installs");
     let bold_injected = render_row(&mut injected, text_bold);
@@ -206,8 +176,6 @@ fn bold_ligature_run_draws_from_real_styled_face() {
     );
 }
 
-/// `font_synthetic_style = false`: with no real styled face, a bold cell
-/// renders with the regular face, and re-enabling restores synthesis.
 #[test]
 fn synthetic_styles_off_renders_regular() {
     let bytes = ligature_test_font();
@@ -215,13 +183,11 @@ fn synthetic_styles_off_renders_regular() {
     let text_bold: &[u8] = b"\x1b[1mabc";
     let mut r = fixture_renderer(&bytes);
     let reg = render_row(&mut r, text_reg);
-    // Control: with synthesis on (the default) bold differs from regular.
     let bold_on = render_row(&mut r, text_bold);
     assert_ne!(
         reg.pixels, bold_on.pixels,
         "default synthesis must show bold"
     );
-    // Flag off: bold renders as the regular face.
     assert!(r.set_synthetic_styles(false), "flip reports a change");
     assert!(!r.synthetic_styles());
     let bold_off = render_row(&mut r, text_bold);
@@ -229,24 +195,17 @@ fn synthetic_styles_off_renders_regular() {
         reg.pixels, bold_off.pixels,
         "font_synthetic_style = false must render styled cells with the regular face"
     );
-    // Same-value set is a no-op; re-enabling restores synthesis.
     assert!(!r.set_synthetic_styles(false), "same value is a no-op");
     assert!(r.set_synthetic_styles(true));
     let bold_again = render_row(&mut r, text_bold);
     assert_eq!(bold_on.pixels, bold_again.pixels, "the flag round-trips");
 }
 
-/// A config `fallback_fonts` path heads the candidate list (config, then the
-/// built-ins), loads on the first primary miss, and an unchanged reload is a
-/// no-op.
 #[test]
 fn config_fallback_fonts_head_the_chain_and_load() {
     let jb = ligature_test_font();
     let dv_path = dejavu_path();
     let dv = std::fs::read(&dv_path).expect("committed DejaVu asset");
-    // A probe char JetBrains Mono lacks and DejaVu covers, outside the
-    // procedural ranges, so the fallback chain is consulted. Scanned, so a
-    // fixture swap cannot silently vacate the test.
     let jb_font = aterm_render::font::Font::from_bytes(
         jb.as_slice(),
         aterm_render::font::FontSettings::default(),
@@ -279,10 +238,7 @@ fn config_fallback_fonts_head_the_chain_and_load() {
         !r.set_config_fallback_fonts(std::slice::from_ref(&dv_path)),
         "an unchanged reload is a free no-op (no cache churn)"
     );
-    // The config chain parses off-thread on native; block on it so the probe
-    // sees the landed chain, not a provisional miss.
     r.debug_block_on_lazy_fallbacks();
-    // The probe char resolves through the config-installed fallback face.
     let key = r.glyph_key(probe);
     assert_eq!(
         key.source,
@@ -290,7 +246,6 @@ fn config_fallback_fonts_head_the_chain_and_load() {
         "U+{:04X} must resolve via the config fallback chain",
         probe as u32
     );
-    // Clearing the config restores (and reports) the built-in chain.
     assert!(r.set_config_fallback_fonts(&[]));
     assert_ne!(
         r.debug_fallback_candidate_paths()
@@ -301,9 +256,6 @@ fn config_fallback_fonts_head_the_chain_and_load() {
     );
 }
 
-/// The symbol and emoji config setters: the explicit path heads each candidate
-/// list, and the no-op guard holds. Marker paths (never read) keep this
-/// order-only test free of font I/O.
 #[test]
 fn config_symbol_and_emoji_fonts_head_their_chains() {
     let jb = ligature_test_font();

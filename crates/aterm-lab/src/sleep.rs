@@ -315,6 +315,7 @@ fn sleep(run: &Run, a: &Asked, ops: &mut impl Ops) -> Result<Slept, Fail> {
         Err("the pid is no longer confirmed as this lab's".to_string())
     };
     if let Err(e) = continued {
+        // Ended in the hold (a crash a driver made: `crash --keep-tree`, whose next
         // instance starts at the stepped offset): nothing is left to continue.
         if !ops.alive(pid) {
             return Err(Fail::die(format!(

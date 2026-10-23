@@ -20,11 +20,11 @@ pub(crate) enum PackagesBusy {
 
 impl PackagesBusy {
     /// Whether the verb's atpkg may apply the `[machine]` settings.
-    pub(crate) fn applies_machine_settings(self) -> bool {
+    pub(crate) const fn applies_machine_settings(self) -> bool {
         matches!(self, Self::Check | Self::Install | Self::MachineApply)
     }
 
-    fn completed_headline(self) -> &'static str {
+    const fn completed_headline(self) -> &'static str {
         match self {
             Self::Check => "Package check completed",
             Self::Install => "ALab tools install completed",
@@ -33,7 +33,7 @@ impl PackagesBusy {
         }
     }
 
-    fn failed_headline(self) -> &'static str {
+    const fn failed_headline(self) -> &'static str {
         match self {
             Self::Check => "Package check failed",
             Self::Install => "ALab tools install failed",
@@ -56,7 +56,7 @@ pub(crate) enum PackagesCommandOutcome {
 }
 
 impl PackagesCommandOutcome {
-    fn operation(&self) -> PackagesBusy {
+    const fn operation(&self) -> PackagesBusy {
         match self {
             Self::Succeeded { operation } | Self::Failed { operation, .. } => *operation,
         }
@@ -91,7 +91,7 @@ pub(crate) struct PackagesWorkerCompletion {
 }
 
 impl PackagesWorkerCompletion {
-    pub(crate) fn refresh(report: PackagesStatusReport) -> Self {
+    pub(crate) const fn refresh(report: PackagesStatusReport) -> Self {
         Self {
             report,
             command: None,
@@ -107,7 +107,7 @@ impl PackagesWorkerCompletion {
     }
 
     /// Attach the machine-apply record (see `machine_state`).
-    pub(crate) fn with_machine_state(
+    pub(crate) const fn with_machine_state(
         mut self,
         state: Option<atpkg::machine::MachineState>,
     ) -> Self {
@@ -115,7 +115,10 @@ impl PackagesWorkerCompletion {
         self
     }
 
-    pub(crate) fn command(report: PackagesStatusReport, command: PackagesCommandOutcome) -> Self {
+    pub(crate) const fn command(
+        report: PackagesStatusReport,
+        command: PackagesCommandOutcome,
+    ) -> Self {
         Self {
             machine_verdict: None,
             machine_state: None,
@@ -412,7 +415,7 @@ impl LocalClock {
         }
     }
 
-    pub(crate) fn known(self) -> bool {
+    pub(crate) const fn known(self) -> bool {
         self.offset_s.is_some()
     }
 }
@@ -738,7 +741,7 @@ const ADVANCE_UNIT: usize = 20;
 /// An approximate advance for `c` in a proportional UI face, in twentieths of an average
 /// lowercase glyph: capitals, `_`, `—` and `@#%&` 1.2, `m`/`w` 1.5, the narrow glyphs and
 /// most punctuation 0.65, a wide char 2, the rest 1.
-fn glyph_advance(c: char) -> usize {
+const fn glyph_advance(c: char) -> usize {
     match c {
         'A'..='Z' | '_' | '\u{2014}' | '\u{2013}' | '@' | '#' | '%' | '&' => 24,
         'm' | 'w' => 30,
@@ -916,7 +919,7 @@ pub(crate) enum PassTroubleKind {
 
 impl PassTroubleKind {
     /// The badge's item for it ([`attention_items`]).
-    fn item(self) -> &'static str {
+    const fn item(self) -> &'static str {
         match self {
             Self::Failed => "the last package check failed",
             Self::StoodDown => "the package check didn\u{2019}t run",
@@ -1000,7 +1003,7 @@ pub(crate) struct PackagesStatusReport {
 impl PackagesStatusReport {
     /// The zero state before any worker observation: nothing is claimed available or
     /// enabled until a collection pass has looked.
-    fn unobserved() -> Self {
+    const fn unobserved() -> Self {
         Self {
             activity: Vec::new(),
             log_path: None,
@@ -1382,11 +1385,11 @@ impl PackagesService {
         true
     }
 
-    pub(crate) fn revision(&self) -> u64 {
+    pub(crate) const fn revision(&self) -> u64 {
         self.revision
     }
 
-    pub(crate) fn busy(&self) -> Option<PackagesBusy> {
+    pub(crate) const fn busy(&self) -> Option<PackagesBusy> {
         self.busy
     }
 
@@ -1407,7 +1410,7 @@ impl PackagesService {
     }
 
     /// Ask for a machine read.
-    pub(crate) fn request_machine_read(&mut self) -> bool {
+    pub(crate) const fn request_machine_read(&mut self) -> bool {
         if self.machine.refreshing {
             self.machine.rerun = true;
             return false;
@@ -1446,6 +1449,7 @@ impl PackagesService {
             }
             Err(error) => {
                 // Keep the last good record beside the error: a transient read
+                // failure must not erase what was measured a moment ago.
                 self.machine.read_error = Some(error);
             }
         }
@@ -1460,7 +1464,7 @@ impl PackagesService {
     }
 
     /// A pass printed a change; its own `machine-state:` record follows on the same stream.
-    pub(crate) fn expect_machine_record(&mut self) {
+    pub(crate) const fn expect_machine_record(&mut self) {
         if self.machine.awaiting_record {
             return;
         }
@@ -1484,7 +1488,7 @@ impl PackagesService {
 
     /// The pass's stream ended (or its record did not parse) while a record was still expected.
     #[must_use = "an open expectation must be answered by a spawned read"]
-    pub(crate) fn take_record_expectation(&mut self) -> bool {
+    pub(crate) const fn take_record_expectation(&mut self) -> bool {
         if !self.machine.awaiting_record {
             return false;
         }
@@ -1647,6 +1651,7 @@ impl PackagesService {
         }
         if let Some(state) = completion.machine_state {
             // The apply's own record is the newest measurement, like a streamed pass's: it
+            // closes the expectation its change line opened.
             self.note_machine_record(state);
         }
         if let Some(verdict) = completion.machine_verdict {
@@ -1664,7 +1669,7 @@ impl PackagesService {
     }
 
     /// Release a reservation whose worker never started (thread-spawn failure).
-    pub(crate) fn abort(&mut self, sequence: u64) -> bool {
+    pub(crate) const fn abort(&mut self, sequence: u64) -> bool {
         if !self.inflight || sequence != self.sequence {
             return false;
         }
@@ -1772,7 +1777,7 @@ pub(crate) struct PackagesState {
 
 impl PackagesState {
     /// Attach the host's saved `[machine]` switch (the config is host-owned; the service holds only worker facts).
-    pub(crate) fn with_machine_config(
+    pub(crate) const fn with_machine_config(
         mut self,
         universal_control: atpkg::config::UniversalControlPolicy,
     ) -> Self {
@@ -1781,7 +1786,7 @@ impl PackagesState {
     }
 
     /// Attach the host's saved `[machine] rosetta` switch (`Config::machine_rosetta`).
-    pub(crate) fn with_machine_rosetta(mut self, rosetta: bool) -> Self {
+    pub(crate) const fn with_machine_rosetta(mut self, rosetta: bool) -> Self {
         self.saved_rosetta = rosetta;
         self
     }
@@ -1862,6 +1867,7 @@ impl PackagesState {
             "Some package details couldn\u{2019}t be read".to_string()
         } else if report.declined {
             // Removed on purpose (`aterm pkg uninstall --all`, Remove ALab Tools): what is
+            // left in the record is stale, and "up to date" would be about nothing.
             "ALab tools aren\u{2019}t installed".to_string()
         } else if report.recorded
             && report
@@ -1870,6 +1876,7 @@ impl PackagesState {
                 .any(|row| row.update.behind(&row.kind))
         {
             // Never "up to date" over a row that names a newer build (the row itself
+            // stops saying so too, [`ProgramUpdate::words`]).
             "Updates are available".to_string()
         } else if report.recorded {
             "ALab tools are up to date".to_string()
@@ -1920,6 +1927,8 @@ impl PackagesState {
             None
         } else if let Some(busy) = self.busy {
             // While the verb runs the card says where its progress is, never "Click Check &
+            // Update Now" under a disabled button. The machine apply (a local edit well
+            // under a second) has no band row: its headline says it all.
             (busy != PackagesBusy::MachineApply).then(|| BUSY_DETAIL.to_string())
         } else if let Some(PackagesCommandOutcome::Succeeded { operation }) =
             self.last_command.as_ref().filter(|c| {
@@ -1970,6 +1979,7 @@ impl PackagesState {
             Some(PACKAGE_TOOL_MISSING_DETAIL.to_string())
         } else if !report.manager_enabled {
             // An inert manager's one cause is an unpinned build; `aterm pkg doctor` names
+            // the key.
             Some("This build can\u{2019}t install packages.".to_string())
         } else if report.recorded {
             recorded_detail(false).map(|recorded| crate::update_words::capitalize_first(&recorded))

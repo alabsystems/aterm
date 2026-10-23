@@ -18,7 +18,7 @@ pub const FRAME_FORMAT: u8 = Format::Two as u8;
 pub(crate) enum Format {
     /// T3's: each frame's sum is its xxh64 alone, so it names no place.
     One = 1,
-    /// Each frame's sum also names its place ([module docs](self)).
+    /// Each frame's sum also names its place.
     Two = 2,
 }
 
@@ -179,6 +179,8 @@ impl FrameSink for std::fs::File {
     }
 
     fn sync(&mut self) -> std::io::Result<()> {
+        // Ordered: a diagnostic record, read back as a prefix of whole frames with a
+        // torn tail reported (`tape::recover`); the barrier keeps it ahead of the
         // run's later journal and ledger writes, and nothing off this device needs it.
         aterm_durable::ordered(self)
     }
@@ -204,7 +206,7 @@ pub enum Stopped {
     Ended,
 }
 
-/// A tape being written ([module docs](self)).
+/// A tape being written.
 pub struct TapeWriter {
     sink: Box<dyn FrameSink>,
     /// The tape's name in the one warning (its path).

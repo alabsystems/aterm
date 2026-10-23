@@ -368,6 +368,7 @@ pub(crate) fn match_input(
         let this_lig_comp = lig_comp(&this);
         if first_lig_id != 0 && first_lig_comp != 0 {
             // A first glyph attached to an earlier ligature's component: the
+            // rest must attach to the same component...
             if first_lig_id != this_lig_id || first_lig_comp != this_lig_comp {
                 // ...unless the ligature they attach to may be skipped.
                 if ligbase == Ligbase::NotChecked {

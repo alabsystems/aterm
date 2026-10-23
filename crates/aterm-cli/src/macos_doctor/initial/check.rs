@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Explicit read-only observations of the displayed checklist. These never
-//! authorize a run or replace its durable record of work already performed.
+//! Read-only observations of the displayed setup checklist.
 
 use super::{
     Action, InitialSetupObserved, LiveInitial, NativeHost, Path, Plan, Report, Row, Selection,
@@ -106,8 +105,7 @@ impl InitialCheckHost for LiveCheck {
     }
 }
 
-/// Read local vault readiness for an explicit check or before repository access.
-/// This never joins, synchronizes, installs a service or reads another source's files.
+/// Reads local vault readiness for an explicit check or before repository access.
 pub(super) fn current_vault_rows(plan: &Plan) -> Result<Vec<Row>, String> {
     let context = LiveInitial::live().context()?;
     let [user] = context.users.as_slice() else {
@@ -130,8 +128,6 @@ pub(super) fn current_vault_rows(plan: &Plan) -> Result<Vec<Row>, String> {
     )
 }
 
-/// The vault this Mac reads, when it is the one the plan selects: the rule the Secrets
-/// stage's item joins by ([`aterm_machines::init_secrets::selected_vault`]).
 fn selected_vault<'a>(
     plan: &Plan,
     home: &Path,
@@ -140,8 +136,7 @@ fn selected_vault<'a>(
     aterm_machines::init_secrets::selected_vault(&plan.vault_url, home, status.config.as_ref())
 }
 
-/// The vault rows of `status` for `plan`: its membership with the files it wrote, and
-/// whether its subscriber runs.
+/// Builds the vault membership and subscriber rows of `status` for `plan`.
 pub(super) fn vault_rows(
     plan: &Plan,
     home: &Path,
@@ -244,8 +239,7 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
     report
 }
 
-/// Observe only the displayed checklist, without joining a vault, changing
-/// credentials, cloning repositories, or altering setup authorization/progress.
+/// Observes the displayed checklist without mutating vault, repository, or setup state.
 pub fn check_initial_setup(plan: &Plan) -> Result<Report, String> {
     check_initial_setup_observed(plan).result
 }

@@ -4,32 +4,8 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
-
-// A display-free event loop for `--headless` runs on macOS: the twin of
-// `platform_impl/linux/headless.rs`, selected the same way (only by an explicit
-// `EventLoopBuilderExtHeadless::with_headless`, never by probing).
-//
-// WHY. The AppKit loop is built on `+[NSApplication sharedApplication]`, and
-// `-[NSApplication init]` opens the process's WindowServer connection, which
-// makes WindowServer run a synchronous TCC preflight of the binary on its main
-// thread (aterm's AGENTS.md: from a binary in a huge directory that
-// preflight outran WindowServer's watchdog). A process with no window has no
-// reason to be a WindowServer client, so this loop never creates the
-// application object.
-//
-// WHAT. The MAIN thread's CFRunLoop, run in its default mode: one wake source
-// that every proxy signals (`EventLoopProxy::sharing` says why it is shared),
-// `ControlFlow` honoured including `WaitUntil`, and the `NewEvents -> Resumed ->
-// UserEvent -> AboutToWait -> LoopExiting` order of every other backend. The
-// run loop rather than `poll(2)` because the main thread's run loop also drains
-// the main dispatch queue, which `dispatch_sync` callers on other threads wait
-// on. CoreFoundation only.
-//
-// WHAT IT REFUSES. Windows (`window.rs` answers an error), monitors, the system
-// theme, a display handle, hiding the application: each would reach AppKit or
-// CoreGraphics' display services, i.e. open the connection. (Custom cursors
-// were on this list until the macOS carve removed them, winit-core step 5.)
+//! Display-free `CFRunLoop` event loop for `--headless` on macOS (never initializes
+//! `NSApplication` or connects to WindowServer).
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -37,8 +13,6 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-// The run-loop declarations are `aterm_objc::cf`'s (CoreFoundation only, as
-// before), not the `core-foundation` crate's.
 use aterm_objc::cf::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFIndex, CFRelease, CFRunLoopAddSource,
     CFRunLoopGetMain, CFRunLoopRunInMode, CFRunLoopSourceContext, CFRunLoopSourceCreate,
@@ -53,12 +27,10 @@ use crate::event::{Event, StartCause};
 use crate::event_loop::{ActiveEventLoop as RootWindowTarget, ControlFlow};
 use crate::platform::pump_events::PumpStatus;
 
-/// One `ControlFlow::Wait` turn: effectively forever. `CFRunLoopRunInMode` has
-/// no "no deadline" spelling; a handled source (a proxy wake) returns it.
+/// Indefinite wait duration for `CFRunLoopRunInMode` on `ControlFlow::Wait`.
 const WAIT_FOREVER_SECS: f64 = 1.0e10;
 
-/// The control-flow and exit state of a headless loop, held by the macOS
-/// `ActiveEventLoop` in place of the AppKit backend's application delegate.
+/// Control-flow and exit state of a headless macOS event loop.
 #[derive(Debug)]
 pub(super) struct LoopState {
     control_flow: Cell<ControlFlow>,
@@ -91,12 +63,7 @@ impl LoopState {
     }
 }
 
-/// The loop's ONE wake source, in the main run loop's common modes. Every proxy
-/// signals it, so an event always has a source the run loop really holds and a
-/// signal landing between runs is still pending at the next; it also keeps the
-/// mode non-empty (an empty mode returns at once: a spin). Its `info` is a heap
-/// address owned here, which makes it unequal to every other source (see
-/// `EventLoopProxy::sharing`).
+/// Shared wake source registered in the main run loop's common modes.
 struct WakeSource {
     source: CFRunLoopSourceRef,
     _identity: Box<u8>,
@@ -107,9 +74,7 @@ impl WakeSource {
         const extern "C" fn perform(_: *mut c_void) {}
         let identity = Box::new(0u8);
         let info = (&*identity as *const u8).cast_mut().cast::<c_void>();
-        // SAFETY: a version-0 context whose `info` CoreFoundation only compares
-        // and hashes (no callback dereferences it); the +1 from `Create` is
-        // released in `Drop`, after the source is invalidated.
+        // SAFETY: version-0 context whose `info` is only compared/hashed; released in `Drop`.
         unsafe {
             let mut context = CFRunLoopSourceContext {
                 version: 0,
@@ -132,9 +97,7 @@ impl WakeSource {
 
 impl Drop for WakeSource {
     fn drop(&mut self) {
-        // SAFETY: the +1 source from `new`; invalidating removes it from every
-        // mode, so a proxy outliving the loop (whose sends now fail) signals
-        // a source nothing runs.
+        // SAFETY: invalidates and releases the +1 source created in `new`.
         unsafe {
             CFRunLoopSourceInvalidate(self.source);
             CFRelease(self.source as _);
@@ -153,7 +116,6 @@ pub struct EventLoop<T: 'static> {
 
 impl<T: 'static> EventLoop<T> {
     pub(super) fn new() -> Result<Self, EventLoopError> {
-        // The loop runs the MAIN run loop, on the thread that calls `run`.
         let mtm =
             MainThread::new().expect("on macOS, `EventLoop` must be created on the main thread!");
         let (sender, receiver) = wake_queue::channel();
@@ -178,8 +140,7 @@ impl<T: 'static> EventLoop<T> {
     }
 
     pub(super) fn create_proxy(&self) -> EventLoopProxy<T> {
-        // SAFETY: `self.wake.source` is live and in the main run loop for as
-        // long as this loop exists; the proxy holds its own retain on it.
+        // SAFETY: `self.wake.source` is live on the main run loop; the proxy retains it.
         unsafe { EventLoopProxy::sharing(self.sender.clone(), self.wake.source) }
     }
 
@@ -209,7 +170,6 @@ impl<T: 'static> EventLoop<T> {
             self.single_iteration(&mut callback, StartCause::Init);
         }
 
-        // An exit asked on the `Init` turn runs no further turn.
         if !self.state().exiting() {
             self.wait_and_iterate(timeout, &mut callback);
         }
@@ -223,9 +183,6 @@ impl<T: 'static> EventLoop<T> {
         }
     }
 
-    /// Is anything waiting? An event whose sender is still inside its push is
-    /// not seen here, and its wake signal (which follows the push) ends the
-    /// wait instead (`wake_queue.rs`).
     fn has_pending(&self) -> bool {
         self.receiver.has_pending()
     }
@@ -236,7 +193,6 @@ impl<T: 'static> EventLoop<T> {
     {
         let start = Instant::now();
 
-        // Queued work never waits on a deadline: one pass of zero seconds.
         let wait = if self.has_pending() {
             Some(Duration::ZERO)
         } else {
@@ -252,16 +208,11 @@ impl<T: 'static> EventLoop<T> {
         };
 
         let seconds = wait.map_or(WAIT_FOREVER_SECS, |d| d.as_secs_f64());
-        // SAFETY: the main thread (`new` asserted it; `EventLoop` is `!Send`), so
-        // this runs the MAIN run loop's default mode, which holds `self.wake`.
-        // `returnAfterSourceHandled`: a proxy wake or a main-queue block ends
-        // the wait, as does the deadline.
+        // SAFETY: runs the main run loop's default mode on the main thread.
         unsafe {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 1);
         }
 
-        // Read AFTER the wait: an elapsed `WaitUntil` is `ResumeTimeReached`,
-        // one cut short by a wake `WaitCancelled`.
         let cause = match self.state().control_flow() {
             ControlFlow::Poll => StartCause::Poll,
             ControlFlow::Wait => StartCause::WaitCancelled { start, requested_resume: None },
@@ -281,7 +232,6 @@ impl<T: 'static> EventLoop<T> {
     where
         F: FnMut(Event<T>, &RootWindowTarget),
     {
-        // One pool per turn, as `-[NSApplication run]` gives every event.
         autoreleasepool(|_| {
             callback(Event::NewEvents(cause), &self.window_target);
 
@@ -289,9 +239,6 @@ impl<T: 'static> EventLoop<T> {
                 callback(Event::Resumed, &self.window_target);
             }
 
-            // Pop one at a time: events a handler posts to itself during this
-            // drain belong to it, as on the other backends. The queue is never
-            // waited on (`wake_queue.rs`).
             while let Some(event) = self.receiver.try_next() {
                 callback(Event::UserEvent(event), &self.window_target);
             }

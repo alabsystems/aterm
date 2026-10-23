@@ -334,7 +334,7 @@ enum NativeDocumentJob {
 }
 
 impl NativeDocumentJob {
-    fn proxy(&self) -> &aterm_window::event_loop::EventLoopProxy<crate::Wake> {
+    const fn proxy(&self) -> &aterm_window::event_loop::EventLoopProxy<crate::Wake> {
         match self {
             Self::Save { proxy, .. }
             | Self::JournalAppend { proxy, .. }
@@ -501,7 +501,7 @@ fn try_enqueue_document_job<T>(
     }
 }
 
-fn native_document_queue_slot_available_wake() -> crate::Wake {
+const fn native_document_queue_slot_available_wake() -> crate::Wake {
     crate::Wake::NativeDocumentQueueSlotAvailable
 }
 
@@ -1154,6 +1154,8 @@ impl App {
                 };
                 if let Some(buffer) = state.buffer.as_mut() {
                     // A value added at its default is selected, to type over;
+                    // a line added without one keeps the caret where the
+                    // value goes.
                     if added_as == AbsentKeyAdded::AtDefault
                         && let Some(range) = crate::native_config_language::config_key_source_range(
                             &text, &requested,
@@ -2142,7 +2144,7 @@ impl App {
     }
 
     /// Whether this process's update successor reopens its document tabs (and its Settings tabs, from the same layout, with their field drafts).
-    pub(crate) fn successor_restores_document_tabs(&self) -> bool {
+    pub(crate) const fn successor_restores_document_tabs(&self) -> bool {
         #[cfg(all(test, unix))]
         if self.native_documents.carry_as_windowed_for_test {
             return true;
@@ -2181,7 +2183,7 @@ impl App {
     }
 
     /// Whether a journal write landed after the parked successor may have read its image.
-    pub(crate) fn document_journal_landed_while_parked(&self) -> bool {
+    pub(crate) const fn document_journal_landed_while_parked(&self) -> bool {
         self.native_documents.journal_landed_while_parked
     }
 
@@ -3433,6 +3435,9 @@ impl App {
             };
             if intent.seq > durable {
                 // Keep the Editor in its Saving state across the hand-off. In a
+                // headless run this call completes inline (and performs the final
+                // publication); with a real event loop it launches the next worker
+                // generation and the later completion owns final publication.
                 if let Err(message) = self.save_document_checkpoint(document, intent.source_view) {
                     self.native_runtime.set_document_saving(document, false);
                     self.publish_editor_commit(document, source_view);
@@ -3445,6 +3450,8 @@ impl App {
 
         if outcome.is_err() {
             // A conflict/failure invalidates every intent based on that unproven
+            // generation. A new stable observation must be explicitly accepted;
+            // no save may launch automatically from stale state.
             self.native_documents.pending_saves.remove(&document);
         }
         self.native_runtime.set_document_saving(document, false);
@@ -3609,6 +3616,8 @@ impl App {
         let mut deferred = Vec::new();
         for close in pending {
             // A pending window or Quit plan owns teardown atomically; detaching
+            // an older tab close here would apply part of it before its other
+            // documents are durable.
             if self.native_documents.pending_quit.is_some()
                 || self
                     .native_documents
@@ -3764,6 +3773,8 @@ impl App {
         if let Some(plan) = self.native_documents.pending_quit.clone() {
             if self.document_close_plan_ready(&plan)? {
                 // The native-app preflight ran before the async checkpoint; a
+                // Settings draft (or another native blocker) may have appeared
+                // since, so re-ask at the irreversible exit boundary.
                 if !self.prepare_quit_native_shutdown()? {
                     return Ok((false, Vec::new()));
                 }
@@ -3798,6 +3809,8 @@ impl App {
             };
             if self.document_close_plan_ready(&plan)? {
                 // Detach nothing until every native leaf is still ready: the UI
+                // stays live while checkpoints run, and a new Settings draft must
+                // keep the whole window and surface its recovery payload.
                 if !self
                     .prepare_window_native_shutdown(window, crate::native_app::CloseScope::Window)?
                 {
@@ -4412,6 +4425,8 @@ impl App {
         key: DocumentAdmissionKey,
     ) -> Result<DocumentAdmission, String> {
         // Coalescing is per window: a hit is this live window's own read in
+        // flight. Another window's read of the file is a separate entry and
+        // installs there (or is dropped if that window closed).
         if let Some(pending) = self.native_documents.admissions.get(&(wid, key.clone()))
             && pending.started.elapsed() < DOCUMENT_ADMISSION_STALE_AFTER
         {
@@ -4440,6 +4455,8 @@ impl App {
             .name("aterm-document-admit".to_string())
             .spawn(move || {
                 // This thread may wait for a download: the user asked for the
+                // file and this is nobody's event loop. The policy is
+                // thread-scoped; the main thread's stays off.
                 if let Err(errno) = aterm_diskwalk::set_thread_materialize_policy(
                     aterm_diskwalk::MaterializePolicy::On,
                 ) {
@@ -5556,6 +5573,7 @@ mod tests {
 
     fn file_uri(path: &std::path::Path) -> String {
         // The shipping encoder: a hand-rolled `format!` is malformed on Windows
+        // (drive letter and backslashes after the authority).
         crate::native_document_host::path_to_file_uri(path).unwrap()
     }
 

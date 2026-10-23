@@ -29,9 +29,6 @@ pub(super) fn read(path: &Path, uid: u32, max: usize, private: bool) -> io::Resu
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
-        // Both admission and the read use this descriptor: replacing the pathname
-        // cannot swap an uninspected file into the operation. O_NONBLOCK also makes
-        // a planted FIFO return before metadata rejects its non-regular type.
         let metadata = file.metadata()?;
         admit(
             metadata.uid(),

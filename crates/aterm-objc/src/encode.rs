@@ -16,6 +16,52 @@ pub unsafe trait Encode {
 
     /// Whether `Self` contains any field at an offset not aligned to that field's alignment ([`crate::returns_indirectly`]).
     ///
+    /// Defaults to `false`; nothing in Foundation, AppKit, CoreGraphics or this
+    /// crate is packed. A packed type sets it by hand:
+    ///
+    /// ```
+    /// # use aterm_objc::{Encode, returns_indirectly};
+    /// #[repr(C, packed)]
+    /// struct Packed {
+    ///     c: i8,
+    ///     q: i64,
+    /// }
+    /// // SAFETY: `{Packed=cq}` is the layout; the `q` sits at offset 1, so
+    /// // System V x86-64 classification is MEMORY regardless of the 9-byte size.
+    /// unsafe impl Encode for Packed {
+    ///     const ENCODING: &'static str = "{Packed=cq}";
+    ///     const HAS_UNALIGNED_FIELDS: bool = true;
+    /// }
+    /// assert_eq!(size_of::<Packed>(), 9);
+    /// assert_eq!(returns_indirectly::<Packed>(), cfg!(target_arch = "x86_64"));
+    /// ```
+    ///
+    /// A wrapper inherits it; prefer `<Field as Encode>::HAS_UNALIGNED_FIELDS`
+    /// over a hand-typed `true`:
+    ///
+    /// ```
+    /// # use aterm_objc::{Encode, returns_indirectly};
+    /// #[repr(C, packed)]
+    /// struct Packed { c: i8, q: i64 }
+    /// // SAFETY: `{Packed=cq}`; the `q` sits at offset 1.
+    /// unsafe impl Encode for Packed {
+    ///     const ENCODING: &'static str = "{Packed=cq}";
+    ///     const HAS_UNALIGNED_FIELDS: bool = true;
+    /// }
+    /// #[repr(C)]
+    /// struct Wrap { inner: Packed }
+    /// // ONE field, at offset 0, alignment 1: only the field's own flag
+    /// // knows its `q` is misaligned.
+    /// // SAFETY: the misalignment is `Packed`'s and `Wrap` inherits it.
+    /// unsafe impl Encode for Wrap {
+    ///     const ENCODING: &'static str = "{Wrap={Packed=cq}}";
+    ///     const HAS_UNALIGNED_FIELDS: bool = <Packed as Encode>::HAS_UNALIGNED_FIELDS;
+    /// }
+    /// assert_eq!(size_of::<Wrap>(), 9);
+    /// assert_eq!(align_of::<Wrap>(), 1);
+    /// assert_eq!(returns_indirectly::<Wrap>(), cfg!(target_arch = "x86_64"));
+    /// ```
+    ///
     /// # Safety
     /// Setting `false` when a field is misaligned routes `x86_64` sends to the wrong entry point.
     const HAS_UNALIGNED_FIELDS: bool = false;
@@ -385,6 +431,49 @@ unsafe impl Encode for *const NSRange {
 }
 
 /// Strips top-level argument frame offsets from a compiler-emitted Objective-C method type encoding.
+///
+/// ```
+/// # use aterm_objc::strip_method_offsets;
+/// // `-[NSWindowDelegate windowDidResize:]`, as the runtime reports it.
+/// assert_eq!(strip_method_offsets("v24@0:8@16"), "v@:@");
+/// // `-[NSDraggingDestination draggingEntered:]` — an NSUInteger return.
+/// assert_eq!(strip_method_offsets("Q24@0:8@16"), "Q@:@");
+/// // The struct-returning row, offsets and all.
+/// assert_eq!(
+///     strip_method_offsets(
+///         "{CGRect={CGPoint=dd}{CGSize=dd}}40@0:8{_NSRange=QQ}16^{_NSRange=QQ}32"
+///     ),
+///     "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}"
+/// );
+/// ```
+///
+/// Offsets appear only at the top level, after a complete type, so digits are
+/// stripped only at nesting depth zero and outside quotes. That keeps array
+/// counts (`[16c]`), bitfield widths (`b4b1b24`), and digits in struct, union,
+/// template or quoted class names (`CATransform3D`, `MTLHashMask<4>`);
+/// `tests/encode_offsets.rs` checks these against the live runtime.
+///
+/// ```
+/// # use aterm_objc::strip_method_offsets;
+/// // An array count.
+/// assert_eq!(strip_method_offsets("v20@0:8[4i]16"), "v@:[4i]");
+/// // A bitfield width — `NSDecimal`, off `-[NSString decimalValue]`.
+/// assert_eq!(
+///     strip_method_offsets("{?=b8b4b1b1b18[8S]}16@0:8"),
+///     "{?=b8b4b1b1b18[8S]}@:"
+/// );
+/// // A digit in a struct tag.
+/// assert_eq!(
+///     strip_method_offsets("v144@0:8{CATransform3D=dddddddddddddddd}16"),
+///     "v@:{CATransform3D=dddddddddddddddd}"
+/// );
+/// // A digit inside a QUOTED class name, which clang emits for a typed
+/// // object argument.
+/// assert_eq!(
+///     strip_method_offsets("v24@0:8@\"NSISO8601DateFormatter\"16"),
+///     "v@:@\"NSISO8601DateFormatter\""
+/// );
+/// ```
 #[must_use]
 pub fn strip_method_offsets(types: &str) -> String {
     let mut out = String::with_capacity(types.len());
@@ -412,6 +501,26 @@ pub fn strip_method_offsets(types: &str) -> String {
 }
 
 /// Builds an offset-free Objective-C method type-encoding string from return and argument types.
+///
+/// ```
+/// # use aterm_objc::{method_encoding, Bool, CGRect, Encode, Id, Sel};
+/// // `- (void)reduceMotionDidChange:(id)note`
+/// assert_eq!(method_encoding!(() ; Id), "v@:@");
+/// // `- (BOOL)validateMenuItem:(id)item` — `BOOL` is "B" on arm64 and "c" on
+/// // the x86_64 compat slice, so the expectation is written from the type.
+/// assert_eq!(method_encoding!(Bool ; Id), format!("{}@:@", Bool::ENCODING));
+/// // `- (void)drawRect:(NSRect)r`
+/// assert_eq!(method_encoding!(() ; CGRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+/// // no explicit arguments: `- (void)updateTrackingAreas`
+/// assert_eq!(method_encoding!(()), "v@:");
+/// // TWO arguments, and three: one semicolon, then a comma-separated list.
+/// // `- (BOOL)control:(id)c textView:(id)tv doCommandBySelector:(SEL)s`
+/// assert_eq!(
+///     method_encoding!(Bool ; Id, Id, Sel),
+///     format!("{}@:@@:", Bool::ENCODING)
+/// );
+/// assert_eq!(method_encoding!(Id ; Id, Id, Bool), format!("@@:@@{}", Bool::ENCODING));
+/// ```
 #[macro_export]
 macro_rules! method_encoding {
     ($ret:ty $(; $($arg:ty),* $(,)?)?) => {{

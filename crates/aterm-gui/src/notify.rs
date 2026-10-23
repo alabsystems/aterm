@@ -54,7 +54,7 @@ impl NotifyMsg {
         Self::with_origin(session, title, body, true)
     }
 
-    fn with_origin(session: u64, title: Option<String>, body: String, own: bool) -> Self {
+    const fn with_origin(session: u64, title: Option<String>, body: String, own: bool) -> Self {
         #[cfg(not(any(target_os = "macos", windows, target_os = "linux", test)))]
         let _ = (session, title, own);
         Self {
@@ -311,7 +311,7 @@ enum Route {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn route(
+const fn route(
     center: crate::notice_center::Center,
     bundled: bool,
     notifier: bool,
@@ -416,7 +416,7 @@ fn platform_voice() -> Option<crate::status_item::NoticeVoice> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn voice_of(
+const fn voice_of(
     center: crate::notice_center::Center,
     bundled: bool,
     notifier: bool,
@@ -686,6 +686,7 @@ mod freedesktop {
                 if dialled {
                     self.conn = open().ok();
                     if self.conn.is_some() {
+                        // Before even a retained message from the new connection
                         // can be heard (including this method's retry).
                         heard(Observation::ConnectionReset);
                     }

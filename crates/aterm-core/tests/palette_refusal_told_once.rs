@@ -9,8 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use aterm_core::config::TerminalConfig;
 use aterm_core::terminal::{Rgb, Terminal};
 
-/// A terminal configured with the palette gate at `open`, counting the
-/// refusals its host is told about.
 fn counted(open: bool) -> (Terminal, Arc<AtomicUsize>) {
     let mut t = Terminal::new(4, 20);
     t.apply_config(&TerminalConfig {
@@ -76,8 +74,6 @@ fn an_open_gate_tells_nothing_and_the_palette_moves() {
     assert_eq!(t.palette_color(5), TARGET);
 }
 
-/// Closed, open, closed again: each closed spell's first refusal is told,
-/// through `apply_config` and through the setter alike.
 #[test]
 fn reopening_the_gate_rearms_the_report() {
     let (mut t, told) = counted(false);
@@ -106,7 +102,6 @@ fn reopening_the_gate_rearms_the_report() {
     assert_eq!(told.load(Ordering::SeqCst), 3, "the setter re-arms too");
 }
 
-/// Control: a gate that stays closed (re-applied closed) tells once.
 #[test]
 fn a_gate_kept_closed_tells_once() {
     let (mut t, told) = counted(false);

@@ -20,6 +20,8 @@ pub(crate) const HUNG: i32 = 3;
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn run_toolbar_drive() -> i32 {
+    // The drive is a windowed process of its own: it builds AppKit windows and
+    // reads NSApp, so it mints the proof a windowed launch carries and hands it
     // to the body that sends `+sharedApplication`.
     macos::run(crate::platform::Windowed::launch())
 }
@@ -326,7 +328,7 @@ mod macos {
         )
     }
 
-    fn meta(
+    const fn meta(
         icon: Option<TabIconKind>,
         dirty: bool,
         busy: bool,

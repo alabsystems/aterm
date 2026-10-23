@@ -11,7 +11,6 @@ pub fn crates(template: &str) -> String {
     template.replace("@S@", SHIM).replace("@R@", REAL)
 }
 
-/// Every status word, then the extremes the loop does not reach.
 const STATUS: &str = r#"let mut s: i32 = -1; while s < 0x1_0000 { assert!(@S@::@N@(s) == @R@::@N@(s), "@N@ differs"); s += 1; } let edge = [i32::MIN, i32::MIN + 1, -0x1_0000, -0x8001, 0x1_0000, 0x1234_5678, i32::MAX]; let mut i = 0; while i < edge.len() { let s = edge[i]; assert!(@S@::@N@(s) == @R@::@N@(s), "@N@ differs"); i += 1; }"#;
 
 /// Sweeps that run at compile time when the macro is a `const fn`, in emission order.

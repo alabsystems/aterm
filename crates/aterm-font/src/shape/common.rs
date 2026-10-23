@@ -55,8 +55,7 @@ impl Direction {
         }
     }
 
-    /// Returns the horizontal direction `script` is written in, or `None` for the scripts written
-    /// either way (harfbuzz#1000).
+    /// Returns the horizontal direction `script` is written in, or `None` for boustrophedon scripts (harfbuzz#1000).
     #[inline]
     pub(crate) const fn from_script(script: Script) -> Option<Self> {
         match &script.0 {

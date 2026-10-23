@@ -5,10 +5,7 @@
 
 use aterm_spec::derive::Model;
 
-/// The service has already imported a verified activation. An observation can
-/// confirm its identity, contradict it, or fail to establish either. Both an
-/// idle reconcile and a returned apply retain the stage until contradicted.
-/// `Buggy=1` reproduces retiring on a failed probe in the returned-apply lane.
+/// Model verifying that an imported activation stage is retained until an observation contradicts its identity.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_activation_observation_model() -> Model {
@@ -45,7 +42,6 @@ pub fn native_update_activation_observation_model() -> Model {
             }
 
             invariant NoRetirementWithoutEvidence: retained == 1 || changed == 1;
-            // Dial 2 keeps an identity the observation saw change.
             invariant ChangedIdentityRetires: reduced == 0 || changed == 0 || retained == 0;
         }
     }

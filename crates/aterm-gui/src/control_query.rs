@@ -243,7 +243,7 @@ pub(crate) fn screen_hash(t: &Terminal) -> u64 {
 pub(crate) use aterm_types::control_verbs::ScreenGen;
 
 /// [`ScreenGen`] of `t` now (the caller holds its lock).
-pub(crate) fn screen_gen(t: &Terminal) -> ScreenGen {
+pub(crate) const fn screen_gen(t: &Terminal) -> ScreenGen {
     ScreenGen {
         epoch: t.content_scroll_state().invalidation_epoch,
         seq: t.content_seq(),
@@ -424,7 +424,7 @@ enum CellRow {
     History(usize),
 }
 
-fn cell_attrs(cell: Cell) -> CellFlags {
+const fn cell_attrs(cell: Cell) -> CellFlags {
     cell.flags()
 }
 
@@ -1063,7 +1063,7 @@ fn full_history_search(
     })
 }
 
-fn search_request(depth_cap: usize, anchor: Option<(usize, usize)>) -> SearchRequest {
+const fn search_request(depth_cap: usize, anchor: Option<(usize, usize)>) -> SearchRequest {
     SearchRequest {
         depth_cap,
         layout: SearchLayout::Logical,
@@ -1725,7 +1725,7 @@ fn frame_open_field(t: &Terminal) -> &'static str {
     }
 }
 
-fn underline_style_name(u: UnderlineStyle) -> &'static str {
+const fn underline_style_name(u: UnderlineStyle) -> &'static str {
     match u {
         UnderlineStyle::None => "none",
         UnderlineStyle::Single => "single",
@@ -1823,7 +1823,7 @@ fn write_styled_cell_json(
 }
 
 /// The wire name of a DEC [`LineSize`](aterm_core::grid::LineSize).
-pub(crate) fn line_size_name(s: aterm_core::grid::LineSize) -> &'static str {
+pub(crate) const fn line_size_name(s: aterm_core::grid::LineSize) -> &'static str {
     use aterm_core::grid::LineSize;
     match s {
         LineSize::SingleWidth => "single",
@@ -1945,7 +1945,7 @@ pub(crate) struct StyledFrameSnapshot {
 
 impl StyledFrameSnapshot {
     /// Whether the frame serializes an image payload.
-    pub(crate) fn carries_image_payloads(&self) -> bool {
+    pub(crate) const fn carries_image_payloads(&self) -> bool {
         self.image_payloads && !self.images.is_empty()
     }
 
@@ -1962,7 +1962,7 @@ impl StyledFrameSnapshot {
     }
 }
 
-fn selection_type_name(kind: SelectionType) -> &'static str {
+const fn selection_type_name(kind: SelectionType) -> &'static str {
     match kind {
         SelectionType::Simple => "simple",
         SelectionType::Block => "block",
@@ -2223,7 +2223,7 @@ pub(crate) fn styled_frame_payload(t: &Terminal) -> String {
     serialize_styled_frame(&gather_styled_frame(t))
 }
 
-fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::RenderInput) {
+const fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::RenderInput) {
     let aterm_core::render::RenderInput {
         rows: _,                         // frame "dims.rows"
         cols: _,                         // frame "dims.cols"
@@ -2305,7 +2305,7 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
     } = ri;
 }
 
-fn _styled_cell_snap_is_fully_serialized(snap: &StyledCellSnap) {
+const fn _styled_cell_snap_is_fully_serialized(snap: &StyledCellSnap) {
     let StyledCellSnap {
         cell: _,
         glyph: _,     // "glyph" — a range into its row's buffer
@@ -2429,7 +2429,7 @@ fn close_with_etag(mut out: String, tail: ScreenTail) -> String {
     out
 }
 
-fn frame_line_len(reply: &str) -> usize {
+const fn frame_line_len(reply: &str) -> usize {
     reply.len().saturating_sub("OK 1\n".len() + 1)
 }
 
@@ -5729,6 +5729,7 @@ mod engine_reader_tests {
         let mut t = Terminal::with_scrollback(6, 40, 5, sb);
         for i in 0..20 {
             if i % 4 == 1 {
+                // 95 columns into a 40-column grid: one head row, two
                 // continuation rows.
                 t.process(format!("wrapped {i:03} {}\r\n", "w".repeat(83)).as_bytes());
             } else {

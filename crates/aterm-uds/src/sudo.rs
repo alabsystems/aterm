@@ -479,7 +479,7 @@ pub fn parent_of(pid: i32) -> Option<i32> {
     }
 }
 
-/// Attest that `pid` is Apple's `/usr/bin/sudo` running as root with our real uid (module docs).
+/// Attest that `pid` is Apple's `/usr/bin/sudo` running as root with our real uid.
 ///
 /// # Errors
 /// A short, secret-free reason safe to surface to the agent.
@@ -495,7 +495,7 @@ pub fn attest_sudo(pid: i32) -> Result<(), AttestError> {
     }
 }
 
-/// Whether this process's fd 1 is an anonymous pipe (module docs).
+/// Whether this process's fd 1 is an anonymous pipe.
 ///
 /// # Errors
 /// A short, secret-free reason.

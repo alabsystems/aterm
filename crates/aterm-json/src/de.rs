@@ -348,6 +348,8 @@ impl<'de> Deserializer<'de> {
                 return Ok(wrap(Num::Unsigned(value)));
             }
             if self.exact_integers {
+                // Strict mode: an integer literal past 64 bits would become an
+                // f64 below, which is exactly the rounding `to_value` must not
                 // do silently.
                 return Err(self.err("number out of range"));
             }

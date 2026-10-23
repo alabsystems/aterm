@@ -226,7 +226,10 @@ pub(crate) fn closing_line(frame: &aterm_render::RenderInput, row: usize) -> Opt
 #[cfg(test)]
 pub(crate) use aterm_render::band::band_icon;
 
-/// The inks row `l`'s surface resolves against, and.
+/// The inks row `l`'s surface resolves against, and — on a busy row — the anchor its
+/// words floor toward (the engine's [`inks_for`](aterm_messages::ink::inks_for) from
+/// the row's layout): a busy row's surface keeps its words' side, and a determinate
+/// row's Fault wash keeps the fill's words' side.
 #[cfg(test)]
 pub(crate) fn row_inks(c: &BandColors, l: &RowLayout, hc: bool) -> (MeterInks, Option<[u8; 3]>) {
     let alarm = matches!(l.severity, Severity::Warn | Severity::Error);

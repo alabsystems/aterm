@@ -2,19 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The read contract (docs/DESIGN-agh-2026-10-19.md §10.3): one set of cases, run unchanged
-//! against [`FakeHost`], against [`AghHost`] over agh-fake, and against [`RestHost`] (the
-//! production host, REST over curl) over agh-fake, so the hosts the lanes run on answer every
-//! read the lanes make exactly as the host their tests drive. Then what only AghHost does: its
-//! M2 refusals, its anonymous reads, the absent writer, one owner per host and ambiguous
-//! drafts.
-//!
-//! RestHost runs every case but the two of the download host (`probe_public`,
-//! `fetch_public`): those go through aterm-update-core's anonymous download-host lane, which
-//! takes only an `https` URL, so a loopback web origin is refused before anything is sent.
-//!
-//! Unix only: the AghHost and RestHost worlds write their tokens into private files
-//! (`aterm_uds::private_file`).
+//! Release-host read contract tests across `FakeHost`, `AghHost`, and `RestHost`.
 
 #![cfg(unix)]
 
@@ -38,42 +26,29 @@ use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace, Slug}
 
 use super::scratch;
 
-/// The repository every case reads.
 const OWNER: &str = "fixture-dev";
 const REPO: &str = "packs";
 const SLUG: &str = "fixture-dev/packs";
-/// The asset API's path prefix: an authenticated download is a GET under it.
 const ASSETS: &str = "/repos/fixture-dev/packs/releases/assets/";
-/// The simulated clock's start, in Unix seconds.
 const SIM_START: u64 = 1_760_000_000;
 
 fn slug() -> Slug {
     Slug::new(OWNER, REPO)
 }
 
-/// One host and the means to lay its state and its faults.
 trait World {
-    /// The host under test.
     fn host(&self) -> &dyn ReleaseHost;
-    /// Lay release `tag` with these assets.
     fn put(&self, tag: &str, draft: bool, prerelease: bool, assets: &[(&str, &[u8])]);
-    /// Every authenticated asset download answers an HTTP 500 from now on.
     fn fail_downloads(&self);
-    /// The repository becomes invisible to this identity.
     fn hide(&self);
-    /// A draft beside the published release `tag`.
     fn put_stray_draft(&self, tag: &str);
-    /// The download attempts so far.
     fn download_attempts(&self) -> usize;
-    /// The warning lines the host wrote, where it keeps them.
     fn warnings(&self) -> Option<Vec<String>>;
-    /// The host's download-host probes reach this world's web origin.
     fn probes_public(&self) -> bool {
         true
     }
 }
 
-/// [`FakeHost`], with slug `fixture-dev/packs`.
 struct FakeWorld {
     host: FakeHost,
 }
@@ -131,40 +106,24 @@ impl World for FakeWorld {
     }
 }
 
-/// [`AghHost`] over agh-fake, routed by an agh.toml.
 struct AghWorld {
     fake: FakeGithub,
     host: AghHost,
-    /// The client's simulated effects: every pause agh takes is in its `slept()`.
     fx: Arc<Fx>,
     _dir: aterm_tempfile::TempDir,
 }
 
-/// How an [`AghWorld`] is built. [`Setup::PLAN`] is PLAN §12's world; every other field
-/// widens it for one AghHost-alone test.
 #[derive(Clone, Copy)]
 struct Setup {
-    /// The dev token file is written.
     token: bool,
-    /// `fixture-dev`'s row names `dev` as its writer.
     writer: bool,
-    /// The client's own retry policy: only a test about retries passes another than
-    /// `RetryPolicy::NONE` (PLAN §1 rule 8).
     policy: RetryPolicy,
-    /// `fixture-dev-bot` holds push on the repository (else only pull).
     push: bool,
-    /// `fixture-dev` reads through its own `reader` profile (login `fixture-reader`, pull on
-    /// the repository), so a call that went through the read chain instead of as the writer
-    /// shows in the logins `seen()` records.
     reader: bool,
-    /// A second owner, `fixture-ext`, with its own writer `ext` (`fixture-ext-bot`, push on
-    /// `fixture-ext/packs`, which holds a published `v1` with `a.bin`): a call the host let
-    /// through for that owner would succeed, as that owner's writer.
     ext: bool,
 }
 
 impl Setup {
-    /// PLAN §12's world: the dev token present, `fixture-dev`'s writer row, no retry.
     const PLAN: Setup = Setup {
         token: true,
         writer: true,
@@ -175,17 +134,13 @@ impl Setup {
     };
 }
 
-/// The other owner's repository, which [`Setup::ext`] lays.
 const EXT_SLUG: &str = "fixture-ext/packs";
 
 impl AghWorld {
-    /// PLAN §12's world.
     fn new() -> AghWorld {
         AghWorld::build(Setup::PLAN)
     }
 
-    /// `token`: the dev token file is written. `writer`: `fixture-dev`'s row names `dev`
-    /// as its writer. The client retries nothing (PLAN §1 rule 8).
     fn with(token: bool, writer: bool) -> AghWorld {
         AghWorld::build(Setup {
             token,
@@ -194,8 +149,6 @@ impl AghWorld {
         })
     }
 
-    /// [`AghWorld::with`], with the client's own retry policy `policy`: only a test about
-    /// retries passes another than `RetryPolicy::NONE`.
     fn with_policy(token: bool, writer: bool, policy: RetryPolicy) -> AghWorld {
         AghWorld::build(Setup {
             token,
@@ -205,7 +158,6 @@ impl AghWorld {
         })
     }
 
-    /// The world `setup` names.
     fn build(setup: Setup) -> AghWorld {
         let Setup {
             token,
@@ -219,7 +171,6 @@ impl AghWorld {
         let dir = scratch("agh-contract");
         let tokens = dir.path().join("tokens");
         aterm_uds::private_file::create_private_dir(&tokens).expect("the token directory");
-        // One profile: its token registered as `login` and, when `written`, in its file.
         let profile = |name: &str, login: &str, written: bool| {
             let secret = agh_fake::token(name);
             fake.add_token(&secret, login);
@@ -303,12 +254,10 @@ impl AghWorld {
         }
     }
 
-    /// Every request the fake has seen so far.
     fn requests(&self) -> usize {
         self.fake.seen().len()
     }
 
-    /// The listing GETs so far: the releases path itself, with or without a query.
     fn listing_gets(&self) -> usize {
         let path = "/repos/fixture-dev/packs/releases";
         self.fake
@@ -324,9 +273,6 @@ impl AghWorld {
             .count()
     }
 
-    /// Every API request so far went as `fixture-dev`'s writer: every draft-inclusive read
-    /// is WriterRead, never the read chain. Meaningful on a [`Setup::reader`] world, where
-    /// the read chain is another login.
     fn assert_all_as_writer(&self) {
         for s in self
             .fake
@@ -345,7 +291,6 @@ impl AghWorld {
     }
 }
 
-/// Lay release `tag` of [`SLUG`] on `fake`, with these assets.
 fn put_on(fake: &FakeGithub, tag: &str, draft: bool, prerelease: bool, assets: &[(&str, &[u8])]) {
     let at = "2026-10-01T00:00:00Z";
     let spec = if draft {
@@ -359,7 +304,6 @@ fn put_on(fake: &FakeGithub, tag: &str, draft: bool, prerelease: bool, assets: &
     }
 }
 
-/// Every authenticated asset download on `fake` answers an HTTP 500 from now on.
 fn fail_downloads_on(fake: &FakeGithub) {
     fake.fault_always(
         Match::api(ASSETS).method("GET"),
@@ -371,8 +315,6 @@ fn fail_downloads_on(fake: &FakeGithub) {
     );
 }
 
-/// A draft of `tag` on `fake`: a prerelease, as the race loser's create always makes it (a
-/// draft prerelease) and as FakeHost lists its stray drafts.
 fn stray_draft_on(fake: &FakeGithub, tag: &str) {
     fake.add_release(
         SLUG,
@@ -380,7 +322,6 @@ fn stray_draft_on(fake: &FakeGithub, tag: &str) {
     );
 }
 
-/// The authenticated asset downloads `fake` has seen.
 fn download_attempts_on(fake: &FakeGithub) -> usize {
     fake.seen()
         .iter()
@@ -390,7 +331,6 @@ fn download_attempts_on(fake: &FakeGithub) -> usize {
         .count()
 }
 
-/// `config::parse`, `config::validate` (with `config::file_id`), then the Router.
 fn router(text: &str, home: &Path) -> Router {
     let parsed = agh::config::parse(text).unwrap_or_else(|f| panic!("{}: {}", f.rule, f.what));
     let validated =
@@ -434,7 +374,6 @@ impl World for AghWorld {
     }
 }
 
-/// [`RestHost`] over agh-fake, as `fixture-dev-bot` (push on the repository).
 struct RestWorld {
     fake: FakeGithub,
     host: RestHost,
@@ -502,17 +441,12 @@ impl World for RestWorld {
     }
 }
 
-/// `case` against a fresh [`RestWorld`], then the fake's own violations (a credential at the
-/// web or CDN origin, a missing API version or user agent among them), which must be none.
 fn on_rest(case: fn(&dyn World)) {
     let w = RestWorld::new();
     case(&w);
     assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 
-/// `case` against a fresh [`AghWorld`], then the fake's own violations (a credential at the
-/// web or CDN origin among them), which must be none. Then once more on a world whose read
-/// chain is another login, where every API request must have gone as the writer.
 fn on_agh(case: fn(&dyn World)) {
     let w = AghWorld::new();
     case(&w);
@@ -526,7 +460,6 @@ fn on_agh(case: fn(&dyn World)) {
     w.assert_all_as_writer();
 }
 
-/// A release as compared across hosts: its asset names sorted.
 fn normal(mut release: Release) -> Release {
     release.assets.sort();
     release
@@ -540,8 +473,6 @@ fn release(tag: &str, draft: bool, prerelease: bool, assets: &[&str]) -> Release
         assets: assets.iter().map(|a| (*a).to_string()).collect(),
     }
 }
-
-// --- 1. releases ---------------------------------------------------------------------
 
 fn case_releases(w: &dyn World) {
     w.put("v1", false, true, &[("b.bin", b"bee"), ("a.bin", b"ay")]);
@@ -580,8 +511,6 @@ fn releases_rest() {
     on_rest(case_releases);
 }
 
-// --- 2. release ----------------------------------------------------------------------
-
 fn case_release(w: &dyn World) {
     w.put("v1", false, true, &[("a.bin", b"ay")]);
     let got = w.host().release(&slug(), "v1").expect("the release");
@@ -603,8 +532,6 @@ fn release_agh() {
 fn release_rest() {
     on_rest(case_release);
 }
-
-// --- 3. download ---------------------------------------------------------------------
 
 fn case_download(w: &dyn World) {
     w.put(
@@ -648,8 +575,6 @@ fn download_rest() {
     on_rest(case_download);
 }
 
-// --- 4. not visible ------------------------------------------------------------------
-
 fn case_not_visible(w: &dyn World) {
     w.put("v1", false, true, &[("a.bin", b"ay")]);
     w.hide();
@@ -669,8 +594,6 @@ fn case_not_visible(w: &dyn World) {
         matches!(download, Err(HostError::Unreachable(_))),
         "{download:?}"
     );
-    // A repository this identity cannot see is private or gone, so the download host serves
-    // nothing for it either.
     if w.probes_public() {
         assert_eq!(w.host().probe_public(&slug(), "v1", "a.bin"), Probe::Absent);
     }
@@ -690,8 +613,6 @@ fn not_visible_agh() {
 fn not_visible_rest() {
     on_rest(case_not_visible);
 }
-
-// --- 5. attempts ---------------------------------------------------------------------
 
 fn case_attempts(w: &dyn World) {
     w.put("v1", false, true, &[("a.bin", b"ay")]);
@@ -723,8 +644,6 @@ fn attempts_rest() {
     on_rest(case_attempts);
 }
 
-// --- 6. probe_public -----------------------------------------------------------------
-
 fn case_probe_public(w: &dyn World) {
     w.put("v1", false, true, &[("a.bin", b"ay")]);
     w.put("v2", true, true, &[("b.bin", b"bee")]);
@@ -749,8 +668,6 @@ fn probe_public_agh() {
     on_agh(case_probe_public);
 }
 
-// --- 7. fetch_public -----------------------------------------------------------------
-
 fn case_fetch_public(w: &dyn World) {
     let bytes: &[u8] = b"the published asset's bytes";
     w.put("v1", false, true, &[("a.bin", bytes)]);
@@ -762,14 +679,11 @@ fn case_fetch_public(w: &dyn World) {
         Probe::Present
     );
     assert_eq!(std::fs::read(&dest).expect("the fetched file"), bytes);
-    // On `dest` itself, which still holds the published bytes: an answer that is not present
-    // leaves no file there, whichever answer it is.
     let capped = w
         .host()
         .fetch_public(&slug(), "v1", "a.bin", &dest, cap - 1);
     assert!(matches!(capped, Probe::Unknown(_)), "{capped:?}");
     assert!(!dest.exists());
-    // A file an earlier call left at `dest` does not outlive an answer that is not present.
     let stale = dir.path().join("stale").join("missing.bin");
     std::fs::create_dir_all(stale.parent().expect("a parent")).expect("the stale dir");
     std::fs::write(&stale, b"stale bytes").expect("the stale file");
@@ -791,8 +705,6 @@ fn fetch_public_agh() {
     on_agh(case_fetch_public);
 }
 
-// --- 8. the race ---------------------------------------------------------------------
-
 fn case_race(w: &dyn World) {
     w.put("v1", false, true, &[("a.bin", b"the winner's bytes")]);
     w.put_stray_draft("v1");
@@ -806,7 +718,6 @@ fn case_race(w: &dyn World) {
         assert!(lines[0].contains("v1"), "{lines:?}");
         assert!(lines[0].contains("1 draft(s)"), "{lines:?}");
     }
-    // The listing shows both: the winner, and the loser's draft with no asset.
     let mut listed: Vec<Release> = w
         .host()
         .releases(&slug())
@@ -847,19 +758,13 @@ fn race_rest() {
     on_rest(case_race);
 }
 
-// --- FakeHost alone ------------------------------------------------------------------
-
 #[test]
 #[should_panic(expected = "put_stray_draft")]
 fn fake_stray_draft_needs_a_published_release() {
-    // A stray beside a draft (or beside nothing) is a state FakeHost would answer otherwise
-    // than GitHub, so laying one fails at its own line.
     let w = FakeWorld::new();
     w.put("v1", true, true, &[]);
     w.put_stray_draft("v1");
 }
-
-// --- AghHost alone -------------------------------------------------------------------
 
 #[test]
 fn agh_writes_and_git_are_refused() {
@@ -879,9 +784,6 @@ fn agh_writes_and_git_are_refused() {
 
 #[test]
 fn agh_refuses_a_listed_asset_name_outside_dir() {
-    // The names come from the reply's own listing (the mirror lane passes them back), so a
-    // name `dir.join` would carry out of `dir`, or a part file's name, is refused before any
-    // byte moves.
     let w = AghWorld::new();
     w.put(
         "v1",
@@ -928,15 +830,12 @@ fn agh_absent_writer_is_unreachable_and_names_the_owner() {
 
 #[test]
 fn agh_one_owner_per_host() {
-    // `fixture-ext` has its own writer row and a repository that writer can read: without
-    // the owner check, each read below would succeed as `fixture-ext-bot`.
     let w = AghWorld::build(Setup {
         ext: true,
         ..Setup::PLAN
     });
     let other = Slug::new("fixture-ext", REPO);
     let dir = scratch("contract-owner");
-    // Every answer names the other slug, which no refusal of the Router's or of M2's does.
     let names_other = |r: Result<(), HostError>| match r {
         Err(HostError::Refused(why)) => assert!(why.contains(EXT_SLUG), "{why}"),
         other => panic!("{other:?}"),
@@ -950,7 +849,6 @@ fn agh_one_owner_per_host() {
         matches!(&probe, Probe::Unknown(why) if why.contains(EXT_SLUG)),
         "{probe:?}"
     );
-    // A file an earlier call left at `dest` does not outlive the refusal either.
     let dest = dir.path().join("fetched").join("a.bin");
     std::fs::create_dir_all(dest.parent().expect("a parent")).expect("the fetch dir");
     std::fs::write(&dest, b"an earlier fetch's bytes").expect("the earlier file");
@@ -960,7 +858,6 @@ fn agh_one_owner_per_host() {
         "{fetch:?}"
     );
     assert!(!dest.exists());
-    // The operations M2 fills in refuse the other owner too, before their own refusal.
     names_other(w.host.create(&other, "v1", "title", "notes", &[]));
     names_other(w.host.upload(&other, "v1", &[], Replace::Never));
     names_other(w.host.publish_draft(&other, "v1"));
@@ -971,8 +868,6 @@ fn agh_one_owner_per_host() {
 
 #[test]
 fn agh_download_never_compounds_the_lanes_retry() {
-    // A client that retries a 500 itself (3 attempts, 2 s then 5 s): each of the lane's
-    // attempts is still one asset GET, and agh takes none of its own pauses.
     let w = AghWorld::with_policy(true, true, RetryPolicy::STANDARD);
     w.put("v1", false, true, &[("a.bin", b"ay")]);
     w.fail_downloads();
@@ -994,8 +889,6 @@ fn agh_download_never_compounds_the_lanes_retry() {
 
 #[test]
 fn agh_download_resolution_never_compounds_the_lanes_retry() {
-    // The same client, failing the tag's resolution instead: the listing answers 500. Each
-    // of the lane's attempts is one listing GET, and agh takes none of its own pauses.
     let w = AghWorld::with_policy(true, true, RetryPolicy::STANDARD);
     w.put("v1", false, true, &[("a.bin", b"ay")]);
     w.fake.fault_always(
@@ -1022,7 +915,6 @@ fn agh_download_resolution_never_compounds_the_lanes_retry() {
 
 #[test]
 fn agh_unauthenticated_download_is_refused_after_one_attempt() {
-    // A 401 is the credential's answer, not the network's: the lane does not try again.
     let w = AghWorld::new();
     w.put("v1", false, true, &[("a.bin", b"ay")]);
     w.fake.fault_always(
@@ -1040,8 +932,6 @@ fn agh_unauthenticated_download_is_refused_after_one_attempt() {
     assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 
-/// A 500 whose body's `message` echoes the dev token: agh keeps GitHub's message in `why`
-/// as sent, so the host's error map is what keeps the credential out of a lane's log.
 fn echoing_the_token() -> Fault {
     Fault::Status {
         status: 500,
@@ -1050,7 +940,6 @@ fn echoing_the_token() -> Fault {
     }
 }
 
-/// `why` carries the server's message (its marker) and not the credential in it.
 fn assert_redacted(why: &str) {
     assert!(why.contains("echo marker"), "{why}");
     assert!(!why.contains(&agh_fake::token("dev")), "{why}");
@@ -1080,8 +969,6 @@ fn agh_redacts_the_texts_it_answers() {
 
 #[test]
 fn agh_writer_without_push_is_refused() {
-    // The writer reads the repository but holds no push: drafts are not visible to it, so a
-    // draft-inclusive read is refused (Forbidden), never answered without the drafts.
     let w = AghWorld::build(Setup {
         push: false,
         ..Setup::PLAN
@@ -1099,7 +986,6 @@ fn agh_writer_without_push_is_refused() {
 
 #[test]
 fn agh_rate_limited_listing_is_unreachable() {
-    // An exhausted rate limit passes: it is never a terminal refusal (design §7.4).
     let w = AghWorld::new();
     w.put("v1", false, true, &[("a.bin", b"ay")]);
     w.fake.fault_always(
@@ -1124,8 +1010,6 @@ fn agh_draft_gone_between_listing_and_read_leaves_the_published_release() {
         SLUG,
         ReleaseSpec::draft("v1", "2026-10-02T00:00:00Z").prerelease(true),
     );
-    // Deleted once the listing (the first GET under the releases path) is answered, so its
-    // read by id finds nothing.
     w.fake.after(
         Match::api("/repos/fixture-dev/packs/releases").method("GET"),
         1,
@@ -1157,8 +1041,6 @@ fn agh_download_checks_every_name_before_any_byte_moves() {
 
 #[test]
 fn agh_reads_a_two_page_listing() {
-    // 150 releases: two pages of 100, so the listing and the tag's resolution both walk past
-    // the first page and revalidate it.
     let w = AghWorld::new();
     let tags: Vec<String> = (0..150).map(|n| format!("v{n:03}")).collect();
     for tag in &tags {

@@ -776,6 +776,8 @@ struct Found {
 }
 
 fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
+    // Claude Code's autocompact offer (module header, "THE AUTOCOMPACT
+    // OFFER"): its footer names no `<key> to <verb>`, so no reader below sees
     // a box there. Read whole, or not at all.
     if let Some(v2) = crate::autocompact::offer_box(rows) {
         let v1 = Prompt {
@@ -980,6 +982,9 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
                 v2.description_rows = c.description_rows;
                 v2.gutter = c.gutter;
             } else {
+                // `Edit notebook` and the IDE diff name their file in the
+                // question, not in a path row (the notebook's first row is
+                // the cell; the IDE's the path, and then `Save file to
                 // continue…`).
                 if names_file_in_question(title)
                     && let Some(file) = question.and_then(|q| question_file(&rows[q]))
@@ -1343,6 +1348,9 @@ fn content_of(body: &[String], kind: PromptKind) -> Content {
     use crate::phase::leading_spaces;
     let is_tip = |r: &String| crate::text::trim(r).starts_with("Tip:");
     if !kind.is_shell() {
+        // A Read box draws its call, `Read(<path>)` (2.1.284: alone at column
+        // two; 2.1.287: between two dashed rules), and a long call wraps, so
+        // its rows are one token. A box that draws the bare path (2.1.282) is
         // read as any file box.
         if matches!(kind, PromptKind::Read) {
             let bare = |t: &str| t.is_empty() || t.starts_with("Tip:");
@@ -1897,6 +1905,7 @@ fn plan_approval(rows: &[String]) -> Option<Found> {
             last = i;
             own_end = i;
         } else if hint.is_none() && leading_spaces(r) > leading_spaces(&rows[last]) + 2 {
+            // The option's own row (its label's Ink wrap, or a description
             // under it).
             own_end = i;
         } else if hint.is_none() && is_key_hint_row(r) {
@@ -2345,6 +2354,7 @@ fn cursors(title: &str) -> &'static [char] {
 }
 
 fn strip_cursor<'a>(t: &'a str, cur: &[char]) -> Option<&'a str> {
+    // `t.strip_prefix(cur)`: one char stripped when it is any of `cur`, each
     // tried as a single char rather than through a char-set searcher.
     cur.iter().find_map(|&c| t.strip_prefix(c))
 }
@@ -2784,6 +2794,7 @@ fn broken_word(above: &str, below: &str, room: usize) -> bool {
 }
 
 fn unbroken(label: &str, breaks: &[usize]) -> Option<String> {
+    // Four breaks are sixteen readings; a label broken more often than that
     // stays as read.
     if breaks.is_empty() || breaks.len() > 4 || vendor_label(label) {
         return None;
@@ -2810,6 +2821,7 @@ struct Options {
 
 fn role_of(label: &str, kind: PromptKind) -> Role {
     if kind == PromptKind::McpServer {
+        // Every answer of it is saved for good, the checkbox rows and the
         // submit of the dialog for several included.
         return Role::Persist;
     }
@@ -2847,6 +2859,9 @@ fn role_of(label: &str, kind: PromptKind) -> Role {
     } else if kind == PromptKind::ModelSwitch
         && l.starts_with(&const { crate::anchors::anchor_text("model_switch.yes") }.to_lowercase())
     {
+        // `Yes, switch to Sonnet 5` confirms the one change the person typed:
+        // no permission mode and no tool grant — not the mode switch its
+        // `switch to` would read as below. (What `/model` persists, the
         // person's default, is what their own command asked for.)
         Role::Once
     } else if l.starts_with("allow") {

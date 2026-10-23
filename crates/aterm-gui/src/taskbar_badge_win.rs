@@ -37,7 +37,7 @@ impl Badges {
         vec![Op::Show(hwnd)]
     }
 
-    /// Records a frame of `hwnd` and clears its badge when focused.
+    /// A frame of `hwnd`: a badged window that draws focused loses its badge.
     pub(crate) fn frame(&mut self, hwnd: isize, focused: bool) -> Vec<Op> {
         if !focused || self.up.is_empty() {
             return Vec::new();
@@ -176,7 +176,8 @@ fn create_icon(size: u32) -> isize {
     let pixels = dot_pixels(size);
     let mask = vec![0u8; size.div_ceil(16) as usize * 2 * size as usize];
     let side = i32::try_from(size).unwrap_or(16);
-    // SAFETY: one documented user32 call.
+    // SAFETY: one documented user32 call; `pixels` holds size*size 32-bit pixels and `mask` size
+    // rows of the WORD-padded 1-bit mask, both outliving it.
     unsafe { CreateIcon(0, side, side, 1, 32, mask.as_ptr(), pixels.as_ptr()) }
 }
 

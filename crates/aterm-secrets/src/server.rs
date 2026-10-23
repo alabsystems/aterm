@@ -1,94 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm secrets serve`: the keyless vault server (docs/DESIGN-secrets-2026-10-20.md §9).
-//!
-//! | request | answer |
-//! |---|---|
-//! | `GET /v1/<name>` | the envelope, `ETag: "<seq>"`, `Cache-Control: no-store`; 404 if none |
-//! | `GET /v1/<name>?after=<n>` | at once if the held seq > n, else held up to the hold time for a newer one, else 204 |
-//! | `PUT /v1/<name>` | accepted (204) only if it verifies under the pin for `<name>` with a higher seq; wakes every long-poll; else 409/400/403 with a one-line reason |
-//! | `POST /v1/<name>/join` | one line `age1… <host> <code>[ proof=<b64>]` whose code is its key's, queued (dedup by key and address, newest kept, at most 256 and 4 from one address, 7 days) |
-//! | `GET /v1/<name>/join` | the queue, one line each |
-//!
-//! The pin for a name is the signer of the envelope it holds (a handoff chain from that key
-//! moves it), or for a name it holds nothing for, the `--pin` it was given, else the first
-//! envelope it accepts (trust on first use), which it accepts only from this machine: from
-//! loopback or one of this machine's own addresses, so a stranger on the LAN cannot claim a
-//! name first. HTTP/1.1, one thread per connection, at most [`MAX_CONNECTIONS`] (1024) at
-//! once and [`MAX_PEER_CONNECTIONS`] (16) from one address, `Connection: close`, heads at
-//! most 16 KiB sent within 10 s, bodies at most [`crate::envelope::MAX_ENVELOPE`] with at
-//! most [`MAX_PUTS`] (4) PUT bodies read at once, [`MAX_PEER_PUTS`] (1) from one address of
-//! another machine and the last kept for this machine, an answer sent within 5 min. No
-//! redirects. The store is `<store>/<name>.vault` and `<store>/<name>.joins`, written
-//! atomically; a slow disk under the join store holds up only other join requests.
-//!
-//! A new version carries on the handoff chain of the one held, every link of it in order
-//! ([`crate::envelope::Envelope::check_extends`]): a chain only grows, and one cut short (a
-//! rotation by a build before chains, which carried the latest link alone) would leave every
-//! machine pinned before the cut unable to follow the vault.
-//!
-//! An envelope signed by a key the ALab vault rotated away from ([`crate::ALAB_RETIRED`]) is
-//! refused whatever the pin, even as a name's first version, and a held signer or `--pin`
-//! that is such a key, or a held signer the held chain reached through such a key's
-//! endorsement of a key this build does not know, gives way to [`crate::ALAB_SIGNER`]
-//! ([`crate::envelope::Envelope::check_pin`]): the admin a rotation removed still holds it. The
-//! version held then floors nothing (its seq and chain may be that admin's), so the real
-//! vault replaces it.
-//!
-//! The per-address caps count addresses, not machines: they keep one client (a runaway
-//! subscriber, a script) from taking what every machine shares, and a machine that takes
-//! many addresses (IPv4 aliases, IPv6 temporary addresses) meets only the server's own caps.
-//! IPv6 peers are not grouped by their /64: on a LAN that prefix is every machine's.
-//!
-//! The details a client sees:
-//!
-//! - Over a cap the answer is 503 at once with the cap it met: the server's connections,
-//!   the connections from the client's address, or the PUT bodies being read (in all, from
-//!   other machines, or from the client's address).
-//! - A PUT of exactly the envelope already held is 204 and wakes nobody (a publisher that
-//!   lost the first answer and retried is told it is done). A PUT or POST needs
-//!   `Content-Length` (411 without; chunked is 501); `Expect: 100-continue` is honoured.
-//!   A PUT is 400 when it is not an envelope or names another vault, 403 when its signature
-//!   or pin fails, when it drops or changes a link of the held version's handoff chain (the
-//!   answer names it), or when it would be a vault's first version here and comes from
-//!   another machine with no `--pin` for the name (refused before its body is read), 409 when
-//!   its seq is not newer; the store holds at most 64 vaults (507).
-//! - A join POST is refused (404) for a vault the server does not hold, (400) when its code
-//!   is not its key's, and (429) when the queue already holds 256 requests, or 4 from the
-//!   client's address, all asked since the vault's current version arrived: once either holds
-//!   its cap, the longest queued request asked before that version gives way to the new one
-//!   (an admin's publish answers what it saw, a machine it approved never asks again, and one
-//!   still waiting asks again within the hour). A POST of exactly a request already queued,
-//!   from any address, keeps its place and the address it was queued from, and changes
-//!   nothing but its queue time, moved on at most hourly, so a machine still waiting never
-//!   ages out, its address changed or not; one for the same key from the same address with
-//!   another host or proof replaces it, but not within [`JOIN_CHANGE_GAP`] (10 s) of when its
-//!   own address last queued or changed it (429), which no re-post moves; one from another
-//!   address is queued beside it, so a host on the LAN can neither replace, hide nor hold off
-//!   another machine's request. The queue keeps the wall clock's times, but a time ahead
-//!   of the clock (stepped back since) holds no change off, and a request expires a week from
-//!   its time either way. The listing's lines are `age1… <host> <code> <unix secs>[
-//!   proof=<b64>]`, the time it was last asked, moved on at most hourly
-//!   ([`crate::transport::parse_join_line`] reads them); the address a request came from is
-//!   kept in the store, never listed. A new request is logged; changes to one
-//!   are logged at most hourly.
-//! - Every answer carries `Cache-Control: no-store` and `Connection: close`; one with a body
-//!   carries `Content-Type: text/plain; charset=utf-8` and `Content-Length`; a refusal's body
-//!   is one line saying why. The envelope's answers (200, and the long-poll's 204) carry
-//!   `ETag: "<seq>"`.
-//! - Every subscriber's long-poll holds one connection for the hold time, so
-//!   [`MAX_CONNECTIONS`] is also the number of machines that can watch at once. A held
-//!   long-poll whose client went away ends within 5 s.
-//!
-//! [`serve`] returns `Ok`, stopping as [`Running::stop`] does, when its own program is
-//! replaced on disk, so launchd or systemd starts the new build, and on a stop signal
-//! (SIGTERM, SIGINT, SIGHUP: a `kill <pid>`, Activity Monitor's Quit, launchd or systemd
-//! stopping the job). Its children (`dns-sd`, `caffeinate`) are killed when it returns. They
-//! stay in its process group, so launchd (which ends a job's process group with it) and a
-//! terminal's Ctrl-C end them too when the server is killed outright; `caffeinate -w` also
-//! watches the server's pid. Only a SIGKILL of the server alone, outside a job, leaves
-//! `dns-sd` running.
+//! Keyless HTTP vault server ([`serve`], [`Running::stop`]) enforcing connection and body caps
+//! ([`MAX_CONNECTIONS`], [`MAX_PEER_CONNECTIONS`], [`MAX_PUTS`], [`MAX_PEER_PUTS`],
+//! [`crate::envelope::MAX_ENVELOPE`]), signer pins and handoff chains ([`crate::ALAB_SIGNER`],
+//! [`crate::ALAB_RETIRED`], [`crate::envelope::Envelope::check_pin`],
+//! [`crate::envelope::Envelope::check_extends`]), and join queues ([`JOIN_CHANGE_GAP`],
+//! [`crate::transport::parse_join_line`]).
 
 use crate::envelope::{self, MAX_ENVELOPE};
 use crate::transport::{JoinRequest, parse_join_line};
@@ -112,9 +30,7 @@ pub struct Options {
     pub listen: SocketAddr,
     /// The store directory (made 0700).
     pub store: PathBuf,
-    /// `Some(name)`: hold an mDNS registration of `<name>.local` at the primary interface's
-    /// IPv4 address (`/usr/bin/dns-sd -P`, re-registered when the address changes), and a
-    /// `_alab-vault._tcp` service. macOS only; ignored elsewhere with a note.
+    /// Optional `<name>.local` mDNS registration on the primary IPv4 address.
     pub advertise: Option<String>,
     /// Pins for names the store holds nothing for: name → signing key.
     pub pins: Vec<(String, [u8; 32])>,
@@ -124,24 +40,17 @@ pub struct Options {
     pub keep_awake: bool,
 }
 
-/// The hold the design names for a long-poll (§9).
+/// Default hold duration for a long-poll.
 pub const DEFAULT_HOLD: Duration = Duration::from_secs(50);
-/// The most connections served at once; one more is answered 503. Every watching machine
-/// holds one long-poll, so this is also how many machines can watch at once (the services
-/// raise the open-file limit to 4096 to match).
+/// The most connections served at once.
 pub const MAX_CONNECTIONS: usize = 1024;
-/// The most connections served at once from one address; one more is answered 503. A
-/// machine needs one for its long-poll and a few for the rest, and no one address takes the
-/// whole of [`MAX_CONNECTIONS`].
+/// The most connections served at once from one address ([`MAX_CONNECTIONS`]).
 pub const MAX_PEER_CONNECTIONS: usize = 16;
-/// The most PUT bodies read at once (each up to [`MAX_ENVELOPE`]); one more is answered 503
-/// at once. The last is kept for this machine, so another machine's PUTs take at most
-/// `MAX_PUTS - 1`.
+/// The most PUT bodies read at once (each up to [`MAX_ENVELOPE`]).
 pub const MAX_PUTS: usize = 4;
-/// The most PUT bodies read at once from one address of another machine: a publisher sends
-/// one version at a time, and no one address takes the PUTs every admin needs.
+/// The most PUT bodies read at once from one address of another machine.
 pub const MAX_PEER_PUTS: usize = 1;
-/// A connection thread's stack: the handler keeps bodies on the heap.
+/// A connection thread's stack.
 const CONNECTION_STACK: usize = 256 * 1024;
 /// The largest request head, its blank line included.
 pub const MAX_HEAD: usize = 16 * 1024;
@@ -150,15 +59,14 @@ pub const HEAD_DEADLINE: Duration = Duration::from_secs(10);
 /// How long a client has to send a body, and the longest it may stall within it.
 const BODY_DEADLINE: Duration = Duration::from_secs(120);
 const BODY_STALL: Duration = Duration::from_secs(10);
-/// The longest one write of an answer may block, and the longest the whole answer may take
-/// (a client that reads a byte now and then holds a connection no longer than this).
+/// The longest one write of an answer may block, and the longest the whole answer may take.
 const WRITE_STALL: Duration = Duration::from_secs(60);
 const ANSWER_DEADLINE: Duration = Duration::from_secs(300);
 /// The most an answer is handed to the socket in one write.
 const WRITE_CHUNK: usize = 64 * 1024;
 /// How long the accept loop gives a 503 over a cap (a fresh socket takes one line at once).
 const REFUSAL_DEADLINE: Duration = Duration::from_secs(1);
-/// How many answered refusals may wait to be closed gently; past that one is closed at once.
+/// How many answered refusals may wait to be closed gently.
 const REFUSALS_QUEUED: usize = 64;
 /// How often a held long-poll looks whether its client went away.
 const LIVENESS_EVERY: Duration = Duration::from_secs(5);
@@ -168,17 +76,15 @@ pub const MAX_JOIN_BODY: usize = 1024;
 pub const MAX_JOINS: usize = 256;
 /// The most queued join requests from one address per vault.
 pub const MAX_PEER_JOINS: usize = 4;
-/// The largest `.joins` file read: [`MAX_JOINS`] requests, each after its address line.
+/// The largest `.joins` file read ([`MAX_JOINS`]).
 const MAX_JOINS_FILE: usize = MAX_JOINS * (MAX_JOIN_BODY + 128);
 /// How long a join request stays queued.
 pub const JOIN_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-/// How long a queued join request stands before its key may change it: each change rewrites
-/// the store, so one key cannot keep the disk busy.
+/// How long a queued join request stands before its key may change it.
 pub const JOIN_CHANGE_GAP: Duration = Duration::from_secs(10);
 /// How often the log notes changes to one queued join request.
 const JOIN_NOTE_EVERY_SECS: u64 = 60 * 60;
-/// How often a join request asked again unchanged moves its queue time on: each move rewrites
-/// the store, and a machine still waiting asks hourly, far inside [`JOIN_TTL_SECS`].
+/// Minimum interval before an unchanged join re-post refreshes its queue timestamp ([`JOIN_TTL_SECS`]).
 const JOIN_REFRESH_EVERY_SECS: u64 = 60 * 60;
 /// The most vaults one server holds.
 pub const MAX_VAULTS: usize = 64;
@@ -207,9 +113,6 @@ pub fn serve(options: Options) -> crate::Result<()> {
             "--advertise takes a host label: lowercase letters, digits and -",
         ));
     }
-    // Taken before any thread starts (each inherits the mask), so a `kill <pid>` stops the
-    // server as a replaced program does and its children end with it: `dns-sd` has no
-    // lifeline of its own.
     let signalled = Arc::new(AtomicBool::new(false));
     {
         let signalled = Arc::clone(&signalled);
@@ -243,7 +146,7 @@ pub fn serve(options: Options) -> crate::Result<()> {
     result
 }
 
-/// An executable as it is on disk: device, inode, size and modification time.
+/// An executable as it is on disk.
 type Stamp = (u64, u64, u64, i64);
 
 /// This process's executable as it is now (client.rs's subscriber watches the same).
@@ -253,12 +156,7 @@ fn program_stamp() -> Option<Stamp> {
     Some((meta.dev(), meta.ino(), meta.size(), meta.mtime()))
 }
 
-/// Run until the accept loop ends (its error is the result), until `signalled` is raised (a
-/// stop signal; the thread that raises it unparks this one), or until `stamp`, read every
-/// `every`, differs from what it read at the start: this program was replaced on disk (an
-/// update), and a job keeps the image it started with. Then stop as [`Running::stop`] does,
-/// give the answers in flight up to [`DRAIN_DEADLINE`], and return `Ok`, so launchd or
-/// systemd starts the new build. A program `stamp` cannot read at the start is not watched.
+/// Run until the accept loop ends ([`Running::stop`], [`DRAIN_DEADLINE`]).
 fn supervise(
     running: Running,
     every: Duration,
@@ -291,8 +189,7 @@ fn supervise(
     }
 }
 
-/// A running server on a listener already bound (tests bind `127.0.0.1:0`). Dropping it does
-/// not stop it; [`Running::stop`] does.
+/// A running server on a listener already bound (tests bind `127.0.0.1:0`) ([`Running::stop`]).
 pub struct Running {
     /// Where it listens.
     pub addr: SocketAddr,
@@ -302,8 +199,7 @@ pub struct Running {
 }
 
 impl Running {
-    /// Stop accepting and return once the accept loop has ended. Long-polls held open end
-    /// at once (204).
+    /// Stop accepting and return once the accept loop has ended.
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.shared.stopping.store(true, Ordering::SeqCst);
@@ -313,8 +209,6 @@ impl Running {
                 slot.wake.notify_all();
             }
         }
-        // The accept loop sleeps in accept(2): a connection of our own wakes it to see the
-        // flag. Without one (the listener is unreachable) it is left to the process's end.
         let wake = wake_addr(self.addr);
         if TcpStream::connect_timeout(&wake, Duration::from_secs(5)).is_ok()
             && let Some(accept) = self.accept.take()
@@ -332,7 +226,6 @@ impl Running {
         }
     }
 
-    /// How many long-polls are waiting now.
     #[cfg(test)]
     fn waiting(&self) -> usize {
         self.shared.waiting.load(Ordering::SeqCst)
@@ -357,9 +250,7 @@ pub fn start(listener: std::net::TcpListener, options: &Options) -> crate::Resul
     launch(listener, options, Tuning::default())
 }
 
-/// [`start`] with the join queue's change gap `gap` in place of [`JOIN_CHANGE_GAP`]: a flow
-/// that changes a request sits out no real gap (the gap itself is held on a faked clock in
-/// this module's tests).
+/// [`start`] with the join queue's change gap `gap` in place of [`JOIN_CHANGE_GAP`].
 #[cfg(any(test, debug_assertions))]
 pub fn start_with_join_change_gap(
     listener: std::net::TcpListener,
@@ -376,9 +267,7 @@ pub fn start_with_join_change_gap(
     )
 }
 
-/// [`start`] as a server on another Mac than its clients': no connection comes from this
-/// machine, so a name the store holds nothing for takes a first version only under a pin
-/// ([`refuse_unheld`]), as from every Mac but the server's own.
+/// [`start`] as a server on another Mac than its clients' ([`refuse_unheld`]).
 #[cfg(test)]
 pub(crate) fn start_apart(
     listener: std::net::TcpListener,
@@ -394,8 +283,7 @@ pub(crate) fn start_apart(
     )
 }
 
-/// The clocks a server keeps and how it tells this machine's connections from others':
-/// the constants above and [`this_machine`] in a served server; tests shorten and fake them.
+/// Server deadlines, clock, and local-connection predicate ([`this_machine`]).
 #[derive(Clone, Copy)]
 struct Tuning {
     head_deadline: Duration,
@@ -405,15 +293,13 @@ struct Tuning {
     answer_deadline: Duration,
     liveness_every: Duration,
     join_change_gap: Duration,
-    /// The wall clock the join queue is kept by, in unix seconds: when a request was asked,
-    /// changed, noted and expires ([`now`] in a served server; a test's moves only when the
-    /// test moves it).
+    /// How long a closing connection drains what its client still sends ([`linger`]).
+    linger: Duration,
+    /// The wall clock the join queue is kept by, in unix seconds ([`now`]).
     now: fn() -> u64,
-    /// Whether a connection from a peer address, arriving on one of this machine's addresses
-    /// (`None`: unknown), comes from this machine.
+    /// Whether a connection from a peer address, arriving on one of this machine's addresses.
     is_local: fn(IpAddr, Option<IpAddr>) -> bool,
-    /// The keys no PUT is taken signed by, and the key a held signer among them gives way to
-    /// (what this build carries; tests name their own).
+    /// The keys no PUT is taken signed by, and the key a held signer among them gives way to.
     retired: fn() -> envelope::Retired,
 }
 
@@ -427,6 +313,7 @@ impl Default for Tuning {
             answer_deadline: ANSWER_DEADLINE,
             liveness_every: LIVENESS_EVERY,
             join_change_gap: JOIN_CHANGE_GAP,
+            linger: LINGER_DEADLINE,
             now,
             is_local: this_machine,
             retired: envelope::Retired::compiled,
@@ -462,15 +349,13 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         #[cfg(test)]
         served: AtomicUsize::new(0),
     });
-    // Connections refused over a cap are closed here, one at a time, so the accept loop
-    // never waits on one; it ends when the accept loop drops its end of the queue.
     let (refusals, refused) = sync_channel::<TcpStream>(REFUSALS_QUEUED);
     std::thread::Builder::new()
         .name("vault-refuse".to_owned())
         .stack_size(CONNECTION_STACK)
         .spawn(move || {
             for mut stream in refused {
-                linger(&mut stream);
+                linger(&mut stream, tuning.linger);
             }
         })?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -489,12 +374,7 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
     })
 }
 
-/// Whether a connection from `peer` comes from this machine: loopback, the address it
-/// arrived on (a machine that connects to one of its own addresses connects from it), or
-/// the address a default route leaves by. aterm-secrets keeps no unsafe code, so the
-/// interface list (`getifaddrs`) is not read: a connection from an address of this machine
-/// that is none of these (rare: a connection to oneself leaves from the address it goes to)
-/// is not recognized, which refuses a first version and never admits one.
+/// Whether a connection from `peer` comes from this machine.
 fn this_machine(peer: IpAddr, arrived_on: Option<IpAddr>) -> bool {
     let peer = peer.to_canonical();
     peer.is_loopback()
@@ -507,8 +387,7 @@ fn this_machine(peer: IpAddr, arrived_on: Option<IpAddr>) -> bool {
 struct Held {
     seq: u64,
     signer: [u8; 32],
-    /// The held envelope's handoff chain: the next version must carry it on, and its keys are
-    /// how the held signer was reached ([`envelope::Retired::gives_way`]).
+    /// The held envelope's handoff chain ([`envelope::Retired::gives_way`]).
     handoff: Vec<([u8; 32], [u8; 64])>,
     bytes: Arc<Vec<u8>>,
 }
@@ -519,18 +398,14 @@ struct Slot {
     wake: Arc<Condvar>,
 }
 
-/// A queued join request and the address it came from (`None`: queued before addresses
-/// were kept). The address is never listed.
+/// A queued join request and the address it came from (`None`: queued before addresses were kept).
 #[derive(Clone)]
 struct Queued {
     request: JoinRequest,
     peer: Option<IpAddr>,
-    /// The vault's seq when the request was last asked (queued, changed or asked again): it
-    /// counts against its address while that is the seq held (0: never).
+    /// The vault's seq when the request was last asked (queued, changed or asked again).
     asked: u64,
-    /// When its address last queued or changed it (unix secs; 0: not since the server
-    /// started): what the change gap reads. Asking again unchanged, from anywhere, never moves
-    /// it, so no re-post of a listed line holds off the machine's own change.
+    /// When its address last queued or changed it.
     changed: u64,
     /// When the log last noted it (unix secs; 0: not since the server started).
     noted: u64,
@@ -556,8 +431,7 @@ struct Shared {
     peers: Mutex<HashMap<IpAddr, usize>>,
     /// PUT bodies being read now.
     puts: Mutex<Puts>,
-    /// Held while a join request is decided and its store written, taken before `server_state`:
-    /// the store's write (two fsyncs) holds up other join requests, never `server_state`.
+    /// Held while a join request is decided and its store written, taken before `server_state`.
     join_writes: Mutex<()>,
     #[cfg(test)]
     waiting: AtomicUsize,
@@ -600,16 +474,12 @@ fn now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
-/// A line for the server's log (stderr). Names, seqs and fingerprints only.
+/// A line for the server's log (stderr).
 fn note(line: &str) {
     eprintln!("aterm secrets serve: {line}");
 }
 
-/// What [`serve`] logs at start when its store holds no vault yet (a new server, or one moved
-/// to another Mac): a machine that asks to join finds none until a Mac in the vault puts its
-/// copy here, as its subscriber's next pass does (`client::sync`) and any admin command there
-/// (`client::admin_open`), and a first version comes from another Mac only for a name `pins`
-/// covers ([`refuse_unheld`]). `None` once it holds one.
+/// What [`serve`] logs at start when its store holds no vault yet ([`refuse_unheld`]).
 fn unheld_note(state: &State, pins: &[(String, [u8; 32])]) -> Option<String> {
     if !state.vaults.is_empty() {
         return None;
@@ -628,8 +498,7 @@ fn unheld_note(state: &State, pins: &[(String, [u8; 32])]) -> Option<String> {
     ))
 }
 
-/// Read the store: every `<name>.vault` that parses and verifies, every `<name>.joins` line
-/// that parses and has not expired. Anything else is skipped with a note.
+/// Read the store: every `<name>.vault` that parses and verifies.
 fn load(store: &Path, now: u64) -> crate::Result<State> {
     let mut state = State::default();
     let entries =
@@ -699,8 +568,7 @@ fn load_vault(path: &Path, name: &str) -> crate::Result<Held> {
     })
 }
 
-/// Drop requests queued more than [`JOIN_TTL_SECS`] from now either way: older, or ahead of a
-/// clock stepped back that far since.
+/// Drop requests queued more than [`JOIN_TTL_SECS`] from now either way.
 fn expire(queue: &mut Vec<Queued>, now: u64) {
     queue.retain(|queued| {
         queued
@@ -720,8 +588,7 @@ fn join_lines(queue: &[Queued]) -> String {
     text
 }
 
-/// The store's form of a queue: each request's listed line, after a `peer <address> <seq>`
-/// line (the address it came from and [`Queued::asked`]) when the address is known.
+/// The store's form of a queue ([`Queued::asked`]).
 fn stored_lines(queue: &[Queued]) -> String {
     let mut text = String::new();
     for queued in queue {
@@ -734,10 +601,7 @@ fn stored_lines(queue: &[Queued]) -> String {
     text
 }
 
-/// Read [`stored_lines`]: a `peer` line names the next line's address and is no request
-/// (an older server skips it as a line that does not parse), so a store written before
-/// addresses were kept reads as requests from no known address. A `peer` line without a seq
-/// reads as asked at none. Lines that are neither are skipped.
+/// Read [`stored_lines`].
 fn parse_stored(text: &str) -> Vec<Queued> {
     let mut queue = Vec::new();
     let mut peer = None;
@@ -781,8 +645,6 @@ fn accept_loop(
             Ok((stream, peer)) => dispatch(shared, stream, peer.ip(), refusals),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) if is_transient(&e) => {
-                // Out of descriptors or a connection reset before accept: back off a
-                // moment rather than spin.
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => return Err(e),
@@ -804,8 +666,7 @@ fn is_transient(error: &io::Error) -> bool {
     )
 }
 
-/// One connection's slot under [`MAX_CONNECTIONS`] and [`MAX_PEER_CONNECTIONS`], released
-/// when its thread ends.
+/// One connection's slot under [`MAX_CONNECTIONS`] and [`MAX_PEER_CONNECTIONS`].
 struct Active {
     shared: Arc<Shared>,
     peer: IpAddr,
@@ -832,7 +693,6 @@ fn dispatch(
     peer: IpAddr,
     refusals: &SyncSender<TcpStream>,
 ) {
-    // An IPv4 client of a dual-stack listener arrives as ::ffff:a.b.c.d; it is a.b.c.d.
     let peer = peer.to_canonical();
     if shared.active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
         shared.active.fetch_sub(1, Ordering::SeqCst);
@@ -876,13 +736,10 @@ fn dispatch(
             handle(&active.shared, stream, active.peer);
             drop(active);
         });
-    // A thread that could not start dropped its closure, and with it the slot.
     drop(spawned);
 }
 
-/// Answer a connection over a cap with 503 from the accept loop, then hand it to the
-/// refuser thread, which closes it as [`linger`] does so a client still sending its request
-/// reads the answer rather than a reset. A full queue closes it at once.
+/// Answer a connection over a cap with 503 from the accept loop ([`linger`]).
 fn refuse(mut stream: TcpStream, why: String, refusals: &SyncSender<TcpStream>) {
     let sent = write_reply(
         &mut stream,
@@ -895,7 +752,7 @@ fn refuse(mut stream: TcpStream, why: String, refusals: &SyncSender<TcpStream>) 
     }
 }
 
-/// The PUT bodies being read now: in all, and from each address of another machine.
+/// The PUT bodies being read now.
 #[derive(Default)]
 struct Puts {
     reading: usize,
@@ -906,7 +763,7 @@ struct Puts {
 struct Reading<'a> {
     shared: &'a Shared,
     peer: IpAddr,
-    /// From this machine: not counted by address, and may take the last slot.
+    /// From this machine.
     local: bool,
 }
 
@@ -1044,7 +901,6 @@ fn write_reply(
     if let Some(allow) = reply.allow {
         head.push_str(&format!("Allow: {allow}\r\n"));
     }
-    // RFC 9110 §8.6: a 204 carries no Content-Length (and no content to type).
     if reply.status != 204 {
         head.push_str("Content-Type: text/plain; charset=utf-8\r\n");
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
@@ -1057,8 +913,7 @@ fn write_reply(
     stream.flush()
 }
 
-/// Write all of `bytes`, no write blocking longer than `stall` and none past `deadline`
-/// (`None`: no end but the stall).
+/// Write all of `bytes`, no write blocking longer than `stall` and none past `deadline`.
 fn send(
     stream: &mut TcpStream,
     mut bytes: &[u8],
@@ -1112,13 +967,13 @@ fn handle(shared: &Shared, mut stream: TcpStream, peer: IpAddr) {
     )
     .is_ok()
     {
-        linger(&mut stream);
+        linger(&mut stream, tuning.linger);
     }
 }
 
-/// Close our half and drain what the client still sends, briefly, so a client still writing
-/// (an oversize body) reads the answer instead of a reset.
-fn linger(stream: &mut TcpStream) {
+/// Close our half and drain what the client still sends, for at most `deadline`, so a client
+/// still writing (an oversize body) reads the answer instead of a reset.
+fn linger(stream: &mut TcpStream, deadline: Duration) {
     if stream.shutdown(Shutdown::Write).is_err() {
         return;
     }
@@ -1126,7 +981,7 @@ fn linger(stream: &mut TcpStream) {
     let mut drained = 0usize;
     let mut sink = [0u8; 8192];
     while drained < LINGER_BYTES {
-        let Some(left) = LINGER_DEADLINE
+        let Some(left) = deadline
             .checked_sub(started.elapsed())
             .filter(|left| !left.is_zero())
         else {
@@ -1149,9 +1004,7 @@ fn find_blank_line(buf: &[u8], from: usize) -> Option<usize> {
         .map(|at| from + at + 4)
 }
 
-/// Read and parse one head within `deadline` ([`HEAD_DEADLINE`]) and [`MAX_HEAD`]: a client
-/// that sends it slowly, or never, is cut at the deadline. `Ok(None)`: the client went away
-/// before sending anything.
+/// Read and parse one head within `deadline` ([`HEAD_DEADLINE`]) and [`MAX_HEAD`].
 fn read_request(stream: &mut TcpStream, deadline: Duration) -> Result<Option<Request>, Reply> {
     let late = || {
         Reply::text(
@@ -1288,16 +1141,11 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
     })
 }
 
-/// Why a request carrying browser metadata is refused. aterm's client sends neither header.
+/// Why a request carrying browser metadata is refused.
 const BROWSER_REFUSED: &str =
     "browser-origin or fetch-metadata headers are not accepted (Origin or Sec-Fetch-*)";
 
-/// Reject browser request metadata before processing a body or admitting a join. `Origin`
-/// covers browser POSTs; `Sec-Fetch-*` is sent only to potentially trustworthy destinations
-/// (https://www.w3.org/TR/fetch-metadata/#integration-with-fetch-and-html).
-/// A plain HTTP read with neither header remains admissible, including after DNS rebinding:
-/// this filter is not client authentication. Envelope verification and the vault's admission
-/// policy retain their separate protocol boundaries.
+/// Reject browser request metadata before processing a body or admitting a join.
 fn browser_metadata_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("origin")
         || name
@@ -1315,7 +1163,7 @@ enum Route<'a> {
     Join(&'a str),
 }
 
-/// `/v1/<name>` or `/v1/<name>/join`, with `<name>` a vault name; nothing else.
+/// `/v1/<name>` or `/v1/<name>/join`, with `<name>` a vault name.
 fn route(path: &str) -> Option<Route<'_>> {
     let rest = path.strip_prefix("/v1/")?;
     let (name, join) = match rest.split_once('/') {
@@ -1370,12 +1218,10 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
             };
             let arrived_on = stream.local_addr().ok().map(|addr| addr.ip());
             let local = (shared.tuning.is_local)(peer, arrived_on);
-            // A PUT that would be refused whatever its body is refused before it is read.
             let refused = refuse_unheld(shared, &shared.lock_server_state(), name, local);
             if let Some(reply) = refused {
                 return reply;
             }
-            // Held until the envelope is stored or refused: its body stays in memory so long.
             let _reading = match Reading::take(shared, peer, local) {
                 Ok(reading) => reading,
                 Err(reply) => return reply,
@@ -1395,16 +1241,11 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
     }
 }
 
-/// Why a PUT for `name` is refused whatever it carries, when the store holds nothing for
-/// `name`: no `--pin` covers it and it comes from another machine (`local` false), or the
-/// store is full. `None` when `name` is held, or its first version may be taken.
+/// Why a PUT for `name` is refused whatever it carries, when the store holds nothing for `name`.
 fn refuse_unheld(shared: &Shared, state: &State, name: &str, local: bool) -> Option<Reply> {
     if state.vaults.contains_key(name) {
         return None;
     }
-    // Trust on first use, from this machine only: whoever is first pins the name, and a
-    // stranger on the LAN must not be first. The reason is read on another Mac, so it names
-    // this one as the server's, and what lets the version in.
     if !local && !shared.pins.iter().any(|(pinned, _)| pinned == name) {
         return Some(Reply::text(
             403,
@@ -1420,8 +1261,7 @@ fn refuse_unheld(shared: &Shared, state: &State, name: &str, local: bool) -> Opt
     None
 }
 
-/// A body's `Content-Length`, which must be there and at most `max`, and cover the body
-/// bytes that came with the head.
+/// A body's `Content-Length`.
 fn body_length(request: &Request, max: usize) -> Result<usize, Reply> {
     let Some(length) = request.length else {
         return Err(Reply::text(
@@ -1444,8 +1284,7 @@ fn body_length(request: &Request, max: usize) -> Result<usize, Reply> {
     Ok(length)
 }
 
-/// Read the `length` bytes of body [`body_length`] admitted, within the body deadline and
-/// stall.
+/// Read the `length` bytes of body [`body_length`] admitted, within the body deadline and stall.
 fn read_body(
     stream: &mut TcpStream,
     request: Request,
@@ -1486,7 +1325,6 @@ fn read_body(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                // A read that waited what was left of the deadline outran it.
                 let why = if wait == left {
                     "the body took too long"
                 } else {
@@ -1537,8 +1375,6 @@ fn get_vault(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str
         return envelope_reply(&slot.held);
     }
     let wake = Arc::clone(&slot.wake);
-    // A hold too long for the clock to add (a huge --hold) ends only by a newer version, a
-    // stop, or the client leaving.
     let deadline = Instant::now().checked_add(shared.hold);
     let every = shared.tuning.liveness_every;
     #[cfg(test)]
@@ -1582,8 +1418,7 @@ fn get_vault(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&str
     }
 }
 
-/// Whether a held long-poll's client went away: its end is closed (a read would return end
-/// of file at once) or the connection broke. Bytes it sent after its request change nothing.
+/// Whether a held long-poll's client went away.
 fn gone(stream: &TcpStream) -> bool {
     if stream.set_nonblocking(true).is_err() {
         return true;
@@ -1617,7 +1452,6 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
     if let Err(e) = envelope.verify_signature() {
         return Reply::text(403, e.0);
     }
-    // Before any pin, so a retired key cannot be the first one a store trusts either.
     if let Err(e) = envelope.check_signer(&shared.retired) {
         return Reply::text(403, e.0);
     }
@@ -1631,8 +1465,6 @@ fn put_vault(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
                 Ok(pin) => pin,
                 Err(e) => return Reply::text(403, e.0),
             };
-            // A held version whose key gave way may be the removed admin's, with any seq and
-            // any chain: the version that replaces it is judged by the key this build names.
             if !matches!(pin, envelope::Pin::Replaced(_)) {
                 if envelope.seq <= held.seq {
                     if envelope.seq == held.seq && held.bytes.as_slice() == body {
@@ -1716,7 +1548,6 @@ fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
         Ok(_) => return Reply::text(400, "a join request is `age1… <host> <code>`"),
         Err(e) => return Reply::text(400, e.0),
     };
-    // Every client drops, unread, a line whose code is not its key's.
     let code = crate::age::Recipient::parse(&request.recipient)
         .ok()
         .map(|key| crate::client::join_code(&key));
@@ -1724,8 +1555,6 @@ fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
         return Reply::text(400, "a join request's code is not its key's");
     }
     let now = (shared.tuning.now)();
-    // One join request decided and stored at a time. `server_state` is held only to decide and to
-    // swap the new queue in, so a slow disk holds up no GET, long-poll or PUT.
     let _writing = shared.join_writes();
     let (queue, noted) = match decide_join(shared, name, request, peer, now) {
         Ok(Decided::Next(queue, noted)) => (queue, noted),
@@ -1752,14 +1581,13 @@ fn post_join(shared: &Shared, name: &str, body: &[u8], peer: IpAddr) -> Reply {
 
 /// What [`decide_join`] decided.
 enum Decided {
-    /// The request is queued as it is already; only its [`Queued::asked`] moved.
+    /// The request is queued as it is already ([`Queued::asked`]).
     Queued,
     /// The queue to store, and the line to log.
     Next(Vec<Queued>, Option<String>),
 }
 
-/// Decide a join request from `peer` under `server_state`, or refuse it. Called with
-/// [`Shared::join_writes`] held, so the queue it returns is the next one.
+/// Decide a join request from `peer` under `server_state`, or refuse it ([`Shared::join_writes`]).
 fn decide_join(
     shared: &Shared,
     name: &str,
@@ -1782,14 +1610,6 @@ fn decide_join(
     };
     if let Some(at) = queue.iter().position(same) {
         // A machine asking again for exactly what it asked (the subscriber re-asks hourly,
-        // from whatever address it has now) is told it is queued, with no log line, and keeps
-        // its place and the address it was queued from: it counts against that address again,
-        // as one still waiting, and asking from another address moves no request past that
-        // one's cap. Its time moves on at most hourly, asked from any address: a machine still
-        // waiting, its address changed or not, never ages out of the queue, where an admin
-        // opening the vault would not see it to hold it (`client::code_only_for`), and the
-        // store is rewritten for it at most hourly. Anyone can re-post a listed line, so the
-        // change gap reads [`Queued::changed`], which this never moves.
         if now.saturating_sub(queue[at].request.time.unwrap_or(0)) < JOIN_REFRESH_EVERY_SECS {
             if let Some(held) = state
                 .joins
@@ -1804,16 +1624,11 @@ fn decide_join(
         queue[at].asked = seq;
         return Ok(Decided::Next(queue, None));
     }
-    // A request replaces only the one its own address queued for the key; another address's
-    // is queued beside it. Anyone may post any key, so no host can replace or hide another's
-    // request, or hold its changes off with the gap. One from no known address (a store from
-    // before addresses were kept) is anyone's.
     let ours = |queued: &Queued| {
         queued.request.recipient == request.recipient && queued.peer.is_none_or(|at| at == peer)
     };
     let previous = queue.iter().position(ours).map(|at| queue.remove(at));
     if let Some(previous) = &previous {
-        // A time ahead of the clock (it was stepped back since) holds nothing off.
         let gap = shared.tuning.join_change_gap;
         if now
             .checked_sub(previous.changed)
@@ -1866,12 +1681,7 @@ fn decide_join(
     Ok(Decided::Next(queue, line))
 }
 
-/// Make room in `queue` for one more request among those `counted` picks, once they number
-/// `cap`: the longest queued of them that a publish answered gives way (asked before version
-/// `seq`, or at a seq above it: a version whose held key gave way, the removed admin's with any
-/// seq, was replaced by one below it). An admin's publish answers what it saw, a machine it
-/// approved never asks again, and one still waiting asks again within the hour. `false` when
-/// every one of them was asked at `seq`.
+/// Make room in `queue` for one more request among those `counted` picks, once they number `cap`.
 fn make_room(
     queue: &mut Vec<Queued>,
     cap: usize,
@@ -1909,8 +1719,7 @@ fn list_joins(shared: &Shared, name: &str) -> Reply {
     }
 }
 
-/// The argv (after the program) that registers `<name>.local` at `ip` and the vault service
-/// on `port`: `dns-sd -P <name> _alab-vault._tcp local <port> <name>.local <ip> path=/v1`.
+/// Arguments to `dns-sd` registering `<name>.local` at `ip` and the vault service on `port`.
 pub fn dns_sd_args(name: &str, port: u16, ip: Ipv4Addr) -> Vec<String> {
     vec![
         "-P".to_owned(),
@@ -1924,16 +1733,12 @@ pub fn dns_sd_args(name: &str, port: u16, ip: Ipv4Addr) -> Vec<String> {
     ]
 }
 
-/// The argv (after the program) that keeps the Mac from idle sleep while `pid` lives:
-/// `caffeinate -i -w <pid>`.
+/// The argv (after the program) that keeps the Mac from idle sleep while `pid` lives.
 pub fn caffeinate_args(pid: u32) -> Vec<String> {
     vec!["-i".to_owned(), "-w".to_owned(), pid.to_string()]
 }
 
-/// The addresses this Mac's traffic leaves by: the default route's over IPv4, the LAN's (the
-/// one `<name>.local` is reached by) and the default route's over IPv6, each `None` without a
-/// route. What changes when the Mac joins or leaves a network (a Wi-Fi, a cable, a VPN), so a
-/// vault that did not answer is asked again at once; no packet is sent.
+/// The addresses this Mac's traffic leaves by: the default route's over IPv4, the LAN's.
 pub fn route_sources() -> [Option<IpAddr>; 3] {
     [
         primary_ipv4().map(IpAddr::V4),
@@ -1942,24 +1747,17 @@ pub fn route_sources() -> [Option<IpAddr>; 3] {
     ]
 }
 
-/// The IPv4 address of the interface the default route leaves by: a UDP socket connected to
-/// TEST-NET-1 (no packet is sent) and its local address. `None` when there is no route.
+/// Primary IPv4 address of the default-route interface.
 pub fn primary_ipv4() -> Option<Ipv4Addr> {
     source_ipv4(Ipv4Addr::new(192, 0, 2, 1), 9)
 }
 
-/// The IPv4 address `<name>.local` is advertised at: the one this Mac's LAN reaches it by.
-/// The route to mDNS's own group (224.0.0.251) leaves by an interface mDNS answers on, and on
-/// macOS it is a link route on that interface, more specific than a full-tunnel VPN's `0/1`
-/// and `128/1` or a default route through a tunnel, so a tunnel's address (a corporate
-/// `10.x`, Tailscale's `100.x`), which the LAN cannot reach, is not the one advertised.
-/// Without such a route, [`primary_ipv4`]'s.
+/// LAN IPv4 address at which `<name>.local` is advertised ([`primary_ipv4`]).
 fn lan_ipv4() -> Option<Ipv4Addr> {
     source_ipv4(Ipv4Addr::new(224, 0, 0, 251), 5353).or_else(primary_ipv4)
 }
 
-/// The local address a UDP socket connected to `to` gets (no packet is sent): the address of
-/// the interface the route to `to` leaves by. `None` without a route.
+/// The local address a UDP socket connected to `to` gets (no packet is sent).
 fn source_ipv4(to: Ipv4Addr, port: u16) -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect((to, port)).ok()?;
@@ -1969,8 +1767,7 @@ fn source_ipv4(to: Ipv4Addr, port: u16) -> Option<Ipv4Addr> {
     }
 }
 
-/// The IPv6 address the default route leaves by, found as [`primary_ipv4`] finds its own
-/// (2001:db8::1 is documentation space; no packet is sent). `None` without an IPv6 route.
+/// The IPv6 address the default route leaves by, found as [`primary_ipv4`] finds its own.
 fn primary_ipv6() -> Option<Ipv6Addr> {
     let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
     socket
@@ -2051,8 +1848,7 @@ impl Children {
     }
 }
 
-/// Keep one `dns-sd -P` registered at `ip`: a live registration at the same address stays;
-/// a dead one, or one at an old address, is replaced; no address, none.
+/// Keep one `dns-sd -P` registered at `ip`: a live registration at the same address stays.
 fn reregister(set: &mut ChildSet, name: &str, port: u16, ip: Option<Ipv4Addr>) {
     if let (Some((child, held_ip)), Some(ip)) = (set.dns_sd.as_mut(), ip)
         && *held_ip == ip
@@ -2205,8 +2001,7 @@ mod tests {
         }
     }
 
-    /// Wait (a hang detector) until no connection is open: a client's answer can arrive
-    /// before the server's thread for it has let its slot go.
+    /// Wait (a hang detector) until no connection is open.
     fn until_closed(running: &Running) {
         until("every connection has closed", || {
             running.shared.active.load(Ordering::SeqCst) == 0
@@ -2297,14 +2092,10 @@ mod tests {
         );
         assert_eq!(response.body(), first.as_slice());
 
-        // The same envelope again is done, not refused.
         put(&running, &first).expect("idempotent");
         running.stop();
     }
 
-    /// A server whose store holds no vault yet says so in its log at start: a joining machine
-    /// finds none until a Mac in the vault puts its copy here, which another Mac than the
-    /// server's can do only for a vault the server pins. A store that holds one says nothing.
     #[test]
     fn a_store_that_holds_no_vault_says_a_mac_in_the_vault_puts_its_copy_here() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2391,8 +2182,6 @@ mod tests {
         put(&running, &envelope(&OLD, 1)).expect("first");
         let new = signer_public(&NEW).expect("public");
         let old = signer_public(&OLD).expect("public");
-        // An endorsement made for another vault does not move this one (signed, so only
-        // the endorsement is wrong).
         let elsewhere = endorse(&OLD, "other", &new).expect("endorsed");
         let forged =
             crate::envelope::sign_unchecked(&unsigned(2, vec![(old, elsewhere)], "alab"), &NEW)
@@ -2404,7 +2193,6 @@ mod tests {
         let chain = vec![(old, endorse(&OLD, "alab", &new).expect("e"))];
         let handoff = envelope_with(&NEW, 2, chain.clone(), "alab");
         put(&running, &handoff).expect("an endorsed handoff");
-        // The new key is the pin now, carrying the chain on; the old key is not.
         put(&running, &envelope_with(&NEW, 3, chain, "alab")).expect("the new key");
         let error = put(&running, &envelope(&OLD, 4)).expect_err("the old key");
         assert!(error.0.contains("403"), "{error}");
@@ -2426,8 +2214,6 @@ mod tests {
 
     #[test]
     fn a_fresh_store_pinned_to_the_first_key_takes_a_vault_three_rotations_on() {
-        // What `serve` pins `alab` to is the key a build carries, which may be older than the
-        // vault's key: a new server follows the chain from it like any reader.
         let seeds: Vec<[u8; 32]> = (0..4u8).map(|index| [0x40 + index; 32]).collect();
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let mut options = options(root.path(), Duration::from_millis(200));
@@ -2456,8 +2242,6 @@ mod tests {
             "alab",
         );
         put(&running, &chained).expect("followed from the pin");
-        // The vault's key is the pin now, and the chain it carried is what every version
-        // after carries: one that drops it would cut the first key off.
         let error = put(&running, &envelope(&seeds[3], 10)).expect_err("the chain dropped");
         assert!(error.0.contains("403"), "{error}");
         assert!(error.0.contains("handoff 1 of 3"), "{error}");
@@ -2481,7 +2265,6 @@ mod tests {
         let once = envelope_with(&seeds[1], 2, chain[..1].to_vec(), "alab");
         put(&running, &once).expect("the first rotation");
 
-        // An admin on a build before chains rotates again: it carries its own link alone.
         let cut = envelope_with(&seeds[2], 3, chain[1..].to_vec(), "alab");
         let error = put(&running, &cut).expect_err("the first link dropped");
         assert!(error.0.contains("403"), "{error}");
@@ -2491,7 +2274,6 @@ mod tests {
         );
         let first = crate::envelope::fingerprint(&signer_public(&seeds[0]).expect("public"));
         assert!(error.0.contains(&first), "{error}");
-        // Nor does the held key drop it without rotating.
         let error = put(&running, &envelope(&seeds[1], 3)).expect_err("dropped in place");
         assert!(error.0.contains("handoff 1 of 1"), "{error}");
         assert_eq!(stored(root.path()).as_deref(), Some(once.as_slice()));
@@ -2502,8 +2284,6 @@ mod tests {
         .expect("the chain carried on");
         running.stop();
 
-        // A store that took the cut version first (an older server's store) takes the version
-        // an admin's copy restores the dropped link in.
         let other = root.path().join("cut");
         let running = run(&options(&other, Duration::from_millis(200)));
         put(&running, &cut).expect("its first version, from this machine");
@@ -2520,11 +2300,7 @@ mod tests {
                 endorse(&OLD, "alab", &signer_public(seed).expect("public")).expect("endorsed"),
             )]
         };
-        // The vault, after its key went from OLD to NEW.
         let real = envelope_with(&NEW, 3, to(&NEW), "alab");
-        // What the admin that rotation removed fed a store that still held OLD's version: (a) a
-        // fork, a key of its own OLD endorsed, and (b) a version OLD signed, each with a seq no
-        // real version reaches.
         let fork = envelope_with(&STRANGER, 1 << 40, to(&STRANGER), "alab");
         let high = envelope(&OLD, 1 << 40);
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2534,7 +2310,6 @@ mod tests {
             let running = run(&options(&store, hold));
             put(&running, &envelope(&OLD, 1)).expect("first");
             put(&running, &fed).expect("taken before a build knew OLD retired");
-            // The control: the store refuses the vault while its build does not know.
             let error = put(&running, &real).expect_err("captured");
             assert!(error.0.contains(why), "{error}");
             running.stop();
@@ -2575,8 +2350,6 @@ mod tests {
         }
         running.stop();
 
-        // The build that retires OLD takes the vault back, whose seq is far below the one the
-        // four were asked at: they are still listed, and give way to what the address asks.
         let running = run_tuned(&options(root.path(), hold), retiring());
         put(&running, &real).expect("the held key gave way");
         ask(&running, 5).expect("m1 gave way");
@@ -2585,7 +2358,6 @@ mod tests {
             4
         );
         running.stop();
-        // And so after a restart, which reads the queue from its file.
         let running = run_tuned(&options(root.path(), hold), retiring());
         ask(&running, 6).expect("m2 gave way");
         running.stop();
@@ -2606,13 +2378,11 @@ mod tests {
     fn a_retired_key_signs_nothing_the_server_takes() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let hold = Duration::from_millis(200);
-        // The control: a server that does not know OLD is retired takes it as a first version.
         let unaware = root.path().join("unaware");
         let running = run(&options(&unaware, hold));
         put(&running, &envelope(&OLD, 1)).expect("not retired here");
         running.stop();
 
-        // The removed admin's copy of the old key is not the first key a store trusts.
         let empty = root.path().join("empty");
         let running = run_tuned(&options(&empty, hold), retiring());
         let error = put(&running, &envelope(&OLD, 1)).expect_err("retired");
@@ -2621,8 +2391,6 @@ mod tests {
         assert!(stored(&empty).is_none());
         running.stop();
 
-        // A store that still holds a version the old key signed: neither a version the old
-        // key signs nor a key it endorses moves it; the key that replaced it does.
         let running = run_tuned(&options(&unaware, hold), retiring());
         let error = put(&running, &envelope(&OLD, 2)).expect_err("retired");
         assert!(error.0.contains("rotated away from"), "{error}");
@@ -2645,7 +2413,6 @@ mod tests {
     #[test]
     fn a_long_poll_answers_at_once_when_newer_and_wakes_on_a_put() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // A hold as long as the hang detector: a missed wake fails as a 204 or a timeout.
         let running = run(&options(root.path(), HANG_DETECTOR));
         put(&running, &envelope(&OLD, 5)).expect("first");
         let poll = |after| transport::fetch(&source(&running), Some(after), HANG_DETECTOR);
@@ -2690,7 +2457,6 @@ mod tests {
         let running = run(&options(root.path(), Duration::from_millis(200)));
         put(&running, &envelope(&OLD, 1)).expect("first");
         let line = join_line(1, "m22");
-        // A page's simple POST (text/plain needs no preflight), from any origin.
         for header in [
             "Origin: https://example.com",
             "origin: null",
@@ -2707,8 +2473,6 @@ mod tests {
             );
             assert!(answer.starts_with("HTTP/1.1 403 "), "{header}: {answer}");
         }
-        // Refuse reads that carry Fetch Metadata too. Browsers omit these
-        // headers for destinations that are not potentially trustworthy.
         for path in ["/v1/alab", "/v1/alab/join"] {
             let answer = raw(
                 &running,
@@ -2725,7 +2489,6 @@ mod tests {
                 .is_empty(),
             "nothing a browser sent was queued"
         );
-        // NEGATIVE CONTROL: aterm's own client is answered.
         transport::post_join(&url(&running), &line).expect("queued");
         assert_eq!(
             transport::list_joins(&url(&running)).expect("listed").len(),
@@ -2748,7 +2511,6 @@ mod tests {
 
         transport::post_join(&url(&running), &line).expect("queued");
         transport::post_join(&url(&running), &join_line(2, "m3")).expect("queued");
-        // The same key again replaces its request.
         transport::post_join(&url(&running), &join_line(1, "m22b")).expect("again");
         let listed = transport::list_joins(&url(&running)).expect("listed");
         assert_eq!(listed.len(), 2, "{listed:?}");
@@ -2765,7 +2527,6 @@ mod tests {
             join_line(3, "M22"),
             format!("{} 1", join_line(3, "m22")),
             format!("{}\nsecond line", join_line(3, "m22")),
-            // The code of another key.
             format!("{} m22 {}", key(3), code(4)),
         ] {
             let answer = raw(
@@ -2794,7 +2555,6 @@ mod tests {
         let mut queue = Vec::new();
         for n in 0..MAX_JOINS {
             let mut line = crate::transport::test_recipient(0);
-            // Distinct keys: vary the last characters.
             line.truncate(60);
             line.push(char::from(b"qpzry9x8gf2tvdw0s3jn54khce6mua7l"[n % 32]));
             line.push(char::from(b"qpzry9x8gf2tvdw0s3jn54khce6mua7l"[n / 32]));
@@ -2818,8 +2578,6 @@ mod tests {
         assert!(error.0.contains("429"), "{error}");
         assert!(error.0.contains("already holds 256"), "{error}");
 
-        // Once a publish answered them, the longest queued gives way to a new key: a queue
-        // filled once is not shut to every new machine for a week.
         put(&running, &envelope(&OLD, 2)).expect("a new version");
         transport::post_join(&url(&running), &join_line(1, "m22")).expect("room made");
         let state = running.shared.lock_server_state();
@@ -2843,7 +2601,6 @@ mod tests {
         transport::post_join(&url(&running), &line).expect("queued");
         running.stop();
 
-        // A request from eight days ago, written as the server writes them.
         let old = format!(
             "{} m9 abcd-ef24-ghij-k234 {}\n",
             crate::transport::test_recipient(2),
@@ -2862,7 +2619,6 @@ mod tests {
         let listed = transport::list_joins(&url(&running)).expect("listed");
         assert_eq!(listed.len(), 1, "{listed:?}");
         assert!(listed[0].starts_with(&line), "{listed:?}");
-        // The pin and the seq survived the restart.
         assert!(put(&running, &envelope(&OLD, 3)).is_err());
         assert!(put(&running, &envelope(&STRANGER, 5)).is_err());
         put(&running, &envelope(&OLD, 5)).expect("newer");
@@ -2981,7 +2737,6 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
         let answer = raw(&running, b"GET /v1/alab HTTP/1.1\r\n folded\r\n\r\n");
         assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
-        // Nothing outside the store was touched or served.
         assert_eq!(
             get(&running).expect("held"),
             Fetched::Body(envelope(&OLD, 1))
@@ -3038,7 +2793,6 @@ mod tests {
             request(now),
             request(now - JOIN_TTL_SECS),
             request(now - JOIN_TTL_SECS - 1),
-            // Queued before the clock was stepped back: two days, and a week, kept.
             request(now + 2 * 86_400),
             request(now + JOIN_TTL_SECS),
             request(now + JOIN_TTL_SECS + 1),
@@ -3060,14 +2814,12 @@ mod tests {
     #[test]
     fn one_address_holds_at_most_16_connections_and_the_next_reads_503() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // Held past the hang detector: only a stop, or noticing a client gone, ends one.
         let tuning = Tuning {
             liveness_every: Duration::from_millis(10),
             ..Tuning::default()
         };
         let running = run_tuned(&options(root.path(), 2 * HANG_DETECTOR), tuning);
         put(&running, &envelope(&OLD, 1)).expect("first");
-        // The publish's own connection may still hold a slot as it closes.
         until_closed(&running);
         let poll = b"GET /v1/alab?after=1 HTTP/1.1\r\nHost: x\r\n\r\n";
         let mut held: Vec<TcpStream> = (0..MAX_PEER_CONNECTIONS)
@@ -3075,7 +2827,6 @@ mod tests {
             .collect();
         until_waiting(&running, MAX_PEER_CONNECTIONS);
 
-        // One more, its request sent and all, reads its refusal rather than a reset.
         let answer = raw(&running, b"GET /v1/alab HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
         assert!(
@@ -3084,7 +2835,6 @@ mod tests {
         );
         assert!(answer.contains("Connection: close\r\n"), "{answer}");
 
-        // A client that leaves frees its slot once its long-poll notices.
         drop(held.pop());
         until_waiting(&running, MAX_PEER_CONNECTIONS - 1);
         until("the departed client's slot is released", || {
@@ -3109,7 +2859,6 @@ mod tests {
     #[test]
     fn at_most_4_put_bodies_are_read_at_once() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // Stalled bodies outlast the hang detector: only their clients end them here.
         let tuning = Tuning {
             body_deadline: 2 * HANG_DETECTOR,
             body_stall: 2 * HANG_DETECTOR,
@@ -3123,8 +2872,6 @@ mod tests {
         );
         let mut partial = head.clone().into_bytes();
         partial.extend_from_slice(&body[..10]);
-        // This machine's PUTs (loopback) are not counted by address: all four slots are
-        // its own.
         let stalled: Vec<TcpStream> = (0..MAX_PUTS).map(|_| sent(&running, &partial)).collect();
         until("four bodies are being read", || {
             reading(&running) == MAX_PUTS
@@ -3135,7 +2882,6 @@ mod tests {
         let answer = raw(&running, &whole);
         assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
         assert!(answer.contains("4 envelopes"), "{answer}");
-        // Reads are not held back.
         assert_eq!(get(&running).expect("answered"), Fetched::Missing);
 
         drop(stalled);
@@ -3147,7 +2893,7 @@ mod tests {
     /// Whether [`toggled`] says a peer is this machine's.
     static LOCAL: AtomicBool = AtomicBool::new(false);
 
-    /// An `is_local` a test flips: loopback stands for this machine or for another one.
+    /// An `is_local` a test flips.
     fn toggled(_: IpAddr, _: Option<IpAddr>) -> bool {
         LOCAL.load(Ordering::SeqCst)
     }
@@ -3155,14 +2901,12 @@ mod tests {
     #[test]
     fn another_machine_reads_one_put_at_a_time_and_the_last_slot_is_this_machines() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // Stalled bodies outlast the hang detector: only their clients end them here.
         let tuning = Tuning {
             body_deadline: 2 * HANG_DETECTOR,
             body_stall: 2 * HANG_DETECTOR,
             is_local: toggled,
             ..Tuning::default()
         };
-        // Pinned, so another machine's first version is read at all.
         let mut options = options(root.path(), Duration::from_millis(200));
         options.pins = vec![("alab".to_owned(), signer_public(&OLD).expect("public"))];
         let running = run_tuned(&options, tuning);
@@ -3176,7 +2920,6 @@ mod tests {
         let mut whole = head.into_bytes();
         whole.extend_from_slice(&body);
 
-        // Another machine's address sends one envelope at a time.
         LOCAL.store(false, Ordering::SeqCst);
         let mut stalled = vec![sent(&running, &partial)];
         until("its body is being read", || reading(&running) == 1);
@@ -3184,7 +2927,6 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 503 "), "{answer}");
         assert!(answer.contains("your address is sending"), "{answer}");
 
-        // Other machines' PUTs leave the last slot to this machine's.
         LOCAL.store(true, Ordering::SeqCst);
         stalled.extend((0..2).map(|_| sent(&running, &partial)));
         until("three bodies are being read", || reading(&running) == 3);
@@ -3206,16 +2948,16 @@ mod tests {
     #[test]
     fn a_put_body_that_stalls_or_outruns_its_deadline_is_cut_with_408_and_frees_its_slot() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // In each, only the clock under test can cut the body: the other is past the hang
-        // detector.
         let stall = Tuning {
             body_stall: Duration::from_millis(100),
             body_deadline: 2 * HANG_DETECTOR,
             ..Tuning::default()
         };
+        // The trickling client keeps the linger's drain going until it ends.
         let deadline = Tuning {
             body_stall: 2 * HANG_DETECTOR,
             body_deadline: Duration::from_millis(200),
+            linger: Duration::from_millis(100),
             ..Tuning::default()
         };
         let head = format!(
@@ -3228,7 +2970,6 @@ mod tests {
         ] {
             let running = run_tuned(&options(root.path(), Duration::from_millis(200)), tuning);
             let stream = sent(&running, head.as_bytes());
-            // A byte now and then keeps a body from stalling, but buys it no time.
             let mut writer = stream.try_clone().expect("clone");
             let trickle = std::thread::spawn(move || {
                 while trickled && writer.write_all(b"a").is_ok() {
@@ -3279,7 +3020,6 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // Asked again within the hour of its queue time, it changes nothing, not even the store.
         let recent = now() - (JOIN_REFRESH_EVERY_SECS - 60);
         queued_at(recent);
         transport::post_join(&url(&running), &line).expect("asked again");
@@ -3289,9 +3029,6 @@ mod tests {
         );
         assert_eq!(inode(&joins), first, "the store was rewritten");
 
-        // An hour on, its time moves on in its place, asked from any address (a Mac whose
-        // address changed asks from its new one), so a machine still waiting (it asks hourly)
-        // never ages out of the queue; it keeps the address it was queued from.
         let earlier = now() - JOIN_REFRESH_EVERY_SECS;
         queued_at(earlier);
         let set_peer = |peer: Option<IpAddr>| {
@@ -3324,8 +3061,6 @@ mod tests {
         let moved = inode(&joins);
         set_peer(here);
 
-        // Another proof from the same key replaces it, and so does another host (from another
-        // address it would be queued beside it).
         transport::post_join(
             &url(&running),
             &format!("{} proof={}", join_line(1, "m22"), proof(2)),
@@ -3347,7 +3082,6 @@ mod tests {
     #[test]
     fn another_address_can_neither_replace_nor_hide_a_queued_join_request() {
         use std::sync::atomic::AtomicU64;
-        // The test's own clock, as in the change-gap test: no gap depends on the machine's pace.
         const START: u64 = 1_800_000_000;
         static CLOCK: AtomicU64 = AtomicU64::new(START);
         fn clock() -> u64 {
@@ -3373,8 +3107,6 @@ mod tests {
         let asked = format!("{} proof={}", join_line(1, "m30"), proof(1));
         assert_eq!(ask(&asked, machine), 204);
 
-        // A stranger who read the key off the listing posts it with a code that is not its
-        // key's (refused), then, a gap on, with its code under another host and proof.
         assert_eq!(ask(&format!("{key} m30 {}", code(2)), stranger), 400);
         CLOCK.store(START + gap, Ordering::SeqCst);
         assert_eq!(
@@ -3392,8 +3124,6 @@ mod tests {
             "the machine's request stands as it asked it"
         );
 
-        // The stranger changing its own line every gap holds off none of the machine's
-        // changes: a corrected password lands at once.
         CLOCK.store(START + 2 * gap, Ordering::SeqCst);
         assert_eq!(
             ask(
@@ -3409,8 +3139,6 @@ mod tests {
             ),
             204
         );
-        // Moved to another address, the machine asks again for exactly what it asked: still
-        // one request of its own.
         let moved: IpAddr = "192.0.2.11".parse().expect("address");
         assert_eq!(
             ask(
@@ -3429,9 +3157,6 @@ mod tests {
         assert_eq!(mine[0].request.proof, Some(proof(4)));
         drop(state);
 
-        // A stranger re-posting the machine's line an hour on moves its time, as the machine
-        // asking from a new address would, but not what the gap reads, so the machine's own
-        // change a moment later is not held off.
         let hour = START + 2 * gap + JOIN_REFRESH_EVERY_SECS;
         CLOCK.store(hour, Ordering::SeqCst);
         let asked = format!("{} proof={}", join_line(1, "m30"), proof(4));
@@ -3440,8 +3165,6 @@ mod tests {
         let asked = format!("{} proof={}", join_line(1, "m30"), proof(5));
         assert_eq!(ask(&asked, machine), 204);
 
-        // Moved for good, the machine asking again hourly from its new address moves its time
-        // each hour, so it stays queued past the week a request lasts.
         let mut at = hour + 1;
         while at < hour + 1 + JOIN_TTL_SECS + 2 * JOIN_REFRESH_EVERY_SECS {
             at += JOIN_REFRESH_EVERY_SECS;
@@ -3458,8 +3181,6 @@ mod tests {
         running.stop();
     }
 
-    /// Two addresses asking for one key list it twice, and an open vault's approver lets it in
-    /// once, as the first line asked.
     #[test]
     fn a_key_two_addresses_ask_for_is_let_in_once() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3511,7 +3232,6 @@ mod tests {
         let error = transport::post_join(&url(&running), &join_line(5, "m5")).expect_err("a fifth");
         assert!(error.0.contains("429"), "{error}");
         assert!(error.0.contains("your address"), "{error}");
-        // A queued key may still change its request.
         transport::post_join(&url(&running), &join_line(4, "m4b")).expect("replaced");
 
         let listed = transport::list_joins(&url(&running)).expect("listed");
@@ -3524,15 +3244,12 @@ mod tests {
         assert_eq!(stored.matches("peer 127.0.0.1 1\n").count(), 4, "{stored}");
         running.stop();
 
-        // The addresses survive a restart.
         let running = run(&options(root.path(), Duration::from_millis(200)));
         let error =
             transport::post_join(&url(&running), &join_line(5, "m5")).expect_err("still a fifth");
         assert!(error.0.contains("429"), "{error}");
         running.stop();
 
-        // A store written before addresses were kept reads, its requests from no known
-        // address, so they count against no one.
         let old: String = stored
             .lines()
             .filter(|line| !line.starts_with("peer "))
@@ -3559,17 +3276,13 @@ mod tests {
         }
         assert!(ask(5).expect_err("a fifth").0.contains("429"));
 
-        // An admin publishes (approving m1 and m2, say): what it saw gives way, the longest
-        // queued first, to what the address asks next.
         put(&running, &envelope(&OLD, 2)).expect("a new version");
         ask(5).expect("m1 gave way");
-        // m3 and m4, still waiting, ask again as their subscribers do: they count again.
         ask(3).expect("asked again");
         ask(4).expect("asked again");
         ask(6).expect("m2 gave way");
         let error = ask(7).expect_err("a fifth counted");
         assert!(error.0.contains("your address"), "{error}");
-        // Never more than 4 from the address, however many versions it outlasts.
         let hosts: Vec<String> = transport::list_joins(&url(&running))
             .expect("listed")
             .iter()
@@ -3582,8 +3295,6 @@ mod tests {
     #[test]
     fn a_key_changes_its_request_at_most_every_10_s_and_the_log_notes_it_hourly() {
         use std::sync::atomic::AtomicU64;
-        // The server's clock is this test's own: it stands still until the test moves it, so
-        // no gap and no hour depends on how fast the machine runs the test.
         const START: u64 = 1_800_000_000;
         static CLOCK: AtomicU64 = AtomicU64::new(START);
         fn clock() -> u64 {
@@ -3611,7 +3322,6 @@ mod tests {
         );
         assert_eq!(held(&running).request.time, Some(START));
 
-        // A second short of the gap, a change is refused and nothing moves.
         at(gap - 1);
         let error = transport::post_join(&url(&running), &join_line(1, "m22b"))
             .expect_err("changed too soon");
@@ -3621,21 +3331,16 @@ mod tests {
         assert_eq!(held(&running).request.host, "m22");
         assert_eq!(held(&running).request.time, Some(START));
 
-        // CONTROL: at the gap, it changes, and a change within the hour of the last note is
-        // not noted again.
         at(gap);
         transport::post_join(&url(&running), &join_line(1, "m22b")).expect("changed");
         assert_eq!(held(&running).request.host, "m22b");
         assert_eq!(held(&running).request.time, Some(START + gap));
         assert_eq!(held(&running).noted, START, "noted again within the hour");
         assert_ne!(std::fs::read(&joins).expect("joins"), first);
-        // The gap runs from the last change, and the hour from the last note: a change a gap
-        // short of the hour is still not noted ...
         at(JOIN_NOTE_EVERY_SECS - gap);
         transport::post_join(&url(&running), &join_line(1, "m22c")).expect("changed");
         assert_eq!(held(&running).request.host, "m22c");
         assert_eq!(held(&running).noted, START, "noted again within the hour");
-        // ... and the next, an hour after the note, is.
         at(JOIN_NOTE_EVERY_SECS);
         transport::post_join(&url(&running), &join_line(1, "m22d")).expect("changed");
         assert_eq!(held(&running).request.host, "m22d");
@@ -3667,8 +3372,6 @@ mod tests {
         transport::post_join(&url(&running), &join_line(1, "m22")).expect("queued");
         transport::post_join(&url(&running), &join_line(2, "m23")).expect("queued");
 
-        // The server booted six hours fast, and NTP set it right: the person who mistyped
-        // the password joins again at once, and the change is taken.
         let back = START - 6 * 60 * 60;
         CLOCK.store(back, Ordering::SeqCst);
         transport::post_join(&url(&running), &join_line(1, "m22b")).expect("changed at once");
@@ -3685,7 +3388,6 @@ mod tests {
             ]
         );
 
-        // Two days fast, set right: the requests queued meanwhile are still listed.
         CLOCK.store(back - 2 * 86_400, Ordering::SeqCst);
         assert_eq!(
             transport::list_joins(&url(&running)).expect("listed").len(),
@@ -3699,7 +3401,6 @@ mod tests {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&options(root.path(), Duration::from_millis(200)));
         put(&running, &envelope(&OLD, 1)).expect("first");
-        // As if a join request's store write were on a slow disk.
         let writing = running.shared.join_writes();
         let target = url(&running);
         let poster =
@@ -3752,13 +3453,10 @@ mod tests {
         let read = parse_stored(&text);
         assert_eq!(triples(&read[..1]), triples(&queue[..1]));
         assert_eq!(triples(&read[2..]), triples(&queue[2..]));
-        // A request from no known address was asked at no seq the store kept.
         assert_eq!(
             (read[1].request.clone(), read[1].peer, read[1].asked),
             (request(2), None, 0)
         );
-        // A peer line names only the line after it; one before garbage, or one that is no
-        // address, names nothing; one without a seq names an address asked at none.
         let odd = format!(
             "peer 192.0.2.7\nnot a request\n{one}\npeer nonsense 3\n{two}\npeer 192.0.2.7\n{three}\n"
         );
@@ -3771,7 +3469,6 @@ mod tests {
     #[test]
     fn a_first_version_is_taken_only_from_this_machine_or_under_a_pin() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // Loopback is this machine: its first version is trusted on first use.
         let running = run(&options(
             &root.path().join("here"),
             Duration::from_millis(200),
@@ -3794,9 +3491,6 @@ mod tests {
             "{error}"
         );
         assert!(stored(&store).is_none());
-        // It is refused before its body is read: a head that promises one and sends none is
-        // answered at once (a body awaited would end in 408 after the stall), and holds no
-        // PUT slot.
         let answer = raw(
             &running,
             b"PUT /v1/alab HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n",
@@ -3809,9 +3503,7 @@ mod tests {
         pinned.pins = vec![("alab".to_owned(), signer_public(&OLD).expect("public"))];
         let running = run_tuned(&pinned, elsewhere);
         put(&running, &envelope(&OLD, 1)).expect("under the pin");
-        // Once a version is held, the pin decides, not the address.
         put(&running, &envelope(&OLD, 2)).expect("a later version");
-        // A name no pin covers is still refused.
         let other = Source::Url(format!("http://{}/v1/other", running.addr));
         let error = transport::publish(&other, &envelope_with(&OLD, 1, Vec::new(), "other"))
             .expect_err("unpinned");
@@ -3825,13 +3517,11 @@ mod tests {
         for local in ["127.0.0.1", "127.0.0.9", "::1", "::ffff:127.0.0.1"] {
             assert!(this_machine(ip(local), None), "{local}");
         }
-        // A connection from the address it arrived on came from this machine.
         assert!(this_machine(ip("192.0.2.55"), Some(ip("192.0.2.55"))));
         assert!(this_machine(
             ip("::ffff:192.0.2.55"),
             Some(ip("192.0.2.55"))
         ));
-        // TEST-NET-1 is no machine's address.
         assert!(!this_machine(ip("192.0.2.55"), Some(ip("127.0.0.1"))));
         assert!(!this_machine(ip("192.0.2.55"), None));
         if let Some(primary) = primary_ipv4() {
@@ -3869,7 +3559,6 @@ mod tests {
         let waiter = std::thread::spawn(move || transport::fetch(&target, Some(1), HANG_DETECTOR));
         until_waiting(&running, 1);
         let shared = Arc::clone(&running.shared);
-        // The program reads the same three times, then as another file.
         let looks = AtomicUsize::new(0);
         let stamp = || {
             let look = looks.fetch_add(1, Ordering::SeqCst);
@@ -3884,7 +3573,6 @@ mod tests {
         .expect("a clean exit");
         assert!(looks.load(Ordering::SeqCst) >= 4);
         assert!(shared.stopping.load(Ordering::SeqCst));
-        // The held long-poll was answered, not cut.
         assert_eq!(
             waiter.join().expect("waiter").expect("ended"),
             Fetched::NoNewer(Some(1))
@@ -3894,11 +3582,6 @@ mod tests {
         });
     }
 
-    /// What [`serve`]'s signal thread does on a stop signal: raise the flag and unpark the
-    /// supervisor, which stops the server so [`serve`] goes on to end its children. The flag
-    /// is raised here, not by a signal: a test process cannot take one, since the harness's
-    /// own threads leave the stop signals unblocked and the kernel may hand it to one of them,
-    /// whose default action ends the whole run.
     #[test]
     fn a_raised_stop_flag_stops_the_server_and_ends_it_cleanly() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3911,8 +3594,6 @@ mod tests {
         let signalled = Arc::new(AtomicBool::new(false));
         let supervisor = {
             let signalled = Arc::clone(&signalled);
-            // The program never changes, and a pass waits past the hang detector: only the
-            // signal ends it.
             std::thread::spawn(move || supervise(running, 2 * HANG_DETECTOR, &|| None, &signalled))
         };
         signalled.store(true, Ordering::SeqCst);
@@ -3929,9 +3610,6 @@ mod tests {
         );
     }
 
-    /// The children [`serve`] holds end when it lets them go, as it does once the supervisor
-    /// returns: `dns-sd` has no lifeline of its own and would go on advertising this Mac. A
-    /// stand-in `sleep` holds each slot; one left running ends by itself within the minute.
     #[test]
     fn letting_the_servers_children_go_ends_them() {
         let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
@@ -3959,8 +3637,10 @@ mod tests {
     #[test]
     fn a_client_that_never_finishes_its_head_is_cut_at_the_deadline() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
+        // The trickling client below keeps the linger's drain going until it ends.
         let tuning = Tuning {
             head_deadline: Duration::from_millis(100),
+            linger: Duration::from_millis(100),
             ..Tuning::default()
         };
         let running = run_tuned(&options(root.path(), Duration::from_millis(200)), tuning);
@@ -3968,7 +3648,6 @@ mod tests {
             let answer = read_all(sent(&running, start));
             assert!(answer.starts_with("HTTP/1.1 408 "), "{answer}");
         }
-        // A byte now and then buys no time: the deadline is the whole head's.
         let stream = sent(&running, b"GET /v1/alab HTTP/1.1\r\nX-Slow: ");
         let mut writer = stream.try_clone().expect("clone");
         let trickle = std::thread::spawn(move || {
@@ -3988,16 +3667,12 @@ mod tests {
     #[test]
     fn an_answer_read_too_slowly_is_cut_at_its_deadline() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // Only the whole answer's deadline can cut it: one write may block past the hang
-        // detector.
         let tuning = Tuning {
             answer_deadline: Duration::from_millis(200),
             write_stall: 2 * HANG_DETECTOR,
             ..Tuning::default()
         };
         let running = run_tuned(&options(root.path(), Duration::from_millis(200)), tuning);
-        // More than loopback's socket buffers hold at both ends together, so the server's
-        // writes block on a client that reads nothing.
         let big = Arc::new(vec![b'x'; 15 << 20]);
         running.shared.lock_server_state().vaults.insert(
             "alab".to_owned(),

@@ -314,6 +314,7 @@ impl<'a, 'f> Shaper<'a, 'f> {
                         continue;
                     };
                     for index in feature.lookup_indices {
+                        // We only care about errors here for testing, and
                         // the budget's: past it the walk stops.
                         if gsub_handler.process_lookup(index) == Err(ProcessLookupError::OverBudget)
                         {
@@ -326,6 +327,7 @@ impl<'a, 'f> Shaper<'a, 'f> {
         if let Some(range) = gsub_handler.finish() {
             let mut result = false;
             for glyph_style in &mut glyph_styles[range] {
+                // We only want to return true here if we actually assign the
                 // style to avoid computing unnecessary metrics
                 result |= glyph_style.maybe_assign_gsub_output_style(style);
             }

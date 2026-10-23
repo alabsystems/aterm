@@ -1,28 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `targo --unverified forge survey`: the inventory report of aterm's
-//! third-party dependencies.
-//!
-//! # Every number is measured
-//!
-//! The report is assembled at run time from [`crate::loc::survey_cell`] (graph
-//! and per-package facts) and [`crate::dominator`] (true cost); no count is
-//! hand-typed.
-//!
-//! # Ranked by dominator cost
-//!
-//! `dom(C) = reach(root) \ reach(root, block C)`: the packages that disappear
-//! if and only if `C` does. A subtree double-counts dependencies other edges
-//! also reach; the table prints the top row's subtree beside its dominator.
-//!
-//! # The partition invariant
-//!
-//! Dominator sets nest (`dom(naga) ⊂ dom(wgpu)`), so costs must not be summed
-//! blindly. The sets not nested inside another third-party package's set are
-//! pairwise disjoint and cover every third-party node, so their LOC sums to the
-//! third-party total exactly. The report prints that check, cross-checking
-//! [`crate::dominator`] against [`crate::loc`].
+//! Third-party dependency inventory ranked by dominator cost
+//! ([`crate::loc::survey_cell`], [`crate::dominator`]).
 
 use crate::dominator::DomCost;
 use crate::model::{Cell, CellSurvey, PkgId};
@@ -31,23 +11,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// A third-party package whose dominator is exactly itself and whose source is
-/// under this many lines is a replace-in-house candidate: removing it cascades
-/// to nothing.
+/// Line threshold below which a self-dominated third-party package is a replace-in-house candidate.
 const ZERO_COST_LOC: u64 = 3_000;
 
 const W_LOC: usize = 9;
 const W_PKGS: usize = 4;
 const W_NAME: usize = 33;
 const W_ALSO: usize = 43;
-/// Every emitted line stays inside this, so an 100-column terminal never wraps
-/// a table row into an unreadable second line.
+/// Every emitted line stays inside this.
 const W_LINE: usize = 96;
 
-/// Emit the survey. `cells` empty means every cell; `top` 0 means every row.
-///
-/// A cell that cannot be resolved is named and the outcome is not `ok`, so a
-/// partial survey never understates the surface.
+/// Emit the survey.
 pub fn run(root: &Path, cells: &[String], top: usize) -> Result<Outcome, String> {
     let all = resolve::default_cells();
     let chosen = resolve::select(&all, cells)?;
@@ -89,12 +63,10 @@ pub fn run(root: &Path, cells: &[String], top: usize) -> Result<Outcome, String>
     })
 }
 
-/// A cell that did not resolve: its name, and why.
+/// A cell that did not resolve.
 type Skipped = (String, String);
 
-/// Survey each chosen cell: those that resolved, and every one that did not,
-/// named with why. `Err` is that list when none resolved; each caller says what
-/// that stops ([`run`], [`crate::blame::run`]).
+/// Survey each chosen cell ([`run`], [`crate::blame::run`]).
 pub(crate) fn survey_cells(
     root: &Path,
     chosen: &[Cell],
@@ -117,15 +89,11 @@ pub(crate) fn survey_cells(
     Ok((surveys, skipped))
 }
 
-// ---------------------------------------------------------------- report body
-
 fn preamble(out: &mut String, root: &Path, surveys: &[CellSurvey]) {
     let names: Vec<&str> = surveys.iter().map(|s| s.cell.name.as_str()).collect();
     let _ = writeln!(out, "{}", "=".repeat(W_LINE));
     let _ = writeln!(out, "FORGE SURVEY — aterm's third-party surface");
     let _ = writeln!(out, "{}", "=".repeat(W_LINE));
-    // Elided from the left: every line fits 100 columns, and the tail (the
-    // leaf directory) is the informative half of a checkout path.
     let root_text = root.display().to_string();
     let root_line = if root_text.chars().count() > 88 {
         let tail: String = root_text
@@ -193,8 +161,7 @@ fn cell_section(out: &mut String, s: &CellSurvey, top: usize) {
     zero_cost_section(out, s, &ranked);
 }
 
-/// The ranked table, plus the two things that make it honest: the live
-/// subtree-vs-dominator comparison, and the partition check.
+/// The ranked table, plus the two things that make it honest.
 fn ranked_table(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost)], top: usize) {
     let _ = writeln!(
         out,
@@ -219,9 +186,6 @@ fn ranked_table(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost)], t
         );
     }
 
-    // A row is NESTED when some other row's dominator set already contains it:
-    // deleting the outer row deletes this one too, so the two costs must never
-    // be added together.
     let mut covered: BTreeSet<&PkgId> = BTreeSet::new();
     for (id, cost) in ranked {
         for other in &cost.also {
@@ -285,10 +249,7 @@ fn ranked_table(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost)], t
     partition_check(out, s, ranked, &covered);
 }
 
-/// Non-nested dominator sets are pairwise disjoint and cover every third-party
-/// node, so their LOC must sum to the third-party total. Printing the identity
-/// makes any disagreement between [`crate::dominator`] and [`crate::loc`]
-/// visible.
+/// Checks that non-nested dominator sets partition all third-party nodes ([`crate::dominator`], [`crate::loc`]).
 fn partition_check(
     out: &mut String,
     s: &CellSurvey,
@@ -428,8 +389,6 @@ fn zero_cost_section(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost
         let _ = writeln!(out, "{}", line.trim_end());
     }
 
-    // The SPDX expression decides whether replacing one in-house is even
-    // allowed, so it is censused in full rather than truncated into a column.
     let mut by_license: BTreeMap<&str, usize> = BTreeMap::new();
     for (id, _) in &leaves {
         let lic = s.facts.get(*id).map_or("", |f| f.license.as_str());
@@ -523,10 +482,7 @@ fn cross_cell(out: &mut String, surveys: &[CellSurvey]) {
     );
 }
 
-// ------------------------------------------------------------------ formatting
-
-/// Thousands separators. Big numbers are the point of this report and an
-/// unseparated seven-digit column is unreadable at a glance.
+/// Thousands separators.
 pub(crate) fn commas(n: u64) -> String {
     let digits = n.to_string();
     let len = digits.len();
@@ -540,8 +496,7 @@ pub(crate) fn commas(n: u64) -> String {
     out
 }
 
-/// Word-wrap prose that interpolates measured values, whose widths are unknown
-/// at source time. Shared with [`crate::blame`].
+/// Word-wraps prose with runtime-measured values ([`crate::blame`]).
 pub(crate) fn wrap(out: &mut String, indent: &str, text: &str, width: usize) {
     for para in text.split('\n') {
         let mut line = String::from(indent);
@@ -562,8 +517,7 @@ pub(crate) fn wrap(out: &mut String, indent: &str, text: &str, width: usize) {
     }
 }
 
-/// Truncate to `width` CHARACTERS (never bytes — a byte slice can split a
-/// multi-byte name and panic), marking the cut with a single ellipsis.
+/// Truncate to `width` CHARACTERS.
 pub(crate) fn fit(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
@@ -576,18 +530,12 @@ pub(crate) fn fit(s: &str, width: usize) -> String {
     out
 }
 
-/// One filesystem path, bounded to `width` characters without losing the part
-/// the reader came for.
-///
-/// [`fit`] cuts the tail, which on a path is the package directory. This drops
-/// whole leading components instead and marks the cut with `…/`, leaving a true
-/// suffix. A single component too long on its own falls back to [`fit`].
+/// Bounds a filesystem path to `width` characters while keeping its tail ([`fit`]).
 pub(crate) fn fit_path(path: &str, width: usize) -> String {
     if path.chars().count() <= width {
         return path.to_string();
     }
     let parts: Vec<&str> = path.split('/').collect();
-    // Widest suffix that still fits once the "…/" marker is charged for.
     for start in 1..parts.len() {
         let tail = parts[start..].join("/");
         if tail.chars().count() + 2 <= width {
@@ -597,8 +545,7 @@ pub(crate) fn fit_path(path: &str, width: usize) -> String {
     fit(path, width)
 }
 
-/// The `also` list, largest package first, packed into `width` columns with a
-/// trailing `+N more` so the count is never lost to truncation.
+/// The `also` list.
 fn also_column(s: &CellSurvey, also: &[PkgId], target: &PkgId, width: usize) -> String {
     let mut items: Vec<(&PkgId, u64)> = also
         .iter()
@@ -636,8 +583,7 @@ fn also_column(s: &CellSurvey, also: &[PkgId], target: &PkgId, width: usize) -> 
     fit(&out, width)
 }
 
-/// Packages reachable FROM `id` (its subtree) — reported only next to the
-/// dominator cost, as the live demonstration that the two differ.
+/// Packages reachable FROM `id` (its subtree).
 fn reach_from(s: &CellSurvey, id: &PkgId) -> BTreeSet<PkgId> {
     let mut seen = BTreeSet::new();
     seen.insert(id.clone());
@@ -659,8 +605,6 @@ fn reach_from(s: &CellSurvey, id: &PkgId) -> BTreeSet<PkgId> {
 mod tests {
     use super::*;
 
-    /// A name cut to fit its column never splits a multi-byte character (a
-    /// byte-indexed cut panics on one).
     #[test]
     fn fit_truncates_by_chars_and_never_splits_one() {
         assert_eq!(fit("abc", 5), "abc");

@@ -264,7 +264,7 @@ impl PreverifyPublisher {
 
 #[cfg(unix)]
 impl HandoffWorkerJob {
-    fn capture(&self) -> &HandoffCapture {
+    const fn capture(&self) -> &HandoffCapture {
         self.capture
             .as_ref()
             .expect("the handoff worker reads the capture only after the park delivered it")
@@ -319,7 +319,7 @@ struct HandoffLaneFacts {
 
 #[cfg(target_os = "macos")]
 #[must_use]
-fn out_of_band_lane_refusal(facts: HandoffLaneFacts) -> Option<&'static str> {
+const fn out_of_band_lane_refusal(facts: HandoffLaneFacts) -> Option<&'static str> {
     if !facts.launcher_available {
         return Some("this platform has no LaunchServices launcher");
     }
@@ -370,7 +370,7 @@ struct HandoffWorkerCleanup {
 }
 
 #[cfg(unix)]
-fn successor_reads_fabric_carry(target_build: u64, running_build: u64) -> bool {
+const fn successor_reads_fabric_carry(target_build: u64, running_build: u64) -> bool {
     target_build >= running_build
 }
 
@@ -507,7 +507,7 @@ pub(crate) type AgentCarry = (
 
 #[cfg(unix)]
 #[must_use]
-fn handoff_commit_admitted(facts: HandoffCommitFacts) -> bool {
+const fn handoff_commit_admitted(facts: HandoffCommitFacts) -> bool {
     facts.exact_sessions
         && facts.exact_layout
         && facts.exact_agent_carry
@@ -567,7 +567,7 @@ fn handoff_rejection_reason(
 }
 
 #[cfg(unix)]
-fn handoff_rejection_activity_shaped(facts: HandoffCommitFacts) -> bool {
+const fn handoff_rejection_activity_shaped(facts: HandoffCommitFacts) -> bool {
     !facts.exact_sessions
         || !facts.exact_layout
         || !facts.exact_agent_carry
@@ -757,7 +757,7 @@ impl HandoffCandidate {
         }
     }
 
-    fn from_bare_pid(pid: u32) -> Self {
+    const fn from_bare_pid(pid: u32) -> Self {
         Self { pid, birth: None }
     }
 
@@ -905,6 +905,8 @@ fn signal_handoff_candidate(candidate: HandoffCandidate) {
         HandoffCandidateIdentity::Recycled => (),
         HandoffCandidateIdentity::Corroborated => kill_corroborated_candidate(pid),
         HandoffCandidateIdentity::Unwitnessed => {
+            // A group kill is sound only while the pid is pinned: a launched candidate can
+            // be reaped by launchd, and `-pid` would then name a stranger's group. So ask
             // the kernel now (`WNOWAIT`; ECHILD means not pinned).
             if candidate_is_our_child(pid) {
                 // SAFETY: `SIGKILL` to the verified candidate process group and candidate PID.
@@ -1462,7 +1464,7 @@ impl crate::UpdateHandoffCompletion {
     }
 
     #[must_use]
-    fn with_child_death(mut self, death: crate::ChildDeathEvidence) -> Self {
+    const fn with_child_death(mut self, death: crate::ChildDeathEvidence) -> Self {
         self.child_death = death;
         self
     }
@@ -1791,6 +1793,7 @@ fn worker_pre_park_check(
         let facts = match verify(job) {
             Ok(facts) => facts,
             Err(error) => {
+                // The verdict is the arm-time read's word too, and is kept
                 // where that read keeps it ([`PreverifyPublisher::publish_refusal`]).
                 if let Some(publisher) = job.preverified.as_ref() {
                     publisher
@@ -1811,6 +1814,7 @@ fn worker_pre_park_check(
             return Err(PreParkRefusal::Policy(refusal));
         }
     } else if let Some(error) = skipped_verification_floor_refusal(job, floor) {
+        // A fresh cached pass skipped the full check; the floor and the stage are what the
         // cache cannot vouch for, refused as the full check would refuse them.
         return Err(refused(error));
     }
@@ -3215,6 +3219,8 @@ fn run_prelaunched_handoff(
         )
         .err();
     if let Some(error) = transfer_failed {
+        // Only a failure before the descriptors left is an ungranted stand-down; after a
+        // partial send the successor holds duplicates, and rollback owes the candidate
         // proof.
         if matches!(
             error,
@@ -3374,6 +3380,8 @@ fn run_handoff_decision(
         corroboration,
     );
     if proof_outcome != crate::UpdateHandoffOutcome::ProofReady {
+        // A refusing, crashed or starved successor all close the readiness channel alike;
+        // the successor logs its own refusal and the reject path adds what this process
         // saw.
         if proof_outcome == crate::UpdateHandoffOutcome::ChildDied {
             aterm_log::warn!(
@@ -3428,6 +3436,8 @@ fn run_handoff_decision(
 
     let decision_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
+        // Readable PTY output does not revoke here (post-park bytes wait in the
+        // kernel for the child). Only a cancel poke (`ActivityRevoked`) or session
         // death (HUP/ERR) rejects before Commit.
         if job.cancel.try_recv().is_ok()
             && worker_reject_and_reap_handoff_child(
@@ -3597,7 +3607,7 @@ impl FreezeSeed {
 
     /// The ledger's prior, or the default when neither was measured.
     #[must_use]
-    pub(crate) fn from_prior(prior: Option<&aterm_update::HandoffCaptureRecord>) -> Self {
+    pub(crate) const fn from_prior(prior: Option<&aterm_update::HandoffCaptureRecord>) -> Self {
         let Some(record) = prior else {
             return Self::Default;
         };
@@ -3864,7 +3874,7 @@ impl HandoffUnavailable {
 
     /// What is set.
     #[must_use]
-    pub(crate) fn cause(self) -> &'static str {
+    pub(crate) const fn cause(self) -> &'static str {
         match self {
             Self::UnownedControlSocket => {
                 "the configured control socket is not owned by this process"
@@ -3877,7 +3887,7 @@ impl HandoffUnavailable {
     /// The log line's remedy, for the reasons that have one.
     #[must_use]
     #[cfg(unix)]
-    pub(crate) fn remedy(self) -> &'static str {
+    pub(crate) const fn remedy(self) -> &'static str {
         match self {
             Self::UnownedControlSocket => {
                 " Resolve the control-socket ownership conflict before updating."
@@ -4002,7 +4012,7 @@ impl App {
 
     /// This process keeps the image it was launched with (`App::launch_image_kept`).
     #[must_use]
-    pub(crate) fn launch_keeps_image(&self) -> bool {
+    pub(crate) const fn launch_keeps_image(&self) -> bool {
         #[cfg(unix)]
         {
             self.launch_image_kept
@@ -4328,6 +4338,9 @@ impl App {
             && !(self.launch_image_kept && handoff_unavailable.is_some())
             && !self.handoff_exited_session_ids().is_empty()
         {
+            // A process that keeps its image has no cold lane to take once the held panes
+            // close (`KeptImageNeedsTerminal`): only a new tab's live session lets it hand over.
+            // With no overlap handoff either, nothing does, and the admission's own
             // refusal below says so (`update_admission_refusal`).
             return Err(crate::UpdateHandoffStartError::refused(
                 if self.launch_image_kept {
@@ -4362,12 +4375,15 @@ impl App {
         }
         match decision {
             crate::native_update_admission::AdmissionDecision::Block(reason) => {
+                // A Block is a refusal to attempt, never a failed attempt (see
+                // [`crate::UpdateHandoffStartError::Refused`]); counting it as a
                 // failure would inflate the failed-apply count.
                 return Err(update_admission_refusal(reason, facts, handoff_unavailable));
             }
             crate::native_update_admission::AdmissionDecision::Apply(
                 crate::native_update_admission::ApplyLane::Cold,
             ) => {
+                // The admission already refuses it (`image_kept`); said again where the
                 // exec is, whatever the facts.
                 if renewal {
                     return Err(crate::UpdateHandoffStartError::refused(
@@ -5962,6 +5978,7 @@ impl App {
             return;
         };
         if prelaunch.dialled.is_none() {
+            // The worker has not reported the dial yet: nothing has been
             // launched-and-held to park for.
             return;
         }
@@ -6083,6 +6100,7 @@ impl App {
             stand_down.detail
         );
         if prelaunch.stand_down.try_send(stand_down).is_err() {
+            // The worker is past its hold (or gone): the cancel poke reaches every
             // later wait it might be in.
             let _ = prelaunch.cancel.try_send(());
         }
@@ -6577,7 +6595,7 @@ impl App {
     }
 
     #[cfg(unix)]
-    fn handoff_loop_present(&self) -> bool {
+    const fn handoff_loop_present(&self) -> bool {
         #[cfg(test)]
         if self.handoff_reposts.is_some() {
             return true;
@@ -6955,6 +6973,7 @@ impl App {
                 self.on_native_terminate_requested(el, generation);
             }
             crate::DeferredHandoffTeardown::CleanQuitReady => {
+                // A native view or document may have gained unsaved work during the
                 // rollback, so both are asked again at the exit edge.
                 if self.replay_clean_quit_ready() {
                     el.exit();
@@ -6985,6 +7004,7 @@ impl App {
         let Some((completion, input_dispatch_fenced, egress_settled)) =
             self.handoff_drain_gate(completion)
         else {
+            // Re-posted for another drain spin (or the event loop is
             // closing and the drop rejects the attempt).
             return;
         };
@@ -7003,6 +7023,7 @@ impl App {
                 held_fence,
             )
         else {
+            // The pending attempt vanished mid-drain: nothing can be
             // committed; ask the worker to reject and reap.
             if let Some(reject) = completion.reject {
                 let _ = reject.try_send(());
@@ -8045,28 +8066,28 @@ enum PreverifyWaiter {
 
 #[cfg(unix)]
 impl PreverifyWaiter {
-    fn lane(self) -> &'static str {
+    const fn lane(self) -> &'static str {
         match self {
             Self::ForkPark => "the fork lane",
             Self::ColdRelaunch => "the cold lane",
         }
     }
 
-    fn what(self) -> &'static str {
+    const fn what(self) -> &'static str {
         match self {
             Self::ForkPark => "handoff policy",
             Self::ColdRelaunch => "pre-park verification",
         }
     }
 
-    fn acts(self) -> &'static str {
+    const fn acts(self) -> &'static str {
         match self {
             Self::ForkPark => "parks",
             Self::ColdRelaunch => "relaunches",
         }
     }
 
-    fn acting(self) -> &'static str {
+    const fn acting(self) -> &'static str {
         match self {
             Self::ForkPark => "parking",
             Self::ColdRelaunch => "relaunching",
@@ -9187,7 +9208,7 @@ enum PreDialDeath {
 
 #[cfg(target_os = "macos")]
 impl PreDialDeath {
-    fn evidence(self) -> crate::ChildDeathEvidence {
+    const fn evidence(self) -> crate::ChildDeathEvidence {
         match self {
             Self::TerminatedBeforeCheckIn => crate::ChildDeathEvidence::Unobserved,
             Self::NamedProcessGone { death, .. } => death,

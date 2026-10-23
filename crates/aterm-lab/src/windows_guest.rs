@@ -152,7 +152,7 @@ pub const GENERIC_PRO_KEY: &str = "VK7JG-NPHTM-C97JM-9MPGT-3V66T";
 /// The guest's name on its network.
 pub const COMPUTER_NAME: &str = "ATERM-LANE";
 
-/// A CPU architecture the lane builds.
+/// A CPU architecture the lane builds for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arch {
     /// The guest's own: built and run natively.

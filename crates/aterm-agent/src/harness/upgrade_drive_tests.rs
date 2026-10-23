@@ -7803,6 +7803,7 @@ fn the_real_classifier_conforms_to_the_upgrade_look_model() {
                                 let leads = present && group;
                                 let process = ids == Ids::Whole && argv;
                                 let (due, readable) = if !leads {
+                                    // No record of the tab's agent: final
                                     // past its launch, unknown before.
                                     (!old, old)
                                 } else if !behind {

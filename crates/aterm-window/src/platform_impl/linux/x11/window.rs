@@ -1033,6 +1033,7 @@ impl UnownedWindow {
         mut x: i32,
         mut y: i32,
     ) -> Result<VoidCookie<'_>, X11Error> {
+        // There are a few WMs that set client area position rather than window position, so
         // we'll translate for consistency.
         if util::wm_name_is_one_of(&["Enlightenment", "FVWM"]) {
             let extents = self.frame_extents()?;

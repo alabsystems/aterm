@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The trail host: the GUI-faithful frame seam the case families and laws drive
-//! (`copies_are_not_moves.rs`, `moves_are_followed.rs`, `erased_under_its_twin.rs`,
-//! `copy_beside_the_line.rs`, `moved_again_without_a_key.rs`, `composer_multiline_wrap.rs`).
-//! `effects_suite` mounts it once, with `#[macro_use]`.
-//!
-//! A real `aterm_core` [`Terminal`] is driven byte for byte. Each frame ([`Core::frame`]) is the
-//! GUI's: SYNC-1 withholding when asked, the content-scroll seam first (a scroll or band move is
-//! applied and the frame samples nothing, as `app_render.rs` does), then the frame hold (the
-//! caret row's probe and every row `CursorGlow::ribbon_rows` names, read after the last
-//! `process`), then the tick. Family differences are an explicit [`Opts`]; options a family
-//! sweeps (`far_ok`, `drop_far_frames`, a pet) are fields of [`Core`]. [`PacedHost`] frames time
-//! on a flat train or at the GUI's real pacing ([`Pace`]).
-//!
-//! Each case is registered by id ([`case`]) and judged by its family's reading ([`Outcome::ff`],
-//! [`Outcome::mf`]). A law runs the cases under one id prefix ([`holds`], [`holds_where`]); a law
-//! with stated limits names them by a rule over the ids ([`holds_but`]), and each named case must
-//! still read bad while every other holds.
-//!
-//! A family's grid is the product of what it sweeps. A release build, or `TRAIL_LAWS_FULL=1`
-//! (which `verify test` sets), runs every case; a debug run runs the spine ([`sweep`]): values
-//! either side of each stated threshold, so every law keeps a case that must hold and every limit
-//! rule names one. Counts the laws quote are of the full grid.
+//! GUI-faithful frame harness for cursor-trail case families and laws.
 #![allow(dead_code)]
 
 use aterm_core::render::GlowQuad;
@@ -32,9 +11,6 @@ use aterm_effects::kitty_pet::{PetBrain, PetSense};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
 
-// Outcomes and cases.
-
-/// One case's reading and verdict.
 #[derive(Clone, Debug, Default)]
 pub struct Outcome {
     pub followed: u64,
@@ -101,8 +77,6 @@ pub fn case(
     });
 }
 
-/// A law's running tally: the metrics it read, and every assertion that
-/// failed (a failed assertion does not stop the law — each is one `dark`).
 #[derive(Default)]
 pub struct Law {
     pub followed: u64,
@@ -163,9 +137,6 @@ pub fn istr(g: &[i32]) -> String {
         .join("")
 }
 
-// The shared host core.
-
-/// The frame seam's variants, as the case families use them.
 #[derive(Clone, Copy, Debug)]
 pub struct Opts {
     /// `sync_cursor_effect_scroll` first: a scroll / band move is applied to
@@ -197,9 +168,7 @@ pub const LOCK_A: Opts = Opts {
 
 #[derive(Clone, Copy)]
 pub enum Theme {
-    /// fg `0xC8D3F5`, bg `0x1A1B26`.
     Tokyo,
-    /// fg `0xD0D0D0`, bg `0x111318` (the composer captures').
     Default,
 }
 
@@ -487,18 +456,10 @@ macro_rules! core_deref {
     };
 }
 
-// The paced host.
-
-/// How a [`PacedHost`] frames time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pace {
-    /// A frame every `n` ms, whatever the engine asks for.
     Flat(u64),
-    /// The GUI's real pacing for the style "rainbow kitty" (no pet): 16 ms
-    /// while `needs_frame_cadence`, else at `next_change_deadline` —
-    /// 110–130 ms apart once a key's light has settled.
     Paced,
-    /// The same, with the default style's resident pet asking for frames.
     Pet,
 }
 
@@ -623,8 +584,6 @@ impl PacedHost {
     }
 }
 
-// The grid, and the law runner.
-
 /// Whether the laws run every case of each family's grid: in a release
 /// build, or with `TRAIL_LAWS_FULL` set (to anything but `0`). A debug build
 /// runs each grid's spine ([`sweep`]).
@@ -646,10 +605,6 @@ pub fn sweep<T: Clone + PartialEq + std::fmt::Debug>(all: &[T], spine: &[T]) -> 
     }
 }
 
-/// Runs every case of `cases` whose id satisfies `pick` and fails listing, in order, every one
-/// that does not read as it must: bad where `limit` names it (a limit that now holds is a finding
-/// too: restate the law), held everywhere else. A panic inside a case fails the law. Each case
-/// owns its host and clock, so the cases run on [`crate::common::par_map`]'s pool.
 fn run_law(cases: Vec<Case>, pick: impl Fn(&str) -> bool, limit: impl Fn(&str) -> bool) {
     let picked: Vec<Case> = cases.into_iter().filter(|c| pick(&c.id)).collect();
     assert!(!picked.is_empty(), "the law picks no case");

@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Panic-freedom fuzz for the VT engine on hostile output (`curl evil | cat`): the full
-//! byte space and the structured escape space (CSI/OSC/DCS/APC/PM with extreme or random
-//! params, bodies, intermediates and terminators), interleaved with resizes, with core
-//! invariants asserted after every step. Deterministic LCG, so a failure reproduces.
+
+//! Deterministic panic-freedom and invariant fuzz tests for the VT terminal engine.
 
 use aterm_core::terminal::Terminal;
 
-/// One step of a deterministic LCG (Knuth's MMIX constants).
 #[inline]
 fn next(state: &mut u64) -> u32 {
     *state = state
@@ -17,7 +13,6 @@ fn next(state: &mut u64) -> u32 {
     (*state >> 33) as u32
 }
 
-/// Invariants that must hold no matter what bytes were fed.
 fn check_invariants(term: &Terminal) {
     let (rows, cols) = (term.rows(), term.cols());
     assert!(
@@ -35,22 +30,15 @@ fn check_invariants(term: &Terminal) {
         "cursor col {} escaped bounds (cols {cols})",
         cur.col
     );
-    // The grid's own invariants (aterm-grid `invariants.rs`): cursor bounds, scroll
-    // region, ring structure, wide-char pairing.
     term.grid().assert_structural_invariants();
     term.grid().assert_wide_char_consistent();
 }
 
-/// Every extras-map entry on screen is claimed by its cell's HAS_EXTRAS bit
-/// (`Grid::assert_extras_claimed`): an operation that blanks or replaces a cell drops
-/// what the cell carried, or a later write adopts an old combining mark, skin tone or link.
 fn check_extras_claimed(term: &Terminal) {
     term.grid().assert_extras_claimed();
 }
 
-/// Every cell must be accessible without panic (corruption would index-panic).
 fn walk_all_cells(term: &Terminal) {
-    // `Grid::cell(r, c)` is `row(r)` then `get(c)`, so this visits the same cells.
     let (rows, cols) = (term.rows(), term.cols());
     for r in 0..rows {
         let Some(row) = term.grid().row(r) else {
@@ -66,8 +54,6 @@ fn walk_all_cells(term: &Terminal) {
 
 #[test]
 fn process_arbitrary_bytes_never_panics() {
-    // The widest net: uniform random bytes across the full 0x00..=0xFF range
-    // (malformed UTF-8, lone continuation bytes, stray ESC/CSI introducers).
     let mut s = 0xC0FF_EE12_3456_789Au64;
     let mut term = Terminal::new(24, 80);
     let mut buf: Vec<u8> = Vec::with_capacity(64);
@@ -86,13 +72,8 @@ fn process_arbitrary_bytes_never_panics() {
 
 #[test]
 fn process_crafted_escape_sequences_never_panics() {
-    // Bias hard toward valid-looking ESC/CSI/OSC/DCS/APC/PM shapes so the fuzz
-    // drives deep into the parser's parameter/string handling, where an
-    // unchecked index or overflow on an attacker-chosen parameter would panic.
     let mut s = 0x0BAD_C0DE_99C0_1A57u64;
     let mut term = Terminal::new(24, 80);
-    // Each `resize()` reflows all retained history; the cap bounds that and lets the ring
-    // wrap.
     term.set_scrollback_line_limit(Some(RESIZE_FUZZ_SCROLLBACK_LINES));
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     for _ in 0..100_000u32 {
@@ -104,7 +85,6 @@ fn process_crafted_escape_sequences_never_panics() {
         term.process(&buf);
         check_invariants(&term);
         check_extras_claimed(&term);
-        // Occasionally resize to exercise reflow against pathological state.
         if next(&mut s).is_multiple_of(64) {
             let r = (1 + next(&mut s) % 60) as u16;
             let c = (1 + next(&mut s) % 160) as u16;
@@ -118,9 +98,6 @@ fn process_crafted_escape_sequences_never_panics() {
 
 #[test]
 fn process_unicode_edges_never_panics() {
-    // Valid + truncated multi-byte UTF-8, wide CJK, emoji / ZWJ / regional
-    // indicators / skin tones, combining marks, VS15/VS16 — the width, grapheme
-    // and wrap paths, on a small grid so column-boundary wrap fires constantly.
     let mut s = 0xFEED_FACE_7717_2390u64;
     let mut term = Terminal::new(10, 12);
     let samples: &[&[u8]] = &[
@@ -161,8 +138,6 @@ fn process_unicode_edges_never_panics() {
     walk_all_cells(&term);
 }
 
-/// [`check_invariants`] plus scrollback consistency (`total_lines >= visible rows`, the
-/// spec's `TotalLinesMinimum`) and the offset-0 precondition of the strict cell walk.
 fn check_invariants_reflow(term: &Terminal) {
     check_invariants(term);
     let (rows, cols) = (term.rows(), term.cols());
@@ -171,9 +146,6 @@ fn check_invariants_reflow(term: &Terminal) {
         total >= rows as usize,
         "total_lines {total} < visible rows {rows} ({rows}x{cols})"
     );
-    // `Grid::cell` reads ring-resident rows only (`None` on a viewport scrolled onto lazy
-    // or tiered history), so the cell walk holds only at offset 0. These fuzzers never
-    // move the viewport.
     assert_eq!(
         term.grid().display_offset(),
         0,
@@ -181,11 +153,6 @@ fn check_invariants_reflow(term: &Terminal) {
     );
 }
 
-/// Every visible cell must be accessible (a corrupt row index/length would panic or return
-/// None here), and reading its char must not panic. Only sound at display offset 0, which
-/// [`check_invariants_reflow`] asserts first. Run after every step: once the capped ring
-/// ([`RESIZE_FUZZ_SCROLLBACK_LINES`]) wraps, `scroll_up` recycles ring rows, and a recycled
-/// row of stale width shows right after a `process()`, before a width change rebuilds it.
 fn walk_visible_cells_strict(term: &Terminal) {
     check_invariants_reflow(term);
     let (rows, cols) = (term.rows(), term.cols());
@@ -200,10 +167,6 @@ fn walk_visible_cells_strict(term: &Terminal) {
     }
 }
 
-/// Read every visible line plus a sampled scrollback window, reconstructing reflowed rows
-/// and history lines (slicing wide graphemes), so resize corruption surfaces as a panic.
-/// History is sampled: the 16 lines just above the screen, about 16 lines strided across
-/// the full depth, the oldest line, and one past it (the `None` boundary).
 fn probe_lines(term: &Terminal) {
     let rows = i32::from(term.rows());
     for r in 0..rows {
@@ -219,14 +182,8 @@ fn probe_lines(term: &Terminal) {
     }
 }
 
-/// History cap for the resize fuzzers. Far below the default ring cap, so the
-/// ring reaches capacity (head wrap, oldest-line eviction) early in the run and
-/// stays there; it also bounds the cost of each `resize()`, which reflows all
-/// retained history.
 const RESIZE_FUZZ_SCROLLBACK_LINES: usize = 250;
 
-/// Wide-grapheme + autowrap + style content that makes reflow do real work:
-/// CJK / emoji (width 2), ASCII runs, combining marks, colour SGR, newlines.
 fn emit_reflow_content(s: &mut u64, buf: &mut Vec<u8>) {
     const WIDE: &[&[u8]] = &[
         "日".as_bytes(),
@@ -254,15 +211,12 @@ fn emit_reflow_content(s: &mut u64, buf: &mut Vec<u8>) {
         }
         4 => buf.push(b'\n'),
         _ => {
-            // base char + combining acute — the grapheme-cluster path.
             buf.push((0x61 + (next(s) % 26)) as u8);
             buf.extend_from_slice("\u{0301}".as_bytes());
         }
     }
 }
 
-/// Resize dimensions biased toward small + extreme shapes (1×1, 1×N, N×1, tiny)
-/// that stress reflow's row/column buffers, plus a general range.
 fn next_dim_pair(s: &mut u64) -> (u16, u16) {
     match next(s) % 8 {
         0 => (1, 1),
@@ -273,18 +227,12 @@ fn next_dim_pair(s: &mut u64) -> (u16, u16) {
     }
 }
 
-/// The visible rows' text, top to bottom.
 fn screen_text(term: &Terminal) -> Vec<String> {
     (0..usize::from(term.rows()))
         .map(|r| term.row_text(r).unwrap_or_default())
         .collect()
 }
 
-/// Feed `buf` as `process` would, checking every line feed that lands on the bottom row of
-/// a full-screen scroll region at the live bottom: it scrolls every visible row up by
-/// exactly one and leaves a blank bottom row. The split is at line feeds only, which these
-/// fuzzers never emit inside an escape sequence or before a combining mark. Reading the
-/// cells catches a scroll that moved the extras but not the rows.
 fn process_checking_bottom_line_feeds(term: &mut Terminal, buf: &[u8]) {
     let mut rest = buf;
     while let Some(lf) = rest.iter().position(|&b| b == b'\n') {
@@ -330,8 +278,6 @@ fn process_checking_bottom_line_feeds(term: &mut Terminal, buf: &[u8]) {
 
 #[test]
 fn reflow_wide_char_resize_never_panics() {
-    // Wide graphemes through aggressive resize/reflow oscillation: a wide char straddling
-    // a shrunk column boundary is the classic reflow corruption surface.
     let mut s = 0x5EED_1234_ABCD_9001u64;
     let mut term = Terminal::new(24, 80);
     term.set_scrollback_line_limit(Some(RESIZE_FUZZ_SCROLLBACK_LINES));
@@ -345,7 +291,6 @@ fn reflow_wide_char_resize_never_panics() {
         process_checking_bottom_line_feeds(&mut term, &buf);
         walk_visible_cells_strict(&term);
         check_extras_claimed(&term);
-        // Resize ~1/3 of iterations to drive reflow against wide-char state.
         if next(&mut s).is_multiple_of(3) {
             let (r, c) = next_dim_pair(&mut s);
             term.resize(r, c);
@@ -357,9 +302,6 @@ fn reflow_wide_char_resize_never_panics() {
     walk_visible_cells_strict(&term);
 }
 
-/// `ESC # 6` makes the row DECDWL, 45 cells then U+A0E2 (a wide Yi syllable) put a pair at
-/// 45/46, and a resize 112 -> 46 cuts through it: the head in the new last column is
-/// blanked, never left wide without its continuation.
 #[test]
 fn a_decdwl_row_resized_through_its_wide_pair_stays_consistent() {
     let mut term = Terminal::new(4, 112);
@@ -376,9 +318,6 @@ fn a_decdwl_row_resized_through_its_wide_pair_stays_consistent() {
     term.grid().assert_wide_char_consistent();
 }
 
-/// The alternate screen resizes without rewrap, so a width cut through a wide pair blanks
-/// its head (`Row::resize`) and drops the head's extras: no link, mark or cluster stays on
-/// the blank.
 #[test]
 fn an_alt_screen_width_cut_through_a_wide_pair_drops_its_extras() {
     for glyph in ["\u{1F680}", "\u{4E2D}\u{301}"] {
@@ -408,9 +347,6 @@ fn an_alt_screen_width_cut_through_a_wide_pair_drops_its_extras() {
 
 #[test]
 fn alt_screen_resize_never_panics() {
-    // The alternate screen (vim, htop, less) has its own buffer and resize path: toggle
-    // DEC 1049 around wide-char content and aggressive resizes, and check that every line
-    // feed at the bottom scrolls the whole screen.
     let mut s = 0xA17E_5C9E_2026_0601u64;
     let mut term = Terminal::new(24, 80);
     term.set_scrollback_line_limit(Some(RESIZE_FUZZ_SCROLLBACK_LINES));
@@ -444,13 +380,10 @@ fn alt_screen_resize_never_panics() {
     walk_all_cells(&term);
 }
 
-/// Append one (mostly well-formed) escape sequence with randomized contents.
 fn emit_escape(s: &mut u64, buf: &mut Vec<u8>) {
     buf.push(0x1b); // ESC
     match next(s) % 9 {
         0 => {
-            // CSI: optional private marker, random params (`;`/`:`-separated),
-            // random intermediates, a final byte in 0x40..=0x7e.
             buf.push(b'[');
             if next(s).is_multiple_of(4) {
                 buf.push(b'?');
@@ -473,7 +406,6 @@ fn emit_escape(s: &mut u64, buf: &mut Vec<u8>) {
             buf.push((0x40 + (next(s) % 0x3f)) as u8);
         }
         1 => {
-            // OSC: numeric command ; random body ; random terminator (BEL/ST/none).
             buf.push(b']');
             for d in (next(s) % 1000).to_string().bytes() {
                 buf.push(d);
@@ -490,7 +422,6 @@ fn emit_escape(s: &mut u64, buf: &mut Vec<u8>) {
             }
         }
         2 => {
-            // DCS ... ST
             buf.push(b'P');
             let bl = next(s) % 48;
             for _ in 0..bl {
@@ -499,17 +430,14 @@ fn emit_escape(s: &mut u64, buf: &mut Vec<u8>) {
             buf.extend_from_slice(b"\x1b\\");
         }
         3 => {
-            // ESC # n — DEC line sizing / alignment.
             buf.push(b'#');
             buf.push((0x30 + (next(s) % 0x10)) as u8);
         }
         4 => {
-            // Charset designation: ESC ( ) * + <byte>.
             buf.push((0x28 + (next(s) % 4)) as u8);
             buf.push((next(s) & 0xFF) as u8);
         }
         5 => {
-            // APC ... ST
             buf.push(b'_');
             let bl = next(s) % 24;
             for _ in 0..bl {
@@ -518,7 +446,6 @@ fn emit_escape(s: &mut u64, buf: &mut Vec<u8>) {
             buf.extend_from_slice(b"\x1b\\");
         }
         6 => {
-            // PM ... ST
             buf.push(b'^');
             let bl = next(s) % 24;
             for _ in 0..bl {
@@ -527,11 +454,9 @@ fn emit_escape(s: &mut u64, buf: &mut Vec<u8>) {
             buf.extend_from_slice(b"\x1b\\");
         }
         7 => {
-            // A single ESC Fe (0x40..=0x5f): RI, NEL, HTS, IND, etc.
             buf.push((0x40 + (next(s) % 0x20)) as u8);
         }
         _ => {
-            // ESC followed by arbitrary garbage (resync stress).
             let bl = next(s) % 24;
             for _ in 0..bl {
                 buf.push((next(s) & 0xFF) as u8);
@@ -540,9 +465,6 @@ fn emit_escape(s: &mut u64, buf: &mut Vec<u8>) {
     }
 }
 
-/// Resize / reflow fuzz with its own emitter and seed: realistic samples (wrapping ASCII,
-/// wide CJK, ZWJ emoji, combining marks, tabs, SGR, home, a pending-wrap cell) and a
-/// resize about every other iteration, down to 1xN and Nx1.
 mod resize_reflow {
     use aterm_core::terminal::Terminal;
 
@@ -599,10 +521,6 @@ mod resize_reflow {
         );
     }
 
-    /// The resize schedule under the ConPTY seam policy, plus its law: a rows-only grow appends
-    /// blank rows and reveals nothing, so the history depth and every absolute key stay put.
-    /// History is capped as the other resize fuzzers cap it: with no reveal it accumulates, and
-    /// each width change rewraps all of it.
     #[test]
     fn resize_reflow_keeps_engine_invariants_under_the_conpty_policy() {
         use aterm_core::grid::ResizePolicy;
@@ -613,9 +531,6 @@ mod resize_reflow {
             emit_content(&mut s, &mut term);
             if next(&mut s) & 1 == 0 {
                 let r = 1 + (next(&mut s) % 50) as u16;
-                // A third of the resizes keep the width: window-height drags are
-                // the common ConPTY resize, and a random width almost never
-                // repeats.
                 let c = if next(&mut s).is_multiple_of(3) {
                     term.cols()
                 } else {
@@ -659,9 +574,4 @@ mod resize_reflow {
     }
 }
 
-// Fresh-terminal batches: a fresh 24x80 terminal fed one multi-KiB batch,
-// chunked soup, 1..=3 x 1..=3 grids, and the adversarial corpus.
-// (This file is a module of `core_fuzz`, so `mod fresh;` finds
-// (This file is a module of `core_suite`, so `mod fresh;` finds
-// `fuzz_process_never_panics/fresh.rs`.)
 mod fresh;

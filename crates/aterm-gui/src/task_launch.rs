@@ -172,7 +172,9 @@ pub(crate) fn fact_line(from: &str, autopilot: Autopilot, agent: &str) -> String
     )
 }
 
-/// What a worker's task file holds: the task as given, its last line ended, then.
+/// What a worker's task file holds: the task as given, its last line ended,
+/// then — with a starter `from` — a blank line and the [`fact_line`] naming
+/// it and its `autopilot`.
 pub(crate) fn task_text(
     task: &[u8],
     from: Option<&str>,

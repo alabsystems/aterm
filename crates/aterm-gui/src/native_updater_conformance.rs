@@ -1150,6 +1150,8 @@ fn real_refused_desks_park_degraded_or_refused_and_never_missed() {
     for (desk, geometry, bytes) in desks {
         let mut app = crate::App::headless_for_test();
         for session in app.pool.iter() {
+            // A fresh engine at the desk's geometry rather than a resize under
+            // the held guard: the resize would trip the main-loop census, whose
             // `#[cfg(test)]` mask does not see this file's inner attribute.
             if let Some((rows, cols)) = geometry {
                 *crate::term_lock(&session.term) = aterm_core::terminal::Terminal::new(rows, cols);
@@ -1576,6 +1578,7 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
         let mutant = buggy.successors("Decide", &state);
         let refusal_scope = facts.unspent_newer_download.is_some() && state["day"] == 1;
         if asked {
+            // A counted look is the same under `Buggy = 1`: its defect is at
             // the bound.
             assert_eq!(mutant.as_slice(), std::slice::from_ref(&after));
         } else if refusal_scope {

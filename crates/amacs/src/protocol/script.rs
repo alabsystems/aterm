@@ -561,6 +561,7 @@ impl Script {
                 });
             }
             if !line.starts_with("@@") {
+                // Headers before the first hunk, and blank lines after the
                 // last, are not the patch.
                 if ops.is_empty() || line.trim().is_empty() {
                     continue;
@@ -2539,6 +2540,7 @@ mod tests {
                             replaced = regions.len();
                         }
                         if apply_as_resolved {
+                            // The PartialApply rig: each op's edits go into
                             // the text the moment it resolves.
                             held = plan_of(regions.clone()).apply(&held);
                         }

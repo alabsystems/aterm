@@ -38,7 +38,6 @@ fn codex_is_read_from_its_login_file_by_stat_alone() {
     assert!(f.managed.is_some());
     assert!(!f.home_exists && f.login_file.is_none());
     std::fs::create_dir_all(b.home.join(".codex")).expect("home");
-    // Not JSON at all: aterm never opens it, so its content cannot matter.
     std::fs::write(b.home.join(".codex/auth.json"), "\u{0}\u{1}not json").expect("auth");
     let f = gather_with(&b, &[], &[], &CODEX);
     assert!(f.home_exists);
@@ -120,12 +119,6 @@ fn claude_with_no_accounts_store_reads_its_profile() {
     );
 }
 
-/// CODEX'S LIMIT IS READ BY ITS PICK (`ai::codex_limits::home_pick`): a window at
-/// 100% whose reset is ahead names the limit's end, though another thread of the login wrote a
-/// smaller share of that window since (a count written again from what it held), and a legacy
-/// fork written last copied its parent's 60% under fresh stamps. Negative controls: a login
-/// signed in since, whose own window is far from its limit, is the one read; and a 100% window
-/// whose reset has passed names no end.
 #[test]
 fn codexs_limit_is_the_newest_logins_largest_share_past_a_forks_copy() {
     use crate::harness::codex_rollout::fixtures::{meta_as, rate};
@@ -182,7 +175,6 @@ fn codexs_limit_is_the_newest_logins_largest_share_past_a_forks_copy() {
     );
     let limit = |b: &crate::ai::testing::Box3| gather_with(b, &[], &[], &CODEX).limited_until;
     assert_eq!(limit(&b), Some(reset + 40), "the window's anchor");
-    // NEGATIVE CONTROL 1: another login's thread, written last.
     let other = [
         meta_as(
             ms - 30_000,
@@ -197,7 +189,6 @@ fn codexs_limit_is_the_newest_logins_largest_share_past_a_forks_copy() {
     .concat();
     write(OTHER, other, 20);
     assert_eq!(limit(&b), None);
-    // NEGATIVE CONTROL 2: the 100% window's reset passed.
     std::fs::remove_file(path(OTHER)).expect("rm");
     std::fs::remove_file(path(SIDE)).expect("rm");
     write(ROOT, limited(now - 100), 600);
@@ -259,15 +250,12 @@ fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
         roster: Some(roster_path.clone()),
     };
 
-    // While m27 is not enrolled yet, m27-3 is reported as limited with next_sign_in = Some("m27").
     let f = gather(&m, &CLAUDE);
     let view = f.accounts.expect("accounts view");
     assert_eq!(view.label, "m27-3");
     assert!(view.limited_until.is_some_and(|u| u >= now + 86_400));
     assert_eq!(view.next_sign_in.as_deref(), Some("m27"));
 
-    // Once m27 is enrolled (.credentials.json written in its login dir), claude_accounts
-    // switches to the ready enrolled m27 row so `aterm ai` and `aterm ai review` use it.
     std::fs::write(m27_dir.join(".credentials.json"), "{}").expect("enroll m27");
     let f_after = gather(&m, &CLAUDE);
     let view_after = f_after.accounts.expect("accounts view after enroll");

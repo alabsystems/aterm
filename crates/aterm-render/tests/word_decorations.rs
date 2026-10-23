@@ -110,12 +110,6 @@ fn add_blend_only_brightens() {
     assert_ne!(base_target, now_target, "additive sparkle must brighten");
 }
 
-/// Dirty-row closure for the settled-deco dy spill: a SETTLED lifted deco
-/// (unchanged stream, so `deco_changed` is false) whose row goes dirty for an
-/// UNRELATED reason must drag its spill-neighbour row into the dirty set —
-/// else `draw_decorations` re-stamps it and the `dy` spill re-Adds onto the
-/// neighbour's NOT-rebuilt pixels. Chains iterate to a fixpoint, and a fully
-/// settled frame (no dirt at all) still gate-hits with zero rows marked.
 #[test]
 fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
     const CELL_H: usize = 16;
@@ -210,13 +204,6 @@ fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
     );
 }
 
-/// END-TO-END regression for the settled-deco dy-spill re-blend: a SETTLED
-/// lifted `Add` sparkle (the v2 nova-ember regime, `dy = -cell_h/3`) with
-/// UNRELATED text dirt on its own row, N damaged frames. Pre-fix,
-/// `draw_decorations` re-stamped the deco every frame (its row is dirty) and
-/// the upward spill re-Added onto row-above pixels the damaged path never
-/// rebuilt — accumulating brighter each frame. Every cached frame must equal
-/// a fresh full render byte-for-byte.
 #[test]
 fn settled_lifted_add_deco_with_dirt_on_its_row_stays_byte_stable() {
     let mut rend = renderer();

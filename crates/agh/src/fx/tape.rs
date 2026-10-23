@@ -306,7 +306,12 @@ fn head_text(header: &TapeHeader) -> String {
     out
 }
 
-/// One record's lines, each ending `\n`, or `None` for a kind outside the subset (`Rand`, `File`, `FileErr`, `Raised`, which no agh door makes):
+/// One record's lines, each ending `\n`, or `None` for a kind outside the subset (`Rand`,
+/// `File`, `FileErr`, `Raised`, which no agh door makes):
+/// - `Clock(ns)` → `clock {ns}`; `Mono(ns)` → `mono {ns}`;
+/// - `Exchange { door, request, reply }` → `exchange {token(door)}`, the request's pieces as
+///   `>` lines, then the reply's as `<` lines;
+/// - `Emit { door, bytes }` → `emit {token(door)}`, then the bytes' pieces as `|` lines.
 #[must_use]
 pub fn render_record(record: &EffectRecord) -> Option<String> {
     let mut out = String::new();

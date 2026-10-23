@@ -47,7 +47,7 @@ pub(crate) fn lock_modifier_source(headless: bool) -> fn() -> Modifiers {
 
 /// The lock-state source for headless instances and unit tests: always empty.
 #[must_use]
-pub(crate) fn no_lock_modifiers() -> Modifiers {
+pub(crate) const fn no_lock_modifiers() -> Modifiers {
     Modifiers::empty()
 }
 
@@ -191,7 +191,7 @@ pub(crate) fn press_is_inert(ev: &KeyEvent) -> bool {
 
 /// Whether a direct key send must be suppressed because an IME composition (CJK, dead key) is active.
 #[must_use]
-pub(crate) fn suppress_direct_send(preedit: &str) -> bool {
+pub(crate) const fn suppress_direct_send(preedit: &str) -> bool {
     !preedit.is_empty()
 }
 
@@ -418,7 +418,7 @@ pub(crate) fn text_press_repeat(ev: &KeyEvent, mods: Modifiers) -> Option<String
 /// [`text_press_repeat`] off Windows, where a repeat replays the press.
 #[cfg(not(windows))]
 #[must_use]
-pub(crate) fn text_press_repeat(_ev: &KeyEvent, _mods: Modifiers) -> Option<String> {
+pub(crate) const fn text_press_repeat(_ev: &KeyEvent, _mods: Modifiers) -> Option<String> {
     None
 }
 

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 console attention: real Terminal snapshots, injected clocks and the
-//! shipping PetBrain projected onto the derived episode ownership relation.
+//! Tier-1 console attention conformance against the derived episode ownership relation.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -21,7 +20,6 @@ struct Fixture {
     brain: PetBrain,
     term: Terminal,
     now: Instant,
-    // The harness counts calls and ownership replacements, not pet state.
     inputs: i64,
     surface: i64,
 }
@@ -29,8 +27,6 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let mut term = Terminal::new(24, 80);
-        // Match a presented host: unresolved COLOR_UNSET cannot certify a
-        // blank sprite footprint even on an otherwise empty terminal.
         term.process(b"\x1b]11;#000000\x07\x1b[12;40H");
         let mut f = Self {
             brain: PetBrain::default(),
@@ -172,7 +168,6 @@ fn input_echo_selection_and_surface_ownership_conform() {
     f.input(PetInputKind::Text);
     step(&model, &mut state, &f, "Input", 1);
     let consumed = f.brain.console_input_consumed_seq();
-    // A delayed stationary overwrite arrives as output, not another input.
     f.term.process(b"\x1b[12;40Hx\x1b[12;40H");
     f.tick(20);
     step(&model, &mut state, &f, "Echo", 2);
@@ -286,7 +281,6 @@ fn completed_and_already_stale_results_expire_without_a_backlog() {
             assert!(!accepted, "a result replay must not conform");
             step(&model, &mut state, &f, "Expire", 7);
         }
-        // Further identical observations cannot rediscover the expired verdict.
         f.tick(1500);
         step(&model, &mut state, &f, "Echo", 2);
         f.change_surface();

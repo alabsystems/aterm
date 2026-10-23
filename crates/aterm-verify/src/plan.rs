@@ -101,7 +101,8 @@ pub enum StageId {
     /// The forge cells no fleet machine hosts (or each `--cell`), each linted
     /// for its own triple ([`crate::cells`]).
     ForeignCells,
-    /// The two web modules' host boundary under node ([`crate::wasm_smoke`]).
+    /// The two web modules' host boundary in a headless Chromium
+    /// ([`crate::wasm_smoke`]).
     WasmSmoke,
     /// The JS glue generator on aterm-wasm-abi's toy module
     /// ([`crate::wasm_glue`]).
@@ -334,12 +335,12 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::WasmSmoke,
-            "wasm smoke (both web modules' host boundary under node)",
+            "wasm smoke (both web modules' host boundary in a browser)",
             Lane::CellsTarget,
         ),
         spec(
             StageId::WasmGlue,
-            "wasm glue (the generator on aterm-wasm-abi's toy, its goldens, under node)",
+            "wasm glue (the generator on aterm-wasm-abi's toy, its goldens, in a browser)",
             Lane::CellsTarget,
         ),
         spec(

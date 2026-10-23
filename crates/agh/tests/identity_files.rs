@@ -187,10 +187,6 @@ fn the_loose_remedy_names_only_the_loose_parts() {
     );
 }
 
-/// A token file directly in the home directory, which is open to the group (0750, as on
-/// macOS): the remedy never narrows `~` (design §6.2), and names no chmod of the file either,
-/// which cannot lift a refusal the directory's mode makes. Only provisioning remains; with
-/// `~` private, the file's own chmod is offered.
 #[test]
 fn the_loose_remedy_never_narrows_home() {
     let root = common::scratch("id-home");
@@ -219,8 +215,6 @@ fn the_loose_remedy_never_narrows_home() {
     assert!(!file_only.contains("chmod 700"), "{file_only}");
 }
 
-/// `~/.config` and `~/.config/aterm` are never narrowed either (design §6.2), and each is
-/// judged by identity: a `..` spelling of `~/.config` is still `~/.config`.
 #[test]
 fn the_loose_remedy_never_narrows_the_config_directories() {
     let root = common::scratch("id-dotconfig");
@@ -244,10 +238,6 @@ fn the_loose_remedy_never_narrows_the_config_directories() {
     }
 }
 
-/// A token file that is a link, or a directory, in a loose directory: `read_private`
-/// refuses the directory first. The remedy names no chmod of the file, which would follow
-/// the link (and the link's mode is no inverse of the target's); a directory gets the
-/// not-a-file remedy, with no chmod and no provisioning from it.
 #[test]
 fn the_loose_remedy_names_no_chmod_of_a_link_or_a_directory() {
     let root = common::scratch("id-loose-link");
@@ -283,8 +273,6 @@ fn the_loose_remedy_names_no_chmod_of_a_link_or_a_directory() {
     );
 }
 
-/// A directory that is another user's (`/`, root's): `read_private` refuses it for its
-/// owner, which no chmod of its mode changes, so the remedy holds no chmod of it.
 #[test]
 fn the_loose_remedy_names_no_chmod_of_another_users_directory() {
     if aterm_uds::peer::our_uid() == 0 {
@@ -298,8 +286,6 @@ fn the_loose_remedy_names_no_chmod_of_another_users_directory() {
     assert!(remedy.contains("--stdin < /agh-no-such-token"), "{remedy}");
 }
 
-/// A token file whose directory is a link: the remedy names the directory, the link to
-/// fix; a file that is itself the link gets the other remedy.
 #[test]
 fn the_symlink_remedy_names_a_linked_directory() {
     let root = common::scratch("id-linked");
@@ -335,9 +321,6 @@ pub(crate) fn foreign_dir_link() -> Option<(PathBuf, PathBuf)> {
     })
 }
 
-/// A token file under a directory link that is another user's: the person cannot make it a
-/// real directory, so the remedy names the real path and the token_file key, and never the
-/// link's change. Skipped where no such link exists (no system directory is a link).
 #[test]
 fn the_symlink_remedy_of_another_users_link_names_only_the_real_path() {
     let Some((link, real)) = foreign_dir_link() else {
@@ -372,9 +355,6 @@ pub(crate) fn path_mentions(text: &str, path: &str) -> usize {
         .count()
 }
 
-/// The Malformed remedy follows the rule broken: the token's shape (which carries the
-/// 20-255 bounds) for a token of the wrong shape or size, and another for a token_file that
-/// names a directory, and for a variable.
 #[test]
 fn the_malformed_remedy_follows_the_rule_broken() {
     let root = common::scratch("id-malformed");

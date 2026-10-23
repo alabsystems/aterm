@@ -395,6 +395,7 @@ impl TitleState {
     #[inline]
     pub(super) fn reset(&mut self) {
         // Clearing a non-empty window title is a real title change: bump the
+        // epoch so hosts see the RIS clear.
         if !self.window.is_empty() {
             self.epoch
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

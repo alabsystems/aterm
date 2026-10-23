@@ -3,8 +3,6 @@
 
 use super::*;
 
-/// Two glyphs: an empty glyph zero and glyph one in `glyf`. The production
-/// preflight reads these tables before allocating the loader's buffers.
 struct FontTables {
     head: [u8; 54],
     hhea: [u8; 36],

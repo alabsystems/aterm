@@ -467,8 +467,13 @@ fn serve_fleet_port(
 /// proved under the key this Mac's book binds it to, read fresh, so a `peers
 /// rm` counts at once, when a `[fleet] drive_from` grant (`drivers`) names it
 /// with that same key ([`aterm_net::fleet_member::proven_driver`]) — named
-/// as a person reads it ([`driver_name`]).
-///
+/// as a person reads it ([`driver_name`]). The fleet secret alone never
+/// drives, and neither does a node id bound afresh to another key since the
+/// grant. On a member, a node only its copy of the issuer's book binds is
+/// admitted against a copy under a minute old
+/// ([`aterm_net::fleet_member::COPY_DRIVES_FOR`]); an older one is checked
+/// by reading the issuer's book again, proving `recheck` (this listener's
+/// secret and node), and refused while that book cannot be read.
 /// # Errors
 /// Why the dialer may not drive: it proved no node bound here, a node no
 /// grant names, one whose grant holds another key, or one an old copy alone

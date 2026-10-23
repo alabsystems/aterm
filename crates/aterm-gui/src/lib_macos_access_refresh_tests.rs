@@ -1059,7 +1059,6 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
 
 std::thread_local! {
     /// How long ago the Developer Tools page came up, for [`devtools_opened_within`].
-    /// How long ago the Developer Tools page came up, for [`devtools_opened_within`].
     static DEVTOOLS_AGO: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 

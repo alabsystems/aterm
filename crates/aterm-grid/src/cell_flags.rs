@@ -6,20 +6,9 @@
 
 /// Cell flags, packed into the Cell's 16-bit flags field.
 ///
-/// ## Bit allocation
-/// - Bits 0-7: visual attributes (bold, dim, italic, underline, blink, inverse,
-///   hidden, strikethrough)
-/// - Bit 8: double underline
-/// - Bit 9: wide character
-/// - Bit 10: wide continuation / protected (shared; a spacer's protection is its lead's)
-/// - Bit 11: superscript (SGR 73)
-/// - Bit 12: subscript (SGR 74)
-/// - Bits 11+12: overline (SGR 53), exclusive with super/subscript
-/// - Bit 13: curly underline
-/// - Bit 14: reserved, never set on a cell (it once marked a style-interned
-///   cell; `aterm-scrollback`'s `CellAttrs::VISUAL_FLAGS_MASK` masks it, and a
-///   stored line's walk clears its `CellAttrs::OPENS_CELL` there)
-/// - Bit 15: COMPLEX (char_data is an overflow table index)
+/// Bits 0–13 hold visual attributes, wide/spacer markers, protection, super/subscript,
+/// overline, and underline styles; bit 14 is reserved; bit 15 (`COMPLEX`) marks
+/// `char_data` as an overflow table index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct CellFlags(pub u16);
@@ -155,8 +144,7 @@ impl CellFlags {
         (self.0 & Self::COMPLEX.0) != 0
     }
 
-    /// Get only the core flags (bits 0-13: without the reserved bit 14 and
-    /// COMPLEX).
+    /// Core visual flags (bits 0–13, excluding bit 14 and `COMPLEX`).
     #[must_use]
     #[inline]
     #[cfg(test)]
@@ -164,10 +152,7 @@ impl CellFlags {
         Self(self.0 & Self::VISUAL_FLAGS_MASK)
     }
 
-    /// The SGR parameter selecting this rendition's underline style (`4`, or
-    /// `4:2` to `4:5`), if it has one. The composite styles share bits with the
-    /// singletons (DASHED = DOUBLE | CURLY, DOTTED = UNDERLINE | CURLY), so they
-    /// are tested first. DECRQSS and the screen serializer both encode with it.
+    /// Returns the SGR parameter for this rendition's underline style (`4` or `4:2`..=`4:5`).
     #[must_use]
     #[inline]
     pub const fn underline_sgr(self) -> Option<&'static str> {
@@ -186,10 +171,7 @@ impl CellFlags {
         }
     }
 
-    /// The SGR parameter for this rendition's overline (`53`), superscript
-    /// (`73`) or subscript (`74`), if any. OVERLINE is SUPERSCRIPT | SUBSCRIPT,
-    /// so it is tested first. DECRQSS and the screen serializer both encode
-    /// with it.
+    /// Returns the SGR parameter for overline (`53`), superscript (`73`), or subscript (`74`).
     #[must_use]
     #[inline]
     pub const fn overline_or_script_sgr(self) -> Option<&'static str> {
@@ -221,29 +203,17 @@ impl CellFlags {
         (self.0 & Self::EXTENDED_FLAGS_MASK) != 0
     }
 
-    /// Rendition a wide character's continuation spacer inherits from its lead:
-    /// bits 0-8 and 11-13, every visual attribute and nothing else.
-    ///
-    /// Excluded: `WIDE` (bit 9, the spacer is never a lead); bit 10 (the
-    /// spacer's own role bit, which aliases PROTECTED); the reserved bit 14
-    /// and `COMPLEX` (bit 15, a storage discriminant the spacer's constructor
-    /// owns).
+    /// Visual rendition mask inherited by a wide character's continuation spacer (bits 0–8 and 11–13).
     pub const SPACER_RENDITION_MASK: u16 =
         Self::VISUAL_FLAGS_MASK & !(Self::WIDE.0 | Self::WIDE_CONTINUATION.0);
 
-    /// The flags for the continuation spacer of a wide character written with `self`.
-    ///
-    /// A rendition belongs to the character, not the column, so the spacer inherits
-    /// the lead's visual attributes and keeps only its own role bit. Otherwise SGR 7
-    /// paints the glyph's right half invisibly and underlines gap under it.
+    /// Returns the flags for the continuation spacer of a wide character written with `self`.
     #[must_use]
     #[inline]
     pub const fn wide_continuation_of(self) -> Self {
         Self((self.0 & Self::SPACER_RENDITION_MASK) | Self::WIDE_CONTINUATION.0)
     }
 }
-
-// Bitwise operators (`flags & CellFlags::DIM`), for Alacritty-style callers.
 
 impl std::ops::BitAnd for CellFlags {
     type Output = Self;
@@ -290,9 +260,6 @@ impl std::ops::Not for CellFlags {
 mod tests {
     use super::*;
 
-    // Bit layout: checkpoints and the render path read these bits raw, so every
-    // position is pinned.
-
     #[test]
     fn bit_layout_is_pinned() {
         let rows: &[(&str, u16, u16)] = &[
@@ -315,7 +282,6 @@ mod tests {
                 CellFlags::WIDE_CONTINUATION.bits(),
                 1 << 10,
             ),
-            // PROTECTED shares WIDE_CONTINUATION's bit.
             ("PROTECTED", CellFlags::PROTECTED.bits(), 1 << 10),
             ("SUPERSCRIPT", CellFlags::SUPERSCRIPT.bits(), 1 << 11),
             ("SUBSCRIPT", CellFlags::SUBSCRIPT.bits(), 1 << 12),
@@ -325,7 +291,6 @@ mod tests {
                 1 << 13,
             ),
             ("COMPLEX", CellFlags::COMPLEX.bits(), 1 << 15),
-            // Combo encodings: two bits each, no bit of their own.
             (
                 "OVERLINE = SUPERSCRIPT | SUBSCRIPT",
                 CellFlags::OVERLINE.bits(),
@@ -341,7 +306,6 @@ mod tests {
                 CellFlags::DASHED_UNDERLINE.bits(),
                 (1 << 8) | (1 << 13),
             ),
-            // Masks.
             (
                 "EXTENDED_FLAGS_MASK = bits 11-13",
                 CellFlags::EXTENDED_FLAGS_MASK,
@@ -360,9 +324,6 @@ mod tests {
 
     #[test]
     fn methods_agree_with_raw_bit_arithmetic() {
-        // Each method is checked against the u16 arithmetic it stands for, over
-        // every pair drawn from the single bits, combos, masks, a few mixes, 0
-        // and 0xFFFF.
         assert!(CellFlags::default().is_empty());
         assert_eq!(CellFlags::empty(), CellFlags::default());
 

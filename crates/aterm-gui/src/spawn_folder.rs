@@ -108,7 +108,11 @@ fn folder_fault_in(
     within(in_flight, budget, dir, check).flatten()
 }
 
-/// Why a fresh shell cannot start in `dir`: [`folder_fault`], except that a check that did not answer in time.
+/// Why a fresh shell cannot start in `dir`: [`folder_fault`], except that a
+/// check that did not answer in time — or was not started, the cap being
+/// reached, or not needed, another folder's check on the same volume having
+/// run past the budget ([`beside_silent`]) — is [`Fault::Unresponsive`] for a
+/// folder on a volume that is not local ([`remote_volume`]).
 pub(crate) fn start_fault(dir: &str) -> Option<Fault> {
     #[cfg(unix)]
     {
@@ -947,7 +951,7 @@ pub(crate) struct RowFolders {
 }
 
 impl RowFolders {
-    pub(crate) fn of(&mut self, fault: Fault) -> &mut Named {
+    pub(crate) const fn of(&mut self, fault: Fault) -> &mut Named {
         match fault {
             Fault::Missing => &mut self.missing,
             Fault::Shut => &mut self.shut,

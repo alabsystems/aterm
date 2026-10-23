@@ -229,7 +229,8 @@ impl WebThemeState {
         Ok(())
     }
 
-    /// `{"unset", "themes".
+    /// `{"unset", "themes": [...]}`: built-ins in catalog order, then the
+    /// registered themes in insertion order.
     pub(crate) fn catalog_json(&self) -> String {
         let builtins = builtin_theme_list().into_iter().filter_map(|identity| {
             let theme = CatalogTheme::builtin(identity.name)?;

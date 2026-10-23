@@ -720,6 +720,7 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
 }
 
 fn self_instance_sock_in(dir: &Path, self_sid: Option<&str>) -> Option<String> {
+    // Only a sid the wire's grammar reads as one (`s-<hex>`) is looked up, so a
     // weird env value can never path-traverse out of the graph dir.
     graph_entry_sock_in(dir, aterm_types::control_request::Sid::parse(self_sid?)?)
 }
@@ -881,6 +882,7 @@ fn detect_mux_nesting(env: &MuxEnv<'_>) -> Option<MuxNesting> {
         });
     }
     if let Some(base) = set(base) {
+        // Equal to the recorded base: nothing entered since. Different and marked: a
         // pane. Different with no marker (unset by hand) names no multiplexer.
         if base == mux_env_signature(tmux, sty) {
             return None;
@@ -1058,6 +1060,8 @@ fn announce_mux_boundary_with(
     already_said: bool,
     claim: impl FnOnce(&MuxNesting) -> bool,
 ) {
+    // No aterm identity in scope: no block model to have lost. The shell half also
+    // announces only under `$ATERM_PARENT_SESSION_ID`, and this leaves no stamps for
     // unrelated multiplexers.
     if n.outer_sid.is_none() {
         return;
@@ -2901,6 +2905,7 @@ fn read_token_file_at(path: &str) -> Result<(PathBuf, String), (PathBuf, io::Err
         match read_control_token_file(&token_path) {
             Ok(token) => return Ok((token_path, token)),
             Err(e) => {
+                // A malformed or non-regular file exists for this socket; do not
                 // reach past it for a directory-shared legacy credential.
                 if matches!(
                     e.kind(),
@@ -3035,6 +3040,7 @@ pub fn main_entry_with(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> Exit
     match real_main(argv, local) {
         Ok(code) => code,
         Err(e) => {
+            // The reader closed stdout (`aterm ctl help --full | head`): nothing is
             // wrong, so no line and status 0.
             if is_stdout_closed(&e) {
                 return ExitCode::SUCCESS;
@@ -3540,6 +3546,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
     let verb_tok = rest.first().map(String::as_str);
     let verb_args = rest.get(1..).unwrap_or(&[]);
     if verb_tok == Some("feed-bin") {
+        // The payload is stdin, not an inline argument; an inline token (e.g. a
         // bare length) has no client path and would only desync the frame.
         if !verb_args.is_empty() {
             return Err(feed_bin_inline_error());
@@ -4594,6 +4601,9 @@ fn is_peer_drop(e: &io::Error) -> bool {
 }
 
 fn pending_status_line(stream: &CtlStream) -> Option<String> {
+    // Darwin answers EINVAL to SO_RCVTIMEO once an AF_UNIX peer has detached,
+    // while `recv` still yields the queued bytes and then EOF, so a refused
+    // bound means "read without blocking". Windows' `CtlStream` refuses only a
     // zero timeout and never reaches the fallback.
     if stream
         .set_read_timeout(Some(std::time::Duration::from_secs(1)))
@@ -5226,6 +5236,8 @@ fn exchange_on(
             stderr_line(&verdict.join(" "))?;
         }
         if drift::is_drift_request(verb, request) {
+            // A backstop: every `cast drift` is dispatched to the `drift` module before
+            // any exchange. A server predating the verb answers the bare cast: read it off
             // and refuse by name rather than read a byte body as lines.
             if !tail.split_whitespace().any(|t| t.starts_with("verdict=")) {
                 if let (1, Some(n)) = (tail.split_whitespace().count(), byte_count(tail)) {

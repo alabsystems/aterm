@@ -927,6 +927,7 @@ fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
     let mut at = t0;
     let mut seq = 1;
     while at < t0 + span {
+        // Output for 150 ms, then 150 ms of silence: Running and Quiet
         // candidates alternate every few samples.
         if (at - t0).as_millis() % 300 < 150 {
             seq += 1;
@@ -1739,7 +1740,8 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              program_state last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
              session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
              disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms syspolicyd \
-             syspolicyd_workers syspolicyd_full_ms supervisor supervisor_proven autopilot \
+             syspolicyd_workers syspolicyd_full_ms occupancy occupancy_hold ready slots \
+             idle_ready_min supervisor supervisor_proven autopilot \
              human_ms human_seq launch launch_seq path_evidence copy upgrade history_lost \
              journal journal_off integration_rev born render \
              resizes flaps land_at task pause land_held land_nudges land_since end end_seen \

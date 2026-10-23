@@ -249,6 +249,7 @@ mod tests {
                     conn.hello().map(|_| ())
                 } else {
                     // 256 KiB: the bridge's post cap, far past a Unix
+                    // socket's buffers.
                     conn.publish(1, 1, "/f/t/x", &[0; 256 * 1024]).map(|_| ())
                 };
                 let _ = tx.send(served);

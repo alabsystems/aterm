@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The committed protocol modules are what the generator writes from the
-//! committed protocol files: the generator's own code (scan/src, built
-//! outside the workspace) compiled into this binary at its root
-//! (`tests/wayland_suite.rs`) and run in process.
-//!
-//! Negative control: a protocol file one attribute away generates other
-//! text.
+//! Verifies that the committed Wayland protocol modules match the generator's output.
 
 use std::path::Path;
 

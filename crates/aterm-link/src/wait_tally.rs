@@ -637,7 +637,7 @@ pub(crate) struct Stamp {
 }
 
 impl Stamp {
-    /// Now, the loop parked.
+    /// Now, the loop parked or not.
     pub(crate) fn now(parked: bool) -> Self {
         Self {
             at: Instant::now(),

@@ -8,8 +8,6 @@ use aterm_types::{
     KittyKeyboardFlags, KittyKeyboardState, KittyKeyboardStateSnapshot, ScreenBuffer,
 };
 
-// --- KittyKeyboardFlags tests ---
-
 #[test]
 fn test_flags_from_bits_masks_invalid() {
     let f = KittyKeyboardFlags::from_bits(0xFF);
@@ -18,7 +16,6 @@ fn test_flags_from_bits_masks_invalid() {
 
 #[test]
 fn test_flags_individual_bits_no_cross_contamination() {
-    // Each flag bit must activate only its own accessor, not others.
     let flags = [
         (KittyKeyboardFlags::DISAMBIGUATE, "disambiguate"),
         (KittyKeyboardFlags::REPORT_EVENTS, "report_events"),
@@ -49,11 +46,7 @@ fn test_flags_individual_bits_no_cross_contamination() {
     }
 }
 
-/// `CSI = flags ; mode u`: 1 sets, 2 ORs, 3 AND-NOTs; mode 0 behaves as 1
-/// (the default branch); an explicit UNDEFINED mode (>= 4) changes nothing,
-/// because kitty's set handler is if/else-if over 1/2/3 — so a program
-/// probing a future mode gets "unsupported", not "clobber my flags". Input
-/// bits past the five defined ones are masked.
+/// `CSI = flags ; mode u`: mode 0/1 sets, 2 ORs, 3 AND-NOTs, and >=4 is a no-op.
 #[test]
 fn test_flags_apply_modes() {
     for (start, input, mode, want) in [
@@ -70,24 +63,17 @@ fn test_flags_apply_modes() {
     }
 }
 
-// --- KittyKeyboardState push/pop tests ---
-
 #[test]
 fn test_push_set_flags_pop_restores_pre_push_state() {
-    // Verify that set_flags() between push and pop doesn't corrupt the stack:
-    // pop must restore the value saved at push time, regardless of what
-    // set_flags did to current flags afterward.
     let mut state = KittyKeyboardState::new();
 
     state.set_flags(0b0_0011, 1); // flags = 0b11
     state.push_flags_for_buffer(0b0_0111, ScreenBuffer::Main); // saves 0b11, flags = 0b111
     assert_eq!(state.flags().bits(), 0b0_0111);
 
-    // Mutate flags directly — this should NOT affect what pop restores
     state.set_flags(0b1_1111, 1); // flags = 0b11111
     assert_eq!(state.flags().bits(), 0b1_1111);
 
-    // Regression #5679: restores the pre-push value (0b11) from stack[0].
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0b0_0011);
 }
@@ -107,7 +93,6 @@ fn test_push_pop_three_levels() {
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 1);
 
-    // Stack empty → reset to 0 (per Kitty spec)
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
 }
@@ -120,16 +105,12 @@ fn test_pop_multi_count() {
     state.push_flags_for_buffer(3, ScreenBuffer::Main);
     state.push_flags_for_buffer(7, ScreenBuffer::Main);
 
-    // Pop 2: skip over 3, restore 1
     state.pop_flags_for_buffer(2, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 1);
 }
 
 #[test]
 fn test_pop_explicit_count_zero_pops_nothing() {
-    // The spec's "defaulting to 1 if unspecified" covers only the OMITTED
-    // parameter (resolved by the dispatcher); an EXPLICIT `CSI < 0 u` is
-    // specified and kitty's pop loop (`num && i-- > 0`) pops nothing.
     let mut state = KittyKeyboardState::new();
 
     state.push_flags_for_buffer(1, ScreenBuffer::Main);
@@ -146,8 +127,6 @@ fn test_pop_count_exceeds_stack_resets_to_zero() {
     state.push_flags_for_buffer(1, ScreenBuffer::Main);
     state.push_flags_for_buffer(3, ScreenBuffer::Main);
 
-    // Pop 10 when only 2 on stack → per Kitty spec, all entries are popped
-    // and flags reset to default (0), not to the oldest saved entry (#7482).
     state.pop_flags_for_buffer(10, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
 }
@@ -157,8 +136,6 @@ fn test_pop_from_empty_stack_resets_to_zero() {
     let mut state = KittyKeyboardState::new();
     state.set_flags(0b1_1111, 1);
 
-    // Pop from empty stack → per Kitty spec, flags reset to 0 when
-    // count > stack depth (#7421, #7482).
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
 }
@@ -167,17 +144,14 @@ fn test_pop_from_empty_stack_resets_to_zero() {
 fn test_stack_overflow_evicts_oldest() {
     let mut state = KittyKeyboardState::new();
 
-    // Push 8 entries to fill the stack
     for i in 1..=8 {
         state.push_flags_for_buffer(i, ScreenBuffer::Main);
     }
     assert_eq!(state.flags().bits(), 8);
 
-    // Push 9th: evicts oldest
     state.push_flags_for_buffer(9, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 9);
 
-    // Pop through: 8, 7, 6, 5, 4, 3, 2, then reset.
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 8);
 
@@ -193,11 +167,6 @@ fn test_stack_overflow_evicts_oldest() {
         );
     }
 
-    // A pop that empties an OVERFLOWED stack resets all flags — the base
-    // entry was evicted, and restoring the stale evicted-era stack[0] would
-    // resurrect a mode the app long since abandoned. Matches kitty's
-    // 8-retained-modes array byte-for-byte (7 saved + the live mode): after
-    // pushes f1..f9, kitty yields f8..f2 on 7 pops, then 0.
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
 }
@@ -206,21 +175,17 @@ fn test_stack_overflow_evicts_oldest() {
 fn test_screen_buffer_stacks_independent() {
     let mut state = KittyKeyboardState::new();
 
-    // Push twice on main, once on alternate
     state.push_flags_for_buffer(1, ScreenBuffer::Main);
     state.push_flags_for_buffer(3, ScreenBuffer::Main);
     state.push_flags_for_buffer(7, ScreenBuffer::Alternate);
     assert_eq!(state.flags().bits(), 7);
 
-    // Pop from main: 2 entries, restores saved-before-second-push (flags=1)
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 1);
 
-    // Regression #5679: restores pre-push value (flags=3) from alt stack[0].
     state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
     assert_eq!(state.flags().bits(), 3);
 
-    // Regression #5679: restores pre-first-push value (flags=0) from main stack[0].
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
 }
@@ -250,25 +215,20 @@ fn test_reset_clears_everything() {
     state.reset();
     assert_eq!(state.flags().bits(), 0);
 
-    // Popping after reset restores nothing
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 0);
     state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
     assert_eq!(state.flags().bits(), 0);
 }
 
-// --- switch_screen tests (#5985) ---
-
 #[test]
 fn test_switch_screen_basic_round_trip() {
     let mut state = KittyKeyboardState::new();
     state.set_flags(0b0_0101, 1); // flags = 5
 
-    // Enter alt: saves main flags, restores alt (None → 0)
     state.switch_screen(true);
     assert_eq!(state.flags().bits(), 0);
 
-    // Exit alt: saves alt flags (0), restores main (5)
     state.switch_screen(false);
     assert_eq!(state.flags().bits(), 0b0_0101);
 }
@@ -293,19 +253,15 @@ fn test_switch_screen_preserves_alt_flags_across_round_trips() {
 
 #[test]
 fn test_switch_screen_double_enter_overwrites_saved_main() {
-    // Pathological: calling switch_screen(true) twice without intervening false.
-    // The second call overwrites main_saved_flags with current (alt) flags.
     let mut state = KittyKeyboardState::new();
     state.set_flags(5, 1); // main = 5
 
     state.switch_screen(true); // saves main=5, flags=0
     state.set_flags(3, 1); // alt flags = 3
 
-    // Second enter-alt: saves current (3) as main, restores alt_saved (None→0)
     state.switch_screen(true);
     assert_eq!(state.flags().bits(), 0);
 
-    // Exit: restores "main" which is now 3, not the original 5
     state.switch_screen(false);
     assert_eq!(state.flags().bits(), 3);
 }
@@ -315,15 +271,12 @@ fn test_switch_screen_after_reset_no_stale_flags() {
     let mut state = KittyKeyboardState::new();
     state.set_flags(7, 1);
 
-    // Enter alt, saving main=7
     state.switch_screen(true);
     state.set_flags(15, 1);
 
-    // Reset clears everything including saved screen flags
     state.reset();
     assert_eq!(state.flags().bits(), 0);
 
-    // switch_screen after reset must not restore stale flags
     state.switch_screen(true);
     assert_eq!(state.flags().bits(), 0);
 
@@ -335,39 +288,30 @@ fn test_switch_screen_after_reset_no_stale_flags() {
 fn test_switch_screen_interleaved_with_push_pop() {
     let mut state = KittyKeyboardState::new();
 
-    // Push on main screen
     state.push_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 1);
 
-    // Enter alt screen
     state.switch_screen(true);
     assert_eq!(state.flags().bits(), 0);
 
-    // Push on alt screen
     state.push_flags_for_buffer(4, ScreenBuffer::Alternate);
     assert_eq!(state.flags().bits(), 4);
 
-    // Return to main
     state.switch_screen(false);
     assert_eq!(state.flags().bits(), 1);
 
-    // Push more on main
     state.push_flags_for_buffer(8, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 8);
 
-    // Re-enter alt — should restore alt flags (4)
     state.switch_screen(true);
     assert_eq!(state.flags().bits(), 4);
 
-    // Pop from alt stack — restores pre-push alt value (0 from first switch)
     state.pop_flags_for_buffer(1, ScreenBuffer::Alternate);
     assert_eq!(state.flags().bits(), 0);
 
-    // Return to main — restores saved main flags (8)
     state.switch_screen(false);
     assert_eq!(state.flags().bits(), 8);
 
-    // Pop from main stack — restores pre-push value (1)
     state.pop_flags_for_buffer(1, ScreenBuffer::Main);
     assert_eq!(state.flags().bits(), 1);
 }

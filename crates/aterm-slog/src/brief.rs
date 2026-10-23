@@ -1,49 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `brief` (design §7.4): a token-budgeted rollup for AI readers, a pure
-//! function of the log window, the fold state, the budget and `now_wall`.
-//!
-//! ```text
-//! OK 8 brief sid=s-7bd6 v=2 as_of=4123 ep=2 budget=600 used=412
-//! - claude r3 3h12m · need=approval:bash 40s [screen+]
-//! t17 open 4m10s by=harness · p204 approval bash open 40s [screen+]
-//! t16 done 6m02s · 23 steps · appr 3 [screen+]
-//! t1-t14 14 turns: 13 done 1 interrupted · 310 steps
-//! mail in 2 · out 1
-//! claim verdict on-track by=s-ops 12m ago [?]
-//! more=t16,t1-t14
-//! ```
-//!
-//! Tokens are estimated as bytes ÷ 4 ([`tokens`]). When the whole does not
-//! fit, it sheds in this order: first what a Claude Code transcript added
-//! — the closed transcript steps' lines, and the open
-//! turn's open transcript steps down to the newest and a count (`· +3
-//! open`), then every transcript record (the brief as it read without
-//! them: no transcript step, no transcript amend's numbers, a turn's step
-//! count less its transcript steps); then (1) step lines of older turns;
-//! (2) runs of ordinary turns, collapsed into ranges; (3) marks other than
-//! needs and claims, then the oldest turn lines, newest kept; (4) finally,
-//! the session down to one line. Every line after the header starts with a node id (a
-//! mark's id is its seq) until the trailer: `need` lines for the needs the
-//! session line does not name, the counts of `mail` and of `act` and `story`
-//! marks (`acts 2 · stories 1`, phase 3B) and of `shown` marks (`shown 3`,
-//! phase 6, 6F-9; all shed before anything else),
-//! then one
-//! `claim` line per live claim (a verdict, a label, a need raised by a
-//! mark). `more=` names what was left out. A suffix gives the source's reliability: `!` exact, `+`
-//! strong, `~` heuristic, `?` claim; a phase nothing has observed yet has
-//! none (`- session · -`).
-//!
-//! A `gap why=<w> lost=<n> resync_to=<seq>` line before `more=` says the
-//! window does not reach back to where the reader stands: the caller passes
-//! the [`Gap`] its read crossed ([`Log::read`]), never one inferred from the
-//! window's first seq, so a window narrowed to a node or past a cursor
-//! reports no loss that did not happen.
-//!
-//! The open turn and step come from the fold when the ring has evicted
-//! their open records: the line the reader most needs is never lost to
-//! eviction.
+//! Token-budgeted session brief rollup, a pure function of the log window, fold state, budget, and `now_wall`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -56,9 +14,9 @@ use crate::log::{Cursor, Gap};
 use crate::rec::Rec;
 use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
 
-/// The default budget for one session (§7.4).
+/// Default budget for one session.
 pub const DEFAULT_BUDGET: usize = 600;
-/// The default budget for the instance-wide form.
+/// Default budget for the instance-wide form.
 pub const INSTANCE_BUDGET: usize = 1000;
 
 /// The token estimate of `bytes`: bytes ÷ 4, rounded up.
@@ -74,8 +32,7 @@ pub struct Brief {
     pub text: String,
     /// Its token estimate, as `used=` prints it.
     pub used: usize,
-    /// The shedding level it took (0: nothing shed … 3: marks and the
-    /// oldest turn lines shed … 4: one line).
+    /// The shedding level taken (0: nothing shed … 4: one line).
     pub level: u8,
 }
 
@@ -109,8 +66,7 @@ impl StepInfo<'_> {
         best(self.close, &self.amends, Key::Out).and_then(Rec::out)
     }
 
-    /// A step the transcript opened (phase 3B: a tool, a subagent, a
-    /// compaction).
+    /// Whether the step was opened by the transcript.
     fn transcript(&self) -> bool {
         self.open
             .or(self.close)
@@ -118,14 +74,12 @@ impl StepInfo<'_> {
     }
 }
 
-/// How much of what a transcript added a rendering keeps: it
-/// is shed before any line the brief held without it.
+/// How much transcript detail a rendering keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TxShed {
     /// All of it.
     Full,
-    /// No closed transcript step's line; the open turn's open transcript
-    /// steps as the newest and a count.
+    /// No closed transcript step lines; open transcript steps collapsed to the newest plus a count.
     Collapsed,
     /// None of it: rendered from [`scan_stripped`]'s window.
     Stripped,
@@ -137,19 +91,13 @@ struct TurnInfo<'a> {
     close: Option<&'a Rec>,
     amends: Vec<&'a Rec>,
     steps: BTreeMap<u32, StepInfo<'a>>,
-    /// The transcript steps [`scan_stripped`] left out of `steps`: what its
-    /// close's `steps=` rollup counts that this rendering does not show.
+    /// Transcript steps omitted by [`scan_stripped`].
     tx_steps: u64,
-    /// Of those, the tools by class: what its close's `tools=` rollup
-    /// counts that this rendering does not show.
+    /// Transcript tools by class omitted by [`scan_stripped`].
     tx_tools: BTreeMap<&'static str, u64>,
 }
 
-/// The record a node's `key` is read from (phase 3B, A5): its close, or an
-/// amend that refines it — the fold's own rules, so `brief` and the fold
-/// never disagree: an outcome only by an exact amend
-/// ([`crate::fold::amend_refines_out`]), any other key under the confidence
-/// law. `None` for a node with neither (an open one).
+/// Return the record from which a node's `key` is read (its close or a refining amend).
 fn best<'a>(close: Option<&'a Rec>, amends: &[&'a Rec], key: Key) -> Option<&'a Rec> {
     let mut held = close.filter(|c| c.f.get(key).is_some());
     for a in amends.iter().copied().filter(|a| a.f.get(key).is_some()) {
@@ -172,8 +120,7 @@ impl TurnInfo<'_> {
         best(self.close, &self.amends, Key::Out).and_then(Rec::out)
     }
 
-    /// A turn a range may absorb: closed `done`, `interrupted`, `asked` or
-    /// `superseded`.
+    /// Whether a range may absorb this turn.
     fn ordinary(&self) -> bool {
         matches!(
             self.out(),
@@ -188,9 +135,7 @@ impl TurnInfo<'_> {
             .unwrap_or(self.steps.len() as u64)
     }
 
-    /// Its close's `tools=` rollup (`shell:9,edit:8`) as the line shows it
-    /// (`shell 9 edit 8`), less the transcript tools [`scan_stripped`] left
-    /// out; `None` when none is left.
+    /// Return the close record's `tools=` rollup minus stripped transcript tools.
     fn tools(&self) -> Option<String> {
         let tools =
             best(self.close, &self.amends, Key::Tools).and_then(|r| r.f.get_str(Key::Tools))?;
@@ -210,9 +155,7 @@ impl TurnInfo<'_> {
     }
 }
 
-/// The window, sorted into turns, their steps and the marks worth a line;
-/// and the `act` and `story` marks, counted, and the `shown`
-/// marks.
+/// Window records sorted into turns, steps, marks, and mark counts.
 struct Scan<'a> {
     turns: BTreeMap<u32, TurnInfo<'a>>,
     marks: Vec<&'a Rec>,
@@ -222,27 +165,13 @@ struct Scan<'a> {
 }
 
 impl Scan<'_> {
-    /// Whether any count line has something to count ([`render`]'s
-    /// `counts`): mail in `totals`, acts or stories, or shown marks.
+    /// Whether any count line has a non-zero count.
     const fn counts_any(&self, totals: &crate::fold::Totals) -> bool {
         self.acts + self.stories + self.shown > 0 || totals.mail_in > 0 || totals.mail_out > 0
     }
 }
 
-/// Marks a brief never gives a line: the raw signals the tree is built from,
-/// the content tier, and needs and claims (shown elsewhere). A source's state
-/// and a post's landing (phase 3B) are bookkeeping: the turns they explain
-/// are the lines. PHASE 3B's signals give none
-/// either, so a brief reads with them as it read without: the engine's,
-/// the status classifier's, the screen's context and goal, the fabric's
-/// (mail is the `mail in · out` line), the usage tap's; `act` and `story`
-/// are one count line ([`Scan::acts`]), the first line shed. A worker's
-/// `task` mark (phase 5, 5C-1) is bookkeeping too: `task` is its reader. So
-/// are Phase 6's ring facts (6F-2): a session's state, a policy's
-/// generation, a topic, an advisory, the program's own report,
-/// a mail fetch and what the person was shown (6F-9: `shown`, one count
-/// line, [`Scan::shown`], shed with the others). And a row the log holds as
-/// its row alone (`row`, the timeline's).
+/// Whether a mark of kind `k` renders its own line in a brief.
 const fn mark_worth_a_line(k: Kind) -> bool {
     !matches!(
         k,
@@ -305,8 +234,7 @@ fn seed_of(o: &OpenNode) -> Rec {
     }
 }
 
-/// The fold's open turn and step whose open records the window no longer
-/// holds, as records the scan reads after the window.
+/// Return open turn and step records from the fold whose open records were evicted.
 fn open_path_seeds(st: &SessionState, window: &[&Rec]) -> Vec<Rec> {
     [st.turn(), st.step()]
         .into_iter()
@@ -316,10 +244,7 @@ fn open_path_seeds(st: &SessionState, window: &[&Rec]) -> Vec<Rec> {
         .collect()
 }
 
-/// [`scan`] of the window as it would be without the transcript's records:
-/// no transcript step and no transcript amend of a step or a
-/// turn, each turn's transcript steps counted so its rollup reads without
-/// them; and whether the window held any.
+/// Scan `window` without transcript records and return whether any were stripped.
 fn scan_stripped<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> (Scan<'a>, bool) {
     let mut tx_steps: BTreeMap<u32, u64> = BTreeMap::new();
     let mut tx_tools: BTreeMap<u32, BTreeMap<&'static str, u64>> = BTreeMap::new();
@@ -343,8 +268,6 @@ fn scan_stripped<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> (Scan<'a>, bool) {
                 }
                 true
             }
-            // A transcript's close of a screen step stays: without it the
-            // step would read open, which it no longer is.
             (Op::Close, Lvl::Step) => tx_nodes.contains(&r.node.n),
             (Op::Amend, Lvl::Step) => tx || tx_nodes.contains(&r.node.n),
             (Op::Amend, Lvl::Turn) => tx,
@@ -401,8 +324,6 @@ fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
                         .close = Some(r);
                 }
             }
-            // A step's refinement (a transcript's `out=` or `confirmed=1`,
-            // phase 3B) is read with its close.
             (Op::Amend, Lvl::Step) => {
                 if let Some(t) = step_turn.get(&r.node.n).copied() {
                     turns
@@ -432,8 +353,7 @@ fn scan<'a>(window: &[&'a Rec], seeds: &'a [Rec]) -> Scan<'a> {
     }
 }
 
-/// The needs the brief names as observed: every one but a claim (a need
-/// raised by a mark), most urgent first.
+/// Observed needs (excluding claims), most urgent first.
 fn observed_needs(st: &SessionState) -> impl Iterator<Item = &Need> {
     st.needs.iter().flatten().filter(|n| n.observed())
 }
@@ -471,8 +391,6 @@ fn session_line(st: &SessionState, now: u64) -> String {
         );
     } else {
         let _ = write!(s, " · {}", st.phase.word);
-        // A phase nothing has observed yet says so by carrying no source:
-        // `?` is a claim's, and no one claimed anything.
         if st.phase.conf != Conf::Unknown {
             let _ = write!(s, " {}", reliability(st.phase.src, st.phase.conf));
         }
@@ -533,14 +451,8 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, link: Option<MailLink>, shed: TxShed, now
     } else if t.open.is_none()
         && let Some(Val::Id(opener)) = t.close.and_then(|c| c.f.get(Key::OpBy))
     {
-        // THE OPEN WAS EVICTED: the close's
-        // restated opener, printed as the text it is, never read back into
-        // an actor.
         let _ = write!(line, " by={opener}");
     }
-    // The open's own `ledger=`, `cause=` and `cont=`; with the open evicted,
-    // the `ledger=` its close restates (5F-4a), the one of them a close
-    // carries.
     let (from, keys): (Option<&Rec>, &[Key]) = match t.open {
         Some(o) => (Some(o), &[Key::Ledger, Key::Cause, Key::Cont]),
         None => (t.close, &[Key::Ledger]),
@@ -558,10 +470,6 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, link: Option<MailLink>, shed: TxShed, now
             }
         }
     }
-    // THE MAIL IT PROBABLY ANSWERED: the
-    // fold's heuristic link, printed with its confidence's suffix, so it
-    // never reads without the `~` that says it is a guess. A turn that
-    // names its cause has none (the fold never links one).
     if let Some(l) = link {
         let _ = write!(line, " mail=@{}{}", l.off, l.conf.suffix());
     }
@@ -573,7 +481,6 @@ fn turn_line(n: u32, t: &TurnInfo<'_>, link: Option<MailLink>, shed: TxShed, now
             }
             let _ = write!(line, " open {}", dur(now.saturating_sub(o.t)));
         };
-        // Collapsed, the open transcript steps are the newest and a count.
         let mut tx_open: Vec<(u32, &Rec)> = Vec::new();
         for (sn, s) in &t.steps {
             if s.close.is_none()
@@ -681,15 +588,13 @@ fn mark_line(r: &Rec) -> String {
     line
 }
 
-/// A rendering: the body lines, and how many turn units (a turn with its
-/// step lines, or a range of turns) it could shed oldest first.
+/// Rendered body lines and the number of turn units available to shed.
 struct Rendered {
     lines: Vec<String>,
     units: usize,
 }
 
-/// What `more=` names: the turns left out (by number), and how many marks,
-/// need lines and claim lines were.
+/// Omitted turns and mark/need/claim counts for the `more=` line.
 #[derive(Default)]
 struct More {
     turns: std::collections::BTreeSet<u32>,
@@ -698,9 +603,7 @@ struct More {
     claims: usize,
 }
 
-/// The trailer's need and claim lines: every observed need but the one the
-/// session line names, then the live claims (verdict, label, needs raised
-/// by a mark).
+/// Build the trailer's need and claim lines.
 fn trailer(st: &SessionState, now: u64) -> (Vec<String>, Vec<String>) {
     let ago = |t: u64| dur(now.saturating_sub(t));
     let needs = observed_needs(st)
@@ -716,11 +619,6 @@ fn trailer(st: &SessionState, now: u64) -> (Vec<String>, Vec<String>) {
         })
         .collect();
     let mut claims = Vec::new();
-    // The newest proven verdict (the harness's), the newest trusted one
-    // (the owner class, `ctl` among it) when it is another, then the newest
-    // of any author when that is yet another: no `ctl` client — the agent
-    // the harness judges is one — and no other author displaces the
-    // harness's verdict here (`fold::shown_verdicts`).
     for v in crate::fold::shown_verdicts(st) {
         if let Some(w) = v.word {
             claims.push(format!(
@@ -731,9 +629,6 @@ fn trailer(st: &SessionState, now: u64) -> (Vec<String>, Vec<String>) {
             ));
         }
     }
-    // A label only from the harness, else the owner class (§7.3, D6;
-    // `fold::shown_label`, the clause's own rule): another author's stays in
-    // the ring and in `log`, never put in front of a reader here.
     if let Some(l) = crate::fold::shown_label(st, now)
         && let Some(text) = &l.text
     {
@@ -756,8 +651,7 @@ fn trailer(st: &SessionState, now: u64) -> (Vec<String>, Vec<String>) {
     (needs, claims)
 }
 
-/// A claim's ` as=<pct>` (the name its author declared, never `by=`) and
-/// ` re=<id>`, each when it has one.
+/// Format a claim's `as=` and `re=` fields when present.
 fn claim_refs(c: &crate::fold::Claim) -> String {
     let mut s = String::new();
     if let Some(a) = &c.as_name {
@@ -780,11 +674,7 @@ fn gap_line(g: &Gap) -> String {
     )
 }
 
-/// Render at shedding `level`, dropping the `drop` oldest turn units at
-/// level 3 (the newest is always kept): the body lines and the `more=`
-/// items. `counts`: with the count lines — `mail in · out` and `acts ·
-/// stories` (S15, A23), and `shown` (6F-9, U26) — which a rendering that
-/// does not fit sheds before anything else.
+/// Render body lines at shedding `level`, dropping the `drop` oldest turn units at level 3.
 fn render(
     scan: &Scan<'_>,
     gap: Option<&Gap>,
@@ -796,19 +686,15 @@ fn render(
 ) -> Rendered {
     let mut lines = vec![session_line(st, now)];
     let mut more = More::default();
-    // Newest first.
     let turns: Vec<(u32, &TurnInfo<'_>)> = scan.turns.iter().rev().map(|(n, t)| (*n, t)).collect();
     let newest = turns.first().map(|t| t.0);
     let (needs, claims) = trailer(st, now);
     let mut units_len = 0;
     if level < 4 {
-        // Each unit: its lines and the turns it covers.
         let mut units: Vec<(Vec<String>, Vec<u32>)> = Vec::new();
         let mut i = 0;
         while i < turns.len() {
             let (n, t) = turns[i];
-            // Level 2 collapses runs of ordinary closed turns, keeping the
-            // newest turn whole.
             if level >= 2 && Some(n) != newest && t.ordinary() {
                 let mut j = i;
                 while j < turns.len() && Some(turns[j].0) != newest && turns[j].1.ordinary() {
@@ -833,7 +719,6 @@ fn render(
             if detail {
                 for (sn, s) in &t.steps {
                     // An open turn's open steps are already on its line;
-                    // collapsed, a closed transcript step has none.
                     if (t.close.is_none() && s.close.is_none())
                         || (shed == TxShed::Collapsed && s.transcript())
                     {
@@ -850,8 +735,6 @@ fn render(
             i += 1;
         }
         units_len = units.len();
-        // Past everything else, level 3 sheds the oldest turn units, the
-        // newest kept, each named in `more=`.
         let keep = if level >= 3 {
             units
                 .len()
@@ -900,9 +783,7 @@ fn render(
     }
 }
 
-/// `more=`: the turns left out, newest first, a run of three or more as a
-/// range (`more=t17,t16,t1-t14`), then `marks:<n>`, `needs:<n>` and
-/// `claims:<n>`; `more=-` when nothing was.
+/// Format the `more=` trailer line.
 fn more_line(more: &More) -> String {
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for &n in &more.turns {
@@ -935,8 +816,7 @@ fn more_line(more: &More) -> String {
     }
 }
 
-/// Assemble the reply: the header's `used=` is the whole reply's token
-/// estimate, header included.
+/// Assemble the header and body with the total token estimate.
 fn assemble(sid: &str, st: &SessionState, budget: usize, body: &[String]) -> (String, usize) {
     let body_text = body.join("\n");
     let mut used = 0usize;
@@ -965,11 +845,7 @@ fn assemble(sid: &str, st: &SessionState, budget: usize, body: &[String]) -> (St
     (format!("{header}\n{body_text}"), used)
 }
 
-/// What a brief reads apart from its budget: the window the reader asked
-/// for, the fold's open turn and step whose open records the window no
-/// longer holds, the gap the read crossed, the fold's state, and the fold's
-/// heuristic mail links. [`BriefInput::scanned`] sorts it once into a
-/// [`Briefing`], which renders it at any budget.
+/// Pre-scan inputs for rendering a brief at any budget.
 pub struct BriefInput<'a> {
     window: Vec<&'a Rec>,
     seeds: Vec<Rec>,
@@ -979,17 +855,7 @@ pub struct BriefInput<'a> {
 }
 
 impl<'a> BriefInput<'a> {
-    /// `window` is the records the reader asked for (the whole ring, one
-    /// node's subtree, or those past its cursor) and `gap` the gap that read
-    /// crossed ([`crate::log::Read::gap`]): the one `gap` line says exactly
-    /// that, never a loss inferred from where a narrowed window starts.
-    ///
-    /// `links` are the fold's heuristic mail links
-    /// ([`crate::Fold::mail_links`]): a linked turn's line ends its fields
-    /// with ` mail=@<off>~`. The fold holds
-    /// links for the open turns and the newest closed one only, so an older
-    /// closed turn's line has none. The local brief passes its fold's; a
-    /// brief of the bus passes none.
+    /// Construct a [`BriefInput`] from a record window, read gap, fold state, and mail links.
     #[must_use]
     pub fn new(
         window: impl IntoIterator<Item = &'a Rec>,
@@ -1008,8 +874,7 @@ impl<'a> BriefInput<'a> {
         }
     }
 
-    /// The window sorted into turns, their steps and the marks worth a line,
-    /// with and without what a transcript added ([`scan_stripped`]).
+    /// Scan the window with and without transcript records.
     #[must_use]
     pub fn scanned(&self) -> Briefing<'_> {
         #[cfg(any(test, debug_assertions))]
@@ -1026,8 +891,7 @@ impl<'a> BriefInput<'a> {
     }
 }
 
-/// A [`BriefInput`], scanned: the brief at any budget renders from it
-/// without reading the window again.
+/// Scanned [`BriefInput`] ready to render at any budget.
 pub struct Briefing<'b> {
     scan: Scan<'b>,
     /// The window without the transcript's records ([`TxShed::Stripped`]).
@@ -1040,10 +904,7 @@ pub struct Briefing<'b> {
 }
 
 impl Briefing<'_> {
-    /// The rendering at shedding `level`, `drop` oldest turn units shed, its
-    /// header naming `budget`, with the count lines when `counts` and as much
-    /// of what a transcript added as `shed` keeps; and how many turn units it
-    /// could shed.
+    /// Render at shedding `level` with `drop` oldest turn units omitted.
     fn at_with(
         &self,
         (sid, budget, now): (&str, usize, u64),
@@ -1069,26 +930,21 @@ impl Briefing<'_> {
         (Brief { text, used, level }, r.units)
     }
 
-    /// [`Self::at_with`] past the count lines and the transcript's records:
-    /// the levels shed what the brief held without them.
+    /// Render [`Self::at_with`] without count lines or transcript records.
     fn at(&self, sid: &str, budget: usize, now: u64, level: u8, drop: usize) -> (Brief, usize) {
         self.at_with((sid, budget, now), (level, drop), false, TxShed::Stripped)
     }
 
-    /// The brief of session `sid` within `budget` tokens at `now_wall`
-    /// ([`brief`]).
+    /// Fit the brief of session `sid` within `budget` tokens at `now_wall`.
     #[must_use]
     pub fn fit(&self, sid: &str, budget: usize, now_wall: u64) -> Brief {
         let whole = (sid, budget, now_wall);
-        // The count lines first, shed before any other (S15): the mail a 3B
-        // producer counts, the acts and stories, and the shown marks (6F-9).
         if self.scan.counts_any(&self.st.totals) {
             let (b, _) = self.at_with(whole, (0, 0), true, TxShed::Full);
             if b.used <= budget {
                 return b;
             }
         }
-        // Then what the transcript added (S15): collapsed, then none of it.
         if self.transcript {
             for shed in [TxShed::Full, TxShed::Collapsed] {
                 let (b, _) = self.at_with(whole, (0, 0), false, shed);
@@ -1105,8 +961,6 @@ impl Briefing<'_> {
             }
             units = n;
         }
-        // Level 3, shedding the oldest turn units: the fewest drops that fit
-        // (fewer units only ever shorten the body).
         if units > 1 {
             let (most, _) = self.at(sid, budget, now_wall, 3, units - 1);
             if most.used <= budget {
@@ -1127,9 +981,7 @@ impl Briefing<'_> {
         self.at(sid, budget, now_wall, 4, 0).0
     }
 
-    /// Exactly `fit(sid, 0, now_wall)`, rendered once: no rendering fits a
-    /// budget of 0 (a reply's estimate is at least one token), so that brief
-    /// is the one-line form with `budget=0` in its header.
+    /// Render the one-line floor brief with `budget=0` in its header.
     #[must_use]
     pub fn floor(&self, sid: &str, now_wall: u64) -> Brief {
         self.at(sid, 0, now_wall, 4, 0).0
@@ -1141,23 +993,14 @@ thread_local! {
     static SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many windows [`BriefInput::scanned`] has sorted on this thread: a
-/// test's count of the scans a reply made.
+/// Number of windows [`BriefInput::scanned`] has sorted on this thread.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn scans_on_this_thread() -> u64 {
     SCANS.with(std::cell::Cell::get)
 }
 
-/// The brief of session `sid` (§7.4): the least-shed rendering whose token
-/// estimate fits `budget`, or the one-line form when none does. At level 3
-/// the oldest turn lines go one unit at a time (the fewest that fit), so the
-/// brief reaches the one-line form only when even the session line and the
-/// newest turn do not fit.
-///
-/// `window`, `gap` and `links` are as [`BriefInput::new`] takes them. A
-/// reader that renders one window at several budgets scans it once
-/// ([`BriefInput::scanned`]) and fits each from the [`Briefing`].
+/// Render the least-shed brief of session `sid` that fits `budget`, or the one-line floor.
 pub fn brief<'a>(
     sid: &str,
     window: impl IntoIterator<Item = &'a Rec>,
@@ -1173,9 +1016,7 @@ pub fn brief<'a>(
 }
 
 impl crate::log::Log {
-    /// [`brief`] over this log's whole window and fold, its mail links
-    /// among it: its gap is the ring's own eviction (a reader that holds
-    /// nothing, `since=0`).
+    /// Render [`brief`] over this log's whole window and fold.
     #[must_use]
     pub fn brief(&self, sid: &str, budget: usize, now_wall: u64) -> Brief {
         let read = self.read(Cursor::new(self.ep(), 0), usize::MAX);

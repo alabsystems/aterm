@@ -139,7 +139,7 @@ impl TaskRecord {
 
     /// Whether a waiter has news (a terminal state or standing attention).
     #[must_use]
-    pub(crate) fn has_news(&self) -> bool {
+    pub(crate) const fn has_news(&self) -> bool {
         self.state.is_terminal() || self.attention
     }
 
@@ -322,7 +322,7 @@ pub(crate) const TASK_USAGE: &str = "ERR usage: task [mark <working|done|exited|
 impl TaskMark {
     /// Creates a mark to `state` with default fields.
     #[must_use]
-    pub(crate) fn new(state: TaskState) -> Self {
+    pub(crate) const fn new(state: TaskState) -> Self {
         Self {
             state,
             from: None,

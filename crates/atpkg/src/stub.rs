@@ -598,7 +598,8 @@ fn pending_bin_stub_executable(
         return Ok(None);
     }
     if tool.is_alias() {
-        // An alias is never a stub (module doc): it names the managed copy once
+        // An alias is never a stub: it names the managed copy once
+        // installed, and the plain name's stub already answers until then.
         return Ok(None);
     }
     pending_stub_at(layout, tool, comes_with, layout.shim(tool))

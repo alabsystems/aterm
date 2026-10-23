@@ -123,11 +123,11 @@ impl Program {
     #[must_use]
     pub const fn harness_version(self) -> Option<&'static str> {
         match self {
-            Program::Claude => Some("0.1"),
-            Program::Codex => Some("0.1"),
-            Program::Agy => Some("0.1"),
-            Program::Muse => Some("0.1"),
-            Program::Gemini => Some("0.1"),
+            Program::Claude => Some(crate::phase::HARNESS_VERSION),
+            Program::Codex => Some(crate::codex::HARNESS_VERSION),
+            Program::Agy => Some(crate::agy::HARNESS_VERSION),
+            Program::Muse => Some(crate::muse::HARNESS_VERSION),
+            Program::Gemini => Some(crate::gemini::HARNESS_VERSION),
             Program::Generic => None,
         }
     }
@@ -203,6 +203,10 @@ pub struct Reading {
 /// Per-program screen grammar.
 pub trait ScreenReader: Sync {
     fn program(&self) -> Program;
+    /// Incremental version of this program's harness (`"0.1"`), or `None` for [`Program::Generic`].
+    fn harness_version(&self) -> Option<&'static str> {
+        self.program().harness_version()
+    }
     fn phase(&self, rows: &[String]) -> Phase;
     fn prompt(&self, _rows: &[String]) -> Option<PromptV2> {
         None
@@ -2255,5 +2259,30 @@ mod tests {
                 "{program:?}: {said:?} then {read:?}"
             );
         }
+    }
+
+    #[test]
+    fn each_harness_module_owns_its_own_version_from_0_1() {
+        assert_eq!(crate::phase::HARNESS_VERSION, "0.1");
+        assert_eq!(crate::codex::HARNESS_VERSION, "0.1");
+        assert_eq!(crate::agy::HARNESS_VERSION, "0.1");
+        assert_eq!(crate::muse::HARNESS_VERSION, "0.1");
+        assert_eq!(crate::gemini::HARNESS_VERSION, "0.1");
+        for prog in Program::ALL {
+            assert_eq!(
+                prog.harness_version().is_some(),
+                prog.harness_table(),
+                "{prog:?}"
+            );
+            assert_eq!(
+                prog.reader().harness_version(),
+                prog.harness_version(),
+                "{prog:?}"
+            );
+            if prog.harness_table() {
+                assert_eq!(prog.harness_version(), Some("0.1"), "{prog:?}");
+            }
+        }
+        assert_eq!(Program::Generic.harness_version(), None);
     }
 }

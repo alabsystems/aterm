@@ -56,8 +56,6 @@ fn complex() {
         ],
     );
 
-    // Serializes to unit, deserializes from either depending on format's
-    // preference.
     assert_tokens(&Untagged::C, &[Token::Unit]);
     assert_de_tokens(&Untagged::C, &[Token::None]);
 
@@ -109,7 +107,6 @@ fn newtype_unit_and_empty_map() {
     );
 }
 
-// Reaches crate::private::de::content::ContentRefDeserializer::deserialize_newtype_struct
 #[test]
 fn newtype_struct() {
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -124,7 +121,6 @@ fn newtype_struct() {
 
     let value = E::Newtype(NewtypeStruct(5));
 
-    // Content::Newtype case
     assert_tokens(
         &value,
         &[
@@ -135,7 +131,6 @@ fn newtype_struct() {
         ],
     );
 
-    // _ case
     assert_de_tokens(&value, &[Token::U32(5)]);
 }
 
@@ -158,7 +153,6 @@ mod newtype_enum {
         EmptyStruct {},
     }
 
-    // Reaches crate::private::de::content::VariantRefDeserializer::unit_variant
     #[test]
     fn unit() {
         assert_tokens(
@@ -170,7 +164,6 @@ mod newtype_enum {
         );
     }
 
-    // Reaches crate::private::de::content::VariantRefDeserializer::newtype_variant_seed
     #[test]
     fn newtype() {
         assert_tokens(
@@ -185,7 +178,6 @@ mod newtype_enum {
         );
     }
 
-    // Reaches crate::private::de::content::VariantRefDeserializer::tuple_variant
     #[test]
     fn tuple0() {
         assert_tokens(
@@ -201,7 +193,6 @@ mod newtype_enum {
         );
     }
 
-    // Reaches crate::private::de::content::VariantRefDeserializer::tuple_variant
     #[test]
     fn tuple2() {
         assert_tokens(
@@ -219,8 +210,6 @@ mod newtype_enum {
         );
     }
 
-    // Reaches crate::private::de::content::VariantRefDeserializer::struct_variant
-    // Content::Map case
     #[test]
     fn struct_from_map() {
         assert_tokens(
@@ -238,17 +227,13 @@ mod newtype_enum {
         );
     }
 
-    // Reaches crate::private::de::content::VariantRefDeserializer::struct_variant
-    // Content::Seq case
     #[test]
     fn struct_from_seq() {
         assert_de_tokens(
             &Outer::Inner(Inner::Struct { f: 1 }),
             &[
                 Token::Map { len: Some(1) },
-                // tag
                 Token::Str("Struct"),
-                // content
                 Token::Seq { len: Some(1) },
                 Token::U8(1),
                 Token::SeqEnd,
@@ -257,18 +242,13 @@ mod newtype_enum {
         );
     }
 
-    // Reaches crate::private::de::content::VariantRefDeserializer::struct_variant
-    // Content::Map case
-    // Special case - empty map
     #[test]
     fn empty_struct_from_map() {
         assert_de_tokens(
             &Outer::Inner(Inner::EmptyStruct {}),
             &[
                 Token::Map { len: Some(1) },
-                // tag
                 Token::Str("EmptyStruct"),
-                // content
                 Token::Map { len: Some(0) },
                 Token::MapEnd,
                 Token::MapEnd,
@@ -276,18 +256,13 @@ mod newtype_enum {
         );
     }
 
-    // Reaches crate::private::de::content::VariantRefDeserializer::struct_variant
-    // Content::Seq case
-    // Special case - empty seq
     #[test]
     fn empty_struct_from_seq() {
         assert_de_tokens(
             &Outer::Inner(Inner::EmptyStruct {}),
             &[
                 Token::Map { len: Some(1) },
-                // tag
                 Token::Str("EmptyStruct"),
-                // content
                 Token::Seq { len: Some(0) },
                 Token::SeqEnd,
                 Token::MapEnd,
@@ -296,7 +271,6 @@ mod newtype_enum {
     }
 }
 
-// Reaches crate::private::de::content::ContentRefDeserializer::deserialize_option
 mod with_optional_field {
     use super::*;
 

@@ -102,7 +102,9 @@ pub(crate) fn team_titles<'a>(
 
 impl TabStripMetadata {
     #[must_use]
-    pub(crate) fn from_presentation(presentation: &crate::tab_model::TabPresentation) -> Self {
+    pub(crate) const fn from_presentation(
+        presentation: &crate::tab_model::TabPresentation,
+    ) -> Self {
         Self {
             icon: presentation.icon,
             dirty: presentation.indicators.dirty,
@@ -207,7 +209,9 @@ pub(crate) fn tab_status_center(ordinal: usize, count: usize) -> f32 {
 
 /// Per-shape scale for `count` packed status marks.
 #[must_use]
-pub(crate) fn tab_status_mark_scale(count: usize) -> f32 {
+pub(crate) const fn tab_status_mark_scale(count: usize) -> f32 {
+    // At 0.75 the widest shapes (the diamond and the outbound triangle, 2.5 from
+    // centre at full size) fit the 4-unit pitch, only the diamond's stroke reaching
     // past it, and the edge marks (centres 2.0/14.0) stay inside the box.
     if count >= 4 { 0.75 } else { 1.0 }
 }
@@ -1105,7 +1109,7 @@ fn push_pill_segments(
     segments.push(pill_segment(run_start, start + width, region));
 }
 
-fn pill_segment(start_col: u16, end_col: u16, hit: crate::presence::PillHit) -> TabSegment {
+const fn pill_segment(start_col: u16, end_col: u16, hit: crate::presence::PillHit) -> TabSegment {
     TabSegment {
         start_col,
         end_col,
@@ -1458,7 +1462,7 @@ pub(crate) enum StripFloor {
 
 impl StripFloor {
     /// The floor's tone over `ground`, the terminal's own.
-    fn tone(self, ground: [u8; 3]) -> [u8; 3] {
+    const fn tone(self, ground: [u8; 3]) -> [u8; 3] {
         match self {
             Self::Ground => ground,
             Self::Surface(tone) => tone,
@@ -1838,6 +1842,7 @@ pub(crate) fn seal_strip_bottom(row: &mut [RenderCell], p: impl Into<ChromePalet
         return;
     };
     for cell in row.iter_mut() {
+        // Never overwrite an existing rule: the selected chip's accent underline is
         // its seam.
         if cell.underline == UnderlineStyle::None {
             cell.underline = UnderlineStyle::Single;
@@ -2346,6 +2351,7 @@ fn paint_strip_impl(
                 {
                     put(row, cx, '✕', tab_role);
                     if STRIP_CHIP_CARDS && let Some(slot) = row.get_mut(cx as usize) {
+                        // The mark is an affordance, not a second label: regular
                         // weight beside the selected card's bold title.
                         slot.bold = false;
                     }
@@ -2647,6 +2653,7 @@ fn status_primitives(metadata: TabStripMetadata) -> Vec<TabIconPrimitive> {
             }
             TabStatusKind::Connection => {
                 let Some(role) = metadata.conn else {
+                    // Unreachable behind `has_status_kind`, but the arm stays
                     // total rather than trusting the gate at a distance.
                     continue;
                 };
@@ -2969,6 +2976,7 @@ fn paint_rename_field(
         }
     }
     if scroll > 0 && caret != scroll {
+        // The first visible char loses its lead cell to the marker; if it was wide,
         // blank its orphaned continuation too.
         if chars.get(scroll).is_some_and(|&(_, w)| w == 2) && field.start + 1 < field.end {
             row[field.start + 1] = well(' ', c.value, c.field_bg);
@@ -2976,6 +2984,7 @@ fn paint_rename_field(
         row[field.start] = well(RENAME_SCROLL_LEFT, c.label, c.field_bg);
     }
     if index < chars.len() && !caret_on_last_cell {
+        // When a wide pair ends exactly at the field edge, the marker replaces its
         // continuation, so blank the lead as well.
         if pair_ends_field && field.end >= 2 && field.end - 2 >= field.start {
             row[field.end - 2] = well(' ', c.value, c.field_bg);
@@ -3229,7 +3238,7 @@ fn distinct_chip_labels_in(
         }
     }
     let mut parent: Vec<usize> = (0..cut.len()).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
+    const fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
             x = parent[x];
@@ -3307,12 +3316,17 @@ fn distinct_chip_labels_in(
             .filter(|label| !family_of_twins || label.contains(" · "));
         let label = if twins >= 2 && i != active {
             if let Some(label) = path_ordinal {
+                // Among other members the path's own cut, bare or not: the
+                // family cut would split the directory name. In a family of
+                // twins only a cut with a tail; a bare number leaves the
                 // family's own context ([`twin_tail`]) to speak.
                 label
             } else {
                 ordinal_chip_label(i, &titles[i], core, remainder, avail, furniture, tail_cut)
             }
         } else if path_cut[i] {
+            // A path keeps the label its first cut gave it ([`path_chip_label`]),
+            // independent of which neighbours are cut or seated. Twins by subject
             // still take their ordinal, above.
             labels[i].clone().unwrap_or_default()
         } else {
@@ -3530,7 +3544,7 @@ fn cut_core(title: &str, shared: usize) -> &str {
 }
 
 /// The characters a label may be cut after without splitting a name.
-fn is_token_boundary(c: char) -> bool {
+const fn is_token_boundary(c: char) -> bool {
     matches!(c, '/' | '\\' | '-' | '_' | '.') || c.is_whitespace()
 }
 
@@ -3547,7 +3561,7 @@ fn snap_shed(title: &str, shared: usize) -> usize {
 }
 
 /// Whether a chip's subject is a filesystem path: `~`, `~/…`, `~\…`, `/…`, `C:\…`, `\\host\…`.
-fn is_path_subject(subject: &str) -> bool {
+const fn is_path_subject(subject: &str) -> bool {
     matches!(
         subject.as_bytes(),
         [b'~'] | [b'~', b'/' | b'\\', ..] | [b'/', ..] | [b'\\', b'\\', ..]
@@ -10497,6 +10511,7 @@ mod tests {
                 floor("active-tab text", c.active_fg, c.active_bg);
                 floor("inactive-tab label", c.inactive_fg, c.band_bg);
                 if STRIP_IS_CHROME_BAND {
+                    // The hover wash is a step toward the ink, so it is the pair
                     // likeliest to slip under the floor on a muted scheme.
                     floor("hovered-tab label", c.hover_fg, c.hover_bg);
                 }
@@ -11308,6 +11323,8 @@ mod tests {
                 );
             }
             if hovered {
+                // The band's one hover material (`strip_hover_bg_for_test`'s
+                // answer, read directly: that helper exists only where a
                 // chrome band does, and this test runs on every host).
                 assert_eq!(want.bg, colors.hover_bg, "the band's hover material");
             }

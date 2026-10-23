@@ -1216,6 +1216,7 @@ impl Root {
             Cap::Yes
         } else {
             // `hidepid`: other users' processes are hidden, so sums over
+            // them are lower bounds.
             Cap::Estimate
         };
         let has_zones = self.zones().iter().any(|z| !z.trips.is_empty());

@@ -5,16 +5,15 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Color Palette Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/cpal) implementation.
+//! A [Color Palette Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/cpal)
+//! implementation.
 
 use core::num::NonZeroU16;
 
 use crate::RgbaColor;
 use crate::parser::{FromData, LazyArray16, Offset, Offset32, Stream};
 
-/// A [Color Palette Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/cpal).
+/// A [Color Palette Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/cpal).
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     color_indices: LazyArray16<'a, u16>,
@@ -53,7 +52,6 @@ impl<'a> Table<'a> {
 
     /// Returns the number of palettes.
     pub fn palettes(&self) -> NonZeroU16 {
-        // Already checked during parsing: `parse` refuses zero palettes.
         NonZeroU16::new(self.color_indices.len()).unwrap_or(NonZeroU16::MIN)
     }
 

@@ -146,6 +146,23 @@ pub trait EventLoopBuilderExtWindows {
     fn with_any_thread(&mut self, any_thread: bool) -> &mut Self;
 
     /// Whether to enable process-wide DPI awareness.
+    ///
+    /// # Example
+    ///
+    /// Disable process-wide DPI awareness.
+    ///
+    /// ```
+    /// use aterm_window::event_loop::EventLoop;
+    /// #[cfg(target_os = "windows")]
+    /// use aterm_window::platform::windows::EventLoopBuilderExtWindows;
+    ///
+    /// let mut builder = EventLoop::builder();
+    /// #[cfg(target_os = "windows")]
+    /// builder.with_dpi_aware(false);
+    /// # if false { // We can't test this part
+    /// let event_loop = builder.build();
+    /// # }
+    /// ```
     fn with_dpi_aware(&mut self, dpi_aware: bool) -> &mut Self;
 
     // The example is compiled code: the win32 oracle (`verify cells`) reads the
@@ -258,6 +275,19 @@ pub trait WindowExtWindows {
     /// use std::thread;
     /// use aterm_window::platform::windows::WindowExtWindows;
     /// use aterm_window::raw_window_handle::HasWindowHandle;
+    ///
+    /// // We can get the window handle on the current thread.
+    /// let handle = window.window_handle().unwrap();
+    ///
+    /// // However, on another thread, we can't!
+    /// thread::spawn(move || {
+    ///     assert!(window.window_handle().is_err());
+    ///
+    ///     // We can use this function as an escape hatch.
+    ///     let handle = unsafe { window.window_handle_any_thread().unwrap() };
+    /// });
+    /// # }
+    /// ```
     #[cfg(feature = "rwh_06")]
     unsafe fn window_handle_any_thread(
         &self,
@@ -298,6 +328,8 @@ impl WindowExtWindows for Window {
     #[inline]
     fn set_title_background_color(&self, color: Option<Color>) {
         // The windows docs don't mention NONE as a valid options but it works in practice and is
+        // useful to circumvent the Windows option "Show accent color on title bars and
+        // window borders"
         self.window.set_title_background_color(color.unwrap_or(Color::NONE))
     }
 
@@ -523,6 +555,38 @@ pub trait IconExtWindows: Sized {
     fn from_resource(ordinal: u16, size: Option<PhysicalSize<u32>>) -> Result<Self, BadIcon>;
 
     /// Create an icon from a resource embedded in this executable or library by its name.
+    ///
+    /// # Notes
+    ///
+    /// Due to some internal implementation details of the resource embedding/loading process on
+    /// Windows platform, strings that can be interpreted as 16-bit unsigned integers (`"1"`,
+    /// `"002"`, etc.) cannot be used as valid resource names, and instead should be passed into
+    /// [`from_resource`]:
+    ///
+    /// [`from_resource`]: IconExtWindows::from_resource
+    ///
+    /// ```rust,no_run
+    /// use aterm_window::platform::windows::IconExtWindows;
+    /// use aterm_window::window::Icon;
+    ///
+    /// assert!(Icon::from_resource_name("app", None).is_ok());
+    /// assert!(Icon::from_resource(1, None).is_ok());
+    /// assert!(Icon::from_resource(27, None).is_ok());
+    /// assert!(Icon::from_resource_name("27", None).is_err());
+    /// assert!(Icon::from_resource_name("0027", None).is_err());
+    /// ```
+    ///
+    /// While `0` cannot be used as an ordinal id (see [`from_resource`]), it can be used as a
+    /// name:
+    ///
+    /// [`from_resource`]: IconExtWindows::from_resource
+    ///
+    /// ```rust,no_run
+    /// # use aterm_window::platform::windows::IconExtWindows;
+    /// # use aterm_window::window::Icon;
+    /// assert!(Icon::from_resource_name("0", None).is_ok());
+    /// assert!(Icon::from_resource(0, None).is_err());
+    /// ```
     fn from_resource_name(name: &str, size: Option<PhysicalSize<u32>>) -> Result<Self, BadIcon>;
 }
 

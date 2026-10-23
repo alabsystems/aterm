@@ -38,15 +38,13 @@ impl<'a> ArgumentsStack<'a> {
         Ok(())
     }
 
-    /// The argument at `index`; 0 past the buffer (every caller checks the
-    /// stack length first, so this answers only a malformed charstring).
+    /// The argument at `index` (0 past the buffer).
     #[inline]
     pub fn at(&self, index: usize) -> f32 {
         self.data.get(index).copied().unwrap_or(0.0)
     }
 
-    /// The top argument; 0 on an empty stack. Upstream underflowed here (a
-    /// CFF2 `blend` with no operands panicked even in release builds).
+    /// The top argument; 0 on an empty stack.
     #[inline]
     pub fn pop(&mut self) -> f32 {
         let Some(len) = self.len.checked_sub(1) else {
@@ -68,7 +66,6 @@ impl<'a> ArgumentsStack<'a> {
             return;
         }
 
-        // Reverse only the actual data and not the whole stack.
         if let Some(first) = self.data.get_mut(..self.len) {
             first.reverse();
         }

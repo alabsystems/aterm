@@ -713,4 +713,20 @@ mod tests {
             "refuse vacuous or ambiguous plant"
         );
     }
+    // The oracle plants only on a host with both Windows targets; an edit that loses a
+    // plant's text fails here, on any host, rather than there as a NOT RUN.
+    #[test]
+    fn every_plant_finds_its_one_spot_in_aterm_win32() {
+        let krate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-win32");
+        for p in PLANTS {
+            let text = read(&krate.join(p.file)).unwrap();
+            assert_eq!(
+                text.matches(p.old).count(),
+                1,
+                "plant {} in {}",
+                p.name,
+                p.file
+            );
+        }
+    }
 }

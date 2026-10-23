@@ -480,6 +480,7 @@ pub(super) fn after_exit_onto(
     };
     if k.alive(snap.pid) && k.process_start(snap.pid).as_deref() == Some(snap.start.as_str()) {
         // Ctrl-Z: agy stopped, alive, holding its lock — no exit yet, never a
+        // crash (the host leaves a program still there as `not-exited`).
         return said(r, "wait:not-exited");
     }
     prune_known(opts, vec![snap.tab.clone()]);
@@ -711,6 +712,8 @@ fn free_at(config: &Path, lock: &Path, conversation: &str, k: &dyn AgyKernel) ->
 /// Plan the relaunch from what the record keeps: the shell's dialect, the heal it needs, the `cd` to the launch's directory (where the shell's differs), and the line — `<twin> <carried flags> --conversation=<uuid>` ([`ag::rewrite_argv`]) behind the `HOME` the process was started with ([`ag::line_env`], REQUIRED: a line that cannot hold it is refused).
 pub(super) fn plan(opts: &Opts, st: &St, k: &dyn AgyKernel) -> Result<Plan, NoPlan> {
     // No shell ([`NO_SHELL`], a tab's own agy) is refused for good, as the
+    // Claude and Muse Code lanes' plans refuse it: nothing would read the
+    // line.
     if st.shell == NO_SHELL {
         return Err(NoPlan::Refused {
             why: "not-a-shell-job".to_string(),
@@ -945,6 +948,7 @@ fn await_held(
             .map(|(pid, _)| pid);
         if let Some(pid) = new {
             // On the record at once: a line that ends as soon as it is found
+            // is read with ITS crash file ([`line_word`]).
             found(st, pid, k);
         }
         if new.is_none()
@@ -970,6 +974,7 @@ fn await_held(
         Some(pid) => carry_on(opts, r, st, c, pid, k, Some(hand)),
         None => {
             // The line's own command ended: its agy never came up, or was
+            // gone before it was found.
             if let Some(kind) = ended.or_else(|| line_word(c, st, k)) {
                 return line_ended(opts, r, st, kind);
             }
@@ -1287,6 +1292,7 @@ fn carry_on(
         "done:resumed"
     } else if st.quiet {
         // Up, and gone before its lock was seen held by it: the relaunch is
+        // not proved the conversation's (nothing was typed either way).
         "done:unconfirmed"
     } else {
         "done:no-continue"

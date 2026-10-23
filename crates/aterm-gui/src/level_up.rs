@@ -74,7 +74,7 @@ pub(crate) struct LevelUp {
 impl LevelUp {
     /// Begin the rim for `build` at `now`.
     #[cfg(any(unix, test))]
-    pub(crate) fn charging(build: u64, now: Instant, motion: f32) -> Self {
+    pub(crate) const fn charging(build: u64, now: Instant, motion: f32) -> Self {
         Self {
             build,
             spawned: now,
@@ -84,7 +84,7 @@ impl LevelUp {
 
     /// Stop the movement and keep the rim (serious mode turned on mid-update):
     /// the reduced-motion still rim, from now to its cap.
-    pub(crate) fn hold_still(&mut self) {
+    pub(crate) const fn hold_still(&mut self) {
         self.motion = 0.0;
     }
 

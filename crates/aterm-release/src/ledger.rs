@@ -1,7 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Build-number ledger: parse and append `RELEASES.ledger` (`#` comments; records are `<build_number> <version>`; a malformed non-comment line refuses with its line number), compute `n = max(last + 1, unix_now)`, and run the claim in two halves:
+//! Build-number ledger: parse and append `RELEASES.ledger` (`#` comments; records are
+//! `<build_number> <version>`; a malformed non-comment line refuses with its line number),
+//! compute `n = max(last + 1, unix_now)`, and run the claim in two halves:
+//!
+//! * [`reserve`] fixes the release's identity before anything is built from it: `n` from
+//!   origin's ledger tail and the clock, and the release commit C (the published commit
+//!   plus the ledger line and the rolled changelog), made from git objects and pushed
+//!   nowhere. The binary is built and verified from C carrying `n`, so the bytes `verify
+//!   release` judged are the bytes that ship, and a release that refuses before the claim
+//!   burns no number.
+//! * [`claim`] lands the reservation: main takes C (a fast-forward, or a merge onto a tip
+//!   peers moved), and that `git push` is a compare-and-swap on the ledger tail, retried on
+//!   rejection up to [`MAX_CLAIM_ATTEMPTS`] times and verified afterwards against the
+//!   remote tail byte for byte. A reservation whose `n` the tail has reached is never
+//!   re-numbered (its bytes carry `n`): it refuses, and the release reserves and builds
+//!   again.
 
 use aterm_uds::spawnfd::{Command, command};
 use std::fmt;

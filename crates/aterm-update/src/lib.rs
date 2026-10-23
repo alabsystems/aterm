@@ -713,7 +713,7 @@ pub fn handoff_capture_prior() -> Option<HandoffCaptureRecord> {
     None
 }
 
-/// The apply lane's answer to "a build is staged.
+/// The apply lane's answer to "a build is staged; why is it not running?".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ApplyLaneReport {
     /// Reason of the most recent apply failure.
@@ -3306,7 +3306,8 @@ fn automatic_apply_on() -> bool {
     AUTOMATIC_APPLY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Serializes the tests that mutate the process-global "this machine cannot read its release.
+/// Serializes the tests that mutate the process-global "this machine cannot read its release
+/// channel" latch (`unreadable::STRANDED`), since a crate's tests run as threads of one process.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) static STRANDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

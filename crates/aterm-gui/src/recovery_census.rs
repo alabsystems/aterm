@@ -493,7 +493,7 @@ struct LogFacts {
 }
 
 impl LogFacts {
-    fn stall(self) -> Tri {
+    const fn stall(self) -> Tri {
         match (self.lines, self.stall_open) {
             (0, _) => Tri::Unknown,
             (_, true) => Tri::Yes,
@@ -501,7 +501,7 @@ impl LogFacts {
         }
     }
 
-    fn pressure(self) -> Pressure {
+    const fn pressure(self) -> Pressure {
         match (self.lines, self.pressure) {
             (0, _) => Pressure::Unknown,
             (_, None) => Pressure::None,
@@ -532,6 +532,7 @@ impl LogFacts {
         } else if body.contains(SHED_LINE_CRITICAL) {
             self.pressure = Some(Pressure::Critical);
         } else if body.contains(SHED_LINE_WARN) {
+            // A shed line only restates a level: it never lowers a critical report
             // the pressure source made just before it.
             if self.pressure != Some(Pressure::Critical) {
                 self.pressure = Some(Pressure::Warn);

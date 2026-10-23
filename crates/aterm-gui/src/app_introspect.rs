@@ -47,7 +47,7 @@ impl Default for CapturePresentBudget {
 }
 
 impl CapturePresentBudget {
-    fn record_attempt(&mut self, pending: bool, presented: bool, failed: bool) {
+    const fn record_attempt(&mut self, pending: bool, presented: bool, failed: bool) {
         if !pending && !presented && failed {
             self.remaining = self.remaining.saturating_sub(1);
         }
@@ -114,7 +114,7 @@ impl CaptureRequest {
         }
     }
 
-    fn takes_client_tap(&self) -> bool {
+    const fn takes_client_tap(&self) -> bool {
         match self {
             Self::Image(request) => !request.clean,
             Self::Snapshot { .. } => true,
@@ -200,7 +200,7 @@ fn deferred_capture_owns_current_tap(exact_tap: bool, expected: u64, current: Op
     exact_tap && current == Some(expected)
 }
 
-fn capture_resume_owns_next_frame(
+const fn capture_resume_owns_next_frame(
     before: u64,
     after: u64,
     pending: bool,
@@ -480,7 +480,7 @@ enum DestinationDemand {
 }
 
 impl DestinationDemand {
-    fn of_image(clean: bool) -> Self {
+    const fn of_image(clean: bool) -> Self {
         if clean { Self::Never } else { Self::Preferred }
     }
 }
@@ -541,14 +541,14 @@ enum CaptureSource {
 }
 
 impl CaptureSource {
-    fn serial(&self) -> Option<u64> {
+    const fn serial(&self) -> Option<u64> {
         match *self {
             Self::Destination { serial, .. } => Some(serial),
             Self::Rerender { serial, .. } => serial,
         }
     }
 
-    fn phase(&self) -> &'static str {
+    const fn phase(&self) -> &'static str {
         match self {
             Self::Destination { .. } => "destination",
             Self::Rerender {
@@ -676,7 +676,7 @@ fn exact_pixels(
 }
 
 impl CapturePixels {
-    fn whole(store: PixelStore, width: usize, height: usize) -> Self {
+    const fn whole(store: PixelStore, width: usize, height: usize) -> Self {
         Self {
             store,
             view: aterm_render::PixelRect {
@@ -749,7 +749,7 @@ impl CapturePixels {
         Ok(self)
     }
 
-    fn dims(&self) -> (usize, usize) {
+    const fn dims(&self) -> (usize, usize) {
         (self.view.width, self.view.height)
     }
 
@@ -759,7 +759,7 @@ impl CapturePixels {
             .saturating_add(capture_encode_overhead(width, height))
     }
 
-    fn allocation(&self) -> usize {
+    const fn allocation(&self) -> usize {
         match &self.store {
             PixelStore::Rgba8 { bytes, .. } => bytes.capacity(),
             PixelStore::Packed(frame) => frame
@@ -1374,7 +1374,7 @@ enum SnapshotCommitPlan {
 }
 
 #[must_use]
-fn snapshot_commit_plan(job_generation: u64, latest_generation: u64) -> SnapshotCommitPlan {
+const fn snapshot_commit_plan(job_generation: u64, latest_generation: u64) -> SnapshotCommitPlan {
     if job_generation == latest_generation {
         SnapshotCommitPlan::Publish
     } else {
@@ -1489,6 +1489,8 @@ fn write_snapshot_artifacts_with_hook(
         .map_err(|_| "snapshot generation fence is poisoned".to_string())?;
     let latest = generations.get(&target.path).copied().unwrap_or(0);
     if snapshot_commit_plan(generation, latest) == SnapshotCommitPlan::DiscardStale {
+        // This job has not touched the shared payload paths. In particular, do
+        // not clean them: they may already belong to the current generation
         // whose transaction completed while this worker waited for the lock.
         return Err(format!(
             "snapshot generation {generation} was superseded by {latest}"
@@ -2324,7 +2326,7 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
 
 pub(crate) use aterm_types::control_verbs::AuxTarget;
 
-fn capture_ticks_cursor_fx(has_os_window: bool, recording_this_window: bool) -> bool {
+const fn capture_ticks_cursor_fx(has_os_window: bool, recording_this_window: bool) -> bool {
     !has_os_window && !recording_this_window
 }
 
@@ -2489,7 +2491,7 @@ fn capture_flying_companion_enabled(
         ) || sing > 0.0)
 }
 
-fn capture_flying_alpha(pet_mode: bool, kitty_enabled: bool, cat_alpha: u8) -> u8 {
+const fn capture_flying_alpha(pet_mode: bool, kitty_enabled: bool, cat_alpha: u8) -> u8 {
     if kitty_enabled && !pet_mode {
         cat_alpha
     } else {
@@ -2518,7 +2520,7 @@ fn capture_pet_facts(
     }
 }
 
-fn capture_mode(windowless: bool) -> aterm_effects::host::CaptureMode {
+const fn capture_mode(windowless: bool) -> aterm_effects::host::CaptureMode {
     if windowless {
         aterm_effects::host::CaptureMode::StaticCapture
     } else {
@@ -2537,7 +2539,7 @@ fn dims_axis(axis: aterm_render::AxisPlacement) -> (i64, u32, u32, u32, u32) {
     )
 }
 
-fn dims_px(cells: u32, cell_px: u32, extra_px: u32) -> u32 {
+const fn dims_px(cells: u32, cell_px: u32, extra_px: u32) -> u32 {
     cells.saturating_mul(cell_px).saturating_add(extra_px)
 }
 
@@ -3340,6 +3342,9 @@ impl App {
             .get(&wid)
             .is_none_or(|window| window.os_window.is_none());
         if exact_focus.session != capture_front_session || !exact_focus.damage_consumed {
+            // A one-pane headless decoration pass is admitted only by the
+            // exact extraction that consumed its own damage session. Missing
+            // or mismatched custody fails closed instead of re-locking a
             // possibly newer synchronized-output episode.
             return;
         }
@@ -3467,6 +3472,10 @@ impl App {
         let pet = ws.fx.companion_mut().tick(pet_tick);
         let words_suspended = exact_focus.alternate_screen && suppress_alt;
         if load_shed || words_suspended || sparkle.is_none() {
+            // The word field freezes under load or alternate-screen suppression;
+            // an explicit feature disable resets it. The full resident retains
+            // its independent surface and its motion (the shed takes only its
+            // frame train). The flying head's existing load gate already denies
             // its pixels and pauses its hello.
             if load_shed || words_suspended {
                 ws.fx.decos_mut().freeze(now);
@@ -4739,6 +4748,10 @@ impl App {
 
     /// Hand a capture to the single PNG encode/write worker, spawning it lazily on first use (a run that never screenshots pays nothing).
     pub(crate) fn submit_encode_job(&mut self, mut job: EncodeJob) {
+        // A video dump can hold a worker for seconds to minutes (hundreds of
+        // full-frame PNG encodes), so it runs on its own one-shot lane and no
+        // `image`/`window`/`snapshot` reply queues behind it. At most one recording
+        // exists at a time. A failed spawn falls through to the shared worker. A
         // dump is byte-budgeted at capture, so it takes no capture permit.
         if matches!(&job, EncodeJob::VideoDump { .. }) {
             let (vtx, vrx) = std::sync::mpsc::channel::<EncodeJob>();
@@ -4746,6 +4759,8 @@ impl App {
                 "aterm-video-encode".to_string(),
                 crate::qos::Role::Background,
                 move || {
+                    // Background QoS: a recording encode is cosmetic work no
+                    // keystroke waits on, so it never takes P-core time from the
                     // UI thread on a saturated machine.
                     if let Ok(j) = vrx.recv() {
                         run_encode_job(j, None);
@@ -5429,6 +5444,7 @@ impl App {
                 .copied()
                 .and_then(crate::tab_model::View::terminal_session)
             else {
+                // The tree said all-terminal; a leaf that resolves to no session
                 // is a stale plan. Fail closed, never a guess.
                 return Vec::new();
             };
@@ -5727,6 +5743,7 @@ impl App {
                 }
                 out.extend(self.apprt.read_toolbar_tab_menus(handle));
             } else if let Some(line) = self.stripless_tab_chrome() {
+                // No native strip (a headless instance): the line its strip
                 // would show, so a tab's marks stay readable there too.
                 out.push(line);
             }
@@ -6746,7 +6763,7 @@ fn macos_view_is_ancestor_of(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_rect_is_finite(rect: aterm_objc::CGRect) -> bool {
+const fn macos_rect_is_finite(rect: aterm_objc::CGRect) -> bool {
     rect.origin.x.is_finite()
         && rect.origin.y.is_finite()
         && rect.size.width.is_finite()
@@ -6921,6 +6938,7 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
         )
     };
     if image.is_null() {
+        // Not a permission failure (see the doc comment), and the message must not
         // say it is: NULL means the window is not on screen.
         return Err(
             "window capture failed (the window is not on screen: minimized, on another \
@@ -7084,7 +7102,7 @@ impl ShotEncoding {
         }
     }
 
-    fn carries_outer_shape(self) -> bool {
+    const fn carries_outer_shape(self) -> bool {
         match self {
             #[cfg(target_os = "macos")]
             Self::PremultipliedRgba => true,
@@ -7229,7 +7247,7 @@ impl ChromeLayer {
 }
 
 #[cfg(target_os = "macos")]
-fn chrome_peak_bytes(width: usize, height: usize, handed: usize) -> usize {
+const fn chrome_peak_bytes(width: usize, height: usize, handed: usize) -> usize {
     handed.saturating_add(width.saturating_mul(height).saturating_mul(4))
 }
 

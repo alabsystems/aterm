@@ -276,6 +276,8 @@ impl Catalog {
             } else if crate::bundled::is_identity(trimmed)
                 && let Some((id, _)) = crate::bundled::face_for_family(trimmed)
             {
+                // A bundled identity is compiled in, never a name to hunt for. A bundled
+                // family name is hunted like any other and falls back to the bundled face below
                 // only when nothing installed answers.
                 results[index] = Some(Ok((PathBuf::from(id), FaceChoice::At(0))));
             } else {

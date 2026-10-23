@@ -1,13 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Damage-path differential: `Renderer::render_input_cached` over a persistent `WindowCpu`
-// (the shipping CPU present's entry) must be byte-identical to a fresh renderer's full
-// repaint after every step of a long mutation walk (typing, cursor moves, SGR, wide CJK,
-// combining marks, DECDWL, blink phase, cursor override, selection, scrollback offset,
-// resize). `render_input` repaints fully into a throwaway cache, so the warm arm must not
-// use it; each test pins via the `DamageOutcome` tally that the row-scoped path, the dirty
-// gate and the full fallback actually ran.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CursorStyle, Terminal};
@@ -16,16 +8,13 @@ use aterm_render::{DamageOutcome, Frame, Renderer, Theme, WindowCpu};
 fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
         .map(|mut r| {
-            // Block on lazy fallback parses so both arms rasterize the CJK step
-            // identically (no provisional `.notdef`).
             r.debug_block_on_lazy_fallbacks();
             r
         })
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// The warm arm: renderer plus its persistent `WindowCpu`, and a tally of the
-/// [`DamageOutcome`]s taken so each test can pin that the fast paths ran.
+/// Warm renderer plus its persistent `WindowCpu` and a tally of [`DamageOutcome`]s taken.
 struct DamageRig {
     r: Renderer,
     wc: WindowCpu,
@@ -46,8 +35,7 @@ fn rig() -> DamageRig {
     }
 }
 
-/// Renderer-side state applied to both arms before each render: blink phase and the
-/// cursor-style override are not in `RenderInput`.
+/// Renderer-side state applied to both arms before each render.
 #[derive(Clone, Copy)]
 struct RState {
     blink_phase: bool,
@@ -63,8 +51,7 @@ impl Default for RState {
     }
 }
 
-/// Render `term` through the warm rig and a brand-new renderer under identical state and
-/// assert byte equality; tally the warm arm's [`DamageOutcome`].
+/// Renders `term` through the warm rig and a fresh renderer, asserting byte equality and tallying [`DamageOutcome`].
 fn assert_identical(
     damaged: &mut DamageRig,
     rows: usize,
@@ -77,8 +64,6 @@ fn assert_identical(
 
     damaged.r.set_cursor_blink_phase(st.blink_phase);
     damaged.r.set_cursor_style_override(st.cursor_override);
-    // The view is copied into an owned `Frame` so the `wc` borrow ends before the
-    // outcome tally reads it.
     let dmg: Frame = {
         let view = damaged.r.render_input_cached(&mut damaged.wc, &input);
         Frame {
@@ -129,7 +114,6 @@ fn assert_identical(
     }
 }
 
-/// One end-to-end differential walk.
 #[test]
 fn damage_path_is_byte_identical_to_full_repaint() {
     let mut dmg = rig();
@@ -138,10 +122,8 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     let mut term = Terminal::new(rows as u16, cols as u16);
     let st = RState::default();
 
-    // The first frame takes the full path and warms the cache.
     assert_identical(&mut dmg, rows, cols, &mut term, st, "blank");
 
-    // Typing: each keystroke is a 1-cell change on one row.
     for (i, ch) in "hello world".bytes().enumerate() {
         term.process(&[ch]);
         assert_identical(&mut dmg, rows, cols, &mut term, st, &format!("type[{i}]"));
@@ -153,7 +135,6 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     term.process(b"\r\nsecond line");
     assert_identical(&mut dmg, rows, cols, &mut term, st, "second row");
 
-    // Cursor moves without a content change.
     term.process(b"\x1b[1;1H"); // home
     assert_identical(&mut dmg, rows, cols, &mut term, st, "cursor home");
     term.process(b"\x1b[3;5H"); // row 3 col 5
@@ -177,7 +158,6 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     term.process(b"\x1b#6DOUBLEWIDE");
     assert_identical(&mut dmg, rows, cols, &mut term, st, "decdwl");
 
-    // Blink phase changes no content and matters only for a Blinking* cursor.
     term.process(b"\x1b[1 q"); // DECSCUSR 1 = blinking block
     term.process(b"\x1b[1;1H");
     let st_off = RState {
@@ -190,14 +170,11 @@ fn damage_path_is_byte_identical_to_full_repaint() {
         ..st
     };
     assert_identical(&mut dmg, rows, cols, &mut term, st_on, "blink on");
-    // Toggle again from the warm cache to exercise the gate's phase tracking.
     assert_identical(&mut dmg, rows, cols, &mut term, st_off, "blink off 2");
 
-    // No change at all: the dirty-gate fast return.
     assert_identical(&mut dmg, rows, cols, &mut term, st_on, "no-op gate");
     assert_identical(&mut dmg, rows, cols, &mut term, st_on, "no-op gate 2");
 
-    // Cursor-style override (the frontend forces HollowBlock while unfocused).
     let st_hollow = RState {
         cursor_override: Some(CursorStyle::HollowBlock),
         ..st_on
@@ -212,7 +189,6 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     );
     assert_identical(&mut dmg, rows, cols, &mut term, st_on, "override cleared");
 
-    // Steady block over a glyph: the block cut-out path.
     term.process(b"\x1b[2 q\x1b[1;1H"); // steady block at home, over the 'h'
     assert_identical(
         &mut dmg,
@@ -228,7 +204,6 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     term.process(b"\x1b[?25h"); // show
     assert_identical(&mut dmg, rows, cols, &mut term, st, "cursor shown");
 
-    // Selection is frame-global: full fallback.
     {
         let sel = term.text_selection_mut();
         sel.start_selection(0, 2, SelectionSide::Left, SelectionType::Simple);
@@ -247,7 +222,6 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     }
     assert_identical(&mut dmg, rows, cols, &mut term, st, "selection clear");
 
-    // A display-offset change is frame-global: full fallback. Generate history first.
     for i in 0..20 {
         term.process(format!("\r\nscrollback row {i}").as_bytes());
     }
@@ -262,12 +236,10 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     term.process(b"Z");
     assert_identical(&mut dmg, rows, cols, &mut term, st, "1-cell after scroll");
 
-    // Resize changes dims: full fallback and cache rebuild.
     let (rows2, cols2) = (8usize, 30usize);
     term.resize(rows2 as u16, cols2 as u16);
     term.process(b"after resize");
     assert_identical(&mut dmg, rows2, cols2, &mut term, st, "after resize");
-    // A 1-cell change at the new size takes the rebuilt damage path.
     term.process(b"!");
     assert_identical(&mut dmg, rows2, cols2, &mut term, st, "1-cell after resize");
 
@@ -276,7 +248,6 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     term.process(b"Q");
     assert_identical(&mut dmg, rows, cols, &mut term, st, "1-cell after shrink");
 
-    // Non-vacuity: the walk exercised every damage outcome class.
     assert!(
         dmg.rows_frames > 0,
         "warm arm never took the row-scoped damage path — the differential is vacuous"
@@ -322,7 +293,6 @@ fn warm_single_cell_typing_is_identical() {
         );
     }
 
-    // Only the priming frame repaints fully; every keystroke takes the row-scoped path.
     assert_eq!(
         dmg.full_frames, 1,
         "warm typing: only the cache-priming first frame may full-repaint"

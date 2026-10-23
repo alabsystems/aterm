@@ -5,6 +5,23 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
+//! ## Application termination
+//!
+//! This fork installs its own `NSApplicationDelegate` to deliver application lifecycle events.
+//! Keep that delegate in place. To decide whether AppKit may terminate the application,
+//! register a callback with [`set_application_should_terminate_handler`]. It runs on the main
+//! thread; returning `false` cancels termination. Only the first registration takes effect.
+//!
+//! ```no_run
+//! use aterm_window::platform::macos::set_application_should_terminate_handler;
+//!
+//! fn allow_termination() -> bool {
+//!     true
+//! }
+//!
+//! set_application_should_terminate_handler(allow_termination);
+//! ```
 
 use crate::event_loop::EventLoopBuilder;
 use crate::keyboard::ModifiersState;
@@ -90,6 +107,23 @@ pub enum ActivationPolicy {
 
 pub trait EventLoopBuilderExtMacOS {
     /// Set the macOS activation policy for the application.
+    ///
+    /// # Example
+    ///
+    /// Set the activation policy to "accessory".
+    ///
+    /// ```
+    /// use aterm_window::event_loop::EventLoop;
+    /// #[cfg(target_os = "macos")]
+    /// use aterm_window::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+    ///
+    /// let mut builder = EventLoop::builder();
+    /// #[cfg(target_os = "macos")]
+    /// builder.with_activation_policy(ActivationPolicy::Accessory);
+    /// # if false { // We can't test this part
+    /// let event_loop = builder.build();
+    /// # }
+    /// ```
     fn with_activation_policy(&mut self, activation_policy: ActivationPolicy) -> &mut Self;
 
     /// Configure whether the application activates automatically on launch when another app is active.

@@ -1,7 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The measured phases, each selected scenario over its own world, booted as the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with aterm's own options for the arm's tier — ordered at aterm's horizon by default — and retained by aterm's default rules as `aterm link broker` retains it, a headless `aterm`, and the real `aterm link serve` child it launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's `retention=off`, `log=off` and tick interval):
+//! The measured phases, each selected scenario over its own world, booted as
+//! the fabric suite boots it (`harness::World`: a guarded broker in this process, opened with
+//! aterm's own options for the arm's tier — ordered at aterm's horizon by
+//! default — and retained by aterm's default rules as `aterm link broker`
+//! retains it, a headless `aterm`, and the real `aterm link serve` child it
+//! launched, its bus mirror at `--log auto`; [`boot_world`] takes an arm's
+//! `retention=off`, `log=off` and tick interval):
+//!
+//! 1. MESSAGING, on one node. [`latency`]: session A posts a `note` to session
+//!    B, one at a time on an idle bridge, and the clock runs from the `post`
+//!    reply to B's `await inbox` answering. [`burst`]: N posts back to back
+//!    from sender sessions to B (within B's allowance, [`BURST_WINDOW`]), with
+//!    B consuming as a real reader does. Then the census of the records each
+//!    message cost.
+//! 2. PING-PONG, on a node of its own ([`pingpong`]): A posts, B replies the
+//!    moment it sees the message, back to back, with the bridge's wait tally
+//!    on — the reply's wait on the delivery's inbox commit and the bridge's one
+//!    loop, which the latency phase waits out on purpose.
+//! 3. ATTACH, on a third node: a bridge that starts with N sessions, until
+//!    its node row and every session's presence row are on the broker again,
+//!    for each population in the spec; the census of what it wrote, the
+//!    killed bridge's fired will counted apart. And a second stop each
+//!    restart: a note the boot session posts to itself the moment the bridge
+//!    is killed, until it is visible — after the presence rows, the bus
+//!    mirror's start (over a retaining broker at `--log auto`), the refill
+//!    the rows owe and the live drain.
+//! 4. HANDOFF, on a fourth node ([`handoff`]): a successor instance's bridge
+//!    standing by on the held state dir while the holder quits saying `bye
+//!    handoff`; the outage until the successor's rows are acked, and a post
+//!    queued in the gap.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -193,8 +222,8 @@ struct Consumed {
 /// Read `sid`'s inbox like a reader until `want` DISTINCT messages whose text
 /// is `<prefix><j>` have arrived: each wake is followed by a listing, and a
 /// row is stamped VISIBLE at the wake that covered it (or at the listing, for
-/// one that arrived between the two).
-///
+/// one that arrived between the two). After each listing it tells `credit`
+/// how many it has listed.
 /// # Errors
 ///
 /// A wait that timed out, or a row whose text is not `<prefix><j>` — a stray,

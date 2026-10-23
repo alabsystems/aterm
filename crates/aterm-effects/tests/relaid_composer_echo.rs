@@ -1,27 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A key whose echo rides a relayout is still the hand's key.
-//!
-//! Claude Code echoes each key in a per-key shape (glyph addressed from home, caret after it,
-//! inside `?2026h` / `?25l` … `?25h` / `?2026l`), but a key can instead ride a relayout: a
-//! synchronized frame re-laying the whole screen with the bottom-anchored box one row higher (the
-//! agent list under it grew a row) and the composer text rewritten there.
-//!
-//! When the frame train stalls across the relayout, one tick sees the keys before, on and after
-//! it as one caret move, `(r, 21) → (r − 1, 25)`. Read against the old row, the move judge
-//! (`CursorGlow::judge_observed_caret`) would take the typed re-anchor arm and lay only the
-//! landing. The hand riding its line (`CursorGlow::lift_hand_row`, `rk::Engine::lift_hand`) lays
-//! the middle key: with a key in flight, a caret shown a row away first asks whether the hand's
-//! own line was repainted there with it, and the move is judged as the same-row advance
-//! `21 → 25` it is in the text's frame, while the follow pass carries the band up with the hand.
-//! With the seam's lift switched off the stalled takes go red; the per-key and keyless takes stay
-//! green.
-//!
-//! Each take feeds an `aterm_core` [`Terminal`], samples rows as `app_render.rs`'s frame hold
-//! does and ticks [`CursorGlow`] every 16.7 ms with the app's per-key stamp
-//! (`note_typed_expected`). A hole is a dark column strictly between two lit ones in the text
-//! row's planned coverage.
+//! End-to-end [`CursorGlow`] coverage tests when a composer relayout moves the bottom-anchored box.
+//! Covers keys whose echo rides a relayout, stalled frame trains across relayouts, and keyless relayouts.
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::Terminal;
@@ -29,34 +10,26 @@ use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConf
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::{Duration, Instant};
 
-/// A 15×28 device-px cell; a 90×30 pane keeps the take small.
 const ROWS: usize = 30;
 const COLS: usize = 90;
 const CW: usize = 15;
 const CH: usize = 28;
 const FRAME_US: u64 = 16_667;
-/// Within the recorded cadence around the hole, 60–120 ms between keys.
 const KEY_MS: u64 = 90;
-/// One macOS PTY read.
 const PTY_READ: usize = 1024;
-/// A column is lit at this planned coverage (the glass census's 20/255).
 const LIT_COV: u8 = 20;
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
 
-/// The composer's text row, 1-based, before the relayout; the box sits on
-/// the rows around it and the agent list below it.
+/// 1-based composer text row before the relayout.
 const TEXT_ROW: usize = 22;
-/// The grid column (0-based) of the first text glyph: `❯` + NBSP before it.
+/// 0-based grid column of the first text glyph (`❯` + NBSP precede it).
 const COL0: usize = 2;
 
-/// The recorded line up to the relayout, the key that rode it, and the rest.
 const BEFORE: &str = "also in parallel, ch";
 const RIDER: char = 'e';
 const AFTER: &str = "ck why the ";
 
-/// The transcript above the box — enough rows that the relayout is a
-/// multi-KiB frame, as Claude Code's is.
 const TRANSCRIPT: [&str; 6] = [
     "⏺ Agent \"Lint pass: the parser crate\" failed: Agent terminated early",
     "  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)",
@@ -66,8 +39,6 @@ const TRANSCRIPT: [&str; 6] = [
     "✽ Whirlpooling… (37s · ↓ 2.5k tokens · thinking with xhigh effort)",
 ];
 
-/// The agent list under the box; the relayout adds its last row, which is
-/// what lifts the bottom-anchored box one row.
 const AGENTS: [&str; 6] = [
     "  ⏺ main",
     "  ◯ general-purpose  Checking fix lines in the parser",
@@ -91,7 +62,6 @@ fn geom() -> Geom {
     }
 }
 
-/// Rainbow kitty at intensity 0.70 on the dark theme.
 fn cfg() -> GlowConfig {
     GlowConfig {
         classic_mono: false,
@@ -119,7 +89,7 @@ fn rule() -> String {
     "\u{2500}".repeat(COLS)
 }
 
-/// Plan coverage per column of `row` (as `tests/common/mod.rs` `coverage`).
+/// Planned coverage per column of `row`.
 fn coverage(glow: &CursorGlow, row: u16) -> Vec<u8> {
     let mut cov = vec![0u8; COLS];
     let rib = glow.v2_ribbon().expect("rainbow kitty owns the frame");
@@ -162,10 +132,9 @@ fn holes_of(cov: &[u8]) -> Vec<(usize, usize)> {
 /// How the relayout frame reaches the terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Delivery {
-    /// In one read.
+    /// Delivered in one read.
     Whole,
-    /// In 1024-byte reads, a frame of the train between each — the capped
-    /// `?2026` hold letting the host present mid-frame.
+    /// Delivered in 1024-byte reads with a frame presented between each.
     Reads,
 }
 
@@ -191,19 +160,13 @@ struct Host {
     out: Vec<GlowQuad>,
     row_buf: Vec<char>,
     blink_seen: u64,
-    /// The composer's text so far.
     text: String,
-    /// The 1-based text row; the relayout moves it up one.
+    /// 1-based text row.
     row: usize,
-    /// How many agent rows stand under the box.
     agents: usize,
-    /// Blank rows under the agent list once it is full: a relayout that lifts
-    /// the box further than the list can grow.
     tail: usize,
     label: String,
     census: Vec<Census>,
-    /// The frame train is stalled: time passes and keys echo, and no tick
-    /// observes any of it until the stall ends.
     stalled: bool,
 }
 
@@ -243,10 +206,7 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// Claude Code's whole screen, bottom-anchored: the transcript, a blank,
-    /// the rule, the text row, the rule, the mode row, a blank, the agent
-    /// list — each row rewritten in full inside the DEC 2026 bracket, then
-    /// the caret after the text.
+    /// Encode the bottom-anchored screen inside a DEC 2026 bracket with the caret after `self.text`.
     fn screen(&self) -> Vec<u8> {
         let mut rows: Vec<String> = TRANSCRIPT.iter().map(|s| (*s).to_string()).collect();
         rows.push(String::new());
@@ -278,7 +238,7 @@ impl Host {
         s.into_bytes()
     }
 
-    /// The frame hold's samples, then the tick, then the text row's census.
+    /// Sample rows, tick [`CursorGlow`], and record the text row's census.
     fn frame(&mut self) {
         let c = self.term.cursor();
         let cur = self.term.cursor_visible().then_some((c.row, c.col));
@@ -343,8 +303,7 @@ impl Host {
         self.stalled = true;
     }
 
-    /// The train resumes: the first frame is due at once and observes every
-    /// byte the stall held back.
+    /// Resume the frame train so the next tick observes everything buffered during the stall.
     fn resume(&mut self) {
         self.stalled = false;
         self.next_frame = self.now;
@@ -355,8 +314,7 @@ impl Host {
         self.advance_to(t);
     }
 
-    /// The app_input seam stamps the typed hint at the key, `KEY_MS` after the
-    /// last one; the frames until then run first.
+    /// Stamp a one-cell printable key `KEY_MS` after the previous key.
     fn press(&mut self, ch: char) {
         let t = self.last_key + Duration::from_millis(KEY_MS);
         self.advance_to(t);
@@ -368,14 +326,10 @@ impl Host {
         } else {
             TypedClass::Glyph
         };
-        // The window's own stamp for a one-cell printable key: the glyph
-        // itself rides the press (`app_input`'s `note_typed_expected` arm).
         self.glow.note_typed_expected(t, 1, false, class, ch);
     }
 
-    /// One ordinary key in Claude Code's captured per-key shape: the glyph
-    /// addressed from home, the status row touched, the caret put after it. A
-    /// Space is a caret move only.
+    /// Echo one key in per-key shape (or a caret move for Space).
     fn key(&mut self, ch: char) {
         self.press(ch);
         let c = COL0 + self.text.chars().count() + 1;
@@ -404,9 +358,7 @@ impl Host {
         }
     }
 
-    /// The relayout the key rode: the program answers the key with its whole
-    /// screen re-laid (the agent list a row longer, the box one row higher),
-    /// the key's glyph in the rewritten text and the caret after it.
+    /// Echo `ch` inside a full-screen relayout that lifts the composer one row.
     fn relay(&mut self, ch: char, delivery: Delivery) {
         self.press(ch);
         self.text.push(ch);
@@ -441,8 +393,7 @@ impl Host {
         self.term.process(&bytes);
     }
 
-    /// A keyless relayout moving the box `rows` rows: up for agents launched together, down
-    /// (`rows` negative) for agents that finished together.
+    /// Perform a keyless relayout shifting the composer by `rows` (positive = up, negative = down).
     fn keyless_relay_rows(&mut self, rows: isize) {
         for _ in 0..rows {
             if self.agents < AGENTS.len() {
@@ -467,7 +418,6 @@ impl Host {
         self.label = "keyless relayout".into();
     }
 
-    /// The first census frame labelled `label`.
     fn first_frame_labelled(&self, label: &str) -> usize {
         self.census
             .iter()
@@ -513,16 +463,12 @@ impl Host {
         s
     }
 
-    /// `trail status`'s `inflight_forgotten=`.
     fn inflight_forgotten(&self) -> u64 {
         self.glow.in_flight_tally().forgotten
     }
 }
 
-/// The first census frame at or after `label`, and every frame from it on
-/// that reads the relaid text row, must hold the band whole; the rider's own
-/// column must be lit on the last frame; and no press the relayout carried
-/// may be forgotten as an unexplained hop.
+/// Assert that from `label` onward the relaid text row has no holes, lights the rider's column, and forgets no press.
 fn assert_whole_from(h: &Host, label: &str, what: &str, forgotten_before: u64) {
     let from = h.first_frame_labelled(label);
     let holed = h.census[from..]
@@ -553,9 +499,6 @@ fn assert_whole_from(h: &Host, label: &str, what: &str, forgotten_before: u64) {
     );
 }
 
-/// Every frame ticks: the key before, the relayout and the keys after are each
-/// observed on their own (a one-cell diagonal hop, licensed as the rider's
-/// typed advance). A guard: whole with and without the seam's lift.
 fn take(delivery: Delivery) {
     let mut h = Host::new();
     h.type_str(BEFORE);
@@ -571,17 +514,14 @@ fn take(delivery: Delivery) {
     );
 }
 
-/// The relayout delivered whole, and read in 1024-byte pieces.
+/// Verify that a key riding a 1-row relayout lights its glyph under whole and chunked delivery.
 #[test]
 fn a_key_whose_echo_rides_a_relayout_a_row_up_is_laid_under_its_glyph() {
     take(Delivery::Whole);
     take(Delivery::Reads);
 }
 
-/// The frame train stalls from the key before the rider until `after` more
-/// keys have echoed on the relaid row, so one tick sees it all as one move
-/// from the old row to the new. `before` is how many keys of [`BEFORE`] echo
-/// inside the stall.
+/// Stall the frame train across `before` keys, the relayout, and `after` keys on the relaid row.
 fn stalled_take(before: usize, after: usize) {
     let mut h = Host::new();
     let n = BEFORE.chars().count();
@@ -604,10 +544,7 @@ fn stalled_take(before: usize, after: usize) {
     );
 }
 
-/// Every stall width around the relayout, from the rider alone to three keys
-/// either side: each must lay every glyph typed. `(1, 2)` is the recorded map:
-/// the `h` before, the relayout with the `e`, and `ck` after, seen by one tick
-/// as `(r, 21) → (r − 1, 25)`; red without the seam's lift.
+/// Verify that every stall width around the relayout (`0..=3` keys before and after) lights every typed glyph.
 #[test]
 fn every_stall_width_around_the_relayout_lays_every_key() {
     for before in 0..=3 {
@@ -617,16 +554,13 @@ fn every_stall_width_around_the_relayout_lays_every_key() {
     }
 }
 
-/// A relayout with no key behind it (the box moves up a row alone) and the
-/// hand types on: the band follows its text, nothing is laid for the move,
-/// and the next keys join the band with no hole.
+/// Verify that a keyless relayout carries the band and subsequent keys join it without a hole.
 #[test]
 fn a_keyless_relayout_moves_the_band_and_the_next_keys_join_it() {
     let mut h = Host::new();
     h.type_str(BEFORE);
     h.idle(150);
     let forgotten_before = h.inflight_forgotten();
-    // The program re-lays the box a row up on its own; the text is unchanged.
     h.agents += 1;
     h.row -= 1;
     let bytes = h.screen();
@@ -638,8 +572,7 @@ fn a_keyless_relayout_moves_the_band_and_the_next_keys_join_it() {
     assert_whole_from(&h, "after relayout", "a keyless relayout", forgotten_before);
 }
 
-/// The band laid before the relayout moved up a row with its text and the caret, so it stays
-/// lit and whole, under the stall too.
+/// Verify that the band laid before the relayout stays lit while the hand keeps typing.
 #[test]
 fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
     for stalled in [false, true] {
@@ -653,7 +586,6 @@ fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
         h.type_str(&AFTER[..2]);
         h.resume();
         h.type_str(&AFTER[2..]);
-        // Past `FLOW_TOTAL_S` from the relayout, the hand still typing.
         h.type_str("aterm claude harness ");
         let last = h.census.last().expect("frames ran");
         let lit_before = last.lit.as_bytes()[COL0..COL0 + BEFORE.chars().count()]
@@ -674,25 +606,17 @@ fn the_band_laid_before_the_relayout_stays_lit_under_the_hand() {
     }
 }
 
-/// Typing a prefix (`" gaps "`), pausing past the phrase rest into the swoosh,
-/// typing a typo key that revives the prefix via `recent_typed_run`, erasing
-/// the typo with Backspace, taking a keyless 1-row composer relayout, and
-/// typing the suffix (`"and "`) keeps the revived prefix and suffix in one
-/// continuous lit cohort without a hole.
+/// Verify that a revived prefix survives Backspace and a keyless relayout without holes or drift.
 #[test]
 fn revived_prefix_survives_backspace_and_keyless_relayout_without_holes_or_drift() {
     for post_relay_idle_ms in [34, 350, 600] {
         let mut h = Host::new();
         h.type_str(" gaps ");
-        // Pause past the phrase rest (0.9 s) into the swoosh, well inside the chain window
-        // (`CHAIN_GAP_MAX`, 5 s).
         h.idle(1_300);
         h.last_key = h.now;
-        // Typo key revives `" gaps "` via `recent_typed_run` in the same frame as `Event::Typed`.
         h.type_str("n");
         h.backspace();
         h.idle(34);
-        // Keyless 1-row composer relayout while `key_in_flight` is false (`pc == cc`).
         h.keyless_relay_rows(1);
         h.idle(post_relay_idle_ms);
         h.last_key = h.now;
@@ -718,21 +642,12 @@ fn revived_prefix_survives_backspace_and_keyless_relayout_without_holes_or_drift
     }
 }
 
-/// A prefix a keyless relayout carried revives when the hand resumes. ` gaps` is typed, the hand
-/// pauses past the swoosh so the prefix's cells are gone, a keyless relayout moves the box with
-/// the caret after the text (up one row; up two, three or six, agents launched in one frame; down
-/// two, agents that finished together; none, the control), and ` and ` follows. The remembered
-/// typed run rode its line (`CursorGlow::tick`'s keyless carry of `recent_typed_run`; no lit cell
-/// is left for the follow pass to carry), so the first key joins it and the prefix comes back
-/// with the suffix. RED without the carry (one row), with the carry held to one row (two), and
-/// with it held to the follow pass's two-row offsets (three, six): ` gaps` stays dark beside a
-/// lit ` and `.
+/// Verify that a faded prefix carried across a keyless relayout revives when typing resumes.
 #[test]
 fn a_prefix_a_keyless_relayout_carried_revives_when_the_hand_resumes() {
     for lift in [0, 1, 2, 3, 6, -2] {
         let mut h = Host::new();
         h.type_str(" gaps");
-        // Past the whole swoosh (`SWOOSH_TOTAL_S`, 1.69 s): the prefix's cells are gone.
         h.idle(2_200);
         h.keyless_relay_rows(lift);
         h.idle(100);
@@ -774,8 +689,6 @@ fn no_fresh_hint_flood_preserves_licensed_admissions_in_ring() {
         .collect();
     assert_eq!(licensed_before.len(), 5);
 
-    // Simulate 40 keyless background cursor bounces (`no-fresh-hint`) after the
-    // typing license window has expired.
     for step in 0..40u16 {
         let bounce_row = if step % 2 == 0 { 1 } else { h.row as u16 };
         h.term.process(format!("\x1b[{bounce_row};3H").as_bytes());

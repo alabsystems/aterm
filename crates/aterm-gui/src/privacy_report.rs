@@ -251,7 +251,7 @@ pub(crate) struct CoverageSplit {
 }
 
 /// The `observer fda=` value: `off` when deliberately not consulted, `unavailable` when permitted but unable to run, `ok` when a syscall answered.
-pub(crate) fn observer_fda_value(probe: ProbeLabel) -> &'static str {
+pub(crate) const fn observer_fda_value(probe: ProbeLabel) -> &'static str {
     match probe {
         ProbeLabel::RefusedDisabled => "off",
         ProbeLabel::Pending => "pending",
@@ -657,7 +657,7 @@ fn folder_source(states: &[(&'static str, &'static str)]) -> String {
     }
 }
 
-fn yes_no(value: bool) -> &'static str {
+const fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
@@ -1116,7 +1116,7 @@ impl App {
     /// This instance's adoption record: `adopted` when it took over its
     /// predecessor's shells across an in-place apply (even when its session 0
     /// is a fresh bootstrap), `live` otherwise.
-    fn instance_attribution(&self) -> Attribution {
+    const fn instance_attribution(&self) -> Attribution {
         if self.handoff_successor {
             Attribution::Adopted
         } else {

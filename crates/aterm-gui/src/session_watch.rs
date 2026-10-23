@@ -24,7 +24,7 @@ pub(crate) struct Watchers {
     /// stored like `count`: a hold of the session's terminal compares its frame
     /// only while this is not 0.
     frames: AtomicUsize,
-    /// The registered slots. A STRICT LEAF (see the module doc).
+    /// The registered slots. A STRICT LEAF.
     slots: Mutex<Vec<Slot>>,
     /// How many holds of this list's rings stand ([`Self::hold_rings`]).
     holds: AtomicUsize,

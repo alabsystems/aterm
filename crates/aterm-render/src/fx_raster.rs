@@ -408,6 +408,8 @@ pub fn slice_layers<'a>(
             continue;
         };
         for item in layer.content.items() {
+            // Per item, fail closed: an item the layer's blend does not draw
+            // draws nothing, and nor does a sprite whose art the frame's art
             // budget refuses.
             if item.blend() != layer.blend {
                 continue;

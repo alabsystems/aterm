@@ -6,7 +6,7 @@
 use crate::{App, WindowId};
 
 /// The `scheme_from=` word of a session's `status`.
-pub(crate) fn scheme_from_word(
+pub(crate) const fn scheme_from_word(
     source: Option<aterm_core::terminal::ColorSchemeSource>,
 ) -> &'static str {
     use aterm_core::terminal::ColorSchemeSource;
@@ -19,7 +19,7 @@ pub(crate) fn scheme_from_word(
 
 /// Map a winit window [`Theme`](aterm_window::window::Theme) onto the engine's [`Appearance`](aterm_types::Appearance).
 #[must_use]
-pub(crate) fn theme_to_appearance(
+pub(crate) const fn theme_to_appearance(
     theme: Option<aterm_window::window::Theme>,
 ) -> aterm_types::Appearance {
     match theme {
@@ -142,6 +142,7 @@ impl App {
         }
         if (engine_changed || own_applies > 0) && !theme_changed {
             // Cells re-coloured under an unchanged chrome: each window's repaint
+            // key keeps an untouched presentation cheap.
             self.request_redraw_all_windows();
         }
         aterm_log::debug!(

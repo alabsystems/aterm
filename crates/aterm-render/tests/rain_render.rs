@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Digital rain on the CPU renderer (`RenderInput.rain_quads`, `rain_atlas`,
-// `rain_add`): the stamp's `mul8` math and band containment, z-order under
-// glyphs and cats (the GPU's `bg → RainUnder → cat_over → glyphs`), the
-// `rain_add` post-pass, no ghosting on the damaged path, dirty gating, and
-// conformance to the `RainBandContainment` model. Empty channels are the
-// `rain_*` row of `tests/empty_channels.rs`.
+
+//! Digital rain tests for the CPU renderer.
 
 use std::sync::Arc;
 
@@ -31,8 +26,6 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
     out
 }
 
-/// An opaque RGBA atlas with distinct texels, so a wrong NEAREST index or a
-/// missed `flip_x` shows.
 fn patterned_atlas(w: u32, h: u32, version: u64) -> SceneAtlas {
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
     for y in 0..h {
@@ -53,7 +46,6 @@ fn patterned_atlas(w: u32, h: u32, version: u64) -> SceneAtlas {
     }
 }
 
-/// A solid single-colour atlas with a chosen per-texel alpha.
 fn solid_atlas(w: u32, h: u32, rgb: [u8; 3], alpha: u8, version: u64) -> SceneAtlas {
     let rgba = (0..w * h)
         .flat_map(|_| [rgb[0], rgb[1], rgb[2], alpha])
@@ -66,7 +58,6 @@ fn solid_atlas(w: u32, h: u32, rgb: [u8; 3], alpha: u8, version: u64) -> SceneAt
     }
 }
 
-/// Opaque untinted quad: `dest = [x, y, w, h]`, `src = [ax, ay, aw, ah]`.
 fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
     SpriteQuad {
         row,
@@ -84,8 +75,6 @@ fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
     }
 }
 
-/// A one-cell rain quad in its row's band at `(x, row·ch)`, sourced 1:1 from
-/// atlas texel `(ax, ay)`.
 fn band_quad(row: u16, x: u16, cw: u16, ch: u16, ax: u16, ay: u16) -> SpriteQuad {
     quad(row, [x, row * ch, cw, ch], [ax, ay, cw, ch])
 }
@@ -102,25 +91,19 @@ fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
         cy: y + h / 2,
         rx: (w / 2).max(1),
         ry: (h / 2).max(1),
-        // `mode` defaults to `HaloMode::Add`.
         ..Default::default()
     }
 }
 
-/// The stamp's channel math, restated independently: round-half 8-bit multiply.
 fn mul8(c: u32, f: u32) -> u32 {
     (c * f + 127) / 255
 }
 
-/// Per-channel saturating add, restated independently of `add_sat`.
 fn sat_add(dst: u32, premul: u32) -> u32 {
     let ch = |sh: u32| (((dst >> sh) & 0xff) + ((premul >> sh) & 0xff)).min(255);
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// The stamp: tint and alpha go through `mul8` (rounding included), `flip_x`
-/// mirrors the source columns, and nothing lands outside the quad's one-row
-/// cell band.
 #[test]
 fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
     let mut rend = renderer();
@@ -129,8 +112,6 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
     term.process(b"\x1b[?25l");
     let base = rend.render_input(&term.cell_frame(4, 12)).pixels.clone();
 
-    // Tint at a non-endpoint: opaque (200,200,200) texels under 0x80_40_C0 give
-    // exactly (mul8(200,0x80), mul8(200,0x40), mul8(200,0xC0)).
     let mut input = term.cell_frame(4, 12);
     input.rain_atlas = Some(Arc::new(solid_atlas(64, 64, [200, 200, 200], 255, 1)));
     let mut q = band_quad(1, 0, cw as u16, ch.min(64) as u16, 0, 0);
@@ -148,7 +129,6 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
             );
         }
     }
-    // Band containment: every changed pixel lies inside row 1's pixel band.
     for (i, (&b, &p)) in base.iter().zip(f.pixels.iter()).enumerate() {
         if b != p {
             let y = i / f.width;
@@ -159,8 +139,6 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
         }
     }
 
-    // Alpha at the rounding boundary: quad alpha 1 over texel alpha 127 is
-    // mul8 == 0 (nothing painted); texel alpha 128 is mul8 == 1.
     let mut input = term.cell_frame(4, 12);
     input.rain_atlas = Some(Arc::new(solid_atlas(64, 64, [255, 255, 255], 127, 2)));
     let mut q = band_quad(1, 0, cw as u16, ch.min(64) as u16, 0, 0);
@@ -180,7 +158,6 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
         "mul8(128, 1) == 1: one unit of coverage must survive the rounding"
     );
 
-    // flip_x at 1:1: dest (dx, dy) reads texel (aw-1-dx, dy).
     let atlas = patterned_atlas(64, 64, 4);
     let (aw, ah) = (cw.min(64) as u16, ch.min(64) as u16);
     let mut input = term.cell_frame(4, 12);
@@ -205,7 +182,6 @@ fn rain_stamp_mul8_tint_alpha_flip_and_band_containment() {
     }
 }
 
-/// Rain draws under the row's glyphs and under `cat_quads` (cats walk on rain).
 #[test]
 fn rain_under_text_and_under_cats() {
     let mut rend = renderer();
@@ -217,9 +193,7 @@ fn rain_under_text_and_under_cats() {
     let cat_red = 0x00C8_2020;
     let mut input = term.cell_frame(2, 8);
     input.rain_atlas = Some(Arc::new(solid_atlas(8, 8, [0x20, 0xC8, 0x40], 255, 1)));
-    // One row-0 rain quad across cells 0..3 (band-wide, opaque, untinted).
     input.rain_quads = vec![quad(0, [0, 0, (3 * cw) as u16, ch as u16], [0, 0, 8, 8])];
-    // A cat over cell 2 of the same row.
     input.cat_atlas = Some(Arc::new(solid_atlas(8, 8, [0xC8, 0x20, 0x20], 255, 1)));
     input.cat_quads = vec![quad(
         0,
@@ -245,8 +219,6 @@ fn rain_under_text_and_under_cats() {
     );
 }
 
-/// `rain_add` is a radial premultiplied saturating add, byte-exact against the
-/// integer falloff restated here, and it only brightens.
 #[test]
 fn rain_add_is_saturating_add_and_only_brightens() {
     let mut rend = renderer();
@@ -255,8 +227,6 @@ fn rain_add_is_saturating_add_and_only_brightens() {
     term.process(b"\x1b[?25lglow");
     let base = rend.render_input(&term.cell_frame(3, 10)).pixels.clone();
 
-    // A halo overlapping both glyph pixels and bare background on row 0, plus
-    // a near-saturating halo on row 1 to exercise the clamp.
     let dim = 0x0018_3010;
     let hot = 0x00F0_F0F0;
     let mut input = term.cell_frame(3, 10);
@@ -266,7 +236,6 @@ fn rain_add_is_saturating_add_and_only_brightens() {
     ];
     let f = rend.render_input(&input);
 
-    // The grid is padded; recover the pad from the frame width.
     let pad = (f.width - 10 * cw) / 2;
     let mut expected = base.clone();
     for q in &input.rain_add {
@@ -306,15 +275,10 @@ fn rain_add_is_saturating_add_and_only_brightens() {
     }
 }
 
-/// No ghosting: through the damage cache (quads moving rows with a halo, a
-/// mutation tick changing every row, an atlas rebake with byte-equal quads)
-/// each cached frame equals a fresh full render.
 #[test]
 fn damaged_path_no_ghosting_as_rain_animates() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
-    // Glyph-free, like the cat/glow damaged-path tests: glyph AA overhang
-    // across row bands is outside the rain contract.
     let rows = 6usize;
     let mut term = Terminal::new(rows as u16, 12);
     term.process(b"\x1b[?25l");
@@ -329,7 +293,6 @@ fn damaged_path_no_ghosting_as_rain_animates() {
     };
     let atlas_v1 = Arc::new(patterned_atlas(64, 64, 1));
 
-    // A: two columns of rain on rows 1..=2 + a bright-head halo on row 2.
     let in_a = make(
         vec![
             band_quad(1, 0, cw16, ch16, 0, 0),
@@ -339,7 +302,6 @@ fn damaged_path_no_ghosting_as_rain_animates() {
         vec![halo(2, 3 * cw16, 2 * ch16, cw16, ch16, 0x0030_6030)],
         &atlas_v1,
     );
-    // B: the heads step down a row (rows 2..=3), the halo follows.
     let in_b = make(
         vec![
             band_quad(2, 0, cw16, ch16, 0, 0),
@@ -349,7 +311,6 @@ fn damaged_path_no_ghosting_as_rain_animates() {
         vec![halo(3, 3 * cw16, 3 * ch16, cw16, ch16, 0x0030_6030)],
         &atlas_v1,
     );
-    // C: mutation tick: a quad on every row, every row's slice differs from B.
     let in_c = make(
         (0..rows as u16)
             .map(|r| band_quad(r, cw16, cw16, ch16, 16 + r, 8))
@@ -357,8 +318,6 @@ fn damaged_path_no_ghosting_as_rain_animates() {
         vec![halo(5, cw16, 5 * ch16, cw16, ch16, 0x0018_4018)],
         &atlas_v1,
     );
-    // D: rebake: byte-equal quads, a new atlas version and new texels, so a
-    // missed repaint shows.
     let atlas_v2 = {
         let mut a = patterned_atlas(64, 64, 2);
         for px in a.rgba.as_chunks_mut::<4>().0 {
@@ -380,24 +339,17 @@ fn damaged_path_no_ghosting_as_rain_animates() {
     }
 }
 
-/// Dirty gating and the per-row sorted-slice merge-diff: settled rain gate-hits
-/// with no rows marked; moved quads mark only rows whose slice differs (plus
-/// the scissor-band fill); an atlas-version bump marks every quad row; a moved
-/// halo sets `rain_add_changed` and marks its prev∪cur rows.
 #[test]
 fn rain_dirty_gate_and_merge_diff_row_marking() {
     let mut term = Terminal::new(6, 8);
     term.process(b"\x1b[?25l"); // hidden cursor: no cursor rows in the dirty set
     let atlas_v1 = Arc::new(patterned_atlas(16, 16, 1));
-    // Row-sorted, row 2 carrying TWO quads (a slice, not a single element).
     let settled = vec![
         quad(1, [0, 16, 8, 16], [0, 0, 8, 16]),
         quad(2, [0, 32, 8, 16], [0, 0, 8, 16]),
         quad(2, [24, 32, 8, 16], [8, 0, 8, 16]),
         quad(3, [8, 48, 8, 16], [0, 0, 8, 16]),
     ];
-    // The halo sits below the quad rows, so the halo-motion band [4, 5] holds
-    // no settled quad for the band fill to mark.
     let halos = vec![halo(4, 0, 64, 8, 16, 0x0010_2010)];
 
     let mut frame = |quads: &[SpriteQuad], add: &[RainHalo], atlas: &Arc<SceneAtlas>| {
@@ -415,7 +367,6 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
             .collect()
     };
 
-    // Settled: equal non-empty channels and the same atlas.
     let prev = frame(&settled, &halos, &atlas_v1);
     let cur = frame(&settled, &halos, &atlas_v1);
     let mut dirty = Vec::new();
@@ -442,11 +393,6 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
     );
     assert!(dirty.iter().all(|&b| !b), "settled rain must mark no rows");
 
-    // Row 2 loses a quad, row 4 gains one. The merge-diff marks {2, 4}; the
-    // scissor-band fill also marks row 3, a settled row inside the [2, 4] band
-    // (the GPU redraws rain ungated inside the scissor, so the row rebuilds or
-    // the translucent stamp re-blends over its cached pixels). Row 1, outside
-    // the band, stays clean.
     let moved = vec![
         settled[0],
         settled[1],
@@ -475,7 +421,6 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
          settled in-band row — the out-of-band settled row 1 stays clean"
     );
 
-    // Within-row change: same rows, one quad's tile reselected ⇒ only its row.
     let mut mutated = settled.clone();
     mutated[3].ax = 8;
     let cur = frame(&mutated, &halos, &atlas_v1);
@@ -498,7 +443,6 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
         "a within-row slice change must mark exactly that row"
     );
 
-    // Atlas-version bump with byte-equal quads repaints every quad row.
     let cur = frame(&settled, &halos, &Arc::new(patterned_atlas(16, 16, 2)));
     let DirtyDecision::Rows(d) = compute_dirty_rows(
         &prev,
@@ -523,8 +467,6 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
         "the rebake must mark every (unmoved) quad row"
     );
 
-    // Halo motion row 4 → 5: the [4, 5] band holds no settled quad, so the
-    // marks are the prev∪cur halo rows alone.
     let cur = frame(&settled, &[halo(5, 0, 80, 8, 16, 0x0010_2010)], &atlas_v1);
     let DirtyDecision::Rows(d) = compute_dirty_rows(
         &prev,
@@ -548,8 +490,6 @@ fn rain_dirty_gate_and_merge_diff_row_marking() {
     );
 }
 
-/// The rows of `quads` as the frame emitted them, independent of the
-/// renderer's merge walk.
 fn rows_of(quads: &[SpriteQuad]) -> std::collections::BTreeMap<u16, Vec<SpriteQuad>> {
     let mut rows = std::collections::BTreeMap::<u16, Vec<SpriteQuad>>::new();
     for q in quads {
@@ -558,15 +498,6 @@ fn rows_of(quads: &[SpriteQuad]) -> std::collections::BTreeMap<u16, Vec<SpriteQu
     rows
 }
 
-/// Conformance to `RainBandContainment`
-/// (`aterm_models_effects::rain_band_containment_model`): at every point of the
-/// model's lattice (head position, trail length, step or mutation tick) one
-/// column's band is laid down twice, rows past the bottom dropped as the
-/// engine drops them, and `compute_dirty_rows`'s verdict on every visible band
-/// row is exactly the model's one `Mark` successor.
-///
-/// Non-vacuity: the lattice reaches rows where the `Buggy = 1` marker (a
-/// merge-diff blind to the glyph swap) decides differently.
 #[test]
 fn rain_marking_conforms_to_the_rain_band_containment_model() {
     const COLS: usize = 4;
@@ -584,8 +515,6 @@ fn rain_marking_conforms_to_the_rain_band_containment_model() {
     };
     let mut term = Terminal::new(rows as u16, COLS as u16);
     term.process(b"\x1b[?25l"); // hidden cursor: no cursor rows in the dirty set
-    // A glyph per (row, hash window), different across the two windows on
-    // every row, so the mutation tick's roll changes every lit cell.
     let glyph = |row: i64, window: i64| ((row * 3 + window * 5) % 8) as u16;
     let mut column = |lit: std::ops::RangeInclusive<i64>, window: i64| {
         let mut input = term.cell_frame(rows, COLS);
@@ -653,9 +582,6 @@ fn rain_marking_conforms_to_the_rain_band_containment_model() {
     );
 }
 
-/// The model's theorem on the real engine's emission: across `MatrixRain`
-/// ticks (fading trails, stepped heads, mutation ticks, progressive atlas bake)
-/// every row whose quads changed, or whose atlas was re-published, is marked.
 #[test]
 fn real_rain_emission_leaves_no_changed_row_unmarked() {
     use aterm_effects::matrix_rain::{EffectGeom, MatrixRain, RainConfig, RainTickInput};
@@ -673,7 +599,6 @@ fn real_rain_emission_leaves_no_changed_row_unmarked() {
     let mut engine = MatrixRain::new(RainConfig {
         enabled: true,
         density: 12,
-        // The decorative ROM path: literal mode needs sampled output material.
         output_material: false,
         seed: 7,
         ..RainConfig::default()

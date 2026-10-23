@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A split window renders decorations, ink, peeking cats, novas and the
-//! cursor companion in every visible pane; these pin that and the per-pane
-//! geometry behind it.
+//! Split-window sparkle, decoration, ink, nova, and cursor-companion tests.
 
 use super::{PanePlace, seed_resident_pet_mid_flight_for_test};
 use crate::{App, WindowId, term_lock};
@@ -12,8 +10,7 @@ use aterm_effects::pane::{
 };
 use std::time::{Duration, Instant};
 
-/// Give stub terminals the headless renderer's theme background: an unset
-/// default is not a certified blank perch.
+/// Sets the headless theme background on stub terminals so perches are certified blank.
 fn configure_pane_backgrounds(app: &App, sid: u64) {
     let bg = aterm_render::Theme::default().bg;
     for session in [0, sid] {
@@ -39,11 +36,7 @@ fn place(col_off: u16, cols: u16) -> PanePlace {
     }
 }
 
-/// A 2-pane vertical split with freshly typed text in both panes.
-///
-/// The establishing compose spends whatever a never-scanned pane already
-/// held (`set_presentable`'s refocus rule), so the words that must summon
-/// cats are written after that first frame.
+/// Builds a 2-pane vertical split with freshly typed text in both panes after the initial compose.
 fn split_app(now: Instant) -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -95,8 +88,6 @@ fn split_compose_emits_cats_in_every_visible_pane() {
         compose(&mut app, wid, t0).is_some(),
         "the split frame presents"
     );
-    // The peek plays over ~600 ms; sample a later frame like the engine
-    // batteries do.
     let t1 = t0 + Duration::from_millis(600);
     compose(&mut app, wid, t1);
     let diag = channels(&app, wid, t1);
@@ -127,9 +118,7 @@ fn split_compose_emits_cats_in_every_visible_pane() {
     );
 }
 
-/// The merged ink stream is non-empty and strictly increasing by `(row, col)`,
-/// as `aterm_render::sparse_row_slice` requires; a pane-major concatenation of
-/// a vertical split is not.
+/// The merged ink stream is non-empty and strictly increasing by `(row, col)`.
 #[test]
 fn split_compose_ink_is_non_empty_and_sorted() {
     let t0 = Instant::now();
@@ -151,10 +140,6 @@ fn split_compose_ink_is_non_empty_and_sorted() {
     );
 }
 
-// Not tested: that `deco_fp` alone repaints an animation-only frame (an
-// animating cat damages no cell). Other `now`-derived key terms present
-// every frame, so such a test would pass vacuously.
-
 /// Without the cadence a correct emitter renders one frame and freezes.
 #[test]
 fn split_layout_arms_the_effect_frame_cadence() {
@@ -172,16 +157,12 @@ fn split_layout_arms_the_effect_frame_cadence() {
     );
 }
 
-/// One companion per window, riding the focused (right) pane's caret and
-/// translated into that pane's window coords. Sparkle Words is off, so the
-/// only sprites are the companion's, summoned by `on_collect`; an
-/// untranslated companion would land in the left pane.
+/// The cursor companion rides only the focused pane and translates into its window coordinates.
 #[test]
 fn split_companion_rides_only_the_focused_pane() {
     let t0 = Instant::now();
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // Enable the companion explicitly; its default is off on Windows.
     app.config.cursor_trail = Some(true);
     let sid = app.split_active_stub_tab(wid);
     configure_pane_backgrounds(&app, sid);
@@ -214,7 +195,6 @@ fn split_companion_rides_only_the_focused_pane() {
         !sprites.is_empty(),
         "the summoned companion is drawn on a split frame ({diag})"
     );
-    // The right pane starts at col 41 (col 40 is the divider).
     let pane_x0 = (41 * cw) as i32;
     assert!(
         sprites.iter().all(|s| s.x >= pane_x0),
@@ -224,10 +204,7 @@ fn split_companion_rides_only_the_focused_pane() {
     );
 }
 
-/// A hidden caret is not a coordinate: the resident pet keeps its last body
-/// on glass for a bounded fade, but a program relocating the raw cursor in
-/// the same DECTCEM-off batch does not turn into a word claim, and the
-/// settled ambient kitty keeps peeking.
+/// Fading the resident pet on a hidden caret does not claim a word under the relocated raw cursor.
 #[test]
 fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
     let t0 = Instant::now();
@@ -235,19 +212,12 @@ fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
     let wid = WindowId(0);
     let focus = app.split_active_stub_tab(wid);
     configure_pane_backgrounds(&app, focus);
-    // The resident is the subject, so seat it explicitly: `cursor_trail`'s
-    // default is platform-split ([`crate::app_config::DEFAULT_DECORATIVE_EFFECTS`],
-    // off on Windows).
     app.config.cursor_trail = Some(true);
     app.recompute_sparkle();
     app.windows.get_mut(&wid).expect("window").focused = true;
 
-    // Establish the per-pane scanner and the resident pet at a bare caret in
-    // the focused (right) pane.
     assert!(compose(&mut app, wid, t0).is_some());
     let term = app.pool.get(focus).expect("focused pane").term.clone();
-    // Put an ambient word far from the pet, then return the visible caret to
-    // a bare cell. It must first settle visibly, proving the negative arm.
     term_lock(&term).process(b"\x1b[11;3Hkitty\x1b[4;31H");
     assert!(compose(&mut app, wid, t0 + Duration::from_millis(16)).is_some());
     assert!(compose(&mut app, wid, t0 + Duration::from_millis(616)).is_some());
@@ -264,8 +234,6 @@ fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
         channels(&app, wid, t0 + Duration::from_millis(616))
     );
 
-    // Hide and move the program cursor onto that word. The pet still fades
-    // at its old body, but no honest visible caret exists at the new cell.
     term_lock(&term).process(b"\x1b[?25l\x1b[11;3H");
     assert!(compose(&mut app, wid, t0 + Duration::from_millis(632)).is_some());
     {
@@ -299,9 +267,7 @@ fn split_present_hidden_pet_fade_does_not_claim_program_relocated_word() {
 /// The pet's drawn body, `(x0, x1, y0, y1)` frame px.
 type BodyPx = (i32, i32, i32, i32);
 
-/// The resident mid-flight, its caret painted, then one present with or
-/// without a DECTCEM hide, then the caret shown again: the drawn body
-/// `[before, at the hide, back]` and the cell size.
+/// Steps a mid-flight resident pet through one frame with or without a DECTCEM hide and returns `[before, hidden, returned]`.
 fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
     let t0 = Instant::now();
     let mut app = App::headless_for_test();
@@ -390,11 +356,7 @@ fn split_midflight_pet_through_a_hide(hide: bool) -> ([BodyPx; 3], (i32, i32)) {
     ([before, hidden, returned], (cw as i32, ch as i32))
 }
 
-/// A DECTCEM hide inside the repaint hold (`HIDDEN_HOLD_MAX`) is no event
-/// for a pet in the air: the brain reads the hidden caret as the caret it
-/// last saw painted, so the flight lands where it was going, drawn exactly
-/// as its painted twin draws it, and the caret's quick return walks on from
-/// there.
+/// A brief DECTCEM hide inside `HIDDEN_HOLD_MAX` preserves a mid-flight pet's trajectory and resumes walking on return.
 #[test]
 fn split_present_holds_a_hidden_midflight_pet_and_quick_return_walks() {
     let ([before, painted, _], _) = split_midflight_pet_through_a_hide(false);
@@ -411,13 +373,7 @@ fn split_present_holds_a_hidden_midflight_pet_and_quick_return_walks() {
     );
 }
 
-/// A split-pane focus switch crossfades across panes: the composed host's
-/// half of `PetSurfaceSeam`'s `Shift` (the owner's half is aterm-effects'
-/// `pet_coordinate_seams.rs`). On the frame after the switch the arriver is
-/// drawn in the left pane and the old body as a ghost in the right pane, at
-/// its drawn window pixels and under that pane's text: the ghost reaches the
-/// window's channel, not the focused pane's staging, which would crop it at
-/// the divider. Once the crossfade is spent nothing of the pet is left there.
+/// Switching focus across split panes crossfades the old pet body in its own pane while the new pane's pet arrives.
 #[test]
 fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     let t0 = Instant::now();
@@ -429,7 +385,6 @@ fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
     app.config.cursor_trail_style = Some("rainbow kitty pet".into());
     app.config.motion = Some("full".into());
     app.recompute_sparkle();
-    // Only the companion draws free sprites.
     app.sparkle = None;
     app.windows.get_mut(&wid).expect("window").focused = true;
     let (cw, _) = app.win_cell_size(wid);
@@ -442,8 +397,6 @@ fn split_focus_switch_fades_the_old_body_in_its_own_pane() {
             .copied()
             .max_by_key(|s| u32::from(s.w) * u32::from(s.h))
     };
-    // A frame with nothing new to show early-outs (`None`), keeping the
-    // last presented one in `input_scratch`.
     let mut now = t0;
     for _ in 0..200 {
         compose(&mut app, wid, now);
@@ -504,7 +457,6 @@ fn splitting_does_not_reset_the_untouched_panes_episodes() {
             .is_some_and(|ws| ws.fx.decos().is_active(t0)),
         "the composed frame established live episodes ({diag})"
     );
-    // A pane-space mutation evicts only departed panes.
     app.reset_pane_space_decorations(wid);
     assert!(
         app.windows
@@ -514,10 +466,7 @@ fn splitting_does_not_reset_the_untouched_panes_episodes() {
     );
 }
 
-/// A sprite straddling an interior pane edge is cropped in dest and, in
-/// lockstep, in its atlas source rect (nearest 1:1); one wholly outside is
-/// dropped; a pane at the window edge keeps its overhang; nothing
-/// underflows at offset 0.
+/// `translate_free_into_pane` crops interior-edge straddlers in dest and atlas source, drops out-of-pane sprites, and keeps window-edge overhang.
 #[test]
 fn translate_free_sprites_into_pane_crops_source_and_dest() {
     let sprite = |x: i32, y: i32, w: u16, h: u16| aterm_core::render::FreeSprite {
@@ -535,7 +484,6 @@ fn translate_free_sprites_into_pane_crops_source_and_dest() {
         z: aterm_core::render::FreeZ::UnderText,
         sampler: aterm_core::render::FreeSampler::Nearest,
     };
-    // Left pane (cols 0..40): a sprite straddling the divider at x = 400.
     let mut free = vec![sprite(380, 40, 40, 20)];
     translate_free_into_pane(&mut free, place(0, 40));
     assert_eq!(free.len(), 1, "the visible half survives");
@@ -551,21 +499,16 @@ fn translate_free_sprites_into_pane_crops_source_and_dest() {
     );
     assert_eq!(free[0].ay, 200, "an untouched axis keeps its texel origin");
 
-    // Right pane (col_off 41): the shift lands it past the divider, and its
-    // left overhang is cropped there.
     let mut free = vec![sprite(-30, 0, 40, 20)];
     translate_free_into_pane(&mut free, place(41, 39));
     assert_eq!(free[0].x, 410, "clipped to the pane's own left edge");
     assert_eq!((free[0].w, free[0].aw), (10, 10), "dest and source agree");
     assert_eq!(free[0].ax, 100 + 30, "the cropped-away texels are skipped");
 
-    // A sprite wholly inside the neighbour is dropped, not wrapped.
     let mut free = vec![sprite(600, 0, 20, 20)];
     translate_free_into_pane(&mut free, place(0, 40));
     assert!(free.is_empty(), "nothing leaks across a divider");
 
-    // Window-edge overhang survives: the leftmost pane owns the left pad,
-    // and `col_off == 0` must not underflow the shift.
     let mut free = vec![sprite(-8, -6, 20, 20)];
     translate_free_into_pane(&mut free, place(0, 40));
     assert_eq!(
@@ -575,13 +518,9 @@ fn translate_free_sprites_into_pane_crops_source_and_dest() {
     );
 }
 
-/// The cursor companion ships a pose-scaled destination in `w/h` and the
-/// natural art size in `aw/ah`, so at an interior pane edge it is cropped
-/// proportionally rather than dropped; the crop reduces to texel-for-texel
-/// at 1:1.
+/// A pose-scaled companion straddling an interior divider is cropped proportionally in source and dest.
 #[test]
 fn a_scaled_companion_is_cropped_at_a_divider_not_deleted() {
-    // Dest 40x20 drawn from a 20x10 atlas tile: a 2x upscale.
     let companion = aterm_core::render::FreeSprite {
         x: 380,
         y: 40,
@@ -604,8 +543,6 @@ fn a_scaled_companion_is_cropped_at_a_divider_not_deleted() {
         1,
         "the companion SURVIVES the divider — dropping it is the bug"
     );
-    // Half the dest is cropped away, so half the source must be too: 10 of
-    // the 20 atlas texels, not the 20 dest pixels a 1:1 crop would take.
     assert_eq!((free[0].x, free[0].w), (380, 20), "dest cropped at 400");
     assert_eq!(
         (free[0].ax, free[0].aw),
@@ -618,8 +555,6 @@ fn a_scaled_companion_is_cropped_at_a_divider_not_deleted() {
         "the untouched axis keeps its whole source span"
     );
 
-    // A sliver thinner than the scale factor must still select a texel: an
-    // empty source rect is a sprite the backends have nothing to sample.
     let mut sliver = vec![aterm_core::render::FreeSprite {
         x: 399,
         ..companion
@@ -634,8 +569,7 @@ fn a_scaled_companion_is_cropped_at_a_divider_not_deleted() {
     );
 }
 
-/// The ink/nova translators shift into window coords and clip at interior
-/// dividers.
+/// The ink/nova translators shift into window coords and clip at interior dividers.
 #[test]
 fn translate_ink_and_nova_shift_and_clip_at_the_divider() {
     let mut ink = vec![
@@ -661,7 +595,6 @@ fn translate_ink_and_nova_shift_and_clip_at_the_divider() {
         w: 30,
         h: 10,
         color: 0x0011_2233,
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: 0x0011_2233,
         alpha2: 0,

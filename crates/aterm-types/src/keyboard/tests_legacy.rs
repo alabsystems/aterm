@@ -413,7 +413,7 @@ fn ctrl_alt_space_and_backspace_keep_the_alt() {
     );
 }
 
-/// Ctrl+~ (Ctrl+Shift+` on US keyboards) is RS, 0x1E: kitty's legacy ctrl table ("~ -> 30")
+/// Ctrl+~ (`` Ctrl+Shift+` `` on US keyboards) is RS, 0x1E: kitty's legacy ctrl table ("~ -> 30")
 /// and xterm's control alias.
 #[test]
 fn ctrl_tilde_is_record_separator() {

@@ -41,7 +41,7 @@ pub const META_ATTENTION_KEYED_MAX: usize = 200;
 /// A verb's authority class.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OpClass {
-    /// Pure observer / view-state control (incl.
+    /// Pure observer / view-state control (incl. `subscribe`, the push face of read).
     Read,
     /// Injects the human input vocabulary the driven program observes, plus the app-drive verbs (`turn`/`spawn`/`close`/`tab`/`invoke`).
     Write,
@@ -1855,7 +1855,10 @@ pub const VERBS: &[VerbSpec] = &[
          fg_rss_mb=<n|-> job=<verdict|-> job_quiet_ms=<ms|-> \
          disk=<ok|warn|critical> disk_free_mb=<n> disk_room_mb=<n> disk_age_ms=<ms> \
          syspolicyd=<-|ok|full|stuck> syspolicyd_workers=<n>/<limit|->|- \
-         syspolicyd_full_ms=<ms|-> attribution=<live|adopted|unknown> \
+         syspolicyd_full_ms=<ms|-> occupancy=<off|observe|prompt> \
+         occupancy_hold=<declared|undeclared|none> ready=<n> slots=<usable>/<n>|- \
+         idle_ready_min=<n> (the harness's occupancy door: `occupancy why`) \
+         attribution=<live|adopted|unknown> \
          fs_consent=<covered|denied|unknown> log_ep=<e> log_seq=<n>`. Additional \
          cross-reference keys (`app=`, `as=`, `enabled=`, `ep=`, ` fleet=`, `hash=`, `kind=`, \
          `origin=`, `pid=`, `reason=`, `reasons=`, `rev=`, `run=`, `since=`, `src=`, `step=`, \
@@ -2008,6 +2011,30 @@ pub const VERBS: &[VerbSpec] = &[
          `n_*` alongside percentiles.",
     )
     .json(Json::Emits),
+    v(
+        "occupancy",
+        Read,
+        Lines,
+        Session,
+        "occupancy [why|check --replay <dur>]: why the occupancy door fired, or why nothing did",
+        "Harness occupancy (`[harness] occupancy`; docs/DESIGN-harness-occupancy-2026-10-20.md \
+         §6), read-only: nothing is typed or written. `occupancy why` (the default) is the door's \
+         last word as this session's loop told it: `occupancy=<off|observe|prompt> hold \
+         <declared|undeclared> since <HH:MM> held <span> ready=<0|1>` (or `hold none`), a line a \
+         built-in rule (`wait-nudge@v1`, `hold-room@v1`: `rev=builtin \
+         <quiet|would|held:<guard>|paced|spent|typed|skipped why=<w>|told|paced why=<w>|refused \
+         why=<w>> [HH:MM]:` then each term with `✓` or `✗`) and `  guards: brakes <none|<guard>> \
+         <✓|✗>` then each guard the break judged (`person`, `halted`, `draft`, `taskless`, \
+         `exchange`, `managed`, `memory`, `reach`, `autopilot <mode>`) with `✓`, or `✗` where it \
+         holds (`  guards: none judged` before a break); `OK 1` and `occupancy=<mode> unsaid` \
+         where no loop told one. \
+         `occupancy check --replay <n>s|m|h|d` (at most 36h) re-runs the pure decider over the \
+         window's facts ring (`<state>/occupancy/facts.ring`, a row a minute look, the newest \
+         1440 kept) with this session's `fact-hold@v1` ledger rows: `replay from <HH:MM> to \
+         <HH:MM> looks=<n> holds=<n>`, then `<HH:MM> <rule> <would|held:<guard>|paced|spent>` \
+         once a change, then `<rule> first would <HH:MM|never>` a rule. Any other form is `ERR \
+         usage: occupancy why|check --replay <dur>`.",
+    ),
     v(
         "sys",
         Read,
@@ -3740,6 +3767,12 @@ mod tests {
         assert_eq!(framing_of("meta", "meta set title build agent"), Status);
         assert_eq!(framing_of("meta", "@s-a meta unset icon"), Status);
         assert_eq!(framing_of("timeline", "timeline"), Lines);
+        assert_eq!(framing_of("occupancy", "occupancy"), Lines);
+        assert_eq!(framing_of("occupancy", "occupancy why"), Lines);
+        assert_eq!(
+            framing_of("occupancy", "@s-a occupancy check --replay 24h"),
+            Lines
+        );
         assert_eq!(framing_of("timeline", "@s-a timeline 10 since=3"), Lines);
         assert_eq!(framing_of("resizes", "resizes"), Lines);
         assert_eq!(framing_of("resizes", "@s-a resizes 20 since=4"), Lines);

@@ -1221,6 +1221,7 @@ fn restore_grid(rows: u16, cols: u16, bytes: &[u8], cursor: &GridCursorRepr, is_
     let (scrollback_lines, visible_lines) = lines.split_at(visible_start);
 
     let mut grid = if is_alt {
+        // The alternate screen keeps no scrollback (as `enter_alternate_screen`): a
         // ring would accrue history the source never had and diverge on re-checkpoint.
         Grid::with_scrollback(rows, cols, 0)
     } else {

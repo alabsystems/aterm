@@ -136,7 +136,7 @@ fn layout_glyph(key: &Key, layout_text: Option<char>) -> Option<char> {
 }
 
 /// The US key a Ctrl chord on a non-Latin layout stands for: `Some('c')` for Ctrl + Russian
-/// 'с' (physical C) and `Some('[')` for Ctrl + Russian 'х' or German 'ü' (physical [), the C0
+/// 'с' (physical C) and `Some('[')` for Ctrl + Russian 'х' or German 'ü' (physical `[`), the C0
 /// byte kitty (its `alternate_key` for a non-ASCII key) and ghostty (its physical key) send;
 /// Terminal.app and iTerm2 send Ctrl + Russian 'с' as ETX too.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -206,6 +206,8 @@ fn should_encode_kitty_event(
     event_type: KeyEventType,
 ) -> bool {
     // Releases report only under REPORT_EVENT_TYPES. Without it `encode_kitty` drops the `:3`
+    // subfield, so a release would encode identical to a press and a DISAMBIGUATE-only app
+    // would see every key twice; the legacy release path encodes nothing.
     if event_type == KeyEventType::Release && !mode.contains(KeyboardMode::REPORT_EVENT_TYPES) {
         return false;
     }
@@ -700,7 +702,7 @@ const fn conhost_holds_once_switched(legacy: &[u8]) -> bool {
 
 /// The record for a key whose legacy bytes [`conhost_holds_once_switched`]: Escape (any
 /// modifiers), Alt+Backspace, and a character chord legacy spells as one of those forms
-/// (Ctrl+[ and Ctrl+3 are a lone ESC, Alt+[ is `ESC [`, Ctrl+Alt+8 is `ESC DEL`).
+/// (`Ctrl+[` and Ctrl+3 are a lone ESC, `Alt+[` is `ESC [`, Ctrl+Alt+8 is `ESC DEL`).
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_escape_record(
     key: &Key,
@@ -959,6 +961,7 @@ fn xterm_level1_character_applies(c: char, modifiers: Modifiers) -> bool {
     }
     if modifiers == Modifiers::CTRL {
         // A traditional Ctrl mapping already has a unique legacy byte. If the
+        // character has no such mapping, CSI is needed to retain the modifier.
         return ctrl_character(c).is_none();
     }
     false

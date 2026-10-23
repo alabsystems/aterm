@@ -441,7 +441,8 @@ pub(crate) const fn buffer_size(part: Part, width: u32, height: u32, scale: u32)
     ((rect.width * scale) as usize, (rect.height * scale) as usize)
 }
 
-/// The shadow `Shadow::draw` paints into `part`'s buffer beside a `width`×`height` window at `scale`.
+/// The shadow sctk-adwaita's `Shadow::draw` paints into `part`'s buffer beside a
+/// `width`×`height` window at `scale`.
 #[cfg(test)]
 pub(crate) fn shadow_plane(
     part: Part,

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for [`super`]: the incremental fold against temp files this test
-//! writes (never a real transcript), the limit wall, and the footer's text.
+//! Unit tests for incremental transcript usage folding, rate-limit walls, and footer text.
 
 use std::fs;
 use std::io::Write as _;
 
 use super::*;
 
-/// A fresh scratch directory under the system temp dir, removed on drop.
 struct TestDir(aterm_tempfile::TempDir);
 
 impl TestDir {
@@ -27,7 +25,6 @@ impl TestDir {
     }
 }
 
-/// One assistant row as the vendor writes it, with its newline.
 fn row(id: &str, model: &str, input: u64, output: u64) -> String {
     format!(
         "{{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{{\"id\":\"{id}\",\"model\":\"{model}\",\"role\":\"assistant\",\"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":1000}}}}}}\n"
@@ -49,11 +46,6 @@ fn output_of(fold: &TranscriptUsage, model: &str) -> u64 {
 
 const BIG: u64 = u64::MAX;
 
-// The incremental fold
-
-/// The cost rule: a re-read reads what was appended and nothing else — the
-/// appended bytes plus the one boundary byte — and a re-read of an unchanged
-/// file reads nothing at all.
 #[test]
 fn a_reread_reads_only_the_appended_bytes() {
     let dir = TestDir::new("appended");
@@ -91,9 +83,6 @@ fn a_reread_reads_only_the_appended_bytes() {
     assert_eq!(cursor.offset(), (first.len() + more.len()) as u64);
 }
 
-/// A file whose size, mtime and inode have not moved is not even opened: a finished subagent
-/// transcript costs one `stat` a read. Proved by taking the read permission away (an open would
-/// fail) and then, as the control, by an append, which must open (and here, fail).
 #[cfg(unix)]
 #[test]
 fn an_unchanged_file_is_not_opened() {
@@ -105,7 +94,6 @@ fn an_unchanged_file_is_not_opened() {
     cursor.advance(BIG).expect("reads");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod");
     let unchanged = cursor.advance(BIG);
-    // The control must see a changed file: set the mtime far from now.
     append_keeping_mode(&path, &row("m2", "claude-opus-5-5", 1, 7));
     let changed = cursor.advance(BIG);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
@@ -113,8 +101,6 @@ fn an_unchanged_file_is_not_opened() {
     assert!(changed.is_err(), "control: a changed file is opened");
 }
 
-/// Append to a file whose mode refuses the owner a write: flip it open,
-/// append, flip it back.
 #[cfg(unix)]
 fn append_keeping_mode(path: &Path, text: &str) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -124,8 +110,6 @@ fn append_keeping_mode(path: &Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
-/// Between reads a cursor holds the bytes of a torn last line and no line buffer: a row that spans
-/// read chunks is assembled in one, let go when the read ends.
 #[test]
 fn no_line_buffer_is_kept_between_reads() {
     let dir = TestDir::new("buffer");
@@ -153,8 +137,6 @@ fn no_line_buffer_is_kept_between_reads() {
     );
 }
 
-/// Truncated below the offset reached: the fold starts over and holds only
-/// what the file holds now.
 #[test]
 fn a_truncated_file_starts_the_fold_over() {
     let dir = TestDir::new("truncated");
@@ -179,9 +161,6 @@ fn a_truncated_file_starts_the_fold_over() {
     assert_eq!(output_of(cursor.fold(), "claude-haiku-4-5"), 7);
 }
 
-/// Rotated: another file renamed over the path is a new inode, and the fold starts over, even when
-/// the new file is longer and its byte under the old boundary is a newline too, so only the file's
-/// identity can tell.
 #[cfg(unix)]
 #[test]
 fn a_rotated_file_starts_the_fold_over() {
@@ -208,8 +187,6 @@ fn a_rotated_file_starts_the_fold_over() {
     );
 }
 
-/// Rewritten in place, same inode and longer than before: only the boundary
-/// byte can tell, and it does.
 #[test]
 fn a_file_rewritten_in_place_is_caught_by_the_boundary_byte() {
     let dir = TestDir::new("rewritten");
@@ -218,7 +195,6 @@ fn a_file_rewritten_in_place_is_caught_by_the_boundary_byte() {
     append(&path, &first);
     let mut cursor = TranscriptCursor::new(&path);
     cursor.advance(BIG).expect("reads");
-    // A longer text whose byte at the old boundary is not a newline.
     let rewrite = format!(
         "{}{}",
         row("r1", "claude-sonnet-5", 1_000_000, 9),
@@ -237,8 +213,6 @@ fn a_file_rewritten_in_place_is_caught_by_the_boundary_byte() {
     assert_eq!(output_of(cursor.fold(), "claude-sonnet-5"), 10);
 }
 
-/// The budget bounds one read; the next read carries on from where it
-/// stopped, and the whole is the same fold one pass makes.
 #[test]
 fn a_budget_bounds_one_read_and_the_next_carries_on() {
     let dir = TestDir::new("budget");
@@ -260,19 +234,15 @@ fn a_budget_bounds_one_read_and_the_next_carries_on() {
     assert_eq!(cursor.fold().rows, 20);
 }
 
-/// However the appends fall (mid-line, mid-character), the incremental fold ends equal to one
-/// streaming pass over the whole file.
 #[test]
 fn any_split_of_the_appends_folds_to_the_one_pass_result() {
     let dir = TestDir::new("splits");
     let text: String = (0..15)
         .map(|i| {
             let model = ["claude-opus-5-5", "claude-haiku-4-5", "claude-fable-5-1"][i % 3];
-            // Every fifth row repeats the one before it: dedupe across cuts.
             let id = if i % 5 == 4 { i - 1 } else { i };
             let r = row(&format!("m{id}"), model, i as u64, (i * 7) as u64);
             if i % 7 == 0 {
-                // A non-ASCII line (a user row) the cuts can split inside.
                 format!("{{\"type\":\"user\",\"text\":\"\u{00E9}\u{6F22}\u{1F600}\"}}\n{r}")
             } else {
                 r
@@ -287,8 +257,6 @@ fn any_split_of_the_appends_folds_to_the_one_pass_result() {
         let path = dir.join(&format!("s{step}.jsonl"));
         fs::write(&path, b"").expect("create");
         let mut cursor = TranscriptCursor::new(&path);
-        // One writer appending, as Claude Code's own: each append is on disk
-        // when `write` returns, before the cursor reads.
         let mut f = fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -304,8 +272,6 @@ fn any_split_of_the_appends_folds_to_the_one_pass_result() {
     }
 }
 
-/// A line past the parse cap is skipped and counted even when it arrives
-/// torn across reads, and the row after it still counts.
 #[test]
 fn an_oversize_line_across_reads_is_skipped_and_counted() {
     let dir = TestDir::new("oversize");
@@ -327,8 +293,6 @@ fn an_oversize_line_across_reads_is_skipped_and_counted() {
     assert_eq!(output_of(cursor.fold(), "claude-opus-5-5"), 3);
 }
 
-/// A line that is not UTF-8 is counted unparsed, never folded, and the row
-/// after it still counts.
 #[test]
 fn a_line_that_is_not_utf8_is_counted_unparsed() {
     let dir = TestDir::new("not-utf8");
@@ -342,8 +306,6 @@ fn a_line_that_is_not_utf8_is_counted_unparsed() {
     assert_eq!(output_of(cursor.fold(), "claude-opus-5-5"), 2);
 }
 
-/// A FIFO where a transcript should be is refused, never read (a read would
-/// park the resolver thread).
 #[cfg(unix)]
 #[test]
 fn a_fifo_is_not_folded() {
@@ -357,12 +319,6 @@ fn a_fifo_is_not_folded() {
     assert_eq!(cursor.bytes_read(), 0);
 }
 
-// One session: the transcript and its subagents
-
-/// The session's spend is its transcript's plus every subagent transcript
-/// the vendor keeps beside it (`<session>/subagents/…/agent-*.jsonl`) — and
-/// nothing else in the project directory: another session's file is not
-/// this one's.
 #[test]
 fn a_session_sums_its_subagent_transcripts_and_nothing_else() {
     let dir = TestDir::new("session");
@@ -383,8 +339,6 @@ fn a_session_sums_its_subagent_transcripts_and_nothing_else() {
         &row("s2", "claude-haiku-4-5", 5, 2),
     );
     append(&subs.join("notes.txt"), "not a transcript\n");
-    // A workflow's journal sits beside its agents' transcripts
-    // (`subagents/workflows/wf_<id>/journal.jsonl`): not a transcript.
     append(
         &subs.join("workflows").join("run-1").join("journal.jsonl"),
         &row("j1", "claude-haiku-4-5", 5, 7_000),
@@ -396,8 +350,6 @@ fn a_session_sums_its_subagent_transcripts_and_nothing_else() {
     let total = session.total_fold();
     assert_eq!(total.per_model()["claude-opus-5-5"].output, 100);
     assert_eq!(total.per_model()["claude-haiku-4-5"].output, 42);
-    // A subagent that starts later is picked up on the next refresh, and only
-    // its bytes are read: the files already folded are not opened.
     let late = row("s3", "claude-haiku-4-5", 5, 1000);
     append(&subs.join("agent-a2.jsonl"), &late);
     let before = session.bytes_read();
@@ -412,11 +364,6 @@ fn a_session_sums_its_subagent_transcripts_and_nothing_else() {
     assert_eq!(total.assistant_rows, 4);
 }
 
-/// THE TRAFFIC VIEW is the whole session's: the transcript's and every
-/// subagent's stamped rows in one series, the unstamped ones counted beside
-/// it, the totals every file's; the main chain's working spans in whole
-/// seconds, rounded outward, and its working time. The generation holds
-/// while nothing was appended and moves with a row in any file.
 #[test]
 fn the_traffic_view_is_the_whole_sessions() {
     let dir = TestDir::new("traffic");
@@ -449,11 +396,9 @@ fn the_traffic_view_is_the_whole_sessions() {
     )
     .expect("fits");
     assert_eq!((view.start_s, view.width_s), (minute, 60));
-    // Each prompt is its input and 1010 cache tokens.
     assert_eq!(&*view.buckets, &[(1_020, 100), (0, 0), (1_015, 40)]);
     assert_eq!(view.totals, (1_020 + 1_011 + 1_015, 141));
     assert_eq!(view.unread, 1, "m2 has no stamp");
-    // The turn 12:00:08.750–12:01:10.250, outward to whole seconds.
     assert_eq!(&*view.busy, &[(minute + 8, minute + 71)]);
     assert_eq!(view.runtime_s, Some(61));
     let generation = session.traffic_generation();
@@ -468,9 +413,6 @@ fn the_traffic_view_is_the_whole_sessions() {
     assert_ne!(session.traffic_generation(), generation, "a subagent's row");
 }
 
-/// A FOLD THAT STARTS OVER never takes back an old generation: a reader
-/// keyed on it rebuilds. CONTROL by construction: the old fold and the new
-/// one each summed one row, so a fresh count would read the same.
 #[test]
 fn a_fold_that_starts_over_moves_its_generation() {
     let dir = TestDir::new("generation");
@@ -485,8 +427,6 @@ fn a_fold_that_starts_over_moves_its_generation() {
     assert_ne!(cursor.fold().generation(), before);
 }
 
-/// A subagent still behind is a prefix: the session is not caught up while the transcript is, and
-/// it is once the subagent is read to its end.
 #[test]
 fn a_subagent_behind_keeps_the_session_from_catching_up() {
     let dir = TestDir::new("behind");
@@ -517,10 +457,6 @@ fn a_subagent_behind_keeps_the_session_from_catching_up() {
     );
 }
 
-/// A finished subagent file keeps its totals and a few ids (not its whole dedupe set, not a line
-/// buffer) and stays followed: when a continued agent appends to it again (its file is fixed per
-/// agent id), the fold reads on from where it stopped. Its earlier total is carried, nothing is
-/// counted twice (a streamed repeat of its newest message is raised), and nothing is left unread.
 #[test]
 fn a_finished_subagent_keeps_its_totals_and_grows_on() {
     let dir = TestDir::new("finished");
@@ -544,8 +480,6 @@ fn a_finished_subagent_keeps_its_totals_and_grows_on() {
     assert_eq!(held.pending.capacity(), 0);
     let before = session.total_fold().per_model()["claude-haiku-4-5"].output;
     assert_eq!(before, 400);
-    // The agent is continued: its newest message streams on (a repeat,
-    // raised), and a new one follows.
     append(
         &agent,
         &format!(
@@ -567,7 +501,6 @@ fn a_finished_subagent_keeps_its_totals_and_grows_on() {
     );
 }
 
-/// Set a file's mtime `secs_ago` seconds in the past.
 fn set_age(path: &Path, secs_ago: u64) {
     let f = fs::OpenOptions::new()
         .append(true)
@@ -577,8 +510,6 @@ fn set_age(path: &Path, secs_ago: u64) {
         .expect("mtime");
 }
 
-/// At the bound, new files are unread, never guessed at: within the read that crosses it the newest
-/// are followed; past it every new file is counted `unread`, and a followed file is never dropped.
 #[test]
 fn at_the_bound_new_files_are_unread() {
     let dir = TestDir::new("bound");
@@ -637,9 +568,6 @@ fn at_the_bound_new_files_are_unread() {
     assert!(text.ends_with("+2 unread"), "{text}");
 }
 
-/// The walk that stops at its entry bound is said end to end: the fold is not complete, and the
-/// footer reads `+? unread` (a `0` would read as nothing missing), or `+N+ unread` beside files it
-/// could not count.
 #[test]
 fn a_walk_cut_short_is_said_on_the_glass() {
     let dir = TestDir::new("walk");
@@ -702,13 +630,6 @@ fn a_walk_cut_short_is_said_on_the_glass() {
     );
 }
 
-/// A directory whose stamp was RACY at the walk (changed under [`RACY_DIR`] before it, after it,
-/// or at a time that cannot be read) is listed again by `moved`, and moves when its entries are
-/// not the walk's, though its stamp is unchanged: Linux stamps a directory from its coarse clock,
-/// and an ext4 directory's size does not move for a new file, so a file made in the walk's tick
-/// changed nothing `stat` says (measured on the Linux lane). A settled stamp is never listed.
-/// NEGATIVE CONTROL: with the stamp alone (the old check), the racy directory's new entry is
-/// unseen.
 #[test]
 fn a_racy_directory_is_listed_again_and_a_settled_one_is_not() {
     let walked = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
@@ -742,7 +663,6 @@ fn a_racy_directory_is_listed_again_and_a_settled_one_is_not() {
     );
     assert_eq!(DirSeen::at(path, None, 0, walked).racy, None, "not there");
 
-    // The same stamp now: a racy directory moves by its entries, a settled one never asks.
     assert!(
         dir_moved(&racy, racy.stamp, || Some(4)),
         "a new entry in the walk's tick"
@@ -764,10 +684,6 @@ fn a_racy_directory_is_listed_again_and_a_settled_one_is_not() {
     );
 }
 
-/// What a refresh now could find is known from a few `stat`s: the fold behind with progress to
-/// make, the transcript, a new file in the subagent directory, or a running subagent's file growing
-/// (the main transcript can sit still for minutes while its subagents spend). A fold behind whose
-/// last read moved nothing is left alone until a file changes.
 #[test]
 fn moved_sees_subagent_growth_and_an_unfinished_fold() {
     let dir = TestDir::new("moved");
@@ -804,9 +720,6 @@ fn moved_sees_subagent_growth_and_an_unfinished_fold() {
     assert!(session.moved(), "the transcript grew");
 }
 
-/// `moved` checks every followed file, not only the most recently written: of ten parallel agents,
-/// the one written longest ago appending its final message is seen at once, and a followed file
-/// deleted since is not a change to read.
 #[test]
 fn moved_watches_every_followed_file() {
     let dir = TestDir::new("recent");
@@ -841,9 +754,6 @@ fn moved_watches_every_followed_file() {
     assert!(!session.moved(), "a followed file gone has nothing to read");
 }
 
-/// Once the read's budget is spent, no further file is opened: a subagent
-/// cursor left behind costs nothing on a read whose budget the transcript
-/// took — the meter moves by the budget alone.
 #[test]
 fn a_spent_budget_opens_no_more_files() {
     let dir = TestDir::new("spent");
@@ -861,9 +771,6 @@ fn a_spent_budget_opens_no_more_files() {
         .map(|i| row(&format!("m{i}x"), "claude-opus-5-5", 1, 1))
         .collect();
     append(&main, &big);
-    // New subagent files appear — one unreadable — while the budget is
-    // spent: neither is opened, so neither is admitted (a file never opened
-    // is not in the totals) nor found unreadable; the read is not caught up.
     let fresh = subs.join("agent-y.jsonl");
     append(&fresh, &row("y", "claude-haiku-4-5", 1, 7000));
     #[cfg(unix)]
@@ -896,14 +803,11 @@ fn a_spent_budget_opens_no_more_files() {
     assert!(r.complete(), "{r:?}");
     assert_eq!(
         session.total_fold().per_model()["claude-haiku-4-5"].output,
-        // The locked file's turn too, where one was made.
         30 + 7000 + u64::from(cfg!(unix)),
         "admitted once there was budget to open it"
     );
 }
 
-/// A subagent file that cannot be read is counted once, as unread — never
-/// also as followed — and once it can be read it is followed and counted.
 #[cfg(unix)]
 #[test]
 fn an_unreadable_subagent_is_unread_and_nothing_else() {
@@ -921,8 +825,6 @@ fn an_unreadable_subagent_is_unread_and_nothing_else() {
     append(&locked, &row("b", "claude-haiku-4-5", 1, 20));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
     let mut session = SessionUsage::new(&main);
-    // One cursor only, and the unreadable file the newest: it must not take
-    // the slot the readable one needs.
     session.cap = 1;
     set_age(&subs.join("agent-a.jsonl"), 100);
     let r = session.refresh(BIG);
@@ -941,8 +843,6 @@ fn an_unreadable_subagent_is_unread_and_nothing_else() {
         session.total_fold().per_model()["claude-haiku-4-5"].output,
         30
     );
-    // A followed file that turns unreadable with new rows: its earlier tokens stay in the
-    // totals, and it is counted once, unread, not also folded.
     append(&locked, &row("b2", "claude-haiku-4-5", 1, 5));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
     let r = session.refresh(BIG);
@@ -950,8 +850,6 @@ fn an_unreadable_subagent_is_unread_and_nothing_else() {
     assert_eq!((session.subagent_files(), r.unread), (1, 1), "{r:?}");
 }
 
-/// A subagent file still for [`QUIET_AFTER`] keeps its totals and no ids;
-/// one that may still grow keeps the few newest.
 #[test]
 fn a_quiet_subagent_keeps_only_its_totals() {
     let dir = TestDir::new("quiet");
@@ -985,16 +883,11 @@ fn a_quiet_subagent_keeps_only_its_totals() {
     );
 }
 
-/// Date the directory `dir` an hour back: the next entry made in it moves its
-/// mtime to now whatever tick the file system dates by (NTFS can date the
-/// walk's look and a file made just after it alike).
 fn date_dir_back(dir: &Path) {
     let mut open = fs::OpenOptions::new();
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        // FILE_WRITE_ATTRIBUTES, and FILE_FLAG_BACKUP_SEMANTICS: a directory
-        // opens only with it.
         open.access_mode(0x0100).custom_flags(0x0200_0000);
     }
     #[cfg(not(windows))]
@@ -1004,10 +897,6 @@ fn date_dir_back(dir: &Path) {
         .expect("mtime");
 }
 
-/// A subagent file's directory can appear at any depth: the vendor writes
-/// 97 % of them under `subagents/workflows/<run>/`. `moved` stats every
-/// directory the walk looked at — `subagents/` itself before it exists — so a
-/// new file in a run directory is seen at once, not at the slow clock.
 #[test]
 fn moved_sees_a_new_file_at_any_depth() {
     let dir = TestDir::new("depth");
@@ -1030,7 +919,6 @@ fn moved_sees_a_new_file_at_any_depth() {
     assert!(session.moved(), "a file in a run directory");
     session.refresh(BIG);
     assert!(!session.moved());
-    // Nine files, so the newest followed ones `moved` stats are all taken.
     for i in 2..10 {
         append(
             &run.join(format!("agent-w{i}.jsonl")),
@@ -1052,7 +940,6 @@ fn moved_sees_a_new_file_at_any_depth() {
     );
 }
 
-/// Replace `path`'s contents in place, keeping its inode.
 fn rewrite_in_place(path: &Path, text: &str) {
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -1062,9 +949,6 @@ fn rewrite_in_place(path: &Path, text: &str) {
     f.write_all(text.as_bytes()).expect("write");
 }
 
-/// A quiet file's ids are released: a plain append is read on and counted, and any other change
-/// (shrunk, replaced, rewritten in place) leaves it unread with its earlier totals standing, never
-/// re-read from its first byte nor counted twice. A file that is not quiet still starts over.
 #[test]
 fn a_released_file_changed_but_appended_is_unread() {
     let dir = TestDir::new("released");
@@ -1102,8 +986,6 @@ fn a_released_file_changed_but_appended_is_unread() {
     )
     .expect("tmp");
     fs::rename(&tmp, &replaced).expect("replace");
-    // Rewritten in place, longer: the byte the fold stopped after is no
-    // longer the newline it was.
     rewrite_in_place(
         &rewritten,
         &format!(
@@ -1128,7 +1010,6 @@ fn a_released_file_changed_but_appended_is_unread() {
     assert_eq!(haiku(&session), 1200);
     assert_eq!(session.bytes_read(), before, "and not opened again");
 
-    // Control: a file not yet quiet starts over, as any cursor does.
     let live = subs.join("agent-live.jsonl");
     append(&live, &row("l1", "claude-haiku-4-5", 1, 3));
     session.refresh(BIG);
@@ -1139,9 +1020,6 @@ fn a_released_file_changed_but_appended_is_unread() {
     assert_eq!(haiku(&session), 1204);
 }
 
-/// A quiet file still behind is not released: its ids are what raise the rest of a streamed
-/// message instead of counting it again. Read to a cut between the two rows of one message, the
-/// file keeps them, and the message counts once, at its final 349.
 #[test]
 fn a_quiet_file_behind_is_not_released() {
     let dir = TestDir::new("behind-quiet");
@@ -1176,8 +1054,6 @@ fn a_quiet_file_behind_is_not_released() {
     );
 }
 
-/// A session whose transcript is not there yet is not caught up, and shows
-/// no totals as though it were.
 #[test]
 fn a_missing_transcript_is_not_caught_up() {
     let dir = TestDir::new("missing");
@@ -1187,9 +1063,6 @@ fn a_missing_transcript_is_not_caught_up() {
     assert!(session.total_fold().per_model().is_empty());
 }
 
-// The limit wall
-
-/// The newest limit-notice row per window, as the fold keeps them.
 fn notices(rows: &[(&str, Option<&str>, i64)]) -> BTreeMap<String, LimitNoticeRow> {
     rows.iter()
         .map(|(key, reset, at)| {
@@ -1204,16 +1077,12 @@ fn notices(rows: &[(&str, Option<&str>, i64)]) -> BTreeMap<String, LimitNoticeRo
         .collect()
 }
 
-/// Every zone, the local one included, is UTC.
 fn utc(_: Option<&str>, _: i64) -> Option<i64> {
     Some(0)
 }
 
 const DAY: i64 = 1_790_000_000 - 1_790_000_000 % 86_400;
 
-/// The wall is the newest notice's, shown while its reset — placed from the
-/// row's own time — is ahead, as the vendor printed it (its zone left off:
-/// it is the local one here), and not at all once it has passed.
 #[test]
 fn the_wall_stands_until_its_reset() {
     let two_pm = DAY + 14 * 3600;
@@ -1233,7 +1102,6 @@ fn the_wall_stands_until_its_reset() {
         None,
         "read the next day: day 0's 3pm, long passed"
     );
-    // The newest row decides, whichever window it names.
     let both = notices(&[
         ("five_hour", Some("3pm (UTC)"), two_pm),
         ("seven_day", Some("Oct 1 at 9am (UTC)"), two_pm + 600),
@@ -1247,9 +1115,6 @@ fn the_wall_stands_until_its_reset() {
     );
 }
 
-/// A response served after the notice takes the wall down: the limit no
-/// longer blocks (`/limit-reset`, extra usage, another account), whatever
-/// its printed reset. One served before it, or at its instant, does not.
 #[test]
 fn a_response_served_since_takes_the_wall_down() {
     let two_pm = DAY + 14 * 3600;
@@ -1261,9 +1126,6 @@ fn a_response_served_since_takes_the_wall_down() {
     assert!(wall_of(&rows, Some(two_pm), at, &utc).is_some());
 }
 
-/// A reset that cannot be placed shows nothing — never a guess, and never
-/// an older row in its place: a text the parser does not read, a row with
-/// no reset, a zone this machine does not know.
 #[test]
 fn an_unplaceable_wall_shows_nothing() {
     let at = DAY + 14 * 3600;
@@ -1285,10 +1147,6 @@ fn an_unplaceable_wall_shows_nothing() {
     assert!(wall_of(&control, None, at + 60, &known).is_some());
 }
 
-/// A weekly reset under a day away is printed with no date, and it is its next
-/// occurrence: `9am` written at 14:00 is tomorrow's, shown for the 19 hours
-/// the user is walled, never placed in the past. The five-hour window keeps its
-/// own rule (today's, passed), and a dated reset is where its date puts it.
 #[test]
 fn a_weekly_clock_time_is_its_next_occurrence() {
     let two_pm = DAY + 14 * 3600;
@@ -1304,9 +1162,6 @@ fn a_weekly_clock_time_is_its_next_occurrence() {
     assert_eq!(wall_of(&dated, None, two_pm + 60, &utc), None);
 }
 
-/// A weekly reset in the next calendar year names the year (`Jan 2, 2027 at
-/// 9am`): placed by the one reset parser, so the wall written on Dec 30
-/// stands until Jan 2 09:00 and not after.
 #[test]
 fn a_reset_in_the_next_year_is_placed() {
     let dec30 = 1_798_632_000;
@@ -1319,7 +1174,6 @@ fn a_reset_in_the_next_year_is_placed() {
     assert_eq!(wall_of(&rows, None, jan2_9am, &utc), None);
 }
 
-/// America/Los_Angeles around its 2026 spring switch (10:00Z on Mar 8).
 fn pacific(_: Option<&str>, t: i64) -> Option<i64> {
     Some(if t >= 1_772_964_000 {
         -7 * 3600
@@ -1328,9 +1182,6 @@ fn pacific(_: Option<&str>, t: i64) -> Option<i64> {
     })
 }
 
-/// Across a daylight-saving jump the wall stands for its real time: `4am`
-/// written at 22:30 PST on Mar 7 is 4am PDT on Mar 8 (11:00Z), four and a
-/// half hours on — shown until then, not dropped as Mar 7's.
 #[test]
 fn a_wall_across_a_dst_jump_stands_its_real_time() {
     let written = 1_772_951_400; // 2026-03-08T06:30Z
@@ -1343,11 +1194,6 @@ fn a_wall_across_a_dst_jump_stands_its_real_time() {
     assert_eq!(wall_of(&rows, None, 1_772_967_600, &pacific), None);
 }
 
-/// Another zone's clock is never shown as the local one: Claude Code prints
-/// the reset in its process's zone. On a Pacific machine `10pm (UTC)` keeps
-/// its zone; where that zone's clock is the local one at the reset (the same
-/// zone, or another at the same offset then) it is left off; and where the
-/// local offset cannot be read, the zone stays.
 #[test]
 fn another_zones_clock_keeps_its_zone() {
     let one_pm_pdt = DAY + 20 * 3600;
@@ -1378,8 +1224,6 @@ fn another_zones_clock_keeps_its_zone() {
     );
 }
 
-/// A span (`in 3h`) counts from the notice, so it is said as the local clock time it names (`in
-/// 3h` read hours later would be false), with the date once it is a day or more off.
 #[test]
 fn a_span_is_said_as_the_local_clock() {
     let two_pm = DAY + 14 * 3600;
@@ -1402,8 +1246,6 @@ fn a_span_is_said_as_the_local_clock() {
     );
 }
 
-// The footer's text
-
 fn spend(input: u64, output: u64, cache_write: u64, cache_read: u64) -> ModelSpend {
     ModelSpend {
         input,
@@ -1415,9 +1257,6 @@ fn spend(input: u64, output: u64, cache_write: u64, cache_read: u64) -> ModelSpe
     }
 }
 
-/// A count at the top of the range (a corrupt or hostile row saturates to
-/// `u64::MAX`) is named, never an overflow — a panic would kill the footer's
-/// resolver thread and start every tab's fold over.
 #[test]
 fn a_saturated_count_is_named_without_overflow() {
     let mut per = BTreeMap::new();
@@ -1450,8 +1289,6 @@ fn token_counts_are_short_and_never_rounded_up() {
     }
 }
 
-/// Family names where they are unique, the version where two share one; a
-/// model with no tokens is left out; most first; past three are counted.
 #[test]
 fn models_are_named_short_and_ordered_by_tokens() {
     let mut per = BTreeMap::new();
@@ -1497,10 +1334,6 @@ fn models_are_named_short_and_ordered_by_tokens() {
     );
 }
 
-/// A model reached through a cloud route is named as the model: Bedrock's
-/// `us.anthropic.…-v1:0` and Vertex's `…@date` ids name their family like
-/// the API's own, two different models never share one label, and one
-/// model reached by two routes is one entry.
 #[test]
 fn a_routed_model_id_is_named_as_its_model() {
     let mut per = BTreeMap::new();
@@ -1535,8 +1368,6 @@ fn a_routed_model_id_is_named_as_its_model() {
     assert_eq!(more.models, 1, "opus5.5, gathered");
 }
 
-/// The totals count every model, the ones past [`NAMED_MODELS`] included, and the facts
-/// are complete exactly where the refresh that folded them was (Stats Deck v2 T-A2).
 #[test]
 fn usage_totals_cover_every_model() {
     let spends = [
@@ -1588,10 +1419,6 @@ fn usage_totals_cover_every_model() {
     assert!(!unfolded.complete, "no refresh said the totals were whole");
 }
 
-/// The `Σ` text at each grain: the footer's total (runtime, then every model's tokens merged into
-/// one pair, the gathered ones included, no model named) and its runtime alone; `harness usage`'s
-/// per model (a model named only where two or more spent, the models past [`NAMED_MODELS`]
-/// counted). The wall is its own segment's text.
 #[test]
 fn the_segment_says_runtime_and_tokens_at_each_grain() {
     let opus = ModelTokens {
@@ -1663,8 +1490,6 @@ fn the_segment_says_runtime_and_tokens_at_each_grain() {
     }
 }
 
-/// What is left out of the totals is said even while no tokens are shown (the fold not caught up
-/// yet): `+2 unread`, beside a wall or alone.
 #[test]
 fn unread_is_said_with_no_tokens_shown() {
     let left_out = Refresh {
@@ -1693,10 +1518,6 @@ fn unread_is_said_with_no_tokens_shown() {
     );
 }
 
-// Its subagents' calls in flight (`super::super::flight`)
-
-/// The measured rows of `testdata/flight/<name>`, the header left out, each
-/// with its newline.
 fn measured(name: &str) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/harness/testdata/flight")
@@ -1718,11 +1539,6 @@ fn testdata(name: &str) -> String {
     .expect("test data")
 }
 
-/// THE ONE FOLD: a subagent's calls in flight are read off the same appended
-/// bytes as its tokens, and its meta once. MEASURED rows: `long probe`'s
-/// call is in flight after its row, the model's after its result; the table
-/// names it as its meta does and starts it at its first row. A refresh with
-/// nothing new reads no byte and no meta, and moves no generation.
 #[test]
 fn a_subagents_calls_in_flight_ride_the_usage_fold() {
     let dir = TestDir::new("flight");
@@ -1761,29 +1577,21 @@ fn a_subagents_calls_in_flight_ride_the_usage_fold() {
     );
     assert!(matches!(flyer.flight, FileFlight::Tool(c) if c.budget_ms == 400_000));
     assert_eq!(session.meta_reads(), 1);
-    // At rest: nothing read, nothing moved.
     let (bytes, generation) = (session.bytes_read(), session.flight_generation());
     assert!(!session.moved());
     session.refresh(BIG);
     assert_eq!(session.bytes_read(), bytes);
     assert_eq!(session.meta_reads(), 1);
     assert_eq!(session.flight_generation(), generation);
-    // The result appended: the model's, and the generation moved.
     append(&file, &rows[2]);
     session.refresh(BIG);
     assert_eq!(session.bytes_read() - bytes, rows[2].len() as u64 + 1);
     assert_eq!(session.flights().flyers[0].flight, FileFlight::Model);
     assert_ne!(session.flight_generation(), generation);
     assert_eq!(session.meta_reads(), 1, "the meta is read once");
-    // The main transcript has no flight of its own.
     assert_eq!(session.main().file_flight(), FileFlight::Unknown);
 }
 
-/// A RUN IS LOOKED FOR ONCE A REFRESH, however many of its agents' files
-/// are followed: a run of five agents whose script is missing spends one of
-/// its [`META_TRIES`] a refresh, so it is looked for on that many refreshes,
-/// then no more. Each file spent one before, so a run of four agents or more
-/// spent every try on its first refresh, before its script was written.
 #[test]
 fn a_run_is_looked_for_once_a_refresh_whatever_its_agents() {
     let dir = TestDir::new("flight-run-tries");
@@ -1813,9 +1621,6 @@ fn a_run_is_looked_for_once_a_refresh_whatever_its_agents() {
     }
 }
 
-/// An agent with no meta is in no table (its row cannot map), looked for at
-/// most `META_TRIES` times; one written later is found while tries are left.
-/// A workflow run's agents make one entry, named by its script.
 #[test]
 fn metas_and_scripts_are_looked_for_a_bounded_number_of_times() {
     let dir = TestDir::new("flight-meta");
@@ -1830,7 +1635,6 @@ fn metas_and_scripts_are_looked_for_a_bounded_number_of_times() {
     let mut session = SessionUsage::new(&main);
     session.refresh(BIG);
     assert!(session.flights().flyers.is_empty(), "no meta, no entry");
-    // Found on a later try.
     fs::write(
         subs.join("agent-a1.meta.json"),
         testdata("claude-2.1.304-long-bash.meta.json"),
@@ -1840,8 +1644,6 @@ fn metas_and_scripts_are_looked_for_a_bounded_number_of_times() {
     session.refresh(BIG);
     assert_eq!(session.flights().flyers.len(), 1);
     assert_eq!(session.meta_reads(), 2);
-    // A run whose script is missing: looked for at each refresh that finds
-    // its agents, at most `META_TRIES` times, then no more.
     let wf = measured("claude-2.1.304-workflow-long.jsonl");
     let agent = run.join("agent-aa69f18335229ca32.jsonl");
     for (k, r) in wf.iter().enumerate() {
@@ -1853,7 +1655,6 @@ fn metas_and_scripts_are_looked_for_a_bounded_number_of_times() {
     }
     assert_eq!(session.meta_reads(), 2 + u64::from(META_TRIES), "bounded");
     assert_eq!(session.flights().flyers.len(), 1, "no script, no run");
-    // Control: with its script there from the start, the run is one entry.
     let dir = TestDir::new("flight-run");
     let main = dir.join("abc-123.jsonl");
     append(&main, &row("m1", "claude-opus-5-5", 10, 100));

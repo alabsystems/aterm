@@ -5,10 +5,6 @@
 
 use super::*;
 
-/// Landing ring, light-theme fork: on dark the ring is an additive square
-/// shockwave (GlowQuads); on light it is an expanding darkened source-over
-/// veil ring in the halo stream, capped for legibility, and the additive
-/// stream stays empty.
 #[test]
 fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     let g = geom();
@@ -23,7 +19,6 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
         caret: Some((2, 12)),
     };
 
-    // Dark: an additive round bloom, never a source-over veil.
     let c_dark = cfg(GlowStyle::RainbowKitty, true);
     let dark = CursorGlow {
         ring: Some(ring),
@@ -40,7 +35,6 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
         "the dark ring is additive, never source-over"
     );
 
-    // Light: source-over veil ring, no additive quads.
     let mut c_light = cfg(GlowStyle::RainbowKitty, true);
     c_light.dark_theme = false;
     let light = CursorGlow {
@@ -63,10 +57,6 @@ fn rainbow_landing_ring_light_theme_forks_to_source_over() {
     );
 }
 
-/// Every style lands a ring on a light ground, and none of it is additive:
-/// Water lands its two-ripple train in conservative ink over the text
-/// (source-over quads under the over-text ceiling), and every other style,
-/// Fire included, the shared source-over veil ring, capped for legibility.
 #[test]
 fn every_style_lands_a_veil_ring_on_light() {
     let g = geom();
@@ -126,9 +116,6 @@ fn every_style_lands_a_veil_ring_on_light() {
     }
 }
 
-/// The same ring at the same age: a full-line jump's outline reaches
-/// further from the landing cell than a hop's, on every square-outline
-/// theme arm and for the fire flash — the grade is not a no-op.
 #[test]
 fn classic_landing_ring_expands_wider_with_the_jump() {
     let g = geom();
@@ -182,19 +169,11 @@ fn classic_landing_ring_expands_wider_with_the_jump() {
     }
 }
 
-/// The dark landing ring is one soft round bloom, not a thin square outline
-/// (which read as a stray rectangle left on the page, a side of it cut off by
-/// the pad): through its life its light is radial halos and no quad, along
-/// the row through its middle it is brightest at the middle and falls off a
-/// little at a time to nothing, and it is round (as wide as tall, within the
-/// halo's own squash). Negative control: the old outline's four 2 px bars at
-/// the same size, laid on the same probe, show the hard edge it looks for.
 #[test]
 fn the_dark_landing_ring_is_a_soft_round_bloom() {
     let g = geom();
     let born = Instant::now();
     let c = cfg(GlowStyle::Phaser, true);
-    // The light along the row through the ring's middle, and down the column.
     let lines = |quads: &[GlowQuad], halos: &[RainHalo], cx: i32, cy: i32| {
         let mut glass = Glass::new(g, 0);
         glass.add_quads(quads);
@@ -251,7 +230,6 @@ fn the_dark_landing_ring_is_a_soft_round_bloom() {
             (h as f32) >= 0.7 * w as f32 && (h as f32) <= 1.05 * w as f32,
             "round at {ms}ms: {w} px across, {h} down"
         );
-        // Control: the old square outline at this size.
         let s = ((0.6 + 1.0 * (ms as f32 / 300.0)) * g.ch as f32) as i32;
         let premul = aterm_render::premul_rgb(c.accent, 160);
         let mut bars = Vec::new();
@@ -272,10 +250,6 @@ fn the_dark_landing_ring_is_a_soft_round_bloom() {
     }
 }
 
-/// A halo whose centre lies past the effects box keeps its true centre in the
-/// emitted bands (the falloff reads ~0 on the surviving sliver), and a centre
-/// that cannot be represented (negative) culls the halo. Clamping it onto the
-/// edge would flash a particle sliding off the grid.
 #[test]
 fn halo_centres_past_the_box_stay_true_and_negative_centres_cull() {
     let g = geom(); // box [0,320) x [0,96)
@@ -302,9 +276,6 @@ fn halo_centres_past_the_box_stay_true_and_negative_centres_cull() {
     assert!(over_neg.is_empty(), "…including the cull side");
 }
 
-/// A cold navigation timestamp is not a jump witness: with no candidate and no
-/// ribbon it births no terminus scatter; a real jump still flies its meteor
-/// and a short cold nudge throws nothing.
 #[test]
 fn cold_navigation_timestamp_scatters_nothing() {
     let g = geom();
@@ -313,16 +284,12 @@ fn cold_navigation_timestamp_scatters_nothing() {
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
     glow.tick(Some((2, 30)), t0, &c, g, &mut out); // seed: the cursor stays cold
-    // (rainbow.disp left at its default 0.0 — no typing momentum, no ribbon.)
     glow.note_navigation(t0);
     glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A leap on a cold cursor
     assert!(
         glow.particles.is_empty(),
         "a cold-cursor jump dissolves no phantom terminus (finding 3)"
     );
-    // The starburst forks on distance: a cold Home/End past
-    // `timing::JUMP_MIN_CELLS` (this 30-cell Ctrl-A) celebrates, while a short
-    // cold move such as a history recall throws nothing (pinned below).
     assert!(
         glow.v2_status().is_some_and(|s| s.meteors >= 1),
         "a cold-cursor JUMP (30 cells) flies its meteor — punctuation, \
@@ -339,13 +306,6 @@ fn cold_navigation_timestamp_scatters_nothing() {
     );
 }
 
-/// A LANDING AT THE GRID'S EDGE FADES BEFORE THE EDGE: a jump that lands on
-/// the left column (an Enter's new line, or a jump to a prompt) blooms with
-/// its whole radial falloff inside the effects box on a dark ground, Fire's
-/// flash and every other style's bloom, so the grid's edge column is all but
-/// dark instead of standing cut through the bloom's middle. Negative
-/// control: the same bloom laid unfitted at its landing lights the edge
-/// column at most of its peak.
 #[test]
 fn a_landing_at_the_grids_edge_fades_before_the_edge() {
     let g = geom();
@@ -409,7 +369,6 @@ fn a_landing_at_the_grids_edge_fades_before_the_edge() {
             edge * 5 <= peak,
             "{style:?}: the grid's edge column stands at {edge} of {peak}"
         );
-        // Control: the first bloom unfitted, at its landing and full size.
         let h = halos[0];
         let grow = (0.55 + 1.25 * 0.3) * g.ch as f32;
         let mut cut = Vec::new();
@@ -428,12 +387,6 @@ fn a_landing_at_the_grids_edge_fades_before_the_edge() {
     }
 }
 
-/// ON PAPER A LANDING VEIL FALLS OFF FROM ITS CENTRE: the veil ring a light
-/// ground lays darkens the page most at the landing and less and less
-/// outward (no flat disc of ink, which reads as a stain), never deeper than
-/// its cap allows. Judged on the veil as it ships, held to the caret's cell
-/// and row, on a cell the gallery's size. Negative control: one veil held
-/// under the same cap is flat out to half its radius.
 #[test]
 fn a_light_landing_veil_falls_off_from_its_centre() {
     let g = tall_geom();
@@ -488,7 +441,6 @@ fn a_light_landing_veil_falls_off_from_its_centre() {
         "a flat disc: {half:.3} at half its reach against {:.3} at its centre",
         shipped[0]
     );
-    // Control: one veil under the same cap, at the same reach.
     let cap = halos[0].color >> 24;
     let one = halos.iter().map(|h| h.rx).max().unwrap_or(1);
     let mut flat = Vec::new();
@@ -509,12 +461,6 @@ fn a_light_landing_veil_falls_off_from_its_centre() {
     );
 }
 
-/// ON PAPER A LANDING VEIL WEARS ITS STYLE'S HUE: the light landing veil of
-/// the phaser and of sparkle reads, where it is deepest, in the hue of the
-/// style's own colour and clearly coloured (a veil of the darkened
-/// over-text ink thinned to a grey halo round the caret), while the letters
-/// under it keep the light bar. Negative control: the same veil in the
-/// over-text ink reads grey.
 #[test]
 fn a_light_landing_veil_wears_its_style_hue() {
     let g = geom();
@@ -579,20 +525,6 @@ fn a_light_landing_veil_wears_its_style_hue() {
     }
 }
 
-/// THE PAPER LANDING VEIL STAYS IN THE CARET'S CELL AND ROW, AT THE TEXT
-/// BAR (2026-10-22: after an Enter at the bottom row the veil, carried up
-/// with the scrolled text, stood as a cloud five to eight cells wide and two
-/// and a half rows tall over the lines just printed above the caret, on
-/// GitHub Light and Default Light alike). A landing a row above the caret
-/// (where the scroll left it), on two paper themes and every veiled style,
-/// at the Enter's frame and at 120 ms: every pixel the veil touches lies in
-/// the caret's row, within [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] and a pixel
-/// of the caret's centre, and the theme's text over it keeps 4.5:1. So on a
-/// frame whose caret the host withholds (`cur: None`, a hidden caret): the
-/// veil stays on the caret the ring last saw. NEGATIVE CONTROLS: the veil as
-/// it was ([`CursorGlow::veil_unbound`]) leaves the row; and (as run on
-/// 2026-10-22, the bound held only while `cur` was there) the hidden-caret
-/// frame laid the old cloud over the landing.
 #[test]
 fn a_paper_landing_veil_stays_in_the_caret_row_at_the_text_bar() {
     let g = tall_geom();
@@ -679,14 +611,6 @@ fn a_paper_landing_veil_stays_in_the_caret_row_at_the_text_bar() {
     );
 }
 
-/// THE PAPER LANDING VEIL HOLDS ITS ROW THROUGH A HIDDEN CARET, through the
-/// whole frame step: a jump to the bottom row lays the landing, an Enter's
-/// scroll carries it a row up with the text, and one frame of the ring's
-/// life the host withholds the caret (`cur: None`, as it does for a hidden
-/// caret). On every frame, that one too, every pixel the halos lay lies in
-/// the caret's row. Negative control (as run on 2026-10-22, the bound held
-/// only while `cur` was there): the hidden frame laid the cloud two rows up
-/// over the scrolled text (Comet's first pixel off the row at (30, 142)).
 #[test]
 fn a_paper_landing_veil_keeps_the_caret_row_through_a_hidden_caret() {
     let g = tall_geom();
@@ -736,15 +660,6 @@ fn a_paper_landing_veil_keeps_the_caret_row_through_a_hidden_caret() {
     assert!(lit_hidden > 0, "the hidden-caret frame lays no veil at all");
 }
 
-/// THE DARK FIRE'S LANDING IS A BRIEF FLASH, NOT A DISC LEFT BEHIND (round 1:
-/// the Enter's landing bloom, spread to three cells with an aftershock
-/// behind it, stood as a flat orange disc where the caret had landed, still
-/// there after a clear took the line away). Through its life the flash
-/// reaches no further than [`CursorGlow::FIRE_DARK_LANDING_REACH`] of a row
-/// (graded by the jump) and is one bloom, and past half its life its peak
-/// is under a quarter of its birth's. Negative control: the other dark
-/// styles' bloom on the same probe, fading only linearly, still holds more
-/// than that there.
 #[test]
 fn the_dark_fire_landing_is_a_brief_flash() {
     let g = geom();
@@ -815,14 +730,6 @@ fn the_dark_fire_landing_is_a_brief_flash() {
     );
 }
 
-/// A RING ON THE GRID'S LAST ROW MELTS INTO THE BOX'S EDGE (round-2 judges,
-/// item 8: water's Return rings round a caret on the bottom row stood cut
-/// flat along the grid's bottom, dark and light). A ripple ring round a
-/// caret on the last row lays in the effects box's last pixel row at most a
-/// tenth of what the same ring round a caret mid-grid lays at the same
-/// offset from its centre, and nothing past the box. Negative control: mid
-/// grid that offset is lit, so a straight cut at the box's edge would have
-/// stood there whole.
 #[test]
 fn a_ring_on_the_last_row_melts_into_the_box_edge() {
     let g = tall_geom();
@@ -832,7 +739,6 @@ fn a_ring_on_the_last_row_melts_into_the_box_edge() {
         push_ripple_ring(&mut out, g, (200.0, cy), (40.0, 22.0), 4.0, 0x00FF_FFFF);
         (cy as i32, out)
     };
-    // The light a ring lays in window pixel row `y` (channels × width).
     let lit_at = |quads: &[GlowQuad], y: i32| -> u64 {
         quads
             .iter()

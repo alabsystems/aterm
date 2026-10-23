@@ -63,7 +63,7 @@ fn named_path(fact: &str, foreign: Option<&Path>) -> Option<String> {
 impl AiCli {
     /// Whether a definite install or sign-in action is needed.
     #[must_use]
-    pub(crate) fn needs_you(&self) -> bool {
+    pub(crate) const fn needs_you(&self) -> bool {
         self.state.needs_person(self.wanted)
     }
 
@@ -312,7 +312,7 @@ const fn from_fleet(from: From) -> bool {
 }
 
 /// Where a value came from, in the page's words.
-fn from_words(from: From) -> &'static str {
+const fn from_words(from: From) -> &'static str {
     match from {
         From::Local => "aterm.toml",
         From::FleetMachine => "the fleet document, this machine's row",
@@ -753,6 +753,7 @@ fn windows_launch_line(exe: &Path, args: &[&str], shell: &Path) -> Option<String
         .to_ascii_lowercase();
     let program = match name.strip_suffix(".exe").unwrap_or(&name) {
         "cmd" => {
+            // cmd expands both forms even inside quotes (delayed expansion
             // can be enabled by shell_args). Do not type a different path.
             if exe.contains(['%', '!']) {
                 return None;
@@ -762,6 +763,7 @@ fn windows_launch_line(exe: &Path, args: &[&str], shell: &Path) -> Option<String
         "pwsh" | "powershell" => {
             let mut quoted = String::from("& '");
             for c in exe.chars() {
+                // PowerShell accepts typographic single quotes as delimiters
                 // too, and doubles any member of this class to quote it.
                 if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
                     quoted.push(c);

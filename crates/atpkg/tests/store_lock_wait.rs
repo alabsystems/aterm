@@ -1,42 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Store lock contention at the process edge across two processes.
-//!
-//! Holds `store.lock` in this process (`Layout` over a temp prefix) and drives
-//! the dev `atpkg` binary against it: a `--wait-lock` child announces the wait
-//! and proceeds once the holder releases, or times out with exit 75
-//! (`EX_TEMPFAIL`) and prints `seed-busy:`; a non-interactive typed verb stays
-//! fail-fast with exit 75 and prints no progress marker; an unwritable prefix
-//! fails immediately with exit 1; an uncontended child prints no lock marker;
-//! a waiter whose spawner exits stands down silently; and a waiter whose
-//! parent is init from the start is not treated as an orphan.
-//!
-//! Isolation: the child's `HOME` is a temp directory and `XDG_CONFIG_HOME` is
-//! absent, so `store::resolve` lands on the default prefix under that temp
-//! `HOME`, and `<prefix>/declined` makes `seed` exit 0 before any index or
-//! network work.
+//! Cross-process `store.lock` contention and `--wait-lock` CLI tests.
 
 #![cfg(unix)]
 
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::path::{Path, PathBuf};
-// `spawnfd`'s: every child here holds its stdio and nothing else of this
-// process — not a pipe another test thread had open unflagged at the spawn,
-// held for as long as a waiting child lives.
+
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The sentence a `--wait-lock` child prints once its wait outlasts the grace
-/// (`atpkg::cli::LOCK_WAITING_MARKER` with the `atpkg: ` prefix the GUI strips).
+/// The sentence a `--wait-lock` child prints once its wait outlasts the grace.
 fn waiting_line() -> String {
     format!("atpkg: {}", atpkg::cli::LOCK_WAITING_MARKER)
 }
 
-/// The sentence that answers it once the announced wait ends in the lock
-/// (`atpkg::cli::LOCK_ACQUIRED_MARKER`).
+/// The sentence that answers it once the announced wait ends in the lock.
 fn acquired_line() -> String {
     format!("atpkg: {}", atpkg::cli::LOCK_ACQUIRED_MARKER)
 }
@@ -63,8 +45,6 @@ impl Fixture {
         let registry = root.path().join("registry");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&registry).unwrap();
-        // The default prefix under the temp HOME — the one place `store::resolve`
-        // can land with no config.
         let prefix = atpkg::store::default_prefix(&home);
         assert!(
             prefix.starts_with(&home),
@@ -86,8 +66,7 @@ impl Fixture {
         }
     }
 
-    /// Take the store lock in this process (creates the 0700 prefix), and write the
-    /// `declined` marker so a child that does get to run its verb exits 0 at once.
+    /// Take the store lock in this process.
     fn hold(&self) -> atpkg::lock::StoreLock {
         let guard =
             atpkg::lock::try_lock_store(&self.layout()).expect("the fixture holds the lock");
@@ -103,11 +82,7 @@ impl Fixture {
         std::fs::write(layout.declined(), b"declined by the test fixture\n").unwrap();
     }
 
-    /// A command confined to this fixture's HOME, config and registry, both pipes
-    /// captured — for the dev `atpkg` itself or for a shell that runs it. Clears
-    /// `ATERM_STATE_HOME` so a suite run inside a private instance does not skip
-    /// the `[machine]` edge or write logs into that instance's root. A waiter announces
-    /// at its first contended poll: no test here but the orphan's is about the grace.
+    /// A command confined to this fixture's HOME, config and registry, both pipes captured.
     fn command(&self, program: &str) -> Command {
         let mut cmd = Command::new(program);
         cmd.env("HOME", &self.home)
@@ -129,8 +104,8 @@ impl Fixture {
     }
 }
 
-/// A spawned child with stdout collected line by line as it arrives and stderr
-/// drained concurrently.
+/// A spawned child with stdout collected line by line as it arrives and stderr drained
+/// concurrently.
 struct Streamed {
     child: Child,
     stdout: Arc<Mutex<Vec<String>>>,
@@ -173,8 +148,7 @@ impl Streamed {
             .any(|l| l.contains(needle))
     }
 
-    /// Block until stdout carries `needle`, or panic (killing the child) after
-    /// `within`.
+    /// Block until stdout carries `needle`, or panic (killing the child) after `within`.
     fn wait_for_line(&mut self, needle: &str, within: Duration) {
         let deadline = Instant::now() + within;
         while !self.stdout_has(needle) {
@@ -196,8 +170,7 @@ impl Streamed {
         }
     }
 
-    /// Wait for the child to exit (killing it past `within`), returning its status,
-    /// the elapsed time since spawn, every stdout line and the whole stderr.
+    /// Wait for the child to exit.
     fn finish(mut self, within: Duration) -> (ExitStatus, Duration, Vec<String>, String) {
         let deadline = Instant::now() + within;
         let status = loop {
@@ -231,12 +204,10 @@ fn lock_path_of(prefix: &Path) -> String {
     .to_string()
 }
 
-/// A hang detector, not a latency budget: the first exec of a freshly linked binary has
-/// been measured at 26 s on a loaded machine.
+/// A hang detector, not a latency budget.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 
-/// Assert that a refused pass prints only `[machine]` host lines and no window
-/// progress markers.
+/// Assert that a refused pass prints only `[machine]` host lines and no window progress markers.
 fn no_progress_marker(stdout: &[String]) {
     for line in stdout {
         assert!(
@@ -261,8 +232,6 @@ fn no_progress_marker(stdout: &[String]) {
 
 #[test]
 fn a_conditional_link_waits_and_rechecks_the_selection_under_the_lock() {
-    // Every path is inside the fixture; include empty directories and link targets so a
-    // refusal cannot hide a landing sweep, notice preparation, twin or pass-log write.
     fn inventory(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         fn visit(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
             let meta = std::fs::symlink_metadata(path).unwrap();
@@ -401,8 +370,6 @@ fn a_waiting_seed_proceeds_once_the_holder_releases() {
         ran_at > waiting_at,
         "the verb runs AFTER the wait: {stdout:?}"
     );
-    // `lock-acquired:` is printed once between the waiting announcement and the
-    // verb's own output so the GUI retires its waiting row immediately.
     let acquired: Vec<usize> = stdout
         .iter()
         .enumerate()
@@ -424,9 +391,6 @@ fn a_waiting_seed_proceeds_once_the_holder_releases() {
     );
 }
 
-/// When the holder never releases, the waiter announces, waits its full bound,
-/// exits 75 (`EX_TEMPFAIL`) with the contention refusal on stderr without
-/// running its verb, and emits one `seed-busy:` marker on stdout.
 #[test]
 fn a_waiting_seed_times_out_with_exit_75() {
     let fx = Fixture::new("timeout");
@@ -442,7 +406,6 @@ fn a_waiting_seed_times_out_with_exit_75() {
         .iter()
         .position(|l| l.starts_with(&waiting_line()))
         .unwrap_or_else(|| panic!("announced the wait: {stdout:?}"));
-    // `seed-busy:` reaches the `--wait-lock` caller once after the announcement.
     let busy_line = format!("atpkg: {}", atpkg::cli::SEED_BUSY_MARKER);
     let busy: Vec<usize> = stdout
         .iter()
@@ -474,10 +437,6 @@ fn a_waiting_seed_times_out_with_exit_75() {
     );
 }
 
-/// A typed verb (no flag) with no person at a terminal behind it — stdin here is not
-/// one — is unchanged in everything but the code: instant, loud on stderr, silent on
-/// stdout; a script is told at once and never waits invisibly. (A person at a terminal
-/// waits, visibly: `typed_lock_wait_tty.rs`.)
 #[test]
 fn a_typed_seed_stays_fail_fast_with_exit_75() {
     let fx = Fixture::new("typed");
@@ -492,8 +451,6 @@ fn a_typed_seed_stays_fail_fast_with_exit_75() {
     no_progress_marker(&stdout);
 }
 
-/// An unwritable prefix is not waited on, even with `--wait-lock`: the `Io` refusal
-/// keeps exit 1 and comes back at once — the remedy is a different one.
 #[test]
 fn an_unwritable_prefix_never_waits_and_keeps_exit_1() {
     let fx = Fixture::new("badprefix");
@@ -505,8 +462,7 @@ fn an_unwritable_prefix_never_waits_and_keeps_exit_1() {
     no_progress_marker(&stdout);
 }
 
-/// Check whether `pid` is alive via `kill -0` (the waiter is a grandchild
-/// this process cannot `waitpid` on).
+/// Check whether `pid` is alive via `kill -0`.
 fn pid_alive(pid: u32) -> bool {
     Command::new("/bin/kill")
         .args(["-0", &pid.to_string()])
@@ -516,20 +472,14 @@ fn pid_alive(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// An orphaned waiter stands down silently before its bound: a throwaway `sh`
-/// spawns the waiter, prints its pid, and exits immediately while the lock
-/// stays held here, so the waiter can only exit early via the orphan check
-/// before printing `lock-waiting:`.
+/// An orphaned waiter stands down silently before its bound.
 fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
     let fx = Fixture::new(case);
     let guard = fx.hold();
     let sh = fx
         .command("/bin/sh")
-        // The real grace: it is what keeps a waiter silent while its spawner exits.
         .env_remove(atpkg::lock::WAIT_ANNOUNCE_GRACE_SEAM)
         .arg("-c")
-        // The waiter inherits both pipes, so this process sees EOF on them only
-        // once the waiter itself has exited.
         .arg(script)
         .arg("sh")
         .arg(env!("CARGO_BIN_EXE_atpkg"))
@@ -537,7 +487,6 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
         .expect("spawn the throwaway parent");
     let started = Instant::now();
     let streamed = stream(sh);
-    // The throwaway parent exits at once; the waiter's pid is its one line.
     let pid = loop {
         let found = streamed.stdout.lock().unwrap().iter().find_map(|l| {
             l.strip_prefix("waiter=")
@@ -553,13 +502,8 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    // The waiter is gone long before its bound. A minute is a hang detector, not a
-    // latency budget: the regression — a waiter that misses the orphan check —
-    // polls out all ten minutes, so the minute tells the two apart however loaded
-    // the machine is.
     while pid_alive(pid) {
         if started.elapsed() >= aterm_spec::wait::MUST_HAPPEN {
-            // Leave no orphan polling out its ten minutes behind a red run.
             let _ = Command::new("/bin/kill")
                 .args(["-KILL", &pid.to_string()])
                 .status();
@@ -571,7 +515,6 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
         std::thread::sleep(Duration::from_millis(50));
     }
     let gone_after = started.elapsed();
-    // Both pipes reach EOF once the waiter is gone: it said nothing on either.
     let (status, _, stdout, stderr) = streamed.finish(Duration::from_secs(60));
     assert!(status.success(), "the throwaway parent itself: {status}");
     assert_eq!(
@@ -583,9 +526,6 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
         stderr.trim().is_empty(),
         "…and nothing on stderr either: {stderr}"
     );
-    // Neither the announcement nor the verb's own sentence ever arrived — the
-    // orphan check preceded the announcement on every poll, and the waiter never
-    // held the lock (a verb run on this declined fixture prints its sentence).
     assert!(
         !stdout.iter().any(|l| l.starts_with(&waiting_line())),
         "no `lock-waiting:` announcement: {stdout:?}"
@@ -594,9 +534,6 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
         !stdout.iter().any(|l| l.contains(DECLINED_SENTENCE)),
         "the verb never ran: {stdout:?}"
     );
-    // Once this holder releases `guard`, the lock becomes takeable (polled
-    // because a concurrent test's fork/posix_spawn can briefly inherit the
-    // open fd until `exec`).
     drop(guard);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -612,9 +549,6 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
     }
 }
 
-/// The spawner passes `ATPKG_SPAWNER_PID=$$` beside `--wait-lock`, so orphan
-/// detection compares against that pid even when the spawner exits before the
-/// waiter reaches `getppid()` or under a Linux subreaper.
 #[test]
 fn an_orphaned_waiter_stands_down_silently_before_its_bound() {
     an_orphaned_waiter_stands_down(
@@ -625,26 +559,15 @@ fn an_orphaned_waiter_stands_down_silently_before_its_bound() {
     );
 }
 
-/// The orphaned waiter's `--wait-lock` bound: ten minutes, far past the minute's
-/// hang detector that watches it stand down, so a waiter that polls out its bound
-/// is told apart from one that stands down however loaded the machine is.
+/// The orphaned waiter's `--wait-lock` bound.
 const ORPHAN_BOUND_SECS: u64 = 600;
 
-/// A waiter whose parent is already init/subreaper when it starts (with no
-/// `ATPKG_SPAWNER_PID`) records that initial `getppid()` as its spawner and
-/// waits normally instead of treating itself as orphaned. A throwaway `sh`
-/// forks a subshell that waits on a FIFO gate; the test reaps the `sh` (so the
-/// subshell is re-parented) and only then opens the gate for it to `exec` the
-/// waiter. A waiter that stands down fails at its exit, not at the deadline.
 #[test]
 fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
     use std::io::Write as _;
     let fx = Fixture::new("init-parent");
     let _guard = fx.hold();
-    // Outlives every check below; the waiter is killed once they pass.
     let bound = aterm_spec::wait::MUST_HAPPEN;
-    // The gate, held open read-write here, so the subshell's open of it never waits for
-    // a writer and the line written below waits in the pipe until it reads.
     let gate_path = fx.home.with_file_name("gate");
     let gate_c = {
         use std::os::unix::ffi::OsStrExt as _;
@@ -670,8 +593,6 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
         .expect("spawn the throwaway parent");
     let sh_pid = sh.id();
     let mut streamed = stream(sh);
-    // The throwaway parent exits at once (a hang detector, not a budget); once it is
-    // reaped, the subshell's parent is init (or the subreaper), and the gate opens.
     let reaped = Instant::now();
     let exited = loop {
         if let Some(status) = streamed
@@ -689,13 +610,8 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
     };
     assert!(exited.success(), "the throwaway parent itself: {exited}");
     gate.write_all(b"go\n").expect("open the gate");
-    // The announcement is the proof it did NOT stand down: it is printed only while the
-    // waiter still wants the lock. With the `sh` reaped, the waiter alone holds the pipes,
-    // so their end is its exit: a waiter that ends before it announces stood down, and
-    // fails here at once.
     let deadline = Instant::now() + ANNOUNCE_WITHIN;
     loop {
-        // Read before the lines, so an end seen here follows every line it read.
         let ended = streamed.stdout_reader.is_finished();
         if streamed.stdout_has(&waiting_line()) {
             break;
@@ -722,24 +638,19 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
                 .and_then(|p| p.trim().parse::<u32>().ok())
         })
         .expect("the waiter's pid line");
-    // The shape held: the announcing waiter's parent is not the (reaped) `sh`.
     let ppid = parent_of(pid);
     assert!(
         ppid.is_some_and(|p| p != sh_pid),
         "the waiter (pid {pid}) is re-parented away from sh (pid {sh_pid}): ppid {ppid:?}"
     );
-    // Settled: both inputs to the orphan check (the recorded spawner, the current
-    // parent) are fixed from here on, so the waiter cannot stand down later. End it
-    // rather than wait out its bound.
     let _ = Command::new("/bin/kill")
         .args(["-KILL", &pid.to_string()])
         .status();
-    // Both pipes reach EOF once the waiter is gone.
     let _ = streamed.finish(Duration::from_secs(60));
 }
 
-/// `pid`'s parent, read from the kernel's process table as `ps -o ppid=` reads it, without
-/// running `ps`; `None` once no process has that pid.
+/// `pid`'s parent, read from the kernel's process table as `ps -o ppid=` reads it, without running
+/// `ps`.
 fn parent_of(pid: u32) -> Option<u32> {
     #[cfg(target_os = "macos")]
     let parent = aterm_sysprobe::kproc::record(pid).map(|r| r.ppid);
@@ -752,7 +663,6 @@ fn parent_of(pid: u32) -> Option<u32> {
     parent
 }
 
-/// No contention, no marker: the flag changes nothing about an uncontended pass.
 #[test]
 fn a_declined_seed_without_contention_is_unchanged() {
     let fx = Fixture::new("uncontended");
@@ -777,9 +687,6 @@ fn a_declined_seed_without_contention_is_unchanged() {
 /// The sentence a full `update` prints when nothing is installed and the set is not owed.
 const NOTHING_TO_UPDATE: &str = "nothing installed to update";
 
-/// When the holder records a failed full pass while a child waits, the child
-/// does not re-run the pass back-to-back: it prints the holder's failure on
-/// stderr, exits 1, and leaves the holder's status record intact.
 #[test]
 fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited() {
     use aterm_update_core::pkg_check::PassOutcome;
@@ -787,9 +694,6 @@ fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited(
     let guard = fx.hold();
     let mut child = stream(fx.spawn(&["update", "--wait-lock", "60"]));
     child.wait_for_line(&waiting_line(), ANNOUNCE_WITHIN);
-    // Stamped in the same second the child found the lock held: the store's
-    // full-pass sequence number (read before the first lock attempt) distinguishes
-    // a pass that ended during the wait from one that ended before it.
     let unix = aterm_time::unix_secs().unwrap();
     let ended = aterm_types::rfc3339::format_rfc3339(unix);
     let layout = fx.layout();
@@ -820,9 +724,6 @@ fn a_waiting_update_stands_down_behind_a_failed_pass_that_ended_while_it_waited(
     );
 }
 
-/// Behind a pass that failed only because its index came from cache
-/// (`stale_index_only_pass_seq`), the waiting child stands down with its line
-/// on stdout, empty stderr, and exit 1, preserving the holder's record.
 #[test]
 fn a_waiting_update_stands_down_quietly_behind_a_pass_that_failed_only_for_its_cached_index() {
     use aterm_update_core::pkg_check::PassOutcome;
@@ -864,9 +765,6 @@ fn a_waiting_update_stands_down_quietly_behind_a_pass_that_failed_only_for_its_c
     );
 }
 
-/// With nothing installed and the default set declined, `update` exits 0 and
-/// records `last_pass = ok` (with `last_success_at` empty since nothing was
-/// checked).
 #[test]
 fn an_update_with_nothing_to_check_records_its_end() {
     let fx = Fixture::new("nothing-to-check");

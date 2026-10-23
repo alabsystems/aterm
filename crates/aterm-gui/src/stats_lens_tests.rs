@@ -15,13 +15,11 @@ use aterm_vitals::Cell;
 use aterm_vitals::history::FREE_BUCKET_S;
 use aterm_vitals::model::{Hog, ProcScope, ScopeFig, TopProc, Writer};
 
-/// The mockups' clock: [`AT`] reads 10:42:17 here.
 const LOC: Locale = Locale {
     platform: Platform::MacOs,
     utc_offset_s: -8 * 3600,
 };
 
-/// A fixed sequence of numbers in `a..b`.
 struct Rng(u64);
 
 impl Rng {
@@ -34,10 +32,6 @@ impl Rng {
     }
 }
 
-/// An hour's ring for row `i` of `s`: the scene's last ten minutes after
-/// fifty minutes that walk to them from `from` (a share of the row's
-/// capacity, wandering by `noise`), with two minutes unread at the
-/// 40-minutes-ago mark.
 fn hour_ring(s: &Snapshot, i: usize, from: f64, noise: f64, r: &mut Rng) -> Arc<[Cell]> {
     let view = &s.resources[i];
     let cap = view.capacity.unwrap_or(1.0);
@@ -222,7 +216,6 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
     s
 }
 
-/// The lens's input: the scene's, at the mockups' clock, in `inks`.
 fn input(snap: &Snapshot, inks: VitalsInks) -> DeckInput<'_> {
     let mut input = scene_input(snap, DeckForm::Full);
     input.inks = inks;
@@ -230,7 +223,6 @@ fn input(snap: &Snapshot, inks: VitalsInks) -> DeckInput<'_> {
     input
 }
 
-/// A shell `lw` × `lh` pt at `s` device px per pt.
 fn shell(lw: f64, lh: f64, s: f32) -> LensGeom {
     let margin = (6.0 * s).round();
     LensGeom {
@@ -252,7 +244,6 @@ fn pinned(focus: Instrument) -> Lens {
     }
 }
 
-/// Every instrument a lens shows.
 const ALL: [Instrument; 8] = [
     Instrument::Cpu,
     Instrument::Gpu,
@@ -268,9 +259,6 @@ fn overlap(a: &[f64; 4], b: &[f64; 4]) -> bool {
     a[0] < b[2] - EPS && b[0] < a[2] - EPS && a[1] < b[3] - EPS && b[1] < a[3] - EPS
 }
 
-/// What is wrong with one laid lens: a text box outside the shell or over
-/// its foot, two boxes that meet, a column count the width does not call
-/// for, or a column whose placed sections are not the first of its stack.
 fn faults(laid: &LensLaid, lw: f64, lh: f64) -> Vec<String> {
     let mut out = Vec::new();
     for b in &laid.boxes {
@@ -307,12 +295,6 @@ fn faults(laid: &LensLaid, lw: f64, lh: f64) -> Vec<String> {
     out
 }
 
-/// T-G16: at every shell width from 160 to 1024 pt and height from 90 to
-/// 250 pt, for every lens, in Helvetica Neue's metrics: one column below
-/// 640 pt and two from it, every text box inside the shell and clear of
-/// every other, each column's sections in its order, the sections shown the
-/// first of the priority order in either column, and Disk's Space now shown
-/// at every size.
 #[test]
 fn every_lens_holds_its_frame_at_every_size() {
     let snap = lens_scene(Scene::Calm);
@@ -370,7 +352,6 @@ fn every_lens_holds_its_frame_at_every_size() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// The Disk lens's sections and the forms they took at `lw` × `lh`, by name.
 fn disk_forms(snap: &Snapshot, lw: f64, lh: f64) -> Vec<Vec<(String, usize, usize)>> {
     let m = FaceMetrics::helvetica_neue();
     let input = input(snap, dark_inks());
@@ -402,10 +383,6 @@ fn disk_forms(snap: &Snapshot, lw: f64, lh: f64) -> Vec<Vec<(String, usize, usiz
         .collect()
 }
 
-/// §11.3: at 526 × 250 the Disk lens keeps Space now, the chart and the
-/// Where and Writing lines (`dark_1100_lens_disk`); at 526 × 154 Space now
-/// and the Filling line (`dark_1100_lens_disk_short`); on a wide shell Space
-/// now over the chart on the left, Writing now over Where on the right.
 #[test]
 fn the_disk_lens_keeps_what_the_mockups_keep() {
     let snap = lens_scene(Scene::Calm);
@@ -440,7 +417,6 @@ fn the_disk_lens_keeps_what_the_mockups_keep() {
     assert!(wide[1].iter().all(|s| !one_line(s)), "{wide:?}");
 }
 
-/// The words a reader hears for `focus`: its title and its wells.
 fn heard(snap: &Snapshot, lens: Lens) -> LensLaid {
     let input = input(snap, dark_inks());
     lay_lens(
@@ -459,9 +435,6 @@ fn well<'a>(laid: &'a LensLaid, name: &str) -> &'a str {
     )
 }
 
-/// A chart's sentence says when its first reading was, in the singular
-/// for one: six 10-minute buckets are "1 hour ago", one 1-minute bucket "1
-/// minute ago".
 #[test]
 fn a_chart_says_one_hour_ago_in_the_singular() {
     let trace = |n: usize| Trace {
@@ -498,9 +471,6 @@ fn a_chart_says_one_hour_ago_in_the_singular() {
     );
 }
 
-/// §7.7 and §12: the Disk lens answers Wrong?, says the 24 hours of free
-/// space as a sentence with its gap and aterm's pass, and lists the folders
-/// and the writers, the nine rustc as one.
 #[test]
 fn the_disk_lens_says_its_reading() {
     let snap = lens_scene(Scene::Calm);
@@ -563,8 +533,6 @@ fn the_disk_lens_says_its_reading() {
     );
 }
 
-/// ↑/↓'s scope filters the lists: Tab shows the front tab's own, aterm
-/// every tab's and aterm's, Global everything.
 #[test]
 fn the_scope_filters_the_lists() {
     let snap = lens_scene(Scene::Calm);
@@ -587,8 +555,6 @@ fn the_scope_filters_the_lists() {
     assert!(well(&global, "Biggest now").contains("WindowServer"));
 }
 
-/// §11.3: a chip is in Tab ink only for this window's front tab; another
-/// tab's and aterm's are in aterm ink, everything else in the machine's.
 #[test]
 fn chips_say_whose_a_row_is() {
     let inks = dark_inks();
@@ -611,7 +577,6 @@ fn chips_say_whose_a_row_is() {
     assert_eq!(chip_ink(&pen, ProcScope::Other, Some(FRONT)), inks.machine);
 }
 
-/// §11.4: each lens's sections, by heading, on a wide shell.
 #[test]
 fn each_lens_shows_its_sections() {
     let snap = lens_scene(Scene::Calm);
@@ -686,8 +651,6 @@ fn each_lens_shows_its_sections() {
     assert!(now.starts_with("Network "), "{now}");
 }
 
-/// ⌘C copies the instrument's sentence (§12), How to read its own words;
-/// ←/→ step over `Instrument::ALL`, wrapping, and leave How to read.
 #[test]
 fn the_keys_step_and_copy_the_instruments() {
     let snap = lens_scene(Scene::Calm);
@@ -734,8 +697,6 @@ fn the_keys_step_and_copy_the_instruments() {
     );
 }
 
-/// §11.3's line 1: the longest key hint and source that fit together, the
-/// hint's forms tried first; a hover lens says a click pins it.
 #[test]
 fn line_one_fits_its_longest_forms() {
     let snap = lens_scene(Scene::Calm);
@@ -770,10 +731,6 @@ fn line_one_fits_its_longest_forms() {
     assert_eq!(hover.last().map(String::as_str), Some("click pins it"));
 }
 
-/// §11.3's drop rule on its own: each section takes its largest form that
-/// leaves the one-line forms after it room, else its own one-line form,
-/// else drops with every section after it; a kept first section drops the
-/// others before it shrinks.
 #[test]
 fn sections_take_the_largest_form_that_leaves_room() {
     let sec = |hs: &[f64]| Section {
@@ -817,8 +774,6 @@ fn sections_take_the_largest_form_that_leaves_room() {
     assert_eq!(forms(40.0, true), [1, 2]);
 }
 
-/// The lens hangs 4 pt under the Deck, 4 pt over the sill, and no lens
-/// opens in a window under 160 × 90 pt of grid.
 #[test]
 fn the_lens_hangs_under_the_deck_and_over_the_sill() {
     let deck = lens_geom(
@@ -865,10 +820,6 @@ fn the_lens_hangs_under_the_deck_and_over_the_sill() {
     );
 }
 
-/// The gallery: every lens at the mockups' sizes, dark and light, in the
-/// installed UI face, as PNGs a person reads beside
-/// `dark_2238_lens_disk`, `light_2238_lens_disk`, `dark_1100_lens_disk` and
-/// `dark_1100_lens_disk_short`.
 #[test]
 #[ignore = "writes PNGs for a person to read: set ATERM_LENS_GALLERY to a directory"]
 fn lens_gallery() {
@@ -923,12 +874,6 @@ fn lens_gallery() {
     assert_eq!(written.len(), (6 + 10) * 2);
 }
 
-/// A CJK LINE OF THE LENS WRAPS BETWEEN ITS CHARACTERS, kinsoku kept, the
-/// shared rule's breaks ([`aterm_grapheme::pieces`]): a process name or an
-/// explainer with no space is laid on as many lines as its width needs,
-/// each inside it, none starting with a closer, rejoined the text; a Latin
-/// one wraps at its spaces as before. NEGATIVE CONTROL: broken only at
-/// white space, the name was one line cut short with `…`.
 #[test]
 fn a_cjk_line_of_the_lens_wraps_between_its_characters() {
     let m = FaceMetrics::helvetica_neue();

@@ -31,6 +31,11 @@ pub enum Fetched {
 
 /// What [`fetch`] adds to `wait` for the request's own deadline.
 pub const FETCH_MARGIN: Duration = Duration::from_secs(5);
+/// The DNS lookup, connect and TLS handshake of each of a look's tries ([`get_bounded`]):
+/// a vault's name answers in milliseconds once macOS lets it, and mDNS says a `.local` name
+/// nobody has is not there after about five seconds, which this outlasts so that answer is
+/// heard as one.
+pub const LOOK_CONNECT: Duration = Duration::from_secs(8);
 /// The deadline of a publish (up to 16 MiB on a LAN) and of the join exchanges.
 const EXCHANGE: Duration = Duration::from_secs(120);
 /// The largest answer read from a PUT or a join POST (a one-line reason).
@@ -256,20 +261,68 @@ pub enum Answer {
 
 /// Execute one GET of the vault at `url` ([`fetch`], [`Answer::Foreign`]).
 pub fn get(url: &str, after: Option<u64>, wait: Duration) -> crate::Result<Answer> {
+    get_bounded(url, after, wait, None).map_err(|unheard| unheard.why)
+}
+
+/// Why a GET heard no answer ([`get_bounded`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unheard {
+    /// What failed, as [`get`] says it.
+    pub why: Error,
+    /// The lookup got no answer in time, or the host has no route: how macOS holds the
+    /// lookups and LAN connects of an app whose Local Network question nobody has answered
+    /// yet, so a try after the answer can succeed (a slow network and a host that sleeps
+    /// look the same).
+    pub held: bool,
+}
+
+/// [`get`], with its DNS lookup, connect and TLS handshake bounded by `connect` within the
+/// request's deadline, saying of a failure whether it is [`Unheard::held`].
+pub fn get_bounded(
+    url: &str,
+    after: Option<u64>,
+    wait: Duration,
+    connect: Option<Duration>,
+) -> Result<Answer, Unheard> {
+    get_via(
+        &client(wait.saturating_add(FETCH_MARGIN)),
+        url,
+        after,
+        connect,
+    )
+}
+
+/// [`get_bounded`] through `client` (its timeout is the request's deadline).
+fn get_via(
+    client: &Client,
+    url: &str,
+    after: Option<u64>,
+    connect: Option<Duration>,
+) -> Result<Answer, Unheard> {
     let target = match after {
         Some(seq) => with_query(url, &format!("after={seq}")),
         None => base(url).to_owned(),
     };
-    let response = match client(wait.saturating_add(FETCH_MARGIN))
-        .get(&target)
-        .limit(MAX_ENVELOPE)
-        .send(&[])
-    {
+    let request = client.get(&target).limit(MAX_ENVELOPE);
+    let request = match connect {
+        Some(connect) => request.connect_within(connect),
+        None => request,
+    };
+    let response = match request.send(&[]) {
         Ok(response) => response,
         Err(error) if foreign_reply(&error) => {
             return Ok(Answer::Foreign(transport_error("fetching", url, &error).0));
         }
-        Err(error) => return Err(transport_error("fetching", url, &error)),
+        Err(error) => {
+            return Err(Unheard {
+                why: transport_error("fetching", url, &error),
+                held: held(&error),
+            });
+        }
+    };
+    let failed = |status| Unheard {
+        why: refused("fetching", url, status, response.body()),
+        held: false,
     };
     match response.status() {
         200 => Ok(Answer::Fetched(Fetched::Body(response.body().to_vec()))),
@@ -277,11 +330,22 @@ pub fn get(url: &str, after: Option<u64>, wait: Duration) -> crate::Result<Answe
             response.header("etag").and_then(etag_seq),
         ))),
         404 => Ok(Answer::Fetched(Fetched::Missing)),
-        status if foreign_status(status) => Ok(Answer::Foreign(
-            refused("fetching", url, status, response.body()).0,
-        )),
-        status => Err(refused("fetching", url, status, response.body())),
+        status if foreign_status(status) => Ok(Answer::Foreign(failed(status).why.0)),
+        status => Err(failed(status)),
     }
+}
+
+/// Whether `error` is [`Unheard::held`]: aterm-http's resolver gives up on a lookup with no
+/// answer as `TimedOut` (a definite "no such name" is another kind), and a connect macOS
+/// refuses an app it has not let onto the LAN fails `HostUnreachable`.
+fn held(error: &aterm_http::Error) -> bool {
+    matches!(
+        error,
+        aterm_http::Error::Io(error) if matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::HostUnreachable
+        )
+    )
 }
 
 /// The seq an `ETag` names: `"<seq>"`, as the server sends it; anything else names none.
@@ -986,6 +1050,117 @@ mod tests {
             assert_eq!(fetched, Fetched::NoNewer(None), "{etag:?}");
             server.join().expect("stub");
         }
+    }
+
+    /// A lookup that got no answer and a host with no route are held: how macOS holds an app
+    /// it has not let onto the LAN. A refusal, a definite "no such name", no network at all, a
+    /// malformed reply and a request that cannot be made are not.
+    #[test]
+    fn only_a_lookup_with_no_answer_and_no_route_are_held() {
+        use std::io::ErrorKind;
+        let io = |kind, text: &str| aterm_http::Error::Io(std::io::Error::new(kind, text));
+        assert!(held(&io(
+            ErrorKind::TimedOut,
+            "dns: no answer within 8000ms"
+        )));
+        assert!(held(&io(ErrorKind::HostUnreachable, "No route to host")));
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+            ErrorKind::PermissionDenied,
+        ] {
+            let error = io(
+                kind,
+                "dns: alab-secrets.local: nodename nor servname provided",
+            );
+            assert!(!held(&error), "{kind:?}");
+        }
+        assert!(!held(&aterm_http::Error::Protocol("2x".into())));
+        assert!(!held(&aterm_http::Error::Invalid("no host".into())));
+        assert!(!held(&aterm_http::Error::TooLarge { limit: 1 }));
+    }
+
+    /// Over real sockets: a port nobody listens on and a server's `503` are not held, and a
+    /// server that takes the request and never answers is, once the request's deadline
+    /// (`wait` plus [`FETCH_MARGIN`]) passes.
+    #[test]
+    fn a_get_says_which_failures_are_held() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/v1/alab", closed.local_addr().expect("addr"));
+        drop(closed);
+        let refused =
+            get_bounded(&url, None, HANG_DETECTOR, Some(LOOK_CONNECT)).expect_err("no listener");
+        assert!(!refused.held, "{refused:?}");
+        assert!(
+            refused.why.0.starts_with(&format!("fetching {url}")),
+            "{refused:?}"
+        );
+
+        let (url, server) =
+            stub(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_vec());
+        let busy = get_bounded(&url, None, HANG_DETECTOR, Some(LOOK_CONNECT)).expect_err("503");
+        server.join().expect("stub");
+        assert!(!busy.held && busy.why.0.contains("503"), "{busy:?}");
+
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
+        let unanswered =
+            get_bounded(&url, None, Duration::ZERO, Some(LOOK_CONNECT)).expect_err("silent");
+        assert!(unanswered.held, "{unanswered:?}");
+        drop(silent);
+    }
+
+    /// A connector that answers every connect as a lookup macOS holds would, and keeps the
+    /// time its deadline left it.
+    #[derive(Debug, Default)]
+    struct HeldLookup {
+        left: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl aterm_http::Connect for HeldLookup {
+        fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            deadline: aterm_http::Deadline,
+        ) -> std::io::Result<std::net::TcpStream> {
+            let left = deadline.remaining().unwrap_or_default();
+            self.left.lock().expect("lock").push(left);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("dns: no answer within {}ms", left.as_millis()),
+            ))
+        }
+    }
+
+    /// A look's try gives its DNS lookup and connect [`LOOK_CONNECT`] of a much longer
+    /// request deadline, and a lookup that gets no answer in it is held. Negative control:
+    /// with no connect bound the lookup has the whole deadline.
+    #[test]
+    fn a_looks_lookup_and_connect_get_the_connect_bound_and_a_hung_one_is_held() {
+        let held = std::sync::Arc::new(HeldLookup::default());
+        let client =
+            client(HANG_DETECTOR.saturating_add(FETCH_MARGIN)).with_connector(held.clone());
+        let url = "http://alab-secrets.local:7484/v1/alab";
+        let bounded = get_via(&client, url, None, Some(LOOK_CONNECT)).expect_err("held lookup");
+        assert!(bounded.held, "{bounded:?}");
+        assert!(
+            bounded.why.0.starts_with(
+                "fetching http://alab-secrets.local:7484/v1/alab: dns: no answer within"
+            ),
+            "{bounded:?}"
+        );
+        let unbounded = get_via(&client, url, None, None).expect_err("held lookup");
+        assert!(unbounded.held, "{unbounded:?}");
+        let left = held.left.lock().expect("lock").clone();
+        assert_eq!(left.len(), 2);
+        assert!(left[0] <= LOOK_CONNECT, "{left:?}");
+        assert!(
+            left[1] > LOOK_CONNECT,
+            "the request's own deadline: {left:?}"
+        );
     }
 
     /// `text` with its last character changed to another bech32 one: a broken checksum.

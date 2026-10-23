@@ -271,6 +271,7 @@ impl TrickFlash {
         let mut rtl = false;
         for c in word.chars() {
             // The grid keeps a zero-width scalar on the previous cell, so it can
+            // never be found as a cell of its own.
             if aterm_grapheme::char_width(c) == 0 {
                 continue;
             }

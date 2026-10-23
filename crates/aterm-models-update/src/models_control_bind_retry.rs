@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bounded recovery after the handoff's one authorized endpoint retirement.
+//! Bounded recovery model after control-socket endpoint retirement.
 
 use aterm_spec::derive::Model;
 
-/// A transient bind failure may retry a vacant path. An occupied or unreadable
-/// path cannot enter a stale-path retry that might unlink another listener.
-/// Tier-1 drives the genuine retry loop with real native socket bindings.
+/// A transient bind failure may retry a vacant path.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_handoff_bind_retry_model() -> Model {
@@ -53,7 +51,6 @@ pub fn native_update_handoff_bind_retry_model() -> Model {
                 bound = 1;
             }
 
-            // Dial 2 retries and fails once past the limit.
             invariant BoundedAttempts: attempts <= Limit;
             invariant PreserveOccupiedEndpoint: retried_occupied == 0;
         }

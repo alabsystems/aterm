@@ -8,11 +8,9 @@ use super::*;
 use crate::process::child_pids;
 
 #[cfg(target_vendor = "apple")]
-/// A wait for something that must happen: a hang detector, never a latency budget.
 const MUST_HAPPEN: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(target_vendor = "apple")]
-/// Drain `watch` into `seen` until `done(seen)` holds, parking on its descriptor between drains.
 fn drain_until(
     watch: &mut ProcWatch,
     seen: &mut Vec<ProcEvent>,
@@ -33,7 +31,6 @@ fn drain_until(
     }
 }
 
-/// Wait up to 100 ms for `watch` to go readable.
 #[cfg(target_vendor = "apple")]
 fn park(watch: &ProcWatch) {
     let mut fds = [libc::pollfd {
@@ -45,7 +42,6 @@ fn park(watch: &ProcWatch) {
     unsafe { libc::poll(fds.as_mut_ptr(), 1, 100) };
 }
 
-/// A `/bin/sh` reading commands from a pipe: a shell the test types into.
 #[cfg(target_vendor = "apple")]
 struct Shell {
     child: crate::spawnfd::Child,
@@ -92,7 +88,6 @@ impl Drop for Shell {
     }
 }
 
-/// A fifo `name` in `dir`.
 #[cfg(target_vendor = "apple")]
 fn mkfifo(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let path = dir.join(name);
@@ -102,9 +97,6 @@ fn mkfifo(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     path
 }
 
-/// The write end of `fifo`, once a reader has its read end open: a nonblocking writer's open
-/// fails until then. A process that opens the fifo itself (`/bin/cat <fifo>`) is past its
-/// `exec` when this returns: only its new image opens it.
 #[cfg(target_vendor = "apple")]
 fn open_writer(fifo: &std::path::Path) -> std::os::fd::OwnedFd {
     use std::os::fd::FromRawFd as _;
@@ -126,7 +118,6 @@ fn open_writer(fifo: &std::path::Path) -> std::os::fd::OwnedFd {
     }
 }
 
-/// Write `line` to a fifo's write end.
 #[cfg(target_vendor = "apple")]
 fn release(gate: &std::os::fd::OwnedFd, line: &[u8]) {
     use std::os::fd::AsRawFd as _;
@@ -156,8 +147,6 @@ fn execs_of(seen: &[ProcEvent], pid: i32) -> usize {
         .count()
 }
 
-/// The shell's fork is a `Fork` naming the child, registered before its image is read, and the
-/// child's `exec` is an `Exec` (late when it beat the drain), with the child's own group.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_forked_child_is_watched_and_its_exec_reported() {
@@ -193,8 +182,6 @@ fn a_forked_child_is_watched_and_its_exec_reported() {
     });
 }
 
-/// Control: a forked child that never `exec`s (a subshell running a loop) is a `Fork` and never
-/// an `Exec`, and its flags say so.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_child_that_never_execs_is_no_exec() {
@@ -226,8 +213,6 @@ fn a_child_that_never_execs_is_no_exec() {
     );
 }
 
-/// `posix_spawn` (std's `Command` on Darwin) raises the parent's `NOTE_FORK`, and its child is
-/// found already exec'd: a late `Exec`.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn posix_spawn_raises_note_fork() {
@@ -274,8 +259,6 @@ fn posix_spawn_raises_note_fork() {
     println!("ALONE fork seen");
 }
 
-/// `follow` watches a holder that is no child of the shell: its `exec` is an event, and after
-/// `unfollow` it is not.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_followed_holder_reports_its_exec_until_unfollowed() {
@@ -305,10 +288,6 @@ fn a_followed_holder_reports_its_exec_until_unfollowed() {
     );
 }
 
-/// A new watch adopts the children the shell already has, with no event for their past: an
-/// adopted session's running job is watched from the start. The job is past its `exec` for
-/// certain (its new image opened a fifo, which only a running `cat` does), so no `NOTE_EXEC` is
-/// still in flight for the new knote to receive: the watch hears nothing until the job exits.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_new_watch_adopts_running_children_silently() {
@@ -337,9 +316,6 @@ fn a_new_watch_adopts_running_children_silently() {
     );
 }
 
-/// Past [`MAX_CHILDREN`] a fork is counted once and left unwatched (no `Fork`, no `Exec`), and
-/// `follow` watches it once it holds the terminal: its `exec` is then an event, not late (the
-/// subshell had not exec'd when it was followed).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_child_past_the_cap_is_counted_and_heard_only_once_followed() {
@@ -406,22 +382,18 @@ fn a_child_past_the_cap_is_counted_and_heard_only_once_followed() {
     assert_eq!(watch.overflow(), 1, "counted once");
 }
 
-/// Off Darwin there is no exec event: the reader runs its byte-driven arm.
 #[cfg(not(target_vendor = "apple"))]
 #[test]
 fn no_watch_off_darwin() {
     assert!(ProcWatch::new(i32::try_from(std::process::id()).expect("pid")).is_none());
 }
 
-/// A gone shell is no watch.
 #[test]
 fn a_gone_shell_is_no_watch() {
     assert!(ProcWatch::new(1).is_none());
     assert!(ProcWatch::new(0).is_none());
 }
 
-/// The scripted watch hands out what was posted, in order, and its descriptor reads readable
-/// exactly while something is queued.
 #[test]
 fn a_scripted_watch_hands_out_what_was_posted() {
     let (mut watch, script) = ProcWatch::scripted(4100).expect("pipe");
@@ -455,7 +427,6 @@ fn a_scripted_watch_hands_out_what_was_posted() {
     assert_eq!(script.drains(), 1);
 }
 
-/// One call the bookkeeping made of its kernel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
     Register(Vec<i32>),
@@ -463,8 +434,6 @@ enum Call {
     Info(i32),
 }
 
-/// A scripted [`Kernel`]: every call logged in order; every process alive, its group its own
-/// pid, and exec'd when `execed` names it.
 #[derive(Default)]
 struct Scripted {
     calls: Vec<Call>,
@@ -491,7 +460,6 @@ impl Kernel for Scripted {
 }
 
 impl Scripted {
-    /// Each process whose image was read, read only after a registration that named it.
     fn read_after_registered(&self) -> Result<(), String> {
         for (at, call) in self.calls.iter().enumerate() {
             if let Call::Info(pid) = call
@@ -509,9 +477,6 @@ impl Scripted {
     }
 }
 
-/// REGISTER FIRST (§3.3): a fork's children, an adopted child and a followed holder are each
-/// registered before their image is read, so an `exec` after the read is a kernel event; one
-/// found exec'd is reported (a fork's) and stays `late` until its first kernel `exec`.
 #[test]
 fn every_process_is_registered_before_its_image_is_read() {
     let mut kernel = Scripted {
@@ -549,9 +514,6 @@ fn every_process_is_registered_before_its_image_is_read() {
     assert!(!tracked.take_late(100) && !tracked.take_late(201));
 }
 
-/// THE CAP: past [`MAX_CHILDREN`] a child is counted once and left unwatched, however many
-/// forks list it; one gone from the table is forgotten; an exit makes room for the next fork's
-/// child. A followed holder or a tracked child is not registered again.
 #[test]
 fn a_child_past_the_cap_counts_once_and_an_exit_makes_room() {
     let mut kernel = Scripted::default();

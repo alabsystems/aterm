@@ -1366,6 +1366,8 @@ mod unix {
             },
         )
         .inspect_err(|_| {
+            // Cut off after it saved the source (the server gone before the request was
+            // queued), the join leaves this Mac waiting with its request due at once: the
             // subscriber that makes it goes in now, as once a request is queued.
             if client::config(paths)
                 .ok()

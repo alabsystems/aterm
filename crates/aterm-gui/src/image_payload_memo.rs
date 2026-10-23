@@ -64,7 +64,7 @@ impl ImagePayload {
     }
 
     /// `png`, `rgba`, `unknown`, or `truncated` past the F4 cap.
-    pub(crate) fn format(&self) -> &'static str {
+    pub(crate) const fn format(&self) -> &'static str {
         self.format
     }
 

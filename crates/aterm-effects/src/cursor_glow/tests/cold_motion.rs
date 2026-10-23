@@ -5,10 +5,6 @@
 
 use super::*;
 
-/// A cold cursor delta (a token streamer's one-cell step, a spinner/TUI warp)
-/// emits no light in any channel, in every selectable style. Asserts presented
-/// output (frame fingerprint plus the six accessor planes the compositor
-/// copies), not just empty jump pools.
 #[test]
 fn cold_program_motion_emits_no_rainbow_light() {
     let g = geom();
@@ -29,8 +25,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
         let mut glow = CursorGlow::default();
         assert_eq!(glow.tick(Some((0, 0)), t0, &c, g, &mut out), 0);
         assert!(!frame_has_output(&out, &glow));
-        // A one-cell output stream followed by repeated cold spinner
-        // warps; no key, Return or reflow gesture licenses any of them.
         let mut t = t0;
         for &(cr, cc) in &[(0u16, 1u16), (3, 30), (0, 5), (4, 35), (1, 12), (5, 20)] {
             t += Duration::from_millis(120);
@@ -63,8 +57,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
                 !glow.is_active(),
                 "{style:?}: a dark program move must stay idle"
             );
-            // No thermal either: the integrators earned-drama consumers
-            // read stay at rest.
             assert_eq!(
                 [glow.heat, glow.coal, glow.flare, glow.quench,],
                 [0.0f32; 4],
@@ -100,10 +92,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
         glow.tick(Some((cr, cc)), t, &c, g, &mut out);
     }
 
-    // A far hidden->visible relocation is outside the bounded ConPTY
-    // bridge, so `spawn` never runs; its declined Return/Tab-paste licence
-    // must still be consumed there, or the next one-cell program update
-    // borrows it.
     for arm in [
         CursorGlow::note_typed as fn(&mut CursorGlow, Instant),
         CursorGlow::note_return as fn(&mut CursorGlow, Instant),
@@ -148,9 +136,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
         assert!(!frame_has_output(&out, &hidden));
     }
 
-    // A same-cell hidden completion never enters `spawn`, but it closes the
-    // hide/echo choreography: the one-shot classes (Return, Tab/paste) are
-    // consumed so the following cold CUP move cannot borrow them.
     for arm in [
         CursorGlow::note_return as fn(&mut CursorGlow, Instant),
         CursorGlow::note_user_gesture,
@@ -178,11 +163,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
         assert!(!frame_has_output(&out, &hidden));
     }
 
-    // Banked typed stamps are per-press licenses whose echoes may land after
-    // the bracket completes (a TUI hides inside DEC-2026 per keystroke). A
-    // fresh stamp survives a same-cell completion and licenses exactly the
-    // one echo it was banked for; stale stamps are retired (see
-    // `hidden_boundary_spares_fresh_typed_stamps_and_retires_stale`).
     {
         let mut hidden = CursorGlow::default();
         hidden.tick(Some((2, 4)), t0, &c, g, &mut out);
@@ -201,8 +181,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
             1,
             "the surviving stamp licenses exactly the echo it was banked for"
         );
-        // Only that echo: the bank is spent, so the next cold move finds no
-        // license.
         let cold = hidden.tick(Some((2, 9)), t0 + Duration::from_millis(5), &c, g, &mut out);
         let _ = cold;
         assert_eq!(
@@ -212,9 +190,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
         );
     }
 
-    // A fresh/reset engine has no source anchor for a landing that completed
-    // before its first visible sample, so the seed tick consumes every class
-    // dark; otherwise the next cold CUP could borrow that witness.
     for reset_first in [false, true] {
         for arm in [
             CursorGlow::note_typed as fn(&mut CursorGlow, Instant),
@@ -262,9 +237,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
             assert!(!frame_has_output(&out, &unseeded));
         }
     }
-    // Tier 1: a hidden->visible completion that reaches no `spawn` decision
-    // consumes every class without licensing anything (the licence model's
-    // swallow disposition); a surviving stamp is the control.
     let hidden_model = aterm_models_effects::cursor_hint_license_model();
     let mut hidden_source = hidden_model.init_state();
     hidden_source.insert("hint", 1);
@@ -296,8 +268,6 @@ fn cold_program_motion_emits_no_rainbow_light() {
     assert!(!ok, "a declined hidden glow hint must not survive");
 }
 
-/// Explicit preview candidates light visible output; every timestamp-only
-/// classifier stays dark.
 #[test]
 fn synthetic_rainbow_moves_are_visible_and_cold_output_stays_dark() {
     let g = geom();
@@ -335,9 +305,6 @@ fn synthetic_rainbow_moves_are_visible_and_cold_output_stays_dark() {
         );
     }
 
-    // Every key class past its own freshness window is inert: the same warp
-    // with a 0.6 s-old stamp is program output. `reflow` is not a license
-    // term (a resize is not a keypress), so it stays dark even while fresh.
     type Arm = fn(&mut CursorGlow, Instant);
     let stale: [(&str, Arm); 6] = [
         ("typed", CursorGlow::note_typed),
@@ -372,8 +339,6 @@ fn synthetic_rainbow_moves_are_visible_and_cold_output_stays_dark() {
     }
 }
 
-/// The universal candidate gate is style-blind: a reflow timestamp cannot
-/// birth a streak in any built-in style.
 #[test]
 fn every_style_keeps_a_timestamp_only_relayout_dark() {
     let g = geom();
@@ -403,15 +368,9 @@ fn every_style_keeps_a_timestamp_only_relayout_dark() {
     }
 }
 
-/// The rainbow ribbon drains without a visible step: walking a typing run out
-/// at 60 fps, no frame removes a cell still carrying body coverage, nor more
-/// than one cell at once. Measured per cell, so the bar is independent of how
-/// brightness is distributed along the ribbon.
 #[test]
 fn rainbow_ribbon_vanishes_without_a_visible_step() {
     let g = geom();
-    // Both presentations ride the same drain (swoosh schedule, retract fade,
-    // envelopes) and are measured on the same scale.
     let drain = |tall: bool| -> (i64, i64, u32, usize) {
         let mut c = cfg(GlowStyle::RainbowKitty, true);
         c.ribbon_tall = tall;
@@ -426,12 +385,6 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
             glow.tick(Some((2, 4 + i)), t, &c, g, &mut out);
         }
 
-        // Ribbon light per cell, keeping each cell's brightest coverage: a
-        // cell still carrying visible coverage may not be absent on the next
-        // frame. Keyed by column, not (row, column): the underline strip
-        // straddles two text rows, so a (row, col) key would count each
-        // retirement twice. The caret cell (col 14) carries the head's
-        // attach and leaves with the head, not as a separate cell.
         let lit_by_cell = |glow: &CursorGlow| -> std::collections::BTreeMap<u16, u32> {
             let mut per_cell: std::collections::BTreeMap<u16, u32> =
                 std::collections::BTreeMap::new();
@@ -469,9 +422,6 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
             let cells = lit_by_cell(&glow);
             let total = lit(&glow);
             peak = peak.max(total);
-            // The brightest cell this frame made vanish, and how many went
-            // at once. An easing drain answers "one, already spent"; a
-            // deleting drain or a cliff answers with full body coverage.
             let mut gone = 0usize;
             for (cell, cov) in &prev_cells {
                 if !cells.contains_key(cell) {
@@ -493,11 +443,8 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
         (peak, prev, worst, most_gone)
     };
 
-    // The bar, in coverage: a ribbon cell's body is well above it, and a
-    // deleting drain removes cells at body coverage.
     const SPENT: u32 = 34;
 
-    // Classic tall body.
     let (peak, end, worst, most_gone) = drain(true);
     assert!(
         peak > 10_000,
@@ -515,9 +462,6 @@ fn rainbow_ribbon_vanishes_without_a_visible_step() {
          {most_gone} went in one frame"
     );
 
-    // Explicit underline strip: the same drain and the same bar; per-cell
-    // coverage does not depend on how many rows a presentation spreads its
-    // light over.
     let (peak, end, worst, most_gone) = drain(false);
     assert!(
         peak > 10_000,

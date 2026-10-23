@@ -283,7 +283,7 @@ impl StartupAttachMilestones {
 
     /// The two stamps that bracket `backend_finalize_ns` — the join entry and
     /// the join exit.
-    fn backend_finalize_bounds(self) -> (Instant, Instant) {
+    const fn backend_finalize_bounds(self) -> (Instant, Instant) {
         let [
             _,
             _,
@@ -1145,6 +1145,7 @@ fn read_gpu_probe() -> StartupGpuSample {
 /// measurement of the same call (`gpu_build_ns`).
 fn close_startup_gpu(sample: StartupGpuSample, gpu_build_ns: u64) -> StartupGpuSample {
     // A zero slot is the probe's UNSET sentinel (a recorded leg floors at 1 ns),
+    // so any zero here means this process never took the GPU path.
     if [
         sample.instance_ns,
         sample.adapter_ns,

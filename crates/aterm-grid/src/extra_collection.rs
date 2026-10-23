@@ -538,6 +538,9 @@ trait RingSpans {
 
     /// Scroll up by `n` rows: recycle the top `n` rows by clearing them.
     fn scroll_up(&mut self, n: u16) {
+        // Over-scroll: when the whole visible area (or more) scrolls off, the
+        // ring is fully recycled and the offset resets to 0. `ring_row` only
+        // normalizes inputs < 2*visible_rows, so a huge `n` (e.g. `CSI 65535 S`)
         // would otherwise leave `ring_offset >= visible_rows`.
         if n >= self.visible_rows() {
             self.clear();
@@ -1076,6 +1079,7 @@ impl CellExtras {
     pub fn set(&mut self, coord: CellCoord, extra: CellExtra) {
         let internal = self.internal_coord(coord);
         if extra.has_data() {
+            // Charge only for a value that carries a link: reflow and DECCRA's
             // rect copy also store link-free extras here.
             if extra.hyperlink().is_some() {
                 self.hyperlink_upper_bound += 1;
@@ -1134,6 +1138,7 @@ impl CellExtras {
 
     /// Clear extras for a single row (cleared or scrolled off), including the RGB ring.
     pub(crate) fn clear_row(&mut self, row: u16) {
+        // The RGB ring first: RGB-only writes bypass the map, so it may hold
         // data even when the map is empty.
         if let Some(ring) = &mut self.rgb_ring {
             ring.clear_row(row);
@@ -1589,6 +1594,8 @@ impl CellExtras {
     /// Enforce the hyperlink entry limit (bounding memory under OSC 8 spam): when the population may exceed [`MAX_HYPERLINK_ENTRIES`], drop the links of the oldest entries (lowest internal rows).
     #[inline]
     pub fn enforce_hyperlink_limit(&mut self) {
+        // Two sound upper bounds on the hyperlink population; either proving
+        // "under budget" skips the cold walk. `data.len()` caps the counter's
         // over-charge (`get_or_create` charges every link-free handout).
         if self.hyperlink_upper_bound <= MAX_HYPERLINK_ENTRIES
             || self.data.len() <= MAX_HYPERLINK_ENTRIES

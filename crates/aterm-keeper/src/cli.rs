@@ -2,9 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm keeper serve|status|start|stop`, the verbs `crates/aterm` routes here.
-//!
-//! `start` submits a keeper as a transient `launchctl submit` job, `stop` removes it, `serve` is
-//! what the job runs, and `status` asks one what it holds. Nothing starts a keeper by itself.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -61,7 +58,6 @@ keeper answers (start, status) or has ended (stop), 1 if not, 2 on bad usage.
 
 struct Args {
     verb: String,
-    // Read by the verbs only unix builds implement.
     #[cfg_attr(not(unix), allow(dead_code))]
     sock: Option<PathBuf>,
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -103,9 +99,7 @@ fn parse(args: &[OsString]) -> Result<Args, String> {
     })
 }
 
-/// Whether `start`/`stop` may touch `label`: this build's own, or a test
-/// label. Never another build's (a dev tree cannot remove the installed
-/// app's keeper, nor the installed app a dev tree's).
+/// Whether `start`/`stop` may touch `label`: this build's own, or a test label.
 #[must_use]
 pub fn label_is_ours(label: &str, own: &str) -> bool {
     label == own
@@ -114,9 +108,7 @@ pub fn label_is_ours(label: &str, own: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.') && rest.len() > 1)
 }
 
-/// `aterm keeper <args>`. `version`: the running build's version, which a
-/// served keeper reports (WELCOME, status) and a status client says at HELLO —
-/// the binary's, handed in because this crate links nothing that knows it.
+/// `aterm keeper <args>`.
 #[must_use]
 pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
     let first = args.first().map(|a| a.to_string_lossy().into_owned());
@@ -127,8 +119,6 @@ pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
             if first.is_none() { 2 } else { 0 },
         );
     }
-    // A runtime test, not a `cfg`, so the Unix verbs stay compiled (and
-    // linted) on Linux, where launchd and code identity do not exist.
     if !cfg!(target_vendor = "apple") {
         eprintln!("{MACOS_ONLY}");
         return ExitCode::FAILURE;
@@ -152,7 +142,6 @@ pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
     }
 }
 
-/// What every verb says off macOS.
 const MACOS_ONLY: &str = "aterm keeper: macOS only";
 
 #[cfg(unix)]
@@ -169,12 +158,8 @@ fn serve(args: &Args, version: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Sweep the copies of code that ended keepers (a crash, a logout) left. A keeper whose peers
-    // check its code then runs from its own copy, so an update that deletes its build leaves it
-    // checkable; `run_from_own_copy` returns only when it could not.
     let code = crate::code::code_dir();
     let own_copy = code.as_deref().and_then(crate::code::own_copy);
-    // First thing from a copy: its exec is over, so a sweep may remove it once this keeper ends.
     if let Some(copy) = &own_copy {
         crate::code::mark_ran(copy);
     }
@@ -194,14 +179,12 @@ fn serve(args: &Args, version: &str) -> ExitCode {
         );
     }
     let exit = serve_as(args, identity, exe.as_deref(), version);
-    // Nothing checks this keeper once it stops serving: its copy goes with it.
     if let Some(copy) = own_copy {
         let _ = std::fs::remove_dir_all(copy);
     }
     exit
 }
 
-/// Serve as the keeper of `exe`, the executable it was started as.
 #[cfg(unix)]
 fn serve_as(
     args: &Args,
@@ -209,8 +192,6 @@ fn serve_as(
     exe: Option<&std::path::Path>,
     version: &str,
 ) -> ExitCode {
-    // The socket, label and relaunch bundle are the build's it was started
-    // as, never its copy's.
     let Some(socket) = args
         .sock
         .clone()
@@ -252,8 +233,6 @@ fn serve_as(
     }
 }
 
-// Off Unix only these stubs exist, and `main_entry` answers `macOS only`
-// before it reaches them.
 #[cfg(not(unix))]
 fn serve(_args: &Args, _version: &str) -> ExitCode {
     eprintln!("{MACOS_ONLY}");
@@ -278,7 +257,6 @@ fn stop(_args: &Args, _version: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// The label `start`/`stop` act on: `--label`, checked, else this build's.
 #[cfg(unix)]
 fn chosen_label(args: &Args, verb: &str) -> Result<String, ExitCode> {
     let own = crate::job::own_place().label;
@@ -296,15 +274,11 @@ fn chosen_label(args: &Args, verb: &str) -> Result<String, ExitCode> {
     }
 }
 
-/// Why a dial of the socket reached no keeper of this build's.
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum NoKeeper {
-    /// A keeper answered and failed this build's identity check.
     NotOurs,
-    /// Nothing answers: no socket there, or a stale one.
     Nothing,
-    /// The dial or the exchange failed another way; why.
     Failed(String),
 }
 
@@ -324,7 +298,6 @@ impl NoKeeper {
     }
 }
 
-/// Ask the keeper on `socket` for its status, as a client of build `version`.
 #[cfg(unix)]
 fn ask(socket: &std::path::Path, identity: &Identity, version: &str) -> Result<String, NoKeeper> {
     crate::client::KeeperClient::connect(socket, identity, Duration::from_secs(2))
@@ -332,7 +305,6 @@ fn ask(socket: &std::path::Path, identity: &Identity, version: &str) -> Result<S
         .map_err(|e| NoKeeper::of(&e))
 }
 
-/// launchd's word on a job, as the verbs print it after `job=`.
 #[cfg(unix)]
 fn job_words(job: &crate::job::JobState) -> String {
     match job {
@@ -342,17 +314,9 @@ fn job_words(job: &crate::job::JobState) -> String {
     }
 }
 
-/// A refused keeper and its remedy, offered only when a bare `stop` and
-/// `start` act on its label and socket (this build's own).
 #[cfg(unix)]
 const REPLACE: &str = "(not this build's keeper); aterm keeper stop, then aterm keeper start";
 
-/// What `start` prints instead of submitting — a job is loaded under the
-/// label, or a keeper already answers on the socket — and whether that is
-/// success. `None`: submit. `log` is the job's log when it exists.
-/// `own_place`: the label and the socket are this build's own, so the job's
-/// pid is the keeper's and a bare `stop` and `start` act on them; otherwise
-/// the job is named apart from what answers.
 #[cfg(unix)]
 fn start_without_submit(
     label: &str,
@@ -375,8 +339,6 @@ fn start_without_submit(
                 true,
             ));
         }
-        // A loaded job that runs nothing is not what answers: the next arm
-        // names it `job=loaded`, never `pid=-` as the keeper's.
         (JobState::Loaded { pid: Some(pid) }, Ok(_)) if own_place => {
             return Some((
                 format!("keeper=running label={label} pid={pid} socket={at}"),
@@ -420,9 +382,6 @@ fn start_without_submit(
     Some((line, false))
 }
 
-/// `status`'s first line when no keeper of this build's answered.
-/// `replaceable`: the socket is this build's own and launchd runs this
-/// build's job now, so a bare `stop` and `start` replace what answers.
 #[cfg(unix)]
 fn status_miss_line(socket: &std::path::Path, miss: &NoKeeper, replaceable: bool) -> String {
     let at = socket.display();
@@ -434,9 +393,6 @@ fn status_miss_line(socket: &std::path::Path, miss: &NoKeeper, replaceable: bool
     }
 }
 
-/// Empty the job's log (0600), making its directory (0700) if missing:
-/// launchd opens the log before the keeper runs, and what it then holds is
-/// this job's alone.
 #[cfg(unix)]
 fn fresh_log(log: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -498,8 +454,6 @@ fn start(args: &Args, version: &str) -> ExitCode {
             ExitCode::FAILURE
         };
     }
-    // The socket is resolved in the caller's environment and passed as `--sock`: a launchd job's
-    // `$TMPDIR` and `$XDG_RUNTIME_DIR` are not the caller's. Its directory is made now (the log).
     if let Err(e) = fresh_log(&log) {
         eprintln!("aterm keeper start: {}: {e}", log.display());
         return ExitCode::FAILURE;
@@ -523,7 +477,6 @@ fn start(args: &Args, version: &str) -> ExitCode {
         eprintln!("aterm keeper start: {e}");
         return ExitCode::FAILURE;
     }
-    // launchd starts the job asynchronously: wait (bounded) for it to answer.
     let started = std::time::Instant::now();
     while started.elapsed() < Duration::from_secs(10) {
         if ask(&socket, &own, version).is_ok() {
@@ -540,8 +493,6 @@ fn start(args: &Args, version: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// How long `stop` waits for the keeper to end after `launchctl remove`: a hang detector, not a
-/// budget (launchd SIGKILLs a submitted job that outlives its SIGTERM; measured 5 s).
 #[cfg(unix)]
 const STOP_WAIT: Duration = Duration::from_secs(60);
 
@@ -553,8 +504,6 @@ fn stop(args: &Args, version: &str) -> ExitCode {
     };
     let exit = match crate::job::state(&label) {
         Ok(crate::job::JobState::Absent) => {
-            // A keeper this build's socket still answers is one `stop` cannot
-            // end: say it runs rather than report the job alone.
             let answering = (label == crate::job::own_place().label)
                 .then(default_socket)
                 .flatten()
@@ -575,8 +524,6 @@ fn stop(args: &Args, version: &str) -> ExitCode {
             }
         }
         Ok(crate::job::JobState::Loaded { pid }) => {
-            // Which process the job runs, read before it ends, so its end is
-            // told from a reused pid.
             let running = pid.and_then(|pid| crate::server::born(pid).map(|b| (pid, b)));
             match crate::job::remove(&label) {
                 Ok(()) => match running {
@@ -602,17 +549,12 @@ fn stop(args: &Args, version: &str) -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    // The ended keeper's copy of its code goes now, with any a crash or a logout left; a live
-    // keeper's copy is kept.
     if let Some(dir) = crate::code::code_dir() {
         crate::code::sweep(&dir, crate::server::born);
     }
     exit
 }
 
-/// `stop`'s line when launchd has no job under `label`, and whether that is
-/// success. `answering`: the socket on which a keeper of this build's still
-/// answers, with the pid its status named, when one does.
 #[cfg(unix)]
 fn stop_absent_line(
     label: &str,
@@ -632,8 +574,6 @@ fn stop_absent_line(
     }
 }
 
-/// The `pid=` field of a keeper's status text ([`crate::server`]'s
-/// `status_text`), when it names one.
 #[cfg(unix)]
 fn status_pid(status: &str) -> Option<u32> {
     status
@@ -642,7 +582,6 @@ fn status_pid(status: &str) -> Option<u32> {
         .and_then(|pid| pid.parse().ok())
 }
 
-/// `stop`'s line when the job is removed but its keeper outlived the wait.
 #[cfg(unix)]
 fn still_running_line(label: &str, pid: u32) -> String {
     format!(
@@ -651,8 +590,6 @@ fn still_running_line(label: &str, pid: u32) -> String {
     )
 }
 
-/// Wait up to `wait` until `pid` is no longer the process born at `birth`;
-/// whether it ended.
 #[cfg(unix)]
 fn await_end(
     pid: u32,
@@ -679,8 +616,6 @@ fn status(args: &Args, version: &str) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let job = crate::job::state(&place.label);
-    // `stop` and `start` act on this build's job and socket: the remedy is
-    // offered only for that socket.
     let replaceable = own_socket.as_ref() == Some(&socket)
         && matches!(job, Ok(crate::job::JobState::Loaded { pid: Some(_) }));
     let job = match job {
@@ -712,8 +647,6 @@ fn status(args: &Args, version: &str) -> ExitCode {
 mod tests {
     use super::*;
 
-    /// Only a failed identity check is `NotOurs`; no socket or a stale one is `Nothing`;
-    /// anything else keeps its words.
     #[cfg(unix)]
     #[test]
     fn a_dial_error_is_read_as_what_it_is() {
@@ -739,8 +672,6 @@ mod tests {
         );
     }
 
-    /// `stop` says `keeper=stopped` only when the keeper ended, and a keeper
-    /// that still answers with no job is named running, never `job=absent`.
     #[cfg(unix)]
     #[test]
     fn stop_says_stopped_only_when_the_keeper_ended() {
@@ -784,10 +715,6 @@ mod tests {
         assert_eq!(status_pid("keeper=running\nsocket=/p/k.sock"), None);
     }
 
-    /// `start` submits only when no job is loaded and nothing answers, and says `keeper=running`
-    /// only when this build's keeper answered, never from launchd's word alone (a job that
-    /// restarts every 10 s is loaded). Only for this build's own label and socket is the job's pid
-    /// the keeper's, and a refused keeper offered `stop` then `start`.
     #[cfg(unix)]
     #[test]
     fn start_says_running_only_when_this_builds_keeper_answers() {
@@ -911,9 +838,6 @@ mod tests {
         );
     }
 
-    /// `status` says `keeper=absent` only when nothing answered; a keeper
-    /// that answered but is not this build's is `keeper=refused`, with the
-    /// replacement when the socket is this build's and its job runs.
     #[cfg(unix)]
     #[test]
     fn status_tells_a_refused_keeper_from_an_absent_one() {

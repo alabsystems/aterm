@@ -502,6 +502,9 @@ fn protected_path(text: &str) -> Option<String> {
     }
     for shape in ["/Volumes", "Library/Containers", "Library/CloudStorage"] {
         // `/System/Volumes/<volume>` is where macOS mounts its own volumes (the
+        // firmlinks point into `/System/Volumes/Data`), not the protected
+        // `/Volumes`; that folder spelled on the data volume
+        // (`/System/Volumes/Data/Volumes`) still counts.
         if text
             .match_indices(shape)
             .any(|(at, _)| shape != "/Volumes" || !text[..at].ends_with("/System"))

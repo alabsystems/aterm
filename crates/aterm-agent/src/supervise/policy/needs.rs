@@ -376,7 +376,7 @@ const NONE_WORDS: NoneWords<'static> = NoneWords {
 
 /// The marks that end a clause of a none line ([`none_said`]): `nothing —
 /// everything is on main`, `none; all of it is merged`, `nothing (all
-/// landed)`, `none.
+/// landed)`, `none. Everything is on main.`
 const NONE_CLAUSE_MARKS: &[char] = &[
     '—', '–', ';', ':', ',', '(', ')', '[', ']', '.', '!', '?', '{', '}',
 ];
@@ -581,7 +581,7 @@ fn your_head(rest: &str) -> Option<&str> {
 
 /// What a NEEDS YOU head's token runs into ([`head_from`]): a separator
 /// (`:`, `—`, `–`, `--`, `...`, `…`, `-` before a space, an arrow `→`, `->`
-/// or `=>`), and in capitals a `!`, `;` or `?` too (`NEEDS YOU?
+/// or `=>`), and in capitals a `!`, `;` or `?` too (`NEEDS YOU? Yes: renew the cert`).
 fn need_separator(rest: &str, capitals: bool) -> Option<&str> {
     rest.strip_prefix("--")
         .or_else(|| rest.strip_prefix("..."))
@@ -1048,7 +1048,9 @@ struct NeedLines {
     /// rows), by index.
     lines: Vec<usize>,
     /// The lines a head opens past their start ([`mid_head`]: `Nothing
-    /// left: all on origin/main.
+    /// left: all on origin/main. NEEDS YOU: none`), by index, each with
+    /// where its head starts: the words before it stay every other
+    /// reader's.
     cuts: Vec<(usize, usize)>,
     /// Each need's words as written, wrapped rows joined.
     needs: Vec<String>,
@@ -1121,7 +1123,12 @@ const MID_QUOTES: &[char] = &['"', '“', '‘', '\''];
 /// A NEEDS YOU HEAD PAST THE START OF `row` (FAIL TOWARD A KEPT NEED): the
 /// token in capitals ([`needs_token`]: `NEEDS YOU`, `NEED YOU`) as a whole
 /// word anywhere on the row — after a sentence of its own (`Nothing left:
-/// all on origin/main.
+/// all on origin/main. NEEDS YOU: publish the crate`), inside one (`One
+/// thing NEEDS YOU: the promote`, `- release: NEEDS YOU: sign 3.4.0`,
+/// `Nothing left (NEEDS YOU: the grant)`), in ticks or quotation marks, in a
+/// quoted line — where a separator, a qualifier or a comma follows it, past
+/// its closing marks; [`head_from`] reads the rest, and drops the one
+/// mention (`the primer says a NEEDS YOU: line reaches the person`).
 fn mid_head<'a>(row: &'a str, above: &str) -> Option<(usize, &'a str)> {
     if unquoted(row).starts_with('⎿') {
         return None;

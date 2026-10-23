@@ -978,6 +978,7 @@ unsafe extern "system" fn aterm_subclass_wndproc(
     wparam: usize,
     lparam: isize,
 ) -> isize {
+    // UIA requests are sent messages too. Serve the retained publication from
     // this existing chain; the provider never re-enters the live App.
     if msg == WM_GETOBJECT
         && let Some(result) = aterm_a11y::uia::handle_wm_getobject(hwnd, wparam, lparam)

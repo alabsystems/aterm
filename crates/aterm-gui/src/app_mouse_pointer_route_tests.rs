@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a pointer report goes, read off each program's own wire: the pane under the pointer for
-//! a gesture that begins nothing, the session a press went to for its drag and release, one
-//! report per position, and the lowest held button of a chord.
+//! Pointer-report routing tests across panes, tabs, native views, and button chords.
 
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::UnixStream;
@@ -18,8 +16,7 @@ use super::PointerRoute;
 use crate::input::{InputEvent, PasteFraming, PixelOffset, Source};
 use crate::{App, WindowId, pane, term_lock};
 
-/// A private observer of one session's PTY input: the read end, and a sink
-/// writing into the other end.
+/// Private observer of one session's PTY input (`(reader, sink)`).
 fn observer() -> (UnixStream, Arc<SinkWriter>) {
     let (reader, writer) = UnixStream::pair().expect("private input observer");
     reader.set_nonblocking(true).unwrap();
@@ -41,10 +38,7 @@ fn drain(reader: &mut UnixStream) -> String {
     String::from_utf8(out).expect("SGR reports are ASCII")
 }
 
-/// Everything `session`'s program was sent before a marker pasted to it now.
-/// A paste reaches the PTY through that session's one ordered writer, so the
-/// marker lands after any paste already queued there: a paste that went to
-/// this program is in the text, and one that did not cannot arrive later.
+/// Reads everything sent to `session` before a marker paste queued now.
 fn written_before_marker(
     app: &mut App,
     wid: WindowId,
@@ -59,7 +53,6 @@ fn written_before_marker(
         Some(session),
         crate::app_input::PressPhase::Initial,
     );
-    // A hang detector, not a latency budget.
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen = String::new();
     loop {
@@ -91,8 +84,7 @@ fn click(app: &mut App, wid: WindowId, button: MouseButton) {
     app.on_mouse_input(wid, ElementState::Released, button);
 }
 
-/// Two stacked panes, each writing to its own observer: `top` (session 0) and
-/// the focused `bottom`, both tracking any motion in SGR (`?1003h?1006h`).
+/// Two stacked panes (`top` and focused `bottom`), both tracking any motion in SGR (`?1003h?1006h`).
 struct Stacked {
     app: App,
     wid: WindowId,
@@ -137,9 +129,7 @@ fn window_cell(app: &App, wid: WindowId, session: u64, (row, col): (u16, u16)) -
     (ro + row, co + col)
 }
 
-/// Hover, the wheel and the right, middle and thumb buttons over the pane that does not have
-/// focus reach that pane's program at its own cell, never the focused pane's at a row clamped
-/// onto its top edge.
+/// Hover, wheel, and non-left clicks over an unfocused pane reach that pane's program at its own cell.
 #[test]
 fn a_pointer_over_an_unfocused_pane_reaches_that_panes_program_at_its_own_cell() {
     let mut f = stacked();
@@ -180,7 +170,6 @@ fn a_pointer_over_an_unfocused_pane_reaches_that_panes_program_at_its_own_cell()
     );
     assert_eq!(app.windows[&wid].reported_buttons, 0);
 
-    // Negative control: over the focused pane the focused pane's program is the one addressed.
     let over_bottom = window_cell(app, wid, f.bottom, (2, 3));
     move_to(app, wid, over_bottom, 0.0);
     click(app, wid, MouseButton::Right);
@@ -191,9 +180,7 @@ fn a_pointer_over_an_unfocused_pane_reaches_that_panes_program_at_its_own_cell()
     assert_eq!(drain(&mut f.top_wire), "");
 }
 
-/// Side by side, the unfocused right pane's report is at its own column: the window cell less
-/// the pane's column origin as well as its row origin (the stacked fixture has no column offset
-/// to get wrong).
+/// An unfocused side-by-side pane reports coordinates relative to its own column and row origin.
 #[test]
 fn a_pointer_over_an_unfocused_pane_beside_the_focused_one_reports_its_own_column() {
     let (mut left_wire, left_sink) = observer();
@@ -287,7 +274,6 @@ fn a_glide_on_the_unfocused_pane_survives_typing_in_the_focused_one() {
     assert!(glide_on_top(app), "a key in the bottom pane keeps it");
     app.snap_to_bottom(wid);
     assert!(glide_on_top(app), "the bottom pane's snap to live keeps it");
-    // Control: the front pane's own glide is still dropped.
     let bottom_term = app.pool.get(f.bottom).unwrap().term.clone();
     let over_bottom = window_cell(app, wid, f.bottom, (4, 5));
     move_to(app, wid, over_bottom, 0.0);
@@ -322,14 +308,12 @@ fn a_pointer_over_a_native_sibling_addresses_no_terminal() {
     let cell = (rect.origin.y as u16 + 2, rect.origin.x as u16 + 2);
     move_to(&mut app, wid, cell, 0.0);
     assert_eq!(app.pointer_route(wid, None), PointerRoute::Nowhere);
-    // …and over the focused terminal it is the front.
     let (ro, co, ..) = app.focused_pane_rect(wid);
     move_to(&mut app, wid, (ro + 1, co + 1), 0.0);
     assert_eq!(app.pointer_route(wid, None), PointerRoute::Front);
 }
 
-/// A press's drag and release follow the session it went to when the keyboard moves focus to
-/// the other pane mid-drag; the newly focused pane never saw the press.
+/// A held button's drag and release stay with the pressed pane across a keyboard focus move.
 #[test]
 fn a_held_buttons_drag_and_release_stay_with_its_pane_across_a_focus_move() {
     let mut f = stacked();
@@ -351,9 +335,7 @@ fn a_held_buttons_drag_and_release_stay_with_its_pane_across_a_focus_move() {
     assert_eq!(app.windows[&wid].reported_buttons, 0);
 }
 
-/// A tab switch with a reported button held writes that button's release to
-/// the program that got the press, at the cell it last saw, and the new tab's
-/// program never gets the drag or the release.
+/// A tab switch releases a held button to the departed tab's session at its last cell.
 #[test]
 fn a_tab_switch_releases_a_held_button_to_the_tab_it_leaves() {
     let (mut wire_a, sink_a) = observer();
@@ -389,9 +371,7 @@ fn a_tab_switch_releases_a_held_button_to_the_tab_it_leaves() {
     assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
 }
 
-/// A two-button chord under DEC 1002 names the lowest held button in its motion (xterm's
-/// `FirstBitN`), and releasing one button keeps the other's drag reported (a buttonless motion,
-/// which 1002 drops, would end it).
+/// A two-button chord under DEC 1002 names the lowest held button in its motion until that button is released.
 #[test]
 fn a_chords_motion_names_the_lowest_held_button_until_its_release() {
     let (mut wire, sink) = observer();
@@ -419,10 +399,7 @@ fn a_chords_motion_names_the_lowest_held_button_until_its_release() {
     assert_eq!(app.windows[&wid].held_mouse_button, None);
 }
 
-/// Motion is reported once per position (xterm: "only if the mouse pointer has moved to a
-/// different character cell"): pixel moves inside one cell repeat nothing, a drag that never
-/// leaves the pressed cell reports no motion, and under DEC 1016 every new pixel is a new
-/// position.
+/// Motion is reported once per position (per cell in 1002/1003, per pixel in 1016).
 #[test]
 fn motion_reports_once_per_position() {
     let (mut wire, sink) = observer();
@@ -441,7 +418,6 @@ fn motion_reports_once_per_position() {
     move_to(&mut app, wid, (4, 8), 0.0);
     assert_eq!(drain(&mut wire), "\x1b[<35;9;5M", "a new cell reports");
 
-    // A 1002 drag inside the pressed cell: the press named the position.
     arm(&app, 0, b"\x1b[?1003l\x1b[?1002h");
     move_to(&mut app, wid, (6, 2), 0.0);
     app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
@@ -451,7 +427,6 @@ fn motion_reports_once_per_position() {
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
     assert_eq!(drain(&mut wire), "\x1b[<0;3;7M\x1b[<0;3;7m");
 
-    // SGR-pixel: a sub-cell move changes the coordinate the report carries.
     arm(&app, 0, b"\x1b[?1002l\x1b[?1003h\x1b[?1016h");
     move_to(&mut app, wid, (4, 7), 0.0);
     let first = drain(&mut wire);
@@ -464,10 +439,7 @@ fn motion_reports_once_per_position() {
     );
 }
 
-/// A right-click copy/paste over the unfocused pane is decided by that pane's program and acts
-/// on that pane: the clipboard is pasted into it (focused first, as Windows Terminal and kitty
-/// focus on any press), its selection is what is copied, and the focused pane's mouse-tracking
-/// program gets neither a paste nor a report.
+/// Right-click `copy_paste` over an unfocused pane acts on that pane without disturbing the focused pane.
 #[test]
 fn a_right_click_copy_or_paste_acts_on_the_pane_under_the_pointer() {
     let mut f = stacked();
@@ -489,7 +461,6 @@ fn a_right_click_copy_or_paste_acts_on_the_pane_under_the_pointer() {
         "the tracking program beside it gets no paste and no report"
     );
 
-    // Copy: the selection under the pointer is the one taken.
     assert!(app.focus_pane_in(wid, pane::FocusDir::Down));
     let top_term = app.pool.get(f.top).unwrap().term.clone();
     {
@@ -573,12 +544,9 @@ fn a_gesture_held_over_an_unfocused_pane_keeps_its_chord_wheel_and_drag() {
     app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Middle);
     app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 1.0));
     move_to(app, wid, window_cell(app, wid, f.top, (4, 8)), 0.0);
-    // Into the focused pane: the drag still addresses the pane it began in,
-    // at its edge.
     move_to(app, wid, window_cell(app, wid, f.bottom, (2, 8)), 0.0);
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Middle);
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
-    // The top pane's last row, 1-based: where its clamped drag stays.
     let (_, _, edge, _) = app.visible_session_rect(wid, f.top).unwrap();
     assert_eq!(
         drain(&mut f.top_wire),
@@ -669,9 +637,7 @@ fn a_trackpad_band_over_an_unfocused_pane_moves_that_panes_history() {
     assert!(Arc::ptr_eq(&glide.term, &top_term), "on the top pane");
 }
 
-/// A wheel notch on the next pane lands the glide it interrupts on the other
-/// pane at that glide's own target, instead of leaving that pane stopped
-/// part-way: the window holds one glide.
+/// A wheel notch on another pane lands the interrupted glide on the previous pane at its target.
 #[test]
 fn a_wheel_on_the_next_pane_lands_the_glide_it_interrupts() {
     let mut f = stacked();
@@ -710,10 +676,7 @@ fn a_wheel_on_the_next_pane_lands_the_glide_it_interrupts() {
     );
 }
 
-/// A release that goes to a pane behind the front (its press's owner, after a keyboard focus
-/// move), from a program that has since stopped tracking the mouse, runs no local gesture: it
-/// leaves the front's pointer cell alone, so the next wheel notch over the front reports where
-/// the pointer is.
+/// A release routed to a background pane after it disabled mouse tracking leaves the front pane's pointer cell intact.
 #[test]
 fn a_release_to_a_pane_behind_the_front_leaves_the_fronts_pointer_cell() {
     let mut f = stacked();
@@ -822,9 +785,7 @@ fn a_hover_report_to_a_sibling_keeps_the_fronts_typed_move_licence() {
     assert!(!licensed(app), "the front's own report retires it");
 }
 
-/// A Settings page beside a terminal whose program tracks the mouse, with the
-/// page focused (a left click on it, as a hand focuses it): the terminal's
-/// session and the wire its program reads.
+/// Focused Settings page beside a mouse-tracking terminal (`(app, wid, terminal, wire)`).
 fn native_focused_beside_a_tracking_terminal() -> (App, WindowId, u64, UnixStream) {
     let (mut wire, sink) = observer();
     let mut app = App::headless_for_test();
@@ -859,11 +820,7 @@ fn native_focused_beside_a_tracking_terminal() -> (App, WindowId, u64, UnixStrea
     (app, wid, terminal, wire)
 }
 
-/// with a native page focused, a non-left press and a wheel
-/// notch over the terminal beside it are that terminal's, at its own cell,
-/// routed by the pane under the pointer as they are between two terminals.
-/// Before, the page's pointer boundary swallowed the button and scrolled the
-/// page by the wheel.
+/// With a native page focused, non-left presses and wheel notches over a sibling terminal reach that terminal.
 #[test]
 fn a_press_and_wheel_over_a_terminal_beside_a_focused_native_page_reach_its_program() {
     let (mut app, wid, terminal, mut wire) = native_focused_beside_a_tracking_terminal();
@@ -879,7 +836,6 @@ fn a_press_and_wheel_over_a_terminal_beside_a_focused_native_page_reach_its_prog
     );
     app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, -1.0));
     assert_eq!(drain(&mut wire), "\x1b[<65;5;4M", "wheel");
-    // A drag the press began there reports its motion there too.
     app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
     let further = window_cell(&app, wid, terminal, (3, 6));
     move_to(&mut app, wid, further, 0.0);
@@ -897,11 +853,7 @@ fn a_press_and_wheel_over_a_terminal_beside_a_focused_native_page_reach_its_prog
     assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
 }
 
-/// a reported press whose release a modal swallows still
-/// ends: the program that got the press is told the button went up, and the
-/// window holds no button. Before, a non-left release the palette swallowed
-/// left the button marked held, so every later motion reported a drag to the
-/// press's program.
+/// A reported press whose release is swallowed by a modal still reports the button release and clears held state.
 #[test]
 fn a_release_a_modal_swallows_still_ends_the_press() {
     let (mut wire, sink) = observer();
@@ -923,9 +875,7 @@ fn a_release_a_modal_swallows_still_ends_the_press() {
     assert_eq!(drain(&mut wire), "", "no drag after the button is up");
 }
 
-/// A control on the focused native page beside the terminal: its key and the
-/// window pixel at its centre, read off the mixed frame's retained artifact (as
-/// a present marks it), which the shipping hit test reads.
+/// Returns `(key, x, y)` at the centre of a control on the focused native page.
 fn a_page_control(app: &mut App, wid: WindowId) -> (crate::native_ui::UiKey, f64, f64) {
     let (_, view) = app.active_native_view(wid).expect("native front");
     assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
@@ -966,12 +916,7 @@ fn page_pressed(app: &App, wid: WindowId) -> Option<crate::native_ui::UiKey> {
         .clone()
 }
 
-/// review: while a press the terminal beside a focused native
-/// page took is held, a left press on the page is the page's: it arms the
-/// control under the pointer, and the terminal's program sees no left press.
-/// The held button decides where its own drag and release go, not where a new
-/// press lands. Before, the held press's owner decided this press too: the
-/// page's boundary was skipped and the press reached nobody.
+/// A left press on a focused native page arms its control even while a sibling terminal holds a button.
 #[test]
 fn a_left_press_on_the_page_while_the_terminal_beside_it_holds_a_button_is_the_pages() {
     let (mut app, wid, terminal, mut wire) = native_focused_beside_a_tracking_terminal();
@@ -1005,12 +950,7 @@ fn a_left_press_on_the_page_while_the_terminal_beside_it_holds_a_button_is_the_p
     assert_eq!((ws.reported_buttons, ws.held_mouse_button), (0, None));
 }
 
-/// review: a drag that starts on a focused native page is the
-/// page's while its button is held, so the terminal beside it, whose program
-/// tracks every motion, is not sent hover reports as the pointer crosses into
-/// it; once the button is up, the hover is that program's again. Before, the
-/// native motion fell through to the terminal whenever the pane under the
-/// pointer was one.
+/// A drag started on a focused native page is not reported as hover motion to a sibling terminal.
 #[test]
 fn a_drag_from_the_page_over_the_terminal_beside_it_is_not_reported_to_its_program() {
     let (mut app, wid, terminal, mut wire) = native_focused_beside_a_tracking_terminal();
@@ -1044,13 +984,7 @@ fn a_drag_from_the_page_over_the_terminal_beside_it_is_not_reported_to_its_progr
     );
 }
 
-/// review: a left press on an empty part of the focused page
-/// (no control under it, so nothing is armed) is the page's too, and so is its
-/// drag: the terminal beside it, whose program tracks every motion, is sent no
-/// hover reports while the button is held, and the hover is its program's
-/// again once the button is up, as after a press on a control. Before, only a
-/// press that armed a control kept the drag, so this one reported no-button
-/// motion to a program that never saw the gesture end.
+/// A drag started on an empty part of the focused native page is not reported to a sibling terminal.
 #[test]
 fn a_drag_from_an_empty_part_of_the_page_is_not_reported_to_the_terminal_beside_it() {
     let (mut app, wid, terminal, mut wire) = native_focused_beside_a_tracking_terminal();
@@ -1114,12 +1048,7 @@ fn strip_px(app: &App, wid: WindowId, kind: crate::tab_bar::TabHit) -> (f64, f64
     (pad + (col + 0.5) * cw as f64, head + ch as f64 * 0.5)
 }
 
-/// A middle press on the in-grid tab strip is the strip's, never the
-/// terminal's: on a chip it closes that tab (the GTK, browser and Windows
-/// Terminal convention), and nowhere on the strip does it paste PRIMARY into
-/// the front pane (Linux) or hand a tracking program a press at the last grid
-/// cell the pointer crossed. Before, the inactive chip stayed open and the
-/// front shell got the PRIMARY text, or the TUI a stale-cell report.
+/// A middle press on the in-grid tab strip closes a tab chip without pasting PRIMARY or reporting to a terminal.
 #[test]
 fn a_middle_press_on_the_tab_strip_closes_a_chip_and_reaches_no_terminal() {
     use crate::tab_bar::TabHit;
@@ -1134,7 +1063,6 @@ fn a_middle_press_on_the_tab_strip_closes_a_chip_and_reaches_no_terminal() {
     #[cfg(target_os = "linux")]
     crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = Some("PRIMARY-TEXT".into()));
 
-    // Tracking off: the middle press on the inactive chip closes it.
     let (x, y) = strip_px(&app, wid, TabHit::Select(0));
     app.on_cursor_moved(wid, x, y);
     click(&mut app, wid, MouseButton::Middle);
@@ -1146,8 +1074,6 @@ fn a_middle_press_on_the_tab_strip_closes_a_chip_and_reaches_no_terminal() {
         "no PRIMARY paste into the front pane"
     );
 
-    // Tracking on: a grid press is reported; a middle press on the strip's
-    // `+` afterwards is neither reported (at that stale cell) nor a new tab.
     arm(&app, front, b"\x1b[?1000h\x1b[?1006h");
     let (gx, gy) = app.cell_centre_px(wid, 4, 5).expect("cell on the grid");
     app.on_cursor_moved(wid, gx, gy);
@@ -1164,10 +1090,7 @@ fn a_middle_press_on_the_tab_strip_closes_a_chip_and_reaches_no_terminal() {
     crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
 }
 
-/// Off macOS a Shift+drag over a mouse-tracking program selects text locally
-/// and reports nothing (the xterm convention, and the one left where the
-/// window manager takes Alt+drag); a plain drag still reports. Before, the
-/// Shift press and release went to the program with the shift bit.
+/// Off macOS, a `Shift`+drag over a mouse-tracking program selects text locally without reporting to the program.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn a_shift_drag_over_a_tracking_program_selects_and_reports_nothing() {
@@ -1198,7 +1121,6 @@ fn a_shift_drag_over_a_tracking_program_selects_and_reports_nothing() {
         "the program saw no shifted press or release"
     );
 
-    // Control: a plain drag is still the program's.
     drag(&mut app, aterm_window::keyboard::ModifiersState::empty());
     let plain = written_before_marker(&mut app, wid, front, &mut wire);
     assert!(plain.starts_with("\x1b[<0;"), "the plain press: {plain:?}");

@@ -39,6 +39,9 @@ impl TerminalHandler<'_> {
                 }
             }
             None => {
+                // No capability: drop 1-21 (manipulation, geometry queries, title
+                // reports), which change host window state or leak data for
+                // fingerprinting. The title stack touches neither the callback
                 // nor the PTY.
                 if let 1..=21 = ps {
                     return;

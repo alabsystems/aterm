@@ -541,6 +541,7 @@ fn parsed(argv: &[String]) -> Vec<(&str, Option<Fate>, &[String])> {
                     }
                 }
                 Arity::Many => {
+                    // The first value is required, so Claude's parser takes it
                     // whatever it looks like (`--add-dir -c`).
                     if i < argv.len() {
                         i += 1;
@@ -1529,6 +1530,7 @@ impl FinishedScan {
     }
 
     fn answered(&mut self, row: &Value) {
+        // A command of someone else's that started a turn was a prompt of
         // theirs (any answer counts, `<synthetic>` included: [`TaskScan`]).
         if std::mem::take(&mut self.command) {
             (self.finished, self.said, self.land, self.done_said) = (false, false, false, false);
@@ -3599,6 +3601,8 @@ pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
     };
     if f.background_point && *phase != Phase::Pending {
         let Phase::Announced { at_s, asks } = phase else {
+            // A given-up upgrade's late READY at a break: the agent's work
+            // outliving the answer voids it here as at an idle point, so an
             // always-at-a-break session is not held on it for good.
             if matches!(phase, Phase::Failed(why) if why == GAVE_UP) && ready {
                 if f.limited {

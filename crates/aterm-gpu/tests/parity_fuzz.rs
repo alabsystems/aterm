@@ -1,13 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// CPU==GPU rendering parity fuzz. The CPU renderer is the GPU renderer's
-// correctness oracle; `gpu_matches_cpu.rs` pins specific features, and this
-// sweeps random mixed content (ASCII, colour emoji with VS16/ZWJ/flags, every
-// SGR style and decoration, wide CJK, combining marks, procedural glyphs,
-// opaque and transparent iTerm2 inline images, DECDWL/DECDHL) and asserts the
-// two paths stay within the glyph AA/blend tolerance on every frame. A
-// deterministic PRNG keeps it reproducible; gated on a GPU.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::Theme;
@@ -17,9 +9,7 @@ use crate::common::{
     max_channel_delta_frame as max_channel_delta,
 };
 
-/// A 2x2-cell RGBA PNG: left column opaque, right column 50% alpha, covering
-/// both the straight-RGBA image blit and the alpha-over-bg composite the GPU
-/// image pass shares with colour emoji.
+/// 2x2-cell RGBA PNG inline-image OSC (left column opaque, right column 50% alpha).
 fn image_osc(cw: u32, ch: u32) -> Vec<u8> {
     let (iw, ih) = (2 * cw, 2 * ch);
     let mut rgba = Vec::with_capacity((iw * ih * 4) as usize);
@@ -45,14 +35,12 @@ fn image_osc(cw: u32, ch: u32) -> Vec<u8> {
     out
 }
 
-/// Per-pixel ceiling for the rare divergent AA-fringe pixel. Metal measures
-/// 1 over this seed; the ceiling leaves headroom for other GPU drivers.
+/// Per-pixel ceiling for divergent AA-fringe pixels.
 const EDGE_CEIL: i32 = 40;
-/// Max fringe pixels per frame (Metal measures 0). A real regression (a wrong
-/// glyph or region) produces thousands.
+/// Maximum AA-fringe pixels per frame.
 const MAX_FRINGE_PX: usize = 8;
 
-/// Tokens the fuzz strings together. Each is raw bytes fed to the terminal.
+/// Tokens concatenated by the fuzz loop.
 const TOKENS: &[&[u8]] = &[
     b"abc",
     b"XY",
@@ -60,9 +48,6 @@ const TOKENS: &[&[u8]] = &[
     b"123",
     b".rs",
     b"/usr",
-    // Descenders: with `baseline = round(ascent)` some faces let g/j/p/q/y
-    // overshoot the row band by a pixel, which the shared `row_scale` band
-    // clip keeps identical. No other token exercises it.
     b"gjpq",
     b"yes/go",
     b"\x1b[1m",
@@ -104,18 +89,12 @@ fn cpu_gpu_parity_fuzz() {
     let theme = Theme::default();
     let px = 17.0;
     let (mut cpu, mut gpu) = backends(px, theme);
-    // Compare the shared base render: GPU-only bloom and heat shimmer are
-    // outside the parity check.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
-    // Deterministic parity: block on the lazy fallback parses so neither
-    // renderer compares a provisional `.notdef` frame against a real glyph.
     cpu.debug_block_on_lazy_fallbacks();
     gpu.debug_block_on_lazy_fallbacks();
     let mut win = aterm_gpu::WindowGpu::new();
 
-    // Precompute the inline-image OSC for the renderer's cell size so the image's
-    // footprint maps cleanly onto whole cells (iTerm2 places from the left margin).
     let (cw, ch) = cpu.cell_size();
     let image_token = image_osc(cw as u32, ch as u32);
 
@@ -133,16 +112,13 @@ fn cpu_gpu_parity_fuzz() {
     let iters = 160;
     for it in 0..iters {
         let mut term = Terminal::new(rows as u16, cols as u16);
-        // The image footprint needs the cell pixel size so it tiles whole cells.
         term.set_cell_pixel_size(cw as u16, ch as u16);
-        // Half the frames hide the cursor; the rest exercise the block cursor too.
         if next() & 1 == 0 {
             term.process(b"\x1b[?25l");
         }
         let token_count = 12 + (next() % 40) as usize;
         for _ in 0..token_count {
             // ~1 in 8 tokens is an inline image over the text, so many frames
-            // exercise the image pass without it dominating.
             if next() % 8 == 0 {
                 term.process(&image_token);
                 continue;
@@ -160,11 +136,6 @@ fn cpu_gpu_parity_fuzz() {
         );
         let d = max_channel_delta(&cpu_frame, &gpu_frame);
         worst = worst.max(d);
-        // Compositing is in linear light (CPU `blend`, GPU sRGB target). Almost
-        // every pixel is within 8; a few glyph AA-fringe pixels differ more
-        // because software and hardware sRGB encodes round differently near
-        // black. Bounding both the per-pixel ceiling and the fringe count
-        // still catches real regressions.
         let exc = count_exceeding(&cpu_frame, &gpu_frame, 8);
         worst_exc = worst_exc.max(exc);
         assert!(

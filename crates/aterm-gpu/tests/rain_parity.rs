@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Phosphor rain (`rain_quads` + `rain_atlas` + `rain_add`) CPU/GPU parity on a
-// genuine `MatrixRain` emission (deterministic seed). Rain is the same NEAREST
-// 1:1 sprite regime as the cat (bar: target <= 1, hard <= 2) but also
-// exercises tint: the CPU quantizes the multiply to 8 bits via
-// `(c*f+127)/255`, the GPU multiplies in f32 in `fs_sprite_over`, and the
-// tests assert non-trivial tints so the check is never vacuous.
-//
-// No GPU or no font: COULD NOT RUN. On a downlevel (sRGB-offscreen) adapter
-// (`additive_is_byte_exact`) a test runs its other checks, then ends COULD NOT
-// RUN naming the byte-exact comparisons it could not make (`common::ByteExact`).
+
+//! Phosphor rain CPU/GPU parity tests.
 
 use crate::common;
 use crate::common::ByteExact;
@@ -20,14 +11,6 @@ use aterm_render::{Theme, WindowCpu};
 
 use crate::common::{backends, max_channel_delta};
 
-/// Rain parity. The base frame is byte-exact, so every delta below is the
-/// rain's. A real engine is driven to a rich frame (tinted trail levels +
-/// head halos), then each channel is checked alone and combined:
-///   (a) base without rain: delta == 0;
-///   (b) sprites only: delta <= 2 hard (target <= 1), tints multi-level so the
-///       CPU `mul8` vs GPU f32 path is exercised;
-///   (c) halos only: byte-exact over the background;
-///   (d) sprites + halos: within the sprite bar.
 #[test]
 fn rain_effect_only_parity_pinned_over_bg_and_text() {
     let exact = ByteExact::default();
@@ -36,11 +19,8 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Hidden cursor + a procedural block row: byte-exact base, and the row's
-    // cells are occupied so the engine's Tier-A mask keeps rain out of them.
     term.process("\x1b[?25l████████████".as_bytes());
 
-    // (a) Base (no rain): the effect-only premise — CPU==GPU exactly.
     let base_input = term.cell_frame(rows, cols);
     let cpu_base = cpu.render_input(&base_input);
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
@@ -50,12 +30,9 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
         "procedural-block base must be byte-exact so the rain delta is effect-only"
     );
 
-    // Drive a real engine to a genuine emission (deterministic seed).
     let mut scene = RainScene::new(rows, cols, cpu.cell_size(), &base_input);
     scene.drive_until_raining();
 
-    // Anti-vacuity: the ramp must make tint load-bearing; all-white tints would
-    // silently reduce this test to cat parity.
     assert!(
         scene.quads.iter().any(|q| q.tint != 0x00FF_FFFF),
         "rain emission carries only trivial (white) tints — the tint path is unexercised"
@@ -69,7 +46,6 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
          trail levels (got {tints:?})"
     );
 
-    // (b) Sprites only: the NEAREST-1:1 + tint bar.
     let mut quads_in = term.cell_frame(rows, cols);
     quads_in.rain_quads = scene.quads.clone();
     quads_in.rain_atlas = scene.atlas();
@@ -92,8 +68,6 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
          (target <= 1) — the tinted NEAREST-1:1 path diverged"
     );
 
-    // (c) Halos only: premultiplied additive light over the byte-exact base
-    // must be byte-exact. Downlevel adapters add in linear, so gate like glow.
     let mut add_in = term.cell_frame(rows, cols);
     add_in.rain_add = scene.add.clone();
     let cpu_a = cpu.render_input(&add_in);
@@ -114,8 +88,6 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
         );
     }
 
-    // (d) The full frame (sprites + halos), as the gui sends it: within the
-    // sprite bar, which holds only where the halos composite byte-exact.
     if exact.holds(&gpu, "the full rain frame within the sprite bar") {
         let mut full_in = term.cell_frame(rows, cols);
         scene.apply(&mut full_in);
@@ -130,13 +102,6 @@ fn rain_effect_only_parity_pinned_over_bg_and_text() {
     }
 }
 
-/// The GPU rain row filter on the scissored path: with steady rain and a
-/// one-row text change, `present_input_readback` (`RepaintScope::Dirty`)
-/// uploads only `row_active` rain instances. Pixel-exact because
-/// `compute_dirty_rows` marks every band row a rain quad overlaps, so an
-/// admitted quad is on a fully rebuilt row and a dropped one is clipped. The
-/// scissored frame equals an independent fresh render; CPU-vs-GPU stays within
-/// the sprite bar.
 #[test]
 fn scissored_path_rain_row_filter_matches_full_render() {
     let theme = Theme::default();
@@ -158,23 +123,17 @@ fn scissored_path_rain_row_filter_matches_full_render() {
         scene.quads.len(),
         qrows.len()
     );
-    // The damaged row carries quads, with quad rows above and below it: the
-    // band ends here, so quads below must be dropped and this row's kept.
     let hit_row = qrows[1];
     assert!(
         qrows.first() < Some(&hit_row) && qrows.last() > Some(&hit_row),
         "picked band row must have rain strictly above and below (rows {qrows:?})"
     );
 
-    // Frame A: text A + rain — primes the CPU cache and the GPU present-path
-    // offscreen/`present_prev` (this first present is the Full repaint).
     let mut in_a = base_a.clone();
     scene.apply(&mut in_a);
     let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
     let _ = gpu.present_input_readback(&mut win_gpu, &in_a);
 
-    // Frame B: one row of text changes and the rain is unchanged (settled), the
-    // sparse-damage shape the row filter optimizes.
     term.process(format!("\x1b[{};1H▒▒▒▒▒▒", hit_row + 1).as_bytes());
     let mut in_b = term.cell_frame(rows, cols);
     scene.apply(&mut in_b);
@@ -191,8 +150,6 @@ fn scissored_path_rain_row_filter_matches_full_render() {
          bypass the row filter and pass vacuously)"
     );
 
-    // Ground truth: a fresh full render of frame B by an independent renderer
-    // (no shared caches, no shared prev state).
     let mut gpu2 = common::independent_gpu(18.0, theme);
     let mut win_fresh = aterm_gpu::WindowGpu::new();
     let gpu_fresh = gpu2.render_input(&mut win_fresh, &in_b, None);

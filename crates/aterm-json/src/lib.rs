@@ -2,6 +2,21 @@
 // Copyright 2026 Andrew Yates
 
 //! JSON for aterm: a serde `Deserializer`/`Serializer` for typed models, and an untyped [`Value`] tree with `json!`, over one parser and one writer.
+//!
+//! ```
+//! # use serde::Deserialize;
+//! #[derive(Deserialize)]
+//! struct Release { tag_name: String }
+//!
+//! // Typed.
+//! let release: Release = aterm_json::from_str(r#"{"tag_name":"v1.2.3"}"#).unwrap();
+//! assert_eq!(release.tag_name, "v1.2.3");
+//!
+//! // Untyped.
+//! let body = aterm_json::json!({"model": "qwen", "options": {"temperature": 0}});
+//! assert_eq!(aterm_json::to_string(&body).unwrap(),
+//!            r#"{"model":"qwen","options":{"temperature":0}}"#);
+//! ```
 
 #![warn(missing_docs)]
 

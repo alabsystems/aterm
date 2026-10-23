@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows right-click on the grid, through the function a real right press calls
-//! (`App::on_mouse_input`), under the platform default (`right_click` unset: copy/paste, the
-//! conhost and Windows Terminal convention) and the test build's clipboard board, never the
-//! person's clipboard. The unix suite (`app_mouse_pointer_route_tests`) reads the paste off a
-//! pipe; Windows has no such observer, so here the copy half is read off the board and the
-//! selection.
+//! Windows right-click copy and mouse-tracking routing tests.
 
 use aterm_window::event::{ElementState, MouseButton};
 
@@ -22,9 +17,6 @@ fn right_click_at(app: &mut App, wid: WindowId, (row, col): (u16, u16)) {
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
 }
 
-/// With a selection and no mouse-tracking program, a right-click copies the selection to the
-/// clipboard and clears it, under Windows' default `right_click`; with tracking on the press is
-/// the program's and nothing is copied.
 #[test]
 fn a_right_click_copies_the_selection_by_default_on_windows() {
     assert_eq!(
@@ -64,7 +56,6 @@ fn a_right_click_copies_the_selection_by_default_on_windows() {
         "the copy takes the selection"
     );
 
-    // A program tracking the mouse gets the press; the clipboard is left alone.
     term_lock(&term).process(b"\x1b[?1000h");
     select_hello();
     crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = Some("before".into()));

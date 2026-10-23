@@ -391,7 +391,7 @@ impl ConfigAnalysis {
             .find(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Error)
     }
 
-    pub(crate) fn diagnostic_count(&self) -> usize {
+    pub(crate) const fn diagnostic_count(&self) -> usize {
         self.diagnostics.len()
     }
 
@@ -496,7 +496,7 @@ pub(crate) struct ConfigCompletionContext {
 }
 
 impl ConfigCompletionContext {
-    pub(crate) fn new(document: u64, document_sequence: u64, caret: usize) -> Self {
+    pub(crate) const fn new(document: u64, document_sequence: u64, caret: usize) -> Self {
         Self {
             document,
             document_sequence,
@@ -3587,6 +3587,8 @@ fn validate_registered_values(
                 }
             }
             ConfigSchemaKind::Table => {
+                // A `disk` that is not a table is told in the reader's words
+                // ([`validate_disk_values`]). A `machine` that is not a table never gets
                 // here: `Config` reads it, so the parse refuses it.
                 if !item.is_table_like() && setting.key != "disk" {
                     push_diagnostic(
@@ -3863,6 +3865,7 @@ fn structured_warning_word_index(message: &str, record_path: &str) -> Option<usi
 pub(crate) fn registered_enum_value_is_valid(key: &str, value: &str, options: &[&str]) -> bool {
     let value = value.trim();
     if key == "machine.universal_control" {
+        // Other spellings warn and Leave, so the generic case-insensitive acceptance would
         // promise a setting atpkg ignores.
         return value.is_empty() || UNIVERSAL_CONTROL_POLICIES.contains(&value);
     }
@@ -3988,6 +3991,7 @@ fn warn_unknown_item(
     analysis: &mut ConfigAnalysis,
 ) {
     if is_compatibility_only_key(path) {
+        // The compatibility walker already reports every entry of an inert subtree; calling
         // it "unknown" too would give one key two contradictory recoveries.
         return;
     }
@@ -4008,6 +4012,8 @@ fn warn_unknown_item(
             ConfigSchemaKind::DynamicStringMap | ConfigSchemaKind::Flexible
         )
     }) {
+        // Dynamic map keys are authored names. Flexible values have no stable
+        // descendant schema outside the explicitly registered structured-list
         // records handled above.
         return;
     }
@@ -5649,7 +5655,7 @@ fn example_value(setting: &ConfigSchemaEntry) -> String {
     }
 }
 
-fn editable_value_selection(value: &str) -> Range<usize> {
+const fn editable_value_selection(value: &str) -> Range<usize> {
     let bytes = value.as_bytes();
     if bytes.len() >= 2
         && matches!(

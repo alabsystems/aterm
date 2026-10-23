@@ -993,6 +993,7 @@ impl PetFrame {
     #[must_use]
     #[inline]
     pub const fn fp(&self) -> u64 {
+        // Keyed on presence, not the composed alpha: the arrival multiply can
         // truncate a faint body to 0 while its ghosts are live.
         if self.lane_alpha == 0 {
             return 0;
@@ -1887,6 +1888,7 @@ impl PetBrain {
         self.held_lead = if away {
             0.0
         } else if self.carrying_run() {
+            // Through a carried rhythm the stand is the one the last key
             // left ([`Self::on_move`]); the carry goes on from it.
             self.held_lead
         } else {
@@ -2155,6 +2157,7 @@ impl PetBrain {
         let trick_content_at = self.trick_content_at;
         let mut stroke = std::mem::take(&mut self.stroke);
         if let Some(now) = self.last_now {
+            // Contact belongs to the old surface; the rate limit belongs
             // to the same pet, so switching panes cannot bypass it.
             stroke.sample(now, None, 0.0);
         }
@@ -2757,9 +2760,12 @@ impl PetBrain {
         if dr.abs() == 1.0 && dc.signum() != dr.signum() && dc.abs() >= bar {
             (0.0, dc + dr * w, true)
         } else if wrapped && dr == 0.0 && dc.signum() < 0.0 && dc.abs() >= bar {
+            // The scrolled wrap, folded on the fact; the bar still guards it
             // so a mid-line `Home` the same frame keeps its literal retreat.
             (1.0, dc + w, true)
         } else if dr == 0.0 && dc <= -STARTLE_COLS && dc > -SNAP_COLS && (home || scrolled) {
+            // The shell's own new line. Known false positive: a `Home` or
+            // `Ctrl-W` landing at the home edge in one move is quiet too. A held
             // backspace walks column by column and keeps its flinch.
             (1.0, dc, true)
         } else {
@@ -2949,6 +2955,7 @@ impl PetBrain {
                 self.pending_vigil_pounce = vigil;
             }
             _ => {
+                // Under two seconds (or no timestamps at all): the ledger
                 // only — no latch, no choreography.
                 self.content = (self.content + CHEER_FAST_CONTENT).min(1.0);
             }
@@ -3256,6 +3263,7 @@ impl PetBrain {
 
     /// An ambient word-cat peek landed with its head at `(col, row)` (fractional cells of this pane).
     pub const fn note_peek(&mut self, now: Instant, col: f32, row: f32) {
+        // Non-finite coordinates never latch: NaN passes no range gate and
         // would poison the flight target.
         if !col.is_finite() || !row.is_finite() {
             return;
@@ -3318,6 +3326,10 @@ impl PetBrain {
         });
         let carried = core::mem::take(&mut self.carried);
         if self.console_observation_incoherent() {
+            // Keep the previous motion commitment and real caret/input history
+            // until geometry can be read again: a stale ink hull here would
+            // launch a full-pane flight. Clocks above still advance, and emit
+            // holds a body already on glass under the visibility hold's blind
             // rule without licensing guessed ground.
             return self.emit(sense, width);
         }
@@ -3451,6 +3463,7 @@ impl PetBrain {
             }
         }
         if was_invisible {
+            // A new sighting samples the palette under its own prospective
             // body. Never inherit a previous resident appearance.
             self.colors = None;
         }
@@ -3470,6 +3483,8 @@ impl PetBrain {
 
         let prev = self.last_caret;
         if prev.is_none() {
+            // A caret seen again where it was keeps the stand its cat held:
+            // after a one-frame hide, or on a surface the focus comes back to
             // (`held_stash`). Anywhere else the stand starts afresh.
             if self.held_for != Some((cr, cc)) {
                 let surface = self.surface;
@@ -4121,6 +4136,9 @@ impl PetBrain {
         };
 
         if let Some(mut f) = self.flight {
+            // The wrap the bound left for has come: its landing goes to the
+            // caret's stand on the row the wrap put it on (the next one, or
+            // this one where the wrap scrolled the line up), rebased, row and
             // column, so the drawn arc never jumps.
             if wrap_landing && airborne_at_entry {
                 let (aim, aim_row) = self.station_safe((cr, cc), sense.cols, sense.rows, width);
@@ -4195,6 +4213,8 @@ impl PetBrain {
                 }
             }
             if airborne_at_entry && (move_dr.abs() >= 0.5 || move_dc.abs() >= POUNCE_JUMP) {
+                // Any row change or jump while airborne cancels a split
+                // crossing's queued second bound (`bound2`), which was cut
                 // against the original launch row and destination.
                 self.bound2 = None;
             }
@@ -4462,6 +4482,10 @@ impl PetBrain {
 
         match self.action {
             PetAction::Sit | PetAction::Stand | PetAction::Perk if self.stream && !hugging => {
+                // The stream watch sits the cat down: the notice keeps its
+                // beat, a stand sits at once, and the sit holds until the
+                // events lapse. Ranked above the tennis watch and idle
+                // vignettes. The live-edge hug's trip (`hugging`) is exempt,
                 // since this hold returns before every door.
                 if self.action == PetAction::Stand
                     || (self.action == PetAction::Perk && self.action_t >= PERK_HOLD)
@@ -4472,6 +4496,7 @@ impl PetBrain {
                 return self.emit(sense, width);
             }
             PetAction::Stand if self.commit_t > 0.0 => {
+                // The commit stare. A third jump abandons it, judged on this
                 // tick's move (the latch is already set by the second).
                 if move_dc.abs() >= POUNCE_JUMP {
                     self.commit_t = 0.0;
@@ -4500,6 +4525,8 @@ impl PetBrain {
                 return self.emit(sense, width);
             }
             PetAction::Crouch if self.big_gather => {
+                // The big jump's gather plays through BIG_CROUCH_DUR, then the
+                // bound(s) launch at the re-read target. Over ink it is cut to
                 // the pounce's quick coil.
                 if (target - self.col).abs() > 1e-4 {
                     self.facing_left = target < self.col;
@@ -4523,6 +4550,8 @@ impl PetBrain {
                 return self.emit(sense, width);
             }
             PetAction::Crouch if self.hop_crouch => {
+                // The row hop's gather: one tick for a hop, [`CROUCH_DUR`] when
+                // the predicted span makes it a bound. The target is re-read
                 // every tick.
                 if (target - self.col).abs() > 1e-4 {
                     self.facing_left = target < self.col;
@@ -4541,6 +4570,7 @@ impl PetBrain {
                         LeapPolicy::Quiet,
                     );
                 } else {
+                    // The caret moved into the bound tier during a one-tick
                     // coil: hold for the real coil.
                     self.coil_d = CROUCH_DUR;
                 }
@@ -4567,6 +4597,7 @@ impl PetBrain {
                 self.tennis = false;
             }
             PetAction::Crouch if self.vigil || self.pending_vigil_pounce => {
+                // Anything else stands the cat up and lets the ladder act this
                 // same tick.
                 if self.pending_vigil_pounce {
                     self.pending_vigil_pounce = false;
@@ -4605,6 +4636,8 @@ impl PetBrain {
                 self.set_action_keep(PetAction::Stand);
             }
             PetAction::Crouch if self.hiding => {
+                // The dwell is wall time: the still crouch is off the frame
+                // train (`needs_frames`), and the tick that serves its offered
                 // end must spend all of it, not a clamped `dt`.
                 if self.room_hold {
                     self.hiding = false;
@@ -4621,6 +4654,8 @@ impl PetBrain {
                 return self.emit(sense, width);
             }
             PetAction::Crouch if self.stakeout => {
+                // The stakeout: the hunting crouch at a creeping (or stopped)
+                // toy, up to its patience. A latched dash pounce becomes the
                 // strike; anything else lapsing stands the cat up.
                 if self.room_hold {
                     self.pending_pointer_pounce = None;
@@ -4749,6 +4784,8 @@ impl PetBrain {
                 return self.emit(sense, width);
             }
             PetAction::Perk if self.action_t < PERK_HOLD => {
+                // The double-take never loiters on ink: with travel latched and
+                // glyphs underfoot, the hold collapses and the launch ladder
                 // takes over this tick.
                 if !((self.pending_pounce || self.pending_big_jump)
                     && self.ink_overlaps(self.col, self.row, width))
@@ -4779,6 +4816,7 @@ impl PetBrain {
                 }
             }
             PetAction::Land if self.land_t > 0.0 => {
+                // Landing recovery. A big landing also skids the 0.8 cells the
                 // flight aimed short by, ending on the station.
                 if self.land_span > 0.0 && self.skid_dir != 0.0 {
                     let u = (1.0 - self.land_t / BIG_LAND_DUR).clamp(0.0, 1.0);
@@ -5162,6 +5200,9 @@ impl PetBrain {
                 if old != pair {
                     let quiet = arrival == PetArrival::Quiet;
                     let (edge, speed, arrive_in) = if quiet {
+                        // Homecoming: a [`HOMECOMING_IN`] in-place crossfade;
+                        // the old coat is a zero-span still departure
+                        // (`life() == EDGE_FADE`) at the pet's feet. The speed
                         // is inert.
                         (self.col, DEPART_SPEED, HOMECOMING_IN)
                     } else {
@@ -5569,6 +5610,7 @@ impl PetBrain {
         let airborne = self.action == PetAction::Leap;
         if dr == 0.0 && dc < 0.0 {
             if dc <= -SNAP_COLS {
+                // The snap ([`SNAP_COLS`]): a jump home, not a threat. Face the
                 // caret, forget the held-delete run, and latch a quiet jump.
                 if !airborne {
                     self.facing_left = caret_col < self.col;
@@ -5674,9 +5716,12 @@ impl PetBrain {
             self.clear_trick_settle();
         }
         let next = if self.trick_settle == Some(Trick::Down) {
+            // down: the loaf, held — no wash, no purr's pose — until the
             // hold's end hands the dwell back to the deal below.
             PetAction::Loaf
         } else if self.trick_settle == Some(Trick::Sit) {
+            // Commanded seats are checked above the ladder's sleep, so a cat
+            // already past [`SLEEP_AFTER`] still wears the seat for the hold
             // (parked throughout).
             PetAction::Sit
         } else if self.quiet >= SLEEP_AFTER
@@ -5684,6 +5729,7 @@ impl PetBrain {
         {
             PetAction::Sleep
         } else if self.quiet >= SIT_AFTER && self.room_hold {
+            // A standing `hold on` keeps the seat at the sit (no wash, loaf or
             // purr) until the ladder's sleep.
             PetAction::Sit
         } else if self.quiet >= SIT_AFTER {
@@ -5706,6 +5752,8 @@ impl PetBrain {
                 PetAction::Sit
             }
         } else if self.action == PetAction::Waking {
+            // The wake's stretch ends in the seat it is drawn in: stood up
+            // for a frame, the cat sat back down the next as the rest seat
             // was judged.
             PetAction::Sit
         } else {
@@ -6117,6 +6165,8 @@ impl PetBrain {
         width: f32,
         policy: LeapPolicy,
     ) {
+        // The aim does not read the quiet-leap latch (its prediction is the
+        // decay-gated [`Self::station_drift`]); the latch only rules the show,
         // and is spent at the end of this function.
         if policy != LeapPolicy::Play {
             self.pending_wall_transit = false;
@@ -6173,6 +6223,12 @@ impl PetBrain {
     }
 
     fn begin_arc(&mut self, to_col: f32, to_row: f32, dur: f32, arc: f32, kind: FlightKind) {
+        // NO STILL POSE IS A ONE-FRAME FLASH BEFORE A FLIGHT. A still pose
+        // just put on glass (a wake's last beat, a landing's seat, a play
+        // bow, a notice) stays on it [`STILL_SECS`] before the cat leaves the
+        // ground from it; taken at once, it flashed for a single frame
+        // between the pose before it and the leap. The flight leaves on a
+        // later tick ([`Self::deferred_arc`]), as aimed, under two 60 Hz
         // frames late, on the words or off them.
         if !kind.drop && self.flight.is_none() && self.still_fresh() {
             self.deferred_arc = Some((to_col, to_row, dur, arc, kind));
@@ -6409,6 +6465,7 @@ impl PetBrain {
         let behind =
             side.is_some_and(|left| left != self.facing_left) && !(caret_gaze && self.sit_front);
         if self.sit_front {
+            // The dwell only runs here, where a turn is possible, so a target
             // crossing back rewinds it.
             if behind {
                 self.gaze_dwell += elapsed;
@@ -6441,6 +6498,7 @@ impl PetBrain {
     fn tend_motes(&mut self, width: f32) {
         match self.action {
             PetAction::Sleep => {
+                // light sleep only: no new z once its life would outlive the
                 // breath window, so deep sleep begins with an empty lane.
                 if self.quiet > SLEEP_AFTER + BREATH_WINDOW - ZEE_LIFE {
                     return;
@@ -6957,6 +7015,7 @@ impl PetBrain {
         self.run_t = (self.run_t + secs).min(60.0);
         if self.run_t > RHYTHM_WINDOW {
             if carrying {
+                // The rhythm ends at its window, not at whichever tick saw
                 // it end: the stand keeps the lead it reached there.
                 self.held_lead = self.lead_at(RHYTHM_WINDOW);
             }
@@ -7053,6 +7112,7 @@ impl PetBrain {
             return false;
         };
         if asleep || !(self.action.settled() || self.arriving()) {
+            // Kept, not dropped: the TTL above is the only thing that retires
             // a star, and a cat one tick from its feet may still get there.
             return false;
         }
@@ -7148,6 +7208,7 @@ impl PetBrain {
             return false;
         }
         if matches!(self.action, PetAction::Sleep | PetAction::Waking) {
+            // A sleeper ignores the peek — the TTL retires it; waking a cat
             // for scenery would teach the eye to ignore the wake.
             return false;
         }
@@ -7607,6 +7668,8 @@ impl PetBrain {
             }
             PetAction::Waking if !self.console_stretch_on_blank() => PetGlyphId::PetSit,
             PetAction::Waking => {
+                // The stretch in two halves: the front reach draws out over
+                // [`STRETCH_LEAD`] and eases back, then the hind leg reaches
                 // back.
                 if self.action_t < STRETCH_SPLIT * WAKE_DUR {
                     let k = (self.action_t / STRETCH_LEAD).min(1.0);
@@ -7635,6 +7698,8 @@ impl PetBrain {
                 (scale_x, scale_y) = Self::seat_scale(self.quiet, self.clock, false);
                 let tail = self.sit_tail();
                 if self.sit_front && !self.sit_glance() {
+                    // Face-on eye contact has its own blink, a one-field
+                    // departure from the frame beneath it, so a stare can
                     // break without looking away.
                     if self.sit_blink_shows().is_some() {
                         PetGlyphId::PetSitFrontBlink
@@ -7723,6 +7788,9 @@ impl PetBrain {
                 PetGlyphId::PetPurr
             }
             PetAction::Groom => {
+                // Alternating washes: the wash's cycle index (as placed by
+                // `enter_settled`) picks chest-then-flank on even washes and
+                // flank-then-chest on odd. The owed post-chase groom is always
                 // the paw lick.
                 if self.groom_owed {
                     PetGlyphId::PetGroom
@@ -7750,6 +7818,8 @@ impl PetBrain {
             PetAction::Perk => PetGlyphId::PetPerk,
             PetAction::Startle => PetGlyphId::PetStartle,
             PetAction::Frolic if self.swipe => {
+                // The bat swipe is pinned to `PetBat`, the swipe's own frame,
+                // for the whole hold; the plain Frolic alternates it with the
                 // playbow instead.
                 PetGlyphId::PetBat
             }
@@ -7847,6 +7917,7 @@ impl PetBrain {
                 let (dur, q0, pose) = if self.bound2.is_some() {
                     (TOUCH_LAND_DUR, LAND_SQUASH * 0.5, PetGlyphId::PetCrouch)
                 } else if self.land_running {
+                    // A touch-down on the run: the braced landing, brief
                     // and light.
                     (TOUCH_LAND_DUR, LAND_SQUASH * 0.5, PetGlyphId::PetLand)
                 } else if self.scrabble {
@@ -8236,6 +8307,8 @@ impl PetBrain {
             sense.now.saturating_duration_since(at).as_secs_f32()
         });
         let level = if self.repainting && at.is_some() {
+            // A torn frame ([`Self::note_repainting`]): its ink is a partial
+            // write, so the veil holds its level and moves again on the next
             // finished frame.
             level
         } else if dt > LETTER_VEIL_OFF_S && !resting {
@@ -8583,6 +8656,9 @@ impl PetBrain {
                 if park != self.pending_worn {
                     self.handoff_parked_clock = park.is_some().then_some(self.clock);
                     if park.is_some() {
+                        // The park edge owns the arrival. The host sends
+                        // `Ceremony` once and then re-syncs the same park with
+                        // `Quiet` every frame of the debounce, so only a new or
                         // changed park may overwrite it.
                         self.pending_arrival = arrival;
                     }
@@ -8653,6 +8729,7 @@ impl PetBrain {
     /// Whether the pet needs the host's 60 fps lane this frame.
     #[must_use]
     pub const fn needs_frames(&self) -> bool {
+        // A veil at its level is not easing: a still crouch under a word (the
         // hide) holds its floor without the train.
         if self.letter_veil.0 != self.letter_veil.2 && self.alpha > 0.0 && !self.repainting {
             return true;
@@ -8671,10 +8748,12 @@ impl PetBrain {
             return frames;
         }
         if self.alpha < 1.0 {
+            // Mid-fade, including alpha == 0 with a caret in view (the first
             // tick of a fade-in, where `dt` is 0).
             return self.last_caret.is_some() || self.alpha > 0.0;
         }
         if self.last_caret.is_none() {
+            // Opaque with the caret gone: the fade-out's first tick had zero
             // `dt`; the next one is owed.
             return true;
         }
@@ -8820,6 +8899,7 @@ impl PetBrain {
 
     fn next_change_secs(&self) -> Option<f32> {
         if self.alpha < 1.0 || self.last_caret.is_none() {
+            // Hidden, or a fade the frame train already owns (the first
             // clause of `needs_frames`): nothing of the settled cat's to offer.
             return None;
         }
@@ -8848,6 +8928,7 @@ impl PetBrain {
             soon.at(VIGIL_AFTER - self.vigil_t);
         }
         if self.last_reduced {
+            // Reduced motion draws one still per pose; the only edge left is
             // the ladder's sleep (the reduced arm of `tick` verdicts it).
             if self.action != PetAction::Sleep {
                 soon.at(SLEEP_AFTER - q);
@@ -8855,6 +8936,7 @@ impl PetBrain {
             return soon.0;
         }
         if self.action == PetAction::Sleep && q >= SLEEP_AFTER + BREATH_WINDOW {
+            // Deep sleep: byte-stable until an input, by law — the last z
             // died before the window closed, so this is `None`.
             return soon.0;
         }

@@ -40,8 +40,7 @@ fn tail_header(w: &JournalWriter<VecStore>, pos: u64) -> TailHeader {
     TailHeader::read(&head)
 }
 
-/// The header carries the writer's identity and the geometry, and the magic is written
-/// last: a region read before it is no region.
+/// Header layout writes writer identity and geometry, publishing the magic word last.
 #[test]
 fn create_lays_the_header_out_magic_last() {
     let geometry = Geometry::custom(64 * 1024, 4096, 4096).expect("layout");
@@ -81,7 +80,6 @@ fn create_lays_the_header_out_magic_last() {
         JournalWriter::create(VecStore::new(geometry.region_len), misaligned, &WRITER),
         Err(WriteError::Layout(LayoutError::Misaligned))
     ));
-    // The session id keeps its printable ASCII only.
     let odd = WriterIdentity {
         sid: "s 1\u{7}\u{e9}x",
         ..WRITER
@@ -95,10 +93,8 @@ fn create_lays_the_header_out_magic_last() {
     assert_eq!(&sid, b"s1x\0");
 }
 
-/// The tail ring: records land 8-aligned and in order, the commit and stream words
-/// follow each, the floor moves only onto record boundaries and only when a record would
-/// overwrite bytes above it, and a record that would straddle the ring's end goes to the
-/// start after a PAD, a gap of exactly a header's size included.
+/// Tail ring advances `tail_floor` onto record boundaries before overwriting and pads ring-end
+/// wraps.
 #[test]
 fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
     let mut w = small(96, 4096);
@@ -108,17 +104,12 @@ fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
     assert_eq!((w.tail_commit(), w.tail_floor()), (72, 0));
     assert_eq!(word_at(&w, OFF_TAIL_COMMIT), 72);
     assert_eq!(word_at(&w, OFF_STREAM_PROCESSED), 15);
-    // A 40-byte record (24 bytes of payload) would straddle the end at 72: a PAD fills
-    // [72, 96), the record lands at [96, 136) and overwrites [0, 40), so the floor moves
-    // past the two records it touches, onto the third's start.
     w.append_slice(b"0123456789abcdefghijklmn").expect("four");
     assert_eq!(w.tail_commit(), 136);
     assert_eq!(w.tail_floor(), 48, "the first record it does not overwrite");
     assert_eq!(word_at(&w, OFF_TAIL_FLOOR), 48);
     assert_eq!(tail_header(&w, 72).kind, KIND_PAD);
     assert_eq!(tail_header(&w, 72).record_len(), 24);
-    // With no keyframe committed, a settle has nothing to settle: the bytes below the
-    // floor stay as they are.
     let before = region_of(&w);
     w.settle_clear().expect("nothing to do");
     assert!(region_of(&w) == before, "no byte changed");
@@ -127,8 +118,6 @@ fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
         (moved.kind, moved.payload_len, moved.stream_end),
         (KIND_BYTES, 24, 39)
     );
-    // A gap of exactly a header gets its PAD too: the reader skips only a gap under a
-    // header, and reads these 16 bytes, here the last lap's payload, as a record.
     let mut exact = small(96, 4096);
     for _ in 0..3 {
         exact.append_slice(b"0123456789abcdef").expect("[0, 96)"); // 32 bytes each
@@ -143,15 +132,12 @@ fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
         .expect("a PAD, then [192, 216)");
     let pad = tail_header(&exact, 176);
     assert_eq!((pad.kind, pad.record_len()), (KIND_PAD, 16));
-    // Its one byte of padding is zeroed, not left as the last lap's payload.
     let mut padding = [0xFF];
     exact
         .store()
         .read(exact.geometry().tail_off + 23, &mut padding)
         .expect("inside");
     assert_eq!(padding, [0]);
-    // A gap under a header holds no PAD, and nothing lands past the ring's end. The
-    // record goes to the start over the last lap's payload, its 7 bytes of padding zeroed.
     let mut short = small(96, 4096);
     for bytes in [&b"abcdefgh"[..], b"0123456789abcdef", b"0123456789abcdef"] {
         short.append_slice(bytes).expect("[0, 88)"); // 24, 32 and 32 bytes
@@ -172,22 +158,18 @@ fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
         .read(short.geometry().tail_off + 17, &mut padding)
         .expect("inside");
     assert_eq!(padding, [0; 7]);
-    // Synthesized bytes are journaled but add nothing to the stream.
     w.append_synthesized(b"\x1bc").expect("five");
     assert_eq!(w.stream_processed(), 39);
-    // A slice longer than the ring's largest record is split.
     let mut big = small(64, 4096);
     big.append_slice(&[b'x'; 100]).expect("split");
     assert_eq!(big.stream_processed(), 100);
     assert!(big.tail_floor() > 0);
-    // In a full-size ring, at MAX_BYTES_PAYLOAD a record.
     let v1 = Geometry::v1();
     let mut full = JournalWriter::create(VecStore::new(v1.region_len), v1, &WRITER).expect("c");
     full.append_slice(&vec![b'x'; MAX_BYTES_PAYLOAD + 1])
         .expect("split");
     let two = 2 * TAIL_RECORD_HEADER + MAX_BYTES_PAYLOAD + 8;
     assert_eq!(full.tail_commit(), two as u64);
-    // A record larger than the whole ring is refused, and nothing is stored.
     let mut least = small(24, 4096);
     assert_eq!(
         least.append_resize(4, 20, ResizePolicy::Native, 1, 1),
@@ -196,9 +178,8 @@ fn the_tail_moves_its_floor_onto_boundaries_before_it_overwrites() {
     assert_eq!(least.tail_commit(), 0);
 }
 
-/// Keyframes alternate between the slots by sequence parity; a begun keyframe zeroes its
-/// slot's commit word before anything else and publishes it last; a keyframe too large
-/// for a slot stores nothing; forgetting the other slot leaves only the newest.
+/// Keyframes alternate slots by sequence parity, publish their commit word last, and clear the
+/// older slot on `settle_clear`.
 #[test]
 fn keyframes_alternate_slots_and_publish_last() {
     let mut w = small(4096, 4096);
@@ -259,7 +240,6 @@ fn keyframes_alternate_slots_and_publish_last() {
     assert!(!tiny.keyframe_in_progress());
     assert_eq!(word_at(&tiny, kf_commit_word(1)), 0, "nothing stored");
 
-    // A keyframe exactly a slot's size fits it, and a restore reads it.
     let (fit, len) = (0..64u8)
         .find_map(|n| {
             let mut t = Terminal::new(4, 20);
@@ -288,8 +268,6 @@ fn keyframes_alternate_slots_and_publish_last() {
         "{restored:?}"
     );
 
-    // A settle while a keyframe is being written leaves every byte as it was, the slot
-    // being written included (its older keyframe's bytes stay until the copy).
     let mut busy = small(4096, 4096);
     for _ in 0..2 {
         busy.write_keyframe(&ki).expect("committed");
@@ -298,9 +276,6 @@ fn keyframes_alternate_slots_and_publish_last() {
     let before = region_of(&busy);
     busy.settle_clear().expect("nothing to do");
     assert!(region_of(&busy) == before, "no byte changed");
-    // A record appended between a keyframe's begin and its finish, which the writer
-    // accepts, lies past that keyframe's tail_from: it is tail since the keyframe, and a
-    // settle's floor stays below it.
     busy.append_slice(b"after the capture").expect("appended");
     assert_eq!(busy.finish_keyframe(), Ok(3));
     assert_eq!(busy.tail_since_keyframe(), busy.tail_commit());
@@ -308,9 +283,8 @@ fn keyframes_alternate_slots_and_publish_last() {
     assert_eq!(busy.tail_floor(), 0, "the keyframe's tail_from");
 }
 
-/// The history ring: chunks are dense steps whose run the words bound; a chunk that would
-/// straddle the end goes to the start after a zeroed gap, evicting what it overlaps; a
-/// reset publishes the ring empty, and a clear zeroes every byte it ever held.
+/// History ring wraps after zeroing end gaps, evicts overlapped chunks, and zeroes touched bytes
+/// on a clearing reset.
 #[test]
 fn the_history_ring_wraps_evicts_and_clears() {
     let mut w = small(4096, 1024);
@@ -324,8 +298,6 @@ fn the_history_ring_wraps_evicts_and_clears() {
         .expect("reset");
     let mut row = fence.oldest;
     let mut seqs = Vec::new();
-    // Chunks of 8, 3 and 5 lines, so the laps do not line up and a gap falls over an
-    // earlier lap's chunk.
     let to_end = |w: &JournalWriter<VecStore>, hi: u64| {
         let at = (hi % 1024) as usize;
         let mut bytes = vec![0xFF; 1024 - at];
@@ -347,7 +319,6 @@ fn the_history_ring_wraps_evicts_and_clears() {
         seqs.push(w.append_history(row, &lines).expect("fits"));
         row += lines.len() as u64;
         if (w.history.hi - 1) / 1024 > hi / 1024 {
-            // It straddled the ring's end: the gap before it is zeroed, and touched.
             assert!(
                 to_end(&w, hi).iter().all(|b| *b == 0),
                 "a zeroed gap at {hi}"
@@ -387,7 +358,6 @@ fn the_history_ring_wraps_evicts_and_clears() {
         w.append_history(fence.oldest, &lines),
         Err(WriteError::TooLarge { .. })
     ));
-    // A reset's modulus is a multiple of 8, and never past the physical ring.
     w.reset_history(cleared, row, 1023, false)
         .expect("an odd cap");
     assert_eq!(w.history.cap(), 1016);
@@ -395,8 +365,6 @@ fn the_history_ring_wraps_evicts_and_clears() {
         .expect("a cap past the ring");
     assert_eq!((w.history.cap(), word_at(&w, OFF_HIST_CAP)), (1024, 1024));
 
-    // A chunk exactly the ring's size fits it; one exactly filling the room left to the
-    // ring's end lands there, with no gap and nothing evicted.
     let (lines, len) = (1..64usize)
         .find_map(|n| {
             let text: String = (0..n).map(|k| char::from(b'a' + (k % 26) as u8)).collect();
@@ -433,9 +401,7 @@ fn other_threads_words_need_no_writer() {
     assert_eq!(word_at(&w, OFF_CONFIG_FP), 0xAB);
 }
 
-/// A line of program output nothing else in the region could hold by chance: random
-/// hex, which LZ4 keeps as readable literals, so a byte search finds it wherever a
-/// keyframe, a tail record or a history chunk still holds it.
+/// Pseudo-random hex token that LZ4 keeps as readable literals for region byte searches.
 fn token(i: u64) -> String {
     let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
     x ^= x >> 31;
@@ -444,9 +410,7 @@ fn token(i: u64) -> String {
     format!("Q{x:016x}{:016x}Z", x.rotate_left(17))
 }
 
-/// How many of the tokens `range` a byte search of the whole region still finds: every
-/// 19-byte window of every run of lowercase hex the region holds, against the first 19
-/// hex digits of each token.
+/// Count how many tokens in `range` appear in a raw byte scan of the region.
 fn tokens_left<S: RegionStore>(w: &JournalWriter<S>, range: std::ops::Range<u64>) -> usize {
     const NEEDLE: usize = 19;
     let mut bytes = vec![0u8; w.store().len()];
@@ -477,11 +441,8 @@ fn keyframe_of<S: RegionStore>(w: &mut JournalWriter<S>, t: &Terminal, bridge: u
     .expect("a keyframe fits")
 }
 
-/// A clear (`clear`'s ED2 + ED3) leaves no byte from before it anywhere in the region
-/// (the plan's privacy claim 4): not in the history ring (the worker's reset zeroes it),
-/// not in the tail, not in the slot the forced keyframe did not take, and not in the
-/// slot it did take past its own record, where an earlier, longer keyframe left its
-/// tail bytes.
+/// A clear followed by `reset_history(..., true)`, a forced keyframe, and `settle_clear` leaves
+/// no pre-clear bytes in the region.
 #[test]
 fn a_clear_leaves_no_byte_from_before_it_in_the_region() {
     let geometry = Geometry::v1();
@@ -503,7 +464,6 @@ fn a_clear_leaves_no_byte_from_before_it_in_the_region() {
         t.process(line.as_bytes());
         w.append_slice(line.as_bytes()).expect("appended");
         if i == 599 {
-            // A big keyframe (seq 2, slot 0): 512 lines of bridge.
             keyframe_of(&mut w, &t, 512);
         }
         if i % 100 == 99 {
@@ -549,9 +509,8 @@ fn a_clear_leaves_no_byte_from_before_it_in_the_region() {
     assert_eq!(w.tail_floor(), w.tail_commit(), "the tail is rebased");
 }
 
-/// A clear zeroes every byte the history ring ever held, even after the adaptive cap
-/// shrank (plan §2.6 recomputes it every export tick) and the smaller ring wrapped: the
-/// bytes the larger ring wrote past the smaller one's end are pre-clear lines too.
+/// A clearing reset zeroes every byte the history ring ever touched, even after the adaptive cap
+/// shrank.
 #[test]
 fn a_clear_after_the_cap_shrank_zeroes_every_byte_the_ring_held() {
     let geometry = Geometry::custom(64 * 1024, 4096, 16 * 1024).expect("a test layout");
@@ -564,8 +523,6 @@ fn a_clear_after_the_cap_shrank_zeroes_every_byte_the_ring_held() {
         .expect("the full ring");
     let mut n = 0u64;
     let mut exported = fence.oldest;
-    // Export eight lines a chunk until the ring has written `upto` bytes and wrapped
-    // twice under its current modulus.
     let pump = |w: &mut JournalWriter<VecStore>,
                 t: &mut Terminal,
                 n: &mut u64,
@@ -609,18 +566,12 @@ fn a_clear_after_the_cap_shrank_zeroes_every_byte_the_ring_held() {
     );
 }
 
-/// A stop anywhere inside the clear settle restores as the region did before it: the
-/// newest keyframe and the tail past it are untouched, the other slot reads empty or
-/// whole, and the floor never passes the newest keyframe's `tail_from`. So the settle
-/// costs no restore anything, at any instruction.
+/// Stopping at any store inside `settle_clear` restores identically to the unsettled region.
 #[test]
 fn a_stop_anywhere_in_the_clear_settle_restores_as_before() {
     use crate::recover::{RecoverPolicy, Recovery, recover};
     use crate::store::CountdownStore;
     let geometry = Geometry::custom(64 * 1024, 1024, 4096).expect("a small region");
-    // The session up to the settle, and the settle itself when `settle`. (Each build
-    // gets a fresh engine, so the restores compare the keyframe by its positions, not
-    // by the engine-lifetime numbers in its head.)
     let build = |budget: Option<usize>, settle: bool| {
         let store = CountdownStore::new(geometry.region_len, budget);
         let mut w = JournalWriter::create(store, geometry, &WRITER).expect("created");
@@ -638,7 +589,6 @@ fn a_stop_anywhere_in_the_clear_settle_restores_as_before() {
         t.process(clear);
         w.append_slice(clear).expect("the clear");
         keyframe_of(&mut w, &t, 64); // the forced keyframe: short, in the long one's slot
-        // A slice after it: the settle must keep the live window.
         t.process(b"after\r\n");
         w.append_slice(b"after\r\n").expect("after");
         let before = w.store().stores();
@@ -691,10 +641,8 @@ fn a_stop_anywhere_in_the_clear_settle_restores_as_before() {
     }
 }
 
-/// The settle's floor is the keyframe's `tail_from` itself: when the record after the
-/// keyframe went to the ring's start behind a PAD, a floor on that record's start would
-/// read as an overflow of the keyframe's tail. The restore after the settle still replays
-/// it, exactly.
+/// `settle_clear` sets `tail_floor` to the keyframe's `tail_from` so a record wrapped behind a
+/// PAD still replays cleanly.
 #[test]
 fn the_settle_keeps_a_record_behind_a_pad() {
     use crate::recover::{RecoverPolicy, Recovery, recover};
@@ -730,27 +678,18 @@ fn the_settle_keeps_a_record_behind_a_pad() {
         Terminal::from_checkpoint(&r.checkpoint).row_text(1),
         t.row_text(1)
     );
-    // A record ending exactly one lap above the floor overwrites nothing the floor
-    // guards: the floor stays on tail_from, not on the record behind the PAD.
     w.append_slice(b"0123456789abcdef")
         .expect("[136, 168), over [40, 72)");
     assert_eq!(w.tail_floor(), 72);
 }
 
-/// AN ERASED REGION HOLDS NOTHING IT RECORDED AND READS AS NO REGION (R6 review). The
-/// memory shed's superseded region outlives its writer while the keeper holds it, and a
-/// clear made then has no writer left to settle it there, so the whole region is erased:
-/// no token a keyframe, the tail or the history ring held is left, a restore takes the
-/// META rung, no page nothing wrote is made resident, and a stop anywhere in the erase
-/// leaves either the region as it was (no store made yet) or one that reads as no region,
-/// never a screen rebuilt from what is left.
-/// NEGATIVE CONTROL: before the erase the region holds every token and restores a screen.
+/// `erase_region` zeroes all recorded content, preserves the turn-count marker, touches no
+/// unwritten pages, and never restores a partial screen if interrupted.
 #[test]
 fn an_erased_region_holds_nothing_it_recorded_and_reads_as_no_region() {
     use crate::recover::{RecoverPolicy, Recovery, recover};
     use crate::store::{CountdownStore, Touched};
     let geometry = Geometry::custom(64 * 1024, 4096, 16 * 1024).expect("a small region");
-    // The session's journal up to the erase, and the erase itself when `erase`.
     let build = |budget: Option<usize>, erase: bool| {
         let store = Touched::new(CountdownStore::new(geometry.region_len, budget), None);
         let mut w = JournalWriter::create(store, geometry, &WRITER).expect("created");
@@ -826,8 +765,6 @@ fn an_erased_region_holds_nothing_it_recorded_and_reads_as_no_region() {
         Some(47_000)
     );
     assert!(!restores(&erased), "the META rung");
-    // An arbitrary count word alone does not authorize the counter-only reader.
-    // The old zero-magic erase cannot carry it: the new marker is required.
     let legacy = erased.store().get_ref().snapshot();
     legacy
         .store_u64_release(OFF_MAGIC, 0)
@@ -866,9 +803,8 @@ fn an_erased_region_holds_nothing_it_recorded_and_reads_as_no_region() {
     }
 }
 
-/// The adaptive cap (the plan's §2.6): a line limit at the corpus's rate with a quarter to
-/// spare, never under 32 bytes a line or 256 KiB, never over the physical ring, the whole
-/// ring for an unlimited scrollback, always a multiple of 8.
+/// `adaptive_hist_cap` scales with the line limit and bytes-per-line floor while staying
+/// 8-byte aligned and within `[MIN_HIST_CAP, hist_cap_phys]`.
 #[test]
 fn the_adaptive_cap_follows_the_line_limit_and_the_corpus() {
     let phys = Geometry::v1().hist_cap_phys;
@@ -903,10 +839,8 @@ fn the_adaptive_cap_follows_the_line_limit_and_the_corpus() {
     }
 }
 
-/// The ring's writer is a value of its own over the region's store (the journal worker's,
-/// apart from the parse thread's writer): its chunks and words are what a single writer's
-/// would be, and its mirror says what the ring holds — the identity, the first and end
-/// rows, the bytes a line, and the bytes it ever touched.
+/// `HistoryWriter` operates independently over the store and tracks identity, row bounds,
+/// bytes per line, and touched bytes.
 #[test]
 fn the_ring_writer_stands_apart_from_the_journal_writer() {
     let mut w = small(4096, 8192);
@@ -939,8 +873,6 @@ fn the_ring_writer_stands_apart_from_the_journal_writer() {
     let per_line = ring.bytes_per_line().expect("lines");
     assert!(per_line > 0 && per_line < 200, "{per_line}");
     assert!(ring.touched() > 0 && ring.touched() <= 8192);
-    // The first chunk after a reset, straddling the new modulus's end, starts the run past
-    // the gap: the run's first word, and its bytes a line, count the chunk alone.
     let lines = t
         .history_lines_since_fence(&fence, fence.oldest, 4)
         .expect("holds");
@@ -957,8 +889,6 @@ fn the_ring_writer_stands_apart_from_the_journal_writer() {
     let len = ring.hi - modulus as u64;
     assert_eq!(word_at(&fresh, OFF_HIST_LO), modulus as u64);
     assert_eq!(ring.bytes_per_line(), Some(len.div_ceil(4)));
-    // The next straddles too and evicts the whole run: the run starts past its gap, at
-    // that chunk alone.
     ring.append_chunk(fresh.store(), 8, &lines)
         .expect("after the gap");
     let start = 2 * modulus as u64;
@@ -967,7 +897,6 @@ fn the_ring_writer_stands_apart_from_the_journal_writer() {
         (start, Some(8))
     );
     assert_eq!(ring.bytes_per_line(), Some((ring.hi - start).div_ceil(4)));
-    // The tail goes on beside it, through the journal writer.
     w.append_slice(b"the tail, beside the ring")
         .expect("appended");
     assert_eq!(
@@ -977,10 +906,7 @@ fn the_ring_writer_stands_apart_from_the_journal_writer() {
     );
 }
 
-// The control slot (increment 7)
-
-/// A small layout with a control slot of `ctl_cap` bytes between the tail and the ring
-/// (`Geometry::custom` packs none).
+/// Build a test geometry with a `ctl_cap`-byte control slot between the tail and history rings.
 fn with_control(ctl_cap: usize) -> Geometry {
     let g = Geometry::custom(4096, 1024, 4096).expect("a test layout");
     let hist_off = g.tail_off + g.tail_cap + ctl_cap;
@@ -994,8 +920,7 @@ fn with_control(ctl_cap: usize) -> Geometry {
     geometry
 }
 
-/// Carry `i`: a long carry for odd `i`, a short one for even, so a short record is
-/// written over a long one and the slot's stale bytes are exercised.
+/// Alternating long (odd `i`) and short (even `i`) control payloads.
 fn control_carry(i: u64) -> Vec<u8> {
     let n = if i % 2 == 1 { 300 } else { 7 };
     (0..n)
@@ -1007,8 +932,8 @@ fn control_of<V: RegionView + ?Sized>(view: &V, geometry: &Geometry) -> ControlV
     crate::recover::read_control(view, geometry)
 }
 
-/// A carry round-trips through the slot, and the next replaces it whole: a shorter record
-/// written over a longer one leaves no byte of the longer one past it.
+/// Control records round-trip through the slot and zero any trailing bytes from a longer prior
+/// record.
 #[test]
 fn a_control_record_round_trips_and_replaces_the_one_before() {
     let geometry = with_control(8192);
@@ -1039,8 +964,7 @@ fn a_control_record_round_trips_and_replaces_the_one_before() {
     );
 }
 
-/// A carry too large for the slot is refused with nothing stored: the slot still holds
-/// the record before it.
+/// An oversized control carry is refused without modifying the slot.
 #[test]
 fn a_control_carry_past_the_slot_is_refused_and_stores_nothing() {
     let geometry = with_control(256);
@@ -1049,7 +973,6 @@ fn a_control_carry_past_the_slot_is_refused_and_stores_nothing() {
     let small = b"turn 1 settled".to_vec();
     assert_eq!(ctl.write(&store, &geometry, &small), Ok(1));
     let stores = store.stores();
-    // Incompressible: a stream of distinct words.
     let big: Vec<u8> = (0u64..4096)
         .flat_map(|k| k.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes())
         .collect();
@@ -1066,7 +989,6 @@ fn a_control_carry_past_the_slot_is_refused_and_stores_nothing() {
             carry: small
         }
     );
-    // A layout with no slot refuses every carry.
     let none = Geometry::custom(4096, 1024, 4096).expect("a test layout");
     assert!(matches!(
         ControlWriter::new().write(&VecStore::new(none.region_len), &none, b"x"),
@@ -1078,10 +1000,7 @@ fn a_control_carry_past_the_slot_is_refused_and_stores_nothing() {
     );
 }
 
-/// What a death after `budget` primitive stores of `writes` control writes (carries 1, 2,
-/// …) leaves the slot holding, with `fault` planted; and how many stores the whole run
-/// makes. The run starts with the window's count word stored ([`store_ctl_count`]), as a
-/// window stores it before any carry; it is the first store, so `budget` counts it.
+/// Run `writes` control writes stopped after `budget` primitive stores (with optional `fault`).
 fn control_death(
     geometry: &Geometry,
     writes: u64,
@@ -1105,17 +1024,10 @@ fn control_death(
     (control_of(&snapshot, geometry), count, store.stores())
 }
 
-/// The count [`control_death`] stores before its writes.
 const CONTROL_COUNT: u64 = 4_242;
 
-/// Every verdict a death at any primitive store of a run of control writes leaves that is
-/// not what the one-slot protocol promises (module doc, "Control slot"), and every death
-/// that cost the count word: the sweep's findings (empty for a sound writer).
-///
-/// What it promises, for a death after `k` stores: when `k` is where write `i` ended and
-/// the next had not begun, write `i`'s carry (none before the first); inside write `i + 1`,
-/// no carry or exactly write `i + 1`'s, under its sequence number. Never write `i`'s
-/// carry from inside write `i + 1`: one slot, so the carry it held is lost with it.
+/// Return any `(store_budget, verdict)` pairs across a 4-write run that violate the one-slot
+/// control protocol or lose `OFF_CTL_COUNT`.
 fn control_sweep(fault: Option<WriterFault>) -> Vec<(usize, ControlVerdict)> {
     let geometry = with_control(8192);
     let writes = 4;
@@ -1132,7 +1044,6 @@ fn control_sweep(fault: Option<WriterFault>) -> Vec<(usize, ControlVerdict)> {
         seq,
         carry: control_carry(seq),
     };
-    // Where each write ended: `ends[i]` stores (the count word's included) after write `i`.
     let mut ends = vec![control_death(&geometry, 0, None, fault).2];
     for i in 1..=writes {
         ends.push(control_death(&geometry, i, None, fault).2);
@@ -1148,7 +1059,6 @@ fn control_sweep(fault: Option<WriterFault>) -> Vec<(usize, ControlVerdict)> {
             (None, Some(i)) => verdict == ControlVerdict::Empty || verdict == valid(i),
             (None, None) => false,
         };
-        // The count word is stored first and no control write touches it.
         let counted = k == 0 || count == CONTROL_COUNT;
         if !promised || !counted {
             bad.push((k, verdict));
@@ -1157,17 +1067,8 @@ fn control_sweep(fault: Option<WriterFault>) -> Vec<(usize, ControlVerdict)> {
     bad
 }
 
-/// THE CONTROL SLOT'S DEATH SWEEP (the plan's increment 7 test, "a torn slot yields no
-/// carry, never a wrong one"): a writer killed after every primitive store of a run of
-/// writes (long, short, long, short records) leaves the slot empty or holding exactly a
-/// carry one write wrote, under that write's sequence number, never a record the reader
-/// must refuse. A write's carry stands from its last store until the next write's first:
-/// ONE slot, so a death inside a write loses the carry the slot held before it too
-/// ([`control_sweep`] holds the writer to exactly that). The window's count word, which no
-/// control write touches, survives every death. NEGATIVE CONTROL: a writer that stores the
-/// commit word with the new sequence number before its copy (`ControlPublishEarly`), right
-/// once each write ends, leaves a slot whose commit word names a record it does not hold,
-/// and the sweep finds it.
+/// Stopping at any store during control writes yields `Empty` or a complete record, whereas
+/// `ControlPublishEarly` is caught.
 #[test]
 fn every_death_inside_a_control_write_leaves_no_carry_or_a_whole_one() {
     assert_eq!(control_sweep(None), Vec::new());
@@ -1180,9 +1081,7 @@ fn every_death_inside_a_control_write_leaves_no_carry_or_a_whole_one() {
     );
 }
 
-/// A shed's fresh region is given the slot's record as it is, under its sequence number;
-/// a death inside that copy leaves the fresh region empty or holding it, never another; a
-/// source never written gives nothing.
+/// `carry_into` copies the control record atomically into a fresh region.
 #[test]
 fn a_fresh_region_is_given_the_control_record_whole() {
     let geometry = with_control(8192);
@@ -1207,8 +1106,6 @@ fn a_fresh_region_is_given_the_control_record_whole() {
             "a death after {k} stores: {got:?}"
         );
     }
-    // The writer goes on in the fresh region from the copied record: the next write is
-    // the next sequence number, and a shorter record leaves none of the copy past it.
     ctl.write(&whole, &geometry, &control_carry(4))
         .expect("written");
     assert_eq!(
@@ -1226,9 +1123,8 @@ fn a_fresh_region_is_given_the_control_record_whole() {
     assert_eq!(fresh.stores(), 0, "an empty slot copies nothing");
 }
 
-/// Damage the commit word does not explain is refused, never read as a carry: every
-/// single-byte change to a valid record, a commit word naming another record, and a
-/// length past the slot or of zero.
+/// Single-byte corruption, mismatched commit sequence, or out-of-range length in the control
+/// slot is refused.
 #[test]
 fn a_damaged_control_slot_is_refused_never_read_as_a_carry() {
     let geometry = with_control(8192);

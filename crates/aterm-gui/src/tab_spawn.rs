@@ -107,7 +107,7 @@ pub(crate) enum SpawnPlace {
 
 impl SpawnPlace {
     /// The window this spawn was asked from, whose input waits for it and whose folder it inherits.
-    fn asked_from(self, window: WindowId) -> Option<WindowId> {
+    const fn asked_from(self, window: WindowId) -> Option<WindowId> {
         match self {
             Self::Window { from } => from,
             Self::Tab | Self::Split(_) => Some(window),
@@ -363,7 +363,7 @@ struct Held {
 }
 
 /// Whether `event` is pointer input held for a tab or split landing in its window.
-fn is_pointer(event: &WindowEvent) -> bool {
+const fn is_pointer(event: &WindowEvent) -> bool {
     matches!(
         event,
         WindowEvent::CursorMoved { .. }
@@ -375,7 +375,7 @@ fn is_pointer(event: &WindowEvent) -> bool {
 }
 
 /// A key press or an IME commit: what the "Keystrokes dropped" row counts.
-fn is_keystroke(event: &WindowEvent) -> bool {
+const fn is_keystroke(event: &WindowEvent) -> bool {
     matches!(event, WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed())
         || matches!(event, WindowEvent::Ime(aterm_window::event::Ime::Commit(_)))
 }
@@ -506,7 +506,7 @@ struct ReplayFloor {
 
 impl TabSpawns {
     /// Whether no spawn is queued or running.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.in_flight.is_empty()
     }
 

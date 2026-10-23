@@ -2,18 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Budgeted, resumable full-content search.
-//!
-//! [`Terminal::indexed_search`] answers repeat queries in O(1), but the first query after a
-//! content change pays the whole index rebuild in one call. [`Terminal::search_budgeted`]
-//! runs the same search in slices: each call verifies at most `row_budget` rows and
-//! delivers at most 4,096 match deltas via [`aterm_search::BudgetedSearch`], then returns a
-//! cursor, so the caller can yield between slices and cancel a superseded search.
-//!
-//! A cursor is valid only for its `(query, case_sensitive, is_regex)` and the snapshot key
-//! `(alternate_screen, content_seq())` the one-shot index uses. Any mismatch (changed
-//! content or pattern, a dropped or forged cursor) starts over from row zero and the step
-//! says `reset`. A completed search is consistent because every slice saw the same key.
+//! Budgeted, resumable full-content search across scrollback and visible rows.
 
 use super::search_index::ONE_SHOT_SEARCH;
 use super::search_rows::history_row_for_search;
@@ -21,15 +10,11 @@ use super::{SearchKey, Terminal};
 use crate::search::{BudgetedSearch, SearchOptionsError, SearchResults};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Maximum match records copied out per turn, so a dense search does not keep marshalling
-/// an ever-growing prefix (verification stays row-budgeted).
 const MAX_MATCHES_PER_STEP: usize = 4_096;
 
-/// Cursor token source, unique module-wide so a cursor from another live Terminal is never
-/// accepted. Separate wasm module instances are distinct cursor domains: hosts keep a
-/// cursor with its originating engine.
 static NEXT_BUDGETED_SEARCH_CURSOR: AtomicU64 = AtomicU64::new(1);
 
+// Trust renamed this to try_update; stable x86 slice still exposes fetch_update.
 #[allow(deprecated)] // Trust renamed this to try_update; stable x86 slice still exposes fetch_update.
 #[inline]
 fn allocate_cursor(counter: &AtomicU64) -> Option<u64> {
@@ -50,8 +35,6 @@ pub enum BudgetedSearchError {
     CursorSpaceExhausted,
 }
 
-// Piece-wise `write_str` + `Display::fmt`, never a runtime-argument `format_args!` (the
-// Trust lane fails closed on its unsafe constructor).
 impl std::fmt::Display for BudgetedSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -73,9 +56,6 @@ impl From<SearchOptionsError> for BudgetedSearchError {
     }
 }
 
-/// Lifecycle of a retained budgeted search: `InFlight` keeps the cursor live; `Complete`
-/// keeps the verified matches for `search_summary` but retires the cursor, so presenting it
-/// restarts.
 #[derive(PartialEq, Eq)]
 enum ScanPhase {
     InFlight,
@@ -85,47 +65,31 @@ enum ScanPhase {
 /// Budgeted search state in `Terminal::budgeted_search`: at most one per terminal, a new
 /// search supersedes it.
 pub(crate) struct BudgetedSearchState {
-    /// Cursor token issued to the caller; must match to resume.
     cursor: u64,
-    /// Snapshot key: which grid was active when the search started.
     alt_screen: bool,
-    /// Snapshot key: the active grid's `content_seq()` at start.
     content_gen: u64,
-    /// The query the cursor was issued for.
     query: String,
-    /// Case sensitivity the cursor was issued for.
     case_sensitive: bool,
-    /// Regex mode the cursor was issued for.
     is_regex: bool,
-    /// The `ambiguous_width` policy at start (a live switch moves no `content_seq`).
     ambiguous_width: aterm_types::text_shaping::AmbiguousWidth,
-    /// Scrollback line count at start (any change bumps `content_seq`); rows below it are
-    /// history lines.
     scrollback: usize,
-    /// The incremental engine: verified matches + progress; no retained rows.
     engine: BudgetedSearch,
-    /// Number of stable match records already delivered to the caller.
     emitted_matches: usize,
-    /// A `Complete` state stays for `search_summary` until a fresh start supersedes it or
-    /// `release_search_index()` frees it; its cursor is spent.
     phase: ScanPhase,
 }
 
 /// One slice of a budgeted search: the results so far plus resume state.
 #[derive(Debug)]
 pub struct BudgetedSearchStep {
-    /// The new match delta plus incompleteness/watermark metadata. Once `complete`, the
-    /// concatenated `matches` equal a one-shot [`Terminal::indexed_search`] query.
+    /// The new match delta plus incompleteness and watermark metadata.
     pub results: SearchResults,
     /// Every row has been verified and every match delta delivered.
     pub complete: bool,
     /// Token to resume with; `None` once complete.
     pub cursor: Option<u64>,
-    /// Stable identity of this logical search, kept on the completing step too; a changed
-    /// identity means earlier deltas belong to a superseded snapshot.
+    /// Stable identity of this logical search, kept on the completing step too.
     pub search_id: u64,
-    /// This call started a fresh logical search (first call, supersession, or a stale,
-    /// changed-query or foreign cursor): clear accumulated deltas before appending.
+    /// Whether this call started a fresh logical search.
     pub reset: bool,
     /// Rows consumed so far (monotone within one search; restarts reset it).
     pub rows_fed: usize,
@@ -135,10 +99,7 @@ pub struct BudgetedSearchStep {
 
 impl Terminal {
     /// Run at most `row_budget` rows (at least 1) of a full-content search, resuming from
-    /// `resume_cursor` while it is valid (module docs). A turn may drain a bounded match
-    /// backlog without advancing `rows_fed`. Drive to `complete` by passing each step's
-    /// cursor back and appending its result deltas. A row whose regex scan runs out of
-    /// budget is counted in `cut_short_lines`, as the one-shot search counts it.
+    /// `resume_cursor` while it is valid.
     ///
     /// # Errors
     /// Pattern errors from the engine (invalid or oversized regex, regex feature disabled),
@@ -263,7 +224,6 @@ impl Terminal {
 
         let resumable = match (resume_cursor, &self.budgeted_search) {
             (Some(cursor), Some(state)) => {
-                // A completed state is never resumable; it is kept for `search_summary`.
                 state.phase == ScanPhase::InFlight
                     && state.cursor == cursor
                     && state.alt_screen == key_alt
@@ -278,13 +238,11 @@ impl Terminal {
 
         let reset = !resumable;
         if reset {
-            // Fresh start: whatever was in flight is superseded and its cursor dies.
             self.budgeted_search = None;
             let grid = &self.grid;
             let oldest = usize::try_from(grid.oldest_absolute_row()).unwrap_or(usize::MAX);
             let scrollback = grid.scrollback_lines();
             let total_rows = scrollback.saturating_add(usize::from(self.rows()));
-            // The one-shot index's window: the rows past it are fed unverified.
             let window = SearchKey::capture(self, ONE_SHOT_SEARCH.depth_cap).max_lines;
             let engine = BudgetedSearch::with_max_cached_lines(
                 query,
@@ -312,14 +270,11 @@ impl Terminal {
             });
         }
 
-        // Taken out so row reads (&self) don't conflict with feeding the engine.
         let mut state = self
             .budgeted_search
             .take()
             .expect("budgeted_search populated above");
 
-        // Drain a large match backlog before scanning more rows, bounding both the payload
-        // and the per-turn copying.
         let backlog = state
             .engine
             .result_count()
@@ -334,8 +289,6 @@ impl Terminal {
                 .min(state.engine.total_rows())
         };
         self.feed_budgeted_history(&mut state, end);
-        // Visible rows: the walk above fed every history row below `end` (`hist_end <= end
-        // <= total_rows`), so every row left here is visible.
         while state.engine.rows_fed() < end {
             let i = state.engine.rows_fed();
             let (text, cells) = i
@@ -361,8 +314,6 @@ impl Terminal {
             rows_fed: state.engine.rows_fed(),
             total_rows: state.engine.total_rows(),
         };
-        // Kept either way: incomplete for resume, complete so a same-key `search_summary`
-        // reads its matches without rebuilding (the spent cursor cannot resume it).
         state.phase = if complete {
             ScanPhase::Complete
         } else {
@@ -372,11 +323,6 @@ impl Terminal {
         Ok(step)
     }
 
-    /// Feed the history rows below `end`. The results-equality contract needs the same row
-    /// sources (and bounded history read) as the one-shot build, which copies its rows
-    /// through `Terminal::read_search_rows`: the same dense walk (item `k` is
-    /// `get_history_line(start + k)`, an unreadable line a `None` placeholder, empty text),
-    /// padded with placeholders should the walk be shorter than the keyed retained count.
     fn feed_budgeted_history(&self, state: &mut BudgetedSearchState, end: usize) {
         let hist_start = state.engine.rows_fed();
         let hist_end = end.min(state.scrollback);
@@ -394,8 +340,7 @@ impl Terminal {
         }
     }
 
-    /// Drop any budgeted search (its matches and scratch; an outstanding cursor would
-    /// restart). Call when the search UI closes or a query is abandoned between slices.
+    /// Drop any budgeted search (its matches and scratch; an outstanding cursor restarts).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -409,11 +354,8 @@ impl Terminal {
         self.budgeted_search = None;
     }
 
-    /// Results for a federated `search_summary`: a budgeted search for the same
-    /// `(query, case_sensitive, is_regex)` completed over the current snapshot answers
-    /// directly, with no rebuild ([`search_index_rebuilds`](Self::search_index_rebuilds)
-    /// unchanged); a miss falls back to [`indexed_search`](Self::indexed_search). Both give
-    /// identical results (`budgeted_completion_equals_one_shot_all_modes`).
+    /// Results for a federated `search_summary`, reading a matching completed budgeted search
+    /// directly or falling back to [`indexed_search`](Self::indexed_search).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -465,8 +407,6 @@ mod tests {
             .expect("one-shot search")
     }
 
-    /// Drive a budgeted search to completion at `budget` rows per step: the concatenated
-    /// deltas and the step count.
     fn drive(
         t: &mut Terminal,
         query: &str,
@@ -521,8 +461,6 @@ mod tests {
         t
     }
 
-    /// Over a corrupt tiered segment every budget reproduces the one-shot results: both
-    /// walk history the same dense way.
     #[test]
     fn budgeted_completion_equals_one_shot_over_a_corrupt_tiered_segment() {
         for budget in [1, 3, 7, 1_000] {
@@ -534,8 +472,6 @@ mod tests {
         }
     }
 
-    /// For every filter mode and several budgets, driving to completion equals the one-shot
-    /// search: matches, incomplete flag and watermark.
     #[test]
     fn budgeted_completion_equals_one_shot_all_modes() {
         let cases: &[(&str, bool, bool)] = &[
@@ -564,7 +500,6 @@ mod tests {
         }
     }
 
-    /// An invalid regex propagates the engine error and retains no state.
     #[test]
     fn invalid_regex_errors_and_keeps_no_state() {
         let mut t = seeded_terminal();
@@ -573,10 +508,6 @@ mod tests {
         assert_eq!(got, one_shot(&mut t, "NEEDLE", true, false));
     }
 
-    /// A row the per-line regex budget cannot afford is reported as the one-shot search
-    /// reports it: counted in `cut_short_lines`, results incomplete, the rows around it
-    /// searched. Both shapes: one search over budget, and a `find_iter` whose searches each
-    /// fit but together re-walk the row quadratically.
     #[test]
     fn an_unaffordable_regex_row_is_reported_not_passed_off() {
         for (pattern, row) in [
@@ -602,7 +533,6 @@ mod tests {
         }
     }
 
-    /// A cursor from another live Terminal restarts, even with matching query and content.
     #[test]
     fn foreign_terminal_cursor_restarts_with_a_unique_token() {
         let mut a = seeded_terminal();
@@ -625,7 +555,6 @@ mod tests {
         assert_ne!(restarted.search_id, b_first.search_id);
     }
 
-    /// The allocator fails closed at the boundary instead of wrapping to a reissued token.
     #[test]
     fn cursor_allocator_never_wraps() {
         let counter = AtomicU64::new(u64::MAX - 1);
@@ -634,8 +563,6 @@ mod tests {
         assert_eq!(allocate_cursor(&counter), None);
     }
 
-    /// After a budgeted search completes, `search_summary` reads its retained results with
-    /// no rebuild; once content changes, the fallback rebuilds.
     #[test]
     fn search_summary_reads_completed_index_with_zero_rebuild() {
         let mut t = seeded_terminal();
@@ -660,11 +587,9 @@ mod tests {
             "the retained-index read equals the budgeted completion"
         );
 
-        // After the no-rebuild check: this builds the one-shot index.
         let oracle = one_shot(&mut t, "NEEDLE", true, false);
         assert_eq!(summary, oracle, "retained read equals the one-shot search");
 
-        // Negative control: changed content misses the retained key and rebuilds.
         t.process(b"NEEDLE-appended after completion\r\n");
         let before_miss = t.search_index_rebuilds();
         let missed = t
@@ -681,8 +606,6 @@ mod tests {
         );
     }
 
-    /// `release_search_index` frees a completed search's retained results, so a later
-    /// `search_summary` rebuilds.
     #[test]
     fn a_released_completed_index_is_rebuilt_by_the_next_summary() {
         let mut t = seeded_terminal();

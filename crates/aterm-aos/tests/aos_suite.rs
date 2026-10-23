@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The aterm-aos integration suite: every integration test file is a `mod` here.
-//!
-//! `toy` is the task every test hosts (an accumulator with an intentionally introduced
-//! demonstration fault); the other modules each test one module of the crate.
+//! Integration test harness for `aterm-aos`.
 
 mod toy;
 

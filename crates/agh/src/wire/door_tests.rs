@@ -2,16 +2,13 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The door's in-crate cases: `Endpoints` and `Origin`s that name a host of their own, which
-//! only the crate can build (by struct literal). The credential is `Credential::for_tests`, and
-//! each case calls the crate-private `for_origin`.
+//! In-crate tests for `AuthHeader::for_origin` across endpoint and origin configurations.
 
 use super::AuthHeader;
 use crate::identity::Credential;
 use crate::policy::Tier;
 use crate::wire::{Endpoints, Origin};
 
-/// A loopback port for the cases that name one.
 const PORT: u16 = 47_001;
 
 fn origin(scheme: &'static str, host: &str, port: u16) -> Origin {
@@ -22,7 +19,6 @@ fn origin(scheme: &'static str, host: &str, port: u16) -> Origin {
     }
 }
 
-/// An `Endpoints` whose api and uploads origins are both `api`; web and CDN are elsewhere.
 fn endpoints_with(api: Origin) -> Endpoints {
     Endpoints {
         uploads: api.clone(),

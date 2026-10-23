@@ -101,6 +101,7 @@ impl<'a> VariationTuples<'a> {
         self.reserve(self.len().saturating_add(1));
         match self {
             Self::Stack { headers, len } => {
+                // `reserve` keeps the stack only while a slot is free, so
                 // this slot exists.
                 if let Some(slot) = headers.get_mut(usize::from(*len)) {
                     *slot = header;
@@ -349,6 +350,7 @@ fn parse_tuple_variation_header(
                 }
             }
         } else if v == 0 || v < cmp::min(0, peak) || v > cmp::max(0, peak) {
+            // 'If the instance coordinate is out of range for some axis, then the
             // region and its associated deltas are not applicable.'
             return Some(header);
         } else {

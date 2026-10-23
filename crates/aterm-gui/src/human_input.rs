@@ -404,7 +404,7 @@ pub(crate) fn reaches_program(
 }
 
 /// Whether `ev` is a person's deliberate gesture toward a session (see the module doc): everything but a key release, bare pointer motion, a focus change and a geometry change.
-pub(crate) fn is_person_gesture(ev: &InputEvent) -> bool {
+pub(crate) const fn is_person_gesture(ev: &InputEvent) -> bool {
     match ev {
         InputEvent::Key { event_type, .. } => {
             !matches!(event_type, aterm_types::keyboard::KeyEventType::Release)

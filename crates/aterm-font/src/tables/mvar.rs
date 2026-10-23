@@ -5,8 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Metrics Variations Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/mvar) implementation.
+//! Metrics Variations Table (`MVAR`) implementation.
 
 use crate::parser::{FromData, LazyArray16, Offset, Offset16, Stream};
 use crate::var_store::ItemVariationStore;
@@ -33,8 +32,7 @@ impl FromData for ValueRecord {
     }
 }
 
-/// A [Metrics Variations Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/mvar).
+/// A Metrics Variations Table (`MVAR`).
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
     variation_store: ItemVariationStore<'a>,

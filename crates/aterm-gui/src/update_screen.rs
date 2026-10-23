@@ -329,7 +329,7 @@ impl UpdateState {
     }
 
     /// "Check for updates automatically" as this process runs it (`running`: the value `aterm_update::automatic` read at launch) and as saved (`saved`: `app_config::update_checks_automatic`, which the next launch reads).
-    pub(crate) fn with_automatic_checks(mut self, running: bool, saved: bool) -> Self {
+    pub(crate) const fn with_automatic_checks(mut self, running: bool, saved: bool) -> Self {
         self.automatic_checks = running;
         self.automatic_checks_saved = saved;
         self
@@ -348,7 +348,7 @@ impl UpdateState {
     }
 
     /// Where this copy runs from (`App::install_posture`): a copy that can't update itself is told its one cause and remedy, not a guess between three.
-    pub(crate) fn with_install_posture(
+    pub(crate) const fn with_install_posture(
         mut self,
         posture: Option<aterm_update::which_copy::InstallPosture>,
     ) -> Self {
@@ -357,13 +357,13 @@ impl UpdateState {
     }
 
     /// The staged build is on hold (`App::latched_activation_trial_spent`): the page says so, and its button starts nothing.
-    pub(crate) fn with_staged_on_hold(mut self, on_hold: bool) -> Self {
+    pub(crate) const fn with_staged_on_hold(mut self, on_hold: bool) -> Self {
         self.staged_on_hold = on_hold;
         self
     }
 
     /// A build on offer that is on hold ([`Self::staged_on_hold`]).
-    fn on_hold(&self) -> bool {
+    const fn on_hold(&self) -> bool {
         self.enabled && self.staged.is_some() && self.staged_on_hold
     }
 
@@ -463,7 +463,10 @@ impl UpdateState {
 
     /// The persistent failure is in the apply class (the staged build will not start), as
     /// opposed to an acquisition class (`manifest`, `pipeline`, `network`, `stage`).
-    fn apply_is_failing(&self) -> bool {
+    const fn apply_is_failing(&self) -> bool {
+        // Not `failing_kind == "apply"`: that is the last class to fail, so a machine
+        // whose apply lane escalated but whose latest failure was a network blip
+        // would hide it, and a single apply failure under an escalated `pipeline`
         // streak would wrongly claim it. The apply streak itself is the statement.
         self.failing_applies >= aterm_update::PERSISTENT_AFTER
     }
@@ -496,21 +499,30 @@ impl UpdateState {
         if self.checking {
             "Checking for updates\u{2026}".to_string()
         } else if self.installable == UpdateInstallability::Unobserved {
+            // Nothing has read this copy yet (the startup or first-open reconcile is
+            // in flight): it may be an installed copy or one that can't replace
+            // itself, so the page claims neither — no "up to date", no "can't update
             // itself", no timing for the switches.
             UPDATE_UNOBSERVED_HEADLINE.to_string()
         } else if self.linux_host {
             if let Some(fact) = self.linux_fact_headline() {
                 fact.to_string()
             } else if !self.automatic_checks {
+                // The Linux updater reads `[update] enabled` as macOS's does (once per
+                // process, gating only its background checker), so the idle arm speaks for
                 // the checker this process runs. Every Linux arm above outranks it.
                 "Automatic checks are off.".to_string()
             } else {
                 "No update staged.".to_string()
             }
         } else if self.on_hold() {
+            // Not "ready": no surface starts a build on hold (the band's record
+            // says "is on hold" too). The count and the cause, when the ledger
             // still has them, ride the detail line below.
             "Update on hold".to_string()
         } else if self.staged.is_some() && self.enabled && self.apply_is_failing() {
+            // Only the apply class earns this: the health notice points here and this line
+            // must not contradict it. A `manifest`/`pipeline` streak is about acquiring the
             // next build; the stage in hand is verified and will install.
             "Update keeps failing to install.".to_string()
         } else if self.apply_trouble().is_some() {
@@ -527,15 +539,21 @@ impl UpdateState {
                 None => "This copy of aterm can\u{2019}t update itself.".to_string(),
             }
         } else if !self.enabled {
+            // No native updater on this platform (Linux answers in its own ladder above),
+            // so the line does not call the updater macOS-only. The Settings switch is not
             // this: off, it stops only the background checker (the arm below).
             "aterm doesn\u{2019}t update itself on this platform.".to_string()
         } else if self.channel_unreadable {
+            // Stranded: the channel cannot be read and the state records zero ledger
             // failures, so the `failing_persistent` arm below never catches it.
             "aterm can\u{2019}t check for updates on this machine.".to_string()
         } else if self.failing_persistent {
+            // Never "up to date" while the ledger says otherwise. The cause, in words, is the
             // detail; the ledger's own sentence is `aterm ctl update status`'s and the log's.
             "Updates are failing on this machine.".to_string()
         } else if !self.automatic_checks {
+            // Nothing in this process looks by itself, so "up to date" would describe a
+            // check that is not running. Short: the medium workbench gives the hero line
             // ~320pt, and "Automatic update checks are off." ellipsized there.
             "Automatic checks are off.".to_string()
         } else {
@@ -606,6 +624,8 @@ impl UpdateState {
                         });
                     }
                     if status.trial_phase.is_some() && !status.trial_healthy {
+                        // Only once the new executable is in place (`Installed`: the
+                        // installed build is the trial's); mid-install or mid-rollback
                         // nothing waits for a launch yet.
                         if status.trial_phase.as_deref() == Some("Installed") {
                             facts.push(format!(
@@ -632,6 +652,7 @@ impl UpdateState {
             return (!detail.is_empty()).then_some(detail);
         }
         if self.installable == UpdateInstallability::Unobserved {
+            // The headline says the copy is being read; no detail claims anything
             // about it before that read lands.
             return None;
         }
@@ -695,6 +716,8 @@ impl UpdateState {
             });
         }
         if self.failing_persistent && !self.checking && self.enabled {
+            // A build that predates the channel's keys (the one `manifest` sentence that
+            // says "reinstall") can never check again: the one check failure a person must
             // act on, so its remedy is on the page. Every other class clears by itself.
             if self.failing_kind == "manifest" && self.outcome.contains("reinstall") {
                 return Some(

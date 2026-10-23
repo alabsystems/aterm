@@ -457,6 +457,7 @@ impl ChannelRelease for FakeChannel<'_> {
             match publish::after_upload_post(settle, || Ok(stored))? {
                 publish::AfterUploadPost::Converge { journal } => {
                     // Its bytes are ours by construction; the journal names it again if the
+                    // retraction dropped it.
                     if journal {
                         self.github.upload_intents.push(name.clone());
                     }

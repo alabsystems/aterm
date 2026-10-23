@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `wasm-glue` oracle lane holding toy goldens and `drive.mjs` against `wasm-bindgen` 0.2.108.
+//! `wasm-glue` oracle lane holding toy goldens and `drive.mjs` against `wasm-bindgen` 0.2.108:
+//! its `--target web` glue for a `#[wasm_bindgen]` twin of the toy, driven in the same browser
+//! page the toy's own glue is ([`super::toy::drive`]).
 //! STOCK EXCEPTION: `rustup`'s `stable` carries the `wasm32` `std` that Trust lacks.
 
 use aterm_uds::output::CommandOutput as _;
@@ -10,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use aterm_uds::spawnfd::command;
 
-use super::Flavor;
-use super::toy::{STEM, flavor_name, golden_dir, toy_dir};
+use super::toy::{GLUE, STEM, golden_dir, toy_dir};
 use crate::perf::{LaneRun, Status};
+use crate::wasm_page::Refused;
 
 /// Pinned `wasm-bindgen` crate and CLI version.
 pub const BINDGEN: &str = aterm_uds::host::pinned_version("wasm-bindgen");
@@ -174,22 +176,26 @@ const TOY_RUNTIME: &str = "aterm_wasm_abi::export_runtime!();";
 
 /// Runs the `wasm-glue` oracle check over `root`, building in `work`.
 pub(crate) fn gate(root: &Path, work: &Path, log: &mut String) -> LaneRun {
-    let rustup = match super::toy::stable_wasm32() {
+    let browser = match crate::wasm_page::browser() {
+        Ok(browser) => browser,
+        Err(refused) => return refused.verdict("the oracle's driver"),
+    };
+    let rustup = match crate::perf::wasm::build_tools(false) {
         Ok(rustup) => rustup,
-        Err(skip) => return skip,
+        Err(unrun) => return unrun,
     };
     let bindgen = match bindgen_at(root, &rustup) {
         Ok(bindgen) => bindgen,
         Err(skip) => return skip,
     };
     let _ = writeln!(log, "  wasm-bindgen: {} ({BINDGEN})", bindgen.display());
-    match run(root, &rustup, &bindgen, work, log) {
+    match run(root, &rustup, &browser, &bindgen, work, log) {
         Ok(findings) if findings.is_empty() => LaneRun::pass(),
         Ok(findings) => LaneRun {
             status: Status::Fail(findings),
             ..LaneRun::pass()
         },
-        Err(e) => LaneRun::fail(e),
+        Err(refused) => refused.verdict("the oracle's driver"),
     }
 }
 
@@ -197,77 +203,80 @@ pub(crate) fn gate(root: &Path, work: &Path, log: &mut String) -> LaneRun {
 fn run(
     root: &Path,
     rustup: &Path,
+    browser: &crate::wasm_page::Browser,
     bindgen: &Path,
     work: &Path,
     log: &mut String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, Refused> {
     let toy = toy_dir(root);
-    let twin = twin_source(&read(&toy.join("src/lib.rs"))?)?;
+    let twin = twin_source(&read(&toy.join("src/lib.rs"))?).map_err(Refused::Failed)?;
     let staged = work.join("twin");
-    let manifest = super::toy::stage(root, &staged)?;
-    std::fs::write(&manifest, twin_manifest(&read(&manifest)?)?)
-        .map_err(|e| format!("could not write the twin's manifest: {e}"))?;
+    let manifest = super::toy::stage(root, &staged).map_err(Refused::Failed)?;
+    std::fs::write(
+        &manifest,
+        twin_manifest(&read(&manifest)?).map_err(Refused::Failed)?,
+    )
+    .map_err(|e| Refused::Failed(format!("could not write the twin's manifest: {e}")))?;
     std::fs::write(staged.join("src/lib.rs"), twin)
-        .map_err(|e| format!("could not write the twin's source: {e}"))?;
+        .map_err(|e| Refused::Failed(format!("could not write the twin's source: {e}")))?;
     let module = super::toy::build_staged(
         rustup,
         &manifest,
         &work.join("target"),
         "the wasm-bindgen twin",
         log,
-    )?;
+    )
+    .map_err(Refused::Failed)?;
 
-    let glue = work.join("glue");
-    if glue.exists() {
-        std::fs::remove_dir_all(&glue)
-            .map_err(|e| format!("could not clear {}: {e}", glue.display()))?;
+    let site = work.join("site");
+    if site.exists() {
+        std::fs::remove_dir_all(&site)
+            .map_err(|e| Refused::Failed(format!("could not clear {}: {e}", site.display())))?;
     }
-    for flavor in [Flavor::Nodejs, Flavor::Web] {
-        let name = flavor_name(flavor);
-        let out = command(bindgen)
-            .args(["--target", name, "--out-dir"])
-            .arg(glue.join(name))
-            .arg(&module)
-            .output_owned()
-            .map_err(|e| format!("could not run {}: {e}", bindgen.display()))?;
-        if !out.status.success() {
-            return Err(format!(
-                "wasm-bindgen --target {name} exited {:?}:\n{}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim_end()
-            ));
-        }
+    let glue = site.join(GLUE);
+    let out = command(bindgen)
+        .args(["--target", "web", "--out-dir"])
+        .arg(&glue)
+        .arg(&module)
+        .output_owned()
+        .map_err(|e| Refused::Failed(format!("could not run {}: {e}", bindgen.display())))?;
+    if !out.status.success() {
+        return Err(Refused::Failed(format!(
+            "wasm-bindgen --target web exited {:?}:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim_end()
+        )));
     }
 
-    let (passed, stderr) = super::toy::drive(&toy.join("drive.mjs"), &glue)?;
-    let mut findings = judge_drive(passed, &stderr);
+    let mut page = super::toy::start_page(browser, root, &site, work)?;
+    let glue_url = format!("../{GLUE}/{STEM}.js");
+    let (passed, console) = super::toy::drive(&mut page, &glue_url)?;
+    let mut findings = judge_drive(passed, &console);
     if findings.is_empty() {
         let _ = writeln!(
             log,
             "  wasm-bindgen {BINDGEN} meets every drive.mjs check but the STRICTER ones, \
-             and fails `another class` in both flavors"
+             and fails `another class`"
         );
     }
 
     let before = findings.len();
-    for flavor in [Flavor::Nodejs, Flavor::Web] {
-        let name = flavor_name(flavor);
-        let golden = read(&golden_dir(root, flavor).join(format!("{STEM}.d.ts")))?;
-        let theirs = declarations(&read(&glue.join(name).join(format!("{STEM}.d.ts")))?);
-        findings.extend(judge_declarations(name, &golden, &theirs));
-    }
+    let golden = read(&golden_dir(root).join(format!("{STEM}.d.ts")))?;
+    let theirs = declarations(&read(&glue.join(format!("{STEM}.d.ts")))?);
+    findings.extend(judge_declarations(&golden, &theirs));
     if findings.len() == before {
         let _ = writeln!(
             log,
             "  the golden .d.ts declarations are wasm-bindgen {BINDGEN}'s, parameter names \
-             included; a renamed parameter is caught in both flavors"
+             included; a renamed parameter is caught"
         );
     }
     Ok(findings)
 }
 
-fn read(path: &Path) -> Result<String, String> {
-    std::fs::read_to_string(path).map_err(|e| format!("could not read {}: {e}", path.display()))
+fn read(path: &Path) -> Result<String, Refused> {
+    std::fs::read_to_string(path)
+        .map_err(|e| Refused::Failed(format!("could not read {}: {e}", path.display())))
 }
 
 /// The twin's source: the toy's, with `#[export]` spelled `#[wasm_bindgen]`
@@ -328,8 +337,7 @@ fn twin_manifest(staged: &str) -> Result<String, String> {
 }
 
 /// `drive.mjs`'s run on wasm-bindgen's glue, judged: it must fail, and only
-/// the checks it marks STRICTER ([`stricter`]), `another class` among them in
-/// both flavors.
+/// the checks it marks STRICTER ([`stricter`]), `another class` among them.
 fn judge_drive(passed: bool, stderr: &str) -> Vec<String> {
     let mut findings = Vec::new();
     let fails: Vec<&str> = stderr
@@ -355,14 +363,14 @@ fn judge_drive(passed: bool, stderr: &str) -> Vec<String> {
             unexpected.join("\n")
         ));
     }
-    for flavor in ["nodejs", "web"] {
-        let mark = format!("wasm-glue: FAIL {flavor} classes another class:");
-        if !fails.iter().any(|l| l.starts_with(&mark)) {
-            findings.push(format!(
-                "NEGATIVE CONTROL: `another class` held on {flavor}: not wasm-bindgen's glue, \
-                 or a vacuous run"
-            ));
-        }
+    if !fails
+        .iter()
+        .any(|l| l.starts_with("wasm-glue: FAIL web classes another class:"))
+    {
+        findings.push(
+            "NEGATIVE CONTROL: `another class` held: not wasm-bindgen's glue, or a vacuous run"
+                .to_string(),
+        );
     }
     findings
 }
@@ -425,10 +433,10 @@ fn missing_from<'a>(a: &'a [String], b: &[String]) -> Vec<&'a str> {
     out
 }
 
-/// One flavor's golden .d.ts against wasm-bindgen's `theirs` declarations,
+/// The golden .d.ts against wasm-bindgen's `theirs` declarations,
 /// and the NEGATIVE CONTROL: the golden with its first `(v: ` parameter
 /// renamed must not match.
-fn judge_declarations(flavor: &str, golden: &str, theirs: &[String]) -> Vec<String> {
+fn judge_declarations(golden: &str, theirs: &[String]) -> Vec<String> {
     let mut findings = Vec::new();
     let ours = declarations(golden);
     if ours != theirs {
@@ -440,20 +448,18 @@ fn judge_declarations(flavor: &str, golden: &str, theirs: &[String]) -> Vec<Stri
             let _ = writeln!(diff, "> {line}");
         }
         findings.push(format!(
-            "the {flavor} golden .d.ts declares otherwise than wasm-bindgen \
+            "the golden .d.ts declares otherwise than wasm-bindgen \
              (< wasm-bindgen, > golden):\n{}",
             diff.trim_end()
         ));
     }
     let planted = golden.replacen("(v: ", "(planted: ", 1);
     if planted == golden {
-        findings.push(format!(
-            "NEGATIVE CONTROL: no `(v: ` in the {flavor} golden .d.ts to plant in"
-        ));
+        findings.push("NEGATIVE CONTROL: no `(v: ` in the golden .d.ts to plant in".to_string());
     } else if declarations(&planted) == theirs {
-        findings.push(format!(
-            "NEGATIVE CONTROL: a {flavor} .d.ts with a parameter renamed matched wasm-bindgen's"
-        ));
+        findings.push(
+            "NEGATIVE CONTROL: a .d.ts with a parameter renamed matched wasm-bindgen's".to_string(),
+        );
     }
     findings
 }
@@ -494,29 +500,28 @@ mod tests {
         assert!(twin_manifest("[package]\nname = \"t\"\n").is_err());
     }
 
-    const RUN: &str = "wasm-glue: nodejs scalars: 40 checks\n\
-                       wasm-glue: FAIL nodejs classes another class: no throw\n\
-                       wasm-glue: FAIL nodejs misuse throws 100k: leaked\n\
+    const RUN: &str = "wasm-glue: web scalars: 40 checks\n\
                        wasm-glue: FAIL web classes another class: no throw\n\
-                       wasm-glue: 3 checks FAILED\n";
+                       wasm-glue: FAIL web misuse throws 100k: leaked\n\
+                       wasm-glue: 2 checks FAILED\n";
 
     /// wasm-bindgen's run passes only when it fails the STRICTER checks and
-    /// nothing else, `another class` in both flavors.
+    /// nothing else, `another class` among them.
     #[test]
     fn the_drive_verdict_wants_exactly_the_stricter_failures() {
         assert_eq!(judge_drive(false, RUN), Vec::<String>::new());
         let held = RUN.replace("wasm-glue: FAIL web classes another class: no throw\n", "");
         let found = judge_drive(false, &held);
         assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].contains("held on web"), "{found:?}");
+        assert!(found[0].contains("`another class` held"), "{found:?}");
         let extra = RUN.replace(
-            "wasm-glue: 3",
-            "wasm-glue: FAIL nodejs scalars u32 max is unsigned: -1\nwasm-glue: 4",
+            "wasm-glue: 2",
+            "wasm-glue: FAIL web scalars u32 max is unsigned: -1\nwasm-glue: 3",
         );
         assert!(judge_drive(false, &extra)[0].contains("u32 max"));
         let passed = "wasm-glue: every check held\n";
-        assert_eq!(judge_drive(true, passed).len(), 3);
-        let died = RUN.replace("wasm-glue: 3 checks FAILED\n", "TypeError: boom\n");
+        assert_eq!(judge_drive(true, passed).len(), 2);
+        let died = RUN.replace("wasm-glue: 2 checks FAILED\n", "TypeError: boom\n");
         assert!(judge_drive(false, &died)[0].contains("TypeError: boom"));
     }
 
@@ -545,17 +550,14 @@ mod tests {
     #[test]
     fn a_golden_matches_only_wasm_bindgens_declarations() {
         let theirs = declarations(DTS);
-        assert_eq!(
-            judge_declarations("web", DTS, &theirs),
-            Vec::<String>::new()
-        );
+        assert_eq!(judge_declarations(DTS, &theirs), Vec::<String>::new());
         let reordered = DTS.replace(
             "  free(): void;\n  add(by: bigint): bigint;\n  readonly value: number;",
             "  readonly value: number;\n  add(by: bigint): bigint;\n  free(): void;",
         );
         assert_ne!(reordered, DTS);
         assert_eq!(
-            judge_declarations("web", &reordered, &theirs),
+            judge_declarations(&reordered, &theirs),
             Vec::<String>::new()
         );
         let moved = DTS.replace("  add(by: bigint): bigint;\n", "")
@@ -582,7 +584,7 @@ mod tests {
             ),
         ] {
             assert_ne!(golden, DTS);
-            let found = judge_declarations("web", &golden, expected);
+            let found = judge_declarations(&golden, expected);
             if found.is_empty() {
                 missed.push(change);
             } else {
@@ -598,7 +600,7 @@ mod tests {
             "undetected declaration changes: {missed:?}"
         );
         let renamed = DTS.replace("(by: ", "(n: ");
-        let found = judge_declarations("web", &renamed, &theirs);
+        let found = judge_declarations(&renamed, &theirs);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(
             found[0].contains("< export class Counter :: add(by: bigint): bigint;"),
@@ -611,11 +613,11 @@ mod tests {
             found[0]
         );
         let bare = DTS.replace("(v: ", "(x: ");
-        let found = judge_declarations("web", &bare, &declarations(&bare));
+        let found = judge_declarations(&bare, &declarations(&bare));
         assert_eq!(found.len(), 1);
         assert!(found[0].contains("no `(v: `"), "{found:?}");
         let comment = format!("// (v: x\n{DTS}");
-        let found = judge_declarations("web", &comment, &theirs);
+        let found = judge_declarations(&comment, &theirs);
         assert!(found[0].contains("matched wasm-bindgen's"), "{found:?}");
     }
 

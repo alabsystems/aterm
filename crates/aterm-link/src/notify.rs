@@ -174,6 +174,7 @@ impl Sel {
             }
             Sel::Ask(p) => {
                 // `/f/<F>/in/p/<p>/<src>/ask`, by position from the left: the
+                // literal owner `p`, the watched principal, and the sender.
                 if segs.len() != 8
                     || segs[3] != "in"
                     || segs[4] != "p"
@@ -2264,6 +2265,7 @@ mod tests {
             .unwrap();
             if !matches!(ended, Ended::Clean) {
                 // What a stop that never reached the clean close leaves
+                // (astream's seam): the log as a killed run left it.
                 opened.broker.arm_unclean_stop();
             }
             let mut server = opened.broker.serve(&sock).unwrap();

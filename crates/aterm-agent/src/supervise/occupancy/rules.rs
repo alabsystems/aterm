@@ -89,6 +89,14 @@ impl RuleId {
         Self::ALL.into_iter().find(|rule| rule.name() == name)
     }
 
+    /// The kind of fact its line tells: both built-ins tell the hold's.
+    #[must_use]
+    pub const fn kind(self) -> crate::supervise::facts::FactKind {
+        match self {
+            RuleId::WaitNudge | RuleId::HoldRoom => crate::supervise::facts::FactKind::Hold,
+        }
+    }
+
     /// Its slot in a per-rule array.
     #[must_use]
     pub const fn index(self) -> usize {
@@ -161,19 +169,26 @@ impl Guards {
         if let Some(brake) = self.brake {
             return Some(brake);
         }
-        let held = [
-            (self.person, Guard::Person),
-            (self.halted, Guard::Halted),
-            (self.draft, Guard::Draft),
-            (self.taskless, Guard::Taskless),
-            (self.exchange, Guard::Exchange),
-            (self.managed, Guard::Managed),
-            (self.memory, Guard::Memory),
-            (self.reach_down, Guard::Reach),
-            (!modes(rule).contains(&self.mode), Guard::Autopilot),
-        ];
-        held.into_iter()
-            .find_map(|(holds, guard)| holds.then_some(guard))
+        self.each(rule)
+            .into_iter()
+            .find_map(|(guard, holds)| holds.then_some(guard))
+    }
+
+    /// Each guard past the brake, in [`Self::held`]'s order, with whether it holds a line of
+    /// `rule`: what `occupancy why`'s guards line marks (design §6).
+    #[must_use]
+    pub fn each(&self, rule: RuleId) -> [(Guard, bool); 9] {
+        [
+            (Guard::Person, self.person),
+            (Guard::Halted, self.halted),
+            (Guard::Draft, self.draft),
+            (Guard::Taskless, self.taskless),
+            (Guard::Exchange, self.exchange),
+            (Guard::Managed, self.managed),
+            (Guard::Memory, self.memory),
+            (Guard::Reach, self.reach_down),
+            (Guard::Autopilot, !modes(rule).contains(&self.mode)),
+        ]
     }
 }
 
@@ -286,6 +301,18 @@ pub fn wants_reading(hold: Option<HoldSeen>, books: &Books, now_ms: i64) -> bool
     hold.is_some_and(|hold| {
         holds_but_machine(RuleId::HoldRoom, hold, books, now_ms)
             && !spent(RuleId::HoldRoom, books, now_ms)
+    })
+}
+
+/// THE READY PROXY (§6, idle-while-ready): `hold-room`'s terms but its cadence, its cap and
+/// the guards hold at `now_ms` on `r` — the hold past [`HOLD_ROOM_AFTER_MS`], the board fresh,
+/// its slot term, its machine terms and `disk=ok` met, in a session whose jobs held a build
+/// slot during the hold. A session the host counts as ready while build slots stand idle.
+#[must_use]
+pub fn ready(r: &OccupancyReading, hold: Option<HoldSeen>, now_ms: i64) -> bool {
+    hold.is_some_and(|hold| {
+        now_ms.saturating_sub(hold.since_ms) >= HOLD_ROOM_AFTER_MS
+            && line(RuleId::HoldRoom, r, hold, now_ms).is_some()
     })
 }
 

@@ -179,7 +179,9 @@ pub fn boot(prefix: &str, args: &[&str]) -> Instance {
     )
 }
 
-/// Arm `cmd` — a `--headless` launch, before any `-e` payload.
+/// Arm `cmd` — a `--headless` launch, before any `-e` payload — with its ready
+/// signal (`--ready-fd`, the FIFO in `dir`): the instance says once that its
+/// control socket listens, and [`await_ready`] waits on that word.
 ///
 /// # Panics
 /// The FIFO could not be made in `dir`: a scratch world this test cannot write to is a broken fixture.
@@ -375,7 +377,9 @@ fn prove_standins_resolve(inst: &Instance, standins: &[PathBuf]) {
     }
 }
 
-/// What the instance's own login shell.
+/// What the instance's own login shell — its boot session's — names each of
+/// `names` (`command -v`, which runs nothing): one entry a name, empty where
+/// nothing answers.
 ///
 /// # Panics
 /// A name a shell would read as more than one word, or a scratch root it would read as more than one quoted word, is a broken fixture.

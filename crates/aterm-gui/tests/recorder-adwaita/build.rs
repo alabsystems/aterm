@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Copies sctk-adwaita 0.10.1's `buttons.rs`, `config.rs`, `theme.rs` and
-//! `shadow.rs` (MIT, Copyright (c) 2022 Bartłomiej Maryńczak; the crate's
-//! LICENSE goes with them as `LICENSE-sctk-adwaita`) from the registry into
-//! `OUT_DIR`, each checked against the SHA-256 of the file the recording was
-//! made from. Two mechanical edits let `include!` take a file as a module's
-//! body: its inner doc lines (`//!`) are dropped, and `use
-//! crate::smithay_client_toolkit;` goes first, so the files' paths into
-//! smithay-client-toolkit name the recorder's stand-in (src/main.rs).
+//! Copies and verifies `sctk-adwaita` 0.10.1 sources (MIT, Copyright (c) 2022 Bartłomiej Maryńczak) into `OUT_DIR`.
 
 use std::path::{Path, PathBuf};
 
@@ -33,8 +26,7 @@ const FILES: [(&str, &str); 4] = [
     ),
 ];
 
-/// The registry's unpacked `sctk-adwaita-0.10.1`, under `$CARGO_HOME`
-/// (`~/.cargo` when unset).
+/// Locates the unpacked `sctk-adwaita` crate in the Cargo registry.
 fn source() -> PathBuf {
     let home = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)

@@ -13,7 +13,6 @@ use crate::app_colorscheme::ThemeChange;
 use crate::app_config::ThemeCatalog;
 use crate::control::control_media::{ThemeForm, parse_theme_form};
 
-/// A headless App drawing `toml` (installed as a config reload would).
 fn app_with(toml: &str) -> App {
     let mut app = App::headless_for_test();
     app.config = aterm_toml::from_str(toml).expect("valid toml");
@@ -25,8 +24,6 @@ fn builtin(name: &str) -> ColorScheme {
     aterm_types::scheme::builtin(name).expect("built-in")
 }
 
-/// Every one of session 0's 256 palette entries and its default colours: the
-/// engine half of what a theme install changes.
 fn engine_colors(app: &App) -> (Vec<Rgb>, Rgb, Rgb) {
     let term = crate::term_lock(&app.pool.get(0).expect("session 0").term);
     let palette = (0..=255u8).map(|i| term.palette_color(i)).collect();
@@ -37,14 +34,10 @@ fn engine_colors(app: &App) -> (Vec<Rgb>, Rgb, Rgb) {
     )
 }
 
-/// What a person and a program can see of the theme: the renderer's chrome,
-/// the engine palette and defaults, and the image-meta fingerprint.
 fn visible(app: &App) -> (aterm_render::Theme, (Vec<Rgb>, Rgb, Rgb), u64) {
     (app.theme, engine_colors(app), app.image_theme_fingerprint())
 }
 
-/// The durable side: the config lane's text and revision, and nothing queued
-/// for it.
 fn durable(app: &App) -> (String, u64, usize) {
     let snapshot = app.native_config_service.snapshot();
     (
@@ -58,7 +51,6 @@ fn run(app: &mut App, op: ThemeCtlOp, now: Instant) -> Result<String, String> {
     run_on(app, op, None, now)
 }
 
-/// [`run`] aimed at `session` (the session path's `@<sid>`).
 fn run_on(
     app: &mut App,
     op: ThemeCtlOp,
@@ -81,9 +73,6 @@ fn preview(app: &mut App, id: &str, ttl: Duration, now: Instant) -> Result<Strin
     )
 }
 
-/// A preview changes the chrome and every session's palette and writes
-/// nothing; revert puts back exactly what was drawn before. Negative control:
-/// a name that does not resolve is refused and changes nothing.
 #[test]
 fn control_theme_preview_draws_without_writing_and_revert_restores_exactly() {
     let mut app = app_with("theme = \"Dracula\"\n");
@@ -126,9 +115,6 @@ fn control_theme_preview_draws_without_writing_and_revert_restores_exactly() {
     assert_eq!(visible(&app), before);
 }
 
-/// The TTL is read on the clock the caller hands in: the preview stands until
-/// the instant it was given, the event loop is armed at exactly that instant,
-/// and then the configured theme comes back by itself.
 #[test]
 fn control_theme_preview_expires_on_the_injected_clock() {
     let mut app = app_with("theme = \"Dracula\"\n");
@@ -150,9 +136,6 @@ fn control_theme_preview_expires_on_the_injected_clock() {
     assert!(!app.expire_theme_preview(t0 + ttl * 2), "expires once");
 }
 
-/// A config reload ends the preview and draws what the config draws; a
-/// catalog reload keeps a preview that still draws; an OS flip keeps it and
-/// draws its other side; a second preview keeps the first one's `restore`.
 #[test]
 fn control_theme_preview_ends_at_a_reload_and_follows_an_os_flip() {
     let mut app = app_with("theme = \"Dracula\"\n");
@@ -198,10 +181,6 @@ fn control_theme_preview_ends_at_a_reload_and_follows_an_os_flip() {
     assert_eq!(app.installed_colors.id, "Nord");
 }
 
-/// Saving a previewed theme's file redraws the preview, whatever holds it (a
-/// `theme preview`, a palette choice in flight): the catalog reload keeps it
-/// and resolves it against the new file. Negative control: once the file is
-/// gone the preview ends and the configured theme is drawn.
 #[test]
 fn a_catalog_reload_redraws_a_preview_and_ends_one_whose_file_left() {
     let scheme = |bg| ColorScheme {
@@ -235,12 +214,6 @@ fn a_catalog_reload_redraws_a_preview_and_ends_one_whose_file_left() {
     }
 }
 
-/// A config reload while a Settings trial stands (an edit elsewhere on the
-/// page, any save of `aterm.toml`) resolves once with the trial: the screen
-/// does not bounce to the configured theme and back, so a mode-2031 program
-/// is pushed nothing and the sessions get at most one `apply_config`.
-/// Negative control: the same reload ends a `theme preview`, and the program
-/// is told the scheme went back.
 #[cfg(unix)]
 #[test]
 fn a_config_reload_keeps_a_settings_trial_without_a_bounce() {
@@ -301,9 +274,6 @@ fn a_config_reload_keeps_a_settings_trial_without_a_bounce() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A background a program set with OSC 11 is the program's: a preview and its
-/// revert move the theme under it and leave it on screen. Negative control: a
-/// session whose program set nothing follows the preview.
 #[test]
 fn control_theme_program_osc11_survives_preview_then_revert() {
     let mut app = app_with("theme = \"Dracula\"\n");
@@ -337,9 +307,6 @@ fn control_theme_program_osc11_survives_preview_then_revert() {
     assert_eq!(bg(&app, 0), builtin("Dracula").background);
 }
 
-/// The status line answers from App state: the file a theme came from, the
-/// side the OS picked, why a configured name misses, what is reported, and
-/// the 16-entry palette.
 #[test]
 fn control_theme_status_names_source_side_miss_and_palette() {
     let mut app = App::headless_for_test();
@@ -397,8 +364,6 @@ fn control_theme_status_names_source_side_miss_and_palette() {
     assert!(status.contains("source=builtin"), "{status}");
 }
 
-/// `theme list` is one quoted row per theme the instance can name, the drawn
-/// one marked, and a closing folder row; no row can carry a newline.
 #[test]
 fn control_theme_list_marks_the_drawn_theme_and_quotes_labels() {
     let mut app = app_with("theme = \"GitHub Light\"\n");
@@ -435,8 +400,6 @@ fn control_theme_list_marks_the_drawn_theme_and_quotes_labels() {
     );
 }
 
-/// `theme commit` with nothing previewed is refused at once and queues
-/// nothing.
 #[test]
 fn control_theme_commit_without_a_preview_is_refused() {
     let mut app = app_with("theme = \"Dracula\"\n");
@@ -445,8 +408,6 @@ fn control_theme_commit_without_a_preview_is_refused() {
     assert!(app.native_config_pending.is_empty());
 }
 
-/// The control-thread grammar: every form, a spaced or quoted preview name,
-/// `ttl=` anywhere once and in range, and junk refused with the usage line.
 #[test]
 fn control_theme_form_grammar() {
     let op = |op| Ok(ThemeForm::Op(op));
@@ -530,7 +491,6 @@ fn control_theme_form_grammar() {
     }
 }
 
-/// Point the open Settings view's Themes page at `trial`.
 fn set_settings_trial(app: &mut App, trial: crate::native_settings::showcase_page::ShowcaseTrial) {
     let (_, _, view, _) = app.native_settings_view_target().expect("a Settings view");
     let Some(crate::native_app::AppViewState::Settings(state)) =
@@ -546,9 +506,6 @@ fn trying(id: &str) -> crate::native_settings::showcase_page::ShowcaseTrial {
     crate::native_settings::showcase_page::ShowcaseTrial::Trying { id: id.to_string() }
 }
 
-/// Settings ▸ Themes' trial draws the tried theme everywhere and writes
-/// nothing; each way it ends — Revert (no trial), leaving the page, closing
-/// Settings — puts back exactly what was drawn, by the one per-turn rule.
 #[test]
 fn settings_trial_draws_without_writing_and_every_ending_reverts() {
     let mut app = app_with("theme = \"Hearth\"\n");
@@ -597,11 +554,6 @@ fn settings_trial_draws_without_writing_and_every_ending_reverts() {
     }
 }
 
-/// A preview something else holds (`theme preview`) is not taken over by a
-/// Settings trial: the trial is refused and the view told which preview is
-/// showing, so it never offers to Keep a theme the screen is not drawing. A
-/// trial the catalog cannot draw is refused the same way. Negative control:
-/// the same trial with no other preview standing is drawn.
 #[test]
 fn settings_trial_never_takes_over_a_ctl_preview_and_refuses_a_missing_theme() {
     let mut app = app_with("");
@@ -649,7 +601,6 @@ fn settings_trial_never_takes_over_a_ctl_preview_and_refuses_a_missing_theme() {
     );
 }
 
-/// One `key=value` field of a status line.
 fn field<'a>(status: &'a str, key: &str) -> &'a str {
     status
         .split_whitespace()
@@ -657,11 +608,6 @@ fn field<'a>(status: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{key} in {status}"))
 }
 
-/// `theme` names the chrome accent, where it came from and who set it: a
-/// grey-cursor theme borrows its ANSI blue, a coloured cursor is the accent,
-/// and a config `accent_color` is authored by the config. NEGATIVE CONTROL:
-/// with nothing authored, every chrome key's origin is `default` and the
-/// selected tab has no colour.
 #[test]
 fn theme_status_line_reports_chrome() {
     let now = Instant::now();
@@ -700,7 +646,6 @@ fn theme_status_line_reports_chrome() {
     assert_eq!(field(&status, "border_from"), "default");
 }
 
-/// The value of a `key="…"` field (Rust `{:?}` escaping), unescaped.
 fn quoted_field(status: &str, key: &str) -> String {
     let start = status
         .find(&format!(" {key}=\""))
@@ -719,10 +664,6 @@ fn quoted_field(status: &str, key: &str) -> String {
     panic!("{key} is unterminated in {status}");
 }
 
-/// `theme` names the typography the drawn theme applies, the keys a config
-/// key beat, and the size scale, each escaped so a font name with a quote in
-/// it cannot split the line. NEGATIVE CONTROL: a theme without typography
-/// reports `-` for all three.
 #[test]
 fn theme_status_line_reports_typography() {
     let now = Instant::now();
@@ -761,7 +702,6 @@ fn theme_status_line_reports_typography() {
     }
 }
 
-/// A community pack theme no file and no built-in answers to.
 fn pack_only_id() -> &'static str {
     aterm_theme_pack::themes()
         .iter()
@@ -780,9 +720,6 @@ fn scratch_themes(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// A pack theme resolves from the embedded pack for a preview, and only for
-/// one: a configured `theme` naming it with no file draws Default, as any
-/// missing name does.
 #[test]
 fn pack_ids_resolve_for_preview_only() {
     use crate::resolved_colors::ThemeSource;
@@ -838,8 +775,6 @@ fn theme_preview_unavailable_refuses_an_unknown_id() {
     assert_eq!(durable(&app).2, 0, "a pack preview writes nothing");
 }
 
-/// Committing a preview the pack draws installs its file first, reads the
-/// folder into the catalog, and only then queues the `theme` write.
 #[test]
 fn committing_a_pack_preview_installs_then_commits() {
     let id = pack_only_id();

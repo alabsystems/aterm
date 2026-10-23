@@ -4,20 +4,34 @@
 //! THE OCCUPANCY FACTS BOARD (`docs/DESIGN-harness-occupancy-2026-10-20.md`,).
 //! Under the same lock it keeps the pace and reservation table (design §4.2, [`Pace`]),
 //! which a loop under `occupancy = "prompt"` takes before it books its intent ([`pace_for`]).
+//!
+//! SURFACING (§6, slice 1e). Under the same lock, too: what each session's loop last told
+//! ([`told`], `IdleHost::occupancy_said`), from which each look judges the sessions whose hold
+//! is ready ([`rules::ready`]) and the build slots idle while they were
+//! ([`ring::idle_ready_ms`]); the minute look's row, kept a day in memory and appended to the
+//! facts ring (`<state>/occupancy/facts.ring`) while the owner's mode observes ([`set_mode`],
+//! [`append_look`]); the status fields ([`status_fields`]); and the `occupancy` verb
+//! ([`cmd_occupancy`]).
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use aterm_agent::harness::disk::Level;
+use aterm_agent::supervise::Occupancy;
 use aterm_agent::supervise::memory::Pressure as MemoryPressure;
-use aterm_agent::supervise::occupancy::rules::{HOLD_ROOM_MACHINE, HOLD_ROOM_SLOTS};
-use aterm_agent::supervise::occupancy::{OccupancyReading, PaceGrant, RuleId, SlotsSeen};
+use aterm_agent::supervise::occupancy::ring::{self, RingRow, RingSession};
+use aterm_agent::supervise::occupancy::rules::{self, HOLD_ROOM_MACHINE, HOLD_ROOM_SLOTS};
+use aterm_agent::supervise::occupancy::{
+    HoldSeen, OccupancyReading, OccupancySaid, PaceGrant, RuleId, SlotsSeen,
+};
 use aterm_sysprobe::slots::{SlotsRead, Unread};
 use aterm_uds::process::ProcessStart;
 use aterm_vitals::model::{Pressure, ProcSample, SlotsUnread, SlotsView, Snapshot, TabRoot};
 use aterm_vitals::sys::predicate::{AwaitSys, Latch, Parsed, evaluate};
+
+use crate::occupancy_ring::RingFile;
 
 /// A board whose snapshot is older than this (two disk looks) is stale.
 pub(crate) const STALE_AFTER: Duration =
@@ -62,7 +76,9 @@ fn x100(load: f64) -> Option<u32> {
         .then(|| (load * 100.0).round().min(f64::from(u32::MAX)) as u32)
 }
 
-/// The board of `snap`, which landed at `snap_unix_ms` (`None`.
+/// The board of `snap`, which landed at `snap_unix_ms` (`None`: no snapshot
+/// yet, `snap` then the empty one), with the home volume at `disk`, taken at
+/// `now_unix_ms`.
 pub(crate) fn board_of(
     snap: &Snapshot,
     snap_unix_ms: Option<i64>,
@@ -89,7 +105,7 @@ pub(crate) fn board_of(
 }
 
 /// The slot reader's reading as a snapshot carries it.
-pub(crate) fn slots_view(r: &SlotsRead) -> SlotsView {
+pub(crate) const fn slots_view(r: &SlotsRead) -> SlotsView {
     match r {
         SlotsRead::Unread(why) => SlotsView::Unread(match why {
             Unread::Unsupported => SlotsUnread::Unsupported,
@@ -173,7 +189,7 @@ fn judged_snapshot(snap: &Snapshot) -> Snapshot {
     }
 }
 
-/// THE BOARD AND WHAT IT JUDGED ACROSS ITS LOOKS ([module docs](self)).
+/// THE BOARD AND WHAT IT JUDGED ACROSS ITS LOOKS.
 #[derive(Debug, Default)]
 pub(crate) struct Judged {
     /// The board as last taken.
@@ -190,6 +206,13 @@ pub(crate) struct Judged {
     held: BTreeMap<String, i64>,
     /// The machine's pace and the slots reserved ([`Pace`]).
     pace: Pace,
+    /// What each session's loop last told ([`told`]), by sid.
+    said: BTreeMap<String, OccupancySaid>,
+    /// The rows of the last [`ring::RING_ROWS`] minute looks ([`Look::Tick`]), oldest first:
+    /// the facts ring as this window holds it ([`Self::look_row`]).
+    rows: VecDeque<RingRow>,
+    /// The ring's file was read into [`Self::rows`] (at the first look).
+    seeded: bool,
 }
 
 impl Judged {
@@ -236,6 +259,97 @@ impl Judged {
             .reserved
             .retain(|r| held.get(&r.sid).is_none_or(|at| *at < r.since_ms));
         self.board = Some(board);
+    }
+
+    /// What session `sid`'s loop last told ([`told`]): a hold that closed or a session gone
+    /// tells again; `None` forgets it.
+    pub(crate) fn tell(&mut self, sid: &str, said: Option<OccupancySaid>) {
+        match said {
+            Some(said) => {
+                self.said.insert(sid.to_string(), said);
+            }
+            None => {
+                self.said.remove(sid);
+            }
+        }
+    }
+
+    /// What session `sid`'s loop last told.
+    pub(crate) fn said(&self, sid: &str) -> Option<&OccupancySaid> {
+        self.said.get(sid)
+    }
+
+    /// The rows a predecessor's ring left (oldest first), taken once, before this window's
+    /// first row.
+    pub(crate) fn seed_rows(&mut self, rows: Vec<RingRow>) {
+        if std::mem::replace(&mut self.seeded, true) {
+            return;
+        }
+        let keep = rows.len().saturating_sub(ring::RING_ROWS);
+        self.rows = rows.into_iter().skip(keep).collect();
+    }
+
+    /// THE LOOK'S ROW at `now_unix_ms`, kept ([`Self::rows`]) and returned for the ring's file:
+    /// the board's machine facts, and each supervised session's last slot-holding look, whether
+    /// its told hold reads ready on the board ([`rules::ready`]) and its told first guard.
+    pub(crate) fn look_row(&mut self, sessions: &[(u64, String)], now_unix_ms: i64) -> RingRow {
+        let rows = sessions
+            .iter()
+            .map(|(_, sid)| {
+                let reading = self.reading(sid, now_unix_ms);
+                let said = self.said.get(sid);
+                let hold = said.and_then(|s| s.hold).map(|h| HoldSeen {
+                    since_ms: h.since_ms,
+                    declared: h.declared,
+                });
+                RingSession {
+                    sid: sid.clone(),
+                    held_ms: reading.held_slot_last_ms,
+                    ready: rules::ready(&reading, hold, now_unix_ms),
+                    guard: said
+                        .and_then(OccupancySaid::guard)
+                        .map(|g| g.word().to_string()),
+                }
+            })
+            .collect();
+        let row = RingRow::of(&self.reading("", now_unix_ms), rows);
+        self.rows.push_back(row.clone());
+        while self.rows.len() > ring::RING_ROWS {
+            self.rows.pop_front();
+        }
+        row
+    }
+
+    /// THE ROW A LOOK OF `look` TAKES at `now_unix_ms` ([`Self::look_row`]): a minute's tick
+    /// takes one; a poke between ticks takes none, so the rows stay a row a minute and a day of
+    /// them a day.
+    pub(crate) fn looked(
+        &mut self,
+        sessions: &[(u64, String)],
+        now_unix_ms: i64,
+        look: Look,
+    ) -> Option<RingRow> {
+        (look == Look::Tick).then(|| self.look_row(sessions, now_unix_ms))
+    }
+
+    /// The sessions whose hold read ready at the last look.
+    pub(crate) fn ready_now(&self) -> u16 {
+        self.rows.back().map_or(0, RingRow::ready)
+    }
+
+    /// The slot-minutes idle while a session was ready over the day before `now_unix_ms`
+    /// ([`ring::idle_ready_ms`]), whole: read in place, as `status` asks it for each session.
+    pub(crate) fn idle_ready_min(&self, now_unix_ms: i64) -> u64 {
+        ring::idle_ready_ms(&self.rows, now_unix_ms.saturating_sub(rules::DAY_MS)) / 60_000
+    }
+
+    /// The looks' rows from `since_ms` on, oldest first.
+    pub(crate) fn rows_since(&self, since_ms: i64) -> Vec<RingRow> {
+        self.rows
+            .iter()
+            .filter(|r| r.at >= since_ms)
+            .cloned()
+            .collect()
     }
 
     /// The board as session `sid`'s host reads it at `now_unix_ms`.
@@ -399,7 +513,7 @@ impl Pace {
 }
 
 /// The kernel's memory pressure as the supervisor names it; `None` unread.
-fn memory_pressure(p: Pressure) -> Option<MemoryPressure> {
+const fn memory_pressure(p: Pressure) -> Option<MemoryPressure> {
     match p {
         Pressure::Normal => Some(MemoryPressure::Normal),
         Pressure::Warn => Some(MemoryPressure::Warn),
@@ -507,8 +621,101 @@ fn home_level() -> Option<Level> {
     board.row_at(&home).map(|r| r.level)
 }
 
-/// TAKE THE BOARD at `now_unix_ms` (the disk look's).
-pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)]) {
+/// The owner's `[harness] occupancy` in the policy the window's loops run ([`set_mode`]): 0
+/// `off`, 1 `observe`, 2 `prompt`; `observe`, the default, before the launch sets it.
+static MODE: AtomicU8 = AtomicU8::new(1);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own mode ([`set_mode`] on its thread): tests run in parallel, each with its
+    /// own app, and each that adopts a policy sets the mode.
+    static MODE_FOR_TEST: std::cell::Cell<Option<Occupancy>> = const { std::cell::Cell::new(None) };
+}
+
+/// THE OWNER'S MODE IN FORCE (`App::note_occupancy_mode`: the launch's policy before the host
+/// starts, then each the watcher posts): the status field says it, and the facts ring is
+/// written only while it observes.
+pub(crate) fn set_mode(mode: Occupancy) {
+    #[cfg(test)]
+    MODE_FOR_TEST.with(|m| m.set(Some(mode)));
+    #[cfg(not(test))]
+    MODE.store(
+        match mode {
+            Occupancy::Off => 0,
+            Occupancy::Observe => 1,
+            Occupancy::Prompt => 2,
+        },
+        Ordering::Release,
+    );
+}
+
+/// The owner's mode ([`set_mode`]).
+pub(crate) fn mode() -> Occupancy {
+    #[cfg(test)]
+    if let Some(mode) = MODE_FOR_TEST.with(std::cell::Cell::get) {
+        return mode;
+    }
+    match MODE.load(Ordering::Acquire) {
+        0 => Occupancy::Off,
+        2 => Occupancy::Prompt,
+        _ => Occupancy::Observe,
+    }
+}
+
+/// WHICH LOOK the board takes: the disk watch's minute tick, which takes the ring's row, or a
+/// poke between ticks (the disk watch's), which refreshes the board alone. The ring is a row a
+/// minute (§6), so its [`ring::RING_ROWS`] rows are a day however often the watch is poked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Look {
+    Tick,
+    Poke,
+}
+
+/// THE RING'S APPEND of a look of `look`'s `row` under the owner's `mode`: a tick's row, while
+/// the mode observes (`observe` or `prompt`), to `file`; under `off` nothing is written (slice
+/// 1's F4), and a poke has no row. Whether a row was written.
+///
+/// # Errors
+/// The file's append failed ([`RingFile::append`]).
+pub(crate) fn append_look(
+    file: &mut RingFile,
+    mode: Occupancy,
+    look: Look,
+    row: Option<&RingRow>,
+) -> std::io::Result<bool> {
+    match row {
+        Some(row) if look == Look::Tick && mode.observes() => file.append(row).map(|()| true),
+        _ => Ok(false),
+    }
+}
+
+/// The facts ring's file, as this window writes it; `None` before the first look, or with no
+/// state directory.
+static RING: Mutex<Option<RingFile>> = Mutex::new(None);
+
+/// What session `sid`'s loop told (`IdleHost::occupancy_said`, through the window's note):
+/// kept on the board for the status, `why` and the next look's ready.
+pub(crate) fn told(sid: &str, said: Option<OccupancySaid>) {
+    BOARD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(Judged::default)
+        .tell(sid, said);
+}
+
+/// TAKE THE BOARD at `now_unix_ms` (the disk look's, of `kind`).
+pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)], kind: Look) {
+    // The ring's file is read once, at the first look, apart from the board's lock.
+    let seed = {
+        let mut ring = RING.lock().unwrap_or_else(PoisonError::into_inner);
+        if ring.is_none() {
+            *ring =
+                aterm_types::dirs::state_dir().map(|state| RingFile::at(ring::ring_path(&state)));
+            ring.as_ref().map(RingFile::read)
+        } else {
+            None
+        }
+    };
     let held = crate::sys_host::SYS.held_now();
     let disk = home_level();
     let board = match held.as_ref() {
@@ -521,16 +728,158 @@ pub(crate) fn look(now_unix_ms: i64, sessions: &[(u64, String)]) {
         None => board_of(&Snapshot::default(), None, disk, now_unix_ms),
     };
     let words = change_words(&board);
-    let moved = {
+    let (moved, row) = {
         let mut kept = BOARD.lock().unwrap_or_else(PoisonError::into_inner);
         let judged = kept.get_or_insert_with(Judged::default);
         let moved = judged.board.as_ref().map(change_words).as_deref() != Some(words.as_str());
         judged.step(board, held.as_ref().map(|h| &*h.snap), sessions);
-        moved
+        if let Some(rows) = seed {
+            judged.seed_rows(rows);
+        }
+        (moved, judged.looked(sessions, now_unix_ms, kind))
     };
     if moved {
         aterm_log::info!("occupancy board: {words}");
     }
+    if let Some(file) = RING.lock().unwrap_or_else(PoisonError::into_inner).as_mut()
+        && let Err(e) = append_look(file, mode(), kind, row.as_ref())
+    {
+        aterm_log::warn!("occupancy ring: {} not written: {e}", file.path().display());
+    }
+}
+
+/// THE STATUS FIELDS of session `sid` (`status`; design §6): `occupancy=<mode>` (the owner's,
+/// [`mode`]), `occupancy_hold=<declared|undeclared|none>` (as its loop last told it),
+/// `ready=<n>` (the sessions ready at the last look), `slots=<usable>/<n>` (`-` unread) and
+/// `idle_ready_min=<n>` (the slot-minutes idle while a session was ready, over the last day).
+pub(crate) fn status_fields(sid: Option<&str>) -> String {
+    let now_unix_ms = aterm_time::unix_millis()
+        .and_then(|ms| i64::try_from(ms).ok())
+        .unwrap_or(0);
+    let board = BOARD.lock().unwrap_or_else(PoisonError::into_inner);
+    status_words(mode(), board.as_ref(), sid, now_unix_ms)
+}
+
+/// [`status_fields`] from `judged` at `now_unix_ms`.
+pub(crate) fn status_words(
+    mode: Occupancy,
+    judged: Option<&Judged>,
+    sid: Option<&str>,
+    now_unix_ms: i64,
+) -> String {
+    let hold = judged
+        .zip(sid)
+        .and_then(|(j, sid)| j.said(sid))
+        .map_or("none", OccupancySaid::hold_word);
+    let slots = judged
+        .map(|j| j.reading("", now_unix_ms))
+        .and_then(|r| r.slots)
+        .map_or_else(|| "-".to_string(), |s| format!("{}/{}", s.usable, s.n));
+    format!(
+        "occupancy={} occupancy_hold={hold} ready={} slots={slots} idle_ready_min={}",
+        mode.word(),
+        judged.map_or(0, Judged::ready_now),
+        judged.map_or(0, |j| j.idle_ready_min(now_unix_ms)),
+    )
+}
+
+/// The verb's usage.
+const USAGE: &str = "ERR usage: occupancy why|check --replay <dur>\n";
+
+/// `occupancy` ON THE CONTROL SOCKET for session `sid` (design §6): `why` (the default), the
+/// last word its loop told in §6's form; `check --replay <dur>`, the decider re-run over the
+/// window's rows of the last `<dur>` with the session's `fact-hold@v1` ledger rows (read from
+/// `<state>/drive/<sid>.jsonl`). Read-only.
+pub(crate) fn cmd_occupancy(sid: Option<&str>, rest: &str) -> String {
+    let now_unix_ms = aterm_time::unix_millis()
+        .and_then(|ms| i64::try_from(ms).ok())
+        .unwrap_or(0);
+    let offset_s = crate::presence::local_offset_s().unwrap_or(0);
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    match words.as_slice() {
+        [] | ["why"] => {
+            let said = sid.and_then(|sid| {
+                BOARD
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .and_then(|j| j.said(sid).cloned())
+            });
+            why_reply(mode(), said.as_ref(), now_unix_ms, offset_s)
+        }
+        ["check", "--replay", dur] => {
+            let Some(window_ms) = aterm_agent::supervise::occupancy::replay::window_ms(dur) else {
+                return USAGE.to_string();
+            };
+            let Some(sid) = sid else {
+                return "ERR occupancy: no session\n".to_string();
+            };
+            let from_ms = now_unix_ms.saturating_sub(window_ms);
+            let rows = BOARD
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .map(|j| j.rows_since(from_ms))
+                .unwrap_or_default();
+            let ledger = aterm_types::dirs::state_dir()
+                .map(|state| aterm_agent::supervise::approvals::ledger_under(&state, Some(sid)))
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .unwrap_or_default();
+            replay_reply(sid, &rows, &ledger, (from_ms, now_unix_ms), offset_s)
+        }
+        _ => USAGE.to_string(),
+    }
+}
+
+/// `occupancy why`'s reply for `said` ([`cmd_occupancy`]).
+pub(crate) fn why_reply(
+    mode: Occupancy,
+    said: Option<&OccupancySaid>,
+    now_unix_ms: i64,
+    offset_s: i64,
+) -> String {
+    let lines = match said {
+        Some(said) => {
+            aterm_agent::supervise::occupancy::said::why_lines(said, now_unix_ms, offset_s)
+        }
+        None => vec![format!("occupancy={} unsaid", mode.word())],
+    };
+    lines_reply(&lines)
+}
+
+/// `occupancy check --replay`'s reply for session `sid` over `rows` (the window's, oldest
+/// first) with its ledger text `ledger`, over the window `(from_ms, to_ms)`.
+pub(crate) fn replay_reply(
+    sid: &str,
+    rows: &[RingRow],
+    ledger: &str,
+    (from_ms, to_ms): (i64, i64),
+    offset_s: i64,
+) -> String {
+    use aterm_agent::supervise::occupancy::{hold, replay};
+    let spans = replay::spans_of(&hold::hold_rows_in(ledger, Some(sid)));
+    let replayed = replay::replay(rows, &spans, sid, from_ms);
+    let holds = spans
+        .iter()
+        .filter(|s| s.end_ms.is_none_or(|end| end >= from_ms) && s.since_ms <= to_ms)
+        .count();
+    lines_reply(&replay::replay_lines(
+        &replayed,
+        rows.len(),
+        holds,
+        (from_ms, to_ms),
+        offset_s,
+    ))
+}
+
+/// `OK <n>` and the lines.
+fn lines_reply(lines: &[String]) -> String {
+    let mut out = format!("OK {}\n", lines.len());
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// THE BOARD AS SESSION `sid`'S HOST READS IT NOW (`IdleHost::occupancy`, [`Judged::reading`]).

@@ -29,6 +29,9 @@ pub(crate) struct HarnessStatsReport {
     pub(crate) sibling_tabs: Vec<TabSpreadsheetRow>,
     pub(crate) remote_computers: Vec<TabComputer>,
     pub(crate) remote_tabs: Vec<TabSpreadsheetRow>,
+    /// The build-slot minutes idle while a session's hold was ready, over the day the facts
+    /// ring (`<state>/occupancy/facts.ring`) holds; `None` with no ring.
+    pub(crate) idle_ready_min: Option<u64>,
     day_lines: BTreeMap<String, String>,
     decision_clocks: BTreeMap<i64, String>,
 }
@@ -72,6 +75,7 @@ impl HarnessStatsReport {
             sibling_tabs: Vec::new(),
             remote_computers: Vec::new(),
             remote_tabs: Vec::new(),
+            idle_ready_min: None,
             day_lines,
             decision_clocks,
         }
@@ -120,9 +124,20 @@ pub(crate) fn collect_harness_stats(
         local_midnight_ms(now_ms, &offset_at),
         now_ms.saturating_sub(WEEK_MS),
     );
-    Ok(HarnessStatsReport::new(
-        today, week, now_ms, offset_s, &offset_at,
-    ))
+    let mut report = HarnessStatsReport::new(today, week, now_ms, offset_s, &offset_at);
+    report.idle_ready_min = idle_ready_min_under(state_dir, now_ms);
+    Ok(report)
+}
+
+/// The slot-minutes idle while ready over the day before `now_ms`, from the facts ring under
+/// `state_dir` ([`aterm_agent::supervise::occupancy::ring`]); `None` where there is no ring.
+pub(crate) fn idle_ready_min_under(state_dir: &Path, now_ms: i64) -> Option<u64> {
+    use aterm_agent::supervise::occupancy::ring;
+    let path = ring::ring_path(state_dir);
+    let body = std::fs::read_to_string(path).ok()?;
+    let rows = ring::rows_in(&body);
+    let since = now_ms.saturating_sub(aterm_agent::supervise::occupancy::rules::DAY_MS);
+    Some(ring::idle_ready_ms(&rows, since) / 60_000)
 }
 
 /// THE STATS THREAD'S READING (blocking file I/O: a worker's only): the ledgers ([`collect_harness_stats`]) and the A/B book's exchange (§10.5.3 C.2–3, `harness_ab_store::exchange`) — this process's book (`ab`, the ring the App copied and its today; `None` where it was never fed) written whole as `own` under `harness_state/ab/`, then every other process's days read into [`HarnessStatsReport::ab_others`].
@@ -238,7 +253,7 @@ pub(crate) struct HarnessScreen {
 impl HarnessScreen {
     /// When the re-read an act owes is due, if one is owed.
     #[must_use]
-    pub(crate) fn reread_at(&self) -> Option<Instant> {
+    pub(crate) const fn reread_at(&self) -> Option<Instant> {
         self.reread_at
     }
 
@@ -275,7 +290,7 @@ impl HarnessScreen {
         self.reread_at = Some(self.reread_at.map_or(due, |at| at.max(due)));
     }
 
-    fn take_reread(&mut self) {
+    const fn take_reread(&mut self) {
         self.reread_at = None;
         self.owed_since = None;
     }
@@ -983,6 +998,31 @@ impl HarnessState {
                     waited(today.limit_wait_ms, week.limit_wait_ms),
                 ),
             ]);
+            // The occupancy door's fact lines, by kind: typed under `prompt`, would-be under
+            // `observe`. Shown once a week holds any.
+            let kinds: std::collections::BTreeSet<&String> = week
+                .facts_told
+                .keys()
+                .chain(week.facts_would.keys())
+                .collect();
+            let of =
+                |book: &BTreeMap<String, u64>, kind: &str| book.get(kind).copied().unwrap_or(0);
+            for kind in kinds {
+                rows.push(row(
+                    &format!("Facts told ({kind})"),
+                    both(of(&today.facts_told, kind), of(&week.facts_told, kind)),
+                ));
+                rows.push(row(
+                    &format!("Facts it would tell ({kind})"),
+                    both(of(&today.facts_would, kind), of(&week.facts_would, kind)),
+                ));
+            }
+        }
+        if let Some(min) = report.idle_ready_min {
+            rows.push(row(
+                "Idle while ready",
+                format!("{min} slot-min in the last day"),
+            ));
         }
         if self.stats.stale {
             rows.push(row(
@@ -1288,7 +1328,19 @@ pub(crate) fn duration_words(ms: u64) -> String {
     }
 }
 
-/// A DECISION IN ONE SENTENCE (§10.4.1), its session named `name`, the agent's words in quotes:
+/// A DECISION IN ONE SENTENCE (§10.4.1), its session named `name`, the
+/// agent's words in quotes:
+///
+/// * a dialog: `<name> asked “<question>” → the harness chose <option>:
+///   <why>`;
+/// * a prose question: `<name> asked “<question>” → <the answer>` (`said`
+///   where the words are the agent's last row at the turn's end);
+/// * an unproven press: `<name>: pressed Yes on <command head> ×N under
+///   Approve permission boxes: All; no safe rule proved it` — or, where full
+///   power chose another of the box's options, `chose “<option>” on <command
+///   head>` — the switch that pressed it named, never "unsafe";
+/// * a refusal: `<name>: declined <command head>: <the reason it gave>`;
+/// * a limit reset kept: `<name>: kept its limit reset unspent: <why>`.
 #[must_use]
 pub(crate) fn decision_sentence(
     decision: &aterm_agent::harness::stats::Decision,
@@ -1716,7 +1768,7 @@ fn under_land(landing: usize, landed: usize, quiet: usize) -> Vec<String> {
 impl EveryRow {
     /// How many `press` moves.
     #[must_use]
-    pub(crate) fn moved(&self, press: EveryPress) -> usize {
+    pub(crate) const fn moved(&self, press: EveryPress) -> usize {
         use crate::autopilot_timers::TimerChoice;
         match press {
             EveryPress::Mode(Autopilot::Cruise) => self.cruise,
@@ -1759,7 +1811,7 @@ impl EveryRow {
 
     /// The timers a press cancels, for its words: Land's (every timed Cruise it lands) and Follow's (every timed own Cruise it clears).
     #[must_use]
-    pub(crate) fn cancels(&self, press: EveryPress) -> usize {
+    pub(crate) const fn cancels(&self, press: EveryPress) -> usize {
         match press {
             EveryPress::Mode(Autopilot::Land) => self.cruise_timed,
             EveryPress::Follow => self.follow_timed,
@@ -2690,6 +2742,8 @@ impl App {
         screen.stats.collecting = false;
         match result {
             Ok(mut report) => {
+                // A reading that asked nothing of the fleet keeps the fleet
+                // the last one read: Tab Control shows its last sweep, never
                 // an empty fleet, until its next.
                 if !screen.reading.fleet
                     && let Some(last) = screen.stats.report.as_deref()

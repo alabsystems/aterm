@@ -737,6 +737,7 @@ impl Run<'_> {
                 .filter(|t| opts.triples.contains(t) && !d.published_rows.contains(t))
                 .collect();
             if new.is_empty() {
+                // Signed earlier only when the staging owner serves exactly what this lane
                 // signed: a manifest another machine extended since is not this lane's.
                 if staged.with_extension("toml.sig").exists()
                     && same_bytes(&staged, d.published.as_deref())

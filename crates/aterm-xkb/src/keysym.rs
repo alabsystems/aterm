@@ -2,21 +2,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from xkeysym 0.2.1 (MIT OR Apache-2.0 OR Zlib, used under
-// Apache-2.0) src/automatically_generated.rs: the names and values of the
-// keysyms the winit fork's key handling names, taken from its `key` module,
-// with each one's C name (libxkbcommon's) added by the aterm project in 2026.
+// Derived from xkeysym 0.2.1 (MIT OR Apache-2.0 OR Zlib, used under Apache-2.0).
 
-//! The keysyms aterm's key handling names (the winit fork's Linux backend
-//! maps exactly these to keys), with their values from the X11 protocol's
-//! keysym list (keysymdef.h, XF86keysym.h, Sunkeysym.h) as libxkbcommon's
-//! `xkbcommon-keysyms.h` repeats them. The Rust names are xkeysym 0.2.1's
-//! (`XF86_AudioMute`, `SUN_Copy`, `_3270_Attn`), so the fork's call sites
-//! read as they did; [`NAMES`] gives each one's C name, what
-//! `xkb_keysym_from_name` takes.
-//!
-//! Held to xkeysym 0.2.1's values by `tests/recorded/`, and in the Linux
-//! lane to libxkbcommon's own (`xkb_keysym_from_name` of every C name).
+//! X11 keysyms used by aterm's key handling, with xkeysym 0.2.1 Rust names
+//! and [`NAMES`] mapping each constant to its `xkb_keysym_from_name` C name.
 
 #![allow(
     non_upper_case_globals,

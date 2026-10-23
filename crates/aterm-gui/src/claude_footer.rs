@@ -1483,7 +1483,7 @@ impl PaneFooter {
     }
 
     /// The facts the rule shows.
-    fn shown(&self) -> &FooterFacts {
+    const fn shown(&self) -> &FooterFacts {
         &self.shown
     }
 
@@ -1762,7 +1762,7 @@ pub(crate) struct LogWake {
 
 impl LogWake {
     /// Constructs a [`LogWake`] controlled by `clause`.
-    pub(crate) fn new(clause: bool) -> LogWake {
+    pub(crate) const fn new(clause: bool) -> LogWake {
         LogWake { clause }
     }
 
@@ -1879,6 +1879,7 @@ pub(crate) fn request_footer(
         .as_ref()
         .is_some_and(|tx| tx.send(Command::Request(job)).is_err())
     {
+        // The thread is gone (it ends only when the channel closes, so this is
         // a panic in a read); start a fresh one next time.
         *slot = None;
     }
@@ -2888,6 +2889,10 @@ fn resolve_into(
     Found,
     crate::session_log::transcript::Applied,
 ) {
+    // THE SESSION LOG'S STEP TAP (phase 3B): armed before the read while the
+    // log holds a run that reads a transcript, with that run's watermark and
+    // floor — one short hold of the (leaf) timeline lock, released before
+    // any file is read. A tap still waiting for its file is armed again, so
     // the run in front now gives it its floor and watermark.
     if !fold.steps_armed() || !fold.steps_bound() {
         let arm = timeline
@@ -3142,6 +3147,7 @@ fn resolve_facts_at_with_cwd(
         .flatten();
     let read = is_claude.then(|| {
         (asks.args)(identity.pid).and_then(|args| {
+            // A refused auth-source check says nothing, and a registry write
             // missed during an exec cannot borrow the prior image's verdict.
             if !identity.stored_login
                 || args.argv != identity.argv
@@ -3702,7 +3708,7 @@ struct Tokens {
 }
 
 impl Tokens {
-    fn of(s: &RenderInput) -> Self {
+    const fn of(s: &RenderInput) -> Self {
         Self {
             snapshot_seq: s.snapshot_seq,
             engine_fill_seq: s.engine_fill_seq,
@@ -3964,7 +3970,7 @@ pub(crate) struct ProgramCells<'a> {
 #[cfg(any(a11y_tree, test))]
 impl<'a> ProgramCells<'a> {
     /// Wraps `scratch` with `undo` to read the underlying program cells.
-    pub(crate) fn of(scratch: &'a RenderInput, undo: &'a FooterUndo) -> Self {
+    pub(crate) const fn of(scratch: &'a RenderInput, undo: &'a FooterUndo) -> Self {
         Self { scratch, undo }
     }
 }
@@ -4813,6 +4819,9 @@ impl App {
                     _ => None,
                 };
                 if !held && gate.is_none() {
+                    // No drawer and no facts: a card this window keeps for
+                    // the session left by its identity (Claude stopped or
+                    // gone), which bounds its next show
                     // (`claude_card::RESHOW_MS`). Nothing is read.
                     if ws.claude_card.keeps(session) {
                         cards.push(crate::claude_card::drawerless_leaf(
@@ -4896,6 +4905,8 @@ impl App {
                         if let Some((pgid, _)) = timeline.claude_footer_identity()
                             && timeline.note_claude_card(pgid, &owner, card)
                         {
+                            // The card's amend of the session log: its owed
+                            // wake rings its watchers in this hold, and the
                             // loop follows the log after the frame.
                             if timeline.slog_take_wake() {
                                 lists.log_owed.push(session);
@@ -6230,7 +6241,7 @@ fn reads_on(ink: [u8; 3], ground: [u8; 3]) -> f32 {
 }
 
 /// `c` as `0x00RRGGBB`.
-fn pack_rgb(c: [u8; 3]) -> u32 {
+const fn pack_rgb(c: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, c[0], c[1], c[2]])
 }
 
@@ -6297,7 +6308,7 @@ fn greyed_on(gray: [u8; 3], value: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
 
 /// The mark a program's top line wears ([`aterm_effects::cli_marks`]): one
 /// exhaustive match, so a new program does not compile until it is placed.
-fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
+const fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
     match program {
         aterm_phase::Program::Claude => Some(CliMark::Claude),
         aterm_phase::Program::Codex => Some(CliMark::Codex),
@@ -6315,7 +6326,7 @@ fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
 /// the switch — so its lockup reads `codex-alab` ([`CliMark::name`]); the
 /// vendor's for a vendor `codex`, which no host admits, and for every other
 /// program.
-fn top_build(program: aterm_phase::Program, agent: Option<aterm_phase::Program>) -> Build {
+const fn top_build(program: aterm_phase::Program, agent: Option<aterm_phase::Program>) -> Build {
     match (program, agent) {
         (aterm_phase::Program::Codex, Some(aterm_phase::Program::Codex)) => Build::Alab,
         _ => Build::Vendor,
@@ -6571,7 +6582,7 @@ fn context_left_of(shown: Option<&str>) -> Option<u8> {
 }
 
 /// A `0x00RRGGBB` colour's channels.
-fn rgb_of(c: u32) -> [u8; 3] {
+const fn rgb_of(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
@@ -6947,7 +6958,7 @@ fn pane_grid_px(
 }
 
 /// Computes the stable fx layer ID for `session`'s top composer mark.
-pub(crate) fn top_mark_id(session: u64) -> u64 {
+pub(crate) const fn top_mark_id(session: u64) -> u64 {
     let mut z = session ^ 0x746F_702D_6D61_726B;
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -7456,7 +7467,7 @@ pub(crate) struct GlassColumns {
 }
 
 impl GlassColumns {
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         self.len = 0;
     }
 
@@ -12336,7 +12347,7 @@ mod tests {
         let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 2]);
         assert!(
             card_line.contains("enhanced by aterm harness")
-                && card_line.contains("\u{00B7} muse \u{00B7}")
+                && card_line.contains("\u{00B7} muse v0.1 \u{00B7}")
                 && card_line.contains("autopilot"),
             "muse card line on row top+1: {card_line:?}"
         );
@@ -13264,7 +13275,9 @@ mod tests {
                 );
             } else {
                 assert!(
-                    card_on.contains("enhanced by aterm harness") && card_on.contains("autopilot"),
+                    card_on.contains("enhanced by aterm harness")
+                        && card_on.contains("autopilot")
+                        && (prog != "muse" || card_on.contains("\u{00B7} muse v0.1")),
                     "{prog}: active harness draws launch card banner: {card_on:?}"
                 );
             }

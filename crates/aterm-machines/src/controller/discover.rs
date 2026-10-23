@@ -600,7 +600,8 @@ DATE: ---Fri 16 Oct 2026---
     const RESOLVE_NOBODY: &str = "";
 
     /// A later capture in the VM (macOS 27.0, then named lab-02), while `dns-sd -R spark-1
-    /// _ssh._tcp local.
+    /// _ssh._tcp local. 22` advertised a host with Remote Login alone, as a Linux box's Avahi
+    /// does: `dns-sd -B _ssh._tcp local.`, then `_sftp-ssh._tcp` and `_rfb._tcp`.
     const BROWSE_SSH_LAB: &str = "Browsing for _ssh._tcp.local.
 DATE: ---Sun 18 Oct 2026---
  6:21:48.496  ...STARTING...

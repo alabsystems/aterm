@@ -54,7 +54,7 @@ pub const RETIRED_BINS: &[&str] = &[
 /// The `libexec/` counterpart of [`RETIRED_BINS`].
 pub const RETIRED_LIBEXEC: &[&str] = &["rust-analyzer-proc-macro-srv"];
 
-/// What a bundle's hello-world compiles.
+/// What a bundle's hello-world compiles with, and against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HelloPlan {
     /// No hello, on purpose.

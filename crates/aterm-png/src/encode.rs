@@ -258,7 +258,9 @@ impl<W: Write> Writer<W> {
 
     /// Write the image a scanline at a time.
     /// # Errors
-    /// [`EncodingError::WrongDataSize`] names a row that is not `row_bytes` long (`expected` and.
+    /// [`EncodingError::WrongDataSize`] names a row that is not `row_bytes` long (`expected` and
+    /// `got` are that row's), [`EncodingError::Parameter`] on a second call or on an indexed
+    /// sample past the end of the palette, and [`EncodingError::Io`] from the sink.
     pub fn write_rows(
         &mut self,
         mut row: impl FnMut(usize, &mut Vec<u8>),

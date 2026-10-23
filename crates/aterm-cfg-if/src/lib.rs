@@ -7,6 +7,58 @@
 #![warn(missing_docs)]
 
 /// Emit the items of the first arm whose `#[cfg]` predicate holds.
+///
+/// ```
+/// cfg_if::cfg_if! {
+///     if #[cfg(unix)] {
+///         fn platform() -> &'static str { "unix" }
+///     } else if #[cfg(windows)] {
+///         fn platform() -> &'static str { "windows" }
+///     } else {
+///         fn platform() -> &'static str { "other" }
+///     }
+/// }
+/// # fn main() {}
+/// ```
+///
+/// The `else` is optional; when no predicate holds the macro expands to
+/// nothing, so it can sit in statement position.
+///
+/// ```
+/// fn f() -> Result<(), ()> {
+///     cfg_if::cfg_if! {
+///         if #[cfg(any())] {
+///             return Err(());
+///         }
+///     };
+///     Ok(())
+/// }
+/// assert!(f().is_ok());
+/// ```
+///
+/// Arms that are not selected are never expanded, so `compile_error!` works as
+/// an unsupported-platform guard:
+///
+/// ```
+/// cfg_if::cfg_if! {
+///     if #[cfg(all())] {
+///         fn supported() -> bool { true }
+///     } else {
+///         compile_error!("unsupported platform");
+///     }
+/// }
+/// assert!(supported());
+/// ```
+///
+/// Control: the same `compile_error!` in the selected arm fails the build.
+///
+/// ```compile_fail
+/// cfg_if::cfg_if! {
+///     if #[cfg(all())] {
+///         compile_error!("this arm is selected, so this must fire");
+///     }
+/// }
+/// ```
 #[macro_export]
 macro_rules! cfg_if {
     (

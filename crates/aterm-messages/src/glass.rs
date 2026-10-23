@@ -973,6 +973,13 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     let mut words = ExcerptWords::Detail;
     if head.fixed > budget && spec.step && ex > 3 + DETAIL_FLOOR {
         // An ask's step that the title at its floor still cannot pay for
+        // whole gives way to its short form where it has one (a command is
+        // whole or replaced, never cut: the short form, a sentence, is what
+        // a narrower band cuts). The head is fitted again around the short
+        // form, so the cells the whole step would have taken are the row's
+        // again: the `Details ›` the short form sends the reader to where it
+        // fits, the capsules' long forms, the title's words (the review of
+        // the band, ox4-3: `Claude usag… · Run the command under Details.`
         if let Some(short) = spec.step_short {
             words = ExcerptWords::Short;
             ex = 3 + width(short);
@@ -1202,6 +1209,8 @@ fn allocate_extras(
         }
         if fit.action_excerpt {
             // What the excerpt left is the row's again only beside a whole
+            // excerpt: a shaped one ends where its words did, and the cells a
+            // word-boundary cut left must not re-buy what a wider row had.
             room += if detail_whole { cells } else { 0 };
         } else {
             room = cells;

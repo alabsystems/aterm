@@ -11,7 +11,6 @@ fn test_no_match_at_position() {
     let smart = SmartSelection::with_builtin_rules();
     let text = "just some regular words";
 
-    // Position on whitespace
     let m = smart.find_at(text, 4);
     assert!(m.is_none(), "whitespace position should not match any rule");
 }
@@ -21,7 +20,6 @@ fn test_word_boundaries_with_match() {
     let smart = SmartSelection::with_builtin_rules();
     let text = "Check https://example.com please";
 
-    // On URL - should return URL boundaries
     let bounds = smart.word_boundaries_at(text, 15);
     assert_eq!(bounds, Some((6, 25)));
 }
@@ -31,14 +29,11 @@ fn test_word_boundaries_fallback() {
     let smart = SmartSelection::with_builtin_rules();
     let text = "hello world";
 
-    // On regular word - should return word boundaries
     let bounds = smart.word_boundaries_at(text, 2);
     assert_eq!(bounds, Some((0, 5)));
 }
 
-/// Each builtin rule selects the whole token under the cursor, and nothing
-/// around it: trailing sentence punctuation and enclosing parentheses stay out
-/// of a URL, a query string stays in.
+/// Each builtin rule selects the whole token under the cursor and excludes surrounding punctuation.
 #[test]
 fn builtin_rules_select_the_token_under_the_cursor() {
     let smart = SmartSelection::with_builtin_rules();

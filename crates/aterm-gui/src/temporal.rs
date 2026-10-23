@@ -214,7 +214,7 @@ pub(crate) struct SpinePre {
 
 impl SpinePre {
     /// Read `term` (the caller holds its lock) before processing a slice.
-    pub(crate) fn take(term: &Terminal) -> Self {
+    pub(crate) const fn take(term: &Terminal) -> Self {
         Self {
             lifetime: term.resize_lifetime(),
             ordinal: term.resize_ordinal(),
@@ -455,7 +455,7 @@ impl TemporalRecorder {
     }
 
     /// Mark this spine as one that starts at a seamless update ([`crate::session_timeline::HandoffGap`]).
-    pub(crate) fn mark_handoff(&mut self, gap: crate::session_timeline::HandoffGap) {
+    pub(crate) const fn mark_handoff(&mut self, gap: crate::session_timeline::HandoffGap) {
         self.handoff = Some(gap);
     }
 
@@ -468,12 +468,12 @@ impl TemporalRecorder {
     }
 
     /// Replay under `policy` (every recorded resize, and the replayed engine's console-host posture).
-    pub(crate) fn set_resize_policy(&mut self, policy: ResizePolicy) {
+    pub(crate) const fn set_resize_policy(&mut self, policy: ResizePolicy) {
         self.resize_policy = policy;
     }
 
     /// Replay under the live engine's alternate-screen recovery.
-    pub(crate) fn set_host_resyncs_alt_screen(&mut self, on: bool) {
+    pub(crate) const fn set_host_resyncs_alt_screen(&mut self, on: bool) {
         self.host_resyncs_alt_screen = on;
     }
 
@@ -631,7 +631,7 @@ impl TemporalRecorder {
 
     /// Total events ever appended to the spine (live + evicted).
     #[must_use]
-    pub(crate) fn total_events(&self) -> u64 {
+    pub(crate) const fn total_events(&self) -> u64 {
         self.log.total()
     }
 
@@ -748,7 +748,7 @@ impl TemporalRecorder {
 
     /// Resizes the live engine applied that the spine never held.
     #[must_use]
-    pub(crate) fn lost_resizes(&self) -> u64 {
+    pub(crate) const fn lost_resizes(&self) -> u64 {
         self.lost_resizes
     }
 

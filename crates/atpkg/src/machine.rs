@@ -441,6 +441,8 @@ impl UniversalControlState {
     /// The coarse posture: `Unknown` when either read measured nothing; otherwise both keys true is `Disabled`, one is `Partial`, and neither is the OS default (an absent key is the ordinary state of a machine that never turned the feature off).
     #[must_use]
     pub const fn posture(&self) -> UcPosture {
+        // An UNMEASURED read is `Unknown`, which is the variant's whole purpose: before
+        // this, a `defaults` that would not run reported the OS default and Settings
         // told the user the cursor roams, on no evidence.
         if !self.measured {
             return UcPosture::Unknown;

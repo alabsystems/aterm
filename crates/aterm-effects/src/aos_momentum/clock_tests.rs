@@ -86,11 +86,6 @@ fn nanos(d: Duration) -> i128 {
     i128::try_from(d.as_nanos()).expect("a stream time fits i128 ns")
 }
 
-/// Random in-profile streams, a third of their calls stamped up to 6 ms early, played into
-/// an attached host: nothing is refused, the host sees exactly what an unattached engine
-/// fed the logical times sees, every moved call is counted, the log holds the logical
-/// times, and its replay lands on the live state and chain. Negative control: the skew
-/// moved some calls in every stream.
 #[test]
 fn interleaved_host_clocks_are_recorded_at_the_logical_time_and_never_refused() {
     let t0 = Instant::now();
@@ -136,9 +131,6 @@ fn interleaved_host_clocks_are_recorded_at_the_logical_time_and_never_refused() 
     }
 }
 
-/// The first calls after attach can predate the epoch (the host read the event's time
-/// before it read the epoch): each is recorded at the epoch, counted, and applied there, as
-/// a direct engine fed the epoch shows. A later call on time moves nothing.
 #[test]
 fn a_call_before_the_epoch_is_recorded_at_the_epoch_and_counted() {
     let t0 = Instant::now();
@@ -171,10 +163,6 @@ fn a_call_before_the_epoch_is_recorded_at_the_epoch_and_counted() {
     assert!(line.ends_with(" clamped=3"), "{line}");
 }
 
-/// Keys interleaved while paused queue at the logical time (the latest queued key's time is
-/// the floor), so after a resume, and after a commit, every one reaches the glow (none is
-/// refused as a time that went back) and the log holds them in order. The two that went
-/// back are counted.
 #[test]
 fn keys_interleaved_while_paused_are_all_delivered_after_a_resume_and_after_a_commit() {
     let t0 = Instant::now();
@@ -216,10 +204,6 @@ fn keys_interleaved_while_paused_are_all_delivered_after_a_resume_and_after_a_co
     }
 }
 
-/// A log whose own times go back, encoded and decoded, replays with each late input
-/// refused as `TimeWentBack` against the latest time before it. Negative control: the
-/// same times sent live are recorded at the logical time, and that log replays with no
-/// refusal.
 #[test]
 fn a_decoded_log_whose_times_go_back_replays_as_time_went_back() {
     let t0 = Instant::now();
@@ -308,7 +292,6 @@ fn a_decoded_log_whose_times_go_back_replays_as_time_went_back() {
     assert_eq!(host.aos_status().clamped, 2);
 }
 
-/// Unattached, nothing is clamped: the direct engine takes every time as given.
 #[test]
 fn an_unattached_host_reports_no_clamps() {
     let t0 = Instant::now();

@@ -206,11 +206,6 @@ fn paths(doomed: &[Doomed]) -> Vec<(Part, Vec<String>)> {
         .collect()
 }
 
-/// THE RULE ON A SURVEYED BUILD DIRECTORY: the incremental crate folder nothing wrote for
-/// four days goes whole; the unit the old compiler built goes with every entry carrying its
-/// hash (deps, its codegen objects, build, examples). NEGATIVE CONTROLS, each kept: the
-/// fresh crate folder, the unit the current compiler built (whatever its age), the fresh
-/// one, and the entries no fingerprint names.
 #[test]
 fn a_stale_crate_folder_and_an_old_compilers_unit_go_with_their_entries() {
     let fs = world(now() - 2 * DAY, 4 * DAY);
@@ -244,10 +239,6 @@ fn a_stale_crate_folder_and_an_old_compilers_unit_go_with_their_entries() {
     );
 }
 
-/// UNWRITTEN FOR A FEW DAYS, AND ALL OF IT: the old compiler's unit two days unwritten stays
-/// (and so does the crate folder of its age); one whose codegen object something wrote
-/// today stays whole; one whose fingerprint's compiler cannot be read (two JSONs that
-/// disagree, or one that names none) stays.
 #[test]
 fn nothing_goes_while_any_of_it_was_written_within_the_window() {
     let young = world(now() - DAY, 2 * DAY);
@@ -283,13 +274,6 @@ fn nothing_goes_while_any_of_it_was_written_within_the_window() {
     }
 }
 
-/// WHICH COMPILER IS CURRENT IS READ, NEVER GUESSED: no unit is judged by compiler where
-/// cargo last built with a compiler no store holds (a stock toolchain, or a folder named
-/// like a build outside a `store`), where `.rustc_info.json` names two sysroots or none,
-/// where `current` is a folder and not a link, or, cargo having last built with the
-/// current build, in a profile nothing was built in since its link was made (a link laid
-/// again over the same build reads that way). The stale crate folder goes in every case:
-/// its rule asks no compiler.
 #[test]
 fn units_stay_where_the_current_compiler_cannot_be_named() {
     let incremental_only = |fs: &Fake| {
@@ -396,11 +380,6 @@ fn date_unit(fs: &mut Fake, hash: &str, at: SystemTime) {
     }
 }
 
-/// THE STORE MOVED AND THIS WORKSPACE DID NOT FOLLOW: cargo last built here with the store's
-/// previous build, so every unit no build since the link names goes once stale — the old
-/// compiler's and the one before it alike, as the next build rebuilds each. NEGATIVE
-/// CONTROL: the very same tree with `.rustc_info.json` naming the current build (its link
-/// laid again, say) keeps every unit.
 #[test]
 fn a_workspace_left_on_the_previous_compiler_loses_every_unit_once_stale() {
     let mut fs = world(now() - DAY, 4 * DAY);
@@ -434,9 +413,6 @@ fn a_workspace_left_on_the_previous_compiler_loses_every_unit_once_stale() {
     assert_eq!(parts, vec![Part::Incremental]);
 }
 
-/// UNDER THE LOCKS, AS SURVEYED OR NOT AT ALL: a crate folder a session was written into
-/// since the survey, and a unit rebuilt since (its fingerprint written), are no longer
-/// doomed; untouched ones still are. A part that cannot be read is never stale.
 #[test]
 fn what_was_written_since_the_survey_is_kept() {
     let mut fs = world(now() - 2 * DAY, 4 * DAY);
@@ -484,7 +460,6 @@ fn what_was_written_since_the_survey_is_kept() {
     assert!(decide(&s, now()).iter().all(|d| d.part == Part::Unit));
 }
 
-/// A unit's hash in each name cargo gives its outputs; nothing else reads as one.
 #[test]
 fn the_unit_hash_is_read_from_every_output_name() {
     let h = "0123456789abcdef";

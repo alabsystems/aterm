@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Headless present-real: recording-mode honesty, the recording lifecycle's conformance to its
-//! derived model, and idle-zero (finalize drops the Virtual target and timer).
+//! Headless recording-mode honesty, model conformance, and idle-zero tests.
 
 use std::time::{Duration, Instant};
 
@@ -54,11 +53,7 @@ fn controller_key(key: Key, event_type: KeyEventType) -> InputEvent {
     controller_key_with_mods(key, Modifiers::empty(), event_type)
 }
 
-/// Bounded bookkeeping for pre-routing controller character attempts: press/repeat adds
-/// one sample, release none, never past the cap; an attempt past the cap is counted as
-/// dropped, so logged plus dropped is every attempt. Says nothing about delivery or pixels.
-/// `Buggy=1` logs a Kitty release as an attempt (the negative control); the conformance
-/// test's own control is the overflow dropped uncounted, the defect the count fixes.
+/// Bounded bookkeeping for pre-routing controller character attempts: press/repeat adds one sample.
 fn video_controller_attempt_ledger_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -97,9 +92,6 @@ fn video_controller_attempt_ledger_model_proves_and_catches_release_duplication(
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 }
 
-/// Tier-1 conformance of the attempt ledger to the shipping classifier: press/repeat
-/// record once, release is silent, named Space is kept, multi-character Text/Paste is
-/// complete, the cap truncates exactly. A Ctrl shortcut is still an attempt sample.
 #[test]
 fn real_controller_video_attempt_ledger_conforms_to_model() {
     let model = video_controller_attempt_ledger_model();
@@ -160,8 +152,6 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
     assert_eq!(log.len() as i64, state["logged"]);
     assert!(model.check_invariant("ExactAttemptLedger", &state));
 
-    // Past the cap the helper appends nothing and answers what it dropped: one press,
-    // then a two-character text, three attempts the full ledger counts and keeps out.
     let press = record_controller_video_attempts(
         &mut log,
         &controller_key(Key::Character('x'), KeyEventType::Press),
@@ -181,7 +171,6 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
     );
     assert_eq!((press + text) as i64, state["dropped"]);
     assert!(model.check_invariant("ExactAttemptLedger", &state));
-    // A release past the cap is no attempt, so it is no drop either.
     assert_eq!(
         record_controller_video_attempts(
             &mut log,
@@ -191,12 +180,10 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
         ),
         0
     );
-    // Negative control: the overflow dropped uncounted (the old helper) breaks the law.
     let mut uncounted = state.clone();
     uncounted.insert("dropped", uncounted["dropped"] - 1);
     assert!(!model.check_invariant("ExactAttemptLedger", &uncounted));
 
-    // Multi-codepoint text/paste records every character below the cap.
     let mut multi = Vec::new();
     let _ = record_controller_video_attempts(&mut multi, &InputEvent::Text("ab".into()), 20, 8);
     let _ = record_controller_video_attempts(
@@ -215,9 +202,6 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
         ]
     );
 
-    // Ctrl-C may be consumed or encoded as a control byte by later routing; the
-    // pre-routing ledger still records the attempt, so a sample is neither a PTY write
-    // receipt nor a visible glyph.
     let mut shortcut = Vec::new();
     let _ = record_controller_video_attempts(
         &mut shortcut,
@@ -227,15 +211,11 @@ fn real_controller_video_attempt_ledger_conforms_to_model() {
     );
     assert_eq!(shortcut, vec![(30, VideoInputSample::Char('c'))]);
 
-    // Negative control: the release-as-sample mutant breaks `ExactAttemptLedger`.
     let mut bad = state.clone();
     bad.insert("logged", bad["logged"] + 1);
     assert!(!model.check_invariant("ExactAttemptLedger", &bad));
 }
 
-/// The ledger stamps only the window it records: attempts on another window (the front window
-/// can change mid-take) are counted into `unlogged_inputs`, through both the socket seam and the
-/// hardware key path.
 #[test]
 fn the_key_ledger_refuses_input_from_a_window_it_is_not_recording() {
     let mut app = super::App::headless_for_test();
@@ -263,12 +243,9 @@ fn the_key_ledger_refuses_input_from_a_window_it_is_not_recording() {
         reply,
     });
 
-    // The recorded window: both paths log on the frame clock (the socket arm with the
-    // `KeySequence` that `send`/`feed` build, the hardware arm with a named key).
     app.note_video_ledger_event(recorded, &InputEvent::KeySequence(b"hi".to_vec()), 100);
     app.note_video_ledger_sample(recorded, VideoInputSample::Named(NamedKey::ArrowUp), 150);
 
-    // A second window: three bytes plus one key, four attempts this take cannot answer.
     app.note_video_ledger_event(other, &InputEvent::KeySequence(b"abc".to_vec()), 200);
     app.note_video_ledger_sample(other, VideoInputSample::Char('z'), 250);
 
@@ -286,14 +263,11 @@ fn the_key_ledger_refuses_input_from_a_window_it_is_not_recording() {
         rec.unlogged_other_window, 4,
         "the declined attempts must be COUNTED in the ledger's own unit, not dropped"
     );
-    // …and reach the take's published figure, so a short inputs[] never looks like a quiet
-    // screen. A lower bound: the control-thread counter is process-wide.
     assert!(
         super::App::video_unlogged_total(rec) >= 4,
         "the take's unlogged_inputs must include the foreign-window attempts"
     );
 
-    // Negative control: a take without a ledger counts nothing.
     if let Some(rec) = app.video_rec.as_mut() {
         rec.keys = false;
         rec.unlogged_other_window = 0;
@@ -311,9 +285,6 @@ fn the_key_ledger_refuses_input_from_a_window_it_is_not_recording() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A full ledger counts what it drops: once `key_log` holds `VIDEO_KEY_LOG_CAP` rows, the
-/// recorded window's attempts on both the socket seam and the hardware key path are counted in
-/// `unlogged_over_cap` and reach the take's `unlogged_inputs`, as frames count their drops.
 #[test]
 fn a_full_key_ledger_counts_the_attempts_it_drops() {
     let mut app = super::App::headless_for_test();
@@ -339,7 +310,6 @@ fn a_full_key_ledger_counts_the_attempts_it_drops() {
         reply,
     });
 
-    // One row is left: `hi` fills it with `h` and drops `i`; the hardware key is dropped too.
     app.note_video_ledger_event(recorded, &InputEvent::KeySequence(b"hi".to_vec()), 100);
     app.note_video_ledger_sample(recorded, VideoInputSample::Named(NamedKey::ArrowUp), 150);
 
@@ -358,7 +328,6 @@ fn a_full_key_ledger_counts_the_attempts_it_drops() {
         (2, 0),
         "the two attempts past the cap are counted, as the full ledger's own"
     );
-    // A lower bound: the control-thread counter is process-wide.
     assert!(
         super::App::video_unlogged_total(rec) >= 2,
         "the take's unlogged_inputs must include the attempts past the cap"
@@ -368,8 +337,6 @@ fn a_full_key_ledger_counts_the_attempts_it_drops() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Mode honesty both ways: glass records through the GPU swapchain tap or refuses, never the
-/// offscreen arm; only a glass-less window takes the offscreen arm.
 #[test]
 fn video_mode_honesty_both_ways() {
     assert_eq!(
@@ -382,7 +349,6 @@ fn video_mode_honesty_both_ways() {
         Ok(VideoMode::OffscreenPresentReal),
         "a glass-less window records its virtual present target"
     );
-    // Glass without a GPU swapchain (CPU present, mid-rebuild) refuses.
     assert!(
         video_capture_mode(true, false, true).is_err(),
         "a windowed non-GPU target refuses; it must not fall back offscreen"
@@ -439,11 +405,6 @@ fn capture_regression_translucent_raw_present_refuses_wysiwyg_claim() {
     );
 }
 
-/// Each platform's capture traits route both guards: a translucent GPU window
-/// is refused where the compositor blends the client (macOS) and admitted where
-/// it stays opaque (Windows, Linux); a compositor material is refused where the
-/// photograph omits it (Windows) and admitted where it does not. A solid window
-/// without a material passes on every platform.
 #[test]
 fn platform_traits_route_both_guards() {
     let solid = RenderKnobs {
@@ -468,8 +429,6 @@ fn platform_traits_route_both_guards() {
         );
     }
 
-    // Translucency: only a window that really presents through the GPU
-    // swapchain the compositor blends.
     assert_eq!(
         platform_capture_guards(MAC_CAPTURE, &translucent, true, true),
         Err(TRANSLUCENT_CAPTURE_ERROR),
@@ -493,7 +452,6 @@ fn platform_traits_route_both_guards() {
         );
     }
 
-    // Material: only where the platform photograph omits it.
     for material in [
         BackgroundMaterial::Hud,
         BackgroundMaterial::Sidebar,
@@ -514,8 +472,6 @@ fn platform_traits_route_both_guards() {
         }
     }
 
-    // Both guards are asked: a translucent GPU window with a material is
-    // refused by each platform for its own reason.
     let both = RenderKnobs {
         background_material: BackgroundMaterial::Hud,
         ..translucent
@@ -557,15 +513,11 @@ fn capture_regression_post_present_stop_fails_closed() {
     );
 }
 
-/// Tier-1 conformance: the real begin decision, export permit, cancellation CAS and
-/// cleanup projected onto `VideoRecordingLifecycle`. Tier-0 lives in aterm-spec.
 #[test]
 fn real_video_lifecycle_conforms_to_model() {
     let model = aterm_models_misc::video_recording_lifecycle_model();
     let mut st = model.init_state();
 
-    // The control thread reserves one directory/recording slot before the
-    // event-loop begin decision.
     assert!(model.fire("Reserve", &mut st));
     assert_eq!((st["phase"], st["private_dirs"]), (1, 1));
     assert_eq!(
@@ -585,9 +537,6 @@ fn real_video_lifecycle_conforms_to_model() {
     );
     assert!(model.check_invariant("OffscreenOnlyWithoutGlass", &st));
     assert!(model.check_invariant("RecordingOwnsItsPacingTimer", &st));
-    // Negative control: `video_initial_next_frame` written as
-    // `pace.then_some(now)` arms nothing for an unpaced headless begin, and
-    // the offscreen loop's sole redraw driver never fires.
     let pace_only = |_mode: VideoMode, pace: bool, now: Instant| pace.then_some(now);
     let mut untimed = st.clone();
     untimed.insert(
@@ -597,7 +546,6 @@ fn real_video_lifecycle_conforms_to_model() {
     assert!(!model.check_invariant("RecordingOwnsItsPacingTimer", &untimed));
     assert!(model.fire("Tick", &mut st));
 
-    // Finalize transfers the sole ownership slot to the real export permit.
     let export = std::sync::Arc::new(super::VideoExportState::default());
     let cancel = VideoCancellation::new();
     let permit = export
@@ -611,7 +559,6 @@ fn real_video_lifecycle_conforms_to_model() {
     );
     assert!(!model.fire("Reserve", &mut st));
 
-    // The worker's CAS authorizes publication immediately before rename.
     assert!(cancel.authorize_commit());
     assert!(model.fire("AuthorizeCommit", &mut st));
     cancel.cancel();
@@ -625,9 +572,6 @@ fn real_video_lifecycle_conforms_to_model() {
         if cancel.is_cancelled() { 1 } else { 2 },
         "the real token's verdict after the late cancel"
     );
-    // Negative control: a cancel that stores VIDEO_CANCELLED instead of
-    // CAS-ing it from live would read cancelled here, while the export it
-    // revoked is still past its rename boundary.
     let mut revoked = st.clone();
     revoked.insert("cancel_state", 1);
     assert!(!model.check_invariant("CancelledOwnsNothing", &revoked));
@@ -639,7 +583,6 @@ fn real_video_lifecycle_conforms_to_model() {
         (0, 0, 0)
     );
 
-    // With glass: the real law picks the tap and the model refuses the headless arm.
     assert!(model.fire("AttachGlass", &mut st));
     assert!(model.fire("Reserve", &mut st));
     assert_eq!(
@@ -658,17 +601,12 @@ fn real_video_lifecycle_conforms_to_model() {
         "an unpaced tap's begin arms no deadline: its presents drive it"
     );
     assert!(model.check_invariant("TapOnlyOnGlass", &st));
-    // Negative control: glass gone while the tap still copies it (a close that skipped
-    // `video_abort_window_close`). The shipping close path is driven by
-    // `window_close_app_drop_and_backend_rebuild_abort_recording_ownership`.
     let mut orphaned = st.clone();
     orphaned.insert("glass", 0);
     assert!(!model.check_invariant("TapOnlyOnGlass", &orphaned));
     assert!(model.fire("OwnerLost", &mut st));
     assert_eq!((st["phase"], st["mode"], st["timer"]), (0, 0, 0));
 
-    // A paced tap: the shipping begin arms the WaitUntil owner on glass too, like the
-    // model's paced begin.
     assert!(model.fire("RequestPaced", &mut st));
     assert!(model.fire("Reserve", &mut st));
     assert!(model.fire("BeginOnGlass", &mut st));
@@ -677,8 +615,6 @@ fn real_video_lifecycle_conforms_to_model() {
         i64::from(video_initial_next_frame(VideoMode::SwapchainTap, true, tapped).is_some()),
         "the paced tap's timer is the deadline the shipping begin arms"
     );
-    // Negative control: a begin that arms no deadline for any swapchain tap
-    // starves a paced recording on its first skipped unchanged frame.
     let mut starved = st.clone();
     starved.insert("timer", 0);
     assert!(!model.check_invariant("RecordingOwnsItsPacingTimer", &starved));
@@ -694,8 +630,6 @@ fn real_video_lifecycle_conforms_to_model() {
     assert!(model.fire("RequestUnpaced", &mut st));
     assert_eq!((st["phase"], st["mode"], st["timer"]), (0, 0, 0));
 
-    // A live transition to translucent glass atomically aborts the raw tap
-    // before another frame can be recorded under its opaque admission.
     assert!(model.fire("Reserve", &mut st));
     assert!(model.fire("BeginOnGlass", &mut st));
     assert!(video_capture_opacity_requires_abort(
@@ -707,8 +641,6 @@ fn real_video_lifecycle_conforms_to_model() {
     assert_eq!(st["mode"], 0, "opacity transition ends the tap");
     assert!(model.check_invariant("NoTranslucentTap", &st));
 
-    // Cancellation winning before publication maps to cleanup plus permit
-    // acknowledgement; the token can no longer authorize commit.
     assert!(model.fire("MakeOpaque", &mut st));
     assert!(model.fire("DetachGlass", &mut st));
     assert!(model.fire("Reserve", &mut st));
@@ -725,8 +657,6 @@ fn real_video_lifecycle_conforms_to_model() {
     assert!(!export.is_busy());
     assert!(model.check_invariant("CancelledOwnsNothing", &st));
 
-    // Negative controls: the forbidden windowed-offscreen fallback, and a publication
-    // that skipped the CAS authorization.
     let mut bad = model.init_state();
     assert!(model.fire("AttachGlass", &mut bad));
     assert!(model.fire("Reserve", &mut bad));
@@ -793,8 +723,6 @@ fn live_opacity_transition_aborts_swapchain_recording_fail_closed() {
             .contains(super::TRANSLUCENT_CAPTURE_ERROR)
     );
 
-    // Negative controls: an opaque transition and the headless present-real
-    // mode retain their recording because neither omits compositor pixels.
     for (mode, opacity, blends) in [
         (VideoMode::SwapchainTap, 1.0, true),
         (VideoMode::OffscreenPresentReal, 0.75, true),
@@ -828,8 +756,6 @@ fn live_opacity_transition_aborts_swapchain_recording_fail_closed() {
 
 #[test]
 fn video_cancel_and_index_commit_have_one_atomic_winner() {
-    // Schedule A: timeout/shutdown wins first. The worker cannot later
-    // authorize the index rename and must abort its unpublished directory.
     let cancel_wins = VideoCancellation::new();
     cancel_wins.cancel();
     assert!(cancel_wins.is_cancelled());
@@ -838,8 +764,6 @@ fn video_cancel_and_index_commit_have_one_atomic_winner() {
         "a cancelled request cannot publish"
     );
 
-    // Schedule B: the worker's single CAS before rename wins; a later timeout cannot revoke
-    // it, and shutdown waits for its permit acknowledgement.
     let commit_wins = VideoCancellation::new();
     assert!(commit_wins.authorize_commit());
     commit_wins.cancel();
@@ -855,7 +779,6 @@ fn video_cancel_and_index_commit_have_one_atomic_winner() {
 
 #[test]
 fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
-    // Survivor close: abort synchronously before WindowState/tap removal.
     let mut app = super::App::headless_for_test();
     let survivor_session = app.next_session_id;
     let _survivor = app.insert_logical_window(super::stub_session(survivor_session), 24, 80);
@@ -892,8 +815,6 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
     );
     let _ = std::fs::remove_dir_all(root);
 
-    // Both recording modes are aborted by the real backend rebuild before
-    // WindowGpu replacement. Virtual additionally loses its timer target.
     for mode in [VideoMode::SwapchainTap, VideoMode::OffscreenPresentReal] {
         let mut app = super::App::headless_for_test();
         if mode == VideoMode::OffscreenPresentReal {
@@ -932,8 +853,6 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // Drop is the last fail-safe for test/embedding exits; production calls the same seam
-    // before its deliberate mem::forget/process::exit.
     let mut app = super::App::headless_for_test();
     let (root, path, dir) = test_video_dir("video-app-drop");
     let (reply, rx) = std::sync::mpsc::channel();
@@ -964,14 +883,10 @@ fn window_close_app_drop_and_backend_rebuild_abort_recording_ownership() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Idle-zero: during an offscreen recording the deadline fold arms the hard stop and
-/// the paced `next_frame`; after `video_finalize` the Virtual target is dropped and the
-/// fold contributes nothing, so `about_to_wait` waits.
 #[test]
 fn finalize_drops_virtual_target_and_timer() {
     let mut app = super::App::headless_for_test();
     let wid = WindowId(0);
-    // Attach the glass-less Virtual target as the `Wake::Video` headless arm does.
     app.windows
         .get_mut(&wid)
         .expect("headless window 0")
@@ -999,22 +914,17 @@ fn finalize_drops_virtual_target_and_timer() {
         cancel: VideoCancellation::new(),
         reply,
     });
-    // In flight the fold arms the earlier of {deadline, next_frame}: the due paced frame.
     assert_eq!(
         fold_video_deadlines(app.video_rec.as_ref(), None),
         Some(now),
         "the offscreen loop's next_frame is folded into the single WaitUntil"
     );
-    // It folds against other deadlines like every arm in `about_to_wait`.
     let later = now + Duration::from_secs(9);
     assert_eq!(
         fold_video_deadlines(app.video_rec.as_ref(), Some(later)),
         Some(now)
     );
 
-    // Tier-1 (`VideoRecordingLifecycle`): project this App's recording: `mode` from the
-    // window's present target (a `Virtual` target is the offscreen arm), `timer` from the
-    // pacing deadline, `private_dirs` from the directory on disk.
     let model = aterm_models_misc::video_recording_lifecycle_model();
     let project = |app: &super::App, base: &aterm_spec::interp::State| {
         let mut state = base.clone();
@@ -1051,27 +961,18 @@ fn finalize_drops_virtual_target_and_timer() {
         None,
         "idle-zero: nothing armed after finalize (about_to_wait -> Wait)"
     );
-    // The CPU test backend has no GPU take: the client gets the honest recording-lost
-    // error, not a silent empty artifact.
     let msg = rx.recv().expect("finalize answers the pending client");
     assert!(msg.starts_with("ERR video"), "honest reply, got: {msg}");
-    // A lost take is the model's `Fail`, and what the shipping finalize
-    // left behind is exactly that successor's target, timer and directory.
     let lost = model.successors("Fail", &recording)[0].clone();
     assert_eq!(project(&app, &lost), lost);
-    // Negative control: a finalize without `ws.present = None` keeps the
-    // recording-only Virtual target once no recording exists.
     let mut retained = lost;
     retained.insert("mode", 2);
     assert!(!model.check_invariant("ModeMatchesRecordingPhase", &retained));
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The video judge runs on every `new_events` cause: under sustained `WaitCancelled` the timer
-/// cause never fires, so a non-timer wake must consume every due video clock.
 #[test]
 fn service_video_wake_consumes_due_clocks_on_any_wake() {
-    // (a) A past hard-stop deadline finalizes without a timer wake.
     let mut app = super::App::headless_for_test();
     let (root, path, dir) = test_video_dir("video-wake-judge-finalize");
     let (reply, rx) = std::sync::mpsc::channel();
@@ -1104,14 +1005,11 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
         None,
         "idle-zero: the judge leaves nothing armed once it finalizes"
     );
-    // As above: no GPU take, so the honest recording-lost error.
     let msg = rx.recv().expect("the blocked client is answered");
     assert!(msg.starts_with("ERR video"), "honest reply, got: {msg}");
     assert!(!path.exists());
     let _ = std::fs::remove_dir_all(root);
 
-    // (b) A due paced `next_frame` is consumed and re-armed ahead of now, never left in
-    // the past for the fold to re-arm every turn; the recording lives on.
     let mut app = super::App::headless_for_test();
     let (root, _path, dir) = test_video_dir("video-wake-judge-pace");
     let (reply, _rx) = std::sync::mpsc::channel();
@@ -1149,8 +1047,6 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
          presented nor PROVED the screen unchanged: it sampled nothing and books no \
          tick — a render stall under a live loop reads as a hole"
     );
-    // A tick whose redraw reached the RepaintKey early-out (the screen proved unchanged) is
-    // booked; a redraw that did not move the count books nothing.
     let wid = WindowId(0);
     let before = app.windows.get(&wid).map(|ws| ws.redraws_proved_unchanged);
     app.book_video_tick_if_proved_unchanged(wid, 42, before);
@@ -1168,7 +1064,6 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
     drop(app); // the drop fail-safe answers the client; not under test here
     let _ = std::fs::remove_dir_all(root);
 
-    // (c) Nothing due: a spurious wake changes nothing.
     let mut app = super::App::headless_for_test();
     let (root, _path, dir) = test_video_dir("video-wake-judge-idle");
     let (reply, _rx) = std::sync::mpsc::channel();
@@ -1207,8 +1102,6 @@ fn service_video_wake_consumes_due_clocks_on_any_wake() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// GPU loss cannot leave a headless Virtual recording paced forever on the CPU backend:
-/// the abort seam removes the target and its timer and answers the blocked client.
 #[test]
 fn device_loss_aborts_virtual_recording_without_a_timer_wedge() {
     let model = aterm_models_core::gpu_loss_recovery_model();
@@ -1273,8 +1166,6 @@ fn device_loss_aborts_virtual_recording_without_a_timer_wedge() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The mode labels are the disclosure contract's exact strings — index.json
-/// consumers key on them.
 #[test]
 fn video_mode_labels_are_the_disclosure_contract() {
     assert_eq!(VideoMode::SwapchainTap.as_str(), "swapchain-tap");

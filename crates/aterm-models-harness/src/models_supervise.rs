@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Formal state-machine models (`ty_model!`) for harness session supervision, Autopilot, and wall handling.
+//! Formal state-machine models (`ty_model!`) for harness session supervision and Autopilot.
 
 use aterm_spec::derive::{Liveness, Model};
 
@@ -121,7 +121,7 @@ pub fn supervisor_focus_choice_model() -> Model {
     }
 }
 
-/// Formal model for the turn-end decision policy across Autopilot modes (`supervise/policy/turn_end.rs`).
+/// Formal model for the turn-end decision policy across Autopilot modes.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_turn_end_model() -> Model {
@@ -1136,7 +1136,7 @@ pub fn supervisor_host_turn_end_model() -> Model {
     }
 }
 
-/// Formal model ensuring human-grace expiry over a READY reply triggers upgrade restart rather than continuation.
+/// Formal model ensuring human-grace expiry over a READY reply triggers upgrade restart.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn upgrade_attended_turn_end_model() -> Model {
@@ -1381,7 +1381,7 @@ pub fn upgrade_refused_turn_end_model() -> Model {
     }
 }
 
-/// Formal model for answering Claude Code question dialogs with free-text notes (`answer-recommended@v1`).
+/// Formal model for answering Claude Code question dialogs with free-text notes.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_question_text_model() -> Model {
@@ -1683,7 +1683,7 @@ const QUESTION_TEXT_ACTIONS: [&str; 6] = [
     "PersonTypesPolicyText",
 ];
 
-/// Specialization of [`supervisor_question_text_model`] with `Text = 0` for the recommended-option path.
+/// Specialization of [`supervisor_question_text_model`] with `Text = 0`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
@@ -1702,7 +1702,7 @@ pub fn supervisor_question_answer_model() -> Model {
     m
 }
 
-/// Formal model for keystroke sequences when declining a tool-approval dialog (`supervise/press.rs`).
+/// Formal model for keystroke sequences when declining a tool-approval dialog.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_decline_keys_model() -> Model {
@@ -1904,7 +1904,7 @@ pub fn supervisor_decline_keys_model() -> Model {
     }
 }
 
-/// Formal model for bounded retries on transient network/API walls (`supervise/policy/turn_end.rs`).
+/// Formal model for bounded retries on transient network/API walls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_network_wall_model() -> Model {
@@ -2124,7 +2124,7 @@ pub fn supervisor_survey_press_model() -> Model {
     }
 }
 
-/// Formal model for waiting out or resetting a standing usage-limit wall, the usage tap timing a cut notice's reset included (`Tapped`).
+/// Formal model for waiting out or resetting a standing usage-limit wall.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_usage_wall_model() -> Model {
@@ -2286,7 +2286,6 @@ pub fn supervisor_usage_wall_model() -> Model {
                 waited = 0;
             }
 
-            // A wall whose notice's reset is cut (the `Tapped` dial): its reset `CutAt` out, past the back-off.
             action WallAppearsCut when (Tapped == 1 && wall == 0 && held == 0 && credits == 0) {
                 wall = 1;
                 sitting = 0;
@@ -2300,11 +2299,9 @@ pub fn supervisor_usage_wall_model() -> Model {
                 cut = 1;
                 tap = 0;
             }
-            // The tap's run after the wall was first read names its reset, before a tick.
             action TapReads when (cut == 1 && tap == 0 && (wall == 1 || wall == 5)) {
                 tap = 1;
             }
-            // The tap's run at the reset: the window rolled over.
             action TapRollsOver when (cut == 1 && tap == 1 && due <= clock && (wall == 1 || wall == 5)) {
                 tap = 2;
             }
@@ -2476,7 +2473,6 @@ pub fn supervisor_usage_wall_model() -> Model {
                 waited = 0;
             }
 
-            // The tap's reset unread at a cut notice: the act goes on the back-off, before the reset.
             action TapResetIgnored when (
                 Buggy == 1 && wall == 1 && cut == 1 && tap == 1 && held == 0 && tries == 0
                     && Rung2 <= clock && clock <= CutAt - 1
@@ -2872,81 +2868,7 @@ pub fn supervisor_box_ask_model() -> Model {
     }
 }
 
-/// A HOLD NEVER RUNS AN UNTOUCHED BOX EPISODE INTO THE VENDOR'S AUTO-DENY,
-/// AND A TOUCHED EPISODE IS HELD AS EVER (aterm-agent
-/// `supervise/approval_loop.rs`: `Session::held_for_person`, its cap
-/// `DENY_MARGIN`, and the touch rule, `Episode`). The incident of
-/// 2026-10-15: a person typed into a session 22 s before an rm box came up,
-/// so its answer was held for their two-minute grace while the box's own
-/// countdown (`⚠ Claude Code will automatically deny this request in 1:44,
-/// …`) ran out, and Claude Code DENIED it: the outcome nobody chose, the
-/// worker's command failed and its work stalled.
-///
-/// THE ONE RULE, over the BOX EPISODE (`up`: 0 before it, 1 from the first
-/// read that shows a box, 2 from the first read that shows none; one
-/// episode a run): an episode TOUCHED by a fact the server records — the
-/// person count risen past its baseline (`counted`), or another driver's
-/// hand on the session while it runs (`driven`) — is theirs: held as it
-/// always was, the vendor's deny standing for the answer they left
-/// unfinished (they were there). An episode nobody touched is held to the
-/// margin before the deny, no further. An episode whose touch cannot be told
-/// (`blind`: its first read the loop's first, a read without the count or
-/// the stamp, a count that started over) is held as one touched. `latched`
-/// is what the loop knows: every fact latches it, and nothing inside the
-/// episode unlatches it — a box redrawn, re-wrapped, relabelled (`1 of 2`)
-/// or replaced by another (`Redraw`) keeps it.
-///
-/// Time is counted in margins: `left` is the vendor's countdown (`Window`
-/// margins: 2:00 over 15 s is 8), `Tick` takes one off. `known` that the loop
-/// knows the deny — the vendor's countdown, read where Claude Code draws it
-/// and seen ticking (0: none drawn, a form not read, the worker's own text
-/// spelling one, or one standing still — `Countdown`, unit-tested with its
-/// own negative controls); `policy` that the policy answers the box (1: an
-/// approval or a decline; 0: it escalates, the owner is needed); `grace` a
-/// person's grace running, `driver` another driver's hand on the session —
-/// either holds the loop. `lost` latches a deny of an untouched episode the
-/// policy answers whose deny the loop knew; `over` a press in a touched
-/// episode while a hand still holds it.
-///
-/// THE ONE ASSUMPTION, stated: a press that is DUE lands within one margin —
-/// `Tick` waits while it is (the look at the hold's end, its reads and the
-/// fenced key take milliseconds; a key the box did not take is pressed again
-/// after a leave-wait of 3 s inside the margin under `approve = "all"`,
-/// `leave_wait`; `DENY_MARGIN`'s doc says what else the 15 s hold). A press
-/// is due when the policy answers the box and no hand holds it, or — the
-/// episode not latched and its deny known — once the countdown is within
-/// the margin, a person's grace or not.
-///
-/// The defects, each a dial of its own and caught alone: `Outlast`, the hold
-/// outlasts the countdown (the code before the cap, the incident:
-/// `TheVendorNeverDeniesAnUntouchedEpisode`); `Touched`, the cap presses a
-/// touched episode (`ATouchedEpisodeIsHeldAsEver`); `Lost`, a touch lost
-/// inside an episode — a redraw judged afresh, from a baseline that already
-/// holds the person's gesture (the stacked-asks label read as another box)
-/// — so the cap presses it (`ATouchedEpisodeIsHeldAsEver`).
-/// `Buggy = 1` is all three. Denied by the vendor in the model as in the
-/// code, when nobody answers it: a box the policy escalates (fail-closed: the
-/// owner was asked), a deny the loop does not know (the hold as it always
-/// was), a touched episode whose hand outlasts its countdown (theirs), and a
-/// blind one (held as touched).
-///
-/// Out of the model, in the code: every key of the press past a person's
-/// hold is fenced on the episode's baseline count (`key|send
-/// if-human=<n>`, `Session::person_fence`), so a gesture the server counts
-/// between any two keys skips the next — a second guard on `counted`; a
-/// person's key unread by Claude Code at the read (milliseconds) is the race
-/// left. A key another driver sends with no lease and no named turn is no
-/// fact the server records, and no touch.
-///
-/// Tier-1: aterm-agent `supervise/run_box_hold_tests.rs` drives the real
-/// `Session` over the scripted server, one look a world, and projects each
-/// deciding look onto this model: a look that pressed must find `Press`
-/// enabled, a look that held must find time free to pass (`Tick`) — with the
-/// loop before the cap (`Session::set_deny_cap_off`, `Outlast`), a loop that
-/// reads no episode as touched (`Session::set_touch_off`, `Touched`) and one
-/// that starts an episode at every box another than the last read's
-/// (`Session::set_episode_per_box`, `Lost`) as the negative controls, looks
-/// the model forbids.
+/// Formal model for holding an approval-box episode within the vendor auto-deny margin.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_box_hold_model() -> Model {
@@ -2971,12 +2893,6 @@ pub fn supervisor_box_hold_model() -> Model {
             var lost = 0;
             var over = 0;
 
-            // The episode's first read shows a box, its countdown full: one
-            // the policy answers, its deny known; one whose deny the loop
-            // does not know; one the policy escalates. A driver's hand on the
-            // session as it comes up touches it: the code reads that on the
-            // status read its first decision makes, never off one before the
-            // episode (`DriverOff` before `BoxUp`: untouched).
             action BoxUp when (up == 0) {
                 up = 1;
                 left = Window;
@@ -3001,21 +2917,14 @@ pub fn supervisor_box_hold_model() -> Model {
                 driven = driver;
                 latched = driver;
             }
-            // A person's keystroke before the episode's baseline (the
-            // incident's): their grace, and no touch.
             action Types when (up == 0 && grace == 0) {
                 grace = 1;
             }
-            // A person's gesture the server counts while the episode runs (or
-            // in the gap before its first read): the count past its
-            // baseline, a touch, and their grace.
             action Gesture when (up == 1 && counted == 0) {
                 counted = 1;
                 latched = 1;
                 grace = 1;
             }
-            // Another driver's hand on the session (a lease, a named turn):
-            // a touch of the episode under way.
             action DriverOn when (up <= 1 && driver == 0) {
                 driver = 1;
                 driven = if up == 1 { 1 } else { driven };
@@ -3027,23 +2936,16 @@ pub fn supervisor_box_hold_model() -> Model {
             action GraceEnds when (grace == 1) {
                 grace = 0;
             }
-            // Whether anyone touched the episode cannot be told: held as
-            // touched.
             action Blind when (up == 1 && blind == 0) {
                 blind = 1;
                 latched = 1;
             }
-            // Claude Code redraws the box, re-wraps it, relabels it (`1 of
-            // 2`) or draws another in its place: the same episode, its touch
-            // kept — lost only by the defect.
             action Redraw when (up == 1 && latched == 1) {
                 latched = if Lost == 1 || Buggy == 1 { 0 } else { latched };
             }
-            // Whoever touched the episode answers its box: it leaves.
             action Answered when (up == 1 && (counted == 1 || driven == 1)) {
                 up = 2;
             }
-            // A margin passes — never while the loop's press is due.
             action Tick when (
                 up == 1 && left > 0 &&
                 (policy == 0 ||
@@ -3053,7 +2955,6 @@ pub fn supervisor_box_hold_model() -> Model {
             ) {
                 left = left - 1;
             }
-            // The loop presses the policy's answer.
             action Press when (
                 up == 1 && policy == 1 &&
                 ((grace == 0 && driver == 0) ||
@@ -3068,7 +2969,6 @@ pub fn supervisor_box_hold_model() -> Model {
                     over
                 };
             }
-            // The countdown runs out: Claude Code denies the box.
             action Deny when (up == 1 && left == 0) {
                 up = 2;
                 lost = if policy == 1 && known == 1 && counted == 0 && driven == 0 &&

@@ -71,12 +71,12 @@ impl DevToolsWatch {
     }
 
     /// Records that aterm opened the Developer Tools pane so the next focus gain re-reads.
-    pub(crate) fn note_handed_over(&mut self) {
+    pub(crate) const fn note_handed_over(&mut self) {
         self.read_on_return = true;
     }
 
     /// Resets the hand-over latch after an inconclusive helper attempt.
-    pub(crate) fn forget_hand_over(&mut self) {
+    pub(crate) const fn forget_hand_over(&mut self) {
         self.handed_over = false;
     }
 
@@ -102,7 +102,7 @@ impl DevToolsWatch {
     }
 
     /// Records that the owner confirmed switching on Developer Tools and requests a refresh.
-    pub(crate) fn note_switched_on(&mut self) -> bool {
+    pub(crate) const fn note_switched_on(&mut self) -> bool {
         self.refreshed = true;
         self.refresh_owed = false;
         true
@@ -124,7 +124,7 @@ impl DevToolsWatch {
         std::mem::take(&mut self.refresh_owed)
     }
 
-    fn owe_refresh(&mut self) {
+    const fn owe_refresh(&mut self) {
         if !self.refreshed {
             self.refreshed = true;
             self.refresh_owed = true;

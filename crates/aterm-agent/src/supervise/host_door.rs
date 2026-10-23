@@ -385,6 +385,15 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// under `occupancy = "prompt"` alone.
     fn break_taken(&self) {}
 
+    /// Notifies the host of what the occupancy door says now (the occupancy design's §6), once
+    /// a change: the mode, the hold, the ready proxy, the first guard and each rule's last word
+    /// ([`crate::supervise::occupancy::OccupancySaid`]). Composed from what the loop holds; told
+    /// on hosted, unattended loops whose `occupancy` is not `off`. The host's status fields,
+    /// `occupancy why` and its Entries read it; nothing is typed from it.
+    fn occupancy_said(&self, said: &crate::supervise::occupancy::OccupancySaid) {
+        let _ = said;
+    }
+
     /// Returns whether the upgrade's notice is due for this session: a nudge waits for it (the
     /// occupancy red-team's F11). Asked under `occupancy = "prompt"` alone, after the grant, of
     /// a due line.

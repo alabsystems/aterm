@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-dbus's messages against zbus 5.16.0's, recorded in
-//! tests/recorded/zbus-5.16.0-messages.tsv: each message encodes to the bytes
-//! zbus built for it, and those bytes decode to it.
-//!
-//! Negative controls: every case is recorded and every recording has a case;
-//! a message one field away (another serial, no sender, the other byte order)
-//! misses its recording; and no single-bit flip of a recording decodes to the
-//! recorded message.
+//! Tests for `aterm-dbus` message encoding and decoding against recorded `zbus` 5.16.0 messages.
 
 use std::collections::BTreeMap;
 

@@ -32,7 +32,7 @@ pub(crate) struct PathSpan {
 
 /// Characters that end a path token: whitespace, the quotes and brackets a
 /// citation is wrapped in, and the pipes of a table.
-fn is_delimiter(ch: char) -> bool {
+const fn is_delimiter(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
             ch,
@@ -41,7 +41,7 @@ fn is_delimiter(ch: char) -> bool {
 }
 
 /// Trailing sentence punctuation that is never part of a citation.
-fn is_trailing_punct(ch: char) -> bool {
+const fn is_trailing_punct(ch: char) -> bool {
     matches!(ch, '.' | ',' | ';' | ':' | '!' | '?')
 }
 

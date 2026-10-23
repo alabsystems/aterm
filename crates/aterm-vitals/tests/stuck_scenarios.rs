@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stuck-process engine against the design: the §11.10 example rows
-//! (the `sys jobs` row word for word, the contract an agent reads); every
-//! scenario of the §18 expectation table in each shape it names, with the
-//! shapes an interactive shell adds; and the laws of §11.3–§11.9 one at a
-//! time (orphans, the exited row, Ctrl-Z's carried clock and `fg`, a block
-//! as one job, demand, findings, `serves`, lanes off, the wait name's 2-tick
-//! agreement, pid reuse, episodes, the class table, the foreign-text rule).
+//! Scenario tests for the stuck-process engine.
 
 #[path = "support/world.rs"]
 mod world;
@@ -23,8 +17,6 @@ use aterm_vitals::jobs::{
 use scenarios::{TICK_MS, curl, follow_fds, pipe_end, sleeper, spinner, tcp_fd};
 use world::{OutFile, Proc, World, hint};
 
-/// Tick every 2 s from now until `until_ms` from now, calling `each` after
-/// each advance; the last view.
 fn run_to(w: &mut World, until_ms: u64, mut each: impl FnMut(&mut World, u64)) -> JobsView {
     let mut rel = 0;
     each(w, 0);
@@ -50,8 +42,6 @@ fn wire(v: &JobsView, id: &str) -> String {
         .wire()
 }
 
-// §11.10 example rows
-
 #[test]
 fn example_a_password_prompt_in_a_background_tab_waits_for_you() {
     let mut w = World::new();
@@ -63,7 +53,6 @@ fn example_a_password_prompt_in_a_background_tab_waits_for_you() {
         wire(&v, "b51"),
         "job id=b51 kind=shell consumer=person-fg exe=ssh class=waiting wait=tty-password quiet_ms=252000 phi=0 verdict=waiting-you"
     );
-    // A person's wait arms nothing.
     assert_eq!(v.demand, Demand::Idle);
 }
 
@@ -103,7 +92,6 @@ fn example_c_a_cargo_lock_wait_is_capped_until_named_then_fine_behind_a_running_
             12_000,
         );
     }
-    // Tab 2's cargo holds the lock; its rustc children churn with work.
     w.shell_tab(2, 2, 210);
     let mut holder = sleeper(5120, "cargo");
     holder.child_cpu_per_s = 1_800_000_000;
@@ -115,7 +103,6 @@ fn example_c_a_cargo_lock_wait_is_capped_until_named_then_fine_behind_a_running_
         wire(&v, "b77"),
         "job id=b77 kind=shell consumer=person-fg exe=cargo class=waiting wait=unnamed quiet_ms=420000 phi=15.2 mu_ms=12000 mu_from=class verdict=quiet"
     );
-    // φ passed 8 at 3 min 41 s, and an unnamed wait stays capped at quiet.
     assert_eq!(v.row("b61").map(|r| r.class), Some(Class::Running));
     w.advance(TICK_MS);
     churn(&mut w, 422_000);
@@ -128,12 +115,10 @@ fn example_c_a_cargo_lock_wait_is_capped_until_named_then_fine_behind_a_running_
         },
     );
     let held = w.observe();
-    // One tick of a legitimate class keeps the suspect verdict (no flap)…
     assert_eq!(held.row("b77").map(|r| r.verdict), Some(Verdict::Quiet));
     w.advance(TICK_MS);
     churn(&mut w, 424_000);
     let v = w.observe();
-    // …and the second makes it fine: it waits for a running holder.
     assert_eq!(
         wire(&v, "b77"),
         "job id=b77 kind=shell consumer=person-fg exe=cargo class=waiting wait=unnamed named=lock holder=5120:cargo:tab2:running quiet_ms=424000 phi=0 verdict=fine"
@@ -200,7 +185,6 @@ fn example_f_a_held_stop_under_an_agent_call_is_stuck_and_a_parked_one_is_parked
         "job id=a6301 kind=agent-call consumer=agent-bg task=a71pq0zz3 pgid=6301 exe=zsh class=stopped stop=held stopped_pid=6302:node quiet_ms=1130000 phi=8.18 verdict=stuck"
     );
 
-    // The contrast: vim, Ctrl-Z'd, the shell holding the terminal again.
     let mut w = World::new();
     w.run_fg(1, 12, "vim notes", sleeper(1200, "vim"));
     let v = run_to(&mut w, 7_200_000, |w, rel| {
@@ -229,7 +213,6 @@ fn example_g_a_zombie_pile_under_a_logging_server_is_running_with_its_zombies_co
     w.run_bg(1, node);
     let v = run_to(&mut w, 2_400_000, |w, rel| {
         w.line(1);
-        // One worker forked per request every 65 s, never reaped.
         let k = u32::try_from(rel / 65_000).expect("small");
         if k < 37 && !w.procs.contains_key(&(6200 + k)) {
             let mut z = Proc::new(6200 + k, 6120, "node");
@@ -252,12 +235,9 @@ fn example_g_a_zombie_pile_under_a_logging_server_is_running_with_its_zombies_co
     );
 }
 
-// §18 item 8: every scenario, every shape
-
 #[test]
 fn every_scenario_of_the_expectation_table_reads_as_the_table_says() {
     let all = scenarios::all();
-    // Rows 1–24 and the two added rows, each in the shapes it names.
     let rows: std::collections::BTreeSet<&str> = all
         .iter()
         .map(|s| s.row.split(' ').next().unwrap_or(""))
@@ -281,8 +261,6 @@ fn every_scenario_of_the_expectation_table_reads_as_the_table_says() {
     );
 }
 
-// Laws
-
 #[test]
 fn a_call_whose_leader_exits_leaves_an_orphan_with_findings_only() {
     let mut w = World::new();
@@ -290,7 +268,6 @@ fn a_call_whose_leader_exits_leaves_an_orphan_with_findings_only() {
     child.cpu_per_s = 1_000_000_000;
     w.call(1, 300, 400, child, None);
     let _ = run_to(&mut w, 4_000, |_, _| {});
-    // The call shell is killed; its build script lives on at ppid 1.
     w.exit(400, false);
     w.p(401).ppid = 1;
     let v = w.tick(TICK_MS);
@@ -317,8 +294,6 @@ fn a_call_whose_leader_exits_unreaped_reads_exited_as_the_call() {
     let mut w = World::new();
     w.call(1, 300, 400, sleeper(401, "sleep"), None);
     let _ = run_to(&mut w, 4_000, |_, _| {});
-    // The child ends; the call's leader exits and its agent has not reaped
-    // it yet: a zombie, which leads no session.
     w.exit(401, false);
     w.exit(400, true);
     let v = w.tick(TICK_MS);
@@ -384,11 +359,8 @@ fn demand_is_fast_for_suspects_slow_for_legit_waits_and_idle_for_the_person() {
         Some(hint(400, Consumer::AgentBg, None, None)),
     );
     w.p(300).cpu_per_s = 0;
-    // The agent is a person-fg job waiting unnamed: a suspect, fast.
     let v = w.tick(TICK_MS);
     assert_eq!(v.demand, Demand::Fast);
-    // With the agent's own job gone from the picture, a background follow
-    // alone is a legitimate wait: slow.
     let mut w = World::new();
     let mut tail = sleeper(1000, "tail");
     tail.fds = follow_fds();
@@ -417,7 +389,6 @@ fn findings_count_stopped_d_state_and_the_process_table() {
         v.findings.d_state.iter().map(|n| n.pid).collect::<Vec<_>>(),
         vec![7001]
     );
-    // aterm, the shell and fsck are ours; the stopped one is root's.
     assert_eq!(v.findings.own_procs, 3);
     assert_eq!(v.findings.process_limit, Some(5333));
     let lines = v.findings.wire_lines();
@@ -433,7 +404,6 @@ fn a_detached_job_reading_its_consumers_pipe_serves() {
     let mut server = sleeper(401, "mcp-server");
     server.fds.push(pipe_end(0, 0xD1, 0xD2, false, 0x8, 0));
     w.call(1, 300, 400, server, None);
-    // The agent holds the write end.
     w.p(300).fds.push(pipe_end(9, 0xD2, 0xD1, true, 0, 0));
     let v = run_to(&mut w, 1_200_000, |_, _| {});
     let row = v.row("a400").expect("the server");
@@ -475,20 +445,17 @@ fn the_shown_wait_name_changes_after_two_agreeing_ticks() {
         v.row("b51").and_then(|r| r.wait.as_ref()).map(|w| w.name),
         Some(WaitName::Tcp)
     );
-    // One tick without the socket: still tcp.
     let fds = std::mem::take(&mut w.p(1000).fds);
     let v = w.tick(TICK_MS);
     assert_eq!(
         v.row("b51").and_then(|r| r.wait.as_ref()).map(|w| w.name),
         Some(WaitName::Tcp)
     );
-    // A second agreeing tick: unnamed.
     let v = w.tick(TICK_MS);
     assert_eq!(
         v.row("b51").and_then(|r| r.wait.as_ref()).map(|w| w.name),
         Some(WaitName::Unnamed)
     );
-    // Back for one tick: unnamed holds; two: tcp.
     w.p(1000).fds = fds;
     let v = w.tick(TICK_MS);
     assert_eq!(
@@ -508,7 +475,6 @@ fn a_reused_pid_is_a_new_job() {
     let mut w = World::new();
     w.call(1, 300, 400, curl(401), None);
     let _ = run_to(&mut w, 600_000, |_, _| {});
-    // The call ends; a new call reuses both pids with new start times.
     w.exit(401, false);
     w.exit(400, false);
     let _ = w.tick(TICK_MS);
@@ -639,15 +605,11 @@ fn verdict_and_class_words_are_closed_and_share_only_exited() {
         assert_eq!(Class::from_word(c.word()), Some(c));
     }
     assert_eq!(Verdict::from_word("done"), Some(Verdict::Exited));
-    // `exited` names both a verdict and a class (the same fact); no other
-    // word does, so a class never stands in for a verdict.
     let shared: Vec<&&str> = verdicts.iter().filter(|w| classes.contains(w)).collect();
     assert_eq!(shared, [&"exited"]);
     assert_eq!(Verdict::from_word("running"), None);
     assert_eq!(Class::from_word("stuck"), None);
 }
-
-// One block, one job (§11.3)
 
 #[test]
 fn every_command_of_a_block_is_one_job_with_one_id() {
@@ -656,11 +618,9 @@ fn every_command_of_a_block_is_one_job_with_one_id() {
     make.cpu_per_s = 900_000_000;
     w.run_fg(1, 51, "make && make test", make);
     let _ = run_to(&mut w, 6_000, |w, _| w.line(1));
-    // `make` exits 0; the shell holds the terminal for a tick…
     w.exit(1000, false);
     w.tab(1).tpgid = 200;
     let between = w.tick(TICK_MS);
-    // …then puts `make test` in front, a group of its own.
     let mut t = Proc::new(1001, 200, "make");
     t.cpu_per_s = 900_000_000;
     t.sid = 200;
@@ -680,8 +640,6 @@ fn every_command_of_a_block_is_one_job_with_one_id() {
     let row = v.row("b51").expect("the block");
     assert_eq!((row.class, row.verdict), (Class::Running, Verdict::Fine));
     assert!(row.wire().contains(" exe=make "), "{}", row.wire());
-    // `D`: the block's one job exits with the block's status; the shell is
-    // never left behind as an orphan.
     w.exit(1001, false);
     w.close_block(1, 2);
     let v = w.tick(TICK_MS);
@@ -716,7 +674,6 @@ fn fg_makes_a_parked_job_the_next_blocks_foreground_job_again() {
     w.close_block(1, 148);
     let v = run_to(&mut w, 10_000, |_, _| {});
     assert_eq!(v.row("b12").map(|r| r.verdict), Some(Verdict::Parked));
-    // `fg`: block 13 opens and puts the stopped group back in front.
     let at = w.at;
     w.tab(1).tab.block = Some(Block {
         id: 13,
@@ -736,7 +693,6 @@ fn fg_makes_a_parked_job_the_next_blocks_foreground_job_again() {
         (JobKind::Shell, Consumer::PersonFg)
     );
     assert_eq!(row.wait.as_ref().map(|w| w.name), Some(WaitName::TtyRaw));
-    // vim exits: `D` for block 13 closes the job it resumed.
     w.exit(1200, false);
     w.close_block(1, 0);
     let v = w.tick(TICK_MS);
@@ -745,8 +701,6 @@ fn fg_makes_a_parked_job_the_next_blocks_foreground_job_again() {
         Some((Verdict::Exited, Some(0)))
     );
 }
-
-// Naming the wait: a connection is the wait only when nothing else is
 
 #[test]
 fn an_idle_dev_server_with_a_keep_alive_client_listens_and_never_reads_stuck() {
@@ -765,7 +719,6 @@ fn an_idle_dev_server_with_a_keep_alive_client_listens_and_never_reads_stuck() {
 
 #[test]
 fn a_connection_is_the_wait_when_the_queue_waits_on_it_alone() {
-    // A kqueue whose only entry is a read on the silent connection: tcp.
     let mut w = World::new();
     let mut p = curl(1000);
     p.fds.push(aterm_vitals::jobs::Fd {
@@ -783,8 +736,6 @@ fn a_connection_is_the_wait_when_the_queue_waits_on_it_alone() {
     let row = v.row("b51").expect("row");
     assert_eq!(row.wait.as_ref().map(|w| w.name), Some(WaitName::Tcp));
     assert_eq!(row.verdict, Verdict::Stuck);
-    // The same connection beside a timer entry: the queue waits for more than
-    // the connection, so the wait is an event loop (capped at quiet).
     let mut w = World::new();
     let mut p = curl(1000);
     p.fds.push(aterm_vitals::jobs::Fd {
@@ -816,7 +767,6 @@ fn a_full_screen_program_waking_often_with_no_key_queued_reads_keys_not_polling(
     let t = scenarios::run(&s, None);
     let bad = scenarios::check(&s, &t);
     assert!(bad.is_empty(), "{}", bad.join("\n"));
-    // The same program in a canonical terminal (no tty name applies) polls.
     let mut w = World::new();
     let mut p = sleeper(1000, "poller");
     p.syscalls_per_s = 1_100;
@@ -825,16 +775,6 @@ fn a_full_screen_program_waking_often_with_no_key_queued_reads_keys_not_polling(
     assert_eq!(v.row("b51").map(|r| r.class), Some(Class::Polling));
 }
 
-/// A FULL-SCREEN PROGRAM AT ITS PROMPT THAT WRITES FILES (agy 1.4.0 at rest
-/// appends to its own log every 5 s while its telemetry is refused): it
-/// makes progress the terminal does not show, so it reads `running`, but it
-/// holds the foreground at the person's raw-terminal read with no key
-/// queued, so job demand parks (`Idle`: nothing more until its next
-/// terminal output, the design's "a session parked at a raw-mode prompt: 0
-/// job samples until its next PTY output"). NEGATIVE CONTROLS: the same
-/// writer in a canonical terminal, or one that drew past its mode word, is
-/// watched fast; so is a program at the raw read spinning a core with no
-/// progress.
 #[test]
 fn a_program_at_the_persons_raw_read_parks_demand_even_while_it_writes_files() {
     let writer = || {
@@ -885,15 +825,6 @@ fn a_program_at_the_persons_raw_read_parks_demand_even_while_it_writes_files() {
     );
 }
 
-/// THE PARKED TABS (`JobsView::parked_tabs`, design §6.1): a tab is parked
-/// exactly while every live job of it holds the foreground at the person's
-/// own raw read and adds no demand, whatever its class: an idle full-screen
-/// program at its prompt, or one at the prompt that writes its own files.
-/// NEGATIVE CONTROLS, each leaving its tab unparked: the same program in a
-/// canonical terminal (no read is named), one that drew past its mode word,
-/// one spinning a core at the raw read (still watched fast), the raw program
-/// beside a background job of the same tab, and an exited job alone (no live
-/// job: nothing to park). Another tab's park never parks this one.
 #[test]
 fn a_tab_is_parked_only_while_every_live_job_waits_at_the_persons_read() {
     let parked = |w: &mut World| run_to(w, 20_000, |_, _| {}).parked_tabs;
@@ -961,10 +892,6 @@ fn a_tab_is_parked_only_while_every_live_job_waits_at_the_persons_read() {
     );
 }
 
-/// A full-screen program at its prompt whose fds 1 and 2 are its own log
-/// (agy 1.4.5 in the real-Claude lab, 2026-10-21: the terminal raw, a log
-/// line every 5 s while its telemetry post is refused), playing tab `key`'s
-/// block 51 in `w`, the log growing a line a tick.
 fn logging_tui(w: &mut World, canonical: bool) {
     let log = (1, 77_051);
     w.files.insert(
@@ -981,14 +908,6 @@ fn logging_tui(w: &mut World, canonical: bool) {
     w.tty_mode(1, canonical, canonical);
 }
 
-/// THE SAME PERSON'S READ BY THE OUTPUT-FILE CHANNEL (agy as `lsof` read it
-/// in the real-Claude lab, 2026-10-21: fds 1 and 2 on its own log, a line
-/// every 5 s): the log is the job's progress, so it reads `running`, and the
-/// person's raw read still parks job demand. NEGATIVE CONTROLS: the same log
-/// under a canonical word (a plain command with its output sent to a file)
-/// is watched fast, and so is the raw program once it printed after its
-/// word: one redraw at 2 s voids the word, and from then on only the log
-/// grows, so nothing but the stale word could park it.
 #[test]
 fn a_full_screen_program_logging_to_its_own_file_parks_demand() {
     let mut w = World::new();
@@ -1018,8 +937,6 @@ fn a_full_screen_program_logging_to_its_own_file_parks_demand() {
         "drawn past the word: it names nothing"
     );
 }
-
-// The foreign-text rule (§13.3)
 
 #[test]
 fn a_process_name_prints_only_as_a_safe_word() {
@@ -1068,7 +985,6 @@ fn foreign_names_never_reach_the_row_or_the_sentence_raw() {
     for line in v.findings.wire_lines() {
         assert!(printable(&line), "{line:?}");
     }
-    // An agent's task id is a join key validated the same way.
     let mut w = World::new();
     w.call(
         1,
@@ -1088,7 +1004,6 @@ fn foreign_names_never_reach_the_row_or_the_sentence_raw() {
 #[test]
 fn the_row_names_the_executable_not_its_cut_short_name() {
     let mut w = World::new();
-    // `p_comm` keeps 16 bytes; the executable's own name is longer.
     let mut p = sleeper(1000, "very-long-tool-n");
     p.exe = Some("very-long-tool-name".to_owned());
     w.run_fg(1, 51, "very-long-tool-name", p);

@@ -3,6 +3,17 @@
 // Author: Andrew Yates
 
 //! Unicode Bidirectional Algorithm (UAX #9) line reordering for the terminal.
+//!
+//! ## Example
+//!
+//! ```
+//! use aterm_bidi::{reorder_visual_to_logical, BaseDirection};
+//! // "abc" is pure LTR → identity order.
+//! assert_eq!(reorder_visual_to_logical(&['a', 'b', 'c'], BaseDirection::Auto), vec![0, 1, 2]);
+//! // A pure-RTL line (Hebrew aleph-bet-gimel) displays reversed.
+//! let hebrew = ['\u{05D0}', '\u{05D1}', '\u{05D2}'];
+//! assert_eq!(reorder_visual_to_logical(&hebrew, BaseDirection::Auto), vec![2, 1, 0]);
+//! ```
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -1029,6 +1040,7 @@ fn resolve_paragraph(
     let run_of_char = std::mem::take(&mut r.run_of_char);
     let mut seq = std::mem::take(&mut r.seq);
     for &(start, _) in &runs {
+        // A run that begins with a PDI matching an initiator continues that
         // initiator's sequence; it never starts one.
         if classes.get(start) == Some(&PDI) && matching.get(start).is_some_and(|&m| m < n) {
             continue;

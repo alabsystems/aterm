@@ -1,59 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE JOURNAL (design §5.3, §5.4; phase 2B): the lines a host's journal
-//! writer appends to its segments, their names, and the READER'S VIEW of
-//! them, every rule of which is a pure function here, so its model
-//! (`aterm_models_session::session_log_journal_model`) binds to exactly the
-//! code a `log @<sid>` runs. The host owns the files, the locks and the
-//! threads; this crate reads no file and keeps no clock.
-//!
-//! ```text
-//! s1→*→#seg→v=1→inst=<inst>→n=<n>→t=<ms>→build=<ver>→end=↵
-//! s1→<sid>→#snap→head=<seq>→ep=<e>→base=<b>→first=<f>→open=<k>→t=<ms>→end=↵
-//! s1→<sid>→<open record>→re=1→end=↵                       (k of them, outermost first)
-//! s1→<sid>→<record>→end=↵
-//! s1→<sid>→#gap→why=evicted|handoff|reset|dropped→lost=<n>→after=<seq>→through=<seq>→end=↵
-//! s1→<sid>→#hole→lo=<seq>→hi=<seq>→why=<w>→end=↵
-//! s1→<sid>→#handed→fence=<seq>→end=↵
-//! s1→*→#fin→why=quit|handoff→t=<ms>→end=↵                 (a chain's last line)
-//! ```
-//!
-//! (`→` is TAB, `↵` LF.) A record is [`crate::encode`] at [`Tier::Host`]: the
-//! content tier (the OSC title) never reaches a journal. Only ASCII appears.
-//! A reader takes complete lines only ([`complete_lines`]: a partial last
-//! line is dropped), refuses a line that is not `s1 … end=` with every field
-//! after the body a `key=value` ([`decode_line`]: a tear glued onto the next
-//! line fails), skips unknown keys and kinds, and treats a segment whose
-//! `#seg` names a version it does not know as opaque.
-//!
-//! THE VIEW ([`view_of`]). Lines are grouped by the session's seq space,
-//! `(sid, base)` (a keeper's crash adoption starts a new one under the same
-//! sid), and the newest space answers. Within it:
-//! - each `(sid, base, seq)` is shown at most once (a line journaled twice,
-//!   by an update's overlap or a stopped writer's successor, is one record),
-//!   and gap frames are deduplicated by their range;
-//! - every seq the journal accounts for and holds no record of is a loss a
-//!   read says, and every range nobody holds says why: an update's overlap
-//!   (`why=handoff`), segments pruned (`why=pruned`) or left unread by the
-//!   read's budget (`why=unread`);
-//! - a node the journal opened, never closed, and a later snap of the space
-//!   does not list as open, closed while the writer was behind: it is shown
-//!   closed `out=unknown` at that snap's time;
-//! - CRASH CLOSES ARE DERIVED AT READ TIME, never written: when the chain
-//!   that last wrote the space ends with no `#fin` and no `#handed` for the
-//!   sid, and its instance is not live (the host's lock probe), the view adds
-//!   `gap why=crash after=<the journal's head>` and closes everything still
-//!   open `out=gone by=aterm`, innermost first. A misjudged liveness changes
-//!   one reply, never the disk;
-//! - the records a reply derives (the crash gap and closes, `out=unknown`
-//!   closes, a `gap why=unread`) are numbered past the journal's head in the
-//!   journal's own epoch, and DERIVED AGAIN BY EVERY READ: a reply hands out
-//!   the journal's own cursor, its epoch and head ([`View::reply_cursor`]),
-//!   never one into what it derived, and [`View::cursor`] places a reader's
-//!   cursor only within the journal's own numbering, resetting (said) every
-//!   other, so following one reply into the next never skips a record the
-//!   journal holds and no cursor of another epoch is read as this one's.
+//! Session log journal segment encoding and reader view.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -74,35 +22,28 @@ pub const SEGMENT_BYTES: u64 = 8 << 20;
 pub const SEGMENT_READ_MAX: u64 = 16 << 20;
 /// The journal directory's budget: its own segments, oldest deleted first.
 pub const BUDGET_BYTES: u64 = 64 << 20;
-/// The journal directory's count budget: its own segments and lock files,
-/// oldest segments deleted first past it. Well under [`LIST_MAX`], so one
-/// listing sees all of a journal however small its segments are.
+/// The journal directory's count budget.
 pub const FILES_MAX: usize = 2048;
-/// The most names one retention pass visits (it holds only the journal's
-/// own among them): a directory past it is pruned by what was visited.
+/// The most names one retention pass visits (it holds only the journal's own among them).
 pub const RETENTION_SCAN_MAX: usize = 1 << 16;
 /// The longest line a reader decodes.
 pub const LINE_MAX: usize = 2048;
-/// The most bytes one journal read decodes past its newest
-/// [`READ_MIN_SEGMENTS`] segments that hold the session.
+/// The most bytes one journal read decodes past its newest [`READ_MIN_SEGMENTS`] segments that hold
+/// the session.
 pub const READ_BUDGET: u64 = 16 << 20;
-/// The segments holding the session that one read decodes whatever their
-/// size (each at most [`SEGMENT_READ_MAX`]): a budget measured in whole
-/// segments, so a session's newest lines are always reached.
+/// The segments holding the session that one read decodes whatever their size (each at most
+/// [`SEGMENT_READ_MAX`]): a budget measured in whole segments, so a session's newest lines are
+/// always reached.
 pub const READ_MIN_SEGMENTS: usize = 2;
-/// The most bytes one read's index refresh reads (no decoding: which
-/// sessions each segment names, whether it ends its chain). Twice the
-/// directory's budget, so a journal within its budgets is indexed whole and
-/// whether it holds a session is known, never guessed from a budget.
+/// The most bytes one read's index refresh reads (no decoding: which sessions each segment names,
+/// whether it ends its chain).
 pub const INDEX_BUDGET: u64 = 2 * BUDGET_BYTES;
 /// The most names one listing of the directory takes.
 pub const LIST_MAX: usize = 4096;
 /// The retention pass's lock file (`flock LOCK_EX|LOCK_NB`; busy: skip).
 pub const PRUNE_LOCK: &str = "prune.lock";
 
-/// A process instance's name (`control_auth::process_instance_id`):
-/// `p<pid>-<nonce>`, the pid 1 to 10 digits, the nonce 1 to 40 lower hex
-/// digits (or a decimal nanosecond count, which is hex digits too).
+/// A process instance's name (`control_auth::process_instance_id`).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Inst(String);
 
@@ -139,9 +80,7 @@ pub fn segment_name(inst: &Inst, n: u32) -> String {
     format!("{inst}.{n}.slog")
 }
 
-/// The instance and number a segment's name gives, or `None` for any other
-/// name: exactly [`segment_name`]'s spelling (no leading zero, no 0, no
-/// suffix after `.slog`, an instance [`Inst::new`] reads).
+/// The instance and number a segment's name gives, or `None` for any other name.
 #[must_use]
 pub fn parse_segment_name(name: &str) -> Option<(Inst, u32)> {
     let (inst, n) = name.strip_suffix(".slog")?.rsplit_once('.')?;
@@ -151,8 +90,7 @@ pub fn parse_segment_name(name: &str) -> Option<(Inst, u32)> {
     Some((Inst::new(inst)?, n.parse().ok()?))
 }
 
-/// `<inst>.lock`: the instance's liveness lock, `flock`ed `LOCK_EX` for its
-/// journal's whole life.
+/// `<inst>.lock`: the instance's liveness lock, `flock`ed `LOCK_EX` for its journal's whole life.
 #[must_use]
 pub fn lock_name(inst: &Inst) -> String {
     format!("{inst}.lock")
@@ -164,8 +102,8 @@ pub fn parse_lock_name(name: &str) -> Option<Inst> {
     Inst::new(name.strip_suffix(".lock")?)
 }
 
-/// `.<inst>.lock.pending`: where the lock is created and locked before it is
-/// renamed into place, so no reader ever sees an unlocked live lock.
+/// `.<inst>.lock.pending`: where the lock is created and locked before it is renamed into place, so
+/// no reader ever sees an unlocked live lock.
 #[must_use]
 pub fn pending_lock_name(inst: &Inst) -> String {
     format!(".{inst}.lock.pending")
@@ -180,8 +118,7 @@ pub enum LossWhy {
     Handoff,
     /// The writer's cursor did not place (never expected).
     Reset,
-    /// The writer let a closed session's timeline go unwritten (its
-    /// backstop).
+    /// The writer let a closed session's timeline go unwritten (its backstop).
     Dropped,
 }
 
@@ -243,9 +180,9 @@ pub enum Frame {
         /// The writer's build.
         build: String,
     },
-    /// A session's restatement: the seq space it writes in, the writer's
-    /// cursor (`head`: everything at or below it is already accounted for),
-    /// and the count of open records that follow (`re=1`).
+    /// A session's restatement: the seq space it writes in, the writer's cursor (`head`: everything
+    /// at or below it is already accounted for), and the count of open records that follow
+    /// (`re=1`).
     Snap {
         /// The session.
         sid: ShortId,
@@ -295,8 +232,7 @@ pub enum Frame {
         /// Why.
         why: GapWhy,
     },
-    /// The outgoing process journaled the session to its carry's fence: a
-    /// successor continues the space above it.
+    /// The outgoing process journaled the session to its carry's fence.
     Handed {
         /// The session.
         sid: ShortId,
@@ -333,7 +269,6 @@ pub enum LineError {
     Record(DecodeError),
 }
 
-/// A token for `build=`: `[A-Za-z0-9.+_-]`, at most 64 bytes.
 fn build_token(build: &str) -> String {
     build
         .chars()
@@ -342,8 +277,7 @@ fn build_token(build: &str) -> String {
         .collect()
 }
 
-/// `frame` as one line, without its LF; `None` for a record over the byte
-/// bound (the ring refuses those) or [`Frame::Unknown`].
+/// `frame` as one line, without its LF.
 #[must_use]
 pub fn encode_frame(frame: &Frame) -> Option<String> {
     let mut s = String::with_capacity(128);
@@ -417,8 +351,7 @@ pub fn encode_frame(frame: &Frame) -> Option<String> {
     Some(s)
 }
 
-/// The complete lines of `bytes` (each without its LF), in order: a last
-/// line with no LF (a writer still appending it, or a torn tail) is not one.
+/// The complete lines of `bytes` (each without its LF), in order.
 pub fn complete_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     let end = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     bytes[..end]
@@ -427,12 +360,9 @@ pub fn complete_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// One complete line (without its LF) back to its frame.
-///
 /// # Errors
-///
-/// A [`LineError`] for a line too long, not ASCII, not `s1 … end=`, with a
-/// field after the body that is no `key=value`, a frame missing a field, or
-/// a record that does not decode.
+/// A [`LineError`] for a line too long, not ASCII, not `s1 … end=`, with a field after the body
+/// that is no `key=value`, a frame missing a field, or a record that does not decode.
 pub fn decode_line(line: &[u8]) -> Result<Frame, LineError> {
     if line.len() > LINE_MAX {
         return Err(LineError::TooLong);
@@ -532,9 +462,7 @@ pub fn decode_line(line: &[u8]) -> Result<Frame, LineError> {
     })
 }
 
-/// The session a line names, without decoding it: its second field (`*` for
-/// the instance's own lines), or `None` for a line that is not `s1→…`. What
-/// a reader's index reads of every line.
+/// The session a line names, without decoding it.
 #[must_use]
 pub fn line_subject(line: &[u8]) -> Option<&[u8]> {
     let rest = line.strip_prefix(b"s1\t")?;
@@ -548,11 +476,7 @@ pub fn is_end_line(line: &[u8]) -> bool {
     matches!(decode_line(line), Ok(Frame::End { .. }))
 }
 
-// ---- the writer's take ----------------------------------------------
-
-/// What a journal writer copies out of a log under its lock for one pass
-/// ([`take`]): everything [`take_frames`] turns into lines, so the lock is
-/// held only for the read and the copies.
+/// What a journal writer copies out of a log under its lock for one pass ([`take`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Take {
     /// The log's epoch, base epoch and first accounted seq: its seq space.
@@ -571,22 +495,18 @@ pub struct Take {
     pub recs: Vec<Rec>,
     /// The overlaps the read crossed.
     pub holes: Vec<(u64, u64, GapWhy)>,
-    /// The open path (the session's open, then each open node's), when the
-    /// writer asked for a snap or the read lost records.
+    /// The open path (the session's open, then each open node's), when the writer asked for a snap
+    /// or the read lost records.
     pub opens: Option<Vec<Rec>>,
     /// The readers' fence, while an update's carry stands.
     pub fence: Option<u64>,
-    /// The session is closed and the read reached the log's last record (its
-    /// close among them): never while a fence hides records past the read.
+    /// The session is closed and the read reached the log's last record (its close among them).
     pub done: bool,
     /// More records wait past `max`.
     pub more: bool,
 }
 
-/// The writer's take of `log` from `cursor`: at most `max` records, the gap
-/// and overlaps crossed, and the open path when `snap` asks for it or the
-/// read lost records (after any loss a fresh snap restates the
-/// open path, so a reader can tell a close that went unjournaled).
+/// The writer's take of `log` from `cursor`.
 #[must_use]
 pub fn take(log: &Log, cursor: u64, max: usize, snap: bool) -> Take {
     let read = log.read(crate::Cursor::new(log.ep(), cursor), max);
@@ -610,18 +530,11 @@ pub fn take(log: &Log, cursor: u64, max: usize, snap: bool) -> Take {
         holes,
         opens: (snap || lost).then(|| log.open_path_records()),
         fence: log.read_fence(),
-        // Against the log's own head, never the readers' fence: a session
-        // that closes during an update's overlap is fenced past its close, and
-        // its track must outlive a rollback to write it.
         done: !log.is_open(Node::SESSION) && next >= log.last_seq(),
         more,
     }
 }
 
-/// A snap of `take`'s space at `head`: the `#snap` frame, then the open
-/// path restated AS OF THE HEAD: the nodes open at the take that opened at or
-/// below `head` (a node opened past it is not yet journaled, and a snap that
-/// named it would claim a seq the writer never accounted for).
 fn snap_frames(sid: ShortId, take: &Take, head: u64, t: u64, out: &mut Vec<Frame>) {
     let opens: Vec<&Rec> = take
         .opens
@@ -648,10 +561,7 @@ fn snap_frames(sid: ShortId, take: &Take, head: u64, t: u64, out: &mut Vec<Frame
     }
 }
 
-/// The lines of one take for session `sid`, at wall time `t`: a snap first
-/// when `snap` (a new segment, or a new seq space), then the gap frame and
-/// the overlaps, then the records, then, after a loss, a fresh snap. Every
-/// snap restates the open path as of its own head ([`snap_frames`]).
+/// The lines of one take for session `sid`, at wall time `t`.
 #[must_use]
 pub fn take_frames(sid: ShortId, take: &Take, snap: bool, t: u64) -> Vec<Frame> {
     let mut out = Vec::with_capacity(take.recs.len() + 4);
@@ -691,11 +601,7 @@ pub fn take_frames(sid: ShortId, take: &Take, snap: bool, t: u64) -> Vec<Frame> 
     out
 }
 
-/// The lines that say a session the writer let go unwritten (its backstop):
-/// a snap first when `snap` (none of the session's in this segment yet, so
-/// the reader places the frame in its space), then `#gap why=dropped` over
-/// `(take.cursor, through]`, `lost` of them. `take` is a probe of the log
-/// (`take(log, cursor, 0, true)`) made when the writer let it go.
+/// The lines that say a session the writer let go unwritten (its backstop).
 #[must_use]
 pub fn dropped_frames(
     sid: ShortId,
@@ -721,10 +627,8 @@ pub fn dropped_frames(
     out
 }
 
-/// The format version a segment's first complete line names, read from its
-/// raw `v=` field without decoding the rest: `None` when that line is no
-/// `s1→*→#seg` or names no version. A segment whose first line does not name
-/// [`FORMAT`] is opaque to this build, however much of it decodes.
+/// The format version a segment's first complete line names, read from its raw `v=` field without
+/// decoding the rest: `None` when that line is no `s1→*→#seg` or names no version.
 #[must_use]
 pub fn segment_version(first_line: &[u8]) -> Option<u32> {
     let rest = first_line.strip_prefix(b"s1\t*\t#seg\t")?;
@@ -733,8 +637,6 @@ pub fn segment_version(first_line: &[u8]) -> Option<u32> {
         .and_then(|v| std::str::from_utf8(v).ok())
         .and_then(|v| v.parse().ok())
 }
-
-// ---- the view -------------------------------------------------------
 
 /// Whether a chain's instance lives, as the host's lock probe says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -763,20 +665,15 @@ pub struct ChainRead {
     pub inst: Inst,
     /// The segments that hold the session's lines, in any order.
     pub segments: Vec<SegmentRead>,
-    /// Whether the chain's newest segment (of all of it) holds its end
-    /// (`#fin`).
+    /// Whether the chain's newest segment (of all of it) holds its end (`#fin`).
     pub ended: bool,
     /// Whether the writer lives.
     pub live: Liveness,
-    /// When the chain began (its first segment's `#seg t=`, else the
-    /// earliest the read saw): chains are ordered by it.
+    /// When the chain began (its first segment's `#seg t=`, else the earliest the read saw).
     pub start_t: u64,
 }
 
-/// The view's rules: [`ViewRules::READER`] is the reader's. Each switch
-/// exists for the conformance test's negative controls, which turn one off
-/// and watch the model refuse the view (the way `encode_with_table` is the
-/// tier test's).
+/// The view's rules: [`ViewRules::READER`] is the reader's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewRules {
     /// Each `(sid, base, seq)` once.
@@ -785,19 +682,11 @@ pub struct ViewRules {
     pub crash_closes: bool,
     /// Every seq accounted for and not held said as a loss.
     pub say_losses: bool,
-    /// A restatement counts only right after its snap and at or below the
-    /// snap's head, and never toward the journal's head (off: the reader
-    /// before phase 2B's fixes, which took a restated open past the head for
-    /// an accounted seq).
+    /// A restatement counts only right after its snap and at or below the snap's head.
     pub restated_heads: bool,
-    /// A later snap of the session voids its `#handed` (an update that stood
-    /// down; off: a `#handed` voided only by a record or a gap frame).
+    /// A later snap of the session voids its `#handed`.
     pub snap_voids_handed: bool,
-    /// Two chains that no `#handed` links and that hold different records
-    /// at one `(base, seq)` are two seq spaces, ordered by when each chain
-    /// began (off: the reader before it, which
-    /// keyed a space by its base alone and let a relaunch's records hide
-    /// behind a dead process's at the same seqs).
+    /// Unlinked chains holding different records at one `(base, seq)` form separate seq spaces.
     pub split_unlinked: bool,
 }
 
@@ -818,12 +707,10 @@ impl ViewRules {
 pub struct View {
     /// The rebuilt log, synthetic closes included.
     pub log: Log,
-    /// The journal's own epoch for the space, the rebuilt log's: the records
-    /// the reply derives are numbered in it, past the head.
+    /// The journal's own epoch for the space, the rebuilt log's.
     pub ep: u32,
-    /// The journal's own head for the space, before any record the reply
-    /// derives (those are numbered past it): a cursor of the dead process
-    /// past it names records nobody journaled.
+    /// The journal's own head for the space, before any record the reply derives (those are
+    /// numbered past it): a cursor of the dead process past it names records nobody journaled.
     pub head: u64,
     /// Whether the view added crash closes.
     pub crashed: bool,
@@ -843,22 +730,17 @@ struct SnapSeen {
 struct Space {
     ep: u32,
     first: u64,
-    /// seq → (record, restated): one per seq.
     recs: BTreeMap<u64, (Rec, bool)>,
-    /// Every line journaled again (the dedupe's work), for the switch.
     dups: Vec<Rec>,
     gaps: BTreeSet<(u64, u64, LossWhy)>,
     holes: BTreeSet<(u64, u64, GapWhy)>,
     snaps: Vec<SnapSeen>,
-    /// The chains that wrote it: (start_t, inst, chain index).
     chains: BTreeSet<(u64, Inst, usize)>,
     last_t: u64,
 }
 
-/// One maximal run of seqs `[lo, hi]`.
 type Run = (u64, u64);
 
-/// The runs of `[lo, hi]` no run of `covered` (sorted, may overlap) meets.
 fn uncovered(lo: u64, hi: u64, covered: &[Run]) -> Vec<Run> {
     let mut out = Vec::new();
     let mut at = lo;
@@ -883,28 +765,12 @@ fn uncovered(lo: u64, hi: u64, covered: &[Run]) -> Vec<Run> {
     out
 }
 
-/// What one chain wrote of session `sid` in one base: each seq's first
-/// admitted record (an ordinary one ahead of a restatement), and whether its
-/// last word on the session was
-/// `#handed` (as [`view_of`] reads it: a later record, gap or snap voids
-/// it).
 #[derive(Default)]
 struct ChainSpace<'a> {
     recs: BTreeMap<u64, (&'a Rec, bool)>,
     handed: bool,
 }
 
-/// THE SEQ SPACES THE CHAINS WROTE:
-/// for each `(chain, base)`, the number of its space among that base's,
-/// counted in the order the chains began (`start_t`, then instance). A
-/// chain continues the base's newest space when the newest chain of it
-/// handed the session on (`#handed`: a seamless update's successor), or
-/// when every seq both hold is the same record (an overlap journaled
-/// twice, a carry's restatement); otherwise it holds another process's
-/// records at the same seqs (a relaunch under the same sid by a producer
-/// that reused the epoch) and starts a space of its own, newer, so its
-/// records are never hidden behind the dead one's. Every chain is space 0
-/// with the rule off.
 fn space_numbers(
     sid: &ShortId,
     chains: &[ChainRead],
@@ -939,7 +805,6 @@ fn space_numbers(
                     } if s == sid => {
                         if let Some(b) = space {
                             // Only a row the view admits may distinguish spaces.
-                            // An ignored restatement is no conflicting evidence.
                             if *restated
                                 && (!snap_open || (rules.restated_heads && rec.seq > snap_head))
                             {
@@ -992,8 +857,6 @@ fn space_numbers(
     let mut out = BTreeMap::new();
     for (base, mut order) in bases {
         order.sort();
-        // The newest space's records so far, and whether its newest chain
-        // handed the session on.
         let mut held: BTreeMap<u64, &Rec> = BTreeMap::new();
         let mut handed = false;
         let mut n = 0u32;
@@ -1017,10 +880,7 @@ fn space_numbers(
     out
 }
 
-/// The view of session `sid` over the chains a read gathered (module
-/// docs); `unread`: the read stopped at its budget, so a range nobody
-/// accounts for may still be on disk. `None` when no chain holds a line of
-/// the session.
+/// The view of session `sid` over the chains a read gathered (module docs).
 #[must_use]
 pub fn view_of(
     sid: &ShortId,
@@ -1030,9 +890,7 @@ pub fn view_of(
 ) -> Option<View> {
     let numbers = space_numbers(sid, chains, rules);
     let number = |ci: usize, base: u32| numbers.get(&(ci, base)).copied().unwrap_or(0);
-    // Keyed by base, then by its space's number among that base's.
     let mut spaces: BTreeMap<(u32, u32), Space> = BTreeMap::new();
-    // Per chain: whether the session's last line in it is `#handed`.
     let mut handed: BTreeMap<usize, bool> = BTreeMap::new();
     for (ci, chain) in chains.iter().enumerate() {
         let mut segs: Vec<&SegmentRead> = chain.segments.iter().collect();
@@ -1040,7 +898,6 @@ pub fn view_of(
         for seg in segs {
             let mut space: Option<(u32, u32)> = None;
             let mut snap_open = false;
-            // The head of the snap whose restatement is being read.
             let mut snap_head = 0u64;
             for f in &seg.frames {
                 match f {
@@ -1083,9 +940,6 @@ pub fn view_of(
                         };
                         if *restated {
                             // A restatement is its snap's alone, as of the
-                            // snap's head: one elsewhere, or of a seq past the
-                            // head, accounts for nothing (and leaves the snap
-                            // short of its count, so it closes nothing).
                             if !snap_open || (rules.restated_heads && rec.seq > snap_head) {
                                 continue;
                             }
@@ -1109,7 +963,6 @@ pub fn view_of(
                                 sp.recs.insert(rec.seq, (rec.clone(), *restated));
                             }
                         }
-                        // A restatement belongs to its snap, which voided any `#handed`.
                         if !*restated {
                             handed.insert(ci, false);
                         }
@@ -1166,15 +1019,11 @@ fn build(
     unread: bool,
     rules: ViewRules,
 ) -> Option<View> {
-    // The newest chain that wrote the space decides how it ended.
     let last_chain = sp.chains.iter().next_back().map(|(.., ci)| *ci)?;
     let chain = chains.get(last_chain)?;
     let dead = !chain.ended
         && chain.live == Liveness::Dead
         && !handed.get(&last_chain).copied().unwrap_or(false);
-    // The newest seq the journal accounts for: its records', its gap and
-    // hole frames' and its snaps' heads, never a restatement's (a restated
-    // open is accounted where it was first written).
     let head = sp
         .recs
         .iter()
@@ -1185,15 +1034,10 @@ fn build(
         .chain(sp.snaps.iter().map(|s| s.head))
         .max()
         .unwrap_or(0);
-    // Validate decoded seqs before range arithmetic. A first past the head
-    // can describe a writer behind its log, but no log counts past this bound.
     if head > crate::log::SEQ_LIMIT || sp.first > crate::log::SEQ_LIMIT + 1 {
         return None;
     }
     let first = sp.first.max(1);
-    // What the journal accounts for: its own records, its gap frames' ranges
-    // and the overlaps; a snap's restatement covers nothing (its seqs were
-    // accounted where they were first written).
     let mut covered: Vec<Run> = sp
         .recs
         .iter()
@@ -1203,9 +1047,6 @@ fn build(
         .chain(sp.holes.iter().map(|&(lo, hi, _)| (lo, hi)))
         .collect();
     covered.sort_unstable();
-    // A range nobody accounts for, ending where a successor's handoff gap
-    // begins, is the outgoing process's shortfall: a loss, said across the
-    // overlap. Any other was pruned (or is unread past the budget).
     let handoff_after: BTreeSet<u64> = sp
         .gaps
         .iter()
@@ -1230,8 +1071,6 @@ fn build(
             } else {
                 GapWhy::Pruned
             };
-            // Carved around the restated opens it holds: a range never held
-            // holds no record.
             let mut lo = a;
             for s in restated.range(a..=b) {
                 if *s > lo {
@@ -1244,7 +1083,6 @@ fn build(
             }
         }
     }
-    // Disjoint: overlapping overlaps from two writers merge.
     let mut merged: Vec<(u64, u64, GapWhy)> = Vec::new();
     for h in holes {
         match merged.last_mut() {
@@ -1260,8 +1098,6 @@ fn build(
         .collect();
     let mut img_head = head;
     if !rules.say_losses {
-        // NEGATIVE CONTROL: a reader blind to seqs, numbering what it holds
-        // densely, says no loss.
         for (i, r) in recs.iter_mut().enumerate() {
             r.seq = first + i as u64;
         }
@@ -1269,7 +1105,6 @@ fn build(
         img_head = (first + recs.len() as u64).saturating_sub(1);
     }
     if !rules.dedupe {
-        // NEGATIVE CONTROL: every line it read, each a record of its own.
         for r in &sp.dups {
             img_head += 1;
             let mut r = r.clone();
@@ -1290,15 +1125,7 @@ fn build(
     let journal_head = log.last_seq();
     let victims = unknown_victims(&log, &sp, &img);
     let crash = rules.crash_closes && dead && log.is_open(Node::SESSION);
-    // A read that did not reach all of the journal says so: by its holes
-    // when what it missed lies within what it accounts for, else by a
-    // `gap why=unread` record of its own past the head (what it missed may
-    // be newer: a cut listing, a segment past the reader's limit).
     let said_unread = unread && !img.holes.iter().any(|h| h.2 == GapWhy::Unread);
-    // The records the reply derives are numbered past the head in the
-    // journal's own epoch: no cursor a reply hands out names one
-    // ([`View::reply_cursor`]), so each read derives them again. Both gaps
-    // say `after=` the seq the journal accounted for last (its head).
     if said_unread {
         log.gap_after(GapWhy::Unread, head, Stamp::new(sp.last_t, 0));
     }
@@ -1322,34 +1149,13 @@ fn build(
 }
 
 impl View {
-    /// THE CURSOR A REPLY OVER THIS VIEW HANDS OUT (its `as_of=` and `ep=`):
-    /// the journal's own epoch and head, never one into the records the
-    /// reply derives past the head. Those are derived again by the next
-    /// read: a later read over more of the journal (it grew, or a read cut
-    /// by its budget is followed by a whole one) may hold journaled records
-    /// at the same seqs, and a cursor that named the derived ones would read
-    /// on past them. No reply's cursor names an epoch the journal never
-    /// numbered, so [`View::cursor`] needs no epoch of its own to tell one.
+    /// THE CURSOR A REPLY OVER THIS VIEW HANDS OUT (its `as_of=` and `ep=`).
     #[must_use]
     pub const fn reply_cursor(&self) -> crate::Cursor {
         crate::Cursor::new(self.ep, self.head)
     }
 
-    /// Where a reader's cursor `c` reads on in this view: one of the
-    /// journal's own numbering (an epoch of the space, its base to its
-    /// epoch) at or below the head reads on, the replies' own among them
-    /// ([`View::reply_cursor`]); every other is reset, and the read says so
-    /// (`why=reset`):
-    /// - past the head: the dead process's records nobody journaled, which
-    ///   the records this reply derives are numbered over;
-    /// - an epoch after the journal's: a carried successor's (the journal
-    ///   lags it), a later crash recovery's or adoption's (Unix seconds: a
-    ///   space the journal does not hold), or a reply's from a reader that
-    ///   numbered what it derived in an epoch past the journal's. A
-    ///   successor's `+1` and a recovery's seconds share one range of
-    ///   numbers, so no epoch above the journal's is read as naming a place
-    ///   in it;
-    /// - before the space's base: another, earlier space's.
+    /// Where a reader's cursor `c` reads on in this view.
     #[must_use]
     pub fn cursor(&self, c: crate::Cursor) -> crate::Cursor {
         let own = (self.log.base_ep()..=self.ep).contains(&c.ep);
@@ -1361,9 +1167,6 @@ impl View {
     }
 }
 
-/// Every node the journal opened and never closed that a later complete
-/// snap does not list as open (its close went unjournaled while the writer
-/// was behind): (its open's seq, the node, that snap's time).
 fn unknown_victims(log: &Log, sp: &Space, img: &JournalImage) -> Vec<(u64, Node, u64)> {
     let opened: BTreeMap<Node, u64> = img
         .recs
@@ -1387,10 +1190,7 @@ fn unknown_victims(log: &Log, sp: &Space, img: &JournalImage) -> Vec<(u64, Node,
     victims
 }
 
-/// Close `out=unknown`, at its snap's time, each of `victims`
-/// ([`unknown_victims`]). Innermost first.
 fn close_unknown(log: &mut Log, mut victims: Vec<(u64, Node, u64)>) -> usize {
-    // Innermost (latest opened) first.
     victims.sort_by_key(|v| std::cmp::Reverse(v.0));
     let mut n = 0;
     for (_, node, t) in victims {

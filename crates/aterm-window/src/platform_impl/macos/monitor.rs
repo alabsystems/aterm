@@ -86,6 +86,12 @@ pub fn available_monitors() -> VecDeque<MonitorHandle> {
     if let Ok(displays) = CGDisplay::active_displays() {
         let mut monitors = VecDeque::with_capacity(displays.len());
         for display in displays {
+            // LOCAL PATCH (aterm): upstream unwraps here ("just fetched from
+            // `CGGetActiveDisplayList`, should be fine"). A display can leave
+            // between that list and `CGDisplayCreateUUIDFromDisplayID` —
+            // unplug, sleep/wake, an arrangement change — and under aterm's
+            // trampoline policy the panic is a process abort from inside
+            // whatever AppKit callback asked for the monitor list. Skip the
             // vanished display and say so.
             if let Some(monitor) = MonitorHandle::new(display) {
                 monitors.push_back(monitor);
@@ -196,6 +202,7 @@ impl MonitorHandle {
                             return Obj::retain(screen);
                         }
                     } else {
+                        // Display ID was just fetched from live NSScreen, but can still result in
                         // `None` with certain Thunderbolt docked monitors.
                         warn!(other_native_id, "comparing against screen with invalid display ID");
                     }

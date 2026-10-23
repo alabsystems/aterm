@@ -4,18 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/state.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
-//
-// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7 with winit-core
-// WC.8): the globals are bound through first-party `aterm-wayland`'s registry, at the versions
-// smithay-client-toolkit 0.19.2 bound them, and the state applies what the loop's dispatch
-// heard in the order it heard it (`WinitState::drain`): one `Inbox` holds the backend's own
-// objects' events and, through sinks, the seats', the drags', the selection sources' and the
-// outputs' `done`s. sctk's `CompositorHandler`, `WindowHandler`, `SeatHandler`, device handlers
-// and output scale watchers are the `Wire` arms here; the per-surface scale is the backend's own
-// `SurfaceScale`, as sctk's `SurfaceData` kept it, and an output's scale is the one its last
-// applied `done` gave, as sctk's `OutputData` kept it.
-
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -48,45 +36,35 @@ use crate::platform_impl::wayland::wire::{Inbox, Owned, SurfaceEvent, ToplevelEv
 use crate::platform_impl::wayland::{WaylandError, WindowId};
 use crate::platform_impl::OsError;
 
-/// The display connection and the loop's queue, shared by the loop's state and every window,
-/// so neither outlives them: a window kept past the loop keeps its connection.
+/// Shared display connection and event-loop queue.
 pub(crate) struct Connection {
     /// The queue every object of the backend's is on; destroyed before the display goes.
     pub(crate) queue: Queue,
     display: aterm_wayland::proxy::OwnedDisplay,
 }
 
-// SAFETY: the queue is read and dispatched only by the event loop's thread (its state's
-// methods, and `Window::new`, which runs there); every other thread holding the connection
-// holds it to keep it alive, and reads only the display pointer, which libwayland lets any
-// thread use.
+// SAFETY: the queue is accessed only on the event-loop thread and the display pointer is thread-safe.
 unsafe impl Sync for Connection {}
 
 impl Connection {
-    /// Connect to the compositor `name` names, else to `$WAYLAND_DISPLAY` (or
-    /// `$WAYLAND_SOCKET`, as libwayland reads them), and make the loop's queue.
+    /// Connect to `name` (or `$WAYLAND_DISPLAY` / `$WAYLAND_SOCKET`) and create the event-loop queue.
     pub(crate) fn connect(
         name: Option<&std::ffi::CStr>,
     ) -> Result<Connection, aterm_wayland::proxy::Error> {
         let display = aterm_wayland::proxy::OwnedDisplay::connect(name)?;
-        // SAFETY: the owner moves into Connection after its queue, so the queue is
-        // destroyed first. Dispatch is confined to the event-loop thread; window
-        // object destruction is serialized there, or follows its final dispatch.
+        // SAFETY: the owner moves into Connection after its queue, so the queue is destroyed first.
         let queue = Queue::new(unsafe { display.display() })?;
         Ok(Connection { queue, display })
     }
 
     /// The display.
     pub(crate) fn display(&self) -> Display {
-        // SAFETY: callers retain this Connection while using the handle. Its queue
-        // drops before its display, and only the event-loop thread dispatches it.
+        // SAFETY: callers retain this Connection while using the handle.
         unsafe { self.display.display() }
     }
 }
 
-/// The scale of one of the backend's surfaces (a window's, or a cursor's), as sctk's
-/// `SurfaceData` kept it: the outputs the surface is on, and its integer scale (1 until the
-/// compositor or an output says otherwise).
+/// Tracked outputs and integer scale factor for a backend surface.
 #[derive(Debug)]
 pub struct SurfaceScale {
     outputs: Vec<Proxy>,
@@ -100,9 +78,6 @@ impl Default for SurfaceScale {
 }
 
 /// Winit's Wayland state.
-///
-/// The fields drop in order: the windows and the seats' objects first, then the globals, the
-/// registry, and the connection last.
 pub struct WinitState {
     /// The currently present windows.
     pub windows: RefCell<FxHashMap<WindowId, Arc<Mutex<WindowState>>>>,
@@ -128,44 +103,33 @@ pub struct WinitState {
     /// The scale of each of the backend's surfaces.
     pub surface_scales: FxHashMap<WindowId, SurfaceScale>,
 
-    /// Each output's integer scale as of its last `done` the inbox applied, by registry name.
     output_scales: FxHashMap<u32, i32>,
 
     /// Observed monitors.
     pub monitors: Arc<Mutex<Vec<MonitorHandle>>>,
 
-    /// Sink to accumulate window events from the compositor, which is latter dispatched in
-    /// event loop run.
+    /// Sink accumulating window events from the compositor for dispatch during the event loop run.
     pub events_sink: EventSink,
 
-    /// The clipboard sources this client offers and the own-selection slots
-    /// the `WaylandClipboard` handle shares (see `clipboard.rs`).
+    /// Clipboard sources and own-selection slots shared with `WaylandClipboard`.
     pub(crate) clipboard: ClipboardState,
 
-    /// In-flight drag-and-drop `text/uri-list` reads, streamed through the event
-    /// loop until EOF and then parsed into `WindowEvent::DroppedFile`s.
+    /// In-flight drag-and-drop `text/uri-list` reads streamed through the event loop.
     pub dnd_pipes: Vec<DndPipe>,
 
-    /// The window a file drag is currently hovering over (a `HoveredFile` was
-    /// emitted for it), so `leave` knows which window to send `HoveredFileCancelled`
-    /// to — the Wayland `leave` event carries no surface. `None` when no file drag
-    /// is over any of our windows. See `data_device.rs`.
+    /// Window currently hovered by a file drag.
     pub dnd_hover_window: Option<WindowId>,
 
-    /// Whether we have dispatched events to the user thus we want to
-    /// send `AboutToWait` and normally wakeup the user.
+    /// Whether events were dispatched to the user since the last wait.
     pub dispatched_events: bool,
 
     /// Where the backend's own objects record their events.
     pub(crate) inbox: Inbox,
 
-    /// The `wl_data_device_manager`, used to create a `wl_data_device` per seat
-    /// for drag-and-drop and the clipboard. `None` if the compositor doesn't
-    /// advertise it (file drops then simply never arrive). See `data_device.rs`.
+    /// Data device manager used to create a `wl_data_device` per seat.
     pub(crate) data_device_manager: Option<Manager>,
 
-    /// The `zwp_primary_selection_device_manager_v1`, one device per seat, for
-    /// the PRIMARY selection (see `clipboard.rs`). `None` without the global.
+    /// Primary selection device manager, one device per seat.
     pub(crate) primary_selection_manager: Option<Manager>,
 
     /// The text-input-v3 manager.
@@ -186,7 +150,6 @@ pub struct WinitState {
     /// The XDG shell that is used for windows.
     pub(crate) xdg_shell: Arc<Shell>,
 
-    /// The `wl_shm`, for the cursor theme's images and the shadow margin's buffers.
     shm: Arc<Owned>,
 
     /// The `wl_subcompositor`, for the shadow margin's border parts (`None`: no shadow).
@@ -195,14 +158,12 @@ pub struct WinitState {
     /// The compositor, which is used to create new surfaces and regions.
     pub(crate) compositor: Arc<Owned>,
 
-    /// The seats and their devices (aterm-wayland's), shared with the windows for the serials
-    /// and seat a move, a resize or a menu names.
+    /// Seats and their devices shared with windows for move, resize, and menu serials.
     pub(crate) seats_book: Arc<Seats>,
 
     /// The outputs.
     pub(crate) outputs: Outputs,
 
-    /// The registry, and its generation when the outputs and seats were last synced.
     registry_generation: u64,
     registry: Registry,
 
@@ -221,13 +182,9 @@ impl WinitState {
             registry.find(name).and_then(|global| registry.bind(&global, iface, version))
         };
         let owned = |proxy: Option<Proxy>, destroy: unsafe fn(Proxy)| {
-            // SAFETY: a global just bound, owned here alone; its destructor (or the proxy's
-            // client-side destruction for one with none).
+            // SAFETY: `proxy` is a newly bound global owned exclusively here.
             proxy.map(|proxy| unsafe { Owned::new(proxy, destroy) })
         };
-        // LOCAL PATCH (aterm), L-HEADER-LW7: `wl_subcompositor` is bound again (LW.5 left it
-        // with sctk-adwaita's frame), for the shadow margin's border parts; a compositor
-        // without one shows windows with no shadow.
         let subcompositor = owned(
             bind(c"wl_subcompositor", &wl_subcompositor::INTERFACE, 1),
             wl_subcompositor::destroy,
@@ -242,13 +199,10 @@ impl WinitState {
                 .ok_or(WaylandError::Missing("wl_shm"))?;
         let xdg_shell = Shell::bind(&registry).map_err(|_| WaylandError::Missing("xdg_wm_base"))?;
 
-        // Every event the backend hears goes to one inbox, in the order it was dispatched.
         let inbox = Inbox::default();
         let outputs = Outputs::bind_all(&registry, inbox.output_sink())?;
         let seats_book = Arc::new(Seats::bind_all(&registry, inbox.seat_sink())?);
 
-        // The data-device manager drives drag-and-drop (and clipboard) offers. It
-        // is optional: a compositor without it just never delivers file drops.
         let data_device_manager = Manager::bind(&registry, Kind::Clipboard);
         let primary_selection_manager = Manager::bind(&registry, Kind::Primary);
 
@@ -288,7 +242,6 @@ impl WinitState {
             clipboard: ClipboardState::default(),
             dnd_pipes: Vec::new(),
             dnd_hover_window: None,
-            // Make it true by default.
             dispatched_events: true,
             inbox,
             data_device_manager,
@@ -308,8 +261,6 @@ impl WinitState {
             registry,
             connection: Arc::clone(&connection),
         };
-        // Bind a data device for each startup seat (later seats get theirs as they come),
-        // so drags onto our surfaces are received from the start.
         state.add_new_seats();
         state.refresh_monitors();
         Ok(state)
@@ -330,10 +281,7 @@ impl WinitState {
         Arc::clone(&self.shm)
     }
 
-    /// Destroy the retired seat objects no window holds; apply everything the last dispatch
-    /// heard, in the order it heard it (the backend's own objects', the outputs', the seats',
-    /// the drags' and the selection sources' events share one inbox); then bind or release the
-    /// globals that came or went.
+    /// Destroy the retired seat objects no window holds.
     pub(crate) fn drain(&mut self) {
         self.reap_retired();
         self.add_new_seats();
@@ -350,12 +298,7 @@ impl WinitState {
         }
     }
 
-    /// A global came or went: outputs and seats follow the registry (sctk's
-    /// `registry_handlers![OutputState, SeatState]`).
     fn sync_globals(&mut self) {
-        // The monitors' lock is held while an output is released and the list renewed, so a
-        // window's request naming a monitor's output (`set_fullscreen`) finds it bound or not
-        // at all.
         let monitors = Arc::clone(&self.monitors);
         let mut monitors = monitors.lock().unwrap();
         match self.outputs.sync(&self.registry) {
@@ -365,7 +308,6 @@ impl WinitState {
             Ok(false) => {},
             Err(_error) => {
                 warn!("wayland: the outputs could not be bound: {_error}");
-                // sync may have released old outputs before a later bind failed.
                 *monitors = self.outputs.outputs().into_iter().map(MonitorHandle::new).collect();
             },
         }
@@ -378,12 +320,6 @@ impl WinitState {
         self.sync_seats();
     }
 
-    /// Drop every output the registry no longer lists from the outputs each surface is on:
-    /// whether any surface was on one. A compositor need not send `wl_surface.leave` for an
-    /// output that goes (sway sends none), and sctk kept such an output in a surface's list,
-    /// so before `wl_compositor` version 6 a window that was on a gone output kept its scale
-    /// until the next `enter`, `leave` or `done` (docs/AUDIT-third-party-2026-10-15.md,
-    /// L-HEADER-LW7). The proxy is released, and a later output's could reuse its address.
     fn forget_gone_outputs(&mut self) -> bool {
         let outputs = &self.outputs;
         let mut gone = false;
@@ -398,7 +334,6 @@ impl WinitState {
         gone
     }
 
-    /// The monitors list, as the outputs now are.
     fn refresh_monitors(&mut self) {
         let monitors = self.outputs.outputs().into_iter().map(MonitorHandle::new).collect();
         *self.monitors.lock().unwrap() = monitors;
@@ -422,8 +357,6 @@ impl WinitState {
         }
     }
 
-    /// One event of a window's xdg objects: sctk 0.19.2's pending configure, updated by each
-    /// toplevel and decoration event and handed to the window on `xdg_surface.configure`.
     fn toplevel_event(&mut self, window_id: WindowId, event: ToplevelEvent) {
         let configure = {
             let windows = self.windows.get_mut();
@@ -465,12 +398,10 @@ impl WinitState {
         };
         match configure {
             Some(configure) => self.configure(window_id, configure),
-            // sctk's `WindowHandler::request_close`.
             None => Self::queue_close(&mut self.window_compositor_updates, window_id),
         }
     }
 
-    /// sctk's `WindowHandler::configure` (the configure is already acked).
     fn configure(&mut self, window_id: WindowId, configure: WindowConfigure) {
         let pos = if let Some(pos) =
             self.window_compositor_updates.iter().position(|update| update.window_id == window_id)
@@ -481,7 +412,6 @@ impl WinitState {
             self.window_compositor_updates.len() - 1
         };
 
-        // Populate the configure to the window.
         self.window_compositor_updates[pos].resized |= self
             .windows
             .get_mut()
@@ -491,18 +421,13 @@ impl WinitState {
             .unwrap()
             .configure(configure);
 
-        // NOTE: configure demands wl_surface::commit, however winit doesn't commit on behalf of the
-        // users, since it can break a lot of things, thus it'll ask users to redraw instead.
         if let Some(requests) = self.window_requests.get_mut().get(&window_id) {
             requests.redraw_requested.store(true, Ordering::Relaxed);
         }
 
-        // Manually mark that we've got an event, since configure may not generate a resize.
         self.dispatched_events = true;
     }
 
-    /// One event of a surface of the backend's (sctk's `CompositorHandler` and its
-    /// `SurfaceData`): the outputs it is on, and with them its integer scale.
     fn surface_event(&mut self, surface: WindowId, event: SurfaceEvent) {
         let entry = self.surface_scales.entry(surface).or_default();
         match event {
@@ -522,7 +447,6 @@ impl WinitState {
             },
             SurfaceEvent::Enter(None) | SurfaceEvent::Leave(None) => return,
             SurfaceEvent::PreferredBufferScale(factor) => {
-                // NOTE: with v6 the scale is the compositor's to say, and only this says it.
                 let current = std::mem::replace(&mut entry.factor, factor);
                 if current != factor {
                     self.scale_factor_changed(surface, factor as f64, true);
@@ -535,7 +459,6 @@ impl WinitState {
         }
     }
 
-    /// The surface's protocol version (a window's or a cursor's).
     fn surface_version(&mut self, surface: WindowId) -> u32 {
         if let Some(window) = self.windows.get_mut().get(&surface) {
             // SAFETY: the window's live surface.
@@ -548,18 +471,12 @@ impl WinitState {
         0
     }
 
-    /// An output's `done`: its scale as of it, and, when the scale changed, every surface that
-    /// takes its scale from the outputs rescaled (sctk's output scale watchers, which ran at the
-    /// `done` that changed a scale).
     fn output_done(&mut self, info: aterm_wayland::output::OutputInfo) {
         if self.output_scales.insert(info.global, info.scale) != Some(info.scale) {
             self.rescale_legacy_surfaces();
         }
     }
 
-    /// A surface's integer scale before `wl_compositor` version 6: the largest scale of the
-    /// outputs it is on, each as of its last applied `done` (sctk's
-    /// `dispatch_surface_state_updates`); unchanged while it is on none.
     fn rescale_surface(&mut self, surface: WindowId) {
         let Some(entry) = self.surface_scales.get_mut(&surface) else { return };
         let factor = entry
@@ -575,8 +492,6 @@ impl WinitState {
         }
     }
 
-    /// An output's scale moved: rescale every surface that takes its scale from the outputs
-    /// (sctk's output scale watcher).
     fn rescale_legacy_surfaces(&mut self) {
         let surfaces: Vec<WindowId> = self.surface_scales.keys().copied().collect();
         for surface in surfaces {
@@ -587,7 +502,6 @@ impl WinitState {
     }
 
     pub fn scale_factor_changed(&mut self, surface: WindowId, scale_factor: f64, is_legacy: bool) {
-        // Check if the cursor surface.
         let window_id = surface;
 
         if let Some(window) = self.windows.get_mut().get(&window_id) {
@@ -596,7 +510,6 @@ impl WinitState {
                 return;
             }
 
-            // The scale factor change is for the window.
             let pos = if let Some(pos) = self
                 .window_compositor_updates
                 .iter()
@@ -608,13 +521,11 @@ impl WinitState {
                 self.window_compositor_updates.len() - 1
             };
 
-            // Update the scale factor right away.
             window.lock().unwrap().set_scale_factor(scale_factor);
             self.window_compositor_updates[pos].scale_changed = true;
         } else if let Some(pointer) = self.pointer_surfaces.get(&surface) {
             pointer.set_cursor_scale(scale_factor as i32);
 
-            // Get the window, where the pointer resides right now.
             let focused_window = match pointer.focused_window() {
                 Some(focused_window) => focused_window,
                 None => return,
@@ -626,7 +537,6 @@ impl WinitState {
         }
     }
 
-    /// The attention request's activation token arrived: activate the window with it.
     fn activation_done(&mut self, window_id: WindowId, token: &str) {
         let Some(window) = self.windows.get_mut().get(&window_id) else { return };
         let mut window = window.lock().unwrap();
@@ -635,7 +545,6 @@ impl WinitState {
             // SAFETY: the live activation global and the window's live surface.
             unsafe { xdg_activation_v1::activate(activation.proxy(), &token, window.surface()) };
         }
-        // Mark that no request attention is in process, and destroy the spent token.
         window.attention_requested = false;
         window.objects.attention_token = None;
     }
@@ -655,16 +564,12 @@ impl WinitState {
 
 impl Drop for WinitState {
     fn drop(&mut self) {
-        // A Window may retain this list after the loop. Empty it before Outputs
-        // drops; the same lock lets any in-flight fullscreen request finish first.
         self.monitors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
     }
 }
 
-/// The scaling factor denominator.
 const SCALE_DENOMINATOR: f64 = 120.;
 
-// The window update coming from the compositor.
 #[derive(Debug, Clone, Copy)]
 pub struct WindowCompositorUpdate {
     /// The id of the window this updates belongs to.

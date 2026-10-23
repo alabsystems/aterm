@@ -111,7 +111,7 @@ pub(crate) struct AskpassTicket {
 }
 
 impl AskpassTicket {
-    pub(crate) fn new(id: u64, deadline: Instant) -> Self {
+    pub(crate) const fn new(id: u64, deadline: Instant) -> Self {
         #[cfg(not(target_os = "macos"))]
         let _ = id;
         Self {

@@ -1041,6 +1041,8 @@ mod macos {
                     &format!("row {i} separator={} (want {separator})", row.separator),
                 );
                 if *separator {
+                    // A separator's title, action and key equivalent are
+                    // AppKit's, not the fork's; asserting them would be
                     // asserting `+separatorItem`.
                     continue;
                 }

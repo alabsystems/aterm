@@ -56,7 +56,6 @@ pub(crate) struct Answer {
     pub drawn: Option<Where>,
 }
 
-/// The GPU page's `where` report, if the answer carries one.
 fn parse_where(v: &Value) -> Result<Option<Where>, String> {
     let Some(w) = v.get("where") else {
         return Ok(None);
@@ -74,7 +73,6 @@ fn parse_where(v: &Value) -> Result<Option<Where>, String> {
     }))
 }
 
-/// The GPU page's `init` report, if the answer carries one.
 fn parse_init(v: &Value) -> Result<Option<Init>, String> {
     let Some(init) = v.get("init") else {
         return Ok(None);
@@ -140,7 +138,6 @@ pub(crate) fn parse(v: &Value) -> Result<Answer, String> {
     })
 }
 
-/// A page's frames, each decoded and sized; `what` names one in an error.
 fn parse_frames(frames: &[Value], what: &str) -> Result<Vec<Frame>, String> {
     frames
         .iter()
@@ -403,8 +400,6 @@ pub(crate) fn worker(gpu: &Answer, worker: &Answer) -> Verdict {
     v
 }
 
-/// How frame `b` moved from `a`: the largest byte delta and how many bytes
-/// differ, or the two sizes.
 fn moved(a: &Frame, b: &Frame) -> String {
     if a.rgba.len() == b.rgba.len() {
         let differing = a.rgba.iter().zip(&b.rgba).filter(|(x, y)| x != y).count();
@@ -417,10 +412,6 @@ fn moved(a: &Frame, b: &Frame) -> String {
     }
 }
 
-/// The harness readback (`render_offscreen()` + `rgba()` after the last
-/// frame) holds the last frame's content: within [`TOLERANCE`] of the CPU's
-/// last frame, at its size. NEGATIVE CONTROL: outside it of the CPU's frame
-/// before, so a readback of a stale or blank offscreen cannot pass.
 fn judge_readback(cpu: &Answer, gpu: &Answer, v: &mut Verdict) {
     let Some(rb) = gpu.readback.as_ref() else {
         v.failures
@@ -460,9 +451,6 @@ fn judge_readback(cpu: &Answer, gpu: &Answer, v: &mut Verdict) {
     }
 }
 
-/// `init` (WP.5): the GPU is ready when `init(canvas)` returns, and an
-/// `init` that throws inside an awaited call rejects its async caller with
-/// the thrown string.
 fn judge_init(init: Option<&Init>, v: &mut Verdict) {
     let before = v.failures.len();
     let Some(init) = init else {
@@ -502,7 +490,6 @@ mod tests {
     const RED: [u8; 4] = [205, 49, 49, 255];
     const WHITE: [u8; 4] = [224, 224, 224, 255];
 
-    /// A 4x4 frame: a red pixel, then one white pixel per line fed.
     fn frame(lines: usize) -> Frame {
         let mut rgba: Vec<u8> = BG.repeat(16);
         rgba[..4].copy_from_slice(&RED);
@@ -517,8 +504,6 @@ mod tests {
         }
     }
 
-    /// A page's answer; its readback is the run's last frame, as a GPU page
-    /// whose offscreen holds what it presented reads it.
     fn answer(frames: Vec<Frame>) -> Answer {
         Answer {
             module: "m".to_string(),
@@ -566,9 +551,6 @@ mod tests {
         assert!(v.failures[0].starts_with("frame 2: the WebGL2 frame differs"));
     }
 
-    /// The readback must show the last frame: one off by more than the
-    /// tolerance fails, a stale one (the frame before) trips the control, and
-    /// a page that sent none fails.
     #[test]
     fn a_readback_that_misses_the_last_frame_fails() {
         let mut off = answer(run());
@@ -611,8 +593,6 @@ mod tests {
         );
     }
 
-    /// A GPU page stuck on its first frame matches no later CPU frame within
-    /// the tolerance, and the control names the stall.
     #[test]
     fn a_page_that_stops_presenting_trips_the_negative_control() {
         let cpu = answer(run());
@@ -651,8 +631,6 @@ mod tests {
         );
     }
 
-    /// An init that came back unfinished, a probe that resolved, and one that
-    /// rejected with something other than init's string each fail.
     #[test]
     fn an_init_that_is_not_synchronous_or_does_not_reject_fails() {
         let judged = |edit: fn(&mut Init)| {
@@ -671,9 +649,6 @@ mod tests {
         assert!(judge(&answer(run()), &gpu, 3).failures[0].contains("no init report"));
     }
 
-    /// Across backends the CPU frames must not move: identical ones pass
-    /// and report the GPU frames' distance, and one changed byte fails and
-    /// names its frame.
     #[test]
     fn a_cpu_frame_that_moves_with_the_backend_fails() {
         fn refs(frames: &[Frame]) -> Vec<(String, &Frame)> {
@@ -705,9 +680,6 @@ mod tests {
         );
     }
 
-    /// A gpu page and its worker in the same session draw the same bytes:
-    /// identical runs pass, one byte moved fails and names its frame, and a
-    /// run drawn somewhere other than it says trips the control.
     #[test]
     fn a_worker_must_draw_where_it_says_and_what_the_page_drew() {
         let place = |w: [&str; 3]| {

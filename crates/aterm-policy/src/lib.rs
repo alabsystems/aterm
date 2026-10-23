@@ -3,6 +3,16 @@
 // Author: Andrew Yates
 
 //! OSC / escape-sequence **policy engine**: the data model, the three built-in profiles, the decision-tree engine ([`engine::PolicyEngine`]) and the token-bucket rate limiter ([`limits`]).
+//!
+//! # Example
+//!
+//! ```
+//! use aterm_policy::profiles;
+//!
+//! let hardened = profiles::hardened();
+//! assert_eq!(hardened.schema_version, aterm_policy::SCHEMA_VERSION);
+//! assert_eq!(hardened.profile, aterm_policy::Profile::Hardened);
+//! ```
 
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]

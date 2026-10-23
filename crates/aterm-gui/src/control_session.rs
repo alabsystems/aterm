@@ -407,6 +407,8 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         None => Act::None,
         Some(crate::Lease::Turn { id, driver, .. }) => {
             if force {
+                // Force-preempt a wedged turn whose driver crashed: a deliberate operator
+                // override, like `signal`. Safe because the turn's `LeaseGuard` clears only its
                 // own id, so a fresh turn in the freed slot is not stomped when it returns.
                 Act::Release(driver.clone())
             } else {
@@ -1317,7 +1319,7 @@ pub(crate) const TYPED_CAP_MAX: usize = 4096;
 /// The default inter-key interval of `turn typed=1`, in ms (~14 cps).
 pub(crate) const TYPED_CADENCE_MS: u64 = 70;
 
-fn unshift_us(c: char) -> Option<char> {
+const fn unshift_us(c: char) -> Option<char> {
     Some(match c {
         'A'..='Z' => c.to_ascii_lowercase(),
         '!' => '1',
@@ -1345,7 +1347,7 @@ fn unshift_us(c: char) -> Option<char> {
     })
 }
 
-fn has_us_base_layout(base: char) -> bool {
+const fn has_us_base_layout(base: char) -> bool {
     base.is_ascii_lowercase()
         || base.is_ascii_digit()
         || matches!(
@@ -1490,6 +1492,7 @@ impl TypingHold {
         {
             Look::Stop("changed")
         } else if (sent_from.is_some() && keys_unread(ctx)) || sent_from == Some(cursor) {
+            // The key before it is still unread by the program, or it has
             // not yet moved the caret off where it went out from.
             Look::Wait
         } else {
@@ -1549,7 +1552,7 @@ fn keys_unread(ctx: &SessionCtx) -> bool {
         .is_some_and(|b| b.queued != 0 || b.spilled != Some(0))
 }
 
-fn is_digit_key(ev: &InputEvent) -> bool {
+const fn is_digit_key(ev: &InputEvent) -> bool {
     matches!(
         ev,
         InputEvent::Key {
@@ -2485,6 +2488,7 @@ pub(crate) fn cmd_turn(
             None
         };
         for press_no in 0..presses {
+            // A re-press is for an Enter the program read and swallowed; one still unread would
             // only queue another behind it (`input_stall::repress_would_queue`).
             if press_no > 0 && crate::input_stall::repress_would_queue(&ctx.sink) {
                 break;
@@ -3405,6 +3409,9 @@ pub(super) fn cmd_meta_harness_act_with_clock(
                 == Some(aterm_agent::harness::acts::TaskFace::Theirs)
                 && !snapshot.is_some_and(|point| point.left_at_rest)
             {
+                // A pending submission already reports Working before Core
+                // accepts its turn. Working/Blocked/unknown cannot establish
+                // an earlier at-rest point; otherwise its count could become
                 // the new turn's own landing mark and never reopen the face.
                 return Some(("ERR busy harness_act\n".to_string(), false));
             }
@@ -4181,6 +4188,7 @@ pub(crate) fn cmd_connect_in(
         kind,
         "wire",
     ) {
+        // `connect_in` refuses only a self-loop, checked above; keep the
         // fail-closed reply rather than an unreachable! on a future refusal.
         return "ERR self-loop\n".to_string();
     }
@@ -4216,6 +4224,7 @@ pub(crate) fn cmd_disconnect_in(
         return "ERR usage: disconnect dst=<sid> src=<sid> [kind=pull|push|both]\n".to_string();
     };
     if src == dst {
+        // A self-loop is never a connection; refusing here also keeps the
         // fallback sweep from eating raw self-granted rows by accident.
         return "ERR self-loop\n".to_string();
     }

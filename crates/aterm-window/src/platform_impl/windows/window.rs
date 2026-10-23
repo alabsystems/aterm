@@ -83,8 +83,7 @@ use crate::window::{
     WindowButtons, WindowLevel,
 };
 
-// SAFETY: an `HWND` names a process-global window; owner-thread calls go through
-// `thread_executor` (auto-derived while windows-sys 0.52 made it an `isize`).
+// SAFETY: an `HWND` names a process-global window.
 unsafe impl Send for Window {}
 unsafe impl Sync for Window {}
 
@@ -96,7 +95,6 @@ pub(crate) struct Window {
     /// The current window state.
     window_state: Arc<Mutex<WindowState>>,
 
-    // The events loop proxy.
     thread_executor: event_loop::EventLoopThreadExecutor,
 }
 
@@ -105,20 +103,14 @@ impl Window {
         event_loop: &ActiveEventLoop,
         w_attr: WindowAttributes,
     ) -> Result<Window, RootOsError> {
-        // We dispatch an `init` function because of code style.
-        // First person to remove the need for cloning here gets a cookie!
-        //
-        // done. you owe me -- ossi
         unsafe { init(w_attr, event_loop) }
     }
 
     pub(crate) fn maybe_queue_on_main(&self, f: impl FnOnce(&Self) + Send + 'static) {
-        // TODO: Use `thread_executor` here
         f(self)
     }
 
     pub(crate) fn maybe_wait_on_main<R: Send>(&self, f: impl FnOnce(&Self) -> R + Send) -> R {
-        // TODO: Use `thread_executor` here
         f(self)
     }
 
@@ -165,7 +157,6 @@ impl Window {
 
     #[inline]
     pub fn request_redraw(&self) {
-        // NOTE: mark that we requested a redraw to handle requests during `WM_PAINT` handling.
         self.window_state.lock().unwrap().redraw_requested = true;
         unsafe {
             RedrawWindow(self.hwnd(), ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
@@ -272,7 +263,6 @@ impl Window {
     #[inline]
     pub fn set_min_inner_size(&self, size: Option<Size>) {
         self.window_state_lock().min_size = size;
-        // Make windows re-check the window size bounds.
         let size = self.inner_size();
         self.request_inner_size(size.into());
     }
@@ -280,7 +270,6 @@ impl Window {
     #[inline]
     pub fn set_max_inner_size(&self, size: Option<Size>) {
         self.window_state_lock().max_size = size;
-        // Make windows re-check the window size bounds.
         let size = self.inner_size();
         self.request_inner_size(size.into());
     }
@@ -370,8 +359,6 @@ impl Window {
     #[cfg(feature = "rwh_06")]
     #[inline]
     pub fn raw_window_handle_rwh_06(&self) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
-        // TODO: Write a test once integration framework is ready to ensure that it holds.
-        // If we aren't in the GUI thread, we can't return the window.
         if !self.thread_executor.in_event_loop_thread() {
             tracing::error!("tried to access window handle outside of the main thread");
             return Err(rwh_06::HandleError::Unavailable);
@@ -501,7 +488,6 @@ impl Window {
             };
             let points = POINTS { x: points.x as i16, y: points.y as i16 };
 
-            // ReleaseCapture needs to execute on the main thread
             unsafe { ReleaseCapture() };
 
             unsafe {
@@ -555,12 +541,9 @@ impl Window {
                 point
             };
 
-            // get the current system menu
             let h_menu = GetSystemMenu(self.hwnd(), 0);
             if h_menu.is_null() {
                 warn!("The corresponding window doesn't have a system menu");
-                // This situation should not be treated as an error so just return without showing
-                // menu.
                 return;
             }
 
@@ -571,8 +554,6 @@ impl Window {
                     MFS_DISABLED
                 }
             }
-
-            // Change the menu items according to the current window status.
 
             let restore_btn = enable(self.is_maximized() && self.is_resizable());
             let size_btn = enable(!self.is_maximized() && self.is_resizable());
@@ -585,10 +566,8 @@ impl Window {
             EnableMenuItem(h_menu, SC_MAXIMIZE, MF_BYCOMMAND | maximize_btn);
             EnableMenuItem(h_menu, SC_CLOSE, MF_BYCOMMAND | MFS_ENABLED);
 
-            // Set the default menu item.
             SetMenuDefaultItem(h_menu, SC_CLOSE, 0);
 
-            // Popup the system menu at the position.
             let result = TrackPopupMenu(
                 h_menu,
                 TPM_RETURNCMD | TPM_LEFTALIGN, /* for now im using LTR, but we have to use user
@@ -601,11 +580,9 @@ impl Window {
             );
 
             if result == 0 {
-                // User canceled the menu, no need to continue.
                 return;
             }
 
-            // Send the command that the user select to the corresponding window.
             if PostMessageW(self.hwnd(), WM_SYSCOMMAND, result as _, 0) == 0 {
                 warn!("Can't post the system menu message to the window.");
             }
@@ -695,10 +672,7 @@ impl Window {
         let old_fullscreen = window_state_lock.fullscreen.clone();
 
         match (&old_fullscreen, &fullscreen) {
-            // Return if we already are in the same fullscreen mode
             _ if old_fullscreen == fullscreen => return,
-            // Return if saved Borderless(monitor) is the same as current monitor when requested
-            // fullscreen is Borderless(None)
             (Some(Fullscreen::Borderless(Some(monitor))), Some(Fullscreen::Borderless(None)))
                 if *monitor == monitor::current_monitor(window.get()) =>
             {
@@ -712,8 +686,6 @@ impl Window {
 
         self.thread_executor.execute_in_thread(move || {
             let window = window.get();
-            // Change video mode if we're transitioning to or from exclusive
-            // fullscreen
             match (&old_fullscreen, &fullscreen) {
                 (_, Some(Fullscreen::Exclusive(video_mode))) => {
                     let monitor = video_mode.monitor();
@@ -756,19 +728,10 @@ impl Window {
             }
 
             unsafe {
-                // There are some scenarios where calling `ChangeDisplaySettingsExW` takes long
-                // enough to execute that the DWM thinks our program has frozen and takes over
-                // our program's window. When that happens, the `SetWindowPos` call below gets
-                // eaten and the window doesn't get set to the proper fullscreen position.
-                //
-                // Calling `PeekMessageW` here notifies Windows that our process is still running
-                // fine, taking control back from the DWM and ensuring that the `SetWindowPos` call
-                // below goes through.
                 let mut msg = mem::zeroed();
                 PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
             }
 
-            // Update window style
             WindowState::set_window_flags(window_state.lock().unwrap(), window, |f| {
                 f.set(
                     WindowFlags::MARKER_EXCLUSIVE_FULLSCREEN,
@@ -780,19 +743,12 @@ impl Window {
                 );
             });
 
-            // Mark as fullscreen window wrt to z-order
-            //
-            // this needs to be called before the below fullscreen SetWindowPos as this itself
-            // will generate WM_SIZE messages of the old window size that can race with what we set
-            // below
             unsafe {
                 taskbar_mark_fullscreen(window, fullscreen.is_some());
             }
 
-            // Update window bounds
             match &fullscreen {
                 Some(fullscreen) => {
-                    // Save window bounds before entering fullscreen
                     let placement = unsafe {
                         let mut placement = mem::zeroed();
                         GetWindowPlacement(window, &mut placement);
@@ -1018,8 +974,6 @@ impl Window {
 
     #[inline]
     pub fn reset_dead_keys(&self) {
-        // `ToUnicode` consumes the dead-key by default, so we are constructing a fake (but valid)
-        // key input which we can call `ToUnicode` with.
         unsafe {
             let vk = VK_SPACE as VIRTUAL_KEY;
             let scancode = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC);
@@ -1089,25 +1043,20 @@ impl Drop for Window {
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            // The window must be destroyed from the same thread that created it, so we send a
-            // custom message to be handled by our callback to do the actual work.
             PostMessageW(self.hwnd(), DESTROY_MSG_ID.get(), 0, 0);
         }
     }
 }
 
 pub(super) struct InitData<'a> {
-    // inputs
     pub event_loop: &'a ActiveEventLoop,
     pub attributes: WindowAttributes,
     pub window_flags: WindowFlags,
-    // outputs
     pub window: Option<Window>,
 }
 
 impl InitData<'_> {
     unsafe fn create_window(&self, window: HWND) -> Window {
-        // Register for touch events if applicable
         {
             let digitizer = unsafe { GetSystemMetrics(SM_DIGITIZER) as u32 };
             if digitizer & NID_READY != 0 {
@@ -1118,9 +1067,6 @@ impl InitData<'_> {
         let dpi = unsafe { hwnd_dpi(window) };
         let scale_factor = dpi_to_scale_factor(dpi);
 
-        // If the system theme is dark, we need to set the window theme now
-        // before we update the window flags (and possibly show the
-        // window for the first time).
         let current_theme = try_theme(window, self.attributes.preferred_theme);
 
         let window_state = {
@@ -1147,8 +1093,6 @@ impl InitData<'_> {
     unsafe fn create_window_data(&self, win: &Window) -> event_loop::WindowData {
         let file_drop_handler = if self.attributes.platform_specific.drag_and_drop {
             let ole_init_result = unsafe { OleInitialize(ptr::null_mut()) };
-            // It is ok if the initialize result is `S_FALSE` because it might happen that
-            // multiple windows are created on the same thread.
             if ole_init_result == OLE_E_WRONGCOMPOBJ {
                 panic!("OleInitialize failed! Result was: `OLE_E_WRONGCOMPOBJ`");
             } else if ole_init_result == RPC_E_CHANGED_MODE {
@@ -1189,9 +1133,6 @@ impl InitData<'_> {
         }
     }
 
-    // Returns a pointer to window user data on success.
-    // The user data will be registered for the window and can be accessed within the window event
-    // callback.
     pub unsafe fn on_nccreate(&mut self, window: HWND) -> Option<isize> {
         let runner = self.event_loop.runner_shared.clone();
         let result = runner.catch_unwind(|| {
@@ -1210,9 +1151,7 @@ impl InitData<'_> {
     pub unsafe fn on_create(&mut self) {
         let win = self.window.as_mut().expect("failed window creation");
 
-        // making the window transparent
         if self.attributes.transparent && !self.attributes.platform_specific.no_redirection_bitmap {
-            // Empty region for the blur effect, so the window is fully transparent
             let region = unsafe { CreateRectRgn(0, 0, -1, -1) };
 
             let bb = DWM_BLURBEHIND {
@@ -1240,8 +1179,6 @@ impl InitData<'_> {
 
         win.set_cursor(attributes.cursor);
 
-        // Set visible before setting the size to ensure the
-        // attribute is correctly applied.
         win.set_visible(attributes.visible);
 
         win.set_enabled_buttons(attributes.enabled_buttons);
@@ -1253,14 +1190,6 @@ impl InitData<'_> {
         let min_size = attributes.min_inner_size.unwrap_or_else(|| PhysicalSize::new(0, 0).into());
         let clamped_size = Size::clamp(size, min_size, max_size, win.scale_factor());
         win.request_inner_size(clamped_size);
-
-        // let margins = MARGINS {
-        //     cxLeftWidth: 1,
-        //     cxRightWidth: 1,
-        //     cyTopHeight: 1,
-        //     cyBottomHeight: 1,
-        // };
-        // dbg!(DwmExtendFrameIntoClientArea(win.hwnd(), &margins as *const _));
 
         if let Some(position) = attributes.position {
             win.set_outer_position(position);
@@ -1305,10 +1234,7 @@ unsafe fn init(
         .set(WindowFlags::NO_BACK_BUFFER, attributes.platform_specific.no_redirection_bitmap);
     window_flags.set(WindowFlags::MARKER_ACTIVATE, attributes.active);
     window_flags.set(WindowFlags::TRANSPARENT, attributes.transparent);
-    // WindowFlags::VISIBLE and MAXIMIZED are set down below after the window has been configured.
     window_flags.set(WindowFlags::RESIZABLE, attributes.resizable);
-    // Will be changed later using `window.set_enabled_buttons` but we need to set a default here
-    // so the diffing later can work.
     window_flags.set(WindowFlags::CLOSABLE, true);
     window_flags.set(WindowFlags::CLIP_CHILDREN, attributes.platform_specific.clip_children);
 
@@ -1362,7 +1288,6 @@ unsafe fn init(
         )
     };
 
-    // If the window creation in `InitData` panicked, then should resume panicking here
     if let Err(panic_error) = event_loop.runner_shared.take_panic_error() {
         panic::resume_unwind(panic_error)
     }
@@ -1371,13 +1296,8 @@ unsafe fn init(
         return Err(os_error!(io::Error::last_os_error()));
     }
 
-    // If the handle is non-null, then window creation must have succeeded, which means
-    // that we *must* have populated the `InitData.window` field.
     let win = initdata.window.unwrap();
 
-    // Need to set FULLSCREEN or MAXIMIZED after CreateWindowEx
-    // This is because if the size is changed in WM_CREATE, the restored size will be stored in that
-    // size.
     if fullscreen.is_some() {
         win.set_fullscreen(fullscreen.map(Into::into));
         unsafe { force_window_active(win.window) };
@@ -1404,10 +1324,6 @@ unsafe fn register_window_class(class_name: &[u16]) {
         hIconSm: std::ptr::null_mut(),
     };
 
-    // We ignore errors because registering the same window class twice would trigger
-    //  an error, and because errors here are detected during CreateWindowEx anyway.
-    // Also since there is no weird element in the struct, there is no reason for this
-    //  call to fail.
     unsafe { RegisterClassExW(&class) };
 }
 
@@ -1434,14 +1350,6 @@ pub fn com_initialized() {
     COM_INITIALIZED.with(|_| {});
 }
 
-// Reference Implementation:
-// https://github.com/chromium/chromium/blob/f18e79d901f56154f80eea1e2218544285e62623/ui/views/win/fullscreen_handler.cc
-//
-// As per MSDN marking the window as fullscreen should ensure that the
-// taskbar is moved to the bottom of the Z-order when the fullscreen window
-// is activated. If the window is not fullscreen, the Shell falls back to
-// heuristics to determine how the window should be treated, which means
-// that it could still consider the window as fullscreen. :(
 unsafe fn taskbar_mark_fullscreen(handle: HWND, fullscreen: bool) {
     com_initialized();
 
@@ -1459,13 +1367,11 @@ unsafe fn taskbar_mark_fullscreen(handle: HWND, fullscreen: bool) {
                 )
             };
             if hr != S_OK {
-                // In visual studio retrieving the taskbar list fails
                 return;
             }
 
             let hr_init = unsafe { (*(*task_bar_list2).lpVtbl).parent.HrInit };
             if unsafe { hr_init(task_bar_list2.cast()) } != S_OK {
-                // In some old windows, the taskbar object could not be created, we just ignore it
                 return;
             }
             task_bar_list2_ptr.set(task_bar_list2)
@@ -1493,13 +1399,11 @@ pub(crate) unsafe fn set_skip_taskbar(hwnd: HWND, skip: bool) {
                 )
             };
             if hr != S_OK {
-                // In visual studio retrieving the taskbar list fails
                 return;
             }
 
             let hr_init = unsafe { (*(*task_bar_list).lpVtbl).HrInit };
             if unsafe { hr_init(task_bar_list.cast()) } != S_OK {
-                // In some old windows, the taskbar object could not be created, we just ignore it
                 return;
             }
             task_bar_list_ptr.set(task_bar_list)
@@ -1517,10 +1421,6 @@ pub(crate) unsafe fn set_skip_taskbar(hwnd: HWND, skip: bool) {
 }
 
 unsafe fn force_window_active(handle: HWND) {
-    // In some situation, calling SetForegroundWindow could not bring up the window,
-    // This is a little hack which can "steal" the foreground window permission
-    // We only call this function in the window creation, so it should be fine.
-    // See : https://stackoverflow.com/questions/10740346/setforegroundwindow-only-working-while-visual-studio-is-open
     let alt_sc = unsafe { MapVirtualKeyW(VK_MENU as u32, MAPVK_VK_TO_VSC) };
 
     let inputs = [
@@ -1550,16 +1450,12 @@ unsafe fn force_window_active(handle: HWND) {
         },
     ];
 
-    // Simulate a key press and release
     unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), mem::size_of::<INPUT>() as i32) };
 
     unsafe { SetForegroundWindow(handle) };
 }
 
-/// LOCAL PATCH (aterm): the `FlashWindowEx` request `request_user_attention` makes for `window`,
-/// apart so its flags are testable without a window. Informational (a bell) flashes the taskbar
-/// button until the window comes forward; Critical flashes the caption too, until it does; `None`
-/// stops a flash.
+/// LOCAL PATCH (aterm).
 fn attention_flash(window: HWND, request_type: Option<UserAttentionType>) -> FLASHWINFO {
     let (flags, count) = request_type
         .map(|ty| match ty {
@@ -1583,10 +1479,6 @@ mod attention_tests {
         FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY,
     };
 
-    /// A bell's request flashes the taskbar button alone, until the window comes forward
-    /// (`FLASHW_TIMERNOFG` with no count); a critical one flashes the caption too; none stops.
-    /// The structure is `winuser.h`'s `FLASHWINFO` (32 bytes on a 64-bit target), sized in
-    /// its own `cbSize`.
     #[test]
     fn a_bell_flashes_the_taskbar_button_until_the_window_comes_forward() {
         let hwnd = 0x1234 as _;

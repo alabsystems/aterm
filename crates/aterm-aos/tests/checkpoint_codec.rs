@@ -54,8 +54,6 @@ fn reframe(body: Vec<u8>) -> Vec<u8> {
     Frame::new(body).encode().unwrap()
 }
 
-/// A checkpoint body written by hand from the documented layout, with a correct state digest
-/// over whatever state bytes it is given.
 fn body(p: &Provenance, state_bytes: &[u8]) -> Vec<u8> {
     let mut e = Enc::new();
     e.raw(&CHECKPOINT_MAGIC);
@@ -260,8 +258,6 @@ fn a_checkpoint_whose_provenance_names_another_schema_is_refused_on_decode_and_r
     );
 }
 
-/// A checkpoint captured under another schema artifact than the one its provenance names
-/// (the same codec, so the state bytes decode) carries a state digest under the wrong schema.
 #[test]
 fn restore_refuses_a_checkpoint_whose_state_digest_is_not_under_the_restoring_schema() {
     let named = identity(Variant::Good);

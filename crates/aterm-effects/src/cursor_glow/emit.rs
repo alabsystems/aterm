@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Emission: turning the engine's live state into this frame's quads, halos and patches, style by style.
+//! Emission of per-frame cursor-glow quads, halos, and patches by style.
 
 use super::*;
 
 impl CursorGlow {
-    /// Emit the live lightning bolts: each frozen jagged channel draws as a wide same-hue corona under a hot core (branches thinner, dimmer, no white mix), through the shared [`comet_beam`] so strikes stay smooth at any angle with CPU/GPU parity.
+    /// Emit the live lightning bolts through [`comet_beam`].
     pub(super) fn emit_bolts(
         &self,
         now: Instant,
@@ -53,7 +53,6 @@ impl CursorGlow {
                 cov_f = cov_f.min(cap);
             }
             if !dark {
-                // letter the strike crosses keeps its strokes.
                 cov_f = cov_f.min(alpha_cap);
             }
             if cov_f < 1.0 {
@@ -222,7 +221,6 @@ impl CursorGlow {
                     cell * 0.15,
                     1.0 + 2.4 * t,
                     if cfg.dark_theme {
-                        // over the dark.
                         lerp_rgb(0x005E_5E60, 0x0042_4246, t)
                     } else {
                         lerp_rgb(0x0060_544A, 0x0084_7E78, t)
@@ -269,7 +267,7 @@ impl CursorGlow {
         }
     }
 
-    /// Emit the comet body as a smooth line of light rather than one opaque cell per swept step (which staircases on diagonals): the swept cells become a polyline that [`comet_beam`] rasterizes as an anti-aliased beam (a soft wide halo under a hot core).
+    /// Emit the comet body as an anti-aliased beam through [`comet_beam`].
     #[allow(
         clippy::too_many_arguments,
         reason = "clock + config + geometry + cursor + the three streams a beam can land in"
@@ -284,7 +282,6 @@ impl CursorGlow {
         halos: &mut Vec<RainHalo>,
         under: &mut Vec<GlowQuad>,
     ) {
-        // its own continuous ribbon) emit no shared additive beam. See `style_has_beam`.
         if !cfg.beam || self.sparks.is_empty() {
             return;
         }
@@ -336,9 +333,6 @@ impl CursorGlow {
             leap_air: shape.leap_air && !self.leap_split,
             ..shape
         });
-        // Fire's per-unit lift on each band of a cell, memoized by colour and
-        // `pos` (consecutive samples of a typing run share both); its core
-        // thickness is `core_thick`'s Fire arm below.
         let mut fire_lift_memo: Option<((u32, u32), BandLifts)> = None;
         let fire_core = (chf * (0.13 + 0.09 * self.fire_t())).max(2.0);
         let fire_text = if matches!(cfg.style, GlowStyle::Fire)
@@ -355,7 +349,6 @@ impl CursorGlow {
             let frac = (age / s.life).clamp(0.0, 1.0);
             let tf = if s.typing {
                 if matches!(cfg.style, GlowStyle::Beam) {
-                    // hairline, like an emitter switching off.
                     beam_power(frac)
                 } else if matches!(cfg.style, GlowStyle::Laser) {
                     // full-power light over the text.
@@ -385,7 +378,6 @@ impl CursorGlow {
                     ((s.pos - k) / 0.15).clamp(0.0, 1.0) * (1.0 - 0.35 * k)
                 }
             } else if matches!(cfg.style, GlowStyle::Beam) {
-                // with the same uniform envelope as the typing tube.
                 beam_power(frac)
             } else {
                 1.0 - frac
@@ -573,17 +565,12 @@ impl CursorGlow {
             return;
         }
 
-        // The laser aura's anchor: the head of the path (the bridge onto the
-        // caret, else the newest sample), taken before the bed splits the
-        // runs.
         let aura_head = bridge.map(|b| (b[1].x, b[1].y)).or_else(|| {
             self.comet_runs
                 .get(runs_len - 1)
                 .and_then(|r| r.last())
                 .map(|s| (s.x, s.y))
         });
-        // The dark bed: the swept runs lie under the letters as the style's
-        // bed, and the beam is drawn only over air (and onto the caret).
         let runs_len = if let Some(shape) = bed {
             #[cfg(test)]
             let heads = if self.heads_square { None } else { cur };
@@ -598,9 +585,6 @@ impl CursorGlow {
                 heads,
                 under,
             );
-            // The beam lights no jump: its leap is its ice tube
-            // ([`BedShape::leap_air`]), with no white-hot head over the air
-            // it crosses. The comet's head is its own.
             #[cfg(not(test))]
             let split = false;
             #[cfg(test)]
@@ -688,18 +672,6 @@ impl CursorGlow {
                 );
             }
             if matches!(cfg.style, GlowStyle::Laser) {
-                // The laser's wide aura is radial halos, never per-row quad
-                // slabs, which would posterize into bands and drop a detached
-                // quad below the cursor. One halo per swept sample (the bridge
-                // at its full punch, never the knee) in the pure beam hue, and
-                // only around the head: full within
-                // [`Self::LASER_AURA_FULL_CELLS`] of it, nothing by
-                // [`Self::LASER_AURA_REACH_CELLS`]. Along a whole leap's air
-                // the halos stood as a fat white-lilac slab over the prompt,
-                // and a lone air cell the leap crossed (the blank after a
-                // printed line) as a detached grey-violet block. Each halo's
-                // radii are held inside the effects box around its own
-                // centre, so on the last row it is not cut square.
                 #[cfg(not(test))]
                 let held = true;
                 #[cfg(test)]
@@ -734,30 +706,6 @@ impl CursorGlow {
             .admit_halos_masked(halos, aura_from, InkLedger::HEAD_FLOOR);
     }
 
-    /// The beam family on a light ground: each style's body as ink under the
-    /// letters (source-over into the under-ink stream through [`ribbon_beam`],
-    /// so glyphs keep full contrast on top), held inside the swept row so the
-    /// lines above and below stay clean. Each style keeps its own shape:
-    ///
-    /// * Comet: a wedge from a hairline tail to a full head at the caret,
-    ///   held inside the caret's cell, with a dense round nucleus where the
-    ///   caret meets the newest letter;
-    /// * Beam: an even tube around the letters, one colour with no darker
-    ///   core, fading as it powers down — never a line through them;
-    /// * Laser: a hard thin line in its own hue over a faint sheath (the
-    ///   bolts and sparks ink in their own emitters, and a crackle laid on
-    ///   top keeps the stack under the body cap's legibility);
-    /// * Phaser: the band of spectrum it sweeps through;
-    /// * Sparkle: the light twin of its dark ribbon, at the beam's quiet
-    ///   alpha, in the hue it rolls through;
-    /// * Lumen: a quiet tracer behind the caret (its glow is its crown,
-    ///   [`Self::emit_crown`]);
-    /// * Fire: no body here (fire is carried by its ink flames, meteors and
-    ///   embers).
-    ///
-    /// Every pass composites to at most [`LIGHT_BODY_ALPHA_CAP`] at any
-    /// pixel, in the light body's ink ([`LightGround::body_ink`]), solved so
-    /// that even opaque it keeps the theme's text at the bar over it.
     #[allow(
         clippy::too_many_arguments,
         reason = "clock, config, geometry, the caret, the runs and the stream"
@@ -869,8 +817,6 @@ impl CursorGlow {
             })
         };
         let (fg, bg) = (cfg.theme_fg, cfg.theme_bg);
-        // The caret's cell: a band whose head is not in it is one the hand
-        // has left (an Enter, a jump off the row).
         let caret = cur.map(|(r, c)| (i32::from(r), i32::from(c)));
         let mut band_run = std::mem::take(&mut self.light_band_run);
         let banded = |under: &mut Vec<GlowQuad>,
@@ -885,12 +831,6 @@ impl CursorGlow {
                 }
                 _ => None,
             };
-            // A band the hand has left melts out over its last letter to
-            // nothing at the letter's outer edge, over
-            // [`bed::DARK_BED_HEAD_FEATHER_CELLS`], as the dark bed does:
-            // while the caret stood there its body covered the end, and once
-            // it has gone the band stood cut square through the letter. The
-            // cell past it (the one the caret left) takes none of it.
             let run = match (tail, run.last()) {
                 (Some((_, dir)), Some(&head)) if caret.is_some_and(|c| c != cell_of(&head)) => {
                     let from = head.x + dir * cwf * (0.5 - bed::DARK_BED_HEAD_FEATHER_CELLS);
@@ -1143,7 +1083,6 @@ impl CursorGlow {
                     });
                 }
                 GlowStyle::Phaser => {
-                    // The spectrum band, each cell in the hue it was laid in.
                     banded(under, &mut verts, &mut band_run, run, &|s| {
                         (
                             0.0,
@@ -1154,9 +1093,6 @@ impl CursorGlow {
                     });
                 }
                 GlowStyle::Sparkle => {
-                    // The light twin of its 0.45-cell dark ribbon, at the
-                    // beam's quiet alpha, in its paper gold
-                    // ([`Self::sparkle_paper_gold_at`]).
                     #[cfg(not(test))]
                     let vivid = true;
                     #[cfg(test)]
@@ -1177,27 +1113,7 @@ impl CursorGlow {
         self.light_band_run = band_run;
     }
 
-    /// Per-pixel fire on a dark ground: each hot cell of the envelope emits
-    /// [`FirePatch`]es that both backends evaluate per device pixel through
-    /// the shared integer field, composited additively. The patches are cut
-    /// in narrow columns ([`Self::FIRE_SUBCOLS`] a cell) whose height is the
-    /// envelope smoothed across the cells ([`flame_heat`]), so a flame rises
-    /// and falls off along the line instead of standing as a one-cell slab
-    /// with square sides, and in short slices whose ceiling thins toward the
-    /// tips, so the light dies upward instead of ending in a flat lid. Over
-    /// a row the frame shows blank the ceiling is the air's, brighter than
-    /// the translucent tint a line of text keeps. Under a line of text (or a
-    /// row nobody read) the flame keeps to its own row instead: rooted under
-    /// the letters' baseline it rises beneath them in the same feathered
-    /// tongues, orange to yellow at their cores, and dies before the line
-    /// above, keeping the fire's own heat (a blaze stands taller and burns
-    /// hotter than a cold start), each letter it burns under held to
-    /// [`Self::FIRE_DARK_ROW_BAR`]
-    /// ([`Self::flame_dark_letter`]). The per-cell engulfment,
-    /// derived from the same envelope, feeds the contrast-halo strengths
-    /// (`halo_cells`), a colour-free legibility stream (ink is never
-    /// recoloured). On a light ground the fire is ink tongues beneath the
-    /// letters instead ([`Self::emit_flames_light`]).
+    /// Emit per-pixel fire patches for each hot cell of the envelope.
     #[allow(
         clippy::too_many_arguments,
         reason = "clock, config, geometry, the five streams the fire can land in and the over-ink account"
@@ -1222,7 +1138,6 @@ impl CursorGlow {
         let t = self.fire_t();
         let cov_cap = (22.0 + 12.0 * t).min(255.0);
         let mut cells: [(u16, u16, f32); 16] = [(0, 0, 0.0); 16];
-        // Whether a key's spark burns in each cell (not only a jump's).
         let mut typed_cell = [false; 16];
         let mut n_cells = 0usize;
         for s in self.sparks.iter().rev() {
@@ -1238,7 +1153,6 @@ impl CursorGlow {
             let age = now.saturating_duration_since(s.born).as_secs_f32();
             let u = (age / s.life).clamp(0.0, 1.0);
             let env = if s.typing && !cfg.dark_theme {
-                // caret.
                 if u < 0.30 {
                     1.0
                 } else {
@@ -1315,24 +1229,6 @@ impl CursorGlow {
             }
             seen_rows[n_rows] = row;
             n_rows += 1;
-            // Every row but the grid's first burns in tongues: a row of
-            // separate flames laid along the burning letters as the light
-            // ink-fire lays them ([`Self::FIRE_DARK_SPACING`] apart on the
-            // grid, each its own height and slow flicker), each a body of the
-            // shared field with a hot core of its own
-            // ([`Self::emit_flame_cores`]). A tongue whose cells above hold
-            // no ink (no letter, no coloured ground) roots on the burning
-            // row's top edge and stands in the air over it; one under ink
-            // (a line of text, a prompt's bar, a row nobody read) keeps to
-            // its own row: rooted under the letters' baseline it rises
-            // beneath them and dies before the row's top, each letter it
-            // burns under held to [`Self::FIRE_DARK_ROW_BAR`]
-            // ([`Self::flame_dark_letter`]) above the baseline, its root and
-            // core burning whole under a letter with no descender and in the
-            // blank cells between words. Chosen tongue by tongue, as the
-            // light fire's headroom is (`flame_light_headroom`), so a lone
-            // `40` at the far left of the row above holds only the tongues
-            // under it.
             let air = row > 0;
             let row_i = i32::from(row);
             let page = cfg.theme_bg & 0x00FF_FFFF;
@@ -1342,10 +1238,6 @@ impl CursorGlow {
             let rise_free = self.fire_rises_into_text;
             let inked_above =
                 |col: i32| air && !rise_free && self.flame_cell_inked(&text, page, row_i - 1, col);
-            // Only the keys' cells burn under ink: a jump over letters (a
-            // completion printing them) lays no flame under them, its meteor
-            // is its look, so `Length` stays the knob law's (unseen over
-            // text).
             let mut burning = [(0u16, 0u16, 0.0f32); 16];
             let mut n_burning = 0usize;
             for (c, &typed) in cells.iter().zip(&typed_cell).filter(|(c, _)| c.0 == row) {
@@ -1359,9 +1251,6 @@ impl CursorGlow {
                 continue;
             }
             if air {
-                // The letters behind the head, back along the way the run
-                // came, each raised to its rank's share of the head (a letter
-                // whose spark already died still burns while the head does).
                 let (head_col, head_strength) = (i32::from(burning[0].1), burning[0].2);
                 let back = if n_burning > 1 && i32::from(burning[1].1) > head_col {
                     1
@@ -1411,11 +1300,6 @@ impl CursorGlow {
             let (cmin, cmax) = on_row().fold((i32::MAX, i32::MIN), |(lo, hi), c| {
                 (lo.min(i32::from(c.1)), hi.max(i32::from(c.1)))
             });
-            // In the air a cool fire still stands a row tall with hot cores;
-            // kept in its row the tongues start at their own orange and the
-            // fire's heat carries them the rest of the way (a floor alone
-            // stood every heat below it at one colour), so a sustained blaze
-            // still reads hotter than a cold start there.
             let air_temp = (t.max(Self::FIRE_DARK_AIR_TEMP) * 255.0) as u8;
             #[cfg(test)]
             let strip = self.fire_kept_strip;
@@ -1433,11 +1317,6 @@ impl CursorGlow {
             } else {
                 air_cap
             };
-            // In the air the flame roots on the burning row's top edge and
-            // burns wholly above it, its foot fading in over
-            // [`Self::FIRE_DARK_AIR_FOOT`] of a row: a root inside the
-            // letters' ascender band stood a dim slab over them, and the
-            // ceiling easing down to it a dark seam above it.
             let row_top = oy + (row as f32 * ch) as i32;
             let kept_base = oy + (row as f32 * ch + ch * Self::FIRE_DARK_ROW_ROOT) as i32;
             let air_base = if air {
@@ -1459,10 +1338,6 @@ impl CursorGlow {
             } else {
                 DarkTongues::default()
             };
-            // Kept in its row, a blank cell between the burning letters (a
-            // word's gap) carries a tongue of its own on its axis, so its
-            // core burns there: the one place in a lettered row a whole
-            // core may stand over the baseline.
             if air {
                 for col in cmin..=cmax {
                     let u = col as f32 + 0.5;
@@ -1477,8 +1352,6 @@ impl CursorGlow {
                     {
                         continue;
                     }
-                    // Its heat eased up (a square root), so a gap a few
-                    // letters back still stands a core, not an ember.
                     let e = e.sqrt();
                     tongues.push(DarkTongue {
                         u,
@@ -1490,23 +1363,12 @@ impl CursorGlow {
                 }
             }
             let tongues = tongues.as_slice();
-            // The tallest tongue over column position `u` (cells): its rise
-            // in px, how far inside it `u` stands (1 on its axis, 0 at its
-            // side) and whether it keeps to its row. The grid's first row
-            // burns its smoothed heat as one field instead.
             let column = |u: f32| -> (f32, f32, bool) {
                 if !air {
                     return (air_rise * flame_heat(on_row(), u), 1.0, false);
                 }
                 let mut best = (0.0f32, 0.0f32, false);
                 for tg in tongues {
-                    // Kept in its row, a tongue is the field's own crest
-                    // over the row's smoothed heat (one continuous field
-                    // along the line, its pointed crests dying under the
-                    // row's top), easing off at the run's ends over a
-                    // footprint wide enough that neighbours overlap whole:
-                    // an envelope per tongue stepped the silhouette at every
-                    // sampling column there.
                     let reach = if tg.kept {
                         Self::FIRE_DARK_KEPT_REACH
                     } else {
@@ -1528,15 +1390,6 @@ impl CursorGlow {
                 best
             };
             let any_kept = tongues.iter().any(|tg| tg.kept);
-            // Under a held tongue, each cell's ceiling per heat level (the
-            // field's light at the heights that level spans,
-            // [`Self::FIRE_DARK_HELD_LEVELS`]): the air's over a blank cell,
-            // a letter's own hold over a letter, laid in the account for
-            // every later light over that letter; and under the baseline,
-            // the air's again wherever the letter has no descender. Solved
-            // against the light the field lays at each height, not its
-            // hottest anywhere, so the tongue's upper body keeps its orange
-            // and red over the letters instead of a dim brown.
             const LEVELS: usize = CursorGlow::FIRE_DARK_HELD_LEVELS;
             let mut held = [[0.0f32; Self::FIRE_DARK_HELD_CELLS]; LEVELS];
             let mut free_low = [false; Self::FIRE_DARK_HELD_CELLS];
@@ -1568,14 +1421,8 @@ impl CursorGlow {
                 }
                 free_low[i] = self.flame_cell_glyph(&text, row_i, col).free_below();
             }
-            // The heat levels a kept slice burnt at over the letter band, for
-            // the account below.
             let used_levels = std::cell::Cell::new(0u32);
             let ease = Self::FIRE_DARK_ROW_EASE;
-            // The ceiling at column position `u` (cells), in the band over
-            // the baseline or under it (`low`), at heat level `level`: each
-            // held cell's own over its width, easing off to the air's over
-            // `ease` cells around it (a cell past the table holds nothing).
             let held_at = |u: f32, low: bool, level: usize| -> f32 {
                 let table = &held[level.min(LEVELS - 1)][..span];
                 if !low {
@@ -1598,25 +1445,17 @@ impl CursorGlow {
                 }
                 cap
             };
-            // Where the band under the baseline begins, window y.
             let low_top = row_top as f32 + ch * Self::FIRE_DARK_LOW_BAND;
             let row_foot = (ch * Self::FIRE_DARK_ROW_FOOT).max(4.0);
             let row_fade = (ch * Self::FIRE_DARK_ROW_TOP_FADE).max(1.0);
             for col in (cmin - 1).max(0)..=(cmax + 1).min(geom.cols as i32 - 1) {
                 for k in 0..sub {
                     let u = col as f32 + (k as f32 + 0.5) / sub as f32;
-                    // Height ramps quadratically in the eased temperature: a
-                    // lone peck is a sixth-of-a-cell lick, sustained key-repeat
-                    // cadence (inter-key ≤ HEAT_GAP_FULL) builds toward a
-                    // ~6-cell wall. cov_cap keeps even the wall translucent
-                    // over text.
                     let (rise_px, side, kept) = column(u);
                     if rise_px < 1.5 {
                         continue;
                     }
                     let base_y = if kept { kept_base } else { air_base };
-                    // A tongue's foot curls up from its sides, so the line
-                    // of feet is scalloped rather than one flat base.
                     #[cfg(not(test))]
                     let curl = Self::FIRE_DARK_FOOT_CURL;
                     #[cfg(test)]
@@ -1625,17 +1464,9 @@ impl CursorGlow {
                     } else {
                         Self::FIRE_DARK_FOOT_CURL
                     };
-                    // Kept in its row the field is one along the line, its
-                    // root one line fading in over the root's foot: a curl
-                    // there would shift the field column by column.
                     let curl = if kept { 0.0 } else { curl };
                     let base_y = base_y - (ch * curl * (1.0 - side)) as i32;
                     let scallop = if air { smooth(side / 0.5) } else { 1.0 };
-                    // Rise ceiling: the grid top relaxed by the head band — at
-                    // head 0 this is the grid top exactly (the historical clamp).
-                    // Kept in its row, the field's crests stand to the
-                    // row's top, where the ceiling fades them: cut at the
-                    // envelope, every crest over it stood flat.
                     let top_y = if kept && !strip {
                         row_top
                     } else if kept {
@@ -1653,20 +1484,11 @@ impl CursorGlow {
                         continue;
                     }
                     let strength = flame_heat(on_row(), u);
-                    // The flame ends at its root: the field's root lift fades
-                    // it in over a few pixels inside the burning row's
-                    // ascender band, so no unlit line stands between the
-                    // letters and the flame (a mirrored skirt below the root
-                    // left one at the root itself).
                     let flame_end = base_y.min(geom.fx_bot());
                     let (ca, cb) = ((x0 - ox).div_euclid(cwi), (x1 - 1 - ox).div_euclid(cwi));
                     let on_text =
                         |b: i32| b >= 0 && (text.over_text(b, ca) || text.over_text(b, cb));
                     let u_mid = ((x0 + x1) as f32 * 0.5 - ox as f32) / cwi as f32;
-                    // The field's tongue stands taller than the patch lets it
-                    // show (its lower, hotter part): kept in its row by
-                    // [`Self::FIRE_DARK_ROW_FIELD_REACH`], in the air by
-                    // [`Self::FIRE_DARK_AIR_FIELD_REACH`].
                     let peak_h = (rise_px
                         * if kept && strip {
                             4.0
@@ -1685,8 +1507,6 @@ impl CursorGlow {
                     } else {
                         (t * 255.0) as u8
                     };
-                    // The field this column burns, as far as its light at a
-                    // height goes ([`aterm_render::fire_field::fire_add_index_at`]).
                     let field = aterm_render::fire_field::FireFieldParams {
                         base_y,
                         peak_h: i32::from(peak_h),
@@ -1698,14 +1518,7 @@ impl CursorGlow {
                         cell_h: chi,
                         top_fade_y: oy,
                     };
-                    // The slice ceiling at window y `mid` of band `band`: the
-                    // text's tint over a line of text, the air's over a blank
-                    // row, eased between them over a shoulder.
                     let ceiling_at = |band: i32, mid: f32| {
-                        // Kept in its row: the cell's hold at the field's
-                        // heat there (the air's under the baseline of a
-                        // letter with no descender), fading in from the root
-                        // and out to nothing under the row's top.
                         if kept {
                             let py = mid.floor() as i32;
                             let idx = (py - 1..=py + 1)
@@ -1719,10 +1532,6 @@ impl CursorGlow {
                                 idx
                             };
                             let level = flame_level_of(idx);
-                            // Under the baseline the air's ceiling eases in
-                            // from the letter's over the band's upper half,
-                            // as the root fades out under it: one soft glow
-                            // under the line, never a hot line along it.
                             let over = held_at(u_mid, false, level);
                             let low = if mid >= low_top {
                                 let under = held_at(u_mid, true, level);
@@ -1738,8 +1547,6 @@ impl CursorGlow {
                                 * smooth((base_y as f32 - mid) / row_foot)
                                 * smooth((mid - row_top as f32) / row_fade);
                         }
-                        // In the air the foot fades in from nothing at the
-                        // root (the burning row's top edge).
                         let foot_in = if air {
                             smooth((base_y as f32 - mid) / foot)
                         } else {
@@ -1800,8 +1607,6 @@ impl CursorGlow {
                                 temp: row_temp,
                                 strength: 255,
                                 lean: lean_q,
-                                // Kept in its row, the falloff under the row's
-                                // top is the tip's.
                                 cov_cap: (ceiling
                                     * if kept { 1.0 } else { flame_tip_fade(rise) }
                                     * scallop) as u8,
@@ -1825,11 +1630,6 @@ impl CursorGlow {
                     }
                 }
             }
-            // The account: under each letter it held, the brightest light
-            // (by luminance) the kept flame laid at the heat levels it burnt
-            // at over the letter band. Each is held to the same bar, so any
-            // one stands for them; a per-channel union of them would be a
-            // light no pixel carries, brighter than the bar.
             let used = used_levels.get();
             if used != 0 {
                 let luma = crate::color_math::relative_luminance_table();
@@ -1857,7 +1657,6 @@ impl CursorGlow {
                     }
                 }
             }
-            // Each tongue's hot core, beneath the ink.
             #[cfg(not(test))]
             let cores = air;
             #[cfg(test)]
@@ -1882,7 +1681,6 @@ impl CursorGlow {
             if strength == 0 {
                 continue;
             }
-            // A cell the frame shows blank has no stroke to ring.
             match self.frame_text.pair(i32::from(er), i32::from(ec)) {
                 Some((None, _)) => continue,
                 Some((Some(ink), ground))
@@ -1902,15 +1700,6 @@ impl CursorGlow {
         halo_cells.sort_unstable_by_key(|c| (c.row, c.col));
     }
 
-    /// The letter a dark flame kept in its row burns under at cell
-    /// `(row, col)`, as its hold is solved ([`flame_dark_letter_cap`]): `None`
-    /// over air; under a letter (the probe's lines and the frame's cells,
-    /// [`TextView`], and every cell of a row nobody read), the ink and the
-    /// ground its cell is drawn in (the theme's pair where the frame did not
-    /// hand them over), and the light the account already laid over it
-    /// ([`InkLedger::laid_peak`]). Each heat level's ceiling over it is the
-    /// coverage of that level's light at which it keeps
-    /// [`Self::FIRE_DARK_ROW_BAR`], or what it keeps on its own if less.
     fn flame_dark_letter(
         &self,
         cfg: &GlowConfig,
@@ -1936,10 +1725,7 @@ impl CursorGlow {
         Some((ink, ground, lift))
     }
 
-    /// Whether cell `(row, col)` holds ink a dark tongue may not rise into:
-    /// a letter (or a blank between a line's letters), a ground other than
-    /// the page `page` (a prompt's bar, a selection), or a row the frame did
-    /// not read. Above the grid there is none.
+    /// Whether cell `(row, col)` holds ink a dark tongue may not rise into.
     pub(super) fn flame_cell_inked(
         &self,
         text: &TextView<'_>,
@@ -1958,11 +1744,7 @@ impl CursorGlow {
             .is_some_and(|(ink, ground)| ink.is_some() || !reads_as_page(ground, page))
     }
 
-    /// What stands in cell `(row, col)` of a burning row for the dark
-    /// flame's root: a blank (off the line, a space, a glyph-less cell) or a
-    /// letter, which descends under the baseline unless the host's probe of
-    /// the row names a glyph that does not ([`DESCENDER_GLYPHS`]; a wide
-    /// glyph fills its box). A cell nobody named is a descending letter.
+    /// What stands in cell `(row, col)` of a burning row for the dark flame's root.
     pub(super) fn flame_cell_glyph(&self, text: &TextView<'_>, row: i32, col: i32) -> FlameGlyph {
         if text.knows_row(row) && !text.covers_cell(row, col) {
             return FlameGlyph::Blank;
@@ -1993,15 +1775,6 @@ impl CursorGlow {
         }
     }
 
-    /// The dark flame's tongues over a burning row's `burning` cells (`cmin
-    /// ..= cmax`): laid as the light ink-fire lays its own, anchored to the
-    /// grid [`Self::FIRE_DARK_SPACING`] apart and jittered by their own hash
-    /// (a growing run adds tongues and never slides the old ones), each
-    /// riding the row's smoothed heat, a little shorter or taller by its
-    /// hash and flickering slowly in height on its own rate and phase (under
-    /// the flash bound at full heat, [`Self::TONGUE_FLICKER_SPREAD`]). A
-    /// tongue any of whose cells above
-    /// `inked_above` names keeps to its row.
     fn dark_tongues(
         &self,
         burning: &[(u16, u16, f32)],
@@ -2042,20 +1815,6 @@ impl CursorGlow {
         out
     }
 
-    /// THE DARK FLAME'S CORES: each tongue's hot heart, additive light
-    /// beneath the ink (the under-ink stream, which the renderer adds before
-    /// the field over the same pixels): a teardrop narrower than the tongue
-    /// and [`Self::FIRE_DARK_CORE_REACH`] of its height, pale yellow at its
-    /// root going gold, amber and orange as it climbs ([`flame_core_ramp`])
-    /// and dying before the tip, feathered at its sides, leaning back with
-    /// the field. Neighbouring cores are one union, never summed into a
-    /// seam. A tongue kept in its row burns its core only where no letter's
-    /// stroke stands: over the blank cells of its row, and under the
-    /// baseline ([`Self::FIRE_DARK_LOW_BAND`]) of a letter with no descender
-    /// ([`Self::flame_cell_glyph`]), eased across cell edges and a few pixels
-    /// clear of the baseline, so every letter it burns beside keeps its
-    /// strokes on the dark (a glowing ember bed under the line, tongues
-    /// licking up between the words).
     #[allow(
         clippy::too_many_arguments,
         reason = "geometry, the text, the row's tongues, their roots and rises, the heat and the stream"
@@ -2078,10 +1837,6 @@ impl CursorGlow {
             let k = k.clamp(0.0, 1.0);
             k * k * (3.0 - 2.0 * k)
         };
-        // A kept core's ceiling at window `(x, y)`: whole over a blank cell
-        // and under a letter's baseline when it has no descender, nothing
-        // over a letter's strokes; eased across a third of a cell and a few
-        // pixels up.
         let cap_cell = |x: f32, y: f32| -> f32 {
             let c = ((x - oxf) / cwf).floor() as i32;
             match self.flame_cell_glyph(text, row_i, c) {
@@ -2106,7 +1861,6 @@ impl CursorGlow {
         let knot = Self::FIRE_LIGHT_KNOT_PX;
         let slab = Self::FIRE_LIGHT_SLAB_PX;
         for kept in [false, true] {
-            // This pass's cores: (centre x, half-width, height, peak, root).
             let mut cores = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_CORES];
             let mut n = 0usize;
             let base = if kept { kept_base } else { air_base } as f32;
@@ -2115,12 +1869,6 @@ impl CursorGlow {
             } else {
                 Self::FIRE_DARK_CORE_ROOT_PX
             };
-            // A kept core stands its teardrop on a foot as tall as its root
-            // fade: the band under the baseline it burns in is about that
-            // tall, so a teardrop rising from the root itself spent the
-            // whole band fading in and climbing, and its bed burnt amber at
-            // little over half its light, never the gold heart the air's
-            // cores keep.
             #[cfg(test)]
             let foot = if kept && !self.fire_kept_core_from_base {
                 root_px
@@ -2177,20 +1925,15 @@ impl CursorGlow {
                 }
                 let h = slab.min(base - y);
                 let ym = y + 0.5 * h;
-                // The union of the cores at `x` on this slab: the strongest,
-                // in its own colour.
                 let at = |x: f32| -> (u32, u32) {
                     let mut best = (0.0f32, 0.0f32);
                     for &(xc, half, th, peak) in cores {
-                        // How far up its teardrop: 0 over its foot.
                         let rise = (base - foot - ym) / th;
                         if rise >= 1.0 || ym >= base {
                             continue;
                         }
                         let rise = rise.max(0.0);
                         let xc = xc + lean * rise * rise;
-                        // A teardrop: a little narrower at the root, widest
-                        // a fifth of the way up, tapering to a point.
                         let k = (rise / 0.2).clamp(0.0, 1.0);
                         let hw =
                             half * (0.62 + 0.38 * k * k * (3.0 - 2.0 * k)) * (1.0 - rise).powf(0.7);
@@ -2204,8 +1947,6 @@ impl CursorGlow {
                         let root_in = smooth((base - ym) / root_px);
                         let cov = peak * (1.0 - d * d).powf(1.6) * root_in * (1.0 - rise).powf(0.8);
                         if cov > best.0 {
-                            // Toward its feathered sides and its foot the
-                            // core burns as cool as it is high or cooler.
                             #[cfg(test)]
                             let rise = if self.fire_core_uncooled {
                                 rise
@@ -2219,8 +1960,6 @@ impl CursorGlow {
                     }
                     let cov = if kept { best.0 * cap_at(x, ym) } else { best.0 };
                     let cov = cov.min(255.0);
-                    // Thin light burns amber at the warmest: a dim yellow
-                    // over the dark reads olive, a dim amber an ember.
                     #[cfg(test)]
                     let yellow_cov = if kept && !self.fire_kept_core_from_base {
                         Self::FIRE_DARK_KEPT_CORE_YELLOW_COV
@@ -2246,7 +1985,6 @@ impl CursorGlow {
                     let (a1, c1) = here;
                     if a0 > 0 || a1 > 0 {
                         let (xi0, xi1) = (x0.round() as i32, x.round() as i32);
-                        // A ramp to nothing ends in the colour it ramps from.
                         let (c0, c1) = (if a0 > 0 { c0 } else { c1 }, if a1 > 0 { c1 } else { c0 });
                         crate::effect_util::push_fx_ramp(
                             under,
@@ -2266,21 +2004,6 @@ impl CursorGlow {
         }
     }
 
-    /// THE INK-FIRE ON A LIGHT GROUND: additive light cannot show on paper,
-    /// so the fire is ink beneath the letters, source-over in the under-ink
-    /// stream: a row of separate tongues rising from the burning cells' own
-    /// row, each rooted at the foot of the letters' x-height in a warm
-    /// orange and standing up out of the line, going amber and yellow as it
-    /// climbs and melting to nothing at its tip, feathered at its sides,
-    /// leaning back against the typing and flickering slowly in height. The
-    /// row's heat is smoothed across its cells ([`flame_kernel`]), so the
-    /// flames rise and fall off along the line with no square end. A
-    /// temperature makes them taller, never more than about three rows.
-    /// Over every letter they reach the paint is held to the
-    /// opacity at which that letter keeps 4.5:1 (or its own contrast, if
-    /// less) in the colours its cell is drawn in ([`Self::flame_light_cap`]),
-    /// eased across cell edges so a held letter is a soft thinning, never a
-    /// box.
     fn emit_flames_light(
         &self,
         cfg: &GlowConfig,
@@ -2524,7 +2247,6 @@ impl CursorGlow {
     ) -> f32 {
         let (fg, bg) = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
         if (text.knows_row(row) && !text.covers_cell(row, col)) || self.light_body_unsolved() {
-            // Air; or a test's control, every ceiling off.
             return Self::FIRE_LIGHT_ALPHA;
         }
         let table = crate::color_math::relative_luminance_table();
@@ -2606,7 +2328,7 @@ impl CursorGlow {
         }
     }
 
-    /// Emit water's own fluid wake (not the shared straight comet): live path samples form a curved two-layer wave, a dim deep-blue undertow under a thin cyan crest.
+    /// Emit water's own fluid wake (not the shared straight comet).
     pub(super) fn emit_water(
         &mut self,
         now: Instant,
@@ -2822,7 +2544,7 @@ impl CursorGlow {
         out.truncate(Self::MAX_QUADS);
     }
 
-    /// The water's crest colour at path position `pos` (tail 0, head 1) and heat `heat`: a clear cyan, deeper toward the tail (a slate at the ramp's middle read as dull grey water).
+    /// The water's crest colour at path position `pos` (tail 0, head 1) and heat `heat`.
     #[inline]
     pub(super) fn water_crest_color(pos: f32, heat: f32) -> u32 {
         water_ramp(0.66 + 0.24 * pos + 0.10 * heat)
@@ -2841,7 +2563,7 @@ impl CursorGlow {
         start
     }
 
-    /// One run's surface as a curve into `curve` (cleared first): along one row, the swell itself between each two samples ([`Self::WATER_KNOTS`] knots a cell, phase and height eased between theirs), so its crests are rounded, never a chord's corner; across rows (a leap), the straight line from its first sample to its last, so the cells' stair draws no zigzag through the lines it crosses.
+    /// One run's surface as a curve into `curve` (cleared first).
     pub(super) fn water_curve(run: &[WaterSample], curve: &mut Vec<BeamVertex>) {
         curve.clear();
         let (Some(first), Some(last)) = (run.first(), run.last()) else {
@@ -2955,7 +2677,7 @@ impl CursorGlow {
         out.truncate(Self::MAX_QUADS);
     }
 
-    /// Emit the fire meteors: one straight anti-aliased streak per jump vector (white-hot head at the landing, orange core, deep-red tail fringe) whose tail retracts into the landing.
+    /// Emit the fire meteors as one straight anti-aliased streak per jump vector.
     pub(super) fn emit_fire_meteors(
         &self,
         now: Instant,
@@ -3036,19 +2758,8 @@ impl CursorGlow {
                 out.truncate(Self::MAX_QUADS);
                 return;
             }
-            // Hot tapered core: three chained segments, slim red tail, orange
-            // mid, thick near-white head wedge striking the landing. The
-            // wedge feathers out over its last [`Self::FIRE_METEOR_FEATHER`]
-            // of a cell into the landing: drawn whole to its end, it stood
-            // there as a hard vertical tick beside the caret.
             let len = (dx * dx + dy * dy).sqrt();
             let feather = (Self::FIRE_METEOR_FEATHER * geom.cw as f32 / len).min(0.15);
-            // Each join between two pieces lands on a whole pixel of the
-            // streak's major axis, so the one piece's slabs end where the
-            // next one's begin: two separate beams sharing a column add
-            // twice there, a bright tick across the streak at every join
-            // (and one stopped a pixel short left a dark one where the join
-            // fell on a whole pixel).
             let snap_joins = true;
             #[cfg(test)]
             let (snap_joins, feather) = if self.fire_meteor_joined {
@@ -3067,13 +2778,6 @@ impl CursorGlow {
                 }
                 (((m0 + dm * t).round() - m0) / dm).clamp(0.0, 1.0)
             };
-            // Each piece takes up where the last one ended (its colour and
-            // coverage) and eases its width, colour and coverage up from
-            // there over its whole length in steps of about two pixels, and
-            // the white head's wedge eases in over at least
-            // [`Self::FIRE_METEOR_HEAD_EASE`] of a cell: a piece that began
-            // at its own colour and width stood a hard shoulder across the
-            // streak where the head began, a tick in the Return's root.
             let head_from = if snap_joins {
                 (1.0 - feather - Self::FIRE_METEOR_HEAD_EASE * geom.cw as f32 / len)
                     .clamp(SEG[1].0 + 0.05, SEG[2].0)
@@ -3138,12 +2842,12 @@ impl CursorGlow {
         }
     }
 
-    /// Polyline scratch lent to v2 ([`rk::Frame::beams`]): the meteor's 96 stations and the ring's polyline, with room to spare.
+    /// Polyline scratch lent to v2 ([`rk::Frame::beams`]).
     pub(super) const V2_BEAM_SCRATCH: usize = 512;
-    /// The cue sink v2 is lent ([`rk::Frame::cues`]): far above the handful a landing frame mints (the meteor, five rain glints, the key's own).
+    /// The cue sink v2 is lent ([`rk::Frame::cues`]).
     pub(super) const V2_CUE_SCRATCH: usize = 64;
 
-    /// Size the three pixel streams to their caps once (see the emit arm of seam point 3): [`Self::MAX_QUADS`] for `under` and `out`, [`Self::MAX_HALOS`] for `halos`.
+    /// Size the three pixel streams to their caps once (see the emit arm of seam point 3).
     #[inline]
     pub(super) fn reserve_v2_scratch(
         under: &mut Vec<GlowQuad>,
@@ -3180,7 +2884,6 @@ impl CursorGlow {
         halos: &mut Vec<RainHalo>,
         under: &mut Vec<GlowQuad>,
     ) {
-        // whatever radius a config carries.
         if cfg.radius <= 0.0
             || !cfg
                 .style
@@ -3288,9 +2991,6 @@ impl CursorGlow {
         if peak >= 1.0 {
             let from = halos.len();
             let (core_rx, core_ry) = (cw as f32 * 1.25 * size, ch as f32 * 0.85 * size);
-            // The laser's head light (with its aura) is held inside the
-            // effects box on the last row, as the aura is, so the impact
-            // flash is not cut square by the grid's bottom edge.
             let laser = matches!(cfg.style, GlowStyle::Laser);
             let (core_rx, core_ry) = if laser {
                 hold_glow_radii_in_box(geom, (ccx, ccy), (core_rx, core_ry))
@@ -3306,8 +3006,6 @@ impl CursorGlow {
                 core_ry,
                 premul_rgb(color, peak as u8),
             );
-            // Laser: a tight hot heart over the landing cell in the beam hue,
-            // riding the blaze-boosted peak, as the impact flash.
             if laser {
                 let (rx, ry) = hold_glow_radii_in_box(
                     geom,
@@ -3329,7 +3027,7 @@ impl CursorGlow {
         }
     }
 
-    /// The forge dressing on the cursor cell (fire only): molten core, hot top rim and edge-ember crawl, all riding `cursor_temp`.
+    /// The forge dressing on the cursor cell (fire only).
     pub(super) fn emit_forge_cursor(
         &mut self,
         cfg: &GlowConfig,
@@ -3467,15 +3165,6 @@ impl CursorGlow {
             self.emit_ring_light(cfg, geom, cur, ring, t, cov, color, out, halos);
             return;
         }
-        // Fire: the impact is a brief round flash, white-hot cooling to
-        // ember as it spreads to [`Self::FIRE_DARK_LANDING_REACH`] of a row
-        // and dies by the square of its life, with no aftershock: a bloom
-        // that spread to three cells and an aftershock behind it stood as a
-        // flat orange disc where the caret had landed, still there after a
-        // clear took the line away.
-        // Every round bloom below is fitted inside the effects box, so a
-        // landing at the grid's edge fades out before it instead of standing
-        // cut by it ([`fit_glow_in_box`]).
         let bloom = |halos: &mut Vec<RainHalo>, radii: (f32, f32), premul: u32| {
             let ((cx, cy), (rx, ry)) = fit_glow_in_box(geom, (ring.cx, ring.cy), radii);
             push_halo(halos, geom, cx, cy, rx, ry, premul);
@@ -3518,13 +3207,9 @@ impl CursorGlow {
         );
     }
 
-    /// How far a dark fire's landing flash spreads at the end of its life,
-    /// in rows ([`Self::emit_ring`]).
+    /// How far a dark fire's landing flash spreads at the end of its life, in rows.
     pub(super) const FIRE_DARK_LANDING_REACH: f32 = 1.0;
 
-    /// The dark ring's bloom peak as a share of the ring's coverage: a
-    /// filled bloom carries far more light than the 2 px outline it replaced
-    /// at the same coverage.
     const DARK_RING_SHARE: f32 = 0.45;
 
     #[allow(
@@ -3587,20 +3272,6 @@ impl CursorGlow {
         } else {
             ((cov as u32) * 3 / 4).clamp(1, 160) as u8
         };
-        // THE VEIL STAYS IN THE CARET'S CELL AND ROW, and keeps the text it
-        // lies under at the bar (2026-10-22: after an Enter at the bottom row
-        // the veil, carried up with the scrolled text, stood as a cloud five
-        // to eight cells wide and two and a half rows tall over the lines just
-        // printed above the caret, on GitHub Light and Default Light alike).
-        // It sits on the caret's cell, reaches along the row no further than
-        // [`Self::LIGHT_VEIL_REACH_CELLS`] and never past the row's edges,
-        // and its centre's opacity is held to what leaves the theme's text
-        // [`Self::LIGHT_VEIL_BAR`] over it. A frame whose caret the host
-        // withholds (a hidden caret: `cur` is `None`) keeps it on the last
-        // caret the ring saw ([`Ring::caret`]): bound only while `cur` was
-        // there, one such frame stood the old cloud over the scrolled
-        // landing, a flash over the line just printed. With no caret known
-        // there is no veil.
         #[cfg(not(test))]
         let unbound = false;
         #[cfg(test)]
@@ -3623,22 +3294,17 @@ impl CursorGlow {
             _ if unbound => ((ring.cx, ring.cy), (grow, grow * 0.85), cap),
             _ => return,
         };
-        // A veil falling off from its centre: one capped veil is a flat
-        // disc that reads on paper as a stain.
         push_soft_veil(halos, geom, centre, radii, veil, cap);
     }
 
-    /// The most opacity a light landing veil in `veil` may lay at its centre
-    /// and leave the theme's text `fg` [`Self::LIGHT_VEIL_BAR`] over it on
-    /// the page `bg` (a theme whose own text reads under the bar keeps all
-    /// it has: no veil).
+    /// Maximum centre opacity for a light landing veil in `veil` over `fg` and `bg`.
     pub(crate) fn light_veil_cap(veil: u32, fg: u32, bg: u32) -> u8 {
         let own = crate::color_math::contrast_ratio(fg & 0x00FF_FFFF, bg & 0x00FF_FFFF);
         let keep = (Self::LIGHT_VEIL_BAR / own.max(1.0)).min(1.0);
         light_alpha_keeping(veil, fg, bg, keep).clamp(0.0, 255.0) as u8
     }
 
-    /// A light landing veil's ink for `rgb`: its hue (a gold or yellow bent to amber) at its own saturation (raised to [`Self::LIGHT_VEIL_SAT`] at least, so a pale colour still tints), at full value, darkened only as far as the vivid ink's luma ([`LIGHT_INK_BOLD_MAX_LUMA`]): a colour, never the grey (or the olive) a darker ink thins to.
+    /// A light landing veil's ink for `rgb`.
     pub(super) fn light_veil_ink(rgb: u32) -> u32 {
         let (h, s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
         let h = if (30.0..80.0).contains(&h) {
@@ -3830,13 +3496,10 @@ impl CursorGlow {
                     let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
                     if scov > 0 {
                         let tint = if p.hue < 0.45 {
-                            // Distinct branch.
                             0x00FF_FFFF
                         } else if p.hue < 0.85 {
-                            // Distinct branch.
                             0x00CF_ECFF
                         } else {
-                            // Distinct branch.
                             0x00A9_8BFF
                         };
                         if !star_accent((p.hue * 4096.0) as u32) {
@@ -4078,7 +3741,6 @@ impl CursorGlow {
                             continue;
                         }
                         6 => {
-                            // words, so it keeps off the text on a dark ground too.
                             if over_text {
                                 continue;
                             }
@@ -4206,7 +3868,7 @@ impl CursorGlow {
         ground
     }
 
-    /// Whether a test asked for the light bodies' inks and ceilings unsolved ([`Self::light_ground`]); never in a build.
+    /// Whether a test asked for the light bodies' inks and ceilings unsolved.
     #[cfg(test)]
     pub(super) const fn light_body_unsolved(&self) -> bool {
         self.light_body_unsolved
@@ -4217,7 +3879,7 @@ impl CursorGlow {
         false
     }
 
-    /// Whether the dark bed is laid at each stop's full value rather than solved to the bar: never in a build, and only when a test asks (the bed's bar test's negative control).
+    /// Whether the dark bed is laid at each stop's full value rather than solved to the bar.
     #[cfg(test)]
     pub(super) const fn bed_unsolved(&self) -> bool {
         self.bed_unsolved
@@ -4228,7 +3890,7 @@ impl CursorGlow {
         false
     }
 
-    /// Whether the frame keeps its dark bed but no over-ink account: never in a build, and only when a test asks (the account's negative control).
+    /// Whether the frame keeps its dark bed but no over-ink account.
     #[cfg(test)]
     pub(super) const fn over_ink_idle(&self) -> bool {
         self.over_ink_idle
@@ -4239,7 +3901,7 @@ impl CursorGlow {
         false
     }
 
-    /// Whether the dark streak skips its over-ink budget (and fire its over-ink ledger and its steam's stacking budget): never in a build, and only when a test asks (the contrast tests' negative control).
+    /// Whether the dark streak skips its over-ink budget in tests.
     #[cfg(test)]
     pub(super) const fn streak_unbudgeted(&self) -> bool {
         self.streak_unbudgeted
@@ -4280,7 +3942,6 @@ impl CursorGlow {
 
     /// The comet colour at path position `pos` (0 tail .. 1 head) for the style.
     pub(super) fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
-        // only its grains are dealt from the wheel.
         if matches!(cfg.style, GlowStyle::Sparkle) {
             return Self::sparkle_gold_at(cfg, pos);
         }
@@ -4301,20 +3962,18 @@ impl CursorGlow {
         base
     }
 
-    /// Sparkle's gold on a dark ground: its configured colour (starlight gold by default) at a warm gold's chroma, so the comet reads gold, not cream.
+    /// Sparkle's gold on a dark ground at warm gold chroma.
     #[inline]
     pub(super) const fn sparkle_gold(cfg: &GlowConfig) -> u32 {
         crate::spectrum::spectrum_with_min_saturation(cfg.color & 0x00FF_FFFF, 0.72)
     }
 
-    /// Sparkle's gold along its tail, `pos` 0 (tail) to 1 (head): its gold at the head, a shade deeper at the tail, never leaving the gold family (a warmer tail fading over the dark read as rust and brown).
+    /// Sparkle's gold along its tail, `pos` 0 (tail) to 1 (head).
     #[inline]
     pub(super) fn sparkle_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
         Self::shade_gold_to_tail(Self::sparkle_gold(cfg), pos)
     }
 
-    /// `gold` at `pos` along a sparkle tail, 0 (tail) to 1 (head): itself
-    /// at the head, a shade deeper and warmer toward the tail.
     #[inline]
     fn shade_gold_to_tail(gold: u32, pos: f32) -> u32 {
         let (h, s, v) = crate::color_math::rgb2hsv(gold);
@@ -4323,15 +3982,7 @@ impl CursorGlow {
         crate::color_math::hsv2rgb(h - 4.0 * k, (s + 0.05 * k).min(1.0), v * (1.0 - 0.08 * k))
     }
 
-    /// Sparkle's body gold on paper at `pos`, shaded toward the tail as
-    /// [`Self::sparkle_gold_at`] is: the gold its paper beads are cored with
-    /// ([`Self::SPARKLE_PAPER_CORE`]) for the automatic colour, a pinned
-    /// colour's own sparkle gold otherwise. It is laid as itself, walked
-    /// toward white only as far as the text over it asks
-    /// ([`LightGround::vivid_body_ink`]): the one-weight vivid ink every
-    /// sweeping body takes put this one gold at a burnt orange-brown, and
-    /// under the letters at the body's alpha it read as a muddy caramel
-    /// smear.
+    /// Sparkle's body gold on paper at `pos`, shaded toward the tail.
     #[inline]
     pub(crate) fn sparkle_paper_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
         let gold = if cfg.color & 0x00FF_FFFF == SPARKLE_DEFAULT_COLOR {
@@ -4342,20 +3993,14 @@ impl CursorGlow {
         Self::shade_gold_to_tail(gold, pos)
     }
 
-    /// A sparkle mark's opacity on paper for a dark coverage request: a
-    /// fresh mark is all but opaque (it is never laid over the text, so it
-    /// needs no may-touch-text ceiling), and a fading one thins with it.
+    /// A sparkle mark's opacity on paper for a dark coverage request.
     #[inline]
     pub(super) const fn paper_gold_alpha(cov: u8) -> u8 {
         (cov as f32 * 1.25).min(240.0) as u8
     }
 }
 
-/// Whether a cell's ground `ground` reads as the page `page` rather than a
-/// surface of its own (a prompt's bar, a selection, a panel): within
-/// [`SURFACE_CONTRAST`] of it in luminance and [`SURFACE_CHANNEL`] in every
-/// channel. A ground that close is the page to the eye, so a light rising
-/// over it reads as rising over the page.
+/// Whether a cell's ground `ground` reads as the page `page` rather than a surface of its own.
 pub(super) fn reads_as_page(ground: u32, page: u32) -> bool {
     let (g, p) = (ground & 0x00FF_FFFF, page & 0x00FF_FFFF);
     if g == p {
@@ -4367,19 +4012,13 @@ pub(super) fn reads_as_page(ground: u32, page: u32) -> bool {
     near && crate::color_math::contrast_ratio(g, p) < SURFACE_CONTRAST
 }
 
-/// See [`reads_as_page`].
 const SURFACE_CONTRAST: f32 = 1.2;
-/// See [`reads_as_page`].
 const SURFACE_CHANNEL: u32 = 32;
 
-/// The ASCII glyphs whose ink reaches under the baseline (with the round and
-/// square brackets, the bar and the signs a font draws long): a light laid
-/// under a letter's baseline keeps off these (a comet's low glint, the dark
-/// flame's root).
+/// The ASCII glyphs whose ink reaches under the baseline.
 pub(super) const DESCENDER_GLYPHS: &str = "gjpqyQ,;_|()[]{}@$";
 
-/// What stands in a burning row's cell for the dark flame's root
-/// ([`CursorGlow::flame_cell_glyph`]).
+/// What stands in a burning row's cell for the dark flame's root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FlameGlyph {
     /// No glyph: the flame burns whole there.
@@ -4396,9 +4035,7 @@ impl FlameGlyph {
     }
 }
 
-/// One dark tongue ([`CursorGlow::dark_tongues`]): its axis and half-width
-/// in cells, its size (a share of the row's rise), the heat under it and
-/// whether it keeps to its row.
+/// One dark tongue ([`CursorGlow::dark_tongues`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct DarkTongue {
     pub(super) u: f32,
@@ -4430,7 +4067,6 @@ impl DarkTongues {
         &self.buf[..self.n]
     }
 
-    /// Add `tongue` while there is room.
     #[inline]
     fn push(&mut self, tongue: DarkTongue) {
         if self.n < self.buf.len() {
@@ -4440,8 +4076,6 @@ impl DarkTongues {
     }
 }
 
-/// A dark flame core's light at `rise` (0 at its root, 1 at its top): pale
-/// yellow at the root through gold and amber to orange, never green.
 const FLAME_CORE_STOPS: [(f32, u32); 4] = [
     (0.0, 0x00FF_F040),
     (0.30, 0x00FF_D820),
@@ -4461,11 +4095,6 @@ fn flame_core_ramp(rise: f32) -> u32 {
     lerp_rgb(a.1, b.1, (rise - a.0) / (b.0 - a.0))
 }
 
-/// The fire's heat smoothed along its line: a burning cell's share at `d`
-/// cells from its centre, a raised cosine to nothing a cell out. The shares
-/// of cells a cell apart sum to one, so the heat between two burning cells
-/// runs smoothly from one's to the other's and a run's ends fall off over a
-/// cell, never standing square on a cell edge ([`flame_heat`]).
 #[inline]
 fn flame_kernel(d: f32) -> f32 {
     let d = d.abs();
@@ -4484,12 +4113,6 @@ fn flame_heat<'a>(cells: impl Iterator<Item = &'a (u16, u16, f32)>, u: f32) -> f
         .min(1.0)
 }
 
-/// The most coverage of the dark fire's light `hot` (per unit coverage: a
-/// heat level's, [`flame_level_light`]) the ground under a letter
-/// in `ink` on `ground` may take, with `lift` (per channel, `add_sat` levels)
-/// already over both, before the letter's contrast falls under `bar`, or
-/// under what it keeps with no flame if that is less. A letter darker than
-/// its ground only gains from light under it: no hold.
 fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], bar: f32) -> f32 {
     let table = crate::color_math::relative_luminance_table();
     let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
@@ -4521,21 +4144,14 @@ fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], bar: f
     lo as f32
 }
 
-/// The dark field's palette index a heat level of the kept flame's ceilings
-/// stands for ([`CursorGlow::FIRE_DARK_HELD_LEVELS`]): the level's top, so a
-/// level's light is never under any index it holds.
 const FLAME_LEVEL_STEP: i32 = 64;
 
-/// The heat level an index of the dark field falls in: rounded up, so the
-/// level's light bounds the index's.
 #[inline]
 fn flame_level_of(idx: i32) -> usize {
     let level = (idx.max(0) + FLAME_LEVEL_STEP - 1) / FLAME_LEVEL_STEP;
     (level as usize).min(CursorGlow::FIRE_DARK_HELD_LEVELS - 1)
 }
 
-/// The field's light per unit coverage at heat level `level`'s top
-/// ([`flame_level_of`]); the last level is the field's hottest.
 #[inline]
 fn flame_level_light(level: usize) -> u32 {
     if level + 1 >= CursorGlow::FIRE_DARK_HELD_LEVELS {
@@ -4544,9 +4160,6 @@ fn flame_level_light(level: usize) -> u32 {
     aterm_render::fire_field::fire_add_light(level as i32 * FLAME_LEVEL_STEP)
 }
 
-/// The dark flame field's ceiling as a share of its whole, at `rise` (0 at
-/// the root, 1 at the tallest tongue's tip): whole over the lower third,
-/// thinning to a quarter at the tips, so the light dies upward.
 #[inline]
 fn flame_tip_fade(rise: f32) -> f32 {
     const HOLD: f32 = 0.33;

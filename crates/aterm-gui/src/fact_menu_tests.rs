@@ -47,8 +47,6 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
     }
 }
 
-/// Each row as `controls fact-menu` keys it: its glyph and words, its key and
-/// whether it is on; a row that is no choice by its kind and words.
 fn shown(rows: &[MenuRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
@@ -67,10 +65,6 @@ fn shown(rows: &[MenuRow]) -> Vec<String> {
         .collect()
 }
 
-/// THE MENUS' ROWS (design §10.6.14): each fact's value, the rows that act on it, its
-/// own Hide; only the model's and the effort's type, and only Claude's own
-/// commands. NEGATIVE CONTROL: with no side published the folder's rows are
-/// off, and the branch offers no root.
 #[test]
 fn each_fact_menu_offers_its_rows_and_its_hide() {
     let on = menu_facts(FactMask::default(), true);
@@ -174,11 +168,6 @@ fn each_fact_menu_offers_its_rows_and_its_hide() {
     assert!(rows(Fact::Usage, &on).iter().all(|r| !r.selectable()));
 }
 
-/// THE TYPED ROWS FOLLOW WHAT THEY TYPE INTO: the key's row says off while
-/// the engine's top rule shows the tag; a refusal's note stands over the
-/// typed rows and disables them, as a press in flight does. NEGATIVE
-/// CONTROL: no key row (an older build, a latch) offers no key at all, and
-/// the slider stays.
 #[test]
 fn the_typed_rows_say_what_they_type_and_wait_under_a_note() {
     let key = aterm_primer::CLAUDE_TOP_EFFORT_KEY;
@@ -219,9 +208,6 @@ fn the_typed_rows_say_what_they_type_and_wait_under_a_note() {
     assert!(effort[2].ends_with("[fact-menu/effort/type/effort] true"));
 }
 
-/// EVERY MENU SHOWS WHAT IS HIDDEN: a fact's own Hide turns to Show while it
-/// is hidden, and a Show for every other fact hidden in the session follows
-/// it — so a stub the rule gave up for room is still shown again.
 #[test]
 fn a_menu_shows_every_hidden_fact_again() {
     let hid = menu_facts(mask(&[FactKind::Path, FactKind::Model]), true);
@@ -243,11 +229,8 @@ fn a_menu_shows_every_hidden_fact_again() {
     );
 }
 
-/// 14:02 UTC on a day of 2024: the first bucket's start.
 const T0: i64 = 86_400 * 19_800 + 14 * 3600 + 2 * 60;
 
-/// Four minutes of traffic, a minute a bucket: a thousand in, then none, then
-/// four thousand (the peak, while Claude was working), then two thousand.
 fn traffic() -> TrafficView {
     TrafficView {
         start_s: T0,
@@ -260,7 +243,6 @@ fn traffic() -> TrafficView {
     }
 }
 
-/// Each row's text, a graph row's cells as they read.
 fn texts(rows: &[MenuRow]) -> Vec<String> {
     rows.iter()
         .map(|row| match row {
@@ -271,11 +253,6 @@ fn texts(rows: &[MenuRow]) -> Vec<String> {
         .collect()
 }
 
-/// THE TRAFFIC CARD (owner: "the traffic shows a graph over time"): the in
-/// band and the out band, two rows each, labelled; the axis from the first
-/// bucket's local time through the span to `now`; the working time and
-/// totals; the peaks per column's slice. NEGATIVE CONTROL: an empty series
-/// is `No traffic yet` and no graph.
 #[test]
 fn the_traffic_card_paints_two_bands_and_its_axis() {
     let rows = traffic_rows(&traffic(), T0 + 240, Some(0), 30);
@@ -324,10 +301,6 @@ fn the_traffic_card_paints_two_bands_and_its_axis() {
     );
 }
 
-/// A BAND'S PEAK FILLS BOTH ITS ROWS AND A TRICKLE IS AT LEAST AN EIGHTH: the
-/// level is linear in the band's own peak over sixteen eighths, the bottom
-/// row filling first; a token is never drawn as nothing. CONTROL: none is
-/// blank.
 #[test]
 fn a_band_peak_fills_both_rows_and_a_trickle_is_at_least_one_eighth() {
     assert_eq!(band_level(667, 667), 16);
@@ -346,9 +319,6 @@ fn a_band_peak_fills_both_rows_and_a_trickle_is_at_least_one_eighth() {
     assert_eq!((at(0, 0), at(1, 0)), (Some(' '), Some('\u{2584}')));
 }
 
-/// THE COLUMNS CLAUDE WAS WORKING IN TAKE THE SHADED GROUND: the card paints
-/// a busy column on the card's ground a tenth of the way to its accent, in
-/// the band's ink. CONTROL: an idle column stands on the card's ground.
 #[test]
 fn busy_columns_take_the_shaded_ground() {
     use crate::autopilot_menu::{paint, place};

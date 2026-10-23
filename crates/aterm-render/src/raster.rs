@@ -100,6 +100,7 @@ impl Rasterizer {
             let x1i = x1ceil as i32;
             let linestart_x0i = linestart as isize + x0i as isize;
             if linestart_x0i < 0 {
+                // Deliberately without advancing `x`, so the march does not
                 // reinterpret the segment.
                 continue;
             }
@@ -115,6 +116,7 @@ impl Rasterizer {
                 let am = 0.5 * s * x1f * x1f;
                 self.add(linestart_x0i, d * a0);
                 if x1i == x0i + 2 {
+                    // Exactly two interior-free columns: the middle takes
                     // whatever the two corners did not.
                     self.add(linestart_x0i + 1, d * (1.0 - a0 - am));
                 } else {

@@ -90,7 +90,7 @@ impl std::fmt::Display for Date {
 
 /// The local day number (days since 1970-01-01, local) of unix second `at`
 /// under offset `offset_s`.
-fn local_days(at: i64, offset_s: i64) -> i64 {
+const fn local_days(at: i64, offset_s: i64) -> i64 {
     (at + offset_s).div_euclid(86_400)
 }
 
@@ -162,7 +162,18 @@ pub(crate) fn local_stamp(at_ms: i64, offset_s: Option<i64>) -> String {
     )
 }
 
-/// Resolve `when` against `now_ms` (unix ms) in the zone `offset_at` reads (unix second → its offset from UTC in seconds; `presence::local_offset_at` in the window, a fixed or a DST zone in a test). §9.3.5's rules:
+/// Resolve `when` against `now_ms` (unix ms) in the zone `offset_at` reads
+/// (unix second → its offset from UTC in seconds; `presence::local_offset_at`
+/// in the window, a fixed or a DST zone in a test). §9.3.5's rules:
+///
+/// * `In(m)`: `m` minutes of elapsed time from now, from the next whole
+///   second, so the instant is never short of what was asked;
+/// * `Clock(hh:mm)`: the earliest instant STRICTLY after now whose local
+///   reading is `hh:mm`, looked for on today's local date, then tomorrow's.
+///   A fall-back night that reads it twice gives the earlier reading still
+///   ahead. A reading a spring-forward skips refuses with the date, but only
+///   on the day it would fall: a skipped reading already behind now is no
+///   refusal, and tomorrow's is taken.
 pub(crate) fn resolve(
     when: When,
     now_ms: i64,

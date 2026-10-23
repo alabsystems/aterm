@@ -35,7 +35,7 @@ pub(crate) fn realized_alpha(elapsed: Duration) -> f32 {
 
 /// Fade bucket index at `elapsed`, folded into the palette fingerprint so each bucket
 /// edge repaints once while the arrow is live.
-pub(crate) fn realized_bucket(elapsed: Duration) -> u64 {
+pub(crate) const fn realized_bucket(elapsed: Duration) -> u64 {
     elapsed.as_secs() / REALIZED_BUCKET.as_secs()
 }
 

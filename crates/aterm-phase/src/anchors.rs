@@ -1445,7 +1445,7 @@ pub fn newer_than(a: &str, b: &str) -> bool {
     parts(a) > parts(b)
 }
 
-/// The name stem a Codex build's committed rollout reductions carry in `aterm-agent`'s step.
+/// The name stem a Codex build's committed rollout reductions carry in `aterm-agent`'s step testdata.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn rollout_reduction_stem(build: &str) -> String {

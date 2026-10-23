@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Capability witnesses for the conformance tests. A buffer cap is granted by an
-//! `aterm_cap::Authority`, and the mint is sealed behind `launcher-mint`, which
-//! this crate enables for its dev-dependency edge only.
+//! Capability witnesses for the conformance tests.
 
 use aterm_buffer::{ReadCap, WriteCap};
 use aterm_cap::{Authority, Tier};
 
 fn authority() -> Authority {
-    // SAFETY: a test process that processes no untrusted input is its own
-    // trusted launcher, which is the whole of `root_authority`'s contract.
+    // SAFETY: a test process with no untrusted input is its own trusted launcher.
     unsafe { Authority::root_authority() }
 }
 

@@ -370,6 +370,8 @@ pub(crate) fn main() -> ExitCode {
     }
 
     if aterm_cli::is_tool_candidate(Some(first.as_str())) && store_resolves(&first) {
+        // `run <tool> -- <args…>`: `pkg run` strips exactly one leading `--`, so the tool's
+        // own flags are never parsed by it and a user's `--` survives. `split_first`, not
         // `rest[0]`/`rest[1..]`: the verifier refuted both bounds checks.
         if let Some((tool, tool_args)) = rest.split_first() {
             let mut run_args: Vec<OsString> = vec![OsString::from("run"), tool.clone()];
@@ -1576,6 +1578,8 @@ fn run_first_run_doctor(
     password: Option<aterm_secrets::SecretBytes>,
     busy: InitialSetupBusy,
 ) {
+    // A process that may never change the person's profile (its state root, uid
+    // and HOME are fixed for its life) has nothing to retry, and an idle
     // session must not wake each minute to learn that again.
     if let Some(why) = aterm_cli::macos_doctor::lasting_scope_refusal() {
         aterm_log::info!("first-run macOS doctor: skipped: {why}");
@@ -1947,6 +1951,7 @@ mod setup_retry_tests {
             };
             state.borrow_mut().revision = 2;
             if replace_ticket {
+                // Negative control: recreating the host with a fresh ticket
                 // would redirect the old keystroke to the replacement run.
                 prepared.decisions.cancellation = Ticket::default();
             }
@@ -2332,6 +2337,7 @@ fn initial_setup_status_with(
         rows.extend(last.rows.iter().cloned());
         last.check.clone()
     } else {
+        // Filter without evicting: this snapshot may precede a newer result
         // already published in the cache. Its own next snapshot can show it.
         None
     };
@@ -3273,6 +3279,7 @@ fn plain_launch_policy(
 /// ([`aterm_cli::parse_window_request`], [`aterm_cli::route_launch`]); this is the impure half:
 /// resolving a directory, asking whether an instance is reachable, and performing the route.
 fn window_verb(verb: &str, args: &[OsString], host: WindowHost) -> ExitCode {
+    // `-h`/`--help` in first position answers with the verb's synopsis rather than the strict
     // grammar's "unknown option": these verbs dispatch to no tool that could answer it.
     if args
         .first()
@@ -3547,6 +3554,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             "-v" | "--verbose" => verbose = true,
             _ if sub.is_none() && !arg.starts_with('-') => sub = Some(arg),
             _ => {
+                // A word that is not ours (`claude --wait-lock 60`, `apply` on a Mac)
                 // says what it is, whatever flag follows it.
                 if let Some(word) = sub.as_deref().filter(|w| !matches!(*w, "status" | "check")) {
                     eprintln!("{}", update_unknown_line(word, store_resolves));
@@ -3562,6 +3570,8 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
         "status" => aterm_update::status(build),
         "check" if cfg!(windows) => None,
         "check" => {
+            // A check can download a whole release: say it is working, to a person only, and
+            // only on a copy that checks. A dev, disk-image or quarantined copy refuses at once,
             // and a Linux install waiting for its first start skips the check.
             if std::io::IsTerminal::is_terminal(&std::io::stderr())
                 && aterm_update::status(build).is_some_and(|st| {
@@ -3926,6 +3936,7 @@ fn update_summary(
         st.failing_checks_kind.as_str()
     };
     if st.failing_persistent {
+        // The one failure a person has to act on: a build that predates the channel's
         // keys, whose ledger sentence prescribes the reinstall.
         if class == "manifest" && st.outcome.contains("reinstall") {
             return (

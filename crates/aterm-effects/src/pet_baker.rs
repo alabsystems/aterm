@@ -371,6 +371,8 @@ fn bake_pose_with_reflections(
     let face_lod = h < FACE_DETAIL_MIN_H;
     let mouth_lod = h < MOUTH_DETAIL_MIN_H;
     for layer in PET_GLYPHS[pose as usize].layers {
+        // LOD cull by authored role: whisker/blush/pattern are sub-pixel charm;
+        // iris/catch-light/pupil (`Detail`) are what the dot and its
         // device-sized reflection replace.
         if (face_lod
             && matches!(

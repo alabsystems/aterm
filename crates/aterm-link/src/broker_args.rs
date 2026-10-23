@@ -186,11 +186,6 @@ mod tests {
         ));
     }
 
-    /// **A LIFELINE IS ONE MORE VALUED FLAG**, so a broker a test or tool armed
-    /// (`--lifeline-fd 0` appended after its words) reads off the process table as
-    /// the same serving invocation: its endpoint, its tier and its log. Its value is
-    /// opaque like the others', and it is kept once. NEGATIVE CONTROL: the same argv
-    /// with the flag's value missing is refused, never a serving argv.
     #[test]
     fn a_lifeline_is_a_valued_flag_and_the_serving_reads_hold() {
         let argv = [
@@ -231,12 +226,6 @@ mod tests {
         assert!(BrokerArgs::from_invocation(cut).is_none(), "no value");
     }
 
-    /// **THE LOG IS READ AS THE BROKER VERB READS IT** — where astream's
-    /// `<log>.health` is looked for: the second word, or the socket's
-    /// `<socket>.log` without one, whatever flags sit between. NEGATIVE
-    /// CONTROLS: a relative log (the broker's working directory's, not the
-    /// reader's), a repair, and an argv the verb would refuse name no log it
-    /// serves.
     #[test]
     fn the_log_is_the_one_the_broker_verb_serves() {
         let log = |args: &[&str]| BrokerArgs::parse(args).ok().and_then(|a| a.log_path());

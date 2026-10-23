@@ -619,7 +619,10 @@ impl Broker {
 }
 
 impl State {
-    /// EXACTLY THE CUTS THE LAW ALLOWS a restart of this kind to keep: the whole log, or.
+    /// EXACTLY THE CUTS THE LAW ALLOWS a restart of this kind to keep: the
+    /// whole log, or — a power loss on Ordered or Relaxed — any prefix at or
+    /// above the durable head (every escalated record is below it: its full
+    /// flush raised it).
     pub(crate) fn allowed_cuts(&self, stop: Stop) -> Vec<u64> {
         let head = self.log.len() as u64;
         match (stop, self.tier) {
@@ -1299,6 +1302,8 @@ impl State {
             } => self.register(conn, producer_id, producer_seq, subject, body),
             Request::Commit { group, upto } => {
                 // A BATCH ROLLED BACK refuses the group commit in it too: the
+                // bridge's commit rides the pipeline beside its publishes
+                // (aterm-0), and only a bridge's connection commits here.
                 if self.refuse_next > 0 {
                     self.refuse_next -= 1;
                     self.notes.push(format!(
@@ -1641,6 +1646,7 @@ impl Read for SimStream {
             if let Some((cursor, filter)) = sub {
                 if let Some(off) = s.next_match(cursor, &filter) {
                     // THE REORDER aterm-0 must survive: a record handed to a
+                    // reader while its publisher's ack is still held.
                     if s.conns
                         .values()
                         .any(|c| c.held.iter().any(|h| h.ack_of == Some(off)))

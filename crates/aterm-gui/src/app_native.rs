@@ -173,25 +173,25 @@ pub(crate) struct NativeUpdateSafetyToken {
 
 impl NativeUpdateSafetyToken {
     #[must_use]
-    pub(crate) fn is_certified(&self) -> bool {
+    pub(crate) const fn is_certified(&self) -> bool {
         true
     }
 
     #[cfg(unix)]
     #[must_use]
-    pub(crate) fn carried_drafts(&self) -> usize {
+    pub(crate) const fn carried_drafts(&self) -> usize {
         self.carried_drafts
     }
 
     #[cfg(unix)]
     #[must_use]
-    pub(crate) fn carried_settings_drafts(&self) -> usize {
+    pub(crate) const fn carried_settings_drafts(&self) -> usize {
         self.carried_settings_drafts
     }
 
     #[cfg(unix)]
     #[must_use]
-    pub(crate) fn failed_checkpoints(&self) -> usize {
+    pub(crate) const fn failed_checkpoints(&self) -> usize {
         self.failed_checkpoints
     }
 
@@ -393,7 +393,7 @@ pub(crate) enum NativeUpdateReconcilePurpose {
 }
 
 #[must_use]
-fn merge_reconcile_purpose(
+const fn merge_reconcile_purpose(
     left: NativeUpdateReconcilePurpose,
     right: NativeUpdateReconcilePurpose,
 ) -> NativeUpdateReconcilePurpose {
@@ -659,7 +659,7 @@ impl EnvironmentBlockCause {
     }
 
     /// What a person does about this cause.
-    pub(crate) fn remedy(self) -> crate::update_apply_trouble::PersonRemedy {
+    pub(crate) const fn remedy(self) -> crate::update_apply_trouble::PersonRemedy {
         use crate::update_apply_trouble::PersonRemedy;
         match self {
             Self::InstallLocation => PersonRemedy::MoveOrAskAdmin,
@@ -809,7 +809,7 @@ impl PhysicalFailureSchedule {
     }
 
     #[must_use]
-    fn retry_at(self) -> Option<std::time::Instant> {
+    const fn retry_at(self) -> Option<std::time::Instant> {
         match self {
             Self::Retry(at) | Self::StandDown(at) => Some(at),
             Self::Converged { resample_at } => resample_at,
@@ -897,7 +897,8 @@ impl PhysicalFailureShape {
         }
     }
 
-    /// Did the successor image run and decide, or did something end a candidate that never got that far?.
+    /// Did the successor image run and decide, or did something end a candidate that never got
+    /// that far?
     #[must_use]
     #[cfg(unix)]
     pub(crate) fn of_child_death(death: crate::ChildDeathEvidence) -> Self {
@@ -942,7 +943,7 @@ impl PhysicalFailureShape {
 
 #[cfg(unix)]
 #[must_use]
-fn signal_is_the_image_faulting(signal: i32) -> bool {
+const fn signal_is_the_image_faulting(signal: i32) -> bool {
     matches!(
         signal,
         libc::SIGILL
@@ -980,6 +981,7 @@ impl HandoffFailureLane {
         death: crate::ChildDeathEvidence,
         revoked_by_activity: bool,
     ) -> Self {
+        // Before the mode: a stage waiting for a check to confirm its signer is no
         // failure of either lane's, a person's press included.
         if outcome == crate::UpdateHandoffOutcome::StageUnconfirmed {
             return Self::AwaitsRosterConfirmation {
@@ -1001,7 +1003,7 @@ impl HandoffFailureLane {
 
     #[must_use]
     #[cfg(any(unix, test))]
-    fn charges_the_automatic_lane(self) -> bool {
+    const fn charges_the_automatic_lane(self) -> bool {
         match self {
             Self::Manual => false,
             #[cfg(unix)]
@@ -1106,7 +1108,7 @@ impl Drop for RaiseOnDrop {
 /// Parse the durable artifact identity without allocating.
 #[must_use]
 pub(crate) fn decode_dmg_sha256(digest: &str) -> Option<[u8; 32]> {
-    fn nibble(byte: u8) -> Option<u8> {
+    const fn nibble(byte: u8) -> Option<u8> {
         match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -1140,7 +1142,7 @@ pub(crate) fn load_native_updater_service(
 
 /// What the launch's own path already says about whether this copy can replace itself.
 #[must_use]
-pub(crate) fn launch_installability(
+pub(crate) const fn launch_installability(
     posture: Option<aterm_update::which_copy::InstallPosture>,
     dev_marked: bool,
 ) -> crate::native_updater_service::UpdateInstallability {
@@ -1184,7 +1186,7 @@ pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> Durab
     }
 }
 
-fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
+const fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
     DurableUpdateStatus {
         linux_host: cfg!(target_os = "linux"),
         linux: None,
@@ -1269,7 +1271,7 @@ fn native_appearance_revision(preferences: crate::native_appearance::AppearanceP
     revision.finish()
 }
 
-fn native_motion_revision(motion: crate::native_app::ViewMotionCx) -> u8 {
+const fn native_motion_revision(motion: crate::native_app::ViewMotionCx) -> u8 {
     (motion.system_reduced as u8)
         | ((motion.focused as u8) << 1)
         | ((motion.performance_reduced as u8) << 2)
@@ -1809,7 +1811,7 @@ impl App {
     }
 
     #[must_use]
-    fn has_pending_native_update_reconcile(&self) -> bool {
+    const fn has_pending_native_update_reconcile(&self) -> bool {
         self.pending_native_update_reconcile_purpose.is_some()
     }
 
@@ -2692,6 +2694,8 @@ impl App {
         wid: WindowId,
         event: AppEvent,
     ) -> Result<EventResult, String> {
+        // A scroll the person asked for (a wheel, a page key) moves the page
+        // under a still pointer while they watch it: what the pointer rests on
         // afterwards is theirs to press (`app_mouse::NativePointerRest`).
         if matches!(
             event,
@@ -2859,6 +2863,9 @@ impl App {
             return Err(refusal);
         }
         if let Some(result) = self.dispatch_editor_event(instance, view, &event)? {
+            // The editor workspace is an independent reducer and currently has
+            // no regional-damage effect lane. Invalidate its exact leaf only,
+            // and not for an input it declined, which changed nothing, nor for
             // a view the command closed.
             if result == EventResult::Handled && self.view_store.get(view).is_some() {
                 self.invalidate_native_view_cache(wid, view, DamageRegion::All);
@@ -3093,6 +3100,7 @@ impl App {
             } = event
         {
             if editor_config_completion_active && !mods.contains(Modifiers::SHIFT) {
+                // A held Tab pages the list once: its repeats neither page on
                 // nor indent the buffer behind the list.
                 if *event_type == KeyEventType::Repeat {
                     return true;
@@ -4009,6 +4017,8 @@ impl App {
                 )?;
             }
             AppEffect::ChooseWallpaperImage => {
+                // Only an affirmative selection writes config, through the same
+                // versioned lane as control `settings set`, so the image is
                 // re-decoded and every Settings view converges on one verdict.
                 if let Some(path) =
                     crate::menu::choose_local_image("Choose a wallpaper image", "Set Wallpaper")
@@ -4697,6 +4707,9 @@ impl App {
 
     pub(crate) fn pump_native_config(&mut self) -> Result<(), String> {
         while !self.native_config_inflight {
+            // A watcher candidate owns file authority from receipt through
+            // parse/assets/font preparation; hold semantic writes until that
+            // baseline is admitted or rejected. Once a generation is retained,
             // reconciliation orders it against a concurrent durable write.
             if self.config_watch_admission_pending()
                 && self.native_config_external_pending.is_none()
@@ -4950,6 +4963,7 @@ impl App {
         };
 
         if self.native_config_external_sequence > completion.pending_sequence {
+            // Admit the sample as an intermediate generation, retain the newer
             // watcher payload, and sample once more before any write.
             if let Err(error) = self
                 .native_config_service
@@ -5092,6 +5106,7 @@ impl App {
         &mut self,
         baseline: &crate::native_document_host::AtomicFileBaseline,
     ) {
+        // Clear only the payload this admission actually proves. A slower
         // generation A must not discard a newer retained generation B.
         if self
             .native_config_external_pending
@@ -5152,6 +5167,8 @@ impl App {
         match completion.result {
             Ok(prepared) => self.reload_prepared_config_observation(prepared),
             Err(error) => {
+                // Invalid TOML is still valid UTF-8: Manual gets the exact watcher
+                // bytes so its diagnostics can help repair them, while live Config
                 // stays unchanged.
                 if let Err(refresh_error) =
                     self.refresh_open_config_editor_observation(&completion.observation)
@@ -5196,6 +5213,7 @@ impl App {
             host.set_config(running.policy.clone());
         }
         self.config.harness = running;
+        self.note_occupancy_mode(self.config.harness.policy.occupancy);
         self.announce_harness_policy();
         self.publish_harness_posture();
         self.note_harness_arms();
@@ -5870,6 +5888,8 @@ impl App {
             },
         );
         if spawn.is_err() {
+            // Release the reservation via abort, never a fabricated report: a
+            // never-observed surface stays on "Reading package status…", and an
             // observed one keeps its facts.
             let _ = self.native_packages_service.abort(sequence);
         }
@@ -6230,6 +6250,7 @@ impl App {
     }
 
     pub(crate) fn start_native_update_check(&mut self) -> UpdateOutcome {
+        // Joining does no physical work and mints no event-loop capability, which
         // keeps the no-duplicate promise testable headless.
         if self.native_updater_service.snapshot().active.is_some() {
             return match self.native_updater_service.request_check() {
@@ -6299,10 +6320,13 @@ impl App {
     ) {
         let completion = self.native_updater_service.finish_check(ticket, status);
         if completion != CheckCompletion::Reduced {
+            // An old worker cannot redraw, notify, arm intent, or drain a newer
             // deferred observation. Reducer-inert means presentation-inert too.
             return;
         }
         if self.native_updater_service.snapshot().staged.is_some() {
+            // The floor for disk observations: anything read before this instant
+            // predates the stage this check imported (see
             // `reconcile_native_update_facts`).
             self.native_stage_imported_at = Some(std::time::Instant::now());
         }
@@ -6312,6 +6336,7 @@ impl App {
             && !self.request_native_update_reconcile(purpose)
         {
             if purpose == NativeUpdateReconcilePurpose::ApplyControl {
+                // A control apply never vanishes silently: the same refusal the control
                 // entry path surfaces when facts cannot be collected.
                 self.refuse_control_apply_without_facts();
             } else {
@@ -6386,7 +6411,7 @@ impl App {
         }
     }
 
-    fn count_sleep_toward_messages_clock(&mut self, slept: std::time::Duration) {
+    const fn count_sleep_toward_messages_clock(&mut self, slept: std::time::Duration) {
         if let Some(until) = self.messages_words_change_in.as_mut() {
             *until = until.saturating_sub(slept);
         }
@@ -6448,6 +6473,9 @@ impl App {
 
     fn structural_latch_trial_room(&self, latch: crate::AutoApplyManualOnly) -> Option<bool> {
         if !latch.activation {
+            // The latched build's own trial has counted nothing (above). This is
+            // no answer for the RUNNING build's trial, which a deferred-on-a-
+            // verdict candidate can spend: that count is not this latch's, and
             // the lane does not read it here.
             return Some(true);
         }
@@ -6492,6 +6520,8 @@ impl App {
             return false;
         };
         if self.native_activation_supersede.is_some() {
+            // The retire runs off the event loop; the latch stands until it
+            // answers (`finish_activation_supersede`). A latch past its deadline
             // must move it, or the deadline fold wakes on it forever.
             if latch.retry_at.is_some_and(|at| now >= at) {
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
@@ -6533,6 +6563,9 @@ impl App {
         }
         match structural_latch(facts) {
             StructuralLatchDecision::Hold => {
+                // A look its own deadline brought (the re-sample, now outranked
+                // by a release waiting out a refusal) must move that deadline or
+                // the deadline fold wakes on it forever; the release's retry is
                 // the next thing that can change anything.
                 if facts.resample_due
                     && latch.retry_at.is_some_and(|at| now >= at)
@@ -6552,12 +6585,14 @@ impl App {
                 false
             }
             StructuralLatchDecision::Supersede { newer } => {
+                // Spent only once the retire is under way; a look that cannot start
                 // it now leaves the release for the next look.
                 if self.request_activation_supersede(latch, newer, verdict.newer_spent) {
                     verdict.newer_spent = newer;
                     verdict.newer_retry = None;
                     self.auto_apply_structural_verdict = Some(verdict);
                 } else {
+                    // Not started, nothing spent; a deadline that brought this look
                     // moves, so the deadline fold does not spin on it.
                     if retry_due {
                         verdict.newer_retry =
@@ -7408,7 +7443,7 @@ impl App {
 
     /// Whether a person's Install is held for the candidate's pre-park read ([`Self::run_held_person_apply`]).
     #[must_use]
-    pub(crate) fn person_apply_is_held(&self) -> bool {
+    pub(crate) const fn person_apply_is_held(&self) -> bool {
         #[cfg(unix)]
         {
             self.person_apply_held.is_some()
@@ -7696,6 +7731,7 @@ impl App {
         let now = std::time::Instant::now();
         let deadline_ready = now >= intent.retry_at;
         if deadline_ready {
+            // A capture refusal recorded beside a busy engine reads that session
             // at the lane's next look, whatever the poll then decides.
             self.capture_refusal_take_baseline();
         }
@@ -7738,6 +7774,9 @@ impl App {
         });
         let (attempt_build, attempt_phase) = match decision {
             PollDecision::Clear => {
+                // The lane dropped its promise: restate the staged words to the
+                // posture that now holds. A person's wait was a wait for this lane,
+                // so it ends here too, with its standing row and the overdue notice's
                 // exemption.
                 if let Some(intent) = self.auto_apply_intent.take() {
                     self.restate_staged_bar_posture(intent.build);
@@ -7803,6 +7842,11 @@ impl App {
             ApplyMode::AutomaticPastGrace
         });
         if let UpdateOutcome::Deferred { reason } = outcome {
+            // A deferral is the ladder saying "not this instant". It returned
+            // before `begin_apply_preflight` (no park, launch, ticket or budget),
+            // so it is re-polled on the quiet cadence and not logged per poll;
+            // the phase change is (`announce_apply_phase`). A path that re-armed
+            // its own intent keeps it. A fork-lane park that missed its budget
             // was already surfaced by `fork_park_miss_outcome`.
             if self.auto_apply_intent.is_none() {
                 intent.retry_at = std::time::Instant::now() + crate::AUTOMATIC_UPDATE_QUIET_EPOCH;
@@ -7885,6 +7929,7 @@ impl App {
                     );
                 }
                 if announce && intent.attempts == 1 {
+                    // Already recorded above: announcement adds UI only, not a
                     // second durable write for this same refused attempt.
                     self.react_to_update_apply_outcome("automatic", blocked, false);
                 }
@@ -8211,6 +8256,8 @@ impl App {
                         );
                     }
                     DurableStageDisposition::Retired => {
+                        // The latch belongs to the exact retired artifact; kept, it could
+                        // suppress a replacement lower than the withdrawn stage but newer
                         // than this process. A latch for other bytes survives.
                         if let Some(retired) = current.as_ref()
                             && self.auto_apply_manual_only.is_some_and(|manual| {
@@ -8283,6 +8330,7 @@ impl App {
                 }
             }
             if let CheckStart::Start(ticket) = self.native_updater_service.request_check() {
+                // Logged only when the import happens: while an activation is held,
                 // `request_check` refuses and every ~75 s reconcile lands here again.
                 if activation.is_some() {
                     aterm_log::info!("update sync: {}", durable.outcome);
@@ -8557,6 +8605,8 @@ impl App {
     }
 
     pub(crate) fn apply_native_update(&mut self, mode: ApplyMode) -> UpdateOutcome {
+        // A person's press already held for the candidate's pre-park read: a second
+        // press joins it and runs with it once the read ends
         // (`App::run_held_person_apply`).
         if !mode.is_automatic() && self.person_apply_is_held() {
             return UpdateOutcome::Accepted;
@@ -9406,6 +9456,7 @@ impl App {
             .native_updater_service
             .abort_apply(attempt, message.clone())
         {
+            // The `Rearmed` policy of `reconcile_returned_native_apply_with_facts`
             // (the lane every completion takes), with no facts to reduce.
             return self.settle_rearmed_apply_failure(attempt, message, lane, None);
         }
@@ -9553,6 +9604,7 @@ impl App {
         );
         match disposition {
             ReturnedApplyDisposition::Rearmed => {
+                // The stage is re-armed on disk; the facts are reduced once the
                 // lane's policy has published.
                 Some(self.settle_rearmed_apply_failure(&attempt, message, lane, Some(facts)))
             }
@@ -9676,6 +9728,9 @@ impl App {
         blockers.extend(settings.blocker());
         blockers.extend(drafts.blockers());
         if self.document_journal_writes_in_flight() {
+            // A journal write on the worker now (any document's, a re-seat after
+            // a rolled-back update included) could land after the successor read
+            // its restore image or after Commit, so no update starts or commits
             // over one.
             blockers.push("Wait: a draft journal write is in flight".to_string());
         }
@@ -10059,6 +10114,8 @@ fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::Machine
     )?;
     parse_machine_state_output(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         if output.status.success() {
+            // The line prints after atpkg's platform check, so its absence means
+            // no state was measured, which the status must say, never "nothing to
             // apply".
             "atpkg machine printed no state".to_string()
         } else {
@@ -10340,7 +10397,7 @@ pub(crate) fn packages_argv(request: &PackagesRequest) -> Vec<String> {
 }
 
 /// The verb a person pressed and waits on.
-pub(crate) fn person_verb(
+pub(crate) const fn person_verb(
     request: &PackagesRequest,
 ) -> Option<crate::message_reporters::PackagesVerb> {
     use crate::message_reporters::PackagesVerb;
@@ -10353,7 +10410,7 @@ pub(crate) fn person_verb(
 }
 
 /// How a person's verb row ends.
-pub(crate) fn person_echo(failed: bool, ran: bool) -> aterm_messages::EchoKind {
+pub(crate) const fn person_echo(failed: bool, ran: bool) -> aterm_messages::EchoKind {
     if failed {
         aterm_messages::EchoKind::Fault
     } else if ran {
@@ -10363,7 +10420,7 @@ pub(crate) fn person_echo(failed: bool, ran: bool) -> aterm_messages::EchoKind {
     }
 }
 
-pub(crate) fn packages_busy(request: &PackagesRequest) -> PackagesBusy {
+pub(crate) const fn packages_busy(request: &PackagesRequest) -> PackagesBusy {
     match request {
         PackagesRequest::CheckUpdate => PackagesBusy::Check,
         PackagesRequest::InstallDefaultSet => PackagesBusy::Install,

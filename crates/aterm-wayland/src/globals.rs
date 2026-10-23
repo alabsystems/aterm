@@ -21,9 +21,6 @@ pub struct Global {
     pub version: u32,
 }
 
-/// What the registry's listener and the caller share: the globals, and how
-/// many times the list changed (a leaf of the lock graph: nothing but the
-/// list's own methods runs while it is held).
 #[derive(Default)]
 struct RegistryBook {
     globals: Vec<Global>,
@@ -34,7 +31,6 @@ struct RegistryBook {
 pub struct Registry {
     proxy: Proxy,
     registry_book: Arc<Mutex<RegistryBook>>,
-    /// Freed after `proxy` is destroyed (Drop).
     _listener: Listener,
 }
 
@@ -104,7 +100,6 @@ impl Registry {
     }
 }
 
-/// A registry event, decoded.
 enum Announced {
     Global(Global),
     Removed(u32),

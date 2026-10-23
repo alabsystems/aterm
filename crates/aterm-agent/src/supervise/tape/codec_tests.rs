@@ -11,8 +11,6 @@ use aterm_spec::rng::XorShift;
 use super::super::doors;
 use super::*;
 
-/// `items` encoded by one encoder and decoded by one decoder, as a file's
-/// frames are.
 fn round_trip(items: &[Item]) -> Vec<Item> {
     let mut enc = Encoder::default();
     let mut bytes = Vec::new();
@@ -31,7 +29,6 @@ fn round_trip(items: &[Item]) -> Vec<Item> {
     back
 }
 
-/// The bytes of `items`, encoded in order.
 fn encoded(enc: &mut Encoder, items: &[Item]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for item in items {
@@ -40,7 +37,6 @@ fn encoded(enc: &mut Encoder, items: &[Item]) -> Vec<u8> {
     bytes
 }
 
-/// Text from `rng`: ASCII, a newline, a NUL, multi-byte characters.
 fn text(rng: &mut XorShift, max: usize) -> String {
     const PIECES: [&str; 9] = ["a", "Z", " ", "\n", "\0", "é", "猫", "🐈", "@"];
     (0..rng.index(max + 1))
@@ -48,15 +44,12 @@ fn text(rng: &mut XorShift, max: usize) -> String {
         .collect()
 }
 
-/// Bytes from `rng`, any value.
 fn bytes(rng: &mut XorShift, max: usize) -> Vec<u8> {
     (0..rng.index(max + 1))
         .map(|_| (rng.next_u64() & 0xff) as u8)
         .collect()
 }
 
-/// A path: under a root (as a header's roots spell one), a root alone, or
-/// verbatim — one that itself starts with `@` included.
 fn path(rng: &mut XorShift) -> String {
     match rng.index(6) {
         0 => format!("@ledger/{}", text(rng, 12)),
@@ -68,7 +61,6 @@ fn path(rng: &mut XorShift) -> String {
     }
 }
 
-/// A screen-sized body that shares most of itself with `base`.
 fn near(rng: &mut XorShift, base: &[u8]) -> Vec<u8> {
     let mut body = base.to_vec();
     if body.is_empty() {
@@ -80,7 +72,6 @@ fn near(rng: &mut XorShift, base: &[u8]) -> Vec<u8> {
     body
 }
 
-/// A clock value: small steps, steps back, and the extremes.
 fn clock(rng: &mut XorShift, prev: u64) -> u64 {
     match rng.index(5) {
         0 => 0,
@@ -90,7 +81,6 @@ fn clock(rng: &mut XorShift, prev: u64) -> u64 {
     }
 }
 
-/// One generated item of every kind the codec carries.
 fn item(rng: &mut XorShift, last: &mut (u64, u64, Vec<u8>)) -> Item {
     const DOORS: [&str; 5] = [
         doors::CTL,
@@ -181,7 +171,6 @@ fn item(rng: &mut XorShift, last: &mut (u64, u64, Vec<u8>)) -> Item {
     Item::Effect { record, stamp }
 }
 
-/// Generated runs of items of every kind come back exactly, many seeds over.
 #[test]
 fn every_item_comes_back_from_its_bytes() {
     let mut kinds_seen = std::collections::BTreeSet::new();
@@ -210,7 +199,6 @@ fn every_item_comes_back_from_its_bytes() {
     );
 }
 
-/// A varint and a zigzag at their edges.
 #[test]
 fn integers_come_back_at_their_edges() {
     for v in [0, 1, 127, 128, 16_383, 16_384, u64::MAX - 1, u64::MAX] {
@@ -232,9 +220,6 @@ fn integers_come_back_at_their_edges() {
     assert!(Input::new(&over).varint().is_err());
 }
 
-/// Every kind in the table comes back as itself; a kind the table does not
-/// hold is written as `Other`, and a code this build does not know reads as
-/// `Other`.
 #[test]
 fn every_error_kind_in_the_table_comes_back() {
     for (code, kind) in KINDS {
@@ -244,8 +229,6 @@ fn every_error_kind_in_the_table_comes_back() {
     assert_eq!(kind_of(250), ErrorKind::Other);
 }
 
-/// A screen read again unchanged is one byte of body; a screen whose last
-/// rows changed is its changed middle; a short reply is whole.
 #[test]
 fn a_repeated_screen_is_one_byte_and_a_changed_one_its_middle() {
     let screen: Vec<u8> = (0..3_000).map(|i| b'a' + (i % 26) as u8).collect();
@@ -276,10 +259,6 @@ fn a_repeated_screen_is_one_byte_and_a_changed_one_its_middle() {
     assert_eq!(round_trip(&items), items);
 }
 
-/// The table remembers 64 keys, and a key used again — a repeat looked up, or
-/// a short body that only replaces it — is the most recently used: the keys
-/// that come after push out the least recently used, which are not the oldest
-/// inserted. On both sides alike.
 #[test]
 fn the_table_forgets_its_least_recently_used_key() {
     let body: Vec<u8> = (0..1_000).map(|i| (i % 251) as u8).collect();
@@ -309,9 +288,6 @@ fn the_table_forgets_its_least_recently_used_key() {
     assert_eq!(round_trip(&items), items);
 }
 
-/// A body over the table's limit is stored against the base its key holds,
-/// but never becomes one: its key is forgotten, so the same body again is
-/// whole, and so is the next after that.
 #[test]
 fn a_body_past_the_tables_limit_is_spliced_but_never_remembered() {
     let small: Vec<u8> = (0..1_000).map(|i| (i % 251) as u8).collect();
@@ -337,7 +313,6 @@ fn a_body_past_the_tables_limit_is_spliced_but_never_remembered() {
     assert_eq!(round_trip(&items), items);
 }
 
-/// A name costs its spelling once a file, and a byte after that.
 #[test]
 fn a_name_is_spelled_once_per_file() {
     let raised = || {
@@ -353,8 +328,6 @@ fn a_name_is_spelled_once_per_file() {
     assert!(first.len() > doors::RAISED_STOP.len());
 }
 
-/// The control lane's request and reply forms come back, a transport error
-/// and an empty screen included.
 #[test]
 fn the_control_lanes_forms_come_back() {
     for args in [
@@ -393,8 +366,6 @@ fn the_control_lanes_forms_come_back() {
     assert!(ctl_reply_of(&[7]).is_err(), "no reply form");
 }
 
-/// Two screens of different lengths share the reply's leading bytes up to
-/// the screen's first difference: the stdout is last and unprefixed.
 #[test]
 fn two_replies_share_their_prefix_up_to_the_screens_difference() {
     let reply = |stdout: &str| {
@@ -410,9 +381,6 @@ fn two_replies_share_their_prefix_up_to_the_screens_difference() {
     assert!(shared > 20, "{shared}");
 }
 
-/// Bytes the encoder never writes are refused with where: an unknown tag, a
-/// name the file never spelled, a repeat or a splice with no base, a length
-/// past the frame, text that is not UTF-8.
 #[test]
 fn bytes_the_encoder_did_not_write_are_refused() {
     let refused = |bytes: &[u8]| {

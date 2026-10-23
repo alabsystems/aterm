@@ -490,6 +490,10 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
             }
         }
         "Commit" | QUIET_COMMIT => {
+            // The successor says HELLO and registers what the keeper holds
+            // (beside its Commit); the outgoing window `_exit`s, but its
+            // stream — late frames, EOF, exit status — is read later
+            // (`OutgoingDrained`), so until then it is a second claimant. A
             // successor that takes no part in the keeper says nothing.
             if let Some(conn) = rig.conn.remove("w") {
                 rig.conn.insert("o", conn);
@@ -562,6 +566,7 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
             rig.die("s", 9, &next);
         }
         "SuccessorQuits" => {
+            // BYE on the successor's link, when it has one, then its EOF and
             // `exit(0)`; one that takes no part ends with `exit(0)` alone.
             if let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("s").copied()) {
                 core.bye(conn);
@@ -629,6 +634,8 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
             }
         }
         "RelaunchedWindowQuits" | RELAUNCHED_WINDOW_QUITS_BYE_LOST => {
+            // BYE on the relaunched window's current link (or lost), then its EOF and
+            // `exit(0)` with its marker gone: the keeper judges every link of the process at
             // that exit, a dropped one included.
             if mv == "RelaunchedWindowQuits"
                 && let (Some(core), Some(conn)) = (rig.core.as_mut(), rig.conn.get("r").copied())

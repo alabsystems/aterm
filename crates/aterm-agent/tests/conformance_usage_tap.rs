@@ -31,7 +31,7 @@
 //! path is a command one would run inert (`tap::exe_admissible`).
 #![cfg(unix)]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::Path;
 
 use aterm_agent::harness::accounts;
@@ -55,11 +55,12 @@ const DECIDED: [&str; 9] = [
 
 /// Every state `m` reaches, invariants unchecked.
 fn reachable(m: &Model) -> Vec<S> {
-    let mut seen = BTreeSet::new();
+    let mut seen = HashSet::new();
     let mut queue = VecDeque::from([m.init_state()]);
     let mut out = Vec::new();
     while let Some(s) = queue.pop_front() {
-        if !seen.insert(s.clone()) {
+        // Every state binds every variable, so its values in name order are its identity.
+        if !seen.insert(s.values().copied().collect::<Vec<i64>>()) {
             continue;
         }
         for a in &m.actions {
@@ -265,24 +266,25 @@ fn launch_by(s: &S, first: &First) -> S {
 }
 
 /// The disagreements of the real code (under `admit`) with model `m`, on
-/// every state `m` reaches: `(action, state, real, model)`.
+/// every state of `states` (those `m` reaches): `(action, state, real, model)`.
 fn disagreements(
     m: &Model,
+    states: &[S],
     admit: &dyn Fn(&mut Fresh, &Reading) -> bool,
     beside: &BesideBy,
     first: &First,
 ) -> Vec<(&'static str, S, S, S)> {
     let mut out = Vec::new();
-    for s in reachable(m) {
+    for s in states {
         for action in ["Launch", "Read", "Tick30"] {
             let mut model = s.clone();
             if !m.fire(action, &mut model) {
                 continue;
             }
             let real = match action {
-                "Launch" => launch_by(&s, first),
-                "Read" => read_by(&s, admit, beside),
-                _ => tick_by(&s),
+                "Launch" => launch_by(s, first),
+                "Read" => read_by(s, admit, beside),
+                _ => tick_by(s),
             };
             if DECIDED.iter().any(|v| real[v] != model[v]) {
                 out.push((action, s.clone(), real, model));
@@ -305,11 +307,11 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
     );
     let real = |f: &mut Fresh, r: &Reading| f.admit(r);
     let beside = |f: &Fresh, r: &Reading| f.beside(r);
-    let wrong = disagreements(&m, &real, &beside, &first_point);
+    let wrong = disagreements(&m, &states, &real, &beside, &first_point);
     assert!(wrong.is_empty(), "{:?}", wrong.first());
     // Every decided step is reached with each outcome.
     let reads = |m: &Model, pick: &dyn Fn(&S, &S) -> bool| {
-        reachable(m).iter().any(|s| {
+        states.iter().any(|s| {
             let mut n = s.clone();
             m.fire("Read", &mut n) && pick(s, &n)
         })
@@ -327,16 +329,10 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
             && n["noted"] == s["noted"]),
         "a first reading under the epoch says nothing"
     );
-    assert!(
-        reachable(&m).iter().any(|s| s["silent"] == 1),
-        "a silent tap"
-    );
-    assert!(
-        reachable(&m).iter().any(|s| s["tapped"] == 1),
-        "a tapped line"
-    );
+    assert!(states.iter().any(|s| s["silent"] == 1), "a silent tap");
+    assert!(states.iter().any(|s| s["tapped"] == 1), "a tapped line");
     let ends = |tapped: i64| {
-        reachable(&m).iter().any(|s| {
+        states.iter().any(|s| {
             let mut n = s.clone();
             s["said"] == 1 && m.fire("Launch", &mut n) && n["said"] == 0 && n["tapped"] == tapped
         })
@@ -348,13 +344,13 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
     // Negative controls: the always-fresh admit; the rule started over on a new
     // process without a word.
     let always = |_: &mut Fresh, _: &Reading| true;
-    let caught = disagreements(&m, &always, &beside, &first_point);
+    let caught = disagreements(&m, &states, &always, &beside, &first_point);
     assert!(
         caught.iter().any(|(action, ..)| *action == "Read"),
         "the always-fresh admit must disagree with the model"
     );
     let blind = |_: &Fresh, _: &Reading| Beside::default();
-    let caught = disagreements(&m, &real, &blind, &first_point);
+    let caught = disagreements(&m, &states, &real, &blind, &first_point);
     assert!(
         caught
             .iter()
@@ -365,7 +361,7 @@ fn the_real_tap_takes_the_models_steps_on_every_reachable_state() {
         *silence = Silence::default();
         Heard::Same
     };
-    let caught = disagreements(&m, &real, &beside, &unsaid);
+    let caught = disagreements(&m, &states, &real, &beside, &unsaid);
     assert!(
         caught
             .iter()

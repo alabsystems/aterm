@@ -1052,6 +1052,13 @@ fn sh_shim_body(
         s.push_str(" ] && exec ");
         s.push_str(&launch);
         s.push_str(" \"$@\"\n");
+        // exec keeps $$, unlike a descendant inheriting these fields. A raw fallback
+        // must retain its managed route even while the entry cannot be executed.
+        s.push_str("export ATPKG_MANAGED_LAUNCH_PID=\"$$\"\nexport ATPKG_MANAGED_LAUNCH_PATH=");
+        s.push_str(&launch);
+        s.push_str("\nexport ATPKG_MANAGED_LAUNCH_TARGET=");
+        s.push_str(&target_q);
+        s.push('\n');
     }
     if let Some(route) = route {
         let marker = route
@@ -1095,6 +1102,15 @@ pub(crate) fn parse_sh_shim_env(content: &str) -> crate::shim_env::ShimEnv {
         let Some((name, quoted)) = rest.split_once("='") else {
             continue;
         };
+        // These describe one exec, not a manifest's persistent shim environment.
+        if matches!(
+            name,
+            "ATPKG_MANAGED_LAUNCH_PID"
+                | "ATPKG_MANAGED_LAUNCH_PATH"
+                | "ATPKG_MANAGED_LAUNCH_TARGET"
+        ) {
+            continue;
+        }
         let Some(value) = quoted.strip_suffix('\'') else {
             continue;
         };

@@ -644,6 +644,10 @@ impl Grid {
     /// Set the retained scrollback line limit (`None` = unlimited).
     pub fn set_scrollback_line_limit(&mut self, limit: Option<usize>) {
         // The worker owns the store during an off-thread reflow. Keep the
+        // newest request in the detach snapshot so the getter is truthful and
+        // re-attach can replay it. If another path has already attached a
+        // replacement store, apply below as well; replaying the same latest
+        // value when the stale worker result arrives is harmless.
         if self.storage.scrollback_detached_for_reflow {
             debug_assert!(
                 self.storage.pending_scrollback_settings.is_some(),

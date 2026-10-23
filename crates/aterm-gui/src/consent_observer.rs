@@ -217,6 +217,8 @@ fn field_after<'a>(haystack: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
     // `log stream` opens every generation with a header echoing the predicate (`Filtering the
+    // log data using "… CONTAINS "AUTHREQ_PROMPTING""`). Counted as `Unparsed` once per
+    // rotation, it would trip the drift limit after 64 quiet generations (16 h).
     if line.trim_start().starts_with("Filtering the log data") {
         return None;
     }
@@ -233,6 +235,7 @@ pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
         };
         if !body.contains("pid=") {
             // A recognized kind with no pid anywhere is the format-change
+            // signature, not a self-request.
             return Some(TccEvent::Unparsed);
         }
         return Some(TccEvent::Attribution {
@@ -677,7 +680,7 @@ impl ObserverProbe {
 }
 
 /// Headless attribution has no process-table observation.
-fn inert_process_probe(_pid: i32) -> Option<i32> {
+const fn inert_process_probe(_pid: i32) -> Option<i32> {
     None
 }
 
@@ -1717,7 +1720,7 @@ impl AttentionGate {
         self.denied_sessions.iter().any(|(id, _)| *id == session)
     }
 
-    pub(crate) fn has_denials(&self) -> bool {
+    pub(crate) const fn has_denials(&self) -> bool {
         !self.denied_sessions.is_empty()
     }
 
@@ -1776,7 +1779,7 @@ impl AttentionGate {
 
 impl crate::App {
     /// Returns the `observer log=` token for the `privacy` control verb.
-    pub(crate) fn privacy_observer_log(&self) -> &'static str {
+    pub(crate) const fn privacy_observer_log(&self) -> &'static str {
         self.consent_observer.availability().as_str()
     }
 }

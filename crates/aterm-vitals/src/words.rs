@@ -417,6 +417,7 @@ pub struct Parts {
 
 /// `v` rounded half up to a whole number (v2 §6.0).
 fn half_up(v: f64) -> f64 {
+    // The nudge rounds a half that binary floating point stores a hair low
     // (12.5 % of 0.125 as 12.499…) up, as the reader expects.
     (v + 0.5 + 1e-9).floor()
 }

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test support (test and debug builds, never release ones): the `git` a test fixture
-//! runs, the developer directory's own, isolated from the machine the tests run on.
+//! Hermetic `git` command builder for test fixtures.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -17,11 +16,7 @@ pub fn git() -> Command {
     git
 }
 
-/// Isolate `cmd` (a fixture's git, or a child that runs one) from this machine: no
-/// inherited `GIT_*` but a trace (a hook's `GIT_DIR`, an alias's `GIT_CONFIG_PARAMETERS`),
-/// no system or global config, no global ignore or attributes file (git reads those under
-/// `$XDG_CONFIG_HOME` whatever `GIT_CONFIG_GLOBAL` says), and a fixed `EMAIL` for an
-/// identity no fixture set. What is set on `cmd` after this still applies.
+/// Isolates `cmd` from the host machine's Git environment and global configuration.
 pub fn hermetic(cmd: &mut Command) -> &mut Command {
     for (key, _) in std::env::vars_os() {
         let key_text = key.to_string_lossy();
@@ -35,9 +30,7 @@ pub fn hermetic(cmd: &mut Command) -> &mut Command {
         .env("EMAIL", "fixture@example.invalid")
 }
 
-/// The executable a `git` from `PATH` ends up running, resolved once per process: on macOS,
-/// what xcode-select's `/usr/bin/git` trampoline would exec (`xcrun --find git`), so no
-/// fixture git pays a second exec; elsewhere, or when the lookup fails, that `git`.
+/// Resolves the underlying `git` executable once per process, bypassing `/usr/bin/git` on macOS.
 fn path() -> &'static Path {
     static GIT: OnceLock<PathBuf> = OnceLock::new();
     GIT.get_or_init(|| {

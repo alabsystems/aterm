@@ -15,6 +15,9 @@ use std::fmt;
 use crate::prompt::parse_prompt;
 use crate::wall::{Placement, Wall, WallKind, classify_wall};
 
+/// Version of the Claude Code harness, tracked independently per harness starting at `"0.1"`.
+pub const HARNESS_VERSION: &str = "0.1";
+
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
@@ -269,7 +272,8 @@ pub fn carried_wait_alone(rows: &[String]) -> bool {
         && busy_signal(rows) == Some(CARRIED)
 }
 
-/// Walking up from the top rule `top` over every row.
+/// Walking up from the top rule `top` over every row, the first glyph row
+/// ([`is_glyph_row`]) met.
 fn glyph_above(rows: &[String], top: usize) -> Option<usize> {
     let parked = crate::survey::parked_span(rows);
     for i in (0..top).rev() {
@@ -324,7 +328,10 @@ fn counts_work(row: &str) -> bool {
         })
 }
 
-/// The rules of [`busy_signal`] that are the agent's own background work with its turn.
+/// The rules of [`busy_signal`] that are the agent's own background work with its turn over (a
+/// dynamic workflow, a background agent or other task it waits for, a shell or a monitor it
+/// left running, a workflow's progress line), never a live turn's (a spinner, `esc to
+/// interrupt`, `Still working`, a foreground command's `ctrl+b to run in background`).
 const BACKGROUND_RULES: &[&str] = &[
     "waiting for a dynamic workflow",
     "waiting for a background agent",
@@ -367,7 +374,10 @@ fn turn_just_begun(rows: &[String]) -> bool {
     })
 }
 
-/// Whether the agent's own background work.
+/// Whether the agent's own background work (a shell, a monitor, a workflow, a background
+/// agent, hard or soft), and nothing else, keeps this screen busy: the composer frame is drawn,
+/// no live turn is drawn anywhere ([`no_live_turn`]) and none has just begun
+/// ([`turn_just_begun`]), whatever the last thing said.
 #[must_use]
 pub fn background_only(rows: &[String]) -> bool {
     composer_frame(rows).is_some()
@@ -713,7 +723,11 @@ fn frame_at(rows: &[String], caret: usize) -> Option<Frame> {
     Some(Frame { top, bottom })
 }
 
-/// The composer's frame on a screen ([`composer_rules`]) and how much of the screen the search.
+/// The composer's frame on a screen ([`composer_rules`]) and how much of the
+/// screen the search for it READ — for a caller that keeps a reading of the
+/// frame and the rows under its bottom rule from one rebuild of a pane's rows
+/// to the next, and knows which rows changed between them (aterm's footer
+/// and lights: `footer::mode_row_under`, `footer::pill_row_under`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameReach {
     frame: Option<Frame>,
@@ -850,6 +864,7 @@ pub(crate) fn composer_top(rows: &[String]) -> Option<usize> {
 
 /// A full-width composer rule.
 pub fn is_rule(row: &str) -> bool {
+    // A rule opens on `─` (and the trim below cuts only its end): any other
     // first char rejects the row before the char-wise trims and counts.
     if !row.as_bytes().starts_with("─".as_bytes()) {
         return false;
@@ -898,7 +913,11 @@ pub(crate) struct StatusBlock {
 }
 
 impl StatusBlock {
-    /// The status row's text, its line read across the rows Ink wrapped it.
+    /// The status row's text, its line read across the rows Ink wrapped it
+    /// onto, joined with one space ([`crate::wrap::rejoined`]): `✻ Choreogr
+    /// aphing…` (a word wider than the row broken where the row ends, read in
+    /// two halves), `✻ Baked for 0s · done 7:06 AM` — a glyph alone on its
+    /// row read over the text columns Ink laid out under it ([`status_text`]).
     pub(crate) fn line<'a>(&self, rows: &'a [String]) -> Option<Cow<'a, str>> {
         let status = self.status?;
         Some(if self.end > status {
@@ -1099,7 +1118,9 @@ pub fn is_glyph_row(row: &str) -> bool {
         || is_spinner_shape(row)
 }
 
-/// A row only the transcript.
+/// A row only the transcript has: the worker's message or tool call in column
+/// 0 (`⏺`; `●` where the platform draws that — never the session survey), or
+/// output under the `⎿` gutter that is not a tip or a todo item.
 pub(crate) fn is_transcript_row(row: &str) -> bool {
     if is_survey(row) {
         return false;
@@ -1328,7 +1349,8 @@ pub fn completion_menu(rows: &[String]) -> Option<CompletionMenu> {
     })
 }
 
-/// The column a build that draws the completion menu's pointer starts every entry.
+/// The column a build that draws the completion menu's pointer starts every entry at:
+/// `  ❯ ` before the pointed one, four spaces before the rest (2.1.290 and later).
 pub const POINTER_ROOM: usize = 4;
 
 /// One thing Enter may do over Claude Code's completion menu ([`CompletionMenu::runs`]).
@@ -1836,7 +1858,7 @@ pub(crate) fn line_at(rows: &[String], i: usize, until: usize, width: usize) -> 
 /// What the vendor adds under a message past 1000 characters.
 const EXPAND_HINT: &str = "(ctrl+o to expand)";
 
-/// The vendor's error row the last turn ended.
+/// The vendor's error row the last turn ended on.
 fn error_row_notice(
     rows: &[String],
     last: usize,
@@ -1889,11 +1911,11 @@ pub struct SaidNotice {
     pub text: String,
     /// It has the vendor's error row's own shape, which no table needs to name.
     pub shaped: bool,
-    /// The row its line opens.
+    /// The row its line opens on: the `⏺` row, or the block's `⎿` row.
     pub row: usize,
     /// [`Placement::ErrorRow`] for a `⏺` row, [`Placement::Gutter`] for a `⎿` block.
     pub placement: Placement,
-    /// The block stands right under a hook's error row, where the hook's own words.
+    /// The block stands right under a hook's error row, where the hook's own words do.
     pub hook_words: bool,
 }
 
@@ -2009,7 +2031,12 @@ fn block_is_vendors(rows: &[String], open: usize) -> Block {
     Block::Unowned
 }
 
-/// Whether the owner walk ([`block_is_vendors`]) from the `⎿` block row `i` stands in reaches.
+/// Whether the owner walk ([`block_is_vendors`]) from the `⎿` block row `i`
+/// stands in reaches THE FIRST OF `rows` with no owner found — no row in
+/// column 0, no blank row over a row that opens an item — so whatever owns
+/// the block, if anything does, is above the rows: a call row scrolled off
+/// the screen over its long output (2.1.304, measured: the history right
+/// above the screen holds it, `claude-2.1.304-verbose-long-output-context-wall-scrollback.txt`).
 #[must_use]
 pub fn owner_above_rows(rows: &[String], i: usize) -> bool {
     gutter_open(rows, i).is_some_and(|open| block_is_vendors(rows, open) == Block::Unowned)
@@ -2093,7 +2120,7 @@ pub fn words_of(rows: &[String], i: usize) -> WordsOf {
 /// Where a walk up from a row ended ([`message_open`], [`owning_gutter`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Walk {
-    /// At the row it looks.
+    /// At the row it looks for.
     Found(usize),
     /// At a row that says the row walked from has none.
     None,
@@ -2101,7 +2128,8 @@ enum Walk {
     Top,
 }
 
-/// The `⏺` or `●` row whose message row `i` is a later row.
+/// The `⏺` or `●` row whose message row `i` is a later row of: up from `i`
+/// over the message's own rows ([`in_message`]) to that bullet row.
 fn message_open(rows: &[String], i: usize) -> Walk {
     let mut j = i;
     while in_message(&rows[j]) {
@@ -2117,7 +2145,7 @@ fn message_open(rows: &[String], i: usize) -> Walk {
     }
 }
 
-/// The `⎿` row that row `i` stands.
+/// The `⎿` row that row `i` stands under.
 fn owning_gutter(rows: &[String], mut i: usize) -> Walk {
     loop {
         let row = rows[i].as_str();
@@ -2234,7 +2262,10 @@ fn footer_notice(
         })
 }
 
-/// What of footer row `i` Claude Code itself drew a notice.
+/// What of footer row `i` Claude Code itself drew a notice in, measured on
+/// 2.1.304 (`claude-2.1.304-footer-*`, `…-statusline-login-words-*`,
+/// `…-wall-session-auto-continue-*`) and on 2.1.299 and 2.1.300 at 26, 34,
+/// 50 and 80 columns: the footer is two columns.
 fn footer_text(
     rows: &[String],
     from: usize,
@@ -2310,7 +2341,9 @@ pub(crate) fn under_a_call(rows: &[String], i: usize) -> bool {
     })
 }
 
-/// The `⎿` row that opens the gutter block row `i` belongs.
+/// The `⎿` row that opens the gutter block row `i` belongs to: `i` itself, or
+/// the row its continuation rows (indented to the gutter's text,
+/// [`GUTTER_TEXT_COLUMN`] or more) hang from.
 pub(crate) fn gutter_open(rows: &[String], mut i: usize) -> Option<usize> {
     loop {
         let t = crate::text::trim_start(&rows[i]);

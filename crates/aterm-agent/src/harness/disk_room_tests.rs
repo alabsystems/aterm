@@ -5,21 +5,16 @@
 
 use super::*;
 
-/// Midnight UTC of a fixed day (20,743 whole days); every instant is the
-/// test's own.
 const DAY0: i64 = 1_792_195_200;
 const H: i64 = 3_600;
 const D: i64 = 86_400;
 const _: () = assert!(DAY0 % D == 0, "DAY0 is a midnight");
-/// The owner's Mac's Data volume, 1.81 TiB.
 const TOTAL: u64 = 1_948_404_040 * 1024;
 
 fn gib(n: u64) -> u64 {
     n * GIB
 }
 
-/// A day on which free space fell `fall` GiB inside one two-hour window
-/// (from 500 GiB, at noon), with readings every nine minutes.
 fn fall_on(m: &mut RoomMeter, day: i64, fall: u64) {
     let noon = DAY0 + day * D + 12 * H;
     for step in 0..=12u64 {
@@ -31,10 +26,6 @@ fn fall_on(m: &mut RoomMeter, day: i64, fall: u64) {
     }
 }
 
-/// A fall inside the two-hour window counts whole; one spread over more
-/// than two hours counts only what fell inside one window. NEGATIVE CONTROL:
-/// a reading two hours and a minute after the peak does not measure against
-/// it.
 #[test]
 fn a_fall_is_measured_against_the_two_hours_before_it() {
     let mut m = RoomMeter::new();
@@ -47,8 +38,6 @@ fn a_fall_is_measured_against_the_two_hours_before_it() {
     assert_eq!(slow.days(), [(DAY0 / D, 0)], "past the window");
 }
 
-/// A later rise (a pass, an `rm`, a gc) cancels no earlier fall: the day keeps
-/// its largest.
 #[test]
 fn a_later_rise_cancels_no_earlier_fall() {
     let mut m = RoomMeter::new();
@@ -58,10 +47,6 @@ fn a_later_rise_cancels_no_earlier_fall() {
     assert_eq!(m.days(), [(DAY0 / D, gib(90))]);
 }
 
-/// ONE OUTLIER DAY DOES NOT SET THE ROOM: a 300 GiB copy on one day and
-/// builds of 60-80 GiB on the others give a room of the second-largest day,
-/// 80 GiB. NEGATIVE CONTROL: the outlier IS the week's largest fall, so a
-/// plain maximum would have read 300.
 #[test]
 fn one_outlier_day_does_not_set_the_room() {
     let mut m = RoomMeter::new();
@@ -73,9 +58,6 @@ fn one_outlier_day_does_not_set_the_room() {
     assert_eq!(m.days().iter().map(|(_, f)| *f).max(), Some(gib(300)));
 }
 
-/// With readings on fewer than two days the room is the bounds' floor, and a
-/// day older than seven ages out of the room (and of the meter at its next
-/// reading).
 #[test]
 fn fewer_than_two_days_read_the_floor_and_a_week_old_day_ages_out() {
     let (lo, hi) = room_bounds(TOTAL);
@@ -91,9 +73,6 @@ fn fewer_than_two_days_read_the_floor_and_a_week_old_day_ages_out() {
     assert!(m.days().iter().all(|(d, _)| *d > DAY0 / D + 1));
 }
 
-/// The room is clamped to the volume: a tiny daily fall reads the floor, a
-/// huge one the cap; on a 128 GB disk the clamp is [5 %, 10 %] and not
-/// empty (`[16 GiB, 10 %]` would be).
 #[test]
 fn the_room_is_clamped_to_the_volume_and_the_clamp_is_defined_on_a_small_one() {
     let mut m = RoomMeter::new();
@@ -112,9 +91,6 @@ fn the_room_is_clamped_to_the_volume_and_the_clamp_is_defined_on_a_small_one() {
     assert_eq!(room_bounds(huge), (gib(16), gib(256)));
 }
 
-/// Encode and decode keep the day pairs (the in-day ring is not kept); a
-/// corrupt file reads as no history; [`Rooms`] keeps at most eight volumes
-/// and writes at most hourly.
 #[test]
 fn the_rooms_round_trip_and_a_corrupt_file_is_no_history() {
     let mut rooms = Rooms::default();
@@ -159,8 +135,6 @@ fn the_rooms_round_trip_and_a_corrupt_file_is_no_history() {
     assert!(many.save_due(DAY0 + H));
 }
 
-/// Saved and loaded through the file, by temp file and rename; a directory
-/// with no file loads as no history.
 #[test]
 fn the_rooms_persist_in_the_harness_state_directory() {
     let tmp = super::super::tests::Tmp::new("room-file");

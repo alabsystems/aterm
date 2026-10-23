@@ -8,11 +8,7 @@ use std::collections::HashMap;
 
 use super::{Decor, Key, Value};
 
-/// One entry in a table: a scalar/array/inline-table, a sub-table, an array of
-/// sub-tables, or nothing at all.
-///
-/// [`Item::None`] is not a TOML value but the vacant state, so indexing a document with a
-/// missing key yields a place to write rather than a panic.
+/// One entry in a table: a value, a sub-table, an array of sub-tables, or vacant ([`Item::None`]).
 #[derive(Debug, Clone, Default)]
 pub enum Item {
     /// No entry.
@@ -217,12 +213,7 @@ impl Item {
         self.as_table_like()?.get(key)
     }
 
-    /// The byte range this entry occupied in the document it was parsed from.
-    ///
-    /// For a value that is the value token; for a `[header]` table it is the
-    /// header line. It is `None` for a synthesized node, for an array of
-    /// tables (whose elements each carry their own), and after a mutation that
-    /// invalidated it.
+    /// Byte range this entry occupied in the parsed source (`None` if synthesized, invalidated, or an array of tables).
     #[inline]
     #[must_use]
     pub fn span(&self) -> Option<Range<usize>> {
@@ -252,9 +243,7 @@ impl From<Value> for Item {
     }
 }
 
-/// An insertion-ordered map from key to entry: sorting would reorder a user's file on the
-/// first write. A side index keeps `get` off a scan in big tables (the lexicon has
-/// thousands of keys).
+/// Insertion-ordered map from key to entry with a hash index for O(1) lookup.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct KeyMap {
     entries: Vec<(Key, Item)>,
@@ -271,9 +260,7 @@ impl KeyMap {
         Some(&mut self.entries[i].1)
     }
 
-    /// Where `key` sits among the entries. A position stays valid until an entry is
-    /// removed (inserting never moves one), so the parser can keep a header's path as
-    /// positions while it appends beneath it.
+    /// Index of `key` in `entries` (valid until an entry is removed).
     pub(crate) fn position(&self, key: &str) -> Option<usize> {
         self.index.get(key).copied()
     }
@@ -290,8 +277,7 @@ impl KeyMap {
         })
     }
 
-    /// Insert, keeping an existing key's position and authored spelling, so
-    /// `doc["font_px"] = new` replaces one value without moving its line.
+    /// Inserts `value`, preserving an existing key's position and authored spelling.
     pub(crate) fn insert(&mut self, key: Key, value: Item) -> Option<Item> {
         match self.index.get(key.get()) {
             Some(&i) => Some(core::mem::replace(&mut self.entries[i].1, value)),
@@ -339,37 +325,23 @@ impl KeyMap {
     }
 }
 
-/// A TOML table: `[header]`, the document root, or the implied parent of a
-/// dotted key.
+/// A TOML table: `[header]`, the document root, or the implied parent of a dotted key.
 #[derive(Debug, Clone, Default)]
 pub struct Table {
     pub(crate) items: KeyMap,
     pub(crate) decor: Decor,
-    /// No `[header]` was authored for this table; a deeper one named it. An implicit table
-    /// with no direct values prints no header, so `[a.b]` alone does not grow a stray `[a]`.
+    /// True when no `[header]` was authored for this table (created implicitly by a deeper header).
     pub(crate) implicit: bool,
-    /// This table came from a dotted key (`a.b = 1`), so it is printed as part
-    /// of its parent's key-value line, never as a header of its own.
+    /// True when created from a dotted key (`a.b = 1`) and printed inline on its parent's key-value line.
     pub(crate) dotted: bool,
-    /// Where this table's header stood among all headers in the document. Rendering sorts
-    /// on it, so `[a.b]` written before `[a]` prints back in that order.
+    /// Header ordinal in the document for preserving authored header order.
     pub(crate) position: Option<usize>,
     pub(crate) span: Option<Range<usize>>,
-    /// The verbatim text between the header brackets, so `[ a . b ]` prints back with its
-    /// spacing. Kept on the table, not the key segments, because an implicit parent's key
-    /// node is shared with the deeper header that created it.
+    /// Verbatim text between header brackets (`[ a . b ]`).
     pub(crate) header_repr: Option<super::RawString>,
-    /// Created by a dotted key, so a later `[header]` may not redefine it. A header may still
-    /// add a sub-table beneath it, so the parser reads this only when a header path ends here.
+    /// True when created by a dotted key so a later `[header]` cannot redefine it.
     pub(crate) closed: bool,
-    /// Comment and blank lines printed after this table's key-value lines: the
-    /// comment lines the parser read directly under its last line (up to the
-    /// first blank line before the next header or the end of the file, which
-    /// describe what is above them), and the ones a removed LAST line was
-    /// written under (see [`super::DocumentMut::remove_path`]). Keeping them
-    /// here, not on whichever header prints next, holds them under this table
-    /// when a reset prunes it, and when an edit adds a table that prints
-    /// between.
+    /// Comment and blank lines printed after this table's key-value lines.
     pub(crate) trailing: super::RawString,
 }
 
@@ -443,9 +415,7 @@ impl Table {
         self.items.remove(key)
     }
 
-    /// Keep the comment and blank lines the removed line was written under where they were:
-    /// on the head of the next line this table prints, else after its last one. The rest of
-    /// the head (indentation, dotted path) goes with the line.
+    /// Preserves leading comment and blank lines from `removed` on the next printed line or `self.trailing`.
     pub(crate) fn keep_lines_above(&mut self, removed: &Key) {
         let Some(repr) = &removed.path_repr else {
             return;
@@ -456,8 +426,6 @@ impl Table {
         let lines = &repr.head.as_str()[..=end];
         let mut keys = Vec::new();
         line_keys_mut(&mut self.items, &mut keys);
-        // A built key (order `usize::MAX`) prints after every authored line and
-        // has no authored head to extend, so the lines go after the table's.
         let next = keys
             .into_iter()
             .filter(|key| key.order > removed.order)
@@ -468,9 +436,7 @@ impl Table {
         }
     }
 
-    /// The table's own key-value lines, in authored order: every scalar, array or inline
-    /// table reachable without crossing a header (the direct values and the leaves of dotted
-    /// sub-tables), with the dotted key path that names it.
+    /// Direct and dotted-subtable key-value pairs in authored order.
     #[must_use]
     pub fn get_values(&self) -> Vec<(Vec<&Key>, &Value)> {
         let mut out = Vec::new();
@@ -480,9 +446,7 @@ impl Table {
     }
 }
 
-/// Restore the order the lines were written in: the tree groups dotted keys under their
-/// shared parent, which would reorder a file that interleaves `net.listen`, `font_px`,
-/// `net.timeout_ms`. Stable, so unauthored keys (`usize::MAX`) keep insertion order at the end.
+/// Sorts key-value pairs by authored line order (`Key::order`).
 pub(crate) fn sort_by_authored_order(values: &mut [(Vec<&Key>, &Value)]) {
     values.sort_by_key(|(path, _)| path.last().map_or(usize::MAX, |key| key.order));
 }
@@ -566,10 +530,7 @@ impl<'a> IntoIterator for &'a ArrayOfTables {
     }
 }
 
-/// The operations shared by the two table spellings, `[header]` and
-/// `{ inline }`.
-///
-/// Object-safe, so callers walk either spelling through a `&dyn TableLike`.
+/// Object-safe operations shared by `[header]` and `{ inline }` tables.
 pub trait TableLike {
     /// Entries in authored order.
     fn iter(&self) -> Box<dyn Iterator<Item = (&str, &Item)> + '_>;

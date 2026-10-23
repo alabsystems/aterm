@@ -743,7 +743,16 @@ pub fn remove_all(layout: &Layout) -> io::Result<()> {
     }
 }
 
-/// Bring every trust shim in `bin/` in line with the exec roots its build needs, and write nothing when it already is:
+/// Bring every trust shim in `bin/` in line with the exec roots its build needs, and
+/// write nothing when it already is:
+///
+/// 1. [`sweep`];
+/// 2. group the `bin/` shims that forward to a trust build's tools by build (`trust_shims`);
+/// 3. [`ensure_root`] at `depth` for each build that is there;
+/// 4. re-render each shim through `platform::shim_executable_to_env` with the environment
+///    it already exports, and keep those whose bytes differ (routed where a root now
+///    stands, plain where none does);
+/// 5. lay them ([`crate::lay::write_in_process`]).
 #[must_use]
 pub fn reconcile(layout: &Layout, depth: Depth) -> Report {
     if cfg!(not(unix)) {
@@ -901,6 +910,8 @@ pub fn inspect(layout: &Layout, build: u64) -> Option<Result<Inspection, String>
         let mut unrouted = Vec::new();
         for (shim, target) in trust_shims(layout).remove(&build).unwrap_or_default() {
             // A shim whose target is not a regular file of the build has nothing to route
+            // to (no root carries it, and [`route_for_shim`] answers `None`): it is a broken
+            // shim, which doctor's own scan names, not an unrouted one.
             if !std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file()) {
                 continue;
             }

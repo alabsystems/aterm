@@ -14,6 +14,8 @@ impl Grid {
     /// Extract the whole off-screen scrollback as logical [`Line`]s.
     // COST: UNBOUNDED(ring+tiered-history-lines) — materializes the entire off-screen scrollback.
     // COST: UNBOUNDED(ring+tiered-history-lines) — materializes the entire
+    // off-screen scrollback. Must stay behind the `resize_offloading_scrollback`
+    // detach on any main-thread-reachable path (`aterm-census --mainloop`).
     pub(super) fn take_scrollback_lines(&mut self) -> Vec<Line> {
         self.drain_lazy_buffer();
         let mut lines = Vec::new();
@@ -46,6 +48,7 @@ impl Grid {
     /// Extract the ring's scrollback rows but the `keep` newest as logical [`Line`]s.
     // COST: O(ring-scrollback-rows): bounded by the ring capacity (a construction-time constant).
     // COST: O(ring-scrollback-rows): bounded by the ring capacity (a
+    // construction-time constant), not by session history.
     pub(super) fn take_older_ring_scrollback_lines(&mut self, keep: usize) -> Vec<Line> {
         let ring_scrollback = self.storage.ring_buffer_scrollback();
         let take = ring_scrollback.saturating_sub(keep);
@@ -112,6 +115,7 @@ impl Grid {
                 }
             }
             if self.storage.lazy_buffer.is_empty() {
+                // No overflow pending: drain_lazy_buffer would early-return, but
                 // budget enforcement and display-offset clamping must still run.
                 self.enforce_scrollback_budget_and_clamp();
             } else {
@@ -313,6 +317,8 @@ pub(super) fn rewrap_cell_row(
 /// The newest `rows` rows of [`reflow_scrollback_lines`]`(lines, new_cols)`.
 // COST: O(rows × new_cols + one logical line).
 // COST: O(rows × new_cols + one logical line): every logical line rewrapped
+// but the oldest one visited yields only kept rows, at most `new_cols` cells
+// each.
 #[must_use]
 pub(super) fn reflow_newest_rows(lines: &[Line], new_cols: u16, rows: usize) -> Vec<Line> {
     let mut runs: Vec<Vec<Line>> = Vec::new();
@@ -364,6 +370,7 @@ fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
         return false;
     }
     let Some(text) = line.as_str() else {
+        // Non-UTF-8 content: the rebuild path maps it to a blank line; never
         // clone it through.
         return false;
     };

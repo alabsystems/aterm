@@ -49,7 +49,7 @@ pub(crate) fn level_line(mask: usize, level: Option<PressureLevel>) -> String {
     format!("memory pressure: the system reports {word} (level {mask:#x})")
 }
 
-fn level_of(level: usize) -> Option<PressureLevel> {
+const fn level_of(level: usize) -> Option<PressureLevel> {
     if level & CRITICAL != 0 {
         Some(PressureLevel::Critical)
     } else if level & WARN != 0 {
@@ -97,7 +97,7 @@ fn current_level() -> Option<usize> {
 }
 
 /// What a level asks of the scrollback's shed (`App::shed_memory_under_pressure`).
-pub(crate) fn scrollback_shed(level: PressureLevel) -> Option<bool> {
+pub(crate) const fn scrollback_shed(level: PressureLevel) -> Option<bool> {
     match level {
         PressureLevel::Normal => None,
         PressureLevel::Warn => Some(false),

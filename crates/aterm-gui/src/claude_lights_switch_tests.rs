@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE HARNESS SWITCH ON THE COMPOSER'S TOP RULE (owner, 2026-10-20: "there
-//! needs to be an \"on\" button drawn for the claude harness"; design §2.3):
-//! wherever a host is, Claude Code's top rule draws ONE switch at its right,
-//! `alab harness ● on` — lit while the harness carries the session, and in
-//! every off state (the session's own word, its agent's switch, the master
-//! switch) `alab harness ○ off ▐ on ▌`, whose `on`
-//! button turns the harness on from whichever switch holds it off, opening
-//! nothing. Driven through the window's own pointer path on the real
-//! engine, read off the frame the capture route splices.
+//! Tests for the Claude Code composer top-rule harness switch.
 
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -27,8 +19,6 @@ use crate::autopilot::{AutopilotView, HarnessSwitch, SwitchOff};
 use crate::native_settings::SettingsRoute;
 use crate::{App, WindowId};
 
-/// A Claude Code pane `cols` wide in a hosted window: its program read, its
-/// facts published, its composer drawn, one frame painted.
 fn claude_pane(cols: u16) -> (App, WindowId, u64, UnixStream, Hosted) {
     let (mut app, wid, session, reader) = app();
     assert!(app.apply_term_resize(wid, 24, cols));
@@ -51,14 +41,12 @@ fn set_program(app: &App, session: u64, program: Option<&str>) {
         .set_program(PGID, program.map(Into::into));
 }
 
-/// The policy in force, as the config watcher would post `text`.
 fn policy(app: &mut App, text: &str) {
     app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
         crate::app_config::HarnessPolicy::read(text),
     );
 }
 
-/// The composer's top rule as the frame paints it, glyph by glyph.
 fn top_rule(app: &App, wid: WindowId) -> String {
     app.windows[&wid].input_scratch.cells[footer_row(app, wid) - 2]
         .iter()
@@ -66,7 +54,6 @@ fn top_rule(app: &App, wid: WindowId) -> String {
         .collect()
 }
 
-/// What the cells `cols` of switch `b`'s row paint.
 fn painted(app: &App, wid: WindowId, b: &BorderSwitch, cols: std::ops::Range<usize>) -> String {
     let row = &app.windows[&wid].input_scratch.cells[b.frame_row];
     assert!(
@@ -77,14 +64,12 @@ fn painted(app: &App, wid: WindowId, b: &BorderSwitch, cols: std::ops::Range<usi
     row[cols].iter().map(|c| c.ch).collect()
 }
 
-/// The switch the frame drew, if any (one pane, one switch at most).
 fn switch(app: &App, wid: WindowId) -> Option<BorderSwitch> {
     let toggles = &app.windows[&wid].claude_lights.border_toggles;
     assert!(toggles.len() <= 1, "one pane, one switch: {toggles:?}");
     toggles.first().cloned()
 }
 
-/// A left click at frame cell `cell`, as a person makes one.
 fn click_at(app: &mut App, wid: WindowId, cell: (usize, usize)) {
     let (x, y) = px_of(app, wid, cell);
     app.on_cursor_moved(wid, x, y);
@@ -92,7 +77,6 @@ fn click_at(app: &mut App, wid: WindowId, cell: (usize, usize)) {
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
 }
 
-/// The middle cell of the drawn switch's `on` button.
 fn on_button(app: &App, wid: WindowId) -> (usize, usize) {
     let b = switch(app, wid).expect("a switch");
     let button = b.button.expect("an off switch's on button");
@@ -123,7 +107,6 @@ pub(super) fn later(app: &mut App, wid: WindowId, session: u64) {
     }
 }
 
-/// The message the switch's refused write posted for `key`, if any.
 fn not_saved(app: &App, key: &str) -> Option<String> {
     let want = format!("harness.switch-save.{key}");
     app.messages
@@ -133,17 +116,8 @@ fn not_saved(app: &App, key: &str) -> Option<String> {
         .map(|r| r.detail.join(" "))
 }
 
-/// The off switch's face, every form: label, state, the `on` button.
 const OFF_FACE: &str = " alab harness \u{25cb} off \u{2590} on \u{258c} ";
 
-/// AN OFF SESSION'S `on` TURNS IT ON (the session's own word `off`): the
-/// lit switch reads `alab harness ● on`; Off draws `alab harness ○ off
-/// ▐ on ▌` — no wordmark, the switch alone — and a click on `on` writes the
-/// session's word `cruise`, so the next frame's switch is lit again; and
-/// the lit switch's click turns it off, as before. Nothing reaches the PTY
-/// and nothing opens. NEGATIVE CONTROL: a click on the rule beside the
-/// switch changes nothing (on main an Off session's rule drew no button,
-/// and its invisible pill turned it on from any of its cells).
 #[test]
 fn an_off_sessions_on_button_turns_it_on() {
     let (mut app, wid, session, mut reader, _host) = claude_pane(120);
@@ -171,14 +145,12 @@ fn an_off_sessions_on_button_turns_it_on() {
         painted(&app, wid, &off, off.button.clone().unwrap()),
         "\u{2590} on \u{258c}"
     );
-    // NEGATIVE CONTROL: the rule beside the switch.
     click_at(&mut app, wid, (off.frame_row, off.cols.start - 2));
     assert_eq!(
         autopilot(&app, session),
         (Some(Autopilot::Off), AutopilotView::Off),
         "control: the rule beside the switch is no button"
     );
-    // The `on` button.
     let at = on_button(&app, wid);
     click_at(&mut app, wid, at);
     assert_eq!(
@@ -190,7 +162,6 @@ fn an_off_sessions_on_button_turns_it_on() {
     frame(&mut app, wid);
     let lit = switch(&app, wid).expect("the switch, lit");
     assert_eq!(lit.face, HarnessSwitch::On);
-    // The lit switch's click, a separate click later, turns it off again.
     later(&mut app, wid, session);
     click_at(&mut app, wid, (lit.frame_row, lit.switch.start + 2));
     assert_eq!(
@@ -203,13 +174,6 @@ fn an_off_sessions_on_button_turns_it_on() {
     );
 }
 
-/// A DOUBLE CLICK ON `on` LEAVES THE HARNESS ON (review of k2/harnesson):
-/// in a real window a frame paints between a double click's
-/// two clicks, so the second lands on the switch the first lit; it is the
-/// same gesture's and does nothing, and the session stays in cruise. The
-/// same holds the other way: a double click on the lit switch leaves it
-/// off. NEGATIVE CONTROL: a separate click after a double click's interval
-/// flips it (on the branch before the fix the second click wrote `off`).
 #[test]
 fn a_double_click_on_on_leaves_the_harness_on() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -238,7 +202,6 @@ fn a_double_click_on_on_leaves_the_harness_on() {
         (Some(Autopilot::Cruise), AutopilotView::Cruise),
         "the second click of the double click turned nothing back"
     );
-    // NEGATIVE CONTROL: a separate click later turns it off…
     later(&mut app, wid, session);
     frame(&mut app, wid);
     let lit = switch(&app, wid).expect("lit");
@@ -249,8 +212,6 @@ fn a_double_click_on_on_leaves_the_harness_on() {
         AutopilotView::Off,
         "a later click"
     );
-    // …and a double click on the lit switch leaves it off, its second click
-    // on the `on` the frame between drew.
     frame(&mut app, wid);
     let at = on_button(&app, wid);
     click_at(&mut app, wid, at);
@@ -260,8 +221,6 @@ fn a_double_click_on_on_leaves_the_harness_on() {
         "the double click's second click on the off switch turned nothing on"
     );
 
-    // The bottom off chip uses the same enable gesture. A watcher readback
-    // between its two clicks must not turn the second into Cruise -> Land.
     for off in [
         "[harness]\nenabled = false\n",
         "[harness.claude]\nenabled = false\n",
@@ -281,8 +240,6 @@ fn a_double_click_on_on_leaves_the_harness_on() {
                 .is_some(),
             "the enable gesture was recorded"
         );
-        // The captured policy adoption is successful readback, unlike the
-        // immediate no-proxy write refusal used by the older chip controls.
         policy(&mut app, "[harness]\n");
         frame(&mut app, wid);
         assert_eq!(autopilot(&app, session), (None, AutopilotView::Cruise));
@@ -293,8 +250,6 @@ fn a_double_click_on_on_leaves_the_harness_on() {
             (None, AutopilotView::Cruise),
             "readback did not turn the double click's second press into land"
         );
-        // A genuinely separate click still cycles; mode-only clicks do not
-        // stamp a new enable gesture and may continue cycling immediately.
         later(&mut app, wid, session);
         click_at(&mut app, wid, at);
         assert_eq!(autopilot(&app, session).1, AutopilotView::Land);
@@ -311,17 +266,6 @@ fn a_double_click_on_on_leaves_the_harness_on() {
     }
 }
 
-/// THE MASTER SWITCH OFF (`[harness] enabled = false`): the same switch,
-/// `○ off ▐ on ▌`, and a click on `on` writes aterm.toml's master switch
-/// `true` through the config lane — the switch the owner sees off is the
-/// switch the click turns on, so one click is all it takes (the bottom
-/// rule's `⊘ off` chip does the same, `claude_lights`' gesture tests) —
-/// never the session's word, and Settings stays shut. This window has no
-/// event loop, so the lane refuses the write at once: the switch's own
-/// message names the key, and the `◐ turning on` the click armed lets go.
-/// The policy read back with the switch on (what the watcher posts once a
-/// write lands) lights it, the session under the table's default.
-/// NEGATIVE CONTROL: with no click, no write and no message.
 #[test]
 fn under_the_master_switch_off_on_turns_the_master_switch_on() {
     let (mut app, wid, session, mut reader, _host) = claude_pane(120);
@@ -368,9 +312,6 @@ fn under_the_master_switch_off_on_turns_the_master_switch_on() {
     assert!(pty(&mut reader, 0).is_empty());
 }
 
-/// CLAUDE CODE'S OWN SWITCH OFF (`[harness.claude] enabled = false`, the
-/// master on): `○ off ▐ on ▌` again, and `on` writes that switch `true` —
-/// not the master, not the word — opening nothing.
 #[test]
 fn under_the_agents_switch_off_on_turns_the_agents_switch_on() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -402,10 +343,6 @@ fn under_the_agents_switch_off_on_turns_the_agents_switch_on() {
     );
 }
 
-/// A WRITE IN FLIGHT (`HarnessSwitch::Turning`): while the config lane
-/// writes the switch, the face says `◐ turning on`, has no button, and a
-/// click does nothing — a double click never writes twice; the policy read
-/// back lights it. The repaint key moves with it and stands at rest.
 #[test]
 fn a_switch_turning_on_says_so_and_takes_no_click() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -441,8 +378,6 @@ fn a_switch_turning_on_says_so_and_takes_no_click() {
     assert_eq!(switch(&app, wid).map(|b| b.face), Some(HarnessSwitch::On));
 }
 
-/// The glass's marks (`● ○ ◐ ◌ ⊘ ⤓`) the frame draws as the chrome's icons
-/// on frame row `row` (`claude_card::WindowCards::paint_marks`).
 fn drawn_marks(app: &App, wid: WindowId, row: usize) -> Vec<ChromeIcon> {
     app.windows[&wid]
         .input_scratch
@@ -454,13 +389,6 @@ fn drawn_marks(app: &App, wid: WindowId, row: usize) -> Vec<ChromeIcon> {
         .collect()
 }
 
-/// THE SWITCH'S MARK IS DRAWN, ONE SET (the default macOS face has `●` and
-/// `○` but no `◐`, whose fallback drew half their size at 1×): on, off and
-/// turning on, the frame draws the mark's cell as the chrome's own `●`, `○`
-/// or `◐`, once however often it is painted or spliced, and the footer's
-/// strip takes it back, while the cell keeps its character for the text, a
-/// screen reader and copy. NEGATIVE CONTROL: a pane with no switch draws no
-/// mark on any row.
 #[test]
 fn the_switch_draws_its_mark_as_one_set_in_every_state() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -508,8 +436,6 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
     drawn(&app, BandIcon::HalfDisc, "turning on");
     frame(&mut app, wid);
     drawn(&app, BandIcon::HalfDisc, "turning on, painted again");
-    // The same scratch spliced again (a capture's re-splice: no strip
-    // clears its rasters first) takes the last mark back before it draws.
     let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
     for _ in 0..3 {
         app.splice_claude_footer(wid, &plan, route);
@@ -520,9 +446,6 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
     crate::claude_card::strip(&mut ws.claude_card, &mut ws.input_scratch);
     assert_eq!(drawn_marks(&app, wid, row), [], "the strip takes it back");
     frame(&mut app, wid);
-    // NEGATIVE CONTROL: no agent, no switch, no mark on any row but the
-    // bottom rule's, whose chip still says `⊘ off` (the chips' own mark,
-    // `the_chips_marks_are_drawn_as_the_switchs_are`).
     set_program(&app, session, None);
     frame(&mut app, wid);
     assert_eq!(switch(&app, wid), None, "control: no switch");
@@ -543,14 +466,6 @@ fn the_switch_draws_its_mark_as_one_set_in_every_state() {
     );
 }
 
-/// THE CHIPS' MARKS ARE DRAWN AS THE SWITCH'S ARE (`BandIcon::glass_mark`, one
-/// map for the glass): on the composer's bottom rule the Autopilot chip's
-/// `○ off` is drawn as the switch's ring and Land's `⤓ land` as the drawn
-/// arrow (STIX Two Math's stood 7 × 13 at 1×, over the capitals and below the
-/// baseline), each once at the cell that keeps its character, however often
-/// the frame is painted or the same scratch spliced (a splice again
-/// allocating nothing), and the strip takes them back. NEGATIVE CONTROL: Cruise's `∞` and the facts' marks (`◆ ⌂ ⎇`, the
-/// face's or set small by their script) draw no icon on the rule.
 #[test]
 fn the_chips_marks_are_drawn_as_the_switchs_are() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -623,11 +538,6 @@ fn the_chips_marks_are_drawn_as_the_switchs_are() {
     assert_eq!(drawn_marks(&app, wid, rule), [], "control: Cruise again");
 }
 
-/// ONE MAP, KEYED BY THE CHARACTER (`WindowCards::paint_marks`): of a write's
-/// cells, each full-size `● ○ ◐ ◌ ⊘ ⤓` is drawn at its own column, and the
-/// cell keeps its character. NEGATIVE CONTROLS: a small (`Script::Sub`) `◐`,
-/// as the context fact sets it, a wide glyph's continuation, and the marks
-/// the faces serve in the set's size (`∞ ✓ ⏸ ·`) draw nothing.
 #[test]
 fn the_glass_draws_its_marks_by_the_character_alone() {
     let (mut app, wid, _session, _reader, _host) = claude_pane(120);
@@ -668,15 +578,6 @@ fn the_glass_draws_its_marks_by_the_character_alone() {
     );
 }
 
-/// A REFILLED FRAME'S MARKS ALLOCATE ONLY THEIR LISTS: the engine's fill of a
-/// frame drops every chrome raster, so the footer's pass on a refilled frame
-/// gives each marked row a raster again, whose ground and rail are the one
-/// shared empty row: the row's icon list is all it allocates (Cruise's switch
-/// `●`; Off's switch and chip `○`; Land's switch `●` and chip `⤓`), frame
-/// after frame, and a splice of the same frame again allocates nothing. Each
-/// row cost three before (two empty rows of its own and its list). CONTROL:
-/// the counter sees the pass: the one that composes a mode's rule anew counts
-/// more than its marks' lists.
 #[test]
 fn a_refilled_frames_marks_allocate_only_their_lists() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -720,13 +621,6 @@ fn a_refilled_frames_marks_allocate_only_their_lists() {
     }
 }
 
-/// A MENU OVER THE TOP RULE KEEPS THE SWITCH'S MARK: the Autopilot menu,
-/// hung from its chip, covers the composer's top rule under its own columns
-/// only, and takes back the cells it covers, not the row: the switch's mark
-/// beside the card is still drawn as the chrome's `●` while the menu is up
-/// (on main the card's scrub retired the row's whole raster, and the cell
-/// fell back to the font's glyph), and as before once it closes. NEGATIVE
-/// CONTROL: no drawn icon is left on the card's own cells of that row.
 #[test]
 fn a_menu_over_the_top_rule_keeps_the_switch_mark_beside_it() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -770,7 +664,6 @@ fn a_menu_over_the_top_rule_keeps_the_switch_mark_beside_it() {
         mark,
         "the mark beside the card is still drawn, once"
     );
-    // CONTROL: nothing drawn is left over the card's cells of the row.
     let over_card: Vec<ChromeIcon> = app.windows[&wid]
         .input_scratch
         .chrome_rasters
@@ -786,9 +679,6 @@ fn a_menu_over_the_top_rule_keeps_the_switch_mark_beside_it() {
     assert_eq!(drawn_marks(&app, wid, row), mark, "the mark once it closes");
 }
 
-/// THE POINTER OVER `on` (hover): the button is drawn as what a press acts
-/// on (underlined, its fill lifted) and the repaint key moves; off it again, the key
-/// and the glass are what they were. Idle to zero: nothing else moves it.
 #[test]
 fn hovering_on_moves_the_key_and_leaving_puts_it_back() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
@@ -825,21 +715,11 @@ fn hovering_on_moves_the_key_and_leaving_puts_it_back() {
     );
 }
 
-/// One state a hosted pane can be in: its name, what puts the policy there,
-/// and the switch it draws.
 type Case = (&'static str, fn(&mut App), HarnessSwitch);
 
-/// WHERE THE SWITCH STANDS: in every state a host gives a Claude Code pane —
-/// Cruise and Land lit, Off, the master switch off and the agent's off with
-/// the `on` button — and on no pane without a host (Unhosted: nothing
-/// supervises, so no switch, the lockup alone on Claude's rule) or without
-/// an agent (a shell's rule, as the shell drew it). NEGATIVE CONTROL: the same pane with its host back draws
-/// it again.
 #[test]
 fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
-    // The word each case runs under (a word already standing writes
-    // nothing, so its answer is not asked).
     let word = |app: &mut App, w: Autopilot| {
         app.set_session_autopilot(session, Some(w), crate::autopilot::Surface::Chip);
     };
@@ -883,7 +763,6 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
             "{what}: {rule:?}"
         );
     }
-    // No host: nothing supervises — no switch, a plain rule.
     policy(&mut app, "[harness]\n");
     let held = app.harness.take();
     frame(&mut app, wid);
@@ -895,11 +774,9 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
             && rule.chars().skip(13).all(|c| c == '\u{2500}'),
         "unhosted: the lockup on the rule as Claude drew it: {rule:?}"
     );
-    // NEGATIVE CONTROL: the host back.
     app.harness = held;
     frame(&mut app, wid);
     assert!(switch(&app, wid).is_some(), "control: hosted again");
-    // No agent: a shell's rule.
     set_program(&app, session, None);
     frame(&mut app, wid);
     assert_eq!(switch(&app, wid), None, "no agent: no switch");
@@ -910,12 +787,6 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
     );
 }
 
-/// A NARROW PANE (`footer::fit_rule`'s rule for the top rule: the switch
-/// gives way LATE, after its words): narrowing column by column from 120,
-/// the off switch sheds `harness`, then `alab`, then `○ off`, and keeps
-/// its `on` button to the last — never a form back once a wider pane gave
-/// it up — and goes only where the rule has no room for `▐ on ▌` with a
-/// rule cell either side. CONTROL: every form is met.
 #[test]
 fn a_narrow_pane_keeps_the_on_button_to_the_last() {
     let (mut app, wid, session, _reader, _host) = claude_pane(121);
@@ -966,15 +837,6 @@ fn a_narrow_pane_keeps_the_on_button_to_the_last() {
     );
 }
 
-/// A SCREEN READER'S SWITCH (WCAG 2.5.3; `a11y_tree::HarnessChip`): the
-/// lit switch is one `Switch` node, toggled on, named by the words it
-/// paints; the off switch is a `Switch` node toggled off and an `on`
-/// button whose name begins with the word it paints (`on: turn the Claude
-/// Code harness on`), each name holding the painted words whole and in
-/// order, and the reader's press of `on` turns the session on — and,
-/// pressed while the switch is lit, does nothing. NEGATIVE
-/// CONTROL: a pane too narrow for the switch has no node, and the reader's
-/// press for it does nothing.
 #[cfg(a11y_tree)]
 #[test]
 fn the_switch_is_a_switch_a_screen_reader_can_press() {
@@ -1007,9 +869,6 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
         "{visual:?} in {:?}",
         lit[0].label
     );
-    // A press of `on` while the switch is lit — a stale or repeated request
-    // for a button the glass no longer shows — does nothing (review of
-    // k2/harnesson, it turned the harness OFF).
     let before = autopilot(&app, session);
     assert_eq!(before.1, AutopilotView::Cruise);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::SwitchOn);
@@ -1046,7 +905,6 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
         assert!(node.description.is_some(), "{node:?}");
     }
     assert_eq!(off[1].label, "on: turn the Claude Code harness on");
-    // NEGATIVE CONTROL: too narrow for the switch.
     assert!(app.apply_term_resize(wid, 24, 8));
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
@@ -1056,7 +914,6 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
         autopilot(&app, session),
         (Some(Autopilot::Off), AutopilotView::Off)
     );
-    // The reader's press of `on`.
     assert!(app.apply_term_resize(wid, 24, 120));
     draw_claude(&app, session, BYPASS);
     frame(&mut app, wid);
@@ -1067,16 +924,6 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
     );
 }
 
-/// DECORATION HAS NO NODE (spec §8; WCAG 1.1.1 and 2.5.3): a Claude Code
-/// pane wearing the lockup — the CLI's icon, a sprite over two blank cells,
-/// and its name — publishes the switch as one node named by the words it
-/// paints and the product it no longer spells, `alab harness on: Claude
-/// Code`, and no node over the lockup's cells, nor any node of the tree that
-/// names or holds them: the lockup is decoration, the switch the control.
-///
-/// NEGATIVE CONTROL: hb-int's law (a name that holds `harness` is the
-/// painted words alone) names the switch `alab harness on`, which lacks the
-/// product, and the name check refuses it.
 #[cfg(a11y_tree)]
 #[test]
 fn decoration_has_no_node() {
@@ -1091,7 +938,6 @@ fn decoration_has_no_node() {
     assert_eq!(cols, 2..13, "two `\u{2500}` in: {rule:?}");
     let product = b.program.product();
     let (words, _) = crate::claude_footer::switch_words(&b);
-    // The name holds the painted words whole and in order, then the product.
     let names = |label: &str| {
         crate::native_ui::visible_label_in_name(&words, label) && label.ends_with(product)
     };
@@ -1126,7 +972,6 @@ fn decoration_has_no_node() {
         .map(|(_, n)| n.role())
         .collect();
     assert!(held.is_empty(), "no node names the lockup: {held:?}");
-    // NEGATIVE CONTROL: hb-int's law.
     let hb_int = |words: &str, product: &str| {
         if words.contains("harness") {
             words.to_owned()
@@ -1142,26 +987,9 @@ fn decoration_has_no_node() {
     );
 }
 
-/// THE HARNESS'S TINT IS THE RULE'S; ITS LOCKUP AND SWITCH ARE THE HOST'S,
-/// for the resident pet (`crate::pet_chrome`). With the harness carrying the
-/// session the composer's top rule is repainted whole in its tint, the CLI's
-/// lockup at its left and the lit switch at its right. The strokes are the
-/// rule they were (the pet reads the program's own rule as ink); only the
-/// lockup's cells (its pads, the icon's two cells under its sprite, the
-/// name) and the switch's are protected ground. Noted whole, the rule
-/// refused every stand on the composer's first line (the pet's 1.7-row body
-/// reaches into it), and the cat waited off the line, up to fifty columns
-/// behind the caret, and bounded back at every line (2026-10-20, real Claude
-/// Code 2.1.305 with the harness on, windowed).
-///
-/// NEGATIVE CONTROL (as run on hb-int): the write noted whole
-/// (`PetChrome::note` over its length), every one of the rule's strokes is
-/// held.
 #[test]
 fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
-    // The host holds the session's live supervisor claim: the harness
-    // carries it, and its tint, lockup and switch stand on the rule.
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     crate::session_timeline::claim_supervisor(
         &ctx,
@@ -1172,7 +1000,6 @@ fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
     )
     .expect("the claim");
     frame(&mut app, wid);
-    // The menu's splice ends the pet's pass (`crate::pet_chrome`).
     app.splice_autopilot_menu(wid);
     let b = switch(&app, wid).expect("a hosted Claude Code pane draws the switch");
     assert!(
@@ -1184,7 +1011,6 @@ fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
         .map(|c| c.ch)
         .collect();
     let held = app.windows[&wid].pet_chrome.held().to_vec();
-    // Pane-local: one pane, at the window's first column.
     let covered = |col: usize| {
         let (r, c) = (b.term_row as f32 + 0.5, col as f32 + 0.5);
         held.iter().any(|rect| {
@@ -1219,20 +1045,10 @@ fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
     );
 }
 
-/// A POINTED AGENTS-PANEL ROW LEAVES THE OVERLAY STANDING (owner, 2026-10-21:
-/// the facts, the chips and the switch went when the pointer reached the
-/// bottom of the screen): Claude Code 2.1.307's full-screen renderer (the
-/// alternate screen, `1003` mouse tracking) hangs its agents panel under the
-/// mode row and a blank, and points at the row the pointer hovers with `❯ `
-/// in column 0. Pointed or not, the switch stands on the composer's top rule
-/// and the facts and the Autopilot chip in its bottom rule, on the same rows.
-/// RED with a876b81f9d's reader reverted, which read the pointed row as the
-/// caret, lost the frame and drew none of them. CONTROL: the panel unpointed.
 #[test]
 fn a_pointed_agents_panel_row_keeps_the_switch_the_facts_and_the_chip() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     let rule = "\u{2500}".repeat(120);
-    // The pane's row 0 in the frame (`footer_row` is `draw_claude`'s row 22).
     let strip = footer_row(&app, wid) - 22;
     let (main, agent) = ("\u{23FA} main", "\u{25EF} general-purpose  Searching");
     for (main, agent) in [
@@ -1269,18 +1085,6 @@ fn a_pointed_agents_panel_row_keeps_the_switch_the_facts_and_the_chip() {
     }
 }
 
-/// THE SWITCH READS ON A TAB'S OWN THEME (design §8; `session_theme`): a
-/// tab drawn in a theme of its own keeps the instance's accent — the
-/// window's chrome follows the instance — so on an instance in Dracula a
-/// Claude Code tab in Default Light laid the master switch's `○ off ▐ on ▌`
-/// with Dracula's light accent on Default Light's paper, the `on` pill and
-/// its letters at 1.0:1, and the only control that turns the harness back
-/// on could not be read. On the composer's top rule every letter of the
-/// switch reads at 4.5:1 or more on what it is laid on, and the pill's caps
-/// and fill at 3:1 or more on the tab's ground.
-///
-/// NEGATIVE CONTROL: the instance's accent as chosen reads under 1.5:1 on
-/// the tab's ground.
 #[test]
 fn the_switch_reads_on_a_tab_theme_the_instance_did_not_choose() {
     use aterm_effects::color_math::contrast_ratio;
@@ -1358,16 +1162,6 @@ fn the_switch_reads_on_a_tab_theme_the_instance_did_not_choose() {
     );
 }
 
-/// THE BOTTOM RULE READS ON A TAB'S OWN THEME (design §8; `session_theme`):
-/// the facts' marks and Cruise's `∞` are the instance's accent too, laid on
-/// the tab's paper. On an instance in Dracula, a Claude Code tab in Default
-/// Light with its rules drawn grey (`#999999`), the composer's bottom rule
-/// lays every mark (`◆ ⌂ ⎇`) at 3:1 or more on the tab's ground and Cruise's
-/// `∞` at 4.5:1 or more, each on the tab's own paper.
-///
-/// NEGATIVE CONTROL: the marks' mix as it was laid (the accent halfway to
-/// the rule's grey) reads under 3:1 there, and the accent itself, `∞`'s
-/// ink as it was laid, under 1.5:1.
 #[test]
 fn the_facts_and_the_chip_read_on_a_tab_theme_the_instance_did_not_choose() {
     use aterm_effects::color_math::contrast_ratio;
@@ -1433,7 +1227,6 @@ fn the_facts_and_the_chip_read_on_a_tab_theme_the_instance_did_not_choose() {
         "every mark and the chip read: {text:?}"
     );
     let accent = crate::chrome_band::band_colors(app.theme).accent;
-    // The accent halfway to the rule's grey, per channel, as it was laid.
     let old: [u8; 3] =
         std::array::from_fn(|i| ((f32::from(accent[i]) + f32::from(0x99_u8)) / 2.0).round() as u8);
     assert!(
@@ -1448,16 +1241,6 @@ fn the_facts_and_the_chip_read_on_a_tab_theme_the_instance_did_not_choose() {
     );
 }
 
-/// THE FACTS' WORDS READ ON A TAB'S OWN THEME, on the real splice (design
-/// §8): on a Claude Code tab in Default Light with its rules drawn in
-/// Claude's panel grey (`#999999`), the composer's bottom rule lays every
-/// value of the facts at 4.5:1 or more on the tab's ground, and with the
-/// branch clicked off its stub (`⎇ main off`) greyed — not bold, at 3:1 or
-/// more and below every value on the line.
-///
-/// NEGATIVE CONTROL: the values as they were laid (the grey lifted a third
-/// toward the tab's ink) read under 4.5:1 there, and the stub, the grey
-/// itself, under 3:1.
 #[test]
 fn the_facts_words_read_on_a_tab_theme_of_its_own() {
     use aterm_agent::harness::footer::{FactKind, FactMask};
@@ -1497,7 +1280,6 @@ fn the_facts_words_read_on_a_tab_theme_of_its_own() {
     );
     let row = &app.windows[&wid].input_scratch.cells[at];
     let marks = ['\u{25C6}', '\u{2302}', '\u{2387}'];
-    // The facts are set small and low; the chips are full-size.
     let words: Vec<_> = row
         .iter()
         .filter(|c| {
@@ -1536,7 +1318,6 @@ fn the_facts_words_read_on_a_tab_theme_of_its_own() {
             "{ch:?} of the stub at {k:.2}:1, the quietest value at {quietest:.2}:1"
         );
     }
-    // CONTROLS: the inks as they were laid.
     let old_value: [u8; 3] = std::array::from_fn(|i| {
         (f32::from(0x99_u8) + (f32::from(ink[i]) - f32::from(0x99_u8)) / 3.0).round() as u8
     });

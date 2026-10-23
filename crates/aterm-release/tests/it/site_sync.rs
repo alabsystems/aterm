@@ -11,7 +11,6 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use aterm_uds::spawnfd::{Child, Command};
-use aterm_verify::wasm_glue::Flavor;
 
 use crate::site::pages::{self, Difference};
 use crate::site::{
@@ -894,7 +893,7 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
     assert!(wasm.windows(40).any(|w| w == lab.public_sha.as_bytes()));
     let mut built = toy_module();
     built.extend(custom_section("fixture-commit", lab.public_sha.as_bytes()));
-    let generated = aterm_verify::wasm_glue::glue(&built, "aterm_wasm", Flavor::Web).unwrap();
+    let generated = aterm_verify::wasm_glue::glue(&built, "aterm_wasm").unwrap();
     let (_, generated) = generated
         .into_iter()
         .find(|(name, _)| name == "aterm_wasm.js")

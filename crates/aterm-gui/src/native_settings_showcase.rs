@@ -2,16 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Settings ▸ Themes page: theme chooser, live demo stage, action strip, and Customize sheet.
-//!
-//! [`view`] lays out the chooser ([`ShowcaseCard`] rows), the scripted demo session
-//! ([`crate::settings_theme_demo`]), and the action strip. Selecting a row starts a live
-//! preview ([`ShowcaseTrial::Trying`]) synced via [`crate::App::sync_settings_theme_trial`];
-//! Keep writes `theme` through the config patch lane ([`ShowcaseTrial::Keeping`]) without
-//! blocking further interactions, and Revert ([`SettingsApp::revert_trial`]) or leaving the
-//! page restores the prior state.
-//!
-//! [`customize`] replaces the chooser with color overrides, the 16-slot palette editor, and
-//! "Save as theme…".
 
 use super::*;
 use crate::control_theme::ThemeTrialIntent;

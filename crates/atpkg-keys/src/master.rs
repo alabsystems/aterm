@@ -471,6 +471,7 @@ mod tests {
     /// The refusal for an input that must not parse. [`MasterPhrase`] has no `PartialEq` on
     /// purpose: equality on secret material invites comparison and timing side channels.
     fn refused(input: &str) -> PhraseError {
+        // `expect_err` needs `Debug` on the Ok type, which prints `<redacted>`, so a failure
         // cannot spill phrase bytes into the panic message.
         parse_master(input).expect_err("this input must be refused")
     }

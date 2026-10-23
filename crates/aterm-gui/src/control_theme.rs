@@ -96,7 +96,7 @@ fn opt_hex(c: Option<Rgb>) -> String {
     c.map_or_else(|| "-".to_string(), hex)
 }
 
-fn side_word(appearance: Appearance) -> &'static str {
+const fn side_word(appearance: Appearance) -> &'static str {
     match appearance {
         Appearance::Dark => "dark",
         Appearance::Light => "light",
@@ -119,7 +119,7 @@ pub(crate) fn theme_palette_rows(colors: &crate::resolved_colors::ResolvedColors
 
 /// Who set a chrome colour, as `theme` reports it: `theme`, `config`, or
 /// `default` (nobody: the chrome derives it).
-fn origin_word(origin: crate::resolved_colors::ColorOrigin) -> &'static str {
+const fn origin_word(origin: crate::resolved_colors::ColorOrigin) -> &'static str {
     use crate::resolved_colors::ColorOrigin;
     match origin {
         ColorOrigin::Theme => "theme",

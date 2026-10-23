@@ -75,5 +75,4 @@ pub fn should_retry(
     }
 }
 
-/// The secondary wait an answer with no `retry-after` counts as, in seconds.
 const ABSENT_RETRY_AFTER: u64 = 60;

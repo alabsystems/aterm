@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// The CPU module's boundary replay (`verify wasm-smoke`): one fixed
+// The CPU module's boundary replay (`verify wasm-smoke`), run in a page of
+// the pinned chrome-headless-shell: one fixed
 // script of calls into aterm-wasm's exports, every answer encoded
 // type-exactly (BigInt, undefined, -0, typed arrays by constructor, class
 // instances by their getters, a thrown string vs a thrown Error) and held
@@ -12,8 +13,8 @@
 // bound another way that reproduces them carries every value across the
 // boundary as that one did.
 //
-//   node replay.mjs check  <answers.json> <glue dir> nodejs|web
-//   node replay.mjs record <answers.json> <glue dir> nodejs|web
+//   run({ glue, font, answers })   the ES module glue's URL, the font's, and
+//                                  the answers' (null to record)
 //
 // The script covers the bench.mjs workloads at a size a debug build runs in
 // seconds, the key-encode table, search, link_at, selection, the message
@@ -24,24 +25,33 @@
 // (`performance.now`, `Date.now`), and the font is the one in the tree, so
 // the answers do not depend on the box.
 //
-// `check` prints the first differences and exits 1 on any; `record`
-// rewrites the answers. A change to what the engine draws or answers moves
+// It answers { count, failures, text }: against `answers`, how many differ
+// (the first ten printed); `text` is the answers as the file records them,
+// which `record` writes. A change to what the engine draws or answers moves
 // some of them: `verify glue --record-replay`, then review the diff (one
 // answer per line, labelled by its call).
 
-import { createHash } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
-import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { sha256 as sha } from './sha256.mjs'
 
-const STEM = 'aterm_wasm'
-const [mode, answersPath, dir, flavor] = process.argv.slice(2)
-if (!['check', 'record'].includes(mode) || !answersPath || !dir || !['nodejs', 'web'].includes(flavor)) {
-  console.error('usage: node replay.mjs check|record <answers.json> <glue dir> nodejs|web')
-  process.exit(2)
+export async function run({ glue, font, answers: answersUrl }) {
+  const fetched = async (url) => {
+    const r = await fetch(url)
+    if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`)
+    return r
+  }
+  const FONT = new Uint8Array(await (await fetched(font)).arrayBuffer())
+  const want = answersUrl ? (await (await fetched(answersUrl)).json()).answers : null
+  const mod = await import(glue)
+  // The default init, as a page loads the module: the glue fetches the
+  // `_bg.wasm` beside it and compiles it off the main thread.
+  const { memory } = await mod.default()
+  if (!(memory instanceof WebAssembly.Memory)) throw new Error('wasm-replay: the module exported no memory')
+  return replay(mod, memory, FONT, want)
 }
 
+// The script, synchronous from its first call to its last answer. It pins
+// the page's clocks for good: the tab is this run's alone.
+function replay(mod, memory, FONT, want) {
 // --- pinned clocks: the module reads them at call time ----------------------
 let monoMs = 1000
 let wallMs = 1_760_000_000_000
@@ -52,33 +62,7 @@ function advance(ms) {
 Object.defineProperty(performance, 'now', { value: () => monoMs, configurable: true, writable: true })
 Date.now = () => wallMs
 
-// --- the module, and its linear memory -------------------------------------
-let memory = null
-let mod
-if (flavor === 'nodejs') {
-  // The CommonJS glue keeps its instance private; take the memory as the
-  // glue instantiates.
-  const Instance = WebAssembly.Instance
-  WebAssembly.Instance = function (module, imports) {
-    const instance = new Instance(module, imports)
-    memory = instance.exports.memory
-    return instance
-  }
-  mod = createRequire(import.meta.url)(join(dir, `${STEM}.js`))
-  WebAssembly.Instance = Instance
-} else {
-  mod = await import(pathToFileURL(join(dir, `${STEM}.js`)).href)
-  memory = mod.initSync({ module: readFileSync(join(dir, `${STEM}_bg.wasm`)) }).memory
-}
-if (!(memory instanceof WebAssembly.Memory)) {
-  console.error('wasm-replay: the module exported no memory')
-  process.exit(1)
-}
-
 // --- type-exact encoding -----------------------------------------------------
-function sha(bytes) {
-  return createHash('sha256').update(bytes).digest('hex')
-}
 function bytesOf(view) {
   return new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
 }
@@ -167,7 +151,6 @@ function surface() {
 rec('surface', surface())
 
 // --- inputs ------------------------------------------------------------------
-const FONT = readFileSync(new URL('../../../aterm-render/assets/DejaVuSansMono.ttf', import.meta.url))
 const THEME = [0x00e0e0e0, 0x00101010, 0x00e0e0e0, 0x00404060]
 const text = (s) => new TextEncoder().encode(s)
 
@@ -683,31 +666,25 @@ state('end', t)
 step('free', () => t.free())
 
 // --- check or record -------------------------------------------------------
-// The verdict is the exit code the process ends with by itself (`exitCode`),
-// never `process.exit()`: under node 26.3.0, `process.exit()` after this replay
-// hung 13 times in 60 runs against a planted answer (idle, its last line
-// written) and a natural exit 0 times in the 60 runs interleaved with them.
-if (mode === 'record') {
-  // One answer per line, so a re-record reads as a diff of the calls it moved.
-  writeFileSync(answersPath, `{"answers": [\n${answers.map((a) => JSON.stringify(a)).join(',\n')}\n]}\n`)
-  console.error(`wasm-replay: recorded ${answers.length} answers (${flavor})`)
-} else {
-  const want = JSON.parse(readFileSync(answersPath, 'utf8')).answers
-  let failures = 0
-  const n = Math.max(want.length, answers.length)
-  for (let i = 0; i < n; i++) {
-    const got = JSON.stringify(answers[i])
-    const exp = JSON.stringify(want[i])
-    if (got !== exp) {
-      failures++
-      if (failures <= 10) {
-        console.error(`wasm-replay: FAIL ${flavor} #${i}: got ${got?.slice(0, 400)}`)
-        console.error(`wasm-replay:      want ${exp?.slice(0, 400)}`)
-      }
+// One answer per line, so a re-record reads as a diff of the calls it moved.
+const recorded = `{"answers": [\n${answers.map((a) => JSON.stringify(a)).join(',\n')}\n]}\n`
+if (want === null) {
+  console.error(`wasm-replay: ${answers.length} answers to record`)
+  return { count: answers.length, failures: null, text: recorded }
+}
+let failures = 0
+const n = Math.max(want.length, answers.length)
+for (let i = 0; i < n; i++) {
+  const got = JSON.stringify(answers[i])
+  const exp = JSON.stringify(want[i])
+  if (got !== exp) {
+    failures++
+    if (failures <= 10) {
+      console.error(`wasm-replay: FAIL #${i}: got ${got?.slice(0, 400)}`)
+      console.error(`wasm-replay:      want ${exp?.slice(0, 400)}`)
     }
   }
-  console.error(
-    `wasm-replay: ${flavor}: ${answers.length} answers, ${failures === 0 ? 'all as recorded' : `${failures} differ`}`
-  )
-  process.exitCode = failures === 0 ? 0 : 1
+}
+console.error(`wasm-replay: ${answers.length} answers, ${failures === 0 ? 'all as recorded' : `${failures} differ`}`)
+return { count: answers.length, failures, text: recorded }
 }

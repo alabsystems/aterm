@@ -875,6 +875,7 @@ fn display_command(app: &Path) -> Command {
 /// What one ended [`display_command`] run (`what`) on `app` printed, or its refusal.
 fn display_from(what: &str, app: &Path, out: &std::process::Output) -> Result<String, String> {
     // A run that ended on a moment (a signal, or a file it could not read just then) reached
+    // no verdict, and its output is no evidence of a missing TeamIdentifier.
     if !out.status.success() {
         let ended = aterm_update_core::codesign::CodesignError::Refused {
             code: out.status.code(),

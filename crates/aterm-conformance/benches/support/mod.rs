@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Sequential acceptance measurements. The matrix is the execution plan; each
-//! row contributes exactly one outcome, including a panic as a finding. The
-//! final counts let verify distinguish a complete matrix from an empty or
-//! interrupted process without pretending these measurements are unit tests.
+//! Sequential acceptance measurement runner.
 
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};

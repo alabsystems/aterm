@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The built-in rules' lines, by their structure: the mark, the closed fact, the rule's name, the
-//! caps — never their prose word for word (the red-team's F17).
+//! Tests for built-in occupancy rule template formatting, length bounds, and span rendering.
 
 use super::*;
 
 const MIN: i64 = 60_000;
 const HOUR: i64 = 60 * MIN;
 
-/// Every line is the mark, one fact sentence within [`FACT_CAP`], constant words, and its rule's
-/// name last, all printable ASCII and under [`LINE_CAP`] — across the numbers it can be filled
-/// with, the largest included: nothing but numbers and closed words goes in.
 #[test]
 fn every_line_is_the_mark_a_closed_fact_and_its_rule() {
     let spans = [
@@ -51,8 +47,6 @@ fn every_line_is_the_mark_a_closed_fact_and_its_rule() {
     }
 }
 
-/// The nudge asks for the declaration; `hold-room` does not (its hold may be declared already),
-/// and each says the numbers it was given.
 #[test]
 fn each_rule_says_its_own_numbers() {
     let nudge = wait_nudge(30 * MIN);
@@ -68,7 +62,6 @@ fn each_rule_says_its_own_numbers() {
     assert!(!room.text().contains("WAITING:"), "{}", room.text());
 }
 
-/// A span is whole minutes under the hour, hours and two-digit minutes past it, rounded down.
 #[test]
 fn spans_read_in_minutes_then_hours() {
     for (ms, want) in [

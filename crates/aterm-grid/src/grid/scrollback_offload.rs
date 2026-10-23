@@ -264,6 +264,11 @@ impl PendingScrollbackReflow {
 
     /// Advance the rewrap by up to `max_lines` input lines (0 counts as 1), then yield.
     // COST: O(max_lines × cols) per step (≤ max_lines line reads plus rewrap and
+    // re-compress of the runs they complete); memory O(max_lines + one logical
+    // run) uncompressed. Two caveats: a run longer than max_lines is rewrapped
+    // whole by the step completing it (runs are capped at MAX_LOGICAL_WIDTH
+    // cells), and a front truncation mid-block makes the next step re-decode at
+    // most one warm/cold block.
     pub fn reflow_step(mut self, max_lines: usize) -> ReflowStep {
         let budget = max_lines.max(1);
         if self.lifted_limits.is_none() && matches!(self.phase, ReflowPhase::Stream { .. }) {
@@ -298,6 +303,8 @@ impl PendingScrollbackReflow {
                 }
                 if from_store > 0 {
                     // Release consumed input now (warm blocks and cold pages free
+                    // as the front offset crosses them), so the store never holds
+                    // full input plus full output.
                     if let Err(error) = self.store.truncate_oldest(from_store) {
                         aterm_log::warn!("offload reflow: input front-truncation failed: {error}");
                     }
@@ -345,6 +352,8 @@ impl PendingScrollbackReflow {
                     };
                 } else {
                     // Rewrap and push the runs completed before the last run head
+                    // among the newly read lines; the trailing run stays carried
+                    // (with no head, the whole chunk continues it).
                     if let Some(rel) = carry[appended_from..]
                         .iter()
                         .rposition(|line| !line.is_wrapped())
@@ -734,6 +743,7 @@ impl Grid {
                 .saturating_sub(self.storage.ring_buffer_scrollback())
         } else {
             // Staged flight output, or a width-stale result: the store is the
+            // only seat that is both order-correct and width-tolerant.
             0
         };
         let skip = ring_out.len().saturating_sub(room);
@@ -748,6 +758,7 @@ impl Grid {
                 }
             } else {
                 // Unreachable (a store-less grid took the ring route above); the
+                // ring cap bounds retention, oldest evicted.
                 drop(ring_out.drain(..skip));
             }
         }

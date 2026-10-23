@@ -1306,6 +1306,7 @@ fn claude_defaults_edit(
     text: Option<&str>,
     hold_window: bool,
 ) -> Result<Option<(settings_json::Json, Vec<&'static str>)>, String> {
+    // No settings directory means no Claude Code here. A dangling link gets past this
     // check; the write refuses it ([`dangling_link`]).
     if text.is_none() && !path.parent().is_some_and(Path::is_dir) {
         return Ok(None);

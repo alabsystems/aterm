@@ -57,9 +57,6 @@ fn a_password_prompt_refuses_synthetic_input_before_it_is_attached() {
     assert_eq!(posted, ["ordinary input", "after retirement"]);
 }
 
-/// The reply line for a secret is `OK askpass secret=<hex>`, and for a cancel
-/// / refusal the matching `ERR` — and a secret's reply never contains the raw
-/// bytes.
 #[test]
 fn reply_lines_are_shaped_and_hex() {
     let secret = AskpassAnswer::Secret(aterm_uds::sudo::Secret::from_bytes(b"ab"));
@@ -74,9 +71,6 @@ fn reply_lines_are_shaped_and_hex() {
     );
 }
 
-/// The command display escapes control, newline and bidi characters, so a
-/// crafted command line cannot inject rows into the sheet or reorder what the
-/// owner reads. Ordinary text is untouched.
 #[test]
 fn escape_display_neutralizes_control_and_bidi() {
     assert_eq!(escape_display("rm -rf /a b"), "rm -rf /a b");
@@ -86,9 +80,6 @@ fn escape_display_neutralizes_control_and_bidi() {
     assert!(!shown.contains('\n'), "{shown}");
 }
 
-/// Backoff: a session is clear until it cancels; then it is quiet for a
-/// widening window; an answer clears it. (Positive control: a different session
-/// is unaffected.)
 #[test]
 fn backoff_widens_on_cancel_and_clears_on_answer() {
     let mut b = Backoff::default();
@@ -111,8 +102,6 @@ fn backoff_widens_on_cancel_and_clears_on_answer() {
     assert!(b.quiet_for(1, t0).is_none(), "cleared by an answer");
 }
 
-/// await_answer returns the secret's line when the sheet answers before the
-/// deadline.
 #[test]
 fn await_answer_delivers_a_secret() {
     let (tx, rx) = channel();
@@ -129,8 +118,6 @@ fn await_answer_delivers_a_secret() {
     assert_eq!(line.as_bytes(), b"OK askpass secret=7077\n");
 }
 
-/// await_answer returns the timeout line once the deadline passes with no
-/// answer — proven with a clock the test advances, not by waiting.
 #[test]
 fn await_answer_times_out_on_the_injected_clock() {
     let (_tx, rx) = channel::<AskpassAnswer>();
@@ -143,7 +130,6 @@ fn await_answer_times_out_on_the_injected_clock() {
     assert_eq!(line.as_bytes(), b"ERR askpass timeout\n");
 }
 
-/// await_answer treats a hung-up caller as a decline, promptly.
 #[test]
 fn await_answer_gives_up_when_the_caller_hangs_up() {
     let (_tx, rx) = channel::<AskpassAnswer>();
@@ -183,9 +169,6 @@ fn an_answer_dequeued_after_its_deadline_does_not_release_a_secret() {
     assert_eq!(line.as_bytes(), b"ERR askpass timeout\n");
 }
 
-/// The owner off-switch: absent marker means on (the default); its presence
-/// means off. Tested with an explicit path in a tempdir so it never touches the
-/// real state dir or races the `ATERM_STATE_HOME` env.
 #[test]
 fn off_switch_marker_presence_is_the_off_state() {
     let dir = aterm_tempfile::TempDir::new().unwrap();

@@ -293,7 +293,7 @@ pub(crate) enum EscalationKind {
 
 impl EscalationKind {
     /// The herald's kind for a need word.
-    pub(crate) fn of(word: NeedWord) -> Self {
+    pub(crate) const fn of(word: NeedWord) -> Self {
         match word {
             NeedWord::Frozen | NeedWord::Stopped => Self::Unresponsive,
             NeedWord::Stalled => Self::Stalled,
@@ -304,7 +304,7 @@ impl EscalationKind {
         }
     }
 
-    fn log_word(self) -> &'static str {
+    const fn log_word(self) -> &'static str {
         match self {
             Self::Unresponsive => "unresponsive",
             Self::Stalled => "stalled",
@@ -317,7 +317,7 @@ impl EscalationKind {
 }
 
 /// The notification's title for a need — aterm's own words, the word's: a stopped job is not frozen, and an agent under the memory banner has not stopped (Claude Code draws it while the agent still runs).
-pub(crate) fn headline(word: NeedWord) -> &'static str {
+pub(crate) const fn headline(word: NeedWord) -> &'static str {
     match word {
         NeedWord::Frozen => "aterm \u{00b7} program frozen",
         NeedWord::Stopped => "aterm \u{00b7} program stopped",
@@ -447,7 +447,7 @@ struct HeraldSlot {
 }
 
 impl HeraldSlot {
-    fn suppress_desktop_notice(&mut self) {
+    const fn suppress_desktop_notice(&mut self) {
         self.owed = 0;
         self.retry_at = None;
     }
@@ -719,6 +719,7 @@ impl Herald {
     ) -> HeraldOutcome {
         self.last_quiet = None;
         if current.is_none() && !self.slots.contains_key(&session) {
+            // Nothing escalates and nothing did: keep no slot, so a retired session's late
             // refresh cannot re-grow the map.
             return HeraldOutcome::default();
         }
@@ -879,7 +880,7 @@ impl Herald {
     }
 
     /// Why the last [`Self::note`] posted nothing, when it had a transition or a re-read to judge; `None` after a post or a cleared escalation.
-    pub(crate) fn last_quiet(&self) -> Option<HeraldQuiet> {
+    pub(crate) const fn last_quiet(&self) -> Option<HeraldQuiet> {
         self.last_quiet
     }
 
@@ -1754,7 +1755,7 @@ impl Glance {
         all(not(target_os = "macos"), not(test)),
         expect(dead_code, reason = "the menu-bar status item is macOS's")
     )]
-    pub(crate) fn in_fleet(&self) -> bool {
+    pub(crate) const fn in_fleet(&self) -> bool {
         matches!(self.fleet, FleetLine::InFleet { .. })
     }
 
@@ -1858,7 +1859,7 @@ impl Glance {
     }
 }
 
-fn plural(n: usize) -> &'static str {
+const fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
@@ -1884,7 +1885,7 @@ pub(crate) fn tab_name(
 }
 
 /// A need word in a few words, where a row has no words of its own (a sibling's or a fleet peer's facts row carries the word, never its text).
-pub(crate) fn need_words(word: NeedWord) -> &'static str {
+pub(crate) const fn need_words(word: NeedWord) -> &'static str {
     match word {
         NeedWord::Frozen => "frozen: not reading input",
         NeedWord::Stopped => "stopped with input queued",
@@ -1899,7 +1900,7 @@ pub(crate) fn need_words(word: NeedWord) -> &'static str {
 }
 
 /// The mark a need row leads with: `◆` stuck, `◇` decide.
-pub(crate) fn need_mark(word: NeedWord) -> char {
+pub(crate) const fn need_mark(word: NeedWord) -> char {
     match word.severity() {
         Severity::Stuck => '\u{25c6}',
         Severity::Decide => '\u{25c7}',
@@ -3140,6 +3141,7 @@ mod macos {
                 // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender; `-tag` is `-(NSInteger)` with no side effects.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = StatusAction::from_tag(tag) {
+                    // Fire-and-forget: a closed loop (app shutting down) just
                     // drops the event — mirrors menu.rs.
                     let _ = self.ivars().proxy.send_event(Wake::StatusAction { action });
                 }

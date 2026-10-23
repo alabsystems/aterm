@@ -13,13 +13,11 @@ use aterm_json::Value;
 
 use crate::common;
 
-/// The canonical router, over a fresh root.
 fn canonical() -> Router {
     let root = common::scratch("table");
     common::router(&common::canonical_config(root.path()), root.path())
 }
 
-/// Presence: the dev profile `dev`, the release profile `rel`, every other profile absent.
 fn pres(dev: Presence, rel: Presence) -> impl Fn(&str) -> Presence {
     move |name: &str| match name {
         "dev" => dev,
@@ -46,7 +44,6 @@ fn anonymous(why: AnonymousWhy) -> Decision {
     Decision::Anonymous { why }
 }
 
-/// The refusal's code, or `None`.
 fn code(decision: &Decision) -> Option<RefusalCode> {
     match decision {
         Decision::Refuse(refusal) => Some(refusal.code),
@@ -272,7 +269,6 @@ fn a_floor_owner_with_no_row_is_release_tier_and_never_written() {
     assert_eq!(code(&refused), Some(RefusalCode::WriteNone));
 }
 
-/// The refusal for `req` with every profile `presence`, as an error.
 fn refused(router: &Router, req: &RouteRequest, dev: Presence, rel: Presence) -> agh::Error {
     match router.decide(req, &pres(dev, rel)) {
         Decision::Refuse(refusal) => refusal.into_error(None),
@@ -280,7 +276,6 @@ fn refused(router: &Router, req: &RouteRequest, dev: Presence, rel: Presence) ->
     }
 }
 
-/// The error's kind and sub-kind, and every one of `names` in its `why` or its `next`.
 fn assert_refusal(error: &agh::Error, code: RefusalCode, kind: Kind, names: &[&str]) {
     assert_eq!(error.kind, kind, "{error:?}");
     assert_eq!(error.sub, Sub::Policy(code), "{error:?}");
@@ -423,7 +418,6 @@ fn every_refusal_a_valid_config_gives() {
     );
 }
 
-/// The fourteenth: `config::load` of a file that breaks a rule (unix: a private agh.toml).
 #[cfg(unix)]
 #[test]
 fn config_invalid_comes_from_load() {
@@ -449,7 +443,6 @@ fn tier_of_holds_the_floor() {
     assert_eq!(router.tier_of("fixture-ext"), Tier::External);
 }
 
-/// `explain` of `req` with `dev` and `rel`, as compact JSON.
 fn explained(router: &Router, req: &RouteRequest, dev: Presence, rel: Presence) -> Value {
     router.explain(req, &pres(dev, rel)).to_json()
 }
@@ -510,7 +503,6 @@ fn explain_shows_the_walk() {
     );
 }
 
-/// The real presence of `router`'s profiles in `env`.
 fn real(router: &Router, env: &MapEnv) -> impl Fn(&str) -> Presence {
     move |name: &str| {
         router

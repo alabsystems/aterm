@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 use aterm_gui_fabric::{FabricSession, HOLD_BUSY, HOLD_FENCE_WAIT, SessionFabric, cmd_topic};
 use aterm_session::SessionId;
 
-/// A session with nothing but its fabric endpoint.
 struct Session {
     id: SessionId,
     fabric: SessionFabric,
@@ -28,13 +27,6 @@ impl FabricSession for Session {
     }
 }
 
-/// A session's fence bound is the production one, and a topic change under a
-/// committing update's fence waits its session's bound, then answers busy with
-/// nothing changed. CONTROL: with the fence lifted, the same change lands at
-/// once. AND THE PRODUCTION BOUND ITSELF: on a session whose bound is its own,
-/// an add and a drop each park under [`HOLD_FENCE_WAIT`], and land as the
-/// fence lifts — so a verb that waited any other bound at the production
-/// value alone, which neither set bound shows, fails here.
 #[test]
 fn a_fenced_change_waits_the_production_bound_then_answers_busy() {
     if aterm_gui_timing::current().is_fast() {

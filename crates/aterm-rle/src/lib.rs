@@ -353,6 +353,7 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 
     #[inline]
     const fn checked_run_length_sum(lhs: u32, rhs: u32) -> u32 {
+        // `saturating_add` discharges the overflow obligation for the verifier;
         // `total_length <= u32::MAX` guarantees it never saturates.
         lhs.saturating_add(rhs)
     }

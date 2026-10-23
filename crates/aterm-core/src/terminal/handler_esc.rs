@@ -10,10 +10,6 @@ use super::TerminalHandler;
 use aterm_types::charset::{CharacterSet, CharacterSet96, SingleShift};
 
 impl TerminalHandler<'_> {
-    /// VT52 escapes: `A`/`B`/`C`/`D` cursor up/down/right/left, `H` home, `I` reverse line
-    /// feed, `J`/`K` erase to end of screen/line, `Y row col` direct addressing (each +32),
-    /// `Z` identify (answers `ESC / Z`), `<` back to ANSI, `F`/`G` enter/leave graphics (G0
-    /// line drawing), `=`/`>` keypad application/numeric. None takes intermediates.
     fn vt52_esc_dispatch(
         &mut self,
         cap: &super::super::response_capability::ResponseCapability,
@@ -60,7 +56,6 @@ impl TerminalHandler<'_> {
                 self.grid.reverse_line_feed();
             }
             b'J' => {
-                // ESC J and ESC K erase with the SGR background (BCE).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
@@ -75,7 +70,6 @@ impl TerminalHandler<'_> {
                 self.grid.erase_to_end_of_line();
             }
             b'Y' => {
-                // Row and column follow as the next two printables.
                 self.transient.vt52_cursor_state = super::Vt52CursorState::WaitingRow;
             }
             b'Z' => {
@@ -100,9 +94,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Dispatch `ESC [<intermediates>] <final>`: VT52 mode first, then no intermediates
-    /// (DECSC/DECRC, IND/RI/NEL, HTS, shifts, RIS, keypad modes), `#` (line sizes, DECALN),
-    /// else character set designation (SCS).
+    /// Dispatches `ESC [<intermediates>] <final>` across VT52, ANSI, `#`, and SCS forms.
     pub(super) fn esc_dispatch_core(
         &mut self,
         cap: &super::super::response_capability::ResponseCapability,
@@ -134,16 +126,13 @@ impl TerminalHandler<'_> {
             b'7' => self.cursor_state().save_cursor_state(), // DECSC
             b'8' => self.cursor_state().restore_cursor_state(), // DECRC
             b'D' => {
-                // IND. The BCE refresh here and in RI/NEL is defensive, as for CSI S/T.
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
                 );
-                // IND, RI and NEL scroll within the horizontal margins under DECLRMM (VT510).
                 self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             b'M' => {
-                // RI
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
@@ -152,7 +141,6 @@ impl TerminalHandler<'_> {
                     .reverse_line_feed_margined(self.modes.left_right_margin_mode);
             }
             b'E' => {
-                // NEL
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
                     self.style.bce_bg_rgb(),
@@ -162,35 +150,27 @@ impl TerminalHandler<'_> {
                 self.margined_line_feed(self.modes.left_right_margin_mode);
             }
             b'H' => {
-                // HTS
                 self.grid.set_tab_stop();
             }
             b'N' => {
-                // SS2: G2 for the next character
                 self.charset.single_shift = SingleShift::Ss2;
             }
             b'O' => {
-                // SS3: G3 for the next character
                 self.charset.single_shift = SingleShift::Ss3;
             }
             b'n' => {
-                // LS2: G2 into GL
                 self.charset.gl = aterm_types::charset::GlMapping::G2;
             }
             b'o' => {
-                // LS3: G3 into GL
                 self.charset.gl = aterm_types::charset::GlMapping::G3;
             }
             b'~' => {
-                // LS1R: G1 into GR
                 self.charset.gr = aterm_types::charset::GrMapping::G1;
             }
             b'}' => {
-                // LS2R: G2 into GR
                 self.charset.gr = aterm_types::charset::GrMapping::G2;
             }
             b'|' => {
-                // LS3R: G3 into GR
                 self.charset.gr = aterm_types::charset::GrMapping::G3;
             }
             b'6' => {
@@ -200,16 +180,13 @@ impl TerminalHandler<'_> {
                 self.handle_decfi();
             }
             b'Z' => {
-                // DECID, the identify request older than DA1, gets DA1's answer (VT510).
                 self.handle_primary_da(cap);
             }
             b'c' => self.reset_terminal_state(), // RIS
             b'=' => {
-                // DECKPAM
                 self.set_application_keypad(true);
             }
             b'>' => {
-                // DECKPNM
                 self.set_application_keypad(false);
             }
             _ => {}
@@ -223,8 +200,7 @@ impl TerminalHandler<'_> {
                     b'3' => LineSize::DoubleHeightTop,    // DECDHL top half
                     b'4' => LineSize::DoubleHeightBottom, // DECDHL bottom half
                     b'5' => LineSize::SingleWidth,        // DECSWL
-                    // b'6' is the only remaining value from the outer arm
-                    _ => LineSize::DoubleWidth, // DECDWL
+                    _ => LineSize::DoubleWidth,           // DECDWL
                 };
                 let row = self.grid.cursor().row;
                 let mut changed = false;
@@ -232,9 +208,6 @@ impl TerminalHandler<'_> {
                     changed = row_data.line_size() != size;
                     row_data.set_line_size(size);
                 }
-                // A line-size change is a content change of the row, so readers
-                // keyed on `content_gen` must see it. DECDWL/DECDHL also erase the
-                // hidden half below (which marks it); DECSWL writes only the flag.
                 if changed {
                     self.grid.mark_content_cell(row, 0);
                 }
@@ -248,8 +221,6 @@ impl TerminalHandler<'_> {
                     self.grid.mark_has_double_width();
                     let half = (cols / 2).max(1);
                     if half < cols {
-                        // The hidden second half is erased, or its stale content would
-                        // reappear after DECSWL.
                         self.grid.erase_rect(row, half, row, cols.saturating_sub(1));
                         self.grid.extras_mut().clear_range(row, half, cols);
                     }
@@ -258,7 +229,6 @@ impl TerminalHandler<'_> {
                 self.grid.set_cursor(row, col);
             }
             b'8' => {
-                // DECALN
                 self.grid.screen_alignment_pattern();
             }
             _ => {}
@@ -269,8 +239,6 @@ impl TerminalHandler<'_> {
         match intermediates.len() {
             1 => {}
             2 => {
-                // Two-intermediate SCS (VT420/VT510): ESC ( % 5 designates DEC Supplemental
-                // into G0.
                 if intermediates[1] == b'%' {
                     let g_set = match intermediates[0] {
                         b'(' => Some(0u8),
@@ -293,7 +261,6 @@ impl TerminalHandler<'_> {
             }
             _ => return,
         }
-        // SCS: ESC ( ) * + C designates G0-G3.
         let g_set = match intermediates[0] {
             b'(' => Some(0u8),
             b')' => Some(1u8),
@@ -308,8 +275,6 @@ impl TerminalHandler<'_> {
             return;
         }
 
-        // 96-character set designation (ESC - / ESC . / ESC /).
-        // Maps to G1/G2/G3 respectively (G0 cannot hold 96-char sets).
         match intermediates[0] {
             b'-' => {
                 if let Some(cs96) = CharacterSet96::from_final_byte(final_byte) {
@@ -339,10 +304,6 @@ impl TerminalHandler<'_> {
         )
     )]
     fn reset_terminal_state(&mut self) {
-        // RIS. `reset_common_fields` keeps the host's policy (`reset_modes`): a program's
-        // `ESC c` must not clear an `allow_*` bit or the shell-integration nonce requirement
-        // (it could then forge OSC 133/633 marks), nor toggle an input capability. The CWD
-        // is kept: it is filesystem state.
         let mut groups = super::super::ResetGroups {
             kitty_keyboard: self.kitty_keyboard,
             xterm_keyboard: self.xterm_keyboard,
@@ -368,28 +329,14 @@ impl TerminalHandler<'_> {
             self.secure_keyboard_entry,
             &mut groups,
         );
-        // RIS leaves the alternate screen.
         self.holder_fence.note_alt_exit();
-
-        // The BiDi cache may hold resolutions of the pre-reset content.
         self.invalidate_bidi_all();
-
-        // The RIS side effects this handler cannot reach (secure keyboard entry, the parked
-        // selection) run in the processing loop after advance_fast returns; the parser itself
-        // is not reset. Set after reset_common_fields, whose transient.reset() clears it.
         self.transient.pending_parser_reset = true;
-
-        // The host's default cursor style survives RIS: host preference, not app state.
         self.modes.cursor_style = *self.default_cursor_style;
-        // Mode 12 mirrors the style's blink bit.
         self.modes.cursor_blink = self.modes.cursor_style.blinks();
-        // So does the host's alternate scroll (1007).
         self.modes.alternate_scroll = *self.host_alternate_scroll;
     }
 
-    /// DECBI, Back Index (ESC 6, VT420+): at the left margin (column 0 without DECLRMM), scroll
-    /// the region within the margins right one column, the new column BCE blank, cursor
-    /// still; a no-op outside the scroll region rows (xterm). Elsewhere, CUB 1.
     fn handle_decbi(&mut self) {
         let col = self.grid.cursor_col();
         let margins = self.grid.horizontal_margins();
@@ -399,7 +346,6 @@ impl TerminalHandler<'_> {
             0
         };
 
-        // BCE refresh, as for DECIC/DECDC.
         if col == left_bound {
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -424,9 +370,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// DECFI, Forward Index (ESC 9, VT420+): at the right margin (the last column without
-    /// DECLRMM), scroll the region within the margins left one column, the new column BCE
-    /// blank, cursor still; a no-op outside the scroll region rows (xterm). Elsewhere, CUF 1.
     fn handle_decfi(&mut self) {
         let col = self.grid.cursor_col();
         let margins = self.grid.horizontal_margins();
@@ -436,7 +379,6 @@ impl TerminalHandler<'_> {
             self.grid.cols().saturating_sub(1)
         };
 
-        // BCE refresh, as for DECIC/DECDC.
         if col == right_bound {
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),

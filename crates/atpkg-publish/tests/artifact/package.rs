@@ -28,27 +28,18 @@ use super::fixture::{
 };
 
 const MAC: &str = "aarch64-apple-darwin";
-/// The live head's codex pin: a legacy vendor manifest on repo `aterm`.
 const LIVE_CODEX: u64 = 2_026_101_501;
-/// The first ALab build above it.
 const ALAB: u64 = 2_026_101_601;
 
-/// A rostered machine over the live channel head (index 71: `ay`, and `codex` on repo
-/// `aterm`), a fixture Trust toolchain the client admits, and a codex-alab checkout whose
-/// origin is `alabsystems/codex-alab`.
 struct World {
     _tmp: aterm_tempfile::TempDir,
     root: PathBuf,
     ctx: Ctx,
     host: Arc<FakeHost>,
-    /// The toolchain's `bin/`.
     bin: PathBuf,
-    /// The codex-alab checkout.
     source: PathBuf,
-    /// Its main's head.
     commit: String,
     tools: FakeTools,
-    /// The rostered machine's keys, which sign a quad the mirror reads.
     keys: Keys,
 }
 
@@ -91,11 +82,6 @@ fn world(label: &str) -> World {
     }
 }
 
-/// Under `root` (which holds nothing yet), the codex-alab checkout `codex-alab` of two
-/// commits, pushed to and fetched from its origin, the bare `remotes/alabsystems/
-/// codex-alab.git`; its main's head. Thirteen git processes and a push's receive-pack, so
-/// the pair is made once per process, by the first world, and laid down for every world
-/// after, the checkout's origin moved to the bare beside it.
 fn codex_alab(root: &Path) -> String {
     static MADE: Made<(), String> = Mutex::new(BTreeMap::new());
     made_once(&MADE, &(), root, |root| {
@@ -119,7 +105,6 @@ fn codex_alab(root: &Path) -> String {
     })
 }
 
-/// A copy of `/usr/bin/true` after `codesign <args>` ran on it.
 fn codesigned(dir: &Path, args: &[&str]) -> Vec<u8> {
     let exe = dir.join(format!("true-{}", args.join("")));
     std::fs::copy("/usr/bin/true", &exe).expect("copy /usr/bin/true");
@@ -150,7 +135,6 @@ fn json_string(s: &str) -> String {
     out
 }
 
-/// What a package says about itself; [`World::package`] lays it.
 #[derive(Clone)]
 struct Lay {
     version: String,
@@ -164,12 +148,10 @@ struct Lay {
     id: Option<String>,
     exe: Vec<u8>,
     alab_build: bool,
-    /// The record's `upstream` field, raw JSON; none for a package from before it.
     upstream: Option<String>,
 }
 
 impl World {
-    /// The record of a package `alab/package.sh` built from main's head with this toolchain.
     fn lay(&self) -> Lay {
         let seal = self.bin.parent().expect("root").to_path_buf();
         Lay {
@@ -258,7 +240,6 @@ impl World {
         self.ctx.staging_slug("codex-alab")
     }
 
-    /// Lay `files` (name, bytes) as the staging release of `build`.
     fn stage(&self, build: u64, files: &[(String, Vec<u8>)]) {
         for (name, bytes) in files {
             self.host.put_asset(
@@ -301,7 +282,6 @@ fn files_of(o: &PackageOutcome) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// package.sh's own digest of a compiler, from its Python (known answers computed with it).
 #[test]
 fn the_compiler_digest_and_id_are_package_sh_s() {
     let tmp = scratch("pkg-kat");
@@ -358,10 +338,6 @@ fn the_version_form_and_the_origin_are_read_exactly() {
     }
 }
 
-/// The happy path: the package is packed whole, the signed pair is what the client verifies
-/// under the head's roster, and the archive stages through the client's ALab pack gate into
-/// exactly the package's own files. Nothing reaches a host without `--upload`; `--key`
-/// names the signing key.
 #[test]
 fn a_package_packs_whole_and_signs_what_a_client_stages() {
     let w = world("pkg-ok");
@@ -413,8 +389,6 @@ fn a_package_packs_whole_and_signs_what_a_client_stages() {
     );
 }
 
-/// `--upload` stages the pack on the staging owner's `codex-alab`, release
-/// `atpkg-codex-<build>` — and only there (the in-memory host: no test reaches a network).
 #[test]
 fn upload_goes_to_the_staging_codex_alab_release_only_when_asked() {
     let w = world("pkg-upload");
@@ -444,10 +418,6 @@ fn upload_goes_to_the_staging_codex_alab_release_only_when_asked() {
     );
 }
 
-/// THE PAGES NAME THE UPSTREAM BASE: the staging release `--upload` writes and the public one
-/// the mirror creates both say `Based on upstream openai/codex …` when the package's record
-/// names its base (the public page reading it off the archive as a client stages it). A
-/// package from before the field, and one whose field is malformed, name no base on either.
 #[test]
 fn both_release_pages_name_the_upstream_base_the_package_records() {
     let w = world("pkg-upstream");
@@ -506,8 +476,6 @@ fn both_release_pages_name_the_upstream_base_the_package_records() {
     }
 }
 
-/// Every gate refuses before a manifest exists: the build id outside the window, each
-/// package fact, the source, the compiler, and the tree.
 #[test]
 fn each_gate_refuses_before_anything_is_signed() {
     let w = world("pkg-gates");
@@ -640,11 +608,6 @@ fn each_gate_refuses_before_anything_is_signed() {
     w.pack(&w.request(&pkg, ALAB)).expect("the control packs");
 }
 
-/// THE INDEX PINS AN ALAB BUILD ONLY OVER A PACK THAT VERIFIES. `--pin codex=<b>` over the
-/// live head switches the row to repo `codex-alab` once the staged pack stages as a client
-/// stages it; the signed index routes codex to ALab on Apple silicon only. A tampered archive
-/// or a manifest signed off the roster is refused and leaves no signed quad behind. A routine
-/// publish reads no codex pack and keeps the live row. `--pack-dir` reads a local pack.
 #[test]
 fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
     let w = world("pkg-index");

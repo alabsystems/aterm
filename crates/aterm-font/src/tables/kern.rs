@@ -5,21 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-/*!
-A [Kerning Table](
-https://docs.microsoft.com/en-us/typography/opentype/spec/kern) implementation.
-
-Supports both
-[OpenType](https://docs.microsoft.com/en-us/typography/opentype/spec/kern)
-and
-[Apple Advanced Typography](https://developer.apple.com/fonts/TrueType-Reference-Manual/RM06/Chap6kern.html)
-variants.
-
-Since there is no single correct way to process a kerning data,
-we have to provide an access to kerning subtables, so a caller can implement
-a kerning algorithm manually.
-But we still try to keep the API as high-level as possible.
-*/
+//! OpenType and Apple Advanced Typography `kern` table parser.
 
 use crate::GlyphId;
 use crate::parser::{FromData, LazyArray16, NumFrom, Offset, Offset16, Stream};
@@ -65,9 +51,6 @@ impl FromData for AATCoverage {
 #[derive(Clone, Copy, Debug)]
 pub struct KerningPair {
     /// Glyphs pair.
-    ///
-    /// In the kern table spec, a kerning pair is stored as two u16,
-    /// but we are using one u32, so we can binary search it directly.
     pub pair: u32,
     /// Kerning value.
     pub value: i16,
@@ -105,9 +88,7 @@ impl FromData for KerningPair {
 #[derive(Clone, Debug)]
 pub enum Format<'a> {
     Format0(Subtable0<'a>),
-    /// An AAT state machine. Its header is checked as upstream's
-    /// `apple-layout` build parses it, but the machine is not kept: aterm
-    /// reads only pairwise kerning.
+    /// An AAT state machine.
     Format1,
     Format2(Subtable2<'a>),
     Format3(Subtable3<'a>),
@@ -123,8 +104,6 @@ pub struct Subtable<'a> {
     /// Indicates that subtable has a cross-stream values.
     pub has_cross_stream: bool,
     /// Indicates that subtable uses a state machine.
-    ///
-    /// In this case `glyphs_kerning()` will return `None`.
     pub has_state_machine: bool,
     /// Subtable format.
     pub format: Format<'a>,
@@ -132,8 +111,6 @@ pub struct Subtable<'a> {
 
 impl<'a> Subtable<'a> {
     /// Returns kerning for a pair of glyphs.
-    ///
-    /// Returns `None` in case of state machine based subtable.
     #[inline]
     pub fn glyphs_kerning(&self, left: GlyphId, right: GlyphId) -> Option<i16> {
         match self.format {
@@ -146,16 +123,13 @@ impl<'a> Subtable<'a> {
 }
 
 /// A list of subtables.
-///
-/// The internal data layout is not designed for random access,
-/// therefore we're not providing the `get()` method and only an iterator.
 #[derive(Clone, Copy)]
 pub struct Subtables<'a> {
     /// Indicates an Apple Advanced Typography format.
     is_aat: bool,
     /// The total number of tables.
     count: u32,
-    /// Actual data. Starts right after the `kern` header.
+    /// Actual data.
     data: &'a [u8],
 }
 
@@ -202,7 +176,7 @@ pub struct SubtablesIter<'a> {
     table_index: u32,
     /// The total number of tables.
     number_of_tables: u32,
-    /// Actual data. Starts right after `kern` header.
+    /// Actual data.
     stream: Stream<'a>,
 }
 
@@ -227,11 +201,9 @@ impl<'a> Iterator for SubtablesIter<'a> {
             self.stream.skip::<u16>(); // variation tuple index
 
             if format_id > 3 {
-                // Unknown format.
                 return None;
             }
 
-            // Subtract the header size.
             let data_len = usize::num_from(table_len).checked_sub(usize::from(HEADER_SIZE))?;
             let data = self.stream.read_bytes(data_len)?;
 
@@ -258,23 +230,16 @@ impl<'a> Iterator for SubtablesIter<'a> {
 
             self.stream.skip::<u16>(); // version
             let table_len = self.stream.read::<u16>()?;
-            // In the OpenType variant, `format` comes first.
             let format_id = self.stream.read::<u8>()?;
             let coverage = self.stream.read::<OTCoverage>()?;
 
             if format_id != 0 && format_id != 2 {
-                // Unknown format.
                 return None;
             }
 
             let data_len = if self.number_of_tables == 1 {
-                // An OpenType `kern` table with just one subtable is a special case.
-                // The `table_len` property is mainly required to jump to the next subtable,
-                // but if there is only one subtable, this property can be ignored.
-                // This is abused by some fonts, to get around the `u16` size limit.
                 self.stream.tail()?.len()
             } else {
-                // Subtract the header size.
                 usize::from(table_len).checked_sub(usize::from(HEADER_SIZE))?
             };
 
@@ -297,10 +262,7 @@ impl<'a> Iterator for SubtablesIter<'a> {
     }
 }
 
-/// Whether upstream's `aat::StateTable::parse` (ttf-parser 0.25.1
-/// src/aat.rs, with its default `apple-layout` feature) accepts `data`. A
-/// format 1 subtable it refuses ends the subtable walk there, so this keeps
-/// the walk's length identical.
+/// Whether upstream's `aat::StateTable::parse`.
 fn state_table_parses(data: &[u8]) -> Option<()> {
     let mut s = Stream::new(data);
     s.read::<u16>()?; // number_of_classes
@@ -318,7 +280,7 @@ fn state_table_parses(data: &[u8]) -> Option<()> {
     Some(())
 }
 
-/// A format 0 subtable: ordered glyph pairs.
+/// A format 0 subtable.
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable0<'a> {
     /// A list of kerning pairs.
@@ -346,11 +308,8 @@ impl<'a> Subtable0<'a> {
 }
 
 /// A format 2 subtable.
-///
-/// Simple n x m Array of Kerning Values.
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable2<'a> {
-    // TODO: parse actual structure
     data: &'a [u8],
     header_len: u8,
 }
@@ -366,27 +325,19 @@ impl<'a> Subtable2<'a> {
         let mut s = Stream::new(self.data);
         s.skip::<u16>(); // row_width
 
-        // Offsets are from beginning of the subtable and not from the `data` start,
-        // so we have to subtract the header.
         let header_len = usize::from(self.header_len);
         let left_hand_table_offset = s.read::<Offset16>()?.to_usize().checked_sub(header_len)?;
         let right_hand_table_offset = s.read::<Offset16>()?.to_usize().checked_sub(header_len)?;
         let array_offset = s.read::<Offset16>()?.to_usize().checked_sub(header_len)?;
 
-        // 'The array can be indexed by completing the left-hand and right-hand class mappings,
-        // adding the class values to the address of the subtable,
-        // and fetching the kerning value to which the new address points.'
-
         let left_class = get_format2_class(left.0, left_hand_table_offset, self.data).unwrap_or(0);
         let right_class =
             get_format2_class(right.0, right_hand_table_offset, self.data).unwrap_or(0);
 
-        // 'Values within the left-hand offset table should not be less than the kerning array offset.'
         if usize::from(left_class) < array_offset {
             return None;
         }
 
-        // Classes are already premultiplied, so we only need to sum them.
         let index = usize::from(left_class) + usize::from(right_class);
         let value_offset = index.checked_sub(header_len)?;
         Stream::read_at::<i16>(self.data, value_offset)
@@ -404,11 +355,8 @@ pub(crate) fn get_format2_class(glyph_id: u16, offset: usize, data: &[u8]) -> Op
 }
 
 /// A format 3 subtable.
-///
-/// Simple n x m Array of Kerning Indices.
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable3<'a> {
-    // TODO: parse actual structure
     data: &'a [u8],
 }
 
@@ -459,14 +407,6 @@ pub struct Table<'a> {
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
     pub fn parse(data: &'a [u8]) -> Option<Self> {
-        // The `kern` table has two variants: OpenType and Apple.
-        // And they both have different headers.
-        // There are no robust way to distinguish them, so we have to guess.
-        //
-        // The OpenType one has the first two bytes (UInt16) as a version set to 0.
-        // While Apple one has the first four bytes (Fixed) set to 1.0
-        // So the first two bytes in case of an OpenType format will be 0x0000
-        // and 0x0001 in case of an Apple format.
         let mut s = Stream::new(data);
         let version = s.read::<u16>()?;
         let subtables = if version == 0 {
@@ -478,7 +418,6 @@ impl<'a> Table<'a> {
             }
         } else {
             s.skip::<u16>(); // Skip the second part of u32 version.
-            // Note that AAT stores the number of tables as u32 and not as u16.
             let count = s.read::<u32>()?;
             Subtables {
                 is_aat: true,

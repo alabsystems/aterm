@@ -7,17 +7,14 @@ use aterm_render::{DirtyDecision, compute_dirty_rows, row_revisions_comparable};
 
 const CELL_H: usize = 16;
 
-/// What a corpus step does to the composed frame after the strip splice —
-/// the shipping chrome that runs later in the same seam.
+/// What a corpus step does to the composed frame after the strip splice.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Chrome {
     /// Nothing after the strip.
     None,
-    /// `splice_find_bar` — overwrites terminal cells in place and bumps
-    /// `snapshot_seq`. Must cost the next frame its scoped arm.
+    /// `splice_find_bar`.
     FindBar,
-    /// `splice_settings_panel` — a composited card; it writes no cells, so
-    /// it must not cost the next frame anything.
+    /// `splice_settings_panel` — a composited card.
     SettingsPanel,
 }
 
@@ -28,9 +25,7 @@ struct Step {
     chrome: Chrome,
 }
 
-/// A window with empty scratch and strip state over a terminal with a
-/// settled damage session (a fresh terminal's `Damage::Full` publishes no
-/// lane and would make the reach floors vacuous).
+/// A window with empty scratch and strip state over a terminal with a settled damage session.
 fn fixture() -> (App, WindowId, usize, usize) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -56,11 +51,7 @@ fn fixture() -> (App, WindowId, usize, usize) {
     (app, wid, rows, cols)
 }
 
-/// One presented frame of the single-pane strip window at the three seams in
-/// shipping order: the resident scratch's reclaim/un-splice (hoisted ahead
-/// of the frame hold in `redraw_window`), the damage-scoped re-extract under
-/// the hold, and the tab-strip prepend. A prepend that cannot be inverted
-/// falls back to salvaging the buffers.
+/// One presented frame of the single-pane strip window at the three seams in shipping order.
 fn strip_frame(
     app: &mut App,
     wid: WindowId,
@@ -72,9 +63,7 @@ fn strip_frame(
     strip_frame_with(app, wid, rows, cols, strip, strip_fp, true)
 }
 
-/// [`strip_frame`] with the un-splice switchable: `unsplice: false` salvages
-/// the surplus tail only, leaving the scratch `strip` rows too tall and its
-/// continuity tokens broken.
+/// [`strip_frame`] with the un-splice switchable.
 fn strip_frame_with(
     app: &mut App,
     wid: WindowId,
@@ -113,9 +102,7 @@ fn strip_frame_with(
     refill
 }
 
-/// Reference: a full re-extract (`cell_frame`, which retains nothing) of the
-/// same terminal state, taken before the incremental frame consumes the
-/// damage session.
+/// Reference: a full re-extract.
 fn reference(app: &mut App, wid: WindowId, rows: usize, cols: usize) -> RenderInput {
     let terminal = app
         .front_terminal(wid)
@@ -126,9 +113,8 @@ fn reference(app: &mut App, wid: WindowId, rows: usize, cols: usize) -> RenderIn
     term.cell_frame(rows, cols)
 }
 
-/// Every engine row of the composed frame must equal the same row of a full
-/// re-extract at its shifted index, on every channel a scoped refill may
-/// retain plus the two it rebuilds.
+/// Every engine row of the composed frame must equal the same row of a full re-extract at its
+/// shifted index.
 fn assert_engine_band_matches(
     composed: &RenderInput,
     reference: &RenderInput,
@@ -168,8 +154,7 @@ fn assert_engine_band_matches(
     }
 }
 
-/// The lane-disowned verdict: `compute_dirty_rows` down its exact whole-grid
-/// compare, which is the path every frame the stamp gate refuses still takes.
+/// The lane-disowned verdict.
 fn brute_force(prev: &RenderInput, cur: &RenderInput, dirty: &mut Vec<bool>) -> DirtyDecision {
     let mut p = prev.clone();
     let mut c = cur.clone();
@@ -189,7 +174,6 @@ fn brute_force(prev: &RenderInput, cur: &RenderInput, dirty: &mut Vec<bool>) -> 
 
 fn corpus() -> Vec<Step> {
     vec![
-        // ---- Strip off: the macOS shape. ----
         Step {
             name: "off_idle",
             strip: 0,
@@ -208,7 +192,6 @@ fn corpus() -> Vec<Step> {
             engine: |t| t.process(b"y"),
             chrome: Chrome::None,
         },
-        // ---- Strip on, one row. ----
         Step {
             name: "on1_appear",
             strip: 1,
@@ -281,7 +264,6 @@ fn corpus() -> Vec<Step> {
             engine: |t| t.process(b"\x1b[7;1Hplain"),
             chrome: Chrome::None,
         },
-        // ---- The chrome that runs after the strip in the shipping seam. ----
         Step {
             name: "on1_settings_panel",
             strip: 1,
@@ -312,7 +294,6 @@ fn corpus() -> Vec<Step> {
             engine: |t| t.process(b"\x1b[9;9H."),
             chrome: Chrome::None,
         },
-        // ---- The strip row count changing mid-session. ----
         Step {
             name: "on2_grow",
             strip: 2,
@@ -367,13 +348,10 @@ fn corpus() -> Vec<Step> {
             engine: |_| {},
             chrome: Chrome::None,
         },
-        // ---- A scrolled-back viewport under the strip: must fail closed. ----
         Step {
             name: "on1_scroll_back",
             strip: 1,
             engine: |t| {
-                // Build real scrollback first: `scroll_display` with no
-                // history is a no-op.
                 for _ in 0..40 {
                     t.process(b"scrollback line\r\n");
                 }
@@ -401,7 +379,6 @@ fn corpus() -> Vec<Step> {
             engine: |t| t.process(b"\x1b[10;1Hsettled"),
             chrome: Chrome::None,
         },
-        // ---- Alt screen: an independent grid and an independent clock. ----
         Step {
             name: "on1_alt_enter",
             strip: 1,
@@ -432,7 +409,6 @@ fn corpus() -> Vec<Step> {
             engine: |t| t.process(b"\x1b[11;1Hprimary again"),
             chrome: Chrome::None,
         },
-        // ---- Glyph-free recolours: the sharpest attack on a content stamp. ----
         Step {
             name: "on1_palette_osc4",
             strip: 1,
@@ -475,12 +451,9 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
     let mut stamped_dirty: Vec<bool> = Vec::new();
     let mut brute_dirty: Vec<bool> = Vec::new();
 
-    // Non-vacuity ledgers.
     let mut scoped_on = 0usize;
     let mut full_on = 0usize;
     let mut scoped_off = 0usize;
-    // Which clause refused, over every full-arm frame of the (adversarial)
-    // corpus: the attribution must move with the mutation.
     let mut cause_tally: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
     let mut lane_on = 0usize;
@@ -489,8 +462,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
     let mut scrolled_frames = 0usize;
 
     let steps = corpus();
-    // Two passes: the second re-enters every step from a different prior
-    // state, which is where an order-dependent index bug shows up.
     for pass in 0..2 {
         for (i, step) in steps.iter().enumerate() {
             let terminal = app
@@ -504,8 +475,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
             }
             let what = format!("pass {pass} step {i} ({})", step.name);
             let reference_frame = reference(&mut app, wid, rows, cols);
-            // The strip fingerprint moves with the row count, so the cached
-            // strip rows are rebuilt whenever the count changes.
             let fp = u64::try_from(step.strip).unwrap_or(0).wrapping_add(1);
             let refill = strip_frame(&mut app, wid, rows, cols, step.strip, fp);
             match step.chrome {
@@ -522,9 +491,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
 
             let composed = app.windows[&wid].input_scratch.clone();
 
-            // ---- The correctness claim. ----
-            // (The find-bar step overwrites terminal cells on purpose; it
-            // exists for the fail-closed assertion on the next frame.)
             if step.chrome != Chrome::FindBar {
                 assert_engine_band_matches(&composed, &reference_frame, rows, step.strip, &what);
             }
@@ -567,7 +533,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
                 }
             }
 
-            // ---- The dirty-row claim, against the lane-disowned brute force. ----
             if let Some(prev) = presented.as_ref() {
                 let lane = row_revisions_comparable(prev, &composed);
                 let got = compute_dirty_rows(
@@ -608,8 +573,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
                         }
                     }
                 }
-                // A strip-count change invalidates rather than shifts: stamps
-                // of frames with different shifts are never compared.
                 if prev_strip != step.strip {
                     assert!(
                         !lane,
@@ -631,8 +594,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
                     *cause_tally.entry(cause.as_str()).or_insert(0usize) += 1;
                 }
             }
-            // Fail-closed: the frame after a find bar overwrote engine cells
-            // retains nothing.
             if step.name == "on1_after_find_bar" {
                 assert_eq!(
                     refill,
@@ -643,9 +604,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
                      full, attributed to the HOST that overwrote it"
                 );
             }
-            // A scrolled-back viewport likewise: the revision lane is indexed
-            // by live grid row, so a frame filled at a non-zero display offset
-            // is never retained by the next. Counted for non-vacuity below.
             if prev_offset != 0 {
                 assert!(
                     matches!(refill, FrameRefill::Full { .. }),
@@ -663,8 +621,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
         }
     }
 
-    // ---- Non-vacuity: a corpus that fell back to Full on every strip frame
-    // would satisfy every equality above and prove nothing. ----
     assert!(
         scoped_on >= 20,
         "the strip-ON corpus reached the damage-scoped arm on only {scoped_on} frames — \
@@ -697,8 +653,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
          lane_on={lane_on} lane_work={lane_reported_work}"
     );
     crate::logging::stderr_line!("STRIP-LANE ORACLE full-arm causes: {cause_tally:?}");
-    // The attribution must discriminate: this corpus reporting a single
-    // clause would mean the cause is a constant.
     assert!(
         cause_tally.len() >= 3,
         "the corpus refused under only {} distinct clause(s) ({cause_tally:?}) — the \
@@ -707,10 +661,6 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
     );
 }
 
-/// The scoped share (`frame_refills_scoped` / `frame_refills_full` from
-/// `metrics::note_frame_refill`) on a tab-strip window moves off zero: the
-/// same steady-state keystroke corpus runs with the salvage-only reclaim and
-/// with the un-splice, and both shares are printed.
 #[test]
 fn the_strip_window_scoped_share_moves_off_zero() {
     fn steady_state_share(
@@ -730,8 +680,6 @@ fn the_strip_window_scoped_share_moves_off_zero() {
         let mut full = 0usize;
         let mut causes: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
-        // One settling frame, then 64 keystroke echoes — the shape the
-        // frontend produces while a human types into a strip window.
         let _ = strip_frame_with(&mut app, wid, rows, cols, 1, 1, unsplice);
         for i in 0..64u8 {
             {
@@ -760,11 +708,6 @@ fn the_strip_window_scoped_share_moves_off_zero() {
     crate::logging::stderr_line!(
         "STRIP FULL-ARM CAUSES  before: {before_causes:?}  after: {after_causes:?}"
     );
-    // Without the un-splice every full-arm frame books to `host_mutation`,
-    // not `scratch_row_count`: `splice_tab_strip_with` bumps `snapshot_seq`
-    // when it prepends, and the seq clause is checked ahead of the row-count
-    // clause. So a strip window whose full arm dominates under
-    // `host_mutation` points at the splice, not a scratch-sizing bug.
     assert_eq!(
         before_causes.keys().copied().collect::<Vec<_>>(),
         vec!["host_mutation"],
@@ -786,9 +729,6 @@ fn the_strip_window_scoped_share_moves_off_zero() {
     );
 }
 
-/// A settled strip window takes the scoped arm and retains the row a full
-/// re-extract resolves; a strip-count change on the next frame discards the
-/// retention.
 #[test]
 fn a_strip_count_change_invalidates_rather_than_shifts() {
     let (mut app, wid, rows, cols) = fixture();
@@ -799,7 +739,6 @@ fn a_strip_count_change_invalidates_rather_than_shifts() {
         .clone();
     term_lock(&terminal).process(b"\x1b[1;1HROW-ZERO\x1b[2;1HROW-ONE");
 
-    // Settle: two strip-1 frames, the second of which must retain.
     let _ = strip_frame(&mut app, wid, rows, cols, 1, 1);
     term_lock(&terminal).process(b"\x1b[2;9H!");
     let settled_ref = reference(&mut app, wid, rows, cols);
@@ -819,8 +758,6 @@ fn a_strip_count_change_invalidates_rather_than_shifts() {
         "the retained top engine row must sit at composed index 1"
     );
 
-    // Grow the strip to 2: composed index 2 is now engine row 0, which the
-    // previous frame served at index 1, so stamps must not be compared across.
     let grown_ref = reference(&mut app, wid, rows, cols);
     let _ = strip_frame(&mut app, wid, rows, cols, 2, 2);
     let two = app.windows[&wid].input_scratch.clone();
@@ -839,9 +776,6 @@ fn a_strip_count_change_invalidates_rather_than_shifts() {
     );
 }
 
-/// Only an engine fill and a blessed prepend may leave
-/// `snapshot_seq == shifted_fill_seq`; any other host cell write bumps the
-/// seq alone, so both gates fail closed by default.
 #[test]
 fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
     let (mut app, wid, rows, cols) = fixture();
@@ -852,7 +786,6 @@ fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
         .clone();
     term_lock(&terminal).process(b"\x1b[1;1Hcontent");
 
-    // A clean prepend keeps the lane.
     let _ = strip_frame(&mut app, wid, rows, cols, 1, 1);
     let clean = app.windows[&wid].input_scratch.clone();
     assert_ne!(clean.row_rev_lane, 0, "a blessed prepend keeps the lane");
@@ -861,7 +794,6 @@ fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
         "a blessed prepend re-arms the provenance token"
     );
 
-    // A host writes a cell (bumping the seq) before the prepend runs.
     term_lock(&terminal).process(b"\x1b[1;1Hcontent2");
     {
         let ws = app.windows.get_mut(&wid).expect("fixture window");
@@ -895,8 +827,6 @@ fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
         "the stamp gate accepted a frame whose cells a host had overwritten"
     );
 
-    // …and the un-splice refuses it, so the next extract cannot retain rows
-    // whose bytes the host changed.
     let ws = app.windows.get_mut(&wid).expect("fixture window");
     let mut pool = Vec::new();
     assert!(

@@ -5,7 +5,6 @@
 
 use super::*;
 
-/// Feed a whole sixel data body (without DCS framing) through a fresh decoder.
 fn decode(body: &[u8]) -> Option<SixelImage> {
     let mut d = SixelDecoder::new();
     d.hook();
@@ -29,10 +28,6 @@ fn empty_sequence_is_none() {
 
 #[test]
 fn width_growth_is_amortized_and_preserves_the_height_fast_path() {
-    // Growing the raster width one column at a time (the per-byte sixel
-    // paint path) must over-allocate the stride geometrically — O(log W) reallocations
-    // instead of a realloc+whole-raster copy on every byte (Theta(H*W^2) DoS). And a
-    // height-only growth must still take the in-place resize fast-path.
     let mut d = SixelDecoder::new();
     d.hook();
 
@@ -45,8 +40,6 @@ fn width_growth_is_amortized_and_preserves_the_height_fast_path() {
         d.alloc_width
     );
 
-    // Advance one column at a time; the stride always covers the need and grows in
-    // doubling steps, so it exceeds need_w between reallocations (amortized O(area)).
     for x in 2..64usize {
         d.ensure_capacity(x, 0);
         assert!(d.alloc_width > x, "stride must cover the needed width {x}");
@@ -54,7 +47,6 @@ fn width_growth_is_amortized_and_preserves_the_height_fast_path() {
     let wide = d.alloc_width;
     assert!(wide >= 64, "stride covers 64 columns, got {wide}");
 
-    // Height-only growth must NOT change the stride (fast-path).
     d.ensure_capacity(0, 100);
     assert_eq!(
         d.alloc_width, wide,
@@ -65,17 +57,9 @@ fn width_growth_is_amortized_and_preserves_the_height_fast_path() {
 
 #[test]
 fn tall_raster_width_growth_stays_amortized_near_the_pixel_cap() {
-    // On a tall raster, geometric doubling eventually overflows
-    // SIXEL_MAX_PIXELS while alloc_width is still moderate (2*alloc_width*new_h > cap).
-    // The fallback must grab the widest cap-fitting stride in one realloc — not the
-    // exact needed width (= alloc+1 on a column-at-a-time paint), which would realloc +
-    // copy the whole raster on every byte.
     let mut d = SixelDecoder::new();
     d.hook();
 
-    // new_h = 1025 ⇒ cap/new_h ≈ 4092 columns fit; doubling past ~2046 columns
-    // overflows the cap and hits the fallback. All columns 0..3000 fit the cap
-    // (3000*1025 < 4 Mi), so the stride must cover each and the grow is never refused.
     let tall_y = 1024usize; // need_h = 1025
     let mut reallocs = 0usize;
     let mut prev_w = d.alloc_width;
@@ -91,30 +75,22 @@ fn tall_raster_width_growth_stays_amortized_near_the_pixel_cap() {
             prev_w = d.alloc_width;
         }
     }
-    // O(log W) reallocations (~13 across this loop), not one per column.
     assert!(
         reallocs <= 20,
         "tall-raster column-at-a-time width growth must stay amortized (O(log W) \
          reallocations); got {reallocs} — the per-byte whole-raster-copy DoS regressed"
     );
-    // The fallback grabbed the wide cap-fitting stride (≈4092) rather than crawling
-    // up by +1: it covers thousands of columns from a single realloc.
     assert!(
         d.alloc_width >= 4000,
         "the fallback must grab the wide cap-fitting stride, got {}",
         d.alloc_width
     );
-    // Never over the pixel cap (fail-closed preserved).
     assert!(
         d.alloc_width * d.alloc_height <= SIXEL_MAX_PIXELS,
         "the amortized stride must still respect SIXEL_MAX_PIXELS"
     );
 }
 
-/// Small valid bodies decode to their raster geometry, every painted pixel
-/// the colour register 1 defines (RGB% 100;0;0, opaque red): one full `~`
-/// column, four columns in one band, two bands split by a graphics newline
-/// `-`, and a DECGRI `!5` repeat.
 #[test]
 fn small_bodies_decode_to_their_geometry_in_the_defined_colour() {
     for (body, width, height) in [
@@ -136,21 +112,11 @@ fn small_bodies_decode_to_their_geometry_in_the_defined_colour() {
 
 #[test]
 fn oversized_raster_declaration_is_refused_without_allocating() {
-    // REGRESSION: a ~16-byte DECGRA declaring a 4096×4096 raster (16.7 M cells)
-    // must NOT force the ~150 MB raster/mask/compose allocation. The total-pixel
-    // cap (SIXEL_MAX_PIXELS) refuses the over-cap raster: ensure_capacity does
-    // not allocate and unhook refuses to compose (the image would be rejected
-    // downstream anyway).
     let mut d = SixelDecoder::new();
     d.hook();
-    // `"Pan;Pad;Ph;Pv` = 4096×4096, then one data byte `~` to trigger the
-    // deferred apply_raster (and thus ensure_capacity).
     for &b in b"\"1;1;4096;4096~" {
         d.put(b);
     }
-    // ensure_capacity refused the 4096×4096 declaration, so only the tiny painted
-    // region is allocated — NOT the ~67 MB (4096·4096·4) raster a missing cap
-    // would have produced. Stay well under 1 MiB.
     assert!(
         d.pixel_alloc_bytes() < 1024 * 1024,
         "an over-cap raster must not allocate the full 4096x4096 buffers (got {} bytes)",
@@ -164,9 +130,6 @@ fn oversized_raster_declaration_is_refused_without_allocating() {
 
 #[test]
 fn capped_raster_at_the_pixel_limit_still_decodes() {
-    // A raster exactly at the total-pixel cap (2048×2048 = 4 Mi pixels) must
-    // still decode — the cap is a ceiling, not an off-by-one rejection of
-    // legitimate large images.
     let mut d = SixelDecoder::new();
     d.hook();
     for &b in b"\"1;1;2048;2048#1;2;100;0;0#1~" {
@@ -181,11 +144,9 @@ fn capped_raster_at_the_pixel_limit_still_decodes() {
 
 #[test]
 fn partial_column_sets_only_low_bits() {
-    // `?` = 0x3F → value 0 → no pixels. `A` = 0x41 → value 2 → bit 1 set (row 1).
     let img = decode(b"\"1;1;1;6#1;2;0;100;0#1A").expect("image");
     assert_eq!(img.width(), 1);
     assert_eq!(img.height(), 6);
-    // Only row 1 (second from top) is painted green; others transparent.
     assert_eq!(img.pixels()[0], 0, "row 0 transparent");
     assert_eq!(
         img.pixels()[1] & 0xFF00_FF00,
@@ -197,7 +158,6 @@ fn partial_column_sets_only_low_bits() {
 
 #[test]
 fn dimensions_are_clamped() {
-    // A hostile DECGRI cannot exceed SIXEL_MAX_DIMENSION on width.
     let body = b"#1;2;100;0;0#1!4294967295~";
     let img = decode(body).expect("image");
     assert!(img.width() <= SIXEL_MAX_DIMENSION, "width clamped");
@@ -207,7 +167,6 @@ fn dimensions_are_clamped() {
 
 #[test]
 fn register_select_out_of_range_is_clamped_no_panic() {
-    // Selecting register 99999 must clamp, not panic or grow the palette.
     let img = decode(b"\"1;1;1;6#99999~").expect("image");
     assert_eq!(img.width(), 1);
     assert_eq!(img.height(), 6);
@@ -216,13 +175,10 @@ fn register_select_out_of_range_is_clamped_no_panic() {
 #[test]
 fn span_helpers_round_up() {
     let img = decode(b"\"1;1;4;6#1;2;100;0;0#1~~~~").expect("image");
-    // 4px wide / 8px cell → 1 col; 6px tall / 16px cell → 1 row.
     assert_eq!(img.cols_spanned(8), 1);
     assert_eq!(img.rows_spanned(16), 1);
-    // 4px / 2px cell → 2 cols; 6px / 4px cell → 2 rows.
     assert_eq!(img.cols_spanned(2), 2);
     assert_eq!(img.rows_spanned(4), 2);
-    // A zero cell size divides by one, not zero; the largest is one cell.
     assert_eq!((img.cols_spanned(0), img.rows_spanned(0)), (4, 6));
     assert_eq!(
         (img.cols_spanned(u16::MAX), img.rows_spanned(u16::MAX)),
@@ -240,7 +196,6 @@ fn reuse_across_cycles_resets_state() {
     let a = d.unhook().expect("first image");
     assert_eq!(a.width(), 4);
 
-    // Second cycle: a smaller image must not inherit the first's geometry.
     d.hook();
     for &b in b"\"1;1;1;6#1;2;0;100;0#1~" {
         d.put(b);
@@ -270,9 +225,6 @@ fn abort_frees_and_yields_no_image() {
 
 #[test]
 fn repeat_does_not_survive_band_control() {
-    // DECGRI `!Pn` applies ONLY to the immediately-following sixel data byte. A
-    // `$` (graphics-CR) or `-` (graphics-NL) between `!3` and the data byte must
-    // cancel the pending repeat — otherwise the next band is wrongly widened.
     let cr = decode(b"#1;2;100;0;0#1!3$~").expect("image");
     assert_eq!(
         cr.width(),
@@ -285,7 +237,6 @@ fn repeat_does_not_survive_band_control() {
         1,
         "`!3` then `-` then `~` must NOT repeat (width 1)"
     );
-    // Control: a repeat IMMEDIATELY followed by its data byte still repeats.
     let ok = decode(b"#1;2;100;0;0#1!3~").expect("image");
     assert_eq!(
         ok.width(),
@@ -296,11 +247,6 @@ fn repeat_does_not_survive_band_control() {
 
 #[test]
 fn decgra_only_oversized_yields_none_without_transient() {
-    // A DECGRA declaration of the maximal raster with NO following data byte:
-    // `apply_raster` is deferred to `unhook`. The decoder must NOT eagerly
-    // allocate the declared box during `put`,
-    // and `unhook` must reject the over-cap geometry before composing the
-    // output `pixels` Vec — so no multi-MiB transient is ever materialized.
     let mut d = SixelDecoder::new();
     d.hook();
     for &b in b"\"1;1;4096;4096" {
@@ -315,14 +261,11 @@ fn decgra_only_oversized_yields_none_without_transient() {
         d.unhook().is_none(),
         "over-cap declared geometry (4096*4096*4 > SIXEL_MAX_IMAGE_BYTES) must yield None"
     );
-    // 4096*4096*4 = 64 MiB really does exceed the 16 MiB image cap.
     const _: () = assert!(4096usize * 4096 * 4 > SIXEL_MAX_IMAGE_BYTES);
 }
 
 #[test]
 fn decgra_only_within_cap_uses_declared_geometry() {
-    // A small DECGRA-only declaration still yields a transparent image of the
-    // declared size (the declared-geometry fallback).
     let img = decode(b"\"1;1;4;6").expect("in-cap declared geometry");
     assert_eq!(img.width(), 4);
     assert_eq!(img.height(), 6);
@@ -334,11 +277,6 @@ fn decgra_only_within_cap_uses_declared_geometry() {
 
 #[test]
 fn compose_pads_declared_edges_transparent() {
-    // Declared geometry larger than the painted extent exercises BOTH padding
-    // paths of the row-wise compose: the right edge (width 5 > stride 2, the
-    // painted columns) and the bottom rows (height 13 > alloc_height 6, one
-    // painted band). Every pixel must match the per-pixel reference: painted
-    // region opaque red, all padding fully transparent.
     let img = decode(b"\"1;1;5;13#1;2;100;0;0#1~~").expect("image");
     assert_eq!(img.width(), 5, "declared width wins over painted extent");
     assert_eq!(img.height(), 13, "declared height wins over painted extent");
@@ -357,8 +295,6 @@ fn compose_pads_declared_edges_transparent() {
 
 #[test]
 fn semicolon_flood_keeps_params_bounded() {
-    // A long `;`-separator run after an introducer must not grow `params`
-    // unbounded — it is capped at SIXEL_MAX_PARAMS regardless of stream length.
     let mut d = SixelDecoder::new();
     d.hook();
     d.put(b'#');
@@ -372,15 +308,11 @@ fn semicolon_flood_keeps_params_bounded() {
     );
 }
 
-// The richest valid introducer uses 5 params (`#Pc;Pu;Px;Py;Pz`): lowering the
-// cap below 5 would truncate a colour define (params-bound, second clause).
 const _: () = assert!(
     SIXEL_MAX_PARAMS >= 5,
     "cap must admit the 5-param color define"
 );
 
-/// xorshift64: a few lines, so the generated-stream test below needs no
-/// dev-dependency. Fixed seeds, so a failure reproduces from its case index.
 struct XorShift(u64);
 
 impl XorShift {
@@ -393,15 +325,11 @@ impl XorShift {
         x
     }
 
-    /// Uniform-enough in `0..n` for a stream generator.
     fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
 
-/// A stream of sixel protocol bytes: raster attributes, repeat and colour
-/// introducers, carriage return, newline, digit parameters, the separator,
-/// and the sixel data characters `?`..`~`.
 fn sixel_stream(rng: &mut XorShift, max: usize) -> Vec<u8> {
     const CONTROLS: &[u8] = b"\"!#$-;0123456789";
     (0..rng.below(max))
@@ -415,8 +343,6 @@ fn sixel_stream(rng: &mut XorShift, max: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Arbitrary protocol streams never panic, and any image produced is within
-/// bounds with exactly width * height pixels; without a hook there is none.
 #[test]
 fn decoder_is_bounded_on_arbitrary_streams() {
     let mut rng = XorShift(0x51_8E1);

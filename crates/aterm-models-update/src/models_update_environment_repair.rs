@@ -29,7 +29,6 @@ pub fn native_update_environment_repair_model() -> Model {
                 decided = 1;
             }
 
-            // Dial 2 releases without the verification.
             invariant ReleaseRequiresProof:
                 latched == 1 || (owned == 1 && fresh == 1 && verified == 1);
             invariant RepairedSourceRecovers:

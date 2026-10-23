@@ -10,7 +10,6 @@ use aterm_tty::tty::Size;
 use aterm_types::CursorStyle;
 use aterm_types::text_shaping::AmbiguousWidth;
 
-/// SplitMix64: a seeded stream, so a failure names the seed that replays it.
 struct Rng(u64);
 
 impl Rng {
@@ -22,7 +21,6 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    /// A number in `0..n`.
     fn below(&mut self, n: usize) -> usize {
         usize::try_from(self.next() % u64::try_from(n).expect("small")).expect("small")
     }
@@ -40,8 +38,6 @@ impl Rng {
     }
 }
 
-/// What the frames are written in: plain and wide text, and every character the grid
-/// stores with the cell before it or lays out by its neighbour.
 const PIECES: &[&str] = &[
     "a",
     "b",
@@ -132,7 +128,6 @@ fn text(rng: &mut Rng) -> String {
     (0..n).map(|_| *rng.pick(PIECES)).collect()
 }
 
-/// One random change to `screen`.
 fn mutate(rng: &mut Rng, screen: &mut Screen) {
     let Size { cols, rows } = screen.size();
     let row = rng.below_u16(rows);
@@ -166,7 +161,6 @@ fn mutate(rng: &mut Rng, screen: &mut Screen) {
     }
 }
 
-/// A terminal laying text out under `ambiguous`.
 fn terminal(size: Size, ambiguous: AmbiguousWidth) -> Terminal {
     let mut term = Terminal::new(size.rows, size.cols);
     term.apply_config(&aterm_core::config::TerminalConfig {
@@ -186,7 +180,6 @@ fn color(default: bool, indexed: bool, index: u8) -> Option<Color> {
     }
 }
 
-/// `CellFlags` bits for each attribute.
 const FLAG_BITS: [(Attrs, u16); 6] = [
     (Attrs::BOLD, 1),
     (Attrs::DIM, 1 << 1),
@@ -196,7 +189,6 @@ const FLAG_BITS: [(Attrs, u16); 6] = [
     (Attrs::STRIKE, 1 << 7),
 ];
 
-/// The first way the grid differs from `screen`, if any.
 fn mismatch(term: &Terminal, screen: &Screen) -> Option<String> {
     let Size { cols, rows } = screen.size();
     for row in 0..rows {
@@ -280,10 +272,6 @@ fn mismatch(term: &Terminal, screen: &Screen) -> Option<String> {
     })
 }
 
-/// What an earlier program may have left on the terminal before a repaint: each of
-/// these, or none, then the cursor somewhere. Each one moves or reshapes text when the
-/// repaint does not put it back: SGR, a graphic G0, a graphic G1 shifted in, insert
-/// mode, autowrap off, origin mode, a scroll region, left and right margins.
 fn dirty_state(rng: &mut Rng, size: Size) -> Vec<u8> {
     let mut out = Vec::new();
     let margins = format!("\x1b[?69h\x1b[1;{}s", (size.cols - 1).max(2));

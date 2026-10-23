@@ -284,6 +284,7 @@ mod tests {
         let reports = run_stages(
             &specs,
             |s| {
+                // Pure stages finish instantly; the compile takes its time. The
                 // ladder must not reorder because of it.
                 if s.lane == Lane::MainTarget {
                     std::thread::sleep(Duration::from_millis(40));

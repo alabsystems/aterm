@@ -6,10 +6,7 @@
 
 use aterm_restore::store::{RegionStore, RegionView, StoreError};
 
-/// The real shared mapping is a store: a session journaled through the window's read-write
-/// mapping recovers from a read-only mapping of its custody descriptor exactly as from the
-/// heap region, after the window's own mapping is gone; the read-only mapping refuses every
-/// store by name.
+/// A session journaled into a shared mapping recovers from a read-only mapping of its custody descriptor.
 #[cfg(unix)]
 #[test]
 fn a_session_journaled_into_shared_memory_recovers_from_its_custody_descriptor() {
@@ -58,7 +55,6 @@ fn a_session_journaled_into_shared_memory_recovers_from_its_custody_descriptor()
         term.process(slice);
         writer.append_slice(slice).expect("appended");
     }
-    // The window dies: its mapping goes, the custody descriptor keeps the words.
     drop(writer);
     // SAFETY: drop(writer) above removed this private object's only writable mapping.
     // The retained custody is read-only and stays open until after `dead` is dropped.
@@ -86,8 +82,6 @@ fn a_session_journaled_into_shared_memory_recovers_from_its_custody_descriptor()
     };
     assert!(restored.exact, "{:?}", restored.losses);
     assert_eq!(restored.replayed_records, 2);
-    // The replayed tail leaves its lineage's seed uncertainty to the host's adoption,
-    // which a live engine never has: no state a person sees.
     assert!(restored.checkpoint.holder.seed_untrusted);
     let visible = |c| {
         Terminal::from_checkpoint(c)

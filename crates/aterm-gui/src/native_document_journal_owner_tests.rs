@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The owner identity on a draft journal and the launch sweep
-//! : a process's lease, the owner set on each image, and a
-//! sweep that takes only a clean journal nobody holds.
+//! Tests for draft journal owner identity and the launch sweep.
 
 use super::super::{DraftJournalHost, encode_journal};
 use super::*;
 use crate::document_store::DocumentSnapshot;
 use crate::native_document_io::JournalRecord;
 
-/// A private draft directory for one test, removed when it drops.
 struct Root {
     path: PathBuf,
     _scratch: aterm_tempfile::TempDir,
@@ -28,13 +25,11 @@ impl Root {
         }
     }
 
-    /// A store over this directory: one owner, as a running aterm is.
     fn host(&self) -> DraftJournalHost {
         DraftJournalHost::new(self.path.clone()).expect("journal host")
     }
 }
 
-/// `text` as opened from disk, under its own document id.
 fn snapshot(text: &str) -> (crate::document_store::DocumentStore, DocumentSnapshot) {
     let mut store = crate::test_document_store();
     let id = store.open(format!("file:///tmp/{}.md", text.len()), text.to_string());
@@ -42,8 +37,6 @@ fn snapshot(text: &str) -> (crate::document_store::DocumentStore, DocumentSnapsh
     (store, snapshot)
 }
 
-/// Open `uri` (`disk` on disk) in `host` and leave it clean: the image is the
-/// file's snapshot alone. Returns the journal's path.
 fn open_clean(host: &DraftJournalHost, uri: &str, disk: &str) -> PathBuf {
     let (_store, disk) = snapshot(disk);
     let decision = host
@@ -54,7 +47,6 @@ fn open_clean(host: &DraftJournalHost, uri: &str, disk: &str) -> PathBuf {
         .path
 }
 
-/// Open `uri` in `host` with an unsaved draft over `disk`.
 fn open_with_draft(host: &DraftJournalHost, uri: &str, disk: &str, draft: &str) -> PathBuf {
     let (mut store, disk_snapshot) = snapshot(disk);
     let decision = host
@@ -82,13 +74,11 @@ fn mark(path: &Path) -> OwnerMark {
     read_mark(path, &sys::open_regular(path).expect("image"))
 }
 
-/// The owners the image at `path` names on its own bytes.
 fn named(path: &Path) -> Option<BTreeSet<JournalOwnerId>> {
     let bytes = fs::read(path).expect("image");
     mark(path).owners_of(ContentFingerprint::of(&bytes))
 }
 
-/// The sweep's look at the keyed journal at `path`, in a draft root.
 fn candidate(path: &Path) -> Option<(Candidate, ContentFingerprint)> {
     let name = path.file_name().unwrap().to_str().unwrap();
     let key = keyed_image_key(name).expect("a keyed journal");
@@ -99,14 +89,6 @@ fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-/// The reproduction and the rule together. Before the owner identity, every
-/// document ever opened left its journal in `drafts/` for good: here five
-/// opens leave five images. The sweep takes exactly the one that is clean and
-/// held by nobody, with its lock file, and keeps every other kind: a clean
-/// journal a live process holds (closed or not, it is that process's until it
-/// exits), an unsaved draft whose owner is gone, an image an older aterm wrote
-/// (no owner set: its holders cannot be named), a preserved copy and a legacy
-/// journal.
 #[test]
 fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
     let root = Root::new("sweep-rule");
@@ -116,7 +98,6 @@ fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
     let live = root.host();
     let clean_held = open_clean(&live, "file:///tmp/c.md", "gamma");
 
-    // An older aterm's clean image: the same record, written without a mark.
     let older = live.path_for(live.key_for("file:///tmp/d.md"));
     let (_store, disk) = snapshot("delta");
     let key = live.key_for("file:///tmp/d.md");
@@ -125,9 +106,6 @@ fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
         encode_journal(&[JournalRecord::snapshot_for(key, &disk)]).unwrap(),
     )
     .unwrap();
-    // A clean image whose mark names a gone owner on OTHER bytes (what a
-    // Windows replace leaves when it carries a replaced file's stream): it
-    // names nobody, so it stays.
     let stale = open_clean(&live, "file:///tmp/e.md", "epsilon");
     let stale_bytes = fs::read(&stale).unwrap();
     write_mark(
@@ -150,7 +128,6 @@ fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
     };
     assert_eq!(images(), 5, "every open left its journal");
 
-    // The first host's process exits.
     drop(gone);
     let sweep = sweep_unheld_journals(&root.path);
     assert_eq!(sweep.removed, 1, "{sweep:?}");
@@ -179,19 +156,13 @@ fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
     }
     assert_eq!(sweep.dead_owners, 1, "the gone owner's lease goes");
 
-    // A second sweep finds nothing more while the live host holds its journal.
     assert_eq!(sweep_unheld_journals(&root.path).removed, 0);
-    // Once it exits too, its clean journal goes; the draft never does.
     drop(live);
     assert_eq!(sweep_unheld_journals(&root.path).removed, 1);
     assert!(!exists(&clean_held));
     assert!(exists(&draft_unheld) && exists(&older) && exists(&stale));
 }
 
-/// A journal stays its owner's while the owner lives, however long ago the
-/// document closed: a Suspended document reopened in that process appends to
-/// it without initializing it again. The store's own appends and checkpoints
-/// carry its owner, not only the open's first image.
 #[test]
 fn a_live_stores_writes_name_it_and_are_never_swept() {
     let root = Root::new("live-store");
@@ -229,7 +200,6 @@ fn a_live_stores_writes_name_it_and_are_never_swept() {
         super::super::JournalCompletion::Durable { .. }
     ));
     assert_eq!(named(&path), Some(BTreeSet::from([owner])));
-    // Saved back to the file: clean again, and still held.
     store
         .request_checkpoint(
             crate::native_document_io::DurableCheckpoint {
@@ -264,10 +234,6 @@ fn a_live_stores_writes_name_it_and_are_never_swept() {
     );
 }
 
-/// A process appends to an image while its bytes are the ones it last made
-/// durable, so one that republishes those same bytes carries the claim of
-/// whoever held them. Two live opens of one clean document: the second names
-/// both, and the image stays until both are gone.
 #[test]
 fn an_identical_republish_keeps_the_live_holders_claim() {
     let root = Root::new("identical-marked");
@@ -292,9 +258,6 @@ fn an_identical_republish_keeps_the_live_holders_claim() {
     assert_eq!(sweep_unheld_journals(&root.path).removed, 1);
 }
 
-/// An older aterm names nobody on what it writes. When this one republishes
-/// those very bytes, that older process may still be appending to them, so the
-/// republished image stays unmarked: never swept.
 #[test]
 fn an_identical_republish_over_an_older_aterms_image_stays_unmarked() {
     let root = Root::new("identical-unmarked");
@@ -314,9 +277,6 @@ fn an_identical_republish_over_an_older_aterms_image_stays_unmarked() {
     assert!(exists(&path));
 }
 
-/// The sweep may take a clean journal nobody holds between an open's inspection
-/// and its initialization. The open decided the same with or without it, so it
-/// publishes over the absence instead of refusing as a changed journal does.
 #[test]
 fn a_clean_journal_swept_after_the_inspection_still_opens() {
     let root = Root::new("swept-mid-open");
@@ -334,7 +294,6 @@ fn a_clean_journal_swept_after_the_inspection_still_opens() {
         .expect("the open publishes over the swept journal");
     assert!(exists(&initialized.path));
 
-    // A journal that CHANGED since the inspection still refuses, as before.
     let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
     let (_other, draft) = snapshot("other text");
     fs::write(
@@ -353,9 +312,6 @@ fn a_clean_journal_swept_after_the_inspection_still_opens() {
     );
 }
 
-/// A re-seat that finds its own bytes still in place, under an owner set that
-/// no longer names it (another process wrote those same bytes since), joins
-/// that set: the image then names every live process that can write it.
 #[test]
 fn a_reseat_that_finds_its_own_image_joins_its_owner_set() {
     let root = Root::new("reseat-adopts");
@@ -365,7 +321,6 @@ fn a_reseat_that_finds_its_own_image_joins_its_owner_set() {
     let uri = "file:///tmp/reseat.md";
     let decision = store.inspect_open(uri, disk.text.as_bytes()).unwrap();
     let path = store.initialize(decision, &disk, &disk).unwrap().path;
-    // Another owner, gone now, wrote these same bytes over it.
     let other = root.host();
     let other_id = other.owner_id().unwrap();
     drop(other);
@@ -392,9 +347,6 @@ fn a_reseat_that_finds_its_own_image_joins_its_owner_set() {
     assert_eq!(sweep_unheld_journals(&root.path).removed, 1);
 }
 
-/// What a writer that is gone leaves: a publication's temporary and a lock
-/// file whose journal is gone go; a live journal's lock file and anything not
-/// named like a journal's stay.
 #[test]
 fn a_sweep_clears_the_leftovers_of_writers_that_are_gone() {
     let root = Root::new("leftovers");
@@ -407,8 +359,6 @@ fn a_sweep_clears_the_leftovers_of_writers_that_are_gone() {
     fs::write(&orphan_lock, b"").unwrap();
     let legacy_lock = root.path.join(".fedcba9876543210.atdj.lock");
     fs::write(&legacy_lock, b"").unwrap();
-    // A temporary whose journal is gone: taking that journal's lock to remove
-    // it makes a lock file, which goes with it.
     let gone_temporary = root.path.join(".0123456789abcdef.mac.atdj.777-2.tmp");
     fs::write(&gone_temporary, b"torn").unwrap();
     let gone_lock = root.path.join(".0123456789abcdef.mac.atdj.lock");
@@ -428,8 +378,6 @@ fn a_sweep_clears_the_leftovers_of_writers_that_are_gone() {
     assert!(exists(&path));
 }
 
-/// An owner's lease is acquirable exactly when it is gone: a live host's never
-/// is, and the sweep removes only the leases of owners that are gone.
 #[test]
 fn only_a_gone_owners_lease_is_removed() {
     let root = Root::new("leases");
@@ -447,11 +395,6 @@ fn only_a_gone_owners_lease_is_removed() {
     assert!(owner_alive(&owners, live_id));
 }
 
-/// The sweep reads a journal without its lock, and session restore reopens
-/// exactly the documents whose clean journals it is reading, at the same
-/// moment. A live process that republished the journal since the look (a new
-/// file, named with it) keeps it: the decision under the lock is made on the
-/// file the look read, which is no longer the one the name names.
 #[test]
 fn a_journal_republished_after_the_sweeps_look_is_kept() {
     let root = Root::new("republished-mid-sweep");
@@ -474,9 +417,6 @@ fn a_journal_republished_after_the_sweeps_look_is_kept() {
     );
 }
 
-/// A live process that joined the journal's owner set in place since the
-/// sweep's look (a re-seat that found its own bytes, `adopt`) keeps it: the
-/// owner set is read again under the lock.
 #[test]
 fn an_owner_named_after_the_sweeps_look_keeps_the_journal() {
     let root = Root::new("named-mid-sweep");
@@ -494,11 +434,6 @@ fn an_owner_named_after_the_sweeps_look_keeps_the_journal() {
     assert!(exists(&path));
 }
 
-/// The sweep removes a journal's lock file while it holds it. A writer that
-/// opened that lock file just before, and waited, then holds a lock nobody
-/// else will take — the next taker makes the name afresh — so it proves the
-/// name still names what it locked, and opens it again when not: two writers
-/// are never in at once.
 #[test]
 fn a_lock_removed_while_a_writer_waits_on_it_is_never_taken_as_held() {
     let root = Root::new("lock-removed");
@@ -511,8 +446,8 @@ fn a_lock_removed_while_a_writer_waits_on_it_is_never_taken_as_held() {
         assert_eq!(sweep_unheld_journals(&swept).removed, 1);
     });
     let inside = with_journal_lock(&path, JournalLockPatience::Worker, || {
-        // The lock this writer holds is the one its name names, so a second
-        // taker is refused while it is in.
+        // The lock this writer holds is the one its name names, so a second taker is refused while
+        // it is in.
         Ok((
             exists(&lock),
             with_journal_lock(&path, JournalLockPatience::Sweep, || Ok(())).is_err(),
@@ -522,10 +457,6 @@ fn a_lock_removed_while_a_writer_waits_on_it_is_never_taken_as_held() {
     assert!(!exists(&path), "the sweep took the journal");
 }
 
-/// A process that lets a document go leaves its journal's owner set: an image
-/// another live process still names stays, now naming only that one; the last
-/// holder's release takes a clean image with its lock file; an image holding a
-/// draft never goes.
 #[test]
 fn a_release_takes_a_clean_journal_once_no_live_owner_is_left_on_it() {
     let root = Root::new("release");
@@ -548,7 +479,6 @@ fn a_release_takes_a_clean_journal_once_no_live_owner_is_left_on_it() {
     assert!(!exists(&path), "nobody holds it now");
     assert!(!exists(&journal_lock_path(&path).unwrap()));
 
-    // An image holding a draft never goes, whoever lets it go.
     let mut drafting = super::super::DocumentJournalStore::for_test(root.path.clone()).unwrap();
     let (mut documents, base) = snapshot("base");
     let decision = drafting
@@ -574,10 +504,6 @@ fn a_release_takes_a_clean_journal_once_no_live_owner_is_left_on_it() {
     assert_eq!(named(&draft), Some(BTreeSet::from([drafting_id])));
 }
 
-/// A released journal is settled off the event loop, against the file it
-/// opened there. When this process opens the same file again first, its open
-/// republishes the journal as a new file it holds, which the settle leaves
-/// alone.
 #[test]
 fn a_release_leaves_a_journal_reopened_since_alone() {
     let root = Root::new("release-reopened");

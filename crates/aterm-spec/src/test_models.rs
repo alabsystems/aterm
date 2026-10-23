@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The committed models the engine's own unit tests run on (the ring, the session kernel, the
-//! config catalog, …), mounted from their domain crates' sources rather than copied, so a unit
-//! test here exercises the model that ships. Each domain crate keeps these few in a file of their
-//! own, `models_engine_corpus.rs`, that names only `aterm_spec::…` paths and its own items, which
-//! is what lets it compile here as well as in its crate (`aterm_spec` is this crate's own alias).
-//! Mounting only those files keeps every other model edit out of this crate's tests and out of
-//! the `verify` change cone a mount seeds (aterm-spec and all its dependents). Test builds only:
-//! no library carries a model.
+//! Committed domain models mounted for the engine's unit tests.
 
 #[path = "../../aterm-models-core/src/models_engine_corpus.rs"]
 mod models_core;

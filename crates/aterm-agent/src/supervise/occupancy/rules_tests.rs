@@ -10,16 +10,12 @@ use crate::supervise::memory::Pressure;
 const MIN: i64 = 60_000;
 const HOUR: i64 = 60 * MIN;
 
-/// The board's stamp in these tables (unix ms).
 const T0: i64 = 1_760_000_000_000;
 
-/// One fact a table takes off a board.
 type Unset = fn(&mut OccupancyReading);
 
-/// One guard a table sets.
 type SetGuard = fn(&mut Guards);
 
-/// A hold open since 0, undeclared.
 fn hold() -> Option<HoldSeen> {
     Some(HoldSeen {
         since_ms: 0,
@@ -27,8 +23,6 @@ fn hold() -> Option<HoldSeen> {
     })
 }
 
-/// A board on which every one of `hold-room`'s machine terms holds, taken at `T0`, a slot held
-/// by this session a minute before.
 fn room() -> OccupancyReading {
     OccupancyReading {
         taken_ms: T0,
@@ -43,7 +37,6 @@ fn room() -> OccupancyReading {
     }
 }
 
-/// The verdict of `rule` at `now_ms`.
 fn verdict(
     rule: RuleId,
     r: &OccupancyReading,
@@ -67,7 +60,6 @@ fn is_due(v: &Verdict, rule: RuleId) -> bool {
     matches!(v, Verdict::Due(line) if line.rule() == rule)
 }
 
-/// Books in which the nudge went at `at_ms`, in the hold since 0.
 fn nudged_at(at_ms: i64) -> Books {
     let mut b = Books::default();
     b.hold(0);
@@ -75,8 +67,6 @@ fn nudged_at(at_ms: i64) -> Books {
     b
 }
 
-/// `wait-nudge` is due from 30 minutes into an undeclared hold, not a millisecond before, and
-/// with no hold at all never.
 #[test]
 fn the_nudge_is_due_at_thirty_minutes_not_before() {
     let b = Books::default();
@@ -91,8 +81,6 @@ fn the_nudge_is_due_at_thirty_minutes_not_before() {
     );
 }
 
-/// A DECLARED hold gets no nudge (the agent said what it waits for), but `hold-room` still goes
-/// on it (§10 Q2: a declared wait may name the wrong event, as on 10-19).
 #[test]
 fn a_declared_hold_gets_no_nudge_but_hold_room_still_goes() {
     let declared = Some(HoldSeen {
@@ -107,8 +95,6 @@ fn a_declared_hold_gets_no_nudge_but_hold_room_still_goes() {
     assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
 }
 
-/// The nudge goes ONCE A HOLD: told, it is quiet for the rest of that hold, and due again in the
-/// next.
 #[test]
 fn the_nudge_goes_once_a_hold() {
     let r = OccupancyReading::default();
@@ -127,8 +113,6 @@ fn the_nudge_goes_once_a_hold() {
     ));
 }
 
-/// At most three nudges a rolling day: the fourth hold's is SPENT until the first of them is a
-/// day old.
 #[test]
 fn three_nudges_a_day_then_spent() {
     let r = OccupancyReading::default();
@@ -169,7 +153,6 @@ fn three_nudges_a_day_then_spent() {
     ));
 }
 
-/// `hold-room` is due from two hours into the hold on a board where all its terms hold.
 #[test]
 fn hold_room_is_due_at_two_hours_on_room() {
     let b = nudged_at(WAIT_NUDGE_AFTER_MS);
@@ -178,7 +161,6 @@ fn hold_room_is_due_at_two_hours_on_room() {
     assert!(is_due(&at(HOLD_ROOM_AFTER_MS), RuleId::HoldRoom));
 }
 
-/// `hold-room` lines stand two hours apart, at most four a hold: past the fourth it is SPENT.
 #[test]
 fn hold_room_goes_two_hours_apart_four_a_hold() {
     let mut b = nudged_at(WAIT_NUDGE_AFTER_MS);
@@ -201,10 +183,6 @@ fn hold_room_goes_two_hours_apart_four_a_hold() {
     ));
 }
 
-/// EVERY MACHINE TERM OF `hold-room` IS NEEDED: a board that is stale or absent (the empty
-/// reading), a slot term not held for 20 min, the machine's terms unmet or unjudged, a disk not
-/// `ok`, no slot of this session's held in the hold, or a figure the line needs unread — each is
-/// quiet. The control, every term held, is due.
 #[test]
 fn every_term_of_hold_room_is_needed() {
     let b = nudged_at(WAIT_NUDGE_AFTER_MS);
@@ -244,7 +222,6 @@ fn every_term_of_hold_room_is_needed() {
     }
 }
 
-/// EACH GUARD HOLDS A DUE LINE, under its own word; with none, the same break's line is due.
 #[test]
 fn each_guard_holds_a_due_line() {
     let r = OccupancyReading::default();
@@ -284,7 +261,6 @@ fn each_guard_holds_a_due_line() {
     }
 }
 
-/// A spent cap is said as spent whatever holds the break: the cap is the rule's own.
 #[test]
 fn a_spent_cap_is_said_before_a_guard() {
     let mut b = nudged_at(WAIT_NUDGE_AFTER_MS);
@@ -310,8 +286,6 @@ fn a_spent_cap_is_said_before_a_guard() {
     );
 }
 
-/// ONE LINE A SESSION PER 20 MINUTES: a line due within the pace of the last is paced to its
-/// end, and at most one is due at a break — the second waits a whole pace behind it.
 #[test]
 fn the_session_pace_holds_a_second_line() {
     let b = nudged_at(HOUR + 50 * MIN);
@@ -333,8 +307,6 @@ fn the_session_pace_holds_a_second_line() {
     );
 }
 
-/// THE READING IS WANTED only where `hold-room` could be due by all but the machine (F9): not
-/// before two hours, not within its spacing, not past its cap, never with no hold.
 #[test]
 fn the_reading_is_wanted_only_where_hold_room_could_be_due() {
     let mut b = Books::default();
@@ -354,10 +326,6 @@ fn the_reading_is_wanted_only_where_hold_room_could_be_due() {
     );
 }
 
-/// A WOULD ROW READS BACK: its rule, its stamp and its hold's age, for this session only and
-/// under its own rule only; a row this build did not write is passed over. A line the door typed
-/// under `prompt` (its `fact-hold@v1` outcome `typed`) is booked as a would-be line is; its
-/// `skipped` outcome and the hold clock's own rows are not.
 #[test]
 fn would_rows_read_back_for_this_session() {
     let row =
@@ -397,15 +365,12 @@ fn would_rows_read_back_for_this_session() {
     assert_eq!(would_rows_in(&body, Some("s-3")), []);
 }
 
-/// A ledger row of `sid`'s at `ts`, `decision` under `rule`.
 fn row_said(sid: &str, rule: &str, ts: i64, decision: &str, reason: &str) -> String {
     format!(
         r#"{{"ts":{ts},"sid":"{sid}","rule_id":"{rule}","decision":"{decision}","reason":"{reason}"}}"#
     )
 }
 
-/// An episode's id is the rule's, the hold's and its ordinal's: the same three give the same id
-/// (a successor that carries the hold names it alike), any other gives another.
 #[test]
 fn an_episode_is_its_rule_hold_and_ordinal() {
     let id = episode(RuleId::WaitNudge, T0, 0);
@@ -419,7 +384,6 @@ fn an_episode_is_its_rule_hold_and_ordinal() {
     }
 }
 
-/// A rule's name reads back, and no other name does.
 #[test]
 fn rule_names_read_back() {
     for rule in RuleId::ALL {

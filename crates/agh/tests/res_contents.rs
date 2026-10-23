@@ -4,8 +4,6 @@
 
 //! `contents()` over agh-fake: a file's bytes and a directory's entries.
 
-// Every test routes through the canonical config's dev profile, a private token file (plan §1,
-// rule 12).
 #![cfg(unix)]
 
 use agh::page::{Consistency, End};
@@ -14,7 +12,6 @@ use agh_fake::{FakeGithub, FakeOrigin, Fault, Match, RepoSpec};
 
 use crate::common;
 
-/// The repository: public, the dev bot holding pull.
 const APP: &str = "fixture-dev/app";
 
 struct World {
@@ -38,7 +35,6 @@ impl World {
         }
     }
 
-    /// The api paths seen under `/repos/{APP}/contents`.
     fn contents_paths(&self) -> Vec<String> {
         let prefix = format!("/repos/{APP}/contents");
         self.fake
@@ -142,7 +138,6 @@ fn the_ref_is_honoured_and_a_spaced_path_is_encoded() {
 fn a_file_labelled_raw_json_is_bytes_and_only_application_json_is_a_directory() {
     let w = World::new("ct-media");
     w.fake.put_file(APP, "main", "README", b"Hello World!\n");
-    // GitHub labels a raw file's bytes with the vendor type Accept raw asked for.
     let labelled = |media: &str| Fault::Status {
         status: 200,
         body: "Hello World!\n".to_string(),
@@ -205,7 +200,6 @@ fn a_small_max_holds_the_file_and_never_a_failed_answer() {
 #[test]
 fn a_submodule_is_invalid_to_cat_and_to_ls_and_names_its_type() {
     let w = World::new("ct-submodule");
-    // GitHub answers a submodule's object under either Accept type.
     let object = Fault::Status {
         status: 200,
         body: r#"{"type":"submodule","name":"sub","path":"sub","sha":"s1","submodule_git_url":"https://github.com/fixture-dev/other.git"}"#.to_string(),

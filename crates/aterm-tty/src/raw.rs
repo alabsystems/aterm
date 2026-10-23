@@ -128,7 +128,8 @@ fn restore() {
     }
     if ARMED.load(Ordering::Acquire) {
         let saved = saved();
-        // SAFETY: `saved` holds the settings `tcgetattr` gave when the guard was made; the flush.
+        // SAFETY: `saved` holds the settings `tcgetattr` gave when the guard was made;
+        // the flush names the open terminal.
         unsafe {
             libc::tcsetattr(fd, libc::TCSANOW, saved.as_ptr());
             libc::tcflush(fd, libc::TCIFLUSH);

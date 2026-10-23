@@ -61,7 +61,7 @@ impl Snapshot {
     }
 
     /// The reducer's stage as [`Self::capture`] read it.
-    pub(crate) fn staged(&self) -> Option<&StagedUpdate> {
+    pub(crate) const fn staged(&self) -> Option<&StagedUpdate> {
         self.staged.as_ref()
     }
 

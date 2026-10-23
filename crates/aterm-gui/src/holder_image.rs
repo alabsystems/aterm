@@ -114,7 +114,7 @@ impl CardGate {
     /// The repaint key's term for the gate (`App::claude_footer_fp`): a
     /// drawer, reader or build policy that moves asks for a frame, whose
     /// splice judges the card anew.
-    pub(crate) fn key(&self) -> u64 {
+    pub(crate) const fn key(&self) -> u64 {
         let (policy, build) = match self.build {
             GateBuild::Exact(b) => (1, b.build_id()),
             GateBuild::Registry(b) => (2, b.build_id()),
@@ -844,7 +844,7 @@ impl ByteArm {
     }
 
     /// Whether the batch's C cuts are scanned (not under kernel edges).
-    pub(crate) fn scans(&self) -> bool {
+    pub(crate) const fn scans(&self) -> bool {
         !self.kernel
     }
 
@@ -863,7 +863,7 @@ impl ByteArm {
 
     /// Allow one ordinary read in this batch. A settled drawer or other
     /// non-shell image owes none, however many output batches follow.
-    pub(crate) fn begin_batch(&mut self) {
+    pub(crate) const fn begin_batch(&mut self) {
         self.batch_due = true;
     }
 
@@ -913,7 +913,7 @@ impl ByteArm {
 
     /// The engine's accepted command mark and resulting shell state, read
     /// under its existing hold.
-    pub(crate) fn note_shell(&mut self, signed_c: bool, executing: bool) {
+    pub(crate) const fn note_shell(&mut self, signed_c: bool, executing: bool) {
         if self.kernel {
             return;
         }

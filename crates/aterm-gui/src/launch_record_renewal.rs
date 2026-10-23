@@ -64,7 +64,7 @@ pub(crate) enum RenewalWait {
 
 impl RenewalWait {
     /// How soon a renewal this keeps waiting looks again.
-    fn repoll(self) -> Duration {
+    const fn repoll(self) -> Duration {
         match self {
             Self::Work => WORK_REPOLL,
             Self::Terminal => PERSON_STATE_REPOLL,
@@ -84,7 +84,7 @@ pub(crate) enum NoRenewal {
 impl NoRenewal {
     /// The clause the log line ends with.
     #[must_use]
-    pub(crate) fn cause(self) -> &'static str {
+    pub(crate) const fn cause(self) -> &'static str {
         match self {
             Self::UpdatesOff => "[update] auto_apply is off, so nothing replaces it unasked",
             Self::HandoffUnavailable => "the overlap handoff is unavailable in this process",
@@ -215,7 +215,7 @@ enum InFlightEnd {
 
 impl InFlightEnd {
     /// What the renewal settles at the attempt's return.
-    fn settles(self) -> RenewalDecision {
+    const fn settles(self) -> RenewalDecision {
         match self {
             Self::UpdatesOff => RenewalDecision::Book(BookCause::NoRenewal(NoRenewal::UpdatesOff)),
             Self::LeaveToUpdate => RenewalDecision::LeaveToUpdate,
@@ -223,7 +223,7 @@ impl InFlightEnd {
     }
 
     /// The stand-down's account, for the worker's completion and aterm.log.
-    fn stand_down_detail(self) -> &'static str {
+    const fn stand_down_detail(self) -> &'static str {
         match self {
             Self::UpdatesOff => {
                 "[update] auto_apply was switched off; a launch-record renewal replaces nothing \
@@ -235,7 +235,7 @@ impl InFlightEnd {
 }
 
 impl LaunchRecordRenewal {
-    pub(crate) fn new(renewed_from: Option<u32>) -> Self {
+    pub(crate) const fn new(renewed_from: Option<u32>) -> Self {
         Self {
             renewed_from,
             attempts: 0,
@@ -249,7 +249,7 @@ impl LaunchRecordRenewal {
     }
 
     /// An armed renewal's next look, for the event loop's deadline.
-    pub(crate) fn wake_at(&self) -> Option<Instant> {
+    pub(crate) const fn wake_at(&self) -> Option<Instant> {
         match self.state {
             RenewalState::Armed { retry_at, .. } => Some(retry_at),
             _ => None,

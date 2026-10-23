@@ -7,25 +7,21 @@ use aterm_effects::kitty_pet::PetArrival;
 use aterm_effects::kitty_registry::{KittyLook, SUFFICIENT_DIFFERENCE, coat_distance};
 use std::time::{Duration, Instant};
 
-/// Feed the pane the exact byte stream the zsh integration emits when a
-/// command starts executing (OSC 633;E names it, 133;C opens the run).
+/// Feed the pane the zsh integration command-start byte stream (OSC 633;E and 133;C).
 fn run_program(app: &mut App, cmdline: &str) {
     let term = app.pool.get(0).expect("session 0").term.clone();
     let mut t = crate::term_lock(&term);
     t.process(format!("{cmdline}\x1b]633;E;{cmdline}\x07\r\n\x1b]133;C\x07").as_bytes());
 }
 
-/// …and the stream for the command finishing and the prompt returning.
+/// Feed the pane the command-finish and prompt-return byte stream.
 fn exit_to_prompt(app: &mut App) {
     let term = app.pool.get(0).expect("session 0").term.clone();
     let mut t = crate::term_lock(&term);
     t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07user@host repo % \x1b]133;B\x07");
 }
 
-/// Present-shaped brain ticks with a live caret until the pet's fade
-/// envelope is on glass, so the next `sync_look` of a differing pair takes
-/// the visible arm (a park) instead of the silent birth apply. Live `tick`
-/// (not `tick_static_capture`), so the envelope earns its opacity.
+/// Tick the pet brain until its fade envelope is on glass (`alpha > 0`).
 fn tick_pet_on_glass(app: &mut App, wid: WindowId, t: Instant) {
     let ws = app.windows.get_mut(&wid).expect("window");
     for step in 0..100u64 {
@@ -53,19 +49,16 @@ fn tick_pet_on_glass(app: &mut App, wid: WindowId, t: Instant) {
     panic!("fixture: the pet never reached the glass in 10 s of fed frames");
 }
 
-/// The prompt's byte stream (OSC 133;A/B); every trace starts at a real prompt.
+/// Feed the prompt's byte stream (OSC 133;A/B).
 fn at_prompt(app: &mut App) {
     let term = app.pool.get(0).expect("session 0").term.clone();
     let mut t = crate::term_lock(&term);
     t.process(b"\x1b]133;A\x07user@host repo % \x1b]133;B\x07");
 }
 
-/// The drawn-present performance: what both emit sites call, with
-/// `present = true`, the one caller allowed to spend a hello.
+/// Emit the resident pet with `present = true` and return its worn pair.
 fn perform_on_glass(app: &mut App, wid: WindowId, look: KittyLook, t: Instant) -> (u8, u8) {
     let ws = app.windows.get_mut(&wid).expect("window");
-    // The frame the performance draws: a live present once the resident
-    // is on glass, the materialising still for a pet not yet seen.
     let capture = if ws.fx.companion_mut().alpha() > 0 {
         aterm_effects::host::CaptureMode::Present
     } else {
@@ -109,10 +102,7 @@ fn perform_on_glass(app: &mut App, wid: WindowId, look: KittyLook, t: Instant) -
         .expect("the performance dresses the pet")
 }
 
-/// vim 30 s, claude 30 s, back to vim, through real OSC bytes, the verdict
-/// seam and the render-side commit: landings 1 and 2 are strangers and commit
-/// their hellos at the performance; landing 3 is a return inside `HOMECOMING`
-/// and is Quiet. (The gate alone: `alternating_two_programs_greets_each_once`.)
+/// Strangers commit their hellos at the performance, while a return inside `HOMECOMING` is `Quiet`.
 #[test]
 fn a_return_to_a_recent_program_is_quiet() {
     let t0 = Instant::now();
@@ -121,9 +111,6 @@ fn a_return_to_a_recent_program_is_quiet() {
     let wid = WindowId(0);
     let session = app.front_terminal(wid).expect("front terminal").session;
     let (vim, claude) = (KittyLook::for_app("vim"), KittyLook::for_app("claude"));
-    // Every hop must be a visible change or the sufficient-difference gate
-    // would demote it: probe launch seeds for a coat far from both
-    // programs, and pin the harness's launch kitty to it.
     let launch = (0..)
         .map(KittyLook::for_launch)
         .find(|l| {
@@ -137,7 +124,6 @@ fn a_return_to_a_recent_program_is_quiet() {
         "fixture: the owner's own pair is the 99.2% visible case"
     );
 
-    // Born at the prompt: the launch kitty, worn silently from frame one.
     at_prompt(&mut app);
     assert_eq!(app.companion_verdict(wid, session, t0), launch);
     assert_eq!(
@@ -152,8 +138,6 @@ fn a_return_to_a_recent_program_is_quiet() {
     );
     tick_pet_on_glass(&mut app, wid, t0);
 
-    // Landing 1 — vim, a stranger: ceremony authorised, performed on the
-    // present, committed.
     run_program(&mut app, "vim");
     let t1 = t0 + Duration::from_secs(1);
     assert_eq!(
@@ -174,8 +158,6 @@ fn a_return_to_a_recent_program_is_quiet() {
         "hello 1 was PERFORMED and committed: the authorisation is consumed"
     );
 
-    // Landing 2 — claude, 30 s later (clear of `HELLO_FLOOR`): the second
-    // stranger gets the second ceremony.
     exit_to_prompt(&mut app);
     run_program(&mut app, "claude --resume");
     let t3 = t2 + Duration::from_secs(30);
@@ -196,8 +178,6 @@ fn a_return_to_a_recent_program_is_quiet() {
         PetArrival::Quiet
     );
 
-    // Landing 3: vim again, a roster hit already greeted, inside
-    // `HOMECOMING`: Quiet, and the sync-site mapping agrees.
     exit_to_prompt(&mut app);
     run_program(&mut app, "vim");
     let t5 = t4 + Duration::from_secs(30);
@@ -233,10 +213,7 @@ fn a_return_to_a_recent_program_is_quiet() {
     );
 }
 
-/// The sufficient-difference gate: `vim` and `git` hash into dark-collapse
-/// neighbour coats (different ramps, pixel-identical on a dark background),
-/// so an authorised ceremony between them is demoted to Quiet at the sync
-/// site, the floor is not stamped and the debt is kept.
+/// An authorised ceremony between dark-collapse neighbour coats is demoted to `Quiet` at the sync site without stamping the floor.
 #[test]
 fn a_near_identical_program_switch_never_ceremonies() {
     let t0 = Instant::now();
@@ -244,10 +221,6 @@ fn a_near_identical_program_switch_never_ceremonies() {
     app.recompute_sparkle();
     let wid = WindowId(0);
     let session = app.front_terminal(wid).expect("front terminal").session;
-    // Real canonical ids through `for_app` (the hash path): a genuine pair
-    // change whose coats are insufficiently different. `vim` and `git` are
-    // (coat 0, coat 2), dark-collapse neighbours under the
-    // min-over-backgrounds metric.
     let (vim, git) = (KittyLook::for_app("vim"), KittyLook::for_app("git"));
     assert!(
         coat_distance(vim.coat, git.coat) < SUFFICIENT_DIFFERENCE,
@@ -260,8 +233,6 @@ fn a_near_identical_program_switch_never_ceremonies() {
         "fixture: still a real pair change — only the ANNOUNCEMENT is noise"
     );
 
-    // vim lands on a never-dressed pet: the sync is the silent birth apply;
-    // nothing was performed, so nothing commits and the floor stays clear.
     at_prompt(&mut app);
     run_program(&mut app, "vim");
     app.companion_verdict(wid, session, t0);
@@ -283,8 +254,6 @@ fn a_near_identical_program_switch_never_ceremonies() {
     );
     tick_pet_on_glass(&mut app, wid, t1);
 
-    // git lands: authorised Ceremony (stranger, floor clear) — but the
-    // coat on glass is vim's near-twin, so the mapping demotes.
     exit_to_prompt(&mut app);
     run_program(&mut app, "git log");
     let t2 = t1 + Duration::from_secs(30);
@@ -321,8 +290,6 @@ fn a_near_identical_program_switch_never_ceremonies() {
         "the quiet re-dress is parked; the costume law is untouched"
     );
 
-    // The demoted hello never stamped the floor: a different stranger
-    // landing 6 s later (inside `HELLO_FLOOR`) still gets its ceremony.
     let cargo = KittyLook::for_app("cargo");
     assert!(
         coat_distance(vim.coat, cargo.coat) >= SUFFICIENT_DIFFERENCE
@@ -342,16 +309,11 @@ fn a_near_identical_program_switch_never_ceremonies() {
     );
 }
 
-/// A capture never spends a hello: the introspect splice reaches the same
-/// emitter as the present and syncs the same look, but passes
-/// `present = false`, so the debt survives for the next drawn present.
+/// A capture syncs the look with `present = false`, preserving the hello debt for the next drawn present.
 #[test]
 fn a_capture_never_spends_a_hello() {
     let t0 = Instant::now();
     let mut app = App::headless_for_test();
-    // Enable the trail explicitly: the master's absent-key default is
-    // platform-split (`app_config::DEFAULT_DECORATIVE_EFFECTS` is off on
-    // Windows), and this law must hold on every host.
     app.config.cursor_trail = Some(true);
     app.recompute_sparkle();
     let wid = WindowId(0);
@@ -363,9 +325,6 @@ fn a_capture_never_spends_a_hello() {
         "fixture: the hop is visible — no demotion in this trace"
     );
 
-    // A first capture at the prompt dresses the pet in the launch pair
-    // (proving the splice reaches the pet sync), then a fed tick puts it on
-    // glass so the next differing sync parks.
     at_prompt(&mut app);
     app.capture_words(wid, t0);
     assert_eq!(
@@ -375,7 +334,6 @@ fn a_capture_never_spends_a_hello() {
     );
     tick_pet_on_glass(&mut app, wid, t0);
 
-    // claude earns the cursor: ceremony authorised.
     run_program(&mut app, "claude --resume");
     let t1 = t0 + Duration::from_secs(1);
     app.companion_verdict(wid, session, t1);
@@ -386,9 +344,6 @@ fn a_capture_never_spends_a_hello() {
         PetArrival::Ceremony
     );
 
-    // The capture splice runs before any drawn present. It parks the claude
-    // pair on the live brain and spends nothing: greeted stays unpaid, the
-    // floor unstamped, the latch standing.
     app.capture_words(wid, t2);
     assert_eq!(
         app.windows[&wid].fx.look().tenure().arrival(),
@@ -396,9 +351,6 @@ fn a_capture_never_spends_a_hello() {
         "a capture never spends a hello: the authorisation survives it"
     );
 
-    // The next drawn present spends the surviving debt even though the
-    // capture consumed the brain's fresh-park edge: the commit rides the
-    // standing differing pair, deduped by the latch.
     perform_on_glass(&mut app, wid, claude, t2 + Duration::from_millis(16));
     assert_eq!(
         app.windows[&wid].fx.look().tenure().arrival(),
@@ -407,16 +359,11 @@ fn a_capture_never_spends_a_hello() {
     );
 }
 
-/// A background window never spends a hello: the verdict resolves for an
-/// unfocused window, but the pet is not on glass, so the sync site is never
-/// reached (no park, no commit, the debt intact). When focus returns the
-/// present performs and only then is the hello spent.
+/// A background window resolves the verdict without reaching the sync site, spending the hello only when focus returns.
 #[test]
 fn a_background_window_never_spends_a_hello() {
     let t0 = Instant::now();
     let mut app = App::headless_for_test();
-    // Enable the trail explicitly (see the sibling above): a pet that never
-    // reaches glass would pass this law vacuously.
     app.config.cursor_trail = Some(true);
     app.recompute_sparkle();
     let wid = WindowId(0);
@@ -424,8 +371,6 @@ fn a_background_window_never_spends_a_hello() {
     let launch = KittyLook::for_launch(App::TEST_LAUNCH_SEED);
     let claude = KittyLook::for_app("claude");
 
-    // Dress + show the pet while focused (the trap: if an unfocused
-    // frame wrongly reached the sync, it would park and could commit).
     at_prompt(&mut app);
     app.capture_words(wid, t0);
     assert_eq!(
@@ -435,8 +380,6 @@ fn a_background_window_never_spends_a_hello() {
     );
     tick_pet_on_glass(&mut app, wid, t0);
 
-    // The window goes to the background; claude lands there anyway (the
-    // verdict is resolved unconditionally, above the presentation gates).
     app.windows.get_mut(&wid).expect("window").focused = false;
     run_program(&mut app, "claude --resume");
     let t1 = t0 + Duration::from_secs(1);
@@ -452,8 +395,6 @@ fn a_background_window_never_spends_a_hello() {
         PetArrival::Ceremony
     );
 
-    // A frame for the unfocused window: the pet is not on glass, so the
-    // sync site is never reached — nothing parks, nothing commits.
     app.capture_words(wid, t2);
     assert_eq!(
         app.windows[&wid].fx.companion().brain().worn_pair(),
@@ -466,10 +407,6 @@ fn a_background_window_never_spends_a_hello() {
         "a hello nobody saw was not spent"
     );
 
-    // Focus returns: the drawn present performs and the debt is spent. The
-    // pet must be back on glass first: its envelope decayed in the
-    // background, and a sync against an invisible pet is the silent tier,
-    // which performs no ceremony and spends nothing.
     app.windows.get_mut(&wid).expect("window").focused = true;
     tick_pet_on_glass(&mut app, wid, t2 + Duration::from_secs(1));
     assert!(

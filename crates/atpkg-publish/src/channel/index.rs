@@ -1503,6 +1503,9 @@ fn triple_gate(
     let _ = std::fs::remove_dir_all(&dir);
     let result = (|| {
         for m in &plan.moved {
+            // An ALab pin's targets are the row's own, and its pack was verified to carry
+            // exactly them (`artifact::package::check_pack`); its head pin may be another
+            // repo's legacy build, and everywhere ALab does not build it the client follows
             // the vendor.
             if programs::alab_package(&m.program).is_some() {
                 continue;

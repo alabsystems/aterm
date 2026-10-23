@@ -241,6 +241,11 @@ impl MessagesState {
         let mut began: Vec<(u64, u64)> = Vec::new();
         for rec in log.records().rev() {
             // ONE FACT, ONE ROW: a record a later row tells the story of on
+            // (a keyed post in new words, a notice moved to its next state, an
+            // exception taking over a row) is that row's past, not a row of its
+            // own; the `messages` verb still prints it, `superseded`. Newest
+            // first, its successor was met already, so a chain resolves to the
+            // entry at its head.
             if let Some(by) = told_on_by(log, rec) {
                 let standing = told_on
                     .iter()

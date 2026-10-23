@@ -604,6 +604,7 @@ impl<'a> RawFace<'a> {
             }
         } else {
             // When reading from a regular font (not a collection) disallow index to be non-zero
+            // Basically treat the font as a one-element collection
             if index != 0 {
                 return Err(FaceParsingError::FaceIndexOutOfBounds);
             }

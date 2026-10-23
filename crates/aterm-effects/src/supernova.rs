@@ -299,6 +299,7 @@ pub fn emit_super(
         budget: budget.min(MAX_SUPER_QUADS_PER),
     };
     if t_ms < CHARGE_END_MS {
+        // Charge: 12 motes spiral toward the word centre. Dark themes only;
         // light themes draw them on the Over deco stream (`emit_super_decos`).
         if !env.light {
             let p = t_ms as f32 / CHARGE_END_MS as f32;

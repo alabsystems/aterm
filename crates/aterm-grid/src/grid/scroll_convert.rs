@@ -300,6 +300,7 @@ fn cells_to_line(cells: &[Cell], extras: &ScrolledRowExtras, wrapped: bool) -> L
         line
     } else if extras.is_empty() {
         // No complex chars and no overflow colours: every cell is one BMP
+        // character with inline colours, and none can fold into the one before.
         plain_cells_to_line(cells)
     } else {
         styled_cells_to_line(cells, extras)
@@ -1061,6 +1062,7 @@ impl Grid {
     /// Convert a row to a [`Line`] using extras extracted at scroll time (RGB overflow colours already resolved).
     pub(crate) fn row_to_line_with_stored_extras(row: &Row, extras: &ScrolledRowExtras) -> Line {
         // As a staged line reads it (`DeferredLine::new_boxed`): a recorded
+        // early-wrap hole is not content, also when BCE put it inside `len`.
         Self::row_to_line_with_stored_extras_at_len(row, extras, row.written_len())
     }
 
@@ -1118,6 +1120,7 @@ impl Grid {
             let (mut n_fg, mut n_bg) = (0usize, 0usize);
             for (i, c) in cap_cells.iter().enumerate() {
                 // Mirror the main loop's spacer skip so the reserve matches what
+                // is actually pushed.
                 if is_spacer(cap_cells, i) {
                     continue;
                 }

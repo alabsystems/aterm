@@ -398,6 +398,8 @@ impl GlShared {
 
     /// Make the context current on this thread (see the module header).
     pub(crate) fn enter(&self) -> Result<Current<'_>, String> {
+        // First, so a nested guard refuses too: a present holds one guard
+        // throughout, and a loss latched in it ends the present at its next
         // step's guard, as when every step bound the context itself.
         if self.lost() {
             #[cfg(not(target_arch = "wasm32"))]
@@ -500,6 +502,7 @@ impl GlShared {
 #[cfg(target_arch = "wasm32")]
 impl Drop for GlShared {
     fn drop(&mut self) {
+        // The resources holding this `Arc` are gone; the glue forgets the
         // context, and the canvas's slot goes with `_canvas`.
         ffi::webgl::context_drop(self.context);
     }
@@ -534,6 +537,7 @@ fn has_ext(list: &str, ext: &str) -> bool {
 impl GlDevice {
     /// A headless device: no window system, rendering only into textures it reads back.
     pub(crate) fn headless() -> Result<Self, String> {
+        // Creation binds the new context on this thread, which would unbind a
         // device held here.
         if !HELD.with(Cell::get).is_null() {
             return Err(

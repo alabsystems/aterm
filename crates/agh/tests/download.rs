@@ -18,9 +18,7 @@ use agh_fake::{
 
 use crate::common;
 
-/// The repository: public, the dev bot holding push.
 const APP: &str = "fixture-dev/app";
-/// The asset's bytes.
 const BYTES: &[u8] = b"the asset's bytes, all of them";
 
 struct World {
@@ -47,7 +45,6 @@ impl World {
         }
     }
 
-    /// Add `spec` to the release and read its object back.
     fn asset(&self, spec: AssetSpec) -> AssetObject {
         let id = self.fake.add_asset(self.release, spec);
         self.gh
@@ -82,7 +79,6 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::from_bytes(aterm_digest::Sha256::digest(bytes))
 }
 
-/// Neither the destination nor its part file is there.
 fn nothing_remains(dest: &Path) {
     assert!(!dest.exists(), "{} remains", dest.display());
     assert!(!part_path(dest).exists(), "the part file remains");

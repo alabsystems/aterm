@@ -132,6 +132,28 @@ fn an_unrelated_key_decides_while_the_cold_registry_is_locked() {
     }
 }
 
+/// A sink that outlives its borrowed fd leaves its writer slot under a number the next fd can
+/// take: the new sink gets a slot of its own, so the handoff gate reads the new sink's queue.
+/// Negative control: handing the new sink the stale slot leaves the gate reading an idle sink.
+#[cfg(unix)]
+#[test]
+fn a_reused_master_number_gates_on_the_new_sink() {
+    use std::sync::Arc;
+
+    const MASTER: i32 = -3;
+    let stale = Arc::new(SinkWriter::new(MASTER));
+    drop(paste_order::pin_ordering_for_test(&stale));
+    let fresh = Arc::new(SinkWriter::new(MASTER));
+    let pin = paste_order::pin_ordering_for_test(&fresh);
+    assert!(
+        paste_order::is_master_ordering_for_handoff(MASTER),
+        "the gate reads the sink now on the number"
+    );
+    drop(pin);
+    assert!(!paste_order::is_master_ordering_for_handoff(MASTER));
+    drop(stale);
+}
+
 /// Two real, independent input sinks: A submits a paste and a key to its
 /// writer while B submits many keys to its own PTY. A's held ordering pin fixes
 /// the interleaving; every B receipt is an inline acceptance, and A's bytes keep

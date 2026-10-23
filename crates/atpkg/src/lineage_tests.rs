@@ -1,22 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `lineage` over synthetic trees: the scan's evidence classes (each with the
-//! prose or shape that must NOT count), compiler admission by content (the `-vV`
-//! probe injected, everything else real files) and the SEED-MINT port's messages. The
-//! LINEAGE record's round trip and the tree scan are the producer's
-//! (`atpkg-publish`'s `tests/artifact/lineage.rs`).
+//! Lineage scan, compiler admission, and SEED-MINT receipt tests.
 
 use super::*;
 
-/// A Trust compiler's commit.
 const TRUST: &str = "7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15";
-/// Stock rustc 1.97.1's commit.
 const STOCK: &str = "8bab26f4f68e0e26f0bb7960be334d5b520ea452";
-/// A Mach-O thin 64-bit head: what `native_head` admits.
 const MACHO: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
 
-/// A scratch dir (removed on drop) and its path.
 fn tmp(label: &str) -> (crate::testdir::Dir, PathBuf) {
     let dir = crate::testdir::dir(&format!("atpkg-lineage-{label}-"));
     let path = dir.to_path_buf();
@@ -31,8 +23,7 @@ fn object(bytes: &[u8]) -> Vec<u8> {
     v
 }
 
-/// A crate-metadata header, as rustc writes it (`rustc_serialize`'s `emit_str`): the
-/// length as unsigned LEB128, the string, then the `0xc1` string sentinel.
+/// Unsigned LEB128 length followed by the version string and `0xc1` sentinel.
 fn metadata_header(version: &str) -> Vec<u8> {
     let mut v = b"rust\0\0\0\n\0\0\0\0\0\0\0\0".to_vec();
     let mut len = version.len();
@@ -70,9 +61,7 @@ fn a_stock_std_path_is_refused_and_named() {
     }
     .describe();
     assert!(described.contains(STOCK), "{described}");
-    // The admitted compiler's own commit is not evidence against it.
     assert!(scan_bytes(&object(path.as_bytes()), STOCK).is_empty());
-    // Not a 40-hex commit: not a std path.
     assert!(scan_bytes(&object(b"/rustc/not-a-commit/library/std/src/x.rs"), TRUST).is_empty());
 }
 
@@ -88,7 +77,6 @@ fn a_stock_metadata_header_is_refused_and_trusts_own_is_not() {
         scan_bytes(&object(&metadata_header(nightly)), TRUST),
         vec![Evidence::MetadataVersion(nightly.to_string())]
     );
-    // The admitted compiler's own header (Trust's carries no `(trustc …)` suffix there).
     assert!(
         scan_bytes(
             &object(&metadata_header("rustc 1.99.0-dev (7d5533b2b 2026-09-23)")),
@@ -96,7 +84,6 @@ fn a_stock_metadata_header_is_refused_and_trusts_own_is_not() {
         )
         .is_empty()
     );
-    // Another Trust commit's metadata is not this compiler's either.
     assert_eq!(
         scan_bytes(
             &object(&metadata_header("rustc 1.99.0-dev (321aaeda7 2026-09-17)")),
@@ -109,8 +96,6 @@ fn a_stock_metadata_header_is_refused_and_trusts_own_is_not() {
 
 #[test]
 fn a_beta_or_distribution_built_compiler_is_evidence() {
-    // Every shape a stock rustc writes into crate metadata: a beta channel's
-    // `<num>-beta.<n>`, and the ` (<description>)` a distribution appends.
     for v in [
         "rustc 1.81.0-beta.3 (4c39e7b6b 2024-07-29)",
         "rustc 1.82.0 (f6e511eec 2024-10-15) (Homebrew)",
@@ -123,7 +108,6 @@ fn a_beta_or_distribution_built_compiler_is_evidence() {
             "{v}"
         );
     }
-    // A description long enough that the length takes two LEB128 bytes.
     let long = format!(
         "rustc 1.82.0 (f6e511eec 2024-10-15) ({})",
         "a distribution's own words ".repeat(5)
@@ -133,7 +117,6 @@ fn a_beta_or_distribution_built_compiler_is_evidence() {
         scan_bytes(&object(&metadata_header(&long)), TRUST),
         vec![Evidence::MetadataVersion(long.clone())]
     );
-    // The same shapes as an LLVM producer / ELF `.comment`.
     for (producer, named) in [
         (
             "clang LLVM (rustc version 1.81.0-beta.3 (4c39e7b6b 2024-07-29))",
@@ -150,7 +133,6 @@ fn a_beta_or_distribution_built_compiler_is_evidence() {
             "{producer}"
         );
     }
-    // The admitted compiler under a description of its own is still the admitted one.
     assert!(
         scan_bytes(
             &object(&metadata_header(
@@ -160,8 +142,6 @@ fn a_beta_or_distribution_built_compiler_is_evidence() {
         )
         .is_empty()
     );
-    // A length that runs past the version into anything but ` (…)` is no header: a string
-    // that merely starts with a version (prose, a self-report) is not one.
     let mut not_a_header = b"rust\0\0\0\n\0\0\0\0\0\0\0\0".to_vec();
     let text = b"rustc 1.97.1 (8bab26f4f 2026-07-14) was the stock compiler we measured";
     not_a_header.push(u8::try_from(text.len()).expect("short"));
@@ -176,11 +156,8 @@ fn a_beta_or_distribution_built_compiler_is_evidence() {
 
 #[test]
 fn prose_and_self_reports_are_not_evidence() {
-    // A doc comment quoting a stock version, as Trust's own crate metadata carries: space-led,
-    // so no length byte can match it.
     let prose = b" not work either. MEASURED on stock rustc 1.97.1 (8bab26f4f 2026-07-14),";
     assert!(scan_bytes(&object(prose), TRUST).is_empty());
-    // A backtick-quoted `trustc 1.99.0-dev (…)` (libtrust_types).
     assert!(
         scan_bytes(
             &object(b"MEASURED on `trustc 1.99.0-dev (ddb545d35 2026-08-21)`"),
@@ -188,11 +165,9 @@ fn prose_and_self_reports_are_not_evidence() {
         )
         .is_empty()
     );
-    // A program's build-info self-report.
     let self_report = b"another copyrustc 1.99.0-dev (7d5533b2b 2026-09-23) (trustc 0.1.0)";
     assert!(scan_bytes(&object(self_report), TRUST).is_empty());
     assert!(scan_bytes(&object(self_report), STOCK).is_empty());
-    // aterm's own help text names rustup's `trust` channel link, not a toolchain path.
     assert!(
         scan_bytes(
             &object(b"~/.rustup/toolchains/trust -> <prefix>/rustup/trust"),
@@ -218,7 +193,6 @@ fn producer_wasm_and_rustup_evidence_is_refused() {
         )
         .is_empty()
     );
-    // A wasm producers section.
     let mut wasm =
         b"\0asm\x01\0\0\0\0p\tproducers\x02\x08language\x01\x04Rust\0\x0cprocessed-by\x03\x05rustc"
             .to_vec();
@@ -237,7 +211,6 @@ fn producer_wasm_and_rustup_evidence_is_refused() {
             "nightly-2025-12-03-aarch64-apple-darwin".to_string()
         )]
     );
-    // A system RUSTUP_HOME (the Linux images' /usr/local/rustup) is the same toolchain tree.
     let system = b"/usr/local/rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/lib.rs";
     assert_eq!(
         scan_bytes(&object(system), TRUST),
@@ -245,14 +218,11 @@ fn producer_wasm_and_rustup_evidence_is_refused() {
             "1.97.1-x86_64-unknown-linux-gnu".to_string()
         )]
     );
-    // Not rooted at a directory boundary: a longer word ending in `rustup` is no such path.
     assert!(scan_bytes(&object(b"/opt/myrustup/toolchains/x/lib"), TRUST).is_empty());
 }
 
 #[test]
 fn evidence_straddling_a_read_boundary_is_found_once_and_the_digest_is_whole() {
-    // A small step, so every boundary case is a few KiB rather than 8 MiB of debug-build
-    // hashing: the anchor just inside the scanned window, just past it, and in the tail.
     const STEP: usize = 4 * TAIL;
     let path = format!("/rustc/{STOCK}/library/core/src/panic.rs");
     for offset in [
@@ -301,8 +271,6 @@ fn find_byte_agrees_with_a_linear_search() {
     assert_eq!(find_byte(&hay, b'r'), None);
 }
 
-// Compiler admission.
-
 fn trust_vv(commit: &str) -> String {
     format!(
         "rustc 1.99.0-dev ({} 2026-09-23) (trustc 0.1.0)\nbinary: trustc\ncommit-hash: {commit}\n\
@@ -316,8 +284,6 @@ const STOCK_VV: &str = "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncomm
      8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: \
      aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 20.1.8\n";
 
-/// A toolchain root: bin/{trustc,targo} and lib/librustc_driver-<h>.dylib, each a
-/// Mach-O-headed file carrying `extra`.
 fn toolchain(root: &Path, extra: &[u8]) -> PathBuf {
     std::fs::create_dir_all(root.join("bin")).expect("mkdir");
     std::fs::create_dir_all(root.join("lib")).expect("mkdir");
@@ -347,8 +313,6 @@ fn sha(path: &Path) -> String {
     crate::tree::sha256_file(path).expect("hash")
 }
 
-/// A SEED-MINT for the toolchain at `root` (commit `commit`), comparing trustc and the
-/// driver, with `kv` fields replaced.
 fn seed_mint(root: &Path, commit: &str, kv: &[(&str, &str)]) {
     let tree = "a".repeat(64);
     let mut fields: Vec<(String, String)> = [
@@ -392,7 +356,6 @@ fn seed_mint(root: &Path, commit: &str, kv: &[(&str, &str)]) {
     std::fs::write(root.join(SEED_MINT_FILE), text).expect("write SEED-MINT");
 }
 
-/// Sh wrappers named trustc/targo that exec rustup's stable and sed its identity into Trust's.
 #[test]
 fn a_genesis_style_wrapper_is_refused_by_content() {
     let (_dir, d) = tmp("genesis");
@@ -417,8 +380,6 @@ fn a_genesis_style_wrapper_is_refused_by_content() {
     );
 }
 
-/// A stock rustc copied in under Trust's names: native, so it runs, and its `-vV` and its
-/// driver's bytes say what it is.
 #[test]
 fn a_renamed_stock_rustc_is_refused_by_content() {
     let (_dir, d) = tmp("renamed");
@@ -435,8 +396,6 @@ fn a_renamed_stock_rustc_is_refused_by_content() {
         "{err:?}"
     );
     assert!(err.iter().any(|l| l.contains("binary: rustc")), "{err:?}");
-    // Even with a Trust-shaped report, a driver carrying another compiler's std is not
-    // this compiler's.
     let err = check_compiler_with(&bin, LineagePolicy::Dormant, &probe_says(trust_vv(TRUST)))
         .expect_err("stock bytes");
     assert!(
@@ -456,7 +415,6 @@ fn a_stock_location_is_refused_before_it_runs() {
         err.iter().any(|l| l.contains("rustup's directory")),
         "{err:?}"
     );
-    // A system RUSTUP_HOME's toolchain (no dot: /usr/local/rustup/toolchains/<name>).
     let (_dir3, d3) = tmp("system-rustup");
     let bin3 = toolchain(
         &d3.join("rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu"),
@@ -468,7 +426,6 @@ fn a_stock_location_is_refused_before_it_runs() {
         err.iter().any(|l| l.contains("rustup's directory")),
         "{err:?}"
     );
-    // A trustc linked into ~/.cargo (a rustup proxy) resolves there and is refused too.
     let (_dir2, d2) = tmp("cargo-link");
     let bin2 = toolchain(&d2.join("tc"), b"");
     std::fs::create_dir_all(d2.join(".cargo/bin")).expect("mkdir");
@@ -524,7 +481,6 @@ fn a_seed_mint_admits_the_bytes_it_compared_and_nothing_else() {
         matches!(admitted.lineage, LineageProof::SeedMint { ref relation, .. } if relation == "pin-ancestor")
     );
 
-    // One flipped digest: the receipt no longer describes this seal.
     let text = std::fs::read_to_string(d.join(SEED_MINT_FILE)).expect("read");
     let trustc_sha = sha(&d.join("bin/trustc"));
     let first = if trustc_sha.starts_with('0') {
@@ -540,10 +496,8 @@ fn a_seed_mint_admits_the_bytes_it_compared_and_nothing_else() {
             .any(|l| l.contains("does not describe this seal") && l.contains("bin/trustc")),
         "{err:?}"
     );
-    // Dormancy never excuses a wrong receipt.
     assert!(check_compiler_with(&bin, LineagePolicy::Dormant, &probe).is_err());
 
-    // A receipt that compared other files does not cover this compiler's bytes.
     seed_mint(&d, TRUST, &[]);
     let text = std::fs::read_to_string(d.join(SEED_MINT_FILE)).expect("read");
     let only_trustc: String = text
@@ -559,7 +513,6 @@ fn a_seed_mint_admits_the_bytes_it_compared_and_nothing_else() {
         "{err:?}"
     );
 
-    // A receipt minted for another compiler.
     seed_mint(&d, "4444444444444444444444444444444444444444", &[]);
     let err = check_compiler_with(&bin, LineagePolicy::Require, &probe).expect_err("other");
     assert!(
@@ -568,7 +521,6 @@ fn a_seed_mint_admits_the_bytes_it_compared_and_nothing_else() {
     );
 }
 
-/// Each SEED-MINT defect, alone, is exactly one refusal, and it names that defect.
 #[test]
 fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
     let (_dir, d) = tmp("mint-words");
@@ -588,10 +540,6 @@ fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
         r.into_iter().next().unwrap_or_default()
     };
     assert_eq!(only(&[]), "");
-    // Each defect alone: one refusal, carrying the value that names it. The double
-    // compile's substance counts, not its verdict word: two seeds that built different
-    // stage2 trees are refused even beside `ddc_verdict=identical`, and so is a pair of
-    // equal digests that are no sha256.
     let other_tree = "b".repeat(64);
     for (kv, names) in [
         (
@@ -621,13 +569,11 @@ fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
         let refusal = only(kv);
         assert!(refusal.contains(names), "{kv:?}: {refusal}");
     }
-    // A compared file that is not the seal's.
     seed_mint(&d, TRUST, &[]);
     std::fs::write(d.join("bin/trustc"), object(b"swapped")).expect("write");
     let r = seed_mint_refusals(&d, TRUST);
     assert_eq!(r.len(), 1, "{r:?}");
     assert!(r[0].ends_with("bin/trustc"), "{r:?}");
-    // A compared link repointed after the cut.
     #[cfg(unix)]
     {
         seed_mint(&d, TRUST, &[]);
@@ -640,7 +586,6 @@ fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
         assert_eq!(r.len(), 1, "{r:?}");
         assert!(r[0].ends_with("— lib/trustc-link"), "{r:?}");
     }
-    // A compared path that climbs out of the seal is never read.
     seed_mint(&d, TRUST, &[]);
     let mut t = std::fs::read_to_string(d.join(SEED_MINT_FILE)).expect("read");
     t.push_str(&format!("compiler_file={} ../outside\n", "b".repeat(64)));
@@ -650,7 +595,6 @@ fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
             .iter()
             .any(|l| l.contains("../outside"))
     );
-    // No receipt at all.
     std::fs::remove_file(d.join(SEED_MINT_FILE)).expect("rm");
     assert_eq!(seed_mint_refusals(&d, TRUST).len(), 1);
 }

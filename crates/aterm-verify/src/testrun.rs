@@ -608,6 +608,8 @@ pub fn run_tests(
         return;
     }
     if !recorded && !recorder_failed {
+        // The recorder never ran: no test binary at all, or a runner the
+        // caller's cargo config names outranked this one and cargo ran every
         // binary itself — this pass WAS the serial run.
         if !announced(&pass.output).is_empty() {
             r.raw(

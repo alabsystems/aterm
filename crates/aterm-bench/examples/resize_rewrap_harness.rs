@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Resize/rewrap fence harness: a width change must never rewrap the whole
-// scrollback synchronously on the event-loop thread. Workloads:
-//
-//   ring          ring-only (the wasm/daemon config): `Terminal::resize`
-//                 rewraps the whole ring synchronously. Floor: resizes/s;
-//                 fence: worst single resize.
-//   tiered        `resize_offloading_scrollback`: the synchronous half stays
-//                 viewport-bounded, with the history rewrap stepped via
-//                 `reflow_step`. Floor: offload+pump+reattach cycles/s;
-//                 fence: worst synchronous phase.
-//   deep_mixed    a ~200k-logical-line history, ~90% short lines / ~10%
-//                 wrapping: total off-thread rewrap time, worst single pump
-//                 step, and the synchronous phase at depth.
-//   deep_wrapall  the same depth with the all-wrapping worst-case corpus.
-//   converge      a second width change lands mid-flight; reports whether
-//                 the settled wrap width is stale (1) or the final width (0).
-//
-// `verify perf` applies a baseline-relative floor to the rates and absolute caps
-// to the worst-ms values, so the caps hold even with no recorded baseline.
-//
-//   targo --unverified run --release -q -p aterm-bench --example resize_rewrap_harness
-//   -> {"resize_ring_median_rps":...,"resize_tiered_median_rps":...,
-//       "resize_ring_worst_ms":...,"resize_tiered_sync_worst_ms":...,
-//       "ring_lines":...,"tiered_fill_lines":...,"n":...,"warmup":...}
+// Resize/rewrap fence harness (`verify perf`).
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -34,42 +11,21 @@ use aterm_core::terminal::{Terminal, TerminalBuilder};
 use aterm_grid::ReflowStep;
 
 const ROWS: u16 = 24;
-
-/// Width toggle: 80 <-> 76 forces a real rewrap of every soft-wrapped line in
-/// both directions (lines below are ~100 chars, so they wrap at either width).
 const COLS_A: u16 = 80;
 const COLS_B: u16 = 76;
-
-/// Ring-only depth: the product's 50k scrollback cap, the deepest ring a pane
-/// rewraps synchronously.
 const RING_LINES: usize = 50_000;
-
-/// Tiered fill: overflow the 100k default limit so warm/cold tiers are real.
 const TIERED_FILL_LINES: usize = 120_000;
 const TIERED_RING: usize = 10_000;
-
-/// Resizes per timed pass (each pass toggles width back and forth so every
-/// resize rewraps; an even count returns the grid to its start width).
 const RESIZES_PER_PASS: usize = 6;
-
-/// Pump budget for the tiered step loop — the wasm pump's default
-/// (`REFLOW_STEP_BUDGET_LINES`), so the stepped total matches production.
 const PUMP_BUDGET_LINES: usize = 2_000;
-
 const N_ITERS: usize = 5;
 const WARMUP: usize = 1;
-
-/// Deep-history depth (logical lines): big enough that warm and cold tiers are
-/// real and the pump takes hundreds of steps, small enough that the fence run
-/// stays a few seconds.
 const DEEP_FILL_LINES: usize = 200_000;
 const DEEP_RING: usize = 10_000;
-/// One toggle out and back per pass, so the terminal ends at its start width.
 const DEEP_RESIZES: usize = 2;
 const DEEP_ITERS: usize = 2;
 
-/// ~100-char wrapping-prone lines (they re-break at both toggle widths), with
-/// a counter so content is distinguishable. Deterministic, no RNG/clock.
+/// Deterministic ~100-char wrapping lines.
 fn fill_corpus(lines: usize) -> Vec<u8> {
     const GLYPHS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/-=";
     let mut out = Vec::with_capacity(lines * 108);
@@ -84,8 +40,7 @@ fn fill_corpus(lines: usize) -> Vec<u8> {
     out
 }
 
-/// Mixed corpus: ~90% short (8..48-char, wrap-invariant at both toggle widths)
-/// lines, ~10% ~100-char wrapping lines: the realistic shell-history shape.
+/// Deterministic mixed corpus (~90% short 8..48-char lines, ~10% ~100-char wrapping lines).
 fn fill_mixed_corpus(lines: usize) -> Vec<u8> {
     const GLYPHS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/-=";
     let mut out = Vec::with_capacity(lines * 44);
@@ -101,8 +56,7 @@ fn fill_mixed_corpus(lines: usize) -> Vec<u8> {
     out
 }
 
-/// An unlimited-line-limit tiered terminal (retention bounded only by the byte
-/// budget, the histories the offload exists for), filled with `corpus`.
+/// Unlimited-line-limit tiered terminal filled with `corpus`.
 fn deep_unlimited_term(corpus: &[u8]) -> Terminal {
     let mut sb = Scrollback::new(64, 512, 512_000_000);
     sb.set_line_limit(None);
@@ -111,7 +65,6 @@ fn deep_unlimited_term(corpus: &[u8]) -> Terminal {
     term
 }
 
-/// Deep-pass measurements (see the header).
 struct DeepPassStats {
     sync_worst: f64,
     pump_total: f64,
@@ -119,8 +72,6 @@ struct DeepPassStats {
     steps: usize,
 }
 
-/// One deep pass: DEEP_RESIZES offloading width toggles, each pumped at the
-/// production budget, timing every step.
 fn deep_pass(term: &mut Terminal) -> DeepPassStats {
     let mut stats = DeepPassStats {
         sync_worst: 0.0,
@@ -147,9 +98,7 @@ fn deep_pass(term: &mut Terminal) -> DeepPassStats {
             match step {
                 ReflowStep::InProgress(next) => job = next,
                 ReflowStep::Done(reflowed) => {
-                    // Re-attach can hand back a convergence job (the settled
-                    // width disagreed with the job's); drive it through this
-                    // same timed loop so its cost is priced here.
+                    // Drive any follow-up convergence job through the same timed loop.
                     match term.finish_resize_offload(reflowed) {
                         Some(next) => job = next,
                         None => break,
@@ -162,18 +111,13 @@ fn deep_pass(term: &mut Terminal) -> DeepPassStats {
     stats
 }
 
-/// Convergence probe: a second width change lands mid-flight (throttled; the
-/// one-in-flight rule detaches nothing), the job completes at the first width,
-/// and the settled wrap width of the deep history is measured: 1 = stale, 0 =
-/// converged at the final width. A metric, not an assert.
+/// Measure whether a mid-flight width change settles to the final width (0) or stays stale (1).
 fn converge_probe() -> (u64, usize) {
     let mut term = deep_unlimited_term(&fill_corpus(60_000));
 
     let mut job = term
         .resize_offloading_scrollback(ROWS, COLS_B)
         .expect("deep tiered history detaches");
-    // Reach guard (two-sided): the race must really race; the mid-flight
-    // width change is throttled to a plain bounded resize.
     assert!(
         term.resize_offloading_scrollback(ROWS, 72).is_none(),
         "mid-flight width change must detach nothing while a job is in flight"
@@ -184,9 +128,6 @@ fn converge_probe() -> (u64, usize) {
             ReflowStep::Done(done) => break done,
         }
     };
-    // Drive every returned follow-up job (same pump loop) before measuring.
-    // The loop also guards the protocol: convergence must settle, not
-    // oscillate.
     let mut follow_up = term.finish_resize_offload(reflowed);
     let mut passes = 0usize;
     while let Some(mut job) = follow_up.take() {
@@ -207,8 +148,6 @@ fn converge_probe() -> (u64, usize) {
         depth > 40_000,
         "reach: deep history survived ({depth} lines)"
     );
-    // Sample the oldest region, the tiered store the job rewrapped; the ring
-    // was rewrapped synchronously at 72 and would mask staleness.
     let mut max_width = 0usize;
     for i in 0..depth.min(20_000) {
         if let Some(line) = grid.get_history_line(i)
@@ -231,8 +170,7 @@ fn median(samples: &[f64]) -> f64 {
     }
 }
 
-/// Ring-only pass: RESIZES_PER_PASS synchronous full-ring rewraps.
-/// Returns (rate: resizes/s, worst single resize seconds).
+/// Ring-only pass returning `(resizes/s, worst_single_resize_secs)`.
 fn ring_pass(term: &mut Terminal) -> (f64, f64) {
     let mut worst = 0.0f64;
     let t0 = Instant::now();
@@ -252,8 +190,7 @@ fn ring_pass(term: &mut Terminal) -> (f64, f64) {
     (rate, worst)
 }
 
-/// Tiered pass: offloading resize + budget-stepped rewrap + reattach, the
-/// production pump schedule. Returns (full-cycle rate, worst sync-phase secs).
+/// Tiered pass returning `(full_cycle_rate, worst_sync_phase_secs)`.
 fn tiered_pass(term: &mut Terminal) -> (f64, f64) {
     let mut worst_sync = 0.0f64;
     let t0 = Instant::now();
@@ -261,13 +198,7 @@ fn tiered_pass(term: &mut Terminal) -> (f64, f64) {
         let cols = if i % 2 == 0 { COLS_B } else { COLS_A };
         let s0 = Instant::now();
         let pending = term.resize_offloading_scrollback(ROWS, cols);
-        // The sync phase (everything a caller's thread cannot avoid) ends
-        // here; this is the value the fence caps.
         worst_sync = worst_sync.max(s0.elapsed().as_secs_f64());
-        // A width change over a deep tiered history must hand the rewrap back
-        // as a pending job (stepped by the pump), never complete it
-        // synchronously; otherwise the measured sync phase would include the
-        // whole history rewrap and the fence would cap the wrong thing.
         let mut job = pending.expect(
             "resize_offloading_scrollback returned no pending job over a deep tiered \
              history — the offload/async contract is broken",
@@ -276,8 +207,6 @@ fn tiered_pass(term: &mut Terminal) -> (f64, f64) {
             match job.reflow_step(PUMP_BUDGET_LINES) {
                 ReflowStep::InProgress(next) => job = next,
                 ReflowStep::Done(reflowed) => {
-                    // Widths are settled before each pump completes, so the
-                    // convergence pass must not trigger here.
                     assert!(
                         term.finish_resize_offload(reflowed).is_none(),
                         "no convergence pass expected in the settled-width pump"
@@ -298,7 +227,6 @@ fn tiered_pass(term: &mut Terminal) -> (f64, f64) {
 }
 
 fn main() {
-    // -- ring-only terminal at the 50k cap --
     let ring_corpus = fill_corpus(RING_LINES);
     let mut ring_term = TerminalBuilder::new()
         .size(ROWS, COLS_A)
@@ -306,7 +234,6 @@ fn main() {
         .build();
     ring_term.process(black_box(&ring_corpus));
 
-    // -- tiered terminal overflowing into warm/cold --
     let tiered_corpus = fill_corpus(TIERED_FILL_LINES);
     let mut tiered_term =
         Terminal::with_scrollback(ROWS, COLS_A, TIERED_RING, Scrollback::with_defaults());
@@ -333,7 +260,6 @@ fn main() {
     let ring_med = median(&ring_rates);
     let tiered_med = median(&tiered_rates);
 
-    // -- deep unlimited-history passes: mixed (realistic) + all-wrapping --
     let deep_mixed_corpus = fill_mixed_corpus(DEEP_FILL_LINES);
     let mut deep_mixed_term = deep_unlimited_term(&deep_mixed_corpus);
     let deep_mixed_depth = deep_mixed_term.grid().scrollback_lines();
@@ -374,9 +300,6 @@ fn main() {
         wrapall.step_worst = wrapall.step_worst.max(s.step_worst);
         wrapall.steps = s.steps;
     }
-    // Reach: the deep pump is genuinely chunked (a one-step completion would
-    // mean the budget contract silently broke and the step metrics price
-    // nothing).
     assert!(
         mixed.steps > 50 && wrapall.steps > 50,
         "reach: deep pumps must take many steps (mixed {}, wrapall {})",

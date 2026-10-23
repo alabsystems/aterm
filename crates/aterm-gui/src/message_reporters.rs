@@ -50,6 +50,7 @@ pub(crate) fn attention(msg: &Message) -> Result<Attention, &'static str> {
         .is_some_and(|m| m.fill_permille.is_some() || m.busy);
     let class = if matches!(msg.hold, Hold::Live { .. }) {
         if indicator {
+            // Work in flight is no decision, except a capsule that stops the
             // row's own work (`Stop paste`).
             if msg
                 .actions
@@ -60,6 +61,8 @@ pub(crate) fn attention(msg: &Message) -> Result<Attention, &'static str> {
             }
             Attention::Progress
         } else if msg.severity >= Severity::Warn {
+            // A live row blocked on the person persists without saying why:
+            // the door records it (`Message::admit`), so it is not a shape a
             // reporter may build. What it asked is `.now(Ask)`.
             return Err("a blocked live row that names no ask");
         } else {
@@ -1200,7 +1203,7 @@ fn typed_relaunch_why(agent: aterm_agent::harness::upgrade::Agent) -> String {
     }
 }
 
-fn resume_words(agent: aterm_agent::harness::upgrade::Agent) -> (&'static str, &'static str) {
+const fn resume_words(agent: aterm_agent::harness::upgrade::Agent) -> (&'static str, &'static str) {
     match agent {
         aterm_agent::harness::upgrade::Agent::Claude => ("claude --resume", "conversation"),
         aterm_agent::harness::upgrade::Agent::Codex => ("codex resume", "thread"),
@@ -3413,6 +3416,83 @@ pub(crate) fn supervisor_failing_key(sid: &str) -> String {
     digest_key(Family::Supervisor, sid, "failing")
 }
 
+/// Digest key for [`occupancy_prompt_entry`]: `harness.occupancy.aterm-toml.prompt`.
+pub(crate) fn occupancy_prompt_key() -> String {
+    digest_key(Family::Occupancy, "aterm-toml", "prompt")
+}
+
+/// THE OWNER'S `occupancy = "prompt"` IN FORCE (docs/DESIGN-harness-occupancy-2026-10-20.md
+/// §1.1; the red-team's F14, R9): aterm.toml's root `[harness]` table now has the harness type
+/// occupancy lines into the agents' sessions. A fact for later, the owner's own choice: raised
+/// by the policy in force that says it, cleared by one that does not
+/// (`App::note_occupancy_mode`). The policy carries no line of the file, and the editor opens
+/// at its top whatever line an intent names.
+pub(crate) fn occupancy_prompt_entry() -> Entry {
+    Entry::new(
+        Family::Occupancy,
+        "aterm-toml",
+        "prompt",
+        "Harness types occupancy lines",
+        Why::Configured {
+            key: Reason::new("[harness] occupancy = \"prompt\""),
+            reason: Reason::new("the harness types occupancy lines into the agents' sessions"),
+        },
+        Then::step("Set occupancy to observe in aterm.toml to stop them"),
+    )
+    .resurface(Resurface::CHOICE)
+    .show(Intent::OpenConfigEditor { line: None })
+    .more(
+        "aterm.toml's root [harness] table says occupancy = \"prompt\": at a drawn break, with \
+         every guard clear and paced, the harness types wait-nudge@v1 and hold-room@v1 lines \
+         into a waiting agent's session. aterm ctl @<sid> occupancy why says what it judged.",
+    )
+    .log_line("occupancy mode=prompt")
+}
+
+/// Digest key for [`occupancy_hold_entry`]: `harness.occupancy.<sid>.hold`.
+pub(crate) fn occupancy_hold_key(sid: &str) -> String {
+    digest_key(Family::Occupancy, sid, "hold")
+}
+
+/// A TAB'S OCCUPANCY LINES SPENT FOR ITS HOLD, under `prompt` (design §6, `occupancy.hold`):
+/// `spent` names each rule whose cap is spent — 3 nudges today, 4 hold-room asks this hold —
+/// while the tab still waits. Raised and cleared from what its loop tells.
+pub(crate) fn occupancy_hold_entry(
+    sid: &str,
+    spent: &[aterm_agent::supervise::occupancy::RuleId],
+) -> Entry {
+    use aterm_agent::supervise::occupancy::said::cap_words;
+    let caps: Vec<String> = spent.iter().map(|rule| cap_words(*rule)).collect();
+    let entry = Entry::new(
+        Family::Occupancy,
+        sid,
+        "hold",
+        "A tab's occupancy lines are spent",
+        Why::Spent {
+            tried: Reason::new("typed its occupancy lines"),
+            reason: Reason::new(format!(
+                "{} spent, and the tab still holds",
+                caps.join(" and ")
+            )),
+        },
+        Then::step(format!(
+            "Look at the tab's wait with aterm ctl @{sid} occupancy why"
+        )),
+    )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .log_line(format!(
+        "occupancy hold sid={sid} spent={}",
+        spent
+            .iter()
+            .map(|rule| rule.name())
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+    caps.iter()
+        .fold(entry, |entry, cap| entry.more(format!("{cap} spent")))
+}
+
 /// Retired `aterm.toml` feature table and its replacement guidance.
 pub(crate) struct RemovedFeature {
     pub(crate) table: &'static str,
@@ -3582,7 +3662,7 @@ pub(crate) fn removed_setting_entry(
     left.iter().fold(entry, |entry, line| entry.more(line))
 }
 
-fn survey_cause(kind: aterm_agent::supervise::StuckSurvey) -> &'static str {
+const fn survey_cause(kind: aterm_agent::supervise::StuckSurvey) -> &'static str {
     match kind {
         aterm_agent::supervise::StuckSurvey::Withheld => "survey-card",
         aterm_agent::supervise::StuckSurvey::Unclosed => "survey-open",
@@ -4525,7 +4605,9 @@ pub(crate) fn render_unrepaired_entry(
     entry
 }
 
-fn render_unrepaired_reason(why: aterm_core::terminal::repaint_nudge::GiveUp) -> &'static str {
+const fn render_unrepaired_reason(
+    why: aterm_core::terminal::repaint_nudge::GiveUp,
+) -> &'static str {
     use aterm_core::terminal::repaint_nudge::{Gate, GiveUp};
     match why {
         GiveUp::NoAnswer => "the program in the tab did not redraw when aterm asked",
@@ -4889,7 +4971,7 @@ fn resume_tab_entry(
     entry
 }
 
-fn resume_agent_word(agent: aterm_phase::Program) -> &'static str {
+const fn resume_agent_word(agent: aterm_phase::Program) -> &'static str {
     match agent {
         aterm_phase::Program::Claude => "Claude",
         aterm_phase::Program::Generic => "The agent",
@@ -5307,7 +5389,7 @@ pub(crate) enum StallEnd {
     Left,
 }
 
-fn agent_word(agent: aterm_agent::harness::upgrade::Agent) -> &'static str {
+const fn agent_word(agent: aterm_agent::harness::upgrade::Agent) -> &'static str {
     match agent {
         aterm_agent::harness::upgrade::Agent::Claude => "Claude",
         aterm_agent::harness::upgrade::Agent::Codex => "Codex",

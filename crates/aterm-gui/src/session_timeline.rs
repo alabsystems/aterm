@@ -69,7 +69,7 @@ pub(crate) fn normalize_autopilot_value(value: &str) -> Option<&'static str> {
 }
 
 /// True for characters that must never reach chrome from user metadata.
-pub(crate) fn is_forbidden_metadata_char(ch: char) -> bool {
+pub(crate) const fn is_forbidden_metadata_char(ch: char) -> bool {
     aterm_messages::text::is_hidden_char(ch)
 }
 
@@ -184,7 +184,7 @@ impl Eq for SessionMeta {}
 impl SessionMeta {
     /// Whether any field is set.
     #[must_use]
-    pub(crate) fn any_set(&self) -> bool {
+    pub(crate) const fn any_set(&self) -> bool {
         self.user_title.is_some()
             || self.description.is_some()
             || self.icon.is_some()
@@ -380,7 +380,8 @@ impl SessionMeta {
         self.supervisor.as_ref().and_then(|claim| claim.expires_us)
     }
 
-    /// The claim a seamless update carries at `now_us`, as `` for the handoff record.
+    /// The claim a seamless update carries at `now_us`, as `(row, claim_known)` for the
+    /// handoff record.
     #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn handoff_supervisor(
@@ -450,10 +451,13 @@ impl SessionMeta {
     /// Set (or with `None`, unset) a named field.
     pub(crate) fn set(&mut self, field: &str, value: Option<String>) -> Option<bool> {
         if field == "attention" {
+            // The bare field is the bare owner: existing callers (the wire's bare
+            // form, a restore seed) keep their meaning, and keyed entries are
             // untouched.
             return Some(self.set_bare_attention(value).effective);
         }
         if field == "autopilot" {
+            // The word alone is a hand write of it: its timer goes with it
             // (§9.3.6, item 1).
             return Some(self.set_autopilot(value, None));
         }
@@ -486,7 +490,7 @@ impl SessionMeta {
     }
 
     /// Store `set_by` as the Autopilot pair's setter ([`Self::autopilot_set_by`]) and step [`Self::autopilot_revision`].
-    pub(crate) fn note_autopilot_set_by(&mut self, set_by: AutopilotSetBy) {
+    pub(crate) const fn note_autopilot_set_by(&mut self, set_by: AutopilotSetBy) {
         self.autopilot_set_by = Some(set_by);
         self.autopilot_revision = self.autopilot_revision.wrapping_add(1);
     }
@@ -529,13 +533,13 @@ pub(crate) struct AttentionOwners {
 impl AttentionOwners {
     /// Whether no owner holds an entry.
     #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// How many owners hold an entry.
     #[must_use]
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.entries.len()
     }
 
@@ -653,6 +657,7 @@ impl AttentionOwners {
                 Ok(kind_moved || text_moved)
             }
             (None, Some(text)) => {
+                // The bare owner always has its slot: it is the field every
                 // pre-keyed caller writes, and refusing it would break them.
                 if owner != BARE_ATTENTION_OWNER
                     && self
@@ -1611,7 +1616,7 @@ pub(crate) struct MetaChange<'a> {
 
 impl<'a> MetaChange<'a> {
     /// `field` now storing `value`, written by `by`.
-    pub(crate) fn written_by(
+    pub(crate) const fn written_by(
         field: &'static str,
         value: Option<&'a str>,
         by: aterm_slog::Actor,
@@ -1625,7 +1630,7 @@ impl<'a> MetaChange<'a> {
     }
 
     /// This change with the Autopilot pair's timer, as its row says it.
-    pub(crate) fn with_land_at(self, land_at: Option<i64>) -> Self {
+    pub(crate) const fn with_land_at(self, land_at: Option<i64>) -> Self {
         MetaChange { land_at, ..self }
     }
 }
@@ -2094,7 +2099,7 @@ impl SessionTimeline {
     }
 
     /// The list this timeline rings.
-    pub(crate) fn watchers(&self) -> &Arc<crate::session_watch::Watchers> {
+    pub(crate) const fn watchers(&self) -> &Arc<crate::session_watch::Watchers> {
         &self.watchers
     }
 
@@ -2130,22 +2135,22 @@ impl SessionTimeline {
     }
 
     /// A proven self-claim's holder recorded its landing over `mark`, replacing any mark before it.
-    pub(crate) fn mark_landing(&mut self, mark: LandingMark) {
+    pub(crate) const fn mark_landing(&mut self, mark: LandingMark) {
         self.landing_mark = Some(mark);
     }
 
     /// The latest landing's mark ([`Self::mark_landing`]), `None` before one.
-    pub(crate) fn landing_mark(&self) -> Option<LandingMark> {
+    pub(crate) const fn landing_mark(&self) -> Option<LandingMark> {
         self.landing_mark
     }
 
     /// Record a turn-starting act typed by a proven self-claim holder.
-    pub(crate) fn note_typed_act(&mut self, at_rest_turns: Option<u64>) {
+    pub(crate) const fn note_typed_act(&mut self, at_rest_turns: Option<u64>) {
         self.typed_turn = at_rest_turns;
     }
 
     /// The count [`Self::note_typed_act`] kept, taken by the landing or the point left to a person that follows it.
-    pub(crate) fn take_typed_turn(&mut self) -> Option<u64> {
+    pub(crate) const fn take_typed_turn(&mut self) -> Option<u64> {
         self.typed_turn.take()
     }
 
@@ -2355,7 +2360,7 @@ impl SessionTimeline {
     }
 
     /// The resize ledger, for its readers (`resizes`, the `events` digest).
-    pub(crate) fn resizes(&self) -> &crate::resize_ledger::ResizeLedger {
+    pub(crate) const fn resizes(&self) -> &crate::resize_ledger::ResizeLedger {
         &self.resizes
     }
 
@@ -2540,7 +2545,7 @@ impl SessionTimeline {
     }
 
     /// The session log ([`crate::session_log`]).
-    pub(crate) fn slog(&self) -> &crate::session_log::SessionLog {
+    pub(crate) const fn slog(&self) -> &crate::session_log::SessionLog {
         &self.slog
     }
 
@@ -2554,7 +2559,7 @@ impl SessionTimeline {
     }
 
     /// The session log, to write.
-    pub(crate) fn slog_mut(&mut self) -> &mut crate::session_log::SessionLog {
+    pub(crate) const fn slog_mut(&mut self) -> &mut crate::session_log::SessionLog {
         &mut self.slog
     }
 
@@ -2604,7 +2609,7 @@ impl SessionTimeline {
     }
 
     /// The server's published program and agent verdict for this session.
-    pub(crate) fn agent(&self) -> &AgentPublication {
+    pub(crate) const fn agent(&self) -> &AgentPublication {
         &self.agent
     }
 
@@ -2621,7 +2626,7 @@ impl SessionTimeline {
         })
     }
 
-    fn advance_foreground_generation(&mut self) {
+    const fn advance_foreground_generation(&mut self) {
         // Exhaustion disables new stamps instead of aliasing an older one.
         self.foreground_generation = self.foreground_generation.saturating_add(1);
     }
@@ -2635,7 +2640,7 @@ impl SessionTimeline {
     }
 
     /// The session's task record, `None` for a session with no task.
-    pub(crate) fn task(&self) -> Option<&crate::task_record::TaskRecord> {
+    pub(crate) const fn task(&self) -> Option<&crate::task_record::TaskRecord> {
         self.task.as_ref()
     }
 
@@ -2645,7 +2650,7 @@ impl SessionTimeline {
     }
 
     /// What the worker's launcher did with its line, and when.
-    pub(crate) fn worker_launch(&self) -> Option<&(std::time::Instant, String)> {
+    pub(crate) const fn worker_launch(&self) -> Option<&(std::time::Instant, String)> {
         self.worker_launch.as_ref()
     }
 
@@ -2660,7 +2665,7 @@ impl SessionTimeline {
     }
 
     /// The published need verdict ([`crate::needs`]).
-    pub(crate) fn need(&self) -> &crate::needs::Verdict {
+    pub(crate) const fn need(&self) -> &crate::needs::Verdict {
         &self.need
     }
 
@@ -2879,6 +2884,7 @@ impl SessionTimeline {
         self.leader_no_harness = None;
         self.leader_no_harness_applied = None;
         if self.agent.program.take().is_some() || had_reader {
+            // A runtime identified by its screen can have no named program;
             // its worker must still see the foreground group leave.
             crate::harness_host::ring();
         }
@@ -2899,7 +2905,7 @@ impl SessionTimeline {
     }
 
     /// [`Self::witness_cwd_report`]'s record.
-    pub(crate) fn cwd_witness(&self) -> Option<(u64, i32)> {
+    pub(crate) const fn cwd_witness(&self) -> Option<(u64, i32)> {
         self.cwd_witness
     }
 
@@ -2983,7 +2989,9 @@ impl SessionTimeline {
     }
 
     /// The holder image last published ([`Self::offer_holder_image`]).
-    pub(crate) fn holder_image(&self) -> Option<&std::sync::Arc<crate::holder_image::HolderImage>> {
+    pub(crate) const fn holder_image(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::holder_image::HolderImage>> {
         self.holder_image.as_ref()
     }
 
@@ -3359,12 +3367,12 @@ impl SessionTimeline {
     }
 
     /// A known switch or carried glass cannot attribute an anonymous Muse card to the current login.
-    pub(crate) fn muse_cards_need_account(&self) -> bool {
+    pub(crate) const fn muse_cards_need_account(&self) -> bool {
         self.muse_cards_need_account
     }
 
     /// An adopted terminal may still show another account's cards, and its predecessor need not have carried an account observation.
-    pub(crate) fn note_carried_glass(&mut self) {
+    pub(crate) const fn note_carried_glass(&mut self) {
         self.muse_cards_need_account = true;
     }
 
@@ -3380,7 +3388,7 @@ impl SessionTimeline {
     }
 
     /// The footer resolver read `pgid`'s facts at `at`, kept only while that group is in front.
-    pub(crate) fn note_claude_footer_read(&mut self, pgid: i32, at: std::time::Instant) {
+    pub(crate) const fn note_claude_footer_read(&mut self, pgid: i32, at: std::time::Instant) {
         if self.agent.program_pgid == pgid {
             self.claude_footer_read = Some((pgid, at));
         }
@@ -3434,7 +3442,7 @@ impl SessionTimeline {
     }
 
     /// The status sweep's latest [`AgentGauges`] for the agent in front.
-    pub(crate) fn set_gauges(&mut self, gauges: AgentGauges) {
+    pub(crate) const fn set_gauges(&mut self, gauges: AgentGauges) {
         self.gauges = gauges;
     }
 
@@ -3534,7 +3542,7 @@ impl SessionTimeline {
         true
     }
 
-    /// `` of the last PATH measurement, or `None`.
+    /// `(path word, age in ms, settled)` of the last PATH measurement, or `None`.
     pub(crate) fn path_reading(&self) -> Option<(&'static str, u64, bool)> {
         self.path.map(|p| {
             (
@@ -3584,7 +3592,7 @@ impl SessionTimeline {
     }
 
     /// This tab's live-upgrade row, or `None`.
-    pub(crate) fn upgrade(&self) -> Option<&aterm_agent::harness::upgrade_drive::Row> {
+    pub(crate) const fn upgrade(&self) -> Option<&aterm_agent::harness::upgrade_drive::Row> {
         self.upgrade.as_ref()
     }
 
@@ -3601,7 +3609,7 @@ impl SessionTimeline {
     }
 
     /// The live upgrade's note for the person here, while the move waits only on them, or `None`.
-    pub(crate) fn upgrade_note(&self) -> Option<&aterm_agent::harness::footer::UpgradeNote> {
+    pub(crate) const fn upgrade_note(&self) -> Option<&aterm_agent::harness::footer::UpgradeNote> {
         self.upgrade_note.as_ref()
     }
 
@@ -3626,12 +3634,12 @@ impl SessionTimeline {
     }
 
     /// The task's face as this window's host last heard it, and the wall time (unix ms) it moved there.
-    pub(crate) fn task_face(&self) -> Option<(aterm_agent::harness::acts::TaskFace, i64)> {
+    pub(crate) const fn task_face(&self) -> Option<(aterm_agent::harness::acts::TaskFace, i64)> {
         self.task_face
     }
 
     /// A SEAMLESS UPDATE'S CARRIED END.
-    pub(crate) fn seed_task_face_held(
+    pub(crate) const fn seed_task_face_held(
         &mut self,
         face: aterm_agent::harness::acts::TaskFace,
         at_ms: i64,
@@ -3657,7 +3665,7 @@ impl SessionTimeline {
     }
 
     /// The loop's pause after short turns as this window's host last heard it.
-    pub(crate) fn pause(&self) -> Option<crate::PausePlan> {
+    pub(crate) const fn pause(&self) -> Option<crate::PausePlan> {
         self.pause
     }
 
@@ -3684,7 +3692,7 @@ impl SessionTimeline {
     }
 
     /// Land's hold as the session's loop last told this window's host (§12.3.3 item 3).
-    pub(crate) fn land_held(&self) -> Option<aterm_agent::harness::acts::LandHeld> {
+    pub(crate) const fn land_held(&self) -> Option<aterm_agent::harness::acts::LandHeld> {
         self.land_held
     }
 

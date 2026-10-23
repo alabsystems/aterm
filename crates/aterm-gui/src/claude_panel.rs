@@ -302,7 +302,7 @@ impl PanelEntry {
     /// Whether this panel on show may want a frame with nothing new on the
     /// screen — known without a clock: its bar crests, a stuck dot
     /// breathes, or a dot's next turn is due some time.
-    fn live(&self) -> bool {
+    const fn live(&self) -> bool {
         self.shown && (self.crest || self.breathing || self.due.is_some())
     }
 
@@ -398,7 +398,7 @@ impl PanelGrid {
     /// `t` (ms on the window's clock) on the ripple's: in phase with the
     /// card's (`crest` is periodic in `GLINT_PERIOD_MS`), a period ahead so
     /// it never underflows.
-    fn ripple(self, t: u64) -> u64 {
+    const fn ripple(self, t: u64) -> u64 {
         t + GLINT_PERIOD_MS - self.phase
     }
 
@@ -414,7 +414,7 @@ impl PanelGrid {
 
     /// When (ms on the window's clock) step `step`'s frame is asked: its
     /// start, and the slack.
-    fn wake(self, step: u64) -> u64 {
+    const fn wake(self, step: u64) -> u64 {
         (step * FLOW_STEP_MS + self.phase + self.slack).saturating_sub(GLINT_PERIOD_MS)
     }
 
@@ -514,7 +514,7 @@ fn stuck_rows(panel: &AgentsPanel, dots: &[aterm_agent::harness::agents::Dot]) -
 }
 
 /// What the fold says of a dot, as its look takes it.
-fn mood_of(state: DotState) -> DotMood {
+const fn mood_of(state: DotState) -> DotMood {
     match state {
         DotState::Running => DotMood::Running,
         DotState::Quiet => DotMood::Quiet,
@@ -533,7 +533,7 @@ fn pack(rgb: [u8; 3]) -> u32 {
     (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2])
 }
 
-fn unpack(rgb: u32) -> [u8; 3] {
+const fn unpack(rgb: u32) -> [u8; 3] {
     [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]
 }
 
@@ -542,7 +542,7 @@ fn u16_of(v: usize) -> u16 {
 }
 
 /// SplitMix64's finalizer: a key term from plain integers.
-fn mix(mut x: u64) -> u64 {
+const fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);

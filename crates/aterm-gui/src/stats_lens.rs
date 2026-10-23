@@ -601,7 +601,7 @@ impl<'a> Pen<'a> {
     }
 
     /// The machine's ink, `machine_ic` under Increase Contrast.
-    fn machine(&self) -> Rgb {
+    const fn machine(&self) -> Rgb {
         if self.ic {
             self.inks.machine_ic
         } else {
@@ -3123,7 +3123,7 @@ enum Seg {
 }
 
 /// The key hint's forms for a lens opened `how`, longest first (§11.3).
-fn hints(how: Opened) -> &'static [&'static [Seg]] {
+const fn hints(how: Opened) -> &'static [&'static [Seg]] {
     use Seg::{Across, T, UpDown};
     match how {
         Opened::Pinned => &[
@@ -3860,6 +3860,7 @@ impl crate::App {
 
     /// The `StatsLens` deadline's work, judged every wake.
     pub(crate) fn service_stats_lens(&mut self, now: Instant) {
+        // Nothing armed or nothing due (the steady case): no work, and no
         // allocation on a wake that is not this deadline's.
         if self.stats_lens_deadline().is_none_or(|due| due > now) {
             return;

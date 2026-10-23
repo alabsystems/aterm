@@ -80,6 +80,7 @@ impl<'a> Subtable<'a> {
             PlatformId::Windows if self.encoding_id == WINDOWS_UNICODE_BMP_ENCODING_ID => true,
             PlatformId::Windows => {
                 // "Note: Subtable format 13 has the same structure as format 12; it differs only
+                // in the interpretation of the startGlyphID/glyphID fields".
                 let is_format_12_compatible = matches!(
                     self.format,
                     Format::SegmentedCoverage(..) | Format::ManyToOneRangeMappings(..)

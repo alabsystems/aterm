@@ -753,6 +753,9 @@ fn decide_box(
     ctx: &ApprovalCtx,
     trace: &mut dyn Trace,
 ) -> Decision {
+    // A program the supervisor does not host
+    // (`aterm_phase::Program::supervisable`: the generic reader's, and
+    // Codex's, whose screen aterm reads no more) is read, never answered: every box of its is a person's,
     // whatever its reader names in it.
     if !reading.program.supervisable() {
         return decided_at(
@@ -1422,6 +1425,7 @@ fn command_readings(prompt: &PromptV2, rows: &[String], rm_breaker: bool) -> (Ve
 }
 
 fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
+    // Every header form aterm-phase reads: an origin, `(unsandboxed)`,
     // `(runs on <m>)`. An unreadable suffix is no Bash header.
     if prompt.base_title().as_deref() != Some(anchor("box.bash")) {
         return Decision::escalate(format!(
@@ -1449,6 +1453,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     let (readings, subject) = command_readings(prompt, rows, rm_breaker);
     let guard = row_guard(&rows[first_row]);
     if rm_breaker {
+        // The scratch-root proof is this machine's, so an rm running on another
         // machine is not proven by it.
         if let Some(machine) = prompt.runs_on() {
             return Decision::escalate(format!(
@@ -2418,6 +2423,9 @@ fn resolve_abs(path: &str, home: Option<&Path>) -> Result<Vec<String>, String> {
 }
 
 fn read_path_lexical(path: &str, ctx: &ApprovalCtx) -> Result<Vec<String>, String> {
+    // The components below drop an empty one (`a//b`, `a/./b`, a trailing `/`),
+    // so the path judged would not be the one drawn. Claude Code collapses those
+    // in a real path, so one on the box means the screen drew a name as nothing
     // (zero-width characters only): a person reads it.
     if path.contains("//") || path.contains("/./") || path.ends_with('/') {
         return Err(format!(

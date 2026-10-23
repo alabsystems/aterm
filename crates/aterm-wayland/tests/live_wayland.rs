@@ -220,11 +220,6 @@ fn every_output_reports_a_current_mode() {
     assert_eq!(unsafe { display.display() }.error(), None);
 }
 
-/// A toplevel on `display`: the shell, its first configure acked and a
-/// buffer of that size committed. With `second_role`, the surface is given a
-/// second xdg_surface first (`xdg_wm_base.role`: the negative control, which
-/// every compositor enforces; Mutter 46 lets an unknown serial or a buffer
-/// before the first ack pass).
 fn map_toplevel(
     display: &OwnedDisplay,
     second_role: bool,
@@ -347,10 +342,6 @@ fn decorations_are_negotiated_or_the_client_draws() {
     assert_eq!(unsafe { display.display() }.error(), None);
 }
 
-/// The read a poll loop makes (the winit fork's): a read announced on a queue with nothing
-/// queued, the socket polled readable, read, then the queue's events dispatched; and the
-/// negative control: with an event already queued the announcement is refused, so a loop
-/// dispatches before it waits instead of sleeping on events it holds.
 #[test]
 fn a_poll_loop_reads_the_socket_and_dispatches_and_a_full_queue_refuses_the_read() {
     use aterm_wayland::protocols::wayland::{wl_callback, wl_display};

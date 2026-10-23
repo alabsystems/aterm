@@ -382,7 +382,7 @@ enum AppAim {
 }
 
 impl AppAim {
-    fn session(&self) -> Option<u64> {
+    const fn session(&self) -> Option<u64> {
         match self {
             AppAim::Front => None,
             AppAim::Aimed((_, _, session, _)) => Some(*session),
@@ -431,7 +431,7 @@ pub(crate) enum Scope {
 
 impl Scope {
     /// Owner-class.
-    pub(crate) fn is_owner_class(self) -> bool {
+    pub(crate) const fn is_owner_class(self) -> bool {
         match self {
             Scope::Owner => true,
             #[cfg(any(unix, test))]
@@ -451,7 +451,7 @@ impl Scope {
     }
 
     /// Whether this is the inherited bridge connection.
-    pub(crate) fn is_bridge(self) -> bool {
+    pub(crate) const fn is_bridge(self) -> bool {
         #[cfg(any(unix, test))]
         {
             matches!(self, Scope::Bridge)
@@ -471,7 +471,7 @@ pub(crate) enum Principal {
     Harness,
 }
 
-fn op_of(class: aterm_types::control_verbs::OpClass) -> Option<Op> {
+const fn op_of(class: aterm_types::control_verbs::OpClass) -> Option<Op> {
     use aterm_types::control_verbs::OpClass;
     match class {
         OpClass::Read => Some(Op::ReadScreen),
@@ -537,6 +537,7 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
                     | aterm_types::app_inspection::OpenAppRequest::SystemState)
             ) =>
         {
+            // The native setup/config apps are the same capability as `open prefs`;
             // classify it here, before the main-thread hop.
             Some(Need::Op(Op::ConfigWrite))
         }
@@ -942,6 +943,8 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let st = match rest.trim() {
         "" | "status" => aterm_update::status(build),
         "check" => {
+            // The check reads live settings on the main thread; under a dialog or
+            // stall that hop is refused, which would otherwise surface as an
             // empty `OK` status hiding a stage on disk. Refuse typed, up front.
             if let Some(refusal) = crate::control::control_media::main_thread_refusal() {
                 return update_check_refused(&refusal);
@@ -1661,7 +1664,7 @@ impl ReplyRetention {
         result
     }
 
-    fn classified(&mut self) {
+    const fn classified(&mut self) {
         #[cfg(any(test, debug_assertions))]
         {
             self.phase = ReplyRetentionPhase::Classified;
@@ -1821,7 +1824,7 @@ pub(crate) struct Retained<T> {
 }
 
 impl<T> Retained<T> {
-    pub(crate) fn plain(value: T) -> Self {
+    pub(crate) const fn plain(value: T) -> Self {
         Self {
             value,
             retention: None,
@@ -1843,7 +1846,7 @@ impl<T> Retained<T> {
         }
     }
 
-    pub(crate) fn write_retained(value: T, retention: WriteOnlyRetention) -> Self {
+    pub(crate) const fn write_retained(value: T, retention: WriteOnlyRetention) -> Self {
         Self {
             value,
             retention: Some(ReplyHandoff::WriteOnly(retention)),
@@ -2019,7 +2022,7 @@ impl ControlReply {
         }
     }
 
-    pub(crate) fn with_handoff(body: String, retention: Option<ReplyHandoff>) -> Self {
+    pub(crate) const fn with_handoff(body: String, retention: Option<ReplyHandoff>) -> Self {
         Self {
             body,
             retention,
@@ -2320,7 +2323,7 @@ impl<T> BoundedDispatch<T> {
         self.inbox.pop()
     }
 
-    fn completion_guard(&self) -> DispatchCompletion<'_, T> {
+    const fn completion_guard(&self) -> DispatchCompletion<'_, T> {
         DispatchCompletion { dispatch: self }
     }
 
@@ -2489,7 +2492,7 @@ impl ControlPreparation {
     }
 }
 
-fn control_lanes_prepared(rpc: usize, subscriptions: usize) -> bool {
+const fn control_lanes_prepared(rpc: usize, subscriptions: usize) -> bool {
     rpc > 0 && subscriptions > 0
 }
 
@@ -2695,6 +2698,7 @@ pub(crate) fn attach_fabric_bridge(
         "aterm-fabric-bridge".to_string(),
         crate::qos::Role::Responsive,
         move || {
+            // Same QoS floor as the pooled lanes: this thread serves the same verbs
             // and then stays for the push loop, holding the terminal mutex.
             context.serve_bridge(stream, generation);
         },
@@ -2784,7 +2788,11 @@ mod bound_control {
 
     impl BoundControl {
         /// `listener` must be the socket just bound at `sock_path`.
-        pub(super) fn bound(listener: CtlListener, token: Arc<String>, sock_path: String) -> Self {
+        pub(super) const fn bound(
+            listener: CtlListener,
+            token: Arc<String>,
+            sock_path: String,
+        ) -> Self {
             Self {
                 listener,
                 token,
@@ -2792,11 +2800,11 @@ mod bound_control {
             }
         }
 
-        pub(super) fn listener(&self) -> &CtlListener {
+        pub(super) const fn listener(&self) -> &CtlListener {
             &self.listener
         }
 
-        pub(super) fn token(&self) -> &Arc<String> {
+        pub(super) const fn token(&self) -> &Arc<String> {
             &self.token
         }
 
@@ -2903,6 +2911,7 @@ fn bind_control_listener_within(
             return None;
         }
         loop {
+            // ECONNREFUSED is not ownership evidence; revalidate the parent's
             // socket inode and token digest before every probe.
             if !identity.matches_current(plan) {
                 aterm_log::warn!(
@@ -3052,7 +3061,7 @@ impl BindRetry {
         unlink: UnlinkRule::Never,
     };
 
-    fn retry_allowed(self, failed_attempt: u32, path_missing: bool) -> bool {
+    const fn retry_allowed(self, failed_attempt: u32, path_missing: bool) -> bool {
         failed_attempt < self.attempts
             && match self.unlink {
                 UnlinkRule::Never => path_missing,
@@ -3262,6 +3271,8 @@ pub(crate) fn spawn(
             crate::fabric_launch::spawn_supervisor(&startup_config);
             crate::fleet_listen::start_fleet_listener(startup_config.fleet.as_ref());
             let admit = move |stream: CtlStream| {
+                // Peer credential gate: refuse other uids before spending a lane (Unix:
+                // unverifiable also refuses; Windows: the peer pid's token user where
                 // readable, the token remaining the mandatory gate).
                 if let Err(why) = control_auth::peer_check(&stream) {
                     log_denial(
@@ -3315,6 +3326,7 @@ pub(crate) fn spawn(
                             s
                         }
                         Err(e) => {
+                            // Descriptor/buffer exhaustion recurs immediately; back off
                             // rather than spin (logged once per streak).
                             if let Some(wait) = accept_error_backoff(&e, accept_backoff) {
                                 if accept_backoff.is_none() {
@@ -3473,11 +3485,11 @@ impl Request {
         self.spans.head(&self.line)
     }
 
-    fn form(&self) -> Option<Resolved> {
+    const fn form(&self) -> Option<Resolved> {
         self.form
     }
 
-    fn body_len(&self) -> usize {
+    const fn body_len(&self) -> usize {
         self.body
     }
 
@@ -4379,6 +4391,7 @@ fn dispatch_await_task(
     };
     let mut held: Vec<(u64, Arc<SessionCtx>, Option<u64>)> = Vec::new();
     for target in &args.targets {
+        // A list element that names nothing is refused like a bare `@`
         // ([`empty_selector_refusal`]), never read as the active tab.
         if !aterm_types::control_verbs::selector_body_names_something(&target.selector) {
             return format!("{}\n", aterm_types::control_verbs::EMPTY_SELECTOR);
@@ -4964,7 +4977,7 @@ enum PendingHandoff {
 }
 
 impl PendingHandoff {
-    fn deadline(&self) -> std::time::Instant {
+    const fn deadline(&self) -> std::time::Instant {
         match self {
             Self::WriteOnly { deadline, .. } => *deadline,
             Self::Acknowledged(ack) => ack.deadline,
@@ -5315,6 +5328,8 @@ fn serving_caller(scope: Scope, ctx: &SessionCtx) -> Option<Arc<crate::typed_by:
     use crate::typed_by::{Caller, Who};
     match scope {
         Scope::Owner => {
+            // A drive connection's admitted line: the node it serves for, by
+            // the host this Mac's book names it and its id. Never the lane's
             // memo: the drive thread carries no pooled connection's caller.
             if let Some(driver) = crate::fabric::serving_driver() {
                 return Some(Caller::new(Who::Word(crate::typed_by::fleet_credit(
@@ -5807,6 +5822,13 @@ fn authenticate_connection(
     denials: &control_denials::AuthDenials,
     deadline: std::time::Instant,
 ) -> Option<(Scope, Principal, Option<String>)> {
+    // Bound the unauthenticated phase so a peer cannot hold the lane before
+    // presenting a token: the first line must be whole by `deadline` (the lane's
+    // pick-up plus [`AUTH_READ_TIMEOUT`]), re-armed before every refill so a
+    // dribbled byte buys nothing; expiry drops the connection. While a parker
+    // runs the line is whole before this is called (the parker holds the
+    // connection until it is); this bound is a lane's without one. The reader
+    // borrows this stream rather than duplicating the fd (a duplicated AF_UNIX
     // fd's close can block on macOS). Cleared after authentication.
     if stream.set_read_timeout(Some(AUTH_READ_TIMEOUT)).is_err() {
         // Distinct branch.
@@ -6276,6 +6298,7 @@ fn serve_request_line(
     sock_dir: &std::path::Path,
     recovery_count_admission: &crate::keeper_link::RecoveryCountAdmission,
 ) -> Option<ServeDisposition> {
+    // Before drive attribution, forwarding, subscribe, askpass, frames or dispatch:
     // no ID or history/since anchor can escape while an old journal is offerable.
     if let Some(refusal) = recovery_count_refusal(recovery_count_admission) {
         out.extend_from_slice(refusal.as_bytes());
@@ -6887,7 +6910,7 @@ struct DeadlineRead<'a> {
 }
 
 impl<'a> DeadlineRead<'a> {
-    fn new(stream: &'a CtlStream, deadline: std::time::Instant) -> Self {
+    const fn new(stream: &'a CtlStream, deadline: std::time::Instant) -> Self {
         Self {
             stream,
             deadline,
@@ -6973,6 +6996,7 @@ fn authenticated_poll_event(revents: libc::c_short) -> std::io::Result<()> {
         return Err(std::io::Error::from_raw_os_error(libc::EBADF));
     }
     if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        // Read even on HUP/ERR: queued bytes (including a final unterminated
         // line) must be drained before EOF is observed.
         return Ok(());
     }
@@ -9127,6 +9151,14 @@ fn serve_session_verb(
         "sys" => {
             crate::sys_host::cmd_sys(store, session, term, master, scope.is_owner_class(), rest)
         }
+        "occupancy" => {
+            let sid = store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .by_local(session)
+                .map(|h| h.sid.as_str().to_string());
+            crate::occupancy_host::cmd_occupancy(sid.as_deref(), rest)
+        }
         "mark" => dispatch_mark(ctx, scope, rest),
         "resizes" => crate::resize_ledger::cmd_resizes(ctx, term, rest),
         "status" => control_media::cmd_session_status(proxy, session, rest),
@@ -9161,7 +9193,7 @@ fn stamp_input_seq(class: Input, resp: String, term: &Arc<Mutex<Terminal>>) -> S
 }
 
 /// The wire name of a [`CursorStyle`]: its variant in lowercase snake_case.
-pub(crate) fn cursor_style_name(style: CursorStyle) -> &'static str {
+pub(crate) const fn cursor_style_name(style: CursorStyle) -> &'static str {
     match style {
         CursorStyle::BlinkingBlock => "blinking_block",
         CursorStyle::SteadyBlock => "steady_block",

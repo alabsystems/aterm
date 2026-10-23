@@ -2,10 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Scenarios that cross packages, as sequences of `run_cli` calls on one fake: a
-//! provisioning read as the routed identity, a token that disappears, a wait then two
-//! downloads, and jq over pages. Each step asserts exits, JSON values, receipt fields and what
-//! the fake saw, never prose.
+//! Multi-step CLI scenario tests over a fake GitHub server.
 
 use agh_fake::{FakeGithub, ReleaseSpec, RepoSpec};
 #[cfg(unix)]
@@ -93,7 +90,6 @@ fn a_profile_provisioned_from_nothing_reads_as_the_routed_identity() {
     );
     assert!(!agh::config::Dirs::under(root).config_file().exists());
 
-    // A person at the keyboard (stderr a terminal) hands the token over on stdin.
     let (ctx, captured) = common::ctx(root, &fake, common::env());
     let mut ctx = ctx
         .with_terminals(false, true)

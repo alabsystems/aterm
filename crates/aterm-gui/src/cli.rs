@@ -709,7 +709,7 @@ impl OrdinaryWindowOption {
         })
     }
 
-    fn takes_value(self) -> bool {
+    const fn takes_value(self) -> bool {
         matches!(
             self,
             Self::WorkingDirectory

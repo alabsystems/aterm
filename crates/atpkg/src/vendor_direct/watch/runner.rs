@@ -525,7 +525,7 @@ struct Following {
     since: Duration,
 }
 
-/// A host's head watch, driven alone (the module doc).
+/// A host's head watch, driven alone.
 pub struct Runner {
     layout: Layout,
     watch: HeadWatch,
@@ -666,6 +666,10 @@ impl Runner {
             && self.index.pending.is_none()
             && self.index.ready == 0
         {
+            // A session denied the seat can do no work before `admit_after` (every path
+            // re-admits through that claim), so it sleeps to the claim's deadline (at most
+            // a minute) instead of waking every slice for a config stat, then re-reads the
+            // live gate before admitting or asking a head. `HostHandle::stop` still unparks
             // this wait.
             admission_wait.min(CADENCE)
         } else {
@@ -733,6 +737,8 @@ impl Runner {
         }
         let owns_watch = self.begin_update_look(wall);
         if !owns_watch {
+            // Only the nonblocking rendezvous was read. The common admission
+            // deadline makes a window retry on the next slice and another
             // session retry after the seat's minute cadence.
             return false;
         }
@@ -750,6 +756,8 @@ impl Runner {
     }
 
     fn begin_update_look(&mut self, wall: SystemTime) -> bool {
+        // A shared, unhosted watch exists only as the negative control for the
+        // host rendezvous. It has no session claim to pace; its vendor slice
         // must keep running so the test catches a missing host gate.
         if self.watch.host != Some(Host::Session) {
             return false;

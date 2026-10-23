@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `sys` host: the workers' copy, pulls, deltas and cursors, and the
-//! machine wait, each on a private [`Shared`] (never the process's).
+//! Tests for the `sys` host on a private [`Shared`].
 
 use super::*;
 use aterm_vitals::model::{
@@ -10,7 +9,6 @@ use aterm_vitals::model::{
 };
 use aterm_vitals::sys::json::contract_violations;
 
-/// A snapshot two readings of this process made (the live machine).
 fn live_snapshot() -> Snapshot {
     let mut reader = crate::vitals_host::Reader::new(std::sync::Arc::default());
     let req = crate::vitals_host::Request {
@@ -26,7 +24,6 @@ fn live_snapshot() -> Snapshot {
     reader.read(&req)
 }
 
-/// A small synthetic snapshot: 4 cores at `busy` each, memory normal, no GPU.
 fn synthetic(seq: u64, busy: f32) -> Snapshot {
     let flat = aterm_vitals::TrendView::flat;
     Snapshot {
@@ -163,7 +160,6 @@ fn a_since_cursor_answers_a_delta_and_its_gaps() {
     let first = ask(&shared, "global");
     let cursor = cursor_of(&first);
     assert_eq!(cursor, format!("{:x}.3", *EPOCH));
-    // The same snapshot again: every value line folds into one `same` line.
     let again = ask(&shared, &format!("global since={cursor}"));
     let header = again.lines().next().unwrap();
     assert!(header.ends_with(" delta=1"), "{again}");
@@ -171,29 +167,21 @@ fn a_since_cursor_answers_a_delta_and_its_gaps() {
         again.lines().nth(1).unwrap().starts_with("same "),
         "{again}"
     );
-    // A moved figure stays; the others fold.
     shared.publish_for_test(synthetic(4, 0.6), Vec::new());
     let moved = ask(&shared, &format!("global since={cursor}"));
     assert!(moved.lines().any(|l| l.starts_with("cpu ")), "{moved}");
     assert!(moved.lines().any(|l| l.starts_with("same ")), "{moved}");
-    // Another view's reply at that cursor is not kept: a full reply, gap evicted.
     let other = ask(&shared, &format!("cores since={cursor}"));
     assert!(other.lines().any(|l| l == "gap why=evicted"), "{other}");
     assert!(!other.lines().next().unwrap().contains("delta=1"));
-    // …nor is the same view printed to another shape (`top=`).
     let shorter = ask(&shared, &format!("global top=1 since={cursor}"));
     assert!(shorter.lines().any(|l| l == "gap why=evicted"), "{shorter}");
-    // Another start's cursor: reset.
     let reset = ask(&shared, &format!("global since={:x}.3", *EPOCH ^ 1));
     assert!(reset.lines().any(|l| l == "gap why=reset"), "{reset}");
-    // A cursor ahead of the head.
     let ahead = ask(&shared, &format!("global since={:x}.99", *EPOCH));
     assert_eq!(ahead, format!("ERR bad since head={:x}.4\n", *EPOCH));
 }
 
-/// A `why` folds only against the same reply: never another subject's, nor
-/// the byte-cut reply's against one with `top=` given (both top at 8);
-/// another view's rows are the same with `top=8` named or not, and fold.
 #[test]
 fn a_why_since_cursor_folds_only_against_the_same_reply() {
     let shared = Shared::new();
@@ -244,7 +232,6 @@ fn events_since_a_cursor_print_and_the_ring_says_when_it_lost_them() {
     let (events, covered) = shared.events_since(1);
     assert_eq!(events.len(), 1);
     assert!(covered);
-    // Fill the ring past its size: a cursor before what it lost gets no events.
     for seq in 3..(3 + EVENTS_CAP as u64 + 1) {
         let mut s = synthetic(seq, 0.1);
         s.events = vec![aterm_vitals::events::Event {
@@ -261,16 +248,12 @@ fn events_since_a_cursor_print_and_the_ring_says_when_it_lost_them() {
     assert!(!covered, "the oldest events left the ring");
 }
 
-/// The pull's order of things, on a copy whose gap is an hour (so a second
-/// read is certainly within it) and whose wait is a one-minute hang detector:
-/// nothing here depends on how fast the probe thread is scheduled.
 #[test]
 fn a_pull_asks_the_probe_once_per_gap_and_takes_its_reading() {
     let shared = Arc::new(Shared::paced(
         Duration::from_secs(3600),
         Duration::from_secs(60),
     ));
-    // No probe: what is held, at once.
     let (held, state) = shared.fresh(Duration::ZERO, true);
     assert!(held.is_none());
     assert_eq!(state, Freshness::Warming);
@@ -278,7 +261,6 @@ fn a_pull_asks_the_probe_once_per_gap_and_takes_its_reading() {
     let (held, state) = shared.fresh(Duration::ZERO, true);
     assert_eq!(held.map(|h| h.snap.seq), Some(1));
     assert_eq!(state, Freshness::Stale);
-    // A probe that answers each pull with the next snapshot.
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
     shared.install(tx);
     let probe = {
@@ -298,18 +280,14 @@ fn a_pull_asks_the_probe_once_per_gap_and_takes_its_reading() {
     let (held, state) = shared.fresh(Duration::ZERO, true);
     assert_eq!(held.map(|h| h.snap.seq), Some(2));
     assert_eq!(state, Freshness::Fresh);
-    // Within the gap a second forced read takes the reading that pull left.
     let (held, _) = shared.fresh(Duration::ZERO, true);
     assert_eq!(held.map(|h| h.snap.seq), Some(2));
-    // A fresh enough snapshot asks for nothing.
     let (held, _) = shared.fresh(Duration::from_secs(60), false);
     assert_eq!(held.map(|h| h.snap.seq), Some(2));
     shared.lock().tx = None;
     assert_eq!(probe.join().unwrap(), 1, "one pull for three reads");
 }
 
-/// `synthetic(seq, 0.1)` read with the coalition lane on, its split set read
-/// at the reading `split` (`None`: no split yet); readings are a second apart.
 fn with_split(seq: u64, split: Option<u64>) -> Snapshot {
     let mut s = synthetic(seq, 0.1);
     s.coal_lane = aterm_vitals::explain::CoalLane::On;
@@ -324,19 +302,8 @@ fn with_split(seq: u64, split: Option<u64>) -> Snapshot {
     s
 }
 
-/// A `why` is judged by its split's age, never the snapshot's: a fresh
-/// snapshot carrying an old split pulls and takes the next split; another
-/// view's pull within the gap, which read no split, does not stand in for
-/// its own; a pull that brings no new split answers the held one stale; with
-/// the lane off the snapshot's age decides. The gap and the freshness are an
-/// hour, and each probe is joined before the next step reads what it left,
-/// so nothing depends on scheduling: the stale path's own bound expires
-/// whatever the probe does, and the other wait is a one-minute hang
-/// detector.
 #[test]
 fn a_why_is_as_fresh_as_its_split() {
-    // A probe that answers each pull with the next reading, its split read
-    // with it from pull `moves_from` on and carried from reading 1 before.
     let probe = |shared: &Arc<Shared>, moves_from: u64| {
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         shared.install(tx);
@@ -356,15 +323,12 @@ fn a_why_is_as_fresh_as_its_split() {
     let hour = Duration::from_secs(3600);
     let shared = Arc::new(Shared::paced(hour, Duration::from_secs(60)));
     let pulls = probe(&shared, 1);
-    // A split read with the snapshot answers at once.
     shared.publish_for_test(with_split(1, Some(1)), Vec::new());
     let (held, state) = shared.fresh_why(hour, false);
     assert_eq!(
         (held.map(|h| h.snap.seq), state),
         (Some(1), Freshness::Fresh)
     );
-    // A new snapshot carrying a split two hours old is fresh to every view
-    // but `why`, which pulls and takes the reading with the new split.
     shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
     let (held, _) = shared.fresh(hour, false);
     assert_eq!(held.map(|h| h.snap.seq), Some(7300));
@@ -376,7 +340,6 @@ fn a_why_is_as_fresh_as_its_split() {
     shared.lock().tx = None;
     assert_eq!(pulls.join().unwrap(), 1);
 
-    // Another view's pull reads no split: a `why` inside its gap pulls again.
     let shared = Arc::new(Shared::paced(hour, Duration::from_secs(60)));
     let pulls = probe(&shared, 2);
     shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
@@ -390,18 +353,14 @@ fn a_why_is_as_fresh_as_its_split() {
     shared.lock().tx = None;
     assert_eq!(pulls.join().unwrap(), 2);
 
-    // A probe whose readings never move the split: the wait ends stale.
     let shared = Arc::new(Shared::paced(hour, Duration::from_millis(200)));
     let pulls = probe(&shared, u64::MAX);
     shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
     let (held, state) = shared.fresh_why(hour, false);
     assert!(held.is_some_and(|h| h.snap.seq >= 7300));
     assert_eq!(state, Freshness::Stale);
-    // The probe's answer lands before the lane goes off, never after it.
     shared.lock().tx = None;
     assert_eq!(pulls.join().unwrap(), 1);
-    // With the lane off, the snapshot's age decides: no pull (none could be
-    // sent).
     let mut off = synthetic(7400, 0.1);
     off.coal_lane = aterm_vitals::explain::CoalLane::Off;
     shared.publish_for_test(off, Vec::new());
@@ -412,10 +371,6 @@ fn a_why_is_as_fresh_as_its_split() {
     );
 }
 
-/// A `why` holds the split armed while it waits (`cmd_sys` passes
-/// `vitals_host::SPLIT_ARMED`), so the pull it sends reads a split; another
-/// view's pull is unarmed, and nothing stays armed once the reply has its
-/// snapshot. The wait is a one-minute hang detector.
 #[test]
 fn a_why_arms_the_split_while_it_waits() {
     static ARMED: Arming = Arming::new();
@@ -496,8 +451,6 @@ fn the_machine_wait_meets_refuses_times_out_and_sees_its_session_exit() {
         "ERR exited\n"
     );
 
-    // The last low-CPU reading cannot meet a wait once it is stale and no
-    // probe answers. A fresh replacement may meet it, on its own cursor.
     let make_stale = |shared: &Shared| {
         shared.lock().held.as_mut().unwrap().at = Instant::now()
             .checked_sub(AWAIT_PERIOD + Duration::from_secs(1))
@@ -521,9 +474,6 @@ fn the_machine_wait_meets_refuses_times_out_and_sees_its_session_exit() {
         "{met}"
     );
 
-    // A failed refresh also breaks a hold. Advance the producer at each
-    // cancellation check: fresh 10, stale 12, fresh 13, fresh 15. Only the
-    // last two may supply the two-second hold; this uses no wall-clock wait.
     shared.publish_for_test(synthetic(10, 0.1), Vec::new());
     let stage = std::cell::Cell::new(0);
     let produce = || {
@@ -561,7 +511,6 @@ fn machine(s: &str) -> AwaitSys {
     }
 }
 
-/// A snapshot whose jobs view is `view`.
 fn with_jobs(seq: u64, view: &Arc<aterm_vitals::jobs::JobsView>) -> Snapshot {
     let mut s = synthetic(seq, 0.1);
     s.jobs = Some(Arc::clone(view));
@@ -578,17 +527,10 @@ fn jobs_view(rows: Vec<aterm_vitals::jobs::JobRow>) -> Arc<aterm_vitals::jobs::J
     })
 }
 
-/// §13.7: a named job that left the engine's view after it exited answers
-/// from the event ring (its exit meets `done`; any other wait is `ERR
-/// gone`), and one neither the view nor the ring knows is gone once the
-/// engine passed twice more, never parked to the timeout. NEGATIVE CONTROL:
-/// a job still in the view, and a pass that did not happen (the same view
-/// again), park.
 #[test]
 fn a_named_job_that_left_the_view_answers_from_the_ring_or_is_gone() {
     use aterm_vitals::events::{Event, EventKind};
     use aterm_vitals::jobs::{Class, Verdict};
-    // The ring's `exited` event, through the copy the workers read.
     let shared = Shared::new();
     let empty = jobs_view(Vec::new());
     let mut s = with_jobs(2, &empty);
@@ -634,8 +576,6 @@ fn a_named_job_that_left_the_view_answers_from_the_ring_or_is_gone() {
         ),
         "ERR gone job=a1\n"
     );
-    // A job nobody knows: the arm's pass and one more park; the second new
-    // pass says gone. The same view again is not a pass.
     let wait = machine("sys job=a9 done");
     let mut w = MachineWait::default();
     let (v1, v2, v3) = (
@@ -651,7 +591,6 @@ fn a_named_job_that_left_the_view_answers_from_the_ring_or_is_gone() {
             .as_deref(),
         Some("ERR gone job=a9\n")
     );
-    // A job in the view parks however many passes go by.
     let live = || {
         jobs_view(vec![crate::stats_paint::tests::job_row(
             "a9",
@@ -669,7 +608,6 @@ fn a_named_job_that_left_the_view_answers_from_the_ring_or_is_gone() {
     }
 }
 
-/// `scope=aterm` reads every pane; the default reads the caller's tab.
 #[test]
 fn a_machine_wait_reads_its_tab_or_with_scope_aterm_every_tab() {
     let panes = [
@@ -703,11 +641,6 @@ fn a_machine_wait_reads_its_tab_or_with_scope_aterm_every_tab() {
     );
 }
 
-/// THE SLOTS WAIT over the snapshots the probe thread fills (`vitals_host`'s
-/// one slot reader): parked while the one slot is held, met on the snapshot
-/// that frees it (`slots=1/1`), refused where the reader could not read the
-/// slots, and `for=` held only across stamps that span it. NEGATIVE CONTROL:
-/// a free slot an orphaned build still fills (discounted) parks.
 #[test]
 fn a_slots_wait_latches_on_the_snapshot_that_frees_a_slot() {
     use aterm_vitals::model::SlotsView;
@@ -758,9 +691,6 @@ fn a_slots_wait_latches_on_the_snapshot_that_frees_a_slot() {
     assert!(met.contains(" held_ms=20000 "), "{met}");
 }
 
-/// A wait arms the slots' few-second cadence only when it names them; the
-/// gauge counts every armed wait and is at rest once the last is dropped.
-/// NEGATIVE CONTROL: a wait on the machine's other terms arms nothing.
 #[test]
 fn a_wait_naming_the_slots_arms_their_cadence_while_it_stands() {
     for (text, names) in [
@@ -790,7 +720,6 @@ fn for_holds_across_snapshots_before_the_wait_answers() {
     let feeder = {
         let (shared, stop) = (Arc::clone(&shared), Arc::clone(&stop));
         std::thread::spawn(move || {
-            // Snapshots whose stamps are a second apart, until the wait answers.
             let mut seq = 1;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(20));
@@ -815,8 +744,6 @@ fn for_holds_across_snapshots_before_the_wait_answers() {
     assert!(reply.starts_with("OK sys cpu=10% held_ms="), "{reply}");
 }
 
-/// The seam's honest arm: each pane's folder is one `cwd` root, two panes in
-/// one folder are one root, and no size or balance is claimed.
 #[test]
 fn without_a_walker_the_seam_names_each_panes_folder_and_claims_no_size() {
     let cwds = [
@@ -848,12 +775,6 @@ fn without_a_walker_the_seam_names_each_panes_folder_and_claims_no_size() {
     assert_eq!(roots[1].tab, Some(2));
 }
 
-/// THE WALKER'S ARM: a pane's report becomes `sys` roots: a complete walk
-/// with its subtrees and growth, a running one as a lower bound beside its
-/// last complete figure, a refused and a too-broad root by their unavailable
-/// words; who claims each folder (for the per-root path rule) and the tab
-/// numbers; the report's own balance. A pane the walker was not told of yet
-/// reads its folder as queued.
 #[test]
 fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
     use crate::diskwalk_host::{
@@ -1010,7 +931,6 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
         (t.total, t.exclusive, t.shared, t.walking),
         (9_000, 4_000, 5_000, true)
     );
-    // A pane whose facts have not reached the walker: its folder, queued.
     let unknown = DiskReport {
         scope: DiskScope::Tab(5),
         roots: Vec::new(),
@@ -1042,8 +962,6 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
     assert!(totals.is_some_and(|t| t.walking && t.total == 0));
 }
 
-/// `EVENT <local> job …`'s words: the verdict, the id, the class and the rev,
-/// then the task id (a plain word only) and the exit code when known.
 #[test]
 fn a_job_event_carries_join_keys_and_closed_words_only() {
     use aterm_vitals::jobs::{Class, Verdict};
@@ -1062,16 +980,12 @@ fn a_job_event_carries_join_keys_and_closed_words_only() {
         job_event_payload(Verdict::Exited, "j12", Class::Exited, 1, None, Some(0)),
         "exited job=j12 class=exited rev=1 code=0"
     );
-    // A task id that is not a plain word is left out, never printed.
     assert_eq!(
         job_event_payload(Verdict::Quiet, "a1", Class::Waiting, 2, Some("x y;z"), None),
         "quiet job=a1 class=waiting rev=2"
     );
 }
 
-/// The brief's jobs line goes last before the trailer's `gap`/`more=`, and
-/// the header counts it, keeps the budget asked and says the whole reply's
-/// token estimate.
 #[test]
 fn the_jobs_line_lands_before_the_trailer_and_the_header_counts_it() {
     let text = "OK 3 brief sid=s-1 v=2 as_of=9 ep=1 budget=500 used=40\n\
@@ -1094,15 +1008,10 @@ fn the_jobs_line_lands_before_the_trailer_and_the_header_counts_it() {
         .and_then(|u| u.parse().ok())
         .expect("used=");
     assert_eq!(used, aterm_slog::tokens(out.len()), "{out}");
-    // No trailer (the one-line form): unchanged.
     let one = "OK 1 brief sid=s-1 v=2 as_of=9 ep=1 budget=5 used=12\n- sh r1 · -";
     assert_eq!(splice_brief_line(one, "jobs 1 job", 5), one);
 }
 
-/// A jobs view that is not parked speaks for now only while it is at most a
-/// minute old; a parked one (demand idle) for as long as its reader runs.
-/// NEGATIVE CONTROL: the parked view with its reader stopped says nothing
-/// past the minute.
 #[test]
 fn a_jobs_view_older_than_a_minute_says_nothing_of_now_unless_parked() {
     let view = Arc::new(aterm_vitals::jobs::JobsView {

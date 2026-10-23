@@ -230,7 +230,7 @@ pub(crate) fn capped_labels(labels: &[String]) -> Cow<'_, [String]> {
 
 /// Whether `ch` is a frame of a busy spinner an agent animates at the head of its OSC title: any braille pattern (U+2800–U+28FF — every braille set of cli-spinners, Codex's `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` among them), and the circle and corner sets (`◐◑◒◓◔◕`, Claude Code's moons; `◴◵◶◷`, `◰◱◲◳`, `◜◝◞◟◠◡`, `◢◣◤◥`).
 #[must_use]
-pub(crate) fn is_spinner_frame(ch: char) -> bool {
+pub(crate) const fn is_spinner_frame(ch: char) -> bool {
     matches!(
         ch,
         '\u{2800}'..='\u{28FF}'

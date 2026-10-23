@@ -213,7 +213,7 @@ fn fda_observation(
 /// What a debugger reading says. One that observed no mode (a probe still
 /// out, a closed gate, a refused or failed run, an inert instance) is not an
 /// observation, so it can neither arm the baseline nor latch.
-fn debugger_observation(probe: DebuggerProbe) -> ConsentObservation {
+const fn debugger_observation(probe: DebuggerProbe) -> ConsentObservation {
     match probe.mode {
         DebuggerMode::Unknown => ConsentObservation::Pending,
         mode => ConsentObservation::Complete(ConsentTuple::Debugger { mode }),

@@ -265,7 +265,7 @@ pub(crate) enum SurfaceColorspace {
 impl SurfaceColorspace {
     /// The CoreGraphics named-colour-space identifier for this tag, as accepted by `CGColorSpaceCreateWithName`.
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn cg_name(self) -> &'static str {
+    pub(crate) const fn cg_name(self) -> &'static str {
         match self {
             Self::Srgb => "kCGColorSpaceSRGB",
             Self::DisplayP3 => "kCGColorSpaceDisplayP3",
@@ -274,7 +274,7 @@ impl SurfaceColorspace {
     }
 
     /// The colour coordinates actually consumed by the platform compositor, frozen into GPU capture metadata after the platform confirms the tag.
-    pub(crate) fn gpu_capture_space(self) -> aterm_gpu::video_tap::CaptureColorSpace {
+    pub(crate) const fn gpu_capture_space(self) -> aterm_gpu::video_tap::CaptureColorSpace {
         match self {
             Self::ExtendedLinearSrgb => aterm_gpu::video_tap::CaptureColorSpace::ExtendedLinearSrgb,
             Self::DisplayP3 => aterm_gpu::video_tap::CaptureColorSpace::DisplayP3,
@@ -416,6 +416,7 @@ impl AppRt for AppRtMacOS {
                     }
                 }
             } else {
+                // Auto: clear any forced appearance so the window tracks the OS
                 // `effectiveAppearance` again after a live Dark/Light → Auto change.
                 appkit::send_v_id(ns_window, sel!(setAppearance:), aterm_objc::Id::NIL);
             }
@@ -735,7 +736,19 @@ impl AppRt for AppRtMacOS {
     }
 }
 
-/// Map aterm's config [`WindowTheme`] onto the winit window-theme override [`aterm_window::window::Theme`] applied via [`Window::set_theme`]:
+/// Map aterm's config [`WindowTheme`] onto the winit window-theme override
+/// [`aterm_window::window::Theme`] applied via [`Window::set_theme`]:
+/// * `Auto`  → `None` — clear the override. On X11 winit defaults the
+///   `_GTK_THEME_VARIANT` hint to dark; on Wayland the fork only stores the value
+///   (it draws no frame since LW.5: a window the compositor leaves undecorated
+///   has aterm's own header, `crate::client_frame`).
+///   Neither backend reports the desktop preference back (`Window::theme()` is
+///   the override or `None`, and no `ThemeChanged` arrives), which is why
+///   `App::chrome_theme_for_apprt` resolves Linux `Auto` from the terminal theme
+///   instead.
+/// * `Light` → `Some(Theme::Light)` — force the light variant of the window
+///   system's frame (X11's `_GTK_THEME_VARIANT`, a Windows title bar).
+/// * `Dark`  → `Some(Theme::Dark)` — force the dark variant.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<aterm_window::window::Theme> {
@@ -782,7 +795,7 @@ pub(crate) fn cached_modifiers(
 /// The window setting for an Option that is an Alt (`alt`, [`crate::App::option_is_alt`]): both keys, so AppKit is handed each Option key event without its Option characters and neither composes a glyph (Option+a, "å") nor starts a dead key (Option+e), and the key event's text is the layout's character at the Shift level, which the encoder sends after ESC; neither key otherwise, so Option types what the layout composes.
 #[cfg(target_os = "macos")]
 #[must_use]
-pub(crate) fn option_as_alt_for(alt: bool) -> aterm_window::platform::macos::OptionAsAlt {
+pub(crate) const fn option_as_alt_for(alt: bool) -> aterm_window::platform::macos::OptionAsAlt {
     use aterm_window::platform::macos::OptionAsAlt;
     if alt {
         OptionAsAlt::Both
@@ -802,7 +815,10 @@ pub(crate) fn set_option_as_alt(window: &aterm_window::window::Window, alt: bool
     let _ = (window, alt);
 }
 
-/// Where an Option chord that Meta mode would send as ESC and the key types a character instead: the one its layout reaches only with Option (`App::on_key`; German Option+L is `@`, Option+7 `|`, Option+N `~`, French Option+( `{`, British Option+3 `#`), as [`aterm_window::platform::macos::option_only_character`] reads the selected layout.
+/// Where an Option chord that Meta mode would send as ESC and the key types a character
+/// instead: the one its layout reaches only with Option (`App::on_key`; German Option+L is
+/// `@`, Option+7 `|`, Option+N `~`, French `Option+(` `{`, British Option+3 `#`), as
+/// [`aterm_window::platform::macos::option_only_character`] reads the selected layout.
 pub(crate) type OptionOnly = fn(aterm_window::keyboard::PhysicalKey, bool) -> Option<char>;
 
 /// The [`OptionOnly`] source an `App` holds: the selected layout's windowed on macOS, [`no_option_only`] headless, in unit tests and off macOS (no other backend reads Alt chords as Meta past a layout's level-3 characters: X11 and Wayland report AltGr as a level, and Windows encodes the composed key).
@@ -817,7 +833,7 @@ pub(crate) fn option_only_source(headless: bool) -> OptionOnly {
 
 /// [`OptionOnly`] for HEADLESS instances and unit tests: never.
 #[must_use]
-pub(crate) fn no_option_only(
+pub(crate) const fn no_option_only(
     _key: aterm_window::keyboard::PhysicalKey,
     _shift: bool,
 ) -> Option<char> {
@@ -826,7 +842,7 @@ pub(crate) fn no_option_only(
 
 /// Whether an Option chord's key-event text is what Option composed rather than the layout's character at the Shift level: on macOS, whenever the window's Option is not an Alt (`option_is_alt`, what `App::sync_option_as_alt` last set), so the keymap must not hand that text to the encoder as the layout's character (`keymap::layout_text`).
 #[must_use]
-pub(crate) fn option_composes(option_is_alt: bool) -> bool {
+pub(crate) const fn option_composes(option_is_alt: bool) -> bool {
     cfg!(target_os = "macos") && !option_is_alt
 }
 
@@ -987,7 +1003,7 @@ pub(crate) fn user_input_source(headless: bool) -> fn(std::time::Duration) -> bo
 
 /// The input-activity source for headless instances and unit tests: never recent.
 #[must_use]
-pub(crate) fn no_recent_user_input_event(_within: std::time::Duration) -> bool {
+pub(crate) const fn no_recent_user_input_event(_within: std::time::Duration) -> bool {
     false
 }
 
@@ -1356,7 +1372,7 @@ pub(crate) fn redraw_is_exposure() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn redraw_is_exposure() -> bool {
+pub(crate) const fn redraw_is_exposure() -> bool {
     false
 }
 
@@ -1488,7 +1504,7 @@ pub(crate) type PlatformAppRt = crate::platform_win::AppRtWindows;
 pub(crate) type PlatformAppRt = AppRtLinux;
 
 /// Construct the platform application-runtime for this build target.
-pub(crate) fn platform_apprt() -> PlatformAppRt {
+pub(crate) const fn platform_apprt() -> PlatformAppRt {
     #[cfg(target_os = "macos")]
     {
         AppRtMacOS {
@@ -2317,7 +2333,7 @@ mod vibrancy {
     const AUTORESIZE_WH: usize = 2 | 16;
     const ORDER_BELOW: isize = -1;
 
-    fn material_value(m: BackgroundMaterial) -> Option<isize> {
+    const fn material_value(m: BackgroundMaterial) -> Option<isize> {
         match m {
             BackgroundMaterial::None => None,
             BackgroundMaterial::Hud => Some(MATERIAL_HUD),

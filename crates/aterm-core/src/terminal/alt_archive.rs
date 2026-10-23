@@ -1805,6 +1805,7 @@ fn is_anchor_text(s: &str) -> bool {
 /// space (aterm-control's `visible_char`, so the hash and archived bytes match the screen
 /// reply), then trailing whitespace is trimmed.
 fn normalize_row(s: &mut String) {
+    // Fast screen: C0, DEL, and the UTF-8 lead byte of U+0080..=U+00BF (C1
     // controls live there, alongside common glyphs like `·`).
     if s.bytes().any(|b| b < 0x20 || b == 0x7f || b == 0xc2)
         && s.chars().any(|c| c == '\0' || c.is_control())

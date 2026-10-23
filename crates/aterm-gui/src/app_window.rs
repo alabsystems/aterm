@@ -181,7 +181,7 @@ impl App {
 
 impl crate::WindowState {
     /// Take a restored window's carried frame before its first attach sizes it.
-    pub(crate) fn take_carried_frame(&mut self, inner_px: Option<PhysicalSize<u32>>) {
+    pub(crate) const fn take_carried_frame(&mut self, inner_px: Option<PhysicalSize<u32>>) {
         self.carried_inner_px = inner_px;
     }
 }
@@ -240,7 +240,7 @@ pub(crate) fn push_home_abbreviated_cwd(slot: &mut String, cwd: Option<&str>) ->
 }
 
 #[must_use]
-fn present_target_install_outcome(
+const fn present_target_install_outcome(
     present_installed: bool,
     milestones: crate::metrics::StartupAttachMilestones,
 ) -> (bool, Option<crate::metrics::StartupAttachMilestones>) {
@@ -328,7 +328,7 @@ impl App {
     }
 
     /// The window-chrome theme from config `window_theme`.
-    pub(crate) fn window_theme_for_chrome(&self) -> crate::app_config::WindowTheme {
+    pub(crate) const fn window_theme_for_chrome(&self) -> crate::app_config::WindowTheme {
         self.window_theme
     }
 
@@ -347,7 +347,7 @@ impl App {
         )
     }
 
-    fn early_reveal_backdrop(&self) -> u32 {
+    const fn early_reveal_backdrop(&self) -> u32 {
         self.theme.bg & 0x00FF_FFFF
     }
 
@@ -2748,7 +2748,9 @@ pub(crate) mod taskbar {
                 // Distinct branch.
                 return; // no taskbar interface available
             };
-            // SAFETY: `obj` is a live `ITaskbarList3` created on this thread and `hwnd` a live.
+            // SAFETY: `obj` is a live `ITaskbarList3` created on this thread and `hwnd` a live
+            // window handle (0 rejected by the caller); both calls are synchronous and take
+            // integers.
             unsafe {
                 let vtbl = &*(*obj).vtbl;
                 (vtbl.set_progress_state)(obj, hwnd, flag);
@@ -2767,7 +2769,10 @@ pub(crate) mod taskbar {
                 return false;
             };
             let description = overlay_description(icon, description);
-            // SAFETY: `obj` is a live `ITaskbarList3` created on this thread, `hwnd` a live.
+            // SAFETY: `obj` is a live `ITaskbarList3` created on this thread, `hwnd` a live
+            // top-level window (0 rejected by the caller), `icon` a live HICON or 0, and
+            // `description` null or a NUL-terminated UTF-16 string that outlives this synchronous
+            // call.
             unsafe { ((*(*obj).vtbl).set_overlay_icon)(obj, hwnd, icon, description) >= 0 }
         })
     }

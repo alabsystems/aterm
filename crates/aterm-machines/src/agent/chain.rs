@@ -66,7 +66,6 @@ pub fn check(sys: &dyn System, exe: &Path) -> Result<(), String> {
     dirs(sys, parent)
 }
 
-/// `dir` and every directory above it: real directories, root's, writable by root alone.
 fn dirs(sys: &dyn System, dir: &Path) -> Result<(), String> {
     for d in dir.ancestors() {
         let st = sys.stat(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -129,8 +128,6 @@ mod tests {
         }
     }
 
-    /// The installed layout as `stat -f "%Su:%Sg %Sp"` showed it in the VM: `/` and
-    /// `/Library` root:wheel 0755, everything the agent made root:wheel 0755.
     fn installed() -> Fake {
         let fake = Fake::root();
         for d in [

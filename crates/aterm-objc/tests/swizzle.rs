@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `SwizzleSite::install`'s refusals and chaining, and `owning_class`, against
-//! classes registered here.
-//!
-//! The third-party patches the refusals exist for are applied through this
-//! file's own `method_setImplementation` binding, so the module under test
-//! cannot vouch for itself. These run on libtest workers, which is fine: class
-//! registration is not gated by [`aterm_objc::MainThread`], and these classes
-//! touch no AppKit state and hold no ivar with a destructor.
+//! Tests for `SwizzleSite::install` refusals, chaining, and `owning_class`.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -25,58 +18,42 @@ use aterm_objc::{
     method_types, msg, ns_string, sel,
 };
 
-// The runtime, bound here so the third-party patches are independent of the
-// module under test.
-//
-// SAFETY: every symbol below is libobjc's, loaded in every process on this
-// platform.
+// SAFETY: every symbol below is libobjc's, loaded in every process on this platform.
 unsafe extern "C" {
     fn class_getInstanceMethod(cls: ClassPtr, name: Sel) -> *const c_void;
     fn method_setImplementation(method: *const c_void, imp: *const c_void) -> *const c_void;
 }
 
-// Probe implementations: each records that it ran and returns a distinct value.
-
-/// Process-global counters, read only for their value: libtest is parallel, so
-/// the one test that counts calls has its own private pair below.
 static ORIGINAL_RUNS: AtomicU32 = AtomicU32::new(0);
 static PATCHED_RUNS: AtomicU32 = AtomicU32::new(0);
 
-/// The private pair, touched by exactly one test.
 static SITE_ORIGINAL_RUNS: AtomicU32 = AtomicU32::new(0);
 static SITE_PATCHED_RUNS: AtomicU32 = AtomicU32::new(0);
 
-/// `-(int64_t)probeValue` — the original, for the site test alone.
 unsafe extern "C-unwind" fn site_original_probe(_this: Id, _cmd: Sel) -> i64 {
     SITE_ORIGINAL_RUNS.fetch_add(1, Ordering::Relaxed);
     1
 }
 
-/// `-(int64_t)probeValue` — the patch, for the site test alone.
 unsafe extern "C-unwind" fn site_patched_probe(_this: Id, _cmd: Sel) -> i64 {
     SITE_PATCHED_RUNS.fetch_add(1, Ordering::Relaxed);
     2
 }
 
-/// `-(int64_t)probeValue`: the original.
 unsafe extern "C-unwind" fn original_probe(_this: Id, _cmd: Sel) -> i64 {
     ORIGINAL_RUNS.fetch_add(1, Ordering::Relaxed);
     1
 }
 
-/// `-(int64_t)probeValue`: the patch.
 unsafe extern "C-unwind" fn patched_probe(_this: Id, _cmd: Sel) -> i64 {
     PATCHED_RUNS.fetch_add(1, Ordering::Relaxed);
     2
 }
 
-/// A second patch, for the displacement case.
 unsafe extern "C-unwind" fn other_probe(_this: Id, _cmd: Sel) -> i64 {
     3
 }
 
-/// A patch with the wrong return width, the shape the encoding check refuses. Never installed by
-/// a passing test.
 unsafe extern "C-unwind" fn wrong_shape(_this: Id, _cmd: Sel) -> Bool {
     Bool::from(true)
 }
@@ -84,20 +61,14 @@ unsafe extern "C-unwind" fn wrong_shape(_this: Id, _cmd: Sel) -> Bool {
 type ProbeFn = unsafe extern "C-unwind" fn(Id, Sel) -> i64;
 type WrongFn = unsafe extern "C-unwind" fn(Id, Sel) -> Bool;
 
-/// Register a fresh `NSObject` subclass with `-probeValue`. The name must be
-/// unique per test (`begin` panics on a duplicate).
 fn register_probe_class(name: &'static CStr) -> ClassPtr {
     register_probe_class_with(name, original_probe)
 }
 
-/// As [`register_probe_class`], with the implementation named, so a test that
-/// counts calls can own its counter.
 fn register_probe_class_with(name: &'static CStr, imp: ProbeFn) -> ClassPtr {
     let mut b = begin(c"NSObject", name);
-    // `ClassBuilder::register` asserts the ivar exists; `()` is the empty payload.
     b.add_rust_ivar::<()>();
-    // SAFETY: `imp` has the `(Id, Sel) -> i64` prototype its encoding describes and cannot
-    // unwind (one atomic, then a constant).
+    // SAFETY: `imp` has the `(Id, Sel) -> i64` prototype its encoding describes and cannot unwind.
     unsafe {
         b.add_method(
             sel!(probeValue),
@@ -108,11 +79,8 @@ fn register_probe_class_with(name: &'static CStr, imp: ProbeFn) -> ClassPtr {
     b.register().class()
 }
 
-/// A fresh instance of `cls`, +1, leaked: these classes hold no ivar with a destructor, and the
-/// tests are about method tables, not lifetimes.
 fn instance_of(cls: ClassPtr) -> Id {
-    // SAFETY: `+alloc` then `-init` on an `NSObject` subclass is the canonical
-    // +1 construction and both prototypes are `-(id)(id, SEL)`.
+    // SAFETY: `+alloc` then `-init` on an `NSObject` subclass uses `-(id)(id, SEL)`.
     unsafe {
         let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
         let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
@@ -120,17 +88,13 @@ fn instance_of(cls: ClassPtr) -> Id {
     }
 }
 
-/// Send `-probeValue`.
 fn probe_value(obj: Id) -> i64 {
-    // SAFETY: `-probeValue` is registered `q@:` on every class in this file and
-    // `obj` is a live instance of one.
+    // SAFETY: `-probeValue` is registered `q@:` on every class here and `obj` is live.
     unsafe {
         let send: unsafe extern "C-unwind" fn(Id, Sel) -> i64 = msg();
         send(obj, sel!(probeValue))
     }
 }
-
-// Part 1 — the owner: the class you name is not the class you patch.
 
 #[test]
 fn owning_class_finds_the_definer_not_the_class_asked() {
@@ -145,7 +109,6 @@ fn owning_class_finds_the_definer_not_the_class_asked() {
     let owner = unsafe { owning_class(child, sel!(probeValue)) }.expect("the chain implements it");
     assert_eq!(parent, owner, "the row lives on the parent");
 
-    // A row the child DOES define resolves to the child.
     let mut b = begin(c"AtermSwizzleOwner", c"AtermSwizzleOwnerOverride");
     b.add_rust_ivar::<()>();
     // SAFETY: prototype and encoding agree, and the trampoline cannot unwind.
@@ -163,7 +126,6 @@ fn owning_class_finds_the_definer_not_the_class_asked() {
         unsafe { owning_class(over, sel!(probeValue)) }.expect("it defines it")
     );
 
-    // And a selector nothing implements has no owner.
     // SAFETY: `child` is live; the selector is interned and unimplemented.
     assert_eq!(None, unsafe {
         owning_class(child, sel!(atermNoSuchSelector))
@@ -173,8 +135,6 @@ fn owning_class_finds_the_definer_not_the_class_asked() {
         owning_class(ClassPtr::NULL, sel!(probeValue))
     });
 }
-
-// Part 2 — the encoding derived from the prototype.
 
 #[test]
 fn method_fn_derives_the_encoding_from_the_prototype() {
@@ -194,8 +154,6 @@ fn method_fn_derives_the_encoding_from_the_prototype() {
          `-[NSApplication sendEvent:]` row strips to"
     );
 
-    // The shape a wide selector takes, so the derivation is exercised past
-    // arity one.
     type Wide = unsafe extern "C-unwind" fn(Id, Sel, CGRect, NSRange, *mut NSRange, Bool) -> CGRect;
     assert_eq!(
         format!(
@@ -213,8 +171,7 @@ fn install_refuses_a_prototype_the_registered_encoding_does_not_match() {
     static SITE: SwizzleSite<WrongFn> = SwizzleSite::new();
     let cls = register_probe_class(c"AtermSwizzleMismatch");
 
-    // SAFETY: `wrong_shape` cannot unwind; the install must refuse it (it returns `BOOL` where
-    // the row is `q`).
+    // SAFETY: `wrong_shape` cannot unwind and the install refuses the encoding mismatch.
     let outcome = unsafe { SITE.install(cls, sel!(probeValue), wrong_shape) };
 
     match outcome {
@@ -240,8 +197,7 @@ fn install_refuses_a_selector_nothing_implements_and_a_null_class() {
     static SITE: SwizzleSite<ProbeFn> = SwizzleSite::new();
     let cls = register_probe_class(c"AtermSwizzleAbsent");
 
-    // SAFETY: the patch cannot unwind; the selector is not implemented, which is the refusal
-    // under test.
+    // SAFETY: the patch cannot unwind and the selector is unimplemented.
     assert_eq!(
         Err(SwizzleError::NoSuchMethod),
         unsafe { SITE.install(cls, sel!(atermNoSuchSelector), patched_probe) },
@@ -254,9 +210,6 @@ fn install_refuses_a_selector_nothing_implements_and_a_null_class() {
     });
 }
 
-// Part 3 — the site: install, chain, idempotence, and the refusals that stop a
-// chain being built from someone else's implementation.
-
 #[test]
 fn install_replaces_publishes_the_original_and_reports_the_owner() {
     static SITE: SwizzleSite<ProbeFn> = SwizzleSite::new();
@@ -267,9 +220,7 @@ fn install_replaces_publishes_the_original_and_reports_the_owner() {
         b.register().class()
     };
 
-    // Ask for the child; the row lives on the parent.
-    // SAFETY: `site_patched_probe` has the row's `(Id, Sel) -> i64` prototype
-    // (re-checked by the install) and cannot unwind.
+    // SAFETY: `site_patched_probe` has the row's `(Id, Sel) -> i64` prototype and cannot unwind.
     let done = unsafe { SITE.install(child, sel!(probeValue), site_patched_probe) }
         .expect("the row exists and the prototype matches");
 
@@ -285,26 +236,20 @@ fn install_replaces_publishes_the_original_and_reports_the_owner() {
         other => panic!("expected a replacement, got {other:?}"),
     }
 
-    // The runtime now calls ours, on an instance of the PARENT.
     assert_eq!(2, probe_value(instance_of(parent)));
     assert_eq!(1, SITE_PATCHED_RUNS.load(Ordering::Relaxed));
     assert_eq!(0, SITE_ORIGINAL_RUNS.load(Ordering::Relaxed));
 
-    // And the chain is typed: no transmute at the call site.
     let original = SITE.original().expect("the site published the original");
-    // SAFETY: the install verified this prototype. An IMP entered directly is
-    // not a message send, so the receiver must be live — it is.
+    // SAFETY: the install verified this prototype.
     let chained = unsafe { original(instance_of(parent), sel!(probeValue)) };
     assert_eq!(1, chained);
     assert_eq!(1, SITE_ORIGINAL_RUNS.load(Ordering::Relaxed));
 
-    // The IMP the runtime will call is ours (the question the live auditor's
-    // part A2 asks of AppKit).
     // SAFETY: `parent` is a live class.
     let live = unsafe { method_imp(parent, sel!(probeValue)) }.expect("registered");
     assert!(std::ptr::eq(live, site_patched_probe as *const c_void));
 
-    // The encoding did not move, which is why part A2 resolves the IMP instead.
     // SAFETY: `parent` is live.
     assert_eq!(
         Some("q@:".to_owned()),
@@ -312,7 +257,6 @@ fn install_replaces_publishes_the_original_and_reports_the_owner() {
         "no encoding check in this tree can tell this class was patched"
     );
 
-    // Idempotent re-entry.
     // SAFETY: as the first install.
     let again = unsafe { SITE.install(child, sel!(probeValue), site_patched_probe) }
         .expect("a second install of the same implementation is a no-op");
@@ -338,7 +282,6 @@ fn install_refuses_once_a_third_party_has_displaced_it() {
     // SAFETY: prototype matches the registered row and cannot unwind.
     unsafe { SITE.install(cls, sel!(probeValue), patched_probe) }.expect("the first install");
 
-    // A third party swizzles on top, through the raw runtime.
     // SAFETY: the row exists and `other_probe` has its prototype.
     unsafe {
         let m = class_getInstanceMethod(cls, sel!(probeValue));
@@ -372,8 +315,6 @@ fn install_refuses_when_the_row_is_already_patched_by_somebody_else() {
     static SITE: SwizzleSite<ProbeFn> = SwizzleSite::new();
     let cls = register_probe_class(c"AtermSwizzleOrphan");
 
-    // Someone else installs our implementation without the site, so the
-    // original is gone and the runtime cannot give it back.
     // SAFETY: the row exists and the prototype matches.
     unsafe {
         let m = class_getInstanceMethod(cls, sel!(probeValue));
@@ -389,12 +330,6 @@ fn install_refuses_when_the_row_is_already_patched_by_somebody_else() {
     );
 }
 
-// Part 4 — one site asked about two rows, and KVO swapping an object's class
-// under the patch.
-
-/// One site asked about a second row is refused, not answered with the first
-/// row's original. Deciding "already installed?" from the row alone would
-/// report `A`'s original for `B` (same encoding, so nothing else could see it).
 #[test]
 fn one_site_asked_about_a_second_row_refuses_instead_of_answering() {
     static SITE: SwizzleSite<ProbeFn> = SwizzleSite::new();
@@ -414,13 +349,11 @@ fn one_site_asked_about_a_second_row_refuses_instead_of_answering() {
         "a site claims a ROW, and can say which"
     );
 
-    // A different site patches B's row to the same implementation.
     // SAFETY: as above.
     let second = unsafe { OTHER.install(b, sel!(probeValue), patched_probe) }
         .expect("the second install lands");
     assert_eq!(second.previous(), (other_probe as ProbeFn).imp());
 
-    // Ask the first site about B's row, which now holds `patched_probe`.
     // SAFETY: as above.
     let asked = unsafe { SITE.install(b, sel!(probeValue), patched_probe) };
     match asked {
@@ -431,7 +364,6 @@ fn one_site_asked_about_a_second_row_refuses_instead_of_answering() {
         other => panic!("expected WrongRow, got {other:?}"),
     }
 
-    // The same site asked about a different selector on its own class.
     // SAFETY: as above.
     let by_selector = unsafe { SITE.install(a, sel!(description), patched_probe) };
     assert!(
@@ -441,7 +373,6 @@ fn one_site_asked_about_a_second_row_refuses_instead_of_answering() {
          this site's row: {by_selector:?}"
     );
 
-    // The refusal wrote nothing.
     assert_eq!(
         SITE.original().map(|f| f.imp()),
         Some((original_probe as ProbeFn).imp())
@@ -449,18 +380,10 @@ fn one_site_asked_about_a_second_row_refuses_instead_of_answering() {
     assert_eq!(probe_value(instance_of(b)), 2, "B still runs the patch");
 }
 
-/// KVO swapping the class under a patched object changes nothing that matters.
-///
-/// `-addObserver:forKeyPath:…` creates `NSKVONotifying_X`, repoints the
-/// instance's isa, and overrides `-class` to hide it. This pins why
-/// `override_send_event` uses `class_of` (`object_getClass`) rather than a
-/// `-class` send.
 #[test]
 fn a_kvo_isa_swap_leaves_the_swizzle_and_its_owner_where_they_were() {
     static SITE: SwizzleSite<ProbeFn> = SwizzleSite::new();
 
-    // A class with a property KVO will observe. `-probeValue` is the swizzle
-    // target; `-value`/`-setValue:` are what KVO needs to isa-swap at all.
     unsafe extern "C-unwind" fn get_value(_this: Id, _cmd: Sel) -> i64 {
         41
     }
@@ -491,15 +414,12 @@ fn a_kvo_isa_swap_leaves_the_swizzle_and_its_owner_where_they_were() {
     };
     let obj = instance_of(cls);
 
-    // Swizzle first, then let KVO in on top.
     // SAFETY: `patched_probe` has the registered prototype and cannot unwind.
     let done = unsafe { SITE.install(cls, sel!(probeValue), patched_probe) }.expect("install");
     assert_eq!(done.owner(), cls);
     assert_eq!(probe_value(obj), 2);
 
-    // SAFETY: `-addObserver:forKeyPath:options:context:` is
-    // `v40@0:8@16@24Q32^v40` on `NSObject`; `obj` observing itself is legal and
-    // makes the runtime build the notifying subclass.
+    // SAFETY: `-addObserver:forKeyPath:options:context:` is `v40@0:8@16@24Q32^v40` on `NSObject`.
     let before = unsafe { class_of(obj) };
     unsafe {
         let add: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, usize, *const c_void) = msg();
@@ -519,7 +439,6 @@ fn a_kvo_isa_swap_leaves_the_swizzle_and_its_owner_where_they_were() {
         "KVO must have installed a notifying subclass"
     );
 
-    // 1. `-class` lies and `object_getClass` does not.
     // SAFETY: `-class` is `#16@0:8` on `NSObject` and `obj` is live.
     let lied = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel) -> ClassPtr = msg();
@@ -528,16 +447,11 @@ fn a_kvo_isa_swap_leaves_the_swizzle_and_its_owner_where_they_were() {
     assert_eq!(lied, cls, "-class hides the KVO subclass");
     assert_ne!(after, cls, "object_getClass does not");
 
-    // 2. `owning_class` walks through the notifying subclass to the definer.
     // SAFETY: `after` is a live class object.
     assert_eq!(unsafe { owning_class(after, sel!(probeValue)) }, Some(cls));
 
-    // 3. The patch still runs through the swapped isa.
     assert_eq!(probe_value(obj), 2);
 
-    // 4. Re-installing through the notifying subclass is the idempotent path
-    //    (the row identity is the owner's) and must not publish our own
-    //    implementation as the original.
     // SAFETY: as above.
     let again = unsafe { SITE.install(after, sel!(probeValue), patched_probe) };
     assert!(

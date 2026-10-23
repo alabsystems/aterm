@@ -1,51 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every corpus case the two engines do not agree on, with its triage, and
-//! the answer aterm must give on it instead.
-//!
-//! Each divergence the oracle finds is one of three things:
-//!
-//! - **an aterm bug**: fixed in aterm with a regression test beside the fix,
-//!   and the case stays in the corpus (the `Regression:` comments in
-//!   `corpus.rs`). Those found so far: a refused SGR 38/48/58 colour
-//!   re-dispatched its tail, DECSEL/DECSED erased to the default background,
-//!   RI kept the pending wrap at the top margin and left a one-row screen
-//!   standing, a `?47`/`?1047` switch left the incoming buffer's BCE
-//!   background stale, and `CSI 0 T` (xterm's highlight mouse tracking)
-//!   scrolled. The pinned fold models each of those behaviours, so
-//!   each case is held to agree with it byte by byte.
-//! - **an astream-term gap** ([`Triage::Astream`]): the fold lacks an xterm
-//!   behaviour, and an astream branch (the entry names it) adds it. The aterm
-//!   pin is not moved by the change that finds the gap; whoever lands that
-//!   branch on astream's main bumps it. Until then the case must still
-//!   diverge, AND aterm's screen after its last byte must be the entry's
-//!   [`Want`]: xterm's answer, written out, and the answer the fold on that
-//!   branch gives. So an excluded case still checks aterm while the fold
-//!   cannot: a regression to the fold's wrong answer fails the written
-//!   answer, and the engines agreeing while the fold's [`Caps`] probe has not
-//!   moved is read the same way, never as a stale entry. Once the pin carries
-//!   the fix (the probe flips) the entry, written answer and all, must be
-//!   deleted, and the case is held to agree byte by byte. None is open at
-//!   this pin: the thirty the oracle's first run found (VT/FF, erases at a
-//!   pending wrap, ED 3, BCE on a scroll, ICH/DCH/ECH/IL/DL, IND/NEL/RI, the
-//!   alternate-screen rules, the DECSC pen and UTF-8 maximal subparts) came
-//!   with astream's `fix/term-oracle-divergences` (astream main 4e91e82) and
-//!   were deleted in the bump that pinned it.
-//! - **a deliberate difference** ([`Triage::ByDesign`]): the engines differ on
-//!   purpose; the entry says why, against xterm, and its written answer pins
-//!   aterm's side. It must keep diverging while its condition holds.
-//!
-//! `the_corpus_agrees_or_is_excluded` fails on a stale entry, on a case that
-//! diverges unexcused, and on aterm missing an entry's written answer.
+//! Corpus exclusions where the two VT engines diverge, with triage and expected `aterm` output.
 
 use super::caps::Caps;
 use super::engines::{Ink, Snap};
 
 pub enum Triage {
-    /// The pinned fold lacks the behaviour; astream's `branch` adds it.
-    /// `fixed` reads the capability off the fold: false while the case must
-    /// diverge, true once the pin carries the fix (and the entry must go).
+    /// The pinned fold lacks the behaviour and `branch` adds it; `fixed` reports whether the pin carries the fix.
     #[expect(
         dead_code,
         reason = "no astream-term gap is open at this pin; the next one the oracle \
@@ -55,14 +17,11 @@ pub enum Triage {
         branch: &'static str,
         fixed: fn(&Caps) -> bool,
     },
-    /// The engines differ by design; `diverges` says when the difference is
-    /// visible with this fold.
+    /// The engines differ by design when `diverges` holds on the fold.
     ByDesign { diverges: fn(&Caps) -> bool },
 }
 
-/// aterm's screen after an excluded case's last byte, written out by hand
-/// from xterm's source (the entry's `why` cites it), in the oracle's
-/// projection ([`Snap`]).
+/// Expected `aterm` screen state after an excluded case's last byte, in [`Snap`] projection.
 pub struct Want {
     /// Each row's text, trailing blanks trimmed; rows past the list are blank.
     pub rows: &'static [&'static str],
@@ -70,14 +29,12 @@ pub struct Want {
     pub cursor: (u16, u16),
     /// The alternate screen is up.
     pub alt: bool,
-    /// Every run of cells whose rendition is not [`Ink::PLAIN`], as
-    /// `(row, first col, past the last col, ink)`; every other cell is plain.
+    /// Non-[`Ink::PLAIN`] cell rendition runs as `(row, first col, past last col, ink)`.
     pub inks: &'static [(u16, u16, u16, Ink)],
 }
 
 impl Want {
-    /// The first way `snap` misses this answer, in words; `None` when it
-    /// gives it exactly.
+    /// Returns the first mismatch between `snap` and this expected state, or `None` when they match.
     pub fn missed_by(&self, snap: &Snap) -> Option<String> {
         for r in 0..snap.rows {
             let want = self.rows.get(usize::from(r)).copied().unwrap_or("");
@@ -125,7 +82,6 @@ pub struct Exclusion {
     pub why: &'static str,
 }
 
-/// A [`Want`] with no rendition but the default pen on the main screen.
 const fn text(rows: &'static [&'static str], cursor: (u16, u16)) -> Want {
     Want {
         rows,

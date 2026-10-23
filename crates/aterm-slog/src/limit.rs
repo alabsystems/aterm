@@ -107,7 +107,7 @@ impl Owed {
     }
 }
 
-/// One session's mark limiter (see the module doc).
+/// One session's mark limiter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkLimiter {
     harness: Bucket,

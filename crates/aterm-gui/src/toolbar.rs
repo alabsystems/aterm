@@ -42,7 +42,7 @@ pub(crate) fn busy_spinner_title_parts(title: &str) -> Option<(char, &str)> {
 }
 
 #[must_use]
-fn is_busy_spinner_frame(ch: char) -> bool {
+const fn is_busy_spinner_frame(ch: char) -> bool {
     matches!(
         ch,
         '\u{280b}'
@@ -914,7 +914,7 @@ mod macos {
     }
 
     /// `[x, y, w, h]` (the point-space layout arrays) as an AppKit rect.
-    fn rect_of([x, y, w, h]: [f64; 4]) -> CGRect {
+    const fn rect_of([x, y, w, h]: [f64; 4]) -> CGRect {
         rect(x, y, w.max(0.0), h.max(0.0))
     }
 
@@ -2364,6 +2364,7 @@ mod macos {
                             }
                             TabIconPrimitive::Triangle { points } => {
                                 // No app icon uses a filled triangle yet; the IR walk
+                                // stays total.
                                 appkit::send_v(polygon(&points.map(at)), sel!(fill));
                             }
                         }
@@ -3801,6 +3802,7 @@ mod macos {
             tab.set_geometry(metrics.geometry(i, n, active, cx));
             if reframe {
                 // `set_geometry` re-lays only when the geometry itself moved; a new
+                // width with the same centre line still needs the content re-placed.
                 tab.relayout();
             }
         }

@@ -403,6 +403,7 @@ impl CpuFrameBuffer for MacCpuFrame<'_> {
     type Error = MacPresentError;
 
     fn age(&self) -> u8 {
+        // Always 0: each acquisition is a fresh zeroed allocation never on
         // screen, which keeps the frontend on its full-copy branch.
         0
     }
@@ -412,6 +413,8 @@ impl CpuFrameBuffer for MacCpuFrame<'_> {
     }
 
     fn present_with_damage(self, _damage: &[DamageRect]) -> Result<(), Self::Error> {
+        // `contents` is a whole-image property, so the damage list cannot bound
+        // the work; commit the same pixels `present` would (over-claiming damage
         // is safe). Unreachable in practice because `age()` is 0.
         self.commit()
     }

@@ -287,7 +287,7 @@ mod macos {
 
     impl PasteConfirm {
         /// Record a just-presented sheet.
-        pub(crate) fn new(
+        pub(crate) const fn new(
             id: u64,
             wid: crate::WindowId,
             parent: Obj,

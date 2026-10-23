@@ -348,6 +348,8 @@ fn startup_authority_decision(
 }
 
 fn take_reexec_nonce() -> Option<std::ffi::OsString> {
+    // Apply runs before any thread spawns. Read and clear are one critical section
+    // (`aterm_log::env::take`), before any codesign/spctl helper can launch, so the
     // one-shot authority, even a malformed one, is observed once.
     aterm_log::env::take("ATERM_UPDATE_REEXEC")
 }
@@ -506,6 +508,7 @@ fn boot_sentinel(staging: &Staging) -> Sentinel {
 }
 
 fn foreign_trial_counter(staging: &Staging) -> Sentinel {
+    // Ordered: an older count after a power loss restarts the escape budget, which is
     // the conservative direction.
     Sentinel::ordered(foreign_trial_path(staging))
 }
@@ -770,6 +773,8 @@ fn window_trial_wait_notice(build: u64, until: u64) -> String {
 
 /// The trial of `build` waiting for a window, as `update status` says it ([`window_trial_wait_notice`]), or `None` when it is not waiting.
 pub(crate) fn window_trial_wait_at(staging: &Staging, build: u64, now: u64) -> Option<String> {
+    // Armed as the confirmation reads it ([`trial_armed_for`]): a trial whose
+    // sentinel does not read but whose identity names the build is retried, so its
     // refusal is said too.
     if trial_armed_for(staging, build) {
         let ledger = crate::health::Health::read(&staging.health());
@@ -1208,6 +1213,9 @@ fn recover_abandoned_preswap_trial_if_exact(
     if ready.as_ref().is_some_and(|ready| {
         ready_matches_verified_identity(ready, candidate_build, &candidate_commit)
     }) {
+        // Cross-volume staging copies staged_app -> fixed and keeps the staged copy,
+        // so when the staged bundle already carries the exact candidate identity the
+        // fixed twin is redundant: reclaim it and keep the publication (renaming
         // back would fail EXDEV on every external-volume install).
         if verified_bundle_identity(&staging.staged_app)
             .is_ok_and(|(build, commit)| build == candidate_build && commit == candidate_commit)
@@ -1249,6 +1257,7 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
         return false;
     }
     if !matches!(counter_state, Some((build, _)) if build == armed_build) {
+        // A different armed build than the one we were counting (or none yet):
         // start this build's budget from zero rather than inheriting it.
         let _ = counter.arm(armed_build);
     }
@@ -2365,6 +2374,7 @@ fn preverify_installed_rollback_source_with(
     verify: &IdentityReader,
 ) -> Result<(), String> {
     let Some(installed) = installed else {
+        // A handoff whose successor's swap is a no-op can only end as a wrong-build
         // refusal, so say so now.
         return Err(
             "this process does not run from an installed bundle the updater may replace, so a \
@@ -2691,6 +2701,7 @@ impl StageIncoming {
 
 impl Drop for StageIncoming {
     fn drop(&mut self) {
+        // Only an EMPTY reservation can go. A retained candidate keeps its exact
         // path even after this stage returns; there is no assessment-end receipt.
         let _ = std::fs::remove_dir(&self.path);
     }
@@ -3020,6 +3031,8 @@ fn checked_zip_extraction_claim(zip: &Path) -> Result<ZipExtractClaim, String> {
             zip64
         }
         None => {
+            // A sentinel with no ZIP64 record behind it is a shape this reader cannot
+            // describe: a refusal, since the saturated field is the one the cap is
             // measured against.
             if classic.entries == u64::from(u16::MAX)
                 || classic.size == u64::from(u32::MAX)
@@ -3669,6 +3682,9 @@ fn swap_admitted_stage(
     let previous_receipt = previous_receipt_for_sealed_old(staging, old_build, &old_commit);
 
     if let Err(error) = (seams.probe)(&prepared.fixed, ready.build_number) {
+        // A probe that started the candidate and was killed before it exited leaves
+        // macOS assessing its first exec, which the kill does not end: the candidate
+        // stays exactly where it ran ([`keep_unproven_candidate`]). Any other failure
         // either ran it to an exit or never started it, and is backed out as before.
         if probe_left_unproven(&error) {
             keep_unproven_candidate(&prepared, staging, unix_now_secs());
@@ -4083,6 +4099,7 @@ fn check_boot_health_with_proof(
             );
         }
         Err(error) => {
+            // Within budget: the proof may recover on a later boot (a transient
             // read failure, a receipt being rewritten), so keep the trial armed.
             if !sentinel.should_revert(current_build, MAX_BOOT_ATTEMPTS) {
                 return Some(ApplyOutcome::Deferred(format!(
@@ -4136,6 +4153,7 @@ fn check_boot_health_with_proof(
         }
     };
     if !sentinel.should_revert(current_build, MAX_BOOT_ATTEMPTS) {
+        // An unconfirmed trial owns the fixed rollback path. Do not fall through
         // into another apply transaction that could overwrite its sole OLD copy.
         return Some(ApplyOutcome::NotApplicable);
     }
@@ -5257,6 +5275,8 @@ fn confirm_boot_health_at_with_proof(
     lock_wait: std::time::Duration,
     prove: impl FnOnce(&Path) -> Result<(), String>,
 ) -> bool {
+    // No trial armed for this build: already complete. A different build's marker is
+    // not ours to retry or mutate. An unreadable marker of this build's trial is
     // still its trial (`trial_armed_for`).
     if !trial_armed_for(staging, current_build) {
         return true;

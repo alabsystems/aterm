@@ -106,7 +106,7 @@ pub(crate) enum MenuRow {
 impl MenuRow {
     /// Whether a click or Return can choose this row.
     #[must_use]
-    pub(crate) fn selectable(&self) -> bool {
+    pub(crate) const fn selectable(&self) -> bool {
         matches!(self, Self::Item { enabled: true, .. })
     }
 
@@ -499,7 +499,7 @@ pub(crate) fn place(
 
 /// Index into `rows` at `frame_row`, or `None` on a border or past truncation.
 #[must_use]
-pub(crate) fn row_at(rect: MenuRect, frame_row: usize) -> Option<usize> {
+pub(crate) const fn row_at(rect: MenuRect, frame_row: usize) -> Option<usize> {
     if frame_row <= rect.row || frame_row + 1 >= rect.row + rect.h {
         return None;
     }
@@ -555,7 +555,7 @@ pub(crate) enum MenuKey {
 
 /// Classify `key` for an open menu.
 #[must_use]
-pub(crate) fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
+pub(crate) const fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
     use aterm_types::keyboard::{Key, NamedKey as Nk};
     if aterm_types::keyboard::is_modifier_or_lock_key(key) {
         return MenuKey::Inert;
@@ -709,7 +709,7 @@ pub(crate) struct PointerRest {
 
 impl PointerRest {
     /// Initial pointer state when the menu opens.
-    pub(crate) fn at_open(px: Option<(f64, f64)>) -> Self {
+    pub(crate) const fn at_open(px: Option<(f64, f64)>) -> Self {
         Self {
             px,
             frame_row: None,
@@ -1582,7 +1582,7 @@ impl App {
 }
 
 #[cfg(a11y_tree)]
-fn shown_rows(rect: MenuRect) -> usize {
+const fn shown_rows(rect: MenuRect) -> usize {
     rect.h.saturating_sub(2)
 }
 

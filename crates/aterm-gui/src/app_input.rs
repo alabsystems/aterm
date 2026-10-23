@@ -163,7 +163,7 @@ pub(crate) struct DeliveryTicket {
 }
 
 impl DeliveryTicket {
-    fn is_empty(self) -> bool {
+    const fn is_empty(self) -> bool {
         self.insert.is_none() && self.key.is_none()
     }
 }
@@ -199,7 +199,7 @@ pub(crate) struct Deliveries {
 
 impl Deliveries {
     /// Nothing to apply, read up to `latest`.
-    fn none_after(latest: u64) -> Self {
+    const fn none_after(latest: u64) -> Self {
         Self {
             latest,
             items: [None; DELIVERY_RING],
@@ -236,7 +236,7 @@ impl Default for OutputEchoPublished {
 
 impl OutputEchoPublished {
     /// Write `receipt` at the ring's head, the oldest slot.
-    fn push_receipt(&mut self, receipt: DeliveryReceipt) {
+    const fn push_receipt(&mut self, receipt: DeliveryReceipt) {
         let head = self.delivery_head;
         self.deliveries[head] = Some(receipt);
         self.delivery_head = (head + 1) % DELIVERY_RING;
@@ -267,7 +267,7 @@ pub(crate) struct OutputEchoSample {
 
 impl OutputEchoSample {
     /// The facts prism wake's licence reads.
-    pub(crate) fn streak(self) -> aterm_effects::pipeline::StreakEcho {
+    pub(crate) const fn streak(self) -> aterm_effects::pipeline::StreakEcho {
         aterm_effects::pipeline::StreakEcho {
             boundary_at: self.last_boundary_at,
             accepted_at: self.last_accepted_at,
@@ -570,6 +570,8 @@ impl OutputEchoTracker {
 impl OutputEchoWrite<'_> {
     /// Complete with the seam's narrow receipt.
     fn finish(mut self, receipt: input::EgressReceipt, sink: &SinkWriter) {
+        // THE SUBMISSION COUNT, at the write's full acceptance: before the
+        // program can have read it, so a screen that shows its answer is read
         // before a count that holds it.
         if receipt.fully_accepted_nonempty() {
             self.tracker.submit.accepted(self.submit);
@@ -753,7 +755,9 @@ pub(crate) fn keystroke_click_audible(
 /// What kind of glyph the key landed, for Rainbow Kitty's engine
 /// ([`aterm_effects::rainbow_kitty::TypedClass`]).
 #[inline]
-pub(crate) fn typed_class_for(typed: Option<char>) -> aterm_effects::rainbow_kitty::TypedClass {
+pub(crate) const fn typed_class_for(
+    typed: Option<char>,
+) -> aterm_effects::rainbow_kitty::TypedClass {
     use aterm_effects::rainbow_kitty::TypedClass;
     match typed {
         Some(' ') => TypedClass::Space,
@@ -765,7 +769,7 @@ pub(crate) fn typed_class_for(typed: Option<char>) -> aterm_effects::rainbow_kit
 
 /// The synth's glyph class ([`aterm_effects::trail_sound::EventMeta::glyph_class`]).
 #[inline]
-pub(crate) fn typed_glyph_class(typed: Option<char>) -> u8 {
+pub(crate) const fn typed_glyph_class(typed: Option<char>) -> u8 {
     aterm_effects::trail_sound::typed_glyph_class(typed)
 }
 
@@ -816,14 +820,14 @@ fn key_sound_at_ms() -> u32 {
 
 /// The synth's glyph rank ([`aterm_effects::trail_sound::EventMeta::rank`]).
 #[inline]
-pub(crate) fn typed_glyph_rank(typed: Option<char>) -> u8 {
+pub(crate) const fn typed_glyph_rank(typed: Option<char>) -> u8 {
     aterm_effects::trail_sound::typed_glyph_rank(typed)
 }
 
 /// Whether an input event carries fresh, discrete intent that may start one new bounded
 /// presentation-recovery episode.
 #[inline]
-pub(crate) fn is_present_recovery_stimulus(ev: &InputEvent) -> bool {
+pub(crate) const fn is_present_recovery_stimulus(ev: &InputEvent) -> bool {
     !matches!(
         ev,
         InputEvent::Key {
@@ -889,7 +893,7 @@ pub(crate) fn take_physical_release_trace() -> Option<PhysicalReleaseTrace> {
 
 /// Compatibility `open prefs|about|update` spellings resolve to durable routes in the
 /// process-singleton Settings tab.
-fn native_settings_route_for_aux(
+const fn native_settings_route_for_aux(
     target: crate::app_introspect::AuxTarget,
 ) -> Option<crate::native_settings::SettingsRoute> {
     use crate::app_introspect::AuxTarget;
@@ -1015,7 +1019,7 @@ pub(crate) mod paste_order {
     }
 
     impl Budget {
-        fn new(limits: Limits) -> Self {
+        const fn new(limits: Limits) -> Self {
             Self {
                 used: AtomicU64::new(0),
                 limits,
@@ -1064,7 +1068,7 @@ pub(crate) mod paste_order {
         }
 
         /// Whether a charge of `bytes` fits this queue at all, however empty.
-        fn could_ever_hold(&self, bytes: u32, paste: bool) -> bool {
+        const fn could_ever_hold(&self, bytes: u32, paste: bool) -> bool {
             bytes
                 <= if paste {
                     self.limits.paste_bytes
@@ -1115,6 +1119,7 @@ pub(crate) mod paste_order {
 
     impl Drop for Reservation {
         fn drop(&mut self) {
+            // A receiver can unwind with accepted jobs still queued. Their
             // watches must finish too; preserve an already published verdict.
             if let Some(meter) = &self.meter
                 && matches!(
@@ -1324,6 +1329,8 @@ pub(crate) mod paste_order {
             && let Some(wake) = completed_queued_key_wake(receipt, Some(session))
             && let Some(proxy) = proxy
         {
+            // Reconsider a content frame already deferred at the full,
+            // pre-key interval. A spill merely retires its FIFO job and
             // preserves the original bounded arrival-time priority.
             let _ = proxy.send_event(wake);
         }
@@ -1562,7 +1569,11 @@ pub(crate) mod paste_order {
         sink: &Arc<SinkWriter>,
         limits: Limits,
     ) -> Option<(SyncSender<Job>, Arc<Budget>)> {
-        if let Some(s) = reg.get(&master) {
+        // A slot filed for another sink is one whose borrowed fd closed while it lived on, the
+        // number since reused: this sink takes the number over.
+        if let Some(s) = reg.get(&master)
+            && std::ptr::eq(s.sink.as_ptr(), Arc::as_ptr(sink))
+        {
             return Some((s.tx.clone(), Arc::clone(&s.budget)));
         }
         let (tx, rx) = sync_channel::<Job>(limits.jobs as usize);
@@ -1572,6 +1583,9 @@ pub(crate) mod paste_order {
             "aterm-egress-order",
             crate::qos::Role::Interactive,
             move || {
+                // macOS: this thread does the real PTY write for keys the UI thread
+                // handed off (`enqueue` transfers the key-arrival stamp), so it takes
+                // the UI thread's urgency rather than default QoS, or a key queued
                 // behind a paste would wait on an E-core-parked thread.
                 run(rx, weak_sink, Duration::from_secs(30));
             },
@@ -1806,8 +1820,8 @@ pub(crate) mod paste_order {
         )
     }
 
-    /// [`ordered_or_inline`] with the platform's routing fact explicit, so the Windows arm — every
-    /// key through the writer.
+    /// [`ordered_or_inline`] with the platform's routing fact explicit, so the
+    /// Windows arm — every key through the writer — runs under test on unix.
     #[allow(
         clippy::too_many_arguments,
         reason = "ordered_or_inline's handles plus the one routing fact it is parameterised on"
@@ -1939,8 +1953,9 @@ pub(crate) mod paste_order {
         report_ordered_or_inline_routed(ui_writes_can_block(), term, modes, sink, ev)
     }
 
-    /// [`report_ordered_or_inline`] with the platform's routing fact explicit, so the Windows arm —
-    /// every report through the writer.
+    /// [`report_ordered_or_inline`] with the platform's routing fact explicit,
+    /// so the Windows arm — every report through the writer — runs under test
+    /// on unix.
     pub(super) fn report_ordered_or_inline_routed(
         ui_writes_can_block: bool,
         term: &Arc<Mutex<Terminal>>,
@@ -2138,7 +2153,7 @@ mod ime_commit_paste_tests;
 mod paste_order_sink_isolation_tests;
 
 /// Map the seam's [`input::Egress`] to the reply-bearing [`InputOutcome`].
-fn egress_to_outcome(e: input::Egress) -> InputOutcome {
+const fn egress_to_outcome(e: input::Egress) -> InputOutcome {
     match e {
         input::Egress::Reported(input::Delivery::Full) | input::Egress::TrackingOff { .. } => {
             InputOutcome::Ok
@@ -2355,12 +2370,12 @@ fn field_edit_for(stroke: FieldStroke<'_>) -> Option<crate::app_search::SearchEd
 }
 
 /// A ⌘ (Super) chord on a character key.
-fn overlay_command_chord(mods: ModifiersState, ev: &KeyEvent) -> bool {
+const fn overlay_command_chord(mods: ModifiersState, ev: &KeyEvent) -> bool {
     mods.super_key() && matches!(ev.logical_key, Key::Character(_))
 }
 
 /// Whether this is a bare modifier press.
-fn is_bare_modifier_key(key: &Key) -> bool {
+const fn is_bare_modifier_key(key: &Key) -> bool {
     matches!(
         key,
         Key::Named(
@@ -2385,7 +2400,9 @@ fn is_bare_modifier_key(key: &Key) -> bool {
 pub(crate) const HARDCODED_SUPER_CHORDS: bool = !cfg!(target_os = "linux");
 
 /// The default scrollback chord, if any.
-fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent> {
+const fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent> {
+    // ⌘↓ jumps to the live bottom and ⌘↑ to the oldest retained line, a way back to
+    // live without typing. Routed as a `ScrollIntent` like the other scrollback
     // chords, so the selection survives.
     if HARDCODED_SUPER_CHORDS
         && mods.super_key()
@@ -2440,7 +2457,7 @@ fn tab_menu_chord(
 
 /// Whether an open find field suspends a configured `[keybindings]` action so the keystroke drives
 /// the query.
-fn find_suspends_action(action: keybinding::Action) -> bool {
+const fn find_suspends_action(action: keybinding::Action) -> bool {
     use keybinding::Action as A;
     matches!(
         action,
@@ -2504,6 +2521,7 @@ fn font_zoom_repeat_action(
     mods: ModifiersState,
     ev: &KeyEvent,
 ) -> Option<crate::FontZoomRepeatAction> {
+    // Part of the hardcoded Cmd suite: off Linux only (the seeded `ctrl+=` /
     // `ctrl+-` / `ctrl+0` keybindings are the zoom chords there).
     if !HARDCODED_SUPER_CHORDS || !mods.super_key() {
         return None;
@@ -2555,7 +2573,7 @@ fn sampled_release_relevance(session: u64) -> Option<bool> {
 
 /// Mints a fresh App-wide kitty-summon ident: bump the shared sequence first, then namespace the
 /// value under `tag`.
-fn next_kitty_summon_ident(seq: &mut u64, tag: u64) -> u64 {
+const fn next_kitty_summon_ident(seq: &mut u64, tag: u64) -> u64 {
     *seq = seq.wrapping_add(1);
     tag ^ *seq
 }
@@ -2602,6 +2620,7 @@ fn committed_text_moves_cursor(text: &str) -> bool {
 
 /// Exact terminal-cell advance of one committed Text/IME event.
 fn committed_text_cells(text: &str, ambiguous_width_double: bool) -> u16 {
+    // A base-less run of combining marks, selectors or joiners does not advance the
     // terminal, even if the classifier groups it into an emoji-shaped cluster.
     if aterm_grapheme::str_width(text) == 0 {
         return 0;
@@ -2614,7 +2633,9 @@ fn committed_text_cells(text: &str, ambiguous_width_double: bool) -> u16 {
 }
 
 /// The terminal's ambiguous-width setting (single, or the CJK double).
-fn ambiguous_width(ambiguous_width_double: bool) -> aterm_types::text_shaping::AmbiguousWidth {
+const fn ambiguous_width(
+    ambiguous_width_double: bool,
+) -> aterm_types::text_shaping::AmbiguousWidth {
     use aterm_types::text_shaping::AmbiguousWidth;
 
     if ambiguous_width_double {
@@ -3044,6 +3065,7 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     } else if navigation_key || tab_key {
         Some(PetInputKind::Navigate)
     } else if typed.is_some() || ime.is_some() {
+        // A committed IME bundle is one event, including a combining-only
         // edit that changes a glyph without moving the caret.
         Some(PetInputKind::Text)
     } else {
@@ -3168,7 +3190,7 @@ pub(crate) enum PressKind {
 
 impl PressKind {
     /// Resolves the three overlapping press bits into one kind, in the priority on [`PressKind`].
-    pub(crate) fn of(is_release: bool, is_repeat: bool, inert_modifier: bool) -> Self {
+    pub(crate) const fn of(is_release: bool, is_repeat: bool, inert_modifier: bool) -> Self {
         if is_release {
             Self::Release
         } else if is_repeat {
@@ -3181,7 +3203,7 @@ impl PressKind {
     }
 
     /// Whether this press may disturb the user's reading position.
-    pub(crate) fn disturbs(self) -> bool {
+    pub(crate) const fn disturbs(self) -> bool {
         matches!(self, Self::Typing)
     }
 }
@@ -3283,7 +3305,7 @@ pub(crate) fn note_press_custody(t: &mut Terminal, kind: PressKind) {
 }
 
 /// The `PressCustody` transition a press class is.
-fn press_transition(kind: PressKind) -> CustodyTransition {
+const fn press_transition(kind: PressKind) -> CustodyTransition {
     match kind {
         PressKind::Typing => CustodyTransition::TypingPress,
         PressKind::Repeat => CustodyTransition::RepeatPress,
@@ -3350,7 +3372,7 @@ struct TrickPress<'ev> {
 
 impl TrickPress<'_> {
     /// ⌃U, the one kill the listener reads as a line reset.
-    fn kills_line(self) -> bool {
+    const fn kills_line(self) -> bool {
         self.kill_key && self.kill_moves && !self.kill_word
     }
 
@@ -3408,6 +3430,7 @@ fn feed_trick_listener<'w>(
         return listener.note_line_reset();
     }
     if press.job_chord {
+        // The price of never resetting a poisoned line: after Esc in an editor
         // ⌃Z backgrounds, the prompt stays deaf until Enter, ⌃C or ⌃U.
         return listener.note_job_chord();
     }
@@ -3455,7 +3478,7 @@ pub(crate) enum TrickLineFire {
 
 impl TrickLineFire {
     /// This memory as it stands for a press that went to `session`.
-    fn for_session(self, session: u64) -> Self {
+    const fn for_session(self, session: u64) -> Self {
         match self {
             Self::Admitted { session: on, .. } | Self::Withheld { session: on }
                 if on != session =>
@@ -4160,6 +4183,7 @@ impl App {
         if is_present_recovery_stimulus(&ev)
             && let Some(ws) = self.windows.get_mut(&wid)
         {
+            // In no-echo or app-owned-keyboard modes this input may produce no pixel
             // and no PTY output, so the recovery edge drives its attempt itself.
             ws.rearm_present(false);
         }
@@ -4197,6 +4221,9 @@ impl App {
                     if matches!(event_type, aterm_types::keyboard::KeyEventType::Release)
             );
             if !untracked_release {
+                // Record a press the overlay consumes so its release (possibly after the
+                // overlay closes) is swallowed above. Presses only: a repeat of a
+                // pre-overlay press must not poison the pairing (as in
                 // `note_consumed_press`).
                 if let InputEvent::Key {
                     key, event_type, ..
@@ -4302,6 +4329,14 @@ impl App {
                     })
                 });
             let Some(presented) = presented else {
+                // The hidden seam carries the keyboard and paste payloads it
+                // was built for. A pinned control request whose session left
+                // the front between its check and now (`control::InputRoute`)
+                // can also carry a view-bound gesture: focus, pointer, viewport
+                // scroll or geometry. With no view of the session there is
+                // nothing for it to act on, so it is dropped rather than
+                // retargeted to whatever the window shows now, and rather
+                // than being classed a typing press that snaps and deselects
                 // the hidden session.
                 if !matches!(
                     ev,
@@ -4430,6 +4465,8 @@ impl App {
                 let mut swallowed_press = false;
                 let mut composer_newline = false;
                 if let Some(input_now) = input_now {
+                    // A bare modifier is inert and leaves the blink phase alone. Gated on
+                    // `inert_modifier` only, not on disturbing: an auto-repeat tick is a
                     // key still held, and the cursor stays solid for the whole hold.
                     if !inert_modifier {
                         self.reset_blink(wid);
@@ -4626,6 +4663,10 @@ impl App {
                             && (!enter_like || shift_enter_insert)
                             && !tty_swallows;
                         if typed_forward != Some(false) && !inert_modifier && !prices_typed_glyphs {
+                            // Any other press closes the memory, since a later Backspace
+                            // erases something this dispatch did not price. A typed press
+                            // keeps it and appends its widths, so the memory is the row's
+                            // erasable tail in order: `abc`, paste `yz`, `d`, ⌫⌫⌫⌫ retires
                             // `d`, nothing for `z`, nothing for `y`, then `c`.
                             ws.erase_prices.clear();
                         }
@@ -4646,6 +4687,7 @@ impl App {
                                 aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S,
                             );
                             if tty_swallows {
+                                // The tally is the only trace of a withheld press; taken
                                 // below once the write has landed.
                                 swallowed_press = true;
                             } else {
@@ -4725,6 +4767,8 @@ impl App {
                             && click_audible
                             && ws.fx.cursor_mut().glow.cue_modifier(input_now)
                         {
+                            // `take_key_cue` pops the lift whether or not it can be
+                            // delivered, which is the drop policy: an undeliverable
                             // lift must not be replayed stale by the next drain.
                             if let (Some(synth), Some(cue)) =
                                 (click_synth.as_ref(), ws.fx.cursor_mut().glow.take_key_cue())
@@ -4734,6 +4778,10 @@ impl App {
                             }
                         }
                         if kill_key {
+                            // The companion's delete "oops" fires for span kills too
+                            // (Ctrl-K/U/W, Alt-D, forward Delete, word-backspace): they
+                            // erase text as surely as Backspace. Paid only while the
+                            // kitty cursor is enabled or a companion is live; `on_kill`
                             // never summons.
                             if kitty_cursor_enabled || ws.fx.companions_mut().cursor_cat.is_active()
                             {
@@ -4848,6 +4896,7 @@ impl App {
                         ),
                     )) = act.zip(sample)
                     {
+                        // Split panes predict too: `sync_window` resets the predictor
                         // when the focused pane or tab changes.
                         if let Some(ws) = self.windows.get_mut(&wid) {
                             let now = input_now;
@@ -4865,9 +4914,18 @@ impl App {
                                 }
                             };
                             if no_echo || tty_swallows || edit_swallowed {
+                                // A no-echo press arms nothing, but it is still sent,
+                                // and the program may echo it after all: an app can
+                                // leave the alternate screen before it reads the key,
+                                // and the shell behind it then echoes it on the main
+                                // screen. Unmodelled input owes that echo, so it
+                                // cannot prove a later guess for the same glyph, and
+                                // the flush is the stale-epoch hardening (a confirmed
+                                // epoch from before entering the app must not let the
                                 // first keystroke back on that row display).
                                 ws.predictor.note_unmodelled_input(now);
                             } else if chord_arrow {
+                                // A modified arrow (a lock in Kitty's modifier byte):
                                 // routed as an arrow was before predictive editing.
                                 ws.predictor.note_unmodelled_input(now);
                             } else {
@@ -4939,6 +4997,7 @@ impl App {
                             word: kill_word,
                         })
                     } else if (tab_key || paste_chord_key) && !tty_swallows {
+                        // The gesture half follows the tty's verdict too: a queued Tab
                         // the kernel will not echo re-stamps nothing at delivery.
                         Some(DeliveredClass::Gesture)
                     } else {
@@ -5035,6 +5094,8 @@ impl App {
                         .unwrap_or_default();
                     let summoned = match self.windows.get_mut(&wid) {
                         Some(ws) => {
+                            // The typed-edit witness (above), armed first: edits only
+                            // (walking the caret over a word is not retyping it), scoped to
                             // this pane's session so it never re-arms another pane.
                             if typed_forward.is_some() || kill_key {
                                 ws.fx.decos_mut().note_typed_edit(wire_at, Some(session));
@@ -5115,6 +5176,9 @@ impl App {
                                             TrickLineFire::Withheld { session }
                                         };
                                         if admitted {
+                                            // The flash, best-effort: it needs a running
+                                            // word engine to find the word. Noted now,
+                                            // before the boundary key's echo is scanned,
                                             // in the key's pane, stamped against the wire.
                                             if flash_on {
                                                 ws.fx.decos_mut().note_trick_typed(
@@ -5128,6 +5192,10 @@ impl App {
                                         }
                                     }
                                     Some(TrickEvent::Confirm { trick }) => {
+                                        // Only an admitted fire can be confirmed into the
+                                        // pet: a withheld one (ignored word, feature off)
+                                        // must not latch by the back door, nor an admitted
+                                        // one whose gate closed since (a config reload
                                         // mid-line). The gate is read at every event.
                                         if live
                                             && let TrickLineFire::Admitted { .. } = ws.trick_fire
@@ -5181,6 +5249,8 @@ impl App {
                     unreachable!()
                 };
                 if let Some(ws) = self.windows.get_mut(&wid) {
+                    // `last_mouse_cell` is the pane-local cell `on_cursor_moved` already
+                    // published; do not overwrite it with this event's window
                     // coordinates, since a follow-up press or wheel reads it.
                     ws.last_mouse_side = side;
                 }
@@ -5208,6 +5278,7 @@ impl App {
                 self.input_wheel(wid, session, &ev, &term, &modes, &sink)
             }
             InputEvent::ScrollView(intent) => {
+                // Toward history: a person reaching for scrollback that a rewrap
                 // has detached is waiting on it.
                 if matches!(
                     intent,
@@ -5219,6 +5290,9 @@ impl App {
                 self.input_scroll_view(wid, intent, &term)
             }
             ev @ InputEvent::Paste(..) => {
+                // A paste is typing for the cursor-effect wake (the text lands at
+                // the caret and the cursor walks it), so it stamps `last_key_at` as
+                // the key arms do, or `ctl paste` into an unfocused window would
                 // paint nothing.
                 if let Some(now) = input_now
                     && let Some(ws) = self.windows.get_mut(&wid)
@@ -5324,6 +5398,9 @@ impl App {
             if pressed {
                 self.seam_left_press(wid, row, col, click_count, block);
             } else if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
+                // The release carries the copy-on-select policy: a scoped-edge-injected
+                // gesture (`suppress_copy_on_select == true`) completes the selection
+                // without copying to the clipboard. Human and Owner gestures carry
                 // `false`.
                 self.finish_selection(wid, suppress_copy_on_select);
             }
@@ -5375,6 +5452,7 @@ impl App {
             let detent = matches!(ev, InputEvent::Wheel { detent: true, .. });
             let lines = wheel_viewport_lines(wheel_lines, viewport.rows, detent);
             if lines != 0 {
+                // Toward history: a person reaching for scrollback a rewrap has
                 // detached is waiting on it.
                 if wheel_up {
                     self.note_history_wanted(session);
@@ -5400,6 +5478,7 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.wheel_precise_px.is_some())
         {
+            // The seam reported the delta (an app tracks the mouse, or DEC 1007 alt
             // scroll), so a band still tracking the finger settles to its row now.
             self.release_scroll_track(wid);
         }
@@ -5479,6 +5558,7 @@ impl App {
                 term.scroll_display(step);
                 let landed = i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX);
                 if landed == current {
+                    // The terminal's live clamp is authoritative if its history
                     // changed between the bound read above and the scroll.
                     break;
                 }
@@ -5626,6 +5706,12 @@ impl App {
         };
         let tick_interval = ws.frame_interval.unwrap_or(app_interval);
         if let Some(dy_px) = precise {
+            // Direct manipulation: the band goes where the finger is. A fresh gesture
+            // parks a tracked glide at the engine's real row; a chained delta
+            // continues whatever is armed from its current sample. The clamp applies
+            // on every delta and its excess releases or stacks the bounce as a notch's
+            // does. At an edge the tracked glide stays armed (start == target == edge
+            // row) and the bounce owns `scroll_frac_px`, so a finger held past the top
             // re-probes the route once per settle, not per delta.
             if !same {
                 ws.overscroll = None;
@@ -5641,6 +5727,7 @@ impl App {
             }
             let (excess_px, edges) = ws.scroll_glide.as_mut().map_or((0, (false, false)), |st| {
                 if viewport.is_some() {
+                    // A seam-fed delta (a banked whole row) refreshes the clamp
                     // bound the lock-free sub-row deltas reuse.
                     st.max_rows = max_rows;
                 }
@@ -6083,6 +6170,9 @@ impl App {
             .get(&target)
             .and_then(|ws| ws.os_window.clone())
         {
+            // Best-effort: the WM may clamp or ignore it, so no local geometry is
+            // written on our own request, except when the backend answers `Some`
+            // (Wayland applies synchronously and sends no `Resized`): that answer is
             // fed through the event's path.
             if let Some(applied) =
                 w.request_inner_size(aterm_window::dpi::PhysicalSize::new(width, height))
@@ -6411,6 +6501,7 @@ impl App {
                 true
             }
             LocalRepeatAction::Rename { session, edit } => {
+                // The owner is the session being renamed, checked against the live
                 // in-grid edit: a repeat outliving its editor is dropped.
                 if self.inline_rename_edit(wid).map(|live| live.session) != Some(session) {
                     return false;
@@ -6782,6 +6873,8 @@ impl App {
                 base_layout,
                 layout_text,
             } => {
+                // A modifier's release reports the state it leaves (kitty): its
+                // own bit stays set while the other side is still held (both
                 // Shifts down, one let go) and is clear otherwise.
                 if let aterm_types::keyboard::Key::Named(named) = &key
                     && let Some((flag, _)) = named.modifier_twin()
@@ -7223,6 +7316,15 @@ impl App {
                     if find_suspends_action(action)
                         && self.windows.get(&wid).is_some_and(|ws| ws.search.is_some()) =>
                 {
+                    // Paste is the one suspended action the field honours:
+                    // `field_edit_action` has no `v` arm and its printable tail
+                    // refuses control chords, and off macOS the hardcoded ⌘V is
+                    // Win+V (taken by the shell's clipboard history). Routing the
+                    // resolved action here makes every spelling, including a
+                    // user rebind, paste into the query (`search_paste_in` strips
+                    // control bytes and stays single-line). Both paste actions
+                    // paste the clipboard there, as a GTK entry's Shift+Insert
+                    // does. Other suspended actions stay parked so the keystroke
                     // drives the field below.
                     if action.is_paste() {
                         self.search_paste_in(wid);
@@ -7535,6 +7637,7 @@ impl App {
                     return true;
                 }
                 "l" | "L" => {
+                    // The chord has no `wid`: it acts on the front window, as
                     // every chord here does.
                     if let Some(wid) = self.frontmost_window {
                         self.open_session_ledger(wid);
@@ -7572,6 +7675,9 @@ impl App {
                     return true;
                 }
                 "w" => {
+                    // The last pane of the last tab sets `pending_close` on the window
+                    // `close_active_tab` closed (the frontmost, not the event's `wid`,
+                    // which can differ); `window_event`, which has the
                     // `ActiveEventLoop`, closes it after `on_key` returns.
                     if let Some(closed) = self.close_active_tab()
                         && let Some(ws) = self.windows.get_mut(&closed)
@@ -7778,6 +7884,7 @@ impl App {
             InputEvent::Key {
                 key, event_type, ..
             } => {
+                // A release is not an edit; the caller's consumed-press set
                 // swallows the pair before this gate.
                 if matches!(event_type, KeyEventType::Release) {
                     return false;
@@ -8037,6 +8144,7 @@ impl App {
                     event_type: KeyEventType::Release,
                     ..
                 } => {
+                    // An untracked release belongs to a press that predates the card
                     // and must still reach a Kitty `REPORT_EVENT_TYPES` app.
                     false
                 }
@@ -8312,6 +8420,7 @@ impl App {
             && let Some(session) = self.focused_session_id(wid)
             && let Some(owner) = self.pool.get(session)
         {
+            // The preedit reaches no program: it can dismiss no box. An owed log
             // wake rang the session's watchers in the mark's hold.
             let _ = note_person_reaching(&owner.ctx, crate::human_input::Gesture::Other, false);
         }
@@ -8691,6 +8800,7 @@ impl App {
             _ => None,
         };
         if let Some(edit) = editing {
+            // The in-grid field has no selection model, so Copy/Select All are inert
             // there, but still claimed.
             if self.inline_rename_edit(window).is_some() {
                 if matches!(edit, RenameEditorEdit::Paste) {

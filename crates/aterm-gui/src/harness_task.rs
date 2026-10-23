@@ -29,13 +29,13 @@ pub(crate) fn self_claim_act_face(act: &str) -> Option<TaskFace> {
 
 /// A FACE THAT STANDS UNTIL SOMEONE ELSE'S TURN, as a proven self-claim tells it: its landing ([`TaskFace::Landed`]), and a point it left to a person's own exchange ([`TaskFace::Theirs`]).
 #[must_use]
-pub(crate) fn holds_until_another_turn(face: TaskFace) -> bool {
+pub(crate) const fn holds_until_another_turn(face: TaskFace) -> bool {
     matches!(face, TaskFace::Landed | TaskFace::Theirs)
 }
 
 /// THE LANDING'S OWN TURN, IN THE ORDER THE PROGRAM SAW IT (Autopilot Land §10.4): the count of turns begun a proven self-claim's landing is marked at, from `counted`, the engine's count as its `landed@v1` arrived, and `typed_at`, the count its holder's last act that starts a turn stood at as it arrived with the program's report at rest (`SessionTimeline::typed_turn`; an act that starts none, such as a report mailed after the land turn ended, moves nothing: `aterm_agent::harness::acts::self_claim_types_turn`).
 #[must_use]
-pub(crate) fn landing_turns(counted: u64, typed_at: Option<u64>) -> u64 {
+pub(crate) const fn landing_turns(counted: u64, typed_at: Option<u64>) -> u64 {
     match typed_at {
         Some(at) if at == counted => counted.saturating_add(1),
         _ => counted,
@@ -229,7 +229,7 @@ impl App {
 
 /// THE MOVE FROM `was` TO `face` IS A LANDING'S END, to be recorded once:
 #[must_use]
-pub(crate) fn is_an_end(was: Option<TaskFace>, face: TaskFace) -> bool {
+pub(crate) const fn is_an_end(was: Option<TaskFace>, face: TaskFace) -> bool {
     match face {
         TaskFace::Landed => was.is_some(),
         TaskFace::Open | TaskFace::Theirs => false,

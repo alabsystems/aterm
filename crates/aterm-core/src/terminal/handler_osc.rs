@@ -82,6 +82,7 @@ impl TerminalHandler<'_> {
 
     /// Set window title and/or icon name from an OSC title param.
     pub(super) fn set_title(&mut self, params: &[&[u8]], icon: bool, window: bool) {
+        // The parser splits on `;`, so a title containing semicolons arrives
         // across params[1..]: rejoin with ";" (as OSC 7 and OSC 8 do for URIs).
         if params.len() < 2 {
             return;
@@ -95,6 +96,7 @@ impl TerminalHandler<'_> {
             self.title.icon = text.as_str().into();
         }
         if window {
+            // Bump the title epoch only when the stored value changes, so hosts
             // detect a background tab's title drift with a lock-free load.
             if &*self.title.window != text.as_str() {
                 self.title
@@ -157,6 +159,7 @@ impl TerminalHandler<'_> {
             }
             self.apply_cwd_report(report);
         } else if !self.shell.signs_cwd {
+            // The latest report wins: the shell's own comes last, right
             // before its prompt start.
             self.shell.held_cwd = Some(report);
         }

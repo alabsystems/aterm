@@ -2510,6 +2510,8 @@ fn drain_more_nonblocking_with_idle_wait_after_gap(
     let mut spins = 0u32;
     let mut proven = false;
     while filled < buf.len() {
+        // A batch under one tty queue ends at its first quiet poll of the watch and the
+        // master, which stands in for the dry `read` that would end it: no added system
         // call, and the batch never ends past an `exec` the watch could hear.
         if proc_rd >= 0 && filled < SATURATED {
             match end_poll(master, proc_rd) {

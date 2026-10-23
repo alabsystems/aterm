@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! END-TO-END evidence over a real loopback socket.
-//!
-//! A stub server on `127.0.0.1` exercises the truth: these tests assert the exact
-//! BYTES that reach a server and the exact body that comes back, through real
-//! TCP, real timeouts and the real authority guard.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -16,10 +12,8 @@ use std::time::Duration;
 
 use aterm_http::{Client, Error, Guard, ProxyMode, Trust};
 
-/// A wait for something that must happen is a hang detector, never a latency budget.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// Read a request head (to the blank line) plus `Content-Length` body bytes.
 fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -48,8 +42,6 @@ fn read_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
     (head, body)
 }
 
-/// A one-shot stub server. Returns its endpoint and a channel carrying the
-/// request it observed.
 fn stub(response: &'static [u8]) -> (String, mpsc::Receiver<(String, Vec<u8>)>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -64,7 +56,6 @@ fn stub(response: &'static [u8]) -> (String, mpsc::Receiver<(String, Vec<u8>)>) 
     (format!("http://127.0.0.1:{port}/api/chat"), rx)
 }
 
-/// A client for a stub that answers: its deadline bounds a reply that must come.
 fn client() -> Client {
     Client::new(Trust::PlatformVerifier, ProxyMode::Direct, HANG_DETECTOR)
 }
@@ -84,7 +75,6 @@ fn a_json_post_puts_the_expected_bytes_on_the_wire_and_parses_the_reply() {
         .expect("request succeeds");
 
     let (head, sent) = rx.recv_timeout(HANG_DETECTOR).unwrap();
-    // The request line is origin-form and the Host carries the explicit port.
     assert!(head.starts_with("POST /api/chat HTTP/1.1\r\n"), "{head}");
     assert!(head.contains("Host: 127.0.0.1:"), "{head}");
     assert!(
@@ -121,7 +111,6 @@ fn a_get_and_a_put_put_their_methods_on_the_wire() {
         "{head}"
     );
     assert!(head.contains("Connection: close\r\n"), "{head}");
-    // A GET anticipates no content, so it names no length.
     assert!(
         !head.to_ascii_lowercase().contains("content-length"),
         "{head}"
@@ -152,13 +141,6 @@ fn a_get_and_a_put_put_their_methods_on_the_wire() {
 
 #[test]
 fn a_chunk_size_at_the_top_of_usize_is_an_error_not_a_panic() {
-    // The exact byte sequence that reproduced the defect: one real chunk, then
-    // a chunk-size line of ffffffffffffffff (usize::MAX). The old `body.len() +
-    // size > limit` panicked outright under debug-assertions and WRAPPED in
-    // release — where the wrap passed the limit check, resize truncated instead
-    // of grew, and read_exact panicked on the slice range. A panic here unwinds
-    // the calling worker thread, which has no catch_unwind, and it stays dead
-    // for the rest of the process's life.
     let (endpoint, _rx) = stub(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\r\nffffffffffffffff\r\n",
     );
@@ -184,8 +166,6 @@ impl Guard for Revocable {
 
 #[test]
 fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
-    // Another thread can revoke while the request is in flight. The request
-    // body must not reach the socket after that.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -208,8 +188,6 @@ fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
         .expect_err("revoked authority must fail the request");
     assert!(error.is_revoked(), "{error:?}");
 
-    // The connector connects before the guard is checked, and the client drops
-    // the socket once the write is refused, so the stub always reports.
     let seen = rx
         .recv_timeout(HANG_DETECTOR)
         .expect("the stub reports what it read");
@@ -224,9 +202,6 @@ fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
 fn a_silent_server_hits_the_deadline_instead_of_hanging() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // Accept and never reply, holding the connection for the hang detector: a
-    // client that ignored its 250 ms deadline sees the close a minute later as
-    // UnexpectedEof, which fails the TimedOut assert below.
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
             std::thread::sleep(HANG_DETECTOR);
@@ -249,7 +224,6 @@ fn a_silent_server_hits_the_deadline_instead_of_hanging() {
     );
 }
 
-/// A stub that captures every byte it is sent, to EOF, and never replies.
 fn capturing_stub() -> (u16, mpsc::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -274,25 +248,6 @@ fn capturing_stub() -> (u16, mpsc::Receiver<Vec<u8>>) {
 
 #[test]
 fn an_https_endpoint_puts_a_client_hello_on_the_wire_and_never_the_body() {
-    // The trust model is this crate's headline claim, and the regression that
-    // would hurt most is the silent one: `Client::open` stops running the
-    // handshake and the request body, and a bearer token in the headers, go
-    // out in the clear. This peer speaks no TLS at all,
-    // so the handshake cannot finish; what is asserted is what reached the
-    // socket BEFORE it failed.
-    //
-    // Non-vacuity is the 0x16 check: a downgrade to plaintext would put "POST "
-    // in this buffer instead of a TLS handshake record, and the canary assert
-    // below would fire on the same run.
-    //
-    // NOT covered here, deliberately: that a server certificate is actually
-    // VERIFIED, and an invalid one refused. That needs a peer holding a real
-    // certificate, which needs a private key — and a key fixture would trip
-    // the export's secret scan, while generating one at test time means
-    // either an `openssl s_server` child (LibreSSL here, OpenSSL on CI —
-    // different flags, a bound port, and a process to reap) or hand-rolled
-    // X.509 DER against a new dev-dependency. In a change whose whole purpose
-    // is retiring dependencies, neither is the right trade to make silently.
     let secret = br#"{"model":"m","prompt":"CANARY-MUST-NEVER-APPEAR-IN-CLEARTEXT"}"#;
     let (port, rx) = capturing_stub();
     let error = Client::new(
@@ -327,8 +282,6 @@ fn an_https_endpoint_puts_a_client_hello_on_the_wire_and_never_the_body() {
     );
 }
 
-/// A peer that completes the TCP connect, claims a big TLS record, and then
-/// sends one byte at a time; it never speaks TLS, it only keeps bytes arriving.
 fn dribbling_tls_peer(step: Duration, steps: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -336,8 +289,6 @@ fn dribbling_tls_peer(step: Duration, steps: usize) -> String {
         let Ok((mut stream, _)) = listener.accept() else {
             return;
         };
-        // A handshake record header claiming 16384 bytes of body, so rustls
-        // stays in `read_tls` waiting for a flight that never completes.
         if stream.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
             return;
         }
@@ -353,10 +304,6 @@ fn dribbling_tls_peer(step: Duration, steps: usize) -> String {
 
 #[test]
 fn a_dribbling_tls_peer_cannot_outlive_the_global_deadline() {
-    // The deadline holds inside the handshake: `complete_io` loops on
-    // `read_tls`, so a timeout applied once at the top would let every dribbled
-    // byte restart the clock. The peer dribbles for ~5 minutes against a 1 s
-    // budget and stops at the first byte the closed client refuses.
     let endpoint = dribbling_tls_peer(Duration::from_millis(100), 3_000);
     let client = Client::new(
         Trust::PlatformVerifier,
@@ -377,7 +324,6 @@ fn a_dribbling_tls_peer_cannot_outlive_the_global_deadline() {
     assert!(matches!(error, Error::Io(_)), "{error:?}");
 }
 
-/// An environment that names one `HTTPS_PROXY` and nothing else.
 struct HttpsProxyEnv(String);
 
 impl aterm_http::proxy::EnvSource for HttpsProxyEnv {
@@ -388,9 +334,6 @@ impl aterm_http::proxy::EnvSource for HttpsProxyEnv {
 
 #[test]
 fn a_proxy_that_sends_an_interim_response_before_its_connect_answer_still_tunnels() {
-    // RFC 9110 §15.2 applies to CONNECT too: a `100` before the `200` is not the
-    // answer. The stub reports the first byte sent after the 200; a TLS
-    // handshake record (0x16) means the tunnel was taken.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -427,8 +370,6 @@ fn a_proxy_that_sends_an_interim_response_before_its_connect_answer_still_tunnel
 
 #[test]
 fn userinfo_in_the_proxy_url_authenticates_the_connect() {
-    // `user:password@` in HTTPS_PROXY becomes the CONNECT's
-    // `Proxy-Authorization: Basic`.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -457,7 +398,6 @@ fn userinfo_in_the_proxy_url_authenticates_the_connect() {
         head.starts_with("CONNECT origin.test:443 HTTP/1.1\r\n"),
         "{head}"
     );
-    // base64("alice:s3cret")
     assert!(
         head.contains("\r\nProxy-Authorization: Basic YWxpY2U6czNjcmV0\r\n"),
         "{head}"
@@ -468,11 +408,8 @@ fn userinfo_in_the_proxy_url_authenticates_the_connect() {
 
 #[test]
 fn an_https_proxy_is_refused_before_any_byte_reaches_it() {
-    // An https:// proxy is refused, naming the variable, before any connect.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // Nothing waits under the refusal; the short deadline only bounds a
-    // regression that connects and then waits on the stub's silence.
     let error = Client::new(
         Trust::PlatformVerifier,
         ProxyMode::Environment,
@@ -485,8 +422,6 @@ fn an_https_proxy_is_refused_before_any_byte_reaches_it() {
         matches!(&error, Error::Invalid(message) if message.contains("HTTPS_PROXY")),
         "{error:?}"
     );
-    // A connect that happened completed its handshake before `send` returned,
-    // so an empty accept queue now proves there was none.
     listener.set_nonblocking(true).unwrap();
     match listener.accept() {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -496,7 +431,6 @@ fn an_https_proxy_is_refused_before_any_byte_reaches_it() {
 
 #[test]
 fn a_refused_port_is_an_error_not_a_panic() {
-    // Bind then drop, so the port is almost certainly closed.
     let port = {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
@@ -521,10 +455,6 @@ fn an_unusable_endpoint_fails_before_any_socket_is_opened() {
             .send(b"{}")
             .expect_err("must reject the endpoint");
         assert!(matches!(error, Error::Invalid(_)), "{bad}: {error:?}");
-        // The refusal must not echo what it refused. A caller may print this
-        // message to stderr, and the userinfo shape above
-        // is refused precisely because it carries a credential; printing the
-        // raw endpoint back would put that password on the terminal.
         for rendered in [error.to_string(), format!("{error:?}")] {
             assert!(
                 !rendered.contains("pass"),

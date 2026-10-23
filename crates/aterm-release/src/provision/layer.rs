@@ -386,7 +386,7 @@ fn check_of(row: &ItemReport) -> Check {
     }
 }
 
-/// Every item over `host`, probed and planned, as `` in [`ITEMS`] order.
+/// Every item over `host`, probed and planned, as `(id, check)` in [`ITEMS`] order.
 pub(crate) fn audit(host: &Arc<dyn ReleaseHost>) -> Vec<(&'static str, Check)> {
     let items = items(host);
     match aterm_converge::run(&items, Mode::Plan, &mut aterm_converge::ReadOnly) {

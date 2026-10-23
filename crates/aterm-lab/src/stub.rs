@@ -168,7 +168,7 @@ pub fn is_side(kind: &str) -> bool {
     )
 }
 
-/// The stub's dumps of the conversations' TURNS in `dir`, `` each, the newest first.
+/// The stub's dumps of the conversations' TURNS in `dir`, `(n, path)` each, the newest first.
 #[must_use]
 pub fn turn_dumps(dir: &Path) -> Vec<(u64, PathBuf)> {
     let mut out: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
@@ -656,7 +656,9 @@ pub fn first_sid(text: &str) -> Option<&str> {
         })
 }
 
-/// `input` with every `@SID:<k>@` in its strings replaced by the first session id.
+/// `input` with every `@SID:<k>@` in its strings replaced by the first session
+/// id of `results[k-1]`; one with no such result, or none in it, is left as
+/// written, so the call that names it fails where it can be seen.
 #[must_use]
 pub fn fill_sids(input: &J, results: &[String]) -> J {
     match input {
@@ -792,7 +794,8 @@ pub fn tool_turn(body: &[u8], script: &J) -> Option<ToolTurn> {
     })
 }
 
-/// `limit:CLAIM:RESET[:PLAN]` → ``; PLAN is Codex's `plan_type`, and Claude Code's answer has none.
+/// `limit:CLAIM:RESET[:PLAN]` → `(claim, reset unix seconds, plan)`; PLAN is Codex's
+/// `plan_type`, and Claude Code's answer has none.
 #[must_use]
 pub fn limit_params(mode: &str) -> Option<(String, i64, Option<String>)> {
     let parts: Vec<&str> = mode.split(':').collect();

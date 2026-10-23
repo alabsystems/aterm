@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The aterm-models-core models aterm-spec's own unit tests run the engine on (`ring_model`.
+//! The aterm-models-core models aterm-spec's own unit tests run the engine on (`ring_model`,
+//! `subscribe_model`), with `cursor_model`, which aterm-buffer's conformance test runs, all
+//! re-exported from this crate's root like every other.
 
 use aterm_spec::derive::*;
 

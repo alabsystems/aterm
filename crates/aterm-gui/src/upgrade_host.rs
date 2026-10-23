@@ -40,7 +40,7 @@ pub(crate) struct WordAsk {
 
 impl WordAsk {
     /// Create an upgrade action for `tab` targeting build `to`.
-    pub(crate) fn new(tab: String, to: String, word: UpgradeWord) -> Self {
+    pub(crate) const fn new(tab: String, to: String, word: UpgradeWord) -> Self {
         Self {
             tab,
             to,
@@ -50,7 +50,7 @@ impl WordAsk {
     }
 
     /// Convert this action into the harness [`Ask`].
-    pub(crate) fn ask(&self) -> Ask {
+    pub(crate) const fn ask(&self) -> Ask {
         match self.word {
             UpgradeWord::Now => Ask::Now,
             UpgradeWord::NotToday => Ask::Defer(NOT_TODAY_S),
@@ -413,7 +413,7 @@ impl UpgradeView {
     }
 
     /// Menu cache revision counter.
-    pub(crate) fn revision(&self) -> u64 {
+    pub(crate) const fn revision(&self) -> u64 {
         self.revision
     }
 }
@@ -431,7 +431,7 @@ fn menu_of(row: &Row, now: u64) -> Option<crate::session_chrome::UpgradeMenu> {
 
 /// Whether the owner saw a stalled row through (the once-only rule): read (its hold
 /// folded) or dismissed.
-fn seen_through(record: &aterm_messages::LogRecord) -> bool {
+const fn seen_through(record: &aterm_messages::LogRecord) -> bool {
     matches!(
         record.retired(),
         Some(aterm_messages::Retired::Folded | aterm_messages::Retired::Dismissed)
@@ -995,6 +995,8 @@ impl App {
             let msg = message_reporters::agent_upgrade_stalled_at(row, now, &spot);
             if let Some(id) = self.stall_already_shown(&msg) {
                 // Still on the band (carried): brought to this build's words
+                // — and buttons — where they differ. Off it: the owner saw it,
+                // and it stays down.
                 if self.messages.live(id).is_some_and(|l| {
                     l.msg.title != msg.title
                         || l.msg.detail != msg.detail

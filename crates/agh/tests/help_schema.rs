@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Help, schema and version (the plan's §9.4): structure only. Pages are checked for the data
-//! they carry (usage lines, flags, the refused rows' why and next), never word for word.
+//! Structural tests for `agh` help, schema, and version output.
 
 use std::sync::Arc;
 
@@ -139,9 +138,6 @@ fn only_release_wait_tells_of_a_background_wait() {
 
 #[test]
 fn authored_lines_fit_in_100_characters() {
-    // The plan's §4.6.25 freezes the VERBS usage strings and its §9.2 caps a help line at 100
-    // characters; three usage strings are longer (release download, auth add, api). Frozen,
-    // they cannot be shortened, so the exemption is exactly the two lines that print one whole: the brief's `  {usage}` and a page's `usage: {usage}`.
     let usages: Vec<String> = VERBS
         .iter()
         .flat_map(|v| [format!("  {}", v.usage), format!("usage: {}", v.usage)])

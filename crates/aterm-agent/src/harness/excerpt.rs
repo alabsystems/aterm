@@ -1,7 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT A CLAUDE CODE SESSION WAS ASKED, SAID AND IS DOING, for the survey (`aterm ctl survey`, `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §3): three excerpts of its transcript's end, read by the footer's own tail read ([`super::footer::TailCache`]) — the fresh read looks back with it, an append scans only what was appended — so the survey asks no file of its own:
+//! WHAT A CLAUDE CODE SESSION WAS ASKED, SAID AND IS DOING, for the survey
+//! (`aterm ctl survey`, `docs/DESIGN-sessions-as-subagents-2026-10-15.md`
+//! §3): three excerpts of its transcript's end, read by the footer's own tail
+//! read ([`super::footer::TailCache`]) — the fresh read looks back with it,
+//! an append scans only what was appended — so the survey asks no file of
+//! its own:
+//!
+//! * PROMPTS: the newest user rows typed into the conversation, newest first,
+//!   distinct by [`prompt_key`], at most [`PROMPTS_KEPT`]. Which of them a
+//!   person (or a manager) typed is the host's to say: its turn ledger records
+//!   who typed each `turn` (`by=harness`), and the survey skips a prompt
+//!   whose key a harness record's text has — the newest prompt that was not
+//!   the window harness's own continuation. Kept several deep for that: the
+//!   harness types few distinct lines (an owner's own `continue_text`, its
+//!   other acts carrying its mark), so the newest prompt it did not type is
+//!   among them.
+//! * SAID: the newest text the agent wrote, the retired done token's lines
+//!   (`ATERM-TASK-DONE` alone, which older workers still write) dropped as
+//!   the task's result drops them: a message that is the token alone gives
+//!   the newest one with words.
+//! * DOING: the tool in flight, by NAME (`Bash`), never its input — a call of
+//!   the newest assistant message no result has answered yet.
 
 use aterm_json::Value;
 

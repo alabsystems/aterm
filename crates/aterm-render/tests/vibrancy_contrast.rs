@@ -49,7 +49,6 @@ fn effective_floor_never_illegible_and_never_weakens() {
     assert_ne!(effective_minimum_contrast(1.0, 0.5), 1.0);
 }
 
-/// The model's contrast lattice: index `k` ↔ ratio, with `Floor = 3` ↔ 4.5.
 const LATTICE: [f32; 7] = [1.0, 2.0, 3.0, 4.5, 7.0, 14.0, 21.0];
 
 fn index_of(ratio: f32) -> i64 {
@@ -59,9 +58,6 @@ fn index_of(ratio: f32) -> i64 {
         .unwrap_or_else(|| panic!("{ratio} is off the lattice")) as i64
 }
 
-/// Tier-1 conformance for `VibrancyContrast`: for every `Pick` (translucent × base),
-/// the model's one `Fire` successor's `effective` is the lattice index of the real
-/// resolver's answer, with `translucent ∈ {0, 1}` ↔ opacity `{1.0, 0.6}`.
 #[test]
 fn resolver_conforms_to_the_vibrancy_contrast_model() {
     let model = aterm_models_render::vibrancy_contrast_model();

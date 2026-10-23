@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A keeper outlives the build it started from. An update moves the old bundle to
-//! `aterm.app.rollback` and the successor's boot-health confirmation deletes it, while macOS
-//! checks a running process's code through the file it started from: with that file deleted
-//! the lookup fails `ENOENT` (OSStatus 100002), and with another build at the path it fails
-//! too. So the keeper runs from its own copy of its code, and a window's designated-requirement
-//! check (§5.7) still admits it.
-//!
-//! `aterm keeper serve --identity designated` runs from a copy of this test binary (bare, and in
-//! an ad-hoc signed bundle); that build is deleted, then replaced at its path, and a dial as the
-//! original build must still admit the keeper. Negative controls: other code (`nc`, a bundle
-//! sealing another Info.plist) is refused. The last test checks that `aterm keeper stop` leaves
-//! no copy behind.
-//!
-//! No WindowServer: every process is this binary (run by `exec`, never LaunchServices), `nc`,
-//! `codesign`, `ditto` or `launchctl`; stand-ins end by SIGKILL. Every copy of this binary (the
-//! builds, the bundles, the keepers' own copies) is a new file macOS assesses at its first exec,
-//! so the scratch directory goes only once each test saw every copy it started answer, and stays
-//! when a test fails before that ([`aterm_uds::deadline::KeptUntilRan`]).
-//!
-//! Each test ends COULD NOT RUN if its initial `aterm_uds::deadline::trust_service_silent` probe
-//! finds no answer. A later unavailable identity check fails with `COULD NOT RUN`; it establishes
-//! no code-identity verdict.
-//! The negative controls check Apple-signed code.
+//! A keeper outlives the build it started from.
 
 #![cfg(target_vendor = "apple")]
 
@@ -32,8 +10,7 @@ use std::io::Write as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-// `spawnfd`'s: each child (the keepers, `nc`, the verbs) inherits only its stdio, never a pipe
-// another test thread had open unflagged at the spawn.
+
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -43,22 +20,14 @@ use aterm_keeper::job::{self, JobState};
 use aterm_spec::wait::{MUST_HAPPEN, within};
 use aterm_uds::deadline::{FIRST_EXEC_HANG, KeptUntilRan, output_until};
 
-/// What a child run of this binary does instead of its test.
 const ROLE: &str = "ATERM_KEEPER_SWAP_ROLE";
-/// The keeper role's socket.
 const SOCK: &str = "ATERM_KEEPER_SWAP_SOCK";
-/// The verb role's arguments, one per line.
 const ARGS: &str = "ATERM_KEEPER_SWAP_ARGS";
 
 const BARE: &str = "a_keeper_whose_build_is_deleted_is_still_this_builds";
 const BUNDLED: &str = "a_keeper_whose_app_is_deleted_is_still_that_apps";
 const STOPPED: &str = "a_stopped_keeper_leaves_no_copy_of_its_code";
 
-/// Play the role a parent test gave this run, if any; never returns then.
-///
-/// `keeper`: `aterm keeper serve` on the socket the test names, with the
-/// designated identity — exactly what `aterm keeper start` submits.
-/// `verb`: `aterm keeper <ARGS>`, its words on stdout, exit 0 or 1.
 fn play_role_if_asked() {
     match std::env::var(ROLE).as_deref() {
         Ok("keeper") => {
@@ -92,11 +61,8 @@ fn play_role_if_asked() {
 }
 
 struct Scratch {
-    /// Removed after the kids are killed and reaped, once the test said every copy it started
-    /// ran.
     dir: KeptUntilRan,
     kids: Vec<Child>,
-    /// A launchd job to remove, whatever happens.
     job: Option<String>,
 }
 
@@ -128,7 +94,6 @@ impl Scratch {
         self.dir().join("home")
     }
 
-    /// Where a keeper given [`Self::home`] keeps the copies it runs from.
     fn copies(&self) -> PathBuf {
         self.home()
             .join("Library/Application Support/aterm/keeper-code")
@@ -138,14 +103,12 @@ impl Scratch {
         std::fs::read_to_string(self.dir().join("keeper.log")).unwrap_or_default()
     }
 
-    /// Run the keeper role from `exe` (a run of `test`), its stderr in `log`.
     fn start_keeper(&mut self, exe: &Path, test: &str, log: &str) {
         let log = std::fs::File::create(self.dir().join(log)).expect("log");
         let kid = Command::new(exe)
             .args(["--exact", test, "--nocapture", "--test-threads", "1"])
             .env(ROLE, "keeper")
             .env(SOCK, self.sock())
-            // Where a keeper keeps its own things is per user: this test's.
             .env("HOME", self.home())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -155,9 +118,6 @@ impl Scratch {
         self.kids.push(kid);
     }
 
-    /// `aterm keeper <args>` run by `exe` (a run of `test`): its first line
-    /// that starts `keeper=` or `job=` (the test harness may print its own
-    /// words before it, on the same line), or everything it said.
     fn verb(&self, exe: &Path, test: &str, args: &[&str]) -> String {
         let out = Command::new(exe)
             .args(["--exact", test, "--nocapture", "--test-threads", "1"])
@@ -180,9 +140,6 @@ impl Scratch {
             )
     }
 
-    /// The copy the keeper `pid` runs from, checked to be under
-    /// [`Self::copies`] in its own `<pid>-<start>` directory; the path of its
-    /// executable inside that directory.
     fn runs_from_its_copy(&self, pid: u32) -> PathBuf {
         let running = aterm_uds::process::read_process_path(pid as i32).expect("its executable");
         let copies = self.copies();
@@ -215,7 +172,6 @@ impl Drop for Scratch {
             let _ = kid.kill();
             let _ = kid.wait();
         }
-        // `dir` goes (or stays) next, as the fields drop.
     }
 }
 
@@ -227,24 +183,15 @@ fn private_dir(path: &Path) {
         .expect("a private directory");
 }
 
-/// How long a keeper started from a new copy may take to answer: the system's first-exec wait
-/// for the copy and again for the keeper's own copy of it, a hang detector of its own.
 const FIRST_ANSWER: Duration = Duration::from_secs(2 * FIRST_EXEC_HANG.as_secs());
 
-/// `trustd` going silent after the one probe refuses every later code check
-/// through a process's gate: the machine's moment, never the code's verdict.
 const TRUSTD_SILENT: &str = "the process trustd gate was silent — the machine's, not the code's";
 
-/// Whether `why` is an identity check's words for a gate that refused it
-/// unanswered.
 fn trustd_silent(why: &str) -> bool {
     why.starts_with("macOS's code-signing service (trustd) is not answering")
 }
 
 impl Scratch {
-    /// Dial the keeper as this build's window does (its own designated identity). A check
-    /// `trustd` did not answer, ours of the keeper or the keeper's of this dial (its log says
-    /// so), panics as COULD NOT RUN, so a probe retries only a keeper not yet listening.
     fn dial_as_this_build(&self) -> std::io::Result<String> {
         let own = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let got =
@@ -267,17 +214,11 @@ impl Scratch {
     }
 }
 
-/// A byte-for-byte copy of this test binary at `to`: the very same code (its
-/// cdhash) as the test that checks it.
 fn copy_of_this_binary(to: &Path) {
     private_dir(to.parent().expect("a directory"));
     std::fs::copy(std::env::current_exe().expect("test binary"), to).expect("copy");
 }
 
-/// An app bundle at `app` around a copy of this test binary, its Info.plist
-/// naming `id`, signed ad hoc (`codesign` seals the Info.plist and the
-/// resources into the executable's signature, so two bundles with different
-/// ids are different code). Returns its executable.
 fn signed_bundle(app: &Path, id: &str) -> PathBuf {
     let contents = app.join("Contents");
     let exe = contents.join("MacOS").join("aterm");
@@ -295,7 +236,6 @@ fn signed_bundle(app: &Path, id: &str) -> PathBuf {
         ),
     )
     .expect("Info.plist");
-    // A hang detector: a codesign macOS stops answering fails this test, never hangs the suite.
     let sign = output_until(
         aterm_uds::spawnfd::command("/usr/bin/codesign")
             .args(["--force", "--sign", "-"])
@@ -307,7 +247,6 @@ fn signed_bundle(app: &Path, id: &str) -> PathBuf {
     exe
 }
 
-/// Copy the bundle `from` to `to` as an installer does (`ditto`).
 fn ditto(from: &Path, to: &Path) {
     private_dir(to.parent().expect("a directory"));
     let out = Command::new("/usr/bin/ditto")
@@ -323,7 +262,6 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     play_role_if_asked();
     aterm_uds::deadline::require_trust_service();
     let mut s = Scratch::new("akswap");
-    // The build the keeper starts from: this binary, so this test dials as it.
     let build = s.dir().join("build").join("aterm");
     copy_of_this_binary(&build);
     s.start_keeper(&build, BARE, "keeper.log");
@@ -332,15 +270,10 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     })
     .unwrap_or_else(|| panic!("the keeper never answered this build: {}", s.log()));
     assert!(before.starts_with("keeper=running"), "{before}");
-    // It answers from its own copy of its code: the same pid (`exec` keeps the one launchd
-    // watches), running a file under the given HOME's keeper code directory.
     let keeper = s.kids[0].id();
     let inner = s.runs_from_its_copy(keeper);
     assert_eq!(inner, Path::new("aterm"), "a bare build is copied alone");
 
-    // A second keeper on the same socket cannot serve (one already answers):
-    // it copies itself too, then removes its copy as `serve` returns, and
-    // leaves the live keeper's alone.
     s.start_keeper(&build, BARE, "second.log");
     within(FIRST_EXEC_HANG, Duration::from_millis(10), || {
         s.kids[1].try_wait().ok().flatten()
@@ -348,8 +281,6 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     .expect("the second keeper never ended");
     let second = std::fs::read_to_string(s.dir().join("second.log")).unwrap_or_default();
     assert!(second.contains("a keeper already answers"), "{second}");
-    // Every copy started has run: the first keeper answered from its own copy, and the second
-    // said, from its own, why it could not serve.
     s.dir.ran();
     let left: Vec<_> = std::fs::read_dir(s.copies())
         .expect("the copies' directory")
@@ -361,7 +292,6 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
         "a keeper that could not serve left its copy (the live keeper is {keeper}): {left:?}"
     );
 
-    // The update's boot-health confirmation deletes the build it ran from…
     std::fs::remove_dir_all(s.dir().join("build")).expect("delete the build");
     let after = s.dial_as_this_build();
     assert!(
@@ -371,7 +301,6 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
         "with its build deleted, the keeper is refused: {after:?}"
     );
 
-    // …and the next update puts a different build at the same path.
     private_dir(&s.dir().join("build"));
     std::fs::copy("/usr/bin/true", &build).expect("another program at the path");
     let reused = s.dial_as_this_build();
@@ -382,7 +311,6 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
         "with another build at its path, the keeper is refused: {reused:?}"
     );
 
-    // Negative control: a "keeper" that runs other code is refused.
     let fake = s.dir().join("run").join("f.sock");
     s.kids.push(
         Command::new("/usr/bin/nc")
@@ -409,10 +337,6 @@ fn a_keeper_whose_build_is_deleted_is_still_this_builds() {
     );
 }
 
-/// The installed shape: the keeper runs from an app bundle (`A`, as `/Applications/aterm.app`),
-/// so it copies the whole bundle (the signature seals its Info.plist and resources) and checks
-/// the copy before running from it. The dialing window is the same app at another path (`B`,
-/// the same bytes), as `aterm keeper status --identity designated` runs.
 #[test]
 fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
     play_role_if_asked();
@@ -431,7 +355,6 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
     ditto(&staged, &b);
     let in_bundle = Path::new("Contents/MacOS/aterm");
     let (a_exe, b_exe) = (a.join(in_bundle), b.join(in_bundle));
-    // Other code: the same executable sealed with another Info.plist.
     let other = s.dir().join("other").join("aterm.app");
     let other_exe = signed_bundle(&other, "com.aterm.keeper.swaptest.other");
 
@@ -448,8 +371,6 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
         )
     });
     assert!(before.starts_with("keeper=running"), "{before}");
-    // Every copy started so far has run (the keeper answered, from its own copy of `a`, a verb
-    // `b` ran); each verb below runs to its own exit, never killed.
     s.dir.ran();
     let inner = s.runs_from_its_copy(s.kids[0].id());
     assert_eq!(
@@ -458,7 +379,6 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
         "the keeper does not run from a copy of its whole bundle"
     );
 
-    // The update's boot-health confirmation deletes the bundle it ran from…
     std::fs::remove_dir_all(&a).expect("delete the app");
     let after = s.verb(&b_exe, BUNDLED, &status);
     assert!(
@@ -467,7 +387,6 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
         s.log()
     );
 
-    // …and the next update puts another app at the same path.
     ditto(&other, &a);
     let reused = s.verb(&b_exe, BUNDLED, &status);
     assert!(
@@ -475,8 +394,6 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
         "with another app at its path, the keeper is refused: {reused}"
     );
 
-    // Negative control: dialed from the other app, which is not the keeper's code, the keeper
-    // is refused.
     let refused = s.verb(&other_exe, BUNDLED, &status);
     assert!(
         refused.starts_with("keeper=refused"),
@@ -484,9 +401,6 @@ fn a_keeper_whose_app_is_deleted_is_still_that_apps() {
     );
 }
 
-/// `aterm keeper stop` (launchd's SIGTERM, which the keeper does not catch) waits for the keeper
-/// to end, then removes the copies of every keeper that has ended. The keeper is submitted as
-/// `aterm keeper start` submits it, under a test label.
 #[test]
 fn a_stopped_keeper_leaves_no_copy_of_its_code() {
     play_role_if_asked();
@@ -504,8 +418,6 @@ fn a_stopped_keeper_leaves_no_copy_of_its_code() {
     );
     let build_arg = build.to_string_lossy().into_owned();
     s.job = Some(label.clone());
-    // launchd gives a job no environment of the caller's: `env` sets it, then
-    // becomes the keeper (the same pid, as the job's program would be).
     job::submit(
         &label,
         "/usr/bin/env",
@@ -529,8 +441,6 @@ fn a_stopped_keeper_leaves_no_copy_of_its_code() {
             .filter(|t| t.starts_with("keeper=running"))
     })
     .unwrap_or_else(|| panic!("the keeper never answered: {}", s.log()));
-    // The one copy started has run: the keeper answered from its own copy of it. The verb
-    // below runs to its own exit.
     s.dir.ran();
     let JobState::Loaded { pid: Some(pid) } = job::state(&label).expect("launchctl") else {
         panic!("the job runs nothing");

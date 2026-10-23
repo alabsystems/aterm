@@ -8,7 +8,6 @@ use std::net::Shutdown;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
-/// A wait for something that must happen, never a latency assertion.
 const HANG: Duration = Duration::from_secs(60);
 
 fn connected(stream: CtlStream) -> Connection {
@@ -93,7 +92,6 @@ fn an_expired_reply_deadline_preserves_the_unread_stream() {
     assert_eq!(reply.reply_serial, Some(9));
 }
 
-/// The next whole message the bus's end of a pair reads.
 fn heard(bus: &mut CtlStream) -> Message {
     let mut buf = Vec::new();
     loop {

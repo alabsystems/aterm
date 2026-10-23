@@ -5,12 +5,7 @@
 
 use super::*;
 
-/// Type one printable key in the GUI host's seam order: stamp the press, feed
-/// the row probe (the erase-poof lane's evidence), then tick the cursor onto
-/// its landing. The press stamp matters: a cursor delta with no fresh key hint
-/// is program output, which the license declines.
 fn type_one_key(glow: &mut CursorGlow, cfg: &GlowConfig, g: Geom, at: Instant, row: u16, col: u16) {
-    // The row as input time saw it: glyphs already typed, blanks after.
     let mut after = [' '; 40];
     after[..usize::from(col) + 1].fill('x');
     glow.note_typed_cells(at, 1);
@@ -18,8 +13,6 @@ fn type_one_key(glow: &mut CursorGlow, cfg: &GlowConfig, g: Geom, at: Instant, r
     glow.tick(Some((row, col + 1)), at, cfg, g, &mut typed_scratch());
 }
 
-/// A twelve-key word at fast, average and slow human cadence earns a multi-cell ribbon across at
-/// least two status bands.
 #[test]
 fn a_word_typed_at_human_cadence_earns_the_full_rainbow_ribbon() {
     for ms in [100u64, 150, 250] {
@@ -67,8 +60,6 @@ fn a_word_typed_at_human_cadence_earns_the_full_rainbow_ribbon() {
     }
 }
 
-/// Negative control: ambient program output moves the cursor with no authored
-/// key, so status reports a decline and a dark ribbon.
 #[test]
 fn unauthored_output_is_declined_and_the_status_verb_shows_it_dark() {
     let g = geom();
@@ -76,8 +67,6 @@ fn unauthored_output_is_declined_and_the_status_verb_shows_it_dark() {
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
-    // A TUI redraw rewrote the row and walked the caret. No key was
-    // pressed, so no license term is fresh.
     let at = t0 + Duration::from_millis(1);
     let mut redrawn = [' '; 40];
     redrawn[..8].fill('#');
@@ -96,8 +85,6 @@ fn unauthored_output_is_declined_and_the_status_verb_shows_it_dark() {
     assert_eq!(glow.ribbon_hue_bands(), 0);
 }
 
-/// The status row: fixed key order, every gate present, and `ribbon_active`
-/// derived; one cell, or four cells in one hue, is not a rainbow.
 #[test]
 fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     let base = TrailStatus {
@@ -215,15 +202,11 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     ] {
         assert!(line.contains(key), "missing {key:?} in {line}");
     }
-    // The raw style string is quoted, so a trailing space or an empty
-    // setting is legible as itself rather than as a broken row.
     assert!(
         line.contains(r#"style="rainbow kitty pet""#),
         "the raw config string is reported verbatim: {line}"
     );
-    // One line: a status the caller can grep without reassembly.
     assert!(!line.contains('\n'), "the status row is one line: {line}");
-    // A style that draws nothing says so, not the engine's placeholder enum.
     let off = TrailStatus {
         style_raw: "off",
         style: None,
@@ -233,14 +216,11 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     }
     .line();
     assert!(off.contains(" resolved=off "), "{off}");
-    // Never a fabricated reason.
     let quiet = TrailStatus {
         tally: AdmissionTally::default(),
         ..base
     };
     assert!(quiet.line().contains(" last_decline_reason=none"));
-    // The ribbon verdict is derived from what is drawn: one lone cell is a
-    // glow under the caret, four same-hue cells a monochrome bar.
     assert!(base.ribbon_active());
     assert!(
         !TrailStatus {
@@ -266,9 +246,6 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         .ribbon_active(),
         "four cells in one hue is a bar, not a rainbow"
     );
-    // A falling curtain is still a ribbon: `ribbon_segments` is floored at the arc's dimmest
-    // stop, so late in a curtain the claim is zero while the band is still drawn. The row
-    // carries what is drawn and why the claim is under its floor; the verdict reads both.
     let curtain = TrailStatus {
         ribbon_segments: 0,
         ribbon_hue_bands: 0,
@@ -291,8 +268,6 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         "no curtain reads `none`, never a number: {}",
         base.line()
     );
-    // …and the end of the fall is the honest edge: nothing drawn, nothing
-    // claimed.
     assert!(
         !TrailStatus {
             ribbon_drawn: 0,
@@ -301,8 +276,6 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
         .ribbon_active(),
         "a spent curtain is not an active ribbon"
     );
-    // A dark band outside a curtain stays dark: the curtain clause is not a
-    // back door for the claim floor.
     assert!(
         !TrailStatus {
             ribbon_curtain_ms: None,
@@ -313,8 +286,6 @@ fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
     );
 }
 
-/// A minimal `trail status` row carrying one [`rk::Flow`]; the flow tests
-/// assert the bytes the socket prints.
 fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
     TrailStatus {
         style_raw: "rainbow kitty pet",
@@ -342,7 +313,6 @@ fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
         momentum_glow: 0.0,
         glow_active: false,
         pet_active: false,
-        // A flow row says nothing about the pet.
         pet_action: "none",
         pet_content: 0.0,
         pet_pending: 0,
@@ -362,12 +332,6 @@ fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
     }
 }
 
-/// `resolved=` names what the spelling resolved to: `off` resolves to NO
-/// style and the row says `off` rather than the placeholder enum a disabled
-/// config carries. A spelling naming nothing drawable (a typo, a bare
-/// `pack:`, a pack that did not load) falls back to the default style, so the
-/// row reads that default and `issue=` says why it was not honoured as
-/// written (the control: a style honoured as written reads `issue=none`).
 #[test]
 fn the_row_reports_off_and_names_why_a_spelling_fell_back() {
     let dark = TrailStatus {
@@ -428,10 +392,6 @@ fn the_row_reports_off_and_names_why_a_spelling_fell_back() {
     );
 }
 
-/// The row reports the engine's flow: a run of fast keys moves `flow=` and
-/// `combo=` on the printed row, and one Backspace zeroes them, through the
-/// real engine. An agent reading `trail status` can tell the human is
-/// mid-flow. Flow draws nothing, so no light is asserted.
 #[test]
 fn the_trail_row_reports_the_flow_the_engine_is_in() {
     let g = geom();
@@ -442,7 +402,6 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
     glow.tick(Some((2, 1)), t0, &c, g, &mut out);
     assert!(glow.v2.engaged(), "flow is priced by v2's spine");
 
-    // Cold: no keys, no flow.
     let cold = glow.flow_status();
     assert_eq!(
         (cold.heat, cold.combo, cold.best),
@@ -450,8 +409,6 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
         "a hand that has not typed is not in flow"
     );
 
-    // A run at 12 cps, one key per tick. The spine needs about a dozen keys to
-    // pass `FLOW_KEY_DISP`; the combo counts keys after that.
     let mut now = t0;
     let mut entries = 0u32;
     for k in 0..48u32 {
@@ -473,7 +430,6 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
     assert_eq!(hot.best, hot.combo, "the run IS the best so far");
     assert_eq!(entries, 1, "one ENTRY latch for one crossing, ever");
 
-    // The row, in the bytes the socket prints.
     let row = row_for(hot).line();
     assert!(
         row.contains(" flow=1.00")
@@ -482,7 +438,6 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
         "the row must carry the run it is in: {row}"
     );
 
-    // A delete ends it on the key's own edge, visible on the next reading.
     glow.note_backspace(now + Duration::from_millis(83));
     let broken = glow.flow_status();
     assert_eq!(
@@ -506,7 +461,6 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
         "an EXIT latches nothing — the pet hears only entries"
     );
 
-    // A cold hand's first key is under the spine floor and opens nothing.
     let mut cold = CursorGlow::default();
     cold.tick(Some((2, 1)), t0, &c, g, &mut out);
     cold.note_typed(t0 + Duration::from_millis(83));
@@ -517,8 +471,6 @@ fn the_trail_row_reports_the_flow_the_engine_is_in() {
     );
 }
 
-/// Auto-repeat cannot farm the combo: a held key is maximal momentum (the
-/// bypass [`CursorGlow::celebrate`] takes), so the ladder freezes under it.
 #[test]
 fn a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it() {
     let g = geom();
@@ -535,7 +487,6 @@ fn a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it() {
     }
     let earned = glow.flow_status().combo;
     assert!(earned > 0, "the run is live before the celebration");
-    // The celebration drives once per frame, as the host drives it.
     for _ in 0..20u32 {
         now += Duration::from_millis(83);
         glow.celebrate(now, 1.0);
@@ -547,7 +498,6 @@ fn a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it() {
         earned,
         "a frozen combo neither climbs nor breaks"
     );
-    // …and it thaws: after the grace, real keys count again.
     now += Duration::from_secs_f32(rk::spine::FLOW_FREEZE_S) + Duration::from_millis(83);
     glow.note_typed(now);
     glow.tick(Some((2, 6)), now, &c, g, &mut out);
@@ -558,10 +508,6 @@ fn a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it() {
     );
 }
 
-/// The row names the style that owns the caret, the colour that owner built
-/// its body from, and where that colour came from, so whether the cursor
-/// colour reaches the glass is answered by the sensor, not a capture.
-/// `glow_active` / `pet_active` / `cat_active` cannot answer it.
 #[test]
 fn the_status_row_names_who_owns_the_block_cursor() {
     let quiet = TrailStatus {
@@ -588,7 +534,6 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         momentum: 0.0,
         momentum_display: 0.0,
         momentum_glow: 0.0,
-        // Every gate quiet…
         glow_active: false,
         pet_active: false,
         pet_action: "none",
@@ -617,8 +562,6 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         "nobody owns the caret ⇒ the terminal's own cursor colour paints it: {line}"
     );
 
-    // …and the same quiet row with a body effect live: a named owner holding
-    // the caret beside three `*_active=false` gates.
     let owned = TrailStatus {
         block_fill: Some(BlockFill {
             owner: BlockFillOwner::Phaser,
@@ -642,8 +585,6 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         "…while the row names the style that owns the caret: {line}"
     );
 
-    // A body painting a colour other than the one it was handed is readable
-    // in one row: `base` is what the host handed, `fill` what was painted.
     let broken = TrailStatus {
         block_fill: Some(BlockFill {
             owner: BlockFillOwner::Phaser,
@@ -658,8 +599,6 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         "an owner that ignored its base must be legible as such: {line}"
     );
 
-    // Zero-padded to six digits: a dark colour must not print as `ff` and
-    // be mistaken for a red one.
     assert!(
         TrailStatus {
             block_fill: Some(BlockFill {
@@ -673,8 +612,6 @@ fn the_status_row_names_who_owns_the_block_cursor() {
         .contains(" block_fill_rgb=0000ff")
     );
 
-    // Provenance is a property of the owner: fire owns its orange; the
-    // rainbow and phaser blooms start from the cursor's own colour.
     for (owner, from) in [
         (BlockFillOwner::Rainbow, "cursor_color"),
         (BlockFillOwner::Phaser, "cursor_color"),
@@ -695,7 +632,6 @@ fn the_status_row_names_who_owns_the_block_cursor() {
             block_fill: Some(BlockFill {
                 owner,
                 fill: 0x0012_3456,
-                // The host hands a base to every style except those that own their colour.
                 base: (!identity).then_some(0x00AB_CDEF),
             }),
             ..quiet
@@ -708,8 +644,6 @@ fn the_status_row_names_who_owns_the_block_cursor() {
             "{} is not legible in the row: {line}",
             owner.label()
         );
-        // A style-identity owner reports no base (it was handed none), and
-        // the painted colour still shows.
         assert!(
             line.contains(if identity {
                 " block_fill_base=none"
@@ -720,19 +654,9 @@ fn the_status_row_names_who_owns_the_block_cursor() {
             owner.label()
         );
     }
-    // One line, still — the whole row stays greppable without reassembly.
     assert!(!owned.line().contains('\n'));
 }
 
-/// The engine asks its host for the rows above and below the caret's for
-/// every style with an over-text rule that reads them, not only while the
-/// rainbow kitty owns the frame: Fire (its over-ink ledger and light flame
-/// cap), the beam family (its dark bed's split between bed and beam) and the
-/// particle styles count an unread row as text or as air, which is wrong
-/// either way over a blank row or old output, and the classic wake's mono
-/// face (its bed's rail and its over-ink account). Negative control: the
-/// classic wake's spectrum face reads neither, and a fresh engine has no
-/// style.
 #[test]
 fn the_styles_that_read_the_flanking_rows_ask_for_them() {
     let g = geom();
@@ -770,9 +694,6 @@ fn the_styles_that_read_the_flanking_rows_ask_for_them() {
     assert!(!CursorGlow::default().reads_neighbor_rows());
 }
 
-/// The classic wake lights every observed move without the licensed spawn
-/// path, so it reports its spawns itself: `trail status` counts them and the
-/// diagnosis ring names them `motion`. A frame with no move adds nothing.
 #[test]
 fn classic_spawns_reach_the_count_and_the_ring() {
     let g = geom();
@@ -788,7 +709,6 @@ fn classic_spawns_reach_the_count_and_the_ring() {
     let last = glow.admission_log().last().expect("a ring row");
     assert_eq!(last.licence, AdmissionRecord::LICENCE_MOTION);
     assert_eq!((last.origin, last.target), ((2, 4), (2, 5)));
-    // Negative control: the cursor stays put, nothing more is counted.
     glow.tick(Some((2, 5)), t + Duration::from_millis(80), &c, g, &mut out);
     assert_eq!(glow.spawns(), spawns + 1);
     assert_eq!(glow.admission_tally().licensed, licensed + 1);

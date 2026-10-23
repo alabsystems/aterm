@@ -91,7 +91,7 @@ impl Tile {
     /// fast path the scanline rasterizer ([`crate::vector::fill_path`]) uses for
     /// fully-covered pixel runs. Byte-identical to calling [`over`](Self::over) `len`
     /// times; when `a` is opaque it pattern-fills the RGBA quad directly (one 4-byte
-    /// [`Tile::over_run`] (a 4-byte pattern fill when opaque). The run is clipped to the tile.
+    /// `copy_from_slice` per pixel, no per-pixel blend). The run is clipped to the tile.
     #[inline]
     pub(crate) fn over_run(&mut self, x: i32, y: i32, len: u32, rgb: (f32, f32, f32), a: f32) {
         if y < 0 || y as u32 >= self.h || a <= 0.0 || len == 0 {

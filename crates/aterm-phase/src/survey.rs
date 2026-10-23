@@ -164,6 +164,7 @@ pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
             } else if crate::text::trim(row).is_empty()
                 || (row.starts_with("  ") && !row.starts_with("   "))
             {
+                // A body row: the message continues at column 2 (a blank is the
                 // memory card's paragraph break).
                 None
             } else {
@@ -276,7 +277,12 @@ fn is_drafts_hint(row: &str) -> bool {
         })
 }
 
-/// The prompts drawn in the rating card's slot that are not ratings, with the same `<key>: <label>` cells and a `Don't ask again` choice: the transcript-share ask that follows a rating (`⏺ Can Anthropic look at your session transcript …?`, the docs URL at column 2, `  y: Yes    n: No     d: Don't ask again`) and the web-setup offer (`⏺ Pushed to GitHub.`
+/// The prompts drawn in the rating card's slot that are not ratings, with the same
+/// `<key>: <label>` cells and a `Don't ask again` choice: the transcript-share ask that
+/// follows a rating (`⏺ Can Anthropic look at your session transcript …?`, the docs URL
+/// at column 2, `  y: Yes    n: No     d: Don't ask again`) and the web-setup offer
+/// (`⏺ Pushed to GitHub. Connect GitHub to claude.ai …?` over
+/// `  1: Yes, run /web-setup   2: Not now   3: Don't ask again`).
 #[must_use]
 pub fn ask_card(rows: &[String]) -> Option<(usize, usize)> {
     let frame = composer_frame(rows)?;
@@ -300,6 +306,7 @@ pub fn ask_card(rows: &[String]) -> Option<(usize, usize)> {
                 && !row.starts_with("   ")
                 && !crate::text::trim(row).is_empty()
             {
+                // The docs URL, or the row a long question wraps to: column 2. The card
                 // holds no blank row, so a blank above the options ends the walk: no ask.
                 None
             } else {

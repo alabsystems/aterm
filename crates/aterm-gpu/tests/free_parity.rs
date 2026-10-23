@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Free-floating sprite layer (FREE_OVERLAY_LAYER_DESIGN.md §5): CPU==GPU parity for
-// `free_sprites`. The layer uses the cat's nearest 1:1 regime through the same source-over
-// pipeline, so the effect-only delta is held to the cat bar (target <= 1, hard <= 2; float UV
-// normalization can round a boundary texel on the GPU). Also covered: OverText z-order, the
-// damaged path (moved multi-row rects, no ghosting, the dirty gate), settled overlays inside a
-// scissor band, and scaled-sprite texel selection.
-//
-// No GPU or no font: COULD NOT RUN.
+
+//! CPU/GPU parity and damage-cache tests for the free-floating sprite layer.
 
 use crate::common;
 use std::sync::Arc;
@@ -19,9 +12,6 @@ use aterm_render::{SceneAtlas, SpriteQuad, Theme, WindowCpu};
 
 use crate::common::{backends, bb, gg, max_channel_delta, rr};
 
-/// A deterministic RGBA atlas: distinct per-texel colours, opaque top half,
-/// mixed-alpha bottom half. Power-of-two dims keep nearest UV math exact at
-/// texel centres.
 fn free_atlas(version: u64) -> SceneAtlas {
     let (w, h) = (64u32, 128u32);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -48,8 +38,6 @@ fn free_atlas(version: u64) -> SceneAtlas {
     }
 }
 
-/// A NEAREST-1:1 free sprite (`aw/ah == w/h`, bake == dest), under text by
-/// default.
 fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2], alpha: u8) -> FreeSprite {
     let [ax, ay] = src_xy;
     FreeSprite {
@@ -69,8 +57,6 @@ fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2], alpha: u8) -> Fre
     }
 }
 
-/// Free-layer parity over a delta-0 base (procedural blocks and bg): multi-row rects over blank
-/// bg and text, partial alpha, sprite alpha with `flip_x`, a tinted rect, and an OverText rect.
 #[test]
 fn free_effect_only_parity_pinned_over_bg_and_text() {
     let theme = Theme::default();
@@ -81,7 +67,6 @@ fn free_effect_only_parity_pinned_over_bg_and_text() {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process("\x1b[?25l████████".as_bytes()); // procedural: byte-exact base
 
-    // Base (no sprites): the effect-only premise — CPU==GPU exactly.
     let base_input = term.cell_frame(rows, cols);
     let cpu_base = cpu.render_input(&base_input);
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
@@ -95,13 +80,9 @@ fn free_effect_only_parity_pinned_over_bg_and_text() {
     let mut input = term.cell_frame(rows, cols);
     input.free_atlas = Some(Arc::new(free_atlas(1)));
     input.free_sprites = vec![
-        // Multi-row over blank bg, opaque texels (atlas top half).
         free_1to1(4, (2 * ch) as i32, 40, mh.min(60), [2, 0], 255),
-        // Multi-row over the block text, opaque texels, sub-cell origin.
         free_1to1(2, (ch / 3) as i32, 48, mh.min(60), [8, 0], 255),
-        // Over blank bg, partial-alpha texels (atlas bottom half): real blending.
         free_1to1(8, (4 * ch) as i32, 32, (ch as u16).min(56), [0, 65], 255),
-        // Sprite-level alpha multiplier + horizontal flip.
         FreeSprite {
             flip_x: true,
             ..free_1to1(
@@ -113,7 +94,6 @@ fn free_effect_only_parity_pinned_over_bg_and_text() {
                 140,
             )
         },
-        // Tinted (multiply 0x40C080) over blank bg.
         FreeSprite {
             tint: 0x0040_C080,
             ..free_1to1(
@@ -125,7 +105,6 @@ fn free_effect_only_parity_pinned_over_bg_and_text() {
                 255,
             )
         },
-        // OverText: draws over the glyphs, immediately before the cursor slot.
         FreeSprite {
             z: FreeZ::OverText,
             ..free_1to1(
@@ -154,17 +133,11 @@ fn free_effect_only_parity_pinned_over_bg_and_text() {
     );
 }
 
-/// OverText z-order on both backends: over everything except the cursor. An
-/// opaque OverText sprite covers a glyph, a wdeco `Over` stamp and additive
-/// glow and nova light; the CPU cells are pure sprite colour and the GPU cells
-/// match within the cat bar (<= 2).
 #[test]
 fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
     use aterm_core::render::{DecoBlend, DecoGlyph, GlowQuad, WordDecoration};
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
-    // Bloom and shimmer are GPU-only layers over the whole readback; off so
-    // this measures the shared FreeOver slot.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -173,7 +146,6 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process("\x1b[?25l██".as_bytes());
 
-    // A solid red atlas: covered cells must come out exactly this colour.
     let red = 0x00C8_2020u32;
     let atlas = aterm_render::SceneAtlas {
         width: 8,
@@ -184,14 +156,12 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
 
     let mut input = term.cell_frame(rows, cols);
     input.free_atlas = Some(Arc::new(atlas));
-    // Opaque OverText sprite covering cells (0,0)..=(1,1).
     input.free_sprites = vec![FreeSprite {
         z: FreeZ::OverText,
         aw: 8,
         ah: 8,
         ..free_1to1(0, 0, (2 * cw) as u16, (2 * ch) as u16, [0, 0], 255)
     }];
-    // A wdeco Over stamp + aurora and nova light under the sprite's footprint.
     input.word_decorations.push(WordDecoration {
         row: 0,
         col: 1,
@@ -209,7 +179,6 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
         w: (2 * cw) as u16,
         h: ch as u16,
         color: aterm_render::premul_rgb(0x0040_80FF, 200),
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: aterm_render::premul_rgb(0x0040_80FF, 200),
         alpha2: 0,
@@ -221,13 +190,11 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
         w: cw as u16,
         h: ch as u16,
         color: aterm_render::premul_rgb(0x00FF_C040, 200),
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: aterm_render::premul_rgb(0x00FF_C040, 200),
         alpha2: 0,
     });
 
-    // Non-vacuous premise: without the sprite the stamp + light paint.
     let mut bare = input.clone();
     bare.free_sprites.clear();
     bare.free_atlas = None;
@@ -239,8 +206,6 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
     );
     let gpu_f = gpu.render_input(&mut win, &input, None);
 
-    // Every pixel of the sprite's 2×2-cell footprint: CPU byte-pure red, GPU
-    // within the cat bar of pure red.
     let mut gpu_max = 0i32;
     for y in 0..2 * ch {
         for x in 0..2 * cw {
@@ -263,9 +228,6 @@ fn free_over_text_covers_wdeco_and_additive_light_both_backends() {
     );
 }
 
-/// Damaged path on both backends: prime with the rect at bands 1..=3, move it
-/// to 2..=4, and compare the cached repaint with the same move as per-row
-/// `cat_quads` slices (byte-exact on the CPU, <= 2 on the GPU).
 #[test]
 fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
     let theme = Theme::default();
@@ -313,7 +275,6 @@ fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
         input
     };
 
-    // CPU: byte-exact.
     let mut wc_free = WindowCpu::new();
     let mut wc_legacy = WindowCpu::new();
     let _ = cpu.render_input_cached(&mut wc_free, &make_free(&mut term, y_a));
@@ -332,7 +293,6 @@ fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
          legacy per-row slices byte-for-byte"
     );
 
-    // GPU: within the cat bar (float UV boundary-texel rounding only).
     let mut win_free = aterm_gpu::WindowGpu::new();
     let _ = gpu.render_input_cached(&mut win_free, &make_free(&mut term, y_a));
     let gpu_free = gpu
@@ -354,17 +314,12 @@ fn free_multirow_rect_matches_legacy_slices_on_damaged_path_both_backends() {
     );
 }
 
-/// Damaged-path no-ghosting and the dirty gate on both backends: frame A primes
-/// with a rect at bands 1..=3; frame B moves it down one band (GPU gate misses;
-/// both cached repaints equal a fresh full render); frame C repeats B and takes
-/// the GPU dirty gate.
 #[test]
 fn damaged_path_free_no_ghosting_and_settled_gate_hit_both_backends() {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (6usize, 12usize);
-    // Glyph-free, so glyph AA overhang across band edges stays out of the comparison.
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     let atlas = Arc::new(free_atlas(3));
@@ -387,10 +342,6 @@ fn damaged_path_free_no_ghosting_and_settled_gate_hit_both_backends() {
     );
 }
 
-/// The settled-overlay scissor-band pin the next three tests share: `make(term, 0)` primes the CPU
-/// damage cache and the GPU present-path offscreen, then each of four damaged frames
-/// `make(term, 1..=4)` must take the GPU's scissored path and repaint byte-stable against a
-/// fresh full render on both backends. `cpu_why` / `gpu_why` finish the failure messages.
 fn assert_damaged_frames_byte_stable(
     (cpu, gpu): (&mut aterm_render::Renderer, &mut aterm_gpu::GpuRenderer),
     theme: Theme,
@@ -426,25 +377,16 @@ fn assert_damaged_frames_byte_stable(
     }
 }
 
-/// A settled translucent sprite (rows 3..=6) under a scissor band from edits on
-/// rows 2 and 10: the dirty set must cover every band row the sprite overlaps
-/// (the band fill in `compute_dirty_rows`), or translucent texels re-blend over
-/// their cached pixels and darken each frame. N damaged frames, each byte-stable
-/// against a fresh full render on the GPU and the CPU damaged path.
 #[test]
 fn settled_translucent_sprite_inside_dirty_band_stays_byte_stable() {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (12usize, 20usize);
-    // Glyph-free rows under the sprite (the free layer's own invariant); the
-    // dirt lives on rows 2 and 10, straddling the sprite's bands 3..=6.
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     let atlas = Arc::new(free_atlas(7));
 
-    // Translucent texels (atlas bottom half) + a sprite-level alpha: any
-    // double-blend is visible. Rows 3..=6: y in [3ch + ch/4, 6ch + 3ch/4).
     let sprite = free_1to1(
         6,
         (3 * ch + ch / 4) as i32,
@@ -461,7 +403,6 @@ fn settled_translucent_sprite_inside_dirty_band_stays_byte_stable() {
         input
     };
 
-    // N damaged frames with the sprite settled (equal sprites, same version).
     assert_damaged_frames_byte_stable(
         (&mut cpu, &mut gpu),
         theme,
@@ -475,11 +416,6 @@ fn settled_translucent_sprite_inside_dirty_band_stays_byte_stable() {
     );
 }
 
-/// OverText twin of the test above: a settled translucent OverText sprite
-/// (rows 3..=6) with dirt on rows 2 and 10. The CPU stamps OverText last,
-/// clipped to dirty bands; the GPU `FreeOver` stream is clipped by the scissor.
-/// Both must rebuild every overlapped band row. N frames, byte-stable per
-/// backend.
 #[test]
 fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
     let theme = Theme::default();
@@ -488,12 +424,9 @@ fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
     let (rows, cols) = (12usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    // Static text inside the sprite's bands: OverText must keep covering it (the z premise),
-    // and a re-blend over the glyph pixels is visible too.
     term.process(b"\x1b[5;3Hcovered text");
     let atlas = Arc::new(free_atlas(9));
 
-    // Translucent texels and sprite alpha in the OverText slot, rows 3..=6.
     let sprite = FreeSprite {
         z: FreeZ::OverText,
         ..free_1to1(
@@ -526,10 +459,6 @@ fn settled_translucent_over_text_sprite_inside_dirty_band_stays_byte_stable() {
     );
 }
 
-/// A settled lifted `Add` sparkle (`dy = -cell_h/3`) on row 5 with dirt on its
-/// own row and row 2: both backends re-stamp it each damaged frame, so
-/// `compute_dirty_rows` must include the spill row 4 or the spill re-adds onto
-/// preserved pixels and brightens. N frames, byte-stable per backend.
 #[test]
 fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
     use aterm_core::render::{DecoBlend, DecoGlyph, WordDecoration};
@@ -539,8 +468,6 @@ fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
     let (rows, cols) = (8usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    // Static text on the spill row (index 4), so a re-Add would also land over glyph pixels;
-    // the row below the deco row stays glyph-free.
     term.process(b"\x1b[5;1Hstatic spill row");
 
     let deco = WordDecoration {
@@ -555,8 +482,6 @@ fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
     };
     assert!(deco.dy != 0, "the lift must be non-zero (spill premise)");
     let make = |term: &mut Terminal, n: usize| {
-        // Dirt on row 2 (widens the scissor band over the spill row) and on the deco's own row
-        // (re-stamps the settled deco).
         term.process(format!("\x1b[2;1Htop dirt {n}\x1b[6;1Hdeco row dirt {n}").as_bytes());
         let mut input = term.cell_frame(rows, cols);
         input.word_decorations.push(deco);
@@ -576,8 +501,6 @@ fn settled_lifted_add_deco_spill_inside_dirty_band_stays_byte_stable() {
     );
 }
 
-/// The same invariant for settled `cat_quads`: a translucent cat quad on row 4
-/// with dirt on rows 2 and 8 stays byte-stable on the scissored GPU path.
 #[test]
 fn settled_translucent_cat_quad_inside_dirty_band_stays_byte_stable() {
     let theme = Theme::default();
@@ -632,14 +555,6 @@ fn settled_translucent_cat_quad_inside_dirty_band_stays_byte_stable() {
     }
 }
 
-/// A scaled free sprite samples the same texel on both backends.
-///
-/// The cursor pet draws with `aw != w` (pose scale against a fixed bake). The
-/// CPU picks the source index in integers (`floor(((2·d + 1)·aw) / (2·w))`,
-/// mirrored under `flip_x`); the GPU floors a float uv. They differ at exact
-/// texel-boundary ties, which `uv_tie_bias` resolves. The sweep covers
-/// tie-free ratios (80 %, 120 %, 200 %) and tie-dense ones (50 %, 90 %, 150 %),
-/// each with and without `flip_x`.
 #[test]
 fn free_scaled_sprite_samples_the_same_texel_as_the_cpu() {
     let theme = Theme::default();
@@ -649,7 +564,6 @@ fn free_scaled_sprite_samples_the_same_texel_as_the_cpu() {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
 
-    // A pet-shaped bake: one fixed 40x40 tile, drawn at the pose's dest size.
     let (nat_w, nat_h) = (40u16, 40u16);
     let mut scaled_seen = 0usize;
     for pct in [100u32, 50, 80, 90, 95, 105, 110, 112, 120, 125, 150, 200] {
@@ -679,7 +593,6 @@ fn free_scaled_sprite_samples_the_same_texel_as_the_cpu() {
             }];
             let c = cpu.render_input(&input);
             let g = gpu.render_input(&mut win, &input, None);
-            // Non-vacuity: the sprite must actually be on the glass.
             let mut bare = input.clone();
             bare.free_sprites.clear();
             assert_ne!(

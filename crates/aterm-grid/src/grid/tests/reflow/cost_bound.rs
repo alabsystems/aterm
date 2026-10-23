@@ -2,13 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded cost of the width-change scrollback reflow. A direct width change rewraps the whole
-//! off-screen scrollback (`take_scrollback_lines` + `reflow_scrollback_lines`) under the caller's
-//! lock, O(session history); on the GUI main thread that freezes the UI. These tests count the
-//! history lines a resize rewraps synchronously (`count_scrollback_reflow_sync_lines`, at the
-//! synchronous site in `grid/reflow.rs`) rather than timing it:
-//! `Grid::resize_offloading_scrollback` rewraps only the ring's newest lines it holds back, at most
-//! `HOLD_BACK_SCREENS` screens of cells.
+//! Bounded-cost tests for synchronous width-change scrollback reflow.
 
 use super::super::super::*;
 use crate::test_counters::{take_handback_history_reads, take_scrollback_reflow_sync_lines};
@@ -39,12 +33,7 @@ fn tiered_grid_with_short_history(rows: u16, cols: u16, ring: usize, n: usize) -
     grid
 }
 
-/// [`tiered_grid_with_short_history`] with an 8-line ring, whose newest
-/// history line is longer than the ring and the screen together and starts
-/// further up than a width change walks to bring a line's head onto the
-/// screen (`Grid::head_walk`, four screens): the ring holds only its
-/// continuation rows, so a width change's detach holds no line back, reveals
-/// none, and the whole history is away with the job while it runs.
+/// [`tiered_grid_with_short_history`] with an 8-line ring.
 fn tiered_grid_with_history_away(rows: u16, cols: u16, n: usize) -> Grid {
     let mut grid = tiered_grid_with_short_history(rows, cols, 8, n);
     grid.set_cursor(rows - 1, 0);
@@ -56,7 +45,7 @@ fn tiered_grid_with_history_away(rows: u16, cols: u16, n: usize) -> Grid {
     grid
 }
 
-/// A grid whose bulk history is in the tiered store: its 8-line ring spills most scroll-off there.
+/// A grid whose bulk history is in the tiered store.
 fn tiered_grid_with_deep_history(rows: u16, cols: u16, n: u16) -> Grid {
     let mut grid = tiered_grid(rows, cols, 8);
     for i in 0..n {
@@ -74,14 +63,8 @@ fn tiered_grid_with_deep_history(rows: u16, cols: u16, n: u16) -> Grid {
     grid
 }
 
-/// The offloaded resize rewraps synchronously only the ring's newest lines it holds back, at most
-/// `HOLD_BACK_SCREENS` screens of cells at the larger size: the tiered store detaches and the rest
-/// of the ring history rides the job as `Line`s.
 #[test]
 fn offloaded_resize_rewraps_only_the_lines_it_holds_back() {
-    // Normalize the public inputs before deciding whether there is a width
-    // change or budgeting the job. Skinny grids exercise both full u16 input
-    // domains while retaining only 4096 cells, not a 4096-square allocation.
     for (rows, cols, requested_rows, requested_cols) in [
         (1, crate::MAX_GRID_COLS, 0, u16::MAX),
         (crate::MAX_GRID_ROWS, 1, u16::MAX, 0),
@@ -119,7 +102,6 @@ fn offloaded_resize_rewraps_only_the_lines_it_holds_back() {
         .resize_offloading_scrollback(rows, cols / 2)
         .expect("a width change with a tiered store yields an offload job");
     let sync = take_scrollback_reflow_sync_lines();
-    // `HOLD_BACK_SCREENS` screens of 24 x 80 cells, one-row lines at 80 columns.
     let held = crate::grid::scrollback_offload::HOLD_BACK_SCREENS * usize::from(rows);
     assert_eq!(
         sync, held,
@@ -141,8 +123,6 @@ fn offloaded_resize_rewraps_only_the_lines_it_holds_back() {
     grid.assert_invariants();
 }
 
-/// Output produced during the reflow window is kept: with an 8-line ring, uncaptured window lines
-/// would be evicted with nowhere to go. Short lines, so the 80->40 reflow keeps the line count.
 #[test]
 fn offload_window_captures_concurrent_scrolloff_no_gap() {
     let (rows, cols) = (10u16, 80u16);
@@ -153,7 +133,6 @@ fn offload_window_captures_concurrent_scrolloff_no_gap() {
     let pending = grid
         .resize_offloading_scrollback(rows, cols / 2)
         .expect("offload job");
-    // Foreground program keeps streaming while the worker rewraps.
     for i in 0..500 {
         short_line(&mut grid, rows, &format!("W{i}"));
     }
@@ -169,8 +148,6 @@ fn offload_window_captures_concurrent_scrolloff_no_gap() {
     grid.assert_invariants();
 }
 
-/// Scrollback erased during the reflow window is not resurrected by the worker
-/// re-attaching the stale pre-erase store.
 #[test]
 fn offload_window_erase_is_not_resurrected() {
     let (rows, cols) = (10u16, 80u16);
@@ -192,8 +169,6 @@ fn offload_window_erase_is_not_resurrected() {
     grid.assert_invariants();
 }
 
-/// A reader scrolled deep into history keeps their position across an offloaded
-/// resize (not collapsed to the ring-only count during the detach).
 #[test]
 fn offload_preserves_deep_scroll_position() {
     let (rows, cols) = (10u16, 80u16);
@@ -217,12 +192,9 @@ fn offload_preserves_deep_scroll_position() {
     grid.assert_invariants();
 }
 
-/// A height shrink during the reflow window (find bar, bottom drag, split) stages the front ring
-/// rows (window output) to the lazy buffer instead of dropping them.
 #[test]
 fn offload_window_height_shrink_keeps_ring_scrollback() {
     let (rows, cols) = (10u16, 80u16);
-    // A large ring, so a big block of window output is still in the ring at the height shrink.
     let mut grid = tiered_grid_with_short_history(rows, cols, 128, 1000);
     let before = grid.scrollback_lines();
     assert!(before > 500, "precondition: deep history ({before})");
@@ -230,12 +202,9 @@ fn offload_window_height_shrink_keeps_ring_scrollback() {
     let pending = grid
         .resize_offloading_scrollback(rows, cols / 2)
         .expect("offload job");
-    // Streaming while the worker rewraps fills the ring (128); the overflow stages.
     for i in 0..600 {
         short_line(&mut grid, rows, &format!("W{i}")); // short: no wrap at 40
     }
-    // A height shrink mid-window: width unchanged and store detached, so
-    // `resize_offloading_scrollback` falls back to a plain resize with the store still None.
     assert!(
         grid.resize_offloading_scrollback(rows / 2, cols / 2)
             .is_none(),
@@ -254,22 +223,17 @@ fn offload_window_height_shrink_keeps_ring_scrollback() {
     grid.assert_invariants();
 }
 
-/// A worker that dies mid-rewrap never re-attaches, so `abort_reflow_offload` closes the window;
-/// otherwise every scroll-off stages into an un-drainable lazy buffer and the tiered history stays
-/// invisible.
 #[test]
 fn offload_abort_recovers_grid_to_bounded_state() {
     let (rows, cols) = (10u16, 80u16);
     let mut grid = tiered_grid_with_short_history(rows, cols, 64, 500);
 
-    // The worker dies: the job drops without re-attaching, then abort.
     let pending = grid
         .resize_offloading_scrollback(rows, cols / 2)
         .expect("offload job");
     drop(pending); // worker "panicked" — reattach never runs
     grid.abort_reflow_offload();
 
-    // Window closed: streaming stays ring-bounded (the lazy buffer discards).
     for i in 0..5000 {
         short_line(&mut grid, rows, &format!("R{i}"));
     }
@@ -282,7 +246,6 @@ fn offload_abort_recovers_grid_to_bounded_state() {
     grid.assert_invariants();
 }
 
-/// A reader who goes to the live bottom during the window (End) stays there on re-attach.
 #[test]
 fn offload_window_scroll_to_bottom_not_clobbered() {
     let (rows, cols) = (10u16, 80u16);
@@ -307,8 +270,6 @@ fn offload_window_scroll_to_bottom_not_clobbered() {
     grid.assert_invariants();
 }
 
-/// Heavy streaming through a long reflow window (drain suppressed while the store is detached)
-/// caps the lazy buffer, dropping the oldest staged lines.
 #[test]
 fn offload_window_lazy_buffer_is_bounded() {
     let (rows, cols) = (10u16, 80u16);
@@ -322,14 +283,12 @@ fn offload_window_lazy_buffer_is_bounded() {
     let pending = grid
         .resize_offloading_scrollback(rows, cols / 2)
         .expect("offload job");
-    // Stream more than the DETACHED_LAZY_CAP (50_000) short lines during the window.
     for i in 0..55_000 {
         short_line(&mut grid, rows, &format!("W{i}"));
     }
     let reflowed = pending.reflow();
     grid.reattach_reflowed_scrollback(reflowed);
 
-    // ~50k window lines survive and the ~5k oldest drop.
     let after = grid.scrollback_lines();
     assert!(
         after < before + 52_000,
@@ -344,8 +303,7 @@ fn offload_window_lazy_buffer_is_bounded() {
     grid.assert_invariants();
 }
 
-/// A tiered grid whose history is soft-wrapped at `cols`: `n` lines of `cols + 30` chars, two rows
-/// each, that a widen past their length unwraps.
+/// A tiered grid whose history is soft-wrapped at `cols`.
 fn tiered_grid_with_wrapped_history(rows: u16, cols: u16, n: u16) -> Grid {
     let mut grid = tiered_grid(rows, cols, 8);
     let width = cols as usize + 30;
@@ -364,8 +322,6 @@ fn tiered_grid_with_wrapped_history(rows: u16, cols: u16, n: u16) -> Grid {
     grid
 }
 
-/// A width change that rewraps nothing leaves a scrolled-back reader on the same line: the
-/// detach's own clamp to an empty history is not the reader pressing End.
 #[test]
 fn offload_width_change_keeps_an_unwrapped_reader_on_the_same_line() {
     let (rows, cols) = (10u16, 80u16);
@@ -402,9 +358,6 @@ fn offload_width_change_keeps_an_unwrapped_reader_on_the_same_line() {
     grid.assert_invariants();
 }
 
-/// The same gesture on wrapped content: the widen unwraps history, so no exact
-/// anchor exists; the reader gets the clamped pre-resize offset and stays in
-/// history rather than at the live prompt.
 #[test]
 fn offload_widen_keeps_the_scrolled_back_reader_in_history() {
     let (rows, cols) = (10u16, 80u16);
@@ -437,8 +390,6 @@ fn offload_widen_keeps_the_scrolled_back_reader_in_history() {
     grid.assert_invariants();
 }
 
-/// The converging follow-up detach (no resize to re-clamp) keeps the viewport within the history
-/// still attached, and the reader's position comes back when the converging pass re-attaches.
 #[test]
 fn redetach_clamps_the_viewport_and_still_restores_the_reader() {
     let (rows, cols) = (10u16, 80u16);
@@ -446,8 +397,6 @@ fn redetach_clamps_the_viewport_and_still_restores_the_reader() {
     grid.scroll_display(150);
     assert_eq!(grid.display_offset(), 150, "precondition: 150 rows up");
 
-    // Width change A detaches; a superseding width change B lands mid-flight, so
-    // re-attach converges with one more detach at the settled width.
     let pending = grid
         .resize_offloading_scrollback(rows, cols + 40)
         .expect("offload job A");
@@ -480,8 +429,6 @@ fn redetach_clamps_the_viewport_and_still_restores_the_reader() {
     grid.assert_invariants();
 }
 
-/// An abort discards the staged window output a reader had scrolled up over; the viewport comes
-/// down with it.
 #[test]
 fn abort_reclamps_the_viewport_when_the_staged_window_output_is_discarded() {
     let (rows, cols) = (10u16, 80u16);
@@ -490,8 +437,6 @@ fn abort_reclamps_the_viewport_when_the_staged_window_output_is_discarded() {
     let pending = grid
         .resize_offloading_scrollback(rows, 60)
         .expect("offload job");
-    // Window output stages into the lazy buffer (the store is out with the job);
-    // the reader scrolls up over it.
     for i in 0..200 {
         short_line(&mut grid, rows, &format!("W{i}"));
     }
@@ -515,9 +460,6 @@ fn abort_reclamps_the_viewport_when_the_staged_window_output_is_discarded() {
     grid.assert_invariants();
 }
 
-/// A reader who moved during the window and ended at the live bottom chose it (offset
-/// 0 -> 20 -> 0 after a widen's detach clamped to 0): only a record of the window tells this from
-/// a reader who touched nothing.
 #[test]
 fn offload_window_reader_who_moved_then_returned_to_live_chose_it() {
     let (rows, cols) = (10u16, 80u16);
@@ -553,9 +495,7 @@ fn offload_window_reader_who_moved_then_returned_to_live_chose_it() {
     grid.assert_invariants();
 }
 
-/// `n` short history lines and a long one, the reader at `offset`, then detached for a width
-/// change: nothing is attached above the viewport (the detach holds no line back and lifts the
-/// ring, see [`tiered_grid_with_history_away`]).
+/// `n` short history lines and a long one ([`tiered_grid_with_history_away`]).
 fn detached_with_reader_at(offset: i32, n: usize) -> (Grid, PendingScrollbackReflow) {
     let rows = 10u16;
     let mut grid = tiered_grid_with_history_away(rows, 80, n);
@@ -572,8 +512,6 @@ fn detached_with_reader_at(offset: i32, n: usize) -> (Grid, PendingScrollbackRef
     (grid, pending)
 }
 
-/// A scroll up while the history is away moves nothing but is kept as an aim; the re-attach lands
-/// the reader there. Outside a window it is only a scroll.
 #[test]
 fn offload_window_scroll_up_over_the_away_history_lands_at_the_reattach() {
     let (mut grid, pending) = detached_with_reader_at(0, 500);
@@ -598,8 +536,6 @@ fn offload_window_scroll_up_over_the_away_history_lands_at_the_reattach() {
     assert!(!grid.reader_aim_held());
 }
 
-/// Down spends the aim first; all the way back down is the reader choosing the
-/// live bottom — even over a restore that would have put them 150 rows up.
 #[test]
 fn offload_window_aim_moves_both_ways_and_home_is_a_choice() {
     let (mut grid, pending) = detached_with_reader_at(0, 500);
@@ -619,7 +555,6 @@ fn offload_window_aim_moves_both_ways_and_home_is_a_choice() {
         "up and back down to the live bottom is the reader's choice, not a no-op"
     );
 
-    // End (and a keystroke's snap, which is the same primitive) after an aim.
     let (mut grid, pending) = detached_with_reader_at(150, 500);
     grid.scroll_display(30);
     grid.scroll_to_bottom();
@@ -628,9 +563,6 @@ fn offload_window_aim_moves_both_ways_and_home_is_a_choice() {
     grid.assert_invariants();
 }
 
-/// Top aims at the top of the whole history; an aim below the restore never
-/// pulls the reader down from where the restore puts them; with no aim the
-/// restore stands exactly (including an End that moved nothing).
 #[test]
 fn offload_window_aim_top_and_the_restore() {
     let (mut grid, pending) = detached_with_reader_at(0, 500);
@@ -659,8 +591,6 @@ fn offload_window_aim_top_and_the_restore() {
     grid.assert_invariants();
 }
 
-/// Output that scrolls into history after the ask pushes the aim up with it (the
-/// per-batch repin rule), so the reader lands on the content they asked for.
 #[test]
 fn offload_window_aim_rides_up_with_window_output() {
     let (mut grid, pending) = detached_with_reader_at(0, 500);
@@ -673,7 +603,6 @@ fn offload_window_aim_rides_up_with_window_output() {
     grid.assert_invariants();
 }
 
-/// An abort drops the aim with the history it pointed into.
 #[test]
 fn offload_abort_drops_the_reader_aim() {
     let (mut grid, pending) = detached_with_reader_at(0, 500);
@@ -685,8 +614,6 @@ fn offload_abort_drops_the_reader_aim() {
     grid.assert_invariants();
 }
 
-/// Scroll up over the streaming output, then End: the position exists only because window output
-/// staged into the lazy buffer, so a detach-time baseline cannot see it.
 #[test]
 fn offload_window_end_after_scrolling_over_window_output_is_honored() {
     let (rows, cols) = (10u16, 80u16);
@@ -721,15 +648,12 @@ fn offload_window_end_after_scrolling_over_window_output_is_honored() {
     grid.assert_invariants();
 }
 
-/// The converging window has its own detach and baseline; the reader's End there is honored too.
 #[test]
 fn redetach_window_end_after_scrolling_over_window_output_is_honored() {
     let (rows, cols) = (10u16, 80u16);
     let mut grid = tiered_grid_with_wrapped_history(rows, cols, 300);
     grid.scroll_display(150);
 
-    // A superseded width change converges with a follow-up detach (as in
-    // `redetach_clamps_the_viewport_and_still_restores_the_reader`).
     let pending = grid
         .resize_offloading_scrollback(rows, cols + 40)
         .expect("offload job A");
@@ -739,7 +663,6 @@ fn redetach_window_end_after_scrolling_over_window_output_is_honored() {
         .reattach_reflowed_scrollback_or_redetach(reflowed)
         .expect("stale width must converge with a follow-up job");
 
-    // The second window: output streams, the reader scrolls up over it, then End.
     for i in 0..200 {
         short_line(&mut grid, rows, &format!("W{i}"));
     }
@@ -762,9 +685,6 @@ fn redetach_window_end_after_scrolling_over_window_output_is_honored() {
     grid.assert_invariants();
 }
 
-/// A reader who scrolled up during the window did not choose the live bottom, so when a resize
-/// later puts them there the restore still runs: the descent record is `non-zero -> zero` by the
-/// reader, not "the offset changed".
 #[test]
 fn offload_window_reader_who_only_scrolled_up_did_not_choose_the_bottom() {
     let (rows, cols) = (10u16, 80u16);
@@ -781,8 +701,6 @@ fn offload_window_reader_who_only_scrolled_up_did_not_choose_the_bottom() {
     assert_eq!(grid.display_offset(), 4);
     let gen_after_reader = grid.storage.reader_live_bottom_gen;
 
-    // A height drag lands mid-window: growing the viewport by 4 rows pulls the
-    // anchored line down to the live bottom all on its own.
     grid.resize(rows + 4, 60);
     assert_eq!(
         grid.display_offset(),
@@ -808,8 +726,6 @@ fn offload_window_reader_who_only_scrolled_up_did_not_choose_the_bottom() {
     grid.assert_invariants();
 }
 
-/// The per-batch output pin (force live, then re-pin the reader) is machine motion: it passes
-/// through a >0 -> 0 descent on every batch, so recording it would call `tail -f` an End press.
 #[test]
 fn output_batch_pin_dance_is_not_a_reader_gesture() {
     let (rows, cols) = (10u16, 80u16);
@@ -818,8 +734,6 @@ fn output_batch_pin_dance_is_not_a_reader_gesture() {
     grid.scroll_display(20); // the reader goes up: real, but not a descent
     let after_reader = grid.storage.reader_live_bottom_gen;
 
-    // What `Terminal::process` does around a batch, and `flatten_restored_display_offset` on
-    // an rmcup.
     let pinned = grid.display_offset();
     grid.pin_viewport_to_live_for_output_batch();
     assert_eq!(
@@ -840,14 +754,12 @@ fn output_batch_pin_dance_is_not_a_reader_gesture() {
          viewport-gesture record"
     );
 
-    // …while the reader's own End at the same offset is not.
     grid.scroll_to_bottom();
     assert_eq!(
         grid.storage.reader_live_bottom_gen,
         after_reader + 1,
         "an End that moved the viewport IS a gesture"
     );
-    // And one that moves nothing still is not.
     grid.scroll_to_bottom();
     assert_eq!(
         grid.storage.reader_live_bottom_gen,
@@ -858,8 +770,7 @@ fn output_batch_pin_dance_is_not_a_reader_gesture() {
     grid.assert_invariants();
 }
 
-/// The `aterm_log` records (level and message) written on this thread while `body` runs. The
-/// logger keeps only a capturing thread's records, so tests running beside it add none.
+/// The `aterm_log` records (level and message) written on this thread while `body` runs.
 fn logged_on_this_thread<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
     use std::cell::RefCell;
     thread_local! {
@@ -890,9 +801,6 @@ fn logged_on_this_thread<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
     )
 }
 
-/// The detached-reflow window logs its staging cap once at its first drop and once with its total
-/// when it closes, by re-attach or abort; every drop is still counted (see
-/// `bound_detached_lazy_buffer` for why not a line per drop).
 #[test]
 fn a_reflow_windows_cap_is_logged_at_its_first_drop_and_its_close() {
     let (rows, cols) = (10u16, 80u16);
@@ -901,11 +809,9 @@ fn a_reflow_windows_cap_is_logged_at_its_first_drop_and_its_close() {
     for i in 0..500 {
         short_line(&mut grid, rows, &format!("H{i}"));
     }
-    // Past the window's 50 000-line staging cap (`Grid::DETACHED_LAZY_CAP`).
     let streamed = 55_000;
     let before = grid.truncated_lines();
 
-    // Window 1: a flood through it, then the re-attach.
     let pending = grid
         .resize_offloading_scrollback(rows, cols / 2)
         .expect("offload job");
@@ -939,7 +845,6 @@ fn a_reflow_windows_cap_is_logged_at_its_first_drop_and_its_close() {
     );
     grid.assert_invariants();
 
-    // Window 2 opens at zero and ends by abort: its own two lines.
     let before = grid.truncated_lines();
     let pending = grid
         .resize_offloading_scrollback(rows, cols)
@@ -965,15 +870,6 @@ fn a_reflow_windows_cap_is_logged_at_its_first_drop_and_its_close() {
     grid.assert_invariants();
 }
 
-/// The synchronous half of an offloaded width change reads history to lay
-/// the screen's rows out where the rows hand-back puts them
-/// (`Grid::prepare_rewrap`): the head of the line the screen's top row
-/// continues, brought onto the screen, up to four screens up. Past that the
-/// line is laid out from the screen's top, so what it reads is bounded by the
-/// screen, never by the line: a line 5000 rows long reads what one 500 rows
-/// long does. Walking to the head of any line, the caller's thread spent
-/// 35 ms on a 15000-row line (one `cat` of a minified file) against 0.05 ms
-/// before the walk.
 #[test]
 fn offloaded_width_change_reads_history_bounded_by_the_screen() {
     let (rows, cols) = (24u16, 80u16);

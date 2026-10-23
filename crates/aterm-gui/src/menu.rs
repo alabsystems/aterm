@@ -17,7 +17,7 @@ pub(crate) enum NativeTerminateDecision {
 
 #[cfg(any(target_os = "macos", test))]
 impl NativeTerminateDecision {
-    fn generation(self) -> u64 {
+    const fn generation(self) -> u64 {
         match self {
             Self::Dispatch(generation)
             | Self::DeferExisting(generation)
@@ -74,7 +74,7 @@ impl NativeTerminateArbiter {
         true
     }
 
-    fn cancel_current(&mut self) -> bool {
+    const fn cancel_current(&mut self) -> bool {
         if self.exiting.is_some() {
             return false;
         }
@@ -322,7 +322,7 @@ pub(crate) enum MenuAction {
 impl MenuAction {
     /// The integer stored in the menu item's `tag`.
     #[must_use]
-    pub(crate) fn tag(self) -> isize {
+    pub(crate) const fn tag(self) -> isize {
         match self {
             MenuAction::About => 1,
             MenuAction::Preferences => 2,
@@ -403,7 +403,7 @@ impl MenuAction {
     /// Inverse of [`MenuAction::tag`].
     #[must_use]
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn from_tag(tag: isize) -> Option<MenuAction> {
+    pub(crate) const fn from_tag(tag: isize) -> Option<MenuAction> {
         Some(match tag {
             1 => MenuAction::About,
             2 => MenuAction::Preferences,
@@ -718,7 +718,7 @@ pub(crate) struct AgentsLive {
     pub in_fleet: bool,
     /// A window exists ([`MenuAction::Overview`]).
     pub any_window: bool,
-    /// Why Summarize cannot start a worker here, `None` when it.
+    /// Why Summarize cannot start a worker here, `None` when it can.
     pub summarize_block: Option<String>,
 }
 
@@ -992,7 +992,7 @@ pub(crate) enum InvokeAuthority {
 
 impl MenuAction {
     /// The [`InvokeAuthority`] a socket caller needs to fire this action via `invoke <action>`.
-    pub(crate) fn invoke_authority(self) -> InvokeAuthority {
+    pub(crate) const fn invoke_authority(self) -> InvokeAuthority {
         let _ = crate::command_registry::menu_command(self);
         use InvokeAuthority::{ClipboardWrite, ConfigWrite, OwnerOnly, PersonOnly, WriteInput};
         match self {
@@ -1305,7 +1305,7 @@ impl MenuAction {
 
     /// Whether this platform can do what the row offers.
     #[must_use]
-    pub(crate) fn offered_on_this_platform(self) -> bool {
+    pub(crate) const fn offered_on_this_platform(self) -> bool {
         match self {
             MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => aterm_update::enabled(),
             MenuAction::SystemState => cfg!(target_os = "macos"),
@@ -1416,7 +1416,8 @@ pub(crate) enum MenuEntry {
     Item {
         label: &'static str,
         action: MenuAction,
-        /// Lowercase key-equivalent character ("" for none), visual.
+        /// Lowercase key-equivalent character ("" for none), visual only: `App::on_key`
+        /// handles the keystroke.
         key: &'static str,
         mods: MenuMods,
     },
@@ -1666,7 +1667,8 @@ pub(crate) const PALETTE_ONLY: &[(&str, MenuAction)] = &[
     ("Fleet Machines", MenuAction::FleetMachines),
 ];
 
-/// The palette section the [`PALETTE_ONLY`] rows sit.
+/// The palette section the [`PALETTE_ONLY`] rows sit in: the menu whose
+/// matter they are.
 pub(crate) const PALETTE_ONLY_SECTION: &str = "Agents";
 
 const FIND_MENU: &[MenuEntry] = &[
@@ -1977,7 +1979,8 @@ pub(crate) enum VersionRung {
     Short,
 }
 
-/// The compile-time facts a version signature is composed.
+/// The compile-time facts a version signature is composed from, stamped by `build.rs` and read
+/// from [`crate::build_info`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct VersionFacts<'a> {
     /// A release lane produced the binary ([`crate::build_info::is_release_build`]).
@@ -2099,7 +2102,11 @@ pub(crate) fn realized_row_label(arrow: &str, version: &str) -> String {
 /// Whether the menu-bar Version arrow shows.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
-pub(crate) fn bar_title_attention(staged_present: bool, on_hold: bool, _realized: bool) -> bool {
+pub(crate) const fn bar_title_attention(
+    staged_present: bool,
+    on_hold: bool,
+    _realized: bool,
+) -> bool {
     staged_present && !on_hold
 }
 
@@ -2112,7 +2119,10 @@ pub(crate) fn staged_for_version_menu(
     staged.filter(|(build, _)| *build > running_build)
 }
 
-/// The Version title an outgoing process publishes for its successor once that successor's proof.
+/// The Version title an outgoing process publishes for its successor once that
+/// successor's proof is in: the successor's own plain `v<version>`,
+/// no arrow — or `None` when this process cannot name it (a same-image relaunch
+/// is not a new version; a staged record for another build is not this target).
 #[cfg(any(unix, test))]
 #[must_use]
 pub(crate) fn handoff_target_bar_title(
@@ -2314,7 +2324,7 @@ pub(crate) fn choose_local_image(_title: &str, _prompt: &str) -> Option<std::pat
 
 /// Whether [`choose_local_file`] can actually produce a path here.
 #[cfg(target_os = "macos")]
-pub(crate) fn local_file_picker_available() -> bool {
+pub(crate) const fn local_file_picker_available() -> bool {
     true
 }
 
@@ -2499,7 +2509,7 @@ mod macos {
 
     /// What [`install`] returns.
     pub(crate) struct MenuHandle {
-        /// The single `menuAction:` relay target every item is wired.
+        /// The single `menuAction:` relay target every item is wired to.
         target: Retained<MenuTarget>,
         /// The Version menu's top-level bar item (title `v<version>[ ⬆️]`).
         version_item: Obj,
@@ -2520,6 +2530,7 @@ mod macos {
                 // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = MenuAction::from_tag(tag) {
+                    // Fire-and-forget: a closed loop (app shutting down) just
                     // drops the event — mirrors every other `send_event` here.
                     let _ = crate::tab_spawn::post_native_menu_action(self.ivars(), action);
                 }
@@ -2563,7 +2574,10 @@ mod macos {
         let Some(_windowed) = crate::platform::Windowed::get() else {
             return;
         };
-        // SAFETY: `+sharedApplication` and `-mainWindow` are `-(id)` accessors read on the main.
+        // SAFETY: `+sharedApplication` and `-mainWindow` are `-(id)` accessors
+        // read on the main thread (AppKit calls `validateMenuItem:` there);
+        // `-styleMask` is `-(NSWindowStyleMask)`, an `NSUInteger`, sent only to
+        // a non-nil window.
         let fullscreen = unsafe {
             let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
             let window = if app.is_null() {
@@ -2578,7 +2592,8 @@ mod macos {
 
     fn set_item_title(item: Id, title: &str) {
         if let Some(title) = appkit::nsstring(title) {
-            // SAFETY: `-setTitle:` is `-(void)(NSString *)` on the live NSMenuItem the caller.
+            // SAFETY: `-setTitle:` is `-(void)(NSString *)` on the live
+            // NSMenuItem the caller holds; it COPIES its argument.
             unsafe { appkit::send_v_id(item, sel!(setTitle:), title.id()) };
         }
     }
@@ -2754,15 +2769,15 @@ mod macos {
         }
     }
 
-    fn command_mask() -> usize {
+    const fn command_mask() -> usize {
         NS_EVENT_MODIFIER_FLAG_COMMAND
     }
 
-    fn command_control_mask() -> usize {
+    const fn command_control_mask() -> usize {
         NS_EVENT_MODIFIER_FLAG_COMMAND | NS_EVENT_MODIFIER_FLAG_CONTROL
     }
 
-    fn command_shift_mask() -> usize {
+    const fn command_shift_mask() -> usize {
         NS_EVENT_MODIFIER_FLAG_COMMAND | NS_EVENT_MODIFIER_FLAG_SHIFT
     }
 
@@ -2910,6 +2925,7 @@ mod macos {
 
     /// Show a native modal confirmation (a ⌘Q quit, or a close that would lose work) and block.
     pub(crate) fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
+        // Proceed whenever no alert could be shown (headless included, as
         // `confirm_destructive_close` does): a quit that cannot ask must not wedge.
         ask(title, body, proceed_label, AlertDefault::Proceed).unwrap_or(true)
     }
@@ -2953,6 +2969,7 @@ mod macos {
                 let proceed_button =
                     appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), proceed.id());
                 if !proceed_button.is_null() {
+                    // `-setRefusesFirstResponder:` is `-(void)(BOOL)` on NSControl,
                     // which the NSButton `-addButtonWithTitle:` returns is.
                     appkit::send_v_bool(proceed_button, sel!(setRefusesFirstResponder:), true);
                 }
@@ -3087,7 +3104,11 @@ mod macos {
         let Some(ns) = appkit::nsstring(s) else {
             return false;
         };
-        // SAFETY: `+fileURLWithPath:` / `+URLWithString:` are `-(id)(NSString *)` convenience.
+        // SAFETY: `+fileURLWithPath:` / `+URLWithString:` are `-(id)(NSString *)`
+        // convenience constructors returning an AUTORELEASED NSURL (nil for a
+        // string that is not a URL, which is checked); `+sharedWorkspace` is the
+        // `-(id)` singleton; `-openURL:` is `-(BOOL)(NSURL *)` and its answer is
+        // handed straight back.
         autoreleasepool(|_| unsafe {
             let url = appkit::send_id_id(
                 class(c"NSURL").as_id(),
@@ -3161,7 +3182,8 @@ mod macos {
         SettingsOpen::Refused
     }
 
-    /// Put `window` — a panel aterm itself built, never another.
+    /// Put `window` — a panel aterm itself built, never another app's — in front
+    /// of every app's windows WITHOUT activating aterm (`-orderFrontRegardless`).
     pub(crate) fn order_front_regardless(window: Id, what: &str) -> bool {
         if super::os_ui_refused(what) || MainThread::new().is_none() || window.is_null() {
             return false;

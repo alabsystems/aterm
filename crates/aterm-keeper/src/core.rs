@@ -2155,6 +2155,9 @@ impl KeeperCore {
         let scans = env.holders_of(&held);
         for (rdev, holders) in held.into_iter().zip(scans) {
             // The awaited process ended while another still holds the master: it handed it on
+            // (its own update's Commit `_exit(0)`s), so its end judges nothing. The hold waits
+            // on the holder the scan found instead, and keeps how the awaited process ended
+            // beside the outgoing window's end: a crash anywhere in the chain still orphans.
             if let Holders::Held(pids) = &holders
                 && let Some(rec) = self.records.get_mut(&rdev)
                 && let RecordState::Held {
@@ -2197,6 +2200,8 @@ impl KeeperCore {
                 self.ends.clean_pre_keeper += 1;
             } else {
                 // The hold's end, judged a crash (the successor's, or the
+                // outgoing window's mid-update: F11) — counted as `peer_died`
+                // counts one, orphaned or closed with its shell gone.
                 self.ends.crash += 1;
             }
             if alive {
@@ -2765,6 +2770,7 @@ mod tests {
             }
             if beside == 1 {
                 // No hold is judged while any update is in flight: the other
+                // window's runs out.
                 let _ = k.tick(now + PENDING_TTL_MS, &mut w);
             }
             let state = |rdev| k.records().get(&rdev).map(|r| r.state.clone());

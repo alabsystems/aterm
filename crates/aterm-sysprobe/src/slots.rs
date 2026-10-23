@@ -317,7 +317,7 @@ fn judged(
     SlotsRead::Read { counts, holders }
 }
 
-/// How many of the free slots' gone writers' builds run on (module docs):
+/// How many of the free slots' gone writers' builds run on:
 /// the newest record first, each counted while the 5-minute load exceeds what
 /// the held slots and the orphans counted so far, this one included, explain
 /// (`load5 > (held + k) * ncpu / n`).
@@ -612,6 +612,7 @@ mod live {
         };
         let birth = birth_us(&p);
         if birth > rec.started_us.saturating_add(BIRTH_SLACK_US) {
+            // Born after the record was written: another process with the
             // writer's pid.
             return Sight::NotHeld { gone: Some(rec) };
         }

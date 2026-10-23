@@ -709,7 +709,15 @@ fn check_anchor_obligations(
     }
 }
 
-/// Enforce the bidirectional obligations of TRUST_NATIVE_TLA §2.2 over `modules` and the collected refinements and waivers:
+/// Enforce the bidirectional obligations of TRUST_NATIVE_TLA §2.2 over `modules` and the
+/// collected refinements and waivers:
+///
+/// * **Ob.1, action exists**: every `refines` action (and every waiver action, when present)
+///   names a real definition in its module.
+/// * **Ob.3, coverage**: every action of an active machine (one with a refinement) is bound or
+///   waived, `ratio == 1.0`.
+/// * **Ob.4, machine exists**: every `machine` an anchor names resolves to a registered
+///   `SpecModule`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
     let mut violations = Vec::new();
@@ -742,6 +750,7 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
 
     for w in waivers() {
         if w.machine.is_empty() {
+            // Bare `reason="…"` waiver (bypass-setter form): not tied to a machine,
             // nothing to resolve. It cannot discharge coverage either.
             continue;
         }

@@ -207,7 +207,7 @@ enum Failed {
     /// number reused by something that is no vnode.
     Closed,
     /// `ENOENT`, reading one descriptor or a working directory: its vnode is dead (revoked, or
-    /// its volume force-unmounted) and names no file, device or path (the module docs).
+    /// its volume force-unmounted) and names no file, device or path.
     Dead,
     /// `EPERM`: the kernel will not tell this process. Reading one descriptor, it refuses
     /// the vnode's metadata (a file in a protected folder, whose metadata only an entitled

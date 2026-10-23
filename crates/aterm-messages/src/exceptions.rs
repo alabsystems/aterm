@@ -51,6 +51,8 @@ pub enum Family {
     HugeDir,
     /// The fabric bridge's own state dir (`fabric.state.<cause>`): files found torn after an unclean stop in an earlier boot, which the first bridge after it moved aside into the dir's quarantine (`aterm_link::state::StateDir::set_aside_torn`).
     FabricState,
+    /// Harness occupancy (`harness.occupancy.<subject>.<cause>`, docs/DESIGN-harness-occupancy-2026-10-20.md §6): the owner's `occupancy = "prompt"` in force (raised by the config load that finds it, cleared by one that does not), and a tab's typed lines spent for its hold (raised and cleared from what its loop tells), by event.
+    Occupancy,
 }
 
 impl Family {
@@ -77,6 +79,7 @@ impl Family {
             Self::FleetUnreadable => "fleet.unreadable",
             Self::HugeDir => "vitals.huge-dir",
             Self::FabricState => "fabric.state",
+            Self::Occupancy => "harness.occupancy",
         }
     }
 
@@ -108,12 +111,13 @@ impl Family {
             | Self::Render
             | Self::Terminal
             | Self::Removed
-            | Self::FabricState => Mode::Event,
+            | Self::FabricState
+            | Self::Occupancy => Mode::Event,
         }
     }
 
     /// Every family, in digest order.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Privacy,
         Self::Update,
         Self::Upgrade,
@@ -132,6 +136,7 @@ impl Family {
         Self::FleetUnreadable,
         Self::HugeDir,
         Self::FabricState,
+        Self::Occupancy,
     ];
 
     /// The message tag the family's entries carry.
@@ -148,7 +153,8 @@ impl Family {
             | Self::Accounts
             | Self::Ai
             | Self::ApiOutage
-            | Self::LongHold => tags::HARNESS,
+            | Self::LongHold
+            | Self::Occupancy => tags::HARNESS,
             Self::Toolchain => tags::TOOLCHAIN,
             Self::Disk | Self::FleetUnreadable | Self::HugeDir => tags::SYSTEM,
             Self::Render => tags::RENDER,

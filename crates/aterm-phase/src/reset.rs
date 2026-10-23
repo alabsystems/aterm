@@ -177,7 +177,7 @@ pub fn reset_title(text: &str) -> Option<ResetKind> {
 pub struct ResetRow {
     /// Its place among [`PromptV2::options`], from zero.
     pub index: usize,
-    /// Its label as drawn: what a press fences.
+    /// Its label as drawn: what a press fences on.
     pub label: String,
     /// The kind of reset it offers, never [`ResetKind::Fable`].
     pub kind: ResetKind,

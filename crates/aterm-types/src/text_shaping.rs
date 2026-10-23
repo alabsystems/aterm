@@ -3,14 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Text shaping configuration types for terminal rendering.
-//!
-//! Provides configuration types for:
-//! - Ligature rendering mode
-//! - OpenType font features
-//! - Ambiguous-width character handling
-//!
-//! These settings flow from UI → FFI → rendering pipeline, affecting both
-//! text shaping and grapheme width calculation.
 
 /// Ambiguous-width character handling.
 #[non_exhaustive]
@@ -56,18 +48,8 @@ impl FontFeature {
         Self { tag, value }
     }
 
-    /// Parse a SINGLE feature token into a [`FontFeature`], or `None` if it is
-    /// malformed. Accepted forms (matching the common terminal/ghostty syntax):
-    /// - `ss01` or `+ss01` — ENABLE (value `1`)
-    /// - `-calt` — DISABLE (value `0`)
-    /// - `cv01=2` — explicit VALUE (stylistic alternates / WezTerm syntax)
-    ///
-    /// The tag must be 1–4 ASCII characters (padded with spaces to 4, as
-    /// OpenType requires). Anything else (empty tag, >4 chars, non-ASCII, or an
-    /// unparseable `=value`) yields `None` so a typo is harmlessly skipped rather
-    /// than poisoning the whole feature list.
+    /// Parse a SINGLE feature token into a [`FontFeature`], or `None` if it is malformed.
     #[must_use]
-    // Skip: `str::parse`/split absent std bodies; fail-closed.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn parse_token(token: &str) -> Option<Self> {
         let (tag_str, value) = if let Some(rest) = token.strip_prefix('+') {
@@ -77,12 +59,9 @@ impl FontFeature {
         } else if let Some((tag, val)) = token.split_once('=') {
             (tag, val.trim().parse::<u32>().ok()?)
         } else {
-            // A bare tag enables the feature (`ss01` == `+ss01`).
             (token, 1u32)
         };
         let tag_str = tag_str.trim();
-        // A valid tag is 1–4 ASCII bytes with NO interior whitespace (so the padded
-        // tag is always `<chars><spaces>` — see the well-formedness property test).
         if tag_str.is_empty()
             || tag_str.len() > 4
             || !tag_str.is_ascii()
@@ -96,19 +75,11 @@ impl FontFeature {
     }
 }
 
-/// Parse a whitespace-separated feature spec (e.g. `"+ss01 -calt zero"`) into a
-/// list of [`FontFeature`]s. Each token is parsed by [`FontFeature::parse_token`];
-/// malformed tokens are skipped. An empty/blank spec yields an empty list, so an
-/// unset config is byte-identical to the pre-feature renderer.
+/// Parse a whitespace-separated feature spec (e.g. `"+ss01 -calt zero"`) into a list of
+/// [`FontFeature`]s.
 #[must_use]
-// Skip: split/collect absent std bodies; fail-closed.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn parse_font_features(spec: &str) -> Vec<FontFeature> {
-    // `.take(256)` bounds the `collect` allocation for the Trust gate with a
-    // literal element count. Identity on every real input: the spec is one
-    // hand-written config line of 4-char OpenType tags, and no font exposes
-    // anywhere near 256 features (a few dozen is the practical ceiling), so
-    // the clamp never fires and the parsed list is unchanged.
     spec.split_whitespace()
         .filter_map(FontFeature::parse_token)
         .take(256)
@@ -133,13 +104,7 @@ pub struct TextShapingConfig {
     pub ambiguous_width: AmbiguousWidth,
     /// Per-font OpenType features.
     pub font_features: Vec<FontFeatureSet>,
-    /// Admit MERGED (Cascadia N:1) ligatures: a run whose OpenType shaping
-    /// collapses several cells into ONE wide glyph (Cascadia Code's convention),
-    /// which the renderer slices into per-cell tiles (M4). DEFAULT `false`, so the
-    /// gate stays on the proven 1:1 "spacer convention" every Fira/JetBrains-style
-    /// font uses and the output is byte-identical to the pre-M4 renderer. Only the
-    /// Cascadia-style collapse is affected; a `false`→`true` flip is a no-op on a
-    /// 1:1 font. Wired from the GUI config key `merged_ligatures`.
+    /// Admit MERGED (Cascadia N:1) ligatures.
     pub admit_collapsed: bool,
 }
 
@@ -156,8 +121,6 @@ mod tests {
 
     #[test]
     fn parse_font_features_skips_malformed() {
-        // Too long, empty tag, and an unparseable explicit value are all dropped;
-        // a valid neighbour still parses.
         let f = parse_font_features("+toolong + -calt cv01=x zero");
         assert_eq!(f.len(), 2);
         assert_eq!(&f[0].tag, b"calt");
@@ -166,16 +129,12 @@ mod tests {
     }
 }
 
-/// The feature parser over generated input (fixed-seed xorshift): the
-/// structural invariants the rest of the shaping pipeline relies on must hold
-/// for ARBITRARY input, not just the hand-picked cases above.
 #[cfg(test)]
 mod generated_tests {
     use super::*;
 
     use aterm_spec::rng::XorShift;
 
-    /// Up to `max` characters drawn from `alphabet`.
     fn string(rng: &mut XorShift, alphabet: &[char], max: usize) -> String {
         (0..rng.index(max + 1))
             .map(|_| *rng.pick(alphabet))
@@ -183,17 +142,12 @@ mod generated_tests {
     }
 
     const ALNUM: &[char] = &['a', 'k', 'z', 'A', 'L', 'Z', '0', '5', '9'];
-    /// The realistic config alphabet (tags, affixes, `=`, spaces).
     const SOUP: &[char] = &['a', 'l', 'z', 'L', '0', '1', '9', ' ', '+', '-', '='];
-    /// Anything: whitespace of every kind, controls, multi-byte scalars.
     const ANY: &[char] = &[
         'a', 'Z', '0', ' ', '\t', '\n', '\u{a0}', '\u{3000}', '+', '-', '=', ',', '\0', '\u{7f}',
         'é', '世', '🎉', '\u{200b}',
     ];
 
-    /// Every `FontFeature` the parser emits is WELL-FORMED: the 4-byte tag is all
-    /// ASCII, right-padded with spaces (`<1..=4 chars><spaces>`), and never empty —
-    /// exactly the shape an OpenType feature tag takes (`aterm_font::Tag`).
     fn assert_well_formed(f: &FontFeature) {
         assert!(f.tag.iter().all(u8::is_ascii), "tag bytes must be ASCII");
         let first_space = f.tag.iter().position(|&b| b == b' ').unwrap_or(4);
@@ -214,8 +168,6 @@ mod generated_tests {
         );
     }
 
-    /// PANIC-FREEDOM + well-formedness over any input, and never more features
-    /// than whitespace-separated tokens (each token yields ≤1 feature).
     #[test]
     fn parse_never_panics_and_is_well_formed() {
         let mut rng = XorShift::new(0xF047_FEA7);
@@ -229,9 +181,6 @@ mod generated_tests {
         }
     }
 
-    /// Affix semantics: a bare tag enables (value 1), `+tag` is identical, and
-    /// `-tag` flips to 0 with the same tag bytes; `tag=value` carries the exact
-    /// value for any u32.
     #[test]
     fn affixes_and_explicit_values() {
         let mut rng = XorShift::new(0xAF_F1CE5);

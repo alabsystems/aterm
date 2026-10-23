@@ -18,7 +18,7 @@ pub(crate) fn a(c: Rgb, alpha: f32) -> Rgba {
 }
 
 /// A filled rounded rect (negative sizes collapse to nothing).
-pub(crate) fn panel(x: f32, y: f32, w: f32, h: f32, radius: f32, fill: Rgba) -> DrawPrim {
+pub(crate) const fn panel(x: f32, y: f32, w: f32, h: f32, radius: f32, fill: Rgba) -> DrawPrim {
     DrawPrim::Panel {
         x,
         y,
@@ -249,7 +249,7 @@ impl Mark {
     }
 
     /// A still mark at `level` (no momentum, crisp).
-    pub(crate) fn still(level: f32) -> Self {
+    pub(crate) const fn still(level: f32) -> Self {
         Self {
             level: level.clamp(0.0, 1.0),
             ghost: level.clamp(0.0, 1.0),
@@ -316,7 +316,7 @@ impl WellMark {
 
     /// Its own ink, where a phrase does not lend it one: frost for the jobs'
     /// marks, the accent for waiting, warn for zombies and the levels.
-    fn ink(self, inks: &VitalsInks) -> Rgb {
+    const fn ink(self, inks: &VitalsInks) -> Rgb {
         match self {
             Self::Stuck => inks.stuck,
             Self::Quiet => inks.quiet,

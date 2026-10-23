@@ -21,7 +21,6 @@ use crate::model::ReleaseObject;
 use crate::policy::Access;
 use crate::slug::Slug;
 
-/// `--prerelease` → `Some(true)`, `--no-prerelease` → `Some(false)`, neither → `None`.
 fn prerelease_filter(inv: &Invocation) -> Result<Option<bool>> {
     match (inv.has("--prerelease"), inv.has("--no-prerelease")) {
         (true, true) => Err(inv.usage("--prerelease and --no-prerelease contradict each other")),
@@ -31,7 +30,6 @@ fn prerelease_filter(inv: &Invocation) -> Result<Option<bool>> {
     }
 }
 
-/// `--tag-regex`, compiled.
 fn tag_regex(inv: &Invocation) -> Result<Option<aterm_regex::Regex>> {
     inv.flag("--tag-regex")
         .map(aterm_regex::Regex::new)
@@ -39,7 +37,6 @@ fn tag_regex(inv: &Invocation) -> Result<Option<aterm_regex::Regex>> {
         .map_err(|e| inv.usage(format!("--tag-regex: {e}")))
 }
 
-/// The release's raw JSON with `repo` set, and `latest` when `latest_id` was read.
 fn release_value(release: ReleaseObject, slug: &Slug, latest_id: Option<Option<u64>>) -> Value {
     let id = release.id;
     let mut value = release.raw;
@@ -119,17 +116,11 @@ pub(crate) fn release_list(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// How a `view`, `assets` or `download` names its release.
 enum Which<'a> {
-    /// `--id ID`.
     Id(u64),
-    /// TAG.
     Tag(&'a str),
 }
 
-/// The release a `view`, `assets` or `download` names: by `--id`, by TAG as published, or
-/// with `--include-drafts` by TAG among every release (as the writer). With the routing it
-/// was read under.
 fn named_release(gh: &Github, inv: &Invocation) -> Result<(Slug, How, ReleaseObject)> {
     let (slug, named) = inv.repo(gh.router())?;
     let which = match (inv.rest().first().map(String::as_str), inv.flag("--id")) {
@@ -282,17 +273,12 @@ pub(crate) fn release_assets(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome>
     })
 }
 
-/// Where `release download` puts its bytes.
 enum Out {
-    /// `--output -`.
     Stdout,
-    /// `--output F`.
     File(PathBuf),
-    /// `--dir D` (default `.`).
     Dir(PathBuf),
 }
 
-/// stdout under `--output -`: the bytes it took, and whether its reader went away.
 struct Taken<'a> {
     inner: &'a mut dyn std::io::Write,
     written: u64,
@@ -300,7 +286,6 @@ struct Taken<'a> {
 }
 
 impl Taken<'_> {
-    /// `result`, noting a gone reader ([`aterm_uds::stdout::reader_gone`]).
     fn noted<T>(&mut self, result: std::io::Result<T>) -> std::io::Result<T> {
         if let Err(e) = &result
             && aterm_uds::stdout::reader_gone(e)
@@ -327,7 +312,6 @@ impl std::io::Write for Taken<'_> {
     }
 }
 
-/// `release download`'s argument checks, all before any request.
 fn download_target(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
     if names.is_empty() {
         return Err(inv.usage("--asset NAME is required"));
@@ -372,7 +356,6 @@ fn download_target(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
     Ok(out)
 }
 
-/// `--dir`, `--output F` or `--output -`, judged.
 fn output(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
     match (inv.flag("--dir"), inv.flag("--output")) {
         (Some(_), Some(_)) => Err(inv.usage("--dir and --output contradict each other")),

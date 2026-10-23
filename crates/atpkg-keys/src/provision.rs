@@ -168,6 +168,7 @@ pub fn load_roster(
         }
         if expect == RosterExpectation::MustExist {
             // `join`'s refusal, enforced at the point of use as well as at preflight (see
+            // [`RosterExpectation`]).
             return Err(concat(&[
                 "no roster at ",
                 path,
@@ -836,6 +837,7 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
     match verb {
         Verb::Setup => {
             // A second master is not an additional authority but a replacement for one
+            // that exists only on paper.
             if !master.members.is_empty() {
                 return Err(concat(&[
                     "a paper master is ALREADY committed in ",

@@ -282,7 +282,7 @@ mod imp {
     }
 
     /// The word for a terminating signal, as a log line names it.
-    fn signal_name(sig: libc::c_int) -> &'static str {
+    const fn signal_name(sig: libc::c_int) -> &'static str {
         match sig {
             libc::SIGTERM => "SIGTERM",
             libc::SIGINT => "SIGINT",

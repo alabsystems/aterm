@@ -163,7 +163,8 @@ impl Dib {
             masks: MASKS,
         };
         let mut bits: *mut c_void = ptr::null_mut();
-        // SAFETY: `info` is a BITMAPINFOHEADER followed by its three masks, as BI_BITFIELDS reads.
+        // SAFETY: `info` is a BITMAPINFOHEADER followed by its three masks,
+        // as BI_BITFIELDS reads it; `bits` receives the section's pixels.
         let bitmap = unsafe {
             CreateDIBSection(
                 dc,
@@ -193,6 +194,7 @@ impl Dib {
             }),
             _ => {
                 // SAFETY: what was made above, never selected or already
+                // refused, so each delete succeeds or frees nothing.
                 unsafe {
                     if !bitmap.is_null() {
                         DeleteObject(bitmap);
@@ -343,7 +345,8 @@ impl CpuPresenter for Win32Presenter {
 
     fn new(window: Arc<Window>) -> Result<Self, Self::Error> {
         let hwnd = hwnd_of(&window).ok_or(Win32PresentError::NotWin32)?;
-        // SAFETY: `window` owns `hwnd` and is dropped after the surface; the window is made on.
+        // SAFETY: `window` owns `hwnd` and is dropped after the surface; the
+        // window is made on the thread that presents to it.
         let surface = unsafe { GdiSurface::new(hwnd) }?;
         Ok(Self {
             surface,

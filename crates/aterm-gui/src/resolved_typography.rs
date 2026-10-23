@@ -35,7 +35,7 @@ pub(crate) enum TypeOrigin {
 
 impl TypeOrigin {
     /// The word `--show-config`, `ctl theme` and Settings use.
-    pub(crate) fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::Theme => "theme",
@@ -246,7 +246,7 @@ impl ResolvedTypography {
 
     /// The face-relevant fingerprint: two resolutions need no font generation
     /// between them iff their keys are equal.
-    pub(crate) fn face_key(&self) -> &ThemeTypography {
+    pub(crate) const fn face_key(&self) -> &ThemeTypography {
         &self.applied
     }
 

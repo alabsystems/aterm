@@ -12,11 +12,6 @@ fn commands(spellings: &[Spelling]) -> Vec<&str> {
     spellings.iter().map(|s| s.command.as_str()).collect()
 }
 
-/// The interim guard script's 37 cases, in its order: eighteen it blocked and nineteen it let
-/// through. This reader is what a guard calls in its place (`aterm pkg lane`), so every
-/// verdict is the floor, with one named exception ([`INTERIM_ALLOW_REFUSED_BY_DESIGN`]). The
-/// four path-form cases (the first two of each list) need a filesystem:
-/// [`interim_guard_machine`].
 const INTERIM_BLOCK: &[&str] = &[
     "/usr/local/bin/cargo build",
     "~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc -V",
@@ -60,17 +55,9 @@ const INTERIM_ALLOW: &[&str] = &[
     "python3.12 -c \"print('cargo')\"",
 ];
 
-/// The one case of [`INTERIM_ALLOW`] this reader refuses on purpose: a Trust toolchain's
-/// compatibility `cargo` by path. The interim script let `rustc`, `rustdoc`, `cargo` and
-/// `rustfmt` through by path in any directory holding `trustc` or `targo`; this reader lets
-/// through only `rustc` and `rustdoc` beside their own twins ([`COMPAT_TWINS`]) and refuses
-/// `cargo` there, spelled with that directory's `targo`.
 const INTERIM_ALLOW_REFUSED_BY_DESIGN: &str =
     "build/aarch64-apple-darwin/stage0/bin/cargo --version";
 
-/// The directory probe of [`verdict_in`] for the interim cases: what each directory, as the
-/// case writes it, holds: the trust `stage0/bin` (no `rustdoc`, no `rustfmt`), rustup's
-/// `1.97.1` (no Trust name), and `/usr/local/bin` (none of these names).
 fn interim_guard_machine(dir: &str, name: &str) -> bool {
     const STAGE0: &[&str] = &[
         "cargo",
@@ -110,7 +97,6 @@ fn interim_guard_machine(dir: &str, name: &str) -> bool {
     held.contains(&name)
 }
 
-/// [`verdict_in`] as a guard reads it: the escaped command goes through.
 fn refused_on(machine: &dyn Fn(&str, &str) -> bool, cmd: &str) -> Option<Hit> {
     match verdict_in(cmd, machine) {
         Verdict::Stock(hit) => Some(hit),
@@ -137,8 +123,6 @@ fn the_interim_guards_thirty_seven_cases_hold() {
             "FALSE POSITIVE {cmd:?}"
         );
     }
-    // The named exception: refused, with the `targo` beside that `cargo` — never
-    // "stock Rust", and never whichever `targo` is first on PATH.
     assert!(INTERIM_ALLOW.contains(&INTERIM_ALLOW_REFUSED_BY_DESIGN));
     let hit = refused_on(&interim_guard_machine, INTERIM_ALLOW_REFUSED_BY_DESIGN)
         .expect("a Trust toolchain's compatibility cargo names no lane");
@@ -151,21 +135,13 @@ fn the_interim_guards_thirty_seven_cases_hold() {
         ["build/aarch64-apple-darwin/stage0/bin/targo --version"]
     );
     assert!(!refusal(&hit, None).contains("is stock Rust"));
-    // The text-only reading knows no directory: every path-form case is read by
-    // its name there, which is why a guard reads with `verdict_in`.
     for cmd in INTERIM_BLOCK[..2].iter().chain(&INTERIM_ALLOW[..2]) {
         assert!(check(cmd).is_some(), "{cmd:?}");
     }
 }
 
-/// A Trust toolchain's own compatibility names by path: `<dir>/rustc` beside `<dir>/trustc`
-/// and `<dir>/rustdoc` beside `<dir>/trustdoc` are never a hit; `<dir>/cargo` beside
-/// `<dir>/targo` stays one, spelled with that directory's `targo`. Only the twin counts: a
-/// `rustdoc` beside `trustc` alone, a `rustfmt` anywhere and every bare name are read by name,
-/// as the text-only [`check`] reads every path.
 #[test]
 fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_targo() {
-    // A simulated filesystem: what each directory, as written, holds.
     let dirs: &[(&str, &[&str])] = &[
         (
             "build/aarch64-apple-darwin/stage2/bin/",
@@ -176,7 +152,6 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
             &["trustc", "trustdoc", "targo"],
         ),
         ("/opt/trust/bin/", &["trustc", "trustdoc", "targo"]),
-        // stage0 of a trust checkout: no trustdoc, so its `rustdoc` is not a twin.
         ("./build/x/stage0/bin/", &["trustc", "targo"]),
         ("/opt/stock/bin/", &["rustc", "cargo", "rustdoc"]),
     ];
@@ -202,14 +177,10 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
         "rustc -vV",
         "/opt/stock/bin/rustc -vV",
         "/opt/stock/bin/rustdoc --version",
-        // The twin of rustdoc is trustdoc, not trustc.
         "./build/x/stage0/bin/rustdoc --version",
-        // A Trust toolchain ships no compatibility rustfmt.
         "/opt/trust/bin/rustfmt a.rs",
-        // The exemption covers its own word only.
         "/opt/trust/bin/rustc -vV && cargo build",
         "/opt/trust/bin/rustc -vV; rustfmt a.rs",
-        // A directory the probe was not asked about, or answered no for.
         "$D/rustc -vV",
         "/opt/trust/lib/rustc -vV",
     ] {
@@ -218,7 +189,6 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
             "MISSED {cmd:?}"
         );
     }
-    // The Trust toolchain's own cargo by path: refused, with its own targo.
     let Verdict::Stock(hit) = verdict_in("/opt/trust/bin/cargo test -p x", &beside) else {
         panic!("a compatibility cargo names no lane");
     };
@@ -241,7 +211,6 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
         commands(&meta.instead),
         ["build/aarch64-apple-darwin/stage2/bin/targo metadata --format-version 1"]
     );
-    // A stock cargo by path is spelled with the targo on PATH, as ever.
     let Verdict::Stock(stock) = verdict_in("/opt/stock/bin/cargo build", &beside) else {
         panic!("refused");
     };
@@ -251,7 +220,6 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
         commands(&stock.instead),
         ["targo trust build", "targo --unverified build"]
     );
-    // The escape clears it like any other.
     assert!(matches!(
         verdict_in(
             "ATERM_STOCK_REASON='compat-name smoke' /opt/trust/bin/cargo --version",
@@ -261,9 +229,6 @@ fn a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_tar
     ));
 }
 
-/// [`file_beside`] reads a directory the way the shell wrote it: absolute, under
-/// the cwd, or under `~/`/`$HOME/`/`${HOME}/`; anything it cannot resolve is not
-/// a Trust toolchain.
 #[test]
 fn file_beside_resolves_a_directory_the_way_the_shell_wrote_it() {
     let root = std::env::temp_dir().join(format!("rust-lane-beside-{}", std::process::id()));
@@ -296,7 +261,6 @@ fn file_beside_resolves_a_directory_the_way_the_shell_wrote_it() {
             "unresolvable: {dir}"
         );
     }
-    // A directory named trustc is not the compiler.
     std::fs::create_dir_all(root.join("fake/bin/trustc")).unwrap();
     assert!(!file_beside(
         &format!("{}/fake/bin/", root.display()),
@@ -304,7 +268,6 @@ fn file_beside_resolves_a_directory_the_way_the_shell_wrote_it() {
         None,
         None
     ));
-    // `~` inside a path is a literal character, not home.
     let tilde = root.join("a~b/bin");
     std::fs::create_dir_all(&tilde).unwrap();
     std::fs::write(tilde.join("trustc"), b"").unwrap();
@@ -317,10 +280,6 @@ fn file_beside_resolves_a_directory_the_way_the_shell_wrote_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The shapes the interim script did not reach, each a way the shell runs a
-/// command: prefix words with options, the compound-command keywords, a
-/// flag cluster carrying `-c`, `eval`, `find -exec`, a leading redirection, a
-/// quoted or escaped command word, a heredoc whose unquoted body substitutes.
 #[test]
 fn the_other_places_a_shell_runs_a_command_are_read() {
     for cmd in [
@@ -360,7 +319,6 @@ fn the_other_places_a_shell_runs_a_command_are_read() {
     }
 }
 
-/// Asking where a tool is, or naming it as data, is never running it.
 #[test]
 fn asking_about_a_tool_and_naming_it_as_data_are_not_running_it() {
     for cmd in [
@@ -395,9 +353,6 @@ fn asking_about_a_tool_and_naming_it_as_data_are_not_running_it() {
     }
 }
 
-/// The escape hatch is a non-empty assignment in front of the one simple
-/// command it clears. An empty reason, a different name, an `export` in an
-/// earlier command, or the word anywhere else escapes nothing.
 #[test]
 fn the_escape_hatch_clears_exactly_one_simple_command() {
     assert_eq!(
@@ -421,10 +376,6 @@ fn the_escape_hatch_clears_exactly_one_simple_command() {
     }
 }
 
-/// An escaped stock command is not dropped by [`verdict`]: it is reported with
-/// the reason its author gave, so a guard can journal what ran and why. The
-/// shell's own rule decides the value — the last assignment wins — and one
-/// unescaped stock command anywhere on the line is still a refusal.
 #[test]
 fn an_escape_is_reported_with_its_reason_and_never_hides_a_second_command() {
     match verdict("ATERM_STOCK_REASON='measure stock parity' cargo +1.97.1 test -p x") {
@@ -434,7 +385,6 @@ fn an_escape_is_reported_with_its_reason_and_never_hides_a_second_command() {
         }
         other => panic!("expected Escaped, got {other:?}"),
     }
-    // Through `bash -c` and `find -exec`, the escape covers the one simple command.
     for cmd in [
         "ATERM_STOCK_REASON=why bash -c 'cargo test'",
         "ATERM_STOCK_REASON=why find . -name '*.rs' -exec rustfmt {} \\;",
@@ -445,8 +395,6 @@ fn an_escape_is_reported_with_its_reason_and_never_hides_a_second_command() {
             verdict(cmd)
         );
     }
-    // The last assignment wins, as in the shell: an empty one after a reason
-    // leaves the command unescaped, a reason after an empty one escapes it.
     assert!(matches!(
         verdict("ATERM_STOCK_REASON=x ATERM_STOCK_REASON= cargo test"),
         Verdict::Stock(_)
@@ -455,8 +403,6 @@ fn an_escape_is_reported_with_its_reason_and_never_hides_a_second_command() {
         verdict("ATERM_STOCK_REASON= ATERM_STOCK_REASON=x cargo test"),
         Verdict::Escaped { .. }
     ));
-    // An escaped command and an unescaped one on the same line: the refusal is
-    // the unescaped one's, whichever comes first.
     for cmd in [
         "ATERM_STOCK_REASON=why cargo +1.97.1 test; cargo fmt --check",
         "cargo fmt --check; ATERM_STOCK_REASON=why cargo +1.97.1 test",
@@ -466,19 +412,14 @@ fn an_escape_is_reported_with_its_reason_and_never_hides_a_second_command() {
             other => panic!("{cmd:?}: expected Stock, got {other:?}"),
         }
     }
-    // A substitution is another command: the escape on `echo` does not reach it.
     assert!(matches!(
         verdict("ATERM_STOCK_REASON=why echo $(cargo metadata)"),
         Verdict::Stock(_)
     ));
     assert_eq!(verdict("targo --unverified test"), Verdict::Clean);
-    // `check` is `verdict` with the escaped ones dropped.
     assert_eq!(check("ATERM_STOCK_REASON=why cargo test"), None);
 }
 
-/// The refusal is bounded: a kilobyte argument does not become a kilobyte
-/// line, a quoted newline does not become a line break, and the cut never
-/// splits a character.
 #[test]
 fn the_refusal_is_bounded_and_one_line_per_command() {
     let long = format!("cargo test -- {}", "é".repeat(2_000));
@@ -495,8 +436,6 @@ fn the_refusal_is_bounded_and_one_line_per_command() {
     assert!(text.contains("targo trust test -- a b "), "{text}");
 }
 
-/// A hit carries the stock spelling as used and the Trust spelling of the same command, the
-/// caller's own arguments filled in.
 #[test]
 fn a_hit_names_what_was_used_and_the_trust_command_with_its_arguments() {
     let hit = check("cargo +1.97.1 test -p trust-cg-opt").expect("hit");
@@ -520,8 +459,6 @@ fn a_hit_names_what_was_used_and_the_trust_command_with_its_arguments() {
     let hit = check("rustfmt +1.97.1 x.rs").expect("hit");
     assert_eq!(hit.used, "rustfmt +1.97.1");
     assert_eq!(commands(&hit.instead), ["trustfmt x.rs"]);
-    // A redirection belongs to the shell: neither the verb nor an argument of the Trust
-    // command.
     let hit = check("timeout 60 cargo --version 2>&1 | head -3").expect("hit");
     assert_eq!(hit.used, "cargo");
     assert_eq!(commands(&hit.instead), ["targo --version"]);
@@ -539,8 +476,6 @@ fn a_hit_names_what_was_used_and_the_trust_command_with_its_arguments() {
     );
 }
 
-/// Every cargo verb renders the spelling targo accepts for it (the module table): a lane flag
-/// on a verb that refuses it would be a hint nobody can run.
 #[test]
 fn every_cargo_verb_gets_the_lane_targo_accepts_for_it() {
     let spell =
@@ -572,23 +507,18 @@ fn every_cargo_verb_gets_the_lane_targo_accepts_for_it() {
     );
     assert_eq!(spell(&["--version"]), "targo --version");
     assert_eq!(spell(&[]), "targo");
-    // A leading `+<toolchain>` is dropped: no Trust tool takes a rustup directive.
     assert_eq!(spell(&["+1.97.1", "fmt"]), "targo fmt");
     assert_eq!(
         spell(&["+trust", "check"]),
         "targo trust check | targo --unverified check"
     );
-    // A global flag before the verb moves behind it: `targo trust` reads its
-    // verb first.
     assert_eq!(
         spell(&["-v", "--config", "net.offline=true", "check"]),
         "targo trust check -v --config net.offline=true | targo --unverified check -v --config net.offline=true"
     );
-    // An unknown verb is rendered, with the note that says it may not exist.
     let unknown = trust_spelling("cargo", &args(&["nextest", "run"])).expect("cargo");
     assert_eq!(commands(&unknown), ["targo nextest run"]);
     assert!(unknown[0].note.contains("cargo extension"), "{unknown:?}");
-    // The classes are disjoint: no verb in two rows.
     for verb in BOTH_LANES.iter().chain(UNVERIFIED_ONLY).chain(NO_LANE) {
         let rows = [BOTH_LANES, UNVERIFIED_ONLY, NO_LANE]
             .iter()
@@ -611,12 +541,10 @@ fn a_pin_is_read_the_way_rustup_reads_it() {
         Some("trust")
     );
     assert_eq!(channel_in("channel='nightly'").as_deref(), Some("nightly"));
-    // The legacy one-line form.
     assert_eq!(
         channel_in("nightly-2026-03-12\n").as_deref(),
         Some("nightly-2026-03-12")
     );
-    // No channel named.
     assert_eq!(channel_in("[toolchain]\npath = \"/x\"\n"), None);
     assert_eq!(channel_in("channel_x = \"y\"\n[toolchain]\n"), None);
     assert_eq!(channel_in(""), None);
@@ -633,10 +561,8 @@ fn a_pin_is_read_the_way_rustup_reads_it() {
     let (file, ch) = find_pin(&deep).expect("found walking up");
     assert_eq!(ch, "1.97.1");
     assert_eq!(file, root.join("rust-toolchain.toml"));
-    // `rust-toolchain` wins over `rust-toolchain.toml` in one directory.
     std::fs::write(root.join("rust-toolchain"), "stable\n").expect("write");
     assert_eq!(find_pin(&deep).map(|(_, ch)| ch).as_deref(), Some("stable"));
-    // A nearer file wins.
     std::fs::write(
         root.join("crates").join("rust-toolchain.toml"),
         "[toolchain]\nchannel = \"trust\"\n",
@@ -649,10 +575,6 @@ fn a_pin_is_read_the_way_rustup_reads_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Pathological input is bounded, never a hang or a panic. Text past [`MAX_DEPTH`] is not
-/// parsed, but a stock tool's name in it is a hit marked [`Hit::unread`]; the escape in front
-/// of the command that runs it clears it, and deep text naming no stock tool stays clean. The
-/// cost, pinned too: past the cap a stock name is refused even where it is only data.
 #[test]
 fn nesting_past_the_cap_is_refused_and_malformed_input_is_bounded() {
     let nest = |kind: &str, inner: &str, levels: usize| -> String {
@@ -668,8 +590,6 @@ fn nesting_past_the_cap_is_refused_and_malformed_input_is_bounded() {
         s
     };
     for kind in ["subst", "bash", "eval"] {
-        // 12 levels, past the bound of 8 (`bash -c` quoting grows with each level,
-        // so the count stays small on purpose).
         for levels in 1..=12 {
             let cmd = nest(kind, "cargo build", levels);
             let hit = check(&cmd).unwrap_or_else(|| panic!("MISSED {kind} x{levels}"));
@@ -681,8 +601,6 @@ fn nesting_past_the_cap_is_refused_and_malformed_input_is_bounded() {
                 "{kind} x{levels}"
             );
             if kind != "subst" {
-                // A substitution in an argument is the shell's, outside the
-                // escaped command; `bash -c` and `eval` run theirs inside it.
                 let escaped = format!("ATERM_STOCK_REASON='deep probe' {cmd}");
                 assert!(
                     matches!(verdict(&escaped), Verdict::Escaped { .. }),
@@ -715,10 +633,6 @@ fn nesting_past_the_cap_is_refused_and_malformed_input_is_bounded() {
     assert_eq!(check("echo 'unterminated cargo build"), None);
 }
 
-/// A Trust toolchain chosen by its rustup channel: `rustup run trust rustc` and `rustc +trust`
-/// are that toolchain's trustc, not stock, as `<dir>/rustc` beside `<dir>/trustc` is not. Its
-/// `cargo` stays a hit ([`COMPAT_TWINS`]); a stock channel's tools, a `rustfmt` and a bare
-/// name stay hits.
 #[test]
 fn a_trust_channels_own_rustc_and_rustdoc_are_not_stock() {
     for cmd in [
@@ -743,8 +657,6 @@ fn a_trust_channels_own_rustc_and_rustdoc_are_not_stock() {
     ] {
         assert!(check(cmd).is_some(), "MISSED {cmd:?}");
     }
-    // A Trust channel's cargo is that toolchain's compatibility cargo, never
-    // stock; a stock channel's cargo is stock.
     for cmd in [
         "cargo +trust build",
         "rustup run trust-45040366 cargo build",
@@ -773,12 +685,6 @@ fn shell_quote(s: &str) -> String {
     q
 }
 
-/// Thirteen shapes the interim guard missed, each a way the shell runs the tool: the
-/// compound-command keywords (`if`, `if !`, `while`, `until`), `timeout`, `xargs`,
-/// `find -exec`, wrappers that take options (`nice -n`, `env -u`, `caffeinate -i`,
-/// `stdbuf -oL`, `ionice`) and a leading redirection; beside the allow shapes: heredoc bodies,
-/// quoted strings, grep/sed patterns, `./x.py`, `$(rustup which rustc)`,
-/// `rustup run trust targo`, make targets.
 #[test]
 fn the_reviewers_thirteen_missed_shapes_are_read_and_the_allow_probes_still_pass() {
     let missed_by_the_interim_guard = [
@@ -800,7 +706,6 @@ fn the_reviewers_thirteen_missed_shapes_are_read_and_the_allow_probes_still_pass
     for cmd in missed_by_the_interim_guard {
         assert!(check(cmd).is_some(), "MISSED {cmd:?}");
     }
-    // The same wrappers in their other spellings.
     for cmd in [
         "elif cargo test; then :; fi",
         "if ! timeout 900 cargo test; then exit 1; fi",
@@ -845,9 +750,6 @@ fn the_reviewers_thirteen_missed_shapes_are_read_and_the_allow_probes_still_pass
     }
 }
 
-/// Read as the shell reads them: `${DIR}/cargo` (a parameter expansion is part of one word),
-/// a multi-line `case` arm `cargo)` (a pattern is not a command) and `<<'EOF-1'` (the
-/// delimiter is a whole shell word).
 #[test]
 fn a_parameter_expansion_a_case_pattern_and_a_dashed_heredoc_delimiter_are_read_as_the_shell_reads_them()
  {
@@ -862,19 +764,13 @@ fn a_parameter_expansion_a_case_pattern_and_a_dashed_heredoc_delimiter_are_read_
         assert_eq!(check(cmd), None, "FALSE POSITIVE {cmd:?}");
     }
     for cmd in [
-        // A command in a case arm runs, as it does anywhere else.
         "case \"$x\" in\n  build) cargo build;;\nesac",
         "case \"$x\" in build) cargo build;; esac",
         "case $x in\n  a)\n    cargo test\n    ;;\nesac",
-        // After the case, commands are commands again.
         "case $x in\n  cargo) echo c;;\nesac\ncargo build",
-        // A dashed or dotted delimiter ends where it says.
         "cat <<'EOF-1'\nnot a command\nEOF-1\ncargo build",
         "cat <<END.txt\nbody\nEND.txt\nrustfmt a.rs",
-        // A parameter expansion as the command word is still read by its value's
-        // shape when it is a literal path.
         "${HOME}/.cargo/bin/cargo build",
-        // A substitution inside an expansion still runs.
         "echo ${X:-$(cargo metadata --format-version 1)}",
     ] {
         assert!(check(cmd).is_some(), "MISSED {cmd:?}");

@@ -10,6 +10,18 @@ use std::time::Duration;
 /// How often the serving loop looks for a poisoned log.
 pub const POLL: Duration = Duration::from_secs(2);
 
+/// [`POLL`] at test pace (`bridge::fast_timers`, a development seam a shipped build never reads).
+const FAST_POLL: Duration = Duration::from_millis(100);
+
+/// The serving loop's wake in this process: [`POLL`], or [`FAST_POLL`] at test pace.
+pub(crate) fn poll() -> Duration {
+    if crate::bridge::fast_timers() {
+        FAST_POLL
+    } else {
+        POLL
+    }
+}
+
 /// How often a serving broker has astream rewrite `<log>.health` (the module docs).
 pub const HEALTH_EVERY: Duration = Duration::from_secs(30);
 
@@ -85,7 +97,10 @@ pub fn holds(h: &astream_broker::BrokerHealth) -> String {
     )
 }
 
-/// Whether `read` — a `<log>.health` as astream's reader found it.
+/// Whether `read` — a `<log>.health` as astream's reader found it — is the
+/// health of the broker serving the socket NOW: the reader says its writer
+/// still serves the log, and that writer is `serving`, the pid the process
+/// table names for the socket.
 #[must_use]
 pub fn is_current(read: &astream_broker::HealthRead, serving: Option<u32>) -> bool {
     read.writer == astream_broker::HealthWriter::Serving && serving == Some(read.health.pid)
@@ -195,7 +210,10 @@ fn is_job_label(name: &str) -> bool {
             .is_some_and(|sum| !sum.is_empty() && sum.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// What the broker does when it finds its log poisoned: exit (the cure, and the only behaviour of a shipped build), or.
+/// What the broker does when it finds its log poisoned: exit (the cure, and
+/// the only behaviour of a shipped build), or — the dev seam's `stay`, the
+/// negative control a test runs to show the exit is the cure — say so and keep
+/// serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OnPoison {
     #[default]

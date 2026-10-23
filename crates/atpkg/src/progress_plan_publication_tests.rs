@@ -7,8 +7,6 @@ fn layout(label: &str) -> crate::testdir::ScratchLayout {
     crate::testdir::layout(&format!("atpkg-plan-publication-{label}-"))
 }
 
-/// Pin the capped path's age to zero. The future instant is controlled sink
-/// state, not an elapsed-time assertion or a wait for the rate cap to expire.
 fn cap_writes(sink: &ProgressSink) {
     sink.inner.lock().unwrap().last_write = Some(Instant::now() + Duration::from_secs(86_400));
 }
@@ -53,8 +51,6 @@ fn a_promised_plan_keeps_its_promise_if_publication_fails() {
     let sink = promised_sink(&layout);
     let promise = std::fs::read(layout.pass_owed_file()).unwrap();
     let empty = std::fs::read(layout.progress_file()).unwrap();
-    // A private directory at the atomic writer's temporary-file path forces a
-    // real write error, without permissions assumptions or following a symlink.
     let blocked = layout
         .progress_file()
         .with_file_name(format!("progress.json.tmp-{}", std::process::id()));

@@ -240,7 +240,8 @@ const fn mb_s(swap_kib_s: u32) -> u32 {
 }
 
 impl MemoryOver {
-    /// Whether the measure is acted on (a restart at the next idle point.
+    /// Whether the measure is acted on (a restart at the next idle point, or the person handed
+    /// the resume line): the machine is in trouble and this agent is the dominant consumer.
     #[must_use]
     pub const fn acts(&self) -> bool {
         self.strain.is_some() && self.dominant

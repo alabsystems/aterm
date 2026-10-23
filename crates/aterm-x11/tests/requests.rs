@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-x11's request encodings against x11rb-protocol 0.13.2's, recorded
-//! in tests/recorded/x11rb-protocol-0.13.2-requests.tsv: each request, given
-//! the recorder's arguments, is the same bytes.
-//!
-//! Negative controls: every case is recorded and every recording has a case;
-//! a request one argument away misses its recording.
+//! Request encoding conformance tests against `x11rb-protocol` recordings.
 
 #![cfg(target_endian = "little")]
 

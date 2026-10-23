@@ -722,6 +722,7 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     }
     let written = match &opts.out {
         None => {
+            // THE CAP IS THE ANSWER: one that did not reach stdout whole is no mint the
             // caller holds, so it is refused before the guidance below says "to stdout".
             if let Err(line) = cap_on_stdout(write_capability_to(&mut io::stdout(), &lines)) {
                 eprintln!("{line}");
@@ -858,7 +859,6 @@ fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String
 /// <old mode>))` when it was changed.
 ///
 /// # Errors
-/// Any write or flush failure; no partial result is certified as delivered.
 ///
 /// The stat or the chmod.
 fn private_mode(path: &Path) -> io::Result<Option<u32>> {

@@ -36,7 +36,6 @@ pub struct Spell {
     pub rows: Vec<String>,
 }
 
-/// The window title the last OSC 0 or 2 in `data` sets, if any.
 fn osc_title(data: &str) -> Option<String> {
     let mut last = None;
     let mut rest = data;
@@ -62,7 +61,6 @@ pub(crate) fn spells(cast: &halfdraw::Cast, reader: &dyn ScreenReader) -> Vec<Sp
     struct St {
         at: f64,
         busy: bool,
-        /// An idle reading: (evidence, composer).
         idle: Option<(bool, bool)>,
         rows: Vec<String>,
         typed: bool,
@@ -237,7 +235,6 @@ pub fn spell_report(name: &str, spells: &[Spell], show: usize) -> String {
     out
 }
 
-/// How many of a shown screen's last non-blank rows are printed.
 const SHOWN_ROWS: usize = 8;
 
 /// One point read again.
@@ -438,7 +435,6 @@ pub struct MuseRun {
     pub eot_gate_ms: Option<u64>,
 }
 
-/// Every record of a Muse Code `session.jsonl` line, those a retained frame holds unwrapped.
 fn muse_records(line: &str) -> Vec<aterm_json::Value> {
     let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
         return Vec::new();
@@ -654,7 +650,6 @@ pub fn gate_report(name: &str, points: &[JournalPoint], runs: &[MuseRun]) -> (St
     (out, in_gate + mid)
 }
 
-/// Every file named `name` under `dir`, none under a `subagent` folder, sorted.
 fn files_named(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
@@ -672,8 +667,6 @@ fn files_named(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The name a harness tab went by: the subject its tape's first `status` read named
-/// (`subject=land-d`; `-` and none are no name).
 fn tape_subject(drive: &Path, sid: &str) -> Option<String> {
     let mut tapes = Vec::new();
     for e in std::fs::read_dir(drive.join("tapes").join(sid))
@@ -763,7 +756,6 @@ pub fn pair(
         .collect()
 }
 
-/// `gate` over one lab's kept logs (or a live run's directory).
 fn gate_dir(dir: &Path) -> Result<(String, usize), Fail> {
     let (drive, sessions) = if dir.join("drive").is_dir() {
         (dir.join("drive"), dir.join("muse-sessions"))
@@ -874,11 +866,6 @@ mod tests {
         }
     }
 
-    /// MEASURED (Muse Code 1.4.10): the bare status row after its glyph cycled (`◈ Thinking`,
-    /// replayed from a half-drawn-frame cast) is an idle read with no evidence; NEGATIVE
-    /// CONTROL: the reply's end under the composer (`END_OF_TURN_1_4_10`) is one with evidence.
-    /// A reader that vouched for every idle read (the mutant `evidence = true`) fails the first
-    /// assertion.
     #[test]
     fn a_bare_status_row_is_a_point_with_no_evidence() {
         use aterm_phase::muse::fixtures as u;
@@ -908,8 +895,6 @@ mod tests {
         assert!(!text.contains("seq=9 outcome"), "{text}");
     }
 
-    /// The window title: the last OSC 0 or 2 of a write, ended by BEL or ST; other OSCs (the
-    /// shell's 633 marks, a hyperlink's 8) are no title.
     #[test]
     fn the_title_is_the_last_osc_0_or_2() {
         assert_eq!(osc_title("\x1b]0;⠙ proj\x07"), Some("⠙ proj".to_string()));
@@ -924,13 +909,6 @@ mod tests {
     const HM4_JOURNAL: &str = include_str!("fixtures/muse-1.4.10-R6427.1-lab-hm4-t2.journal.jsonl");
     const HM4_SESSION: &str = include_str!("fixtures/muse-1.4.10-R6427.1-lab-hm4-t2.session.jsonl");
 
-    /// MEASURED (the forever lab's `ie-fb` Muse run): 16 tabs, the Off tab unsupervised and so
-    /// with no harness journal, its Muse Code session started among the others'. Paired in the
-    /// order they started, every tab after it took its neighbour's session (`instant-land` read
-    /// against `FOREVERLAB-OFF`'s runs). By name each tab takes its own: the subject its tape's
-    /// `status` named, the project folder its session names. NEGATIVE CONTROL: where the names
-    /// say nothing (every session in `proj`, as the half-drawn labs' three tabs), the order
-    /// pairs them. MUTANT: names ignored.
     #[test]
     fn a_tab_and_its_muse_session_are_paired_by_the_name_both_say() {
         assert_eq!(
@@ -979,13 +957,6 @@ mod tests {
         );
     }
 
-    /// MEASURED (lab `hm4`, tab 2, the build before the guard): of the tab's 11 idle points, two
-    /// were journaled while Muse Code's run still held its end-of-turn gate (seq 15031 in round
-    /// 2 and 76024 in round 6), the reply committed and the run's `terminal` not yet written; the
-    /// launch's point came before any run, and the other eight after a run's end. NEGATIVE
-    /// CONTROL: the same points 1.7 s later (past every gate) are none in the gate and ten after
-    /// a run's end. MUTANTS: a `place` that ignores the commit reads the gate's points
-    /// MID-REPLY; one that ignores the terminal reads every later point IN THE GATE.
     #[test]
     fn a_point_in_muses_end_of_turn_gate_is_told_from_the_journals() {
         let (first, runs) = muse_runs(HM4_SESSION);
@@ -1032,12 +1003,6 @@ mod tests {
 
     const EOT_GATE: &str = include_str!("fixtures/muse-1.4.10-R6427.1-lab-eot-gate.cast");
 
-    /// MEASURED (`EOT_GATE`, one Muse Code 1.4.10 turn in the lab): the reply's end is drawn
-    /// whole under the running title (`⠙ proj`, …) and the title rests (`proj`) when the run's
-    /// end-of-turn gate ends, 0.65 s later (the journal's `eot_gate_ms=554`). NEGATIVE CONTROLS:
-    /// the same cast with its titles taken out has no word from the title, and a reader with no
-    /// reading of titles (Claude Code's) has none either. MUTANTS: a `title_runs` that reads any
-    /// title as running never rests; one that reads none as running rests at once (0 s).
     #[test]
     fn a_muse_turn_end_is_told_by_its_resting_title() {
         let cast = halfdraw::parse_cast(EOT_GATE).expect("the cast");

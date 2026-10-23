@@ -14,14 +14,16 @@
 //!    checkout's path. A module that still carries a host path fails the
 //!    gate ([`host_paths`]): the committed fixture ships with the source,
 //!    and the export guard refuses a home path in any file.
-//! 2. Bind it in both flavors and compare the text files with the goldens
-//!    under `tests/toy/golden/`. `--record-toy` rewrites them, and the module
+//! 2. Bind it and compare the text files with the goldens under
+//!    `tests/toy/golden/`. `--record-toy` rewrites them, and the module
 //!    fixture the native golden test (`super::tests`) binds, after review.
-//! 3. Run `tests/toy/drive.mjs` under `node --expose-gc` on the fresh glue.
+//! 3. Run `tests/toy/drive.mjs` on the fresh glue in a page of the pinned
+//!    chrome-headless-shell ([`crate::wasm_page`]).
 //! 4. NEGATIVE CONTROL: plant one wrong conversion (a `u32` return read as
 //!    signed) in a copy of the glue; the driver must fail on it, by name.
 //!
-//! A machine without node or the stable wasm32 std is a skip with the fix.
+//! A machine without the pinned browser or the stable wasm32 std is COULD
+//! NOT RUN naming the provider, found before anything builds.
 //! Progress goes to the caller's log, never the terminal. The check's second
 //! row, [`super::oracle`], holds the goldens and the driver to wasm-bindgen
 //! 0.2.108.
@@ -30,10 +32,8 @@ use aterm_uds::output::CommandOutput as _;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use aterm_uds::spawnfd::command;
-
-use super::Flavor;
 use crate::perf::LaneRun;
+use crate::wasm_page::{Browser, Page, Refused};
 
 /// The toy's crate name, which is also its module's file stem.
 pub(crate) const STEM: &str = "aterm_wasm_abi_toy";
@@ -48,17 +48,14 @@ pub(crate) fn fixture(root: &Path) -> PathBuf {
     toy_dir(root).join(format!("{STEM}.wasm"))
 }
 
-/// A flavor's golden directory.
-pub(crate) fn golden_dir(root: &Path, flavor: Flavor) -> PathBuf {
-    toy_dir(root).join("golden").join(flavor_name(flavor))
+/// The goldens' directory.
+pub(crate) fn golden_dir(root: &Path) -> PathBuf {
+    toy_dir(root).join("golden")
 }
 
-pub(crate) const fn flavor_name(flavor: Flavor) -> &'static str {
-    match flavor {
-        Flavor::Web => "web",
-        Flavor::Nodejs => "nodejs",
-    }
-}
+/// Where a site holds the glue the driver loads, and the URL it loads it by.
+pub(crate) const GLUE: &str = "glue";
+const GLUE_URL: &str = "../glue/aterm_wasm_abi_toy.js";
 
 /// The glue's text files, which have goldens (the `_bg.wasm` is the
 /// module's own bytes, and differs with the compiler).
@@ -83,156 +80,119 @@ pub(crate) fn first_difference(got: &str, want: &str) -> String {
 /// The check over the checkout at `root`, building in `work`; its progress
 /// lines are appended to `log`.
 pub(crate) fn gate(root: &Path, work: &Path, record: bool, log: &mut String) -> LaneRun {
-    let rustup = match stable_wasm32() {
+    let browser = match crate::wasm_page::browser() {
+        Ok(browser) => browser,
+        Err(refused) => return refused.verdict("the toy's driver"),
+    };
+    let rustup = match crate::perf::wasm::build_tools(false) {
         Ok(rustup) => rustup,
-        Err(skip) => return skip,
+        Err(unrun) => return unrun,
     };
-    match run(root, &rustup, work, record, log) {
+    match run(root, &rustup, &browser, work, record, log) {
         Ok(()) => LaneRun::pass(),
-        Err(e) => LaneRun::fail(e),
+        Err(refused) => refused.verdict("the toy's driver"),
     }
-}
-
-/// What a toy build and its driver need: node, and rustup with the stable
-/// wasm32 std (found: rustup's path), else the skip naming the install.
-pub(super) fn stable_wasm32() -> Result<PathBuf, LaneRun> {
-    if !command("node")
-        .arg("--version")
-        .output_owned()
-        .is_ok_and(|o| o.status.success())
-    {
-        return Err(LaneRun::skip(
-            "node not found; the toy runs under node",
-            aterm_uds::host::tool("node").remedy(),
-        ));
-    }
-    let Some(rustup) = crate::rustup::find_rustup() else {
-        return Err(LaneRun::skip(
-            format!("no rustup ({})", crate::rustup::RUSTUP_LOOKED),
-            format!(
-                "{}, with stable's wasm32 std",
-                aterm_uds::host::tool("rustup").remedy()
-            ),
-        ));
-    };
-    let has_target = command(&rustup)
-        .args(["target", "list", "--installed", "--toolchain", "stable"])
-        .output_owned()
-        .is_ok_and(|o| {
-            crate::rustup::lists_target(
-                &String::from_utf8_lossy(&o.stdout),
-                "wasm32-unknown-unknown",
-            )
-        });
-    if !has_target {
-        return Err(LaneRun::skip(
-            "no stable wasm32-unknown-unknown target",
-            "rustup target add wasm32-unknown-unknown --toolchain stable",
-        ));
-    }
-    Ok(rustup)
 }
 
 fn run(
     root: &Path,
     rustup: &Path,
+    browser: &Browser,
     work: &Path,
     record: bool,
     log: &mut String,
-) -> Result<(), String> {
-    let module = build(root, rustup, work, log)?;
-    let bytes =
-        std::fs::read(&module).map_err(|e| format!("could not read {}: {e}", module.display()))?;
+) -> Result<(), Refused> {
+    let failed = Refused::Failed;
+    let module = build(root, rustup, work, log).map_err(failed)?;
+    let bytes = std::fs::read(&module)
+        .map_err(|e| failed(format!("could not read {}: {e}", module.display())))?;
     let found = host_paths(&bytes, root);
     if !found.is_empty() {
-        return Err(format!(
+        return Err(failed(format!(
             "the toy's module carries host paths ({}): the staged build should leave none, \
              and the committed fixture must not (the export guard refuses home paths)",
             found.join(", ")
-        ));
+        )));
     }
-    let glue_dir = work.join("glue");
-    for flavor in [Flavor::Web, Flavor::Nodejs] {
-        let out = glue_dir.join(flavor_name(flavor));
-        std::fs::create_dir_all(&out)
-            .map_err(|e| format!("could not create {}: {e}", out.display()))?;
-        let golden = golden_dir(root, flavor);
-        for (name, contents) in super::glue(&bytes, STEM, flavor)? {
-            std::fs::write(out.join(&name), &contents)
-                .map_err(|e| format!("could not write {name}: {e}"))?;
-            if !is_text(&name) {
-                continue;
-            }
-            let path = golden.join(&name);
-            if record {
-                std::fs::create_dir_all(&golden)
-                    .map_err(|e| format!("could not create {}: {e}", golden.display()))?;
-                std::fs::write(&path, &contents)
-                    .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-                continue;
-            }
-            let want = std::fs::read_to_string(&path).map_err(|e| {
-                format!(
-                    "no golden {} ({e}): run `targo --unverified verify glue --record-toy` and \
-                     review it",
-                    path.display()
-                )
-            })?;
-            let got = String::from_utf8_lossy(&contents);
-            if got != want {
-                return Err(format!(
-                    "the {} glue's {name} differs from its golden at {}; review the change, \
-                     then `targo --unverified verify glue --record-toy`",
-                    flavor_name(flavor),
-                    first_difference(&got, &want)
-                ));
-            }
+    let site = work.join("site");
+    let _ = std::fs::remove_dir_all(&site);
+    let out = site.join(GLUE);
+    std::fs::create_dir_all(&out)
+        .map_err(|e| failed(format!("could not create {}: {e}", out.display())))?;
+    let golden = golden_dir(root);
+    for (name, contents) in super::glue(&bytes, STEM).map_err(failed)? {
+        std::fs::write(out.join(&name), &contents)
+            .map_err(|e| failed(format!("could not write {name}: {e}")))?;
+        if !is_text(&name) {
+            continue;
+        }
+        let path = golden.join(&name);
+        if record {
+            std::fs::create_dir_all(&golden)
+                .map_err(|e| failed(format!("could not create {}: {e}", golden.display())))?;
+            std::fs::write(&path, &contents)
+                .map_err(|e| failed(format!("could not write {}: {e}", path.display())))?;
+            continue;
+        }
+        let want = std::fs::read_to_string(&path).map_err(|e| {
+            failed(format!(
+                "no golden {} ({e}): run `targo --unverified verify glue --record-toy` and \
+                 review it",
+                path.display()
+            ))
+        })?;
+        let got = String::from_utf8_lossy(&contents);
+        if got != want {
+            return Err(failed(format!(
+                "the glue's {name} differs from its golden at {}; review the change, then \
+                 `targo --unverified verify glue --record-toy`",
+                first_difference(&got, &want)
+            )));
         }
     }
     if record {
         let fixture = fixture(root);
         std::fs::write(&fixture, &bytes)
-            .map_err(|e| format!("could not write {}: {e}", fixture.display()))?;
+            .map_err(|e| failed(format!("could not write {}: {e}", fixture.display())))?;
         let _ = writeln!(log, "  recorded the goldens and {}", fixture.display());
     }
 
-    let driver = toy_dir(root).join("drive.mjs");
-    let (ok, stderr) = drive(&driver, &glue_dir)?;
-    for line in stderr.lines() {
+    // NEGATIVE CONTROL's glue: the same with a u32 return read as signed.
+    let planted = site.join("planted");
+    std::fs::create_dir_all(&planted)
+        .map_err(|e| failed(format!("could not create {}: {e}", planted.display())))?;
+    for entry in std::fs::read_dir(&out).map_err(|e| failed(format!("{}: {e}", out.display())))? {
+        let entry = entry.map_err(|e| failed(e.to_string()))?;
+        let mut contents = std::fs::read(entry.path()).map_err(|e| failed(e.to_string()))?;
+        if entry.file_name().to_string_lossy().ends_with(".js") {
+            let text = String::from_utf8_lossy(&contents);
+            if !text.contains("return ret$ >>> 0;") {
+                return Err(failed(
+                    "the negative control found no u32 return to plant in".to_string(),
+                ));
+            }
+            contents = text
+                .replace("return ret$ >>> 0;", "return ret$;")
+                .into_bytes();
+        }
+        std::fs::write(planted.join(entry.file_name()), contents)
+            .map_err(|e| failed(e.to_string()))?;
+    }
+
+    let mut page = start_page(browser, root, &site, work)?;
+    let _ = writeln!(log, "  browser: {}", page.product());
+    let (ok, console) = drive(&mut page, GLUE_URL)?;
+    for line in console.lines() {
         let _ = writeln!(log, "  {line}");
     }
     if !ok {
-        return Err("drive.mjs failed on the toy's glue".to_string());
+        return Err(failed("drive.mjs failed on the toy's glue".to_string()));
     }
-
-    // NEGATIVE CONTROL: the same glue with a u32 return read as signed.
-    let planted = work.join("planted");
-    let _ = std::fs::remove_dir_all(&planted);
-    for flavor in [Flavor::Web, Flavor::Nodejs] {
-        let from = glue_dir.join(flavor_name(flavor));
-        let to = planted.join(flavor_name(flavor));
-        std::fs::create_dir_all(&to)
-            .map_err(|e| format!("could not create {}: {e}", to.display()))?;
-        for entry in std::fs::read_dir(&from).map_err(|e| format!("{}: {e}", from.display()))? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let mut contents = std::fs::read(entry.path()).map_err(|e| e.to_string())?;
-            if flavor == Flavor::Nodejs && entry.file_name().to_string_lossy().ends_with(".js") {
-                let text = String::from_utf8_lossy(&contents);
-                if !text.contains("return ret$ >>> 0;") {
-                    return Err("the negative control found no u32 return to plant in".to_string());
-                }
-                contents = text
-                    .replace("return ret$ >>> 0;", "return ret$;")
-                    .into_bytes();
-            }
-            std::fs::write(to.join(entry.file_name()), contents).map_err(|e| e.to_string())?;
-        }
-    }
-    let (ok, stderr) = drive(&driver, &planted)?;
-    if ok || !stderr.contains("FAIL nodejs scalars u32 max is unsigned") {
-        return Err(format!(
-            "NEGATIVE CONTROL: drive.mjs did not fail on glue that reads a u32 as signed:\n{stderr}"
-        ));
+    let (ok, console) = drive(&mut page, "../planted/aterm_wasm_abi_toy.js")?;
+    if ok || !console.contains("FAIL web scalars u32 max is unsigned") {
+        return Err(failed(format!(
+            "NEGATIVE CONTROL: drive.mjs did not fail on glue that reads a u32 as signed:\n{console}"
+        )));
     }
     let _ = writeln!(
         log,
@@ -429,16 +389,37 @@ pub(super) fn build_staged(
     Ok(target.join(format!("wasm32-unknown-unknown/release/{STEM}.wasm")))
 }
 
-/// Run the driver on `dir`: whether it passed, and what it printed.
-pub(super) fn drive(driver: &Path, dir: &Path) -> Result<(bool, String), String> {
-    let out = command("node")
-        .arg("--expose-gc")
-        .arg(driver)
-        .arg(dir)
-        .output_owned()
-        .map_err(|e| format!("could not run node: {e}"))?;
-    Ok((
-        out.status.success(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
+/// A browser serving `site`, with the toy's driver laid in it at
+/// `site/drive/drive.mjs`, its profile under `work`.
+pub(super) fn start_page(
+    browser: &Browser,
+    root: &Path,
+    site: &Path,
+    work: &Path,
+) -> Result<Page, Refused> {
+    let into = site.join("drive");
+    std::fs::create_dir_all(&into)
+        .map_err(|e| Refused::Failed(format!("could not create {}: {e}", into.display())))?;
+    let driver = toy_dir(root).join("drive.mjs");
+    std::fs::copy(&driver, into.join("drive.mjs"))
+        .map_err(|e| Refused::Failed(format!("could not copy {}: {e}", driver.display())))?;
+    Page::start(browser, site, &work.join("browser"))
+}
+
+/// Run the driver on the glue at `glue` (a URL relative to the driver):
+/// whether every check held, and what it printed. A driver that threw is a
+/// failed run, its console kept.
+pub(super) fn drive(page: &mut Page, glue: &str) -> Result<(bool, String), Refused> {
+    match page.run("drive/drive.mjs", &aterm_json::json!({"glue": glue})) {
+        Ok(ran) => {
+            let held = ran
+                .value
+                .get("failures")
+                .and_then(aterm_json::Value::as_u64)
+                == Some(0);
+            Ok((held, ran.log()))
+        }
+        Err(Refused::Failed(why)) => Ok((false, why)),
+        Err(unavailable) => Err(unavailable),
+    }
 }

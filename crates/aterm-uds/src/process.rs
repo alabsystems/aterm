@@ -14,7 +14,7 @@ pub enum ProcessPresence {
     Unknown,
 }
 
-/// Query one positive pid without delivering a signal. Only `ESRCH` proves absence.
+/// Query one positive pid without delivering a signal.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn process_presence(pid: i32) -> ProcessPresence {
@@ -75,7 +75,6 @@ pub fn pid_alive(pid: u32) -> bool {
     let handle =
         unsafe { ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
     if handle == 0 {
-        // Can't even query it: only "exists but is not ours" counts as alive.
         return unsafe { ffi::GetLastError() } == ERROR_ACCESS_DENIED;
     }
     let mut code: u32 = 0;
@@ -86,7 +85,7 @@ pub fn pid_alive(pid: u32) -> bool {
     alive
 }
 
-/// A process's kernel start time: the identity that tells a pid from the next process given the same number.
+/// A process's kernel start time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessBirth {
     /// Start time, unix seconds.
@@ -95,29 +94,19 @@ pub struct ProcessBirth {
     pub microseconds: u64,
 }
 
-/// Who a process is, re-read before every pid-addressed signal
-/// (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.4): a pid wraps in about ten minutes
-/// (M14), so a token names the pid, its birth and its pid version; an observed mismatch
-/// refuses the next signal. The token's wire form is
-/// `<pid>@<birth_us>:<idversion>` (design §11 Q5); its reader is [`read_identity`], its
-/// enforcer [`end_proven`]. The final identity read and pid-addressed signal are separate
-/// kernel calls: an exec or pid reuse after that read cannot be excluded by this token.
+/// Process identity token (`<pid>@<birth_us>:<idversion>`) re-read before each pid signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     /// The pid.
     pub pid: i32,
     /// Its birth, which tells it from the next process given the same number.
     pub birth: ProcessBirth,
-    /// Its pid version, which moves at each exec (M22), detecting changes observed before a
-    /// signal. `0` on a platform with
-    /// no version (Linux, where the token is `<pid>@<start_ticks>`: the leftover design's
-    /// slice 7).
+    /// Its pid version, incremented on exec (`0` on platforms without pid versions).
     pub idversion: i32,
 }
 
 impl Identity {
-    /// The token's wire form, `<pid>@<birth_us>:<idversion>`: `birth_us` is the birth as whole
-    /// microseconds, so it survives a round trip through text with no loss.
+    /// Formats the wire token `<pid>@<birth_us>:<idversion>`.
     #[must_use]
     pub fn token(&self) -> String {
         let micros = self
@@ -129,17 +118,14 @@ impl Identity {
     }
 }
 
-/// Why [`end_proven`] sent no signal, or sent one and the process stayed: the words
-/// `sys left`'s `refused` line and verify's receipt print (design §6.1).
+/// Why [`end_proven`] refused to signal or failed to deliver a signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndRefusal {
-    /// The pid names another process now (gone, reused, or exec'd into another program): its
-    /// birth or pid version has moved since the token was proven. No signal was sent.
+    /// The pid's birth or pid version moved since the token was proven.
     Stale,
-    /// The fresh read no longer meets the tier's conditions (membership lost, a witness gone):
-    /// no signal was sent.
+    /// The fresh read no longer meets the tier's conditions.
     NotProven,
-    /// A signal could not be delivered (the kernel refused it): the reason, for the words.
+    /// A signal could not be delivered (the kernel refused it).
     SignalFailed,
 }
 
@@ -150,62 +136,26 @@ pub struct Ended {
     pub termed: bool,
     /// A `SIGKILL` was sent (the process outlived the grace).
     pub killed: bool,
-    /// Identity reads no longer named the process: no identity, or another birth. A failed
-    /// identity read also yields no identity; callers requiring confirmed absence must query
-    /// [`process_presence`]. An exec under the same birth is not gone.
+    /// Identity reads no longer named the process (no identity or a different birth).
     pub gone: bool,
 }
 
-/// The kernel seam [`end_proven`] acts through: re-read a pid's identity, and signal it. The
-/// shipped reader reads the kernel ([`EndControlLive`]); a test injects one whose identity
-/// changes between the judgment and the signal, the negative control the `EndByProof` model
-/// names, so no signal goes out.
+/// Kernel seam for [`end_proven`] to re-read a pid's identity.
 pub trait EndControl {
     /// `pid`'s identity now, or `None` when gone, unreadable, or not of this uid.
     fn identity(&mut self, pid: i32) -> Option<Identity>;
-    /// Send `sig` to `pid` (never a group; [`end_proven`] signals by pid alone).
-    ///
-    /// # Errors
-    /// The kernel's own, when it refuses the signal.
+    /// Sends `sig` to `pid`.
     fn signal(&mut self, pid: i32, sig: i32) -> std::io::Result<()>;
-    /// Wait `pause` before the next poll for the process to be gone. The shipped arm sleeps;
-    /// a test's injects a no-op or a clock it controls, so a wait for gone is a hang detector,
-    /// never a budget.
+    /// Sleeps `pause` before the next poll for the process to exit.
     fn nap(&mut self, pause: std::time::Duration);
 }
 
-/// The grace [`end_proven`] gives a process to exit after `SIGTERM` before it `SIGKILL`s it,
-/// as verify's per-child `term_grace` is a bound rather than a wait (design §4.4): 10 s.
+/// Grace period [`end_proven`] gives a process to exit after `SIGTERM` before `SIGKILL`.
 pub const END_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long [`end_proven`] naps between polls for a signalled process to be gone.
 const END_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// End the one process `token` names, re-proving it before each signal (design §4.4). The
-/// judgment is the tier's reads (`still_proven`, on the fresh state) bracketed by two identity
-/// reads through `control` that must both equal `token`, so the tier judged the token's own
-/// program and an exec or an exit while it read shows in the second read: a read that moved
-/// refuses [`EndRefusal::Stale`], a tier lost [`EndRefusal::NotProven`]. Then `SIGTERM` by
-/// pid, a poll within `grace` ([`END_GRACE`] for every shipped caller), the same judgment again
-/// and `SIGKILL` by pid, and a poll within `grace` again. A read that moved ends the sequence
-/// with nothing more sent, and a lost tier leaves the process unkilled for the caller to name.
-///
-/// `gone` describes identity reads, not confirmed absence: a missing read may have failed,
-/// while a known different birth establishes that the original process left. A read of the
-/// same birth under another pid version is the same process running another program. Never
-/// `killpg`, never a bare pid
-/// acted on without this re-read. The actor that calls it owns the whole sequence; nothing
-/// waits for a later reading. `grace` is a bound, not a wait, so a caller may pass a shorter
-/// one; a test passes [`std::time::Duration::ZERO`] to reach the `SIGKILL` with no real wait.
-///
-/// It is the `EndByProof` machine's one implementation (`crates/aterm-models-misc`, bound by
-/// `crates/aterm-verify/tests/conformance_end_by_proof.rs`): every signal follows its own
-/// judgment that held, and none follows a read whose identity moved or a tier that was lost.
-/// This is an ordering of observed reads, not an atomic identity-conditioned kernel signal.
-///
-/// # Errors
-/// [`EndRefusal`]: stale or not proven before the `SIGTERM`, or a `SIGTERM` the kernel refused
-/// while the process still reads. Once a `SIGTERM` went out the answer is `Ok`.
+/// Terminates `token`'s process, re-proving identity and `still_proven` before each signal.
 pub fn end_proven(
     token: Identity,
     grace: std::time::Duration,
@@ -239,7 +189,6 @@ pub fn end_proven(
     }
     let mut ended = Ended::default();
     if control.signal(pid, SIGTERM).is_err() {
-        // `ESRCH` is a process that exited after the judgment: the read says which.
         ended.gone = gone(control.identity(pid));
         return if ended.gone {
             Ok(ended)
@@ -252,7 +201,6 @@ pub fn end_proven(
         ended.gone = gone(now);
         return Ok(ended);
     }
-    // Still the token's program at the grace's end: judge again, then SIGKILL by pid.
     match judge(&mut *control) {
         Judged::Holds => {}
         Judged::Moved(now) => {
@@ -266,23 +214,16 @@ pub fn end_proven(
         return Ok(ended);
     }
     ended.killed = true;
-    // XNU tears a killed process down after the signal; a wedged one may stay.
     ended.gone = moved_within(control, token, grace).is_some_and(gone);
     Ok(ended)
 }
 
-/// One judgment of [`end_proven`]'s.
 enum Judged {
-    /// Both identity reads equal the token and the tier holds.
     Holds,
-    /// An identity read no longer equals the token: what it read.
     Moved(Option<Identity>),
-    /// The tier's conditions no longer hold.
     Lost,
 }
 
-/// Poll `token`'s pid within `grace` (a bound, not a wait) until a read no longer equals the
-/// token: that read, or `None` when the pid still reads the token at the grace's end.
 fn moved_within(
     control: &mut impl EndControl,
     token: Identity,
@@ -301,8 +242,7 @@ fn moved_within(
     }
 }
 
-/// The shipped [`EndControl`]: it reads the kernel ([`read_identity`]), signals by pid
-/// (`kill(2)`), and sleeps to nap. Every signal is one `kill` of one pid.
+/// Live [`EndControl`] backed by [`read_identity`], `kill(2)`, and [`std::thread::sleep`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EndControlLive;
 
@@ -310,7 +250,6 @@ impl EndControl for EndControlLive {
     fn identity(&mut self, pid: i32) -> Option<Identity> {
         read_identity(pid)
     }
-    // Skip: bottoms out at the `kill` FFI call.
     #[cfg_attr(trust_verify, trust::skip)]
     fn signal(&mut self, pid: i32, sig: i32) -> std::io::Result<()> {
         #[cfg(unix)]
@@ -318,8 +257,7 @@ impl EndControl for EndControlLive {
             unsafe extern "C" {
                 fn kill(pid: i32, sig: i32) -> i32;
             }
-            // SAFETY: two integer arguments; `end_proven` re-read `pid`'s identity just before
-            // this and signals one pid, never a group.
+            // SAFETY: two integer arguments.
             if unsafe { kill(pid, sig) } == 0 {
                 Ok(())
             } else {
@@ -340,9 +278,6 @@ impl EndControl for EndControlLive {
     }
 }
 
-/// Who a process descends from and which run started it (flavors 17/18, launchd's version, a
-/// group's members, the three marker variables, this boot's id and the program-check
-/// signature), moved here from aterm-gui's warm-spare escape scan. See [`kin`].
 #[path = "process_kin.rs"]
 mod kin;
 pub use kin::{
@@ -350,11 +285,11 @@ pub use kin::{
     boot_id, group_members, launchd_idversion, launched_before, read_identity, read_lineage,
     read_process_markers,
 };
-// The flavor-17/18 record readers exist only where XNU keeps those records (Apple).
+
 #[cfg(target_vendor = "apple")]
 pub use kin::{BsdInfoWithUniqId, UniqIdentifierInfo, bsdinfo_uniq, uniq_identifier};
 
-/// Read the kernel's start-time record for `pid`, or `None` when there is no process of this uid to name there.
+/// Reads the kernel's start-time record for `pid`, or `None` if unavailable.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
@@ -378,14 +313,14 @@ pub fn read_process_parent(pid: i32) -> Option<u32> {
     (read_process_start(pid)? == start).then_some(parent)
 }
 
-/// See the Apple twin: no parent-pid primitive is wired here.
+/// See the Apple twin.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn read_process_parent(_pid: i32) -> Option<u32> {
     None
 }
 
-/// The executable the kernel records for `pid` (`proc_pidpath`), on the terms of [`read_process_birth`], and `None` when the kernel cannot name the file any more.
+/// Reads the executable path the kernel records for `pid` (`proc_pidpath`).
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -397,7 +332,7 @@ pub fn read_process_path(pid: i32) -> Option<std::path::PathBuf> {
     }
     read_bsdinfo(pid)?;
     let mut buf = [0u8; MAX];
-    // SAFETY: `buf` is MAX writable bytes; libproc writes at most that many and returns the path's length, or <= 0 on failure.
+    // SAFETY: `buf` is MAX writable bytes; libproc writes at most that many.
     let len = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), MAX as u32) };
     let len = usize::try_from(len).ok().filter(|&n| n > 0 && n <= MAX)?;
     Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
@@ -462,7 +397,7 @@ pub fn read_short_info(pid: i32) -> Option<BsdShortInfo> {
         return None;
     }
     let mut info = std::mem::MaybeUninit::<BsdShortInfo>::zeroed();
-    // SAFETY: `info` is SIZE writable bytes of exactly the structure this flavor fills (size asserted above).
+    // SAFETY: `info` is SIZE writable bytes matching the structure this flavor fills.
     let read = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -489,14 +424,14 @@ unsafe extern "C" {
 #[cfg(target_vendor = "apple")]
 pub const CHILD_PIDS_MAX: usize = 64;
 
-/// `pid`'s live children, at most [`CHILD_PIDS_MAX`], from libproc, or `None` when the table cannot answer.
+/// Lists `pid`'s live children, up to [`CHILD_PIDS_MAX`].
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn child_pids(pid: i32) -> Option<Vec<i32>> {
     let mut pids = [0i32; CHILD_PIDS_MAX];
     let bytes = i32::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is `bytes` writable bytes of pid slots; libproc writes at most that many and answers how many pids it wrote, or -1.
+    // SAFETY: `pids` is `bytes` writable bytes of pid slots.
     let found = unsafe { proc_listchildpids(pid, pids.as_mut_ptr().cast(), bytes) };
     let found = usize::try_from(found).ok()?.min(CHILD_PIDS_MAX);
     Some(pids[..found].iter().copied().filter(|p| *p > 0).collect())
@@ -506,9 +441,6 @@ pub fn child_pids(pid: i32) -> Option<Vec<i32>> {
 mod short_info_tests {
     use super::{BsdShortInfo, child_pids, read_short_info};
 
-    /// The layout read back: this process's record names it, its parent and its group, and
-    /// flags the `exec` that started this test binary; a child it spawns is listed among its
-    /// children.
     #[test]
     fn this_process_reads_its_own_short_record_back() {
         let me = i32::try_from(std::process::id()).expect("pid");
@@ -556,22 +488,19 @@ pub fn read_process_path(pid: i32) -> Option<std::path::PathBuf> {
     (read_process_start(pid)? == start).then_some(exe)
 }
 
-/// See the Apple twin: no executable-path primitive is wired here.
+/// See the Apple twin.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn read_process_path(_pid: i32) -> Option<std::path::PathBuf> {
     None
 }
 
-/// The `proc_bsdinfo` fields this module reads, for a live process of this uid.
 #[cfg(target_vendor = "apple")]
 struct BsdInfo {
     birth: ProcessBirth,
     parent: u32,
 }
 
-/// `proc_pidinfo(PROC_PIDTBSDINFO)` for `pid`, on the terms
-/// [`read_process_birth`] states.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_bsdinfo(pid: i32) -> Option<BsdInfo> {
@@ -598,7 +527,7 @@ fn read_bsdinfo(pid: i32) -> Option<BsdInfo> {
         return None;
     }
     let mut info = [0u8; SIZE];
-    // SAFETY: `info` is SIZE writable bytes, exactly the structure this flavor fills; libproc returns the number of bytes it wrote.
+    // SAFETY: `info` is SIZE writable bytes matching the structure this flavor fills.
     let read = unsafe {
         proc_pidinfo(
             pid,
@@ -641,7 +570,7 @@ pub fn read_process_birth(pid: i32) -> Option<ProcessBirth> {
     birth_of_filetime(read_creation_filetime(pid)?)
 }
 
-/// The RAW creation `FILETIME` of `pid` — 100 ns ticks since 1601-01-01 UTC, as `GetProcessTimes` reports it, with no conversion.
+/// Raw creation `FILETIME` of `pid` in 100 ns ticks since 1601-01-01 UTC.
 #[cfg(windows)]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -662,7 +591,7 @@ pub fn read_creation_filetime(pid: i32) -> Option<u64> {
     }
     let mut times = [ffi::FileTime::default(); 4];
     let [created, exited, kernel, user] = &mut times;
-    // SAFETY: `handle` is the live process handle opened above, and the four out-params are distinct writable `FILETIME`s that outlive the call.
+    // SAFETY: `handle` is live and the four out-params are distinct writable `FILETIME`s.
     let read = unsafe { ffi::WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT
         && unsafe { ffi::GetProcessTimes(handle, created, exited, kernel, user) } != 0;
     // SAFETY: closes the one handle this function opened.
@@ -670,11 +599,8 @@ pub fn read_creation_filetime(pid: i32) -> Option<u64> {
     read.then(|| times[0].ticks())
 }
 
-/// A Windows `FILETIME` (100 ns ticks since 1601-01-01 UTC) as a
-/// [`ProcessBirth`]; `None` before the Unix epoch.
 #[cfg(any(windows, test))]
 fn birth_of_filetime(ticks: u64) -> Option<ProcessBirth> {
-    /// The ticks from 1601-01-01 to 1970-01-01.
     const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
     let since = ticks.checked_sub(UNIX_EPOCH_TICKS)?;
     Some(ProcessBirth {
@@ -683,14 +609,14 @@ fn birth_of_filetime(ticks: u64) -> Option<ProcessBirth> {
     })
 }
 
-/// See the Apple twin: no birth-record primitive is wired here.
+/// See the Apple twin.
 #[cfg(not(any(target_vendor = "apple", windows)))]
 #[must_use]
 pub fn read_process_birth(_pid: i32) -> Option<ProcessBirth> {
     None
 }
 
-/// A reading of the kernel's boot clock, the monotonic clock this platform records a process's start on.
+/// Reading of the kernel's monotonic boot clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BootClock(pub u64);
 
@@ -746,7 +672,7 @@ pub fn translation() -> Translation {
     }
 }
 
-/// See the Apple twin: nothing translates a process here.
+/// See the Apple twin.
 #[cfg(not(target_vendor = "apple"))]
 #[must_use]
 pub fn translation() -> Translation {
@@ -771,14 +697,14 @@ pub fn translator() -> Option<String> {
     })
 }
 
-/// See the Linux twin: no test depends on a translator here.
+/// See the Linux twin.
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub const fn translator() -> Option<String> {
     None
 }
 
-/// The Apple boot clock for a process whose [`Translation`] is `translation`, read by `ticks` (`mach_absolute_time`).
+/// Reads the Apple boot clock for a process with the given [`Translation`].
 #[must_use]
 pub fn apple_boot_clock(
     translation: Translation,
@@ -790,7 +716,7 @@ pub fn apple_boot_clock(
     }
 }
 
-/// The boot clock now ([`BootClock`]), or `None` where this process cannot read it in the kernel's unit.
+/// Reads the current [`BootClock`], or `None` where unavailable.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -834,7 +760,7 @@ pub fn boot_clock_now() -> Option<BootClock> {
         .map(BootClock)
 }
 
-/// See the Apple twin: no boot clock wired here.
+/// See the Apple twin.
 #[cfg(not(any(
     target_vendor = "apple",
     all(
@@ -847,7 +773,7 @@ pub fn boot_clock_now() -> Option<BootClock> {
     None
 }
 
-/// Milliseconds on a clock that COUNTS THROUGH SLEEP and never steps with the wall clock, from an origin fixed for this boot.
+/// Monotonic milliseconds since boot, counting through sleep.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -922,7 +848,6 @@ pub fn asleep_since_boot() -> Option<std::time::Duration> {
     Some(std::time::Duration::from_nanos(boot.saturating_sub(awake)))
 }
 
-/// One `clock_gettime` reading of `clock`, in nanoseconds.
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     target_pointer_width = "64"
@@ -951,7 +876,7 @@ fn linux_clock_ns(clock: i32) -> Option<u64> {
         .checked_add(u64::try_from(now.tv_nsec).ok()?)
 }
 
-/// See the Apple twin: no sleep is counted here.
+/// See the Apple twin.
 #[cfg(not(any(
     target_vendor = "apple",
     all(
@@ -1000,7 +925,7 @@ pub fn awake_ms() -> Option<u64> {
     linux_clock_ns(CLOCK_MONOTONIC).map(|ns| ns / 1_000_000)
 }
 
-/// See the Apple twin: not wired here.
+/// See the Apple twin.
 #[cfg(not(any(
     target_vendor = "apple",
     all(
@@ -1013,7 +938,7 @@ pub fn awake_ms() -> Option<u64> {
     None
 }
 
-/// THE MACHINE'S LAST SLEEP on the wall clock, as the kernel recorded it: when it went to sleep and when it woke, unix milliseconds.
+/// Wall-clock `(sleep_ms, wake_ms)` of the machine's last sleep.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn last_sleep_ms() -> Option<(i64, i64)> {
@@ -1022,8 +947,6 @@ pub fn last_sleep_ms() -> Option<(i64, i64)> {
     (slept > 0 && slept < woke).then_some((slept, woke))
 }
 
-/// One `struct timeval` sysctl by name, unix milliseconds; `None` if the
-/// kernel refuses it or answers with another width.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn sysctl_timeval_ms(name: &core::ffi::CStr) -> Option<i64> {
@@ -1050,7 +973,7 @@ fn sysctl_timeval_ms(name: &core::ffi::CStr) -> Option<i64> {
         .checked_add(i64::from(tv.tv_usec) / 1000)
 }
 
-/// See the Apple twin: no sleep is recorded here.
+/// See the Apple twin.
 #[cfg(not(target_vendor = "apple"))]
 #[must_use]
 pub fn last_sleep_ms() -> Option<(i64, i64)> {
@@ -1060,13 +983,13 @@ pub fn last_sleep_ms() -> Option<(i64, i64)> {
 /// When a process started, as the kernel recorded it ([`read_process_start`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessStart {
-    /// On the boot clock in the kernel's unit, and never later than the real start: exact on Apple.
+    /// On the boot clock in the kernel's unit, and never later than the real start.
     pub boot: BootClock,
     /// The wall-clock record where the kernel keeps one ([`ProcessBirth`], Apple).
     pub wall: Option<ProcessBirth>,
 }
 
-/// Read the kernel's start record for `pid` on the boot clock, or `None` for the same cases as [`read_process_birth`] (no such process, a zombie, another uid, a record naming another pid, `pid <= 1`).
+/// Reads the kernel's boot-clock and wall-clock start record for `pid`.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn read_process_start(pid: i32) -> Option<ProcessStart> {
@@ -1078,8 +1001,6 @@ pub fn read_process_start(pid: i32) -> Option<ProcessStart> {
     })
 }
 
-/// `ri_proc_start_abstime` of `pid` (`struct rusage_info_v0`, sys/resource.h:
-/// 96 bytes, the field at offset 80).
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn start_abstime(pid: i32) -> Option<BootClock> {
@@ -1089,7 +1010,7 @@ fn start_abstime(pid: i32) -> Option<BootClock> {
         fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut core::ffi::c_void) -> i32;
     }
     let mut info = [0u64; 12];
-    // SAFETY: `info` is 96 writable, aligned bytes — the size of the structure this flavor fills — and outlives the call.
+    // SAFETY: `info` is 96 writable, aligned bytes matching the structure this flavor fills.
     if unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V0, info.as_mut_ptr().cast()) } != 0 {
         return None;
     }
@@ -1111,8 +1032,6 @@ pub fn read_process_start(pid: i32) -> Option<ProcessStart> {
     Some(ProcessStart { boot, wall: None })
 }
 
-/// This process's effective uid and the kernel's clock ticks per second
-/// (`USER_HZ`, the unit of `starttime`), for [`procfs::start`].
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg_attr(trust_verify, trust::skip)]
 #[cfg_attr(
@@ -1133,7 +1052,7 @@ fn linux_reader() -> Option<(u32, u64)> {
     (ticks > 0).then_some((euid, u64::from(ticks)))
 }
 
-/// See the Apple twin: no start record wired here.
+/// See the Apple twin.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 #[must_use]
 pub fn read_process_start(_pid: i32) -> Option<ProcessStart> {
@@ -1144,7 +1063,7 @@ pub fn read_process_start(_pid: i32) -> Option<ProcessStart> {
 pub mod procfs {
     use super::BootClock;
 
-    /// `(state, starttime)` from a `/proc/<pid>/stat` line (fields 3 and 22, the latter in clock ticks after boot), or `None` when the line does not parse or names another pid.
+    /// Parses `(state, starttime)` from a `/proc/<pid>/stat` line for `pid`.
     #[must_use]
     pub fn stat_start(stat: &str, pid: i32) -> Option<(char, u64)> {
         let open = stat.find(" (")?;
@@ -1161,7 +1080,7 @@ pub mod procfs {
         Some((state, start))
     }
 
-    /// The parent pid in a `/proc/<pid>/status` text: its `PPid:` line.
+    /// The parent pid in a `/proc/<pid>/status` text.
     #[must_use]
     pub fn parent(status: &str) -> Option<u32> {
         status
@@ -1172,7 +1091,7 @@ pub mod procfs {
             .ok()
     }
 
-    /// The executable a `/proc/<pid>/exe` link names, or `None` when the kernel marks it ` (deleted)`.
+    /// Returns `link` unless the kernel marks it ` (deleted)`.
     #[must_use]
     pub fn live_exe(link: std::path::PathBuf) -> Option<std::path::PathBuf> {
         (!link.as_os_str().as_encoded_bytes().ends_with(b" (deleted)")).then_some(link)
@@ -1199,7 +1118,7 @@ pub mod procfs {
         u64::try_from(nanos).ok().map(BootClock)
     }
 
-    /// The start of `pid` from its `stat`, its `status` and `stat` read again after `status`, for a reader whose effective uid is `euid`.
+    /// Reads the start of `pid` from `stat`, `status`, and a second `stat` read.
     #[must_use]
     pub fn start(
         stat: &str,
@@ -1220,7 +1139,7 @@ pub mod procfs {
     }
 }
 
-/// Read the argument words of one live process of this uid, between two matching [`ProcessStart`] records.
+/// Reads the argv of a live process of this uid between two matching [`ProcessStart`] reads.
 #[must_use]
 pub fn read_process_argv(pid: i32) -> Option<Vec<std::ffi::OsString>> {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
@@ -1278,7 +1197,7 @@ fn read_process_argv_inner(pid: i32) -> Option<Vec<std::ffi::OsString>> {
     argv_from_cmdline(&read_cmdline(u32::try_from(pid).ok()?)?)
 }
 
-/// `pid`'s `/proc/<pid>/cmdline`, at most 8 MiB: a longer read is unknown, never a prefix.
+/// `pid`'s `/proc/<pid>/cmdline`, at most 8 MiB.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn read_cmdline(pid: u32) -> Option<Vec<u8>> {
@@ -1299,7 +1218,6 @@ pub fn read_exec_path(pid: u32) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
-/// [`read_cmdline`], and whether the word it dropped named the translator.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn cmdline_as_run(pid: u32) -> Option<(Vec<u8>, bool)> {
     use std::io::Read as _;
@@ -1325,8 +1243,6 @@ fn cmdline_as_run(pid: u32) -> Option<(Vec<u8>, bool)> {
     cmdline_from_read(bytes, PROCESS_ARGV_MAX, || shared_interpreter(pid))
 }
 
-/// Admit one whole bounded read before changing its words. `limit` is the reader's
-/// bound; captured controls use a small one.
 #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
 fn cmdline_from_read(
     mut bytes: Vec<u8>,
@@ -1346,9 +1262,6 @@ fn cmdline_from_read(
     Some((bytes, false))
 }
 
-/// The executable the kernel holds for this process when a translator runs it: the
-/// translator, which `binfmt_misc` names as every translated process's executable
-/// (`docs/measured/linux-rosetta-2026-10-17.md`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn own_interpreter() -> Option<&'static std::path::Path> {
     use std::sync::OnceLock;
@@ -1363,8 +1276,6 @@ fn own_interpreter() -> Option<&'static std::path::Path> {
     .as_deref()
 }
 
-/// [`own_interpreter`], when the kernel holds it as `pid`'s executable too: the translator
-/// runs `pid`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn shared_interpreter(pid: u32) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStringExt as _;
@@ -1377,9 +1288,6 @@ fn shared_interpreter(pid: u32) -> Option<Vec<u8>> {
     }
 }
 
-/// The argument words of one `KERN_PROCARGS2` answer ([`crate::procargs::parse`]), all of
-/// them or none: refused when cut, when argc is 0 or past [`PROCESS_ARGV_WORDS`], when the
-/// exec path is empty, or when the buffer is past [`PROCESS_ARGV_MAX`].
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn argv_from_procargs2(bytes: &[u8]) -> Option<Vec<std::ffi::OsString>> {
     use std::os::unix::ffi::OsStringExt as _;
@@ -1416,7 +1324,7 @@ fn argv_from_cmdline(bytes: &[u8]) -> Option<Vec<std::ffi::OsString>> {
     )
 }
 
-/// End this process by `SIGKILL`, here: no destructor, exit handler or buffered flush runs.
+/// End this process by `SIGKILL`, here.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn kill_self_now() -> ! {
@@ -1439,7 +1347,7 @@ pub fn kill_self_now() -> ! {
     std::process::abort()
 }
 
-/// End this process here, running nothing (see the Unix twin); Windows has no `SIGKILL`.
+/// End this process here, running nothing (see the Unix twin).
 #[cfg(windows)]
 pub fn kill_self_now() -> ! {
     #[expect(
@@ -1449,13 +1357,12 @@ pub fn kill_self_now() -> ! {
     std::process::abort()
 }
 
-/// This machine's host name as configured (`m7.local`): the ONE answer every reader that names the machine gives.
+/// Returns this machine's configured host name.
 #[must_use]
 pub fn host_name() -> Option<String> {
     host_name_over(std::env::var_os("HOSTNAME"))
 }
 
-/// [`host_name`] with `$HOSTNAME` passed in: no test may set it.
 fn host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
     env_host_name(env).or_else(os_host_name)
 }
@@ -1466,7 +1373,6 @@ pub fn kernel_host_name() -> Option<String> {
     os_host_name()
 }
 
-/// A `$HOSTNAME` a person set, trimmed; `None` for none or a blank one.
 fn env_host_name(env: Option<std::ffi::OsString>) -> Option<String> {
     let name = env?;
     let name = name.to_str()?.trim();
@@ -1479,7 +1385,6 @@ pub fn lan_host_name() -> Option<String> {
     lan_host_name_over(std::env::var_os("HOSTNAME"))
 }
 
-/// [`lan_host_name`] with `$HOSTNAME` passed in: no test may set it.
 fn lan_host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
     env_host_name(env)
         .or_else(configured_host_name)
@@ -1487,14 +1392,12 @@ fn lan_host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
         .or_else(os_host_name)
 }
 
-/// The CoreFoundation and SystemConfiguration calls the macOS names take.
 #[cfg(target_os = "macos")]
 mod sc {
     use core::ffi::{c_char, c_ulong, c_void};
 
     pub(super) type CFTypeRef = *const c_void;
 
-    /// `kCFStringEncodingUTF8` (CFString.h).
     const UTF8: u32 = 0x0800_0100;
 
     #[link(name = "SystemConfiguration", kind = "framework")]
@@ -1517,8 +1420,7 @@ mod sc {
         pub(super) fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
     }
 
-    /// A host name `string` holds, trimmed; `None` for a blank one or one that is no UTF-8.
-    ///
+    /// A host name `string` holds, trimmed.
     /// # Safety
     /// `string` is a live CFString.
     #[cfg_attr(trust_verify, trust::skip)]
@@ -1537,18 +1439,12 @@ mod sc {
     }
 }
 
-/// The HostName an administrator set for this Mac (`scutil --get
-/// HostName`): `HostName` in the configuration daemon's `Setup:/System`,
-/// which `gethostname(2)` then gives too.
 #[cfg(target_os = "macos")]
 fn configured_host_name() -> Option<String> {
     // SAFETY: a CFString constant SystemConfiguration exports.
     setup_system(unsafe { sc::kSCPropSystemHostName })
 }
 
-/// The string `key` names in the configuration daemon's `Setup:/System`
-/// (the machine's names): `None` when it holds none there, or the daemon
-/// does not answer.
 #[cfg(target_os = "macos")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn setup_system(key_name: sc::CFTypeRef) -> Option<String> {
@@ -1582,20 +1478,15 @@ fn setup_system(key_name: sc::CFTypeRef) -> Option<String> {
     name
 }
 
-/// No configured name apart from the kernel's off macOS: [`os_host_name`]
-/// answers.
 #[cfg(not(target_os = "macos"))]
 fn configured_host_name() -> Option<String> {
     None
 }
 
-/// macOS's Bonjour name, `LocalHostName` without its `.local`
-/// (`SCDynamicStoreCopyLocalHostName`): `None` when none is set or the
-/// configuration daemon does not answer (a sandbox that refuses it).
 #[cfg(target_os = "macos")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn bonjour_host_name() -> Option<String> {
-    // SAFETY: a NULL store asks with a temporary session; the result is a new CFString reference this frame owns, or NULL.
+    // SAFETY: a NULL store asks with a temporary session; this frame owns the returned ref.
     let name = unsafe { sc::SCDynamicStoreCopyLocalHostName(std::ptr::null()) };
     if name.is_null() {
         return None;
@@ -1607,15 +1498,11 @@ fn bonjour_host_name() -> Option<String> {
     text
 }
 
-/// No Bonjour name off macOS: [`lan_host_name`] is [`host_name`]'s answer.
 #[cfg(not(target_os = "macos"))]
 fn bonjour_host_name() -> Option<String> {
     None
 }
 
-/// `gethostname(2)`: the kernel's node name, NUL-terminated in a buffer that
-/// holds any host name (POSIX caps it at `HOST_NAME_MAX`, 255 on Linux, 255 on
-/// Darwin's `MAXHOSTNAMELEN`).
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn os_host_name() -> Option<String> {
@@ -1633,40 +1520,28 @@ fn os_host_name() -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Windows: the DNS host name, as `hostname.exe` prints it
-/// (`GetComputerNameExW(ComputerNameDnsHostname)`), else `%COMPUTERNAME%` (the
-/// NetBIOS name: upper-cased, at most 15 characters, so a longer name would not
-/// match).
 #[cfg(windows)]
 fn os_host_name() -> Option<String> {
-    /// `COMPUTER_NAME_FORMAT::ComputerNameDnsHostname` (sysinfoapi.h).
     const COMPUTER_NAME_DNS_HOSTNAME: u32 = 1;
     computer_name(COMPUTER_NAME_DNS_HOSTNAME)
         .or_else(|| env_host_name(std::env::var_os("COMPUTERNAME")))
 }
 
-/// Windows: this machine's NetBIOS name, read from the OS (`GetComputerNameExW(ComputerNameNetBIOS)`: the name `[Environment]::MachineName` answers, so the one aterm's PowerShell integration writes into its OSC 7 URI).
+/// Reads this machine's NetBIOS name from the OS (`GetComputerNameExW(ComputerNameNetBIOS)`).
 #[cfg(windows)]
 #[must_use]
 pub fn netbios_host_name() -> Option<String> {
     netbios_host_name_over(std::env::var_os("COMPUTERNAME"))
 }
 
-/// [`netbios_host_name`] with `%COMPUTERNAME%` passed in: no test may set it.
 #[cfg(windows)]
 fn netbios_host_name_over(env: Option<std::ffi::OsString>) -> Option<String> {
-    /// `COMPUTER_NAME_FORMAT::ComputerNameNetBIOS` (sysinfoapi.h).
     const COMPUTER_NAME_NETBIOS: u32 = 0;
     computer_name(COMPUTER_NAME_NETBIOS).or_else(|| env_host_name(env))
 }
 
-/// Windows: the machine's name in the `COMPUTER_NAME_FORMAT` `format`
-/// (`GetComputerNameExW`), trimmed; `None` when the call fails or the name is
-/// blank.
 #[cfg(windows)]
 fn computer_name(format: u32) -> Option<String> {
-    /// A DNS host label is at most 63 characters and a NetBIOS name 15; this
-    /// holds any name.
     const CAPACITY: usize = 256;
     let mut buf = [0u16; CAPACITY];
     let mut len = CAPACITY as u32;
@@ -1679,7 +1554,6 @@ fn computer_name(format: u32) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// No OS answer wired here (the wasm32 hosts): `$HOSTNAME` alone.
 #[cfg(not(any(unix, windows)))]
 fn os_host_name() -> Option<String> {
     None
@@ -1687,11 +1561,6 @@ fn os_host_name() -> Option<String> {
 
 #[cfg(all(test, windows))]
 mod netbios_name_tests {
-    /// THE NETBIOS NAME IS THE OS'S, NOT THE ENVIRONMENT'S: with no
-    /// `%COMPUTERNAME%` at all (a process started with an environment of its
-    /// own) it is still read, at most fifteen characters, and it is the name
-    /// Windows set `%COMPUTERNAME%` to where this process's environment has
-    /// it.
     #[test]
     fn the_netbios_name_is_read_from_the_os() {
         let name = super::netbios_host_name_over(None).expect("the OS names this machine");
@@ -1708,8 +1577,6 @@ mod netbios_name_tests {
 
 #[cfg(all(test, unix))]
 mod host_name_tests {
-    /// A `$HOSTNAME` a person set names the machine, trimmed; a blank one
-    /// names nothing and the OS answers.
     #[test]
     fn the_hostname_override_wins_and_a_blank_one_falls_to_the_os() {
         assert_eq!(
@@ -1728,10 +1595,6 @@ mod host_name_tests {
         );
     }
 
-    /// On macOS the LAN's name for this machine is the HostName an
-    /// administrator set, the one `scutil --get HostName` prints; with none,
-    /// its Bonjour name, the one `scutil --get LocalHostName` prints, with
-    /// `.local`: never the name DHCP or reverse DNS gave the kernel.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_lan_name_is_the_configured_name_else_the_bonjour_name() {
@@ -1755,8 +1618,6 @@ mod host_name_tests {
         assert_eq!(super::lan_host_name_over(None), want);
     }
 
-    /// The kernel's answer is the one `uname -n` prints: the same node name,
-    /// read without a spawn.
     #[test]
     fn the_host_name_is_the_kernels_node_name() {
         let ours = super::os_host_name().expect("gethostname names this machine");
@@ -1769,14 +1630,11 @@ mod host_name_tests {
     }
 }
 
-/// `sigset_t`: a 32-bit mask on Darwin, 1024 bits on Linux.
 #[cfg(target_vendor = "apple")]
 type SigSet = u32;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 type SigSet = [u64; 16];
 
-/// SIGTERM, SIGINT and SIGHUP, the signals a supervisor or a terminal stops a process with
-/// (launchd at logout, `launchctl bootout`, `systemctl stop`, ^C, a terminal gone away).
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn stop_set() -> SigSet {
@@ -1785,7 +1643,7 @@ fn stop_set() -> SigSet {
         fn sigaddset(set: *mut SigSet, sig: i32) -> i32;
     }
     let mut set = SigSet::default();
-    // SAFETY: `sigemptyset` initialises the set it is handed; `sigaddset` then adds valid signal numbers to that initialised set.
+    // SAFETY: `sigemptyset` initialises `set`, and `sigaddset` adds valid signal numbers.
     unsafe {
         sigemptyset(&mut set);
         for sig in [15, 2, 1] {
@@ -1795,7 +1653,7 @@ fn stop_set() -> SigSet {
     set
 }
 
-/// TAKE THE STOP SIGNALS (SIGTERM, SIGINT, SIGHUP) so a process can stop cleanly instead of dying of their default action.
+/// Installs a signal-waiter thread for `SIGTERM`, `SIGINT`, and `SIGHUP` that invokes `on_stop`.
 #[cfg(unix)]
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1833,9 +1691,6 @@ pub fn take_stop_signals(name: &str, on_stop: impl FnOnce(i32) + Send + 'static)
 mod start_tests {
     use super::{BootClock, procfs};
 
-    /// A Windows `FILETIME` counts 100 ns ticks from 1601: the Unix epoch is its
-    /// 116444736000000000th, a part of a microsecond is dropped, and a tick
-    /// before the epoch is no birth.
     #[test]
     fn a_filetime_is_a_birth_counted_from_the_unix_epoch() {
         use super::{ProcessBirth, birth_of_filetime};
@@ -1855,8 +1710,6 @@ mod start_tests {
         assert_eq!(birth_of_filetime(EPOCH - 1), None);
     }
 
-    /// Real `/proc` text (`USER_HZ` 100): a command name holding a space and both parentheses,
-    /// running and as a zombie, and a `cat` read at uptime 518318.71 s.
     const TRICKY: &str = "7 (a) b (c) S 1 1 1 0 -1 4194368 63 0 0 0 0 0 0 0 20 0 1 0 51832760 \
          7032832 463 18446744073709551615 205458244435968 205458248030472 281474793899808 0 0 0 \
          0 128 0 1 0 0 17 0 0 0 0 0 0 205458248044264 205458248115556 205458772447232 \
@@ -1870,9 +1723,6 @@ mod start_tests {
     const STATUS_501: &str = "Name:\tcat\nState:\tR (running)\nTgid:\t13\nPid:\t13\n\
          Uid:\t501\t502\t501\t502\nGid:\t20\t20\t20\t20\n";
 
-    /// Field 22 counted from the command name's last `)`, the effective uid as the second
-    /// `Uid:` id, a tick as its first instant; another pid's line, a zombie, another euid, two
-    /// disagreeing `stat` reads, a short line and a zero tick rate answer `None`.
     #[test]
     fn a_linux_start_is_read_off_proc_as_linux_writes_it() {
         assert_eq!(procfs::stat_start(TRICKY, 7), Some(('S', 51_832_760)));
@@ -1923,8 +1773,6 @@ mod start_tests {
         assert_eq!(procfs::tick_start(7, 3), Some(BootClock(2_333_333_333)));
     }
 
-    /// A child spawned after a boot-clock reading starts later, and no later than a reading
-    /// taken once it runs; this process started earlier; an ended process has no record.
     #[cfg(unix)]
     #[test]
     fn a_child_started_after_a_boot_clock_reading_reads_later() {
@@ -1962,8 +1810,6 @@ mod start_tests {
         assert_eq!(super::read_process_start(1), None, "never pid 1");
     }
 
-    /// The translated half of [`a_child_started_after_a_boot_clock_reading_reads_later`]: the
-    /// wall record orders a child spawned after a wall-clock reading as later.
     #[cfg(unix)]
     fn a_child_started_after_a_wall_reading_reads_later() {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1985,8 +1831,6 @@ mod start_tests {
         assert!(wall > moment, "{wall:?} after {moment:?}");
     }
 
-    /// With the translation injected, `Translated` answers `None` without reading the clock,
-    /// and `Native` and `Unknown` answer the reading as is.
     #[test]
     fn a_translated_process_reads_no_boot_clock() {
         let native_ticks = 16_941_646_465_128;
@@ -2022,8 +1866,6 @@ mod kill_self_tests {
 
     const CHILD_ENV: &str = "ATERM_UDS_TEST_KILL_SELF_CHILD";
 
-    /// `kill_self_now` ends the process by SIGKILL at the call, which leaves no
-    /// macOS crash report.
     #[test]
     fn kill_self_now_dies_by_sigkill() {
         if std::env::var_os(CHILD_ENV).is_some() {
@@ -2059,14 +1901,10 @@ mod end_proven_tests {
         }
     }
 
-    /// A control whose identity reads follow a script (one per `identity` call) and whose
-    /// signals and naps are recorded. No process, no clock: the sequence is all that is under
-    /// test.
     struct Fake {
         reads: std::cell::RefCell<std::vec::IntoIter<Option<Identity>>>,
         signals: Vec<(i32, i32)>,
         naps: usize,
-        /// A signal the kernel refuses (`ESRCH`: the process had just exited).
         refuses: Option<i32>,
     }
     impl Fake {
@@ -2098,11 +1936,9 @@ mod end_proven_tests {
     const SIGTERM: i32 = 15;
     const SIGKILL: i32 = 9;
 
-    /// The token's program exits within the grace: one SIGTERM, then gone, no SIGKILL.
     #[test]
     fn a_process_that_exits_within_the_grace_takes_one_sigterm() {
         let t = ident(4242, 7);
-        // judge -> T, T; poll -> None (gone).
         let mut c = Fake::new(vec![Some(t), Some(t), None]);
         let out = end_proven(t, Duration::from_secs(60), &mut c, |_| true).expect("ended");
         assert_eq!(
@@ -2116,12 +1952,9 @@ mod end_proven_tests {
         assert_eq!(c.signals, [(4242, SIGTERM)]);
     }
 
-    /// A process that outlives the grace is SIGKILLed by pid; the token still reads at the
-    /// grace's end, and gone after. A zero grace reaches the kill with no wait.
     #[test]
     fn a_process_that_outlives_the_grace_is_sigkilled() {
         let t = ident(4242, 7);
-        // judge -> T, T; poll -> T (not gone); post-grace judge -> T, T; post-kill poll -> None.
         let mut c = Fake::new(vec![Some(t), Some(t), Some(t), Some(t), Some(t), None]);
         let out = end_proven(t, Duration::ZERO, &mut c, |_| true).expect("ended");
         assert_eq!(
@@ -2135,10 +1968,6 @@ mod end_proven_tests {
         assert_eq!(c.signals, [(4242, SIGTERM), (4242, SIGKILL)]);
     }
 
-    /// NEGATIVE CONTROL (the `EndByProof` law): the identity moved between the token and the
-    /// re-read, so NO signal goes out — the first judgment reads another pid version and refuses
-    /// `stale`. Break `end_proven`'s `names_token` (accept any `Some`) and the refusal assertion
-    /// fails: the run returns `Ok`, its SIGTERM sent to a pid that is now another program.
     #[test]
     fn a_moved_identity_before_the_term_sends_no_signal() {
         let t = ident(4242, 7);
@@ -2150,13 +1979,9 @@ mod end_proven_tests {
         assert!(c.signals.is_empty(), "no signal after a moved identity");
     }
 
-    /// The identity moves after the SIGTERM but before the SIGKILL (it exec'd another
-    /// program): the post-grace re-read refuses, so no SIGKILL reaches the program the token no
-    /// longer names. One SIGTERM, and the process is still there, so not gone.
     #[test]
     fn a_moved_identity_before_the_kill_sends_no_second_signal() {
         let t = ident(4242, 7);
-        // judge -> T, T; poll -> T; post-grace judge -> moved (idversion 8).
         let mut c = Fake::new(vec![Some(t), Some(t), Some(t), Some(ident(4242, 8))]);
         let out = end_proven(t, Duration::ZERO, &mut c, |_| true).expect("ended");
         assert_eq!(
@@ -2170,15 +1995,9 @@ mod end_proven_tests {
         assert_eq!(c.signals, [(4242, SIGTERM)]);
     }
 
-    /// The tier's conditions hold at the SIGTERM and are lost by the grace's end (the process
-    /// left its group, or reached the program check): the judgment before the SIGKILL runs the
-    /// tier's check too, so no SIGKILL goes out and the process is left, neither killed nor
-    /// gone. NEGATIVE CONTROL: drop the `still_proven` call from the judgment and the signals
-    /// read `[SIGTERM, SIGKILL]`.
     #[test]
     fn a_lost_witness_before_the_kill_sends_no_second_signal() {
         let t = ident(4242, 7);
-        // judge -> T, T; poll -> T (not gone); post-grace judge -> T, but the tier is lost.
         let mut c = Fake::new(vec![Some(t), Some(t), Some(t), Some(t)]);
         let mut judged = 0;
         let out = end_proven(t, Duration::ZERO, &mut c, |_| {
@@ -2198,7 +2017,6 @@ mod end_proven_tests {
         assert_eq!(judged, 2, "the tier is judged before each signal");
     }
 
-    /// The tier's conditions no longer hold on the fresh read: refused `not-proven`, no signal.
     #[test]
     fn a_lost_witness_sends_no_signal() {
         let t = ident(4242, 7);
@@ -2210,15 +2028,9 @@ mod end_proven_tests {
         assert!(c.signals.is_empty());
     }
 
-    /// The tier's reads are bracketed by two identity reads: a process that exec'd another
-    /// program WHILE `still_proven` read it (so the tier judged the new program) is refused
-    /// `stale` by the read after the judgment, and no signal goes out. NEGATIVE CONTROL: drop
-    /// the identity read after `still_proven`, and the SIGTERM reaches the new program.
     #[test]
     fn an_exec_during_the_judgment_sends_no_signal() {
         let t = ident(4242, 7);
-        // judge: identity -> T, the tier holds (on what is now another program), identity ->
-        // the exec's version.
         let mut c = Fake::new(vec![Some(t), Some(ident(4242, 8))]);
         assert_eq!(
             end_proven(t, Duration::from_secs(60), &mut c, |_| true),
@@ -2227,14 +2039,9 @@ mod end_proven_tests {
         assert!(c.signals.is_empty(), "no signal after an exec mid-judgment");
     }
 
-    /// A process that execs after its SIGTERM is still there, running another program: it is
-    /// neither SIGKILLed nor gone. Gone is only a pid that reads nothing, or another birth (the
-    /// number taken by a new process). NEGATIVE CONTROL: call any moved read gone, and `gone`
-    /// reads true for a process still alive in its group.
     #[test]
     fn a_process_that_execs_after_its_sigterm_is_not_gone() {
         let t = ident(4242, 7);
-        // judge -> T, T; poll -> the same pid and birth, another version (it exec'd).
         let mut c = Fake::new(vec![Some(t), Some(t), Some(ident(4242, 8))]);
         let out = end_proven(t, Duration::from_secs(60), &mut c, |_| true).expect("termed");
         assert_eq!(
@@ -2246,7 +2053,6 @@ mod end_proven_tests {
             }
         );
         assert_eq!(c.signals, [(4242, SIGTERM)]);
-        // A pid read under another birth is a new process: the token's one has exited.
         let mut reborn = ident(4242, 8);
         reborn.birth.microseconds += 1;
         let mut c = Fake::new(vec![Some(t), Some(t), Some(reborn)]);
@@ -2254,8 +2060,6 @@ mod end_proven_tests {
         assert!(out.gone, "{out:?}");
     }
 
-    /// A SIGKILLed process still in the table at the last read is not gone (XNU tears a
-    /// process down after the signal, and a wedged one may stay): `killed` without `gone`.
     #[test]
     fn a_sigkilled_process_that_still_reads_is_not_gone() {
         let t = ident(4242, 7);
@@ -2271,14 +2075,9 @@ mod end_proven_tests {
         );
     }
 
-    /// A signal the kernel refuses because the process had just exited (`ESRCH`) is judged by
-    /// a read, never by the error: the process is gone, and a SIGTERM already sent stays
-    /// counted. NEGATIVE CONTROL: map every failed signal to `SignalFailed`, and both runs
-    /// read as refusals for a process that is gone.
     #[test]
     fn a_signal_refused_for_a_process_just_gone_reads_gone() {
         let t = ident(4242, 7);
-        // judge -> T, T; the SIGTERM is refused; the read after it -> nothing.
         let mut c = Fake::new(vec![Some(t), Some(t), None]);
         c.refuses = Some(SIGTERM);
         let out = end_proven(t, Duration::from_secs(60), &mut c, |_| true);
@@ -2290,7 +2089,6 @@ mod end_proven_tests {
                 gone: true
             })
         );
-        // judge -> T, T; poll -> T; judge -> T, T; the SIGKILL is refused; then nothing.
         let mut c = Fake::new(vec![Some(t), Some(t), Some(t), Some(t), Some(t), None]);
         c.refuses = Some(SIGKILL);
         let out = end_proven(t, Duration::ZERO, &mut c, |_| true);
@@ -2302,7 +2100,6 @@ mod end_proven_tests {
                 gone: true
             })
         );
-        // Refused while it still reads: a refusal, nothing sent.
         let mut c = Fake::new(vec![Some(t), Some(t), Some(t)]);
         c.refuses = Some(SIGTERM);
         assert_eq!(
@@ -2311,7 +2108,6 @@ mod end_proven_tests {
         );
     }
 
-    /// The token's wire form round-trips its three parts.
     #[test]
     fn a_token_is_pid_birth_and_version() {
         assert_eq!(
@@ -2323,7 +2119,6 @@ mod end_proven_tests {
 
 #[cfg(all(test, windows))]
 mod tests {
-    /// A process that exits with code 259 (== STILL_ACTIVE) still reads dead.
     #[test]
     fn exit_code_259_is_not_alive() {
         let mut child = std::process::Command::new("cmd")
@@ -2340,9 +2135,6 @@ mod tests {
         drop(child);
     }
 
-    /// The birth record (`GetProcessTimes`): a child started after a wall-clock
-    /// reading was born after it and no later than a reading taken once it runs,
-    /// and this process before it.
     #[test]
     fn a_child_born_after_a_wall_reading_reads_later_and_none_once_exited() {
         use crate::spawnfd::Stdio;
@@ -2377,12 +2169,6 @@ mod tests {
         drop(child);
     }
 
-    /// The raw creation `FILETIME` (`read_creation_filetime`) is the untruncated
-    /// integer Claude Code records as `procStart`: it reads for this live
-    /// process, is past the Unix epoch, and rounds to the microsecond-rounded
-    /// [`super::read_process_birth`] — the exact decimal the harness compares
-    /// against a session record, not a value reconstructed from the rounded
-    /// birth.
     #[test]
     fn the_raw_creation_filetime_is_the_untruncated_procstart() {
         const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
@@ -2404,8 +2190,6 @@ mod tests {
 mod parent_and_path_tests {
     use super::{read_process_parent, read_process_path};
 
-    /// This process: its parent is the one `std` reports, and its executable
-    /// is the test binary running now.
     #[test]
     fn this_process_reads_its_parent_and_its_executable() {
         let me = i32::try_from(std::process::id()).expect("pid");
@@ -2421,8 +2205,6 @@ mod parent_and_path_tests {
         );
     }
 
-    /// Linux's `/proc` text: the `PPid:` line, and an exe link the kernel marks
-    /// ` (deleted)` names no live binary.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_reads_the_parent_line_and_refuses_a_deleted_exe_link() {
@@ -2439,8 +2221,6 @@ mod parent_and_path_tests {
         );
     }
 
-    /// A live process whose binary was deleted under it reads no path — the macOS
-    /// contract — while its start record still answers.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_process_on_a_deleted_binary_reads_no_path() {
@@ -2628,8 +2408,6 @@ mod argv_tests {
         }
     }
 
-    /// A child's program and argv read as it was given them, and reading them leaves no
-    /// descriptor behind ([`read_cmdline`], [`read_exec_path`]).
     #[cfg(target_os = "linux")]
     #[test]
     fn a_childs_program_and_argv_read_as_given_and_leave_no_descriptor_behind() {
@@ -2689,10 +2467,6 @@ mod sleep_probe_tests {
     use super::{asleep_since_boot, continuous_ms, last_sleep_ms};
     use std::time::Duration;
 
-    /// The machine's sleep since boot reads where it is wired, never runs
-    /// back between two reads (the reads' own gap aside, a nanosecond's
-    /// order), and is no more than the clock that counts it has run since
-    /// boot.
     #[test]
     fn the_sleep_since_boot_reads_and_never_runs_back() {
         let first = asleep_since_boot().expect("wired on this platform");
@@ -2708,8 +2482,6 @@ mod sleep_probe_tests {
         );
     }
 
-    /// The last sleep, where the kernel keeps one, went to sleep before it
-    /// woke, and woke no later than now.
     #[test]
     fn the_last_sleep_is_in_order() {
         let now_ms = std::time::SystemTime::now()

@@ -107,7 +107,7 @@ impl FleetMac {
     }
 
     /// Whether its needs are this Mac's to count and tell, and its sessions its to hold and hand back.
-    pub(crate) fn counts(&self) -> bool {
+    pub(crate) const fn counts(&self) -> bool {
         !self.older && !self.unproven
     }
 
@@ -865,13 +865,13 @@ pub(crate) fn herald_key(mac: &str, sid: &str) -> u64 {
 }
 
 /// Whether `key` is a fleet need's ([`herald_key`]).
-pub(crate) fn is_herald_key(key: u64) -> bool {
+pub(crate) const fn is_herald_key(key: u64) -> bool {
     key & (1 << 63) != 0
 }
 
 /// A fleet need's transition key within its slot: its word's hash — a facts
 /// row carries no verdict rev, so one notice per (Mac, session, word).
-fn need_key(word: NeedWord) -> u64 {
+const fn need_key(word: NeedWord) -> u64 {
     aterm_hash::fnv1a_64(word.word().as_bytes())
 }
 
@@ -898,7 +898,9 @@ pub(crate) fn told_row(key: u64, word: NeedWord) -> String {
     format!("{key:016x}={}", word.word())
 }
 
-/// The told fleet needs a seamless update carried ([`told_row`]'s rows), by herald key; a row that does not read.
+/// The told fleet needs a seamless update carried ([`told_row`]'s rows),
+/// by herald key; a row that does not read — no fleet key, no word this
+/// build knows — is dropped, and at most [`FLEET_TOLD_MAX`] are read.
 pub(crate) fn parse_told(rows: &[String]) -> std::collections::HashMap<u64, NeedWord> {
     rows.iter()
         .filter_map(|row| {
@@ -974,7 +976,7 @@ impl crate::App {
 
     /// Whether a fleet glance may start here: never headless (no child, no
     /// thread), never off macOS, never twice.
-    fn fleet_glance_may_start(&self) -> bool {
+    const fn fleet_glance_may_start(&self) -> bool {
         !self.headless && cfg!(target_os = "macos") && self.fleet_glance.is_none()
     }
 

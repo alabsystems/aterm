@@ -4,16 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/seat/keyboard/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE.
+//! Wayland keyboard input handling.
 //!
-//! The keyboard input handling.
-//!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): the keyboard's
-//! events come decoded from first-party `aterm_wayland::seat` (its keymap read from the
-//! compositor's descriptor), and key repeat is a deadline the event loop waits for in its own
-//! poll (`EventLoop::poll_events_with_timeout`), where upstream registered a calloop timer.
-//! The timing is calloop's: the first repeat `delay` after the press, then one every `gap`
-//! from when the previous one fired.
+//! Keyboard events arrive decoded from `aterm_wayland::seat`, and key repeat is driven by a
+//! deadline polled in `EventLoop::poll_events_with_timeout` (`delay` after press, then every `gap`).
 
 use std::time::{Duration, Instant};
 
@@ -39,11 +33,8 @@ impl WinitState {
                 return;
             },
         };
-        // Where that keyboard IS: a clipboard copy needs it, because a compositor hands the
-        // selection only to the client its keyboard is on (see `clipboard.rs`). Recorded before
-        // the per-window bookkeeping below, which returns early on a surface we do not know —
-        // mutter sends `leave` with a nil surface, and the keyboard has left us just the same.
-        // (The serial a copy spends is aterm-wayland's seat's, which records each.)
+        // Record whether the keyboard is on a client surface (required for clipboard selection;
+        // mutter may send `leave` with a nil surface).
         match &event {
             KeyboardEvent::Enter { .. } => seat_state.set_keyboard_entered(true),
             KeyboardEvent::Leave { .. } => seat_state.set_keyboard_entered(false),
@@ -73,11 +64,9 @@ impl WinitState {
                 warn!("the compositor's keymap could not be read: {_error}");
             },
             KeyboardEvent::Enter { surface, .. } => {
-                // A nil surface (one this client destroyed) is no window of ours.
                 let Some(surface) = surface else { return };
                 let window_id = wayland::make_wid(surface);
 
-                // Mark the window as focused.
                 let was_unfocused = match self.windows.get_mut().get(&window_id) {
                     Some(window) => {
                         let mut window = window.lock().unwrap();
@@ -88,17 +77,15 @@ impl WinitState {
                     None => return,
                 };
 
-                // Drop the repeat, if there were any.
                 keyboard_state.stop_repeat();
 
                 keyboard_state.window_id = Some(window_id);
 
-                // The keyboard focus is considered as general focus.
                 if was_unfocused {
                     self.events_sink.push_window_event(WindowEvent::Focused(true), window_id);
                 }
 
-                // HACK: this is just for GNOME not fixing their ordering issue of modifiers.
+                // Work around GNOME sending modifiers before `enter`.
                 if std::mem::take(&mut seat_state.modifiers_pending) {
                     self.events_sink.push_window_event(
                         WindowEvent::ModifiersChanged(seat_state.modifiers.into()),
@@ -107,12 +94,8 @@ impl WinitState {
                 }
             },
             KeyboardEvent::Leave { surface, .. } => {
-                // NOTE: we should drop the repeat regardless whether it was for the present
-                // window of for the window which just went gone.
                 keyboard_state.stop_repeat();
 
-                // NOTE: The check whether the window exists is essential as we might get a
-                // nil surface, regardless of what protocol says.
                 let Some(window_id) = surface.map(wayland::make_wid) else { return };
                 let focused = match self.windows.get_mut().get(&window_id) {
                     Some(window) => {
@@ -123,12 +106,9 @@ impl WinitState {
                     None => return,
                 };
 
-                // We don't need to update it above, because the next `Enter` will overwrite
-                // anyway.
                 keyboard_state.window_id = None;
 
                 if !focused {
-                    // Notify that no modifiers are being pressed.
                     self.events_sink.push_window_event(
                         WindowEvent::ModifiersChanged(ModifiersState::empty().into()),
                         window_id,
@@ -151,7 +131,6 @@ impl WinitState {
                     return;
                 }
 
-                // NOTE terminate ongoing timer and start a new timer.
                 keyboard_state.current_repeat = Some(key);
                 keyboard_state.repeat_deadline = Instant::now().checked_add(delay);
             },
@@ -184,7 +163,7 @@ impl WinitState {
                 xkb_state.update_modifiers(depressed, latched, locked, 0, 0, group);
                 seat_state.modifiers = xkb_state.modifiers().into();
 
-                // HACK: part of the workaround from `WlKeyboardEvent::Enter`.
+                // Defer modifiers until `Enter` when no window is focused yet.
                 let window_id = match keyboard_state.window_id {
                     Some(window_id) => window_id,
                     None => {
@@ -200,7 +179,6 @@ impl WinitState {
             },
             KeyboardEvent::RepeatInfo { rate, delay } => {
                 keyboard_state.repeat_info = if rate <= 0 {
-                    // Stop the repeat once we get a disable event.
                     keyboard_state.stop_repeat();
                     RepeatInfo::Disable
                 } else {
@@ -217,8 +195,7 @@ impl WinitState {
         self.seats.values().filter_map(|seat| seat.keyboard_state.as_ref()?.repeat_deadline).min()
     }
 
-    /// Repeat each held key whose deadline has come, once, and schedule its next repeat a
-    /// `gap` from now (calloop's `TimeoutAction::ToDuration`). Whether any repeated.
+    /// Fire due key repeats across all seats and advance their deadlines.
     pub(crate) fn fire_key_repeats(&mut self, now: Instant) -> bool {
         let mut fired = false;
         for seat_state in self.seats.values_mut() {
@@ -228,13 +205,10 @@ impl WinitState {
             if keyboard_state.repeat_deadline.is_none_or(|deadline| deadline > now) {
                 continue;
             }
-            // NOTE: The removed on event source is batched, but key change to `None` is
-            // instant.
             let Some(repeat_keycode) = keyboard_state.current_repeat else {
                 keyboard_state.repeat_deadline = None;
                 continue;
             };
-            // Required to handle the wakeups from the repeat sources.
             fired = true;
             key_input(
                 keyboard_state,
@@ -243,7 +217,6 @@ impl WinitState {
                 ElementState::Pressed,
                 true,
             );
-            // NOTE: the gap could change dynamically while repeat is going.
             keyboard_state.repeat_deadline = match keyboard_state.repeat_info {
                 RepeatInfo::Repeat { gap, .. } => Instant::now().checked_add(gap),
                 RepeatInfo::Disable => None,
@@ -256,10 +229,10 @@ impl WinitState {
 /// The state of the keyboard on the current seat.
 #[derive(Debug)]
 pub struct KeyboardState {
-    /// The state of the keyboard.
+    /// XKB context for this seat's keyboard.
     pub xkb_context: Context,
 
-    /// The information about the repeat rate obtained from the compositor.
+    /// Repeat rate and delay from the compositor.
     pub repeat_info: RepeatInfo,
 
     /// When the held key repeats next.
@@ -268,7 +241,7 @@ pub struct KeyboardState {
     /// The current repeat raw key.
     pub current_repeat: Option<u32>,
 
-    /// The currently focused window surface. Could be `None` on bugged compositors, like mutter.
+    /// Focused window, if any.
     window_id: Option<WindowId>,
 }
 
@@ -305,7 +278,7 @@ pub enum RepeatInfo {
         /// The time between the key repeats.
         gap: Duration,
 
-        /// Delay (in milliseconds) between a key press and the start of repetition.
+        /// Delay between a key press and the start of repetition.
         delay: Duration,
     },
 
@@ -314,9 +287,7 @@ pub enum RepeatInfo {
 }
 
 impl Default for RepeatInfo {
-    /// The default repeat rate is 25 keys per second with the delay of 200ms.
-    ///
-    /// The values are picked based on the default in various compositors and Xorg.
+    /// Default repeat rate: 25 keys/s after a 200 ms delay.
     fn default() -> Self {
         Self::Repeat { gap: Duration::from_millis(40), delay: Duration::from_millis(200) }
     }

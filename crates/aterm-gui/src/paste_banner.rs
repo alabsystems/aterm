@@ -81,7 +81,7 @@ impl PendingPaste {
     }
 
     /// This question's serial (never `0`).
-    pub(crate) fn serial(&self) -> u64 {
+    pub(crate) const fn serial(&self) -> u64 {
         self.serial
     }
 

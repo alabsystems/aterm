@@ -9,12 +9,8 @@ use super::*;
 use crate::guards::Corpus;
 use crate::scan_set::test_fixtures::disk_tree;
 
-/// A made-up word the synthetic extras forbid, standing in for the account word
-/// (which no test spells).
 const WORD: &str = "zebrafish";
 
-/// A synthetic engine baseline: a home row and a word in sections of their own,
-/// and a token shape under the credential header (one the tag exempts).
 const BASELINE: &str = "# Content patterns, the file's own header.\n\
                         \n\
                         # Personal / machine paths\n\
@@ -32,7 +28,6 @@ fn spots(found: &[Finding]) -> BTreeSet<String> {
         .collect()
 }
 
-/// The rule over a synthetic checkout of `files`, judged with `baseline`.
 fn run(
     name: &str,
     files: &[(String, Vec<u8>)],
@@ -64,11 +59,6 @@ fn file(rel: &str, text: impl Into<Vec<u8>>) -> (String, Vec<u8>) {
     (rel.to_string(), text.into())
 }
 
-/// What the export selects is held, line by line, as its transforms leave it:
-/// the word and an untagged token fail, a tagged token passes, the tag does not
-/// reach a row outside the credential section, a home the rewrite doubles
-/// passes, a binary is held by its bytes, and a file the export withholds and an
-/// unlisted file are not read. A path the rows match fails as a path.
 #[test]
 fn the_exported_text_is_held_to_the_rows_as_the_transforms_leave_it() {
     let home = concat!("/Us", "ers/someone/proj");
@@ -113,10 +103,8 @@ fn the_exported_text_is_held_to_the_rows_as_the_transforms_leave_it() {
             .all(|f| !f.detail.contains(WORD) && !f.detail.contains("tok_a")),
         "a finding names the row, never the text: {found:#?}"
     );
-    // negative control: the home only passes because the rewrite doubles it
     let raw = Row::new("a home".into(), "/Users/[A-Za-z]").expect("compiles");
     assert!(raw.line.is_match(home));
-    // without the baseline, its rows (and the tag's reach) go unjudged
     let without = run("export-content-nobase", &files, Err("none".into()));
     assert_eq!(
         spots(&without),
@@ -131,11 +119,6 @@ fn the_exported_text_is_held_to_the_rows_as_the_transforms_leave_it() {
     );
 }
 
-/// A file holding a NUL is one the transforms leave as it is and the engine's
-/// grep reads as bytes (`-a`): its match is a binary hit, at no line, which no
-/// tag clears. So a home the rewrite would double and a tagged token both fail
-/// in one, where their text twins pass; a row it matches on two lines is one
-/// finding; a word a NUL splits is no match, as grep reads it.
 #[test]
 fn a_binary_file_is_held_by_its_bytes_at_no_line_and_no_tag_clears_it() {
     let home = concat!("/Us", "ers/someone/proj");
@@ -179,12 +162,6 @@ fn a_binary_file_is_held_by_its_bytes_at_no_line_and_no_tag_clears_it() {
     );
 }
 
-/// A checkout without a manifest (a public snapshot) publishes every file
-/// outside the central denies; one whose manifest names a pathspec this guard
-/// cannot follow is a finding at that line, not a guess, and one the engine
-/// refuses is a finding, never an export of nothing that passes: at the line it
-/// refuses, or at line 0 for a manifest that selects no file (the engine's "no
-/// tracked files matched", its "empty" and "no allowlist" among them).
 #[test]
 fn without_a_manifest_everything_outside_the_denies_is_held() {
     let files = [
@@ -232,8 +209,6 @@ fn without_a_manifest_everything_outside_the_denies_is_held() {
     }
 }
 
-/// The credential section is the engine's: its header's first line, a blank
-/// line ending it, a pattern listed elsewhere too never exempt.
 #[test]
 fn the_credential_section_is_read_as_the_engine_reads_it() {
     assert_eq!(credentials(BASELINE), ["tok_[a-z]{8}"].into());
@@ -242,8 +217,6 @@ fn the_credential_section_is_read_as_the_engine_reads_it() {
     assert_eq!(credentials(text), ["A", "D", "E"].into());
 }
 
-/// The checkout's own rows refuse the account word planted in a test line, and
-/// its spelling in halves passes: what `verify census` says before a push.
 #[test]
 fn the_checkouts_own_rows_refuse_a_planted_account_word() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -268,11 +241,6 @@ fn the_checkouts_own_rows_refuse_a_planted_account_word() {
     );
 }
 
-/// Every match of a pattern holds one of its anchors, so a line holding none
-/// cannot match: checked over the shapes the export's rows take (literals,
-/// alternatives, `[Xx]` letters, groups, classes, quantifiers, assertions,
-/// escapes), each with text it matches. Shapes with no run of two, a flag, or a
-/// code point spelled in hex have no anchors and are read whole.
 #[test]
 fn every_match_of_a_row_holds_one_of_its_anchors() {
     for (pattern, samples, want) in [
@@ -306,7 +274,6 @@ fn every_match_of_a_row_holds_one_of_its_anchors() {
         ("qq[opsur]_[A-Za-z0-9+/=]{4}", &["qqo_ab/="], &["qq"]),
         ("x\\.y+z", &["x.yyz"], &["x."]),
         ("[[:alpha:]]{2}ab|cd", &["xyab", "cd"], &["ab", "cd"]),
-        // `\<` and `\>` are word edges, holding no character
         ("\\<zebra\\>", &["a zebra here"], &["zebra"]),
         ("\\<ab\\>|cd\\>", &["x ab y", "xcd"], &["ab", "cd"]),
     ] {
@@ -355,7 +322,6 @@ fn every_match_of_a_row_holds_one_of_its_anchors() {
     ] {
         assert!(anchors(unanchored).is_none(), "{unanchored}");
     }
-    // what the hex rows match, which a whole read finds
     for (pattern, sample) in [("\\x41BC", "ABC"), ("tok\\x5fsecret", "a tok_secret")] {
         let row = Row::new("hex".into(), pattern).expect("compiles");
         assert!(row.line.is_match(sample), "{pattern}");
@@ -368,9 +334,6 @@ fn every_match_of_a_row_holds_one_of_its_anchors() {
     }
 }
 
-/// The one pass over the bytes names each line an anchor sits on, either case
-/// for a folded one, and a row without anchors is read on every line of a file
-/// its regex matches somewhere.
 #[test]
 fn the_candidates_are_the_lines_an_anchor_sits_on() {
     let rows = [

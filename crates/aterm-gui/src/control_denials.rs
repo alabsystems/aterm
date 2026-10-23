@@ -161,7 +161,7 @@ impl AuthDenials {
         })
     }
 
-    /// The run rule (module doc): count one refusal in `slot` from the dialer keyed `who` at
+    /// The run rule: count one refusal in `slot` from the dialer keyed `who` at
     /// `now`, and return why it is written with the slot's total, or `None` when it is only
     /// counted.
     fn count(&self, slot: usize, who: Option<&str>, now: Instant) -> Option<(Written, u64)> {

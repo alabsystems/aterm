@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for the write fences and the supervisor key, driven through the
-//! one `aterm` binary against a real headless instance.
-//!
-//! * The swap scenario: a fake worker (a POSIX `sh` script in raw mode that appends every byte
-//!   it reads to a key log) draws approval box A on a fresh alternate screen, then leaves and
-//!   re-enters it and draws box B with the same number of writes, so B reads A's `seq=`.
-//!   `key if-gen=<A's gen> 1` and `key if-fp=<A's hash> 1` answer `OK skipped reason=changed`
-//!   and the key log stays empty; the retired `if-seq=` is refused. Negative controls: `seq=`
-//!   does repeat, and a fence from B's own generation presses and the `1` reaches the log.
-//! * The supervisor key: `meta set supervisor <holder>` on a persistent connection shows in
-//!   `sessions` and `status` while that connection lives and clears when it closes; a `ttl=`
-//!   claim outlives its one-shot client. Two attention owners set and clear independently.
-//!
-//! Isolation is `support/launch_isolation.rs`'s.
+//! Live-headless conformance tests for write fences and supervisor key claims.
 
 #![cfg(unix)]
 
@@ -27,8 +14,7 @@ use headless_boot::{
     Instance, boot_session, client_command, ctl, ctl_ok, field, status, type_line,
 };
 
-/// Boot one headless instance, 40x120 ([`headless_boot::boot`]: an environment
-/// refusal is COULD NOT RUN; a product that cannot start fails the test).
+/// Boot one headless instance ([`headless_boot::boot`]).
 fn boot(tag: &str) -> Instance {
     headless_boot::boot(
         &format!("atfn{tag}"),
@@ -36,13 +22,11 @@ fn boot(tag: &str) -> Instance {
     )
 }
 
-/// How long a wait for something that must happen may take before it is read as a hang
-/// (AGENTS.md).
+/// How long a wait for something that must happen may take before it is read as a hang (AGENTS.md).
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 
 /// Wait for the process-name resolver before asserting supervisor behavior.
-/// The fake worker's screen can be ready before its asynchronous name lookup.
 fn await_program(inst: &Instance, sid: &str, wanted: &str) {
     let deadline = Instant::now() + HANG;
     let mut last = status(inst, sid);
@@ -57,8 +41,7 @@ fn await_program(inst: &Instance, sid: &str, wanted: &str) {
     );
 }
 
-/// `who`'s `watchers=` for `sid`: the live subscribers on the session, one of
-/// which each parked `await` registers right after it arms its watcher.
+/// `who`'s `watchers=` for `sid`.
 fn watchers(inst: &Instance, sid: &str) -> usize {
     let who = ctl_ok(inst, &["who"]);
     let row = who
@@ -70,9 +53,7 @@ fn watchers(inst: &Instance, sid: &str) -> usize {
         .unwrap_or_else(|| panic!("no watchers= in {row}"))
 }
 
-/// The fake worker: raw mode, a background reader appending every byte it
-/// receives to `$2`, box A, then — once `$1` exists — box B, then idle. POSIX
-/// sh + printf + dd only.
+/// The fake worker: raw mode.
 const FAKE_WORKER: &str = r#"#!/bin/sh
 go="$1"
 log="$2"
@@ -102,8 +83,7 @@ box "rm -rf /tmp/work"
 while :; do sleep 1; done
 "#;
 
-/// `await match <re>` on the session: the server's latched watcher, not a
-/// client poll. `<re>` is one wire token (`.` for a space).
+/// `await match <re>` on the session.
 fn await_match(inst: &Instance, sid: &str, re: &str) {
     let reply = ctl_ok(inst, &[&format!("@{sid}"), "await", "match", re, HANG_MS]);
     assert!(
@@ -112,8 +92,6 @@ fn await_match(inst: &Instance, sid: &str, re: &str) {
     );
 }
 
-/// The swap scenario: a fence built from box A's stamp never presses into box B, and the
-/// worker receives nothing.
 #[test]
 fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
     let inst = boot("k");
@@ -132,7 +110,6 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
             keylog.display()
         ),
     );
-    // Box A is whole once its last row is up (the worker draws top down).
     await_match(&inst, &sid, "ls.-la./tmp/work");
     await_match(&inst, &sid, "Esc.to.cancel");
     let a = status(&inst, &sid);
@@ -151,11 +128,6 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         "PRECONDITION: the worker is up and has received nothing"
     );
 
-    // Box B's `await match` is armed over box A, before the worker is let go: box B arrives on
-    // a re-entered alternate screen at box A's own `seq=`, so the observation must key change
-    // on the screen generation, not `(seq, alt screen)`. The go file is created only once
-    // `who`'s `watchers=` counts the await's subscriber (registered right after it arms), so
-    // the watcher is armed over box A, never evaluated at arm over box B.
     assert_eq!(
         watchers(&inst, &sid),
         0,
@@ -169,13 +141,9 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
                 "await",
                 "match",
                 "rm.-rf./tmp/work",
-                // Outlives the arm backstop below: a loaded run can take over ten
-                // seconds to see the watcher.
                 "timeout=150000",
             ],
         );
-        // Asked again while the instance has not yet accepted it, or answers it busy: the go file
-        // waits for the arm, so a waiter armed late is still armed over box A.
         std::thread::spawn(move || {
             headless_boot::until_served(|| {
                 let child = cmd.spawn().expect("spawn the await");
@@ -184,10 +152,6 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
             })
         })
     };
-    // Armed, or the waiter ended without arming: the two events that decide it; the backstop
-    // is only for a server that neither arms nor answers. Every `who` sample is kept (when it
-    // started, how long it took, what it read) and a failure prints them: slow calls say the
-    // client was starved, fast zeros say the server never counted the watcher.
     let started = Instant::now();
     let armed_by = started + Duration::from_secs(120);
     let mut samples: Vec<(Duration, Duration, usize)> = Vec::new();
@@ -256,7 +220,6 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
             "{fence}: {reply}"
         );
     }
-    // The retired spelling is refused, not pressed and not typed.
     let retired = ctl(
         &inst,
         &[&format!("@{sid}"), "key", &format!("if-seq={seq_a}"), "1"],
@@ -267,9 +230,6 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         String::from_utf8_lossy(&retired.stderr)
     );
     assert!(said.contains("ERR usage"), "{said}");
-    // The presses above were refused in the server, so nothing is in flight: one `await idle`
-    // (200 ms of quiet; the timeout is a hang detector) bounds the wait for a byte that must
-    // not come.
     ctl_ok(
         &inst,
         &[&format!("@{sid}"), "await", "idle", "200", HANG_MS],
@@ -280,7 +240,6 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         "a fence on the replaced box must deliver nothing"
     );
 
-    // Negative control: B's own generation presses, and the log sees it.
     let reply = ctl_ok(
         &inst,
         &[&format!("@{sid}"), "key", &format!("if-gen={gen_b}"), "1"],
@@ -295,7 +254,6 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
         b"1",
         "the matched fence delivered exactly the one key"
     );
-    // A malformed fence is a usage error, and writes nothing.
     let bad = ctl(&inst, &[&format!("@{sid}"), "key", "if-gen=soon", "1"]);
     assert!(
         String::from_utf8_lossy(&bad.stdout).contains("ERR usage: if-gen=")
@@ -309,11 +267,6 @@ fn a_fenced_key_skips_a_swapped_box_and_the_worker_receives_nothing() {
     assert_eq!(std::fs::read(&keylog).unwrap(), b"1");
 }
 
-/// `act=` is checked with the key's other
-/// leading options before a byte moves: a malformed or repeated one answers
-/// `ERR usage` and the worker receives nothing. POSITIVE CONTROL:
-/// `key act=approve 1` delivers exactly the key's byte (the option is not
-/// typed), and the log marks the input with its act.
 #[test]
 fn a_refused_act_types_nothing() {
     let inst = boot("a");
@@ -355,8 +308,6 @@ fn a_refused_act_types_nothing() {
         );
         assert!(said.contains("ERR usage: act="), "{bad:?}: {said}");
     }
-    // Refused in the server, so nothing is in flight: one `await idle` bounds
-    // the wait for a byte that must not come (a hang detector, as above).
     ctl_ok(
         &inst,
         &[&format!("@{sid}"), "await", "idle", "200", HANG_MS],
@@ -420,9 +371,6 @@ fn supervisor_until(inst: &Instance, sid: &str, want: &str) -> String {
     panic!("supervisor={want} not reached; last row: {row}");
 }
 
-/// The supervisor key: shown while its persistent connection lives, cleared when it closes; a
-/// `ttl=` claim outlives its one-shot client, and a connection-bound one-shot claim is gone
-/// with its client. Plus two attention owners over the wire.
 #[test]
 fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes() {
     let inst = boot("v");
@@ -443,8 +391,6 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     );
     supervisor_until(&inst, &sid, "sup-live");
     assert_eq!(field(&status(&inst, &sid), "supervisor"), Some("sup-live"));
-    // Still the same connection: other clients' connections closing (every
-    // `aterm ctl` above) did not release it, and a second holder is refused.
     let busy = ctl(
         &inst,
         &[
@@ -463,16 +409,10 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     );
     assert!(request(&mut conn, &format!("@{sid} meta")).contains(" supervisor=sup-live"));
 
-    // The connection closes: the claim goes with it. Shut down, then dropped: the server sees
-    // the close by reading EOF, which a close alone delivers only once every copy of the
-    // descriptor is gone, and std makes a connected socket close-on-exec non-atomically on
-    // macOS, so a sibling test's spawn can carry a copy. `shutdown` acts on the socket.
     let _ = conn.get_ref().shutdown(std::net::Shutdown::Both);
     drop(conn);
     supervisor_until(&inst, &sid, "-");
 
-    // A `ttl=` claim from a one-shot client outlives the client; its ttl outlives the roster
-    // wait, and it is unset below.
     ctl_ok(
         &inst,
         &[
@@ -487,20 +427,12 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     supervisor_until(&inst, &sid, "sup-ttl");
     ctl_ok(&inst, &[&format!("@{sid}"), "meta", "unset", "supervisor"]);
     supervisor_until(&inst, &sid, "-");
-    // …and a one-shot claim without `ttl=` is bound to a connection already closed by the time
-    // anyone reads it; with no expiry of its own, one its connection's end did not release
-    // would stand past the hang detector.
     ctl_ok(
         &inst,
         &[&format!("@{sid}"), "meta", "set", "supervisor", "sup-once"],
     );
     supervisor_until(&inst, &sid, "-");
 
-    // A `ttl=` claim nobody renews lapses, and the instance's own timer records the lapse
-    // (`meta-change field=supervisor value=-`). Both ends are read off the timeline, which
-    // keeps them after the lease is gone: a roster poll cannot reliably catch a 400 ms claim
-    // (`live_supervisor` filters on the expiry). The `sup-ttl` claim above is the roster's
-    // witness.
     let changes = || -> Vec<String> {
         ctl_ok(&inst, &[&format!("@{sid}"), "timeline"])
             .lines()
@@ -526,8 +458,6 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
         std::thread::sleep(Duration::from_millis(50));
         since = changes().split_off(before);
     }
-    // Claimed (recorded only when a claim moves the shown holder), then lapsed, the lapse
-    // recorded exactly once, and the roster agrees.
     assert_eq!(
         since,
         ["value=sup-dies", "value=-"],
@@ -535,7 +465,6 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     );
     supervisor_until(&inst, &sid, "-");
 
-    // Two attention owners, set and cleared independently.
     let meta = |args: &[&str]| {
         let mut full = vec![format!("@{sid}"), "meta".to_string()];
         full.extend(args.iter().map(|a| (*a).to_string()));
@@ -555,13 +484,12 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
     assert_eq!(field(&meta(&[]), "attention"), Some("-"));
 }
 
-/// A [`aterm_agent::supervise::run::Ctl`] that records every request before
-/// the real transport sends it: what the engine asked the server, verbatim.
+/// A [`aterm_agent::supervise::run::Ctl`] that records every request before the real transport
+/// sends it.
 struct Recording<C> {
     inner: C,
     requests: Vec<String>,
-    /// Once a `key` has gone out, every later `await` answers `ERR exited` (the session gone),
-    /// so the loop ends after its press instead of at its budget.
+    /// Once a `key` has gone out.
     end_after_press: bool,
 }
 
@@ -583,17 +511,6 @@ impl<C: aterm_agent::supervise::run::Ctl> aterm_agent::supervise::run::Ctl for R
     }
 }
 
-/// THE MERGED ENGINE'S FENCED PRESS, live (harness/integrate, 2026-09-24):
-/// the engine's hosted loop (`Session::run_hosted`, the window's) at its
-/// default policy (every box its answer), over its real persistent transport, reads the fake worker's read-only Bash box,
-/// decides it, and presses
-/// `key if-human=<the read's person count> if-gen=<the read's generation>
-/// if=<the judged row> 1` — the generation taken from its own `text --json`
-/// read (`"gen"`), the fence
-/// found in the server's real `help key` answer — and the server takes it:
-/// the `1` reaches the worker's key log. The fence form was not refused and
-/// dropped (that would press under `if=` alone, and the recorded `key` line
-/// would carry no `if-gen=`).
 #[test]
 fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     use aterm_agent::supervise::run::{Session, SuperviseOpts};
@@ -604,8 +521,6 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     let go = inst.tmp.join("go");
     let keylog = inst.tmp.join("keys.log");
     std::fs::write(&script, FAKE_WORKER).expect("write the fake worker");
-    // The engine judges a box only when the foreground program is an agent (`status
-    // program=`), so the fake runs as `claude` in a job of its own.
     type_line(
         &inst,
         &sid,
@@ -619,7 +534,6 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
     await_match(&inst, &sid, "ls.-la./tmp/work");
     await_match(&inst, &sid, "Esc.to.cancel");
     await_program(&inst, &sid, "claude");
-    // Precondition: the server's own read carries the generation.
     let json = ctl_ok(&inst, &[&format!("@{sid}"), "text", "--json"]);
     assert!(
         json.contains("\"gen\":\""),
@@ -631,23 +545,17 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         requests: Vec::new(),
         end_after_press: true,
     };
-    // The budget is a hang detector ([`HANG`]); the loop ends once it has pressed
-    // (`end_after_press`). Each step (read, settle, read, status, `help key`, the press) is a
-    // round trip to the live instance's main thread.
     let opts = SuperviseOpts {
         max: HANG,
         ..SuperviseOpts::default()
     };
     let ran = {
         let mut s = Session::new(&mut ctl, Some(format!("@{sid}")));
-        // The approval ledger goes to the scratch world, never the real HOME.
         s.set_approval_ledger(Some(inst.tmp.join("approvals.jsonl")));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut out: Vec<u8> = Vec::new();
         let ran = s.run_hosted(&opts, stop, &mut out);
         drop(s);
-        // Ended by `end_after_press` (a wait answered `ERR exited` after the
-        // press), or by the budget; anything else is the loop failing.
         assert!(
             ran.as_ref()
                 .map_or_else(|e| e.ends_with("ERR exited"), |()| true),
@@ -662,10 +570,6 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         .iter()
         .filter(|r| r.split_whitespace().any(|w| w == "key"))
         .collect();
-    // An option-choosing digit says what it means, then goes fenced on the
-    // read's person count, its generation and the judged row:
-    // `key act=approve if-human=<n> if-gen=<e>.<s> if=^… 1`. This server's
-    // `help key` names `act=` (5D-3), so the approving digit carries it.
     assert!(
         presses.iter().any(|p| {
             let words: Vec<&str> = p.split_whitespace().collect();
@@ -674,7 +578,6 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
                 return false;
             }
             at += 1;
-            // A digit carries the person count it was judged under next.
             if words.get(at).is_some_and(|w| {
                 w.strip_prefix("if-human=")
                     .is_some_and(|n| n.parse::<u64>().is_ok())
@@ -693,7 +596,6 @@ fn the_supervisor_engine_presses_a_read_box_under_the_generation_fence() {
         status(&inst, &sid),
         ctl_ok(&inst, &[&format!("@{sid}"), "text"])
     );
-    // The server took the fenced press: the `1` reached the worker.
     let deadline = Instant::now() + HANG;
     let mut got = Vec::new();
     while Instant::now() < deadline {

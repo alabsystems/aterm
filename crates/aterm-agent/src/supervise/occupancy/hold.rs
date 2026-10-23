@@ -411,6 +411,38 @@ pub fn seed_row_in(body: &str, sid: Option<&str>) -> Option<SeedRow> {
     last
 }
 
+/// EVERY ROW OF THE HOLD'S CLOCK in the ledger text `body` for session `sid` (its rows alone,
+/// by `"sid":`), oldest first, each with its stamp (unix ms): the `fact-hold@v1` rows
+/// [`row_reason`] wrote — the door's own `typed` and `skipped` rows under the same rule carry
+/// an episode, not a hold, and are passed over, as is a row this build cannot read. What
+/// `occupancy check --replay` rebuilds the session's holds from ([`super::replay::spans_of`]).
+#[must_use]
+pub fn hold_rows_in(body: &str, sid: Option<&str>) -> Vec<(i64, RowSaid)> {
+    let rule = super::super::facts::FactKind::Hold.rule();
+    let want = sid.map(|s| s.trim_start_matches('@').to_string());
+    let mut rows = Vec::new();
+    for line in body.lines() {
+        if !line.contains(rule) || want.as_deref().is_some_and(|sid| !line.contains(sid)) {
+            continue;
+        }
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("sid").map(str::to_string) != want || text("rule_id") != Some(rule) {
+            continue;
+        }
+        let (Some(row_ms), Some(said)) = (
+            v.get("ts").and_then(aterm_json::Value::as_i64),
+            text("reason").and_then(row_said),
+        ) else {
+            continue;
+        };
+        rows.push((row_ms, said));
+    }
+    rows
+}
+
 /// A `fact-hold@v1` row's reason read back ([`row_reason`]); `None` for one this build did not
 /// write.
 fn row_said(reason: &str) -> Option<RowSaid> {

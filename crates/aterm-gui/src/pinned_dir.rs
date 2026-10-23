@@ -310,7 +310,8 @@ mod imp {
             })
         }
 
-        /// Reopen one name through an already-validated retained directory and compare its current.
+        /// Reopen one name through an already-validated retained directory and
+        /// compare its current device/inode.
         pub(crate) fn validate_at_retained(self, dir: &PinnedDir, name: &OsStr) -> io::Result<()> {
             if dir.private_file_identity_at_retained(name)? != self {
                 return Err(identity_changed());
@@ -367,7 +368,8 @@ mod imp {
             self.validate_entry_identity_at_retained()
         }
 
-        /// Remove through the retained parent and certify success only when the retained inode.
+        /// Remove through the retained parent and certify success only when the
+        /// retained inode lost its final link.
         pub(crate) fn remove_exact(self) -> io::Result<()> {
             if !self.current_name_matches() {
                 return Err(identity_changed());
@@ -815,7 +817,8 @@ mod imp {
             )
         }
 
-        /// Publish one file as part of a private batch whose caller supplies the parent-directory.
+        /// Publish one file as part of a private batch whose caller supplies the
+        /// parent-directory sync barrier before any visibility marker.
         pub(crate) fn write_new_private_deferred_dir_sync_authorized(
             &self,
             name: &OsStr,
@@ -962,7 +965,8 @@ mod imp {
             Ok((bytes, guard))
         }
 
-        /// Pin a child through the retained directory capability without requiring.
+        /// Pin a child through the retained directory capability without
+        /// requiring the directory's former lexical path to remain current.
         pub(crate) fn pin_private_file_at_retained(&self, name: &OsStr) -> io::Result<PinnedFile> {
             validate_component(name)?;
             let fd = openat(self.leaf(), name, file_read_flags(), Mode::empty())
@@ -1069,7 +1073,8 @@ mod imp {
             Ok(false)
         }
 
-        /// Return at most `limit` entries without turning a larger directory into a permanent.
+        /// Return at most `limit` entries without turning a larger directory
+        /// into a permanent retention failure.
         pub(crate) fn names_up_to(&self, limit: usize) -> io::Result<Vec<OsString>> {
             let mut directory = Dir::read_from(self.leaf()).map_err(io::Error::from)?;
             let mut names = Vec::with_capacity(limit.min(256));
@@ -1652,7 +1657,8 @@ mod imp {
             })
         }
 
-        /// Reopen one name through an already-validated retained directory and compare its current.
+        /// Reopen one name through an already-validated retained directory and
+        /// compare its current volume/file-index.
         pub(crate) fn validate_at_retained(self, dir: &PinnedDir, name: &OsStr) -> io::Result<()> {
             if dir.private_file_identity_at_retained(name)? != self {
                 return Err(identity_changed());
@@ -1945,6 +1951,8 @@ mod imp {
             name: &OsStr,
         ) -> io::Result<std::fs::File> {
             // NTFS refuses to rename a directory above a retained handle and
+            // the open proves its lock sits inside the retained directory, so
+            // the path-validated open is already capability-stable.
             self.open_namespace_lock_with_create(name, false)
         }
 
@@ -2411,7 +2419,8 @@ mod imp {
             self.remove_empty_child_exact(name, child)
         }
 
-        /// Remove `name` only while it is the exact directory `child` retains and a direct child.
+        /// Remove `name` only while it is the exact directory `child` retains
+        /// and a direct child of this one.
         pub(crate) fn remove_empty_child_exact(
             &self,
             name: &OsStr,
@@ -2519,7 +2528,8 @@ mod imp {
         #[cfg(test)]
         #[must_use]
         pub(super) fn request_bytes(&self) -> &[u8] {
-            // SAFETY: `buffer` owns at least `bytes` initialized bytes and `usize` may be read.
+            // SAFETY: `buffer` owns at least `bytes` initialized bytes and
+            // `usize` may be read as its constituent bytes.
             unsafe { std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), self.bytes) }
         }
 
@@ -2604,7 +2614,8 @@ mod imp {
         let mut payload = rename_payload(&parent_path.join(name), replace)?;
         let bytes = u32::try_from(payload.bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename too large"))?;
-        // SAFETY: `payload` owns `bytes` initialized, `usize`-aligned bytes holding one.
+        // SAFETY: `payload` owns `bytes` initialized, `usize`-aligned bytes
+        // holding one FILE_RENAME_INFO plus its NUL-terminated destination.
         set_information(unsafe {
             SetFileInformationByHandle(
                 file.as_raw_handle(),

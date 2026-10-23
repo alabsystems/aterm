@@ -18,9 +18,13 @@ fn char_width(c: char, cjk: bool) -> usize {
         1
     } else if (0x4E00..0xA000).contains(&cp) {
         // Uniformly East Asian Wide in both modes (checked exhaustively by
+        // `fast_path_width_matches_table`).
         2
     } else if (0x3000..0x4E00).contains(&cp) {
         // U+3000-U+4DFF (CJK symbols, kana, bopomofo, compatibility jamo, Yijing
+        // hexagrams, enclosed CJK) mixes wide, narrow, ambiguous (U+3248-U+324F)
+        // and zero-width marks (U+302A-302D, U+3099-309A): defer to the table so
+        // the print path matches reflow/materialize/fill.
         if cjk {
             aterm_grapheme::char_width_cjk(c)
         } else {
@@ -173,6 +177,9 @@ impl TerminalHandler<'_> {
     )]
     pub(super) fn write_unicode_bulk(&mut self, chars: &[char]) {
         // Preconditions: no insert mode, autowrap on, no style extras. VT52
+        // addressing never reaches here (`print_unicode_bulk` routes it per
+        // character). U+00A0-U+00FF may need GR-mapped translation when a
+        // non-ASCII charset is designated on the GR G-set, so fall back then.
         if self.modes.insert_mode
             || !self.modes.auto_wrap
             || self.transient.has_transient_extras
@@ -208,6 +215,7 @@ impl TerminalHandler<'_> {
 
             if (0x3000..0xA000).contains(&cp) || (0xAC00..0xD7A4).contains(&cp) {
                 // U+3000-U+4DFF is mixed-width: classify each char (honoring
+                // `cjk`) and batch only width-2 cells.
                 if (0x3000..0x4E00).contains(&cp) {
                     match char_width(c, cjk) {
                         0 => {
@@ -260,6 +268,7 @@ impl TerminalHandler<'_> {
                 }
                 if width == 2 {
                     // A folded glyph is still REP's last graphic character, as in
+                    // `write_char`.
                     if self.transient.last_combining_was_zwj
                         && self.should_combine_with_previous_zwj()
                     {
@@ -524,6 +533,7 @@ impl TerminalHandler<'_> {
     /// The cell a zero-width mark attaches to: [`Self::preceding_cell`], or with
     /// none (column 0 of a row that is not a soft-wrap continuation) the cell
     /// under the cursor, as in xterm (`use_col = char_was_written ?
+    /// last_written_col : cur_col`).
     #[inline]
     fn combining_target_cell(&self) -> (u16, u16) {
         self.preceding_cell()
@@ -648,6 +658,8 @@ impl TerminalHandler<'_> {
 
         if let Some(row_data) = self.grid.row_mut(row) {
             // Wide char fixup: if the cell we're about to overwrite with
+            // WIDE_CONTINUATION was itself the first half of a wide char,
+            // clear the orphaned continuation at cont_col + 1.
             if row_data
                 .flags()
                 .contains(crate::grid::RowFlags::HAS_WIDE_CHARS)
@@ -703,6 +715,7 @@ impl TerminalHandler<'_> {
             .and_then(crate::grid::CellExtra::underline_color_u32);
         if fg.is_none() && bg.is_none() && underline.is_none() {
             // Nothing to carry — and no empty entry (or HAS_EXTRAS bit) created
+            // for the overwhelmingly common plain emoji.
             return;
         }
         let extra = self.grid.cell_extra_mut(row, spacer);

@@ -109,6 +109,7 @@ impl WeakSlot {
 
 impl fmt::Debug for WeakSlot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Prints the address, not the target: messaging the target from `Debug`
         // could resurrect an object mid-dealloc.
         write!(f, "WeakSlot@{:p}", self.addr())
     }

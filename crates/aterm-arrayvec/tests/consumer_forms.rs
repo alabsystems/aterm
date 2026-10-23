@@ -1,24 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compile-and-run coverage for every `ArrayVec` invocation form used by
-//! `naga`, `wgpu`, `wgpu-core`, and `wgpu-hal`.
-//!
-//! Because host builds `cfg` out non-native backends (e.g. `naga`'s SPIR-V
-//! writer and `wgpu-hal`'s DX12, GLES, and Vulkan backends on macOS), this
-//! test transcribes each consumer's `ArrayVec` type, const-generic, derive,
-//! iterator, and `Deref` forms with local stand-in types so every cell
-//! compiles and exercises the full consumer surface. Behavioral equivalence
-//! against a `Vec`-backed model is tested in
-//! `crates/aterm-alloc/tests/arrayvec_differential.rs`.
+//! Compile-and-run coverage for `ArrayVec` consumer forms used by `naga` and `wgpu`.
 #![allow(dead_code)]
 
 mod naga {
-    // naga-29.0.3/src/proc/constant_evaluator.rs:14
     use arrayvec::ArrayVec;
 
-    /// Stand-in for `naga::VectorSize`, whose `MAX` appears inside const
-    /// blocks as an `ArrayVec` capacity argument.
+    /// Stand-in for `naga::VectorSize`.
     pub struct VectorSize;
     impl VectorSize {
         pub const MAX: usize = 4;
@@ -33,15 +22,12 @@ mod naga {
     pub struct BuiltIn(pub u32);
     pub type Word = u32;
 
-    // naga-29.0.3/src/back/spv/helpers.rs:199 — ArrayVec as an enum-variant payload
     #[derive(Debug)]
     pub enum Decorated {
         BuiltIn(BuiltIn, ArrayVec<Decoration, 2>),
         Location(Word),
     }
 
-    // naga-29.0.3/src/proc/constant_evaluator.rs:285 — variant payload whose
-    // capacity is a const block
     #[derive(Debug)]
     pub enum LiteralVector {
         F64(ArrayVec<f64, { VectorSize::MAX }>),
@@ -49,7 +35,6 @@ mod naga {
     }
 
     impl LiteralVector {
-        // naga-29.0.3/src/proc/constant_evaluator.rs — `LiteralVector::len`
         pub fn len(&self) -> usize {
             match self {
                 Self::F64(v) => v.len(),
@@ -58,19 +43,14 @@ mod naga {
         }
     }
 
-    // naga-29.0.3/src/proc/constant_evaluator.rs:105 and :113 — a turbofish over
-    // a const-generic PARAMETER, then `.into_inner().unwrap()`.
     pub fn compose_exact<const N: usize>(src: &[f64]) -> [f64; N] {
         let mut arr = ArrayVec::<_, N>::new();
         for v in src {
             arr.push(*v);
         }
-        // naga-29.0.3/src/proc/constant_evaluator.rs:113
         arr.into_inner().unwrap()
     }
 
-    // naga-29.0.3/src/proc/constant_evaluator.rs:122 — ArrayVec of ArrayVec,
-    // inner capacity a const block, outer a const-generic parameter.
     pub fn compose_matrix<const N: usize>(cols: &[&[f64]]) -> usize {
         let mut columns = ArrayVec::<ArrayVec<_, { VectorSize::MAX }>, N>::new();
         for col in cols {
@@ -83,16 +63,12 @@ mod naga {
         columns.len()
     }
 
-    // naga-29.0.3/src/proc/constant_evaluator.rs:3195 — ArrayVec in RETURN
-    // position, and :3201 — `Extend` from a borrowed-and-cloned iterator.
     pub fn flatten_matrix(columns: &[Handle]) -> ArrayVec<Handle, 16> {
         let mut flattened = ArrayVec::new();
         flattened.extend(columns.iter().cloned());
         flattened
     }
 
-    // naga-29.0.3/src/back/spv/writer.rs:872 — annotated local + `ArrayVec::new()`
-    // naga-29.0.3/src/back/spv/writer.rs:1115 — `.collect::<ArrayVec<_, 4>>()`
     pub fn column_ids(words: &[Word]) -> (ArrayVec<Word, 4>, ArrayVec<Word, 4>) {
         let mut column_ids: ArrayVec<Word, 4> = ArrayVec::new();
         for w in words {
@@ -102,14 +78,10 @@ mod naga {
         (column_ids, collected)
     }
 
-    // naga-29.0.3/src/proc/constant_evaluator.rs:175 —
-    // `new_components.into_iter().collect()`
     pub fn recollect(new_components: ArrayVec<Handle, 4>) -> ArrayVec<Handle, 4> {
         new_components.into_iter().collect()
     }
 
-    // naga-29.0.3/src/proc/constant_evaluator.rs:347 — `for l in &$components`
-    // naga-29.0.3/src/back/spv/block.rs:652   — `for index in &column_indices`
     pub fn sum_by_ref(components: &ArrayVec<f64, 4>, column_indices: &ArrayVec<Word, 4>) -> f64 {
         let mut total = 0.0;
         for l in components {
@@ -121,8 +93,6 @@ mod naga {
         total
     }
 
-    // naga-29.0.3/src/proc/constant_evaluator.rs:378 — `for e in $v` (by value)
-    // naga-29.0.3/src/back/spv/writer.rs:2898    — `for other in others`
     pub fn sum_by_value(v: ArrayVec<f64, 4>, others: ArrayVec<Word, 4>) -> f64 {
         let mut total = 0.0;
         for e in v {
@@ -180,17 +150,12 @@ mod wgpu {
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct VertexBufferLayout(pub u32);
 
-    // wgpu-29.0.3/src/backend/wgpu_core.rs:1296-1308 — the `// Guards following
-    // ArrayVec` collect. The capacity is the LIMIT; a truncating `collect` here
-    // would silently build a pipeline layout missing its last bind group.
     pub fn bind_group_layouts(ids: &[u32]) -> ArrayVec<BindGroupLayoutId, { MAX_BIND_GROUPS }> {
         ids.iter()
             .map(|id| BindGroupLayoutId(*id))
             .collect::<ArrayVec<_, { MAX_BIND_GROUPS }>>()
     }
 
-    // wgpu-29.0.3/src/backend/wgpu_core.rs:1340-1345 — annotated binding whose
-    // capacity is a const block, initialized by `.collect()`.
     pub fn vertex_buffers(desc: &[u32]) -> ArrayVec<VertexBufferLayout, { MAX_VERTEX_BUFFERS }> {
         let vertex_buffers: ArrayVec<_, { MAX_VERTEX_BUFFERS }> =
             desc.iter().map(|v| VertexBufferLayout(*v)).collect();
@@ -220,56 +185,40 @@ mod wgpu_core {
     pub type ShaderModule = StandIn;
     pub type TextureBarrier = StandIn;
 
-    // wgpu-core-29.0.3/src/resource.rs:1922: a fully-qualified path in field
-    // position, holding `Arc`s (so `Drop` matters).
     #[derive(Debug)]
     pub struct ExternalTexture {
         pub(crate) planes: arrayvec::ArrayVec<Arc<TextureView>, 3>,
     }
 
-    // wgpu-core-29.0.3/src/device/mod.rs:50-55 — `#[derive(Hash)]` reaches
-    // ArrayVec here, on all four cells. Without `impl Hash for ArrayVec` this
-    // single derive is a hard compile error everywhere.
     #[derive(Clone, Debug, Hash, PartialEq)]
     pub struct AttachmentData<T> {
         pub colors: ArrayVec<Option<T>, { MAX_COLOR_ATTACHMENTS }>,
         pub resolves: ArrayVec<T, { MAX_COLOR_ATTACHMENTS }>,
         pub depth_stencil: Option<T>,
     }
-    // wgpu-core-29.0.3/src/device/mod.rs — `impl<T: PartialEq> Eq for AttachmentData<T>`
     impl<T: PartialEq> Eq for AttachmentData<T> {}
 
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct TextureLayerInitTracker(pub u32);
 
-    // wgpu-core-29.0.3/src/init_tracker/texture.rs:50 — capacity is a const
-    // block containing a CAST.
     #[derive(Debug)]
     pub struct TextureInitTracker {
         pub mips: ArrayVec<TextureLayerInitTracker, { MAX_MIP_LEVELS as usize }>,
     }
 
-    // wgpu-core-29.0.3/src/validation.rs:910 — ArrayVec inside a Box, inside an
-    // enum variant.
     #[derive(Debug)]
     pub enum PipelineLayoutSource {
         Provided(u32),
         Derived(Box<ArrayVec<EntryMap, { MAX_BIND_GROUPS }>>),
     }
 
-    // wgpu-core-29.0.3/src/command/render.rs:935 — a generic `type` alias
     pub type AttachmentDataVec<T> = ArrayVec<T, MAX_TOTAL_ATTACHMENTS>;
 
-    // wgpu-core-29.0.3/src/track/texture.rs — `#[derive(Default)]` + iteration
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct ComplexTextureState {
         pub mips: ArrayVec<u32, { MAX_MIP_LEVELS as usize }>,
     }
 
-    // wgpu-core-29.0.3/src/device/resource.rs:3787 and :3793: `pop()`, then
-    // `into_iter()` through a box. wgpu-core's `PipelineLayoutSource::Derived`
-    // stores the ArrayVec boxed (validation.rs:910) and moves out of it, so the
-    // `Box` is the form under test.
     #[allow(clippy::boxed_local)]
     pub fn finish_derived(
         mut derived: Box<ArrayVec<EntryMap, { MAX_BIND_GROUPS }>>,
@@ -278,13 +227,11 @@ mod wgpu_core {
         derived.into_iter().collect()
     }
 
-    // wgpu-core-29.0.3/src/device/resource.rs:3989 — annotated local, const-block capacity
     pub fn color_target_states(n: usize) -> ArrayVec<u32, { MAX_COLOR_ATTACHMENTS }> {
         let cts: ArrayVec<_, { MAX_COLOR_ATTACHMENTS }> = (0..n as u32).collect();
         cts
     }
 
-    // wgpu-core-29.0.3/src/device/resource.rs:4738 — `Extend` from an `Option`
     pub fn shader_modules(
         vertex: ShaderModule,
         fragment: Option<ShaderModule>,
@@ -295,9 +242,6 @@ mod wgpu_core {
         shader_modules
     }
 
-    // wgpu-core-29.0.3/src/command/transfer.rs:1453 and :1462 — `.collect()`
-    // then `Extend` from a mapped `Option`. A truncating `extend` here drops
-    // the destination barrier of a texture-to-texture copy.
     pub fn transfer_barriers(
         src_pending: &[u32],
         dst_pending: Option<u32>,
@@ -308,10 +252,6 @@ mod wgpu_core {
         barriers
     }
 
-    // wgpu-core-29.0.3/src/command/render.rs:1532 — by-value iteration over a
-    // struct field that owns `Arc`s. Every early return out of a loop like this
-    // is where a leaking `IntoIter` would strand a texture for the process
-    // lifetime.
     pub struct RenderPassInfo {
         pub render_attachments: AttachmentDataVec<Arc<TextureView>>,
     }
@@ -325,25 +265,17 @@ mod wgpu_core {
         }
     }
 
-    // wgpu-core-29.0.3/src/track/texture.rs:108 — `get_unchecked_mut` over a
-    // RANGE, through `DerefMut`, then iterated by `&mut`.
     pub fn bump_mips(complex: &mut ComplexTextureState, mips: std::ops::Range<usize>) {
         for mip in unsafe { complex.mips.get_unchecked_mut(mips) } {
             *mip += 1;
         }
     }
 
-    // wgpu-core-29.0.3/src/track/texture.rs:1383 — shared `get_unchecked`
-    // with a `usize` index through `Deref`.
     pub fn read_mip(complex: &ComplexTextureState, mip_id: usize) -> u32 {
-        // SAFETY: the caller has already bounds-checked `mip_id`, exactly as
-        // wgpu-core does one line above its own call
-        // (`strict_assert!((mip_id as usize) < current_complex.mips.len());`).
+        // SAFETY: `mip_id` is bounds-checked against `current_complex.mips.len()` above.
         *unsafe { complex.mips.get_unchecked(mip_id) }
     }
 
-    // wgpu-core-29.0.3/src/device/resource.rs:3991 — `is_empty()`
-    // wgpu-core-29.0.3/src/command/render.rs:1852 — `as_slice()`
     pub fn describe(cts: &ArrayVec<u32, { MAX_COLOR_ATTACHMENTS }>) -> (bool, &[u32]) {
         (cts.is_empty(), cts.as_slice())
     }
@@ -359,7 +291,6 @@ fn wgpu_core_forms() {
     let ext = ExternalTexture { planes };
     assert_eq!(ext.planes.len(), 1);
 
-    // The Hash derive, exercised as a HashMap key — the shape wgpu-core uses.
     let mut colors = arrayvec::ArrayVec::new();
     colors.push(Some(StandIn(1)));
     let key = AttachmentData {
@@ -397,7 +328,6 @@ fn wgpu_core_forms() {
         },
     };
     assert_eq!(info.finish(), 2);
-    // …and the by-value loop dropped its `Arc`, so the outer one is alone again.
     assert_eq!(Arc::strong_count(&arc), 1);
 
     let mut complex = ComplexTextureState::default();
@@ -432,9 +362,6 @@ mod wgpu_hal {
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct ColorTargetState(pub u32);
 
-    // wgpu-hal-29.0.3/src/dx12/shader_compilation.rs:382: `new_const()`, the
-    // only site in the graph, and :388: `Extend` from an array literal. A
-    // truncating extend would drop HLSL compile flags.
     pub fn compile_args(source_name: Option<Pcwstr>, extra: [Pcwstr; 3]) -> ArrayVec<Pcwstr, 13> {
         let mut compile_args = arrayvec::ArrayVec::<Pcwstr, 13>::new_const();
         if let Some(name) = source_name {
@@ -444,8 +371,6 @@ mod wgpu_hal {
         compile_args
     }
 
-    // wgpu-hal-29.0.3/src/dx12/device.rs:1974 — turbofish with a literal capacity
-    // wgpu-hal-29.0.3/src/dx12/device.rs:1990 — `as_slice()`
     pub fn view_instancing(n: u32) -> Vec<ViewInstanceLocation> {
         let mut view_instancing = ArrayVec::<ViewInstanceLocation, 32>::new();
         for i in 0..n {
@@ -454,37 +379,29 @@ mod wgpu_hal {
         view_instancing.as_slice().to_vec()
     }
 
-    // wgpu-hal-29.0.3/src/gles/mod.rs:714-716 — `#[derive(Hash)]` on a
-    // HashMap key whose field is an ArrayVec.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct ProgramCacheKey {
         pub stages: ArrayVec<ProgramStage, 3>,
     }
 
-    // wgpu-hal-29.0.3/src/gles/mod.rs:676
     #[derive(Clone, Debug, Default)]
     pub struct PipelineInner {
         pub immediates_descs: ArrayVec<ImmediateDesc, MAX_IMMEDIATES_COMMANDS>,
     }
 
-    // wgpu-hal-29.0.3/src/gles/mod.rs:824 — `type` alias, capacity is a const
-    // block containing ARITHMETIC.
     pub type InvalidatedAttachments = ArrayVec<u32, { MAX_COLOR_ATTACHMENTS + 2 }>;
 
-    // wgpu-hal-29.0.3/src/vulkan/mod.rs:463 — `Default` and `Hash` in one derive
     #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
     pub struct RenderPassKey {
         pub colors: ArrayVec<TextureView, { MAX_COLOR_ATTACHMENTS }>,
         pub resolves: ArrayVec<TextureView, { MAX_COLOR_ATTACHMENTS }>,
     }
 
-    // wgpu-hal-29.0.3/src/vulkan/mod.rs:913
     #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
     pub struct FramebufferKey {
         pub attachments: ArrayVec<TextureView, { MAX_COLOR_ATTACHMENTS }>,
     }
 
-    // wgpu-hal-29.0.3/src/vulkan/command.rs:788, :795, :796 — `ArrayVec::default()`
     pub fn empty_render_pass_key() -> RenderPassKey {
         RenderPassKey {
             colors: ArrayVec::default(),
@@ -492,8 +409,6 @@ mod wgpu_hal {
         }
     }
 
-    // wgpu-hal-29.0.3/src/gles/command.rs:51-66 — `Default::default()` in a
-    // struct literal, and the five-ArrayVec `State`.
     pub struct State {
         pub resolve_attachments: ArrayVec<(u32, TextureView), { MAX_COLOR_ATTACHMENTS }>,
         pub invalidate_attachments: InvalidatedAttachments,
@@ -513,7 +428,6 @@ mod wgpu_hal {
             }
         }
 
-        // wgpu-hal-29.0.3/src/gles/command.rs:511, :512, :709, :718, :724, :1002
         pub fn begin_pass(&mut self) {
             self.resolve_attachments.clear();
             self.invalidate_attachments.clear();
@@ -521,14 +435,10 @@ mod wgpu_hal {
             self.vertex_attributes.clear();
         }
 
-        // wgpu-hal-29.0.3/src/gles/command.rs:238 — `clone_from`
         pub fn bind_pipeline(&mut self, inner: &PipelineInner) {
             self.immediates_descs.clone_from(&inner.immediates_descs);
         }
 
-        // wgpu-hal-29.0.3/src/gles/command.rs:698: `drain(..)`, the only place
-        // `resolve_attachments` is emptied at end-of-pass. A `drain` that
-        // yielded without removing would re-emit stale MSAA resolves.
         pub fn end_pass(&mut self) -> Vec<(u32, TextureView)> {
             let mut done = Vec::new();
             for (attachment, dst) in self.resolve_attachments.drain(..) {
@@ -537,7 +447,6 @@ mod wgpu_hal {
             done
         }
 
-        // wgpu-hal-29.0.3/src/gles/command.rs:719 and :887 — `for x in &field`
         pub fn vertex_attribute_sum(&self) -> u32 {
             let mut total = 0;
             for vat in &self.vertex_attributes {
@@ -546,15 +455,11 @@ mod wgpu_hal {
             total
         }
 
-        // wgpu-hal-29.0.3/src/gles/command.rs:982 — slice `PartialEq` through
-        // `Index<RangeFull>`
         pub fn color_targets_differ(&self, pipeline: &Self) -> bool {
             self.color_targets[..] != pipeline.color_targets[..]
         }
     }
 
-    // wgpu-hal-29.0.3/src/gles/device.rs:329 — `for &(a, b) in &av` (a DESTRUCTURING
-    // by-reference pattern, which is why the by-ref `IntoIterator` impl has to exist)
     pub fn shader_stages(shaders: &ArrayVec<(u32, ProgramStage), 3>) -> u32 {
         let mut total = 0;
         for &(naga_stage, stage) in shaders {
@@ -563,7 +468,6 @@ mod wgpu_hal {
         total
     }
 
-    // wgpu-hal-29.0.3/src/gles/device.rs:446 — by-value loop over owned handles
     pub fn delete_shaders(shaders_to_delete: ArrayVec<u32, 3>) -> u32 {
         let mut deleted = 0;
         for shader in shaders_to_delete {
@@ -572,11 +476,6 @@ mod wgpu_hal {
         deleted
     }
 
-    // wgpu-hal-29.0.3/src/gles/device.rs:401, :409-412: `last_mut()` through
-    // `DerefMut` inside a block expression whose value is the `&mut` it
-    // returns, stored in a struct after the block. The borrow checker must
-    // see the mutable borrow begin after the `push` ends, which works only
-    // because `last_mut` goes through `DerefMut` on the ArrayVec itself.
     pub struct CompilationContext<'a> {
         pub immediates_items: &'a mut Vec<u32>,
     }
@@ -598,7 +497,6 @@ mod wgpu_hal {
         immediates_items.iter().map(Vec::len).sum()
     }
 
-    // wgpu-hal-29.0.3/src/gles/device.rs:489 — `.into_iter().enumerate()`
     pub fn immediates(immediates_items: ArrayVec<u32, 4>) -> Vec<(usize, u32)> {
         let mut out = Vec::new();
         for (stage_idx, stage_items) in immediates_items.into_iter().enumerate() {
@@ -607,8 +505,6 @@ mod wgpu_hal {
         out
     }
 
-    // wgpu-hal-29.0.3/src/vulkan/instance.rs:803: a deferred-init binding
-    // (declared without a value, assigned in a branch).
     pub fn validation_features(enable: bool) -> usize {
         let mut validation_feature_list: ArrayVec<u32, 3>;
         if enable {
@@ -620,8 +516,6 @@ mod wgpu_hal {
         validation_feature_list.len()
     }
 
-    // wgpu-hal-29.0.3/src/vulkan/device.rs:300 — `.collect::<ArrayVec<_, 8>>()`
-    // wgpu-hal-29.0.3/src/vulkan/device.rs:99  — `.iter()`
     pub fn queue_families(ids: &[u32]) -> u32 {
         let families = ids.iter().copied().collect::<ArrayVec<_, 8>>();
         families.iter().sum()
@@ -646,7 +540,6 @@ fn wgpu_hal_forms() {
     cache.insert(key.clone(), 1u32);
     assert_eq!(cache.get(&key), Some(&1));
 
-    // RenderPassKey / FramebufferKey: Default + Hash + Eq, as HashMap keys.
     assert_eq!(empty_render_pass_key(), RenderPassKey::default());
     let mut fbs = std::collections::HashMap::new();
     fbs.insert(FramebufferKey::default(), 0u32);
@@ -692,20 +585,15 @@ fn wgpu_hal_forms() {
     assert_eq!(queue_families(&[1, 2, 3]), 6);
 }
 
-/// Every `&ArrayVec<T, N>` that the consumers hand to something expecting
-/// `&[T]`, plus the slice inherent methods they reach through `Deref`. None of
-/// these compiles without `Deref<Target = [T]>`, and none of them is visible in
-/// a grep for `ArrayVec`.
+/// Slice coercion and `Deref` slice method coverage for `&ArrayVec<T, N>`.
 mod deref_sites {
     use arrayvec::ArrayVec;
     use std::borrow::Cow;
 
-    // wgpu-core: `Cow::Borrowed(&temp_layouts)`
     pub fn cow_borrowed(temp_layouts: &ArrayVec<u32, 4>) -> Cow<'_, [u32]> {
         Cow::Borrowed(temp_layouts)
     }
 
-    // wgpu-hal gles: `gl.draw_buffers(&indices)`
     pub fn draw_buffers(indices: &ArrayVec<u32, 8>) -> usize {
         fn gl_draw_buffers(bufs: &[u32]) -> usize {
             bufs.len()
@@ -713,7 +601,6 @@ mod deref_sites {
         gl_draw_buffers(indices)
     }
 
-    // wgpu-hal vulkan: `.clear_values(&vk_clear_values)` / `.attachments(attachment_views)`
     pub fn vk_builder(
         vk_clear_values: &ArrayVec<u32, 8>,
         attachment_views: &ArrayVec<u32, 8>,
@@ -724,7 +611,6 @@ mod deref_sites {
         clear_values(vk_clear_values) + clear_values(attachment_views)
     }
 
-    // wgpu-core: `transition_textures(&barriers)`
     pub fn transition_textures(barriers: &ArrayVec<u32, 2>) -> usize {
         fn inner(b: &[u32]) -> usize {
             b.len()
@@ -732,16 +618,11 @@ mod deref_sites {
         inner(barriers)
     }
 
-    // wgpu-hal dx12: `Some(&compile_args)`
     pub fn some_slice(compile_args: &ArrayVec<u32, 13>) -> Option<&[u32]> {
         Some(compile_args)
     }
 
-    /// The slice inherent methods and index forms the consumers reach through
-    /// `Deref`/`DerefMut`: `Index` (usize / `Range` / `RangeFrom` / `RangeFull`),
-    /// `get`, `get_mut`, `first`, `last`, `sort`, `contains`. `get_unchecked`,
-    /// `get_unchecked_mut` and `last_mut` are pinned in their consumer context
-    /// above, since the context is what is tested.
+    /// The slice inherent methods and index forms the consumers reach through `Deref`/`DerefMut`.
     pub fn slice_surface(av: &mut ArrayVec<u32, 8>) -> bool {
         av.sort();
         let _ = av[0];
@@ -777,10 +658,6 @@ fn deref_sites_forms() {
     assert_eq!(deref_sites::some_slice(&args), Some(&[1u32, 2, 3][..]));
 }
 
-/// Upstream exports `arrayvec::IntoIter` and `arrayvec::Drain` as nameable
-/// types. Nothing in aterm's graph writes either name today, but a consumer
-/// storing an iterator in a struct would, so the names have to resolve and
-/// carry their iterator impls.
 #[test]
 fn iterator_types_are_nameable() {
     let av: arrayvec::ArrayVec<u32, 4> = [1, 2, 3].into_iter().collect();
@@ -794,7 +671,6 @@ fn iterator_types_are_nameable() {
     drop(d);
     assert_eq!(av.as_slice(), &[1]);
 
-    // `CapacityError`, upstream's third public export.
     let e: arrayvec::CapacityError<u32> =
         arrayvec::ArrayVec::<u32, 0>::new().try_push(1).unwrap_err();
     assert_eq!(e.element(), 1);

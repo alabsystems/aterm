@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One test binary and one test: count allocation traffic for real transcript
-//! consumers without another parallel test polluting the global allocator.
+//! Allocation-traffic bounds for transcript consumers under a counting global allocator.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -75,8 +74,6 @@ fn within<T>(name: &str, max_bytes: usize, max_calls: usize, f: impl FnOnce() ->
     result
 }
 
-/// The row's working directory: absolute on this host (a Windows one starts
-/// with a drive).
 const CWD: &str = if cfg!(windows) {
     "C:/work/project"
 } else {
@@ -86,8 +83,6 @@ const CWD: &str = if cfg!(windows) {
 #[test]
 fn transcript_readers_keep_allocation_proportional_to_input() {
     let model = "claude-opus-5-5";
-    // A common coding-agent row: an assistant's tool calls, with escaped
-    // multi-line commands and structured arguments, alongside tiny metadata.
     let command = "cat file.rs\\n日本語 ".repeat(200);
     let blocks: Vec<_> = (0..24)
         .map(|i| {
@@ -114,7 +109,6 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
             "the allocation-saving projection still feeds the live wall's served time"
         );
         let facts = bounded("footer", || footer::tail_facts(row.as_bytes(), None));
-        // The land's reader names the model as the footer shows it.
         assert_eq!(facts.model, footer::Said::Is(footer::model_display(model)));
         assert_eq!(facts.effort, footer::Said::Is("xhigh".to_string()));
         assert_eq!(
@@ -153,8 +147,6 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
             .id,
             model
         );
-        // The lifecycle readers need content block kinds and text, but no
-        // tool input/result trees. Their budget includes those 24 small maps.
         assert!(!within("READY", 32 * 1024, 128, || {
             upgrade::transcript_has_ready(&row, "ATERM-UPGRADE-READY-0badf00d")
         }));
@@ -176,16 +168,9 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
         assert!(!within("task scan", 32 * 1024, 128, || {
             upgrade::TaskScan::default().line(&row)
         }));
-        // The session log's step fold: the calls'
-        // ids and names, never their inputs (24 × 5 KB here); a plain-string
-        // content is validated and never copied. Its budget holds the 24
-        // small part maps and the 25 queued steps (about 190 B each), well
-        // under the inputs a reader that kept them would copy.
         let mut fold = steps::StepFold::new(0, None);
         fold.read_at(1, None, 0, false);
         let line_end = row.len() as u64 + 1;
-        // A plain-string content (4 KB here) is never copied: that row's
-        // read keeps a few small values.
         let (bytes, calls) = if content.starts_with('[') {
             (64 * 1024, 256)
         } else {
@@ -194,9 +179,6 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
         within("steps", bytes, calls, || {
             fold.push(row.as_bytes(), line_end)
         });
-        // The row opens the conversation with no prompt before it: the
-        // fold's opening hold keeps its steps through one take, for a
-        // prompt row written after it (`steps::StepFold::take`).
         let calls = [fold.take(), fold.take()]
             .iter()
             .flat_map(|b| &b.steps)
@@ -204,9 +186,6 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
             .count();
         assert_eq!(calls, if content.starts_with('[') { 24 } else { 0 });
     }
-    // The step fold's parts path (a `\u` in the row sends it there) on a
-    // plain-string content with no escape, which the parser hands over
-    // borrowed: still validated and never copied (4 KB here).
     let plain = "cat file.rs 日本語 ".repeat(200);
     let row = format!(
         r#"{{"type":"\u0061ssistant","isSidechain":false,"timestamp":"2026-09-28T12:00:00Z","message":{{"id":"msg-1","model":"{model}","content":"{plain}","usage":{{"input_tokens":42,"output_tokens":7}}}}}}"#
@@ -221,14 +200,6 @@ fn transcript_readers_keep_allocation_proportional_to_input() {
     codex_step_rows_materialize_no_text();
 }
 
-/// The session log's Codex step fold, over a rollout's
-/// rows as Codex 0.163.0 writes them, each carrying about 72 KB where Codex
-/// writes text: the base instructions, a call's arguments, a script's
-/// input, a result's output, a message, a compaction's history and a turn's
-/// last message. Each row's read keeps its few keys and queues its steps,
-/// well under the text a reader that built the row would copy. NEGATIVE
-/// CONTROL: building each text-carrying row's tree allocates more than its
-/// text.
 fn codex_step_rows_materialize_no_text() {
     let big = "SENTINEL-TEXT \\n日本語 ".repeat(3 * 1024);
     let at = "2026-09-28T12:00:00.000Z";
@@ -268,7 +239,6 @@ fn codex_step_rows_materialize_no_text() {
             fold.push(row.as_bytes(), end)
         });
         if row.contains("SENTINEL-TEXT") {
-            // NEGATIVE CONTROL.
             let (tree, bytes, _) = measured(|| aterm_json::from_str::<aterm_json::Value>(row));
             assert!(tree.is_ok());
             assert!(bytes > big.len(), "a built row copies its text: {bytes}");
@@ -277,8 +247,6 @@ fn codex_step_rows_materialize_no_text() {
     assert!(!fold.broken());
     let batch = fold.take();
     assert_eq!((batch.lost, batch.overflow), (0, 0));
-    // The bind, the prompt, the model, two calls, a result, the compaction
-    // and the turn's end.
     assert_eq!(batch.steps.len(), 8, "{:?}", batch.steps);
     assert!(!format!("{:?}", batch.steps).contains("SENTINEL"));
 }

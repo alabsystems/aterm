@@ -473,7 +473,9 @@ impl HolderFence {
         }
     }
 
-    /// A full clear of the main screen from absolute row `top` (ED 2.
+    /// A full clear of the main screen from absolute row `top` (ED 2, ED 0
+    /// from home) while a drawer is current: every row from `top` is blank
+    /// and the current writer's from now on.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -804,7 +806,9 @@ impl super::Terminal {
         &self.holder_fence
     }
 
-    /// After a restore (a seamless rung of any kind.
+    /// After a restore (a seamless rung of any kind, a crash restore, a
+    /// predecessor with no fence), take `token` as the foreground holder,
+    /// `drawer_exact` when it is a drawer whose build passes Exact.
     pub fn adopt_holder_after_restore(&mut self, token: u64, drawer_exact: bool) -> HolderAdoption {
         let untouched = self.holder_carried_at.take() == Some(self.transient.screen_mutations);
         self.holder_fence.seed_untrusted |= !untouched;

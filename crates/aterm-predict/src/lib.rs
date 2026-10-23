@@ -1346,6 +1346,7 @@ impl Predictor {
         if !self.engaged()
             && let Some(cells) = sample.row
         {
+            // A chain starts: nothing the last chain's reconcile read describes
             // this one's line; the row this press read does (`start_chain`).
             self.start_chain(cells, &e);
         }
@@ -2269,6 +2270,7 @@ impl Predictor {
                 *cur += 1;
             }
             Op::Insert => {
+                // R-ROW: the buffer's end, one cell on, short of the last
                 // column, as the chain's own fold keeps it.
                 if *cur > *len || *len + 2 > cells.len() {
                     return false;
@@ -2999,6 +3001,10 @@ impl Predictor {
                         && real_cursor == Some((p.row, p.col))
                         && self.tail_at(p.row, p.col).and_then(Seen::legacy) == Some(c) =>
                 {
+                    // DARK OVER TEXT ([`Rule::DarkOverText`]): not known to be past
+                    // the line's end, `c` may be the line's own text, which this
+                    // key's echo shifts right of its glyph. The guess waits off the
+                    // glass, and what was typed after it with it: painted, it hid
                     // that text unshifted until the echo (`sudo` over `du -sh`).
                     if self.text_under(p.row, p.col, p.ch).is_some() {
                         self.text_wait = Some(p.seq);
@@ -3011,6 +3017,7 @@ impl Predictor {
                     break;
                 }
                 None => {
+                    // As far as the run's echoes reach, as for any glyph
                     // (`echoed_past`).
                     if p.ch == ' '
                         && matches!(real_cursor, Some((rr, rc))
@@ -3541,6 +3548,13 @@ impl Predictor {
                 return;
             }
             if !self.rule(Rule::TailGuard) || self.appended((&p, own), observe, clean_row, cursor) {
+                // A space proves no line by itself ([`Rule::SpaceNeverProves`]):
+                // its echo, a blank with the cursor past it, is what any output
+                // that steps the cursor over a blank draws, a prompt's trailing
+                // space among them. Typed while `Password: ` was still being
+                // drawn, on the cell of its last space, a space was credited with
+                // that space, proved the line where the prompt ends, and the
+                // password typed there was painted. It measures the link, and on
                 // a line a glyph has proven it carries the proof on.
                 if p.ch == ' ' && !self.confirmed_epoch && self.rule(Rule::SpaceNeverProves) {
                     self.retired_as_append(&p);
@@ -5119,6 +5133,7 @@ mod tests {
                 assert!(p.predict_char('n', (0, 2), G, 80, at));
                 assert_eq!(p.overlay(at).len(), 1);
             } else {
+                // The same custody applies to unmodelled input: a Right arrow,
                 // for example, may reprint an existing 'n'.
                 p.note_unmodelled_input(at);
             }

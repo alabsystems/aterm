@@ -12,7 +12,6 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
-/// A binary PPM (P6) or PGM (P5) as RGB triples.
 fn netpbm(bytes: &[u8]) -> (Vec<[u8; 3]>, usize, usize) {
     let mut fields = Vec::new();
     let mut at = 0;
@@ -36,10 +35,6 @@ fn netpbm(bytes: &[u8]) -> (Vec<[u8; 3]>, usize, usize) {
     (pixels, width, height)
 }
 
-/// Decode `name.jpg` and hold it to `name.ppm` (djpeg's decode): the same
-/// size, every channel within `tolerance` levels and the mean error under a
-/// fifth of a level. The tolerance covers the float transform against libjpeg's
-/// integer one and the rounding of the fixed-point colour conversion.
 fn matches_reference(name: &str, tolerance: u8) {
     let (rgba, width, height) =
         aterm_jpeg::decode_rgba8(&fixture(&format!("{name}.jpg")), 8192).expect(name);
@@ -83,7 +78,6 @@ fn baseline_444_matches_the_reference_decode() {
     matches_reference("b444", 2);
 }
 
-/// Luma at 4x2: a factor the triangle filter does not cover, replicated.
 #[test]
 fn baseline_4x2_matches_the_reference_decode() {
     matches_reference("b4x2", 2);
@@ -104,27 +98,21 @@ fn progressive_grayscale_matches_the_reference_decode() {
     matches_reference("pgray", 2);
 }
 
-/// A restart marker after every MCU.
 #[test]
 fn restart_intervals_match_the_reference_decode() {
     matches_reference("r420", 2);
 }
 
-/// Progressive, with a restart every two MCUs (every two blocks in the
-/// single-component AC scans).
 #[test]
 fn progressive_restart_intervals_match_the_reference_decode() {
     matches_reference("pr420", 2);
 }
 
-/// An Adobe transform-0 file: the samples are RGB, not YCbCr.
 #[test]
 fn adobe_rgb_matches_the_reference_decode() {
     matches_reference("rgb", 2);
 }
 
-/// The quadrants come back in their colours (the reference agreeing is not
-/// enough if both read the channels in the wrong order).
 #[test]
 fn the_quadrants_keep_their_colours() {
     let (rgba, width, _) = aterm_jpeg::decode_rgba8(&fixture("b420.jpg"), 8192).unwrap();
@@ -151,7 +139,6 @@ fn the_quadrants_keep_their_colours() {
     );
 }
 
-/// Insert an EXIF APP1 segment carrying `orientation` right after SOI.
 fn with_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
     let tiff = [
         b'M',
@@ -192,8 +179,6 @@ fn with_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
     out
 }
 
-/// EXIF orientation 6 comes back turned upright: the sides swap and the
-/// stored left column is the top row.
 #[test]
 fn the_exif_orientation_turns_the_image_upright() {
     let jpeg = fixture("b444.jpg");
@@ -213,8 +198,6 @@ fn the_exif_orientation_turns_the_image_upright() {
     assert_eq!(same, upright);
 }
 
-/// A frame larger than the bound is refused from its header, before any
-/// pixel buffer exists: the header claims 9000 x 9000.
 #[test]
 fn a_frame_past_the_bound_is_refused_from_its_header() {
     let mut jpeg = fixture("b420.jpg");
@@ -231,8 +214,6 @@ fn a_frame_past_the_bound_is_refused_from_its_header() {
     );
 }
 
-/// Every truncation of every fixture, and a sweep of single-bit flips,
-/// decodes or is refused without a panic.
 #[test]
 fn truncated_and_corrupted_files_never_panic() {
     for name in ["b420", "p420", "pr420", "r420", "gray", "rgb", "b4x2"] {
@@ -250,7 +231,6 @@ fn truncated_and_corrupted_files_never_panic() {
     }
 }
 
-/// A file cut off inside its scan still decodes what it holds, at full size.
 #[test]
 fn a_file_cut_short_decodes_as_far_as_it_goes() {
     let jpeg = fixture("b444.jpg");

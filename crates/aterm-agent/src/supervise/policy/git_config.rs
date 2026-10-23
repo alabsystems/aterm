@@ -415,6 +415,9 @@ impl WorkerEnv {
         worker_writes: &dyn Fn(&Path) -> bool,
     ) -> Result<GitView, String> {
         // A `/`-rooted directory names no drive on Windows: the Bash tool's
+        // shell there (Git Bash) reads `/c/x` as `C:\x` and its `/tmp` as a
+        // folder of its own, where this process would read `\c\x` and `\tmp`
+        // on its current drive — another directory's configuration.
         if dir.has_root() && !dir.is_absolute() {
             return Err(format!(
                 "a git read in {} (a `/` path names no drive on Windows: where it runs is \

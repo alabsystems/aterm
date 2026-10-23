@@ -92,7 +92,8 @@ mod windows {
     /// Whether `stream` is a pipe a shell reads in a legacy code page.
     pub(super) fn shell_reads_in_code_page(stream: &impl AsRawHandle) -> bool {
         let handle = stream.as_raw_handle() as isize;
-        // SAFETY: a type query on this process's own std handle; a null or invalid handle is no.
+        // SAFETY: a type query on this process's own std handle; a null or
+        // invalid handle is no pipe and is never queried.
         if handle == 0 || handle == -1 || unsafe { GetFileType(handle) } != FILE_TYPE_PIPE {
             return false;
         }

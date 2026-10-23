@@ -385,6 +385,7 @@ impl OutputStreak {
         now: Instant,
         input_hot: bool,
     ) -> bool {
+        // Geometry can change before the terminal publishes a new token, so
         // the walk is skipped only when both are unchanged.
         if self.last_token == Some(token) && self.observed_viewport == Some(viewport) {
             return self.note_output(token, &[], now, input_hot);
@@ -501,6 +502,7 @@ impl OutputStreak {
         cfg: &StreakConfig,
         out: &mut Vec<GlowQuad>,
     ) -> StreakFrame {
+        // Fully inert: off, zero amplitude, or degenerate geometry. A reset,
         // not a dimming.
         if !cfg.enabled
             || cfg.intensity <= 0.0

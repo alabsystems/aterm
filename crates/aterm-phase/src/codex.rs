@@ -5,6 +5,9 @@
 
 use crate::text::blank;
 
+/// Version of the Codex harness, tracked independently per harness starting at `"0.1"`.
+pub const HARNESS_VERSION: &str = "0.1";
+
 /// The prompt glyph, in column 0 (U+203A).
 const PROMPT: char = '›';
 

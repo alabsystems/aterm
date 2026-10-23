@@ -7,8 +7,7 @@
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-/// A virtual monotonic clock from 0 and a wall clock from a start, both moved only by `sleep`,
-/// by exactly its length; every sleep recorded.
+/// Simulated monotonic and wall clock advanced only by `sleep`.
 pub(super) struct SimClock {
     start_unix_secs: u64,
     /// The time slept so far, and each sleep in order.

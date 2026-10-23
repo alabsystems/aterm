@@ -667,6 +667,7 @@ impl Fx {
             Seam::Recording { seam, sink } => {
                 if sink.discarded() {
                     // A run that met an answer no tape can hold removed its tape: the
+                    // refusal it latched is the answer, not the file's absence.
                     return self.latched();
                 }
                 infallible(lock(seam).emit(DOOR_EXIT, code.as_bytes()));

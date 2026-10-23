@@ -207,6 +207,7 @@ impl<T> EventLoop<T> {
     pub(crate) fn new(
         attributes: &PlatformSpecificEventLoopAttributes,
     ) -> Result<Self, EventLoopError> {
+        // Before anything touches AppKit: the AppKit arm's first act is
         // `+[NSApplication sharedApplication]`.
         if attributes.headless {
             return super::headless::EventLoop::new().map(Self::Headless);
@@ -375,6 +376,7 @@ impl<T> AppKitEventLoop<T> {
 
         self.delegate.set_event_handler(handler, || {
             autoreleasepool(|_| {
+                // As a special case, if the application hasn't been launched yet then we at least
                 // run the loop until it has fully launched.
                 if !self.delegate.is_launched() {
                     debug_assert!(!self.delegate.is_running());
@@ -553,6 +555,10 @@ impl<T> EventLoopProxy<T> {
     }
 
     pub fn send_event(&self, event: T) -> Result<(), EventLoopClosed<T>> {
+        // LOCAL PATCH (aterm), 2026-10-16: the signal comes AFTER the push, and
+        // a drain that found the queue's lock held relies on it
+        // (`wake_queue.rs`). 2026-10-17: only from the send that armed the
+        // wake; the sends behind it until the next take are drained by the
         // turn that signal brings (`wake_queue.rs`, COALESCED WAKES).
         if self.sender.send(event).map_err(EventLoopClosed)? {
             unsafe {

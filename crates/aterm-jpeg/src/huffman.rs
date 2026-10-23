@@ -227,8 +227,6 @@ impl<'a> BitReader<'a> {
 mod tests {
     use super::{BitReader, HuffmanTable};
 
-    /// The DC luminance table of T.81 Annex K.3 decodes each category from
-    /// its own code, through the fast table and past it.
     #[test]
     fn the_standard_dc_table_decodes_every_code() {
         let counts = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
@@ -239,7 +237,6 @@ mod tests {
         assert_eq!(reader.decode(&table), Some(11));
     }
 
-    /// Stuffed `FF 00` reads as one `FF` byte, and a marker reads as zeros.
     #[test]
     fn stuffing_is_undone_and_a_marker_ends_the_segment() {
         let mut reader = BitReader::new(&[0xFF, 0x00, 0xA5, 0xFF, 0xD9], 0);
@@ -249,7 +246,6 @@ mod tests {
         assert_eq!(reader.position(), 3, "stopped at the marker");
     }
 
-    /// An over-subscribed count list is refused.
     #[test]
     fn an_oversubscribed_code_is_refused() {
         let mut counts = [0u8; 16];

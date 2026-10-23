@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared by the `fabric_world` suite: one guarded broker, one headless aterm, one real bridge child between them, and the bounded waits that keep the whole thing deterministic.
+//! Shared `fabric_world` test harness for a guarded broker, headless `aterm`, and bridge child.
 
 #![allow(dead_code)]
 #![allow(
@@ -21,7 +21,6 @@ use aterm_link::ctl::{Ctl, Reply};
 /// The mint secret every test's broker is guarded with.
 pub const SECRET: &[u8] = b"a3-bridge-e2e-secret-of-32-bytes";
 
-/// THE OPTIONS A TEST BROKER OPENS WITH: exactly aterm's own for `tier` ([`aterm_link::durability::Durability::options`]: astream's tier and, on a weak one, aterm's escalation table), guarded by [`SECRET`] as every broker `aterm fabric on` runs is.
 #[must_use]
 pub fn broker_opts(tier: aterm_link::durability::Durability) -> OpenOptions {
     let mut opts = tier.options();
@@ -29,7 +28,6 @@ pub fn broker_opts(tier: aterm_link::durability::Durability) -> OpenOptions {
     opts
 }
 
-/// Open a guarded broker on `log` with `opts` ([`broker_opts`]), RETAINED by aterm's default rules ([`aterm_link::broker_rules::retain`]): the one constructor `aterm link broker` opens with too, so a world's broker is the production default.
 #[must_use]
 pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     let broker = open_broker_unretained(log, opts);
@@ -37,7 +35,6 @@ pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     broker
 }
 
-/// [`open_broker`] with NO retention rules: a broker from before astream's R4, which never compacts and advertises no rule ([`World::without_retention`]).
 #[must_use]
 pub fn open_broker_unretained(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     Broker::open_opts(log, opts.clone(), || Ok(Prepared::Nothing)).expect("guarded broker")
@@ -45,7 +42,6 @@ pub fn open_broker_unretained(log: impl AsRef<Path>, opts: &OpenOptions) -> Brok
 
 /// The fleet every test runs in.
 pub const FLEET: &str = "f1";
-
 /// The ceiling on every wait.
 pub const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
@@ -74,14 +70,12 @@ pub use aterm_spec::wait::until_within;
 
 /// The budget for something the bridge's periodic backstop publishes.
 pub const PERIODIC_DEADLINE: Duration = Duration::from_secs(180);
-
-/// The fast-timers development seam as a [`World::boot_with`] environment entry: the instance's own waits at test pace (`aterm-gui-timing`), and its bridge's round and the presence republish window matched to it a quarter of production (`aterm-link`'s `roster_refresh`, `presence::republish_min`).
+/// Fast-timers development seam as a [`World::boot_with`] environment entry.
 pub const FAST_TIMERS: (&str, &str) = (aterm_types::domain::ENV_DEV_FAST_TIMERS, "1");
-
-/// The bound on ONE control-verb reply: [`DEADLINE`] for the verb's own wait (`--wait=60000`, `--wait-ack=60000`, `timeout=60000` — each a minute's hang detector of its own) plus [`DEADLINE`] for the reply.
+/// Bound on one control-verb reply (`2 * DEADLINE`).
 pub const VERB_DEADLINE: Duration = Duration::from_secs(2 * DEADLINE.as_secs());
 
-/// Connect to an instance's control socket and authenticate, with every read and write on the connection bounded by `bound`.
+/// Connects to an instance's control socket and authenticates with `bound` read/write timeouts.
 pub fn connect_within(sock: &str, token: &str, bound: Duration) -> std::io::Result<Ctl> {
     let ctl = Ctl::connect(sock, token)?;
     ctl.get_ref().set_read_timeout(Some(bound))?;
@@ -104,7 +98,6 @@ fn boot_gate() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
     GATE.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
 }
 
-/// A permit to bring a whole stack up.
 #[must_use]
 pub struct BootPermit;
 
@@ -246,7 +239,7 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Rece
     rx
 }
 
-/// `cmd.output()` with its waits bounded by [`DEADLINE`] — the exit, and then each pipe's end — for a child CLI a test runs to completion. stdin is `/dev/null`, as `output` makes it.
+/// Runs `cmd` to completion with its exit and stdio pipes bounded by [`DEADLINE`].
 pub fn output_within(cmd: &mut Command, what: &str) -> std::process::Output {
     let child = cmd
         .stdin(Stdio::null())
@@ -257,7 +250,7 @@ pub fn output_within(cmd: &mut Command, what: &str) -> std::process::Output {
     wait_output_within(child, what)
 }
 
-/// `child.wait_with_output()` with its waits bounded by [`DEADLINE`], as [`output_within`] bounds them: for a child the test spawned itself because it needed more than `output` gives (a piped stdin it writes and closes first).
+/// Waits for `child` and collects its output, bounded by [`DEADLINE`].
 pub fn wait_output_within(child: Child, what: &str) -> std::process::Output {
     let mut child = Reaped(child);
     let stdout = child.0.stdout.take().map(drain);
@@ -279,7 +272,7 @@ pub fn wait_output_within(child: Child, what: &str) -> std::process::Output {
     }
 }
 
-/// A broker client on `sock` whose every read and write is bounded by [`VERB_DEADLINE`] — a HANG DETECTOR, like [`connect`]'s: a broker that accepts and never answers fails the test at the call that waited, instead of parking it, and the live slot it holds, for ever.
+/// Connects a broker client on `sock` with read and write timeouts bounded by [`VERB_DEADLINE`].
 pub fn broker_client(sock: impl AsRef<Path>) -> Client {
     let sock = sock.as_ref();
     let s = std::os::unix::net::UnixStream::connect(sock)
@@ -290,7 +283,7 @@ pub fn broker_client(sock: impl AsRef<Path>) -> Client {
     Client::from_stream(s)
 }
 
-/// The first line `child` prints on its (piped) stdout — a readiness line — bounded by [`DEADLINE`].
+/// Reads the first line `child` prints on its piped stdout, bounded by [`DEADLINE`].
 pub fn first_line_within(child: &mut OwnedChild, what: &str) -> String {
     use std::io::BufRead;
     let out = child.stdout.take().expect("the child's stdout is piped");
@@ -314,12 +307,12 @@ pub fn cap_line(grant: &str) -> String {
     format!("{} {hex}\n", cap.filter)
 }
 
-/// A node's ring on the test fleet: THE ring `fabric on` mints ([`aterm_link::enable::node_grants`]), so every guarded World and Fleet bridge attaches with what ships, and a grant the bridge needs cannot be added here and forgotten there.
+/// Returns the capability grant ring for `node` ([`aterm_link::enable::node_grants`]).
 pub fn node_grants(node: &str) -> Vec<String> {
     aterm_link::enable::node_grants(FLEET, node)
 }
 
-/// THE INHERITED IDENTITY MUST BE STRIPPED, and this is not hygiene — it is the difference between a two-node test and a one-node test wearing two hats.
+/// Strips inherited `ATERM_*` environment variables and configures test GUI defaults on `cmd`.
 pub fn prepare_gui_environment(cmd: &mut Command) {
     for (name, _) in std::env::vars_os() {
         if stripped(&name) {
@@ -329,10 +322,10 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
     cmd.env(STALE_HORIZON.0, STALE_HORIZON.1.as_millis().to_string());
 }
 
-/// Every launch's owed-answer horizon (`aterm-gui-fabric`'s `ATERM_FABRIC_STALE_AFTER_MS` seam) at [`VERB_DEADLINE`], past every verb's own wait, set by [`prepare_gui_environment`].
+/// Owed-answer horizon (`ATERM_FABRIC_STALE_AFTER_MS`) set by [`prepare_gui_environment`].
 pub const STALE_HORIZON: (&str, Duration) = ("ATERM_FABRIC_STALE_AFTER_MS", VERB_DEADLINE);
 
-/// Arm a `--headless` launch with a LIFELINE held for the life of this test process (`aterm_uds::lifeline::arm_for_process`): the instance's `Drop` still kills it on every ordinary exit, and when this process dies without one — a SIGKILLed runner, a `timeout` — the kernel cuts the lifeline and the instance shuts itself down instead of outliving the run (gap #36).
+/// Arms a `--headless` launch with a lifeline held for the life of this test process.
 pub fn arm_lifeline(cmd: &mut Command, dir: &Path) {
     use aterm_uds::spawnfd::InheritNothing as _;
     cmd.inherit_nothing();
@@ -340,34 +333,23 @@ pub fn arm_lifeline(cmd: &mut Command, dir: &Path) {
         .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", dir.display()));
 }
 
-/// A real `aterm link broker` child ([`spawn_broker`]) and the lifeline it was armed
-/// with. The broker serves while `lifeline` is held; once it is dropped, or this test
-/// process dies however it dies, the broker ends itself at its next wake.
 #[must_use]
 pub struct BrokerChild {
     pub child: OwnedChild,
     pub lifeline: aterm_uds::lifeline::Lifeline,
 }
 
-/// Start `aterm link broker <args>…` (the [`aterm`] under test), the one way these
-/// suites start a broker process: built by `aterm_uds::spawnfd::command`, so it holds its
-/// stdio and nothing else of this process, and armed with a LIFELINE
-/// (`aterm_uds::lifeline::Lifeline::arm`), so it never outlives the test. A broker that
-/// only a `Drop` kills outlived every runner that was SIGKILLed or timed out: launchd
-/// adopted it, and it served for hours
-/// (`docs/DESIGN-leftover-processes-2026-10-16.md`, I2). `stdio` sets the child's stdout,
-/// stderr and environment; stdin is the lifeline, set after it. `dir` is the test's own
-/// scratch directory: the FIFO's name lives there only until both ends are open.
-///
-/// # Panics
-/// The FIFO could not be made in `dir`, or the spawn failed.
+/// Spawns `aterm link broker <args>…` armed with a [`aterm_uds::lifeline::Lifeline`], at test
+/// pace ([`FAST_TIMERS`]): it sees a poisoned log or a cut lifeline within its fast wake.
 pub fn spawn_broker(
     dir: &Path,
     args: &[&str],
     stdio: impl FnOnce(&mut aterm_uds::spawnfd::Command),
 ) -> BrokerChild {
     let mut cmd = aterm_uds::spawnfd::command(aterm_to_launch());
-    cmd.args(["link", "broker"]).args(args);
+    cmd.args(["link", "broker"])
+        .args(args)
+        .env(FAST_TIMERS.0, FAST_TIMERS.1);
     stdio(&mut cmd);
     let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut cmd, dir)
         .unwrap_or_else(|e| panic!("arm the broker's lifeline in {}: {e}", dir.display()));
@@ -375,22 +357,12 @@ pub fn spawn_broker(
     BrokerChild { child, lifeline }
 }
 
-/// Who `pid` is, read while it lives: a process this test spawned and has not reaped (so
-/// the number names it), the launcher [`end_bridge`] holds a bridge to.
 #[must_use]
 pub fn identity_of(pid: u32) -> Option<aterm_uds::process::Identity> {
     aterm_uds::process::read_identity(i32::try_from(pid).ok()?)
 }
 
-/// End the bridge `state/pid` names through the end protocol
-/// ([`aterm_uds::process::end_proven`]), and only while it proves to be one `launcher`
-/// started: its launcher's pid version (`Lineage::launcher_version`, kept through its
-/// adoption) is `launcher`'s, and it runs the [`aterm`] under test. `launcher` is the
-/// node's aterm, read before it was killed ([`identity_of`]). A drop reads the file after
-/// that aterm is gone, when the number may name any process of this user, another test's
-/// aterm among them (pids wrap in minutes on a loaded machine), so a pid that proves
-/// neither is left alone, and a live one is named on stderr. Linux reads no identity yet
-/// (the leftover design's slice 7), so there every live pid is left and named.
+/// Terminates the bridge `state/pid` names through [`aterm_uds::process::end_proven`].
 pub fn end_bridge(state: &Path, launcher: Option<aterm_uds::process::Identity>) {
     use aterm_uds::process::{END_GRACE, EndControlLive, Identity, end_proven, pid_alive};
     let Some(pid) = std::fs::read_to_string(state.join("pid"))
@@ -416,7 +388,6 @@ pub fn end_bridge(state: &Path, launcher: Option<aterm_uds::process::Identity>) 
         }
         return;
     };
-    // A refusal sends nothing, which is the point.
     let _ = end_proven(token, END_GRACE, &mut EndControlLive, |id| {
         proven(id.pid) == Some(*id)
     });
@@ -549,9 +520,9 @@ pub struct World {
     pub node: String,
     pub state: PathBuf,
     pub gui_log: PathBuf,
-    /// How this world's own broker opens ([`broker_opts`]): Strict for every world but the ordered suite's and the fabric bench's weak arms ([`World::boot_opts`]).
+    /// Broker open options ([`broker_opts`]).
     pub opts: OpenOptions,
-    /// Whether this world's broker retains its log by aterm's default rules ([`open_broker`]): every world's does but [`World::without_retention`]'s.
+    /// Whether this world's broker retains its log by aterm's default rules.
     pub retained: bool,
     watch: std::sync::Mutex<Option<Client>>,
     lifeline: std::sync::Mutex<Option<aterm_uds::lifeline::Lifeline>>,
@@ -609,7 +580,7 @@ unsafe extern "C" {
 #[path = "../support/aterm_under_test.rs"]
 mod aterm_under_test;
 
-/// The binary every world runs: this package's own `aterm`, which cargo builds, and rebuilds after any edit below it, before this suite runs — or the build a private collector selected (`aterm_under_test`), the one every other launch fixture runs then too.
+/// Returns the path to the `aterm` binary under test.
 pub fn aterm() -> &'static str {
     static ATERM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ATERM.get_or_init(|| {
@@ -620,7 +591,7 @@ pub fn aterm() -> &'static str {
     })
 }
 
-/// [`aterm`] for a launch about to happen, run once first with `--version` ([`aterm_spec::wait::first_exec`]): the system's first-exec wait on a just-built binary (a minute, measured for a debug build) is paid here, unclocked, and not inside [`DEADLINE`].
+/// Returns [`aterm`] after warming its first-exec assessment with `--version`.
 pub fn aterm_to_launch() -> &'static str {
     let aterm = aterm();
     aterm_spec::wait::first_exec(Path::new(aterm), &["--version"]);
@@ -628,7 +599,7 @@ pub fn aterm_to_launch() -> &'static str {
 }
 
 impl World {
-    /// Cut this world's lifeline, reap its direct instance, and observe the bridge and listed foreground roots exit.
+    /// Cut this world's lifeline, reap its direct instance, and wait for its roots to exit.
     pub fn stop(&mut self) -> Result<(), String> {
         if self.stopped {
             return Ok(());
@@ -720,12 +691,12 @@ impl World {
         Self::boot_with(tag, accept_from, &[])
     }
 
-    /// [`World::boot`] with extra environment for the bridge child (the fault injection the crash tests arm).
+    /// [`World::boot`] with extra environment for the bridge child.
     pub fn boot_with(tag: &str, accept_from: &[&str], env: &[(&str, &str)]) -> Self {
         Self::boot_at(tag, accept_from, env, None)
     }
 
-    /// [`World::boot_with`] with the bridge pointed at `broker_at` INSTEAD of a broker this harness serves — a path nothing listens on, or a stub the test serves itself.
+    /// [`World::boot_with`] with the bridge pointed at `broker_at`.
     pub fn boot_at(
         tag: &str,
         accept_from: &[&str],
@@ -756,7 +727,7 @@ impl World {
         )
     }
 
-    /// [`World::boot_flags`] and [`World::boot_with`] at once: extra `serve` flags AND extra environment for the bridge child — a `--receipts` bridge under a fault the test arms.
+    /// [`World::boot_flags`] and [`World::boot_with`] combined.
     pub fn boot_flags_with(tag: &str, extra_serve_flags: &[&str], env: &[(&str, &str)]) -> Self {
         Self::boot_full(
             tag,
@@ -769,12 +740,12 @@ impl World {
         )
     }
 
-    /// [`World::boot`] with this world's broker opened with `opts` instead of aterm's Strict options — the same guard ([`broker_opts`]), only what an ack promises changes.
+    /// [`World::boot`] with this world's broker opened with `opts`.
     pub fn boot_opts(tag: &str, opts: OpenOptions) -> Self {
         Self::boot_full(tag, &[], &[], None, &[], None, opts)
     }
 
-    /// THE FABRIC BENCH'S ARM, whole: this world's broker opened with `opts` ([`World::boot_opts`]), RETAINED by aterm's default rules or not (`retained`: [`open_broker`] or [`open_broker_unretained`]), with extra `serve` flags for the bridge (`--log off`) and extra environment for the `aterm` instance, which the bridge child it launches inherits: the ping-pong arm's wait tally (`aterm_link::wait_tally::SEAM`, read by the bridge) and the handoff arm's quit seam (`ATERM_DEBUG_QUIT_BYE`, read by the instance, `aterm-gui` `fabric_launch.rs`).
+    /// Boots a world with custom broker options, retention flag, serve flags, and environment.
     pub fn boot_arm(
         tag: &str,
         opts: OpenOptions,
@@ -785,7 +756,7 @@ impl World {
         Self::boot_inner(tag, &[], env, None, extra_serve_flags, None, opts, retained)
     }
 
-    /// [`World::boot`] with the node's cap file holding `grants(node)` instead of the whole node ring — a bridge whose cap is short of something.
+    /// [`World::boot`] with the node's cap file holding `grants(node)`.
     pub fn boot_with_grants(tag: &str, grants: GrantsFor<'_>) -> Self {
         Self::boot_full(
             tag,
@@ -798,7 +769,7 @@ impl World {
         )
     }
 
-    /// A world whose broker keeps NO retention rules: a broker from before astream's R4, or one `aterm link broker` serves when its rules cannot be set ([`open_broker_unretained`]), the named unretaining case.
+    /// Boots a world whose broker keeps no retention rules.
     pub fn without_retention(tag: &str) -> Self {
         Self::boot_arm(
             tag,
@@ -972,7 +943,7 @@ impl World {
             .unwrap_or_else(|e| panic!("{line}: {e}"))
     }
 
-    /// A god-cap broker client for the test itself: the fleet root, which may publish under any producer id.
+    /// Connects a fleet-root broker client that can publish under any producer id.
     pub fn god(&self) -> Client {
         let mut c = broker_client(&self.broker_sock);
         let cap = astream_cap::mint(SECRET, &format!("/f/{FLEET}/>")).expect("mint the god cap");
@@ -980,7 +951,7 @@ impl World {
         c
     }
 
-    /// Run one broker READ (`last`, `fetch`) on this world's shared read connection — see [`read_on`] for why one is shared and what happens when a broker restart has closed it.
+    /// Runs one broker read on this world's shared read connection.
     pub fn read<T>(&self, f: impl FnMut(&mut Client) -> std::io::Result<T>) -> std::io::Result<T> {
         read_on(
             &self.watch,
@@ -997,7 +968,7 @@ impl World {
         )
     }
 
-    /// The body of the retained row at exactly `subject`, or `None` when there is none (or the read failed), over [`World::read`]'s connection.
+    /// Reads the retained row body at `subject` over [`World::read`].
     pub fn row(&self, subject: &str) -> Option<String> {
         let page = self.read(|c| c.last(subject, "", 8)).ok()?;
         exact_body(page, subject)
@@ -1074,7 +1045,7 @@ impl World {
         });
     }
 
-    /// AN ORDERING BARRIER for "the bridge published nothing more on the endpoint's behalf": `sid` posts a note to itself and waits for it to land.
+    /// Posts a drain-barrier note from `sid` to itself and waits for it to land.
     pub fn drained(&self, sid: &str) {
         let r = self.verb(&format!(
             "@{sid} post to=@{sid} kind=note --wait=60000 drain-barrier"
@@ -1111,12 +1082,12 @@ impl World {
         (first, second)
     }
 
-    /// A SECOND headless instance in this world's socket dir, with no fabric command and so no bridge of its own — what a node with two aterm windows looks like to the first one's bridge.
+    /// Spawns a second headless instance in this world's socket dir without a fabric command.
     pub fn sibling_instance(&mut self) -> Sibling {
         self.sibling_with(None)
     }
 
-    /// [`World::sibling_instance`] ARMED with this world's own fabric command, `--state` and all — what every later aterm launch on a machine where `fabric on` wrote `[fabric] command` looks like.
+    /// Spawns a [`World::sibling_instance`] armed with this world's fabric command.
     pub fn sibling_instance_armed(&mut self) -> Sibling {
         let fabric = std::fs::read_to_string(self.tmp.join("fabric.cmd"))
             .expect("this world's fabric command");
@@ -1162,7 +1133,7 @@ impl World {
         Sibling { child, sock, token }
     }
 
-    /// A SUCCESSOR INSTANCE on this world's node: one more headless `aterm` ARMED with this world's own fabric command — the same broker, cap file and `--state`, so its bridge is a second bridge on the one state dir — in a runtime dir of its own (`run-<n>`), so its control socket is its own and the world's stays where it is.
+    /// Spawns a successor headless instance in `run-<n>` armed with this world's fabric command.
     pub fn successor_instance(&self, n: usize, env: &[(&str, &str)]) -> Successor {
         self.scratch
             .keep
@@ -1215,7 +1186,7 @@ impl World {
         inbox_rows(&self.verb(&format!("@{sid} inbox --peek")))
     }
 
-    /// `@{from} post to=@{to} kind={kind} {flags} --wait=60000 {text}`, answered with its header and the offset it LANDED at.
+    /// Posts from `from` to `to` with `--wait=60000` and returns `(header, offset)`.
     pub fn post_landed(
         &self,
         from: &str,
@@ -1253,7 +1224,7 @@ impl World {
         self.ev_on(&format!("/f/{FLEET}/pub/{}/>", self.node))
     }
 
-    /// Every `ev` record under one face or filter, newest last — a single owner's (`subject::session_face`, `subject::node_face`) where [`World::ev`] reads them all.
+    /// Returns every `ev` record under `filter`, newest last.
     pub fn ev_on(&self, filter: &str) -> Vec<String> {
         self.read(|c| ev_rows(c, filter))
             .unwrap_or_else(|e| panic!("read the ev records under {filter}: {e}"))
@@ -1359,7 +1330,7 @@ pub fn off_of(header: &str) -> u64 {
         .unwrap_or_else(|| panic!("a landing offset in: {header}"))
 }
 
-/// The row id of `sid`'s `inbox` row at broker offset `off`, `--peek` so nothing is marked — the row a recipient is about to acknowledge.
+/// Returns the row id of `sid`'s `inbox` row at broker offset `off`.
 pub fn id_at_off(w: &World, sid: &str, off: u64) -> Option<u64> {
     w.inbox(sid).into_iter().find_map(|r| {
         (kv(&r, "off") == Some(&off.to_string()))
@@ -1368,10 +1339,10 @@ pub fn id_at_off(w: &World, sid: &str, off: u64) -> Option<u64> {
     })
 }
 
-/// One record for [`publish_pipelined`]: `(producer_id, producer_seq, subject, body)`, exactly the arguments of `Client::publish`.
+/// One record for [`publish_pipelined`]: `(producer_id, producer_seq, subject, body)`.
 pub type Record = (u64, u64, String, Vec<u8>);
 
-/// Publish `records` in order on `conn`, as a loop of `conn.publish` would, and answer each one's `(offset, deduped)` in that order — with the acks read BEHIND the sends (astream's pipelined publish), never one round trip each.
+/// Publishes `records` pipelined on `conn` and returns each record's `(offset, deduped)`.
 pub fn publish_pipelined(conn: &mut Client, records: &[Record]) -> Vec<(u64, bool)> {
     const WINDOW: usize = 128;
     let mut acks = Vec::with_capacity(records.len());
@@ -1429,7 +1400,7 @@ pub fn bridge_holds(w: &World, sid: &str, topic: &str) -> Option<()> {
         .then_some(())
 }
 
-/// How many push-lane watches aterm counts on `sid` — `who`'s `watchers=` — or `None` while `who` does not answer it, so a wait polls on. aterm registers a watch only after seeding it at the session's timeline high, and queues its `sub` ack in the same wake, ahead of every frame the watch drains (aterm-gui `subscribe.rs`).
+/// Returns the `watchers=` count reported by `who` for `sid`.
 pub fn watchers(w: &World, sid: &str) -> Option<u64> {
     let reply = w.verb("who");
     if !reply.ok() {
@@ -1445,7 +1416,7 @@ pub fn watchers(w: &World, sid: &str) -> Option<u64> {
         .ok()
 }
 
-/// The endpoint's debug-only PUSH HOLDS, armed by `$ATERM_TEST_PUSH_HOLD` (aterm-gui `subscribe.rs`, `push_held`).
+/// Debug-only push holds armed by `$ATERM_TEST_PUSH_HOLD`.
 pub struct Hold(aterm_tempfile::TempDir);
 
 impl Hold {
@@ -1496,7 +1467,6 @@ fn fnv(s: &str) -> u64 {
     h
 }
 
-/// Whether a pid is still alive (`kill(pid, 0)`).
 #[must_use]
 pub fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 is the liveness probe; it delivers nothing and touches no memory.
@@ -1504,7 +1474,7 @@ pub fn alive(pid: i32) -> bool {
 }
 
 impl World {
-    /// Relaunch `aterm` against the same scratch world — the same broker, the same bridge state dir, the same node id, the same fabric command.
+    /// Relaunches `aterm` against the same scratch world.
     pub fn relaunch_gui(w: &World) -> OwnedChild {
         let fabric_cmd = std::fs::read_to_string(w.tmp.join("fabric.cmd"))
             .expect("the boot recorded its fabric command");
@@ -1540,7 +1510,7 @@ impl World {
         Self::wait_for_token(sock, || {})
     }
 
-    /// [`World::wait_for_token_at`] for the instance this test just spawned as `child`, logging to `log`: a child that EXITS before it answers fails the wait at once, naming its exit status and its log's tail, rather than leaving the test to poll a socket nobody will ever bind until the deadline.
+    /// Waits for `child` to bind `sock` and return its token, failing early if `child` exits.
     pub fn wait_for_token_of(sock: &str, child: &mut Child, log: &Path) -> String {
         let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Self::wait_for_token(sock, || {
@@ -1594,7 +1564,7 @@ impl World {
     }
 }
 
-/// A second instance a [`World`] hosts beside its own ([`World::sibling_instance`]), reaped with the test.
+/// Second instance a [`World`] hosts beside its own ([`World::sibling_instance`]).
 pub struct Sibling {
     child: Child,
     /// Its per-pid control socket.
@@ -1610,7 +1580,7 @@ impl Drop for Sibling {
     }
 }
 
-/// A successor instance ([`World::successor_instance`]): killed and reaped with the test unless [`Successor::take`] hands it to the [`World`] it succeeds, which then tears it down as its own.
+/// Successor instance ([`World::successor_instance`]), reaped on drop unless taken.
 pub struct Successor {
     child: Option<OwnedChild>,
     lifeline: Option<aterm_uds::lifeline::Lifeline>,
@@ -1645,7 +1615,7 @@ impl Successor {
             .unwrap_or_default()
     }
 
-    /// Make it `w`'s own instance: its process, its control socket, its token and its log replace the ones `w` held, whose process must be gone.
+    /// Installs this successor as `w`'s own instance.
     pub fn take(mut self, w: &mut World) {
         w.gui = self.child.take();
         *w.lifeline
@@ -1675,7 +1645,7 @@ fn scratch_home(tmp: &std::path::Path) -> std::path::PathBuf {
     home
 }
 
-/// `cmd`, a one-shot `aterm link …` of the world at `tmp`, given that world's per-user folders ([`scratch_home`], and its `run` and `cfg`) and none of this process's `ATERM_*`: a CLI child reads `aterm.toml` and the state dir's `fabric.toml` as an instance does, and on the inherited `$HOME` those are the person's (2026-10-18: `link ls --fleet` and an observer's `link serve --fleet` read them).
+/// Configures `cmd` with the scratch directories of `tmp` and strips inherited `ATERM_*` variables.
 pub fn scratch_cli<'a>(cmd: &'a mut Command, tmp: &Path) -> &'a mut Command {
     prepare_gui_environment(cmd);
     cmd.envs(scratch_cli_env(tmp))
@@ -1695,9 +1665,6 @@ pub fn scratch_spawnfd<'a>(
     cmd.envs(scratch_cli_env(tmp))
 }
 
-/// An inherited variable a launch removes: every `ATERM_*` but the verify run's mark, which is
-/// no authority and stays, so the run that started this test can find what it launched
-/// (`aterm_uds::process::VERIFY_RUN_VAR`).
 fn stripped(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy();
     name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR
@@ -1711,12 +1678,12 @@ fn scratch_cli_env(tmp: &Path) -> [(&'static str, PathBuf); 3] {
     ]
 }
 
-/// One guarded broker served on a Unix socket in the fleet's scratch dir, and the nodes the tests boot against it: what needs two NODES, which one [`World`] cannot be.
+/// Multi-node test harness with one shared guarded broker in a scratch directory.
 pub struct Fleet {
     pub tmp: PathBuf,
     broker: Option<Broker>,
     handle: Option<BrokerHandle>,
-    /// The broker's socket, `<tmp>/b.sock`: `tmp` is per test and process, so parallel runs never clash.
+    /// The broker's socket path (`<tmp>/b.sock`).
     pub sock: String,
     next: u32,
     watch: std::sync::Mutex<Option<aterm_link::transport::Conn>>,
@@ -1743,7 +1710,7 @@ impl Fleet {
         Self::boot_opts(tag, broker_opts(aterm_link::durability::Durability::Strict))
     }
 
-    /// [`Fleet::boot`] with the broker opened with `opts` ([`broker_opts`]) instead of aterm's Strict options: the ordered suite's.
+    /// [`Fleet::boot`] with the broker opened with `opts`.
     pub fn boot_opts(_tag: &str, opts: OpenOptions) -> Self {
         let scratch = aterm_tempfile::Builder::new()
             .prefix("a5-")
@@ -1765,7 +1732,6 @@ impl Fleet {
         }
     }
 
-    /// The broker this fleet serves, in this process: what a test reads the durable head off, and asks for a full flush.
     #[must_use]
     pub fn broker(&self) -> &Broker {
         self.broker.as_ref().expect("the fleet serves its broker")
@@ -1780,7 +1746,7 @@ impl Fleet {
         c
     }
 
-    /// [`World::read`] on the fleet's broker: one broker READ on this fleet's shared read connection, where a fresh one per poll is a connect as well as the attach ([`read_on`]).
+    /// Runs one broker read on this fleet's shared read connection.
     pub fn read<T>(
         &self,
         f: impl FnMut(&mut aterm_link::transport::Conn) -> std::io::Result<T>,
@@ -1803,7 +1769,7 @@ impl Fleet {
         exact_body(page, subject)
     }
 
-    /// A cap file holding exactly `grants`, for a node id this fleet has not given a bridge — the rogue of §6.1, or an observer.
+    /// Writes a capability file holding `grants` in this fleet's scratch directory.
     pub fn cap_file(&self, name: &str, grants: &[String]) -> PathBuf {
         let path = self.tmp.join(format!("{name}.cap"));
         let caps: String = grants.iter().map(|g| cap_line(g)).collect();
@@ -1811,12 +1777,12 @@ impl Fleet {
         path
     }
 
-    /// Boot one node: a headless `aterm` that launches its own real `aterm link serve` child, both pointed at this fleet's broker.
+    /// Boots a headless `aterm` node and its `aterm link serve` bridge against this fleet's broker.
     pub fn node(&mut self, tag: &str, accept_from: &[&str]) -> Node {
         self.node_with(tag, accept_from, &[], &[])
     }
 
-    /// [`Fleet::node`] with extra `aterm link serve` flags and extra environment on the `aterm` the bridge is a child of.
+    /// [`Fleet::node`] with extra `aterm link serve` flags and environment variables.
     pub fn node_with(
         &mut self,
         tag: &str,
@@ -2035,7 +2001,7 @@ impl Node {
         })
     }
 
-    /// QUIT this node's aterm the way a person does — `invoke Quit`, which a headless instance takes without a confirm and ends through the same teardown as Cmd-Q — and wait for the process to end, then for its bridge to follow it: once the bridge is gone nothing more is published under this node but its will.
+    /// Quits this node's `aterm` via `invoke Quit` and waits for it and its bridge to exit.
     pub fn quit(&mut self) {
         let bridge = self.bridge_pid();
         let _ = self.ctl().request("invoke Quit");

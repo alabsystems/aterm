@@ -42,8 +42,6 @@ pub fn file_subsystem(path: &Path) -> Option<u16> {
 mod tests {
     use super::*;
 
-    /// The smallest header the reader accepts: `MZ`, the NT offset, `PE\0\0`
-    /// there, and `subsystem` at its offset.
     fn header(nt: usize, subsystem: u16) -> Vec<u8> {
         let mut head = vec![0u8; nt + 4 + 20 + 70];
         head[..2].copy_from_slice(b"MZ");

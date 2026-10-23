@@ -869,6 +869,7 @@ fn a_mirror_with_its_copies_and_no_pin_writes_one_at_its_hello() {
         b.state.set_inc_seam(crate::state::IncSeam::default());
         if !legacy {
             // Reopening loses every in-memory hint about a failed first
+            // fence. A visible v=2 still cannot stand for a successful flush.
             b.state = StateDir::open(b.state.root()).unwrap();
         }
         b.mirror_hello_answered("OK lane=2 build=b log=turns");
@@ -2460,7 +2461,7 @@ fn a_batch_owed_its_re_pin_sends_no_slot_at_its_old_sequence() {
     );
 }
 
-/// OFF IS NOTHING, IN TIME (the module doc): with the mirror off the loop's
+/// OFF IS NOTHING, IN TIME: with the mirror off the loop's
 /// park is judged BEFORE the round settles what the items before left owed,
 /// as it was before the mirror.
 #[test]

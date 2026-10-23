@@ -438,7 +438,9 @@ pub(crate) struct KeyedProbe {
 }
 
 impl KeyedProbe {
-    /// A probe standing where the recorded loop had read the first `seen` of the records `index`.
+    /// A probe standing where the recorded loop had read the first `seen` of
+    /// the records `index` holds (the tape's effects, by ordinal), its
+    /// requests written under `roots` and `seed` as the recording wrote them.
     pub(crate) const fn at(index: Arc<TapeIndex>, seen: usize, roots: Roots, seed: u64) -> Self {
         Self {
             index,

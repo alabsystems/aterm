@@ -16,7 +16,7 @@ const MOD_SHIFT: u8 = 1 << 3;
 /// The key portion of a [`Chord`], normalized so a config string and a live key event compare equal.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum KeyToken {
-    /// A printable character key, lowercased (`a`, `=`, ``).
+    /// A printable character key, lowercased (`a`, `=`, `[`).
     Char(char),
     /// A named non-printable key (Enter, Tab, Escape, F1, arrows, …).
     Named(NamedKey),
@@ -961,7 +961,7 @@ pub(crate) fn resolve_chord(
 /// Whether a `focus_pane_*` binding on `base` may give its press to the program when
 /// no pane lies that way ([`resolve_chord`]): only on an arrow key.
 #[must_use]
-fn pane_focus_passes_through(base: &WinitKey) -> bool {
+const fn pane_focus_passes_through(base: &WinitKey) -> bool {
     matches!(
         base,
         WinitKey::Named(

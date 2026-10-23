@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// A live-heap profiler for Windows, in-process: a `#[global_allocator]` shim that keeps,
-// per allocation site, the bytes still live (the Windows twin of the `LD_PRELOAD`
-// interposer in `docs/measured/memory-footprint-2026-08-24.md` §2).
-//
-// What it sees:
-//   * every `alloc`/`realloc`/`dealloc` through Rust's global allocator: every
-//     `Vec`/`Box`/`HashMap`/`Arc` in aterm and the Rust crates it links;
-//   * for allocations >= `MIN_TRACK` bytes, the return-address stack
-//     (`RtlCaptureStackBackTrace`, symbolized through dbghelp at report time).
-//     Symbolization has failed on Windows (`SymInitializeW` returns 1 with
-//     `GetLastError` 0, then every `SymFromAddr` fails), so `report` prints raw
-//     addresses and sites are identified by count and size
-//     (`docs/measured/win-heap-2026-08-29.md` §1). Unresolved: check the build triple
-//     (a `*-windows-gnu` build carries DWARF, which dbghelp cannot read) and whether
-//     the test exe's PDB is found (else pass its directory as the search path);
-//   * exact live and peak byte totals for all sizes.
-//
-// What it cannot see: anything outside Rust's global allocator (direct
-// `HeapAlloc`/`VirtualAlloc`/`malloc` from C/C++ libraries such as the D3D12 runtime,
-// the driver and DirectWrite; thread stacks; module images; file mappings), i.e. the
-// GPU stack and most of the OS footprint. Live bytes and working set are both
-// reported, so the allocator's retained-but-free arena shows as the gap.
-//
-// One report per process: the working set never shrinks back, so a second measurement
-// in the same process would measure the first one's freed arena.
+
+//! In-process live-heap profiler for Windows.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -34,14 +10,10 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-/// Allocations at least this large get a stack; smaller ones are only counted, and
-/// `report` prints the unattributed remainder. 512 B keeps the live map small and the
-/// capture cheap while still catching every font file buffer.
+/// Allocations at least this large get a stack.
 pub const MIN_TRACK: usize = 512;
 /// Return addresses captured per site.
 pub const FRAMES: usize = 16;
-
-// Win32
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -99,8 +71,7 @@ pub fn working_set_kb() -> u64 {
     (c.working_set_size / 1024) as u64
 }
 
-/// Private commit (pagefile usage) in kB — immune to trimming, unlike the
-/// working set.
+/// Private commit (pagefile usage) in kB — immune to trimming, unlike the working set.
 #[must_use]
 pub fn private_bytes_kb() -> u64 {
     let mut c = ProcessMemoryCounters {
@@ -120,8 +91,6 @@ pub fn private_bytes_kb() -> u64 {
     (c.pagefile_usage / 1024) as u64
 }
 
-// The allocator shim
-
 static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
 static PEAK_BYTES: AtomicI64 = AtomicI64::new(0);
 static LIVE_COUNT: AtomicI64 = AtomicI64::new(0);
@@ -129,8 +98,6 @@ static TOTAL_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static TRACKING: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    /// Reentrancy guard: the bookkeeping below allocates, and those allocations
-    /// must not be booked.
     static BUSY: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -145,9 +112,7 @@ struct Site {
 
 #[derive(Default)]
 struct State {
-    /// pointer -> (size, site index)
     live: HashMap<usize, (usize, u32)>,
-    /// stack hash -> site index
     by_stack: HashMap<u64, u32>,
     sites: Vec<Site>,
 }
@@ -185,7 +150,6 @@ impl Prof {
         }
         let mut frames = [std::ptr::null_mut::<c_void>(); FRAMES];
         let mut hash: u32 = 0;
-        // Skip this frame and the `GlobalAlloc::alloc` wrapper.
         let n = unsafe {
             RtlCaptureStackBackTrace(
                 2,
@@ -278,8 +242,7 @@ unsafe impl GlobalAlloc for Prof {
     }
 }
 
-/// Begin attributing allocations to stacks. Counting is always on; this only
-/// gates the (much more expensive) stack capture.
+/// Begin attributing allocations to stacks.
 pub fn start() {
     TRACKING.store(true, Ordering::SeqCst);
 }
@@ -313,8 +276,6 @@ pub fn mark(label: &str) {
         live_allocations()
     );
 }
-
-// Symbolization (dbghelp)
 
 #[link(name = "dbghelp")]
 unsafe extern "system" {
@@ -441,9 +402,6 @@ fn resolve(addr: usize) -> String {
 /// Print the top `top` allocation sites by live bytes, deepest frames first.
 pub fn report(title: &str, top: usize) {
     stop();
-    // The bookkeeping lock is not reentrant and everything below allocates (growing
-    // `rows` reallocs, re-entering `book_dealloc`, which would deadlock on the lock), so
-    // hold the alloc path's `BUSY` guard for the whole report.
     let outer = BUSY.with(|b| b.replace(true));
     let (mut rows, total_live, total_count) = {
         let st = lock();
@@ -487,7 +445,6 @@ pub fn report(title: &str, top: usize) {
         );
         for f in frames.iter().take(*depth) {
             let s = resolve(*f);
-            // Trim the noise frames that every stack shares.
             if s.starts_with("RtlUserThreadStart")
                 || s.starts_with("BaseThreadInitThunk")
                 || s.contains("__rust_begin_short_backtrace")
@@ -511,14 +468,10 @@ pub fn measure<T>(f: impl FnOnce() -> T) -> (T, i64, i64) {
     (out, (after - before) / 1024, (peak - before) / 1024)
 }
 
-/// One priced line item: run `f` and print the live heap it leaves behind, its own
-/// transient peak, the working-set delta and the time. Where [`report`] says which call
-/// site allocated, this says what one named step costs.
+/// Run `f` and print its live heap delta, transient peak, working-set delta, and duration.
 pub fn bill<T>(label: &str, f: impl FnOnce() -> T) -> T {
     let before = LIVE_BYTES.load(Ordering::Relaxed);
     let ws_before = working_set_kb();
-    // Re-arm the high-water mark at the current level, so the peak column is this
-    // step's own transient.
     PEAK_BYTES.store(before, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
     let out = f();

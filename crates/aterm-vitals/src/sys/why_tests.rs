@@ -23,8 +23,6 @@ struct World {
     tabs: Vec<TabFact>,
 }
 
-/// A world whose target is tab 1's one session (key 1), with `tabs` tabs
-/// (keys 1.., numbered 1..), on an OS of `family`.
 fn world(family: &'static str, tabs: u64) -> World {
     World {
         machine: Machine {
@@ -78,20 +76,16 @@ fn ctx<'a>(w: &'a World, s: &'a Snapshot, owner: bool) -> Ctx<'a> {
     }
 }
 
-/// The snapshot of the last of `readings`, through a fresh model.
 fn last(readings: &[crate::model::Sample]) -> Snapshot {
     let mut v = Vitals::new();
     let mut snaps: Vec<Snapshot> = readings.iter().map(|r| v.absorb(r)).collect();
     snaps.pop().expect("readings")
 }
 
-/// The snapshot of the last split tick of `windows` windows of `scene`.
 fn read(scene: &Scene, windows: u64) -> Snapshot {
     last(&scene.series(windows))
 }
 
-/// [`read`], its last split tick at the moment `scene` names (its `at_ms`,
-/// the second tick's): the calm Mac's 22:10:02.120, as plan §2.6 prints it.
 fn read_at(scene: &Scene, windows: u64) -> Snapshot {
     let later = i64::try_from((windows - 1) * scene.window_ms).unwrap_or(0);
     let scene = Scene {
@@ -101,8 +95,6 @@ fn read_at(scene: &Scene, windows: u64) -> Snapshot {
     read(&scene, windows)
 }
 
-/// `scene` with the calm Mac's memory and thermal readings, so what "nothing
-/// needed" rests on is read.
 fn read_calm(scene: Scene) -> Scene {
     let calm = calm_1510();
     Scene {
@@ -112,10 +104,6 @@ fn read_calm(scene: Scene) -> Scene {
     }
 }
 
-/// RD's 10:32 moment, read calm, held three windows so its last split tick
-/// reads 17:32:41.200Z and Spotlight's episode opened on the tick before;
-/// its busy figure easing, as RD's is (the slow average a core above the
-/// fast one), its footprint steady.
 fn example_a() -> Snapshot {
     let scene = Scene {
         at_ms: Some(1_792_517_551_200),
@@ -132,12 +120,10 @@ fn q(text: &str) -> SysQuery {
     SysQuery::parse(text).expect("query")
 }
 
-/// The reply as the server sends it: its header line, then its lines.
 fn wire(r: &Reply, c: &Ctx<'_>) -> String {
     wire_as(r, c, false)
 }
 
-/// [`wire`], its header saying ` delta=1` where `delta`.
 fn wire_as(r: &Reply, c: &Ctx<'_>, delta: bool) -> String {
     let mut t = r.header(c, delta);
     for l in &r.lines {
@@ -157,7 +143,6 @@ fn lines<'t>(text: &'t str, key: &str) -> Vec<&'t str> {
     text.lines().filter(|l| l.starts_with(&head)).collect()
 }
 
-/// A record's integer field.
 fn field(line: &str, key: &str) -> i64 {
     let head = format!("{key}=");
     line.split(' ')
@@ -186,10 +171,6 @@ cannot what=index_progress why=unsupported
 cannot what=index_folder why=needs_privilege:root
 ";
 
-/// RD §2.5's Example A, on the fixture's figures: nine listed coalitions
-/// (one answered nothing), so `n=9` and `more who=2`; launchd born at the
-/// fixture's 16:06:14. The CPU's trend is the busy figure's, never the
-/// footprint's (steady here).
 #[test]
 fn example_a_spotlight_after_start_up() {
     let w = mac();
@@ -205,8 +186,6 @@ fn example_a_spotlight_after_start_up() {
     assert!(bare.len() <= REPLY_MAX, "{} bytes", bare.len());
 }
 
-/// The split, the `who` rows, `more` and `withheld` all sum to the busy
-/// figure, for an owner and for a scoped caller, whose rows are withheld.
 #[test]
 fn the_rows_sum_to_the_split_and_a_scoped_caller_gets_the_sums() {
     let w = mac();
@@ -243,8 +222,6 @@ fn the_rows_sum_to_the_split_and_a_scoped_caller_gets_the_sums() {
     assert_eq!(lines(&two, "more"), ["more who=6 cpu_mc=1350"]);
 }
 
-/// A scoped caller sees the rows of a coalition whose live members are all
-/// in its own tab: an app its shell started outside aterm's coalition.
 #[test]
 fn a_scoped_caller_sees_its_own_tabs_coalition() {
     let mut scene = read_calm(spotlight_1032());
@@ -275,7 +252,6 @@ fn a_scoped_caller_sees_its_own_tabs_coalition() {
     assert_eq!(lines(&t, "withheld"), ["withheld who=9 cpu_mc=3600"]);
 }
 
-/// RD §2.6's Example B: a calm Mac's bare `why` is the sentence and `you`.
 #[test]
 fn example_b_a_calm_mac_is_two_lines() {
     let w = mac();
@@ -300,8 +276,6 @@ you tab=1 role=minor basis=machine_calm cpu_mc=120 share_pm=300
     assert_eq!(lines(&cpu, "pass"), ["pass trend=steady src=kernel"]);
 }
 
-/// Calm needs pressure, swap rates and the thermal state read: on an OS that
-/// reads no thermal state, a calm machine's bare `why` is never calm.
 #[test]
 fn a_bare_why_is_never_calm_without_the_thermal_state() {
     let w = world("Linux", 1);
@@ -318,14 +292,6 @@ fn a_bare_why_is_never_calm_without_the_thermal_state() {
     assert_eq!(subject_word(&q("why"), Some(&s)), Some("global.mem"));
 }
 
-/// RD §10's 11:42 memory (plan §2.7) on the calm Mac: its cache, free and
-/// the footprints of aterm, Safari and WindowServer as read there. The rest
-/// is the calm Mac's, not §2.7's: read at its 22:10:02.120 (§2.7 has
-/// 18:42:29.120), WindowServer born half a second after its start (§2.7's
-/// birth is a whole `ps` second), its few coalitions (`coalitions=6`,
-/// `more who=3`) and members (`live=3`, `1`, `1` where the evidence counts
-/// 26, 19 and 2), and the tab's own footprint, so `owners`, `more` and `you`
-/// differ from §2.7's too.
 fn mem_1142() -> Scene {
     let mut scene = calm_1510();
     scene.mem = Some(MemSample {
@@ -360,9 +326,6 @@ fn mem_1142() -> Scene {
     scene
 }
 
-/// The memory reply (plan §2.7): its classes, which sum to the total, the
-/// caller's footprint, every answering coalition's footprint summed on
-/// `owners`, the rows ranked by footprint.
 #[test]
 fn the_memory_reply_reads_its_classes_and_footprints() {
     let w = mac();
@@ -430,8 +393,6 @@ cannot what=uncharged_memory why=unsupported
     }
 }
 
-/// Another tab's build is `Tab 2's work` to the owner and `another tab's
-/// work` to a caller scoped to tab 1, who gets no line of it.
 #[test]
 fn another_tabs_work_is_named_only_to_the_owner() {
     let w = world("macOS", 2);
@@ -457,9 +418,6 @@ fn another_tabs_work_is_named_only_to_the_owner() {
     assert!(!j.contains("tab-work"), "{j}");
 }
 
-/// An app's work is `an app running as you` to every caller; only the
-/// owner's cause line names its coalition, in text and JSON, and no line's
-/// key does, so a scoped caller's `since=` reply never prints it either.
 #[test]
 fn app_work_names_its_coalition_only_to_the_owner() {
     let w = mac();
@@ -498,8 +456,6 @@ fn app_work_names_its_coalition_only_to_the_owner() {
     }
 }
 
-/// A world whose target tab holds two split panes, sessions 1 and 2, of
-/// which the target is session `key`.
 fn split_tab(key: u64) -> World {
     let mut w = world("macOS", 2);
     w.target.key = key;
@@ -511,8 +467,6 @@ fn split_tab(key: u64) -> World {
     w
 }
 
-/// The 10:32 moment with a second session (key 2, shell 1300) running 0.30
-/// cores in aterm's coalition.
 fn two_sessions_1032() -> Scene {
     let born = USERSPACE_MS + 210_000;
     let mut scene = read_calm(spotlight_1032());
@@ -538,8 +492,6 @@ fn two_sessions_1032() -> Scene {
     scene
 }
 
-/// [`two_sessions_1032`] with session 2 a split pane of tab 1: the split
-/// reads the two sessions as one tab.
 fn split_1032() -> Scene {
     let mut scene = two_sessions_1032();
     for t in &mut scene.tabs {
@@ -548,9 +500,6 @@ fn split_1032() -> Scene {
     scene
 }
 
-/// A tab of two split panes is both sessions: its CPU and footprint are
-/// theirs summed, and a scoped caller in it sees a coalition whose members
-/// sit under both, which a caller in either session's tab alone does not.
 #[test]
 fn a_split_tab_is_its_panes_summed() {
     let apart = read(&two_sessions_1032(), 3);
@@ -608,9 +557,6 @@ fn a_split_tab_is_its_panes_summed() {
     assert_eq!(field(lines(&t, "withheld")[0], "who"), 9, "{t}");
 }
 
-/// A tab split into panes is one tab to its cause as to its role: one
-/// `tab-work`, its panes' work summed against the floor, whether each pane
-/// alone is below the floor or both are above it.
 #[test]
 fn a_split_tabs_work_is_one_cause() {
     let tab_work = |t: &str| -> Vec<String> {
@@ -658,9 +604,6 @@ fn a_split_tabs_work_is_one_cause() {
     assert_eq!(field(lines(&t, "you")[0], "cpu_mc"), 1600, "{t}");
 }
 
-/// A scoped caller never sees a row of aterm's own coalitions, even one
-/// whose live members are all in its tab: in SA's 14:21 window tab 1's shell
-/// sits in a predecessor's coalition, which counts as aterm's.
 #[test]
 fn a_scoped_caller_never_sees_aterms_coalitions() {
     let w = world("macOS", 2);
@@ -688,9 +631,6 @@ fn a_scoped_caller_never_sees_aterms_coalitions() {
     assert!(!j.to_text().contains("55954"), "{}", j.to_text());
 }
 
-/// With no covering cause the first context that holds is the headline:
-/// memory pressure on the CPU and on memory, throttling on the CPU, each
-/// with its own evidence on its cause line.
 #[test]
 fn a_context_with_no_covering_cause_is_the_headline() {
     let w = mac();
@@ -730,10 +670,6 @@ fn a_context_with_no_covering_cause_is_the_headline() {
     );
 }
 
-/// The words of the causes no golden prints: Spotlight since a wake, whose
-/// `wake` line carries the wake's own evidence; work no cause names; aterm's
-/// own work; Low Power Mode alone; a tab the host does not number; and
-/// memory compressed.
 #[test]
 fn each_cause_says_its_own_words() {
     let w = mac();
@@ -811,9 +747,6 @@ fn each_cause_says_its_own_words() {
     assert!(t.contains("; 1.5 GiB compressed; "), "{t}");
 }
 
-/// With the lane off (macOS's self-check missed) and where there are no
-/// coalitions (Linux), the split is by subtraction, services hold the
-/// residual, and no coalition row prints.
 #[test]
 fn with_the_lane_off_the_split_is_by_subtraction() {
     let off = Scene {
@@ -848,8 +781,6 @@ fn with_the_lane_off_the_split_is_by_subtraction() {
     }
 }
 
-/// The 10:32 moment with ten more coalitions of 0.60 cores, each led by an
-/// app with a long name: more rows than 2,048 bytes hold.
 fn long_workers_1032() -> Scene {
     let mut scene = read_calm(spotlight_1032());
     let born = USERSPACE_MS + 60_000;
@@ -878,7 +809,6 @@ fn long_workers_1032() -> Scene {
     scene
 }
 
-/// `pressure` events `1..=n` at `at_ns`.
 fn pressure_events(n: u64, at_ns: u64) -> Vec<Event> {
     (1..=n)
         .map(|seq| Event {
@@ -892,8 +822,6 @@ fn pressure_events(n: u64, at_ns: u64) -> Vec<Event> {
         .collect()
 }
 
-/// `top=` cuts rows into `more`; a reply with no `top=` keeps to 2,048 bytes
-/// by moving rows into `more`, and an explicit `top=` lifts that cut.
 #[test]
 fn the_byte_cut_moves_rows_into_more_unless_top_is_given() {
     let s = read(&long_workers_1032(), 3);
@@ -924,10 +852,6 @@ fn the_byte_cut_moves_rows_into_more_unless_top_is_given() {
     assert!(lines(&with, "who").len() < shown, "{with}");
 }
 
-/// A `since=` reply's header may say ` delta=1`, and the cut counts it: over
-/// every length a reply lands at below the cut (two leads' names a byte
-/// longer at a time, beside a few events) none passes [`REPLY_MAX`] with it,
-/// and some would without it.
 #[test]
 fn the_cut_counts_a_since_replys_delta_header() {
     let base = read(&long_workers_1032(), 3);
@@ -961,8 +885,6 @@ fn the_cut_counts_a_since_replys_delta_header() {
     assert!(edge, "no reply came within ` delta=1` of the cut");
 }
 
-/// Every fixture, with and without the lane, keeps every default text reply
-/// to [`REPLY_MAX`] bytes with its header, for an owner and a scoped caller.
 #[test]
 fn every_default_text_reply_keeps_to_its_cut() {
     let scenes = [
@@ -997,8 +919,6 @@ fn every_default_text_reply_keeps_to_its_cut() {
     }
 }
 
-/// Every record carries at most one `src=`, and only a `cause` line names
-/// more than one source.
 #[test]
 fn one_src_per_record() {
     let w = mac();
@@ -1020,8 +940,6 @@ fn one_src_per_record() {
     }
 }
 
-/// While aterm's work is not all in its live processes, the tab pair is a
-/// bound, in text and in JSON, and the tab's share is not read.
 #[test]
 fn unattributed_work_bounds_the_tab_pair() {
     let w = mac();
@@ -1053,8 +971,6 @@ fn unattributed_work_bounds_the_tab_pair() {
     assert_eq!(you.get("role"), Some(&Jv::why("not_sampled")));
 }
 
-/// A registered delegated job bounds the tab from below, and its
-/// coalition's row says how much of it is the tab's.
 #[test]
 fn delegated_work_bounds_the_tab_from_below() {
     let w = mac();
@@ -1076,8 +992,6 @@ fn delegated_work_bounds_the_tab_from_below() {
     );
 }
 
-/// Before the lane's second tick there is no episode: the cause holds over
-/// the window with no `opened=`.
 #[test]
 fn a_cold_why_names_its_cause_with_no_opened() {
     let w = mac();
@@ -1103,8 +1017,6 @@ fn a_cold_why_names_its_cause_with_no_opened() {
     assert!(!t.contains("no cause open"), "{t}");
 }
 
-/// A `why` reply is as old as its split: on a reading between split ticks,
-/// `as_of` and `window_ms` are the last tick's.
 #[test]
 fn a_why_reply_is_as_old_as_its_split() {
     let scene = spotlight_1032();
@@ -1127,8 +1039,6 @@ fn a_why_reply_is_as_old_as_its_split() {
     assert!(g.contains(" as_of=17:32:42.200 age_ms=120 "), "{g}");
 }
 
-/// Every reply keeps the JSON contract, carries no sentence and splits the
-/// CPU into exactly the built parts.
 #[test]
 fn the_json_keeps_the_contract() {
     let scenes = [
@@ -1170,7 +1080,6 @@ fn the_json_keeps_the_contract() {
     }
 }
 
-/// [`EXAMPLE_A`] as JSON (plan §2.4), one line, broken here at its members.
 const EXAMPLE_A_JSON: &str = r#"{"schema":1,
 "kind":"sys.why",
 "as_of":{"unix_ms":1792517561200,"age_ms":120,"window_ms":5000,"cursor":"7f3a.7","state":"fresh"},
@@ -1193,7 +1102,6 @@ const EXAMPLE_A_JSON: &str = r#"{"schema":1,
 {"what":"index_folder","reason":{"why":"needs_privilege:root"}}],
 "events":[]}"#;
 
-/// The memory reply ([`mem_1142`], `top=3`) as JSON, broken the same way.
 const MEM_1142_JSON: &str = r#"{"schema":1,
 "kind":"sys.why",
 "as_of":{"unix_ms":1792534202120,"age_ms":120,"window_ms":5000,"cursor":"7f3a.7","state":"fresh"},
@@ -1218,8 +1126,6 @@ const MEM_1142_JSON: &str = r#"{"schema":1,
 {"what":"uncharged_memory","reason":{"why":"unsupported"}}],
 "events":[]}"#;
 
-/// Example A and the memory reply (plan §2.4) as JSON, whole: every key an
-/// agent reads, each unknown a `{"why": …}`, the sums as the text's.
 #[test]
 fn the_json_goldens() {
     let w = mac();
@@ -1231,7 +1137,6 @@ fn the_json_goldens() {
     assert_eq!(j, MEM_1142_JSON.replace('\n', ""));
 }
 
-/// A JSON figure's integer: a bare one, or a bound's `v`.
 fn int(j: &Jv) -> Option<i64> {
     match j {
         Jv::Int(n) => Some(*n),
@@ -1242,8 +1147,6 @@ fn int(j: &Jv) -> Option<i64> {
     }
 }
 
-/// The figure at `key` of each of `j`'s `who` rows, `more` and `withheld`,
-/// summed.
 fn rows_sum(j: &Jv, key: &str) -> i64 {
     let who: i64 = match j.get("who") {
         Some(Jv::Arr(rows)) => rows.iter().filter_map(|r| r.get(key).and_then(int)).sum(),
@@ -1255,9 +1158,6 @@ fn rows_sum(j: &Jv, key: &str) -> i64 {
         .sum::<i64>()
 }
 
-/// The JSON's sums close as the text's do: the split is the figure and
-/// equals the text's `split` line; the rows, `more` and `withheld` with the
-/// residual are the figure (the CPU) or `owners` (memory).
 #[test]
 fn the_json_sums_close_as_the_text_does() {
     let scenes = [
@@ -1315,10 +1215,6 @@ fn the_json_sums_close_as_the_text_does() {
     }
 }
 
-/// No name a process chose prints unless it is a word: a lead's image name
-/// and the wake reason print `-` where they are not one, and a team id that
-/// is not ten capitals or digits does not print, in text and JSON, to the
-/// owner and to a scoped caller where its own tab's row shows.
 #[test]
 fn names_print_only_as_words() {
     let mut scene = read_calm(spotlight_1032());
@@ -1381,9 +1277,6 @@ fn names_print_only_as_words() {
     );
 }
 
-/// A footprint the kernel did not write is an unknown wherever it is
-/// summed, never a 0: `more`, `withheld` and `owners` say so, in text and
-/// JSON, while the rows it read keep their figures.
 #[test]
 fn an_unread_footprint_is_never_summed_as_zero() {
     let mut s = read(&mem_1142(), 3);
@@ -1435,9 +1328,6 @@ fn an_unread_footprint_is_never_summed_as_zero() {
     }
 }
 
-/// A coalition the window did not measure reads its CPU as an unknown, never
-/// a measured 0: its work is the residual's, so the measured rows with
-/// `unaccounted` still close on the figure, in text and JSON.
 #[test]
 fn an_unmeasured_coalition_reads_no_cpu() {
     let mut s = example_a();
@@ -1496,8 +1386,6 @@ fn an_unmeasured_coalition_reads_no_cpu() {
     );
 }
 
-/// `since=` folds every record the next reply repeats, the `who` rows and
-/// the sums among them.
 #[test]
 fn since_folds_every_unchanged_record() {
     let w = mac();
@@ -1528,7 +1416,6 @@ fn since_folds_every_unchanged_record() {
     assert_eq!(kept, ["same", "more"]);
 }
 
-/// The header's `subject=`: the asked subject, or the bare reply's choice.
 #[test]
 fn the_subject_word_is_the_replys() {
     let calm = read(&calm_1510(), 3);

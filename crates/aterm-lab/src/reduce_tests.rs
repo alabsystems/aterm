@@ -375,6 +375,7 @@ fn same_text(
                 let id_key = ka != kb && placeholder_id(kb);
                 if ka == kb && is_ident(ka) {
                     // Kept as written: the vendor's schema outside a free
+                    // subtree; inside one, held to the 8-byte rule.
                     if free {
                         (ctx.check)("a key in a free subtree", kb)?;
                     }

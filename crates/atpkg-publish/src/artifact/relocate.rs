@@ -348,8 +348,9 @@ fn stock_vendor_refusal(base: &str, src: &Path, place: &str) -> String {
 }
 
 /// Copy `src` → `<to.dir>/<base>` once (from inside a donor root only, byte-identical
-/// before the re-sign, recorded), make its own id portable, and re-sign ad hoc.
-///
+/// before the re-sign, recorded), make its own id portable, and re-sign ad hoc. Returns
+/// whether a new file was vendored, so the caller chases its deps. Records an unresolved
+/// entry when the source is missing or outside every donor root.
 /// # Errors
 /// A stock toolchain's library (checked on the path as named and as resolved, before
 /// anything is read or written), or a copy that differs from its donor.
@@ -804,10 +805,12 @@ pub mod elf {
             Ok(ObjectRefs { id, needed, rpaths })
         }
         fn set_id_portable(&self, path: &Path, basename: &str) -> Result<(), String> {
+            // An ELF soname is a bare name (never machine-local); normalize to the
             // basename so consumers resolve it by name via the vendored rpath.
             patchelf(&["--set-soname", basename], path)
         }
         fn repoint_dep(&self, path: &Path, from: &str, basename: &str) -> Result<(), String> {
+            // ELF DT_NEEDED is a soname, not an absolute path, so this only fires
             // if a builder emitted an absolute NEEDED (rare) — normalize it.
             patchelf(&["--replace-needed", from, basename], path)
         }

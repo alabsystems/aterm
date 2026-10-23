@@ -310,6 +310,8 @@ impl WindowState {
     }
 
     pub fn configure(&mut self, configure: WindowConfigure) -> bool {
+        // NOTE: when using fractional scaling or wl_compositor@v6 the scaling
+        // should be delivered before the first configure, thus apply it to
         // properly scale the physical sizes provided by the users.
         if let Some(initial_size) = self.initial_size.take() {
             self.size = initial_size.to_logical(self.scale_factor());
@@ -766,6 +768,7 @@ impl WindowState {
 
     /// Sets the window title, truncating at 1024 bytes.
     pub fn set_title(&mut self, mut title: String) {
+        // Truncate the title to at most 1024 bytes, so that it does not blow up the protocol
         // messages
         if title.len() > 1024 {
             let mut new_len = 1024;

@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACE TABLE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.6.0): every face the Autopilot chip wears for every state of its glass (§§9.2–9.5), its inks, its whole and short titles and its spoken label; its glyph-only rung; the default glass giving v1's chip exactly; and the repaint term's bit table.
+//! Autopilot chip face table, title, ink, and repaint term tests.
 
 use super::*;
 
 use aterm_agent::harness::acts::{Act, TaskFace};
 
-/// The footer's mark accent, as a theme gives it: Cruise's ink.
 const ACCENT: [u8; 3] = [0, 128, 255];
 
 fn blank() -> RenderCell {
@@ -23,16 +22,12 @@ fn text(cells: &[RenderCell]) -> String {
     cells.iter().map(|c| c.ch).collect()
 }
 
-/// 18:00, 16:00 and 17:42 as the glass carries them.
 fn clock(h: u16, m: u16) -> Clock {
     Clock::of_minute(h * 60 + m)
 }
 
-/// The local day the table's faces were told on, and the day its titles are
-/// read against: a Friday (2024-10-11).
 const TODAY: i64 = 20_007;
 
-/// The stamp of `h:m` on [`TODAY`].
 fn stamp(h: u16, m: u16) -> Stamp {
     Stamp {
         clock: clock(h, m),
@@ -40,7 +35,6 @@ fn stamp(h: u16, m: u16) -> Stamp {
     }
 }
 
-/// A timer landing at `h:m`, on another day where `day` names one.
 fn timer(h: u16, m: u16, day: Option<Weekday>) -> ChipGlass {
     ChipGlass {
         land_at: Some(LandAtGlass {
@@ -51,7 +45,6 @@ fn timer(h: u16, m: u16, day: Option<Weekday>) -> ChipGlass {
     }
 }
 
-/// The task's face told at 17:42.
 fn told(face: TaskFace) -> ChipGlass {
     ChipGlass {
         task: Some(face),
@@ -60,8 +53,6 @@ fn told(face: TaskFace) -> ChipGlass {
     }
 }
 
-/// The task's face told at 17:42, under a timer landing at `h:m` (on another
-/// day where `day` names one).
 fn told_under(face: TaskFace, h: u16, m: u16, day: Option<Weekday>) -> ChipGlass {
     ChipGlass {
         land_at: timer(h, m, day).land_at,
@@ -69,10 +60,6 @@ fn told_under(face: TaskFace, h: u16, m: u16, day: Option<Weekday>) -> ChipGlass
     }
 }
 
-/// One state of the chip: its view and its glass, and what the table gives
-/// it — the face as drawn, its glyph-only rung, its inks, its whole title
-/// (no trail; the menu's line last, as every Autopilot chip's menu opens),
-/// its short title and its spoken label.
 struct Row {
     view: AutopilotView,
     glass: ChipGlass,
@@ -85,9 +72,6 @@ struct Row {
     spoken: String,
 }
 
-/// Every state of §§9.2–9.5 and §10.2, in the words of the design; each
-/// mode's sentence read from the one table (`autopilot::MODE_WORDS`,
-/// §12.4.1), never a copy of its words.
 fn rows() -> Vec<Row> {
     use crate::autopilot::mode_words;
     use ChipTone::{Accent, Amber, Dim};
@@ -301,7 +285,6 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The ink a tone takes in a row of `blank`'s, under the test accent.
 fn ink(tone: ChipTone) -> [u8; 3] {
     match tone {
         ChipTone::Accent => ACCENT,
@@ -310,17 +293,12 @@ fn ink(tone: ChipTone) -> [u8; 3] {
     }
 }
 
-/// `view` with `glass` folded into a window's lights, as a frame folds it.
 fn lights(view: AutopilotView, glass: ChipGlass) -> WindowLights {
     let mut w = WindowLights::default();
     w.note_autopilot_at(7, view.mode(), view, glass, Instant::now);
     w
 }
 
-/// EVERY STATE: each view and glass of §§9.2–9.5 wears its face — drawn in
-/// its inks, the timer's `∞` in Cruise's and its `⤓18:00` in Land's — with
-/// its whole title, its short title (the mode phrase) and its spoken label;
-/// and every face of the table is some state's.
 #[test]
 fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
     let now = Instant::now();
@@ -420,10 +398,6 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
     }
 }
 
-/// CRUISE NEVER RESTS: over view × task face × timer, under Cruise every
-/// face — a landing a loop under Land told, a person's own exchange, open,
-/// unknown — reads `Cruise`, or `CruiseUntil` with the timer: Cruise takes
-/// nothing as the end.
 #[test]
 fn under_cruise_no_task_face_shows_and_land_wears_its_own() {
     let faces = std::iter::once(None).chain(TaskFace::ALL.into_iter().map(Some));
@@ -464,12 +438,6 @@ fn under_cruise_no_task_face_shows_and_land_wears_its_own() {
     );
 }
 
-/// EVERY FACE CLOCK NAMES ITS DAY WHEN IT IS NOT TODAY (§10.2.3 items 3
-/// and 4; §10.2.5, "The day"): read against the day after the faces were
-/// told, each task's end carries its weekday in the whole title, the short
-/// title (`autopilot: land, landed Fri 17:42`) and the spoken label
-/// (`Landed on Friday at 17:42.`); read against its own day, or with no day
-/// read at all (a title laid with no reading), none does — the clock stands.
 #[test]
 fn every_face_clock_names_its_day_when_it_is_not_today() {
     let tomorrow = Some(TODAY + 1);
@@ -511,10 +479,6 @@ fn every_face_clock_names_its_day_when_it_is_not_today() {
     assert_eq!(short, "autopilot: land, quiet");
 }
 
-/// EACH MODE PHRASE HOLDS NO ` — ` AND NO ` · `: the short title is the
-/// phrase whole, with a trail or without one, the menu's line always last —
-/// so a narrow rule shows the mode, and the whole title always keeps the
-/// explanation ahead of the trail and says the menu is there (§9.3.2).
 #[test]
 fn each_mode_phrase_holds_no_cut_mark() {
     for row in rows() {
@@ -611,10 +575,6 @@ fn each_mode_phrase_holds_no_cut_mark() {
     assert_eq!(lean_titles("autopilot: cruise"), [("", ""); LEAN_FORMS]);
 }
 
-/// EVERY FACE KEEPS ITS CLICKS AFTER ITS EXPLANATION (Claude Code 2.1.302: hovering
-/// `∞ ✓ done` on a 160-column rule showed `autopilot: cruise, done 13:04`
-/// alone, its explanation and both clicks gone below about 240 columns,
-/// where main before wave 1 kept `click: land` from 120).
 #[test]
 fn every_face_keeps_its_clicks_after_its_explanation() {
     use aterm_agent::harness::footer::{self, FooterFacts, LightsWidth, TitleFit};
@@ -682,7 +642,6 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
     };
     for row in rows() {
         if row.view == AutopilotView::Unhosted {
-            // No Autopilot chip is drawn in Claude Code's rule with no host.
             continue;
         }
         let what = format!("{:?} {:?}", row.view, row.glass);
@@ -795,8 +754,6 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
     );
 }
 
-/// EACH SPOKEN LABEL HOLDS NO GLYPH: letters, digits, spaces and `.:,`
-/// alone — the chip's label, and its description of the newest act.
 #[test]
 fn each_spoken_label_holds_no_glyph() {
     let words = |text: &str| {
@@ -832,9 +789,6 @@ fn each_spoken_label_holds_no_glyph() {
     );
 }
 
-/// EACH `GlyphOnly` RUNG is the face's rung alone, in the glyph's ink —
-/// `∞`, `⤓`, `✓`, `○`, `⊘` — with every other chip given up, and measured
-/// as laid out.
 #[test]
 fn each_glyph_only_rung_is_the_glyph_alone() {
     let now = Instant::now();
@@ -889,8 +843,6 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
     );
 }
 
-/// A NARROW RULE GIVES A STANDING FACE DOWN TO ITS GLYPH (§9.3.2), and v1's
-/// faces as v1 did.
 #[test]
 fn a_narrow_rule_gives_a_standing_face_down_to_its_glyph() {
     let now = Instant::now();
@@ -941,10 +893,6 @@ fn a_narrow_rule_gives_a_standing_face_down_to_its_glyph() {
     }
 }
 
-/// THE DEFAULT GLASS IS v1's CHIP: for every view its face, inks, titles
-/// (no trail: v1's words, then the menu's line, §9.2.1) and repaint term
-/// are v1's, so nothing a person sees moves until a fact is told but the
-/// title's offer of the menu.
 #[test]
 fn the_default_glass_is_v1s_chip() {
     let now = Instant::now();
@@ -983,10 +931,6 @@ fn the_default_glass_is_v1s_chip() {
     assert_eq!(glass_bits(rest, true), 0);
 }
 
-/// THE AUTOPILOT TITLE IS SIZED ONCE: built on every frame a hover or a
-/// selection is up, a face of v1's costs two allocations — the whole title
-/// and the short — as v1's copies of its static titles did, the menu's line
-/// sized in; never one regrowth per part.
 #[test]
 fn the_autopilot_title_is_sized_once() {
     let rest = ChipGlass::default();
@@ -1017,7 +961,6 @@ fn the_autopilot_title_is_sized_once() {
     assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
 }
 
-/// What [`glass_bits`] packed, read back by §9.2.3's table.
 #[derive(Debug, PartialEq, Eq)]
 struct Unpacked {
     lit: Option<Act>,
@@ -1078,11 +1021,6 @@ fn unpack(term: u64) -> Unpacked {
     }
 }
 
-/// THE BIT TABLE ROUND TRIPS: every act, face, timer minute (the
-/// day's first and last among them), other-day bit, trail generation and
-/// other day's weekday (bits 56–58, 2c74954acc) packs into its own bits
-/// and reads back — open reading as unknown (both
-/// draw Land's own face), and the trail only while the title is read.
 #[test]
 fn the_autopilot_terms_bit_table_round_trips() {
     let acts = std::iter::once(None).chain(Act::ALL.into_iter().map(Some));
@@ -1149,9 +1087,6 @@ fn the_autopilot_terms_bit_table_round_trips() {
     assert_eq!(term >> 24, glass_bits(glass, false) >> 24);
 }
 
-/// THE TRAIL'S GENERATION COUNTS ONLY WHILE THE TITLE IS READ: an act that
-/// lights nothing moves the term only for the session whose Autopilot chip
-/// is hovered or selected — not another chip of it, not another session.
 #[test]
 fn the_trail_moves_the_term_only_while_the_chip_is_read() {
     let now = Instant::now();
@@ -1176,11 +1111,6 @@ fn the_trail_moves_the_term_only_while_the_chip_is_read() {
     assert_ne!(term(&w, 3), term(&w, 4), "the keyboard reads it");
 }
 
-/// A FACE THAT KEEPS ITS KIND AND MOVES ITS CLOCK REPAINTS A TITLE BEING
-/// READ (§10.2, the title carries the face's clock, `landed 17:42`
-/// then `landed 18:05`): the footer's term moves while the Autopilot chip is
-/// hovered, and not while no one reads its title, which a frame at rest
-/// does not draw.
 #[test]
 fn a_face_clock_that_moves_under_its_face_repaints_the_title_being_read() {
     let mut app = App::headless_for_test();
@@ -1221,9 +1151,6 @@ fn a_face_clock_that_moves_under_its_face_repaints_the_title_being_read() {
     assert_eq!(term(&w, clock_alone), read);
 }
 
-/// THE ACT'S LABEL is its glyph and word in the chip's ink, and the clock
-/// and the weekday are the table's: `HH:MM` both ways, 1970-01-01 a
-/// Thursday.
 #[test]
 fn the_acts_label_and_the_glass_clock_are_the_tables() {
     assert_eq!(
@@ -1249,14 +1176,6 @@ fn the_acts_label_and_the_glass_clock_are_the_tables() {
     );
 }
 
-/// LAND'S AMBER CLEARS THE TEXT FLOOR ON EVERY BUILT-IN THEME (the surfaces
-/// hunt's F2: `⤓ land` was the fixed `#E8B03C`, 1.88:1 on Aterm Day's
-/// `#f8fafd`): drawn on each built-in scheme's own ground, every amber cell
-/// — Land's `⤓ land`, its `✓ done`, a timed Cruise's `⤓18:00` and Land's act
-/// label — clears 4.5:1, the floor chrome's warn ink takes on the same
-/// themes (`chrome_band`'s `band_colors_meet_wcag_aa_on_every_builtin_scheme`);
-/// where the amber already clears it (the dark themes) it is the amber
-/// itself, the auto pill's hue.
 #[test]
 fn lands_amber_clears_the_text_floor_on_every_builtin_theme() {
     use crate::chrome_band::contrast;
@@ -1320,13 +1239,6 @@ fn lands_amber_clears_the_text_floor_on_every_builtin_theme() {
     );
 }
 
-/// THE PERMISSION LIGHT'S OWN HUE CLEARS THE SAME FLOOR (the honest chip's
-/// review, F2's defect on the light beside Land's chip): the mode
-/// light in Claude Code's bypass red or auto amber — drawn at rest only where
-/// it deviates, and in those hues where it is hovered or selected, just
-/// switched, refused or revealed — is floored on each built-in scheme's own
-/// ground as Land's amber is, its glyph and its word alike, and is the hue
-/// itself wherever that already clears 4.5:1 (every dark theme).
 #[test]
 fn the_lights_own_hue_clears_the_text_floor_on_every_builtin_theme() {
     use crate::chrome_band::contrast;
@@ -1379,11 +1291,6 @@ fn the_lights_own_hue_clears_the_text_floor_on_every_builtin_theme() {
     }
 }
 
-/// WHAT THE TITLE SAYS BESIDE THE GLASS, ON EVERY FACE
-/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.1, §12.3.1; the W4
-/// title slice): every face of the table, with no hold and no need, with a
-/// harness's need, with Land's hold read (`not landed yet: …`) and unread
-/// (`landing since …`), and with a hold and a need together.
 #[test]
 fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
     use crate::harness_glass::hold_tests::{ask, glass, held, unread};
@@ -1506,11 +1413,6 @@ fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
     }
 }
 
-/// A NEED IN THE TITLE KEEPS ITS CUT MARKS (§12.2.3 item 6): a
-/// worker's need holding ` · last: `, ` · click: ` and ` — ` gives a title
-/// with the very words and the same four lean forms as the need already
-/// written with `, ` — under a pause and a trail, so every cut stands — on
-/// every face a harness explains.
 #[test]
 fn a_need_in_the_title_keeps_its_cut_marks() {
     use crate::harness_glass::PauseGlass;
@@ -1570,15 +1472,6 @@ fn a_need_in_the_title_keeps_its_cut_marks() {
     }
 }
 
-/// A HELD LANDING KEEPS THE TITLE'S FOUR LEAN FORMS (§12.3.1):
-/// under `⤓ land` with a read hold whose need holds ` · ` and ` — `, a
-/// pause and a trail, every leg's words hold no ` — `, ` · last: ` or ` ·
-/// pausing until `; the four lean forms stand (without the trail; v1's
-/// words, the hold kept; the clicks; the click), the last two with no hold;
-/// and what a screen reader hears ([`App::autopilot_spoken`], the
-/// accessibility node's and `chrome`'s words) is the face's label, unchanged
-/// (`Autopilot: land.`, the painted word in it), and a description that
-/// leads with the hold, glyph-free.
 #[test]
 fn a_held_landing_keeps_the_titles_four_lean_forms() {
     use crate::harness_glass::hold_tests::{ask, glass, held};
@@ -1668,10 +1561,6 @@ fn a_held_landing_keeps_the_titles_four_lean_forms() {
     assert!(description.contains(" Pausing until "), "{description}");
 }
 
-/// THE HANDS-OFF FACES AND THE ROW'S INK READ ON EVERY GROUND (design §8):
-/// the chips' dim ([`dim_of`]) — `○ off`, `⊘ off`, the unhosted chip, a
-/// worker's label — is the row's ink halfway to its ground, a word greyed
-/// on purpose, and the row's ink (a light's word, `✋ you`) is the pane's own.
 #[test]
 fn the_dim_faces_and_the_rows_ink_read_on_every_ground() {
     use aterm_effects::cli_marks::{ICON_CONTRAST, NAME_CONTRAST};

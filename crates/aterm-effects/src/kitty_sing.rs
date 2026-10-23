@@ -225,6 +225,8 @@ impl KittySing {
     #[inline]
     fn rekey(&mut self, now: Instant, session: u64) {
         if self.session != Some(session) {
+            // A fired celebration belongs to its session: a switch cuts it into
+            // its wind-down (the outro still plays). A pending arm is
             // session-bound by its own field and waits.
             if let Some(ext) = self.external
                 && self.wind_from.is_none()
@@ -241,6 +243,8 @@ impl KittySing {
     /// (never a hard cut); an unarmed run just clears.
     #[inline]
     fn release(&mut self, at: Instant) {
+        // A fired celebration has no key under it: typing over it clears the
+        // run bookkeeping and leaves the bars playing to their line. Only
         // `settle` (drive 0) or a session switch ends it early.
         if self.external.is_some() && self.wind_from.is_none() {
             self.run = None;
@@ -250,6 +254,7 @@ impl KittySing {
             return;
         }
         if self.armed_at.is_some() && self.wind_from.is_none() {
+            // A lazy release may already have begun the fade; keep the earlier
             // instant so the crossfade never jumps back up.
             self.wind_from = Some(self.lazy_release().map_or(at, |lazy| lazy.min(at)));
         }
@@ -259,7 +264,9 @@ impl KittySing {
         self.handover_from = None;
     }
 
-    /// The song signature the held character sings.
+    /// The song signature the held character sings from: the one `u32` the synth derives
+    /// every per-key axis from (verse melody walk, root transpose, mode rotation;
+    /// `trail_sound::design_celebration`), or [`NEUTRAL_SIGNATURE`] when nothing is held.
     #[inline]
     #[must_use]
     pub const fn signature(&self) -> u32 {
@@ -325,6 +332,8 @@ impl KittySing {
             return;
         }
         if self.run == Some(ch) {
+            // Key repeat is wall time: a batched IME commit of a repeated string hands
+            // every char one `now`, so count only when real time has elapsed, or a
             // single commit could arm.
             if self.last.is_none_or(|l| now > l) {
                 self.count = self.count.saturating_add(1);
@@ -425,7 +434,7 @@ impl KittySing {
         Some(bar)
     }
 
-    /// A drained detector at rest is byte-identical.
+    /// A drained detector at rest is byte-identical off — the idle contract.
     #[inline]
     pub fn settle(&mut self, now: Instant) {
         if self.armed_at.is_some() && !self.has_drive(now) {

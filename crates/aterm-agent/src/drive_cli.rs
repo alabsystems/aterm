@@ -724,6 +724,7 @@ fn replay_args(args: &[String]) -> Result<ReplayArgs, String> {
     let more: Vec<PathBuf> = files.collect();
     if check {
         // A corpus check replays every tape whole, in acts mode: it names no
+        // point, and decides nothing again.
         if why || at.is_some() || format.is_some() || shadow || options.until.is_some() {
             return Err(format!(
                 "--check takes only FILEs, DIRs, and --set/--policy: {USAGE}"

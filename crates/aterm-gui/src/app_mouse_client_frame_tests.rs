@@ -21,11 +21,6 @@ const FRAME: ClientFrame = ClientFrame {
     layout: crate::client_frame::ButtonLayout::FALLBACK,
 };
 
-/// A headless window at scale 1 that draws its own frame (or, with `None`, one the
-/// window system decorates), with the default padding (12 px, 2 on top), sized
-/// exactly around its grid, that padding and, as [`App::strip_rows_for`] gives a
-/// framed window, its header row: the same geometry on every host (Linux pins the
-/// frame to the window's top, macOS centres it).
 fn framed(frame: Option<ClientFrame>) -> (App, WindowId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -54,7 +49,6 @@ fn framed(frame: Option<ClientFrame>) -> (App, WindowId) {
     (app, wid)
 }
 
-/// The window's size in px, as [`framed`] made it.
 fn size(app: &App, wid: WindowId) -> (f64, f64) {
     let px = app.windows[&wid].win_px.expect("a sized window");
     (f64::from(px.width), f64::from(px.height))
@@ -125,9 +119,6 @@ fn a_press_on_a_handle_goes_no_further() {
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
 }
 
-/// `window_padding = 0`: the grid fills the window's sides and bottom exactly, so
-/// its first and last columns and its last row reach the window's edges. They stay
-/// the grid's (a selection, a program's mouse report), never a resize handle's.
 #[test]
 fn at_no_padding_the_edge_cells_stay_the_grids() {
     let (mut app, wid) = framed(Some(FRAME));
@@ -177,8 +168,6 @@ fn at_no_padding_the_edge_cells_stay_the_grids() {
     assert_eq!(app.windows[&wid].frame_edge, Some(FrameEdge::West));
 }
 
-/// A window that draws its own frame needs its header, so the strip keeps a row at
-/// `tab_strip_rows = 0` while one does, and gives it back with the frame.
 #[test]
 fn a_framed_window_keeps_its_header_row_at_no_strip() {
     let (mut app, wid) = framed(Some(FRAME));
@@ -229,7 +218,6 @@ fn a_window_the_system_decorates_keeps_no_strip() {
     assert!(app.windows[&wid].tab_segments.is_empty());
 }
 
-/// The header strip of a framed window, laid out by the splice.
 #[cfg(any(windows, target_os = "linux"))]
 fn header(app: &mut App, wid: WindowId) -> Vec<crate::tab_bar::TabSegment> {
     app.tab_strip_rows = 1;
@@ -237,7 +225,6 @@ fn header(app: &mut App, wid: WindowId) -> Vec<crate::tab_bar::TabSegment> {
     app.windows[&wid].tab_segments.clone()
 }
 
-/// The window pixel at the middle of strip column `col`.
 #[cfg(any(windows, target_os = "linux"))]
 fn strip_point(app: &App, wid: WindowId, col: u16) -> (f64, f64) {
     let (cw, ch) = app.win_cell_size(wid);
@@ -303,9 +290,6 @@ fn a_window_the_system_decorates_has_no_buttons() {
     );
 }
 
-/// The bare band of a framed window is caption: a press arms the move (which the
-/// press's first real motion starts), its release disarms it, and a second press
-/// within the double-click window toggles maximize instead of arming.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_bare_band_arms_a_move_and_a_double_click_does_not() {

@@ -73,7 +73,9 @@ impl<V: Host> AgentPhase<V> {
         }
     }
 
-    /// What the phase's age counts.
+    /// What the phase's age counts from: its phase word, a box by the kind it
+    /// names ([`super::prompt_band_word`]), so a box that follows another
+    /// starts its own age.
     pub(super) fn age_key(&self) -> Cow<'static, str> {
         match self {
             Self::Prompt { detail } => super::prompt_band_word(detail.as_deref()).into(),
@@ -165,7 +167,7 @@ pub struct MailLast {
 pub struct MailFacts {
     /// Unread rows.
     pub unread: u64,
-    /// Rows delivered, not yet seen.
+    /// Rows delivered, not yet seen through.
     pub pending: u64,
     /// Rows dropped.
     pub dropped: u64,
@@ -645,6 +647,7 @@ impl<V: Host> Slot<V> {
         }
         let starts = facts.program_turn_starts;
         if self.turn != facts.turn {
+            // A carried record settled in a previous process: the baseline,
             // not news (see [`TurnFact::carried`]).
             if let Some(t) = facts.turn
                 && !t.carried
@@ -662,6 +665,7 @@ impl<V: Host> Slot<V> {
                                 && told.starts == starts
                                 && began_in(told.began, opened) =>
                         {
+                            // The program's own end already told this turn
                             // (and counted it where it was news).
                             let _ = self.pair_end(told, true);
                         }

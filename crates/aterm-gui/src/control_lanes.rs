@@ -293,13 +293,13 @@ impl Outbox {
 
     /// Whether the answer is out and the line that acknowledges its challenge
     /// is still owed.
-    fn awaiting_ack(&self) -> bool {
+    const fn awaiting_ack(&self) -> bool {
         matches!(&self.handoff, Some(PendingHandoff::Acknowledged(ack)) if ack.on_wire)
     }
 
     /// Whether the connection closes once this answer is over (the bridge asks: [`super::serve_preresolved`]).
     #[cfg(unix)]
-    pub(super) fn closes(&self) -> bool {
+    pub(super) const fn closes(&self) -> bool {
         self.then_close
     }
 
@@ -530,16 +530,16 @@ impl Spill {
         Some(spill)
     }
 
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.len
     }
 
-    fn as_slice(&self) -> &[u8] {
+    const fn as_slice(&self) -> &[u8] {
         // SAFETY: the mapping's `len` bytes, all initialized (an anonymous mapping starts zeroed), mapped for as long as `self` lives.
         unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    const fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as in `as_slice`, and borrowed exclusively through `self`.
         unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
     }
@@ -611,7 +611,7 @@ impl Unread {
         &self.storage()[self.at..self.end]
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.at == self.end
     }
 
@@ -787,12 +787,12 @@ pub(super) struct LaneReader<'a> {
 }
 
 impl<'a> LaneReader<'a> {
-    pub(super) fn new(stream: &'a CtlStream, unread: &'a mut Unread) -> Self {
+    pub(super) const fn new(stream: &'a CtlStream, unread: &'a mut Unread) -> Self {
         Self { stream, unread }
     }
 
     /// The connection's stream (a readiness wait polls it).
-    pub(super) fn stream(&self) -> &'a CtlStream {
+    pub(super) const fn stream(&self) -> &'a CtlStream {
         self.stream
     }
 
@@ -818,6 +818,7 @@ impl<'a> LaneReader<'a> {
 impl Read for LaneReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // A read at least as large as the buffer's room bypasses it when it
+        // holds nothing (a frame's body read without a parker).
         if self.unread.is_empty() && buf.len() >= READ_BUFFER {
             let mut stream = self.stream;
             return stream.read(buf);
@@ -875,7 +876,7 @@ impl SocketMode {
     }
 
     /// A handler has had the descriptor: its mode is no longer known.
-    fn forget(&mut self) {
+    const fn forget(&mut self) {
         self.0 = None;
     }
 }
@@ -1088,7 +1089,7 @@ impl<J> Handed<J> {
 type WaitSpawnHook = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
 
 impl<J> GrowPool<J> {
-    fn new(name: &'static str, max: usize) -> Self {
+    const fn new(name: &'static str, max: usize) -> Self {
         Self {
             name,
             max,
@@ -1414,6 +1415,8 @@ impl Lanes {
                 crate::qos::Role::Responsive,
                 move || {
                     // QoS floor (qos.rs): a read verb holds the terminal mutex the UI
+                    // thread takes. Not `Interactive`: a verb storm must never outrank
+                    // the UI thread.
                     lanes.rpc_lane();
                 },
             ) {
@@ -1777,6 +1780,7 @@ impl Lanes {
             Some(scope) => scope,
             None => {
                 // The handshake is read once its line is whole; until then the
+                // parker holds the connection, for the rest of its lifetime.
                 if may_park && self.parker_runs() {
                     match gather_here(&mut reader, mode, |buffered| {
                         held(buffered, false) == Held::Whole
@@ -1825,6 +1829,7 @@ impl Lanes {
                 }
             } else {
                 // Written and acknowledged blocking, under the handoff's own
+                // deadline. What that leaves the descriptor in is not known after.
                 if mode.set(stream, false).is_err() {
                     return Here::Closed;
                 }
@@ -2216,6 +2221,7 @@ impl Lanes {
             }
             Step::Stay if !conn.deadline().is_some_and(|at| at <= now) => {
                 // Its peer sent or took bytes (or the wake was spurious, and
+                // nothing came of it but a stamp).
                 if events != 0 {
                     conn.stirred = now;
                 }

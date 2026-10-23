@@ -430,7 +430,8 @@ impl App {
         }
     }
 
-    /// Publish the macOS file-access posture into every open Settings view and perform.
+    /// Publish the macOS file-access posture into every open Settings view and perform
+    /// any outstanding *Ask for folder access now* press.
     pub(crate) fn sync_settings_consent_posture(&mut self) {
         if self
             .native_runtime
@@ -666,6 +667,7 @@ impl App {
         }
         if let Some(plan) = retire {
             // The refusal, if any, is shown by the block's status row
+            // (`MacosAccess::retire_status`) until the next press starts.
             self.claimant_retire_refusal = self.begin_claimant_retire(plan).err();
         }
         if let Some((change, answer)) = debugger {
@@ -680,6 +682,7 @@ impl App {
         }
         if opened {
             // aterm's panel, with its icon to drag into the list, joins the page
+            // when System Settings opened at it.
             if fda_page_up {
                 #[expect(
                     clippy::disallowed_methods,
@@ -699,7 +702,9 @@ impl App {
         }
     }
 
-    /// What the Developer Tools hand-over came.
+    /// What the Developer Tools hand-over came to, on the bar of each Settings view
+    /// in `views` that pressed for it (`SettingsViewState::note_devtools_hand_over`),
+    /// each told to draw it: written outside the reducer.
     pub(crate) fn note_devtools_outcome_on(
         &mut self,
         views: &[(crate::WindowId, crate::tab_model::ViewId)],
@@ -1127,6 +1132,7 @@ impl App {
                 Ok(()) => removed = true,
                 Err(_) => {
                     // Keep the refusing view selected so its draft banner and
+                    // close-recovery palette stay visible to the control caller.
                     self.sync_window(wid);
                 }
             }
@@ -1339,6 +1345,7 @@ impl App {
     #[cfg(a11y_tree)]
     fn grid_a11y_geometry(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridGeometry> {
         // An unknown window would fall back to the shared backend metrics, another
+        // window's geometry; fail closed instead.
         if !self.windows.contains_key(&wid) {
             return None;
         }
@@ -1830,6 +1837,9 @@ impl App {
             .map(crate::overlay::Overlay::kind);
         let Some(kind) = kind else {
             // No overlay: the tree is a native tab app's projection or the terminal
+            // grid. Only the grid mints tab ids, in a range no other builder uses, so
+            // decoding one cannot steal a native app's request. Focus and Click both
+            // mean "show me this tab".
             if let Some(index) = crate::a11y_tree::tab_action_index(&req, |index| {
                 let ws = self.windows.get(&wid)?;
                 if self.tab_strip_rows == 0 || ws.tab_set.len() < 2 {
@@ -2351,6 +2361,8 @@ mod tests {
             let ws = app.windows.get_mut(&crate::WindowId(0)).expect("window 0");
             if matches!(effect, CursorDependent::WordDecoration) {
                 // The feline word can also report a collectible. Keep this arm
+                // isolated so omitting WordDecorations from the shared set could
+                // not be masked by the cat predicate.
                 ws.fx.companions_mut().cursor_cat = crate::kitty_cursor::CursorCat::default();
             }
             let dependents = ws.cursor_dependents_need_frame_cadence(now, true);

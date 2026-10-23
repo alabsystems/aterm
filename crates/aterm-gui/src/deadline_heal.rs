@@ -127,7 +127,7 @@ impl DeadlineHealer {
         heal
     }
 
-    fn end_streak(&mut self) {
+    const fn end_streak(&mut self) {
         self.streak = DeadlineOwner::None;
         self.episode_logged = false;
     }

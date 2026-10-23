@@ -87,8 +87,6 @@ type Case<'a> = (
     u8,
 );
 
-/// Every failure is exit 1 (a usage error 2) with one line that names no
-/// URL, and nothing run: Claude Code then prints the URL itself.
 #[test]
 fn every_refusal_is_exit_one_and_names_no_url() {
     let mut never = |_cmd: aterm_uds::spawnfd::Command| -> bool {
@@ -406,4 +404,495 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
             .is_err()
         );
     }
+}
+
+#[test]
+fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_the_loop() {
+    use super::super::headless_oauth::{
+        CdpClient, MailboxCredential, drive_cdp_oauth, extract_otp_from_email, split_nul_messages,
+    };
+
+    // 1. 6-digit OTP extraction from email with recipient verification.
+    let otp_eml = concat!(
+        "From: Anthropic <no-reply@claude.com>\r\n",
+        "To: <m27@example.test>\r\n",
+        "Subject: Your Claude verification code\r\n\r\n",
+        "<html><body><p>Use this verification code to sign in to Claude:</p>",
+        "<div style=\"color:#123456\">849-204</div></body></html>\r\n"
+    );
+    assert_eq!(
+        extract_otp_from_email(otp_eml, Some("other@example.test")),
+        None,
+        "OTP extractor must reject mismatched recipient"
+    );
+    assert_eq!(
+        extract_otp_from_email(otp_eml, Some("m27@example.test")).as_deref(),
+        Some("849204")
+    );
+
+    // 2. Headless CDP OAuth state machine over real pipes (email -> OTP -> Authorize -> callback).
+    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
+    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
+
+    let authorize_url = concat!(
+        "https://claude.com/cai/oauth/authorize",
+        "?code=true",
+        "&redirect_uri=http%3A%2F%2Flocalhost%3A9123%2Fcallback",
+        "&state=st_cdp_77",
+        "&login_hint=m27%40example.test"
+    );
+
+    let browser_thread = std::thread::spawn(move || {
+        let mut reader = to_browser_r;
+        let mut pending = Vec::new();
+        let mut buf = [0u8; 8192];
+        let mut eval_step = 0usize;
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            pending.extend_from_slice(&buf[..n]);
+            for msg in split_nul_messages(&mut pending) {
+                let id = msg.get("id").and_then(Value::as_u64).unwrap_or(0);
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let result = match method {
+                    "Target.createTarget" => aterm_json::json!({"targetId": "t1"}),
+                    "Target.attachToTarget" => aterm_json::json!({"sessionId": "s1"}),
+                    "Page.enable" | "Runtime.enable" | "Page.navigate" | "Target.closeTarget" => {
+                        aterm_json::json!({})
+                    }
+                    "Browser.close" => {
+                        let reply = format!("{{\"id\":{id},\"result\":{{}}}}\0");
+                        let _ = from_browser_w.write_all(reply.as_bytes());
+                        return;
+                    }
+                    "Runtime.evaluate" => {
+                        eval_step += 1;
+                        let val = match eval_step {
+                            1 => aterm_json::json!({
+                                "state": "submitted_email",
+                                "url": "https://claude.com/login"
+                            }),
+                            2 => aterm_json::json!({
+                                "state": "submitted_otp",
+                                "url": "https://claude.com/login/verify"
+                            }),
+                            3 => aterm_json::json!({
+                                "state": "clicked_consent",
+                                "url": "https://claude.com/cai/oauth/authorize"
+                            }),
+                            _ => aterm_json::json!({
+                                "state": "callback",
+                                "url": "http://127.0.0.1:9123/callback?code=auth_code_99&state=st_cdp_77"
+                            }),
+                        };
+                        aterm_json::json!({"result": {"type": "object", "value": val}})
+                    }
+                    _ => aterm_json::json!({}),
+                };
+                let reply = aterm_json::json!({"id": id, "result": result});
+                let mut bytes = aterm_json::to_vec(&reply).unwrap();
+                bytes.push(0);
+                if from_browser_w.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut cdp = CdpClient::new(to_browser_w, from_browser_r);
+    let mut delivered = Vec::new();
+    let res = drive_cdp_oauth(
+        &mut cdp,
+        authorize_url,
+        None,
+        Duration::from_secs(10),
+        Duration::ZERO,
+        |em| {
+            assert_eq!(em, Some("m27@example.test"));
+            Ok(MailboxCredential::Otp("849204".to_owned()))
+        },
+        |cb| {
+            delivered.push(cb.to_owned());
+            Ok(200)
+        },
+    );
+    browser_thread.join().expect("stand-in browser thread");
+    assert_eq!(res, Ok(()));
+    assert_eq!(
+        delivered,
+        vec!["http://127.0.0.1:9123/callback?code=auth_code_99&state=st_cdp_77".to_owned()]
+    );
+}
+
+#[test]
+fn imap_bridge_and_http_json_mailbox_fetch_credentials_and_track_seen_digests() {
+    use super::super::headless_oauth::{
+        MailboxConfig, MailboxCredential, poll_mailbox_config_for_credential,
+    };
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let pass_file = tmp.path().join("imap.pass");
+    std::fs::write(&pass_file, "bridge-secret-pass\n").expect("write pass");
+
+    let toml_text = format!(
+        r#"
+[ai.mailbox]
+imap_url = "imap://127.0.0.1:1143/INBOX"
+user = "m27@example.test"
+password_file = "{}"
+"#,
+        pass_file.display()
+    );
+    let parsed_cfg =
+        MailboxConfig::from_toml_str(&toml_text, Some(tmp.path())).expect("parse mailbox toml");
+    assert_eq!(
+        parsed_cfg.imap_url.as_deref(),
+        Some("imap://127.0.0.1:1143/INBOX")
+    );
+    assert_eq!(parsed_cfg.user.as_deref(), Some("m27@example.test"));
+    assert_eq!(parsed_cfg.password.as_deref(), Some("bridge-secret-pass"));
+
+    // 1. Stand-in local TCP IMAP server (Proton Mail Bridge style).
+    let imap_listener = TcpListener::bind("127.0.0.1:0").expect("bind imap");
+    let imap_port = imap_listener.local_addr().expect("addr").port();
+    let imap_thread = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((stream, _)) = imap_listener.accept() else {
+                break;
+            };
+            let mut writer = stream.try_clone().expect("clone");
+            let mut reader = BufReader::new(stream);
+            let _ = writer.write_all(b"* OK [CAPABILITY IMAP4rev1] Local Bridge Ready\r\n");
+            let _ = writer.flush();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                let tag = trimmed.split_whitespace().next().unwrap_or("a");
+                if trimmed.contains("LOGIN ") {
+                    assert!(
+                        trimmed.contains("\"m27@example.test\" \"bridge-secret-pass\""),
+                        "unexpected IMAP LOGIN: {trimmed}"
+                    );
+                    let _ = writeln!(writer, "{tag} OK LOGIN completed\r");
+                } else if trimmed.contains("SELECT ") {
+                    let _ = writeln!(
+                        writer,
+                        "* 2 EXISTS\r\n{tag} OK [READ-WRITE] SELECT completed\r"
+                    );
+                } else if trimmed.contains("SEARCH ") {
+                    let _ = writeln!(writer, "* SEARCH 1 2\r\n{tag} OK SEARCH completed\r");
+                } else if trimmed.contains("FETCH 2 ") {
+                    let msg = concat!(
+                        "From: Anthropic <no-reply@claude.com>\r\n",
+                        "To: <m27@example.test>\r\n",
+                        "Subject: Your Claude verification code\r\n\r\n",
+                        "Your verification code is 739-182\r\n"
+                    );
+                    let _ = write!(
+                        writer,
+                        "* 2 FETCH (BODY[] {{{}}}\r\n{}\r\n)\r\n{tag} OK FETCH completed\r\n",
+                        msg.len(),
+                        msg
+                    );
+                } else if trimmed.contains("FETCH 1 ") {
+                    let msg = concat!(
+                        "From: Anthropic <no-reply@claude.com>\r\n",
+                        "To: <other@example.test>\r\n\r\n",
+                        "https://claude.com/cai/oauth/magic?token=wrong_user\r\n"
+                    );
+                    let _ = write!(
+                        writer,
+                        "* 1 FETCH (BODY[] {{{}}}\r\n{}\r\n)\r\n{tag} OK FETCH completed\r\n",
+                        msg.len(),
+                        msg
+                    );
+                } else if trimmed.contains("STORE ") {
+                    let _ = writeln!(writer, "{tag} OK STORE completed\r");
+                } else if trimmed.contains("LOGOUT") {
+                    let _ = writeln!(writer, "* BYE Bridge logging out\r\n{tag} OK LOGOUT\r");
+                    break;
+                }
+                let _ = writer.flush();
+            }
+        }
+    });
+
+    let seen_file = tmp.path().join("mailbox.seen");
+    let imap_cfg = MailboxConfig {
+        imap_url: Some(format!("imap://127.0.0.1:{imap_port}/INBOX")),
+        user: Some("m27@example.test".to_owned()),
+        password: Some("bridge-secret-pass".to_owned()),
+        seen_file: Some(seen_file.clone()),
+        ..MailboxConfig::default()
+    };
+    let cred = poll_mailbox_config_for_credential(
+        &imap_cfg,
+        Some("m27@example.test"),
+        Duration::from_secs(5),
+    )
+    .expect("fetched OTP from IMAP");
+    assert_eq!(cred, MailboxCredential::Otp("739182".to_owned()));
+
+    // Second poll with same seen_file must skip the already-consumed message and time out cleanly.
+    let second = poll_mailbox_config_for_credential(
+        &imap_cfg,
+        Some("m27@example.test"),
+        Duration::from_millis(80),
+    );
+    assert!(
+        second.is_err(),
+        "already-consumed IMAP message must not be reused"
+    );
+    imap_thread.join().expect("imap thread");
+
+    // 2. Stand-in HTTP JSON mailbox endpoint (Mailpit / JMAP / Webhook style).
+    let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind http");
+    let http_port = http_listener.local_addr().expect("addr").port();
+    let http_thread = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = http_listener.accept() else {
+            return;
+        };
+        let mut req_buf = [0u8; 4096];
+        let n = stream.read(&mut req_buf).unwrap_or(0);
+        let req_str = String::from_utf8_lossy(&req_buf[..n]);
+        assert!(
+            req_str.contains("Authorization: Bearer tok-99"),
+            "missing bearer token: {req_str}"
+        );
+        let body = r#"{"messages":[{"To":[{"Address":"other@example.test"}],"HTML":"<a href=\"https://claude.com/cai/oauth/magic?token=wrong\">Sign in</a>"},{"To":[{"Address":"m27@example.test"}],"HTML":"<p><a href=\"https://claude.com/cai/oauth/magic?token=http_magic_ok&amp;state=s1\">Sign in to Claude</a></p>"}]}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+    });
+
+    let http_cfg = MailboxConfig {
+        http_url: Some(format!(
+            "http://127.0.0.1:{http_port}/api/v1/messages?email={{email}}"
+        )),
+        bearer_token: Some("tok-99".to_owned()),
+        seen_file: Some(tmp.path().join("http_mailbox.seen")),
+        ..MailboxConfig::default()
+    };
+    let http_cred = poll_mailbox_config_for_credential(
+        &http_cfg,
+        Some("m27@example.test"),
+        Duration::from_secs(5),
+    )
+    .expect("fetched magic link from HTTP mailbox");
+    assert_eq!(
+        http_cred,
+        MailboxCredential::MagicLink(
+            "https://claude.com/cai/oauth/magic?token=http_magic_ok&state=s1".to_owned()
+        )
+    );
+    http_thread.join().expect("http thread");
+}
+
+#[test]
+fn headless_webmail_cdp_and_totp_complete_oauth_without_human_in_the_loop() {
+    use crate::harness::headless_oauth::{
+        CdpClient, MailboxConfig, drive_cdp_oauth_with_webmail, generate_totp_at,
+        poll_mailbox_or_webmail_for_credential, split_nul_messages,
+    };
+    use std::io::{Read, Write};
+
+    // 1. RFC 6238 / RFC 4226 SHA-1 TOTP test vectors ("12345678901234567890" in Base32).
+    let rfc_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"; // gitleaks:allow
+    assert_eq!(generate_totp_at(rfc_secret, 59).as_deref(), Some("287082"));
+    assert_eq!(
+        generate_totp_at(rfc_secret, 1_111_111_109).as_deref(),
+        Some("081804")
+    );
+
+    // 2. Per-account TOML parsing for webmail credentials + TOTP secrets.
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let toml_str = r#"
+[ai.mailbox]
+webmail_url = "https://mail.example.test/u/0/inbox"
+
+[ai.mailbox.passwords]
+"user-a@example.test" = "pw-alpha"
+
+[ai.mailbox.accounts."user-b@example.test"]
+password = "pw-beta"
+mailbox_password = "mpw-beta"
+totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
+"#;
+    let mut cfg = MailboxConfig::from_toml_str(toml_str, Some(tmp.path())).expect("parse toml");
+    cfg.seen_file = Some(tmp.path().join("webmail.seen"));
+    assert!(cfg.is_configured());
+    assert!(cfg.is_webmail_only(Some("user-b@example.test")));
+    assert_eq!(
+        cfg.password_for(Some("user-a@example.test")).as_deref(),
+        Some("pw-alpha")
+    );
+    assert_eq!(
+        cfg.password_for(Some("user-b@example.test")).as_deref(),
+        Some("pw-beta")
+    );
+    assert_eq!(
+        cfg.mailbox_password_for(Some("user-b@example.test"))
+            .as_deref(),
+        Some("mpw-beta")
+    );
+    assert_eq!(
+        cfg.totp_secret_for(Some("user-b@example.test")).as_deref(),
+        Some(rfc_secret)
+    );
+
+    // 3. End-to-end CDP OAuth + secondary-tab Webmail login (password + TOTP + decrypted iframe OTP).
+    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe1");
+    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe2");
+
+    let authorize_url = "https://claude.com/cai/oauth/authorize?client_id=c1&redirect_uri=http%3A%2F%2F127.0.0.1%3A9123%2Fcallback&state=st_webmail_42";
+
+    let browser_thread = std::thread::spawn(move || {
+        let mut reader = to_browser_r;
+        let mut pending = Vec::new();
+        let mut buf = [0u8; 8192];
+        let mut target_seq = 0usize;
+        let mut oauth_step = 0usize;
+        let mut webmail_step = 0usize;
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            pending.extend_from_slice(&buf[..n]);
+            for msg in split_nul_messages(&mut pending) {
+                let id = msg.get("id").and_then(Value::as_u64).unwrap_or(0);
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let session_id = msg.get("sessionId").and_then(Value::as_str).unwrap_or("");
+                let result = match method {
+                    "Target.createTarget" => {
+                        target_seq += 1;
+                        aterm_json::json!({"targetId": format!("t{target_seq}")})
+                    }
+                    "Target.attachToTarget" => {
+                        let tid = msg
+                            .pointer("/params/targetId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("t1");
+                        aterm_json::json!({"sessionId": format!("s_{tid}")})
+                    }
+                    "Page.enable" | "Runtime.enable" | "Page.navigate" | "Target.closeTarget" => {
+                        aterm_json::json!({})
+                    }
+                    "Browser.close" => {
+                        let reply = format!("{{\"id\":{id},\"result\":{{}}}}\0");
+                        let _ = from_browser_w.write_all(reply.as_bytes());
+                        return;
+                    }
+                    "Runtime.evaluate" if session_id == "s_t2" => {
+                        webmail_step += 1;
+                        let expr = msg
+                            .pointer("/params/expression")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        assert!(
+                            expr.contains("pw-beta"),
+                            "webmail JS must carry per-account password"
+                        );
+                        let val = match webmail_step {
+                            1 => aterm_json::json!({
+                                "state": "submitted_login",
+                                "url": "https://mail.example.test/login"
+                            }),
+                            2 => aterm_json::json!({
+                                "state": "submitted_totp",
+                                "url": "https://mail.example.test/login/2fa"
+                            }),
+                            _ => aterm_json::json!({
+                                "state": "inbox",
+                                "url": "https://mail.example.test/u/0/inbox",
+                                "clicked_row": true,
+                                "html": "<div><p>Your verification code is: 908172</p></div>",
+                                "text": "Sign in to Claude\nYour verification code is: 908172"
+                            }),
+                        };
+                        aterm_json::json!({"result": {"type": "object", "value": val}})
+                    }
+                    "Runtime.evaluate" => {
+                        oauth_step += 1;
+                        let expr = msg
+                            .pointer("/params/expression")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let val = match oauth_step {
+                            1 => aterm_json::json!({
+                                "state": "submitted_email",
+                                "url": "https://claude.com/login"
+                            }),
+                            2 => {
+                                assert!(
+                                    expr.contains("908172"),
+                                    "OAuth tab must receive OTP extracted from webmail tab"
+                                );
+                                aterm_json::json!({
+                                    "state": "submitted_otp",
+                                    "url": "https://claude.com/login/verify"
+                                })
+                            }
+                            3 => aterm_json::json!({
+                                "state": "clicked_consent",
+                                "url": "https://claude.com/cai/oauth/authorize"
+                            }),
+                            _ => aterm_json::json!({
+                                "state": "callback",
+                                "url": "http://127.0.0.1:9123/callback?code=auth_code_webmail&state=st_webmail_42"
+                            }),
+                        };
+                        aterm_json::json!({"result": {"type": "object", "value": val}})
+                    }
+                    _ => aterm_json::json!({}),
+                };
+                let reply = aterm_json::json!({"id": id, "result": result});
+                let mut bytes = aterm_json::to_vec(&reply).unwrap();
+                bytes.push(0);
+                if from_browser_w.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut cdp = CdpClient::new(to_browser_w, from_browser_r);
+    let mut delivered = Vec::new();
+    let res = drive_cdp_oauth_with_webmail(
+        &mut cdp,
+        authorize_url,
+        Some("user-b@example.test"),
+        Duration::from_secs(5),
+        Duration::ZERO,
+        |cdp_inner, em| {
+            poll_mailbox_or_webmail_for_credential(
+                cdp_inner,
+                &cfg,
+                em,
+                Duration::from_secs(5),
+                Duration::ZERO,
+            )
+        },
+        |cb_url| {
+            delivered.push(cb_url.to_owned());
+            Ok(200)
+        },
+    );
+    assert_eq!(res, Ok(()));
+    assert_eq!(
+        delivered,
+        vec![
+            "http://127.0.0.1:9123/callback?code=auth_code_webmail&state=st_webmail_42".to_owned()
+        ]
+    );
+    browser_thread.join().expect("browser thread");
 }

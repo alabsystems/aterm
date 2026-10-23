@@ -807,6 +807,7 @@ impl TrickListener {
     )]
     pub fn note_backspace(&mut self) -> TrickFeed<'_> {
         // Poisoned: the count stopped meaning anything. Zero: nothing to take
+        // (a held key overshooting an empty line).
         if self.line.poisoned || self.line.line_chars == 0 {
             return TrickFeed::NONE;
         }
@@ -816,6 +817,7 @@ impl TrickListener {
             self.line.line_chars = self.line.line_chars.saturating_sub(popped);
         } else if self.line.gap_chars == 1 && self.snapshot.is_some() {
             // The run's first character goes: the caret is back at the end of
+            // the token that run closed, and the line is exactly the snapshot.
             if let Some(before) = self.snapshot.take() {
                 let fired_here = self.line.last_fire != before.last_fire;
                 if fired_here && self.line.tentative.is_some() {
@@ -827,9 +829,11 @@ impl TrickListener {
             let run = self.line.gap_chars as usize;
             if (2..=GAP_WINDOW).contains(&run) {
                 // Inside a remembered delimiter run (`sit!!⌫`, a doubled
+                // space): the run now ends with the character before.
                 self.line.left = self.line.gap.get(run.saturating_sub(2)).copied();
             } else {
                 // A second boundary crossed backwards, or a run longer than
+                // the window: the content left of the caret is unknown.
                 out = self.go_impure();
             }
             self.line.gap_chars = self.line.gap_chars.saturating_sub(1);
@@ -866,6 +870,10 @@ impl TrickListener {
             && aterm_grapheme::char_width(c) == 0
         {
             // Past the window a mark rides with its base, uncounted: it is not
+            // stored, so Backspace could not know it belongs to the previous
+            // character, and counting it would leave the count high (a Thai
+            // line backspaced to its start would look non-empty). A mark on the
+            // window's last character is thereby left out of the lookup too.
             return None;
         }
         let joins = kind == Kind::Joiner && self.line.token_chars > 0;
@@ -918,6 +926,7 @@ impl TrickListener {
         if self.line.token_chars == 0 {
             if aterm_grapheme::char_width(c) == 0 {
                 // A combining mark with no base in this token attaches to the
+                // delimiter, and Backspace would take both: alien.
                 return self.poison();
             }
             let glued = self.line.tail.is_some()
@@ -958,6 +967,7 @@ impl TrickListener {
                 let run_continues = self.line.left.is_some_and(|l| kind_of(l) == Kind::Stop);
                 if run_continues || self.line.any_word || !self.line.pure {
                     // `sit!!`, `sit...`: the parked verdict stays parked. After
+                    // a word and a space it is French spacing (`assis !`).
                     None
                 } else {
                     // Before any word it is code: `!sit`, `.hidden`, `..`.
@@ -1866,6 +1876,7 @@ cjk   = true
             rig.key(mark);
             if mark == '_' {
                 // `_` is a token character: it opens a token that is not a
+                // word, which is judged at its own boundary.
                 rig.run("␣");
             }
             assert_eq!(rig.seen.last(), Some(&Seen::Revoke), "{mark:?}");
@@ -3134,6 +3145,7 @@ cjk   = true
                 });
                 if is_final && final_at.is_none() {
                     // Final at the character just typed: judge what stood
+                    // before it.
                     final_at = Some(typed.clone());
                 }
                 typed.push(c);
@@ -3445,6 +3457,7 @@ cjk   = true
         let listener = &rig.listener;
         if listener.is_poisoned() {
             // Poison claims nothing, and only a reset — which empties the
+            // editor too — lifts it.
             return;
         }
         let line = &editor.line;

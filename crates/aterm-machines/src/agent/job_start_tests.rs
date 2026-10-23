@@ -96,7 +96,6 @@ fn a_committed_exact_job_runs_and_releases_only_its_own_holder() {
         Some("one synthetic effect")
     );
     assert!(state::holder(&sys, &layout).is_none());
-    // The child used its exact ownership receipt; a same-run successor is not removable.
     let old = state::Holder {
         pid: PID,
         run: RUN.into(),
@@ -109,7 +108,6 @@ fn a_committed_exact_job_runs_and_releases_only_its_own_holder() {
 
 #[test]
 fn absent_start_or_mismatched_job_identity_refuses_before_host_effects() {
-    // Positive is the actual complete child path, not merely a synthetic gate result.
     let (sys, layout) = fixture();
     sys.start_answer(Ok(()));
     assert_eq!(

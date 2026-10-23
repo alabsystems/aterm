@@ -155,9 +155,9 @@ pub(crate) const GLINT_RADIUS_PERMILLE: u32 = 30;
 pub(crate) const GLINT_MIN_HALF_CELLS: u32 = 3;
 /// The glint's peak lift (0–255).
 pub(crate) const GLINT_PEAK: u8 = 255;
-/// A data jump in a determinate fill glides over at least this long…
+/// A data jump in a determinate fill glides over at least this long.
 pub const FILL_GLIDE: Duration = Duration::from_millis(180);
-/// …plus this much per percentage point it travels, so a big jump does not hop many cells a frame…
+/// …plus this much per percentage point it travels, so a big jump does not hop many cells a frame.
 pub const FILL_GLIDE_PER_POINT: Duration = Duration::from_millis(7);
 /// …and never longer than this.
 pub const FILL_GLIDE_MAX: Duration = Duration::from_millis(600);

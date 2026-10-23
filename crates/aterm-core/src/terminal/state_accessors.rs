@@ -459,6 +459,7 @@ impl Terminal {
     #[inline]
     pub fn apply_policy_engine(&mut self, engine: aterm_policy::engine::PolicyEngine) {
         // `install` recompiles the constant-probe gate table in the same step,
+        // so no gate can answer from the policy this call replaced.
         self.policy.install(engine);
     }
 

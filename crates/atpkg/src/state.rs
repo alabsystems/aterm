@@ -261,7 +261,11 @@ pub fn agent_own_copy_outside_aterm(build: u64, foreign: &Path) -> String {
 const OWN_COPY_OUTSIDE_ATERM: &str =
     "this shell's own copy (the managed copy leads inside aterm only; aterm help reroute)";
 
-/// The tail of [`agent_shadowed_in_shell`] after `managed <build> — `: `SHADOWED in this shell by <path>: its PATH has no <agents_dir> (a shell that has not sourced the atpkg hook) — \`<remedy>\` here picks the managed copy up`, or with `agents_on_path` `…: its PATH has <agents_dir> behind <path's dir> — \`<remedy>\` here moves it to the front`, then `; a tab opened on this build puts agents/ first on its own`.
+/// The tail of [`agent_shadowed_in_shell`] after `managed <build> — `: ``SHADOWED in this
+/// shell by <path>: its PATH has no <agents_dir> (a shell that has not sourced the atpkg
+/// hook) — `<remedy>` here picks the managed copy up``, or with `agents_on_path` ``…: its
+/// PATH has <agents_dir> behind <path's dir> — `<remedy>` here moves it to the front``,
+/// then `; a tab opened on this build puts agents/ first on its own`.
 #[must_use]
 pub fn agent_shell_shadow_tail(
     path: &Path,
@@ -424,6 +428,7 @@ pub fn alias_hint(alias: &str) -> String {
 /// Where `program`'s builds come from, as the package log and Settings ▸ Packages name it: `ALab build (index <N>)` / `ALab build` for an ALab build of an ALab-built agent program (pinned by the index, or kept: [`crate::alab`]), `Anthropic latest` / `OpenAI latest` for a vendor-direct program (its vendor's channel, whatever else its row says) and `ALab index <N>` for everything else, `N` being the index its row is pinned by, else the one the last pass resolved (`last_index_build`), else none.
 #[must_use]
 pub fn source_words(program: &str, state: &str, last_index_build: u64) -> String {
+    // An ALab-built agent program's row from the index lane, or the one its kept ALab build
     // carries ([`crate::alab`]): ALab's build, never its vendor's latest.
     if crate::alab::agent(program).is_some() {
         if let Some((_, index)) =

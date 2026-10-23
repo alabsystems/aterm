@@ -221,7 +221,7 @@ impl Grid {
         Some(out)
     }
 
-    /// Lend this grid's anchors out for a width change (see the module doc).
+    /// Lend this grid's anchors out for a width change.
     pub fn lend_anchors(&mut self, reach: LendReach) -> Option<AnchorLend> {
         if self.anchors().is_empty() {
             return None;
@@ -305,7 +305,7 @@ impl Grid {
         })
     }
 
-    /// Put lent anchors back where their text landed (see the module doc).
+    /// Put lent anchors back where their text landed.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(

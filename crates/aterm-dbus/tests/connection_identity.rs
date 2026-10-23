@@ -66,8 +66,6 @@ fn address_child(test: &str, mode: &str) {
         .prefix("dbus-address-")
         .tempdir()
         .unwrap();
-    // The fallback is deliberately a regular sentinel, never a real bus. This
-    // tests address selection only; no code here opens a connection to it.
     let bus = scratch.path().join("bus");
     std::fs::write(&bus, b"private non-socket sentinel").unwrap();
     let exe = std::env::current_exe().unwrap();
@@ -97,7 +95,6 @@ fn address_child(test: &str, mode: &str) {
     .pop()
     .unwrap()
     .unwrap();
-    // `1 passed`: a name that matched no test would pass with nothing checked.
     assert!(
         output.status.success()
             && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),

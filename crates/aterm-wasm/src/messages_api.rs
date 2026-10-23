@@ -568,6 +568,7 @@ impl page::Host for WebDesk {
 fn utc_offset_s(timezone_offset_min: f64) -> i64 {
     if timezone_offset_min.is_finite() && timezone_offset_min.abs() < 1440.0 {
         // The sign flips in the float (exact, and `round` is symmetric), so
+        // no integer negation is left that could overflow.
         (timezone_offset_min * -60.0).round() as i64
     } else {
         0

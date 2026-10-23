@@ -59,7 +59,7 @@ const TRUECOLOR: (&str, &str) = ("c86432", "0a141e");
 /// How the stand-in answers the SIGWINCH it was holding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Repaint {
-    /// Node's tty: a full repaint (ESC[2J) only when the size it reads
+    /// Node's tty: a full repaint (`ESC[2J`) only when the size it reads
     /// changed, else a diff frame on the composer (Claude Code's contract).
     OnChange,
     /// A full repaint whatever it reads (the control).
@@ -1048,7 +1048,7 @@ fn the_repaint_nudge_in_log_mode_only_logs() {
     );
 }
 
-/// A program that repaints by cursor addressing (no ESC[2J), not classed as the agent, is
+/// A program that repaints by cursor addressing (no `ESC[2J`), not classed as the agent, is
 /// indistinguishable from one that missed the resize, so it is never accused
 /// (`render=unjudged`) and never touched.
 #[test]

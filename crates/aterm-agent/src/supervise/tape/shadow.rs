@@ -38,7 +38,7 @@ pub struct ShadowRow {
     pub note: Option<String>,
 }
 
-/// A shadow of one tape ([module docs](self)).
+/// A shadow of one tape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shadow {
     pub tape: String,
@@ -141,7 +141,7 @@ impl Shadow {
     }
 }
 
-/// The SHADOW of the tape `bytes` under `candidate` ([module docs](self)).
+/// The SHADOW of the tape `bytes` under `candidate`.
 /// # Errors
 /// A tape that does not read, one with no decision, a header this build cannot read (the candidate
 /// is made from the policy it carries), a candidate the policy's reader refuses.

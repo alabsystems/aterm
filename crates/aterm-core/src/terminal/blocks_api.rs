@@ -218,6 +218,7 @@ impl Terminal {
     /// The command text from a block: OSC 633;E's explicit commandline when present, else the text of the command rows.
     #[must_use]
     pub fn block_command_text(&self, block: &OutputBlock) -> BlockText {
+        // OSC 633;E's commandline is clean of prompt decorations and, stored on the
         // block, survives eviction.
         if let Some(ref cmd) = block.commandline {
             let trimmed = cmd.trim();

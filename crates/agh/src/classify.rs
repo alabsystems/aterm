@@ -8,25 +8,21 @@ use crate::error::{Error, Forbid, GithubBody, Kind, SideEffect, Sub};
 use crate::retry::Idempotency;
 use crate::wire::{Method, Phase, WireError, header_in};
 
-/// The first header so named, ASCII case-insensitively, its value trimmed.
 #[inline]
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     header_in(headers, name).map(str::trim)
 }
 
-/// A header's value as a number of seconds or a Unix time.
 #[inline]
 fn number(headers: &[(String, String)], name: &str) -> Option<u64> {
     header(headers, name).and_then(|v| v.parse::<u64>().ok())
 }
 
-/// Whether `x-ratelimit-remaining` says the budget is spent.
 #[inline]
 fn spent(headers: &[(String, String)]) -> bool {
     number(headers, "x-ratelimit-remaining") == Some(0)
 }
 
-/// A primary limit: `reset` from `x-ratelimit-reset`.
 fn primary(error: Error, headers: &[(String, String)]) -> Error {
     let error = error.with_sub(Sub::Primary);
     match number(headers, "x-ratelimit-reset") {
@@ -35,7 +31,6 @@ fn primary(error: Error, headers: &[(String, String)]) -> Error {
     }
 }
 
-/// A secondary limit: `retry_after` from `retry-after`, when it is a number of seconds.
 fn secondary(error: Error, headers: &[(String, String)]) -> Error {
     let error = error.with_sub(Sub::Secondary);
     match number(headers, "retry-after") {
@@ -44,7 +39,6 @@ fn secondary(error: Error, headers: &[(String, String)]) -> Error {
     }
 }
 
-/// The comma-separated items of a scope header, each trimmed; empty items dropped.
 #[inline]
 fn scopes(text: &str) -> impl Iterator<Item = &str> {
     text.split(',').map(str::trim).filter(|s| !s.is_empty())
@@ -65,7 +59,6 @@ pub(crate) fn scope_next(scope: &str) -> String {
     format!("the token lacks the {scope} scope; a person re-issues it with {scope}")
 }
 
-/// A 403 that is not a rate limit.
 fn forbidden(error: Error, headers: &[(String, String)], body: &GithubBody) -> Error {
     if let Some(sso) = header(headers, "x-github-sso")
         && sso.starts_with("required")

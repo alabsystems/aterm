@@ -692,6 +692,7 @@ fn st_lock(st: &St) -> Option<PathBuf> {
 /// Plan the relaunch from what the record keeps.
 pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoPlan> {
     // No shell ([`NO_SHELL`], a tab's own Muse Code) is refused for good, as
+    // the Claude lane's plan refuses it: nothing would read the line.
     if st.shell == NO_SHELL {
         return Err(NoPlan::Refused {
             why: "not-a-shell-job".to_string(),
@@ -935,6 +936,7 @@ fn await_held(
         Some(pid) => carry_on(opts, r, st, c, pid, k, Some(hand)),
         None => {
             // The line's own command ended: its Muse never came up, or was
+            // gone before it was found.
             if let Some(kind) = ended.or_else(|| line_word(c, &st.tab, st.line_block)) {
                 return line_ended(opts, r, st, kind);
             }
@@ -1220,6 +1222,7 @@ fn carry_on(
         "done:resumed"
     } else if st.quiet {
         // Up, and its session's lock never named it: the relaunch is not
+        // proved the session's (nothing was typed either way).
         "done:unconfirmed"
     } else {
         "done:no-continue"

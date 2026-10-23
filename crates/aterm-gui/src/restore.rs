@@ -296,7 +296,7 @@ impl<'de> Deserialize<'de> for AgentRestore {
 
 impl RunRestore {
     /// The agent whose run it is.
-    pub(crate) fn agent(&self) -> aterm_agent::harness::upgrade::Agent {
+    pub(crate) const fn agent(&self) -> aterm_agent::harness::upgrade::Agent {
         match self {
             RunRestore::Codex(_) => aterm_agent::harness::upgrade::Agent::Codex,
             RunRestore::Muse(_) => aterm_agent::harness::upgrade::Agent::Muse,
@@ -601,7 +601,7 @@ impl AgentRestore {
     }
 
     /// Whether any relaunch brings this agent back.
-    pub(crate) fn relaunched(&self) -> bool {
+    pub(crate) const fn relaunched(&self) -> bool {
         match &self.run {
             None | Some(RunRestore::Muse(_) | RunRestore::Agy(_) | RunRestore::Gemini(_)) => true,
             Some(RunRestore::Codex(run)) => run.alab.is_some(),
@@ -751,7 +751,7 @@ impl TerminalLeafRestore {
     }
 
     /// Whether this leaf's folder may be another machine's.
-    pub(crate) fn folder_may_be_remote(&self) -> bool {
+    pub(crate) const fn folder_may_be_remote(&self) -> bool {
         self.held && self.agent.is_none()
     }
 
@@ -1193,7 +1193,7 @@ pub(crate) enum RestoredSplitTree {
 }
 
 impl RestoredSplitTree {
-    pub(crate) fn leaf(view: RestoredView) -> Self {
+    pub(crate) const fn leaf(view: RestoredView) -> Self {
         Self::Leaf { view }
     }
 
@@ -1480,7 +1480,7 @@ impl PaneLayout {
     }
 
     /// This leaf's outgoing session pool id, when captured for a seamless-update handoff (`None` for a `Split`, and for any cold-quit leaf).
-    pub(crate) fn local_id(&self) -> Option<u64> {
+    pub(crate) const fn local_id(&self) -> Option<u64> {
         match self {
             PaneLayout::Leaf { local_id, .. } => *local_id,
             PaneLayout::Split { .. } => None,
@@ -1724,7 +1724,7 @@ impl WindowLayout {
         }
     }
 
-    fn spill_of(donor: &Self) -> Self {
+    const fn spill_of(donor: &Self) -> Self {
         Self {
             rows: donor.rows,
             cols: donor.cols,
@@ -1894,7 +1894,7 @@ impl LayoutFold {
     }
 
     /// Whether the fold moved anything.
-    pub(crate) fn folded(&self) -> bool {
+    pub(crate) const fn folded(&self) -> bool {
         self.windows > 0 || self.tabs > 0
     }
 }
@@ -2898,7 +2898,7 @@ impl RestoreFault {
             reason = "the cold update lane, which reads it, is unix-only"
         )
     )]
-    pub(crate) fn passing(&self) -> bool {
+    pub(crate) const fn passing(&self) -> bool {
         self.passing
     }
 
@@ -2909,7 +2909,7 @@ impl RestoreFault {
             reason = "the cold update lane, which reads it, is unix-only"
         )
     )]
-    pub(crate) fn published(&self) -> bool {
+    pub(crate) const fn published(&self) -> bool {
         self.published
     }
 }
@@ -3495,6 +3495,9 @@ fn take_holding_result(
         if (claimed || retaken > 0)
             && let Err(error) = sync_restore_directory(parent, Flush::Durable)
         {
+            // Nothing comes back, as from the single-use claim: a claim that may not
+            // outlive a crash must not bring back a layout that brings the machine
+            // down. What this run took stays HELD — never a live run's take with its
             // lock let go for another launch to take — and goes when it settles.
             if let Some(unheld) = unheld {
                 let _ = fs::remove_file(&unheld);
@@ -3705,6 +3708,7 @@ fn store_cell_metrics_to(
     cell_w: usize,
     cell_h: usize,
 ) -> Result<(), String> {
+    // Never persist a degenerate measurement: a 0-px or absurd cell would make the next
     // launch reveal a broken frame. The cache stays cold for this scale.
     if !(1..=MAX_CELL_EDGE_PX).contains(&cell_w) || !(1..=MAX_CELL_EDGE_PX).contains(&cell_h) {
         return Ok(());

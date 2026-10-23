@@ -2,6 +2,87 @@
 // Copyright 2026 Andrew Yates
 
 //! The rule at the door.
+//!
+//! # The locks (each a `compile_fail` doctest with its rustc error code)
+//!
+//! A persistent hold cannot be written by hand: the bare spelling is a type error, a
+//! forged token has no constructor, and the decision row's seal is not optional:
+//!
+//! ```compile_fail,E0308
+//! use aterm_messages::{Hold, Message, Severity, tags};
+//! let _ = Message::new(tags::UPDATE, Severity::Warn, "x").hold(Hold::Standing);
+//! ```
+//!
+//! ```compile_fail,E0423
+//! use aterm_messages::{Hold, need::Persist};
+//! let _ = Hold::Standing(Persist(()));
+//! ```
+//!
+//! ```compile_fail,E0063
+//! use aterm_messages::{Duration, Hold};
+//! let _ = Hold::Ask { for_: Duration::from_secs(600) };
+//! ```
+//!
+//! A message's class is not a public field:
+//!
+//! ```compile_fail,E0616
+//! use aterm_messages::{Message, Severity, need::Need, tags};
+//! let mut m = Message::new(tags::UPDATE, Severity::Warn, "x");
+//! m.need = Need::Record;
+//! ```
+//!
+//! The vocabulary has no word for "waiting":
+//!
+//! ```compile_fail,E0599
+//! use aterm_messages::need::{Reason, Why};
+//! let _ = Why::Waiting(Reason::new("it is waiting for its work"));
+//! ```
+//!
+//! A snooze is not "the one action" — there is no constructor for it:
+//!
+//! ```compile_fail,E0599
+//! use aterm_messages::need::Mover;
+//! let _ = Mover::not_today("s-1", "2.1.284");
+//! ```
+//!
+//! ...and a raw [`crate::Intent`] is not a [`Mover`]:
+//!
+//! ```compile_fail,E0308
+//! use aterm_messages::{Intent, UpgradeWord, need::Then};
+//! let skip = Intent::AgentUpgrade { tab: "s-1".into(), to: "2.1.284".into(), word: UpgradeWord::Skip };
+//! let _ = Then::press(skip, "Skip this build");
+//! ```
+//!
+//! ...whose intent field cannot be written around the whitelist:
+//!
+//! ```compile_fail,E0423
+//! use aterm_messages::{Intent, UpgradeWord, need::Mover};
+//! let _ = Mover(Intent::AgentUpgrade { tab: "s-1".into(), to: "2.1.284".into(), word: UpgradeWord::Skip });
+//! ```
+//!
+//! A reason that may only be a flash cannot be made standing:
+//!
+//! ```compile_fail,E0308
+//! use aterm_messages::need::{Ask, Reason, Then, Why};
+//! let _ = Ask::standing(
+//!     Why::YourAction(Reason::new("you typed a bad key")),
+//!     Then::step("fix aterm.toml"),
+//! );
+//! ```
+//!
+//! An exception can never be promoted to an interrupt:
+//!
+//! ```compile_fail,E0277
+//! use aterm_messages::need::{Ask, LaterAsk};
+//! fn promote(later: LaterAsk) -> Ask { later.into() }
+//! ```
+//!
+//! ...and a horizon cannot be invented at a call site:
+//!
+//! ```compile_fail,E0423
+//! use aterm_messages::{Duration, need::Horizon};
+//! let _ = Horizon(Duration::ZERO);
+//! ```
 
 use crate::model::{Hold, Intent};
 use crate::text::clip;

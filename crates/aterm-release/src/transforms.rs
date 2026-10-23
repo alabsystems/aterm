@@ -236,8 +236,10 @@ fn in_target_dir(path: &str) -> bool {
 }
 
 /// astream's root manifest as the export writes it: the `[workspace]` table's `members`
-/// emptied and its `default-members` dropped, every other byte as committed.
-///
+/// emptied and its `default-members` dropped, every other byte as committed. The crates
+/// the export writes build as aterm's path dependencies, which inherit from this root
+/// without being its members, so a member list naming crates the export leaves out only
+/// makes the root a workspace nothing can load (the engine's closure guard loads it).
 /// # Errors
 /// The manifest has no `[workspace]` table, an array in it does not close, or the result
 /// does not parse with empty members.

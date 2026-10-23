@@ -69,7 +69,8 @@ pub fn usage_read(query: &[(String, String)]) -> &'static str {
     }
 }
 
-/// `spec` with every string `"@ISO+N@"` the UTC instant `now + N` (ISO 8601.
+/// `spec` with every string `"@ISO+N@"` the UTC instant `now + N` (ISO 8601,
+/// milliseconds) and every string `"@NOW+N@"` the unix second `now + N`.
 #[must_use]
 pub fn expand(spec: &J, now: i64) -> J {
     let offset = |s: &str, head: &str| -> Option<i64> {
@@ -264,7 +265,9 @@ pub fn composed() -> J {
     ])
 }
 
-/// The `oauthAccount` Claude Code 2.1.301 keeps in `.claude.json` once it has read [`composed`]'s.
+/// The `oauthAccount` Claude Code 2.1.301 keeps in `.claude.json` once it
+/// has read [`composed`]'s profile and bootstrap (the bundle's profile
+/// merge, then the bootstrap's tiers over it).
 #[must_use]
 pub fn composed_oauth_account(now_ms: i64) -> J {
     J::obj([

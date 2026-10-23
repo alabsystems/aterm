@@ -44,7 +44,7 @@ pub struct Exception {
     pub when: Urgency,
     /// Why a person, and not the machine.
     pub why: String,
-    /// The one thing.
+    /// The one thing to do.
     pub action: String,
     /// What clears it.
     pub clears: &'static str,
@@ -766,6 +766,7 @@ fn claude_login(
     }
     if !walled {
         // The row off the screen with nothing typed (a person's `/status`):
+        // nothing has failed yet.
         return Some(None);
     }
     let label = reading.login_label.as_deref().filter(|_| cfg.logins);

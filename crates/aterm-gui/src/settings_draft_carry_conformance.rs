@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of `aterm_models_update::native_update_settings_draft_carry_model`
-//! (`NativeUpdateSettingsDraftCarry`): an unsaved Settings draft rides a seamless
-//! self-update instead of holding it, and so does a document whose last save failed.
-//!
-//! Each schedule drives two real `App`s through the shipping code: the Settings view's
-//! input, the update preflight (`revalidate_native_update_safety`) behind its close
-//! barrier, the park's capture (`capture_handoff_layout`) round-tripped through the layout
-//! wire (`RestoreManifest::from_toml`), the successor's restore (`restore_into_window`),
-//! the Commit's layout comparison (`commit_layout_topology`) and the lane gate
-//! (`lane_carry_refusal`). After every step the projected state must equal the model's,
-//! the real verdicts must be the model's guards, and at each refusal the defect machine
-//! admits what the real code refused, so no pass is vacuous.
+//! Conformance tests for `NativeUpdateSettingsDraftCarry` across seamless updates.
 
 use aterm_models_update::native_update_settings_draft_carry_model;
 use aterm_spec::derive::Model;
@@ -26,23 +15,17 @@ use crate::native_update_admission::ApplyLane;
 use crate::restore::{RestoreManifest, RestoredSplitTree, RestoredView, SettingsDraftRestore};
 use crate::{App, WindowId};
 
-/// The model's `Surfaced`: the successor said which draft it could not reopen.
 const SURFACED: i64 = 9;
-/// Any running build; the lane gate compares it with the target's.
 const RUNNING: u64 = 5_000;
-/// The Settings row every schedule types into: a plain text field.
 const FIELD: &str = crate::prefs::EDIT_FONT_FAMILY;
 
 fn wid() -> WindowId {
     WindowId(0)
 }
 
-/// One outgoing App with one Settings tab, the successor it hands to, and the
-/// bookkeeping that names each draft version the model counts.
 struct Rig {
     parent: App,
     view: crate::tab_model::ViewId,
-    /// Version → the field's draft text; version 0 is no draft.
     texts: Vec<String>,
     phase: i64,
     older: i64,
@@ -54,8 +37,6 @@ struct Rig {
 }
 
 impl Rig {
-    /// A windowed outgoing App — its successor reopens native tabs, so its
-    /// drafts ride — with Settings open on the page that edits [`FIELD`].
     fn new() -> Self {
         let mut parent = App::headless_for_test();
         parent.carry_drafts_as_windowed_for_test();
@@ -84,7 +65,6 @@ impl Rig {
         i64::try_from(index).unwrap()
     }
 
-    /// The outgoing view's draft of [`FIELD`], as the update would carry it.
     fn parent_drafts(&self) -> CarriedFieldDrafts {
         let Some(AppViewState::Settings(state)) = self.parent.native_runtime.view_state(self.view)
         else {
@@ -107,15 +87,12 @@ impl Rig {
             .map(|draft| draft.text)
     }
 
-    /// The successor said which draft it lost: on glass, or, before its Commit, held to
-    /// be said at the Commit (until then the parent still holds the draft).
     fn successor_said_a_loss(&self) -> bool {
         self.successor.as_ref().is_some_and(|successor| {
             drafts_loss_row(successor).is_some() || successor.carried_settings_drafts_loss_owed()
         })
     }
 
-    /// Every model variable, read from real state.
     fn project(&self) -> State {
         let mut state = self.model.init_state();
         let draft = self
@@ -149,8 +126,6 @@ impl Rig {
         state
     }
 
-    /// The real step `op` must be the model's `actions`, fired in order from the state it
-    /// started in, and the invariant holds after it.
     fn step(&mut self, label: &str, actions: &[&str], op: impl FnOnce(&mut Self)) {
         let before = self.project();
         op(self);
@@ -158,8 +133,6 @@ impl Rig {
         crate::conformance_support::assert_fired(&self.model, label, actions, &before, &after);
     }
 
-    /// Type `text` into [`FIELD`] of the outgoing Settings view, as the
-    /// person does: focus the field, select what is there, type over it.
     fn type_draft(&mut self, label: &str, text: &str) {
         let text = text.to_string();
         self.step(label, &["Type"], |rig| {
@@ -168,8 +141,6 @@ impl Rig {
         });
     }
 
-    /// The real preflight must be the model's Start guard, and the close barrier it runs
-    /// behind must let a carried draft through.
     fn start(&mut self, label: &str) -> bool {
         let before = self.project();
         let barrier = self
@@ -209,9 +180,6 @@ impl Rig {
         });
     }
 
-    /// The seamless lane to a successor at least this build (`older == false`) or older: the
-    /// real lane gate must be the model's guard, and an admitted park captures the layout as
-    /// the update's park does.
     fn park(&mut self, label: &str, older: bool) -> bool {
         let before = self.project();
         let action = if older { "ParkOlder" } else { "Park" };
@@ -248,8 +216,6 @@ impl Rig {
         true
     }
 
-    /// The cold lane: the real gate must be the model's `ColdExec` guard. An admitted exec
-    /// replaces the app with one that reopens nothing.
     fn cold_exec(&mut self, label: &str) -> bool {
         let before = self.project();
         let refusal = lane_carry_refusal(
@@ -277,8 +243,6 @@ impl Rig {
             return false;
         }
         self.step(label, &["ColdExec"], |rig| {
-            // The exec'd build restores no layout: its Settings, if any, is a
-            // fresh view.
             let mut successor = App::headless_for_test();
             assert!(successor.open_settings_tab(SettingsRoute::TextFonts));
             rig.successor = Some(successor);
@@ -288,11 +252,6 @@ impl Rig {
         true
     }
 
-    /// The successor reads the layout the park captured off the real wire —
-    /// `wire` may rewrite the bytes, as a damaged sidecar would be — and
-    /// restores the Settings leaf exactly as the update's successor does. An
-    /// older successor's struct has no `settings_drafts`: it reads the same
-    /// layout without them.
     fn successor_restores(&mut self, label: &str, action: &str, wire: impl Fn(String) -> String) {
         let wire = wire(
             self.pending
@@ -310,8 +269,6 @@ impl Rig {
             let mut successor = App::headless_for_test();
             successor.incoming_handoff_pending = true;
             successor.restore_into_window(wid(), settings_only_layout(&layout));
-            // The end of the restore, as `apply_pending_restore` ends it: only
-            // now is what did not survive said.
             successor.settle_carried_settings_drafts();
             let (instance, _) = successor
                 .active_native_view(wid())
@@ -326,8 +283,6 @@ impl Rig {
         });
     }
 
-    /// The real Commit (layout comparison and native revalidation) must be the model's
-    /// Commit guard.
     fn commit(&mut self, label: &str) -> bool {
         let before = self.project();
         let pending = self.pending.as_ref().expect("a parked layout");
@@ -349,8 +304,6 @@ impl Rig {
         }
         self.step(label, &["Commit"], |rig| {
             rig.phase = 3;
-            // The successor's Commit wake: its freeze lifts, and what it owed
-            // (a loss of carried drafts among it) is said now.
             if let Some(successor) = rig.successor.as_mut() {
                 successor.incoming_handoff_pending = false;
                 #[cfg(unix)]
@@ -378,9 +331,6 @@ impl Rig {
     }
 }
 
-/// Type `text` as the font row's name: its text entry (what "Other…"
-/// opens; a closed font row is a list, which typing only searches), then the
-/// name in place of what it held.
 fn type_into_field(app: &mut App, view: crate::tab_model::ViewId, text: &str) {
     for event in [
         AppEvent::Action(crate::native_app::ActionInvocation {
@@ -394,7 +344,6 @@ fn type_into_field(app: &mut App, view: crate::tab_model::ViewId, text: &str) {
     }
 }
 
-/// The successor's loss row for carried Settings drafts, if it posted one.
 fn drafts_loss_row(app: &App) -> Option<aterm_messages::Message> {
     app.messages
         .live_rows()
@@ -430,8 +379,6 @@ fn for_each_settings_leaf(
     }
 }
 
-/// Window 0 of `manifest` with only its Settings tab: what the successor's
-/// restore does with a Settings leaf, without spawning shells for the rest.
 fn settings_only_layout(manifest: &RestoreManifest) -> crate::restore::WindowLayout {
     tab_only_layout(manifest, "settings")
 }
@@ -469,9 +416,6 @@ fn tab_only_layout(manifest: &RestoreManifest, restore_tag: &str) -> crate::rest
     }
 }
 
-/// A Settings draft typed and never saved rides the update: the close barrier and the
-/// preflight let it through, and the successor's view holds the text still unsaved (tab
-/// dirty, close held for review) and reports no loss.
 #[test]
 fn a_settings_draft_rides_the_update_and_reopens_unsaved() {
     let mut rig = Rig::new();
@@ -513,9 +457,6 @@ fn a_settings_draft_rides_the_update_and_reopens_unsaved() {
     );
 }
 
-/// A key typed into the field while the successor boots holds the Commit —
-/// the successor reopened the older draft — and the next attempt carries the
-/// newer one.
 #[test]
 fn typing_into_settings_during_the_overlap_holds_the_commit() {
     let mut rig = Rig::new();
@@ -536,9 +477,6 @@ fn typing_into_settings_during_the_overlap_holds_the_commit() {
     assert_eq!(rig.successor_draft().as_deref(), Some("Second Mono"));
 }
 
-/// The cold lane reopens nothing and an older successor ignores the carry:
-/// both refuse a token that carries a draft, in the person-facing shape, and
-/// a desk with no draft takes either.
 #[test]
 fn the_cold_lane_and_an_older_successor_refuse_a_carried_draft() {
     let mut rig = Rig::new();
@@ -562,8 +500,6 @@ fn the_cold_lane_and_an_older_successor_refuse_a_carried_draft() {
     assert!(cold.cold_exec("a clean desk execs cold"));
 }
 
-/// A carry the successor cannot read costs that draft, never the layout, the Settings leaf
-/// or the handoff, and the successor says so on glass.
 #[test]
 fn an_unreadable_carry_degrades_without_refusing() {
     let mut rig = Rig::new();
@@ -598,8 +534,6 @@ fn an_unreadable_carry_degrades_without_refusing() {
     );
 }
 
-/// A draft for a row the successor's build does not edit as text is said on glass with
-/// its text, so it can be typed again; drafts it can take land.
 #[test]
 fn a_draft_the_successor_cannot_reopen_is_said_with_its_text() {
     let mut rig = Rig::new();
@@ -631,9 +565,6 @@ fn a_draft_the_successor_cannot_reopen_is_said_with_its_text() {
     );
 }
 
-/// A successor that reopens nothing — a headless one here, the Windows replace
-/// alike — keeps the pre-carry hold, and so does the close
-/// barrier: the draft would close with the process.
 #[test]
 fn a_successor_that_reopens_nothing_keeps_the_settings_hold() {
     let mut app = App::headless_for_test();
@@ -660,9 +591,6 @@ fn a_successor_that_reopens_nothing_keeps_the_settings_hold() {
     );
 }
 
-/// A field mid-composition (an input method's marked text on screen) is held, not
-/// carried as its committed value, by the close barrier under the carried scope and by
-/// the preflight.
 #[test]
 fn a_draft_still_being_composed_holds_the_update() {
     let mut rig = Rig::new();
@@ -695,7 +623,6 @@ fn a_draft_still_being_composed_holds_the_update() {
     );
 }
 
-/// The tally's lane rule and cap, without a window.
 #[test]
 fn the_settings_tally_rides_only_where_the_successor_reopens_and_within_the_cap() {
     let view = |text: &str| CarriedFieldDrafts {
@@ -722,8 +649,6 @@ fn the_settings_tally_rides_only_where_the_successor_reopens_and_within_the_cap(
     assert!(over.held_why.is_some(), "past the cap says why");
 }
 
-/// Every Settings row fits one view's carry: a real capture never meets the
-/// per-view cap the layout's sanitize enforces.
 #[test]
 fn every_settings_row_fits_one_views_carry() {
     let rows = crate::prefs::editable_fields(&crate::app_config::Config::default()).len();
@@ -734,9 +659,6 @@ fn every_settings_row_fits_one_views_carry() {
     );
 }
 
-/// A document whose save failed rides the seamless update too, since its unsaved text is
-/// durable in the draft journal the successor replays; the cold lane and a successor that
-/// reopens nothing still hold it.
 #[test]
 fn a_document_whose_save_failed_rides_the_seamless_update_only() {
     let dir = std::env::temp_dir().join(format!(
@@ -745,8 +667,6 @@ fn a_document_whose_save_failed_rides_the_seamless_update_only() {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    // One file and one journal directory per App under test, so the headless
-    // case never reopens the windowed case's journal.
     let desk = |name: &str| {
         let root = dir.join(name);
         std::fs::create_dir_all(&root).unwrap();
@@ -770,8 +690,6 @@ fn a_document_whose_save_failed_rides_the_seamless_update_only() {
             AppEvent::TextInput(TextInputEvent::Commit("unsaved ".into())),
         )
         .unwrap();
-        // The real reducer path for a save the disk refused: begin it, then
-        // complete it with the host's failure.
         let snapshot = app.document_store.snapshot(document).unwrap();
         let pending = app.native_documents.persistence.begin(&snapshot).unwrap();
         app.native_runtime.set_document_saving(document, true);

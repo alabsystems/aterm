@@ -39,7 +39,6 @@ fn knobs() -> GlowKnobs {
     }
 }
 
-/// One host frame of the scripted session.
 struct Session {
     fx: CursorFx,
     glow: GlowConfig,
@@ -166,8 +165,6 @@ impl Session {
         self.fx.trail.note_synthetic_move(now);
     }
 
-    /// Type eight keys, hop six cells forward (a paste), type two more, then
-    /// drop to another row: every move a host's trail meets.
     fn script(&mut self) -> u64 {
         let mut hash = aterm_hash::FxHasher::default();
         let mut ms = 0;
@@ -208,12 +205,6 @@ impl Session {
     }
 }
 
-/// THE KNOB LAW IS WHAT THE FRAME READS: for every built-in style, on a
-/// dark and a light ground and with a block and a bar cursor, changing one
-/// knob changes the scripted session's frames exactly when
-/// `GlowStyle::reads_knob` says the style reads it. Both directions are the
-/// check: a knob the law lists must show (no dead row in Settings), and a
-/// knob it does not must leave every frame byte-identical (no hidden path).
 #[test]
 fn the_knob_law_is_what_the_frame_reads() {
     let styles = [
@@ -300,9 +291,6 @@ fn the_knob_law_is_what_the_frame_reads() {
     );
 }
 
-/// The ring knob reaches the accent only while the ring is on: Phaser's and
-/// Sparkle's accent colours nothing else, so with the ring off it is dead,
-/// as the law's context says.
 #[test]
 fn the_accent_follows_the_ring_where_the_ring_is_its_only_mark() {
     for raw in ["phaser", "sparkle"] {
@@ -318,11 +306,6 @@ fn the_accent_follows_the_ring_where_the_ring_is_its_only_mark() {
     }
 }
 
-/// THE BODIES ON PAPER: on a light ground the comet's nucleus, the light
-/// rod (bar and emitter block) and every crown are ink under the letters:
-/// the frame carries no additive light at all, and the under-ink stream
-/// holds source-over ink around the caret. Negative control: the same
-/// frames on a dark ground carry the bodies' additive light.
 #[test]
 fn light_bodies_are_ink_under_the_letters() {
     for (raw, bar) in [
@@ -369,8 +352,6 @@ fn light_bodies_are_ink_under_the_letters() {
     }
 }
 
-/// How dark the under-ink makes the white paper, summed over pixel columns
-/// `x0..x1` (composited in emission order).
 fn ink_mass(under: &[aterm_render::GlowQuad], x0: u16, x1: u16) -> f32 {
     let mut px = std::collections::HashMap::<(u16, u16), [f32; 3]>::new();
     for q in under.iter().filter(|q| q.alpha > 0) {
@@ -394,12 +375,6 @@ fn ink_mass(under: &[aterm_render::GlowQuad], x0: u16, x1: u16) -> f32 {
         .sum()
 }
 
-/// THE LIGHT COMET HAS A BODY AND A HEAD: typed on paper, the comet lays at
-/// least three quarters of the beam's ink behind the caret (it was about a
-/// third: a tail that tapered twice and a head dropped), and at rest it
-/// keeps a round head of ink past both edges of its block, as the dark coma
-/// is always there. Negative control: the beam's emitter block lays no ink
-/// beside it on paper.
 #[test]
 fn the_light_comet_carries_a_body_and_a_round_head() {
     let g = geom();

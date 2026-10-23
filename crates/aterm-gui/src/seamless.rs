@@ -43,7 +43,7 @@ const MAX_HANDOFF_HISTORY_LINES: u32 = 256;
 /// The producer's per-session history target: the wire ceiling, so a healthy capture carries all the protocol allows.
 #[must_use]
 #[cfg(unix)]
-pub(crate) fn max_handoff_history_lines() -> u32 {
+pub(crate) const fn max_handoff_history_lines() -> u32 {
     MAX_HANDOFF_HISTORY_LINES
 }
 
@@ -69,7 +69,7 @@ struct HandoffEnvPresence {
 }
 
 #[cfg(any(unix, test))]
-fn handoff_is_modern_overlap(present: HandoffEnvPresence) -> bool {
+const fn handoff_is_modern_overlap(present: HandoffEnvPresence) -> bool {
     let HandoffEnvPresence {
         manifest,
         fds,
@@ -352,7 +352,7 @@ impl ScreenDigestRefusal {
     /// The session this refusal blames, which [`settle_wire_carries`] lowers; `None` for the pool-wide arms (a duplicate id names an id, but as an identity fact).
     #[must_use]
     #[cfg(any(unix, test))]
-    pub(crate) fn local_id(&self) -> Option<u64> {
+    pub(crate) const fn local_id(&self) -> Option<u64> {
         match *self {
             Self::TooManySessions { .. }
             | Self::Alloc { .. }
@@ -490,6 +490,7 @@ pub(crate) fn checkpoint_shape_refusal(
     local_id: u64,
     checkpoint: &TerminalCheckpoint,
 ) -> Option<ScreenDigestRefusal> {
+    // A carried parser (`checkpoint.parser`) is not Ground and is not refused: the successor
     // continues it. Refused is a parser left mid-sequence with nothing carried.
     if !checkpoint.parser_ground && checkpoint.parser.is_none() {
         return Some(ScreenDigestRefusal::ParserNotGround { local_id });
@@ -1302,7 +1303,7 @@ impl WireCaps {
     /// [`Self::for_target`] with the running build named, so a test can pin both directions of a hop.
     #[must_use]
     #[cfg(any(unix, test))]
-    pub(crate) fn for_hop(running_build: u64, target_build: u64) -> Self {
+    pub(crate) const fn for_hop(running_build: u64, target_build: u64) -> Self {
         if target_build >= running_build {
             Self::current()
         } else if target_build >= RELAXED_CONSUMER_FROM_BUILD {
@@ -1472,7 +1473,7 @@ pub(crate) fn checkpoint_capture_budget_bytes(rows: u16, cols: u16, history: u32
 /// The process-wide aggregate cell ceiling, so the producer prices a whole pool against the number `admit_checkpoint_dimensions` enforces.
 #[must_use]
 #[cfg(unix)]
-pub(crate) fn max_handoff_aggregate_grid_cells() -> u64 {
+pub(crate) const fn max_handoff_aggregate_grid_cells() -> u64 {
     MAX_HANDOFF_AGGREGATE_GRID_CELLS
 }
 
@@ -3688,6 +3689,7 @@ fn attest_handoff_parent_from(
         return None;
     }
     if creator > 1 && creator != pid {
+        // A live creator that is not who the environment named: no published detail overrides
         // the kernel. This arm refuses a stale handoff block re-entering through a shell.
         return None;
     }
@@ -3850,14 +3852,14 @@ pub(crate) fn take_parent_reads_passing_exit_from(env: &mut HandoffEnv) -> bool 
 
 /// The turn-id count this successor continues from, given the manifest's `next_turn_id`: past it by one more overlap reserve (`control::TURN_ID_RESERVE`).
 #[must_use]
-pub(crate) fn intake_turn_floor(next_turn_id: u64) -> u64 {
+pub(crate) const fn intake_turn_floor(next_turn_id: u64) -> u64 {
     next_turn_id.saturating_add(crate::control::TURN_ID_RESERVE)
 }
 
 /// The exit status of a successor that refused the carried control-socket witness (`main_entry`'s fixed-socket check).
 #[cfg(unix)]
 #[must_use]
-pub(crate) fn endpoint_refusal_exit(parent_reads_passing: bool) -> i32 {
+pub(crate) const fn endpoint_refusal_exit(parent_reads_passing: bool) -> i32 {
     if parent_reads_passing {
         EXIT_SUCCESSOR_PASSING
     } else {
@@ -3903,7 +3905,7 @@ impl PrearmedIncomingFds {
         pairs
     }
 
-    pub(crate) fn blocks_boot_apply(&self) -> bool {
+    pub(crate) const fn blocks_boot_apply(&self) -> bool {
         self.recognizable && !self.valid
     }
 
@@ -4309,7 +4311,11 @@ pub(crate) fn incoming_offered() -> bool {
 
 /// Whether a successor whose overlap authority is incomplete (`overlap_degraded`: a readiness or Commit channel arrived, and the pair was not admitted) must exit before any window instead of booting fresh: when it adopted sessions (they are the parked parent's too), and when it was offered some and the intake refused them all, since a cold boot would take `session.toml`, crash journals and a shell while the parent still owns every session.
 #[must_use]
-pub(crate) fn overlap_intake_exits(overlap_degraded: bool, adopted: usize, offered: bool) -> bool {
+pub(crate) const fn overlap_intake_exits(
+    overlap_degraded: bool,
+    adopted: usize,
+    offered: bool,
+) -> bool {
     overlap_degraded && (adopted > 0 || offered)
 }
 
@@ -4329,7 +4335,7 @@ pub(crate) enum RefusedIntakeLeave {
 impl RefusedIntakeLeave {
     /// Whether this leave gives back the boot-trial launch this process counted ([`give_back_refused_intake_launch`]): both leaves that say the refusal is not a verdict on the bytes.
     #[must_use]
-    pub(crate) fn gives_back_trial_launch(self) -> bool {
+    pub(crate) const fn gives_back_trial_launch(self) -> bool {
         matches!(self, Self::Passing | Self::ParentEndsIt)
     }
 }
@@ -4527,11 +4533,11 @@ pub(crate) struct CommitReceiver {
 #[cfg(unix)]
 impl CommitReceiver {
     /// Reuse the already-attested identity when the control listener waits for this exact predecessor to exit after Commit.
-    pub(crate) fn parent(&self) -> AttestedParent {
+    pub(crate) const fn parent(&self) -> AttestedParent {
         self.parent
     }
 
-    fn raw(fd: std::os::fd::OwnedFd, fail_stop: bool, parent: AttestedParent) -> Self {
+    const fn raw(fd: std::os::fd::OwnedFd, fail_stop: bool, parent: AttestedParent) -> Self {
         Self {
             fd: Some(fd),
             wire: None,
@@ -4559,6 +4565,8 @@ impl CommitReceiver {
                     // SAFETY: one initialized pollfd; the short timeout bounds parent-death detection even if another process inherited a leaked writer during Darwin's non-atomic pipe+CLOEXEC setup.
                     let polled = unsafe { libc::poll(&mut pollfd, 1, 10) };
                     if polled > 0 {
+                        // Data always wins over parent-death detection: Commit's
+                        // single <=PIPE_BUF write happens before the parent's
                         // `_exit`, and remains readable after reparenting.
                         if pollfd.revents & libc::POLLIN != 0 {
                             break read_atomic_wire(&fd);
@@ -4589,10 +4597,12 @@ impl CommitReceiver {
                 if let Err(end) = received
                     && fail_stop
                 {
+                    // No exact Commit can arrive now, so this candidate can
                     // never become authoritative.
                     fail_stop_without_commit(parent, end)
                 }
                 if send.send(received).is_err() && fail_stop {
+                    // The event-loop authority disappeared while the parent was
                     // deciding. Remaining alive readerless is never terminal.
                     fail_stop_without_commit(parent, NoCommit::ReceiverGone)
                 }
@@ -4701,6 +4711,9 @@ pub(crate) fn commit_and_exit(
         // SAFETY: one atomic write from a live fixed buffer to the private pipe.
         let wrote = unsafe { libc::write(fd.as_raw_fd(), wire.as_ptr().cast(), wire.len()) };
         if wrote == isize::try_from(wire.len()).unwrap_or(-1) {
+            // This is the protocol's point of no return. `_exit` skips every
+            // App/Session destructor that could SIGHUP the handed-off PTYs; the
+            // crash marker goes with it, because handing off IS a clean end
             // (`crash_signal::clean_exit_now`).
             crate::crash_signal::clean_exit_now(0)
         }
@@ -5296,6 +5309,7 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
     }
     let offered = manifest_path.is_some() || env_nonce.is_some() || fds_wire.is_some();
     let (Some(path), Some(env_nonce), Some(fds_wire)) = (manifest_path, env_nonce, fds_wire) else {
+        // No handoff at all is the ordinary cold boot, and says nothing; part
         // of one is a refusal, and says which.
         if offered {
             return refused_whole(

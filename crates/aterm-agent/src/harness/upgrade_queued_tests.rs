@@ -1,17 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Upgrade notices queued behind a usage limit, replayed from a recorded Claude Code 2.1.280
-//! session through the real driver over the login wall tests' apparatus, and the Tier-1 bind
-//! of `harness_upgrade_limit_queue_model` (aterm-spec).
+//! Tests for upgrade notices queued behind a usage limit and conformance with `harness_upgrade_limit_queue_model`.
 
 use super::*;
 
-/// The owner's conversation.
 const OWNERS_SESSION: &str = "25e3b26e-36c9-41cc-bcd0-d0e0b6a70828";
 
-/// The four notices' READY markers, in the order they were typed (the round's
-/// salt `1790373039`).
 const MARKERS: [&str; 4] = [
     "ATERM-UPGRADE-READY-504f8ea5",
     "ATERM-UPGRADE-READY-558d0228",
@@ -19,27 +14,20 @@ const MARKERS: [&str; 4] = [
     "ATERM-UPGRADE-READY-6a57ff7a",
 ];
 
-/// The round's salt, from the owner's state file.
 const OWNERS_SALT: u64 = 1_790_373_039;
 
-/// The recorded state file after a give-up behind the limit, every byte but the tab kept.
 const OWNERS_STATE: &str = r#"{"agent":"","asks":0,"at":0,"cause":"","codex_home":"","confirm_by":0,"cwd":"","done_at":0,"exited_at":0,"from":"2.1.280","hold_seen":1790539070,"hold_since":1790539070,"last_seq":4735,"launch_model":"","left_at":0,"left_typed":"","line":"","mark":0,"marker":"ATERM-UPGRADE-READY-6a57ff7a","mode":"","model_before":"","model_list":"","noted":"","notice_pid":6099,"notice_start":"Thu Sep 24 02:03:13 2026","outcome":"","pending_since":0,"phase":"failed","pid":0,"prompt":"","ready_since":0,"release":"","request":"-","request_at":0,"request_tab":"","resumed_on":"","resumed_pid":0,"salt":1790373039,"seq_since":1790539070,"shell":0,"source":"managed","tab":"s-c543f4e0edd3439e5791","thread":"","to":"2.1.283","twin":"","wait":"failed","wait_since":1790539070,"why":"unanswered"}"#;
 
-/// Claude Code's weekly-limit row as recorded (ids cut), its reset the recorded one while that
-/// is a day ahead or more, else a day from now.
 fn limit_row(ts: &str, session: &str) -> String {
     limit_row_until(ts, session, 1_791_046_800_u64.max(now_s() + 86_400))
 }
 
-/// [`limit_row`] naming the reset `resets` (unix seconds).
 fn limit_row_until(ts: &str, session: &str, resets: u64) -> String {
     format!(
         r#"{{"parentUuid":"00000000-0000-4000-8000-000000000031","isSidechain":false,"type":"assistant","uuid":"00000000-0000-4000-8000-000000000032","timestamp":"{ts}","message":{{"diagnostics":null,"id":"00000000-0000-4000-8000-000000000033","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"You've hit your weekly limit · resets Oct 3 at 10am (America/Los_Angeles)"}}],"context_management":null}},"requestId":"req_0000000000000000000002","quotaLimits":{{"status":"rejected","resetsAt":{resets},"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"perTurnEffort":"xhigh","session_id":"{session}","userType":"external","entrypoint":"cli","cwd":"/Users//owner/aterm","sessionId":"{session}","version":"2.1.280","gitBranch":"main"}}"#
     )
 }
 
-/// An API rate limit's row at `at` (unix seconds): no `quotaLimits` or `error` key, so it names
-/// no reset and is read by the wall table's words alone.
 fn api_limit_row(at: u64) -> String {
     limit_row_until(&ts(at), OWNERS_SESSION, 0)
         .replace(
@@ -53,7 +41,6 @@ fn api_limit_row(at: u64) -> String {
         )
 }
 
-/// The notice with `marker` as this build types it.
 fn notice(marker: &str) -> String {
     upgrade::prepare_prompt(
         &Version::parse("2.1.280").expect("from"),
@@ -63,8 +50,6 @@ fn notice(marker: &str) -> String {
     )
 }
 
-/// The owner's task, five hours before `now`: the conversation has one, so
-/// the upgrade resumes it rather than starting a fresh one.
 fn tasked_at(now: u64) -> String {
     typed_row(
         &ts(now - 5 * 3_600),
@@ -74,9 +59,6 @@ fn tasked_at(now: u64) -> String {
     )
 }
 
-/// The owner's rows: the task, each notice of `asked` answered by the limit, then with
-/// `went_on = (ago, said)` the owner's `first, continue` and the model's row `ago` seconds
-/// before `now`, saying `said`.
 fn owners_rows(now: u64, asked: &[&str], went_on: Option<(u64, &str)>) -> String {
     let mut rows = vec![tasked_at(now)];
     let first = now - 4 * 3_600;
@@ -98,8 +80,6 @@ fn owners_rows(now: u64, asked: &[&str], went_on: Option<(u64, &str)>) -> String
     rows.join("\n") + "\n"
 }
 
-/// An announced upgrade of the owner's session: `asks` notices typed, the
-/// latest one's window run out, the notice's fences on the stand-in.
 fn announced(asks: usize) -> impl FnOnce(&SessionFile, u64) -> St {
     move |sf, now| {
         let asked: Vec<String> = MARKERS[..asks].iter().map(|m| (*m).to_string()).collect();
@@ -125,8 +105,6 @@ fn announced(asks: usize) -> impl FnOnce(&SessionFile, u64) -> St {
     }
 }
 
-/// [`OWNERS_STATE`] with the stand-in's pid, start and tab, and `from` the stand-in's build
-/// (1.0.0: an older build's record names its process by the build it was found on).
 fn owners_state_for(sf: &SessionFile) -> St {
     let text = OWNERS_STATE
         .replace(r#""from":"2.1.280""#, r#""from":"1.0.0""#)
@@ -140,10 +118,6 @@ fn owners_state_for(sf: &SessionFile) -> St {
     St::from_json(&text).expect("the owner's state reads")
 }
 
-/// A notice the limit answered, with no model row since, is never typed again behind itself,
-/// however long ago its window ran out and whatever the screen shows: the visit waits
-/// `limited` and holds the window. Once the model takes it, the window opens then. Negative
-/// control: a notice the model read is asked again.
 #[cfg(unix)]
 #[test]
 fn a_notice_queued_behind_the_limit_is_never_asked_again_behind_it() {
@@ -190,7 +164,6 @@ fn a_notice_queued_behind_the_limit_is_never_asked_again_behind_it() {
         opened.phase
     );
 
-    // Negative control: read as it came, its window run out.
     let first = now - 4 * 3_600;
     let read = [
         tasked_at(now),
@@ -217,9 +190,6 @@ fn a_notice_queued_behind_the_limit_is_never_asked_again_behind_it() {
     assert_eq!(again.typed.len(), 1);
 }
 
-/// The recorded give-up (four notices queued behind the limit, no stamp of when) re-arms on
-/// its first look. While the transcript says the limit holds, the new round's first notice
-/// waits `limited`; once the model took the four, it asks with a marker of its own.
 #[cfg(unix)]
 #[test]
 fn the_give_up_0_93_0_spent_behind_the_limit_rests_then_waits_out_the_limit() {
@@ -273,11 +243,6 @@ fn the_give_up_0_93_0_spent_behind_the_limit_rests_then_waits_out_the_limit() {
     }
 }
 
-/// The quiet upgrade moves a tab whose weekly-limit notice is still on screen as any idle
-/// point once [`LIMIT_GRACE_S`] past the row's named reset: the restart is reached with
-/// nothing typed. Negative controls, each `limited` with nothing typed: a minute short of the
-/// grace; a row naming no reset (none is guessed); and the ask flow, where typing over a
-/// standing notice stays `HarnessUpgradeLimitQueue`'s decision.
 #[cfg(unix)]
 #[test]
 fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
@@ -344,7 +309,6 @@ fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
         ("wait:changed-before-signal", 0),
         "the restart reached, nothing typed: {moved:?}"
     );
-    // Negative controls.
     for (label, row, quiet) in [
         ("c9-short", named(now - LIMIT_GRACE_S + 60), true),
         ("c9-unnamed", api_limit_row(now - 8_000), true),
@@ -370,9 +334,6 @@ fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
     }
 }
 
-/// A limit row naming no reset holds the session (`limited`) but leaves the record no reset
-/// (`St::limit_until` `0`), so the view never says a reset passed. Negative control: the
-/// weekly row's reset is kept and told [`LIMIT_GRACE_S`] past it.
 #[cfg(unix)]
 #[test]
 fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
@@ -417,8 +378,6 @@ fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
     let row = view("lim-api-view", &saved);
     let later = row_at + REASK_S + LIMIT_GRACE_S;
     assert!(!row.limit_passed(later), "no named reset has passed");
-    // Negative control: the weekly row names its reset. One clock reading names it in the row
-    // and in the check: the visit above can take seconds on a loaded machine.
     let reset = 1_791_046_800_u64.max(now_s() + 86_400);
     let weekly = format!(
         "{}\n{}\n",
@@ -438,8 +397,6 @@ fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
     assert!(saved.limit_until.abs_diff(reset) <= 2, "{saved:?}");
     let row = view("lim-weekly-view", &saved);
     assert!(row.limit_passed(saved.limit_until + LIMIT_GRACE_S));
-    // A spend wall naming no reset: kept as money (`St::limit_spend`), the owner's hold, which
-    // the view never bounds by the week nor tells as passed.
     let spend = format!(
         "{}\n{}\n",
         tasked_at(now),
@@ -465,32 +422,20 @@ fn a_limit_row_naming_no_reset_leaves_the_view_no_reset() {
     assert_eq!(row.limit_ends_at(), None, "no usage window");
 }
 
-// ------------------------------------------- Tier-1: HarnessUpgradeLimitQueue
-
 use aterm_spec::derive::Model;
 
-/// A state of `harness_upgrade_limit_queue_model`.
 type S = std::collections::BTreeMap<&'static str, i64>;
 
-/// The walk's clock: a unix second after every stamp it writes.
 const WALK_NOW: u64 = 1_790_600_000;
 
-/// A day: the model's day-long rest (`rested == 2`), the longest a full queue
-/// rests ([`upgrade::QUEUE_REST_MAX_S`], asserted equal in the bind).
 const DAY: u64 = 86_400;
 
-/// The model's `untaken` at its top, `RetypeMax + 1 + Daily`: that many
-/// notices unread or more, the queue's rest grown to a day.
 fn walk_top() -> i64 {
     i64::from(upgrade::REQUEUE_MAX + 1 + upgrade::QUEUE_REST_DOUBLINGS)
 }
 
-/// A notice's marker no ask of the walked round mints: one an earlier round,
-/// another target or an older build typed.
 const FOREIGN_MARKER: &str = "ATERM-UPGRADE-READY-00c0ffee";
 
-/// Ask `k`'s READY marker, as the driver mints it (the round's salt plus the
-/// ask), and the one every copy of that ask carries.
 fn ask_marker(k: i64) -> String {
     upgrade::ready_marker(
         OWNERS_SESSION,
@@ -499,8 +444,6 @@ fn ask_marker(k: i64) -> String {
     )
 }
 
-/// The screen a model state stands for: Claude Code's end of turn at the
-/// session limit where `shown`, else an idle, empty composer.
 fn walk_screen(s: &S) -> Vec<String> {
     if s["shown"] == 1 {
         aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_SESSION_LIMIT)
@@ -510,9 +453,6 @@ fn walk_screen(s: &S) -> Vec<String> {
     }
 }
 
-/// One rendering of a model state: a transcript's tail, and where the latest
-/// ask's window starts by the state's own record (`None`: where the state's
-/// `window` puts it).
 struct Shape {
     name: String,
     tail: String,
@@ -529,13 +469,6 @@ impl Shape {
     }
 }
 
-/// The transcripts a model state stands for, each read the same by the real readers. Earlier
-/// asks are typed and read as they came. The latest ask, with nothing `untaken`: read as it
-/// came, or met by the limit and taken later (its recorded window starting when typed, so
-/// only the take opens it), then the session's last word. Else `untaken` copies (at the top,
-/// also one more), each met by a limit row: its bound ahead where `held`, else over (API
-/// limit, passed reset, or a `/login`; the first copy possibly an earlier round's), and past a
-/// full queue's rest where `rested`.
 fn walk_transcripts(s: &S) -> Vec<Shape> {
     let asks = s["asks"];
     if asks == 0 || s["untaken"] > 0 {
@@ -578,11 +511,7 @@ fn walk_transcripts(s: &S) -> Vec<Shape> {
     out
 }
 
-/// [`walk_transcripts`] with the latest ask's rows `latest` (none: nothing
-/// asked, or its copies are `untaken`).
 fn walk_shapes(s: &S, latest: Option<Vec<String>>) -> Vec<Shape> {
-    // How long ago the rest began: a day and a minute for a day's rest, three minutes short of
-    // a day for a shorter one.
     let rest = if s["rested"] == 2 {
         DAY + 60
     } else {
@@ -591,7 +520,6 @@ fn walk_shapes(s: &S, latest: Option<Vec<String>>) -> Vec<Shape> {
     walk_shapes_resting(s, latest, rest)
 }
 
-/// [`walk_shapes`] with a `rested` state's word run out `rest` seconds ago.
 fn walk_shapes_resting(s: &S, latest: Option<Vec<String>>, rest: u64) -> Vec<Shape> {
     let now = WALK_NOW;
     let asks = s["asks"];
@@ -626,8 +554,6 @@ fn walk_shapes_resting(s: &S, latest: Option<Vec<String>>, rest: u64) -> Vec<Sha
         let marker = ask_marker(asks);
         let copy =
             |at: u64, marker: &str| typed_row(&ts(at), OWNERS_SESSION, &notice(marker), "typed");
-        // The latest copy's typing time, and its limit's rows, by the
-        // transcript's word on it.
         let rested = s["rested"] > 0;
         let lasts: Vec<(&str, u64, Vec<String>)> = if s["held"] == 1 {
             vec![
@@ -694,7 +620,6 @@ fn walk_shapes_resting(s: &S, latest: Option<Vec<String>>, rest: u64) -> Vec<Sha
                 ),
             ]
         };
-        // The model's top as that many notices, and as one more.
         let counts: Vec<u64> = if s["untaken"] == walk_top() {
             vec![untaken, untaken + 1]
         } else {
@@ -703,8 +628,6 @@ fn walk_shapes_resting(s: &S, latest: Option<Vec<String>>, rest: u64) -> Vec<Sha
         let mut out = Vec::new();
         for n in counts {
             for foreign in [false, true] {
-                // An earlier round's notice as the first in the queue: every
-                // upgrade notice counts, whatever its marker.
                 if foreign && n < 2 {
                     continue;
                 }
@@ -789,18 +712,12 @@ fn walk_shapes_resting(s: &S, latest: Option<Vec<String>>, rest: u64) -> Vec<Sha
     ]
 }
 
-/// The rest probe for a full queue that has not rested: its renderings with the limit's word
-/// run out three minutes short of a day, where a shorter rest has run and a day's has not.
 fn walk_rest_probe(s: &S) -> Vec<Shape> {
     let mut probed = s.clone();
     probed.insert("rested", 1);
     walk_shapes(&probed, None)
 }
 
-/// The short rest's end for a full queue the model says rested less than a day (`rested == 1`):
-/// renderings with the limit's word run out a minute either side of [`upgrade::queue_rest`] of
-/// its `untaken` (`true`: still resting, so the real code must wait `queued`). This pins the
-/// real rest to the copies the real fold counts (every unread copy, whatever its round).
 fn walk_short_rest_probe(s: &S) -> Vec<(Shape, bool)> {
     let untaken = u32::try_from(s["untaken"]).expect("untaken");
     let rest = upgrade::queue_rest(untaken);
@@ -817,31 +734,18 @@ fn walk_short_rest_probe(s: &S) -> Vec<(Shape, bool)> {
     out
 }
 
-/// What the real upgrade decided at a look at one rendering of a state.
 #[derive(Clone, Debug)]
 struct Walked {
-    /// The model's action the step is (none: it waited).
     taken: Option<&'static str>,
-    /// The step itself.
     step: Step,
-    /// The ask a notice goes as ([`upgrade::announce_asks`]).
     asks: u32,
-    /// The re-ask clock runs at this look.
     runs: bool,
-    /// The facts the fold left: the limit read, a full queue, a notice to
-    /// type again.
     limited: bool,
     queued: bool,
     undelivered: bool,
-    /// [`queue_facts`] said the notice before it never reached the model.
     requeued: bool,
 }
 
-/// The real decision at the look a model state stands for, over one rendering, in the
-/// driver's order: the screen's limit and the clock, [`queue_facts`] under `request` (`--now`
-/// given at this look), [`upgrade::requested_step`] (no READY in the tail, no round rested:
-/// those are the never-strands model's), the ask count, and whether the clock runs (a look a
-/// window later, same facts, leaves the window where it was). `s` holds only [`DECIDE_VARS`].
 fn walk_decide(s: &S, shape: &Shape, request: &Request) -> Walked {
     let now = WALK_NOW;
     let asks = u32::try_from(s["asks"]).expect("asks");
@@ -909,14 +813,8 @@ fn walk_decide(s: &S, shape: &Shape, request: &Request) -> Walked {
     }
 }
 
-/// The variables [`walk_decide`] reads; the rendering-only ones (`held`, `untaken`, `rested`)
-/// and the model's own records it never reads.
 const DECIDE_VARS: [&str; 4] = ["asks", "phase", "window", "shown"];
 
-/// [`walk_decide`] memoised on its inputs: [`DECIDE_VARS`], the rendering's tail and window
-/// start, and the request. It is pure (fresh `St` and `Facts` at [`WALK_NOW`]) and is handed
-/// only those variables, so reading another panics rather than going unkeyed. About 16k
-/// decisions share under 3k inputs (15.7 s to 3.1 s).
 #[derive(Default)]
 struct Decisions(std::collections::BTreeMap<(S, String, Option<u64>, bool), Walked>);
 
@@ -935,13 +833,8 @@ impl Decisions {
     }
 }
 
-/// The variables [`walk_transcripts`] renders from; `phase`, `shown` and the model's own
-/// records it never reads.
 const RENDER_VARS: [&str; 5] = ["asks", "untaken", "window", "rested", "held"];
 
-/// [`walk_transcripts`] memoised on [`RENDER_VARS`]: it is pure and is handed only those
-/// variables, so reading another panics rather than going unkeyed (a seventh of the test's
-/// instructions saved).
 #[derive(Default)]
 struct Renderings(std::collections::BTreeMap<S, Vec<Shape>>);
 
@@ -952,9 +845,6 @@ impl Renderings {
     }
 }
 
-/// Whether `m` at `s` enables exactly the step the real code took (under the owner's `--now`,
-/// `NowAsks` stands in for `Retype`), to the same ask count, and lets the window run out
-/// (`Elapse`) exactly where the real clock runs.
 fn walk_agrees(m: &Model, s: &S, w: &Walked, owner: bool) -> bool {
     let enabled = |a: &str| {
         m.action_enabled(a, s) || (owner && a == "Retype" && m.action_enabled("NowAsks", s))
@@ -975,7 +865,6 @@ fn walk_agrees(m: &Model, s: &S, w: &Walked, owner: bool) -> bool {
     steps && asks && clock
 }
 
-/// Every state `m` reaches, invariants unchecked.
 fn walk_reachable(m: &Model) -> Vec<S> {
     let mut seen = std::collections::BTreeSet::new();
     let mut queue = std::collections::VecDeque::from([m.init_state()]);
@@ -995,7 +884,6 @@ fn walk_reachable(m: &Model) -> Vec<S> {
     out
 }
 
-/// The model's value of the constant `name`.
 fn walk_const(m: &Model, name: &str) -> i64 {
     m.consts
         .iter()
@@ -1004,10 +892,6 @@ fn walk_const(m: &Model, name: &str) -> i64 {
         .expect("a constant")
 }
 
-/// Tier-1: on every reachable state of `harness_upgrade_limit_queue_model`, over every
-/// rendering, the real readers, fold, clock and step take exactly the steps the model's guards
-/// allow, under the real bounds and queue rest ([`walk_short_rest_probe`]). Negative controls:
-/// `Buggy` and each defect knob disagree with the real code somewhere.
 #[test]
 fn the_real_queue_conforms_to_the_limit_queue_model() {
     use aterm_models_harness::harness_upgrade_limit_queue_model;
@@ -1024,8 +908,6 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
     );
     assert_eq!(upgrade::QUEUE_REST_MAX_S, DAY);
     let retype_max = i64::from(upgrade::REQUEUE_MAX);
-    // Each defect is caught by one look where it disagrees: a defective model
-    // is judged until then.
     let mut uncaught: Vec<(&str, Model)> =
         std::iter::once(("Buggy", interp::with_buggy(&model, 1)))
             .chain(
@@ -1109,7 +991,6 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
             );
             taken.extend(w.taken);
             uncaught.retain(|(_, m)| walk_agrees(m, s, &w, false));
-            // The owner's `--now`, given after the latest notice.
             let now = decisions.decide(s, shape, &Request::Now);
             assert_eq!(now.limited, reads_limit, "the owner's word at {at}");
             assert!(!now.queued, "the owner's word lifts a full queue at {at}");

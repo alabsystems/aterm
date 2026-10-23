@@ -30,7 +30,7 @@ pub(crate) struct TaskFact {
     pub(crate) stalled: bool,
     /// Its `why=`.
     pub(crate) why: Option<&'static str>,
-    /// The rev it entered its state.
+    /// The rev it entered its state at: one stall, one key.
     pub(crate) entered: u64,
 }
 
@@ -204,7 +204,9 @@ impl HarnessNeeds {
         &self.entry
     }
 
-    /// The needs, where `standing`.
+    /// The needs, where `standing` — the needs owner's entry as the server
+    /// stored it, `None` where none stands — is the text they were told
+    /// with, both through the presentation sanitizer; else `None`.
     #[must_use]
     pub(crate) fn words_for(&self, standing: Option<&str>) -> Option<&[String]> {
         let standing = standing?.trim();
@@ -679,6 +681,7 @@ fn wall_outcome(
         }
         kind if LIMIT_WALLS.contains(&kind) => {
             // Answered by this host's harness, or waited out by a live
+            // supervisor loop that says so (its `kind=wait`).
             if answered || waited {
                 return (None, wait(WaitWord::Limit), None);
             }

@@ -339,11 +339,11 @@ pub mod glyph_class {
     pub const DIGIT: u8 = 3;
     /// `.`: the full stop.
     pub const STOP: u8 = 4;
-    /// `(` `` `{` — the brackets that open (not a pluck: they open).
+    /// `(` `[` `{` — the brackets that open (not a pluck: they open).
     pub const OPEN: u8 = 5;
-    /// `)` `` `}` — the brackets that close.
+    /// `)` `]` `}` — the brackets that close.
     pub const CLOSE: u8 = 6;
-    /// `'` `"` `` ` `` — the quotes.`
+    /// `'` `"` `` ` `` — the quotes.
     pub const QUOTE: u8 = 7;
     /// `_` `~` `\` `|`: a line drawn.
     pub const LINE: u8 = 8;
@@ -1345,6 +1345,9 @@ impl TrailSynth {
 
     /// [`Self::push`] with the v2 side-car (§16 rows 6-8).
     pub fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
+        // TOML accepts NaN/Inf, and one non-finite scalar would poison the
+        // persistent voice and bed state. Reject before any mutation and clamp
+        // finite inputs into range. Every scalar `SoundEvent` carries must
         // appear in this filter.
         if !ev.pan.is_finite()
             || !ev.heat.is_finite()
@@ -1379,6 +1382,8 @@ impl TrailSynth {
             return;
         }
         if self.v2_engaged(&ev) {
+            // Rain glints are muted while the riff owns the room (`sing > 0`,
+            // §27): the stardust chime shares the riff shimmer's register and
             // reads as a wrong note. Only the music box ever sets `sing`.
             if self.sing > 0.0 && matches!(ev.kind, SoundGesture::Trail(SoundKind::Stardust { .. }))
             {
@@ -1410,6 +1415,10 @@ impl TrailSynth {
                         self.space_run_len.saturating_add(1)
                     };
                     if self.space_head {
+                        // The word boundary is the bar line: resetting the bar
+                        // here makes each word's first letter an accent, with
+                        // the space as the bass note under it. Typing speed
+                        // still sets the tempo. Only the run head does it, so
                         // an indent re-bars once.
                         self.song_pulse = 0;
                     }
@@ -1445,6 +1454,8 @@ impl TrailSynth {
             bypass || self.since_voice >= MIN_GAP
         };
         if !admit {
+            // A thinned space head is not a head: otherwise the run would be
+            // rooted on a note that never sounded. Un-consume it so the next
             // admitted space opens the run with its own bass root.
             if matches!(ev.kind, SoundGesture::Trail(SoundKind::Space)) && self.space_head {
                 self.space_run = false;
@@ -1480,6 +1491,9 @@ impl TrailSynth {
         }
         match ev.kind {
             SoundGesture::Trail(kind) => {
+                // Keystrokes, edits and jumps advance the melody. Cursor
+                // gestures (Glide/Sweep), Space and Shift play in the melody
+                // without stepping it. Determinism is per (events, seed, tone)
                 // script.
                 if !matches!(
                     kind,
@@ -2695,6 +2709,7 @@ impl TrailSynth {
                         let g = (core::f32::consts::PI * (fc * dt).min(0.45)).tan();
                         (g, 1.0 + g * (g + damp))
                     } else {
+                        // A constant cutoff: coefficient and divisor were
                         // computed in `spawn` (see `Voice::svf_g`).
                         (v.svf_g, v.svf_den)
                     };
@@ -3244,6 +3259,8 @@ impl Palette for FirePalette {
         _deg: i32,
         _col_off: i32,
     ) {
+        // Crackle: every key is an impulsive few-ms high-Q snap over a woody
+        // ember knock; impulsiveness separates fire from water. Jump is the
         // flame leaping: a dark low whoomph plus a scatter of spark snaps.
         if kind == SoundKind::Jump {
             let v = Voice {
@@ -3490,6 +3507,7 @@ impl Palette for LaserPalette {
     }
 
     fn bed_grain(&self, s: &mut TrailSynth, level: f32, gain: f32) {
+        // The storm keeps grumbling: mostly distant rolls, now and then the
         // faint tick of a far-off strike.
         if s.rnd() < 0.25 {
             let cf = s.rnd_in(3000.0, 5200.0);
@@ -4185,6 +4203,7 @@ impl Palette for TypewriterPalette {
                 Self::strike(s, ev.pan, g, bright, ring, body);
             }
             SoundKind::Navigation => {
+                // The escapement "tik": the clack alone, a shade duller, lifted
                 // ×2 so it still reads at tier 0 without ring or platen.
                 Self::strike(s, ev.pan, g * 2.0, 0.75, 0.0, 0.0);
             }
@@ -4338,6 +4357,7 @@ impl Palette for MarimbaPalette {
                 Self::bar(s, deg, 0.0, 0.13, true, g, ev.pan);
             }
             SoundKind::Navigation => {
+                // The dead stroke: the note choked in 50 ms, no glint, lifted
                 // ×1.25 so it stays a tier-0 whisper.
                 Self::bar(s, deg, 0.0, 0.05, false, g * 1.25, ev.pan);
             }
@@ -4430,6 +4450,7 @@ impl Palette for FeltPalette {
                 Self::note(s, deg, 0.0, 0.19, 1.0, g, ev.pan);
             }
             SoundKind::Navigation => {
+                // Una corda — the soft pedal's whisper: shorter, no hammer
                 // thud, a shade under the keystroke (the tier-0 whisper).
                 Self::note(s, deg, 0.0, 0.09, 0.0, g * 0.8, ev.pan);
             }
@@ -4975,6 +4996,7 @@ mod tests {
         for &voice in VOICES {
             for style in LOOKS {
                 for kind in KINDS {
+                    // The music box has no landing voice (§12.3: the meteor's
                     // bell is the landing), so there is no onset to time.
                     if is_music_box(voice, style) && kind == SoundKind::Land {
                         continue;

@@ -41,12 +41,12 @@ pub(crate) struct TargetStreams {
 
 impl TargetStreams {
     #[must_use]
-    fn wants_content(self) -> bool {
+    const fn wants_content(self) -> bool {
         self.screen || self.cursor || self.cells
     }
 
     #[must_use]
-    fn any_frame_source(self) -> bool {
+    const fn any_frame_source(self) -> bool {
         self.screen
             || self.cursor
             || self.events
@@ -81,7 +81,7 @@ impl InstanceStreams {
 
     /// Whether the instance lifecycle stream was granted.
     #[must_use]
-    pub(crate) fn sessions(self) -> bool {
+    pub(crate) const fn sessions(self) -> bool {
         self.sessions
     }
 }
@@ -321,7 +321,7 @@ impl AdoptScope {
         AdoptScope(false)
     }
 
-    fn on(self) -> bool {
+    const fn on(self) -> bool {
         self.0
     }
 }
@@ -402,7 +402,7 @@ struct Egress<'w, W: Write> {
 }
 
 impl<W: Write> Egress<'_, W> {
-    fn new(writer: &mut W, timestamps: bool) -> Egress<'_, W> {
+    const fn new(writer: &mut W, timestamps: bool) -> Egress<'_, W> {
         Egress {
             writer,
             timestamps,
@@ -1402,7 +1402,7 @@ impl ReadPace {
     }
 
     /// The read at `now` that a record drove ([`EVENTS_PACE`]): made whatever the window, and covering any read owed, since it reads the latest state.
-    pub(crate) fn read_now(&mut self, now: Instant) {
+    pub(crate) const fn read_now(&mut self, now: Instant) {
         self.owed = false;
         self.read_at = Some(now);
     }
@@ -1851,7 +1851,7 @@ fn drain_membership(
 struct Closing(Watch);
 
 impl Closing {
-    fn watchers(&self) -> &Arc<Watchers> {
+    const fn watchers(&self) -> &Arc<Watchers> {
         &self.0.src.watchers
     }
 
@@ -1968,6 +1968,8 @@ pub(crate) mod digest_fixture {
                 {
                     let mut t = tl.lock().expect("fresh timeline");
                     for j in 0..timeline {
+                        // A mix: the digest filters for `meta-change`, so an all-meta
+                        // fixture would flatter a whole-ring scan and an all-other one
                         // would never reach the emit path.
                         if j % 8 == 0 {
                             t.record_raw_meta_change("field=role value=lead".to_string());

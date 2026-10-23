@@ -41,6 +41,9 @@ impl fmt::Debug for Window {
 impl Drop for Window {
     fn drop(&mut self) {
         self.window.maybe_wait_on_main(|w| {
+            // If the window is in exclusive fullscreen, we must restore the desktop
+            // video mode (generally this would be done on application exit, but
+            // closing the window doesn't necessarily always mean application exit,
             // such as when there are multiple windows)
             if let Some(Fullscreen::Exclusive(_)) = w.fullscreen().map(|f| f.into()) {
                 w.set_fullscreen(None);
@@ -187,7 +190,7 @@ impl WindowAttributes {
         self
     }
 
-    /// Sets the minimum dimensions a window.
+    /// Sets the minimum dimensions a window can have.
     #[inline]
     pub fn with_min_inner_size<S: Into<Size>>(mut self, min_size: S) -> Self {
         self.min_inner_size = Some(min_size.into());
@@ -248,7 +251,8 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.scale_factor())
     }
 
-    /// Queues a [`WindowEvent::RedrawRequested`] event to be emitted that aligns.
+    /// Queues a [`WindowEvent::RedrawRequested`] event to be emitted that aligns with the windowing
+    /// system drawing loop.
     ///
     /// [`WindowEvent::RedrawRequested`]: crate::event::WindowEvent::RedrawRequested
     #[inline]
@@ -286,7 +290,8 @@ impl Window {
 }
 
 impl Window {
-    /// Returns the position of the top-left hand corner of the window's client area relative.
+    /// Returns the position of the top-left hand corner of the window's client area relative to the
+    /// top-left hand corner of the desktop.
     #[inline]
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         let _span = tracing::debug_span!("aterm_window::Window::inner_position",).entered();
@@ -294,7 +299,8 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.inner_position())
     }
 
-    /// Returns the position of the top-left hand corner of the window relative to the top-left.
+    /// Returns the position of the top-left hand corner of the window relative to the
+    /// top-left hand corner of the desktop.
     #[inline]
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         let _span = tracing::debug_span!("aterm_window::Window::outer_position",).entered();
@@ -308,7 +314,9 @@ impl Window {
     /// # use aterm_window::dpi::{LogicalPosition, PhysicalPosition};
     /// # use aterm_window::window::Window;
     /// # fn scope(window: &Window) {
+    /// // Specify the position in logical dimensions like this:
     /// window.set_outer_position(LogicalPosition::new(400.0, 200.0));
+    /// // Or specify the position in physical dimensions like this:
     /// window.set_outer_position(PhysicalPosition::new(400, 200));
     /// # }
     /// ```
@@ -338,7 +346,9 @@ impl Window {
     /// # use aterm_window::dpi::{LogicalSize, PhysicalSize};
     /// # use aterm_window::window::Window;
     /// # fn scope(window: &Window) {
+    /// // Specify the size in logical dimensions like this:
     /// let _ = window.request_inner_size(LogicalSize::new(400.0, 200.0));
+    /// // Or specify the size in physical dimensions like this:
     /// let _ = window.request_inner_size(PhysicalSize::new(400, 200));
     /// # }
     /// ```
@@ -367,7 +377,9 @@ impl Window {
     /// # use aterm_window::dpi::{LogicalSize, PhysicalSize};
     /// # use aterm_window::window::Window;
     /// # fn scope(window: &Window) {
+    /// // Specify the size in logical dimensions like this:
     /// window.set_min_inner_size(Some(LogicalSize::new(400.0, 200.0)));
+    /// // Or specify the size in physical dimensions like this:
     /// window.set_min_inner_size(Some(PhysicalSize::new(400, 200)));
     /// # }
     /// ```
@@ -388,7 +400,9 @@ impl Window {
     /// # use aterm_window::dpi::{LogicalSize, PhysicalSize};
     /// # use aterm_window::window::Window;
     /// # fn scope(window: &Window) {
+    /// // Specify the size in logical dimensions like this:
     /// window.set_max_inner_size(Some(LogicalSize::new(400.0, 200.0)));
+    /// // Or specify the size in physical dimensions like this:
     /// window.set_max_inner_size(Some(PhysicalSize::new(400, 200)));
     /// # }
     /// ```
@@ -583,7 +597,7 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.fullscreen().map(|f| f.into()))
     }
 
-    /// Turn window decorations.
+    /// Turn window decorations on or off.
     #[cfg(windows_platform)]
     #[inline]
     pub fn set_decorations(&self, decorations: bool) {
@@ -624,7 +638,9 @@ impl Window {
     /// # use aterm_window::dpi::{LogicalPosition, PhysicalPosition, LogicalSize, PhysicalSize};
     /// # use aterm_window::window::Window;
     /// # fn scope(window: &Window) {
+    /// // Specify the position in logical dimensions like this:
     /// window.set_ime_cursor_area(LogicalPosition::new(400.0, 200.0), LogicalSize::new(100, 100));
+    /// // Or specify the position in physical dimensions like this:
     /// window.set_ime_cursor_area(PhysicalPosition::new(400, 200), PhysicalSize::new(100, 100));
     /// # }
     /// ```
@@ -735,7 +751,9 @@ impl Window {
     /// # use aterm_window::dpi::{LogicalPosition, PhysicalPosition};
     /// # use aterm_window::window::Window;
     /// # fn scope(window: &Window) {
+    /// // Specify the position in logical dimensions like this:
     /// window.set_cursor_position(LogicalPosition::new(400.0, 200.0));
+    /// // Or specify the position in physical dimensions like this:
     /// window.set_cursor_position(PhysicalPosition::new(400, 200));
     /// # }
     /// ```

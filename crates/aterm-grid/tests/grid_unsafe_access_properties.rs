@@ -2,23 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Unsafe grid access paths, checked over generated inputs (fixed-seed
-//! xorshift, so a failure reproduces).
+//! Property tests for unsafe grid access paths over generated inputs.
 
 use aterm_grid::{Cell, Grid, PageStore, Row};
 use aterm_spec::rng::XorShift;
 
-/// A `u16` in `lo..hi`.
 fn range(rng: &mut XorShift, lo: u16, hi: u16) -> u16 {
     u16::try_from(rng.range(usize::from(lo), usize::from(hi))).expect("below hi")
 }
 
-/// An ASCII character in `lo..=hi`.
 fn char_in(rng: &mut XorShift, lo: char, hi: char) -> char {
     char::from(range(rng, lo as u16, hi as u16 + 1) as u8)
 }
 
-/// In-bounds unchecked reads must match safe reads for all columns.
 #[test]
 fn row_get_unchecked_matches_safe_access() {
     let mut rng = XorShift::new(0x0A11_0C0D);
@@ -47,7 +43,6 @@ fn row_get_unchecked_matches_safe_access() {
     }
 }
 
-/// In-bounds unchecked mutable access must update only the targeted cell.
 #[test]
 fn row_get_unchecked_mut_updates_only_target_cell() {
     let mut rng = XorShift::new(0x007A_26E7);
@@ -86,7 +81,6 @@ fn row_get_unchecked_mut_updates_only_target_cell() {
     }
 }
 
-/// Distinct grid rows must not alias each other under random writes.
 #[test]
 fn grid_row_storage_does_not_alias_across_rows() {
     let mut rng = XorShift::new(0x0A11_A5ED);

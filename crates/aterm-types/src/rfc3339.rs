@@ -5,7 +5,8 @@
 //! Howard Hinnant's civil-calendar conversions and the RFC 3339 UTC stamp (`YYYY-MM-DDTHH:MM:SSZ`)
 //! built on them: the workspace's one home for this math.
 
-/// Days since 1970-01-01 → proleptic-Gregorian `` — Howard Hinnant's `civil_from_days`.
+/// Days since 1970-01-01 → proleptic-Gregorian `(year, month, day)` —
+/// Howard Hinnant's `civil_from_days`.
 #[inline]
 #[must_use]
 pub const fn civil_from_days(days: i64) -> (i64, i64, i64) {

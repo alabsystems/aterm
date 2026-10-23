@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for [`super`], the bounded child runner, including the Tier-1
-//! lifecycle bind to `harness_capture_worker_lifecycle_model`.
+//! Tests for [`super`] and its conformance bind to `harness_capture_worker_lifecycle_model`.
 
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
@@ -10,8 +9,7 @@ use std::time::Duration;
 
 use super::*;
 
-/// The deadline of a capture whose child must finish: a one-minute hang
-/// detector, never a latency budget.
+/// The deadline of a capture whose child must finish.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 /// A unique temp directory, removed on drop.
@@ -23,8 +21,7 @@ fn temp_dir(tag: &str) -> aterm_tempfile::TempDir {
         .expect("the temp directory is created")
 }
 
-/// A child running `line` in this host's shell: `/bin/sh -c`, or on Windows
-/// `cmd.exe /D /C`, which is handed the line verbatim and parses it itself.
+/// A child running `line` in this host's shell.
 fn shell(line: &str) -> Command {
     #[cfg(unix)]
     {
@@ -43,12 +40,6 @@ fn shell(line: &str) -> Command {
 
 #[test]
 fn a_child_that_never_returns_is_killed_at_the_deadline() {
-    // The point of this shape: `wait_with_output` on a child that hangs never
-    // returns, and a stale NFS mount does that to `df`. The child hangs for
-    // two minutes and the capture must return inside a minute's hang detector
-    // — the spawn is inside that window, so a loaded machine's slow spawn never
-    // reads as a capture that waited the child out. On Windows the shell itself
-    // loops (no `sleep` there), so the kill reaches the one process that hangs.
     let cmd = if cfg!(windows) {
         shell("for /L %i in (0,0,1) do @rem")
     } else {
@@ -65,13 +56,6 @@ fn a_child_that_never_returns_is_killed_at_the_deadline() {
     );
 }
 
-/// THE BUDGET STARTS BEFORE THE SPAWN: a spawn held past the whole budget
-/// (the capture's `before_spawn` step, as a loaded machine or a first exec
-/// the system assesses holds one) leaves the child no time, so the capture
-/// gives up on its deadline although the child prints and exits at once
-/// (FAILS with the deadline taken after the spawn: the slow spawn was added
-/// to the budget and the child's output came back). NEGATIVE CONTROL: the
-/// same slow spawn under a budget that covers it captures the child.
 #[cfg(unix)]
 #[test]
 fn a_slow_spawn_spends_the_budget() {
@@ -88,7 +72,6 @@ fn a_slow_spawn_spends_the_budget() {
     capture_bounded_impl(shell("printf hello"), budget, 1024, slow_spawn(budget * 2))
         .expect_err("a spawn held past the budget leaves the child no time");
 
-    // NEGATIVE CONTROL: the budget covers the slow spawn.
     let got = capture_bounded_impl(
         shell("printf hello"),
         HANG_DETECTOR,
@@ -99,16 +82,10 @@ fn a_slow_spawn_spends_the_budget() {
     assert_eq!(got.stdout, b"hello");
 }
 
-// How long a stdout-hang fixture sleeps. The tests read survival off the
-// kernel (the group must empty), not a clock.
 #[cfg(unix)]
 const HANG_S: u64 = 300;
 
-/// Capture `script`, which writes `"$$ <its pgid>"` to `$PGIDF` then sleeps
-/// `$HANG_S`, taking the deadline once the report is written, and check it gave
-/// up on `path`. Returns the group and how long the capture took; panics when
-/// the child does not lead its own process group, since `kill(-pgid, 0)`
-/// answers ESRCH alike for a group that never existed and one that emptied.
+/// Capture `script`.
 #[cfg(unix)]
 fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t, Duration) {
     let tmp = temp_dir(tag);
@@ -146,14 +123,12 @@ fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t,
     (pgid, took)
 }
 
-/// Whether process group `pgid` has emptied — every member killed and reaped —
-/// within a minute. A survivor is killed (SIGKILL) before this answers `false`.
+/// Whether process group `pgid` has emptied.
 #[cfg(unix)]
 fn group_emptied(pgid: libc::pid_t) -> bool {
     let started = std::time::Instant::now();
     loop {
-        // SAFETY: signal 0 delivers nothing: `kill` only reports whether the
-        // group still has a member this user may signal.
+        // SAFETY: signal 0 only checks whether the process group exists.
         if unsafe { libc::kill(-pgid, 0) } != 0
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         {
@@ -171,8 +146,6 @@ fn group_emptied(pgid: libc::pid_t) -> bool {
 #[cfg(unix)]
 #[test]
 fn a_child_that_closes_stdout_then_hangs_cannot_survive_the_deadline() {
-    // The report is written after the close, so the post-EOF wait starts as soon
-    // as the shell does.
     let (pgid, took) = capture_a_hanging_group(
         "closed-stdout-hang",
         "exec 1>&-; echo \"$$ $(ps -o pgid= -p $$)\" > \"$PGIDF\"; sleep \"$HANG_S\"",
@@ -188,8 +161,6 @@ fn a_child_that_closes_stdout_then_hangs_cannot_survive_the_deadline() {
 #[cfg(unix)]
 #[test]
 fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
-    // The child reads its group before it forks; the descendant, which inherits
-    // it, writes the report, so a report means the descendant was running.
     let (pgid, took) = capture_a_hanging_group(
         "descendant-stdout-hang",
         "g=$(ps -o pgid= -p $$); (echo \"$$ $g\" > \"$PGIDF\"; sleep \"$HANG_S\") & exit 0",
@@ -202,26 +173,14 @@ fn a_descendant_holding_stdout_is_killed_with_its_process_group() {
     assert!(group_emptied(pgid), "the descendant was left running");
 }
 
-// The escape test: a descendant that calls setsid() and keeps the inherited
-// stdout is the case a process-group kill cannot reach. The capture child is
-// this test binary, staged as `escaped_holder_stage`: it forks a holder that
-// calls setsid(), writes the `escaped` marker and says so over a pipe, and the
-// child exits once it has. The capture's `after_spawn` step waits for the
-// marker, so the escape happens before the deadline under any load. The holder
-// never execs, so close-on-exec closes nothing: it closes every descriptor
-// above 2 itself and keeps only the capture's stdout until the test writes
-// `done`, with a two-minute cap of its own. Only async-signal-safe calls run
-// in it.
 #[cfg(unix)]
 const ESCAPED_HOLDER_CAP_TICKS: u32 = 2_400; // x 50 ms
 
-/// Set in the environment when this test binary is the escape test's capture
-/// child.
+/// Set in the environment when this test binary is the escape test's capture child.
 #[cfg(unix)]
 const ESCAPE_STAGE: &str = "ATERM_ALIGN_ESCAPE_STAGE";
 
-/// The escape test's capture: this test binary, staged as
-/// [`escaped_holder_stage`].
+/// The escape test's capture ([`escaped_holder_stage`]).
 #[cfg(unix)]
 fn escaped_pipe_command(done: &Path, exited: &Path, escaped: &Path) -> Command {
     let mut cmd = Command::new(std::env::current_exe().expect("the test binary"));
@@ -239,8 +198,7 @@ fn escaped_pipe_command(done: &Path, exited: &Path, escaped: &Path) -> Command {
     cmd
 }
 
-/// Set the capture's `after_spawn` step: wait, up to [`HANG_DETECTOR`], until
-/// `ready()` says the child has done what the test needs before the deadline.
+/// Set the capture's `after_spawn` step ([`HANG_DETECTOR`]).
 #[cfg(unix)]
 fn settle_until(observed: &CaptureLifecycleObservation, ready: impl Fn() -> bool + Send + 'static) {
     *observed
@@ -254,9 +212,6 @@ fn settle_until(observed: &CaptureLifecycleObservation, ready: impl Fn() -> bool
     }));
 }
 
-/// The escape test's capture child when [`ESCAPE_STAGE`] is set (a no-op
-/// otherwise): fork the holder, wait until it has left this process's group,
-/// exit.
 #[cfg(unix)]
 #[test]
 fn escaped_holder_stage() {
@@ -273,22 +228,15 @@ fn escaped_holder_stage() {
         path("ATERM_ALIGN_ESCAPE_EXITED"),
         path("ATERM_ALIGN_ESCAPE_ESCAPED"),
     );
-    // Read before the fork: only async-signal-safe calls run after it.
     let top = aterm_uds::spawnfd::descriptor_bound();
     let interrupted = || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
     let mut sync: [libc::c_int; 2] = [-1, -1];
-    // SAFETY: `pipe` fills the two-element array; `fork` takes nothing. The
-    // holder branch makes only async-signal-safe calls (setsid, open, close,
-    // write, dup2, access, poll, _exit) on memory prepared before the fork, and
-    // never returns; this branch reads one byte and leaves through `_exit`.
+    // SAFETY: `pipe` fills the two-element array.
     unsafe {
         assert_eq!(libc::pipe(sync.as_mut_ptr()), 0, "pipe");
         match libc::fork() {
             -1 => panic!("fork: {}", std::io::Error::last_os_error()),
             0 => {
-                // The holder: leave the group first, so the marker and the byte
-                // mean the escape happened. A holder that cannot leave writes
-                // neither, and the test fails on the missing marker.
                 if libc::setsid() < 0 {
                     libc::_exit(1);
                 }
@@ -301,8 +249,6 @@ fn escaped_holder_stage() {
                     libc::close(marker);
                 }
                 while libc::write(sync[1], b"e".as_ptr().cast(), 1) < 0 && interrupted() {}
-                // Keep only the pipe under test: stdin to /dev/null, every
-                // descriptor above 2 closed.
                 let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
                 if null >= 0 {
                     libc::dup2(null, 0);
@@ -328,8 +274,6 @@ fn escaped_holder_stage() {
                 libc::_exit(0)
             }
             _ => {
-                // The capture child: exit 0 once the holder has escaped (a
-                // byte), 1 if it died first (EOF).
                 libc::close(sync[1]);
                 let mut byte = 0u8;
                 let got = loop {
@@ -344,8 +288,7 @@ fn escaped_holder_stage() {
     }
 }
 
-/// Release an orphaned fixture even if an assertion panics. Its own two-minute
-/// cap is the last resort; a passing test waits for the exit marker.
+/// Release an orphaned fixture even if an assertion panics.
 #[cfg(unix)]
 struct EscapedHolderGuard {
     done: PathBuf,
@@ -366,8 +309,6 @@ impl EscapedHolderGuard {
     fn release(&mut self) {
         let _ = std::fs::write(&self.done, b"done");
         self.released = true;
-        // Wait for the exit marker, bounded by the holder's own cap, which ends
-        // it whether or not it saw `done`.
         let cap = Duration::from_millis(50 * u64::from(ESCAPED_HOLDER_CAP_TICKS));
         let until = std::time::Instant::now() + cap;
         while !self.exited.exists() && std::time::Instant::now() < until {
@@ -386,9 +327,7 @@ impl Drop for EscapedHolderGuard {
     }
 }
 
-/// Snapshot before releasing the escaped descendant: otherwise a detached
-/// worker could finish during fixture cleanup and make an early return look
-/// green.
+/// Snapshot before releasing the escaped descendant.
 #[cfg(unix)]
 struct CaptureObservedState {
     child_reaped: bool,
@@ -405,9 +344,8 @@ impl From<&CaptureLifecycleObservation> for CaptureObservedState {
     }
 }
 
-/// Tier-1: project actual child/pipe-worker completion from one invocation
-/// onto the derived lifecycle model. A forged early return with the same pipe
-/// worker still live is refused by the normal model and admitted by Buggy=1.
+/// Tier-1: project actual child/pipe-worker completion from one invocation onto the derived
+/// lifecycle model.
 #[cfg(unix)]
 fn assert_capture_return_conforms(
     observed: CaptureObservedState,
@@ -461,8 +399,6 @@ fn escaped_descendant_holding_stdout_cannot_retain_a_reader_thread() {
         Some(Arc::clone(&observed)),
     );
     let returned = CaptureObservedState::from(observed.as_ref());
-    // Read before the release: the capture returned at its deadline, while the
-    // holder still held its stdout.
     let holder_held_on = !exited.exists();
     holder.release();
     let why = result.expect_err("escaped descendant still holds stdout at deadline");
@@ -476,7 +412,6 @@ fn escaped_descendant_holding_stdout_cannot_retain_a_reader_thread() {
 
 #[test]
 fn stdout_is_capped_and_the_exit_code_reported() {
-    // `printf`, and on Windows `set /p`'s prompt: both print with no newline.
     let print = |text: &str| {
         if cfg!(windows) {
             shell(&format!("<nul set /p ={text}& exit 0"))
@@ -488,11 +423,9 @@ fn stdout_is_capped_and_the_exit_code_reported() {
     assert_eq!(got.stdout, b"hello");
     assert!(got.success());
 
-    // The cap truncates; it is not an error.
     let got = capture_bounded(print("aaaaaaaaaaaaaaaaaaaa"), HANG_DETECTOR, 4).expect("it runs");
     assert_eq!(got.stdout, b"aaaa");
 
-    // The exit code is reported; the caller decides what non-zero means.
     let got = capture_bounded(shell("exit 7"), HANG_DETECTOR, 16).expect("it runs");
     assert_eq!(got.code, Some(7));
     assert!(!got.success());

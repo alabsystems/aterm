@@ -292,7 +292,7 @@ fn filling_mark(p: &mut Painter<'_>, x: f32, y: f32, h: f32, ink: aterm_vitals::
 }
 
 /// The pressure ink when memory pressure is not normal.
-fn pressure_ink(
+const fn pressure_ink(
     inks: &aterm_vitals::ink::VitalsInks,
     m: &MemView,
 ) -> Option<aterm_vitals::ink::Rgb> {

@@ -825,6 +825,7 @@ impl<'a> Layer<'a> {
             .map_err(|r| ExtractError::Rejected(r, raw.to_path_buf()))?
         else {
             // Stripped away: the body still has to be consumed for the stream to
+            // advance, through the same caps as a body that is written.
             return drain_capped(body, &mut self.remaining, &self.budget, &mut self.copy_buf);
         };
         self.guard_ancestors(&dest, raw)?;
@@ -924,6 +925,7 @@ impl<'a> Layer<'a> {
             && !tree.record_alias(dest_rel, &target_rel)
         {
             // Unreachable: the fold answered for this target above. Fail closed rather
+            // than invent a digest.
             return Err(ExtractError::Rejected(
                 ExtractReject::HardlinkTargetMissing,
                 raw.to_path_buf(),
@@ -1219,6 +1221,7 @@ fn extract_stream(
             EntryKind::Directory => layer.directory(&raw, declared, mode)?,
             EntryKind::Regular => {
                 // The reader hands out content bytes through the CappedReader; the
+                // per-file cap and the structural refund happen in write_capped.
                 layer.regular(&raw, mode, &mut entry)?;
             }
             EntryKind::Other if opts.allow_global_pax && entry.header().is_global_pax() => {

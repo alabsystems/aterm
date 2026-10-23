@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Weak references: the storage location, not the value, is what the runtime
-//! registers.
+//! Weak reference registration and deallocation tests for `WeakSlot` and `WeakObj`.
 //!
-//! `objc_initWeak(location, obj)` records the address in `obj`'s side table,
-//! and on dealloc the runtime writes `nil` through every recorded address. Move
-//! the bytes and the copy is never zeroed while the old address stays a live
-//! write target. These tests hold `WeakSlot` and `WeakObj` to that on real
-//! objects: a `WeakObj` keeps one registered address across every kind of
-//! Rust move, and dropping the handle unregisters before its box is freed.
-//!
-//! Foundation objects (`NSObject`, `NSMutableString`) have real refcounts and
-//! weak tables; libtest cannot host AppKit, so `objc_window_drive.rs` repeats
-//! the experiments against a live `NSView`.
+//! Verifies that `WeakObj` preserves its registered slot address across Rust moves and
+//! unregisters before freeing its box.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -23,8 +14,7 @@
 
 use aterm_objc::{Id, Obj, Sel, WeakObj, WeakSlot, autoreleasepool, class, msg, sel};
 
-/// `[[NSObject alloc] init]`, +1 and owned. Not interned, cached or
-/// autoreleased, so `drop` is the last release and `dealloc` runs.
+/// Allocate a fresh `+1` `NSObject`.
 fn new_object() -> Obj {
     // SAFETY: `+alloc` is `@16#0:8` and `-init` is `@16@0:8` on `NSObject`;
     // the pair yields a +1 reference this `Obj` adopts.
@@ -36,8 +26,7 @@ fn new_object() -> Obj {
     }
 }
 
-/// `[[NSMutableString alloc] init]`, +1 — a second class, so the properties are
-/// not accidentally about `NSObject`'s own `dealloc`.
+/// Allocate a fresh `+1` `NSMutableString`.
 fn new_mutable_string() -> Obj {
     // SAFETY: `+alloc`/`-init` on `NSMutableString`, same prototypes.
     unsafe {
@@ -48,25 +37,17 @@ fn new_mutable_string() -> Obj {
     }
 }
 
-// The safe handle
-
-/// A container to move a `WeakObj` INTO, so the move is a real struct move and
-/// not something the optimiser can elide as a no-op rebinding.
+/// Container that places `WeakObj` at a non-zero offset so struct moves relocate its bytes.
 struct Holder {
     weak: WeakObj,
-    /// Padding either side, so the field's offset inside `Holder` is non-zero
-    /// and a `Holder` move genuinely relocates the handle's bytes.
     _before: [u64; 3],
 }
 
-/// Take a `WeakObj` by value and give it back — two more moves.
 fn round_trip(w: WeakObj) -> WeakObj {
     w
 }
 
-/// Six real moves keep one registration: allocate, weak-store, move the
-/// container, release the object, and the moved slot reads nil rather than a
-/// dangling pointer.
+/// Six moves of `WeakObj` keep one registration and resolve to nil after target drop.
 #[test]
 fn a_boxed_weak_survives_every_move_rust_can_perform() {
     let obj = new_object();
@@ -75,14 +56,11 @@ fn a_boxed_weak_survives_every_move_rust_can_perform() {
     let weak = WeakObj::from_obj(&obj);
     let registered = weak.slot_addr();
 
-    // 1. a plain rebinding.
     let weak = weak;
-    // 2. into a struct field at a non-zero offset.
     let holder = Holder {
         weak,
         _before: [0; 3],
     };
-    // 3. the whole struct into a Vec, which will reallocate under it.
     let mut v = Vec::with_capacity(1);
     v.push(holder);
     for _ in 0..8 {
@@ -92,11 +70,8 @@ fn a_boxed_weak_survives_every_move_rust_can_perform() {
         });
     }
     assert!(v.capacity() > 1, "the Vec grew, so its buffer moved");
-    // 4. back out of the Vec.
     let holder = v.swap_remove(0);
-    // 5. into a function and 6. back out of it.
     let weak = round_trip(holder.weak);
-    // and onto the heap for good measure.
     let weak = *Box::new(weak);
 
     assert_eq!(
@@ -112,7 +87,6 @@ fn a_boxed_weak_survives_every_move_rust_can_perform() {
         "and the moved handle still resolves to the same object"
     );
 
-    // Now kill it.
     drop(obj);
 
     assert!(
@@ -132,10 +106,7 @@ fn a_boxed_weak_survives_every_move_rust_can_perform() {
     );
 }
 
-// Ordinary behaviour
-
-/// `load` is +1, and the +1 is what keeps the object alive across the drop of
-/// every other strong reference.
+/// `load` returns a `+1` reference that keeps the object alive across the original owner's drop.
 #[test]
 fn load_hands_back_a_plus_one_that_outlives_the_original_owner() {
     let weak;
@@ -147,8 +118,6 @@ fn load_hands_back_a_plus_one_that_outlives_the_original_owner() {
         assert_eq!(held.id().addr(), obj.id().addr());
         drop(obj);
     }
-    // `held` owns a +1, so the object survives `obj`'s drop and the weak
-    // reference still resolves.
     assert!(
         weak.is_live(),
         "the +1 from `load` is a strong reference and keeps the target alive"
@@ -159,9 +128,7 @@ fn load_hands_back_a_plus_one_that_outlives_the_original_owner() {
     assert_ne!(addr, 0);
 }
 
-/// The raw +0 load (`objc_loadWeak`, `unsafe`, no safe wrapper) returns the same
-/// object, kept alive by the pool open at the call (the innermost one, pushed
-/// by this frame).
+/// `load_autoreleased` returns a `+0` reference kept alive by the enclosing autorelease pool.
 #[test]
 fn the_raw_plus_zero_load_answers_inside_the_pool_that_is_open() {
     let obj = new_object();
@@ -211,8 +178,6 @@ fn store_repoints_the_same_slot_at_a_new_target() {
     );
     assert_eq!(weak.load().expect("live").id().addr(), second.id().addr());
 
-    // The first object is no longer named by this slot, so its death must not
-    // touch it.
     drop(first);
     assert_eq!(
         weak.load().expect("still live").id().addr(),
@@ -223,14 +188,12 @@ fn store_repoints_the_same_slot_at_a_new_target() {
     drop(second);
     assert!(weak.load().is_none());
 
-    // And a store back to nil empties it.
     // SAFETY: nil is an explicitly legal `objc_storeWeak` value.
     unsafe { weak.store(Id::NIL) };
     assert!(weak.load().is_none());
 }
 
-/// `objc_copyWeak` — a second registration at a second address, both valid,
-/// both nil'd.
+/// `clone_weak` registers a second independent slot address.
 #[test]
 fn clone_weak_registers_a_second_address_and_both_are_nild() {
     let obj = new_object();
@@ -248,8 +211,6 @@ fn clone_weak_registers_a_second_address_and_both_are_nild() {
         b.load().expect("live").id().addr()
     );
 
-    // Dropping one must not disturb the other — the failure mode a shared slot
-    // would have.
     drop(b);
     assert!(
         a.is_live(),
@@ -262,38 +223,24 @@ fn clone_weak_registers_a_second_address_and_both_are_nild() {
     assert!(!c.is_live());
 }
 
-/// `WeakObj::drop` unregisters the address before the box is freed; otherwise
-/// the runtime would later write `nil` into whatever the allocator handed out.
-///
-/// [`Quarantining`], this binary's global allocator, leaks the one `dealloc`
-/// inside `drop(weak)`, so the eight bytes stay allocated and owned by this
-/// test. Racing the allocator for reuse is not reliable (per-CPU magazines,
-/// and the runtime's weak table allocates in the same size class).
-///
-/// The sentinel is the target's own pointer: libobjc declines to write through
-/// a weak slot holding any other value, which would make the test vacuous.
+/// `WeakObj::drop` unregisters the slot address before freeing its box.
 #[test]
 fn dropping_the_handle_unregisters_before_the_box_is_freed() {
     let obj = new_object();
     let target = obj.id();
 
     let weak = WeakObj::from_obj(&obj);
-    // Expose the address before the box dies and re-derive it afterwards: the
-    // block is still allocated (quarantined), but the `Box`'s provenance
-    // ended, so `with_exposed_provenance_mut` builds a fresh pointer.
     let slot = weak.slot_addr().expose_provenance();
 
     quarantine(true);
     drop(weak);
     quarantine(false);
 
-    // The block is now this test's, permanently. Fill it as a squatter would.
     let slot: *mut Id = std::ptr::with_exposed_provenance_mut(slot);
     // SAFETY: the quarantine leaked this block, so the eight bytes are still
     // allocated, pointer-aligned, and reachable through no other pointer.
     unsafe { *slot = target };
 
-    // If the registration outlived `Drop`, the runtime writes nil through this address now.
     drop(obj);
 
     // SAFETY: as above — the block is leaked and therefore still live.
@@ -309,22 +256,13 @@ fn dropping_the_handle_unregisters_before_the_box_is_freed() {
     );
 }
 
-// The quarantining allocator
-
-/// This binary's global allocator: [`std::alloc::System`], except that a thread
-/// which has armed [`quarantine`] leaks its deallocations, so a test can read
-/// the bytes a `Box` released while they are still allocated.
-///
-/// The flag is thread-local, so other tests are unaffected.
+/// Global allocator that leaks deallocations on threads where [`quarantine`] is armed.
 struct Quarantining;
 
 thread_local! {
-    /// Armed only around the one `drop` that matters. `const` init, since a
-    /// lazily initialised TLS would allocate on first touch inside `dealloc`.
     static QUARANTINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Arm or disarm the quarantine for this thread.
 fn quarantine(on: bool) {
     QUARANTINE.with(|q| q.set(on));
 }
@@ -341,7 +279,6 @@ unsafe impl std::alloc::GlobalAlloc for Quarantining {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         // `try_with`, not `with`: TLS is unavailable during thread teardown,
-        // and a `dealloc` there must still free rather than panic.
         if QUARANTINE.try_with(std::cell::Cell::get).unwrap_or(false) {
             return; // leaked on purpose; see the type docs.
         }
@@ -354,10 +291,6 @@ unsafe impl std::alloc::GlobalAlloc for Quarantining {
         // SAFETY: contract passed through unchanged.
         unsafe { std::alloc::System.alloc_zeroed(layout) }
     }
-
-    // `realloc` uses the default (alloc + copy + `self.dealloc`) so a growing
-    // `Vec` goes through the quarantine too; `System::realloc` would `free`
-    // behind this type's back.
 }
 
 #[global_allocator]

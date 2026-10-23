@@ -137,6 +137,46 @@ fn record(bytes: &[u8]) {
     feed_walk(&walk_mine(bytes));
 }
 
+/// [`record`] for a long corpus: the archives are walked a batch at a time on every core and
+/// folded into this thread's digest in the order they were given, so the digest is the one
+/// [`record`] makes of them one by one. [`Batch::flush`] before [`pin`].
+struct Batch(Vec<Vec<u8>>);
+
+impl Batch {
+    const SIZE: usize = 4096;
+
+    fn new() -> Self {
+        Self(Vec::with_capacity(Self::SIZE))
+    }
+
+    fn record(&mut self, bytes: Vec<u8>) {
+        self.0.push(bytes);
+        if self.0.len() == Self::SIZE {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let part = self.0.len().div_ceil(cores).max(1);
+        let walks: Vec<Vec<Walk>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = self
+                .0
+                .chunks(part)
+                .map(|archives| {
+                    scope.spawn(move || archives.iter().map(|b| walk_mine(b)).collect::<Vec<_>>())
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("a walk"))
+                .collect()
+        });
+        walks.iter().flatten().for_each(feed_walk);
+        self.0.clear();
+    }
+}
+
 /// Assert this thread's digest, then reset it.
 #[track_caller]
 fn pin(expected: &str) {
@@ -1003,10 +1043,11 @@ fn gnu_sparse_entries_are_refused() {
 #[test]
 fn checksum_repaired_header_mutations_are_pinned() {
     let mut rng = Rng(0x7A12_0005);
+    let mut batch = Batch::new();
     for _ in 0..40_000 {
-        let bytes = random_valid_checksum_archive(&mut rng);
-        record(&bytes);
+        batch.record(random_valid_checksum_archive(&mut rng));
     }
+    batch.flush();
     pin(CHECKSUM_REPAIRED_HEADER_MUTATIONS);
 }
 
@@ -1015,6 +1056,7 @@ fn checksum_repaired_header_mutations_are_pinned() {
 fn repaired_mutations_of_real_archives_are_pinned() {
     let sources = [ustar_archive(), handmade_archive()];
     let mut rng = Rng(0x7A12_0006);
+    let mut batch = Batch::new();
     for source in &sources {
         for _ in 0..20_000 {
             let mut v = source.clone();
@@ -1037,9 +1079,10 @@ fn repaired_mutations_of_real_archives_are_pinned() {
             h.copy_from_slice(&v[base..base + 512]);
             checksum(&mut h);
             v[base..base + 512].copy_from_slice(&h);
-            record(&v);
+            batch.record(v);
         }
     }
+    batch.flush();
     pin(REPAIRED_MUTATIONS_OF_REAL_ARCHIVES);
 }
 
@@ -1209,6 +1252,7 @@ fn byte_mutations_are_pinned() {
     let sources = [ustar_archive(), handmade_archive()];
     let mut rng = Rng(0x7A12_0001);
     let mut checked = 0usize;
+    let mut batch = Batch::new();
     for source in &sources {
         for _ in 0..40_000 {
             let mut v = source.clone();
@@ -1219,10 +1263,11 @@ fn byte_mutations_are_pinned() {
                     *slot = (rng.next_u64() & 0xff) as u8;
                 }
             }
-            record(&v);
+            batch.record(v);
             checked += 1;
         }
     }
+    batch.flush();
     assert!(checked >= 80_000, "mutation corpus went missing");
     pin(BYTE_MUTATIONS);
 }
@@ -1232,6 +1277,7 @@ fn byte_mutations_are_pinned() {
 fn block_mutations_are_pinned() {
     let sources = [ustar_archive(), handmade_archive()];
     let mut rng = Rng(0x7A12_0002);
+    let mut batch = Batch::new();
     for source in &sources {
         let blocks: Vec<Vec<u8>> = source.chunks(512).map(<[u8]>::to_vec).collect();
         for _ in 0..12_000 {
@@ -1257,9 +1303,10 @@ fn block_mutations_are_pinned() {
                 }
                 _ => {}
             }
-            record(&b.concat());
+            batch.record(b.concat());
         }
     }
+    batch.flush();
     pin(BLOCK_MUTATIONS);
 }
 

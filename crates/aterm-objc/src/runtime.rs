@@ -133,6 +133,14 @@ impl ClassPtr {
     pub const NULL: Self = Self(std::ptr::null_mut());
 
     /// Wrap a raw class pointer.
+    ///
+    /// Safe code cannot build one from an arbitrary pointer:
+    ///
+    /// ```compile_fail,E0133
+    /// let bogus = std::ptr::without_provenance_mut::<std::ffi::c_void>(0x10);
+    /// let cls = aterm_objc::ClassPtr::from_ptr(bogus);
+    /// ```
+    ///
     /// # Safety
     /// `ptr` must be null or a class object the Objective-C runtime has registered (from `objc_getClass`, `object_getClass`, `objc_registerClassPair` or an address one of them returned).
     #[inline]
@@ -233,13 +241,21 @@ pub struct ObjcSuper {
     pub super_class: ClassPtr,
 }
 
+// The send entry points are `"C-unwind"`. An `NSException` raised inside a
+// send unwinds through the calling Rust frame as a foreign exception; under
+// `extern "C"` (`nounwind`) that frame has no landing pad, so its `Drop`s are
+// skipped, the process aborts with `failed to initiate panic`, or LLVM deletes
+// a `catch_unwind` around nounwind calls. `"C-unwind"` runs every destructor
+// on the way to [`crate::exception`]'s containment at no hot-path cost.
+// [`MsgFn`] is implemented for `unsafe extern "C-unwind" fn(..)` only, since
+// one `"C"` frame on the raise path loses the frames above it.
 #[link(name = "objc")]
 unsafe extern "C-unwind" {
     /// Declared with no parameter list on purpose. Every call goes through
     /// [`msg`], which casts it to the exact prototype of the selector.
     fn objc_msgSend();
     /// Same discipline as [`objc_msgSend`], but the first argument is a
-    /// `*const ObjcSuper` rather than the receiver.
+    /// `*const ObjcSuper` rather than the receiver. Cast through [`msg_super`].
     fn objc_msgSendSuper();
 }
 
@@ -342,6 +358,29 @@ unsafe extern "C-unwind" {
 unsafe extern "C" {}
 
 /// A message-send prototype, decomposed far enough that [`msg`] can read its return type and pick the right entry point.
+///
+/// Fourteen arguments are sendable (`tests/declared_abi.rs`); fifteen do not
+/// compile:
+///
+/// ```compile_fail
+/// # use aterm_objc::{Id, Sel, msg};
+/// // 17 parameters: `self`, `_cmd`, and fifteen arguments.
+/// let _: unsafe extern "C-unwind" fn(
+///     Id, Sel,
+///     i64, i64, i64, i64, i64, i64, i64, i64,
+///     i64, i64, i64, i64, i64, i64, i64,
+/// ) -> i64 = unsafe { msg() };
+/// ```
+///
+/// There is no impl for `unsafe extern "C" fn(..)`: a `"C"` send is
+/// `nounwind`, so an `NSException` raised inside it skips the calling frame's
+/// `Drop`s or aborts (see the note on `objc_msgSend`):
+///
+/// ```compile_fail
+/// # use aterm_objc::{Id, Sel, msg};
+/// let _: unsafe extern "C" fn(Id, Sel) -> Id = unsafe { msg() };
+/// ```
+///
 /// # Safety
 /// An implementor must be a bare `unsafe extern "C-unwind"` function pointer whose return type is `Ret`: [`msg`] transmutes a symbol address into `Self` and dispatches on `size_of::<Self::Ret>()`, so a lying `Ret` picks the wrong entry point.
 #[diagnostic::on_unimplemented(
@@ -422,6 +461,26 @@ fn super_stret_entry() -> *const c_void {
 }
 
 /// Cast the untyped `objc_msgSend` to a concrete prototype, choosing the `_stret` entry point when `F`'s return type needs it.
+///
+/// A return type whose ABI nobody has stated does not compile:
+///
+/// ```compile_fail
+/// # use aterm_objc::{Id, Sel, msg};
+/// #[repr(C, packed)]
+/// struct Packed { c: i8, q: i64 }
+/// // Nine bytes, so `size_of` says "registers"; clang says
+/// // `_objc_msgSend_stret`. Without an `Encode` impl stating which, this is
+/// // `E0277` rather than a wrong entry point.
+/// let _: unsafe extern "C-unwind" fn(Id, Sel) -> Packed = unsafe { msg() };
+/// ```
+///
+/// Nor does a `BOOL` return spelled as a Rust `bool`:
+///
+/// ```compile_fail
+/// # use aterm_objc::{Id, Sel, msg};
+/// let _: unsafe extern "C-unwind" fn(Id, Sel) -> bool = unsafe { msg() };
+/// ```
+///
 /// # Safety
 /// `F` must be the exact C prototype of the selector about to be sent, including the implicit `(self, _cmd)` pair.
 #[inline]
@@ -805,6 +864,36 @@ pub unsafe fn autorelease(obj: Id) -> Id {
 }
 
 /// An `@autoreleasepool` scope.
+///
+/// Not a bare RAII guard: `!Send` and `!Clone` do not imply LIFO drop order,
+/// and popping an outer pool before an inner one frees what the inner pool
+/// holds and then aborts in the runtime:
+///
+/// ```text
+/// Invalid or prematurely-freed autorelease pool … Invalid autorelease pools
+/// are a fatal error
+/// ```
+///
+/// So the token constructor is `unsafe` and [`autoreleasepool`]'s nested scopes
+/// are the safe API; an inner scope cannot outlive the outer one.
+///
+/// This does not compile:
+///
+/// ```compile_fail
+/// # use aterm_objc::AutoreleasePool;
+/// let outer = AutoreleasePool::new();
+/// let inner = AutoreleasePool::new();
+/// drop(outer);
+/// drop(inner);
+/// ```
+///
+/// The same intent, as scopes:
+///
+/// ```
+/// # use aterm_objc::autoreleasepool;
+/// let n = autoreleasepool(|_outer| autoreleasepool(|_inner| 7));
+/// assert_eq!(n, 7);
+/// ```
 pub struct AutoreleasePool(*mut c_void);
 
 impl AutoreleasePool {

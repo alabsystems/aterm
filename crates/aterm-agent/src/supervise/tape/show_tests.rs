@@ -42,8 +42,6 @@ fn emit(door: &str, bytes: &[u8]) -> Item {
     })
 }
 
-/// A recorded approval as the loop tapes one: the screen read, a decision on
-/// it, the guarded key, the journal's line; then an idle read an hour on.
 fn approval_items() -> Vec<Item> {
     let screen = "{\"rows\":[\"⏺ Bash(ls -la)\",\"Do you want to proceed?\",\"❯ 1. Yes\",\"  2. No\"],\
                   \"cursor\":{\"row\":2,\"col\":2},\"seq\":41,\"gen\":\"3.41\"}";
@@ -90,7 +88,6 @@ fn approval_items() -> Vec<Item> {
     ]
 }
 
-/// `items` written as a run's writer writes them.
 fn written(items: &[Item]) -> Vec<u8> {
     let sink = Memory::default();
     let mut w = TapeWriter::start(
@@ -106,9 +103,6 @@ fn written(items: &[Item]) -> Vec<u8> {
     sink.bytes()
 }
 
-/// The decision comes back with the screen it judged (its rows, read back
-/// from the reply that carried them), the act that followed — the key, not
-/// the claim's renewal before it — the act's reply and the journal's line.
 #[test]
 fn a_decision_comes_back_with_its_screen_its_act_and_its_line() {
     let tape = open(&written(&approval_items()), false).expect("reads");
@@ -141,8 +135,6 @@ fn a_decision_comes_back_with_its_screen_its_act_and_its_line() {
     assert!(text.contains("│ ❯ 1. Yes"), "{text}");
 }
 
-/// The text form reads as the binary one does; a damaged tape is refused,
-/// naming where, unless salvaged; a torn one reads to its tear and says so.
 #[test]
 fn either_form_reads_and_damage_is_refused_unless_salvaged() {
     let items = approval_items();
@@ -174,8 +166,6 @@ fn either_form_reads_and_damage_is_refused_unless_salvaged() {
     assert!(tail_note(&salvaged).is_some_and(|n| n.starts_with("salvaged")));
 }
 
-/// The stats count the tape's records by kind and door, its decisions, its
-/// span from its monotonic readings, and its kB an hour of that span.
 #[test]
 fn the_stats_count_what_the_tape_holds_and_what_it_cost() {
     let bytes = written(&approval_items());
@@ -199,12 +189,6 @@ fn the_stats_count_what_the_tape_holds_and_what_it_cost() {
     assert_eq!(still.kb_per_hour, None);
 }
 
-/// A TAPE MADE TO ATTACK ITS READER — an OSC 52 clipboard write in a
-/// screen row, escapes in a request's word, a reply, a journal line, a
-/// door's and a note's name, a path and how the run ended, a C1 CSI and a
-/// DEL among them — is printed by `cat`, `show --decisions` and `stats`
-/// with every control character written out: no byte a terminal acts on
-/// reaches the reader, a newline only between the renderer's own lines.
 #[test]
 fn nothing_a_tape_holds_reaches_the_reader_as_a_control_character() {
     const OSC52: &str = "\u{1b}]52;c;cHduZWQ=\u{7}";

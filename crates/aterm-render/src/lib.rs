@@ -1663,6 +1663,7 @@ impl ImageCache {
             return;
         };
         if entry.tick == self.tick {
+            // Already the most recent use, in this frame (runs of cells share
             // a placement): `begin_frame` takes a tick no entry holds.
             return;
         }
@@ -1758,6 +1759,7 @@ impl ImageCache {
                 break;
             };
             if tick >= self.frame_start || tick == self.tick {
+                // The frame's own (and the entry just inserted, before any
                 // frame) stay, and every entry after the least recent is newer.
                 break;
             }
@@ -2691,6 +2693,9 @@ impl FallbackFace {
         bytes: &crate::font::FaceBytes,
         path: Option<String>,
     ) -> Result<FallbackFace, String> {
+        // The process-global intern, not the thread-local `FONT_BYTES_INTERN`:
+        // `build_fallback_chain` calls this from scoped worker threads, where a thread-local
+        // store is always empty. Admit first, publish second, so a refused face's file is
         // never published.
         if !face_admissible(bytes, 0) {
             return Err("face is not admissible as a renderable font".to_string());
@@ -2868,6 +2873,8 @@ impl RuntimeFallback {
 
     fn discover(&mut self, ch: char, ctx: FallbackProbeCtx) -> Option<usize> {
         for path in runtime_fallback_candidate_paths(ch, ctx) {
+            // Reuse an already-loaded face for this path (a previous code point routed here,
+            // accepted or declined): the per-char acceptance is a cheap probe raster, never a
             // re-read/parse of the same large font.
             if let Some(i) = self.faces.iter().position(|f| f.path == path) {
                 if runtime_face_can_render(&self.faces[i], ch, ctx.use_ct) {
@@ -3023,6 +3030,9 @@ impl font_chain::ChainProbe for RendererProbe<'_, '_> {
             }
             font_chain::Tier::Fallback => !self.yields_to_colour() && self.r.fallback_has(self.ch),
             font_chain::Tier::Symbol => {
+                // When nothing in the chain is chosen, every face in it
+                // yields, so decline WITHOUT consulting it: the consult
+                // would kick its lazy parse and turn this frame's colour
                 // glyph into a provisional `.notdef` until the parse lands.
                 if self.yields_to_colour() && !self.r.symbol_chain_may_be_chosen() {
                     false
@@ -3131,6 +3141,7 @@ fn runtime_fallback_candidate_paths(ch: char, ctx: FallbackProbeCtx) -> Vec<Stri
     let mut paths: Vec<String> = Vec::new();
     #[cfg(target_os = "macos")]
     {
+        // CoreText returns the LastResort tofu font for an uncovered code point; drop it so
         // the resolver can return `None` rather than claim a fake cover.
         if let Some(p) = macos_coretext::font_path_for_char(ch)
             && !path_is_last_resort(&p)
@@ -3252,6 +3263,7 @@ fn relocate_missing_builtin_fonts(paths: &[String], user_prefix: usize) -> Vec<O
 }
 
 fn admit_chain_face(declared: &str, relocated: Option<&str>) -> Option<FallbackFace> {
+    // A bundled chain entry (`bundled:…`) names compiled-in bytes, not a file: admitted by
     // borrowing them, under the same admission verdict as every discovered face.
     if let Some(bytes) = bundled::face_for_id(declared) {
         return FallbackFace::from_path_bytes(
@@ -3289,6 +3301,7 @@ fn build_fallback_chain(paths: &[String], user_prefix: usize) -> Vec<FallbackFac
             .zip(&relocated)
             .map(|(p, moved)| {
                 scope.spawn(move || {
+                    // Straight into the store, no copy; on unix a candidate on the system
                     // font volume is a file mapping, faulted in per glyph.
                     admit_chain_face(p, moved.as_deref())
                 })
@@ -5004,6 +5017,7 @@ pub const fn select_face(
         // The colour face is reachable only for a code point that wants emoji presentation.
         FaceId::ColorEmoji
     } else if color_has {
+        // A default-text code point no mono face covers but the colour font does (⏺ without
         // STIX/Apple Symbols): the colour glyph's monochrome silhouette, foreground-tinted.
         FaceId::ColorEmojiMono
     } else {
@@ -7517,6 +7531,7 @@ impl Renderer {
     /// Fork the live terminal's font engine for a renderer-native semantic surface (Settings specimens, Markdown, editor chrome) without borrowing the presentation renderer or consulting a platform text widget.
     #[must_use]
     pub fn fork_semantic_surface(&self, px: f32, theme: Theme) -> Option<Self> {
+        // A sealed generation is closed over exact admitted bytes; the fork below would
         // recreate candidate paths and reopen the filesystem.
         if self.admitted_sources_sealed {
             return self.rebuild_from_admitted(px, theme).ok();
@@ -7757,12 +7772,14 @@ impl Renderer {
         }
         let (bytes, index, gid): (std::sync::Arc<[u8]>, u32, u16) = match key.glyph_class {
             GlyphClass::MonoGid => {
+                // A collapsed-ligature slice key re-tiles a wide raster
                 // (`rasterize_ligature_slice`); stage 1 leaves slices grayscale.
                 if key.ch_or_id >> LIG_SLICE_SHIFT != 0 {
                     return None;
                 }
                 let gid = key.ch_or_id as u16;
                 if key.source == FaceId::BoldPrimary {
+                    // The injected real bold file; `key.style` is the residual to synthesize,
                     // and synthesis stays grayscale.
                     if key.style.0 != StyleBits::REGULAR.0 {
                         return None;
@@ -7771,6 +7788,7 @@ impl Renderer {
                 } else if key.style.0 == StyleBits::REGULAR.0 {
                     (self.shaping_primary_bytes.clone()?, self.primary_index, gid)
                 } else {
+                    // A styled run glyph: eligible only from a real styled face serving every
                     // bit; a bold instance (`vf_bold_coords`) or synthetic residue declines.
                     if key.style.contains(StyleBits::BOLD) && self.vf_bold_coords.is_some() {
                         return None;
@@ -7917,6 +7935,11 @@ impl Renderer {
             let (m, b) = f.rasterize(ch, eff_px);
             (m.width, m.height, m.xmin, m.ymin, m.advance_width, b)
         } else {
+            // No usable raster from this face: either a CoreText-only runtime face under the
+            // portable backend (honest `.notdef`), or a chain face whose deferred parse
+            // failed. Admission makes the latter unreachable, but if it happens the face
+            // would keep shadowing the entries behind it, so retire it, re-probe and draw
+            // again; the retire returns `true` only when it removed an entry, so the
             // recursion terminates. The symbol tier is a chain too.
             if font.as_ref().is_some_and(LazyFontdue::known_bad) {
                 if source == FaceId::Fallback && self.retire_unparsable_fallback(&bytes) {
@@ -8020,6 +8043,7 @@ impl Renderer {
             return fallback_cjk_scale((2 * self.cell_w) as f32, ideo_em * self.px);
         }
         if let (Some(p_em), Some(f_em)) = (self.primary_x_height_em(), norm.x_height_em) {
+            // Same px on both sides (the ratio is px-free); kept in px form so
             // the policy fn's contract mirrors the CJK one.
             return fallback_xheight_scale(p_em * self.px, f_em * self.px);
         }
@@ -9689,6 +9713,9 @@ impl Renderer {
             // Distinct branch.
             base // cell-exact / emoji silhouette: no synthetic or real styled variant
         } else if base.glyph_class == GlyphClass::MonoGid {
+            // A styled primary glyph is re-addressed by char (not the regular face's glyph
+            // id), so the rasterizer can pull it from the real styled sibling face, whose
+            // glyph ids differ, falling back to the regular face plus synthetic styling when no
             // sibling exists.
             GlyphKey::mono_char(base.source, ch, style, self.px_q)
         } else if base.glyph_class == GlyphClass::Mono {
@@ -9728,6 +9755,7 @@ impl Renderer {
     /// Shape an emoji grapheme cluster (ZWJ / skin-tone / keycap / flag) on the colour chain, cached.
     pub(crate) fn shape_cluster(&mut self, cluster: &str) -> Option<ClusterShape> {
         if let Some((shape, from_prev)) = self.cluster_shapes.get(cluster) {
+            // A previous-generation hit is served without re-shaping; promote it
             // back into the current generation so it survives the next rotation.
             if from_prev {
                 self.cluster_shapes.insert(cluster, shape);
@@ -10097,6 +10125,8 @@ impl Renderer {
                         })
                     });
                     face.as_mut().and_then(|f| {
+                        // `admit_collapsed` (config `merged_ligatures`) admits the Cascadia
+                        // N:1 form, which the raster path slices into per-cell tiles; off by
                         // default (the 1:1 gate).
                         f.shape(run, run_chars, admit_collapsed, shaping_buffer)
                     })
@@ -10406,6 +10436,11 @@ impl Renderer {
         }
         match key.glyph_class {
             GlyphClass::Mono => {
+                // A Procedural key for a char in the procedural ranges is cell-exact (the
+                // blit anchor lands on the cell's top-left). A shade key carries dither-phase
+                // bits above the code point (`shade_phase_key`), decoded here, the one place
+                // procedural bytes are made. A Procedural key outside those ranges can only
+                // be hand-built and falls back to the primary face. The key's `px_q` stands
                 // in for (cell_w, cell_h), both functions of this renderer's px and face.
                 if key.source == FaceId::Procedural && key.ch_or_id & REGIONAL_PAIR_BIT != 0 {
                     return self.rasterize_regional_pair(key);
@@ -10557,14 +10592,18 @@ impl Renderer {
                     key.source,
                     FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
                 ) {
+                    // Fallback faces rasterize through their own pipeline
                     // (`fallback_mono_raster`).
                     self.fallback_mono_raster(key.source, ch)
                 } else if let Some(t) = self.hinted_primary_char(key, ch) {
+                    // Grid-fitted primary raster. Ordered above the instance raster because on
+                    // Windows it grid-fits that instance; on Linux it declines for a varied
                     // primary and hands the cell down. The rasters below are the fail-safes.
                     t
                 } else if key.source == FaceId::Primary
                     && let Some(t) = self.vf_primary_char_raster(ch)
                 {
+                    // Portable path: the primary char's resolved variable instance (the raster
                     // below draws only the fvar default).
                     t
                 } else {
@@ -10812,6 +10851,12 @@ impl Renderer {
                     // Portable path: the resolved variable instance of the primary glyph.
                     t
                 } else {
+                    // `gid` was shaped on the picked styled face and means a different letter
+                    // anywhere else, so an unparsable (unreachable: admission is exact) or
+                    // absent styled slot draws no ink rather than re-picking a face. An
+                    // unparsable slot stays with its retire pending, so every gid of the plan in
+                    // flight is refused too, until `begin_frame_boundary`; the epoch bump makes
+                    // the next frame repaint with the style synthetic. The retire names the face
                     // (`StyledFaceId`), so a replacement installed before the boundary survives.
                     if let FacePick::Styled { slot, .. } = pick
                         && !self.styled_faces[slot]
@@ -12183,6 +12228,9 @@ impl Renderer {
             }
         } else {
             for (c, cell) in cells.iter().take(cols).enumerate() {
+                // Composed row: the cell sits where its pane's run puts it, the fill clamped
+                // to that run's box (else a DECDWL pane's doubled fills repaint the
+                // neighbouring pane's background). Each column clamps to its own run box,
                 // so runs cannot merge.
                 if let Some(color) = resolve(c, cell) {
                     self.note_bg_run(color, band_base);
@@ -12211,6 +12259,7 @@ impl Renderer {
             let bg = if let Some(hit) = input.selection_hit(row, c, false, false) {
                 sel.at(hit).bg
             } else {
+                // An implicit tail cell is its pane's default bg, so under a wallpaper it
                 // shows the backdrop the base fill laid.
                 if wallpaper {
                     continue;
@@ -13252,6 +13301,8 @@ impl Renderer {
             && let Some(atlas) = input.rain_atlas.as_deref()
             && atlas_texels_valid(atlas)
         {
+            // The `WHITE_RGB` fast path only when the atlas is provably white (the production
+            // invariant); both paths give the same pixels, the fast one skipping three
             // per-texel mul8s.
             if rain_white {
                 for &qi in rain_row {
@@ -14996,6 +15047,7 @@ fn effect_stream_changed<T: PartialEq>(
         return !same;
     }
     if prev_damage.is_valid() {
+        // `prev` was emptied by the cache: compare what its metadata says it held
         // against what current holds.
         return !(prev_damage.was_empty() == Some(true) && current.is_empty());
     }
@@ -15009,6 +15061,9 @@ fn mark_effect_stream_rows(
     current_damage: &EffectStreamDamage,
     fallback_rows: impl Iterator<Item = usize>,
 ) {
+    // The prev side is judged on its own validity, as in `effect_stream_changed`: the
+    // cache empties a payload exactly when its metadata is valid, and
+    // `EffectStreamDamage::rows` keeps the vacated rows, so a glow that moved from row 1
     // to row 3 marks both.
     if prev_damage.is_valid() {
         prev_damage.mark_rows(dirty);
@@ -15501,6 +15556,8 @@ pub fn scroll_shift_plan(
             && (row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
                 || row_overlays_differ_shifted(input, r, prev, src as usize))
         {
+            // A streaming flood is this shape: every retained row slides up unchanged and
+            // the one row the writer touched differs. Marking it, not refusing the plan,
             // leaves the exposed strip plus its apron.
             *row_dirty = true;
         }
@@ -16382,6 +16439,8 @@ fn ligature_break_cols_into(
             input.selection_contains_cell(r, c, is_wide_lead, cell.wide)
         };
         for c in 0..n {
+            // A selected cell stays per-cell; excluding it from `shapeable`
+            // already splits the unselected runs to its left and right without
             // excluding the first unselected cell after the selection.
             if selected(c) {
                 cols.push(c);
@@ -17610,6 +17669,7 @@ fn stamp_free_sprite(
                 let dx = (px as i32 - ox) as usize;
                 if s.flip_x { aw - 1 - dx } else { dx }
             } else {
+                // The scaled arm filled `xmap` over exactly `px0..xend`, so this
                 // index is in range.
                 xmap[px - px0] as usize
             };
@@ -17817,6 +17877,7 @@ fn push_glow_rect(
     premul: u32,
     alpha: u8,
 ) {
+    // Additive black adds nothing, but source-over black darkens what it
     // covers: only light skips a zero colour.
     if w <= 0 || h <= 0 || (premul == 0 && alpha == 0) || clip.cell_h <= 0 {
         return;
@@ -18187,7 +18248,7 @@ pub struct RibbonVertex {
     pub up: f32,
     /// …and below it.
     pub dn: f32,
-    /// The full-strength half-width above the spine….
+    /// The full-strength half-width above the spine…
     pub core_up: f32,
     /// …and below it.
     pub core_dn: f32,
@@ -18301,6 +18362,8 @@ fn ribbon_beam_ordered(
                 let mut row_rel = (y0 - clip.origin_y).div_euclid(clip.cell_h);
                 let mut band_end = clip.origin_y + (row_rel + 1) * clip.cell_h;
                 for y in y0..y1 {
+                    // Keep the generic splitter's conservative two-quad
+                    // admission check even though this 1px row can
                     // emit at most one.
                     if out.len() + 2 > max_quads {
                         return false;
@@ -18443,6 +18506,7 @@ fn ribbon_beam_v_ordered(
                     1
                 };
                 for x in x0..x1 {
+                    // Admit the whole column or none of it: a column cut at a band boundary
                     // would leave a visible notch.
                     if out.len() + bands + 1 > max_quads {
                         return false;
@@ -26520,6 +26584,7 @@ mod tests {
                             partial |= b != 0x00f1_fa8c;
                         }
                     } else {
+                        // The icon never reaches a neighbour (its own columns
                         // above and below the cell are the row's chrome).
                         if !(P..P + cw).contains(&x) {
                             assert_eq!(a, b, "{icon:?}: pixel ({x},{y}) outside the cell moved");

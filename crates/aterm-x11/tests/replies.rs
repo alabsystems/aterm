@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-x11's reply, setup and event parsers against x11rb-protocol
-//! 0.13.2's, recorded in tests/recorded/: each packet parses to the fields
-//! x11rb-protocol read from it, and each packet it refused is refused.
-//!
-//! Negative controls: every recording has a case and every case a
-//! recording; every packet that parses stops parsing one byte short, and
-//! stops being a reply with its packet type changed.
+//! Reply, setup, and event parser conformance tests against `x11rb-protocol` recordings.
 
 #![cfg(target_endian = "little")]
 
@@ -438,9 +432,6 @@ fn every_event_parses_as_x11rb_protocol_parsed_it() {
     same_cases(EVENTS, &want, &got);
 }
 
-/// Negative control: the parsers check what they are given. Every packet
-/// that parses is refused one byte short, and a reply is refused under any
-/// packet type but 1.
 #[test]
 fn a_packet_one_byte_short_or_retyped_is_refused() {
     for (case, (bytes, fields)) in recorded(REPLIES) {

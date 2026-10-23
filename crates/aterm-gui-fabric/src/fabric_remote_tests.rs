@@ -14,24 +14,16 @@ fn mac(node: u8, host: &str) -> Driver {
     }
 }
 
-/// `rest` as `driver`'s drive connection sends it.
 fn remote(store: &Store, driver: &Driver, rest: &str) -> String {
     let _driving = DrivingAs::enter(driver.clone());
     cmd_hold(store, rest, HoldIssuer::Remote)
 }
 
-/// `verb`'s halt refusal on `ctx`, as `driver`'s drive connection meets it
-/// (`None`: any other writer's).
 fn refusal_to(ctx: &dyn FabricSession, driver: Option<&Driver>, verb: &str) -> Option<String> {
     let _driving = driver.cloned().map(DrivingAs::enter);
     halt_refusal(ctx, verb)
 }
 
-/// A NODE'S HOLD KEEPS EVERYONE OUT BUT THE NODE. Its `hold on` fills the
-/// remote slot with its node and host; every other writer — a local
-/// client, the harness, another node — meets `ERR halted … origin=remote`;
-/// the node's own writes pass; and its `off` lifts it. CONTROL: with no
-/// hold, nobody is refused.
 #[test]
 fn a_nodes_hold_refuses_every_writer_but_that_node() {
     let store = new_store();
@@ -74,10 +66,6 @@ fn a_nodes_hold_refuses_every_writer_but_that_node() {
     assert!(refusal_to(&ctx, None, "send").is_none());
 }
 
-/// THE PERSON WINS. A node's `hold on` under the person's Take Over is
-/// refused naming the person's hold; the person's Take Over takes a node's
-/// slot away, and while it stands the node's writes are refused too; Hand
-/// Back, with no person's or client's hold, lifts a node's.
 #[test]
 fn the_persons_take_over_refuses_and_clears_a_nodes_hold() {
     let store = new_store();
@@ -113,10 +101,6 @@ fn the_persons_take_over_refuses_and_clears_a_nodes_hold() {
     );
 }
 
-/// THE REMOTE SLOT IS ITS NODE'S. No local connection names it — Owner and
-/// bridge `origin=remote` are `ERR usage`, and a remote act off a drive
-/// connection's thread is `ERR denied` — and the node names no origin. No
-/// carry writes it, so a successor never reads it as a local hold.
 #[test]
 fn no_local_connection_names_the_remote_slot_and_no_carry_writes_it() {
     let store = new_store();

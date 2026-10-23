@@ -408,12 +408,10 @@ pub enum Source {
     /// The signed index pins this ALab build for this target: the index lane.
     Index {
         /// The pinned build.
-        /// The pinned build.
         build: u64,
     },
     /// The active build is ALab's and nothing pins one here: kept, never the vendor's.
     KeepAlab {
-        /// The active build.
         /// The active build.
         build: u64,
     },
@@ -442,7 +440,7 @@ pub struct Facts {
     pub installed_alab: Option<u64>,
 }
 
-/// THE SOURCE RULE (module doc), pure.
+/// THE SOURCE RULE, pure.
 #[must_use]
 pub const fn rule(f: &Facts) -> Source {
     if f.linked {

@@ -561,6 +561,7 @@ impl<'a> Parser<'a> {
             None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}' | b'#') => Ok(()),
             Some(_) => {
                 // The whole offending character: callers slice the source with the
+                // public `Error::span()` (see `here()`).
                 let end = self.next_boundary(self.pos);
                 self.err(start..end, "unexpected characters after a value")
             }
@@ -611,6 +612,8 @@ impl<'a> Parser<'a> {
                 return Ok(array);
             }
             if self.eof() {
+                // An empty span at end of input, not `[`..EOF: the config editor's
+                // `parser_diagnostic_range` turns that into a caret on the last authored
                 // byte, where a whole-array span would underline the opening bracket.
                 return self.err(self.b.len()..self.b.len(), "unterminated array");
             }

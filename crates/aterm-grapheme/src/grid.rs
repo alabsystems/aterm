@@ -160,6 +160,7 @@ impl GridColumns {
                     return GridStep::Joins { widened: true };
                 }
                 if c == VS15 && cell.wide {
+                    // The glyph narrows; the cursor stays past the emptied
                     // column, which is now the cell before it.
                     *cell = Cell::open(cell.col.saturating_add(1), ' ', false);
                 }

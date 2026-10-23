@@ -404,6 +404,7 @@ pub fn verb_usage(verb: &str) -> Option<&'static str> {
 }
 
 fn help_flag_addresses_atpkg(verb: &str, rest: &[String]) -> bool {
+    // `abrew` owns its whole argv (Arity::Own): its --help is abrew's (or,
     // for delegated commands, real brew's), never the atpkg usage line.
     if verb == "abrew" {
         return false;
@@ -507,6 +508,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// The whole package-manager CLI as a callable.
 pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
+    // The private window's lead ([`PRIVATE_STATE_ROOT_FLAG`]), taken off before anything
+    // reads the first word as the verb: this pass carries no `[machine]` edit, whatever this
     // build's seams say.
     if argv.first().and_then(|v| v.to_str()) == Some(PRIVATE_STATE_ROOT_FLAG) {
         argv.remove(0);
@@ -558,6 +561,7 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         return crate::abrew::rerouted_entry(&args[1..]);
     }
     if matches!(verb, Some("help" | "-h" | "--help")) {
+        // `atpkg help <verb>` answers for that verb, as `aterm help <topic>` does; an
         // unknown topic is a usage error ([`cmd_verb_help`]).
         if let Some(topic) = args.get(1) {
             return cmd_verb_help(topic);
@@ -617,6 +621,7 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         match mutator_store_lock(link_request.as_ref().and_then(|r| r.if_prefix)) {
             Ok(guard) => guard,
             Err(code) => {
+                // The package log hears a pass the store lock refused, too: a
                 // `claude update` behind a running pass, a window lane whose wait ran out.
                 if !link_request
                     .as_ref()
@@ -1788,6 +1793,7 @@ fn cmd_reroute(rest: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = layout() else {
+        // No resolvable store (`layout` has said why): the upstream copy on PATH runs
         // after one line; `[reroute] strict = true` refuses instead, exit 2.
         return crate::reroute::run_storeless(upstream, args);
     };
@@ -1847,6 +1853,7 @@ fn detach_rustup_seams(layout: &crate::store::Layout) {
 }
 
 fn lay_reroute_stubs(layout: &crate::store::Layout) {
+    // abrew's `brew` stub rides the same seams (docs/DESIGN-abrew-2026-10-19.md §6);
     // `reroute::lay` lays it too, so every spawn seam is covered by this one call.
     if let Err(err) = crate::reroute::lay(layout) {
         eprintln!(
@@ -1914,6 +1921,7 @@ pub(crate) fn vendor_state_of(
     build: u64,
     row: Option<&crate::ProgramStatus>,
 ) -> String {
+    // An ALab build ([`crate::alab`]) is no vendor version: its row as a lane wrote it
     // (pinned by the index, or kept), else what it is — never `updates from <vendor>`.
     if crate::alab::build_is_alab(layout, spec.program, build) {
         return row
@@ -2371,6 +2379,7 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
                     | Phase::Done
             )
         {
+            // Not started yet, as far as the pass goes: still queued, or its archive fetched
             // ahead and waiting for the pass to reach it ([`ProgramProgress::downloaded`]).
             if row.phase == Phase::Queued || row.downloaded() {
                 let _ = crate::progress::append_bump(layout, &program, io.asker);
@@ -2708,6 +2717,8 @@ fn mutator_store_lock(
     drop(spinner.take());
     match acquired {
         Ok(guard) => {
+            // The wait is over, said once and only after it was announced: the verb that
+            // follows may be quiet for its whole run, and the GUI's waiting row has nothing
             // else to retire it before this child exits. Lossy, like the announcement.
             if announced.get() {
                 emit_marker_line_lossy(&format!(
@@ -2718,6 +2729,8 @@ fn mutator_store_lock(
             Ok(Some(guard))
         }
         Err(e) => {
+            // An orphaned waiter has nobody to tell: the exit code says it all. A window can
+            // quit after that check, so a waiter's lines are lossy writes (the macros panic
             // on a dead pipe, a 101 for the silent 75); a typed verb's stderr is a terminal.
             if !parent_is_gone() {
                 let waited = wait_lock().map(|w| w.bound);
@@ -2896,6 +2909,9 @@ fn which_line_in(
     path_var: Option<&std::ffi::OsStr>,
     env: crate::reroute::StubEnv,
 ) -> Result<String, String> {
+    // A rerouted upstream name is answered by the table, ahead of the deny-list gate and
+    // the store: inside an aterm session the reroute dir is first on PATH, so the stub is
+    // the copy that runs, and the managed bin/ never carries these names — `cargo`/`rustc`
     // are deny-listed, and no index program exposes the other six.
     if let Some(row) = crate::reroute::row_for(tool) {
         return Ok(reroute_which_line(layout, row, path_var));
@@ -2930,6 +2946,7 @@ fn which_line_in(
             AgentStub::Routes { .. } | AgentStub::PassesThrough { .. } | AgentStub::Absent => None,
         };
         if let Some(shadow) = shadow_through(layout, tool, path_var, &answer) {
+            // Outside aterm, a stub that passes through to the user's own copy is the
             // design, said as such ([`agent_passed_row`]).
             if let Some(row) = agent_passed_row(layout, &program, build, &shadow, path_var, env) {
                 return Ok(format!("{tool} → {} — {row}", shadow.display()));
@@ -4069,6 +4086,7 @@ fn list_porcelain_lines(
     for (program, build) in installed {
         let mut notes: Vec<String> = Vec::new();
         if let Some(checkout) = linked.get(program) {
+            // A dev link supersedes every store build, so the note belongs on the program:
             // print it once, and never call a store build "live" while it is shadowed.
             if shown_link.insert(program.clone()) {
                 match checkout {
@@ -4264,6 +4282,8 @@ fn program_present(layout: &crate::store::Layout, program: &str) -> bool {
 }
 
 fn uninstall_one(layout: &crate::store::Layout, program: &str) -> ExitCode {
+    // Refuse to "uninstall" what was never there: a success would mint a durable removed
+    // marker that suppresses set-completion for a program the user never had. A
     // sentinel/flag name reaches the retirement gate's own refusal instead.
     if !(is_sentinel_row(program) || program.starts_with('-')) && !program_present(layout, program)
     {
@@ -4393,6 +4413,8 @@ fn cmd_uninstall_all() -> ExitCode {
     crate::reroute::remove_all(&layout);
     remove_exec_roots(&layout);
     if removed.is_empty() {
+        // Nothing of ours was here (every row names a system copy): the decline just
+        // recorded is what was asked for, so this is a success with an honest report
         // (`tools/install.sh` reads the exit code).
         if failures == 0 {
             println!(
@@ -4608,6 +4630,8 @@ fn now_rfc3339() -> String {
 }
 
 fn rfc3339_at(secs: i64) -> String {
+    // Both ends mean an unusable clock: `now_unix` returns `i64::MAX` when it cannot be read
+    // (the freshness gates' fail-closed sentinel), and that would stamp a far-future year
     // doctor's "publishing looks frozen" check reads as fresh.
     if secs <= 0 || secs == i64::MAX {
         return String::new();
@@ -5557,6 +5581,7 @@ fn explicit_install_door(
     fetcher: &dyn crate::flow::Fetcher,
     program: &str,
 ) -> Option<std::path::PathBuf> {
+    // No index rule decides a vendor-direct program: no system satisfaction, and no index
     // resolve ahead of its own lane.
     if crate::vendor_direct::is_vendor(program) {
         return None;
@@ -6316,6 +6341,7 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             let applied = apply_machine_settings();
             drop(queue);
             if applied.entries.is_empty() {
+                // The window's card shows this sentence alone, so it names the one cause
                 // the apply saw.
                 println!("{MACHINE_VERDICT_PREFIX}{}", applied.nothing_changed());
             } else {
@@ -6906,6 +6932,7 @@ fn human_marker(line: &str) -> Option<String> {
         });
     }
     if marked(SEED_BUSY_MARKER).is_some() {
+        // A fact the sentence beside it already says (the intercept's epilogue, or the
         // typed lane's timed-out sentence), so on a terminal it shows as nothing.
         return None;
     }
@@ -8735,6 +8762,8 @@ fn run_update_pass_in<'scope, 'env>(
             );
             c_toolchain_said = true;
         } else if announced {
+            // Always answer the announcement: a pass that said "installing over the
+            // network" and installed nothing must say so — a failure, unless everything it
             // announced was a vendor landing waiting on its signature check.
             if let Some(line) = fresh_landing_terminal(&[], &deferred, net.announced_count) {
                 emit_marker_line(&line);
@@ -8800,6 +8829,11 @@ fn run_update_pass_in<'scope, 'env>(
         std::collections::BTreeSet::new()
     };
     if failures == 0 && update_toolset_is_empty(&crate::active_builds(layout), &dev_linked) {
+        // A pass that installed nothing on an empty store is not a success: every group
+        // clean-skips when the index publishes no artifact for this triple. Say so durably,
+        // on stderr with exit 2, as `cmd_install_default_set` does (the GUI maps 2 to "not
+        // a temporary error"; exit 2 only for a pass that reached the index). The cause is
+        // a translated process, an unserved triple, a revoked channel, an exclude or
         // uninstalls: ask `running_translated`, then `index_serves`.
         if (seams.translated)() {
             let said = format!(
@@ -10808,6 +10842,7 @@ fn reconcile_links(layout: &crate::store::Layout, cfg: &crate::config::PackagesC
                         }
                     }
                     Some(existing) if existing == want => {
+                        // Already ours at the right target: idempotent re-assert
                         // (picks up newly-built bins), quiet on the happy path.
                         if let Err(e) = crate::refresh(layout, program) {
                             eprintln!("atpkg: [packages.links] {program}: refresh failed: {e}");
@@ -10852,6 +10887,7 @@ fn sysroot_link_bins(
     program: &str,
     checkout: &std::path::Path,
 ) -> Option<Result<Vec<std::path::PathBuf>, Vec<String>>> {
+    // A sysroot is bin/ + lib/rustlib; requiring both keeps an ordinary cargo checkout that
     // happens to have a `bin/` directory on the single-binary path.
     if !checkout.join("bin").is_dir() || !checkout.join("lib").join("rustlib").is_dir() {
         return None;
@@ -10894,6 +10930,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
     if let Some(spec) = crate::vendor_direct::spec(program)
         && head_watch_pass()
     {
+        // The head watch names a vendor's head; a program the index lane owns here
         // (an ALab build pinned for this target, [`crate::alab`]) does not follow it.
         if crate::alab::index_owns(
             &layout,
@@ -12410,6 +12447,7 @@ fn cmd_verify_pkg(args: &[String]) -> ExitCode {
     };
     match admitted.authorize_bytes(raw, &sig_bytes) {
         Ok((verified, who)) => {
+            // The signature is half the chain: a client parses these bytes the moment they
             // verify and drops the program on any refusal ([`pkg_post_verify_refusal`]).
             if let Some(why) = pkg_post_verify_refusal(&verified) {
                 eprintln!(
@@ -12644,6 +12682,10 @@ fn requested_link_bins(
             }
         }
     } else {
+        // Default to the conventional cargo release bin, WITH the platform executable
+        // extension (`target/release/<program>.exe` on Windows) — else `src.is_file()`
+        // never matches the real exe and the link yields nothing to link. Shared with
+        // the `[packages.links]` reconciliation — which a package directory of an
         // ALab-built program answers with its entrypoint instead ([`link_bins_for`]).
         link_bins_for(program, checkout_path)
     };

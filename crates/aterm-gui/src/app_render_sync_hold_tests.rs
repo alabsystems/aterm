@@ -6,9 +6,6 @@ use crate::{App, SyncObservation, WindowId};
 use aterm_core::terminal::Terminal;
 use std::time::{Duration, Instant};
 
-/// A terminal whose own mode-2026 force-clear cannot fire mid-test: that
-/// clear runs on real time (`sync_timeout_ms`, 1 s), while these tests drive
-/// the hold on a synthetic clock and a loaded machine can stall past it.
 fn terminal_without_force_clear() -> Terminal {
     let mut term = Terminal::new(24, 80);
     term.apply_config(&aterm_core::config::TerminalConfig {
@@ -44,31 +41,23 @@ fn terminal_observation(term: &Terminal) -> SyncObservation {
     )
 }
 
-/// The frame-hold state machine: arm on the rising edge, hold while unexpired,
-/// release on `2026l` or timeout, no re-hold within an episode, re-arm on a
-/// fresh episode.
 #[test]
 fn sync_frame_hold_state_machine() {
     let t0 = Instant::now();
     let timeout = Duration::from_millis(1000);
     let d = |ms| t0 + Duration::from_millis(ms);
 
-    // Inactive throughout: never holds, no deadline armed.
     assert_eq!(
         sync_frame_hold(observation(false, 0, false), false, None, 0, t0, timeout),
         (None, false, 0)
     );
 
-    // Rising edge (false->true): arm at now + timeout and hold, recording the
-    // close counter at arm time.
     assert_eq!(
         sync_frame_hold(observation(true, 7, false), false, None, 0, d(0), timeout),
         (Some(d(1000)), true, 7),
         "rising edge arms at now+timeout, holds, records end_seq"
     );
 
-    // Sustained hold (active, not rising, unexpired, counter unmoved): the same
-    // deadline, held.
     assert_eq!(
         sync_frame_hold(
             observation(true, 7, false),
@@ -82,7 +71,6 @@ fn sync_frame_hold_state_machine() {
         "the deadline is not re-armed while holding"
     );
 
-    // `2026l` mid-window (sync inactive before the deadline): release immediately.
     assert_eq!(
         sync_frame_hold(
             observation(false, 8, false),
@@ -96,8 +84,6 @@ fn sync_frame_hold_state_machine() {
         "sync end releases the held frame at once"
     );
 
-    // Timeout expiry (active, not rising, now >= deadline): release + disarm so
-    // about_to_wait folds no stale past instant (which would busy-spin).
     assert_eq!(
         sync_frame_hold(
             observation(true, 7, false),
@@ -111,15 +97,12 @@ fn sync_frame_hold_state_machine() {
         "an expired hold releases and clears the deadline"
     );
 
-    // After a timeout release, sync still active but not rising and no deadline: it
-    // must not re-hold (a stuck-sync app presents normally, not at 1 Hz forever).
     assert_eq!(
         sync_frame_hold(observation(true, 7, false), true, None, 7, d(1500), timeout),
         (None, false, 7),
         "no re-hold within an episode after a timeout"
     );
 
-    // A new episode (sync dropped then set again → rising edge) re-arms.
     assert_eq!(
         sync_frame_hold(
             observation(true, 9, false),
@@ -134,24 +117,16 @@ fn sync_frame_hold_state_machine() {
     );
 }
 
-/// An app bracketing every repaint in `2026h…2026l` under sustained flood
-/// keeps the sampled level true on every redraw. The close counter turns
-/// each closed bracket into a present plus a fresh arm, so glass keeps
-/// updating bracket by bracket.
 #[test]
 fn closed_bracket_presents_even_while_level_stays_true() {
     let t0 = Instant::now();
     let timeout = Duration::from_millis(150);
     let d = |ms| t0 + Duration::from_millis(ms);
 
-    // Frame 0: rising edge — arm and hold (bracket #1 open, counter 0).
     let (armed, hold, seq) =
         sync_frame_hold(observation(true, 0, false), false, None, 0, d(0), timeout);
     assert!(hold && armed == Some(d(150)) && seq == 0);
 
-    // Frame 1 (16 ms later): bracket #1 closed and bracket #2 opened inside one
-    // reader batch; the level still samples true, but the counter advanced.
-    // The completed frame presents, with a fresh deadline armed for #2.
     let (armed, hold, seq) = sync_frame_hold(
         observation(true, 1, false),
         true,
@@ -171,7 +146,6 @@ fn closed_bracket_presents_even_while_level_stays_true() {
     );
     assert_eq!(seq, 1);
 
-    // Frame 2: bracket #2 still open (counter unmoved) — hold under its deadline.
     let (armed2, hold, seq) = sync_frame_hold(
         observation(true, 1, false),
         true,
@@ -182,8 +156,6 @@ fn closed_bracket_presents_even_while_level_stays_true() {
     );
     assert!(hold && armed2 == armed && seq == 1);
 
-    // Frame 3: bracket #2 closed, #3 open — present again. Steady state: one
-    // present per closed bracket, never a 1 Hz pin.
     let (_, hold, seq) = sync_frame_hold(
         observation(true, 2, false),
         true,
@@ -195,11 +167,6 @@ fn closed_bracket_presents_even_while_level_stays_true() {
     assert!(!hold && seq == 2);
 }
 
-/// `sync_reopen_visibility_model` conformance: the real parser-owned episode
-/// bit and the shipping GUI hold decision driven through the close/reopen
-/// race, each sampled state projected onto the derived model. A level-sampled
-/// hold and a close-sequence-only rule on the same observations are the
-/// negative controls.
 #[test]
 fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
     let model = aterm_models_effects::sync_reopen_visibility_model();
@@ -209,9 +176,6 @@ fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
     let mut term = terminal_without_force_clear();
     let mut presented_generation = 0u64;
 
-    // The model begins inside a dirty first episode. Both pieces of this
-    // observation come from shipping code: `sync_open_dirty` is set by the
-    // real parser action, and `hold` is the real glass decision.
     term.process(b"\x1b[?2026hold-frame");
     let initial = model.init_state();
     let (mut armed, hold, mut armed_end_seq) =
@@ -232,9 +196,6 @@ fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
         initial["partial_visible"] as u64
     );
 
-    // Sample the close+immediate-reopen exactly as a PTY reader batch can:
-    // the level is still true, but the close counter advanced and the new
-    // episode is clean. That licenses the completed boundary once.
     term.process(b"\x1b[?2026l\x1b[?2026h");
     let first_closed = model.successors("CloseFirstEpisode", &initial)[0].clone();
     let clean_reopen = model.successors("ReopenClean", &first_closed)[0].clone();
@@ -272,21 +233,15 @@ fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
         u64::from(!clean_hold && term.sync_open_dirty()),
         clean_reopen["partial_visible"] as u64
     );
-    // Negative control: a level-sampled hold (the mode bit itself) on this
-    // terminal reads the close+reopen as one endless episode and presents
-    // nothing. Projected field by field, it is the model's `Buggy=1`
-    // ReopenClean, which the healthy model refuses.
     let level_hold = term.modes().synchronized_output();
     assert!(level_hold && !clean_hold);
     let mut level_held = clean_reopen.clone();
     level_held.insert("hold", i64::from(level_hold));
-    // A held frame leaves glass at the generation presented before it.
     level_held.insert("presented_generation", first_closed["presented_generation"]);
     level_held.insert(
         "partial_visible",
         i64::from(!level_hold && term.sync_open_dirty()),
     );
-    // The level hold is the `Buggy=1` trace that picked it (`level_fault`).
     let (mut level_closed, mut level_picked) = (first_closed.clone(), level_held.clone());
     level_closed.insert("level_fault", 1);
     level_picked.insert("level_fault", 1);
@@ -305,8 +260,6 @@ fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
     );
     assert!(!level_ok, "the level-sampled hold must not conform");
 
-    // A real printable action dirties the reopened episode. With no new
-    // close, the GUI keeps the last completed generation on glass.
     term.process(b"next-frame-prefix");
     let dirty_reopen = model.successors("DirtyReopenedEpisode", &clean_reopen)[0].clone();
     let (next_armed, dirty_hold, next_armed_end_seq) = sync_frame_hold(
@@ -371,9 +324,6 @@ fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
         reopened_closed["presented_generation"] as u64
     );
 
-    // Negative control: race close+reopen+write before the next sample. A
-    // close-sequence-only rule releases because the counter advanced; the
-    // shipping decision also reads the dirty bit and holds.
     let mut raced = terminal_without_force_clear();
     raced.process(b"\x1b[?2026hold-frame");
     let (raced_armed, raced_initial_hold, raced_armed_end_seq) =
@@ -388,9 +338,6 @@ fn sync_reopen_visibility_model_conforms_to_terminal_and_gui_hold() {
         d(80),
         timeout,
     );
-    // The dirty hold arms a fresh deadline (a held pane with no deadline
-    // never gets its about_to_wait wake) and carries the episode's completed
-    // generation forward.
     assert_eq!(
         (raced_deadline, raced_seq),
         (Some(d(80) + timeout), raced.sync_end_seq()),
@@ -454,8 +401,6 @@ fn composed_hold_releases_only_after_every_real_pane_releases() {
     let model_a_closed = model.successors("CloseOnlyA", &model_held)[0].clone();
     assert!(model.check_invariant("NoPartialCompositePresent", &model_a_closed));
 
-    // Negative control: an "any close" aggregate would release here; the
-    // per-pane fold holds.
     let flawed_aggregate_holds = false;
     assert_ne!(held, flawed_aggregate_holds);
 

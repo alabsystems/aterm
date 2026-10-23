@@ -12,6 +12,9 @@ use aterm_json::Value;
 /// How long any one answer or event may take before the lane calls it hung.
 pub(crate) const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
+/// How [`Cdp::take_console`] begins the line of an exception nobody caught.
+pub(crate) const UNCAUGHT: &str = "uncaught: ";
+
 /// One DevTools connection.
 pub(crate) struct Cdp {
     to: std::io::PipeWriter,
@@ -138,6 +141,49 @@ impl Cdp {
         }
     }
 
+    /// Wait for the console line `marker` from the page `session` (a
+    /// `Runtime.consoleAPICalled` whose first argument is exactly `marker`),
+    /// taken out of the events; the lines before it stay for
+    /// [`Cdp::take_console`]. The hang detector starts again at each message
+    /// the page sends, so a page that keeps printing is not hung however long
+    /// it runs, and one silent for a minute is. A page that crashes ends the
+    /// wait at once, a crash read while an earlier call waited included.
+    pub(crate) fn wait_console(&mut self, session: &str, marker: &str) -> Result<(), String> {
+        let from_page = |m: &Value| m.get("sessionId").and_then(Value::as_str) == Some(session);
+        let is = |m: &Value| {
+            from_page(m)
+                && m.get("method").and_then(Value::as_str) == Some("Runtime.consoleAPICalled")
+                && m.pointer("/params/args/0/value").and_then(Value::as_str) == Some(marker)
+        };
+        let crashed = |m: &Value| {
+            from_page(m)
+                && m.get("method").and_then(Value::as_str) == Some("Inspector.targetCrashed")
+        };
+        let crash = || format!("the page crashed before {marker:?}");
+        // The events already read, oldest first: whichever came first decides.
+        if let Some(i) = self.events.iter().position(|m| is(m) || crashed(m)) {
+            if crashed(&self.events[i]) {
+                return Err(crash());
+            }
+            self.events.remove(i);
+            return Ok(());
+        }
+        let mut t0 = Instant::now();
+        loop {
+            let m = self.recv(t0, &format!("console line {marker:?}"))?;
+            if is(&m) {
+                return Ok(());
+            }
+            if crashed(&m) {
+                return Err(crash());
+            }
+            if from_page(&m) {
+                t0 = Instant::now();
+            }
+            self.events.push(m);
+        }
+    }
+
     /// Drains console and exception lines for `session` from the events read so far.
     pub(crate) fn take_console(&mut self, session: &str) -> Vec<String> {
         let mut lines = Vec::new();
@@ -148,7 +194,7 @@ impl Cdp {
             match m.get("method").and_then(Value::as_str) {
                 Some("Runtime.consoleAPICalled") => lines.push(console_line(m)),
                 Some("Runtime.exceptionThrown") => lines.push(format!(
-                    "uncaught: {}",
+                    "{UNCAUGHT}{}",
                     m.pointer("/params/exceptionDetails/exception/description")
                         .or_else(|| m.pointer("/params/exceptionDetails/text"))
                         .and_then(Value::as_str)
@@ -294,5 +340,78 @@ mod tests {
         );
         assert!(cdp.wait_event("s", "Page.loadEventFired").is_ok());
         browser.join().expect("the stand-in");
+    }
+
+    /// A console marker is waited for past the page's other lines, which stay
+    /// for `take_console`; another page's marker is not this page's, and a
+    /// crash ends the wait.
+    #[test]
+    fn a_console_marker_ends_the_wait_and_the_lines_before_it_stay() {
+        let (_to_read, to_write) = std::io::pipe().expect("pipe");
+        let (from_read, mut from_write) = std::io::pipe().expect("pipe");
+        let line = |session: &str, text: &str| {
+            format!(
+                "{{\"method\":\"Runtime.consoleAPICalled\",\"sessionId\":\"{session}\",\"params\":\
+                 {{\"type\":\"error\",\"args\":[{{\"type\":\"string\",\"value\":\"{text}\"}}]}}}}\0"
+            )
+        };
+        let mut sent = line("s", "first");
+        sent.push_str(&line("other", "done"));
+        sent.push_str(&line("s", "second"));
+        sent.push_str(&line("s", "done"));
+        sent.push_str(
+            "{\"method\":\"Inspector.targetCrashed\",\"sessionId\":\"s\",\"params\":{}}\0",
+        );
+        from_write.write_all(sent.as_bytes()).expect("write");
+        let mut cdp = Cdp::new(to_write, from_read);
+        assert_eq!(cdp.wait_console("s", "done"), Ok(()));
+        assert_eq!(
+            cdp.take_console("s"),
+            ["console.error: first", "console.error: second"]
+        );
+        assert_eq!(
+            cdp.wait_console("s", "done"),
+            Err("the page crashed before \"done\"".to_string())
+        );
+        assert_eq!(cdp.wait_console("other", "done"), Ok(()));
+    }
+
+    /// A crash the page reported while an earlier call waited for its answer
+    /// ends the console wait at once, not at the hang detector. NEGATIVE
+    /// CONTROL: for a page whose marker was read before its crash, and after
+    /// another page's crash, the wait ends as found.
+    #[test]
+    fn a_crash_read_during_an_earlier_call_ends_the_console_wait_at_once() {
+        let (to_read, to_write) = std::io::pipe().expect("pipe");
+        let (from_read, mut from_write) = std::io::pipe().expect("pipe");
+        let crashed = |session: &str| {
+            format!(
+                "{{\"method\":\"Inspector.targetCrashed\",\"sessionId\":\"{session}\",\"params\":{{}}}}\0"
+            )
+        };
+        let marker = |session: &str| {
+            format!(
+                "{{\"method\":\"Runtime.consoleAPICalled\",\"sessionId\":\"{session}\",\"params\":\
+                 {{\"type\":\"debug\",\"args\":[{{\"type\":\"string\",\"value\":\"done\"}}]}}}}\0"
+            )
+        };
+        let mut sent = crashed("other");
+        sent.push_str(&marker("early"));
+        sent.push_str(&crashed("early"));
+        sent.push_str(&crashed("s"));
+        sent.push_str("{\"id\":1,\"result\":{}}\0");
+        from_write.write_all(sent.as_bytes()).expect("write");
+        let mut cdp = Cdp::new(to_write, from_read);
+        cdp.call(Some("s"), "Runtime.evaluate", aterm_json::json!({}))
+            .expect("answered");
+        drop(to_read);
+        // Without the buffered crash this would be the hang detector's
+        // sentence, a minute on.
+        assert_eq!(
+            cdp.wait_console("s", "done"),
+            Err("the page crashed before \"done\"".to_string())
+        );
+        assert_eq!(cdp.wait_console("early", "done"), Ok(()));
+        drop(from_write);
     }
 }

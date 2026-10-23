@@ -63,7 +63,7 @@ enum Asked<'a> {
     Emit,
 }
 
-/// The replay's core ([module docs](self)).
+/// The replay's core.
 pub(crate) struct ReplayCore {
     state: Mutex<Replayer>,
     /// The instant every `Mono` record counts from in this replay.
@@ -396,6 +396,7 @@ impl ReplayCore {
             let mut st = self.lock();
             if st.diverged.is_some() || st.reached.is_some() || st.died_in.is_some() {
                 // Nothing is served after the first divergence (or the stop,
+                // or the place the recorded run died).
                 None
             } else {
                 let at = st.cursor.position() as u64;
@@ -507,6 +508,7 @@ impl ReplayCore {
             let mut st = self.lock();
             if st.diverged.is_some() || st.reached.is_some() || st.died_in.is_some() {
                 // Nothing is served after the first divergence (or the stop,
+                // or the place the recorded run died).
                 None
             } else {
                 let Cursor::Acts(c) = &mut st.cursor else {
@@ -547,6 +549,7 @@ impl ReplayCore {
                     }
                     (Err(_), Some((divergence, last_segment, spent))) => {
                         // Asked in the last segment: where a run that died
+                        // inside a door's live call is reached again.
                         if last_segment && let Asked::Exchange { door, request } = &asked {
                             st.past_end = Some(((*door).to_string(), request.to_vec()));
                         }
@@ -575,7 +578,7 @@ impl ReplayCore {
         self.halt()
     }
 
-    /// Unwind the loop from the door it is at ([module docs](self)).
+    /// Unwind the loop from the door it is at.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -714,6 +717,8 @@ impl ReplayCore {
     /// An output at `door`: compared with the recorded one.
     pub(crate) fn emit(&self, door: &str, bytes: &[u8]) {
         // The step returned, so the output was the recorded one (or, in a
+        // counterfactual, was not compared), and no divergence or stop is
+        // latched.
         if self.acts {
             self.step_acts(Some(door), Asked::Emit, |c| Ok(c.emit(door)));
         } else {
@@ -1079,7 +1084,7 @@ pub fn panic_message(panic: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "a panic with no message".to_string())
 }
 
-/// REPLAY the tape `bytes` (its file form or its text form) strictly ([module docs](self)).
+/// REPLAY the tape `bytes` (its file form or its text form) strictly.
 ///
 /// # Errors
 /// A tape that cannot be replayed at all.

@@ -101,6 +101,7 @@ impl Row {
         } else if start < old_len
             && (end >= old_len || (cleared_right_orphan && old_len == end + 1))
         {
+            // A blank `fill` implies a blank `orphan` (see the debug_assert), so
             // there is no visible-orphan case here.
             self.recalculate_len_up_to(start);
         }
@@ -116,6 +117,7 @@ impl Row {
         cols: usize,
         clear_orphan_spacers: bool,
     ) {
+        // Left boundary: if left-1 is WIDE but left is not its continuation,
         // clear the orphaned WIDE cell.
         if left > 0 && left < self.cells.len() && left - 1 < self.cells.len() {
             let prev_wide = self.cells[left - 1].flags().contains(CellFlags::WIDE);
@@ -228,6 +230,8 @@ impl Row {
 
             for col in start_usize..end_usize {
                 if !self.is_cell_protected(col as u16) {
+                    // If this is a WIDE cell, also clear its continuation so the
+                    // forward iteration doesn't see an orphaned continuation whose
                     // WIDE parent was already cleared.
                     if self.cells[col].flags().contains(CellFlags::WIDE)
                         && col + 1 < self.cells.len()
@@ -244,11 +248,19 @@ impl Row {
             if any_erased {
                 self.flags |= RowFlags::DIRTY;
                 if fill.is_empty() {
+                    // Not gated on `end_usize >= old_len`: the WIDE-head co-clear
+                    // above wipes cells[col+1], which for col == end-1 is
+                    // cells[end], one past the range; when that was the tail
+                    // content (old_len == end + 1), that gate would leave len
+                    // stale-high. recalculate_len_up_to(old_len) rescans the
                     // prefix and never over-shrinks.
                     if start_usize < old_len && self.cells[old_len - 1].is_empty() {
                         self.recalculate_len_up_to(old_len);
                     }
                 } else {
+                    // A BCE blank is content, possibly past the old end and
+                    // possibly not through the span's end (a protected cell
+                    // there survives as whatever it was): rescan for the tight
                     // len. DECSEL/DECSED are rare; the O(cols) scan is not.
                     self.recompute_len();
                 }
@@ -289,6 +301,7 @@ impl Row {
 
             for col in start_usize..end_usize {
                 if !self.is_cell_protected(col as u16) {
+                    // If this is a WIDE cell, also wipe its continuation so
                     // the forward iteration never sees an orphaned spacer.
                     if self.cells[col].flags().contains(CellFlags::WIDE)
                         && col + 1 < self.cells.len()

@@ -163,7 +163,7 @@ pub(crate) struct Deferred {
 
 impl Deferred {
     /// A queue holding every key until [`Self::release`].
-    pub(crate) fn holding() -> Self {
+    pub(crate) const fn holding() -> Self {
         Self {
             held: std::sync::Mutex::new(Some(Vec::new())),
         }
@@ -293,7 +293,7 @@ pub(crate) mod typed {
 
     impl Settled {
         /// The reply word.
-        pub(crate) fn word(self) -> &'static str {
+        pub(crate) const fn word(self) -> &'static str {
             match self {
                 Settled::None => "none",
                 Settled::Taken => "taken",

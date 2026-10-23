@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one capture barrier: a capture is bound only to a present it forced,
-//! the binding owns no model, and a capture copies the window's model only to
-//! rasterize it itself, in the one rerender every such capture ends in.
+//! Capture barrier tests: binding captures to forced presents and verifying destination vs rerender paths.
 
 use super::{
     App, CapturePixels, CapturePng, CapturePresentBudget, CaptureRequest, DestinationDemand,
@@ -24,8 +22,7 @@ const WID: WindowId = WindowId(0);
 /// A wait for an answer that must come: a hang detector, not a latency budget.
 const HANG: Duration = Duration::from_secs(60);
 
-/// Force a present of the front window as a capture does, with the fresh
-/// present budget [`App::run_capture`] gives every capture.
+/// Force a present of the front window with a fresh capture present budget.
 fn barrier(app: &mut App, take: PresentTake) -> Result<Option<PresentedCapture>, String> {
     app.capture_present_budget = CapturePresentBudget::default();
     app.present_before_capture(WID, None, take)
@@ -50,8 +47,7 @@ fn private_dir(label: &str) -> std::path::PathBuf {
     dir
 }
 
-/// A SIGUSR1 snapshot of the front window, once published: its PNG decoded
-/// to `(width, height, rgba)`, and its text.
+/// Wait for a SIGUSR1 snapshot of the front window and return its decoded `(width, height, rgba)` and text.
 fn snapshot(app: &mut App, dir: &std::path::Path, name: &str) -> ((usize, usize, Vec<u8>), String) {
     let path = dir.join(name);
     let done = snapshot_sidecar_path(&path, ".done");
@@ -94,8 +90,7 @@ fn headless_image(app: &mut App, clean: bool) -> (usize, usize, Vec<u8>) {
     })
 }
 
-/// An `image --meta` of the front window: its PNG decoded to `(width,
-/// height, rgba)`, and its `frame-phase` and `capture-serial`.
+/// Run `image --meta` on the front window and return `((width, height, rgba), phase, capture_serial)`.
 fn image_meta(app: &mut App, clean: bool) -> ((usize, usize, Vec<u8>), &'static str, u64) {
     let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
     let (reply, rx) = std::sync::mpsc::channel();
@@ -125,8 +120,7 @@ fn image_meta(app: &mut App, clean: bool) -> ((usize, usize, Vec<u8>), &'static 
     )
 }
 
-/// The glass's straight RGBA (a CPU surface is opaque) inside `rect`
-/// (`x, y, width, height`).
+/// Straight RGBA pixels of the CPU surface inside `rect`.
 fn glass_rgba(app: &mut App, rect: (usize, usize, usize, usize)) -> Vec<u8> {
     let ((surface_w, _), pixels) = glass(app);
     let (x0, y0, width, height) = rect;
@@ -136,8 +130,7 @@ fn glass_rgba(app: &mut App, rect: (usize, usize, usize, usize)) -> Vec<u8> {
         .collect()
 }
 
-/// A configured wallpaper: a layer the terminal routes splice and `image
-/// plain` strips.
+/// Configured wallpaper asset stripped by `image plain`.
 fn wallpaper() -> std::sync::Arc<crate::app_config::ConfigAssetCatalog> {
     std::sync::Arc::new(crate::app_config::ConfigAssetCatalog {
         wallpaper: crate::app_config::WallpaperAsset::Ready {
@@ -162,14 +155,11 @@ fn a_capture_is_bound_only_to_a_completed_present() {
         }
         let serial = app.windows[&WID].capture_present_serial;
 
-        // Negative control: every attempt drops, so nothing is bound.
         drop_every_attempt(&mut app);
         let error = barrier(&mut app, PresentTake::Model).expect_err("every present dropped");
         assert!(error.contains("could not synchronize"), "{error}");
         assert_eq!(app.windows[&WID].capture_present_serial, serial);
 
-        // A completed present binds its serial and the visuals committed
-        // beside it.
         app.windows.get_mut(&WID).expect("window").drag_hover = true;
         let presented = barrier(&mut app, PresentTake::Model)
             .expect("the present completes")
@@ -191,7 +181,6 @@ fn a_capture_is_bound_only_to_a_completed_present() {
         assert!(presented.client.is_none(), "a model take arms no tap");
 
         if !native {
-            // The one owned copy of the model cannot tear with a later stage.
             let copy = app.take_rerender_input(WID);
             assert_eq!(copy.cells[0][0].ch, 'A');
             app.windows
@@ -245,8 +234,6 @@ fn a_split_capture_binds_the_presented_divider_generation() {
         "the shipping terminal-divider path updates canonical geometry too"
     );
 
-    // Negative control: the moved divider is staged, and with every present
-    // dropped nothing binds it.
     drop_every_attempt(&mut app);
     assert!(barrier(&mut app, PresentTake::Model).is_err());
 
@@ -263,8 +250,7 @@ fn a_split_capture_binds_the_presented_divider_generation() {
     assert_eq!(widths_b.iter().sum::<usize>() + 1, usize::from(cols));
 }
 
-/// A windowed snapshot writes the destination its own present submitted and
-/// the text of the model that present rendered.
+/// A windowed snapshot writes the destination its own present submitted and the text of the model that present rendered.
 #[test]
 fn a_windowed_snapshot_is_the_presented_destination() {
     let mut app = scripted_app();
@@ -272,8 +258,6 @@ fn a_windowed_snapshot_is_the_presented_destination() {
     app.windows.get_mut(&WID).expect("window").last_present = None;
     app.redraw_window(WID);
     let ((fw, fh), _) = glass(&mut app);
-    // A surface wider and taller than the cell frame: the glass carries
-    // remainder bands that no rerender of the model has.
     let surface_size = (fw + 3, fh + 2);
     app.windows.get_mut(&WID).expect("window").win_px = Some(aterm_window::dpi::PhysicalSize::new(
         u32::try_from(surface_size.0).expect("width"),
@@ -295,8 +279,6 @@ fn a_windowed_snapshot_is_the_presented_destination() {
     assert!(rgba == expected, "the snapshot is the glass, byte for byte");
     assert!(text.contains("hello"), "{text:?}");
 
-    // Negative control: the same window captured headless is the renderer's
-    // frame of the model, which has no bands.
     let ((headless_width, _, _), headless_text) =
         headless(&mut app, |app| snapshot(app, &dir, "headless.png"));
     assert_ne!(headless_width, width);
@@ -304,9 +286,7 @@ fn a_windowed_snapshot_is_the_presented_destination() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A windowed `image` under a recording of its window is bound to its own
-/// barrier, as every windowed capture is: a recording's last present stands
-/// in for the glass only of a headless window, which has none.
+/// A windowed `image` during a recording is bound to its own barrier rather than the recording's last present.
 #[test]
 fn windowed_recording_image_is_bound_to_its_barrier() {
     let mut app = scripted_app();
@@ -315,8 +295,6 @@ fn windowed_recording_image_is_bound_to_its_barrier() {
     let (video_reply, _video_rx) = std::sync::mpsc::channel();
     app.video_rec = Some(crate::VideoRec {
         window: WID,
-        // Out of reach: the barrier's present finalizes a recording past its
-        // deadline.
         deadline: Instant::now() + Duration::from_secs(3_600),
         started_us: 0,
         keys: false,
@@ -333,7 +311,6 @@ fn windowed_recording_image_is_bound_to_its_barrier() {
         cancel: crate::VideoCancellation::new(),
         reply: video_reply,
     });
-    // A non-plain `image --meta`: its `capture_serial`, or its refusal.
     let image = |app: &mut App| {
         let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
         let (reply, rx) = std::sync::mpsc::channel();
@@ -358,8 +335,6 @@ fn windowed_recording_image_is_bound_to_its_barrier() {
     assert!(serial > before, "the barrier presented");
     assert_eq!(serial, app.windows[&WID].capture_present_serial);
 
-    // Negative control: the same window headless is bound to the recording,
-    // which has not presented.
     let error = headless(&mut app, image).expect_err("a headless still waits for the recording");
     assert!(
         error.contains("recording has not presented a frame yet"),
@@ -369,8 +344,7 @@ fn windowed_recording_image_is_bound_to_its_barrier() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A windowed snapshot and `window` read the presented model in place and
-/// copy the presented destination: neither copies the model.
+/// Windowed snapshot and `window` captures read the presented model in place without cloning `RenderInput`.
 #[test]
 fn exact_and_window_captures_clone_no_render_input() {
     let mut app = scripted_app();
@@ -404,8 +378,6 @@ fn exact_and_window_captures_clone_no_render_input() {
         assert_eq!(work_counts::take_capture_inputs_cloned(), 0, "window");
     }
 
-    // Negative control: `image plain` rasterizes its own frame, from one
-    // owned copy.
     let (reply, rx) = std::sync::mpsc::channel();
     app.render_image(crate::control::ImageReq {
         handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
@@ -426,16 +398,10 @@ fn exact_and_window_captures_clone_no_render_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A present a capture's barrier forced books its output→present sample as
-/// capture-forced, which the tainted ledger takes (`metrics::tainted_at`) and
-/// `capture_presents` counts; an ordinary present's sample stays the
-/// terminal's own and leaves `capture_presents` alone. The counts are this
-/// thread's (`work_counts`), the share of the process-global key that
-/// parallel tests' presents and resets cannot move.
+/// Capture-forced presents book their latency sample to `capture_presents` rather than ordinary presents.
 #[test]
 fn forced_capture_presents_are_tainted() {
     let mut app = scripted_app();
-    // A first present puts the pane on this glass, so its next stamp is kept.
     app.windows.get_mut(&WID).expect("window").last_present = None;
     app.redraw_window(WID);
     let arm_output = |app: &App| {
@@ -460,7 +426,6 @@ fn forced_capture_presents_are_tainted() {
         "the barrier's present booked one capture_presents sample"
     );
 
-    // Negative control: an ordinary present of the same kind of output.
     arm_output(&app);
     app.windows.get_mut(&WID).expect("window").last_present = None;
     app.redraw_window(WID);
@@ -471,9 +436,7 @@ fn forced_capture_presents_are_tainted() {
     );
 }
 
-/// A headless `image` and a headless snapshot of one state are one frame on
-/// every route: both stage it the same way and finish it in the one rerender
-/// (`App::rerender_capture`), under the same host visuals.
+/// Headless `image` and headless snapshot produce identical frames across all tab shapes.
 #[test]
 fn headless_snapshot_and_image_rerender_agree() {
     let dir = private_dir("rerender");
@@ -508,8 +471,6 @@ fn headless_snapshot_and_image_rerender_agree() {
         );
     }
 
-    // Negative control: `image plain` leaves out the wallpaper the snapshot
-    // shows, and the comparison sees it.
     let mut app = scripted_app();
     app.config_assets = wallpaper();
     let (snapshotted, _) = headless(&mut app, |app| snapshot(app, &dir, "wallpaper.png"));
@@ -519,14 +480,7 @@ fn headless_snapshot_and_image_rerender_agree() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A windowed `image` is the destination its own present submitted, cut back
-/// to the frame that present placed: on a surface wider and taller than the
-/// frame, exactly the glass inside the frame's placement, band pixels
-/// excluded, with `frame-phase=destination` and the present's serial, and
-/// with no copy of the model rendered; on a surface smaller than the frame (a
-/// transient resize), the part the glass shows, which no rerender of the
-/// frame has. Negative control: `image plain` rerenders one copy of the model,
-/// without the configured wallpaper the glass shows, so it is not the glass.
+/// A windowed `image` crops the presented destination to the frame placement without rerendering.
 #[test]
 fn windowed_image_is_the_presented_destination() {
     let mut app = scripted_app();
@@ -571,7 +525,6 @@ fn windowed_image_is_the_presented_destination() {
     assert_eq!(phase, "destination");
     assert_eq!(serial, app.windows[&WID].capture_present_serial);
 
-    // Negative control: `image plain` has no wallpaper, which the glass shows.
     let ((plain_width, plain_height, plain), plain_phase, _) = image_meta(&mut app, true);
     assert_eq!(work_counts::take_capture_inputs_cloned(), 1, "image plain");
     assert_eq!((plain_width, plain_height), (fw, fh));
@@ -584,7 +537,6 @@ fn windowed_image_is_the_presented_destination() {
         "the plain image is not the glass"
     );
 
-    // A surface smaller than the frame: the image is the part the glass shows.
     set_surface(&mut app, (fw - 5, fh - 3));
     let ((width, height, rgba), phase, _) = image_meta(&mut app, false);
     assert_eq!((width, height), (fw - 5, fh - 3));
@@ -592,21 +544,11 @@ fn windowed_image_is_the_presented_destination() {
     assert_eq!(phase, "destination");
 }
 
-/// The source decision ([`capture_source_kind`]) for `image` over every
-/// combination of its facts, against the table spelled out: `image plain` is
-/// always a rerender; a window's own present is tapped when it is opaque, its
-/// guards admit a copy and its surface offers one; a headless window's
-/// destination is its recording's. Negative control: flipping translucency on
-/// an opaque, copyable window flips its source. Then one GPU window on each
-/// platform, its facts derived from that platform's traits: a translucent
-/// window's `image` is a rerender on every platform, whether or not the
-/// compositor blends it. The snapshot requires the destination: only the
-/// guards refuse it (macOS translucency, a Windows material), and a surface
-/// that offers no copy is still tapped, which its barrier then refuses.
+/// Verify [`capture_source_kind`] across all `(windowed, clean, translucent, copyable, recording)` combinations and platform guards.
 #[test]
 fn image_source_policy_table() {
     use SourceKind::{Destination as D, Rerender as R};
-    /// (windowed, clean, translucent, copyable, recording)
+    /// `(windowed, clean, translucent, copyable, recording)`.
     type Row = (bool, bool, bool, bool, bool);
     let table: [(Row, SourceKind); 32] = [
         ((false, false, false, false, false), R),
@@ -662,7 +604,6 @@ fn image_source_policy_table() {
         );
     }
 
-    // Negative control: translucency alone flips an opaque, copyable window.
     let opaque = capture_source_kind(image(false), facts(true, false, true, false));
     let translucent = capture_source_kind(image(false), facts(true, true, true, false));
     assert_eq!((opaque, translucent), (Ok(D), Ok(R)));
@@ -684,7 +625,6 @@ fn image_source_policy_table() {
     let (mac, win, linux) = (crate::MAC_CAPTURE, crate::WIN_CAPTURE, crate::LINUX_CAPTURE);
     let blended = Err(crate::TRANSLUCENT_CAPTURE_ERROR);
     let unphotographed = Err(crate::MATERIAL_CAPTURE_ERROR);
-    // (row, traits, knobs, image, snapshot)
     let platforms = [
         ("macOS solid", mac, &solid, Ok(D), Ok(D)),
         ("macOS translucent", mac, &see_through, Ok(R), blended),
@@ -729,9 +669,7 @@ fn image_source_policy_table() {
     );
 }
 
-/// A capture that copies its destination owns the tap a deferral leaves
-/// armed while it waits for its drawable: a snapshot and an `image` do,
-/// `image plain` does not.
+/// Destination-copying captures (`image` and `Snapshot`) arm the client tap while `image plain` does not.
 #[test]
 fn image_requests_own_the_tap_while_waiting() {
     let image = |clean: bool| {
@@ -758,10 +696,7 @@ fn image_requests_own_the_tap_while_waiting() {
     );
 }
 
-/// THE MAIN THREAD ONLY ACQUIRES. A windowed snapshot and a windowed `image
-/// --meta`, cut to its frame, take their pixels on this thread; every
-/// conversion, cut, fingerprint and encode of them runs on the encode worker.
-/// Negative control: the same encode called on this thread is recorded here.
+/// Windowed snapshot and `image --meta` run pixel conversion, cropping, fingerprinting, and PNG encoding on the worker thread.
 #[test]
 fn no_pixel_work_runs_on_the_submitting_thread() {
     let mut app = scripted_app();
@@ -786,19 +721,13 @@ fn no_pixel_work_runs_on_the_submitting_thread() {
         "the thread that took the captures ran none of their pixel work"
     );
 
-    // Negative control: an encode on this thread is seen on this thread.
     let pixels = CapturePixels::softbuffer(vec![0; 4], 2, 2).expect("a 2x2 softbuffer");
     CapturePng::encode(&pixels).expect("encodes");
     assert!(ran_pixel_work(here));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// AN `image --meta` IS PUBLISHED BEFORE ITS REPLY. The encode worker
-/// fingerprints the pixels it encodes and publishes the metadata before it
-/// answers, so it is there the moment the reply arrives, and it names the PNG
-/// that reply carries: a terminal frame's `raster-fingerprint` is its
-/// `pixel-fingerprint`. Negative control: a request whose metadata is already
-/// published is answered with an error, and the first metadata stands.
+/// The encode worker publishes `image --meta` frame metadata before sending the reply.
 #[test]
 fn metadata_is_set_before_the_reply() {
     let mut app = scripted_app();
@@ -841,7 +770,6 @@ fn metadata_is_set_before_the_reply() {
     assert_eq!(published.raster_fingerprint, encoded);
     assert_eq!(published.leaves[0].raster_fingerprint, Some(encoded));
 
-    // Negative control: already published.
     let first = crate::control::ImageFrameMetadata {
         pixel_fingerprint: 7,
         ..published

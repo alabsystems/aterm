@@ -157,9 +157,6 @@ impl Parameters {
     }
 }
 
-// All the generics in the input, plus a bound `T: Deserialize` for each generic
-// field type that will be deserialized by us, plus a bound `T: Default` for
-// each generic field type that will be set to a default value.
 fn build_generics(cx: &Errors, cont: &Container, borrowed: &BorrowedLifetimes) -> Generics {
     let generics = match *cont.attrs.default() {
         attr::Default::Default => {
@@ -184,15 +181,10 @@ fn build_generics(cx: &Errors, cont: &Container, borrowed: &BorrowedLifetimes) -
     )
 }
 
-// Fields with a `skip` or `deserialize_with` attribute are not deserialized by
-// us so we do not generate a bound. All other fields may need a `T:
-// Deserialize` bound where T is the type of the field.
 const fn needs_deserialize_bound(field: &attr::Field) -> bool {
     !field.skip_deserializing() && field.deserialize_with().is_none()
 }
 
-// Fields with a `default` attribute (not `default=...`), and fields with a
-// `skip` attribute that do not also have `default=...`.
 const fn requires_default(field: &attr::Field) -> bool {
     matches!(field.default(), attr::Default::Default)
 }
@@ -223,15 +215,6 @@ impl BorrowedLifetimes {
     }
 }
 
-// The union of lifetimes borrowed by each field of the container.
-//
-// These turn into bounds on the `'de` lifetime of the Deserialize impl. If
-// lifetimes `'a` and `'b` are borrowed but `'c` is not, the impl is:
-//
-//     impl<'de: 'a + 'b, 'a, 'b, 'c> Deserialize<'de> for S<'a, 'b, 'c>
-//
-// If any borrowed lifetime is `'static`, then `'de: 'static` would be redundant
-// and we use plain `'static` instead of `'de`.
 fn borrowed_lifetimes(cont: &Container) -> BorrowedLifetimes {
     let mut lifetimes = BTreeMap::new();
     for field in cont.data.all_fields() {
@@ -265,14 +248,13 @@ fn deserialize_body(cont: &Container, params: &Parameters) -> Fragment {
     }
 }
 
-/// Generates `Deserialize::deserialize` body for a type with `#[serde(transparent)]` attribute
+/// Generates `Deserialize::deserialize` body for a type with `#[serde(transparent)]`.
 fn deserialize_transparent(cont: &Container, params: &Parameters) -> Fragment {
     let this_value = &params.this_type;
     let (Data::Struct(_, fields), Some(transparent_field)) = (
         &cont.data,
         cont.data.all_fields().find(|f| f.attrs.transparent()),
     ) else {
-        // The checks refused this input before any code was generated.
         return quote_expr!("_serde::__private::Err(_serde::de::Error::custom(\"transparent\"))");
     };
 
@@ -290,10 +272,6 @@ fn deserialize_transparent(cont: &Container, params: &Parameters) -> Fragment {
             } else {
                 let value = match field.attrs.default() {
                     attr::Default::Default => q!("_serde::__private::Default::default()"),
-                    // If #path returns wrong type, error will be reported here (^^^^^).
-                    // We attach span of the path to the function so it will be reported
-                    // on the #[serde(default = "...")]
-                    //                          ^^^^^
                     attr::Default::Path(path) => q_spanned!(span_of(path) => "#path()", path),
                     attr::Default::None => q!("_serde::__private::PhantomData"),
                 };
@@ -315,9 +293,9 @@ fn deserialize_transparent(cont: &Container, params: &Parameters) -> Fragment {
 
 pub(crate) enum TupleForm<'a> {
     Tuple,
-    /// Contains a variant name
+    /// Contains a variant name.
     ExternallyTagged(&'a Ident),
-    /// Contains a variant name
+    /// Contains a variant name.
     Untagged(&'a Ident),
 }
 
@@ -420,15 +398,10 @@ fn let_default(cattrs: &attr::Container) -> Option<TokenStream> {
         attr::Default::Default => Some(q!(
             "let __default: Self::Value = _serde::__private::Default::default();"
         )),
-        // If #path returns wrong type, error will be reported here (^^^^^).
-        // We attach span of the path to the function so it will be reported
-        // on the #[serde(default = "...")]
-        //                          ^^^^^
         attr::Default::Path(path) => Some(q_spanned!(span_of(path) =>
             "let __default: Self::Value = #path();", path)),
         attr::Default::None => {
-            // We don't need the default value, to prevent an unused variable warning
-            // we'll leave the line empty.
+            // Omit `__default` when no container default is configured.
             None
         }
     }
@@ -436,11 +409,11 @@ fn let_default(cattrs: &attr::Container) -> Option<TokenStream> {
 
 pub(crate) enum StructForm<'a> {
     Struct,
-    /// Contains a variant name
+    /// Contains a variant name.
     ExternallyTagged(&'a Ident),
-    /// Contains a variant name
+    /// Contains a variant name.
     InternallyTagged(&'a Ident),
-    /// Contains a variant name
+    /// Contains a variant name.
     Untagged(&'a Ident),
 }
 
@@ -462,8 +435,7 @@ fn span_of(tokens: &TokenStream) -> Span {
         .map_or_else(Span::call_site, |tt| tt.span())
 }
 
-/// This function wraps the expression in `#[serde(deserialize_with = "...")]`
-/// in a trait to prevent it from accessing the internal `Deserialize` state.
+/// Wraps `#[serde(deserialize_with = "...")]` in a trait impl to isolate `Deserialize` state.
 fn wrap_deserialize_with(
     params: &Parameters,
     value_ty: &TokenStream,
@@ -477,10 +449,6 @@ fn wrap_deserialize_with(
     let delife = params.borrowed.de_lifetime();
     let deserializer_var = q!("__deserializer");
 
-    // If #deserialize_with returns wrong type, error will be reported here (^^^^^).
-    // We attach span of the path to the function so it will be reported
-    // on the #[serde(deserialize_with = "...")]
-    //                                   ^^^^^
     let value = q_spanned!(span_of(deserialize_with) =>
         "#deserialize_with(#deserializer_var)?", deserialize_with, deserializer_var);
     let wrapper = q!(
@@ -535,10 +503,6 @@ fn expr_is_missing(field: &Field, cattrs: &attr::Container) -> Fragment {
             return quote_expr!("#func()", func);
         }
         attr::Default::Path(path) => {
-            // If #path returns wrong type, error will be reported here (^^^^^).
-            // We attach span of the path to the function so it will be reported
-            // on the #[serde(default = "...")]
-            //                          ^^^^^
             return Fragment::Expr(q_spanned!(span_of(path) => "#path()", path));
         }
         attr::Default::None => { /* below */ }
@@ -576,10 +540,6 @@ fn expr_is_missing_seq(
             return q_spanned!(field.span() => "_serde::__private::Default::default()");
         }
         attr::Default::Path(path) => {
-            // If #path returns wrong type, error will be reported here (^^^^^).
-            // We attach span of the path to the function so it will be reported
-            // on the #[serde(default = "...")]
-            //                          ^^^^^
             return q_spanned!(span_of(path) => "#path()", path);
         }
         attr::Default::None => { /* below */ }

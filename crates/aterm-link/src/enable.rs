@@ -156,7 +156,7 @@ pub struct Paths {
     pub login_home: Option<PathBuf>,
     /// The fabric root.
     pub root: PathBuf,
-    /// The aterm binary the bridge and the broker run.
+    /// The aterm binary the bridge and the broker run from.
     pub aterm: String,
     /// The fleet.
     pub fleet: String,
@@ -169,7 +169,9 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// The tier the broker this root runs acks.
+    /// The tier the broker this root runs acks under: the named one, else the
+    /// build's default for a guarded broker ([`crate::durability::default_for`]):
+    /// the job `on` writes always names its mint secret ([`Self::broker_argv`]).
     #[must_use]
     pub fn tier(&self) -> crate::durability::Durability {
         crate::durability::resolve(self.durability, true)
@@ -459,7 +461,8 @@ pub(crate) fn default_root(home: &Path) -> PathBuf {
     home.join(".local/share/aterm-fabric")
 }
 
-/// The fabric ROOT a bridge command (or a rendezvous file) points.
+/// The fabric ROOT a bridge command (or a rendezvous file) points into: its
+/// broker socket's directory.
 pub(crate) fn root_of(broker: &str) -> Option<PathBuf> {
     let root = Path::new(broker).parent()?.to_path_buf();
     root.is_absolute().then_some(root)
@@ -737,7 +740,8 @@ impl Role {
         self.fleet.as_deref()
     }
 
-    /// The command that re-applies this root as it.
+    /// The command that re-applies this root as it is — every remedy that
+    /// re-runs `on` is spelled with it: `on`, with the fleet the root records.
     #[must_use]
     pub fn again(&self) -> String {
         format!("`aterm fabric on{}`", fleet_flag(self.fleet.as_deref()))
@@ -1423,7 +1427,10 @@ fn has_dotted_fabric(lines: &[&str]) -> bool {
 /// `text` with the `[fabric]` table and every `[fabric.<sub>]` table removed.
 ///
 /// # Errors
-/// A file that is not valid TOML.
+/// A file that is not valid TOML (left alone, the error named: which lines are fabric's cannot
+/// be read in it, since a malformed `[keys` ends no table), a result that still defines
+/// `fabric` (a dotted key or an inline table, which this editor does not remove), or one that
+/// does not read back as `text` without it (`reads_back`).
 pub fn remove_fabric_table(text: &str) -> Result<(String, Vec<String>), String> {
     let table: aterm_toml::Table = aterm_toml::from_str(text).map_err(|e| {
         format!(
@@ -1616,7 +1623,7 @@ impl Out {
         let _ = out.flush();
     }
 
-    /// Nothing to do: it was already.
+    /// Nothing to do: it was already so.
     pub(crate) fn already(&self, name: &str, detail: &str) {
         self.line(name, "already", detail);
     }
@@ -1996,7 +2003,8 @@ pub(crate) fn launchctl_list() -> String {
         .unwrap_or_default()
 }
 
-/// What launchd's `gui/<uid>` domain.
+/// What launchd's `gui/<uid>` domain — the one `on` bootstraps the broker
+/// into and `off` boots it out of — says of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaunchdJob {
     /// The domain holds no such job.
@@ -2618,6 +2626,8 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
             armed.push(inst);
         } else if state == "stalled" && reason == "state-locked" {
             // One state dir is one bridge (`bridge::hold_state_dir`), and another instance's
+            // holds this one: not a failed arm (this one takes the node over when that one
+            // exits), but not one the proof can post through.
             out.note("instance", &format!("{pid} armed; {STANDBY_NOTE}"));
         } else if state == "stalled" {
             out.fail(
@@ -3352,6 +3362,7 @@ pub fn off(opts: &OffOpts) -> ExitCode {
                 );
                 if !opts.dry_run {
                     // By domain, with no legacy `unload` fallback: that acts
+                    // on the caller's domain and exits 0 whatever it did.
                     if loaded {
                         let domain = format!("gui/{}/{label}", uid());
                         if let Err(e) = launchctl(&["bootout", &domain]) {
@@ -3523,6 +3534,8 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
         )
     } else if s(&format!(": {}", crate::broker_health::POISONED_EXIT_WORDS)) {
         // The broker left its poisoned log ([`crate::broker_health::poisoned_line`],
+        // whose opening words these are — they survive the quote's cut, which
+        // astream's reason at the line's end does not), and it is not back.
         if s(crate::broker_health::UNSUPERVISED_WORDS) {
             "the broker exited over a poisoned log, and no `aterm fabric on` job runs it: unless \
              something else restarts it, start it again with the command its line names (the \
@@ -3553,7 +3566,9 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
     })
 }
 
-/// The fix for one of `aterm fabric`'s warnings, matched on the words the warning is built.
+/// The fix for one of `aterm fabric`'s warnings, matched on the words the
+/// warning is built from (`fabric::warnings`): every remedy that re-runs `on`
+/// is [`Role::again`], spelled with the fleet this root records.
 #[must_use]
 pub fn fix_for(warning: &str, role: &Role) -> String {
     let w = warning;
@@ -3577,6 +3592,11 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
         )
     } else if s(fabric::POISONED_WARNING) {
         // The broker itself says its log is poisoned (its `Hello`'s entry
+        // 0x04, [`crate::broker_health`]): nothing on this node is wrong and
+        // a re-minted cap cannot help, and `on` keeps a broker that answers
+        // its probe. The cure is the reopen, which a broker of this build
+        // makes itself by exiting; one still poisoned when this was read is
+        // inside those seconds, or predates the exit, or a hand-run one.
         POISONED_LOG_REMEDY.to_string()
     } else if s(fabric::FLUSH_FAILED_WARNING) {
         "check the disk under the broker's log (Disk Utility's First Aid, or the system log's \
@@ -3984,9 +4004,10 @@ fn retire_ghosts_action(yes: bool) -> ExitCode {
 enum Publisher {
     /// The running bridge of the instance at this pid, which answers as the node.
     Bridge(u32),
-    /// This command: the node is its state dir's, and no bridge of it.
+    /// This command: the node is its state dir's, and no bridge of it is up.
     Itself,
-    /// Nothing here: no bridge of the node is up, and this command's state dir is another.
+    /// Nothing here: no bridge of the node is up, and this command's state
+    /// dir is another node's.
     Nobody,
 }
 

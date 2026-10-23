@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The vendor-direct resolver (design §1.1–§1.2): the vendor's head, then its digest
-//! documents (each fetched under the program's pins and caps, each landing where the table
-//! allows), authenticated by the program's anchor into one candidate build.
-//!
-//! The head is a hint: it names a version and nothing else is taken from it until the
-//! anchor has vouched for the document that carries the digest. The platform and the
-//! asset are chosen from the client's own triple, never from a document.
+//! Vendor-direct head and digest resolution authenticated by the program's anchor.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,46 +12,40 @@ use crate::flow::{Fetcher, FlowError, VendorFetchError, VendorGet};
 use crate::manifest::{Artifact, Cost, DigestAlg};
 use crate::openpgp::PinnedRsaKey;
 
-/// The claude head: `x.y.z` and an optional newline.
+/// The claude head.
 const CLAUDE_HEAD_CAP: u64 = 64;
 /// The codex head is the release JSON.
 const CODEX_HEAD_CAP: u64 = 1024 * 1024;
-/// agy's two manifests and muse's channel: about 300 bytes each.
+/// agy's two manifests and muse's channel.
 const SMALL_JSON_CAP: u64 = 4 * 1024;
 /// `<v>/manifest.json`, muse's release manifest.
 const MANIFEST_CAP: u64 = 64 * 1024;
 /// `codex-package_SHA256SUMS`.
 const SUMS_CAP: u64 = 64 * 1024;
-/// A gzip'd package unpacks to at most this many times its size (codex 0.156.0 on darwin:
-/// 127 MB → 318 MB; agy 1.3.6: 55.5 MB → 183.4 MB); the extraction cap is twice the
-/// `disk_installed` this yields.
+/// A gzip'd package unpacks to at most this many times its size.
 const ARCHIVE_UNPACK_RATIO: u64 = 4;
 /// Where every codex payload and `SHA256SUMS` is fetched.
 const CODEX_DOWNLOADS: &str = "https://github.com/openai/codex/releases/download/";
-/// Where every agy payload and its per-version `manifest.json` live:
-/// `<this><version>-<execution id>/<dir>/<file>`.
+/// Where every agy payload and its per-version `manifest.json` live.
 const AGY_BUCKET: &str = "https://storage.googleapis.com/antigravity-public/antigravity-cli/";
-/// Where muse's release manifest and payloads are fetched: `<this>?channel=muse&version=<v>
-/// &file=<file>`.
+/// Where muse's release manifest and payloads are fetched.
 const MUSE_DOWNLOAD: &str = "https://lookaside.facebook.com/lookaside/muse/download/";
 
 /// What the head said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Head {
-    /// 304 to the conditional GET: the head is the one last seen.
+    /// 304 to the conditional GET.
     Unchanged {
         /// The validator to keep.
         etag: String,
     },
     /// The host was not reached, or is not serving now.
     Unreachable(String),
-    /// The host answered, but not with the head: a status, a TLS refusal, a body over its
-    /// cap. It says nothing about any build.
+    /// The host answered, but not with the head.
     Unserved(String),
-    /// The head could not be read as a canonical version in its program's grammar, or
-    /// landed off its pin.
+    /// The head could not be read as a canonical version in its program's grammar.
     Refused(String),
-    /// The head names `version`; `body` is the whole document (codex's is its release JSON).
+    /// The head names `version`.
     Named {
         /// The named version.
         version: Version,
@@ -68,8 +56,7 @@ pub(crate) enum Head {
     },
 }
 
-/// A payload row the vendor lane built from authenticated documents. It has no public
-/// constructor, so no index row can become one; [`admit`] checks it before any byte moves.
+/// A payload row the vendor lane built from authenticated documents ([`admit`]).
 #[derive(Debug, Clone)]
 pub struct SyntheticArtifact {
     program: &'static str,
@@ -103,10 +90,9 @@ pub(crate) struct Candidate {
 /// What verifying a head's documents came to.
 #[derive(Debug, Clone)]
 pub(crate) enum Resolution {
-    /// A vendor host was not reached; keep what is installed, quietly.
+    /// A vendor host was not reached.
     Unreachable,
-    /// A vendor host answered, but not with the document (a 404 while the vendor is still
-    /// publishing, a TLS refusal): nothing about the bytes, so kept at like `Unreachable`.
+    /// A vendor host answered.
     Unserved(String),
     /// A document was refused (never a payload: nothing was downloaded).
     Refused {
@@ -119,15 +105,11 @@ pub(crate) enum Resolution {
     Candidate(Box<Candidate>),
 }
 
-/// A vendor document GET in [`Fetcher::vendor_get`]'s shape: `(program, url, cap,
-/// if_none_match)`. The window's head watch reads heads through it, under the lane's pins
-/// and caps.
+/// A vendor document GET in [`Fetcher::vendor_get`]'s shape.
 pub type VendorGetFn<'a> =
     dyn Fn(&str, &str, u64, Option<&str>) -> Result<VendorGet, VendorFetchError> + 'a;
 
-/// GET `spec`'s head, conditionally on `if_none_match`, in the short single attempt of
-/// [`Fetcher::vendor_head`]: an unreached head keeps the installed build, and the next
-/// pass or check asks again.
+/// GET `spec`'s head ([`Fetcher::vendor_head`]).
 pub(crate) fn read_head(
     spec: &VendorSpec,
     fetcher: &dyn Fetcher,
@@ -140,9 +122,7 @@ pub(crate) fn read_head(
     )
 }
 
-/// The head's document asked again, unconditionally and patiently
-/// ([`Fetcher::vendor_get`]): after a 304 the head was read, and the lane needs the
-/// document it names to verify against.
+/// The head's document asked again, unconditionally and patiently ([`Fetcher::vendor_get`]).
 pub(crate) fn reread_head(spec: &VendorSpec, fetcher: &dyn Fetcher) -> Head {
     read_head_via(
         spec,
@@ -151,7 +131,7 @@ pub(crate) fn reread_head(spec: &VendorSpec, fetcher: &dyn Fetcher) -> Head {
     )
 }
 
-/// [`read_head`] over a bare GET: the head's cap, its pin and its parse are the same.
+/// [`read_head`] over a bare GET.
 pub(crate) fn read_head_via(
     spec: &VendorSpec,
     get: &VendorGetFn<'_>,
@@ -177,8 +157,6 @@ pub(crate) fn read_head_via(
         Err(VendorFetchError::Unreachable(why)) => return Head::Unreachable(why),
         Err(VendorFetchError::Refused(why)) => return Head::Unserved(why),
     };
-    // A head in the other grammar is refused, never ordered: a plain `1.5.0` from muse's
-    // channel would sort below every revision-form build.
     match head_version(spec, &body) {
         Ok(version) if version.has_revision() == spec.revision_versions => Head::Named {
             version,
@@ -209,9 +187,7 @@ fn head_version(spec: &VendorSpec, body: &[u8]) -> Result<Version, String> {
     }
 }
 
-/// Verify the documents behind `version` (the head just named it; `head_body` is the
-/// head's document) into a candidate for `triple`, under `key` (claude's anchor) and the
-/// clock `now`.
+/// Verify the documents behind `version`.
 pub(crate) fn verify(
     spec: &'static VendorSpec,
     triple: &str,
@@ -243,19 +219,14 @@ pub(crate) fn verify(
 pub(crate) fn serves(anchor: Anchor, triple: &str) -> bool {
     match anchor {
         Anchor::AnthropicOpenPgp => claude_platform(triple).is_some(),
-        // OpenAI's `SHA256SUMS` names the package per triple ([`codex_candidates`]).
         Anchor::OpenAiTwoHost => true,
         Anchor::GoogleTwoHost => agy_platform(triple).is_some(),
         Anchor::MetaDeveloperId => muse_platform(triple).is_some(),
     }
 }
 
-/// Admit a synthetic row before any byte moves: its shape is exactly what [`verify`]
-/// builds for its program — the https payload lane its program uses, a URL under that
-/// program's pins, the one payload digest its anchor vouches for
-/// ([`Anchor::digest_alg`]) and an exact size, the per-version local name, and nothing
-/// the table does not supply (no links, no strip, no signed root to compare).
-///
+/// Admit a synthetic row before any byte moves: its shape is exactly what [`verify`] builds for its
+/// program ([`Anchor::digest_alg`]).
 /// # Errors
 /// [`FlowError::VendorRefused`] naming the first field that does not fit.
 pub(crate) fn admit(row: &SyntheticArtifact) -> Result<(), FlowError> {
@@ -272,7 +243,6 @@ pub(crate) fn admit(row: &SyntheticArtifact) -> Result<(), FlowError> {
     }
     let exposed = spec.exposes.contains(&a.entry.as_str());
     let lane_ok = match spec.anchor {
-        // codex's windows package is a `.zip` or a `.tar.gz`, whichever its sums list.
         Anchor::OpenAiTwoHost => {
             matches!(a.payload.as_str(), "tar-gz" | "zip") && a.entry.is_empty()
         }
@@ -297,9 +267,8 @@ pub(crate) fn admit(row: &SyntheticArtifact) -> Result<(), FlowError> {
     Ok(())
 }
 
-/// The staging name `spec`'s payload of `version` downloads to on `triple`
-/// ([`asset_name`] over [`payload_of`]) — what gc spares while `version` is a head the
-/// lane has read and not yet installed (`crate::gc`).
+/// The staging name `spec`'s payload of `version` downloads to on `triple` ([`asset_name`],
+/// [`payload_of`]).
 pub(crate) fn staging_asset(spec: &VendorSpec, version: Version, triple: &str) -> String {
     asset_name(
         spec.program,
@@ -309,9 +278,7 @@ pub(crate) fn staging_asset(spec: &VendorSpec, version: Version, triple: &str) -
     )
 }
 
-/// The payload lane `anchor`'s program stages on `triple`: claude's and muse's raw
-/// binary; agy's gzip tar of its one executable, the raw `.exe` on windows; codex's
-/// `.tar.gz`, or on windows the `.zip` its candidates try first (`codex_candidates`).
+/// The payload lane `anchor`'s program stages on `triple`: claude's and muse's raw binary.
 fn payload_of(anchor: Anchor, triple: &str) -> &'static str {
     let windows = triple.contains("-windows-");
     match anchor {
@@ -323,8 +290,7 @@ fn payload_of(anchor: Anchor, triple: &str) -> &'static str {
     }
 }
 
-/// `<program>-<version>-<triple>[.ext]`: the staging name, per version, so a `.part` left
-/// by one version is never resumed as another.
+/// `<program>-<version>-<triple>[.ext]`.
 fn asset_name(program: &str, version: Version, triple: &str, payload: &str) -> String {
     let ext = match payload {
         "tar-gz" | "tar-gz-binary" => ".tar.gz",
@@ -342,8 +308,7 @@ enum Fault {
     Refused(String),
 }
 
-/// A fetch the transport refused is the host not serving the document, never a verdict
-/// on it: only what the documents themselves say is a refusal.
+/// A fetch the transport refused is the host not serving the document, never a verdict on it.
 impl From<VendorFetchError> for Fault {
     fn from(e: VendorFetchError) -> Self {
         match e {
@@ -357,8 +322,7 @@ fn refused<T>(why: impl Into<String>) -> Result<T, Fault> {
     Err(Fault::Refused(why.into()))
 }
 
-/// GET one digest document: whole, under `cap`, unconditionally, and answered where the
-/// table allows it to land.
+/// GET one digest document.
 fn digest_doc(
     spec: &VendorSpec,
     fetcher: &dyn Fetcher,
@@ -391,8 +355,7 @@ fn claude_head_version(body: &[u8]) -> Option<Version> {
     Version::parse(text.strip_suffix('\n').unwrap_or(text))
 }
 
-/// Anthropic's `manifest.json` platform key for the client's own triple: glibc names on
-/// linux, the musl ones only for a musl client.
+/// Anthropic's `manifest.json` platform key for the client's own triple.
 fn claude_platform(triple: &str) -> Option<&'static str> {
     Some(match triple {
         "aarch64-apple-darwin" => "darwin-arm64",
@@ -440,7 +403,6 @@ fn verify_claude(
             "manifest.json is not signed by Anthropic's key: {e}"
         ));
     }
-    // Parsed from the verified bytes only.
     let Ok(doc) = strict_json(&manifest) else {
         return refused(
             "the signed manifest.json is not strict JSON (a key repeats or it does not parse)",
@@ -556,8 +518,7 @@ fn verify_codex(
 }
 
 /// agy's platform for the client's own triple: `(Run manifest key, bucket directory, payload
-/// file)`, as agy's own updater and Google's bucket spell them; the musl names only for a musl
-/// client, a raw `.exe` on windows.
+/// file)`, as agy's own updater and Google's bucket spell them.
 pub(super) fn agy_platform(triple: &str) -> Option<(&'static str, &'static str, &'static str)> {
     Some(match triple {
         "aarch64-apple-darwin" => ("darwin_arm64", "darwin-arm", "cli_mac_arm64.tar.gz"),
@@ -580,7 +541,7 @@ pub(super) fn agy_platform(triple: &str) -> Option<(&'static str, &'static str, 
     })
 }
 
-/// One agy manifest — the Run head and the bucket's `manifest.json` have this one shape.
+/// One agy manifest.
 #[derive(Debug, PartialEq, Eq)]
 struct AgyManifest {
     version: String,
@@ -588,8 +549,7 @@ struct AgyManifest {
     sha512: String,
 }
 
-/// `{"version", "url", "sha512"}`, strictly; any other key is ignored, as agy's own
-/// updater ignores it.
+/// `{"version", "url", "sha512"}`, strictly.
 fn agy_manifest(body: &[u8]) -> Option<AgyManifest> {
     let doc = strict_json(body).ok()?;
     let field = |key: &str| doc.get(key)?.as_str().map(str::to_string);
@@ -600,9 +560,8 @@ fn agy_manifest(body: &[u8]) -> Option<AgyManifest> {
     })
 }
 
-/// The bucket directory `url` names when it is exactly
-/// `<bucket><version>-<1..20 digits>/<dir>/<file>` for `version` and `triple`'s compiled
-/// `(dir, file)`: the URL with its file name dropped, ending `/`.
+/// The bucket directory `url` names when it is exactly `<bucket><version>-<1..20
+/// digits>/<dir>/<file>` for `version` and `triple`'s compiled `(dir, file)`.
 fn agy_release_dir<'u>(url: &'u str, version: Version, triple: &str) -> Option<&'u str> {
     let (_, dir, file) = agy_platform(triple)?;
     let rest = url.strip_prefix(AGY_BUCKET)?;
@@ -658,8 +617,7 @@ fn verify_agy(
     ))
 }
 
-/// muse's release-manifest key and payload file for `triple`: darwin only — off darwin
-/// nothing but the host that serves the bytes would vouch for them.
+/// muse's release-manifest key and payload file for `triple`: darwin only.
 pub(super) fn muse_platform(triple: &str) -> Option<(&'static str, &'static str)> {
     Some(match triple {
         "aarch64-apple-darwin" => ("aarch64_macos", "muse-aarch64-macos"),
@@ -668,15 +626,12 @@ pub(super) fn muse_platform(triple: &str) -> Option<(&'static str, &'static str)
     })
 }
 
-/// The lookaside URL of `file` in muse's release `version`, built by the client — never
-/// taken from a document, only compared with one.
+/// The lookaside URL of `file` in muse's release `version`, built by the client.
 pub(super) fn muse_url(version: Version, file: &str) -> String {
     format!("{MUSE_DOWNLOAD}?channel=muse&version={version}&file={file}")
 }
 
-/// The version muse's channel names: strict JSON whose `channel` is the one the head URL
-/// asks for, whose `version` is canonical, and whose `manifest_url` is exactly the one the
-/// client builds for it. `urgency`, `min_version` and the rest are never honoured.
+/// The version muse's channel names.
 fn muse_head_version(spec: &VendorSpec, body: &[u8]) -> Result<Version, String> {
     let doc = strict_json(body).map_err(|()| String::from("muse's channel is not strict JSON"))?;
     let field = |key: &str| doc.get(key).and_then(aterm_json::Value::as_str);
@@ -756,10 +711,8 @@ fn verify_muse(
     Ok(vouched(spec, version, triple, &url, digest, size, payload))
 }
 
-/// The candidate `spec`'s anchor vouched for: `size` bytes of `payload` at `url` under
-/// `digest`, as the row [`admit`] expects on `triple`. An archive lane names no entry and
-/// every gzip'd lane unpacks to at most [`ARCHIVE_UNPACK_RATIO`] times its size; the build
-/// date is claude's alone to set.
+/// The candidate `spec`'s anchor vouched for: `size` bytes of `payload` at `url` under `digest`
+/// ([`admit`], [`ARCHIVE_UNPACK_RATIO`]).
 fn vouched(
     spec: &'static VendorSpec,
     version: Version,
@@ -804,7 +757,6 @@ fn vouched(
             strip_components: 0,
             links: BTreeMap::new(),
             vendor: spec.vendor.to_string(),
-            // A vendor-direct row is the vendor's bytes: no compiler of ours built it.
             provenance: None,
         },
     };
@@ -826,8 +778,7 @@ fn codex_tag_version(doc: &aterm_json::Value) -> Result<Version, ()> {
         .ok_or(())
 }
 
-/// The publisher's asset rule for `triple`, in preference order: the tarball everywhere; on
-/// windows the zip first; on linux the static musl package as the glibc triple's fallback.
+/// The publisher's asset rule for `triple`, in preference order: the tarball everywhere.
 fn codex_candidates(triple: &str) -> Vec<String> {
     let package = |t: &str, ext: &str| format!("codex-package-{t}{ext}");
     if triple.contains("-windows-") {
@@ -845,9 +796,7 @@ fn codex_candidates(triple: &str) -> Vec<String> {
     }
 }
 
-/// `SHA256SUMS`, strictly: every non-empty line is 64 hex digits, one or two spaces (the
-/// second may be `*`, binary mode), and a bare file name; no name twice. Digests come
-/// back lowercase.
+/// `SHA256SUMS`, strictly: every non-empty line is 64 hex digits, one or two spaces.
 fn parse_sums(text: &[u8]) -> Option<BTreeMap<String, String>> {
     let text = std::str::from_utf8(text).ok()?;
     let mut out = BTreeMap::new();
@@ -897,8 +846,7 @@ fn json_asset_digest(release: &aterm_json::Value, name: &str) -> Result<String, 
         .ok_or_else(|| format!("the release JSON carries no sha256 digest for {name}"))
 }
 
-/// JSON with every object's keys distinct: a document whose meaning depends on which of
-/// two equal keys a parser keeps is refused, never read.
+/// JSON with every object's keys distinct.
 fn strict_json(bytes: &[u8]) -> Result<aterm_json::Value, ()> {
     aterm_json::from_slice::<Strict>(bytes)
         .map(|s| s.0)
@@ -982,9 +930,7 @@ mod tests {
     const REAL_SIG: &[u8] = include_bytes!("fixtures/claude-2.1.280-manifest.json.sig");
     const REAL_RELEASE: &[u8] = include_bytes!("fixtures/codex-0.156.0-release.json");
     const REAL_SUMS: &[u8] = include_bytes!("fixtures/codex-0.156.0-SHA256SUMS");
-    /// agy 1.3.6's Run manifests, and the bucket's `manifest.json` beside the darwin-arm
-    /// payload (byte-identical to its Run manifest, as the bucket's are for darwin-x64,
-    /// linux-x64 and windows-x64).
+    /// agy 1.3.6's Run manifests.
     const AGY_DARWIN_ARM: &[u8] = include_bytes!("fixtures/agy-1.3.6-darwin_arm64.json");
     const AGY_BESIDE_DARWIN_ARM: &[u8] =
         include_bytes!("fixtures/agy-1.3.6-darwin-arm-manifest.json");
@@ -1011,9 +957,6 @@ mod tests {
         }
     }
 
-    /// Anthropic's real 2.1.280 manifest and signature, under the compiled key, resolve for
-    /// every platform the client can be to the digest, size and binary name Anthropic signed,
-    /// and to the URL the lane fetches from.
     #[test]
     fn the_real_claude_release_resolves_under_the_compiled_key() {
         let f = Fake::default();
@@ -1072,7 +1015,6 @@ mod tests {
             assert_eq!(c.build_date, BuildDate::parse("2026-09-21T20:55:27Z"));
             admit(&c.artifact).unwrap();
         }
-        // The same documents under the committed test key are refused: the key is the anchor.
         let test_key = crate::openpgp::testkit::test_key();
         match verify(
             spec("claude"),
@@ -1088,8 +1030,6 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // A document the host does not serve (a 404 while the vendor is still publishing)
-        // is no verdict on any bytes…
         match verify(
             spec("claude"),
             "aarch64-apple-darwin",
@@ -1102,7 +1042,6 @@ mod tests {
             Resolution::Unserved(why) => assert!(why.contains("404"), "{why}"),
             other => panic!("{other:?}"),
         }
-        // …and a release other than the one the head named is refused by its own version.
         f.doc(&format!("{CLAUDE}2.1.281/manifest.json"), REAL_MANIFEST);
         f.doc(&format!("{CLAUDE}2.1.281/manifest.json.sig"), REAL_SIG);
         match verify(
@@ -1121,8 +1060,6 @@ mod tests {
         }
     }
 
-    /// The real codex release: the JSON and OpenAI's SHA256SUMS agree on every package the
-    /// publisher's rules pick, the linux glibc triple taking the static musl package.
     #[test]
     fn the_real_codex_release_resolves_when_both_hosts_agree() {
         let f = Fake::default();
@@ -1202,7 +1139,6 @@ mod tests {
             read_head(spec("codex"), &f, None),
             Head::Named { version, .. } if version == v("0.156.0")
         ));
-        // A head answered off its pin is refused, never read.
         f.redirect(
             CODEX_HEAD,
             "https://releases.openai.com/codex/channels/other",
@@ -1213,8 +1149,6 @@ mod tests {
         ));
     }
 
-    /// Strict JSON: a document whose meaning depends on which of two equal keys a parser
-    /// keeps is refused — at any depth.
     #[test]
     fn a_repeated_key_is_refused_at_any_depth() {
         assert!(strict_json(b"{\"a\":1,\"b\":[{\"c\":2}]}").is_ok());
@@ -1284,7 +1218,6 @@ mod tests {
         );
     }
 
-    /// Admission refuses every row shape the resolver never builds.
     #[test]
     fn admission_refuses_what_the_resolver_never_builds() {
         let f = Fake::default();
@@ -1333,9 +1266,6 @@ mod tests {
             tweak(&mut row.artifact);
             assert!(admit(&row).is_err(), "tweak {i} was admitted");
         }
-        // A sha512 is the row's one payload digest, under its key — and claude's anchor
-        // vouches for a sha256, so a claude row carrying one is refused (agy's admitted
-        // sha512 rows: `the_real_agy_release_resolves_when_both_google_hosts_agree`).
         let a = good.artifact();
         let sha512 = AuthenticatedDigest::authenticated(DigestAlg::Sha512, &"5".repeat(128));
         let by_512 = vouched(
@@ -1370,7 +1300,7 @@ mod tests {
         }
     }
 
-    /// `doc` with `from` replaced by `to` once — a fixture changed in exactly one place.
+    /// `doc` with `from` replaced by `to` once.
     fn edit(doc: &[u8], from: &str, to: &str) -> Vec<u8> {
         let text = std::str::from_utf8(doc).unwrap();
         assert!(text.contains(from), "{from}");
@@ -1386,9 +1316,6 @@ mod tests {
         verify(spec("agy"), triple, f, v(version), head, &key, NOW)
     }
 
-    /// The real agy release: Google's Run manifest and the bucket's `manifest.json` agree, so
-    /// their sha512 is the payload's (a gzip tar of the one executable on unix, the raw `.exe`
-    /// on windows) at the compiled bucket path for the client's triple, sized by the HEAD.
     #[test]
     fn the_real_agy_release_resolves_when_both_google_hosts_agree() {
         let f = Fake::default();
@@ -1441,13 +1368,11 @@ mod tests {
             assert_eq!(a.asset, format!("agy-1.3.6-{triple}{ext}"));
             assert_eq!((c.build_date, c.anchor), (None, Anchor::GoogleTwoHost));
             admit(&c.artifact).unwrap();
-            // A sha256 is not what Google's two hosts vouch for.
             let mut by_256 = c.artifact.clone();
             by_256.artifact.sha512 = String::new();
             by_256.artifact.sha256 = "a".repeat(64);
             assert!(admit(&by_256).is_err(), "{triple}");
         }
-        // The head names the version on its own.
         f.doc(spec("agy").head_url, AGY_DARWIN_ARM);
         assert!(matches!(
             read_head(spec("agy"), &f, None),
@@ -1455,11 +1380,6 @@ mod tests {
         ));
     }
 
-    /// Every way the two Google documents can fail to vouch for one payload is refused
-    /// before a byte moves: a disagreement on any field, a URL off the compiled bucket path
-    /// (another bucket, another platform's directory, another version, a malformed
-    /// execution id), a digest that is not a sha512, and either document answered from
-    /// anywhere but where it was asked.
     #[test]
     fn agy_refuses_two_hosts_that_do_not_vouch_for_one_payload() {
         const TRIPLE: &str = "aarch64-apple-darwin";
@@ -1468,7 +1388,6 @@ mod tests {
         let real = agy_manifest(AGY_DARWIN_ARM).unwrap();
         let f = Fake::default();
         f.payload(&payload_url, &[0u8; 7]);
-        // The bucket's copy disagrees on the url, the sha512, the version.
         for disagreeing in [
             edit(
                 AGY_BESIDE_DARWIN_ARM,
@@ -1488,9 +1407,6 @@ mod tests {
         }
         f.doc(&beside_url, AGY_BESIDE_DARWIN_ARM);
         candidate(verify_agy_on(&f, TRIPLE, "1.3.6", AGY_DARWIN_ARM));
-        // The url off the compiled path: another bucket path, another platform's directory
-        // or file, a version other than the head's, an execution id that is not 1–20 digits,
-        // a path segment more.
         for (from, to) in [
             (
                 "antigravity-public/antigravity-cli/",
@@ -1512,7 +1428,6 @@ mod tests {
             ));
             assert!(why.contains(" is not "), "{to}: {why}");
         }
-        // The darwin manifest is not linux's, and a head for another version is not this one.
         let why = refusal(verify_agy_on(
             &f,
             "x86_64-unknown-linux-gnu",
@@ -1522,18 +1437,15 @@ mod tests {
         assert!(why.contains(" is not "), "{why}");
         let why = refusal(verify_agy_on(&f, TRIPLE, "1.3.7", AGY_DARWIN_ARM));
         assert!(why.contains("not for 1.3.7"), "{why}");
-        // A 127-hex sha512, though both hosts agree on it.
         let short = format!("\"sha512\": \"{}\"", &real.sha512[..127]);
         let full = format!("\"sha512\": \"{}\"", real.sha512);
         let truncated = edit(AGY_DARWIN_ARM, &full, &short);
         f.doc(&beside_url, &truncated);
         let why = refusal(verify_agy_on(&f, TRIPLE, "1.3.6", &truncated));
         assert!(why.contains("not 128 hex"), "{why}");
-        // A repeated key is no manifest.
         let doubled = edit(AGY_DARWIN_ARM, "{", "{\"version\": \"1.3.6\",");
         let why = refusal(verify_agy_on(&f, TRIPLE, "1.3.6", &doubled));
         assert!(why.contains("strict JSON"), "{why}");
-        // The bucket's copy answered from elsewhere — even its own host's other path.
         f.doc(&beside_url, AGY_BESIDE_DARWIN_ARM);
         f.redirect(
             &beside_url,
@@ -1541,22 +1453,17 @@ mod tests {
         );
         let why = refusal(verify_agy_on(&f, TRIPLE, "1.3.6", AGY_DARWIN_ARM));
         assert!(why.contains("off its pinned host"), "{why}");
-        // Not published there yet: no verdict on any bytes.
         f.forget(&beside_url);
         assert!(matches!(
             verify_agy_on(&f, TRIPLE, "1.3.6", AGY_DARWIN_ARM),
             Resolution::Unserved(_)
         ));
-        // The Run head answered from anywhere but where it was asked is refused, unread.
         let head = spec("agy").head_url;
         f.doc(head, AGY_DARWIN_ARM);
         f.redirect(head, &format!("{AGY_RELEASE}darwin-arm/manifest.json"));
         assert!(matches!(read_head(spec("agy"), &f, None), Head::Refused(_)));
     }
 
-    /// The real muse release, on darwin only: the channel names 1.4.9-R6297.1, and the release
-    /// manifest at the client-built URL carries each Mac's sha256 and size at the client-built
-    /// payload URL. Off darwin nothing is asked of any host.
     #[test]
     fn the_real_muse_release_resolves_on_darwin_only() {
         let f = Fake::default();
@@ -1612,8 +1519,6 @@ mod tests {
             assert_eq!(c.anchor, Anchor::MetaDeveloperId);
             admit(&c.artifact).unwrap();
         }
-        // Meta's linux and windows builds would be vouched for only by the host serving the
-        // bytes: unserved, and refused without a request if a caller asks anyway.
         let asked = f.gets.borrow().len();
         for triple in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
             assert!(!spec("muse").serves(triple), "{triple}");
@@ -1631,10 +1536,6 @@ mod tests {
         assert_eq!(f.gets.borrow().len(), asked, "nothing was asked");
     }
 
-    /// Every muse document that is not the one the client built is refused: a channel
-    /// naming another manifest or another channel, a manifest for another version, with
-    /// another checksum algorithm, placing the payload anywhere else or sizing it zero —
-    /// and a manifest answered from anywhere but where it was asked.
     #[test]
     fn muse_refuses_every_document_that_is_not_the_client_built_one() {
         let f = Fake::default();
@@ -1703,8 +1604,6 @@ mod tests {
         assert!(why.contains("off its pinned host"), "{why}");
     }
 
-    /// A head in the other grammar is refused, never ordered: a plain `x.y.z` from muse's
-    /// channel, a revision-form version from any other program's head.
     #[test]
     fn a_head_in_the_other_grammar_is_refused() {
         let f = Fake::default();
@@ -1728,7 +1627,6 @@ mod tests {
             read_head(spec("codex"), &f, None),
             Head::Refused(_)
         ));
-        // Control: each in its own grammar is named.
         f.doc(&claude_head, b"2.1.281\n");
         assert!(matches!(
             read_head(spec("claude"), &f, None),

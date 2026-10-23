@@ -175,7 +175,8 @@ pub struct EffectsPipeline {
     pending_keys: u32,
     /// Reused row material for the glow engine's row probe (`CursorGlow::observe_row`).
     row_probe_scratch: Vec<char>,
-    /// The caret row the flying head last sat in the sky seat.
+    /// The caret row the flying head last sat in the sky seat over
+    /// ([`crate::rainbow_kitty::companion::SeatQuery::held_sky`]).
     flying_sky_row: Option<u16>,
 
     decos: WordDecorations,
@@ -199,7 +200,8 @@ pub struct EffectsPipeline {
     host_rows_px: u16,
     /// Raw `Lexicon::conflicts()` from the last `rebuild_sparkle` (empty while sparkle is off).
     lexicon_conflicts: Vec<String>,
-    /// Parse diagnostic from the last [`Self::set_sparkle_custom_specs`] whose TOML fragment.
+    /// Parse diagnostic from the last [`Self::set_sparkle_custom_specs`] whose
+    /// TOML fragment was malformed (`None` after a clean parse or a clear).
     custom_spec_warning: Option<String>,
 
     deco_scratch: Vec<WordDecoration>,
@@ -220,7 +222,8 @@ pub struct EffectsPipeline {
     streak: Option<Box<OutputStreak>>,
     /// The streak knobs, kept across off/on toggles.
     streak_cfg: StreakConfig,
-    /// The page's streak seed (`set_output_streak`), the one its engine is built.
+    /// The page's streak seed (`set_output_streak`), the one its engine is
+    /// built with.
     streak_seed: u64,
 
     /// Phosphor rain engine.
@@ -343,7 +346,8 @@ impl EffectsPipeline {
         }
     }
 
-    /// Set the embedder's window chrome (per-edge `pad` + top-only `head`, px) so effect emissions.
+    /// Set the embedder's window chrome (per-edge `pad` + top-only `head`, px)
+    /// so effect emissions are window-absolute within the padded frame.
     #[inline]
     pub const fn set_chrome(&mut self, pad: u16, head: u16) {
         self.chrome_pad = pad;
@@ -572,6 +576,7 @@ impl EffectsPipeline {
         let ctrl = ch.is_control();
         if !ctrl {
             // A scalar commit is one input event even when it has no advance
+            // (for example a combining mark). Its echo must not mint another.
             self.note_console_input(PetInputKind::Text);
         }
         let width = if term.modes().ambiguous_width_double {
@@ -897,7 +902,7 @@ impl EffectsPipeline {
         }
     }
 
-    /// `true` while the sparkle master.
+    /// `true` while the sparkle master is on.
     #[inline]
     #[must_use]
     pub const fn sparkle_enabled(&self) -> bool {
@@ -1101,7 +1106,7 @@ impl EffectsPipeline {
         }
     }
 
-    /// `true` while the rain master.
+    /// `true` while the rain master is on.
     #[inline]
     #[must_use]
     pub const fn matrix_rain_enabled(&self) -> bool {
@@ -1235,7 +1240,8 @@ impl EffectsPipeline {
         }
     }
 
-    /// Update theme-derived rain colors without requiring the host to replay every matrix-rain.
+    /// Update theme-derived rain colors without requiring the host to replay
+    /// every matrix-rain knob after a live theme change.
     #[inline]
     pub fn set_matrix_rain_theme(&mut self, default_bg: u32, theme_fg: u32, theme_accent: u32) {
         let default_bg = default_bg & 0x00FF_FFFF;
@@ -1358,6 +1364,8 @@ impl EffectsPipeline {
             && input.engine_alt == alt;
         if !cursor_snapshot_coherent {
             // `input` and `term` straddle two parser generations/owners, so
+            // cursor effects cannot combine them. Seed nothing and clear every
+            // retained cursor channel for this apply.
             self.cursor.glow.reset();
         }
         let live_viewport = cursor_snapshot_coherent && input.display_offset == 0;
@@ -1673,6 +1681,8 @@ impl EffectsPipeline {
             let display_offset = term.grid().display_offset() as i32;
             if display_offset != 0 {
                 // A scrollback viewport is display-translated while the cursor
+                // remains grid-relative. Do no O(rows*cols) work for a frame
+                // that emit must suppress; returning live forces a fresh scan.
                 rain.defer_reading();
             }
             if !damage_consumed {
@@ -2829,6 +2839,7 @@ mod tests {
                 saw_pet |= body.is_some();
                 for s in &input.free_sprites {
                     // An animal: at least a cell tall (motes are smaller)
+                    // and not the pet's own tile.
                     if s.ah < CELL_H || (s.aw, s.ah) == nat {
                         continue;
                     }
@@ -3438,6 +3449,7 @@ mod tests {
             let mut term = Terminal::new(5, 16);
             if enter_alt {
                 // Mode entry is a coordinate-space transition of its own. The
+                // case under test is a scroll wholly inside the alt screen.
                 term.process(b"\x1b[?1049h");
             }
             let mut pipeline = EffectsPipeline::new();

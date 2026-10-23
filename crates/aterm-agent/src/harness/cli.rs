@@ -4152,6 +4152,7 @@ fn renew_flow_of(
     terminal_flow(
         || {
             let mut cmd = renew_command(program, home, email, browser);
+            cmd.env(super::open_url::EMAIL_ENV, email);
             if let Some(harness_state) = Path::new(home)
                 .parent()
                 .and_then(Path::parent)
@@ -4162,8 +4163,7 @@ fn renew_flow_of(
                 if let Some(mailbox) =
                     super::accounts_sync::resolve_mailbox_dir(user_home.as_deref(), &store)
                 {
-                    cmd.env(super::open_url::EMAIL_ENV, email)
-                        .env(super::open_url::MAILBOX_ENV, mailbox);
+                    cmd.env(super::open_url::MAILBOX_ENV, mailbox);
                 }
             }
             cmd.spawn()
@@ -5976,7 +5976,18 @@ fn run_accounts_renew(
         return ExitCode::SUCCESS;
     }
     let mailbox_dir = super::accounts_sync::resolve_mailbox_dir(env.home.as_deref(), &store);
-    if !chosen.is_empty() && !host.stdin_is_terminal() && mailbox_dir.is_none() {
+    let has_headless_browser =
+        super::headless_oauth::find_headless_browser(env.home.as_deref()).is_some();
+    let all_have_headless_profile = has_headless_browser
+        && !chosen.is_empty()
+        && chosen.iter().all(|label| {
+            let em = roster.row(label).and_then(|r| r.email.as_deref());
+            super::headless_oauth::has_browser_profile(&store.dir, label, em)
+        });
+    let has_mailbox = mailbox_dir.is_some()
+        || super::accounts_sync::has_configured_mailbox(env.home.as_deref(), &store)
+        || all_have_headless_profile;
+    if !chosen.is_empty() && !host.stdin_is_terminal() && !has_mailbox {
         let _ = writeln!(out, "due here: {}", chosen.join(", "));
         let _ = writeln!(
             err,
@@ -6002,7 +6013,7 @@ fn run_accounts_renew(
             continue;
         };
         let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
-        let browser = if host.under_ssh() || mailbox_dir.is_some() {
+        let browser = if host.under_ssh() || has_mailbox {
             RenewBrowser::Remote {
                 opener: opener
                     .get_or_insert_with(|| opener_link(&store, host))
@@ -6391,6 +6402,8 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     }
     let stats = matches!(cmd, Cmd::Accounts(AccountsCmd::Stats { .. }));
     if matches!(cmd, Cmd::Disk { .. }) || stats {
+        // Whether a Claude Code session ended, and how many run on a home,
+        // is read from what runs now, and only `disk` and `accounts stats`
         // ask it: no other verb reads the process table.
         env.claude_running = Some(disk::discover::running_claude_census(env.home.as_deref()));
     }

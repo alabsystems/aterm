@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Shipping accessibility seam (`aterm_a11y::model`) for native tab applications.
-//!
-//! Paint stages a projection from its exact [`crate::native_ui::CompiledUi`]. A successful
-//! present consumes that stage into the window adapter and retains only a stable action-route
-//! table stamped with the originating view lifecycle and review identity.
 
 use crate::native_accessibility::{
     AccessibilityOwner, NativeAccessibilityProjection, PublishedNativeAccessibility,
@@ -37,9 +33,6 @@ impl App {
             self.clear_staged_native_accessibility(wid);
             return;
         };
-        // A heterogeneous frame is staged in one transaction after every leaf
-        // cache has been updated. Publishing only the focused sibling here would
-        // knowingly expose an incomplete tree.
         if owners.len() != 1 || owners[0].view != view {
             self.clear_staged_native_accessibility(wid);
             return;
@@ -60,8 +53,7 @@ impl App {
         }
     }
 
-    /// Stage one composite from the retained semantic artifacts painted for all
-    /// visible native siblings in a heterogeneous frame.
+    /// Stage one composite accessibility projection for all visible native leaves.
     pub(crate) fn stage_visible_native_accessibility(
         &mut self,
         wid: WindowId,
@@ -100,9 +92,7 @@ impl App {
         }
     }
 
-    /// Produce the native tree for a publish. Both the staged path and fallback
-    /// consume retained semantic/raster artifacts; a missing or stale presented
-    /// leaf fails closed instead of publishing a hypothetical recompile.
+    /// Produce the native accessibility tree for a publish.
     pub(crate) fn take_native_accessibility_update(
         &mut self,
         wid: WindowId,
@@ -128,10 +118,6 @@ impl App {
             };
         let staged = self.windows.get_mut(&wid).and_then(|ws| {
             let staged = ws.native_a11y_staged.take()?;
-            // Native preparation stages before `apply_title`, while publish
-            // follows it. A title-only same-frame change therefore invalidates
-            // the staged root even though every view generation still matches;
-            // reject it and recompose from this frame's retained leaves below.
             staged.matches(&owners, &ws.current_title).then_some(staged)
         });
 
@@ -195,8 +181,6 @@ impl App {
         let bounds = self
             .native_accessibility_window_bounds(wid)
             .ok_or_else(|| "native accessibility window is no longer live".to_string())?;
-        // The window's chrome title names the accessible window whichever kind of tab is
-        // in front, so a screen reader user hears one window's identity, not two.
         let title = self
             .windows
             .get(&wid)
@@ -247,8 +231,7 @@ impl App {
         Ok((owners, focused_native))
     }
 
-    /// Map one native leaf's logical coordinates to the exact physical-pixel
-    /// position used by the presented card, including raw-window remainder bands.
+    /// Map one native leaf's logical coordinates to physical-pixel card coordinates.
     #[cfg(test)]
     fn native_accessibility_transform_for_view(
         &self,
@@ -287,10 +270,7 @@ impl App {
         )
     }
 
-    /// Transform sourced only from the compositor's retained destination
-    /// record. `SettingsCard` is the one presented native layer for both a
-    /// singleton and a heterogeneous split; each `NativeLeafRaster` stores its
-    /// exact destination inside that layer. Bounds checks reject a torn pairing.
+    /// Return the transform sourced from the compositor's retained destination record.
     fn retained_native_accessibility_transform_for_view(
         &self,
         wid: WindowId,
@@ -363,9 +343,7 @@ impl App {
         }
     }
 
-    /// Route a platform request only through the exact native view/generation whose tree
-    /// was published. Any tab switch, detach, generation change, unknown node, or unsupported
-    /// action is a silent fail-closed no-op as required by the model's action contract (`ActionHandler::do_action`).
+    /// Route a platform accessibility request through the published native view and generation.
     pub(crate) fn on_native_accessibility_action(
         &mut self,
         wid: WindowId,
@@ -393,7 +371,6 @@ impl App {
             return;
         };
 
-        // Never let a previously staged frame overwrite the post-action state.
         self.clear_staged_native_accessibility(wid);
         let focused = self
             .active_visible_leaf_plan(wid)
@@ -415,8 +392,6 @@ impl App {
             RoutedAccessibilityAction::Activate { action, value, .. } => {
                 AppEvent::Action(ActionInvocation { id: action, value })
             }
-            // Aimed at its node, so a reader scrolling Settings' sidebar
-            // scrolls the sidebar (every other view lowers it to its list's).
             RoutedAccessibilityAction::Scroll { key, lines } => AppEvent::ScrollAt { lines, key },
             RoutedAccessibilityAction::ScrollIntoView { key } => AppEvent::RevealControl(key),
             RoutedAccessibilityAction::ReplaceSelectedText { text, .. } => {
@@ -440,7 +415,6 @@ impl App {
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             window.request_redraw();
         }
-        // Refresh synchronously for screen readers even when the visual frame is coalesced.
         self.push_a11y_tree(wid);
     }
 }
@@ -769,9 +743,6 @@ mod tests {
             .and_then(|cache| cache.native.as_mut())
             .expect("retained native raster")
             .presented = true;
-        // This is the ordering in a live redraw: native paint staged the tree,
-        // then `apply_title` advanced `current_title`, then a successful present
-        // asks accessibility to publish.
         app.windows.get_mut(&wid).unwrap().current_title = "same-frame title".into();
 
         let (update, _) = app
@@ -921,8 +892,6 @@ mod tests {
                 "an old Apply cannot authorize a different offer, before or after its new frame publishes"
             );
 
-            // The replacement's own published action still applies its exact
-            // reviewed source and checklist without changing the view lifetime.
             let fresh_apply = publish_apply(&mut app, wid, view);
             let start = std::time::Instant::now();
             app.native_runtime.tick_system_state(start, true);
@@ -1043,8 +1012,6 @@ mod tests {
             Some(key.clone())
         );
 
-        // A queued event retains its original owner context even when a fresh
-        // publication at the same semantic key is current on receipt.
         app.native_runtime
             .view_state_mut(view)
             .unwrap()
@@ -1170,9 +1137,6 @@ mod tests {
     fn assert_native_sibling_geometry(scale: f64, axis: crate::tab_model::SplitAxis) {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // The win_pad negative control below is provable only with a real
-        // compositor pad: seal the scale-derived boot pad into the headless
-        // record exactly like an attach would (never-attached records carry 0).
         app.backend.set_pad((12.0 * scale).round() as usize);
         app.seed_headless_boot_metrics();
         {
@@ -1528,8 +1492,6 @@ mod tests {
         let origin = app.frame_origin(wid);
         assert!(origin.0 < 0, "fixture crops horizontally (centred)");
         if cfg!(target_os = "linux") {
-            // The vertical axis is top-pinned there: the crop falls off the
-            // bottom and the origin stays at the frame top.
             assert_eq!(origin.1, 0, "Linux pins the frame top");
         } else {
             assert!(origin.1 < 0, "fixture is a centred crop");
@@ -1671,9 +1633,6 @@ mod tests {
         let requested_state = project_route(&model, requested_projection);
         assert_route_transition(&model, &published_state, &requested_state, "RequestOne");
 
-        // Genuine wrong-owner negative: corrupt only the sibling owner stamp.
-        // The shipping route guard must notice that the view-qualified NodeId no
-        // longer agrees with its route owner and perform no reducer dispatch.
         let mut wrong_owner = published.clone();
         assert!(wrong_owner.retag_route_for_test(
             first_node,
@@ -1733,8 +1692,6 @@ mod tests {
         assert_eq!(admits(&model, &requested_state, &cross_view_mutant), None);
         assert!(!model.check_invariant("NoCrossViewDispatch", &cross_view_mutant));
 
-        // Genuine positive: the same request through the unmodified composite
-        // focuses and dispatches only to the first sibling.
         app.windows.get_mut(&wid).unwrap().native_a11y_published = Some(published);
         app.on_native_accessibility_action(
             wid,
@@ -1774,9 +1731,6 @@ mod tests {
         let routed_state = project_route(&model, routed_projection);
         assert_route_transition(&model, &requested_state, &routed_state, "Route");
 
-        // Fresh split for a real stale-generation rejection. The published
-        // composite is stamped one generation behind its still-live second
-        // sibling; the shipping all-owner guard clears it before dispatch.
         let mut stale_app = App::headless_for_test();
         assert!(stale_app.open_settings_tab(SettingsRoute::Home));
         let (stale_instance, stale_first) = stale_app.active_native_view(wid).unwrap();

@@ -23,7 +23,9 @@ pub const RAN_NO_TEST: &str = "cargo announced test binaries and not one printed
      gate's and started them in its place, or they exited before their harness; nothing was \
      decided about them";
 
-/// Did a `targo test` child's log announce test binaries.
+/// Did a `targo test` child's log announce test binaries — cargo's `Running`
+/// / `Doc-tests` headers — and then print not one libtest `test result:`
+/// line?
 #[must_use]
 pub fn ran_no_test(log: &str) -> bool {
     if log.contains('\x1b') {
@@ -226,7 +228,7 @@ fn abnormal_exit(line: &str) -> bool {
             .starts_with("process didn't exit successfully")
 }
 
-/// cargo's `error: test failed, to rerun pass `<spec>`` (or the doctest
+/// cargo's `` error: test failed, to rerun pass `<spec>` `` (or the doctest
 /// spelling) — the spec.
 fn rerun_spec(line: &str) -> Option<&str> {
     let rest = line

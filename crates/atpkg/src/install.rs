@@ -126,7 +126,7 @@ pub(crate) const UNSIGNED_SIZE_CAP: u64 = 2u64 << 30;
 
 const STAGING_SCRATCH_MODE: u32 = 0o700;
 
-/// Verify a downloaded `archive` against the signed `artifact` and stage it at `build_dir` (module docs).
+/// Verify a downloaded `archive` against the signed `artifact` and stage it at `build_dir`.
 pub fn verify_and_stage(
     artifact: &Artifact,
     archive: &Path,
@@ -238,6 +238,7 @@ pub fn verify_and_stage(
                 .map_err(|e| io_step("record a sidecar beside the build", e))?;
         }
         if let Some(parent) = build_dir.parent() {
+            // Ordered: `.ready` implies the sidecars, so they land before it; lost with
             // the marker, the build is staged again.
             crate::store::sync_dir_ordered(parent);
         }
@@ -248,10 +249,16 @@ pub fn verify_and_stage(
     }
 
     if let Err(e) = crate::store::mark_build_ready(build_dir) {
+        // Leave the tree: the outgoing one is already reclaimed, so deleting this one would
+        // leave neither build, with `current` perhaps naming this one. It passed every check,
+        // so it is the verified toolchain, honestly unmarked: it reads as not installed
+        // (`list_installed`, `flow::installed_for_decide`) and the next run re-stages it,
+        // while a `current` link naming it still resolves. Nothing extracts into
         // `build_dir` (it is swapped onto); the next stage or `gc`'s partial arm reclaims it.
         return Err(io_step("mark the build complete", e));
     }
     if let Some(parent) = build_dir.parent() {
+        // Ordered: the marker's name lands before anything after it; a lost or torn
         // marker reads as incomplete and the next pass stages the build again.
         crate::store::sync_dir_ordered(parent);
     }
@@ -1173,6 +1180,8 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
     let was_complete = crate::store::build_is_complete(build_dir);
     crate::store::clear_build_ready(build_dir)?;
     if let Some(parent) = build_dir.parent() {
+        // Ordered: the marker is down (and the staged tree, flushed before, ahead of
+        // it) before the old tree moves aside; an unmarked tree reads as incomplete and
         // is staged again.
         crate::store::sync_dir_ordered(parent);
     }
@@ -1181,6 +1190,8 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
         Some(ref old) if build_dir.exists() => {
             let _ = crate::store::remove_tree(old);
             if let Err(e) = std::fs::rename(build_dir, old) {
+                // The swap could not begin: a failed rename moved nothing, so the old tree
+                // is still at `build_dir`, as complete as it was, and re-marking asserts
                 // nothing new.
                 if was_complete {
                     let _ = crate::store::mark_build_ready(build_dir);
@@ -1192,6 +1203,7 @@ fn swap_into_place(build_dir: &Path, incoming: &Path) -> std::io::Result<()> {
         _ => false,
     };
     if let Err(e) = std::fs::rename(incoming, build_dir) {
+        // Put the old build back before reporting: the difference between "the update did
         // not happen" and "the toolchain is gone".
         if retired && let Some(ref old) = superseded {
             restore_outgoing(old, build_dir, was_complete);

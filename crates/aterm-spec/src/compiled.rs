@@ -4,35 +4,17 @@
 
 //! A [`Model`] resolved once for the interpreter's state-space walks.
 //!
-//! [`Expr::eval`] looks every identifier up in a `BTreeMap<&str, i64>` environment rebuilt at
-//! each step, and a walk evaluates the same few expressions millions of times over states that
-//! bind the same variables, so this module resolves names once. A state becomes its values in
-//! sorted-name order (the order a `BTreeMap` state iterates, and the identity
-//! [`crate::interp`]'s `seen` sets key on), a variable its index into that slice, a constant its
-//! value, and a `\A` index a slot on a small local stack.
-//!
-//! The semantics are [`Expr::eval`]'s and [`Model::successors_in`]'s, case for case, so a walk
-//! visits the same states in the same order and returns the same verdicts:
-//!
-//! * A `\A` index shadows a state variable, which shadows a constant (the layering of
-//!   `eval_env` and `Forall`); a constant declared twice takes its last declaration.
-//! * Evaluation order, short-circuiting and wrapping arithmetic are `eval`'s, and each panic
-//!   (unbound identifier, type error, function- or set-valued expression in a scalar position)
-//!   is raised lazily, with `eval`'s message, only when the expression is evaluated.
-//! * Successors: guard first, every update evaluated against the pre-state in declaration
-//!   order, then the cartesian product with each nondeterministic `lo..hi` ascending.
-//!
-//! A model with an update to a name its initial state does not bind (which grows a `BTreeMap`
-//! state by a key) is not compiled ([`Compiled::new`] returns `None`); the caller walks it the
-//! original way.
+//! Resolves state variables to sorted-name slice indices, constants to values, and `\A` indices
+//! to local stack slots while preserving [`Expr::eval`] and [`Model::successors_in`] semantics
+//! (shadowing, short-circuiting, lazy panics, and successor ordering). Models whose updates add
+//! state keys absent from `init_state` return `None` from [`Compiled::new`].
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use crate::derive::{Expr, Model, Value};
 
-/// A panic `eval` raises where it reads an expression the interpreter cannot
-/// evaluate, raised here with the same message at the same read.
+/// A lazy evaluation fault matching [`Expr::eval`]'s panic message.
 #[derive(Debug, Clone, Copy)]
 enum Fault {
     /// An identifier nothing binds.
@@ -58,12 +40,11 @@ impl Fault {
     }
 }
 
-/// An integer position (an update, a bound, an operand), resolved: what `eval`
-/// computes there before its `as_int`, as an `i64`.
+/// A resolved integer expression.
 #[derive(Debug)]
 enum Num {
     Atom(Atom),
-    /// `Add`/`Sub` of two atoms, wrapping as `eval`'s: one step where the tree takes three.
+    /// `Add`/`Sub` of two atoms, wrapping as `eval`'s.
     Arith(Arith, Atom, Atom),
     Add(Box<Num>, Box<Num>),
     Sub(Box<Num>, Box<Num>),
@@ -73,20 +54,19 @@ enum Num {
     Fault(Fault),
 }
 
-/// A boolean position (a guard, an invariant, an operand), resolved: what
-/// `eval` computes there before its `as_bool`, as a `bool`.
+/// A resolved boolean expression.
 #[derive(Debug)]
 enum Test {
     Const(bool),
     /// `Gt`/`Le`/`Eq`/`Neq` of two atoms.
     Cmp(Cmp, Atom, Atom),
-    /// A run of two or more such comparisons inside one `/\`, all of which hold.
+    /// Two or more atom comparisons inside one `/\`.
     Cmps(Box<[(Cmp, Atom, Atom)]>),
     /// A comparison of operands that are not both atoms.
     CmpOf(Cmp, Box<Num>, Box<Num>),
-    /// A `/\` chain, its operands in order, stopping at the first false.
+    /// A `/\` chain, stopping at the first false.
     And(Box<[Test]>),
-    /// A `\/` chain, its operands in order, stopping at the first true.
+    /// A `\/` chain, stopping at the first true.
     Or(Box<[Test]>),
     Iff(Box<Test>, Box<Test>),
     If(Box<Test>, Box<Test>, Box<Test>),
@@ -97,8 +77,7 @@ enum Test {
     Fault(Fault),
 }
 
-/// A position read whole (a liveness goal), whose type `eval`'s `Value` decides
-/// per evaluation.
+/// A whole-value expression (e.g. a liveness goal).
 #[derive(Debug)]
 enum Whole {
     Num(Num),
@@ -106,9 +85,7 @@ enum Whole {
     If(Test, Box<Whole>, Box<Whole>),
 }
 
-/// An integer operand that reads without evaluating anything: a constant, a state variable,
-/// a `\A` index. Reading one can neither panic nor yield a `Bool`, so an operation over two of
-/// them is `eval`'s operation over two `Int`s, in one step.
+/// An immediate integer operand: a constant, a state variable, or a `\A` index.
 #[derive(Debug, Clone, Copy)]
 enum Atom {
     Int(i64),
@@ -164,8 +141,7 @@ impl Arith {
 }
 
 impl Num {
-    /// [`Num::eval`], with an atom and an operation over two atoms read in place rather than
-    /// through a call.
+    /// Evaluates `self` with atoms and binary atom arithmetic inlined.
     #[inline(always)]
     fn value(&self, s: &[i64], locals: &mut [i64]) -> i64 {
         match self {
@@ -175,8 +151,7 @@ impl Num {
         }
     }
 
-    // Skip: a recursive evaluator over a boxed tree whose panics are `eval`'s, message for
-    // message.
+    // Skip: recursive evaluator over a boxed tree.
     #[cfg_attr(trust_verify, trust::skip)]
     fn eval(&self, s: &[i64], locals: &mut [i64]) -> i64 {
         match self {
@@ -198,8 +173,7 @@ impl Num {
 }
 
 impl Test {
-    /// [`Test::eval`], with a constant and atom comparisons read in place rather than through
-    /// a call.
+    /// Evaluates `self` with constants and atom comparisons inlined.
     #[inline(always)]
     fn check(&self, s: &[i64], locals: &mut [i64]) -> bool {
         match self {
@@ -258,8 +232,6 @@ impl Test {
             }
             Test::Forall(depth, lo, hi, body) => {
                 let (l, h) = (lo.value(s, locals), hi.value(s, locals));
-                // The index's slot: every enclosing `\A` holds the ones below it, and
-                // nothing reads a slot deeper than the `\A` it is in.
                 for n in l..=h {
                     locals[*depth] = n;
                     if !body.check(s, locals) {
@@ -292,13 +264,11 @@ impl Whole {
     }
 }
 
-/// How many `\A` index slots an evaluation holds on the stack; a model nesting deeper takes
-/// them from the heap.
+/// Number of `\A` index slots held on the stack before falling back to the heap.
 const STACK_SLOTS: usize = 8;
 
-/// `f` given `slots` zeroed `\A` index slots: none for a model with no `\A`, on the stack
-/// for every other but one nesting `\A` deeper than [`STACK_SLOTS`].
-// Skip: a stack buffer or a heap one, handed to the caller's closure. Spec-model machinery.
+/// Calls `f` with `slots` zeroed `\A` index slots on the stack or heap.
+// Skip: stack or heap scratch buffer handed to the closure.
 #[cfg_attr(trust_verify, trust::skip)]
 #[inline(always)]
 fn with_slots<R>(slots: usize, f: impl FnOnce(&mut [i64]) -> R) -> R {
@@ -352,8 +322,6 @@ impl Scope<'_> {
     // Skip: recursive tree construction (Box allocation, map lookups).
     #[cfg_attr(trust_verify, trust::skip)]
     fn num(&self, e: &Expr, bound: &mut Vec<&'static str>) -> Num {
-        // An operation over two atoms is one node, and over two constants its value: neither
-        // reads anything that can panic, so `eval`'s order and laziness have nothing to keep.
         let arith = |op: Arith,
                      a: &Expr,
                      b: &Expr,
@@ -435,7 +403,6 @@ impl Scope<'_> {
                 Test::Iff(Box::new(self.test(a, bound)), Box::new(self.test(b, bound)))
             }
             Expr::If(c, a, b) => match self.test(c, bound) {
-                // A constant condition reads one arm only, as `eval` does.
                 Test::Const(true) => self.test(a, bound),
                 Test::Const(false) => self.test(b, bound),
                 c => Test::If(
@@ -445,7 +412,6 @@ impl Scope<'_> {
                 ),
             },
             Expr::Forall(idx, lo, hi, body) => {
-                // The bounds read the enclosing scope; only the body sees `idx`.
                 let lo = Box::new(self.num(lo, bound));
                 let hi = Box::new(self.num(hi, bound));
                 let depth = bound.len();
@@ -465,8 +431,7 @@ impl Scope<'_> {
         }
     }
 
-    /// The operands of the `/\` (`all`) or `\/` chain at `e`, flattened in
-    /// evaluation order onto `out`.
+    /// Flattens `/\` (`all`) or `\/` operands at `e` onto `out` in evaluation order.
     // Skip: same class as `num`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn chain(&self, e: &Expr, all: bool, bound: &mut Vec<&'static str>, out: &mut Vec<Test>) {
@@ -503,10 +468,7 @@ impl Scope<'_> {
     }
 }
 
-/// A flattened `/\` (`all`) or `\/` chain as one test, in `eval`'s order and
-/// with its short circuit. An operand that cannot stop the chain (`TRUE` in a
-/// `/\`) is dropped; one that always stops it is kept as the chain's last, since
-/// nothing after it is read; a run of atom comparisons in a `/\` is one step.
+/// Folds flattened `/\` (`all`) or `\/` operands into a single [`Test`].
 // Skip: Vec bookkeeping over compiled operands. Spec-model machinery.
 #[cfg_attr(trust_verify, trust::skip)]
 fn chained(operands: Vec<Test>, all: bool) -> Test {
@@ -549,8 +511,7 @@ fn chained(operands: Vec<Test>, all: bool) -> Test {
 }
 
 impl Compiled {
-    /// Resolve `m`, or `None` when an update writes a name its initial state
-    /// does not bind (see the module docs).
+    /// Resolves `m`, or returns `None` when an update writes a name unbound in `init_state`.
     // Skip: map/Vec construction over the model's declarations.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn new(m: &Model) -> Option<Self> {
@@ -598,8 +559,7 @@ impl Compiled {
         })
     }
 
-    /// Resolve an expression over `m`, the model this was compiled from (for
-    /// a liveness goal).
+    /// Resolves an expression over `m` (e.g. a liveness goal).
     // Skip: same class as `new`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn expr(&self, m: &Model, e: &Expr) -> CompiledExpr {
@@ -629,7 +589,6 @@ impl Compiled {
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     pub(crate) fn slot(&self, name: &str) -> Option<usize> {
-        // `names` is a `BTreeMap`'s key order: sorted, so searchable.
         self.names.binary_search(&name).ok()
     }
 
@@ -666,9 +625,7 @@ impl Compiled {
             .collect()
     }
 
-    /// [`Compiled::successors`] written into `rows` (replacing what it held) one after
-    /// another, each `s.len()` values long; returns how many. A walk passes the same buffer
-    /// for every step, so a step allocates nothing once it has grown.
+    /// Writes [`Compiled::successors`] consecutively into `rows` and returns the successor count.
     // Skip: the cartesian product's Vec bookkeeping, as in `successors_in`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn successors_into(&self, a: usize, s: &[i64], rows: &mut Vec<i64>) -> usize {
@@ -692,9 +649,6 @@ impl Compiled {
         if act.guard.as_ref().is_some_and(|g| !g.check(s, locals)) {
             return 0;
         }
-        // Every right-hand side reads the pre-state `s`, so evaluating each just before it is
-        // applied matches evaluating all first (same values, order and panics). Each is
-        // evaluated even once the product is empty, as `successors_in` does.
         let width = s.len();
         rows.extend_from_slice(s);
         let mut made = 1;
@@ -707,12 +661,9 @@ impl Compiled {
                 Rhs::Range(lo, hi) => {
                     let (l, h) = (lo.value(s, locals), hi.value(s, locals));
                     if l == h {
-                        // One candidate: `successors_in` writes it in place.
                         write_slot(rows, width, *slot, l);
                         continue;
                     }
-                    // Each row so far, once per candidate in ascending order, appended
-                    // after the rows so far; then those are dropped.
                     let before = made * width;
                     made = 0;
                     let mut base = 0;

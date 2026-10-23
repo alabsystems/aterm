@@ -43,6 +43,14 @@ impl FactKind {
         }
     }
 
+    /// Its word, as the Harness page counts it: `hold`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            FactKind::Hold => "hold",
+        }
+    }
+
     /// The kind a ledger rule names, or `None` for a rule that is no fact's.
     #[must_use]
     pub fn of_rule(rule: &str) -> Option<Self> {

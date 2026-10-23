@@ -55,26 +55,19 @@ impl OutputInfo {
     }
 }
 
-/// An output this module bound. Dropping it releases it (a destructor
-/// request from version 3, the proxy alone before), then frees its listener.
 struct Bound {
     proxy: Proxy,
     version: u32,
-    /// The registry's name for the global.
     global: u32,
     output_book: Arc<Mutex<OutputBook>>,
     listener: Option<Listener>,
 }
 
-/// One output's reports: what is being built since the last `done`, and the
-/// state as of the last `done` (`None` before the first). A leaf of the lock
-/// graph: only its own method runs while it is held.
 struct OutputBook {
     pending: OutputInfo,
     done: Option<OutputInfo>,
 }
 
-/// One `wl_output` event, decoded.
 enum Reported {
     Geometry {
         x: i32,
@@ -140,7 +133,6 @@ fn reported(opcode: u32, args: &[EventArg<'_>]) -> Option<Reported> {
 }
 
 impl OutputBook {
-    /// Take one report; at `done`, the output's state as of it, for the sink.
     fn hear(&mut self, report: Reported) -> Option<OutputInfo> {
         let info = &mut self.pending;
         match report {
@@ -187,8 +179,6 @@ impl OutputBook {
     }
 }
 
-/// Listen to an output: each event, decoded with the book unlocked, goes to
-/// its book, and a `done`'s state to `sink`, with the book unlocked again.
 unsafe fn output_listener(
     proxy: Proxy,
     output_book: &Arc<Mutex<OutputBook>>,
@@ -263,7 +253,6 @@ impl std::fmt::Debug for Output {
 /// Every output of a registry, bound and listened to.
 pub struct Outputs {
     bound: Vec<Bound>,
-    /// Where every output's state goes at its `done`.
     sink: Sink<OutputInfo>,
 }
 
@@ -272,7 +261,6 @@ fn text(s: Option<&CStr>) -> String {
         .unwrap_or_default()
 }
 
-/// Bind `global` (a `wl_output`) at version 4 at most, and listen to it.
 fn bind_one(registry: &Registry, global: &Global, sink: &Sink<OutputInfo>) -> Result<Bound, Error> {
     let version = global.version.min(4);
     let proxy = registry

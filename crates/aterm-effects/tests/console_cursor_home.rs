@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A full resident beside a real coding-console prompt, including ordinary
-//! ink, colored input surfaces and the protected regions it must still yield.
+//! Conformance and placement tests for the cursor pet beside a coding-console prompt.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -20,14 +19,6 @@ const COLS: u16 = 151;
 const CW: u16 = 10;
 const CH: u16 = 20;
 
-/// What a tick reads off the terminal, keyed by everything it is read from: output
-/// (`screen_mutations`), the selection (the one state these tests change without output) and
-/// the facts. The 16 ms ticks far outnumber the terminal's changes and a full `cell_frame` plus
-/// the world rebuilt from it dominated this file's CPU, so a tick whose key is unchanged reuses
-/// the last read; the brain still observes and ticks every frame. A reused read differs from a
-/// fresh one only in `row_rev`, a revision lane each read restamps and the pet never reads. Of
-/// `cell_frame`'s side effects, the `damage_epoch` latch closes on the first read and these
-/// tests take no damage.
 struct Seen {
     mutations: u64,
     selection: TextSelection,
@@ -45,8 +36,6 @@ impl Seen {
         let facts = PetWorldFacts::read(term, 41);
         let mut world = PetWorld::default();
         assert!(world.observe(&input, &facts, PetPane::full(&input)));
-        // The host feeds both the console world and the older ink seam. Keep
-        // both active, so legacy eviction cannot silently undo persistence.
         let spans: Vec<_> = (0..usize::from(ROWS))
             .map(|row| {
                 let first =
@@ -85,10 +74,7 @@ struct Scene {
     brain: PetBrain,
     now: Instant,
     reduced: bool,
-    /// Hand a hidden caret over as the hosts do (the cell, reported unpainted) instead of
-    /// `None`.
     hidden_caret_travels: bool,
-    /// The last caret a tick saw painted — the home a repaint leaves alone.
     painted: (u16, u16),
     seen: Option<Seen>,
 }
@@ -97,8 +83,6 @@ impl Scene {
     fn dense(reduced: bool) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         term.process(b"\x1b]11;#000000\x07\x1b[48;2;35;39;47m");
-        // Real ANSI text/backgrounds, no synthetic world occupancy. Every
-        // candidate has ink, as a busy console can have around an input box.
         for row in 1..=ROWS {
             term.process(format!("\x1b[{row};1H").as_bytes());
             term.process(&vec![b'x'; usize::from(COLS)]);
@@ -153,16 +137,10 @@ impl Scene {
             pointer: None,
         });
         if let Some(rect) = body(frame) {
-            // The caret's own keep-off ring is not protected pixels to its
-            // escort: `STATION_LEAD` seats the pet one cell past the caret,
-            // inside that 3x3 ring. Selections, images and uncertified rows
-            // still fail here, and the caret cell itself stays uncovered at
-            // rest because the station puts the body beside it.
             assert!(
                 world.under_text_clearance_past_caret(rect, 0.0) == Some(true),
                 "emitted body covers protected pixels"
             );
-            // Ink, never the caret's keep-off ring, decides the layer.
             assert!(
                 frame.under_ink || world.ink_clearance(rect, 0.0) == Some(true),
                 "ink must remain in front"
@@ -174,8 +152,6 @@ impl Scene {
     fn at_home(&self, frame: PetFrame) {
         let rect = body(frame).expect("dense ordinary text must keep the complete pet");
         let caret = self.term.cursor();
-        // Home search may choose either side of the cursor; measure from
-        // the nearest part of the body rather than its left corner.
         let dx = (rect.col - f32::from(caret.col))
             .max(0.0)
             .max((f32::from(caret.col) - rect.col - rect.cols).max(0.0));
@@ -194,8 +170,6 @@ impl Scene {
     }
 }
 
-/// Near the last painted caret: a hidden cursor a program is walking while it repaints is not
-/// where the pet belongs.
 fn near_caret(s: &Scene, frame: PetFrame) -> bool {
     body(frame).is_some_and(|rect| {
         let (row, col) = s.painted;
@@ -213,11 +187,6 @@ type State = BTreeMap<&'static str, i64>;
 fn project(s: &Scene, frame: PetFrame, event: i64) -> State {
     State::from([
         ("visible", i64::from(body(frame).is_some())),
-        // `home`: the pet's base is the cursor, standing there or on its way (the model's
-        // `Follow`; `ArrivesAtCursor` makes arrival real). Demanding `near_caret` on the tick of
-        // a hundred-column caret jump would demand a teleport. `Arrive` is stepped only once the
-        // pet has stopped, so `home` there is `near_caret` alone and the `stranded`
-        // counterexample still bites.
         (
             "home",
             i64::from(near_caret(s, frame) || s.brain.needs_frames()),
@@ -263,7 +232,6 @@ fn real_cursor_home_placement_conforms_and_rejects_the_historical_hidden_body() 
     let mut state = model.init_state();
     assert_eq!(project(&s, frame, 0), state);
 
-    // Dense ordinary glyphs arrive without moving the caret or its home.
     s.term.process(b"\x1b7\x1b[15;50Hmore output\x1b8");
     frame = s.tick(16);
     let mut historical_hidden = project(&s, frame, 1);
@@ -302,14 +270,10 @@ fn real_cursor_home_placement_conforms_and_rejects_the_historical_hidden_body() 
     s.reduced = true;
     frame = s.tick(16);
     step(&model, &mut state, &s, frame, "Release", 6);
-    // From here the hidden caret travels as the hosts hand it over.
     s.hidden_caret_travels = true;
     s.term.process(b"\x1b[?25l");
     frame = s.tick(16);
     step(&model, &mut state, &s, frame, "HideCursor", 7);
-    // The program walks its hidden cursor to the top of the screen while it repaints, inside
-    // the repaint hold: the home stays the painted caret. Negative control: a chase to the
-    // write position is refused.
     s.term.process(b"\x1b7\x1b[2;120Hrepaint");
     frame = s.tick(16);
     let mut chased = project(&s, frame, 9);
@@ -323,9 +287,6 @@ fn real_cursor_home_placement_conforms_and_rejects_the_historical_hidden_body() 
     step(&model, &mut state, &s, frame, "ShowCursor", 8);
 }
 
-/// Where the body stands: the brain's own seat and the drawn feet, which the no-caret hold pins.
-/// Not the whole drawn rect: a held sleeper sleeps on, and its breath moves the outline by a
-/// pixel about its feet.
 fn stance(frame: PetFrame) -> (f32, f32, Option<f32>) {
     (frame.col, frame.row, body(frame).map(PetRect::foot_row))
 }
@@ -402,10 +363,6 @@ fn ordinary_typing_keeps_the_full_body_visible_between_keys() {
         for _ in 0..100 {
             s.tick(16);
         }
-        // A delete key erases: `\x08` alone is cursor-left and leaves the
-        // characters on screen (the pet then watches the end of the ink,
-        // ~31 cells out). `\x08 \x08` is what a shell emits, and with it the
-        // pet comes home to 1.1-1.4 cells.
         for kind in [PetInputKind::Text, PetInputKind::Delete] {
             for key in 0..30 {
                 s.brain.note_console_input(s.now, kind);
@@ -421,11 +378,6 @@ fn ordinary_typing_keeps_the_full_body_visible_between_keys() {
                         "{kind:?} key{key} beat{beat} at{frames_per_key} frames/key hid the resident: {}",
                         s.brain.console_reason()
                     );
-                    // Between keys the escort is legitimately behind at these
-                    // rates (a few cells, identical with the console layer on
-                    // and off). The console layer must not claim the body and
-                    // close that gap in one frame; the settled `at_home` below
-                    // checks arrival.
                     let reason = s.brain.console_reason();
                     assert!(
                         matches!(
@@ -498,7 +450,6 @@ fn coding_console_cursor_hide_show_keeps_the_full_resident_without_fake_input() 
     for _ in 1..100 {
         before = s.tick(16);
     }
-    // The dense console's resident has dozed off by now: the hold keeps it asleep.
     assert_eq!(before.action, PetAction::Sleep);
     let input_seq = s.brain.console_input_seq();
     for col in [3, 25, 140, 4] {
@@ -530,8 +481,6 @@ fn coding_console_cursor_hide_show_keeps_the_full_resident_without_fake_input() 
             .process(format!("\x1b[55;{col}H\x1b[?25h").as_bytes());
         let shown = s.tick(16);
         assert!(shown.alpha > 0);
-        // Then it walks back: with no caret to follow the body held its last home, so when the
-        // cursor reappears up to 137 columns away arrival is awaited, not demanded next frame.
         let mut settled = shown;
         for _ in 0..400 {
             settled = s.tick(16);
@@ -581,7 +530,6 @@ fn hidden_cursor_region_scrolls_keep_the_full_body_at_its_last_real_home() {
                 ),
                 "the real regional producer must explain this move"
             );
-            // Hide and scroll are first observed together on this tick.
             let held = s.tick(16);
             assert!(held.alpha > 0);
             s.at_home(held);

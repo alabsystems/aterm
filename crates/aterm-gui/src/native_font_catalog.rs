@@ -146,6 +146,7 @@ impl Lane {
             "aterm-font-catalog",
             crate::qos::Role::Background,
             move || {
+                // QoS: a font-picker catalogue scan; the picker shows a spinner meanwhile,
                 // and the terminal is unaffected.
                 worker(rx, proxy);
             },
@@ -444,6 +445,7 @@ pub(crate) fn prepare(request: Request) -> Completion {
         match admitted(index) {
             Some(asset) => match renderer.set_styled_face(slot, &asset.bytes, asset.index) {
                 Ok(()) => {
+                    // A name that resolved to a face of another style draws
                     // that face; the row says so rather than "Changed".
                     if !aterm_render::FaceTarget::for_slot(slot)
                         .suits_face_in(&asset.bytes, asset.index)

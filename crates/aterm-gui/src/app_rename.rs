@@ -201,6 +201,7 @@ impl App {
                 .get(&window)
                 .and_then(|ws| ws.os_window.as_ref())
         {
+            // The editor was painted, so its removal repaints even when nothing was
             // written (Escape, a no-op commit).
             w.request_redraw();
         }
@@ -301,6 +302,7 @@ impl App {
         match self.write_session_meta_field(session, field, text) {
             Ok(_) => {}
             Err(error) => {
+                // Both editors canonicalize as the user types, so only a scripted `invoke`
                 // can reach this.
                 aterm_log::info!("rename refused for session {session}: {error:?}");
             }

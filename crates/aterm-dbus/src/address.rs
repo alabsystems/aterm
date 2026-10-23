@@ -94,7 +94,8 @@ pub fn parse(list: &str) -> Result<Vec<Address>> {
     Ok(out)
 }
 
-/// Resolves session bus addresses, or returns [`Error::Io`] when none is configured.
+/// Resolves session bus addresses, or returns [`Error::Invalid`] for a malformed or non-UTF-8
+/// `DBUS_SESSION_BUS_ADDRESS` or [`Error::Io`] when none is configured.
 pub fn session_bus() -> Result<Vec<Address>> {
     match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
         Ok(list) if !list.is_empty() => return parse(&list),

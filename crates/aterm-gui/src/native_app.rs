@@ -3773,8 +3773,9 @@ fn shortest_unique_document_parent(uri: &str, group: &[(AppInstanceId, String)])
     format!("location-{:06x}", stable_uri_tag(uri) & 0x00ff_ffff)
 }
 
-fn stable_uri_tag(uri: &str) -> u64 {
+const fn stable_uri_tag(uri: &str) -> u64 {
     // Explicit FNV-1a keeps presentation stable across runs/toolchains. This is
+    // a disambiguating display tag, never authority or a security decision.
     aterm_hash::fnv1a_64(uri.as_bytes())
 }
 
@@ -3910,11 +3911,11 @@ impl MarkdownApp {
             .filter(|range| range.start < range.end && range.end <= self.parsed.source_len)
     }
 
-    fn can_select_source(&self) -> bool {
+    const fn can_select_source(&self) -> bool {
         self.parsed.source_len > 0 && !self.parsed.blocks.is_empty()
     }
 
-    fn location(view: &MarkdownViewState) -> crate::native_markdown::MarkdownLocation {
+    const fn location(view: &MarkdownViewState) -> crate::native_markdown::MarkdownLocation {
         crate::native_markdown::MarkdownLocation::new(view.source_anchor, view.visual_row)
     }
 
@@ -6755,6 +6756,8 @@ impl NativeAppModel for EditorApp {
 
     fn prepare_close(&mut self, _request: CloseRequest, _cx: &mut UpdateCx<'_>) -> CloseReadiness {
         // Durability belongs to `DocumentStore` and the document host: one document can
+        // back several Markdown and editor views, so only the host knows the final view
+        // and performs its proof-gated checkpoint before committing a detach.
         CloseReadiness::Ready
     }
 }
@@ -6893,6 +6896,7 @@ fn editor_status_message(
         summary
     } else if let Some(status) = view.status.as_deref().filter(|status| {
         // Command feedback may outlive its command, but a clean-buffer notice
+        // cannot describe edits made after that save or checkpoint.
         !status.is_empty() && !(app.dirty && matches!(*status, "Saved" | "No unsaved changes"))
     }) {
         status.to_string()

@@ -20,7 +20,6 @@ impl Parser {
             let value = u16::try_from(clamped).unwrap_or(u16::MAX);
             self.params.push(value);
             if is_subparam {
-                // param_index < MAX_PARAMS (24) here, so the u32 shift is in range.
                 self.subparam_mask |= 1 << param_index;
             }
         }
@@ -28,20 +27,8 @@ impl Parser {
         self.param_started = false;
     }
 
-    /// Close the parameter list at the final byte, or at the intermediate
-    /// byte that ends it.
-    ///
-    /// The parameter after the last `;` is a parameter even when empty
-    /// (ECMA-48 §5.4.2): `CSI 1 ; m` is `1` then the default, which xterm and
-    /// vte read as bold, then reset. So the open parameter is pushed when a
-    /// digit of it was read or a `;` came last, an empty one as 0 (what every
-    /// handler reads as its default). A list with no separator closes with no
-    /// parameter (`CSI m` stays `[]`), and a trailing `:` opens no subparameter.
-    ///
-    /// `after_colon`: the last separator was `:` (`last_was_colon` on the byte
-    /// path, `next_is_subparam` on the fast paths). A parameter is finalized
-    /// only at a separator, so a non-empty list with no digit read since means
-    /// a separator came last.
+    /// Close the parameter list at the final byte or at the intermediate byte that ends it.
+    /// An empty trailing parameter after `;` pushes `0` (ECMA-48 §5.4.2), while a trailing `:` opens no subparameter.
     #[inline]
     pub(crate) fn close_params(&mut self, after_colon: bool) {
         if self.param_started || (!self.params.is_empty() && !after_colon) {
@@ -73,15 +60,11 @@ impl Parser {
             return Some(1);
         }
 
-        // One- or two-digit first parameter (ESC[5A, ESC[0m, ESC[32m). Slice
-        // patterns and saturating arithmetic keep this hot path free of panic
-        // obligations; the saturations are exact (digits, at most 99).
         if let &[b0, b1, ..] = input
             && b0.is_ascii_digit()
         {
             let d0 = u16::from(b0.saturating_sub(b'0'));
             if (0x40..=0x7E).contains(&b1) {
-                // Single digit: ESC[Nm
                 self.params.set_single(d0);
                 self.intermediates.clear();
                 self.subparam_mask = 0;
@@ -94,8 +77,6 @@ impl Parser {
                 return Some(2);
             }
             if b1 == b';' {
-                // D;... — 1-digit first param, multi-param sequence.
-                // Common: ESC[1;31m (bold+red), ESC[5;20r (scroll region).
                 return self.parse_csi_after_first_param(input, sink, d0, 2);
             }
             if let &[_, _, b2, ..] = input
@@ -105,7 +86,6 @@ impl Parser {
                     .saturating_mul(10)
                     .saturating_add(u16::from(b1.saturating_sub(b'0')));
                 if (0x40..=0x7E).contains(&b2) {
-                    // Two digits: ESC[NNx
                     self.params.set_single(p1);
                     self.intermediates.clear();
                     self.subparam_mask = 0;
@@ -118,8 +98,6 @@ impl Parser {
                     return Some(3);
                 }
                 if b2 == b';' {
-                    // DD;... — 2-digit first param, multi-param sequence.
-                    // Common: ESC[38;5;Nm (256-color), ESC[12;40H (CUP).
                     return self.parse_csi_after_first_param(input, sink, p1, 3);
                 }
             }
@@ -147,9 +125,7 @@ impl Parser {
         }
     }
 
-    /// Multi-param CSI fast path after a `D;` or `DD;` first parameter
-    /// (`38;5;Nm`, `R;CH`, `1;31m`), continuing from `pos`. Out of line to keep
-    /// the zero/one/two-digit dispatch compact in L1i.
+    /// Multi-param CSI fast path after a `D;` or `DD;` first parameter, continuing from `pos`.
     #[inline(never)]
     fn parse_csi_after_first_param<S: ActionSink>(
         &mut self,
@@ -165,16 +141,11 @@ impl Parser {
         self.current_param = 0;
         self.param_started = false;
 
-        // Clamp the scan window (a proof-friendly `input.len().min(65)`); `get`
-        // reads and saturating increments keep the loop free of panic
-        // obligations, and the saturations are exact (`pos < scan.len() <= 65`).
         let limit = if input.len() < 65 { input.len() } else { 65 };
         let scan = input.get(..limit).unwrap_or(input);
 
-        // Parse remaining params (no private marker — first byte was a digit)
         while let Some(&b) = scan.get(pos) {
             if b.is_ascii_digit() {
-                // `saturating_sub` is exact here: `b >= b'0'` on this branch.
                 self.current_param = self
                     .current_param
                     .saturating_mul(10)
@@ -185,8 +156,6 @@ impl Parser {
                 self.push_current_param(false);
                 pos = pos.saturating_add(1);
             } else if b == b':' {
-                // Colon subparameters are rare: the general loop takes the
-                // rest, its next parameter a subparameter of this one.
                 self.push_current_param(false);
                 return self.parse_csi_general_from(input, sink, pos.saturating_add(1), true);
             } else if (0x40..=0x7E).contains(&b) {
@@ -205,9 +174,7 @@ impl Parser {
         None
     }
 
-    /// Continue general CSI parsing at `pos`, keeping the params parsed so far:
-    /// `parse_csi_after_first_param` hands over the bytes after a `:` with
-    /// `next_is_subparam` set, so this loop reads the rest as the byte path does.
+    /// Continue general CSI parsing at `pos`, keeping the params parsed so far.
     #[inline(never)]
     fn parse_csi_general_from<S: ActionSink>(
         &mut self,
@@ -216,15 +183,11 @@ impl Parser {
         mut pos: usize,
         mut next_is_subparam: bool,
     ) -> Option<usize> {
-        // Same proof-friendly loop shape as `parse_csi_after_first_param`:
-        // clamped scan window, `get`-based reads, and saturating position
-        // increments (all exact at runtime, where `pos < scan.len() <= 65`).
         let limit = if input.len() < 65 { input.len() } else { 65 };
         let scan = input.get(..limit).unwrap_or(input);
 
         while let Some(&b) = scan.get(pos) {
             if b.is_ascii_digit() {
-                // `saturating_sub` is exact here: `b >= b'0'` on this branch.
                 self.current_param = self
                     .current_param
                     .saturating_mul(10)
@@ -255,12 +218,7 @@ impl Parser {
         None
     }
 
-    /// General-path CSI parser: one pass parses params and finds the final
-    /// byte, with private markers, subparams and intermediates.
-    ///
-    /// No speculative bulk parameter pre-parse runs first: one measured slower
-    /// on every shape that reaches here, since `try_parse_csi_fast` already
-    /// takes the `D;…`/`DD;…` SGR shapes.
+    /// General-path CSI parser handling private markers, subparams, and intermediates in one pass.
     #[inline]
     fn parse_csi_general<S: ActionSink>(&mut self, input: &[u8], sink: &mut S) -> Option<usize> {
         self.params.clear();
@@ -270,12 +228,9 @@ impl Parser {
         self.intermediates.clear();
 
         let mut pos = 0;
-        // Clamp the scan window to 65 bytes (a proof-friendly
-        // `input.len().min(65)`); a longer CSI falls back to the byte path.
         let limit = if input.len() < 65 { input.len() } else { 65 };
         let scan = input.get(..limit).unwrap_or(input);
 
-        // Check for private marker (? > < = etc.)
         if let Some(&marker) = scan.first()
             && (0x3C..=0x3F).contains(&marker)
         {
@@ -285,10 +240,8 @@ impl Parser {
 
         let mut next_is_subparam = false;
 
-        // Single pass: parse params and find final byte simultaneously
         while let Some(&b) = scan.get(pos) {
             if b.is_ascii_digit() {
-                // `saturating_sub` is exact here: `b >= b'0'` on this branch.
                 self.current_param = self
                     .current_param
                     .saturating_mul(10)
@@ -328,8 +281,6 @@ impl Parser {
         mut pos: usize,
         limit: usize,
     ) -> Option<usize> {
-        // Callers always pass `limit <= input.len()`, so this clamp is a
-        // runtime no-op that ties the loop below to `scan.len()`.
         let end = if limit < input.len() {
             limit
         } else {

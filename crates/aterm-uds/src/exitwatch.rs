@@ -242,7 +242,8 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
     }
 }
 
-/// A descriptor `poll(2)` reports readable once `pid` has exited (Darwin.
+/// A descriptor `poll(2)` reports readable once `pid` has exited (Darwin: an [`ExitWatch`]
+/// kqueue; Linux: a `pidfd`), for a loop that waits on it beside its own.
 #[cfg(unix)]
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]

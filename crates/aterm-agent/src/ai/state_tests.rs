@@ -122,7 +122,6 @@ fn a_store_aterm_cannot_see_is_unproven_never_signed_out() {
     f.hidden_store = true;
     let row = assess(&f, true, NOW);
     assert_eq!((row.state, row.mark), (State::Unproven, Mark::Note));
-    // A review that worked proves it.
     f.record
         .apply(How::Review, crate::ai::store::Outcome::Worked, NOW - 60);
     assert_eq!(assess(&f, true, NOW).state, State::Ok);
@@ -144,7 +143,6 @@ fn an_end_counts_until_something_newer_shows_the_login_working() {
         "{}",
         row.fact
     );
-    // Codex wrote its login file after the end (someone signed in): it works again.
     f.login_file = Some((PathBuf::from("/a"), Some(NOW - 60)));
     assert_eq!(assess(&f, true, NOW).state, State::Ok);
 }
@@ -159,7 +157,6 @@ fn claude_reads_its_profile_and_accounts_v2s_bound_login() {
     let row = assess(&f, true, NOW);
     assert_eq!(row.state, State::Idle);
     assert!(row.fact.starts_with("signed in (Max)"), "{}", row.fact);
-    // A renewal bound the own row to a login directory: that login is the one read.
     let mut a = accounts(Some("idle"));
     a.login = Some("/state/accounts/logins/main+1".into());
     a.made = false;

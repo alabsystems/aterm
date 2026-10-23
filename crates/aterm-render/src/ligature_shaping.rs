@@ -262,6 +262,7 @@ fn map_shaped_run(
         ShapeVerdict::OneToOne => {}
         ShapeVerdict::Collapsed => {
             // A merged ligature spanning an absurd number of cells falls back to
+            // the per-cell path (keeps the child-key slice index bounded).
             if run_chars.len() > LIG_SLICE_MAX {
                 return None;
             }
@@ -506,6 +507,8 @@ fn plan_piece<F, R>(
         Some(ShapedRun::PerColumn(gids)) => {
             for (i, slot) in gids.iter().enumerate() {
                 // Only columns shaping changed become Ligated, so procedural and
+                // fallback cells keep their own face. `shape` is caller-supplied:
+                // `column` and get_mut make an oversized gid array a no-op.
                 if let Some(gid) = *slot
                     && let Some(cell) = column(i).and_then(|col| out.get_mut(col))
                 {

@@ -939,12 +939,14 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
             let (nx, ny) = (px / wf, (py - mid) / mid);
             let e = (nx * nx + ny * ny).sqrt();
             if outline {
+                // Radial distance scaled by the smaller radius — the
                 // perpendicular stroke width bound, as in `ellipse`.
                 ((e - 1.0) * wf.min(mid)).abs() <= half
             } else {
                 e <= 1.0
             }
         } else if outline {
+            // Chevron `>`: stroke the two hypotenuse segments
             // (0,0)->(w,mid) and (w,mid)->(0,h) at perpendicular width t.
             seg_dist(px, py, 0.0, 0.0, wf, mid).min(seg_dist(px, py, wf, mid, 0.0, hf)) <= half
         } else {

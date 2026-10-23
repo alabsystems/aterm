@@ -20,104 +20,66 @@ use crate::cursor_glow::{
 use crate::effect_util::{lerp_rgb, push_fx_rect as push_rect};
 use crate::trail_sweep::line_cells_tail;
 
-/// One comet cell, fading from `born`.
 #[derive(Clone, Copy)]
 struct Spark {
     row: u16,
     col: u16,
-    /// Coverage at birth (head bright, tail faint).
     born_cov: u8,
-    /// Position along the comet 0.0 (tail) .. 1.0 (head), for the hue sweep.
     pos: f32,
-    /// Fade lifetime in seconds: short for a lone typing advance, chained to the
-    /// observed inter-key cadence during sustained typing, the full comet
-    /// `duration` for a jump.
     life: f32,
-    /// Typing spark (else jump): picks the fade curve in `emit_comet`.
     typing: bool,
     born: Instant,
 }
 
-/// One expanding landing ring, kept on its landing cell (not in pixels) so it
-/// rides a scroll with the text and is centred from the live geometry.
 #[derive(Clone, Copy)]
 struct Ring {
     row: u16,
     col: u16,
     born: Instant,
     life: f32,
-    /// The caret's cell the paper landing veil lies on, which does not ride
-    /// the scroll: its landing, then each on-grid caret the ring has seen
-    /// since ([`ClassicWake::emit_light_ring`]).
     caret: (u16, u16),
 }
 
-/// The classic wake's animation state; no other style touches it.
+/// The classic wake's animation state.
 #[derive(Default)]
 pub struct ClassicWake {
     sparks: Vec<Spark>,
-    /// Resident, bounded swept-cell scratch, built backward from the landing
-    /// point so an outlier jump never walks or allocates the discarded prefix.
     path_scratch: Vec<(i32, i32)>,
     ring: Option<Ring>,
-    /// Last observed cursor cell, to detect a move.
     last: Option<(u16, u16)>,
-    /// When the cursor last moved (drives the bloom-crown fade around the head).
     last_move: Option<Instant>,
-    /// Deadline until which the crown is still emitted (cached so [`Self::is_active`]
-    /// needs no clock); keeps the timer armed past comet decay.
     crown_until: Option<Instant>,
-    /// The crown window the last move applied: [`Self::CROWN_TYPING_MS`] for a
-    /// typing step, [`Self::CROWN_MS`] for a jump.
     crown_window_ms: u64,
-    /// Rolling hue phase (turns), advanced per spawn.
     hue: f32,
-    /// Typing-cadence heat 0..1, decayed lazily from `heat_at`, so idle gaps
-    /// cost nothing and never keep the animation timer armed.
     heat: f32,
     heat_at: Option<Instant>,
-    /// Last typing advance, for the inter-key cadence.
     last_type: Option<Instant>,
-    /// Resident run-builder pool, so the comet reuses its nested buffers every
-    /// redraw.
     comet_runs: Vec<Vec<CometSample>>,
-    /// Index of the run being filled. `comet_live + 1` slots are live once
-    /// anything is pushed; a split only leaves a non-empty run behind, so no
-    /// live slot is empty.
     comet_live: usize,
-    /// Resident light-ground stroke scratch ([`Self::emit_light_comet`]), so
-    /// a light frame allocates nothing after the first growth.
     light_verts: Vec<BeamVertex>,
-    /// The move this frame's tick spawned on, `(from, to)`, for the host's
-    /// diagnosis ring ([`Self::take_spawn`]).
     spawned: Option<((u16, u16), (u16, u16))>,
-    /// The mono face's dark bed's working buffers ([`lay_dark_bed`]).
     bed_scratch: BedScratch,
-    /// The mono face's tracer runs over air ([`split_air_runs`]), pooled as
-    /// `comet_runs` is.
     air_runs: Vec<Vec<CometSample>>,
-    /// Test-only: draw the mono face on a dark ground as the spectrum face draws, additive light over the letters, the negative control of its bed test.
+    /// Test-only: draw the mono face on a dark ground as additive light over the letters.
     #[cfg(test)]
     pub(crate) mono_unbedded: bool,
-    /// Test-only: lay the light-ground stroke and crown in their unsolved vivid ink (`LightGround::unsolved`), the legibility tests' negative control.
+    /// Test-only: lay the light-ground stroke and crown in their unsolved vivid ink.
     #[cfg(test)]
     pub(crate) light_unsolved: bool,
-    /// Test-only: lay the light-ground landing veil as it was, centred on
-    /// the landing and spreading with the ring's age, unbounded by the
-    /// caret's cell and row, the negative control of its bound test.
+    /// Test-only: lay the light-ground landing veil unbounded by the caret's cell and row.
     #[cfg(test)]
     pub(crate) veil_unbound: bool,
 }
 
-/// What the mono face's dark bed reads of the frame ([`ClassicWake::tick`]): the probed text, which says where the tracer may be light, and the over-ink account its bed, crown and ring spend.
+/// Over-text state for the mono face's dark bed.
 pub(crate) struct WakeInk<'a> {
-    /// What the frame shows of text: the probe's lines and the frame's own cells for the rows it missed.
+    /// Probed and observed text spans for the frame.
     pub(crate) text: TextView<'a>,
-    /// The frame's over-ink account (idle when the host keeps none).
+    /// The frame's over-ink account.
     pub(crate) ledger: &'a mut InkLedger,
 }
 
-/// The comet colour at path position `pos` (0 tail .. 1 head), in the face `mono` names: the one colour rule of the classic wake, shared with [`crate::cursor_glow::style_comet_color`]'s `Classic` arm.
+/// Returns the comet colour at path position `pos` (`0` tail to `1` head).
 #[must_use]
 #[inline]
 pub fn comet_color(mono: bool, color: u32, accent: u32, hue: f32, pos: f32) -> u32 {
@@ -129,73 +91,57 @@ pub fn comet_color(mono: bool, color: u32, accent: u32, hue: f32, pos: f32) -> u
 }
 
 impl ClassicWake {
-    /// Hard cap on emitted quads (defends the renderer + the per-frame upload).
     const MAX_QUADS: usize = 8192;
-    /// Hard cap on live swept-path samples. `cfg.length` bounds one move; this
-    /// bounds an accumulation of moves at the same instant.
     const MAX_SPARKS: usize = 512;
-    /// Bloom-crown fade window (the crown follows the head this long post-move).
     const CROWN_MS: u64 = 200;
-    /// Typing crown window: at human cadence (≤~350 ms between keys) the crown
-    /// never lapses mid-sentence.
     const CROWN_TYPING_MS: u64 = 350;
-    /// Heat earned by one keystroke at full cadence (≈7 fast keys to full heat).
     const HEAT_GAIN: f32 = 0.16;
-    /// Exponential heat cool-down time constant (seconds to ~37%).
     const HEAT_DECAY_TAU: f32 = 0.9;
-    /// Inter-key gap (seconds) at or under which a keystroke earns full heat…
     const HEAT_GAP_FULL: f32 = 0.09;
-    /// …and the gap beyond which it earns none (relaxed typing stays cool).
     const HEAT_GAP_ZERO: f32 = 0.40;
-    /// Typing continuity: at or under this gap the spark's life chains to the
-    /// observed cadence, so the streak is continuous at any human rhythm.
     const CHAIN_GAP_MAX: f32 = 0.40;
-    /// Chained life = observed gap + this margin…
     const CHAIN_MARGIN: f32 = 0.10;
-    /// …capped here so the post-stop tail stays crisp.
     const CHAIN_LIFE_MAX: f32 = 0.50;
 
-    /// Wake brightness multiplier for typing light at the current heat: cool
-    /// typing ~0.28×, sustained fast typing ~1.2×.
     #[inline]
     const fn typing_boost(&self) -> f32 {
         0.28 + 0.92 * self.heat
     }
 
-    /// Any light still alive → keep the animation timer armed.
+    /// Returns whether any wake light is still alive.
     #[must_use]
     #[inline]
     pub const fn is_active(&self) -> bool {
         !self.sparks.is_empty() || self.ring.is_some() || self.crown_until.is_some()
     }
 
-    /// The move the last tick spawned on, `(from, to)`, once: the classic wake lights every observed move, typed or not, and the host records it in the same spawn count and diagnosis ring the other styles fill.
+    /// Takes the `(from, to)` move the last tick spawned on.
     #[inline]
     pub const fn take_spawn(&mut self) -> Option<((u16, u16), (u16, u16))> {
         self.spawned.take()
     }
 
-    /// Whether the engine remembers a cursor cell, from which its next tick would spawn a comet on a move.
+    /// Returns whether the engine remembers a cursor cell.
     #[must_use]
     #[inline]
     pub const fn has_last(&self) -> bool {
         self.last.is_some()
     }
 
-    /// Live swept-path samples, for `trail status`'s `sparks=` count.
+    /// Returns the number of live swept-path samples.
     #[must_use]
     #[inline]
     pub const fn live_sparks(&self) -> usize {
         self.sparks.len()
     }
 
-    /// The live sparks' cells, for the host-seam tests.
+    /// Returns the live sparks' cells.
     #[cfg(test)]
     pub(crate) fn spark_cells(&self) -> Vec<(u16, u16)> {
         self.sparks.iter().map(|s| (s.row, s.col)).collect()
     }
 
-    /// The rows the live sparks span, `(first, last)`, for the host's read of the frame's text ([`CursorGlow::observe_frame_text`]).
+    /// Returns the `(first, last)` row range spanned by live sparks.
     #[inline]
     pub(crate) fn row_range(&self) -> Option<(u16, u16)> {
         let mut iter = self.sparks.iter().map(|s| s.row);
@@ -203,13 +149,13 @@ impl ClassicWake {
         Some(iter.fold((first, first), |(lo, hi), r| (lo.min(r), hi.max(r))))
     }
 
-    /// The landing ring's cell, for the host-seam tests.
+    /// Returns the landing ring's cell.
     #[cfg(test)]
     pub(crate) fn ring_cell(&self) -> Option<(u16, u16)> {
         self.ring.map(|r| (r.row, r.col))
     }
 
-    /// Drop all in-flight light and forget the last cursor position, used when the cursor's coordinate space changes or the classic engine stops owning the frame (another style, the master switch), so no comet spawns from a stale position and no orphaned light keeps the host awake.
+    /// Drops all in-flight light and forgets the last cursor position.
     pub fn reset(&mut self) {
         self.sparks.clear();
         self.ring = None;
@@ -223,7 +169,7 @@ impl ClassicWake {
         self.last_type = None;
     }
 
-    /// Carry every row-addressed member under `map` (an absolute row to its new row, `None` once carried off the grid or past a band's edge): the sparks, the ring's landing cell and the last observed cell ride the content, and whatever leaves is dropped, never clamped.
+    /// Translates row-addressed members under `map`, dropping any that leave the grid.
     pub fn translate_rows(&mut self, map: &impl Fn(u16) -> Option<u16>) {
         self.sparks.retain_mut(|s| match map(s.row) {
             Some(row) => {
@@ -240,7 +186,7 @@ impl ClassicWake {
             .and_then(|(row, col)| map(row).map(|row| (row, col)));
     }
 
-    /// Advance one frame: observe the cursor at `cur`, spawn on a move, decay, and emit the light into `out` (additive quads, dark ground) and `halos` (source-over veils, light ground).
+    /// Advances one frame and emits wake quads and halos.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor, clock, config, geometry and the three streams the wake lands in"
@@ -479,9 +425,6 @@ impl ClassicWake {
         }
     }
 
-    /// A spark's coverage now: typing sparks hold full brightness for 55% of
-    /// life then cosine-fade, so the chained streak stays lit across the
-    /// inter-key gap; jump sparks fade linearly.
     #[inline]
     fn spark_cov(s: &Spark, now: Instant, cfg: &GlowConfig) -> u8 {
         let age = now.saturating_duration_since(s.born).as_secs_f32();
@@ -498,9 +441,6 @@ impl ClassicWake {
         ((s.born_cov as f32) * tf * cfg.intensity) as u8
     }
 
-    /// Build this frame's comet as runs of adjacent swept cells in the
-    /// resident pool (`comet_runs[..live]`), the head run attached to the live
-    /// cursor cell, and return `live` (0 when nothing is lit).
     fn build_runs(
         &mut self,
         now: Instant,
@@ -611,11 +551,6 @@ impl ClassicWake {
         }
     }
 
-    /// The mono face on a dark ground: the runs the dark comet builds, laid
-    /// as a bed under the letters in the tracer's own colour
-    /// ([`lay_dark_bed`], a thin tracer's shape), and drawn as the comet's
-    /// additive light only over air and onto the caret's cell
-    /// ([`split_air_runs`]), so no tracer light lands on a letter.
     #[allow(
         clippy::too_many_arguments,
         reason = "clock, config, geometry, cursor, both streams and the over-text facts"
@@ -711,10 +646,6 @@ impl ClassicWake {
         }
     }
 
-    /// The mono face's dark bed: a thin line through the x-height in the
-    /// cursor colour, thinning as each cell fades, full at a head cell's
-    /// birth coverage, over the tracer's bright core as a thin rail in the
-    /// leading under the row, so the face stays a thin bright tracer.
     const MONO_BED: BedShape = BedShape {
         reach: 0.10,
         thin: 0.45,
@@ -724,8 +655,6 @@ impl ClassicWake {
         ..BedShape::BASE
     };
 
-    /// Whether the mono face draws as the spectrum face does on a dark
-    /// ground: never in a build, only for a test's control.
     #[cfg(test)]
     const fn mono_unbedded(&self) -> bool {
         self.mono_unbedded
@@ -736,21 +665,10 @@ impl ClassicWake {
         false
     }
 
-    /// Where the light-ground stroke runs, as a share of the cell height
-    /// below the row's centre: the row's lower band, under the letters'
-    /// x-height and clear of the row below.
     const LIGHT_STROKE_DROP: f32 = 0.30;
-    /// The light-ground stroke's thickness, as a share of the cell height.
     const LIGHT_STROKE_THICK: f32 = 0.12;
-    /// A sample's coverage to the stroke's opacity: a fresh comet reaches the
-    /// body cap ([`LIGHT_BODY_ALPHA_CAP`]); a fading one thins with it.
     const LIGHT_STROKE_GAIN: f32 = 1.9;
 
-    /// The light-ground comet: the same runs the dark comet draws, each as
-    /// one thin source-over stroke beneath the letters ([`comet_beam_over`]
-    /// into the under-ink stream), shifted down to the row's lower band and
-    /// inked in the light body's ink of the comet's colour, solved against
-    /// the theme's text ([`LightGround::body_ink`]).
     fn emit_light_comet(
         &mut self,
         now: Instant,
@@ -832,9 +750,6 @@ impl ClassicWake {
         self.light_verts = verts;
     }
 
-    /// The crown's caret cell and fade now (1 at the move, 0 at the end of
-    /// its window), `None` when there is no crown: the Glow size knob at 0,
-    /// no caret on the grid, or the last move's window over.
     #[inline]
     fn crown_fade(
         &self,
@@ -903,9 +818,6 @@ impl ClassicWake {
         }
     }
 
-    /// The mono face's crown on a dark ground: one smooth radial bloom on the
-    /// caret's cell in the tracer's colour, the shape every modern style's
-    /// crown has, reaching as far as the box crown did (the radius knob).
     fn emit_mono_crown(
         &self,
         now: Instant,
@@ -934,22 +846,10 @@ impl ClassicWake {
         );
     }
 
-    /// The mono crown's peak coverage at full heat: the modern crown's
-    /// (`CursorGlow::emit_crown`, 50 × 1.9).
     const MONO_CROWN_COV: f32 = 95.0;
 
-    /// The light crown's peak opacity at full heat and intensity: the box
-    /// crown's stacked centre (50 × (1 + 2 + 3) / 3 = 100) at the light
-    /// stroke's gain ([`Self::LIGHT_STROKE_GAIN`]), capped at the body cap.
     const LIGHT_CROWN_COV: f32 = 100.0 * Self::LIGHT_STROKE_GAIN;
 
-    /// The crown on a light ground: the box crown's bloom as ink. One round
-    /// mark beneath the letters on the caret's cell ([`push_ink_ellipse`],
-    /// held inside the caret's row so the lines above and below stay paper),
-    /// as far past the cell as the box crown reaches (the Glow size knob),
-    /// with its window, fade and typing heat, in the box crown's colour (the
-    /// rolling spectrum, or the one-colour face's colour) as the light body's
-    /// ink, solved against the theme's text ([`LightGround::body_ink`]).
     fn emit_light_crown(
         &self,
         now: Instant,
@@ -989,8 +889,6 @@ impl ClassicWake {
         );
     }
 
-    /// The ring's age fraction and coverage now, `None` when there is none or
-    /// it has faded out.
     #[inline]
     fn ring_now(&self, now: Instant, cfg: &GlowConfig) -> Option<(Ring, f32, u8)> {
         let ring = self.ring?;
@@ -1015,16 +913,6 @@ impl ClassicWake {
         push_rect(out, geom, cx + s - th, cy - s, th, 2 * s, premul);
     }
 
-    /// The light-ground landing ring: the modern ring's light arm (an
-    /// expanding source-over veil of the ring colour mixed 28% toward black,
-    /// its centre alpha fading with the ring and capped at 120), as
-    /// `CursorGlow::emit_ring` draws it for the other styles, and bound as
-    /// it is: THE VEIL STAYS IN THE CARET'S CELL AND ROW, its reach along the
-    /// row [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] and half a row up and
-    /// down, its centre held to what leaves the theme's text
-    /// [`CursorGlow::LIGHT_VEIL_BAR`] over it (an Enter at the bottom row
-    /// carried the landing up with the scrolled text, and the veil stood as
-    /// a cloud over the line just printed, most of a row above the caret).
     fn emit_light_ring(
         &self,
         now: Instant,
@@ -1043,9 +931,6 @@ impl ClassicWake {
         let unbound = false;
         #[cfg(test)]
         let unbound = self.veil_unbound;
-        // A frame whose caret the host withholds (`cur` is `None`) keeps the
-        // veil on the last caret the ring saw ([`Ring::caret`]), never the
-        // cloud over the scrolled landing.
         let on = |&(r, c): &(u16, u16)| usize::from(r) < geom.rows && usize::from(c) < geom.cols;
         let on_grid = cur.filter(on).or(Some(ring.caret).filter(on));
         let (centre, radii, cap) = match on_grid {
@@ -1067,12 +952,9 @@ impl ClassicWake {
             ),
             _ => return,
         };
-        // Falling off from its centre, never a flat disc of ink (a stain).
         push_soft_veil(halos, geom, centre, radii, veil, cap);
     }
 
-    /// The comet colour at path position `pos` (0 tail .. 1 head) in this
-    /// config's face ([`comet_color`]).
     #[inline]
     fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
         comet_color(cfg.classic_mono, cfg.color, cfg.accent, self.hue, pos)
@@ -1105,7 +987,6 @@ mod tests {
         }
     }
 
-    /// The classic style's shipped defaults.
     fn cfg() -> GlowConfig {
         GlowConfig {
             enabled: true,
@@ -1129,11 +1010,9 @@ mod tests {
         }
     }
 
-    /// GitHub Light's pair: the light ground the light arm is measured on.
     const PAPER: u32 = 0x00FF_FFFF;
     const INK: u32 = 0x001F_2328;
 
-    /// The fixture on a light ground.
     fn light_cfg() -> GlowConfig {
         GlowConfig {
             dark_theme: false,
@@ -1145,8 +1024,6 @@ mod tests {
         }
     }
 
-    /// The engine and its three output streams, ticked as `CursorGlow` does,
-    /// with no probed text and no over-ink account (an idle one).
     #[derive(Default)]
     struct Rig {
         w: ClassicWake,
@@ -1181,8 +1058,6 @@ mod tests {
         t0 + Duration::from_millis(ms)
     }
 
-    /// Every emitted quad lands inside the effects box and inside one cell-row
-    /// band, as the row-scoped damage gate and GPU scissor require.
     fn assert_banded(out: &[GlowQuad], g: Geom) {
         for q in out {
             assert!(
@@ -1211,8 +1086,6 @@ mod tests {
         }
     }
 
-    /// The run builder is resident: after warm-up the pooled slots keep their
-    /// capacity at the top of every frame.
     #[test]
     fn the_comet_run_pool_keeps_its_buffers_between_frames() {
         let (g, c) = (geom(), cfg());
@@ -1259,8 +1132,6 @@ mod tests {
         );
     }
 
-    /// The classic wake spawns on cursor motion alone; an empty frame means the
-    /// classic branch went through the admission seam.
     #[test]
     fn the_classic_wake_spawns_on_motion_alone_with_no_license() {
         let (g, c) = (geom(), cfg());
@@ -1273,9 +1144,6 @@ mod tests {
         assert_banded(&rig.out, g);
     }
 
-    /// One wide glyph (CJK, emoji, a Hangul syllable) advances the caret two
-    /// columns; typed at speed it earns heat and the typing crown, and no
-    /// landing ring.
     #[test]
     fn a_wide_glyph_is_typing_and_a_longer_step_is_a_jump() {
         let (g, c) = (geom(), cfg());
@@ -1302,9 +1170,6 @@ mod tests {
         assert_eq!(jump.w.heat, 0.0, "a jump earns no typing heat");
     }
 
-    /// A bar caret stands at `head_dx` of its cell: the comet's samples sit
-    /// there, so a vertical jump's streak runs down the bar, not half a cell
-    /// to its right.
     #[test]
     fn the_comet_ends_on_a_bar_caret() {
         let g = geom();
@@ -1342,8 +1207,6 @@ mod tests {
         }
     }
 
-    /// The landing ring's stroke keeps its weight on a HiDPI cell: an eighth
-    /// of the cell height, never under the original's 2 px.
     #[test]
     fn the_landing_ring_stroke_scales_with_the_cell() {
         let t0 = Instant::now();
@@ -1370,8 +1233,6 @@ mod tests {
         }
     }
 
-    /// Idle-zero: the engine returns to exactly empty so the event loop can
-    /// park and the animation timer disarm.
     #[test]
     fn the_wake_decays_to_exactly_empty_and_disarms() {
         let t0 = Instant::now();
@@ -1391,8 +1252,6 @@ mod tests {
         }
     }
 
-    /// The master switch and a degenerate geometry both go dark at once, with
-    /// no residue left to re-light the next frame.
     #[test]
     fn disabled_returns_the_engine_to_rest() {
         let (g, mut c) = (geom(), cfg());
@@ -1408,7 +1267,6 @@ mod tests {
         assert!(!rig.w.is_active(), "disabled leaves nothing in flight");
     }
 
-    /// The mono face follows the configured colour; the spectrum face does not.
     #[test]
     fn the_mono_face_follows_the_configured_colour_and_the_spectrum_does_not() {
         let g = geom();
@@ -1451,8 +1309,6 @@ mod tests {
         );
     }
 
-    /// The shared colour ramp's `Classic` arm is the engine's own spectrum
-    /// rule, so the two cannot drift.
     #[test]
     fn the_shared_ramp_speaks_the_engines_spectrum() {
         for i in 0..=8 {
@@ -1472,8 +1328,6 @@ mod tests {
         );
     }
 
-    /// One scripted dark session, folded field-complete: every frame's
-    /// fingerprint, quad count and every quad's damage words.
     fn dark_session_fold(c: &GlowConfig, g: Geom) -> u64 {
         use aterm_hash::fnv_mix_u64;
         let mut rig = Rig::default();
@@ -1530,10 +1384,6 @@ mod tests {
         acc
     }
 
-    /// The mono face's crown on a dark ground is one smooth round bloom: in a
-    /// hot typed run its light is radial halos, and below the caret's cell,
-    /// down the column through its middle, it falls off to nothing a little
-    /// at a time.
     #[test]
     fn the_mono_crown_is_one_smooth_round_bloom() {
         let g = geom();
@@ -1606,11 +1456,6 @@ mod tests {
         );
     }
 
-    /// The dark wake is byte-identical to the salvage at 37b3368a2, the base
-    /// the light, wide-glyph, bar-caret and scroll adaptations were made on
-    /// (the v0.28 A/B harness that once proved it against the release is
-    /// gone): the spectrum face on the identity layout and on a padded window
-    /// with a head band.
     #[test]
     fn the_dark_wake_is_byte_identical_to_its_base() {
         let mono = GlowConfig {
@@ -1653,14 +1498,6 @@ mod tests {
         );
     }
 
-    /// The knobs every host hands the classic wake when its user set none
-    /// (aterm-gui's `cursor_trail_*_or_default` and `cursor_trail_intensity_for`:
-    /// 260 ms, 24 cells and a 0.6-cell crown with the ring on, at the v0.28
-    /// release's own brightness, [`crate::cursor_fx::default_trail_intensity`];
-    /// aterm-gui's `classic_receives_the_shipped_knobs` pins that side),
-    /// resolved for the dark default theme through the one config law every
-    /// host runs ([`crate::cursor_fx::resolve_glow_config`], the knob law
-    /// included), `length` and `intensity` aside.
     fn shipped_dark_at(length: usize, intensity: f32) -> GlowConfig {
         crate::cursor_fx::resolve_glow_config(
             crate::cursor_fx::GlowKnobs {
@@ -1682,7 +1519,6 @@ mod tests {
         )
     }
 
-    /// [`shipped_dark_at`] at the brightness a host hands Classic unset.
     fn shipped_dark(length: usize) -> GlowConfig {
         shipped_dark_at(
             length,
@@ -1690,10 +1526,6 @@ mod tests {
         )
     }
 
-    /// THE WAKE A HOST ACTUALLY DRIVES IS THE BASE'S: the config the one
-    /// config law resolves from the shipped knobs (not only the fixture the
-    /// base was pinned on) reaches the engine whole, so its dark session
-    /// folds to its own print, on the identity layout and the padded one.
     #[test]
     fn the_host_resolved_dark_wake_is_byte_identical_to_its_base() {
         let shipped = shipped_dark(24);
@@ -1754,10 +1586,6 @@ mod tests {
         );
     }
 
-    /// On a light ground the wake is ink: no additive quad at all (no box
-    /// crown of light), the comet and the crown as source-over ink in the
-    /// under-ink stream under the body cap, and the landing ring as a capped
-    /// source-over veil on the landing cell.
     #[test]
     fn a_light_ground_draws_ink_under_the_letters_and_a_veil_ring_and_no_additive_light() {
         let (g, c) = (geom(), light_cfg());
@@ -1791,20 +1619,6 @@ mod tests {
         );
     }
 
-    /// THE PAPER LANDING VEIL STAYS IN THE CARET'S CELL AND ROW, AT THE
-    /// TEXT BAR (round 2: after an Enter at the bottom row the landing,
-    /// carried up with the scrolled text, laid its veil as a cloud over the
-    /// line just printed, most of a row above the caret, on GitHub Light and
-    /// Default Light, in the spectrum face and a pinned pink alike). With the
-    /// landing a row above the caret, at 30 ms and 120 ms: every veil lies in
-    /// the caret's row, centred on the caret's cell and reaching no further
-    /// than [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] along it, and the theme's
-    /// text over its centre keeps 4.5:1. So on a frame whose caret the host
-    /// withholds (`cur: None`): the veil stays on the caret the ring last
-    /// saw. NEGATIVE CONTROLS: the veil as it was
-    /// ([`ClassicWake::veil_unbound`]) leaves the row; and (as run on
-    /// 2026-10-22, the bound held only while `cur` was there) the
-    /// hidden-caret frame laid the old cloud over the landing.
     #[test]
     fn the_paper_landing_veil_stays_in_the_caret_row_at_the_text_bar() {
         let g = geom();
@@ -1860,8 +1674,6 @@ mod tests {
                         if unbound {
                             continue;
                         }
-                        // The stacked veil at its centre, where every layer
-                        // stands at its whole opacity.
                         let (cx, cy) = (halos[0].cx, halos[0].cy);
                         let under = halos
                             .iter()
@@ -1896,10 +1708,6 @@ mod tests {
         );
     }
 
-    /// The under-ink stream composited over `PAPER` in emission order (the
-    /// renderer's source-over law), `times` over, then `INK` stems: two 1 px
-    /// stems per cell from the ascender line to the descender line on `row`
-    /// over `cols`.
     #[allow(clippy::type_complexity)]
     fn light_frame(
         under: &[GlowQuad],
@@ -1940,7 +1748,6 @@ mod tests {
         (px, cells)
     }
 
-    /// The WCAG ratio between the mean luminance of two pixel sets.
     fn ratio(px: &[u32], a: &[usize], b: &[usize]) -> f32 {
         let mean = |set: &[usize]| {
             set.iter().map(|&i| relative_luminance(px[i])).sum::<f32>() / set.len() as f32
@@ -1949,15 +1756,6 @@ mod tests {
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     }
 
-    /// A TYPED RUN ON A LIGHT GROUND IS AN UNDERLINE INSIDE ITS ROW: every
-    /// stroke pixel lies in the typed row (the rows above and below stay
-    /// paper), the stroke lies in the row's lower band (measured with the
-    /// crown off, Glow size 0), and every stem of the letters typed over the
-    /// whole wake, the stroke and the ink crown on the caret's row, keeps
-    /// 4.5:1 against its counters on GitHub Light, across a session that
-    /// rolls the spectrum, even laid three deep (a run that compounded its
-    /// revisits): the inks are solved against the theme's text, so a stack
-    /// of them composites toward the inks.
     #[test]
     fn a_typed_run_on_light_is_an_underline_inside_its_row_that_keeps_the_letters_legible() {
         let (g, c) = (geom(), light_cfg());
@@ -2022,12 +1820,6 @@ mod tests {
         );
     }
 
-    /// THE CROWN ON A LIGHT GROUND IS ONE ROUND INK MARK ON THE CARET'S ROW:
-    /// typed at speed, the wake lays the crown first and then exactly the
-    /// stroke a crownless twin (Glow size 0) lays, so the crown is the
-    /// difference; it is source-over ink under the body cap, inside the
-    /// caret's row, reaching past the caret's cell on both sides by the same
-    /// amount, deepest at the caret and fading toward its rim.
     #[test]
     fn the_light_crown_is_one_round_ink_mark_on_the_caret_row() {
         let (g, c) = (geom(), light_cfg());
@@ -2111,9 +1903,6 @@ mod tests {
         );
     }
 
-    /// A CTRL-L JUMP ON A LIGHT GROUND IS ONE CONNECTED STROKE: the caret
-    /// leaps from the bottom row to the top, and the comet's ink covers every
-    /// pixel row between the two ends along the move, with no per-row gap.
     #[test]
     fn a_vertical_jump_on_light_is_one_connected_stroke() {
         let (g, c) = (geom(), light_cfg());
@@ -2151,9 +1940,6 @@ mod tests {
         );
     }
 
-    /// The wake rides scrolled content: with the prompt on the bottom row of
-    /// a full screen, an Enter scrolls the command up and lands the caret at
-    /// the new prompt's start.
     #[test]
     fn the_wake_rides_a_scroll_and_a_band_move() {
         let g = Geom {
@@ -2209,8 +1995,6 @@ mod tests {
         );
     }
 
-    /// Light and memory carried off the grid's top are dropped, never
-    /// clamped onto row 0, and a forgotten `last` spawns nothing.
     #[test]
     fn a_scroll_drops_what_it_carries_off_the_top() {
         let g = geom();
@@ -2238,7 +2022,6 @@ mod tests {
         assert_eq!(fp, 0, "nothing in flight, nothing spawned");
     }
 
-    /// After a coordinate-space change the next tick draws no comet from the old space.
     #[test]
     fn reset_forgets_the_cursor_so_no_cross_space_comet_spawns() {
         let (g, c) = (geom(), cfg());

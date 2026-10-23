@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ATERM'S ENDPOINT, AS THE BRIDGE SEES IT: a model of the bridge plane of the
-//! verb lane (aterm-gui-fabric's `cmd_deliver`, `cmd_outbox_verb`, `cmd_hold`,
-//! `cmd_link`, `cmd_hello`), with the sessions' own side — queueing a post,
-//! marking rows seen, deciding an ask — driven by the scheduler as the agents
-//! would ([`Endpoint::post`], [`Endpoint::seen`]).
-//!
-//! The rules it keeps are the endpoint's half of exactly once:
-//!
-//! * `deliver <sid> off=<n> …` takes a row ONCE per offset on the log it was
-//!   told (`dedup`): a second `deliver` of the same offset answers the first
-//!   row's id and adds nothing — what makes the bridge's at-least-once cursor
-//!   and refill exactly once at the ring;
-//! * `link log <id>` names the log those offsets are on, and a change forgets
-//!   them (`forget_bus_offsets`): every dedup offset, receipts made
-//!   `log=earlier`, queued replies whose `re=` the new log cannot hold retired
-//!   `log-replaced` — but on lane 3, `continues=<f> was=<old>` forgets only
-//!   what is at or above the fork `f`, and keeps the rest;
-//! * `outbox` lists every queued post (each sender's first before any
-//!   sender's second) and every owed receipt; `outbox sent` and `deliver …
-//!   receipt=` retire them.
-//!
-//! A session joins on the log the endpoint was last told
-//! (`register_on_log`), and answers the reads the bridge's presence takes of
-//! it (`@<sid> status`, `@<sid> meta`). With the node mirroring its session
-//! logs (`hello … log=turns` answered `log=turns`), each session holds a REAL
-//! `aterm_slog::Log`, and `log-take` and `log-landed` are that log's own take
-//! and landing, as aterm-gui's `cmd_log_take` and `cmd_log_landed` answer
-//! them; a replaced log (`forgot=1`) forgets every mirror cursor
-//! (`forget_landed`), so each starts over from its first record.
-//!
-//! Each of the first two rules, and the mirror's forgetting, can be switched
-//! off ([`EpRules`]) for the simulation's negative controls: an endpoint with
-//! no dedup, one that never forgets, one that speaks lane 2 (forgets
-//! everything on any move), one whose mirror cursors outlive the log they
-//! were landed on.
-//!
-//! It is served on one end of a socket pair by a thread that only ever
-//! answers a line the bridge has just written and is blocked on, so it never
-//! acts on its own and the world stays deterministic.
+//! Deterministic verb-lane endpoint model for link bridge simulation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
@@ -57,13 +19,9 @@ pub(crate) struct EpRules {
     pub(crate) lane: u32,
     /// A changed `link log` forgets offsets at all.
     pub(crate) forgets: bool,
-    /// A session holding a generation of the fork's chain AFTER `was` keeps
-    /// below the fork too; off, only one holding `was` does.
+    /// A session holding a generation of the fork's chain AFTER `was` keeps below the fork too.
     pub(crate) chain: bool,
-    /// A replaced log (`link log` answered `forgot=1`) forgets every session
-    /// log's mirror cursor (aterm-gui's `session_log_mirror::forget_landed`):
-    /// what the bus held of each is another log's, and its next take starts
-    /// over from its first record.
+    /// A replaced log.
     pub(crate) mirror_forgets: bool,
 }
 
@@ -134,14 +92,11 @@ pub(crate) struct Session {
     pub(crate) bus_log: Option<String>,
     /// The highest addressed offset ever delivered on that log.
     addressed_head: Option<u64>,
-    /// The session's log (`aterm_slog`), while the node mirrors it onto the
-    /// bus (`[fabric] log = "turns"`).
+    /// The session's log.
     pub(crate) log: Option<aterm_slog::Log>,
 }
 
-/// A session log's ring in the simulation: small, so a burst of local records
-/// evicts bus-class ones before they are mirrored and a take says them as
-/// an exact cover.
+/// A session log's ring in the simulation.
 fn log_limits() -> aterm_slog::Limits {
     aterm_slog::Limits::new(16, 1 << 20).expect("a small ring")
 }
@@ -165,8 +120,7 @@ impl Session {
         }
     }
 
-    /// The addressed refill floor `inbox-seen` reports: the lowest offset of
-    /// an unhandled row on the log, else one past the highest delivered.
+    /// The addressed refill floor `inbox-seen` reports.
     fn floor(&self) -> Option<u64> {
         self.rows
             .iter()
@@ -176,8 +130,7 @@ impl Session {
             .or_else(|| self.addressed_head.map(|h| h + 1))
     }
 
-    /// Forget the offsets of another log: all of them, or those at or above
-    /// `keep_below` (the endpoint's `forget_bus_offsets`).
+    /// Forget the offsets of another log.
     fn forget(&mut self, keep_below: Option<u64>) {
         let fork = keep_below.unwrap_or(0);
         let kept = |off: u64| off < fork;
@@ -215,29 +168,21 @@ pub(crate) struct EpState {
     log: Option<String>,
     /// Every request line, cut, for the trace.
     pub(crate) requests: Vec<String>,
-    /// The node mirrors its sessions' logs (`hello … log=turns` is answered
-    /// `log=turns`, and `log-take`/`log-landed` are served).
+    /// The node mirrors its sessions' logs.
     pub(crate) mirror: bool,
-    /// How many torn state files the bridges said they set aside
-    /// (`link set-aside files=<n>`).
+    /// How many torn state files the bridges said they set aside (`link set-aside files=<n>`).
     pub(crate) set_aside_told: u64,
-    /// The newest count of torn files a bridge said its quarantine still
-    /// holds (`link quarantine torn=<k>`); `None` before any said.
+    /// The newest count of torn files a bridge said its quarantine still holds.
     pub(crate) held_said: Option<u64>,
-    /// What the newest bridge said of its mirror (`link mirror <words>`):
-    /// `on`, `stopped reason=<why>`, `capped`; empty before any said.
+    /// What the newest bridge said of its mirror.
     pub(crate) mirror_said: String,
-    /// How many times a bridge said its mirror stopped for its pin (`link
-    /// mirror stopped reason=pin`), whichever bridge, in whichever boot.
+    /// How many times a bridge said its mirror stopped for its pin.
     pub(crate) pin_stops: u64,
-    /// How many of aterm's last words a bridge acknowledged (`link bye
-    /// <word>`), for the quit the world waits on.
+    /// How many of aterm's last words a bridge acknowledged.
     pub(crate) byes_acked: u64,
-    /// Every alias key a take named (`log-take … key=<hex>`; empty: none),
-    /// across the node's whole life.
+    /// Every alias key a take named.
     pub(crate) take_keys: std::collections::BTreeSet<String>,
-    /// The world's clock as the sessions last stamped a record: a take's
-    /// snapshot is stamped with it.
+    /// The world's clock as the sessions last stamped a record.
     stamp: aterm_slog::Stamp,
 }
 
@@ -258,15 +203,11 @@ impl Endpoint {
         })
     }
 
-    /// A session joins (a tab opened): it is listed from now on, and its log
-    /// holds its open — the first bus-class record, `ms` 1.
+    /// A session joins (a tab opened): it is listed from now on, and its log holds its open.
     pub(crate) fn create(&self, local: u64, sid: &str, at: aterm_slog::Stamp) {
         let mut s = lock(&self.state);
         s.stamp = at;
         let mut session = Session::new(sid, local);
-        // A session registers on the log the endpoint was last told
-        // (aterm-gui-fabric's `register_on_log`): its first offsets are that
-        // log's, and the next `link log` of it forgets nothing.
         session.bus_log.clone_from(&s.log);
         if s.mirror {
             let mut log = aterm_slog::Log::with_limits(1, log_limits());
@@ -284,9 +225,7 @@ impl Endpoint {
         s.sessions.insert(local, session);
     }
 
-    /// A session leaves (its tab closed): its log goes with it — the
-    /// simulation keeps no closed session's bus tail, so a landing for it
-    /// answers `gone` — and it is kept for the oracle.
+    /// A session leaves (its tab closed): its log goes with it.
     pub(crate) fn exit(&self, local: u64) -> Option<String> {
         let mut s = lock(&self.state);
         let mut session = s.sessions.remove(&local)?;
@@ -296,10 +235,7 @@ impl Endpoint {
         Some(sid)
     }
 
-    /// aterm loses power: every session goes (kept for the oracle, its log
-    /// with it), and so does the endpoint's memory of the log it was told —
-    /// the next instance starts with no witness (aterm-gui-fabric's
-    /// `LINK.log` is process memory).
+    /// aterm loses power: every session goes.
     pub(crate) fn power_cut(&self) {
         let mut s = lock(&self.state);
         let sessions = std::mem::take(&mut s.sessions);
@@ -310,9 +246,7 @@ impl Endpoint {
         s.log = None;
     }
 
-    /// Session `local` appends to its log: a bus-class record (a `seen`
-    /// mark), or a local one (a bell, which only evicts). Whether a record was
-    /// appended.
+    /// Session `local` appends to its log.
     pub(crate) fn append_log(&self, local: u64, bus: bool, at: aterm_slog::Stamp) -> bool {
         let mut s = lock(&self.state);
         s.stamp = at;
@@ -348,7 +282,7 @@ impl Endpoint {
         lock(&self.state).sessions.keys().copied().collect()
     }
 
-    /// Session `local` queues a post: its id.
+    /// Session `local` queues a post.
     pub(crate) fn post(&self, local: u64, to: &str, kind: &str, text: &str) -> Option<u64> {
         let mut s = lock(&self.state);
         let session = s.sessions.get_mut(&local)?;
@@ -365,9 +299,7 @@ impl Endpoint {
         Some(id)
     }
 
-    /// Session `local` marks every row seen, deciding the newest undecided
-    /// `ask` it holds when `verdict` names one: the `EVENT … inbox-seen` line
-    /// aterm pushes for it, if anything moved.
+    /// Session `local` marks every row seen.
     pub(crate) fn seen(&self, local: u64, verdict: Option<&str>) -> Option<String> {
         let mut s = lock(&self.state);
         let session = s.sessions.get_mut(&local)?;
@@ -409,8 +341,7 @@ impl Endpoint {
         Some(line)
     }
 
-    /// Serve the verb lane on `far` (the bridge holds the other end) until the
-    /// bridge closes it.
+    /// Serve the verb lane on `far` (the bridge holds the other end) until the bridge closes it.
     pub(crate) fn serve(self: &Arc<Self>, far: UnixStream) {
         let ep = Arc::clone(self);
         std::thread::Builder::new()
@@ -452,8 +383,6 @@ impl Endpoint {
                     .find_map(|t| t.strip_prefix("build="))
                     .unwrap_or("-")
                     .to_string();
-                // `log=turns` acknowledged only when asked, and only by a node
-                // that mirrors: the bridge's mirror runs on this answer alone.
                 let asked = request.split_whitespace().any(|t| t == "log=turns");
                 let log = if asked && s.mirror { " log=turns" } else { "" };
                 format!("OK lane={} build={build}{log}\n", s.rules.lane)
@@ -485,9 +414,6 @@ impl Endpoint {
             "hold" => s.hold(words),
             "link" => match words.next() {
                 Some("log") => s.link_log(words),
-                // The bridge's ack of aterm's last word (`link bye quit`),
-                // which the quitting instance waits for before it closes the
-                // lanes ([`super::world`]'s quit).
                 Some("bye") => match (words.next(), words.next()) {
                     (Some("quit" | "handoff"), None) => {
                         s.byes_acked += 1;
@@ -495,9 +421,6 @@ impl Endpoint {
                     }
                     _ => "ERR usage\n".to_string(),
                 },
-                // The torn state files the bridge set aside after a power
-                // cut, counted for the oracle (lane 4: a lower lane refuses
-                // it, as its real endpoint does).
                 Some("set-aside") if s.rules.lane >= 4 => {
                     match words.next().and_then(|w| w.strip_prefix("files=")) {
                         Some(n) => {
@@ -508,9 +431,6 @@ impl Endpoint {
                     }
                 }
                 Some("set-aside") => "ERR usage\n".to_string(),
-                // How many torn files the quarantine still holds, said at a
-                // bridge's start, for the oracle (lane 5, as the real
-                // endpoint reads it).
                 Some("quarantine") if s.rules.lane >= 5 => {
                     let torn = words
                         .next()
@@ -525,8 +445,6 @@ impl Endpoint {
                     }
                 }
                 Some("quarantine") => "ERR usage\n".to_string(),
-                // The mirror's own word for the oracle: `on`, or why it
-                // stopped (`stopped reason=pin`: a pin that does not read).
                 Some("mirror") => {
                     s.mirror_said = words.collect::<Vec<_>>().join(" ");
                     if s.mirror_said == "stopped reason=pin" {
@@ -536,10 +454,6 @@ impl Endpoint {
                 }
                 _ => "OK\n".to_string(),
             },
-            // A session's own reads, as the bridge's presence takes them: its
-            // `status` (whether a hold stands; no agent, no detail), its
-            // `meta` (nothing set), its topics (none). Anything else of a
-            // session's is not the bridge plane's.
             v if v.starts_with('@') => {
                 let sid = &v[1..];
                 match words.collect::<Vec<_>>().as_slice() {
@@ -564,8 +478,7 @@ impl EpState {
         self.sessions.values_mut().find(|s| s.sid == sid)
     }
 
-    /// Every queued post, each sender's first before any sender's second,
-    /// then every owed receipt.
+    /// Every queued post.
     fn outbox_frame(&self) -> String {
         let mut frame = String::new();
         let queued: Vec<Vec<&Post>> = self
@@ -682,10 +595,7 @@ impl EpState {
         format!("OK {id}\n")
     }
 
-    /// `log-take n=<k> …`: at most `k` slots past each session log's landed
-    /// cursor, sessions in sid order, each line `<sid> <cursor> <body>` (the
-    /// bridge's own tests' endpoint, `FakeMirror`, answers the same way: the
-    /// REAL log's take, as aterm-gui's `cmd_log_take` answers it).
+    /// `log-take n=<k> …`.
     fn log_take<'a>(&mut self, words: impl Iterator<Item = &'a str>) -> String {
         let words: Vec<&str> = words.collect();
         let n: usize = words
@@ -693,7 +603,6 @@ impl EpState {
             .find_map(|t| t.strip_prefix("n="))
             .and_then(|n| n.parse().ok())
             .unwrap_or(aterm_slog::TAKE_MAX);
-        // The alias key the take names, for the oracle.
         let key = words
             .iter()
             .find_map(|t| t.strip_prefix("key="))
@@ -723,8 +632,7 @@ impl EpState {
         format!("OK {} slots={k}{more}\n{body}", body.len())
     }
 
-    /// `log-landed <sid> <cursor> …`: each session log's landing, one word a
-    /// pair (`gone` for a session the endpoint no longer holds).
+    /// `log-landed <sid> <cursor> …`.
     fn log_landed<'a>(&mut self, words: impl Iterator<Item = &'a str>) -> String {
         let toks: Vec<&str> = words.collect();
         let mut answers = Vec::new();
@@ -765,8 +673,7 @@ impl EpState {
         format!("OK hold={}\n", u8::from(on))
     }
 
-    /// `link log <id> [continues=<f> was=<old>]`: a change forgets the
-    /// sessions' offsets — on lane 3 only those at or above `f`.
+    /// `link log <id> [continues=<f> was=<old>]`: a change forgets the sessions' offsets.
     fn link_log<'a>(&mut self, mut words: impl Iterator<Item = &'a str>) -> String {
         let Some(ident) = words.next().map(str::to_string) else {
             return "ERR usage: link log\n".to_string();
@@ -795,9 +702,6 @@ impl EpState {
                 Some(was) => was != ident,
             };
             if forget && forgets {
-                // `was` itself, or a generation of the same log between it and
-                // this one: the fork is the chain's lowest (aterm-gui-fabric's
-                // `LogClock::keep_below`).
                 let keep_below = continues
                     .as_ref()
                     .filter(|(_, was)| {
@@ -814,7 +718,6 @@ impl EpState {
         self.log = Some(ident);
         if changed {
             // AND THE MIRROR'S CURSORS, every one: what the bus held of each
-            // log was another log's (aterm-gui's `forget_landed`).
             if self.rules.mirror_forgets {
                 for log in self.sessions.values_mut().filter_map(|s| s.log.as_mut()) {
                     log.forget_mirror();
@@ -827,9 +730,7 @@ impl EpState {
     }
 }
 
-/// Whether a session holding `held` keeps below a fork a bridge names from
-/// `was` to `now`: `held` is `was`, or a generation of the same log after it
-/// and before `now` (the fork is the lowest over the whole chain).
+/// Whether a session holding `held` keeps below a fork a bridge names from `was` to `now`.
 fn in_chain(was: &str, held: &str, now: &str) -> bool {
     let split = |s: &str| -> Option<(String, u64)> {
         let (id, generation) = s.split_once('.')?;

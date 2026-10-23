@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The walker's throughput and slice latency over a ~200k-entry scratch tree, on the real
-//! clock. Ignored by default (it writes 200,000 files); run it with
-//! `targo --unverified test --release -p aterm-diskwalk --test measure -- --ignored --nocapture`.
-//!
-//! It reports, per lister: entries per second, slices, and the wall time of one slice at
-//! p50/p99/max. The tree was just written, so its metadata is warm in the cache: this measures
-//! the walker, not the disk. It asserts only what the walk found; a number is a report, never a
-//! budget.
+//! Throughput and slice-latency measurement over a 200k-entry scratch tree.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -27,8 +20,7 @@ fn now() -> Instant {
     Instant::now()
 }
 
-/// `TOP × MID` folders of `FILES` files each: 200,000 files in 440 folders. Every tenth file
-/// has a page of bytes, the rest are empty.
+/// `TOP × MID` folders of `FILES` files each: 200,000 files in 440 folders.
 fn build(root: &Path) -> u64 {
     let page = vec![1u8; 4_096];
     let mut entries = 0u64;
@@ -114,7 +106,6 @@ fn walk_a_200k_entry_tree_and_report() {
         "measure: built {expected} entries in {:.1} s",
         (now() - built).as_secs_f64()
     );
-    // Each lister twice: the first pass also warms what the build left cold.
     for lister in [ListerChoice::Native, ListerChoice::Portable] {
         measure(&root, lister, expected);
         measure(&root, lister, expected);

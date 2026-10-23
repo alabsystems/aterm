@@ -89,7 +89,7 @@ pub struct JournalRecord {
     pub summary: String,
     /// The line exactly as printed.
     pub line: String,
-    /// The ledger turn the point's report counted.
+    /// The ledger turn the point's report counted from.
     pub turn: Option<u64>,
     /// The inbox row id of the report folded into an `EVENT turn` line.
     pub report: Option<u64>,

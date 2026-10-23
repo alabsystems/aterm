@@ -232,6 +232,7 @@ impl Roster {
 
     /// **Step 6–7.** Admit the roster itself.
     pub fn admit(&self, floor_seq: u64, now_unix: i64) -> Result<(), RosterReject> {
+        // Step 6, the ratchet: strong for a client that has seen a newer roster, nothing for
         // a fresh install.
         if self.roster_seq < floor_seq {
             return Err(RosterReject::Rollback);

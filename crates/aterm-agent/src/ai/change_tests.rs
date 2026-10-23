@@ -4,8 +4,6 @@
 use super::*;
 use crate::ai::facts::LiveRunner;
 
-/// Git for the fixtures, kept off the developer's own configuration: no global or system
-/// config, no signing, a scratch HOME.
 fn git(dir: &Path, args: &[&str]) {
     git_home(dir, args, dir);
 }
@@ -61,8 +59,6 @@ fn take(r: &Repo, base: &Base) -> Result<Change, Refused> {
     take_home(r, base, None)
 }
 
-/// The change, with `home` as HOME (whose `.gitconfig` the review's git reads, as it would
-/// the person's).
 fn take_home(r: &Repo, base: &Base, home: Option<&Path>) -> Result<Change, Refused> {
     let path = std::env::var("PATH").ok();
     let home = home.map(|h| h.display().to_string());
@@ -230,8 +226,6 @@ fn only_the_repositorys_own_filter_driver_refuses() {
     );
 }
 
-/// The person's own (global) `aterm.aiReview = false` refuses too, read from their home as
-/// git finds it on this host: `HOME`, or on Windows `USERPROFILE` (where no `HOME` is set).
 #[test]
 fn a_global_opt_out_in_the_persons_home_refuses() {
     let r = repo();

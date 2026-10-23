@@ -137,6 +137,8 @@ fn install_panic_hook(dir: PathBuf) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // A panic inside the screen reader's fence is caught and degraded by its
+        // caller and warned once per session per location (`reader_guard`): no crash
+        // report, no stderr.
         if crate::reader_guard::absorb(info) {
             return;
         }
@@ -716,7 +718,7 @@ impl RotationBudget {
         check_every: Duration::from_secs(30),
     };
 
-    fn oversized(self, len: u64) -> bool {
+    const fn oversized(self, len: u64) -> bool {
         len > self.rotate_at
     }
 }
@@ -847,6 +849,7 @@ impl RotatingFile {
         let on_disk = std::fs::metadata(&self.path).ok().and_then(|m| file_id(&m));
         if on_disk.is_none() || on_disk != self.id {
             // Rotated by another process, or deleted: write where the path
+            // points now.
             self.reopen();
         }
         if !self
@@ -1127,6 +1130,7 @@ impl Log for FileLogger {
 
     fn log(&self, record: &Record<'_>) {
         // One write per line once appended: `File` is unbuffered, so no
+        // interleaved fragments.
         self.write_record(record.level(), record.target(), &record.args().to_string());
     }
 

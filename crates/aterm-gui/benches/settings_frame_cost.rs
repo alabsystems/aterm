@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A Settings page's frame of a preview's clock, timed: µs per native compile
-//! at p50/p90/p99 over 400 frames, at short windows whose pages shed their
-//! chrome and at a shipped one. A measurement for a person, never a gate.
-//!
-//! `targo --unverified bench -p aterm-gui --features bench-support --bench settings_frame_cost`
+//! Benchmark measuring per-frame native compile cost for Settings pages.
 
 fn main() {
     const FRAMES: usize = 400;

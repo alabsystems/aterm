@@ -208,10 +208,10 @@ fn hold(
     wait: Duration,
     state: &Mutex<State>,
 ) {
-    let until = std::time::Instant::now() + wait;
+    let began = std::time::Instant::now();
     let mut sink = [0_u8; 4096];
     loop {
-        let left = until.saturating_duration_since(std::time::Instant::now());
+        let left = wait.saturating_sub(began.elapsed());
         if left.is_zero()
             || state
                 .lock()

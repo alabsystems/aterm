@@ -12,7 +12,6 @@ use agh::policy::{ChainStep, Tier};
 
 use crate::common;
 
-/// Two profiles with logins and token files under `{root}`: the rows every fixture adds to.
 const BASE: &str = r#"
 [profiles.dev]
 token_file = "{root}/tokens/dev.token"
@@ -25,7 +24,6 @@ tier = "release"
 login = "fixture-release-bot"
 "#;
 
-/// `text` with `{root}` filled, escaped for a TOML basic string as `common` escapes it.
 fn fill(text: &str, root: &Path) -> String {
     let root = root
         .display()
@@ -35,7 +33,6 @@ fn fill(text: &str, root: &Path) -> String {
     text.replace("{root}", &root)
 }
 
-/// The faults of `BASE` + `extra` under `root`, with `file_id` judging files.
 fn faults_with(
     extra: &str,
     root: &Path,
@@ -52,7 +49,6 @@ fn faults_with(
     }
 }
 
-/// The faults of `BASE` + `extra` in a fresh root.
 fn faults(extra: &str) -> Vec<ConfigFault> {
     let root = common::scratch("rules");
     faults_with(extra, root.path(), &config::file_id)
@@ -62,7 +58,6 @@ fn rules(faults: &[ConfigFault]) -> Vec<&'static str> {
     faults.iter().map(|f| f.rule).collect()
 }
 
-/// One fault, of `rule`, whose text carries every one of `names`.
 fn assert_one(extra: &str, rule: &str, names: &[&str]) {
     let found = faults(extra);
     assert_eq!(rules(&found), [rule], "{extra}: {found:?}");
@@ -120,11 +115,6 @@ fn l1_the_toml_and_its_schema() {
     assert!(unknown[0].what.contains("legacy_loose"), "{unknown:?}");
 }
 
-/// A token pasted into agh.toml, each case to add to `BASE`. The first three fail the parse
-/// (an unknown key's value, a value of the wrong type, unquoted), whose L1 fault names the
-/// line and the parser's message. The rest are well typed, so `validate` judges them and
-/// its fault names the row: an owner's `write`, `read`, `tier` and name, `[default] read`,
-/// a `[targets]` value and a profile's name. No fault carries the token.
 fn pasted(token: &str) -> [String; 10] {
     let owner = "[[owners]]\nname = \"fixture-ext\"\ntier = \"external\"\n";
     [
@@ -141,7 +131,6 @@ fn pasted(token: &str) -> [String; 10] {
     ]
 }
 
-/// Neither the token nor its body after the prefix is in `text`.
 fn assert_unleaked(text: &str, token: &str) {
     assert!(!text.contains(token), "the token in {text:?}");
     assert!(!text.contains(&token[4..]), "the token's body in {text:?}");
@@ -285,8 +274,6 @@ fn l3_owner_names_and_rows() {
     );
 }
 
-/// A name of 20 or more characters with no `-` that passes its own rule (L3's 39 for an
-/// owner, L10's 32 for a profile or target) is carried whole, not masked as a token.
 #[test]
 fn a_long_name_is_carried_whole() {
     let owner = "fixtureextwithalongname";
@@ -380,8 +367,6 @@ fn l7_disjoint_files_and_logins() {
     );
 }
 
-/// L7 by canonical path: a second profile reaches the dev token file through a directory
-/// symlink.
 #[cfg(unix)]
 #[test]
 fn l7_the_same_file_through_a_directory_symlink() {
@@ -506,7 +491,6 @@ fn a_home_path_expands() {
     assert_eq!(config::expand("~a/b", root.path()), None);
 }
 
-/// `config::load` and `agh policy check`: unix, because each writes a private agh.toml.
 #[cfg(unix)]
 mod files {
     use agh::config::{self, Dirs};
@@ -546,7 +530,6 @@ mod files {
         assert_eq!(faulty.next, "agh policy check");
     }
 
-    /// `agh policy check` in a context over `root`, with `args` after the verb.
     fn check(root: &std::path::Path, args: &[&str]) -> (u8, String, String) {
         let fake = FakeGithub::start();
         let (mut ctx, captured) = common::ctx(root, &fake, common::env());
@@ -632,8 +615,6 @@ mod files {
         assert_eq!(value["counts"]["owners"], aterm_json::Value::from(2u64));
     }
 
-    /// A token pasted into agh.toml reaches neither `policy check`'s stdout or stderr nor
-    /// `config::load`'s refusal.
     #[test]
     fn a_pasted_token_is_never_echoed() {
         let token = agh_fake::token("leak");
@@ -655,8 +636,6 @@ mod files {
         }
     }
 
-    /// A `--config` naming no file follows load's rule (plan §7 body 8): `present: false`,
-    /// `ok: true`, exit 0, and the report names the path it looked at.
     #[test]
     fn policy_check_reports_a_named_file_that_is_not_there_as_absent() {
         let root = common::scratch("check-nofile");
@@ -688,8 +667,6 @@ mod files {
         assert!(what.contains("chmod 640"), "{what}");
     }
 
-    /// A `--config` whose directory is a link: the remedy names that directory, the link
-    /// to fix, rather than the file, which is no link.
     #[test]
     fn policy_check_names_a_linked_directory() {
         let root = common::scratch("check-linked");
@@ -717,7 +694,6 @@ mod files {
         assert!(remedy.contains(&linked.display().to_string()), "{what}");
     }
 
-    /// The `what` of `policy check --config {path}`'s one fault, which must be a file fault.
     fn file_fault(root: &std::path::Path, path: &std::path::Path) -> String {
         let path_text = path.display().to_string();
         let (exit, stdout, _) = check(root, &["--config", &path_text]);
@@ -730,7 +706,6 @@ mod files {
             .to_string()
     }
 
-    /// `text` as agh.toml in `dir` (created private), then `dir` and the file chmodded.
     fn loose_config(root: &std::path::Path, dir: &std::path::Path, dir_mode: u32) {
         std::fs::create_dir_all(dir).expect("the directory");
         common::chmod(dir, 0o700);
@@ -744,10 +719,6 @@ mod files {
         common::chmod(dir, dir_mode);
     }
 
-    /// agh.toml directly in the home directory, which is open to the group (0750, as on
-    /// macOS): no remedy asks the person to narrow `~`, by any spelling of it, or names a
-    /// chmod of the file, which cannot lift the directory's refusal; it names `--config`
-    /// and the agh config directory instead.
     #[test]
     fn policy_check_never_narrows_home() {
         let root = common::scratch("check-home");
@@ -767,8 +738,6 @@ mod files {
         assert!(!what.contains("chmod 700"), "{what}");
     }
 
-    /// `~/.config`, `~/.config/aterm` and their XDG-relocated equivalents (the agh config
-    /// directory's parent and grandparent) are never narrowed either (design §6.2).
     #[test]
     fn policy_check_never_narrows_the_config_directories() {
         let root = common::scratch("check-dotconfig");
@@ -790,9 +759,6 @@ mod files {
         }
     }
 
-    /// agh.toml that is a link (as a dotfile manager makes) or a directory, in a loose
-    /// directory: `read_private` refuses the directory first, and the remedy names no chmod
-    /// of the file, which would follow the link and whose "inverse" would widen the target.
     #[test]
     fn policy_check_names_no_chmod_of_a_linked_or_directory_file() {
         let root = common::scratch("check-loose-link");
@@ -825,9 +791,6 @@ mod files {
         assert!(!what.contains("chmod"), "{what}");
     }
 
-    /// A `--config` under a directory link that is another user's (root's `/tmp` on macOS):
-    /// the remedy names the link only as the place and offers `--config`, never the link's
-    /// change. Skipped where no system directory is such a link.
     #[test]
     fn policy_check_of_another_users_link_names_no_change_to_it() {
         let Some((link, real)) = crate::identity_files::foreign_dir_link() else {
@@ -848,9 +811,6 @@ mod files {
         );
     }
 
-    /// The agh directory is one agh never narrows (here it is the home directory, at 0755):
-    /// load's refusal, the `next` of every routed verb, names no `--config`, which no routed
-    /// verb takes and which changes no file that routes, and no chmod of it.
     #[test]
     fn load_of_a_never_narrowed_agh_directory_names_no_config_flag() {
         let root = common::scratch("load-home-agh");
@@ -870,9 +830,6 @@ mod files {
         assert!(refused.next.contains("agh.toml"), "{}", refused.next);
     }
 
-    /// agh.toml with a second hard link: `read_private` refuses it for the link, which no
-    /// chmod lifts, so the remedy is a private copy put in its place, never the mode's
-    /// chmod and its inverse.
     #[test]
     fn a_hard_linked_config_gets_a_private_copy_not_a_chmod() {
         let root = common::scratch("check-hardlink");
@@ -897,8 +854,6 @@ mod files {
         );
     }
 
-    /// `--config ~/x/agh.toml` reads the home directory's file (agh's path rule, token_file's),
-    /// never `./~/x/agh.toml`.
     #[test]
     fn policy_check_expands_a_home_config_path() {
         let root = common::scratch("check-tilde");
@@ -919,7 +874,6 @@ mod files {
         assert_eq!(value["config"], aterm_json::Value::from("~/x/agh.toml"));
     }
 
-    /// A relative `--config` is reported as `./…`, so it never reads as a `~/` path.
     #[test]
     fn policy_check_shows_a_relative_config_path_as_relative() {
         let root = common::scratch("check-relative");

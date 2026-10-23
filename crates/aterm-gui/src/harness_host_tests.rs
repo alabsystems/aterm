@@ -5469,6 +5469,8 @@ fn a_handed_self_claimed_line_survives_publication_into_the_crash_image() {
                     .is_some_and(|w| w.read.is_some())
             });
         } else {
+            // No carried line and no ALab image (the fixture's pid is no
+            // process): a vendor codex, which no successor watches (the
             // Codex screen lane's retirement, 2026-10-16).
             assert!(kept.is_none(), "a vendor codex is watched by nobody");
         }
@@ -18417,7 +18419,7 @@ fn a_pass_that_keeps_an_agent_owes_the_host_a_look() {
     handle.shutdown_and_join();
 }
 
-/// Discovery without a poll (the module doc), pinned without a clock.
+/// Discovery without a poll, pinned without a clock.
 #[test]
 fn a_host_with_nothing_to_supervise_owes_itself_only_the_disk_look() {
     let world = Arc::new(World::default());
@@ -21421,6 +21423,9 @@ fn a_crash_after_a_hand_over_conforms_to_the_commit_owed_model() {
             holds(&state);
         }
         if crash {
+            // The pass that reaps the worker handed over starts the one
+            // that reads the exit in the same hold, and that one ends
+            // once it has relaunched the agent: no worker left is that
             // worker's end.
             if commit {
                 until("the crash relaunched, its worker ended", || {
@@ -31169,6 +31174,7 @@ fn a_restored_queue_that_panics_starts_again_at_the_next_restore() {
         host.relaunch_restored(vec![restored("s-a")]);
         until("the first step", || !seen.lock().unwrap().is_empty());
         if panics {
+            // The worker is gone before the next restore: that restore
             // starts one of its own.
             until("the queue's worker ended", || host.restored_worker_ended());
         }

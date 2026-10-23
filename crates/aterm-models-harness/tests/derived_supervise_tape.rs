@@ -21,7 +21,6 @@ fn supervise_tape_recovery_fires_every_committed_move() {
     }
 }
 
-/// Each wrong reader breaks the law it was written to break, alone.
 #[test]
 fn each_wrong_reader_breaks_its_own_law() {
     let model = supervise_tape_recovery_model();
@@ -46,10 +45,6 @@ fn each_wrong_reader_breaks_its_own_law() {
     }
 }
 
-/// The ends a tape meets: a clean end comes back whole; a crash inside a frame
-/// loses only that frame and says so; damage before a whole frame is refused;
-/// damage to the last frame is a torn tail; whole frames out of place are
-/// refused.
 #[test]
 fn supervise_tape_recovery_walks_the_ends_a_tape_meets() {
     let m = supervise_tape_recovery_model();
@@ -131,7 +126,6 @@ fn supervise_tape_recovery_walks_the_ends_a_tape_meets() {
     );
 }
 
-/// Every move of model 2, each of which fires in both arms.
 const CURSOR_MOVES: [&str; 7] = [
     "AskNext",
     "AskOtherRead",
@@ -142,7 +136,6 @@ const CURSOR_MOVES: [&str; 7] = [
     "AskAfterDivergence",
 ];
 
-/// Model 2 in the arm `acts` (0: strict, 1: the acts scenario).
 fn cursor_arm(acts: i64) -> aterm_spec::derive::Model {
     interp::with_consts(
         &aterm_models_harness::supervise_replay_cursor_model(),
@@ -150,9 +143,6 @@ fn cursor_arm(acts: i64) -> aterm_spec::derive::Model {
     )
 }
 
-/// Tier-0 of `SuperviseReplayCursor` (model 2): proved at `Buggy = 0` and
-/// caught at `Buggy = 1` in both arms — the strict one the model commits to
-/// and the acts scenario — every move firing in each.
 #[test]
 fn supervise_replay_cursor_proves_and_catches() {
     for acts in [0, 1] {
@@ -172,8 +162,6 @@ fn supervise_replay_cursor_proves_and_catches() {
     }
 }
 
-/// Each wrong cursor breaks the law it was written to break, alone, in both
-/// arms.
 #[test]
 fn each_wrong_cursor_breaks_its_own_law() {
     for acts in [0, 1] {
@@ -198,11 +186,6 @@ fn each_wrong_cursor_breaks_its_own_law() {
     }
 }
 
-/// The strict cursor the way a replay meets its tape: every record asked in
-/// order is served to the end, and the end is a divergence, never a question
-/// to the world; a read the tape does not hold diverges where it is asked,
-/// before the act after it — and the lenient cursor resyncs across that act.
-/// A read asked again, or an act asked before its read, diverges too.
 #[test]
 fn supervise_replay_cursor_walks_a_replay() {
     let m = cursor_arm(0);
@@ -241,12 +224,6 @@ fn supervise_replay_cursor_walks_a_replay() {
     );
 }
 
-/// The acts cursor the way a counterfactual meets its tape: a read the
-/// segment served is served again, the closing act asked with the read
-/// before it unasked drops the read and moves to the next segment — no act
-/// skipped — and a read held only past the act is STALE, never resynced to
-/// nor answered from there; the mutant that answers it from there stands
-/// still and serves the future.
 #[test]
 fn supervise_replay_cursor_walks_a_counterfactual() {
     let m = cursor_arm(1);
@@ -283,8 +260,6 @@ fn supervise_replay_cursor_walks_a_counterfactual() {
     );
 }
 
-/// Tier-0 of `SupervisorRaisedLatch` (model 3): every move fires at the committed
-/// configuration (`aterm-models`' `non_vacuity` proves and catches it).
 #[test]
 fn supervisor_raised_latch_fires_every_committed_move() {
     use aterm_models_harness::supervisor_raised_latch_model;
@@ -298,7 +273,6 @@ fn supervisor_raised_latch_fires_every_committed_move() {
     }
 }
 
-/// The setter that tapes the flag itself breaks both laws, each alone.
 #[test]
 fn a_setter_that_tapes_the_flag_breaks_both_laws() {
     use aterm_models_harness::supervisor_raised_latch_model;
@@ -317,9 +291,6 @@ fn a_setter_that_tapes_the_flag_breaks_both_laws() {
     }
 }
 
-/// The flag raised between a read and the door after it: the loop's next read
-/// tapes it and the replay meets it there; the setter's own record sits in
-/// front of the door, and the replay diverges at the door.
 #[test]
 fn supervisor_raised_latch_walks_a_raise_between_read_and_door() {
     use aterm_models_harness::supervisor_raised_latch_model;

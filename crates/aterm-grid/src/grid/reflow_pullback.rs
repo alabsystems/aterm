@@ -216,6 +216,7 @@ impl Grid {
 
     /// Stage up to `want` of the newest history lines from lazy/tiered scrollback into the front of the ring.
     // COST: O(want × cols) for the lines, plus one splice of the ring's rows;
+    // `want` is bounded by the grow.
     pub(super) fn pull_history_into_ring(&mut self, want: usize) -> usize {
         if want == 0 || self.storage.scrollback_detached_for_reflow {
             return 0;

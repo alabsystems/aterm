@@ -794,6 +794,8 @@ fn hls_to_rgb(h: u32, l: u32, s: u32) -> u32 {
     let hue = (h + 240.0) % 360.0;
     let chroma_scale = 1.0 - (2.0 * l - 1.0).abs();
     let c = if chroma_scale > 0.0 && chroma_scale <= 1.0 && s > 0.0 && s <= 1.0 {
+        // Written as `mul_add(s, 0.0)` because the verifier's MIR lowering
+        // cannot discharge a float `Mul`/`Add` overflow-to-infinity check even
         // when operands are branch-pinned.
         chroma_scale.mul_add(s, 0.0)
     } else {
@@ -853,6 +855,9 @@ fn default_palette() -> Vec<u32> {
     ];
     let mut pal = vec![0u32; MAX_COLOR_REGISTERS];
     for (i, &(r, g, b)) in DEC.iter().enumerate() {
+        // `i < 16 <= MAX_COLOR_REGISTERS == pal.len()`, so this is always
+        // `Some`; the verifier reloads `pal.len()` and can't carry the
+        // `vec![_; 1024]` length, so index via get_mut (behavior-identical to
         // `pal[i] = …`).
         if let Some(slot) = pal.get_mut(i) {
             *slot = rgb_percent(r, g, b);

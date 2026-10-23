@@ -209,9 +209,6 @@ fn both_formats(bytes: &[u8]) -> [(&'static str, Vec<u8>); 2] {
     ]
 }
 
-/// A run's items, acts and waits between them, then its end, read back
-/// exactly: the header, every item, the end, a clean tail — with a frame that
-/// compressed and one that did not among them.
 #[test]
 fn a_written_tape_reads_back_whole_and_clean() {
     let mut rng = XorShift::new(7);
@@ -266,9 +263,6 @@ fn a_written_tape_reads_back_whole_and_clean() {
     assert!(said.text().is_empty());
 }
 
-/// One write per frame: the first holds the magic and the header; an act or
-/// a wait closes the open frame (an empty one writes nothing); a mark closes
-/// its frame; the end closes its frame and is the one sync.
 #[test]
 fn each_frame_is_one_write_closed_where_the_plan_closes_it() {
     let (mut w, sink, _) = writer();
@@ -305,7 +299,6 @@ fn each_frame_is_one_write_closed_where_the_plan_closes_it() {
     assert_eq!(sink.taken().writes.len(), 5, "nothing after the end");
 }
 
-/// With no act or wait, a frame closes once its raw items reach 64 KiB.
 #[test]
 fn a_frame_closes_at_64_kib_of_raw_items() {
     let mut rng = XorShift::new(3);
@@ -333,9 +326,6 @@ fn a_frame_closes_at_64_kib_of_raw_items() {
     );
 }
 
-/// Every byte-offset cut of a tape reads back the whole frames before the
-/// cut — said clean only at a frame's end, torn anywhere else — in either
-/// frame format.
 #[test]
 fn every_cut_reads_back_a_prefix_of_whole_frames() {
     let mut rng = XorShift::new(11);
@@ -372,10 +362,6 @@ fn every_cut_reads_back_a_prefix_of_whole_frames() {
     }
 }
 
-/// Every single-byte flip: one with a whole frame after it refuses the tape
-/// at the damaged frame (salvage keeps the frames before it); one in the last
-/// frame is the torn tail, and the frames before it come back — in either
-/// frame format.
 #[test]
 fn a_flip_before_a_whole_frame_is_refused_and_one_in_the_last_is_torn() {
     let mut rng = XorShift::new(5);
@@ -422,13 +408,6 @@ fn a_flip_before_a_whole_frame_is_refused_and_one_in_the_last_is_torn() {
     }
 }
 
-/// T3's review probe, asserted: of a tape of a header and four records
-/// frames, whole frames repeated, dropped or moved are refused where the
-/// first stands out of place, named by the place it was written at — the last
-/// frame repeated too: no crash writes a whole frame twice — and salvage keeps
-/// the frames before it, which are what was written. A tape that lost its
-/// last frame is a prefix of whole frames in place: clean, as a writer that
-/// died between the two leaves it, and only the run's missing end says so.
 #[test]
 fn whole_frames_out_of_place_are_refused_where_the_first_stands() {
     let mut rng = XorShift::new(41);
@@ -492,11 +471,6 @@ fn whole_frames_out_of_place_are_refused_where_the_first_stands() {
     );
 }
 
-/// The negative control: the same frames sealed as format 1 — the frame's
-/// kind its sum's only seed — read the probe's arrangements back clean, with
-/// items that are not what was written, and not even the moved frames' own:
-/// each reply stored against the one before it under its key is decoded
-/// against the wrong one.
 #[test]
 fn format_1_reads_whole_frames_out_of_place_clean() {
     let mut rng = XorShift::new(41);
@@ -565,11 +539,6 @@ const GOLDEN_FORMAT_1: &str = concat!(
     "010474657874029c040001310b000c455849542073746f70706564",
 );
 
-/// A format-1 tape, as the format-1 writer wrote it, reads as it always did:
-/// its header, its items and a clean end. And this build's tape of the same
-/// run, sealed as format 1 ([`as_format_1`]), is those very bytes, so the
-/// tests that read both formats read what the format-1 writer wrote; its own
-/// bytes differ only in the magic's number and each frame's sum.
 #[test]
 fn a_format_1_tape_reads_as_it_always_did() {
     let golden = aterm_codec::hex::decode_vec(GOLDEN_FORMAT_1.as_bytes()).expect("hex");
@@ -604,12 +573,6 @@ const GOLDEN_FORMAT_2: &str = concat!(
     "010474657874029c040001310b000c455849542073746f70706564",
 );
 
-/// A format-2 tape, as the format-2 writer wrote it, reads as it always did:
-/// its header, its items and a clean end, every frame in its place. The
-/// places its sums name are format 2's own, whatever format a later build
-/// writes: read first, so a build that changes how format 2 names a place
-/// fails here, not by reading every format-2 tape as a first write that tore.
-/// And this build still writes those very bytes.
 #[test]
 fn a_format_2_tape_reads_as_it_always_did() {
     let golden = aterm_codec::hex::decode_vec(GOLDEN_FORMAT_2.as_bytes()).expect("hex");
@@ -636,9 +599,6 @@ fn a_format_2_tape_reads_as_it_always_did() {
     assert_eq!(bytes, golden, "this build writes format 2's bytes");
 }
 
-/// A magic whose format byte the damage turned into the other format's is
-/// refused at the magic, not read as a first write that tore: the header is
-/// whole only as the format the frames were written in.
 #[test]
 fn a_magic_naming_the_other_format_is_refused() {
     let (bytes, _) = golden_run();
@@ -659,11 +619,6 @@ fn a_magic_naming_the_other_format_is_refused() {
     }
 }
 
-/// The place a format-2 sum names is read back for every place a test tape
-/// holds and the last a writer's can; a sum damaged in any one bit, or in any
-/// one byte under the bind's three masks, names no place at all (so a damaged
-/// last frame stays the torn tail); and the word a format-1 sum leaves names
-/// none either.
 #[test]
 fn a_place_reads_back_and_a_damaged_sum_names_none() {
     let mut damages: Vec<u64> = (0..64).map(|bit| 1u64 << bit).collect();
@@ -685,8 +640,6 @@ fn a_place_reads_back_and_a_damaged_sum_names_none() {
     assert_eq!(place_named(0, 0), None, "a format-1 sum names no place");
 }
 
-/// Bytes that are no tape, a tape of another frame format, a tape cut at its
-/// magic, an empty file, and frames that are whole but wrong in their place.
 #[test]
 fn what_is_not_a_tape_of_this_build_is_named() {
     let fault = |r: Recovered| match r.tail {
@@ -751,9 +704,6 @@ fn what_is_not_a_tape_of_this_build_is_named() {
     ));
 }
 
-/// At the cap the writer writes `Mark::Truncated` naming the first effect it
-/// did not keep, and stops: the prefix reads back clean, the tape is within
-/// the cap, and the end still makes it durable.
 #[test]
 fn the_cap_leaves_a_truncation_mark_and_stops() {
     let mut rng = XorShift::new(13);
@@ -789,8 +739,6 @@ fn the_cap_leaves_a_truncation_mark_and_stops() {
     assert!(said.text().is_empty(), "the cap is no failure");
 }
 
-/// A sink that refuses every write: the writer says so once, stops, and
-/// never panics or reaches its caller, whatever the loop then appends.
 #[test]
 fn a_sink_that_refuses_every_write_is_said_once() {
     let sink = Memory::default();
@@ -823,8 +771,6 @@ fn a_sink_that_refuses_every_write_is_said_once() {
     assert_eq!(sink.taken().syncs, 0);
 }
 
-/// A sink that fails partway through — the disk filling inside a frame's
-/// write — leaves whole frames and then the torn tail; the writer stops there.
 #[test]
 fn a_sink_that_fails_midway_leaves_whole_frames_then_a_torn_tail() {
     let sink = Memory::default();
@@ -853,9 +799,6 @@ fn a_sink_that_fails_midway_leaves_whole_frames_then_a_torn_tail() {
     assert_eq!(said.text().lines().count(), 1);
 }
 
-/// A file sink's end flush is only ordered (aterm-durable's counting seam): the
-/// tape is a diagnostic record whose torn tail recovery reports, kept ahead of
-/// the run's later writes and promised to nothing off the device.
 #[test]
 fn a_file_sinks_end_flush_is_ordered() {
     let dir = crate::supervise::ScratchDir::new("tape", "file-sink");

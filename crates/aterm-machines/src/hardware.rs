@@ -174,6 +174,7 @@ pub fn internal_disk(text: &str) -> Option<Disk> {
     let mut devices: Vec<Device> = Vec::new();
     let mut reading = Reading::Other;
     for line in text.lines() {
+        // A device starts each subtree at the first column; its driver and medium are drawn
         // under it (`  +-o`, `    +-o`), their properties behind `|` and spaces.
         if line.starts_with("+-o ") {
             devices.push(Device::default());

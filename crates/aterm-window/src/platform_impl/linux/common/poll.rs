@@ -101,8 +101,6 @@ mod tests {
         assert_eq!(timeout_millis(Some(Duration::MAX)), libc::c_int::MAX);
     }
 
-    /// A wake from another thread ends a wait with no deadline; the wake is
-    /// gone once drained, so the next zero-length wait finds nothing.
     #[test]
     fn a_wake_from_another_thread_ends_the_wait_and_drains() {
         let waker = Waker::new().expect("eventfd");
@@ -121,7 +119,6 @@ mod tests {
         assert!(!ready(&fds[0]), "a drained wake fired again");
     }
 
-    /// Many wakes before the loop looks are one wake, and none blocks.
     #[test]
     fn repeated_wakes_coalesce() {
         let waker = Waker::new().expect("eventfd");

@@ -2,11 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! PROTECTED and WIDE_CONTINUATION share bit 10. The char-op fixups use the
-//! context-aware `is_cell_wide_continuation` so they never misread a
-//! DECSCA-protected cell as a spacer; `fixup_wide_boundary` keeps its ' '
-//! spacer heuristic only when `clear_orphan_spacers` is set (whole-row rect
-//! copies), not for the DECLRMM column shifts.
+//! Tests for bit-10 `PROTECTED` and `WIDE_CONTINUATION` disambiguation in row operations.
 
 use super::*;
 use crate::{Cell, CellFlags, PackedColor};
@@ -35,8 +31,6 @@ fn ch(row: &Row, col: u16) -> char {
 
 #[test]
 fn ich_preserves_left_neighbor_and_shifts_protected_cell() {
-    // ICH at a DECSCA-protected cell must not blank the untouched left neighbor and
-    // must shift the protected cell right (not destroy it).
     let (_p, mut row) = make_row(10);
     *row.get_mut(0).unwrap() = normal('X');
     *row.get_mut(1).unwrap() = protected('Y');
@@ -58,7 +52,6 @@ fn ich_preserves_left_neighbor_and_shifts_protected_cell() {
 
 #[test]
 fn dch_preserves_left_neighbor() {
-    // DCH at a protected cell must not blank the cell left of the deletion range.
     let (_p, mut row) = make_row(10);
     *row.get_mut(0).unwrap() = normal('X');
     *row.get_mut(1).unwrap() = protected('Y');
@@ -80,7 +73,6 @@ fn dch_preserves_left_neighbor() {
 
 #[test]
 fn dch_preserves_protected_cell_shifting_into_the_gap() {
-    // A protected cell shifting into the deletion point survives.
     let (_p, mut row) = make_row(10);
     *row.get_mut(0).unwrap() = normal('X');
     *row.get_mut(1).unwrap() = normal('A');
@@ -98,7 +90,6 @@ fn dch_preserves_protected_cell_shifting_into_the_gap() {
 
 #[test]
 fn ech_preserves_left_neighbor() {
-    // ECH over a protected cell must not blank the cell left of the erase range.
     let (_p, mut row) = make_row(10);
     *row.get_mut(0).unwrap() = normal('B');
     *row.get_mut(1).unwrap() = protected('C');
@@ -114,8 +105,6 @@ fn ech_preserves_left_neighbor() {
 
 #[test]
 fn bounded_ich_dch_preserve_protected_cell_outside_the_margin() {
-    // The DECLRMM bounded variants: a protected cell just left of the margin
-    // (cells[col-1], outside [col, right_bound)) survives.
     let (_p, mut row) = make_row(10);
     *row.get_mut(1).unwrap() = normal('L'); // just left of the region
     *row.get_mut(2).unwrap() = protected('P'); // region left edge (cursor)
@@ -139,13 +128,10 @@ fn bounded_ich_dch_preserve_protected_cell_outside_the_margin() {
 
 #[test]
 fn fixup_wide_boundary_preserves_protected_visible_cells() {
-    // The orphan-continuation branches blank only ' ' spacers, never a
-    // protected visible cell.
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
     let _ = (fg, bg);
 
-    // Left branch: protected 'Z' at `left` with a non-wide left neighbor.
     let (_p, mut row) = make_row(10);
     *row.get_mut(2).unwrap() = normal('A'); // left-1, not WIDE
     *row.get_mut(3).unwrap() = protected('Z'); // bit 10 set, but visible text
@@ -156,7 +142,6 @@ fn fixup_wide_boundary_preserves_protected_visible_cells() {
         "protected visible cell at the boundary must survive"
     );
 
-    // Right branch: protected 'Q' at right+1 (outside the region), non-wide at right.
     let (_p2, mut row2) = make_row(10);
     *row2.get_mut(5).unwrap() = normal('B'); // `right`, not WIDE
     *row2.get_mut(6).unwrap() = protected('Q'); // right+1, outside [left,right]
@@ -170,14 +155,9 @@ fn fixup_wide_boundary_preserves_protected_visible_cells() {
 
 #[test]
 fn write_paths_do_not_destroy_left_neighbor_when_overwriting_a_protected_cell() {
-    // The write-path wide fixups (write_char / write_char_packed, fill_cell_run,
-    // write_wide_char_packed) overwriting a DECSCA-protected cell at col leave
-    // the cell at col-1 alone. A wide char elsewhere in the row sets
-    // HAS_WIDE_CHARS so the fixup path runs.
     use crate::PackedColors;
     let colors = PackedColors::DEFAULT;
 
-    // Path (b): write_char_packed → fixup_wide_char_overwrite.
     let (_p, mut row) = make_row(10);
     row.write_wide_char_packed(5, '\u{4E2D}', colors, CellFlags::empty()); // sets HAS_WIDE_CHARS
     row.write_char_packed(0, 'A', colors, CellFlags::empty());
@@ -190,7 +170,6 @@ fn write_paths_do_not_destroy_left_neighbor_when_overwriting_a_protected_cell() 
     );
     assert_eq!(ch(&row, 1), 'X');
 
-    // Path (c): write_char (unstyled).
     let (_p2, mut row2) = make_row(10);
     row2.write_wide_char_packed(5, '\u{4E2D}', colors, CellFlags::empty());
     row2.write_char_packed(0, 'A', colors, CellFlags::empty());
@@ -202,7 +181,6 @@ fn write_paths_do_not_destroy_left_neighbor_when_overwriting_a_protected_cell() 
         "path C: write_char destroyed the left neighbor"
     );
 
-    // Path (a): fill_cell_run → fixup_wide_chars_in_range.
     let (_p3, mut row3) = make_row(10);
     row3.write_wide_char_packed(5, '\u{4E2D}', colors, CellFlags::empty());
     row3.write_char_packed(0, 'A', colors, CellFlags::empty());
@@ -214,7 +192,6 @@ fn write_paths_do_not_destroy_left_neighbor_when_overwriting_a_protected_cell() 
         "path A: fill_cell_run destroyed the left neighbor"
     );
 
-    // Path (d): write_wide_char_packed → fixup_wide_char_write, starting on a protected cell.
     let (_p4, mut row4) = make_row(10);
     row4.write_wide_char_packed(7, '\u{4E2D}', colors, CellFlags::empty());
     row4.write_char_packed(0, 'A', colors, CellFlags::empty());
@@ -229,7 +206,6 @@ fn write_paths_do_not_destroy_left_neighbor_when_overwriting_a_protected_cell() 
 
 #[test]
 fn write_over_a_genuine_wide_continuation_still_clears_the_orphaned_head() {
-    // Overwriting a genuine wide continuation still clears its head.
     use crate::PackedColors;
     let colors = PackedColors::DEFAULT;
     let (_p, mut row) = make_row(10);
@@ -246,12 +222,8 @@ fn write_over_a_genuine_wide_continuation_still_clears_the_orphaned_head() {
 
 #[test]
 fn fixup_wide_boundary_suppressed_preserves_protected_spaces() {
-    // The DECLRMM column shifts pass clear_orphan_spacers=false, so a protected
-    // space at the boundary (indistinguishable from an orphaned spacer)
-    // survives, including one column past the right margin.
     let protected_space = protected(' ');
 
-    // Left boundary: protected space at `left`, non-wide left neighbor.
     let (_p, mut row) = make_row(10);
     *row.get_mut(2).unwrap() = normal('A'); // left-1, not WIDE
     *row.get_mut(3).unwrap() = protected_space; // bit 10 set, char ' '
@@ -261,7 +233,6 @@ fn fixup_wide_boundary_suppressed_preserves_protected_spaces() {
         "suppressed mode must not clear a protected space at the left boundary"
     );
 
-    // Right boundary: protected space at right+1 (outside the operated region).
     let (_p2, mut row2) = make_row(10);
     *row2.get_mut(5).unwrap() = normal('B'); // `right`, not WIDE
     *row2.get_mut(6).unwrap() = protected_space; // right+1, outside [left,right]
@@ -274,8 +245,6 @@ fn fixup_wide_boundary_suppressed_preserves_protected_spaces() {
 
 #[test]
 fn fixup_wide_boundary_suppressed_still_clears_dangling_wide_heads() {
-    // The unambiguous branches (a dangling WIDE head) run even with
-    // clear_orphan_spacers=false.
     let wide = |c: char| {
         Cell::with_style(
             c,
@@ -285,7 +254,6 @@ fn fixup_wide_boundary_suppressed_still_clears_dangling_wide_heads() {
         )
     };
 
-    // Left: dangling WIDE head at left-1 (left is a normal, non-continuation cell).
     let (_p, mut row) = make_row(10);
     *row.get_mut(2).unwrap() = wide('中'); // left-1 = 2, WIDE head
     *row.get_mut(3).unwrap() = normal('N'); // left = 3, NOT a continuation
@@ -295,7 +263,6 @@ fn fixup_wide_boundary_suppressed_still_clears_dangling_wide_heads() {
         "dangling wide head at left-1 must still be cleared in suppressed mode"
     );
 
-    // Right: dangling WIDE head at `right` (right+1 is a normal, non-continuation cell).
     let (_p2, mut row2) = make_row(10);
     *row2.get_mut(5).unwrap() = wide('中'); // right = 5, WIDE head
     *row2.get_mut(6).unwrap() = normal('N'); // right+1 = 6, NOT a continuation

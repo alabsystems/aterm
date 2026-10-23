@@ -29,18 +29,6 @@ fn predicate(bounded: &dyn ToTokens, bound: &TokenStream) -> TokenStream {
     out.into_iter().collect()
 }
 
-// Puts the given bound on any generic type parameters that are used in fields
-// for which filter returns true.
-//
-// For example, the following struct needs the bound `A: Serialize, B:
-// Serialize`.
-//
-//     struct S<'b, A, B: 'b, C> {
-//         a: A,
-//         b: Option<&'b B>
-//         #[serde(skip_serializing)]
-//         c: C,
-//     }
 pub fn with_bound(
     cont: &Container,
     generics: &Generics,
@@ -52,17 +40,10 @@ pub fn with_bound(
     }
 
     struct FindTyParams {
-        // Set of all generic type parameters on the current struct (A, B, C in
-        // the example). Initialized up front.
         all_type_params: HashSet<String>,
 
-        // Set of generic type parameters used in fields for which filter
-        // returns true (A and B in the example). Filled in as the visitor sees
-        // them.
         relevant_type_params: HashSet<String>,
 
-        // Fields whose type is an associated type of one of the generic type
-        // parameters.
         associated_type_usage: Vec<TokenStream>,
     }
 
@@ -83,8 +64,6 @@ pub fn with_bound(
             if let Some(seg) = path.segments.last()
                 && seg.ident.to_string() == "PhantomData"
             {
-                // Hardcoded exception, because PhantomData<T> implements
-                // Serialize and Deserialize whether or not T implements it.
                 return;
             }
             if !path.leading_colon && path.segments.len() == 1 {
@@ -97,8 +76,6 @@ pub fn with_bound(
                 self.visit_path_arguments(&segment.args);
             }
         }
-
-        // Everything below is simply traversing the syntax tree.
 
         fn visit_type(&mut self, ty: &Ty) {
             match ty {
@@ -134,12 +111,6 @@ pub fn with_bound(
                         self.visit_type(elem);
                     }
                 }
-                // Type parameter should not be considered used by a macro path.
-                //
-                //     struct TypeMacro<T> {
-                //         mac: T!(),
-                //         marker: PhantomData<T>,
-                //     }
                 Ty::Macro(_) | Ty::Infer | Ty::Never | Ty::Other => {}
             }
         }
@@ -262,8 +233,7 @@ pub fn with_lifetime_bound(generics: &Generics, lifetime: &str) -> Generics {
     }
 }
 
-/// `Ident<params as arguments>`, upstream's spelling of the item's own type in
-/// a bound (`<>` when there are no parameters).
+/// `Ident<params as arguments>`.
 fn type_of_item(cx: &Errors, cont: &Container) -> Option<TokenStream> {
     let mut out = vec![TokenTree::Ident(cont.ident.clone()), punct('<')];
     for (i, param) in cont.generics.params.iter().enumerate() {

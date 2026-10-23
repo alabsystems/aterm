@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! The small model-walking helpers the Tier-0 tests share (`aterm_spec::walk`): one
-//! copy, beside the interpreter they drive, for every `aterm-models-*` suite.
+
+//! Model-walking helpers shared by Tier-0 `aterm-models-*` test suites.
 
 use crate::derive::Model;
 use crate::interp::State;
 
-/// `m` with only the invariant `name` kept: the interpreter's whole-space
-/// check of that one claim.
+/// Returns a clone of `m` retaining only the invariant named `name`.
 pub fn only(m: &Model, name: &str) -> Model {
     let mut one = m.clone();
     one.invariants.retain(|inv| inv.name == name);
@@ -16,8 +14,7 @@ pub fn only(m: &Model, name: &str) -> Model {
     one
 }
 
-/// Fire `actions` in order from `m`'s initial state, each one required to be
-/// enabled.
+/// Fires `actions` in order from `m`'s initial state, asserting each is enabled.
 pub fn walk(m: &Model, actions: &[&str]) -> State {
     let mut state = m.init_state();
     for action in actions {

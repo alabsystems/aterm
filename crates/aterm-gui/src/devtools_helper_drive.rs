@@ -12,6 +12,8 @@ const NOT_RUN: i32 = 2;
 /// Drives the Developer Tools helper panel views and returns the process exit code.
 #[must_use]
 pub fn run_devtools_helper_drive(snapshots: Option<&Path>) -> i32 {
+    // The drive is a windowed process of its own: it makes the application
+    // object and builds AppKit views, so it mints the proof a windowed launch
     // carries and hands it to the body that sends `+sharedApplication`.
     run(crate::platform::Windowed::launch(), snapshots)
 }
@@ -106,7 +108,7 @@ fn run(_windowed: crate::platform::Windowed, out: Option<&Path>) -> i32 {
 }
 
 /// A list row.
-fn list(listing: DevToolListing, label: DevToolListLabel, rows: Option<u32>) -> DevToolList {
+const fn list(listing: DevToolListing, label: DevToolListLabel, rows: Option<u32>) -> DevToolList {
     DevToolList {
         listing,
         label,

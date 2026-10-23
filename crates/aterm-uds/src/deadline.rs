@@ -512,6 +512,29 @@ fn output_by(
 }
 
 /// Kernel-backed wait handle for a single child process's exit.
+///
+/// Make it while the child is unreaped (right after the spawn), then alternate `try_wait`
+/// with [`ExitWait::wait`]:
+///
+/// ```no_run
+/// use std::{io, process::ExitStatus, time::Instant};
+/// use aterm_uds::{deadline::ExitWait, spawnfd::Child};
+///
+/// // On timeout the caller still owns the live child and decides how to end it.
+/// fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+///     let mut exit = ExitWait::new(child);
+///     loop {
+///         if let Some(status) = child.try_wait()? {
+///             return Ok(Some(status));
+///         }
+///         let remaining = deadline.saturating_duration_since(Instant::now());
+///         if remaining.is_zero() {
+///             return Ok(None);
+///         }
+///         exit.wait(remaining);
+///     }
+/// }
+/// ```
 #[derive(Debug)]
 pub struct ExitWait {
     /// Readable once the child has exited; `None` without such a descriptor, or once it has

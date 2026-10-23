@@ -14,10 +14,6 @@ use std::sync::Arc;
 
 use aterm_objc::{Id, Obj, Sel, autoreleasepool, class, msg, ns_string, ns_string_to_rust, sel};
 
-/// Every Rust string survives the trip exactly, including the two characters a
-/// C-string or byte-order-mark reading loses: U+0000 (a pasted `a\0b` read
-/// back as `a`) and a leading U+FEFF (which `initWithBytes:length:encoding:`
-/// strips as a BOM).
 #[test]
 fn ns_string_round_trips_every_rust_string_exactly() {
     autoreleasepool(|_| {
@@ -45,9 +41,6 @@ fn ns_string_round_trips_every_rust_string_exactly() {
     });
 }
 
-/// An `NSString` can hold an unpaired surrogate (a pasteboard or text-input
-/// string cut mid-pair), which no Rust `String` can: it reads back as U+FFFD
-/// with the rest of the text intact, not as an empty string.
 #[test]
 fn an_unpaired_surrogate_reads_as_a_replacement_character() {
     autoreleasepool(|_| {
@@ -75,8 +68,6 @@ fn an_unpaired_surrogate_reads_as_a_replacement_character() {
 #[test]
 fn owned_and_retained_balance_exactly() {
     autoreleasepool(|_| {
-        // A plain NSObject: a short NSString is an immortal tagged pointer whose `-retainCount`
-        // is `UINT64_MAX`, and the arithmetic below would overflow.
         // SAFETY: `+alloc`/`-init` on NSObject return a +1 instance this `Obj`
         // adopts and releases exactly once.
         let obj = unsafe {
@@ -113,7 +104,6 @@ fn from_owned_and_retain_reject_nil() {
 #[test]
 fn an_error_description_is_read_out_of_a_real_nserror() {
     autoreleasepool(|_| {
-        // Build a real NSError rather than asserting on the nil path only.
         let domain = ns_string("ATermTestDomain").expect("NSString");
         // SAFETY: `+errorWithDomain:code:userInfo:` is a documented Foundation
         // constructor returning an autoreleased NSError; the pool above owns it.
@@ -146,8 +136,6 @@ fn an_error_description_is_read_out_of_a_real_nserror() {
 
 #[test]
 fn a_pool_scope_is_a_pure_nesting() {
-    // Nested scopes pop in reverse order without disturbing each other; scopes are the only way
-    // this crate lets a second pool exist without `unsafe`.
     let text = autoreleasepool(|_outer| {
         autoreleasepool(|_inner| {
             let s = ns_string("nested").expect("NSString");
@@ -160,8 +148,6 @@ fn a_pool_scope_is_a_pure_nesting() {
 
 #[test]
 fn a_scope_pops_its_pool_even_when_the_body_unwinds() {
-    // The pool is a local of `autoreleasepool`'s frame, so unwinding pops it. A skipped pop would
-    // make the next pool on this thread pop against a stack the runtime disagrees with.
     let caught = std::panic::catch_unwind(|| {
         autoreleasepool(|_| {
             let s = ns_string("about to unwind").expect("NSString");
@@ -170,7 +156,6 @@ fn a_scope_pops_its_pool_even_when_the_body_unwinds() {
         })
     });
     assert!(caught.is_err());
-    // A pool pushed after the unwind still pops cleanly; a leaked token would kill the binary here.
     let after = autoreleasepool(|_| {
         let s = ns_string("after").expect("NSString");
         // SAFETY: `s` is a live +1 NSString owned by this scope.
@@ -181,8 +166,6 @@ fn a_scope_pops_its_pool_even_when_the_body_unwinds() {
 
 #[test]
 fn utf8_string_of_a_nil_receiver_is_empty() {
-    // nil is a legal receiver and a send to it returns zero, which is why `Id` is a raw pointer,
-    // not a `NonNull`.
     // SAFETY: sending to nil is defined by the runtime and returns 0/null.
     let p: *const c_char = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
@@ -193,7 +176,6 @@ fn utf8_string_of_a_nil_receiver_is_empty() {
     assert_eq!(unsafe { ns_string_to_rust(Id::NIL) }, "");
 }
 
-/// Fills the stack depth the next call at this level will occupy with 0xAB.
 #[inline(never)]
 fn poison_the_next_frame() -> u64 {
     let junk = [0xABu8; 1024];
@@ -201,9 +183,6 @@ fn poison_the_next_frame() -> u64 {
     junk.iter().map(|&b| u64::from(b)).sum()
 }
 
-/// `send_rect` on nil with the result held in this frame, so its return slot is stack
-/// [`poison_the_next_frame`] just filled with 0xAB. Called from the test body, the slot would be
-/// the test's own clean local and read zero by luck.
 #[inline(never)]
 fn nil_rect_in_a_poisoned_frame() -> [u64; 4] {
     // SAFETY: `-frame` is `-(NSRect)frame`, and nil is a valid receiver.
@@ -217,9 +196,6 @@ fn nil_rect_in_a_poisoned_frame() -> [u64; 4] {
     ]
 }
 
-/// A nil receiver on `send_rect` returns a zero rect on both arches. A 32-byte CGRect is an
-/// indirect (`objc_msgSend_stret`) return on x86_64, which libobjc's nil path leaves unwritten,
-/// and register-class (d0-d3) on arm64, which it zeroes.
 #[test]
 fn a_nil_receiver_returns_a_zero_rect_on_this_arch() {
     for _ in 0..8 {
@@ -229,13 +205,8 @@ fn a_nil_receiver_returns_a_zero_rect_on_this_arch() {
     }
 }
 
-// The selector cache under a hard concurrent first use.
-
 #[test]
 fn the_sel_cache_is_correct_under_a_hard_concurrent_first_use() {
-    // Many threads, many distinct slots, every first use racing: the relaxed
-    // store must be benign by value, every thread seeing the same interned
-    // pointer, equal to the uncached lookup.
     const THREADS: usize = 16;
     let barrier = Arc::new(std::sync::Barrier::new(THREADS));
     let mut handles = Vec::new();

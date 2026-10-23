@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The live test's child (dev-only, `tests/live.rs`): for each line it reads
-//! on stdin it reads every clock the lab's clock library shifts and every
-//! clock it leaves, once each, and prints them on one line of stdout as
-//! `name=nanoseconds` words; it reads no clock between lines, and ends at end
-//! of input. Loaded with the library, its readings show which clocks a step
-//! of the offset moved.
+//! Dev-only probe child that prints nanosecond readings for each clock on every input line.
 
 #[cfg(target_os = "macos")]
 mod probe {

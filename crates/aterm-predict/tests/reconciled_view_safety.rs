@@ -1,58 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Safety theorem for predictive local echo: predictions never corrupt the
-//! reconciled view across any interleaving of typing, program output, and time.
-//!
-//! ## Views and coordinate space
-//!
-//! * **Authoritative view (`A`)**: `aterm-core`'s `Terminal` fed only program
-//!   output and read through `cell_frame_into` / `visual_col`.
-//! * **Overlay (`O`)**: `Predictor::overlay(now)` after `reconcile` against `A`.
-//! * **Displayed view (`D`)**: `A` with `O` painted via
-//!   `RenderInput::paint_prediction_ghost` or `paint_prediction_span`.
-//! * **Coordinate space**: `(coordinate_generation, screen_epoch)` on the main
-//!   screen at the armed geometry.
-//!
-//! ## Clauses
-//!
-//! * **Locality**: `D` differs from `A` only at `O`'s cells, never on half of a
-//!   wide glyph; every guess in `O` is in bounds and on a distinct cell.
-//! * **Provenance**: Every guess in `O` matches the keystroke and coordinate
-//!   space it was armed in. State chains match an independent key fold
-//!   (`Sim::oracle_check`) over the last matched authoritative screen.
-//! * **Secrecy (Adaptive)**: Keys typed into a visible no-echo prompt are never
-//!   in `O`.
-//! * **Fidelity (Adaptive)**: Without intervening unprompted output, a space
-//!   change, or a predecessor whose output arrived past the predictor's glitch
-//!   window (`Sim::late_predecessor`), a displayed guess's echo lands on the
-//!   cell it was painted on.
-//! * **Frame fidelity (Adaptive)**: On a settled base within fidelity's scope,
-//!   every displayed frame matches the screen its newest painted guess's output
-//!   settles to (`Sim::settled`), except stale italic decoration cells and
-//!   vacated blanks under newly drawn decoration.
-//! * **Timeliness**: Every ghost on glass is still pending and younger than the
-//!   predictor's glitch window (at most 2 s).
-//! * **Attribution**: Every guess credited with its echo has had its own output
-//!   begin (`Sim::attributed`), within the link model's scope and on a boundary
-//!   between keys' output.
-//! * **Atomicity**: A state chain paints all of its displayed cells or none.
-//! * **Cursor locality**: A state chain's drawn cursor is in bounds and never
-//!   on a wide glyph's continuation cell.
-//! * **Eventual**: Once all keys are read, all output is delivered, and the
-//!   clock passes the 2 s ceiling, `O` is empty and `D = A`.
-//!
-//! ## Simulation and negative controls
-//!
-//! `common/world.rs` drives `Sim` with deterministic `XorShift` op streams and
-//! shrinks any failure by delta debugging. Every clause and predictor [`Rule`]
-//! is guarded by mutant negative controls in [`MUTANT_HOSTS`] and [`named_cases`].
+//! Safety theorem for predictive local echo across typing, program output, and time.
 
 use aterm_predict::{GhostCell, PredictMode, Rule};
 
 use crate::world::*;
 
-/// Checks the safety theorem across all shipped configurations.
 #[test]
 fn a_prediction_never_corrupts_the_reconciled_view() {
     let mut adaptive = Stats::default();
@@ -79,7 +33,6 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
         configs.len() / 2,
         configs.len() / 2
     );
-    // Non-vacuity floors across clauses and lanes.
     let all_cases = (CASES * faithful_configs().len() / 2) as u64;
     assert_eq!(adaptive.settled_cases, all_cases, "{adaptive:?}");
     assert_eq!(always.settled_cases, all_cases, "{always:?}");
@@ -223,17 +176,14 @@ fn a_prediction_never_corrupts_the_reconciled_view() {
     );
 }
 
-/// Additional seed indices swept alongside [`SEED`] (index 0).
 const SWEPT_SEED_INDICES: std::ops::RangeInclusive<u64> = 1..=2;
 
-/// Checks the safety theorem over [`SWEPT_SEED_INDICES`].
 #[test]
 fn a_prediction_never_corrupts_the_reconciled_view_over_more_seeds() {
     let failures = sweep_seed_indices(SWEPT_SEED_INDICES);
     assert!(failures.is_empty(), "{}", failures.join("\n=====\n"));
 }
 
-/// On-demand 1000-seed sweep across all faithful configurations.
 #[test]
 #[ignore = "the review's sweep: 8000 sweeps of 600 cases, minutes on every core"]
 fn a_prediction_never_corrupts_the_reconciled_view_over_a_thousand_seeds() {
@@ -249,7 +199,6 @@ fn a_prediction_never_corrupts_the_reconciled_view_over_a_thousand_seeds() {
     );
 }
 
-/// Verifies that every mutant in [`MUTANT_HOSTS`] fails its declared [`Host::breaks`] clause.
 #[test]
 fn the_checker_catches_every_mutant_host_in_its_clause() {
     let missed = aterm_spec::check::each(&MUTANT_HOSTS, |&host| {
@@ -280,7 +229,6 @@ fn the_checker_catches_every_mutant_host_in_its_clause() {
     assert!(missed.is_empty(), "{}", missed.join("\n"));
 }
 
-/// Directed fidelity regressions from early interleaving reviews.
 #[test]
 fn the_reviewed_interleavings_hold() {
     let adaptive = adaptive_remote();
@@ -297,7 +245,6 @@ fn the_reviewed_interleavings_hold() {
     }
 }
 
-/// Directed fidelity interleavings checked by [`the_reviewed_interleavings_hold`].
 fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
     let proven_line = [
         Op::Key(0, 1),
@@ -311,7 +258,6 @@ fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
     ];
     [
         (
-            // Guess retired without credit by an earlier key's echo still owes its own echo.
             "a guess retired without credit owes its own echo",
             [
                 &[
@@ -345,7 +291,6 @@ fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
             .concat(),
         ),
         (
-            // Pane swap away and back preserves the owed echo.
             "a tab switched away and back keeps its owed echo",
             [
                 &proven_line[..],
@@ -366,7 +311,6 @@ fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
             .concat(),
         ),
         (
-            // Key refused at the no-echo gate still owes its echo.
             "a key refused at the no-echo gate is owed",
             [
                 &proven_line[..],
@@ -399,16 +343,13 @@ fn reviewed_interleavings() -> [(&'static str, Vec<Op>); 3] {
     ]
 }
 
-/// Directed interleaving that holds under [`Host::Faithful`] and breaks each mutant's clause.
 struct NamedCase {
     name: &'static str,
     cfg: Config,
     ops: Vec<Op>,
-    /// Mutants that must fail [`Host::breaks`] on this case.
     mutants: Vec<Host>,
 }
 
-/// Adaptive, remote, narrow configuration.
 fn adaptive_remote() -> Config {
     Config {
         mode: PredictMode::Adaptive,
@@ -424,7 +365,6 @@ fn adaptive_remote() -> Config {
     }
 }
 
-/// Press `key`, read it, and deliver its echo over a 60 ms link.
 fn echoed(key: Op) -> [Op; 4] {
     [key, Op::Program(1, 0), Op::Advance(60), Op::Deliver(1024)]
 }
@@ -432,7 +372,6 @@ fn echoed(key: Op) -> [Op; 4] {
 fn named_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // Expired guess owes its late echo inside the predictor's glitch window.
             name: "an_expired_guess_s_late_echo_is_owed",
             cfg: Config {
                 remote: false,
@@ -456,7 +395,6 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ExpiryOwes)],
         },
         NamedCase {
-            // Mid-line insert shifting a tail right of the cursor does not prove the epoch.
             name: "mid_line_over_a_space",
             cfg: adaptive_remote(),
             ops: [
@@ -475,14 +413,12 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::TailGuard), Host::TailBlind],
         },
         NamedCase {
-            // Uncredited retirement owes only its own glyph.
             name: "a_guess_retired_without_credit_owes_its_own_glyph",
             cfg: adaptive_remote(),
             ops: reviewed_interleavings()[0].1.clone(),
             mutants: vec![Host::Rule(Rule::TypedOwesSameGlyph)],
         },
         NamedCase {
-            // Cancelled glyph owes its echo so it cannot credit a subsequent same-glyph guess.
             name: "a_cancelled_glyph_leaves_its_cell_as_the_anchor",
             cfg: Config {
                 remote: false,
@@ -508,7 +444,6 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CancelOwes)],
         },
         NamedCase {
-            // Cancelled glyph at the right margin does not wrap the next guess.
             name: "a_cancelled_glyph_at_the_margin_does_not_wrap_the_next",
             cfg: Config {
                 remote: false,
@@ -545,7 +480,6 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // Mid-line glyph echoed before its shifted tail redraws voids the standing proof.
             name: "a_glyph_echoed_before_its_tail_moves_proves_nothing_after",
             cfg: Config {
                 editor: Editor::Readline,
@@ -573,7 +507,6 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StandingTail)],
         },
         NamedCase {
-            // Guesses typed over an autosuggestion require cursor advance before retirement.
             name: "cursor_advance_is_the_echo_s_evidence",
             cfg: adaptive_remote(),
             ops: {
@@ -627,7 +560,6 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CursorAdvance)],
         },
         NamedCase {
-            // Uncredited retirement voids the epoch proof on its cell.
             name: "an_uncredited_retirement_leaves_no_proof",
             cfg: Config {
                 remote: false,
@@ -654,7 +586,6 @@ fn named_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::UncreditedVoids)],
         },
         NamedCase {
-            // Cancelled glyph's cell anchors the next guess while its erase is unread.
             name: "a_cancelled_glyph_s_cell_anchors_what_follows",
             cfg: Config {
                 remote: false,
@@ -692,25 +623,21 @@ fn named_cases() -> Vec<NamedCase> {
     .collect()
 }
 
-/// Directed cases for mid-line insert and erase shifts.
 fn shift_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // Mid-line insert stays dark until the insert shift class is proven.
             name: "overwrite_mode_never_shows_a_shift",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [&typed("ab")[..], &echoed(LEFT), &echoed(glyph('o'))].concat(),
             mutants: vec![Host::Rule(Rule::InsertShiftProof)],
         },
         NamedCase {
-            // Mid-line rubout in overwrite mode never proves the erase shift class.
             name: "overwrite_rubout_never_shows_a_shift",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [&typed("abc")[..], &echoed(LEFT), &echoed(BACKSPACE)].concat(),
             mutants: vec![Host::Rule(Rule::EraseShiftProof)],
         },
         NamedCase {
-            // Shifting a tail of all spaces cannot distinguish insert from overwrite.
             name: "a_shift_of_spaces_proves_nothing",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [
@@ -726,7 +653,6 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ShiftProofDistinguishes)],
         },
         NamedCase {
-            // Mid-line insert paints only the chain's span, not suggestion cells past the line.
             name: "insert_mid_line_beside_a_suggestion",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -746,7 +672,6 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::PaintsPastTheLine],
         },
         NamedCase {
-            // Unplaceable wide glyph mid-line flushes the active state chain.
             name: "a_wide_glyph_mid_line_retires_the_tail",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -767,7 +692,6 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // Right-to-left glyphs that trigger BiDi reordering are declined.
             name: "a_right_to_left_run_is_never_shown",
             cfg: Config {
                 remote: false,
@@ -790,7 +714,6 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::RightToLeftRows)],
         },
         NamedCase {
-            // Shift indistinguishable from an in-place overwrite beside a suggestion proves nothing.
             name: "a_shift_a_suggestion_could_show_proves_nothing",
             cfg: Config {
                 remote: false,
@@ -820,7 +743,6 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ShiftProofDistinguishes)],
         },
         NamedCase {
-            // Multi-op burst matching an in-place overwrite screen proves neither shift class.
             name: "overwrite_mode_s_burst_proves_no_shift",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [
@@ -839,7 +761,6 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ShiftProofDistinguishes)],
         },
         NamedCase {
-            // Screen reachable by fewer keys in overwrite mode credits no chain ops.
             name: "overwrite_mode_s_screen_with_fewer_keys_credits_none",
             cfg: adaptive_on(Editor::Overwrite),
             ops: [
@@ -861,7 +782,6 @@ fn shift_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::InPlaceReadsFewer)],
         },
         NamedCase {
-            // Backspace does not cancel a prior glyph from an unproven mid-line shift.
             name: "a_backspace_cancels_no_glyph_of_an_unproven_shift",
             cfg: Config {
                 remote: false,
@@ -895,7 +815,6 @@ fn shift_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// Local narrow configuration with the given `editor`, `rprompt`, and `forced_wrap`.
 fn swept(editor: Editor, rprompt: bool, forced_wrap: bool) -> Config {
     Config {
         remote: false,
@@ -905,11 +824,9 @@ fn swept(editor: Editor, rprompt: bool, forced_wrap: bool) -> Config {
     }
 }
 
-/// Directed cases for edit-lane and glyph-lane interactions.
 fn edit_review_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // Stale-anchored run is not credited by the echo of a later cancelled key.
             name: "a_stale_run_is_not_credited_by_a_later_key_it_cancelled",
             cfg: swept(Editor::Readline, true, false),
             ops: vec![
@@ -951,7 +868,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StaleAnchor)],
         },
         NamedCase {
-            // Cursor past every cell the run could reach does not retire the run.
             name: "a_cursor_past_every_echo_of_the_run_is_not_an_echo",
             cfg: swept(Editor::Readline, false, true),
             ops: vec![
@@ -972,7 +888,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CursorReach)],
         },
         NamedCase {
-            // State chain is credited as a whole or not at all.
             name: "a_chain_is_credited_whole_or_not_at_all",
             cfg: swept(Editor::Cooked, false, false),
             ops: vec![
@@ -994,7 +909,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ChainAttributedWhole)],
         },
         NamedCase {
-            // Cancelled glyph's typed owe is dated from the cancelling Backspace.
             name: "a_cancelled_glyph_is_owed_until_its_erase_is_due",
             cfg: swept(Editor::Cooked, true, false),
             ops: vec![
@@ -1011,7 +925,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CancelOwes)],
         },
         NamedCase {
-            // Shifted tail reaching the last column is not mistaken for a deferred-wrap park.
             name: "a_shifted_tail_in_the_last_column_is_not_a_park",
             cfg: swept(Editor::ReadlineIch, false, false),
             ops: vec![
@@ -1039,7 +952,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ParkedAtTheEnd)],
         },
         NamedCase {
-            // Echo that acquires a combining mark does not prove a plain guess.
             name: "an_echo_that_takes_a_mark_was_typed_before_it",
             cfg: swept(Editor::Readline, true, false),
             ops: vec![
@@ -1063,7 +975,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::MarkedEcho)],
         },
         NamedCase {
-            // Transit wait only holds when the cursor is within the chain's reachable range.
             name: "a_chain_waits_only_for_a_cursor_its_echoes_can_reach",
             cfg: Config {
                 rprompt: true,
@@ -1087,7 +998,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::TransitReach)],
         },
         NamedCase {
-            // Run started inside known text after a retired motion chain proves nothing.
             name: "a_run_typed_inside_the_known_text_proves_nothing",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -1111,7 +1021,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // Proof carried across an epoch boundary still checks its standing tail.
             name: "a_carried_line_is_held_to_its_standing_tail",
             cfg: swept(Editor::Zle, true, true),
             ops: vec![
@@ -1138,7 +1047,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StandingTail)],
         },
         NamedCase {
-            // Edit chain is not credited while a later key's output is owed.
             name: "a_later_key_s_echo_is_not_an_edit_s",
             cfg: adaptive_on(Editor::Zle),
             ops: [
@@ -1157,7 +1065,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::EditOwedAfter)],
         },
         NamedCase {
-            // Space echo alone never proves a line.
             name: "a_space_proves_no_line_by_itself",
             cfg: Config {
                 forced_wrap: true,
@@ -1192,7 +1099,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::SpaceNeverProves)],
         },
         NamedCase {
-            // Line proof is voided if the cell that earned it no longer holds its glyph.
             name: "a_redrawn_line_keeps_no_proof",
             cfg: Config {
                 rprompt: true,
@@ -1213,7 +1119,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::StandingGlyph)],
         },
         NamedCase {
-            // Part-way `\b \b` erase of a cancelled glyph does not credit a typed space.
             name: "a_cancelled_glyph_s_erase_is_no_space_s_echo",
             cfg: swept(Editor::Zle, true, true),
             ops: vec![
@@ -1231,7 +1136,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // Part-way erase echo matching a later chain state does not credit unread keys.
             name: "an_erase_caught_part_way_is_no_later_state",
             cfg: swept(Editor::Zle, true, true),
             ops: vec![
@@ -1250,7 +1154,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::PartWayEchoes)],
         },
         NamedCase {
-            // Vacated blank overwritten by a fetched autosuggestion counts as stale decoration.
             name: "a_vacated_blank_under_a_suggestion_is_stale_decoration",
             cfg: Config {
                 remote: false,
@@ -1277,7 +1180,6 @@ fn edit_review_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// Adaptive remote configuration using `editor`.
 fn adaptive_on(editor: Editor) -> Config {
     Config {
         editor,
@@ -1285,17 +1187,14 @@ fn adaptive_on(editor: Editor) -> Config {
     }
 }
 
-/// Press and echo each character of `text` over a 60 ms link.
 fn typed(text: &str) -> Vec<Op> {
     text.chars().flat_map(|c| echoed(glyph(c))).collect()
 }
 
-/// Type `ab` and prove the motion class with `←` and `→`.
 fn motions_proven_on_ab() -> Vec<Op> {
     [&typed("ab")[..], &echoed(LEFT), &echoed(RIGHT)].concat()
 }
 
-/// Press Enter with command `choice`, deliver its output, and wait past the glitch window.
 fn enter_and_wait(choice: u32) -> [Op; 5] {
     [
         Op::Key(79, 1),
@@ -1306,23 +1205,19 @@ fn enter_and_wait(choice: u32) -> [Op; 5] {
     ]
 }
 
-/// Reach an authenticated fresh prompt with the first-key gate open.
 fn at_a_fresh_prompt(choice: u32) -> Vec<Op> {
     [&enter_and_wait(0)[..], &enter_and_wait(choice)].concat()
 }
 
-/// Directed cases for state chains on a known line.
 fn edit_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // Arrows over a cooked tty never prove the motion class.
             name: "a_cooked_tty_never_shows_a_motion",
             cfg: adaptive_on(Editor::Cooked),
             ops: [&typed("ab")[..], &echoed(LEFT)].concat(),
             mutants: vec![Host::Rule(Rule::MotionClassProof)],
         },
         NamedCase {
-            // Motion class proof resets when the epoch ends.
             name: "a_proof_does_not_outlive_its_line",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [
@@ -1335,7 +1230,6 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::ProofsEndWithTheEpoch)],
         },
         NamedCase {
-            // Left arrow at the start of the known text is declined.
             name: "a_motion_at_the_text_edge_beeps",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -1349,7 +1243,6 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::TextEdges)],
         },
         NamedCase {
-            // Chain carried across Enter draws its own cursor rather than the glyph lane's.
             name: "enter_with_keys_in_flight",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [
@@ -1367,7 +1260,6 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CarryCursor)],
         },
         NamedCase {
-            // State chain ending in `←` draws the chain's cursor.
             name: "left_moves_the_cursor",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [
@@ -1384,7 +1276,6 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::CursorAfterNewestGlyph],
         },
         NamedCase {
-            // Word motion (Alt-B) is not routed as a single-cell arrow.
             name: "a_word_motion_is_not_an_arrow",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -1402,7 +1293,6 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::WordMotionAsArrow],
         },
         NamedCase {
-            // Keypad Left under Kitty DISAMBIGUATE is not routed as an arrow.
             name: "a_keypad_arrow_kitty_reports_is_not_a_motion",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -1418,7 +1308,6 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::KeypadArrowAsArrow],
         },
         NamedCase {
-            // Net-null `←` `→` burst matches the smallest prefix and retires uncredited.
             name: "an_ambiguous_match_proves_nothing",
             cfg: adaptive_on(Editor::Readline),
             ops: [
@@ -1432,7 +1321,6 @@ fn edit_cases() -> Vec<NamedCase> {
             ],
         },
         NamedCase {
-            // State chain requires the whole line text to match, not just the cursor.
             name: "a_redrawn_line_retires_the_edits",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [
@@ -1450,14 +1338,12 @@ fn edit_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::WholeStateMatch)],
         },
         NamedCase {
-            // Unanswered state chain flushes when its head expires.
             name: "a_chain_no_echo_answers_expires",
             cfg: adaptive_on(Editor::ReadlineIch),
             ops: [&typed("ab")[..], &echoed(LEFT), &[LEFT, Op::Advance(1000)]].concat(),
             mutants: vec![Host::Rule(Rule::StateExpiryFlushes)],
         },
         NamedCase {
-            // Run anchored before an unread Backspace lands is marked as a stale anchor.
             name: "a_run_placed_before_an_erase_lands_is_not_credited_by_the_next_key",
             cfg: Config {
                 remote: false,
@@ -1495,7 +1381,6 @@ fn edit_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// Adaptive remote configuration with shell integration enabled.
 fn integrated(editor: Editor, keymap: Keymap) -> Config {
     Config {
         integration: true,
@@ -1504,7 +1389,6 @@ fn integrated(editor: Editor, keymap: Keymap) -> Config {
     }
 }
 
-/// Teach `start` and `end` bindings by pressing and echoing each twice.
 fn learn_edges(start: Op, end: Op) -> Vec<Op> {
     [
         &echoed(start)[..],
@@ -1515,21 +1399,17 @@ fn learn_edges(start: Op, end: Op) -> Vec<Op> {
     .concat()
 }
 
-/// Tab key op.
 const TAB: Op = Op::Key(87, 13);
 
-/// Directed cases for learned line-edge and Delete bindings.
 fn line_edge_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // Unbound Home under `zsh -f` stays a dark probe.
             name: "an_unbound_home_is_not_predicted",
             cfg: integrated(Editor::Zle, Keymap::ZshVanilla),
             ops: [&at_a_fresh_prompt(0)[..], &typed("ab"), &echoed(HOME)].concat(),
             mutants: vec![Host::Rule(Rule::LearnedBindings)],
         },
         NamedCase {
-            // Delete inserting `~` under `zsh -f` is not shown as delete-char.
             name: "delete_without_a_delete_binding",
             cfg: integrated(Editor::Zle, Keymap::ZshVanilla),
             ops: [
@@ -1543,14 +1423,12 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::LearnedBindings)],
         },
         NamedCase {
-            // Ctrl-A inserting `^A` in vi insert mode is not shown as beginning-of-line.
             name: "ctrl_a_in_vi_insert_mode_is_a_glyph",
             cfg: integrated(Editor::Zle, Keymap::ViIns),
             ops: [&at_a_fresh_prompt(0)[..], &typed("ab"), &echoed(CTRL_A)].concat(),
             mutants: vec![Host::Rule(Rule::LearnedBindings)],
         },
         NamedCase {
-            // Re-executing the shell with a new nonce resets learned bindings.
             name: "a_new_shell_relearns_its_bindings",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1570,7 +1448,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::StaleEditorContext],
         },
         NamedCase {
-            // Line started after Tab completion is not witnessed as the buffer start.
             name: "home_after_a_tab_completion_is_not_predicted",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1586,7 +1463,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::WitnessFreshPrompt)],
         },
         NamedCase {
-            // Unsigned OSC 133 marks are ignored when the nonce gate is active.
             name: "a_forged_prompt_mark_moves_no_home",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1607,7 +1483,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::UnsignedInputStart],
         },
         NamedCase {
-            // Signed `B` mark without `aterm_input=start` on a pre-filled line is not a buffer start.
             name: "a_line_pre_filled_from_the_buffer_stack_has_no_buffer_start",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1623,7 +1498,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::UnattestedInputStart],
         },
         NamedCase {
-            // Only the first key typed at a fresh prompt witnesses an empty buffer.
             name: "only_the_first_key_meets_the_empty_buffer",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1645,7 +1519,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::WitnessFirstKey)],
         },
         NamedCase {
-            // Stale `B` mark left behind by a narrower `reset-prompt` redraw does not witness a line.
             name: "a_b_left_behind_by_a_narrower_redraw_witnesses_nothing",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1669,7 +1542,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::WitnessFirstKey)],
         },
         NamedCase {
-            // Child program's prompt at the shell's old coordinates has no input region.
             name: "a_program_s_prompt_is_no_input_region",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1684,7 +1556,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::StaleInputStart],
         },
         NamedCase {
-            // Control chords escaped under Kitty DISAMBIGUATE are not predicted as line edges.
             name: "ctrl_a_under_kitty_disambiguate",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1701,7 +1572,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::IgnoresKittyChords],
         },
         NamedCase {
-            // Control chords escaped under modifyOtherKeys level 2 are not predicted as line edges.
             name: "ctrl_a_under_modify_other_keys",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1718,7 +1588,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::IgnoresModifyOtherKeys],
         },
         NamedCase {
-            // Learned Delete shifts the tail left and keeps the chain's cursor.
             name: "a_learned_delete_shifts_the_tail",
             cfg: integrated(Editor::Zle, Keymap::Canonical),
             ops: [
@@ -1738,7 +1607,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::CursorAfterNewestGlyph],
         },
         NamedCase {
-            // Line-end key at the end of the text is declined so it can accept an autosuggestion.
             name: "end_accepts_the_autosuggestion",
             cfg: integrated(Editor::Autosuggest, Keymap::Canonical),
             ops: [
@@ -1764,7 +1632,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::EndRefusal)],
         },
         NamedCase {
-            // Part-way line-end reprint matching an intermediate cursor does not credit later ops.
             name: "a_line_end_caught_part_way_is_no_later_state",
             cfg: Config {
                 rprompt: true,
@@ -1787,7 +1654,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::PartWayEchoes)],
         },
         NamedCase {
-            // Combining mark carried onto the next guess's cell makes the head opaque and flushes.
             name: "a_mark_carried_onto_the_next_guess_s_cell_flushes_it",
             cfg: Config {
                 remote: false,
@@ -1837,7 +1703,6 @@ fn line_edge_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// Verifies that `paint_chain` enforces atomicity and cursor locality on wide glyphs.
 #[test]
 fn the_chain_painter_paints_all_or_none() {
     let mut term = aterm_core::terminal::Terminal::new(2, 12);
@@ -1875,7 +1740,6 @@ fn the_chain_painter_paints_all_or_none() {
     }
 }
 
-/// Verifies that every [`Rule`] with a safety clause has a negative control in [`MUTANT_HOSTS`] or [`named_cases`].
 #[test]
 fn every_rule_has_a_negative_control() {
     let named: Vec<Host> = named_cases().into_iter().flat_map(|c| c.mutants).collect();
@@ -1890,7 +1754,6 @@ fn every_rule_has_a_negative_control() {
     }
 }
 
-/// Verifies that every [`NamedCase`] holds under [`Host::Faithful`] and catches each of its mutants.
 #[test]
 fn each_named_case_holds_and_catches_its_mutant() {
     for case in named_cases() {
@@ -1921,11 +1784,9 @@ fn each_named_case_holds_and_catches_its_mutant() {
     }
 }
 
-/// Directed cases for floor validation, wrap flags, and credit revocation.
 fn review_4_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // Unexplained text on the row below a wrapped guess voids the line proof.
             name: "a_prompt_beside_a_wrapped_guess_voids_the_proof",
             cfg: Config {
                 editor: Editor::Zle,
@@ -1969,7 +1830,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::FloorBelow)],
         },
         NamedCase {
-            // Prompt text overwriting wrapped guess cells on the row below voids the line proof.
             name: "a_prompt_drawn_over_the_guesses_on_the_floor_voids_the_proof",
             cfg: Config {
                 editor: Editor::Zle,
@@ -2022,7 +1882,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::FloorBelow)],
         },
         NamedCase {
-            // Combining mark on the prompt's trailing space survives an erase after it.
             name: "a_mark_on_the_prompt_s_space_survives_an_erase_after_it",
             cfg: Config {
                 remote: false,
@@ -2052,7 +1911,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // Prompt drawn after `^C` clears residual wrapped text on its row.
             name: "a_prompt_drawn_over_a_wrapped_line_clears_its_row",
             cfg: Config {
                 remote: false,
@@ -2123,7 +1981,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // Cursor moved onto the last column in overwrite mode is not treated as pending wrap.
             name: "a_cursor_on_text_in_the_last_column_is_not_parked",
             cfg: Config {
                 remote: false,
@@ -2189,7 +2046,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::EngineWrapFlag)],
         },
         NamedCase {
-            // Credit is revoked if the cursor steps back onto the credited guess's cell.
             name: "a_suggestion_drawn_part_way_is_no_echo",
             cfg: Config {
                 remote: false,
@@ -2211,7 +2067,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CreditTakenBack)],
         },
         NamedCase {
-            // Part-way autosuggestion fetch that steps back revokes the credit it triggered.
             name: "a_suggestion_fetched_part_way_is_no_echo",
             cfg: Config {
                 remote: false,
@@ -2236,7 +2091,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::CreditTakenBack)],
         },
         NamedCase {
-            // Guesses behind a head waiting on its own glyph with the cursor on it stay dark.
             name: "nothing_shows_behind_a_guess_the_cursor_was_brought_back_onto",
             cfg: Config {
                 integration: true,
@@ -2258,7 +2112,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::DarkBehindAWait)],
         },
         NamedCase {
-            // Password prompt wrapping onto the row below voids the proof and holds guesses dark.
             name: "a_prompt_wrapped_under_the_line_voids_its_proof",
             cfg: Config {
                 forced_wrap: true,
@@ -2282,7 +2135,6 @@ fn review_4_cases() -> Vec<NamedCase> {
             mutants: vec![],
         },
         NamedCase {
-            // Text appearing on the previously blank row below a proven line voids its proof.
             name: "text_drawn_under_the_line_voids_its_proof",
             cfg: Config {
                 editor: Editor::Cooked,
@@ -2325,11 +2177,9 @@ fn review_4_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// Directed cases for transit blanks, Delete step-backs, and stale cancelled anchors.
 fn review_5_cases() -> Vec<NamedCase> {
     vec![
         NamedCase {
-            // Unexplained blanks left by a narrower prompt redraw flush the chain instead of waiting.
             name: "a_narrower_redraw_is_no_echo_in_transit",
             cfg: Config {
                 forced_wrap: true,
@@ -2374,7 +2224,6 @@ fn review_5_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::TransitBlanks)],
         },
         NamedCase {
-            // Cursor caught mid step-back during a Delete echo does not credit later chain ops.
             name: "a_delete_s_step_back_is_no_later_state",
             cfg: Config {
                 forced_wrap: true,
@@ -2427,7 +2276,6 @@ fn review_5_cases() -> Vec<NamedCase> {
             mutants: vec![Host::Rule(Rule::PartWayStepBack)],
         },
         NamedCase {
-            // Cancelling a stale-anchored guess leaves a stale anchor for the next run.
             name: "a_cancelled_stale_guess_anchors_a_stale_run",
             cfg: Config {
                 forced_wrap: true,
@@ -2464,10 +2312,8 @@ fn review_5_cases() -> Vec<NamedCase> {
     ]
 }
 
-/// Directed cases for mid-line echoes hiding a shifted tail.
 fn sweep_cases() -> Vec<NamedCase> {
     vec![NamedCase {
-        // Echo drawn over the identical glyph it shifts marks the tail as in flight.
         name: "an_echo_drawn_over_the_glyph_it_shifts_hides_its_tail",
         cfg: Config {
             editor: Editor::Readline,

@@ -20,10 +20,8 @@ use crate::wire::hop;
 use crate::wire::{Deadlines, Endpoints, Method, WireRequest};
 
 const MACHINE: &str = "AghRouteWall";
-/// The CDN location every hop is redirected to: one of `Endpoints::github_com()`'s hosts.
 const CDN_URL: &str = "https://objects.githubusercontent.com/github-production-release-asset/1";
 
-/// The eleven laws.
 const LAWS: [&str; 11] = [
     "ReleaseTokenStaysHome",
     "TierWall",
@@ -38,7 +36,6 @@ const LAWS: [&str; 11] = [
     "NoWriteHop",
 ];
 
-/// Each mutant and the law design §17.1 pairs it with.
 const MUTANTS: [(&str, &str); 9] = [
     ("BuggyDecideFallback", "TierWall"),
     ("BuggyDecideAlias", "NamedDestination"),
@@ -51,7 +48,6 @@ const MUTANTS: [(&str, &str); 9] = [
     ("BuggyHopOnWrite", "NoWriteHop"),
 ];
 
-/// The seven world actions the waivers name.
 const WORLD: [&str; 7] = [
     "NextTier",
     "NextOp",
@@ -66,7 +62,6 @@ fn var(state: &State, name: &str) -> i64 {
     state[name]
 }
 
-/// The model's `tier` as the canonical owners' repositories.
 fn slug_text(tier: i64) -> &'static str {
     match tier {
         0 => "fixture-dev/repo",
@@ -75,7 +70,6 @@ fn slug_text(tier: i64) -> &'static str {
     }
 }
 
-/// The model's `op` as an access class.
 fn access(op: i64) -> Access {
     match op {
         0 => Access::Read,
@@ -84,7 +78,6 @@ fn access(op: i64) -> Access {
     }
 }
 
-/// A request for `state`'s tier, op and naming.
 fn request(state: &State, named: Named) -> RouteRequest {
     let slug = Slug::parse(slug_text(var(state, "tier"))).expect("a canonical slug");
     let target = RouteTarget::Repo(slug);
@@ -96,8 +89,6 @@ fn request(state: &State, named: Named) -> RouteRequest {
     req.with_named(named)
 }
 
-/// The namings `state` stands for: the literal for `named == 1`; `@channel` and the
-/// library's default for `named == 0`, which must project alike.
 fn namings(state: &State) -> Vec<Named> {
     if var(state, "named") == 1 {
         let typed = ExplicitTarget::from_argv(OsStr::new(slug_text(var(state, "tier"))))
@@ -108,18 +99,11 @@ fn namings(state: &State) -> Vec<Named> {
     }
 }
 
-/// A scratch root holding the canonical agh.toml and the token files `state` has.
 struct World {
     _root: aterm_tempfile::TempDir,
     router: Router,
 }
 
-/// The canonical config, written as a real agh.toml under `root` and read back by
-/// `config::load`, with the dev token file iff `dev` and the release one iff `rel`.
-/// A new setup file, 0600, written whole and NOT flushed: `write_private`, the store's
-/// own writer, ends each write with two `F_FULLFSYNC`s, and a world per reachable state
-/// made those flushes nearly all of this test's 4.1 s (0.26 s CPU). Nothing it reads
-/// depends on the drive's cache.
 fn setup_file(path: &std::path::Path, bytes: &[u8]) {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -165,7 +149,6 @@ fn world(dev: bool, rel: bool) -> World {
     }
 }
 
-/// The environment `amb` stands for: `GH_TOKEN` set iff `amb`.
 fn env(amb: bool) -> MapEnv {
     if amb {
         MapEnv::new().with("GH_TOKEN", &agh_fake::token("ambient"))
@@ -174,8 +157,6 @@ fn env(amb: bool) -> MapEnv {
     }
 }
 
-/// The real decision for `req` over `router`, presence judged by the real
-/// `identity::presence` in `env`, inside a `Decide` window when `ev` is given.
 fn decide(
     router: &Router,
     req: &RouteRequest,
@@ -193,7 +174,6 @@ fn decide(
     }
 }
 
-/// `state` with `(phase, used)` put in, as the model's `Decide` writes them.
 fn with_decision(state: &State, (phase, used): (i64, i64)) -> State {
     let mut next = state.clone();
     next.insert("phase", phase);
@@ -201,14 +181,12 @@ fn with_decision(state: &State, (phase, used): (i64, i64)) -> State {
     next
 }
 
-/// The one successor of `state` under `action`.
 fn successor(model: &Model, state: &State, action: &str) -> Option<State> {
     let mut next = model.successors(action, state);
     assert!(next.len() <= 1, "{action} from {state:?}: {next:?}");
     next.pop()
 }
 
-/// A GET from the api origin of `endpoints`, carrying `auth` when given.
 fn get<'a>(endpoints: &Endpoints, auth: Option<&'a AuthHeader>) -> WireRequest<'a> {
     let mut req = WireRequest::new(
         Method::Get,
@@ -230,10 +208,8 @@ fn get<'a>(endpoints: &Endpoints, auth: Option<&'a AuthHeader>) -> WireRequest<'
     req
 }
 
-/// What `Decide` reads of a state: tier, op, named, dev, rel, amb.
 type Key = (i64, i64, i64, i64, i64, i64);
 
-/// `state`'s key for the decision cache: everything `Decide` reads.
 fn key(state: &State) -> Key {
     (
         var(state, "tier"),
@@ -395,8 +371,6 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
     );
 }
 
-/// A router over `world`'s loaded `Validated` with the `alabsystems` row changed in the crate
-/// to tier dev and a dev writer: a row L2 refuses in any file.
 fn forged_floor(world: &World) -> Router {
     let mut validated = world
         .router

@@ -1,38 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE JOURNAL'S READER (`docs/DESIGN-session-log-2026-10-15.md` §5.4, §7.2;
-//! phase 2B): `log @<sid>` and `brief @<sid>` of a session from an earlier
-//! process, answered from the disk journal on the control worker that serves
-//! the connection, never the UI thread.
-//!
-//! - OWNER ONLY. No read grant survives its process, so an edge gets `ERR no
-//!   such session`, byte for byte what an unknown sid gets
-//!   (`control::closed_session_reply`).
-//! - OFF WITH THE JOURNAL: the reader exists only when this
-//!   launch keeps a journal ([`install`]); it only opens an existing
-//!   directory and never creates one.
-//! - BOUNDED, in two steps. THE INDEX REFRESH reads, without
-//!   decoding, what segments it has not indexed (or the tail a segment grew
-//!   by), at most `journal::INDEX_BUDGET` bytes, so which segments hold the
-//!   session is known for a journal within its budgets, never guessed from a
-//!   decode budget; it keeps only each segment's sessions, start and end,
-//!   one segment's bytes at a time. THE DECODE then reads the segments that
-//!   hold the session, newest first: always the newest
-//!   `journal::READ_MIN_SEGMENTS`, then more within `journal::READ_BUDGET`
-//!   bytes, the same bytes on a cold index as on a warm one. A listing is at most
-//!   `journal::LIST_MAX` names. Whatever a read could not reach (a cut
-//!   listing, a budget, a segment past `journal::SEGMENT_READ_MAX`) reads
-//!   `gap why=unread`; when it found no line of the session at all, the reply
-//!   says the read was cut ([`JOURNAL_CUT`]), never that the session does not
-//!   exist.
-//! - A TRUNCATED LISTING DERIVES NO CRASH: a chain's newest segment may be
-//!   among the names it did not list, so its liveness is unknown.
-//! - Reads are one at a time (a second waits on the first, whose budgets
-//!   bound the wait); the index's lock is a leaf held only to look up, copy
-//!   out or store an entry, never across I/O.
-//! - The view itself (dedupe, crash closes derived at read time, losses said)
-//!   is `aterm_slog::journal::view_of`.
+//! Disk journal reader for `log @<sid>` and `brief @<sid>` of sessions from earlier processes,
+//! run on the control worker thread within bounded index and decode budgets.
 
 #[cfg(unix)]
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,8 +20,7 @@ use aterm_slog::{Cursor, ShortId};
 #[cfg(unix)]
 use super::fs::{JournalFs, Meta, list};
 
-/// The reply when a read found no line of the session in what it reached and
-/// could not reach all of the journal.
+/// Reply when a truncated journal read reached no line of the session.
 pub(crate) const JOURNAL_CUT: &str = "ERR the session journal was not read whole (too many files or bytes); no line of the session was reached\n";
 
 /// What the index knows of one segment.
@@ -112,8 +81,7 @@ pub(crate) enum JournalRead {
     View(Box<View>),
     /// No line of it in a journal read whole (or no journal).
     Absent,
-    /// No line of it in what the read reached, which was not all: whether
-    /// the journal holds it is not known ([`JOURNAL_CUT`]).
+    /// No line of it in the reached prefix of a truncated read ([`JOURNAL_CUT`]).
     Cut,
 }
 
@@ -127,14 +95,12 @@ pub(crate) struct Reader {
 
 static READER: OnceLock<Reader> = OnceLock::new();
 
-/// Make this launch's reader over `<logs>/session-log` (the lane does, when
-/// the gate passed).
+/// Install the process-wide reader over `<logs>/session-log`.
 pub(crate) fn install(logs: PathBuf) {
     let _ = READER.set(Reader::at(logs));
 }
 
-/// This launch's reader: `None` while it keeps no journal, so nothing is
-/// read and nothing created.
+/// Process-wide reader, or `None` when this launch keeps no journal.
 pub(crate) fn reader() -> Option<&'static Reader> {
     READER.get()
 }
@@ -201,9 +167,7 @@ fn index_put(index: &Mutex<Index>, name: &str, entry: SegIndex) {
         .insert(name.to_string(), entry);
 }
 
-/// The frames of `want` (and the instance's own `*` lines) in a segment read
-/// whole: none for a segment whose first line names another format. Every
-/// byte it is given counts as decoded in `cost`.
+/// Decode frames for `want` (and instance `*` lines) from a whole segment, adding `bytes.len()` to `cost`.
 #[cfg(unix)]
 fn decode_whole(bytes: &[u8], want: &str, cost: &mut ReadCost) -> Option<Vec<Frame>> {
     cost.decoded = cost.decoded.saturating_add(bytes.len() as u64);
@@ -223,8 +187,7 @@ fn decode_whole(bytes: &[u8], want: &str, cost: &mut ReadCost) -> Option<Vec<Fra
     Some(out)
 }
 
-/// What one read spent: the bytes its index refresh read and the bytes it
-/// decoded.
+/// Bytes read during index refresh and segment decode.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReadCost {
@@ -232,7 +195,7 @@ pub(crate) struct ReadCost {
     pub(crate) decoded: u64,
 }
 
-/// One read of `sid` over `fs` within `b` (module docs).
+/// Read `sid` from `fs` within `b`.
 #[cfg(unix)]
 pub(crate) fn view_with(
     fs: &dyn JournalFs,
@@ -271,10 +234,8 @@ pub(crate) fn view_costed(
             })
         })
         .collect();
-    // Newest first, so a budget cut leaves the oldest unread.
     segs.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms).then(b.n.cmp(&a.n)));
     if !listing.truncated {
-        // Only a whole listing says a name is gone.
         let listed: BTreeSet<&str> = segs.iter().map(|s| s.name.as_str()).collect();
         index
             .lock()
@@ -283,7 +244,6 @@ pub(crate) fn view_costed(
             .retain(|name, _| listed.contains(name.as_str()));
     }
     let want = sid.as_str();
-    // THE INDEX REFRESH: what is new, and the tail a segment grew by.
     let mut spent_index = 0u64;
     for s in &segs {
         let known =
@@ -299,8 +259,6 @@ pub(crate) fn view_costed(
             continue;
         }
         if s.meta.size > journal::SEGMENT_READ_MAX {
-            // Past what any writer of this journal writes: not read, and
-            // what it may hold is unread.
             unread = true;
             continue;
         }
@@ -345,13 +303,11 @@ pub(crate) fn view_costed(
             }
         }
         if from == 0 && end == 0 {
-            // No complete line yet: its version is not known either.
             entry.opaque = false;
         }
         entry.indexed_to = from + end as u64;
         index_put(index, &s.name, entry);
     }
-    // THE DECODE: the segments that hold the session, newest first.
     let mut spent = 0u64;
     let mut decoded = 0usize;
     let mut held = 0usize;
@@ -364,13 +320,9 @@ pub(crate) fn view_costed(
             continue;
         }
         if s.meta.size > journal::SEGMENT_READ_MAX {
-            // Grown past what any writer of this journal writes since it was
-            // indexed: not read.
             unread = true;
             continue;
         }
-        // Past half of what a rebuilt log takes, no more segments: one more
-        // (at most `SEGMENT_READ_MAX` of lines) still fits.
         if held >= aterm_slog::JOURNAL_IMAGE_MAX_RECORDS / 2 {
             unread = true;
             continue;
@@ -402,16 +354,12 @@ pub(crate) fn view_costed(
             JournalRead::Absent
         };
     }
-    // Each chain's facts, copied out under the index's lock; the probes run
-    // after it is let go.
     let facts: Vec<(Inst, Vec<SegmentRead>, Option<bool>, u64)> = {
         let idx = index.lock().unwrap_or_else(|p| p.into_inner());
         frames
             .into_iter()
             .map(|(inst, segments)| {
                 let mine = || segs.iter().filter(|s| s.inst == inst);
-                // The chain's newest listed segment decides whether it
-                // ended; one the index does not hold is not known.
                 let ended = mine()
                     .max_by_key(|s| s.n)
                     .and_then(|s| idx.segs.get(&s.name))
@@ -431,7 +379,6 @@ pub(crate) fn view_costed(
         .map(|(inst, segments, ended, start_t)| {
             let live = match ended {
                 Some(true) => Liveness::Dead,
-                // A cut listing may not show the chain's newest segment.
                 Some(false) if !listing.truncated => fs.probe(&journal::lock_name(&inst)),
                 _ => Liveness::Unknown,
             };
@@ -451,19 +398,12 @@ pub(crate) fn view_costed(
     }
 }
 
-/// A reader's cursor against a journal's view ([`View::cursor`]): one of
-/// the journal's own numbering at or below its head reads on (a reply's own,
-/// [`View::reply_cursor`], among them); every other is reset, said: past
-/// the head (the dead process's records nobody journaled), of an epoch past
-/// the journal's (a successor's, another space's) or before its space.
+/// Resolve cursor `c` against `view` ([`View::cursor`]).
 pub(crate) fn journal_cursor(view: &View, c: Cursor) -> Cursor {
     view.cursor(c)
 }
 
-/// `log` over a journal's view: the live reply's shape, a cursor placed by
-/// [`journal_cursor`], the header handing out the journal's own cursor
-/// ([`View::reply_cursor`]): what the reply derives past the head is
-/// derived again by the next read, never named by a cursor.
+/// Render `log` over `view` with its cursor resolved by [`journal_cursor`].
 pub(crate) fn cmd_log_journal(view: &View, rest: &str) -> String {
     let rest = match crate::control::take_json_flag(rest) {
         (true, body) => format!("{body} --json"),

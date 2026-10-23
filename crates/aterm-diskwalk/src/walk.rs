@@ -50,7 +50,8 @@ pub struct Policy {
     pub mounts: Table,
     /// Read each file's private (unshared-clone) size: about 2.5× the cost.
     pub private: bool,
-    /// Keep a `` map of multiply linked files for the walk's first-seen and shared-out figures.
+    /// Keep a `(dev, inode)` map of multiply linked files for the walk's
+    /// first-seen and shared-out figures ([`LinkTotals`]).
     pub links_out: bool,
     /// A slice's budget.
     pub slice: Duration,
@@ -527,7 +528,8 @@ pub struct SizeFull {
 /// A whole walk in one call for a one-shot survey (design §10.7).
 /// # Errors
 /// The [`Refusal`] the root earned.
-// COST: UNBOUNDED(entries) — a whole walk; the harness's survey and the CLI call it on their own.
+// COST: UNBOUNDED(entries) — a whole walk; the harness's survey and the CLI
+// call it on their own threads, never the event loop.
 pub fn diskwalk_size_full(
     root: &RootSpec,
     policy: &Policy,
@@ -1145,6 +1147,7 @@ pub(crate) mod imp {
                     }
                     other => {
                         // A different device (the open crossed a mount), or a
+                        // refusal; an opened descriptor closes here.
                         let why = other.err();
                         let r = tree.rec_mut(child);
                         match why {
@@ -1170,6 +1173,7 @@ pub(crate) mod imp {
                 Next::Nothing => {}
                 Next::Push(frame) => {
                     // Its parent's listing gave the count `ATTR_DIR_ENTRYCOUNT`
+                    // read; its own listing counts again from zero.
                     let r = tree.rec_mut(frame.dir);
                     r.direct_entries = 0;
                     r.direct_exec = 0;

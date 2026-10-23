@@ -489,10 +489,6 @@ mod tests {
         );
     }
 
-    /// An apply journals its change in the journal of the system it runs on: the fake's
-    /// files hold the line. Negative control: a plan of the same machine writes none. A
-    /// mutant that asks the journal this process would resolve for itself leaves the
-    /// fake's empty and fails here.
     #[test]
     fn an_apply_journals_in_the_journal_of_the_system_it_runs_on_and_a_plan_in_none() {
         let journaled = |sys: &Fake| -> Vec<String> {

@@ -135,6 +135,7 @@ fn probe_next(
         });
         let next = next.unwrap_or(Probe::Deferred);
         if let Probe::Published(build) = next {
+            // The release is only a wake hint. Report it before the next HEAD waits; the
             // signed pass resolves authority.
             on_published(build);
         }

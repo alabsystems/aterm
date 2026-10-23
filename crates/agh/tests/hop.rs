@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The one redirect hop (design §11.4): a GET or HEAD rebuilt fresh for an allowlisted CDN
-//! origin, with only `Accept` and `User-Agent` and no credential; a write never hops; any
-//! other location is refused; and the model's view of each request.
+//! Redirect hop tests for allowlisted CDN origins.
 
 use std::time::Duration;
 
@@ -17,8 +15,6 @@ use agh::wire::{Deadlines, Endpoints, Method, Origin, WireBody, WireRequest};
 
 const CDN: &str = "https://objects.githubusercontent.com/github-production-release-asset/9?sig=ab";
 
-/// A request from the api origin with an `Accept`, an api-version header and a header named
-/// as the credential header is, as a caller might have set by hand.
 fn original(method: Method) -> WireRequest<'static> {
     WireRequest::new(
         method,
@@ -137,11 +133,9 @@ fn a_location_off_the_asset_hosts_is_refused() {
     assert!(shown.why.contains(&origin.base()), "{}", shown.why);
 }
 
-/// An unparsable Location is never echoed: it can carry userinfo and a signed query.
 #[test]
 fn an_unparsable_location_is_not_echoed() {
     let endpoints = Endpoints::github_com();
-    // Joined at run time, so no literal in this file has an address's shape.
     let location = [
         "https://u:secret",
         "objects.githubusercontent.com/x?X-Amz-Signature=s",

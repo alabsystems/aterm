@@ -205,6 +205,16 @@ impl Terminal {
     }
 
     /// Last taskbar progress state set by the program (ConEmu OSC 9;4).
+    ///
+    /// # Example
+    /// ```
+    /// use aterm_core::terminal::Terminal;
+    /// use aterm_types::TaskbarProgress;
+    ///
+    /// let mut term = Terminal::new(24, 80);
+    /// term.process(b"\x1b]9;4;1;50\x07");  // Set 50% progress
+    /// assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Normal(50)));
+    /// ```
     #[must_use]
     #[inline]
     pub const fn taskbar_progress(&self) -> Option<TaskbarProgress> {
@@ -212,6 +222,17 @@ impl Terminal {
     }
 
     /// Program's own state report (OSC 7501, [`super::program_state`]).
+    ///
+    /// # Example
+    /// ```
+    /// use aterm_core::terminal::Terminal;
+    /// use aterm_core::terminal::program_state::ProgramStateWord;
+    ///
+    /// let mut term = Terminal::new(24, 80);
+    /// term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+    /// let report = term.program_state();
+    /// assert_eq!(report.state.map(|s| s.state), Some(ProgramStateWord::Working));
+    /// ```
     #[must_use]
     #[inline]
     pub const fn program_state(&self) -> super::program_state::ProgramStateReport {

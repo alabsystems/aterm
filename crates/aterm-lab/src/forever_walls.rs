@@ -1,46 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE JUDGES OF `lab forever`'s WALLS PAST W2 (`--mode wall-shift`,
-//! `wall-redraw`, `wall-switch`, `wall-unread`, and the walls-3 stage's
-//! `wall-day-stop`, `wall-cruise`, `wall-relaunch`, `wall-bucket`): what the
-//! walls stages left to unit tests alone, each judged from the tab's own
-//! records ([`Seen`]: journal, ledger, `status`, the stub's dumps) and what
-//! the lab did to the stub and the tab ([`Cover`]: the walls raised again,
-//! the switch, the relaunch, the unread conversation), never the screen
-//! alone. Each passes beside the
-//! negative controls its tests fail (`forever_walls_tests.rs`).
-//!
-//! FOREVER holds through all of them: NEEDS YOU is loud and never blocks, so
-//! a person told (the ladder's badge, the unread limit's `EXCEPTION`) is no
-//! stall; nothing is ever typed into a wall that stands.
+//! Judges for `lab forever` usage-wall modes (`wall-shift`, `wall-redraw`, `wall-switch`, `wall-unread`, `wall-day-stop`, `wall-cruise`, `wall-relaunch`, `wall-bucket`).
 
 use super::*;
 use aterm_agent::supervise::policy::approval::RULE_LIMIT_RETRY;
 
-/// The minute a reset names: the loop counts the program's grace from that
-/// minute's end (`approval_loop.rs`'s `LIMIT_RETRY_MINUTE_S`, the turn-end
-/// policy's reset placed by its minute).
 const RESET_MINUTE_MS: i64 = 60_000;
 
-/// How far before an hour past the reset the unread limit's told may be
-/// journaled and still be at it (the journal's clock and the lab's agree to
-/// the second).
 const TOLD_SLACK_MS: i64 = 2_000;
 
-/// How long after the told came down a landing may be journaled: the told
-/// ends at the point that reads the conversation, the landing's or the one
-/// before it.
 const CLEARED_BY_DONE_MS: i64 = 5_000;
 
-/// The loop's look at a limit held unread (`turn_end.rs`'s
-/// `LIMIT_CONVERSATION_LOOK`): the conversation read again is decided at
-/// the next look, at the latest.
 const UNREAD_LOOK_MS: i64 = 5 * 60_000;
 
-/// The harness's goings-on after `t1`: every act the journal says was typed
-/// (its rule) and every `Keep trying` the ledger approved
-/// ([`RULE_LIMIT_RETRY`]), in time order.
 fn goings_on(seen: &Seen, t1: i64) -> Vec<(i64, String)> {
     let mut v: Vec<(i64, String)> = seen
         .all_acts()
@@ -58,24 +31,17 @@ fn goings_on(seen: &Seen, t1: i64) -> Vec<(i64, String)> {
     v
 }
 
-/// The first going-on ([`goings_on`]) inside `(from, until)`, said as
-/// `<rule> at +t`.
 fn going_in(on: &[(i64, String)], from: i64, until: i64, t0: i64) -> Option<String> {
     on.iter()
         .find(|(t, _)| *t > from && *t < until)
         .map(|(t, rule)| format!("{rule} at +{}", at(t0, *t)))
 }
 
-/// A going-on at `t` of `rule` that typed a text but left no ledger row of
-/// it: said, for a FAIL.
 fn unledgered(seen: &Seen, rule: &str, t: i64, t0: i64) -> Option<String> {
     (rule != RULE_LIMIT_RETRY && seen.typed_row(rule, t).is_none())
         .then(|| format!("{rule} journaled at +{} but NO ledger row typed", at(t0, t)))
 }
 
-/// The wall the land act met: `(raised ms, reset unix s, land act ms)`, or
-/// the verdict where the records hold none (no wall raised, no land act, an
-/// act outside the wall).
 fn met(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Result<(i64, i64, i64), Verdict> {
     let Some((raised, reset_s)) = seen.cover.wall else {
         return Err(Verdict::Unobserved(
@@ -99,11 +65,6 @@ fn met(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Result<(i64, i64, 
     Ok((raised, reset_s, t1))
 }
 
-/// What FOREVER fails in any walled chain's records from `t1` to `until`:
-/// an escalation of the wall that is no ladder's badge (a stall: the session
-/// handed to a person who must answer before it goes on), a reply's need (a
-/// `NEEDS` line: no reply named one), and new harness text the stub read in
-/// the wall ([`Cover::window_stub`]).
 fn forever_faults(seen: &Seen, t1: i64, until: i64, t0: i64) -> Vec<String> {
     let mut bad = Vec::new();
     if let Some(r) = seen
@@ -133,8 +94,6 @@ fn forever_faults(seen: &Seen, t1: i64, until: i64, t0: i64) -> Vec<String> {
     bad
 }
 
-/// The landing at `done` and its quiet after ([`landing_quiet`]), no task
-/// record invented, its verdict with `said` and `bad` before it.
 fn landed(seen: &Seen, done: &(i64, String), mut bad: Vec<String>, said: &str, t0: i64) -> Verdict {
     let (more, quiet, window) = landing_quiet(seen, done, false, t0);
     bad.extend(more);
@@ -149,25 +108,7 @@ fn landed(seen: &Seen, done: &(i64, String), mut bad: Vec<String>, said: &str, t
     landed_verdict(bad, format!("{said}; {quiet}"), seen, done.0, window)
 }
 
-/// W3, G3'S CLIMB ACROSS A CHANGED RESET (`--mode wall-shift`): Gemini CLI's
-/// usage-limit dialog of a Google account's spent quota (a reset named),
-/// which the lab raised again at each reset instead of lifting it
-/// ([`wall_move`], [`Cover::shifted`]), so each `Keep trying` past the reset
-/// its dialog named met the wall again and the dialog was drawn with a new
-/// reset. Land's act MEETS the wall; every press ([`RULE_LIMIT_RETRY`]
-/// `approved`) comes AT OR AFTER THE RESET THE DIALOG IT ANSWERED NAMED (the
-/// wall standing when the request before it was answered:
-/// [`Cover::reset_at`]) — one before it is an act into the wall: FAIL — and
-/// within the minute, `program`'s grace and [`WALL_LOST_MS`] of it (else
-/// PERSISTENCE LOST); each try that met the wall again is answered by the
-/// loop's wait on the NEW reset (a `WAITING … rule=limit-retry@v1` whose
-/// `until=` is at or past it, before the next press); [`Chain::shifts`]
-/// tries meet the wall and the next gets through; NOTHING TYPED (no journal
-/// act) before the landing; no stall, no reply's need, no harness text in
-/// the wall ([`forever_faults`]); the clean defense lands the task, quiet
-/// after. Fewer tries in the wall than the chain's shifts (a wall lifted
-/// early, a press that came after a later reset) did not drive the climb:
-/// UNOBSERVED.
+/// Judges `--mode wall-shift`: climbing across a changed reset in Gemini CLI's usage-limit dialog.
 pub(super) fn judge_wall_shift(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -313,7 +254,6 @@ pub(super) fn judge_wall_shift(
         return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
     }
     let Some(tg) = through else {
-        // the next try is due past the reset standing at the last request
         let named = pending
             .or_else(|| seen.cover.reset_at(prev).map(|r| r * 1000))
             .unwrap_or(first * 1000);
@@ -360,24 +300,7 @@ pub(super) fn judge_wall_shift(
     landed(seen, done, Vec::new(), &said, t0)
 }
 
-/// W4, THE REDRAW AFTER A TYPED RESUME (`--mode wall-redraw`): the wall the
-/// land act met, raised again at its reset ([`Cover::shifted`]'s one, the
-/// new reset [`REDRAW_AHEAD_MS`] on), so the resume past the first reset
-/// meets it and the program draws its wall again under the new reset.
-/// NOTHING TYPED into the first wall; the first going-on past its reset (the
-/// `usage-resume@v1` typed, or Gemini CLI's press) comes within the minute,
-/// `program`'s grace and [`WALL_LOST_MS`] (else PERSISTENCE LOST); the wall
-/// READ AGAIN after it (a limit point before the new reset: [`cover::wall_point`]);
-/// NOTHING TYPED into the redrawn wall before the new reset; GONE ON past it
-/// (an act or press, ledgered — or the program's own continuation,
-/// [`Cover::went_on_ms`], with nothing typed on top of it) within
-/// [`WALL_LOST_MS`] of its due ([`redraw_due`]: the new reset's minute and
-/// `program`'s grace, or the loop's floor after a typed resume that met the
-/// wall again, the later); no landing before
-/// the lift; no stall, no reply's need, no harness text in the first wall
-/// ([`forever_faults`]); landed, quiet after. A wall never raised again, a
-/// resume past the new reset or one that never met the wall again did not
-/// drive the redraw: UNOBSERVED.
+/// Judges `--mode wall-redraw`: a usage wall redrawn under a new reset after a typed resume.
 pub(super) fn judge_wall_redraw(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -547,17 +470,6 @@ pub(super) fn judge_wall_redraw(
     landed(seen, done, Vec::new(), &said, t0)
 }
 
-/// When W4's going-on past the new reset is due: the new reset's minute and
-/// the program's grace (`at_reset`), or, where the first going-on past the
-/// first reset (`rule1`) was a typed `usage-resume@v1` that met the wall
-/// again (the redraw read at `redrawn`), the loop's floor after such a
-/// continuation ([`limit_retry_ms`] from the take window's end,
-/// `resume_at_reset`'s `after_retry`) where that is later — and whether the
-/// floor is the due. A press of Gemini CLI's dialog, or the program's own
-/// continuation, is no such continuation. Measured (`y6rd-agy`): the resume
-/// at +553.8 s met the wall again at +554.3 s, the take window ended at
-/// +583.6 s, and the loop waited `until=` +1183.6 s (`spend resets`), 418 s
-/// past the new reset +765.3 s; its resume at +1185.0 s landed.
 fn redraw_due(at_reset: i64, rule1: &str, redrawn: i64) -> (i64, bool) {
     if rule1 != turn_end::RULE_LIMIT_RESUME {
         return (at_reset, false);
@@ -570,20 +482,10 @@ fn redraw_due(at_reset: i64, rule1: &str, redrawn: i64) -> (i64, bool) {
     }
 }
 
-/// How long after the second agent's prompt W5 waits for its land act when
-/// the loop named no back-off at its point: its work point's first back-off
-/// ([`next_step_ms`], one short turn), [`PERSISTENCE_GRACE_MS`], and a
-/// minute for its reply.
 fn switch_land_within_ms() -> i64 {
     next_step_ms(1, false) + PERSISTENCE_GRACE_MS + 60_000
 }
 
-/// When W5's second agent's land act is due: the back-off the loop named at
-/// its first point after its prompt ([`named_backoff`]) and
-/// [`PERSISTENCE_GRACE_MS`], or, with none named, [`switch_land_within_ms`]
-/// after its prompt. The tab's short streak runs on across the switch, so the
-/// back-off is the streak's (measured, `y4sw`: Muse Code's work point named
-/// `2 short turn(s) in a row: 4 min back-off`, Land's act at its due).
 fn switch_land_due(seen: &Seen, prompt_ms: i64) -> (i64, String) {
     match named_backoff(seen, prompt_ms) {
         Some((due, line)) => (due + PERSISTENCE_GRACE_MS, crate::util::one_line(line, 120)),
@@ -594,9 +496,6 @@ fn switch_land_due(seen: &Seen, prompt_ms: i64) -> (i64, String) {
     }
 }
 
-/// Land's act on W5's second agent: the first act of Land's rule after its
-/// prompt, `land@v1` or, where the tab's episode had it typed already (the
-/// first agent's land act met the wall), its nudge `land-nudge@v1`.
 fn land_act_after(seen: &Seen, t: i64) -> Option<(i64, &str)> {
     seen.all_acts()
         .into_iter()
@@ -608,9 +507,6 @@ fn land_act_after(seen: &Seen, t: i64) -> Option<(i64, &str)> {
         })
 }
 
-/// A wait of the loop that holds a session on a limit: the remembered
-/// limit's unread hold ([`UNREAD_WORDS`]) or a wait on a limit's reset (a
-/// back-off ending ` resets`).
 fn holds_on_a_limit(line: &str) -> bool {
     line.starts_with("WAITING ")
         && (line.contains(UNREAD_WORDS)
@@ -619,19 +515,7 @@ fn holds_on_a_limit(line: &str) -> bool {
                 .is_some_and(|(_, rest)| rest.trim_end().ends_with(" resets")))
 }
 
-/// W5, THE CROSS-PROGRAM END (`--mode wall-switch`, the remembered-limit
-/// stage's L1): `program`'s agent met the wall the land act met, the wall
-/// READ as one before the switch and NOTHING TYPED into it; then the lab
-/// ended that agent, lifted the stub's wall and started another
-/// ([`Cover::switch`], [`switch_to`]) in the same tab. The first agent's
-/// limit HOLDS NOTHING OF THE SECOND'S: no wait on a limit at its points
-/// ([`holds_on_a_limit`]), its land act ([`land_act_after`]) typed after its
-/// prompt by its due ([`switch_land_due`]) and before the first agent's reset, nothing
-/// typed between the switch and that act, its landing before that reset,
-/// and NOTHING TYPED INTO IT PAST THAT RESET (the ended limit's resume: the
-/// watch must reach [`switch_watch_until`]); no stall, no reply's need, no
-/// harness text in the first agent's wall ([`forever_faults`]); quiet after
-/// the landing. No switch made, or a wall never read before it: UNOBSERVED.
+/// Judges `--mode wall-switch`: a cross-program switch after a usage wall in the same tab.
 pub(super) fn judge_wall_switch(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -768,21 +652,7 @@ pub(super) fn judge_wall_switch(
     }
 }
 
-/// W6, THE UNREAD LIMIT TOLD (`--mode wall-unread`, the remembered-limit
-/// stage's L2): Claude Code's limit met by the land act, its notice out of
-/// sight ([`Cover::hidden`]) and its conversation made unread
-/// ([`Cover::unread`]: the transcript aside). The loop HOLDS the limit unread
-/// (a `WAITING` naming [`UNREAD_WORDS`] after the move) and TYPES NOTHING
-/// until the conversation is read again; an hour past the reset
-/// ([`futile_after_ms`]) the owner is TOLD (an `EXCEPTION` line carrying
-/// [`unread_told_words`]) — not before it, and within
-/// [`UNREAD_TOLD_LATE_MS`] of it — the hold standing; once the transcript is
-/// back the resume is typed (ledgered) within the loop's look
-/// ([`UNREAD_LOOK_MS`]) and [`WALL_LOST_MS`], the told comes down (a
-/// `CLEARED … exception=futile` line by the landing) and the task lands,
-/// quiet after; no stall, no reply's need, no harness text while held
-/// ([`forever_faults`]). A notice that never left, a transcript never moved,
-/// or no unread hold read: the lab did not make it unread, UNOBSERVED.
+/// Judges `--mode wall-unread`: holding a limit whose conversation is unread and raising `EXCEPTION` past its reset.
 pub(super) fn judge_wall_unread(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -963,13 +833,6 @@ pub(super) fn judge_wall_unread(
     landed(seen, done, Vec::new(), &said, t0)
 }
 
-/// WHAT WENT ON PAST THE RESET `r_ms` (`on`, [`goings_on`]; the stub's wall
-/// lifted at `lift`): the first act or press at or past it, ledgered — or
-/// the program's own continuation ([`Cover::went_on_ms`]) with no resume
-/// typed on top of it (W8's `cruise`: Cruise's own act after that
-/// continuation's answer is no resume, and goes) — within the minute,
-/// `program`'s grace and [`WALL_LOST_MS`]: when, and its words; or the
-/// verdict where nothing did, `said` before it.
 fn gone_past(
     seen: &Seen,
     on: &[(i64, String)],
@@ -1034,22 +897,7 @@ fn gone_past(
     }
 }
 
-/// W7, THE PER-DAY DIALOG ANSWERED STOP (`--mode wall-day-stop`, X1 of the
-/// walls-3 stage): Gemini CLI's usage-limit dialog of a key's spent per-day
-/// quota (no reset named) met by the land act, waited on the ladder with
-/// its badge up, then answered `2. Stop` as a person at the keyboard would
-/// ([`Cover::hidden`], [`Hidden::stopped`]). FOREVER: NEEDS YOU is loud and
-/// never blocks, so the Stop hands nothing to a person for good. W2's judge
-/// holds ([`cover::judge_wall_hidden`]: nothing typed into the wall, the
-/// error read without the notice, the resume typed past the lift at a
-/// screen without it, landed, quiet after); and the loop KEPT TRYING: the
-/// first act after the Stop is the resume ([`turn_end::RULE_LIMIT_RESUME`]),
-/// typed at or past the ladder's first due (the `until=` of its first wait,
-/// [`cover::ladder_waits`]) — never before; NEEDS YOU STOOD from the Stop to
-/// that resume (every status read in the span `needs=ask`, at least one,
-/// and no `CLEARED` in it); and the resume that got through TOOK IT DOWN by
-/// the landing ([`cover::ladder_cleared`]). The dialog answered by anything
-/// but its Stop: UNOBSERVED.
+/// Judges `--mode wall-day-stop`: continuing on the back-off ladder after Gemini CLI's per-day dialog is answered `Stop`.
 pub(super) fn judge_wall_day_stopped(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -1150,19 +998,8 @@ pub(super) fn judge_wall_day_stopped(
     }
 }
 
-/// How long after what went on past W8's wall Cruise's own act may come
-/// where the loop named no back-off for it ([`named_backoff`]): a back-off
-/// of 4 min, [`PERSISTENCE_GRACE_MS`], and a minute for the reply.
 const CRUISE_AFTER_WALL_MS: i64 = 4 * 60_000 + PERSISTENCE_GRACE_MS + 60_000;
 
-/// The back-off the loop named for the next act after `tg` (W8: what went on
-/// past the wall; W5: the second agent's prompt): the first `WAITING … N short turn(s) in a row: M min
-/// back-off` written after it, its due (`until=`, unix ms) and its line. The
-/// wall's points lengthen the short streak as any short turn does — the
-/// done check's yield the wall cut, then the answer that went on past it —
-/// so the back-off is the streak's, not a fixed one (measured,
-/// `z4cr-claude`: `3 short turn(s) in a row: 8 min back-off`, Cruise's act at
-/// its due).
 fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
     seen.journal
         .iter()
@@ -1176,8 +1013,7 @@ fn named_backoff(seen: &Seen, tg: i64) -> Option<(i64, &str)> {
         })
 }
 
-/// The act that met W8's wall: Cruise's first act after the stub's wall was
-/// raised ([`Cover::wall`]).
+/// Returns the timestamp of Cruise's first act after the stub's wall was raised.
 #[must_use]
 pub(super) fn cruise_met(seen: &Seen) -> Option<i64> {
     let (raised, _) = seen.cover.wall?;
@@ -1187,9 +1023,7 @@ pub(super) fn cruise_met(seen: &Seen) -> Option<i64> {
         .map(|(t, _)| *t)
 }
 
-/// CRUISE GOING ON after W8's wall: the first act at or past the reset that
-/// is Cruise's own (no `usage-resume@v1`: its done check, its
-/// continuation), the watch's end ([`finished`]) and the judge's.
+/// Returns the timestamp of Cruise's first non-resume act at or past the wall's reset.
 #[must_use]
 pub(super) fn cruise_went_on(seen: &Seen) -> Option<i64> {
     let (_, reset_s) = seen.cover.wall?;
@@ -1199,18 +1033,7 @@ pub(super) fn cruise_went_on(seen: &Seen) -> Option<i64> {
         .map(|(t, _)| *t)
 }
 
-/// W8, A USAGE WALL UNDER CRUISE (`--mode wall-cruise`): the stub's wall
-/// raised at the first point, so Cruise's act on the done claim (its done
-/// check) MEETS it; the wall READ as one; NOTHING TYPED into it to its
-/// reset; no stall, no reply's need, no harness text in it
-/// ([`forever_faults`]); and Cruise never ends: no DONE. Past the reset the
-/// harness GOES ON ([`gone_past`]: the resume, Gemini CLI's `Keep trying`,
-/// or Claude Code's own continuation) — Cruise's own act typed past the reset
-/// before any of them is no resume: FAIL — and then CRUISE GOES ON: its own
-/// act ([`cruise_went_on`]), ledgered, by the due of the back-off the loop
-/// named after that ([`named_backoff`]) and [`PERSISTENCE_GRACE_MS`] (none
-/// named: within [`CRUISE_AFTER_WALL_MS`]), else persistence lost. A first
-/// act past the reset met no wall, a wall never read: UNOBSERVED.
+/// Judges `--mode wall-cruise`: a usage wall encountered and resumed under Cruise.
 pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict {
     let Some((raised, reset_s)) = seen.cover.wall else {
         return Verdict::Unobserved(
@@ -1342,20 +1165,7 @@ pub(super) fn judge_wall_cruise(seen: &Seen, program: &str, t0: i64) -> Verdict 
     ))
 }
 
-/// W9, THE RELAUNCH UNDER A STANDING WALL (`--mode wall-relaunch`): the
-/// agent met the wall the land act met, the wall READ as one and NOTHING
-/// TYPED into it; then the lab ended the agent and launched it again in the
-/// same tab, as a person restarting it would ([`Cover::relaunch`]), its
-/// prompt meeting the stub's wall again (never lifted for it). A relaunch
-/// no host made, on a seat nothing vouches for, is tried once at once
-/// (`TurnEndState::relaunch_startup`): ONE `usage-resume@v1` typed after the
-/// relaunch and before the wall is read again is that try; anything else
-/// typed from the relaunch to the reset is TYPED INTO THE WALL. The wall
-/// read again before the reset; past it the harness GOES ON
-/// ([`gone_past`]); no landing while it stands; no stall, no reply's need,
-/// no harness text in the wall before the relaunch ([`forever_faults`]);
-/// landed, quiet after. No relaunch made, or the wall never read before it
-/// or after it: UNOBSERVED.
+/// Judges `--mode wall-relaunch`: an agent relaunched in the same tab under a standing usage wall.
 pub(super) fn judge_wall_relaunch(
     seen: &Seen,
     land: Option<&(i64, String)>,
@@ -1473,17 +1283,7 @@ pub(super) fn judge_wall_relaunch(
     landed(seen, done, Vec::new(), &said, t0)
 }
 
-/// W10, GEMINI CLI'S PER-MODEL BUCKET (`--mode wall-bucket`): the CLI on its
-/// Auto model routed to a Pro model whose spent quota (a reset named) has a
-/// model to fall back to ([`crate::stub::gemini::BUCKET_CLAIM`]), so it draws
-/// the bucket's dialog — `Switch to <fallback>`
-/// over `Stop`, no `Keep trying`. W1's judge holds ([`cover::judge_wall`]:
-/// nothing pressed or typed in the wall, gone on past the reset, landed);
-/// and the try is the dialog's STOP ([`RULE_LIMIT_STOP`] `approved`) at or
-/// past the due its wait named ([`cover::press_due`]), then the resume typed
-/// at the error it leaves; NEVER THE SWITCH (the model is the person's): no
-/// approved row naming it. No Stop pressed (the dialog drawn was the
-/// account's, its `Keep trying` pressed instead): UNOBSERVED, said.
+/// Judges `--mode wall-bucket`: answering Gemini CLI's per-model fallback dialog with `Stop` and resuming without switching models.
 pub(super) fn judge_wall_bucket(
     seen: &Seen,
     land: Option<&(i64, String)>,

@@ -99,7 +99,9 @@ fn pointer_anchor_at_sel_row(
 }
 
 /// Map a winit mouse button to the engine's [`aterm_types::mouse::MouseButton`] for an [`InputEvent::MouseButton`].
-pub(crate) fn winit_mouse_button(b: WinitMouseButton) -> Option<aterm_types::mouse::MouseButton> {
+pub(crate) const fn winit_mouse_button(
+    b: WinitMouseButton,
+) -> Option<aterm_types::mouse::MouseButton> {
     use aterm_types::mouse::MouseButton;
     match b {
         WinitMouseButton::Left => Some(MouseButton::Left),
@@ -301,7 +303,7 @@ impl HoverMemo {
     }
 
     /// Whether this memo answered a citation for `session`.
-    pub(crate) fn answered_citation_of(&self, session: u64) -> bool {
+    pub(crate) const fn answered_citation_of(&self, session: u64) -> bool {
         self.session == session && self.named.is_some()
     }
 
@@ -352,7 +354,7 @@ pub(crate) enum PressedUrl<'a> {
 }
 
 impl<'a> PressedUrl<'a> {
-    fn url(self) -> &'a str {
+    const fn url(self) -> &'a str {
         match self {
             Self::Osc8(url) | Self::Plain(url) => url,
         }
@@ -459,7 +461,7 @@ pub(crate) fn shell_reads_local(integrated: bool, running: Option<&str>) -> bool
 }
 
 /// Whether the "open link" modifier is held.
-pub(crate) fn link_modifier_held(mods: aterm_window::keyboard::ModifiersState) -> bool {
+pub(crate) const fn link_modifier_held(mods: aterm_window::keyboard::ModifiersState) -> bool {
     #[cfg(target_os = "macos")]
     {
         mods.super_key()
@@ -471,12 +473,12 @@ pub(crate) fn link_modifier_held(mods: aterm_window::keyboard::ModifiersState) -
 }
 
 /// Audit M6: whether a left press starts a LOCAL text selection instead of being reported to a tracking app.
-pub(crate) fn press_starts_selection(tracking: bool, bypass_held: bool) -> bool {
+pub(crate) const fn press_starts_selection(tracking: bool, bypass_held: bool) -> bool {
     !tracking || bypass_held
 }
 
 /// Whether the held modifiers take a left press back from a mouse-tracking app ([`press_starts_selection`]).
-pub(crate) fn tracking_bypass_held(mods: aterm_window::keyboard::ModifiersState) -> bool {
+pub(crate) const fn tracking_bypass_held(mods: aterm_window::keyboard::ModifiersState) -> bool {
     mods.alt_key() || (cfg!(not(target_os = "macos")) && mods.shift_key())
 }
 
@@ -490,7 +492,7 @@ pub(crate) enum RightPressPlan {
 }
 
 /// Resolve a right press against the conhost/Windows Terminal convention (`right_click = "copy_paste"`).
-pub(crate) fn right_press_plan(
+pub(crate) const fn right_press_plan(
     gesture_on: bool,
     over_strip: bool,
     tracking: bool,
@@ -510,7 +512,7 @@ pub(crate) fn right_press_plan(
 }
 
 /// Selection kind for a single left press.
-pub(crate) fn press_selection_kind(option_held: bool, tracking: bool) -> SelectionType {
+pub(crate) const fn press_selection_kind(option_held: bool, tracking: bool) -> SelectionType {
     if option_held && !tracking {
         SelectionType::Block
     } else {
@@ -1026,6 +1028,8 @@ impl App {
             return (0, 0, 0, 0);
         };
         if self.active_tab_is_single_focused_pane(wid) {
+            // Exactly the plan's answer for a lone pane: the sanitized window bounds, built
+            // from `rows.max(1)`/`cols.max(1)`, so a bare `(ws.rows, ws.cols)` would disagree
             // at zero. The no-active-tab default below stays unmaxed.
             return (0, 0, ws.rows.max(1), ws.cols.max(1));
         }
@@ -1539,6 +1543,7 @@ impl App {
         if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
             self.finish_selection(wid, false);
             if let Some(ws) = self.windows.get_mut(&wid) {
+                // Clear the left reported bit like the release path does, so a later
                 // non-reporting press can't leak an orphan release.
                 forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
             }
@@ -1563,6 +1568,9 @@ impl App {
 
     /// The text of window `wid`'s live selection, resolved across panes.
     pub(crate) fn window_selection_text(&self, wid: WindowId) -> Option<String> {
+        // Ownership is decided by `has_selection()`, never by whether the selection resolves
+        // to text: rows are trailing-trimmed, so a painted selection over blank cells
+        // resolves to `None`, and falling through would copy a sibling pane the user never
         // touched (on every drag, with `copy_on_select` on).
         if let Some(terminal) = self.front_terminal(wid) {
             let term = term_lock(&terminal.term);
@@ -1746,6 +1754,7 @@ impl App {
         let seen = pressed.then(|| self.focused_session_id(wid)).flatten();
         self.on_mouse_input(wid, state, button);
         if pressed {
+            // Resolve the hit against the frame that was shown before stopping
             // the timer changes its label and invalidates that frame's stamp.
             self.interact_system_state(wid);
         }
@@ -1842,6 +1851,9 @@ impl App {
                         .band_hit_at(wid, x, y)
                         .is_some_and(|target| self.band_press_acts(wid, target))
                 {
+                    // Not while parked, as `notice` refuses (`take_notice`): the band crossed
+                    // to the successor in the carry the park captured, so a press here would
+                    // be undone at Commit while its side effects stood. Refused before any
                     // press is spent.
                     if self.update_handoff_parked() {
                         let line = aterm_messages::wire::switching_reply();
@@ -1860,6 +1872,7 @@ impl App {
             PointerAction::Leave => self.on_cursor_left(wid),
             PointerAction::Status => {}
             PointerAction::Mods(mods) => {
+                // Keep the person's own modifiers aside, once per script, for
                 // their next input to put back (`App::release_scripted_mods`).
                 if let Some(ws) = self.windows.get_mut(&wid)
                     && ws.scripted_mods_saved.is_none()
@@ -2268,6 +2281,7 @@ impl App {
     }
 
     fn press_band_at(&mut self, wid: WindowId, px: f64, py: f64) -> bool {
+        // Judged against the banner's own floor (`paste_banner_tray_floor_y`, `0` = none)
         // before the band's hit test, whether or not the band has a row under it.
         if let Some(paste_up) = self.band_banner_at(wid, px, py) {
             if paste_up {
@@ -2738,6 +2752,7 @@ impl App {
         } else if let Some(slot) = x.and_then(|x| self.find_box_slot(wid, &hit, x)) {
             self.search_click_caret_in(wid, slot);
         } else if hit.field_cols.contains(&col) {
+            // The well's first cell shows character `field_scroll`, so the click's
             // distance into it is the character index — the same mapping the paint used.
             self.search_click_caret_in(wid, hit.field_scroll + (col - hit.field_cols.start));
         }
@@ -2843,6 +2858,8 @@ impl App {
             HoverProbe::Deferred => parked,
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
+            // A plain write: the park/settle bracket at the event boundary owns
+            // the repaint decision, because only it can see what the value was
             // before the whole routing ran.
             ws.link_hover = resolved;
         }
@@ -3162,6 +3179,9 @@ impl App {
         y: f64,
         parked: Option<crate::link_target::LinkHover>,
     ) {
+        // A drag owns a user gesture, including one consumed by chrome below; plain hover
+        // owns no terminal input and keeps the move licence. Real mouse reports retire the
+        // licence at the input seam, whose byte receipt tells DEC1003 motion from
         // DEC1000/1002's byte-silent motion.
         if self.windows.get(&wid).is_some_and(|ws| {
             ws.selecting
@@ -3588,6 +3608,8 @@ impl App {
         let term = match self.front_terminal(wid) {
             Some(terminal) => terminal.term.clone(),
             None => {
+                // A tab close/switch can retire the front terminal between
+                // repeat ticks. Drop the old level-triggered deadline here or
                 // the event loop keeps re-observing a time in the past.
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.next_autoscroll = None;
@@ -4298,6 +4320,8 @@ impl App {
                     self.close_tab_menu(wid);
                 }
             } else {
+                // A swallowed release still settles a drag in flight when the menu popped,
+                // or a divider/selection drag would keep tracking motion this gate no longer
                 // delivers.
                 self.settle_pointer_drags(wid);
             }
@@ -4405,6 +4429,7 @@ impl App {
             })
         };
         if self.active_native_view(wid).is_some() && !terminal_beside {
+            // Every press this boundary takes is the page's until its release, a miss
             // included: its drag and wheel stay the page's (`pointer_route`).
             if pressed
                 && let Some(button) = winit_mouse_button(button)
@@ -4838,6 +4863,7 @@ impl App {
             let tracking = term_lock(&term).mouse_tracking_enabled();
             let option_held = mods_state.alt_key();
             if pressed && press_starts_selection(tracking, tracking_bypass_held(mods_state)) {
+                // Cmd-click (macOS) / Ctrl-click (elsewhere) on a link opens it (safe
                 // schemes only) instead of starting a selection; GUI-only, never the seam.
                 if link_modifier_held(mods_state) && self.open_link_under_pointer(wid) {
                     return;
@@ -4860,6 +4886,8 @@ impl App {
             if !pressed && self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
                 self.finish_selection(wid, false);
                 if let Some(ws) = self.windows.get_mut(&wid) {
+                    // Clear the Left bit too: this branch returns before the bookkeeping
+                    // below, and a stuck bit would let a later non-reporting press leak an
                     // orphan release.
                     forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
                 }
@@ -5344,7 +5372,7 @@ pub(crate) fn wheel_axis(x: f64, y: f64, floor: f64) -> Option<WheelAxis> {
     None
 }
 
-fn horizontal_dir(positive: bool) -> WheelDir {
+const fn horizontal_dir(positive: bool) -> WheelDir {
     if positive {
         WheelDir::Left
     } else {
@@ -5352,7 +5380,7 @@ fn horizontal_dir(positive: bool) -> WheelDir {
     }
 }
 
-fn vertical_dir(up: bool) -> WheelDir {
+const fn vertical_dir(up: bool) -> WheelDir {
     if up { WheelDir::Up } else { WheelDir::Down }
 }
 

@@ -4806,7 +4806,11 @@ pub fn marked_turns(body: &[u8], token: &str) -> Option<usize> {
     .max()
 }
 
-/// CLAUDE CODE'S OWN CONTINUATION of a usage limit, as its request carries it: the opening words of the user text it sends when its countdown fires at the reset (`Your claude.ai usage limit has reset.`
+/// CLAUDE CODE'S OWN CONTINUATION of a usage limit, as its request carries it: the opening
+/// words of the user text it sends when its countdown fires at the reset (`Your claude.ai
+/// usage limit has reset. Continue the task you were working on when the limit was reached;
+/// do not repeat work that is already complete.`, the transcript's `origin.kind`
+/// `auto-continuation` prompt), beside the act the limit cut.
 pub const CLAUDE_CONTINUES: &str = "Your claude.ai usage limit has reset. Continue the task";
 
 /// Whether request `body` of conversation `token` carries the program's own continuation of a usage limit: one of its user texts holds [`CLAUDE_CONTINUES`] (a Messages API body: Claude Code's).
@@ -5161,7 +5165,8 @@ pub fn claude_composer(rows: &[String]) -> Option<String> {
     Some(first.strip_prefix('❯').unwrap_or(&first).trim().to_string())
 }
 
-/// The option a dialog on `text` draws focused (`● 2.`
+/// The option a dialog on `text` draws focused (`● 2. Stop` inside its box's
+/// `│` borders reads `2. Stop`), or `None` where no row draws one.
 #[must_use]
 pub fn dialog_focus(text: &str) -> Option<String> {
     text.lines().find_map(|r| {

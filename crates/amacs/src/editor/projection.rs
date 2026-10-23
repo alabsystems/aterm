@@ -422,6 +422,9 @@ pub fn editor_grapheme_columns(grapheme: &str, column: usize) -> usize {
     if grapheme == "\t" {
         4 - column % 4
     } else if grapheme.chars().any(char::is_control) {
+        // The editor suppresses control clusters rather than asking the font
+        // rasterizer to render a terminal-style replacement cell. Geometry
+        // must make the same choice or projection, hit testing, and paint
         // disagree (and a control-only line defeats the visible-cell bound).
         0
     } else {
@@ -536,6 +539,10 @@ fn bounded_line_window(
             line_start,
             window_start,
         } => {
+            // Only the pathological primary line owns a proven bounded
+            // grapheme start. Other visible rows begin at their real line
+            // boundary rather than reusing a byte offset that could bisect a
+            // different cluster (and would require scanning an unbounded
             // prefix merely to recover tab phase).
             if start == line_start {
                 (window_start.clamp(start, end), 0)

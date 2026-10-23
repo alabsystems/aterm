@@ -786,6 +786,9 @@ fn alignment_edge(
     seq: u64,
     cols: u16,
 ) -> Option<(u8, u32)> {
+    // Nonblank partial typing means a feline token was replaced, even when it
+    // returns at the same position within the continuity window. Profanity
+    // also needs the completed token to end at the live caret: passive
     // redraws may restore a spent episode, a retyped `fuck` must re-arm.
     if ep.continuity_tainted
         && (occ.class == Class::Feline
@@ -1422,6 +1425,7 @@ fn burst_mutex_end(ep: &Episode) -> Option<Instant> {
     let win = match ep.burst_kind {
         Some(BurstKind::SuperNova) if ep.burst_roll => super_window_of(ep.burst_tier),
         Some(BurstKind::Nova) => {
+            // Duration-only decode: this runs from full-map walks every tick
             // and needs one genome field.
             Duration::from_millis(u64::from(nova_duration_ms(ep.genome.gkey)))
         }
@@ -3170,6 +3174,7 @@ impl WordDecorations {
             return false;
         };
         let Some((edit_row, edit_col)) = e.cell else {
+            // No caret has ever been scanned: abstain rather than veto (see
             // [`TypedEdit::cell`]).
             return true;
         };
@@ -3225,6 +3230,8 @@ impl WordDecorations {
         epoch: u64,
         now: Instant,
     ) {
+        // `last_epoch` is untouched, so the rescan re-fires after thaw; any
+        // `set_scan_base_y` declaration for this skipped snapshot is still
         // spent so it never serves a later undeclared rescan.
         if self.frozen_at.is_some() {
             self.trick_flash.declare_base_y(None, None);
@@ -3266,6 +3273,8 @@ impl WordDecorations {
                     &mut out,
                     &mut ink_full,
                 ) {
+                    // §3.6 cap saturated top-down: restart once from the
+                    // bottom-priority cutoff so the rows nearest the prompt keep
                     // their slots.
                     if start_row == 0 {
                         let cutoff = self.dense_scan_cutoff(
@@ -3366,6 +3375,8 @@ impl WordDecorations {
         context: Option<(EffectGeom, u32)>,
         cursor: Option<(u16, u16)>,
     ) {
+        // Frozen ⇒ no-op, as in [`rescan`](Self::rescan) (`last_epoch`
+        // untouched, so the rescan stays pending); spend any `set_scan_base_y`
         // declaration for this skipped snapshot.
         if self.frozen_at.is_some() {
             self.trick_flash.declare_base_y(None, None);
@@ -3397,6 +3408,7 @@ impl WordDecorations {
                     &mut out,
                     &mut ink_full,
                 ) {
+                    // §3.6 cap saturated top-down: restart once from the
                     // bottom-priority cutoff (as in the term-walk twin).
                     if start_row == 0 {
                         let cutoff = self.dense_scan_cutoff(
@@ -3984,6 +3996,7 @@ impl WordDecorations {
             let lo = unseen[..unseen_len].partition_point(|&(f, _)| f < form_id);
             let hi = unseen[lo..unseen_len].partition_point(|&(f, _)| f == form_id) + lo;
             for &(_, k) in &unseen[lo..hi] {
+                // Order does not matter; `align_old` is sorted below by
                 // `(last_row, last_col, key)`.
                 if let std::collections::hash_map::Entry::Occupied(entry) = self.persist.entry(k)
                     && entry.get().form_id == form_id
@@ -4197,6 +4210,7 @@ impl WordDecorations {
         self.curse_cues.clear();
         self.peek_cues.clear();
         if !self.host_brackets_frames {
+            // No host frame bracket: one baker prologue per tick. A bracketing
             // host resets it once per presented frame, so panes share the budget.
             self.cat_baker_ready = false;
         }
@@ -4353,6 +4367,7 @@ impl WordDecorations {
                     break 'graphic;
                 }
                 {
+                    // v3 §1.1: born-done / born-settled episodes are inert —
                     // the graphic one-shot is pre-spent, zero quads ever.
                     if occ.inert {
                         break 'graphic;
@@ -4506,6 +4521,7 @@ impl WordDecorations {
                     }
                 }
                 Some(BurstKind::Sparkle | BurstKind::Starburst) => {
+                    // v3 §1.1: born-done / born-settled sparkles are inert —
                     // the burst played (or resize-settled); zero decos.
                     if occ.inert {
                         continue;
@@ -4553,6 +4569,9 @@ impl WordDecorations {
                     } else {
                         let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
                         let f = if cfg.reduced_motion {
+                            // Under reduced motion: no static resurrection once
+                            // the burst one-shot faded (`burst_done`). A
+                            // reduced-from-birth episode never advances the
                             // flag, so its static spark persists.
                             (!ep.is_some_and(|e| e.burst_done)).then_some(1.0f32)
                         } else if t < cfg.anim_ms + RESIDUAL_FADE_MS {
@@ -4728,6 +4747,7 @@ impl WordDecorations {
                         let arm = if !is_animal && cfg.feline_style != FelineStyle::Cat {
                             KittyShownAs::PawStyle
                         } else if !drawable {
+                            // Drawability includes text clearance, so a word born
                             // under dense output does not claim a §5.2 slot.
                             KittyShownAs::PawFallbackFloor
                         } else if is_animal {
@@ -4751,6 +4771,8 @@ impl WordDecorations {
                     }
                     match ep.shown_as {
                         Some(KittyShownAs::Cat) if !ep.peek_done => {
+                            // Latch the pause on the first ineligible tick; on
+                            // the first eligible tick shift `phase_start` by the
                             // paused span so the cat resumes where it vanished.
                             if drawable {
                                 if let Some(paused_at) = ep.peek_pause.take()
@@ -4780,6 +4802,7 @@ impl WordDecorations {
                             }
                         }
                         Some(KittyShownAs::PawStyle) => {
+                            // Style says "no cat art": nothing will draw, so the
                             // one-shot completes at once.
                             if !cfg.reduced_motion
                                 && let Some(ps) = ep.phase_start
@@ -4820,6 +4843,10 @@ impl WordDecorations {
         let seq = self.rescan_seq;
         let marks = &mut self.done_marks;
         for (ident, ep) in &mut self.persist {
+            // Scrolled-off mid-peek completion: `episode_prepass` only walks
+            // visible occurrences, so finish such an episode here against its
+            // latched `peek_total`. Paused episodes are exempt (the peek resumes
+            // if the word returns with clear rows), and reduced motion never
             // advances flags.
             if !reduced_motion
                 && ep.seen_seq != seq
@@ -4872,6 +4899,7 @@ impl WordDecorations {
         self.super_until = None;
         self.prune_ignitions(now);
         if cfg.reduced_motion {
+            // reduced_motion suppresses the supernova outright (the word keeps
             // its static rainbow); perf_reduced degrades via freeze/thaw.
             return None;
         }
@@ -4929,6 +4957,7 @@ impl WordDecorations {
             let grid_h = i32::from(geom.rows) * ch;
             let r_max = supernova::r_max_for(ch, grid_h);
             if ep.nova_start.is_none() {
+                // Deferred while selected (§3.2 safety) or while another
                 // supernova holds the mutex (MAX_ACTIVE_SUPERNOVAE = 1).
                 if busy
                     || sel.is_some_and(|sv| sv.span_selected(occ.row, occ.start_col, occ.end_col))
@@ -4992,6 +5021,7 @@ impl WordDecorations {
         let mut until: Option<Instant> = None;
         let scope = self.scan_scope();
         for (i, occ) in self.occ.iter().enumerate() {
+            // v3 §6 dispatch: the classic nova is the `BurstKind::Nova` arm
             // (profanity `style = "nova"` and custom specs alike).
             if occ.spec.burst.map(|b| b.kind) != Some(BurstKind::Nova) {
                 continue;
@@ -5006,6 +5036,7 @@ impl WordDecorations {
             let (cx, cy) = burst_center(occ, geom);
             let r_max = nova_radius(occ.genome.gkey) * ch.max(1) as f32;
             if ep.nova_start.is_none() {
+                // `chance_pct`: a rolled-off burst never ignites (episodes with
                 // a pre-granted `nova_start` are past the roll).
                 if !ep.burst_roll {
                     continue;
@@ -5163,6 +5194,8 @@ fn grant_ignition(
     center: (i32, i32),
     overlap_dist: f32,
 ) -> Option<Instant> {
+    // Memory bound, per scope (each pane or declared session holds its own
+    // episodes). The safety bound is the rolling-window count below, over
     // every scope.
     if igns.iter().filter(|r| r.pane == pane).count() >= MAX_IGNITION_RESERVATIONS {
         return None;
@@ -5572,6 +5605,7 @@ fn ink_fx(
         let pair = (hue_nudge(core, n0), hue_nudge(fringe, n1));
         let done = ep.is_none_or(|e| e.nova_done);
         if cfg.reduced_motion || done {
+            // §6.1 Ember: the settled gradient shifted to the palette's ember
             // tone (reduced_motion takes it from frame 0 — the static glint).
             fx.pair = Some(nova::ember_pair(pair, magic));
         } else {
@@ -6026,6 +6060,7 @@ fn emit_cat(
         return;
     };
     if peek.unlogged && ctx.sightings.len() < MAX_OCCURRENCES {
+        // The pet's bat cue rides the same edge, with the dest rect that is
         // final only here. Cap-truncation drops the gag, never the log.
         if ctx.peek_cues.len() < MAX_PEEK_CUES {
             ctx.peek_cues.push(PeekCue {
@@ -6136,6 +6171,9 @@ fn emit_peek<'a>(
     let dwell_end = CAT_RISE_MS + dwell;
 
     let (t, in_rise, in_dwell) = if cfg.reduced_motion {
+        // A completed peek stays done under reduced motion (unfocused windows
+        // are demoted to it). The clock latched at birth, so the pose shows
+        // from the first presented frame and the flags never advance while
         // reduced. An unlatched clock (defensive) shows nothing.
         if peek.peek_done || peek.start.is_none() {
             return None;
@@ -6439,6 +6477,7 @@ fn emit_ink(
         };
         (center, 0.65 * ramp_in * ramp_out)
     } else {
+        // Settled (or reduced motion): zero highlight ⇒ the emitted bytes are
         // exactly mix_rgb(base_fg, base(u), strength) — constant forever.
         (0.0, 0.0)
     };
@@ -6485,6 +6524,7 @@ fn emit_ink(
     }
     if animating {
         let until = if ink_loop {
+            // A looping sweep never settles while visible; keep the scheduler's
             // is_active chain armed one window ahead.
             now + Duration::from_millis(sweep)
         } else {

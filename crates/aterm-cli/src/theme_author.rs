@@ -2,21 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Theme authoring: `aterm theme check | new | export | schema`.
-//!
-//! These are for whoever writes a theme, a person or an agent. Each one is
-//! built from the pieces the window itself uses, so its answer is the
-//! window's answer:
-//!
-//! * `check` reads a file with the one native parser
-//!   ([`scheme::parse_theme_located`]), admits it as the themes folder does
-//!   ([`ThemeMeta::admit`], measured by the front door's classifier), and
-//!   adds the full contrast report ([`scheme::contrast_report`]).
-//! * `new` and `export` write through the one serializer
-//!   ([`scheme_import::to_native_conf`] and its commented form), seeded from
-//!   the theme catalog the front door hands in.
-//! * `schema` prints the one key table ([`scheme::THEME_KEYS`]) the parser
-//!   reads keys by, so it cannot describe a key the parser reads otherwise.
+//! Theme authoring commands (`check`, `new`, `export`, and `schema`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -34,21 +20,16 @@ use aterm_types::{scheme_import, scheme_install};
 
 use crate::theme_cmd::{Outcome, ThemeHost, read_bounded, write_atomically};
 
-/// The schema version of `check --format json` and `schema --format json`.
-/// A field is only ever added within a version.
+/// Schema version of `check --format json` and `schema --format json`.
 pub(crate) const DOCUMENT_VERSION: u64 = 2;
 
-/// `check`'s exit code for a theme that loads (warnings or not, without
-/// `--strict`).
+/// Exit code for `check` when a theme loads.
 pub(crate) const EXIT_LOADS: u8 = 0;
-/// `check --strict`'s exit code for a theme that loads with warnings.
+/// Exit code for `check --strict` when a theme loads with warnings.
 pub(crate) const EXIT_WARNINGS: u8 = 1;
-/// `check`'s exit code for a theme that does not load (and for a usage
-/// error, as every `aterm theme` command).
+/// Exit code for `check` when a theme does not load or on usage errors.
 pub(crate) const EXIT_INVALID: u8 = 2;
 
-/// A command's operands: positionals, `--flag value` (or `--flag=value`)
-/// values, and switches.
 #[derive(Default)]
 struct Operands {
     positional: Vec<String>,
@@ -56,9 +37,6 @@ struct Operands {
     switches: BTreeSet<&'static str>,
 }
 
-/// Read `args` for a command taking `value_flags` and `switches`; `None` for
-/// `--help`. Operands must be UTF-8. Value flags may be given once; repeating
-/// a switch has the same effect as giving it once.
 fn operands(
     args: &[OsString],
     value_flags: &[&'static str],
@@ -109,7 +87,6 @@ fn operands(
     Ok(Some(out))
 }
 
-/// The one positional operand a command takes, named `what` in the error.
 fn one_positional(operands: &Operands, what: &str) -> Result<String, String> {
     match operands.positional.as_slice() {
         [one] => Ok(one.clone()),
@@ -133,17 +110,14 @@ fn hex(colour: Rgb) -> String {
     format!("#{:02x}{:02x}{:02x}", colour.r, colour.g, colour.b)
 }
 
-/// A WCAG ratio in hundredths as a JSON number (`450` is `4.5`).
 fn ratio(hundredths: u32) -> f64 {
     f64::from(hundredths) / 100.0
 }
 
-/// `d.dd:1`.
 fn ratio_text(hundredths: u32) -> String {
     format!("{}.{:02}:1", hundredths / 100, hundredths % 100)
 }
 
-/// The document as one line of JSON and a newline.
 fn json_line(value: &Value) -> String {
     let mut text = aterm_json::to_string(value).unwrap_or_else(|_| "null".to_string());
     text.push('\n');
@@ -169,17 +143,10 @@ fn failure(verb: &str, message: &str) -> Outcome {
     }
 }
 
-// ───────────────────────────── check ─────────────────────────────
-
-/// How severe one `check` diagnostic is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Severity {
-    /// The theme does not load.
     Error,
-    /// It loads, but something will be hard to read or will not be found.
     Warning,
-    /// It loads as written; this says how it will apply on this machine
-    /// (a font it names is not installed here). `--strict` ignores notes.
     Note,
 }
 
@@ -193,11 +160,9 @@ impl Severity {
     }
 }
 
-/// One `check` finding, pointing at a line and key where it has them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Diagnostic {
     severity: Severity,
-    /// Stable, snake_case: what kind of finding (documented in `HELP`).
     code: &'static str,
     line: Option<usize>,
     key: Option<String>,
@@ -218,7 +183,6 @@ impl Diagnostic {
     }
 }
 
-/// A theme that loaded, as `check` reports it.
 struct Loaded {
     meta: ThemeMeta,
     scheme: aterm_types::ColorScheme,
@@ -227,15 +191,11 @@ struct Loaded {
     bold_is_bright: Option<bool>,
 }
 
-/// What `check` found in one file.
 struct CheckReport {
     file: String,
-    /// The file's stem: the id `theme = "<id>"` would name it by.
     id: Option<String>,
     loaded: Option<Loaded>,
     diagnostics: Vec<Diagnostic>,
-    /// The signature bars the theme misses, when `--signature` asked and
-    /// the theme loaded.
     signature: Option<Vec<SignatureDefect>>,
 }
 
@@ -265,8 +225,6 @@ impl CheckReport {
     }
 }
 
-/// The diagnostic for an admission warning, at the line of the key it is
-/// about.
 fn warning_diagnostic(warning: ThemeWarning, lines: &ThemeKeyLines) -> Diagnostic {
     let (code, key, index) = match warning {
         ThemeWarning::LowTextContrast { .. } => ("low_text_contrast", ThemeKey::Foreground, None),
@@ -296,9 +254,6 @@ fn warning_diagnostic(warning: ThemeWarning, lines: &ThemeKeyLines) -> Diagnosti
     }
 }
 
-/// What the themes folder would make of a file at `path`: the id it would
-/// be named by, and warnings when the folder would not load it under that
-/// name.
 fn id_diagnostics(path: &Path) -> (Option<String>, Vec<Diagnostic>) {
     let warn = |code, message: String| Diagnostic {
         severity: Severity::Warning,
@@ -345,7 +300,6 @@ fn id_diagnostics(path: &Path) -> (Option<String>, Vec<Diagnostic>) {
     (Some(id), out)
 }
 
-/// Check the theme file at `path`: parse, admit, measure.
 fn check_file(path: &Path, host: &dyn ThemeHost) -> CheckReport {
     let file = path.display().to_string();
     let (id, id_warnings) = id_diagnostics(path);
@@ -381,7 +335,6 @@ fn check_file(path: &Path, host: &dyn ThemeHost) -> CheckReport {
                 line: (line > 0).then_some(line),
                 key: key.clone(),
                 message: match foreign_format {
-                    // The full sentence names `aterm theme import`.
                     Some(_) => error.to_string(),
                     None => reason.clone(),
                 },
@@ -421,14 +374,8 @@ fn check_file(path: &Path, host: &dyn ThemeHost) -> CheckReport {
     }
 }
 
-/// The least `OkLab` lightness between the derived palette's dark and light
-/// anchors below which `check` warns: under it the 256-colour cube and grey
-/// ramp span too little lightness to tell their slots apart.
 const PALETTE_ANCHOR_MIN_SPAN: f64 = 0.5;
 
-/// With `palette_generate = true`: a note naming the anchors slots 16-255 are
-/// derived from, and a warning when those anchors are too close in lightness
-/// ([`PALETTE_ANCHOR_MIN_SPAN`]).
 fn palette_notes(scheme: &aterm_types::ColorScheme, lines: &ThemeKeyLines) -> Vec<Diagnostic> {
     if !scheme.palette_generate {
         return Vec::new();
@@ -478,9 +425,6 @@ fn palette_notes(scheme: &aterm_types::ColorScheme, lines: &ThemeKeyLines) -> Ve
     out
 }
 
-/// A note for each font the theme names that is not installed here (the
-/// host's answer; a host that cannot tell says nothing). The theme still
-/// loads: aterm falls to the next rung.
 fn font_notes(
     typography: &scheme::ThemeTypography,
     lines: &ThemeKeyLines,
@@ -596,8 +540,6 @@ fn check_json(report: &CheckReport, strict: bool) -> Value {
     })
 }
 
-/// The typography a theme sets, key by key as the file writes it (`{}` for
-/// none).
 fn typography_json(typography: &scheme::ThemeTypography) -> Value {
     let mut map = aterm_json::Map::new();
     for spec in THEME_KEYS
@@ -703,8 +645,6 @@ pub(crate) fn check(args: &[OsString], host: &dyn ThemeHost) -> Outcome {
     }
 }
 
-// ───────────────────────────── new ─────────────────────────────
-
 /// `aterm theme new <name> [--from <theme>] [--appearance dark|light] [--force]`.
 pub(crate) fn new(args: &[OsString], theme_dir: Option<&Path>, host: &dyn ThemeHost) -> Outcome {
     let operands = match operands(args, &["--from", "--appearance"], &["--force"]) {
@@ -739,7 +679,6 @@ pub(crate) fn new(args: &[OsString], theme_dir: Option<&Path>, host: &dyn ThemeH
     };
     let force = operands.switches.contains("--force");
 
-    // The seed: the named theme, else Default (Default Light for light).
     let from = operands.values.get("--from").cloned().unwrap_or_else(|| {
         match wanted {
             Some(Appearance::Light) => "Default Light",
@@ -751,8 +690,6 @@ pub(crate) fn new(args: &[OsString], theme_dir: Option<&Path>, host: &dyn ThemeH
         Ok(seed) => seed,
         Err(why) => return failure("new", &format!("--from {from:?}: {why}")),
     };
-    // `--appearance` names the side; a seed drawn for the other one is
-    // swapped for its pair, if it has one.
     if let Some(wanted) = wanted
         && seed.meta.appearance != wanted
     {
@@ -781,8 +718,6 @@ pub(crate) fn new(args: &[OsString], theme_dir: Option<&Path>, host: &dyn ThemeH
         return failure("new", &scheme_install::case_collision_message(&other, &id));
     }
 
-    // The new theme: the seed's colours under its own name, its appearance
-    // declared, and no description or author (written as examples to fill in).
     let mut scheme = seed.theme.scheme.clone();
     scheme.name = scheme_import::sanitize_text(&id).unwrap_or_default();
     scheme.appearance = seed.meta.appearance;
@@ -798,14 +733,10 @@ pub(crate) fn new(args: &[OsString], theme_dir: Option<&Path>, host: &dyn ThemeH
         "Every key is listed by: aterm theme schema --format text".to_string(),
     ];
     let header: Vec<&str> = header.iter().map(String::as_str).collect();
-    // The seed's type settings and `bold_is_bright` come along with its
-    // colours; keys it leaves out are written as commented examples.
     let mut expected = ParsedTheme::colours_only(scheme, true, None, None);
     expected.typography = seed.theme.typography.clone();
     expected.bold_is_bright = seed.theme.bold_is_bright;
     let text = scheme_import::to_native_conf_package_commented(&expected, &header);
-    // What the file must read back as: the native parser is the window's
-    // only reader.
     match scheme::parse_theme_str(&text) {
         Ok(read_back) if read_back == expected => {}
         _ => {
@@ -824,8 +755,6 @@ pub(crate) fn new(args: &[OsString], theme_dir: Option<&Path>, host: &dyn ThemeH
     }
 }
 
-// ───────────────────────────── export ─────────────────────────────
-
 /// The native file for a catalog theme, as `export` writes it.
 pub(crate) fn export_text(theme: &CatalogTheme) -> String {
     let source = if scheme::builtin_theme(&theme.id).is_some() {
@@ -834,9 +763,6 @@ pub(crate) fn export_text(theme: &CatalogTheme) -> String {
         format!("the themes-folder theme {:?}", theme.id)
     };
     let header = format!("Exported by `aterm theme export` from {source}.");
-    // The whole theme: colours, identity, `schema`, `bold_is_bright` and
-    // typography. Keys a newer-schema file set that this aterm skipped
-    // cannot be written; `theme check` names them.
     scheme_import::to_native_conf_package(&theme.theme, &[&header])
 }
 
@@ -883,9 +809,6 @@ pub(crate) fn export(args: &[OsString], host: &dyn ThemeHost) -> Outcome {
     }
 }
 
-// ───────────────────────────── schema ─────────────────────────────
-
-/// What a value of `value` must look like.
 fn constraints(value: ThemeValueType) -> Value {
     match value {
         ThemeValueType::Colour => json!({
@@ -939,7 +862,6 @@ fn constraints(value: ThemeValueType) -> Value {
     }
 }
 
-/// What a font name must be: a family, never a file or a path.
 fn font_name_constraints() -> Value {
     json!({
         "max_chars": scheme::MAX_THEME_FONT_NAME_CHARS,
@@ -1017,7 +939,6 @@ pub(crate) fn schema_json() -> Value {
     })
 }
 
-/// `aterm theme schema --format text`.
 fn schema_text() -> String {
     let mut out = String::from(
         "aterm theme file: one `key = value` per line. A line starting with `#` or `;`\n\
@@ -1172,8 +1093,6 @@ mod tests {
     const GOOD: &str = "name = Harbour\nappearance = dark\nforeground = #e0e0e0\n\
                         background = #101418\ncursor = #7aa2f7\nselection = #2a3a50\n";
 
-    /// A theme that loads exits 0 in both forms, strict or not; its JSON says
-    /// so and carries a contrast row for every pair the theme rests on.
     #[test]
     fn check_passes_a_good_theme() {
         let dir = scratch("good");
@@ -1204,7 +1123,6 @@ mod tests {
             Some("declared")
         );
         let contrast = field(&doc, "contrast").as_array().unwrap();
-        // fg/bg, 16 ANSI slots, the band, text on the band, the cursor.
         assert_eq!(contrast.len(), 20);
         assert!(
             contrast
@@ -1223,8 +1141,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A theme that does not load exits 2 with a line-numbered error naming
-    /// the key; another terminal's file names its format.
     #[test]
     fn check_refuses_an_invalid_theme() {
         let dir = scratch("invalid");
@@ -1261,9 +1177,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A theme that loads with warnings exits 0, or 1 under --strict; each
-    /// warning points at its key's line, and the contrast row under the bar
-    /// says so.
     #[test]
     fn check_reports_warnings_and_strict_fails_on_them() {
         let dir = scratch("warn");
@@ -1328,9 +1241,6 @@ mod tests {
             EXIT_WARNINGS
         );
 
-        // An authored chrome colour at the background is below its floor:
-        // the warning points at its line. NEGATIVE CONTROL: the same file
-        // with an accent that clears 3:1 passes --strict.
         let chrome = dir.join("chrome.conf");
         let with_accent = |accent: &str| {
             format!("background = #1a1b26\nforeground = #c0caf5\naccent_color = {accent}\n")
@@ -1351,7 +1261,6 @@ mod tests {
         std::fs::write(&chrome, with_accent("#7aa2f7")).unwrap();
         assert_eq!(theme(&["check", path, "--strict"], None).code, EXIT_LOADS);
 
-        // A file the themes folder would not load under its name warns too.
         let shadowed = dir.join("Nord.conf");
         std::fs::write(&shadowed, GOOD).unwrap();
         let doc = json_of(&theme(
@@ -1359,7 +1268,6 @@ mod tests {
             None,
         ));
         assert_eq!(codes(&doc), ["shadowed_by_builtin"]);
-        // A link reads fine here, but the folder would not follow it.
         #[cfg(unix)]
         {
             let real = dir.join("real.conf");
@@ -1380,7 +1288,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Usage errors exit 2 and never read a file.
     #[test]
     fn authoring_usage_errors_exit_2() {
         for argv in [
@@ -1403,10 +1310,6 @@ mod tests {
         }
     }
 
-    /// `new` writes a theme that parses back to its seed's colours under its
-    /// own name, declared for the seed's appearance; `--appearance light`
-    /// seeds from Default Light, and swaps a dark `--from` for its pair. An
-    /// existing theme is kept unless --force.
     #[test]
     fn new_writes_a_theme_that_round_trips() {
         let dir = scratch("new").join("themes");
@@ -1443,7 +1346,6 @@ mod tests {
         ));
         assert_eq!(paired.scheme.ansi, seeded("Gruvbox Light").ansi);
 
-        // Exists: refused (exit 1) and kept; --force replaces it.
         let again = theme(&["new", "Harbour", "--from", "Nord"], Some(&dir));
         assert_eq!(again.code, 1, "{again:?}");
         let kept = std::fs::read_to_string(dir.join("Harbour.conf")).unwrap();
@@ -1454,22 +1356,17 @@ mod tests {
         ));
         assert_eq!(forced.scheme.ansi, seeded("Nord").ansi);
 
-        // The written file is one the checker loads.
         let path = dir.join("Harbour.conf");
         assert_ne!(
             theme(&["check", path.to_str().unwrap()], None).code,
             EXIT_INVALID
         );
-        // An unknown seed writes nothing.
         let missing = theme(&["new", "Other", "--from", "No Such Theme"], Some(&dir));
         assert_eq!(missing.code, 1);
         assert!(!dir.join("Other.conf").exists());
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    /// `export` is wired to the serializer (a built-in parses back equal;
-    /// every built-in's round trip is the serializer's own test); `--out`
-    /// writes it, and keeps an existing file unless --force.
     #[test]
     fn export_reparses_equal_and_out_respects_force() {
         let out = theme(&["export", "Nord"], None);
@@ -1499,8 +1396,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Replacing an export publishes a whole file at the destination name;
-    /// it must not follow a pre-existing link and truncate its target.
     #[cfg(unix)]
     #[test]
     fn a_forced_export_replaces_the_link_and_preserves_its_target() {
@@ -1526,7 +1421,6 @@ mod tests {
             scheme::parse_theme_str(&exported).unwrap(),
             CatalogTheme::builtin("Nord").unwrap().theme
         );
-        // No temporary file is left beside it.
         let names: BTreeSet<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -1535,10 +1429,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `check --signature` reports the bar aterm's signature themes clear: none
-    /// missed for a signature theme's export, some for a ported one, which
-    /// then fail the check only under --strict. Without the switch the field
-    /// is null.
     #[test]
     fn check_signature_measures_the_signature_bar() {
         let dir = scratch("signature");
@@ -1570,9 +1460,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A theme file built from nothing but `schema`'s JSON (each key's
-    /// example, every slot of an indexed key) parses; dropping a key the
-    /// schema calls required makes it fail, and dropping any other does not.
     #[test]
     fn a_file_built_from_the_schema_examples_parses() {
         let out = theme(&["schema"], None);
@@ -1580,7 +1467,6 @@ mod tests {
         let doc = json_of(&out);
         assert_eq!(field(&doc, "version").as_u64(), Some(DOCUMENT_VERSION));
         let keys = field(&doc, "keys").as_array().unwrap();
-        // Every key spelled by its name, or (for `spell.0`) by `spell.1`.
         let build_as = |skip: Option<&str>, spell: Option<(&str, &str)>| {
             let mut text = String::new();
             for key in keys {
@@ -1621,8 +1507,6 @@ mod tests {
                 assert_eq!(aliased.as_ref(), Ok(&full), "{alias}");
             }
         }
-        // Each key names its group, as the table does: the chrome rows are
-        // `chrome`, every other row `identity` or `colour`.
         for (key, spec) in keys.iter().zip(THEME_KEYS.iter()) {
             assert_eq!(field(key, "group").as_str(), Some(spec.group.label()));
             assert_eq!(
@@ -1643,8 +1527,6 @@ mod tests {
         assert!(!text.stdout.is_empty());
     }
 
-    /// A host whose catalog holds one typography theme `Studio` and whose
-    /// font answer says every name with `Zz` in it is not installed.
     struct TypeHost(CatalogTheme);
 
     impl ThemeHost for TypeHost {
@@ -1680,8 +1562,6 @@ mod tests {
         })
     }
 
-    /// `schema` describes every row of the table with its group and the
-    /// aterm.toml key that overrides it, and the schema gate.
     #[test]
     fn schema_names_each_keys_group_and_config_key() {
         let doc = json_of(&theme(&["schema"], None));
@@ -1706,9 +1586,6 @@ mod tests {
         }
     }
 
-    /// A font the theme names that is not installed is a note at its line:
-    /// the theme still loads and `--strict` still passes. Negative control: a
-    /// parse error fails `--strict`.
     #[test]
     fn check_notes_a_font_that_is_not_installed() {
         let host = type_host();
@@ -1744,18 +1621,12 @@ mod tests {
         assert_eq!(field(typography, "line_height").as_str(), Some("1.15"));
         let text = run(&args(&["check", path]), None, &host).stdout;
         assert!(text.contains("note[font_not_installed]"), "{text}");
-        // Negative control.
         std::fs::write(&file, format!("{STUDIO}line_height = big\n")).unwrap();
         let bad = run(&args(&["check", path, "--strict"]), None, &host);
         assert_eq!(bad.code, EXIT_INVALID);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Spec `scheme-generated-palette`: `palette_generate = true` earns a
-    /// note naming the anchors, and a warning when they are too close in
-    /// lightness for the derived cube and ramp to be told apart. NEGATIVE
-    /// CONTROLS: the same flag over a wide black-to-white span has the note
-    /// and no warning, and without the flag there is neither.
     #[test]
     fn theme_check_warns_on_close_palette_anchors() {
         let dir = scratch("palette-anchors");
@@ -1793,8 +1664,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `export` writes a typography theme whole, and `new --from` it carries
-    /// its typography and `bold_is_bright` into the new file.
     #[test]
     fn export_and_new_carry_typography() {
         let host = type_host();
@@ -1814,7 +1683,6 @@ mod tests {
         let back = scheme::parse_theme_str(&written).expect("new parses");
         assert_eq!(back.typography, host.0.theme.typography);
         assert_eq!(back.bold_is_bright, Some(false));
-        // Negative control: a colours-only seed writes no typography.
         let plain = run(
             &args(&["new", "Plain", "--from", "Nord"]),
             Some(&dir),
@@ -1831,15 +1699,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    /// `contrib/themes/` in the source tree: the community themes
-    /// (`contrib/themes/README.md` states the rule).
     fn contrib_themes() -> PathBuf {
-        // A directory literal (trailing '/'): aterm-verify seeds these tests
-        // from any change beneath it.
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/themes/")
     }
 
-    /// `check --strict` as JSON for `path`.
     fn strict_check(path: &Path) -> (Outcome, Value) {
         let path = path.to_str().expect("a UTF-8 path");
         let out = theme(&["check", path, "--strict", "--format", "json"], None);
@@ -1847,11 +1710,6 @@ mod tests {
         (out, doc)
     }
 
-    /// Law over the community folder: every file is the README, the authoring
-    /// GUIDE, or one `<id>.conf` that passes `aterm theme check
-    /// --strict` with its name, description, author and appearance declared.
-    /// Negative control: the same checker refuses a copy of a contributed
-    /// theme whose text sinks into its background.
     #[test]
     fn contrib_themes_pass_the_strict_check() {
         let dir = contrib_themes();
@@ -1865,8 +1723,6 @@ mod tests {
             if name == "README.md" || name == "GUIDE.md" {
                 continue;
             }
-            // The community pack: generated files with its own law
-            // (`pack_themes_pass_the_strict_check`).
             if name == "pack" {
                 assert!(path.is_dir(), "contrib/themes/pack is the pack's folder");
                 continue;
@@ -1923,12 +1779,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }
-    /// Law over the community pack: every embedded theme, written as
-    /// `<id>.conf`, passes `aterm theme check --strict` with its description
-    /// and author present and the appearance its manifest row declares. A
-    /// theme the checker comes to reject leaves the pack; it is never
-    /// patched. Negative control: a pack theme whose text sinks into its
-    /// background warns `low_text_contrast`.
+
     #[test]
     fn pack_themes_pass_the_strict_check() {
         let dir = scratch("pack-strict");

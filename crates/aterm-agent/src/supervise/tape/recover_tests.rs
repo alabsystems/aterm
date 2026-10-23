@@ -40,8 +40,6 @@ fn read_with(bytes: &[u8], keep: Keep, limits: Limits) -> Recovered {
     read(bytes, keep, Check::Xxh64, limits)
 }
 
-/// A 64 KiB reply stored once and then read again `n - 1` times: each repeat
-/// is one byte of body standing for a copy of the whole reply.
 #[test]
 fn a_body_repeated_past_what_a_read_holds_is_refused() {
     let reply: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
@@ -85,8 +83,6 @@ fn a_body_repeated_past_what_a_read_holds_is_refused() {
     assert_eq!(whole.items, items);
 }
 
-/// Every copy a read makes counts: a name spelled once and named by every
-/// item, and items that own nothing at all, which still take their own size.
 #[test]
 fn a_name_and_items_that_own_nothing_count_too() {
     let named = vec![
@@ -145,10 +141,6 @@ fn crowded(len: usize, last: &[u8]) -> (Vec<u8>, usize) {
     (bytes, at)
 }
 
-/// Bytes crowded with frame-like heads after a damaged frame cost the search
-/// a bounded amount, not the square of the file, and are refused rather than
-/// guessed torn: a quarter MiB of them would hash about 2 GiB unbounded, and
-/// the search hashes at most `SEARCH_FLOOR` (64 MiB) here.
 #[test]
 fn bytes_crowded_with_frame_heads_are_refused_unsearched() {
     let (bytes, at) = crowded(256 * 1024, &[]);
@@ -167,9 +159,6 @@ fn bytes_crowded_with_frame_heads_are_refused_unsearched() {
     );
 }
 
-/// Within the bound the search is the exhaustive one: a whole frame behind a
-/// crowd it can afford to check makes the damage a fault, as it always did; a
-/// bound too small for the same crowd says only that it could not tell.
 #[test]
 fn within_its_bound_the_search_still_finds_a_whole_frame() {
     let whole = frame_bytes(Kind::Records, 2, &{

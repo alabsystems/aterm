@@ -6,7 +6,6 @@
 use super::*;
 use std::collections::BTreeSet;
 
-/// A world the tests describe: who lives, who holds what.
 #[derive(Default)]
 struct World {
     held: BTreeMap<Rdev, Vec<u32>>,
@@ -40,7 +39,6 @@ fn hdr() -> MasterHeader {
     }
 }
 
-/// A window process `pid` on `conn`, its HELLO stating `caps` beside BYE.
 fn connect(k: &mut KeeperCore, w: &mut World, conn: ConnId, pid: u32, caps: u8) -> Vec<Out> {
     assert!(k.accept(conn, pid, None));
     if !w.live_pids.contains(&pid) {
@@ -49,7 +47,6 @@ fn connect(k: &mut KeeperCore, w: &mut World, conn: ConnId, pid: u32, caps: u8) 
     k.hello(conn, PeerClass::App, CAP_SENDS_BYE | caps, 0, w)
 }
 
-/// `pid` is SIGKILLed: its connection's EOF, then its status.
 fn kill(k: &mut KeeperCore, w: &mut World, conn: ConnId, pid: u32) -> Vec<Out> {
     w.live_pids.retain(|p| *p != pid);
     let mut out = k.eof(conn, 1, w);
@@ -66,7 +63,6 @@ fn closed(outs: &[Out]) -> Vec<CompanionId> {
         .collect()
 }
 
-/// The journal fields of the OFFER of `R` in `outs`.
 fn offer_of(outs: &[Out]) -> Option<Option<OfferJournal>> {
     outs.iter().find_map(|o| match o {
         Out::Offer { rdev, journal, .. } if *rdev == R => Some(*journal),
@@ -86,7 +82,6 @@ fn view(k: &KeeperCore) -> CompanionView {
     k.companion_view(R).expect("the record")
 }
 
-/// A journaling window that registered `R` on `conn` and sent its region `id`.
 fn journaled(k: &mut KeeperCore, w: &mut World, conn: ConnId, pid: u32, id: CompanionId) {
     connect(k, w, conn, pid, CAP_JOURNAL);
     k.register(conn, hdr(), vec![], R);
@@ -96,8 +91,6 @@ fn journaled(k: &mut KeeperCore, w: &mut World, conn: ConnId, pid: u32, id: Comp
     );
 }
 
-/// The happy path: a region is kept, rides the next window's offer with the brake at 0, stays
-/// while that window's claim is unsettled, and closes when its own region arrives.
 #[test]
 fn a_region_rides_its_offer_and_the_next_window_s_own_supersedes_it() {
     let mut k = KeeperCore::new(true);
@@ -147,9 +140,6 @@ fn a_region_rides_its_offer_and_the_next_window_s_own_supersedes_it() {
     );
 }
 
-/// §3.2 N4 and the cap: a restorer that dies after its claim, before its COMPANION, costs one
-/// attempt (the next offer says 1); one that dies before its claim costs another; at two the
-/// region closes and the offer carries none.
 #[test]
 fn restorers_that_die_before_their_companion_spend_the_brake_then_the_region() {
     let mut k = KeeperCore::new(true);
@@ -196,9 +186,6 @@ fn restorers_that_die_before_their_companion_spend_the_brake_then_the_region() {
     assert_eq!(view(&k).attempts, 0);
 }
 
-/// §3.2 J2 and N5: a window that does not journal is offered the master alone (its strict loop
-/// meets no COMPANION_OFFER), its offer's return costs no attempt, and its claim closes the
-/// region, which would otherwise show a screen from before its whole life after its death.
 #[test]
 fn a_window_that_does_not_journal_gets_no_region_and_its_claim_closes_it() {
     let mut k = KeeperCore::new(true);
@@ -224,8 +211,6 @@ fn a_window_that_does_not_journal_gets_no_region_and_its_claim_closes_it() {
     );
 }
 
-/// COMPANION_RELEASE settles a claim with no region: the claim's and the retained region close,
-/// the brake resets, and its death offers no region.
 #[test]
 fn a_released_companion_settles_the_claim_with_no_region() {
     let mut k = KeeperCore::new(true);
@@ -258,8 +243,6 @@ fn a_released_companion_settles_the_claim_with_no_region() {
     );
 }
 
-/// Only a window that stated CAP_JOURNAL, claiming the master, may send a companion of a kind
-/// this build knows; every refusal keeps nothing.
 #[test]
 fn companions_are_refused_by_name() {
     let mut k = KeeperCore::new(true);
@@ -299,8 +282,6 @@ fn companions_are_refused_by_name() {
     );
 }
 
-/// A link that reconnects and registers again keeps its process's region and its settling: a
-/// reconnect is no new reader, and the window's later death offers its region at attempts 0.
 #[test]
 fn a_reconnected_link_keeps_its_region_and_its_settling() {
     let mut k = KeeperCore::new(true);
@@ -336,9 +317,6 @@ fn a_reconnected_link_keeps_its_region_and_its_settling() {
     );
 }
 
-/// An update's two claimants. The outgoing window's region is the fallback until its successor
-/// settles, then superseded; whichever order the successor's COMPANION and the outgoing window's
-/// end come in, the successor's crash offers the successor's region.
 #[test]
 fn an_update_hands_the_region_on_whichever_comes_first() {
     for successor_first in [false, true] {
@@ -376,8 +354,6 @@ fn an_update_hands_the_region_on_whichever_comes_first() {
     }
 }
 
-/// A hold that ends with no successor's claim (the successor died before its REGISTER) orphans
-/// the master with no region: whoever held it may have read what no region saw.
 #[test]
 fn a_hold_that_ends_without_a_claim_offers_no_region() {
     let mut k = KeeperCore::new(true);
@@ -398,9 +374,6 @@ fn a_hold_that_ends_without_a_claim_offers_no_region() {
     assert_eq!(offer_of(&outs).flatten().and_then(|j| j.companion), None);
 }
 
-/// Teardown: a RELEASE (the tab closed) removes the record, so its master's `Close` closes every
-/// companion beside it, and the core holds none any more. (That the server's descriptors follow
-/// is `server.rs`'s test, and the kernel lane's.)
 #[test]
 fn a_record_s_end_takes_its_companions() {
     let mut k = KeeperCore::new(true);
@@ -412,7 +385,6 @@ fn a_record_s_end_takes_its_companions() {
     assert!(k.companions_held().is_empty());
 }
 
-/// The fault point the conformance's negative control plants: armed, no death counts.
 #[test]
 fn the_uncounted_fault_point_removes_the_brake_and_only_while_armed() {
     let run = |armed: bool| {
@@ -434,10 +406,6 @@ fn the_uncounted_fault_point_removes_the_brake_and_only_while_armed() {
     assert_eq!(run(false), 1, "disarmed after");
 }
 
-/// An update: the outgoing window `O` (connection 1, pid 500) journals region 1 and names its
-/// successor `S` (pid 600) in a PENDING; `S` says HELLO as a journaling window on connection 2
-/// and registers the master at its Commit, so both claim it and `S` reads it from now on. With
-/// `settled`, `S`'s own region 2 has arrived.
 fn committed_update(k: &mut KeeperCore, w: &mut World, settled: bool) {
     journaled(k, w, 1, 500, 1);
     w.live_pids.push(600);
@@ -453,9 +421,6 @@ fn committed_update(k: &mut KeeperCore, w: &mut World, settled: bool) {
     }
 }
 
-/// What the next journaling window is offered once an update's successor ended unsettled
-/// (`O`'s region, the fallback, with the attempt `S`'s end costs: `S` read output after its
-/// Commit that `O`'s region never saw) or settled (`S`'s own region, exact).
 fn after_the_successor(settled: bool) -> OfferJournal {
     if settled {
         OfferJournal {
@@ -470,12 +435,6 @@ fn after_the_successor(settled: bool) -> OfferJournal {
     }
 }
 
-/// §5 "orphaning" and §3.2 N4 across an update: from its Commit REGISTER the successor is the
-/// reader, and the outgoing window never becomes the reader again, whichever of the two deaths
-/// the keeper judges first. Settled, the successor's region is offered at attempts 0; unsettled,
-/// the outgoing window's region with one attempt counted, never at attempts 0 (which a restorer
-/// would replay to a stale screen and call exact). Before the fix, the successor judged first
-/// left the outgoing window the reader: its region was offered at attempts 0 both ways.
 #[test]
 fn the_outgoing_window_never_reads_again_after_its_successor_s_commit() {
     for settled in [false, true] {
@@ -502,11 +461,6 @@ fn the_outgoing_window_never_reads_again_after_its_successor_s_commit() {
     }
 }
 
-/// The same update whose outgoing window then ends at its Commit (`exit(0)`, inside the death
-/// grace): the hold the keeper judges by the successor's end keeps what that end already left,
-/// as the successor's death alone would have (its region at attempts 0, or the fallback with the
-/// attempt). Before the fix the hold closed every region, losing the settled successor's exact
-/// screen to the META rung.
 #[test]
 fn a_hold_judged_by_a_successor_that_registered_keeps_what_its_end_left() {
     for settled in [false, true] {
@@ -527,9 +481,6 @@ fn a_hold_judged_by_a_successor_that_registered_keeps_what_its_end_left() {
     }
 }
 
-/// The outgoing window's link reconnecting after the Commit (its REGISTER again moves its claim
-/// to the newer connection, the last in the list) does not make it the reader either: its
-/// region told again is only the fallback, and settles nothing.
 #[test]
 fn a_reconnected_outgoing_link_is_no_reader() {
     let mut k = KeeperCore::new(true);
@@ -568,9 +519,6 @@ fn a_reconnected_outgoing_link_is_no_reader() {
     );
 }
 
-/// The successor closing a tab (its RELEASE) while the outgoing window still claims ends the
-/// reader's claim the same way its death would: judged at once, settled or not, and the outgoing
-/// window is left claiming with no reader.
 #[test]
 fn a_successor_s_release_is_judged_as_the_reader_s_end() {
     for settled in [false, true] {
@@ -599,9 +547,6 @@ fn a_successor_s_release_is_judged_as_the_reader_s_end() {
     }
 }
 
-/// A missing exit watch leaves an EOF-only claim during the death grace. A new connection of
-/// the same PID may reuse the old journal only when its known birth does not contradict the
-/// old one. The world is RAM facts; no process, socket, exit watch or clock is exercised.
 #[test]
 fn a_known_different_birth_is_no_reconnect_even_after_eof() {
     let a = Birth {

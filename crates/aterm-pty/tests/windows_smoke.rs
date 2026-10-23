@@ -26,6 +26,7 @@ fn run_with_deadline(name: &str, body: impl FnOnce() + Send + 'static) {
         .expect("spawning the deadline worker thread must succeed");
     match rx.recv_timeout(DEADLINE) {
         Ok(()) => {
+            // Body completed; join is instantaneous (nothing runs after the
             // send), and a post-send panic is impossible by construction.
             if let Err(payload) = worker.join() {
                 std::panic::resume_unwind(payload);

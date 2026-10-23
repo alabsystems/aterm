@@ -2,13 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The item a derive receives: a struct, an enum or a union.
-//!
-//! The grammar is the Reference's (Items > Structs, Enumerations, Unions,
-//! Generic parameters, Where clauses, Attributes, Visibility). Attributes
-//! arrive with `cfg`/`cfg_attr` already applied and doc comments as
-//! `#[doc = "..."]`. Field types, bounds, defaults and discriminants are kept
-//! as the token runs they were written as; [`crate::parse_type`] reads a type
-//! when a macro needs to look inside one.
 
 use proc_macro::{Delimiter, Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 
@@ -69,11 +62,8 @@ pub struct Attribute {
 /// What follows an attribute's path.
 #[derive(Clone, Debug)]
 pub enum AttrArgs {
-    /// `#[path]`.
     None,
-    /// `#[path(...)]`, `#[path[...]]` or `#[path{...}]`.
     List(Group),
-    /// `#[path = value]`: the value's tokens.
     Value(Vec<TokenTree>),
 }
 
@@ -110,37 +100,22 @@ impl ToTokens for Attribute {
 /// A generic parameter.
 #[derive(Clone, Debug)]
 pub enum GenericParam {
-    /// `'a: 'b + 'c`.
     Lifetime {
-        /// Its outer attributes.
         attrs: Vec<Attribute>,
-        /// The lifetime.
         lifetime: Lifetime,
-        /// The lifetimes it outlives.
         bounds: Vec<Lifetime>,
     },
-    /// `T: Bound + Bound = Default`.
     Type {
-        /// Its outer attributes.
         attrs: Vec<Attribute>,
-        /// The name.
         ident: Ident,
-        /// Each `+`-separated bound, as written.
         bounds: Vec<TokenStream>,
-        /// The default, as written.
         default: Option<TokenStream>,
     },
-    /// `const N: Ty = Default`.
     Const {
-        /// Its outer attributes.
         attrs: Vec<Attribute>,
-        /// The `const` keyword.
         const_token: Ident,
-        /// The name.
         ident: Ident,
-        /// The type, as written.
         ty: TokenStream,
-        /// The default, as written.
         default: Option<TokenStream>,
     },
 }
@@ -182,16 +157,14 @@ impl Generics {
         self.params.is_empty()
     }
 
-    /// The parameter list for `impl<...>`: bounds kept, defaults dropped,
-    /// lifetimes first. Empty when there are no parameters.
+    /// The parameter list for `impl<...>`: bounds kept, defaults dropped, lifetimes first.
     #[inline]
     #[must_use]
     pub fn impl_generics(&self) -> TokenStream {
         self.list(true)
     }
 
-    /// The argument list for the type, `<'a, T, N>`. Empty when there are no
-    /// parameters.
+    /// The argument list for the type, `<'a, T, N>`.
     #[inline]
     #[must_use]
     pub fn ty_generics(&self) -> TokenStream {
@@ -320,11 +293,8 @@ impl Field {
 /// A struct's or a variant's fields.
 #[derive(Clone, Debug)]
 pub enum Fields {
-    /// `{ a: A, b: B }`.
     Named(Vec<Field>),
-    /// `(A, B)`.
     Unnamed(Vec<Field>),
-    /// No fields.
     Unit,
 }
 
@@ -360,11 +330,8 @@ pub struct Variant {
 /// The body of the item.
 #[derive(Clone, Debug)]
 pub enum Data {
-    /// A struct.
     Struct(Fields),
-    /// An enum.
     Enum(Vec<Variant>),
-    /// A union.
     Union(Vec<Field>),
 }
 
@@ -390,10 +357,9 @@ pub struct DeriveInput {
 }
 
 /// Parses the input of a `#[proc_macro_derive]`.
-///
 /// # Errors
-/// Anything that is not a struct, an enum or a union, as the compiler would
-/// hand it to a derive, at the first token that does not fit.
+/// Anything that is not a struct, an enum or a union, as the compiler would hand it to a derive, at
+/// the first token that does not fit.
 pub fn parse_derive_input(input: TokenStream) -> Result<DeriveInput, Error> {
     let mut c = Cursor::new(input, Span::call_site());
     let first_span = c.span();
@@ -470,7 +436,6 @@ pub fn parse_derive_input(input: TokenStream) -> Result<DeriveInput, Error> {
 }
 
 /// Parses outer attributes, `#[...]`, while they come.
-///
 /// # Errors
 /// A `#` not followed by `[...]`, or a bracket with no path.
 pub fn parse_attrs(c: &mut Cursor) -> Result<Vec<Attribute>, Error> {
@@ -481,7 +446,6 @@ pub fn parse_attrs(c: &mut Cursor) -> Result<Vec<Attribute>, Error> {
             return Err(Error::new(c.span(), "expected `[` after `#`"));
         };
         let mut inner = Cursor::of_group(&bracket);
-        // `#[unsafe(no_mangle)]`: the path is inside.
         if inner.peek_keyword("unsafe")
             && matches!(inner.peek_raw_nth(1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
         {
@@ -522,11 +486,8 @@ pub fn parse_attrs(c: &mut Cursor) -> Result<Vec<Attribute>, Error> {
     Ok(attrs)
 }
 
-/// Parses a visibility (`pub`, `pub(crate)`, `pub(self)`, `pub(super)`,
-/// `pub(in path)`), possibly inside a `$vis` None-group; empty when private.
 fn parse_vis(c: &mut Cursor) -> Vec<TokenTree> {
     // A None-group in front is a `$vis` fragment when it is empty or starts
-    // with `pub`; otherwise it is a tuple field's `$t:ty`, which stays whole.
     if let Some(TokenTree::Group(g)) = c.peek_raw()
         && g.delimiter() == Delimiter::None
     {
@@ -563,7 +524,6 @@ fn parse_vis(c: &mut Cursor) -> Vec<TokenTree> {
     vis
 }
 
-/// Parses `<...>` if it comes next.
 fn parse_generics(c: &mut Cursor) -> Result<Generics, Error> {
     let mut generics = Generics::default();
     if c.eat_punct('<').is_none() {
@@ -637,15 +597,12 @@ fn parse_generics(c: &mut Cursor) -> Result<Generics, Error> {
     Ok(generics)
 }
 
-/// A parameter's bounds, type or default: up to the top-level `,` or the `>`
-/// that closes the list, and, when `stop_at_eq`, a top-level `=`.
 fn take_param_run(c: &mut Cursor, stop_at_eq: bool) -> Vec<TokenTree> {
     c.take_run(|tt, top| {
         top && (is_punct(tt, ',') || is_punct(tt, '>') || (stop_at_eq && is_punct(tt, '=')))
     })
 }
 
-/// Parses `'name`.
 fn parse_lifetime(c: &mut Cursor) -> Result<Lifetime, Error> {
     let apostrophe = c.expect_punct('\'', "a lifetime")?;
     let ident = c.expect_ident("a lifetime's name")?;
@@ -655,7 +612,6 @@ fn parse_lifetime(c: &mut Cursor) -> Result<Lifetime, Error> {
     })
 }
 
-/// Parses `where p, q` up to the body's `{` or the `;`.
 fn parse_where(c: &mut Cursor) -> Vec<TokenStream> {
     c.eat_keyword("where");
     let mut predicates = Vec::new();
@@ -675,7 +631,6 @@ fn parse_where(c: &mut Cursor) -> Vec<TokenStream> {
     predicates
 }
 
-/// Parses `{ a: A, ... }`.
 fn parse_named(group: &Group) -> Result<Vec<Field>, Error> {
     let mut c = Cursor::of_group(group);
     let mut fields = Vec::new();
@@ -705,7 +660,6 @@ fn parse_named(group: &Group) -> Result<Vec<Field>, Error> {
     Ok(fields)
 }
 
-/// Parses `(A, ...)`.
 fn parse_unnamed(group: &Group) -> Result<Vec<Field>, Error> {
     let mut c = Cursor::of_group(group);
     let mut fields = Vec::new();
@@ -733,14 +687,12 @@ fn parse_unnamed(group: &Group) -> Result<Vec<Field>, Error> {
     Ok(fields)
 }
 
-/// Parses `{ A, B(..), C { .. } = 3, ... }`.
 fn parse_variants(group: &Group) -> Result<Vec<Variant>, Error> {
     let mut c = Cursor::of_group(group);
     let mut variants = Vec::new();
     while !c.is_empty() {
         let first_span = c.span();
         let attrs = parse_attrs(&mut c)?;
-        // The compiler rejects a visibility here; it parses one first.
         let _ = parse_vis(&mut c);
         let ident = c.expect_ident("a variant name")?;
         let mut last_span = ident.span();
@@ -754,7 +706,6 @@ fn parse_variants(group: &Group) -> Result<Vec<Variant>, Error> {
             Fields::Unit
         };
         let discriminant = if let Some(eq) = c.eat_punct('=') {
-            // An expression, not a type: `A = 1 << 0, B` has two variants.
             let run = c.take_expr()?;
             let Some(last) = run.last() else {
                 return Err(Error::new(eq.span(), "expected a discriminant after `=`"));

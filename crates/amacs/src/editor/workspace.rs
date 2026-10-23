@@ -365,6 +365,7 @@ impl EditorWorkspace {
             }
             KeyResolution::Prefix { display, reachable } => {
                 // A pending C-u stays on screen while the sequence it waits
+                // for is typed (`C-u 4 C-x — …`).
                 let argument = view
                     .prefix_argument
                     .map(|argument| format!("{} ", argument.label()))
@@ -624,6 +625,10 @@ impl EditorWorkspace {
             }
             EditorCommand::ScrollPageDown | EditorCommand::ScrollPageUp => {
                 // A page is the view's height less two lines of context. The
+                // view and the carets move by the same lines, so the caret
+                // keeps its row on screen; at either end the view stops and
+                // the carets go on to the first or last line, so no press is
+                // a no-op before the caret reaches the end of the document.
                 let snapshot = snapshot_for_view(store, view)?;
                 let lines = EditorLines::scanning(&snapshot.text);
                 let page = view.viewport_lines().saturating_sub(2).max(1);
@@ -807,6 +812,7 @@ impl EditorWorkspace {
             }
             EditorCommand::DigitArgument => {
                 // Reached only without a digit key (M-x, a button): there is
+                // no digit to take.
                 return Ok(vec![EditorEffect::Status(
                     "digit-argument is typed as M-0 … M-9".to_string(),
                 )]);

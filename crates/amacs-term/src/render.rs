@@ -121,7 +121,7 @@ const fn tab_cells(column: usize) -> u16 {
     }
 }
 
-/// Draw the buffer rows of `view` over `text` on `screen`.
+/// Draw the buffer rows of `view` over `lines` on `screen`.
 pub(crate) fn draw_body(
     screen: &mut Screen,
     lines: &EditorLines<'_>,

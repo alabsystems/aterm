@@ -32,14 +32,14 @@ pub(crate) enum Heal {
 
 impl Heal {
     /// Whether the tab stands in the row: a remedy the person reads.
-    fn in_row(self) -> bool {
+    const fn in_row(self) -> bool {
         !matches!(self, Self::NextPrompt)
     }
 }
 
 /// Remedy for a degraded tab ([`crate::harness_host::agent_of`]).
 #[must_use]
-pub(crate) fn heal_for(
+pub(crate) const fn heal_for(
     rekey_channel: bool,
     agent: Option<aterm_phase::Program>,
     harness_moves: bool,
@@ -135,7 +135,7 @@ impl IntegrationNotices {
     }
 
     /// Whether anything is owed a word.
-    pub(crate) fn owes(&self) -> bool {
+    pub(crate) const fn owes(&self) -> bool {
         self.owed || !self.records.is_empty() || !self.carry_reckoned
     }
 
@@ -234,6 +234,7 @@ impl App {
         }
         let notices = &mut self.integration_notices;
         if let Some(said) = notices.said.take() {
+            // The row this process said is gone from the glass unresolved:
             // the person put it down.
             notices.down.extend(said);
         }

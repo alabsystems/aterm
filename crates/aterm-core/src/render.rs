@@ -2359,6 +2359,7 @@ impl RenderInput {
             start_col,
             cols,
             |ch, col, width| {
+                // Materialize the ragged tail through this character's cells; the walk
                 // proves `col + width <= cols`.
                 if cells.len() < col + width {
                     cells.resize(col + width, pad);

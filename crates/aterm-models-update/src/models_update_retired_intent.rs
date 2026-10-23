@@ -5,9 +5,7 @@
 
 use aterm_spec::derive::Model;
 
-/// Reconciliation retires the stage whose durable identity changed. It releases only a latch
-/// naming those exact bytes; a later artifact's latch is unrelated. `Buggy=1` leaves a withdrawn
-/// build's permanent latch behind.
+/// Model verifying that reconciliation releases only the retry latch matching the retired stage's exact artifact.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_retired_intent_model() -> Model {
@@ -27,14 +25,12 @@ pub fn native_update_retired_intent_model() -> Model {
             }
 
             invariant NoObsoleteLatch: retired == 0 || exact == 0 || latched == 0;
-            // Dial 2 releases the latch for another artifact's stage too.
             invariant OtherArtifactUntouched: exact == 1 || latched == 1;
         }
     }
 }
 
-/// A failed attempt stays attributed to its original artifact after a newer stage is imported.
-/// `Buggy=1` derives the target at publication time.
+/// Model verifying that a failed attempt stays attributed to its original artifact after a newer stage is imported.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_failure_target_model() -> Model {

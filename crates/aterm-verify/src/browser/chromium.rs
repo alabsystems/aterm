@@ -136,21 +136,29 @@ fn is_shell(path: &Path) -> bool {
         .is_some_and(|n| n.contains("headless-shell") || n.contains("headless_shell"))
 }
 
-/// The browser to drive, or why there is none (a COULD NOT RUN sentence, naming [`FETCH_FIX`]).
+/// The browser `ATERM_BROWSER` names, when it is set: §8 rule 3's override, a
+/// person's explicit choice.
+fn named(value: Option<std::ffi::OsString>) -> Option<Result<Browser, String>> {
+    let path = PathBuf::from(value.filter(|v| !v.is_empty())?);
+    if !path.is_file() {
+        return Some(Err(format!(
+            "{BROWSER_ENV} names {}, which is not a file",
+            path.display()
+        )));
+    }
+    Some(Ok(Browser {
+        shell: is_shell(&path),
+        path,
+        source: BROWSER_ENV.to_string(),
+    }))
+}
+
+/// The browser lane's browser, or why there is none (a COULD NOT RUN sentence, naming
+/// [`FETCH_FIX`]): `ATERM_BROWSER`, else the pinned chrome-headless-shell, else an
+/// installed Chromium or Chrome (a host the pin does not cover, such as the Linux guest).
 pub(crate) fn find() -> Result<Browser, String> {
-    if let Some(named) = std::env::var_os(BROWSER_ENV).filter(|v| !v.is_empty()) {
-        let path = PathBuf::from(named);
-        if !path.is_file() {
-            return Err(format!(
-                "{BROWSER_ENV} names {}, which is not a file",
-                path.display()
-            ));
-        }
-        return Ok(Browser {
-            shell: is_shell(&path),
-            path,
-            source: BROWSER_ENV.to_string(),
-        });
+    if let Some(named) = named(std::env::var_os(BROWSER_ENV)) {
+        return named;
     }
     if let (Some(pin), Some(root)) = (host_pin(), host_cache_root()) {
         let binary = pinned_binary(&pinned_dir(&root, pin.platform), pin.platform);
@@ -178,6 +186,50 @@ pub(crate) fn find() -> Result<Browser, String> {
          none installed",
         host_cache_root().map_or_else(|| "the cache".to_string(), |p| p.display().to_string())
     ))
+}
+
+/// What the pinned shell answers to `Browser.getVersion` (`HeadlessChrome/<version>`):
+/// the browser the wasm lane's floors were recorded in.
+pub(crate) fn pinned_product() -> String {
+    format!("HeadlessChrome/{PIN_VERSION}")
+}
+
+/// The browser the wasm drivers run in ([`super::page`]), or why there is none:
+/// `ATERM_BROWSER` when it is set, else the pinned chrome-headless-shell exactly as
+/// `verify provision` placed it on this machine (its stamp admits the pin). Never an
+/// installed Chrome or a copy laid by hand: what the checks and the bench run in is the
+/// `chrome-headless-shell` row's (docs/DESIGN-init-system-2026-10-20.md §8).
+pub(crate) fn pinned() -> Result<Browser, String> {
+    pinned_from(
+        std::env::var_os(BROWSER_ENV),
+        crate::provision::this_machine(&crate::perf::workspace_root()).as_ref(),
+    )
+}
+
+/// [`pinned`] for an `ATERM_BROWSER` value and a machine (`None`: no `$HOME` names its
+/// caches).
+pub(crate) fn pinned_from(
+    env: Option<std::ffi::OsString>,
+    machine: Option<&crate::provision::Machine>,
+) -> Result<Browser, String> {
+    if let Some(named) = named(env) {
+        return named;
+    }
+    let Some(machine) = machine else {
+        return Err("no $HOME names this user's cache, where the pinned browser lives".into());
+    };
+    match crate::provision::placed_browser(crate::provision::Engine::Chromium, machine) {
+        Some(path) => Ok(Browser {
+            path,
+            shell: true,
+            source: format!("pinned chrome-headless-shell {PIN_VERSION}"),
+        }),
+        None => Err(format!(
+            "no pinned chrome-headless-shell {PIN_VERSION} placed in {} (an installed Chrome \
+             is not the pin)",
+            machine.browser.display()
+        )),
+    }
 }
 
 /// An ANGLE backend a session asks WebGL2 to run on (`--use-angle`).
@@ -224,11 +276,13 @@ pub(crate) fn sandbox_off(os: &str) -> bool {
 
 /// The browser's arguments: headless, a private profile under `profile`, DevTools on fds 3 and 4,
 /// WebGL2 on `angle`, without the sandbox where [`sandbox_off`], and nothing that throttles a page
-/// the lane is waiting on.
+/// the lane is waiting on. `extra` comes last before the first page (the wasm drivers'
+/// `--js-flags=--expose-gc`).
 pub(crate) fn launch_args(
     browser: &Browser,
     profile: &Path,
     angle: Angle,
+    extra: &[&str],
 ) -> Vec<std::ffi::OsString> {
     let mut v: Vec<std::ffi::OsString> = Vec::new();
     if !browser.shell {
@@ -258,6 +312,7 @@ pub(crate) fn launch_args(
         v.push("--no-sandbox".into());
     }
     v.push(format!("--use-angle={}", angle.name()).into());
+    v.extend(extra.iter().map(Into::into));
     v.push("about:blank".into());
     v
 }
@@ -294,8 +349,11 @@ mod tests {
             shell: false,
             ..shell.clone()
         };
-        let has =
-            |b: &Browser, a: &str| launch_args(b, profile, Angle::Metal).iter().any(|x| x == a);
+        let has = |b: &Browser, a: &str| {
+            launch_args(b, profile, Angle::Metal, &[])
+                .iter()
+                .any(|x| x == a)
+        };
         assert!(!has(&shell, "--headless") && has(&full, "--headless"));
         for b in [&shell, &full] {
             assert!(has(b, "--remote-debugging-pipe") && has(b, "--user-data-dir=/p"));
@@ -319,7 +377,7 @@ mod tests {
             shell: true,
             source: String::new(),
         };
-        let args = |angle| launch_args(&shell, Path::new("/p"), angle);
+        let args = |angle| launch_args(&shell, Path::new("/p"), angle, &[]);
         let has = |angle, a: &str| args(angle).iter().any(|x| x == a);
         assert!(has(Angle::Metal, "--use-angle=metal"));
         assert!(!has(Angle::Metal, "--use-angle=swiftshader"));

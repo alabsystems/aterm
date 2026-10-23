@@ -7,7 +7,6 @@ use aterm_models_session::incarnation_lease_model;
 use aterm_spec::interp;
 use aterm_spec::walk::{only, walk};
 
-/// Every action, so a guard tightened by mistake shows up as a dead action, not a quieter proof.
 const ACTIONS: [&str; 12] = [
     "Plan",
     "Take",
@@ -35,8 +34,6 @@ fn incarnation_lease_fires_every_committed_move() {
     }
 }
 
-/// Each defect breaks the invariant written for it, alone, and every one of them breaks the
-/// fence itself: the claims are not decoration around a property nothing threatens.
 #[test]
 fn incarnation_lease_each_defect_breaks_its_own_invariant_and_the_fence() {
     let model = incarnation_lease_model();
@@ -60,9 +57,6 @@ fn incarnation_lease_each_defect_breaks_its_own_invariant_and_the_fence() {
     }
 }
 
-/// The hand-traced counterexamples, one per defect, walked on the mutant: each ends in a
-/// state the fence forbids (an incarnation presented twice), and the committed machine
-/// either cannot take the same steps or keeps the fence along them.
 #[test]
 fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
     let model = incarnation_lease_model();
@@ -148,9 +142,6 @@ fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
     }
 }
 
-/// What the lease buys, on the committed machine: in one boot a second attach takes its
-/// incarnation with no flush; after a power loss the attach leases afresh above everything
-/// the media holds; and an older build's attach on the same dir is fenced too.
 #[test]
 fn incarnation_lease_walks_the_attaches_a_node_makes() {
     let m = incarnation_lease_model();

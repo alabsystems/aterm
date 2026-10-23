@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh rate` (design §13.2): GitHub's `/rate_limit` (free) for each identity, beside what the
-//! rate book recorded.
+//! `agh rate`: GitHub `/rate_limit` snapshots alongside the recorded rate book.
 
 use aterm_json::{Value, json};
 
@@ -27,8 +26,7 @@ fn row(label: &str, source: &str, snapshot: &RateSnapshot) -> Value {
     })
 }
 
-/// `agh rate [--as PROFILE | --anonymous]`: with `--as`, that profile; with `--anonymous`,
-/// anonymous; else every present profile, by name, then anonymous.
+/// Runs `agh rate` for a selected profile, anonymous, or every present profile.
 ///
 /// # Errors
 ///
@@ -53,8 +51,6 @@ pub(crate) fn rate(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let mut rows = Vec::new();
     for profile in who {
         let snapshots = gh.users().rate(profile.as_deref())?;
-        // The identity the request was sent as: the client loaded the credential once, and
-        // the meter names it with its fingerprint.
         let identity = gh.meter().as_.unwrap_or(IdentityRef::Anonymous);
         let label = identity.label().to_string();
         rows.extend(snapshots.iter().map(|s| row(&label, "api", s)));

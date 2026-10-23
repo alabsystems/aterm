@@ -58,7 +58,7 @@ impl Ring {
         self.len = (self.len + 1).min(WINDOW);
     }
 
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         self.len = 0;
         self.next = 0;
     }
@@ -174,7 +174,8 @@ pub(crate) fn note_output_burst(session: u64) {
     let _ = close_at(session, crate::metrics::now_us());
 }
 
-/// A key queued behind a paste was just accepted by `session`'s `sink` on the ordered-egress.
+/// A key queued behind a paste was just accepted by `session`'s `sink` on the ordered-egress
+/// writer thread: start the clock there (keep-oldest, like every arm).
 pub(crate) fn arm_deferred(session: u64, sink: &aterm_session::sink::SinkWriter) {
     #[cfg(test)]
     if DEFERRED_ARM_SINK.load(Ordering::Acquire) != std::ptr::from_ref(sink).addr() {

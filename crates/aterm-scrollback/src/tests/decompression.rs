@@ -2,12 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Bounded decompression codec tests and error-safety tests for corrupt
-//! compressed data in the warm and cold tiers.
+//! Bounded decompression and corrupt-block error-safety tests for warm and cold tiers.
 
 use super::*;
-
-// Bounded decompression tests
 
 #[test]
 fn decompress_lz4_bounded_rejects_oversized_prefix() {
@@ -23,10 +20,6 @@ fn decompress_lz4_bounded_rejects_too_short() {
     assert!(matches!(err, ScrollbackError::Decompression(ref m) if m.contains("too short")));
 }
 
-// Decompression failure behaviour
-
-/// Truncation spanning cold+warm+hot needs no decompression of the corrupt
-/// warm boundary block.
 #[test]
 fn truncate_three_tier_succeeds_with_corrupt_warm_block() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
@@ -36,7 +29,6 @@ fn truncate_three_tier_succeeds_with_corrupt_warm_block() {
     assert!(sb.cold_line_count() > 0, "need cold data");
     assert!(sb.warm_line_count() > 0, "need warm data");
     sb.warm.corrupt_oldest_block();
-    // Keep 12: removes 13 → cold(5 all) + warm(8 from corrupt block).
     let result = sb.truncate(12);
     assert!(
         result.is_ok(),
@@ -45,14 +37,10 @@ fn truncate_three_tier_succeeds_with_corrupt_warm_block() {
     assert_eq!(sb.line_count(), 12, "line count should reflect truncation");
 }
 
-/// Verify that `remove_newest` returns Err and leaves state unchanged when
-/// a warm block has corrupt compressed data.
 #[test]
 fn remove_newest_aborts_on_decompression_failure() {
-    // Small tiers: hot=5, warm=10, block_size=5
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
 
-    // Push 15 lines → 5 in warm, 10 in hot
     for i in 0..15 {
         sb.push_str(&format!("Line {i}"));
     }
@@ -64,18 +52,14 @@ fn remove_newest_aborts_on_decompression_failure() {
     let warm_before = sb.warm_line_count();
     let cold_before = sb.cold_line_count();
 
-    // Corrupt the oldest warm block
     sb.warm.corrupt_oldest_block();
 
-    // Remove enough lines to require reading from warm tier
-    // Remove 12 → keep 3 oldest lines (which are in corrupt warm block)
     let result = sb.remove_newest(12);
     assert!(
         result.is_err(),
         "remove_newest should fail on corrupt warm block"
     );
 
-    // State must be unchanged
     assert_eq!(
         sb.line_count(),
         line_count_before,
@@ -94,14 +78,10 @@ fn remove_newest_aborts_on_decompression_failure() {
     );
 }
 
-/// When the cold tier rejects a warm block (re-compression failure), the block
-/// goes back to warm instead of being dropped with its lines.
 #[test]
 fn evict_warm_to_cold_restores_block_on_failure() {
-    // hot=5, warm=10, block_size=5: warm holds 2 blocks of 5 before eviction.
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
 
-    // Push 15 lines to fill hot (5) + warm (10, 2 blocks).
     for i in 0..15 {
         sb.push_str(&format!("Line {i}"));
     }
@@ -109,16 +89,12 @@ fn evict_warm_to_cold_restores_block_on_failure() {
     assert_eq!(sb.warm_line_count(), 10, "expect 2 warm blocks of 5 lines");
     assert_eq!(sb.cold_line_count(), 0, "no cold data yet");
 
-    // Corrupt the oldest warm block (lines 0-4) so cold re-compression fails.
     sb.warm.corrupt_oldest_block();
 
-    // Push 5 more lines to trigger another promotion and eviction attempt:
-    // evicting the corrupt block to cold fails, and it is restored to warm.
     for i in 15..20 {
         sb.push_str(&format!("Line {i}"));
     }
 
-    // The critical invariant: line_count == hot + warm + cold.
     let actual_total = sb.hot_line_count() + sb.warm_line_count() + sb.cold_line_count();
     assert_eq!(
         sb.line_count(),
@@ -128,23 +104,18 @@ fn evict_warm_to_cold_restores_block_on_failure() {
         actual_total
     );
 
-    // No lines should be lost — the corrupt block was restored to warm.
     assert_eq!(
         sb.line_count(),
         20,
         "all 20 lines should be preserved (corrupt block restored to warm)"
     );
 
-    // The corrupt block (lines 0-4) returns decompression errors when read,
-    // but it still occupies its slot in warm tier (not silently dropped).
-    // Non-corrupt lines (5+) should be readable.
     let result = sb.get_line(0);
     assert!(
         result.is_err(),
         "corrupt warm block should return decompression error, not silently vanish"
     );
 
-    // Lines beyond the corrupt block should still be accessible.
     let last_idx = sb.line_count() - 1;
     let result = sb.get_line(last_idx);
     assert!(
@@ -153,13 +124,9 @@ fn evict_warm_to_cold_restores_block_on_failure() {
         result.err()
     );
 
-    // Out-of-range should return None, not error.
     assert!(sb.get_line(sb.line_count()).expect("no error").is_none());
 }
 
-/// Truncation into warm leaves a logical front_offset. If that partially
-/// consumed front block later turns corrupt, eviction retries must preserve the
-/// surviving logical lines until the quarantine threshold is hit.
 #[test]
 fn evict_warm_to_cold_preserves_trimmed_corrupt_block_until_quarantine() {
     let mut sb = Scrollback::with_block_size(5, 10, 10_000_000, 5);
@@ -224,14 +191,10 @@ fn evict_warm_to_cold_preserves_trimmed_corrupt_block_until_quarantine() {
     );
 }
 
-/// The budget setter surfaces a rejected warm-to-cold eviction instead of
-/// looping or reporting success.
 #[test]
 fn set_memory_budget_reports_cold_rejection() {
-    // Small budget forces memory pressure. block_size=5, warm_limit=5 (1 block).
     let mut sb = Scrollback::with_block_size(5, 5, 200, 5);
 
-    // Push enough lines to fill hot + warm (10 lines = 2 blocks).
     for i in 0..10 {
         sb.push_str(&format!("Pressure-line-{i}"));
     }
@@ -240,7 +203,6 @@ fn set_memory_budget_reports_cold_rejection() {
         "need warm data for eviction path"
     );
 
-    // Corrupt warm block so cold tier rejects eviction.
     sb.warm.corrupt_oldest_block();
     let warm_before = sb.warm.block_count();
     let error = sb
@@ -250,7 +212,6 @@ fn set_memory_budget_reports_cold_rejection() {
         matches!(error, ScrollbackError::EnforcementFailed { .. }),
         "expected enforcement failure, got {error:?}"
     );
-    // Verify eviction was attempted and rejected (not just that the loop terminated).
     assert_eq!(
         sb.warm.block_count(),
         warm_before,
@@ -268,38 +229,24 @@ fn set_memory_budget_reports_cold_rejection() {
     );
 }
 
-// Warm block quarantine tests
-
-/// Corrupt warm block is quarantined (dropped) after QUARANTINE_THRESHOLD
-/// consecutive decompression failures during eviction attempts.
 #[test]
 fn corrupt_warm_block_quarantined_after_threshold() {
-    // warm_limit=5: once warm holds a block, each hot→warm promotion makes one
-    // eviction attempt, so one failure per batch (the budget is not the driver).
     let mut sb = Scrollback::with_block_size(5, 5, 10_000_000, 5);
 
-    // Push 10 lines → 5 warm (1 block), 5 hot.
     for i in 0..10 {
         sb.push_str(&format!("Line {i}"));
     }
     assert_eq!(sb.warm_line_count(), 5);
     assert_eq!(sb.warm.block_count(), 1);
 
-    // Corrupt the warm block (lines 0-4).
     sb.warm.corrupt_oldest_block();
 
-    // Push batches of 5 to trigger hot→warm promotion + eviction.
-    // Each promotion pushes a new block, warm exceeds warm_limit (5),
-    // and evict_warm_to_cold pops the corrupt front block → fails → pushed back.
     for batch in 0..crate::tier::QUARANTINE_THRESHOLD {
         for i in 0..5 {
             sb.push_str(&format!("Batch{batch}_{i}"));
         }
     }
 
-    // After QUARANTINE_THRESHOLD eviction failures, the corrupt block is quarantined.
-    // Its 5 lines are subtracted from total. The 3 healthy blocks (15 lines)
-    // + remaining hot lines are all accessible.
     let tier_sum = sb.hot_line_count() + sb.warm_line_count() + sb.cold_line_count();
     assert_eq!(
         sb.line_count(),
@@ -307,8 +254,6 @@ fn corrupt_warm_block_quarantined_after_threshold() {
         "line_count must equal hot+warm+cold after quarantine"
     );
 
-    // The 5 corrupt lines should be gone from the total.
-    // Original 10 + 15 pushed - 5 quarantined = 20
     assert_eq!(
         sb.line_count(),
         20,
@@ -316,9 +261,6 @@ fn corrupt_warm_block_quarantined_after_threshold() {
     );
 }
 
-/// Each failed warm→cold eviction should count as exactly one failed decode.
-/// The corrupt block must survive attempts below the quarantine threshold and
-/// only disappear on the final threshold attempt.
 #[test]
 fn corrupt_warm_block_quarantines_only_on_final_eviction_attempt() {
     let mut sb = Scrollback::with_block_size(5, 5, 10_000_000, 5);
@@ -347,8 +289,6 @@ fn corrupt_warm_block_quarantines_only_on_final_eviction_attempt() {
                 10 + (attempt * 5),
                 "failed eviction attempt {attempt} must not drop the corrupt block early"
             );
-            // Avoid probing `get_line()` here: read-path failures also advance
-            // the quarantine counter and would perturb the eviction-only count.
             assert!(
                 sb.cold_line_count() == 0,
                 "attempt {attempt} must not silently accept the corrupt block into cold storage"
@@ -372,10 +312,6 @@ fn corrupt_warm_block_quarantines_only_on_final_eviction_attempt() {
     }
 }
 
-/// A block quarantined with older history beside it in cold keeps its rows,
-/// blank, and counts its lines as lost (SB1,
-/// docs/AUDIT-persisted-state-2026-10-07.md): dropping them from the middle
-/// would hand every older line the index of the line five newer.
 #[test]
 fn quarantine_mid_history_keeps_rows_and_counts_the_loss() {
     let mut sb = Scrollback::with_block_size(5, 5, 10_000_000, 5);
@@ -406,9 +342,6 @@ fn quarantine_mid_history_keeps_rows_and_counts_the_loss() {
         assert_eq!(line.to_string(), expected, "line {i}");
     }
 
-    // The blank stand-ins retain the row positions above, but their text was
-    // already counted lost. Evicting those rows later only loses the other
-    // retained text, so each original line contributes once.
     let before = sb.line_count();
     sb.set_memory_budget(1).expect("the budget shrink enforces");
     assert_eq!(sb.cold_line_count(), 0, "no cold page fits one byte");
@@ -417,34 +350,24 @@ fn quarantine_mid_history_keeps_rows_and_counts_the_loss() {
     assert_eq!(sb.pressure_evicted_lines(), evicted as u64);
 }
 
-/// The iterator skips a quarantined warm block's lines without a decompress
-/// attempt per line.
 #[test]
 fn iterator_skips_quarantined_block_without_redundant_decompression() {
-    // Large budget so we don't trigger eviction — we want to test get_line
-    // on a block that's manually quarantined.
     let mut sb = Scrollback::with_block_size(5, 100, 10_000_000, 5);
 
-    // Push 15 lines → 10 in warm (2 blocks of 5), 5 in hot.
     for i in 0..15 {
         sb.push_str(&format!("Line {i}"));
     }
     assert_eq!(sb.warm_line_count(), 10);
     let non_corrupt_count = 10; // 5 warm (block 2) + 5 hot
 
-    // Corrupt the oldest warm block (lines 0-4).
     sb.warm.corrupt_oldest_block();
 
-    // Manually quarantine the block by recording QUARANTINE_THRESHOLD failures.
-    // We access the front block directly through the test helper.
     for _ in 0..crate::tier::QUARANTINE_THRESHOLD {
         if let Some(block) = sb.warm.blocks_mut().front_mut() {
             block.record_failure();
         }
     }
 
-    // Iterator should skip the quarantined block's 5 lines and yield
-    // only the 10 non-quarantined lines (5 warm block 2 + 5 hot).
     let lines: Vec<_> = sb.iter().map(|l| l.to_string()).collect();
     assert_eq!(
         lines.len(),
@@ -452,7 +375,6 @@ fn iterator_skips_quarantined_block_without_redundant_decompression() {
         "iterator should skip quarantined block lines"
     );
 
-    // Verify the yielded lines are the non-corrupt ones (lines 5-14).
     for (i, line) in lines.iter().enumerate() {
         assert_eq!(
             *line,
@@ -462,32 +384,25 @@ fn iterator_skips_quarantined_block_without_redundant_decompression() {
     }
 }
 
-/// The line limit is enforced once a corrupt warm block is quarantined.
 #[test]
 fn line_limit_enforced_past_corrupt_block() {
-    // Same warm_limit=5 pattern: one eviction attempt per promotion.
     let mut sb = Scrollback::with_block_size(5, 5, 10_000_000, 5);
 
-    // Push 10 lines → 5 warm (1 block), 5 hot.
     for i in 0..10 {
         sb.push_str(&format!("Line {i}"));
     }
     assert_eq!(sb.warm_line_count(), 5);
 
-    // Corrupt the warm block.
     sb.warm.corrupt_oldest_block();
 
-    // Trigger quarantine through 3 eviction failures (5 lines per batch).
     for batch in 0..crate::tier::QUARANTINE_THRESHOLD {
         for i in 0..5 {
             sb.push_str(&format!("B{batch}_{i}"));
         }
     }
 
-    // Corrupt block is now quarantined. Set a line limit.
     sb.set_line_limit(Some(10));
 
-    // Push more lines to test that the limit is actually enforced.
     for i in 0..5 {
         sb.push_str(&format!("Extra {i}"));
     }

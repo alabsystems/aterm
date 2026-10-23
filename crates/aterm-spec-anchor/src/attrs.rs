@@ -2,6 +2,66 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The anchor attributes (`refines`, `spec_unmodeled`) as `macro_rules!` attributes.
+//!
+//! ```
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project")]
+//! fn up(n: u32) -> u32 {
+//!     n + 1
+//! }
+//! #[aterm_spec_anchor::spec_unmodeled(reason = "a platform fast path", machine = "Twin")]
+//! fn fast() {}
+//! # fn main() { assert_eq!(up(1), 2); fast(); }
+//! ```
+//!
+//! A key the attribute does not take:
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "twin::project", tla = "x")]
+//! fn up(n: u32) -> u32 {
+//!     n + 1
+//! }
+//! # fn main() { assert_eq!(up(1), 2); }
+//! ```
+//!
+//! A value that is not a string literal:
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = Up, project = "twin::project")]
+//! fn up(n: u32) -> u32 {
+//!     n + 1
+//! }
+//! # fn main() { assert_eq!(up(1), 2); }
+//! ```
+//!
+//! A `refines` with an empty `project`, and a waiver with no `reason`:
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::refines(machine = "Twin", action = "Up", project = "")]
+//! fn up(n: u32) -> u32 {
+//!     n + 1
+//! }
+//! # fn main() { assert_eq!(up(1), 2); }
+//! ```
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::spec_unmodeled(machine = "Twin")]
+//! fn fast() {}
+//! # fn main() { fast(); }
+//! ```
+//!
+//! An item that is not a fn with a body:
+//!
+//! ```compile_fail
+//! #![cfg_attr(anchor_rules, feature(macro_attr))]
+//! #[aterm_spec_anchor::spec_unmodeled(reason = "a struct")]
+//! struct S;
+//! # fn main() {}
+//! ```
 
 /// Bind a fn to the model action it performs: `machine`, `action` and `project`, all required.
 #[macro_export]

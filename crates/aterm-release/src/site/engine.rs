@@ -12,7 +12,7 @@
 //!    Trust ships only its host std), `+simd128`, the builder's paths remapped out
 //!    ([`World::build_module`]);
 //! 2. its ES-module glue from `verify glue`'s generator, in process
-//!    ([`aterm_verify::wasm_glue::glue`], the `web` flavor);
+//!    ([`aterm_verify::wasm_glue::glue`], its ES module glue);
 //! 3. the shipping `wasm-opt` pass over the bound module ([`World::optimise`]): a
 //!    module it left unchanged is refused, so nothing ships pre-opt;
 //! 4. refused when a remapped path survives in the module: a panic location must never
@@ -28,7 +28,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use aterm_verify::wasm_glue::{self, Flavor, WASM_OPT_FLAGS};
+use aterm_verify::wasm_glue::{self, WASM_OPT_FLAGS};
 
 use super::{World, say};
 
@@ -80,7 +80,7 @@ pub fn build(
     // behind the /var link), so the remap and the build both use that path
     let resolved = clone.canonicalize().unwrap_or_else(|_| clone.to_path_buf());
     let module = world.build_module(&resolved, pin, &rustflags(&resolved, home), out)?;
-    let mut files = wasm_glue::glue(&module, STEM, Flavor::Web)
+    let mut files = wasm_glue::glue(&module, STEM)
         .map_err(|e| format!("verify glue's generator refused {STEM}.wasm: {e}"))?;
     let mut take = |name: String| {
         files

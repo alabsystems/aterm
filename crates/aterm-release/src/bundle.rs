@@ -29,7 +29,14 @@ pub struct BundleSpec {
     pub aterm_bin: PathBuf,
 }
 
-/// Stamp the Info.plist template (apps/aterm-mac/Info.plist) in-process, replacing the value of an existing `<key>`/`<string>` pair or inserting the pair before `</dict>`:
+/// Stamp the Info.plist template (apps/aterm-mac/Info.plist) in-process, replacing the
+/// value of an existing `<key>`/`<string>` pair or inserting the pair before `</dict>`:
+///   * CFBundleShortVersionString ← `short` (MAJOR.MINOR.PATCH)
+///   * CFBundleVersion            ← `build_number` (the monotonic ledger n)
+///   * CFBundleIdentifier         ← `bundle_id`
+///   * ATermGitCommit             ← `git_commit` (`plutil -p` answers "which source built
+///     this?" without launching it)
+///   * CFBundleIconFile           ← `icon`, only when `Some` (the icon ships)
 pub fn stamp_info_plist(
     template: &str,
     short: &str,

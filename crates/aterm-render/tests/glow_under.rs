@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// Emberforge dark glyph cores on the CPU renderer: `RenderInput.glow_under` (flame-body
-// additive light between the cell background and the glyph ink) and `RenderInput.char_fg`
-// (per-cell final glyph-ink overrides charring engulfed letters toward black). The
-// empty-stream no-ops are rows of `tests/empty_channels.rs`. Pinned here: a charred glyph
-// reads darker than the lit background; `char_fg` follows into line decorations (an SGR 58
-// underline colour still wins); the light only brightens and stays in its row band; the
-// dirty gate; no ghosting on the damaged path.
-
 use aterm_core::render::{CharFg, EffectStreamDamage, GlowQuad, RenderInput};
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, DirtyDecision, Renderer, Theme, WindowCpu, compute_dirty_rows};
@@ -18,8 +10,6 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// A single-row-band flame-body quad (the producer splits row-spanning bodies into per-row
-/// quads).
 fn under(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> GlowQuad {
     GlowQuad {
         row,
@@ -28,17 +18,12 @@ fn under(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> GlowQuad {
         w,
         h,
         color,
-
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: color,
         alpha2: 0,
     }
 }
 
-/// A producer-stamped 8k-quad ribbon takes the same row-damage decision through the
-/// compact damage metadata as through the exact vector comparison, while the retained
-/// prior input drops the payload; the moved quad's vacated row repaints.
 #[test]
 fn compact_effect_damage_matches_exact_fallback_and_marks_vacated_rows() {
     let mut term = Terminal::new(4, 8);
@@ -117,20 +102,15 @@ fn compact_effect_damage_matches_exact_fallback_and_marks_vacated_rows() {
     assert!(compact_dirty[2], "the current row must repaint");
 }
 
-/// Summed-RGB luminance proxy (monotone in every channel).
 fn luma(p: u32) -> u32 {
     ((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff)
 }
 
-/// With `glow_under` lighting the row band under the ink and `char_fg` pinning the glyph
-/// near-black, the stroke is darker than the lit background beside it. The light only
-/// brightens the pre-light frame and stays inside the quad's row band.
 #[test]
 fn silhouette_law_glyph_darker_than_lit_background() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(3, 10);
-    // A full-block glyph at row 1 col 2: full-coverage stroke pixels on any font.
     term.process(b"\x1b[?25l\x1b[2;3H\xe2\x96\x88");
 
     let charred = CharFg {
@@ -138,7 +118,6 @@ fn silhouette_law_glyph_darker_than_lit_background() {
         col: 2,
         fg: 0x0010_0804, // near-black ember char
     };
-    // The flame body: one bright quad filling row 1's band across cols 0..6.
     let body = under(
         1,
         0,
@@ -148,12 +127,10 @@ fn silhouette_law_glyph_darker_than_lit_background() {
         0x0080_4010, // premultiplied orange light
     );
 
-    // Pre-light frame: charred glyph, no flame body (the brighten-only base).
     let mut dark_in = term.cell_frame(3, 10);
     dark_in.char_fg = vec![charred];
     let dark = rend.render_input(&dark_in).pixels.clone();
 
-    // Lit frame: the same char + the flame body underneath the ink.
     let mut lit_in = term.cell_frame(3, 10);
     lit_in.char_fg = vec![charred];
     lit_in.glow_under = vec![body];
@@ -170,7 +147,6 @@ fn silhouette_law_glyph_darker_than_lit_background() {
         luma(stroke),
         luma(beside)
     );
-    // Non-vacuity: without char_fg the stroke is not a dark core.
     let mut plain_in = term.cell_frame(3, 10);
     plain_in.glow_under = vec![body];
     let plain = rend.render_input(&plain_in);
@@ -181,7 +157,6 @@ fn silhouette_law_glyph_darker_than_lit_background() {
         luma(stroke),
         luma(plain_stroke)
     );
-    // Additive laws: brighten-only over the pre-light frame; rows 0 and 2 untouched.
     for (i, (&d, &p)) in dark.iter().zip(f.pixels.iter()).enumerate() {
         let y = i / f.width;
         if !(pad + ch..pad + 2 * ch).contains(&y) {
@@ -196,11 +171,8 @@ fn silhouette_law_glyph_darker_than_lit_background() {
     }
 }
 
-/// The substitution test's `char_fg`: a vivid blue nothing else in the frame produces (a
-/// near-black ember can be indistinguishable from a floored default fg).
 const CHARRED: u32 = 0x007C_C8FF;
 
-/// One cell's pixels out of a padded frame (`Renderer::pad` is symmetric).
 fn cell_pixels(
     f: &aterm_render::Frame,
     pad: usize,
@@ -218,27 +190,14 @@ fn cell_pixels(
     out
 }
 
-/// `char_fg` reaches the underline, undercurl, strike and overline of the cell it chars: a
-/// charred frame is byte-identical to the same text recoloured via SGR 38;2 truecolor fg.
-/// The deco colour is re-derived at three sites (CPU pass 3 solid rects, CPU pass 3b AA
-/// undercurl, the GPU deco loop), each of which must take the substitution.
-///
-/// Row 1's cells are spaces, so the decoration is their only ink and each site is
-/// non-vacuous on its own: col 2 (pass 3) and col 4 (pass 3b) change when char_fg lands;
-/// col 0 carries an explicit SGR 58 colour and does not, since `deco_inks`'s explicit arms
-/// ignore the substituted operand.
 #[test]
 fn char_fg_follows_into_line_decorations() {
     let mut rend = renderer();
-    // A lazy fallback parse landing between two renders would break the byte comparison.
     rend.debug_block_on_lazy_fallbacks();
     let (cw, ch) = rend.cell_size();
     let pad = rend.pad();
     let (rows, cols) = (2usize, 12usize);
 
-    // Row 0: underlined x, curly-underlined w, struck s, overlined o (one per decoration
-    // family). Row 1, deco-only: an SGR 58 underlined space (col 0), a plain underlined
-    // space (col 2), a curly-underlined space (col 4).
     const TEXT: &str = "\x1b[?25l\x1b[4mx\x1b[24m \x1b[4:3mw\x1b[24m \x1b[9ms\x1b[29m \
 \x1b[53mo\x1b[55m\r\n\x1b[4m\x1b[58;2;10;20;30m \x1b[59m\x1b[24m \x1b[4m \x1b[24m \
 \x1b[4:3m \x1b[24m";
@@ -254,8 +213,6 @@ fn char_fg_follows_into_line_decorations() {
         })
         .collect();
 
-    // The same text recoloured via SGR 38;2, no char_fg. Row 1 col 0 keeps its SGR 58
-    // underline colour in both frames: the precedence pin.
     let mut term_b = Terminal::new(rows as u16, cols as u16);
     term_b.process(
         "\x1b[?25l\x1b[38;2;124;200;255m\x1b[4mx\x1b[24m\x1b[39m \x1b[38;2;124;200;255m\
@@ -276,7 +233,6 @@ fn char_fg_follows_into_line_decorations() {
          SGR truecolor recolour"
     );
 
-    // Non-vacuity, per site: the deco-only cells of row 1 must actually move.
     let plain = rend.render_input(&term_a.cell_frame(rows, cols));
     let cell = |f: &aterm_render::Frame, row, col| cell_pixels(f, pad, cw, ch, row, col);
     assert_ne!(
@@ -299,9 +255,6 @@ fn char_fg_follows_into_line_decorations() {
     );
 }
 
-/// Settled streams (equal, non-empty) gate-hit with nothing marked; a moved flame-body quad
-/// sets `glow_under_changed` and a char_fg change sets `char_fg_changed`, each marking
-/// exactly its prev∪cur rows.
 #[test]
 fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
     let mut term = Terminal::new(6, 8);
@@ -350,7 +303,6 @@ fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
     assert!(d.is_gate_hit(), "settled streams must gate-hit");
     assert!(dirty.iter().all(|&b| !b), "settled streams mark no rows");
 
-    // The quad steps row 1 → row 4: prev and cur rows repaint, nothing else.
     let cur = frame(&[under(4, 0, 64, 8, 16, 0x0010_0803)], &settled_c);
     let DirtyDecision::Rows(d) = compute_dirty_rows(
         &prev,
@@ -375,8 +327,6 @@ fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
         "a moved quad must mark exactly its prev∪cur rows"
     );
 
-    // The char sweep moves to row 3 (colour changed too): rows 1 and 3 repaint; the
-    // settled glow_under marks nothing.
     let cur = frame(
         &settled_q,
         &[CharFg {
@@ -413,16 +363,12 @@ fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
     );
 }
 
-/// A flame body animating across rows while the charring sweeps, then both draining,
-/// leaves the cached damaged framebuffer equal to a fresh full render after every step; a
-/// repeat of the drained frame gate-hits.
 #[test]
 fn damaged_path_no_ghosting_as_glow_under_and_char_fg_animate() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let rows = 6usize;
     let mut term = Terminal::new(rows as u16, 12);
-    // Text on rows 1 and 3 so the charring recolours real glyphs.
     term.process(b"\x1b[?25l\x1b[2;1Hburning line\x1b[4;1Hburning line");
     let (cw16, ch16) = (cw as u16, ch.min(48) as u16);
 
@@ -433,8 +379,6 @@ fn damaged_path_no_ghosting_as_glow_under_and_char_fg_animate() {
         input
     };
     let char_at = |row: u16, col: u16, fg: u32| CharFg { row, col, fg };
-    // A: fire on row 1 (chars 0..3 charred); B: it climbs to row 3 (row 1's glyphs
-    // restore); C: drained.
     let in_a = make(
         vec![under(1, 0, ch16, 8 * cw16, ch16, 0x0050_2808)],
         vec![
@@ -459,7 +403,6 @@ fn damaged_path_no_ghosting_as_glow_under_and_char_fg_animate() {
              (no light ghost, no stale charred glyph at vacated rows)"
         );
     }
-    // Steady state: a repeat of the drained frame is a gate hit (zero work).
     let again = rend.render_input_cached(&mut wc, &in_c).pixels().to_vec();
     assert_eq!(
         wc.last_damage(),

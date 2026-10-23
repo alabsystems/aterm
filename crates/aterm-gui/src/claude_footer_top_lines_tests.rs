@@ -224,9 +224,9 @@ fn gemini_wears_the_lockup_on_its_live_zone_rule() {
 }
 
 /// The pane's rows of a Codex screen `cols` wide (the 0.154.0 take's
-/// shape, [`aterm_phase::codex`]'s module header): the session card, a
-/// blank row, the composer's three rows — pad, prompt, pad — erased onto
-/// `slab` (`None`: left on the pane's own ground), and the footer.
+/// shape): the session card, a blank row, the composer's three rows — pad,
+/// prompt, pad — erased onto `slab` (`None`: left on the pane's own ground),
+/// and the footer.
 fn codex_screen(cols: usize, slab: Option<[u8; 3]>) -> String {
     let cut = |s: &str| s.chars().take(cols).collect::<String>();
     let on = slab.map_or(String::new(), |[r, g, b]| format!("\x1b[48;2;{r};{g};{b}m"));

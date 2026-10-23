@@ -18,13 +18,10 @@ use aterm_json::Value;
 
 use crate::common;
 
-/// The scripted api origin's port.
 const API: u16 = 47_301;
 
-/// The repository the listings walk.
 const REPO: &str = "fixture-dev/repo";
 
-/// The first call of a release listing.
 fn releases() -> Call {
     Call::get(
         "/repos/fixture-dev/repo/releases",
@@ -32,7 +29,6 @@ fn releases() -> Call {
     )
 }
 
-/// A JSON array of `{"id": i}` for `ids`.
 fn page(ids: std::ops::Range<u64>) -> Vec<u8> {
     let items: Vec<String> = ids
         .map(|i| format!(r#"{{"id":{i},"tag_name":"v{i}"}}"#))
@@ -40,7 +36,6 @@ fn page(ids: std::ops::Range<u64>) -> Vec<u8> {
     format!("[{}]", items.join(",")).into_bytes()
 }
 
-/// A `Link` header whose next is `/repos/fixture-dev/repo/releases?…&page={page}`.
 fn next_to(page: u32) -> String {
     format!(
         r#"<{}/repos/fixture-dev/repo/releases?per_page=100&page={page}>; rel="next""#,
@@ -48,7 +43,6 @@ fn next_to(page: u32) -> String {
     )
 }
 
-/// Queue a page answer: its body, its ETag and, when `next` is given, its Link.
 fn serve(transport: &ScriptedTransport, body: &[u8], etag: &str, next: Option<u32>) {
     let link = next.map(next_to);
     let mut headers = vec![("etag", etag)];
@@ -497,16 +491,12 @@ fn a_download_count_change_is_no_tear() {
     assert_eq!(transport.remaining(), 0);
 }
 
-/// A repository object of an organization's listing, `stars` setting its counters and
-/// timestamps.
 fn repository(id: u64, name: &str, stars: u64) -> String {
     format!(
         r#"{{"id":{id},"full_name":"fixture-dev/{name}","private":false,"stargazers_count":{stars},"watchers_count":{stars},"watchers":{stars},"forks_count":1,"forks":1,"open_issues_count":2,"open_issues":2,"size":10,"pushed_at":"2026-10-19T00:00:0{stars}Z","updated_at":"2026-10-19T00:00:0{stars}Z"}}"#
     )
 }
 
-/// Serves one pass of a two-page organization repository listing: page 1 (next page 2), then
-/// `second` as page 2.
 fn serve_repositories(transport: &ScriptedTransport, second: &[String], etag: &str) {
     let next = format!(
         r#"<{}/organizations/100/repos?per_page=100&page=2>; rel="next""#,
@@ -525,7 +515,6 @@ fn serve_repositories(transport: &ScriptedTransport, second: &[String], etag: &s
     );
 }
 
-/// The walk of `/orgs/fixture-dev/repos` (organization id 100) under Snapshot.
 fn walk_repositories(gh: &Github) -> agh::Result<agh::page::Listing<Value>> {
     let call = Call::get(
         "/orgs/fixture-dev/repos",
@@ -775,14 +764,11 @@ fn walk_pages_returns_each_body_whole() {
     assert_eq!((listing.pages, listing.requests), (2, 2));
 }
 
-/// The same walks over `HttpTransport::direct` on agh-fake, whose release listing pages by
-/// the numeric `/repositories/{id}` link.
 mod loopback {
     use agh_fake::{FakeGithub, Fault, Match, ReleaseSpec, RepoSpec};
 
     use super::*;
 
-    /// A fake holding the public `fixture-dev/repo` with `count` published releases.
     fn fake_with_releases(count: u64) -> FakeGithub {
         let fake = FakeGithub::start();
         fake.add_repo("fixture-dev/repo", RepoSpec::public());
@@ -853,9 +839,6 @@ mod loopback {
         assert_eq!(fake.violations(), Vec::<String>::new());
     }
 
-    /// A renamed repository's tag listing, which agh-fake pages by `/repos/{o}/{r}/tags`
-    /// links of the new name: the walk follows the 301 on page 1 and reads the rest as the
-    /// new name's listing, the revalidation included.
     #[test]
     fn a_renamed_repository_s_listing_is_walked_under_its_new_name() {
         let fake = FakeGithub::start();
@@ -897,9 +880,6 @@ mod loopback {
     }
 }
 
-/// A walk whose first page follows a transfer out of a release-tier owner: the pages after
-/// the move are routed for the new owner, so the release token never reads a repository that
-/// left the release tier (design §6.5, §7.2). File credentials are unix-only (plan §1 rule 12).
 #[cfg(unix)]
 #[test]
 fn pages_after_a_transfer_are_routed_for_the_new_owner() {

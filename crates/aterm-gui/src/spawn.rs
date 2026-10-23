@@ -165,7 +165,7 @@ impl PrimeSchedule {
         }
     }
 
-    fn release(&mut self) -> Option<PrimeCue> {
+    const fn release(&mut self) -> Option<PrimeCue> {
         match std::mem::replace(&mut self.hold, PrimeHold::Released) {
             PrimeHold::Holding(held) => held,
             PrimeHold::Released => None,
@@ -221,6 +221,8 @@ fn handoff_committed() -> bool {
 
 /// Prime detected coding agents if `cue` starts a pass ([`PrimeSchedule::admit`]).
 pub(crate) fn prime_agents_if_due(cue: PrimeCue) {
+    // Unit tests construct `App`s that reach spawn seams, and headless
+    // instances are tests and agents' private instances: neither may write
     // the `$HOME` it happened to inherit. A windowed aterm is where this runs.
     if !agent_prime_permitted(cfg!(test), HEADLESS_INSTANCE.load(Ordering::Acquire)) {
         return;
@@ -452,7 +454,7 @@ fn substitute_shell(
     Some(substitute)
 }
 
-fn shell_to_start<'a>(
+const fn shell_to_start<'a>(
     substitute: Option<&'a ShellSubstitute>,
     shell_override: Option<&'a str>,
     shell_args: Option<&'a [String]>,
@@ -1084,12 +1086,12 @@ pub(crate) struct HandedMaster(i32);
 
 impl HandedMaster {
     /// Take ownership of handed-off master `fd`.
-    pub(crate) fn new(fd: i32) -> Self {
+    pub(crate) const fn new(fd: i32) -> Self {
         Self(fd)
     }
 
     /// The descriptor, still owned by this handle.
-    pub(crate) fn raw(&self) -> i32 {
+    pub(crate) const fn raw(&self) -> i32 {
         self.0
     }
 
@@ -1298,6 +1300,7 @@ pub(crate) fn hydrate_adopted_engine(
             history.anchor_in(&engine);
             authorize_adopted_shell_nonce(&mut engine, cp, id);
         } else {
+            // Adopted with no screen to restore: the shell's mark authority
             // still crosses (see `hold_adopted_shell_nonce_requirement`).
             hold_adopted_shell_nonce_requirement(&mut engine, id);
         }
@@ -1525,6 +1528,7 @@ pub(crate) fn spawn_session(
     );
     let mut integrated_shell = None;
     let (mut env_add, argv_override, shell_nonce) = if adopt.is_some() {
+        // Adopted: the shell is already running with its original env (including
         // the nonce minted at its first spawn), so nothing is injected.
         (Vec::new(), None, None)
     } else if factory.integrate {
@@ -1624,6 +1628,7 @@ pub(crate) fn spawn_session(
         env_add.push(factory.shell_colorfgbg());
     }
     let child_proxy = if adopt.is_some() {
+        // Adopted: the child keeps its first-spawn recursion tokens; env cannot be
         // re-injected, so nothing is re-provisioned.
         None
     } else if factory.exec_command.is_none() {
@@ -2068,6 +2073,7 @@ fn pulse_adopted_pty(
             },
         );
         if let Err(error) = spawned {
+            // No thread: end the pulse now rather than leave the program at
             // `rows-1`. It may not repaint, but it is never left mis-sized.
             aterm_log::warn!("adoption pulse: no hold thread ({error}); ending the pulse at once");
         }
@@ -3295,6 +3301,9 @@ fn attach_reader_inner(
     factory: &SessionFactory,
     start_gate: Option<DeferredReaderGate>,
 ) -> Result<(), String> {
+    // A previous reader still winding down (a park that missed its deadline):
+    // wait it out — two readers on one master interleave bytes and corrupt both
+    // engines. Bounded in practice: the park already poked the wake pipe, so the
     // old thread is past its last blocking read.
     if let Some(join) = session.reader_join.take() {
         let _ = join.join();
@@ -3518,6 +3527,7 @@ pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
         std::thread::yield_now();
     }
     if join.join().is_err() {
+        // Fail closed so automatic handoff rolls back and reattaches a reader;
         // never treat thread termination alone as a successful quiescence ACK.
         return false;
     }
@@ -4635,7 +4645,7 @@ pub(crate) enum HostReach {
     Refused,
 }
 
-fn host_reach(mode: aterm_containment::ContainmentMode) -> HostReach {
+const fn host_reach(mode: aterm_containment::ContainmentMode) -> HostReach {
     use aterm_containment::ContainmentMode as Cm;
     match mode {
         Cm::User | Cm::Safety => HostReach::Platform,
@@ -5247,7 +5257,7 @@ fn take_injected_reply_writer_spawn_fault() -> bool {
 }
 
 #[cfg(not(test))]
-fn take_injected_reply_writer_spawn_fault() -> bool {
+const fn take_injected_reply_writer_spawn_fault() -> bool {
     false
 }
 
@@ -6027,6 +6037,9 @@ fn spawn_pty_gather(
             let mut after_exit: Option<usize> = None;
             let mut exit_reported = false;
             loop {
+                // Stop before the next read, never between a read and its hand-off:
+                // bytes drained from the kernel must reach the engine (the
+                // checkpoint-tear contract), and the parse stage processes every
                 // batch it was sent.
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     let _ = filled_tx.send(GatherMsg::Wake);
@@ -6081,6 +6094,7 @@ fn spawn_pty_gather(
                         }
                     }
                     aterm_pty::ReadOutcome::Eof => {
+                        // The shell closing its terminal on its way out: the
                         // exit it is about to make goes with this one.
                         let message = if exit_reported {
                             GatherMsg::Wake
@@ -6824,6 +6838,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 if let Some(resp) = response {
                     let resp: std::sync::Arc<[u8]> = resp.into();
                     if let Some(tx) = &temporal_tx {
+                        // The spine records the reply's instant, BEFORE handing it
+                        // to the peer; its bytes stay out (a replay never re-emits
+                        // a reply). Bounded `try_send` (see the RawIn tap above):
                         // dropped on a full queue or inside a break, and counted.
                         spine_mark.reply(tx);
                     }
@@ -6876,6 +6893,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             };
             #[cfg(windows)]
             loop {
+                // Stop is honored at the top of every iteration, never between a
+                // read and its processing (bytes out of the kernel queue must reach
+                // the engine). A flooding master keeps `poll` readable, so without
                 // this the wake-pipe-less fallback could never park such a reader.
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
@@ -6883,6 +6903,8 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 let r = match aterm_pty::read_or_wake(master, &mut buf, wake_rd, -1, -1) {
                     aterm_pty::ReadOutcome::Wake => break,
                     aterm_pty::ReadOutcome::Idle => {
+                        // Wake-pipe-less fallback (fd exhaustion): honor the fd-free
+                        // stop flag `Session::drop` raises, so an orphan-pinned reader
                         // still exits. Else keep waiting.
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
                             break;
@@ -7020,6 +7042,7 @@ fn ingest_chunk_width(pending: impl FnOnce() -> bool, remaining: usize) -> usize
 }
 
 fn stamp_output_arrival(last_output_ns: &AtomicU64, now_ns: u64) {
+    // Load first: a flood between two presents finds the edge already stamped,
     // and a plain load leaves the line shared instead of a failing RMW.
     if last_output_ns.load(Ordering::Relaxed) == 0 {
         let _ = last_output_ns.compare_exchange(0, now_ns, Ordering::Relaxed, Ordering::Relaxed);
@@ -7114,7 +7137,7 @@ pub(crate) enum WakeGate {
 }
 
 /// Whether an armed latch `word` is a wake stranded with its loop wake-up.
-pub(crate) fn wake_stranded(word: u64, idle_since_ns: u64, now_ns: u64) -> bool {
+pub(crate) const fn wake_stranded(word: u64, idle_since_ns: u64, now_ns: u64) -> bool {
     let at = word & WAKE_LATCH_STAMP;
     word & WAKE_LATCH_SENT != 0
         && idle_since_ns != 0
@@ -7215,7 +7238,7 @@ impl PostCadence {
         quiet < OUTPUT_CADENCE_NS || (streamed && quiet < STREAM_AFTER_NS)
     }
 
-    fn dense(&self) -> bool {
+    const fn dense(&self) -> bool {
         self.posts >= STREAM_AFTER_POSTS
     }
 
@@ -7236,7 +7259,7 @@ impl PostCadence {
     }
 
     /// A chunk fed at `now_ns` left a held latch dirty ([`WakeGate::Held`]).
-    pub(crate) fn held(&mut self, now_ns: u64) {
+    pub(crate) const fn held(&mut self, now_ns: u64) {
         self.last_ns = now_ns;
     }
 

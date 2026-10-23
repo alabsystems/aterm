@@ -504,7 +504,7 @@ pub fn release_state(slug: &str, tag: &str) -> Result<ReleaseState> {
 pub struct RemoteState {
     /// The version this cut would publish.
     pub current_version: String,
-    /// Does CHANGELOG.md already carry `## [current_version]`?.
+    /// Does CHANGELOG.md already carry `## [current_version]`?
     pub changelog_has_section: bool,
     /// Whether `v<current_version>` is a published app release on the channel ([`ReleaseState::Published`]).
     pub published: bool,

@@ -22,7 +22,6 @@ fn inst() -> Inst {
     Inst::new("p4242-0123456789abcdef01234567").expect("an instance")
 }
 
-/// A log with a session, a run and a mark, for real records.
 fn sample() -> Log {
     let mut log = Log::new(1);
     let _ = crate::support::agent_session(&mut log, 0);
@@ -95,8 +94,6 @@ fn every_frame() -> Vec<Frame> {
     out
 }
 
-/// A record decodes at the host tier, so its frame round-trips through its
-/// host-tier copy.
 fn host_copy(f: &Frame) -> Frame {
     match f {
         Frame::Rec { sid, rec, restated } => Frame::Rec {

@@ -169,14 +169,15 @@ pub trait Fetcher {
     }
 }
 
-/// What an install.
+/// What an install did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallReport {
     /// The program installed.
     pub program: String,
-    /// The build it is now.
+    /// The build it is now on.
     pub build: u64,
-    /// The `index_build` of the index this install resolved.
+    /// The `index_build` of the index this install resolved from — the caller advances the
+    /// durable high-water [`crate::sig::Floor`] to this on success (§8 gate 3).
     pub index_build: u64,
     /// The `roster_seq` of the master-signed generation that authorized that index.
     pub roster_seq: u64,
@@ -197,7 +198,7 @@ pub struct InstallReport {
 /// What the vendor-direct lane did for an `install`/`update` of one of its programs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorReport {
-    /// The version now active, when one.
+    /// The version now active, when one is.
     pub version: Option<String>,
     /// The vendor, as its row names it (`Anthropic`).
     pub vendor: String,
@@ -219,7 +220,7 @@ pub struct DepOutcome {
 pub enum DepResult {
     /// Freshly installed at `build`, carrying its signed `tree_root` so the CLI records it.
     Installed {
-        /// The build the dependency was installed.
+        /// The build the dependency was installed at.
         build: u64,
         /// The dependency's signed `tree_root`.
         tree_root: String,
@@ -282,7 +283,9 @@ pub enum FlowError {
     Download(String),
     /// Staging (signed digest / extract / tree_root) failed.
     Stage(StageError),
-    /// A recent attempt proved the published asset does not match the pinned build's signed.
+    /// A recent attempt proved the published asset does not match the pinned build's signed
+    /// digests and that refusal still binds ([`crate::store::StageRefusal`]), so nothing
+    /// was fetched, staged or changed.
     StageRefused(String),
     /// Activation / shim install failed.
     Activate(String),
@@ -305,6 +308,8 @@ impl std::fmt::Display for FlowError {
         match self {
             FlowError::NoIndex => f.write_str("no signature-valid index at/above the floor"),
             FlowError::Unreachable(why) => {
+                // No "retries automatically" tail: this reaches foreground verbs, where
+                // nothing retries; the CLI edge appends the per-verb re-run
                 // (`print_unreachable_followup`).
                 write!(f, "could not reach the toolchain index: {why}")
             }
@@ -346,6 +351,7 @@ impl std::fmt::Display for FlowError {
             FlowError::StageRefused(m) => f.write_str(m),
             FlowError::Activate(e) => write!(f, "activate: {e}"),
             FlowError::Rollback(m) => {
+                // No "rollback: " head: the CLI edge already prints "atpkg: rollback <p>
                 // failed:".
                 f.write_str(m)
             }
@@ -755,7 +761,7 @@ pub(crate) struct Landing<'a> {
     pub shim_env: &'a crate::shim_env::ShimEnv,
     /// Whether the tools get `alab-<tool>` aliases.
     pub aliases: Aliases,
-    /// The active build the caller decided.
+    /// The active build the caller decided against.
     pub installed: Option<u64>,
     /// How the row applies ([`crate::dispatch::strategy_for`]).
     pub strategy: crate::dispatch::ApplyStrategy,
@@ -765,7 +771,11 @@ pub(crate) struct Landing<'a> {
     pub download_turn: Option<&'a DownloadTicket<'a>>,
 }
 
-/// The order landings side by side take the link.
+/// The order landings side by side take the link in: ONE TRANSFER AT A TIME, in the order
+/// their programs were taken ([`Self::ticket`]) — not in the order their threads reach the
+/// download, a coin flip between two lanes woken together — so the first program taken has
+/// the whole link, however slow, while a later one's landing gets as far as its transfer and
+/// waits there, its verify, unpack and activate overlapping the next transfer.
 #[derive(Default)]
 pub(crate) struct DownloadTurns {
     state: std::sync::Mutex<Turns>,
@@ -1029,6 +1039,8 @@ fn abort_activated_install(layout: &Layout, program: &str, staged: &Staged) {
     rollback_member(layout, program, staged);
     crate::activate::undo_activation(layout, &staged.build_dir);
     if staged.was_live {
+        // Re-point the witness at the kept tree, or the keep is one-shot. Exists, not
+        // resolves, is the claim test (as in `gc::authority_claims`), so a link a
         // prior-build rollback wrote is never overwritten.
         if crate::store::build_is_complete(&staged.build_dir)
             && std::fs::symlink_metadata(layout.program_current(program)).is_err()
@@ -1073,7 +1085,10 @@ pub struct ChannelApplyReport {
     pub applied: BTreeMap<String, AppliedMember>,
     /// Members excluded from this apply because they are dev-linked ().
     pub skipped_linked: Vec<String>,
-    /// `program → pinned artifact asset file name` for every member resolved far enough to select.
+    /// `program → pinned artifact asset file name` for every member resolved far enough to
+    /// select an artifact, including members whose download or stage then failed: the
+    /// pass-end [`crate::gc::run_keeping_pinned_partials`] spares exactly these programs'
+    /// `.part` resume files.
     pub resolved_assets: BTreeMap<String, String>,
 }
 
@@ -1091,7 +1106,7 @@ pub struct AppliedMember {
 pub struct RollbackReport {
     /// The program rolled back.
     pub program: String,
-    /// The build it was active.
+    /// The build it was active on before.
     pub from_build: u64,
     /// The gate-valid build it is now active on (strictly below `from_build`).
     pub to_build: u64,
@@ -1312,6 +1327,9 @@ fn apply_group(
     resolved_assets: &mut BTreeMap<String, String>,
     flip: &crate::quiet::FlipGate<'_>,
 ) -> Option<(Group, TxnOutcome, BTreeMap<String, AppliedMember>)> {
+    // `installed` itself, the map `decide` reads, is not widened (that would answer
+    // UpToDate for an unmoved pin); `decide` still returns Install, the re-stage
+    // [`Staged::was_live`] exists for. The scan runs only when the shim view was silent
     // for every member.
     if group.members.iter().all(|m| !installed.contains_key(m))
         && !tombstoned_in_place(layout, group.members.iter().map(String::as_str))
@@ -1819,6 +1837,7 @@ fn apply_group_txn_inner(
         TxnOutcome::Aborted { .. } | TxnOutcome::Deferred { .. }
     ) {
         for s in staged.borrow().values() {
+            // Never delete a build that was already live when re-staged: gc protects it
             // ([`crate::gc::live_builds`]), and deleting it would leave `current` dangling.
             if s.was_live {
                 continue;
@@ -1861,7 +1880,7 @@ struct QuietGate {
     label: String,
     /// Member → the live build the flip would move off (what is probed).
     live: BTreeMap<String, u64>,
-    /// Member → the build it would move.
+    /// Member → the build it would move onto.
     to: BTreeMap<String, u64>,
 }
 
@@ -2109,7 +2128,8 @@ enum InstallNeed {
         pins: Vec<PinnedArtifact>,
         bytes: LandingBytes,
     },
-    /// `member`'s manifest.
+    /// `member`'s manifest — bound to its pinned program and `build` — carries no artifact
+    /// for the triple: that pin cannot exist on this host.
     Unpublished { member: String, build: u64 },
     /// Nothing proven: a fetch/verify/parse failure.
     Unknown,
@@ -2117,7 +2137,7 @@ enum InstallNeed {
 
 struct PinnedArtifact {
     program: String,
-    /// The pinned build its manifest was fetched.
+    /// The pinned build its manifest was fetched for.
     build: u64,
     /// Its artifact for the triple.
     artifact: crate::manifest::Artifact,
@@ -2141,7 +2161,7 @@ impl LandingBytes {
         }
     }
 
-    /// `self` and `other` landing together, as a tuple's members.
+    /// `self` and `other` landing together, as a tuple's members do.
     #[must_use]
     pub(crate) const fn and(self, other: Self) -> Self {
         Self {
@@ -2429,7 +2449,7 @@ fn resolve_candidates(
 pub struct ResolveProvenance {
     /// The source served the candidates over the network this resolve (not the cache).
     pub reached: bool,
-    /// Why it did not, when it.
+    /// Why it did not, when it did not — the transport's own sentence.
     pub why: Option<String>,
     /// Whether a host answered at all (the source, or a refusal with a status).
     pub answered: bool,
@@ -2486,7 +2506,9 @@ pub fn last_resolve() -> Option<ResolveProvenance> {
     LAST_RESOLVE.with(|slot| slot.borrow().clone())
 }
 
-/// Roll `program` back to the highest retained build strictly below its active build.
+/// Roll `program` back to the highest retained build strictly below its active build that
+/// still passes the floor/yank gate (§9/§11), re-pointing its shims and `current` via
+/// [`rollback_member`] (links only; no retained tree is touched).
 #[allow(
     clippy::too_many_arguments,
     reason = "rollback needs the fetcher, layout, pinned root key, channel + program \
@@ -2924,6 +2946,9 @@ fn fetch_member(
     let carried = ahead.is_none() && carried_archive(&dl, artifact);
     if ahead.is_none() {
         if !carried {
+            // Same reason as the singleton path: a stale staging entry can be a hardlink
+            // into a `dir:` registry, and fetching over it corrupts the registry. The
+            // carried arm never needs this: it only READS `dl` — nothing is written over a
             // hardlink — and what it reads already matched the signed digest.
             let _ = std::fs::remove_file(&dl);
         }
@@ -3032,6 +3057,7 @@ fn flip_member_with(
     ahead: Option<ResolveAhead>,
     activate: impl FnOnce(&Layout, &Path) -> std::io::Result<()>,
 ) -> bool {
+    // A sysroot-bundle member gets its pre-activation wiring before the flip; a
     // failure here aborts the group (the payload is staged but never activated).
     if let Some(reloc) = &s.reloc
         && apply_sysroot_bundle(reloc).is_err()

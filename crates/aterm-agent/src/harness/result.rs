@@ -307,7 +307,9 @@ fn worker_turns(items: &[Item]) -> Vec<TurnRows<'_>> {
     out
 }
 
-/// The rule a result is read by ([the module's](self)): a check's.
+/// The rule a result is read by ([the module's](self)): a check's — the
+/// newest turn a land act opened, or an older build's done check — or a
+/// plain turn's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DoneBy {
     /// The newest turn is a harness check's: the report before it, then what its reply adds.

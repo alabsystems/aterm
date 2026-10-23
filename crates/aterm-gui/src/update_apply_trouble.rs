@@ -38,7 +38,7 @@ impl PersonRemedy {
 
     /// The sentence, for a detail with a line to spend.
     #[must_use]
-    pub(crate) fn sentence(self) -> &'static str {
+    pub(crate) const fn sentence(self) -> &'static str {
         match self {
             Self::MoveOrAskAdmin => {
                 "Move aterm to a folder you can write to, such as ~/Applications, or have an \
@@ -52,7 +52,7 @@ impl PersonRemedy {
 
     /// The few words, for a menu row's tail.
     #[must_use]
-    pub(crate) fn row_tail(self) -> &'static str {
+    pub(crate) const fn row_tail(self) -> &'static str {
         match self {
             Self::MoveOrAskAdmin => "move aterm or ask an admin",
             Self::InstallSignedRelease => "install the signed release",

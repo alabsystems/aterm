@@ -311,6 +311,7 @@ impl Grid {
     /// Resolve-wrap + write + damage + advance for a width-1 char.
     #[inline]
     pub fn write_narrow_autowrap_fast(&mut self, c: char, colors: PackedColors, flags: CellFlags) {
+        // Resolve a pending wrap first, or a width-1 char after a wide char at end of line
         // overwrites its spacer half.
         if self.storage.take_pending_wrap() {
             self.advance_autowrap_line();

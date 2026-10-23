@@ -408,7 +408,9 @@ pub fn quota_error_for(model: &str, quota_id: &str, limit: u32, retry_delay: &st
 /// The `RetryInfo` of the `rate-limit` mode's spent day quota, in seconds.
 pub const DAY_QUOTA_RETRY: i64 = 3600;
 
-/// The claim of `limit:CLAIM:RESET` whose Gemini API answer is a Google ACCOUNT's spent usage.
+/// The claim of `limit:CLAIM:RESET` whose Gemini API answer is a Google
+/// ACCOUNT's spent usage limit ([`exhausted_error`]) rather than an API key's
+/// spent per-day quota ([`quota_error`], every other claim).
 pub const ACCOUNT_CLAIM: &str = "code_assist";
 
 /// The claim of `limit:CLAIM:RESET` that walls a Google ACCOUNT's PRO
@@ -450,7 +452,13 @@ pub fn routes_pro(mode: &str, now_s: i64) -> bool {
     limit_params(mode).is_some_and(|(claim, reset, _)| claim == BUCKET_CLAIM && now_s < reset)
 }
 
-/// The 429 `RESOURCE_EXHAUSTED` Google's Code Assist server answers once the ACCOUNT's usage limit on `model` is spent.
+/// The 429 `RESOURCE_EXHAUSTED` Google's Code Assist server
+/// (`cloudcode-pa.googleapis.com`, the API a Google sign-in's Gemini CLI
+/// speaks) answers once the ACCOUNT's usage limit on `model` is spent: the
+/// message `You have exhausted your capacity on this model. Your quota will
+/// reset after <span>.`, an `ErrorInfo` whose reason is `QUOTA_EXHAUSTED` in
+/// the Code Assist domain with the reset in its metadata (`quotaResetDelay`,
+/// `quotaResetTimeStamp`), and a `RetryInfo` of the same delay.
 #[must_use]
 pub fn exhausted_error(model: &str, retry_secs: i64, reset_s: i64) -> J {
     let secs = retry_secs.max(0);

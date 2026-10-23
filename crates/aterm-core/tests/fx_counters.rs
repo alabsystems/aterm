@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fx engine's cost counters (design §7 "Cost"): a content seal is one
-//! `fx_layer_builds`, a deep payload copy one `fx_payload_copies`, and handing
-//! the same `Arc` on (a settled layer) moves neither. Its own binary: the
-//! counters are process-wide, so the exact deltas need a process no other
-//! test builds content in.
+//! The fx engine's cost counters (design §7 "Cost").
 
 use std::sync::Arc;
 
@@ -43,7 +39,6 @@ fn seals_and_deep_copies_are_counted_and_a_settled_layer_moves_neither() {
         "a new content is one build and no copy"
     );
 
-    // A settled layer: the host hands the same Arc on, frame after frame.
     let (b1, c1) = (fx_layer_builds(), fx_payload_copies());
     let layer = FxLayer::new(
         1,
@@ -62,8 +57,6 @@ fn seals_and_deep_copies_are_counted_and_a_settled_layer_moves_neither() {
     drop(frames);
     drop(layer);
 
-    // The emitter's ring: the content is unique again, so `make_mut` edits
-    // in place: one build, no copy.
     let (b2, c2) = (fx_layer_builds(), fx_payload_copies());
     Arc::make_mut(&mut content).edit(|items, _| {
         if let Some(FxItem::Rect(r)) = items.first_mut() {
@@ -76,7 +69,6 @@ fn seals_and_deep_copies_are_counted_and_a_settled_layer_moves_neither() {
         "an edit of a unique payload is one build and no copy"
     );
 
-    // A payload a frame still holds: `make_mut` copies it first.
     let held = Arc::clone(&content);
     let (b3, c3) = (fx_layer_builds(), fx_payload_copies());
     Arc::make_mut(&mut content).edit(|items, _| {

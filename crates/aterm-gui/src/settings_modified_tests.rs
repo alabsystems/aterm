@@ -1454,6 +1454,7 @@ fn a_style_round_trip_from_effects_off_leaves_no_redundant_master() {
 #[test]
 fn the_default_style_and_the_glow_are_chosen_over_the_retired_switch() {
     if !crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
+        // Where effects are off by default `cursor_trail = false` reads as
         // the defaults, so there is nothing to choose.
         return;
     }

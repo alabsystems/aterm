@@ -30,7 +30,8 @@ pub(super) fn first_screen_of(
     compile_settings_view(&runtime, instance, view, &view_cx_at(width, height))
 }
 
-/// Every screen of `route` in a `width`×`height` window, top to the last one its list scrolls.
+/// Every screen of `route` in a `width`×`height` window, top to the last
+/// one its list scrolls to, from a fresh runtime `prepare` has set up.
 pub(super) fn screens_of(
     prepare: impl FnOnce(&mut NativeRuntime, crate::native_app::ViewId),
     route: SettingsRoute,
@@ -1951,7 +1952,9 @@ fn packages_without_its_tool() -> PackagesState {
     service.state(false, true, false)
 }
 
-/// Every screen of `route` in a `width`×`height` window as Page Down turns them.
+/// Every screen of `route` in a `width`×`height` window as Page Down turns
+/// them over from the list's top, from a fresh runtime `prepare` has set up,
+/// to the screen a turn no longer changes.
 fn paged_screens_of(
     prepare: impl FnOnce(&mut NativeRuntime),
     route: SettingsRoute,
@@ -2114,7 +2117,9 @@ fn every_page_runtime() -> (
     every_page_runtime_over(EVERY_PAGE_SOURCES[0])
 }
 
-/// The aterm.toml sources the every-page sweep runs.
+/// The aterm.toml sources the every-page sweep runs over: the default
+/// theme, and GitHub Light with a light window (the lab sweep's two), whose
+/// rows Modified, Appearance and Home then draw set.
 const EVERY_PAGE_SOURCES: [&str; 2] = [
     "agents_auto_prime = false\n",
     "agents_auto_prime = false\ntheme = \"GitHub Light\"\nwindow_theme = \"light\"\n",

@@ -1,37 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Crash-restore journal harness (the `crash-restore` lane of `verify perf`; the
-// crash-restore plan §6 and §7.3): what the journal costs the parse thread, and
-// what a restore costs the next window.
-//
-//   targo --unverified run --release -q -p aterm-bench --example crash_restore_harness
-//   -> {"tail_tap_ratio":...,"tail_tap_mbps":...,"kf_shell_hz":...,"kf_tui_hz":...,
-//       "kf_bridge256_hz":...,"kf_bridge512_hz":...,"recover_hz":...,
-//       "kf_shell_us":...,"kf_shell_capture_us":...,...,"recover_us":...,
-//       "export_us_per_line":...,"n":...,"warmup":...}
-//
-// * The tail tap: the throughput lane's corpus processed in 64 KiB slices (the
-//   reader's batches), with and without each slice appended to a v1 region's tail
-//   after `process`, as interleaved pairs; `tail_tap_ratio` is the median of each
-//   pair's with/without throughput (the lane fences it at 0.97, the plan's floor),
-//   `tail_tap_mbps` the median throughput with the tap. The tap writes through the
-//   window's page-counting store (`aterm_restore::Touched`), so its count is priced too.
-// * A keyframe: what the parse thread pays per keyframe, the capture
-//   (`Terminal::checkpoint_journal_marked`, its marks reaching 512 lines as the window
-//   passes them, under the terminal lock) plus the encode and the
-//   copy into its slot (after the lock), for a shell's screen, a full-screen program
-//   over a saved primary, and a shell with a 256- and a 512-line bridge. The capture
-//   alone is reported beside each (`_capture_us`), ungated.
-// * A restore: `recover` of a keyframe and a 256 KiB tail into a fresh engine.
-// * The history ring's export (increment 5), what the journal worker pays per line: a
-//   shell's 20,000-line history read in 1024-line chunks and appended to a v1 ring
-//   (`HistoryWriter::append_chunk`: the LZ4 encode, the step record, the copy).
-//   Reported as `export_us_per_line`, ungated: gating it takes a baseline recorded for it
-//   (`verify perf --record crash-restore` rewrites every key's floor), and the worker
-//   runs off the parse thread and the UI thread, at most 32 chunks a session a tick.
-//
-// Every rate is a median over N_ITERS timed runs after WARMUP, BIGGER-IS-BETTER.
+
+//! Crash-restore journal benchmark harness for the `crash-restore` performance lane.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -45,13 +15,10 @@ use aterm_restore::{
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
-/// The tail tap's corpus: large enough that one pass dominates timer jitter.
 const TAP_BYTES: usize = 16 << 20;
-/// The reader's batch.
 const SLICE: usize = 64 * 1024;
 const N_ITERS: usize = 9;
 const WARMUP: usize = 2;
-/// Keyframes and restores are microseconds each: many per timed sample.
 const PER_SAMPLE: usize = 64;
 
 const WRITER: WriterIdentity<'static> = WriterIdentity {
@@ -78,11 +45,6 @@ fn writer() -> JournalWriter<VecStore> {
         .expect("a v1 region")
 }
 
-/// The tail tap's writer, over the store the window journals through: a region that
-/// counts the pages it makes resident (`aterm_restore::Touched`, what `metrics
-/// journal_resident_bytes=` reads), with a meter as the window's has, so the tap's ratio
-/// prices the count every append pays (one load per page a record spans, once the ring's
-/// first lap has counted them all).
 fn tap_writer() -> JournalWriter<Touched<VecStore>> {
     let geometry = Geometry::v1();
     let meter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -94,8 +56,6 @@ fn tap_writer() -> JournalWriter<Touched<VecStore>> {
     .expect("a v1 region")
 }
 
-/// One pass of the corpus in reader batches; MB/s. With `tap`, every slice is appended
-/// to the tail after `process`, as the parse thread does.
 fn tap_pass(corpus: &[u8], tap: Option<&mut JournalWriter<Touched<VecStore>>>) -> f64 {
     let mut term = Terminal::new(ROWS, COLS);
     let started = Instant::now();
@@ -117,7 +77,6 @@ fn tap_pass(corpus: &[u8], tap: Option<&mut JournalWriter<Touched<VecStore>>>) -
     corpus.len() as f64 / 1e6 / secs
 }
 
-/// A shell with history: `lines` numbered lines of the throughput corpus's shape.
 fn shell(lines: usize) -> Terminal {
     let mut term = Terminal::new(ROWS, COLS);
     for i in 0..lines {
@@ -133,7 +92,6 @@ fn shell(lines: usize) -> Terminal {
     term
 }
 
-/// A full-screen program painted over a shell with history (the saved primary).
 fn tui() -> Terminal {
     let mut term = shell(2000);
     term.process(b"\x1b[?1049h\x1b[2J");
@@ -149,7 +107,6 @@ fn tui() -> Terminal {
     term
 }
 
-/// Median seconds per keyframe of `term` with `bridge`, and per capture alone.
 fn keyframe_secs(term: &Terminal, bridge: usize) -> (f64, f64) {
     let mut writer = writer();
     let mut whole = Vec::with_capacity(N_ITERS);
@@ -184,9 +141,6 @@ fn keyframe_secs(term: &Terminal, bridge: usize) -> (f64, f64) {
     (median(&mut whole), median(&mut capture))
 }
 
-/// Median microseconds per history line exported into a v1 ring: `term`'s whole history,
-/// read in the worker's 1024-line chunks and appended (encode and copy), a fresh ring each
-/// sample.
 fn export_us_per_line(term: &Terminal) -> f64 {
     let fence = term.history_fence();
     let geometry = Geometry::v1();
@@ -219,7 +173,6 @@ fn export_us_per_line(term: &Terminal) -> f64 {
     median(&mut samples)
 }
 
-/// Median seconds per restore of a keyframe plus a tail of just under the v1 ring.
 fn recover_secs(corpus: &[u8]) -> f64 {
     let mut writer = writer();
     let mut term = shell(2000);
@@ -236,7 +189,6 @@ fn recover_secs(corpus: &[u8]) -> f64 {
                 == aterm_core::terminal::ShellIntegrationPosture::On,
         })
         .expect("a keyframe fits");
-    // Fill the tail to ~94% of the ring: the most a restore replays without overflow.
     let tail = &corpus[..TAIL_CAP_V1 - TAIL_CAP_V1 / 16];
     for slice in tail.chunks(4096) {
         term.process(slice);
@@ -277,8 +229,6 @@ fn recover_secs(corpus: &[u8]) -> f64 {
 fn main() {
     let corpus = aterm_bench::throughput_corpus(TAP_BYTES);
 
-    // The tail tap, as interleaved pairs so a frequency step or a neighbour's burst
-    // lands on both arms of a pair.
     let mut tap_writer = tap_writer();
     let mut ratios = Vec::with_capacity(N_ITERS);
     let mut tapped = Vec::with_capacity(N_ITERS);

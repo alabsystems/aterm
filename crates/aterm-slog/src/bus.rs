@@ -225,7 +225,8 @@ impl BusSpace {
         rec.max(cov)
     }
 
-    /// The lowest `ms` a body or a cover of the view holds (0.
+    /// The lowest `ms` a body or a cover of the view holds (0: none): where
+    /// a view that does not hold its space's start begins.
     #[must_use]
     pub fn min_ms(&self) -> u64 {
         let rec = self.held_ms().min();

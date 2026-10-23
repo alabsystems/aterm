@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Canonical command identity and authority classification.
-//!
-//! Menus, native semantic actions and editor commands are adapters onto this
-//! registry.  The adapter matches are exhaustive: a new shipping action cannot
-//! compile until it receives a stable command id and an authority decision.
 
 use crate::menu;
 
@@ -89,7 +85,6 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::SoftwareUpdate => spec("app.settings.updates", S::App, A::UpdateStage, C::Any),
         M::Version => spec("app.settings.version", S::App, A::Observe, C::Any),
         M::ApplyUpdate => spec("update.apply", S::Process, A::UpdateApply, C::Any),
-        // A stable id; the config source opens in native Manual.
         M::Preferences => spec("config.open_source", S::Process, A::ConfigMutate, C::Any),
         M::Quit => spec("app.quit", S::Process, A::LocalUi, C::Any),
         M::NewWindow => spec("window.new", S::Process, A::LocalUi, C::Any),
@@ -107,14 +102,9 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             A::LocalUi,
             C::Terminal,
         ),
-        // The Overview lists every session of the instance: Owner, the
-        // aggregate-disclosure class of the `flows` verb.
         M::Overview => spec("view.overview", S::App, A::Owner, C::Any),
-        // `CloseTab` closes the focused pane/view, hence the view id.
         M::CloseTab => spec("view.close_focused", S::View, A::LocalUi, C::Any),
         M::Copy => spec("selection.copy", S::View, A::Clipboard, C::Any),
-        // Tab-context copies of session identity / cwd: clipboard authority, terminal content
-        // only (a native tab owns no session).
         M::CopySessionId => spec("session.copy_id", S::Tab, A::Clipboard, C::Terminal),
         M::CopyCwd => spec("session.copy_cwd", S::Tab, A::Clipboard, C::Terminal),
         M::Paste => spec("selection.paste", S::View, A::Clipboard, C::Any),
@@ -129,10 +119,6 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::SplitVertical => spec("view.split_vertical", S::View, A::LocalUi, C::Any),
         M::SplitHorizontal => spec("view.split_horizontal", S::View, A::LocalUi, C::Any),
         M::ToggleMatrixRain => spec("effects.rain.toggle", S::Process, A::LocalUi, C::Any),
-        // Promotes the front window's promotable kitty (its tenured program cat, else the launch
-        // kitty) into the durable registry and pins it. Process-scoped and context-free: the
-        // launch kitty is one cat for the whole process. `LocalUi` because the only durable write
-        // is the machine-owned toy ledger, not config.
         M::FavouriteKitty => spec("effects.kitty.favourite", S::Process, A::LocalUi, C::Any),
         M::NextKitty => spec("effects.kitty.next", S::Process, A::LocalUi, C::Any),
         M::ToggleSeriousMode => spec(
@@ -142,67 +128,35 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             C::Any,
         ),
         M::ToggleSettings => spec("app.settings.open", S::App, A::ConfigMutate, C::Any),
-        // Settings at the Packages route: the class of ToggleSettings (it raises the
-        // durable-config Settings tab; the page's switches write [packages] through the OCC
-        // editor).
         M::Packages => spec("app.settings.packages", S::App, A::ConfigMutate, C::Any),
-        // Settings at the Messages route: the same class as Packages.
         M::Messages => spec("app.settings.messages", S::App, A::ConfigMutate, C::Any),
-        // The System State tab (`open app system-state`): the setup surface beside
-        // Settings, the same config ceiling the control gate gives its `open`.
         M::SystemState => spec("app.system_state.open", S::App, A::ConfigMutate, C::Any),
-        // Settings ▸ Harness (the Autopilot design): the same Settings tab at
-        // its Harness route, the same class as its siblings.
         M::HarnessSettings => spec("app.settings.harness", S::App, A::ConfigMutate, C::Any),
         M::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
-        // The palette scoped to its Theme section: its Enter writes `theme`,
-        // so it carries the config-write ceiling, not the gateway's Owner one.
         M::ChooseTheme => spec("palette.choose_theme", S::Window, A::ConfigMutate, C::Any),
-        // Settings ▸ Themes, the Theme Showcase: the same Settings tab at its
-        // Themes route, the same class as its siblings.
         M::BrowseThemes => spec("app.settings.themes", S::App, A::ConfigMutate, C::Any),
         M::Minimize => spec("window.minimize", S::Window, A::LocalUi, C::Any),
         M::Zoom => spec("window.maximize", S::Window, A::LocalUi, C::Any),
         M::NextTab => spec("tab.next", S::Window, A::LocalUi, C::Any),
         M::PrevTab => spec("tab.previous", S::Window, A::LocalUi, C::Any),
-        // The inline pin editor. Tab-scoped because the gesture names a tab and the editor is
-        // tab chrome (the write targets that tab's focused session); `LocalUi` because nothing
-        // durable on disk moves, as the control layer classifies `meta set` as `WriteInput`.
         M::RenameSession => spec("session.rename", S::Tab, A::LocalUi, C::Terminal),
-        // Same identity as the pin's face, one field over: the role is session
-        // metadata written through the same typed API (`meta set role`).
         M::SetRole => spec("session.set_role", S::Tab, A::LocalUi, C::Terminal),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
-        // The Agents menu. Next That Needs You moves focus (a local act).
         M::NextNeed => spec("agents.next_need", S::App, A::LocalUi, C::Any),
-        // Converges on `App::open_session_ledger`; the id keeps the ledger's.
         M::HarnessLog => spec("session.ledger.open", S::Tab, A::ExternalOpen, C::Terminal),
-        // The reads, Fleet Machines and Summarize run a child or start a
-        // worker that sees the whole Mac or fleet: Owner, process-scoped.
         M::ReadThisMac => spec("agents.read_mac", S::Process, A::Owner, C::Any),
         M::ReadFleet => spec("agents.read_fleet", S::Process, A::Owner, C::Any),
         M::SummarizeFleet => spec("agents.summarize", S::Process, A::Owner, C::Any),
         M::FleetMachines => spec("agents.fleet_machines", S::Process, A::Owner, C::Any),
-        // The person's hold pair (Take Over / Hand Back): the window's own act
-        // on the person's slot, at the highest ceiling the registry names; the
-        // `invoke` fence refuses every socket scope (`InvokeAuthority::PersonOnly`).
         M::TakeOver => spec("session.take_over", S::Tab, A::Owner, C::Terminal),
         M::HandBack => spec("session.hand_back", S::Tab, A::Owner, C::Terminal),
-        // The message bus's three commands (`aterm fabric`) run as a child of
-        // this process: Owner, process-scoped, no content requirement.
         M::FabricStatus => spec("fabric.status", S::Process, A::Owner, C::Any),
         M::FabricOn => spec("fabric.on", S::Process, A::Owner, C::Any),
         M::FabricOff => spec("fabric.off", S::Process, A::Owner, C::Any),
-        // Show Needs in Windows writes `[presence] rim` — durable config, the
-        // Serious Mode class; the id keeps the rim's.
         M::ToggleNeedsInWindows => spec("presence.rim.toggle", S::Process, A::ConfigMutate, C::Any),
-        // The Stats Bars radio writes `[sys] stats_bars`: durable config, the
-        // Show Needs in Windows class.
         M::StatsBarsDeck => spec("sys.stats_bars.deck", S::Process, A::ConfigMutate, C::Any),
         M::StatsBarsSill => spec("sys.stats_bars.sill", S::Process, A::ConfigMutate, C::Any),
         M::StatsBarsOff => spec("sys.stats_bars.off", S::Process, A::ConfigMutate, C::Any),
-        // The Deck Size radio writes `[sys] stats_deck_size`: the Stats Bars
-        // radio's class.
         M::DeckSizeAuto => spec(
             "sys.stats_deck_size.auto",
             S::Process,
@@ -221,23 +175,14 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             A::ConfigMutate,
             C::Any,
         ),
-        // The lens: a summoned overlay on the front window, runtime view
-        // state only (the font zoom's class).
         M::ToggleStatsLens => spec("sys.stats_lens.toggle", S::Window, A::LocalUi, C::Any),
-        // The manual reset of the focused view's terminal to its host defaults: runtime engine
-        // state only (`LocalUi`, the class of the font zoom), and it needs a terminal leaf.
         M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),
-        // A tab's own theme: runtime state of the focused view's session, the
-        // `theme session` verbs' class; it needs a terminal leaf.
         M::ChooseTabTheme => spec("palette.choose_tab_theme", S::View, A::LocalUi, C::Terminal),
         M::ClearTabTheme => spec("terminal.theme.clear", S::View, A::LocalUi, C::Terminal),
     }
 }
 
-/// Canonical identity/authority for native document semantic actions. Dynamic
-/// outline/link/image/source-range suffixes deliberately collapse onto one
-/// stable command identity; indices remain reducer parameters, never command
-/// names that can acquire different authority.
+/// Canonical identity/authority for native document semantic actions.
 pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
     use ActionAuthority as A;
     use CommandScope as S;
@@ -266,8 +211,6 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
         "editor/goto-line" => spec("document.goto_line", S::Document, A::LocalUi, C::Native),
         "editor/commands" => spec("document.commands", S::Document, A::LocalUi, C::Native),
         "editor/revert" => spec("document.revert", S::Document, A::DocumentWrite, C::Native),
-        // An `edit` view's header row: done saves and closes, abort discards
-        // and closes, each answering the program that waits.
         "editor/finish" => spec(
             "document.finish_edit",
             S::Document,
@@ -333,14 +276,9 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
     Some(result)
 }
 
-/// The registry's row for an editor command, derived from the engine's own
-/// closed table: its exact name is its id ([`EditorCommand::name`]) and its
-/// authority is [`EditorCommand::authority`]'s, so a command a later slice
-/// adds to the engine is registered here with no edit to this file.
-///
-/// [`EditorCommand::name`]: crate::native_editor::EditorCommand::name
-/// [`EditorCommand::authority`]: crate::native_editor::EditorCommand::authority
-pub(crate) fn editor_command(command: crate::native_editor::EditorCommand) -> CommandSpec {
+/// The registry's row for an editor command ([`EditorCommand::name`],
+/// [`EditorCommand::authority`]).
+pub(crate) const fn editor_command(command: crate::native_editor::EditorCommand) -> CommandSpec {
     spec(
         command.name(),
         CommandScope::Document,
@@ -349,9 +287,7 @@ pub(crate) fn editor_command(command: crate::native_editor::EditorCommand) -> Co
     )
 }
 
-/// The host ceiling an editor authority class asks for: moving and reading
-/// is local UI, editing and saving write the document, copying out is the
-/// clipboard, and naming other files or running a program is the owner's.
+/// The host ceiling an editor authority class asks for: moving and reading is local UI.
 pub(crate) const fn editor_action_authority(
     authority: crate::native_editor::CommandAuthority,
 ) -> ActionAuthority {
@@ -364,9 +300,7 @@ pub(crate) const fn editor_action_authority(
     }
 }
 
-/// Whether a control client's gesture reaches `authority`: it may look at,
-/// move through, edit and save the document it was pointed at, and nothing
-/// that reaches past it (the clipboard, other files, a program).
+/// Whether a control client's gesture reaches `authority`.
 const fn controller_reaches(authority: ActionAuthority) -> bool {
     matches!(
         authority,
@@ -377,10 +311,7 @@ const fn controller_reaches(authority: ActionAuthority) -> bool {
     )
 }
 
-/// The editor authority classes a gesture carries, read off the host
-/// ceiling each class asks for. A person at the window holds every class; a
-/// control client's gesture (`act`, `pointer`, `key` and `text` into an
-/// Editor) holds Read, Edit and Save.
+/// The editor authority classes a gesture carries, read off the host ceiling each class asks for.
 pub(crate) fn editor_grant(controller: bool) -> Vec<crate::native_editor::CommandAuthority> {
     crate::native_editor::CommandAuthority::ALL
         .into_iter()
@@ -402,12 +333,9 @@ mod tests {
             menu_command(menu::MenuAction::SplitVertical).content,
             ContentRequirement::Any
         );
-        // The Overview's id: stable, Owner (it lists every session).
         let map = menu_command(menu::MenuAction::Overview);
         assert_eq!(map.id.as_str(), "view.overview");
         assert_eq!(map.authority, ActionAuthority::Owner);
-        // The person's pair and the Agents rows that see the whole Mac or
-        // fleet carry the Owner ceiling; Next That Needs You is a local act.
         for action in [
             menu::MenuAction::TakeOver,
             menu::MenuAction::HandBack,
@@ -426,7 +354,6 @@ mod tests {
             menu_command(menu::MenuAction::NextNeed).authority,
             ActionAuthority::LocalUi
         );
-        // System State: its own app-scoped id, the Settings tab's ceiling.
         let system_state = menu_command(menu::MenuAction::SystemState);
         assert_eq!(system_state.id.as_str(), "app.system_state.open");
         assert_eq!(system_state.scope, CommandScope::App);
@@ -481,9 +408,6 @@ mod tests {
         );
     }
 
-    /// Every editor command has a row, named exactly as M-x names it and
-    /// carrying the host ceiling of the engine's authority class; a control
-    /// client's grant holds Read, Edit and Save and nothing past them.
     #[test]
     fn editor_rows_carry_their_authority() {
         use crate::native_editor::{CommandAuthority as E, EditorCommand};
@@ -522,12 +446,6 @@ mod tests {
         assert!(!editor_grant(true).contains(&EditorCommand::KillRingSave.authority()));
     }
 
-    /// The host's keybinding table reads every key before the Editor does,
-    /// so a chord it binds never reaches the editor's keymap. This lists
-    /// every editor binding the host table shadows on this platform. Off
-    /// macOS that is M-left and M-right, the pane-focus seeds, which pass
-    /// through to the editor in a one-pane tab
-    /// (`keybinding::pane_focus_passes_through`); macOS seeds none.
     #[test]
     fn host_keybindings_shadow_only_the_listed_editor_chords() {
         use crate::native_editor::{KeyChord, Keymap, Platform, Profile};

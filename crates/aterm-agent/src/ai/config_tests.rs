@@ -209,10 +209,6 @@ fn a_fleet_document_others_may_write_is_refused() {
     assert_eq!(s.preferred.1, From::Default);
 }
 
-/// Ubuntu's umask `002` writes every document `0664` on its user's private group, whose
-/// write bit is no other account's: on each group this process holds, a group-writable
-/// document is read when the group is its user's private one and refused on any other, and
-/// a world-writable one is refused on every group.
 #[cfg(unix)]
 #[test]
 fn a_group_writable_fleet_document_is_read_only_on_its_owners_private_group() {
@@ -264,9 +260,6 @@ fn a_group_writable_fleet_document_is_read_only_on_its_owners_private_group() {
     }
 }
 
-/// A POSIX access ACL makes a file's group bits its mask: a `0664` document on its owner's
-/// private group that also lets another account write it (`setfacl -m u:nobody:rw`, the mode
-/// unchanged) is refused, where without the ACL it is read.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_fleet_document_an_access_acl_shares_is_refused_on_the_private_group_too() {
@@ -407,7 +400,6 @@ fn a_dangling_default_fleet_entry_is_refused_not_absent() {
     ));
 }
 
-/// A signed fleet document under a new key: (public key, secret key).
 fn signer() -> (String, Vec<u8>) {
     let (secret, public) = crate::ai::fleet::keygen().expect("keygen");
     (public, secret)

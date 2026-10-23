@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The windowed instance's keeper (`aterm-lab keeper -- PROGRAM`) ends what it
-//! keeps however its launcher goes: a cut lifeline (a real FIFO, as
-//! `Instance::start` hands it, whose end of file `poll(2)` on macOS never
-//! reports) or a signal to the keeper itself. The kept program is a `sleep`
-//! that prints its pid first, so a survivor is seen by pid.
+//! Windowed instance keeper (`aterm-lab keeper -- PROGRAM`) lifeline and signal termination tests.
 
 #![cfg(target_os = "macos")]
 
@@ -17,10 +13,8 @@ use std::time::Duration;
 use aterm_uds::lifeline::Lifeline;
 use aterm_uds::spawnfd::Stdio;
 
-/// A hang detector, never a latency budget: the keeper's own grace is 5 s.
 const HANG: Duration = Duration::from_secs(60);
 
-/// A keeper holding a `sleep`, its lifeline still held by this test.
 struct Kept {
     keeper: i32,
     sleeper: i32,
@@ -69,7 +63,6 @@ impl Kept {
         }
     }
 
-    /// The keeper's exit status, once it has ended.
     fn exit_code(&self) -> Option<i32> {
         self.exited
             .recv_timeout(HANG)
@@ -79,8 +72,6 @@ impl Kept {
 
 impl Drop for Kept {
     fn drop(&mut self) {
-        // A failed case leaves nothing running (SIGKILL by pid); a passing one
-        // has seen both gone, so it signals nothing that could be a stranger.
         if std::thread::panicking() {
             if alive(self.sleeper) {
                 signal(self.sleeper, libc::SIGKILL);
@@ -98,7 +89,6 @@ fn signal(pid: i32, sig: i32) -> bool {
     unsafe { libc::kill(pid, sig) == 0 }
 }
 
-/// Whether `pid` still names a process (`kill(pid, 0)`).
 fn alive(pid: i32) -> bool {
     signal(pid, 0)
 }

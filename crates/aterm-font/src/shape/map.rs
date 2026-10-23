@@ -41,8 +41,6 @@ pub(crate) const MAX_VALUE: u32 = (1 << MAX_BITS) - 1;
 
 const GLOBAL_BIT_SHIFT: u32 = 31;
 const GLOBAL_BIT_MASK: u32 = 1 << GLOBAL_BIT_SHIFT;
-/// The first mask bit a feature can have: upstream leaves the low three to
-/// its glyph flags.
 const FIRST_FEATURE_BIT: u32 = 4;
 
 const GSUB: usize = 0;
@@ -125,11 +123,9 @@ impl Map {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct FeatureInfo {
     tag: Tag,
-    /// Insertion order, for a stable sort.
     seq: usize,
     max_value: u32,
     flags: u32,
-    /// For a non-global feature, the value unset glyphs take.
     default_value: u32,
     stage: [usize; 2],
 }
@@ -155,8 +151,6 @@ fn tables<'f>(face: &ShapeFace<'f>) -> [Option<LayoutTable<'f>>; 2] {
     [face.face.tables().gsub, face.face.tables().gpos]
 }
 
-/// The first of `script_tags` the table lists, then `DFLT`, `dflt` and
-/// `latn` (`found` is false for those three).
 fn select_script(table: &LayoutTable, script_tags: &[Tag]) -> Option<(bool, ScriptIndex, Tag)> {
     for &tag in script_tags {
         if let Some(index) = table.scripts.index(tag) {
@@ -175,8 +169,6 @@ fn select_script(table: &LayoutTable, script_tags: &[Tag]) -> Option<(bool, Scri
     None
 }
 
-/// With no language to ask for, the script's `dflt` language system if it
-/// lists one (else its default language system).
 fn select_language(table: &LayoutTable, script_index: ScriptIndex) -> Option<LanguageIndex> {
     let script = table.scripts.get(script_index)?;
     script.languages.index(Tag::from_bytes(b"dflt"))
@@ -388,9 +380,6 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
         (map_features, required_stage, global_mask)
     }
 
-    /// Sorts the feature list (unless it was built sorted) and merges
-    /// repeated tags: a global repeat wins outright, a non-global one widens
-    /// the value range; the earliest stage holds.
     fn dedup_feature_infos(&mut self) {
         let infos = &mut self.feature_infos;
         if infos.is_empty() {

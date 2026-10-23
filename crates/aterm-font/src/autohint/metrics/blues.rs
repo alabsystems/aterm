@@ -535,6 +535,10 @@ fn satisfies_min_long_segment_len(first_ix: usize, last_ix: usize, contour_last:
     let inclusive_diff = if first_ix <= last_ix {
         last_ix - first_ix
     } else {
+        // If first_ix > last_ix, then we want to capture the sum of the ranges
+        // [first_ix, contour_last] and [0, last_ix]
+        // We add 1 here to ensure the element that crosses the boundary is
+        // included. For example, if first_ix == contour_last and
         // last_ix == 0, then we want the result to be 1
         contour_last - first_ix + 1 + last_ix
     };
@@ -567,6 +571,8 @@ fn compute_cjk_blues(
         let mut n_fills = 0;
         let mut is_fill = true;
         for cluster in blue_str.split(' ') {
+            // The '|' character is used as a sentinel in the blue string that
+            // signifies a switch to characters that define "flat" values
             // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L380>
             if cluster == "|" {
                 is_fill = false;

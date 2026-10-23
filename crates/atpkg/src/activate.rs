@@ -226,32 +226,46 @@ pub fn reconcile_agents(layout: &Layout) {
                 &crate::yolo::policy_of(name),
             )
         };
-        if (exec != target || (!dev_link && !prelude.is_empty()))
+        if (exec.managed.is_some() || (!dev_link && !prelude.is_empty()))
             && let Err(e) =
-                primary_executable(&primary, &target, &exec, &env, &prelude).and_then(|file| {
-                    if crate::metadata_io::read_bounded_regular(&primary, platform::MAX_SHIM_BYTES)
+                primary_executable(&primary, &target, exec.managed.as_deref(), &env, &prelude)
+                    .and_then(|file| {
+                        if crate::metadata_io::read_bounded_regular(
+                            &primary,
+                            platform::MAX_SHIM_BYTES,
+                        )
                         .is_ok_and(|have| have == file.body)
-                    {
-                        Ok(())
-                    } else {
-                        crate::lay::write_in_publication_turn(&file, &publication)
-                    }
-                })
+                        {
+                            Ok(())
+                        } else {
+                            crate::lay::write_in_publication_turn(&file, &publication)
+                        }
+                    })
         {
             eprintln!(
                 "atpkg: {name}: bin/{name} could not retain its managed launch ({e}); \
                  retried next pass"
             );
         }
-        if platform::resolve_shim(&twin).is_some_and(|t| t == exec)
+        let twin_file = || {
+            if exec.path == target {
+                primary_executable(&twin, &target, exec.managed.as_deref(), &env, &prelude)
+            } else {
+                platform::twin_executable_to_env(&twin, &exec.path, &env, &prelude)
+            }
+        };
+        if platform::resolve_shim(&twin).is_some_and(|t| t == exec.path)
             && platform::shim_env_of(&twin) == env
-            && twin_is_rendered(&twin, &exec, &env, &prelude)
+            && twin_file().is_ok_and(|want| {
+                crate::metadata_io::read_bounded_regular(&twin, platform::MAX_SHIM_BYTES)
+                    .is_ok_and(|have| have == want.body)
+            })
         {
             continue;
         }
         let laid = layout
             .ensure_dir(&layout.agents_dir())
-            .and_then(|()| platform::twin_executable_to_env(&twin, &exec, &env, &prelude))
+            .and_then(|()| twin_file())
             .and_then(|file| crate::lay::write_in_publication_turn(&file, &publication));
         if let Err(e) = laid {
             eprintln!(
@@ -267,15 +281,15 @@ pub fn reconcile_agents(layout: &Layout) {
 fn primary_executable(
     shim: &Path,
     target: &Path,
-    _exec: &Path,
+    _managed: Option<&Path>,
     env: &crate::shim_env::ShimEnv,
     prelude: &str,
 ) -> io::Result<crate::lay::Executable> {
     #[cfg(unix)]
-    if _exec != target {
+    if let Some(launch) = _managed {
         return Ok(crate::lay::Executable::new(
             shim,
-            platform::sh_shim_content_managed(target, env, _exec, prelude),
+            platform::sh_shim_content_managed(target, env, launch, prelude),
         ));
     }
     platform::twin_executable_to_env(shim, target, env, prelude)
@@ -289,9 +303,19 @@ pub fn exec_dir(layout: &Layout, program: &str) -> PathBuf {
 
 /// The stable launch path for an ALab primary and its agent twin. For a non-ALab build,
 /// it is `target` itself, byte for byte as before.
-fn twin_exec(layout: &Layout, program: &str, target: &Path, primary: AgentPrimary) -> PathBuf {
+struct AgentExec {
+    path: PathBuf,
+    // Admission survives failure to lay the symlink: a raw fallback still belongs to
+    // this logical route, which a later reconcile can repair.
+    managed: Option<PathBuf>,
+}
+
+fn twin_exec(layout: &Layout, program: &str, target: &Path, primary: AgentPrimary) -> AgentExec {
     if cfg!(not(unix)) || crate::alab::agent(program).is_none() {
-        return target.to_path_buf();
+        return AgentExec {
+            path: target.to_path_buf(),
+            managed: None,
+        };
     }
     let alab = match primary {
         AgentPrimary::Store => {
@@ -311,14 +335,17 @@ fn twin_exec(layout: &Layout, program: &str, target: &Path, primary: AgentPrimar
         .file_name()
         .filter(|_| alab)
         .map(|name| exec_dir(layout, program).join(name));
-    let laid = entry.filter(|entry| {
+    let laid = entry.as_ref().filter(|entry| {
         std::fs::read_link(entry).ok().as_deref() == Some(target)
             || layout
                 .ensure_dir(&exec_dir(layout, program))
                 .and_then(|()| platform::atomic_symlink(target, entry))
                 .is_ok()
     });
-    laid.unwrap_or_else(|| target.to_path_buf())
+    AgentExec {
+        path: laid.cloned().unwrap_or_else(|| target.to_path_buf()),
+        managed: entry,
+    }
 }
 
 /// What `program`'s `agents/` twin runs, spelled as its `bin/` primary spells it.
@@ -436,20 +463,6 @@ pub(crate) mod agents_checkpoint {
                 .remove(&self.0);
         }
     }
-}
-
-/// [`shim_is_rendered`] for an `agents/` twin: the bytes the twin renderer lays for
-/// `target`, `env` and its `prelude` ([`platform::twin_executable_to_env`]).
-fn twin_is_rendered(
-    shim: &Path,
-    target: &Path,
-    env: &crate::shim_env::ShimEnv,
-    prelude: &str,
-) -> bool {
-    platform::twin_executable_to_env(shim, target, env, prelude).is_ok_and(|want| {
-        crate::metadata_io::read_bounded_regular(shim, platform::MAX_SHIM_BYTES)
-            .is_ok_and(|have| have == want.body)
-    })
 }
 
 /// Whether `shim` holds, byte for byte, what the one shim renderer

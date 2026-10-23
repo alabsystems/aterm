@@ -66,7 +66,7 @@ pub(crate) struct CarrySource {
 impl CarrySource {
     /// The session this capture belongs to, which the park's capture matches against its carried screens: a session whose screen it lowered below the exact rungs goes without its differ's state too ([`Self::without_differ`]).
     #[cfg(unix)]
-    pub(crate) fn local_id(&self) -> u64 {
+    pub(crate) const fn local_id(&self) -> u64 {
         self.local_id
     }
 
@@ -109,7 +109,7 @@ pub(crate) fn capture_head(
 /// Whether a successor of `target_build` reads the session log a handoff carries (the sidecar's `log`): one at least as new as this build, as for the mailbox (`app_update_handoff::successor_reads_fabric_carry`).
 #[cfg(any(unix, test))]
 #[must_use]
-pub(crate) fn successor_reads_session_log(target_build: u64, running_build: u64) -> bool {
+pub(crate) const fn successor_reads_session_log(target_build: u64, running_build: u64) -> bool {
     target_build >= running_build
 }
 
@@ -131,7 +131,7 @@ pub(crate) const READS_HANGUP_FROM_BUILD: u64 = 1_790_807_622;
 impl StatusWords {
     /// The words of the successor at `target_build`, keyed on the first build that reads `hangup` and not on whether the target is older than this build, as the screen carry's ceilings (`seamless::WireCaps::for_hop`) and the history carry (`handoff_history::exports_for_target`) are keyed on theirs: a rollback to v0.100.0 or later reads `hangup`, carried it as it is before this export respelled any word, and still does.
     #[must_use]
-    pub(crate) fn for_target(target_build: u64) -> Self {
+    pub(crate) const fn for_target(target_build: u64) -> Self {
         if target_build < READS_HANGUP_FROM_BUILD {
             Self::PreHangup
         } else {
@@ -374,6 +374,9 @@ pub(crate) fn export_noting(
         };
         let mut archive = source.head.clone();
         if let Some(terminal) = patiently(patience, || source.term.try_lock()) {
+            // The differ's state, when the freeze had no time for it — only
+            // while nothing committed since (then it is the state the freeze
+            // would have taken). Without it the adopting engine starts a new
             // baseline after a `restore` gap, and a report says `archive-gap`.
             if source.keep_differ {
                 let _ = terminal.alt_archive_carry_differ(&mut archive, source.fence);
@@ -1026,7 +1029,7 @@ struct Floors {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the predicate a reference"
 )]
-fn is_zero(n: &u64) -> bool {
+const fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
@@ -1232,12 +1235,12 @@ impl ControlCarry {
     }
 
     /// The carried session log, taken (the adopting log reads it, `session_log::SessionLog::adopt`).
-    pub(crate) fn take_log(&mut self) -> Option<Vec<String>> {
+    pub(crate) const fn take_log(&mut self) -> Option<Vec<String>> {
         self.log.take()
     }
 
     /// The bus mirror's old-space cursor, taken (`LogAdopt::mirror`).
-    pub(crate) fn take_log_mirror(&mut self) -> Option<aterm_slog::Prior> {
+    pub(crate) const fn take_log_mirror(&mut self) -> Option<aterm_slog::Prior> {
         self.log_mirror.take()
     }
 

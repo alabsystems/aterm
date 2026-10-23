@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Glow-halo (`RenderInput.glow_halo`) CPU/GPU byte parity: the radial cursor-effect light
-// stream. It is `RainHalo`-shaped (integer elliptical falloff) and premultiplied One/One
-// additive, so over a byte-exact base the bar is byte-exact CPU==GPU: a synthetic halo field
-// (rx≠ry, off-centre centres over several row bands, edge-clipped quads), the cached path, and
-// `HaloMode::Over` (light-theme veil; CPU `over_rgb` == GPU `fs_rain_glow_over`) over dark and
-// white frames and on the cached path.
-//
-// No GPU or no font: COULD NOT RUN. On a downlevel (sRGB-offscreen) adapter
-// (`additive_is_byte_exact`) a test runs its other checks, then ends COULD NOT
-// RUN naming the byte-exact comparisons it could not make (`common::ByteExact`).
+
+//! Glow-halo (`RenderInput.glow_halo`) CPU/GPU byte parity tests.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{HaloMode, RainHalo, Theme, WindowCpu};
@@ -18,9 +9,6 @@ use aterm_render::{HaloMode, RainHalo, Theme, WindowCpu};
 use crate::common::ByteExact;
 use crate::common::{assert_byte_exact, backends, bb, block_text_term, gg, max_channel_delta, rr};
 
-/// Emit one halo as per-row-band quads: the rect `centre ± (rx, ry)` clamped
-/// to the grid, split at cell-row boundaries, each slice with its own `row`
-/// and the shared falloff centre. Nothing for a fully clipped halo.
 #[allow(clippy::too_many_arguments)]
 fn emit_halo(
     out: &mut Vec<RainHalo>,
@@ -62,8 +50,6 @@ fn emit_halo(
     }
 }
 
-/// The base frame is byte-exact, so the halo delta is the stream's alone; the synthetic field
-/// over text must be byte-identical on both backends.
 #[test]
 fn glow_halo_synthetic_field_is_byte_exact_over_text() {
     let exact = ByteExact::default();
@@ -71,12 +57,10 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (10usize, 40usize);
-    // Hidden cursor + procedural block rows: a byte-exact base with text under the halos.
     let mut term = block_text_term(rows, cols, 1..8);
     let (cw, ch) = cpu.cell_size();
     let (grid_w, grid_h) = (cols * cw, rows * ch);
 
-    // (a) Base (no halos): the effect-only premise — CPU==GPU exactly.
     let base_input = term.cell_frame(rows, cols);
     let cpu_base = cpu.render_input(&base_input);
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
@@ -86,9 +70,7 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
         "procedural-block base must be byte-exact so the halo delta is effect-only"
     );
 
-    // (b) The synthetic field: every RainHalo degree of freedom.
     let mut halos = Vec::new();
-    // A tall ember straddling three row bands (rx != ry, off-centre in its band).
     emit_halo(
         &mut halos,
         6 * cw + cw / 2,
@@ -100,7 +82,6 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
         grid_w,
         grid_h,
     );
-    // A squat wide ember (ry < rx) mid-grid, over the blocks.
     emit_halo(
         &mut halos,
         12 * cw,
@@ -112,7 +93,6 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
         grid_w,
         grid_h,
     );
-    // Clipped at the left edge: centre 2px in, the quad clamps at x=0.
     emit_halo(
         &mut halos,
         2,
@@ -124,7 +104,6 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
         grid_w,
         grid_h,
     );
-    // Clipped at the bottom-right corner: quads clamp at both far edges.
     emit_halo(
         &mut halos,
         grid_w - 3,
@@ -136,7 +115,6 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
         grid_w,
         grid_h,
     );
-    // Clipped at the top edge: centre 2px down, the crown clamps at y=0.
     emit_halo(
         &mut halos,
         20 * cw,
@@ -148,8 +126,6 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
         grid_w,
         grid_h,
     );
-    // Anti-vacuity: the field must be multi-quad, multi-row, and carry a
-    // genuine row-spanner (per-row quads sharing one centre).
     let mut qrows: Vec<u16> = halos.iter().map(|q| q.row).collect();
     qrows.sort_unstable();
     qrows.dedup();
@@ -173,8 +149,6 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
         "glow_halo synthetic-field GPU vs CPU max per-channel delta = {delta} ({} quads)",
         input.glow_halo.len()
     );
-    // Byte-exact additive holds only on native (plain-Unorm offscreen); a downlevel sRGB
-    // offscreen does the add in linear.
     if exact.holds(&gpu, "byte-exact glow_halo gate") {
         assert_eq!(
             delta, 0,
@@ -183,10 +157,6 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
     }
 }
 
-/// Cached-path parity (`render_input_cached` on persistent renderer+window per
-/// backend): frame A places a halo at P1; frame B moves it to P2, which must
-/// miss the dirty gate, repaint prev∪cur rows (`glow_halo_changed`) and land
-/// byte-exact.
 #[test]
 fn damaged_path_glow_halo_parity_cpu_matches_gpu() {
     let exact = ByteExact::default();
@@ -214,13 +184,11 @@ fn damaged_path_glow_halo_parity_cpu_matches_gpu() {
         mode: HaloMode::Add,
     };
 
-    // Frame A: halo at P1 (col 2, row 1) — primes both caches.
     let mut in_a = base_input.clone();
     in_a.glow_halo.push(halo_at(2, 1));
     let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
     let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
 
-    // Frame B: move the halo to P2 (col 9, row 4), a real content change.
     let mut in_b = base_input.clone();
     in_b.glow_halo.push(halo_at(9, 4));
     let misses_before = gpu.gate_misses();
@@ -237,14 +205,11 @@ fn damaged_path_glow_halo_parity_cpu_matches_gpu() {
         "a moved glow_halo must MISS the GPU dirty gate (real re-render)"
     );
 
-    // The damaged frame equals a fresh full render (no ghost at the vacated P1 rows, no missing
-    // light at P2) ...
     let cpu_fresh = cpu.render_input(&in_b).pixels.clone();
     assert_eq!(
         cpu_b, cpu_fresh,
         "CPU cached-damaged glow_halo frame must equal a fresh full render"
     );
-    // ... and byte-exact across backends over the glyph-free background.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path glow_halo CPU vs GPU max per-channel delta = {delta}");
     if exact.holds(&gpu, "damaged-path byte-exact glow_halo gate") {
@@ -255,8 +220,6 @@ fn damaged_path_glow_halo_parity_cpu_matches_gpu() {
     }
 }
 
-/// A calm light theme (white ground, near-black ink): additive light is invisible on it, which
-/// is what `HaloMode::Over` exists for.
 fn light_theme() -> Theme {
     Theme {
         fg: 0x0020_2020,
@@ -265,18 +228,11 @@ fn light_theme() -> Theme {
     }
 }
 
-/// `HaloMode::Over` parity: a mixed Add+Over field (a veil centred on an
-/// ember, exercising split order, plus multi-row and edge-clipped veils) over
-/// text is byte-exact on a dark frame and a text-on-white frame. On white the
-/// veil must visibly darken the frame, so the check is non-vacuous.
 #[test]
 fn over_veils_byte_exact_over_dark_and_light_frames() {
     over_veils_parity("over_veils_byte_exact_over_dark_and_light_frames", false);
 }
 
-/// [`over_veils_byte_exact_over_dark_and_light_frames`] through the wgpu
-/// oracle arm on macOS and Linux, so `fs_rain_glow_over` and wgpu's blend
-/// state (the live renderer on Windows and wasm) draw the veils here too.
 #[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
 #[test]
 fn over_veils_byte_exact_cpu_vs_wgpu_oracle() {
@@ -299,7 +255,6 @@ fn over_veils_parity(test: &str, oracle: bool) {
         let (cw, ch) = cpu.cell_size();
         let (grid_w, grid_h) = (cols * cw, rows * ch);
 
-        // (a) Base (no halos): the effect-only premise — CPU==GPU exactly.
         let base_input = term.cell_frame(rows, cols);
         let cpu_base = cpu.render_input(&base_input);
         let gpu_base = gpu.render_input(&mut win, &base_input, None);
@@ -309,8 +264,6 @@ fn over_veils_parity(test: &str, oracle: bool) {
             "({label}) block base must be byte-exact so the veil delta is effect-only"
         );
 
-        // (b) An Add ember with a grey veil on top (same centre/radii), a tall
-        // veil across three row bands, and a veil clipped at the bottom-right.
         let mut halos = Vec::new();
         let (ecx, ecy) = (6 * cw + cw / 2, 3 * ch + ch / 2);
         emit_halo(
@@ -375,7 +328,6 @@ fn over_veils_parity(test: &str, oracle: bool) {
             "({label}) the veils must actually paint (non-vacuous)"
         );
         if label == "light" {
-            // The law the mode exists for: smoke darkens the white ground.
             let pad = (cpu_f.width - grid_w) / 2;
             let smoke_centre = (pad + 14 * cw) + (pad + 4 * ch + ch / 3) * cpu_f.width;
             assert!(
@@ -400,14 +352,10 @@ fn over_veils_parity(test: &str, oracle: bool) {
     }
 }
 
-/// Summed-RGB luminance proxy (monotone per channel, so ordering is exact).
 fn luma(p: u32) -> i32 {
     rr(p) + gg(p) + bb(p)
 }
 
-/// Cached-path parity for `HaloMode::Over` on the light theme: moving a veil
-/// from P1 to P2 misses the dirty gate, repaints prev∪cur rows and lands
-/// byte-exact (the Over pipeline inside the scissored repaint).
 #[test]
 fn damaged_path_over_veil_parity_cpu_matches_gpu() {
     let exact = ByteExact::default();
@@ -434,13 +382,11 @@ fn damaged_path_over_veil_parity_cpu_matches_gpu() {
         mode: HaloMode::Over,
     };
 
-    // Frame A: veil at P1 (col 2, row 1) — primes both caches.
     let mut in_a = base_input.clone();
     in_a.glow_halo.push(veil_at(2, 1));
     let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
     let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
 
-    // Frame B: move the veil to P2 (col 9, row 4), a real content change.
     let mut in_b = base_input.clone();
     in_b.glow_halo.push(veil_at(9, 4));
     let misses_before = gpu.gate_misses();
@@ -457,8 +403,6 @@ fn damaged_path_over_veil_parity_cpu_matches_gpu() {
         "a moved Over veil must MISS the GPU dirty gate (real re-render)"
     );
 
-    // Ground truth: no ghost smoke at the vacated P1 rows, no missing veil at
-    // P2 (cached == fresh) ...
     let cpu_fresh = cpu.render_input(&in_b).pixels.clone();
     assert_eq!(
         cpu_b, cpu_fresh,
@@ -469,7 +413,6 @@ fn damaged_path_over_veil_parity_cpu_matches_gpu() {
         cpu.render_input(&base_input).pixels,
         "the moved veil must actually darken the white ground (non-vacuous)"
     );
-    // ... and byte-exact across backends over the glyph-free background.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path Over veil CPU vs GPU max per-channel delta = {delta}");
     if exact.holds(&gpu, "damaged-path byte-exact Over gate") {

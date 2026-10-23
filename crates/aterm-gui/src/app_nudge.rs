@@ -317,6 +317,8 @@ impl NudgeHost {
                 continue;
             }
             if driving {
+                // No step ended the hold (the loop did not tick, or the
+                // terminal lock answered nothing at every look): the deadline
                 // does, and the attempt is judged at the steps below.
                 self.let_go(w, session, now, &format!("hold past {PTY_HOLD_CAP_MS} ms"));
             }
@@ -489,6 +491,8 @@ impl NudgeHost {
                 };
             }
             Act::Forget => {
+                // Someone else's layout pass set the PTY: it is theirs, so
+                // nothing is written. The map entry goes once the kernel reads
                 // the engine's size; until then the reconcile sets it.
                 if let Some(guard) = driver.guard.take() {
                     guard.disarm();
@@ -521,6 +525,7 @@ impl NudgeHost {
             }
             Act::Healed { second_ms, .. } => driver.last_answer_ms = Some(second_ms),
             Act::Dropped(Dropped::Superseded) if reason == Reason::Debt => {
+                // The program was given a size of its own; if the resize comes
                 // back after the wait, the epoch judge owes this attempt's end.
                 w.superseded(sid, epoch);
             }
@@ -620,7 +625,7 @@ pub(crate) struct AppWorld<'a> {
 
 impl<'a> AppWorld<'a> {
     /// A world over `app` with nothing given up on yet.
-    pub(crate) fn new(app: &'a crate::App) -> Self {
+    pub(crate) const fn new(app: &'a crate::App) -> Self {
         Self {
             app,
             gave_up: Vec::new(),
@@ -645,6 +650,9 @@ impl NudgeWorld for AppWorld<'_> {
     }
 
     fn facts(&mut self, session: u64) -> Option<WorldFacts> {
+        // The release is proven by reading the kernel's size back
+        // (`TIOCGWINSZ`, [`aterm_pty::size`]); a platform whose PTY cannot be
+        // read (ConPTY answers `None` always) has no proof that a held PTY
         // was put back, so it holds nothing.
         if !cfg!(unix) {
             return None;

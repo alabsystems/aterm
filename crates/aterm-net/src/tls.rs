@@ -483,6 +483,8 @@ where
                         while written < n {
                             if g.done {
                                 // Peer-side teardown already under way: to the
+                                // end below, which the guard leaves only once
+                                // neither socket can block.
                                 break 'up;
                             }
                             match g.conn.writer().write(&buf[written..n]) {
@@ -601,6 +603,7 @@ where
 
     'down: loop {
         // The pre-loop drain already saw the peer's EOF (or failed): the
+        // teardown below is the only thing left to run.
         if fatal_down || drained_eof {
             break;
         }
@@ -657,6 +660,7 @@ where
             }
             if g.conn.wants_write() {
                 // Post-handshake housekeeping (e.g. a KeyUpdate reply) queued
+                // outgoing TLS bytes: wake the writer thread.
                 shared.cv.notify_all();
             }
         }

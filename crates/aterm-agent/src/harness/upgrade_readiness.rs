@@ -31,9 +31,6 @@ pub(super) fn says_ready(words: &str) -> bool {
             .any(|clause| !clause.contains('\0') && affirms(clause))
 }
 
-/// Ignore fenced code and Markdown quotations. Inline code cannot affirm:
-/// mark its clause, keeping its words only in the conservative veto view so
-/// `I'm `not` ready` never becomes consent. Unclosed code refuses the answer.
 fn prose(words: &str) -> Option<(String, String)> {
     let (mut fenced, mut inline) = (None, None);
     let (mut out, mut caution) = (String::new(), String::new());

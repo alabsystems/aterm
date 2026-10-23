@@ -4048,3 +4048,45 @@ fn every_mode_sentence_comes_from_mode_words() {
         "the timed sentence in the manual: {manual}"
     );
 }
+
+/// THE OCCUPANCY ROW IS DISPLAY-ONLY (occupancy 1e; the red-team's F14): the effective table
+/// shows `[harness] occupancy` as aterm.toml reads it — `observe`, the default, and `prompt`
+/// only where the owner wrote it — as a fact row no press reaches: no node on any page of the
+/// route acts on occupancy. NEGATIVE CONTROL: the route's editable autopilot has controls that
+/// act.
+#[test]
+fn the_occupancy_row_shows_the_mode_and_nothing_writes_it() {
+    let rows = config_rows(&SupervisorConfig::default());
+    let row = rows
+        .iter()
+        .find(|row| row.key == "occupancy")
+        .expect("an occupancy row");
+    assert_eq!((row.value.as_str(), row.is_default), ("observe", true));
+
+    let policy = crate::app_config::HarnessPolicy::read("[harness]\noccupancy = \"prompt\"\n");
+    let mut state = fixture();
+    state.words = policy.words();
+    state.config = config_rows(&policy.policy);
+    let (mut runtime, instance, view) = harness_route(state);
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    let shown = node(&pages, "harness/config/row/occupancy");
+    assert!(
+        shown.label.starts_with("occupancy: prompt"),
+        "{}",
+        shown.label
+    );
+    assert!(shown.action.is_none(), "a fact row: {:?}", shown.action);
+    let acting = |word: &str| {
+        pages
+            .iter()
+            .flat_map(|page| &page.semantics)
+            .filter(|node| {
+                node.action
+                    .as_ref()
+                    .is_some_and(|action| action.as_str().contains(word))
+            })
+            .count()
+    };
+    assert_eq!(acting("occupancy"), 0, "no control writes it");
+    assert!(acting("autopilot") > 0, "an editable key's control acts");
+}

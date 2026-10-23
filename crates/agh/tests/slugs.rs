@@ -58,8 +58,6 @@ fn slugs_compare_without_case_and_show_with_it() {
 
 #[test]
 fn slugs_order_as_their_keys_do() {
-    // The `/` between the halves orders as the key's own byte: `a-b/c` before `a/bc`, as
-    // `-` (0x2d) is before `/` (0x2f), and a longer owner after its prefix.
     let texts = ["a/bc", "A-B/c", "ab/c", "a/b", "Zz/a", "a/B.c", "a-b/C"];
     let mut slugs: Vec<Slug> = texts
         .iter()

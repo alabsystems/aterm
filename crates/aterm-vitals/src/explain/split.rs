@@ -90,7 +90,7 @@ pub struct SplitIn<'a> {
     pub listed: u32,
 }
 
-/// The split of `i`'s window (the module's rules).
+/// The split of `i`'s window, by coalition.
 #[must_use]
 pub fn split(i: &SplitIn) -> CoalSplit {
     let window = i.now.at_ns.saturating_sub(i.base.at_ns).max(1);
@@ -233,7 +233,8 @@ fn rounded(num: u128, den: u128) -> i64 {
 }
 
 impl CoalSplit {
-    /// Builds [`crate::Split`] by subtraction with each tab's live figure from the same sweep.
+    /// The split from the built [`crate::Split`] (by subtraction), with each tab's live figure from
+    /// the same sweep.
     #[must_use]
     pub fn by_subtraction(built: &Split, tabs: &[TabView], roots: &[TabRoot]) -> Self {
         let mc = |cores: f32| super::millicores(cores);

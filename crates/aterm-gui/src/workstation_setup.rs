@@ -150,7 +150,7 @@ impl Request {
         finish_reply(&self.reply, answer)
     }
 
-    pub(crate) fn initial(&self) -> &Plan {
+    pub(crate) const fn initial(&self) -> &Plan {
         &self.initial
     }
 
@@ -213,16 +213,16 @@ impl Clock {
         self.remaining.as_secs() + u64::from(self.remaining.subsec_nanos() != 0)
     }
 
-    pub(crate) fn interact(&mut self) {
+    pub(crate) const fn interact(&mut self) {
         self.interacted = true;
         self.active_since = None;
     }
 
-    pub(crate) fn expired(&self) -> bool {
+    pub(crate) const fn expired(&self) -> bool {
         !self.interacted && self.remaining.is_zero()
     }
 
-    pub(crate) fn interacted(&self) -> bool {
+    pub(crate) const fn interacted(&self) -> bool {
         self.interacted
     }
 }
@@ -259,7 +259,7 @@ impl PermissionGate {
             && self.policy.is_some_and(|policy| policy.allowed)
     }
 
-    fn hold(&mut self) {
+    const fn hold(&mut self) {
         self.hold = PermissionHold::Decision;
     }
 
@@ -267,7 +267,7 @@ impl PermissionGate {
         self.await_fresh_status();
     }
 
-    fn await_fresh_status(&mut self) {
+    const fn await_fresh_status(&mut self) {
         self.hold = PermissionHold::FreshStatus;
     }
 
@@ -349,7 +349,7 @@ impl Host {
     pub(crate) fn pending(&self) -> bool {
         self.request.as_ref().is_some_and(Request::pending)
     }
-    pub(crate) fn unified(&self) -> bool {
+    pub(crate) const fn unified(&self) -> bool {
         self.unified
     }
     pub(crate) fn suppresses_permissions(&self) -> bool {
@@ -378,7 +378,7 @@ enum PreviewMode {
     Refused,
 }
 
-fn preview_mode(requested: bool, headless: bool, private: bool) -> PreviewMode {
+const fn preview_mode(requested: bool, headless: bool, private: bool) -> PreviewMode {
     if !requested {
         PreviewMode::Ordinary
     } else if !headless && private {
@@ -452,12 +452,12 @@ impl Drop for Host {
 }
 
 /// First paint and Commit are independent requirements.
-fn may_start(headless: bool, painted: bool, incoming_pending: bool) -> bool {
+const fn may_start(headless: bool, painted: bool, incoming_pending: bool) -> bool {
     !headless && painted && !incoming_pending
 }
 
 /// A carried command is inert in a validated running-window handoff.
-pub(crate) fn eligible_launch_command(
+pub(crate) const fn eligible_launch_command(
     commandless: bool,
     relaunch: bool,
     admitted_handoff: bool,

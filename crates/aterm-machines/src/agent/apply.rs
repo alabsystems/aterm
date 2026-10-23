@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `agent apply` (root, through the one sudoers rule) and `agent attach` (the admin).
-//!
-//! `apply`, in order (design §3.2, §3.3, §4.4):
-//!
-//! 1. refuses unless it is root and its own path chain is root's alone;
-//! 2. reads the envelope from standard input (at most 8 MiB) and verifies it with
-//!    `ssh-keygen` against `allowed_signers`, this Mac's UUID, the clock and the floors.
-//!    Before the signature is accepted it parses nothing and acts on nothing;
-//! 3. takes `state/run.lock` (a live run answers `busy run=<id>`, recorded in
-//!    `state/last_busy` for the screen watch, `super::watch`), checks the floor again
-//!    under the lock, and RAISES the signer's floor before it acts, so a run that crashes
-//!    cannot be replayed;
-//! 4. copies each artifact the envelope names from the admin's inbox into the root cache,
-//!    checking the hash of the root-owned copy, then removes the inbox copy as the admin;
-//!    an `apply` then removes every cached artifact it does not name;
-//! 5. writes `state/runs/<id>/`, starts `agent run-job <id>` detached (`setsid`, its output
-//!    to a log) and `caffeinate -i -s -w <job>` beside it;
-//! 6. streams the run's `progress.ndjson` until `report.json` appears ([`follow`]). If the
-//!    connection drops, the job goes on; `attach` picks the stream up again.
-//!
-//! An `uninstall` envelope is the one action carried out in the foreground (the job could
-//! not report from a directory it removes).
+//! `agent apply` root execution and `agent attach` progress streaming ([`follow`]).
 
 use super::{Layout, chain, state};
 use crate::envelope::{self, Action, Opened};
@@ -37,8 +16,7 @@ use std::time::Duration;
 /// How often [`follow`] looks for new progress.
 const POLL: Duration = Duration::from_millis(250);
 
-/// macOS's `admin` group (`dscl . -read /Groups/admin PrimaryGroupID`: 80, measured in the
-/// macOS 27 VM). The enrolled admin is in it; other local accounts are not.
+/// macOS's `admin` group.
 pub const ADMIN_GID: u32 = 80;
 
 /// Print one stream line.
@@ -97,7 +75,6 @@ pub fn apply(
     match state::take_lock(sys, layout, &run, std::process::id()) {
         Ok(state::Lock::Taken) => {}
         Ok(state::Lock::Busy { run: other }) => {
-            // Signed and fresh, so a controller is there: the screen watch's heartbeat.
             state::set_last_busy(sys, layout, &run);
             return refuse_line(out, &format!("busy run={other}"));
         }
@@ -105,11 +82,8 @@ pub fn apply(
     }
     let mut starting = match StartingRun::claim(sys, layout, &run, std::process::id()) {
         Ok(owner) => owner,
-        // An unrecognizable holder is never removed as a guessed ownership claim.
         Err(why) => return refuse_line(out, &why),
     };
-    // Under the lock: the floor again (another apply may have consumed a later serial),
-    // then raise it before anything is acted on.
     let raised = state::floors_or_refuse(sys, layout).and_then(|floors| {
         let floor = state::floor_of(&floors, &opened.principal);
         if e.serial <= floor {
@@ -127,7 +101,6 @@ pub fn apply(
     }
     if e.action == Action::Uninstall {
         let code = super::install::uninstall(sys, layout, exe, &opened, &run, out);
-        // The foreground uninstall owns/removes the persistent agent tree itself.
         starting.active = false;
         return code;
     }
@@ -152,7 +125,7 @@ pub fn apply(
     follow(sys, layout, &run, out, POLL)
 }
 
-/// Steps 1–2 of `apply`: the signature, the host, the clock and the floors.
+/// Steps 1–2 of `apply`.
 fn verify(sys: &dyn System, layout: &Layout, wire: &[u8]) -> Result<Opened, String> {
     if wire.len() > envelope::MAX_WIRE {
         return Err(format!(
@@ -177,10 +150,7 @@ fn verify(sys: &dyn System, layout: &Layout, wire: &[u8]) -> Result<Opened, Stri
     .map_err(|r| r.to_string())
 }
 
-/// Step 4: every artifact the envelope names (and an upgrade's archive) into the root
-/// cache, from the admin's inbox, hash-checked on the root-owned copy; for an `apply`, the
-/// rest of the cache pruned ([`prune_cache`]). Returns the notes for the run's log (an
-/// inbox copy that could not be removed, what the pruning removed).
+/// Step 4: every artifact the envelope names ([`prune_cache`]).
 fn take_artifacts(
     sys: &dyn System,
     layout: &Layout,
@@ -215,13 +185,7 @@ fn take_artifacts(
     Ok(notes)
 }
 
-/// After an `apply` envelope's artifacts are cached, every other cached artifact leaves the
-/// cache. An apply names all that its baseline needs (a plan, `exec` or `upgrade` names
-/// only some, and prunes nothing), so one it leaves out is a superseded pin, an app image
-/// of hundreds of megabytes that would otherwise stay until uninstall; should a later
-/// baseline name it again, the controller uploads it again from that run's `hello`. Root
-/// unlinks in `cache/`, which only root writes. Returns a note for each one removed or
-/// left.
+/// After an `apply` envelope's artifacts are cached, every other cached artifact leaves the cache.
 fn prune_cache(sys: &dyn System, layout: &Layout, wanted: &[(String, String)]) -> Vec<String> {
     let cache = layout.cache();
     let names = match sys.list_dir(&cache) {
@@ -247,11 +211,7 @@ fn prune_cache(sys: &dyn System, layout: &Layout, wanted: &[(String, String)]) -
     notes
 }
 
-/// Copy each `(sha256, name)` from the admin's inbox into the root cache: first to a
-/// root-owned landing file, whose hash is checked, then renamed into `cache/`. The inbox
-/// copy is then removed, as the admin: root never unlinks by path in a directory the admin
-/// can write. One that stays (hundreds of megabytes, until uninstall) is a note, not a
-/// failure.
+/// Copy each `(sha256, name)` from the admin's inbox into the root cache.
 fn copy_artifacts(
     sys: &dyn System,
     layout: &Layout,
@@ -262,7 +222,6 @@ fn copy_artifacts(
     let mut notes = Vec::new();
     for (at, (sha, name)) in missing.iter().map(|w| (&w.0, &w.1)).enumerate() {
         // Named twice (an artifact that is also the upgrade's archive): the first one took
-        // it, and its inbox copy is gone.
         if missing[..at].iter().any(|w| w.0 == *sha) {
             continue;
         }
@@ -323,7 +282,6 @@ pub struct Signer {
 }
 
 /// Custody between taking the run lock and the child's one-way start commit.
-/// This holds no PID registry: the port retains the exact unreaped Child until commit.
 struct StartingRun<'s> {
     sys: &'s dyn System,
     layout: &'s Layout,
@@ -350,9 +308,6 @@ impl<'s> StartingRun<'s> {
         if !self.active {
             return Ok(());
         }
-        // Clear before any fallible cleanup: on an unproven reap the persistent lock
-        // stays. The port's final Drop closes/signals only its exact owned child and
-        // transfers unreaped custody to the existing reaper; no later Drop guesses a PID.
         self.active = false;
         if let Some(child) = &mut self.child {
             child.abort().map_err(|e| e.to_string())?;
@@ -364,7 +319,6 @@ impl<'s> StartingRun<'s> {
 impl Drop for StartingRun<'_> {
     fn drop(&mut self) {
         if let Err(why) = self.cancel() {
-            // Reporting cleanup must not panic while unwinding an earlier failure.
             let _ = std::io::stderr().write_all(
                 format!("uncommitted run cleanup unproven: {why}; run lock retained\n").as_bytes(),
             );
@@ -372,8 +326,7 @@ impl Drop for StartingRun<'_> {
     }
 }
 
-/// Step 5: the run directory, the detached job and its keep-awake. `notes` open the job's
-/// log (and go to standard error).
+/// Step 5: the run directory, the detached job and its keep-awake.
 #[expect(
     clippy::too_many_arguments,
     reason = "one internal run start and its custody inputs"
@@ -422,8 +375,6 @@ fn prepare_start<'s>(
     }
     let dir = layout.run_dir(run);
     let io = |e: std::io::Error| format!("{}: {e}", dir.display());
-    // The report holds root's facts and an `exec`'s output: readable by the admin (the
-    // forced command's `attach`, through the admin group) and root, not by every account.
     sys.create_dir_all(&layout.runs(), 0o755).map_err(io)?;
     sys.create_dir_all(&dir, 0o750).map_err(io)?;
     sys.chown(&dir, 0, ADMIN_GID).map_err(io)?;
@@ -448,7 +399,6 @@ fn prepare_start<'s>(
     .map_err(io)?;
     if !notes.is_empty() {
         let text: String = notes.iter().map(|n| format!("note: {n}\n")).collect();
-        // Not `eprint!`, which panics when the connection behind standard error is gone.
         let _ = std::io::stderr().write_all(text.as_bytes());
         sys.write_file(&dir.join("job.log"), text.as_bytes(), 0o600)
             .map_err(io)?;
@@ -474,8 +424,6 @@ fn prepare_start<'s>(
     };
     state::hand_lock_from(sys, layout, &starting.holder, &to)?;
     starting.holder = to;
-    // Final fallible start operation. Success transfers detached lifetime to the job;
-    // an error delivers no commit byte and retains the exact Child for cancellation.
     starting
         .child
         .as_mut()
@@ -484,8 +432,6 @@ fn prepare_start<'s>(
         .map_err(|e| format!("the run job was not committed: {e}"))?;
     starting.active = false;
     drop(starting.child.take());
-    // Keep the Mac awake while the job lives (design §4.4). A Mac that sleeps anyway
-    // only delays the run, so a failure here is not fatal.
     let _ = sys.spawn_detached(
         &Cmd::new("/usr/bin/caffeinate").args(["-i", "-s", "-w", &pid.to_string()]),
         &dir.join("caffeinate.log"),
@@ -493,7 +439,7 @@ fn prepare_start<'s>(
     Ok(())
 }
 
-/// `agent attach <run>`: the run's stream from its start.
+/// `agent attach <run>`.
 pub fn attach(sys: &dyn System, layout: &Layout, run: &str, out: &mut dyn Write) -> ExitCode {
     if !super::is_run_id(run) {
         return refuse_line(out, &format!("{run:?} is not a run id"));
@@ -504,9 +450,7 @@ pub fn attach(sys: &dyn System, layout: &Layout, run: &str, out: &mut dyn Write)
     follow(sys, layout, run, out, POLL)
 }
 
-/// Stream `state/runs/<run>/progress.ndjson` from its start, then the report, polling every
-/// `poll`. Ends with a refusal line when the job is gone and left no report. A failed
-/// write (the controller went away) ends the stream; the job goes on.
+/// Stream `state/runs/<run>/progress.ndjson` from its start, then the report, polling every `poll`.
 pub fn follow(
     sys: &dyn System,
     layout: &Layout,
@@ -552,12 +496,8 @@ pub fn follow(
                 Err(e) => refuse_line(out, &format!("run {run}: report.json does not parse: {e}")),
             };
         }
-        // The job holds the run lock from its hand-off until it has written its report.
-        // The lock's holder identity (pid and start) is what says it still runs; a bare
-        // pid could have been reused since a crash, and the stream would never end.
         if !state::running(sys, layout, run) {
             // Once more after the job is seen gone: it may have written the report between
-            // the two reads.
             if gone_once {
                 return refuse_line(
                     out,
@@ -638,7 +578,6 @@ mod tests {
             progress.push_str(&aterm_json::to_string(&l).unwrap());
             progress.push('\n');
         }
-        // A half-written last line is not sent.
         progress.push_str("{\"item\":");
         fake.file("/A/state/runs/1-5/progress.ndjson", progress.as_bytes());
         fake.file(
@@ -682,7 +621,6 @@ mod tests {
             "/A/state/runs/1-5/progress.ndjson",
             b"{\"started\":{\"run\":\"1-5\"}}\n",
         );
-        // The lock still names the run; its pid now belongs to a process started later.
         fake.file(
             "/A/state/run.lock",
             b"pid=4242 run=1-5 start=Fri_Oct_16_22:36:10_2026\n",
@@ -741,7 +679,6 @@ mod tests {
     #[test]
     fn apply_refuses_an_agent_whose_path_chain_is_not_roots() {
         let fake = Fake::root();
-        // Nothing seeded: the executable's stat fails.
         let mut out = Vec::new();
         let mut stdin: &[u8] = b"anything";
         let code = apply(
@@ -760,8 +697,7 @@ mod tests {
         assert_eq!(stdin, b"anything");
     }
 
-    /// The answers `apply` needs on a host where the envelope verifies: the chain, the
-    /// UUID (the VM's ioreg) and ssh-keygen's two answers as measured in the VM.
+    /// The answers `apply` needs on a host where the envelope verifies.
     fn verifying_host(principal: &str) -> Fake {
         let mut fake = Fake::root();
         fake.next_pid = 4242;
@@ -843,10 +779,8 @@ mod tests {
             &mut out,
         );
         assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
-        // The floor is raised to the envelope's serial.
         let floors = state::floors_or_refuse(&fake, &layout()).unwrap();
         assert_eq!(state::floor_of(&floors, "signing@ctl"), 5);
-        // The lock was handed to the job; the envelope kept root-only.
         assert_eq!(
             state::holder(&fake, &layout()),
             Some(state::Holder {
@@ -855,7 +789,6 @@ mod tests {
                 start: Some("known_child_birth".into()),
             })
         );
-        // The run directory is root's and the admin group's, not every account's.
         let calls = fake.calls();
         assert!(
             calls.contains(&format!("mkdir /A/state/runs/{run} 750"))
@@ -912,7 +845,6 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out)
         );
-        // A live run holds the lock: busy, and the floor stays where it was.
         let fake = verifying_host("signing@ctl");
         fake.file("/A/state/run.lock", b"pid=77 run=1799999999-4\n");
         fake.alive(77);
@@ -936,7 +868,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // Recorded for the screen watch, by the id the run would have had.
         assert_eq!(
             state::last_busy(&fake, &layout()).as_deref(),
             Some("1800000000-6")
@@ -975,8 +906,6 @@ mod tests {
         assert_eq!(notes, Vec::<String>::new());
         assert_eq!(fake.written(&format!("/A/cache/{sha}")).unwrap(), b"hello");
         assert!(fake.written(&format!("/A/inbox/{sha}")).is_none());
-        // Bytes swapped in the inbox after upload: refused, nothing cached, and the inbox
-        // copy is left for the admin to see.
         let fake = Fake::root();
         fake.file(&format!("{INBOX}/{sha}"), b"evil");
         let err = copy_artifacts(&fake, &layout(), &[&want], &admin()).unwrap_err();
@@ -984,7 +913,6 @@ mod tests {
         assert!(fake.written(&format!("/A/cache/{sha}")).is_none());
         assert!(fake.written(&format!("/A/inbox/{sha}")).is_none());
         assert!(!fake.calls().iter().any(|c| c.contains("/bin/rm")));
-        // Missing: the refusal says to upload it.
         let fake = Fake::root();
         let err = copy_artifacts(&fake, &layout(), &[&want], &admin()).unwrap_err();
         assert!(err.contains("upload it with `put`"), "{err}");
@@ -1016,7 +944,6 @@ mod tests {
                 .any(|c| c.starts_with(&format!("remove {INBOX}"))),
             "root unlinked in the admin's inbox: {calls:#?}"
         );
-        // A removal that fails is a note; the artifact is cached all the same.
         let fake = Fake::root();
         fake.file(&format!("{INBOX}/{HELLO}"), b"hello");
         fake.on(
@@ -1038,8 +965,6 @@ mod tests {
 
     #[test]
     fn an_artifact_named_twice_is_taken_once() {
-        // The fake leaves the file after `rm`; the live inbox would not have it the second
-        // time, and the run would be refused for an artifact it had just cached.
         let fake = Fake::root();
         fake.file(&format!("{INBOX}/{HELLO}"), b"hello");
         fake.on(
@@ -1058,7 +983,6 @@ mod tests {
 
     #[test]
     fn an_apply_prunes_the_cached_artifacts_its_baseline_no_longer_names() {
-        // The baseline's pin moved from an old image to HELLO, both cached by earlier runs.
         let old = "1".repeat(64);
         let seeded = || {
             let fake = Fake::root();
@@ -1072,7 +996,6 @@ mod tests {
             sha256: HELLO.into(),
             name: "app.Emacs".into(),
         }];
-        // A plan (or exec, or upgrade) names only part of what the host needs: it keeps all.
         for action in [Action::Plan, Action::Exec, Action::Upgrade] {
             let fake = seeded();
             e.envelope.action = action;

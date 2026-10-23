@@ -2507,8 +2507,10 @@ fn an_unconfirmed_owner_gesture_changes_nothing() {
     }
 }
 
-/// A press behind an alert the owner said yes to — queued in the same view, or in another Settings
-/// view holding the same record.
+/// A press behind an alert the owner said yes to — queued in the same view,
+/// or in another Settings view holding the same record — arrives before the
+/// park drains that request: it is the same gesture already under way, so it
+/// raises no second alert and says so.
 #[test]
 fn a_press_behind_a_confirmed_alert_asks_nothing() {
     use aterm_containment::FdaScope;
@@ -17917,7 +17919,9 @@ fn ligatures_say_when_the_drawn_font_has_none() {
     }
 }
 
-/// A `display:` font family — a theme's, or the config's older spelling.
+/// A `display:` font family — a theme's, or the config's older spelling —
+/// names display faces, drawn as a layer over the automatic font
+/// (`Config::display_faces_request`), never as the font.
 #[test]
 fn a_display_family_shows_as_the_display_layer() {
     let catalog = {
@@ -27512,6 +27516,8 @@ fn row_notes_are_native_semantic_and_fit_responsive_layouts_at_scale(scale: f32)
         each_screen(&mut runtime, instance, view, &cx, |compiled, top| {
             let context = format!("{viewport_width}×{viewport_height} screen {top} at {scale}×");
             for (key, note) in &notes {
+                // Its control's description says the note on every screen
+                // that shows the control, whether the note's lines are on it
                 // or are the stop after it.
                 if let Some(control) =
                     compiled.semantic(&UiKey::new(format!("settings/control/{key}")))
@@ -27659,6 +27665,7 @@ fn row_notes_are_native_semantic_and_fit_responsive_layouts_at_scale(scale: f32)
                     })
                     .collect::<Vec<_>>();
                 for key in visible.iter().filter(|key| {
+                    // A control a list's edge cuts may answer under a label
                     // the edge took; it is checked where it shows whole.
                     !list_cuts(compiled, &UiKey::new(format!("settings/control/{key}")))
                 }) {
@@ -37013,6 +37020,7 @@ fn every_picker_host_leaves_the_theme_picker_a_heading_over_two_rows() {
                     .semantic(&UiKey::new("settings/choice-landscape"))
                     .is_some()
                 {
+                    // The compact landscape page lays the picker beside the
                     // preview, not under it.
                     continue;
                 }
@@ -39696,6 +39704,7 @@ fn the_update_status_headline_is_measured_in_its_column() {
                 let pages = update_route_pages(update, width, height);
                 let first = &pages[0];
                 let Some((text, style, rect)) = headline_of(first) else {
+                    // The two-column summary measures its own words, and is
                     // drawn only where they are whole.
                     continue;
                 };

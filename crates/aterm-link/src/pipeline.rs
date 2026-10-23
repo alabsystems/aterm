@@ -300,7 +300,7 @@ mod tests {
     }
 
     /// **A REQUEST BEHIND AN OWED ACK FAILS LOUDLY, AND SENDS NOTHING** — the
-    /// FIRST guard (the module doc), astream's own, reached the one way nothing
+    /// FIRST guard, astream's own, reached the one way nothing
     /// in this crate can: past [`Link::ready`], straight to the client.
     #[test]
     fn a_request_behind_an_owed_ack_fails_loudly_and_sends_nothing() {

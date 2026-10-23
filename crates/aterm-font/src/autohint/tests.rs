@@ -26,9 +26,6 @@ fn outline_of(font: &HintFont, ch: char) -> Outline {
     outline
 }
 
-/// skrifa's `orientation` test, on aterm's faces: a TrueType outline winds
-/// counter-clockwise, a CFF one clockwise, which flips each axis's major
-/// direction for the segment search.
 #[test]
 fn outlines_wind_as_their_format_does() {
     let tt = HintFont::new(DEJAVU, 0).expect("DejaVu reads");
@@ -50,9 +47,6 @@ fn outlines_wind_as_their_format_does() {
     assert_eq!(outline.orientation, Some(Orientation::Clockwise));
 }
 
-/// Glyph styles follow the character map's script ranges, a glyph no range
-/// reaches falls back to the CJK style FreeType defaults to, and a glyph id
-/// past the face has none (its draw is refused).
 #[test]
 fn glyph_styles_follow_the_scripts() {
     let font = HintFont::new(DEJAVU, 0).expect("DejaVu reads");
@@ -80,7 +74,6 @@ fn glyph_styles_follow_the_scripts() {
     assert!(map.style(past).is_none(), "no style past the last glyph");
 }
 
-/// The entry points refuse what cannot be hinted, and draw nothing then.
 #[test]
 fn entry_points_refuse_what_cannot_be_hinted() {
     for px in [0.0, -1.0, f32::NAN, f32::INFINITY] {

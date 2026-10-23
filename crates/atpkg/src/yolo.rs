@@ -215,6 +215,8 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
         return Launch::AsTyped;
     }
     if let Some(i) = word {
+        // The self-update verbs skip too, on every lane: an update shape is
+        // decided by that intercept first (`claude update --help` forwards to
         // the vendor), and the default must not land on the forward.
         if policy.skip.contains(&head[i].as_str())
             || crate::selfupdate::verbs_of(program).contains(&head[i].as_str())

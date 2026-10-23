@@ -164,8 +164,6 @@ mod tests {
         assert!(Union::parse("[]").is_err());
     }
 
-    /// The rendered shape also reads back to itself, so a widening diffs only
-    /// the names it adds.
     #[test]
     fn widening_adds_only_new_names_and_renders_in_table_order() {
         let mut union = Union::parse(r#"{"linux":["b"],"mac":["a"]}"#).expect("parses");

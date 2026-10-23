@@ -7,7 +7,6 @@ use amacs_term::decide::{
     EXIT_USAGE, Face, Handoff, Inputs, NO_TERMINAL, OpenIn, after_handoff, decide,
 };
 
-/// Inside an aterm tab, at a terminal, nothing asked: the native face.
 fn in_a_tab() -> Inputs {
     Inputs {
         parent_session: true,
@@ -17,8 +16,6 @@ fn in_a_tab() -> Inputs {
     }
 }
 
-/// Every combination of the inputs, so each row is checked against all the
-/// others' values.
 fn every_input() -> Vec<Inputs> {
     let mut all = Vec::new();
     for bits in 0u32..(1 << 9) {

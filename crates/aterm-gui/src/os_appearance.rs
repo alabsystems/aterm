@@ -34,7 +34,7 @@ impl OsAppearanceSource {
     /// [`Self::for_launch`] with the seam already read: an injected reading
     /// wins, then headless is inert.
     #[must_use]
-    fn choose(headless: bool, injected: Option<Appearance>) -> Self {
+    const fn choose(headless: bool, injected: Option<Appearance>) -> Self {
         match injected {
             Some(appearance) => Self::Injected(appearance),
             None if headless => Self::Inert,
@@ -93,7 +93,7 @@ impl OsAppearanceSource {
 
     /// The `source=` word the `appearance` control verb prints.
     #[must_use]
-    pub(crate) fn wire_name(self) -> &'static str {
+    pub(crate) const fn wire_name(self) -> &'static str {
         match self {
             Self::Inert => "inert",
             Self::Injected(_) => "injected",
@@ -106,7 +106,7 @@ impl OsAppearanceSource {
 
 /// The wire word for an appearance (`dark`/`light`), as the control verbs print and parse it.
 #[must_use]
-pub(crate) fn appearance_word(appearance: Appearance) -> &'static str {
+pub(crate) const fn appearance_word(appearance: Appearance) -> &'static str {
     match appearance {
         Appearance::Dark => "dark",
         Appearance::Light => "light",
@@ -558,7 +558,7 @@ mod mac {
     }
 
     /// `AppleInterfaceStyle`'s value.
-    pub(super) fn style_appearance(style: &str) -> Appearance {
+    pub(super) const fn style_appearance(style: &str) -> Appearance {
         if style.eq_ignore_ascii_case("dark") {
             Appearance::Dark
         } else {

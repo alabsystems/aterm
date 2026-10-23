@@ -7,8 +7,7 @@
 
 use std::collections::BTreeMap;
 
-/// The recording `name`'s rows: `#` lines and blank lines dropped, each row
-/// split on tabs (empty fields kept).
+/// Parses tab-separated rows from `tests/recorded/{name}`.
 pub fn rows(name: &str) -> Vec<Vec<String>> {
     let path = format!("{}/tests/recorded/{name}", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
@@ -48,8 +47,7 @@ pub fn b(v: bool) -> u8 {
     u8::from(v)
 }
 
-/// Hold `got` (case name to rendering) to the recording: the same case
-/// names, each rendered the same.
+/// Asserts that `got` matches `recorded` for every case.
 pub fn same_cases(what: &str, recorded: &BTreeMap<String, String>, got: &BTreeMap<String, String>) {
     let missing: Vec<_> = recorded.keys().filter(|k| !got.contains_key(*k)).collect();
     let extra: Vec<_> = got.keys().filter(|k| !recorded.contains_key(*k)).collect();

@@ -29,11 +29,6 @@ struct Case {
     refusal: AdmitRefusal,
 }
 
-/// Each input outside the profile, sent to a hot attached glow, is refused as a total step:
-/// the state digest and both streams (with other effects' quads in them) are untouched, the
-/// host is shown nothing for a key, the inert frame for a tick and the frame cadence for a
-/// query; every refusal is recorded, and the replay from the attach checkpoint names the
-/// exact refusal at its cursor and lands on the live state and chain.
 #[test]
 fn every_refusal_in_attached_mode_is_a_total_step_that_replays_identically() {
     let t0 = Instant::now();
@@ -184,9 +179,6 @@ fn every_refusal_in_attached_mode_is_a_total_step_that_replays_identically() {
     assert_eq!(run.observation_chain, h.chain.chain);
 }
 
-/// A tick admitted in attached mode reserves its scratch budget on both host vectors
-/// before it runs: the vectors' capacity covers what the tick appended with no reallocation
-/// during the tick.
 #[test]
 fn an_attached_tick_reserves_its_budget_on_both_vectors_before_it_runs() {
     let t0 = Instant::now();

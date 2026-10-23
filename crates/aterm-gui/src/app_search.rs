@@ -18,7 +18,7 @@ pub(crate) enum SearchDirection {
 }
 
 impl SearchDirection {
-    fn from_forward(forward: bool) -> Self {
+    const fn from_forward(forward: bool) -> Self {
         if forward {
             Self::Forward
         } else {
@@ -231,12 +231,12 @@ pub(crate) struct CountFacts {
 
 impl CountFacts {
     /// `+` when the count is a floor.
-    pub(crate) fn plus(&self) -> &'static str {
+    pub(crate) const fn plus(&self) -> &'static str {
         if self.truncated { "+" } else { "" }
     }
 
     /// The compact marks: `+` (a floor), `…` (stale), both, or none.
-    pub(crate) fn mark(&self) -> &'static str {
+    pub(crate) const fn mark(&self) -> &'static str {
         match (self.truncated, self.stale) {
             (true, true) => "+…",
             (true, false) => "+",
@@ -405,7 +405,7 @@ impl SearchState {
     }
 
     /// The facts behind the count, in the one shape the bar, the title and the spoken status all word it from.
-    pub(crate) fn count_facts(&self) -> CountFacts {
+    pub(crate) const fn count_facts(&self) -> CountFacts {
         CountFacts {
             truncated: self.truncated,
             stale: self.results_dirty,
@@ -1154,6 +1154,11 @@ impl App {
                 || term.content_seq() != match_seq
             {
                 // A footer splice is piecewise and a reflow renumbers wholesale, so a
+                // uniform base_y delta could select unrelated text, and ordinary edits
+                // can move the columns: refuse until the output wake or the next
+                // navigation refreshes the batch. The highlight on glass is destroyed
+                // only when output could have reached it, and then (press custody) a
+                // `UserClear` is recorded.
                 if clear_selection_if_content_is_mutable(&mut term) {
                     note_selection_custody(&mut term, false);
                 }
@@ -1408,6 +1413,7 @@ impl App {
     pub(crate) fn search_repeat_in(&mut self, wid: crate::WindowId, forward: bool) {
         if let Some(s) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
             // Set direction before a possible recall/recompute so backward recall
+            // installs the last match directly, with no transient first match.
             s.direction = SearchDirection::from_forward(forward);
         }
         let query_empty = self
@@ -1558,6 +1564,7 @@ impl App {
             .is_some_and(|search| search.results_dirty)
         {
             // A second concurrent mutation won the bounded retry. Keep the bar
+            // open and fail closed; the next user action retries from fresh state.
             return;
         }
         if let Some((revision_stale, content_stale)) = self.search_stamp_mismatch(wid)
@@ -1612,6 +1619,7 @@ impl App {
             .map(|terminal| (terminal.term.clone(), terminal.session))
         {
             // Removed whether or not the restore applies: ⎋ ends this find, and a
+            // stale entry would be inherited by the next ⌘F on this terminal.
             if let Some(origin) = self.find_origins.remove(&(session, wid)) {
                 let mut terminal = term_lock(&term);
                 let coherent = origin.on_alt_screen == terminal.is_alternate_screen()

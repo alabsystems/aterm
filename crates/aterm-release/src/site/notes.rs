@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Release notes Markdown renderer for `/releases`: headings, paragraphs, lists, fenced code,
-//! block quotes and rules; inline `code`, **bold** and links; everything else escaped text.
+//! Release notes Markdown renderer for `/releases`.
 
 use super::html_escape as esc;
 use super::releases::{Release, stable, version_key};
@@ -560,7 +559,6 @@ mod tests {
         render_page("alabsystems/aterm", &sections)
     }
 
-    /// The reviewed bytes: same input, same page.
     #[test]
     fn the_changelog_page_is_the_reviewed_golden() {
         assert_eq!(changelog_page(), read("releases.golden.html"));

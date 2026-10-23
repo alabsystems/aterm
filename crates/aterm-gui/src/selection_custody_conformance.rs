@@ -63,7 +63,7 @@ pub(crate) fn project_selection_custody(term: &Terminal, base: u64) -> [i64; 5] 
 }
 
 /// One fixture's running abstract state: the observed projection plus the
-/// harness-carried variables (see the module doc).
+/// harness-carried variables.
 struct Custody {
     /// Absolute row corresponding to model row 0.
     base: u64,

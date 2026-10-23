@@ -3,15 +3,12 @@
 // Author: Andrew Yates
 
 //! Derived-content queries on [`Grid`]: text extraction and memory accounting.
-//!
-//! These iterate over grid contents; `accessors.rs` holds the O(1) forwarders.
 
 use super::Grid;
 use crate::CellCoord;
 
 impl Grid {
-    /// The resolved character at a grid position, including non-BMP codepoints
-    /// from the `CellExtras` overflow table (unlike `Cell::char()`).
+    /// The resolved character at a grid position.
     #[must_use]
     #[inline]
     pub fn resolved_char(&self, row: u16, col: u16) -> Option<char> {
@@ -24,12 +21,6 @@ impl Grid {
     }
 
     /// Estimate total memory used by the grid and attached scrollback.
-    ///
-    /// Exact whenever the true sum fits in `usize`, pinned at `usize::MAX`
-    /// otherwise: every sum and product that could exceed `usize` is
-    /// `saturating_*`, here and in each accounting function it adds up. Checked
-    /// sums carried around a walk exhaust the verifier's per-function budget;
-    /// saturating ones keep it decided (docs/AUDIT-control-2026-10-08.md F3).
     #[must_use]
     pub fn memory_used(&self) -> usize {
         let mut total = self.storage.pages.total_memory();
@@ -52,11 +43,7 @@ impl Grid {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<super::ring_extras::RingSlot>()),
         );
-        // Everything the ring rows' extras retain (links, complex text, image
-        // shares), as a running sum: a ring row is not just its cells.
         total = total.saturating_add(self.storage.ring_extras.retained_bytes());
-        // Resize undo owns copies outside the page arena and the live/ring
-        // extras maps (including images only an undo row retains).
         if let Some(undo) = &self.storage.resize_undo {
             use super::resize_undo::{ResizeUndo, UndoRow};
             total = total
@@ -75,7 +62,6 @@ impl Grid {
                 }
             }
         }
-        // Staged scroll-off lines the tiered store has not absorbed yet.
         total = total.saturating_add(self.storage.lazy_buffer.memory_used());
         if let Some(scrollback) = &self.storage.scrollback {
             total = total.saturating_add(scrollback.total_memory_used());
@@ -83,23 +69,17 @@ impl Grid {
         total
     }
 
-    /// The text of a visible row, resolving complex characters. Allocates; hot
-    /// paths use [`row_text_into`](Self::row_text_into) with a reused buffer.
+    /// The text of a visible row ([`row_text_into`](Self::row_text_into)).
     #[must_use]
     pub fn row_text(&self, row: u16) -> Option<String> {
         let mut s = String::new();
         self.row_text_into(row, &mut s).then_some(s)
     }
 
-    /// Write visible row `row`'s resolved text into `out` (cleared first),
-    /// exactly as [`row_text`](Self::row_text) would return it. Returns `false`
-    /// and leaves `out` empty for an out-of-range row.
+    /// Write visible row `row`'s resolved text into `out` ([`row_text`](Self::row_text)).
     #[must_use]
     pub fn row_text_into(&self, row: u16, out: &mut String) -> bool {
         out.clear();
-        // In-range rows resolve through the display-offset-aware view, so a
-        // scrolled-back row reads its extras from the history line; such a
-        // row may have no live grid row at all.
         if row >= self.rows() {
             return false;
         }
@@ -110,8 +90,6 @@ impl Grid {
             let Some(cell) = view.cell(col) else {
                 continue;
             };
-            // Context-aware: Cell::is_wide_continuation() false-positives on
-            // DECSCA-protected cells (shared bit 10).
             if view.is_wide_continuation(col) {
                 continue;
             }
@@ -120,23 +98,14 @@ impl Grid {
         true
     }
 
-    /// Fill `out` with visible row `row` as one `char` per column and return
-    /// the row's fill (one past the last non-blank column; `0` for an empty or
-    /// out-of-range row).
-    ///
-    /// Each column yields its lead char (a complex cell's base codepoint),
-    /// `'\0'` at wide continuations, and `' '` for blanks; combining marks are
-    /// dropped. Used for per-frame row diffing, where column indexing must
-    /// survive wide chars. Reuses the caller's buffer.
+    /// Fill `out` with visible row `row` as one `char` per column and return the row's fill.
     #[inline]
     pub fn row_cols_into(&self, row: u16, out: &mut Vec<char>) -> u16 {
         self.row_cols_prefix_into(row, usize::MAX, out)
     }
 
-    /// Fill `out` with at most the first `prefix_len` columns of visible row
-    /// `row` (same projection as [`row_cols_into`](Self::row_cols_into)) and
-    /// return the fill within that prefix. The sparse row's blank tail is not
-    /// synthesized; resize the buffer to `prefix_len` for a fixed width.
+    /// Fill `out` with at most the first `prefix_len` columns of visible row `row`
+    /// ([`row_cols_into`](Self::row_cols_into)).
     pub fn row_cols_prefix_into(&self, row: u16, prefix_len: usize, out: &mut Vec<char>) -> u16 {
         out.clear();
         if row >= self.rows() {
@@ -151,21 +120,13 @@ impl Grid {
             let ch = view.col_char(col);
             out.push(ch);
             if ch != ' ' {
-                // A wide continuation ('\0') counts as filled: its lead glyph
-                // is real content occupying this column.
                 fill = col + 1;
             }
         }
         fill
     }
 
-    /// A live screen row (as if `display_offset == 0`) as text with ANSI SGR
-    /// escapes: the coloured twin of [`row_text_screen`](Self::row_text_screen).
-    /// `serialize()` uses it because it captures terminal state regardless of
-    /// the user's scroll position.
-    ///
-    /// Emits `\x1b[...m` when SGR state changes and a trailing `\x1b[0m` if any
-    /// SGR was active. Returns `None` for an invalid row.
+    /// A live screen row ([`row_text_screen`](Self::row_text_screen)).
     #[must_use]
     #[allow(clippy::too_many_lines, reason = "flat SGR tracking per cell")]
     pub fn row_ansi_text_screen(&self, row: u16) -> Option<String> {
@@ -197,7 +158,6 @@ impl Grid {
                 None => continue,
             };
 
-            // Context-aware check — see row_text above (shared bit 10).
             if r.is_cell_wide_continuation(col) {
                 continue;
             }
@@ -260,8 +220,6 @@ impl Grid {
                 || want_bg_rgb != cur_bg_rgb;
 
             if changed {
-                // Reset, then the new state; a cell with no attributes emits
-                // only the reset, and only if attributes were active.
                 let has_attrs = want_bold
                     || want_dim
                     || want_italic
@@ -415,10 +373,6 @@ mod tests {
         }
     }
 
-    /// `resolved_char`, `row_text` and `visible_content` read each row as
-    /// drawn: blanks before a write as spaces, an untouched row as "", a wide
-    /// glyph once (its continuation skipped), the latest overwrite, and
-    /// `None` past the grid.
     #[test]
     fn text_reads_follow_the_cells() {
         let mut grid = Grid::new(4, 5);
@@ -458,7 +412,6 @@ mod tests {
         grid.move_cursor_to(1, 0);
         write_text(&mut grid, "World!");
 
-        // Parity with the owning wrapper for every visible row.
         let mut buf = String::new();
         for row in 0..grid.rows() {
             let owned = grid.row_text(row);
@@ -467,8 +420,6 @@ mod tests {
             assert_eq!(Some(buf.as_str()), owned.as_deref(), "row {row} parity");
         }
 
-        // Reuse: refilling a buffer that already holds a longer string clears it
-        // first (no stale tail) and keeps the capacity it already grew to.
         assert!(grid.row_text_into(0, &mut buf));
         assert_eq!(buf, "Hello");
         let cap_after_long = buf.capacity();
@@ -479,13 +430,10 @@ mod tests {
             "capacity is retained across refills, not reallocated",
         );
 
-        // Out-of-range leaves the buffer cleared and reports false.
         buf.push_str("stale");
         assert!(!grid.row_text_into(grid.rows(), &mut buf));
         assert_eq!(buf, "", "out-of-range row clears the buffer");
     }
-
-    // row_cols_into: per-column chars and fill
 
     #[test]
     fn test_row_cols_into_column_indexed_wide_and_fill() {
@@ -500,28 +448,22 @@ mod tests {
         grid.write_char('B'); // col 3
         let mut cols = Vec::new();
         let fill = grid.row_cols_into(0, &mut cols);
-        // One char per column: lead char at its own column, '\0' at the wide
-        // continuation, ' ' for blanks, so column math survives CJK.
         assert_eq!(cols.len() as u16, grid.row(0).unwrap().len());
         assert_eq!(&cols[..4], &['A', '\u{4E2D}', '\0', 'B']);
         assert!(cols[4..].iter().all(|&c| c == ' '));
         assert_eq!(fill, 4, "fill = one past the last non-blank column");
 
-        // Empty and out-of-range rows: cleared buffer, fill 0.
         assert_eq!(grid.row_cols_into(2, &mut cols), 0);
         assert!(cols.iter().all(|&c| c == ' '));
         cols.push('x');
         assert_eq!(grid.row_cols_into(9, &mut cols), 0);
         assert!(cols.is_empty(), "out-of-range clears the buffer");
 
-        // Capacity is reused across refills (the zero-alloc probe contract).
         assert_eq!(grid.row_cols_into(0, &mut cols), 4);
         let cap = cols.capacity();
         assert_eq!(grid.row_cols_into(0, &mut cols), 4);
         assert_eq!(cols.capacity(), cap, "refill reuses the buffer");
 
-        // The bounded sibling is byte-for-byte the corresponding prefix,
-        // including a continuation at the cutoff, and clears on a zero limit.
         assert_eq!(grid.row_cols_prefix_into(0, 3, &mut cols), 3);
         assert_eq!(cols, ['A', '\u{4E2D}', '\0']);
         assert_eq!(grid.row_cols_prefix_into(0, 2, &mut cols), 2);
@@ -529,8 +471,6 @@ mod tests {
         assert_eq!(grid.row_cols_prefix_into(0, 0, &mut cols), 0);
         assert!(cols.is_empty());
     }
-
-    // row_text: complex characters with combining marks
 
     #[test]
     fn test_row_text_complex_with_combining() {
@@ -556,8 +496,6 @@ mod tests {
     fn test_row_text_complex_emoji_via_extras() {
         let mut grid = Grid::new(4, 20);
 
-        // A placeholder extends the row's len to cover col 0;
-        // set_cell_complex_char alone does not.
         grid.write_char('X');
         grid.move_cursor_to(0, 1); // cursor past the cell we'll convert
 
@@ -579,7 +517,6 @@ mod tests {
 
         use crate::{ImageData, ImageFormat, ImageRef};
 
-        // Exercise both a top demotion and a bottom push through real resize.
         for (cursor_row, retained_row) in [(3, 0), (0, 3)] {
             let mut grid = Grid::with_scrollback(4, 20, 0);
             for row in 0..4 {

@@ -77,7 +77,7 @@ pub struct SpeciesId(pub u16);
 pub struct LangSet(u64);
 
 impl LangSet {
-    /// Number of distinct bits (= max interned languages, incl.
+    /// Number of distinct bits (= max interned languages, incl. `"unknown"`).
     pub const CAPACITY: usize = 64;
     /// The empty set.
     pub const EMPTY: LangSet = LangSet(0);
@@ -100,6 +100,8 @@ impl LangSet {
     #[inline]
     #[must_use]
     pub const fn with(self, id: LangId) -> LangSet {
+        // The `& 63` is a no-op for every id this crate hands out (ids are
+        // bounded by CAPACITY at intern time); it makes the shift's
         // no-overflow obligation checkable in const contexts.
         LangSet(self.0 | (1u64 << ((id.0 as u32) & 63)))
     }
@@ -976,6 +978,7 @@ impl Lexicon {
             if fold::is_no_space_script(c) {
                 let mut k = i;
                 while k < n && fold::is_no_space_script(chars[k]) {
+                    // `k < n` makes the plain `+ 1` overflow-free; the saturating
                     // form is identical and lets the verifier discharge it.
                     k = k.saturating_add(1);
                 }
@@ -1157,6 +1160,7 @@ fn intern_lang(table: &mut Vec<String>, code: &str) -> LangId {
         return UNKNOWN_LANG;
     }
     if let Some(i) = table.iter().position(|l| l == code) {
+        // Table length is bounded below UNKNOWN_LANG (< 2^16), so the cast is
         // lossless.
         return LangId(i as u16);
     }
@@ -1273,6 +1277,7 @@ fn insert_class(
             }
         }
         Some(prev) => {
+            // The loser is dropped whole except its marks testimony (as above), so the merge does
             // not depend on claimant order.
             prev.marks_required &= new.marks_required;
         }

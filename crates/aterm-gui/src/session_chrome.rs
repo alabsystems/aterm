@@ -129,7 +129,7 @@ pub(crate) struct UpgradeMenu {
 
 /// An upgrade word's menu item (title case, the menu's own voice — a menu item has no capsule's 16-character bound, so "Skip This Version" whole).
 #[must_use]
-pub(crate) fn upgrade_menu_label(word: aterm_messages::UpgradeWord) -> &'static str {
+pub(crate) const fn upgrade_menu_label(word: aterm_messages::UpgradeWord) -> &'static str {
     match word {
         aterm_messages::UpgradeWord::Now => "Upgrade Now",
         aterm_messages::UpgradeWord::NotToday => "Not Today",

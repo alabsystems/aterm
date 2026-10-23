@@ -216,6 +216,7 @@ fn split_entry(entry: &str) -> Result<(&str, &str), String> {
         return Err(refuse(entry, "control byte in value"));
     }
     if value.trim() != value {
+        // The sidecar and the shim are read back line by line, trimmed: a value with
         // whitespace at either edge would not survive the round trip as declared.
         return Err(refuse(entry, "value starts or ends with whitespace"));
     }
@@ -228,7 +229,8 @@ fn split_entry(entry: &str) -> Result<(&str, &str), String> {
     Ok((name, value))
 }
 
-/// `shim_env entry "<entry>".
+/// `shim_env entry "<entry>": <why>`, the entry in its `Debug` form so a refusal line never
+/// carries control bytes raw.
 fn refuse(entry: &str, why: &str) -> String {
     let mut m = String::from("shim_env entry ");
     m.push_str(&format!("{entry:?}"));

@@ -4,8 +4,6 @@
 
 //! `git()` over agh-fake: commits, history, comparisons, refs and trees.
 
-// Every test routes through the canonical config's dev profile, a private token file (plan §1,
-// rule 12).
 #![cfg(unix)]
 
 use agh::github::CompareResult;
@@ -15,9 +13,7 @@ use agh_fake::{CommitSpec, CompareSpec, FakeGithub, FakeOrigin, Fault, Match, Re
 
 use crate::common;
 
-/// The repository with a history.
 const APP: &str = "fixture-dev/app";
-/// A repository with files and refs but no history.
 const TREE: &str = "fixture-dev/tree";
 
 struct World {
@@ -42,7 +38,6 @@ impl World {
         }
     }
 
-    /// Five commits on APP, `c1` oldest; `dev` at `c3`, the tag `v1` at `c2`.
     fn history(&self) {
         let commits = [
             ("c1", "2026-01-01T00:00:00Z", "fixture-dev-bot", "README.md"),
@@ -88,7 +83,6 @@ impl World {
         self.fake.set_tag(APP, "v1", "c2");
     }
 
-    /// The api requests seen, as `METHOD path`.
     fn api_requests(&self) -> Vec<String> {
         self.fake
             .seen()
@@ -327,7 +321,6 @@ fn a_compare_side_with_a_dot_segment_is_usage_before_any_request() {
 
 #[test]
 fn a_commit_whose_author_is_an_empty_object_still_reads() {
-    // GitHub types a commit's `author` and `committer` as `simple-user` or `{}`.
     let w = World::new("git-empty-author");
     let commit = r#"{"sha":"e1","commit":{"message":"e1 subject","author":{"name":"Someone","date":"2026-06-01T00:00:00Z"}},"author":{},"committer":{},"html_url":""}"#;
     let answer = |body: String| Fault::Status {

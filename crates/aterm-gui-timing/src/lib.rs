@@ -99,7 +99,8 @@ impl Timing {
         self.scale_millis(bounded)
     }
 
-    /// Encode `` into a 20-byte little-endian wire snapshot.
+    /// Encode `(self, production_ms, floor_ms)` into a 20-byte little-endian
+    /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
     #[must_use]
     #[inline]
     pub const fn encode_cadence_wire_le(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
@@ -132,7 +133,8 @@ impl Timing {
         Some((timing, production_ms, floor_ms))
     }
 
-    /// Encode `` into a 20-byte big-endian wire snapshot.
+    /// Encode `(self, production_ms, floor_ms)` into a 20-byte big-endian
+    /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
     #[must_use]
     #[inline]
     pub const fn encode_cadence_wire_be(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {

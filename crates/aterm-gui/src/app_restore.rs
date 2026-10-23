@@ -202,14 +202,14 @@ pub(crate) struct NormalFrame {
 
 impl NormalFrame {
     /// Records `origin` when the window is in its normal frame (`!held`).
-    pub(crate) fn note_origin(&mut self, held: bool, origin: (i32, i32)) {
+    pub(crate) const fn note_origin(&mut self, held: bool, origin: (i32, i32)) {
         if !held {
             self.origin = Some(origin);
         }
     }
 
     /// Records `(rows, cols)` when the window is in its normal frame (`!held`).
-    pub(crate) fn note_grid(&mut self, held: bool, (rows, cols): (u16, u16)) {
+    pub(crate) const fn note_grid(&mut self, held: bool, (rows, cols): (u16, u16)) {
         if !held {
             self.rows = rows;
             self.cols = cols;
@@ -291,7 +291,7 @@ pub(crate) fn take_session0_shell(
 }
 
 /// Returns whether the current layout has settled and may be written to the crash journal.
-pub(crate) fn crash_journal_writable(
+pub(crate) const fn crash_journal_writable(
     first_present_done: bool,
     restore_pending: bool,
     handoff_pending: bool,
@@ -1092,6 +1092,7 @@ impl App {
                 Ok(guard) => guard,
                 Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => {
+                    // Presentation metadata only: a reflow/compression lock must not freeze
                     // quit or update, so omit cwd/title and keep the layout and session id.
                     return (None, String::new());
                 }
@@ -1874,6 +1875,7 @@ impl App {
             }
         }
         if minted_any {
+            // The tables changed on the main thread: run the `Wake::ConnectionsChanged` body
             // directly (marks, map, ❯ count).
             self.refresh_connection_surfaces();
         }
@@ -1900,6 +1902,10 @@ impl App {
         placed: &mut RestoredWindows,
         sliced: Option<&mut Option<FillingWindow>>,
     ) -> std::ops::ControlFlow<()> {
+        // The first persisted window maps onto the bootstrap window: session 0 already runs in
+        // the persisted first-leaf cwd (seeded in `main`), so its layout is rebuilt in place
+        // around it. Its geometry is not applied here: the grid seeded the window's creation
+        // (`run`) and position/maximize were applied post-attach in `resumed`, both before this
         // deferred pass, so the bootstrap frame never visibly hops.
         if first {
             self.restore_bootstrap_window(wl, placed, sliced);
@@ -2685,6 +2691,9 @@ impl App {
                 }
             },
             restore::RestoredView::Placeholder(placeholder) => {
+                // A pane the outgoing process kept open after its command exited, whose final
+                // screen crossed: shown read-only where its placeholder stands. A held pane open
+                // in two windows is named at both leaves: the first shows its screen, each later
                 // one that same session again, as a co-viewed live shell's leaves do.
                 if let Some((leaf, local_id)) = placeholder
                     .unhanded
@@ -2824,6 +2833,20 @@ impl App {
         reusable_terminal: &mut Option<(crate::tab_model::ViewId, u64)>,
         ids: LeafIds,
     ) -> Result<crate::tab_model::ViewId, String> {
+        // THE GRAFT CARRIES THE LEAF'S USER IDENTITY, not just its position. The
+        // reusable terminal is the window's already-running BOOTSTRAP session —
+        // on a seamless update, the adopted shell itself (session 0 is adopted
+        // in `main_entry`, every further window's in `create_window_internal_connected`, each
+        // picked by `WindowLayout::bootstrap_local_id`, i.e. by this leaf); on a
+        // cold restore, the shell those same two spawned for the window. Either
+        // way it started with a fresh ctx, so whatever the operator stamped with
+        // `meta set` in the previous process exists only in this leaf. Returning
+        // the view without it is how the 0.82.0 -> 0.83.0 handoff (measured
+        // 2026-09-12) came back with `user_title=- description=- icon=- role=-
+        // attention=-` on BOTH of its sessions: two windows, one terminal each,
+        // so every session was a graft, and only a leaf that spawned or
+        // re-adopted a session below was ever re-seeded. Which shell the leaf's
+        // identity lands on is `carry_restored_identity`'s business, and what it
         // may overwrite there is `graft_restored_user_meta`'s.
         if let Some((view, session)) = reusable_terminal.take() {
             self.carry_restored_identity(terminal, FillingShell::Registered(session), ids);
@@ -3158,6 +3181,7 @@ impl App {
                     self.mark_status_dirty();
                     "; that pane's identity went to the shell it names, which runs in another pane"
                 } else {
+                    // Nothing moved: the leaf carries no identity, the shell
                     // already wears it, or a driver wrote every field it differs in.
                     ""
                 }
@@ -3199,6 +3223,7 @@ impl App {
                 .slog_mut()
                 .seed_lineage(leaf.lineage.as_deref());
         } else if shell.handoff_local_id.is_none() {
+            // A bootstrap already served under its sid may have readers: an owed
             // log wake rang its watchers under the timeline lock.
             let _ = note_restored(shell, leaf.sid.as_deref(), leaf.lineage.as_deref());
         } else if let Some(other) = leaf
@@ -3285,6 +3310,8 @@ impl App {
             return Err("The saved view state did not match the reopened app".to_string());
         }
         if self.reopen_carried_settings_drafts(view, descriptor) {
+            // The staging presentation was taken before the drafts landed: the
+            // tab must show them unsaved (dirty, not closable) from its first
             // frame, as the outgoing tab did.
             if let Some(live) = self.live_view_presentation(view) {
                 presentation = live;
@@ -3965,6 +3992,7 @@ impl App {
                 adopt,
             ) {
                 Ok(s) => {
+                    // A new shell for a restored leaf: the session log opens
                     // it `restore` (a legacy layout names no session it was).
                     if cold {
                         note_restored(&s, None, None);
@@ -4059,7 +4087,7 @@ fn prune_lost_settings_drafts(folder: &std::path::Path) {
     }
 }
 
-fn restored_row_seen_through(how: &aterm_messages::Retired) -> bool {
+const fn restored_row_seen_through(how: &aterm_messages::Retired) -> bool {
     matches!(
         how,
         aterm_messages::Retired::Dismissed

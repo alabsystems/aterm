@@ -435,7 +435,8 @@ impl PatchEntry {
     }
 }
 
-/// Read `[patch.crates-io]` from `<root>/Cargo.toml` and measure each entry against the vendored.
+/// Read `[patch.crates-io]` from `<root>/Cargo.toml` and measure each entry
+/// against the vendored manifest and `Cargo.lock`.
 pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)

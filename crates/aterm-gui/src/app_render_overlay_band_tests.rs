@@ -3,9 +3,6 @@
 
 use crate::{App, WindowId};
 
-/// An overlay band narrows each pane's selection independently, so the
-/// fail-safe drop (a band strictly inside one pane's box) costs only that
-/// pane's highlight.
 #[test]
 fn overlay_band_narrows_each_pane_selection_independently() {
     use aterm_core::render::{PaneSelection, SelectionClip};
@@ -29,8 +26,6 @@ fn overlay_band_narrows_each_pane_selection_independently() {
     input.rows = 8;
     input.cols = 8;
     input.cells = vec![Vec::new(); 8];
-    // Left pane's selection is rows 0..2, clear of the band; the right pane's
-    // spans the pane, so the band lands strictly inside it.
     input.selections = vec![
         pane_selection((0, 0), (1, 3), SelectionClip::new(0, 8, 0, 4)),
         pane_selection((0, 4), (7, 7), SelectionClip::new(0, 8, 4, 8)),
@@ -57,9 +52,6 @@ fn overlay_band_narrows_each_pane_selection_independently() {
         "the crossed pane fails safe below the band"
     );
 
-    // The scalar `selection`/`selection_clip` goes with the list it
-    // duplicates: `selection_row_key` and the per-cell predicate fall back to
-    // the scalar when `selections` is empty.
     let mut composed = aterm_render::RenderInput::empty();
     composed.rows = 8;
     composed.cols = 8;
@@ -73,8 +65,6 @@ fn overlay_band_narrows_each_pane_selection_independently() {
         "precondition: the pane paints before the scrub"
     );
 
-    // A band strictly interior to the only pane's box: not expressible as one
-    // rectangle, so the entry fails safe and drops, emptying the list.
     super::scrub_overlay_row_band(&mut composed, 3..5, aterm_render::RowBands::new(0, 16));
 
     assert!(
@@ -95,7 +85,6 @@ fn overlay_band_narrows_each_pane_selection_independently() {
         }
     }
 
-    // An edge band is narrowable, so nothing is dropped at all.
     let mut edge = aterm_render::RenderInput::empty();
     edge.rows = 8;
     edge.cols = 8;
@@ -116,9 +105,6 @@ fn overlay_band_narrows_each_pane_selection_independently() {
     assert!(edge.selection_contains_cell(3, 5, false, false));
 }
 
-/// Floating chrome cards (badge, notice, progress) follow the live OSC-11
-/// background only while chrome is the terminal; when `window_theme` forces
-/// chrome against the terminal palette they take the page's palette.
 #[test]
 fn a_floating_chrome_card_takes_the_page_palette_over_the_terminal_background() {
     let mut app = App::headless_for_test();
@@ -147,14 +133,6 @@ fn a_floating_chrome_card_takes_the_page_palette_over_the_terminal_background() 
     );
 }
 
-/// THE CHROME SURFACES PICK THEIR THEME (chrome-8): with `window_theme` forced
-/// light over a dark terminal theme, the header and every card or band over the
-/// grid (find panel, banners, tab menu, settings overlay) take the forced light
-/// palette, so they match the message band; what paints into the pane's cells
-/// (find's highlight) and the grid itself keep the terminal's. A program's OSC
-/// 11 background moves Content and, under Auto, OverGrid, never the header or
-/// the grid. NEGATIVE CONTROL: under Auto, OverGrid is exactly the overlay card
-/// theme, and a forced palette is not the terminal's.
 #[test]
 fn chrome_palette_surfaces_pick_their_theme() {
     use crate::app_render::ChromeSurface;
@@ -163,7 +141,6 @@ fn chrome_palette_surfaces_pick_their_theme() {
     app.prepare_terminal_capture_grid(wid).unwrap();
     let terminal = app.theme;
     let theme_of = |app: &App, surface| app.chrome_palette(surface).theme;
-    // Auto: every surface is the terminal's; OSC 11 moves Content and OverGrid.
     assert_eq!(
         theme_of(&app, ChromeSurface::OverGrid(wid)),
         app.overlay_card_theme(wid)
@@ -174,7 +151,6 @@ fn chrome_palette_surfaces_pick_their_theme() {
     assert_eq!(theme_of(&app, ChromeSurface::OverGrid(wid)).bg, recoloured);
     assert_eq!(theme_of(&app, ChromeSurface::Header), terminal);
     assert_eq!(theme_of(&app, ChromeSurface::Grid), terminal);
-    // Forced light over the dark terminal theme.
     app.window_theme = crate::app_config::WindowTheme::Light;
     let header = theme_of(&app, ChromeSurface::Header);
     assert_eq!(
@@ -185,7 +161,6 @@ fn chrome_palette_surfaces_pick_their_theme() {
     assert_eq!(theme_of(&app, ChromeSurface::OverGrid(wid)), header);
     assert_eq!(theme_of(&app, ChromeSurface::Content(wid)).bg, recoloured);
     assert_eq!(theme_of(&app, ChromeSurface::Grid), terminal);
-    // The band and a banner over the grid wear one ground.
     let band = crate::chrome_band::band_colors(app.chrome_palette(ChromeSurface::Header));
     let banner = crate::paste_banner::banner_rows(
         "ls",
@@ -196,8 +171,7 @@ fn chrome_palette_surfaces_pick_their_theme() {
     assert_eq!(banner[0][0].bg, band.bar_bg);
 }
 
-/// Every destination pixel a list of 1:1 free sprites paints, and the atlas
-/// texel it samples there (`flip_x` mirrors the column).
+/// Every destination pixel a list of 1:1 free sprites paints.
 fn free_texels(
     sprites: &[aterm_core::render::FreeSprite],
 ) -> std::collections::BTreeMap<(i64, i64), (i64, i64)> {
@@ -221,16 +195,9 @@ fn free_texels(
     out
 }
 
-/// THE CARD IS ON TOP (surfaces-F3): an open menu card takes its own cells
-/// back from the caret, the cell-tagged streams, the light and the sprites —
-/// and only its own: what lies beside it on the same rows keeps painting, and
-/// a sprite half under it keeps its other half, sampling the very texels it
-/// sampled there (mirrored or not).
 #[test]
 fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
     use aterm_core::render::{FreeSprite, GlowQuad, SpriteQuad, TrailCell};
-    // Cells 10x20 px, pad 5; the card covers frame rows 2..5, cols 4..10:
-    // grid-interior x 40..100, y 40..100.
     let card = crate::tab_menu::MenuRect {
         row: 2,
         col: 4,
@@ -248,7 +215,6 @@ fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
         input
     };
 
-    // The caret: hidden on the card, standing beside it on the same row.
     let mut under = fresh((3, 6));
     super::scrub_overlay_card(&mut under, card, cell, (pad, 0));
     assert!(!under.cursor_visible, "the caret under the card is hidden");
@@ -272,9 +238,6 @@ fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
             alpha: 9,
         },
     ];
-    // Window-absolute light: `pad` lies to the grid's left. The quad at
-    // window x 40 ends at grid x 39, off the card — it stays only where the
-    // pad is honoured.
     let glow = |x: u16| GlowQuad {
         row: 3,
         x,
@@ -284,9 +247,6 @@ fn a_menu_card_takes_its_cells_back_from_the_caret_and_every_overlay() {
         ..GlowQuad::default()
     };
     input.cursor_glow_add = vec![glow(55), glow(40), glow(105)];
-    // A pet 40 px wide straddling the card's right edge, a mirrored twin
-    // straddling its left edge, a sprite all on the card, one all off it,
-    // and one scaled (not 1:1) touching it.
     let pet = FreeSprite {
         x: 80,
         y: 50,
@@ -387,19 +347,9 @@ fn tinted(input: &aterm_render::RenderInput) -> std::collections::BTreeSet<(usiz
         .collect()
 }
 
-/// THE CARD IS ON TOP OF A SELECTION, A METER AND A JITTERED SPARKLE
-/// (review of surfaces-F3): the selection tint is the renderer's own mask,
-/// one clip rectangle, so a selection the card covers part of keeps the side
-/// of the card holding the most of it and tints none of the card; one the
-/// card covers whole goes, and a split's other panes keep theirs untouched,
-/// in order. A meter row (`ChromeRaster`) on the card's rows is retired, one
-/// beside it stays. A sparkle word goes where its jittered cell meets the
-/// card, wherever its tag is. NEGATIVE CONTROLS: a selection clear of the
-/// card keeps its clip (`None`); a sparkle jittered away from the card stays.
 #[test]
 fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() {
     use aterm_core::render::{ChromeRaster, PaneSelection, SelectionClip, WordDecoration};
-    // Cells 10x20 px; the card covers frame rows 2..5, cols 4..10.
     let card = crate::tab_menu::MenuRect {
         row: 2,
         col: 4,
@@ -415,8 +365,6 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
         input
     };
 
-    // One terminal: rows 1..=3 selected across the frame. The card covers
-    // 12 of its 48 cells; right of it keeps 18, more than above it (16).
     let mut input = fresh(16);
     input.selection = simple_selection((1, 0), (3, 15));
     let before = tinted(&input);
@@ -427,16 +375,12 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
     assert!(after.iter().all(|cell| !on_card(cell)), "{after:?}");
     assert_eq!(after.len(), 18, "the side holding the most of it");
     assert!(after.is_subset(&before));
-    // CONTROL: a selection clear of the card keeps its clip.
     let mut clear = fresh(16);
     clear.selection = simple_selection((6, 0), (7, 15));
     super::scrub_overlay_card(&mut clear, card, (10, 20), (5, 0));
     assert_eq!(clear.selection_clip, None, "a selection clear of the card");
     assert_eq!(tinted(&clear).len(), 32);
 
-    // A split of three panes, 8 columns each. The left pane's whole-pane
-    // selection keeps the side left of the card; the middle one's, all under
-    // the card, goes; the right one's, clear of it, stays as it was.
     let pane = |from, to, clip| PaneSelection {
         selection: simple_selection(from, to),
         clip,
@@ -457,14 +401,12 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
         "the left pane keeps the side left of the card, the middle one goes, in order"
     );
     assert!(tinted(&input).iter().all(|cell| !on_card(cell)));
-    // The list emptied: the scalar, the focused pane's duplicate, goes too.
     let mut input = fresh(24);
     input.selections = vec![middle.clone()];
     input.selection = middle.selection.clone();
     super::scrub_overlay_card(&mut input, card, (10, 20), (5, 0));
     assert!(!input.any_selection(), "nothing the card covers is tinted");
 
-    // A meter row on the card's rows is retired; one beside them stays.
     let meter = |row| ChromeRaster {
         row,
         ground: std::sync::Arc::from(vec![0x0011_2233; 240]),
@@ -478,9 +420,6 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
     };
     let mut input = fresh(24);
     input.chrome_rasters = vec![meter(3), meter(6)];
-    // Sparkle words, a cell each (10x20 px) moved by their jitter: tagged
-    // above the card but jittered into it; tagged left of it, jittered into
-    // it; on it; and jittered away from it (stays).
     let deco = |row, col, dx, dy| WordDecoration {
         row,
         col,
@@ -519,20 +458,9 @@ fn a_menu_card_untints_a_selection_and_retires_a_meter_and_a_sparkle_under_it() 
     );
 }
 
-/// A MENU CARD CUTS A CHROME ROW'S ICONS AT ITS EDGE: a raster on the card's
-/// rows loses what spans the row (ground, rail, rings, split, lift) and the
-/// icons the card covers or one would spill into, and keeps the drawn icons
-/// beside the card (on main the whole raster went, and a switch's `●` beside
-/// the menu fell back to the font's glyph). A glass mark beside a blank card
-/// cell stays: it never spills (`aterm_render::chrome_icon_spills`), so it
-/// keeps its one size there. NEGATIVE CONTROLS: an icon on a card cell goes;
-/// a band's badge whose blank neighbour is a blank card cell goes (it would
-/// spill into the card); a row-wide raster with no icon goes whole; a raster
-/// off the card's rows is untouched.
 #[test]
 fn a_menu_card_cuts_a_chrome_rows_icons_at_its_edge() {
     use aterm_core::render::{BandIcon, ChromeIcon, ChromeRaster, ChromeRing, InkSplit};
-    // Cells 10x20 px; the card covers frame rows 2..5, cols 4..10.
     let card = crate::tab_menu::MenuRect {
         row: 2,
         col: 4,
@@ -572,18 +500,11 @@ fn a_menu_card_cuts_a_chrome_rows_icons_at_its_edge() {
     let mut input = aterm_render::RenderInput::empty();
     input.rows = 8;
     input.cols = 16;
-    // Every row blank (the card's middle cells blank too), the card's
-    // border cells drawn.
     let blank = aterm_core::terminal::RenderCell::default();
     input.cells = vec![vec![blank; 16]; 8];
     for row in &mut input.cells[2..5] {
         row[4].ch = '\u{2502}';
     }
-    // Row 3: on the card (5); a badge right of it with the card's blank last
-    // cell beside it (10, spills into the card); left of it with the card's
-    // border beside it (3, keeps to its cell); clear of it (14). Row 2: a mark
-    // right of it with the card's blank last cell beside it (10, keeps to its
-    // cell).
     input.chrome_rasters = vec![
         raster(2, vec![icon(10)]),
         raster(3, vec![icon(3), icon(5), badge(10), icon(14)]),
@@ -636,8 +557,7 @@ fn a_menu_card_cuts_a_chrome_rows_icons_at_its_edge() {
     );
 }
 
-/// Whether a card raster holds the terminal's orange ink: a pixel whose red
-/// leads its blue by more than 60 at more than a quarter coverage.
+/// Whether a card raster holds the terminal's orange ink.
 fn has_orange_ink(rgba: &[u8]) -> bool {
     rgba.as_chunks::<4>()
         .0
@@ -645,10 +565,6 @@ fn has_orange_ink(rgba: &[u8]) -> bool {
         .any(|px| px[3] > 0x40 && i32::from(px[0]) - i32::from(px[2]) > 60)
 }
 
-/// A colour picked for the terminal never inks a floating card on a native
-/// page: over Settings the build badge takes the page's palette whole (its
-/// ground and its ink), while over the terminal tab the same badge still
-/// wears the terminal's colours.
 #[test]
 fn a_floating_chrome_card_on_a_native_page_ignores_terminal_color_overrides() {
     let overridden = |app: &mut App| {
@@ -685,8 +601,6 @@ fn a_floating_chrome_card_on_a_native_page_ignores_terminal_color_overrides() {
         "the badge over Settings carries no terminal-orange ink"
     );
 
-    // Negative control: the same overrides over the terminal tab ink the
-    // badge orange, so the probe can tell the two apart.
     let mut terminal = App::headless_for_test();
     overridden(&mut terminal);
     terminal.prepare_terminal_capture_grid(wid).unwrap();

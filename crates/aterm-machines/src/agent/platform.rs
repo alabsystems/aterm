@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one host fact the agent needs before it trusts an envelope: this Mac's
-//! IOPlatformUUID, which every envelope is bound to (design §3.3).
+//! Host `IOPlatformUUID` lookup via `ioreg`.
 
 use crate::port::{Cmd, System};
 
@@ -12,8 +11,7 @@ pub fn ioreg_cmd() -> Cmd {
     Cmd::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"])
 }
 
-/// The string value of `"<key>" = "<value>"` in `ioreg` output. A `<…>` data value is not
-/// a string and is not returned.
+/// Extracts the string value of `"<key>" = "<value>"` in `ioreg` output.
 #[must_use]
 pub fn ioreg_value(text: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\" = \"");
@@ -97,7 +95,6 @@ pub(crate) mod tests {
             ioreg_value(IOREG_VM, "IOPlatformSerialNumber").as_deref(),
             Some("ZNYVNTRJN5")
         );
-        // A data value is not a string.
         assert_eq!(ioreg_value(IOREG_VM, "model"), None);
         let fake = Fake::root();
         fake.on(

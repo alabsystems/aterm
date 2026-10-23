@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Each of `aterm pkg repair`'s steps as an item, read back: the state broken on a scratch
-//! prefix and home, the probe reading the break, the engine applying the step, and a second
-//! probe reading it mended. A plan run changes nothing.
+//! Tests for `aterm pkg repair` probe and apply steps.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -14,7 +12,6 @@ use aterm_converge::{Class, ItemReport, Mode, Outcome, Probe, Remedy, Scope};
 use super::{Ground, Pass};
 use crate::store::Layout;
 
-/// A scratch prefix, home and rustup home, removed on drop.
 struct Scratch {
     layout: crate::testdir::ScratchLayout,
     home: crate::testdir::Dir,
@@ -34,7 +31,6 @@ impl Scratch {
         rustup
     }
 
-    /// The ground for `pass`, running as `exe`.
     fn ground(&self, pass: Pass, exe: Option<&Path>) -> Arc<Ground> {
         Arc::new(Ground {
             layout: Layout {
@@ -48,15 +44,12 @@ impl Scratch {
         })
     }
 
-    /// [`Self::ground`] for an account whose login shell reads `login` ([`Ground::login_rc`]).
     fn login_ground(&self, pass: Pass, login: &'static str) -> Arc<Ground> {
         let mut ground = Arc::unwrap_or_clone(self.ground(pass, None));
         ground.login_rc = Some(login);
         Arc::new(ground)
     }
 
-    /// A release-named app bundle under the scratch home, with `aterm` and `atpkg` in its
-    /// `Contents/MacOS`: the executable the command links name.
     fn release_exe(&self) -> PathBuf {
         let macos = self.home.join("Applications/aterm.app/Contents/MacOS");
         std::fs::create_dir_all(&macos).unwrap();
@@ -69,7 +62,6 @@ impl Scratch {
     }
 }
 
-/// The one item `id` of `ground`'s run.
 fn item(ground: &Arc<Ground>, id: &str) -> Box<dyn aterm_converge::Item> {
     super::items(ground)
         .into_iter()
@@ -77,12 +69,10 @@ fn item(ground: &Arc<Ground>, id: &str) -> Box<dyn aterm_converge::Item> {
         .unwrap_or_else(|| panic!("no repair item {id}"))
 }
 
-/// The item's probe now.
 fn probe(ground: &Arc<Ground>, id: &str) -> Probe {
     item(ground, id).probe()
 }
 
-/// The items `ids` of `ground`'s run through the engine in `mode`, under repair's scope.
 fn run(ground: &Arc<Ground>, ids: &[&str], mode: Mode) -> Vec<ItemReport> {
     let items: Vec<Box<dyn aterm_converge::Item>> = super::items(ground)
         .into_iter()
@@ -98,7 +88,6 @@ fn run(ground: &Arc<Ground>, ids: &[&str], mode: Mode) -> Vec<ItemReport> {
     .expect("the repair items order")
 }
 
-/// The one row of `rows` for `id`.
 fn row<'a>(rows: &'a [ItemReport], id: &str) -> &'a ItemReport {
     rows.iter()
         .find(|row| row.id == id)
@@ -113,8 +102,6 @@ fn is_ok(probe: &Probe) -> bool {
     matches!(probe, Probe::Ok { .. })
 }
 
-/// A ready build of `program` at `build`, its shims laid and its `current` links pointed
-/// at it.
 fn install(layout: &Layout, program: &str, build: u64) -> PathBuf {
     let dir = layout.build_dir(program, build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -133,8 +120,6 @@ fn install(layout: &Layout, program: &str, build: u64) -> PathBuf {
     dir
 }
 
-/// `store/trust/<build>/` with the Trust-named tools and `store/trust/current` naming it,
-/// as `seam`'s own fixture lays it.
 fn install_trust(layout: &Layout, build: u64) -> PathBuf {
     let dir = layout.build_dir("trust", build);
     std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -177,11 +162,9 @@ fn every_repair_step_is_one_item_of_its_class() {
     ] {
         assert_eq!(class(&doctor, id), want, "{id}");
     }
-    // The rc block laid again over an opt-out is `pkg repair`'s asked act alone.
     let repair = scratch.ground(Pass::Repair, None);
     assert_eq!(class(&repair, super::RC), Class::Asked);
     assert_eq!(item(&doctor, super::RC).after(), [super::HOOKS]);
-    // Only `pkg repair` re-runs a step over an `Ok` probe; doctor applies a difference.
     for id in [super::SHIMS, super::EXEC_ROOTS, super::RUSTUP_SEAM] {
         assert!(item(&doctor, id).refresh().is_none(), "{id}");
     }
@@ -222,9 +205,6 @@ fn the_hooks_are_laid_and_read_back() {
     assert!(is_ok(&probe(&ground, super::HOOKS)));
 }
 
-/// The doctor's pass from an app bundle that is not the release `aterm.app` lays no shell
-/// integration, as the update pass's hooks stand aside for it; `pkg repair` lays it from
-/// there too.
 #[test]
 fn the_doctor_lays_no_shell_integration_from_another_bundle() {
     let scratch = Scratch::new("other-bundle");
@@ -275,7 +255,6 @@ fn an_unwired_rc_is_wired_and_an_opted_out_one_is_laid_again_by_repair_alone() {
             .is_some_and(|d| d.contains("appended atpkg's block to ~/.zshrc"))
     );
 
-    // The person deletes the block: the opt-out it documents.
     std::fs::write(&zshrc, "export EDITOR=vi\n").unwrap();
     let Probe::Ok { now } = probe(&doctor, super::RC) else {
         panic!("doctor leaves an opted-out rc as the person left it");
@@ -302,9 +281,6 @@ fn an_unwired_rc_is_wired_and_an_opted_out_one_is_laid_again_by_repair_alone() {
     assert!(is_ok(&probe(&repair, super::RC)), "read back");
 }
 
-/// The one rc a pass creates: the login shell's, when absent (design init-system §4.2). A
-/// plan makes nothing; the doctor's pass makes it and no other shell's; deleting its block,
-/// or the file, is an opt-out every pass but repair keeps.
 #[test]
 fn the_login_shell_s_absent_rc_is_made_and_an_opt_out_lifts_under_repair_alone() {
     let scratch = Scratch::new("rc-login");
@@ -315,8 +291,6 @@ fn the_login_shell_s_absent_rc_is_made_and_an_opt_out_lifts_under_repair_alone()
         std::fs::symlink_metadata(&zshrc).is_err(),
         "a plan makes nothing"
     );
-    // The block names the hooks, so the rc waits on them; once laid, the absent login rc
-    // is the change.
     run(&doctor, &[super::HOOKS], Mode::Apply);
     let Probe::Change { from, .. } = probe(&doctor, super::RC) else {
         panic!("an absent login rc is a change");
@@ -343,7 +317,6 @@ fn the_login_shell_s_absent_rc_is_made_and_an_opt_out_lifts_under_repair_alone()
     }
     assert!(is_ok(&probe(&doctor, super::RC)), "read back");
 
-    // The person deletes the block: the doctor's pass keeps it deleted, repair lays it.
     std::fs::write(&zshrc, "").unwrap();
     run(&doctor, &[super::HOOKS, super::RC], Mode::Apply);
     assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), "");
@@ -355,7 +328,6 @@ fn the_login_shell_s_absent_rc_is_made_and_an_opt_out_lifts_under_repair_alone()
             .contains(crate::hooks::RC_BEGIN)
     );
 
-    // The person deletes the file: the doctor's pass leaves it gone and says so.
     std::fs::remove_file(&zshrc).unwrap();
     let Probe::Ok { now } = probe(&doctor, super::RC) else {
         panic!("doctor leaves a deleted login rc absent");
@@ -373,7 +345,6 @@ fn the_login_shell_s_absent_rc_is_made_and_an_opt_out_lifts_under_repair_alone()
 fn the_rc_block_waits_for_the_hooks() {
     let scratch = Scratch::new("rc-after");
     std::fs::write(scratch.home.join(".zshrc"), "").unwrap();
-    // A file where `~/.aterm` must be a directory: the hooks cannot be laid.
     std::fs::write(scratch.home.join(".aterm"), b"not a directory").unwrap();
     let rows = run(
         &scratch.ground(Pass::Doctor, None),
@@ -392,8 +363,6 @@ fn the_rc_block_waits_for_the_hooks() {
         "no block naming a hook that is not there"
     );
 
-    // `--only base.shell.rc` removes the ordering edge, but cannot authorize wiring
-    // an absent or unsafe hook. The rc item must enforce its own precondition.
     let scratch = Scratch::new("rc-only");
     let zshrc = scratch.home.join(".zshrc");
     let original = "export EDITOR=vi\n";
@@ -430,8 +399,6 @@ fn the_rc_block_waits_for_the_hooks() {
     assert!(item(&ground, super::RC).apply().is_err());
     assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), original);
 
-    // With the same current hooks back in their private directory, the narrowed run
-    // may wire the rc, and the ordinary probe reads it back.
     std::fs::remove_file(&shell_d).unwrap();
     std::fs::rename(&elsewhere, &shell_d).unwrap();
     let rows = narrowed();
@@ -463,7 +430,6 @@ fn a_missing_command_link_is_laid_from_the_installed_app_and_read_back() {
     );
     assert!(is_ok(&probe(&ground, super::LINKS)), "read back");
 
-    // Deleted again, it comes back; a dev build lays none.
     std::fs::remove_file(&link).unwrap();
     assert!(is_change(&probe(&ground, super::LINKS)));
     let dev = scratch.home.join("target/debug/aterm");
@@ -670,13 +636,6 @@ fn a_deleted_shim_is_restored_and_read_back() {
     assert!(is_ok(&probe(&ground, super::SHIMS)), "read back");
 }
 
-/// A shim an older atpkg laid under a name no shim may carry now (design S13: `pwsh` joined
-/// the deny-list) is the shim step's to remove, on the unattended pass (the base relay at the
-/// end of every install or update pass, a bare `aterm doctor`) as on `pkg repair`, into
-/// whichever program's store it forwards: one the step re-lays, and one it never re-lays (a
-/// program since removed, whose store is gone). The controls: a plan removes nothing, and a
-/// link under a refused name that forwards outside the store, and a person's own file, are
-/// left.
 #[test]
 fn a_shim_laid_under_a_now_refused_name_is_removed_and_read_back() {
     let scratch = Scratch::new("refused-shims");
@@ -693,7 +652,6 @@ fn a_shim_laid_under_a_now_refused_name_is_removed_and_read_back() {
     std::fs::write(&theirs, b"#!/bin/sh\n").unwrap();
     std::os::unix::fs::symlink(&theirs, bin.join("zsh")).unwrap();
     std::fs::write(bin.join("csh"), b"#!/bin/sh\necho mine\n").unwrap();
-    // Left by a program since removed: it forwards into a store build that is gone.
     std::os::unix::fs::symlink(
         scratch.layout.build_dir("gone", 5).join("bin/ksh"),
         bin.join("ksh"),
@@ -731,9 +689,6 @@ fn a_shim_laid_under_a_now_refused_name_is_removed_and_read_back() {
     assert!(is_ok(&probe(&ground, super::SHIMS)), "read back");
 }
 
-/// Trust build 8595 whose `bin/rustc` is a separate copy of `trustc` (so it needs an exec
-/// root), active, with the plain shims an older client laid (cli's
-/// `seed_affected_trust`) and no root yet. Returns the build's directory.
 fn trust_needing_a_root(layout: &Layout) -> PathBuf {
     let dir = layout.build_dir("trust", 8595);
     let bin = dir.join("bin");
@@ -819,10 +774,6 @@ fn a_withdrawn_build_is_blocked_on_an_update_and_its_tombstone_kept() {
     );
 }
 
-/// `~/.local/bin/aterm` into a release `aterm.app` that moved (`~/Downloads` to
-/// `/Applications`) dangles: the links item reads it as a change, re-points it at the
-/// installed app, and reads it back, as the pass always did. A link to someone's own build
-/// is theirs: left alone, and read `Ok`.
 #[test]
 fn a_link_into_a_moved_bundle_is_re_pointed_and_read_back() {
     let scratch = Scratch::new("moved-bundle");
@@ -852,7 +803,6 @@ fn a_link_into_a_moved_bundle_is_re_pointed_and_read_back() {
     );
     assert!(is_ok(&probe(&ground, super::LINKS)), "read back");
 
-    // Someone's own build at the name: not ours to re-point.
     std::fs::remove_file(bin.join("aterm")).unwrap();
     let mine = scratch.home.join("src/aterm/target/release/aterm");
     std::os::unix::fs::symlink(&mine, bin.join("aterm")).unwrap();
@@ -861,10 +811,6 @@ fn a_link_into_a_moved_bundle_is_re_pointed_and_read_back() {
     assert_eq!(std::fs::read_link(bin.join("aterm")).unwrap(), mine);
 }
 
-/// `~/.aterm` made group-writable with every hook current is still the hooks item's
-/// change (login shells source what it holds): the apply hardens it to `0700`, read back.
-/// A `shell.d` that is a symlink cannot be hardened: the hooks item fails, and the rc block
-/// waits for it, so no rc is wired to source a directory another account may write into.
 #[test]
 fn a_loose_shell_dir_is_hardened_and_a_symlinked_one_holds_the_rc_back() {
     use std::os::unix::fs::MetadataExt as _;
@@ -917,10 +863,6 @@ fn a_loose_shell_dir_is_hardened_and_a_symlinked_one_holds_the_rc_back() {
     );
 }
 
-/// One program whose development link cannot be read keeps its shims, and holds no other
-/// program's back: a deleted shim of another is restored, and the row fails naming the
-/// unreadable one (exit 1). With nothing else broken the doctor's pass names it
-/// (`Blocked`); `pkg repair`, which re-lays every program, still re-lays the rest.
 #[test]
 fn one_unreadable_dev_link_marker_holds_no_other_programs_commands_back() {
     let scratch = Scratch::new("bad-marker");
@@ -958,9 +900,6 @@ fn one_unreadable_dev_link_marker_holds_no_other_programs_commands_back() {
     );
 }
 
-/// An exec root whose state cannot be read (`bin/rustc` unreadable) is `Unknown` on the
-/// doctor's pass, nothing attempted; `pkg repair`, which reconciles it whatever it read,
-/// attempts it and fails on what it could not do, so its exit is 1.
 #[test]
 fn an_unreadable_exec_root_is_attempted_by_repair_and_unknown_to_the_doctor() {
     let scratch = Scratch::new("unread-root");
@@ -974,7 +913,6 @@ fn an_unreadable_exec_root_is_attempted_by_repair_and_unknown_to_the_doctor() {
     let repair_rows = run(&repair, &[super::EXEC_ROOTS], Mode::Apply);
     std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o644)).unwrap();
     if !unreadable {
-        // Root reads a mode-000 file: nothing here is unreadable.
         eprintln!("NOT RUN: a mode-000 file is readable to this uid");
         return;
     }
@@ -994,9 +932,6 @@ fn an_unreadable_exec_root_is_attempted_by_repair_and_unknown_to_the_doctor() {
     );
 }
 
-/// `pkg repair` re-lays the shims over an `Ok` probe, as it always did, and that re-lay
-/// is journaled before it runs; the doctor's pass, which applies only a difference, writes
-/// no line for the same healthy store.
 #[test]
 fn a_repair_re_lay_over_an_ok_probe_is_journaled() {
     let scratch = Scratch::new("relay-journal");
@@ -1025,9 +960,6 @@ fn a_repair_re_lay_over_an_ok_probe_is_journaled() {
     }
 }
 
-/// Outside the account's own shell (here as if under `sudo`), every repair item is read
-/// and none changes anything: a deleted shim stays deleted, its row is `Blocked` naming why,
-/// and `pkg repair` counts it undone.
 #[test]
 fn outside_the_accounts_own_shell_repair_changes_nothing() {
     let scratch = Scratch::new("not-own");
@@ -1063,8 +995,6 @@ fn outside_the_accounts_own_shell_repair_changes_nothing() {
     );
 }
 
-/// An rc that stands but that no pass edits (a dangling link) is named with why it was
-/// left alone, never read as absent.
 #[test]
 fn an_rc_no_pass_edits_is_said_left_alone() {
     let scratch = Scratch::new("rc-dangling");
@@ -1080,8 +1010,6 @@ fn an_rc_no_pass_edits_is_said_left_alone() {
     assert_ne!(now, super::RC_ALL_WIRED);
 }
 
-/// A re-lay that lays the trust build's exec root says so in the row, never on stdout,
-/// where `--json` prints one document: the line is the shims row's detail.
 #[test]
 fn a_relay_says_the_exec_root_it_laid_in_its_row() {
     let scratch = Scratch::new("relay-says");
@@ -1100,12 +1028,9 @@ fn a_relay_says_the_exec_root_it_laid_in_its_row() {
     );
 }
 
-/// The env naming the prefix [`relay_prints_nothing_probe`] re-lays.
 const RELAY_PROBE_ENV: &str = "ATPKG_RELAY_PROBE_PREFIX";
-/// That probe, as the test binary names it.
 const RELAY_PROBE: &str = "converge::repair::tests::relay_prints_nothing_probe";
 
-/// The child half of [`a_relay_writes_nothing_to_stdout`]: re-lay the prefix it is given.
 #[test]
 fn relay_prints_nothing_probe() {
     let Some(prefix) = std::env::var_os(RELAY_PROBE_ENV) else {
@@ -1117,8 +1042,6 @@ fn relay_prints_nothing_probe() {
     assert!(relaid.failed.is_empty(), "{:?}", relaid.failed);
 }
 
-/// What a re-lay says reaches no stdout: a child that re-lays a store whose trust build has
-/// no exec root lays the root (read back here) and prints nothing of it.
 #[test]
 fn a_relay_writes_nothing_to_stdout() {
     let scratch = Scratch::new("relay-quiet");
@@ -1145,8 +1068,6 @@ fn a_relay_writes_nothing_to_stdout() {
     assert!(!stdout.contains("now runs from"), "{stdout}");
 }
 
-/// Point the trust build's `tippy` shim at a file the build does not have: a broken shim
-/// whose name the store still knows.
 fn break_the_tippy_shim(layout: &Layout) {
     let shim = layout.bin_dir().join("tippy");
     std::fs::write(

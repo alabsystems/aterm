@@ -200,7 +200,7 @@ const CAPSULES_PER_ROW: u64 = 4;
 const CAPSULE_BASE: u64 = 16;
 
 /// Map an [`aterm_messages::ActionIndex`] to its band capsule slot index.
-pub(crate) fn capsule_index(action: aterm_messages::ActionIndex) -> u8 {
+pub(crate) const fn capsule_index(action: aterm_messages::ActionIndex) -> u8 {
     if action.is_details() {
         CAPSULE_DETAILS
     } else {
@@ -209,7 +209,7 @@ pub(crate) fn capsule_index(action: aterm_messages::ActionIndex) -> u8 {
 }
 
 /// The inverse of [`capsule_index`].
-pub(crate) fn capsule_action(index: u8) -> aterm_messages::ActionIndex {
+pub(crate) const fn capsule_action(index: u8) -> aterm_messages::ActionIndex {
     if index == CAPSULE_DETAILS {
         aterm_messages::ActionIndex::DETAILS
     } else {
@@ -266,7 +266,7 @@ impl ChromeMessage {
     }
 
     /// This message's node id in [`grid_tree`].
-    fn node_id(self) -> NodeId {
+    const fn node_id(self) -> NodeId {
         NodeId(MESSAGE_BASE + self.slot())
     }
 
@@ -546,7 +546,7 @@ pub(crate) fn chip_for(node: NodeId) -> Option<(u64, HarnessChip)> {
 }
 
 /// Fold a hash of the menu's rows to a menu epoch ([`GridMenu::epoch`]).
-pub(crate) fn menu_epoch_from(hash: u64) -> u32 {
+pub(crate) const fn menu_epoch_from(hash: u64) -> u32 {
     (hash & ((1 << MENU_EPOCH_BITS) - 1)) as u32
 }
 
@@ -832,7 +832,7 @@ pub(crate) struct GridFrame<'a> {
 }
 
 /// The node id for tab `index`, and its inverse.
-fn tab_node_id(index: usize) -> NodeId {
+const fn tab_node_id(index: usize) -> NodeId {
     NodeId(TAB_BASE + index as u64)
 }
 
@@ -874,7 +874,7 @@ fn word_starts_of(line: &str) -> Vec<u8> {
 }
 
 /// Node id for run `chunk` of `row` in pane `slot`.
-fn row_run_id(slot: usize, row: usize, chunk: usize) -> NodeId {
+const fn row_run_id(slot: usize, row: usize, chunk: usize) -> NodeId {
     NodeId(ROW_BASE + slot as u64 * PANE_STRIDE + row as u64 * RUNS_PER_ROW + chunk as u64)
 }
 

@@ -7,23 +7,7 @@
 // aterm project in 2026 as one synchronous dispatcher over aterm-dbus messages
 // in place of zbus's object server and `#[interface]` macros.
 
-//! Answering an assistive technology's calls: the object table and the
-//! dispatcher for every interface the publisher serves.
-//!
-//! The table holds what zbus's object server held for accesskit_unix: the
-//! application root (`Accessible`, `Application`) and the `Cache` object once
-//! the publisher is on the accessibility bus, and each node at its path with
-//! the interfaces the semantics registered for it. Of those, the
-//! seven accesskit_unix implemented are served: `Accessible`, `Action`,
-//! `Component`, `Hyperlink` (a `Role::Link` node has it), `Selection`, `Text`
-//! and `Value`. Every object also answers `org.freedesktop.DBus.Properties`
-//! and, on any path, `org.freedesktop.DBus.Peer`. `Introspectable` is not
-//! served: no AT-SPI client introspects an application.
-//!
-//! The answers are the old publisher's, method for method: the same members
-//! (the root has no `GetAttributes`, as before), the same out-signatures, and
-//! zbus's error names and texts (`Unknown method 'GetAttributes'`), so the
-//! recorded tree walks of `crates/aterm-lab/linux-baseline/` read the same.
+//! Object table and synchronous dispatcher for AT-SPI interfaces.
 
 use std::collections::HashMap;
 
@@ -69,8 +53,6 @@ fn fault(name: &'static str, text: impl Into<String>) -> Fault {
     }
 }
 
-/// accesskit_unix's mapping of a semantic error to the error an AT reads:
-/// a node gone or without the interface is an unknown object, named by path.
 fn semantic(path: &str, error: SemanticError) -> Fault {
     match error {
         SemanticError::Defunct | SemanticError::UnsupportedInterface => fault(UNKNOWN_OBJECT, path),
@@ -81,25 +63,20 @@ fn semantic(path: &str, error: SemanticError) -> Fault {
     }
 }
 
-/// What one call produced: the reply's body or its error, and the signals
-/// to send before it (a property `Set` announces the new value first, as
-/// zbus does).
+/// Reply body or error produced by one call, plus signals to send before it.
 #[derive(Debug)]
 pub(crate) struct Served {
     pub(crate) answer: Result<Vec<Value>, Fault>,
     pub(crate) signals: Vec<Message>,
 }
 
-/// A dispatch step: `Ok(None)` when the member is not one the interface has.
 type Dispatch = Result<Option<Vec<Value>>, Fault>;
 
-/// A node at its path and the interfaces registered for it.
 struct Registered {
     node: PlatformNode,
     interfaces: InterfaceSet,
 }
 
-/// The interfaces a node path can serve (accesskit_unix's seven).
 fn served() -> InterfaceSet {
     InterfaceSet::new(
         Interface::Accessible
@@ -112,9 +89,7 @@ fn served() -> InterfaceSet {
     )
 }
 
-/// Everything one connection serves. The session bus's table is empty (it
-/// answers `Peer` and unknown objects); the accessibility bus's has the root,
-/// the cache and the nodes.
+/// Everything one connection serves.
 pub(crate) struct Objects {
     bus_name: String,
     root: PlatformRoot,
@@ -122,13 +97,10 @@ pub(crate) struct Objects {
     nodes: HashMap<String, Registered>,
 }
 
-/// What a path names.
 enum Target<'a> {
     Root,
     Cache,
     Node(&'a Registered),
-    /// `/` or an ancestor of a served path: it exists, with the standard
-    /// interfaces only (zbus's object tree).
     Bare,
 }
 
@@ -181,9 +153,7 @@ impl Objects {
         }
     }
 
-    /// Drops a closed window's paths. accesskit_unix left them registered,
-    /// answering each call with its defunct node's error, for as long as the
-    /// bus lived; this forgets them, and a call there is an unknown object.
+    /// Drops a closed window's paths.
     pub(crate) fn forget_adapter(&mut self, adapter: usize) {
         self.nodes
             .retain(|_, entry| entry.node.adapter_id() != adapter);
@@ -277,9 +247,6 @@ fn dispatch(
     found.ok_or_else(|| fault(UNKNOWN_METHOD, format!("Unknown method '{member}'")))
 }
 
-// --- arguments ----------------------------------------------------------
-
-/// Holds `body` to the in-signature `sig`, zbus's check before a method runs.
 fn args(body: &[Value], sig: &str) -> Result<(), Fault> {
     let types: Vec<Type> = body.iter().map(Value::type_of).collect();
     let got = aterm_dbus::sig::signature_of(&types);
@@ -293,7 +260,6 @@ fn args(body: &[Value], sig: &str) -> Result<(), Fault> {
     }
 }
 
-// After `args` the accessors cannot miss; their defaults are never read.
 fn int(body: &[Value], at: usize) -> i32 {
     body.get(at).and_then(Value::as_i32).unwrap_or_default()
 }
@@ -350,8 +316,6 @@ fn scroll_type(value: u32) -> Result<ScrollType, Fault> {
     }
 }
 
-// --- org.freedesktop.DBus.Peer -------------------------------------------
-
 fn peer(member: &str, body: &[Value]) -> Result<Vec<Value>, Fault> {
     args(body, "")?;
     match member {
@@ -364,8 +328,6 @@ fn peer(member: &str, body: &[Value]) -> Result<Vec<Value>, Fault> {
         _ => Err(fault(UNKNOWN_METHOD, format!("Unknown method '{member}'"))),
     }
 }
-
-// --- org.freedesktop.DBus.Properties -------------------------------------
 
 fn properties(
     objects: &Objects,
@@ -398,8 +360,6 @@ fn properties(
             if !target.has(interface) {
                 return Err(unknown_interface(interface));
             }
-            // A property whose getter fails is left out, as zbus leaves out
-            // a fallible property that errs.
             let entries = property_names(interface)
                 .iter()
                 .filter_map(|name| {
@@ -440,7 +400,6 @@ fn properties(
     }
 }
 
-/// The readable properties of `interface`, in declaration order (GetAll's).
 fn property_names(interface: &str) -> &'static [&'static str] {
     match interface {
         ACCESSIBLE => &[
@@ -466,7 +425,6 @@ fn property_names(interface: &str) -> &'static [&'static str] {
     }
 }
 
-/// One property's value; `Ok(None)` when `interface` has no `name`.
 fn get(
     objects: &Objects,
     target: &Target<'_>,
@@ -518,8 +476,6 @@ fn get(
     Ok(Some(value))
 }
 
-/// The two writable properties: the application's `Id` (the registry's) and
-/// a value's `CurrentValue` (a SetValue action).
 fn set(
     objects: &Objects,
     target: &Target<'_>,
@@ -537,8 +493,6 @@ fn set(
     match (target, interface, name) {
         (Target::Root, APPLICATION, "Id") => {
             let id = value.as_i32().ok_or_else(wrong_type)?;
-            // `set_id` takes the root mutably; a root is a weak handle, so a
-            // copy writes the same application context.
             objects
                 .root
                 .clone()
@@ -559,10 +513,6 @@ fn set(
     }
 }
 
-// --- the application root -------------------------------------------------
-
-/// The root's `Accessible`: accesskit_unix's `RootAccessibleInterface`, which
-/// has no `GetAttributes`, `GetRoleName` or `GetLocalizedRoleName`.
 fn root_accessible(objects: &Objects, member: &str, body: &[Value]) -> Dispatch {
     let bus = objects.bus_name();
     let root = &objects.root;
@@ -613,7 +563,6 @@ fn root_accessible(objects: &Objects, member: &str, body: &[Value]) -> Dispatch 
     Ok(Some(out))
 }
 
-/// `org.a11y.atspi.Cache.GetItems`: the root's item, then every node's.
 fn cache(objects: &Objects, member: &str, body: &[Value]) -> Dispatch {
     if member != "GetItems" {
         return Ok(None);
@@ -644,8 +593,6 @@ fn cache(objects: &Objects, member: &str, body: &[Value]) -> Dispatch {
         .map_err(|_| fault(FAILED, "cache item of another type"))?;
     Ok(Some(vec![all]))
 }
-
-// --- a node ------------------------------------------------------------------
 
 fn node_method(
     objects: &Objects,
@@ -821,7 +768,6 @@ fn node_method(
     Ok(Some(out))
 }
 
-/// `org.a11y.atspi.Text`.
 fn text(node: &PlatformNode, path: &str, member: &str, body: &[Value]) -> Dispatch {
     let err = |e| semantic(path, e);
     let with_range = |(map, start, end): (HashMap<&'static str, String>, i32, i32)| {

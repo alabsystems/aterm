@@ -118,14 +118,14 @@ struct EndsFile {
 }
 
 impl EndsFile {
-    fn of(ends: &AbEnds) -> Self {
+    const fn of(ends: &AbEnds) -> Self {
         Self {
             landed: ends.landed,
             landing: ends.landing,
         }
     }
 
-    fn ends(&self) -> AbEnds {
+    const fn ends(&self) -> AbEnds {
         AbEnds {
             landed: self.landed,
             landing: self.landing,
@@ -216,7 +216,7 @@ pub(crate) fn dir_of(harness_state: &Path) -> PathBuf {
 }
 
 /// Whether `day` falls within the last [`DAYS`] days of `today`.
-fn kept(day: i64, today: i64) -> bool {
+const fn kept(day: i64, today: i64) -> bool {
     day >= today.saturating_sub(KEPT_BEFORE)
 }
 

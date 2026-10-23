@@ -8,19 +8,12 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use super::make_cloexec_pipe;
 
-/// What a forked outgoing process did: its exit status, whether it reached
-/// the exit seam (its stand-in wrote `marker`), and the bytes its Commit put
-/// on the pipe.
 struct Outgoing {
     status: i32,
     reached_the_seam: bool,
     committed: Vec<u8>,
 }
 
-/// Fork a child that Commits over `commit` and then does what the exit seam
-/// does after a Commit that returns: writes its book, here a marker file
-/// (`open` and `close`, async-signal-safe: libtest is multi-threaded at the
-/// fork). `read` is the pipe's other end, `None` where it is already closed.
 fn outgoing(commit: OwnedFd, read: Option<OwnedFd>, marker: &std::path::Path) -> Outgoing {
     let proof = crate::seamless::adoption_proof(
         "ab-book-exit-seam",
@@ -87,13 +80,6 @@ fn outgoing(commit: OwnedFd, read: Option<OwnedFd>, marker: &std::path::Path) ->
     }
 }
 
-/// A SEAMLESS UPDATE'S OUTGOING PROCESS NEVER REACHES ITS EXIT SEAM: its
-/// Commit lands (the 40-byte wire on the pipe) and the process is gone
-/// (`_exit(0)`), with nothing after the Commit run — so the A/B book's exit
-/// write does not happen there, and what it measured since its last page
-/// reading is lost, as in a crash (§10.5.4). NEGATIVE CONTROL: a Commit that
-/// cannot be written (the successor's end closed: EPIPE) returns, and the
-/// same process goes on to the seam and writes.
 #[test]
 fn a_seamless_updates_outgoing_process_never_reaches_its_exit_seam() {
     let scratch = aterm_tempfile::tempdir().expect("scratch folder");

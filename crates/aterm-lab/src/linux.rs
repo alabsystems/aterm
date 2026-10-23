@@ -28,7 +28,13 @@ pub const TEMPLATE: &str = "template:ubuntu-24.04";
 /// The guest-local directory every build of the lane writes, under the guest user's home (never a host mount); the end of a run (a proof, a one-shot `exec`, `down`) and `clean` empty it, and a run that finds another checkout's output in it empties it first ([`BUILT_FROM`]).
 pub const GUEST_DIR: &str = "aterm-lane";
 
-/// The file in [`GUEST_DIR`] that names the checkout whose build output it holds.
+/// The file in [`GUEST_DIR`] that names the checkout whose build output it
+/// holds. Cargo hashes a path package by its path inside the workspace and
+/// keeps its dep-info relative to it, so the output another checkout left
+/// (`--keep-build`, or an `up` never taken `down`) reads as fresh to this
+/// one's build, which then links that checkout's units: measured 2026-10-19,
+/// when a run took another worktree's aterm-serde-derive and atpkg failed
+/// with E0782 on a method only that worktree's aterm-serde had.
 pub const BUILT_FROM: &str = "built-from";
 
 /// Exit status of a lane that could not run (no lima, no VM, no display): never a pass.
@@ -959,8 +965,7 @@ fn build_output(dir_exists: bool, built_from: Option<&str>, repo: &str) -> Build
 
 /// Make [`GUEST_DIR`] this checkout's before anything builds in it: remove
 /// another checkout's output ([`BUILT_FROM`] says why), then name `repo` in
-/// it.
-///
+/// it. The removal as a step, or `None` when there was nothing to remove.
 /// # Errors
 /// NOT RUN: the foreign output could not be removed, or the stamp written.
 fn claim_build_output(up: &Up, repo: &str) -> Result<Option<Step>, Fail> {
@@ -1053,6 +1058,7 @@ fn provision(up: &Up) -> Result<Option<f64>, Fail> {
         let out = up.lima.shell(&up.home, &s.argv, s.stdin.as_deref());
         if !out.ok() {
             // The guest could not be made ready (apt or rustup unreachable,
+            // most often): nothing was decided, so NOT RUN, never a finding.
             return Err(not_run(format!(
                 "provisioning step '{}' failed:\n{}",
                 s.label,
@@ -1317,6 +1323,7 @@ fn start_servers(
     then: Option<(String, guest::Step)>,
 ) -> Result<String, String> {
     // Mutter after the user's pipewire, always: its screencasts (a
+    // RemoteDesktop finger's stream, `lane-bus cast`'s frame) need it.
     if screen.display == Display::Mutter {
         start_pipewire(up);
     }

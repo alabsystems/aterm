@@ -1,69 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tone-of-typing tracker: the seam between the host's committed key-press path
-//! and the [`crate::tone`] classifier, caching the [`Tone`] the render tick
-//! stamps onto every trail [`crate::trail_sound::SoundEvent`].
-//!
-//! Typed input only, never screen content (the [`crate::kitty_summon`]
-//! discipline): the window is fed from the committed key-press path (bare
-//! Character/Space, committed IME `Text`), a plain Backspace pops one char, and
-//! any key that edits or moves further clears it, since the buffer can no longer
-//! claim to be the text before the caret. PTY output and pastes never steer the
-//! melody; like every input-path effect the tracker is Source-agnostic.
-//!
-//! A keystroke marks inference due after [`INFER_KEYS`] keystrokes, or once
-//! [`INFER_INTERVAL`] has passed since the last run; it runs at the render tick,
-//! never in the key handler. The cached verdict survives line breaks (a mood does
-//! not end at Enter), and an abstention below `tone::MIN_NGRAMS` leaves it as is.
-//!
-//! The host runs the classifier only while tone inference is active
-//! (`App::tone_infer_active`), so a headless or muted build never loads the
-//! weights; window bookkeeping runs regardless, so a re-enable classifies a
-//! clean window. Focus, reduced-motion and quiet policies need no check here:
-//! the tone only rides events the sound path already admitted.
+//! Tone-of-typing tracker caching the [`Tone`] stamped onto trail sound events.
 
 use aterm_time::Instant;
 use std::time::Duration;
 
 use crate::tone::{self, Tone, ToneScratch};
 
-/// Window capacity in chars: the classifier mean-pools, so the tail of a long
-/// line is plenty.
 const BUF_CAP: usize = 160;
 
-/// Re-infer after this many fed keystrokes…
 const INFER_KEYS: u32 = 6;
 
-/// …or once this long has passed since the last inference (slow typing gets
-/// a fresh verdict per key; fast typing batches).
 const INFER_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Per-window tone tracker: the bounded typed-line window (keyed to the
-/// session it was typed into), the cached verdict, and the throttle clocks.
+/// Per-window tone tracker: the bounded typed-line window (keyed to the session it was typed into),
+/// the cached verdict, and the throttle clocks.
 pub struct ToneTracker {
-    /// Rolling window of recent printed keystrokes (≤ [`BUF_CAP`]).
     buf: std::collections::VecDeque<char>,
-    /// The session the window's chars were typed into; a switch clears it.
     session: Option<u64>,
-    /// Cached verdict; [`Tone::Technical`] until the classifier first speaks.
     tone: Tone,
-    /// Keystrokes fed since the last inference.
     keys_since_infer: u32,
-    /// Stamp of the last inference (None ⇒ never ran).
     last_infer: Option<Instant>,
-    /// An inference marked due on the key path, run at the render tick by
-    /// [`Self::drain_pending_inference`]: the classifier never runs inside the
-    /// key handler, between the PTY write and the echo's wake dispatch.
     infer_pending: bool,
-    /// Fixed classifier scratch; inference allocates nothing.
     scratch: ToneScratch,
-    /// Reused `&str` bridge for the char window, taken and returned around each
-    /// inference.
     text_buf_slot: String,
-    /// Total inferences run. Ships so the `tone` control verb can tell "reads
-    /// technical" from "never ran"; counted on the throttled path, never the key
-    /// path.
+    /// Total inferences run.
     pub inferences: u64,
 }
 
@@ -85,18 +47,14 @@ impl Default for ToneTracker {
 }
 
 impl ToneTracker {
-    /// The cached verdict before the `tone_melody` knob, for introspection;
-    /// [`Self::effective`] is what rides a sound event.
+    /// The cached verdict before the `tone_melody` knob, for introspection.
     #[inline]
     #[must_use]
     pub const fn current(&self) -> Tone {
         self.tone
     }
 
-    /// The tone the sound path stamps onto every trail
-    /// [`crate::trail_sound::SoundEvent`]: the cached verdict with the knob on,
-    /// the neutral [`Tone::Technical`] with it off, even while a verdict from
-    /// before the toggle is cached. Every sound seam takes its tone from here.
+    /// The tone the sound path stamps onto every trail [`crate::trail_sound::SoundEvent`].
     #[inline]
     #[must_use]
     pub const fn effective(&self, tone_melody: bool) -> Tone {
@@ -107,15 +65,12 @@ impl ToneTracker {
         }
     }
 
-    /// Chars currently in the window. The count only, never the text: the window
-    /// holds keystrokes typed at a password prompt that the screen never echoed.
+    /// Chars currently in the window.
     #[inline]
     pub fn window_chars(&self) -> usize {
         self.buf.len()
     }
 
-    /// Bind the window to `session`, clearing it on a switch; the cached tone
-    /// survives.
     #[inline]
     fn rekey(&mut self, session: u64) {
         if self.session != Some(session) {
@@ -124,13 +79,7 @@ impl ToneTracker {
         }
     }
 
-    /// Feed one committed printed keystroke and mark a re-inference due when the
-    /// throttle opens; [`Self::drain_pending_inference`] runs it at the next
-    /// render tick. The key's own click reads the tracker before this feed.
-    ///
-    /// Window maintenance is unconditional; only marking is gated on
-    /// `infer_active`. The keystroke count carries across an inactive spell, so
-    /// the first press after a re-enable re-infers.
+    /// Feed one committed printed keystroke and mark a re-inference due when the throttle opens.
     #[inline]
     pub fn note_char(&mut self, now: Instant, session: u64, ch: char, infer_active: bool) {
         self.rekey(session);
@@ -151,9 +100,7 @@ impl ToneTracker {
         }
     }
 
-    /// Run the inference a keystroke marked due, if any. The render-tick sound
-    /// drain calls this right before reading the tone, so a verdict trails its
-    /// key by at most one frame.
+    /// Run the inference a keystroke marked due, if any.
     #[inline]
     pub fn drain_pending_inference(&mut self, now: Instant) {
         if self.infer_pending {
@@ -162,32 +109,28 @@ impl ToneTracker {
         }
     }
 
-    /// A plain Backspace pops one char. Deletion alone never re-infers: only new
-    /// evidence moves the mood.
+    /// A plain Backspace pops one char.
     #[inline]
     pub fn note_backspace(&mut self, session: u64) {
         self.rekey(session);
         self.buf.pop_back();
     }
 
-    /// A word-breaking key (Enter/Tab/Escape/Delete/nav/kill chords, raw byte
-    /// sequences) clears the window; the cached tone persists.
+    /// A word-breaking key (Enter/Tab/Escape/Delete/nav/kill chords, raw byte sequences) clears the
+    /// window; the cached tone persists.
     #[inline]
     pub fn note_break(&mut self) {
         self.buf.clear();
     }
 
-    /// Serious Mode's drain: clear the partial typing window and any owed
-    /// re-inference while keeping the cached tone, throttle timestamp, and
-    /// warmed-up scratch buffers intact. Idempotent.
+    /// Serious Mode's drain: clear the partial typing window and any owed re-inference while
+    /// keeping the cached tone, throttle timestamp, and warmed-up scratch buffers intact.
     #[inline]
     pub fn drain_serious(&mut self) {
         self.buf.clear();
         self.infer_pending = false;
     }
 
-    /// Run the classifier over the window and cache the verdict. A missing or
-    /// corrupt weight asset degrades to Technical.
     #[inline]
     fn infer(&mut self, now: Instant) {
         self.keys_since_infer = 0;
@@ -200,8 +143,6 @@ impl ToneTracker {
         let mut text = std::mem::take(&mut self.text_buf_slot);
         text.clear();
         text.extend(self.buf.iter());
-        // An abstention (`None`, below `tone::MIN_NGRAMS`) keeps the prior
-        // verdict; a real `Some(Tone::Technical)` still overwrites it.
         if let Some(tone) = model.classify_opt(&text, &mut self.scratch) {
             self.tone = tone;
         }
@@ -213,8 +154,6 @@ impl ToneTracker {
 mod tests {
     use super::*;
 
-    /// A live session draws a frame per key, so drain after each keystroke as
-    /// the render tick does.
     fn feed(t: &mut ToneTracker, now: Instant, session: u64, s: &str) {
         for c in s.chars() {
             t.note_char(now, session, c, true);
@@ -222,7 +161,6 @@ mod tests {
         }
     }
 
-    /// The key path only marks inference due; the drain runs it.
     #[test]
     fn the_key_path_marks_inference_due_and_only_the_drain_runs_it() {
         let mut t = ToneTracker::default();
@@ -240,16 +178,12 @@ mod tests {
         assert_eq!(t.inferences, 1, "a drain with nothing pending is free");
     }
 
-    /// Feed keystrokes with inference inactive: the window fills, the classifier
-    /// never runs.
     fn feed_inactive(t: &mut ToneTracker, now: Instant, session: u64, s: &str) {
         for c in s.chars() {
             t.note_char(now, session, c, false);
         }
     }
 
-    /// A same-instant burst re-infers once per [`INFER_KEYS`] keys (plus the
-    /// first run), never per key.
     #[test]
     fn inference_is_throttled_by_keystrokes() {
         let mut t = ToneTracker::default();
@@ -263,7 +197,6 @@ mod tests {
         );
     }
 
-    /// With [`INFER_INTERVAL`] elapsed, one keystroke re-infers.
     #[test]
     fn interval_reopens_inference() {
         let mut t = ToneTracker::default();
@@ -279,7 +212,6 @@ mod tests {
         );
     }
 
-    /// A session switch clears the window but keeps the cached tone.
     #[test]
     fn session_switch_clears_window_but_keeps_mood() {
         let mut t = ToneTracker::default();
@@ -291,7 +223,6 @@ mod tests {
         assert_eq!(t.current(), Tone::Playful, "the mood itself persists");
     }
 
-    /// Backspace never re-infers; the window stays bounded.
     #[test]
     fn backspace_pops_and_window_stays_bounded() {
         let mut t = ToneTracker::default();
@@ -307,8 +238,6 @@ mod tests {
         assert!(t.buf.len() <= BUF_CAP);
     }
 
-    /// An abstention over a one-char window after Enter keeps the classified
-    /// mood instead of snapping to Technical.
     #[test]
     fn thin_window_after_a_classified_line_keeps_the_mood() {
         let mut t = ToneTracker::default();
@@ -316,8 +245,6 @@ mod tests {
         feed(&mut t, start, 1, "why is this broken again ugh");
         assert_eq!(t.current(), Tone::Frustrated);
         t.note_break(); // Enter — window clears, mood persists…
-        // …a pause, then one char: inference is due but abstains (below
-        // MIN_NGRAMS).
         t.note_char(start + INFER_INTERVAL, 1, 'x', true);
         t.drain_pending_inference(start + INFER_INTERVAL);
         assert_eq!(t.buf, vec!['x'], "the window is the single new char");
@@ -328,8 +255,6 @@ mod tests {
         );
     }
 
-    /// With the knob off `effective` is neutral, while `current` still shows the
-    /// cached verdict.
     #[test]
     fn effective_is_neutral_with_the_knob_off_even_with_a_cached_verdict() {
         let mut t = ToneTracker::default();
@@ -341,15 +266,12 @@ mod tests {
         assert_eq!(t.current(), Tone::Frustrated, "the cache is not cleared");
     }
 
-    /// A break recorded while inference is inactive still clears the window, so
-    /// a re-enable classifies only post-break text.
     #[test]
     fn breaks_while_inactive_keep_the_window_coherent() {
         let mut t = ToneTracker::default();
         let now = Instant::now();
         feed(&mut t, now, 1, "why is this broken again ugh");
         assert_eq!(t.current(), Tone::Frustrated);
-        // Inference goes inactive: chars still land, the Enter still clears.
         feed_inactive(&mut t, now, 1, "still poking at it");
         assert!(!t.buf.is_empty(), "the window tracks edits while inactive");
         t.note_break(); // Enter recorded while inactive — must clear.
@@ -357,7 +279,6 @@ mod tests {
             t.buf.is_empty(),
             "a break must clear the window even when inference is inactive"
         );
-        // Re-enable: a clean line classifies without splicing stale text.
         feed(&mut t, now, 1, "git rebase -i HEAD~3 && cargo test");
         assert_eq!(
             t.current(),

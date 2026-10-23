@@ -5,7 +5,6 @@
 
 use std::sync::OnceLock;
 
-/// `C(u)/2 * cos((2x + 1) u pi / 16)`, indexed `[u][x]`.
 #[inline]
 fn basis() -> &'static [[f32; 8]; 8] {
     static BASIS: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
@@ -79,7 +78,6 @@ fn clamp_sample(value: f32) -> u8 {
 mod tests {
     use super::idct_block;
 
-    /// A lone DC coefficient is a flat block at DC / 8 above mid-grey.
     #[test]
     fn a_dc_only_block_is_flat() {
         let mut coefficients = [0i32; 64];
@@ -89,8 +87,6 @@ mod tests {
         assert!(out.iter().all(|&sample| sample == 138), "{out:?}");
     }
 
-    /// The first horizontal AC term is a left-to-right ramp, symmetric about
-    /// the middle, and the transform clamps to the sample range.
     #[test]
     fn a_horizontal_term_ramps_across_the_row() {
         let mut coefficients = [0i32; 64];

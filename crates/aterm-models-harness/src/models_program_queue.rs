@@ -228,9 +228,12 @@ pub fn claude_footer_model_model() -> Model {
                 } else if seen == 3 {
                     0
                 } else if Buggy == 1 && resumed > 0 && (restored == 0 || restored == 2) {
+                    // Buggy=1: the resumed conversation's own model, read without the floor
+                    // under a pin (or by the floor alone in D), or taking a restore for no pin
                     // at the second resume (or missing D's).
                     if resumed == 2 { Other } else { Pred }
                 } else if restored == 1 {
+                    // Buggy=1: the resume read as a clear — the process's
                     // carried answer (its starting model), else its card.
                     if Buggy == 1 {
                         if carry == 1 || carry == 2 { 1 } else { card }

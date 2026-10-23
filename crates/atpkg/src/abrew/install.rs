@@ -935,6 +935,7 @@ fn reinstall_payload_with(
     root: &Path,
     place: impl FnMut(&InstallLink) -> Result<(), String>,
 ) -> Result<(), InstallError> {
+    // Establish receipt authority before moving the live version. Keep the
     // aside on restore failure: a temporary-directory Drop must not delete it.
     if !replacement_target_owned(prefix, live, live, root) {
         return Err("abrew: reinstall requires an owned physical keg"

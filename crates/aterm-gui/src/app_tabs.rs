@@ -97,6 +97,8 @@ pub(crate) fn synchronize_captured_title_cache(
     if let Some(title) = resolved_rung {
         cache.insert(session, title.to_owned());
     } else {
+        // No terminal-owned rung means `tab_titles` must use this tab's live
+        // presentation fallback. Removing is more accurate than caching one
         // window/tab's fallback under the session-wide compatibility key.
         cache.remove(&session);
     }
@@ -1143,6 +1145,8 @@ impl App {
                 .detach_view_if_ready(document, crate::document_store::DocumentViewId(view.get()))
                 .is_err()
         {
+            // Fail closed. The exact view/runtime/document edges remain intact;
+            // dirty final views may only cross this seam after their close plan
             // proves the requested sequence durable.
             return None;
         }
@@ -1176,7 +1180,7 @@ impl App {
     }
 
     /// Whether the visible tab strip is enabled (`tab_strip_rows > 0`), for every window.
-    pub(crate) fn tab_strip_enabled(&self) -> bool {
+    pub(crate) const fn tab_strip_enabled(&self) -> bool {
         self.tab_strip_rows > 0
     }
 
@@ -1187,7 +1191,7 @@ impl App {
     }
 
     /// The chrome rows every window shares — the strip and the message band.
-    pub(crate) fn chrome_rows_shared(&self) -> u16 {
+    pub(crate) const fn chrome_rows_shared(&self) -> u16 {
         self.tab_strip_rows.saturating_add(self.message_band_rows)
     }
 
@@ -1337,6 +1341,8 @@ impl App {
         wid: WindowId,
         titles: &[String],
     ) -> Vec<crate::session_chrome::TabChromeExt> {
+        // A backstop bound on the cache (`detach_session_view` drops a closed
+        // session's entry). The live-id set is collected first so the retain
         // closure borrows no field.
         if self.session_chrome.len() > 64 {
             let live: std::collections::HashSet<u64> = self.pool.iter().map(|s| s.id).collect();
@@ -1970,6 +1976,8 @@ impl App {
         }
         self.sync_window(wid_b);
         if source_now_empty {
+            // A has no canonical tabs left. Close it before the next stable-state
+            // assertion. The moved tab is already absent from A, so window teardown
             // detaches nothing and cannot double-drop its views.
             let _ = self.close_window_logical(wid_a);
         } else {
@@ -2043,6 +2051,8 @@ impl App {
             return;
         };
         if !self.headless && !self.attach_os_window(el, wid) {
+            // GPU surface failed: drop the new viewer. `close_window_logical`
+            // detaches its shared view, so the session survives in the original
             // window.
             self.close_window_logical(wid);
         }
@@ -2238,6 +2248,7 @@ impl App {
         ) {
             Ok(())
         } else {
+            // `connect_in` refuses only a self-loop — unreachable here (the
             // newborn's sid is freshly generated), kept fail-closed.
             Err("self-loop".to_string())
         }
@@ -2446,6 +2457,7 @@ impl App {
 
     /// Fold one session's PUBLISHED need into the herald ([`crate::status_item::Herald`], §9 S4: the herald is fed by the need): remember since when its need and hold stand (the glance's ages, headless too), dirty the menu-bar item where what it shows of the session moved, and post the one native notification a transition earns.
     pub(crate) fn herald_session(&mut self, session: u64) {
+        // A fleet need's key (the herald's timer re-heralds an owed one):
         // the fleet's notices are re-read from the last fleet read.
         if crate::fleet_glance::is_herald_key(session) {
             self.herald_fleet();
@@ -2725,7 +2737,7 @@ impl App {
     }
 
     /// The menu-bar item owes a rebuild: one is made on the event loop's way to its next wait (`about_to_wait`), whatever number of changes marked it this turn (`docs/DESIGN-owner-surfaces-2026-10-16.md` §9 S3).
-    pub(crate) fn mark_status_dirty(&mut self) {
+    pub(crate) const fn mark_status_dirty(&mut self) {
         self.status_dirty = true;
     }
 
@@ -3331,6 +3343,7 @@ impl App {
         } else if let Some(wid) = deferred {
             Ok(CloseProgress::Deferred(wid))
         } else if self.view_store.get(location.view).is_none() {
+            // The pane's view was retired, and its session with it only if this
             // was the last view: another viewer keeps it (one close per viewer).
             Err(self.surviving_session_reason(wid, session))
         } else {
@@ -3358,6 +3371,8 @@ impl App {
                 view: location.view,
             },
         )) {
+            // Queued onto the pending handoff's teardown, applied once that
+            // cancellation lands; the pane is still here, so the reply must not
             // read as closed.
             return Err(
                 "close deferred (a pending update handoff is being cancelled first)".to_string(),
@@ -4005,6 +4020,7 @@ impl App {
             self.retain_closed_view(recovery);
         }
         if closes_window {
+            // The caller sets `pending_close` and the window tears down a later
             // turn, outside this fn's attribution scope.
             self.stash_deferred_close_attribution(window);
         }
@@ -4721,6 +4737,7 @@ impl App {
         }
         let mut to_close = Vec::new();
         for o in owners {
+            // `close_session` leaves a last-tab occurrence intact for
             // `close_window_logical`; never report a window twice.
             if to_close.contains(&o) {
                 continue;
@@ -5034,6 +5051,7 @@ impl App {
         anchor_col: u16,
         keyboard: bool,
     ) -> bool {
+        // (The mouse path cannot reach here with the strip off, since
         // `strip_col_at` already declines; the keyboard path can.)
         if !self.tab_strip_enabled() {
             return false;

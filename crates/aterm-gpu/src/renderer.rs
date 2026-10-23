@@ -4282,6 +4282,7 @@ impl Atlas {
     fn place(&mut self, key: GlyphKey, img: &GlyphImage) -> Option<(u32, u32)> {
         let pad = 1u32;
         if !Self::packs(self.kind, img) {
+            // Mono records every key (zero slot for non-mono/empty) so a lookup
             // there always resolves; Color simply skips.
             if self.kind == AtlasKind::Mono {
                 self.map.insert(
@@ -4795,6 +4796,7 @@ impl WindowGpu {
         }
         #[cfg(not(wgpu_arm))]
         {
+            // Reports `false`: the armed arm's resident `metal_bloom_half` is
             // not consulted.
             false
         }
@@ -6938,6 +6940,7 @@ impl GpuRenderer {
     /// Forward of the inner CPU rasterizer's [`set_runtime_font_discovery`].
     #[inline]
     pub fn set_runtime_font_discovery(&mut self, enabled: bool) {
+        // Widening the chain drops the CPU's rasterized glyphs (a `.notdef` from
         // the narrower chain must not survive), so the atlas copy goes too.
         self.raster_changed(|cpu| cpu.set_runtime_font_discovery(enabled));
     }
@@ -7028,6 +7031,7 @@ impl GpuRenderer {
 
     /// Record the Linux subpixel-RGB mode (`font_subpixel`) on the wrapped CPU face.
     pub fn set_font_subpixel(&mut self, mode: &str) {
+        // No `invalidate_atlas()`: the CPU drops only its LCD overlay cache,
         // which never reaches this atlas.
         let _ = self.cpu.set_font_subpixel(mode);
     }
@@ -8071,6 +8075,7 @@ impl GpuRenderer {
     }
 
     fn ensure_atlases(&mut self, keys: &mut [GlyphKey]) {
+        // Fast path: every key is resident in both atlases. Runs before the sort
         // (membership needs no order), so the common frame never sorts.
         if self.mono_res.is_some()
             && self.color_res.is_some()
@@ -8386,6 +8391,10 @@ impl GpuRenderer {
 
     /// Config `hdr_glow` (default on).
     pub fn set_hdr_glow(&mut self, on: bool) {
+        // The HDR swapchain and the DirectComposition visual swapchain are
+        // mutually exclusive: once the instance is visual, `hdr_glow` stays off
+        // (its composition semantics there are unverified and the instance
+        // cannot be rebuilt without tearing down every window). Every config
         // path funnels through here.
         if on && self.ctx.visual_swapchain {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -9029,6 +9038,7 @@ impl GpuRenderer {
         }
         #[cfg(not(wgpu_arm))]
         {
+            // Disarmed with no wgpu arm: nothing was drawn; the caller's
             // degrade owns the blank/error shape.
             (None, w, h)
         }
@@ -11469,6 +11479,8 @@ impl GpuRenderer {
 
     #[cfg(wgpu_arm)]
     fn pick_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+        // Mailbox where it exists: a non-blocking, newest-frame-wins present, the
+        // lowest-latency mode. Input latency takes priority over animation
         // smoothness.
         if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             return wgpu::PresentMode::Mailbox;
@@ -11827,6 +11839,7 @@ impl GpuRenderer {
         surf: &mut GpuSurface,
         read_potential: impl FnOnce() -> Option<f32>,
     ) -> bool {
+        // The decision reads the screen only past the cheap gates: f16 surfaces
         // and gate-refused windows never pay the AppKit read.
         if !crate::format_plan::hdr_screen_upgrade_decision(
             self.hdr_glow,
@@ -11976,6 +11989,7 @@ impl GpuRenderer {
         surf.config.format = wgpu::TextureFormat::Rgba16Float;
         self.configure_surface_retagging_scrgb(win, surf, "live HDR-state upgrade");
         if surf.is_hdr() {
+            // This path crossed from SDR, so publish the new encoding only after
             // configure and tag succeeded.
             win.apply_hdr_surface_upgrade();
         }
@@ -12955,12 +12969,13 @@ impl GpuRenderer {
         }
         #[cfg(not(wgpu_arm))]
         {
+            // The armed arm's PSOs are demand-built per table row
             // (`MetalArmLive::psos`); this wgpu ledger reports none resident.
             [false; EFFECT_PIPELINE_COUNT]
         }
     }
 
-    /// `` this renderer has spent building effect pipelines since construction.
+    /// `(count, nanoseconds)` this renderer has spent building effect pipelines since construction.
     #[inline]
     pub const fn effect_pipeline_build_cost(&self) -> (u32, u64) {
         #[cfg(wgpu_arm)]
@@ -15373,6 +15388,7 @@ impl GpuRenderer {
         let mut key_scratch = std::mem::take(&mut self.key_scratch);
         key_scratch.resize(vis_rows * cols, None);
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
+            // A Dirty repaint needs keys only for the rows it draws glyphs on;
             // resident atlases hold the rest.
             if glyph_win[r].is_none() {
                 continue;
@@ -15811,6 +15827,7 @@ impl GpuRenderer {
                     let color = if selected {
                         rgb4_u32(theme_selection)
                     } else if wallpaper_on {
+                        // A tail cell is its pane's default bg, so under a
                         // wallpaper it shows the backdrop.
                         continue;
                     } else if default_bg != frame_bg {
@@ -16245,6 +16262,7 @@ impl GpuRenderer {
                     let fp_h = image.image.rows as usize * ch + lift;
                     let key = (std::sync::Arc::as_ptr(&image.image) as usize, fp_w, fp_h);
                     let Some(&(img_y0, dw, dh)) = plane.placements.get(&key) else {
+                        // Failed decode (no texture rows): nothing to draw, the
                         // cell bg shows through — exactly the CPU negative-cache.
                         continue;
                     };
@@ -16808,6 +16826,10 @@ impl GpuRenderer {
             keep: impl Fn(u16) -> bool,
         ) {
             for q in quads {
+                // Skip a quad past the grid's last row, as every other
+                // row-tagged stream does and the CPU twins do structurally
+                // (`build_rain_row_csr` drops `row >= input.rows`; the cat
+                // stamp fires only for `r` in `0..rows`). `keep` cannot stand
                 // in for this: under `RepaintScope::Full` it passes everything.
                 if !keep(q.row) || q.row as usize >= rows {
                     continue;

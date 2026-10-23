@@ -1026,3 +1026,100 @@ fn the_doors_host_calls_are_taped() {
     let d = core.diverged().expect("latched");
     assert_eq!(d.door.as_deref(), Some("host.occupancy_pace"), "{d:?}");
 }
+
+/// WHAT THE DOOR TELLS ITS HOST IS TAPED (`host.occupancy_said`, 1e): an output whose request
+/// is the told word's `Debug`, `said=<OccupancySaid { … }>`, and a replay of the same tell
+/// reproduces from the tape alone. NEGATIVE CONTROL: a replay told another word (the hold
+/// declared) diverges at the door.
+#[test]
+fn the_doors_tell_is_taped() {
+    use astream_effects::EffectRecord;
+
+    use crate::supervise::IdleHost;
+    use crate::supervise::config::Occupancy;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::occupancy::{
+        OccupancyReading, OccupancySaid, PaceGrant, RuleId, SaidHold, SaidRule, SaidVerdict,
+    };
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    let since = 1_760_000_000_000;
+    let said = OccupancySaid {
+        mode: Occupancy::Observe,
+        hold: Some(SaidHold {
+            since_ms: since,
+            declared: false,
+        }),
+        ready: false,
+        guards: Some(crate::supervise::occupancy::rules::Guards {
+            person: true,
+            ..crate::supervise::occupancy::rules::Guards::clear(
+                crate::supervise::config::Autopilot::Cruise,
+            )
+        }),
+        rules: [
+            SaidRule {
+                rule: RuleId::WaitNudge,
+                verdict: SaidVerdict::Held(crate::supervise::Guard::Person),
+                at_ms: since + 1_800_000,
+            },
+            SaidRule {
+                rule: RuleId::HoldRoom,
+                verdict: SaidVerdict::Quiet,
+                at_ms: 0,
+            },
+        ],
+        at_ms: since + 1_800_000,
+        reading: OccupancyReading::default(),
+    };
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let host = TapedHost::new(
+        Arc::new(Paced(PaceGrant::Local)) as Arc<dyn IdleHost>,
+        tape.fx.clone(),
+    );
+    IdleHost::occupancy_said(&host, &said);
+    let read = tape.finish("done");
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+    let [EffectRecord::Emit { door, bytes }] = records.as_slice() else {
+        panic!("one output: {records:?}");
+    };
+    assert_eq!(door, "host.occupancy_said");
+    assert_eq!(
+        String::from_utf8_lossy(bytes),
+        format!("said={said:?}"),
+        "the request is the word's Debug"
+    );
+
+    let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    IdleHost::occupancy_said(&replay, &said);
+    assert_eq!(core.left(), 0, "answered from the tape");
+    assert!(core.diverged().is_none());
+
+    // NEGATIVE CONTROL: another word diverges at the door.
+    let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let mut declared = said.clone();
+    declared.hold = Some(SaidHold {
+        since_ms: since,
+        declared: true,
+    });
+    let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        IdleHost::occupancy_said(&replay, &declared);
+    }));
+    let d = core.diverged();
+    assert!(
+        told.is_err() || d.is_some(),
+        "the replay halts or latches at the divergence"
+    );
+    assert_eq!(
+        d.expect("latched").door.as_deref(),
+        Some("host.occupancy_said")
+    );
+}

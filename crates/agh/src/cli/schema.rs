@@ -28,7 +28,6 @@ pub fn exit_table() -> Value {
     )
 }
 
-/// The order a noun's lists are printed in, or `None` where a noun has no list order.
 const fn order(noun: Noun) -> Option<&'static str> {
     match noun {
         Noun::ReleaseList => Some("created_at desc, then id desc"),
@@ -51,7 +50,6 @@ const fn order(noun: Noun) -> Option<&'static str> {
     }
 }
 
-/// One noun's row.
 fn noun_row(noun: Noun) -> Value {
     json!({
         "default_fields": default_fields(noun),
@@ -67,7 +65,6 @@ pub fn nouns() -> Value {
     Value::Array(Noun::ALL.into_iter().map(noun_row).collect())
 }
 
-/// A class in kebab case.
 const fn class_slug(class: Class) -> &'static str {
     match class {
         Class::Read => "read",
@@ -78,7 +75,6 @@ const fn class_slug(class: Class) -> &'static str {
     }
 }
 
-/// What a flag takes, in kebab case.
 const fn takes_slug(takes: Takes) -> &'static str {
     match takes {
         Takes::None => "none",
@@ -87,7 +83,6 @@ const fn takes_slug(takes: Takes) -> &'static str {
     }
 }
 
-/// One verb's row.
 fn verb_row(verb: &Verb) -> Value {
     let flags = verb
         .flags

@@ -64,7 +64,7 @@ pub(crate) struct CellBox {
 impl CellBox {
     /// A plan rectangle in cells, rounded as the compositor places it.
     #[must_use]
-    pub(crate) fn of(rect: LogicalRect) -> Self {
+    pub(crate) const fn of(rect: LogicalRect) -> Self {
         CellBox {
             row: rect.origin.y.round().max(0.0) as usize,
             col: rect.origin.x.round().max(0.0) as usize,
@@ -73,7 +73,7 @@ impl CellBox {
         }
     }
 
-    fn contains(&self, r: usize, c: usize) -> bool {
+    const fn contains(&self, r: usize, c: usize) -> bool {
         r >= self.row && r < self.row + self.rows && c >= self.col && c < self.col + self.cols
     }
 }
@@ -170,7 +170,7 @@ impl SeamLayout {
 
 /// Returns the light box-drawing glyph for the given arm directions, if any.
 #[must_use]
-pub(crate) fn seam_glyph(up: bool, down: bool, left: bool, right: bool) -> Option<char> {
+pub(crate) const fn seam_glyph(up: bool, down: bool, left: bool, right: bool) -> Option<char> {
     Some(match (up, down, left, right) {
         (false, false, false, false) => return None,
         (true, true, false, false) => '│',

@@ -123,7 +123,7 @@ fn pack(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
 }
 
-fn unpack(c: u32) -> [u8; 3] {
+const fn unpack(c: u32) -> [u8; 3] {
     [
         ((c >> 16) & 0xff) as u8,
         ((c >> 8) & 0xff) as u8,
@@ -139,7 +139,7 @@ pub(crate) use aterm_messages::ink::{PRIMARY_HOVER_LIFT, TRACK_TINT, hover_ink};
 pub(crate) use aterm_messages::ink::{contrast, ensure_contrast, forced_ink, mix3, warn_mark};
 
 /// A packed `0x00RRGGBB` theme colour as sRGB bytes.
-fn rgb(c: u32) -> [u8; 3] {
+const fn rgb(c: u32) -> [u8; 3] {
     [
         ((c >> 16) & 0xff) as u8,
         ((c >> 8) & 0xff) as u8,

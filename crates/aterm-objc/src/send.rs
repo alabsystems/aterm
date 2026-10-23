@@ -43,6 +43,19 @@ pub unsafe trait CheckedFn: MsgFn {
 }
 
 /// [`crate::msg`], checked in a debug build at every call against the runtime's encoding of the method the receiver's class runs for the selector (the module's prototype check); the bare cast in a release build.
+///
+/// The returned pointer is called exactly as a [`crate::msg`] cast is:
+///
+/// ```no_run
+/// # use aterm_objc::{Id, Sel, checked_msg, sel};
+/// # let string: Id = Id::NIL;
+/// // SAFETY: `-length` is `-(NSUInteger)length` on a live NSString.
+/// let len = unsafe {
+///     let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
+///     f(string, sel!(length))
+/// };
+/// ```
+///
 /// # Safety
 /// As [`crate::msg`]: `F` must be the exact C prototype of every selector the pointer is called with.
 #[inline]
@@ -638,6 +651,9 @@ pub unsafe fn send_f64(recv: Id, sel: Sel) -> f64 {
 /// See the module note.
 #[must_use]
 pub unsafe fn send_rect(recv: Id, sel: Sel) -> CGRect {
+    // Nil receiver: libobjc zeroes register-class returns on the nil path but
+    // never writes an indirect struct return, and a 32-byte CGRect is
+    // `objc_msgSend_stret` on x86_64, so `[nil frame]` would return stack
     // garbage. clang makes the same check around every stret send.
     if recv.is_null() {
         return CGRect::default();
@@ -914,6 +930,7 @@ pub unsafe fn send_id_idptr_usize(recv: Id, sel: Sel, a: *const Id, b: usize) ->
 /// See the module note.
 #[must_use]
 pub unsafe fn send_rect_rect(recv: Id, sel: Sel, a: CGRect) -> CGRect {
+    // Nil receiver: an indirect struct return is left uninitialised by libobjc
     // on x86_64 — see `send_rect`.
     if recv.is_null() {
         return CGRect::default();

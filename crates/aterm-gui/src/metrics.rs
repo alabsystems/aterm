@@ -917,7 +917,7 @@ pub(crate) fn note_gpu_frame(shape: aterm_gpu::FrameShape, encode_ns: u64) {
     METRICS.window.gpu.note_frame(shape, encode_ns);
 }
 
-fn ablation_code(mode: aterm_gpu::UnormAblation) -> u8 {
+const fn ablation_code(mode: aterm_gpu::UnormAblation) -> u8 {
     use aterm_gpu::UnormAblation::{Drop, Off, Thin};
     match mode {
         Off => 0,
@@ -971,7 +971,7 @@ impl GpuLedger {
     }
 }
 
-fn gpu_time_source(samples: u64) -> &'static str {
+const fn gpu_time_source(samples: u64) -> &'static str {
     if !aterm_gpu::gpu_time::SUPPORTED {
         "unsupported"
     } else if samples == 0 {
@@ -2143,6 +2143,8 @@ impl Metrics {
             sched.stale_arm_heals.inc();
         }
         if heal.streak {
+            // Per owner, not one global counter, for the same reason as
+            // `deadline_arms_by_owner`: a heal that cannot name its producer
             // sends the investigation to the wrong module.
             sched.streak_heals_by_owner.inc(owner.index());
         }
@@ -2569,6 +2571,7 @@ pub(crate) fn emit_summary(
     }
     emit_pty_census(ctx, s);
     if ctx.reads_process() {
+        // THE WARM SPARE (`crate::spare`): its state and age, its PTY, the
         // learned gate, adoptions, misses, discards and budgets.
         crate::spare::emit_metrics(s);
     }
@@ -2716,6 +2719,9 @@ pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink)
         );
     }
     if ctx.reads_process() {
+        // ECHO ROUND TRIP (audit item 5): the one slice on this line that is NOT
+        // aterm's own cost — bytes out to the PTY, first bytes back from the
+        // child. Emitted by `echo_rtt` itself so its percentiles can never be
         // published apart from the counters that qualify them.
         crate::echo_rtt::emit_metrics(s);
     }

@@ -39,7 +39,9 @@ pub fn fill(buf: &mut [u8]) -> io::Result<()> {
         buf,
         |chunk| {
             // `as *mut c_void` rather than `.cast()`, so the verifier sees the slice's
+            // provenance.
             // SAFETY: `chunk` is a live &mut [u8] for the call, valid for `chunk.len()`
+            // writes; `fill_from` hands over at most 256 bytes, getentropy(2)'s maximum.
             let rc =
                 unsafe { getentropy(chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len()) };
             rc == 0

@@ -339,6 +339,8 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
         }
     };
     if payload.len() != n {
+        // The header on stdout and nothing after it: a client that framed the
+        // reply as a status line and dropped every row — the rows are lost to
         // this reader, not malformed.
         if !header_on_stderr && payload.is_empty() {
             return Err(OffscreenError::NoHeader);

@@ -165,7 +165,6 @@ impl<'a> FeatureTableSubstitution<'a> {
         for record in self.records {
             if record.feature_index == feature_index {
                 let offset = record.feature.to_usize();
-                // TODO: set tag
                 return Feature::parse(Tag::from_bytes(b"DFLT"), self.data.get(offset..)?);
             }
         }

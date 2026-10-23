@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! agh's authenticated read door for an already-admitted development token.
-//! The synthetic identity source is private memory, never process environment.
+//! Authenticated `agh` read client for an admitted initial-setup development token.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt as _;
@@ -27,8 +26,6 @@ const CONFIG: &str = "[profiles.initial-setup-development]\n\
                       [default]\n\
                       read = ['initial-setup-development']\n";
 
-/// The only identity variable agh can read. Its retained copy is scrubbed on
-/// drop; agh consumes and scrubs each returned OsString in identity::load_env.
 struct AdmittedToken(Secret);
 
 impl EnvSource for AdmittedToken {
@@ -47,7 +44,6 @@ fn client(token: &Secret) -> Result<GithubBuilder, String> {
     );
     Ok(GithubBuilder::new(Router::from_validated(validated))
         .env(Arc::new(identity))
-        // Keep ordinary proxy routing separate from the isolated identity source.
         .transport(Arc::new(HttpTransport::new(Arc::new(ProcessEnv))))
         .caller("aterm-initial-setup")
         .retry(RetryPolicy::NONE)

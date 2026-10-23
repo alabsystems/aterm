@@ -563,6 +563,7 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
     };
     let mut unmarked = false;
     for entry in entries.flatten() {
+        // Numeric build dirs only, by the same test every other store scan uses: `current`
         // is a symlink, and `<n>.ready` / `<n>.provenance` / `<n>.shim-env` are files.
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
@@ -577,6 +578,7 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
         }
     }
     if unmarked {
+        // Ordered: every marker is gone before any tree goes; a lost removal leaves a
         // marked tree for the next uninstall to unmark again.
         sync_dir_ordered(prog_store);
     }
@@ -653,6 +655,7 @@ fn parse_declared_modes(bytes: &[u8]) -> Option<crate::tree::DeclaredModes> {
     let mut modes = crate::tree::DeclaredModes::new();
     for line in lines {
         if line.is_empty() {
+            // The trailing newline's empty tail; an empty line anywhere else is
             // equally content-free.
             continue;
         }
@@ -1147,11 +1150,13 @@ fn scratch_siblings(build_dir: &Path) -> Vec<(Scratch, PathBuf)> {
 
 /// Recover the one crash window a swap cannot make atomic; `true` when a tree was moved back.
 pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
+    // `symlink_metadata`, not `exists()`: a dangling symlink at the build path is still
     // something there, and the window means nothing is.
     if std::fs::symlink_metadata(build_dir).is_ok() {
         return false;
     }
     let mut superseded = scratch_siblings(build_dir).into_iter().filter(|(kind, p)| {
+        // A real directory, not a symlink to one: the outgoing tree the swap parked here is
         // a directory, and anything else is not the state this recovers.
         *kind == Scratch::Superseded && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
     });
@@ -1170,6 +1175,7 @@ pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     let recovered = recover_interrupted_swap(build_dir);
     let parked_only_copy = !recovered && std::fs::symlink_metadata(build_dir).is_err();
     for (kind, path) in scratch_siblings(build_dir) {
+        // Spare only a directory (what a swap parks); a file or symlink at that name is
         // nobody's only copy, and nothing else reclaims it.
         if parked_only_copy
             && kind == Scratch::Superseded
@@ -1375,6 +1381,9 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
         return default;
     }
     for anc in p.ancestors().filter(|a| under_home(a, home)) {
+        // A missing ancestor is the tail atpkg makes: the prefix `0700`, the directories on
+        // the way `0755` whatever the umask (`create_dir_all_unshared`), so the next resolve
+        // admits what this one created. `is_reparse` also catches a junction, which needs no
         // admin and reports `is_symlink() == false`.
         if let Ok(m) = std::fs::symlink_metadata(anc)
             && (crate::platform::is_reparse(&m) || !crate::platform::dir_meta_is_private(&m))
@@ -1600,7 +1609,7 @@ impl ToolName {
         Self::new(without_suffix(name, crate::platform::SHIM_SUFFIX))
     }
 
-    /// The logical name, for reporting (`status.toml`, refusal lists, log lines). not for building a path.
+    /// The logical name, for reporting (`status.toml`, refusal lists, log lines), not for building a path.
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {

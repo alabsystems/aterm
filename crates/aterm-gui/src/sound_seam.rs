@@ -27,7 +27,7 @@ pub(crate) use aterm_effects::sound_policy::{fold_window_audibility, user_lit};
 /// `SeamInputs::trail_on` for a resolved (pre-fold) config: `enabled` and a nonzero
 /// brightness knob. An aurora dimmed to zero is silent by design and reads `trail-off`,
 /// never `engine-silent` (the reason reserved for a gate with no name).
-pub(crate) fn trail_on(resolved: &aterm_effects::cursor_glow::GlowConfig) -> bool {
+pub(crate) const fn trail_on(resolved: &aterm_effects::cursor_glow::GlowConfig) -> bool {
     resolved.enabled && user_lit(resolved)
 }
 
@@ -124,7 +124,7 @@ impl SeamReason {
     ];
 
     /// The wire vocabulary: stable, greppable, lowercase kebab.
-    pub(crate) fn token(self) -> &'static str {
+    pub(crate) const fn token(self) -> &'static str {
         match self {
             Self::SoundsOff => "sounds-off",
             Self::VolumeZero => "volume-zero",

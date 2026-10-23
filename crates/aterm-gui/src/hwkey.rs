@@ -83,7 +83,7 @@ const FUNCTION_FLAGGED: &[u16] = &[
 
 /// US-QWERTY virtual keycode for a printable ASCII character: `(keycode, needs_shift)`.
 #[must_use]
-fn ansi_keycode(c: char) -> Option<(u16, bool)> {
+const fn ansi_keycode(c: char) -> Option<(u16, bool)> {
     let (base, shift) = match c {
         'A'..='Z' => (c.to_ascii_lowercase(), true),
         '!' => ('1', true),

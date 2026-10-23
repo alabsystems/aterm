@@ -151,7 +151,7 @@ pub(crate) fn signed_us_ms(us: i64) -> Decimal {
 
 /// A value already in milliseconds, to two places.
 #[must_use]
-pub(crate) fn ms_f64(ms: f64) -> Decimal {
+pub(crate) const fn ms_f64(ms: f64) -> Decimal {
     Decimal::new(ms, 2)
 }
 

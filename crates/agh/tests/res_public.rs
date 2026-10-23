@@ -4,8 +4,6 @@
 
 //! `public()` over agh-fake: the anonymous download host's probe and fetch.
 
-// The client holds the canonical config's dev profile, a private token file (plan §1, rule 12),
-// so a request that dropped its anonymity would carry the dev credential.
 #![cfg(unix)]
 
 use agh::download::part_path;
@@ -14,9 +12,7 @@ use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, Rep
 
 use crate::common;
 
-/// The repository: public.
 const APP: &str = "fixture-dev/app";
-/// The asset's bytes.
 const BYTES: &[u8] = b"public bytes";
 
 struct World {
@@ -26,8 +22,6 @@ struct World {
 }
 
 impl World {
-    /// A published `v1` holding `app.bin`; a client over the canonical config with the dev
-    /// token, which routes `fixture-dev/app` to dev: `public()` must send none of it.
     fn new(label: &str) -> World {
         let root = common::scratch(label);
         let fake = FakeGithub::start();
@@ -40,7 +34,6 @@ impl World {
         World { root, fake, gh }
     }
 
-    /// Every request was sent anonymous, and none carried a credential, at any origin.
     fn anonymous_throughout(&self) {
         assert_eq!(
             self.gh.meter().as_,

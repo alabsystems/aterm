@@ -11,10 +11,8 @@ const PAGE: Rgb = [0x0d, 0x11, 0x17];
 const INK: Rgb = [0xe6, 0xed, 0xf3];
 const EDGE: Rgb = [0x7a, 0x80, 0x87];
 const CARET: Rgb = [0xff, 0xcc, 0x00];
-/// A ribbon colour close to the ink: a glyph laid on it loses its contrast.
 const RIBBON: Rgb = [0xc8, 0xd0, 0xd8];
 
-/// 8 x 3 cells of 6 x 10 px from (2, 1), in a 52 x 32 frame.
 const GRID: Grid = Grid {
     ox: 2,
     oy: 1,
@@ -61,7 +59,6 @@ fn paint(img: &mut Image, b: PxBox, colour: Rgb) {
     }
 }
 
-/// A glyph: a 2 x 6 bar of ink with a one-pixel antialiased edge, in its cell.
 fn glyph(img: &mut Image, row: i64, col: i64) {
     let b = GRID.cell_box(row, col, 1);
     paint(
@@ -86,7 +83,6 @@ fn glyph(img: &mut Image, row: i64, col: i64) {
     );
 }
 
-/// The clean frame: `abc` on row 1, nothing else.
 fn clean_frame() -> Image {
     let mut img = Image::from_pixels(W, H, vec![PAGE; W * H]);
     for col in 0..3 {
@@ -95,7 +91,6 @@ fn clean_frame() -> Image {
     img
 }
 
-/// The clean frame with a caret filling (1, 3) and a ribbon under `c`'s ground.
 fn trail_frame() -> Image {
     let mut img = clean_frame();
     paint(&mut img, GRID.cell_box(1, 3, 1), CARET);
@@ -113,7 +108,6 @@ fn trail_frame() -> Image {
     img
 }
 
-/// A fresh directory for one test's files.
 fn scratch(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::SeqCst);
@@ -126,8 +120,6 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// The gallery's files for one frame: the PNG, its twin, text, cursor and a
-/// dims reply naming [`GRID`].
 fn gallery_files(dir: &Path, frame: &Image) -> PathBuf {
     let png = dir.join("x-dark.t0.png");
     std::fs::write(&png, encode_rgb(frame)).unwrap();

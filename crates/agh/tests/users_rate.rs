@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Users and the rate limit (design §6.7, §13.2): `me` as a profile, `get`, `/rate_limit`
-//! profiled and anonymous, and `agh rate`'s rows beside the rate book. Unix only: every test
-//! reads a private token file or the rate book.
+//! User identity and rate-limit tests.
 #![cfg(unix)]
 
 use agh::Call;
@@ -18,8 +16,7 @@ use aterm_json::Value;
 
 use crate::common;
 
-/// The second stderr line's `error` object.
-/// A fake holding `fixture-dev/app`, the canonical tokens registered, and the dev token file.
+/// A fake holding `fixture-dev/app` with canonical tokens registered.
 fn fake_with_dev(root: &std::path::Path) -> FakeGithub {
     let fake = FakeGithub::start();
     fake.add_repo("fixture-dev/app", RepoSpec::public());

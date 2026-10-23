@@ -878,7 +878,7 @@ pub enum Hold {
     Ask {
         /// The question's patience.
         for_: Duration,
-        /// The proof the decision row was asked.
+        /// The proof the decision row was asked for.
         seal: Persist,
     },
     /// Recorded, never on glass (managed-current repeats).
@@ -1058,7 +1058,8 @@ fn count_of(stats: &str) -> Option<(u64, u64)> {
 /// The continuous quantity behind a determinate fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Amount {
-    /// Which run of work.
+    /// Which run of work this is: [`Amount::series_of`] the deliverable's
+    /// label, so a new download is a new series.
     pub series: u64,
     /// How much is done.
     pub done: u64,
@@ -1577,7 +1578,8 @@ impl Message {
         self.finished_words().unwrap_or_else(|| self.title.clone())
     }
 
-    /// The row's words in the past tense, when there.
+    /// The row's words in the past tense, when there are any: the declared finished words,
+    /// else the title's participle read finished.
     #[must_use]
     pub fn finished_words(&self) -> Option<String> {
         match &self.finished {

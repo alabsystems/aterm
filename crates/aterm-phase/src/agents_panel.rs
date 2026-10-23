@@ -334,7 +334,7 @@ pub const fn text_hash(text: &str) -> u64 {
     h
 }
 
-/// Read one row of the agents panel (module docs).
+/// Read one row of the agents panel.
 #[must_use]
 pub fn parse_row(row: &str, width: Width) -> Option<PanelRow> {
     let cols = Cols { row, width };

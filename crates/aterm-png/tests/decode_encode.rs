@@ -394,6 +394,7 @@ fn decodes_the_whole_format_matrix_to_its_pinned_digest() {
                             Some(match color {
                                 0 => {
                                     // A grey sample value at the source depth. The
+                                    // shift is done in u32 because depth reaches 16.
                                     let max = ((1u32 << depth) - 1) as u16;
                                     let key = 1u16.min(max);
                                     key.to_be_bytes().to_vec()

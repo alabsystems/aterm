@@ -425,7 +425,8 @@ fn who_set_it_is_the_records_last_line_never_its_title() {
 
 /// ONLY AN INTERRUPT STANDS ON THE BAND (the owner, 2026-09-28: "there needs
 /// to be some clear reason why the user must be engaged and what the user
-/// should do...
+/// should do... don't continue to persist alerts to the user that are not
+/// actionable").
 #[test]
 fn only_an_interrupt_stands_on_the_band() {
     use aterm_agent::harness::upgrade::{Agent, GAVE_UP, Phase};

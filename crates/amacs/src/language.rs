@@ -119,7 +119,8 @@ impl LexState {
         commit: CommitPhase::Summary,
     };
 
-    /// The bracket nesting (`(`, ``, `{`) the line starts at, in Rust and TOML; zero in the other languages.
+    /// The bracket nesting (`(`, `[`, `{`) the line starts at, in Rust and
+    /// TOML; zero in the other languages.
     #[inline]
     #[must_use]
     pub const fn depth(self) -> u16 {

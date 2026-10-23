@@ -653,6 +653,7 @@ fn motion(shots: &[Shot], frame_ms: u64) -> Motion {
         }
         if let (Some(f), Some(last)) = (from, shots.last()) {
             // Still active at the end: only the span through the final sample is
+            // observed. No later present establishes how long it stayed on glass.
             out.push((f, last.ms - f));
         }
         out

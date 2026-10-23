@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The misuses that must END the process by name, and the one that must not.
-//! Each runs its fatal body in a child (this binary re-run on the one test,
-//! `support/reexec.rs`) and reads its exit and its stderr back:
-//!
-//! * a Rust panic inside a declared method that Foundation dispatched aborts
-//!   with the method's name instead of unwinding into Foundation;
-//! * the guard that reports it does not itself panic when stderr is gone;
-//! * an instance Objective-C minted by name, never through `alloc_init`, is
-//!   caught by the ivar-written flag before an all-zero slot is read;
-//! * a panicking `Drop` inside a block's captures aborts naming the block's
-//!   dispose helper;
-//! * and autoreleasing with no pool on the thread only LEAKS: the child must
-//!   survive it, which is what lets `autorelease`'s contract be safe.
+//! Subprocess tests for fatal and non-fatal Objective-C boundary misuse paths.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -27,13 +15,9 @@ use aterm_objc::{
 
 use crate::reexec;
 
-/// The [`MainThread`](aterm_objc::MainThread) witness, minted unchecked:
-/// libtest runs every test on a worker, so `MainThread::new()` answers `None`.
-/// Every class here touches no AppKit state and is created and released on the
-/// same worker, which is `new_unchecked`'s second obligation.
+/// The [`MainThread`](aterm_objc::MainThread) witness, minted unchecked.
 fn mtm() -> aterm_objc::MainThread {
-    // SAFETY: see this function's doc comment — the class has no main-thread
-    // affinity and its ivars are born and dropped on this one worker.
+    // SAFETY: see this function's doc comment.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
@@ -56,8 +40,7 @@ struct MintedIvars {
 }
 
 declare_class! {
-    /// Reached by name in the child, the way a nib or `NSClassFromString`
-    /// reaches a class, so `alloc_init` never writes its ivars.
+    /// Reached by name in the child.
     struct Minted: NSObject {
         const NAME: &str = "ATermObjcMintedProbe";
         type Ivars = MintedIvars;
@@ -70,15 +53,12 @@ declare_class! {
 }
 
 declare_class! {
-    /// A class to hand `Retained::autorelease` — the typed twin of the wrapper
-    /// on `Obj`, which is the second safe caller of the same function.
+    /// A class to hand `Retained::autorelease`.
     struct Bare: NSObject {
         const NAME: &str = "ATermObjcPoollessProbe";
         type Ivars = ();
     }
 }
-
-// A panic inside framework dispatch.
 
 /// Set in the child so it performs the panicking send instead of re-spawning.
 const PANIC_CHILD: &str = "ATERM_OBJC_PANIC_CHILD";
@@ -87,11 +67,7 @@ const PANIC_CHILD: &str = "ATERM_OBJC_PANIC_CHILD";
 fn a_panic_inside_a_declared_method_aborts_instead_of_unwinding_into_foundation() {
     if reexec::is_child(PANIC_CHILD) {
         let obj = Panicker::alloc_init(mtm(), ()).expect("+alloc/-init");
-        // Dispatched by Foundation, not by a direct call: `-performSelector:`
-        // puts a framework frame between the send and our trampoline, the
-        // shape `NSNotificationCenter` and AppKit's responder chain use.
-        // SAFETY: `-performSelector:` is `-(id)performSelector:(SEL)`, and the
-        // target is a live instance that declares `-boom`.
+        // SAFETY: `-performSelector:` is `-(id)performSelector:(SEL)`.
         unsafe {
             let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
             perform(obj.as_id(), sel!(performSelector:), sel!(boom));
@@ -121,14 +97,11 @@ fn a_panic_inside_a_declared_method_aborts_instead_of_unwinding_into_foundation(
     );
 }
 
-/// Set in the child: point fd 2 at a pipe with no reader, then panic inside a
-/// declared method.
+/// Set in the child.
 const BROKEN_STDERR: &str = "ATERM_OBJC_P3_BROKEN_STDERR";
 
 #[test]
 fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
-    // libSystem, linked into every process; declared here because this crate
-    // has no dependencies.
     unsafe extern "C" {
         fn pipe(fds: *mut i32) -> i32;
         fn dup2(old: i32, new: i32) -> i32;
@@ -136,10 +109,6 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
     }
 
     if reexec::is_child(BROKEN_STDERR) {
-        // Count panic-hook runs on stdout, which stays open. Exactly one panic
-        // should happen; a second means the guard panicked reporting the first
-        // (as `eprintln!` does on a broken fd 2), unwinding out of the
-        // `extern "C"` frame it exists to protect.
         static HOOKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         std::panic::set_hook(Box::new(|_| {
             let n = HOOKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -148,12 +117,7 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
             let _ = std::io::stdout().flush();
         }));
         let obj = Panicker::alloc_init(mtm(), ()).expect("+alloc/-init");
-        // Point fd 2 at a pipe and close both ends: every stderr write then
-        // fails with `EPIPE` (Rust ignores `SIGPIPE`). Merely closing fd 2 is
-        // not enough: Rust's `Stderr` keeps succeeding under the test harness.
-        // SAFETY: `fds` is a live two-element array; `dup2`/`close` take plain
-        // descriptors and this thread owns fd 2. Nothing after this point may
-        // rely on stderr, which is the property under test.
+        // SAFETY: `fds` is a live two-element array.
         unsafe {
             let mut fds = [0_i32; 2];
             assert_eq!(pipe(fds.as_mut_ptr()), 0, "pipe()");
@@ -191,20 +155,13 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
     );
 }
 
-// An instance Objective-C minted, caught by the ivar-written flag.
-
 /// Set in the child so it mints an instance the way Objective-C would.
 const OBJC_MINTED_CHILD: &str = "ATERM_OBJC_MINTED_CHILD";
 
 #[test]
 fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
-    // The initialised flag is checked in release builds too: ObjC code can
-    // `+alloc`/`-init` the class by name without reaching `alloc_init`, leaving
-    // an all-zero ivar slot. The assert turns that into a named abort.
     if reexec::is_child(OBJC_MINTED_CHILD) {
-        // SAFETY: `+alloc` and `-init` on a registered class reached by name,
-        // then a message the class declares: what a nib or
-        // `NSClassFromString` does, and what the flag guards.
+        // SAFETY: `+alloc` and `-init` on a registered class reached by name.
         let _ = Minted::class();
         unsafe {
             let cls: ClassPtr = class(c"ATermObjcMintedProbe");
@@ -219,7 +176,6 @@ fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
         }
         return;
     }
-    // Force the class to exist in the child by touching it here too.
     let _ = Minted::class();
     let out = reexec::rerun(
         module_path!(),
@@ -243,14 +199,10 @@ fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
     );
 }
 
-// A panicking `Drop` inside a block's captures: the one `extern "C"` callback
-// that once had no panic guard.
-
 /// Set in the child so it runs the body instead of re-spawning.
 const CHILD_DISPOSE: &str = "ATERM_OBJC_BLOCK_DISPOSE_PANIC_CHILD";
 
-/// A capture whose `Drop` panics — the only way to reach `dispose_helper` with
-/// an unwind, since `dispose` runs nothing else of the user's.
+/// A capture whose `Drop` panics.
 struct PanicsOnDrop;
 impl Drop for PanicsOnDrop {
     fn drop(&mut self) {
@@ -262,16 +214,13 @@ impl Drop for PanicsOnDrop {
 fn a_panicking_drop_in_a_block_capture_aborts_by_name() {
     if reexec::is_child(CHILD_DISPOSE) {
         let bomb = PanicsOnDrop;
-        // SAFETY: a no-argument block that is never invoked; the only thing
-        // this test needs from it is that releasing it runs `dispose_helper`,
-        // which drops the capture.
+        // SAFETY: a no-argument block that is never invoked.
         let block = unsafe {
             RcBlock::new0(move || {
                 let _keep = &bomb;
             })
         }
         .expect("_Block_copy");
-        // Last release -> `dispose_helper` -> `drop_in_place` -> panic.
         drop(block);
         println!("SURVIVED-THE-PANICKING-DISPOSE");
         return;
@@ -295,10 +244,6 @@ fn a_panicking_drop_in_a_block_capture_aborts_by_name() {
         Some(reexec::ABORTED),
         "expected an abort\nstdout: {stdout}\nstderr: {stderr}"
     );
-    // It aborted BEFORE the guard, too — through Rust's own
-    // `extern "C"` shim, with "thread caused non-unwinding panic. aborting.",
-    // which names neither this crate nor this callback. The guard makes it say
-    // which one, exactly as `invoke`, `__tramp` and `__dealloc` already did.
     assert!(
         stderr.contains("panic escaped Objective-C method `block dispose`"),
         "aborted, but not through `abort_on_unwind` with the callback's \
@@ -306,21 +251,12 @@ fn a_panicking_drop_in_a_block_capture_aborts_by_name() {
     );
 }
 
-// Autoreleasing with no pool: a leak, and nothing worse. `autorelease`'s
-// contract says so, and this is the arming: a child that does it and lives.
-
 /// Set in the child so it runs the body instead of re-spawning.
 const CHILD_NO_POOL: &str = "ATERM_OBJC_AUTORELEASE_NO_POOL_CHILD";
 
 #[test]
 fn autoreleasing_with_no_pool_leaks_and_that_is_all_it_does() {
     if reexec::is_child(CHILD_NO_POOL) {
-        // NOT inside `autoreleasepool`, and nothing above this frame pushed a
-        // pool either — a libtest worker thread starts with an empty pool
-        // stack. Both safe wrappers run here. Under the OLD `# Safety` text
-        // ("There must be a pool on this thread's stack") both of these lines
-        // were unsound-by-contract, and neither of them can uphold it, because
-        // neither can see its caller's stack.
         let s = ns_string("no pool anywhere").expect("NSString");
         let borrowed: Id = s.autorelease();
         assert!(!borrowed.is_null());
@@ -329,10 +265,6 @@ fn autoreleasing_with_no_pool_leaks_and_that_is_all_it_does() {
         let borrowed2: Id = typed.autorelease();
         assert!(!borrowed2.is_null());
 
-        // The object is not merely un-crashed, it is ALIVE: the runtime leaked
-        // it rather than freeing it, so a message still lands. If the +1 had
-        // been dropped this would be a use-after-free and the child would die,
-        // which is the outcome the parent asserts against.
         // SAFETY: `-length` on a live NSString, whose prototype this is.
         let len = unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();

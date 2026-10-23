@@ -49,7 +49,7 @@ pub(crate) struct InputAct {
 
 impl InputAct {
     /// The mark of an input with `act` whose acceptance came to `bound`.
-    pub(crate) fn of_acceptance(
+    pub(crate) const fn of_acceptance(
         act: Option<aterm_slog::ActWord>,
         bound: aterm_slog::Binding,
     ) -> InputAct {
@@ -209,7 +209,7 @@ impl SessionLog {
     /// reads `Exited`): its program ended and the exit path is running, so
     /// the retire that writes the session's close (`close - spawn
     /// out=shell-exit code=`) may follow.
-    pub(crate) fn note_close_due(&mut self) {
+    pub(crate) const fn note_close_due(&mut self) {
         self.consumers.close_due = true;
     }
 

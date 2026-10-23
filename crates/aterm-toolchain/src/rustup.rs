@@ -135,8 +135,6 @@ mod tests {
         );
     }
 
-    /// PATH first, then `$CARGO_HOME/bin`, then `~/.cargo/bin`, then the keg when one
-    /// is given; a relative entry and a non-executable `rustup` are passed over.
     #[cfg(unix)]
     #[test]
     fn rustup_is_found_on_path_then_where_rustup_installs_itself() {

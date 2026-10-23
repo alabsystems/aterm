@@ -85,6 +85,7 @@ pub fn run(args: &[String], ctx: &mut Ctx) -> u8 {
         },
         Ok(Parsed::ReplayTaped(global)) => {
             // The tape is read once, here, and handed to the run: a tape that cannot be read
+            // twice (a pipe, `/dev/stdin`, a FIFO) replays as a file does.
             let tape = match taping::read_taped(&global) {
                 Ok(tape) => tape,
                 Err(e) => return out::fail(ctx, "-", &e),

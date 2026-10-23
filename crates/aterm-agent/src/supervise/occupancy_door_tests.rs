@@ -9,14 +9,15 @@ use super::*;
 use crate::supervise::config::Autopilot;
 use crate::supervise::occupancy::reading::LOOK_EVERY_MS;
 use crate::supervise::occupancy::rules::{RuleId, WOULD_RULE};
-use crate::supervise::occupancy::{OccupancyReading, SlotsSeen};
+use crate::supervise::occupancy::{OccupancyReading, OccupancySaid, SaidVerdict, SlotsSeen};
 use crate::supervise::policy::turn_end::Reach;
 
-/// A host whose board reads `reading`, counting the asks.
+/// A host whose board reads `reading`, counting the asks and keeping what the door told it.
 #[derive(Debug, Default)]
 struct Board {
     reading: std::sync::Mutex<OccupancyReading>,
     asks: AtomicUsize,
+    said: std::sync::Mutex<Vec<OccupancySaid>>,
 }
 
 impl Board {
@@ -24,7 +25,12 @@ impl Board {
         Arc::new(Self {
             reading: std::sync::Mutex::new(reading),
             asks: AtomicUsize::new(0),
+            said: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    fn said(&self) -> Vec<OccupancySaid> {
+        self.said.lock().expect("the said").clone()
     }
 
     fn asks(&self) -> usize {
@@ -45,6 +51,9 @@ impl IdleHost for Board {
     fn occupancy(&self) -> OccupancyReading {
         self.asks.fetch_add(1, Ordering::SeqCst);
         self.reading.lock().expect("the board").clone()
+    }
+    fn occupancy_said(&self, said: &OccupancySaid) {
+        self.said.lock().expect("the said").push(said.clone());
     }
 }
 
@@ -147,6 +156,8 @@ struct Day {
     would: Vec<(String, i64)>,
     requests: Vec<String>,
     asks: usize,
+    /// What the door told its host ([`IdleHost::occupancy_said`]).
+    said: Vec<OccupancySaid>,
 }
 
 /// A held session's day: one break, read at each of `at_s` (seconds from its start, the read's
@@ -224,6 +235,7 @@ fn day_on(
         would,
         requests: m.requests,
         asks,
+        said: host.said(),
     }
 }
 
@@ -300,6 +312,89 @@ fn the_f1_day_under_observe_books_what_would_go_and_types_nothing() {
             .any(|p| r.starts_with(p))),
         "{:?}",
         d.requests
+    );
+}
+
+/// THE DOOR TELLS ITS HOST ONCE A CHANGE (design §6, `IdleHost::occupancy_said`): the F1 day
+/// under `observe`, read every five minutes, tells the host the hold, each would-be line and
+/// the ready proxy as they change, never the same twice running, and far fewer times than it
+/// reads; what it asks the server is what `off` asks. NEGATIVE CONTROL: under `off` nothing is
+/// told.
+#[test]
+fn the_door_tells_its_host_once_a_change() {
+    let reads = every(0, 6 * 3600, 300);
+    let observe = hosted(30).policy;
+    let d = day(
+        "door-said",
+        true,
+        Some(observe.clone()),
+        false,
+        room(),
+        &reads,
+        &mut nothing_before,
+    );
+    assert!(!d.said.is_empty(), "the door told its host");
+    assert!(d.said.len() < reads.len() / 4, "{} tells", d.said.len());
+    for pair in d.said.windows(2) {
+        assert!(!pair[0].same_change(&pair[1]), "told twice: {pair:#?}");
+    }
+    for said in &d.said {
+        assert_eq!(said.mode, Occupancy::Observe);
+        assert_eq!(said.hold_word(), "undeclared", "{said:#?}");
+        assert!(
+            said.spent_under_prompt().is_empty(),
+            "observe spends nothing the owner sees"
+        );
+    }
+    let since = d.said[0].hold.expect("the hold").since_ms;
+    assert!(
+        d.said
+            .iter()
+            .all(|s| s.hold.map(|h| h.since_ms) == Some(since)),
+        "one hold all day"
+    );
+    let told = |rule: RuleId, verdict: SaidVerdict| {
+        d.said
+            .iter()
+            .filter(|s| s.rules[rule.index()].verdict == verdict)
+            .count()
+    };
+    assert!(
+        told(RuleId::WaitNudge, SaidVerdict::Would) >= 1,
+        "{:#?}",
+        d.said
+    );
+    assert!(
+        told(RuleId::HoldRoom, SaidVerdict::Would) >= 1,
+        "{:#?}",
+        d.said
+    );
+    // The ready proxy: told once the hold passed hold-room's two hours on a board with room.
+    let first_ready = d.said.iter().position(|s| s.ready).expect("ready told");
+    let at_ready = &d.said[first_ready];
+    assert!(
+        at_ready.at_ms - since >= crate::supervise::occupancy::rules::HOLD_ROOM_AFTER_MS,
+        "{at_ready:#?}"
+    );
+    assert!(d.said[..first_ready].iter().all(|s| !s.ready));
+
+    let off = SupervisorConfig {
+        occupancy: Occupancy::Off,
+        ..observe
+    };
+    let quiet = day(
+        "door-said-off",
+        true,
+        Some(off),
+        false,
+        room(),
+        &reads,
+        &mut nothing_before,
+    );
+    assert!(quiet.said.is_empty(), "off tells nothing");
+    assert_eq!(
+        d.requests, quiet.requests,
+        "the tell asks the server nothing"
     );
 }
 
@@ -1016,11 +1111,17 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
             None
         }
     };
+    // What the door tells its host (1e's `host.occupancy_said`) is the door's too: an emit of
+    // its own, with no stamp.
+    let is_said = |i: &Item| matches!(i.record(), Some(EffectRecord::Emit { door, .. }) if door == "host.occupancy_said");
     let mut removed = vec![false; items.len()];
-    let (mut journals, mut ledgers) = (0, 0);
+    let (mut journals, mut ledgers, mut saids) = (0, 0, 0);
     for (at, item) in items.iter().enumerate() {
         if is_board(item) {
             removed[at] = true;
+        } else if is_said(item) {
+            removed[at] = true;
+            saids += 1;
         } else if let Some(kind) = new_rule_output(item) {
             let stamp = at.checked_sub(1).expect("a rule row follows its stamp");
             assert!(
@@ -1040,10 +1141,11 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     }
     assert_eq!(journals, 1, "the nudge's journal row");
     assert_eq!(ledgers, 1, "the nudge's would row");
+    assert!(saids >= 1, "the door told its host");
     assert_eq!(
         removed.iter().filter(|gone| **gone).count(),
-        asks + 2 * (journals + ledgers),
-        "only board exchanges and identified row/stamp pairs"
+        asks + saids + 2 * (journals + ledgers),
+        "only board exchanges, the host's tells and identified row/stamp pairs"
     );
     let before_door: Vec<Item> = items
         .iter()
@@ -1163,5 +1265,164 @@ fn a_prompt_tape_from_a_build_with_no_write_replays_as_observe() {
         matches!(replayed(&rewritten(false)), Verdict::Diverged(_)),
         "this build's doors under prompt: the write"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A TAPE FROM A BUILD WITH THE DOOR BUT NO TELL REPLAYS WITHOUT THE TELLS (the tests review's
+/// F1): a 1b–1d build named `host.occupancy` among its doors but not `host.occupancy_said`, and
+/// told its host nothing, so a replay of its tape tells nothing either — not a break's word,
+/// not a close's, not the loop end's. NEGATIVE CONTROL: the same records under a header that
+/// names the tell's door are this build's, whose tells the records lack: DIVERGED.
+#[test]
+fn a_tape_from_a_build_with_no_tell_replays_without_the_tells() {
+    use crate::supervise::tape::codec::Item;
+    use crate::supervise::tape::recover::recover;
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+    use astream_effects::EffectRecord;
+
+    let (dir, ledger) = ledger_at("door-pre-said-tape");
+    let board = Board::reading(OccupancyReading::default());
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+        ledger: Some(ledger.clone()),
+        journal: Some(dir.join("journal.jsonl")),
+        ..hosted(35 * 60)
+    };
+    let mut m = Mock::new(vec![break_screen()]);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    let is_said = |i: &Item| {
+        matches!(i.record(), Some(EffectRecord::Emit { door, .. })
+            if door == "host.occupancy_said")
+    };
+    assert!(items.iter().any(is_said), "this build told its host");
+    let kept: Vec<Item> = items.iter().filter(|i| !is_said(i)).cloned().collect();
+    let older: String = header
+        .lines()
+        .map(|line| match line.strip_prefix("host_doors=") {
+            Some(doors) => format!(
+                "host_doors={}\n",
+                doors
+                    .split(' ')
+                    .filter(|d| *d != "host.occupancy_said")
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            None => format!("{line}\n"),
+        })
+        .collect();
+    let doors: Vec<&str> = older
+        .lines()
+        .find_map(|l| l.strip_prefix("host_doors="))
+        .expect("the header names its doors")
+        .split(' ')
+        .collect();
+    assert!(
+        doors.contains(&"host.occupancy") && !doors.contains(&"host.occupancy_said"),
+        "{doors:?}"
+    );
+    let report = replay(&written(&older, &kept), &Options::default()).expect("replayed");
+    assert_eq!(report.verdict, Verdict::Reproduced, "{}", report.render());
+    let report = replay(&written(&header, &kept), &Options::default()).expect("replayed");
+    assert!(
+        matches!(report.verdict, Verdict::Diverged(_)),
+        "{}",
+        report.render()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A CLOSED HOLD IS TOLD (the tests review's F3): the agent's own wake ends the hold the door
+/// told its host, and the host is told it closed, so `occupancy_hold=` and `occupancy why` no
+/// longer show it. NEGATIVE CONTROL: the word told before the close names the hold.
+#[test]
+fn a_closed_hold_is_told_to_the_host() {
+    let (dir, path) = ledger_at("door-close-told");
+    let mut m = Mock::new(Vec::new());
+    let host = Board::reading(room());
+    let before = {
+        let (mut s, clock) = hold_session(
+            &mut m,
+            &path,
+            Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            Duration::ZERO,
+        );
+        let opts = hosted(30);
+        let cfg = Some(&opts.policy);
+        let mut heard = Heard::default();
+        let mut at_ms = T0;
+        let mut since = None;
+        for (seq, at) in [(1, 0), (2, 31 * MIN)] {
+            let ahead = T0 + at - at_ms;
+            skip(&clock, &mut at_ms, ahead);
+            s.host_steps_in_background(
+                &screen_at(seq, break_screen()),
+                &mut since,
+                cfg,
+                &mut heard,
+            )
+            .expect("the break's step");
+        }
+        let before = host.said();
+        s.took(3, cfg, &mut heard);
+        before
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    let told = before.last().expect("the door told its host");
+    assert_eq!(told.hold_word(), "undeclared", "{before:#?}");
+    let said = host.said();
+    assert_eq!(
+        said.len(),
+        before.len() + 1,
+        "the close, told once: {said:#?}"
+    );
+    let closed = said.last().expect("told");
+    assert_eq!(closed.hold, None, "{said:#?}");
+    assert_eq!(closed.hold_word(), "none");
+    assert!(!closed.ready);
+}
+
+/// THE LOOP'S END IS TOLD (the safety review's F2): a hosted watch that ends with its hold open
+/// — as a policy whose occupancy moved ends a tab's loop, handing it to a successor that under
+/// `off` tells nothing — tells its host no hold, once, so the window's board counts none in
+/// `occupancy_hold=` or `ready=`; the tape replays it. NEGATIVE CONTROL: the word before it
+/// names the open hold.
+#[test]
+fn a_loop_that_ends_tells_its_host_no_hold() {
+    use crate::supervise::tape::testing::assert_replays;
+
+    let (dir, ledger) = ledger_at("door-end-told");
+    let board = Board::reading(OccupancyReading::default());
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+        ledger: Some(ledger.clone()),
+        journal: Some(dir.join("journal.jsonl")),
+        ..hosted(35 * 60)
+    };
+    let mut m = Mock::new(vec![break_screen()]);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    let said = board.said();
+    let (last, before) = said.split_last().expect("the door told its host");
+    assert_eq!(last.hold, None, "{said:#?}");
+    assert!(!last.ready && last.guards.is_none(), "{last:#?}");
+    assert!(
+        before.last().and_then(|s| s.hold).is_some(),
+        "the open hold was told: {said:#?}"
+    );
+    assert_eq!(
+        said.iter().filter(|s| s.hold.is_none()).count(),
+        1,
+        "told once: {said:#?}"
+    );
+    assert_replays(&run.tape, &run.header, &run.sent, &run.lines);
     let _ = std::fs::remove_dir_all(&dir);
 }

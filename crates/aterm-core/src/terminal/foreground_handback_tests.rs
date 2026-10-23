@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tests for [`Terminal::foreground_handback`]: a program killed while it held
-//! the terminal (alt screen, kitty flags, modifyOtherKeys, mouse tracking,
-//! focus, 2026, a hidden cursor) must not leave those modes armed under the
-//! shell that reclaims it.
+//! Tests for [`Terminal::foreground_handback`] and [`Terminal::manual_handback`].
 
 use aterm_types::keyboard::{Key, Modifiers, encode_key};
 use aterm_types::mouse::{MouseEncoding, MouseMode};
@@ -17,9 +14,6 @@ fn ctrl7(t: &Terminal) -> Vec<u8> {
     encode_key(&Key::Character('7'), Modifiers::CTRL, t.keyboard_mode())
 }
 
-/// A killed Claude Code session's terminal, in either kitty order (push after
-/// entering the alt screen, as Claude Code does, or before it). Ends mid-OSC (a
-/// title write torn by the kill).
 fn dead_claude(push_after: bool) -> Terminal {
     let mut t = Terminal::new(24, 80);
     t.process(b"% claude\r\n");
@@ -34,12 +28,9 @@ fn dead_claude(push_after: bool) -> Terminal {
     t
 }
 
-/// Everything the handback is responsible for, as one comparable value.
 fn projection(t: &Terminal) -> impl PartialEq + core::fmt::Debug + use<> {
     let region = t.grid().scroll_region();
     let mut kitty = t.kitty_keyboard.snapshot();
-    // The inactive alt slot is never touched; after an alt round trip
-    // it reads `Some(0)` where a fresh terminal reads `None` — the same flags.
     if kitty.alt_saved_flags.is_some_and(|f| f.bits() == 0) {
         kitty.alt_saved_flags = None;
     }
@@ -71,8 +62,6 @@ fn foreground_handback_incident_is_handed_back_once_in_both_kitty_orders() {
         );
 
         let h = t.foreground_handback().expect("the gate is open");
-        // Claude Code pushes on the alt screen; the other order pushes on main
-        // and 1049h parks the flags in main's saved slot.
         let kitty = if push_after { "kitty-alt" } else { "kitty" };
         for name in [
             "parser",
@@ -117,7 +106,6 @@ fn foreground_handback_incident_is_handed_back_once_in_both_kitty_orders() {
         );
         assert_eq!(t.foreground_handback(), None, "a second call sends nothing");
 
-        // The next alt-screen program starts with clean kitty flags.
         t.process(b"\x1b[?1049h");
         assert_eq!(
             t.kitty_keyboard_flags().bits(),
@@ -126,7 +114,6 @@ fn foreground_handback_incident_is_handed_back_once_in_both_kitty_orders() {
         );
         t.process(b"\x1b[?1049l");
 
-        // The shell's own post-reclaim setup lands after the handback and wins.
         t.process(b"zsh: killed     claude\r\n% \x1b[?2004h");
         assert!(t.modes().bracketed_paste, "zle's 2004h survives");
         assert_eq!(
@@ -252,13 +239,6 @@ fn foreground_handback_torn_sequence_alone_gets_only_can() {
     }
 }
 
-/// A holder that dies inside a tmux passthrough wrapper (a tab that inherited
-/// `TMUX` with no tmux in it, `aterm_parser::TmuxPassthrough`) is handed back
-/// with the `CAN`, then the `ESC \` that ends the wrapper: a `CAN` alone ends
-/// only the payload's sequence, and the next holder's doubled ESC would still
-/// read as one and its `ESC \` would end the wrapper instead of its own string;
-/// the wrapper's end first would end the torn string as at its ST (a torn
-/// title set, a torn sixel placed).
 #[test]
 fn foreground_handback_ends_a_tmux_wrapper_it_left_open() {
     for (torn, bytes) in [
@@ -283,7 +263,6 @@ fn foreground_handback_ends_a_tmux_wrapper_it_left_open() {
             .filter(|&(r, c)| grid.cell_extra(r, c).is_some_and(|e| e.image().is_some()))
             .count();
         assert_eq!(images, 0, "{label:?}: the torn sixel is not placed");
-        // The next holder's own title, ST-ended, then its prompt.
         t.process(b"\x1b]2;shell\x1b\\% ");
         assert_eq!(t.title(), "shell", "{label:?}");
         assert_eq!(t.row_text(0).unwrap().trim_end(), "%", "{label:?}");
@@ -307,7 +286,6 @@ fn foreground_handback_leaves_vt52_before_any_csi() {
 
 #[test]
 fn foreground_handback_clears_margins_and_keeps_the_cursor() {
-    // DECOM + region on the main screen.
     let mut t = Terminal::new(24, 80);
     t.process(b"\x1b[?1000h\x1b[3;20r\x1b[?6h\x1b[5;7H");
     let before = (t.grid().cursor_row(), t.grid().cursor_col());
@@ -318,7 +296,6 @@ fn foreground_handback_clears_margins_and_keeps_the_cursor() {
     let region = t.grid().scroll_region();
     assert_eq!((region.top, region.bottom), (0, 23));
 
-    // DECSTBM set on alt is copied onto main by 1049l (handler_dec).
     let mut t = Terminal::new(24, 80);
     t.process(b"ab\r\ncd\x1b[?1049h\x1b[?25l\x1b[5;10r\x1b[?1049l");
     let region = t.grid().scroll_region();
@@ -351,7 +328,6 @@ fn foreground_handback_targets_the_host_configured_values() {
     );
     assert_eq!(t.foreground_handback(), None);
 
-    // A program turned all three off and hid the cursor.
     t.process(b"\x1b[?1004l\x1b[?2004l\x1b[?7l\x1b[?25l");
     let h = t.foreground_handback().expect("owned");
     assert!(
@@ -379,11 +355,8 @@ fn foreground_handback_replays_to_the_live_state() {
     }
 }
 
-/// A handback returns mode 1007 (alternate scroll) to the host's value rather
-/// than resetting it, so the wheel keeps scrolling `less`.
 #[test]
 fn foreground_handback_restores_alternate_scroll_to_the_host_value() {
-    // The host turned 1007 on; a program that never touched it died hidden.
     let mut t = Terminal::new(24, 80);
     t.set_host_alternate_scroll(true);
     t.process(b"\x1b[?25l");
@@ -400,22 +373,17 @@ fn foreground_handback_restores_alternate_scroll_to_the_host_value() {
     );
     assert!(t.modes().alternate_scroll, "the host's ON survives");
 
-    // A program switched it off and died: it comes back on.
     t.process(b"\x1b[?1007l\x1b[?1049h");
     let h = t.foreground_handback().expect("alt screen");
     assert!(h.reverted.contains(&"alternate-scroll"), "{:?}", h.reverted);
     assert!(t.modes().alternate_scroll);
 
-    // With no host baseline the power-on off is the target, as before.
     let mut t = Terminal::new(24, 80);
     t.process(b"\x1b[?1007h\x1b[?25l");
     t.foreground_handback().expect("hidden cursor");
     assert!(!t.modes().alternate_scroll);
 }
 
-/// `restore_modes = false`: the program that lost the terminal is gone, but
-/// the modes in force belong to one that still runs (the host's call). Only a
-/// torn sequence is cancelled; every mode stays.
 #[test]
 fn foreground_handback_scoped_without_modes_only_cancels_a_torn_sequence() {
     let mut t = dead_claude(true);
@@ -436,10 +404,6 @@ fn foreground_handback_scoped_without_modes_only_cancels_a_torn_sequence() {
     );
 }
 
-/// Kitty flags pushed on the main screen before `?1049h` count as the
-/// program's input bit even while the alt screen hides them, so a program that
-/// pushed, entered the alt screen and died is handed back. Negative control:
-/// the same program without the push owns no input bit.
 #[test]
 fn foreground_handback_main_screen_kitty_flags_under_the_alt_screen_are_evidence() {
     let mut t = Terminal::new(24, 80);
@@ -462,17 +426,11 @@ fn foreground_handback_main_screen_kitty_flags_under_the_alt_screen_are_evidence
     );
 }
 
-/// A `cat` of a file at a prompt
-/// that does not parse the brackets (macOS `/bin/bash` 3.2, dash) can plant the
-/// clipboard with OSC 52 and arm 2004. Left on, the next Cmd-V would skip the
-/// multi-line paste guard. The `?2004h` is an
-/// input bit, so `cat`'s exit hands it back.
 #[test]
 fn foreground_handback_a_one_shot_that_armed_bracketed_paste_is_handed_back() {
     let mut t = Terminal::new(24, 80);
     t.process(b"bash-3.2$ ");
     assert_eq!(t.take_evidence_asserted(), 0);
-    // OSC 52 with "true\ntouch /tmp/x\n", then the 2004 the reader never asked for.
     t.process(b"\x1b]52;c;dHJ1ZQp0b3VjaCAvdG1wL3gK\x07\x1b[?2004hREADME\r\n");
     assert_ne!(
         t.take_evidence_asserted() & super::evidence::INPUT,
@@ -484,13 +442,6 @@ fn foreground_handback_a_one_shot_that_armed_bracketed_paste_is_handed_back() {
     assert!(!t.modes().bracketed_paste);
 }
 
-// The manual reset: `Terminal::manual_handback`, the engine half of the
-// `reset` control verb and Edit ▸ Reset Terminal.
-
-/// A live zsh prompt drawn under a dead program's modes, where the only holder
-/// the reader sees is the live shell. Returns the terminal and the main
-/// screen's scrollback line count before the modes were armed, so tests can
-/// prove the reset never touches the scrollback.
 fn stuck_live_prompt() -> (Terminal, usize) {
     let sb = aterm_scrollback::Scrollback::new(64, 512, 8_000_000);
     let mut t = Terminal::with_scrollback(24, 80, 64, sb);
@@ -503,10 +454,6 @@ fn stuck_live_prompt() -> (Terminal, usize) {
     (t, history)
 }
 
-/// A shifted charset, an open OSC 8 link and a torn escape sequence carry no
-/// evidence: the automatic handback cannot reach them, the manual one hands
-/// each back. Negative control: the gated path on an identical terminal sends
-/// only the torn sequence's `CAN`.
 #[test]
 fn manual_handback_reaches_what_the_evidence_gate_cannot() {
     let arm = |t: &mut Terminal| {
@@ -531,7 +478,6 @@ fn manual_handback_reaches_what_the_evidence_gate_cannot() {
     assert_eq!(h.bytes.first(), Some(&0x18), "CAN first");
     assert!(t.parser_is_ground());
     assert!(t.current_hyperlink().is_none(), "the link is closed");
-    // The next text prints as ASCII, unlinked.
     t.process(b"\r\nqx");
     let row = t.grid().cursor_row() as usize;
     assert_eq!(
@@ -541,9 +487,6 @@ fn manual_handback_reaches_what_the_evidence_gate_cannot() {
     );
 }
 
-/// Every input-hijacking mode goes, the alt screen is
-/// left, the cursor shows, and neither the scrollback nor the main screen
-/// loses a line. Ctrl+7 reaches the prompt as the legacy byte, not CSI-u.
 #[test]
 fn manual_handback_hands_the_stuck_prompt_back_without_clearing_anything() {
     let (mut t, history) = stuck_live_prompt();
@@ -577,11 +520,8 @@ fn manual_handback_hands_the_stuck_prompt_back_without_clearing_anything() {
     );
 }
 
-/// A second reset has nothing to send; a replay of the recorded bytes
-/// reaches the live state (the host records them as `RawIn`).
 #[test]
 fn manual_handback_is_idempotent_and_replays_to_the_live_state() {
-    // The stuck prompt also wears a program's palette entry and background.
     let coloured = || {
         let (mut t, _) = stuck_live_prompt();
         t.set_allow_palette_reconfigure(true);
@@ -616,12 +556,6 @@ fn manual_handback_is_idempotent_and_replays_to_the_live_state() {
     );
 }
 
-/// A manual reset puts back every theme colour a program set (palette,
-/// background, cursor) with exactly the OSC resets that clear them, and keeps
-/// the colour stack, whose later pop is the program's own business. A second
-/// reset finds nothing, and the bytes replay to the same colours. Negative
-/// control: the automatic handback, on the same coloured terminal with a
-/// program owning modes, never touches colours.
 #[test]
 fn manual_handback_puts_program_colours_back_and_keeps_the_stack() {
     const PUSHED_P1: aterm_types::Rgb = aterm_types::Rgb::new(0x11, 0x22, 0x33);
@@ -637,7 +571,6 @@ fn manual_handback_puts_program_colours_back_and_keeps_the_stack() {
         t.process(
             b"\x1b]4;1;rgb:11/22/33\x1b\\\x1b]11;rgb:01/02/03\x1b\\\x1b]12;rgb:aa/bb/cc\x1b\\",
         );
-        // Push the colours, then set another palette entry over the push.
         t.process(b"\x1b]30001\x1b\\\x1b]4;2;rgb:44/55/66\x1b\\");
         t
     };
@@ -658,12 +591,10 @@ fn manual_handback_puts_program_colours_back_and_keeps_the_stack() {
         "the theme's entry, not xterm's"
     );
 
-    // Idempotent: nothing left to put back.
     let again = t.manual_handback();
     assert!(again.bytes.is_empty(), "{again:?}");
     assert!(again.reverted.is_empty());
 
-    // Replay: the bytes alone reach the same colours.
     let mut replay = coloured();
     replay.process(&h.bytes);
     assert_eq!(
@@ -671,11 +602,9 @@ fn manual_handback_puts_program_colours_back_and_keeps_the_stack() {
         t.program_color_overrides()
     );
 
-    // The stack was kept: the program's pop restores what it pushed.
     t.process(b"\x1b]30101\x1b\\");
     assert_eq!(t.palette_color(1), PUSHED_P1, "the push survived the reset");
 
-    // Negative control: the automatic handback leaves colours alone.
     let mut auto = coloured();
     auto.process(b"\x1b[?1049h\x1b[?1003h");
     assert!(
@@ -690,9 +619,6 @@ fn manual_handback_puts_program_colours_back_and_keeps_the_stack() {
     assert_eq!(auto.program_color_overrides(), before);
 }
 
-/// Every setter of an evidence bit is reported, even over a mode already in
-/// force, and each call takes what it reports, so a job that re-arms mouse
-/// tracking over a stale `?1000h` owns the bit and its death hands it back.
 #[test]
 fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
     use super::evidence::{
@@ -709,7 +635,6 @@ fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
     assert_eq!(t.program_evidence(), MOUSE);
     assert_eq!(t.take_evidence_asserted(), MOUSE);
     assert_eq!(t.take_evidence_asserted(), 0, "taken");
-    // The re-arm: the evidence does not move, the assertion does.
     t.process(b"\x1b[?1003h");
     assert_eq!(t.program_evidence(), MOUSE, "the evidence cannot see it");
     assert_eq!(t.take_evidence_asserted(), MOUSE, "the assertion can");
@@ -720,7 +645,6 @@ fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
         "an identical re-send too"
     );
 
-    // Every setter, one per bit.
     for (bytes, bit) in [
         (&b"\x1b[?1049h"[..], ALT_SCREEN),
         (b"\x1b[?47h", ALT_SCREEN),
@@ -744,7 +668,6 @@ fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
         t.process(bytes);
         assert_eq!(t.take_evidence_asserted(), bit, "{bytes:?}");
     }
-    // One CSI with several modes asserts each.
     let mut t = Terminal::new(24, 80);
     t.process(b"\x1b[?1049;1003;25l\x1b[?1049;1003h");
     assert_eq!(
@@ -752,8 +675,6 @@ fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
         ALT_SCREEN | MOUSE | CURSOR_HIDDEN
     );
 
-    // Negative control: disarms, a kitty pop, a kitty set to zero flags, a
-    // zero modifyOtherKeys and evidence-free modes assert nothing.
     let mut t = Terminal::new(24, 80);
     t.process(b"\x1b[?1049h\x1b[>1u\x1b[?1003h\x1b[>4;2m");
     t.take_evidence_asserted();

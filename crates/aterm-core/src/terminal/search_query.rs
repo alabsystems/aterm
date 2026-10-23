@@ -112,6 +112,7 @@ pub fn join_wrapped_rows(
     wrapped: &[bool],
     cols: usize,
 ) {
+    // A zero-column grid lays nothing out; leaving the rows alone keeps every
     // coordinate the caller already has, and there is no boundary to straddle.
     if cols == 0 {
         return;
@@ -404,6 +405,7 @@ pub fn query_search_index_narrowing(
         }
         *stack = Some(session);
     } else if let Some(session) = session {
+        // Capped walk: no frame for THIS query, but the stacked ancestors are
         // still valid for other extensions of their prefixes — keep them.
         *stack = Some(session);
     }

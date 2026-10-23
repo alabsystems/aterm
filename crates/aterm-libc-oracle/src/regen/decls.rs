@@ -141,8 +141,6 @@ fn text(value: Option<&Value>) -> Option<String> {
     value.and_then(Value::as_str).map(str::to_string)
 }
 
-/// A rendered type, refused when it holds a shape the renderer does not model:
-/// the shim would not compile, and the reason belongs here.
 fn rendered(ty: &Value, what: &str) -> Result<String, String> {
     let out = render(ty);
     if out.contains("/*?*/") {
@@ -381,9 +379,6 @@ mod tests {
         format!(r#"{{"resolved_path":{{"path":"{name}","id":{id},"args":null}}}}"#)
     }
 
-    /// `f(p: *mut s) -> c_int` linked as `f$X`; `s` a `repr(C, packed(4))`
-    /// struct with field `x: t` and explicit `Clone` and `Hash` impls (plus a
-    /// synthetic `Send`); `t` an alias; `K` a constant; `e` a `repr(u32)` enum.
     fn fixture() -> String {
         let index = [
             format!(

@@ -508,7 +508,7 @@ fn class(msg: &str) -> &'static str {
     .unwrap_or("")
 }
 
-/// One answer as the comparison reads it ([module docs](self)), with a `Mark`'s
+/// One answer as the comparison reads it, with a `Mark`'s
 /// durable head apart for the law.
 fn project(tier: Tier, resp: &Response) -> (String, Option<(Option<u64>, u64)>) {
     match resp {
@@ -1226,7 +1226,7 @@ pub(crate) mod long {
 /// mirror off and on ([`super::world::Opts::seed`]'s alternation), on one
 /// device that never loses power, a broker that answers every ack at once,
 /// and a disk that never fails: what a restart may lose and when an ack is
-/// read are the law check's and the held-ack worlds' (module docs).
+/// read are the law check's and the held-ack worlds'.
 fn journalled(seed: u64, tier: Tier) -> super::world::Outcome {
     let opts = super::world::Opts {
         tier: Some(tier),

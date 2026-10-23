@@ -122,7 +122,8 @@ impl TerminalHandler<'_> {
         self.grid.set_cursor(0, 0);
     }
 
-    /// Handle DSR (`CSI Ps n`): 5 answers `CSI 0 n` (OK), 6 the cursor position (CPR) `CSI row .
+    /// Handle DSR (`CSI Ps n`): 5 answers `CSI 0 n` (OK), 6 the cursor position
+    /// (CPR) `CSI row ; col R`.
     pub(super) fn handle_dsr(&mut self, cap: &ResponseCapability, params: &[u16]) {
         let param = params.first().copied().unwrap_or(0);
         match param {
@@ -239,7 +240,9 @@ impl TerminalHandler<'_> {
         self.send_response(cap, response.as_bytes());
     }
 
-    /// Handle DA2 (`CSI > c`): `CSI > Pp .
+    /// Handle DA2 (`CSI > c`): `CSI > Pp ; 100 ; 0 c`, Pp the terminal type for
+    /// the DECSCL level (41 for VT420, 64 for VT520), 100 the firmware version, 0
+    /// no ROM cartridge.
     pub(super) fn handle_secondary_da(&mut self, cap: &ResponseCapability) {
         let da2 = self.modes.vt_level.da2_param();
         let mut response = StackResponse::<24>::new();

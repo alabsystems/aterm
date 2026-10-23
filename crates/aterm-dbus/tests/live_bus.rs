@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A round trip through a real bus: a private `dbus-daemon` on a scratch
-//! socket, two [`Connection`]s, a call from one to the other and back, and a
-//! signal one emits that the other's `AddMatch` routes to it.
-//!
-//! Linux only: D-Bus is a Linux desktop's bus (a Mac has none by default), and
-//! there a missing `dbus-daemon` on PATH ends the test COULD NOT RUN. The daemon
-//! is this test's own, never the session's bus.
+//! End-to-end method call and signal delivery over a private `dbus-daemon`.
 
 #![cfg(target_os = "linux")]
 

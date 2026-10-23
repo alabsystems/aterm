@@ -112,7 +112,7 @@ impl Rig {
         rig
     }
 
-    /// The real state, as the model's variables (see the module doc).
+    /// The real state, as the model's variables.
     pub(crate) fn project(&self) -> State {
         let edits = &self.app.native_documents.edits;
         let ring = |ticket: Ticket| -> Vec<EditOutcome> {

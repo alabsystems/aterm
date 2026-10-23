@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Base64 (RFC 4648 §4, the standard alphabet) in the two spellings the vault uses:
-//! unpadded and canonical (age's header) and padded and canonical (armor and the envelope's
-//! fields). Both decoders refuse every spelling but the one canonical encoding of the bytes,
-//! so a key or a signature has exactly one text form. Both sit on aterm-codec's strict
-//! decoder; the unpadded form is re-padded first.
+//! Canonical padded and unpadded standard Base64 (RFC 4648 §4) encoding and decoding.
 
 use aterm_codec::base64;
 
@@ -18,8 +14,7 @@ pub fn encode_nopad(bytes: &[u8]) -> String {
     text
 }
 
-/// Decode unpadded base64, refusing any `=`, any character outside the alphabet, any
-/// whitespace, a length of 1 mod 4, and non-zero trailing bits. `None` on any refusal.
+/// Decodes unpadded Base64 strictly, rejecting padding, whitespace, invalid lengths, and non-zero trailing bits.
 pub fn decode_nopad(text: &str) -> Option<Vec<u8>> {
     if text.contains('=') {
         return None;
@@ -36,8 +31,7 @@ pub fn decode_nopad(text: &str) -> Option<Vec<u8>> {
     base64::decode_strict(padded.as_bytes()).ok()
 }
 
-/// Padded base64 of `bytes`. Empty for input past aterm-codec's 64 MiB bound, which no
-/// caller here approaches (an envelope is at most 16 MiB).
+/// Encodes `bytes` as padded Base64.
 #[inline]
 pub fn encode_padded(bytes: &[u8]) -> String {
     base64::encode(bytes).unwrap_or_default()

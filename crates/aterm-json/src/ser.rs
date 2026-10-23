@@ -65,6 +65,7 @@ pub(crate) fn write_json_string(out: &mut Vec<u8>, text: &str) {
 
 #[inline]
 fn hex_nibble(v: u8) -> u8 {
+    // `v <= 15` at every call (both arguments are masked or shifted), so the
     // lookup is in range; `get` keeps that local and the fallback is dead.
     *b"0123456789abcdef".get(v as usize).unwrap_or(&b'0')
 }

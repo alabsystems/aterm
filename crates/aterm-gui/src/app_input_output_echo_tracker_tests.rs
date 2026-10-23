@@ -82,9 +82,6 @@ fn enter(mods: TMods, event_type: KeyEventType) -> InputEvent {
     }
 }
 
-/// A receipt is never reported before its dispatch, though `stamp_on_frame_clock`
-/// bounds its instant by the reader's `now`: the ticket here is dispatched after
-/// that `now`.
 #[cfg(unix)]
 #[test]
 fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
@@ -94,8 +91,6 @@ fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = OutputEchoTracker::default();
     let now = std::time::Instant::now();
-    // The dispatch is recorded after the frame clock the reader will pass, as
-    // when input is dispatched during a frame.
     let dispatched_at = now + std::time::Duration::from_millis(50);
     let ev = InputEvent::KeySequence(b"x".to_vec());
     let write = tracker.begin_ticketed(
@@ -137,10 +132,6 @@ fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
     }
 }
 
-/// The delivery register: a ticketed write publishes its receipt when the sink
-/// accepts the bytes, a failed write a FAILED receipt and no delivery. Each read
-/// hands receipts over once, by serial, in completion order; a read with no
-/// baseline gets the newest serial.
 #[cfg(unix)]
 #[test]
 fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
@@ -158,13 +149,10 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
         dispatched_at: now,
     };
 
-    // No baseline: the newest serial, nothing to apply.
     let fresh = tracker.deliveries_after(&sink, None, now);
     assert_eq!(fresh.latest, 0);
     assert!(fresh.items.iter().all(Option::is_none));
 
-    // Two ticketed writes complete in reverse acceptance order (an older
-    // writer descheduled after its acceptance).
     let first = tracker.begin_ticketed(OutputEchoInput::Echoable, Some(ticket(63)));
     let first_receipt = input::seam_egress_receipt(
         &term,
@@ -197,12 +185,10 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
             .all(|(at, _)| now.saturating_duration_since(*at).as_millis() < 1_000),
         "the delivery instant is placed on the frame's clock"
     );
-    // Read once: the same baseline hands over nothing new.
     let again = tracker.deliveries_after(&sink, Some(batch.latest), now);
     assert_eq!(again.latest, 2);
     assert!(again.items.iter().all(Option::is_none));
 
-    // A typed ticket rides the same register.
     let typed = tracker.begin_ticketed(
         OutputEchoInput::Echoable,
         Some(DeliveryTicket {
@@ -232,7 +218,6 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
         })
     );
 
-    // An empty ticket and an un-ticketed write publish nothing.
     let empty = tracker.begin_ticketed(
         OutputEchoInput::Echoable,
         Some(DeliveryTicket {
@@ -261,10 +246,6 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
     plain.finish(r, &sink);
     assert_eq!(tracker.deliveries_after(&sink, Some(3), now).latest, 3);
 
-    // A failed write (a dead sink) is no delivery: a swallowed queued key
-    // stays revoked, a swallowed paste arms nothing. It is a FAILED receipt
-    // instead, which takes back what its dispatch banked
-    // (`revoke_failed_delivery`).
     let dead = SinkWriter::new(-1);
     let failed = tracker.begin_ticketed(OutputEchoInput::Echoable, Some(ticket(8)));
     let r = input::seam_egress_receipt(
@@ -288,8 +269,6 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
     assert_eq!(batch.latest, 4, "read once, like any receipt");
     let again = tracker.deliveries_after(&sink, Some(batch.latest), now);
     assert!(again.failed.iter().all(Option::is_none), "and only once");
-    // An un-ticketed failed write (an inline key, revoked at its dispatch)
-    // publishes nothing at all.
     let plain = tracker.begin_event(&ev);
     let r = input::seam_egress_receipt(
         &term,
@@ -306,9 +285,6 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
     }
 }
 
-/// The ring holds a frame's worth: a paste's receipt and those of every key typed
-/// behind it complete in one frame and are read in one batch. Past
-/// `DELIVERY_RING` the loss is reported: the read says how many it missed.
 #[cfg(unix)]
 #[test]
 fn the_delivery_ring_holds_a_frames_worth_of_receipts() {
@@ -357,8 +333,6 @@ fn the_delivery_ring_holds_a_frames_worth_of_receipts() {
         "every receipt of the frame is handed over, oldest first"
     );
 
-    // The whole depth survives one read; one past it is evicted and reported,
-    // `latest` still advances, and the ring's oldest survivor is the second.
     let depth = DELIVERY_RING as u16;
     for cells in 10..=(9 + depth + 1) {
         publish(cells);
@@ -388,11 +362,6 @@ fn the_delivery_ring_holds_a_frames_worth_of_receipts() {
     }
 }
 
-/// An eviction is reported once, on the read that advances past it: a receipt
-/// held in the spill holds `latest` back, and reads at that baseline report no
-/// loss. The shape is a wedged foreground (Ctrl-S, a stalled child) with more
-/// than `DELIVERY_RING` keys typed behind a paste; a filled `O_NONBLOCK` pipe
-/// wedges the sink deterministically.
 #[cfg(unix)]
 #[test]
 fn an_eviction_is_reported_once_on_the_read_that_advances_past_it() {
@@ -420,7 +389,6 @@ fn an_eviction_is_reported_once_on_the_read_that_advances_past_it() {
     let now = std::time::Instant::now();
     let ev = InputEvent::KeySequence(b"x".to_vec());
 
-    // One non-parking byte into the full pipe seeds the spill.
     let seed = tracker.begin_event(&ev);
     let receipt = input::seam_egress_receipt(
         &term,
@@ -432,7 +400,6 @@ fn an_eviction_is_reported_once_on_the_read_that_advances_past_it() {
     seed.finish(receipt, &sink);
     assert!(!sink.egress_drained_to_kernel(), "the sink is wedged");
 
-    // A frame's worth plus one, every receipt held behind the spill.
     let depth = DELIVERY_RING as u16;
     for cells in 1..=(depth + 1) {
         let write = tracker.begin_ticketed(
@@ -464,11 +431,9 @@ fn an_eviction_is_reported_once_on_the_read_that_advances_past_it() {
         );
     }
 
-    // Read the pipe out: the drainer lands the spill behind the fill.
     // SAFETY: `pipe[0]` is ours and open; the `File` owns and closes it.
     let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
     let mut buf = vec![0_u8; 64 * 1024];
-    // A hang detector, never a latency budget.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while std::time::Instant::now() < deadline {
         if sink.egress_drained_to_kernel() {
@@ -485,11 +450,7 @@ fn an_eviction_is_reported_once_on_the_read_that_advances_past_it() {
     }
     assert!(sink.egress_drained_to_kernel(), "the spill drained");
 
-    // The read that resolves the held receipts and passes the hole reports the
-    // loss once (the drainer may briefly still hold the spill lock, in which
-    // case the read is retried, as a later frame would).
     let mut resolved = tracker.deliveries_after(&sink, Some(0), now);
-    // A hang detector, never a latency budget.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while std::time::Instant::now() < deadline {
         if resolved.latest > 0 {
@@ -598,9 +559,6 @@ fn accepted_order_rejects_an_older_completion_after_enter() {
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = OutputEchoTracker::default();
 
-    // Keep both guards alive, but complete them in reverse order. This is
-    // the real race: an older writer can be descheduled after its sink
-    // acceptance while Enter is accepted and published by another thread.
     let echo_event = InputEvent::KeySequence(b"x".to_vec());
     let echo_write = tracker.begin_event(&echo_event);
     let echo_receipt = input::seam_egress_receipt(
@@ -657,9 +615,6 @@ fn accepted_order_rejects_an_older_completion_after_enter() {
     );
     require_model_transition("Sample", &stale_discarded, &sampled);
 
-    // Negative control: a delayed completion reviving the older echo shadow after
-    // Enter must be rejected by the healthy action, while Buggy=1 admits it and
-    // violates the boundary law.
     let mut overwritten = boundary_published.clone();
     overwritten.insert("older_done", 1);
     overwritten.insert("published_order", 1);
@@ -717,11 +672,6 @@ fn accepted_editor_input_discounts_but_enter_opens_the_turn_immediately() {
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = Arc::new(OutputEchoTracker::default());
-    // Every sample anchors on a fresh clock, as the host's frame loop does.
-    // Stamps sit at the instant they were read (`stamp_on_frame_clock`), so the
-    // paste receipt and the Enter, handed over by different samples, stay
-    // ordered. The late-in-frame shape is
-    // `a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it`.
     let now = std::time::Instant::now();
     let mut streak = aterm_effects::output_streak::OutputStreak::new(1);
     assert!(!streak.note_output(1, &[(2, 0, 0)], now, false));
@@ -797,11 +747,6 @@ fn accepted_editor_input_discounts_but_enter_opens_the_turn_immediately() {
     }
 }
 
-/// The Enter is placed where it was read, however late in its frame it is
-/// sampled: the host reads `frame_started` before the render work and samples
-/// after it, and an Enter handed over a frame after its paste must still map
-/// after the paste, or the streak discounts the response as echo. A re-sampled
-/// boundary stays put, since `verdict_armed` spends an Enter by its instant.
 #[cfg(unix)]
 #[test]
 fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it() {
@@ -822,7 +767,6 @@ fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it()
     let mut streak = aterm_effects::output_streak::OutputStreak::new(1);
     assert!(!streak.note_output(1, &[(2, 0, 0)], Instant::now(), false));
 
-    // Frame N hands over the paste receipt; its echo is discounted.
     write(
         &InputEvent::Paste("paste".into(), input::PasteFraming::AtDrain),
         input::EgressMode::Backpressured,
@@ -833,7 +777,6 @@ fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it()
     streak.note_keystroke(paste_at);
     assert!(!streak.note_output(2, &[(2, 0, 0)], frame_n, paste.input_hot));
 
-    // The Enter lands; frame N+1 reads its clock, renders, then samples.
     write(
         &enter(TMods::empty(), KeyEventType::Press),
         input::EgressMode::Interactive,
@@ -857,8 +800,6 @@ fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it()
         "the command response after Enter is authored output"
     );
 
-    // One Enter is one instant, whichever frame hands it over and however
-    // late in that frame: a second `D` for it finds it already spent.
     let mut spent = None;
     assert!(crate::app_render::verdict_armed(
         &mut spent,
@@ -884,8 +825,7 @@ fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it()
     }
 }
 
-/// A pipe whose write end is wedged (O_NONBLOCK, filled to EAGAIN), so
-/// a write through the sink spills and a drainer is arranged.
+/// A pipe whose write end is wedged.
 #[cfg(unix)]
 fn wedged_pipe() -> [i32; 2] {
     let mut pipe = [0; 2];
@@ -914,7 +854,6 @@ fn fill_pipe(writer: i32) {
 fn drain_pipe(reader: &mut std::fs::File, sink: &SinkWriter) {
     use std::io::Read;
     let mut buf = vec![0_u8; 64 * 1024];
-    // A hang detector, never a latency budget.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while std::time::Instant::now() < deadline {
         if sink.egress_drained_to_kernel() {
@@ -932,9 +871,6 @@ fn drain_pipe(reader: &mut std::fs::File, sink: &SinkWriter) {
     assert!(sink.egress_drained_to_kernel(), "the spill drained");
 }
 
-/// A drained publish settles every receipt the spill had held at its own stamp
-/// (they reached the kernel no later than this write), so receipt instants stay
-/// monotone in serial order even when a spill restarts before the next read.
 #[cfg(unix)]
 #[test]
 fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
@@ -965,7 +901,6 @@ fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
             );
             write.finish(receipt, &sink);
         };
-        // Seed the spill with one non-parking byte: the sink is wedged.
         let seed = tracker.begin_event(&ev);
         let receipt = input::seam_egress_receipt(
             &term,
@@ -976,17 +911,14 @@ fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
         );
         seed.finish(receipt, &sink);
         assert!(!sink.egress_drained_to_kernel(), "wedged");
-        // A: ticketed, held (the spill is non-empty at its publish).
         publish(1);
         {
             let p = tracker.published.lock().unwrap();
             assert_eq!(p.deliveries[0].unwrap().delivered_us, 0, "A is spill-held");
         }
-        // The child reads: the drainer lands the spill.
         let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
         drain_pipe(&mut reader, &sink);
         std::thread::sleep(std::time::Duration::from_millis(30));
-        // B: ticketed, lands direct — and settles A at the same stamp.
         publish(2);
         {
             let p = tracker.published.lock().unwrap();
@@ -999,8 +931,6 @@ fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
             );
         }
         if rewedge {
-            // A new spill starts before the next read (a third paste
-            // into a re-wedged child inside the same frame gap).
             fill_pipe(pipe[1]);
             let seed = tracker.begin_event(&ev);
             let receipt = input::seam_egress_receipt(
@@ -1039,10 +969,6 @@ fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
     }
 }
 
-/// A contended spill probe never holds a receipt on a drained sink: the writer
-/// probes with the parking predicate, so a held receipt means bytes really are in
-/// the spill. A thread spinning on that probe contends the spill mutex while
-/// ticketed writes publish; every receipt is stamped at its publish.
 #[cfg(unix)]
 #[test]
 fn a_contended_spill_probe_never_holds_a_receipt_on_a_drained_sink() {
@@ -1112,13 +1038,6 @@ fn fifo_admission_receipt_is_not_pty_acceptance() {
     );
 }
 
-/// THE SUBMISSION COUNT rides every input write's acceptance
-/// ([`crate::submit_count`]): the egress law's ([`tracked_egress`], a key or a
-/// controller's `send` on any route) and the guarded actuator's
-/// ([`OutputEchoTracker::begin_event`], then `finish_delivery`, as
-/// `control_input::input_if_fenced_observed` writes a fenced `key`). An Enter
-/// counts once something was composed since the last, and only once the sink
-/// accepted it: a refused write moved nothing.
 #[cfg(unix)]
 #[test]
 fn an_accepted_enter_over_composed_input_counts_one_submission() {
@@ -1139,27 +1058,21 @@ fn an_accepted_enter_over_composed_input_counts_one_submission() {
         )
     };
     let plain = enter(TMods::empty(), KeyEventType::Press);
-    // NEGATIVE CONTROL: an Enter over an empty composer.
     write(&plain);
     assert_eq!(tracker.submits(), 0);
     write(&InputEvent::KeySequence(b"keep going".to_vec()));
     assert_eq!(tracker.submits(), 0, "a draft is no submission");
-    // A refused Enter (the program stopped reading) counts nothing, and the
-    // draft stays composed for the Enter that lands.
     tracker
         .begin_event(&plain)
         .finish_delivery(input::Delivery::BusyZero, None, &sink);
     assert_eq!(tracker.submits(), 0, "a refused write moved nothing");
-    // The guarded actuator's accepted Enter counts.
     let fenced = tracker.begin_event(&plain);
     let receipt =
         input::seam_egress_receipt(&term, &modes, &sink, &plain, input::EgressMode::Interactive);
     fenced.finish_delivery(input::Delivery::Full, receipt.accepted_order(), &sink);
     assert_eq!(tracker.submits(), 1);
-    // A second Enter counts none.
     write(&plain);
     assert_eq!(tracker.submits(), 1);
-    // A person's typed key and Enter through the egress law count one more.
     write(&InputEvent::Key {
         key: TKey::Character('y'),
         mods: TMods::empty(),

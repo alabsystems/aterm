@@ -224,7 +224,7 @@ mod mac {
     }
 
     /// Stall verdict: the queue is running, armed (a successful start stamped `last_cb_us`).
-    pub(super) fn callback_stalled(running: bool, last_cb_us: u64, now_us: u64) -> bool {
+    pub(super) const fn callback_stalled(running: bool, last_cb_us: u64, now_us: u64) -> bool {
         running
             && last_cb_us != 0
             && now_us.saturating_sub(last_cb_us) >= super::STALL_AFTER_MS * 1_000
@@ -292,7 +292,7 @@ mod mac {
     }
 
     /// The `IsRunning` verdict.
-    pub(super) fn running_probe(
+    pub(super) const fn running_probe(
         seen_running: bool,
         called_back: bool,
         property: Option<bool>,
@@ -323,7 +323,7 @@ mod mac {
         }
 
         /// A start succeeded and armed the watchdog at `armed_cb_us`.
-        pub(super) fn armed(&mut self, armed_cb_us: u64) {
+        pub(super) const fn armed(&mut self, armed_cb_us: u64) {
             self.armed_cb_us = armed_cb_us;
             self.seen_running = false;
         }
@@ -562,7 +562,7 @@ mod mac {
         }
 
         impl<P: QueueOwnerCalls> OwnedQueue<P> {
-            pub(in crate::trail_audio) fn new(calls: P) -> Self {
+            pub(in crate::trail_audio) const fn new(calls: P) -> Self {
                 Self {
                     calls,
                     listening: false,
@@ -575,7 +575,7 @@ mod mac {
                 self.listening
             }
 
-            pub(in crate::trail_audio) fn calls(&self) -> &P {
+            pub(in crate::trail_audio) const fn calls(&self) -> &P {
                 &self.calls
             }
         }
@@ -598,13 +598,13 @@ mod mac {
         }
 
         impl AudioToolboxQueue {
-            pub(super) fn queue(&self) -> AudioQueueRef {
+            pub(super) const fn queue(&self) -> AudioQueueRef {
                 self.queue
             }
 
             /// The listener's userdata (the edge field inside the pinned
             /// allocation).
-            fn edge_user(&self) -> *mut c_void {
+            const fn edge_user(&self) -> *mut c_void {
                 // SAFETY: `user` is a live `Arc<Shared>` raw pointer until `release_user`.
                 unsafe { std::ptr::addr_of!((*self.user).running_edge) as *mut c_void }
             }
@@ -924,6 +924,8 @@ mod mac {
         )]
         pub(crate) fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) -> Delivery {
             // The key path checks the death verdict too, since `on_tick` only
+            // runs when nobody is typing. The cue is not consumed: the worker
+            // reopens and re-pushes it.
             if self.device_needs_reopen() {
                 return Delivery::Reopen;
             }
@@ -949,6 +951,7 @@ mod mac {
             }
             if !self.shared.running.load(Ordering::Relaxed) && !self.start() {
                 // A failed lazy open. The cue is in the discarded synth, which
+                // was never heard, so re-pushing it plays it once.
                 return Delivery::Reopen;
             }
             if self.shared.running.load(Ordering::Acquire) {
@@ -977,6 +980,7 @@ mod mac {
         )]
         pub(crate) fn on_tick(&mut self) -> Service {
             // A faulted, stalled or stopped-under-us queue must reopen, not
+            // pause: the death verdict is asked first.
             if self.device_needs_reopen() {
                 return Service::Reopen;
             }
@@ -1023,6 +1027,8 @@ mod mac {
     impl Drop for MacOut {
         fn drop(&mut self) {
             // Disable callback recycling first. `owned`'s `Drop` then removes
+            // the listener, disposes the queue synchronously and releases the
+            // callbacks' userdata refcount.
             set_callback_recycling(&self.shared, false);
         }
     }
@@ -1447,7 +1453,7 @@ enum Reopen {
 
 #[cfg(target_os = "macos")]
 impl<'a> RetryState<'a> {
-    fn new(backoff: &'a [Duration]) -> Self {
+    const fn new(backoff: &'a [Duration]) -> Self {
         Self {
             attempts: 0,
             earliest: None,
@@ -1464,7 +1470,7 @@ impl<'a> RetryState<'a> {
     }
 
     /// Reopens remaining in the lifetime budget.
-    fn left(&self) -> u8 {
+    const fn left(&self) -> u8 {
         (self.backoff.len() as u8).saturating_sub(self.attempts)
     }
 
@@ -1620,7 +1626,7 @@ impl HostState {
     ];
 
     /// The word `tone` and `trail status` print.
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Inert => "inert",
             Self::Running => "live",
@@ -1838,6 +1844,7 @@ impl TrailAudio {
                 }
                 None if self.born_active => {
                     // A push at an already-sealed host; counted only for a
+                    // host born active.
                     saturating_increment_u64(&self.dropped_sealed);
                 }
                 _ => {}
@@ -1851,7 +1858,7 @@ impl TrailAudio {
     }
 
     /// Whether cues pushed here can ever reach a device.
-    pub fn is_live(&self) -> bool {
+    pub const fn is_live(&self) -> bool {
         #[cfg(test)]
         if self.capture.is_some() {
             return true;
@@ -1983,6 +1990,7 @@ impl TrailAudio {
     #[cfg(test)]
     pub(crate) fn is_inert_for_test(&self) -> bool {
         // A capturing host accepts cues, so it is not inert; this stays the
+        // exact complement of `is_live`.
         if self.capture.is_some() {
             return false;
         }

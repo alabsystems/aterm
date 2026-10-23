@@ -2,20 +2,11 @@
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Derived from read-fonts 0.43.2 src/tables/gvar.rs, src/tables/variations.rs
-// and generated/generated_gvar.rs, generated/generated_variations.rs, and
-// modified by the aterm project in 2026: the `gvar` glyph variation data as
-// FreeType's 16.16 loader reads it (tuple headers, shared and private packed
-// point numbers, packed deltas, the fixed-point tuple scalar), specialized to
-// point deltas in 16.16, with every read checked.
+// Derived from read-fonts 0.43.2 src/tables/gvar.rs and src/tables/variations.rs,
+// modified by the aterm project in 2026.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
-//! `gvar` tuple variation data for the autohinter's outline loader.
-//!
-//! aterm-font's own `gvar` reader (`tables/gvar.rs`, ttf-parser's) applies
-//! deltas in `f32` as it outlines; the autohinter needs FreeType's answer
-//! instead, every delta in 16.16 and rounded to a font unit, so this is the
-//! read-fonts reader skrifa's FreeType-style scaler sits on.
+//! Fixed-point 16.16 `gvar` tuple variation reader for the autohinter.
 
 use super::fixed::{F2Dot14, Fixed, Point};
 use super::glyf::{PointFlags, PointMarker};
@@ -40,7 +31,6 @@ fn read_u32(data: &[u8], offset: usize) -> Result<u32, ReadError> {
     Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// A forward reader over a byte slice (read-fonts' `Cursor`).
 #[derive(Clone, Copy, Debug)]
 struct Cursor<'a> {
     data: &'a [u8],
@@ -82,7 +72,6 @@ impl<'a> Cursor<'a> {
         Ok(v as i32)
     }
 
-    /// The next `len` bytes, all or nothing.
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], ReadError> {
         let end = self.pos.checked_add(len).ok_or(ReadError)?;
         let bytes = self.data.get(self.pos..end).ok_or(ReadError)?;
@@ -91,7 +80,6 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// A tuple: one 2.14 coordinate per axis.
 #[derive(Clone, Copy, Default, Debug)]
 struct Tuple<'a> {
     values: &'a [u8],
@@ -109,7 +97,6 @@ impl Tuple<'_> {
     }
 }
 
-/// The shared tuple records: `count` tuples of `axis_count` coordinates.
 #[derive(Clone, Copy, Default, Debug)]
 struct SharedTuples<'a> {
     data: &'a [u8],
@@ -145,12 +132,10 @@ impl<'a> Gvar<'a> {
         let count = read_u16(self.data, 6)?;
         let offset = read_u32(self.data, 8)? as usize;
         let axis_count = self.axis_count();
-        // A non-nullable offset: 0 does not resolve.
         if offset == 0 {
             return Err(ReadError);
         }
         let data = self.data.get(offset..).ok_or(ReadError)?;
-        // The tuple array, or none when it runs past the table.
         let len = usize::from(count).saturating_mul(usize::from(axis_count) * 2);
         let data = data.get(..len).unwrap_or_default();
         Ok(SharedTuples { data, axis_count })
@@ -161,7 +146,6 @@ impl<'a> Gvar<'a> {
         let long_offsets = read_u16(self.data, 14)? & 1 != 0;
         let data_start = read_u32(self.data, 16)?;
         let offsets_len = (usize::from(glyph_count) + 1) * if long_offsets { 4 } else { 2 };
-        // The offsets array, or none when it runs past the table.
         let offsets = self
             .data
             .get(20..)
@@ -183,8 +167,7 @@ impl<'a> Gvar<'a> {
         Ok(start as usize..end as usize)
     }
 
-    /// The variation data for a glyph: `Ok(None)` when it has none, an error
-    /// when it has some that is malformed.
+    /// Variation data for `gid`, or `Ok(None)` when absent.
     pub(crate) fn glyph_variation_data(
         &self,
         gid: u16,
@@ -199,8 +182,7 @@ impl<'a> Gvar<'a> {
         GlyphVariationData::new(data, axis_count, shared_tuples).map(Some)
     }
 
-    /// The deltas of the four phantom points (`[left, right, top, bottom]`)
-    /// at `coords`, if the glyph that carries the metrics has variation data.
+    /// Deltas of the four phantom points (`[left, right, top, bottom]`) at `coords`.
     pub(crate) fn phantom_point_deltas(
         &self,
         glyf: &super::glyf::Glyf<'a>,
@@ -213,7 +195,6 @@ impl<'a> Gvar<'a> {
         let Some(var_data) = self.glyph_variation_data(glyph_id)? else {
             return Ok(None);
         };
-        // Phantom points never belong to a contour, so no IUP here.
         for (tuple, scalar) in var_data.active_tuples_at(coords) {
             for tuple_delta in tuple.deltas() {
                 let ix = tuple_delta.position as usize;
@@ -226,22 +207,16 @@ impl<'a> Gvar<'a> {
     }
 }
 
-/// The glyph whose phantom points carry the metrics, and its point count
-/// (for a composite, its component count): the glyph itself, or the last
-/// component marked USE_MY_METRICS, recursively.
 fn find_glyph_and_point_count(
     glyf: &super::glyf::Glyf,
     glyph_id: u16,
     recurse_depth: usize,
 ) -> Result<(u16, usize), ReadError> {
-    // Matches HarfBuzz's nesting limit.
     const RECURSION_LIMIT: usize = 64;
     if recurse_depth > RECURSION_LIMIT {
         return Err(ReadError);
     }
     let Some(glyph) = glyf.get(glyph_id)? else {
-        // Empty glyphs might still contain gvar data that only affects
-        // phantom points.
         return Ok((glyph_id, 0));
     };
     match glyph {
@@ -287,12 +262,10 @@ impl<'a> GlyphVariationData<'a> {
         let count = read_u16(data, 0)?;
         let serialized_offset = usize::from(read_u16(data, 2)?);
         let header_data = data.get(4..).unwrap_or_default();
-        // A non-nullable offset: 0 does not resolve.
         if serialized_offset == 0 {
             return Err(ReadError);
         }
         let serialized = data.get(serialized_offset..).ok_or(ReadError)?;
-        // Shared point numbers, if any, open the serialized data.
         let (shared_point_numbers, serialized_data) = if count & 0x8000 != 0 {
             let (packed, data) = PackedPointNumbers::split_off_front(serialized);
             (Some(packed), data)
@@ -329,8 +302,6 @@ impl<'a> GlyphVariationData<'a> {
     }
 }
 
-/// A tuple variation header: data size, tuple index, and the embedded peak
-/// and intermediate tuples its flags announce.
 #[derive(Clone, Copy)]
 struct TupleVariationHeader<'a> {
     data: &'a [u8],
@@ -419,7 +390,6 @@ impl<'a> Iterator for TupleVariationHeaderIter<'a> {
             })
         };
         let next_len = next.as_ref().map(|h| h.byte_len()).unwrap_or(0);
-        // A header that runs past the data ends the iteration unread.
         self.data = self.data.get(next_len..)?;
         Some(next)
     }
@@ -463,9 +433,6 @@ impl<'a> Iterator for ActiveTupleVariationIter<'a> {
     }
 }
 
-/// The fixed-point scalar of a tuple at `coords`; `None` when the tuple does
-/// not apply there (a zero scalar included). Missing trailing coordinates
-/// are zero.
 fn compute_scalar(
     header: &TupleVariationHeader,
     axis_count: usize,
@@ -523,8 +490,7 @@ fn compute_scalar(
 }
 
 impl Fixed {
-    /// Multiplies `self` by `a` and divides the product by `b`, rounding
-    /// (FreeType's `FT_MulDiv`).
+    /// Multiply `self` by `a` and divide by `b` with rounding (`FT_MulDiv`).
     pub(crate) const fn mul_div(&self, a: Self, b: Self) -> Self {
         let mut sign = 1;
         let mut su = self.to_bits() as u64;
@@ -596,8 +562,7 @@ impl<'a> TupleVariation<'a> {
         }
     }
 
-    /// The explicitly encoded deltas, unscaled (an omission by IUP is not
-    /// among them).
+    /// Explicitly encoded unscaled deltas.
     pub(crate) fn deltas(&self) -> TupleDeltaIter<'a> {
         let (point_numbers, packed_deltas) = self.point_numbers_and_packed_deltas();
         let count = usize::from(point_numbers.count());
@@ -626,8 +591,7 @@ impl<'a> TupleVariation<'a> {
         }
     }
 
-    /// Adds this tuple's deltas, times `scalar`, to every point's: the tuple
-    /// must be dense ([`Self::has_deltas_for_all_points`]).
+    /// Add this dense tuple's scaled deltas to `deltas`.
     pub(crate) fn accumulate_dense_deltas(
         &self,
         deltas: &mut [Point<Fixed>],
@@ -653,8 +617,7 @@ impl<'a> TupleVariation<'a> {
         Ok(())
     }
 
-    /// Adds this tuple's deltas, times `scalar`, to the points it names, and
-    /// marks each with [`PointMarker::HAS_DELTA`]: the tuple must be sparse.
+    /// Add this sparse tuple's scaled deltas to `deltas` and mark touched points.
     pub(crate) fn accumulate_sparse_deltas(
         &self,
         deltas: &mut [Point<Fixed>],
@@ -697,7 +660,6 @@ const DELTAS_ARE_ZERO: u8 = 0x80;
 const DELTAS_ARE_WORDS: u8 = 0x40;
 const DELTA_RUN_COUNT_MASK: u8 = 0x3F;
 
-/// The value type of a delta run; the discriminant is its byte size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DeltaRunType {
     Zero = 0,
@@ -719,7 +681,6 @@ impl DeltaRunType {
     }
 }
 
-/// Reads delta runs into `deltas` front to back until each has one.
 fn read_dense_deltas<T>(
     cursor: &mut Cursor,
     deltas: &mut [T],
@@ -758,7 +719,6 @@ fn read_dense_deltas<T>(
     Ok(())
 }
 
-/// Reads `count` deltas for the points `point_numbers` names.
 fn read_sparse_deltas(
     cursor: &mut Cursor,
     point_numbers: &PackedPointNumbers,
@@ -806,14 +766,12 @@ fn read_sparse_deltas(
     Ok(())
 }
 
-/// Packed point numbers: a count, then runs of point-number increments.
 #[derive(Clone, Copy, Default, Debug)]
 struct PackedPointNumbers<'a> {
     data: &'a [u8],
 }
 
 impl<'a> PackedPointNumbers<'a> {
-    /// The point numbers at the front of `data`, and the data after them.
     fn split_off_front(data: &'a [u8]) -> (Self, &'a [u8]) {
         let this = PackedPointNumbers { data };
         let total_len = this.total_len();
@@ -821,13 +779,10 @@ impl<'a> PackedPointNumbers<'a> {
         (this, remainder)
     }
 
-    /// The number of points in the set; 0 means every point.
     fn count(&self) -> u16 {
         self.count_and_count_bytes().0
     }
 
-    /// The point count and the bytes it takes: at most 0x7FFF points, in
-    /// one byte or two, whatever the data holds.
     #[cfg_attr(
         trust_verify,
         trust::ensures(result.0 <= 0x7FFF && (result.1 == 1 || result.1 == 2))
@@ -837,16 +792,12 @@ impl<'a> PackedPointNumbers<'a> {
             0 => (0, 1),
             count @ 1..=127 => (u16::from(count), 1),
             _ => {
-                // A count with its high bit set takes a second byte; the
-                // count is the big-endian u16 with that bit masked out. As
-                // fonttools does, a masked count of 0 reads as no points.
                 let count = read_u16(self.data, 0).unwrap_or_default() & 0x7FFF;
                 if count == 0 { (0, 2) } else { (count, 2) }
             }
         }
     }
 
-    /// The bytes the packed numbers take.
     fn total_len(&self) -> usize {
         let (n_points, mut n_bytes) = self.count_and_count_bytes();
         if n_points == 0 {
@@ -885,7 +836,6 @@ impl<'a> PackedPointNumbers<'a> {
     }
 }
 
-/// The count and the two-byte flag a run's control byte holds.
 fn read_control_byte(cursor: &mut Cursor) -> Option<(u8, bool)> {
     let control = cursor.read_u8().ok()?;
     let two_bytes = (control & 0x80) != 0;
@@ -928,7 +878,6 @@ impl Iterator for PackedPointNumbersIter<'_> {
     type Item = u16;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // A count of zero counts up forever.
         if self.count == 0 {
             let result = self.last_val;
             self.last_val = self.last_val.checked_add(1)?;
@@ -943,11 +892,9 @@ impl Iterator for PackedPointNumbersIter<'_> {
     }
 }
 
-/// Packed deltas: runs of zero, 8-, 16- or 32-bit values.
 #[derive(Clone, Copy, Debug)]
 struct PackedDeltas<'a> {
     data: &'a [u8],
-    // How many values are expected; `None` reads every run in the data.
     count: Option<usize>,
 }
 
@@ -996,14 +943,12 @@ impl<'a> DeltaRunIter<'a> {
         }
     }
 
-    /// Skips `n` deltas without reading their values.
     fn skip_fast(mut self, n: usize) -> Self {
         let mut wanted = n;
         let mut remaining = self.remaining_in_run as usize;
         let mut value_type = self.value_type;
         loop {
             if wanted > remaining {
-                // Consume the rest of this run and move to the next.
                 self.cursor.advance_by(remaining * value_type as usize);
                 wanted -= remaining;
                 if self.read_next_control().is_none() {
@@ -1061,7 +1006,6 @@ impl Iterator for DeltaRunIter<'_> {
 #[derive(Clone, Debug)]
 pub(crate) struct TupleDeltaIter<'a> {
     cur: usize,
-    // `None`: every point has a delta; `Some`: the points that do.
     points: Option<PackedPointNumbersIter<'a>>,
     next_point: usize,
     x: DeltaRunIter<'a>,
@@ -1088,13 +1032,11 @@ impl Iterator for TupleDeltaIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let (position, dx, dy) = loop {
             let position = if let Some(points) = &mut self.points {
-                // Sparse: only some points have deltas.
                 if self.cur > self.next_point {
                     self.next_point = usize::from(points.next()?);
                 }
                 self.next_point
             } else {
-                // Dense: the next point has the next delta.
                 self.cur
             };
             if position == self.cur {
@@ -1115,11 +1057,6 @@ impl Iterator for TupleDeltaIter<'_> {
 mod tests {
     use super::*;
 
-    // read-fonts 0.43.2 src/tables/variations.rs `packed_points`,
-    // `packed_point_byte_len`, `packed_deltas`, `packed_deltas_spec`,
-    // `packed_point_split`, `packed_points_dont_panic`,
-    // `packed_point_numbers_avoid_overflow`.
-
     fn decode_points(bytes: &[u8]) -> Option<Vec<u16>> {
         let packed = PackedPointNumbers { data: bytes };
         if packed.count() == 0 {
@@ -1132,21 +1069,16 @@ mod tests {
     #[test]
     fn packed_points() {
         assert_eq!(decode_points(&[0]), None);
-        // all points in glyph (in overly long representation)
         assert_eq!(decode_points(&[0x80, 0]), None);
-        // 2 points; first run: [9, 9+6]
         assert_eq!(decode_points(&[0x02, 0x01, 0x09, 0x06]), Some(vec![9, 15]));
-        // 2 points; first run: [0xBEEF, 0xBEEF+0x1001]
         assert_eq!(
             decode_points(&[0x02, 0x81, 0xbe, 0xef, 0x10, 0x01]),
             Some(vec![0xbeef, 0xcef0])
         );
-        // 5 points; first run: [1, 1+1]; second run: [2+5, 2+5+8, 2+5+8+3]
         assert_eq!(
             decode_points(&[0x05, 0x01, 0x01, 0x01, 0x02, 0x05, 0x08, 0x03]),
             Some(vec![1, 2, 7, 15, 18])
         );
-        // 3 points; run of 3 words
         assert_eq!(
             decode_points(&[0x03, 0x82, 0xbe, 0xef, 0x10, 0x01, 0x00, 0x02]),
             Some(vec![0xbeef, 0xcef0, 0xcef2])
@@ -1188,7 +1120,6 @@ mod tests {
         );
     }
 
-    // https://learn.microsoft.com/en-us/typography/opentype/spec/otvarcommonformats#packed-deltas
     #[test]
     fn packed_deltas_spec() {
         static INPUT: &[u8] = &[
@@ -1218,16 +1149,13 @@ mod tests {
 
     #[test]
     fn packed_points_dont_panic() {
-        // a single '0' byte means that there are deltas for all points
         static ALL_POINTS: &[u8] = &[0];
         let (all_points, _) = PackedPointNumbers::split_off_front(ALL_POINTS);
-        // in which case the iterator just keeps incrementing until u16::MAX
         assert_eq!(all_points.iter().count(), u16::MAX as usize);
     }
 
     #[test]
     fn packed_point_numbers_avoid_overflow() {
-        // Lots of large point numbers that overflow a u16 when summed.
         let buf = vec![0xFF; 0xFFFF];
         let iter = PackedPointNumbersIter {
             count: 0xFFFF,
@@ -1239,22 +1167,16 @@ mod tests {
                 cursor: Cursor::new(&buf),
             },
         };
-        // Don't panic; the sum stops the iteration instead.
         let _ = iter.count();
     }
 
-    /// The dense fast path and the sparse path add the same scaled deltas,
-    /// and the sparse one marks exactly the points it touches.
     #[test]
     fn accumulate_dense_and_sparse() {
-        // read-fonts' `accumulate_dense`/`accumulate_sparse` shapes, on a
-        // hand-built tuple: four points, x deltas then y deltas.
         let header = [0, 0, 0x80, 0x00, 0x40, 0x00];
         let header = TupleVariationHeader {
             data: &header,
             axis_count: 1,
         };
-        // Dense: every point (a zero point count), 8-bit runs of 4 + 4.
         let dense = [0x00, 0x03, 1, 2, 3, 4, 0x03, 5, 6, 7, 8];
         let tuple = TupleVariation {
             header: TupleVariationHeader {
@@ -1273,7 +1195,6 @@ mod tests {
             .map(|&(x, y)| Point::new(Fixed::from_i32(x) * half, Fixed::from_i32(y) * half))
             .collect();
         assert_eq!(&deltas[..], &expected[..]);
-        // Sparse: points 1 and 3.
         let sparse = [0x02, 0x01, 0x01, 0x02, 0x01, 10, 20, 0x01, 30, 40];
         let tuple = TupleVariation {
             serialized_data: &sparse,
@@ -1298,7 +1219,6 @@ mod tests {
             .map(|f| f.has_marker(PointMarker::HAS_DELTA))
             .collect();
         assert_eq!(marked, [false, true, false, true]);
-        // And the iterator yields the same explicit deltas.
         let explicit: Vec<_> = tuple.deltas().collect();
         assert_eq!(
             explicit,

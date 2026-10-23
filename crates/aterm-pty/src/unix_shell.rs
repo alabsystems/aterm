@@ -170,7 +170,8 @@ pub(crate) fn runnable(path: &Path) -> bool {
     let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
-    // SAFETY: `c` is a valid NUL-terminated path string that outlives the call; `access` only.
+    // SAFETY: `c` is a valid NUL-terminated path string that outlives the call;
+    // `access` only reads it.
     let executable = unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0;
     executable && path.is_file()
 }
@@ -182,7 +183,8 @@ pub(crate) fn runnable(path: &Path) -> bool {
 /// runnable and is returned: an account that may not log in gets what it asked for).
 #[cfg_attr(trust_verify, trust::skip)]
 fn account_shell() -> Option<OsString> {
-    // SAFETY: `passwd` is plain integers and pointers, for which all-zero is a valid value; it is.
+    // SAFETY: `passwd` is plain integers and pointers, for which all-zero is a
+    // valid value; it is only an out-param here.
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut out: *mut libc::passwd = std::ptr::null_mut();
     let mut len = 4096;

@@ -124,8 +124,6 @@ pub fn shorten_home(path: &str) -> String {
     trimmed.to_owned()
 }
 
-/// Enrich parsed `HostedSession` rows from `sock_path` with live terminal grid dimensions
-/// (`@<id> dims`) and working directory (`@<id> cwd`).
 fn enrich_sessions_dims_and_cwd(
     sock_path: &Path,
     token: &str,
@@ -181,11 +179,8 @@ fn enrich_sessions_dims_and_cwd(
     }
 }
 
-/// How long `hello` waits on each aterm's control socket for its roster.
 const SOCKET_WAIT: Duration = Duration::from_millis(400);
 
-/// Dial one `aterm` control socket at `sock_path` and read its live `sessions` roster,
-/// waiting up to `wait` for each read and write.
 fn query_instance_sessions(
     instance_pid: u32,
     sock_path: &Path,

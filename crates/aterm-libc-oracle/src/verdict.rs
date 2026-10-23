@@ -210,8 +210,6 @@ mod tests {
     use super::*;
     use crate::symbols::SymbolDiff;
 
-    /// The exit code `targo --unverified verify libc` reads: a finding outranks
-    /// a stop, and a stop alone could not run.
     #[test]
     fn findings_outrank_a_stop_and_a_stop_alone_could_not_run() {
         let mut report = Report::default();

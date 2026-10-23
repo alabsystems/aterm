@@ -251,6 +251,7 @@ fn authoritative_zip_artifact(
     };
     let Some(sha256) = manifest.zip_sha256.as_deref() else {
         // A container name with no digest is not stageable — there would be
+        // nothing to check the downloaded bytes against.
         return Ok(None);
     };
     let expected = format!("aterm-{canonical_version}-mac.zip");
@@ -368,6 +369,8 @@ impl AuthoritativeFetch {
         web_tag: &str,
     ) {
         // After every signature has been verified and the version bound, and before
+        // anything is staged, the signed manifest must name the very container URL this
+        // client derived under the pointer's tag.
         if let Some((manifest, release, _)) = self.selected.as_ref()
             && let Err(error) = web_container_url_agrees(source, &release.tag_name, manifest)
         {
@@ -594,6 +597,8 @@ fn fetch_authoritative_release(
     match Manifest::parse(&text) {
         Ok(manifest) if manifest.version == candidate.version => {
             // The identity bind, over authenticated bytes: the machine id is inside the
+            // signed bytes and the roster maps id to key, so a signature can be neither
+            // relabelled nor claimed by another machine.
             if let Some(who) = &attribution
                 && let Err(reject) = who.bind(manifest.machine_id.as_deref(), manifest.roster_seq)
             {
@@ -606,6 +611,7 @@ fn fetch_authoritative_release(
             }
             if let Some(who) = &attribution {
                 // The durable record is the status file's, written by the check; the log
+                // line is once per release per process.
                 if crate::first_in_process(&format!("signer {} {who}", candidate.release.tag_name))
                 {
                     crate::debug(&format!(
@@ -741,7 +747,8 @@ struct StageBackoff {
     attempts: u32,
     /// The candidate is quarantined (applied, crash-looped, reverted).
     quarantined: bool,
-    /// The window.
+    /// The window is a moment's: staging could not finish, and the line must not say it
+    /// "failed".
     moment: bool,
     /// A published local stage that is strictly newer than the running build, if one exists.
     applicable: Option<Ready>,
@@ -794,6 +801,7 @@ fn stage_backoff(
     asked: Asked,
 ) -> Option<StageBackoff> {
     // The quarantine ledger first: a verdict no later stage event can overwrite
+    // — `failed.toml` holds one artifact at a time.
     if crate::manifest::artifact_quarantined(staging, manifest.build_number, &manifest.sha256) {
         return Some(StageBackoff {
             retry_in_secs: 0,

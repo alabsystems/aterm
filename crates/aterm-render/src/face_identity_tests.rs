@@ -21,11 +21,6 @@ fn drawn(r: &mut Renderer, ch: char, style: StyleBits) -> Vec<u8> {
     r.glyph_image(key).bytes().to_vec()
 }
 
-/// A primary inside a collection draws ITS face, not the collection's first:
-/// `PT Mono` (face 1) draws Regular although face 0 is Bold, and that Bold —
-/// another face of the primary's family in the same file — serves bold
-/// cells. Before, every reader of the primary opened face 0, so plain text
-/// drew bold and BOLD could not differ from it.
 #[test]
 fn a_primary_inside_a_collection_draws_its_own_face_and_its_sibling_bold() {
     let collection = ttc_of(&[JB_BOLD, JB_REGULAR]);
@@ -58,9 +53,6 @@ fn a_primary_inside_a_collection_draws_its_own_face_and_its_sibling_bold() {
     );
 }
 
-/// An injected styled face inside a collection draws the face asked for:
-/// `font_family_italic = "Menlo Italic"` is `Menlo.ttc`'s face 2. Before,
-/// every styled setter parsed face 0, so a named Bold drew Regular.
 #[test]
 fn an_injected_styled_face_inside_a_collection_draws_that_face() {
     let collection = ttc_of(&[JB_REGULAR, JB_BOLD, JB_ITALIC]);
@@ -88,11 +80,6 @@ fn an_injected_styled_face_inside_a_collection_draws_that_face() {
     );
 }
 
-/// The collections macOS ships resolve to the faces their names name:
-/// `PT Mono` is `PTMono.ttc`'s Regular (face 1, after its Bold), `Menlo
-/// Bold` is `Menlo.ttc`'s face 1, and `Courier` asked for its bold slot is
-/// `Courier.ttc`'s Bold — a face with no `OS/2` table, whose style is only in
-/// `head.macStyle`.
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_collections_resolve_to_the_named_faces() {
@@ -112,12 +99,6 @@ fn macos_collections_resolve_to_the_named_faces() {
     }
 }
 
-/// A sealed generation reports what each style draws with, by the pick the
-/// rasterizer makes: a collection's own Bold, Italic and Bold Italic faces;
-/// an injected bold for bold, and for bold italic that bold with a synthetic
-/// italic over it; the regular face with a synthetic style when no real face
-/// serves it, or drawn regular with synthesis off. An unsealed generation
-/// reports nothing, since its styled faces are not discovered yet.
 #[test]
 fn a_sealed_generation_reports_the_faces_each_style_draws() {
     use crate::{DrawnFaces, StyleDraw};

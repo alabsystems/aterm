@@ -17,7 +17,7 @@ use crate::{
 pub(crate) const DEFAULT_DECORATIVE_EFFECTS: bool = !cfg!(windows);
 
 /// The cursor style an aterm.toml that names none draws.
-pub(crate) fn default_cursor_trail_style() -> &'static str {
+pub(crate) const fn default_cursor_trail_style() -> &'static str {
     if DEFAULT_DECORATIVE_EFFECTS {
         crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE
     } else {
@@ -750,6 +750,8 @@ impl ThemeCatalog {
             Err(_) => return Err(ThemeCatalogWatchError::DirectoryUnreadable),
         };
         for (index, result) in read_dir.take(caps.entries + 1).enumerate() {
+            // Past the entry cap the scan stops but keeps what it gathered:
+            // a folder full of strays degrades to a bounded prefix, never to
             // an empty catalog.
             if index == caps.entries {
                 truncated = true;
@@ -956,12 +958,12 @@ impl ThemeCatalog {
     }
 
     /// Whether the folder held more than discovery keeps (entries, candidates or files).
-    pub(crate) fn truncated(&self) -> bool {
+    pub(crate) const fn truncated(&self) -> bool {
         self.truncated
     }
 
     /// How many `.conf` files discovery saw and how many it read.
-    pub(crate) fn limits(&self) -> ThemeCatalogLimits {
+    pub(crate) const fn limits(&self) -> ThemeCatalogLimits {
         self.limits
     }
 
@@ -1351,7 +1353,7 @@ impl Default for TrailStyleCache {
 }
 
 impl ResolvedTrailStyle {
-    fn off() -> Self {
+    const fn off() -> Self {
         Self {
             canonical: Some("off"),
             style: None,
@@ -1524,7 +1526,8 @@ pub(crate) struct AiPolicy {
 }
 
 impl AiPolicy {
-    /// The table `text`.
+    /// The table `text` — the whole `aterm.toml` — writes, over the fleet
+    /// document it names or the one beside the canonical `aterm.toml`.
     pub(crate) fn read(text: &str) -> Self {
         #[cfg(test)]
         let beside: Option<std::path::PathBuf> = None;
@@ -1599,7 +1602,7 @@ impl AiPolicy {
 }
 
 impl HarnessPolicy {
-    /// The policy `text`.
+    /// The policy `text` — the whole `aterm.toml` — writes.
     pub(crate) fn read(text: &str) -> Self {
         let (policy, notes) = aterm_agent::supervise::SupervisorConfig::from_aterm_toml(text);
         Self { policy, notes }
@@ -2003,7 +2006,7 @@ pub(crate) fn search_index_depth(config: &Config) -> usize {
 }
 
 /// Aterm's own theme for `appearance`, a side of Default's light/dark pair.
-pub(crate) fn default_pair_side(appearance: aterm_types::Appearance) -> &'static str {
+pub(crate) const fn default_pair_side(appearance: aterm_types::Appearance) -> &'static str {
     match appearance {
         aterm_types::Appearance::Dark => "Default",
         aterm_types::Appearance::Light => "Default Light",
@@ -2318,7 +2321,7 @@ impl Config {
     }
 
     /// Trail sound volume 0..1 (`trail_sound_volume`, default 0.4), clamped.
-    pub(crate) fn trail_sound_volume(&self) -> f32 {
+    pub(crate) const fn trail_sound_volume(&self) -> f32 {
         match self.trail_sound_volume {
             Some(value) if value.is_finite() => value.clamp(0.0, 1.0),
             Some(_) => 0.0,
@@ -2327,7 +2330,7 @@ impl Config {
     }
 
     /// Wallpaper dim fraction toward the theme background, clamped to `0..=1`.
-    pub(crate) fn wallpaper_dim_or_default(&self) -> f32 {
+    pub(crate) const fn wallpaper_dim_or_default(&self) -> f32 {
         match self.wallpaper_dim {
             Some(value) if value.is_finite() => value.clamp(0.0, 1.0),
             _ => 0.3,
@@ -2734,6 +2737,7 @@ impl Config {
             .and_then(|sparkle| sparkle.enabled)
             == Some(false)
         {
+            // A disabled feed has no consumer; re-enabling it forces a fresh
             // worker generation, so dormant paths need no I/O.
             return (None, fingerprint.finish());
         }
@@ -3543,7 +3547,7 @@ impl Config {
     }
 
     /// `font_weight_dark_nudge`, default 0 (off), clamped 0..=300.
-    pub(crate) fn font_weight_dark_nudge_or_default(&self) -> f32 {
+    pub(crate) const fn font_weight_dark_nudge_or_default(&self) -> f32 {
         match self.font_weight_dark_nudge {
             Some(v) if v.is_finite() => v.clamp(0.0, 300.0),
             _ => 0.0,
@@ -3570,7 +3574,7 @@ impl Config {
     }
 
     /// Line-height multiplier, default [`DEFAULT_LINE_HEIGHT`] (`1.1` on Windows, `1.0` elsewhere), clamped 0.8..=2.0 (the renderer floors at 0.5).
-    pub(crate) fn line_height_or_default(&self) -> f32 {
+    pub(crate) const fn line_height_or_default(&self) -> f32 {
         match self.line_height {
             Some(v) if v.is_finite() => v.clamp(0.8, 2.0),
             _ => DEFAULT_LINE_HEIGHT,
@@ -3625,7 +3629,7 @@ impl Config {
     }
 
     /// Per-cell minimum contrast ratio, default `1.0` (off; xterm treats 1 as "do nothing"), clamped to the WCAG 1.0..=21.0 domain.
-    pub(crate) fn minimum_contrast_or_default(&self) -> f32 {
+    pub(crate) const fn minimum_contrast_or_default(&self) -> f32 {
         match self.minimum_contrast {
             Some(v) if v.is_finite() => v.clamp(1.0, 21.0),
             _ => 1.0,
@@ -3633,7 +3637,7 @@ impl Config {
     }
 
     /// The engine's theme-pair contrast floor (`TerminalConfig::indexed_minimum_contrast`).
-    pub(crate) fn indexed_minimum_contrast_or_default(&self) -> f32 {
+    pub(crate) const fn indexed_minimum_contrast_or_default(&self) -> f32 {
         if self.minimum_contrast.is_some() {
             1.0
         } else {
@@ -3657,7 +3661,7 @@ impl Config {
     }
 
     /// SGR 2 faint opacity, default `0.5`, clamped 0.0..=1.0.
-    pub(crate) fn faint_opacity_or_default(&self) -> f32 {
+    pub(crate) const fn faint_opacity_or_default(&self) -> f32 {
         match self.faint_opacity {
             Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
             _ => aterm_types::DIM_FACTOR,
@@ -3665,7 +3669,7 @@ impl Config {
     }
 
     /// Window background opacity, default `1.0` (solid), clamped to 0.0..=1.0.
-    pub(crate) fn background_opacity_or_default(&self) -> f32 {
+    pub(crate) const fn background_opacity_or_default(&self) -> f32 {
         match self.background_opacity {
             Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
             _ => 1.0,
@@ -3687,7 +3691,7 @@ impl Config {
     }
 
     /// Window padding in logical px (`window_padding`), default [`crate::PAD_LOGICAL_PX`] (12.0), clamped 0..=[`MAX_WINDOW_PADDING_PX`].
-    pub(crate) fn window_padding_or_default(&self) -> f32 {
+    pub(crate) const fn window_padding_or_default(&self) -> f32 {
         match self.window_padding {
             Some(v) if v.is_finite() => v.clamp(0.0, MAX_WINDOW_PADDING_PX),
             _ => crate::PAD_LOGICAL_PX,
@@ -4374,7 +4378,7 @@ impl TabBandHeight {
     }
 
     /// Target band height in logical px (1/96 in on Windows).
-    pub(crate) fn target_logical_px(self) -> f32 {
+    pub(crate) const fn target_logical_px(self) -> f32 {
         match self {
             Self::Compact => 0.0,
             Self::Standard => TAB_BAND_STANDARD_LOGICAL_PX,
@@ -4522,7 +4526,7 @@ fn read_bounded_kitty_png(path: &std::path::Path) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("unreadable ({error})"))
 }
 
-fn stable_asset_fingerprint(tag: u8, source: &[u8], w: u16, h: u16, rgba: &[u8]) -> u64 {
+const fn stable_asset_fingerprint(tag: u8, source: &[u8], w: u16, h: u16, rgba: &[u8]) -> u64 {
     let mut hash = aterm_hash::Fnv1a64::new();
     hash.write_u8(tag);
     hash.write(&(source.len() as u64).to_le_bytes());
@@ -5285,7 +5289,7 @@ fn resolve_shell_override_with(flag: Option<String>, configured: Option<&str>) -
 }
 
 /// Pure precedence core for [`resolve_want_gpu`], with the two flags and the config value passed in.
-pub(crate) fn resolve_want_gpu_with(
+pub(crate) const fn resolve_want_gpu_with(
     force_cpu: bool,
     force_gpu: bool,
     config_gpu: Option<bool>,
@@ -6306,6 +6310,7 @@ impl App {
             .collect();
         for (wid, size) in sized {
             if Some(wid) == settling {
+                // Its band's head follows the rows now, so the frame its caller's
                 // settle asks for has it.
                 self.sync_synthetic_strip_head(wid, size.height);
             } else {
@@ -6525,6 +6530,7 @@ impl App {
             }
             self.on_resize(wid, size);
             if let Some(ws) = self.windows.get_mut(&wid) {
+                // A font/theme rebuild is an external visual stimulus: couple the
                 // recovery reset to its repaint edge until a real present or drop.
                 ws.rearm_present(true);
             }
@@ -6607,6 +6613,11 @@ impl App {
             }
             KnobChange::BackgroundMaterial(m) => {
                 if self.backend.is_gpu() {
+                    // Windows Mica/Acrylic: update the GPU renderer first so the
+                    // redraw reconciles the swapchain composite mode (Opaque ⇄
+                    // PreMultiplied on a DComp visual). Material → none must go
+                    // opaque; none → material re-engages only if the instance was
+                    // built as a visual. A plain HWND swapchain stays DWM-chrome
                     // only, which `window_set_vibrancy` diagnoses.
                     if let Some(g) = self.backend.gpu_mut() {
                         g.set_backdrop_margins(m != BackgroundMaterial::None);
@@ -6968,6 +6979,8 @@ impl App {
             return true;
         }
         let Some(observation) = self.native_config_service.admitted_observation() else {
+            // An unwritten edit or an unreconciled write: the generation that
+            // admits it resolves the typography of this state, so the colours
             // install now and the face follows with it.
             return false;
         };
@@ -7634,6 +7647,7 @@ impl App {
                 }
             }
         } else {
+            // No backend rebuild, but the engine config may have changed cells, so
             // still request a repaint (the redraw early-out skips it if nothing moved).
             if let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) {
                 w.request_redraw();

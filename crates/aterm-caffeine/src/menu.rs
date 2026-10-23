@@ -266,8 +266,6 @@ mod tests {
         assert!(expired.iter().all(|(l, _, c)| !c && !l.contains("left")));
     }
 
-    /// Blocked in Login Items, the row says where startup is turned on, unchecked: the plist
-    /// is there, but no login loads it.
     #[test]
     fn a_blocked_startup_points_at_login_items() {
         let startup_row = |startup| {

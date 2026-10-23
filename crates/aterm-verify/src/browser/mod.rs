@@ -5,11 +5,13 @@
 //!
 //! The modules are `verify wasm-smoke`'s dev build ([`crate::wasm_smoke::
 //! build_dev`], a STOCK EXCEPTION: Trust has no wasm32 std), bound for a page
-//! by `verify glue --flavor web`.
+//! by `verify glue`. [`page`] runs the wasm lanes' drivers in the same
+//! Chromium.
 pub(crate) mod cdp;
 pub(crate) mod chromium;
 pub(crate) mod firefox;
 pub(crate) mod judge;
+pub(crate) mod page;
 pub(crate) mod recorded;
 pub(crate) mod serve;
 pub(crate) mod webkit;
@@ -266,7 +268,7 @@ fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cos
         Ok(rustup) => rustup,
         Err(refused) => {
             match refused.status {
-                Status::Skip { why, fix } => {
+                Status::Skip { why, fix } | Status::CouldNotRun { why, fix } => {
                     r.cannot_run(format!("{LABEL} — {why} (fix: {fix})"));
                 }
                 Status::Fail(findings) => {
@@ -883,11 +885,7 @@ fn assemble(root: &Path, modules: &Path, site: &Path) -> Result<(), String> {
                 .map_err(|e| format!("could not write {}: {e}", spec_path.display()))
         })?;
     for (module, dir) in [("aterm_wasm.wasm", "cpu"), ("aterm_gpu_web.wasm", "gpu")] {
-        crate::wasm_glue::bind(
-            &modules.join(module),
-            &site.join(dir),
-            crate::wasm_glue::Flavor::Web,
-        )?;
+        crate::wasm_glue::bind(&modules.join(module), &site.join(dir))?;
     }
     Ok(())
 }
@@ -952,7 +950,7 @@ fn drive_chromium(
     let pipe = || std::io::pipe().map_err(|e| Stop::CouldNotRun(format!("no pipe: {e}")));
     let ((cmd_read, cmd_write), (out_read, out_write)) = (pipe()?, pipe()?);
     let mut cmd = LaneCommand::new(&browser.path);
-    cmd.args(chromium::launch_args(browser, profile, angle))
+    cmd.args(chromium::launch_args(browser, profile, angle, &[]))
         .stdin(ChildStdio::Null)
         .stdout(out)
         .stderr(err);

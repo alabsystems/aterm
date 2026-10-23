@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm_json`: verdicts and bytes.
-//!
-//! Serialization output matters byte for byte (some of this JSON is hashed into
-//! a checkpoint fingerprint, some is a request body), and a parser that is
-//! merely more permissive hands the program a document the reference would
-//! have rejected. The sampled sweeps below are pinned by digest; each was
-//! recorded when every verdict and every byte matched `serde_json`.
+//! `aterm_json` verdict and serialization parity sweeps.
 
 use serde::{Deserialize, Serialize};
 
-/// FNV-1a over a sweep's outputs, so a whole sweep is pinned by one value.
 struct Golden(u64);
 
 impl Golden {
@@ -26,7 +19,6 @@ impl Golden {
         }
     }
 
-    /// A parse: its verdict, and on success the compact re-serialization.
     fn parsed(&mut self, result: &Result<aterm_json::Value, aterm_json::Error>) {
         match result {
             Ok(v) => self.feed(aterm_json::to_string(v).expect("serialize").as_bytes()),
@@ -34,7 +26,6 @@ impl Golden {
         }
     }
 
-    /// A typed read: its verdict, and on success the value's `Debug`.
     fn typed<T: std::fmt::Debug>(&mut self, result: &Result<T, aterm_json::Error>) {
         match result {
             Ok(v) => self.feed(format!("{v:?}").as_bytes()),
@@ -51,7 +42,6 @@ impl Golden {
     }
 }
 
-/// Parse, and hold a successful parse to a lossless re-serialization.
 fn parse(input: &str) -> Result<aterm_json::Value, aterm_json::Error> {
     let result = aterm_json::from_str::<aterm_json::Value>(input);
     if let Ok(v) = &result {
@@ -90,8 +80,6 @@ fn ignored_strings_validate_the_same_bytes_as_materialized_values() {
         cases.push(text.into_bytes());
     }
     for raw in cases {
-        // Test values, nested values, and escaped map keys: every discarded
-        // string path must reject malformed UTF-8 and escapes alike.
         let mut nested = b"{\"ignored\":[".to_vec();
         nested.extend_from_slice(&raw);
         nested.extend_from_slice(b"]}");
@@ -106,9 +94,6 @@ fn ignored_strings_validate_the_same_bytes_as_materialized_values() {
     }
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
-
-/// A deterministic pseudo-random source.
 struct Rng(u64);
 
 impl Rng {
@@ -124,7 +109,6 @@ impl Rng {
     }
 }
 
-/// Generate a random VALID JSON document, bounded in depth and size.
 fn random_json(rng: &mut Rng, depth: u32, out: &mut String) {
     let choice = if depth >= 4 {
         rng.below(5)
@@ -185,7 +169,6 @@ fn random_json(rng: &mut Rng, depth: u32, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                // Deliberately a small key space, so duplicate keys happen.
                 out.push_str(&format!("\"k{}\":", rng.below(4)));
                 random_json(rng, depth + 1, out);
             }
@@ -193,8 +176,6 @@ fn random_json(rng: &mut Rng, depth: u32, out: &mut String) {
         }
     }
 }
-
-// ── the properties ─────────────────────────────────────────────────────────
 
 #[test]
 fn generated_documents_parse_and_reserialize() {
@@ -210,7 +191,6 @@ fn generated_documents_parse_and_reserialize() {
     golden.check(GENERATED);
 }
 
-/// Mutated valid JSON: where a too-permissive parser shows itself.
 #[test]
 fn mutated_documents_get_their_pinned_verdicts() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -241,7 +221,6 @@ fn mutated_documents_get_their_pinned_verdicts() {
     golden.check(MUTATED);
 }
 
-/// Raw byte strings, including invalid UTF-8, through `from_slice`.
 #[test]
 fn arbitrary_bytes_get_their_pinned_verdicts() {
     let mut rng = Rng(0xDEAD_BEEF_1234_5678);
@@ -259,13 +238,10 @@ fn arbitrary_bytes_get_their_pinned_verdicts() {
     golden.check(ARBITRARY);
 }
 
-/// The named edge cases: every one of these is a decision the module docs
-/// record.
 #[test]
 fn named_edge_cases_get_their_pinned_verdicts() {
     let mut golden = Golden::new();
     for input in [
-        // numbers
         "0",
         "-0",
         "0.0",
@@ -289,7 +265,6 @@ fn named_edge_cases_get_their_pinned_verdicts() {
         "0.1",
         "1.5",
         "-1.5",
-        // malformed numbers
         "01",
         "-01",
         "1.",
@@ -306,7 +281,6 @@ fn named_edge_cases_get_their_pinned_verdicts() {
         "1.0e",
         "--1",
         "1..2",
-        // literals
         "null",
         "true",
         "false",
@@ -315,7 +289,6 @@ fn named_edge_cases_get_their_pinned_verdicts() {
         "fals",
         "NULL",
         "True",
-        // strings
         r#""""#,
         r#""a""#,
         r#""A""#,
@@ -333,7 +306,6 @@ fn named_edge_cases_get_their_pinned_verdicts() {
         r#""\/""#,
         r#""\b\f\n\r\t""#,
         r#""😀""#,
-        // structure
         "[]",
         "{}",
         "[1]",
@@ -349,7 +321,6 @@ fn named_edge_cases_get_their_pinned_verdicts() {
         r#"{"a":1 "b":2}"#,
         r#"{"a":1,"a":2}"#,
         r#"{"a":1,"a":2,"a":3}"#,
-        // whitespace and trailing data
         "  1  ",
         "\n\t{}\r\n",
         "1 2",
@@ -358,7 +329,6 @@ fn named_edge_cases_get_their_pinned_verdicts() {
         "",
         "   ",
         "\u{feff}1",
-        // nesting
         "[[[[[[[[[[1]]]]]]]]]]",
     ] {
         golden.feed(input.as_bytes());
@@ -367,7 +337,6 @@ fn named_edge_cases_get_their_pinned_verdicts() {
     golden.check(NAMED);
 }
 
-/// The recursion bound: 128 levels.
 #[test]
 fn the_recursion_limit() {
     let mut golden = Golden::new();
@@ -391,8 +360,6 @@ fn the_recursion_limit() {
     golden.check(RECURSION);
 }
 
-/// Floats: the shortest decimal that round-trips, laid out fixed or scientific
-/// by exponent. Every value must also read back as the same bits.
 #[test]
 fn float_formatting_is_pinned_and_round_trips() {
     let mut sample: Vec<f64> = vec![
@@ -438,13 +405,11 @@ fn float_formatting_is_pinned_and_round_trips() {
     ];
     let mut rng = Rng(0x0BAD_C0DE_F00D_1234);
     for _ in 0..50_000 {
-        // Uniform over the bit pattern, so every exponent range is reached.
         let bits = (u64::from(rng.next()) << 32) | u64::from(rng.next());
         let value = f64::from_bits(bits);
         if value.is_finite() {
             sample.push(value);
         }
-        // And a second sample biased to "human" magnitudes.
         let scale = 10f64.powi((rng.below(40) as i32) - 20);
         sample.push(f64::from(rng.next()) * scale);
     }
@@ -461,7 +426,6 @@ fn float_formatting_is_pinned_and_round_trips() {
     golden.check(FLOATS);
 }
 
-/// `f32` is formatted through the f32 shortest form, not widened first.
 #[test]
 fn f32_formatting_is_pinned() {
     let mut rng = Rng(0x1234_ABCD_5678_EF01);
@@ -479,16 +443,6 @@ fn f32_formatting_is_pinned() {
     golden.check(F32S);
 }
 
-/// The digits are the SHORTEST that read back, at an exact power of two too.
-///
-/// A power of two has a lopsided rounding interval — the next double down is
-/// half as far away as the next one up — so the decimal of a given length
-/// closest to it can miss the interval while a farther one of the same length
-/// lands inside. `ryu` (what `serde_json` writes with), Python's `repr` and
-/// Rust's own `{:e}` all print `2^-24` in 16 digits; walking the correctly
-/// rounded precision up wrote 17. The literals below are Python's `repr`; the
-/// sweep holds every power of two of both widths to the digit count of Rust's
-/// shortest form.
 #[test]
 fn a_power_of_two_gets_the_shortest_digits() {
     assert_eq!(
@@ -537,7 +491,6 @@ fn a_power_of_two_gets_the_shortest_digits() {
     }
 }
 
-/// Integers across every width and both signs are plain decimal.
 #[test]
 fn integer_formatting() {
     macro_rules! check {
@@ -566,8 +519,6 @@ fn integer_formatting() {
     );
 }
 
-/// String escaping: only ASCII controls, in pinned forms, and every escaped
-/// string reads back as itself.
 #[test]
 fn string_escaping_is_pinned_and_round_trips() {
     let mut cases: Vec<String> = Vec::new();
@@ -597,11 +548,6 @@ fn string_escaping_is_pinned_and_round_trips() {
     golden.check(STRINGS);
 }
 
-// ── typed models ───────────────────────────────────────────────────────────
-
-/// A model shaped like the ones this tree actually deserializes: renamed
-/// variants, container and field `default`, `skip_serializing_if`, `Option`,
-/// nesting, a map, and an enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Phase {
@@ -621,15 +567,8 @@ struct Row {
     flag: bool,
     tags: Vec<String>,
     extra: std::collections::BTreeMap<String, i64>,
-    /// A FIXED-SIZE array, and the reason this field is here: `serde`'s visitor
-    /// for `[T; N]` takes exactly N elements and returns WITHOUT draining to
-    /// the closing bracket, unlike a `Vec`'s. A deserializer whose sequence
-    /// access consumed the `]` itself works for one and leaves a stray bracket
-    /// for the other (`aterm-core`'s `CheckpointMeta` holds a `[u8; 8]`).
     stack: [u8; 8],
-    /// A tuple, which has the same early-stopping visitor.
     pair: (u8, String),
-    /// A newtype over a fixed array, nested one level deeper.
     nested_fixed: Wrapped,
 }
 
@@ -707,7 +646,6 @@ fn typed_deserialization_verdicts_and_values_are_pinned() {
         r#"{"v":1.5}"#,
         r#"{"rows":[{"ratio":1}]}"#,
         r#"{"rows":[{"extra":{"a":1,"b":-2}}]}"#,
-        // Fixed-size arrays and tuples: exact, short, long, and wrong-typed.
         r#"{"rows":[{"stack":[1,2,3,4,5,6,7,8]}]}"#,
         r#"{"rows":[{"stack":[1,2,3]}]}"#,
         r#"{"rows":[{"stack":[1,2,3,4,5,6,7,8,9]}]}"#,
@@ -718,8 +656,6 @@ fn typed_deserialization_verdicts_and_values_are_pinned() {
         r#"{"rows":[{"pair":[7,"x","extra"]}]}"#,
         r#"{"rows":[{"nested_fixed":[1,2,3]}]}"#,
         r#"{"rows":[{"nested_fixed":[1,2,3,4]}]}"#,
-        // Negative zero into a typed integer field: `serde_json` refuses it
-        // because `parse_number` turns `-0` into the float `-0.0`.
         r#"{"v":-0}"#,
         r#"{"v":-0.0}"#,
         r#"{"v":0}"#,
@@ -731,8 +667,6 @@ fn typed_deserialization_verdicts_and_values_are_pinned() {
     golden.check(TYPED_READS);
 }
 
-/// Every integer width against the same literals at the top level — the typed
-/// entry points `deserialize_u8` … `u128` each dispatch separately.
 #[test]
 fn scalar_integer_targets_are_pinned() {
     let mut golden = Golden::new();
@@ -780,8 +714,6 @@ fn scalar_integer_targets_are_pinned() {
     golden.check(SCALARS);
 }
 
-/// The 128-bit round trip, and `to_value` FAILS rather than hand back a
-/// silently rounded float for a value `Value::Number` cannot hold.
 #[test]
 fn wide_integers_round_trip_or_fail() {
     for value in [u128::MAX, u128::from(u64::MAX) + 1, 0, 1] {
@@ -806,8 +738,6 @@ fn wide_integers_round_trip_or_fail() {
     assert!(aterm_json::to_value(i64::MIN).is_ok());
 }
 
-/// A value that CANNOT serialize is refused, not turned into `null` — and
-/// `json!` panics rather than substituting one.
 #[test]
 fn a_value_that_cannot_serialize_is_refused() {
     use std::collections::BTreeMap;
@@ -822,16 +752,6 @@ fn a_value_that_cannot_serialize_is_refused() {
     assert!(ours.is_err(), "json! must not substitute null");
 }
 
-// ── map keys ───────────────────────────────────────────────────────────────
-//
-// A JSON object key is a string, so a map keyed by anything else — an integer,
-// a `bool`, a `char`, a unit variant, a newtype over one of them — is written
-// with its key spelled as text. Every map the writer accepts must read back as
-// itself, whether the reader takes it straight from the document or from
-// serde's buffer (a flattened map, an untagged or internally tagged enum).
-
-/// Write `value` and read it back: `Ok` when what comes back equals it, else
-/// what went wrong.
 fn reads_back<T>(value: &T) -> Result<(), String>
 where
     T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
@@ -846,8 +766,6 @@ where
     }
 }
 
-/// A key drawn where a spelling could go wrong: the type's extremes, zero,
-/// small values of both signs, and wide random ones.
 trait DrawKey: Sized {
     fn draw(rng: &mut Rng) -> Self;
 }
@@ -876,8 +794,6 @@ draw_integer_key!(
     u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, isize
 );
 
-/// Characters a key spelling can trip on: digits and signs, the escaped ones,
-/// and multi-byte ones.
 const KEY_CHARS: &[char] = &[
     'a', '7', '0', '-', '+', '.', '"', '\\', '\n', '\u{0}', '\u{7f}', 'é', '世', '😀',
 ];
@@ -895,8 +811,6 @@ impl DrawKey for char {
 }
 
 impl DrawKey for String {
-    /// Includes text that LOOKS like another key type's spelling: a string
-    /// key stays the string it is.
     fn draw(rng: &mut Rng) -> Self {
         const LOOKALIKES: &[&str] = &["7", "007", "-0", "+7", "true", "True", "1e3", ""];
         if rng.below(3) == 0 {
@@ -906,7 +820,6 @@ impl DrawKey for String {
     }
 }
 
-/// Newtype keys, as a model wraps an id, a name, or another newtype.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct KeyId(u32);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -918,7 +831,6 @@ struct KeyName(String);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct KeyOuter(KeyId);
 
-/// A unit-variant key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum KeyLane {
     Fast,
@@ -961,9 +873,6 @@ impl DrawKey for KeyLane {
     }
 }
 
-/// The same map read back through serde's buffer rather than straight from
-/// the document: flattened into a struct, as an untagged enum's payload, and
-/// inside an internally tagged one. No drawn key spells `name` or `kind`.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct FlatKeyed<K: Ord> {
     name: String,
@@ -985,8 +894,6 @@ enum TaggedKeyed<K: Ord> {
     },
 }
 
-/// `rounds` maps of up to five `K` keys, each written and read back: alone,
-/// nested under a key of the same type, and through serde's buffer.
 fn every_map_reads_back<K>(rng: &mut Rng, rounds: u32)
 where
     K: DrawKey + Ord + Clone + Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -1024,10 +931,6 @@ where
 fn every_map_the_writer_accepts_reads_back() {
     use std::collections::BTreeMap;
 
-    // The negative control first: a key that does NOT read back as itself is
-    // caught, whether the reader refuses its spelling or reads another key.
-
-    /// Written with leading zeros, which no integer key is written with.
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
     struct Padded(u32);
     impl Serialize for Padded {
@@ -1035,7 +938,6 @@ fn every_map_the_writer_accepts_reads_back() {
             s.serialize_str(&format!("{:03}", self.0))
         }
     }
-    /// Written without its low bit: an odd key reads back as the even one.
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
     struct Even(u32);
     impl Serialize for Even {
@@ -1074,10 +976,6 @@ fn every_map_the_writer_accepts_reads_back() {
     every_map_reads_back::<KeyLane>(&mut rng, 300);
 }
 
-/// A non-string key reads back from exactly the text the writer spells it
-/// with, and from nothing else: a spelling it never writes reaches the key
-/// type as the string it is, which refuses it. `Value` and `String` keys stay
-/// text, however numeric they look.
 #[test]
 fn a_key_reads_back_only_in_the_spelling_the_writer_uses() {
     use std::collections::{BTreeMap, HashMap};
@@ -1174,8 +1072,6 @@ fn deny_unknown_fields_denies() {
     }
 }
 
-/// The `json!` macro: nesting, arrays of objects, expression values, and a
-/// `Value` spliced in.
 #[test]
 fn the_json_macro() {
     let model = "qwen3.5";
@@ -1235,7 +1131,6 @@ fn the_json_macro() {
     );
 }
 
-/// `to_value` / `from_value` round-trip a typed model through the untyped tree.
 #[test]
 fn to_value_and_from_value_round_trip() {
     let doc = Doc {
@@ -1268,17 +1163,12 @@ fn to_value_and_from_value_round_trip() {
     assert_eq!(back, doc);
 }
 
-/// `Display` on a `Value` is a compact document — what every
-/// `format!("{data}")` interpolation in this tree relies on.
 #[test]
 fn value_display_is_compact() {
     let value = aterm_json::json!({"b": 1, "a": [true, null, "x"]});
     assert_eq!(value.to_string(), r#"{"a":[true,null,"x"],"b":1}"#);
 }
 
-/// OUR parse is exactly the nearest double to the decimal written (Rust's
-/// correctly rounded `dec2flt`); `serde_json`'s fast path is off by an ULP or
-/// more on inputs as ordinary as `935092.5986328125`.
 #[test]
 fn our_float_parsing_is_correctly_rounded() {
     let mut rng = Rng(0xF10A_7C0D_E123_4567);
@@ -1308,9 +1198,6 @@ fn our_float_parsing_is_correctly_rounded() {
     }
 }
 
-/// JSON Pointer (RFC 6901): the LLM transport reaches into a provider's reply
-/// with `/message/content` and `/choices/0/message/content`, so the resolution
-/// rules — including the ones that must FAIL — matter.
 #[test]
 fn json_pointer() {
     let text = r#"{
@@ -1357,7 +1244,6 @@ fn json_pointer() {
     }
 }
 
-/// `value["key"]` is total: a miss is `Null`, not a panic.
 #[test]
 fn index_sugar_is_total() {
     let text = r#"{"rows": 24, "cols": null, "list": [1, 2]}"#;

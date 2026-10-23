@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Xlib, XKB (Xlib side), XIM, XInput 2 and Xcursor declarations the
-//! window system's X11 backend calls: types, constants, structs and the
-//! entry points of `libX11.so.6`, `libXi.so.6` and `libXcursor.so.1`, read at
-//! run time through `aterm-dl`. They replace x11-dl
-//! (docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6; the winit
-//! fork's X11 backend calls them since LW.7).
-//!
-//! Each struct transcribes its header (`X11/Xlib.h`, `X11/XKBlib.h`,
-//! `X11/extensions/XInput2.h`, `X11/Xcursor/Xcursor.h`) field for field.
-//! Their layouts are held, on each Linux architecture, to what that
-//! architecture's C compiler makes of those headers: `tests/xlib_layout.rs`
-//! writes a probe of every size, alignment, field offset and constant here,
-//! compiles it with the target's `cc` in the Linux lane and compares.
-//! Xlib's `XID`-like types are C `unsigned long` (64 bits on every Linux
-//! cell), not the protocol's 32-bit ids.
+//! Runtime-loaded Xlib, XKB, XIM, XInput 2, and Xcursor declarations.
 
 #![allow(
     non_camel_case_types,
@@ -200,7 +186,6 @@ pub mod xi {
     pub const DEVICE_DISABLED: c_int = 1 << 7;
 }
 
-/// `XAnyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XAnyEvent {
@@ -211,7 +196,6 @@ pub struct XAnyEvent {
     pub window: Window,
 }
 
-/// `XKeyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XKeyEvent {
@@ -232,7 +216,6 @@ pub struct XKeyEvent {
     pub same_screen: Bool,
 }
 
-/// `XExposeEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XExposeEvent {
@@ -248,7 +231,6 @@ pub struct XExposeEvent {
     pub count: c_int,
 }
 
-/// `XVisibilityEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XVisibilityEvent {
@@ -260,7 +242,6 @@ pub struct XVisibilityEvent {
     pub state: c_int,
 }
 
-/// `XDestroyWindowEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XDestroyWindowEvent {
@@ -272,7 +253,6 @@ pub struct XDestroyWindowEvent {
     pub window: Window,
 }
 
-/// `XUnmapEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XUnmapEvent {
@@ -285,7 +265,6 @@ pub struct XUnmapEvent {
     pub from_configure: Bool,
 }
 
-/// `XMapEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XMapEvent {
@@ -298,7 +277,6 @@ pub struct XMapEvent {
     pub override_redirect: Bool,
 }
 
-/// `XReparentEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XReparentEvent {
@@ -314,7 +292,6 @@ pub struct XReparentEvent {
     pub override_redirect: Bool,
 }
 
-/// `XConfigureEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XConfigureEvent {
@@ -333,7 +310,6 @@ pub struct XConfigureEvent {
     pub override_redirect: Bool,
 }
 
-/// `XPropertyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XPropertyEvent {
@@ -347,7 +323,6 @@ pub struct XPropertyEvent {
     pub state: c_int,
 }
 
-/// `XSelectionEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XSelectionEvent {
@@ -371,7 +346,6 @@ pub union ClientMessageData {
     pub l: [c_long; 5],
 }
 
-/// `XClientMessageEvent`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct XClientMessageEvent {
@@ -385,7 +359,6 @@ pub struct XClientMessageEvent {
     pub data: ClientMessageData,
 }
 
-/// `XErrorEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XErrorEvent {
@@ -398,7 +371,6 @@ pub struct XErrorEvent {
     pub minor_code: c_uchar,
 }
 
-/// `XGenericEventCookie`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XGenericEventCookie {
@@ -434,7 +406,6 @@ pub union XEvent {
     pub pad: [c_long; 24],
 }
 
-/// `XModifierKeymap`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XModifierKeymap {
@@ -442,7 +413,6 @@ pub struct XModifierKeymap {
     pub modifiermap: *mut KeyCode,
 }
 
-/// `XColor`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XColor {
@@ -454,7 +424,6 @@ pub struct XColor {
     pub pad: c_char,
 }
 
-/// `XPoint`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XPoint {
@@ -462,7 +431,6 @@ pub struct XPoint {
     pub y: c_short,
 }
 
-/// `XkbAnyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XkbAnyEvent {
@@ -475,7 +443,6 @@ pub struct XkbAnyEvent {
     pub device: c_uint,
 }
 
-/// `XkbNewKeyboardNotifyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XkbNewKeyboardNotifyEvent {
@@ -496,7 +463,6 @@ pub struct XkbNewKeyboardNotifyEvent {
     pub req_minor: c_char,
 }
 
-/// `XkbStateNotifyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XkbStateNotifyEvent {
@@ -528,7 +494,6 @@ pub struct XkbStateNotifyEvent {
     pub req_minor: c_char,
 }
 
-/// `XkbBellNotifyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XkbBellNotifyEvent {
@@ -549,7 +514,6 @@ pub struct XkbBellNotifyEvent {
     pub event_only: Bool,
 }
 
-/// `XkbStateRec`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct XkbStateRec {
@@ -569,7 +533,6 @@ pub struct XkbStateRec {
     pub ptr_buttons: c_ushort,
 }
 
-/// `XIMCallback`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIMCallback {
@@ -585,7 +548,6 @@ pub union XIMTextString {
     pub wide_char: *mut c_int,
 }
 
-/// `XIMText`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct XIMText {
@@ -595,7 +557,6 @@ pub struct XIMText {
     pub string: XIMTextString,
 }
 
-/// `XIMPreeditDrawCallbackStruct`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIMPreeditDrawCallbackStruct {
@@ -615,7 +576,6 @@ pub struct XIMPreeditCaretCallbackStruct {
     pub style: c_int,
 }
 
-/// `XIMStyles`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIMStyles {
@@ -623,7 +583,6 @@ pub struct XIMStyles {
     pub supported_styles: *mut XIMStyle,
 }
 
-/// `XIModifierState` (and `XIGroupState`, its alias).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct XIModifierState {
@@ -636,7 +595,6 @@ pub struct XIModifierState {
 /// `XIGroupState`.
 pub type XIGroupState = XIModifierState;
 
-/// `XIButtonState`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIButtonState {
@@ -644,7 +602,6 @@ pub struct XIButtonState {
     pub mask: *mut c_uchar,
 }
 
-/// `XIValuatorState`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIValuatorState {
@@ -653,7 +610,6 @@ pub struct XIValuatorState {
     pub values: *mut f64,
 }
 
-/// `XIDeviceEvent` (key, button, motion and touch events).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIDeviceEvent {
@@ -681,7 +637,6 @@ pub struct XIDeviceEvent {
     pub group: XIGroupState,
 }
 
-/// `XIRawEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIRawEvent {
@@ -700,7 +655,6 @@ pub struct XIRawEvent {
     pub raw_values: *mut f64,
 }
 
-/// `XIEnterEvent` (and `XILeaveEvent`, `XIFocusInEvent`, `XIFocusOutEvent`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIEnterEvent {
@@ -736,7 +690,6 @@ pub type XIFocusInEvent = XIEnterEvent;
 /// `XIFocusOutEvent`.
 pub type XIFocusOutEvent = XIEnterEvent;
 
-/// `XIHierarchyInfo`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIHierarchyInfo {
@@ -747,7 +700,6 @@ pub struct XIHierarchyInfo {
     pub flags: c_int,
 }
 
-/// `XIHierarchyEvent`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIHierarchyEvent {
@@ -763,7 +715,6 @@ pub struct XIHierarchyEvent {
     pub info: *mut XIHierarchyInfo,
 }
 
-/// `XIAnyClassInfo`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIAnyClassInfo {
@@ -771,7 +722,6 @@ pub struct XIAnyClassInfo {
     pub sourceid: c_int,
 }
 
-/// `XIValuatorClassInfo`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIValuatorClassInfo {
@@ -786,7 +736,6 @@ pub struct XIValuatorClassInfo {
     pub mode: c_int,
 }
 
-/// `XIScrollClassInfo`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIScrollClassInfo {
@@ -798,7 +747,6 @@ pub struct XIScrollClassInfo {
     pub flags: c_int,
 }
 
-/// `XIDeviceInfo`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XIDeviceInfo {
@@ -811,7 +759,6 @@ pub struct XIDeviceInfo {
     pub classes: *mut *mut XIAnyClassInfo,
 }
 
-/// `XcursorImage`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct XcursorImage {
@@ -929,7 +876,6 @@ aterm_dl::table! {
         ) -> c_int;
     }
     optional {
-        /// libX11 1.7 (2020) and later.
         XSetIOErrorExitHandler = c"XSetIOErrorExitHandler":
             unsafe extern "C" fn(*mut Display, XIOErrorExitHandler, *mut c_void);
     }

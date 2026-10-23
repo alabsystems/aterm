@@ -270,6 +270,15 @@ pub(crate) fn complete(t: &Target) -> bool {
     t.dir.join(&t.exe).is_file() && place::read_stamp(&t.dir).is_some_and(|s| t.admits(&s))
 }
 
+/// `engine`'s pinned browser exactly as `verify provision` placed it on
+/// `machine`: its executable, when it is there and its stamp admits the pin
+/// ([`complete`]). A copy laid by hand, an adopted one or another pin's is
+/// not, so nothing a run finds this way is a browser nobody pinned.
+pub(crate) fn placed_browser(engine: Engine, machine: &Machine) -> Option<PathBuf> {
+    let t = target(row(engine_name(engine))?, machine)?;
+    complete(&t).then(|| t.dir.join(&t.exe))
+}
+
 /// Where `row` would be placed on `machine`, with what its stamp must say.
 fn target(row: &Row, machine: &Machine) -> Option<Target> {
     let (os, arch) = machine.os_arch();

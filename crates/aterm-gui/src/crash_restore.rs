@@ -102,7 +102,7 @@ pub(crate) enum Rung {
 
 impl Rung {
     /// The `status restore=` word.
-    pub(crate) fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Exact => "exact",
             Self::Screen => "screen",
@@ -127,7 +127,7 @@ pub(crate) struct RestoreReport {
 impl RestoreReport {
     /// The META rung, for `why`.
     #[cfg(unix)]
-    pub(crate) fn meta(why: &'static str, attempts: u8) -> Self {
+    pub(crate) const fn meta(why: &'static str, attempts: u8) -> Self {
         Self {
             rung: Rung::Meta,
             why,
@@ -166,7 +166,7 @@ pub(crate) struct RungCounts {
 impl RungCounts {
     /// Count one more on `rung`.
     #[cfg(unix)]
-    pub(crate) fn note(&mut self, rung: Rung) {
+    pub(crate) const fn note(&mut self, rung: Rung) {
         let slot = match rung {
             Rung::Exact => &mut self.exact,
             Rung::Screen => &mut self.screen,
@@ -176,7 +176,7 @@ impl RungCounts {
     }
 
     /// How many screens came back from a region (exact or not).
-    pub(crate) fn screens(self) -> u32 {
+    pub(crate) const fn screens(self) -> u32 {
         self.exact.saturating_add(self.screen)
     }
 }
@@ -222,7 +222,7 @@ impl RestoreTally {
     }
 
     /// The history lines the restored screens could not bring back, the band row's count (every line of a blank screen's is said apart, in words).
-    pub(crate) fn screens_history_lost(&self) -> u64 {
+    pub(crate) const fn screens_history_lost(&self) -> u64 {
         self.history_lost.saturating_sub(self.meta_history_lost)
     }
 
@@ -485,7 +485,7 @@ impl SpineSink for TailSink<'_> {
 
 #[cfg(unix)]
 impl Writer {
-    fn admits(&self, reason: Reason) -> bool {
+    const fn admits(&self, reason: Reason) -> bool {
         !self.hold || matches!(reason, Reason::Clear | Reason::Forced | Reason::Renumbered)
     }
 
@@ -493,7 +493,7 @@ impl Writer {
         self.clock.now_ms()
     }
 
-    fn sync_host(&mut self, host_fp: u64) {
+    const fn sync_host(&mut self, host_fp: u64) {
         if host_fp != 0 && host_fp != self.config_fp {
             self.config_fp = host_fp;
             self.policy.note_config(host_fp);
@@ -572,7 +572,7 @@ fn bridge_lines(fence: &HistoryFence, exported: Option<(HistoryIdentity, u64)>) 
 }
 
 #[cfg(unix)]
-fn fence_identity(fence: &HistoryFence) -> HistoryIdentity {
+const fn fence_identity(fence: &HistoryFence) -> HistoryIdentity {
     HistoryIdentity {
         renumber_epoch: fence.renumber_epoch,
         clear_gen: fence.clear_gen,
@@ -995,6 +995,7 @@ impl SessionJournal {
         if self.replace_parked.load(Ordering::Relaxed)
             && self.replace_parked.swap(false, Ordering::AcqRel)
         {
+            // A shed region's replacement waited for bytes that could end the sequence
             // that deferred it (K5): these may have.
             self.notify_worker();
         }
@@ -1048,6 +1049,7 @@ impl SessionJournal {
             let mut guard = self.lock();
             let w = &mut *guard;
             if w.region_gen != captured.region_gen {
+                // The memory shed replaced the region between the capture and this write,
                 // and keyframed the engine itself, later: this capture is stale there.
                 return;
             }
@@ -1484,6 +1486,12 @@ impl SessionJournal {
         let identity = fence_identity(&fence);
         let current = ring.writer.identity();
         if fence.detached {
+            // A reflow holds the store, so no line can be read; but a clear made meanwhile
+            // still empties and zeroes the ring at once (the privacy claim, plan §5 claim
+            // 4): `erase_scrollback` bumps the clear generation even while the store is
+            // out, and a window drag can keep it out for as long as the drag lasts. The
+            // ring starts over under the detached fence's identity; the attached fence
+            // after the reflow renumbers it again (the settle), and nothing is published
             // to bridge against meanwhile.
             if current.cols != 0 && identity.clear_gen != current.clear_gen {
                 let cap = ring.writer.cap();
@@ -2033,6 +2041,7 @@ impl SessionJournal {
                 self.replace_owed.store(false, Ordering::Release);
             }
             Replaced::Deferred => {
+                // A parser carry parks until its next bytes; a pending keeper receipt
                 // remains pollable. Neither case starts another mapping before K1's quiet.
                 ring.replace_due = Some(now.saturating_add(aterm_restore::policy::QUIET_MS));
             }
@@ -2055,6 +2064,7 @@ impl SessionJournal {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .waiting_for_read()
         {
+            // One queued predecessor is the bound. Busy intermediate regions were never
             // offered to the keeper and may still be replaced below.
             return Ok(Replaced::Deferred);
         }
@@ -2380,7 +2390,7 @@ pub(crate) enum PressureLevel {
 
 impl PressureLevel {
     /// The word `pressure level=` says.
-    pub(crate) fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Normal => "normal",
             Self::Warn => "warn",
@@ -2433,7 +2443,7 @@ pub(crate) struct ShedPolicy {
 #[cfg(unix)]
 impl ShedPolicy {
     /// The level last reported.
-    pub(crate) fn level(&self) -> Option<PressureLevel> {
+    pub(crate) const fn level(&self) -> Option<PressureLevel> {
         self.level
     }
 
@@ -2519,7 +2529,7 @@ struct WorkerState {
 }
 
 #[cfg(unix)]
-fn level_code(level: Option<PressureLevel>) -> u8 {
+const fn level_code(level: Option<PressureLevel>) -> u8 {
     match level {
         None => 0,
         Some(PressureLevel::Normal) => 1,
@@ -3046,6 +3056,7 @@ unsafe fn restore_screen(
     )
     .is_err()
     {
+        // The screen goes blank, and with it every history line the region held: read,
         // so counted (`status history_lost=`, the ledger), not left at 0.
         return Err(RestoreReport {
             history_lost: history_held(&restored),
@@ -3246,11 +3257,12 @@ fn restored_history_lines(restored: &aterm_restore::Restored) -> u32 {
 }
 
 #[cfg(unix)]
-fn first_loss(restored: &aterm_restore::Restored, attempts: u8) -> &'static str {
+const fn first_loss(restored: &aterm_restore::Restored, attempts: u8) -> &'static str {
     let l = &restored.losses;
     if attempts > 0 {
         "keyframe-only"
     } else if l.superseded {
+        // The memory shed had moved the session to a fresh region, and the window died
         // before the keeper took its COMPANION: this is the region it left.
         "superseded"
     } else if l.tail_overflow {
@@ -3278,6 +3290,8 @@ fn first_loss(restored: &aterm_restore::Restored, attempts: u8) -> &'static str 
     } else if l.config_moved {
         "config-moved"
     } else {
+        // Nothing lost: the tail was recorded under another config than this window
+        // runs (a tab with a theme of its own that was writing when it died, or a
         // config edited between the two windows).
         "config"
     }

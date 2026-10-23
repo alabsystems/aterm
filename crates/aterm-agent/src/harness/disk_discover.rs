@@ -1263,6 +1263,8 @@ impl Walk {
                 continue;
             }
             if ty.is_symlink() {
+                // The ONE link followed: a checkout's `target -> target.noindex`
+                // — its marker never read where it leads into a sync root or
                 // another app's container.
                 if n.starts_with("target")
                     && !self.leads_into_mount(&path)
@@ -2042,6 +2044,7 @@ pub fn newest_write(dir: &Path, max: usize) -> Result<Option<i64>, String> {
                     stack.push(e.path());
                 }
             } else if ty.is_file() && !CARGO_LOCKS.iter().any(|l| name == *l) {
+                // A lock file is never written (only created, by cargo or by
                 // a reclaim taking its locks): it dates nothing.
                 newest = newest.max(mtime_of(&e.path()));
             }

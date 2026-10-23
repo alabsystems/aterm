@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Machine-wide point-in-time system probes (CPU ticks, throttle, topology,
-//! memory, GPU, volume space, network links, process/workqueue limits,
-//! load averages, cgroup capacity, and platform capabilities).
-//!
-//! Each reader answers once on demand without background threads, timers, or
-//! subprocesses; unavailable metrics return `None` (with a [`Why`] where needed).
+//! Machine-wide point-in-time system probes (CPU, memory, GPU, storage, network, and limits).
 
 use std::path::{Path, PathBuf};
 
 use crate::{CapSource, Caps, MemoryLevel, Why};
 
-/// Cumulative ticks for one logical core since boot, in platform units
-/// (100 Hz on macOS/Linux `USER_HZ`, 100 ns on Windows).
+/// Cumulative ticks for one logical core since boot, in platform units.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoreTicks {
     /// Running user code at normal or raised priority.
@@ -126,13 +120,13 @@ impl Probe {
 /// Ordered CPU thermal throttle severity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ThrottleLevel {
-    /// Full speed.
+    /// No thermal throttling active.
     Nominal,
-    /// Throttling has begun.
+    /// Light thermal throttling.
     Light,
-    /// Throttling hard.
+    /// Heavy thermal throttling.
     Heavy,
-    /// At the point the OS shuts work, or the machine, down.
+    /// Severe thermal throttling.
     Severe,
 }
 
@@ -194,9 +188,6 @@ impl CpuLayout {
 }
 
 /// Logical cores grouped into OS performance clusters, fastest first.
-///
-/// Reads `hw.perflevelN` and IORegistry `/cpus/cpuN` on macOS, hybrid PMUs or
-/// `cpu_capacity` on Linux, and `EfficiencyClass` CPU sets on Windows.
 #[must_use]
 pub fn cpu_layout() -> CpuLayout {
     #[cfg(target_os = "macos")]
@@ -243,8 +234,7 @@ pub(crate) fn parallelism() -> u16 {
     std::thread::available_parallelism().map_or(0, |n| u16::try_from(n.get()).unwrap_or(u16::MAX))
 }
 
-/// Names for `n` ranked performance levels, fastest first (`"CPU"` for 1,
-/// `"Performance"`/`"Efficiency"` with `"Mid"` tiers between them).
+/// Names for `n` ranked performance levels, fastest first.
 #[must_use]
 pub fn level_names(n: usize) -> Vec<String> {
     match n {
@@ -293,7 +283,6 @@ pub fn layout_by_rank(ranked: &[(u16, u32)]) -> Option<CpuLayout> {
     Some(CpuLayout { clusters })
 }
 
-/// One performance level as macOS names it (`hw.perflevelN.*`).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Level {
@@ -305,7 +294,6 @@ pub(crate) struct Level {
     pub l2: Option<u64>,
 }
 
-/// One device-tree CPU node (`IODeviceTree:/cpus/cpuN`).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DtCpu {
@@ -317,7 +305,6 @@ pub(crate) struct DtCpu {
     pub l2: Option<u64>,
 }
 
-/// Match a device-tree CPU node to its performance level by L2 size or `P`/`E` kind.
 #[cfg(any(target_os = "macos", test))]
 fn level_of(levels: &[Level], cpu: &DtCpu) -> Option<usize> {
     if let Some(l2) = cpu.l2 {
@@ -334,7 +321,6 @@ fn level_of(levels: &[Level], cpu: &DtCpu) -> Option<usize> {
     }
 }
 
-/// Assign logical core IDs to levels from device-tree nodes if complete and exact.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn dt_assignment(
     levels: &[Level],
@@ -363,7 +349,6 @@ pub(crate) fn dt_assignment(
     Some(groups)
 }
 
-/// Fallback contiguous core assignment from slowest level (lowest IDs) to fastest.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn conventional_assignment(levels: &[Level], logical: u16) -> Option<Vec<Vec<u16>>> {
     let sum: u32 = levels.iter().map(|l| u32::from(l.logical)).sum();
@@ -380,7 +365,6 @@ pub(crate) fn conventional_assignment(levels: &[Level], logical: u16) -> Option<
     Some(groups)
 }
 
-/// Build [`CpuLayout`] from device-tree assignment, conventional fallback, or a single cluster.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn layout_of(levels: &[Level], cpus: &[DtCpu], logical: u16) -> CpuLayout {
     let groups =
@@ -424,9 +408,6 @@ impl Commit {
 }
 
 /// Machine memory breakdown by OS page class, swap, commit, and pressure in bytes.
-///
-/// Classes absent on the host OS are `None`. See [`crate::linux::memory_detail`] and
-/// [`crate::windows::memory_detail_of`] for platform mappings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryDetail {
     /// Total physical memory in bytes.
@@ -484,7 +465,6 @@ pub struct VmCounters {
     pub pageins: u64,
 }
 
-/// The `HOST_VM_INFO64` page counts [`memory_detail_of`] reads.
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VmPages {
@@ -505,7 +485,6 @@ pub(crate) struct VmPages {
     pub pageins: u64,
 }
 
-/// Convert `HOST_VM_INFO64` page counts and swap figures into a [`MemoryDetail`].
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn memory_detail_of(
     p: &VmPages,
@@ -619,7 +598,6 @@ pub struct GpuReading {
     pub unread: Option<Why>,
 }
 
-/// Clamp a driver utilization figure to `0..=100`, returning `None` if negative.
 #[cfg(any(target_os = "macos", test))]
 #[must_use]
 pub(crate) fn percent_of(value: i64) -> Option<u8> {
@@ -643,7 +621,7 @@ pub fn gpu() -> Option<GpuReading> {
     }
 }
 
-/// The volume a path lives on.
+/// Capacity and mount metadata for a filesystem volume.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeReading {
     /// Its size in bytes.
@@ -658,7 +636,6 @@ pub struct VolumeReading {
     pub fs: String,
 }
 
-/// Build [`VolumeReading`] from block counts and block size, clamping `free <= total` and `available <= free`.
 #[cfg(any(
     target_os = "macos",
     target_os = "linux",
@@ -686,7 +663,6 @@ pub(crate) fn volume_of(
     }
 }
 
-/// Copy `path` as a NUL-terminated C string into `buf` without heap allocation.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn c_path<'a>(path: &Path, buf: &'a mut [u8]) -> Option<&'a std::ffi::CStr> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -806,16 +782,16 @@ fn linux_volume(path: &Path) -> Option<VolumeReading> {
     ))
 }
 
-/// What a network link is, as the OS classes it.
+/// Network interface classification.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LinkKind {
-    /// Ethernet: built in, USB or Thunderbolt.
+    /// Wired Ethernet or USB interface.
     Wired,
-    /// Wi-Fi.
+    /// Wi-Fi wireless interface.
     Wifi,
-    /// Cellular data.
+    /// Cellular modem interface.
     Cellular,
-    /// Loopback, tunnel, bridge, virtual, companion radio, or unclassified link.
+    /// Other or unclassified interface.
     #[default]
     Other,
 }
@@ -869,17 +845,14 @@ pub struct LinkReading {
     pub tx: LinkCounters,
 }
 
-/// The most interfaces one [`net_links`] reading holds.
+/// Maximum number of interfaces returned by [`net_links`].
 pub const MAX_LINKS: usize = 1024;
 
-/// Interface prefixes excluded from machine-level traffic totals (loopback, tunnels,
-/// bridges, peer-to-peer/companion radios, coprocessor links, and guest links).
 const NOT_MACHINE_LINKS: &[&str] = &[
     "lo", "utun", "ipsec", "ppp", "gif", "stf", "bridge", "awdl", "llw", "nan", "ap", "anpi",
     "vmenet",
 ];
 
-/// True if `name` has a prefix in [`NOT_MACHINE_LINKS`].
 #[must_use]
 pub(crate) fn never_the_machines(name: &str) -> bool {
     NOT_MACHINE_LINKS
@@ -887,8 +860,7 @@ pub(crate) fn never_the_machines(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// True when `link` is up, non-loopback, not in [`NOT_MACHINE_LINKS`], and backed by
-/// hardware (Linux `physical`, or macOS `en*`/`pdp_ip*`).
+/// True when `link` is an active physical non-loopback machine interface.
 #[must_use]
 pub fn counts_toward_machine(link: &LinkReading) -> bool {
     if !link.up || link.loopback || never_the_machines(&link.name) {
@@ -900,7 +872,6 @@ pub fn counts_toward_machine(link: &LinkReading) -> bool {
     }
 }
 
-/// Fallback [`LinkKind`] classification from interface name prefixes.
 #[must_use]
 pub(crate) fn kind_by_name(name: &str) -> LinkKind {
     let any = |prefixes: &[&str]| prefixes.iter().any(|p| name.starts_with(p));
@@ -948,7 +919,6 @@ pub struct ProcessLimits {
     pub per_user: Option<u64>,
 }
 
-/// Minimum of two optional ceilings.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[must_use]
 pub(crate) fn smaller(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -958,14 +928,12 @@ pub(crate) fn smaller(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Convert a soft `rlimit` to `Option<u64>`, mapping `RLIM_INFINITY` to `None`.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[must_use]
 pub(crate) fn rlimit_ceiling(soft: u64, infinity: u64) -> Option<u64> {
     (soft != infinity).then_some(soft)
 }
 
-/// Soft `RLIMIT_NPROC` ceiling for this process, or `None` if unlimited or unreadable.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[cfg_attr(
     target_pointer_width = "64",
@@ -1054,8 +1022,6 @@ pub fn load_average() -> Option<[f64; 3]> {
 }
 
 /// Count total processes/tasks on the machine and processes owned by real user `uid`.
-///
-/// Returns `(all, by_uid)`, with `None` for any unread count.
 #[must_use]
 pub fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     #[cfg(target_os = "macos")]
@@ -1083,11 +1049,9 @@ pub fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     }
 }
 
-/// Upper bound on PID buffer capacity for [`pid_counts`] (131,072 PIDs, 512 KiB).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const MAX_PIDS: usize = 1 << 17;
 
-/// Compute PID buffer capacity (`estimate * 5 / 4`, capped at [`MAX_PIDS`]).
 #[cfg(any(target_os = "macos", test))]
 #[must_use]
 pub(crate) fn pid_room(estimate: i64) -> Option<usize> {
@@ -1095,7 +1059,6 @@ pub(crate) fn pid_room(estimate: i64) -> Option<usize> {
     Some(pids.saturating_add(pids / 4).min(MAX_PIDS))
 }
 
-/// Validate a non-empty PID listing count that did not saturate `room`.
 #[cfg(any(target_os = "macos", test))]
 #[must_use]
 pub(crate) fn listed_count(listed: i64, room: usize) -> Option<u64> {
@@ -1105,7 +1068,6 @@ pub(crate) fn listed_count(listed: i64, room: usize) -> Option<u64> {
     u64::try_from(n).ok()
 }
 
-/// Validate a per-UID PID listing count, treating `listed == 0 && errno == 0` as `Some(0)`.
 #[cfg(any(target_os = "macos", test))]
 #[must_use]
 pub(crate) fn owned_count(listed: i64, errno: i32, room: usize) -> Option<u64> {

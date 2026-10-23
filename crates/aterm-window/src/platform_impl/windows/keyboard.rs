@@ -152,6 +152,7 @@ impl KeyEventBuilder {
                             WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
                         );
                         if next_belongs_to_this {
+                            // The next OS event belongs to this Winit event, so let's just
                             // store the partial information, and add to it in the upcoming events
                             *event_info = finished_event_info.take();
                         } else {
@@ -232,6 +233,7 @@ impl KeyEventBuilder {
                         .map(|m| matches!(m.message, WM_CHAR | WM_SYSCHAR))
                         .unwrap_or(false);
                     if more_char_coming {
+                        // No need to produce an event just yet, because there are still more
                         // characters that need to be appended to this keyboard event
                         MatchResult::TokenToRemove(pending_token)
                     } else {
@@ -576,6 +578,7 @@ impl PartialKeyEventInfo {
         let logical_key = if let Some(key) = code_as_key.clone() {
             PartialLogicalKey::This(key)
         } else if is_pressed && key_is_char && !mods.contains(WindowsModifiers::CONTROL) {
+            // In some cases we want to use the UNICHAR text for logical_key in order to allow
             // dead keys to have an effect on the character reported by `logical_key`.
             PartialLogicalKey::TextOr(preliminary_logical_key)
         } else {
@@ -638,6 +641,12 @@ impl PartialKeyEventInfo {
         let logical_key = match self.logical_key {
             PartialLogicalKey::TextOr(fallback) => match text.as_ref() {
                 Some(s) => {
+                    // LOCAL PATCH (aterm): aterm-grapheme's UAX #29 segmenter (Unicode 16, the
+                    // one aterm segments terminal text with) replaces unicode-segmentation's
+                    // `grapheme_indices(true)` (Unicode 17). The two answer this question alike
+                    // except on Unicode 16 -> 17 property changes no keyboard layout types;
+                    // crates/aterm-grapheme/tests/uax29_conformance.rs
+                    // (`where_unicode_segmentation_disagreed_this_crate_follows_unicode_16`)
                     // records them.
                     if s.graphemes().count() > 1 {
                         fallback
@@ -857,6 +866,7 @@ impl<T> PendingEventQueue<T> {
             }
         }
         if target_is_first {
+            // If the message that we just finished was the first one in the pending queue,
             // then we can empty the queue, and dispatch all of the messages.
             Self::drain_pending(&mut *pending)
         } else {

@@ -1195,6 +1195,7 @@ pub fn awaited_try_in(body: &str, sid: Option<&str>) -> Option<AwaitedTry> {
         let rule = text("rule_id").unwrap_or("");
         let ts = v.get("ts").and_then(aterm_json::Value::as_i64);
         if text("decision") == Some("typed") {
+            // The accounts probe's `/usage` is no act; an account move made
             // relaunched the agent, and nothing typed before it is awaited.
             if rule == RULE_USAGE_PROBE {
                 continue;
@@ -1285,6 +1286,7 @@ pub fn usage_attempt_taken_in(
         };
         let first = read && last.is_some() && !std::mem::replace(&mut seen, true);
         if text("decision") == Some("waiting") {
+            // Existing point/answer/wall records can retain an upgraded
             // unknown even after the try closed OpenWall. No new row kind.
             if matches!(
                 text("rule_id"),
@@ -1293,6 +1295,7 @@ pub fn usage_attempt_taken_in(
                 && let Some(a) = last.as_mut()
                 && row_conversation(&v) != a.conversation
             {
+                // A later wall/point cannot relabel the actual try as
                 // another conversation, nor prove a legacy try's owner.
                 a.conversation = Conversation::Unknown;
             }
@@ -2331,6 +2334,7 @@ impl SwitchWalk {
                     c.strip_prefix("relaunch --model ")
                         .or_else(|| c.strip_prefix("/model "))
                 }) else {
+                    // The switch's own turn (a `/model` switch's `keep
                     // going`): asked on the fallback.
                     if let Some(open) = &mut self.open {
                         open.asked = true;

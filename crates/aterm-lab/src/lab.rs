@@ -563,8 +563,8 @@ fn jailed_command(
 /// takes no ready signal (`--ready-fd` is a headless launch's, refused for a
 /// window a person sees come up), so it is ready once its control socket
 /// answers `version` through the lab's door, asked every 250 ms up to `hang`
-/// (the hang detector).
-///
+/// (the hang detector). `pid` is set to the child's as soon as it is spawned,
+/// so a caller's cleanup ends it.
 /// # Errors
 /// The launch failed, the child ended before its socket answered, it did not
 /// answer within `hang`, or the run was interrupted (`interrupted`).
@@ -885,8 +885,11 @@ pub(crate) fn names_this_lab(run: &Run, pid: i32) -> bool {
 
 /// Whether `up` may make the lab `run` names at `now`: no lab of its tag is
 /// up (no `env.sh`), and no copy of the lab's program an earlier lab of the
-/// tag left is still unproven.
-///
+/// tag left is still unproven. Such copies (an aterm-lab before this one's
+/// `down` dropped `env.sh` while keeping them) go once they may
+/// ([`sweep_copies`]); until then the tag waits. So `up` never lays its copy
+/// over a file whose first exec macOS may still be assessing, and never
+/// hands the new lab an older lab's relay.
 /// # Errors
 /// Why the tag cannot come up now.
 fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
@@ -1789,8 +1792,12 @@ fn relay_shown_running(run: &Run) -> bool {
 }
 
 /// Lay the relay for a launch behind it: this program under the name `node`,
-/// copied where jailed code cannot write (`relay/node`), ONCE per lab.
-///
+/// copied where jailed code cannot write (`relay/node`), ONCE per lab. The
+/// copy is the same file at every launch (the lab's program does not change
+/// while it is up), and a later launch never replaces it: an earlier launch's
+/// relay may still be starting from it, its first exec under assessment, and
+/// a file renamed over or removed then crashes `syspolicyd`. A relay that
+/// made its log ran, which is recorded before the log goes ([`RELAY_RAN`]).
 /// # Errors
 /// The copy could not be made.
 fn lay_relay(run: &Run) -> Result<(), Fail> {

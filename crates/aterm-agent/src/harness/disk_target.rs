@@ -2358,6 +2358,8 @@ mod fd {
         }
         let mut done = Removed::default();
         for profile in &profiles {
+            // Not the one asked for, or a profile of a build directory named
+            // inside this one, which decides its own (one that cannot be
             // placed is left too): passed over, no lock taken.
             if wanted.is_some_and(|w| !same_path(profile, w))
                 || leave

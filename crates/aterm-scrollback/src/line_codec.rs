@@ -297,6 +297,7 @@ impl Line {
             return None;
         }
         if data[content_end] == 0 {
+            // saturating_add cannot wrap here (guard above); it discharges an obligation
             // the verifier cannot chain.
             return Some((None, content_end.saturating_add(1)));
         }

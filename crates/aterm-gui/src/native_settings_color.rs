@@ -62,7 +62,7 @@ pub(super) enum ColorTarget {
 
 impl ColorTarget {
     /// The node keys' and actions' name: the key, or [`PALETTE_SLOT_ID`].
-    fn id(self) -> &'static str {
+    const fn id(self) -> &'static str {
         match self {
             Self::Key(key) => key,
             Self::Slot(_) => PALETTE_SLOT_ID,
@@ -118,7 +118,7 @@ impl SettingsViewState {
         true
     }
 
-    /// What the wheel that holds the keyboard picks.
+    /// What the wheel that holds the keyboard picks for.
     pub(super) fn focused_color_wheel(&self) -> Option<ColorTarget> {
         let id = self
             .common

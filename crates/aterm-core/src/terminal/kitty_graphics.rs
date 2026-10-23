@@ -3,14 +3,6 @@
 // Author: Andrew Yates
 
 //! Kitty graphics protocol (APC `G`) command parser.
-//!
-//! Parses `APC G <control> ; <base64 payload> ST` into a [`KittyCommand`]: the control data is
-//! comma-separated `key=value` pairs, the payload the base64 image data (or, for a non-direct
-//! medium, a path or shared-memory name). Pure and panic-free. The image store, placements and
-//! deletes live in `handler_actions.rs` (`handle_complete_kitty_command` lists what the engine
-//! does not implement).
-//!
-//! Protocol: <https://sw.kovidgoyal.net/kitty/graphics-protocol/>.
 
 /// The `a=` action of a Kitty graphics command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -80,9 +72,7 @@ pub enum KittyMedium {
     SharedMemory,
 }
 
-/// A parsed Kitty graphics command. Every numeric field is `Option` so an absent
-/// key is distinguishable from an explicit `0`; the payload is base64-decoded
-/// (empty when absent or undecodable).
+/// A parsed Kitty graphics command.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -97,107 +87,75 @@ pub struct KittyCommand {
     pub format: KittyFormat,
     /// `t=` — transmission medium (default [`KittyMedium::Direct`]).
     pub medium: KittyMedium,
-    /// `i=` — client-assigned image id. `i=0` means "none", as in kitty.
+    /// `i=` — client-assigned image id.
     pub id: Option<u32>,
-    /// `I=` — client-assigned image number (id alternative: the terminal picks
-    /// the id and reports it). `I=0` means "none".
+    /// `I=` — client-assigned image number (id alternative: the terminal picks the id and reports
+    /// it).
     pub number: Option<u32>,
-    /// `p=` — placement id. `p=0` means "none".
+    /// `p=` — placement id.
     pub placement: Option<u32>,
-    /// `x=` — for a display, the left edge of the source rectangle in pixels;
-    /// for a delete (`d=p`/`q`/`x`), the 1-based cell column; for `d=r`, the
-    /// lowest image id of the range.
+    /// `x=` — for a display, the left edge of the source rectangle in pixels.
     pub x: Option<u32>,
-    /// `y=` — for a display, the top edge of the source rectangle in pixels;
-    /// for a delete (`d=p`/`q`/`y`), the 1-based cell row; for `d=r`, the
-    /// highest image id of the range.
+    /// `y=` — for a display, the top edge of the source rectangle in pixels.
     pub y: Option<u32>,
-    /// `w=` — width of the source rectangle in pixels (`0`/absent = to the
-    /// right edge).
+    /// `w=` — width of the source rectangle in pixels (`0`/absent = to the right edge).
     pub crop_width: Option<u32>,
-    /// `h=` — height of the source rectangle in pixels (`0`/absent = to the
-    /// bottom edge).
+    /// `h=` — height of the source rectangle in pixels (`0`/absent = to the bottom edge).
     pub crop_height: Option<u32>,
     /// `C=1` — do not move the cursor after placing the image.
     pub cursor_stays: bool,
-    /// `U=1` — a virtual placement: the image is shown only where the client
-    /// prints Unicode placeholders, never stamped at the cursor.
+    /// `U=1` — a virtual placement: the image is shown only where the client prints Unicode
+    /// placeholders, never stamped at the cursor.
     pub virtual_placement: bool,
-    /// `s=` — source image width in pixels (for raw formats); for `a=a`, the
-    /// animation state (1 stop, 2 run while loading, 3 run).
+    /// `s=` — source image width in pixels (for raw formats).
     pub width: Option<u32>,
-    /// `v=` — source image height in pixels (for raw formats); for `a=a`, the
-    /// loop count (1 forever, `n` n−1 times).
+    /// `v=` — source image height in pixels (for raw formats).
     pub height: Option<u32>,
-    /// `c=` — display width in cells (columns); for `a=f`, `a=c` and `a=a`,
-    /// a frame number.
+    /// `c=` — display width in cells (columns); for `a=f`, `a=c` and `a=a`, a frame number.
     pub columns: Option<u32>,
-    /// `r=` — display height in cells (rows); for `a=f`, `a=c`, `a=a` and a
-    /// frame delete, a frame number.
+    /// `r=` — display height in cells (rows).
     pub rows: Option<u32>,
-    /// `z=` — z-index (may be negative: behind the text); for `a=f` and
-    /// `a=a`, a frame's gap in milliseconds (negative: gapless).
+    /// `z=` — z-index (may be negative: behind the text).
     pub z_index: Option<i32>,
-    /// `X=` — for a display, the pixel offset within the first cell at which
-    /// the image starts; for `a=f`, the frame's composition mode; for `a=c`,
-    /// the source rectangle's left edge.
+    /// `X=` — for a display, the pixel offset within the first cell at which the image starts.
     pub cell_x_offset: Option<u32>,
-    /// `Y=` — for a display, the pixel offset within the first cell at which
-    /// the image starts; for `a=f`, the frame's background colour; for `a=c`,
-    /// the source rectangle's top edge.
+    /// `Y=` — for a display, the pixel offset within the first cell at which the image starts.
     pub cell_y_offset: Option<u32>,
-    /// `P=` — the image id of a relative placement's parent. `P=0` means none.
+    /// `P=` — the image id of a relative placement's parent.
     pub parent_id: Option<u32>,
-    /// `Q=` — the placement id of a relative placement's parent. `Q=0` means
-    /// none.
+    /// `Q=` — the placement id of a relative placement's parent.
     pub parent_placement: Option<u32>,
-    /// `H=` — a relative placement's offset from its parent, in columns
-    /// (negative is left).
+    /// `H=` — a relative placement's offset from its parent, in columns (negative is left).
     pub parent_dx: Option<i32>,
-    /// `V=` — a relative placement's offset from its parent, in rows (negative
-    /// is up).
+    /// `V=` — a relative placement's offset from its parent, in rows (negative is up).
     pub parent_dy: Option<i32>,
     /// `m=1` — more chunks of this image follow (chunked transmission).
     pub more: bool,
     /// `o=z` — the payload is zlib-compressed.
     pub compressed: bool,
-    /// `d=` — for `a=d` delete, what to delete: `i`/`I` = by image id (`i=`),
-    /// `a`/`A` = all, etc. `None` (no `d=`) means delete all visible placements.
+    /// `d=` — for `a=d` delete, what to delete: `i`/`I` = by image id (`i=`), `a`/`A` = all, etc.
     pub delete_target: Option<char>,
     /// The base64-decoded payload (image bytes for `t=d`, else a path / shm name).
-    /// Empty when there was no payload or it failed to decode.
     pub payload: Vec<u8>,
 }
 
-/// The largest width or height, in pixels, of an image kitty loads (its
-/// `MAX_IMAGE_DIMENSION`).
+/// The largest width or height, in pixels, of an image kitty loads (its `MAX_IMAGE_DIMENSION`).
 pub(crate) const MAX_KITTY_DIMENSION: u32 = 10_000;
 
-/// What a command arriving during a chunked load (`m=1`) does to that load. As in kitty's
-/// `grman_handle_command` (`graphics.c`), only action and medium decide. The two commands
-/// handled before routing (both `i=` and `I=`; a query with no `i=`) never get here
-/// (`handle_kitty_command` in `handler_actions.rs`).
+/// What a command arriving during a chunked load (`m=1`) does to that load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DuringLoad {
-    /// A chunk of the load: a transmit, query or frame load on the direct
-    /// medium, whatever else it carries. Only its payload, `m=` and a non-zero
-    /// `q=` count, so a client that repeats the first chunk's keys on every
-    /// chunk, and the `a=f` the protocol puts on every frame chunk, still
-    /// assemble.
+    /// A chunk of the load: a transmit, query or frame load on the direct medium, whatever else it
+    /// carries.
     Continues,
-    /// A command of its own that ends the load first: a delete (the protocol:
-    /// "the partial upload must be aborted"), or a transmit, query or frame
-    /// load on another medium, which kitty reads at once.
+    /// A command of its own that ends the load first.
     Ends,
-    /// A command of its own that leaves the load in flight: a put, a
-    /// composition or an animation control.
+    /// A command of its own that leaves the load in flight.
     Beside,
 }
 
 impl KittyCommand {
-    /// How this command is read while a chunked load is in flight. Only a
-    /// command that would continue a load can open one with `m=1`, and only
-    /// when kitty accepts it as a first chunk (`handle_kitty_command`).
+    /// How this command is read while a chunked load is in flight.
     #[inline]
     pub(crate) const fn during_load(&self) -> DuringLoad {
         match self.action {
@@ -218,12 +176,7 @@ impl KittyCommand {
         }
     }
 
-    /// Whether kitty would begin loading this command's data: no declared side (`s=`, `v=`)
-    /// over `MAX_KITTY_DIMENSION`, whatever the format, and for raw pixels both sides declared
-    /// and at least 1 (a PNG's size comes from its data). kitty checks the sides before the
-    /// format (`handle_add_command`, `handle_animation_frame_load_command` for `a=f`), then
-    /// refuses zero-area raw pixels (`initialize_load_data`); any other command it aborts at the
-    /// first chunk, holding no load and storing no image.
+    /// Whether kitty would begin loading this command's data.
     #[inline]
     pub(crate) const fn declares_loadable_size(&self) -> bool {
         let width_within = match self.width {
@@ -242,14 +195,8 @@ impl KittyCommand {
     }
 }
 
-/// Parse a Kitty graphics APC command from the raw APC payload (the bytes between
-/// `APC` and `ST`), which for a graphics command begins with the `G` identifier.
-///
-/// Returns `None` when the payload is not a `G` command or the control data is not
-/// valid UTF-8. Unknown control keys are ignored and a duplicate key takes the
-/// last value (matching kitty). A malformed or absent base64 payload yields an
-/// empty [`KittyCommand::payload`] rather than a parse failure, so the control
-/// half is still usable (e.g. a query or delete with no data). Never panics.
+/// Parse a Kitty graphics APC command from the raw APC payload (the bytes between `APC` and `ST`),
+/// which for a graphics command begins with the `G` identifier.
 #[must_use]
 pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
     let rest = apc.strip_prefix(b"G")?;
@@ -316,7 +263,6 @@ pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
         }
     }
 
-    // Standard-alphabet base64, unwrapped.
     if !payload_b64.is_empty()
         && let Ok(s) = std::str::from_utf8(payload_b64)
         && let Ok(bytes) = aterm_codec::base64::decode(s)
@@ -327,19 +273,12 @@ pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
     Some(cmd)
 }
 
-/// Parse an id-like key (`i=`, `I=`, `p=`), where kitty reserves `0` for "not
-/// specified".
 #[inline]
 fn nonzero(value: &str) -> Option<u32> {
     value.parse().ok().filter(|&v| v != 0)
 }
 
-/// Compose straight-alpha RGBA8 pixels the way kitty composes animation
-/// frames: the `w × h` rectangle at `(sx, sy)` of `over` (a raster `over_w`
-/// pixels wide) lands at `(dx, dy)` of `under` (a raster `under_w` pixels
-/// wide) — alpha-blended ("source over") when `blend`, copied when not
-/// (kitty's `X=1` / `C=1`). Whatever falls outside either raster is skipped,
-/// so no geometry a client sends can index out of bounds.
+/// Compose straight-alpha RGBA8 pixels the way kitty composes animation frames.
 pub fn compose_rgba(
     under: &mut [u8],
     under_w: usize,
@@ -375,7 +314,6 @@ pub fn compose_rgba(
     }
 }
 
-/// Straight-alpha "source over" of one RGBA8 pixel onto another.
 #[inline]
 fn blend_over(dst: &mut [u8], src: &[u8]) {
     let sa = u32::from(src[3]);
@@ -387,7 +325,6 @@ fn blend_over(dst: &mut [u8], src: &[u8]) {
         return;
     }
     let dst_weight = u32::from(dst[3]) * (255 - sa);
-    // The result's alpha, scaled by 255: never 0, since `sa > 0`.
     let alpha = sa * 255 + dst_weight;
     for c in 0..3 {
         let mixed = u32::from(src[c]) * sa * 255 + u32::from(dst[c]) * dst_weight;
@@ -396,15 +333,12 @@ fn blend_over(dst: &mut [u8], src: &[u8]) {
     dst[3] = u8::try_from((alpha + 127) / 255).unwrap_or(u8::MAX);
 }
 
-/// Extract `(width, height)` in pixels from a PNG's IHDR header, or `None` if the bytes are not
-/// a PNG. Gives a PNG's cell footprint without a decode (the renderer decodes at draw time).
+/// Extract `(width, height)` in pixels from a PNG's IHDR header, or `None` if the bytes are not a
+/// PNG.
 #[must_use]
 #[inline]
 pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-    // PNG: 8-byte signature, then the IHDR chunk
-    // `[len:4][type:4 "IHDR"][width:4 BE][height:4 BE]…`. Width is at byte 16,
-    // height at byte 20.
     if bytes.len() < 24 || bytes[..8] != SIG {
         return None;
     }
@@ -413,8 +347,8 @@ pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// Expand packed RGB (`f=24`, 3 bytes/pixel) to RGBA (4 bytes/pixel, opaque
-/// alpha) for the renderer's `RawRgba8` path. A trailing partial pixel is dropped.
+/// Expand packed RGB (`f=24`, 3 bytes/pixel) to RGBA (4 bytes/pixel, opaque alpha) for the
+/// renderer's `RawRgba8` path.
 #[must_use]
 pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
@@ -424,13 +358,9 @@ pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A zlib stream (RFC 1950) of `len` zero bytes, `len >= 1`: a literal zero, then
-/// 258-byte back-references at distance 1 (about 13 bits per 258 bytes). An `o=z`
-/// payload for tests that need large rasters from little output.
+/// A zlib stream (RFC 1950) of `len` zero bytes, `len >= 1`.
 #[cfg(test)]
 pub(crate) fn zlib_zeros(len: usize) -> Vec<u8> {
-    // Deflate packs fields low bit first; a Huffman code goes out most
-    // significant bit first.
     let mut bits: Vec<u8> = Vec::new();
     let mut field = |value: u32, n: u32| bits.extend((0..n).map(|i| ((value >> i) & 1) as u8));
     let code = |code: u32, n: u32| (0..n).fold(0, |r, i| r | ((code >> i) & 1) << (n - 1 - i));
@@ -452,7 +382,6 @@ pub(crate) fn zlib_zeros(len: usize) -> Vec<u8> {
             .enumerate()
             .fold(0u8, |acc, (i, &bit)| acc | (bit << i))
     }));
-    // Adler-32 of zeros: `a` stays 1, `b` counts the bytes.
     let b = u32::try_from(len % 65521).expect("below 65521");
     out.extend_from_slice(&((b << 16) | 1).to_be_bytes());
     out
@@ -462,8 +391,6 @@ pub(crate) fn zlib_zeros(len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// Build an APC `G` payload from a control string + raw payload bytes (base64-
-    /// encoded here so the parser decodes them back).
     fn apc(control: &str, payload: &[u8]) -> Vec<u8> {
         let mut v = b"G".to_vec();
         v.extend_from_slice(control.as_bytes());
@@ -596,7 +523,6 @@ mod tests {
 
     #[test]
     fn bad_base64_keeps_command_with_empty_payload() {
-        // '!' is not in the base64 alphabet -> payload undecodable, control intact.
         let c = parse_kitty_command(b"Ga=T,i=9;!!!not-base64!!!").expect("parses control");
         assert_eq!(c.action, KittyAction::TransmitAndDisplay);
         assert_eq!(c.id, Some(9));
@@ -608,15 +534,12 @@ mod tests {
 
     #[test]
     fn non_utf8_control_is_none() {
-        // A 0xFF byte in the control half is not valid UTF-8.
         assert!(parse_kitty_command(b"Ga=\xfft").is_none());
     }
 
     #[test]
     fn compose_rgba_copies_blends_and_clips() {
-        // A 2x2 opaque blue canvas.
         let mut under = [0, 0, 255, 255].repeat(4);
-        // A 1x1 half-transparent red pixel, blended at (1, 1).
         compose_rgba(
             &mut under,
             2,
@@ -632,7 +555,6 @@ mod tests {
             "source over an opaque pixel"
         );
         assert_eq!(&under[..4], &[0, 0, 255, 255], "the rest untouched");
-        // The same pixel copied keeps its own alpha.
         compose_rgba(
             &mut under,
             2,
@@ -643,7 +565,6 @@ mod tests {
             false,
         );
         assert_eq!(&under[..4], &[255, 0, 0, 128]);
-        // Over a fully transparent pixel, blending is the source itself.
         let mut clear = [0u8; 4];
         compose_rgba(
             &mut clear,
@@ -655,7 +576,6 @@ mod tests {
             true,
         );
         assert_eq!(clear, [10, 20, 30, 40]);
-        // Out of bounds on every side: clipped.
         let before = under.clone();
         compose_rgba(&mut under, 2, (2, 0), &[1; 16], 2, (0, 0, 9, 9), false);
         compose_rgba(&mut under, 2, (0, 0), &[1; 16], 2, (2, 2, 9, 9), false);
@@ -670,7 +590,6 @@ mod tests {
 
     #[test]
     fn png_dimensions_reads_ihdr() {
-        // Minimal PNG signature + IHDR with width=3, height=5.
         let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         png.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
         png.extend_from_slice(b"IHDR");
@@ -685,7 +604,6 @@ mod tests {
     fn rgb_to_rgba_inserts_opaque_alpha() {
         let rgba = rgb_to_rgba(&[1, 2, 3, 4, 5, 6]);
         assert_eq!(rgba, vec![1, 2, 3, 0xff, 4, 5, 6, 0xff]);
-        // Trailing partial pixel is dropped.
         assert_eq!(rgb_to_rgba(&[9, 9]), Vec::<u8>::new());
     }
 }

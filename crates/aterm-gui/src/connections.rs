@@ -130,6 +130,7 @@ pub(crate) fn connect_in(
     origin: &str,
 ) -> bool {
     if src == dst {
+        // Refused before any state is touched — `grant_connection` would also
         // refuse, but a self-loop must not even churn the record store.
         return false;
     }
@@ -338,6 +339,7 @@ pub(crate) fn sweep_session_closed_in(
         .collect();
     for (sid, ctx) in survivors {
         if sid == *closing {
+            // A caller that swept before deregistering (or a duplicate-close
             // race) must not "sweep" the dying session's own table.
             continue;
         }
@@ -346,6 +348,7 @@ pub(crate) fn sweep_session_closed_in(
             edges.revoke_src(closing)
         };
         if removed > 0 {
+            // Audit off the table lock; `op=*`, since the sweep removes every op
             // the source held (the `revoke src=` wire-form convention).
             session_edge_audit::emit(EdgeAction::RevokeSrc, "close", closing, &sid, "*");
         }

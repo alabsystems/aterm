@@ -711,7 +711,7 @@ pub(crate) fn strip_sgr(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// How far into a `/fast` result (SGR stripped, in UTF-16 code units, as JavaScript's `indexOf`
-/// counts) Claude's classifier takes the `Fast mode ON · model set to `` phrase (Claude Code
+/// counts) Claude's classifier takes the `` Fast mode ON · model set to ` `` phrase (Claude Code
 /// 2.1.283): room for the icon and a space.
 const FAST_ON_LEAD: usize = 4;
 

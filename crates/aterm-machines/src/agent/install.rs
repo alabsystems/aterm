@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `agent install` (enrollment's last step, root through a password `sudo`, never through
-//! the sudoers rule) and the `uninstall` envelope's work (design §3.2, §4.2).
-//!
-//! `install --admin <user> --fleet-key <public key line> --allowed-signers <file>
-//! --payload-sha <hex> --stage <dir>` runs from the staged, root-owned agent that the
-//! enrollment command line expanded into `/Library/Management/aterm/.staging/payload`.
-//! It:
-//!
-//! 1. refuses, before it changes anything, on a Mac already enrolled (`allowed_signers`
-//!    exists): after enrollment only a signed rekey envelope changes who the Mac trusts;
-//! 2. checks its arguments, its stage, its own path chain, and that it is the executable
-//!    an upgrade would find in the same archive (`job::find_executable`);
-//! 3. makes `state/`, `cache/`, `stage/`, `inbox/` and `bin/` (root:wheel 0755);
-//! 4. moves the stage into `agent/` (an earlier agent into `agent.prev/`) and points
-//!    `bin/aterm` at the agent's executable;
-//! 5. writes the sudoers drop-in with the executable's SHA-256, checked by `visudo -cf`
-//!    before it is moved into `/etc/sudoers.d` (0440);
-//! 6. writes `managed.toml` and `.metadata_never_index`;
-//! 7. adds the fleet key's restricted line to the admin's `~/.ssh/authorized_keys`, written
-//!    by the agent re-run as the admin (`put-file`), never by root;
-//! 8. writes `allowed_signers` (0644), last, so an install that failed before it can be
-//!    run again.
+//! Enrollment `agent install` and `uninstall` envelope execution.
 
 use super::state::{self, Managed};
 use super::{Layout, chain};
@@ -41,7 +20,7 @@ pub struct Args {
     pub admin: String,
     /// The fleet key's public line (`ssh-ed25519 <base64> <comment>`).
     pub fleet_key: String,
-    /// The `allowed_signers` document to install (a root-owned copy in the staging area).
+    /// The `allowed_signers` document to install.
     pub allowed_signers: PathBuf,
     /// SHA-256 of the agent archive.
     pub payload_sha: String,
@@ -96,10 +75,7 @@ pub fn account_ok(name: &str) -> bool {
         && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.'))
 }
 
-/// The sudoers drop-in (design §3.2): the one NOPASSWD command, pinned by digest.
-///
-/// visudo on macOS 27 (sudo 1.9.17p2) refuses the design's `env_keep = ""` ("empty
-/// string"); `!env_keep`, measured in the VM, clears the list instead.
+/// The sudoers drop-in for the NOPASSWD apply command pinned by digest.
 #[must_use]
 pub fn sudoers_text(admin: &str, sha256: &str) -> String {
     let exe = crate::protocol::AGENT_EXE;
@@ -112,8 +88,7 @@ pub fn sudoers_text(admin: &str, sha256: &str) -> String {
     )
 }
 
-/// Render the drop-in for `admin` and `sha256` and have `visudo -cf` check it. Returns
-/// the checked text for the caller to move into place.
+/// Render the drop-in for `admin` and `sha256` and have `visudo -cf` check it.
 ///
 /// # Errors
 /// One line with visudo's complaint.
@@ -183,8 +158,7 @@ pub fn fleet_line(fleet_key: &str) -> Result<String, String> {
     ))
 }
 
-/// `authorized_keys` with `line` in it once: any line holding the same key (`blob`, its
-/// base64) is replaced, every other line is kept as it was.
+/// `authorized_keys` with `line` in it once, replacing any line holding the same key (`blob`).
 #[must_use]
 pub fn merge_authorized_keys(current: &str, line: &str, blob: &str) -> String {
     let mut out = String::new();
@@ -214,8 +188,6 @@ pub fn strip_authorized_keys(current: &str) -> String {
         .collect()
 }
 
-/// The admin's `authorized_keys`, read as the admin (root never opens a path in a user's
-/// home). A missing file reads as empty.
 fn read_as(sys: &dyn System, user: &User, path: &Path) -> Result<String, String> {
     let ran = sys
         .run(&Cmd::new("/bin/cat").arg(path.as_os_str()).as_user(user))
@@ -234,7 +206,6 @@ fn read_as(sys: &dyn System, user: &User, path: &Path) -> Result<String, String>
     ))
 }
 
-/// Write `bytes` to `path` as `user` through `agent put-file`, run from `exe`.
 fn put_as(
     sys: &dyn System,
     layout: &Layout,
@@ -294,10 +265,6 @@ pub fn main(
     }
 }
 
-/// Refuse an install on a Mac that is already enrolled: one whose `allowed_signers` exists
-/// (or cannot be looked at). Install runs under the admin's password sudo; once enrolled,
-/// only a signed rekey envelope may change who the Mac trusts, so a second enrollment
-/// must never replace `allowed_signers` (design review).
 fn refuse_enrolled(sys: &dyn System, layout: &Layout, admin: &User) -> Result<(), String> {
     let signers = layout.allowed_signers();
     let how = format!(
@@ -323,11 +290,10 @@ fn refuse_enrolled(sys: &dyn System, layout: &Layout, admin: &User) -> Result<()
     }
 }
 
-/// The install itself, for the resolved `admin`.
+/// Perform the agent installation for the resolved `admin`.
 ///
 /// # Errors
-/// One line; whatever was done before it stays (re-running install finishes it, because
-/// `allowed_signers`, which makes the Mac enrolled, is written last).
+/// One line naming why installation failed.
 pub fn install(
     sys: &dyn System,
     layout: &Layout,
@@ -336,7 +302,6 @@ pub fn install(
     admin: &User,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    // Before anything is changed or even checked further.
     refuse_enrolled(sys, layout, admin)?;
     if !account_ok(&args.admin) || admin.name != args.admin {
         return Err(format!("{:?} is not a plain account name", args.admin));
@@ -366,9 +331,6 @@ pub fn install(
         ));
     }
     let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
-    // The staging area and the agent root are made by the enrollment command line as root;
-    // the chain check covers them and everything above. Every file of the payload is made
-    // root's too (the line does it already; a bundle's other files are code root runs).
     super::job::own_tree(sys, &payload)?;
     chain::check(sys, exe)?;
     let signers = sys
@@ -376,8 +338,6 @@ pub fn install(
         .map_err(|e| io(&args.allowed_signers, e))?;
     let signers = String::from_utf8(signers).map_err(|_| "allowed_signers is not UTF-8")?;
     let principals = crate::envelope::check_signers(&signers)?;
-    // An archive that cannot be hashed is not one that hashed right (tri-state: an
-    // unreadable answer is never the expected one).
     let archive = layout.staging().join("payload.zip");
     match sys.sha256(&archive) {
         Ok(got) if got == args.payload_sha => {}
@@ -394,8 +354,6 @@ pub fn install(
         .strip_prefix(&payload)
         .map_err(|_| "the staged executable is outside the stage")?
         .to_path_buf();
-    // An upgrade finds the executable in its archive itself: an agent enrolled from an
-    // archive it would read differently could never be upgraded.
     let (found, _) = super::job::find_executable(sys, &payload)?;
     if found != rel {
         return Err(format!(
@@ -404,8 +362,6 @@ pub fn install(
             found.display()
         ));
     }
-    // The admin reads `hello`'s state and runs bin/aterm as the forced command, so these
-    // must be open to others for reading and search; stage/ and inbox/ are root's alone.
     for (dir, open) in [
         (layout.root.clone(), true),
         (layout.bin(), true),
@@ -444,7 +400,6 @@ pub fn install(
             ));
         }
     }
-    // The agent: the stage becomes agent/, an earlier agent agent.prev/.
     if sys.stat(&layout.agent()).is_ok() {
         super::remove_tree(sys, &layout.previous()).map_err(|e| io(&layout.previous(), e))?;
         sys.rename(&layout.agent(), &layout.previous())
@@ -455,8 +410,6 @@ pub fn install(
     let installed = layout.agent().join(&rel);
     link_exe(sys, layout, &installed)?;
     chain::check(sys, &layout.exe_link())?;
-    // The lines below are what the owner reads at enrollment: what changes for them, in
-    // plain words. Where each thing lives is the design's (§3.2) and `managed.toml`'s.
     let digest = sys.sha256(&installed).map_err(|e| io(&installed, e))?;
     let sudoers = check_sudoers(sys, layout, &args.admin, &digest)?;
     sys.write_file(Path::new(crate::SUDOERS_FILE), sudoers.as_bytes(), 0o440)
@@ -497,10 +450,6 @@ pub fn install(
         "this Mac now lets the controller in with its own key, which can only talk to \
          aterm's helper"
     );
-    // Last: this file makes the Mac enrolled (a later install refuses), and until it
-    // exists no envelope verifies, so the rule and the key above admit nothing yet. A
-    // state/ left by an earlier agent keeps its floors; a key listed again under a new
-    // principal must not start that principal at floor 0.
     state::inherit_floors(sys, layout, &principals)?;
     sys.write_file(&layout.allowed_signers(), signers.as_bytes(), 0o644)
         .map_err(|e| io(&layout.allowed_signers(), e))?;
@@ -518,8 +467,6 @@ pub fn install(
     Ok(())
 }
 
-/// Who `principals` (`signing@m14`, `recovery@m14`) are, as the owner knows them: the
-/// controllers they name (`the controller m14`), each once.
 fn signed_by(principals: &[String]) -> String {
     let mut hosts: Vec<&str> = Vec::new();
     for p in principals {
@@ -534,9 +481,7 @@ fn signed_by(principals: &[String]) -> String {
     }
 }
 
-/// The `uninstall` envelope (design §4.2): each user's `aterm_github` key, the
-/// `authorized_keys` line, the sudoers file, then the agent itself. Runs in the foreground
-/// of `apply`; the report is streamed before the agent root is removed.
+/// Execute the `uninstall` envelope and stream the host report before removing the agent root.
 pub fn uninstall(
     sys: &dyn System,
     layout: &Layout,
@@ -548,8 +493,6 @@ pub fn uninstall(
     let started = sys.now();
     let facts = crate::facts::gather(sys);
     let mut rows: Vec<ItemReport> = Vec::new();
-    // Each step says whether it removed anything: a key a user never had is `ok`, never a
-    // change.
     let mut step = |id: &str, title: &str, done: Result<bool, String>| {
         let row = ItemReport {
             id: id.to_owned(),
@@ -580,7 +523,6 @@ pub fn uninstall(
         let key = Path::new(&user.home).join(".ssh/aterm_github_ed25519");
         let mut public = key.clone().into_os_string();
         public.push(".pub");
-        // `rm -v` names each file it removed, so nothing printed is nothing there.
         let ran = sys.run(
             &Cmd::new("/bin/rm")
                 .arg("-fv")
@@ -614,7 +556,6 @@ pub fn uninstall(
         "the controller's key, which let it in without a password",
         keys_done,
     );
-    // The upload inbox `put` made in the admin's home, removed as the admin.
     let inbox_done = admin.as_ref().map_err(Clone::clone).and_then(|admin| {
         let dir = Path::new(&admin.home).join("Library/Caches/aterm-machines");
         let ran = sys
@@ -657,7 +598,6 @@ pub fn uninstall(
     let failed = report.failed();
     let _ = aterm_json::to_string(&Line::Report(Box::new(report)))
         .map(|l| writeln!(out, "{l}").and_then(|()| out.flush()));
-    // Last: the agent itself. The running binary keeps working until this process exits.
     let _ = super::remove_tree(sys, &layout.root);
     if failed {
         ExitCode::FAILURE
@@ -772,7 +712,6 @@ mod tests {
         }
     }
 
-    /// A staged agent as the enrollment command line leaves it, root's all the way up.
     fn staged() -> (Fake, Layout, Args) {
         let fake = Fake::root();
         let layout = Layout {
@@ -817,7 +756,6 @@ mod tests {
             "/Library/Management/aterm/.staging/allowed_signers",
             format!("signing@ctl namespaces=\"aterm-machines\" ssh-ed25519 {BLOB}\n").as_bytes(),
         );
-        // The root-owned copy of the archive the enrollment line hashed, as it left it.
         fake.file(
             "/Library/Management/aterm/.staging/payload.zip",
             b"the archive",
@@ -835,7 +773,6 @@ mod tests {
         (fake, layout, args)
     }
 
-    /// The answers a successful install needs from the tools and the admin.
     fn script_install(fake: &Fake) {
         for c in [
             "/usr/sbin/chown -R root:wheel /Library/Management/aterm/.staging/payload",
@@ -898,7 +835,6 @@ mod tests {
     fn a_reinstall_starts_a_renamed_principal_at_the_highest_floor() {
         let (fake, layout, args) = staged();
         script_install(&fake);
-        // The earlier enrollment's signer consumed serial 40.
         fake.file(
             "/Library/Management/aterm/state/floors.toml",
             b"[[floor]]\nprincipal = \"old@ctl\"\nserial = 40\n",
@@ -948,10 +884,8 @@ mod tests {
         install(&fake, &layout, exe, &args, &admin(), &mut out)
             .unwrap_or_else(|e| panic!("{e}\n{}", String::from_utf8_lossy(&out)));
         let calls = fake.calls();
-        // The stage moved into place, the link points at it.
         assert!(calls.contains(&"rename /Library/Management/aterm/.staging/payload /Library/Management/aterm/agent".to_owned()), "{calls:#?}");
         assert!(calls.iter().any(|c| c == "symlink /Library/Management/aterm/bin/.aterm.new -> /Library/Management/aterm/agent/aterm-machines-dev"), "{calls:#?}");
-        // The drop-in was checked before it was written, and pins the agent's digest.
         let check = calls
             .iter()
             .position(|c| c.starts_with("/usr/sbin/visudo -cf"))
@@ -974,7 +908,6 @@ mod tests {
             )),
             "{sudoers}"
         );
-        // Root files are root's; the admin's file was written by put-file as the admin.
         assert_eq!(
             fake.mode_of("/Library/Management/aterm/allowed_signers"),
             Some(0o644)
@@ -984,7 +917,6 @@ mod tests {
             calls.iter().all(|c| !c.starts_with("write /Users/")),
             "{calls:#?}"
         );
-        // put-file's stdin was staged in the root-only stage and removed after.
         assert!(
             fake.written(&format!("/Library/Management/aterm/stage/put-file.{pid}"))
                 .is_none()
@@ -1043,8 +975,6 @@ mod tests {
 
     #[test]
     fn uninstall_says_ok_for_what_was_never_there_and_changed_only_for_what_it_removed() {
-        // The rehearsal: an `unenroll` of a Mac that was only ever renamed printed `Changed
-        // uninstall.github-key@admin`, though no GitHub key had been made there.
         let fake = Fake::root();
         let layout = Layout {
             root: "/Library/Management/aterm".into(),
@@ -1052,7 +982,6 @@ mod tests {
         fake.file("/Library/Management/aterm/managed.toml", b"schema = 1\nadmin = \"admin\"\npayload_sha256 = \"\"\nagent_version = \"\"\nexecutable = \"agent/x\"\ninstalled = 0\n");
         fake.file("/etc/sudoers.d/aterm-machines", b"rule");
         let admin = admin();
-        // `rm -fv` printed nothing (no key), and `rm -rfv` named the inbox it removed.
         fake.on(
             "admin$ /bin/rm -fv /Users//admin/.ssh/aterm_github_ed25519 /Users//admin/.ssh/aterm_github_ed25519.pub",
             Ran::ok(""),
@@ -1065,7 +994,6 @@ mod tests {
             "admin$ /bin/cat /Users//admin/.ssh/authorized_keys",
             Ran::ok("ssh-ed25519 OWNKEY admin@laptop\n"),
         );
-        // The VM's one person, admin (dscl's answers there).
         fake.on(
             "/usr/bin/dscl . -list /Users UniqueID",
             Ran::ok("admin                    501\nroot                     0\n"),
@@ -1157,7 +1085,6 @@ mod tests {
                 .unwrap(),
             format!("old@ctl namespaces=\"aterm-machines\" ssh-ed25519 {BLOB}\n").as_bytes()
         );
-        // A stat that cannot be read is no answer that the Mac is not enrolled.
         let (fake, layout, args) = staged();
         script_install(&fake);
         fake.stat_fails(
@@ -1194,7 +1121,6 @@ mod tests {
             "/usr/sbin/visudo -cf /Library/Management/aterm/stage/sudoers.check",
             Ran::ok("/Library/Management/aterm/stage/sudoers.check: parsed OK\n"),
         );
-        // The admin's authorized_keys cannot be read: the last step before allowed_signers.
         fake.on(
             "admin$ /bin/cat /Users//admin/.ssh/authorized_keys",
             Ran::exit(
@@ -1254,7 +1180,6 @@ mod tests {
     fn install_refuses_an_executable_an_upgrade_would_not_find_in_the_archive() {
         let (fake, layout, args) = staged();
         script_install(&fake);
-        // A bundle payload: aterm.app/Contents/MacOS/aterm, and an alias beside it.
         let _ = fake.remove(Path::new(STAGED_EXE));
         let file = Stat {
             dir: false,
@@ -1283,7 +1208,6 @@ mod tests {
             ))
         };
         let mut out = Vec::new();
-        // Run as its alias, every upgrade would swap in another program than enrolled.
         install(
             &fake,
             &layout,

@@ -109,10 +109,6 @@ struct Ring {
     born: Instant,
     life: f32,
     scale: f32,
-    /// The caret's cell the paper landing veil lies on: its landing, then
-    /// each on-grid caret the ring has seen since, so a frame whose caret the
-    /// host withholds (a hidden caret, `cur: None`) keeps the veil where it
-    /// was ([`CursorGlow::emit_ring`]).
     caret: Option<(u16, u16)>,
 }
 
@@ -307,89 +303,38 @@ pub struct CursorGlow {
     bolts_unlimited: bool,
     #[cfg(test)]
     fire_flat_feet: bool,
-    /// Test-only: let the dark flame kept in its row burn under the letters
-    /// at the air's ceiling (no letter held to the row bar), the negative
-    /// control of the kept-flame test.
     #[cfg(test)]
     fire_row_unheld: bool,
-    /// Test-only: let the dark flame rise into a line of text above its row
-    /// as it once did, the tongues held to the letters' tint there, the
-    /// negative control of the kept-flame test.
     #[cfg(test)]
     fire_rises_into_text: bool,
-    /// Test-only: lay the dark tongues without their hot cores
-    /// ([`Self::emit_flame_cores`]), the field alone, the negative control
-    /// of the yellow-core tests.
     #[cfg(test)]
     fire_coreless: bool,
-    /// Test-only: lay the laser's aura on every swept air sample at its
-    /// full radii, as it once was, the negative control of the head-held
-    /// aura test.
     #[cfg(test)]
     laser_aura_unheld: bool,
-    /// Test-only: lay sparkle's paper body in its hue's one-weight vivid
-    /// ink, as it once was, the negative control of the paper-gold test.
     #[cfg(test)]
     sparkle_paper_bold_ink: bool,
-    /// Test-only: straighten a one-row streak run into one chord, as every
-    /// built-in but the phaser once did, the negative control of the typing
-    /// streak's flash-rate test.
     #[cfg(test)]
     streak_chords_rows: bool,
-    /// Test-only: lay a leap's bed only under the text it crosses and light
-    /// the beam's leap over air, as before [`bed::BedShape::leap_air`]: the
-    /// negative control of the one-tube leap test.
     #[cfg(test)]
     leap_split: bool,
-    /// Test-only: lay every run's head as is, cut square where the hand
-    /// left it ([`BedScratch::caret`] `None`), the negative control of the
-    /// head feather's test.
     #[cfg(test)]
     heads_square: bool,
-    /// Test-only: burn the dark flame's cores in their height's colour
-    /// alone, thin or not, the negative control of the olive test.
     #[cfg(test)]
     fire_core_uncooled: bool,
-    /// Test-only: hold the dark flame kept in its row against its hottest
-    /// light at every height, as round 2 did, the negative control of the
-    /// kept body's test.
     #[cfg(test)]
     fire_held_hottest: bool,
-    /// Test-only: burn the dark flame kept in its row as round 2 did: its
-    /// lower quarter (a field four times its envelope, cut at it), as hot
-    /// as a cold start's 0.75 and held against its hottest light, the
-    /// negative control of the kept body's test.
     #[cfg(test)]
     fire_kept_strip: bool,
-    /// Test-only: burn a kept core as round 3's first capture did, its
-    /// teardrop standing on its root itself and thin under the air's
-    /// yellow coverage, the negative control of its gold heart.
     #[cfg(test)]
     fire_kept_core_from_base: bool,
-    /// Test-only: lay the fire meteor's pieces whole to their joins and its
-    /// head whole to the landing, the negative control of its joins' test.
     #[cfg(test)]
     fire_meteor_joined: bool,
-    /// Test-only: begin the hold off a neighbour row's ink at the caret
-    /// row's edge, as round 2 did, the negative control of its ease.
     #[cfg(test)]
     neighbour_hold_hard: bool,
-    /// Test-only: lay the light landing veil where the landing was, as wide
-    /// as the ring grows and at the ring's own cap, as before it was held to
-    /// the caret's row and the text bar: the negative control of the
-    /// paper landing test.
     #[cfg(test)]
     veil_unbound: bool,
-    /// Reused by the light-ground body ([`Self::emit_comet_light`]) for its
-    /// ribbon polyline, so a light frame allocates nothing after the first
-    /// growth.
     light_verts: Vec<aterm_render::RibbonVertex>,
-    /// Reused by the light-ground band ([`Self::emit_comet_light`]) for a
-    /// run with its head feather appended, so a light frame allocates
-    /// nothing after the first growth.
     light_band_run: Vec<CometSample>,
-    /// The dark bed's working buffers ([`Self::emit_dark_bed`]), so a bed
-    /// frame allocates nothing after the first growth.
     bed_scratch: BedScratch,
     air_runs: Vec<Vec<CometSample>>,
     wedge_runs: Vec<Vec<CometSample>>,
@@ -423,20 +368,20 @@ pub struct Geom {
     pub ch: usize,
     pub rows: usize,
     pub cols: usize,
-    /// Grid-interior top-left X in window px (the host's `pad`).
+    /// Grid-interior top-left X in window pixels.
     pub origin_x: u16,
-    /// Grid-interior top-left Y in window px (`pad + head + strip_px`).
+    /// Grid-interior top-left Y in window pixels.
     pub origin_y: u16,
-    /// Full frame width in px (effects may reach the window edges).
+    /// Full frame width in pixels.
     pub win_w: u16,
-    /// Full frame height in px.
+    /// Full frame height in pixels.
     pub win_h: u16,
-    /// Rise allowance above the grid in px: the chrome band the host opened for effects (the macOS titlebar under `fullSizeContentView`; `ATERM_HEADROOM_PX` headless).
+    /// Rise allowance above the grid in pixels.
     pub head: u16,
 }
 
 impl Geom {
-    /// The effects box, where effect pixels may land (window px): the grid box plus the `head` band above it, `x ∈ fx_left, fx_right)`, `y ∈ fx_top, fx_bot)`.
+    /// Returns the left edge of the effects box in window pixels.
     #[inline]
     pub(crate) const fn fx_left(&self) -> i32 {
         self.origin_x as i32
@@ -454,7 +399,7 @@ impl Geom {
         self.origin_y as i32 + (self.rows * self.ch) as i32
     }
 
-    /// Window-px centre of a grid cell — `origin + (index + 0.5) · cell` on each axis, the one cell→pixel anchor every emitter shares.
+    /// Returns the window-pixel centre of `(row, col)`.
     #[inline]
     pub(crate) const fn cell_center(&self, row: u16, col: u16) -> (f32, f32) {
         (
@@ -463,7 +408,7 @@ impl Geom {
         )
     }
 
-    /// The beam rasterizers' clip for this geometry — the effects box + grid anchor.
+    /// Returns the beam rasterizer clip for this geometry.
     #[inline]
     pub(crate) const fn beam_clip(&self) -> BeamClip {
         BeamClip {
@@ -716,21 +661,21 @@ impl CursorGlow {
     const QUENCH_DAMP: f32 = 0.6;
     const QUENCH_HINT_FRESH: f32 = 0.25;
     const NAV_HINT_FRESH: f32 = 0.25;
-    /// A typed-glyph classifier and its exact candidate stay fresh this long.
+    /// Freshness window for a typed-glyph classifier and its exact candidate.
     pub(crate) const TYPE_HINT_FRESH: f32 = 0.25;
-    /// How long the caret must stand still before a typed lay is judged against where it rests ([`TornLay`]): two 60 Hz frames, past the continuation of a read that tore inside one redisplay.
+    /// Rest window before a typed lay is judged against where the caret rests.
     pub(crate) const TORN_REST_S: f32 = 0.032;
     const RETURN_HINT_FRESH: f32 = 0.25;
     const USER_GESTURE_HINT_FRESH: f32 = 0.25;
-    /// Freshness window for the delivered-insert licence ([`InsertSeam`]).
+    /// Freshness window for the delivered-insert licence.
     pub const INSERT_HINT_FRESH: f32 = 2.0;
-    /// The same window for the unknown-width class (a bare Tab or ⌃V, whose echo is the local program's).
+    /// Freshness window for an unknown-width insert gesture.
     pub const INSERT_GESTURE_HINT_FRESH: f32 = 1.0;
-    /// How long after a delivered insert was laid a keyless same-row retreat inside its span reads as the program's rewrite of it (Claude Code swaps a dropped path for `[Image #1] ` a few hundred ms after echoing it).
+    /// Freshness window for a program's same-row rewrite of a delivered insert.
     pub const INSERT_REWRITE_FRESH: f32 = 2.0;
-    /// How long after a refused same-row forward hop a delivery receipt may still claim it ([`PendingHop`]): the writer publishes microseconds after the write, and the observing frame is at most one present behind.
+    /// Freshness window for claiming a refused same-row forward hop on delivery receipt.
     pub const INSERT_RETRO_FRESH: f32 = 0.25;
-    /// The unknown-width bound for an insert the host cannot price (a Tab completion, a raw ⌃V placeholder): a same-row forward echo of at most this many cells may spend it.
+    /// Maximum cells a same-row forward echo may span under an unknown-width insert gesture.
     pub const INSERT_GESTURE_CELLS: u16 = 32;
     const REFLOW_HINT_FRESH: f32 = 0.40;
     const KILL_HINT_FRESH: f32 = 0.35;
@@ -744,14 +689,10 @@ impl CursorGlow {
     const DISP_SLAM_S: f32 = 0.05;
     const DISP_RELEASE_TAU: f32 = 0.45;
     const FLAME_PHASE_RING: f32 = std::f32::consts::TAU * 640.0;
-    /// The flame phase's speed (units a second) cold, and the most the
-    /// displayed heat adds at full heat.
+    /// Base flame phase speed in units per second when cold.
     pub(crate) const FLAME_PHASE_SPEED: f32 = 1.6;
     pub(crate) const FLAME_PHASE_HEAT_SPEED: f32 = 2.2;
-    /// A fire tongue's height flicker, in cycles a unit of flame phase: its
-    /// floor and the most its hash adds, so the fastest tongue at full heat
-    /// flickers under [`TWINKLE_FLASH_BOUND_HZ`] (the dark tongues and the
-    /// paper flame's alike; 0.35 put it at 3.04 Hz).
+    /// Base height flicker rate for a fire tongue in cycles per unit of flame phase.
     pub(crate) const TONGUE_FLICKER_RATE: f32 = 0.45;
     pub(crate) const TONGUE_FLICKER_SPREAD: f32 = 0.33;
     const TEMP_ATTACK_TAU: f32 = 1.5;
@@ -762,7 +703,7 @@ impl CursorGlow {
     const METEOR_CAP: usize = 4;
     const METEOR_RETARGET_S: f32 = 0.12;
     const METEOR_STRIKE_FRAC: f32 = 0.62;
-    /// Hard cap on per-frame radial halos (embers dominate; well above any real frame — both backends see the identical truncated snapshot).
+    /// Hard cap on per-frame radial halos.
     pub(crate) const MAX_HALOS: usize = 512;
     const MAX_VAPOR: usize = 128;
     const STEAM_STACK: f32 = 2.0;
@@ -789,141 +730,40 @@ impl CursorGlow {
     const FIRE_DARK_AIR_TEMP: f32 = 0.72;
     const FIRE_DARK_AIR_TONGUE_CAP: f32 = 208.0;
     const FIRE_DARK_ROOT: f32 = 0.20;
-    /// How far a dark flame over a blank row fades in from its root (the
-    /// burning row's top edge), in cell heights: a soft foot, no edge, and
-    /// no longer than the field's own cooled root (a sixth of a row), so
-    /// the thin light at the foot burns orange. Half a row faded the
-    /// field's white-yellow body in, and thin it read olive.
     const FIRE_DARK_AIR_FOOT: f32 = 0.2;
-    /// The dark tongues' spacing along their row, in cells
-    /// ([`Self::dark_tongues`]): far enough apart that each reads as its own
-    /// flame, as the light ink-fire's ([`Self::FIRE_LIGHT_SPACING`]).
     const FIRE_DARK_SPACING: f32 = 0.85;
-    /// A dark tongue's half-width at its foot, in cells, at full heat: wider
-    /// than the spacing's half, so neighbours merge at their feet and part
-    /// above them.
     const FIRE_DARK_HALF_W: f32 = 0.70;
-    /// A dark tongue's silhouette: its height at `d` half-widths off its
-    /// axis is `1 − d^shape` of its axis's, a point with hollow flanks.
     const FIRE_DARK_TONGUE_SHAPE: f32 = 1.43;
-    /// Where the band under a burning row's baseline begins, as a share of
-    /// the cell height (the baseline sits about 0.77 down): under a letter
-    /// with no descender the dark flame kept in its row burns whole there.
     const FIRE_DARK_LOW_BAND: f32 = 0.80;
-    /// How much taller than it shows a dark tongue in the air stands in the
-    /// field: the patch shows its lower, hotter part.
     const FIRE_DARK_AIR_FIELD_REACH: f32 = 1.8;
-    /// A dark core's height, width and peak coverage
-    /// ([`Self::emit_flame_cores`]): a share of its tongue's height, a share
-    /// of its tongue's half-width, and the additive coverage at its root on
-    /// its axis at full heat.
     const FIRE_DARK_CORE_REACH: f32 = 0.70;
-    /// See [`Self::FIRE_DARK_CORE_REACH`].
     const FIRE_DARK_CORE_W: f32 = 0.55;
-    /// See [`Self::FIRE_DARK_CORE_REACH`].
     const FIRE_DARK_CORE_COV: f32 = 190.0;
-    /// The least coverage a dark core burns yellow at, and where on its
-    /// ramp it burns under that (amber): over the dark a yellow thinner
-    /// than about half reads olive (round-2 judges, item 2). Between them
-    /// it eases over 38 levels of coverage.
     const FIRE_DARK_CORE_YELLOW_COV: f32 = 150.0;
-    /// See [`Self::FIRE_DARK_CORE_YELLOW_COV`].
     const FIRE_DARK_CORE_AMBER: f32 = 0.62;
-    /// [`Self::FIRE_DARK_CORE_YELLOW_COV`] for a core kept in its row: it
-    /// burns over its own flame's orange body, never the bare dark, so a
-    /// thinner yellow there still reads gold.
     const FIRE_DARK_KEPT_CORE_YELLOW_COV: f32 = 120.0;
-    /// How far a fire meteor's head wedge feathers out into its landing, in
-    /// cell widths ([`Self::emit_fire_meteors`]).
     const FIRE_METEOR_FEATHER: f32 = 0.5;
-    /// The least a fire meteor's white head eases in over from the orange
-    /// behind it, in cell widths ([`Self::emit_fire_meteors`]).
     const FIRE_METEOR_HEAD_EASE: f32 = 0.8;
-    /// A word's gap in a lettered row carries a kept tongue on its axis
-    /// ([`Self::emit_flames`]) this share of its heat tall, so its core
-    /// stands whole between the words.
     const FIRE_DARK_GAP_TONGUE: f32 = 0.95;
-    /// How far a dark core fades in over its root, px: amber at its foot,
-    /// never a dim yellow (the core ramp cools where its light thins).
     const FIRE_DARK_CORE_ROOT_PX: f32 = 5.0;
-    /// A kept tongue's core: its coverage on its axis at full heat, burning
-    /// whole in the band under the letters' baseline (the one band of a
-    /// lettered row it may light at all), so the bed under the line keeps
-    /// its yellow; and how far it fades in over its root, px, a foot its
-    /// teardrop stands on ([`Self::emit_flame_cores`]).
     const FIRE_DARK_KEPT_CORE_COV: f32 = 255.0;
-    /// See [`Self::FIRE_DARK_KEPT_CORE_COV`].
     const FIRE_DARK_KEPT_CORE_ROOT_PX: f32 = 4.0;
-    /// How far under a letter's baseline band a kept core stays clear, px.
     const FIRE_DARK_CORE_CLEAR_PX: f32 = 1.0;
-    /// How far a dark tongue's foot curls up at its sides, in cell heights:
-    /// the line of feet is scalloped, never one flat base.
     const FIRE_DARK_FOOT_CURL: f32 = 0.25;
-    /// The tongue over the caret, ahead of the head, as a share of the
-    /// head's strength over a blank row: the flames taper off past the
-    /// newest letter rather than standing cut at its edge.
     const FIRE_DARK_AIR_LEAD: f32 = 0.45;
-    /// Under a line of text the dark flame keeps to its own row
-    /// ([`Self::emit_flames`]): it roots this far down the burning row, as a
-    /// share of the cell height (under the letters' baseline), and rises
-    /// beneath them.
     const FIRE_DARK_ROW_ROOT: f32 = 0.98;
-    /// The gap a dark tongue kept in its row leaves under the row's top
-    /// edge, in cell heights: its tip has died before the line above.
     const FIRE_DARK_ROW_HEADROOM: f32 = 0.06;
-    /// How far under the row's top edge a dark tongue kept in its row thins
-    /// to nothing, in cell heights: a smooth falloff, never a lid.
     const FIRE_DARK_ROW_TOP_FADE: f32 = 0.28;
-    /// How far a dark flame kept in its row fades in from its root, in cell
-    /// heights: over four pixels and more of a common cell, never a hard
-    /// line at the root.
     const FIRE_DARK_ROW_FOOT: f32 = 0.18;
-    /// How much taller than the row lets it stand a dark tongue kept there
-    /// is in the field: its crests stand through the letters' x-height and
-    /// die in the falloff under the row's top, a hot root under the
-    /// baseline, an orange body over the letters and red tips, held at each
-    /// height against that height's own light. Round 2 stood it four times
-    /// taller but cut it at the row's envelope and held it against the
-    /// field's hottest light: a dim brown strip with a hot line at the
-    /// baseline and a flat top.
     const FIRE_DARK_ROW_FIELD_REACH: f32 = 3.4;
-    /// How much wider than a tongue's own a kept tongue's footprint on the
-    /// row's field is ([`Self::emit_flames`]): neighbours a spacing apart
-    /// overlap whole, so the field along the line never dips between them.
     const FIRE_DARK_KEPT_REACH: f32 = 1.7;
-    /// How much of the row a dark flame kept in it stands, cold, as a share
-    /// of the height its row lets it ([`Self::emit_flames`]); a full blaze
-    /// stands all of it, so a sustained blaze stands taller than a cold
-    /// start, as it burns hotter (the kept flame keeps the fire's own heat).
     const FIRE_DARK_ROW_RISE_COLD: f32 = 0.8;
-    /// The display temperature a dark flame kept in its row burns at from a
-    /// cold start: amber at its root, orange through its body and red at its
-    /// tips, the yellow left to its cores. The fire's heat carries it from
-    /// there toward white-hot, so every heat burns its own colour (a floor
-    /// alone stood a sustained blaze at a cold start's).
     const FIRE_DARK_ROW_TEMP: f32 = 0.2;
-    /// The contrast every letter a dark flame kept in its row burns under
-    /// keeps against the flame's light at each height at its ceiling there
-    /// ([`Self::flame_dark_letter`]): just over [`InkLedger::STEADY_FLOOR`],
-    /// the thin room the steady lights laid after it (the crown, the forge)
-    /// spend down to that floor, with the flying ones past it to the
-    /// account's floor, all over WCAG's 4.5:1. At or under the steady floor
-    /// the ledger leaves the crown and forge nothing; much over it (7:1)
-    /// the body kept over the letters is held too dim to show its orange.
     const FIRE_DARK_ROW_BAR: f32 = 6.2;
-    /// How far a held letter's ceiling eases off into the air around it, in
-    /// cells: a soft thinning over the letter, never a box.
     const FIRE_DARK_ROW_EASE: f32 = 0.25;
-    /// The cells around a burning row a dark flame kept in it holds a
-    /// ceiling for ([`Self::emit_flames`]); a cell past them takes no flame.
     const FIRE_DARK_HELD_CELLS: usize = 256;
-    /// The heat levels a dark flame kept in its row solves each letter's
-    /// ceiling at ([`Self::emit_flames`]): the field's palette in steps of 64
-    /// up to its hottest, so a tongue's orange and red upper body is held
-    /// against its own light, not its root's white-yellow.
+    /// Heat levels solved for each letter's ceiling when a dark flame is kept in its row.
     pub(super) const FIRE_DARK_HELD_LEVELS: usize = 15;
-    /// How far along a leap off the line its grains start being born, in
-    /// cells ([`Self::spawn_burst_particles`]).
     const LEAP_BIRTH_SKIP_CELLS: f32 = 1.5;
     const FLAME_SNUFF_S: f32 = 0.18;
     const SPARK_SNUFF_S: f32 = 0.08;
@@ -932,15 +772,10 @@ impl CursorGlow {
     const FIRE_EMBER_R: f32 = 0.04;
     const FIRE_EMBER_R_HOT: f32 = 0.05;
     const LIGHT_VEIL_SAT: f32 = 0.75;
-    /// The contrast a light landing veil keeps the theme's text at over its
-    /// centre: WCAG's 4.5:1 plus the measure's margin, as the dark bed's
-    /// ([`bed::DARK_BED_BAR`]).
+    /// Contrast floor a light landing veil preserves for theme text over its centre.
     pub(crate) const LIGHT_VEIL_BAR: f32 = 4.8;
-    /// How far (cells) a light landing veil reaches either side of the
-    /// caret's centre along its row.
+    /// Horizontal reach in cells of a light landing veil on either side of the caret's centre.
     pub(crate) const LIGHT_VEIL_REACH_CELLS: f32 = 1.5;
-    /// The gap a light tongue keeps under a line of text above its own, in
-    /// cell heights ([`Self::flame_light_headroom`]).
     const FIRE_LIGHT_HEADROOM: f32 = 0.08;
     const FIRE_LIGHT_ALPHA: f32 = 240.0;
     const FIRE_LIGHT_ROOT: f32 = 0.70;
@@ -967,11 +802,7 @@ impl CursorGlow {
     const SPARKLE_DARK_GROW: f32 = 1.3;
     const COMET_LIGHT_GLINTS: [(f32, bool); 3] = [(1.5, true), (2.3, false), (3.1, true)];
     const LIGHT_BAND_TAIL_CELLS: f32 = 1.5;
-    /// The knots a light band's head feather is laid in past its last
-    /// letter's outer edge ([`bed::DARK_BED_HEAD_FEATHER_CELLS`]).
     const LIGHT_BAND_HEAD_KNOTS: usize = 6;
-    /// A light comet glint's horizontal arm, from its centre, in cell
-    /// heights.
     const COMET_LIGHT_GLINT_ARM: f32 = 0.19;
     const COMET_LIGHT_COMA_R: f32 = 0.5;
     const COMET_LIGHT_COMA_RIM: f32 = 0.11;
@@ -996,15 +827,10 @@ impl CursorGlow {
     const SPARKLE_PAPER_MOON: u32 = 0x00C4_7C00;
     const SPARKLE_PAPER_BEAD: f32 = 0.85;
     const LASER_AURA_COV: f32 = 0.42;
-    /// How far from the path's head, in cells, the laser aura keeps its
-    /// whole peak.
+    /// Distance in cells from the path's head over which the laser aura keeps its peak.
     pub(super) const LASER_AURA_FULL_CELLS: f32 = 0.5;
-    /// How far from the path's head, in cells, the laser aura has faded to
-    /// nothing: the head's cell and the one behind it carry it.
+    /// Distance in cells from the path's head at which the laser aura fades to zero.
     pub(super) const LASER_AURA_REACH_CELLS: f32 = 2.0;
-    /// How far back along the charged trail (live typing sparks, newest first)
-    /// a crackle arc may root — the stray arcs dance over the whole lingering
-    /// trail, not just off the write head.
     const CRACKLE_TRAIL_CELLS: usize = 12;
     const BEAM_CHAIN_KEYS: f32 = 3.5;
     const BEAM_CHAIN_GAP_MAX: f32 = 0.75;
@@ -1012,7 +838,7 @@ impl CursorGlow {
     const WATER_CHAIN_KEYS: f32 = 4.0;
     const WATER_CHAIN_LIFE_MAX: f32 = 1.2;
 
-    /// Last honest visible source owned by this engine.
+    /// Returns the last visible cursor cell owned by this engine.
     #[inline]
     #[must_use]
     pub const fn cursor_anchor(&self) -> Option<(u16, u16)> {
@@ -1022,7 +848,7 @@ impl CursorGlow {
         }
     }
 
-    /// Reduced-motion arm for the fresh-ink pop (see the `reduced_motion` field).
+    /// Sets the reduced-motion flag and forwards it to Rainbow Kitty when engaged.
     #[inline]
     pub fn set_reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
@@ -1033,7 +859,7 @@ impl CursorGlow {
         }
     }
 
-    /// The focus seam: the window's OS focus changed, forwarded from `App::on_focus` on the event's clock.
+    /// Forwards a window OS focus change to Rainbow Kitty when engaged.
     #[inline]
     pub fn note_focus(&mut self, focused: bool, now: Instant) {
         if self.v2.engaged() {
@@ -1041,26 +867,26 @@ impl CursorGlow {
         }
     }
 
-    /// Host repaint blink: the focused terminal's `repaint_blink_epoch` advanced (a cursor hide inside a DEC-2026 synchronized update, Claude Code's per-keystroke redraw).
+    /// Records a host repaint blink epoch advance.
     #[inline]
     pub const fn note_repaint_blink(&mut self, now: Instant) {
         self.unsettle();
         self.blink_hint = Some(now);
     }
 
-    /// Drop the blink hint — a tab/pane switch re-pointed this window at a different terminal, and a blink carried from the old one must not classify a candidate (or, host-side, the probe) against the new one.
+    /// Clears any pending repaint blink hint across a terminal switch.
     #[inline]
     pub const fn clear_blink(&mut self) {
         self.blink_hint = None;
     }
 
-    /// Host per-frame context: whether the probed terminal is on the alt screen this frame (read beside the row probe).
+    /// Records whether the probed terminal is on the alternate screen this frame.
     #[inline]
     pub const fn note_context(&mut self, alt: bool) {
         self.ctx_alt = alt;
     }
 
-    /// Stamp the focused pane's rows (`first_row`, `rows`) in the coordinate space handed to [`Self::tick`], for v2's band floor.
+    /// Records the focused pane's `(first_row, rows)` span in tick coordinates.
     #[inline]
     pub const fn note_pane_rows(&mut self, first_row: u16, rows: usize) {
         let pane_rows = if rows > 0 && rows <= u16::MAX as usize {
@@ -1071,7 +897,7 @@ impl CursorGlow {
         self.v2.set_pane_rows(pane_rows);
     }
 
-    /// Stamp the focused pane's rows (`first_row`, `rows`) in the coordinate space handed to [`Self::tick`], for v2's band floor.
+    /// Records the focused pane's `(first_col, cols)` span in tick coordinates.
     #[inline]
     pub const fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
         self.pane_columns = if cols > 0 && cols <= u16::MAX as usize {
@@ -1082,7 +908,7 @@ impl CursorGlow {
         self.v2.set_pane(self.pane_columns);
     }
 
-    /// Any light still alive keeps the animation timer armed.
+    /// Returns whether any light or pending witness keeps the animation timer armed.
     #[inline]
     pub fn is_active(&self) -> bool {
         self.has_live_motion()
@@ -1112,7 +938,6 @@ impl CursorGlow {
     const fn poof_erase_witnessed(&self) -> bool {
         match (self.bs_baseline, self.row_cur_meta) {
             (Some((brow, bfill)), Some(cur)) => {
-                // the shrink may be a region scroll (see [`ProbeTrust`]).
                 matches!(cur.trust, ProbeTrust::Full) && cur.row == brow && cur.fill < bfill
             }
             _ => false,
@@ -1124,11 +949,10 @@ impl CursorGlow {
         self.needs_frame_cadence() || !self.vapor.is_empty()
     }
 
-    /// Whether live geometry changes fast enough to need phase-locked frame cadence: the GUI scheduler's choice between its frame train and [`Self::next_change_deadline`]'s coarse path.
+    /// Returns whether live geometry changes fast enough to require frame cadence.
     #[inline]
     #[must_use]
     pub const fn needs_frame_cadence(&self) -> bool {
-        // the classic one, and the classic branch settles this one.
         self.classic.is_active() || self.modern_needs_frame_cadence()
     }
 
@@ -1144,7 +968,7 @@ impl CursorGlow {
             || self.v2.needs_frame_cadence()
     }
 
-    /// When the next visible change is due, so the host paces the animation wake instead of pinning 60 fps; `None` when nothing is live.
+    /// Returns the deadline for the next visible change, or `None` when idle.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant, frame_interval: Duration) -> Option<Instant> {
         let v2_due = if self.v2.engaged() {
@@ -1163,7 +987,6 @@ impl CursorGlow {
                 poll
             })
         } else if !self.vapor.is_empty() || self.ember_live() {
-            // forge ember's coarse poll.
             Some(now + Self::EMBER_POLL_INTERVAL)
         } else {
             None
@@ -1259,13 +1082,13 @@ impl CursorGlow {
         self.dark_settled = false;
     }
 
-    /// The curtain at a coordinate-space seam: [`Self::reset`], except that Rainbow Kitty's ribbon is drawn into the caret it last stood under over `rk::ribbon::CURTAIN_S` and spent to zero, with nothing laid until it ends ([`rk::Engine::curtain`]).
+    /// Resets coordinate-space state and draws Rainbow Kitty's ribbon into the last caret over its curtain window.
     #[inline]
     pub fn curtain(&mut self, now: Instant) {
         self.reset_space(Some(now));
     }
 
-    /// Hide Rainbow Kitty's next frame: the viewport shows history.
+    /// Hides Rainbow Kitty's next frame while the viewport shows history.
     #[inline]
     pub const fn hide_v2(&mut self) -> bool {
         if !self.v2.engaged() {
@@ -1275,14 +1098,14 @@ impl CursorGlow {
         true
     }
 
-    /// Whether v2 owns the frame: for a host path deciding between keeping Rainbow Kitty's band and resetting other styles' marks without arming a hide it has no tick for ([`Self::hide_v2`]; `TornBand::Keep`).
+    /// Returns whether Rainbow Kitty owns the frame.
     #[inline]
     #[must_use]
     pub const fn v2_owns_frame(&self) -> bool {
         self.v2.engaged()
     }
 
-    /// Whether this engine reads the rows above and below the caret's, so a host must capture them with its row probe: v2's occupancy and content witnesses while it owns the frame, and every other lit style's over-text rules ([`Self::probed_text_spans`]: the over-ink ledger, the dark bed's split between bed and beam, Fire's light flame cap, the particles that keep off the text).
+    /// Returns whether this engine reads the rows above and below the caret's row.
     #[inline]
     #[must_use]
     pub const fn reads_neighbor_rows(&self) -> bool {
@@ -1291,14 +1114,14 @@ impl CursorGlow {
             || matches!(self.last_style, Some(s) if !matches!(s, GlowStyle::Classic))
     }
 
-    /// Whether a one-frame hide is armed and not yet taken — the twins' witness that no non-ticking path left one standing.
+    /// Returns whether a one-frame hide is armed on Rainbow Kitty.
     #[inline]
     #[must_use]
     pub const fn v2_hide_armed(&self) -> bool {
         self.v2.hide_armed()
     }
 
-    /// Drop all in-flight light and forget the last cursor position, when the cursor's coordinate space changes out from under the animator (e.g. a single pane ⇄ split layout transition).
+    /// Drops all in-flight light and forgets the last cursor position across a coordinate-space transition.
     #[inline]
     pub fn reset(&mut self) {
         self.reset_space(None);
@@ -1404,11 +1227,10 @@ impl CursorGlow {
         let (asked, asked_n) = self.witness_asked.take();
         self.v2.set_engaged(v2_active);
         if !self.v2.engaged() {
-            // so a re-engage seats afresh instead of holding a stale hue.
             self.v2_stop = None;
         }
         if !valid_canvas {
-            // common law ([`Self::settle_key_seam`]).
+            // Full zero includes any in-flight crossfade. The master switch (and
             if cfg.enabled {
                 self.store_key_timbre(cfg);
                 self.settle_key_seam(cfg, false);
@@ -1503,7 +1325,7 @@ impl CursorGlow {
             let elapsed = now.saturating_duration_since(t0);
             let dt = elapsed.as_secs_f32();
             if dt > 0.0 {
-                // with the key-time click's timbre prediction via `heat_tau`.
+                // Fire cools on its own slower τ; other styles use 0.9 s. Shared
                 if self.heat > 0.0 {
                     let heat_tau = Self::heat_tau(cfg);
                     self.heat *= (-dt / heat_tau).exp();
@@ -1538,12 +1360,10 @@ impl CursorGlow {
                 let rise = target - self.disp_t;
                 if rise != 0.0 {
                     let ease = if rise > 0.5 {
-                        // Distinct branch.
                         Self::DISP_SLAM_S
                     } else if rise > 0.0 {
                         Self::DISP_ATTACK_S
                     } else {
-                        // natural pause keeps the slower release.
                         Self::DISP_RELEASE_TAU / (1.0 + 2.0 * self.quench)
                     };
                     self.disp_t += rise * (1.0 - (-dt / ease).exp());
@@ -1796,12 +1616,6 @@ impl CursorGlow {
         self.begin_ink_ledger(cfg, geom, cur);
         self.emit_comet(now, cfg, geom, cur, out, &mut halos, &mut under);
         out.truncate(Self::MAX_QUADS);
-        // Per-pixel fire (Fire only): FirePatches render at the under-ink
-        // seam through the shared byte-exact integer field. Not gated on
-        // the GlowQuad budget: the flame writes the separate patch/halo
-        // streams, each self-capped in `emit_flames`.
-        // The dark flame kept in its row lays its light under the letters
-        // in the account, for every later light over them.
         let mut ledger = std::mem::take(&mut self.ink_ledger);
         self.emit_flames(
             now,
@@ -1815,8 +1629,6 @@ impl CursorGlow {
             &mut ledger,
         );
         self.ink_ledger = ledger;
-        // Jump streaks (Fire only): over the ink on a dark ground,
-        // beneath it on a light one, like the lightning.
         if cfg.dark_theme {
             if out.len() < Self::MAX_QUADS {
                 self.emit_fire_meteors(now, cfg, geom, out);
@@ -1825,7 +1637,6 @@ impl CursorGlow {
             self.emit_fire_meteors(now, cfg, geom, &mut under);
         }
         if under.len() < Self::MAX_QUADS {
-            // landing ripple and free droplets remain over-ink accents.
             self.emit_water(now, cfg, geom, cur, &mut under);
         }
         if self.v2.engaged() {
@@ -1889,7 +1700,6 @@ impl CursorGlow {
                 self.v2.witness_rows(&samples[..n], now);
             }
         } else {
-            // ([`Self::needs_frame_cadence`]).
             self.emit_crown(now, cfg, geom, cur, &mut halos, &mut under);
         }
         if out.len() < Self::MAX_QUADS {
@@ -1969,7 +1779,6 @@ impl CursorGlow {
         self.sound_cues.clear();
         self.clear_keyed_clicks();
         let Some(mut cfg) = self.last_cfg else {
-            // No snapshot means no prior tick, so no residue to fade.
             return;
         };
         let crown_until = self.crown_until.take();
@@ -1993,7 +1802,6 @@ impl CursorGlow {
             return;
         }
         if matches!(cfg.style, GlowStyle::RainbowKitty) {
-            // engaging `ghost.v2` and reserving its scratch vectors.
             cfg.style = GlowStyle::Comet;
         }
         let mut ghost = Box::<CursorGlow>::default();
@@ -2024,7 +1832,6 @@ impl CursorGlow {
         ghost.last_cfg = Some(cfg);
         self.flame_phase = 0.0;
         if self.fading.len() >= Self::FADE_CAP {
-            // Chained switches: the oldest fade is the darkest — shed it.
             self.fading.remove(0);
         }
         self.fading.push(OutgoingFade {
@@ -2059,14 +1866,12 @@ impl CursorGlow {
         fades.retain_mut(|f| {
             let u = now.saturating_duration_since(f.started).as_secs_f32() / Self::FADE_OUT_S;
             if u >= 1.0 {
-                // Distinct branch.
                 return false;
             }
             let env = f.level0 * (0.5 + 0.5 * (std::f32::consts::PI * u).cos());
             let mut c = f.cfg;
             c.intensity *= env;
             if c.intensity <= 0.0 {
-                // Distinct branch.
                 return false;
             }
             f.engine.tick(f.anchor, now, &c, geom, &mut scratch);

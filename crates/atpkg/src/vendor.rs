@@ -423,6 +423,9 @@ fn first_foreign_on_path(
     let path_var = path_var?;
     let prefix_real = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
     for dir in std::env::split_paths(path_var) {
+        // A relative entry (`.`, `bin`, the empty string) resolves against the current
+        // directory: a `gh` dropped into a project checkout must never read as a system
+        // install, nor retire the managed copy. Absolute directories only (on Windows,
         // drive-rooted).
         if dir.as_os_str().is_empty() || !dir.is_absolute() {
             continue;

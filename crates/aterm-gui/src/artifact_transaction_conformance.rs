@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for fixed-path snapshot generations and handle-anchored artifacts: the
-//! shipping generation fence, `PinnedDir` accessors and video lease registry are projected onto
-//! the derived models, with stale or outside post-states as negative controls.
-//! `ArtifactReplyPublication` is driven in `control`'s `capture_reply_*` tests; its projection
-//! is here.
+//! Tier-1 conformance projections and tests for snapshot generations, pinned directories, and video leases.
 
 #![cfg(test)]
 
@@ -70,13 +66,7 @@ pub(crate) fn project_snapshot(model: &Model, observed: SnapshotObservation) -> 
     state
 }
 
-/// Test-visible projection of one guarded artifact reply. As `control`'s
-/// `capture_reply_*` binds read the shipping capture reply: `artifact` is the
-/// advertised file, `guard` the name lease only the capture guard holds once
-/// the file is written, `committed`/`reply`/`challenge` the bytes the writer
-/// produced (the OK body; the complete body-then-trailer frame; any nonce
-/// trailer), and `ack`/`ack_failed`/`write_error` the writer's and ACK wait's
-/// verdicts. `phase` and `quarantine_age` are drive coordinates.
+/// Test-visible projection of one guarded artifact reply.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ArtifactReplyObservation {
     pub(crate) phase: i64,
@@ -131,8 +121,6 @@ pub(crate) fn project_artifact_handoff_capacity(
 }
 
 /// Test-visible projection of the durable video-batch publication boundary.
-/// A counted member has completed its per-file sync; `synced_members` is the
-/// prefix covered by the most recent recording-directory barrier.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct VideoBatchPublicationObservation {
     pub(crate) members: i64,
@@ -151,13 +139,7 @@ pub(crate) fn project_video_batch_publication_durability(
     state
 }
 
-/// Test-visible projection of the refcounted recording-lease registry; production anchors name
-/// this function. Registry `count` -> `leases`, the entry's `video_sweep_requested` -> `armed`,
-/// an entry without its reserved `video_retention` admission -> `admission_spent`, a retained
-/// recording-identity disagreement -> `identity_mismatch`, the last-release handoff ->
-/// `pending`, callback execution -> `sweeping`. `requested` is the caller's history (an arm no
-/// finished sweep has discharged), so a registry that lost an armed entry still owes its sweep.
-/// `replacement_joined` is a negative-control witness, always false for shipping code.
+/// Test-visible projection of the refcounted recording-lease registry.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ArtifactReaderObservation {
@@ -656,9 +638,7 @@ fn published_recording_count(root: &Path) -> usize {
         .count()
 }
 
-/// A private recordings root holding `count` published recordings. Returns the
-/// fixture directory, the root, the newest recording's name, and the registry
-/// key `retain_video_artifact_path` files that recording under.
+/// Create a private recordings root holding `count` published recordings.
 #[cfg(unix)]
 fn reader_fixture(label: &str, count: usize) -> (PathBuf, PathBuf, std::ffi::OsString, PathBuf) {
     let dir = unique_dir(label);
@@ -674,9 +654,7 @@ fn reader_fixture(label: &str, count: usize) -> (PathBuf, PathBuf, std::ffi::OsS
     (dir, root, fresh, key)
 }
 
-/// One shipping `video frames` reader lease on `fresh`, with the recording
-/// handle its arm validates against. `None` is the registry refusing a lease
-/// while a sweep owns the entry.
+/// Acquire a shipping `video frames` reader lease on `fresh` along with its recording handle.
 #[cfg(unix)]
 fn reader_lease(
     root: &Path,
@@ -694,12 +672,7 @@ fn reader_lease(
     .map(|lease| (lease, recording))
 }
 
-/// Read the shipping lease registry. `leases`, `armed` and `sweeping` are the
-/// entry's `count`, `video_sweep_requested` and `sweeping`, and
-/// `admission_spent` is an entry without its `video_retention`; an absent entry
-/// is idle. `pending` is never observable — the last decrement and the sweep's
-/// start happen under one registry mutex — and `requested`/`identity_mismatch`
-/// are the history this test drove.
+/// Project the shipping lease registry state for `key` onto `model`.
 #[cfg(unix)]
 fn observe_reader(model: &Model, key: &Path, requested: bool, identity_mismatch: bool) -> State {
     let entry = crate::control_auth::artifact_lease_registry_for_test(key);
@@ -718,10 +691,7 @@ fn observe_reader(model: &Model, key: &Path, requested: bool, identity_mismatch:
     )
 }
 
-/// Tier-1: the shipping lease registry — `retain_video_artifact_path`,
-/// `arm_video_retention_sweep`, a lease's drop, and the cleanup worker's
-/// sweep — read back after every step. Twelve published recordings over the
-/// keep-limit of eight make the sweep's work visible: a sweep that ran prunes.
+/// Verify that the shipping lease registry conforms to the last-release sweep lifecycle.
 #[cfg(unix)]
 #[test]
 fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
@@ -783,15 +753,8 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
         "a non-final release cannot start convergence",
     );
 
-    // The final drop decrements and starts the sweep under one mutex, and the
-    // cleanup worker finishes it. Park the worker first, so the sweeping entry
-    // stays open and the refusal below is judged on every run, not only when
-    // this thread happens to beat the worker.
     let pending = model.successors("Release", &armed_one)[0].clone();
     let sweeping = model.successors("StartSweep", &pending)[0].clone();
-    // The seam between the last decrement and the sweep's start is crossed
-    // under that one mutex, so real code never shows it; the model must still
-    // refuse a lease entering it.
     let entered_seam = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
@@ -809,10 +772,6 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
         &entered_seam,
         "no producer-or-reader lease may enter the last-release/sweep interval",
     );
-    // The final release that removes the armed entry instead of sweeping it —
-    // the `video_sweep_requested` case folded into the plain removal, or the
-    // release-build `_ =>` arm. The registry then reads idle, but the arm this
-    // test made is still owed its sweep.
     let dropped_entry = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
@@ -853,8 +812,6 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
         "acquisition fails closed while the sweep owns the entry",
     );
     drop(hold);
-    // Waits until the entry is gone: a finish that reset the entry's flags and kept it (with
-    // its recorded identity) times out here.
     crate::control_auth::wait_for_artifact_cleanup_for_test(&key);
     let swept = observe_reader(&model, &key, false, false);
     assert_transition(
@@ -864,8 +821,6 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
         &swept,
         "completion removes the entry and reopens acquisition",
     );
-    // A finish that reset the entry's flags and kept it: the entry has spent
-    // its admission, so `join_video_artifact_state` would refuse every reader.
     let kept_entry = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
@@ -887,8 +842,6 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
         "the last armed release ran the retention sweep ({retained} recordings left)"
     );
 
-    // Re-seed four recordings older than every survivor, so a sweep the next
-    // release had no business running would visibly prune them.
     for sequence in 0..4 {
         write_published_recording(&root, &format!("rec-{sequence:020}-000"));
     }
@@ -919,8 +872,6 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
         reseeded,
         "an unarmed final release sweeps nothing"
     );
-    // The same release scheduling a sweep nothing armed: it could never start,
-    // and the path would refuse every later reader.
     let mut stranded = released.clone();
     stranded.insert("pending", 1);
     reject_transition(
@@ -935,8 +886,7 @@ fn real_video_reader_registry_conforms_to_last_release_sweep_lifecycle() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Tier-1: a same-name replacement cannot join a live recording's lease group.
-/// The replacement is the environment's move; the refusal is the registry's.
+/// Verify that a same-name replacement cannot join a live recording's lease group.
 #[cfg(unix)]
 #[test]
 fn real_video_reader_registry_refuses_a_replaced_recording() {
@@ -1207,9 +1157,7 @@ fn real_pinned_read_write_and_reply_validation_conform() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Where bytes a confined operation touched ended up, in the model's
-/// `effect_target` coding: the pinned original directory (`1`), the swapped-in
-/// replacement (`2`), or nowhere (`0`).
+/// Return `effect_target` coding for where `bytes` landed: `1` (pinned `moved`), `2` (`outside`), or `0` (neither).
 #[cfg(unix)]
 fn landed(moved: &Path, outside: &Path, bytes: &[u8]) -> i64 {
     let holds = |dir: &Path| {
@@ -1226,11 +1174,7 @@ fn landed(moved: &Path, outside: &Path, bytes: &[u8]) -> i64 {
     }
 }
 
-/// Tier-1: the swap happens between pinning and the operation. Both shipping operations run
-/// through the handle retained before the swap, and where their bytes went is read back off
-/// the filesystem: the retained original (`effect_target = 1`) or the swapped-in outside
-/// directory (`2`). The same reads and writes by path, re-resolved after the swap, are the
-/// negative controls the model refuses.
+/// Verify that ancestor swaps fail reply validation and reject outside-target mutants.
 #[cfg(unix)]
 #[test]
 fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
@@ -1240,8 +1184,6 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
     let outside = unique_dir("outside");
     std::fs::create_dir_all(root.join("images")).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    // `PinnedDir::open` walks the path without following symlinks, so the
-    // temp dir's `/var` spelling is resolved first.
     let root = std::fs::canonicalize(root).unwrap();
     let outside = std::fs::canonicalize(outside).unwrap();
     std::fs::write(root.join("images").join("read.bin"), b"read-inside").unwrap();
@@ -1249,7 +1191,6 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
     let model = anchored_artifact_transaction_model();
     let initial = project_anchored(&model, unconfined());
 
-    // Pin both transactions, then swap the ancestor under them.
     let read_pin = PinnedDir::open(&root.join("images")).expect("pin read directory");
     let write_pin = PinnedDir::open(&root.join("images")).expect("pin write directory");
     let pinned_state = project_anchored(&model, pinned());
@@ -1306,8 +1247,6 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
         )
     };
 
-    // READ: `read_private_at_retained` reads through the retained handle, and
-    // the reply's path check then fails closed.
     let (bytes, read_guard) = read_pin
         .read_private_at_retained(OsStr::new("read.bin"), 64)
         .expect("the retained handle still reads the original");
@@ -1334,7 +1273,6 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
         &replied_after_swap(1, read_target),
         "artifact fail-closed read reply",
     );
-    // Negative control: the same read by path lands on the replacement.
     let resolved = std::fs::read(root.join("images").join("read.bin")).unwrap();
     assert_eq!(resolved, b"read-outside");
     let outside_read = after_swap(1, 2);
@@ -1347,9 +1285,6 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
     );
     assert!(!model.check_invariant("AnchoredAccessNeverOutside", &outside_read));
 
-    // Write: the shipping write stages its bytes through the retained handle and the
-    // authorizer measures them once they are down; the final path validation then fails
-    // closed and removes them.
     let mut write_target = None;
     write_pin
         .write_private_authorized(OsStr::new("shot.png"), b"write-after-swap", || {
@@ -1378,7 +1313,6 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
         0,
         "the refused write leaves its bytes nowhere"
     );
-    // Negative control: the same write by path lands outside.
     std::fs::write(root.join("images").join("shot.png"), b"write-by-path").unwrap();
     let outside_write = after_swap(2, landed(&moved, &outside, b"write-by-path"));
     assert_eq!(outside_write["effect_target"], 2);
@@ -1392,8 +1326,6 @@ fn swapped_ancestor_fails_reply_and_outside_mutants_are_rejected() {
     assert!(!model.check_invariant("AnchoredAccessNeverOutside", &outside_write));
     std::fs::remove_file(outside.join("shot.png")).unwrap();
 
-    // A swap in the operation-to-reply interval: the write is published inside,
-    // then the ancestor moves, and the reply fails closed.
     std::fs::remove_file(root.join("images")).unwrap();
     std::fs::rename(&moved, root.join("images")).unwrap();
     let target = ConfinedImage::for_test(&root.join("images"), "late.png");

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The System State tab's boundary to the binary's setup workers. The view
-//! edits a plan; these callbacks own OS work and run away from the event loop.
+//! Boundary between the System State tab and the binary's setup workers.
 
 use std::cell::Cell;
 use std::sync::Mutex;
@@ -17,13 +16,10 @@ use crate::system_state::{SetupStatus, SetupStatusRow, SystemStateAction};
 use crate::workstation_setup::{Request, WorkstationSetupDecision};
 use crate::{App, Wake};
 
-/// Installed by the one shipped binary; library-only/headless hosts have no
-/// authority to provision a machine.
+/// Provisioning callbacks installed by the shipped binary.
 #[derive(Clone, Copy)]
 pub struct InitialSetupHandlers {
-    /// An Apply: the reviewed plan, whether its vault was typed
-    /// ([`crate::workstation_setup::SetupAnswer::vault_typed`]), the join password and the
-    /// receipt.
+    /// Applies the reviewed plan with its vault-typed flag, optional join password, and receipt.
     pub apply: fn(Plan, bool, Option<SecretBytes>, InitialSetupApplyReceipt) -> bool,
     pub check: fn(Plan) -> bool,
     pub restore: fn() -> bool,
@@ -31,8 +27,7 @@ pub struct InitialSetupHandlers {
     pub status: fn() -> SetupStatus,
 }
 
-/// A queued Apply owns this receipt until its exact plan is durably authorized.
-/// Dropping it rejects the attempt and preserves the person's reviewed inputs.
+/// Receipt owned by a queued Apply until its plan is durably authorized.
 #[must_use = "accept only after the plan is durable; dropping preserves the draft"]
 #[derive(Debug)]
 pub struct InitialSetupApplyReceipt {
@@ -69,8 +64,7 @@ impl Drop for InitialSetupApplyReceipt {
     }
 }
 
-/// Completes only after the exact Cancel choice is durably saved or superseded.
-/// Shutdown waits for accepted cancellation operations, independently of views.
+/// Receipt completed after the Cancel choice is durably saved or superseded.
 #[must_use = "complete only after cancellation is durable"]
 #[derive(Debug)]
 pub struct InitialSetupCancelReceipt {
@@ -94,7 +88,7 @@ struct CancelCompletion {
 }
 
 impl CancelCompletion {
-    fn new(answer: Receiver<()>) -> Self {
+    const fn new(answer: Receiver<()>) -> Self {
         Self {
             answer,
             result: Cell::new(None),
@@ -138,7 +132,6 @@ pub fn publish_initial_setup_status(status: SetupStatus) {
 #[derive(Default)]
 pub(crate) struct Host {
     pending: Option<Request>,
-    // Each private receiver is an attempt identity independent of status polls.
     pending_apply: Option<PendingApply>,
     cancel_receipts: Vec<CancelCompletion>,
     cancel_failed: bool,
@@ -149,7 +142,6 @@ pub(crate) struct Host {
     offer_presented: bool,
     action_refusal: Option<SetupStatusRow>,
     latest_status: SetupStatus,
-    /// The last status read this Mac synced by setup ([`SetupStatus::vault_synced`]).
     vault_synced: bool,
     #[cfg(target_os = "macos")]
     notice_shown: bool,
@@ -198,8 +190,7 @@ impl App {
                 )
     }
 
-    /// The event loop has ended. Transfer only cancellation intents still owned
-    /// by its form, then wait for those workers without joining any Apply work.
+    /// Transfers remaining form cancellation intents after the event loop ends and waits for them.
     pub(crate) fn finish_system_state_shutdown(&mut self) -> Result<(), &'static str> {
         if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState)
             && self.native_runtime.take_system_state_cancel(instance)
@@ -228,9 +219,6 @@ impl App {
         status: SetupStatus,
     ) {
         let Some(generation) = generation else {
-            // An unsolicited worker notification may have waited in the queue
-            // since before Apply. Use it to request a current snapshot rather
-            // than letting its old idle state unlock an active operation.
             self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
             self.system_state_host.status_in_flight = false;
             self.system_state_host.next_status = Some(Instant::now());
@@ -267,8 +255,6 @@ impl App {
                 })
     }
 
-    /// Attach only after the host has opened the review. Keeping this separate
-    /// also lets headless tests exercise the exact offer/focus boundary.
     fn attach_system_state_offer(&mut self, request: Request) {
         if !request.pending() || !self.can_offer_system_state() {
             request.finish(WorkstationSetupDecision::Unavailable);
@@ -278,8 +264,6 @@ impl App {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
         }
-        // Retain the hold's exact owner even if the waiting worker withdraws
-        // between model admission and the next UI tick.
         self.system_state_host.pending = Some(request);
         self.hold_initial_setup_permissions();
         self.refresh_system_state_tab_indicators();
@@ -287,9 +271,6 @@ impl App {
         self.system_state_host.offer_presented = false;
         self.system_state_host.action_refusal = None;
         self.system_state_host.latest_status = SetupStatus::default();
-        // A reused view can remember Apply from a previous manual visit. The
-        // automatic offer starts without a keyboard action target in every
-        // linked view, so queued Return cannot accept the new plan.
         let views: Vec<_> = self
             .view_store
             .iter()
@@ -319,11 +300,7 @@ impl App {
         self.publish_system_state_with_notice(status, |app| app.present_system_state_indicator());
     }
 
-    /// The vault lines' press (`Intent::ReviewVaultSync`): System State opened or focused in
-    /// `wid`, its review preset where [`crate::system_state::SystemStateApp::preset_vault_sync`]
-    /// allows. A tab opened just now takes setup's last read first, so the preset lands on
-    /// this Mac's own plan and vault. The press is the person's own, so an offer it brings to
-    /// the front stops its countdown, as a click in it would.
+    /// Opens or focuses System State in `wid` and presets its review for vault sync when allowed.
     pub(crate) fn review_vault_sync_in_window(&mut self, wid: crate::WindowId) -> bool {
         if !self.open_system_state_tab_in_window(wid) {
             return false;
@@ -344,9 +321,6 @@ impl App {
         true
     }
 
-    /// The non-modal attention surface: an existing System State tab's
-    /// indicator. It never opens a dialog, steals focus, or blocks a
-    /// window; with no such tab the notice stays deferred.
     fn present_system_state_indicator(&mut self) -> bool {
         let has_tab = self.windows.values().any(|window| {
             window.tab_set.tabs().iter().any(|tab| {
@@ -369,9 +343,6 @@ impl App {
     ) {
         #[cfg(not(target_os = "macos"))]
         let _ = present_notice;
-        // A run whose Secrets stage now reads this Mac in and subscribed ends the vault's
-        // digest lines, once per report that says so: a line raised later beside the same
-        // report stands.
         let synced = status.vault_synced();
         let was = std::mem::replace(&mut self.system_state_host.vault_synced, synced);
         if synced && !was {
@@ -387,8 +358,6 @@ impl App {
             status.busy = true;
         }
         if let Some(refusal) = &self.system_state_host.action_refusal {
-            // The worker's current status remains authoritative. A refused
-            // local action stays visible until the person makes another one.
             status.rows.insert(0, refusal.clone());
         }
         #[cfg(target_os = "macos")]
@@ -415,12 +384,9 @@ impl App {
                 })
             })
         {
-            // Keep the notice deferred until a non-modal presenter can
-            // actually surface it.
             self.system_state_host.notice_shown = present_notice(self);
         }
         self.system_state_host.status_in_flight = false;
-        // Permission policy still converges when the review tab is closed.
         self.system_state_host.next_status = Some(Instant::now() + Duration::from_secs(1));
         let indicators_changed = self.refresh_system_state_tab_indicators();
         if changed || indicators_changed {
@@ -529,8 +495,6 @@ impl App {
         {
             return;
         }
-        // Local Apply, Cancel and Restore consume this owner before setting
-        // their own hold. Only an abandoned automatic review remains here.
         self.system_state_host.pending = None;
         self.recheck_initial_setup_permissions();
         self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
@@ -563,9 +527,6 @@ impl App {
                     })
         });
         if active {
-            // The first real offer frame must reach glass. Later content
-            // revisions can await repaint while that same setup form remains
-            // visible; they must not repeatedly pause its clock.
             self.system_state_host.offer_presented = true;
         }
         active
@@ -605,9 +566,7 @@ impl App {
         self.run_system_state_action_with_handlers(action, handlers);
     }
 
-    /// The final view can disappear before the park drains its action queue.
-    /// Hand explicit Cancel, or the automatic offer's existing Tab/View close
-    /// cancellation, to its coordinator. Queued Apply and Check stay unsubmitted.
+    /// Hands explicit or close-triggered Cancel to its coordinator on view close.
     pub(crate) fn finish_system_state_close(
         &mut self,
         instance: crate::native_app::AppInstanceId,
@@ -641,8 +600,6 @@ impl App {
                 self.retire_native_review(instance);
             }
             self.hold_initial_setup_permissions();
-            // A newer mutating intent retires the prior admission receipt.
-            // A read-only Check cannot revoke its durable permission decision.
             self.system_state_host.pending_apply = None;
         }
         self.system_state_host.action_refusal = None;
@@ -675,8 +632,6 @@ impl App {
                 if !started {
                     self.system_state_host.pending_apply = None;
                 }
-                // Sending a startup answer and spawning a manual worker both
-                // await the same durable admission before consuming the review.
                 if started {
                     self.publish_system_state(self.system_state_host.latest_status.clone());
                 }
@@ -687,9 +642,6 @@ impl App {
                 handlers.is_some_and(|handlers| (handlers.check)(plan))
             }
             SystemStateAction::Restore => {
-                // Restore supersedes the original automatic offer even if its
-                // worker refuses to start. A later Apply must use manual rerun
-                // admission, rather than answer a worker honoring Restore's stop.
                 if let Some(request) = self.system_state_host.pending.take() {
                     request.finish(WorkstationSetupDecision::Unavailable);
                     self.native_runtime.tick_system_state(Instant::now(), false);
@@ -701,8 +653,6 @@ impl App {
         self.finish_system_state_action(started, action_name);
     }
 
-    /// The cancellation worker owns persistence. This handoff also runs after
-    /// the display connection has ended, so it must never touch presentation.
     fn start_system_state_cancel(&mut self, handlers: Option<InitialSetupHandlers>) -> bool {
         let (receipt, receiver) = InitialSetupCancelReceipt::new();
         let started = if let Some(request) = self.system_state_host.pending.take() {
@@ -748,14 +698,10 @@ impl App {
             Err(TryRecvError::Disconnected) => false,
         };
         let pending = self.system_state_host.pending_apply.take().unwrap();
-        // A snapshot started before durable admission still describes the old
-        // plan. It cannot replace the newly accepted, now-clean review.
         self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
         self.system_state_host.status_in_flight = false;
         if accepted {
             self.accepted_initial_setup_apply();
-            // Admission belongs to the accepted operation after its view
-            // closes. Consuming a draft belongs only to that original model.
             if self.system_state_instance_has_view(pending.instance) {
                 self.native_runtime.accept_system_state_apply(pending.plan);
                 self.refresh_system_state_tab_indicators();
@@ -781,9 +727,6 @@ fn wait_for_cancellations(receipts: Vec<CancelCompletion>) -> Result<(), &'stati
     wait_for_cancellations_until(receipts, Instant::now() + Duration::from_secs(5))
 }
 
-/// Shutdown gets one short, total grace period for Cancel receipts. A stuck
-/// worker or system prompt must not hold Quit hostage: at the deadline the
-/// unsaved cancel is reported and shutdown proceeds.
 fn wait_for_cancellations_until(
     receipts: Vec<CancelCompletion>,
     deadline: Instant,
@@ -888,8 +831,6 @@ mod tests {
             }
         };
 
-        // Hold the mixed sibling's parser lock while publishing. The deadline
-        // releases a regressed blocking read, so it fails instead of hanging.
         let term = app.pool.get(session).unwrap().term.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -965,8 +906,6 @@ mod tests {
         app.publish_system_state(clean.clone());
         assert_flags(&app, TabIndicators::default());
 
-        // A later reviewed Apply clears dirty in every linked tab only once
-        // its receipt accepts, including a tab that is not the active one.
         app.native_runtime
             .dispatch(
                 instance,
@@ -1138,7 +1077,6 @@ mod tests {
         );
     }
 
-    /// Setup's read of a Mac with the vault and repositories rows off, on its own vault.
     fn vault_read() -> Plan {
         use aterm_types::macos_setup::Setting;
         let mut read = Plan::default();
@@ -1159,7 +1097,6 @@ mod tests {
         state.reviewed_plan()
     }
 
-    /// What the press says when the review it opened shows the vault sync's rows, and when not.
     const SET: &str = "Opened System State with the vault row on and the Mac settings rows off";
     const CHECK: &str = "Opened System State; check its vault and Mac settings rows before Apply";
 
@@ -1169,7 +1106,6 @@ mod tests {
         }
     }
 
-    /// `plan` is [`vault_read`] set for the sync, and nothing was applied.
     fn assert_synced(app: &mut App, plan: &Plan) {
         use aterm_types::macos_setup::Setting;
         for setting in Setting::ALL {
@@ -1184,7 +1120,6 @@ mod tests {
         );
     }
 
-    /// The failed join's digest line pressed from `wid`, as Settings ▸ Messages presses it.
     fn press_vault_line(
         app: &mut App,
         wid: crate::WindowId,
@@ -1205,10 +1140,6 @@ mod tests {
         app.perform_message_act(wid, line.id.raw(), 0)
     }
 
-    /// THE VAULT LINE'S PRESS OPENS SYSTEM STATE SET FOR THE SYNC, in the window it came
-    /// from: a tab opened just now takes setup's last read, then the vault row goes on and
-    /// the Mac settings rows off; the other rows and the vault field stay as read, nothing
-    /// is applied, and a later read leaves the preset alone.
     #[test]
     fn the_vault_lines_press_opens_system_state_set_for_the_sync_in_its_window() {
         let mut app = App::headless_for_test();
@@ -1243,8 +1174,6 @@ mod tests {
         assert_eq!(reviewed(&app), plan, "a later read keeps the preset");
     }
 
-    /// THE PRESS NEVER ANSWERS THE LINE: the button is a navigation beside the step, so the
-    /// line stays in the digest after it, and raised again it is not held back as answered.
     #[test]
     fn the_vault_lines_press_leaves_the_line_up() {
         let mut app = App::headless_for_test();
@@ -1262,9 +1191,6 @@ mod tests {
         assert!(up(&app), "raised again");
     }
 
-    /// A PRESS BEFORE SETUP'S FIRST READ PRESETS THAT READ: the tab waits for it (a preset
-    /// would hold the default vault against it) and says to check the rows, and the read lands
-    /// set for the sync over this Mac's own plan and vault.
     #[test]
     fn the_vault_lines_press_before_setups_first_read_presets_that_read() {
         let mut app = App::headless_for_test();
@@ -1281,8 +1207,6 @@ mod tests {
         assert_synced(&mut app, &plan);
     }
 
-    /// A REVIEW THE PERSON EDITED IS ONLY SHOWN: the press brings System State to the front
-    /// with their rows, vault and password as they left them, and says to check the rows.
     #[test]
     fn the_vault_lines_press_only_shows_an_edited_review() {
         let mut app = App::headless_for_test();
@@ -1313,10 +1237,6 @@ mod tests {
         );
     }
 
-    /// A REVIEW A RUN OR AN OFFER HOLDS IS ONLY SHOWN: setup's own pass, an Apply awaiting
-    /// its receipt and a first-run offer each keep the plan they hold, the press says to check
-    /// the rows, and the offer it brings to the front waits for the person instead of applying
-    /// itself when its countdown would end.
     #[test]
     fn the_vault_lines_press_changes_nothing_held_by_a_run_or_an_offer() {
         let read = || SetupStatus {
@@ -1396,8 +1316,6 @@ mod tests {
             let instance = app.native_runtime.instance_by_kind(AppKind::SystemState);
             let (send, receive) = mpsc::channel();
             let request = Request::new(Plan::default(), send);
-            // The real waiting worker can withdraw its queued wake when an
-            // explicit doctor operation completes in another process.
             request.finish(WorkstationSetupDecision::Unavailable);
             assert_eq!(
                 receive.try_recv().unwrap().decision,
@@ -1507,8 +1425,6 @@ mod tests {
             if let Some(cancel) = answer.cancel_receipt.take() {
                 cancel.complete();
             }
-            // A late completion of that old channel cannot retire the newer
-            // local action's permission hold, even once its view is idle.
             request.finish(WorkstationSetupDecision::Unavailable);
             app.tick_system_state(Instant::now());
             app.receive_system_state_status(Some(previous), policy());
@@ -1577,8 +1493,6 @@ mod tests {
             assert_eq!(reviewed.2.busy, busy);
             assert_eq!(reviewed.2.dirty, !busy);
 
-            // Exercise the windowed offer route without an OS surface. The
-            // fixture's injected runtime keeps native preference probes inert.
             assert!(!app.apprt.probe_preferences);
             assert!(app.windows[&wid].os_window.is_none());
             app.headless = false;
@@ -1736,8 +1650,6 @@ mod tests {
             );
             app.close_active_native_tab(wid).unwrap();
             assert!(app.system_state_cancel_pending());
-            // A reopened controller begins idle before any status poll. Its
-            // receipt, rather than that cached busy flag, must reject reoffers.
             assert!(app.open_system_state_tab());
             let refuse_offer = |app: &mut App| {
                 let (send, receive) = mpsc::channel();
@@ -1813,8 +1725,6 @@ mod tests {
                 );
             }
             receipt.complete();
-            // The read-only update preflight may poll completion before the UI
-            // tick. That success must remain known on later preflight checks.
             for _ in 0..2 {
                 assert!(!app.system_state_cancel_pending());
             }
@@ -1922,9 +1832,6 @@ mod tests {
             if already_observed {
                 assert!(app.resolve_system_state_cancellations());
             }
-            // A rendezvous send succeeds only when shutdown actually receives
-            // this later completion; dropping it after the first failure fails
-            // deterministically, regardless of which thread is scheduled first.
             let (finish, receive) = mpsc::sync_channel(0);
             app.system_state_host
                 .cancel_receipts
@@ -1971,8 +1878,6 @@ mod tests {
             }),
         )
         .unwrap();
-        // A second input event can close the last view before the event-loop
-        // park drains the reducer's queued action.
         app.close_active_native_tab(wid).unwrap();
         assert!(app.native_runtime.app(instance).is_none());
         assert!(app.structural_invariants_ok());
@@ -2037,8 +1942,6 @@ mod tests {
         let generation = app.system_state_host.generation;
         app.close_active_native_tab(wid).unwrap();
         app.tick_system_state(Instant::now());
-        // Library tests have no provisioning handlers. The ordinary refusal is
-        // evidence that the manual action reached its host instead of vanishing.
         let refusal = app.system_state_host.action_refusal.as_ref().unwrap();
         assert_eq!(refusal.name, "Cancel");
         assert_eq!(refusal.status, "not started");
@@ -2197,8 +2100,6 @@ mod tests {
     fn closed_check_notices_match_the_plan_that_reopening_restores() {
         use aterm_types::macos_setup::Setting;
 
-        // A completed Check can outlive its final view. Only results that the
-        // reopened form can show should summon the person back to that form.
         for (saved, edit, action_failure) in [
             (None, None, false),
             (Some("http://saved.local/v1/team"), None, false),
@@ -2435,8 +2336,6 @@ mod tests {
             CHECKED.with(|plans| {
                 assert_eq!(std::mem::take(&mut *plans.borrow_mut()), vec![expected]);
             });
-            // A completed read-only check can refresh progress without marking
-            // the review submitted or consuming its canonical password.
             app.receive_system_state_status(Some(app.system_state_host.generation), old_status);
             assert_review(&mut app, wid, view, url, false);
             assert!(app.system_state_host.pending_apply.is_none());
@@ -2490,9 +2389,6 @@ mod tests {
             assert!(app.system_state_host.pending.is_none());
             assert!(!app.native_runtime.system_state_mut().unwrap().pending());
 
-            // The worker can publish Restore's result before the old offer's
-            // one-second completion poll. That must not route the next Apply
-            // back to the automatic worker, which honors the restored marker.
             app.receive_system_state_status(
                 Some(app.system_state_host.generation),
                 SetupStatus {
@@ -2702,8 +2598,6 @@ mod tests {
     fn manual_apply_receipt_keeps_inputs_busy_until_a_spawned_worker_accepts_or_refuses() {
         let (mut app, wid, view, receipt) = reviewed_apply();
         for _ in 0..3 {
-            // An unsolicited status changes the status generation, never the
-            // independent admission receipt or its pending busy reservation.
             app.receive_system_state_status(None, SetupStatus::default());
             app.receive_system_state_status(
                 Some(app.system_state_host.generation),
@@ -2721,7 +2615,6 @@ mod tests {
                 true,
             );
         }
-        // A successful thread spawn can still fail to claim or persist its plan.
         drop(receipt);
         app.resolve_system_state_apply();
         assert_review(
@@ -2864,8 +2757,6 @@ mod tests {
                 let url = "http://reopened.local:7484/v1/team";
                 edit_review(&mut app, wid, view, url);
                 assert_review(&mut app, wid, view, url, false);
-                // A read-only action does not replace the accepted Apply's
-                // outstanding admission or its permission authorization.
                 app.run_system_state_action_with_handlers(
                     SystemStateAction::Check(Plan::default()),
                     Some(InitialSetupHandlers {
@@ -3000,14 +2891,11 @@ mod tests {
                 .indicators
                 .busy
         );
-        // A held key still belongs to that one press after the worker becomes
-        // idle. It cannot authorize another pass by taking the text fallback.
         assert!(app.native_input_event(wid, &repeat));
         assert!(
             app.native_runtime.take_system_state_action().is_none(),
             "Return auto-repeat must not queue another Apply"
         );
-        // A new press remains an intentional activation of the focused button.
         assert!(app.native_input_event(wid, &enter));
         assert!(matches!(
             app.native_runtime.take_system_state_action(),
@@ -3030,8 +2918,6 @@ mod tests {
         common.last_focus = Some(UiKey::new("system-state/apply"));
         common.focus_visible = true;
 
-        // Negative control: the real native key reducer activates the old
-        // focused Apply button before a new automatic offer is attached.
         assert!(app.native_input_event(wid, &press(NamedKey::Enter)));
         assert!(matches!(
             app.native_runtime.system_state_mut().unwrap().take_action(),
@@ -3108,7 +2994,6 @@ mod tests {
             let start = Instant::now();
             app.native_runtime.tick_system_state(start, true);
 
-            // These are platform lifecycle/reset callbacks, with no typing.
             app.on_ime_enablement_changed(wid);
             app.on_ime_preedit(wid, String::new(), None);
             assert!(app.windows[&wid].preedit.is_empty());
@@ -3409,8 +3294,6 @@ mod tests {
                 })
                 .count()
         };
-        // The refusal preserves the last measured completion; the first poll
-        // can neither erase the notice nor duplicate it on each refresh.
         assert_eq!(app.system_state_host.latest_status, completed);
         assert!(app.commit_glassless_native_frame(wid));
         assert_eq!(visible_notices(&app), 1);
@@ -3867,8 +3750,6 @@ mod tests {
                 .unwrap()
                 .common()
                 .presentation_revision;
-            // No repaint or input occurs during these idle ticks. Repeated
-            // identical worker snapshots also leave the shown frame valid.
             for tick in 1..=40 {
                 app.tick_system_state(
                     start + Duration::from_secs(30) + Duration::from_millis(tick * 250),

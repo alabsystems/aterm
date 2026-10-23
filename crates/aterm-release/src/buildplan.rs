@@ -1060,6 +1060,7 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Opti
     snapshot::refuse_root_cargo_config()?;
     // PATH `cargo`.
     // PATH `cargo`. Compat: stable's `cargo` via the rustup shim (STOCK EXCEPTION, see the
+    // module doc).
     let home = std::env::var_os("HOME").ok_or("release build requires HOME")?;
     let compat_shim = if target.is_some() {
         Some(release_rustup_shim_dir(&home)?)
@@ -2045,7 +2046,7 @@ fn turn_verdict(out: &std::process::Output, slice: SliceArch) -> Result<(), Stri
 }
 
 /// Combine slices into one fat binary, or pass a single slice through
-/// (build-app.sh's lipo step, incl.
+/// (build-app.sh's lipo step, incl. the single-arch copy branch).
 fn lipo_or_copy(slices: &[PathBuf], out: &Path) -> Result<(), String> {
     match slices {
         [] => Err("no architecture built".into()),

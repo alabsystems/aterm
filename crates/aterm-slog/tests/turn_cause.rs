@@ -49,8 +49,6 @@ fn a_caused_input_names_the_turn_it_opens() {
     );
 }
 
-/// NEGATIVE: an input six seconds old attributes nothing, and another
-/// actor's later input takes the turn without the cause.
 #[test]
 fn a_stale_or_superseded_cause_names_no_turn() {
     let mut log = Log::new(1);
@@ -74,8 +72,6 @@ fn a_stale_or_superseded_cause_names_no_turn() {
     );
 }
 
-/// The cause crosses a seamless update with its input and its ledger, and a
-/// 2A carry line (none) reads with none.
 #[test]
 fn a_cause_crosses_the_carry_and_a_2a_line_reads() {
     let mut log = Log::new(1);

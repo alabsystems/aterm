@@ -129,7 +129,6 @@ pub struct World {
     pub limit: Option<u64>,
     /// Named pids a scenario keeps.
     pub vars: HashMap<&'static str, u32>,
-    /// The size each (pid, file) was last looked at, for the tail check.
     looked: HashMap<(u32, u64, u64), u64>,
 }
 
@@ -469,7 +468,6 @@ impl World {
         }
     }
 
-    /// The session a process's terminal belongs to (the shell it runs under).
     fn session_of(&self, pid: u32) -> Option<u32> {
         let p = self.procs.get(&pid)?;
         if p.sid != 0 {

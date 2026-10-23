@@ -98,7 +98,7 @@ pub(super) const RESET_WAITS: ResetWaits = ResetWaits {
 pub(super) enum ResetAsked {
     /// The host's go: the row is pressed as decided.
     Take,
-    /// The host cannot say.
+    /// The host cannot say yet: the dialog is looked at again in a moment.
     Again,
     /// The reset is passed over for this mount.
     Pass,
@@ -239,7 +239,9 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    /// A step an earlier loop opened.
+    /// A step an earlier loop opened ([`approvals::reset_owed`]: its ledger row, and whether the
+    /// confirmation's Enter was written since) is this loop's to end: Escape-only, as every step
+    /// with no go.
     pub(super) fn reset_take_up(&mut self, open: &approvals::ResetOpen, review: &mut dyn Review) {
         let age_ms = self.fx.stamp_ms().saturating_sub(open.taken_ms);
         self.reset_step_owed(None, self.fx.mono(), open.entered);
@@ -377,6 +379,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &dyn Review,
     ) -> Result<Option<&'static str>, Fail> {
+        // A loop that acts on the session by itself, for a host, and keeps
         // a ledger the loop after it can read.
         if !review.unattended() {
             return Ok(Some("attended"));
@@ -629,6 +632,7 @@ impl<C: Ctl> Session<'_, C> {
                 Shows::Unread => {
                     let bound = if entered { waits.claim } else { waits.open };
                     if self.fx.since(since) >= bound {
+                        // No screen of the step's that this build reads: said once, never
                         // keyed, and not said of a step that ends untold.
                         if self.reset_untold(opts).is_none()
                             && let Some(host) = opts.idle_host.as_ref()
@@ -846,6 +850,7 @@ impl<C: Ctl> Session<'_, C> {
                         Ok(Flow::Again(Duration::ZERO))
                     }
                     Some(Pressing::Lost { why, .. }) => {
+                        // Cut mid-exchange, the Enter may have been written:
                         // the books say so before the outage is ridden out.
                         if !r.untouched() {
                             self.reset_yes_written(confirm.kind, &confirm.head, seq, review);

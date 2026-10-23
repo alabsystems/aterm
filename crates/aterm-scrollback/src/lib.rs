@@ -53,6 +53,57 @@ pub(crate) use watermark::{
 };
 
 /// Scrollback buffer with tiered storage.
+///
+/// # Examples
+///
+/// Basic usage with string lines:
+///
+/// ```
+/// use aterm_scrollback::Scrollback;
+///
+/// let mut sb = Scrollback::with_defaults();
+/// sb.push_str("First line");
+/// sb.push_str("Second line");
+///
+/// // Get lines by index (0 = oldest)
+/// assert_eq!(sb.get_line(0).expect("ok").expect("some").to_string(), "First line");
+/// assert_eq!(sb.get_line(1).expect("ok").expect("some").to_string(), "Second line");
+///
+/// // Get lines by reverse index (0 = newest)
+/// assert_eq!(sb.get_line_rev(0).expect("ok").expect("some").to_string(), "Second line");
+/// ```
+///
+/// Iterating over scrollback history:
+///
+/// ```
+/// use aterm_scrollback::Scrollback;
+///
+/// let mut sb = Scrollback::with_defaults();
+/// sb.push_str("Line A");
+/// sb.push_str("Line B");
+/// sb.push_str("Line C");
+///
+/// // Iterate oldest to newest
+/// let lines: Vec<_> = sb.iter().map(|l| l.to_string()).collect();
+/// assert_eq!(lines, vec!["Line A", "Line B", "Line C"]);
+/// ```
+///
+/// Setting a line limit:
+///
+/// ```
+/// use aterm_scrollback::Scrollback;
+///
+/// let mut sb = Scrollback::with_defaults();
+/// sb.set_line_limit(Some(3));
+///
+/// sb.push_str("One");
+/// sb.push_str("Two");
+/// sb.push_str("Three");
+/// sb.push_str("Four");  // "One" gets discarded
+///
+/// assert_eq!(sb.line_count(), 3);
+/// assert_eq!(sb.get_line(0).expect("ok").expect("some").to_string(), "Two");
+/// ```
 #[derive(Debug)]
 pub struct Scrollback {
     /// Hot tier: uncompressed lines (instant access).
@@ -291,6 +342,7 @@ pub(crate) fn count_image_rows(lines: &[Line]) -> u64 {
     let mut rows = 0u64;
     for line in lines {
         if line.has_images() {
+            // Saturating: one warm block cannot approach u64::MAX; this only
             // discharges the strict L0 gate's overflow obligation.
             rows = rows.saturating_add(1);
         }

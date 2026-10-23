@@ -1,7 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The journal reader's view (design §5.3, §5.4, phase 2B), over chains a simulated writer wrote with the host writer's own policy ([`journal::take`], [`journal::take_frames`]) and read back through the codec:
+//! The journal reader's view (design §5.3, §5.4, phase 2B), over chains a
+//! simulated writer wrote with the host writer's own policy
+//! ([`journal::take`], [`journal::take_frames`]) and read back through the
+//! codec:
+//! - DIFFERENTIAL: seeded traffic on a small ring, journaled at random
+//!   intervals (so the writer meets evictions): the view's records past the
+//!   first loss, its loss count and its open set equal the live log's;
+//! - each `(sid, base, seq)` once, however many writers journaled it;
+//! - a dead chain's view closes what was open, innermost first, after `gap
+//!   why=crash after=<head>`; an ended chain's and a live one's add nothing;
+//! - a close the writer never saw reads `out=unknown` at the later snap;
+//! - pruned and unread prefixes say so; an update's shortfall reads
+//!   `why=handoff` with its count;
+//! - ONE TAKE PER PASS (the host's own pace, a writer behind its log): no
+//!   range is said pruned when nothing was, a crash gap says the writer's
+//!   cursor, each seq once, every loss at or below the cursor counted;
+//! - a reader holds every record it read: 10⁵ records in, none said lost;
+//! - the ring evicts what the writer holds before what it has not reached;
+//! - the records a reply derives are numbered past the journal's head in
+//!   the journal's epoch and derived again by every read: a reply hands out
+//!   the journal's cursor, so a reader following one reply into the next
+//!   never skips a record the journal holds, and a cursor the journal never
+//!   numbered (another space's, a successor's the journal lags) is reset,
+//!   said;
+//! - a restatement past its snap's head accounts for nothing.
 
 use aterm_slog::journal::{
     ChainRead, EndWhy, FORMAT, Frame, Inst, Liveness, SegmentRead, View, ViewRules, complete_lines,

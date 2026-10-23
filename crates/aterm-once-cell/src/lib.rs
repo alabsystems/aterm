@@ -385,6 +385,7 @@ pub mod sync {
         where
             F: FnOnce() -> Result<T, E>,
         {
+            // Fast path: fully initialised, no lock taken. `OnceLock::get`
             // carries the acquire ordering that makes the value visible.
             if let Some(val) = self.get() {
                 return Ok(val);

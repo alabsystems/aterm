@@ -394,6 +394,7 @@ mod content {
         where
             D: Deserializer<'de>,
         {
+            // Internally tagged enums are only supported in self-describing
             // formats.
             deserializer.deserialize_any(self)
         }
@@ -1471,6 +1472,7 @@ mod content {
             if len == 2 {
                 self.deserialize_seq(visitor)
             } else {
+                // First argument is the number of elements in the data, second
                 // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(2, &ExpectedInSeq(len)))
             }
@@ -2389,6 +2391,7 @@ mod content {
             if len == 2 {
                 self.deserialize_seq(visitor)
             } else {
+                // First argument is the number of elements in the data, second
                 // argument is the number of elements expected by the Deserialize.
                 Err(de::Error::invalid_length(2, &ExpectedInSeq(len)))
             }

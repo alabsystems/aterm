@@ -8703,6 +8703,8 @@ impl crate::flow::Fetcher for SetBesideVendors {
             "claude"
         };
         if self.checkpoints && !self.was_asked(&format!("payload:{other}")) {
+            // The other lane's landing begins while the first agent's bytes are in flight,
+            // and waits for the link, its row still queued: the lanes land side by side, and
             // only their bytes take turns.
             self.wait_until_waiting_for_the_link(other);
         }

@@ -9,9 +9,6 @@ use core::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     message: String,
-    /// 1-based position in the source, or `None` for a serializer failure and
-    /// for errors raised by a `Deserialize` impl against an in-memory
-    /// [`Value`](crate::Value).
     line_col: Option<(usize, usize)>,
 }
 
@@ -33,9 +30,6 @@ impl Error {
     }
 }
 
-/// Resolve a byte offset to a 1-based line and column, counting a column per
-/// CHARACTER rather than per byte so a diagnostic against a line with
-/// non-ASCII text points where a reader would look.
 fn line_col(source: &[u8], at: usize) -> (usize, usize) {
     let mut line = 1usize;
     let mut col = 1usize;

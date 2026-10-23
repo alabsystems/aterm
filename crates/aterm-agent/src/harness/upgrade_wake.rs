@@ -220,6 +220,7 @@ impl ActivationWake {
     fn wait_macos(&mut self, fallback: Duration) -> bool {
         let deadline = Instant::now() + fallback;
         loop {
+            // A Settings edit may have moved the package prefix: the builds
             // it holds are others, and the watch moves with it.
             if self
                 .marks

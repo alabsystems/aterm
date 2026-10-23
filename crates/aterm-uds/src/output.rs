@@ -16,7 +16,8 @@ thread_local! {
     static EXECUTOR: RefCell<Option<Arc<Executor>>> = const { RefCell::new(None) };
 }
 
-/// Runs `command` and reads stdout and stderr through the current [`with_executor`].
+/// Runs `command` and reads stdout and stderr, through the current [`with_executor`] when one is
+/// installed.
 /// # Errors
 /// The executor's error, or the command's spawn, read or wait error.
 pub fn output(command: &mut Command) -> io::Result<Output> {

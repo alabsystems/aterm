@@ -131,7 +131,7 @@ impl Breadcrumb {
     /// AppKit loop, the update handoff), and in particular true at the idle park
     /// [`Breadcrumb::AboutToWait`]: a thread parked in the OS event wait uses no CPU, so one
     /// that burns it there is spinning where the heartbeat cannot see.
-    fn spin_is_a_stall(self) -> bool {
+    const fn spin_is_a_stall(self) -> bool {
         !matches!(
             self,
             Breadcrumb::Startup | Breadcrumb::UpdateHandoff | Breadcrumb::Modal
@@ -140,7 +140,7 @@ impl Breadcrumb {
 
     /// A root where a frozen heartbeat is expected, so the sampler does not
     /// report a stall while parked here.
-    fn is_park_point(self) -> bool {
+    const fn is_park_point(self) -> bool {
         matches!(
             self,
             Breadcrumb::Startup
@@ -304,7 +304,7 @@ enum EndedBy {
 }
 
 impl Sampler {
-    fn with_threshold(now: Instant, beat: u64, threshold: Duration) -> Self {
+    const fn with_threshold(now: Instant, beat: u64, threshold: Duration) -> Self {
         Self {
             last_beat: beat,
             last_advance: now,
@@ -341,7 +341,7 @@ impl Sampler {
     }
 
     /// The reported stall that ended since the last call, once.
-    fn take_ended(&mut self) -> Option<Ended> {
+    const fn take_ended(&mut self) -> Option<Ended> {
         self.ended.take()
     }
 
@@ -418,6 +418,10 @@ impl Sampler {
                 }
                 None => {
                     // Idle / startup park: a frozen heartbeat is expected, so keep the
+                    // clock reset. A spin reported here ends once a reading finds the thread
+                    // quiet (with no reading, at the next beat). A stall reported at a work
+                    // root is not ended here: a park point under its unmoved heartbeat is the
+                    // next root's breadcrumb read before its beat, and that beat ends it.
                     if judged == Some(false)
                         && self.open.is_some_and(|stall| stall.root.is_park_point())
                     {
@@ -505,7 +509,7 @@ impl Sampler {
         due
     }
 
-    fn clear_reports(&mut self) {
+    const fn clear_reports(&mut self) {
         self.reported = false;
         self.last_report = None;
         self.reports = 0;
@@ -543,7 +547,7 @@ impl SamplerWake {
     /// [`start`]'s callback tells the App that every deadline it derived
     /// from the wall must be derived again (Autopilot's timers,
     /// `crate::Wake::WallMoved`).
-    fn wall_moved(&self) -> bool {
+    const fn wall_moved(&self) -> bool {
         matches!(
             self.gap,
             Some(Gap {
@@ -1133,7 +1137,7 @@ pub(crate) enum Phase {
 impl Phase {
     /// Reconstruct a phase from its stored `u8` (unknown values fold to
     /// [`Phase::None`], which adds nothing to the line).
-    fn from_u8(v: u8) -> Self {
+    const fn from_u8(v: u8) -> Self {
         match v {
             1 => Phase::PixelBackendRedeem,
             2 => Phase::ImageCapture,
@@ -1142,7 +1146,7 @@ impl Phase {
     }
 
     /// Stable, symbol-free wording for the log line.
-    pub(crate) fn describe(self) -> &'static str {
+    pub(crate) const fn describe(self) -> &'static str {
         match self {
             Phase::None => "",
             Phase::PixelBackendRedeem => {
@@ -2020,6 +2024,8 @@ mod tests {
     #[test]
     fn the_watchdog_is_armed_unless_explicitly_switched_off() {
         // `enabled()` reads the environment, which is process-global and shared
+        // with every other test in this binary, so assert the decision, not by
+        // mutating the env. With nothing set, it must be on.
         if seam().is_none() {
             assert!(
                 enabled(),

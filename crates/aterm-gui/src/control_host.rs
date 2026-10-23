@@ -57,7 +57,7 @@ impl<'a> GuiHost<'a> {
     }
 
     /// The shipped host: [`GuiHost::new`] plus the registry the roster/selector verbs read and the resolved target's context, whose watchers it parks on.
-    pub(crate) fn with_fleet(
+    pub(crate) const fn with_fleet(
         sid: u64,
         term: &'a Arc<Mutex<Terminal>>,
         proxy: Option<&'a EventLoopProxy<Wake>>,
@@ -76,7 +76,7 @@ impl<'a> GuiHost<'a> {
 
     /// Whether this host serves `sid` at all — the fail-closed gate every
     /// per-session method takes first.
-    fn serves(&self, sid: u64) -> bool {
+    const fn serves(&self, sid: u64) -> bool {
         sid == self.sid
     }
 }

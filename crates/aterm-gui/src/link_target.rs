@@ -151,7 +151,7 @@ fn safe_form(text: &str) -> String {
 
 /// How many characters `ch` takes in the [`safe_form`]: one for printable
 /// ASCII, three (`%XX`) for each UTF-8 byte of anything else.
-fn safe_width(ch: char) -> usize {
+const fn safe_width(ch: char) -> usize {
     if matches!(ch, '\u{21}'..='\u{7e}') {
         1
     } else {

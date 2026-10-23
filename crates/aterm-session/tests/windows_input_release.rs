@@ -10,13 +10,11 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use aterm_pty::{ConsoleHostChoice, ConsoleHostKind};
 use aterm_session::sink::{BulkMeter, BulkState, SinkWriter};
-
-/// A wait for something that must happen: a hang detector, never a budget.
-const MUST_HAPPEN: Duration = Duration::from_secs(60);
+use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
 /// The PowerShell program: it writes without end until a key is waiting, then
 /// reads keys until a `Q` and reports how many of each character it read.
@@ -62,15 +60,6 @@ fn io_pending<T>(thread: &JoinHandle<T>) -> bool {
     ok != 0 && pending != 0
 }
 
-/// Wait for `what` (a hang detector, never a budget).
-fn eventually(what: &str, mut done: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < MUST_HAPPEN, "never: {what}");
-        std::thread::sleep(Duration::from_millis(2));
-    }
-}
-
 /// Serializes the tests: each one sets the process-global console host.
 static HOST: Mutex<()> = Mutex::new(());
 
@@ -94,7 +83,9 @@ fn under_each_host(scenario: impl Fn(ConsoleHostKind)) {
 
 /// `writer`'s answer, once it has ended (a writer the test released must end).
 fn ended<T>(writer: JoinHandle<T>) -> T {
-    eventually("the released writer ends", || writer.is_finished());
+    until_within(MUST_HAPPEN, "the released writer ends", || {
+        writer.is_finished().then_some(())
+    });
     writer.join().expect("the writer")
 }
 
@@ -158,14 +149,20 @@ impl Tab {
         );
         if handshake {
             let (mut seen, mut buf) = (Vec::new(), vec![0u8; 4096]);
-            eventually("the console host asks for win32-input-mode records", || {
-                let n = aterm_pty::read(master, &mut buf);
-                seen.extend_from_slice(&buf[..usize::try_from(n).unwrap_or(0)]);
-                seen.windows(8).any(|w| w == b"\x1b[?9001h")
-            });
+            until_within(
+                MUST_HAPPEN,
+                "the console host asks for win32-input-mode records",
+                || {
+                    let n = aterm_pty::read(master, &mut buf);
+                    seen.extend_from_slice(&buf[..usize::try_from(n).unwrap_or(0)]);
+                    seen.windows(8).any(|w| w == b"\x1b[?9001h").then_some(())
+                },
+            );
         }
-        eventually("the program's output fills the pipe", || {
-            aterm_pty::output_waiting_for_test(master).is_some_and(|n| n >= 64 * 1024)
+        until_within(MUST_HAPPEN, "the program's output fills the pipe", || {
+            aterm_pty::output_waiting_for_test(master)
+                .is_some_and(|n| n >= 64 * 1024)
+                .then_some(())
         });
         Self {
             master,
@@ -185,8 +182,8 @@ impl Tab {
     /// `writes` others; the host reads nothing, so it stays blocked until
     /// released.
     fn blocked<T>(&self, writer: &JoinHandle<T>, writes: u64) {
-        eventually("the writer blocks in WriteFile", || {
-            self.writes() > writes && io_pending(writer)
+        until_within(MUST_HAPPEN, "the writer blocks in WriteFile", || {
+            (self.writes() > writes && io_pending(writer)).then_some(())
         });
     }
 

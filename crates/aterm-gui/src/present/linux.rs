@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Linux CPU presenter: whichever display server the window is on. X11
-//! windows draw through [`super::x11`] (MIT-SHM), Wayland windows through
-//! [`super::wayland`] (`wl_shm`); both first-party since LW.6 of
-//! docs/AUDIT-third-party-2026-10-15.md, which took softbuffer off Linux.
+//! Linux CPU presenter dispatching to [`super::x11`] (MIT-SHM) or [`super::wayland`] (`wl_shm`).
 
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};

@@ -54,10 +54,6 @@ fn mode_of(path: &Path) -> u32 {
         & 0o7777
 }
 
-/// A write lands whole at its mode, in a directory it makes; the `check` runs
-/// last before the rename, the temp already holding the new bytes at their
-/// mode, and one that refuses leaves the old bytes and no temp; and a link at
-/// the path is replaced, never written through.
 #[test]
 fn a_write_is_whole_or_nothing_and_never_through_a_link() {
     let scratch = Scratch::new("write");
@@ -106,11 +102,6 @@ fn a_write_is_whole_or_nothing_and_never_through_a_link() {
     );
 }
 
-/// aterm.toml is written as the config service writes it: through a link to
-/// the file it names, the previous text kept as `.bak`, the file's own
-/// permission bits kept (on the descriptor: 0664 is past the umask) and never
-/// a set-id bit, and never over bytes that changed, appeared or went after
-/// they were read.
 #[test]
 fn aterm_toml_is_written_through_its_link_and_never_over_a_change() {
     let scratch = Scratch::new("config");
@@ -191,8 +182,6 @@ fn aterm_toml_is_written_through_its_link_and_never_over_a_change() {
     assert_eq!(mode_of(&fresh), 0o600, "a new file is private");
 }
 
-/// What cannot be read whole is never edited: a link that names no file, a
-/// directory, and text that is not UTF-8.
 #[test]
 fn aterm_toml_that_cannot_be_read_is_never_edited() {
     let scratch = Scratch::new("unreadable");
@@ -209,9 +198,6 @@ fn aterm_toml_that_cannot_be_read_is_never_edited() {
     );
 }
 
-/// A temporary name already taken, by a planted link or by a file, is never
-/// opened: the next salt is tried, a clash on every try refuses as
-/// `AlreadyExists`, and any other failure of the create is its own.
 #[test]
 fn a_taken_temporary_name_is_never_opened() {
     let scratch = Scratch::new("temp");
@@ -244,12 +230,6 @@ fn a_taken_temporary_name_is_never_opened() {
     assert_eq!(missing.kind(), io::ErrorKind::NotFound);
 }
 
-/// The config write lock: a holder makes an edit wait, and one held past the
-/// wait refuses it as busy; a lock file already there is taken and made 0600
-/// again (no other account may hold it open), and the lock is let go by
-/// `LOCK_UN` before the close, so a child forked while it was held keeps
-/// nothing. A link or a directory planted at the lock's name is refused as no
-/// regular file, and what a link names is neither opened nor made private.
 #[test]
 fn the_write_lock_waits_refuses_past_its_wait_and_is_let_go() {
     let scratch = Scratch::new("lock");
@@ -315,10 +295,6 @@ fn the_write_lock_waits_refuses_past_its_wait_and_is_let_go() {
     }
 }
 
-/// A link or a FIFO a racing writer swaps in at the lock's name after the check that the name
-/// is a regular file, before the open, is refused there too: the link by the no-follow open,
-/// what it names neither opened nor made private, and the FIFO by the descriptor's own type,
-/// its mode kept.
 #[test]
 fn a_lock_name_swapped_after_its_check_is_still_refused() {
     let scratch = Scratch::new("swap");
@@ -347,8 +323,6 @@ fn a_lock_name_swapped_after_its_check_is_still_refused() {
     assert_eq!(mode_of(&lock), 0o644, "the FIFO is not made private");
 }
 
-/// A writer that ignores the lock (an editor) and saves after the edit's first check, while
-/// its `.bak` and text are written, still makes the edit refuse: its save is never reverted.
 #[test]
 fn a_save_after_the_first_check_still_refuses_the_edit() {
     let scratch = Scratch::new("late");
@@ -365,9 +339,6 @@ fn a_save_after_the_first_check_still_refuses_the_edit() {
     );
 }
 
-/// A lock refused for any reason but a holder is that refusal, at once: never waited out and
-/// reported as another writer's save. Staged by a Seatbelt profile that denies `flock`
-/// (`EPERM`), with this test binary run again under `sandbox-exec`.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_lock_refused_for_another_reason_is_not_waited_on() {

@@ -1093,6 +1093,8 @@ impl StepFold {
         let k = out.len() as u64;
         if kind == Some("user") {
             // THE HELD TURN'S PROMPT, written late: dated before its rows,
+            // it is queued before their steps; any other user row says no
+            // such prompt comes, and they go on as they are.
             if let Some(h) = self.hold.take()
                 && let (Some(vref), Some(when)) = (late, at_ms)
                 && when <= h.at_ms
@@ -1339,6 +1341,9 @@ impl StepFold {
                 self.prompt(obj, out);
             } else if anew {
                 // Claude Code's own row that begins a turn (a `/loop`'s
+                // wake, a missed task's notice) waits as a wake does; one
+                // under the running turn's `promptId`, or under none (a
+                // Stop hook's feedback, `/goal`'s check-in), goes on it.
                 self.pending = Some(waits(true));
             }
             return (EndRow::None, None);
@@ -1369,6 +1374,7 @@ impl StepFold {
         let lead = lead(line);
         if let Some(l) = lead.as_ref().filter(|l| l.local()) {
             // A command's row waits for the turn it may start (a prompt
+            // command's), its output says it started none (a local one's).
             if l.starts(LOCAL_COMMAND[0]) || l.starts(LOCAL_COMMAND[1]) {
                 self.pending = Some(waits(false));
             } else if l.starts(LOCAL_OUTPUT) {
@@ -1433,6 +1439,7 @@ impl StepFold {
             }
             Some(KEY_LOCAL_COMMAND) => {
                 // A local command's output in the newer shape: the command
+                // before it started no turn (`upgrade.rs`'s `TaskScan`).
                 if obj
                     .get("content")
                     .and_then(Value::as_str)

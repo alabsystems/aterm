@@ -4,17 +4,6 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (The wake pipe and the
-// deadline rounding moved to `common::poll`, which the X11 loop shares:
-// docs/AUDIT-third-party-2026-10-15.md, LW.7.)
-
-// A display-free event loop, selected explicitly with `with_headless`.
-// It never connects to X11 or Wayland or silently substitutes for a failed display.
-// A proxy wakes it across threads; ControlFlow governs polling and deadlines.
-// Init emits NewEvents, Resumed, user events and AboutToWait; later turns omit
-// Resumed, and exit emits LoopExiting. Window creation is an explicit error, and
-// monitor enumeration is empty.
-
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -29,8 +18,8 @@ use crate::platform::pump_events::PumpStatus;
 use super::common::poll::{self, Waker};
 use super::MonitorHandle;
 
-/// A proxy's half of the loop: the queue carries the events, the waker only "something
-/// was posted" (`common::poll::Waker`, which never blocks the sender).
+/// A proxy's half of the loop: the queue carries the events, the waker only "something was posted"
+/// (`common::poll::Waker`, which never blocks the sender).
 pub struct EventLoopProxy<T: 'static> {
     queue: Arc<Mutex<VecDeque<T>>>,
     waker: Waker,
@@ -44,9 +33,6 @@ impl<T: 'static> Clone for EventLoopProxy<T> {
 
 impl<T: 'static> EventLoopProxy<T> {
     pub fn send_event(&self, event: T) -> Result<(), EventLoopClosed<T>> {
-        // A poisoned queue hands the event back rather than unwinding the sender: the
-        // caller's `Err` arm already knows how to cope with a loop it cannot reach, and
-        // a panic here would be a second failure on top of the first.
         let Ok(mut queue) = self.queue.lock() else {
             return Err(EventLoopClosed(event));
         };
@@ -57,8 +43,7 @@ impl<T: 'static> EventLoopProxy<T> {
     }
 }
 
-/// The windowless twin of the X11/Wayland `ActiveEventLoop`: the control-flow and exit
-/// state a handler is allowed to set, and nothing that implies a display.
+/// The windowless twin of the X11/Wayland `ActiveEventLoop`.
 pub struct ActiveEventLoop {
     control_flow: Cell<ControlFlow>,
     exit: Cell<Option<i32>>,
@@ -99,7 +84,6 @@ impl ActiveEventLoop {
         self.exit.get().is_some()
     }
 
-    // Reached only through the dispatcher's, which the Wayland loop calls.
     #[cfg(wayland_platform)]
     #[inline]
     pub(crate) fn set_exit_code(&self, code: i32) {
@@ -111,9 +95,7 @@ impl ActiveEventLoop {
         self.exit.get()
     }
 
-    /// There is no display, so there is no handle to hand out. `NotSupported` is the
-    /// honest answer and the one a graphics backend can act on — it is the same answer
-    /// it would get from a platform that genuinely cannot present.
+    /// There is no display, so there is no handle to hand out.
     #[cfg(feature = "rwh_06")]
     #[inline]
     pub fn raw_display_handle_rwh_06(
@@ -124,12 +106,9 @@ impl ActiveEventLoop {
 }
 
 pub struct EventLoop<T: 'static> {
-    /// The root wrapper handed to the callback on every dispatch.
     target: RootELW,
     queue: Arc<Mutex<VecDeque<T>>>,
     waker: Waker,
-    /// Whether the `StartCause::Init` iteration has already run. `pump_events` may be
-    /// called many times for one loop, and only the first is `Init`.
     loop_running: bool,
     _marker: PhantomData<T>,
 }
@@ -191,8 +170,6 @@ impl<T: 'static> EventLoop<T> {
             self.single_iteration(&mut callback, StartCause::Init);
         }
 
-        // The `Init` iteration is allowed to ask to exit, exactly as it is on the other
-        // backends; polling after that request would run a turn the app already declined.
         if !self.state().exiting() {
             self.poll_events_with_timeout(timeout, &mut callback);
         }
@@ -216,7 +193,6 @@ impl<T: 'static> EventLoop<T> {
     {
         let start = Instant::now();
 
-        // Work already queued must not be made to wait on a deadline: block for zero.
         let deadline = if self.has_pending() {
             Some(Duration::ZERO)
         } else {
@@ -231,14 +207,9 @@ impl<T: 'static> EventLoop<T> {
             }
         };
 
-        // A failed wait is a spurious wake: the turn below runs, and the next one waits again.
         let _ = poll::wait(&mut [poll::readable(self.waker.as_raw_fd())], deadline);
         self.waker.drain();
 
-        // The cause is read AFTER the wait, so a `WaitUntil` that actually elapsed is
-        // reported as `ResumeTimeReached` and one cut short by a proxy wake is reported
-        // as `WaitCancelled` — the distinction a handler uses to tell a due timer from
-        // an early wake.
         let cause = match self.state().control_flow() {
             ControlFlow::Poll => StartCause::Poll,
             ControlFlow::Wait => StartCause::WaitCancelled { start, requested_resume: None },
@@ -264,9 +235,6 @@ impl<T: 'static> EventLoop<T> {
             callback(Event::Resumed, &self.target);
         }
 
-        // Drain by repeated pop rather than by swapping the whole queue out: a handler is
-        // allowed to post to its own proxy, and those events belong to THIS turn's drain
-        // if they arrive before it finishes, exactly as on the other backends.
         loop {
             let next = match self.queue.lock() {
                 Ok(mut queue) => queue.pop_front(),
@@ -284,8 +252,6 @@ impl<T: 'static> EventLoop<T> {
 mod tests {
     use super::*;
 
-    /// Record events until `on_turn` exits. Timed pumps bound a lost wake by a
-    /// one-minute hang detector without changing the handler's ControlFlow.
     fn drive<T: 'static>(
         mut loop_: EventLoop<T>,
         mut on_turn: impl FnMut(&RootELW, usize),
@@ -317,10 +283,6 @@ mod tests {
         log
     }
 
-    /// The order an `ApplicationHandler` is entitled to. `Resumed` must arrive exactly
-    /// once, on the `Init` turn, and `LoopExiting` must be last — a handler that sets up
-    /// on `Resumed` and tears down on `LoopExiting` is otherwise silently broken here
-    /// while working on X11 and Wayland.
     #[test]
     fn the_first_turn_is_init_then_resumed_and_the_last_is_loop_exiting() {
         let loop_: EventLoop<()> = EventLoop::new().unwrap();
@@ -335,9 +297,6 @@ mod tests {
         );
     }
 
-    /// A proxy is the ONLY way a windowless run learns anything from another thread, so
-    /// an event posted before the loop starts must still be delivered — the queue, not
-    /// the wake byte, is what carries the payload.
     #[test]
     fn an_event_posted_before_the_loop_runs_is_still_delivered() {
         let loop_: EventLoop<u32> = EventLoop::new().unwrap();
@@ -346,14 +305,10 @@ mod tests {
         assert!(log.contains(&"UserEvent".to_string()), "a pre-posted event was dropped: {log:?}");
     }
 
-    /// A worker released after Init delivers its event under ControlFlow::Wait.
-    /// The handoff does not establish whether the kernel poll has blocked yet.
     #[test]
     fn an_event_posted_after_init_is_delivered_from_another_thread_under_wait() {
         let loop_: EventLoop<u32> = EventLoop::new().unwrap();
         let proxy = loop_.create_proxy();
-        // The worker starts after the first turn, with the loop set to Wait.
-        // Only its proxy event or the driver's hang detector ends the wait.
         loop_.window_target().p.set_control_flow(ControlFlow::Wait);
         let (start, ready) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -371,7 +326,6 @@ mod tests {
         assert!(log.contains(&"UserEvent".to_string()), "a threaded wake never arrived: {log:?}");
     }
 
-    /// An already due WaitUntil produces ResumeTimeReached on the next turn.
     #[test]
     fn a_due_wait_until_reports_resume_time_reached() {
         let loop_: EventLoop<()> = EventLoop::new().unwrap();
@@ -388,8 +342,6 @@ mod tests {
         );
     }
 
-    /// Exit requested during the very first turn must be honoured without running a
-    /// second one, matching the other backends.
     #[test]
     fn an_exit_on_the_init_turn_runs_no_further_turn() {
         let loop_: EventLoop<()> = EventLoop::new().unwrap();

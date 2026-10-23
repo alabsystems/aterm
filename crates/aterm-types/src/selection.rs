@@ -108,6 +108,8 @@ pub const fn glyph_cell_span(
     is_wide_continuation: bool,
 ) -> (u16, u16) {
     if is_wide_continuation {
+        // Saturating, not `col - 1`: a continuation at column 0 has no lead to
+        // back up to (a wide glyph cannot start left of the row), so it stands
         // alone rather than wrapping to u16::MAX and selecting the far edge.
         (col.saturating_sub(1), col)
     } else if is_wide_lead {

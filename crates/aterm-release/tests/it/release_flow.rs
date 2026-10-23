@@ -704,6 +704,7 @@ impl Backend for World {
         self.calls.push(format!("cut {}", args[3..].join(" ")));
         let resuming = args.iter().any(|a| a == "--resume");
         let Some(reserved) = self.journal().and_then(|j| j.reserved) else {
+            // a resume finishes the claim its own journal holds, the bytes it names:
             // it reads no release journal
             if resuming && let Some(cut) = self.cut.as_mut() {
                 cut.finished = self.cut_finishes;

@@ -79,6 +79,7 @@ fn probe(invert: Option<&str>) -> String {
         });
         let lit = as_c_literal(&value);
         let lit = if invert == Some(rust.as_str()) {
+            // `+ 1` is enough and is arithmetic the compiler must evaluate; it
             // works for the `double` row as well as every integer one.
             format!("(({lit}) + 1)")
         } else {

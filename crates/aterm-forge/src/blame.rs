@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `targo --unverified forge blame`: why is this package here?
-//!
-//! Answers three questions a `cargo tree | grep` cannot:
-//!
-//!   1. Which first-party line is responsible: every path from the cell root to the package
-//!      (the shortest printed, the rest counted), with the direct dependants whose manifest
-//!      lines would have to change.
-//!   2. What it costs: the dominator cost per cell, not the subtree.
-//!   3. Whether the fork is live: a `[patch.crates-io]` entry replaces one version, so a
-//!      dependant asking for another major silently gets the unpatched registry copy in the
-//!      same build.
-//!
-//! A bare `name` is never refused as ambiguous (as `cargo pkgid` does); every matching version
-//! is listed with the cells that hold it.
+//! Dependency path, dominator cost, and fork liveness report for a third-party package.
 
 use crate::model::{CellSurvey, Graph, PkgId};
 use crate::survey::{commas, fit, fit_path, survey_cells, wrap};
@@ -26,8 +13,7 @@ use std::path::Path;
 
 /// Paths printed per cell before the rest are counted rather than listed.
 const PATHS_SHOWN: usize = 10;
-/// Hard bound on the best-first path search, so a wide graph cannot hang the report. When it
-/// trips, the report says so.
+/// Hard bound on the best-first path search, so a wide graph cannot hang the report.
 const SEARCH_BUDGET: usize = 40_000;
 const W_LINE: usize = 96;
 
@@ -36,15 +22,13 @@ const W_LINE: usize = 96;
 enum PatchState {
     /// This version is the vendored fork aterm maintains.
     Fork { path: String },
-    /// A fork of this name exists at another version, and this copy is the pristine registry
-    /// code: the fork's fixes do not reach it.
+    /// A fork of this name exists at another version, and this copy is the pristine registry code.
     UnpatchedBesideFork { path: String, fork_version: String },
     /// A fork directory exists but its version could not be read.
     ForkVersionUnreadable { path: String },
-    /// Ordinary registry code: no patch row claims this version.
+    /// Ordinary registry code.
     Registry,
-    /// aterm's own code, vendored in-tree and reached by a path dependency
-    /// (`provenance::FIRST_PARTY_VENDORED`). Neither a fork nor registry code.
+    /// aterm's own code, vendored in-tree and reached by a path dependency.
     FirstPartyVendored { path: String },
 }
 
@@ -52,16 +36,14 @@ enum PatchState {
 struct VendorFork {
     path: String,
     version: Option<String>,
-    /// The row is renamed, so it claims one version line of its package
-    /// ([`crate::policy::in_row_scope`]).
+    /// Renamed row claiming one version line of its package ([`crate::policy::in_row_scope`]).
     renamed: bool,
 }
 
-/// Package → the patch rows replacing it: one, or one per version line when
-/// rows are renamed ([`crate::policy::patched_package`]).
+/// Package → the patch rows replacing it ([`crate::policy::patched_package`]).
 type Forks = BTreeMap<String, Vec<VendorFork>>;
 
-/// Explain one package. `pkg` is `name` or `name@version`.
+/// Explain one package.
 pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> {
     let (want_name, want_version) = match pkg.split_once('@') {
         Some((n, v)) if !n.is_empty() && !v.is_empty() => (n.to_string(), Some(v.to_string())),
@@ -85,7 +67,6 @@ pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> 
         )
     })?;
 
-    // (name, version) -> the surveys that resolve it.
     let mut found: BTreeMap<PkgId, Vec<usize>> = BTreeMap::new();
     for (i, s) in surveys.iter().enumerate() {
         for id in &s.graph.nodes {
@@ -136,8 +117,6 @@ pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> 
     Ok(Outcome { ok: true, log })
 }
 
-// ------------------------------------------------------------------- sections
-
 fn versions_block(
     log: &mut String,
     root: &Path,
@@ -164,8 +143,6 @@ fn versions_block(
         let _ = writeln!(log, "{line}");
     }
     if found.len() > 1 {
-        // The same arithmetic as `survey`'s duplicate-versions section, for
-        // the one name asked about.
         let mut locs: Vec<u64> = found
             .keys()
             .map(|id| {
@@ -192,7 +169,7 @@ fn versions_block(
     }
 }
 
-/// The patch-liveness check: a fork that covers only one of the resolved versions.
+/// The patch-liveness check.
 fn liveness_block(
     log: &mut String,
     root: &Path,
@@ -244,8 +221,6 @@ fn liveness_block(
         );
         for i in *cells_with {
             let s = &surveys[*i];
-            // A copy reached through a proc macro is compiled into the compiler's
-            // own process — the strongest form of this defect.
             let mut via: Vec<PkgId> = ancestors(&s.graph, id)
                 .into_iter()
                 .filter(|a| s.facts.get(a).is_some_and(|f| f.is_proc_macro))
@@ -348,8 +323,6 @@ fn package_block(
             );
         }
         PatchState::FirstPartyVendored { path } => {
-            // Three lines: `vendor/<root>/crates/<name>` plus its sentence does
-            // not fit in 100 columns.
             let _ = writeln!(
                 log,
                 "  source        {path} — FIRST-PARTY, vendored in-tree."
@@ -391,8 +364,6 @@ fn package_block(
         if let Some(dir) = &f.root_dir {
             let _ = writeln!(log, "                {}", dir_line(root, dir));
         }
-        // If the facts were not measured from the fork's directory, say so and
-        // give the fork's own line count and delta against what was measured.
         if let PatchState::Fork { path } = &state {
             let vendored = root.join(path);
             let measured_here = f
@@ -532,7 +503,6 @@ fn not_found(
         );
     }
 
-    // Same name, other version? That is a different (and useful) answer.
     if let Some(v) = version {
         let others: BTreeSet<&str> = surveys
             .iter()
@@ -578,8 +548,6 @@ fn not_found(
     );
 }
 
-// ------------------------------------------------------------------ graph work
-
 fn parents_of(g: &Graph) -> BTreeMap<PkgId, BTreeSet<PkgId>> {
     let mut rev: BTreeMap<PkgId, BTreeSet<PkgId>> = BTreeMap::new();
     for (u, children) in &g.edges {
@@ -611,8 +579,6 @@ fn depths(g: &Graph) -> BTreeMap<PkgId, usize> {
 }
 
 /// Exact number of distinct root→target paths, memoised over the reverse graph.
-/// Returns `(count, saturated)`; the `active` set makes a cycle degrade to an
-/// under-count instead of a hang.
 fn count_paths(g: &Graph, target: &PkgId) -> (u64, bool) {
     let rev = parents_of(g);
     let mut memo: BTreeMap<PkgId, u64> = BTreeMap::new();
@@ -665,11 +631,6 @@ fn walk(
 }
 
 /// The `want` shortest root→target paths, in nondecreasing length.
-///
-/// Best-first over the reverse graph with `f = depth(head) + hops(head→target)`,
-/// an admissible and consistent heuristic, so the first `want` completions are
-/// exactly the shortest. Searching backwards keeps the frontier inside the
-/// target's ancestor set.
 fn shortest_paths(g: &Graph, target: &PkgId, want: usize) -> (Vec<Vec<PkgId>>, bool) {
     let mut out: Vec<Vec<PkgId>> = Vec::new();
     if want == 0 || !g.nodes.contains(target) {
@@ -736,8 +697,7 @@ fn direct_dependants(g: &Graph, target: &PkgId) -> BTreeSet<PkgId> {
         .collect()
 }
 
-/// The root's direct dependencies from which the target is still reachable —
-/// the first-party manifest lines that own this package's presence.
+/// The root's direct dependencies from which the target is still reachable.
 fn entry_points(s: &CellSurvey, target: &PkgId) -> Vec<PkgId> {
     let anc = ancestors(&s.graph, target);
     let Some(children) = s.graph.edges.get(&s.graph.root) else {
@@ -749,8 +709,6 @@ fn entry_points(s: &CellSurvey, target: &PkgId) -> Vec<PkgId> {
         .cloned()
         .collect()
 }
-
-// ------------------------------------------------------------------ vendor/fork
 
 /// `[patch.crates-io]` entries with the vendored manifest's own version.
 fn read_forks(root: &Path) -> Result<Forks, String> {
@@ -805,9 +763,6 @@ fn patch_state(
     forks: &Forks,
     id: &PkgId,
 ) -> PatchState {
-    // The roster is asked first, off the measured directory: a first-party
-    // vendored crate has no patch entry and would otherwise read as registry
-    // code.
     if let Some(dir) = facts.and_then(|f| f.root_dir.as_ref())
         && crate::provenance::is_first_party_vendored(root, dir)
     {
@@ -826,8 +781,6 @@ fn patch_state(
             path: f.path.clone(),
         };
     }
-    // Not any row's own copy. Unpatched beside the first row that claims this
-    // version; a version line no renamed row claims is ordinary registry code.
     let claimed = rows
         .iter()
         .find(|f| crate::policy::in_row_scope(f.renamed, f.version.as_deref(), &id.version));
@@ -845,8 +798,7 @@ fn patch_state(
     }
 }
 
-/// Versions of `name` in `Cargo.lock`. Used only to explain an absence: a
-/// package in the lock but not in the shipped graph is a dev/build edge.
+/// Versions of `name` in `Cargo.lock`.
 fn lock_versions(root: &Path, name: &str) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(root.join("Cargo.lock")) else {
         return Vec::new();
@@ -872,8 +824,7 @@ fn lock_versions(root: &Path, name: &str) -> Vec<String> {
     out
 }
 
-/// Cheap "did you mean": substring either way, then a shared prefix. No edit
-/// distance — a suggestion list is a courtesy, not a search engine.
+/// Cheap "did you mean".
 fn nearby(name: &str, surveys: &[CellSurvey]) -> Vec<String> {
     let needle = name.to_ascii_lowercase();
     let mut hits: BTreeSet<String> = BTreeSet::new();
@@ -893,24 +844,14 @@ fn nearby(name: &str, surveys: &[CellSurvey]) -> Vec<String> {
     hits.into_iter().take(8).collect()
 }
 
-// ------------------------------------------------------------------ formatting
-
-/// The measured package's directory as the report shows it: repo-relative when
-/// in the checkout, and bounded either way by [`fit_path`], keeping the package
-/// directory the line names. The line's width depends on content, not on the
-/// checkout location or `$CARGO_HOME` depth.
+/// The measured package's directory as the report shows it ([`fit_path`]).
 fn dir_line(root: &Path, dir: &Path) -> String {
     let shown = dir.strip_prefix(root).unwrap_or(dir);
     fit_path(&shown.display().to_string(), W_LINE - 16)
 }
 
-/// One versions-resolved row: `name version`, the patch tag, then the cells.
-///
-/// Each field is fitted one column short of its width, so a long name+version
-/// never runs into the next field without a separating space.
+/// One versions-resolved row.
 fn versions_row(name: &str, version: &str, tag: &str, cells: &str) -> String {
-    // The name yields and the version survives: the version is what this
-    // section reports.
     const NAME_VERSION: usize = 27;
     let for_name = NAME_VERSION.saturating_sub(version.chars().count() + 1);
     let name_version = format!("{} {}", fit(name, for_name), version);
@@ -923,9 +864,7 @@ fn versions_row(name: &str, version: &str, tag: &str, cells: &str) -> String {
     line.trim_end().to_string()
 }
 
-/// One root→package path, wrapped at the terminal width with the continuation
-/// hanging under the first segment. `indent` may carry a label (`[ 3] `),
-/// replaced by blanks on continuation lines.
+/// One root→package path.
 fn write_path(out: &mut String, indent: &str, path: &[PkgId]) {
     let segs: Vec<String> = path
         .iter()
@@ -952,8 +891,7 @@ fn write_path(out: &mut String, indent: &str, path: &[PkgId]) {
     let _ = writeln!(out, "{line}");
 }
 
-/// Physical `*.rs` lines under a directory, comparable with [`crate::loc`]'s count (though
-/// [`aterm_census::collect_rs_files`] skips dot-directories, which loc's walk does not).
+/// Physical `*.rs` line count under a directory ([`crate::loc`], [`aterm_census::collect_rs_files`]).
 fn rs_lines(dir: &Path) -> u64 {
     let mut files = Vec::new();
     if aterm_census::collect_rs_files(dir, &mut files).is_err() {
@@ -975,7 +913,6 @@ mod tests {
     use super::*;
 
     fn toy() -> Graph {
-        // root -> a -> c ; root -> b -> c ; c -> d
         let (r, a, b, c, d) = (
             PkgId::new("root", "1"),
             PkgId::new("a", "1"),
@@ -1000,8 +937,6 @@ mod tests {
         g
     }
 
-    /// Every path is counted, the shortest come first, a bounded request returns
-    /// only the shortest, and an absent node has none (and no panic).
     #[test]
     fn every_path_is_counted_and_the_shortest_come_first() {
         let g = toy();
@@ -1015,7 +950,6 @@ mod tests {
             assert_eq!(p.last(), Some(&d));
             assert_eq!(p.len(), 4);
         }
-        // The root reaches itself by exactly one (empty) path.
         assert_eq!(count_paths(&g, &g.root), (1, false));
         let (paths, _) = shortest_paths(&g, &PkgId::new("c", "1"), 1);
         assert_eq!(paths.len(), 1);

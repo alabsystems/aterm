@@ -136,7 +136,7 @@ fn opt_text(line: &str, key: &str) -> Option<Option<String>> {
 }
 
 #[cfg(any(unix, test))]
-fn origin_word(k: Kind) -> &'static str {
+const fn origin_word(k: Kind) -> &'static str {
     k.word()
 }
 

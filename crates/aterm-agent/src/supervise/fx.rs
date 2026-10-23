@@ -107,7 +107,11 @@ impl Fx {
         }
     }
 
-    /// Whether the files a run writes beside its loop (its journal.
+    /// Whether the files a run writes beside its loop (its journal, its
+    /// approval ledger) are opened: yes, except on a replay — whose rows are
+    /// outputs it compares with the recorded ones, never writes, and whose
+    /// roots name directories that do not exist, so an open would only fail
+    /// and say so.
     pub(crate) const fn opens_files(&self) -> bool {
         !self.replaying()
     }
@@ -149,14 +153,18 @@ impl Fx {
         }
     }
 
-    /// The local zone's offset from UTC now, in seconds ([`super::limit::tz_offset_s`].
+    /// The local zone's offset from UTC now, in seconds ([`super::limit::tz_offset_s`]:
+    /// `date +%z`; `fixed`, a test's stand-in, answers in its place): on a tape, the derived
+    /// door `probe.tz_offset`, the number back.
     pub(crate) fn tz_offset(&self, fixed: Option<i64>) -> i64 {
         self.exchange(doors::PROBE_TZ_OFFSET, Vec::new, || {
             fixed.unwrap_or_else(super::limit::tz_offset_s)
         })
     }
 
-    /// Zone `zone`'s offset from UTC at `unix`, by `live` (the session's reader.
+    /// Zone `zone`'s offset from UTC at `unix`, by `live` (the session's reader:
+    /// [`super::limit::zone_offset_at`], a table in tests): on a tape, the derived door
+    /// `probe.zone_offset`.
     pub(crate) fn zone_offset(
         &self,
         live: fn(&str, i64) -> Option<i64>,
@@ -170,7 +178,8 @@ impl Fx {
         )
     }
 
-    /// The local zone's offset at `unix`, by `live` (the session's reader.
+    /// The local zone's offset at `unix`, by `live` (the session's reader: the machine's `date`,
+    /// a table in tests): on a tape, the derived door `probe.local_offset_at`.
     pub(crate) fn local_offset_at(&self, live: fn(i64) -> Option<i64>, unix: i64) -> Option<i64> {
         self.exchange(
             doors::PROBE_LOCAL_OFFSET,
@@ -249,7 +258,10 @@ impl Fx {
         ms
     }
 
-    /// THE MACHINE'S COUNT OF ITS SLEEP NOW ([`SleepStamp`].
+    /// THE MACHINE'S COUNT OF ITS SLEEP NOW ([`SleepStamp`]: how long it slept since boot,
+    /// `aterm_uds::process::asleep_since_boot`, and the boot's id, `astream_sys::boot_session`),
+    /// `None` where it keeps none — and from the system's clocks in a test build, whose loops
+    /// read a sleep only where a test's clock counts one ([`ScriptedClock::count_sleeps`]).
     pub(crate) fn asleep(&self) -> Option<SleepStamp> {
         self.exchange(doors::PROBE_ASLEEP, Vec::new, || self.clock.asleep())
     }
@@ -537,7 +549,9 @@ impl Fx {
         }
     }
 
-    /// The CANDIDATE policy a shadow replay decides each turn end again under (`tape::shadow`.
+    /// The CANDIDATE policy a shadow replay decides each turn end again under (`tape::shadow`,
+    /// `aterm drive replay --shadow`); `None` in the shipped loop, a recording one and any other
+    /// replay.
     pub(crate) fn shadow_policy(&self) -> Option<super::SupervisorConfig> {
         match &self.mode {
             Mode::Live | Mode::Record(_) => None,

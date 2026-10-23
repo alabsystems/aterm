@@ -47,7 +47,7 @@ fn row_text(scratch: &RenderInput, row: usize) -> String {
     text.trim_end_matches([' ', '\0']).to_string()
 }
 
-fn mode_name(mode: PredictMode) -> &'static str {
+const fn mode_name(mode: PredictMode) -> &'static str {
     match mode {
         PredictMode::Off => "off",
         PredictMode::Adaptive => "adaptive",

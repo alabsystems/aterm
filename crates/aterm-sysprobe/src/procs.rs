@@ -340,6 +340,7 @@ pub(crate) mod stopped_spinner {
     impl OwnedSpinner {
         fn forget_reaped(&mut self) {
             if let Some(child) = self.0.take() {
+                // The raw wait already reaped it. Do not let the handle's
                 // drop ask for a PID that another child may now reuse.
                 std::mem::forget(child);
             }
@@ -352,6 +353,7 @@ pub(crate) mod stopped_spinner {
                 && matches!(child.try_wait(), Ok(None))
                 && child.kill().is_ok()
             {
+                // Still our unreaped child, even if the read panicked while
                 // it was stopped. The handle caches this reap before drop.
                 let _ = child.wait();
             }

@@ -4,7 +4,6 @@
 use super::*;
 use crate::crash_signal::markers::{Owner, probe};
 
-/// The files under `<dir>/edges`, sorted.
 fn edge_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("edges"))
         .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
@@ -13,12 +12,6 @@ fn edge_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Child provisions wait, [`DEPTH`] of them, as edge-token files written and
-/// locked under the control dir they were made for. A take hands its file over
-/// whole: still there, still locked, and named by the env the child gets. A
-/// control dir that moves retires the ones made under the old one, a provision
-/// nobody took removing its own file, and with no control dir none waits.
-/// NEGATIVE CONTROL: a take for a dir nothing was made under gets nothing.
 #[test]
 fn provisions_wait_under_their_control_dir_and_an_untaken_one_removes_its_file() {
     let first = aterm_tempfile::tempdir().expect("a control dir");
@@ -76,8 +69,6 @@ fn provisions_wait_under_their_control_dir_and_an_untaken_one_removes_its_file()
     assert!(edge_files(first).is_empty(), "a retired file is removed");
 }
 
-/// A dir that refuses the file leaves nothing waiting, so every spawn takes
-/// the inline path, which says why as it always did.
 #[test]
 fn a_dir_that_refuses_the_file_leaves_no_provision() {
     let scratch = aterm_tempfile::tempdir().expect("scratch");
@@ -92,10 +83,6 @@ fn a_dir_that_refuses_the_file_leaves_no_provision() {
     assert!(ready.lock().unwrap().is_empty());
 }
 
-/// A fill the final exit stopped waiting for mints nothing that outlives it:
-/// a provision minted once the exit set its flag removes its own file rather
-/// than waiting where the exit already took the provisions from. NEGATIVE
-/// CONTROL: the same fill before the flag keeps [`DEPTH`] files.
 #[test]
 fn a_fill_after_the_release_leaves_no_file() {
     let dir = aterm_tempfile::tempdir().expect("a control dir");

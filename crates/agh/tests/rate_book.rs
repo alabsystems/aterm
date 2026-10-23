@@ -2,14 +2,13 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Rate snapshots and the advisory rate book (the plan's §4.6.14).
+//! Tests for rate snapshots and the advisory rate book.
 
 use agh::error::IdentityRef;
 use agh::rate::{RateBook, RateSnapshot, book_key, resource_for};
 
 use crate::common;
 
-/// The simulated clock's start.
 const NOW: u64 = 1_760_000_000;
 
 fn snapshot(resource: &str, remaining: u64, reset: u64) -> RateSnapshot {
@@ -29,7 +28,6 @@ fn from_headers_needs_limit_remaining_and_reset() {
         ("X-RateLimit-Remaining", "4987"),
         ("X-RateLimit-Reset", "1760003600"),
         ("X-RateLimit-Resource", "search"),
-        // Not `limit - remaining` (13), so a read value and the default differ.
         ("X-RateLimit-Used", "20"),
     ];
     let full = RateSnapshot {
@@ -126,7 +124,6 @@ mod files {
 
     use crate::common;
 
-    /// A client with `book`, anonymous, over `transport`.
     fn client(transport: &Arc<ScriptedTransport>, book: RateBook) -> Github {
         GithubBuilder::new(Router::empty())
             .transport(transport.clone())

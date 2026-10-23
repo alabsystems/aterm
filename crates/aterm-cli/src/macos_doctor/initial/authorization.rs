@@ -8,8 +8,6 @@ use super::*;
 /// Authorization bound to the records observed before a startup offer.
 pub struct InitialSetupAuthorization {
     revision: u64,
-    /// The vault this Mac was in when the offer was loaded ([`Self::offer`]), which the run
-    /// it admits keeps; none known before an offer is.
     vault: AdmittedVault,
     state: AuthorizationState,
 }

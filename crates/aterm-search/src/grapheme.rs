@@ -89,6 +89,7 @@ pub fn display_columns(text: &str) -> usize {
 #[inline]
 #[must_use]
 pub fn display_columns_with(text: &str, ambiguous: AmbiguousWidth) -> usize {
+    // Printable ASCII holds no East Asian Ambiguous character, so the
     // identity holds under either policy.
     if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
         return text.len();

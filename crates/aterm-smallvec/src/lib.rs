@@ -20,6 +20,15 @@ use core::ops::{Bound, Deref, DerefMut, Index, IndexMut, RangeBounds};
 use core::slice::{self, SliceIndex};
 
 /// Creates a [`SmallVec`] containing the arguments, as `vec!` does a `Vec`.
+///
+/// ```
+/// use smallvec::{smallvec, SmallVec};
+/// let v: SmallVec<[u8; 4]> = smallvec![1, 2, 3];
+/// assert_eq!(&v[..], &[1, 2, 3]);
+/// assert!(!v.spilled());
+/// let w: SmallVec<[u8; 2]> = smallvec![7; 3];
+/// assert!(w.spilled());
+/// ```
 #[macro_export]
 macro_rules! smallvec {
     (@one $x:expr) => (1usize);

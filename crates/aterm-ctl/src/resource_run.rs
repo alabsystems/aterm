@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A process-root registration followed by one exact, identity-preserving
-//! exec. A shared launcher is never registered as this job's root.
+//! A process-root registration followed by one exact, identity-preserving exec.
 
 use std::ffi::OsString;
 use std::io;
@@ -121,10 +120,6 @@ fn exec_command(command: &[OsString]) -> io::Result<ExitCode> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        // Exec keeps the registered PID and start record, the launcher's
-        // process group, limits, cwd, environment and every inherited fd.
-        // Its wait therefore observes the actual command's exit, even when
-        // that command catches a group signal and takes time to finish.
         #[expect(
             clippy::disallowed_types,
             reason = "a registered pass-through becomes its command; exec preserves all caller descriptors and process identity"

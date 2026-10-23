@@ -914,6 +914,7 @@ impl GithubFetcher {
 impl crate::flow::Fetcher for GithubFetcher {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
         // Memoized per invocation (the `index` field); the same raw bytes still flow through
+        // every gate.
         if let Ok(memo) = self.index.lock()
             && let Some(hit) = memo.as_ref()
         {
@@ -983,6 +984,8 @@ impl crate::flow::Fetcher for GithubFetcher {
 
     fn download_url(&self, url: &str, dest: &Path, cap: u64) -> Result<(), String> {
         // The vendor lane: the URL is the signed row's own, already admitted by
+        // `vendor::check_row` (https, allow-listed host), so no slug, override or credential is
+        // consulted. `cap` is the signed `size`; the https pin covers every redirect.
         aterm_update_core::download_to_resumable_https_only(url, dest, cap)
     }
 

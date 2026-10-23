@@ -761,6 +761,7 @@ fn relaunch_held(
 ) -> Report {
     let old = st.pid;
     if !super::upgrade_wake::wait_exit(old, opts.timings.exited) {
+        // Never a harder signal: the agent finishes exiting on its own, and a
         // later pass finds the phase and the process as they are.
         return said(r, "wait:exiting");
     }
@@ -1720,6 +1721,7 @@ fn carry_on_once(
     let mut conversation_changed = false;
     let mut tail_available = true;
     let settled = wait_until(opts.timings.carry_settle, || {
+        // The hand the caller holds outlasts this wait (120 s against a 60 s
         // lease): renewed through it.
         if let Some(h) = hand.as_deref_mut() {
             h.keep(c);
@@ -1985,6 +1987,8 @@ pub(super) const CONTINUE_FENCE_TRIES: usize = 3;
 
 /// The model after, for a restart whose continuation was typed.
 pub(super) fn confirm(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64) -> Option<Report> {
+    // A quiet restart's look, or that of a carry-on that typed nothing
+    // ([`restore_look`]): a sweep reads it, and types its line only into a
     // tab whose own Autopilot is on, under the tab's own guards.
     if looks_back(st) {
         return restore_look(opts, r, st, key, now, None, |c, pid, tab| {
@@ -3693,6 +3697,7 @@ fn after_exit_as(
         .or_else(|| snap.session.clone())
         .filter(|s| upgrade::is_session_id(s))
     else {
+        // No record names a conversation: none was registered, or the agent
         // removed its record as it ended by itself.
         return said(r, "ended:no-conversation");
     };
@@ -3749,6 +3754,8 @@ fn after_exit_as(
             relaunched_before = st.relaunched_on_exit_of(snap.pid);
             if !opts.dry_run {
                 if overtook {
+                    // Never a day-long stall with `claude --resume` for a
+                    // relaunch that landed (a graceful `/exit` of the
                     // relaunched agent reads so).
                     st.close_overtaken(why, now_s());
                 } else {
@@ -4572,6 +4579,8 @@ pub enum Outcome {
 /// [`Outcome`] from one [`after_exit`] step's word.
 #[must_use]
 pub fn outcome(step: &str) -> Outcome {
+    // The host hands every relaunched agent to its loop
+    // ([`Opts::hand_back`]), so no other word lands — and a carry-on that
     // typed nothing (`done:no-continue`) is never one.
     if matches!(step, "adopted" | "done:fresh" | "landed" | "done:resumed") {
         Outcome::Relaunched
@@ -4583,11 +4592,13 @@ pub fn outcome(step: &str) -> Outcome {
         .strip_prefix("refused:")
         .or_else(|| step.strip_prefix("told:"))
     {
+        // `told:` is a restart that can never land whose own row asks the
         // owner ([`told_by_its_row`]): said there, as the host reads it.
         Outcome::Cannot(why.to_string())
     } else if matches!(step, "busy:another-sweep" | WAIT_ACT_ENDS | WAIT_HAND_LIFTS) {
         Outcome::Busy
     } else if let Some(why) = step.strip_prefix("busy:") {
+        // The state directory cannot hold the lock at all: no later try
         // gets past that.
         Outcome::Cannot(why.to_string())
     } else {
@@ -4813,6 +4824,9 @@ impl Relaunches {
     pub fn attempted(&mut self, outcome: &Outcome, now: Instant) -> Say {
         match outcome {
             Outcome::Relaunched => {
+                // A landing of an exit someone asked for is no crash's: it
+                // neither climbs the crash back-off nor restarts the healthy
+                // run that forgives it — but it starts one a streak of misses
                 // alone never had.
                 if self.crash {
                     self.streak = self.streak.saturating_add(1);
@@ -4892,7 +4906,8 @@ impl Relaunches {
         }
     }
 
-    /// The session's standing word.
+    /// The session's standing word — its tab's mark — asks a person to
+    /// resume `conversation` (the command it names).
     pub fn ask(&mut self, conversation: &str) {
         if self.badged {
             self.asks = Some(conversation.to_string());

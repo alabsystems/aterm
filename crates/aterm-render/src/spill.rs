@@ -425,6 +425,7 @@ impl SpillBand {
         self.base_bg = base_bg;
 
         if self.prev.is_empty() && self.cur.is_empty() {
+            // A bg/geometry change under an all-transparent band: no visible
             // bytes changed, so the revision (the host's blit signal) holds.
             self.rects.clear();
         } else {

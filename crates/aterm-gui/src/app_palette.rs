@@ -273,6 +273,9 @@ impl App {
 
     /// Commit theme `id` from the palette while holding [`PreviewHold::Committing`].
     pub(crate) fn palette_choose_theme(&mut self, id: &str) {
+        // The Tab-scoped palette keeps the row as the session's own theme and
+        // writes nothing. Only the trial's own window's palette settles it
+        // (the activating palette is the front window's); a palette elsewhere
         // chooses the instance theme as usual.
         if let Some(trial) = self
             .palette_tab_theme
@@ -631,6 +634,8 @@ impl App {
             self.end_theme_preview_if(|preview| preview.hold == PreviewHold::Palette);
         }
         if closed {
+            // Re-resolve the cursor immediately against the revealed surface. Keyboard
+            // close must not leave a stale neutral pointer over editor text until motion;
             // a pointer the window no longer holds is not replayed.
             self.replay_held_pointer(wid);
         }

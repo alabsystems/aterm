@@ -62,7 +62,6 @@ const _: () = assert!(std::mem::size_of::<UniqIdentifierInfo>() == 56);
 /// `pid`'s record with its unique ids (flavor 18), whole or `None` ([`read_lineage`]).
 #[cfg(target_vendor = "apple")]
 #[must_use]
-// Skip: bottoms out at the `proc_pidinfo` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn bsdinfo_uniq(pid: i32) -> Option<BsdInfoWithUniqId> {
     const PROC_PIDT_BSDINFOWITHUNIQID: i32 = 18;
@@ -85,7 +84,6 @@ pub fn bsdinfo_uniq(pid: i32) -> Option<BsdInfoWithUniqId> {
 /// `pid`'s identifiers (flavor 17, `PROC_PIDUNIQIDENTIFIERINFO`).
 #[cfg(target_vendor = "apple")]
 #[must_use]
-// Skip: bottoms out at the `proc_pidinfo` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn uniq_identifier(pid: i32) -> Option<UniqIdentifierInfo> {
     const PROC_PIDUNIQIDENTIFIERINFO: i32 = 17;
@@ -153,11 +151,9 @@ impl Lineage {
 /// `pid`'s [`Lineage`].
 #[cfg(target_vendor = "apple")]
 #[must_use]
-// Skip: bottoms out at the `proc_pidinfo`/`geteuid` FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn read_lineage(pid: i32) -> Option<Lineage> {
     const SZOMB: u32 = 5;
-    /// `NODEV` (`(dev_t)-1`) as `e_tdev` holds it.
     const NODEV: u32 = u32::MAX;
     unsafe extern "C" {
         fn geteuid() -> u32;
@@ -219,7 +215,6 @@ pub struct GroupMembers {
 /// Up to [`MAX_GROUP_PIDS`] members of process group `pgid` (`proc_listpids(PROC_PGRP_ONLY)`).
 #[cfg(target_vendor = "apple")]
 #[must_use]
-// Skip: bottoms out at the `proc_listpids` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn group_members(pgid: u32) -> Option<GroupMembers> {
     const PROC_PGRP_ONLY: u32 = 2;
@@ -285,7 +280,6 @@ pub fn read_process_markers(pid: i32) -> Option<Markers> {
     }
 }
 
-/// Return `read()` only if `identity(pid)` matches before and after.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn bracketed<T>(
     pid: i32,
@@ -297,7 +291,6 @@ fn bracketed<T>(
     (identity(pid)? == before).then_some(got)
 }
 
-/// Extract [`Markers`] from a `KERN_PROCARGS2` buffer ([`crate::procargs::parse`]).
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn markers_from_procargs2(bytes: &[u8]) -> Option<Markers> {
     if bytes.len() > super::PROCESS_ARGV_MAX {
@@ -356,7 +349,6 @@ pub fn boot_id() -> Option<String> {
 /// Whether `pid` shows the signature of a program held at macOS's program check.
 #[cfg(target_vendor = "apple")]
 #[must_use]
-// Skip: bottoms out at the `proc_pidinfo` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn at_program_check(pid: i32) -> Option<bool> {
     const PROC_PIDLISTTHREADS: i32 = 6;
@@ -400,10 +392,6 @@ mod tests {
         bytes
     }
 
-    /// The three markers are read and every other variable is skipped; argv words that look
-    /// like a marker are argv, not environment. An empty environment is withheld, never "no
-    /// marker". NEGATIVE CONTROL: the same buffer with the argc one short reads the last argv
-    /// word as the environment's first, so the marker it spells is read.
     #[test]
     fn only_the_three_markers_are_read_and_an_empty_environment_is_withheld() {
         let words: [&[u8]; 6] = [
@@ -437,10 +425,6 @@ mod tests {
         );
     }
 
-    /// The environment is taken only when the pid named one program throughout: an exec while
-    /// it was read (the same birth, another pid version) or an exit reads nothing. NEGATIVE
-    /// CONTROL: compare the births alone (the fork-time start records the read was bracketed by
-    /// before), and the exec'd program's environment is taken.
     #[test]
     fn markers_read_across_an_exec_are_refused() {
         let id = |idversion| super::super::Identity {
@@ -460,8 +444,6 @@ mod tests {
         assert_eq!(script(vec![Some(id(7)), None]), None, "an exit");
     }
 
-    /// A variable named twice reads as the process itself reads it: `getenv(3)` takes the
-    /// first. NEGATIVE CONTROL: let a later entry overwrite, and the second run's id is read.
     #[test]
     fn a_marker_named_twice_reads_as_getenv_reads_it() {
         let words: [&[u8]; 4] = [
@@ -475,7 +457,6 @@ mod tests {
         assert_eq!(read.child.as_deref(), Some("1"));
     }
 
-    /// Pid versions compare across the counter's wrap.
     #[test]
     fn a_launcher_version_is_older_across_the_wrap() {
         assert!(launched_before(10, 11));
@@ -483,10 +464,6 @@ mod tests {
         assert!(launched_before(i32::MAX, i32::MIN));
     }
 
-    /// This process reads its own lineage and its group lists it; a child spawned into its
-    /// group is listed there too and is no orphan; this process shows no program-check
-    /// signature once it runs. Off macOS every reader answers `None` (the leftover design's
-    /// slice 7).
     #[test]
     fn this_process_reads_its_lineage_and_its_group() {
         let me = i32::try_from(std::process::id()).expect("pid");

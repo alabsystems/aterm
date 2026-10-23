@@ -599,6 +599,8 @@ impl Prefix {
         let link = dir.join(name);
         match std::fs::symlink_metadata(&link) {
             Ok(_) if self.is_pinned(name) || self.pin_link_dangling_ours(name) => {
+                // A live owned pin refreshes; a dangling pin of
+                // ours (keg hand-deleted, then reinstalled) must
                 // not block re-pinning forever.
                 std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))?;
             }
@@ -621,6 +623,7 @@ impl Prefix {
         self.ensure()?;
         let link = self.root.join("Pinned").join(name);
         if self.pinned_version(name).is_none() && !self.pin_link_dangling_ours(name) {
+            // A dangling pin of ours is still removable — refusing
             // would strand it forever short of a manual rm.
             return Err(format!("abrew: {name} has no owned pin"));
         }

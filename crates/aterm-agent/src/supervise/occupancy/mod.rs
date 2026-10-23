@@ -16,6 +16,11 @@
 //! * [`templates`]: the closed lines they type.
 //! * [`door`]: the pure parts of the write under `prompt`: the `status` read before it, the
 //!   write's own holds, the host's pace, and the intent and outcome rows.
+//! * [`said`]: what the loop tells its host once a change ([`OccupancySaid`],
+//!   `IdleHost::occupancy_said`) and its `occupancy why` form.
+//! * [`ring`]: the board's facts ring (`<state>/occupancy/facts.ring`) and the slot-time idle
+//!   while a session was ready; [`replay`]: `occupancy check --replay`, the decider run again
+//!   over it.
 //!
 //! The loop feeds the clock and asks the decider from `run::occupancy_loop` on hosted,
 //! unattended loops only, and only while the key is not `off`; there it journals `OCCUPANCY`
@@ -28,13 +33,17 @@ pub mod door;
 mod door_environment;
 pub mod hold;
 pub mod reading;
+pub mod replay;
+pub mod ring;
 pub mod rules;
+pub mod said;
 pub mod templates;
 
 pub use door::{AtWrite, PaceGrant, PaceRefusal, StatusSeen, write_held};
 pub use hold::{Close, HoldChange, HoldClock, HoldEvent, waiting_declared};
 pub use reading::{OccupancyReading, SlotsSeen};
 pub use rules::{Books, Guards, HoldSeen, RuleId, Verdict, decide};
+pub use said::{OccupancySaid, SaidHold, SaidRule, SaidVerdict};
 pub use templates::FactLine;
 
 #[cfg(any(test, debug_assertions))]

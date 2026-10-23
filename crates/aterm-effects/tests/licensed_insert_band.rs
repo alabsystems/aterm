@@ -1,34 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A licensed insert is laid, however its frame is torn.
-//!
-//! Cells the program writes at the caret after a Tab or a paste (a completion, a pasted word)
-//! must be laid, so the hand's next key does not start a second band with a dark gap between.
-//!
-//! The take: a line typed to `…BEST WORK IN` at 12 cps, the program inserts
-//! `TO ` at the caret (a Tab's completion, a three-cell paste, or no key at
-//! all), and the hand types `MAIN!!!!`. The insert's licence is stamped as the
-//! host stamps it: a Tab is `note_user_gesture` and
-//! `note_insert_armed(Unknown)` at the press (`app_input.rs`); a ⌘V is the
-//! gesture stamped and revoked at the enqueue and
-//! `note_insert_delivered_from(Cells(3))` at the delivery edge (`input_paste`,
-//! `apply_delivery`). The repaint arrives in one of six shapes ([`Shape`]):
-//! the Ink-shaped split whole-line redraw, the same bytes in one read, the same
-//! bytes with the hide alone in the first read, Claude Code's own diff frame
-//! (`?2026h ?25l … ?25h ?2026l`) whole or torn after its hide, and a shell's
-//! print at a visible caret.
-//!
-//! The hard case is a frame torn before its glyphs: the next present shows the caret the insert's
-//! width on, with the print in the same present. `CursorGlow::hidden_bridge_source` bridges a
-//! hidden→visible reappearance a fresh insert licence lays, whatever the hide's age, by the same
-//! predicate `spawn` lays the insert by (`visible_insert_echo`), so a reappearance wider than the
-//! paste, a Tab's echo past its one-second window, and unlicensed program output (T1, v3's X1)
-//! stay dark.
-//!
-//! The census is the plan's coverage on the composer row every frame (`#` at ≥ `LIT_COV`, `.`
-//! dark); a hole is a dark column strictly between two lit ones. A licensed take allows none
-//! lasting longer than [`HOLE_FRAMES_MAX`] frames.
+//! End-to-end [`CursorGlow`] coverage tests for licensed Tab and paste inserts across whole and torn repaint frames.
+//! Verifies that licensed inserts light without standing holes while unlicensed or out-of-budget output stays dark.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, coverage, geom, holes_of, note_blink, observe_caret_row,
@@ -43,54 +17,41 @@ const CW: usize = 8;
 const CH: usize = 16;
 const ROWS: usize = 60;
 const COLS: usize = 140;
-/// 12 cps.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
-/// The Ink-shaped composer's pause between a redraw's two reads.
 const INK_SPLIT_MS: u64 = 30;
-/// A hole standing longer than this many frames is the defect.
 const HOLE_FRAMES_MAX: usize = 3;
 
-/// The line the take ends with.
 const LINE: &str = "zoom out. first of all, STOP LANDING BRANCHES AND PATCHES! YOU NEED TO FUCKING MERGE ALL BEST WORK INTO MAIN!!!!";
-/// Where the hand's typing stops before the insert.
 const TYPED_TO: &str = "WORK IN";
-/// What the program inserts at the caret.
 const INSERT: &str = "TO ";
-/// What the hand types after it.
 const SUFFIX: &str = "MAIN!!!!";
 
-/// How the composer's repaint reaches the glass.
+/// How the composer's repaint reaches the terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// The Ink-shaped redraw: hide, home, clear, the whole line | present |
-    /// 30 ms | the caret placed and shown | present.
+    /// Ink-style redraw split across two presents (`?25l` + line, then caret CUP + `?25h`).
     InkSplit,
-    /// The same bytes in one read, one present.
+    /// Ink-style redraw delivered in one read.
     InkWhole,
-    /// The hide alone in the first read | present | 30 ms | the line, the
-    /// caret, the show | present: a frame torn before its glyphs.
+    /// Hide (`?25l`) presented alone, followed 30 ms later by the line, caret CUP, and `?25h`.
     InkHideFirst,
-    /// Claude Code's diff frame, the recorded shape: `?2026h ?25l`, the
-    /// changed glyphs on the composer row, a CUP to the hint row, the
-    /// caret's CUP, `?25h ?2026l` — one read, one present.
+    /// Claude Code diff frame (`?2026h ?25l … ?25h ?2026l`) delivered in one read.
     ClaudeWhole,
-    /// The same frame torn after `?2026h ?25l`: the hold capped, the rest
-    /// a read later.
+    /// Claude Code diff frame torn after `?2026h ?25l`.
     ClaudeTorn,
-    /// A shell completing at a visible caret: the glyphs printed where the
-    /// caret stands, no hide.
+    /// Shell completion printed directly at a visible caret.
     Visible,
 }
 
-/// The licence the host stamps for the insert.
+/// Licence stamped by the host for the insert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lic {
-    /// Program output: no key behind it.
+    /// Unlicensed program output.
     None,
-    /// A bare Tab.
+    /// Bare Tab key (`InsertWidth::Unknown`).
     Tab,
-    /// A ⌘V priced at `n` cells.
+    /// Paste priced at `n` cells (`InsertWidth::Cells(n)`).
     Paste(u16),
 }
 
@@ -102,11 +63,9 @@ struct Census {
     text: String,
     lit: String,
     holes: Vec<u16>,
-    /// Columns of the row that carry a cell of any cohort, leaving or not.
     cells: Vec<u16>,
 }
 
-/// The host: one terminal, the kitty, one clock, the composer's state.
 struct Host {
     term: Terminal,
     glow: CursorGlow,
@@ -118,7 +77,6 @@ struct Host {
     row_buf: Vec<char>,
     blink: u64,
     shape: Shape,
-    /// The composer's row, and the grid column of its text's first glyph.
     row: u16,
     col0: usize,
     text: String,
@@ -133,8 +91,6 @@ impl Host {
         let now = Instant::now();
         let mut glow = CursorGlow::default();
         glow.note_pane_columns(0, COLS);
-        // Ink's composer at the top of the alt screen; Claude Code's in its
-        // bottom-pinned box behind `│ > `.
         let (row, col0) = match shape {
             Shape::ClaudeWhole | Shape::ClaudeTorn => ((ROWS - 3) as u16, 4),
             _ => (2, 0),
@@ -169,9 +125,7 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// The render path: the frame hold's caret row and every ribbon row whether or not the caret
-    /// is visible, the print anchor fed just before the tick (`app_render.rs`), the tick, then
-    /// the census.
+    /// Observe caret/ribbon rows and print anchor, tick [`CursorGlow`], and record the census.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
@@ -188,7 +142,6 @@ impl Host {
     fn record(&mut self) {
         let row = self.row;
         let cov = coverage(&self.glow, geom(ROWS, COLS, CW, CH), row);
-        // Every dark column between the first and last lit one.
         let holes = holes_of(&cov)
             .into_iter()
             .flat_map(|(s, n)| s..s + n)
@@ -239,7 +192,7 @@ impl Host {
         self.idle_to(t);
     }
 
-    /// The frames up to `ms` after the last event, then that instant.
+    /// Advance frames to `ms` after `last_event`.
     fn schedule(&mut self, ms: u64) {
         let t = self.last_event + Duration::from_millis(ms);
         self.idle_to(t);
@@ -247,13 +200,10 @@ impl Host {
         self.last_event = self.now;
     }
 
-    /// The CUP to text column `col` of the composer.
     fn cup(&self, col: usize) -> String {
         format!("\x1b[{};{}H", self.row + 1, self.col0 + col + 1)
     }
 
-    /// The Ink redraw's two halves: hide, home, clear, `line`; the caret
-    /// placed and shown.
     fn ink_halves(&self, line: &str) -> (String, String) {
         (
             format!("\x1b[?25l\x1b[{};1H\x1b[2K{line}", self.row + 1),
@@ -261,8 +211,7 @@ impl Host {
         )
     }
 
-    /// The program's repaint after its text went from `before` to
-    /// `self.text` (the caret at `self.caret`), in this host's shape.
+    /// Emit the repaint from `before` to `self.text` in `self.shape`.
     fn repaint(&mut self, before: &str) {
         match self.shape {
             Shape::InkSplit => {
@@ -284,7 +233,6 @@ impl Host {
                 self.term.process(format!("{head}{tail}").as_bytes());
             }
             Shape::ClaudeWhole | Shape::ClaudeTorn => {
-                // The diff: from the first changed text column on.
                 let first = before
                     .chars()
                     .zip(self.text.chars())
@@ -314,8 +262,6 @@ impl Host {
         self.frame();
     }
 
-    /// One typed key `KEY_MS` after the last event, stamped as the host
-    /// stamps it.
     fn key(&mut self, ch: char) {
         self.schedule(KEY_MS);
         let (shifted, class) = class_of(ch);
@@ -332,8 +278,7 @@ impl Host {
         }
     }
 
-    /// The insert: its licence stamped `gap_ms` after the last key, the
-    /// program's repaint of it `echo_ms` after that.
+    /// Stamp `lic` at `gap_ms` after the previous event and repaint `s` after `echo_ms`.
     fn insert(&mut self, s: &str, lic: Lic, gap_ms: u64, echo_ms: u64) {
         self.schedule(gap_ms);
         let press = self.now;
@@ -350,8 +295,6 @@ impl Host {
         }
         self.schedule(echo_ms);
         if let Lic::Paste(n) = lic {
-            // The delivery edge, applied before the frame that shows the
-            // echo.
             self.glow
                 .note_insert_delivered_from(press, self.now, InsertWidth::Cells(n));
         }
@@ -361,8 +304,7 @@ impl Host {
         self.repaint(&before);
     }
 
-    /// A key whose Ink redraw is torn: the first present shows `shown` with
-    /// the caret hidden, the second, 30 ms later, the whole text and caret.
+    /// Type `ch` with a torn Ink redraw showing `shown` on the first present.
     fn torn_key(&mut self, ch: char, shown: &str) {
         self.schedule(KEY_MS);
         let (shifted, class) = class_of(ch);
@@ -372,7 +314,6 @@ impl Host {
         self.torn_redraw(shown);
     }
 
-    /// A program repaint `ms` after the last event, torn the same way.
     fn torn_repaint(&mut self, shown: &str, ms: u64) {
         self.schedule(ms);
         self.torn_redraw(shown);
@@ -420,8 +361,7 @@ impl Host {
         s
     }
 
-    /// No hole stands longer than [`HOLE_FRAMES_MAX`] frames; the frames
-    /// around the longest when one does.
+    /// Assert that no hole stands for [`HOLE_FRAMES_MAX`] or more frames.
     fn assert_no_standing_hole(&self, what: &str) {
         let runs = self.hole_runs();
         if let Some((a, b, cols)) = runs.iter().max_by_key(|(a, b, _)| b - a) {
@@ -434,7 +374,6 @@ impl Host {
         }
     }
 
-    /// The grid columns the insert took.
     fn insert_cols(&self) -> std::ops::Range<u16> {
         let first = self.col0 + typed_prefix().len();
         (first as u16)..((first + INSERT.len()) as u16)
@@ -450,8 +389,6 @@ fn completed() -> String {
     format!("{}{INSERT}", typed_prefix())
 }
 
-/// The take: the hand types to `…WORK IN`, the insert lands, the hand types
-/// `MAIN!!!!`, then 600 ms idle.
 fn take(shape: Shape, lic: Lic, gap_ms: u64, echo_ms: u64) -> Host {
     let mut h = Host::new(shape);
     h.label = "type";
@@ -466,8 +403,7 @@ fn take(shape: Shape, lic: Lic, gap_ms: u64, echo_ms: u64) -> Host {
     h
 }
 
-/// A licensed take is laid as the insert, once, and leaves no hole; the
-/// frames around the insert when it does not.
+/// Assert that a licensed take records one lit insert with zero declines and no standing hole.
 fn assert_laid_whole(h: &Host, what: &str) {
     let at = h
         .census
@@ -490,7 +426,6 @@ fn assert_laid_whole(h: &Host, what: &str) {
     h.assert_no_standing_hole(what);
 }
 
-/// Every torn shape at each `(gap, echo)` timing, in that order.
 fn torn_timings() -> Vec<(Shape, u64, u64)> {
     [Shape::InkHideFirst, Shape::ClaudeTorn]
         .into_iter()
@@ -498,13 +433,7 @@ fn torn_timings() -> Vec<(Shape, u64, u64)> {
         .collect()
 }
 
-// Every law below replays independent takes, each its own host on its own clock, on the binary's
-// threads (`crate::common::par_map`); the first failing take in the law's order raises its panic.
-
-/// A tab completion or a paste whose frame is torn before its glyphs. Before
-/// the fix the Tab was declined `hidden-relocation`, `O` and ` ` of `INTO `
-/// dark for 73 frames in every take; the paste was refused silently (the
-/// enqueue revoked its gesture), the same 73-frame hole.
+/// Verify that a licensed Tab or paste whose frame is torn before its glyphs is laid as an insert.
 #[test]
 fn a_licensed_insert_whose_frame_is_torn_before_its_glyphs_is_laid_as_the_insert() {
     let takes: Vec<(Lic, Shape, u64, u64)> = [Lic::Tab, Lic::Paste(3)]
@@ -521,9 +450,7 @@ fn a_licensed_insert_whose_frame_is_torn_before_its_glyphs_is_laid_as_the_insert
     });
 }
 
-/// Controls: every shape whose print or caret move arrives whole is laid, by
-/// the anchored lane (the split redraw's print under the hidden caret) or the
-/// insert arm (a visible hop).
+/// Verify that a licensed insert is laid whole across every non-torn repaint shape.
 #[test]
 fn a_licensed_insert_is_laid_whole_in_every_frame_shape_that_reaches_the_glass_whole() {
     let takes: Vec<(Shape, Lic)> = [
@@ -541,9 +468,7 @@ fn a_licensed_insert_is_laid_whole_in_every_frame_shape_that_reaches_the_glass_w
     });
 }
 
-/// T1 and v3's X1: program output at the caret lays no cell, caret visible or
-/// hidden, torn or whole; the bridge lane opens only for a licence. (The gap
-/// beside these cells when the hand types on is not pinned.)
+/// Verify that unlicensed program output at the caret lays no light in any frame shape.
 #[test]
 fn program_output_at_the_caret_lays_no_light_however_its_frame_reaches_the_glass() {
     let shapes = [
@@ -571,17 +496,12 @@ fn program_output_at_the_caret_lays_no_light_however_its_frame_reaches_the_glass
     });
 }
 
-/// The bridge admits only what the licence buys: a torn reappearance wider
-/// than the paste's priced width, or a Tab's torn echo after its one-second
-/// window (`INSERT_GESTURE_HINT_FRESH`), is refused and stays dark.
+/// Verify that a torn reappearance exceeding the paste width or past the Tab freshness window stays dark.
 #[test]
 fn a_torn_reappearance_the_licence_cannot_buy_lays_nothing() {
-    // `None`: the paste; `Some(shape)`: the lapsed Tab in that shape.
     let cases = [None, Some(Shape::InkHideFirst), Some(Shape::ClaudeTorn)];
     crate::common::par_map(&cases, |&case| {
         let Some(shape) = case else {
-            // A three-cell paste, then the program re-lays the line nine cells
-            // on.
             let mut h = Host::new(Shape::InkHideFirst);
             h.type_str(typed_prefix());
             h.insert("TO MAIN! ", Lic::Paste(3), 120, 0);
@@ -600,7 +520,6 @@ fn a_torn_reappearance_the_licence_cannot_buy_lays_nothing() {
             );
             return;
         };
-        // A Tab whose completion lands 1.2 s after the press.
         let mut h = Host::new(shape);
         h.type_str(typed_prefix());
         h.insert(INSERT, Lic::Tab, 120, 1200);
@@ -619,10 +538,7 @@ fn a_torn_reappearance_the_licence_cannot_buy_lays_nothing() {
     });
 }
 
-/// Torn-frame guard: with the hand typing `MAIN!!!!` after `INTO `, one Ink repaint shows the
-/// line damaged for a frame and the next restores it. Every tear heals, under a key or between
-/// keys: `TO ` blanked or overwritten, the line cut at `TO ` (a 1024-byte tear; also on the first
-/// key after `INTO `), or cut one cell short of the caret.
+/// Verify that a one-frame Ink tear of the completed word heals while typing continues.
 #[test]
 fn a_one_frame_tear_of_the_completed_word_heals_while_the_hand_types() {
     fn blank_to(text: &str) -> String {
@@ -653,12 +569,10 @@ fn a_one_frame_tear_of_the_completed_word_heals_while_the_hand_types() {
         ("b6 TO -> XX, keyless", other_glyph_to, false),
         ("b8 cut one short, keyed", cut_last_two, true),
     ];
-    // The seven tears, then (`None`) b7.
     let cases: Vec<Option<(&str, Tear, bool)>> =
         tears.into_iter().map(Some).chain([None]).collect();
     crate::common::par_map(&cases, |&case| {
         let Some((what, tear, keyed)) = case else {
-            // b7: the tear on the `M` key, the torn present showing `…WORK IN`.
             let mut h = Host::new(Shape::InkSplit);
             h.type_str(&completed());
             h.label = "torn";

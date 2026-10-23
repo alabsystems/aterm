@@ -190,6 +190,7 @@ impl Watched {
                     REOFFER_AFTER
                 };
                 if now.duration_since(at).is_ok_and(|since| since < cooldown) {
+                    // A retry deadline between two GET ticks must not be rounded up
                     // to the following minute (the watcher owns user-visible latency).
                     if let Some(deadline) = at.checked_add(cooldown) {
                         self.next_check_at = Some(
@@ -533,11 +534,14 @@ impl HeadWatch {
         *self.parker.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread::current());
         self.take_notices();
         if self.ready_notices.is_empty() {
+            // park_timeout retains an unpark that races the call. A notifier
             // cannot be lost between the channel check and this wait.
             thread::park_timeout(slice);
         }
         *self.parker.lock().unwrap_or_else(|p| p.into_inner()) = None;
         if self.take_notices() || !self.ready_notices.is_empty() {
+            // The completion's unpark can race the channel read and leave a
+            // token behind. Consume that vendor token now so a later park for
             // another still-pending head does not return before it finishes.
             thread::park_timeout(Duration::ZERO);
         }
@@ -557,7 +561,9 @@ impl HeadWatch {
         arrived
     }
 
-    /// One slice of the caller's park, over which the wall clock moved `wall` (`None`.
+    /// One slice of the caller's park, over which the wall clock moved `wall` (`None`:
+    /// backwards) and the monotonic clock `mono`. A wake schedules every head
+    /// [`AFTER_WAKE`] from `now`; answers whether this slice was one.
     pub fn note_slice(&mut self, now: SystemTime, wall: Option<Duration>, mono: Duration) -> bool {
         let woke = wall.is_some_and(|w| w > mono.saturating_add(WAKE_GAP));
         if woke {
@@ -903,6 +909,7 @@ fn check_watched(
     get: &VendorGetFn<'_>,
     notes: &mut Vec<String>,
 ) -> CheckOutcome {
+    // A short retry deadline can fall just after a normal minute tick. Reoffer
     // the recently checked head without launching another curl subprocess.
     if let Some(last) = watched.last_fetch_at
         && now.duration_since(last).is_ok_and(|age| age < CADENCE)

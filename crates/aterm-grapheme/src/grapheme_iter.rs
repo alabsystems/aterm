@@ -243,6 +243,16 @@ impl<'a> Iterator for GraphemeIndices<'a> {
 }
 
 /// Extension trait providing grapheme cluster iteration on `&str`.
+///
+/// # Example
+///
+/// ```
+/// use aterm_grapheme::GraphemeClusters;
+///
+/// let text = "cafe\u{0301}";  // "café" with combining acute
+/// let graphemes: Vec<&str> = text.graphemes().collect();
+/// assert_eq!(graphemes, &["c", "a", "f", "e\u{0301}"]);
+/// ```
 pub trait GraphemeClusters {
     /// Iterate over grapheme clusters.
     fn graphemes(&self) -> Graphemes<'_>;

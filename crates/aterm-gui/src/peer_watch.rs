@@ -29,7 +29,7 @@ pub(crate) enum Peer {
 }
 
 impl Peer {
-    fn from_u8(raw: u8) -> Peer {
+    const fn from_u8(raw: u8) -> Peer {
         match raw {
             0 => Peer::Watching,
             1 => Peer::Gone,

@@ -183,7 +183,7 @@ pub(crate) enum RootState {
 
 impl RootState {
     /// The word `sys disk` prints: a refusal's own word, so one fact has one spelling (`too-broad` here and as a nested row's reason).
-    pub(crate) fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Walking => "walking",
@@ -276,7 +276,7 @@ pub(crate) struct RootRecord {
 }
 
 impl RootRecord {
-    fn queued(path: PathBuf) -> Self {
+    const fn queued(path: PathBuf) -> Self {
         Self {
             path,
             state: RootState::Queued,
@@ -1321,6 +1321,7 @@ impl Engine {
     fn discover_if_due(&mut self, now: Instant) {
         let live = self.live(now);
         if live.is_empty() {
+            // Nothing demanded: walk nothing, age nothing. The last figures
             // stay for the next read, which derives the roots again first.
             return;
         }

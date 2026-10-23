@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OSC shell-integration handlers: - OSC 133: FinalTerm/Terminal shell integration - OSC 633: VS Code shell integration
+//! OSC shell-integration handlers:
+//! - OSC 133: FinalTerm/Terminal shell integration
+//! - OSC 633: VS Code shell integration
 #![forbid(clippy::disallowed_methods)]
 
 use super::handler::TerminalHandler;
@@ -181,6 +183,8 @@ impl TerminalHandler<'_> {
             'D' => {
                 if self.shell.phase != ShellIntegrationPhase::CommandExec {
                     // The shell says a command finished while its marks say it
+                    // sat at its prompt: it ran one it did not mark with `C`
+                    // (unless its marks were dropped since that prompt).
                     if !self.shell.phase_stale
                         && matches!(
                             self.shell.phase,

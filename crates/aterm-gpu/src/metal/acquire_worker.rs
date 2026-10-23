@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! One demand-driven drawable acquisition, with no caller-side wait or join.
-//!
-//! This module deliberately knows nothing about Objective-C. Inputs, outputs,
-//! and retirement payloads must own their resources and perform any required
-//! autorelease-pool cleanup themselves. A retirement payload is processed only
-//! after the preceding acquisition has returned, including when that request
-//! had not started when the caller closed the worker.
 
 use std::sync::{Arc, mpsc};
 
@@ -17,8 +11,7 @@ pub(crate) const fn request_allowed(pending: bool, closed: bool) -> bool {
     !pending && !closed
 }
 
-/// The caller must additionally own a completed result. Epochs identify the
-/// complete surface configuration/loss domain, not merely its pixel dimensions.
+/// The caller must additionally own a completed result.
 #[inline]
 pub(crate) const fn result_is_current(
     request_generation: u64,
@@ -38,12 +31,7 @@ pub(crate) enum AcquireOutcome<O> {
 #[derive(Debug)]
 pub(crate) struct Completed<O> {
     pub(crate) generation: u64,
-    /// Time this request spent queued, from `try_request` until the worker
-    /// dequeued it; the acquisition's own clock (`LayerAcquire::run`) starts
-    /// inside the worker and cannot see it. The caller pays it: a frame without a
-    /// prefetched drawable returns `AcquireRefusal::Pending` and cannot present
-    /// until the worker runs. Published beside the acquire wait as
-    /// `acquire_queue_*`.
+    /// Time this request spent queued, from `try_request` until the worker dequeued it.
     pub(crate) queue_ns: u64,
     pub(crate) outcome: AcquireOutcome<O>,
 }
@@ -51,8 +39,6 @@ pub(crate) struct Completed<O> {
 enum Command<I, R> {
     Request {
         generation: u64,
-        /// Admission time for [`Completed::queue_ns`], stamped by `try_request`
-        /// because the span to measure is when the worker is not running.
         queued: aterm_time::Instant,
         input: I,
     },
@@ -76,16 +62,11 @@ impl<I, O, R> std::fmt::Debug for AcquireWorker<I, O, R> {
 }
 
 impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O, R> {
-    /// `notify` must be a short, nonblocking event publication. Neither callback
-    /// runs under a mutex shared with the caller. The acquisition callback may
-    /// block; its caller never waits for it. A callback panic becomes a terminal
-    /// result rather than an indefinitely outstanding request.
+    /// `notify` must be a short, nonblocking event publication.
     pub(crate) fn spawn(
         acquire: impl FnMut(I) -> O + Send + 'static,
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<Self> {
-        // At most one Request is admitted; the second slot is reserved for the
-        // one consuming close, so retirement never waits for acquisition.
         let (commands, requests) = mpsc::sync_channel(2);
         let (completed, results) = mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -104,8 +85,7 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
         self.pending_generation.is_some()
     }
 
-    /// Return the input unchanged on busy/closed/disconnected admission. This
-    /// never waits for a queue slot, acquisition, or a result notification.
+    /// Return the input unchanged on busy/closed/disconnected admission.
     pub(crate) fn try_request(&mut self, generation: u64, input: I) -> Result<(), I> {
         if !request_allowed(self.is_pending(), self.closed) {
             return Err(input);
@@ -131,8 +111,7 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
         }
     }
 
-    /// Exactly one terminal result per accepted request. In particular, a
-    /// disconnected result producer clears pending and closes future admission.
+    /// Exactly one terminal result per accepted request.
     pub(crate) fn try_take(&mut self) -> Option<Completed<O>> {
         let generation = self.pending_generation?;
         let result = self.results.as_ref()?.try_recv();
@@ -141,8 +120,6 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
             Err(mpsc::TryRecvError::Empty) => return None,
             Err(mpsc::TryRecvError::Disconnected) => Completed {
                 generation,
-                // Synthesized result: no worker dequeued the request, so no
-                // queue span (0 = not measured; no sample is booked).
                 queue_ns: 0,
                 outcome: AcquireOutcome::Disconnected,
             },
@@ -154,11 +131,8 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
         Some(completed)
     }
 
-    /// Close once, discard any unclaimed result, and retire after acquisition,
-    /// without joining or blocking. Destructors keep their cleanup obligations.
-    /// On failure the caller keeps the retirement payload. With one request and
-    /// one close, the capacity-two channel cannot be full; a disconnected
-    /// worker has already stopped acquiring.
+    /// Close once, discard any unclaimed result, and retire after acquisition, without joining or
+    /// blocking.
     pub(crate) fn close(mut self, retirement: R) -> Result<(), R> {
         self.closed = true;
         drop(self.results.take());
@@ -174,26 +148,16 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
     }
 }
 
-// SAFETY: `pthread_set_qos_class_self_np` is in libpthread, part of
-// `libSystem`, which every process links. `qos_class_t` is `unsigned int`.
+// SAFETY: `pthread_set_qos_class_self_np` is in libpthread, part of `libSystem`, which every
+// process links.
 unsafe extern "C" {
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
 }
 
-/// `QOS_CLASS_USER_INTERACTIVE` (`<sys/qos.h>`), the class `aterm-gui`'s
-/// `qos::Role::Interactive` maps to.
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 
-/// Give the acquisition thread user-interactive QoS. A new pthread does not
-/// inherit its creator's class and would run at `QOS_CLASS_DEFAULT`, level
-/// with compilers on a busy machine, and a frame cannot present until this
-/// thread hands the drawable back. It holds no lock the UI thread contends
-/// (the caller uses `try_*` on `sync_channel`s), so this cannot cause
-/// inversion. Applies to the whole thread, including the blocking
-/// `nextDrawable` and retirement drops.
 fn declare_interactive_thread() {
-    // SAFETY: sets this thread's own QoS class; takes no pointers and mutates
-    // no shared state. Failure leaves the default class and is not actionable.
+    // SAFETY: sets this thread's own QoS class; takes no pointers and mutates no shared state.
     unsafe {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
@@ -214,12 +178,8 @@ fn run_worker<I, O, R>(
                 queued,
                 input,
             } => {
-                // First, before any work: close the span that began at
-                // `try_request`.
                 let queue_ns = u64::try_from(queued.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let outcome = if poisoned {
-                    // Admission closes when the panic result is taken; never
-                    // reuse an unwound callback even if that contract weakens.
                     drop(input);
                     AcquireOutcome::Panicked
                 } else {
@@ -232,9 +192,6 @@ fn run_worker<I, O, R>(
                         }
                     }
                 };
-                // The owner stays pending through publication, so a second
-                // result cannot fill the one-slot queue. After close the
-                // receiver is gone; the output drops here before Retire runs.
                 if completed
                     .try_send(Completed {
                         generation,
@@ -260,9 +217,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    /// Hang detector, not a latency budget: every wait is for a handoff that
-    /// must happen, and returns as soon as it does. One minute, so a
-    /// descheduled worker on a loaded machine is not read as a lost wake.
     const LIMIT: Duration = Duration::from_secs(60);
 
     struct Retirement {
@@ -322,8 +276,6 @@ mod tests {
         let mut premature = state.clone();
         assert!(buggy.fire("Retire", &mut premature));
         assert!(!buggy.check_invariant("RetirementFollowsAcquisition", &premature));
-        // The fake acquire cannot finish until all caller operations, close
-        // included, have returned: progress pinned without a timing guess.
         assert!(matches!(
             retirement.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -334,8 +286,6 @@ mod tests {
         assert!(model.fire("Complete", &mut state));
         assert!(model.fire("Retire", &mut state));
         assert!(model.check_invariant("RetirementFollowsAcquisition", &state));
-        // Close disconnected the result receiver before acquisition returned:
-        // no invisible result can create a spurious ready wake.
         assert_eq!(wakes.load(Ordering::SeqCst), 0);
     }
 
@@ -356,8 +306,6 @@ mod tests {
             closed: false,
         };
         let thread = std::thread::spawn(move || {
-            // Gate only entry into the actual shipping worker loop. Both FIFO
-            // commands must be queued before that loop may receive either.
             started.recv_timeout(LIMIT).unwrap();
             run_worker(
                 move |()| {
@@ -392,8 +340,6 @@ mod tests {
         ));
         release.send(()).unwrap();
         assert!(!retirement.recv_timeout(LIMIT).unwrap());
-        // Joining is test cleanup after retirement; AcquireWorker never owns a
-        // JoinHandle, so its caller cannot join on close.
         thread.join().unwrap();
     }
 
@@ -433,7 +379,6 @@ mod tests {
         release.send(()).unwrap();
         woken.recv_timeout(LIMIT).unwrap();
         assert!(model.fire("Complete", &mut state));
-        // Ready still occupies the one logical slot until it is consumed.
         assert_eq!(
             worker.try_request(1, 12).is_ok(),
             model.action_enabled("Request", &state)
@@ -447,8 +392,6 @@ mod tests {
             model.action_enabled("AcceptResult", &state)
         );
         assert!(!result_is_current(result.generation, 1, false));
-        // The buggy model accepts on dimensions or openness alone; the shipped
-        // guard rejects that.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         assert!(buggy.action_enabled("AcceptResult", &state));
         assert!(!model.action_enabled("AcceptResult", &state));
@@ -559,13 +502,12 @@ mod tests {
         assert!(worker.try_take().is_none());
     }
 
-    // SAFETY: `qos_class_self` is in libpthread (`libSystem`) and reads only the
-    // calling thread's class.
+    // SAFETY: `qos_class_self` is in libpthread (`libSystem`) and reads only the calling thread's
+    // class.
     unsafe extern "C" {
         fn qos_class_self() -> u32;
     }
 
-    /// `QOS_CLASS_USER_INTERACTIVE` as the SDK spells it (`<sys/qos.h>`).
     const USER_INTERACTIVE_RAW: u32 = 0x21;
 
     #[test]
@@ -583,8 +525,6 @@ mod tests {
         let AcquireOutcome::Ready(class) = result.outcome else {
             panic!("acquisition did not complete: {:?}", result.outcome);
         };
-        // A bare new pthread reads QOS_CLASS_DEFAULT (0x15), below the main
-        // thread it serves.
         assert_eq!(QOS_CLASS_USER_INTERACTIVE, USER_INTERACTIVE_RAW);
         assert_eq!(
             class, USER_INTERACTIVE_RAW,

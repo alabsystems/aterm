@@ -72,7 +72,7 @@ pub(crate) struct TapAnswers {
 
 impl SessionLog {
     /// One ask the rollout tap answered, with its word ([`TapAnswers`]).
-    pub(crate) fn rollout_answered(&mut self, word: &'static str) {
+    pub(crate) const fn rollout_answered(&mut self, word: &'static str) {
         self.rollout.asks = self.rollout.asks.saturating_add(1);
         self.rollout.word = Some(word);
         #[cfg(test)]
@@ -82,7 +82,7 @@ impl SessionLog {
     }
 
     /// The sweep dropped the session's tap ([`TapAnswers`]): a session the tap answered says `stopped`, its count kept; one never asked stays `-`.
-    pub(crate) fn rollout_stopped(&mut self) {
+    pub(crate) const fn rollout_stopped(&mut self) {
         if self.rollout.word.is_some() {
             self.rollout.word = Some("stopped");
         }

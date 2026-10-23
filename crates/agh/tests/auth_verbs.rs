@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The `auth` verbs and the first provisioning, with tokens from `agh_fake::token`:
-//! `auth add` (stdin, file, refusals, drafts), `auth remove`, `auth status` and `whoami`.
+//! The `auth` verbs and the first provisioning, with tokens from `agh_fake::token`.
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -17,13 +16,11 @@ use aterm_json::Value;
 
 use crate::common;
 
-/// A CLI context whose stderr is a terminal: a person at the keyboard.
 fn person(root: &Path, fake: &FakeGithub, env: MapEnv) -> (Ctx, Captured) {
     let (ctx, captured) = common::ctx(root, fake, env);
     (ctx.with_terminals(false, true), captured)
 }
 
-/// The same, reading `stdin`.
 fn person_with(root: &Path, fake: &FakeGithub, stdin: &str) -> (Ctx, Captured) {
     let (ctx, captured) = person(root, fake, common::env());
     (ctx.with_stdin(stdin.as_bytes().to_vec()), captured)
@@ -41,17 +38,14 @@ fn mode(path: &Path) -> u32 {
         & 0o7777
 }
 
-/// agh.toml's text.
 fn config_text(dirs: &Dirs) -> String {
     std::fs::read_to_string(dirs.config_file()).expect("agh.toml")
 }
 
-/// agh.toml parsed (aterm-toml's value model).
 fn parsed(dirs: &Dirs) -> aterm_toml::Value {
     aterm_toml::from_str(&config_text(dirs)).expect("agh.toml parses")
 }
 
-/// agh.toml validated, as a router.
 fn validated(dirs: &Dirs) -> Router {
     let text = config_text(dirs);
     let parsed = config::parse(&text).expect("L1");
@@ -59,7 +53,6 @@ fn validated(dirs: &Dirs) -> Router {
     Router::from_validated(validated)
 }
 
-/// The `[[owners]]` row named `name`.
 fn owner(doc: &aterm_toml::Value, name: &str) -> aterm_toml::Value {
     doc.get("owners")
         .and_then(aterm_toml::Value::as_array)
@@ -72,7 +65,6 @@ fn owner(doc: &aterm_toml::Value, name: &str) -> aterm_toml::Value {
         .expect("the owner row")
 }
 
-/// A TOML array of strings.
 fn strings(value: Option<&aterm_toml::Value>) -> Vec<String> {
     value
         .and_then(aterm_toml::Value::as_array)
@@ -86,8 +78,6 @@ fn strings(value: Option<&aterm_toml::Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The second stderr line's `error` object.
-/// The files directly in `dir`, by name.
 fn names_in(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -117,8 +107,6 @@ const ADD_DEV: [&str; 10] = [
     "--format",
 ];
 
-// ---------------------------------------------------------------- auth add: first provisioning
-
 #[test]
 fn auth_add_without_a_terminal_refuses_and_creates_nothing() {
     let root = common::scratch("auth-noterm");
@@ -140,8 +128,6 @@ fn auth_add_without_a_terminal_refuses_and_creates_nothing() {
     assert!(fake.seen().is_empty());
 }
 
-// A token typed at a terminal is echoed as it is typed: `--stdin` takes a pipe or a file, and a
-// terminal stdin is usage before anything is read, made or sent. `--file` is not stdin.
 #[test]
 fn auth_add_stdin_from_a_terminal_is_usage_and_reads_nothing() {
     let root = common::scratch("auth-ttyin");
@@ -169,7 +155,6 @@ fn auth_add_stdin_from_a_terminal_is_usage_and_reads_nothing() {
     let error = common::error_json(&captured.stderr_text());
     assert_eq!(error["kind"], Value::from("usage"));
     let next = error["next"].as_str().expect("a next");
-    // The next is the whole request, stdin filled: following it provisions this profile.
     assert!(next.contains("dev --stdin --tier dev"), "{next}");
     assert!(next.contains("--owner fixture-dev"), "{next}");
     assert!(next.contains("--write"), "{next}");
@@ -180,7 +165,6 @@ fn auth_add_stdin_from_a_terminal_is_usage_and_reads_nothing() {
     let mut unread = String::new();
     std::io::Read::read_to_string(&mut ctx.stdin, &mut unread).expect("stdin");
     assert_eq!(unread, format!("{token}\n"), "stdin was read");
-    // With --file, a terminal stdin is no refusal: the token is not on stdin.
     let dirs = dirs(root.path());
     std::fs::create_dir_all(&dirs.home).expect("home");
     let file = common::write_token(&dirs.home.join("tok"), "dev.token", &token);
@@ -245,9 +229,6 @@ fn auth_add_from_stdin_writes_private_files_that_validate() {
     assert_eq!(user.as_login.as_deref(), Some("fixture-dev-bot"));
 }
 
-// ---------------------------------------------------------------- auth add: editing a file
-
-/// A valid agh.toml with a comment above an owner table and one at the end of its read line.
 const COMMENTED: &str = "# kept above the owner table\n\
 [[owners]]\n\
 name = \"fixture-dev\"\n\
@@ -307,8 +288,6 @@ fn auth_add_again_replaces_the_token_and_login_and_a_tier_change_is_refused() {
     let row = owner(&parsed(&dirs), "fixture-dev");
     assert_eq!(strings(row.get("read")), ["dev"]);
 
-    // Park a real request after its credential is prepared, before its network
-    // send. All environment reads are injected and return no value.
     struct GateEnv(
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     );
@@ -346,7 +325,6 @@ fn auth_add_again_replaces_the_token_and_login_and_a_tier_change_is_refused() {
             )));
             (run(&mut ctx, &args), captured)
         });
-        // Dropped before scope joins on an assertion failure too.
         let release = Release(Some(release));
         ready
             .recv_timeout(common::HANG)
@@ -459,8 +437,6 @@ fn auth_add_of_a_token_github_rejects_changes_nothing() {
     assert!(captured.stdout().is_empty());
 }
 
-// ---------------------------------------------------------------- auth add: refusals
-
 #[test]
 fn auth_add_of_a_loose_file_names_the_chmods() {
     let root = common::scratch("auth-loose");
@@ -561,8 +537,6 @@ fn auth_add_refuses_a_missing_file_a_long_stdin_and_a_loose_config_directory() {
     assert_eq!(mode(&dirs.config), 0o755);
     assert!(!dirs.tokens().exists());
 
-    // A loose tokens/ under a private config directory: refused, the directory named once,
-    // by the `~/…`-or-absolute form agh chose, never again by aterm-uds's absolute form.
     common::chmod(&dirs.config, 0o700);
     std::fs::DirBuilder::new()
         .mode(0o755)
@@ -580,8 +554,6 @@ fn auth_add_refuses_a_missing_file_a_long_stdin_and_a_loose_config_directory() {
     let why = error["why"].as_str().unwrap_or_default();
     let tokens = dirs.tokens().display().to_string();
     assert_eq!(why.matches(tokens.as_str()).count(), 1, "{why}");
-    // The data the refusal carries: the chmod that makes it private, and its inverse with
-    // the 0755 this test set.
     assert!(
         error["next"]
             .as_str()
@@ -618,7 +590,6 @@ fn auth_add_checks_its_arguments() {
     }
     assert!(!dirs(root.path()).config.exists());
 
-    // Library callers need the same name admission before stdin or filesystem work.
     let dirs = dirs(root.path());
     let gh = common::github(Router::empty(), &fake);
     let token = agh_fake::token("api-args");
@@ -638,7 +609,6 @@ fn auth_add_checks_its_arguments() {
     assert_eq!(stdin.position(), 0);
     assert!(!dirs.config.exists());
 
-    // Existing intermediate directories must not make slash or absolute names usable.
     std::fs::create_dir_all(dirs.config.parent().expect("the config parent"))
         .expect("the config parent");
     aterm_uds::private_file::create_private_dir(&dirs.config).expect("the private config");
@@ -681,8 +651,6 @@ fn auth_add_checks_its_arguments() {
     );
     assert_eq!(fake.seen().len(), 1);
 }
-
-// ---------------------------------------------------------------- auth remove
 
 #[test]
 fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
@@ -741,8 +709,6 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
     );
     assert_eq!(exit, 0, "{}", captured.stderr_text());
     assert!(dirs.tokens().join("ext.token").exists());
-    // An interrupted stage may be the only surviving copy of a token. Removing
-    // the profile does not claim ownership of that occupied staging name.
     let stale = common::write_token(&dirs.tokens(), "ext.token.agh-new", &token);
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     assert_eq!(
@@ -799,7 +765,6 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
     let dirs = dirs(root.path());
     common::write_config(&dirs, "");
     std::fs::remove_file(dirs.config_file()).expect("no agh.toml yet");
-    // The token an interrupted `auth add dev --stdin` left: naming it is usage, and it stays.
     let staged = common::write_token(&dirs.tokens(), "dev.token.agh-new", &token);
     let path = staged.display().to_string();
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
@@ -812,8 +777,6 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
     assert!(!dirs.config_file().exists());
     assert!(fake.seen().is_empty(), "{:?}", fake.seen());
 
-    // Even when no profile names it, another edit's or an interrupted stage is
-    // not overwritten. A link is not followed, and a FIFO is not opened.
     let own = dirs.tokens().join("dev.token");
     let neighbor = common::write_token(root.path(), "kept-token", &token);
     let other = agh_fake::token("other");
@@ -878,7 +841,6 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
         format!("{token}\n")
     );
     let lock = dirs.config.join(".auth-edit.lock");
-    // Existing lock entries are admitted, never truncated or followed.
     std::fs::write(&lock, b"occupied lock").expect("the fixture's lock file");
     let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{other}\n"));
     assert_eq!(
@@ -950,8 +912,6 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
     std::fs::remove_file(&lock).expect("remove the fixture's lock FIFO");
     assert!(!dirs.config_file().exists());
     assert!(fake.seen().is_empty());
-    // Only after the fixture removes its own occupied entries can a normal
-    // provision complete; its created stage is cleaned on success.
     let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{other}\n"));
     assert_eq!(
         run(
@@ -971,8 +931,6 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
     common::write_token(&dirs.tokens(), "dev.token.agh-new", &token);
     fake.clear_seen();
 
-    // A hand-written agh.toml naming it as ci's token: removing dev keeps ci's token, and a
-    // stdin add of dev refuses before it stages over it.
     common::write_config(
         &dirs,
         &format!(
@@ -1004,8 +962,6 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
     );
     assert!(!own.exists());
 }
-
-// ---------------------------------------------------------------- auth add --drafts
 
 #[test]
 fn auth_add_drafts_vouches_for_the_token_and_a_re_add_without_it_drops_the_line() {
@@ -1063,8 +1019,6 @@ fn auth_add_drafts_vouches_for_the_token_and_a_re_add_without_it_drops_the_line(
     assert!(row.get("drafts_fp").is_none(), "{}", config_text(&dirs));
     assert!(!common::github(validated(&dirs), &fake).drafts_vouched("dev"));
 }
-
-// ---------------------------------------------------------------- auth status
 
 #[test]
 fn auth_status_reports_a_valid_file() {
@@ -1165,9 +1119,6 @@ fn auth_status_fails_on_an_unusable_referenced_profile() {
     );
 }
 
-// ---------------------------------------------------------------- whoami
-
-/// The canonical config with a third profile, `ext`, whose token file is `{root}/loose`.
 fn three_profiles(root: &Path) -> String {
     let loose = root.join("loose").join("ext.token");
     format!(
@@ -1364,7 +1315,6 @@ fn whoami_verify_keeps_a_matching_login() {
     assert_eq!(users.len(), 1, "only the present profile is verified");
 }
 
-/// One dev profile over `{root}/tokens/dev.token`, binding `login`.
 fn one_dev_profile(root: &Path, login: &str) -> String {
     format!(
         "[profiles.dev]\ntoken_file = \"{}\"\ntier = \"dev\"\nlogin = \"{login}\"\n",
@@ -1374,8 +1324,6 @@ fn one_dev_profile(root: &Path, login: &str) -> String {
 
 #[test]
 fn whoami_never_prints_an_unprefixed_token_pasted_into_login() {
-    // No name rule holds a login, and the Redactor knows no unprefixed shape: the row masks
-    // the long hex run itself.
     let root = common::scratch("whoami-pasted");
     let fake = FakeGithub::start();
     let pasted = agh_fake::token("pasted")[4..].to_string();
@@ -1393,7 +1341,6 @@ fn whoami_verify_names_a_login_github_disagrees_with() {
     let root = common::scratch("whoami-mismatch");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
-    // The fake maps the dev token to fixture-dev-bot; agh.toml binds another login.
     common::canonical_tokens(root.path(), &fake, true, false);
     common::write_config(&dirs, &one_dev_profile(root.path(), "fixture-reader"));
     validated(&dirs);
@@ -1425,7 +1372,6 @@ fn whoami_verify_marks_a_token_github_refuses_unusable() {
     let root = common::scratch("whoami-401");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
-    // A token the fake does not know: GET /user answers 401.
     common::write_token(
         &root.path().join("tokens"),
         "dev.token",
@@ -1456,7 +1402,6 @@ fn whoami_verify_marks_a_token_github_refuses_unusable() {
     );
 }
 
-/// stderr's error lines: every `agh: ` line but the receipt's `agh: ok `.
 fn error_lines_of(captured: &Captured) -> Vec<String> {
     captured
         .stderr_text()
@@ -1499,7 +1444,6 @@ fn auth_remove_refuses_a_file_that_is_already_invalid_and_changes_nothing() {
     let dirs = dirs(root.path());
     common::write_config(&dirs, ""); // the private config directory, for tokens/
     let token = common::write_token(&dirs.tokens(), "b.token", &agh_fake::token("shared"));
-    // L7: two profiles name one file.
     let text = format!(
         "[profiles.a]\ntoken_file = \"{shared}\"\ntier = \"dev\"\n\n[profiles.b]\ntoken_file = \"{shared}\"\ntier = \"dev\"\n",
         shared = token.display()
@@ -1529,8 +1473,6 @@ fn auth_remove_of_a_linked_agh_directory_gives_the_loads_refusal() {
     let root = common::scratch("auth-remove-linked-dir");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
-    // A private agh directory elsewhere, holding a valid agh.toml, and the agh directory a
-    // link to it.
     let real = Dirs {
         config: root.path().join("elsewhere").join("agh"),
         ..dirs.clone()
@@ -1560,7 +1502,6 @@ fn auth_remove_of_a_linked_agh_directory_gives_the_loads_refusal() {
         "the remedy names the linked directory: {next}"
     );
 
-    // `whoami` reads agh.toml through `config::load`: the same refusal, word for word.
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     assert_eq!(run(&mut ctx, &["whoami"]), 1, "{}", captured.stderr_text());
     let loaded = common::error_json(&captured.stderr_text());
@@ -1575,8 +1516,6 @@ fn a_linked_tokens_directory_is_never_deleted_from() {
     let root = common::scratch("auth-linked-tokens");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
-    // The person's own token, and a file beside it at the name agh stages under, in a
-    // private directory of theirs, with agh's tokens/ a link to that directory.
     let secrets = root.path().join("secrets");
     let token = common::write_token(&secrets, "dev.token", &agh_fake::token("linked-tokens"));
     let beside = common::write_token(&secrets, "dev.token.agh-new", &agh_fake::token("beside"));
@@ -1588,7 +1527,6 @@ fn a_linked_tokens_directory_is_never_deleted_from() {
     std::os::unix::fs::symlink(&secrets, dirs.tokens()).expect("the link");
     validated(&dirs);
 
-    // A stdin add that is usage (an empty token) touches nothing.
     let (mut ctx, captured) = person_with(root.path(), &fake, "");
     let exit = run(
         &mut ctx,
@@ -1597,7 +1535,6 @@ fn a_linked_tokens_directory_is_never_deleted_from() {
     assert_eq!(exit, 2, "{}", captured.stderr_text());
     assert!(beside.exists(), "a usage error deletes nothing");
 
-    // Removing the profile edits agh.toml and deletes no file reached through the link.
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     assert_eq!(
         run(&mut ctx, &["auth", "remove", "dev"]),
@@ -1629,7 +1566,6 @@ fn auth_add_under_a_parent_it_cannot_write_could_not_run() {
     common::chmod(parent, 0o500);
     let probe = parent.join("probe");
     if std::fs::create_dir(&probe).is_ok() {
-        // A user the mode does not bind (root): nothing here is unwritable to it.
         let _ = std::fs::remove_dir(&probe);
         common::chmod(parent, 0o700);
         return;
@@ -1642,7 +1578,6 @@ fn auth_add_under_a_parent_it_cannot_write_could_not_run() {
         &["auth", "add", "dev", "--stdin", "--tier", "dev"],
     );
     common::chmod(parent, 0o700);
-    // No directory exists to chmod: an environment fault, never a refusal with a remedy.
     assert_eq!(exit, 3, "{}", captured.stderr_text());
     let error = common::error_json(&captured.stderr_text());
     assert_eq!(error["kind"], Value::from("could_not_run"), "{error}");
@@ -1691,16 +1626,12 @@ fn a_pure_edit_of_text_that_does_not_parse_names_only_the_line() {
 
 #[test]
 fn an_edit_and_policy_check_name_the_same_line_for_an_error_at_end_of_input() {
-    // The parser places this error at end of input, after the final newline: both readers
-    // name the last line, not the empty one after it.
     let text = "x = 1\na = [\n";
     let edit = agh::identity::provision::remove_from_config(text, "a").expect_err("no parse");
     assert!(edit.why.ends_with(" at line 2"), "{}", edit.why);
     let check = agh::config::parse(text).expect_err("no parse");
     assert!(check.what.contains(": line 2: "), "{}", check.what);
 }
-
-// ---------------------------------------------------------------- inline spellings and reach
 
 #[test]
 fn auth_add_re_provisions_an_inline_profile_row_and_drops_its_reach_claim() {
@@ -1890,8 +1821,6 @@ fn an_ambient_token_a_profile_names_is_reported_as_that_profiles() {
     );
 }
 
-// ---------------------------------------------------------------- metering, unnameable files, quoted remedies
-
 #[test]
 fn auth_add_meters_the_get_user_it_sends_as_the_new_token() {
     let root = common::scratch("auth-metered");
@@ -1922,10 +1851,6 @@ fn auth_add_refuses_a_token_file_agh_toml_cannot_name() {
     fake.add_token(&token, "fixture-dev-bot");
     let (mut ctx, _captured) = person(root.path(), &fake, common::env());
     let gh = ctx.github().expect("the client");
-    // A stdin token under a config directory whose path is not UTF-8 (an XDG_CONFIG_HOME
-    // outside home): refused before any directory is made or request sent. Without the
-    // check the directory's creation is the first failure (could_not_run), or, where the
-    // file system takes the name, agh.toml names the token lossily.
     let mut odd = dirs(root.path());
     odd.config = root
         .path()

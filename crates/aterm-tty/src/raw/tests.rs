@@ -16,7 +16,6 @@ use crate::decode::{Decoder, Event, Reply};
 use crate::signals::Signals;
 use crate::tty::{DevTty, Mode, Modes, Readiness, Size, Tty};
 
-/// Every mode a terminal program sets.
 const ALL_MODES: [Mode; 7] = [
     Mode::AltScreen,
     Mode::KittyKeys(5),
@@ -27,23 +26,17 @@ const ALL_MODES: [Mode; 7] = [
     Mode::Cursor,
 ];
 
-/// The child's orders: `panic`, `sigterm` or `suspend`. The child's stdin is the pty.
 const CHILD: &str = "ATERM_TTY_RAW_CHILD";
-/// The test the child runs.
 const CHILD_TEST: &str = "raw::tests::child";
-/// What the child writes once raw with every mode set, and again once back from a stop.
 const RAW_MARK: &[u8] = b"<raw>";
 const BACK_MARK: &[u8] = b"<back>";
 
-/// A pty pair `(master, slave)`.
 fn pty() -> (OwnedFd, OwnedFd) {
     let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
     // SAFETY: both are open descriptors the call just returned and nothing else owns.
     unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
 }
 
-/// A terminal's settings, field by field: the padding in a termios is whatever the
-/// kernel's copy left there, so two equal settings can differ in their bytes.
 fn settings(termios: &Termios) -> String {
     // SAFETY: an aligned termios `tcgetattr` filled.
     let t = unsafe { &*termios.as_ptr() };
@@ -55,11 +48,9 @@ fn settings(termios: &Termios) -> String {
     )
 }
 
-/// What the program wrote to a pty's slave, read from its master.
 struct Seen {
     master: OwnedFd,
     bytes: Vec<u8>,
-    /// Where the next wait starts looking: past what the last one waited for.
     from: usize,
 }
 
@@ -72,8 +63,6 @@ impl Seen {
         }
     }
 
-    /// Read until `end` appears past what the last wait waited for; everything written
-    /// up to and including it. A read may bring more, which the next wait looks at.
     fn until(&mut self, end: &[u8]) -> &[u8] {
         let deadline = Instant::now() + MUST_HAPPEN;
         loop {
@@ -110,8 +99,6 @@ impl Seen {
     }
 }
 
-/// The terminal's private modes as aterm's engine holds them after `bytes`: each mode's
-/// DECRPM state, the kitty flags, and the cursor.
 fn modes_after(bytes: &[u8]) -> Vec<String> {
     let mut term = Terminal::new(24, 80);
     term.process(bytes);
@@ -135,12 +122,10 @@ fn modes_after(bytes: &[u8]) -> Vec<String> {
     seen
 }
 
-/// The modes of a terminal no program changed.
 fn untouched() -> Vec<String> {
     modes_after(b"")
 }
 
-/// This process's one guard and signal wake, for this test alone.
 fn alone() -> MutexGuard<'static, ()> {
     TEST_TERMINAL.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -205,8 +190,6 @@ fn guard_restores_termios_on_drop() {
     );
 }
 
-/// A panic on another thread, which the program survives by joining it, leaves the
-/// terminal raw with every mode set: only the guard's own thread puts it back.
 #[test]
 fn a_worker_panic_leaves_the_terminal_raw() {
     let _alone = alone();
@@ -225,7 +208,6 @@ fn a_worker_panic_leaves_the_terminal_raw() {
     );
 }
 
-/// The size the pty's master gives its slave.
 fn set_size(master: &OwnedFd, cols: u16, rows: u16) {
     let ws = libc::winsize {
         ws_row: rows,
@@ -238,29 +220,22 @@ fn set_size(master: &OwnedFd, cols: u16, rows: u16) {
     assert_eq!(set, 0, "the size set");
 }
 
-/// Write `bytes` to the pty's master: typed at the terminal.
 fn type_in(master: &OwnedFd, bytes: &[u8]) {
     // SAFETY: a write(2) from a live slice to the open master.
     let n = unsafe { libc::write(master.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
     assert_eq!(usize::try_from(n).ok(), Some(bytes.len()), "typed");
 }
 
-/// Send `signal` to this process.
 fn signal_self(signal: libc::c_int) {
     // SAFETY: a signal this process's signal wake catches.
     assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
 }
 
-/// A wait on `tty` for what must come: a minute's hang detector, not a budget.
 fn wait(tty: &mut DevTty, buf: &mut [u8]) -> Readiness {
     tty.read(buf, Some(Instant::now() + MUST_HAPPEN))
         .expect("a wait")
 }
 
-/// The terminal a loop reads: a wait ends at its deadline, with what was typed (raw: no
-/// echo, no CR translation, C-c a byte), or with a signal, reported until it is taken.
-/// After SIGCONT the terminal is raw again with its modes set again in place, though
-/// the shell reset it meanwhile; dropped, it is as it was; hung up, a wait ends Closed.
 #[test]
 fn dev_tty_waits_reads_takes_signals_and_hangs_up() {
     let _alone = alone();
@@ -353,8 +328,6 @@ fn dev_tty_waits_reads_takes_signals_and_hangs_up() {
     assert_eq!(wait(&mut tty, &mut buf), Readiness::Closed);
 }
 
-/// Run this test binary on [`CHILD_TEST`] with `how` as its orders and the slave as its
-/// stdin, to its end.
 fn run_child(how: &str, slave: &OwnedFd) -> std::process::Output {
     let exe = std::env::current_exe().expect("the test binary");
     let mut cmd = aterm_uds::spawnfd::command(exe);
@@ -401,7 +374,6 @@ fn restores_on_panic_and_on_sigterm() {
     }
 }
 
-/// A child killed and reaped if a failed assertion leaves it running or stopped.
 struct Reap(aterm_uds::spawnfd::Child);
 
 impl Drop for Reap {
@@ -474,7 +446,6 @@ fn suspend_puts_back_then_reenters() {
     );
 }
 
-/// The child half of the tests above; an ordinary run (no orders) passes at once.
 #[test]
 fn child() {
     let Ok(how) = std::env::var(CHILD) else {

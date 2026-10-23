@@ -253,6 +253,7 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
                 }
             }
             Event::Deleting(_, profile) => {
+                // Each profile is deleted under its own locks, the first one
                 // the unit's removal.
                 if !held.contains(&profile) {
                     return Err(format!(

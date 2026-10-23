@@ -42,6 +42,7 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
         Ok(file) => Ok((file, Cow::Borrowed(path))),
         Err(error) => {
             // Only a final-component LINK is retried; every other refusal
+            // (absent, FIFO, device, oversize) keeps its own error.
             if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
                 return Err(error);
             }
@@ -242,6 +243,7 @@ impl MappedFontFile {
         }
         let Some(ptr) = std::ptr::NonNull::new(raw.cast::<u8>()) else {
             // A NULL success is impossible with a NULL hint on every unix
+            // aterm builds for; treat it as a failed map rather than trust it.
             return Err(io::Error::other("mmap returned a null mapping"));
         };
         Ok(Self {

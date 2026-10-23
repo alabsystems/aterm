@@ -1,37 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which copy of aterm itself is running.
-//!
-//! The updater replaces only the running bundle; another `aterm.app` elsewhere
-//! (`~/Applications`, a Caskroom leftover) is left alone (`install::trial_owned_by`).
-//! `aterm --version` and Settings ▸ About name the running copy and any other copy in the
-//! usual places, in the words spelled here:
-//!
-//! ```text
-//! running: /Applications/aterm.app
-//! another copy: /Users//ana/Applications/aterm.app (0.60.0) — the updater leaves it alone
-//! ```
-//!
-//! Identity is the updater's own [`crate::install::same_install_root`]; versions are
-//! read with the bounded `read_ledger_text` reader. Nothing here spawns a helper.
+//! Identifies the running copy of aterm and any other copies in usual install locations.
 
 use std::path::{Path, PathBuf};
 
-/// Why a running copy is inert: [`Running::InertApp`] collapses a dev-marked build,
-/// a mounted-image launch and an App-Translocated launch, which the updater treats
-/// alike but a person does not: two are a mistake one drag undoes, and the third
-/// is no fault at all. Portable so every host can render it; only the
-/// macOS probe classifies a real bundle.
+/// Why a running copy is inert ([`Running::InertApp`]).
 pub use crate::install_posture::InstallPosture;
 
 /// The macOS classification, shared with the updater's bundle admission.
 #[cfg(target_os = "macos")]
 pub use crate::bundle::posture_from;
 
-/// The running copy's [`InstallPosture`], from its resolved executable path (the
-/// same shim resolution as [`crate::bundle::resolve_layout`]); `None` when that path
-/// cannot be read.
+/// The running copy's [`InstallPosture`] ([`crate::bundle::resolve_layout`]).
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn running_posture() -> Option<InstallPosture> {
@@ -39,17 +20,14 @@ pub fn running_posture() -> Option<InstallPosture> {
     Some(posture_from(&exe))
 }
 
-/// What the running copy is — decides whether the other-copy clause ("the updater
-/// leaves it alone") may be made at all.
+/// What the running copy is — decides whether the other-copy clause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Running {
     /// An installed `.app` the updater may replace (`bundle::resolve` semantics).
     InstalledApp,
-    /// An `.app` the updater never touches: dev-marked (`ATermDevBuild`), or launched
-    /// from a mounted disk image / App Translocation.
+    /// An `.app` the updater never touches.
     InertApp,
-    /// Not a bundle: a bare executable (every Linux/Windows launch, and a macOS `target/` or
-    /// store binary).
+    /// Not a bundle: a bare executable.
     Binary,
 }
 
@@ -58,15 +36,14 @@ pub enum Running {
 pub struct OtherCopy {
     /// The `.app` root.
     pub path: PathBuf,
-    /// Its `CFBundleShortVersionString`; `None` when the plist is missing, binary, or
-    /// lacks the key (the row then says `version unknown` rather than guessing).
+    /// Its `CFBundleShortVersionString`.
     pub version: Option<String>,
 }
 
 /// The answer: the running copy, what kind of thing it is, and the other copies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhichCopy {
-    /// macOS `.app` root containing the executable; otherwise the executable path.
+    /// macOS `.app` root containing the executable.
     pub running: PathBuf,
     /// See [`Running`].
     pub kind: Running,
@@ -75,8 +52,7 @@ pub struct WhichCopy {
 }
 
 impl WhichCopy {
-    /// The running copy's row value: the path, plus, for a bundle the updater never touches,
-    /// why the other rows' "the updater leaves it alone" is absent.
+    /// The running copy's row value.
     #[must_use]
     pub fn running_detail(&self) -> String {
         match self.kind {
@@ -88,10 +64,7 @@ impl WhichCopy {
         }
     }
 
-    /// One other copy's row value: `<path> (<version>) — the updater leaves it alone`. The
-    /// clause is made only when the running copy is an installed bundle the updater owns; from
-    /// a bare binary or an inert bundle it updates neither, and the value is
-    /// `<path> (<version>)`.
+    /// One other copy's row value.
     #[must_use]
     pub fn other_detail(&self, other: &OtherCopy) -> String {
         let version = other.version.as_deref().unwrap_or("version unknown");
@@ -102,9 +75,7 @@ impl WhichCopy {
         detail
     }
 
-    /// The report as printed lines: `running: …`, then `another copy: …` per other
-    /// copy. `aterm --version` prints these after its identity line; About shows the
-    /// same values under the `running` / `another copy` rows.
+    /// The report as printed lines.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
         let mut out = vec![format!("running: {}", self.running_detail())];
@@ -117,14 +88,10 @@ impl WhichCopy {
     }
 }
 
-/// Observe this process: the copy it runs from and, on macOS, every other `aterm.app`
-/// in the usual places. `None` only when the executable path itself is unknown.
+/// Observe this process.
 #[must_use]
 pub fn observe() -> Option<WhichCopy> {
     let exe = std::env::current_exe().ok()?;
-    // Resolve a symlink shim as `bundle::resolve_layout` does: a `~/.local/bin/aterm` launcher
-    // names the bundle (or store binary) it points into. Unix only: on Windows `canonicalize`
-    // answers a verbatim `\\?\C:\…` spelling, and there is no shim.
     #[cfg(unix)]
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     Some(observe_from(&exe))
@@ -135,16 +102,12 @@ fn observe_from(exe: &Path) -> WhichCopy {
     survey(exe, &usual_app_locations())
 }
 
-/// [`observe`]'s `kind` alone, without probing for other copies: one canonicalize
-/// and, for a bundle, one bounded `Info.plist` read. For a launch-time caller
-/// (`aterm-gui`'s `crash_signal::Arming`). [`Running::Binary`] when the executable
-/// path is unknown.
+/// [`observe`]'s `kind` alone, without probing for other copies ([`Running::Binary`]).
 #[must_use]
 pub fn running_kind() -> Running {
     let Ok(exe) = std::env::current_exe() else {
         return Running::Binary;
     };
-    // The same deliberate shim resolution as [`observe`].
     #[cfg(unix)]
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     kind_of(&exe)
@@ -164,8 +127,7 @@ pub fn kind_of(exe: &Path) -> Running {
     }
 }
 
-/// The running copy's root and kind: the `.app` root and whether the updater owns
-/// it, or the bare executable.
+/// The running copy's root and kind.
 #[cfg(target_os = "macos")]
 fn classify(exe: &Path) -> (PathBuf, Running) {
     match crate::bundle::layout_of(exe) {
@@ -185,8 +147,7 @@ fn classify(exe: &Path) -> (PathBuf, Running) {
     }
 }
 
-/// Off macOS there is no bundle and no updater lane: the executable path is the
-/// whole answer.
+/// Off macOS there is no bundle and no updater lane.
 #[cfg(not(target_os = "macos"))]
 fn observe_from(exe: &Path) -> WhichCopy {
     WhichCopy {
@@ -196,12 +157,7 @@ fn observe_from(exe: &Path) -> WhichCopy {
     }
 }
 
-/// Pure core of [`observe`]: classify `exe` and probe `candidates` (`.app` roots).
-/// A candidate that does not exist, is not a real directory (a symlink planted at a
-/// usual place is never followed out of it — not read, not reported; so a symlinked
-/// spelling of the running bundle is not a second copy either), resolves to the
-/// running bundle (`same_install_root`), or duplicates an earlier candidate is
-/// skipped.
+/// Pure core of [`observe`].
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn survey(exe: &Path, candidates: &[PathBuf]) -> WhichCopy {
@@ -230,26 +186,20 @@ pub fn survey(exe: &Path, candidates: &[PathBuf]) -> WhichCopy {
     }
 }
 
-/// A directory that is really there, not a symlink to one. Every probe of another copy goes
-/// through this, so the report never follows a link planted in `~/Applications` or a Caskroom.
+/// A directory that is really there, not a symlink to one.
 #[cfg(target_os = "macos")]
 fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
 }
 
-/// The most Caskroom version directories the report looks inside (more is not a shape `brew`
-/// produces); the first of them, sorted, are named.
+/// The most Caskroom version directories the report looks inside.
 #[cfg(target_os = "macos")]
 const MAX_CASKROOM_ENTRIES: usize = 16;
 
-/// The longest version string another copy's plist may contribute. A version is
-/// `MAJOR.MINOR.PATCH` plus at most a pre-release or build tag; anything else (an escape
-/// sequence, a paragraph) reads as unknown rather than reaching the terminal.
+/// The longest version string another copy's plist may contribute.
 #[cfg(any(target_os = "macos", test))]
 const MAX_VERSION_CHARS: usize = 32;
 
-/// `version` if it is shaped like one ([`MAX_VERSION_CHARS`] of `[0-9A-Za-z.+-]`),
-/// else `None`. Pure; every platform's tests pin the rule.
 #[cfg(any(target_os = "macos", test))]
 #[must_use]
 fn plausible_version(version: &str) -> Option<&str> {
@@ -261,9 +211,7 @@ fn plausible_version(version: &str) -> Option<&str> {
     ok.then_some(version)
 }
 
-/// `CFBundleShortVersionString` from a bundle's XML `Info.plist` (anything else reads as
-/// unknown), through the bounded ledger reader with no helper spawned. Admitted only when
-/// version-shaped ([`plausible_version`]): the report prints it into a terminal.
+/// `CFBundleShortVersionString` from a bundle's XML `Info.plist` ([`plausible_version`]).
 #[cfg(target_os = "macos")]
 fn plist_short_version(app_root: &Path) -> Option<String> {
     let text = crate::read_ledger_text(&app_root.join("Contents/Info.plist"))?;
@@ -272,9 +220,7 @@ fn plist_short_version(app_root: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The usual places an `aterm.app` lands: `/Applications`, `~/Applications`, and the Homebrew
-/// Caskroom (`brew install --cask` stages `<prefix>/Caskroom/aterm/<version>/aterm.app`; a
-/// leftover there is a copy). `HOME` and `HOMEBREW_PREFIX` come from the environment.
+/// The usual places an `aterm.app` lands.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn usual_app_locations() -> Vec<PathBuf> {
@@ -289,7 +235,6 @@ fn app_locations(home: Option<&Path>, homebrew_prefix: Option<&Path>) -> Vec<Pat
     if let Some(home) = home {
         out.push(home.join("Applications").join("aterm.app"));
     }
-    // Apple silicon, Intel, then a configured prefix that is neither.
     let mut prefixes = vec![PathBuf::from("/opt/homebrew"), PathBuf::from("/usr/local")];
     if let Some(prefix) = homebrew_prefix
         && !prefixes.iter().any(|p| p == prefix)
@@ -302,8 +247,7 @@ fn app_locations(home: Option<&Path>, homebrew_prefix: Option<&Path>) -> Vec<Pat
     out
 }
 
-/// `<caskroom>/<version>/aterm.app` for each version directory present: real directories only,
-/// at most [`MAX_CASKROOM_ENTRIES`], sorted so the report is stable.
+/// `<caskroom>/<version>/aterm.app` for each version directory present ([`MAX_CASKROOM_ENTRIES`]).
 #[cfg(target_os = "macos")]
 fn caskroom_bundles(caskroom: &Path) -> Vec<PathBuf> {
     if !is_real_dir(caskroom) {
@@ -330,8 +274,6 @@ fn caskroom_bundles(caskroom: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Another copy's version reaches the terminal, so only a version-shaped value
-    /// is admitted; anything else reads as unknown.
     #[test]
     fn only_a_version_shaped_string_is_admitted() {
         assert_eq!(plausible_version("0.60.0"), Some("0.60.0"));
@@ -346,17 +288,13 @@ mod tests {
         assert_eq!(plausible_version(&"9".repeat(MAX_VERSION_CHARS + 1)), None);
     }
 
-    /// Every platform answers with at least the executable path.
     #[test]
     fn this_process_names_its_own_executable() {
         let report = observe().expect("current_exe resolves under test");
         assert!(report.running.is_absolute(), "{report:?}");
         let exe = std::env::current_exe().unwrap();
-        // Resolved where `observe` resolves it: unix only, never into Windows's
-        // verbatim `\\?\C:\…` spelling.
         #[cfg(unix)]
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-        // A test binary is never a `.app`, so the running path is the executable.
         assert_eq!(report.kind, Running::Binary);
         assert_eq!(report.running, exe);
     }
@@ -376,8 +314,6 @@ mod tests {
             root
         }
 
-        /// A fake bundle: the `Contents/MacOS/aterm` layout, plus an XML plist
-        /// when `plist_body` is given.
         fn make_bundle(app: &Path, plist_body: Option<&str>) -> PathBuf {
             let macos = app.join("Contents").join("MacOS");
             std::fs::create_dir_all(&macos).unwrap();
@@ -402,9 +338,6 @@ mod tests {
             )
         }
 
-        /// The running bundle is named by its `.app` root; every other existing candidate is
-        /// listed in probe order with its plist's version (or `None`); a missing candidate, a
-        /// plain file or a symlink is not a copy.
         #[test]
         fn the_running_bundle_is_named_and_the_other_copies_carry_their_versions() {
             let root = temp_root();
@@ -423,13 +356,10 @@ mod tests {
             std::fs::write(&file, b"not a bundle").unwrap();
             let link = root.join("link.app");
             std::os::unix::fs::symlink(&running_app, &link).unwrap();
-            // A symlink planted at a usual place pointing at a real other bundle is
-            // never followed: not read, not reported.
             let elsewhere = root.join("elsewhere").join("aterm.app");
             make_bundle(&elsewhere, Some(&version_plist("0.1.0")));
             let planted = root.join("planted.app");
             std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
-            // A version that is not shaped like one reads as unknown.
             let odd = root.join("odd").join("aterm.app");
             make_bundle(&odd, Some(&version_plist("0.60.0\u{1b}[31m")));
 
@@ -442,7 +372,6 @@ mod tests {
                     file,
                     home_app.clone(),
                     cask_app.clone(),
-                    // The same install spelled twice is one copy.
                     home_app.clone(),
                     odd.clone(),
                 ],
@@ -470,9 +399,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(root);
         }
 
-        /// A bare binary is named by its own path and makes no updater promise (the
-        /// clause is a promise about the running copy, made only when the updater owns
-        /// it); the installed copies beside it are still reported.
         #[test]
         fn a_bare_binary_names_its_path_and_makes_no_updater_promise() {
             let root = temp_root();
@@ -494,8 +420,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(root);
         }
 
-        /// A dev-marked bundle and a mounted-image launch are inert bundles: named, and said
-        /// to be left alone.
         #[test]
         fn an_inert_bundle_says_the_updater_leaves_it_alone() {
             let root = temp_root();
@@ -510,7 +434,6 @@ mod tests {
             let report = survey(&dev_exe, &[]);
             assert_eq!(report.running, dev_app);
             assert_eq!(report.kind, Running::InertApp);
-            // The shape alone classifies a DMG launch; no filesystem needed.
             let mounted = survey(
                 Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm"),
                 &[],
@@ -520,9 +443,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(root);
         }
 
-        /// The Caskroom contributes one candidate per versioned bundle, sorted; the
-        /// fixed places come first, and a configured prefix that repeats a default
-        /// is not probed twice.
         #[test]
         fn the_usual_places_include_every_caskroom_bundle_once() {
             let root = temp_root();
@@ -531,10 +451,7 @@ mod tests {
             let older = caskroom.join("0.60.0").join("aterm.app");
             make_bundle(&newer, None);
             make_bundle(&older, None);
-            // A version directory with no bundle inside contributes nothing.
             std::fs::create_dir_all(caskroom.join("0.58.0")).unwrap();
-            // A symlinked version directory, or a symlinked bundle inside a real one,
-            // is never followed out of the Caskroom.
             let outside = root.join("outside").join("aterm.app");
             make_bundle(&outside, None);
             std::os::unix::fs::symlink(outside.parent().unwrap(), caskroom.join("0.57.0")).unwrap();
@@ -546,11 +463,9 @@ mod tests {
                 vec![older.clone(), newer.clone()]
             );
             assert!(caskroom_bundles(&root.join("no-caskroom")).is_empty());
-            // A Caskroom that is itself a symlink is not probed.
             let linked_caskroom = root.join("linked-caskroom");
             std::os::unix::fs::symlink(&caskroom, &linked_caskroom).unwrap();
             assert!(caskroom_bundles(&linked_caskroom).is_empty());
-            // The walk is bounded: past the cap, the rest is not looked at.
             let crowded = root.join("crowded");
             for i in 0..(MAX_CASKROOM_ENTRIES + 4) {
                 make_bundle(&crowded.join(format!("1.{i:03}.0")).join("aterm.app"), None);
@@ -565,7 +480,6 @@ mod tests {
                 places.contains(&older) && places.contains(&newer),
                 "{places:?}"
             );
-            // A default prefix named again as HOMEBREW_PREFIX is one prefix.
             let defaults = app_locations(None, None);
             let repeated = app_locations(None, Some(Path::new("/opt/homebrew")));
             assert_eq!(defaults, repeated);

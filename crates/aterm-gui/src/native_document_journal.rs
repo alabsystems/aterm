@@ -439,6 +439,8 @@ impl DocumentJournalStore {
             .ok_or(DraftCarryRefusal::Unjournaled)?;
         if entry.reseat_failed && (entry.reseat_owed || entry.reseat_inflight.is_some()) {
             // Checked before "writing": the retry is usually on the worker when
+            // the update asks, and a journal that keeps refusing must not read
+            // as one that is merely busy.
             return Err(DraftCarryRefusal::ReseatFailed);
         }
         if entry.append_failed && entry.desired.seq > entry.reducer.durable_seq() {
@@ -453,6 +455,7 @@ impl DocumentJournalStore {
         }
         if entry.pending_checkpoint.is_some() {
             // A verified save is queued to prune the journal: the next drive
+            // writes it.
             return Err(DraftCarryRefusal::Writing);
         }
         if entry.desired.seq != head.seq || entry.reducer.durable_seq() != head.seq {
@@ -846,11 +849,13 @@ impl DocumentJournalStore {
     }
 
     /// Fence or unfence journal re-seats while a handoff attempt is in progress.
-    pub(crate) fn set_reseat_fenced(&mut self, fenced: bool) {
+    pub(crate) const fn set_reseat_fenced(&mut self, fenced: bool) {
         self.reseat_fenced = fenced;
     }
 
-    /// Whether `document`'s journal has nothing left.
+    /// Whether `document`'s journal has nothing left to do: no write on the
+    /// worker, no re-seat owed, no checkpoint queued, no legacy journal left to
+    /// retire, and its head durable.
     pub(crate) fn settled(&self, document: DocumentId) -> bool {
         self.entries.get(&document).is_none_or(|entry| {
             !entry_busy(entry)
@@ -987,7 +992,7 @@ fn copy_held_lock_for_test(lock: &File) {
     });
 }
 
-fn entry_busy(entry: &JournalEntry) -> bool {
+const fn entry_busy(entry: &JournalEntry) -> bool {
     entry.append_text.is_some()
         || entry.rewrite_inflight.is_some()
         || entry.reseat_inflight.is_some()
@@ -1016,7 +1021,7 @@ pub(crate) fn verify_carried_draft(
 
 /// Whether a journal image holds no draft: its first snapshot alone, the file as opened or last
 /// saved.
-fn holds_no_draft(recovered: &StoredJournalRecovery) -> bool {
+const fn holds_no_draft(recovered: &StoredJournalRecovery) -> bool {
     recovered.record_count == 1
 }
 
@@ -1027,12 +1032,15 @@ struct OpenReading {
     recover: bool,
     /// Its draft was made against other contents and is not the file.
     keep_aside: bool,
-    /// It holds a draft made against exactly the file on disk, equal to it.
+    /// It holds a draft made against exactly the file on disk, equal to it or
+    /// not — the draft an outgoing older aterm's Commit check reads back
+    /// ([`LegacyJournal`]).
     made_against_disk: bool,
 }
 
 fn read_for_open(recovered: &StoredJournalRecovery, disk_bytes: &[u8]) -> OpenReading {
     // Opened or saved and never edited since: nothing to recover or keep aside, whatever the
+    // disk holds now; `initialize` replaces the image with the file as it is.
     if holds_no_draft(recovered) {
         return OpenReading {
             recover: false,
@@ -1192,7 +1200,7 @@ pub(crate) fn execute_journal_reseat(
     }
 }
 
-fn synthetic_snapshot(document: DocumentId, seq: Seq, text: Arc<str>) -> DocumentSnapshot {
+const fn synthetic_snapshot(document: DocumentId, seq: Seq, text: Arc<str>) -> DocumentSnapshot {
     DocumentSnapshot {
         id: document,
         seq,

@@ -682,6 +682,7 @@ impl MatrixRain {
     pub fn note_activity(&mut self, content_seq: u64) {
         let Some(previous) = self.last_seq.replace(content_seq) else {
             // The first observation is a baseline, not activity: enabling
+            // rain over a static screen must not read as streaming.
             return;
         };
         if content_seq < previous {
@@ -1094,6 +1095,7 @@ impl MatrixRain {
             self.baker.begin_frame(geom.cell_w, geom.cell_h);
             if !self.baker.complete() && !self.material.is_empty() {
                 // A literal charset becomes visible as one complete generation:
+                // never mix new slot indices with old/blank atlas tiles.
                 self.finish_material_bake();
             } else if !self.baker.complete() && (ticked || self.last_bake_tick != Some(self.tick)) {
                 let rom = self.rom.get_or_insert_with(|| decorative_master().clone());
@@ -1229,6 +1231,7 @@ impl MatrixRain {
         }
         if let Some(failed) = self.pending_exit.take() {
             // Exit status: success rides the turn-wave machinery
+            // (limiter-bounded); failure holds the ember ramp.
             if self.cfg.exit_tint {
                 if failed {
                     self.fail_until_ms = now + EXIT_FAIL_MS;
@@ -1245,6 +1248,7 @@ impl MatrixRain {
             self.semantic_started_ms = now;
             if phase_changed {
                 // Repeated evidence for one still-active phase extends its
+                // bounded hold without reseeding the tape lanes or popping art.
                 self.semantic_seq = self.semantic_seq.wrapping_add(1);
             }
             match signal {
@@ -1334,6 +1338,8 @@ impl MatrixRain {
         let desired = self.desired_weather(now);
         if desired != self.weather && now.saturating_sub(self.weather_since_ms) >= DWELL_MS {
             // Any transition out of Working is a completed turn, including a
+            // direct Working→Sleep jump at the idle_secs minimum (where Calm is
+            // skipped).
             if self.weather == RainWeather::Working
                 && desired != RainWeather::Working
                 && self.cfg.turn_wave
@@ -1881,6 +1887,8 @@ impl MatrixRain {
     #[inline]
     fn cell_unmasked(&self, row: u32, col: u16, input: &RainTickInput<'_>) -> bool {
         // The composer band `sample_material` protects also holds for
+        // emission, even before the damage ring warms. `row < geom.rows`, so it
+        // fits a u16.
         if Self::row_banded(row as usize, self.occ_rows, input.cursor, input.hidden_band) {
             return false;
         }

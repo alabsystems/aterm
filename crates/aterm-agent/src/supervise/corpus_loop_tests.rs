@@ -9,10 +9,8 @@ use crate::supervise::tape::corpus::{self, Scrub, token};
 use crate::supervise::tape::recover::recover;
 use crate::supervise::tape::report::Verdict;
 
-/// The recording machine's home, as the approval policy holds it.
 const OWNER: &str = "/Users/_owner";
 
-/// A one-row Bash box running `command`.
 fn bash_box(command: &str) -> Vec<String> {
     bash_one_row()
         .into_iter()
@@ -26,9 +24,6 @@ fn bash_box(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// The scripted worker: a Read outside every allowed root, a Bash box that
-/// reads a file under the owner's home by its absolute path, then the
-/// session gone.
 fn script() -> Mock {
     let mut m = fenced(vec![
         busy_screen(),
@@ -42,8 +37,6 @@ fn script() -> Mock {
     m
 }
 
-/// A run of [`script`] recorded under `approve = "all"`, the policy's home
-/// [`OWNER`]: its tape.
 fn recorded() -> Vec<u8> {
     let mut m = script();
     let mut opts = auto(30);
@@ -57,7 +50,6 @@ fn recorded() -> Vec<u8> {
     run.tape.reframed(&run.header.encode())
 }
 
-/// [`recorded`]'s items edited by `edit`, written again under its header.
 fn recorded_edited(edit: impl FnOnce(&mut Vec<Item>)) -> Vec<u8> {
     let read = recover(&recorded());
     let mut items = read.items;
@@ -65,7 +57,6 @@ fn recorded_edited(edit: impl FnOnce(&mut Vec<Item>)) -> Vec<u8> {
     crate::supervise::tape::testing::written(&read.header.expect("a header"), &items)
 }
 
-/// The scrub a lab whose home is [`OWNER`] promotes with.
 fn owner_scrub() -> Scrub {
     let mut s = Scrub::new();
     s.path(std::path::Path::new(OWNER), token::HOME)
@@ -73,17 +64,10 @@ fn owner_scrub() -> Scrub {
     s
 }
 
-/// The tape `bytes` promoted by [`owner_scrub`].
 fn promoted(bytes: &[u8], scrub: &Scrub) -> Result<corpus::Promoted, String> {
     corpus::promote(bytes, scrub, Some(std::path::Path::new(OWNER)))
 }
 
-/// A RECORDED RUN MADE A CORPUS TAPE: the owner's home is the lab's token in
-/// the header and on the screen the Bash box drew, nowhere `/Users/`; the
-/// text holds both approvals and their acts; and the kept text replays as a
-/// corpus replays it — REPRODUCED in acts mode with every act taken, through
-/// `aterm drive replay --check` over its directory (exit 0) — while a
-/// candidate that would not have pressed the Read diverges there (exit 1).
 #[test]
 fn a_recorded_run_is_promoted_scrubbed_and_checks() {
     let bytes = recorded();
@@ -122,11 +106,6 @@ fn a_recorded_run_is_promoted_scrubbed_and_checks() {
     assert!(safe.text.starts_with("DIVERGED "), "{}", safe.text);
 }
 
-/// PROMOTE REFUSES A PLANTED UNSCRUBBED PATH: a tape whose home no scrub
-/// takes is refused by the lint, naming `/Users/` and its line; so is one
-/// whose home is taken but which holds another machine path the scrub was
-/// never told of (planted in a note, which no replay reads) — the lint reads
-/// every item, not only the ones a replay consumes.
 #[test]
 fn promote_refuses_a_planted_unscrubbed_path() {
     let bytes = recorded();
@@ -150,11 +129,6 @@ fn promote_refuses_a_planted_unscrubbed_path() {
     );
 }
 
-/// A SCRUB THAT CHANGES WHAT THE LOOP DOES IS REFUSED: a word taken out of
-/// the box's options (`Yes`) leaves a box with no option the policy
-/// presses, so the scrubbed tape's replay does not press where the
-/// recorded run pressed — the promote's own replay finds it, and nothing is
-/// kept.
 #[test]
 fn promote_refuses_a_scrub_that_changes_what_the_loop_does() {
     let mut scrub = owner_scrub();
@@ -166,9 +140,6 @@ fn promote_refuses_a_scrub_that_changes_what_the_loop_does() {
     );
 }
 
-/// A tape a corpus does not keep: one with no end (its loop cut off), and
-/// one that does not replay as recorded on this build (an act on it
-/// changed) — each refused, naming why.
 #[test]
 fn promote_refuses_a_tape_with_no_end_or_one_that_does_not_replay() {
     let endless = recorded_edited(|items| {

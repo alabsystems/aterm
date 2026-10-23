@@ -12,6 +12,7 @@ impl Terminal {
     /// Compute the visual-to-logical cell permutation for a rendered row.
     #[must_use]
     pub fn bidi_visual_order_cells(&self, cells: &[super::RenderCell]) -> Vec<usize> {
+        // Fast path: with BiDi off or no codepoint at/past the first RTL block
         // (U+0590), skip the per-cell scalar/flag allocations.
         if self.modes.bidi_mode == BiDiMode::Disabled || !cells.iter().any(|c| c.ch >= '\u{0590}') {
             return (0..cells.len()).collect();

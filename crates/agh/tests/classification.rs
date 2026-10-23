@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The answer and wire-failure table (the plan's §4.6.18): each status's kind and sub.
+//! Tests for HTTP status and wire-failure classification.
 
 use agh::classify::{answer, wire};
 use agh::error::{FieldError, Forbid, GithubBody};
@@ -12,7 +12,6 @@ use agh::{Error, Kind, SideEffect, Sub};
 
 use crate::common;
 
-/// A GET's classification.
 fn classify(status: u16, pairs: &[(&str, &str)], body: &str) -> Error {
     answer(
         status,
@@ -24,7 +23,6 @@ fn classify(status: u16, pairs: &[(&str, &str)], body: &str) -> Error {
     .expect("an error")
 }
 
-/// One row of the table: the status, its headers, its body, and the kind and sub.
 type Row = (
     u16,
     Vec<(&'static str, &'static str)>,
@@ -33,7 +31,6 @@ type Row = (
     Sub,
 );
 
-/// The error's kind and sub.
 fn kind_sub(error: &Error) -> (Kind, Sub) {
     (error.kind, error.sub.clone())
 }

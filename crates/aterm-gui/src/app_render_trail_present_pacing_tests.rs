@@ -6,17 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::geom_24x80_for_test as output_streak_geom;
 
-/// The chrome-decoration lane (the typed dog, the reduced-motion sing
-/// still, the companion's wince follow-up) arms a deadline rather than
-/// calling `request_redraw()` from the redraw handler, which winit's Windows
-/// backend turns into an immediate re-invalidation and a free-running loop.
-///
-/// * A level, not a one-shot request: it survives parks
-///   (`an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick`)
-///   but expires, so a decoration that stopped moving stops paying and idle
-///   reaches zero.
-/// * Phase-locked: the re-arm continues from the slot that fired, so the
-///   animation holds the panel cadence instead of sliding by the frame cost.
+/// The chrome-decoration lane arms a bounded, phase-locked level deadline rather than calling `request_redraw()`.
 #[test]
 fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
     let mut app = App::headless_for_test();
@@ -34,9 +24,6 @@ fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
         "a resting decoration holds the lane open for nothing: the loop parks"
     );
 
-    // One animating frame. The hold is `DECO_ANIM_LEVEL_FRAMES` periods of the window's
-    // longest lane (`deco_anim_hold`): it covers arm -> fire -> next redraw even if a park
-    // stretches the lane meanwhile.
     let grace = ws.deco_anim_hold();
     ws.note_deco_animating(t0);
     assert!(ws.deco_anim_frame_active(t0));
@@ -51,8 +38,6 @@ fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
          the loop awake forever — the idle-to-zero law"
     );
 
-    // Monotonic: a stale/earlier sample never shortens a hold a livelier
-    // decoration already extended (two of them can draw on one frame).
     ws.note_deco_animating(t0 + grace);
     ws.note_deco_animating(t0);
     assert!(
@@ -60,10 +45,6 @@ fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
         "the longer hold wins regardless of the order the arms run in"
     );
 
-    // The wake it buys: the same deadline every other effect takes, phase
-    // locked to the fired slot rather than to when this frame finished.
-    // Negative control on the second assert — `presented + interval` (tick 6)
-    // is exactly the completion-relative slide this lane exists to reject.
     let interval = Duration::from_millis(4);
     let base = Instant::now();
     let fired = base + interval;
@@ -78,10 +59,7 @@ fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
     );
 }
 
-/// An event-loop turn that redraws some other window, or none, between the arm and the
-/// fire keeps the armed decoration tick. A park that dropped it
-/// (`park_terminal_effect_scheduler`) would freeze a decoration mid-stride: it has no
-/// focus-gated or blink wake to revive it.
+/// Unrelated event-loop wakes between arm and fire preserve the armed decoration tick until its grace expires.
 #[test]
 fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     let mut app = App::headless_for_test();
@@ -94,9 +72,6 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
         "the fixture must front a terminal, or the arm gate is vacuous"
     );
     let t0 = Instant::now();
-    // `has_glass` stands in for `os_window.is_some()`: a test cannot
-    // fabricate a winit Window, and every arm is vacuous without one.
-    // Baseline: nothing at all is live, so the lane parks and owes no wake.
     assert_eq!(
         ws.plan_terminal_effect_lane(t0, false, true),
         None,
@@ -104,7 +79,6 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     );
     assert_eq!(ws.next_trail_tick, None);
 
-    // A redraw draws a decoration mid-stride. The next park arms its slot.
     ws.note_deco_animating(t0);
     let armed = ws
         .plan_terminal_effect_lane(t0, false, true)
@@ -112,8 +86,6 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     assert!(armed > t0, "the armed slot is strictly in the future");
     assert_eq!(ws.next_trail_tick, Some(armed));
 
-    // Five event-loop turns before the slot is due, none a redraw of this window: nothing
-    // refreshes the latch or consumes the tick.
     let interval = ws.effect_present_interval();
     for step in 1..=5_u32 {
         let woke = t0 + interval / 8 * step;
@@ -130,8 +102,6 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
         assert_eq!(ws.next_trail_tick, Some(armed));
     }
 
-    // Bounded, not a train: with no redraw refreshing the latch, the lane parks within
-    // the grace.
     let grace = ws.deco_anim_hold();
     assert_eq!(
         ws.plan_terminal_effect_lane(t0 + grace, false, true),
@@ -144,9 +114,7 @@ fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
     );
 }
 
-/// Prism Wake's sound episode outlives its visible comet without keeping
-/// the frame train alive: the scheduler takes the engine's analytic Settle
-/// crossing as one exact wake, then parks.
+/// A parked output episode schedules one exact Settle wake and then parks.
 #[test]
 fn a_parked_output_episode_wakes_once_for_settle() {
     let mut app = App::headless_for_test();
@@ -220,9 +188,7 @@ fn a_parked_output_episode_wakes_once_for_settle() {
     );
 }
 
-/// Single-pane and composed Prism Wake engines are retained separately, and
-/// only the route on glass contributes a deadline: a hidden route's comet
-/// is not ticked, so its `now` deadline would loop without draining.
+/// Only the visible route's output-streak engine contributes a scheduler deadline.
 #[test]
 fn a_hidden_output_streak_route_cannot_pin_the_scheduler() {
     fn active_engine(now: Instant, seed: u64) -> crate::output_streak::OutputStreak {
@@ -268,11 +234,7 @@ fn a_hidden_output_streak_route_cannot_pin_the_scheduler() {
     );
 }
 
-/// The frame-cadence arm takes the earlier of an inherited `next_trail_tick` and its own
-/// slot. The one-shot arm can leave a slot seconds out (the reduced-motion cat's
-/// `static_cursor_cat_deadline`), which would outlive `deco_anim_until`, so a later park
-/// would drop it and freeze the lane; clamped, the tick that refreshes the latch is
-/// always due inside it.
+/// A frame-cadence arm clamps an inherited coarse `next_trail_tick` inside its own latch window.
 #[test]
 fn a_decoration_arm_never_inherits_a_slot_that_outlives_its_own_latch() {
     let mut app = App::headless_for_test();
@@ -283,8 +245,6 @@ fn a_decoration_arm_never_inherits_a_slot_that_outlives_its_own_latch() {
     let t0 = Instant::now();
     let interval = ws.effect_present_interval();
 
-    // Stand in for the reduced-motion cat's one-shot erase, armed by the one-shot arm on an
-    // earlier park and still pending when a decoration moves.
     let far = t0 + Duration::from_secs(3);
     ws.next_trail_tick = Some(far);
     ws.note_deco_animating(t0);
@@ -446,13 +406,7 @@ fn every_successful_route_replaces_capture_visuals_instead_of_inheriting_them() 
     );
 }
 
-/// The pool-park latch hears both routes that draw cursor effects: a mixed
-/// native + terminal tab whose focused leaf is a terminal runs the same
-/// effect lane and drawable pool, so a heterogeneous present that waited
-/// [`crate::EFFECT_LANE_ACQUIRE_PARK_NS`] for a drawable leaves the lane at
-/// the halving as a terminal present does. Driven through the shared
-/// success boundary with the wait injected; one nanosecond short of the
-/// threshold is the negative control on each route.
+/// Both effect-drawing present routes feed the drawable-acquire pool-park latch.
 #[test]
 fn both_effect_drawing_routes_feed_the_pool_park_latch() {
     struct ClearInjectedWait;
@@ -545,7 +499,6 @@ fn content_present_rebase_conforms_to_derived_model() {
     let mut next = None;
     let mut anchor = None;
 
-    // Reach the pending state through the model's real Arm transition.
     let initial = state(0, 0, 0, 0);
     assert_eq!(model.init_state(), initial);
     assert_eq!((next, anchor), (None, None));
@@ -655,8 +608,6 @@ fn event_loop_fire_present_rearm_trace_conforms_end_to_end() {
         "the on-time Fire prestate is reachable"
     );
 
-    // `new_events`: transfer the due timer's exact deadline into the
-    // cadence anchor before requesting the redraw.
     assert!(take_due_trail_tick(&mut next, &mut anchor, fired));
     assert_eq!((next, anchor), (None, Some(fired)));
     let after_fire = state(2, 2, 0, 2, 0, 1, 0, 0);
@@ -667,8 +618,6 @@ fn event_loop_fire_present_rearm_trace_conforms_end_to_end() {
         "real event-loop trail fire",
     );
 
-    // The actual present path runs while the timer is disarmed. Its
-    // post-present rebase must preserve the fired anchor.
     let presented = fired + Duration::from_millis(1);
     rebase_pending_trail_tick_after_present(&mut next, &mut anchor, presented);
     assert_eq!((next, anchor), (None, Some(fired)));
@@ -680,9 +629,6 @@ fn event_loop_fire_present_rearm_trace_conforms_end_to_end() {
         "real timer-driven present cost",
     );
 
-    // `about_to_wait`: consume the transferred anchor and arm the next
-    // phase-locked slot. A completion-relative implementation would return
-    // tick 5 here and is rejected by the model.
     let last_fire = anchor.take();
     let deadline = phase_locked_effect_deadline(presented, interval, last_fire, None, true);
     next = Some(deadline);
@@ -707,9 +653,6 @@ fn event_loop_fire_present_rearm_trace_conforms_end_to_end() {
     );
     assert!(!ok, "completion-relative event-loop rearm must be rejected");
 
-    // Late delivery plus an overloaded present is the other real branch.
-    // The due helper retains the original deadline as anchor, while re-arm
-    // starts a fresh full interval once the next phase slot is already past.
     let late_base = Instant::now();
     let late_fired = late_base + interval;
     let delivered = late_base + Duration::from_millis(5);
@@ -767,8 +710,6 @@ fn event_loop_fire_present_rearm_trace_conforms_end_to_end() {
         "overloaded event-loop trail rearm",
     );
 
-    // A catch-up rearm at the already-passed phase slot is the overload
-    // counterpart to the completion-relative slide above.
     let catch_up = state(6, 2, 2, 4, 1, 0, 0, 1);
     let (ok, _) = aterm_spec::verify::validate_transition_tiered(
         &model,

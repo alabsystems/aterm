@@ -856,6 +856,7 @@ fn st_chats(st: &St) -> Option<PathBuf> {
 /// Plan the relaunch from what the record keeps: the shell's dialect, the heal it needs, the `cd` to the project (where the shell's differs), and the line — `gemini <carried flags> --resume <uuid>` ([`ug::rewrite_argv`]; the shell's own `gemini`, never a Cellar path) behind the homes the process ran under ([`ug::line_env`], REQUIRED: a line that cannot hold them is refused).
 pub(super) fn plan(opts: &Opts, st: &St, k: &dyn GeminiKernel) -> Result<Plan, NoPlan> {
     // No shell ([`NO_SHELL`], a tab's own Gemini CLI) is refused for good, as
+    // the other lanes' plans refuse it: nothing would read the line.
     if st.shell == NO_SHELL {
         return Err(NoPlan::Refused {
             why: "not-a-shell-job".to_string(),

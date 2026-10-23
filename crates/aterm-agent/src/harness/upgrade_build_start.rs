@@ -21,7 +21,7 @@ pub const PROBE_GAP_S: u64 = 15 * 60;
 /// newest last: enough to tell a record saved again from a new failure.
 const STOPS_KEPT: usize = 16;
 
-/// What loads the build's program without starting a session (see the module docs).
+/// What loads the build's program without starting a session.
 const PROBE_ARG: &str = "--help";
 
 /// What is known of one build's start: the failures noted against it, the probes run since, and whether a probe can still prove anything of it.

@@ -657,7 +657,8 @@ pub struct CutState {
     pub finished: bool,
 }
 
-/// What the after-cut step did: the published release's shape checked as GitHub serves it, and alab.systems brought to it.
+/// What the after-cut step did: the published release's shape checked as
+/// GitHub serves it, and alab.systems brought to it — or not from here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AfterCut {
     /// The step's line.

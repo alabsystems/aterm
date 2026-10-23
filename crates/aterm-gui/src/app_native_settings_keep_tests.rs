@@ -331,9 +331,6 @@ fn text_save_completion_retires_unchanged_draft_only_on_success() {
     }
 }
 
-/// A held arrow installs once per turn: three ↓ dispatched in one turn
-/// install nothing themselves, and the turn's one sync installs the row the
-/// highlight landed on, never the rows it passed.
 #[test]
 fn a_held_arrow_installs_once_per_frame() {
     let mut app = app();

@@ -239,6 +239,7 @@ fn codex_streaming_12cps() -> Scenario {
     let mut row = ROW;
     let mut prose = PROSE.chars().cycle();
     for tick in 0..ticks {
+        // The host replays the batch before the tick's typed echo is judged,
         // so a band move on a key's tick is pushed first.
         if tick > 0 && tick < phase_b_from && tick.is_multiple_of(line_a) && row + 1 < bottom {
             steps.push(Step {

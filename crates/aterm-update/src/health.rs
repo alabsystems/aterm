@@ -431,6 +431,7 @@ impl Health {
         h.last_apply_failure_target_build = 0;
         if h.total_failures() == 0 || h.kind == "apply" {
             // Some acquisition streak may still stand; let it own the headline
+            // WITH ITS OWN REASON (`kind == ""` means healthy).
             Self::relabel_by_standing(&mut h);
         }
         h.write(path);
@@ -512,6 +513,9 @@ impl Health {
             h.last_apply_failure_build = 0;
             if h.total_failures() == 0 || h.kind == "apply" {
                 // Acquisition failures may still stand; stop describing the ledger
+                // by the apply failure that just resolved — and NAME the one that
+                // is still standing, with its own reason, because `kind == ""`
+                // means healthy.
                 Self::relabel_by_standing(&mut h);
             }
         }

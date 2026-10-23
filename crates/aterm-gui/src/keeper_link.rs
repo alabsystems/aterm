@@ -116,7 +116,7 @@ pub(crate) struct Fingerprint {
 
 #[cfg(unix)]
 impl Fingerprint {
-    pub(crate) fn of(term: &Terminal) -> Self {
+    pub(crate) const fn of(term: &Terminal) -> Self {
         let mut modes = *term.modes();
         modes.synchronized_output = false;
         modes.cursor_visible = true;
@@ -274,9 +274,11 @@ fn quit_link_in(st: &mut State) -> Option<Arc<KeeperLink>> {
 pub(crate) struct Claim {
     rdev: u64,
     owner: Option<u32>,
-    /// The update's parent's (window, session id) this shell.
+    /// The update's parent's (window, session id) this shell was, when its
+    /// registrant adopted it in an update ([`Tag::handed`]).
     handed: Option<(u32, u64)>,
-    /// The pair the crash journal image its registrant took over keys it.
+    /// The pair the crash journal image its registrant took over keys it by,
+    /// when that image was older than its parent's ([`Tag::keyed`]).
     keyed: Option<(u32, u64)>,
     /// What the crash restore brought back for this master (its rung and losses).
     restore: Option<crate::crash_restore::RestoreReport>,
@@ -288,7 +290,7 @@ pub(crate) struct Claim {
 impl Claim {
     /// The obligation for the offered master `rdev`, registered by `owner`.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn new(rdev: u64, owner: Option<u32>) -> Self {
+    pub(crate) const fn new(rdev: u64, owner: Option<u32>) -> Self {
         Self {
             rdev,
             owner,
@@ -311,17 +313,18 @@ impl Claim {
     }
 
     /// The window that registered the master (the tag's `owner`).
-    pub(crate) fn owner(&self) -> Option<u32> {
+    pub(crate) const fn owner(&self) -> Option<u32> {
         self.owner
     }
 
     /// The update's parent's (window, session id) the shell was ([`Tag::handed`]).
-    pub(crate) fn handed(&self) -> Option<(u32, u64)> {
+    pub(crate) const fn handed(&self) -> Option<(u32, u64)> {
         self.handed
     }
 
-    /// The pair the crash journal image its registrant took over keys the shell.
-    pub(crate) fn keyed(&self) -> Option<(u32, u64)> {
+    /// The pair the crash journal image its registrant took over keys the
+    /// shell by ([`Tag::keyed`]).
+    pub(crate) const fn keyed(&self) -> Option<(u32, u64)> {
         self.keyed
     }
 
@@ -332,7 +335,7 @@ impl Claim {
     }
 
     /// What the crash restore brought back for this master, taken.
-    pub(crate) fn take_restore(&mut self) -> Option<crate::crash_restore::RestoreReport> {
+    pub(crate) const fn take_restore(&mut self) -> Option<crate::crash_restore::RestoreReport> {
         self.restore.take()
     }
 
@@ -393,7 +396,8 @@ fn release_unclaimed(rdev: u64) {
     let _ = rdev;
 }
 
-/// Match recovered shells to the panes they filled by putting every id in one namespace keyed.
+/// Match recovered shells to the panes they filled by putting every id in one namespace keyed
+/// by (writer, id).
 pub(crate) fn place_by_owner(
     shells: &mut [crate::spawn::Adopted],
     layout: Option<&mut crate::restore::RestoreManifest>,
@@ -478,7 +482,7 @@ pub(crate) struct RecoveryCountAdmission {
 
 impl RecoveryCountAdmission {
     #[cfg(unix)]
-    pub(crate) fn from_retained(retained: Vec<std::sync::Arc<AtomicBool>>) -> Self {
+    pub(crate) const fn from_retained(retained: Vec<std::sync::Arc<AtomicBool>>) -> Self {
         Self {
             retained,
             ready: AtomicBool::new(false),
@@ -604,7 +608,7 @@ fn marker() -> Option<MarkerRef> {
 }
 
 /// Whether a launch is an update's candidate for its keeper.
-pub(crate) fn is_update_candidate(overlap_admitted: bool, adopted_a_handoff: bool) -> bool {
+pub(crate) const fn is_update_candidate(overlap_admitted: bool, adopted_a_handoff: bool) -> bool {
     overlap_admitted || adopted_a_handoff
 }
 
@@ -612,11 +616,13 @@ pub(crate) fn is_update_candidate(overlap_admitted: bool, adopted_a_handoff: boo
 /// headless one only of a build whose keeper is not the installed app's
 /// ([`boot`]'s App-class rule).
 #[cfg_attr(not(unix), allow(dead_code))]
-fn takes_part(headless: bool, installed_keeper: bool) -> bool {
+const fn takes_part(headless: bool, installed_keeper: bool) -> bool {
     !(headless && installed_keeper)
 }
 
-/// `cfg` is the config this window builds a live session's engine.
+/// `cfg` is the config this window builds a live session's engine with: a recovered
+/// session's crash restore replays into an engine built the same way
+/// (`crash_restore::restore_offered`).
 pub(crate) fn boot(
     enabled: bool,
     candidate: bool,
@@ -1105,6 +1111,7 @@ fn register_unix(session: &crate::Session, prior_claim: bool) -> bool {
     }
     let Some(shell_birth) = session.shell_identity.birth else {
         // Nothing proves the shell is the one on this terminal: a keeper could
+        // never check it, and a recovery would refuse it.
         return false;
     };
     // SAFETY: `session.master` is this live session's open master.

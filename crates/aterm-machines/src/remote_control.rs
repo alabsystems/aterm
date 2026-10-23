@@ -212,19 +212,17 @@ fn verify_spotlight_policy(
 ) -> Result<FunctionRoundTripReport, String> {
     use crate::model::{Mode, Outcome};
 
-    let rows = crate::init::run_initial_spotlight(sys, ctx, Mode::Apply)?;
-    if !rows.iter().all(|row| {
-        matches!(
-            row.outcome,
-            Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
-        )
-    }) {
+    let rows = crate::init::run_initial_spotlight(sys, ctx, Mode::Plan)?;
+    if !rows
+        .iter()
+        .all(|row| matches!(row.outcome, Outcome::Ok | Outcome::NotApplicable))
+    {
         return Err(format!("Spotlight items failed to verify Ok: {rows:?}"));
     }
     Ok(FunctionRoundTripReport {
         function: "Spotlight .noindex Control".into(),
         off_state: "not toggled; existing caches retained".into(),
-        on_state: "Spotlight policy applied and read back where applicable".into(),
+        on_state: "Spotlight policy already satisfied where applicable; no changes applied".into(),
         verified: true,
     })
 }
@@ -245,23 +243,15 @@ pub fn verify_workstation_round_trip(
     if let Some(kb) = ctx.facts.keyboards.first() {
         let mut only_caps = Selection::none();
         only_caps.set(Setting::CapsLock, true);
-        let clear = Cmd::new("/usr/bin/hidutil")
-            .args([
-                "property",
-                "--matching",
-                &format!(
-                    "{{\"ProductID\":{},\"VendorID\":{}}}",
-                    kb.product, kb.vendor
-                ),
-                "--set",
-                "{\"UserKeyMapping\":[]}",
-            ])
-            .as_user(&user)
-            .in_session();
-        let ran = sys.run(&clear).map_err(|e| e.to_string())?;
-        if !ran.success() {
-            return Err(format!("hidutil clear failed: {}", ran.describe()));
-        }
+        crate::init_preferences::clear_attached_caps_lock(
+            sys,
+            &user,
+            crate::items::keyboard::Model {
+                vendor: kb.vendor,
+                product: kb.product,
+            },
+        )
+        .map_err(|e| format!("hidutil clear failed: {e}"))?;
         let drift =
             run_workstation_selected(sys, WorkstationGroup::Preferences, Mode::Plan, only_caps)
                 .map_err(|e| e.to_string())?;
@@ -297,7 +287,7 @@ pub fn verify_workstation_round_trip(
         }
         reports.push(FunctionRoundTripReport {
             function: "CapsLock -> Control".into(),
-            off_state: "UserKeyMapping=[] (Planned drift)".into(),
+            off_state: "Caps Lock mapping absent; other remaps retained (Planned drift)".into(),
             on_state: "0x700000039 -> 0x7000000E0 (Ok)".into(),
             verified: true,
         });
@@ -503,7 +493,7 @@ pub fn verify_workstation_round_trip(
         });
     }
 
-    // 7. Spotlight .noindex build & toolchain policy verified without disrupting concurrent builds.
+    // 7. Read Spotlight policy without migrating caches or changing toolchains.
     reports.push(verify_spotlight_policy(sys, &ctx)?);
 
     // 8. Machine remote control alert-box inspection runs without error or consent popup.
@@ -646,16 +636,26 @@ VendorID ProductID Product  Built-In\n\
 
         let sys = console(501);
         sys.on(&inventory, Ran::ok(keyboard));
+        let get = Cmd::new("/usr/bin/hidutil")
+            .args([
+                "property",
+                "--matching",
+                "{\"PrimaryUsagePage\":1,\"PrimaryUsage\":6,\"VendorID\":1452,\"ProductID\":1}",
+                "--get",
+                "UserKeyMapping",
+            ])
+            .as_user(&user)
+            .display();
+        sys.on(&get, Ran::ok("10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; }, { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n"));
         let clear = Cmd::new("/usr/bin/hidutil")
             .args([
                 "property",
                 "--matching",
-                "{\"ProductID\":1,\"VendorID\":1452}",
+                "{\"PrimaryUsagePage\":1,\"PrimaryUsage\":6,\"VendorID\":1452,\"ProductID\":1}",
                 "--set",
-                "{\"UserKeyMapping\":[]}",
+                "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingDst\":456,\"HIDKeyboardModifierMappingSrc\":123}]}",
             ])
             .as_user(&user)
-            .in_session()
             .display();
         sys.on(&clear, Ran::exit(1, "scripted CapsLock clear refusal"));
         let refused = verify_workstation_round_trip(&sys).unwrap_err();
@@ -689,6 +689,14 @@ VendorID ProductID Product  Built-In\n\
             );
         }
         sys.file(&cached_tool, b"existing cached executable bytes");
+        sys.file("/usr/bin/mdfind", b"");
+        let mdfind =
+            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"*.rmeta\"'";
+        sys.on(mdfind, Ran::ok(""));
+        sys.on(
+            mdfind,
+            Ran::ok("/Users//alice/work/demo/target/debug/libdemo.rmeta\0"),
+        );
         let before = sys.read_file(std::path::Path::new(&cached_tool)).unwrap();
         assert!(verify_spotlight_policy(&sys, &ctx).unwrap().verified);
         assert_eq!(
@@ -696,6 +704,25 @@ VendorID ProductID Product  Built-In\n\
             before
         );
         assert!(sys.stat(std::path::Path::new(tooling)).unwrap().dir);
+
+        let target = "/Users//alice/work/demo/target";
+        sys.create_dir_all(std::path::Path::new(&format!("{target}/debug")), 0o755)
+            .unwrap();
+        let artifact = format!("{target}/debug/libdemo.rmeta");
+        sys.file(&artifact, b"artifact used by a build");
+        assert!(verify_spotlight_policy(&sys, &ctx).is_err());
+        assert_eq!(
+            sys.read_file(std::path::Path::new(&artifact)).unwrap(),
+            b"artifact used by a build"
+        );
+        assert!(sys.stat(std::path::Path::new(target)).unwrap().dir);
+        assert!(
+            sys.stat(std::path::Path::new(&format!("{target}.noindex")))
+                .is_err()
+        );
+        assert!(!sys.calls().iter().any(|call| call.contains("/bin/ln")
+            || call.contains(" set ")
+            || call.contains(" remove ")));
     }
 
     #[test]

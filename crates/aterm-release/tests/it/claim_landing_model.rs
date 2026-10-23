@@ -1,24 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for `ReleaseClaimLanding`, the release claim's writer/reader contract.
+//! Tier-1 conformance for `ReleaseClaimLanding` (`aterm_models_release::release_claim_landing_model`).
 //!
-//! The model (`aterm_models_release::release_claim_landing_model`) states the laws: the release
-//! commit carries only the published commit's code, main keeps every peer commit and ledger
-//! line, build numbers strictly increase, and a claimed-unpublished version reads as a recut,
-//! never fresh, never "cut elsewhere", never claimed again once published. This drives the real
-//! writers (`ledger::reserve`, `ledger::claim` with `changelog::claim_changelogs`) and reader
-//! (`publish::real_cut_version`) against real git (a bare origin, a rival clone for the
-//! environment's pushes, a work clone as the cut tree), projects each observed state onto the
-//! model's variables, and requires the model to admit each named transition on both tiers.
-//!
-//! A hooked `GitRunner` records each push attempt and lands the environment's push at the
-//! first one, which makes a lost race deterministic. Projections are read from git, never
-//! restated; the harness supplies only what git does not hold (its push count, whether the
-//! version is published).
-//!
-//! Negative controls: the recut signal read from the checkout's changelog is replayed and
-//! refused, and a landing built from the release commit's tree is committed and refused.
+//! Drives the real writers (`ledger::reserve`, `ledger::claim`, `changelog::claim_changelogs`)
+//! and reader (`publish::real_cut_version`) against real git and verifies that the model admits
+//! each projected transition and refuses the negative controls.
 
 use crate::{changelog, ledger, publish};
 
@@ -32,8 +19,6 @@ use aterm_spec::interp::State;
 use ledger::testing::Git;
 use ledger::{ClaimPlan, GitRunner, RunOut};
 
-/// The seed line's build, ordinal 1 in the model. Claims run with `now = 0`, so each build is
-/// its predecessor plus one.
 const SEED: u64 = ledger::LEDGER_FLOOR;
 const VERSION: &str = "0.92.0";
 const DATE: &str = "2026-09-23";
@@ -72,8 +57,6 @@ fn identity(repo: &Path) {
 fn ordinal(build: u64) -> i64 {
     i64::try_from(build - SEED + 1).unwrap()
 }
-
-// --- the fixture: a bare origin, a rival clone (peers, other machines), a work clone ---
 
 struct Fixture {
     _root: aterm_tempfile::TempDir,
@@ -119,14 +102,10 @@ impl Fixture {
     }
 }
 
-/// What the environment pushes to main.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Env {
-    /// A peer's code commit.
     Peer,
-    /// Another version's claim: one ledger line.
     Rival,
-    /// Another machine's claim of this version: a ledger line and the section.
     Elsewhere,
 }
 
@@ -140,7 +119,6 @@ impl Env {
     }
 }
 
-/// The rival lands `env` on origin's main. `k` names the peer file.
 fn env_push(rival: &Path, env: Env, k: usize) {
     git(rival, &["fetch", "-q", "origin", "main"]);
     git(rival, &["reset", "-q", "--hard", "origin/main"]);
@@ -175,9 +153,6 @@ fn env_push(rival: &Path, env: Env, k: usize) {
     git(rival, &["push", "-q", "origin", "main"]);
 }
 
-/// A commit, projected: its parents, how many peer commits' code its tree carries, its
-/// ledger's record count and tail ordinal, and whether its changelog carries the version's
-/// section.
 #[derive(Debug, Clone)]
 struct View {
     commit: String,
@@ -188,8 +163,6 @@ struct View {
     section: i64,
 }
 
-/// The objects `specs` name, as one `git cat-file --batch` in `repo` reads them: each one's
-/// header (`<id> <type> <size>`) and bytes.
 fn objects<const N: usize>(repo: &Path, specs: [String; N]) -> [(String, Vec<u8>); N] {
     let input: String = specs.iter().map(|spec| format!("{spec}\n")).collect();
     let out = Git::new(repo)
@@ -216,8 +189,6 @@ fn objects<const N: usize>(repo: &Path, specs: [String; N]) -> [(String, Vec<u8>
     })
 }
 
-/// `rev`'s commit, its two files and its peers' code: one `cat-file --batch` and one
-/// `ls-tree`.
 fn view(repo: &Path, rev: &str) -> View {
     let [(header, commit), (_, ledger_text), (_, changelog_text)] = objects(
         repo,
@@ -251,12 +222,8 @@ fn view(repo: &Path, rev: &str) -> View {
     }
 }
 
-// --- the hooked runner: records each push attempt, lands the environment's at the first ---
-
 enum Event {
-    /// The claimant is about to push this commit to main.
     Attempt(String),
-    /// The environment landed a push first; main as it then stood.
     Env(Env, View),
 }
 
@@ -291,17 +258,12 @@ impl GitRunner for Hooked<'_> {
     }
 }
 
-// --- the harness: the projected state, every transition checked by the model ---
-
 struct Harness {
     fix: Fixture,
     model: Model,
     state: State,
-    /// The published commit — P.
     source: String,
-    /// P's changelog, which the reader is handed as the checkout's.
     source_changelog: String,
-    /// origin/main's tips in push order: `seq` is an index here.
     tips: Vec<String>,
     pushes: usize,
     steps: usize,
@@ -327,7 +289,6 @@ impl Harness {
             pushes: 0,
             steps: 0,
         };
-        // The initial state is the fixture: the seed line only, no peer code, no section.
         let main = view(&harness.fix.origin, "main");
         assert_eq!(
             (main.code, main.lines, main.tail, main.section),
@@ -386,7 +347,6 @@ impl Harness {
         );
     }
 
-    /// The environment step `env` observed as `main`, with its counter moved.
     fn env_state(&self, env: Env, main: &View) -> State {
         let counter = match env {
             Env::Peer => "peers",
@@ -412,7 +372,6 @@ impl Harness {
         self.step(env.action(), next);
     }
 
-    /// The real reader over `main_changelog`, as the transition it makes.
     fn classification(&self, main_changelog: &str) -> (&'static str, State) {
         let published = self.state["published"] == 1;
         match publish::real_cut_version(
@@ -459,20 +418,13 @@ impl Harness {
         action
     }
 
-    /// Negative control: main's section read from the checkout, i.e. the published commit's
-    /// changelog.
     fn replay_the_checkout_reader(&mut self) {
         let (action, next) = self.classification(&self.source_changelog);
         assert_eq!(action, "ClassifyFresh", "the checkout never carries it");
         self.refuses(action, &next);
     }
 
-    /// The real reservation and claim from the cut tree at the published commit, with `during`
-    /// landed on main at the claim's first push, every observed step checked (the reservation
-    /// is the model's `ClaimRead`: it fixes `n`). `bad_landing` also requires the model to
-    /// refuse a landing built from the release commit's tree.
     fn claim(&mut self, during: Option<Env>, bad_landing: bool) -> ledger::Result<ledger::Claim> {
-        // What `gates::place_cut_tree` does before a claim.
         git(
             &self.fix.work,
             &["checkout", "-q", "--detach", &self.source],
@@ -546,8 +498,6 @@ impl Harness {
                 let main = view(&self.fix.origin, "main");
                 assert_eq!(main.commit, claim.landed, "main is the landing");
                 let before = main.parents[0].clone();
-                // The structural laws, read off git: R is the published commit plus the claim
-                // files, and main moved by exactly those files.
                 for (from, to) in [(&self.source, &claim.commit), (&before, &claim.landed)] {
                     let moved = git(&self.fix.work, &["diff", "--name-only", from, to]);
                     for path in moved.lines() {
@@ -575,8 +525,6 @@ impl Harness {
                     ])
                 };
                 let seq = i64::try_from(self.tips.len()).unwrap();
-                // Negative control: main takes the release commit's tree (same parents, R's
-                // tree), committed for real, never pushed.
                 let bad_state = bad_landing.then(|| {
                     let tree = git(
                         &self.fix.work,
@@ -605,8 +553,6 @@ impl Harness {
                 self.step("ClaimLand", next);
             }
             Err(error) if error.to_string().contains("at or past the reserved build") => {
-                // The tail reached the reserved number: nothing is claimed (the built bytes
-                // carry that number, so no other is taken) and the release reserves again.
                 let next = self.with(&[("phase", 1)]);
                 self.step("ClaimStale", next);
             }
@@ -630,10 +576,6 @@ impl Harness {
     }
 }
 
-/// Peers push; a rival claim reaches the fresh claim's reserved number, so the claim refuses
-/// with nothing claimed and the release reserves again and lands by a merge; the cut dies; the
-/// next cut is a recut, which loses a race to a peer, keeps its number and lands; it
-/// publishes; the next cut is refused. Both negative controls run on the way.
 #[test]
 fn the_real_claim_and_reader_refine_the_model_through_a_wedge_and_a_recut() {
     let mut h = Harness::new("wedge");
@@ -663,7 +605,6 @@ fn the_real_claim_and_reader_refine_the_model_through_a_wedge_and_a_recut() {
     assert_eq!(h.state["main_lines"], 4);
 }
 
-/// Main has not moved: main takes the release commit itself.
 #[test]
 fn an_unmoved_main_takes_the_release_commit_as_a_fast_forward() {
     let mut h = Harness::new("fast-forward");
@@ -674,8 +615,6 @@ fn an_unmoved_main_takes_the_release_commit_as_a_fast_forward() {
     assert_eq!(h.classify(), "ClassifyRefuse");
 }
 
-/// Another machine claims this version while ours is in flight: the lost race finds
-/// the section and aborts as cut elsewhere — the one case the abort is for.
 #[test]
 fn another_machines_claim_of_the_version_is_the_cut_elsewhere_abort() {
     let mut h = Harness::new("elsewhere");

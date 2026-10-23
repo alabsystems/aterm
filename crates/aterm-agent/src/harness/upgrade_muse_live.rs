@@ -48,7 +48,6 @@ pub enum Open {
     /// an output `background_running`).
     Task {
         /// Its last word names background work.
-        /// Its last word names background work.
         background: bool,
     },
     /// An inbox item queued with no later drain.

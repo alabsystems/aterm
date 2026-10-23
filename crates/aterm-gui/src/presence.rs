@@ -62,7 +62,7 @@ pub(crate) fn attested_aterms_holder(holder: &str, pid: Option<u32>, own: &str, 
 
 impl Native {
     /// Whether the harness retries this wall on its own clock (an API error, an overload, the API's own 429).
-    pub(crate) fn wall_retries(kind: aterm_phase::WallKind) -> bool {
+    pub(crate) const fn wall_retries(kind: aterm_phase::WallKind) -> bool {
         matches!(
             kind,
             aterm_phase::WallKind::ApiError { .. } | aterm_phase::WallKind::Overloaded
@@ -262,7 +262,7 @@ pub(crate) const API_REQUEST_REFUSED: &str = "request refused";
 pub(crate) const API_OVERLONG: &str = "reply too long";
 
 /// What an API error the network caused is called on the tab, in the menu and in the notification.
-pub(crate) fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static str> {
+pub(crate) const fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static str> {
     match kind {
         aterm_phase::WallKind::ApiError { cause, .. } => match cause {
             aterm_phase::ApiCause::Unreachable => Some(API_UNREACHABLE),
@@ -399,7 +399,7 @@ impl AgentVerdict {
     }
 
     /// The agent the verdict is of (its reader's program), when it is one.
-    pub(crate) fn program(&self) -> Option<aterm_phase::Program> {
+    pub(crate) const fn program(&self) -> Option<aterm_phase::Program> {
         match self {
             Self::Agent { program, .. } => Some(*program),
             Self::NotAgent => None,
@@ -407,7 +407,7 @@ impl AgentVerdict {
     }
 
     /// The reading, when there is one.
-    pub(crate) fn reading(&self) -> Option<&AgentReading> {
+    pub(crate) const fn reading(&self) -> Option<&AgentReading> {
         match self {
             Self::Agent { reading, .. } => Some(reading),
             Self::NotAgent => None,
@@ -483,7 +483,7 @@ pub(crate) fn agent_verdict(
 /// Whether the reader a screen sniff answered ([`aterm_phase::identify`])
 /// names an agent: every program's but the generic reader's, which is the
 /// answer for a screen that names none.
-fn names_agent(program: aterm_phase::Program) -> bool {
+const fn names_agent(program: aterm_phase::Program) -> bool {
     match program {
         aterm_phase::Program::Claude
         | aterm_phase::Program::Codex

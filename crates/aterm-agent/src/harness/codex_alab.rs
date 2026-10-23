@@ -228,6 +228,7 @@ pub(crate) fn kept_flags(
             continue;
         }
         if positional_only || !maybe_option(tok) {
+            // The first positional is the subcommand when it names one, else
             // the prompt (dropped, as is every positional after it).
             if subcommand.is_none() && !positional_only {
                 if SUBCOMMANDS.contains(&tok) {
@@ -311,7 +312,8 @@ pub fn line_env(home: Option<&str>) -> Vec<(&'static str, &str)> {
     home.map(|value| (HOME_ENV, value)).into_iter().collect()
 }
 
-/// Whether `argv` is an interactive Codex TUI's (no subcommand.
+/// Whether `argv` is an interactive Codex TUI's (no subcommand, `resume` or
+/// `fork`), not the daemon, its updater, `exec` or another face of the binary.
 #[must_use]
 pub fn is_tui_argv(argv: &[String]) -> bool {
     let mut i = 1;

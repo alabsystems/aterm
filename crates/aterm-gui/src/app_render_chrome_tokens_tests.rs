@@ -15,20 +15,13 @@ const ACCENT: [u8; 3] = [0xff, 0x00, 0xaa];
 const ACTIVE_TAB: [u8; 3] = [0x12, 0x34, 0x56];
 const BORDER: [u8; 3] = [0x5a, 0x5a, 0x5a];
 
-/// What each surface drew in one App.
 #[derive(Debug)]
 struct Drawn {
-    /// Every strip cell's ground and rule.
     strip: Vec<([u8; 3], Option<[u8; 3]>)>,
-    /// Every cell ground of the composed split frame.
     composed: Vec<[u8; 3]>,
-    /// The seam token the split's divider takes on the terminal background.
     seam: [u8; 3],
-    /// The Settings pages' accent.
     native_accent: [u8; 3],
-    /// The matrix rain's accent.
     rain_accent: u32,
-    /// The drop-target highlight's accent.
     drop_accent: u32,
 }
 
@@ -92,12 +85,6 @@ fn drawn(config: &str) -> Drawn {
     }
 }
 
-/// THE AUTHORED CHROME REACHES EVERY SURFACE: one `aterm.toml` with the chrome
-/// keys, and the strip's selected tab wears `active_tab_color` and, where it
-/// has one, its rule the accent; the split's divider is the authored border (held to its floor, which
-/// `#5a5a5a` on Default already clears); the Settings accent wears the accent's
-/// hue; the rain and the drop highlight wear the accent. NEGATIVE CONTROL: the
-/// same App without the keys draws none of them.
 #[test]
 fn authored_chrome_reaches_every_surface() {
     let hue = |c: [u8; 3]| aterm_messages::palette::oklch(c).2;

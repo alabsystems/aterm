@@ -5336,6 +5336,7 @@ fn a_measure_past_the_ceiling_warns_and_restarts_only_when_the_mac_is_in_trouble
         host.trouble.store(trouble, Ordering::SeqCst);
         let restarts = !answers.is_empty() && trouble;
         if restarts {
+            // The restarted agent is a fresh, small one, so the episode ends (else the spent
             // test host reads as one that restarts no more).
             host.memory_at_restart.store(HEALTHY_MIB, Ordering::SeqCst);
         }
@@ -5482,6 +5483,7 @@ fn trouble_that_comes_while_idle_decides_the_standing_point_again() {
         let stop = match trouble {
             Trouble::WhileWaiting => Stop::reached(
                 |h| {
+                    // The point read (a warning only), and a step waited
                     // past it: the Mac falls into trouble.
                     if h.turn_ends.load(Ordering::SeqCst) >= 1
                         && h.memory_asks.load(Ordering::SeqCst) >= 3
@@ -5688,6 +5690,7 @@ fn a_memory_wall_no_longer_acted_on_hands_the_limit_back() {
                 }
                 let asks = h.memory_asks.load(Ordering::SeqCst);
                 if crossing {
+                    // Decided healthy with the reset seconds off: the memory crosses, is
                     // decided on, and falls back under.
                     if crossed_at == 0 {
                         h.memory_mib.store(RUNAWAY_MIB, Ordering::SeqCst);
@@ -9062,6 +9065,7 @@ fn q_projected_run_as(
             assert!(model.fire(action, &mut st));
             keys.push(key.to_string());
         } else if req.starts_with("await idle 2000 ") && st["mine"] == 1 && st["fresh"] == 1 {
+            // The screen held still 2 s after a read showed the box as
             // keyed: by the model's premise, the key was read by then.
             if st["q1"] >= 2 {
                 assert!(model.fire("KeyRefused", &mut st), "{st:?}");

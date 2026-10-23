@@ -72,6 +72,8 @@ impl TerminalHandler<'_> {
                         self.show_cursor();
                     } else {
                         // Repaint-blink epoch: a DECTCEM hide inside a DEC 2026 update is
+                        // full-redraw choreography (`?2026h ?25l … ?25h ?2026l`); a hide
+                        // without sync is not. Counted on every hide, so re-hides register.
                         if self.modes.synchronized_output {
                             *self.repaint_blink_epoch += 1;
                         }
@@ -122,6 +124,7 @@ impl TerminalHandler<'_> {
                         self.exit_alternate_screen();
                         if dead {
                             // The host's forwarded switch out of a dead app's screen
+                            // is that app's exit: what it left on goes with it.
                             self.release_dead_app_modes();
                         }
                     }
@@ -166,6 +169,7 @@ impl TerminalHandler<'_> {
                 1004 => {
                     if set {
                         // Counted on the off->on edge only, as DEC 2048's report is: a
+                        // program re-sending `?1004h` with every frame arms nothing new.
                         if !self.modes.focus_reporting {
                             self.transient.focus_arms = self.transient.focus_arms.wrapping_add(1);
                         }

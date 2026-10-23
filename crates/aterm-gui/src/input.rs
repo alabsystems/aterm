@@ -144,7 +144,7 @@ pub(crate) enum PasteFraming {
 impl PasteFraming {
     /// The framing for a paste being written now, given the terminal's live DEC 2004 state: the one place the two answers are reconciled.
     #[must_use]
-    pub(crate) fn bracketed(self, live: bool) -> bool {
+    pub(crate) const fn bracketed(self, live: bool) -> bool {
         match self {
             Self::AtDrain => live,
             Self::Gesture { bracketed } => bracketed,
@@ -490,7 +490,7 @@ fn host_wheel_platform() -> WheelPlatform {
 }
 
 #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
-fn host_wheel_platform() -> WheelPlatform {
+const fn host_wheel_platform() -> WheelPlatform {
     WheelPlatform::Mac
 }
 
@@ -510,7 +510,7 @@ pub(crate) enum WheelRoute {
 }
 
 /// Resolve a wheel's [`WheelRoute`] from the facts the seam reads under its term lock.
-pub(crate) fn wheel_route(
+pub(crate) const fn wheel_route(
     shift_held: bool,
     alt_local: bool,
     tracking: bool,
@@ -936,6 +936,15 @@ fn seam_egress_inner(
                 } else if route == WheelRoute::AltScroll
                     && let Some(bytes) = alt_scroll_arrow(*dir, t.keyboard_mode())
                 {
+                    // VERTICAL ONLY — `alt_scroll_arrow`'s `vertical_up()`. REJECTED:
+                    // synthesizing Left/Right arrows for a horizontal flick. DEC 1007's
+                    // whole premise is that the alt screen has no scrollback, so the
+                    // wheel owes the PAGER the motion it would have made; a pager's
+                    // left/right arrows are not a horizontal scroll — in `less` they are
+                    // (by default) unbound-ish/positional, and in a shell's alt-screen
+                    // TUI an ArrowRight is a CURSOR MOVE or a menu entry. xterm does not
+                    // do it either: its alternateScroll only maps the vertical pair. A
+                    // horizontal flick over a non-tracking alt-screen app is therefore
                     // nothing, which is exactly what it was before this widening.
                     if bytes.is_empty() {
                         WheelPlan::Swallow

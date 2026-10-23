@@ -2,16 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Windows actuator for [`crate::Limits`].
-//!
-//! * [`apply_limits`] (the [`crate::Limits::apply`] body) is a no-op: Windows has
-//!   no rlimits and no pre-exec `fork` seam.
-//! * [`apply_to_job`] folds memory, CPU time and the active-process cap into the
-//!   job's extended-limit info and optionally installs UI restrictions. The
-//!   ConPTY seam (`aterm-pty/src/windows/mod.rs`, after
-//!   `AssignProcessToJobObject`) calls it on the still-suspended child's job and
-//!   terminates the child if it fails.
-//!
-//! The cap gate in `lib.rs` runs on both entry points (SEC-2).
 
 use std::ffi::c_void;
 use std::io;
@@ -24,25 +14,13 @@ pub(crate) fn apply_limits(_limits: &Limits) -> io::Result<()> {
     Ok(())
 }
 
-/// `JobObjectExtendedLimitInformation` — the info class carrying the resource
-/// limits (memory / CPU-time) plus the `LimitFlags` bitset.
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
-/// `JOB_OBJECT_LIMIT_PROCESS_TIME`: enforce `PerProcessUserTimeLimit`.
 const JOB_OBJECT_LIMIT_PROCESS_TIME: u32 = 0x0000_0002;
-/// `JOB_OBJECT_LIMIT_PROCESS_MEMORY`: enforce `ProcessMemoryLimit` (per-process
-/// committed-memory ceiling — the closest Windows analog to POSIX `RLIMIT_AS`).
 const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
-/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS`: enforce `ActiveProcessLimit` (max number
-/// of concurrently-active processes in the job — a spawn-storm / fork-bomb cap).
 const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0000_0008;
-/// `100`-nanosecond ticks per second, the unit of `PerProcessUserTimeLimit`.
 const HUNDRED_NS_PER_SEC: i64 = 10_000_000;
 
-/// `JobObjectBasicUIRestrictions` — the info class carrying the UI-restriction
-/// bitset (a separate `SetInformationJobObject` write from the extended limits).
 const JOB_OBJECT_BASIC_UI_RESTRICTIONS_CLASS: i32 = 4;
-// UI restriction flags (winnt.h) a confined shell must not reach through the
-// shared window station.
 const JOB_OBJECT_UILIMIT_READCLIPBOARD: u32 = 0x0000_0002;
 const JOB_OBJECT_UILIMIT_WRITECLIPBOARD: u32 = 0x0000_0004;
 const JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS: u32 = 0x0000_0008;
@@ -50,10 +28,6 @@ const JOB_OBJECT_UILIMIT_DISPLAYSETTINGS: u32 = 0x0000_0010;
 const JOB_OBJECT_UILIMIT_GLOBALATOMS: u32 = 0x0000_0020;
 const JOB_OBJECT_UILIMIT_DESKTOP: u32 = 0x0000_0040;
 const JOB_OBJECT_UILIMIT_EXITWINDOWS: u32 = 0x0000_0080;
-/// The UI restrictions installed for a hardened job: everything except
-/// `JOB_OBJECT_UILIMIT_HANDLES` (which blocks using USER handles created outside
-/// the job and can break a shell that launches GUI helpers — the security value
-/// of the others is higher and their breakage risk lower for a console child).
 const HARDENED_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_READCLIPBOARD
     | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
     | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
@@ -62,34 +36,20 @@ const HARDENED_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_READCLIPBOARD
     | JOB_OBJECT_UILIMIT_DESKTOP
     | JOB_OBJECT_UILIMIT_EXITWINDOWS;
 
-/// Fold the requested resource limits into `job`'s extended-limit info so the
-/// kernel enforces them on every process in the job.
-///
-/// Query-modify-write: `LimitFlags` already on the job (the ConPTY seam's
-/// `KILL_ON_JOB_CLOSE`) are kept; only the flags for set fields are OR-ed in.
-///
-/// Mapping:
-/// * [`Limits::address_space`] → `ProcessMemoryLimit` + `LIMIT_PROCESS_MEMORY`.
-/// * [`Limits::cpu_seconds`] → `PerProcessUserTimeLimit` + `LIMIT_PROCESS_TIME`.
-/// * [`Limits::active_processes`] → `ActiveProcessLimit` + `LIMIT_ACTIVE_PROCESS`.
-/// * [`Limits::restrict_ui`] → a second write of `JobObjectBasicUIRestrictions`
-///   locking the job out of the shared window station (clipboard, desktop,
-///   display / system parameters, global atoms, `ExitWindows`).
-/// * [`Limits::open_files`] / [`Limits::file_size`] have NO Job Object analog and
-///   stay unactuated (a handle-count / file-size cap is not a job limit class).
-///
+/// Fold the requested resource limits into `job`'s extended-limit info so the kernel enforces them
+/// on every process in the job.
 /// # Errors
-/// The first `QueryInformationJobObject` / `SetInformationJobObject` OS error
-/// (e.g. an invalid job handle) — the caller must fail closed.
+/// The first `QueryInformationJobObject` / `SetInformationJobObject` OS error (e.g. an invalid job
+/// handle) — the caller must fail closed.
 pub(crate) fn apply_to_job(limits: &Limits, job: RawHandle) -> io::Result<()> {
-    // SAFETY: a zeroed extended-limit struct is a valid all-fields-clear value;
-    // the query below overwrites it with the job's real state.
+    // SAFETY: a zeroed extended-limit struct is a valid all-fields-clear value; the query below
+    // overwrites it with the job's real state.
     let mut info: JobObjectExtendedLimitInformation = unsafe { std::mem::zeroed() };
     let size = u32::try_from(std::mem::size_of::<JobObjectExtendedLimitInformation>())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "job info size overflow"))?;
     let mut ret_len: u32 = 0;
-    // SAFETY: `job` is only read; `info` is a valid out-buffer of `size` bytes and
-    // `ret_len` a valid out-param.
+    // SAFETY: `job` is only read; `info` is a valid out-buffer of `size` bytes and `ret_len` a
+    // valid out-param.
     let queried = unsafe {
         QueryInformationJobObject(
             job,
@@ -108,8 +68,6 @@ pub(crate) fn apply_to_job(limits: &Limits, job: RawHandle) -> io::Result<()> {
         info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
     }
     if let Some(secs) = limits.cpu_seconds {
-        // PerProcessUserTimeLimit is in 100 ns ticks; saturate rather than wrap on
-        // an absurd (multi-millennia) request so the cap is never silently tiny.
         info.BasicLimitInformation.PerProcessUserTimeLimit = i64::try_from(secs)
             .unwrap_or(i64::MAX)
             .saturating_mul(HUNDRED_NS_PER_SEC);
@@ -120,8 +78,7 @@ pub(crate) fn apply_to_job(limits: &Limits, job: RawHandle) -> io::Result<()> {
         info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
     }
 
-    // SAFETY: `job` is a valid job handle and `info` a fully-initialized struct of
-    // the stated size.
+    // SAFETY: `job` is a valid job handle and `info` a fully-initialized struct of the stated size.
     let set = unsafe {
         SetInformationJobObject(
             job,
@@ -134,17 +91,12 @@ pub(crate) fn apply_to_job(limits: &Limits, job: RawHandle) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    // A separate info class, so a separate write.
     if limits.restrict_ui {
         apply_ui_restrictions(job)?;
     }
     Ok(())
 }
 
-/// Install [`HARDENED_UI_RESTRICTIONS`] on `job` (`JobObjectBasicUIRestrictions`).
-///
-/// # Errors
-/// The `SetInformationJobObject` OS error (e.g. an invalid job handle).
 fn apply_ui_restrictions(job: RawHandle) -> io::Result<()> {
     let restrictions = JobObjectBasicUiRestrictions {
         UIRestrictionsClass: HARDENED_UI_RESTRICTIONS,
@@ -153,8 +105,8 @@ fn apply_ui_restrictions(job: RawHandle) -> io::Result<()> {
         u32::try_from(std::mem::size_of::<JobObjectBasicUiRestrictions>()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "ui-restrictions size overflow")
         })?;
-    // SAFETY: `job` is only read; `restrictions` is a fully-initialized struct of
-    // the stated size, read-only for the call's duration.
+    // SAFETY: `job` is only read; `restrictions` is a fully-initialized struct of the stated size,
+    // read-only for the call's duration.
     let set = unsafe {
         SetInformationJobObject(
             job,
@@ -169,7 +121,6 @@ fn apply_ui_restrictions(job: RawHandle) -> io::Result<()> {
     Ok(())
 }
 
-/// `JOBOBJECT_BASIC_LIMIT_INFORMATION`.
 #[repr(C)]
 #[allow(non_snake_case)]
 struct JobObjectBasicLimitInformation {
@@ -184,7 +135,6 @@ struct JobObjectBasicLimitInformation {
     SchedulingClass: u32,
 }
 
-/// `IO_COUNTERS`.
 #[repr(C)]
 #[allow(non_snake_case)]
 struct IoCounters {
@@ -196,7 +146,6 @@ struct IoCounters {
     OtherTransferCount: u64,
 }
 
-/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`.
 #[repr(C)]
 #[allow(non_snake_case)]
 struct JobObjectExtendedLimitInformation {
@@ -208,15 +157,12 @@ struct JobObjectExtendedLimitInformation {
     PeakJobMemoryUsed: usize,
 }
 
-/// `JOBOBJECT_BASIC_UI_RESTRICTIONS`.
 #[repr(C)]
 #[allow(non_snake_case)]
 struct JobObjectBasicUiRestrictions {
     UIRestrictionsClass: u32,
 }
 
-// Hand-rolled kernel32 binding in the same direct style as
-// `aterm-pty::windows::ffi` (std already links kernel32).
 #[allow(non_snake_case)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -247,7 +193,6 @@ unsafe extern "system" {
 mod tests {
     use super::*;
 
-    /// RAII wrapper so a test job handle is always closed even on assert-unwind.
     struct TestJob(RawHandle);
     impl TestJob {
         fn create() -> Self {
@@ -343,8 +288,6 @@ mod tests {
 
     #[test]
     fn apply_to_job_preserves_preexisting_limit_flags() {
-        // The ConPTY seam sets KILL_ON_JOB_CLOSE (0x2000) before this runs; the
-        // query-modify-write must NOT clear it while adding the memory flag.
         const KILL_ON_JOB_CLOSE: u32 = 0x2000;
         let job = TestJob::create();
         {
@@ -429,7 +372,6 @@ mod tests {
     #[test]
     fn apply_to_job_leaves_ui_unrestricted_by_default() {
         let job = TestJob::create();
-        // inherit() has restrict_ui = false → no UI-restriction write.
         apply_to_job(&Limits::inherit(), job.handle()).expect("apply_to_job should succeed");
         assert_eq!(
             job.query_ui(),
@@ -440,8 +382,6 @@ mod tests {
 
     #[test]
     fn shell_default_hardens_the_job() {
-        // The hardened opt-in must actuate memory, cpu-adjacent caps, the
-        // active-process bound, AND the UI restrictions in one apply.
         let job = TestJob::create();
         apply_to_job(&Limits::shell_default(), job.handle())
             .expect("apply_to_job with shell_default should succeed");
@@ -478,8 +418,6 @@ mod tests {
 
     #[test]
     fn apply_to_job_fails_closed_on_invalid_handle() {
-        // A null "job" is not a valid job object; the query must fail and the
-        // actuator must surface the error (never silently succeed).
         let err = apply_to_job(&Limits::shell_default(), std::ptr::null_mut()).unwrap_err();
         assert_ne!(
             err.kind(),

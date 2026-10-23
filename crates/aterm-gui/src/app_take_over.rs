@@ -493,7 +493,7 @@ fn cli_status_words(status: &Result<Option<i32>, String>) -> String {
 
 impl App {
     /// View ▸ Show Needs in Windows (`[presence] rim`) as applied: off, no window draws its border or its pill.
-    pub(crate) fn presence_rim_on(&self) -> bool {
+    pub(crate) const fn presence_rim_on(&self) -> bool {
         self.presence_rim_on
     }
 
@@ -646,7 +646,7 @@ impl App {
     }
 
     /// Whether the gesture being dispatched is a control client's, so a person-only act refuses it ([`AgentsState::controller_gesture`]).
-    pub(crate) fn person_gesture_refused(&self) -> bool {
+    pub(crate) const fn person_gesture_refused(&self) -> bool {
         self.agents.controller_gesture
     }
 
@@ -1192,6 +1192,7 @@ impl App {
             && outcome.plan.raise
         {
             // A menu bar click never makes aterm the active app: without
+            // the raise the owner, in another app or Space, sees nothing.
             self.raise_window(wid);
         }
     }

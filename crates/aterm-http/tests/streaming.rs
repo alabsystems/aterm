@@ -2,14 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! STREAMED BODIES, PHASES AND DEADLINES over loopback sockets (design §5.2).
-//!
-//! An upload streams from a reader of a stated length, and a download is read
-//! incrementally under the response's framing and the request's limit. A
-//! failure says how far the request got (`Phase`), and a quiet peer is named
-//! by the bound that caught it: the idle cap, the total, or the connect
-//! budget. Each time-based case asserts the error and its text, never the time
-//! taken; the client's own deadline is the 60 s hang detector.
+//! Loopback tests for streamed request/response bodies, phases, and deadlines.
 
 use std::ffi::OsString;
 use std::io::{self, ErrorKind, Read, Write};
@@ -24,13 +17,10 @@ use aterm_http::{
 };
 use aterm_uds::secret::Secret;
 
-/// A wait for something that must happen is a hang detector, never a latency budget.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// One mebibyte.
 const MIB: usize = 1024 * 1024;
 
-/// An environment with no variable set: no proxy, whatever the process has.
 struct NoEnv;
 
 impl EnvSource for NoEnv {
@@ -43,14 +33,12 @@ fn client() -> Client {
     Client::new(Trust::Roots(Vec::new()), ProxyMode::Direct, HANG_DETECTOR)
 }
 
-/// `n` bytes of a pattern no run of zeros could fake.
 fn pattern(n: usize) -> Vec<u8> {
     (0..n)
         .map(|i| u8::try_from(i % 251).unwrap_or_default())
         .collect()
 }
 
-/// Read one request's head, to its blank line.
 fn read_head(stream: &mut TcpStream) -> Vec<u8> {
     let mut seen = Vec::new();
     let mut byte = [0u8; 1];
@@ -63,7 +51,6 @@ fn read_head(stream: &mut TcpStream) -> Vec<u8> {
     seen
 }
 
-/// The `Content-Length` a recorded head declares.
 fn declared(head: &[u8]) -> usize {
     String::from_utf8_lossy(head)
         .lines()
@@ -76,8 +63,6 @@ fn declared(head: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// A listener for one connection, handled by `handle` on its own thread,
-/// whose result comes back on the receiver.
 fn one_connection<T: Send + 'static>(
     handle: impl FnOnce(TcpStream) -> T + Send + 'static,
 ) -> (String, mpsc::Receiver<T>) {
@@ -94,8 +79,6 @@ fn one_connection<T: Send + 'static>(
     (format!("http://127.0.0.1:{port}/s"), rx)
 }
 
-/// A listener that reads the request head and answers with `answer`, then
-/// closes.
 fn answering(answer: Vec<u8>) -> String {
     one_connection(move |mut stream| {
         let _ = read_head(&mut stream);
@@ -104,7 +87,6 @@ fn answering(answer: Vec<u8>) -> String {
     .0
 }
 
-/// GET `endpoint` and read its whole body through the [`aterm_http::BodyReader`].
 fn read_body(endpoint: &str, limit: usize) -> io::Result<Vec<u8>> {
     let exchange = client()
         .request(Method::Get, endpoint)
@@ -116,7 +98,6 @@ fn read_body(endpoint: &str, limit: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The loopback address an [`one_connection`] endpoint names.
 fn loopback_addr(endpoint: &str) -> SocketAddr {
     let port = endpoint
         .trim_start_matches("http://127.0.0.1:")
@@ -185,12 +166,10 @@ fn a_reader_shorter_than_its_length_fails_after_the_head_was_sent() {
     assert_eq!(failed.phase, Phase::Sent);
     let error = io_error(&failed);
     assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
-    // The counts it carries: where the reader ended, and the length promised.
     let text = error.to_string();
     assert!(text.contains(" 4 ") && text.contains(" 10 "), "{text}");
 }
 
-/// A body reader whose own read fails `kind`.
 struct Failing(ErrorKind);
 
 impl Read for Failing {
@@ -201,8 +180,6 @@ impl Read for Failing {
 
 #[test]
 fn a_failing_body_reader_is_never_read_as_the_socket_failing() {
-    // `PermissionDenied` from a socket is a revoked authority; from the
-    // caller's own reader it is a local failure, and must not read as one.
     for kind in [ErrorKind::PermissionDenied, ErrorKind::TimedOut] {
         let (endpoint, _rx) = one_connection(|mut stream| {
             let _ = read_head(&mut stream);
@@ -259,8 +236,6 @@ fn a_mebibyte_answer_reads_incrementally() {
 
 #[test]
 fn a_chunked_mebibyte_in_small_chunks_reads_whole() {
-    // 16,384 chunks of 64 bytes: their framing lines total far more than one
-    // header block's budget, which bounds each line, not the whole body.
     let data = pattern(MIB);
     let mut answer = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
     for chunk in data.chunks(64) {
@@ -362,8 +337,6 @@ fn a_server_that_reads_the_request_and_closes_leaves_it_sent() {
 fn a_server_that_closes_mid_body_had_answered() {
     let endpoint =
         answering(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX-Seen: yes\r\n\r\nshort".to_vec());
-    // The exchange reached Answered: its head parsed, and only the body's
-    // reader meets the cut.
     let exchange = client()
         .request(Method::Get, &endpoint)
         .exchange_with_env(Body::Empty, &NoEnv)
@@ -375,24 +348,15 @@ fn a_server_that_closes_mid_body_had_answered() {
     assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
 }
 
-/// A server that refuses an upload after its head (RFC 9112 §9.5) answers
-/// and closes over the body it never read, so the client's next write fails;
-/// the answer, already received, is what the exchange returns. Unix only:
-/// Windows discards the bytes a socket received once a reset arrives.
 #[cfg(unix)]
 #[test]
 fn an_answer_sent_while_the_body_was_still_going_out_is_read() {
     let (endpoint, _rx) = one_connection(|mut stream| {
         let _ = read_head(&mut stream);
-        // The answer leaves at once, never held back by Nagle for the close's
-        // reset to discard.
         let _ = stream.set_nodelay(true);
         let _ = stream
             .write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 9\r\n\r\ntoo large");
-        // Dropped over the unread body: the client's next write meets the reset.
     });
-    // Far more than the socket buffers hold, so the server's close lands
-    // while the body is still being written.
     let len = 64 * MIB;
     let mut zeros = io::repeat(0).take(u64::try_from(len).unwrap());
     let exchange = client()
@@ -426,8 +390,6 @@ fn a_head_whose_framing_is_refused_had_answered() {
 
 #[test]
 fn an_unrequested_switch_of_protocols_had_answered() {
-    // A 101 is no interim head here (nothing asked to upgrade): its status
-    // line and headers parsed, so it is the final head, and refused at Answered.
     for method in [Method::Get, Method::Head] {
         let endpoint = answering(
             b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n"
@@ -445,7 +407,6 @@ fn an_unrequested_switch_of_protocols_had_answered() {
     }
 }
 
-/// An environment that names one `HTTPS_PROXY` and nothing else.
 struct HttpsProxyEnv(String);
 
 impl EnvSource for HttpsProxyEnv {
@@ -481,9 +442,6 @@ fn a_proxy_that_refuses_the_tunnel_is_a_protocol_error_unsent() {
 
 #[test]
 fn the_request_deadline_takes_over_once_the_connect_budget_has_opened_the_stream() {
-    // The answer comes later than the whole connect budget could last, so it
-    // is read only if the stream left that budget behind when it opened. A
-    // loopback connect takes milliseconds of the budget's 500.
     const CONNECT: Duration = Duration::from_millis(500);
     let (endpoint, _rx) = one_connection(|mut stream| {
         let _ = read_head(&mut stream);
@@ -507,8 +465,6 @@ fn exchange_and_body_reader_are_send() {
 
 #[test]
 fn a_silent_server_hits_the_idle_cap() {
-    // Never accepted: the kernel completes the connect and takes the request
-    // into its buffer, and no byte ever comes back.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let failed = client()
@@ -525,11 +481,6 @@ fn a_silent_server_hits_the_idle_cap() {
 
 #[test]
 fn a_trickling_server_hits_the_total_deadline() {
-    // One byte every 100 ms keeps any idle cap satisfied; only the total ends it.
-    // The status line and the start of one header go once, then the header's
-    // value trickles: however many bytes a stalled read collects, the head is
-    // one valid, unfinished header line (600 bytes, under the line cap), so no
-    // parse error can end the exchange before the deadline does.
     let (endpoint, _rx) = one_connection(|mut stream| {
         let _ = read_head(&mut stream);
         if stream.write_all(b"HTTP/1.1 200 OK\r\nX-Trickle: ").is_err() || stream.flush().is_err() {
@@ -542,8 +493,6 @@ fn a_trickling_server_hits_the_total_deadline() {
             std::thread::sleep(Duration::from_millis(100));
         }
     });
-    // Dialled straight, so no DNS wait shares the 300 ms with the deadline
-    // under test.
     let failed = client()
         .with_connector(Arc::new(Straight(loopback_addr(&endpoint))))
         .request(Method::Get, &endpoint)
@@ -551,10 +500,6 @@ fn a_trickling_server_hits_the_total_deadline() {
         .backstop(Duration::from_millis(300))
         .exchange_with_env(Body::Empty, &NoEnv)
         .expect_err("the trickle outlives the backstop");
-    // No phase is asserted: a stall before the head's first byte would leave
-    // it NotSent under this short a total. Sent is pinned by the cases above.
-    // The data its text carries: the request's own deadline fired, not the
-    // idle cap (whose `no bytes for` agh classifies by) nor the connect budget.
     let error = io_error(&failed);
     assert_eq!(error.kind(), ErrorKind::TimedOut);
     let text = error.to_string();
@@ -565,8 +510,6 @@ fn a_trickling_server_hits_the_total_deadline() {
     );
 }
 
-/// A connector that dials one address and resolves nothing, so no DNS wait
-/// shares the connect budget with the handshake.
 #[derive(Debug)]
 struct Straight(SocketAddr);
 
@@ -578,12 +521,8 @@ impl Connect for Straight {
 
 #[test]
 fn a_tls_handshake_that_never_answers_hits_the_connect_budget_unsent() {
-    // A plain listener that never accepts: the ClientHello lands in the
-    // kernel's buffer and no ServerHello ever comes.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // The suite's own root, so the host's trust store plays no part: no
-    // certificate is ever checked, since the peer never answers.
     let roots = vec![include_bytes!("testdata/loopback-cert.der").to_vec()];
     let failed = Client::new(Trust::Roots(roots), ProxyMode::Direct, HANG_DETECTOR)
         .with_connector(Arc::new(Straight(listener.local_addr().unwrap())))
@@ -592,8 +531,6 @@ fn a_tls_handshake_that_never_answers_hits_the_connect_budget_unsent() {
         .exchange_with_env(Body::Empty, &NoEnv)
         .expect_err("the handshake cannot finish");
     assert_eq!(failed.phase, Phase::NotSent, "{failed:?}");
-    // The data its text carries: the connect budget fired, not the 60 s total
-    // (which would also end NotSent and TimedOut, a minute later).
     let error = io_error(&failed);
     assert_eq!(error.kind(), ErrorKind::TimedOut);
     let text = error.to_string();
@@ -608,7 +545,6 @@ fn a_tls_handshake_that_never_answers_hits_the_connect_budget_unsent() {
 
 #[test]
 fn a_secret_header_is_on_the_wire_and_in_no_error_or_debug() {
-    // Built at run time: no token-shaped literal is in the source.
     let value = format!("Bearer canary-{:x}", 0x00c0_ffee_u32);
     let (endpoint, rx) = one_connection(|mut stream| read_head(&mut stream));
     let client = client();
@@ -619,8 +555,6 @@ fn a_secret_header_is_on_the_wire_and_in_no_error_or_debug() {
     let debug = format!("{builder:?}");
     assert!(!debug.contains(&value), "{debug}");
     assert!(!debug.contains("canary"), "{debug}");
-    // The listener reads the head and closes, so the request fails after the
-    // secret went out: the failure must not carry it either.
     let failed = builder
         .exchange_with_env(Body::Empty, &NoEnv)
         .expect_err("the listener answers nothing");
@@ -640,7 +574,6 @@ fn a_secret_header_is_on_the_wire_and_in_no_error_or_debug() {
 
 #[test]
 fn an_exchange_debug_names_its_headers_without_their_values() {
-    // Built at run time: no token-shaped literal is in the source.
     let signed = format!("canary-{:x}", 0x00c0_ffee_u32);
     let endpoint = answering(
         format!(
@@ -663,9 +596,6 @@ fn an_exchange_debug_names_its_headers_without_their_values() {
 
 #[test]
 fn a_secret_header_with_a_reserved_name_is_refused_before_any_connect() {
-    // A credential under a name the client generates would be dropped from
-    // the head unsent, and a secret Accept would sit beside the default
-    // `Accept: */*`; the builder says so instead, before any connection.
     for name in ["Proxy-Authorization", "Accept"] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();

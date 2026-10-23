@@ -35,7 +35,7 @@ impl CheckerWatchState {
     }
 
     /// A lock-held warning the parent carried across an update is this watchdog's to heal.
-    pub(crate) fn adopt_carried_lock_held(&mut self) {
+    pub(crate) const fn adopt_carried_lock_held(&mut self) {
         if self.lock_held.is_none() {
             self.lock_held = Some(LockHeldSaid {
                 generation: CARRIED_GENERATION,

@@ -198,6 +198,7 @@ impl EventProcessor {
                 if filtered {
                     let xev: &XKeyEvent = unsafe { &xev.key };
                     if self.xmodmap.is_modifier(xev.keycode as u8) {
+                        // Don't grow the buffer past the `MAX_MOD_REPLAY_LEN`. This could happen
                         // when the modifiers are consumed entirely.
                         if self.xfiltered_modifiers.len() == MAX_MOD_REPLAY_LEN {
                             self.xfiltered_modifiers.pop_back();
@@ -662,6 +663,9 @@ impl EventProcessor {
             callback(&self.target, event);
         }
         if path_list.is_empty() {
+            // Nothing to drop (a web link, a trash or network item, a refused request): refuse
+            // the drag now, not at its next position, so the source's cursor says so while the
+            // pointer rests. A source takes an `XdndStatus` at any time (GTK and Qt update the
             // drag's action from it).
             if let Some(source_window) = self.dnd.source_window {
                 unsafe {
@@ -1007,6 +1011,8 @@ impl EventProcessor {
                 self.held_key_press = Some(keycode);
                 is_latest_held
             } else {
+                // Check that the released key is the latest repeatable key that has been
+                // pressed, since repeats will continue for the latest key press if a
                 // different previously pressed key is released.
                 if is_latest_held {
                     self.held_key_press = None;
@@ -1235,6 +1241,8 @@ impl EventProcessor {
         if let Some(all_info) = DeviceInfo::get(&wt.xconn, super::ALL_DEVICES.into()) {
             let mut devices = self.devices.borrow_mut();
             for device_info in all_info.iter() {
+                // The second expression is need for resetting to work correctly on i3, and
+                // presumably some other WMs. On those, `XI_Enter` doesn't include the physical
                 // device ID, so both `sourceid` and `deviceid` are the virtual device.
                 if device_info.deviceid == event.sourceid
                     || device_info.attachment == event.sourceid
@@ -1663,6 +1671,7 @@ impl EventProcessor {
         force: bool,
         callback: &mut F,
     ) {
+        // NOTE: Always update the modifiers to account for case when they've changed
         // and forced was `true`.
         if self.modifiers.replace(modifiers) != modifiers || force {
             let event = Event::WindowEvent {

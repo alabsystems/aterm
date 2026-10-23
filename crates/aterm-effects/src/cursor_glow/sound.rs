@@ -220,6 +220,7 @@ impl CursorGlow {
     /// Drain the sound cues recorded since the last call (the host feeds them to the synth after [`Self::tick`]).
     #[inline]
     pub fn drain_sound_cues(&mut self) -> std::vec::Drain<'_, SoundCue> {
+        // v2 flushes its cues into this backlog inside `tick`; appending its
         // drain here leaves no cue behind on a non-ticking path.
         if self.v2.engaged() {
             self.sound_cues.extend(self.v2.drain_sound_cues());

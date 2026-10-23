@@ -801,8 +801,9 @@ pub const TOOLS: &[Tool] = &[
         When::Always,
         None,
         &[],
-        "the browser lane tests the web modules in Chromium itself; pinned by version and sha256 in \
-         aterm-verify's browser module (row 23)",
+        "the browser lane tests the web modules in Chromium itself, and the wasm smoke, glue and \
+         perf lanes and aterm-verify's glue tests run their drivers in it; pinned by version and \
+         sha256 in aterm-verify's browser module (rows 17, 23)",
     ),
     workspace(
         "firefox",
@@ -853,13 +854,6 @@ pub const TOOLS: &[Tool] = &[
         "the Linux lane's VM (vz backend), for the Linux-only tests and the fish floor (row 25)",
     ),
     unprovided(
-        "node",
-        &[],
-        "S10 moves its dev lanes into the pinned browser, and S17 the site deploy off it (row 17)",
-        "the wasm smoke, glue and perf lanes run modules under node until S10 moves them into the \
-         pinned browser; then only the site deploy's firebase-tools needs it, until S17 (row 17)",
-    ),
-    unprovided(
         "zstd",
         &["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"],
         "only a rostered publish host packs with it, until S17's encoder (row 18)",
@@ -873,6 +867,12 @@ pub const TOOLS: &[Tool] = &[
         "it is the publication engine's own dependency, put where `pub stage` finds it (row 19)",
         "the publication engine's own guard in `pub stage` and `ship check --export`; aterm never \
          runs it (row 19)",
+    ),
+    release_host(
+        "node",
+        &[],
+        "`ship site`'s firebase-tools runs on it until S17's REST deploy; no check runs it, every \
+         wasm driver runs in the pinned chrome-headless-shell (row 17)",
     ),
     release_host(
         "firebase",

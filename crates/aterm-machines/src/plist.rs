@@ -1,28 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The XML property-list subset `defaults export` writes and `defaults write` reads back
-//! as a value: `dict`, `array`, `string`, `integer`, `real`, `true`/`false`, `data` and
-//! `date`.
-//!
-//! The reader takes what `defaults export <domain> -` prints on macOS 27 (measured in the
-//! 27.0 VM, fixtures under `fixtures/prefs/`): the XML header and DOCTYPE, tab indents,
-//! `<data>` as base64 broken across indented lines, the five named XML entities and
-//! numeric ones, CDATA, comments, and the empty forms `<dict/>`, `<array/>`, `<string/>`.
-//! A missing domain exports as an empty `<dict/>` and exits 0.
-//!
-//! The writers produce the same text back. [`document`] matches `defaults export` byte
-//! for byte (a real is `%.17g`, a `<data>` line is `76 - 8 × indent` characters, as
-//! CoreFoundation writes them); [`fragment`] is the one-line form `defaults write
-//! <domain> <key> '<fragment>'` takes. The 27.0 VM accepted a fragment of every type this
-//! way and read each back with the type it was written as. A `<real>` fragment keeps all
-//! 64 bits, which `defaults write … -float` does not: that flag stores a 32-bit float
-//! (`-float 0.1` reads back `0.10000000149011612`).
+//! Reader and writer for the XML property-list subset used by `defaults export` and `defaults write`
+//! (`dict`, `array`, `string`, `integer`, `real`, `true`/`false`, `data`, and `date`).
+//! [`document`] formats full plists matching `defaults export`, and [`fragment`] formats compact
+//! single-line values for `defaults write`.
 
 use crate::model::PValue;
 
-/// How deep containers may nest before the reader gives up (a guard against a hostile
-/// or broken document, far beyond anything `defaults` writes).
+/// Maximum container nesting depth accepted by the parser.
 const MAX_DEPTH: usize = 256;
 
 /// The header `defaults export` writes before the root value.
@@ -37,18 +23,11 @@ pub fn parse(xml: &[u8]) -> Result<PValue, String> {
     Parser::new(xml, false).document(|p, tag| p.value_from(tag, 0))
 }
 
-/// One domain's keys as [`parse_domain`] read them: each with its value, or why that one
-/// value cannot be held.
+/// Domain keys and values parsed by [`parse_domain`].
 pub type Entries = Vec<(String, Result<PValue, String>)>;
 
-/// Parse what `defaults export <domain> -` prints, whose root must be a dictionary, key by
-/// key.
-///
-/// A value [`PValue`] cannot hold makes only its own key an `Err`, so the domain's other
-/// keys still read: CoreFoundation keeps integers past the 64-bit signed range
-/// (`com.apple.ncprefs` holds `9223372036854775815` and `com.apple.siri.shortcuts`
-/// `13713454596331600536` on a 27.0.1 Mac). A document that is not a plist fails as a
-/// whole, as [`parse`] does.
+/// Parse `defaults export <domain> -` output (whose root must be a dictionary) key by key,
+/// recording out-of-range integers as per-key `Err` entries.
 ///
 /// # Errors
 /// One line saying where the document stops being a plist, or that its root is not a
@@ -57,8 +36,7 @@ pub fn parse_domain(xml: &[u8]) -> Result<Entries, String> {
     Parser::new(xml, true).document(Parser::domain)
 }
 
-/// `value` as an XML fragment with no header (`<dict>…</dict>`), the form `defaults
-/// write <domain> <key> '<fragment>'` accepts. One line: no indents, `<data>` unbroken.
+/// Format `value` as a single-line XML fragment without a header (`<dict>…</dict>`).
 #[must_use]
 pub fn fragment(value: &PValue) -> String {
     let mut out = String::new();
@@ -75,8 +53,7 @@ pub fn document(value: &PValue) -> String {
     out
 }
 
-/// `r` as CoreFoundation writes a `<real>`: `%.17g`, so the text reads back to the same
-/// 64 bits, with `nan`, `+infinity` and `-infinity` for the values that have no digits.
+/// Format `r` as CoreFoundation writes `<real>` (`%.17g`, `nan`, `+infinity`, `-infinity`).
 #[must_use]
 pub fn real_text(r: f64) -> String {
     if r.is_nan() {
@@ -85,8 +62,6 @@ pub fn real_text(r: f64) -> String {
     if r.is_infinite() {
         return if r > 0.0 { "+infinity" } else { "-infinity" }.into();
     }
-    // `%.17g`: the exponent after rounding to 17 significant digits picks fixed or
-    // scientific notation; trailing zeros (and a bare point) go.
     let sci = format!("{r:.16e}");
     let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
     let exp: i32 = exp.parse().unwrap_or(0);
@@ -111,8 +86,7 @@ fn strip_fraction_zeros(text: &str) -> String {
     }
 }
 
-/// `text` with the three characters XML text may not hold bare escaped, as
-/// CoreFoundation escapes them (quotes stay bare).
+/// Append `text` with `&`, `<`, and `>` escaped.
 fn push_escaped(out: &mut String, text: &str) {
     for c in text.chars() {
         match c {
@@ -125,8 +99,6 @@ fn push_escaped(out: &mut String, text: &str) {
 }
 
 fn base64(bytes: &[u8]) -> String {
-    // A preference value never nears the codec's 64 MiB guard; past it, empty text is
-    // what an encoder that refused would leave, and the read-back would catch it.
     aterm_codec::base64::encode(bytes).unwrap_or_default()
 }
 
@@ -207,7 +179,6 @@ fn write_pretty(out: &mut String, value: &PValue, depth: usize) {
     match value {
         PValue::Data(bytes) => {
             out.push_str("<data>\n");
-            // CoreFoundation's line: 76 characters, less 8 for each indent (capped at 8).
             let width = 76 - 8 * depth.min(8);
             let text = base64(bytes);
             for line in text.as_bytes().chunks(width) {
@@ -268,8 +239,7 @@ impl std::fmt::Display for Tag {
 struct Parser<'a> {
     s: &'a [u8],
     pos: usize,
-    /// Read a value [`PValue`] cannot hold as a placeholder and say why in `unheld`,
-    /// rather than fail the document ([`parse_domain`]).
+    /// Record out-of-range values in `unheld` instead of failing the document.
     lenient: bool,
     /// Why the value being read cannot be held, once a part of it could not.
     unheld: Option<String>,
@@ -285,8 +255,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The document around its root value: the XML declaration, DOCTYPE and comments, an
-    /// optional `<plist>` wrapper, and nothing after. `root` reads the root from its tag.
+    /// Parse the XML prolog and optional `<plist>` wrapper around `root`.
     fn document<T>(
         &mut self,
         root: impl FnOnce(&mut Self, Tag) -> Result<T, String>,
@@ -410,7 +379,6 @@ impl<'a> Parser<'a> {
         if name.is_empty() {
             return Err(self.err("a tag with no name"));
         }
-        // Attributes (`version="1.0"`) are skipped, quotes and all.
         let mut quote: Option<u8> = None;
         loop {
             let Some(&b) = self.s.get(self.pos) else {
@@ -609,8 +577,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Add `key` to a dictionary's entries; a repeated key keeps its last value, as
-/// CoreFoundation's reader does.
+/// Insert or replace `key` in `entries`.
 fn upsert<V>(entries: &mut Vec<(String, V)>, key: String, value: V) {
     if let Some(slot) = entries.iter_mut().find(|(k, _)| *k == key) {
         slot.1 = value;
@@ -619,8 +586,7 @@ fn upsert<V>(entries: &mut Vec<(String, V)>, key: String, value: V) {
     }
 }
 
-/// Whether `text` is spelled as a plist `<integer>` (decimal with an optional sign, or
-/// `0x` hex), whatever its size.
+/// Whether `text` has valid plist `<integer>` syntax (signed decimal or `0x` hex).
 fn integer_syntax(text: &str) -> bool {
     let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
     match digits
@@ -632,8 +598,7 @@ fn integer_syntax(text: &str) -> bool {
     }
 }
 
-/// A plist `<integer>`: decimal with an optional sign, or `0x` hex as CoreFoundation also
-/// reads. `None` past the 64-bit signed range.
+/// Parse a signed decimal or `0x` hex plist `<integer>` within `i64`.
 fn parse_integer(text: &str) -> Option<i64> {
     // from_str_radix accepts its own sign; only the one outer sign belongs here.
     if !integer_syntax(text) {
@@ -662,8 +627,7 @@ fn parse_integer(text: &str) -> Option<i64> {
     i64::try_from(signed).ok()
 }
 
-/// A plist `<real>`, including the spellings CoreFoundation writes for the values with no
-/// digits.
+/// Parse a plist `<real>`, including `nan` and signed `inf`/`infinity`.
 fn parse_real(text: &str) -> Option<f64> {
     match text.to_ascii_lowercase().as_str() {
         "nan" => Some(f64::NAN),
@@ -677,19 +641,14 @@ fn parse_real(text: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
-    /// `defaults -currentHost export -g -` for the admin user of the macOS 27.0 VM
-    /// (26A428): a ByHost Caps Lock mapping, `<data>` across tab-indented lines, a
-    /// `<date>`, booleans and integers.
+    /// Fixture from `defaults -currentHost export -g -` on macOS 27.0.
     const VM_CURRENT_HOST_GLOBAL: &[u8] =
         include_bytes!("../fixtures/prefs/vm-27.0-currenthost-global.plist");
 
-    /// `defaults export` of a scratch domain in the 27.0 VM after `defaults write` of a
-    /// fragment of every type: nested containers, empty forms, entities, a negative
-    /// integer and reals.
+    /// Fixture from `defaults export` covering every plist value type.
     const VM_EVERY_TYPE: &[u8] = include_bytes!("../fixtures/prefs/vm-27.0-every-type.plist");
 
-    /// What `defaults export` printed in the 27.0 VM for a domain that does not exist
-    /// (exit 0).
+    /// Output of `defaults export` for a missing domain.
     const VM_MISSING_DOMAIN: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict/>\n</plist>\n";
 
     fn get<'a>(dict: &'a PValue, key: &str) -> &'a PValue {
@@ -778,7 +737,6 @@ mod tests {
         assert_eq!(get(&root, "emptystr"), &PValue::Str(String::new()));
         assert_eq!(get(&root, "emptyarr"), &PValue::Array(Vec::new()));
         assert_eq!(get(&root, "emptydict"), &PValue::Dict(Vec::new()));
-        // Written as `&amp; &lt;c&gt; &quot;q&quot; &apos;s&apos; &#233; &#x263A;`.
         assert_eq!(
             get(&root, "str"),
             &PValue::Str("a & b <c> \"q\" 's' \u{e9} \u{263a}".into())
@@ -850,7 +808,6 @@ mod tests {
 
     #[test]
     fn reals_are_written_as_corefoundation_writes_them() {
-        // Each pair is a `<real>` fragment the VM was given and what its export printed.
         assert_eq!(real_text(0.1), "0.10000000000000001");
         assert_eq!(real_text(1e-7), "9.9999999999999995e-08");
         assert_eq!(real_text(30_064_771_129.5), "30064771129.5");
@@ -924,8 +881,6 @@ mod tests {
 
     #[test]
     fn an_integer_past_the_signed_range_fails_only_its_own_key_of_a_domain() {
-        // As `com.apple.ncprefs` holds it on a 27.0.1 Mac: an unsigned 64-bit value,
-        // here nested inside the entry it belongs to.
         let text = "<plist version=\"1.0\"><dict><key>apps</key><array><dict><key>flags</key><integer>9223372036854775815</integer></dict></array><key>k</key><true/><key>big</key><integer>13713454596331600536</integer></dict></plist>";
         let entries = parse_domain(text.as_bytes()).unwrap();
         let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
@@ -935,7 +890,6 @@ mod tests {
             let why = value.clone().unwrap_err();
             assert!(why.contains("past the 64-bit signed range"), "{key}: {why}");
         }
-        // Whole-document parsing still refuses it, and a malformed integer fails a domain.
         assert!(
             parse(text.as_bytes())
                 .unwrap_err()

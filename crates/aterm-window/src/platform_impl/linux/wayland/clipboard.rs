@@ -471,6 +471,7 @@ impl WinitState {
                     warn!("wayland clipboard: the compositor binds no device for {selection:?} — copy refused");
                 },
                 CopyRefusal::Unfocused => {
+                    // A compositor hands a selection only to the client its keyboard
                     // is on, and we hold no source for this one to keep instead.
                     warn!("wayland clipboard: no keyboard focus and no {selection:?} of ours — copy refused");
                 },
@@ -495,6 +496,7 @@ impl WinitState {
         selection: WaylandSelection,
         reply: mpsc::Sender<Option<String>>,
     ) {
+        // Own it? Answer at once (the handle already tried this slot, but the
         // ownership may have arrived since).
         if let Ok(mut shared) = self.clipboard.shared.lock() {
             if let Some(text) = shared.slot(selection).clone() {

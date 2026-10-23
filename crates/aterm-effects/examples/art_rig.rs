@@ -1289,6 +1289,7 @@ mod pet {
             };
             if !p.front {
                 // yawed, the near ear rotates OUT with the turning skull and
+                // the far ear trails behind the crown
                 base_a += (if near { 4.0 } else { -6.0 }) * p.yaw;
             }
             let sweep = if near { p.ear_near } else { p.ear_far };
@@ -1419,6 +1420,8 @@ mod pet {
             let mut specs = vec![(shoulder(p, !near), if near { p.fl_near } else { p.fl_far })];
             if near && p.front {
                 // face-on both forelegs stand IN FRONT of the chest, side by
+                // side: the far pass would bury one behind the torso, so it
+                // joins the near pass (off-side first, equal width)
                 specs.insert(0, (shoulder(p, true), p.fl_far));
             }
             if !p.hide_hind {
@@ -2034,6 +2037,7 @@ mod pet {
             .concat();
             if let Some([bx, by, brx, bry]) = p.belly {
                 // LAST in the coat list, and coat-only: it fills a counter the
+                // limbs already enclose, so an outline would draw a seam.
                 coat.push(ellipse(bx, by, brx, bry, 0.0));
             }
             let layers: Vec<Layer> = vec![

@@ -22,13 +22,11 @@ pub(super) fn canonical_text(root: &Path) -> String {
     include_str!("../tests/fixtures/canonical.toml").replace("{root}", &root)
 }
 
-/// The canonical config, parsed and validated over `root`.
 fn canonical(root: &Path) -> Validated {
     let parsed = config::parse(&canonical_text(root)).expect("the canonical config parses");
     config::validate(&parsed, root, &config::file_id).expect("the canonical config validates")
 }
 
-/// A scratch root, absolute on every platform.
 fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix("agh-policy-")
@@ -36,7 +34,6 @@ fn scratch() -> aterm_tempfile::TempDir {
         .expect("a scratch directory")
 }
 
-/// Every profile Present.
 fn present(_: &str) -> Presence {
     Presence::Present
 }
@@ -49,7 +46,6 @@ fn literal(text: &str) -> Named {
     Named::Literal(ExplicitTarget::from_argv(OsStr::new(text)).expect("a literal"))
 }
 
-/// The refusal's code, or `None` for any other decision.
 fn code(decision: &Decision) -> Option<RefusalCode> {
     match decision {
         Decision::Refuse(refusal) => Some(refusal.code),
@@ -57,8 +53,6 @@ fn code(decision: &Decision) -> Option<RefusalCode> {
     }
 }
 
-/// The canonical config with the `alabsystems` row moved to tier dev and a dev writer: a
-/// row L2 refuses in any file.
 fn forged_floor(root: &Path) -> Router {
     let mut validated = canonical(root);
     validated.owners.insert(

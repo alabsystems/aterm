@@ -174,7 +174,7 @@ impl ExecEdges {
     }
 
     /// The image the batch's kernel edge was read with, once.
-    pub(crate) fn take_image(&mut self) -> Option<Arc<HolderImage>> {
+    pub(crate) const fn take_image(&mut self) -> Option<Arc<HolderImage>> {
         self.image.take()
     }
 
@@ -224,7 +224,7 @@ struct FgOnce<F> {
 }
 
 impl<F: FnMut() -> i32> FgOnce<F> {
-    fn new(probe: F) -> Self {
+    const fn new(probe: F) -> Self {
         Self { probe, read: None }
     }
 

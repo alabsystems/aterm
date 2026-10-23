@@ -23,7 +23,7 @@ pub(crate) enum UpdateInstallability {
 
 impl UpdateInstallability {
     #[must_use]
-    pub(crate) fn observed(installable: bool) -> Self {
+    pub(crate) const fn observed(installable: bool) -> Self {
         if installable {
             Self::Installable
         } else {
@@ -326,7 +326,7 @@ pub(crate) enum ApplyMode {
 impl ApplyMode {
     /// Whether this attempt came from background policy rather than a person.
     #[must_use]
-    pub(crate) fn is_automatic(self) -> bool {
+    pub(crate) const fn is_automatic(self) -> bool {
         matches!(self, Self::Automatic | Self::AutomaticPastGrace)
     }
 }
@@ -423,7 +423,7 @@ impl ApplyAttemptTicket {
 
     /// Expected compiled build the child must report before parent commit.
     #[must_use]
-    pub(crate) fn target_build(&self) -> u64 {
+    pub(crate) const fn target_build(&self) -> u64 {
         self.artifact_build
     }
 
@@ -690,7 +690,7 @@ impl NativeUpdaterService {
     }
 
     #[must_use]
-    pub(crate) fn snapshot(&self) -> &UpdaterSnapshot {
+    pub(crate) const fn snapshot(&self) -> &UpdaterSnapshot {
         &self.snapshot
     }
 
@@ -1417,7 +1417,7 @@ impl NativeUpdaterService {
         }
     }
 
-    fn publish(&mut self) {
+    const fn publish(&mut self) {
         self.snapshot.revision = self.snapshot.revision.saturating_add(1);
     }
 }

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Drives a real runtime-declared class: registers it, messages it through `objc_msgSend` (not
-//! through Rust), and checks the runtime's own view of what was built. The risk is what `libobjc`
-//! does with the bytes, not whether the macro expands.
+//! Runtime registration, `objc_msgSend` dispatch, and reflection tests for declared classes.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -21,10 +19,7 @@ use aterm_objc::{
     msg, msg_super, sel,
 };
 
-/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes, minted
-/// unchecked: libtest runs every test on a worker (even under `--test-threads=1`), where
-/// `MainThread::new()` answers `None`. Every class here touches no AppKit state and is
-/// instantiated and released on one worker, so its `Ivars` drop on the thread that made them.
+/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes, minted unchecked.
 fn mtm() -> aterm_objc::MainThread {
     // SAFETY: see the doc comment above.
     unsafe { aterm_objc::MainThread::new_unchecked() }
@@ -43,9 +38,7 @@ impl Drop for Ivars {
 }
 
 declare_class! {
-    /// A test class with every shape the real sites use: an ivar with a destructor, a void
-    /// method, an integer argument, a `BOOL` return, a struct-by-value argument, and a
-    /// `[super …]` send.
+    /// A test class with every shape the real sites use.
     struct Probe: NSObject {
         const NAME: &str = "ATermObjcProbe";
         type Ivars = Ivars;
@@ -78,25 +71,21 @@ declare_class! {
             a + b
         }
 
-        /// Three float arguments, so a wrong argument shift shows up as a wrong number rather
-        /// than as a crash.
+        /// Three float arguments.
         @sel(blendRed:green:blue:)
         fn blend_three(&self, r: f64, g: f64, b: f64) -> f64 {
             r * 100.0 + g * 10.0 + b
         }
 
         /// The signature of `aterm-gui/src/toolbar.rs`'s
-        /// `-(BOOL)control:textView:doCommandBySelector:` override: three arguments of three
-        /// encodings and a `BOOL` return.
+        /// `-(BOOL)control:textView:doCommandBySelector:` override.
         @sel(control:textView:doCommandBySelector:)
         fn control_text_view(&self, _control: Id, _view: Id, command: Sel) -> Bool {
             Bool::new(command == sel!(insertNewline:))
         }
 
-        /// The signature of `aterm-gui/src/toolbar.rs`'s
-        /// `-(NSToolbarItem *)toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:`. It
-        /// returns a new object and owes its caller +0, hence `autorelease`: `into_raw` would
-        /// leak, and a pointer to something about to drop would dangle.
+        /// The signature of `aterm-gui/src/toolbar.rs`'s `-(NSToolbarItem
+        /// *)toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:`.
         @sel(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:)
         fn toolbar_item(&self, _toolbar: Id, _identifier: Id, inserted: Bool) -> Id {
             let ivars = self.ivars();
@@ -110,8 +99,7 @@ declare_class! {
             }
         }
 
-        /// A 32-byte struct return: `objc_msgSend_stret` on the x86_64 compat slice, a
-        /// four-double HFA in `d0`–`d3` through plain `objc_msgSend` on arm64.
+        /// A 32-byte struct return.
         @sel(bigRect)
         fn big_rect(&self) -> CGRect {
             CGRect {
@@ -128,9 +116,7 @@ declare_class! {
             r.size.width * r.size.height
         }
 
-        /// Overrides `-hash`, XOR-ing the superclass's answer. A super send that resolved to
-        /// this method would recurse until the stack died, so a returned value proves
-        /// `objc_msgSendSuper` started lookup above this class.
+        /// Overrides `-hash`, XOR-ing the superclass's answer.
         @sel(hash)
         fn hash_override(&self) -> usize {
             self.super_hash() ^ 0xABCD
@@ -139,9 +125,7 @@ declare_class! {
         @sel(superHash)
         fn super_hash(&self) -> usize {
             let sup = self.super_receiver();
-            // SAFETY: `-hash` is `-(NSUInteger)hash`, exactly the prototype
-            // below, and `sup` names this class's superclass as the place to
-            // start lookup.
+            // SAFETY: `-hash` is `-(NSUInteger)hash`.
             unsafe {
                 let f: unsafe extern "C-unwind" fn(*const ObjcSuper, Sel) -> usize = msg_super();
                 f(&raw const sup, sel!(hash))
@@ -165,8 +149,7 @@ fn probe(drops: &Arc<AtomicUsize>) -> aterm_objc::Retained<Probe> {
 fn messages_reach_the_rust_bodies_through_objc_msg_send() {
     let drops = Arc::new(AtomicUsize::new(0));
     let obj = probe(&drops);
-    // SAFETY: every prototype below is the exact C signature of the selector
-    // declared above, and `obj` is a live instance of the class that declares it.
+    // SAFETY: every prototype below is the exact C signature of the selector declared above.
     unsafe {
         let void0: unsafe extern "C-unwind" fn(Id, Sel) = msg();
         let void_i64: unsafe extern "C-unwind" fn(Id, Sel, i64) = msg();
@@ -204,7 +187,6 @@ fn the_super_send_starts_above_this_class() {
         let supers = hash(obj.as_id(), sel!(superHash));
         assert_ne!(supers, 0, "NSObject's -hash returned 0");
         assert_eq!(ours, supers ^ 0xABCD);
-        // NSObject's -hash is the instance pointer.
         assert_eq!(supers, obj.as_id().addr());
     }
 }
@@ -212,9 +194,7 @@ fn the_super_send_starts_above_this_class() {
 #[test]
 fn the_type_encodings_are_what_the_runtime_reports() {
     let cls = Probe::class();
-    // SAFETY: `class_getInstanceMethod` + `method_getTypeEncoding` are plain
-    // runtime queries on a registered class; the returned string is owned by
-    // the runtime and outlives the read.
+    // SAFETY: runtime method/encoding queries on a registered class.
     let encoding = |name: &'static CStr| -> String {
         unsafe extern "C" {
             fn class_getInstanceMethod(cls: ClassPtr, sel: Sel) -> *const std::ffi::c_void;
@@ -284,10 +264,6 @@ fn an_extra_retain_defers_the_drop() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
-/// `MainThread::new()` is a real query: it refuses a libtest worker and a thread this test
-/// spawns, so the witness is no rubber stamp. Instantiating without a witness does not compile
-/// (the `compile_fail` doctest on `declare_class!`); the affirmative half needs the process main
-/// thread, which libtest never gives, and `crates/aterm-gui/examples/objc_event_drive.rs` runs it.
 #[test]
 fn the_main_thread_witness_refuses_a_worker_and_a_spawned_thread() {
     assert!(
@@ -301,22 +277,15 @@ fn the_main_thread_witness_refuses_a_worker_and_a_spawned_thread() {
         .expect("the probe thread does not panic");
     assert!(on_spawned, "a spawned thread is never the main thread");
 
-    // Registration is not gated, only instantiation is, so an encoding test can read a method
-    // table off a worker.
     assert!(!Probe::class().is_null());
 }
 
-/// [`class_methods`](aterm_objc::class_methods) reports every registered row without being told
-/// what to look for (`crates/aterm-gui/examples/objc_live_class_audit.rs` is built on it): the
-/// class's own methods with their registered encodings, complete for this file's `declare_class!`
-/// site, agreeing row by row with [`method_types`](aterm_objc::method_types).
 #[test]
 fn the_whole_registered_table_comes_back_with_its_encodings() {
     let cls = Probe::class();
     // SAFETY: `Probe::class()` is a live, registered class object.
     let rows = unsafe { aterm_objc::class_methods(cls) };
 
-    // 1. Every row agrees with the one-at-a-time accessor.
     for (selector, encoding) in &rows {
         // SAFETY: `cls` is live and `selector` came out of its own table.
         let one_at_a_time = unsafe { aterm_objc::method_types(cls, *selector) };
@@ -328,7 +297,6 @@ fn the_whole_registered_table_comes_back_with_its_encodings() {
         );
     }
 
-    // 2. The table is complete for the declared site.
     let names: Vec<String> = rows
         .iter()
         .map(|(s, _)| s.name().to_string_lossy().into_owned())
@@ -354,8 +322,6 @@ fn the_whole_registered_table_comes_back_with_its_encodings() {
         );
     }
 
-    // 3. An encoding read out of the table is the real one: `-isPositive:` returns `BOOL`,
-    //    whose letter differs between arm64 and the x86_64 compat slice.
     let is_positive = rows
         .iter()
         .find(|(s, _)| s.name() == c"isPositive:")
@@ -366,8 +332,6 @@ fn the_whole_registered_table_comes_back_with_its_encodings() {
         format!("{}@:q", Bool::ENCODING)
     );
 
-    // 4. Only the class's own: `-description` is NSObject's and `Probe` does not override it,
-    //    so it is absent here while `method_types`, which walks the chain, finds it.
     assert!(
         !names.iter().any(|n| n == "description"),
         "class_copyMethodList must report only the class's OWN methods"
@@ -376,8 +340,6 @@ fn the_whole_registered_table_comes_back_with_its_encodings() {
     assert!(unsafe { aterm_objc::method_types(cls, sel!(description)) }.is_some());
 }
 
-/// [`class_protocols`](aterm_objc::class_protocols) reports the class's own conformance claim,
-/// which no encoding check sees: a dropped protocol leaves every encoding correct.
 #[test]
 fn the_conformance_claim_is_readable_and_is_the_classs_own() {
     let cls = Probe::class();
@@ -388,18 +350,14 @@ fn the_conformance_claim_is_readable_and_is_the_classs_own() {
         "Probe's `protocols:` list names NSObject; the runtime says {claimed:?}"
     );
 
-    // Only what the class itself claims: neither NSObject nor `Probe` carries
-    // `NSDraggingDestination`.
     assert!(
         !claimed.iter().any(|p| p == "NSDraggingDestination"),
         "a protocol nobody added must not appear: {claimed:?}"
     );
 
-    // And it is the same answer AppKit gets, through the front door.
     let drops = Arc::new(AtomicUsize::new(0));
     let obj = probe(&drops);
-    // SAFETY: `-conformsToProtocol:` is `B@:@`; `obj` is a live instance and
-    // `protocol` answers a live protocol object.
+    // SAFETY: `-conformsToProtocol:` is `B@:@`.
     let conforms: Bool = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ProtocolPtr) -> Bool = msg();
         f(

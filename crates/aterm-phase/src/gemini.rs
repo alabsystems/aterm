@@ -9,6 +9,9 @@ use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Selec
 use crate::text::blank;
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
+/// Version of the Gemini CLI (`gemini`) harness, tracked independently per harness starting at `"0.1"`.
+pub const HARNESS_VERSION: &str = "0.1";
+
 /// The spinner's frames: braille patterns (`⠧`, `⠴`, `⠼`, `⠏` measured), the
 /// blank one aside.
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
@@ -52,6 +55,7 @@ const CARET_SHELL: u8 = b'!';
 const CARET_SENT_SHELL: u8 = b'$';
 
 /// The glyph in column 1 of a band's first row (` > text`, ` * text`, ` !
+/// text`, ` $ text`), alone or before a blank.
 fn caret_glyph(row: &str) -> Option<u8> {
     let b = row.as_bytes();
     if b.first() != Some(&b' ') || !b.get(2).is_none_or(|&c| c == b' ') {
@@ -849,6 +853,7 @@ fn kind_of(texts: &[(usize, &str)], first_option: Option<usize>) -> (PromptKind,
         .and_then(|t| t.split_whitespace().next());
     let kind = if asks.starts_with(const { anchor_text("gemini.box.exec.ask") }) {
         // `[Shell]` is the shell tool's; an MCP tool's box asks `Allow
+        // execution of MCP tool "<tool>" from server "<server>"?`.
         if asks.ends_with("[Shell]?") {
             PromptKind::Bash
         } else {

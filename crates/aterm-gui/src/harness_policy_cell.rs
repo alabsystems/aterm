@@ -49,12 +49,12 @@ pub(crate) struct HarnessPolicyCell {
 }
 
 impl HarnessStampSource {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         HarnessStampSource { last: 0 }
     }
 
     /// `policy`, stamped with the next generation.
-    pub(crate) fn stamp(&mut self, policy: HarnessPolicy) -> StampedHarnessPolicy {
+    pub(crate) const fn stamp(&mut self, policy: HarnessPolicy) -> StampedHarnessPolicy {
         self.last += 1;
         StampedHarnessPolicy {
             generation: self.last,
@@ -74,7 +74,7 @@ impl StampedHarnessPolicy {
 impl HarnessPolicyCell {
     /// The cell at launch: `launch` is the policy the launch read of
     /// `aterm.toml` wrote, in force until the watcher's first post.
-    pub(crate) fn new(launch: HarnessPolicy) -> Self {
+    pub(crate) const fn new(launch: HarnessPolicy) -> Self {
         HarnessPolicyCell {
             in_force: 0,
             policy: launch,
@@ -94,13 +94,13 @@ impl HarnessPolicyCell {
     }
 
     /// The policy in force.
-    pub(crate) fn get(&self) -> &HarnessPolicy {
+    pub(crate) const fn get(&self) -> &HarnessPolicy {
         &self.policy
     }
 
     /// The generation of the policy in force (`0`: the launch read): what
     /// `harness policy` answers as `gen=` and its event names.
-    pub(crate) fn generation(&self) -> u64 {
+    pub(crate) const fn generation(&self) -> u64 {
         self.in_force
     }
 }

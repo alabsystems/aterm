@@ -208,6 +208,7 @@ impl ColorRamp {
         let (lo, hi) = (first.0, last.0);
         let span = hi - lo;
         if span <= 0.0 {
+            // All stops coincide; the portion above the shared offset shows the
             // last stop, and that is where pad extension lands.
             return last.1;
         }
@@ -549,6 +550,10 @@ impl ColrCanvas<'_> {
 
 impl<'a> Painter<'a> for ColrCanvas<'a> {
     fn outline_glyph(&mut self, glyph_id: GlyphId) {
+        // Snapshot `cur` now: the PaintGlyph clip lives in this space, and a transform
+        // pushed in its subtree moves only the gradient geometry. Fluent's 🔥 depends on
+        // it: warping the outline through its mirroring paint transforms samples the pad
+        // ramps at their alpha-0 ends and all but erases the glyph. Nested PaintGlyph
         // clips are not intersected (the module's src-over simplification).
         self.pending = Some((glyph_id, self.cur));
     }

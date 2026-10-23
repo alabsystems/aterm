@@ -184,7 +184,7 @@ const USAGE: &str = "tape promote <results-run|dir|tape> [--as NAME] [--fewer] |
                      [FILE|DIR...] | tape replay-jailed [FILE|DIR...] | tape rerecord NAME \
                      [--fewer]";
 
-/// `tape promote|lint|replay-jailed|rerecord` ([module docs](self)).
+/// `tape promote|lint|replay-jailed|rerecord`.
 /// # Errors
 /// A usage error, or the verb's own refusal.
 pub fn cmd_tape(args: &[String]) -> Res {
@@ -378,7 +378,7 @@ fn held(path: &Path) -> Option<Census> {
     )
 }
 
-/// `source`'s tape promoted into the corpus as `name` ([module docs](self)):
+/// `source`'s tape promoted into the corpus as `name`:
 /// where it was written, what it is, and what the tape it replaced held.
 ///
 /// # Errors
@@ -433,7 +433,7 @@ fn said_promoted(verb: &str, out: &Path, kept: &corpus::Promoted, old: Option<&C
     }
 }
 
-/// `tape promote <results-run|dir|tape> [--as NAME] [--fewer]` ([module docs](self)).
+/// `tape promote <results-run|dir|tape> [--as NAME] [--fewer]`.
 /// # Errors
 /// A usage error (no source; no name a results run gives, and no `--as`), or the promote's refusal, said.
 pub fn cmd_promote(args: &[String]) -> Res {
@@ -559,8 +559,8 @@ struct Jailed {
 
 /// `aterm drive replay --check <asked>` run by `bin` in the jail whose
 /// profile names `allowed` (`sandbox-exec -p`), its environment cleared: what
-/// it did.
-///
+/// it did. A minute is the hang detector: a replay that has not ended by
+/// then is killed (it is this process's own child) and said to have hung.
 /// # Errors
 /// The profile, the spawn, or an interrupt.
 fn jailed(bin: &Path, allowed: &Path, asked: &Path) -> Result<Jailed, Fail> {
@@ -620,7 +620,7 @@ fn drain<P: io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::JoinHand
     })
 }
 
-/// `tape replay-jailed [FILE|DIR...]` ([module docs](self)): the negative control first — a copy of the first tape, which the profile does not name, must be refused by the very binary and profile (exit 2, the tape not read) — then each tape replayed in its own jail by `aterm drive replay --check`; exit 1 when the control was not refused or a tape did not take every act as recorded.
+/// `tape replay-jailed [FILE|DIR...]`: the negative control first — a copy of the first tape, which the profile does not name, must be refused by the very binary and profile (exit 2, the tape not read) — then each tape replayed in its own jail by `aterm drive replay --check`; exit 1 when the control was not refused or a tape did not take every act as recorded.
 /// # Errors
 /// No tape, no aterm built beside the lab, or the control's copy.
 pub fn cmd_replay_jailed(args: &[String]) -> Res {
@@ -685,7 +685,7 @@ pub fn cmd_replay_jailed(args: &[String]) -> Res {
     Ok(i32::from(failed > 0))
 }
 
-/// `tape rerecord NAME [--fewer]` ([module docs](self)): the scenario NAME on a fresh lab (`scn run NAME`, run 1, the tag `$LAB_TAG` or `survey`), then its tape promoted over the corpus's `NAME` — unless the run says it did not go as the scenario meant (its `error` or `exception`), or its tape loses what the one it would replace held ([`lost`]) and `--fewer` does not say the loss is deliberate ([`promote_into`]).
+/// `tape rerecord NAME [--fewer]`: the scenario NAME on a fresh lab (`scn run NAME`, run 1, the tag `$LAB_TAG` or `survey`), then its tape promoted over the corpus's `NAME` — unless the run says it did not go as the scenario meant (its `error` or `exception`), or its tape loses what the one it would replace held ([`lost`]) and `--fewer` does not say the loss is deliberate ([`promote_into`]).
 /// # Errors
 /// No scenario of that name (a tape promoted `--as` another name is rerecorded by hand), an interrupt, a failed run, or the promote's refusal.
 pub fn cmd_rerecord(args: &[String]) -> Res {

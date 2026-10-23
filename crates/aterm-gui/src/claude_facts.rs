@@ -351,6 +351,7 @@ impl App {
         fact: Fact,
         restores: FactMask,
     ) {
+        // The top rule's key toggles for the session through Claude's own
         // command ([`Self::press_top_effort`]).
         if fact == Fact::TopEffort {
             self.press_top_effort(wid, session);

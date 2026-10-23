@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Scrollback-offload detach window: the `ty_model!` spec (`include!`d from
-//! `offload_window_spec.rs`) bound to the real `Grid`.
-//!
-//! - Tier 0: the invariants hold over every Produce/Erase/config/replacement/Reattach/Abort
-//!   interleaving, with a counterexample required at `Buggy=1`.
-//! - Tier 1: every bounded history interleaving and every distinct detached-settings
-//!   ordering class runs against a real tiered `Grid` in lockstep with the model, each real
-//!   transition judged against the spec's `Next`.
-//! - Negative controls: corrupted observations are rejected, and the resurrection scanner
-//!   finds pre-erase tags before the erase.
-//!
-//! The interpreter always judges; `ty` (`ty check`, `ty trace validate`) also does wherever
-//! it is installed, and the verdicts must agree.
+//! Scrollback-offload detach window conformance tests against `Grid`.
 
 use aterm_scrollback::{Line, Scrollback, ScrollbackStorage};
 use aterm_spec::derive::Model;
@@ -51,11 +39,6 @@ fn feed_line(g: &mut Grid, s: &str) {
     g.carriage_return();
 }
 
-/// Saturate the detach-window ring so the next scroll-off stages into the lazy buffer.
-///
-/// The window opens with an empty ring (its rows go to the detached job), and the model's
-/// `Produce` ("a line scrolls off and is staged") holds only once the ring is full. These
-/// lines are unmodelled environment output (`produced`/`retained` stay 0).
 fn saturate_window_ring(g: &mut Grid) {
     for i in 0..RING {
         if g.ring_buffer_scrollback() >= RING {
@@ -75,10 +58,8 @@ fn saturate_window_ring(g: &mut Grid) {
     );
 }
 
-/// A real tiered grid with `H` short (rewrap-count-stable) tagged history lines.
 fn real_grid_with_history() -> Grid {
     let mut sb: ScrollbackStorage = Scrollback::new(64, 512, INITIAL_BUDGET).into();
-    // The model uses `0` for unlimited lines; make that initial state literal.
     sb.set_line_limit(None);
     let mut g = Grid::with_tiered_scrollback(ROWS, OLD_COLS, RING, sb);
     for i in 0..H {
@@ -88,7 +69,6 @@ fn real_grid_with_history() -> Grid {
     g
 }
 
-/// Count store lines whose text starts with the pre-erase tag `H` (resurrection scan).
 fn store_h_tags(g: &Grid) -> usize {
     let Some(store) = g.scrollback() else {
         return 0;
@@ -136,9 +116,6 @@ fn budget_code(budget: Option<usize>) -> i64 {
     })
 }
 
-/// Substitute every settings value the real grid/store exposes into the model
-/// state. `pending` and the dirty bits have no public projection and stay
-/// model-driven.
 fn project_real_settings(st: &mut BTreeMap<&'static str, i64>, g: &Grid) {
     let detached = i64::from(g.reflow_offload_in_flight());
     let backend = i64::from(g.scrollback().is_some());
@@ -170,9 +147,6 @@ fn project_real_settings(st: &mut BTreeMap<&'static str, i64>, g: &Grid) {
         None => {
             st.insert("line_applied", 0);
             st.insert("budget_applied", 0);
-            // Once a backend-less Abort resolves the window, the public total is
-            // the surviving ring cap; during detach the getter shows the pending
-            // request instead.
             if detached == 0
                 && let Some(limit) = observed_limit
             {
@@ -200,9 +174,6 @@ fn replacement_store() -> ScrollbackStorage {
     replacement
 }
 
-/// Project the replacement-backed history accounting: the replacement starts
-/// with one sentinel line, every further store line was drained from this
-/// window, and `lazy_backlog_len` is the still-staged remainder.
 fn project_replacement_history(st: &mut BTreeMap<&'static str, i64>, g: &Grid) {
     let relocated = g.scrollback().map_or(0, |store| {
         assert!(
@@ -221,8 +192,6 @@ fn project_replacement_history(st: &mut BTreeMap<&'static str, i64>, g: &Grid) {
     );
 }
 
-/// Tiered per-transition conformance (see [`verify::validate_transition_tiered`]); the
-/// trace's step 0 is `prev` and the cfg carries the real regime overrides.
 fn validate_transition(
     m: &Model,
     prev: &BTreeMap<&'static str, i64>,
@@ -238,8 +207,6 @@ fn validate_transition(
         "offload detach-window Tier-1 binding",
     )
 }
-
-// The bounded trace alphabet, enumerated exhaustively.
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Step {
@@ -262,17 +229,13 @@ enum ConfigStep {
     Abort,
 }
 
-/// All interleavings: k Produces (0..=W), an optional Erase at every position,
-/// ending in Reattach or Abort (the space Tier 0 explores).
 fn all_traces() -> Vec<Vec<Step>> {
     let mut out = Vec::new();
     for k in 0..=(W as usize) {
         for terminal in [Step::Reattach, Step::Abort] {
-            // No erase.
             let mut t: Vec<Step> = vec![Step::Produce; k];
             t.push(terminal);
             out.push(t.clone());
-            // Erase at each possible position among the produces.
             for pos in 0..=k {
                 let mut t: Vec<Step> = vec![Step::Produce; k];
                 t.insert(pos, Step::Erase);
@@ -284,17 +247,12 @@ fn all_traces() -> Vec<Vec<Step>> {
     out
 }
 
-/// One representative of every semantically distinct settings ordering:
-/// latest-writer order, low/high/unlimited fallback-ring policy, replacement
-/// before/between/after setters, untouched-baseline adoption, and both terminal
-/// paths.
 fn settings_traces() -> Vec<Vec<ConfigStep>> {
     use ConfigStep::{
         Abort, AttachReplacement, Erase, Reattach, SetBudgetHigh, SetBudgetLow, SetLineHigh,
         SetLineLow, SetLineUnlimited,
     };
     vec![
-        // Backend-less Abort: only the newest LOW finite value may tighten ring.
         vec![SetLineLow, Abort],
         vec![SetLineHigh, Abort],
         vec![SetLineLow, SetLineHigh, Abort],
@@ -302,19 +260,15 @@ fn settings_traces() -> Vec<Vec<ConfigStep>> {
         vec![SetLineLow, SetLineUnlimited, Abort],
         vec![SetLineUnlimited, SetLineLow, Abort],
         vec![SetBudgetLow, Abort],
-        // Clean re-attach: latest finite/unlimited line values and budget values.
         vec![SetLineLow, SetLineHigh, Reattach],
         vec![SetLineHigh, SetLineLow, Reattach],
         vec![SetLineLow, SetLineUnlimited, Reattach],
         vec![SetBudgetLow, SetBudgetHigh, Reattach],
         vec![SetBudgetHigh, SetBudgetLow, Reattach],
-        // Clean replacement adopts its baseline; Abort and Reattach both consume.
         vec![AttachReplacement, Reattach],
         vec![AttachReplacement, Abort],
-        // A dirty field wins while the untouched sibling adopts replacement.
         vec![SetLineLow, AttachReplacement, Reattach],
         vec![SetBudgetLow, AttachReplacement, Reattach],
-        // Clear-generation replacement of the stale worker store preserves config.
         vec![
             SetLineLow,
             SetBudgetLow,
@@ -323,7 +277,6 @@ fn settings_traces() -> Vec<Vec<ConfigStep>> {
             SetBudgetHigh,
             Reattach,
         ],
-        // Setters after replacement apply immediately; the final setter wins.
         vec![
             AttachReplacement,
             SetLineLow,
@@ -340,7 +293,6 @@ fn settings_traces() -> Vec<Vec<ConfigStep>> {
             SetBudgetHigh,
             Abort,
         ],
-        // Explicit unlimited remains distinguishable from "not dirty".
         vec![
             SetLineHigh,
             SetBudgetHigh,
@@ -352,9 +304,6 @@ fn settings_traces() -> Vec<Vec<ConfigStep>> {
     ]
 }
 
-/// Drive one trace against the real grid in lockstep with the model; returns
-/// the final model state and per-step `(prev, next, action)`, with the final
-/// step's `retained` replaced by the real measurement.
 #[allow(clippy::type_complexity)]
 fn run_lockstep(
     trace: &[Step],
@@ -369,7 +318,6 @@ fn run_lockstep(
     let m = offload_window_model();
     let mut g = real_grid_with_history();
 
-    // Open the window on the real grid (the literal production entry point).
     let mut pending = Some(
         g.resize_offloading_scrollback(ROWS, NEW_COLS)
             .expect("width change with tiered store opens the offload window"),
@@ -414,8 +362,6 @@ fn run_lockstep(
             "model guard rejects {name} at step {i} of {trace:?} — model/real enabledness diverged"
         );
 
-        // `detached` comes from the real flag accessor, not store presence, so a
-        // flag that outlives Reattach/Abort diverges here.
         assert_eq!(
             i64::from(g.reflow_offload_in_flight()),
             st["detached"],
@@ -429,8 +375,6 @@ fn run_lockstep(
         );
 
         let mut next = st.clone();
-        // Final step: substitute the real measured `retained`, so the spec judges the
-        // grid rather than the model echoing itself.
         if i == trace.len() - 1 && *s == Step::Reattach {
             let baseline = if cleared { 0 } else { H as i64 };
             let real_retained = g.scrollback_lines() as i64 - baseline;
@@ -441,7 +385,6 @@ fn run_lockstep(
         steps.push((prev, next, name));
     }
 
-    // Post-trace real-world assertions (the invariant-bearing observables).
     match trace.last().unwrap() {
         Step::Reattach => {
             if cleared {
@@ -464,9 +407,6 @@ fn run_lockstep(
     (st, steps)
 }
 
-/// Drive one detached-settings schedule against the public Grid API, projecting
-/// getters, raw store settings, backend presence and the inferred ring share
-/// into each successor before the spec judges it.
 #[allow(clippy::type_complexity)]
 fn run_settings_lockstep(
     trace: &[ConfigStep],
@@ -552,7 +492,6 @@ fn run_settings_lockstep(
     (g, steps)
 }
 
-/// Tier 0: the invariants prove at `Buggy=0` and are caught at `Buggy=1`.
 #[test]
 fn offload_window_spec_model_checked_in_trust() {
     verify::prove_and_catch_scalar(
@@ -561,8 +500,6 @@ fn offload_window_spec_model_checked_in_trust() {
     );
 }
 
-/// Tier 1: every bounded interleaving on the real Grid in lockstep with the model, each
-/// transition judged against the spec's `Next`.
 #[test]
 fn real_grid_offload_window_conforms_to_spec_exhaustively() {
     let m = offload_window_model();
@@ -583,8 +520,6 @@ fn real_grid_offload_window_conforms_to_spec_exhaustively() {
         }
     }
 
-    // Negative control 1: claiming one more retained line than measured is
-    // rejected.
     let (_st, steps) = run_lockstep(&[Step::Produce, Step::Reattach]);
     let (prev, next, action) = steps.last().unwrap().clone();
     let mut forged = next.clone();
@@ -595,7 +530,6 @@ fn real_grid_offload_window_conforms_to_spec_exhaustively() {
         "negative control: ty must reject a forged final observation (binding is vacuous otherwise)"
     );
 
-    // Negative control 2: the resurrection scanner sees pre-erase tags.
     let g = real_grid_with_history();
     assert!(
         store_h_tags(&g) > 0,
@@ -609,8 +543,6 @@ fn real_grid_offload_window_conforms_to_spec_exhaustively() {
     );
 }
 
-/// Tier 1 settings binding: exercise every semantically distinct ordering class
-/// against public getters and raw backend values, including replacement and abort.
 #[test]
 fn real_grid_detached_settings_conform_to_spec() {
     use ConfigStep::{Abort, AttachReplacement, Reattach, SetLineHigh, SetLineLow};
@@ -641,8 +573,6 @@ fn real_grid_detached_settings_conform_to_spec() {
         }
     }
 
-    // Settings negative control 1: a forged stale/high getter after SetLineLow
-    // satisfies the scalar domain but not the action body.
     let (_g, steps) = run_settings_lockstep(&[SetLineLow, Reattach]);
     let (prev, next, action) = steps.first().expect("setter transition").clone();
     let mut forged = next.clone();
@@ -656,8 +586,6 @@ fn real_grid_detached_settings_conform_to_spec() {
         "negative control: ty must reject a forged deferred line getter"
     );
 
-    // Settings negative control 2: a high request cannot expand the backend-less
-    // ring on Abort.
     let (_g, steps) = run_settings_lockstep(&[SetLineHigh, Abort]);
     let (prev, next, action) = steps.last().expect("abort transition").clone();
     let mut forged = next.clone();
@@ -676,9 +604,6 @@ fn real_grid_detached_settings_conform_to_spec() {
     );
 }
 
-/// Tier 1 replacement-loss binding: attaching a replacement drains rows already
-/// staged in the detach window, and replacement-backed Abort drains rows staged
-/// afterward. Unlike backend-less worker death, this close has no loss waiver.
 #[test]
 fn replacement_backed_abort_preserves_window_output_in_spec() {
     let m = offload_window_model();
@@ -686,14 +611,11 @@ fn replacement_backed_abort_preserves_window_output_in_spec() {
     let pending = g
         .resize_offloading_scrollback(ROWS, NEW_COLS)
         .expect("open detach window");
-    // The window opens with the ring history riding the job; the modelled Produce steps
-    // below assume a full ring.
     saturate_window_ring(&mut g);
 
     let mut st = m.init_state();
     let mut transitions = Vec::new();
 
-    // One full-ring eviction is staged before the replacement arrives.
     let prev = st.clone();
     feed_line(&mut g, "REPLACEMENT-PRE");
     assert!(m.fire("Produce", &mut st));
@@ -704,7 +626,6 @@ fn replacement_backed_abort_preserves_window_output_in_spec() {
     transitions.push((prev, next, "Produce"));
     assert_eq!(g.lazy_backlog_len(), 1, "one pre-attach row staged");
 
-    // Replacement attachment must immediately relocate that staged row.
     let prev = st.clone();
     g.attach_scrollback(replacement_store());
     assert!(m.fire("AttachReplacement", &mut st));
@@ -720,8 +641,6 @@ fn replacement_backed_abort_preserves_window_output_in_spec() {
         "sentinel + pre-attach staged row"
     );
 
-    // Keep the next eviction staged until Abort so that Abort's replacement
-    // branch—not attachment—must perform the second conserving transfer.
     g.set_compress_offload_active(true);
     let prev = st.clone();
     feed_line(&mut g, "REPLACEMENT-POST");
@@ -759,7 +678,6 @@ fn replacement_backed_abort_preserves_window_output_in_spec() {
         );
     }
 
-    // Negative control: a lossy Abort (the second staged row vanished) is rejected.
     let mut forged = next;
     forged.insert("relocated", forged["relocated"] - 1);
     let (ok, _) = validate_transition(&m, &prev, &forged, "Abort");

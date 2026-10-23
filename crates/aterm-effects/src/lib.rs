@@ -1,40 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
-// under them (crates/aterm-spec-anchor/anchor_rules.rs).
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
-//! `aterm-effects`: the host-agnostic visual-effects engines (cursor aurora and
-//! comet trail, sparkle words, animated ink, cat, supernova) shared by the native
-//! app and the web embedders (`aterm-wasm`, `aterm-gpu-web`).
-//!
-//! ## Contract
-//!
-//! - **Clockless state machines.** Every `tick`/`rescan` takes an injected
-//!   `now: Instant` (`aterm_time::Instant`, a browser clock on wasm32), so a web
-//!   host can synthesize `now` from `advance(dt)`.
-//! - **Render-time overlay only.** Output goes to the `RenderInput` overlay
-//!   channels (`cursor_glow_add`, `cursor_trail`, `word_decorations`, `ink`,
-//!   `cat_quads` + `cat_atlas`, `nova_add`); the grid is never touched, so the
-//!   overlay never reaches copy, clipboard, PTY or recordings.
-//! - **Empty means off.** Disabled emitters return fingerprint `0` and empty
-//!   vectors; the renderers' empty-overlay paths are byte-identical to no overlay.
-//! - **Idle-to-zero.** `is_active()` reports when nothing is animating and
-//!   `EffectsPipeline::next_deadline_ms` names the next scheduled wake, so an
-//!   idle host sleeps.
-//! - **Flash safety is structural.** The WCAG 2.3.1 limits (350 ms twinkle
-//!   floors, the window-wide nova ignition limiter, `reduced_motion`) live in the
-//!   state machines and their config clamps, so embedders cannot bypass them.
+//! Host-agnostic visual-effects engines shared by native and web embedders.
 
-/// The animal roster's bake path: one species head to an exact-size RGBA tile,
-/// handed to the shared cat atlas through `CatBaker::host_tile`.
+/// The animal roster's bake path.
 pub mod animal_baker;
-/// The typing-momentum glow as an Aos task (schema, prebuilt code, the corrected
-/// contract) and `MomentumHost`, the live wrapper `CursorFx::momentum` holds.
+/// The typing-momentum glow as an Aos task.
 pub mod aos_momentum;
-/// `@generated` animal drawlists; regenerate with `targo --unverified run -p aterm-effects
-/// --example gen_animal_glyphs` (drift test `animal_glyphs_gen_matches_assets`).
+/// `@generated` animal drawlists.
 pub mod animal_glyphs_gen {
     include!("animal_glyphs_gen.rs");
 }
@@ -42,37 +17,25 @@ pub mod cat_baker;
 /// The examples share this generator source with the unit drift/schema tests.
 #[cfg(test)]
 mod cat_glyphs_codegen;
-/// `@generated` cat drawlists; regenerate with `targo --unverified run -p aterm-effects
-/// --example gen_cat_glyphs` (unit drift test `cat_glyphs_gen_matches_assets`).
-/// `include!`d rather than `mod` so rustfmt never reflows the generated file.
+/// `@generated` cat drawlists.
 pub mod cat_glyphs_gen {
     include!("cat_glyphs_gen.rs");
 }
-/// The top line's marks: one drawn icon and one brand colour per agent CLI
-/// (the lockup every agent CLI's top line opens with), their fit law, their
-/// inks floored to their grounds, and the fx payload that draws them.
+/// The top line's marks.
 pub mod cli_marks;
 pub mod color_math;
-/// The pet driver: `CompanionOwner` owns a resident [`kitty_pet`] brain per
-/// surface and senses for it, dresses it, decides custody and draws it, for
-/// every host.
+/// The pet driver: `CompanionOwner` owns a resident [`kitty_pet`] brain per surface and senses for
+/// it.
 pub mod companion;
-/// Which cat the companions wear: the program cats' tenure gate, the
-/// homecoming rate law and the precedence law (favourite > program > launch
-/// kitty), one [`companion_look::LookPolicy`] per window.
+/// Which cat the companions wear ([`companion_look::LookPolicy`]).
 pub mod companion_look;
-/// The companions a window keeps beside its resident pet: the flying head,
-/// the sing-along, the typed-word detectors and the typed dog
-/// ([`companions::Companions`]).
+/// The companions a window keeps beside its resident pet ([`companions::Companions`]).
 pub mod companions;
-/// The dog roster's bake path: one authored breed head to an exact-size RGBA
-/// tile, handed to the shared cat atlas through `CatBaker::host_tile`.
+/// The dog roster's bake path.
 pub mod dog_baker;
-/// The typed-word dog cameo that trots up when you type `dog` past the
-/// typed-a-lot gate: lifecycle envelope, breed/coat roll and entry bounce.
+/// The typed-word dog cameo that trots up when you type `dog` past the typed-a-lot gate.
 pub mod dog_cameo;
-/// `@generated` dog drawlists; regenerate with `targo --unverified run -p aterm-effects
-/// --example gen_dog_glyphs` (drift test `dog_glyphs_gen_matches_assets`).
+/// `@generated` dog drawlists.
 pub mod dog_glyphs_gen {
     include!("dog_glyphs_gen.rs");
 }
@@ -81,122 +44,82 @@ pub mod classic_wake;
 pub mod cursor_beam;
 pub mod cursor_comet;
 pub mod cursor_droplet;
-/// The cursor family's frame step: aurora, cadence comet and every block-cursor
-/// body, ticked in one order with one caret-ownership law, for every host.
+/// The cursor family's frame step.
 pub mod cursor_fx;
 pub mod cursor_glow;
 pub mod cursor_phaser;
 pub mod cursor_rainbow;
 pub mod cursor_trail;
-/// Crate-private shared render kit for the cursor emitters (the two per-cell-row
-/// quad pushers, colour ramps, and the one twinkle star).
+/// Crate-private shared render kit for the cursor emitters.
 mod effect_util;
-/// WCAG 2.3.1's general-flash bound every flash rate here is held under,
-/// for the hosts that bound a flash of their own (the harness card's
-/// re-show bound).
+/// WCAG 2.3.1's general-flash bound every flash rate here is held under.
 pub use effect_util::TWINKLE_FLASH_BOUND_HZ;
 /// Hardened, bounded file admission shared by every native visual-feed loader.
 pub mod file_feed;
 pub mod genome;
-/// The harness card (`docs/DESIGN-harness-autopilot-2026-10-15.md` §3): the
-/// rainbow border, pixel-art kitty, rainbow trail and stars Claude Code's
-/// launch card wears while the harness has it on Autopilot; a pure emitter,
-/// one episode then stillness.
+/// The harness card.
 pub mod harness_card;
-/// The agents panel's glass (the harness theme's rainbow on Claude Code's
-/// agents panel, and its dots' light: hue = which agent, brightness and glow
-/// = work, saturation = freshness); a pure emitter, the host places it.
+/// The agents panel's glass.
 pub mod harness_panel;
-/// The host contract (`docs/DESIGN-host-boundary-2026-08-30.md` §3): the plain
-/// data a host hands the effects driver for one frame (`HostFrameInput`,
-/// `TerminalFacts`) and gets back (`PressOutcome`). Uses `aterm_time::Instant` only.
+/// The host contract (`docs/DESIGN-host-boundary-2026-08-30.md` §3).
 pub mod host;
-/// The rainbow kitty that flies in front of the cursor on the `rainbow kitty`
-/// trail style — its art, pose, and exit choreography.
+/// The rainbow kitty that flies in front of the cursor on the `rainbow kitty` trail style.
 pub mod kitty_cursor;
-/// The rainbow kitty pet: the full-body companion that lives in the text plane
-/// and chases the caret (gait, behaviour, screen awareness).
+/// The rainbow kitty pet.
 pub mod kitty_pet;
 pub mod kitty_registry;
-/// The kitty's sing-along for held keys: repeat detector, beat clock and the
-/// music-note sprite field.
+/// The kitty's sing-along for held keys.
 pub mod kitty_sing;
-/// The typed-word detector: a feline word typed at the prompt records a Kitty
-/// Log sighting, a curse winces the companion, and `dog` past the typed-a-lot
-/// gate pops a visiting dog — fed from the host's key path, never the screen.
+/// The typed-word detector: a feline word typed at the prompt records a Kitty Log sighting.
 pub mod kitty_summon;
 pub mod matrix_rain;
-/// Motion policy: the single accessibility gate for decorative animation,
-/// resolving `motion`, the OS Reduce Motion flag and focus to an amplitude.
+/// Motion policy: the single accessibility gate for decorative animation.
 pub mod motion;
 pub mod nova;
-/// The mushroom cloud — the rarest f-bomb detonation tier.
+/// The mushroom cloud.
 pub mod nuke;
-/// Prism wake for program output: a per-theme rainbow comet on the newest
-/// damaged row plus one pip, metered by typing momentum, blind to echoed
-/// keystrokes, coalescing to one ribbon under a flood
-/// (`docs/DESIGN-output-streak-2026-08-30.md`).
+/// Prism wake for program output.
 pub mod output_streak;
-/// The pet roster's bake path: one authored full-body pose → an exact-size
-/// RGBA tile, handed to the shared cat atlas through `CatBaker::host_tile`.
+/// The pet roster's bake path.
 pub mod pet_baker;
 mod pet_stroke;
 /// Bounded, coherent terminal occupancy and text-free content anchors.
 pub mod pet_world;
-/// `@generated` pet drawlists; regenerate with `targo --unverified run -p aterm-effects
-/// --example gen_pet_glyphs` (drift test `pet_glyphs_gen_matches_assets`).
+/// `@generated` pet drawlists.
 pub mod pet_glyphs_gen {
     include!("pet_glyphs_gen.rs");
 }
 pub mod cursor_momentum;
 pub mod pane;
 pub mod pipeline;
-/// Rainbow kitty, the `rainbow kitty` cursor theme with pixels and sound as one
-/// design (`docs/design/RAINBOW-KITTY-V2.md`). [`rainbow_kitty::Engine`] is what
-/// `CursorGlow` delegates to at its seam points; other styles are unaffected.
+/// Rainbow kitty ([`rainbow_kitty::Engine`]).
 pub mod rainbow_kitty;
-/// Claude Code's mascot ripple (2.1.304), decoded: the glint wave the
-/// harness's glass shimmers in step with — Claude's own per-cycle field and
-/// the ring train that carries it past the mascot. Pure: time comes in.
+/// Claude Code's mascot ripple (2.1.304), decoded.
 pub mod ripple;
-/// Sound-cue policy: the gain laws (focus, music master, volume, per-cue
-/// switches) and the drains that turn engine cues into synth events. The sink
-/// is the host's.
+/// Sound-cue policy.
 pub mod sound_policy;
 pub mod spec;
-/// The rainbow family's colour law (`docs/design/RAINBOW-KITTY-V2.md` §2.3, C1):
-/// seven ROYGBIV stops joined by smooth per-channel interpolation, baked to a
-/// 511-entry (just under 2 KiB) LUT. Colours resolve through
-/// [`spectrum::spectrum`]; point marks snap to a name through
-/// [`spectrum::spectrum_snap`].
+/// The rainbow family's colour law ([`spectrum::spectrum`], [`spectrum::spectrum_snap`]).
 pub mod spectrum;
 pub mod supernova;
-/// The tests' replay pool ([`test_pool::par_map`]), for the unit tests and
-/// the integration suite: a test seam, absent from a release build.
+/// The tests' replay pool ([`test_pool::par_map`]), for the unit tests and the integration suite.
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod test_pool;
-/// Tone of typing: a small hashed char-n-gram classifier that maps the line
-/// being typed to a mood hint for `trail_sound`'s tone tables. Trained by
-/// `examples/tone_train.rs`; weights ship as a verified binary asset.
+/// Tone of typing: a small hashed char-n-gram classifier that maps the line being typed to a mood
+/// hint for `trail_sound`'s tone tables.
 pub mod tone;
-/// The tone-of-typing tracker: the typed-line window and the throttled
-/// classifier cache whose verdict rides the trail's sound events.
+/// The tone-of-typing tracker.
 pub mod tone_infer;
 pub mod trail_sound;
 pub mod trail_sweep;
-/// Kitty-command word flash: the word just typed to the pet turns rainbow for
-/// about a second. State is owned by [`word_decorations::WordDecorations`].
+/// Kitty-command word flash ([`word_decorations::WordDecorations`]).
 mod trick_flash;
-/// Kitty-command listener: the typed-line state machine that hears `sit`,
-/// `kitty jump`, `good kitty` on a line of pure pet talk and reports fire,
-/// confirm or revoke. Vocabulary is `aterm_lexicon::tricks`.
+/// Kitty-command listener.
 pub mod typed_tricks;
 pub mod typing_momentum;
 pub mod word_decorations;
 
-// These conformances need the implementation's cfg(test) model anchors in
-// the same binary. Keep them unit modules instead of flipping library features.
 #[cfg(test)]
 #[path = "../tests/conformance_trick_flash.rs"]
 mod conformance_trick_flash;

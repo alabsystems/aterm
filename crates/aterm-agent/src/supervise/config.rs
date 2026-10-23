@@ -777,7 +777,7 @@ impl SupervisorConfig {
         word.unwrap_or(self.autopilot)
     }
 
-    /// The reader of aterm.toml's `[harness]` table (module docs).
+    /// The reader of aterm.toml's `[harness]` table.
     #[must_use]
     pub fn from_aterm_toml(text: &str) -> (Self, Vec<String>) {
         let mut cfg = Self::default();

@@ -37,6 +37,7 @@ struct Header {
 impl HeaderCache {
     pub(crate) fn paint(&self, input: &mut RenderInput) {
         if !self.entries.is_empty() {
+            // This is host chrome written after extraction, so it cannot keep
             // an engine-only snapshot identity or a composed retention blessing.
             input.snapshot_seq = input.snapshot_seq.wrapping_add(1);
         }
@@ -457,7 +458,7 @@ fn fit_cell_label(label: &str, cols: usize) -> String {
     result
 }
 
-fn status_label(indicators: TabIndicators) -> &'static str {
+const fn status_label(indicators: TabIndicators) -> &'static str {
     if indicators.wants_attention() {
         "!"
     } else if indicators.busy {
@@ -618,6 +619,7 @@ fn raster(
     colors: chrome_band::BandColors,
     native_icon: Option<TabIconKind>,
 ) -> Option<Arc<ImageData>> {
+    // Keep its semantic cells visible for CJK/emoji rather than covering real
     // content with a raster containing missing-glyph holes.
     if !tray_raster::strip_band_run_coverable(label) {
         return None;

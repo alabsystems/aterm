@@ -238,6 +238,7 @@ fn imported(leaf: &UseLeaf<'_>) -> Option<String> {
         let bound = if leaf.glob {
             parts.len() > 1 && ends(parts.len() - 1)
         } else if ends(parts.len()) {
+            // The whole of it: a path read bare from here on (`sleep(d)`), a one-word name
             // that is itself the door (`RandomState`), or a wall reader passed as a fn item.
             true
         } else {

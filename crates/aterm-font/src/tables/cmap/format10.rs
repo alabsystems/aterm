@@ -8,8 +8,7 @@
 use crate::GlyphId;
 use crate::parser::{LazyArray32, Stream};
 
-/// A [format 10](https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-10-trimmed-array)
-/// subtable.
+/// A format 10 `cmap` subtable.
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable10<'a> {
     /// First character code covered.

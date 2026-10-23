@@ -224,7 +224,8 @@ pub struct Font {
     upem: f32,
     /// `maxp` glyph count.
     glyph_count: u16,
-    /// Every cmap subtable enumerated, non-zero mappings.
+    /// Every cmap subtable enumerated, non-zero mappings only, later subtables overwriting
+    /// earlier ones.
     char_to_glyph: FxHashMap<char, NonZeroU16>,
     /// Where [`Font::unicode_glyph_index`] answers differently from [`Self::char_to_glyph`].
     unicode_overrides: Box<[(char, u16)]>,

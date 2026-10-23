@@ -11,7 +11,6 @@ use aterm_uds::CtlStream;
 
 use super::{ServingFd, serving_peer_pid};
 
-/// The lease a session holds now, as `(holder, holder_pid)`.
 fn drive_lease(ctx: &crate::SessionCtx) -> Option<(String, Option<u32>)> {
     match ctx
         .turn_lease
@@ -26,10 +25,6 @@ fn drive_lease(ctx: &crate::SessionCtx) -> Option<(String, Option<u32>)> {
     }
 }
 
-/// The harness's own `Hand::take` connects from inside the aterm process
-/// over a direct connection: the kernel names aterm itself. The same acquire
-/// over the bridge's inherited connection (not a direct one) is attested by
-/// nobody, and `lease status` then prints no `pid=`.
 #[test]
 fn a_lease_taken_over_a_direct_connection_records_its_kernel_peer() {
     let handle = crate::session_store::test_handle(7601);
@@ -71,9 +66,6 @@ fn a_lease_taken_over_a_direct_connection_records_its_kernel_peer() {
     ));
 }
 
-/// The ruling-313 judgement, pure. NEGATIVE CONTROL: the old name-only
-/// judgement takes a forged lease (aterm's holder name, another process's
-/// pid, or none attested) for aterm's own hand; the attested one refuses it.
 #[test]
 fn a_forged_holder_name_is_not_atermss_hand() {
     let me = std::process::id();
@@ -95,8 +87,6 @@ fn a_forged_holder_name_is_not_atermss_hand() {
     ));
 }
 
-/// A lane service that serves `lease …` against one session exactly as the
-/// dispatch's `lease` arm does ([`super::control_session::cmd_lease`]).
 #[cfg(target_os = "macos")]
 struct LeaseService {
     ctx: Arc<crate::SessionCtx>,
@@ -158,8 +148,6 @@ impl super::control_lanes::LaneService for LeaseService {
     }
 }
 
-/// The forger: `perl` connecting to `sock` and taking a hard lease under
-/// aterm's own holder name, then reading its status, then closing.
 #[cfg(target_os = "macos")]
 const FORGER: &str = r#"
 use IO::Socket::UNIX;
@@ -171,12 +159,6 @@ my $b = <$s>;
 print "PID $$\n$a$b";
 "#;
 
-/// A LEASE TAKEN BY ANOTHER PROCESS NAMES THAT PROCESS, whatever its
-/// `holder=` says: a real child connects to a real socket served by the real
-/// lanes and acquires `holder=aterm-harness@<this process's pid>` — the
-/// forgery any same-uid client can make — and the lease records the CHILD's
-/// pid, so `status hand_pid=` and `lease status pid=` name it and the
-/// presence layer reads it as somebody else's hand.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_lease_taken_by_another_process_names_it_whatever_its_holder_says() {

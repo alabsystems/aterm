@@ -182,8 +182,6 @@ fn refusals_change_nothing() {
     assert_eq!((lines(&log), log.last_seq()), (before, seq));
 }
 
-/// Random opens and closes: every open's parent is open when it opens,
-/// every node closes at most once, and seqs strictly increase.
 #[test]
 fn random_traffic_keeps_the_tree_well_formed() {
     for seed in 1..=20u64 {
@@ -243,10 +241,6 @@ fn random_traffic_keeps_the_tree_well_formed() {
     }
 }
 
-/// A named parent of the child's own level is natural where §2.1 and §2.7
-/// say so: an agent run started from zsh hangs from zsh's `cmd` run, and an
-/// approval from its open `tool` step, neither an orphan; closing the
-/// parent cascades to them.
 #[test]
 fn a_same_level_parent_is_natural() {
     let mut log = Log::new(0);
@@ -293,9 +287,6 @@ fn a_same_level_parent_is_natural() {
     );
 }
 
-/// The log writes the outcome, the duration, the rollup and `orphan=`: a
-/// caller's fields carrying one are refused and write nothing, and a
-/// duration measured elsewhere goes through the typed builders.
 #[test]
 fn the_log_owns_its_own_keys() {
     let mut log = Log::new(0);
@@ -358,9 +349,6 @@ fn the_log_owns_its_own_keys() {
     );
 }
 
-/// A successor continues the predecessor's node ids (§2.2): `t3` names one
-/// turn for as long as the session lives, across an update that carries no
-/// records.
 #[test]
 fn node_ids_continue_across_a_handoff() {
     let mut old = Log::new(1);
@@ -389,10 +377,6 @@ fn node_ids_continue_across_a_handoff() {
     );
 }
 
-/// Every record the log accepts fits both forms: the line, and for the turn
-/// class the bus mirror carries, the `v=2` body at its widest header. A
-/// record whose line fits but whose body would not is refused, writing
-/// nothing.
 #[test]
 fn every_accepted_turn_class_record_fits_the_bus() {
     let id = |i: u64| ShortId::new(&format!("{i:0>39}")).expect("an id");

@@ -362,6 +362,7 @@ pub fn resolve_state_dir(
     platform: StatePlatform,
 ) -> Option<PathBuf> {
     if let Some(root) = override_root {
+        // Relative is refused, not resolved: a state root that depends on the
         // cwd is no root at all.
         return root.is_absolute().then_some(root);
     }

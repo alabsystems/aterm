@@ -208,7 +208,7 @@ pub enum WorkspacePolicy {
     ProbeFailed { why: String },
 }
 
-/// The workspace probe's result, bound to the directory it was taken.
+/// The workspace probe's result, bound to the directory it was taken in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePolicyProbe {
     pub workspace: PathBuf,
@@ -248,13 +248,18 @@ pub struct Probes {
     pub index_head: bool,
     /// The C toolchain's verdict ([`crate::prereq::probe`]).
     pub cc: Option<crate::prereq::CcVerdict>,
-    /// The Claude Code defaults the owner runs with, as `~/.claude/settings.json` leaves.
+    /// The Claude Code defaults the owner runs with, as `~/.claude/settings.json`
+    /// leaves each — or why the window adds none to that file
+    /// ([`claude_defaults_state`]) — or `None` when this report does not read that
+    /// file (the default: a fixture has no Claude settings).
     pub claude_defaults: Option<Result<Vec<(&'static str, DefaultState)>, String>>,
     /// Whether a window adds those defaults at all.
     pub claude_auto_prime: bool,
     /// Whether this aterm is on macOS's Developer Tools list ([`crate::devtools::facts`]).
     pub devtools: Option<crate::devtools::Facts>,
-    /// Rosetta 2 as read ([`crate::machine::rosetta_posture`]) and whether `[machine] rosetta`.
+    /// Rosetta 2 as read ([`crate::machine::rosetta_posture`]) and whether `[machine]
+    /// rosetta` wants it, or `None` when this report does not read it (the default: a
+    /// fixture reads no machine).
     pub rosetta: Option<(crate::machine::RosettaPosture, bool)>,
     /// The directories on the active Trust build's physical chain that `targo trust` refuses.
     pub trust_chain: Option<TrustChainProbe>,
@@ -267,7 +272,7 @@ pub struct Probes {
 pub struct TrustChainProbe {
     /// The trust build whose `bin/` and `lib/` were walked.
     pub build: u64,
-    /// Each refused directory, top.
+    /// Each refused directory, top down, once.
     pub refused: Vec<ChainRefusal>,
 }
 
@@ -289,7 +294,10 @@ pub enum ChainWhy {
     Redirected,
 }
 
-/// `targo trust`'s rule for one component of the physical chain from `/` to a verified.
+/// `targo trust`'s rule for one component of the physical chain from `/` to a verified
+/// toolchain's launchers (`bin/`) and runtime libraries (`lib/`), Trust's
+/// `process_authority.rs`: owned by root or the invoking identity, and `mode & 0o022 == 0`
+/// with no sticky exemption.
 #[must_use]
 pub const fn chain_component_refusal(ours: u32, owner: u32, mode: u32) -> Option<ChainWhy> {
     if owner != 0 && owner != ours {
@@ -981,7 +989,8 @@ pub(crate) fn probe_local_seal_at(layout: &Layout, rustup_home: &Path) -> Option
     })
 }
 
-/// How much of the report a person asked.
+/// How much of the report a person asked for: the problems (the default), or everything
+/// the doctor checked (`--verbose`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
     /// The verdict, then only what needs attention (each in one short line with its next step).
@@ -2771,6 +2780,8 @@ pub(crate) fn read(
     }
     if let Some(s) = status.as_ref() {
         for (program, row) in &s.programs {
+            // Only the group hold. A member held after a failed stage (`held: last attempt
+            // failed with …`) is not installed and no pass moves it; it is listed with the
             // problems (`is_problem_state`).
             if row.state.starts_with(crate::state::HELD_PREFIX)
                 && !row.state.starts_with(crate::state::HELD_FAILED_PREFIX)
@@ -2814,6 +2825,7 @@ pub(crate) fn read(
             continue;
         }
         if let Some((tool, path)) = shadow {
+            // Outside aterm, a stub that passes through to the user's own copy is the
             // design: a note, never shadowed.
             if let Some(row) = crate::cli::agent_passed_row(
                 layout,

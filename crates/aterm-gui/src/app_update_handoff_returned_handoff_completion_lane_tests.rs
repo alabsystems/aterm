@@ -10,8 +10,7 @@ use crate::native_updater_service::{
 
 const TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// Stage one strictly-newer build through the real check reducer, so the
-/// artifact the completion reduces below is the one production would hold.
+/// Stage one strictly-newer build through the real check reducer.
 fn stage_one_build(app: &mut App) -> u64 {
     let current_build = app.native_updater_service.snapshot().current_build;
     let build = current_build + 1;
@@ -51,7 +50,6 @@ fn stage_one_build(app: &mut App) -> u64 {
 }
 
 /// Whether a latch deadline is a structural verdict's single re-sample a day out.
-/// Named by its schedule, not to the second, since these are real `Instant`s.
 fn is_structural_resample(retry_at: Option<std::time::Instant>) -> bool {
     retry_at.is_some_and(|at| {
         let wait = at.saturating_duration_since(std::time::Instant::now());
@@ -121,10 +119,6 @@ fn reduce_one_returned_failure(
     );
 }
 
-/// A physical failure a person asked for (Version menu, palette,
-/// `aterm-ctl update apply`, install on clean quit) is not charged to the
-/// automatic lane's budget. Both lanes are driven against the same artifact in
-/// the same `App` with identical worker reports; the contrast is the assertion.
 #[test]
 fn a_person_s_returned_handoff_never_spends_the_automatic_lane_s_budget() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -136,8 +130,6 @@ fn a_person_s_returned_handoff_never_spends_the_automatic_lane_s_budget() {
          which is the state a person's click has to leave alone"
     );
 
-    // A person's failure charges nothing: not the physical budget, the
-    // manual-only latch or the live automatic intent.
     reduce_one_returned_failure(
         &mut app,
         ApplyMode::Immediate,
@@ -163,8 +155,6 @@ fn a_person_s_returned_handoff_never_spends_the_automatic_lane_s_budget() {
         "and it must not retire the live automatic intent either"
     );
 
-    // The same failure authorized in the background is charged in full; ignoring
-    // the mode would make the block above produce this state.
     reduce_one_returned_failure(
         &mut app,
         ApplyMode::AutomaticPastGrace,
@@ -195,9 +185,6 @@ fn a_person_s_returned_handoff_never_spends_the_automatic_lane_s_budget() {
     );
 }
 
-/// The activity classification stays on the background lane: a person's attempt
-/// arms no revocation watcher, so an activity-shaped rejection against it must
-/// not mint an `arm_activity_revoked_overlap_retry` cycle.
 #[test]
 fn a_person_s_activity_revoked_completion_arms_no_automatic_retry() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -256,9 +243,6 @@ fn a_person_s_activity_revoked_completion_arms_no_automatic_retry() {
     );
 }
 
-/// Automatic attempts that will retry (capture refusal or physical failure within
-/// budget) record an Info wait entry rather than a Warn failure; stopped lanes and
-/// manual attempts record Warn.
 #[test]
 fn a_switch_the_automatic_lane_retries_by_itself_is_recorded_as_waiting() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -266,8 +250,6 @@ fn a_switch_the_automatic_lane_retries_by_itself_is_recorded_as_waiting() {
         app.messages
             .log()
             .records()
-            // The switch's own stop: "aterm vY kept running …", or the
-            // capture refusal's record that says it.
             .filter(|record| {
                 let detail = record.detail.join(" ");
                 (record.title.starts_with("Couldn't install aterm")
@@ -296,7 +278,6 @@ fn a_switch_the_automatic_lane_retries_by_itself_is_recorded_as_waiting() {
             crate::UpdateHandoffOutcome::TimedOut,
             true,
         ),
-        // Negative control: a person's press that failed is not retried.
         (
             ApplyMode::Immediate,
             crate::UpdateHandoffOutcome::TimedOut,
@@ -332,10 +313,6 @@ fn a_switch_the_automatic_lane_retries_by_itself_is_recorded_as_waiting() {
     }
 }
 
-/// The typed failure kind reaches the budget: "missed a 15 s deadline" and
-/// "these two images cannot agree on an adoption proof" cost differently.
-/// Driven through `reduce_returned_handoff_completion` with two artifacts in one
-/// `App`, so each has its own budget and only the worker's verdict differs.
 #[test]
 fn a_structural_worker_outcome_reaches_a_different_schedule_from_a_transient_one() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -347,9 +324,6 @@ fn a_structural_worker_outcome_reaches_a_different_schedule_from_a_transient_one
             .retry_at
     };
 
-    // AdoptionMismatch twice: a confirmation, then the end of the schedule for
-    // those bytes, converged onto the one re-sample a day out (`arm` reads it as
-    // `SuppressManualOnly` until due).
     for _ in 0..2 {
         reduce_one_returned_failure(
             &mut app,
@@ -369,8 +343,6 @@ fn a_structural_worker_outcome_reaches_a_different_schedule_from_a_transient_one
         deadline(&app)
     );
 
-    // TimedOut twice on different bytes: still scheduled, on the second rung,
-    // proving the two arcs have separate counters.
     for _ in 0..2 {
         reduce_one_returned_failure(
             &mut app,
@@ -391,16 +363,11 @@ fn a_structural_worker_outcome_reaches_a_different_schedule_from_a_transient_one
     );
 }
 
-/// Through the production reducer: an automatic attempt whose park missed every
-/// rung returns with `park_miss_disposition`'s outcome and is treated as
-/// activity: a live retry intent on the spaced schedule, no manual-only latch, no
-/// physical budget spent, the ladder's anchor unchanged. Twice.
 #[test]
 fn a_park_that_missed_every_rung_is_retried_as_activity_and_never_latches() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
     let build = stage_one_build(&mut app);
-    // Inside KeysOnly, where a busy machine is admitted.
     let armed_at = std::time::Instant::now()
         - crate::native_update_auto_intent::PREFER_IDLE_WINDOW
         - crate::native_update_auto_intent::PREFER_OUTPUT_GAP_WINDOW
@@ -452,12 +419,6 @@ fn a_park_that_missed_every_rung_is_retried_as_activity_and_never_latches() {
     );
 }
 
-/// A capture refusal is its own lane, through the production reducer: recorded as
-/// an apply failure (`failing_applies` moves, `update status` names it), retried
-/// only once the desk changes or the hourly backstop passes, never on the
-/// activity spacing, never charged to the physical budget, never latched. Twice.
-// The bundle apply lane and its ledger (`aterm_update::apply_lane_report`) are
-// macOS's: a Linux update replaces the executable on disk and hands nothing off.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_capture_refusal_is_recorded_waits_for_the_desk_and_never_latches() {
@@ -472,8 +433,6 @@ fn a_capture_refusal_is_recorded_waits_for_the_desk_and_never_latches() {
         announced: crate::native_update_auto_intent::ApplyPhase::KeysOnly,
         restored_hold_said: false,
     });
-    // The scratch ledger is shared with sibling tests (under the lock held above),
-    // so counts are compared step to step.
     let mut failing = None;
     for refusal in 1..=2_u32 {
         let before = std::time::Instant::now();
@@ -524,16 +483,10 @@ fn a_capture_refusal_is_recorded_waits_for_the_desk_and_never_latches() {
         );
     }
 
-    // An unchanged desk holds the next attempt: no successor is launched into
-    // the same refusal.
     let now = std::time::Instant::now();
     assert!(app.capture_refusal_holds(build, dmg, false, now));
     assert!(app.capture_refusal_holds(build, dmg, false, now));
-    // …a different artifact is not held by it…
     assert!(!app.capture_refusal_holds(build + 1, dmg, false, now));
-    // …and the desk moving releases it (a resize is one of the facts every
-    // refusal the capture can make is about), once the spacing of a second
-    // refusal in a row has passed (`capture_refusal_spacing`).
     for session in app.pool.iter() {
         crate::term_lock(&session.term).resize(30, 100);
     }
@@ -545,7 +498,6 @@ fn a_capture_refusal_is_recorded_waits_for_the_desk_and_never_latches() {
         "a released refusal holds nothing more, so the attempt that follows is ordinary"
     );
 
-    // The backstop: an hour with the desk unchanged tries once more anyway.
     app.auto_apply_capture_refusal = Some(crate::AutoApplyCaptureRefusal {
         build,
         dmg_sha256: dmg,
@@ -564,8 +516,7 @@ fn a_capture_refusal_is_recorded_waits_for_the_desk_and_never_latches() {
     ));
 }
 
-/// Arm the refusal lane for `build` through the production reducer, as a
-/// returned `CaptureRefused` completion does.
+/// Arm the refusal lane for `build` through the production reducer.
 fn refuse_capture(app: &mut App, build: u64) {
     reduce_one_returned_failure(
         app,
@@ -577,8 +528,6 @@ fn refuse_capture(app: &mut App, build: u64) {
     );
 }
 
-/// Verify parser mid-escape state changes from streaming output do not release a
-/// capture-refusal hold, while a terminal resize does.
 #[test]
 fn a_parser_between_reads_does_not_release_a_capture_refusal() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -602,8 +551,6 @@ fn a_parser_between_reads_does_not_release_a_capture_refusal() {
     );
 }
 
-/// Verify repeated capture refusals for the same build enforce backoff spacing
-/// (0 s first, 600 s second, 1800 s third+) before a desk change releases the hold.
 #[test]
 fn a_capture_refusal_that_comes_back_is_spaced_not_retried_every_probe() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -645,8 +592,6 @@ fn a_capture_refusal_that_comes_back_is_spaced_not_retried_every_probe() {
             "refusal {refusal}: never a latch"
         );
     }
-    // The streak is about one update: another build's first refusal is
-    // released at the probe.
     refuse_capture(&mut app, build + 1);
     let refused_at = std::time::Instant::now();
     move_desk(&mut app);
@@ -658,8 +603,6 @@ fn a_capture_refusal_that_comes_back_is_spaced_not_retried_every_probe() {
     ));
 }
 
-/// Verify a capture refusal recorded while a tab's engine is locked captures its
-/// baseline at the next probe rather than waiting for the backoff spacing to elapse.
 #[test]
 fn a_refusal_recorded_on_a_busy_desk_takes_its_baseline_at_the_probe() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -667,9 +610,6 @@ fn a_refusal_recorded_on_a_busy_desk_takes_its_baseline_at_the_probe() {
     let build = stage_one_build(&mut app);
     let dmg = [0xab_u8; 32];
     refuse_capture(&mut app, build);
-    // Refusal 2 is recorded while a reader holds its tab's engine. The arm
-    // is called directly: the rest of the reducer's rollback waits for
-    // that engine, which in production its reader lets go of.
     let busy = HeldEngine::hold(&app.pool.iter().next().expect("a session").term);
     app.arm_capture_refusal_retry(build, dmg, false, "the park's capture refused");
     let refused_at = std::time::Instant::now();
@@ -691,7 +631,6 @@ fn a_refusal_recorded_on_a_busy_desk_takes_its_baseline_at_the_probe() {
         "the lane comes back within {probe:?} for its baseline, not after the {spacing:?} \
          spacing"
     );
-    // The probe takes the baseline, and still holds.
     assert!(app.capture_refusal_holds(build, dmg, false, refused_at + probe));
     assert!(
         app.auto_apply_capture_refusal
@@ -699,13 +638,10 @@ fn a_refusal_recorded_on_a_busy_desk_takes_its_baseline_at_the_probe() {
             .is_some_and(|refusal| refusal.desk.complete()),
         "the first readable desk is the baseline, inside the spacing"
     );
-    // …after which nothing comes back before the spacing ends (the record's
-    // clock was read a moment before `refused_at`).
     assert!(
         app.capture_refusal_reprobe_at(refused_at + probe)
             >= refused_at + spacing - Duration::from_secs(1)
     );
-    // The person closes the offending tab at +60 s (a resize stands for it).
     for session in app.pool.iter() {
         crate::term_lock(&session.term).resize(31, 100);
     }
@@ -730,8 +666,7 @@ fn a_refusal_recorded_on_a_busy_desk_takes_its_baseline_at_the_probe() {
     );
 }
 
-/// A reader holding one session's engine, as a reader draining a flood
-/// does, until dropped.
+/// A reader holding one session's engine, as a reader draining a flood does, until dropped.
 struct HeldEngine {
     unlock: Option<std::sync::mpsc::Sender<()>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -745,8 +680,6 @@ impl HeldEngine {
         let reader = std::thread::spawn(move || {
             let _engine = crate::term_lock(&term);
             locked.send(()).expect("the test waits for the lock");
-            // A hang detector, never a latency budget: dropping the guard
-            // disconnects this at once.
             let _ = unlocked.recv_timeout(Duration::from_secs(60));
         });
         is_locked.recv().expect("the reader holds the engine");
@@ -766,11 +699,7 @@ impl Drop for HeldEngine {
     }
 }
 
-/// A desk of three tabs whose first one a reader holds, with `build`'s
-/// second capture refusal in a row recorded on it (spaced 600 s): its
-/// baseline knows all three tabs and lacks only the busy one's reading.
-/// Returns the build, the held engine, the two quiet tabs' ids and when it
-/// was refused.
+/// A desk of three tabs whose first one a reader holds.
 fn second_refusal_beside_a_busy_engine(
     app: &mut App,
 ) -> (u64, HeldEngine, [u64; 2], std::time::Instant) {
@@ -799,8 +728,6 @@ fn second_refusal_beside_a_busy_engine(
     (build, busy, quiet, refused_at)
 }
 
-/// Verify closing or resizing a quiet tab before the first probe releases a capture
-/// refusal even if another tab's engine remains locked.
 #[test]
 fn a_tab_closed_or_resized_before_the_first_probe_beside_a_busy_engine_counts() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -812,7 +739,6 @@ fn a_tab_closed_or_resized_before_the_first_probe_beside_a_busy_engine_counts() 
     for change in ["close", "resize", "nothing"] {
         let mut app = App::headless_for_test();
         let (build, busy, quiet, refused_at) = second_refusal_beside_a_busy_engine(&mut app);
-        // At once, before any probe, while the busy tab stays busy.
         match change {
             "close" => assert!(app.pool.detach(quiet[0]), "PRECONDITION: the tab closes"),
             "resize" => {
@@ -875,8 +801,6 @@ fn a_tab_closed_or_resized_before_the_first_probe_beside_a_busy_engine_counts() 
     }
 }
 
-/// Verify `poll_native_auto_apply` captures a previously locked tab's baseline
-/// even when the poll defers on user activity.
 #[test]
 fn a_poll_that_waits_for_activity_still_reads_a_busy_tabs_baseline() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -888,8 +812,6 @@ fn a_poll_that_waits_for_activity_still_reads_a_busy_tabs_baseline() {
         "the lane looks again within the baseline probe"
     );
     drop(busy);
-    // That look comes while the person is busy, in the ladder's first phase
-    // (the refusal anchored it now), so the poll waits for activity.
     app.auto_apply_intent = Some(crate::AutoApplyIntent {
         retry_at: std::time::Instant::now() - Duration::from_secs(1),
         ..intent
@@ -910,8 +832,6 @@ fn a_poll_that_waits_for_activity_still_reads_a_busy_tabs_baseline() {
     );
 }
 
-/// Verify repeated capture refusals log a single switch-titled wait record per
-/// refusal naming the retry spacing from the second refusal onward.
 #[test]
 fn a_refusal_that_came_back_is_recorded_with_its_spacing() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -921,8 +841,6 @@ fn a_refusal_that_came_back_is_recorded_with_its_spacing() {
     let running = snapshot.current_build;
     let version = snapshot.staged.as_ref().expect("staged").version.clone();
     for refusal in 1..=3 {
-        // As the lane does: the switch is on record before the park refuses
-        // (the first attempt's start; a later attempt at the build adds none).
         let before = app.messages.log().records().count();
         app.record_update_switch_started(running, false, true);
         let started = app.messages.log().records().count() - before;
@@ -939,7 +857,6 @@ fn a_refusal_that_came_back_is_recorded_with_its_spacing() {
             .skip(before + started)
             .cloned()
             .collect();
-        // One record per refusal: no separate "kept running" stop beside it.
         assert_eq!(added.len(), 1, "refusal {refusal}: {added:?}");
         assert_eq!(
             added[0].title,
@@ -949,11 +866,6 @@ fn a_refusal_that_came_back_is_recorded_with_its_spacing() {
     }
 }
 
-/// This process's own failures are not the candidate's, through the production
-/// reducer: two `ProducerFailed` completions (a full disk at the manifest write,
-/// `EMFILE` at the descriptor duplicate) stay on the transient schedule, while the
-/// same two as `PreparationFailed` (the control) converge onto a structural
-/// verdict's one re-sample a day out.
 #[test]
 fn a_producer_failure_retries_where_a_preparation_failure_converges() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -986,9 +898,6 @@ fn a_producer_failure_retries_where_a_preparation_failure_converges() {
     }
 }
 
-/// The fork lane climbs the freeze ladder across attempts: a miss rides the
-/// activity spacing, and the rung is counted per target build: 20 ms, then
-/// 80 ms, then a quarter second; a different build starts over.
 #[cfg(unix)]
 #[test]
 fn a_fork_lane_park_miss_is_timing_and_buys_the_next_rung() {
@@ -1022,10 +931,6 @@ fn a_fork_lane_park_miss_is_timing_and_buys_the_next_rung() {
     );
 }
 
-/// The fork lane's automatic park miss is recorded like the launched lane's
-/// activity stand-down (`HandoffFailureLane::ActivityRevoked`, routine), so the
-/// switch record says "Waiting to install", while a person's apply (`Manual`)
-/// stays a stop worth a warning.
 #[cfg(unix)]
 #[test]
 fn a_fork_lane_park_miss_is_recorded_as_the_routine_wait_it_is() {
@@ -1041,7 +946,6 @@ fn a_fork_lane_park_miss_is_recorded_as_the_routine_wait_it_is() {
     assert!(!miss.stops_routinely(mode), "{mode:?}: a person asked");
     let activity = crate::UpdateHandoffStartError::activity("typing");
     assert!(activity.stops_routinely(ApplyMode::Immediate));
-    // Automatic capture refusal is routine (`stops_routinely`); manual is not.
     let refusal = crate::UpdateHandoffStartError::capture_refused("session 3");
     assert!(refusal.stops_routinely(ApplyMode::Automatic));
     assert!(!refusal.stops_routinely(ApplyMode::Immediate));
@@ -1053,9 +957,6 @@ fn a_fork_lane_park_miss_is_recorded_as_the_routine_wait_it_is() {
     }
 }
 
-/// The classification as a table, so a new outcome variant is placed deliberately: by mode
-/// and typed outcome, with `Unobserved` evidence (so `ChildDied` lands in `Unexplained`; its
-/// evidence arms are `a_dead_candidate_is_classified_by_what_the_worker_saw`).
 #[test]
 fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
     use crate::ChildDeathEvidence as Death;
@@ -1064,25 +965,16 @@ fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
 
     for (outcome, expected) in [
         (Outcome::AdoptionMismatch, Lane::Physical(Shape::Structural)),
-        // Only the candidate failing its pre-park verification.
         (
             Outcome::PreparationFailed,
             Lane::Physical(Shape::Structural),
         ),
-        // This process's own write/descriptor failures: about the moment and
-        // the machine, never the bytes.
         (Outcome::ProducerFailed, Lane::Physical(Shape::Transient)),
-        // A deterministic capture refusal: its own lane, never a physical
-        // shape and never activity.
         (Outcome::CaptureRefused, Lane::Refused),
-        // Neither `Structural` nor `Transient`: with nothing observed, proof
-        // EOF is a failure whose kind is unknown.
         (Outcome::ChildDied, Lane::Physical(Shape::Unexplained)),
         (Outcome::TimedOut, Lane::Physical(Shape::Transient)),
         (Outcome::Rejected, Lane::Physical(Shape::Transient)),
         (Outcome::ActivityRevoked, Lane::ActivityRevoked),
-        // Unreachable as a failure (the commit path handles it); fails closed to
-        // the forgiving shape.
         (Outcome::ProofReady, Lane::Physical(Shape::Transient)),
     ] {
         assert_eq!(
@@ -1095,15 +987,11 @@ fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
             expected,
             "{outcome:?} in the background lane"
         );
-        // A person's apply charges nothing whatever the worker reported.
         assert_eq!(
             Lane::classify(ApplyMode::Immediate, outcome, Death::Unobserved, false),
             Lane::Manual,
             "{outcome:?} from a person"
         );
-        // The main thread's own activity-shaped rejection dominates the physical shape (a
-        // rollback the terminal caused says nothing about the artifact), but not a capture
-        // refusal (`RefusalNeverRetriesAsActivity`).
         assert_eq!(
             Lane::classify(
                 ApplyMode::AutomaticPastGrace,
@@ -1121,8 +1009,6 @@ fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
     }
 }
 
-/// Verify `ChildDied` with `Sigkill` uses the transient failure budget rather
-/// than converging on the structural budget.
 #[test]
 fn a_starved_child_died_keeps_retrying_past_the_budget_a_refusal_would_spend() {
     use crate::app_native::{
@@ -1166,8 +1052,6 @@ fn a_starved_child_died_keeps_retrying_past_the_budget_a_refusal_would_spend() {
          got {still_coming:?}"
     );
 
-    // Still bounded: the rest of the transient lifetime ends the schedule; after that, one
-    // quiet re-sample per epoch cooldown (six hours).
     for _ in STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS..PHYSICAL_FAILURE_LIFETIME_ATTEMPTS {
         reduce_one_returned_failure(
             &mut app,
@@ -1189,9 +1073,6 @@ fn a_starved_child_died_keeps_retrying_past_the_budget_a_refusal_would_spend() {
     );
 }
 
-/// A refusing successor converges on the structural budget, but not on its first failure.
-/// `Exited { code: 0 }` is how a candidate whose boot apply could not swap refuses (it
-/// returns from `main_entry`); reaching an exit separates it from a starved child.
 #[test]
 fn a_refusing_child_died_converges_to_manual_only_within_its_budget() {
     use crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS;
@@ -1247,11 +1128,6 @@ fn a_refusing_child_died_converges_to_manual_only_within_its_budget() {
     );
 }
 
-/// A successor whose swap was deferred for a moment (its boot apply waited out a sibling's
-/// apply lock, or `codesign` ran out of budget) exits
-/// [`crate::seamless::EXIT_SUCCESSOR_PASSING`] and is retried, not converged: the failures
-/// that converge an exit `0` leave it on the transient schedule's second rung, with no
-/// structural verdict and its trial launch forgiven.
 #[test]
 fn a_successor_that_exits_75_is_retried_on_the_transient_schedule() {
     use crate::app_native::STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS;
@@ -1292,9 +1168,6 @@ fn a_successor_that_exits_75_is_retried_on_the_transient_schedule() {
     );
 }
 
-/// A pre-park check that did not finish is this process's trouble: the worker
-/// files it `ProducerFailed`, which the completion classifies Transient, while a
-/// verdict stays `PreparationFailed` (Structural).
 #[test]
 fn a_pre_park_check_that_did_not_finish_is_filed_transient() {
     use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
@@ -1342,8 +1215,6 @@ fn a_pre_park_check_that_did_not_finish_is_filed_transient() {
     );
 }
 
-/// Verify `ChildDied` with `Unobserved` evidence converges after
-/// `UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS` and schedules an epoch-cooldown resample.
 #[test]
 fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
     use crate::app_native::{
@@ -1396,9 +1267,6 @@ fn an_unexplained_child_died_gets_a_second_epoch_and_then_only_resamples() {
     );
 }
 
-/// The evidence axis as a total table: each `ChildDeathEvidence` and the shape it earns. A
-/// CPU-starved child also dies before its proof, so `ChildDied` is not structural
-/// unconditionally; every arm is an observed fact, never a duration or a message.
 #[test]
 fn a_dead_candidate_is_classified_by_what_the_worker_saw() {
     use crate::ChildDeathEvidence as Death;
@@ -1471,8 +1339,6 @@ fn a_dead_candidate_is_classified_by_what_the_worker_saw() {
             Lane::Physical(expected),
             "{death:?}: {why}"
         );
-        // The evidence is read for `ChildDied` only; every other outcome is a
-        // candidate this process ended, whose status is our SIGKILL.
         assert_eq!(
             Lane::classify(
                 ApplyMode::AutomaticPastGrace,

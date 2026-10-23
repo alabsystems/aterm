@@ -3,8 +3,7 @@
 
 use super::*;
 
-/// Every line of `text` lexed from the start, one rendered line per line:
-/// each span as its class letter and its text in «».
+/// Every line of `text` lexed from the start, one rendered line per line.
 fn render(language: Language, text: &str) -> String {
     let mut state = LexState::START;
     let mut rendered = Vec::new();
@@ -37,7 +36,6 @@ fn letter(class: SyntaxClass) -> char {
 #[test]
 fn detect_table() {
     let table: &[(&str, &str, Language)] = &[
-        // The files git asks its editor for decide by name, wherever they are.
         ("/repo/.git/COMMIT_EDITMSG", "", Language::GitCommit),
         (
             "/repo/.git/MERGE_MSG",
@@ -53,10 +51,8 @@ fn detect_table() {
             "pick 1a2b3c4 x",
             Language::GitRebaseTodo,
         ),
-        // A name git did not write is not one of git's files.
         ("commit_editmsg", "", Language::Plain),
         ("COMMIT_EDITMSG.bak", "", Language::Plain),
-        // Extensions, in any case.
         ("README.md", "", Language::Markdown),
         ("notes.MARKDOWN", "", Language::Markdown),
         ("Cargo.toml", "", Language::Toml),
@@ -65,15 +61,11 @@ fn detect_table() {
         ("x.zsh", "", Language::Shell),
         ("fix.patch", "", Language::Diff),
         ("x.diff", "", Language::Diff),
-        // Well-known names.
         ("Cargo.lock", "", Language::Toml),
         ("/home/me/.bashrc", "", Language::Shell),
         ("/home/me/.zshrc", "", Language::Shell),
-        // A dotfile's name is not an extension.
         (".md", "", Language::Plain),
-        // The extension beats the first line.
         ("main.rs", "#!/bin/sh", Language::Rust),
-        // Shebangs, through `env` and its options.
         ("tools/install", "#!/bin/sh", Language::Shell),
         ("x", "#!/usr/bin/env bash", Language::Shell),
         ("x", "#! /bin/zsh -f", Language::Shell),
@@ -84,7 +76,6 @@ fn detect_table() {
             Language::Rust,
         ),
         ("x.py", "#!/usr/bin/env python3", Language::Plain),
-        // A diff or a patch mail by its first line.
         ("-", "diff --git a/x b/x", Language::Diff),
         (
             "0001",
@@ -92,7 +83,6 @@ fn detect_table() {
             Language::Diff,
         ),
         ("From", "From me to you", Language::Plain),
-        // Everything else is plain.
         ("notes.txt", "", Language::Plain),
         ("Makefile", "all:", Language::Plain),
         ("", "", Language::Plain),
@@ -234,10 +224,6 @@ M«msg» S«"open»
 S«still"»"#;
     assert_eq!(render(Language::Shell, shell), shell_expected);
 
-    // A here-document's body is string to the line that is its word: an
-    // apostrophe in it opens nothing. `<<-` takes the body's tabs off, a
-    // quoted word is the word without its quotes, and `<<` inside `$(( ))`
-    // is a shift.
     let heredoc = "cat <<EOF >out
 Don't stop
 EOF
@@ -284,9 +270,6 @@ M«```»\n\
 P«|» P«|» P«|»";
     assert_eq!(render(Language::Markdown, markdown), markdown_expected);
 
-    // A fence opened in a quote closes on a quoted fence, and ends with the
-    // quote when a line leaves it; a quoted fence inside an unquoted one is
-    // code.
     let quoted = "> ```\n> x = 1;\n> ```\n# After\n> ~~~\n> y\nplain\n```\n> ```\n```";
     let quoted_expected = "P«>» M«```»\n\
 P«>» S«x = 1;»\n\
@@ -367,8 +350,7 @@ C«# comment»
     );
 }
 
-/// A deterministic generator (splitmix64), so the property tests are the
-/// same cases on every run.
+/// A deterministic generator (splitmix64), so the property tests are the same cases on every run.
 struct Rng(u64);
 
 impl Rng {
@@ -385,8 +367,7 @@ impl Rng {
     }
 }
 
-/// Fragments that open and close every construct some lexer carries across
-/// lines, and the characters that could split a span.
+/// Fragments that open and close every construct some lexer carries across lines.
 const FRAGMENTS: &[&str] = &[
     "\n",
     "\n",
@@ -450,7 +431,7 @@ fn random_text(rng: &mut Rng, fragments: usize) -> String {
         .collect()
 }
 
-/// Where line `line` of `text` starts: 0, or just past the `line`-th `\n`.
+/// Where line `line` of `text` starts.
 fn line_offset(text: &str, line: usize) -> usize {
     match line.checked_sub(1) {
         None => 0,
@@ -471,8 +452,7 @@ fn boundary(rng: &mut Rng, text: &str) -> usize {
     boundaries[rng.below(boundaries.len())]
 }
 
-/// Every span of every line is non-empty, inside its line, on char
-/// boundaries, and after the one before it.
+/// Every span of every line is non-empty.
 fn assert_spans_well_formed(cache: &LexCache, text: &str) {
     for (index, line) in text.split('\n').enumerate() {
         let mut end = 0;
@@ -499,8 +479,6 @@ fn incremental_lex_equals_full_lex() {
             for _ in 0..6 {
                 let lines = text.split('\n').count();
                 let (first, removed, inserted) = match rng.below(3) {
-                    // Whole lines inserted before line `at`: nothing of
-                    // the old text is replaced.
                     0 => {
                         let at = rng.below(lines);
                         let count = rng.below(3);
@@ -515,9 +493,6 @@ fn incremental_lex_equals_full_lex() {
                         text.insert_str(line_offset(&text, at), &block);
                         (at, 0, count)
                     }
-                    // Whole lines deleted, each with its line break (so
-                    // never the last line, which has none): nothing is
-                    // inserted.
                     1 if lines > 1 => {
                         let at = rng.below(lines - 1);
                         let count = 1 + rng.below(lines - 1 - at);
@@ -526,7 +501,6 @@ fn incremental_lex_equals_full_lex() {
                         text.replace_range(start..end, "");
                         (at, count, 0)
                     }
-                    // Any range of chars replaced.
                     _ => {
                         let a = boundary(&mut rng, &text);
                         let b = boundary(&mut rng, &text);
@@ -557,15 +531,12 @@ fn incremental_lex_equals_full_lex() {
 fn splice_stops_where_the_state_settles() {
     let text: String = (0..100).map(|n| format!("let v{n} = {n};\n")).collect();
     let mut cache = LexCache::new(Language::Rust, &text);
-    // An edit inside one line that leaves its end state alone re-lexes it alone.
     let edited = text.replacen("let v50", "let w50", 1);
     assert_eq!(cache.splice(&edited, 50, 1, 1), 1);
     assert_eq!(cache, LexCache::new(Language::Rust, &edited));
-    // Opening a comment at the top re-lexes every line it now covers.
     let opened = format!("/*{edited}");
     assert_eq!(cache.splice(&opened, 0, 1, 1), 101);
     assert_eq!(cache, LexCache::new(Language::Rust, &opened));
-    // Out-of-range input is clamped, never a panic.
     cache.splice(&opened, 1_000, 5, 1);
     assert_eq!(cache, LexCache::new(Language::Rust, &opened));
     assert!(cache.spans(10_000).is_empty());
@@ -574,8 +545,6 @@ fn splice_stops_where_the_state_settles() {
 
 #[test]
 fn lexing_reads_each_byte_a_bounded_number_of_times() {
-    // Lines built to make a careless lexer look back or rescan: runs of
-    // openers that never close, and closers with no opener.
     let units = [
         "/*", "*/", "\"\\", "r###\"", "\"##", "'", "'\\", "`", "``", "<!--", "-", "#", "${", "$",
         "@@ -", "\"\"\"", "'''", "[", "{", "](", "<a", "- ", "> ", "é", "=", ",", "<<", "<<-x ",
@@ -589,7 +558,6 @@ fn lexing_reads_each_byte_a_bounded_number_of_times() {
             .filter(|fragment| !fragment.contains('\n'));
         fragments.collect::<String>()
     }));
-    // Every state a line can start in, from a short opener line.
     let openers = [
         "",
         "/* a",
@@ -641,8 +609,7 @@ fn prefix(
     language.line_break(state, before, after, style).prefix
 }
 
-/// Each line's indent as `indent_column` computes it from the lines above,
-/// next to the indent the line has.
+/// Each line's indent as `indent_column` computes it from the lines above.
 fn reindent(language: Language, text: &str, style: IndentStyle) -> Vec<(usize, usize)> {
     let cache = LexCache::new(language, text);
     let mut previous: Option<&str> = None;
@@ -660,7 +627,6 @@ fn reindent(language: Language, text: &str, style: IndentStyle) -> Vec<(usize, u
 
 #[test]
 fn indent_rules() {
-    // Rust: re-indenting rustfmt's output changes nothing.
     let rust = "fn main() {
     let x = foo(
         a,
@@ -695,8 +661,6 @@ fn indent_rules() {
     }
     let style = IndentStyle::DEFAULT;
     let start = LexState::START;
-    // A line break indents the new line by the depth at the break, and a
-    // closer after the break dedents it.
     assert_eq!(
         prefix(Language::Rust, start, "fn main() {", "", style),
         "    "
@@ -711,12 +675,10 @@ fn indent_rules() {
         prefix(Language::Rust, inside, "    if y {", "}", style),
         "    "
     );
-    // Inside a string a break adds nothing.
     assert_eq!(
         prefix(Language::Rust, inside, "    let s = \"abc", "def\";", style),
         ""
     );
-    // Tabs write whole stops.
     let tabs = IndentStyle {
         width: 4,
         tabs: true,
@@ -729,8 +691,6 @@ fn indent_rules() {
     assert_eq!(tabs.columns_of("\t  x"), 6);
     assert_eq!(style.render(usize::MAX).len(), MAX_INDENT_COLUMNS);
 
-    // The blanks around a break go, and the prefix stands in for them;
-    // inside a string nothing goes and nothing is added.
     assert_eq!(
         Language::Rust.line_break(start, "fn main() {  ", "  }", style),
         LineBreak {
@@ -757,7 +717,6 @@ fn indent_rules() {
         }
     );
 
-    // Markdown continues a list, and ends it at an empty item.
     let markdown = |before: &str| prefix(Language::Markdown, start, before, "", style);
     assert_eq!(markdown("- item"), "- ");
     assert_eq!(markdown("  * nested"), "  * ");
@@ -769,14 +728,10 @@ fn indent_rules() {
     assert_eq!(markdown("plain text"), "");
     assert_eq!(markdown("    indented"), "    ");
     assert_eq!(markdown("---"), "", "a thematic break is not an item");
-    // An empty item's marker comes off the line above.
     let ended = |before: &str| Language::Markdown.line_break(start, before, "", style);
     assert_eq!(ended("- ").keep, 0);
     assert_eq!(ended("  3. ").keep, 0);
     assert_eq!(ended("- item  ").keep, 6);
-    // A quote continues, with any list inside it; an empty item in a quote
-    // ends the list and keeps the quote, and an empty quote line ends the
-    // quote.
     assert_eq!(markdown("> quoted text"), "> ");
     assert_eq!(markdown("> > nested"), "> > ");
     assert_eq!(markdown("  >no space"), "  >");
@@ -798,7 +753,6 @@ fn indent_rules() {
             prefix: String::new()
         }
     );
-    // In a quoted fence the quote and the code's indentation continue.
     let (_, quoted_fence) = Language::Markdown.lex_line(start, "> ```");
     assert_eq!(
         prefix(
@@ -815,8 +769,6 @@ fn indent_rules() {
         prefix(Language::Markdown, fence, "- in code", "", style),
         ""
     );
-    // A line under an item lines up with the item's text; an item keeps its
-    // own indent.
     let md_indent =
         |above: &str, line: &str| Language::Markdown.indent_column(start, Some(above), line, style);
     assert_eq!(md_indent("- item text", "continued"), 2);
@@ -826,7 +778,6 @@ fn indent_rules() {
     assert_eq!(md_indent("plain", "x"), 0);
     assert_eq!(md_indent("   plain", "x"), 3);
 
-    // Every other language keeps the indentation of the line above.
     for language in [
         Language::Plain,
         Language::Toml,
@@ -891,7 +842,6 @@ fn git_commit_diagnostics() {
     let fifty = chars("s", 50);
     let fifty_one = chars("s", 51);
     assert_eq!(commit.diagnostics(&format!("{fifty}\n\nbody\n")), vec![]);
-    // One character over: the overflow is the range.
     assert_eq!(
         commit.diagnostics(&format!("{fifty_one}\n")),
         vec![Diag {
@@ -902,7 +852,6 @@ fn git_commit_diagnostics() {
             message: "the summary is 51 characters; keep it to 50".to_owned(),
         }]
     );
-    // Characters, not bytes; trailing blanks and a CR do not count.
     let wide = chars("é", 51);
     let found = commit.diagnostics(&format!("{wide}  \r\n"));
     assert_eq!(found.len(), 1);
@@ -911,15 +860,12 @@ fn git_commit_diagnostics() {
         commit.diagnostics(&format!("{}  \r\n", chars("é", 50))),
         vec![]
     );
-    // The summary is the first line git keeps: comments and blank lines
-    // before it are skipped, and the range is in the whole text.
     let text = format!("# Please enter\n\n{fifty_one}\n");
     let found = commit.diagnostics(&text);
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].line, 2);
     assert_eq!(&text[found[0].range.clone()], "s");
 
-    // The line after the summary must be blank, once comments are dropped.
     let second = |text: &str| {
         commit
             .diagnostics(text)
@@ -940,7 +886,6 @@ fn git_commit_diagnostics() {
     assert_eq!(second("Summary\n   \nBody"), vec![]);
     assert_eq!(second("Summary"), vec![]);
     assert_eq!(second(""), vec![]);
-    // Both rules at once.
     assert_eq!(
         commit
             .diagnostics(&format!("{fifty_one}\nbody"))
@@ -949,16 +894,13 @@ fn git_commit_diagnostics() {
             .collect::<Vec<_>>(),
         vec![DiagKind::SummaryTooLong, DiagKind::SecondLineNotBlank]
     );
-    // Nothing after the scissors line is the message.
     let verbose =
         format!("\n# ------------------------ >8 ------------------------\n{fifty_one}\nx\n");
     assert_eq!(commit.diagnostics(&verbose), vec![]);
-    // A configured limit.
     assert_eq!(commit.diagnostics_with(&fifty_one, 72), vec![]);
     assert_eq!(commit.diagnostics_with(&fifty, 49).len(), 1);
     assert_eq!(DiagKind::SummaryTooLong.name(), "summary-too-long");
 
-    // A rebase todo flags each command git does not know, and nothing else.
     let todo = "pick 1a2b3c4 x\npck 5d6e7f8 typo\n\n# pick in a comment\n  exec make\r\nbogus\n";
     let found = Language::GitRebaseTodo.diagnostics(todo);
     let flagged: Vec<_> = found
@@ -981,7 +923,6 @@ fn git_commit_diagnostics() {
     );
     assert!(found[0].message.contains("`pck`"));
 
-    // The other languages report nothing.
     for language in [
         Language::Plain,
         Language::Markdown,
@@ -1007,10 +948,6 @@ fn commit_editmsg_detects_fills_at_72_and_flags_a_51_character_summary() {
     assert_eq!(found[0].range, 50..51);
 }
 
-/// The contracted byte classes, clamps and digit step against the std
-/// forms they stand for, which no Clean theorem can state (they are calls),
-/// and the one fact about the digit step no theorem states: below the bound
-/// it never wraps.
 #[test]
 fn contracted_scalar_core_matches_the_std_forms() {
     for byte in 0..=u8::MAX {
@@ -1036,8 +973,6 @@ fn contracted_scalar_core_matches_the_std_forms() {
             "{byte:#04x}"
         );
     }
-    // Every character's first byte gives its encoded length, and no
-    // continuation byte leads one.
     for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
         let mut buffer = [0; 4];
         let encoded = c.encode_utf8(&mut buffer);

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! agh's integration tests: one binary (autotests = false); a tests/*.rs that is not a mod line here never compiles.
+//! Integration test harness for `agh`.
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
@@ -10,7 +10,6 @@ aterm_durable::plain_durable_flushes_in_tests!();
 mod common;
 
 mod args;
-// Every test provisions or reports file credentials, which are unix-only (plan §1, rule 12).
 #[cfg(unix)]
 mod auth_verbs;
 mod classification;
@@ -23,7 +22,6 @@ mod fx_seam;
 mod golden_cli;
 mod help_schema;
 mod hop;
-// Every test reads a private token file.
 #[cfg(unix)]
 mod identity_files;
 mod jq_corpus;

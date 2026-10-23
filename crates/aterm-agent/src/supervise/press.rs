@@ -483,6 +483,7 @@ impl<C: Ctl> Session<'_, C> {
         let at = match self.question_text(&guard, text, &now, &key, priority, person)? {
             Keyed::Written(at) => at,
             Keyed::Not(p) => {
+                // No answer: the text may be in the field or on its way. Pending, so a box
                 // read unchanged after the reconnect is the text not taken, never re-sent.
                 if matches!(p, Pressing::Lost { .. }) {
                     self.question_pending(&now, QuestionFocus::FreeText, PendingKind::Text, false);
@@ -861,6 +862,8 @@ impl<C: Ctl> Session<'_, C> {
             .flatten()
         });
         let Some(focused) = focused.filter(|o| o.label == label) else {
+            // Same dialog, focus unmoved: the keys went nowhere (a dialog drawn before its
+            // input is live takes none), so read and decide again. A focus that moved elsewhere
             // is the manager's.
             if before.is_some() && focused_on(&now.rows) == before {
                 return Ok(Pressing::Done(Press::Changed { seq: now.seq }));
@@ -1031,6 +1034,7 @@ impl<C: Ctl> Session<'_, C> {
             }
             written += 1;
             if matches!(step, DeclineStep::Submit { .. }) {
+                // The Enter stays remembered: a read of the box still showing
                 // the reason is the Enter not yet drawn, never one to send again.
                 return Ok(Pressing::Done(Press::Pressed { seq: at }));
             }

@@ -25,8 +25,7 @@ use std::fmt::Debug;
 use std::iter;
 use std::path::PathBuf;
 
-//////////////////////////////////////////////////////////////////////////
-
+/// ///////////////////////////////////////////////////////////////////////.
 #[derive(Copy, Clone, PartialEq, Debug, Deserialize)]
 struct UnitStruct;
 
@@ -114,17 +113,14 @@ impl<'de> Deserialize<'de> for IgnoredAny {
     }
 }
 
-//////////////////////////////////////////////////////////////////////////
-
+/// ///////////////////////////////////////////////////////////////////////.
 #[track_caller]
 fn test<'de, T>(value: T, tokens: &'de [Token])
 where
     T: Deserialize<'de> + PartialEq + Debug,
 {
-    // Test ser/de roundtripping
     assert_de_tokens(&value, tokens);
 
-    // Test that the tokens are ignorable
     assert_de_tokens_ignore(tokens);
 }
 
@@ -135,8 +131,6 @@ fn assert_de_tokens_ignore(ignorable_tokens: &[Token]) {
         a: i32,
     }
 
-    // Embed the tokens to be ignored in the normal token
-    // stream for an IgnoreBase type
     let concated_tokens: Vec<Token> = vec![
         Token::Map { len: Some(2) },
         Token::Str("a"),
@@ -152,8 +146,6 @@ fn assert_de_tokens_ignore(ignorable_tokens: &[Token]) {
     assert_de_tokens(&expected, &concated_tokens);
 }
 
-//////////////////////////////////////////////////////////////////////////
-
 #[test]
 fn test_bool() {
     test(true, &[Token::Bool(true)]);
@@ -164,7 +156,6 @@ fn test_bool() {
 fn test_i8() {
     let test = test::<i8>;
 
-    // from signed
     test(-128, &[Token::I8(-128)]);
     test(-128, &[Token::I16(-128)]);
     test(-128, &[Token::I32(-128)]);
@@ -174,7 +165,6 @@ fn test_i8() {
     test(127, &[Token::I32(127)]);
     test(127, &[Token::I64(127)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -189,7 +179,6 @@ fn test_i8() {
 fn test_i16() {
     let test = test::<i16>;
 
-    // from signed
     test(-128, &[Token::I8(-128)]);
     test(-32768, &[Token::I16(-32768)]);
     test(-32768, &[Token::I32(-32768)]);
@@ -199,7 +188,6 @@ fn test_i16() {
     test(32767, &[Token::I32(32767)]);
     test(32767, &[Token::I64(32767)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -214,7 +202,6 @@ fn test_i16() {
 fn test_i32() {
     let test = test::<i32>;
 
-    // from signed
     test(-128, &[Token::I8(-128)]);
     test(-32768, &[Token::I16(-32768)]);
     test(-2147483648, &[Token::I32(-2147483648)]);
@@ -224,7 +211,6 @@ fn test_i32() {
     test(2147483647, &[Token::I32(2147483647)]);
     test(2147483647, &[Token::I64(2147483647)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -239,7 +225,6 @@ fn test_i32() {
 fn test_i64() {
     let test = test::<i64>;
 
-    // from signed
     test(-128, &[Token::I8(-128)]);
     test(-32768, &[Token::I16(-32768)]);
     test(-2147483648, &[Token::I32(-2147483648)]);
@@ -249,7 +234,6 @@ fn test_i64() {
     test(2147483647, &[Token::I32(2147483647)]);
     test(9223372036854775807, &[Token::I64(9223372036854775807)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -264,7 +248,6 @@ fn test_i64() {
 fn test_i128() {
     let test = test::<i128>;
 
-    // from signed
     test(-128, &[Token::I8(-128)]);
     test(-32768, &[Token::I16(-32768)]);
     test(-2147483648, &[Token::I32(-2147483648)]);
@@ -274,7 +257,6 @@ fn test_i128() {
     test(2147483647, &[Token::I32(2147483647)]);
     test(9223372036854775807, &[Token::I64(9223372036854775807)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -289,7 +271,6 @@ fn test_i128() {
 fn test_isize() {
     let test = test::<isize>;
 
-    // from signed
     test(-10, &[Token::I8(-10)]);
     test(-10, &[Token::I16(-10)]);
     test(-10, &[Token::I32(-10)]);
@@ -299,7 +280,6 @@ fn test_isize() {
     test(10, &[Token::I32(10)]);
     test(10, &[Token::I64(10)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -314,7 +294,6 @@ fn test_isize() {
 fn test_u8() {
     let test = test::<u8>;
 
-    // from signed
     test(0, &[Token::I8(0)]);
     test(0, &[Token::I16(0)]);
     test(0, &[Token::I32(0)]);
@@ -324,7 +303,6 @@ fn test_u8() {
     test(255, &[Token::I32(255)]);
     test(255, &[Token::I64(255)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -339,7 +317,6 @@ fn test_u8() {
 fn test_u16() {
     let test = test::<u16>;
 
-    // from signed
     test(0, &[Token::I8(0)]);
     test(0, &[Token::I16(0)]);
     test(0, &[Token::I32(0)]);
@@ -349,7 +326,6 @@ fn test_u16() {
     test(65535, &[Token::I32(65535)]);
     test(65535, &[Token::I64(65535)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -364,7 +340,6 @@ fn test_u16() {
 fn test_u32() {
     let test = test::<u32>;
 
-    // from signed
     test(0, &[Token::I8(0)]);
     test(0, &[Token::I16(0)]);
     test(0, &[Token::I32(0)]);
@@ -374,7 +349,6 @@ fn test_u32() {
     test(2147483647, &[Token::I32(2147483647)]);
     test(4294967295, &[Token::I64(4294967295)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -389,7 +363,6 @@ fn test_u32() {
 fn test_u64() {
     let test = test::<u64>;
 
-    // from signed
     test(0, &[Token::I8(0)]);
     test(0, &[Token::I16(0)]);
     test(0, &[Token::I32(0)]);
@@ -399,7 +372,6 @@ fn test_u64() {
     test(2147483647, &[Token::I32(2147483647)]);
     test(9223372036854775807, &[Token::I64(9223372036854775807)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -414,7 +386,6 @@ fn test_u64() {
 fn test_u128() {
     let test = test::<u128>;
 
-    // from signed
     test(0, &[Token::I8(0)]);
     test(0, &[Token::I16(0)]);
     test(0, &[Token::I32(0)]);
@@ -424,7 +395,6 @@ fn test_u128() {
     test(2147483647, &[Token::I32(2147483647)]);
     test(9223372036854775807, &[Token::I64(9223372036854775807)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -439,7 +409,6 @@ fn test_u128() {
 fn test_usize() {
     let test = test::<usize>;
 
-    // from signed
     test(0, &[Token::I8(0)]);
     test(0, &[Token::I16(0)]);
     test(0, &[Token::I32(0)]);
@@ -449,7 +418,6 @@ fn test_usize() {
     test(10, &[Token::I32(10)]);
     test(10, &[Token::I64(10)]);
 
-    // from unsigned
     test(0, &[Token::U8(0)]);
     test(0, &[Token::U16(0)]);
     test(0, &[Token::U32(0)]);
@@ -829,7 +797,6 @@ fn test_struct() {
             Token::MapEnd,
         ],
     );
-    // Mixed key types
     test(
         Struct { a: 1, b: 2, c: 0 },
         &[

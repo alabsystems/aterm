@@ -1378,7 +1378,7 @@ fn a_hidden_deck_reads_the_machine_and_the_engine_reads_whole() {
     assert_eq!(kinds(&rx), [false], "the engine's demand reads whole");
 }
 
-/// EDGES (module docs): with no window, output asks one whole reading at
+/// EDGES: with no window, output asks one whole reading at
 /// once and the next no sooner than the floor, whatever the held view says
 /// (a job may have started or ended); a window showing the bars clears the
 /// edge (its cadence reads).

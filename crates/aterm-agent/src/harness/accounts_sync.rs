@@ -1,44 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Fleet and machine account synchronization (`aterm harness accounts sync`
-//! and `aterm harness accounts serve`):
-//!
-//! * NOTHING HAS A DEFAULT SOURCE. A roster is read only from the source this
-//!   machine's person named: the one a command names (`aterm harness accounts
-//!   sync <path-or-url>`), else this machine's own `fleet-accounts.toml` where
-//!   such a sync wrote it (it says so: [`OPT_IN_KEY`] `= "named"`), else
-//!   `[fleet] accounts_source` in aterm.toml ([`configured_source`]). With
-//!   none, nothing is fetched, read, synced or renewed ([`NO_SOURCE`]): no
-//!   spreadsheet link, no rclone remote, no file in a folder macOS guards (a
-//!   read of `~/Downloads` can put a privacy dialog on the person's screen).
-//!   0.112.0 to 0.115.0 shipped a hard-coded sheet link, an rclone remote and
-//!   a window upkeep that fetched them on every machine with no
-//!   `accounts.toml`, and wrote `fleet-accounts.toml` from what came back; all
-//!   three are gone, and a fleet file with no [`OPT_IN_KEY`] (every one those
-//!   versions wrote) opts nothing in.
-//! * Parses an accounting spreadsheet's CSV (a local file or an `http(s)://`
-//!   export URL) or a LAN `fleet-accounts.toml` URL/path. An rclone remote
-//!   (`rclone:<remote>:<path>`) is refused by name: aterm runs no rclone
-//!   (init design §6.1 row 29).
-//! * Writes `fleet-accounts.toml` beside `accounts.toml` so any machine on
-//!   the LAN can sync from one shared config file, and writes this machine's
-//!   `accounts.toml` (`m8` -> `m8` and `m8-2`), adopting whichever account is
-//!   already signed into the default Claude Code home (`dir = None`) and
-//!   creating isolated login directories (`<state>/accounts/logins/<label>`)
-//!   for the remaining accounts.
-//! * Scans the default Claude Code home's transcripts for any standing quota
-//!   wall on the adopted default login and records it in
-//!   `<state>/accounts/state.json` (touching `<state>/accounts/wake`) so a
-//!   running `aterm` window immediately sees the wall and rotates once a
-//!   second account is signed in.
-//! * Serves a lightweight local/LAN HTTP dashboard and config endpoint
-//!   (`aterm harness accounts serve`) for LAN sharing, status inspection, and
-//!   account rotation control.
-//! * The window's upkeep ([`upkeep_live`]): where a source is configured, the
-//!   roster is synced where it is missing and a walled login's successor is
-//!   signed in in the background; where none is, it does nothing at all
-//!   ([`Upkept::Unconfigured`]).
+//! Fleet and machine account synchronization.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -54,52 +17,35 @@ use super::accounts::{self, Class, Roster, Row};
 use super::cli::{ACCOUNTS_OWN_LABEL, Env};
 use super::upgrade;
 
-/// The aterm.toml table whose [`SOURCE_KEY`] names this machine's fleet
-/// accounts source.
+/// Table name whose [`SOURCE_KEY`] names this machine's fleet accounts source.
 pub const SOURCE_TABLE: &str = "fleet";
 
-/// `[fleet] accounts_source = "<path | http(s) URL>"`:
-/// where a machine with no `fleet-accounts.toml` yet syncs its roster from
-/// ([`configured_source`]).
+/// Key under [`SOURCE_TABLE`] naming the fleet accounts path or URL.
 pub const SOURCE_KEY: &str = "accounts_source";
 
-/// The prefix that names an rclone remote (`rclone:<remote>:<path>`), a source
-/// refused by name ([`fetch_plan`]): aterm runs no rclone, so the sources are
-/// a sheet's CSV export URL, a LAN `fleet-accounts.toml` and a local file
-/// (init design §6.1 row 29).
+/// Prefix naming an `rclone` remote, which [`fetch_plan`] refuses by name.
 pub const RCLONE_PREFIX: &str = "rclone:";
 
-/// What a sync says when it was handed no source and none is configured:
-/// nothing was fetched or read.
+/// What a sync says when it was handed no source and none is configured.
 pub const NO_SOURCE: &str = "no accounts source is configured, so nothing was fetched or read: \
      name one (`aterm harness accounts sync <path-or-url>`) or set `[fleet] accounts_source` \
      in aterm.toml";
 
-/// The development seam (`aterm_types::dev_seam!`) that gives an instance
-/// which is not its account's own — a scratch HOME, a private state root —
-/// the live window upkeep all the same: the jailed instance test's arm. A
-/// shipped build reads no such variable, and a test binary ignores it.
+/// Development seam enabling live window upkeep under a scratch state root in tests.
 pub const UPKEEP_SEAM: &str = "ATERM_DEBUG_ACCOUNTS_UPKEEP";
 
 /// Shared fleet config file written beside `accounts.toml`.
 pub const FLEET_ROSTER_FILE: &str = "fleet-accounts.toml";
 
-/// The top-level key of this machine's own `fleet-accounts.toml` that says why
-/// a sync wrote it ([`OptIn`]). Only `"named"` opts the machine in
-/// ([`configured_source`]); a file without the key — every one 0.112.0 to
-/// 0.115.0 wrote from their built-in source, unasked — opts nothing in. The
-/// file the dashboard serves carries none ([`FleetRoster::to_toml`]).
+/// Top-level key recording why a sync wrote this machine's fleet roster ([`OptIn`]).
 pub const OPT_IN_KEY: &str = "opt_in";
 
-/// Why a sync wrote this machine's `fleet-accounts.toml` ([`OPT_IN_KEY`]).
+/// Why a sync wrote this machine's fleet roster ([`OPT_IN_KEY`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptIn {
-    /// The person handed the sync its source (`aterm harness accounts sync
-    /// <source>`), or it read a fleet file that said so: the file itself opts
-    /// this machine in, until it is deleted.
+    /// Sync was handed an explicit source or read a fleet file that opted in by name.
     Named,
-    /// The sync read `[fleet] accounts_source`: the key opts in, the file
-    /// does not, so taking the key out opts the machine out.
+    /// The sync read `[fleet] accounts_source`.
     Key,
 }
 
@@ -117,7 +63,6 @@ impl OptIn {
 /// Default bind address for `aterm harness accounts serve`.
 pub const DEFAULT_SERVE_BIND: &str = "127.0.0.1:8741";
 
-/// Tail bytes read from a transcript when checking for a standing quota wall.
 const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 
 /// One active Claude Code account in the fleet roster.
@@ -135,7 +80,7 @@ pub struct FleetAccount {
     pub browser: Option<String>,
 }
 
-/// Complete fleet account table parsed from CSV or `fleet-accounts.toml`.
+/// Complete fleet account table parsed from CSV or the fleet roster file.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FleetRoster {
     /// Human-readable source description (path or URL; never an email).
@@ -145,8 +90,7 @@ pub struct FleetRoster {
 }
 
 impl FleetRoster {
-    /// Filter accounts belonging to `machine` (e.g. `"m8"`), returning rows in
-    /// slot order (`m8` before `m8-2`, dedicated before shared).
+    /// Filter accounts belonging to `machine`, returning rows in slot order.
     #[must_use]
     pub fn accounts_for_machine(&self, machine: &str) -> Vec<&FleetAccount> {
         let norm = normalize_machine_id(machine).unwrap_or_else(|| machine.to_ascii_lowercase());
@@ -171,16 +115,13 @@ impl FleetRoster {
         set.into_iter().collect()
     }
 
-    /// Serialize the fleet roster as `fleet-accounts.toml` for LAN sharing:
-    /// no [`OPT_IN_KEY`], which only this machine's own copy carries
-    /// ([`Self::to_toml_for`]).
+    /// Serialize the fleet roster as `fleet-accounts.toml` for LAN sharing.
     #[must_use]
     pub fn to_toml(&self) -> String {
         self.to_toml_for(None)
     }
 
-    /// [`Self::to_toml`], with this machine's [`OPT_IN_KEY`] where `opt_in`
-    /// names one.
+    /// [`Self::to_toml`], with this machine's [`OPT_IN_KEY`] where `opt_in` names one.
     #[must_use]
     pub fn to_toml_for(&self, opt_in: Option<OptIn>) -> String {
         let mut out = String::from(
@@ -212,12 +153,8 @@ impl FleetRoster {
     }
 
     /// Parse `fleet-accounts.toml` text back into a [`FleetRoster`].
-    ///
     /// # Errors
     /// The generated rows do not admit as one complete roster.
-    ///
-    /// Returns a human-readable error if the TOML is invalid or any row is
-    /// missing required fields.
     pub fn from_toml(text: &str, source: &str) -> Result<Self, String> {
         let table: aterm_toml::Table = aterm_toml::from_str(text)
             .map_err(|e| format!("fleet roster at {source} is not valid TOML: {e}"))?;
@@ -316,9 +253,7 @@ fn normalize_machine_token(trimmed: &str) -> Option<String> {
     }
 }
 
-/// Normalize a machine token such as `"m8"`, `"M109"`, `"m8-Macbook-Pro"`, or
-/// `"MacbookAir-m27-M5-32GB-4TB.local"` to its canonical lowercase `"m<digits>"`
-/// identifier.
+/// Normalize a machine token to its canonical lowercase `"m<digits>"` identifier.
 #[must_use]
 pub fn normalize_machine_id(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
@@ -356,8 +291,6 @@ pub fn normalize_machine_id(raw: &str) -> Option<String> {
     None
 }
 
-/// Parse a `computer` cell from the accounting spreadsheet (e.g. `"m8"`,
-/// `"m8.2"`, `"M109"`, `"m38.106.2"`) into `(machines, slot_suffix)`.
 fn parse_computer_cell(cell: &str) -> Option<(Vec<String>, Option<u32>)> {
     let trimmed = cell.trim();
     if trimmed.is_empty() || trimmed.starts_with('*') || trimmed.contains('?') {
@@ -388,8 +321,6 @@ fn parse_computer_cell(cell: &str) -> Option<(Vec<String>, Option<u32>)> {
     }
 }
 
-/// Also check if an email local-part encodes a secondary shared machine
-/// (e.g. `foxtrot.m38.106.2@example.test` or `golf.m41.109.2@example.test`).
 fn machines_from_email_hint(email: &str) -> Vec<String> {
     let Some((local, _)) = email.split_once('@') else {
         return Vec::new();
@@ -415,16 +346,12 @@ fn machines_from_email_hint(email: &str) -> Vec<String> {
     out
 }
 
-/// Borrow complete CSV records, keeping line endings inside quoted fields.
-/// Each record is scanned once and passed straight to the existing field decoder.
-/// Quotes must open a field; after they close only a delimiter or record end is valid.
 fn csv_records(mut text: &str) -> impl Iterator<Item = Result<&str, &'static str>> {
     std::iter::from_fn(move || {
         let input = text;
         if input.is_empty() {
             return None;
         }
-        // An error ends the iterator; no partial record can become another row.
         text = "";
         let bytes = input.as_bytes();
         let (mut first, mut quoted, mut closed) = (true, false, false);
@@ -476,7 +403,6 @@ fn csv_records(mut text: &str) -> impl Iterator<Item = Result<&str, &'static str
     })
 }
 
-/// Split one admitted CSV record into fields.
 fn parse_csv_line(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut cur = String::new();
@@ -506,8 +432,6 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
-/// Whether a row's notes mark the account unusable (`banned`, `roll off`,
-/// `payment disabled`, `deactivated`, `suspended`).
 fn notes_disqualify(notes: &str) -> bool {
     let lower = notes.to_ascii_lowercase();
     lower.contains("banned")
@@ -518,12 +442,8 @@ fn notes_disqualify(notes: &str) -> bool {
 }
 
 /// Parse the accounting CSV into a [`FleetRoster`].
-///
 /// # Errors
 /// The generated rows do not admit as one complete roster.
-///
-/// Returns an error if the CSV has no header row, no `email` / `claude`
-/// columns, or malformed quoting. LF and CRLF separate records only outside quotes.
 pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster, String> {
     let mut records = csv_records(csv_text);
     let header_line = records
@@ -546,8 +466,6 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
         .filter(|(_, h)| h.trim().eq_ignore_ascii_case("computer"))
         .map(|(i, _)| i)
         .collect();
-    // In an accounting sheet's CSV export, the column right after `computer`
-    // may hold the paired machine (`m38`, `m42`, …) under an empty header.
     if let Some(&first_comp) = computer_cols.first()
         && first_comp + 1 < claude_col
         && header
@@ -572,7 +490,6 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
             continue;
         }
         let cols = parse_csv_line(raw_line);
-        // Skip rows marked with `*` in column 0 or email starting with `*`.
         if cols.first().is_some_and(|c| c.trim().starts_with('*')) {
             continue;
         }
@@ -678,9 +595,7 @@ pub fn parse_accounting_csv(csv_text: &str, source: &str) -> Result<FleetRoster,
     })
 }
 
-/// Detect this machine's canonical ID (`"m8"`, `"m14"`, …) from an explicit
-/// override, `aterm.toml`, or the system hostname (`scutil --get LocalHostName`
-/// / `hostname`).
+/// Detect this machine's canonical ID from an override, config file, or system hostname.
 #[must_use]
 pub fn detect_machine_id(override_machine: Option<&str>, config: Option<&Path>) -> Option<String> {
     if let Some(m) = override_machine {
@@ -720,9 +635,6 @@ pub fn detect_machine_id(override_machine: Option<&str>, config: Option<&Path>) 
     None
 }
 
-/// Read the `oauthAccount.emailAddress` field from a Claude Code `.claude.json`
-/// profile IN MEMORY ONLY for matching against a roster row's `email`
-/// ([`accounts::email_matches`]). Never logged, printed, or persisted.
 fn read_default_profile_email(env: &Env) -> Option<String> {
     let path = env.claude_profile.as_deref().map(|own| {
         super::profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth)
@@ -737,10 +649,7 @@ fn read_default_profile_email(env: &Env) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Find the newest standing quota wall across `<claude_dir>/projects/*/*.jsonl`
-/// in the default Claude Code home, so syncing on a machine whose default
-/// login is already at a usage wall immediately records that wall in
-/// `<state>/accounts/state.json`.
+/// Find the newest standing quota wall across transcripts in the default Claude Code home.
 pub fn find_default_home_standing_wall(
     claude_dir: &Path,
     now: i64,
@@ -784,10 +693,6 @@ pub fn find_default_home_standing_wall(
     newest_wall.filter(|w| w.at >= newest_clear_at)
 }
 
-/// Match a `"session_context"` transcript line's `"userEmail"` against `roster`
-/// IN MEMORY ONLY, returning `Some(Some(label))` when the line names an email
-/// in `roster`, `Some(None)` when the line names an email not in `roster`, or
-/// `None` when the line is not a `"session_context"` with `"userEmail"`.
 fn match_session_context_label(line: &str, roster: &Roster) -> Option<Option<String>> {
     if !line.contains("\"session_context\"") || !line.contains("\"userEmail\"") {
         return None;
@@ -814,13 +719,7 @@ fn match_session_context_label(line: &str, roster: &Roster) -> Option<Option<Str
     Some(matched)
 }
 
-/// Scan recent `.jsonl` transcripts under `<claude_dir>/projects/*/*.jsonl`
-/// (up to 16 newest files by modification time), attributing quota walls and
-/// model answers to the active account row tracked via `"session_context"`
-/// `"userEmail"` entries (falling back to the roster's default login row when
-/// a transcript has no `"session_context"`). Returns each roster label's
-/// newest standing quota wall (`until > now`) that was not cleared by a newer
-/// model turn under that same label.
+/// Scan recent transcripts and attribute standing quota walls to active account rows.
 #[must_use]
 pub fn find_transcript_walls_by_email(
     claude_dir: &Path,
@@ -924,9 +823,7 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     }
 }
 
-/// Build the machine's [`Roster`] from `fleet` for `machine`, choosing at most
-/// one row as the default login (`dir = None`) and assigning `<state>/accounts/logins/<label>`
-/// to the remaining rows.
+/// Build the machine's [`Roster`] from `fleet` for `machine`.
 #[must_use]
 pub fn build_machine_roster(
     fleet: &FleetRoster,
@@ -940,10 +837,6 @@ pub fn build_machine_roster(
         return existing.cloned().unwrap_or_default();
     }
 
-    // Determine which label gets `dir = None` (the machine's default login):
-    // 1. The row whose email matches `~/.claude.json`'s `oauthAccount.emailAddress`.
-    // 2. Otherwise, a row that already had `dir = None` in `existing`.
-    // 3. Otherwise, the first row for this machine.
     let default_label: String = default_email
         .and_then(|de| {
             fleet_rows
@@ -985,16 +878,12 @@ pub fn build_machine_roster(
         });
     }
 
-    // Put the default login row (`dir = None`) first if it is currently active
-    // or so `accounts_next` naturally treats it as the starting login when
-    // `state.active` is `None`.
     rows.sort_by_key(|r| (r.dir.is_some(), r.class, r.label.clone()));
 
     Roster { rows }
 }
 
 /// Format a [`Roster`] into valid `accounts.toml` text.
-///
 /// # Errors
 /// The generated rows do not admit as one complete roster.
 pub fn format_roster_toml(roster: &Roster) -> Result<String, String> {
@@ -1005,10 +894,6 @@ fn toml_quote(s: &str) -> String {
     aterm_toml::Value::String(s.to_owned()).to_string()
 }
 
-/// Extract `(machines, slot_suffix)` from an account email local-part such as
-/// `"sol-m27@example.test"` -> `(["m27"], None)`, `"sun.m27.2@example.test"` ->
-/// `(["m27"], Some(2))`, or `"yellow.m38.106.2@example.test"` ->
-/// `(["m38", "m106"], Some(2))`.
 fn email_machines_and_slot(email: &str) -> (Vec<String>, Option<u32>) {
     let Some((local, _)) = email.split_once('@') else {
         return (Vec::new(), None);
@@ -1044,14 +929,12 @@ fn email_machines_and_slot(email: &str) -> (Vec<String>, Option<u32>) {
     (machines, slot)
 }
 
-/// Where this machine's person said the fleet accounts come from
-/// ([`configured_source`]).
+/// Where this machine's person said the fleet accounts come from ([`configured_source`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FleetSource {
-    /// This machine's own `fleet-accounts.toml` beside `accounts.toml`, as a
-    /// sync handed its source wrote it ([`OptIn::Named`]).
+    /// Local fleet roster file beside `accounts.toml` ([`OptIn::Named`]).
     File(PathBuf),
-    /// `[fleet] accounts_source` in aterm.toml, as written ([`SOURCE_KEY`]).
+    /// `[fleet] accounts_source` in the config file ([`SOURCE_KEY`]).
     Key(String),
 }
 
@@ -1065,8 +948,7 @@ impl FleetSource {
         }
     }
 
-    /// Which of the two it is, for a log line: never the source itself, whose
-    /// link may be a secret of its own.
+    /// Which of the two it is, for a log line.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -1076,19 +958,7 @@ impl FleetSource {
     }
 }
 
-/// THE ONE OPT-IN of the fleet accounts feature: the source this machine's
-/// person configured, or `None`, and then nothing is fetched, read, synced or
-/// renewed — not by a sync handed no source ([`load_fleet_source`]), not by
-/// the window's upkeep ([`upkeep_live`]). First this machine's own
-/// `fleet-accounts.toml` beside `roster` where it says a sync handed its
-/// source wrote it ([`OPT_IN_KEY`] `= "named"`), else `[fleet]
-/// accounts_source` in the aterm.toml at `config` (a string that is not
-/// blank; a file that is not TOML names none). A fleet file without that
-/// word — one 0.112.0 to 0.115.0 wrote from their built-in source, unasked, or
-/// one a sync from the key wrote — is no opt-in ([`fleet_file_ignored`]). A
-/// fresh home — every new install and every test world — has neither. There
-/// is NO DEFAULT: no spreadsheet link, no rclone remote, no file in
-/// `~/Downloads`.
+/// THE ONE OPT-IN of the fleet accounts feature.
 #[must_use]
 pub fn configured_source(config: Option<&Path>, roster: Option<&Path>) -> Option<FleetSource> {
     if let Some(fleet) = roster
@@ -1100,24 +970,17 @@ pub fn configured_source(config: Option<&Path>, roster: Option<&Path>) -> Option
     config.and_then(source_key).map(FleetSource::Key)
 }
 
-/// Whether a `fleet-accounts.toml` stands beside `roster` that opts nothing
-/// in ([`configured_source`]): what the window's log says where no source is
-/// configured, so a person whose machine kept the file an older aterm wrote
-/// learns it is no longer read.
+/// Whether a fleet roster file stands beside `roster` without opting in ([`configured_source`]).
 #[must_use]
 pub fn fleet_file_ignored(roster: &Path) -> bool {
     fleet_file_beside(roster)
         .is_some_and(|fleet| fleet.is_file() && fleet_file_opt_in(&fleet) != Some(OptIn::Named))
 }
 
-/// This machine's own `fleet-accounts.toml`, beside `roster`.
 fn fleet_file_beside(roster: &Path) -> Option<PathBuf> {
     roster.parent().map(|dir| dir.join(FLEET_ROSTER_FILE))
 }
 
-/// What the fleet file at `fleet` says of why it was written ([`OPT_IN_KEY`]):
-/// `None` where it is missing, is not TOML, or says nothing (as every one
-/// 0.112.0 to 0.115.0 wrote).
 fn fleet_file_opt_in(fleet: &Path) -> Option<OptIn> {
     let text = read_local_source_text(fleet).ok()?;
     let table: aterm_toml::Table = aterm_toml::from_str(&text).ok()?;
@@ -1128,8 +991,6 @@ fn fleet_file_opt_in(fleet: &Path) -> Option<OptIn> {
     }
 }
 
-/// `[fleet] accounts_source` in the aterm.toml at `config`, when it is a string
-/// that is not blank.
 fn source_key(config: &Path) -> Option<String> {
     let text = fs::read_to_string(config).ok()?;
     let table: aterm_toml::Table = aterm_toml::from_str(&text).ok()?;
@@ -1143,25 +1004,15 @@ fn source_key(config: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// How a source's text is fetched: [`fetch_source_text`] live, a test's
-/// recorder in a test.
 type Fetch = dyn Fn(&Env, &str) -> Result<String, String> + Sync;
 
-/// Load a [`FleetRoster`] from `source`, else from the source this machine
-/// configured ([`configured_source`]); with neither, nothing is read and the
-/// answer is [`NO_SOURCE`].
-///
+/// Load a [`FleetRoster`] from `source`, or from [`configured_source`] when `source` is `None`.
 /// # Errors
 /// The generated rows do not admit as one complete roster.
-///
-/// No source, or the source could not be read or parsed.
 pub fn load_fleet_source(env: &Env, source: Option<&str>) -> Result<FleetRoster, String> {
     load_fleet_source_with(env, source, &fetch_source_text).map(|(fleet, _)| fleet)
 }
 
-/// [`load_fleet_source`] over `fetch`, with why it may be kept
-/// ([`OptIn`]): `source` itself, or this machine's own named fleet file, is
-/// [`OptIn::Named`]; the key is [`OptIn::Key`].
 fn load_fleet_source_with(
     env: &Env,
     source: Option<&str>,
@@ -1191,10 +1042,6 @@ fn load_fleet_source_with(
     Ok((fleet, opt_in))
 }
 
-/// Discover accounts for this machine from local `.claude.json*` profiles,
-/// `.claude/backups/`, `.config/muse/auth.json`, and recent
-/// `.claude/projects/*/*.jsonl` `"session_context"` `"userEmail"` lines when
-/// external CSV/sheet sources are unreachable or incomplete.
 fn discover_local_fleet(env: &Env) -> Option<FleetRoster> {
     discover_local_fleet_with_min(env, 2)
 }
@@ -1367,7 +1214,6 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
 
 const SOURCE_TEXT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-/// Admit a whole source before its text can become a roster.
 fn decode_source_text(bytes: Vec<u8>, source: &str) -> Result<String, String> {
     if bytes.len() > SOURCE_TEXT_MAX_BYTES {
         return Err(format!(
@@ -1378,9 +1224,6 @@ fn decode_source_text(bytes: Vec<u8>, source: &str) -> Result<String, String> {
         .map_err(|e| format!("account source at {source} is not valid UTF-8: {e}"))
 }
 
-/// Admit local discovery text from the opened regular file, never a FIFO or
-/// an oversized prefix. On Unix the open also refuses the final symbolic link;
-/// other platforms use `astream_sys`'s read-only open.
 fn read_local_source_text(path: &Path) -> io::Result<String> {
     let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse)?;
     let metadata = file.metadata()?;
@@ -1403,22 +1246,12 @@ fn read_local_source_text(path: &Path) -> io::Result<String> {
         .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
 }
 
-/// How one named source is read ([`fetch_plan`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FetchPlan {
-    /// `curl` of an `http(s)://` URL (a Sheets `/edit` link as its CSV export).
     Http(String),
-    /// A local file (a leading `~/` is the home's).
     File(PathBuf),
 }
 
-/// What reading `source` takes: curl only for an `http(s)://` URL, else a
-/// file. Nothing is added to it: no fallback source, no default remote.
-///
-/// # Errors
-///
-/// An rclone remote ([`RCLONE_PREFIX`]), refused by name with the sources
-/// that remain.
 fn fetch_plan(env: &Env, source: &str) -> Result<FetchPlan, String> {
     if source.starts_with(RCLONE_PREFIX) {
         return Err(format!(
@@ -1436,23 +1269,15 @@ fn fetch_plan(env: &Env, source: &str) -> Result<FetchPlan, String> {
     })
 }
 
-/// How a fetch's one program is run: [`run_fetcher`] live, a test's witness
-/// in a test, so the composition of [`fetch_source_text_with`] is seen
-/// without curl running.
 type RunFetcher =
     dyn Fn(aterm_uds::spawnfd::Command) -> Result<super::align::Captured, String> + Sync;
 
-/// The live [`RunFetcher`]: the program bounded at 20 s, its output at
-/// [`SOURCE_TEXT_MAX_BYTES`] and one byte more (so an oversized answer is
-/// refused, not cut).
 fn run_fetcher(cmd: aterm_uds::spawnfd::Command) -> Result<super::align::Captured, String> {
     super::align::capture_bounded(cmd, Duration::from_secs(20), SOURCE_TEXT_MAX_BYTES + 1)
 }
 
 fn fetch_http(url: &str, run: &RunFetcher) -> Result<String, String> {
     let mut cmd = aterm_uds::spawnfd::command("/usr/bin/curl");
-    // Ignore default curl config and keep the initial request and redirects HTTP(S).
-    // `-q` must be first; `--` keeps the URL out of option parsing.
     cmd.args([
         "-q",
         "-fsSL",
@@ -1473,14 +1298,10 @@ fn fetch_http(url: &str, run: &RunFetcher) -> Result<String, String> {
     decode_source_text(cap.stdout, url)
 }
 
-/// The live [`Fetch`]: the one source named, read as [`fetch_plan`] says.
 fn fetch_source_text(env: &Env, source: &str) -> Result<String, String> {
     fetch_source_text_with(env, source, &run_fetcher)
 }
 
-/// [`fetch_source_text`] over `run`: one program at most (curl for a link,
-/// none for a file or a refused rclone remote), and its failure is the
-/// answer — nothing else is tried after it.
 fn fetch_source_text_with(env: &Env, source: &str, run: &RunFetcher) -> Result<String, String> {
     match fetch_plan(env, source)? {
         FetchPlan::Http(url) => fetch_http(&url, run),
@@ -1508,7 +1329,6 @@ pub fn normalize_google_sheet_url(url: &str) -> String {
     url.to_owned()
 }
 
-/// The files and report state published by one successful sync.
 struct SyncedAccounts {
     roster: Roster,
     fleet_path: PathBuf,
@@ -1516,15 +1336,8 @@ struct SyncedAccounts {
     note: Option<String>,
 }
 
-/// The fleet bytes init captured before taking the account lock, or its
-/// absence for a first discovery. Other syncs intentionally replace a source.
 struct FleetSnapshot(Option<Vec<u8>>);
 
-/// How long a sync from the command line waits for `accounts.lock` before it
-/// gives up and says so ([`persist_accounts_sync`]): the host's own bounded
-/// wait ([`accounts::LOCK_LADDER`], two seconds), then sixteen half-second
-/// tries more, ten seconds in all. The lock is a short one; a holder that keeps
-/// it past this (a suspended `aterm harness accounts`) is not waited out.
 fn sync_lock_ladder() -> Vec<Duration> {
     accounts::LOCK_LADDER
         .iter()
@@ -1533,16 +1346,6 @@ fn sync_lock_ladder() -> Vec<Duration> {
         .collect()
 }
 
-/// Persist captured sync inputs. Source/profile/transcript discovery happens
-/// before this call; the account lock spans the roster's read/build/write and
-/// the existing state/login transaction. Init's locally captured fleet also
-/// requires unchanged fleet bytes under that lock. Individual replacements
-/// are durable writes, not an atomic transaction across all these files.
-///
-/// THE LOCK IS WAITED FOR WITHIN `ladder` ([`accounts::Store::acquire_within`]):
-/// still held after it, the sync fails before it reads or writes anything and
-/// says so — [`accounts::LOCK_HELD`], the store, how long it waited, and that
-/// nothing was synced.
 fn persist_accounts_sync(
     store: &accounts::Store,
     roster_path: &Path,
@@ -1612,8 +1415,6 @@ fn persist_accounts_sync(
     });
     let mut note = None;
     let mut publishing = false;
-    // The held API reads and admits logins and state before invoking this edit.
-    // Re-acquiring the store here would deadlock the lock already held above.
     store
         .transact_logins_held(&held, now, &mut note, |state, logins| {
             publishing = true;
@@ -1636,7 +1437,6 @@ fn persist_accounts_sync(
                     accounts::note_served_login(logins, label, now);
                     events.extend(accounts::note_auth(state, label, accounts::Auth::Ok, now));
                 }
-                // Retain the initial adoption of the default login's walls.
                 if let Some(own_acct) = state.accounts.get(ACCOUNTS_OWN_LABEL).cloned() {
                     for (win, wall) in own_acct.walls.into_iter().filter(|(_, wall)| !wall.cleared)
                     {
@@ -1671,7 +1471,6 @@ fn persist_accounts_sync(
                 format!("sync refused before roster publication: {why}")
             }
         })?;
-    // A roster change must wake readers even when no state event changed.
     store.touch_wake().map_err(|why| {
         format!(
             "sync files were published but the wake marker could not be written: {why}; \
@@ -1695,10 +1494,7 @@ fn persist_accounts_sync(
     })
 }
 
-/// Run `aterm harness accounts sync [<source>] [--machine <mN>] [--json]`:
-/// from `source`, else the source this machine configured
-/// ([`configured_source`]); with neither, nothing is read ([`NO_SOURCE`],
-/// exit 1).
+/// Run `aterm harness accounts sync [<source>] [--machine <mN>] [--json]`.
 pub fn run_accounts_sync(
     env: &Env,
     source: Option<&str>,
@@ -1715,16 +1511,12 @@ pub fn run_accounts_sync(
     run_accounts_sync_with(env, (source, machine_override, json), (out, err), &how)
 }
 
-/// What one sync reads its source with and how long it waits for the lock:
-/// the command line's ([`run_accounts_sync`]), the window's upkeep's
-/// ([`upkeep`]) or a test's. Init also binds its captured fleet snapshot.
 struct SyncHow<'a> {
     fetch: &'a Fetch,
     ladder: &'a [Duration],
     fleet_snapshot: Option<&'a FleetSnapshot>,
 }
 
-/// [`run_accounts_sync`] over `how`.
 fn run_accounts_sync_with(
     env: &Env,
     (source, machine_override, json): (Option<&str>, Option<&str>, bool),
@@ -1763,7 +1555,6 @@ fn run_accounts_sync_with(
         return ExitCode::FAILURE;
     };
 
-    // The potentially slow discovery is outside the short account lock.
     let store = env.accounts_store();
     let prelim_roster =
         build_machine_roster(&fleet, &machine, &store, None, default_email.as_deref());
@@ -1913,8 +1704,6 @@ fn run_accounts_sync_with(
     ExitCode::SUCCESS
 }
 
-/// The window's sync's cooldown: one try in ten minutes per process
-/// ([`sync_if_missing`]).
 static AUTO_SYNC_COOLDOWN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
 /// Which of the upkeep's two works one call makes ([`upkeep_live`]).
@@ -1922,11 +1711,9 @@ static AUTO_SYNC_COOLDOWN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex:
 pub enum UpkeepStep {
     /// Both, the sync first: the activation wake's upkeep.
     Both,
-    /// The sync of a missing roster alone: before a wall is read against the
-    /// roster, so a wall is recorded against the rows the sync wrote.
+    /// Sync a missing roster alone before reading a wall against the roster.
     Sync,
-    /// The renewal alone: after a wall is recorded, so the wall just recorded
-    /// is the one renewed.
+    /// The renewal alone: after a wall is recorded, so the wall just recorded is the one renewed.
     Renew,
 }
 
@@ -1943,17 +1730,12 @@ impl UpkeepStep {
 /// What one upkeep of the window's fleet accounts did ([`upkeep_live`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Upkept {
-    /// No source is configured ([`configured_source`]): nothing was read,
-    /// fetched, synced or renewed, and no program was started.
-    /// `fleet_file_ignored`: a `fleet-accounts.toml` stands that opts nothing
-    /// in ([`fleet_file_ignored`]), one an older aterm wrote unasked, say.
+    /// No source is configured ([`configured_source`]).
     Unconfigured {
         /// [`fleet_file_ignored`].
         fleet_file_ignored: bool,
     },
-    /// A source is configured (`kind`, [`FleetSource::kind`]); the roster
-    /// stands (`roster`: it stood, or the sync wrote it) and a renewal's
-    /// worker was started or not (`renewal`).
+    /// A source is configured (`kind`, [`FleetSource::kind`]).
     Configured {
         /// [`FleetSource::kind`].
         kind: &'static str,
@@ -1964,10 +1746,6 @@ pub enum Upkept {
     },
 }
 
-/// What the upkeep may do past reading its own files: fetch a source, start a
-/// renewal's worker, and the two process-wide gates (the sync's cooldown and
-/// the renewal's admission). The live ones in [`upkeep_live`]; a test's own
-/// in a test, so none reaches curl, `claude` or another test's gates.
 struct UpkeepEffects<'a> {
     fetch: &'a Fetch,
     spawn_renewal: &'a SpawnRenewal,
@@ -1975,11 +1753,8 @@ struct UpkeepEffects<'a> {
     renew_guard: &'a std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
 }
 
-/// How a renewal's worker is started: [`spawn_renewal_thread`] live, a test's
-/// recorder in a test.
 type SpawnRenewal = dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Sync;
 
-/// The live renewal worker: a thread of its own.
 fn spawn_renewal_thread(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("aterm-auto-renew".to_owned())
@@ -1987,16 +1762,7 @@ fn spawn_renewal_thread(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
         .map(|_| ())
 }
 
-/// THE WINDOW'S FLEET ACCOUNTS' UPKEEP, the one way a window reaches this
-/// module: with the source this machine's person configured
-/// ([`configured_source`], read again at every upkeep, beside `roster_path`),
-/// `accounts.toml` is synced where it is missing ([`sync_if_missing`]) and a
-/// walled login's successor is signed in in the background
-/// ([`auto_renew_next_account`]); with none — every fresh home, every new
-/// install, every test world — it returns [`Upkept::Unconfigured`] having read
-/// nothing past aterm.toml and the fleet file beside it, fetched nothing and
-/// started nothing. The aterm.toml read is the one beside `roster_path`.
-/// `step` says which of the two works this call makes ([`UpkeepStep`]).
+/// THE WINDOW'S FLEET ACCOUNTS' UPKEEP, the one way a window reaches this module.
 pub fn upkeep_live(
     home: &Path,
     state_dir: &Path,
@@ -2017,7 +1783,6 @@ pub fn upkeep_live(
     )
 }
 
-/// [`upkeep_live`] over `fx`.
 fn upkeep(
     home: &Path,
     state_dir: &Path,
@@ -2043,7 +1808,6 @@ fn upkeep(
     }
 }
 
-/// The aterm.toml `roster` sits beside.
 fn config_beside(roster: &Path) -> PathBuf {
     roster
         .parent()
@@ -2051,11 +1815,6 @@ fn config_beside(roster: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("aterm.toml"))
 }
 
-/// Sync `accounts.toml` from the source configured beside `config` when `roster_path` is
-/// missing, bounded by a 10-minute cooldown (`fx`'s) so a machine whose
-/// source cannot be reached is not asked again on every upkeep, and by the
-/// host's bounded wait for the store's lock ([`accounts::LOCK_LADDER`]).
-/// Returns `true` when `roster_path` exists.
 fn sync_if_missing(
     home: &Path,
     state_dir: &Path,
@@ -2108,16 +1867,11 @@ fn sync_if_missing(
         ladder: &accounts::LOCK_LADDER,
         fleet_snapshot: None,
     };
-    // Handed no source: the sync reads the one configured, as configured, so
-    // the fleet file it writes says why ([`OptIn`]) and a key taken out later
-    // takes the machine out.
     let _ = run_accounts_sync_with(&env, (None, None, true), (&mut out, &mut err), &how);
     roster_path.exists()
 }
 
-/// Whether a fleet accounts source is configured or discoverable for [`sync_accounts_for_init`]
-/// (`[fleet] accounts_source`, `fleet-accounts.toml`, `~/.secrets/fleet-accounts.toml` or
-/// `ai-accounts.csv`, or local Claude profiles/transcripts for this machine).
+/// Whether a fleet accounts source is configured or discoverable for [`sync_accounts_for_init`].
 #[must_use]
 pub fn has_init_accounts_source(
     home: &Path,
@@ -2173,9 +1927,7 @@ pub fn has_init_accounts_source(
     discover_local_fleet(&env).is_some()
 }
 
-/// Synchronize `accounts.toml` and `fleet-accounts.toml` (and `~/.secrets/fleet-accounts.toml`
-/// when `~/.secrets` exists) during `aterm init` or `aterm secrets`.
-/// Returns `Ok((machine_id, machine_account_count, enrolled_count, fleet_account_count))`.
+/// Synchronize the machine and fleet account rosters during `aterm init` or `aterm secrets`.
 pub fn sync_accounts_for_init(
     home: &Path,
     state_dir: &Path,
@@ -2286,8 +2038,6 @@ pub fn sync_accounts_for_init(
             source
         })
     };
-    // Discovery stays in memory until the normal sync admits the roster and
-    // account state under its lock. Only that publication path writes files.
     let fetch = move |env: &Env, source: &str| {
         if let Some((path, text)) = &captured_fleet
             && source == path
@@ -2362,9 +2112,6 @@ static AUTO_RENEW_GUARD: std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<Aut
         }))
     });
 
-/// Own busy admission before the closure reaches the thread builder. A
-/// refused spawn drops the closure too, releasing the same permit that a
-/// finished or unwinding worker releases.
 struct AutoRenewPermit(std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>);
 
 impl AutoRenewPermit {
@@ -2485,13 +2232,11 @@ pub(super) fn resolve_mailbox_dir(home: Option<&Path>, store: &accounts::Store) 
     None
 }
 
-/// When the active or default account (or any recorded session's account) on a
-/// live host stands at a quota wall and no enrolled account is ready to take
-/// over (`candidates` has no `Ok`), automatically launches a background
-/// `claude auth login --claudeai --email <email>` renewal into a staging
-/// directory for the next non-limited account (`sign_in_next`), bounded by a
-/// single in-flight worker and a 15-minute per-label cooldown. Once verified
-/// via `claude auth status --json`, binds the account in `logins.json` +
+pub(super) fn has_configured_mailbox(home: Option<&Path>, store: &accounts::Store) -> bool {
+    resolve_mailbox_dir(home, store).is_some()
+        || super::headless_oauth::discover_mailbox_config(home, Some(&store.dir)).is_some()
+}
+
 fn next_auto_renew_target(
     file_roster: &Roster,
     state: &accounts::State,
@@ -2616,21 +2361,6 @@ fn select_auto_renew_browser(
     })
 }
 
-/// Automatically start a non-blocking staging login (`claude auth login --claudeai --email ...`)
-/// for the next un-enrolled account when the active or walled account has no ready candidate
-/// (`NotEnrolled` or `SignedOut`), so weekly-limit rollovers complete without manual CLI intervention.
-///
-/// Runs at most one renewal at a time across the process with a 15-minute cooldown per account
-/// label, and once `claude auth login` succeeds in `<state>/accounts/logins/<label>+<seq>`,
-/// verifies `claude auth status --json`, binds the staging directory in `logins.json` and
-/// `state.json` and touches `wake` so waiting sessions rotate immediately.
-///
-/// REACHED ONLY THROUGH [`upkeep`], past its gate: a machine whose person
-/// configured no fleet accounts source ([`configured_source`]) never gets here,
-/// so no `claude auth login`, no opener and no mailbox authorizer
-/// (`super::open_url::authorize_with_mailbox`, which only a renewal's
-/// [`super::open_url::MAILBOX_ENV`] arms) runs there. `true` when the worker
-/// was started (`fx`'s spawn took it).
 fn auto_renew_next_account(
     home: &Path,
     state_dir: &Path,
@@ -2667,10 +2397,7 @@ fn auto_renew_next_account(
     )
 }
 
-/// Start a non-blocking staging login for the next un-enrolled successor when
-/// all enrolled accounts stand at a quota wall, allowing the default browser
-/// when no mailbox or dedicated profile is configured (e.g. when the person
-/// chooses `Auto-rotate` in the Accounts menu).
+/// Start an interactive non-blocking staging login for the next un-enrolled successor at a wall.
 pub fn auto_renew_next_account_interactive(
     home: &Path,
     state_dir: &Path,
@@ -2707,7 +2434,6 @@ pub fn auto_renew_next_account_interactive(
 }
 
 /// Starts a staging login for a saved explicit selection.
-/// The verified login pins only while this request is still current.
 pub fn auto_renew_account_by_label(
     home: &Path,
     state_dir: &Path,
@@ -2756,7 +2482,15 @@ fn spawn_row_renewal(
 ) -> bool {
     let store = accounts::Store::at(state_dir);
     let mailbox_dir = resolve_mailbox_dir(Some(home), &store);
-    if !allow_default_browser && next_row.browser.is_none() && mailbox_dir.is_none() {
+    let has_mailbox = mailbox_dir.is_some() || has_configured_mailbox(Some(home), &store);
+    let has_headless_profile = super::headless_oauth::has_browser_profile(
+        &store.dir,
+        &next_row.label,
+        next_row.email.as_deref(),
+    ) && super::headless_oauth::find_headless_browser(Some(home))
+        .is_some();
+    if !allow_default_browser && next_row.browser.is_none() && !has_mailbox && !has_headless_profile
+    {
         return false;
     }
     let next_label = next_row.label.clone();
@@ -2783,9 +2517,12 @@ fn spawn_row_renewal(
                 let browser = match select_auto_renew_browser(
                     next_row.browser.as_deref(),
                     mailbox_dir.as_deref(),
-                    opener,
+                    opener.clone(),
                 ) {
                     Some(b) => b,
+                    None if (has_mailbox || has_headless_profile) && opener.is_some() => {
+                        super::cli::RenewBrowser::Remote { opener }
+                    }
                     None if allow_default_browser => super::cli::RenewBrowser::Default,
                     None => return false,
                 };
@@ -2819,6 +2556,9 @@ fn spawn_row_renewal(
                     .envs(pass_env);
                 if let Some(mailbox) = &mailbox_dir {
                     cmd.env(super::open_url::MAILBOX_ENV, mailbox);
+                }
+                if has_headless_profile {
+                    cmd.env(super::headless_oauth::HEADLESS_ENV, "1");
                 }
                 let ran = super::align::capture_bounded(cmd, Duration::from_secs(300), 64 * 1024);
                 if !ran.is_ok_and(|cap| cap.code == Some(0)) || !accounts::login_made(&staging) {
@@ -2870,19 +2610,6 @@ fn spawn_row_renewal(
 }
 
 /// Run `aterm harness accounts serve [--bind <addr:port>] [<source>] [--machine <mN>]`.
-///
-/// Serves a clean HTTP dashboard and LAN configuration service:
-/// * `GET /` — HTML status & control webapp for this machine and the fleet
-/// * `GET /fleet-accounts.toml` — shared LAN fleet config file
-/// * `GET /accounts.toml?machine=<mN>` — per-machine `accounts.toml`
-/// * `GET /status.json` — JSON status of this machine's accounts
-/// * `POST /sync` — re-syncs from the named or configured source ([`configured_source`])
-/// * `POST /use` — pins an account (`label=<l>`) or resumes auto (`auto=1`)
-///
-/// Open the dashboard using the bound name or an address of the listening
-/// interface. Browser actions require its own Origin; scripts that POST
-/// explicitly send `X-Aterm-Accounts-Action: 1`. Sharing on a LAN remains an
-/// explicit `--bind` choice, with access controlled by that network.
 pub fn run_accounts_serve(
     env: &Env,
     bind: Option<&str>,
@@ -3120,8 +2847,6 @@ pub fn run_accounts_serve(
     ExitCode::SUCCESS
 }
 
-/// Read a complete bounded HTTP head, including when TCP splits a header.
-/// No route may run on a prefix that omits a later Origin or Host field.
 fn read_request_head(mut read: impl FnMut(&mut [u8]) -> io::Result<usize>) -> io::Result<String> {
     let mut bytes = [0u8; 8192];
     let mut used = 0;
@@ -3142,11 +2867,6 @@ fn read_request_head(mut read: impl FnMut(&mut [u8]) -> io::Result<usize>) -> io
     ))
 }
 
-/// The dashboard accepts its bound name/address, never an arbitrary Host
-/// supplied by a browser after DNS rebinding. Browser actions must have this
-/// same origin. A script can explicitly opt in with the non-simple action
-/// header; cross-origin browser fetches cannot send it without a preflight,
-/// and this service does not grant CORS access.
 fn admit_request<'a>(head: &'a str, bind: &str, local: SocketAddr) -> Option<(&'a str, &'a str)> {
     let mut lines = head.strip_suffix("\r\n\r\n")?.split("\r\n");
     let mut first = lines.next()?.split_ascii_whitespace();
@@ -3248,7 +2968,6 @@ fn write_redirect(stream: &mut impl Write, location: &str) -> std::io::Result<()
     stream.flush()
 }
 
-/// A failed account action must not redirect as though it succeeded.
 fn write_action_reply(
     stream: &mut impl Write,
     done: ExitCode,
@@ -3442,7 +3161,6 @@ mod tests {
             let mut input = raw.as_slice();
             assert!(read_request_head(|buf| input.read(buf)).is_err());
         }
-        // A body in the same read is not part of the header.
         let mut padded = format!(
             "GET / HTTP/1.1\r\nHost: localhost:8741\r\nX-Padding: {}\r\n\r\nbody",
             "a".repeat(8000)
@@ -3451,7 +3169,6 @@ mod tests {
         let head = read_request_head(|buf| input.read(buf)).unwrap();
         assert!(!head.ends_with("body"));
         assert!(admit_request(&head, DEFAULT_SERVE_BIND, local).is_some());
-        // A complete head at the exact cap is valid; one byte over is not.
         let padding = "a".repeat(8192 - head.len() + 8000);
         let exact = head.replace(&"a".repeat(8000), &padding);
         assert_eq!(exact.len(), 8192);
@@ -3477,8 +3194,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
 
     #[test]
     fn parses_accounting_csv_and_assigns_machine_slots_and_shared_classes() {
-        // The complete admitted boundary is still a real, parseable roster.
-        // One additional byte is refused instead of publishing its valid prefix.
         let mut boundary = b"email,computer,claude,notes\nwithin@example.test,m30,1,".to_vec();
         boundary.resize(SOURCE_TEXT_MAX_BYTES, b'x');
         let admitted = decode_source_text(boundary.clone(), "boundary.csv").unwrap();
@@ -3490,8 +3205,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(decode_source_text(boundary, "oversized.csv").is_err());
         assert!(decode_source_text(vec![0xff], "invalid-utf8.csv").is_err());
 
-        // Local discovery uses the same whole-source admission. Its opened
-        // descriptor, not an earlier directory entry, must be a bounded file.
         let owned = aterm_tempfile::Builder::new()
             .prefix("aterm-account-source-")
             .tempdir()
@@ -3521,8 +3234,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             assert!(read_local_source_text(&link).is_err());
             let fifo = owned.path().join("source.fifo");
             let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-            // SAFETY: a NUL-terminated path in this test's exclusive directory;
-            // mkfifo creates a node and retains no pointer. No writer is opened.
+            // SAFETY: `name` is a NUL-terminated path in this test's exclusive directory.
             assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
             assert!(read_local_source_text(&fifo).is_err());
             assert_eq!(
@@ -3531,8 +3243,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             );
         }
 
-        // A note's second physical line is still the same account's note.
-        // Every existing unusable marker, including suspension, refuses it.
         for ending in ["\n", "\r\n"] {
             for marker in [
                 "banned",
@@ -3551,8 +3261,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             }
         }
 
-        // A legitimate quoted note may contain a comma, doubled quote and a
-        // complete account-looking physical line; none becomes another row.
         let text = concat!(
             "\"email\",computer,claude,notes\r\n",
             "\"first@example.test\",\"m22\",\"1\",\"ready, \"\"quoted\"\"\r\n",
@@ -3574,7 +3282,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             ["a,b", "a\"b", "line1\r\nline2", ""]
         );
 
-        // Refuse malformed quoting whole, even after an ordinary valid row.
         for bad in [
             "bad@example.test,m24,1,\"unterminated\nnext line",
             "bad@example.test,m24,1,unquoted\"quote",
@@ -3598,21 +3305,16 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(m8[1].email, "bravo.m8@example.test");
         assert_eq!(m8[1].class, Class::Dedicated);
 
-        // Shared row across m106 and m38, plus foxtrot.m38.106.2 hint.
         let m38 = fleet.accounts_for_machine("m38");
         assert_eq!(m38.len(), 2);
         assert!(m38.iter().all(|a| a.class == Class::Shared));
         let m106 = fleet.accounts_for_machine("m106");
         assert_eq!(m106.len(), 2);
 
-        // Round-trip through fleet-accounts.toml.
         let toml = fleet.to_toml();
         let reparsed = FleetRoster::from_toml(&toml, "fleet-accounts.toml").expect("valid toml");
         assert_eq!(reparsed.accounts, fleet.accounts);
 
-        // Browser profile hints are free text. Keep every control and Unicode
-        // character through the actual fleet writer/reader, rather than
-        // emitting a roster that the next sync cannot parse.
         let mut fleet = fleet.clone();
         let controls: String = (0u8..=31).map(char::from).collect();
         fleet.accounts[0].browser = Some(format!("{controls}\u{7f}\"\\ profile \u{a0} \u{1f680}"));
@@ -3624,9 +3326,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(fleet.accounts[0].label, "m8");
         assert_eq!(fleet.accounts[1].label, "m8-2");
 
-        // Growing a suffix can never repair an already oversized label.
-        // Both an oversized base and a valid base whose duplicate would
-        // exceed the grammar must return, rather than search forever.
         let long = (100_000_000..100_000_008)
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
@@ -3647,8 +3346,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let tmp = std::env::temp_dir().join(format!("aterm-sync-test-{}", std::process::id()));
         let store = accounts::Store::at(&tmp);
 
-        // When default profile email is bravo.m8@example.test (`m8-2`), `m8-2`
-        // gets `dir = None` (adopted default login) and `m8` gets a private login dir.
         let roster =
             build_machine_roster(&fleet, "m8", &store, None, Some("bravo.m8@example.test"));
         assert_eq!(roster.rows.len(), 2);
@@ -3670,8 +3367,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let parsed = Roster::parse(&toml).expect("roster admits");
         assert_eq!(parsed, roster);
 
-        // A duplicate in a captured fleet must not become an empty successful
-        // roster response or replace a good roster with an empty file.
         let mut duplicate = roster.clone();
         duplicate.rows.push(duplicate.rows[0].clone());
         assert!(format_roster_toml(&duplicate).is_err());
@@ -3832,8 +3527,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(kept.roster.row_for_login(None).unwrap().label, "m8-2");
         let before_roster = fs::read(&target).unwrap();
         let before_fleet = fs::read(&saved.fleet_path).unwrap();
-        // An existing malformed roster is not an empty starting point.
-        // Refuse it without changing either its bytes or the published fleet.
         let malformed = b"[[account]\nlabel = \"broken\"\n";
         fs::write(&target, malformed).unwrap();
         assert!(
@@ -3853,8 +3546,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         fs::write(&target, &before_roster).unwrap();
         let mut changed = fleet.clone();
         changed.accounts[0].browser = Some("new profile".into());
-        // Both identity files admit before the edit callback can publish
-        // any roster. A newer schema is not an empty state to overwrite.
         for path in [store.state_file(), store.logins_file()] {
             let before = fs::read(&path).unwrap();
             fs::write(&path, "{\"schema\":999}").unwrap();
@@ -3892,8 +3583,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(fs::read(&target).unwrap(), before_roster);
         assert_eq!(fs::read(&saved.fleet_path).unwrap(), before_fleet);
 
-        // A later fleet write fails deterministically at an owned directory.
-        // The earlier roster replacement remains: refusal is not rollback.
         fs::remove_file(&saved.fleet_path).unwrap();
         fs::create_dir(&saved.fleet_path).unwrap();
         assert!(
@@ -3930,8 +3619,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         )
         .unwrap();
 
-        // Exercise the actual CLI function's failure return and absence of
-        // success output using a local CSV and no vendor/profile location.
         let source = root.join("source.csv");
         fs::write(&source, csv).unwrap();
         fs::remove_file(store.wake_path()).unwrap();
@@ -4097,9 +3784,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(!walls.contains_key("m15-3"));
     }
 
-    /// The production permit and spawn seam, without a thread, process,
-    /// account home or global guard reset. A refused builder must release
-    /// busy admission; a queued worker owns it until it actually finishes.
     #[test]
     fn a_refused_renewal_worker_releases_admission_without_running_it() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -4253,7 +3937,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let file_roster = Roster::load(&roster_path).expect("accounts.toml written");
         let (logins_before, _) = store.load_logins(now).expect("logins loaded");
 
-        // Record a live supervised session `sid-m15-live` on `m15-2` hitting its weekly wall.
         let who_m15_2 = accounts::ProcessLogin {
             login: None,
             default_home: true,
@@ -4284,8 +3967,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(next_row.label, "m15-3");
         assert_eq!(next_row.email.as_deref(), Some("m15-3@example.test"));
 
-        // Also verify `next_auto_renew_target` finds `m15-3` when `state.active` is None
-        // and the active account is only recorded in `state.sessions`.
         let mut session_only_state = state_walled;
         session_only_state.active = None;
         assert_eq!(
@@ -4311,8 +3992,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             "when a mailbox directory is present, headless Remote opener is preferred over GUI profile"
         );
 
-        // Claim the staging directory for `m15-3`, deliver a decoy + a Quoted-Printable magic-link
-        // email to the mailbox, and run the capability-injected OAuth + magic-link flow.
         let staging = store
             .claim_staging_dir(&next_row.label)
             .expect("claim staging dir");
@@ -4386,7 +4065,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             ]
         );
 
-        // Write the newly authorized staging login profile and commit via `complete_staging_renewal`.
         fs::write(
             staging.join(".claude.json"),
             "{\"oauthAccount\":{\"emailAddress\":\"m15-3@example.test\",\"subscriptionType\":\"max\"}}\n",
@@ -4415,8 +4093,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             "complete_staging_renewal must touch wake so waiting sessions rotate immediately"
         );
 
-        // Prove the waiting session on `m15-2` immediately receives `Advice::Move` to `m15-3`
-        // and rotates onto `CLAUDE_LOGIN_DIR=<state>/accounts/logins/m15-3+1`.
         let (state_after_renew, _) = store.load(now + 5).unwrap();
         let (logins_after_renew, _) = store.load_logins(now + 5).unwrap();
         let bound_roster = accounts::bound(&file_roster, &logins_after_renew);
@@ -4473,8 +4149,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         );
     }
 
-    /// A test's world for the fleet accounts: `home`, the harness `state`
-    /// root and the config folder, every one empty and none made but `home`.
     struct World {
         _dir: aterm_tempfile::TempDir,
         home: PathBuf,
@@ -4541,9 +4215,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         }
     }
 
-    /// What the upkeep reached past its own files: every source it fetched,
-    /// every renewal worker it started (dropped unrun: no `claude`, no opener,
-    /// no mailbox sign-in), behind gates of its own.
     struct Witness {
         fetched: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         spawned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -4554,7 +4225,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     impl Witness {
-        /// Every fetch answers `text`.
         fn answering(text: &'static str) -> Self {
             let fetched: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
             let spawned: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
@@ -4597,26 +4267,13 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         }
     }
 
-    /// An obviously fake source on a loopback port nothing listens on: the
-    /// witness answers it, nothing dials it.
     const LOOPBACK_SOURCE: &str = "http://127.0.0.1:9/fleet.csv";
     const ONE_ACCOUNT_CSV: &str = "email,computer,claude\nm1@example.test,m1,1\n";
     const UPKEEP_NOW: i64 = 1_792_660_000;
-    /// Nothing configured, and no fleet file beside the roster.
     const UNCONFIGURED: Upkept = Upkept::Unconfigured {
         fleet_file_ignored: false,
     };
 
-    /// NOTHING CONFIGURED, NOTHING DONE: the window's upkeep in a fresh home —
-    /// every new install's and every test world's — and under an aterm.toml
-    /// that names the machine but no source, a blank source, a source outside
-    /// `[fleet]`, or a file that is not TOML, fetches nothing, starts no
-    /// renewal and writes nothing (FAILS with a default source of any kind
-    /// restored: the 0.112.0 upkeep fetched a hard-coded spreadsheet link
-    /// here, then an rclone remote). NEGATIVE CONTROL: the same upkeep with
-    /// `[fleet] accounts_source` naming a loopback source fetches exactly it,
-    /// writes the roster it answered and a fleet file that owes itself to the
-    /// key.
     #[test]
     fn an_unconfigured_upkeep_fetches_nothing_and_starts_nothing() {
         let w = World::new();
@@ -4646,7 +4303,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(!w.roster().exists() && !w.fleet_file().exists());
         assert!(!w.state.exists(), "the accounts store is never made");
 
-        // NEGATIVE CONTROL: the arm on.
         w.write_config(&format!(
             "[fleet]\naccounts_source = \"{LOOPBACK_SOURCE}\"\nmachine = \"m1\"\n"
         ));
@@ -4661,14 +4317,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(wit.fetched(), vec![LOOPBACK_SOURCE.to_owned()]);
         let roster = fs::read_to_string(w.roster()).expect("the roster the source answered");
         assert!(roster.contains("m1@example.test"), "{roster}");
-        // The fleet file it left owes itself to the key, and opts nothing in.
         assert_eq!(fleet_file_opt_in(&w.fleet_file()), Some(OptIn::Key));
     }
 
-    /// `aterm harness accounts sync` handed no source reads nothing where none
-    /// is configured: it says so ([`NO_SOURCE`]) and fails (FAILS with the old
-    /// fallback to a default link, remote or `~/Downloads` file). NEGATIVE
-    /// CONTROL: with `[fleet] accounts_source`, the same command reads that.
     #[test]
     fn a_sync_handed_no_source_reads_only_a_configured_one() {
         let w = World::new();
@@ -4701,8 +4352,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let (code, err) = sync(&w);
         assert_eq!(code, ExitCode::SUCCESS, "{err}");
         assert_eq!(wit.fetched(), vec![LOOPBACK_SOURCE.to_owned()]);
-        // The fleet file a sync from the key left says so, and opts nothing
-        // in of itself: the key is the opt-in, and taking it out opts out.
         assert_eq!(fleet_file_opt_in(&w.fleet_file()), Some(OptIn::Key));
         assert_eq!(
             configured_source(Some(&w.aterm_toml()), Some(&w.roster())),
@@ -4715,15 +4364,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         );
     }
 
-    /// A SOURCE IS READ AS WRITTEN AND NOTHING MORE, where the fetch is
-    /// composed ([`fetch_source_text_with`]): an rclone remote (`rclone:`) is
-    /// refused by name, naming the sources that remain, and runs nothing
-    /// (init design §6.1 row 29); curl only for an `http(s)` link (a Sheets
-    /// `/edit` link as its export); no program for a file (`~/` the home's; a
-    /// bare `remote:path` is a file name); and a fetcher's failure is the
-    /// answer — nothing is tried after it (FAILS with 0.112.0's fallback
-    /// restored: a Sheets link whose curl failed went on to an rclone remote).
-    /// NEGATIVE CONTROL: a fetcher that answers is the answer.
     #[test]
     fn a_source_is_fetched_only_as_it_is_written() {
         let w = World::new();
@@ -4786,24 +4426,13 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(got.is_err(), "no such file here");
         assert!(ran.is_empty(), "a bare `remote:path` is a file: {ran:?}");
 
-        // NEGATIVE CONTROL: a fetcher that answers.
         let (got, ran) = took(LOOPBACK_SOURCE, &run_as(0, ONE_ACCOUNT_CSV));
         assert_eq!(got.as_deref(), Ok(ONE_ACCOUNT_CSV));
         assert_eq!(ran.len(), 1);
     }
 
-    /// One program a fetch ran: its path and its arguments.
     type Ran = (String, Vec<String>);
 
-    /// A FLEET FILE NO ONE HERE NAMED A SOURCE FOR OPTS NOTHING IN: the one
-    /// 0.112.0 to 0.115.0 wrote from their built-in sheet, unasked (no
-    /// [`OPT_IN_KEY`]), and the one a sync from `[fleet] accounts_source`
-    /// wrote once the key is gone. With either beside an aterm.toml that
-    /// names no source, the upkeep fetches nothing, writes no roster and
-    /// starts nothing, and says a fleet file is ignored (FAILS with any
-    /// existing fleet file taken for the person's opt-in, as the first fix
-    /// took it). NEGATIVE CONTROL: the person syncs by hand from a source
-    /// they name; the file then says so, and the upkeep is configured by it.
     #[test]
     fn a_fleet_file_no_one_here_named_a_source_for_opts_nothing_in() {
         let w = World::new();
@@ -4843,8 +4472,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             );
         }
 
-        // A valid marker in an oversized file does not opt this machine in.
-        // The metadata read uses the same whole-file bound as local discovery.
         let mut oversized = format!("{OPT_IN_KEY} = \"named\"\n#");
         oversized.push_str(&"x".repeat(SOURCE_TEXT_MAX_BYTES + 1 - oversized.len()));
         fs::write(w.fleet_file(), oversized).unwrap();
@@ -4862,7 +4489,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(wit.spawned(), 0, "no renewal started");
         assert!(!w.roster().exists(), "no roster written");
 
-        // NEGATIVE CONTROL: a sync by hand from a source the person names.
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let synced = run_accounts_sync_with(
             &w.env(UPKEEP_NOW),
@@ -4891,12 +4517,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         );
     }
 
-    /// A machine whose `accounts.toml` was synced and later unconfigured, with
-    /// one login at its weekly wall, a successor free and a mailbox to sign it
-    /// in by: the window's upkeep starts no renewal (no `claude auth login`,
-    /// no mailbox authorizer) while no source is configured (FAILS with the
-    /// renewal made outside the gate, as 0.112.0 made it). NEGATIVE CONTROL:
-    /// with this machine's fleet file back, the same upkeep starts one.
     #[test]
     fn a_walled_login_is_renewed_only_where_a_source_is_configured() {
         let w = World::new();
@@ -4979,7 +4599,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(upkept(UpkeepStep::Both), UNCONFIGURED);
         assert_eq!(wit.spawned(), 0, "no renewal without a configured source");
 
-        // NEGATIVE CONTROL: the fleet file back.
         fs::rename(&fleet_aside, w.fleet_file()).unwrap();
         assert_eq!(
             upkept(UpkeepStep::Sync),
@@ -5002,11 +4621,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(wit.spawned(), 1, "the successor's sign-in started");
     }
 
-    /// A HELD ACCOUNTS LOCK FAILS THE SYNC, CLEARLY AND BOUNDED: with the
-    /// store's lock held for good, a sync gives up after its ladder, says the
-    /// lock is held and that nothing was synced, and writes no roster (FAILS,
-    /// by this test's one-minute hang detector, with the unbounded wait it
-    /// had). NEGATIVE CONTROL: the lock let go, the same sync completes.
     #[test]
     fn a_held_accounts_lock_fails_the_sync_and_says_so() {
         let w = World::new();
@@ -5039,7 +4653,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert!(err.contains(accounts::LOCK_HELD), "{err}");
         assert!(!w.roster().exists(), "no roster under a held lock");
 
-        // NEGATIVE CONTROL: let go.
         drop(held);
         let (code, err) = sync_in_thread(&w);
         assert_eq!(code, ExitCode::SUCCESS, "{err}");
@@ -5126,8 +4739,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(enrolled, 1);
         assert_eq!(fleet_count, 2);
 
-        // User signs into a third account locally; re-running init merges it into
-        // fleet-accounts.toml and accounts.toml without manual TOML editing.
         fs::remove_file(w.home.join(".claude.json.backup")).unwrap();
         fs::write(
             w.home.join(".claude.json"),
@@ -5142,8 +4753,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(fleet_count2, 3);
 
         let before = Roster::load(&w.roster()).unwrap();
-        // An address with no machine hint falls back to m27, whose label is
-        // already owned by a different email in the named fleet.
         fs::write(
             w.home.join(".claude.json"),
             "{\"oauthAccount\":{\"emailAddress\":\"new@example.test\"}}\n",
@@ -5202,8 +4811,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 .expect("publish after account state admits again");
         assert_eq!((count, fleet_count), (5, 5));
 
-        // The first local discovery must also wait for admission, rather
-        // than leave a new fleet file behind when the state is refused.
         let fresh = World::new();
         fresh.write_config("[fleet]\nmachine = \"m27\"\n");
         for (file, email) in [
@@ -5231,9 +4838,6 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 .expect("initial discovery publishes after admission");
         assert_eq!((count, fleet_count), (2, 2));
 
-        // A cooperating sync can replace the fleet after discovery but before
-        // init takes the lock. Exercise that gap through the actual fetch and
-        // publication funnel, without racing threads or sleeps.
         let captured = fs::read(w.fleet_file()).unwrap();
         let mut concurrent =
             FleetRoster::from_toml(std::str::from_utf8(&captured).unwrap(), "captured").unwrap();

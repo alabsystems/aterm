@@ -265,6 +265,7 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<SiblingInstance> {
     let header = read_bounded_line(&stream, &mut reader, deadline)?;
     let count: usize = header.trim_end().strip_prefix("OK ")?.parse().ok()?;
     if count > MAX_SESSIONS_PER_PEER + 1 {
+        // Refuse, never clamp: reading fewer lines than the peer sent would
         // leave the leftovers desyncing every later reply on this stream.
         return None;
     }

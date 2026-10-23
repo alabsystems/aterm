@@ -361,6 +361,8 @@ impl Bridge {
         );
         if acked {
             // `mirror_asks` is false now, so this hello says `log=auto`, and
+            // its answer leaves the mirror unacknowledged until a retaining
+            // attach asks again.
             self.introduce();
         }
         if self.endpoint_lane >= LINK_MIRROR_WAIT_LANE {

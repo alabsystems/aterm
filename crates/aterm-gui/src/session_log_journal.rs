@@ -100,7 +100,7 @@ impl Inactive {
 }
 
 /// One admission policy for the writer and Settings' next-launch disclosure.
-pub(crate) fn eligibility(
+pub(crate) const fn eligibility(
     requested: bool,
     restore: bool,
     desk: crate::desk::Desk,
@@ -388,7 +388,7 @@ pub(crate) struct Lane {
 
 impl Lane {
     /// A lane that does nothing.
-    pub(crate) fn inert() -> Lane {
+    pub(crate) const fn inert() -> Lane {
         Lane {
             shared: None,
             logs: None,
@@ -1068,7 +1068,7 @@ impl<T: Targets> Writer<T> {
         self.retention();
     }
 
-    fn phase(&self) -> Phase {
+    const fn phase(&self) -> Phase {
         match self.state {
             State::Running if self.handed_done => Phase::Handed,
             State::Running => Phase::Running,
@@ -1077,7 +1077,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    pub(crate) fn is_stopped(&self) -> bool {
+    pub(crate) const fn is_stopped(&self) -> bool {
         matches!(self.state, State::Stopped)
     }
 
@@ -1152,7 +1152,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    pub(crate) fn begin_handing(&mut self) {
+    pub(crate) const fn begin_handing(&mut self) {
         self.handing = true;
     }
 
@@ -1893,7 +1893,7 @@ impl<T: Targets> Drop for Writer<T> {
 }
 
 /// Whether `errno` wrote nothing and may pass: EAGAIN, EWOULDBLOCK, EINTR.
-fn is_transient(errno: i32) -> bool {
+const fn is_transient(errno: i32) -> bool {
     errno == self::errno::EAGAIN || errno == self::errno::EWOULDBLOCK || errno == self::errno::EINTR
 }
 

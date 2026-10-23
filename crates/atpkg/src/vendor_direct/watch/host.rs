@@ -1,23 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which aterm host runs the head watch: the window, or, with no window open, one terminal
-//! session — never both kinds at once. Two store-scoped lock files are the rendezvous;
-//! neither carries authority (the per-vendor `.watch` files still decide whose GET a minute
-//! is, and the pass re-verifies everything):
-//!
-//! * `vendor-head.hosts` — every watching window holds it shared for its watch's life; the
-//!   session watcher holds it exclusive for one round of checks at a time. A window that
-//!   arrives waits at most the round in flight (one short GET), and while it lives the
-//!   session never gets the lock again.
-//! * `vendor-head.session` — the seat: the one session that may watch holds it exclusive
-//!   for its life and writes its pid into it. Every other session tries the seat once a
-//!   minute, so a second tab costs one `flock` a minute, not a watcher.
-//!
-//! The kernel releases both with the process, so a host that exits — cleanly or not —
-//! hands the watch on within a minute. Fail-safe both ways: a window that cannot open the
-//! rendezvous watches anyway, and a session that cannot stands by and says so once (a
-//! window, or the next update pass, still finds the release).
+//! Lock-file rendezvous selecting which aterm host runs the vendor head watch.
 
 use std::fs::File;
 use std::io::{Read as _, Seek as _, Write as _};
@@ -29,19 +13,15 @@ use crate::index_probe::open_private;
 use crate::lock::{Flock, RecordLock};
 use crate::store::Layout;
 
-/// The rendezvous every watching host locks: shared by windows, exclusive per round by
-/// the session watcher.
 const HOSTS_FILE: &str = "vendor-head.hosts";
-/// The one session watcher's seat, holding its pid.
 const SEAT_FILE: &str = "vendor-head.session";
-/// The seat's pid record is a few bytes; anything longer is not ours.
 const MAX_SEAT_BYTES: u64 = 64;
 
 /// Which kind of aterm host runs a head watch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Host {
-    /// The window's package thread: it watches whenever it is up, sharing the store's
-    /// vendor files with every other window.
+    /// The window's package thread: it watches whenever it is up, sharing the store's vendor files
+    /// with every other window.
     Window,
     /// A terminal session: it watches only from the seat, and only while no window does.
     Session,
@@ -56,16 +36,11 @@ pub(super) enum Admit {
     Later(Duration),
 }
 
-/// Where a session watcher stands, for the one log line each change is worth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Standing {
-    /// It holds the seat and checks when no window does.
     Watching,
-    /// Another session holds the seat.
     SeatTaken,
-    /// A window watches (or another session's round is in flight: the next try tells).
     WindowWatches,
-    /// The rendezvous could not be opened or locked: nothing proves no window watches.
     Unavailable,
 }
 
@@ -73,9 +48,7 @@ enum Standing {
 pub(super) struct HostClaim {
     host: Host,
     prefix: PathBuf,
-    /// A window's shared hold, kept once taken; a session's exclusive hold for one round.
     hosts: Option<Flock>,
-    /// A session's seat, kept once taken with its pid record outside the locked range.
     seat: Option<RecordLock>,
     standing: Option<Standing>,
     #[cfg(test)]
@@ -107,8 +80,8 @@ impl HostClaim {
         }
     }
 
-    /// Whether this host may start a round now, and the one line a changed standing is
-    /// worth (a session's only: a window's claim is taken once and kept).
+    /// Whether this host may start a round now, and the one line a changed standing is worth (a
+    /// session's only: a window's claim is taken once and kept).
     pub(super) fn admit(&mut self) -> (Admit, Option<String>) {
         #[cfg(test)]
         {
@@ -125,9 +98,6 @@ impl HostClaim {
         }
     }
 
-    /// A window takes the rendezvous shared once and keeps it. Refused only while a
-    /// session's round holds it, which ends within one GET: ask again in a slice. A
-    /// rendezvous it cannot open or lock is no reason to stop watching.
     fn admit_window(&mut self) -> Admit {
         if self.hosts.is_some() {
             return Admit::Yes;
@@ -145,9 +115,6 @@ impl HostClaim {
         }
     }
 
-    /// A session watches only from the seat and only while no window holds the
-    /// rendezvous; it then holds the rendezvous exclusive until its round ends. Unsure —
-    /// either file unopenable or unlockable — it stands by.
     fn admit_session(&mut self) -> (Admit, Standing) {
         if self.hosts.is_some() {
             return (Admit::Yes, Standing::Watching);
@@ -158,7 +125,6 @@ impl HostClaim {
             };
             match RecordLock::try_lock(file, MAX_SEAT_BYTES) {
                 Ok(mut held) => {
-                    // The pid is only what `doctor` names; a failed write names none.
                     let _ = write_pid(&mut held);
                     self.seat = Some(held);
                 }
@@ -185,17 +151,13 @@ impl HostClaim {
         }
     }
 
-    /// Whether this session holds the rendezvous exclusive right now. The seat and the last
-    /// admission alone are not enough: a window can take its shared hold immediately after
-    /// [`Self::end_round`]. A held toolchain move must re-admit before looking, then keep
-    /// this hold through its pass launch.
+    /// Whether this session holds the rendezvous exclusive right now.
     pub(super) fn seated_session(&self) -> bool {
         self.host == Host::Session && self.seat.is_some() && self.hosts.is_some()
     }
 
-    /// A seated session refused only because a window owns the rendezvous
-    /// retries on the next park slice; another tab without the seat waits the
-    /// watch's minute cadence.
+    /// A seated session refused only because a window owns the rendezvous retries on the next park
+    /// slice; another tab without the seat waits the watch's minute cadence.
     pub(super) fn window_watches(&self) -> bool {
         self.host == Host::Session && self.standing == Some(Standing::WindowWatches)
     }
@@ -205,8 +167,7 @@ impl HostClaim {
         self.admit_calls
     }
 
-    /// A round is over: a session lets the rendezvous go, so a window can take it; a
-    /// window keeps its shared hold.
+    /// A round is over: a session lets the rendezvous go, so a window can take it.
     pub(super) fn end_round(&mut self) {
         if self.host == Host::Session {
             self.hosts = None;
@@ -214,7 +175,6 @@ impl HostClaim {
     }
 }
 
-/// The line a session watcher's new standing is worth in its host's log.
 fn standing_note(standing: Standing) -> String {
     match standing {
         Standing::Watching => String::from(
@@ -243,7 +203,6 @@ fn write_pid(file: &mut File) -> std::io::Result<()> {
     file.flush()
 }
 
-/// The seat holder's pid, as it wrote it.
 fn read_pid(file: &mut File) -> Option<u32> {
     let mut text = String::new();
     file.take(MAX_SEAT_BYTES).read_to_string(&mut text).ok()?;
@@ -264,11 +223,7 @@ pub enum Watcher {
     Unknown(String),
 }
 
-/// Who watches `layout`'s vendor heads, read off the rendezvous without taking the watch:
-/// each file is opened read-only, never created, and a lock is held only for the instant a
-/// probe needs it. A window's shared hold admits a shared probe but refuses an exclusive
-/// one; a session's round refuses both. A host trying its claim in that instant is told
-/// to try again, as it would be by any other host.
+/// Who watches `layout`'s vendor heads, read off the rendezvous without taking the watch.
 #[must_use]
 pub fn watcher(layout: &Layout) -> Watcher {
     let hosts = match probe(&layout.prefix.join(HOSTS_FILE)) {
@@ -283,22 +238,16 @@ pub fn watcher(layout: &Layout) -> Watcher {
         Ok(Probe::Exclusive) => Watcher::Session(
             open_private(&seat_path, false).and_then(|mut file| read_pid(&mut file)),
         ),
-        // A round holds the rendezvous only from the seat; the seat being free between
-        // the two probes is a session that just exited.
         Ok(_) if hosts == Probe::Exclusive => Watcher::Session(None),
         Ok(_) => Watcher::Nobody,
         Err(why) => Watcher::Unknown(why),
     }
 }
 
-/// How a rendezvous file is held.
 #[derive(Debug, PartialEq, Eq)]
 enum Probe {
-    /// Absent, or held by nobody.
     Free,
-    /// Held shared (a window's watch).
     Shared,
-    /// Held exclusive (a session's seat or round).
     Exclusive,
 }
 
@@ -337,16 +286,11 @@ mod tests {
         crate::testdir::layout(&format!("atpkg-hosts-{label}-"))
     }
 
-    /// A window's shared hold keeps every session out; a session's round keeps a window out
-    /// until the round ends, and a window that then takes its hold keeps the session out for
-    /// good; a second session never gets past the seat while the first lives; and every
-    /// release hands on at once.
     #[test]
     fn a_window_and_a_session_never_both_hold_the_watch() {
         let l = layout("claims");
         assert_eq!(watcher(&l), Watcher::Nobody, "nothing has ever watched");
 
-        // Session A takes the seat and a round; session B stands by at the seat.
         let mut a = HostClaim::new(Host::Session, &l);
         let (admit, note) = a.admit();
         assert_eq!(admit, Admit::Yes);
@@ -363,7 +307,6 @@ mod tests {
         assert!(note.unwrap().contains("another terminal session watches"));
         assert_eq!(b.admit(), (Admit::Later(CADENCE), None), "said once");
 
-        // A window arriving mid-round is refused for one slice, not for good.
         let mut window = HostClaim::new(Host::Window, &l);
         assert_eq!(window.admit(), (Admit::Later(BUSY_RETRY), None));
         a.end_round();
@@ -376,12 +319,10 @@ mod tests {
         assert!(!a.seated_session(), "the window now holds that space");
         assert_eq!(watcher(&l), Watcher::Window);
 
-        // From now on the seat holder never gets a round, and says so once.
         let (admit, note) = a.admit();
         assert_eq!(admit, Admit::Later(CADENCE));
         assert!(note.unwrap().contains("an aterm window watches"));
         assert_eq!(a.admit(), (Admit::Later(CADENCE), None));
-        // A second window shares the hold.
         let mut second = HostClaim::new(Host::Window, &l);
         assert_eq!(second.admit(), (Admit::Yes, None));
         drop(window);
@@ -392,7 +333,6 @@ mod tests {
         );
         drop(second);
 
-        // The windows gone, the seat holder watches again; its exit hands the seat to B.
         let (admit, note) = a.admit();
         assert_eq!(admit, Admit::Yes);
         assert!(note.unwrap().contains("this terminal session watches"));
@@ -406,7 +346,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The real hosts of one store, as the derived model `AtpkgHeadWatchHosts` names them.
     struct Hosts {
         layout: Layout,
         window: Option<HostClaim>,
@@ -422,7 +361,6 @@ mod tests {
             }
         }
 
-        /// Do what `action` names, through the real claims.
         fn act(&mut self, action: &str) {
             let session = |name: &str| usize::from(name.starts_with("S2"));
             match action {
@@ -450,7 +388,6 @@ mod tests {
             }
         }
 
-        /// The model's variables, read off the real claims.
         fn project(&self) -> std::collections::BTreeMap<&'static str, i64> {
             let window = self
                 .window
@@ -478,12 +415,6 @@ mod tests {
         }
     }
 
-    /// The real claims against the derived model `AtpkgHeadWatchHosts`, over every
-    /// reachable step: each reachable state is reached again by its shortest path through
-    /// real `HostClaim`s on a fresh store, each enabled action is taken through them, and
-    /// the real holds must read as the model's successor. Negative control: the probe
-    /// design's counterexample (`Buggy=1`) walked through the real hosts, where the session
-    /// is refused the round the probe let it take.
     #[test]
     fn the_real_claims_refine_the_derived_model() {
         use aterm_models_atpkg::atpkg_head_watch_hosts_model;
@@ -524,7 +455,6 @@ mod tests {
             "every reachable step is taken: {}",
             steps.len()
         );
-        // Each step on its own store: side by side.
         crate::testdir::each_side_by_side(&steps, |i, (state, path, action, next)| {
             let l = layout(&format!("refines-{i}"));
             let mut hosts = Hosts::new(&l);
@@ -542,9 +472,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&l.prefix);
         });
 
-        // The probe design: the session found the rendezvous free and let it go; a window
-        // took it since; the buggy session rounds on its stale answer beside the window.
-        // The real session asks for the round instead, and is refused.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let mut probed = buggy.init_state();
         for action in [
@@ -585,9 +512,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A rendezvous that is not a plain file (here a directory in its place) leaves a window
-    /// watching and a session standing by — it cannot prove no window watches — saying so
-    /// once; the report says it could not tell.
     #[test]
     fn an_unopenable_rendezvous_keeps_the_window_and_stands_the_session_by() {
         let l = layout("unopenable");

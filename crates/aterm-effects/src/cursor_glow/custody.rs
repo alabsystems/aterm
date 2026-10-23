@@ -1795,7 +1795,8 @@ impl CursorGlow {
         Self::share_rule(credits, paid, cells)
     }
 
-    /// How many columns of the same-row run `[from_col, to_col)` are wide continuations (`'\0'`.
+    /// How many columns of the same-row run `[from_col, to_col)` are wide continuations (`'\0'`
+    /// in the row probe, as `Terminal::row_cols_into` spells them).
     pub(super) fn swept_wide_continuations(
         &self,
         row: u16,

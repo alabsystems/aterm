@@ -906,7 +906,8 @@ fn probe_shell_setup_under_an_open_umask_shares_no_directory() {
     let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
         return;
     };
-    // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this process.
+    // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+    // process runs this one test (`--exact`), so no other create sees the mask.
     unsafe { libc::umask(0o022) };
     let home = PathBuf::from(dir).join("home");
     std::fs::create_dir(&home).expect("mkdir home");
@@ -1054,6 +1055,25 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
         "the rendezvous stays"
     );
     assert!(!app.exists(), "the bundle went after its aterm was asked");
+    // Swept again, with no aterm left to ask: the free lock alone is no mug to stop.
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("left Caffeine lock rendezvous"), "{out}");
+    assert!(support.join("caffeine.lock").is_file());
+    // Held, it is a mug no aterm here can stop; with a login plist, one a login starts.
+    let lock = support.join("caffeine.lock");
+    let held =
+        crate::lock::Flock::try_lock(std::fs::File::open(&lock).expect("open")).expect("hold");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "a held lock is a running mug: {out}{err}");
+    assert!(err.contains("Caffeine lock is busy"), "{err}");
+    drop(held);
+    let plist = home.join("Library/LaunchAgents/com.aterm.aterm.caffeine.plist");
+    write(&plist, "<plist/>");
+    let (ok, out, err) = a.sweep(None, false);
+    assert!(!ok, "a login plist starts a mug: {out}{err}");
+    assert!(err.contains("Caffeine stop was not confirmed"), "{err}");
+    assert!(plist.is_file() && lock.is_file());
 
     let a = Account::new("caffeine-quit-acts");
     let home = a.home().to_path_buf();
@@ -1155,6 +1175,7 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
                 s,
                 p,
                 dirs,
+                0,
                 || Some((501, 20)),
                 |program, args| {
                     assert_eq!(program, Path::new(SUDO));
@@ -1228,6 +1249,133 @@ fn a_root_sweep_asks_caffeine_as_the_homes_owner() {
         helper_line(aterm, &args, None),
         "/A/aterm.app/Contents/MacOS/aterm caffeine quit own"
     );
+}
+
+/// What a sweep finds rather than was started as runs as the account the home is: under root
+/// (sudo keeps the person's HOME), through sudo as the home's owner; for any other home, root
+/// runs itself only what it runs already or no account can replace, and nothing else. The
+/// store's `aterm` is then not asked, nor `/Applications` taken for another account's.
+#[test]
+fn a_root_sweep_runs_nothing_an_account_could_replace() {
+    let me = aterm_uds::peer::our_uid();
+    assert_ne!(me, 0, "the tests run unprivileged");
+    let own = aterm_uds::account::home_of(me).expect("this account's home");
+    let a = Account::new("runs-as");
+    let ran = a.dir.join("ran");
+    let planted = a.home().join(".local/lib/aterm/bin/aterm");
+    exe(
+        &planted,
+        &format!("#!/bin/sh\n: >'{}'\necho 'aterm 9.9.0'\n", ran.display()),
+    );
+    let this = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .expect("this test binary");
+    let through = a.dir.join("through-a-link");
+    std::os::unix::fs::symlink(&this, &through).expect("a link to it");
+    let roots = aterm_uds::account::home_of(0).expect("root's home");
+    assert_eq!(runs_as(me, a.home(), &planted), RunAs::Me, "not root");
+    assert_eq!(
+        runs_as(0, &own, &planted),
+        RunAs::Account(me),
+        "sudo's HOME"
+    );
+    assert_eq!(runs_as(0, a.home(), &planted), RunAs::Nobody);
+    assert_eq!(runs_as(0, &roots, &planted), RunAs::Nobody, "root's HOME");
+    assert_eq!(runs_as(0, &roots, Path::new("/bin/sh")), RunAs::Me);
+    assert_eq!(runs_as(0, &roots, &this), RunAs::Me, "root runs it already");
+    assert_eq!(
+        runs_as(0, a.home(), Path::new("/bin/sh")),
+        RunAs::Nobody,
+        "root's files in another's home"
+    );
+    assert_eq!(runs_as(0, a.home(), &this), RunAs::Nobody);
+    assert_eq!(
+        runs_as(0, &roots, &through),
+        RunAs::Nobody,
+        "a link its owner may repoint"
+    );
+    // Root's own, not group- or other-writable but by root's group or under a sticky bit; a
+    // link by its owner alone.
+    for (uid, gid, mode, dir, link, alone) in [
+        (0, 0, 0o040_755, true, false, true),
+        (0, 80, 0o040_775, true, false, false),
+        (0, 0, 0o040_775, true, false, true),
+        (0, 0, 0o040_777, true, false, false),
+        (0, 0, 0o041_777, true, false, true),
+        (0, 0, 0o101_777, false, false, false),
+        (0, 0, 0o100_755, false, false, true),
+        (501, 0, 0o040_755, true, false, false),
+        (0, 0, 0o120_777, false, true, true),
+        (501, 0, 0o120_755, false, true, false),
+    ] {
+        assert_eq!(
+            root_only_entry(uid, gid, mode, dir, link),
+            alone,
+            "uid {uid} gid {gid} mode {mode:o}"
+        );
+    }
+
+    // The desktop database's refresh runs the program `$PATH` names only as this process.
+    let bin = a.dir.join("bin");
+    let refreshed = a.dir.join("refreshed");
+    exe(
+        &bin.join("update-desktop-database"),
+        &format!("#!/bin/sh\n: >'{}'\n", refreshed.display()),
+    );
+    aterm_spec::wait::first_exec(&bin.join("update-desktop-database"), &[]);
+    std::fs::remove_file(&refreshed).expect("the warm-up's mark");
+    let env = ShellEnv {
+        shell: None,
+        path: Some(bin.clone().into()),
+        manpath: None,
+    };
+    refresh_desktop_database(&env, &a.places.xdg_data, |_| RunAs::Nobody);
+    refresh_desktop_database(&env, &a.places.xdg_data, |_| RunAs::Account(me));
+    assert!(!refreshed.exists(), "not run but as this process");
+    refresh_desktop_database(&env, &a.places.xdg_data, |_| RunAs::Me);
+    assert!(refreshed.exists());
+    assert!(home_is_the_accounts(me, &own));
+    assert!(home_is_the_accounts(0, &own), "sudo's HOME is the person's");
+    assert!(!home_is_the_accounts(me, a.home()));
+    assert!(!home_is_the_accounts(0, a.home()));
+
+    aterm_spec::wait::first_exec(&planted, &["--version"]);
+    std::fs::remove_file(&ran).expect("the warm-up's mark");
+    assert!(!store_entry_is_ours(&planted, RunAs::Nobody));
+    assert!(!ran.exists(), "not run for nobody");
+    assert!(store_entry_is_ours(&planted, RunAs::Me));
+    assert!(ran.exists(), "asked as this process");
+
+    // A root sweep with no account to ask as runs none of the home's Caffeine helpers, and
+    // keeps each for its steps.
+    let a = Account::new("caffeine-root-nobody");
+    let app = a.home().join("Applications/aterm.app");
+    bundle(&app, None);
+    exe(&app.join("Contents/MacOS/aterm"), "#!/bin/sh\nexit 0\n");
+    write(
+        &a.home()
+            .join("Library/Application Support/aterm/caffeine.state"),
+        "mode=on\n",
+    );
+    let mut failed = Vec::new();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let ok =
+        self_uninstall_with_caffeine(&a.places, None, false, &mut out, &mut err, |s, p, dirs| {
+            failed = sweep_caffeine_with(
+                s,
+                p,
+                dirs,
+                0,
+                || None,
+                |program, args| panic!("root ran {} {args:?}", program.display()),
+            );
+            failed.clone()
+        });
+    let err = String::from_utf8(err).expect("utf-8");
+    assert!(!ok, "{err}");
+    assert!(err.contains(NOT_AS_ROOT), "{err}");
+    assert_eq!(failed, std::slice::from_ref(&app));
+    assert!(app.is_dir(), "kept for its steps");
 }
 
 /// The cleanup's hold takes only a lock of the account the sweep is for: this process's,

@@ -183,6 +183,8 @@ impl App {
         }
         if !self.resume_swept {
             // The API outage is a level family too, stated only as tabs
+            // enter and leave the wait: an entry an earlier process left open
+            // would stand for the 14-day expiry where no tab here ever waits.
             if self.resume_looked.is_none() {
                 self.hand_api_outage();
             }
@@ -314,6 +316,43 @@ impl App {
         }
     }
 
+    /// THE OWNER'S OCCUPANCY MODE IN FORCE, `mode` (the red-team's F14, R9): the policy the
+    /// window's loops run — the launch read's, then each the watcher posts
+    /// ([`App::adopt_harness_policy`], whose wake comes whether or not a config generation is
+    /// admitted). The board takes it ([`crate::occupancy_host::set_mode`]), and while it is
+    /// `prompt` (the root `[harness]` table's `occupancy = "prompt"`, the one grant) an Entry
+    /// says so — the harness types occupancy lines into the agents' sessions — cleared by a
+    /// policy that says otherwise. Raised and cleared here alone, never typed.
+    pub(crate) fn note_occupancy_mode(&mut self, mode: aterm_agent::supervise::Occupancy) {
+        use crate::message_reporters::{occupancy_prompt_entry, occupancy_prompt_key};
+        crate::occupancy_host::set_mode(mode);
+        if mode.grant().is_some() {
+            self.except(&occupancy_prompt_entry());
+        } else {
+            self.except_clear(&occupancy_prompt_key());
+        }
+    }
+
+    /// WHAT TAB `sid`'S OCCUPANCY DOOR SAYS NOW ([`HostNote::OccupancySaid`]): the board keeps
+    /// it; a cap spent under `prompt` with the hold open raises the tab's `occupancy.hold`
+    /// Entry, and a word with nothing spent clears it. A word that spends what the last one
+    /// did posts the same Entry, which the store keeps as it stands (a duplicate, or one the
+    /// owner put away).
+    pub(crate) fn note_occupancy_said(
+        &mut self,
+        sid: &str,
+        said: aterm_agent::supervise::occupancy::OccupancySaid,
+    ) {
+        use crate::message_reporters::{occupancy_hold_entry, occupancy_hold_key};
+        let spent = said.spent_under_prompt();
+        crate::occupancy_host::told(sid, Some(said));
+        if spent.is_empty() {
+            self.except_clear(&occupancy_hold_key(sid));
+        } else {
+            self.except(&occupancy_hold_entry(sid, &spent));
+        }
+    }
+
     /// Replaces the open set for a level-mode `family` with `entries`.
     pub(crate) fn except_replace(&mut self, family: Family, entries: &[Entry]) {
         if family.mode() != Mode::Level || entries.iter().any(|e| e.family() != family) {
@@ -344,6 +383,7 @@ impl App {
         );
         if sync.posted + sync.restated + sync.resolved > 0 {
             // A restatement alone is words moving in place (a count, an age),
+            // at most once per `RESTATE_QUIET`: not news for `aterm.log`.
             if sync.posted + sync.resolved > 0 {
                 aterm_log::info!("exceptions: {family:?} {sync:?}");
             } else {
@@ -548,6 +588,9 @@ impl App {
             HostNote::ResumeUnread { sid, agent, stall } => match stall {
                 Some(stall) => {
                     // The second rung of the stall canary (90 minutes of
+                    // background work, 30 of a dialog). A record, once per
+                    // episode, and one log line, in the witness's words; the
+                    // digest waits for the third (3 h; an hour).
                     if self.host_noted.insert(format!("stalled:{sid}")) {
                         let spot = self.upgrade_spot(&sid);
                         let record = match stall {
@@ -684,6 +727,7 @@ impl App {
                 let place = self.upgrade_place(&sid);
                 self.record_message(message_reporters::supervisor_note(&sid, &place, &text));
             }
+            HostNote::OccupancySaid { sid, said } => self.note_occupancy_said(&sid, said),
             HostNote::UsageTap { sid, silent } => {
                 let tab = format!("{USAGE_TAP_NOTED}{sid}");
                 if silent {
@@ -1135,6 +1179,7 @@ impl App {
     /// Clears `render.<tab>.unrepaired` exceptions whose render epoch has healed.
     pub(crate) fn check_render_repairs(&mut self) {
         // Every turn of the event loop asks: with nothing held and the earlier
+        // process's lines swept once, it is one flag and one map length.
         if self.render_lines_swept && self.render_unrepaired.is_empty() {
             return;
         }
@@ -1227,6 +1272,8 @@ impl App {
                 }
             } else if let Some(sid) = noted.strip_prefix("relaunch:") {
                 // A relaunch line stands while this process's worker told of it and has not
+                // seen the agent run again; an earlier run's ends here, and a live relaunch tells
+                // it again.
                 held.extend(message_reporters::relaunch_keys(sid));
             }
         }

@@ -5,11 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Color Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/colr) implementation.
-
-// NOTE: Parts of the implementation have been inspired by
-// [skrifa](https://github.com/googlefonts/fontations/tree/main/skrifa).
+//! A [Color Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/colr) implementation.
 
 use super::cpal;
 use crate::NormalizedCoordinate;
@@ -19,8 +15,6 @@ use crate::var_store::ItemVariationStore;
 use crate::{Fixed, LazyArray32, RectF, Transform};
 use crate::{GlyphId, RgbaColor};
 
-/// A [base glyph](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#baseglyph-and-layer-records).
 #[derive(Clone, Copy, Debug)]
 struct BaseGlyphRecord {
     glyph_id: GlyphId,
@@ -28,7 +22,7 @@ struct BaseGlyphRecord {
     num_layers: u16,
 }
 
-/// A [ClipBox](https://learn.microsoft.com/en-us/typography/opentype/spec/colr#baseglyphlist-layerlist-and-cliplist).
+/// A `COLR` clip box.
 pub type ClipBox = RectF;
 
 /// A paint.
@@ -44,8 +38,6 @@ pub enum Paint<'a> {
     SweepGradient(SweepGradient<'a>),
 }
 
-/// A [clip record](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#baseglyphlist-layerlist-and-cliplist).
 #[derive(Clone, Copy, Debug)]
 struct ClipRecord {
     /// The first glyph ID for the range covered by this record.
@@ -76,8 +68,6 @@ impl ClipRecord {
     }
 }
 
-/// A [clip list](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#baseglyphlist-layerlist-and-cliplist).
 #[derive(Clone, Copy, Debug, Default)]
 struct ClipList<'a> {
     data: &'a [u8],
@@ -145,8 +135,6 @@ impl FromData for BaseGlyphRecord {
     }
 }
 
-/// A [layer](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#baseglyph-and-layer-records).
 #[derive(Clone, Copy, Debug)]
 struct LayerRecord {
     glyph_id: GlyphId,
@@ -165,8 +153,6 @@ impl FromData for LayerRecord {
     }
 }
 
-/// A [BaseGlyphPaintRecord](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#baseglyphlist-layerlist-and-cliplist).
 #[derive(Clone, Copy, Debug)]
 struct BaseGlyphPaintRecord {
     glyph_id: GlyphId,
@@ -185,8 +171,7 @@ impl FromData for BaseGlyphPaintRecord {
     }
 }
 
-/// A [gradient extend](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#baseglyphlist-layerlist-and-cliplist).
+/// A gradient extend mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GradientExtend {
     /// The `Pad` gradient extend mode.
@@ -210,8 +195,6 @@ impl FromData for GradientExtend {
     }
 }
 
-/// A [color stop](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#color-references-colorstop-and-colorline).
 #[derive(Clone, Copy, Debug)]
 struct ColorStopRaw {
     stop_offset: F2DOT14,
@@ -232,8 +215,6 @@ impl FromData for ColorStopRaw {
     }
 }
 
-/// A [var color stop](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#color-references-colorstop-and-colorline).
 #[derive(Clone, Copy, Debug)]
 struct VarColorStopRaw {
     stop_offset: F2DOT14,
@@ -265,7 +246,6 @@ struct NonVarColorLine<'a> {
 }
 
 impl NonVarColorLine<'_> {
-    // TODO: Color stops should be sorted, but hard to do without allocations
     fn get(&self, palette: u16, index: u16) -> Option<ColorStop> {
         let info = self.colors.get(index)?;
 
@@ -284,7 +264,6 @@ impl NonVarColorLine<'_> {
 }
 
 impl VarColorLine<'_> {
-    // TODO: Color stops should be sorted, but hard to do without allocations
     fn get(
         &self,
         palette: u16,
@@ -322,8 +301,7 @@ enum ColorLine<'a> {
     NonVarColorLine(NonVarColorLine<'a>),
 }
 
-/// A [gradient extend](
-/// https://learn.microsoft.com/en-us/typography/opentype/spec/colr#baseglyphlist-layerlist-and-cliplist).
+/// A gradient color stop.
 #[derive(Clone, Copy, Debug)]
 pub struct ColorStop {
     /// The offset of the color stop.
@@ -332,7 +310,7 @@ pub struct ColorStop {
     pub color: RgbaColor,
 }
 
-/// A [linear gradient](https://learn.microsoft.com/en-us/typography/opentype/spec/colr#formats-4-and-5-paintlineargradient-paintvarlineargradient)
+/// A linear gradient.
 #[derive(Clone)]
 pub struct LinearGradient<'a> {
     /// The `x0` value.
@@ -369,8 +347,7 @@ impl<'a> core::fmt::Debug for LinearGradient<'a> {
 }
 
 impl<'a> LinearGradient<'a> {
-    /// Returns an iterator over the stops of the linear gradient. Stops need to be sorted
-    /// manually by the caller.
+    /// Returns an iterator over the stops of the linear gradient.
     pub fn stops<'b>(
         &'b self,
         palette: u16,
@@ -386,7 +363,7 @@ impl<'a> LinearGradient<'a> {
     }
 }
 
-/// A [radial gradient](https://learn.microsoft.com/en-us/typography/opentype/spec/colr#formats-6-and-7-paintradialgradient-paintvarradialgradient)
+/// A radial gradient.
 #[derive(Clone)]
 pub struct RadialGradient<'a> {
     /// The `x0` value.
@@ -423,8 +400,7 @@ impl<'a> core::fmt::Debug for RadialGradient<'a> {
 }
 
 impl<'a> RadialGradient<'a> {
-    /// Returns an iterator over the stops of the radial gradient. Stops need to be sorted
-    /// manually by the caller.
+    /// Returns an iterator over the stops of the radial gradient.
     pub fn stops<'b>(
         &'b self,
         palette: u16,
@@ -440,7 +416,7 @@ impl<'a> RadialGradient<'a> {
     }
 }
 
-/// A [sweep gradient](https://learn.microsoft.com/en-us/typography/opentype/spec/colr#formats-8-and-9-paintsweepgradient-paintvarsweepgradient)
+/// A sweep gradient.
 #[derive(Clone)]
 pub struct SweepGradient<'a> {
     /// The x of the center.
@@ -471,10 +447,7 @@ impl<'a> core::fmt::Debug for SweepGradient<'a> {
 }
 
 impl<'a> SweepGradient<'a> {
-    // TODO: Make API nicer so that variable coordinates don't
-    // need to be passed by the caller (same for radial and linear gradient)
-    /// Returns an iterator over the stops of the sweep gradient. Stops need to be sorted
-    /// manually by the caller.
+    /// Returns an iterator over the stops of the sweep gradient.
     pub fn stops<'b>(
         &'b self,
         palette: u16,
@@ -531,7 +504,7 @@ impl core::fmt::Debug for GradientStopsIter<'_, '_> {
     }
 }
 
-/// A [composite mode](https://learn.microsoft.com/en-us/typography/opentype/spec/colr#format-32-paintcomposite)
+/// A composite mode.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum CompositeMode {
     /// The composite mode 'Clear'.
@@ -631,8 +604,6 @@ impl FromData for CompositeMode {
 }
 
 /// A trait for color glyph painting.
-///
-/// See [COLR](https://learn.microsoft.com/en-us/typography/opentype/spec/colr) for details.
 pub trait Painter<'a> {
     /// Outline a glyph and store it.
     fn outline_glyph(&mut self, glyph_id: GlyphId);
@@ -657,19 +628,14 @@ pub trait Painter<'a> {
     fn pop_transform(&mut self);
 }
 
-/// A [Color Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/colr).
-///
-/// Currently, only version 0 is supported.
+/// A [Color Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/colr).
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     pub(crate) palettes: cpal::Table<'a>,
     data: &'a [u8],
     version: u8,
-    // v0
     base_glyphs: LazyArray16<'a, BaseGlyphRecord>,
     layers: LazyArray16<'a, LayerRecord>,
-    // v1
     base_glyph_paints_offset: Offset32,
     base_glyph_paints: LazyArray32<'a, BaseGlyphPaintRecord>,
     layer_paint_offsets_offset: Offset32,
@@ -773,9 +739,6 @@ impl<'a> Table<'a> {
     }
 
     /// Returns `true` if the current table has version 0.
-    ///
-    /// A simple table can only emit `outline_glyph` and `paint`
-    /// [`Painter`] methods.
     pub fn is_simple(&self) -> bool {
         self.version == 0
     }
@@ -810,9 +773,6 @@ impl<'a> Table<'a> {
             .find(glyph_id, &self.variation_data(), coords)
     }
 
-    // This method should only be called from outside, not from within `colr.rs`.
-    // From inside, you always should call paint_impl, so that the recursion stack can
-    // be passed on and any kind of recursion can be prevented.
     /// Paints the color glyph.
     pub fn paint(
         &self,
@@ -876,7 +836,6 @@ impl<'a> Table<'a> {
 
         for layer in layers {
             if layer.palette_index == 0xFFFF {
-                // A special case.
                 painter.outline_glyph(layer.glyph_id);
                 painter.paint(Paint::Solid(foreground_color));
             } else {
@@ -933,7 +892,6 @@ impl<'a> Table<'a> {
         let mut s = Stream::new_at(self.data, offset)?;
         let format = s.read::<u8>()?;
 
-        // Cycle detected
         if recursion_stack.contains(offset) {
             return None;
         }
@@ -967,7 +925,6 @@ impl<'a> Table<'a> {
     ) -> Option<()> {
         match format {
             1 => {
-                // PaintColrLayers
                 let layers_count = s.read::<u8>()?;
                 let first_layer_index = s.read::<u32>()?;
 
@@ -987,7 +944,6 @@ impl<'a> Table<'a> {
                 }
             }
             2 => {
-                // PaintSolid
                 let palette_index = s.read::<u16>()?;
                 let alpha = s.read::<F2DOT14>()?;
 
@@ -1001,7 +957,6 @@ impl<'a> Table<'a> {
                 painter.paint(Paint::Solid(color));
             }
             3 => {
-                // PaintVarSolid
                 let palette_index = s.read::<u16>()?;
                 let alpha = s.read::<F2DOT14>()?;
                 let var_index_base = s.read::<u32>()?;
@@ -1020,7 +975,6 @@ impl<'a> Table<'a> {
                 painter.paint(Paint::Solid(color));
             }
             4 => {
-                // PaintLinearGradient
                 let color_line_offset = s.read::<Offset24>()?;
                 let color_line = self.parse_color_line(
                     offset.saturating_add(color_line_offset.to_usize()),
@@ -1040,7 +994,6 @@ impl<'a> Table<'a> {
                 }))
             }
             5 => {
-                // PaintVarLinearGradient
                 let var_color_line_offset = s.read::<Offset24>()?;
                 let color_line = self.parse_var_color_line(
                     offset.saturating_add(var_color_line_offset.to_usize()),
@@ -1067,7 +1020,6 @@ impl<'a> Table<'a> {
                 }))
             }
             6 => {
-                // PaintRadialGradient
                 let color_line_offset = s.read::<Offset24>()?;
                 let color_line = self.parse_color_line(
                     offset.saturating_add(color_line_offset.to_usize()),
@@ -1086,7 +1038,6 @@ impl<'a> Table<'a> {
                 }))
             }
             7 => {
-                // PaintVarRadialGradient
                 let color_line_offset = s.read::<Offset24>()?;
                 let color_line = self.parse_var_color_line(
                     offset.saturating_add(color_line_offset.to_usize()),
@@ -1114,7 +1065,6 @@ impl<'a> Table<'a> {
                 }))
             }
             8 => {
-                // PaintSweepGradient
                 let color_line_offset = s.read::<Offset24>()?;
                 let color_line = self.parse_color_line(
                     offset.saturating_add(color_line_offset.to_usize()),
@@ -1131,7 +1081,6 @@ impl<'a> Table<'a> {
                 }))
             }
             9 => {
-                // PaintVarSweepGradient
                 let color_line_offset = s.read::<Offset24>()?;
                 let color_line = self.parse_var_color_line(
                     offset.saturating_add(color_line_offset.to_usize()),
@@ -1157,7 +1106,6 @@ impl<'a> Table<'a> {
                 }))
             }
             10 => {
-                // PaintGlyph
                 let paint_offset = s.read::<Offset24>()?;
                 let glyph_id = s.read::<GlyphId>()?;
                 painter.outline_glyph(glyph_id);
@@ -1175,7 +1123,6 @@ impl<'a> Table<'a> {
                 painter.pop_clip();
             }
             11 => {
-                // PaintColrGlyph
                 let glyph_id = s.read::<GlyphId>()?;
                 self.paint_impl(
                     glyph_id,
@@ -1187,7 +1134,6 @@ impl<'a> Table<'a> {
                 );
             }
             12 => {
-                // PaintTransform
                 let paint_offset = s.read::<Offset24>()?;
                 let ts_offset = s.read::<Offset24>()?;
                 let mut s = Stream::new_at(self.data, offset.saturating_add(ts_offset.to_usize()))?;
@@ -1212,7 +1158,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             13 => {
-                // PaintVarTransform
                 let paint_offset = s.read::<Offset24>()?;
                 let ts_offset = s.read::<Offset24>()?;
                 let mut s = Stream::new_at(self.data, offset.saturating_add(ts_offset.to_usize()))?;
@@ -1246,7 +1191,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             14 => {
-                // PaintTranslate
                 let paint_offset = s.read::<Offset24>()?;
                 let tx = f32::from(s.read::<i16>()?);
                 let ty = f32::from(s.read::<i16>()?);
@@ -1263,7 +1207,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             15 => {
-                // PaintVarTranslate
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1289,7 +1232,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             16 => {
-                // PaintScale
                 let paint_offset = s.read::<Offset24>()?;
                 let sx = s.read::<F2DOT14>()?.to_f32();
                 let sy = s.read::<F2DOT14>()?.to_f32();
@@ -1306,7 +1248,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             17 => {
-                // PaintVarScale
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1332,7 +1273,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             18 => {
-                // PaintScaleAroundCenter
                 let paint_offset = s.read::<Offset24>()?;
                 let sx = s.read::<F2DOT14>()?.to_f32();
                 let sy = s.read::<F2DOT14>()?.to_f32();
@@ -1355,7 +1295,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             19 => {
-                // PaintVarScaleAroundCenter
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1387,7 +1326,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             20 => {
-                // PaintScaleUniform
                 let paint_offset = s.read::<Offset24>()?;
                 let scale = s.read::<F2DOT14>()?.to_f32();
 
@@ -1403,7 +1341,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             21 => {
-                // PaintVarScaleUniform
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1428,7 +1365,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             22 => {
-                // PaintScaleUniformAroundCenter
                 let paint_offset = s.read::<Offset24>()?;
                 let scale = s.read::<F2DOT14>()?.to_f32();
                 let center_x = f32::from(s.read::<i16>()?);
@@ -1450,7 +1386,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             23 => {
-                // PaintVarScaleUniformAroundCenter
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1481,7 +1416,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             24 => {
-                // PaintRotate
                 let paint_offset = s.read::<Offset24>()?;
                 let angle = s.read::<F2DOT14>()?.to_f32();
 
@@ -1497,7 +1431,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             25 => {
-                // PaintVarRotate
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1522,7 +1455,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             26 => {
-                // PaintRotateAroundCenter
                 let paint_offset = s.read::<Offset24>()?;
                 let angle = s.read::<F2DOT14>()?.to_f32();
                 let center_x = f32::from(s.read::<i16>()?);
@@ -1544,7 +1476,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             27 => {
-                // PaintVarRotateAroundCenter
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1575,7 +1506,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             28 => {
-                // PaintSkew
                 let paint_offset = s.read::<Offset24>()?;
                 let skew_x = s.read::<F2DOT14>()?.to_f32();
                 let skew_y = s.read::<F2DOT14>()?.to_f32();
@@ -1592,7 +1522,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             29 => {
-                // PaintVarSkew
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1618,7 +1547,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             30 => {
-                // PaintSkewAroundCenter
                 let paint_offset = s.read::<Offset24>()?;
                 let skew_x = s.read::<F2DOT14>()?.to_f32();
                 let skew_y = s.read::<F2DOT14>()?.to_f32();
@@ -1641,7 +1569,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             31 => {
-                // PaintVarSkewAroundCenter
                 let paint_offset = s.read::<Offset24>()?;
 
                 let mut var_s = s.clone();
@@ -1673,7 +1600,6 @@ impl<'a> Table<'a> {
                 painter.pop_transform();
             }
             32 => {
-                // PaintComposite
                 let source_paint_offset = s.read::<Offset24>()?;
                 let composite_mode = s.read::<CompositeMode>()?;
                 let backdrop_paint_offset = s.read::<Offset24>()?;
@@ -1740,21 +1666,11 @@ impl<'a> Table<'a> {
     }
 }
 
-/// The most paint tables one [`Table::paint`] call visits. The depth limit
-/// alone does not bound the work: paint tables at distinct offsets may share
-/// children (a `PaintColrLayers` of 255 layers each naming the same few
-/// paints, 64 levels deep), and upstream walks every path through such a
-/// graph, exponential in its depth, so a crafted font could hang the
-/// renderer. A paint past the budget is refused like one past the depth
-/// limit; the 402 colour glyphs of the COLR v1 test fonts visit at most 51
-/// (measured 2026-10-16; no COLR face ships on macOS).
 const MAX_PAINT_VISITS: u32 = 1 << 16;
 
 struct RecursionStack {
-    // The limit of 64 is chosen arbitrarily and not from the spec. But we have to stop somewhere...
     stack: [usize; 64],
     len: usize,
-    /// Paint tables visited so far, against [`MAX_PAINT_VISITS`].
     visits: u32,
 }
 
@@ -1801,7 +1717,6 @@ struct VariationData<'a> {
 }
 
 impl VariationData<'_> {
-    // Inspired from `fontations`.
     fn read_deltas<const N: usize>(
         &self,
         var_index_base: u32,
@@ -1818,10 +1733,6 @@ impl VariationData<'_> {
         };
 
         for (i, delta) in deltas.iter_mut().enumerate() {
-            // Wrapping, as upstream's release build does: a base within N of
-            // u32::MAX names a low delta-set index for the later deltas (the
-            // map is bounds-checked, so a wrapped index is only a wrong
-            // delta on an already malformed font, never a panic).
             let index = u32::try_from(i)
                 .ok()
                 .map(|i| var_index_base.wrapping_add(i));

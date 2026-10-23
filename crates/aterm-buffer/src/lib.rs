@@ -302,6 +302,7 @@ impl Surface {
             }
             Edit::SetLine(id, text) => {
                 // Resolve before make_mut: an absent id still rides the event
+                // spine, but must not copy a shared line spine it cannot change.
                 if let Some(i) = self.line_index(id) {
                     let changed = match self.lines.get(i) {
                         Some((_, current)) => current.as_str() != text.as_str(),

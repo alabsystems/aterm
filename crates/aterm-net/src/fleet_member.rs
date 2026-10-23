@@ -3354,6 +3354,8 @@ fn reply_node(
 ) -> Result<(Option<String>, bool), Unreached> {
     match answered {
         Some((node, proven)) => {
+            // A peer that proved a node speaks for that node alone: a header
+            // anywhere in its reply that names another is its word against
             // its proof, and nothing it sent is read.
             if let Some(claimed) = header_nodes(lines).find(|claimed| *claimed != node) {
                 return Err(Unreached::Misnamed {
@@ -3365,6 +3367,7 @@ fn reply_node(
             Ok((Some(node), proven || mine))
         }
         None => {
+            // A header that names a node bound to a key, from a peer that
             // proved none, is that node's name without its key.
             if let Some(said) = header_nodes(lines).find(|said| keys.bound(said).is_some()) {
                 return Err(Unreached::Unproved { at, node: said });

@@ -72,7 +72,7 @@ pub(crate) const CHROME_KEYS: [(&str, aterm_types::scheme::ThemeKey); 4] = [
 
 impl ChromeProvenance {
     /// The origin of the slot `key` sets (a chrome key of [`CHROME_KEYS`]).
-    pub(crate) fn of(&self, key: aterm_types::scheme::ThemeKey) -> ColorOrigin {
+    pub(crate) const fn of(&self, key: aterm_types::scheme::ThemeKey) -> ColorOrigin {
         use aterm_types::scheme::ThemeKey;
         match key {
             ThemeKey::AccentColor => self.accent,
@@ -82,7 +82,7 @@ impl ChromeProvenance {
         }
     }
 
-    fn of_mut(&mut self, key: aterm_types::scheme::ThemeKey) -> &mut ColorOrigin {
+    const fn of_mut(&mut self, key: aterm_types::scheme::ThemeKey) -> &mut ColorOrigin {
         use aterm_types::scheme::ThemeKey;
         match key {
             ThemeKey::AccentColor => &mut self.accent,
@@ -169,7 +169,7 @@ pub(crate) enum SlotOrigin {
 
 impl SlotOrigin {
     /// The word `theme palette` prints for this origin.
-    pub(crate) fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Ansi(ColorOrigin::Theme) => "theme",
             Self::Ansi(ColorOrigin::Config) | Self::Config => "config",
@@ -187,12 +187,12 @@ impl ResolvedColors {
     }
 
     /// The colour theme before the four colour keys that reach the renderer's theme: what native pages draw from.
-    pub(crate) fn theme_before_overrides(&self) -> Theme {
+    pub(crate) const fn theme_before_overrides(&self) -> Theme {
         self.theme_before_overrides
     }
 
     /// The chrome colours the theme authors before any chrome key ([`Self::authored_chrome`] with the keys left out).
-    pub(crate) fn theme_authored_chrome(&self) -> aterm_messages::tokens::AuthoredChrome {
+    pub(crate) const fn theme_authored_chrome(&self) -> aterm_messages::tokens::AuthoredChrome {
         self.theme_authored_chrome
     }
 
@@ -204,7 +204,7 @@ impl ResolvedColors {
     }
 
     /// The selected-text foreground, when the theme or the config sets one; `None` keeps the renderer's contrast floor.
-    pub(crate) fn selection_fg(&self) -> Option<Rgb> {
+    pub(crate) const fn selection_fg(&self) -> Option<Rgb> {
         self.scheme.selection_fg
     }
 

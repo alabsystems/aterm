@@ -145,7 +145,8 @@ pub(crate) struct JournalHeader {
     /// The writer's boot reopened a journal whose writer was on probation and was stopped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) second_chance: bool,
-    /// Every terminal leaf whose foreground was a program other than its shell when the image.
+    /// Every terminal leaf whose foreground was a program other than its shell
+    /// when the image was captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) programs: Option<Vec<LeafProgram>>,
     /// The writing build names its run in `session.toml` at quit (`restore::write_quit`).
@@ -220,7 +221,7 @@ impl JournalHeader {
 
     /// Whose pool ids the image's leaves carry.
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn image_writer(&self, id: JournalId) -> u32 {
+    pub(crate) const fn image_writer(&self, id: JournalId) -> u32 {
         if self.pid == 0 { id.pid } else { self.pid }
     }
 
@@ -243,7 +244,7 @@ impl JournalHeader {
     }
 
     /// This header, marked as a second chance's ([`Self::second_chance`]).
-    pub(crate) fn with_second_chance(mut self, second_chance: bool) -> Self {
+    pub(crate) const fn with_second_chance(mut self, second_chance: bool) -> Self {
         self.second_chance = second_chance;
         self
     }
@@ -298,7 +299,7 @@ pub(crate) enum DeathClass {
 
 impl DeathClass {
     /// The row's first line.
-    pub(crate) fn sentence(self) -> &'static str {
+    pub(crate) const fn sentence(self) -> &'static str {
         match self {
             Self::Killed => {
                 "aterm was stopped last time without quitting (a force quit, a kill or the \
@@ -310,7 +311,7 @@ impl DeathClass {
     }
 
     /// A crash (the error class) rather than a kill (the warning class).
-    pub(crate) fn crashed(self) -> bool {
+    pub(crate) const fn crashed(self) -> bool {
         !matches!(self, Self::Killed)
     }
 }
@@ -354,7 +355,8 @@ pub(crate) struct Lost {
 /// The reopened layout's terminal panes whose saved folder is not here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PanesWithoutFolder {
-    /// Panes whose restore asks for a folder no shell can start.
+    /// Panes whose restore asks for a folder no shell can start in: each
+    /// starts in the home folder, and a Messages row names the folder.
     pub(crate) gone: usize,
     /// Panes a program held ([`crate::restore::TerminalLeafRestore::folder_may_be_remote`]).
     pub(crate) unasked: usize,
@@ -413,6 +415,7 @@ impl Reopened {
                 crate::restore::RestoredSplitTree::Leaf {
                     view: crate::restore::RestoredView::Terminal(leaf),
                 } => {
+                    // A held tab's agent is the holder's: never relaunched
                     // (`App::carry_restored_identity`, ruling 23).
                     if let Some(agent) = leaf.resumes_agent().filter(|agent| {
                         seen.as_ref()
@@ -490,7 +493,9 @@ impl Reopened {
         told
     }
 
-    /// The layout's terminal panes whose folder no shell can start.
+    /// The layout's terminal panes whose folder no shell can start in
+    /// (`not_found`, the spawn's own check [`crate::spawn_folder::folder_fault`]),
+    /// counted from each window's canonical tabs, else its legacy mirror.
     pub(crate) fn panes_without_folder(
         &self,
         not_found: impl Fn(&str) -> bool,
@@ -604,12 +609,12 @@ pub(crate) enum Note {
     },
 }
 
-/// What one launch's claim.
+/// What one launch's claim did.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct BootClaim {
     pub(crate) reopened: Option<Reopened>,
     pub(crate) notes: Vec<Note>,
-    /// Every journal this launch took, reopened.
+    /// Every journal this launch took, reopened or not.
     pub(crate) taken: Vec<JournalId>,
     /// Taken and set aside without a row, each with why (the log's).
     pub(crate) set_aside: Vec<(JournalId, &'static str)>,
@@ -628,7 +633,9 @@ pub(crate) struct QuitLayout {
     pub(crate) written_unix_ms: Option<u64>,
 }
 
-/// How much later than an unstamped quit layout's date a journal image.
+/// How much later than an unstamped quit layout's date a journal image may be
+/// and still be that quit's own: the layout's date is a file mtime (HFS+
+/// truncates up to 1 s, FAT up to 2 s), the image's is milliseconds.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const QUIT_DATE_SLACK_MS: u64 = 2_000;
 
@@ -664,7 +671,7 @@ impl QuitLayout {
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
-    fn unstamped(&self) -> bool {
+    const fn unstamped(&self) -> bool {
         self.windows > 0 && self.run.is_none()
     }
 
@@ -745,7 +752,8 @@ mod unix {
                     dir.join(id.lock_name()).display()
                 )
             })?;
-            // SAFETY: `create_locked` returns a descriptor it opened for this call and nobody else.
+            // SAFETY: `create_locked` returns a descriptor it opened for this
+            // call and nobody else owns; the `OwnedFd` closes it exactly once.
             let lock = unsafe { OwnedFd::from_raw_fd(fd) };
             Ok(Self {
                 dir: dir.to_path_buf(),
@@ -850,7 +858,8 @@ mod unix {
 
     impl Drop for JournalOwner {
         fn drop(&mut self) {
-            // SAFETY: `flock` on the descriptor this owner holds open until its field drops right.
+            // SAFETY: `flock` on the descriptor this owner holds open until
+            // its field drops right after; LOCK_UN never waits.
             #[expect(
                 clippy::disallowed_methods,
                 reason = "the release: LOCK_UN before the descriptor closes"
@@ -1095,7 +1104,8 @@ mod unix {
         manifest: RestoreManifest,
     }
 
-    /// The reader's half: take every dead writer's journal in `dir` and decide what this launch.
+    /// The reader's half: take every dead writer's journal in `dir` and decide what this launch
+    /// reopens (rules in the module docs).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1473,7 +1483,7 @@ impl Armed {
 
 #[derive(Debug, Default)]
 struct Inherited {
-    /// The update's parent: the pid the shells it handed were keyed.
+    /// The update's parent: the pid the shells it handed were keyed by.
     parent: u32,
     /// What the parent's image said of each of its shells, by the parent's pool id.
     leaves: std::collections::BTreeMap<u64, InheritedLeaf>,
@@ -1863,9 +1873,11 @@ pub(crate) struct Lane {
     adopted: bool,
     /// What this run took over at its Commit and carries forward until it has facts of its own.
     inherited: Option<Inherited>,
-    /// The pairs the last capture's leaves were handed.
+    /// The pairs the last capture's leaves were handed as
+    /// ([`JournalHeader::handed`], [`Self::carry_forward`]).
     handed: Vec<Handed>,
-    /// What the disk holds: `true` from a take-over that found the parent's image until the writer.
+    /// What the disk holds: `true` from a take-over that found the parent's image until the
+    /// writer has really replaced it (published an image of this run's own, or withdrawn it).
     inherited_on_disk: Arc<AtomicBool>,
     /// Images handed to the writer.
     pub(crate) writes: u64,
@@ -1966,7 +1978,7 @@ pub(crate) struct EndSessionCadence {
 )]
 impl EndSessionCadence {
     /// Whether a snapshot was ever taken.
-    pub(crate) fn taking(&self) -> bool {
+    pub(crate) const fn taking(&self) -> bool {
         self.taken.is_some()
     }
 
@@ -2060,7 +2072,7 @@ impl Lane {
     }
 
     /// This launch is an update's candidate whose parent is `pid`, started at `born`.
-    pub(crate) fn set_predecessor(&mut self, pid: u32, born: Option<u128>) {
+    pub(crate) const fn set_predecessor(&mut self, pid: u32, born: Option<u128>) {
         self.predecessor = Some((pid, born));
     }
 
@@ -2225,7 +2237,7 @@ impl Lane {
             .flatten()
     }
 
-    pub(crate) fn is_active(&self) -> bool {
+    pub(crate) const fn is_active(&self) -> bool {
         self.dir.is_some()
     }
 
@@ -2267,7 +2279,7 @@ impl Lane {
     }
 
     /// Something that was not a timer woke the loop.
-    pub(crate) fn note_activity(&mut self) {
+    pub(crate) const fn note_activity(&mut self) {
         self.dirty = true;
         self.activity = true;
     }
@@ -2290,7 +2302,7 @@ impl Lane {
     }
 
     /// What a restore carries of a tab's agent moved.
-    pub(crate) fn owe_agent_capture(&mut self) {
+    pub(crate) const fn owe_agent_capture(&mut self) {
         if self.dir.is_some() {
             self.dirty = true;
             self.owed_now = true;

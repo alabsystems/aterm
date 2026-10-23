@@ -265,7 +265,9 @@ impl Identity {
         &self.description
     }
 
-    /// Whether the code at `path`.
+    /// Whether the code at `path` — an executable, or an app bundle — meets the
+    /// requirement in force, with its signature intact: what a peer checking a
+    /// process started from it will find.
     ///
     /// # Errors
     /// Why the code does not pass, or could not be read.

@@ -138,7 +138,9 @@ pub(crate) mod consts {
     /// `NSGraphics.h:99` — `NSBackingStoreBuffered = 2` (`NSUInteger`).
     pub(crate) const NS_BACKING_STORE_BUFFERED: usize = 2;
 
-    /// `NSWindow.h:194` — `static const NSWindowLevel NSFloatingWindowLevel = kCGFloatingWindowLevel;`, and `CGWindowLevel.h:68`.
+    /// `NSWindow.h:194` — `static const NSWindowLevel NSFloatingWindowLevel =
+    /// kCGFloatingWindowLevel;`, and `CGWindowLevel.h:68` —
+    /// `#define kCGFloatingWindowLevel ((CGWindowLevel)3)` (`NSInteger`).
     pub(crate) const NS_FLOATING_WINDOW_LEVEL: isize = 3;
 
     /// `NSWindow.h:130,141`.

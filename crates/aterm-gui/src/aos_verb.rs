@@ -82,7 +82,7 @@ fn verdict_word(v: &Verdict) -> String {
 }
 
 /// The grade's word.
-fn grade_word(g: EvidenceGrade) -> &'static str {
+const fn grade_word(g: EvidenceGrade) -> &'static str {
     match g {
         EvidenceGrade::Tested => "tested",
     }

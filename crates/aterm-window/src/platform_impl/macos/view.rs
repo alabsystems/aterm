@@ -38,7 +38,6 @@ use crate::platform::macos::OptionAsAlt;
 
 #[derive(Debug)]
 struct CursorState {
-    // LOCAL PATCH (aterm): `Retained<NSCursor>` -> `Obj`. The reason
     cursor: Obj,
 }
 
@@ -131,7 +130,7 @@ pub struct ViewState {
     /// True if the current key event should be forwarded to the application, even during IME.
     forward_key_to_app: Cell<bool>,
 
-    /// Local patch (aterm), : upstream's option-as-alt, restored.
+    /// Option-as-Alt mapping configuration.
     option_as_alt: Cell<OptionAsAlt>,
 
     marked_text: RefCell<Obj>,
@@ -148,7 +147,6 @@ aterm_objc::declare_class! {
 
         @sel(isFlipped) @abort_on_exception
         fn is_flipped(&self) -> Bool {
-            // `winit` uses the upper-left corner as the origin.
             Bool::YES
         }
 
@@ -219,7 +217,6 @@ aterm_objc::declare_class! {
             if length > 0 {
                 NSRange { location: 0, length }
             } else {
-                // Documented to return `{NSNotFound, 0}` if there is no marked range.
                 NSRange { location: consts::NS_NOT_FOUND, length: 0 }
             }
         }
@@ -272,13 +269,11 @@ aterm_objc::declare_class! {
             if self.has_marked_text().into() {
                 self.ivars().ime_state.set(ImeState::Preedit);
             } else {
-                // In case the preedit was cleared, set IME into the Ground state.
                 self.ivars().ime_state.set(ImeState::Ground);
             }
 
             // SAFETY: `string` owns a +1 reference to a live `NSString`.
             let cursor_range = if unsafe { utf8_len(string.id()) } == 0 {
-                // An empty string basically means that there's no preedit, so indicate that by
                 None
             } else {
                 // SAFETY: As above.
@@ -308,7 +303,6 @@ aterm_objc::declare_class! {
 
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             if self.is_ime_enabled() {
-                // Leave the Preedit self.ivars()
                 self.ivars().ime_state.set(ImeState::Ground);
             } else {
                 tracing::warn!("Expected to have IME enabled when receiving unmarkText");
@@ -399,7 +393,6 @@ aterm_objc::declare_class! {
 
             if self.has_marked_text().into() && self.ivars().ime_state.get() == ImeState::Preedit
             {
-                // Leave preedit so that we also report the key-up for this key.
                 self.ivars().ime_state.set(ImeState::Ground);
             }
         }
@@ -436,7 +429,6 @@ aterm_objc::declare_class! {
                 });
 
                 if self.ivars().ime_state.get() == ImeState::Committed {
-                    // Remove any marked text, so normal input can continue.
                     *self.ivars().marked_text.borrow_mut() = new_marked_text();
                 }
             }
@@ -722,8 +714,7 @@ impl WinitView {
         this
     }
 
-    /// The main-thread witness objc2's `mutability::MainThreadOnly` used to
-    /// derive from the receiver's type.
+    /// Main-thread witness for AppKit view callbacks.
     #[track_caller]
     fn mtm(&self) -> aterm_objc::MainThread {
         aterm_objc::MainThread::new()
@@ -744,15 +735,13 @@ impl WinitView {
         }
     }
 
-    /// The marked text's length in UTF-16 code units — `-length` on
-    /// `NSAttributedString`, which is what `markedRange` reports.
+    /// Marked text length in UTF-16 code units.
     fn marked_text_length(&self) -> usize {
         // SAFETY: The ivar holds a live `NSMutableAttributedString`.
         unsafe { send_usize(self.ivars().marked_text.borrow().id(), sel!(length)) }
     }
 
-    /// Drop the old tracking rect and install one over the current frame,
-    /// answering that frame.
+    /// Replace the tracking rect over the current frame and return that frame.
     fn reset_tracking_rect(&self) -> CGRect {
         // SAFETY: `-removeTrackingRect:` `v24@0:8q16`, `-frame` `{CGRect=…}16@0:8`.
         unsafe {
@@ -775,10 +764,8 @@ impl WinitView {
         }
     }
 
-    /// LOCAL PATCH (aterm): the return is a bare [`Obj`] rather than
-    /// `Retained<NSWindow>`, for the reason on `ViewState::_ns_window`.
+    /// Returns the owning `NSWindow` as [`Obj`].
     fn window(&self) -> Obj {
-        // TODO: Simply use `window` property on `NSView`.
         self.ivars()._ns_window.load().expect("view to have a window")
     }
 
@@ -860,12 +847,12 @@ impl WinitView {
         }
     }
 
-    /// Local patch (aterm): the modifier state this view last derived from an event.
+    /// Last modifier state derived from an event.
     pub(super) fn cached_modifiers(&self) -> ModifiersState {
         self.ivars().modifiers.get().state()
     }
 
-    /// Update modifiers if `event` has something different
+    /// Update modifiers if `event` has something different.
     fn update_modifiers(&self, ns_event: Id, is_flags_changed_event: bool) {
         use ElementState::{Pressed, Released};
 
@@ -934,7 +921,6 @@ impl WinitView {
                     *phys_mod = ModLocationMask::empty();
                 } else {
                     if *phys_mod == location_mask {
-                        // Here we hit a contradiction:
                         event.state = Pressed;
                     } else {
                         phys_mod.toggle(location_mask);
@@ -1002,7 +988,6 @@ impl WinitView {
             let mouse_buttons_down =
                 unsafe { send_usize(class(c"NSEvent").as_id(), sel!(pressedMouseButtons)) };
             if mouse_buttons_down == 0 {
-                // Point is outside of the client area (view) and no buttons are pressed
                 return;
             }
         }
@@ -1018,10 +1003,7 @@ impl WinitView {
     }
 }
 
-/// An `NSString`'s length in UTF-8 bytes.
-///
-/// # Safety
-/// `s` must be a live `NSString`.
+/// UTF-8 byte length of a live `NSString` `s`.
 unsafe fn utf8_len(s: Id) -> usize {
     // SAFETY: The caller pins `s` as a live `NSString`.
     unsafe {
@@ -1029,17 +1011,13 @@ unsafe fn utf8_len(s: Id) -> usize {
     }
 }
 
-/// An `NSString`'s length in UTF-16 code units.
-///
-/// # Safety
-/// `s` must be a live `NSString`.
+/// UTF-16 code-unit length of a live `NSString` `s`.
 unsafe fn utf16_len(s: Id) -> usize {
     // SAFETY: The caller pins `s` as a live `NSString`; `-length` is `Q16@0:8`.
     unsafe { send_usize(s, sel!(length)) }
 }
 
-/// An empty `NSMutableAttributedString`, +1 — `objc2`'s
-/// `NSMutableAttributedString::new()`.
+/// Creates an empty `+1` `NSMutableAttributedString`.
 fn new_marked_text() -> Obj {
     // SAFETY: `+new` is `@16@0:8` and is in the `new` family, so the result is +1 and is adopted.
     unsafe { Obj::from_owned(send_id(class(c"NSMutableAttributedString").as_id(), sel!(new))) }
@@ -1059,9 +1037,7 @@ fn mouse_button(event: Id) -> MouseButton {
     }
 }
 
-/// The +1 key event the `keyDown:`/`keyUp:` rows work on: rebuilt without its Option
-/// characters when `option_as_alt` makes the held Option an Alt ([`option_is_alt`]), a copy
-/// otherwise.
+/// Returns a `+1` key event, stripping Option characters when [`option_is_alt`] holds.
 fn replace_event(event: Id, option_as_alt: OptionAsAlt) -> Obj {
     // SAFETY: `event` is the live `NSEvent` AppKit delivered.
     let (kind, flags) =

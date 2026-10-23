@@ -411,6 +411,7 @@ pub(crate) fn take_leading_options(class: Input, rest: &str) -> (LeadingInputOpt
     let caused = class.contains(Input::CAUSE);
     let mut opts = LeadingInputOptions::default();
     if !keyed && !guarded {
+        // `paste`'s body is raw: only a leading `if-supervisor=<holder>` and
         // the one space after it are taken off, and nothing else.
         if supervised && let Some(after) = rest.strip_prefix("if-supervisor=") {
             let (value, body) = after.split_once(' ').unwrap_or((after, ""));
@@ -1124,6 +1125,7 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
         } else if let Some(b) = tok.strip_prefix("block=") {
             block = matches!(b, "1" | "true" | "yes" | "block");
         } else if let Some(l) = tok.strip_prefix("lines=") {
+            // A non-positive or non-numeric count is 1; clamped so one line cannot
             // flood the PTY.
             wheel_lines = l.parse::<i32>().unwrap_or(1).clamp(1, MAX_WHEEL_LINES);
         } else if action.is_empty() {
@@ -1708,6 +1710,9 @@ pub(crate) fn parse_resize(rest: &str) -> Result<(u16, u16), String> {
 
 /// `resize <r> <c>` -> resize the engine grid, the PTY, and the GUI (RES-1).
 pub(crate) fn cmd_resize(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    // `resize px <w> <h>` resizes the window in physical pixels and the grid follows from
+    // the platform's `Resized`, as an edge drag does. The cell form applies the grid first
+    // and echoes the pixel size after, so the live-resize throttle sees no reflow; the px
     // form is what drives the throttle. Several back to back reproduce a drag's pressure.
     if let Some(event) = parse_resize_px(rest) {
         return match event {

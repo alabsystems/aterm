@@ -542,7 +542,7 @@ const CURRENT_STEP: f64 = 2.0;
 
 /// The query's ink: the warn tone across a search that found nothing or a bad
 /// regex, else the band's words.
-fn query_ink(v: &FindBarView, c: &BandColors) -> [u8; 3] {
+const fn query_ink(v: &FindBarView, c: &BandColors) -> [u8; 3] {
     if !v.query.is_empty() && (v.regex_error || (v.total == 0 && !v.history_away)) {
         c.warn
     } else {
@@ -779,7 +779,7 @@ impl FluentGeom {
     }
 
     /// The left edge of cell column `col`, px from the panel's left edge.
-    fn x(self, col: usize) -> f32 {
+    const fn x(self, col: usize) -> f32 {
         (col * self.cell_w) as f32
     }
 

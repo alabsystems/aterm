@@ -86,7 +86,6 @@ pub fn parse(text: &str) -> Result<Baseline, String> {
 pub fn tables() -> Vec<&'static str> {
     use serde::de::{self, Visitor};
 
-    /// A deserializer that answers nothing and notes the fields a struct asks for.
     struct Fields(&'static [&'static str]);
 
     impl<'de> de::Deserializer<'de> for &mut Fields {

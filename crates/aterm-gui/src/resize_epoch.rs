@@ -140,7 +140,7 @@ pub(crate) struct Epoch {
 }
 
 impl Epoch {
-    fn open(id: u64, report: &ResizeReport, now_ms: u64) -> Self {
+    const fn open(id: u64, report: &ResizeReport, now_ms: u64) -> Self {
         Self {
             id,
             t_ms: now_ms,
@@ -165,12 +165,12 @@ impl Epoch {
         }
     }
 
-    fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
+    const fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
     }
 
     /// Returns whether this epoch owed render debt and should appear in `resizes`.
-    pub(crate) fn listed(&self) -> bool {
+    pub(crate) const fn listed(&self) -> bool {
         self.had_debt
     }
 }
@@ -254,12 +254,12 @@ pub(crate) struct EpochBook {
 
 impl EpochBook {
     /// Updates whether the presence classifier identifies Claude Code.
-    pub(crate) fn set_agent(&mut self, agent: bool) {
+    pub(crate) const fn set_agent(&mut self, agent: bool) {
         self.agent = agent;
     }
 
     /// Records that this session cleared its screen on resize.
-    pub(crate) fn learn(&mut self) {
+    pub(crate) const fn learn(&mut self) {
         self.learned = true;
     }
 
@@ -320,12 +320,12 @@ impl EpochBook {
     }
 
     /// Takes the epoch ID whose superseded repair returned to `desync-risk`.
-    pub(crate) fn take_returned(&mut self) -> Option<u64> {
+    pub(crate) const fn take_returned(&mut self) -> Option<u64> {
         self.returned.take()
     }
 
     /// Updates the repaint nudge phase and attempt count for the `resizes` header.
-    pub(crate) fn set_nudge(&mut self, phase: &'static str, nudged: u32) {
+    pub(crate) const fn set_nudge(&mut self, phase: &'static str, nudged: u32) {
         self.nudge_phase = phase;
         self.nudged = nudged;
     }
@@ -355,7 +355,7 @@ impl EpochBook {
     }
 
     /// Returns when the next epoch look is due (timeline ms).
-    pub(crate) fn look_at_ms(&self) -> Option<u64> {
+    pub(crate) const fn look_at_ms(&self) -> Option<u64> {
         self.look_at_ms
     }
 
@@ -542,7 +542,7 @@ impl EpochBook {
     }
 
     /// Clears the open epoch after the terminal engine is replaced.
-    pub(crate) fn rebase(&mut self) {
+    pub(crate) const fn rebase(&mut self) {
         self.current = None;
         self.look_at_ms = None;
     }

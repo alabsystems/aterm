@@ -65,7 +65,6 @@ impl Counter {
         0
     }
 
-    /// Left alone: not `pub`.
     fn bump(&mut self) {
         self.n += 1;
     }
@@ -115,7 +114,6 @@ unsafe extern "C-unwind" {
     fn sum_bytes_export(ptr: usize, len: usize) -> u32;
 }
 
-/// The glue's `passStringToWasm0`.
 fn pass(bytes: &[u8]) -> (usize, usize) {
     let ptr = mem::alloc(bytes.len(), 1).unwrap();
     // SAFETY: a fresh allocation of `bytes.len()` bytes.
@@ -123,7 +121,6 @@ fn pass(bytes: &[u8]) -> (usize, usize) {
     (ptr, bytes.len())
 }
 
-/// The glue's string return: the length from the slot, copy, free.
 fn take_string(ptr: usize) -> String {
     let len = mem::ret() as usize;
     // SAFETY: the export handed out `len` bytes of UTF-8 at `ptr`.
@@ -135,8 +132,6 @@ fn take_string(ptr: usize) -> String {
     s
 }
 
-/// What a call threw, or `None` when it returned: the glue's check after
-/// every call. A call that threw returned a zero word.
 fn thrown<R: Default + PartialEq + std::fmt::Debug>(f: impl FnOnce() -> R) -> Option<Thrown> {
     let word = f();
     let thrown = mem::take_thrown();

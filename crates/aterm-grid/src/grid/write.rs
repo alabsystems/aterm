@@ -228,7 +228,12 @@ impl Grid {
         }
     }
 
-    /// Advance the cursor to the next line for autowrap, with `line_feed()`'s scroll-region behaviour:
+    /// Advance the cursor to the next line for autowrap, with `line_feed()`'s scroll-region
+    /// behaviour:
+    /// - at the region bottom: scroll the region up;
+    /// - above it: move down one row;
+    /// - below it: move down unless at the screen bottom (xterm `xtermIndex`: below the region
+    ///   is CursorDown clamped at `max_row`, never a display scroll).
     #[inline]
     pub(crate) fn advance_autowrap_line(&mut self) {
         self.storage.wrap_serial += 1;
@@ -256,6 +261,7 @@ impl Grid {
                 self.mark_row_wrapped(self.storage.cursor.row);
             }
             std::cmp::Ordering::Greater => {
+                // Below the scroll region: cursor-down clamped at the last row, never a
                 // scroll (as `line_feed()`).
                 if self.storage.cursor.row < self.storage.visible_rows.saturating_sub(1) {
                     self.storage.cursor.row = self.storage.cursor.row.saturating_add(1);

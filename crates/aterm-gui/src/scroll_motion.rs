@@ -72,7 +72,7 @@ pub(crate) struct Glide {
 impl Glide {
     /// A glide from `start_px` to `target_px` starting at `now`.
     #[must_use]
-    pub(crate) fn new(start_px: i64, target_px: i64, now: Instant) -> Self {
+    pub(crate) const fn new(start_px: i64, target_px: i64, now: Instant) -> Self {
         Self {
             start_px,
             target_px,
@@ -134,12 +134,12 @@ impl Glide {
 
     /// When the ease begins (`t0`).
     #[must_use]
-    pub(crate) fn settle_start(&self) -> Instant {
+    pub(crate) const fn settle_start(&self) -> Instant {
         self.t0
     }
 
     /// Shift start and target by `delta_px` without touching the clock.
-    pub(crate) fn shift(&mut self, delta_px: i64) {
+    pub(crate) const fn shift(&mut self, delta_px: i64) {
         self.start_px += delta_px;
         self.target_px += delta_px;
     }
@@ -170,7 +170,7 @@ impl Glide {
 
     /// The glide's current target (absolute px).
     #[must_use]
-    pub(crate) fn target_px(&self) -> i64 {
+    pub(crate) const fn target_px(&self) -> i64 {
         self.target_px
     }
 
@@ -191,7 +191,7 @@ pub(crate) fn spring_displacement(x0_px: f64, omega: f64, t_s: f64) -> f64 {
 
 /// Map raw overscroll pixels past a history end to the resisted elastic displacement.
 #[must_use]
-pub(crate) fn overscroll_resist(raw_px: i64) -> i64 {
+pub(crate) const fn overscroll_resist(raw_px: i64) -> i64 {
     raw_px.signum() * (raw_px.abs() * 3) / 10
 }
 
@@ -210,7 +210,7 @@ pub(crate) struct OverscrollSpring {
 impl OverscrollSpring {
     /// A bounce released from `x0_px` at `now`.
     #[must_use]
-    pub(crate) fn new(x0_px: f64, now: Instant) -> Self {
+    pub(crate) const fn new(x0_px: f64, now: Instant) -> Self {
         Self {
             x0_px,
             t0: now,
@@ -227,12 +227,12 @@ impl OverscrollSpring {
 
     /// The anchored next tick.
     #[must_use]
-    pub(crate) fn next_tick(&self) -> Instant {
+    pub(crate) const fn next_tick(&self) -> Instant {
         self.next_tick
     }
 
     /// Re-anchor the next tick.
-    pub(crate) fn set_next_tick(&mut self, next: Instant) {
+    pub(crate) const fn set_next_tick(&mut self, next: Instant) {
         self.next_tick = next;
     }
 
@@ -282,7 +282,7 @@ pub(crate) fn pill_geometry(
 
 /// The pill's alpha `since_touch_ms` after the last scroll activity.
 #[must_use]
-pub(crate) fn pill_alpha(since_touch_ms: u64, animated: bool) -> u8 {
+pub(crate) const fn pill_alpha(since_touch_ms: u64, animated: bool) -> u8 {
     if since_touch_ms < PILL_HOLD_MS {
         return 255;
     }
@@ -304,7 +304,7 @@ pub(crate) struct PillFade {
 
 impl PillFade {
     /// Record scroll activity at `now`.
-    pub(crate) fn touch(&mut self, now: Instant) {
+    pub(crate) const fn touch(&mut self, now: Instant) {
         self.last_touch = Some(now);
     }
 

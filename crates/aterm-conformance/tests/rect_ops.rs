@@ -1,19 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// VT420/VT520 rectangular area operations and degenerate/adversarial
-// parameters. Forms (xterm ctlseqs, "Functions using CSI"):
-//   CSI Pch ; Pt ; Pl ; Pb ; Pr $ x   DECFRA  — Fill Rectangular Area
-//   CSI Pt ; Pl ; Pb ; Pr $ z         DECERA  — Erase Rectangular Area
-//   CSI Pt ; Pl ; Pb ; Pr $ {         DECSERA — Selective Erase Rect. Area
-//   CSI ... ; Pps ; Ptd ; Pld ; Ppd $ v  DECCRA — Copy Rectangular Area
-//   CSI Pt ; Pl ; Pb ; Pr ; Ps.. $ r  DECCARA — Change Attributes in Rect. Area
-//   CSI Pt ; Pl ; Pb ; Pr ; Pm.. $ t  DECRARA — Reverse Attributes in Rect. Area
-//   CSI Ps * x                        DECSACE — Select Attribute Change Extent
-//
-// Coordinates are 1-based and inclusive; 0 or omitted takes the default (Pt=1,
-// Pl=1, Pb=page bottom, Pr=page right) per the VT420/VT520 programmer manuals
-// (EK-VT520-RM). Expectations follow the spec, cited inline, never the engine.
 
 use aterm_conformance::Screen;
 use aterm_core::grid::cell_flags::CellFlags;
@@ -23,9 +9,7 @@ fn has_flags(s: &Screen, r: u16, c: u16, want: CellFlags) -> bool {
     s.cell_flags_bits(r, c) & want.bits() == want.bits()
 }
 
-/// DECALN (ESC # 8): fill the whole screen with 'E' — the standard backdrop
-/// for "outside the rectangle is untouched" assertions (VT510: screen
-/// alignment pattern).
+/// DECALN (ESC # 8): fill the whole screen with 'E'.
 fn decaln(s: &mut Screen) {
     s.feed(b"\x1b#8");
 }
@@ -34,8 +18,6 @@ fn decaln(s: &mut Screen) {
 fn decfra_fills_exact_rect_and_leaves_outside_untouched() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // VT520 EK-VT520-RM (DECFRA): fill the area bounded by (Pt;Pl)=(2;3) and
-    // (Pb;Pr)=(4;6), inclusive, with character 42 = '*'.
     s.feed(b"\x1b[42;2;3;4;6$x");
     assert_eq!(s.row(0), "EEEEEEEEEE", "row above the rect untouched");
     assert_eq!(s.row(1), "EE****EEEE", "top rect row: cols 3-6 filled");
@@ -48,8 +30,6 @@ fn decfra_fills_exact_rect_and_leaves_outside_untouched() {
 #[test]
 fn decfra_default_coords_fill_full_screen() {
     let mut s = Screen::new(4, 6);
-    // VT520 (DECFRA): Pt/Pl default to 1, Pb/Pr default to the page bottom /
-    // right — only Pch given means fill the entire page. 65 = 'A'.
     s.feed(b"\x1b[65$x");
     for r in 0..4 {
         assert_eq!(s.row(r), "AAAAAA", "row {r} fully filled by default rect");
@@ -60,9 +40,6 @@ fn decfra_default_coords_fill_full_screen() {
 fn decfra_rejects_non_printable_fill_char() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // VT520 (DECFRA): "Pch can be any value from 32 to 126 or from 160 to
-    // 255" — control values (7 = BEL, 27 = ESC code, 127 = DEL) and the C1
-    // range (130) are not valid fill characters, so the command is ignored.
     s.feed(b"\x1b[7;1;1;2;2$x");
     s.feed(b"\x1b[27;1;1;2;2$x");
     s.feed(b"\x1b[127;1;1;2;2$x");
@@ -80,9 +57,6 @@ fn decfra_rejects_non_printable_fill_char() {
 fn decfra_fill_uses_current_sgr_rendition() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // VT420/VT520 (DECFRA): the fill takes the attributes of the last SGR
-    // (xterm util.c ScrnFillRectangle). Bold + underline 'X' (88), rows 2-3,
-    // cols 2-4.
     s.feed(b"\x1b[1;4m\x1b[88;2;2;3;4$x");
     assert_eq!(s.row(1), "EXXXEEEEEE");
     assert_eq!(s.row(2), "EXXXEEEEEE");
@@ -115,15 +89,9 @@ fn decfra_fill_uses_current_sgr_rendition() {
 #[test]
 fn decfra_fill_carries_current_decsca_protection() {
     let mut s = Screen::new(4, 10);
-    // DECALN materializes the rows, so only protection is under test here.
     decaln(&mut s);
-    // DEC STD 070 / xterm: DECFRA writes with the current rendition and DECSCA
-    // protection (xterm's ScrnFillRectangle mask keeps PROTECTED). Protected
-    // fill at cols 1-3, unprotected at cols 5-6:
     s.feed(b"\x1b[1\"q\x1b[88;1;1;1;3$x\x1b[0\"q\x1b[88;1;5;1;6$x");
     assert_eq!(s.row(0), "XXXEXXEEEE");
-    // DECSERA full screen erases only the unprotected cells (VT520 DECSERA:
-    // erases all *erasable* characters; DECSCA defines erasability).
     s.feed(b"\x1b[${");
     assert_eq!(s.row(0), "XXX", "protected DECFRA fill survives DECSERA");
 }
@@ -132,8 +100,6 @@ fn decfra_fill_carries_current_decsca_protection() {
 fn decera_erases_rect_to_spaces_outside_untouched() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // VT520 (DECERA): replaces all character positions in the rectangle with
-    // the space character; rows 2-4, cols 3-6, inclusive bounds.
     s.feed(b"\x1b[2;3;4;6$z");
     assert_eq!(s.row(0), "EEEEEEEEEE");
     assert_eq!(s.row(1), "EE    EEEE");
@@ -146,8 +112,6 @@ fn decera_erases_rect_to_spaces_outside_untouched() {
 #[test]
 fn decera_erases_visual_attributes() {
     let mut s = Screen::new(4, 10);
-    // VT520 (DECERA): "DECERA erases character values and visual attributes"
-    // — erased positions are spaces with no rendition.
     s.feed(b"\x1b[1;1H\x1b[1;4mABCD\x1b[0m"); // bold+underline ABCD
     let want = CellFlags::BOLD.union(CellFlags::UNDERLINE);
     assert!(has_flags(&s, 0, 0, want), "precondition: text is styled");
@@ -161,9 +125,6 @@ fn decera_erases_visual_attributes() {
 #[test]
 fn decera_ignores_decsca_protection() {
     let mut s = Screen::new(4, 10);
-    // VT510 (DECSCA): protection only guards against the *selective* erase
-    // functions (DECSED/DECSEL, and DECSERA on VT420+). DECERA is the
-    // non-selective rectangle erase, so protected characters are erased too.
     s.feed(b"\x1b[1\"qAB\x1b[0\"qCD");
     assert_eq!(s.row(0), "ABCD");
     s.feed(b"\x1b[$z"); // defaults: full screen
@@ -178,7 +139,6 @@ fn decera_ignores_decsca_protection() {
 fn decera_default_params_erase_full_screen() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // VT520 (DECERA): all parameters default → rectangle = entire page.
     s.feed(b"\x1b[$z");
     assert_eq!(s.screen(), "");
 }
@@ -186,8 +146,6 @@ fn decera_default_params_erase_full_screen() {
 #[test]
 fn decsera_preserves_decsca_protected_cells() {
     let mut s = Screen::new(4, 10);
-    // VT520 (DECSERA): erases all *erasable* characters in the rectangle;
-    // DECSCA (CSI 1 " q) defines subsequent characters as not erasable.
     s.feed(b"\x1b[1;1HA\x1b[1\"qB\x1b[0\"qC");
     assert_eq!(s.row(0), "ABC");
     s.feed(b"\x1b[1;1;1;10${");
@@ -202,8 +160,6 @@ fn decsera_preserves_decsca_protected_cells() {
 fn decsera_erases_only_inside_rect() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // DECALN characters are erasable (no DECSCA), so DECSERA acts as a plain
-    // rectangle erase here.
     s.feed(b"\x1b[2;3;4;6${");
     assert_eq!(s.row(0), "EEEEEEEEEE");
     assert_eq!(s.row(1), "EE    EEEE");
@@ -216,10 +172,6 @@ fn decsera_erases_only_inside_rect() {
 #[test]
 fn decsera_preserves_visual_attributes_of_erased_positions() {
     let mut s = Screen::new(4, 10);
-    // VT520 (DECSERA): "DECSERA does not change: visual attributes set by the
-    // select graphic rendition (SGR) function; protection attributes set by
-    // DECSCA; line attributes." Only the characters become spaces. xterm
-    // matches (DECSERA resets the character, not the video attributes).
     s.feed(b"\x1b[1;1H\x1b[1mABCD\x1b[0m"); // bold ABCD, unprotected
     assert!(
         has_flags(&s, 0, 0, CellFlags::BOLD),
@@ -239,8 +191,6 @@ fn decsera_preserves_visual_attributes_of_erased_positions() {
 fn deccra_copies_rect_and_source_remains() {
     let mut s = Screen::new(6, 10);
     s.feed(b"\x1b[1;1HABCDEF\x1b[2;1HGHIJKL");
-    // VT520 (DECCRA): copy rows 1-2, cols 1-3 of page 1 to destination
-    // (4;5) of page 1. The copy does not move the source — it duplicates it.
     s.feed(b"\x1b[1;1;2;3;1;4;5;1$v");
     assert_eq!(s.row(0), "ABCDEF", "source row 1 unchanged");
     assert_eq!(s.row(1), "GHIJKL", "source row 2 unchanged");
@@ -254,20 +204,13 @@ fn deccra_copies_rect_and_source_remains() {
 fn deccra_overlapping_copy_behaves_as_if_buffered() {
     let mut s = Screen::new(4, 10);
     s.feed(b"\x1b[1;1HABCDEF");
-    // DEC STD 070 / xterm: DECCRA reads the source rectangle before writing
-    // the destination (xterm copies via a temporary buffer), so an
-    // overlapping copy must reproduce the original source content.
-    // Copy row 1 cols 1-4 ("ABCD") to destination (1;3): cols 3-6 <- "ABCD".
     s.feed(b"\x1b[1;1;1;4;1;1;3;1$v");
-    // A naive in-place forward copy would produce "ABABAB" instead.
     assert_eq!(s.row(0), "ABABCD", "overlap copied from pre-copy source");
 }
 
 #[test]
 fn deccra_copies_character_attributes() {
     let mut s = Screen::new(4, 10);
-    // VT520 (DECCRA): "The copied text takes on the character attributes of
-    // the source area" — renditions travel with the characters.
     s.feed(b"\x1b[1;1H\x1b[1mAB\x1b[0m"); // bold "AB"
     s.feed(b"\x1b[1;1;1;2;1;3;1;1$v"); // copy to (3;1)
     assert_eq!(s.row(2), "AB");
@@ -285,9 +228,6 @@ fn deccra_copies_character_attributes() {
 fn deccra_destination_clipped_at_page_edge() {
     let mut s = Screen::new(6, 10);
     s.feed(b"\x1b[1;1HWXYZ");
-    // VT520 (DECCRA): "If the destination area is partially off the page,
-    // then DECCRA clips the off-page data." Copy 1x4 to (6;9): only cols
-    // 9-10 of row 6 fit; nothing wraps to other rows.
     s.feed(b"\x1b[1;1;1;4;1;6;9;1$v");
     assert_eq!(s.row(5), "        WX", "clipped copy: only 'WX' fits");
     assert_eq!(s.row(0), "WXYZ", "source unchanged");
@@ -300,9 +240,6 @@ fn deccra_destination_clipped_at_page_edge() {
 fn deccara_single_row_applies_attrs_and_keeps_characters() {
     let mut s = Screen::new(6, 10);
     s.feed(b"\x1b[2;1HABCDEFGHIJ");
-    // xterm ctlseqs (DECCARA): "Ps denotes the SGR attributes to change: 0, 1,
-    // 4, 5, 7"; VT520: "DECCARA does not change the characters". A one-row
-    // area is the same under both DECSACE extents.
     s.feed(b"\x1b[2;3;2;6;1;4$r");
     assert_eq!(s.row(1), "ABCDEFGHIJ", "characters unchanged");
     let want = CellFlags::BOLD.union(CellFlags::UNDERLINE);
@@ -319,9 +256,6 @@ fn deccara_single_row_applies_attrs_and_keeps_characters() {
 fn deccara_rect_extent_decsace2_changes_exact_rectangle() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // xterm ctlseqs (DECSACE): "Ps = 2 -> rectangle (exact)." VT520
-    // (DECSACE): Ps=2 -> DECCARA affects all character positions in the
-    // rectangular area. So bold must land on rows 2-4 x cols 3-6 only.
     s.feed(b"\x1b[2*x\x1b[2;3;4;6;1$r");
     for r in 1..=3 {
         assert!(
@@ -353,11 +287,7 @@ fn deccara_rect_extent_decsace2_changes_exact_rectangle() {
 fn deccara_stream_extent_decsace1_runs_streamwise() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // xterm ctlseqs (DECSACE): "Ps = 1 -> from start to end position,
-    // wrapped": first row from Pl to line end, middle rows full width, last
-    // row from line start to Pr.
     s.feed(b"\x1b[1*x\x1b[2;3;4;6;1$r");
-    // Row 2 (first): cols 3-10 bold, cols 1-2 not.
     assert!(!has_flags(&s, 1, 0, CellFlags::BOLD));
     assert!(!has_flags(&s, 1, 1, CellFlags::BOLD));
     for c in 2..10 {
@@ -366,14 +296,12 @@ fn deccara_stream_extent_decsace1_runs_streamwise() {
             "(1,{c}) first stream row"
         );
     }
-    // Row 3 (middle): entire row bold.
     for c in 0..10 {
         assert!(
             has_flags(&s, 2, c, CellFlags::BOLD),
             "(2,{c}) middle stream row"
         );
     }
-    // Row 4 (last): cols 1-6 bold, cols 7-10 not.
     for c in 0..=5 {
         assert!(
             has_flags(&s, 3, c, CellFlags::BOLD),
@@ -389,9 +317,6 @@ fn deccara_stream_extent_decsace1_runs_streamwise() {
 fn deccara_default_extent_is_stream() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // VT520 (DECSACE): the default extent (Ps=0, before any DECSACE) is the
-    // character stream, not the rectangle; xterm likewise defaults to the
-    // wrapped extent. The middle row must go bold full-width.
     s.feed(b"\x1b[2;3;4;6;1$r");
     assert!(
         has_flags(&s, 2, 0, CellFlags::BOLD),
@@ -406,12 +331,8 @@ fn deccara_default_extent_is_stream() {
 #[test]
 fn deccara_sgr0_clears_attrs_but_not_protection() {
     let mut s = Screen::new(4, 10);
-    // Bold + DECSCA-protected "AB":
     s.feed(b"\x1b[1;1H\x1b[1m\x1b[1\"qAB\x1b[0\"q\x1b[0m");
     assert!(has_flags(&s, 0, 0, CellFlags::BOLD), "precondition: bold");
-    // VT520 (DECCARA): Ps = 0 -> "attributes off" (clears bold/underline/
-    // blink/reverse); and "DECCARA does not change: ... the protection
-    // attribute (DECSCA)". One-row rect, so extent is irrelevant.
     s.feed(b"\x1b[1;1;1;2;0$r");
     assert!(
         !has_flags(&s, 0, 0, CellFlags::BOLD),
@@ -422,15 +343,12 @@ fn deccara_sgr0_clears_attrs_but_not_protection() {
         "bold cleared by Ps=0"
     );
     assert_eq!(s.row(0), "AB", "DECCARA does not change characters");
-    // Protection must be intact: DECSERA spares the cells.
     s.feed(b"\x1b[${");
     assert_eq!(s.row(0), "AB", "DECSCA protection survives DECCARA 0");
 }
 
 #[test]
 fn decrqss_decsace_roundtrips_current_extent() {
-    // VT520 (DECRQSS "*x"): reports the current DECSACE extent as
-    // DCS 1 $ r Ps * x ST (2 = rectangle, 1 = stream).
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1b[2*x\x1bP$q*x\x1b\\");
     assert_eq!(s.response_string(), "\x1bP1$r2*x\x1b\\");
@@ -438,23 +356,13 @@ fn decrqss_decsace_roundtrips_current_extent() {
     assert_eq!(s.response_string(), "\x1bP1$r1*x\x1b\\");
 }
 
-// DECRARA, xterm ctlseqs: "Pm denotes the attributes to reverse, i.e., 0, 1, 4,
-// 5, 7, 8. Reversing SGR 0 reverses modes 1, 4, 5, 7. Reversing SGR 8 is an
-// xterm extension. See DECSACE." DA1 advertises 28 (rectangular editing).
-
 /// Write `text` at row `r` (1-based), column 1, wrapped in `sgr` … SGR 0.
-///
-/// DECALN paints its backdrop with default attributes, so a test that needs
-/// cells which already carry an attribute has to write them itself.
 fn styled_row(s: &mut Screen, r: u16, sgr: &str, text: &str) {
     s.feed(format!("\x1b[{r};1H\x1b[{sgr}m{text}\x1b[0m").as_bytes());
 }
 
 #[test]
 fn decrara_turns_a_named_attribute_on_where_absent_and_off_where_present() {
-    // What separates DECRARA from DECCARA: one sequence, one rectangle,
-    // opposite outcomes per cell. "Pm denotes the attributes to reverse": not
-    // set (`$ r`), not clear (`$ r` with the reset code).
     let mut s = Screen::new(4, 6);
     styled_row(&mut s, 1, "7", "AAA"); // (0,0..2) already INVERSE
     s.feed(b"\x1b[2;1HBBB"); // (1,0..2) plain
@@ -475,8 +383,6 @@ fn decrara_turns_a_named_attribute_on_where_absent_and_off_where_present() {
 
 #[test]
 fn decrara_applied_twice_restores_the_original_attributes() {
-    // Reversal is an involution — the invariant that would not hold if the
-    // engine quietly implemented DECRARA as "set" or "clear".
     let mut s = Screen::new(4, 6);
     styled_row(&mut s, 1, "1", "AAAAAA"); // BOLD across the row
     s.feed(b"\x1b[1;2;1;4;1$t");
@@ -516,9 +422,6 @@ fn decrara_leaves_every_cell_outside_the_rectangle_alone() {
 
 #[test]
 fn decrara_default_pm_reverses_modes_1_4_5_7() {
-    // xterm ctlseqs: "Reversing SGR 0 reverses modes 1, 4, 5, 7" — and Pm
-    // defaults to 0, exactly as DECCARA's attribute list does. SGR 8 is not in
-    // that list: it is xterm's extension and only reverses when named.
     let mut s = Screen::new(3, 6);
     styled_row(&mut s, 1, "8", "AAAAAA"); // HIDDEN, nothing else
     s.feed(b"\x1b[1;1;1;6$t");
@@ -549,10 +452,6 @@ fn decrara_reversing_mode_8_is_the_documented_xterm_extension() {
 
 #[test]
 fn decrara_reversing_mode_4_never_produces_an_underline_style_sgr_4_cannot() {
-    // Underline is a family (SGR 4, 4:2 double, 4:3 curly, 4:4 dotted, 4:5
-    // dashed): flipping the single bit alone would turn curly into dotted. The
-    // only reading inside what SGR 4 can produce is any underline -> none,
-    // none -> single.
     let mut s = Screen::new(4, 6);
     styled_row(&mut s, 1, "4:3", "AAA"); // curly
     s.feed(b"\x1b[2;1HBBB"); // no underline
@@ -579,9 +478,6 @@ fn decrara_reversing_mode_4_never_produces_an_underline_style_sgr_4_cannot() {
 
 #[test]
 fn decrara_ignores_sgr_codes_the_pm_list_does_not_name() {
-    // Pm is "0, 1, 4, 5, 7, 8". A reset code such as SGR 22 has no defined
-    // reverse, so it must leave the cells exactly as they were rather than
-    // borrowing DECCARA's wider set and clearing bold.
     let mut s = Screen::new(3, 6);
     styled_row(&mut s, 1, "1", "AAAAAA");
     s.feed(b"\x1b[1;1;1;6;22$t");
@@ -598,8 +494,6 @@ fn decrara_ignores_sgr_codes_the_pm_list_does_not_name() {
 fn decrara_rect_extent_decsace2_reverses_the_exact_rectangle() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // xterm ctlseqs (DECSACE): "Ps = 2 -> rectangle (exact)". DECRARA reads the
-    // same extent selector as DECCARA — "See DECSACE".
     s.feed(b"\x1b[2*x\x1b[2;3;4;6;1$t");
     for r in 1..=3 {
         assert!(!has_flags(&s, r, 1, CellFlags::BOLD), "({r},1) outside");
@@ -614,8 +508,6 @@ fn decrara_rect_extent_decsace2_reverses_the_exact_rectangle() {
 fn decrara_stream_extent_decsace1_runs_streamwise() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // xterm ctlseqs (DECSACE): "Ps = 1 -> from start to end position, wrapped."
-    // First row from Pl to line end, middle rows full width, last row to Pr.
     s.feed(b"\x1b[1*x\x1b[2;3;4;6;1$t");
     assert!(!has_flags(&s, 1, 1, CellFlags::BOLD), "(1,1) before Pl");
     for c in 2..10 {
@@ -636,9 +528,6 @@ fn decrara_stream_extent_decsace1_runs_streamwise() {
 fn decrara_default_extent_is_stream_like_deccara() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // No DECSACE sent: the extent is the character stream, the same default
-    // DECCARA takes (`deccara_default_extent_is_stream`), because both read the
-    // one `stream_attribute_extent` mode.
     s.feed(b"\x1b[2;3;4;6;1$t");
     assert!(
         has_flags(&s, 2, 0, CellFlags::BOLD),
@@ -653,8 +542,6 @@ fn decrara_default_extent_is_stream_like_deccara() {
 #[test]
 fn decrara_does_not_change_dec_sca_protection() {
     let mut s = Screen::new(4, 10);
-    // VT520 (DECCARA/DECRARA): the protection attribute (DECSCA) is not among
-    // the attributes these change — DECSERA must still spare the cells.
     s.feed(b"\x1b[1;1H\x1b[1\"qAB\x1b[0\"q");
     s.feed(b"\x1b[1;1;1;2;0$t");
     s.feed(b"\x1b[${");
@@ -665,10 +552,6 @@ fn decrara_does_not_change_dec_sca_protection() {
 fn rect_coords_are_relative_to_margins_when_decom_set() {
     let mut s = Screen::new(10, 10);
     decaln(&mut s);
-    // VT520 (DECERA notes): "The coordinates of the rectangular area are
-    // affected by the setting of origin mode (DECOM)." With DECSTBM 3;8 and
-    // DECOM set, (Pt;Pl)=(1;1) addresses absolute row 3, and Pb is clamped
-    // to the bottom margin (origin-mode addressing cannot leave the region).
     s.feed(b"\x1b[3;8r\x1b[?6h");
     s.feed(b"\x1b[1;1;1;5$z");
     assert_eq!(
@@ -682,7 +565,6 @@ fn rect_coords_are_relative_to_margins_when_decom_set() {
         "region row 1 = absolute row 3 erased"
     );
     assert_eq!(s.row(3), "EEEEEEEEEE", "Pb=1 inclusive: next row intact");
-    // Pb=99 clamps to the bottom margin (absolute row 8), not the page end:
     s.feed(b"\x1b[1;1;99;2$z");
     assert_eq!(
         s.row(7),
@@ -696,8 +578,6 @@ fn rect_coords_are_relative_to_margins_when_decom_set() {
 fn rect_coords_are_page_absolute_when_decom_reset() {
     let mut s = Screen::new(10, 10);
     decaln(&mut s);
-    // DECOM reset (the default): rectangle coordinates address the page, and
-    // DECSTBM margins do not shift them.
     s.feed(b"\x1b[5;8r"); // margins set, but DECOM is reset
     s.feed(b"\x1b[1;1;1;4$z");
     assert_eq!(
@@ -712,9 +592,6 @@ fn rect_coords_are_page_absolute_when_decom_reset() {
 fn reversed_coords_are_ignored() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // DEC STD 070 (rectangular area ops): the area must satisfy Pt <= Pb and
-    // Pl <= Pr; otherwise the command is ignored (xterm: no-op). None of
-    // these may modify the screen or panic.
     s.feed(b"\x1b[4;3;2;6$z"); // DECERA, Pb < Pt
     s.feed(b"\x1b[2;6;4;3$z"); // DECERA, Pr < Pl
     s.feed(b"\x1b[88;4;3;2;6$x"); // DECFRA, Pb < Pt
@@ -740,9 +617,6 @@ fn reversed_coords_are_ignored() {
 fn zero_params_take_defaults() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // VT520 parameter convention: a parameter value of 0 is treated as the
-    // default — CSI 0;0;0;0 $ z therefore erases the full page (Pt=1, Pl=1,
-    // Pb=bottom, Pr=right).
     s.feed(b"\x1b[0;0;0;0$z");
     assert_eq!(s.screen(), "", "0;0;0;0 = full-page defaults");
 }
@@ -751,7 +625,6 @@ fn zero_params_take_defaults() {
 fn rect_clipped_at_screen_right_edge() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // Pb/Pr past the page clip to it: fill rows 5-6, cols 8-10.
     s.feed(b"\x1b[42;5;8;99;99$x");
     assert_eq!(s.row(0), "EEEEEEEEEE");
     assert_eq!(s.row(3), "EEEEEEEEEE");
@@ -763,7 +636,6 @@ fn rect_clipped_at_screen_right_edge() {
 fn one_by_one_rect_affects_single_cell() {
     let mut s = Screen::new(6, 10);
     decaln(&mut s);
-    // Inclusive coordinates: Pt=Pb, Pl=Pr is a legal 1x1 rectangle.
     s.feed(b"\x1b[42;3;5;3;5$x"); // fill '*' at exactly (3;5)
     assert_eq!(s.row(2), "EEEE*EEEEE");
     assert_eq!(s.row(1), "EEEEEEEEEE");
@@ -778,8 +650,6 @@ fn rect_ops_do_not_move_cursor() {
     decaln(&mut s);
     s.feed(b"\x1b[5;5H");
     assert_eq!(s.cursor(), (4, 4));
-    // VT520: DECFRA/DECERA/DECSERA/DECCARA/DECCRA "do not change the cursor
-    // position"; DECRARA follows them.
     s.feed(b"\x1b[42;1;1;2;2$x");
     s.feed(b"\x1b[1;1;2;2$z");
     s.feed(b"\x1b[1;1;2;2${");
@@ -791,8 +661,6 @@ fn rect_ops_do_not_move_cursor() {
 
 #[test]
 fn adversarial_rect_sequences_never_panic() {
-    // Max and garbage parameters, tiny screens, degenerate rects: the engine
-    // clamps or ignores, never panics, and keeps parsing.
     for (rows, cols) in [(1u16, 1u16), (2, 2), (24, 80)] {
         let mut s = Screen::new(rows, cols);
         s.feed(b"\x1b[65535;65535;65535;65535;65535$x");

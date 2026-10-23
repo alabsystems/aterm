@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Software Update: preferences in `/Library/Preferences/com.apple.SoftwareUpdate`, and
-//! checking for updates through `softwareupdate --schedule` (design §5.1).
-//!
-//! These are the keys System Settings ▸ General ▸ Software Update ▸ Automatic Updates
-//! writes, as root-scope [`Pref`]s. On macOS 27 the MDM payload for them is gone (only
-//! supervised declarative management has a successor), so the preference file is what
-//! an unmanaged Mac has. A 27.0.1 (26A434) Mac whose switches were set in System
-//! Settings holds `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`,
-//! `ConfigDataInstall` and `CriticalUpdateInstall` (each `<true/>`) and no
-//! `AutomaticCheckEnabled`; the 27.0 VM (26A428) holds none of the five, only
-//! softwareupdated's own bookkeeping (`LastSuccessfulDate`, `RecommendedUpdates`, …),
-//! so each reads absent, the OS default. Each key was written as root there, read back
-//! as a boolean with the file left `root:wheel 0644`, and deleted again. Whether
-//! softwareupdated honors a key written this way, rather than by System Settings, was
-//! not measured.
-//!
-//! Checking for updates is not one of those keys on 27. VM (27.0, 26A428): an
-//! `AutomaticCheckEnabled` written as root was gone again after the next `softwareupdate
-//! -l`, `softwareupdate --schedule off` exited 0 and left `--schedule` reading `Automatic
-//! checking for updates is turned on`, and so did every state of the key. So
-//! [`Schedule`] reads `--schedule` and asks for it on with `--schedule on`, which was never
-//! measured turning it on (no Mac read off); a baseline that wants it off is blocked with
-//! that measurement, which says so when the Mac is not on 27.0.
+//! macOS Software Update [`Pref`] items and [`Schedule`] check.
 
 use super::defaults::{Pref, Target, Want};
 use super::{Ctx, Item};
@@ -49,9 +27,6 @@ pub struct Table {
 }
 
 /// The items `table` asks for, one per key, in the order System Settings lists them.
-///
-/// # Errors
-/// One line naming what cannot be expanded.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let _ = ctx;
     let rows: [(Option<bool>, &str, &str, &str); 4] = [
@@ -107,8 +82,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     Ok(items)
 }
 
-/// Why checking for updates is not turned off on a Mac running `os_version`: what 27.0
-/// did, and, on any other system, that it was measured there and not here.
+/// Why checking for updates is not turned off on a Mac running `os_version`.
 fn off_blocked(os_version: &str) -> String {
     let why = "checking for updates is not turned off: `softwareupdate --schedule off` \
                changed nothing on macOS 27.0 and the next check removed AutomaticCheckEnabled"
@@ -178,9 +152,6 @@ impl Item for Schedule {
             (now, on) if now == on => Probe::Ok {
                 now: Self::word(now).into(),
             },
-            // Never measured: the VM never read `turned off`, so whether `--schedule on`
-            // turns checking on is not known. The engine's read-back reports a setter that
-            // changes nothing as Failed (`still reads off`), never as Changed.
             (false, true) => Probe::Change {
                 from: "off".into(),
                 to: "on".into(),
@@ -208,12 +179,11 @@ mod tests {
     use crate::model::{Mode, Outcome};
     use crate::port::{Fake, Ran};
 
-    /// `defaults export /Library/Preferences/com.apple.SoftwareUpdate -` in the 27.0 VM
-    /// (26A428): softwareupdated's bookkeeping and none of the switches.
+    /// Exported SoftwareUpdate preferences fixture from a clean macOS 27 VM.
     const VM_SOFTWARE_UPDATE: &[u8] =
         include_bytes!("../../fixtures/prefs/vm-27.0-softwareupdate.plist");
 
-    /// The switches as a 27.0.1 (26A434) Mac holds them after System Settings (read only).
+    /// Switches as a configured macOS 27 Mac holds them after System Settings.
     const SWITCHED_ON_27_0_1: &str = "<dict>\n\t<key>AutomaticDownload</key>\n\t<true/>\n\t<key>AutomaticallyInstallMacOSUpdates</key>\n\t<true/>\n\t<key>ConfigDataInstall</key>\n\t<true/>\n\t<key>CriticalUpdateInstall</key>\n\t<true/>\n</dict>";
 
     const EXPORT: &str = "/usr/bin/defaults export /Library/Preferences/com.apple.SoftwareUpdate -";
@@ -221,8 +191,7 @@ mod tests {
 
     const SCHEDULE: &str = "/usr/sbin/softwareupdate --schedule";
 
-    /// `softwareupdate --schedule`, VM (27.0), with and without AutomaticCheckEnabled and
-    /// after `--schedule off`.
+    /// `softwareupdate --schedule`, VM.
     const SCHEDULE_ON: &str = "Automatic checking for updates is turned on\n";
 
     #[test]
@@ -249,8 +218,6 @@ mod tests {
         .unwrap();
         let rows = engine::run(&off, Mode::Apply, &sys, &ctx(&[]), &mut NoJournal);
         assert_eq!(rows[0].outcome, Outcome::Blocked);
-        // Measured on 27.0 only: another system is blocked too, and its row names it
-        // rather than claiming 27.0's behaviour for it.
         let mut older = ctx(&[]);
         older.facts.os_version = "26.6.2".into();
         let rows = engine::run(&off, Mode::Apply, &sys, &older, &mut NoJournal);

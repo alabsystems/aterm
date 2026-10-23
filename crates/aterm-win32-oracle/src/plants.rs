@@ -157,21 +157,17 @@ pub struct DWM_BLURBEHIND {"###,
         name: r###"com-slot-inserted"###,
         phase: r###"conformance"###,
         file: r###"src/dxgi.rs"###,
-        old: r###"    // IDXGIOutput6
-    pub GetDesc1:"###,
-        new: r###"    // IDXGIOutput6
-    pub Reserved: usize,
-    pub GetDesc1:"###,
+        old: r###"    pub GetDesc1: unsafe extern"###,
+        new: r###"    pub Reserved: usize,
+    pub GetDesc1: unsafe extern"###,
     },
     Plant {
         name: r###"com-slot-order"###,
         phase: r###"conformance"###,
         file: r###"src/dxgi.rs"###,
-        old: r###"    // IDXGIOutput
-    pub GetDesc: usize,
+        old: r###"    pub GetDesc: usize,
     pub GetDisplayModeList: usize,"###,
-        new: r###"    // IDXGIOutput
-    pub GetDisplayModeList: usize,
+        new: r###"    pub GetDisplayModeList: usize,
     pub GetDesc: usize,"###,
     },
     Plant {

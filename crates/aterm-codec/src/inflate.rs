@@ -422,6 +422,7 @@ fn read_dynamic_tables(br: &mut BitReader) -> Result<(Huffman, Huffman), Inflate
         let sym = cl_huff.decode_bitwise(br)?;
         match sym {
             0..=15 => {
+                // Always `Some`; `get_mut` keeps the bound local across the
                 // opaque `decode` call.
                 if let Some(slot) = lengths.get_mut(i) {
                     *slot = sym;
@@ -595,6 +596,7 @@ fn block_loop<const TABLE: bool>(
             out.reserve(length);
             let start = cur - distance;
             if distance >= length {
+                // Non-overlapping: the source range is fully decoded, so the
                 // match is one memcpy.
                 out.extend_from_within(start..start.saturating_add(length));
             } else {

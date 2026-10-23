@@ -3,10 +3,6 @@
 
 use super::*;
 
-/// `--at` names a point by a screen's sequence, an effect's ordinal, a local
-/// time (with its day or without), or a journal line's text; a number that
-/// does not read is refused, and anything else — a day the calendar has
-/// not, an hour past 23 — is a line's text.
 #[test]
 fn at_reads_each_way_to_name_a_point() {
     let time = |day: Option<i64>, secs: u32| At::Time { day, secs };
@@ -18,7 +14,6 @@ fn at_reads_each_way_to_name_a_point() {
         Ok(time(None, 14 * 3600 + 5 * 60 + 9))
     );
     assert_eq!(At::parse("14:05"), Ok(time(None, 14 * 3600 + 5 * 60)));
-    // 2026-10-20 is day 20_746 of the Unix epoch.
     assert_eq!(
         At::parse("2026-10-20T14:05"),
         Ok(time(Some(20_746), 14 * 3600 + 5 * 60))

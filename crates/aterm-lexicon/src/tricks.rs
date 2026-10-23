@@ -128,7 +128,7 @@ impl Trick {
     }
 }
 
-/// What one typed token means to the pet (see the module docs).
+/// What one typed token means to the pet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum TrickRole {
     /// A command word.
@@ -646,6 +646,8 @@ fn claim_surface(
         return;
     }
     let (key, entry) = if row.cjk {
+        // A no-space row's keys are RAW and the typed run must equal one, so
+        // every character has to BE no-space script: a mixed surface would
         // take the folded path at lookup and never find this key.
         if !is_no_space_surface(surface) {
             push_surface_conflict(

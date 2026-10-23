@@ -175,6 +175,24 @@ pub trait ChangeWait {
 }
 
 /// Host of one or more terminal sessions addressed by process-local `sid`.
+///
+/// # The roster answers fleet-wide; every other method fails closed on a foreign sid
+///
+/// [`SessionHost::sessions`] and [`SessionHost::resolve`] answer for the whole
+/// roster. Per-session methods answer only for sids this host serves (possibly
+/// one: `aterm-gui`'s host is session-scoped). A sid it does not serve gets
+/// `None` (a no-op for returnless methods), never its own session under a
+/// borrowed number, which keeps the cross-host sequence safe:
+///
+/// ```
+/// use aterm_control::{Selector, SessionHost};
+///
+/// fn clear_selected(host: &impl SessionHost, sel: Selector<'_>) -> Option<()> {
+///     let sid = host.resolve(sel)?;  // fleet-wide answer
+///     host.with_terminal_mut(sid, |t| t.text_selection_mut().clear())
+///                                    // None unless THIS host serves that sid
+/// }
+/// ```
 pub trait SessionHost {
     /// Capabilities supported by this host.
     fn capabilities(&self) -> HostCapabilities;

@@ -148,7 +148,6 @@ impl HugeDir {
     }
 }
 
-/// Append one recorded name (raw bytes on Unix) to a path.
 fn push_name(p: &mut PathBuf, name: &[u8]) {
     #[cfg(unix)]
     {
@@ -161,7 +160,6 @@ fn push_name(p: &mut PathBuf, name: &[u8]) {
     }
 }
 
-/// `104211` as `104,211`.
 fn group(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -489,8 +487,6 @@ mod tests {
         assert_eq!(t.children(DirId::ROOT), vec![a, b]);
     }
 
-    /// A nested root reads its figures from its parent's walk: found by name,
-    /// and every query scoped to it sees only what lies inside it.
     #[test]
     fn a_folder_is_found_by_name_and_queries_scope_to_it() {
         let mut t = Tree::new(PathBuf::from("/r"), 1);

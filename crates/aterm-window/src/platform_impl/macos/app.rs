@@ -22,6 +22,17 @@ static SEND_EVENT: SwizzleSite<SendEvent> = SwizzleSite::new();
 
 thread_local! {
     // LOCAL PATCH (aterm): the event loop's panic slot, installed by
+    // [`set_send_event_panic_info`] from `EventLoop::new` right after the
+    // override. `sendEvent:` can reach the application's handlers directly
+    // (the original's routing → a `WinitView` row → `maybe_queue_event` →
+    // `handle_event` when no other event is being handled), so a Rust panic in
+    // there must take the same road every other handler panic takes on this
+    // backend:
+    // `stop_app_on_panic` stores it here, stops the app, and `run_on_demand`
+    // resumes the unwind on the main thread once `-[NSApplication run]`
+    // returns. Thread-local rather than a `static mut`: the slot is written
+    // and read on the main thread only, and a thread-local says so without an
+    // `unsafe` block or a `static_mut_refs` allow.
     static PANIC_INFO: RefCell<Option<Weak<PanicInfo>>> = const { RefCell::new(None) };
 }
 

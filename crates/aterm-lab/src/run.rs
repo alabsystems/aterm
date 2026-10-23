@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A lab that is up: `runs/<tag>/env.sh`, the one record of it, written from
-//! outside the jail and rewritten atomically the moment a fact is known (so
-//! `ps` and `down` know a lab however far `up` got). It stays a shell file a
-//! person can `.` (`PROJ`, `SOCK`, the pids).
+//! Lab run-record persistence and tag resolution for `runs/<tag>/env.sh`.
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +16,7 @@ pub struct Run {
     pub tag: String,
     /// `runs/<tag>/`.
     pub run: PathBuf,
-    /// `runs/<tag>/scratch/`: the one place jailed code writes.
+    /// `runs/<tag>/scratch/`.
     pub w: PathBuf,
     /// The private socket directory, `/tmp/at.XXXX`.
     pub sockdir: String,
@@ -65,29 +62,20 @@ pub struct Run {
     pub muse_bin: String,
     /// Its version, from its store build's record (`1.4.10-R6427.1`).
     pub muse_ver: String,
-    /// The agent the tab last launched: `claude`, `codex`, `gemini`, `agy` or
-    /// `muse` (fixtures are named after it).
+    /// The agent the tab last launched.
     pub agent: String,
     /// The login the tab's Codex was launched with: `lab`, `chatgpt` or `signed-out`.
     pub codex_mode: String,
-    /// The aterm under test, resolved once at `up`: every later call for this
-    /// lab runs exactly this file, which its jail pins (never a new pick).
+    /// The aterm under test, resolved once at `up`.
     pub aterm: String,
-    /// The jail's mark: the Mach name its profile alone denies, by which every
-    /// process in the jail is found ([`crate::procs::jail_members`]).
+    /// The jail's mark ([`crate::procs::jail_members`]).
     pub mark: String,
-    /// `LAB_INSTANCE_ENV` as `up` took it (`K=V K=V`, checked by
-    /// [`crate::lab::instance_env`]): the variables every launch of the lab's
-    /// instance adds, `up`'s and each relaunch's alike (never read again from
-    /// a later caller's environment).
+    /// `LAB_INSTANCE_ENV` as `up` took it (`K=V K=V`, checked by [`crate::lab::instance_env`]).
     pub instance_env: String,
-    /// `1` when `up` loaded the lab's sleep clock into its instance and its
-    /// Claude Code (`LAB_CLOCK=1`, [`crate::clock`]): its files sit at fixed
-    /// places in the run directory ([`crate::clock::Layout`]).
+    /// `1` when `up` loaded the lab's sleep clock into its instance and its Claude Code
+    /// ([`crate::clock`], [`crate::clock::Layout`]).
     pub clock: String,
-    /// `1` when the lab's instance opens a window (`forever --window`,
-    /// [`crate::lab::windowed`]): every launch of it on this record is
-    /// windowed, in the same jail.
+    /// `1` when the lab's instance opens a window (`forever --window`, [`crate::lab::windowed`]).
     pub window: String,
 }
 
@@ -212,9 +200,7 @@ impl Run {
         let _ = atomic_write(&self.run.join("env.sh"), self.render().as_bytes());
     }
 
-    /// The lab `tag` as `env.sh` records it (its `ATERM` and `LAB_MARK` only
-    /// from there: never a new pick, never a mark the caller's environment carried).
-    ///
+    /// The lab `tag` as `env.sh` records it.
     /// # Errors
     /// No lab of that tag is up.
     pub fn load(tag: &str) -> Result<Run, String> {
@@ -226,7 +212,6 @@ impl Run {
     }
 
     /// The aterm this lab runs (its door, a restart), as `up` recorded it.
-    ///
     /// # Errors
     /// An older lab's `env.sh` names none.
     pub fn need_aterm(&self) -> Result<std::path::PathBuf, String> {
@@ -251,8 +236,7 @@ impl Run {
         }
     }
 
-    /// The prefix of this lab's fixtures: `<agent>-<version>` (`claude-2.1.300`,
-    /// `codex-0.163.0` after `codex`, `gemini-0.46.0`, `agy-1.4.0`, `muse-1.4.10-R6427.1`).
+    /// The prefix of this lab's fixtures.
     #[must_use]
     pub fn fixture_prefix(&self) -> String {
         let ver = match self.agent() {
@@ -288,9 +272,7 @@ pub fn is_run(tag: &str) -> bool {
     valid_tag(tag) && paths().run_dir(tag).join("env.sh").is_file()
 }
 
-/// The tag a verb acts on: its first argument when that names a lab that is up
-/// (then taken off `args`), else `$LAB_TAG`, else `lab`.
-///
+/// The tag a verb acts on: its first argument when that names a lab that is up.
 /// # Errors
 /// `$LAB_TAG` is not a valid tag.
 pub fn take_tag(args: &mut Vec<String>) -> Result<String, String> {
@@ -307,14 +289,7 @@ pub fn take_tag(args: &mut Vec<String>) -> Result<String, String> {
     }
 }
 
-/// The tag a verb whose ONE positional argument is its tag acts on (`ps
-/// [tag]`, `down [tag] [--keep-dumps]`): its first argument where that is no
-/// option, taken off `args` whether or not a lab of that tag is up — the verb
-/// then says that lab is not up — else [`take_tag`]'s. Read by [`take_tag`],
-/// the tag of a lab already down is no run, so it was left as an argument and
-/// the verb acted on the default lab: `ps <tag>` named the default tag, and
-/// `down <tag>` took the default lab down.
-///
+/// The tag a verb whose ONE positional argument is its tag acts on ([`take_tag`]).
 /// # Errors
 /// The argument, or `$LAB_TAG`, is not a valid tag.
 pub fn take_only_tag(args: &mut Vec<String>) -> Result<String, String> {
@@ -422,11 +397,6 @@ mod tests {
         assert_eq!(unread.fixture_prefix(), "muse-?");
     }
 
-    /// A VERB WHOSE ONE ARGUMENT IS ITS TAG TAKES A LAB THAT IS DOWN
-    /// : `ps <tag>` and `down <tag>` of a lab with no run
-    /// directory act on that tag, never the default lab's ([`take_tag`] leaves
-    /// it as an argument). An option first is no tag: the default; a tag
-    /// that is not one is refused.
     #[test]
     fn a_verb_whose_one_argument_is_its_tag_takes_a_lab_that_is_down() {
         let gone = "ki1016-gone-lab";
@@ -434,7 +404,6 @@ mod tests {
         let mut a = vec![gone.to_string(), "--keep-dumps".to_string()];
         assert_eq!(take_only_tag(&mut a), Ok(gone.to_string()));
         assert_eq!(a, vec!["--keep-dumps".to_string()]);
-        // CONTROLS: an option first; a word that is no tag.
         let mut flags = vec!["--keep-dumps".to_string()];
         assert_eq!(take_only_tag(&mut flags), take_tag(&mut Vec::new()));
         assert_eq!(flags, vec!["--keep-dumps".to_string()]);

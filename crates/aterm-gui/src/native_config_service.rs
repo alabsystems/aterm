@@ -367,19 +367,19 @@ impl VersionedConfigService {
     }
 
     /// Disk generation the service was initialized from.
-    pub(crate) fn observed_disk_baseline(
+    pub(crate) const fn observed_disk_baseline(
         &self,
     ) -> Option<&crate::native_document_host::AtomicFileBaseline> {
         self.disk_baseline.as_ref()
     }
 
     /// A writer reported an unknown or externally won disk generation.
-    pub(crate) fn mark_reconciliation_required(&mut self) {
+    pub(crate) const fn mark_reconciliation_required(&mut self) {
         self.disk_text_admitted = false;
         self.write_reconciliation_required = true;
     }
 
-    pub(crate) fn reconciliation_required(&self) -> bool {
+    pub(crate) const fn reconciliation_required(&self) -> bool {
         self.write_reconciliation_required
     }
 
@@ -788,6 +788,9 @@ impl VersionedConfigService {
         }
         let next = if *self.text == *record.after_text {
             // Still the patch's result: the text before it, exactly, whatever
+            // it spelled — a value only a file holds (an old style alias the
+            // writer reads but never writes) comes back as it was, so Undo
+            // never needs the writer to take it.
             record.before_text.to_string()
         } else {
             let merged = merge_reverting(&record.after_text, &record.before_text, &self.text)
@@ -952,6 +955,8 @@ fn parse_values(text: &str) -> Result<BTreeMap<String, String>, String> {
     let mut values = BTreeMap::new();
     for (key, item) in document.iter() {
         // Full-depth dotted projection, mirroring `prefs::apply_prefs_edits`, so Settings
+        // and OCC expectations address the leaf (`sparkle_words.profanity.enabled`). Each
+        // table keeps its whole-table entry too, so an edit anywhere in it stamps it.
         project_item(&mut values, &join_config_key_path("", key), item);
     }
     Ok(values)

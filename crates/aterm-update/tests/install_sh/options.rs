@@ -5,8 +5,6 @@
 
 use crate::support::{Home, Lib, Scratch, install_sh, installer, q, read, s, symlink, tree};
 
-/// A run that excludes every half: an installer that did accept the flag
-/// prints a plan, never installs.
 fn gate(home: &Home, extra: &[&str]) -> crate::support::Run {
     let mut args = vec![
         "--dry-run",
@@ -19,8 +17,6 @@ fn gate(home: &Home, extra: &[&str]) -> crate::support::Run {
     installer(&install_sh(), home, &[], &args)
 }
 
-/// The update-token half is gone: `--token` and `--no-token` are unknown
-/// arguments, refused at the gate, and nothing is written.
 #[test]
 fn retired_token_flags_are_unknown_arguments() {
     let scratch = Scratch::new();
@@ -39,8 +35,6 @@ fn retired_token_flags_are_unknown_arguments() {
     assert_eq!(tree(&home.home), Vec::<String>::new());
 }
 
-/// `-v`/`--version` PINS a release: without a value, or with one that is not a
-/// three-component release, it exits 2 at the argument gate.
 #[test]
 fn the_version_flag_pins_a_three_component_release() {
     let scratch = Scratch::new();
@@ -62,8 +56,6 @@ fn the_version_flag_pins_a_three_component_release() {
     assert_eq!(tree(&home.home), Vec::<String>::new());
 }
 
-/// The env twins of `--no-toolchain` / `--no-path`: only `1` opts out; unset,
-/// empty and `0` keep the half; anything else is refused, never guessed.
 #[test]
 fn only_one_opts_out_through_an_env_twin() {
     let scratch = Scratch::new();
@@ -87,11 +79,6 @@ fn only_one_opts_out_through_an_env_twin() {
     }
 }
 
-/// `--no-toolchain` persists `[packages] auto_install = false`: created,
-/// appended on a line of its own, or inserted under the header — and never
-/// over a value the person set, nor into a form it cannot edit safely. The
-/// key is atpkg's install consent, so the write says what it does to a
-/// toolset already installed.
 #[test]
 fn no_toolchain_persists_its_exclusion_without_overwriting() {
     let scratch = Scratch::new();
@@ -197,7 +184,6 @@ fn no_toolchain_persists_its_exclusion_without_overwriting() {
     );
 }
 
-/// The config path atpkg and the app read: an empty XDG_CONFIG_HOME is unset.
 #[test]
 fn the_config_path_is_atpkgs() {
     let scratch = Scratch::new();

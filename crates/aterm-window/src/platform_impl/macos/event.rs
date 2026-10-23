@@ -77,6 +77,7 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
         return Key::Unidentified(NativeKey::MacOS(scancode));
     }
     if result_len == 0 {
+        // For instance, users that have mapped the `Fn` key to toggle
         // keyboard layouts will hit this code path.
         return Key::Unidentified(NativeKey::MacOS(scancode));
     }
@@ -151,7 +152,8 @@ impl LayoutKeys for CurrentLayout {
         let mut string = [0; 4];
         let mut len = 0;
         let mut dead_keys = 0;
-        // SAFETY: `layout` is the live table `source` owns; the out-pointers name locals whose.
+        // SAFETY: `layout` is the live table `source` owns; the out-pointers name locals whose
+        // lengths are the ones passed.
         let status = unsafe {
             ffi::UCKeyTranslate(
                 self.layout,
@@ -446,7 +448,8 @@ pub(super) fn dummy_event() -> Option<Obj> {
             0,
         )
     };
-    // SAFETY: `raw` is nil or the live autoreleased event just constructed; `Obj::retain` answers.
+    // SAFETY: `raw` is nil or the live autoreleased event just constructed;
+    // `Obj::retain` answers `None` for nil and takes its own +1 otherwise.
     unsafe { Obj::retain(raw) }
 }
 

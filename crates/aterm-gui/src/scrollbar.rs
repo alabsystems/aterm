@@ -60,7 +60,7 @@ pub(crate) fn hairline_stroke(cell_w: u32, cell_h: u32) -> u32 {
 
 /// Where a light `│` (or `─`) of `stroke` px starts across a cell `extent` px wide (or tall): `(extent − stroke) / 2`, the extra pixel of an odd remainder going right (down), as the renderer places it.
 #[must_use]
-pub(crate) fn hairline_start(extent: u32, stroke: u32) -> u32 {
+pub(crate) const fn hairline_start(extent: u32, stroke: u32) -> u32 {
     extent.saturating_sub(stroke) / 2
 }
 
@@ -125,13 +125,13 @@ pub(crate) fn span(lane: Lane, width: u32, m: Metrics) -> (u32, u32) {
 
 /// The resting (and scrolling) thumb's width, for [`rest_span`]: under the Fluent chrome (`fluent`, Windows) WinUI's thin panning indicator, [`Metrics::fine`], at the window's edge and in a divider gap alike; under the Classic chrome the [`Metrics::thin`] thumb.
 #[must_use]
-pub(crate) fn rest_width(m: Metrics, fluent: bool) -> u32 {
+pub(crate) const fn rest_width(m: Metrics, fluent: bool) -> u32 {
     if fluent { m.fine } else { m.thin }
 }
 
 /// The opacity a resting (or scrolling) thumb of `alpha` paints at: under the Fluent chrome twice `alpha` (opaque at most), so the thin indicator carries the ink of WinUI's (its `ControlStrongFillColorDefault`, about 55% white on dark) and stands off the divider's hairline it covers in a gap, where the plain resting opacity laid almost the hairline's own tone; the scrolling and parked steps stay apart.
 #[must_use]
-pub(crate) fn rest_alpha(alpha: u8, fluent: bool) -> u8 {
+pub(crate) const fn rest_alpha(alpha: u8, fluent: bool) -> u8 {
     if fluent {
         alpha.saturating_mul(2)
     } else {

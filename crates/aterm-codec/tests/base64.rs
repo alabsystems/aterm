@@ -44,8 +44,6 @@ fn rfc4648_vectors() {
     }
 }
 
-/// Every byte length from 0 to 300 and every byte value, so no alphabet slot
-/// or quad alignment goes unexercised.
 #[test]
 fn every_short_length_and_every_byte_value_round_trips() {
     for len in 0..=300usize {
@@ -61,9 +59,6 @@ fn every_short_length_and_every_byte_value_round_trips() {
     }
 }
 
-/// `encode_into` appends exactly what `encode` returns, onto an empty and onto
-/// a non-empty buffer, and `encoded_len` is the length it appends: every input
-/// length from 0 to 1023.
 #[test]
 fn encode_into_appends_exactly_encode() {
     let mut rng = XorShift::new(0x2545_F491_4F6C_DD1D);
@@ -86,9 +81,6 @@ fn encode_into_appends_exactly_encode() {
     }
 }
 
-/// A destination already sized by `encoded_len` takes the whole encoding in
-/// place. Negative control: one byte short, the same append reallocates, so
-/// an unchanged capacity is evidence of no second buffer.
 #[test]
 fn a_destination_sized_by_encoded_len_never_reallocates() {
     for len in 1..=300usize {
@@ -108,8 +100,6 @@ fn a_destination_sized_by_encoded_len_never_reallocates() {
     }
 }
 
-/// Above `MAX_INPUT_LEN` both refuse, and `encode_into` leaves its destination
-/// as it was. The oversized input is a zeroed allocation nothing reads.
 #[test]
 fn oversized_input_is_refused_and_appends_nothing() {
     let max = aterm_codec::MAX_INPUT_LEN;
@@ -126,10 +116,6 @@ fn oversized_input_is_refused_and_appends_nothing() {
     assert_eq!(out.capacity(), "kept".len());
 }
 
-/// EXHAUSTIVE over short strings from an alphabet that hits every sharp edge:
-/// symbols with zero and non-zero low bits (the trailing-bit rejections), both
-/// alphabet-specific symbols, the URL-safe symbols a standard decoder must
-/// refuse, the pad byte, and a byte outside the alphabet.
 #[test]
 fn exhaustive_short_strings_are_accepted_only_when_canonical() {
     const ALPHA: &[u8] = b"AQh9+/-_=!";
@@ -157,8 +143,6 @@ fn exhaustive_short_strings_are_accepted_only_when_canonical() {
     }
 }
 
-/// The non-canonical spellings that motivated `decode_strict`: the lenient
-/// `decode` accepts them, the strict one does not.
 #[test]
 fn non_canonical_spellings_are_refused() {
     for alias in ["Zh==", "Zi==", "Zj==", "Zm9=", "Zm+="] {
@@ -177,8 +161,6 @@ fn non_canonical_spellings_are_refused() {
     }
 }
 
-/// The shapes the trust call sites feed it: a 32-byte Ed25519 public key is 44
-/// characters with one `=`, a 64-byte signature 88.
 #[test]
 fn ed25519_key_and_signature_shapes() {
     let mut rng = XorShift::new(0x9E37_79B9_7F4A_7C15);
@@ -194,8 +176,6 @@ fn ed25519_key_and_signature_shapes() {
     }
 }
 
-/// Pseudo-random fuzz in both directions; decode-side inputs come from a
-/// base64-ish alphabet so many are NEARLY valid.
 #[test]
 fn fuzz_both_directions() {
     let mut rng = XorShift::new(0xC2B2_AE3D_27D4_EB4F);

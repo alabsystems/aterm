@@ -467,6 +467,7 @@ impl AtermTerminal {
     /// Set the cursor blink visibility phase for the next frame.
     pub fn set_cursor_blink_phase(&mut self, on: bool) {
         // Frame gate: blink is renderer-held, invisible to the damage epoch. The shadow
+        // keeps a timer re-asserting the same phase from forcing a render.
         if self.blink_phase_shadow != Some(on) {
             self.blink_phase_shadow = Some(on);
             self.note_host_visual_change();
@@ -571,6 +572,8 @@ impl AtermTerminal {
         if let Some(pending) = self.term.resize_offloading_scrollback(rows, cols) {
             if pending.line_count() <= INLINE_REFLOW_MAX_LINES {
                 // Small-history fast path. A follow-up job cannot arise on this
+                // single-threaded path, but dropping one would wedge the detach window,
+                // so route it to the pump.
                 if let Some(follow) = self.term.finish_resize_offload(pending.reflow()) {
                     self.pending_reflow = Some(follow);
                     self.reflow_grace = REFLOW_PUMP_GRACE_RENDERS;
@@ -1597,6 +1600,7 @@ mod tests {
         let mut t = crate::system_font_terminal(5, 20, 16.0);
         for i in 0..30 {
             // Box-drawing edges force the host's per-cell path; a wide emoji
+            // exercises complex-cluster pairing for materialized history rows.
             t.process(format!("│🦀line{i}│\r\n").as_bytes());
         }
         let per_cell_row = |t: &AtermTerminal, row: u16| -> String {

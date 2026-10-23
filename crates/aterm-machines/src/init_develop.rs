@@ -418,7 +418,7 @@ fn workspace_of(manifest: &aterm_toml::Value) -> Option<Workspace> {
     })
 }
 
-/// Where the aterm workspace at `root` is a linked worktree.
+/// The main worktree the aterm workspace at `root` belongs to, when it is a linked worktree.
 fn linked_worktree_of(sys: &dyn System, user: &User, root: &Path) -> Option<PathBuf> {
     let ran = sys
         .run_complete_stdout(&checkout::git(user, Some(root)).args([
@@ -480,7 +480,8 @@ fn enclosing(sys: &dyn System, user: &User, cwd: &Path) -> Result<Option<PathBuf
     Ok(None)
 }
 
-/// Where the recorded checkout `path` is missing or is not an aterm workspace.
+/// Where the recorded checkout `path` is missing or is not an aterm workspace: the probe that
+/// says so; else its origin.
 fn admitted(sys: &dyn System, user: &User, path: &Path, spelled: &str) -> Result<Origin, Probe> {
     match sys.stat(path) {
         Ok(stat) if stat.dir && !stat.symlink => {}
@@ -517,7 +518,7 @@ struct Checkout {
     spelled: String,
     /// Origin's host could not be reached by the last probe ([`Item::read_aside`]).
     unread: Aside,
-    /// Whether the last probe stood aside ([`Item::stood_aside`]).
+    /// Origin's host could not be reached by the last apply ([`Item::stood_aside`]).
     stood: Aside,
 }
 

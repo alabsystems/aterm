@@ -76,7 +76,6 @@ pub enum Admit {
     /// ([`Boundary::take_delivered`] holds what each returned).
     Rejected {
         /// How many queued inputs were delivered before this one.
-        /// How many queued inputs were delivered before this one.
         delivered_after: usize,
     },
 }
@@ -198,7 +197,6 @@ pub enum PublishRefusal {
     /// The candidate's artifact is not of kind code.
     NotCode {
         /// Its kind.
-        /// Its kind.
         kind: ArtifactKind,
     },
     /// The boundary's own contract (the one it was constructed with) is not the one the task
@@ -221,7 +219,6 @@ pub enum PublishRefusal {
     CandidateFailed(Verdict),
     /// The candidate's replay refused the input at `cursor`.
     CandidateRefused {
-        /// The cursor of the refused input.
         /// The cursor of the refused input.
         cursor: u64,
     },
@@ -250,7 +247,6 @@ pub enum PublishRefusal {
     /// finds the queue full rejects the update instead ([`Admit::Rejected`]), so nothing is
     /// ever dropped.
     QueueFull {
-        /// The queue's capacity.
         /// The queue's capacity.
         cap: usize,
     },

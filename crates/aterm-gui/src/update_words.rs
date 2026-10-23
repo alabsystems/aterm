@@ -301,7 +301,7 @@ pub(crate) fn staged_on_hold_title(version: &str) -> String {
 }
 
 /// The `Install now` capsule only where a press is the way the build installs.
-pub(crate) fn apply_capsule_for(posture: Option<ApplyPosture>, build: u64) -> Option<Intent> {
+pub(crate) const fn apply_capsule_for(posture: Option<ApplyPosture>, build: u64) -> Option<Intent> {
     match posture {
         Some(
             ApplyPosture::HandoffDisabled { .. }
@@ -797,7 +797,10 @@ pub(crate) fn span_words(span: Duration) -> String {
     }
 }
 
-/// When `build` — the one a handoff is about to install.
+/// When `build` — the one a handoff is about to install — finished
+/// downloading in this process (`verified`, `App::update_verified`), on the
+/// wall clock in Unix milliseconds: what the handoff carry hands the successor
+/// (`WindowCarry::update_verified_unix_ms`).
 #[cfg(any(unix, test))]
 pub(crate) fn verified_unix_ms(
     verified: Option<(u64, Instant)>,
@@ -975,7 +978,10 @@ pub(crate) fn waiting_to_install(switch: Option<Option<&str>>) -> String {
     }
 }
 
-/// `said`, then — after ` · `.
+/// `said`, then — after ` · ` — the apply failure `reason` in a person's words
+/// when the apply lane can name it ([`crate::update_apply_trouble::named_clause`]),
+/// never the ledger's own text ("overlap handoff failed safely: handoff proof
+/// ended ChildDied"), which stays in aterm.log.
 pub(crate) fn with_named_cause(said: &str, reason: &str) -> String {
     match crate::update_apply_trouble::named_clause(reason) {
         Some(cause) => format!("{said} \u{b7} {cause}"),
@@ -1367,7 +1373,7 @@ pub(crate) const KEY_DEV_BUILD: &str = "update.dev-build";
 pub(crate) const KEY_DEV_BUILD_WRITES: &str = "update.dev-build-writes";
 
 /// What a dev build writes of the shared user state only the release writes unattended, in words, with what puts it back.
-pub(crate) fn dev_shared_writes(
+pub(crate) const fn dev_shared_writes(
     non_release_bundle: bool,
     packages_lane: bool,
     agents_prime: bool,

@@ -33,7 +33,9 @@ impl Grid {
         }
     }
 
-    /// Give the wide halves a row op blanked with the BCE fill.
+    /// Give the wide halves a row op blanked with the BCE fill
+    /// ([`BlankedHalves`](crate::row::BlankedHalves)) the fill's ring bytes, as
+    /// [`Self::fill_bce_rgb_range`] gives the span it vacated.
     #[inline]
     pub(in crate::grid) fn fill_bce_rgb_cols(&mut self, row: u16, cols: crate::row::BlankedHalves) {
         for col in cols.into_iter().flatten() {
@@ -98,6 +100,9 @@ impl Grid {
                     bce = row.selective_clear_range(cursor_col, right_bound, fill);
                 } else {
                     // xterm `ClearRight`: the orphaned wide half goes through the
+                    // same `ClearCells` as the erased span, so it receives the BCE
+                    // blank, not a default-coloured one (rect ops differ — see
+                    // `Row::clear_range_with_orphan`).
                     bce = row.clear_range_with_orphan(cursor_col, right_bound, fill, fill);
                 }
             }
@@ -136,7 +141,10 @@ impl Grid {
         }
     }
 
-    /// Break the soft wrap from `row` into the row.
+    /// Break the soft wrap from `row` into the row below, as xterm `ClearRight`
+    /// always ends with `LineClrWrapped(ld)` ("with the right part cleared, we
+    /// can't be wrapping"): after EL 0 / ED 0 / DECSEL 0 / DECSED 0 (and an ECH
+    /// reaching the last column, see `erase_chars`).
     pub(in crate::grid) fn clear_wrap_into_next_row(&mut self, row: u16) {
         let next = row.saturating_add(1);
         if next >= self.storage.visible_rows {
@@ -171,6 +179,7 @@ impl Grid {
                     bce = row.selective_clear_range(0, end, fill);
                 } else {
                     // BCE blank on the orphan, per xterm `ClearRight` (see
+                    // `erase_to_end_of_line_core`).
                     bce = row.clear_range_with_orphan(0, end, fill, fill);
                 }
             }
@@ -197,6 +206,8 @@ impl Grid {
                 row.selective_clear(fill);
             } else {
                 // `erase_with()` keeps DECDWL/DECDHL line attributes, which EL
+                // keeps where ED 2 drops them, as in xterm (`ClearInLine2` never
+                // writes `DblCS`).
                 row.erase_with(fill);
             }
         }
@@ -220,6 +231,10 @@ impl Grid {
                     r.selective_clear(fill);
                 } else {
                     // A complete row a plain ED erases comes back single-width
+                    // and single-height (xterm `ClearBufRows`: "clearing the
+                    // whole row resets the doublesize characters"). DECSED must
+                    // not reset: xterm's protected branch never reaches
+                    // `ClearBufRows`.
                     r.reset_with(fill);
                 }
             }
@@ -315,6 +330,9 @@ impl Grid {
         for row in 0..self.storage.visible_rows {
             if let Some(r) = self.row_mut(row) {
                 // ED 2 erases complete lines, which come back single-width and
+                // single-height (VT510 ED: "When you erase complete lines, they
+                // become single-height, single-width lines"; xterm `ClearScreen`
+                // -> `ClearBufRows` -> `SetLineDblCS(ld, CSET_SWL)`).
                 r.reset_with(fill);
             }
         }
@@ -604,6 +622,7 @@ impl Grid {
                 for &col in &wiped_cols {
                     if self.storage.extras.scrub_char_marks(row_idx, col) {
                         // Entry is now empty — drop it and clear the flag to
+                        // keep the HAS_EXTRAS ⇔ entry-exists invariant.
                         self.remove_cell_extra(row_idx, col);
                     }
                 }

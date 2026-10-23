@@ -32,6 +32,20 @@ pub(crate) struct Server {
 impl Server {
     /// Serve `root` on 127.0.0.1 at a port the kernel picks.
     pub(crate) fn start(root: &Path) -> Result<Self, String> {
+        Self::serve(root, false)
+    }
+
+    /// [`Server::start`], every file sent with the two headers that make a
+    /// page of it cross-origin isolated (`Cross-Origin-Opener-Policy:
+    /// same-origin`, `Cross-Origin-Embedder-Policy: require-corp`), where a
+    /// browser's `performance.now()` keeps its fine resolution (Chromium's
+    /// is 100 µs without, 5 µs with). Everything the page loads is this
+    /// origin's, so the embedder policy blocks nothing.
+    pub(crate) fn start_isolated(root: &Path) -> Result<Self, String> {
+        Self::serve(root, true)
+    }
+
+    fn serve(root: &Path, isolated: bool) -> Result<Self, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| format!("could not listen on loopback: {e}"))?;
         let addr = listener
@@ -49,7 +63,7 @@ impl Server {
                 let Ok(stream) = stream else { continue };
                 let (root, served, posted) = (root.clone(), served2.clone(), posted.clone());
                 std::thread::spawn(move || {
-                    if answer(stream, &root, &posted).is_ok() {
+                    if answer(stream, &root, &posted, isolated).is_ok() {
                         served.fetch_add(1, Ordering::SeqCst);
                     }
                 });
@@ -137,18 +151,43 @@ pub(crate) fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// The file under `root` a request target names.
+/// The file under `root` a request target names, each `/`-separated segment percent-decoded;
+/// `None` for anything not a plain relative path once decoded.
 pub(crate) fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
     let path = target.split(['?', '#']).next()?;
     let rel = path.strip_prefix('/')?;
-    if rel.is_empty() || rel.contains(['%', '\\']) {
-        return None;
+    let mut out = root.to_path_buf();
+    for raw in rel.split('/') {
+        let segment = percent_decoded(raw)?;
+        if segment.contains(['/', '\\', '\0']) {
+            return None;
+        }
+        let mut parts = Path::new(&segment).components();
+        match (parts.next(), parts.next()) {
+            (Some(Component::Normal(_)), None) => out.push(&segment),
+            _ => return None,
+        }
     }
-    let rel = Path::new(rel);
-    if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
-        return None;
+    Some(out)
+}
+
+/// `raw` with each `%XX` escape decoded, if every escape is two hex digits
+/// and the result is UTF-8.
+fn percent_decoded(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
     }
-    Some(root.join(rel))
+    String::from_utf8(out).ok()
 }
 
 /// The kind a POST target names.
@@ -221,11 +260,17 @@ fn request_body<R: Read>(
     Ok(body)
 }
 
+/// The headers that make a page cross-origin isolated
+/// ([`Server::start_isolated`]).
+const ISOLATED: &str = "Cross-Origin-Opener-Policy: same-origin\r\n\
+                        Cross-Origin-Embedder-Policy: require-corp\r\n";
+
 /// Read one request from `stream` and answer it.
 fn answer(
     mut stream: TcpStream,
     root: &Path,
     posted: &Sender<(String, Vec<u8>)>,
+    isolated: bool,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(crate::browser::cdp::HANG_DETECTOR))?;
     stream.set_write_timeout(Some(crate::browser::cdp::HANG_DETECTOR))?;
@@ -267,9 +312,10 @@ fn answer(
             write!(
                 out,
                 "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
-                 Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                 Cache-Control: no-store\r\n{}Connection: close\r\n\r\n",
                 content_type(&path),
-                body.len()
+                body.len(),
+                if isolated { ISOLATED } else { "" }
             )?;
             out.write_all(&body)?;
         }
@@ -366,6 +412,12 @@ mod tests {
             resolve(root, "/gpu/aterm_gpu_web.js?v=1#x"),
             Some(PathBuf::from("/site/gpu/aterm_gpu_web.js"))
         );
+        // An escaped name is fetched as itself: the glue spells its module's
+        // file name this way.
+        assert_eq!(
+            resolve(root, "/q/quote%27%60%24%7Bx%7D%23%3F%25_bg.wasm?copy=1"),
+            Some(PathBuf::from("/site/q/quote'`${x}#?%_bg.wasm"))
+        );
         for bad in [
             "/",
             "",
@@ -373,6 +425,14 @@ mod tests {
             "/../etc/passwd",
             "/a/../../b",
             "/%2e%2e/x",
+            "/%2E/x",
+            "/a%2Fb",
+            "/a%5Cb",
+            "/a%00b",
+            "/a%zzb",
+            "/a%2",
+            "/a%ff",
+            "/a//b",
             "/a\\b",
             "/./a",
         ] {
@@ -452,6 +512,16 @@ mod tests {
             "{ok}"
         );
         assert!(ok.ends_with("\r\n\r\nexport {}\n"), "{ok}");
+        assert!(
+            !ok.contains("Cross-Origin-"),
+            "the lane's pages stay as they were: {ok}"
+        );
+        let isolated = Server::start_isolated(dir.path()).expect("start");
+        let iso = get(&isolated.origin(), "/lane.mjs");
+        assert!(
+            iso.contains(ISOLATED) && iso.ends_with("\r\n\r\nexport {}\n"),
+            "{iso}"
+        );
         assert!(get(&server.origin(), "/missing.js").starts_with("HTTP/1.1 404"));
         assert!(get(&server.origin(), "/../lane.mjs").starts_with("HTTP/1.1 404"));
         let oversized =

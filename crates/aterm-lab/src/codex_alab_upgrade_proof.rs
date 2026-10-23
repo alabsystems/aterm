@@ -31,7 +31,6 @@ pub(super) fn describe_package(package: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
-/// These fields belong to the conversation and process, rather than the new image.
 fn same_custody(before: &J, after: &J) -> bool {
     [
         "pid",
@@ -50,7 +49,6 @@ fn same_custody(before: &J, after: &J) -> bool {
     })
 }
 
-/// Epoch conversion may round a deadline up, but must never shorten it.
 fn same_owed(before: &J, after: &J) -> bool {
     let (J::Obj(before_fields), J::Obj(after_fields)) = (before, after) else {
         return false;
@@ -86,9 +84,6 @@ fn one_carried_request(rows: &[J], owed: &J, not_before: i64) -> bool {
         })
 }
 
-/// The first new writer snapshot can still contain the predecessor's owed
-/// state while this image has not claimed yet. Read its restored deadline only
-/// after its own record reports the expected active image and native claimant.
 fn active_image_record(record: &J, version: &str, pid: i32) -> bool {
     record.get("version").and_then(J::as_str) == Some(version)
         && record.get("pid").and_then(J::as_i64) == Some(i64::from(pid))

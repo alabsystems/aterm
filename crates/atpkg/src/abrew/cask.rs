@@ -1044,6 +1044,9 @@ fn artifact_paths(
                 continue;
             }
             Artifact::Other(kind) => {
+                // Name the artifact that forced delegation: a bare
+                // "unsupported" makes every upstream recipe change
+                // look like an abrew regression (1password-cli's
                 // generate_completions_from_executable did).
                 return Err(InstallError::PassThrough(format!(
                     "cask {} has an unsupported artifact recipe ({kind})",
@@ -1157,6 +1160,7 @@ fn artifact_directories(
             .file_type()
             .map_err(|error| format!("abrew: cannot inspect manpage entry: {error}"))?;
         if entry.file_name().to_string_lossy().starts_with("man") {
+            // A final artifact link belongs to its physical parent survey;
             // it is never traversed as a manpage directory.
             if kind.is_dir() {
                 directories.push(entry.path());
@@ -1242,6 +1246,7 @@ impl UninstallPlan {
             }
         }
         for dir in &directories {
+            // A declared final directory link is removed from its checked parent,
             // never surveyed through. Other directory aliases still refuse below.
             if recorded.iter().any(|(version, paths)| {
                 paths.contains(dir)

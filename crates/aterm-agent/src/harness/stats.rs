@@ -69,6 +69,10 @@ pub struct HarnessStats {
     pub upgraded: u64,
     /// Every act of the approval ledger (`approved`, `declined`, `typed`) in the window, by its full rule id.
     pub by_rule: BTreeMap<String, u64>,
+    /// The fact lines the occupancy door typed in the window (`fact-<kind>@v1` `typed`), by their kind (`hold`): no act, so counted here alone.
+    pub facts_told: BTreeMap<String, u64>,
+    /// The fact lines it would have typed under `prompt`, booked under `observe` (`fact-would@v1`), by the kind of the rule each names.
+    pub facts_would: BTreeMap<String, u64>,
     /// The rows of all three files whose time is in the window.
     pub rows: u64,
     /// Lines that are no row: not JSON, no time (a line cut short by a crash, a hand edit).
@@ -1162,6 +1166,7 @@ pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
     }
     acc.row_of(sid);
     if fact {
+        fold_fact(acc, rule, outcome, text("reason").unwrap_or_default());
         return;
     }
     let Some(outcome @ (Outcome::Approved | Outcome::Declined | Outcome::Typed)) = outcome else {
@@ -1189,6 +1194,30 @@ pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
     if kind == Counter::Approved && text("reason").is_some_and(|r| r.starts_with("unproven:")) {
         acc.count(sid, Count::Unproven);
     }
+}
+
+/// A fact row in the window: a line typed counts toward [`HarnessStats::facts_told`] by its
+/// kind, a would-be line toward [`HarnessStats::facts_would`] by the kind of the rule it names
+/// (`rule=<name>`); intents, skips and the hold's own rows count toward neither.
+fn fold_fact(acc: &mut HarnessStats, rule: &str, outcome: Option<Outcome>, reason: &str) {
+    use crate::supervise::facts::FactKind;
+    use crate::supervise::occupancy::rules::{RuleId, WOULD_RULE};
+    let (book, kind) = if rule == WOULD_RULE {
+        let named = reason
+            .split(' ')
+            .find_map(|w| w.strip_prefix("rule="))
+            .and_then(RuleId::of_name);
+        let Some(named) = named else {
+            return;
+        };
+        (&mut acc.facts_would, named.kind())
+    } else {
+        match (FactKind::of_rule(rule), outcome) {
+            (Some(kind), Some(Outcome::Typed)) => (&mut acc.facts_told, kind),
+            _ => return,
+        }
+    };
+    *book.entry(kind.word().to_string()).or_insert(0) += 1;
 }
 
 /// `sid`'s limit wait, if one is open, closed at `at` (unix ms).

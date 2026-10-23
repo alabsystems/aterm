@@ -41,7 +41,11 @@ const KEYED: &[(&str, &str)] = &[
     ("target_endian", "little"),
 ];
 
-/// `pred` (a `cfg` predicate.
+/// `pred` (a `cfg` predicate, without its `cfg(..)` wrapper) on
+/// wasm32-unknown-unknown in a shipped build: `test`, `unix` and `windows`
+/// are false; [`KEYED`] names compare against the target's values;
+/// `all`/`any`/`not` combine three-valued; anything else, or a predicate this
+/// reader cannot parse, is [`Truth::Unknown`].
 pub(crate) fn on_wasm32(pred: &str) -> Truth {
     let pred = pred.trim();
     if let Some(inner) = call(pred, "not") {
@@ -166,7 +170,11 @@ enum IncludeArg<'a> {
     Unknown,
 }
 
-/// The files of one crate's `src` tree (`files`.
+/// The files of one crate's `src` tree (`files`: every `*.rs` in it, with its
+/// text) that no shipped wasm32-unknown-unknown build compiles: every loader
+/// that could load one — a `mod <name>;` declaration, an `include!` — is
+/// false there (masked by [`attr_never_on_wasm32`], as
+/// [`crate::lock_order::unmasked_lines`] masks it) or sits in such a file.
 pub(crate) fn unloaded_on_wasm32(
     files: &BTreeMap<PathBuf, String>,
     roots: &BTreeSet<PathBuf>,
@@ -218,6 +226,7 @@ pub(crate) fn unloaded_on_wasm32(
                 ModLine::None | ModLine::InlineOpen => continue,
                 ModLine::Unplaced => {
                     // A compact inline module (`mod outer { mod live; }`) or
+                    // another declaration on this line can still load a file.
                     if live {
                         cannot(file, i, "declares a module this line-reader cannot place");
                     }

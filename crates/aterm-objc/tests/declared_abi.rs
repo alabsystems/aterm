@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The C ABI of DECLARED methods and of the sends that reach them: arity from
-//! four arguments to the fourteen-argument ceiling, the struct sizes either
-//! side of the `_stret` boundary, one encoding letter per pointer-shaped
-//! runtime type, `BOOL *`, registration under a race, and the reflective path
-//! (`NSInvocation`) that reads the encodings this crate registers. Each test
-//! sends through `objc_msgSend` and reads the runtime's own view back, so a
-//! register shift or a wrong letter fails here rather than in AppKit.
-//!
-//! No `#![allow(clippy::too_many_arguments)]` here, on purpose:
-//! `declare_class!` must emit that allow itself (the lint's span is inside the
-//! expansion, where a caller's `#[allow]` cannot reach). The fourteen-colon
-//! selector below makes the lint fire if the macro stops emitting it.
+//! The C ABI of DECLARED methods and of the sends that reach them.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -28,13 +17,8 @@ use aterm_objc::{
     class, declare_class, msg, protocol, sel, sel_uncached, strip_method_offsets,
 };
 
-/// The [`MainThread`](aterm_objc::MainThread) witness, minted unchecked:
-/// libtest runs every test on a worker, so `MainThread::new()` answers `None`.
-/// Every class here touches no AppKit state and is created and released on the
-/// same worker, which is `new_unchecked`'s second obligation.
 fn mtm() -> aterm_objc::MainThread {
-    // SAFETY: see this function's doc comment — the class has no main-thread
-    // affinity and its ivars are born and dropped on this one worker.
+    // SAFETY: test classes here have no main-thread affinity and live on this worker.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
@@ -45,10 +29,8 @@ unsafe extern "C" {
     fn free(p: *mut c_void);
 }
 
-/// The type encoding the runtime holds for `cls`'s `name`.
 fn encoding_of(cls: ClassPtr, name: &'static CStr) -> String {
-    // SAFETY: side-effect-free runtime queries on a registered class; the
-    // string the runtime returns is owned by it and outlives the read.
+    // SAFETY: side-effect-free runtime queries on a registered class.
     unsafe {
         let m = class_getInstanceMethod(cls, sel_uncached(name));
         assert!(!m.is_null(), "{name:?} is not a method of this class");
@@ -57,8 +39,6 @@ fn encoding_of(cls: ClassPtr, name: &'static CStr) -> String {
             .into_owned()
     }
 }
-
-// Arity 4..6, and the struct sizes that straddle the `_stret` boundary.
 
 /// 16 bytes — the last size that comes back in registers on x86_64.
 #[repr(C)]
@@ -83,8 +63,6 @@ unsafe impl Encode for B17 {
 unsafe impl aterm_objc::InertZero for B17 {}
 
 declare_class! {
-    /// Arities 4, 5 and 6, the two struct sizes that straddle the `_stret`
-    /// boundary, and the methods the reflective tests invoke.
     struct Arity: NSObject {
         const NAME: &str = "ATermObjcArityProbe";
         type Ivars = ();
@@ -94,8 +72,6 @@ declare_class! {
             a * 1000 + b * 100 + c * 10 + d
         }
 
-        /// Five arguments of five different encodings, so a register shift
-        /// cannot cancel out.
         @sel(i:d:o:s:f:)
         fn arity5(&self, i: i64, d: f64, o: Id, s: Sel, f: f32) -> f64 {
             let o_bit = f64::from(u8::from(o.is_null()));
@@ -103,7 +79,6 @@ declare_class! {
             (i as f64) * 100_000.0 + d * 1000.0 + o_bit * 100.0 + s_bit * 10.0 + f64::from(f)
         }
 
-        /// Six arguments of mixed widths, a struct among them.
         @sel(p:q:r:s:t:u:)
         fn arity6(&self, p: i8, q: i16, r: i32, s: i64, t: Bool, u: CGPoint) -> f64 {
             f64::from(p) + f64::from(q) + f64::from(r) + (s as f64)
@@ -151,8 +126,7 @@ fn arity() -> aterm_objc::Retained<Arity> {
 #[test]
 fn arity_four_five_and_six_reach_their_bodies_with_arguments_in_order() {
     let obj = arity();
-    // SAFETY: each prototype is the exact C signature declared above, on a
-    // live instance of the declaring class.
+    // SAFETY: each prototype matches the declared C signature on a live instance.
     unsafe {
         let f4: unsafe extern "C-unwind" fn(Id, Sel, i64, i64, i64, i64) -> i64 = msg();
         assert_eq!(f4(obj.as_id(), sel!(a:b:c:d:), 1, 2, 3, 4), 1234);
@@ -216,9 +190,7 @@ fn sixteen_and_seventeen_byte_returns_both_round_trip() {
     );
 
     let obj = arity();
-    // SAFETY: exact prototypes of `-sixteen`/`-seventeen`/`-echo…`, live
-    // instance. On x86_64 the 17-byte pair goes through `objc_msgSend_stret`
-    // and the 16-byte pair does not; `msg` picks, not this call site.
+    // SAFETY: exact prototypes of `-sixteen`/`-seventeen`/`-echo…`, live instance.
     unsafe {
         let g16: unsafe extern "C-unwind" fn(Id, Sel) -> B16 = msg();
         assert_eq!(
@@ -233,7 +205,6 @@ fn sixteen_and_seventeen_byte_returns_both_round_trip() {
             g17(obj.as_id(), sel!(seventeen)),
             B17([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
         );
-        // Arguments and return of each size, so a shifted register shows up.
         let e16: unsafe extern "C-unwind" fn(Id, Sel, B16) -> B16 = msg();
         assert_eq!(
             e16(obj.as_id(), sel!(echoSixteen:), B16 { lo: 11, hi: 22 }),
@@ -253,17 +224,11 @@ fn sixteen_and_seventeen_byte_returns_both_round_trip() {
     }
 }
 
-// The encoding, read by Foundation itself.
-
 #[test]
 fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
-    // The reflective path: Foundation builds an `NSMethodSignature` from the
-    // encoding this crate registered and reads argument count, widths and the
-    // return type out of it.
     let obj = arity();
     let cls = Arity::class();
-    // SAFETY: every prototype below is the documented signature of the
-    // Foundation method being sent, on live objects.
+    // SAFETY: every prototype below matches the documented Foundation method signature.
     unsafe {
         let sig_for: unsafe extern "C-unwind" fn(ClassPtr, Sel, Sel) -> Id = msg();
         let sig = sig_for(
@@ -302,7 +267,6 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
         let ret_len: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
         assert_eq!(ret_len(sig, sel!(methodReturnLength)), 8);
 
-        // Now invoke through NSInvocation.
         autoreleasepool(|_| {
             let inv_with: unsafe extern "C-unwind" fn(ClassPtr, Sel, Id) -> Id = msg();
             let inv = inv_with(
@@ -333,12 +297,7 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
     }
 }
 
-// Registration under a race, and the fourteen-colon arity wall, declared AND
-// sent.
-
 declare_class! {
-    /// No methods at all, and a zero-sized ivar — the degenerate expansion,
-    /// registered first by the race below.
     struct Empty: NSObject {
         const NAME: &str = "ATermObjcEmptyProbe";
         type Ivars = ();
@@ -347,10 +306,6 @@ declare_class! {
 
 #[test]
 fn concurrent_first_registration_produces_one_class() {
-    // `class()` is a `OnceLock` around `objc_allocateClassPair` +
-    // `objc_registerClassPair`. Two threads racing it must not register two
-    // pairs — the second `objc_allocateClassPair` would return nil and `begin`
-    // would panic with "already registered".
     const N: usize = 8;
     let barrier = Arc::new(std::sync::Barrier::new(N));
     let handles: Vec<_> = (0..N)
@@ -368,13 +323,6 @@ fn concurrent_first_registration_produces_one_class() {
 }
 
 declare_class! {
-    /// FOURTEEN colons — 16 parameters counting `self` and `_cmd`, the new
-    /// ceiling of [`aterm_objc::MsgFn`]. A narrower `MsgFn` would let this
-    /// method register and dispatch from Objective-C while `msg()` refused to
-    /// build its prototype (`E0277`): reachable from the runtime, not from Rust.
-    ///
-    /// Note also that no `#[allow(clippy::too_many_arguments)]` appears at this
-    /// call site or at the top of this file: the macro emits it.
     struct Widest: NSObject {
         const NAME: &str = "ATermObjcFourteenColonProbe";
         type Ivars = ();
@@ -385,8 +333,6 @@ declare_class! {
             a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64,
             h: i64, i: i64, j: i64, k: i64, l: i64, m: i64, n: i64,
         ) -> i64 {
-            // Each argument is weighted by its POSITION, so a send that shifts
-            // by one register cannot produce this sum by accident.
             a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7
                 + h * 8 + i * 9 + j * 10 + k * 11 + l * 12 + m * 13 + n * 14
         }
@@ -396,8 +342,7 @@ declare_class! {
 #[test]
 fn a_fourteen_argument_method_is_sendable_from_rust_not_just_declarable() {
     let obj = Widest::alloc_init(mtm(), ()).expect("+alloc/-init");
-    // SAFETY: the exact declared prototype — 16 parameters, `self` and `_cmd`
-    // included — on a live instance of the class that declares it.
+    // SAFETY: exact declared 16-parameter prototype on a live instance.
     unsafe {
         #[rustfmt::skip]
         let f: unsafe extern "C-unwind" fn(
@@ -406,41 +351,26 @@ fn a_fourteen_argument_method_is_sendable_from_rust_not_just_declarable() {
             i64, i64, i64, i64, i64, i64, i64,
         ) -> i64 = msg();
         let s = sel!(a:b:c:d:e:f:g:h:i:j:k:l:m:n:);
-        // 1+2+…+14 = 105.
         assert_eq!(
             f(obj.as_id(), s, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
             105
         );
-        // Only the FIRST argument set: 1. A one-register shift would read
-        // `_cmd` here and give something else entirely.
         assert_eq!(
             f(obj.as_id(), s, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
             1
         );
-        // Only the LAST: 14. This is the argument that falls off the end of the
-        // register file on both ABIs, so it is the one a stack-slot mistake
-        // corrupts first.
         assert_eq!(
             f(obj.as_id(), s, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1),
             14
         );
     }
-    // The runtime agrees on the arity: fourteen `q`s after `@:`.
     assert_eq!(
         encoding_of(Widest::class(), c"a:b:c:d:e:f:g:h:i:j:k:l:m:n:"),
         "q@:qqqqqqqqqqqqqq"
     );
 }
 
-// One encoding letter per pointer-shaped runtime type. `Id`, `ClassPtr`,
-// `ProtocolPtr` and `Sel` are distinct types with their own `Encode` impls: a
-// shared `*mut c_void` alias would register KVO's `context:` as an object (`@`)
-// and `Class` as `@` where clang emits `#`. `*const c_void`, once encoded as
-// `:` (a selector), is `^v` too, and a block argument (`BlockPtr`) is `@?`.
-
 declare_class! {
-    /// One method per pointer-shaped type, so the four letters are read out of
-    /// the runtime side by side.
     struct Shapes: NSObject {
         const NAME: &str = "ATermObjcPointerShapesProbe";
         type Ivars = ();
@@ -470,9 +400,6 @@ declare_class! {
 
 #[test]
 fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
-    // The letters, from clang:
-    //   @encode(id) = @   @encode(Class) = #   @encode(Protocol *) = @
-    //   @encode(SEL) = :  @encode(void *) = ^v
     assert_eq!(<Id as Encode>::ENCODING, "@");
     assert_eq!(<ClassPtr as Encode>::ENCODING, "#");
     assert_eq!(<ProtocolPtr as Encode>::ENCODING, "@");
@@ -480,8 +407,6 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
     assert_eq!(<*mut c_void as Encode>::ENCODING, "^v");
     assert_eq!(<*const c_void as Encode>::ENCODING, "^v");
 
-    // What the runtime holds, which is what `NSMethodSignature`,
-    // `NSInvocation`, forwarding and accessibility read.
     let cls = Shapes::class();
     let b = Bool::ENCODING;
     assert_eq!(encoding_of(cls, c"takeObject:"), format!("{b}@:@"));
@@ -506,9 +431,6 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
         "`*const c_void` once encoded as `:`, a SELECTOR"
     );
 
-    // A block argument is `@?`, the string Foundation's own compiled
-    // `-[NSString enumerateLinesUsingBlock:]` carries — not the `^v` an opaque
-    // pointer gets.
     // SAFETY: `NSString` is a live, immortal Foundation class.
     let foundation = unsafe {
         aterm_objc::method_types(
@@ -520,11 +442,8 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
     assert_eq!(strip_method_offsets(&foundation), "v@:@?");
     assert_eq!(encoding_of(cls, c"takeBlock:"), "v@:@?");
 
-    // The dynamic half: send each one, so the prototypes are exercised and not
-    // merely written.
     let obj = Shapes::alloc_init(mtm(), ()).expect("+alloc/-init");
-    // SAFETY: each prototype below is exactly the declared method's signature,
-    // on a live instance of the class that declares it.
+    // SAFETY: each prototype below matches the declared method signature on a live instance.
     unsafe {
         let f_cls: unsafe extern "C-unwind" fn(Id, Sel, ClassPtr) -> Bool = msg();
         assert!(!f_cls(obj.as_id(), sel!(setDelegateClass:), Shapes::class()).as_bool());
@@ -538,21 +457,12 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
     }
 }
 
-// `BOOL *` as Foundation compiled it.
-
-/// `BOOL *`'s encoding, asked of the runtime: argument 3 of
-/// `-[NSFileManager fileExistsAtPath:isDirectory:]` is its `BOOL *isDirectory`,
-/// encoded by clang when Apple built Foundation (`c32@0:8@16^c24` on x86_64).
-/// A pin against a typed literal stays green when the constant and the literal
-/// are wrong together; this one cannot.
 #[test]
 fn bool_ptr_encodes_what_foundation_compiled_for_its_bool_out_parameter() {
     let cls = aterm_objc::class(c"NSFileManager");
     assert!(!cls.is_null(), "Foundation's NSFileManager is registered");
     let name = c"fileExistsAtPath:isDirectory:";
     // SAFETY: side-effect-free runtime queries on a registered class.
-    // `method_copyArgumentType` answers a `malloc`ed copy (null past the last
-    // argument), which is read and then freed exactly once.
     let arg3 = unsafe {
         let m = class_getInstanceMethod(cls, sel_uncached(name));
         assert!(!m.is_null(), "{name:?} is a method of NSFileManager");

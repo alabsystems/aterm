@@ -487,8 +487,8 @@ pub fn elect_mac<'r>(
     Err(Refused::NothingInstallable)
 }
 
-/// The appcast a release's Linux executable is proved by: its current one, or a unique
-/// tag-bound archived pair.
+/// The appcast a release's Linux executable is proved by: its current one, or a tag-bound archived
+/// pair.
 #[must_use]
 pub fn linux_appcast_name(r: &Release) -> Option<String> {
     if r.lists("aterm-appcast.toml") {

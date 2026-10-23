@@ -173,7 +173,10 @@ pub(crate) fn until_reread(
     }
 }
 
-/// Set (or, with no value, remove) `key` in the scratch settings' env block of a lab whose Claude.
+/// Set (or, with no value, remove) `key` in the scratch settings' env block
+/// of a lab whose Claude Code is running, and return once Claude Code
+/// re-read the file ([`until_reread`] on the witness's log), written again
+/// every [`REWRITE_EVERY`] and given up [`HANG`] after the first write.
 /// # Errors
 /// The settings could not be written.
 pub fn set_env_reread(run: &Run, key: &str, value: Option<&str>) -> Result<Reread, Fail> {

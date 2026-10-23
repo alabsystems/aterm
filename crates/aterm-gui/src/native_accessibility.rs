@@ -10,9 +10,6 @@
 
 use std::ops::Range;
 
-// FxHash: the per-frame side tables below are keyed by internal `UiKey`s and self-derived
-// ids, never untrusted input, and rebuilt every frame. No map is iterated, so node ids and
-// tree order do not depend on the hasher.
 use aterm_hash::{FxHashMap, FxHashSet};
 
 use aterm_a11y::model::{
@@ -31,24 +28,15 @@ use crate::tab_model::ViewId;
 pub(crate) const MAX_VIRTUAL_TEXT_RANGE: u64 = 1024 * 1024;
 
 /// Deterministically derive an accessibility node identity from a stable semantic key.
-///
-/// FNV-1a is used only as a stable identifier projection, never as a security primitive.
-/// A collision inside one projected tree is detected and fails the whole projection.
 #[cfg(test)]
 pub(crate) fn stable_node_id(key: &UiKey) -> NodeId {
     let mut hash = aterm_hash::Fnv1a64::new();
     hash.write(b"aterm/native-a11y/v1\0");
     hash.write(key.as_str().as_bytes());
-    // NodeId(0) is the root id of the non-native trees (`accesskit_tree`, palette, conn
-    // card); no native key maps to it.
     NodeId(hash.finish().max(1))
 }
 
 /// Deterministically namespace a semantic identity by its stable native view.
-///
-/// Native split siblings may render the same app (and so the same `UiKey`s). A
-/// view-qualified id keeps those trees independently actionable without making sibling
-/// order or focus part of identity.
 pub(crate) fn stable_node_id_for_view(view: ViewId, key: &UiKey) -> NodeId {
     let mut hash = aterm_hash::Fnv1a64::new();
     hash.write(b"aterm/native-a11y/view/v1\0");
@@ -70,7 +58,7 @@ pub(crate) struct AccessibilityOwner {
 }
 
 impl AccessibilityOwner {
-    fn context(self) -> ActionContext {
+    const fn context(self) -> ActionContext {
         ActionContext::native_review(self.view.get(), self.generation, self.review_revision)
     }
 }
@@ -92,8 +80,7 @@ impl AccessibilityRoute {
     }
 }
 
-/// One virtual text surface. The host resolves ranges against `document_key`; the adapter
-/// deliberately does not materialize document lines as accessibility nodes.
+/// One virtual text surface resolved against `document_key`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct VirtualTextTarget {
     pub(crate) node: NodeId,
@@ -101,8 +88,6 @@ pub(crate) struct VirtualTextTarget {
     pub(crate) document_key: String,
     pub(crate) visible_bounds: LogicalRect,
     /// Smallest canonical UTF-8 byte interval covering the projected rows.
-    /// Individual line ranges below remain authoritative when a pathological
-    /// long line was windowed and therefore leaves a gap in this envelope.
     pub(crate) visible_range: Range<u64>,
     pub(crate) lines: Vec<VirtualTextLine>,
     pub(crate) primary_selection: Option<VirtualTextSelection>,
@@ -267,13 +252,10 @@ pub(crate) struct StagedNativeAccessibility {
 }
 
 impl StagedNativeAccessibility {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         owners: Vec<AccessibilityOwner>,
         projection: NativeAccessibilityProjection,
     ) -> Self {
-        // `compose_native_accessibility` appends its host Window root last.
-        // Retain that O(1) slot and revalidate both id and label at publish;
-        // malformed or differently-built projections fail closed.
         let window_root_index = projection.update.nodes.len().saturating_sub(1);
         Self {
             owners,
@@ -282,10 +264,7 @@ impl StagedNativeAccessibility {
         }
     }
 
-    /// A staged composite is reusable only while every piece of its published
-    /// identity is still current. The view generations protect action routes;
-    /// the root label protects the window name, which `apply_title` may advance
-    /// after native paint stages this projection but before the frame publishes.
+    /// Returns whether the staged composite still matches the active owners and window title.
     pub(crate) fn matches(&self, owners: &[AccessibilityOwner], window_title: &str) -> bool {
         let root = self.projection.update.tree.as_ref().map(|tree| tree.root);
         self.owners.as_slice() == owners
@@ -301,7 +280,7 @@ impl StagedNativeAccessibility {
     }
 }
 
-fn normalized_window_title(title: &str) -> &str {
+const fn normalized_window_title(title: &str) -> &str {
     if title.is_empty() { "aterm" } else { title }
 }
 
@@ -369,7 +348,7 @@ impl PublishedNativeAccessibility {
         }
     }
 
-    pub(crate) fn composite(
+    pub(crate) const fn composite(
         primary: AccessibilityOwner,
         owners: Vec<AccessibilityOwner>,
         routes: Vec<AccessibilityRoute>,
@@ -751,8 +730,6 @@ fn materialize_visible_text(
         }
     }
 
-    // The editor modeline, including live config diagnostics, is a polite live region,
-    // not only footer pixels.
     if let Some(status) = spec
         .semantic_status
         .as_deref()
@@ -768,7 +745,6 @@ fn materialize_visible_text(
             });
         }
         let mut status_node = Node::new(Role::Status);
-        // The status itself is the name ([`announce_live`]); the caption is the description.
         status_node.set_description("Editor status");
         announce_live(&mut status_node, Live::Polite, status);
         status_node.set_bounds(Rect {
@@ -847,9 +823,6 @@ fn text_position_for_source(lines: &[VirtualTextLine], source_byte: u64) -> Opti
 }
 
 /// Project native semantics using stable [`UiKey`] identities.
-///
-/// `focused` is the host's authoritative content focus. When omitted, exactly zero or one
-/// `ControlState::focused` flag is accepted; zero falls back to the semantic root.
 #[cfg(test)]
 pub(crate) fn project_native_accessibility(
     compiled: &CompiledUi,
@@ -858,9 +831,7 @@ pub(crate) fn project_native_accessibility(
     project_with_ids(compiled, focused, stable_node_id)
 }
 
-/// Project logical native coordinates into the physical-pixel window coordinates the model
-/// requires. The root transform is the only host-owned geometry added to the canonical tree;
-/// every descendant bound still comes verbatim from [`CompiledUi::semantics`].
+/// Project logical native coordinates into physical-pixel window coordinates.
 #[cfg(test)]
 pub(crate) fn project_native_accessibility_in_container(
     compiled: &CompiledUi,
@@ -876,8 +847,7 @@ pub(crate) fn project_native_accessibility_in_container(
     project_with_transform_and_ids(compiled, focused, Some(transform), stable_node_id)
 }
 
-/// Project one visible native leaf into window coordinates with identities and
-/// action routes qualified by the leaf's stable lifecycle owner.
+/// Project one visible native leaf into window coordinates qualified by `owner`.
 pub(crate) fn project_native_accessibility_for_view_in_container(
     compiled: &CompiledUi,
     focused: Option<&UiKey>,
@@ -905,11 +875,6 @@ pub(crate) fn project_native_accessibility_for_view_in_container(
 }
 
 /// Publish all visible native split leaves as one accessibility window tree.
-///
-/// Each child projection has already consumed the exact host transform used by
-/// its presented raster.  This function only adds a stable `Role::Window` root,
-/// checks cross-leaf identity uniqueness, and selects the focused native leaf's
-/// existing focus node (or the window root while a terminal sibling is focused).
 pub(crate) fn compose_native_accessibility(
     projections: Vec<(AccessibilityOwner, NativeAccessibilityProjection)>,
     focused_native: Option<ViewId>,
@@ -969,10 +934,6 @@ pub(crate) fn compose_native_accessibility(
     }
 
     let mut window = Node::new(Role::Window);
-    // The window's own title, exactly as `a11y_tree::grid_tree` names the terminal
-    // window: the root's name is what every assistive client calls the WINDOW, so a user
-    // moving between windows must not hear "aterm" for all of them — and it must not
-    // change meaning merely because the front tab is a native app rather than a shell.
     window.set_label(normalized_window_title(window_title));
     window.set_bounds(window_bounds);
     window.set_children(child_roots);
@@ -1042,7 +1003,6 @@ fn project_with_transform_and_ids(
     let mut state_focus = None;
     let mut state_focus_ambiguous = false;
 
-    // This is the sole traversal of the canonical semantic source.
     for semantic in &compiled.semantics {
         if by_key.contains_key(&semantic.key) {
             return Err(AccessibilityProjectionError::DuplicateKey(
@@ -1211,8 +1171,6 @@ fn project_with_transform_and_ids(
         state_focus.unwrap_or(root)
     };
 
-    // Materialize model nodes from the one-pass intermediate. This does not revisit the
-    // semantic source or app tree.
     let nodes = pending
         .into_iter()
         .map(|mut pending| {
@@ -1244,7 +1202,6 @@ fn lower_node(
         node.set_label(semantic.label.clone());
     }
 
-    // A control's description is what a reader says after the name, never folded into it.
     if let Some(description) = &semantic.description {
         node.set_description(description.clone());
     }
@@ -1259,9 +1216,6 @@ fn lower_node(
         node.set_read_only();
     }
     if semantic.role == SemanticRole::Status {
-        // A `Status` semantic carries its sentence in the label (`UiContent::Text` and
-        // `UiContent::Group` both project it there) and usually has no value, which is
-        // silent on macOS.
         let announced = node
             .value()
             .map(str::to_string)
@@ -1271,8 +1225,6 @@ fn lower_node(
     if enabled {
         lower_actions(&mut node, semantic, focusable);
     }
-    // A list's row off its screen: in the tree, not showing, owning no
-    // point; a reader scrolls it into view.
     if semantic.offscreen {
         node.set_offscreen();
         node.add_action(Action::ScrollIntoView);
@@ -1280,28 +1232,14 @@ fn lower_node(
     Ok(node)
 }
 
-/// Mark `node` a live region that speaks `announced` on every platform.
-///
-/// Platforms read different halves, so the string goes in both the name and the value:
-///
-/// * AT-SPI (`aterm_a11y::atspi`, after accesskit_atspi_common) emits an `Announcement`
-///   carrying the node's NAME, and only when the name CHANGES (or the node is newly
-///   added). A live region whose name is a constant caption therefore speaks that
-///   caption once and never says anything again, however often its value moves.
-/// * UIA (as AccessKit's accesskit_windows did) raises `UIA_LiveRegionChangedEventId`
-///   under the same name-changed condition, and the screen reader then reads the name.
-/// * NSAccessibility (as AccessKit's accesskit_macos did) does the opposite: it
-///   announces the node's VALUE, and raises nothing at all when the node has no value.
-///
-/// A fixed caption belongs in the `description`: a property change on every platform,
-/// never an announcement.
+/// Mark `node` a live region that speaks `announced` on every platform (setting both label and value).
 fn announce_live(node: &mut Node, politeness: Live, announced: &str) {
     node.set_label(announced.to_string());
     node.set_value(announced.to_string());
     node.set_live(politeness);
 }
 
-fn lower_role(role: SemanticRole) -> Role {
+const fn lower_role(role: SemanticRole) -> Role {
     match role {
         SemanticRole::Application => Role::Application,
         SemanticRole::Group => Role::Group,
@@ -1325,8 +1263,6 @@ fn lower_state(node: &mut Node, role: SemanticRole, state: ControlState) {
     if !state.enabled {
         node.set_disabled();
     }
-    // An option says whether it is selected either way: AT-SPI exposes only
-    // an option that says so as selectable, and selects only those.
     if state.selected || role == SemanticRole::ListBoxOption {
         node.set_selected(state.selected);
     }
@@ -1347,8 +1283,6 @@ fn lower_value(
 ) -> Result<(), AccessibilityProjectionError> {
     match &semantic.value {
         SemanticValue::None => {}
-        // For a virtual viewport this string is a provider identity, not user-authored text.
-        // Keep it in the sidecar target and never announce it as the document value.
         SemanticValue::Text(_) if semantic.role == SemanticRole::TextViewport => {}
         SemanticValue::Text(value) => node.set_value(value.clone()),
         SemanticValue::Bool(value) => {
@@ -1374,8 +1308,6 @@ fn lower_value(
             node.set_numeric_value(*value);
             node.set_min_numeric_value(*minimum);
             node.set_max_numeric_value(*maximum);
-            // The words the control paints for its value ("12 px"), else
-            // the number.
             node.set_value(
                 semantic
                     .value_text
@@ -1387,7 +1319,7 @@ fn lower_value(
     Ok(())
 }
 
-fn lower_actions(node: &mut Node, semantic: &SemanticNode, focusable: bool) {
+const fn lower_actions(node: &mut Node, semantic: &SemanticNode, focusable: bool) {
     if focusable {
         node.add_action(Action::Focus);
     }
@@ -1664,8 +1596,6 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].live(), Some(Live::Polite));
         assert_eq!(statuses[0].label(), Some(COMPLETE));
-        // The complete sentence, not the visual truncation, in the value as well as the
-        // name ([`announce_live`]).
         assert_eq!(statuses[0].value(), Some(COMPLETE));
         assert!(statuses[0].children().is_empty());
         assert!(
@@ -1773,7 +1703,6 @@ mod tests {
 
         let font = node(&projection, "font");
         assert_eq!(font.numeric_value(), Some(14.0));
-        // The value says the words the slider paints, its unit with it.
         assert_eq!(font.value(), Some("14 px"));
         assert_eq!(font.min_numeric_value(), Some(6.0));
         assert_eq!(font.max_numeric_value(), Some(32.0));
@@ -1803,9 +1732,6 @@ mod tests {
         assert_eq!(node(&projection, "status").live(), Some(Live::Polite));
     }
 
-    /// A row its list holds off screen lowers as off screen (in the tree,
-    /// not showing) and takes a reader's "scroll into view", which routes to
-    /// its key. Negative control: a row on screen is neither.
     #[test]
     fn an_offscreen_row_lowers_off_screen_and_scrolls_into_view() {
         let row = |key: &str| {
@@ -1859,9 +1785,6 @@ mod tests {
         );
     }
 
-    /// A list box and its options lower to the platform's own roles: the
-    /// box scrolls, each option is pressed and focused, and the highlighted
-    /// one is selected.
     #[test]
     fn list_box_and_its_options_lower_to_their_roles() {
         let option = |key: &str, selected: bool| {
@@ -1920,8 +1843,6 @@ mod tests {
         let day = node(&projection, "day");
         assert_eq!(day.role(), Role::ListBoxOption);
         assert_eq!(day.is_selected(), Some(false), "selectable, not selected");
-        // Negative control: a button with no role override stays a button,
-        // and says nothing about selection.
         assert_eq!(node(&projection, "plain").role(), Role::Button);
         assert_eq!(node(&projection, "plain").is_selected(), None);
     }
@@ -2154,7 +2075,6 @@ mod tests {
             .find(|(id, _)| *id == window_root)
             .unwrap();
         assert_eq!(window.1.role(), Role::Window);
-        // Named what the titlebar names it, as on the terminal branch.
         assert_eq!(window.1.label(), Some("Settings \u{2014} aterm"));
         assert_eq!(window.1.children(), [first_root, second_root]);
         assert_eq!(
@@ -2321,8 +2241,6 @@ mod tests {
             status.value(),
             Some("Config error · Ln 7, Col 3 · complete diagnostic message")
         );
-        // The diagnostic is the name too (AT-SPI and UIA announce the name); the fixed
-        // caption is the description.
         assert_eq!(
             status.label(),
             Some("Config error · Ln 7, Col 3 · complete diagnostic message")

@@ -37,8 +37,6 @@ fn every_measured_login_screen_is_read_as_its_state() {
     for text in [LOGIN_OPENING, LOGIN_HANDOFF] {
         assert_eq!(login_screen(&screen(text)), Some(LoginScreen::Browser));
     }
-    // The first three seconds draw no URL and no paste field: the hand-off is
-    // read by its opening row alone.
     for id in ["login.no_browser", "login.paste"] {
         assert!(!LOGIN_OPENING.contains(crate::anchors::anchor(id)), "{id}");
     }
@@ -68,13 +66,6 @@ fn esc_out_of_the_dialog_is_read_as_the_login_interrupted() {
     }
 }
 
-/// The `/login` a dialog or its `Login interrupted` hangs from is read as
-/// typed at a lost login where the wall's row stands right above it — the
-/// hand-off, the picker, an error, the success state, an Esc out of it, and
-/// a second loss's dialog under an earlier `/login` left — and with the
-/// `/login`s left at the same wall before it said. NEGATIVE CONTROLS: the
-/// same dialogs and interrupt typed after a person's own Esc (no lost login
-/// above them), and screens with neither.
 #[test]
 fn a_login_typed_at_a_lost_login_is_read_as_the_walls() {
     let at_wall = |rows: &[String]| login_at_wall(rows);
@@ -90,8 +81,6 @@ fn a_login_typed_at_a_lost_login_is_read_as_the_walls() {
         assert!(got.message.contains("Not logged in"), "{got:?}");
         assert!(!got.left_before, "{text}");
     }
-    // Esc out of the hand-off at the wall, then a person's own `/login`
-    // after it: both are the wall's, the second after one left.
     let handoff = screen(LOGIN_HANDOFF);
     let typed = handoff
         .iter()
@@ -118,7 +107,6 @@ fn a_login_typed_at_a_lost_login_is_read_as_the_walls() {
     again.push(String::new());
     again.extend(handoff[typed..].iter().cloned());
     assert_eq!(at_wall(&again).map(|w| w.left_before), Some(true));
-    // NEGATIVE CONTROLS.
     for text in [
         LOGIN_INTERRUPTED,
         LOGIN_PICKER,

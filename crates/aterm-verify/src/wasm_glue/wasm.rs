@@ -48,13 +48,11 @@ pub(crate) struct Export {
     pub(crate) index: u32,
 }
 
-/// One top-level section: its id and the payload's byte range.
 #[derive(Clone, Debug)]
 struct Section {
     id: u8,
     start: usize,
     end: usize,
-    /// A custom section's name.
     name: Option<String>,
 }
 

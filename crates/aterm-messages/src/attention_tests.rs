@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The attention and motion invariants of design §10.12: the reveal (E2), the
-//! record's retirement (E4), the excerpt flag (E1), the live indicator, the
-//! echoes, the load words, the motion epoch, and the motion layer's purity,
-//! bounds, forms and deadlines.
+//! Tests for attention and motion invariants.
 
 use crate::animate::{Anim, Look, Pace, Tone};
 use crate::center::{EchoKind, MessageCenter, Outcome};
@@ -40,7 +37,6 @@ fn warn(title: &str) -> Message {
     Message::new(tags::CONFIG, Severity::Warn, title)
 }
 
-/// A live download row: determinate, with an amount.
 fn download(done: u64) -> Message {
     let total = 74_000_000;
     Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.92.0")
@@ -62,7 +58,6 @@ fn download(done: u64) -> Message {
         .key("update.progress")
 }
 
-/// A live indeterminate row (the comet).
 fn busy(title: &str) -> Message {
     Message::new(tags::PACKAGES, Severity::Info, title)
         .in_flight()
@@ -78,8 +73,6 @@ fn present(c: &MessageCenter, cols: usize) -> Presentation {
 fn kinds(p: &Presentation) -> Vec<RowKind> {
     p.rows.iter().map(|r| r.kind).collect()
 }
-
-// ---- attention (E1–E5) --------------------------------------------------------
 
 #[test]
 fn a_row_with_reveal_after_is_not_eligible_until_its_grace() {
@@ -127,7 +120,6 @@ fn a_supersede_keeps_the_earlier_reveal() {
     );
     c.settle(now + PROGRESS_GRACE, true);
     assert!(c.live(second).unwrap().revealed);
-    // A revealed row stays revealed through a supersede with a grace.
     let third = c
         .post(
             download(2).reveal_after(PROGRESS_GRACE),
@@ -160,8 +152,6 @@ fn a_row_resolved_inside_its_grace_never_regrids_and_leaves_no_echo() {
 #[test]
 fn an_unrevealed_row_moves_neither_the_overflow_row_nor_the_plus_count() {
     let now = t0();
-    // Three rows fill a three-row band; an unrevealed fourth must not call
-    // the overflow row up.
     let mut c = fresh(now);
     let ids: Vec<MessageId> = (0..3)
         .map(|i| {
@@ -177,7 +167,6 @@ fn an_unrevealed_row_moves_neither_the_overflow_row_nor_the_plus_count() {
     assert_eq!(c.fingerprint(80), fp);
     assert_eq!(c.queued(), 0);
     assert_eq!(c.on_glass().map(|l| l.id).collect::<Vec<_>>(), ids);
-    // At one row, no `+1 ›` for a row nobody may see yet.
     let mut one = fresh(now);
     one.post(warn("w").hold(Hold::STANDING), stamp(), now);
     one.commit_rows(now, 1);
@@ -192,7 +181,6 @@ fn an_unrevealed_row_moves_neither_the_overflow_row_nor_the_plus_count() {
         before.rows[0].capsules.last().unwrap().text,
         "Details \u{203a}"
     );
-    // Once revealed, it counts.
     one.settle(now + PROGRESS_GRACE, true);
     assert_eq!(
         present(&one, 80).rows[0].capsules.last().unwrap().text,
@@ -270,14 +258,11 @@ fn a_record_retires_recorded() {
         "spelled as the fold an older build wrote: {enc}"
     );
     assert_eq!(&LogLine::decode(&enc).unwrap(), retired, "round trip");
-    // An older reader ignores the key it does not know: without `rec=1`
-    // the line reads as a fold.
     let older = enc.replace("\trec=1", "");
     match LogLine::decode(&older).unwrap() {
         LogLine::Retired { how, .. } => assert_eq!(how, Retired::Folded),
         other => panic!("{other:?}"),
     }
-    // A replay of the file keeps it a record.
     let mut log = MessageLog::empty();
     for line in &lines {
         log.replay(line.clone());
@@ -286,7 +271,6 @@ fn a_record_retires_recorded() {
         log.get(id).unwrap().state,
         LogState::Retired(Retired::Recorded)
     );
-    // A restate to LogOnly of a row that was on the glass stays a fold.
     let row = c.post(warn("on glass"), stamp(), now).id;
     c.commit_rows(now, 3);
     c.restate(
@@ -325,7 +309,6 @@ fn no_excerpt_rows_lay_out_and_speak_without_detail0() {
         vec!["crash log at /x/crash.log".to_string()],
         "the line still rides Details and the log"
     );
-    // The flag restates like any word, and the fingerprint follows.
     let before = c.fingerprint(160);
     c.restate(
         id,
@@ -353,25 +336,17 @@ fn a_carried_row_keeps_its_excerpt_flag() {
     child.seed_carried(&carry, stamp(), now);
     assert!(!child.live(id).unwrap().msg.excerpt);
     assert_eq!(present(&child, 160).rows[0].detail, None);
-    // An unrevealed row is not carried.
     let mut parent = fresh(now);
     parent.post(download(1).reveal_after(PROGRESS_GRACE), stamp(), now);
     assert!(parent.carried().live.is_empty());
 }
 
-/// The indicator is the meter's state, never invented from the hold. A Live
-/// row with neither a fill nor `busy` (blocked on the person) is still: no
-/// meter, track, motion or echo. A row that declares `busy` (`in_flight()`)
-/// sweeps the comet; a restate clearing the meter stills it; the carry keeps
-/// `busy`, so a carried busy row with no fill and no stats keeps its track.
 #[test]
 fn the_indicator_is_the_meters_state_never_the_holds() {
     let now = t0();
     let mut c = fresh(now);
     let blocked = c
         .post(
-            // Info: a blocked Live row at Warn is a record
-            // (`door_tests::a_blocked_live_row_at_warn_is_a_record_and_work_needs_its_indicator`).
             Message::new(tags::UPDATE, Severity::Info, "Close the editor to finish").hold(
                 Hold::Live {
                     stale_after: STALE_UPDATE,
@@ -403,7 +378,6 @@ fn the_indicator_is_the_meters_state_never_the_holds() {
         crate::animate::RowMotion::default()
     );
     assert!(matches!(m.rows[row_of(&p, id)].anim, Anim::Comet { .. }));
-    // Restate: clearing the meter stills the row.
     let other = c.post(busy("other"), stamp(), now).id;
     c.restate(
         other,
@@ -414,7 +388,6 @@ fn the_indicator_is_the_meters_state_never_the_holds() {
         now,
     );
     assert!(!c.live(other).unwrap().is_animated());
-    // Seed: a carried busy row with no fill and no stats keeps its track.
     let carry = c.carried();
     let mut child = fresh(now);
     child.seed_carried(&carry, stamp(), now);
@@ -425,13 +398,6 @@ fn the_indicator_is_the_meters_state_never_the_holds() {
     assert_eq!(p.rows[row_of(&p, id)].track, Some((0, 120)));
 }
 
-// ---- the center's motion state ---------------------------------------------
-
-/// A row posted heavy shows its load words from the first frame (a later latch
-/// would re-lay the row mid-animation), and its layout reserves one slot for
-/// them for life: a resource change swaps the words at once, the load ending
-/// takes them, a load declared after none waits [`LOAD_AFTER`], and none of it
-/// moves the meter or anything after it.
 #[test]
 fn load_words_show_at_post_and_their_slot_never_moves() {
     let now = t0();
@@ -513,9 +479,6 @@ fn load_words_show_at_post_and_their_slot_never_moves() {
     assert_eq!(unmoved(&c, "the latch"), Some("disk busy"));
 }
 
-/// The load slot is sized to the row's declared loads: `[Cpu]` reserves
-/// `CPU busy`'s cells for the row's life, a load outside the declaration widens
-/// it once, and an undeclared row reserves every load's width.
 #[test]
 fn the_load_slot_is_reserved_for_the_declared_loads() {
     let now = t0();
@@ -564,7 +527,6 @@ fn the_load_slot_is_reserved_for_the_declared_loads() {
         "a load outside the declaration widens it once"
     );
     assert_eq!(slot(&c), Some("network busy".chars().count()));
-    // Undeclared: every load's width.
     let mut u = fresh(now);
     let other = u.post(row(&[]), stamp(), now).id;
     u.commit_rows(now, 3);
@@ -627,17 +589,12 @@ fn a_resolved_live_row_echoes_in_its_slot_then_frees_it() {
         "then it moves up"
     );
     assert_eq!(c.glass_position(z), Some(1));
-    // Resolved Warn is a Fault; withdrawn is a fade.
     assert!(c.resolve(z, Outcome::Warn, until));
     assert_eq!(c.echoes()[0].kind, EchoKind::Fault);
     assert!(c.withdraw(a, until));
     assert!(c.echoes().iter().any(|e| e.kind == EchoKind::Vanish));
 }
 
-/// A Fault echo says it failed for its whole life: ⚠ in the glyph cell and
-/// `failed` in the row's time slot (ETA for a bar, elapsed for a comet). A
-/// Complete echo says nothing there under its ✓, and a Vanish says neither.
-/// The slots are the row's own: nothing re-grids.
 #[test]
 fn a_fault_echo_wears_the_warn_glyph_and_says_failed() {
     for (look, name) in [(Look::MOVING, "moving"), (Look::STILL, "still")] {
@@ -671,9 +628,6 @@ fn a_fault_echo_wears_the_warn_glyph_and_says_failed() {
             assert_eq!(m.rows[1].readout.as_deref(), Some("failed"), "{name}@{k}");
         }
     }
-    // A Complete echo wears ✓ beside its finished words and says nothing in
-    // its time slots or its percent, in every look; its capsules keep their
-    // cells, blank.
     for look in [Look::MOVING, Look::STILL] {
         let now = t0();
         let mut c = fresh(now);
@@ -702,7 +656,6 @@ fn a_fault_echo_wears_the_warn_glyph_and_says_failed() {
             "an echo's capsules draw nothing"
         );
     }
-    // A Vanish says neither word: the comet's slot keeps its frozen clock.
     let now = t0();
     let mut c = fresh(now);
     let dl = c.post(download(30_000_000), stamp(), now).id;
@@ -720,7 +673,6 @@ fn a_fault_echo_wears_the_warn_glyph_and_says_failed() {
 #[test]
 fn echoes_never_change_the_row_count() {
     let now = t0();
-    // The same script with a live row (it echoes) and a held one (no echo).
     let run = |row: Message, echoes: usize| -> Vec<Option<u16>> {
         let mut c = fresh(now);
         let id = c.post(row, stamp(), now).id;
@@ -741,16 +693,10 @@ fn echoes_never_change_the_row_count() {
     };
     let held = run(warn("held"), 0);
     assert_eq!(held[31], Some(1), "the held run shrinks at step 30 (+1510)");
-    // A bar at 70 %: its Complete echo (a 390 ms glide, the sweep and the
-    // fade, 1440 ms) fits inside the quiet — the held row's timeline exactly.
     assert_eq!(run(download(51_800_000), 1), held);
-    // A busy row's Complete echo runs 1650 ms (the longest glide), past the
-    // 1500 ms quiet: the quiet shrink waits it out, so the same counts in the
-    // same order, the shrink at the first step past the echo's end (+1660).
     let mut late = held.clone();
     late.swap(31, 34);
     assert_eq!(run(busy("work"), 1), late);
-    // The window's own shrink drops an echo past the new count.
     let mut c = fresh(now);
     c.post(warn("top").hold(Hold::STANDING), stamp(), now);
     let id = c.post(busy("work"), stamp(), now).id;
@@ -799,8 +745,6 @@ fn only_live_revealed_rows_on_glass_echo() {
         assert!(c.resolve(id, Outcome::Ok, now + ms(5)));
         assert!(c.echoes().is_empty(), "{id}: no echo");
     }
-    // A queued busy row and an unrevealed one, behind a single row's `+N ›`
-    // (two rows or more keep a row for live progress).
     let mut c = fresh(now);
     let on_glass = c
         .post(warn("held").hold(Hold::For(HOLD_WARN)), stamp(), now)
@@ -811,8 +755,6 @@ fn only_live_revealed_rows_on_glass_echo() {
         .post(busy("hidden").reveal_after(PROGRESS_GRACE), stamp(), now)
         .id;
     assert!(c.live(queued).unwrap().is_queued());
-    // The queued and unrevealed rows first: a resolve above would promote
-    // the queued one onto the glass.
     for id in [queued, hidden, on_glass] {
         assert!(c.resolve(id, Outcome::Ok, now + ms(5)));
         assert!(c.echoes().is_empty(), "{id}: no echo");
@@ -827,8 +769,6 @@ fn a_change_of_activity_restarts_the_motion_epoch() {
     let id = c.post(staged, stamp(), now).id;
     c.commit_rows(now, 3);
     assert_eq!(c.live(id).unwrap().motion_since, Some(now));
-    // The held staged row restated live in place: a new epoch, so the
-    // comet enters at the left, not mid-sweep.
     let later = now + ms(5000);
     c.restate(
         id,
@@ -843,7 +783,6 @@ fn a_change_of_activity_restarts_the_motion_epoch() {
     );
     assert_eq!(c.live(id).unwrap().activity(), 2);
     assert_eq!(c.live(id).unwrap().motion_since, Some(later));
-    // A restate that keeps the activity keeps the epoch.
     c.restate(
         id,
         Restatement {
@@ -853,7 +792,6 @@ fn a_change_of_activity_restarts_the_motion_epoch() {
         later + ms(100),
     );
     assert_eq!(c.live(id).unwrap().motion_since, Some(later));
-    // A supersede from determinate to indeterminate restarts it too.
     let dl = c.post(download(1), stamp(), later + ms(200)).id;
     let epoch = c.live(dl).unwrap().motion_since;
     let verifying = busy("Verifying aterm v0.92.0").key("update.progress");
@@ -862,8 +800,6 @@ fn a_change_of_activity_restarts_the_motion_epoch() {
     assert_eq!(c.live(v).unwrap().motion_since, Some(later + ms(900)));
 }
 
-/// A row released and re-placed while the band grows (a third row revealed
-/// into a two-row band) keeps its motion epoch: its comet never restarts.
 #[test]
 fn a_row_the_band_grows_past_keeps_its_motion_epoch() {
     let now = t0();
@@ -892,10 +828,6 @@ fn a_row_the_band_grows_past_keeps_its_motion_epoch() {
     );
 }
 
-// ---- the motion layer -----------------------------------------------------------
-
-/// A center with a comet row, a determinate row mid-glide and an echo, on
-/// a 120-column band.
 fn scene(now: Instant) -> (MessageCenter, Presentation) {
     let mut c = fresh(now);
     c.post(busy("Installing Homebrew"), stamp(), now);
@@ -925,8 +857,6 @@ fn motion_is_a_pure_function_of_the_frame_instant() {
         let a = c.motion(&p, t, Look::MOVING);
         assert_eq!(a, c2.motion(&p2, t, Look::MOVING), "same state, same frame");
         let q = c.frame_instant(t);
-        // The frame's instant: the grid's, or the display's own while a
-        // glide or an echo is in flight.
         let fine = c.fine_instant(t).max(q);
         assert!(a.at == q || a.at == fine, "{k}");
         assert_eq!(
@@ -945,9 +875,6 @@ fn motion_is_a_pure_function_of_the_frame_instant() {
     }
 }
 
-/// The comet's head moves forward on every frame and never back, by at most a
-/// sixtieth of the row per frame; at 80, 120 and 200 columns the rightmost lit
-/// cell never jumps back and never skips more than the head moved.
 #[test]
 fn the_comet_head_moves_forward_calmly_on_every_frame() {
     let mut prev: Option<i64> = None;
@@ -987,9 +914,6 @@ fn the_comet_head_moves_forward_calmly_on_every_frame() {
     }
 }
 
-/// The comet never leaves the row empty (an empty track reads as 0 % or
-/// stalled): only a crossing's hand-over frame can be dark, and it asks a frame
-/// on every grid step. The glyph cell keeps the row's own glyph, no spinner.
 #[test]
 fn the_comet_never_leaves_the_row_empty_and_never_rests() {
     for cols in [40usize, 80, 120, 200] {
@@ -1026,7 +950,6 @@ fn the_comet_never_leaves_the_row_empty_and_never_rests() {
         let d = c.motion_deadline(&p, at, Look::MOVING).unwrap();
         assert_eq!(d, c.frame_instant(at) + ANIM_FRAME, "{k}: the next frame");
     }
-    // Still: the unlit track and the row's own glyph.
     let m = c.motion(&p, now + ms(500), Look::STILL);
     assert_eq!((m.rows[0].anim, m.rows[0].glyph), (Anim::Track, None));
     assert!(
@@ -1051,7 +974,6 @@ fn the_glint_never_lifts_the_track() {
             }
         }
     }
-    // It does lift the fill somewhere mid-travel.
     let lifted = (0..48u64).any(|k| {
         crate::animate::bar(620, Some(ANIM_FRAME * u32::try_from(k).unwrap()), true)
             .stops
@@ -1065,8 +987,6 @@ fn the_glint_never_lifts_the_track() {
 fn still_forms_have_no_time_dependence() {
     let now = t0();
     let (c, p) = scene(now);
-    // Seven seconds apart, both before the bytes stall: the still surfaces
-    // are identical (a stall changes the bar's tone once, below).
     let a = c.motion(&p, now + ms(2000), Look::STILL);
     let b = c.motion(&p, now + ms(9000), Look::STILL);
     for (x, y) in a.rows.iter().zip(&b.rows) {
@@ -1084,8 +1004,6 @@ fn still_forms_have_no_time_dependence() {
         "an hour without bytes: the still bar wears the stalled tone"
     );
     assert_eq!(a.rows[0].anim, Anim::Track);
-    // The deadline is text only, and a hidden estimate's blank slot asks none:
-    // the next change is the busy row's elapsed words or the stall onset.
     let at = now + ms(2500);
     let slot = |t: Instant| c.motion(&p, t, Look::STILL).rows[1].eta.clone();
     assert_eq!(slot(at), None);
@@ -1094,9 +1012,6 @@ fn still_forms_have_no_time_dependence() {
     }
 }
 
-/// A Fault or Vanish on a moving busy row draws, on its first frame, the
-/// surface the last live frame drew and runs the comet on from there, never
-/// cutting to a bare track. The still and flat looks keep the track.
 #[test]
 fn a_busy_echo_runs_the_comet_on_from_its_last_live_frame() {
     for kind in [EchoKind::Fault, EchoKind::Vanish] {
@@ -1126,13 +1041,10 @@ fn a_busy_echo_runs_the_comet_on_from_its_last_live_frame() {
             "{kind:?}: the first echo frame"
         );
         assert_eq!(first.rows[0].fade, 0);
-        // …and it keeps moving: the next frame's comet is the next live one's.
         let next = c.motion(&p, q + ANIM_FRAME, Look::MOVING).rows[0]
             .surface
             .clone();
         if kind == EchoKind::Fault {
-            // A Fault freezes the comet where the work failed and drains it
-            // to the track: the same stops, dimmer, no warn.
             assert_eq!(next.stops.len(), live.stops.len());
             for (n, l) in next.stops.iter().zip(&live.stops) {
                 assert_eq!(n.at, l.at, "frozen: {n:?} {l:?}");
@@ -1141,7 +1053,6 @@ fn a_busy_echo_runs_the_comet_on_from_its_last_live_frame() {
             }
             assert!(next != live, "draining");
         } else {
-            // Read on the display's own cadence while it is in flight.
             let at = c.fine_instant(q + ANIM_FRAME);
             let moved = crate::animate::comet(at - epoch, true);
             assert_eq!(next, moved, "{kind:?}: the comet runs on");
@@ -1189,7 +1100,6 @@ fn no_motion_deadline_when_idle() {
     let p = present(&empty, 80);
     assert_eq!(empty.motion_deadline(&p, now, Look::MOVING), None);
     assert_eq!(empty.motion(&p, now, Look::MOVING).fingerprint(), 0);
-    // Held, ask and standing rows: no motion.
     let mut c = fresh(now);
     c.post(warn("held"), stamp(), now);
     c.post(warn("standing").hold(Hold::STANDING), stamp(), now);
@@ -1202,8 +1112,6 @@ fn no_motion_deadline_when_idle() {
     let p = present(&c, 80);
     assert_eq!(c.motion_deadline(&p, now, Look::MOVING), None);
     assert_eq!(c.motion(&p, now, Look::MOVING).fingerprint(), 0);
-    // A queued live row arms nothing either, behind a single row's `+N ›`
-    // (with two rows or more the glass keeps a row for live progress).
     let mut c = fresh(now);
     c.post(warn("fourth").hold(Hold::STANDING), stamp(), now);
     c.post(busy("queued"), stamp(), now);
@@ -1226,8 +1134,6 @@ fn motion_deadlines_land_on_the_frame_grid() {
                 continue;
             };
             assert!(d > t, "{k}: a deadline in the past");
-            // On the 33 ms grid, or on the display's own while a glide or
-            // an echo is in flight.
             let since = d.duration_since(now).as_micros();
             assert!(
                 since % ANIM_FRAME.as_micros() == 0 || since % c.refresh().as_micros() == 0,
@@ -1237,7 +1143,6 @@ fn motion_deadlines_land_on_the_frame_grid() {
     }
 }
 
-/// The first run's live row: a step count behind its fill, disk busy.
 fn first_run(permille: u16) -> Message {
     Message::new(tags::PACKAGES, Severity::Info, "Installing ALab tools")
         .meter(Meter {
@@ -1258,10 +1163,6 @@ fn first_run(permille: u16) -> Message {
         .key("toolchain.pass")
 }
 
-/// A hidden estimate leaves the ETA slot blank (an elapsed `0:07` there reads
-/// as seven seconds left). The slot keeps its cells, so nothing re-lays when
-/// the estimate latches, and nothing ticks there, at 80 and 120 columns, then
-/// latched.
 #[test]
 fn a_hidden_estimate_leaves_the_eta_slot_blank() {
     for (name, cols) in [
@@ -1289,8 +1190,6 @@ fn a_hidden_estimate_leaves_the_eta_slot_blank() {
             "one read: nothing to estimate from"
         );
         assert!(p.rows[0].eta.is_some(), "the slot is reserved");
-        // Blank in every look, and no tick is asked for it: the next text
-        // change is at the earliest the stall onset, never the next second.
         for look in [Look::MOVING, Look::STILL] {
             assert_eq!(c.motion(&p, at, look).rows[0].eta, None, "{name}/{cols}");
         }
@@ -1298,7 +1197,6 @@ fn a_hidden_estimate_leaves_the_eta_slot_blank() {
             assert!(d >= now + ms(13_400), "{name}/{cols}: {:?}", d - now);
         }
     }
-    // Latched, the slot says what is left.
     let now = t0();
     let mut c = fresh(now);
     let id = c.post(download(0), stamp(), now).id;
@@ -1323,8 +1221,6 @@ fn a_hidden_estimate_leaves_the_eta_slot_blank() {
     );
 }
 
-/// Every piece of `row` but its title: what a Complete echo's finished title
-/// must leave where the row had it.
 fn all_but_title(row: &crate::glass::RowLayout) -> crate::glass::RowLayout {
     let mut row = row.clone();
     row.title.1.clear();
@@ -1332,8 +1228,6 @@ fn all_but_title(row: &crate::glass::RowLayout) -> crate::glass::RowLayout {
     row
 }
 
-/// The first cell another piece of `row` paints after the title (a joint
-/// counts), else the right margin.
 fn next_piece_col(row: &crate::glass::RowLayout, cols: usize) -> usize {
     let mut next = cols - crate::MARGIN;
     if let Some((c, _)) = &row.detail {
@@ -1357,12 +1251,6 @@ fn next_piece_col(row: &crate::glass::RowLayout, cols: usize) -> usize {
     next
 }
 
-/// A Complete echo says the finished form (`✓ Downloaded aterm v0.92.0`, never
-/// `✓ Downloading …`): the title's leading participle through the closed table,
-/// or the reporter's declared words; an unknown title keeps its words. A Fault
-/// keeps the title, and the record states the outcome. Nothing else on the row
-/// moves at 60, 80, 120 and 160 columns, and the words never run into the next
-/// piece.
 #[test]
 fn the_complete_echo_says_the_finished_form_without_a_reflow() {
     let full = |m: Message| {
@@ -1380,7 +1268,6 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
             "Installed aterm v0.92.0",
         ),
         (
-            // Declared words longer than the title's cells elide in place.
             busy("Finishing v2").finished_as("Installed and verified v2"),
             "Installed and verified v2",
         ),
@@ -1408,8 +1295,6 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
             let mut was = all_but_title(&live);
             was.kind = echo.kind;
             was.stats = None;
-            // ✓ and the finished words only: the percent and every capsule
-            // keep their cells, blank.
             was.pct = None;
             let mut got = all_but_title(&echo);
             assert_eq!(got.capsules.len(), was.capsules.len());
@@ -1431,7 +1316,6 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
             if char_width(finished) <= room.max(laid) {
                 assert_eq!(words, finished, "{title}@{cols}: whole where it fits");
             } else {
-                // Longer than the cells it may take: elided, never reflowed.
                 let stem = words.trim_end_matches('\u{2026}');
                 assert!(words.ends_with('\u{2026}'), "{title}@{cols}: {words:?}");
                 assert!(finished.starts_with(stem), "{title}@{cols}: {words:?}");
@@ -1440,8 +1324,6 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
                 assert_eq!(words, finished, "{title}@{cols}: whole on a wide row");
             }
             assert_eq!(echo.full_title, finished, "{title}@{cols}: spoken whole");
-            // The log states the outcome: the finished words alone under the
-            // ✓ Success mark; a title with no past tense says `— done`.
             let rec = c.log().get(id).unwrap();
             let logged = crate::words::done_form(finished).unwrap_or_else(|| finished.to_string());
             assert_eq!(rec.title, logged, "the record states the outcome");
@@ -1452,15 +1334,12 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
             );
         }
     }
-    // A Fault keeps the title.
     let now = t0();
     let mut c = fresh(now);
     let id = c.post(busy("Installing Homebrew"), stamp(), now).id;
     c.commit_rows(now, 3);
     assert!(c.resolve(id, Outcome::Warn, now + ms(5000)));
     assert_eq!(present(&c, 120).rows[0].title.1, "Installing Homebrew");
-    // A restatement that re-titles the row drops the words declared for the
-    // old title; a declared restatement sets new ones.
     let mut c = fresh(now);
     let id = c
         .post(
@@ -1499,11 +1378,6 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
     );
 }
 
-/// A RESTATEMENT THAT RE-TITLES A ROW TAKES THE SHORT FORM IT CARRIES
-/// ([`Restatement::short_title`]): the new title's own, as it takes the
-/// finished words it declares; the same title keeps its short form; and
-/// `Some(None)` clears it. NEGATIVE CONTROL: left unset, a new title drops
-/// the old short form — it shortened the old title.
 #[test]
 fn a_restatement_takes_the_short_form_it_carries() {
     let now = t0();
@@ -1547,7 +1421,6 @@ fn a_restatement_takes_the_short_form_it_carries() {
         now + ms(3)
     ));
     assert_eq!(short(&c), None, "cleared");
-    // NEGATIVE CONTROL: unset, the new title drops the old short form.
     assert!(c.restate(
         id,
         retitle("Claude usage limit reached in tab 1", usage),
@@ -1561,8 +1434,6 @@ fn a_restatement_takes_the_short_form_it_carries() {
     assert_eq!(short(&c), None, "the control");
 }
 
-/// An echo draws no load words (the work ended) and keeps the slot they sat
-/// in, declared or not, so nothing on the row reflows.
 #[test]
 fn an_echo_keeps_the_load_slot_but_draws_no_load_words() {
     let filled = |m: Message| {
@@ -1584,7 +1455,6 @@ fn an_echo_keeps_the_load_slot_but_draws_no_load_words() {
     let rows = [
         filled(busy("Updating ALab tools").loads(declared)),
         busy_loaded(busy("Removing ALab tools").loads(declared)),
-        // A load it never declared: the slot was every load's.
         busy_loaded(busy("Removing ALab tools")),
     ];
     for msg in rows {
@@ -1623,8 +1493,6 @@ fn an_echo_keeps_the_load_slot_but_draws_no_load_words() {
                 );
                 assert_eq!(echo.elapsed, live.elapsed);
                 assert_eq!(echo.eta, live.eta);
-                // Every capsule keeps its cells and draws nothing: an echo is
-                // not pressable.
                 assert_eq!(echo.capsules.len(), live.capsules.len());
                 for (e, l) in echo.capsules.iter().zip(&live.capsules) {
                     assert_eq!((e.col, e.width), (l.col, l.width));
@@ -1635,9 +1503,6 @@ fn an_echo_keeps_the_load_slot_but_draws_no_load_words() {
     }
 }
 
-/// An echo offers no stop, nor any other press: a paste's echo keeps every
-/// capsule's cells (nothing reflows) and draws blank words in the `Details`
-/// ink in them.
 #[test]
 fn an_echo_keeps_the_stops_cells_and_draws_no_stop() {
     use crate::glass::CapsuleRole;

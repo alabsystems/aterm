@@ -1561,7 +1561,7 @@ fn theme_colors_reach_rendercell() {
 }
 
 /// A named `theme` flows config → engine → rendered cells: it sets the default
-/// fg/bg and the full ANSI palette (incl.
+/// fg/bg and the full ANSI palette (incl. bold-to-bright), and the renderer Theme chrome.
 #[test]
 fn named_theme_reaches_rendercell_and_chrome() {
     use aterm_core::terminal::Terminal;

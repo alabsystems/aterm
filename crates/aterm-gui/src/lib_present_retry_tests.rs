@@ -16,21 +16,12 @@ use crate::metrics::{DeadlineOwner, PresentDropReason};
 use aterm_core::selection::SelectionSide;
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 
-/// How the dropped frame fails.
 #[derive(Clone, Copy, Debug)]
 enum Drop {
-    /// A real scripted CPU-surface failure, through `cpu_surface_transaction`.
     Cpu(crate::present::scripted::ScriptedOutcome),
-    /// A GPU-surface outcome. A unit test has no GPU, so the frame drops at the scripted
-    /// CPU acquire (the composed, damage-consumed, nothing-on-glass state a failed GPU
-    /// present leaves) and the retry is the one `rearm_dropped_present` arms for it.
     Gpu(PresentDropReason),
 }
 
-/// Every consumed echo is presented after a recoverable failure: glass is established,
-/// an echo's frame consumes the damage and drops, and with no new PTY byte the retry
-/// (a due deadline, or a stimulus when parked) puts it on glass pixel-for-pixel equal
-/// to a control. Redraws before the retry is due stay gated.
 #[test]
 fn a_dropped_echo_frame_reaches_glass_on_the_retry_for_every_drop_reason() {
     use crate::present::scripted::ScriptedOutcome;
@@ -76,8 +67,6 @@ fn a_dropped_echo_frame_reaches_glass_on_the_retry_for_every_drop_reason() {
             app.rearm_dropped_present(wid, reason);
         }
 
-        // Not yet due: a redraw (an animation tick, a stray request) is
-        // gated and presents nothing.
         app.redraw_window(wid);
         assert_eq!(
             surface(&mut app).commits(),
@@ -85,7 +74,6 @@ fn a_dropped_echo_frame_reaches_glass_on_the_retry_for_every_drop_reason() {
             "{case:?}: gated before the retry"
         );
 
-        // Fire the retry exactly as the event loop does.
         let ws = app.windows.get_mut(&wid).unwrap();
         let fired = match ws.present_retry.deadline {
             Some(deadline) => service_due_presentation_clocks(
@@ -138,8 +126,6 @@ fn wait_cancelled_wake_flushes_due_frame_cap_level() {
     );
     assert!(pending);
 
-    // The production caller invokes this transition before inspecting
-    // StartCause, so this is the WaitCancelled/proxy-pressure path too.
     assert!(service_due_presentation_clocks(
         false,
         &mut retry,
@@ -178,8 +164,6 @@ fn project(
     now: Instant,
     bootstrap_available: bool,
 ) -> BTreeMap<&'static str, i64> {
-    // The host increments `autonomous_retries` when it schedules; the model spends
-    // `remaining` when that deadline wakes. Adding the pending slot back aligns them.
     let pending = u8::from(retry.deadline.is_some());
     let train = retry.autonomous_retries.saturating_sub(pending);
     let remaining = PRESENT_RETRY_CAP
@@ -230,16 +214,11 @@ fn failed_present_device_loss_route_conforms_to_derived_model() {
     assert_eq!(state["lost"], 1);
     assert_eq!(state["route"], 2);
 
-    // Negative control: routing a lost device to the surface retry is the forbidden
-    // state, so the binding is not a vacuous enum comparison.
     let mut deleted = state;
     deleted.insert("route", 1);
     assert!(!model.check_invariant("LostUsesFallback", &deleted));
 }
 
-/// Tier-1 success binding for the routed production transaction: stand-ins for the OS
-/// target and `request_redraw`, but the real method replaces the backend, classifies
-/// the source target and updates its `PresentRetry`.
 #[test]
 fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
     let model = aterm_models_core::gpu_loss_recovery_model();
@@ -254,12 +233,7 @@ fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
         ),
     ] {
         let mut app = App::headless_for_test();
-        // The seam begins after the route observed a live GPU loss; a CPU-backed
-        // fixture suffices because the transaction replaces the backend with a freshly
-        // built CPU renderer.
         app.use_gpu = true;
-        // A `--scale 2` headless boot seal: nothing re-tunes a window without
-        // glass (`apply_window_scale`), so the swap itself must keep it.
         app.backend.set_pad(app.cfg_pad_for_scale(2.0));
         app.backend.set_head(60);
         app.seed_headless_boot_metrics();
@@ -285,8 +259,6 @@ fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
                             window.is_none(),
                             "the fixture deliberately has no OS window"
                         );
-                        // The production redraw half, over a counting
-                        // stand-in for the window this fixture lacks.
                         request_gpu_recovery_redraw(retry, Some(&()), |_| requests += 1)
                     },
                 )
@@ -314,15 +286,10 @@ fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
         assert_eq!(state["cpu_presented"], 0);
         assert_eq!(state["drops"], expected_drops);
         assert_eq!(state["reason"], expected_reason);
-        // Negative control: `SourceReadyRequested` without its `request_redraw` leaves a
-        // ready CPU target nothing will present.
         let mut frozen = state.clone();
         frozen.insert("requested", 0);
         assert!(!model.check_invariant("ReadyCpuOwnsRedrawUntilPresent", &frozen));
 
-        // A successful CPU commit is the only acknowledgement edge in both
-        // model and shipping retry state. The platform buffer itself is the
-        // sole excluded OS seam in this deterministic conformance drive.
         assert!(model.fire("PresentCpu", &mut state));
         app.windows
             .get_mut(&wid)
@@ -333,8 +300,6 @@ fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
         assert_eq!(app.windows[&wid].present_retry, PresentRetry::default());
     }
 
-    // Load-bearing classification control: installing the global CPU
-    // renderer is not success when the source target constructor fails.
     let mut app = App::headless_for_test();
     app.use_gpu = true;
     let observed = app.complete_latched_gpu_loss_recovery(
@@ -363,8 +328,6 @@ fn successful_gpu_recovery_classifies_source_ready_only_after_redraw_request() {
     assert!(!app.windows[&wid].present_retry.recovery_redraw_outstanding);
 }
 
-/// `GpuLossRecovery`'s `reason`: 0 none, 1 the source surface's own drop,
-/// 2 the failed CPU fallback (`CpuAcquire`, the builder the recovery ran).
 fn recovery_reason_code(reason: PresentDropReason) -> i64 {
     match reason {
         PresentDropReason::None => 0,
@@ -373,17 +336,11 @@ fn recovery_reason_code(reason: PresentDropReason) -> i64 {
     }
 }
 
-/// Tier-1 for the exact post-route transaction: drive the production
-/// accounting/abort/retry method with an injected CPU-builder failure for
-/// both notification entry paths, then deliver its real future deadline.
 #[test]
 fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
     let model = aterm_models_core::gpu_loss_recovery_model();
     let wid = WindowId(0);
 
-    // A successful present resets prior retry history before the device-lost callback
-    // is sampled: start exhausted, present, then run the post-present
-    // (`failed_reason=None`) transaction.
     let mut app = App::headless_for_test();
     let mut clock = Instant::now();
     {
@@ -438,8 +395,6 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
         i64::from(app.windows[&wid].present_retry.deadline.is_some()),
         "take_due consumes the deadline it hands over"
     );
-    // Negative control: a `take_due` without `self.deadline = None` hands
-    // the wake over and keeps the spent deadline armed.
     let mut rearmed = after_present.clone();
     rearmed.insert("retry", 1);
     assert!(!model.check_invariant("DeliveredRetryHasNoDeadline", &rearmed));
@@ -463,8 +418,6 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
     assert_eq!(after_present["cpu_presented"], 1);
     assert_eq!(app.windows[&wid].present_retry, PresentRetry::default());
 
-    // A failed-present entry with fuel refines the already-counted source
-    // drop and schedules the same typed retry.
     let mut app = App::headless_for_test();
     let mut after_drop = model.init_state();
     assert!(model.fire("FailFallbackAfterDropWithFuel", &mut after_drop));
@@ -488,8 +441,6 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
     assert_eq!(after_drop["retry"], 1);
     assert_eq!(after_drop["drops"], 1);
     assert_eq!(after_drop["reason"], recovery_reason_code(observed.reason));
-    // Negative control: the Update path refining the accounting but keeping
-    // the source surface's reason never names the failed CPU fallback.
     let mut undiagnosed = after_drop.clone();
     undiagnosed.insert(
         "reason",
@@ -497,8 +448,6 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
     );
     assert!(!model.check_invariant("FailedFallbackIsDiagnosed", &undiagnosed));
 
-    // A failed-present path that already spent all retry fuel parks; the model claims
-    // no autonomous wake for it.
     let mut app = App::headless_for_test();
     let mut clock = Instant::now();
     {
@@ -530,15 +479,11 @@ fn failed_gpu_recovery_retries_both_entry_paths_and_counts_once() {
         i64::from(app.windows[&wid].present_retry.deadline.is_some())
     );
     assert_eq!(exhausted["parked"], i64::from(observed.parked));
-    // Negative control: spent fuel treated as a fresh drop arms a retry
-    // past the cap instead of parking.
     let mut unparked = exhausted.clone();
     unparked.insert("retry", 1);
     unparked.insert("parked", 0);
     assert!(!model.check_invariant("ExhaustedFailureIsParked", &unparked));
 
-    // Negative controls: no retry after a failed fallback, and one frame's drop counted
-    // twice, both violate the model the helper just matched.
     let mut no_retry = model.init_state();
     assert!(model.fire("FailFallbackAfterPresent", &mut no_retry));
     no_retry.insert("retry", 0);
@@ -574,8 +519,6 @@ fn unresolved_recovery_stimulus_delivers_redraw_and_conforms() {
         "negative control: reset-without-request must be rejected"
     );
 
-    // Suppression does not acknowledge recovery; only a real present clears both the
-    // model and production acknowledgement bits.
     assert!(model.fire("Suppress", &mut state));
     assert_eq!(state["unresolved"], 1);
     assert!(retry.recovery_redraw_outstanding);
@@ -592,8 +535,6 @@ fn unresolved_recovery_stimulus_delivers_redraw_and_conforms() {
     assert_eq!(state["presented"], 1);
     assert_eq!(retry, PresentRetry::default());
 
-    // A due retry was consumed and its winit redraw suppressed: the gate is open, but
-    // the non-default episode still makes the next input or focus deliver another edge.
     let mut retry = PresentRetry::default();
     let deadline = retry
         .on_drop(PresentDropReason::GpuTimeout, Instant::now())
@@ -612,8 +553,6 @@ fn unresolved_recovery_stimulus_delivers_redraw_and_conforms() {
     assert_eq!(suppressed_recovery_requests, 2);
     retry.on_presented();
 
-    // A truly idle default episode does not manufacture redraws, while a
-    // real monitor/surface transition explicitly forces one.
     let mut retry = PresentRetry::default();
     assert!(!rearm_present_and_request(&mut retry, false, || {
         panic!("idle input stimulus must not redraw")
@@ -626,8 +565,6 @@ fn unresolved_recovery_stimulus_delivers_redraw_and_conforms() {
     assert!(retry.recovery_redraw_outstanding);
     retry.on_presented();
 
-    // A new CPU target has only requested its first redraw; keep that unresolved so a
-    // suppressed request is replaced by the next stimulus.
     let mut retry = PresentRetry::default();
     let mut initial_requests = 0;
     request_recovery_redraw(&mut retry, || initial_requests += 1);
@@ -656,9 +593,6 @@ fn assert_matches(
     assert_eq!(project(retry, now, bootstrap_available), *model_state);
 }
 
-/// Tier-1 binding for the macOS cold-start seam: drive the real App drop
-/// reducer so one pristine per-window `GpuOccluded` result arms a future
-/// retry, consumes its permit, and a second result parks.
 #[test]
 fn bootstrap_occlusion_gets_exactly_one_future_retry() {
     let model = aterm_models_core::present_retry_model();
@@ -705,9 +639,6 @@ fn bootstrap_occlusion_gets_exactly_one_future_retry() {
     assert_matches(&model_state, &window.present_retry, Instant::now(), false);
 }
 
-/// Tier-1 binding for the other one-way edge: the genuine window-success
-/// reducer closes bootstrap admission, and a later external stimulus cannot
-/// replenish it or reclassify an occlusion as a startup retry.
 #[test]
 fn successful_present_permanently_closes_bootstrap_retry() {
     let model = aterm_models_core::present_retry_model();
@@ -745,10 +676,6 @@ fn successful_present_permanently_closes_bootstrap_retry() {
     assert_matches(&model_state, &window.present_retry, Instant::now(), false);
 }
 
-/// Tier-1 binding for synchronous capture/internal redraws, whose shipping
-/// call sites reset retry state directly and present in the same operation
-/// without creating a new winit request. A request already in flight stays
-/// outstanding until present/drop acknowledges it.
 #[test]
 fn synchronous_stimulus_preserves_but_never_replenishes_bootstrap_retry() {
     let model = aterm_models_core::present_retry_model();
@@ -830,10 +757,6 @@ fn synchronous_stimulus_preserves_but_never_replenishes_bootstrap_retry() {
     assert_matches(&model_state, &window.present_retry, Instant::now(), false);
 }
 
-/// Tier-1: drive the genuine per-window retry state through every model
-/// transition. Each deadline is future, delay doubles, the finite train
-/// parks, an external stimulus grants a fresh finite train, and success
-/// resets to idle.
 #[test]
 fn bounded_present_retry_conforms_to_derived_model() {
     let model = aterm_models_core::present_retry_model();
@@ -867,7 +790,6 @@ fn bounded_present_retry_conforms_to_derived_model() {
         assert_matches(&model_state, &retry, now, bootstrap_available);
     }
 
-    // Retry fuel is empty: this drop parks and owns no deadline.
     assert!(model.fire("Drop", &mut model_state));
     assert_eq!(retry.on_drop(PresentDropReason::GpuTimeout, now), None);
     assert!(retry.parked);
@@ -875,7 +797,6 @@ fn bounded_present_retry_conforms_to_derived_model() {
     assert!(!retry.present_attempt_allowed());
     assert_matches(&model_state, &retry, now, bootstrap_available);
 
-    // A real surface stimulus starts a fresh bounded episode.
     assert!(model.fire("Stimulus", &mut model_state));
     let mut stimulus_requests = 0;
     assert!(rearm_present_and_request(&mut retry, false, || {
@@ -885,14 +806,11 @@ fn bounded_present_retry_conforms_to_derived_model() {
     assert!(retry.present_attempt_allowed());
     assert_matches(&model_state, &retry, now, bootstrap_available);
 
-    // And a successful present returns to the same idle projection.
     assert!(model.fire("Present", &mut model_state));
     retry.on_presented();
     bootstrap_available = false;
     assert_matches(&model_state, &retry, now, bootstrap_available);
 
-    // Ordinary input while idle is a no-op in both; a genuine surface/expose event is
-    // the forced edge and owns an outstanding redraw at once.
     assert!(model.successors("Stimulus", &model_state).is_empty());
     assert!(!rearm_present_and_request(&mut retry, false, || {
         panic!("idle non-forced stimulus must not manufacture a redraw")
@@ -909,8 +827,6 @@ fn bounded_present_retry_conforms_to_derived_model() {
     retry.on_presented();
     assert_matches(&model_state, &retry, now, bootstrap_available);
 
-    // A stimulus while ready: first consume one autonomous wake so state is not idle,
-    // then require Stimulus to restore the default episode and report a redraw.
     assert!(model.fire("Drop", &mut model_state));
     let deadline = retry
         .on_drop(PresentDropReason::GpuTimeout, now)
@@ -945,14 +861,10 @@ fn bounded_present_retry_conforms_to_derived_model() {
     }));
 }
 
-/// Non-transient surface conditions park immediately. Negative control: an immediate
-/// (past) retry projects as `retry=2`, which the derived invariant rejects.
 #[test]
 fn persistent_drop_parks_and_past_deadline_is_rejected() {
     let now = Instant::now();
     let model = aterm_models_core::present_retry_model();
-    // Every transient production reason, including CPU-target construction
-    // after GPU fallback, must take the model's bounded Drop route.
     for reason in [
         PresentDropReason::GpuReconfigured,
         PresentDropReason::GpuTimeout,
@@ -1004,8 +916,6 @@ fn parked_input_state_rearms_only_on_external_input_intent() {
         .on_drop(PresentDropReason::GpuOccluded, Instant::now());
     assert!(app.windows[&wid].present_retry.parked);
 
-    // A release is bookkeeping for earlier input, not a new recovery
-    // stimulus, so it cannot silently mint another retry episode.
     let release = InputEvent::Key {
         key: Key::Character('x'),
         mods: Modifiers::empty(),
@@ -1016,9 +926,6 @@ fn parked_input_state_rearms_only_on_external_input_intent() {
     let _ = app.input(wid, release, Source::Human);
     assert!(app.windows[&wid].present_retry.parked);
 
-    // Hover and held-button motion can arrive once per pixel: neither may refill the
-    // finite retry train while the drawable is unavailable; a discrete click, key or
-    // wheel is the recovery stimulus.
     for buttons in [3, 0] {
         let motion = InputEvent::MouseMove {
             buttons,
@@ -1035,8 +942,6 @@ fn parked_input_state_rearms_only_on_external_input_intent() {
         );
     }
 
-    // The next genuine press is explicit user intent and must open exactly
-    // one fresh bounded episode, so a recovered drawable cannot stay frozen.
     let press = InputEvent::Key {
         key: Key::Character('x'),
         mods: Modifiers::empty(),
@@ -1070,8 +975,6 @@ fn earliest_deadline_retains_its_diagnostic_owner() {
     assert_eq!(deadline, Some(now + Duration::from_millis(16)));
     assert_eq!(owner, DeadlineOwner::PresentRetry);
 
-    // Equal candidates preserve the first stable label without changing
-    // the min-folded instant.
     fold_owned_deadline(
         &mut deadline,
         &mut owner,
@@ -1079,7 +982,6 @@ fn earliest_deadline_retains_its_diagnostic_owner() {
         DeadlineOwner::Predictor,
     );
     assert_eq!(owner, DeadlineOwner::PresentRetry);
-    // Title/cwd drift folds under its own owner.
     fold_owned_deadline(
         &mut deadline,
         &mut owner,
@@ -1090,10 +992,6 @@ fn earliest_deadline_retains_its_diagnostic_owner() {
     assert_eq!(owner, DeadlineOwner::TitleDrift);
 }
 
-/// A paint the window system asks for presents the unchanged frame when the surface owes
-/// it (the `window --cpu` launch at 150 % row's band: Windows grew the window under the
-/// last present, and the `WM_PAINT` for the gained rows found nothing changed). With nothing
-/// owed the same paint stays gated.
 #[test]
 fn a_paint_the_window_owes_presents_the_unchanged_frame() {
     let wid = WindowId(0);
@@ -1123,15 +1021,6 @@ fn a_paint_the_window_owes_presents_the_unchanged_frame() {
     assert!(!app.windows[&wid].present_retry.recovery_redraw_outstanding);
 }
 
-/// The X server's `Expose` re-presents the whole unchanged frame: the server
-/// lost what the window showed (a VT switch, NVIDIA's video-memory purge, an
-/// unredirection) and asks for it again, and nothing here changed, so the
-/// RepaintKey early-out and the CPU present's damage copy would leave the
-/// window as the server left it until a cell moved. aterm's own redraw of the
-/// same unchanged frame stays gated, before and after. The negative controls:
-/// without the exposure branch in `note_owed_repaint` the exposure presents
-/// nothing; with its recovery edge but not its cache drop, the exposure
-/// commits the 1×1 gate-hit damage, and the glass stays black.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_x11_exposure_presents_the_whole_unchanged_frame() {

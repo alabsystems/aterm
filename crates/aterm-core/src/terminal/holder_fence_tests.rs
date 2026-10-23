@@ -707,6 +707,7 @@ impl Sim {
 
     fn cut_step(&mut self) {
         if self.calm() {
+            // A program leaves the alternate screen before it stops or
             // exits, and the next one starts below what it drew.
             if self.t.modes().alternate_screen {
                 self.write(b"\x1b[?1049l");
@@ -717,6 +718,8 @@ impl Sim {
             Who::Shell => match self.rng.below(6) {
                 0 | 1 => {
                     if let Some(i) = self.dead_drawer() {
+                        // Sometimes the shell left its prompt on the
+                        // cursor's row (the drawer lays on the next), or
                         // returned under its text (the lay taints).
                         if self.rng.chance(30) {
                             let n = self.rng.below(6) + 1;
@@ -733,6 +736,7 @@ impl Sim {
                 }
                 2 => {
                     if let Some(i) = self.stopped.pop() {
+                        // `fg` typed at the prompt, sometimes after
                         // `clear; cat card.txt` rewrote the drawer's rows.
                         if self.rng.chance(25) {
                             let b = self.clear_and_cat();

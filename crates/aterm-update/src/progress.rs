@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live progress of the updater's own check, for a host that shows it (the window's update
-//! status bar).
-//!
-//! The download shells `curl` into `Updates/download/<name>.part`, so no byte passes through
-//! this process: a sibling thread stats the growing `.part` and reports through one
-//! process-wide observer the host installs once ([`set_progress_observer`]). Every lane that
-//! runs a check in this process reports through it.
-//!
-//! # What is (and is not) reported
-//!
-//! * `bytes_total` is the asset's size from a HEAD run beside the download, `0` until it
-//!   lands or when it never does; a host renders `0` as unknown. The digest, not this size,
-//!   proves what is installed.
-//! * `bytes_done` is the `.part` size and can drop: curl `--retry` truncates its sink between
-//!   attempts.
-//! * Reports arrive on a worker thread; the observer must be cheap and never block.
+//! Live progress observer for updater checks.
 
 #[cfg(any(target_os = "macos", test))]
 use std::path::Path;
@@ -31,32 +16,26 @@ use std::time::Duration;
 /// One report from inside a running check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Progress {
-    /// The release container is being fetched. `bytes_total == 0` ⇒ unknown.
+    /// The release container is being fetched.
     Downloading {
         version: String,
         bytes_done: u64,
         bytes_total: u64,
     },
-    /// The container arrived: size/digest checks, extraction, codesign/Gatekeeper
-    /// policy and the atomic stage publish — seconds each, one phase.
+    /// The container arrived: size/digest checks, extraction, codesign/Gatekeeper policy and the
+    /// atomic stage publish — seconds each, one phase.
     Verifying { version: String },
-    /// Verified and published: the in-session apply lane applies it in place
-    /// (automatic by default, landing within `aterm-gui`'s `LANDS_WITHIN`, 15
-    /// minutes; on a press while `[update] auto_apply` is off). A stage no handoff
-    /// completed stays for the next launch's in-session lane; that launch's boot swaps it
-    /// only if it is a replaceable one (`ImageReplacement::Replaceable`), or a window's
-    /// with the automatic lane on once `LEFT_STAGE_ESCAPE` launches that left it ended.
+    /// Verified and published: the in-session apply lane applies it in place (automatic by default,
+    /// landing within `aterm-gui`'s `LANDS_WITHIN`, 15 minutes; on a press while `[update]
+    /// auto_apply` is off).
     Staged { version: String, build: u64 },
-    /// The download was cut short by something that will heal on its own (the
-    /// download host answering 429); the check backs off and retries later.
+    /// The download was cut short by something that will heal on its own (the download host
+    /// answering 429); the check backs off and retries later.
     Deferred { detail: String },
-    /// A check that had begun downloading failed. `detail` is the same sentence
-    /// `status.toml` records.
+    /// A check that had begun downloading failed.
     Failed { detail: String },
     /// The release being downloaded was withheld on this machine while the download ran (signer
-    /// revoked, yanked, or quarantined after crash-looping here). Nothing to retry: the next
-    /// check refuses it before downloading. `detail` is the `held: …` sentence `status.toml`
-    /// records.
+    /// revoked, yanked, or quarantined after crash-looping here).
     Withheld { detail: String },
 }
 
@@ -65,28 +44,21 @@ pub type ProgressNotify = Box<dyn Fn(Progress) + Send + Sync>;
 
 static OBSERVER: OnceLock<ProgressNotify> = OnceLock::new();
 
-/// Whether the current check has reported a download: only then does the wrapper turn an `Err`
-/// into a [`Progress::Failed`] report. One check runs at a time per process (`check_lane`), so
-/// a process-wide flag is exact.
 #[cfg(any(target_os = "macos", test))]
 static DOWNLOAD_BEGAN: AtomicBool = AtomicBool::new(false);
 
-/// Install the process-wide observer. First caller wins (the host installs it
-/// once at startup, before any check can run); later calls are ignored.
+/// Install the process-wide observer.
 pub fn set_progress_observer(observer: ProgressNotify) {
     let _ = OBSERVER.set(observer);
 }
 
-/// Report one step: download and verify steps re-stamp the heartbeat of a check in flight, and
-/// the host's observer, if installed, gets every step (a terminal session has none).
+/// Report one step: download and verify steps re-stamp the heartbeat of a check in flight, and the
+/// host's observer, if installed, gets every step (a terminal session has none).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn report(p: Progress) {
     if let Progress::Downloading { .. } = &p {
         DOWNLOAD_BEGAN.store(true, Ordering::Relaxed);
     }
-    // A check moving bytes is alive: a slow-link download can take hours, past the watchdog's
-    // budget for everything else a check does. Only a check in flight is re-stamped
-    // (`beat_progress`), so a manual check's download never vouches for a stuck checker.
     if matches!(p, Progress::Downloading { .. } | Progress::Verifying { .. }) {
         crate::checker_watch::WATCH.beat_progress();
     }
@@ -95,8 +67,7 @@ pub(crate) fn report(p: Progress) {
     }
 }
 
-/// Whether a download was reported since the last [`take_download_began`] —
-/// consumed by the check wrapper at each check's end.
+/// Whether a download was reported since the last [`take_download_began`].
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn take_download_began() -> bool {
     DOWNLOAD_BEGAN.swap(false, Ordering::Relaxed)
@@ -105,14 +76,6 @@ pub(crate) fn take_download_began() -> bool {
 /// Watch the growing `dest` (the curl sink) at 10 Hz while `url` downloads, reporting
 /// [`Progress::Downloading`] whenever its size or the known total changes; the guard stops and
 /// joins the poller on drop.
-///
-/// The first report (0 of unknown) is synchronous, so a host sees the download begin even if
-/// curl finishes before the first poll. The total comes from [`asset_size`], a HEAD on its own
-/// thread beside the download, never waited for.
-///
-/// The poller runs with no observer too: its reports re-stamp the checker's heartbeat
-/// ([`report`]), which both machine-wide locks' holder beats live off, so a terminal session's
-/// slow download does not read as a stopped holder. Only the size probe is skipped then.
 #[must_use]
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn watch_download(dest: &Path, version: &str, url: &str) -> DownloadWatch {
@@ -123,11 +86,6 @@ pub(crate) fn watch_download(dest: &Path, version: &str, url: &str) -> DownloadW
     watch_with(dest, version, move || asset_size(&url), Arc::new(report))
 }
 
-/// The asset's size from an anonymous HEAD that follows the storage redirect
-/// ([`aterm_update_core::vendor_content_length`]: https on every hop, bounded,
-/// never a credential), admitted only inside the download's own bound
-/// ([`aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND`]). `None` when the host
-/// does not say, which leaves the meter busy.
 #[cfg(any(target_os = "macos", test))]
 fn asset_size(url: &str) -> Option<u64> {
     aterm_update_core::vendor_content_length(url)
@@ -135,7 +93,6 @@ fn asset_size(url: &str) -> Option<u64> {
         .filter(|n| (1..=aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND).contains(n))
 }
 
-/// [`watch_download`]'s body over any size probe and sink, for the tests.
 #[cfg(any(target_os = "macos", test))]
 fn watch_with(
     dest: &Path,
@@ -148,8 +105,6 @@ fn watch_with(
         bytes_done: 0,
         bytes_total: 0,
     });
-    // The total, once the probe answers; 0 until then. The probe thread is
-    // detached on purpose: it writes this atomic and nothing else.
     let total = Arc::new(AtomicU64::new(0));
     let total_w = Arc::clone(&total);
     let _ = std::thread::Builder::new()
@@ -168,8 +123,6 @@ fn watch_with(
         .spawn(move || {
             let mut last: Option<(u64, u64)> = None;
             while !stop2.load(Ordering::Acquire) {
-                // Regular files only: the sink is ours, but a symlink planted at
-                // the path is not a byte count worth reporting.
                 let len = std::fs::symlink_metadata(&dest)
                     .ok()
                     .filter(|m| m.file_type().is_file())
@@ -211,12 +164,8 @@ impl Drop for DownloadWatch {
 mod tests {
     use super::*;
 
-    /// The process-wide download flag and heartbeat are shared: the tests that
-    /// report through [`report`] take turns.
     static GLOBAL_REPORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The wrapper's gate: a download report arms it, taking it disarms it, and
-    /// a report that is not a download leaves it alone.
     #[test]
     fn the_download_flag_is_set_by_a_download_report_and_consumed_once() {
         let _turn = GLOBAL_REPORTS
@@ -236,9 +185,6 @@ mod tests {
         assert!(!take_download_began(), "consumed");
     }
 
-    /// A download in a terminal session (no observer installed) still re-stamps
-    /// the checker's heartbeat as `.part` grows so a slow download is not
-    /// mistaken for a stalled checker.
     #[test]
     fn a_download_with_no_observer_still_restamps_the_checking_heartbeat() {
         use crate::checker_watch::{CheckerPhase, WATCH};
@@ -280,19 +226,15 @@ mod tests {
         );
     }
 
-    /// Every report a sink saw.
     type Seen = Arc<std::sync::Mutex<Vec<Progress>>>;
-    /// A sink the watcher reports into.
     type Sink = Arc<dyn Fn(Progress) + Send + Sync>;
 
-    /// Every report the sink saw, and a sink that records into it.
     fn recorder() -> (Seen, Sink) {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let into = Arc::clone(&seen);
         (seen, Arc::new(move |p| into.lock().unwrap().push(p)))
     }
 
-    /// Wait until a report matches; the minute is a hang detector.
     fn wait_for(seen: &std::sync::Mutex<Vec<Progress>>, want: &Progress) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
@@ -304,8 +246,6 @@ mod tests {
         seen.lock().unwrap().contains(want)
     }
 
-    /// The size probe's total rides every report from the moment it lands,
-    /// beside the `.part`'s bytes.
     #[test]
     fn the_probed_size_rides_every_report_once_it_lands() {
         let dir = std::env::temp_dir().join(format!("aterm-update-size-{}", std::process::id()));
@@ -319,7 +259,6 @@ mod tests {
             bytes_total: 0,
         };
         assert_eq!(seen.lock().unwrap().first(), Some(&first), "at once");
-        // The total lands before any byte: reported with no bytes yet.
         assert!(wait_for(
             &seen,
             &Progress::Downloading {
@@ -341,8 +280,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A silent probe leaves the total unknown, and dropping the watch never waits for a probe
-    /// still in flight.
     #[test]
     fn a_silent_or_slow_size_probe_leaves_the_total_unknown() {
         let dir = std::env::temp_dir().join(format!("aterm-update-slow-{}", std::process::id()));

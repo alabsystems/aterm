@@ -80,7 +80,7 @@ pub(crate) struct ClosedRead {
 
 impl ClosedRead {
     /// Returns the closed session's ID.
-    pub(crate) fn sid(&self) -> &SessionId {
+    pub(crate) const fn sid(&self) -> &SessionId {
         &self.sid
     }
 
@@ -142,7 +142,7 @@ pub(crate) enum ClosedKeep {
 
 impl ClosedKeep {
     /// Returns the retention tier for close `index` in a batch of `of` closes.
-    pub(crate) fn in_batch(index: usize, of: usize) -> ClosedKeep {
+    pub(crate) const fn in_batch(index: usize, of: usize) -> ClosedKeep {
         if of - index <= CLOSED_SKELETONS {
             ClosedKeep::Skeleton
         } else {
@@ -333,7 +333,7 @@ impl ClosedLogs {
     }
 
     /// The slots' estimated heap together.
-    pub(crate) fn charge(&self) -> usize {
+    pub(crate) const fn charge(&self) -> usize {
         self.charge
     }
 

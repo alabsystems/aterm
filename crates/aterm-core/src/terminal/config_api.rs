@@ -1,19 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration hot-reload: `Terminal::apply_config`, and its colour half
-//! `Terminal::rebase_colors`.
+//! Configuration hot-reload (`Terminal::apply_config` and `Terminal::rebase_colors`).
 
 use super::Terminal;
 
-/// Push one host-config value into a mode an application also negotiates over
-/// the wire, and report whether the live mode moved.
-///
-/// Diffs against `seed`, the host value last applied
-/// ([`ConfiguredModes`](super::state::ConfiguredModes)), never against `live`:
-/// a live value that disagrees usually means the program set it, and diffing
-/// live would re-assert the power-on value on every reload (for mode 2004,
-/// stripping a shell's bracketed-paste guards).
 #[inline]
 const fn apply_negotiated_mode(live: &mut bool, seed: &mut bool, configured: bool) -> bool {
     if *seed == configured {
@@ -25,12 +16,6 @@ const fn apply_negotiated_mode(live: &mut bool, seed: &mut bool, configured: boo
     moved
 }
 
-/// The live colours `apply_config` judges a change on, before and after: the
-/// cursor ([`ConfigChange::CursorColor`]) and the rest
-/// ([`ConfigChange::Colors`]).
-///
-/// [`ConfigChange::CursorColor`]: crate::config::ConfigChange::CursorColor
-/// [`ConfigChange::Colors`]: crate::config::ConfigChange::Colors
 struct LiveColors {
     cursor: Option<aterm_types::Rgb>,
     rest: (
@@ -58,9 +43,7 @@ impl LiveColors {
     }
 }
 
-/// The host's colour baseline: what OSC 104/110-119 and RIS reset to, and the
-/// scheme DSR 996 reports while no program holds its own background. Read it
-/// with [`Terminal::color_baseline`] and move it with [`Terminal::rebase_colors`].
+/// Host colour baseline that OSC 104/110-119 and RIS reset to and DSR 996 reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColorBaseline {
     /// The configured default foreground (OSC 110 resets to it).
@@ -81,7 +64,7 @@ pub struct ColorBaseline {
 }
 
 impl ColorBaseline {
-    /// The baseline a [`TerminalConfig`](crate::config::TerminalConfig) declares.
+    /// Extract the colour baseline from a [`TerminalConfig`](crate::config::TerminalConfig).
     #[inline]
     #[must_use]
     pub fn of_config(c: &crate::config::TerminalConfig) -> Self {
@@ -97,7 +80,7 @@ impl ColorBaseline {
     }
 }
 
-/// What a [`Terminal::rebase_colors`] changed, judged on the live colours.
+/// Live colour changes produced by [`Terminal::rebase_colors`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ColorRebase {
     /// The live cursor colour moved.
@@ -110,10 +93,7 @@ pub struct ColorRebase {
 }
 
 impl Terminal {
-    // Configuration Hot-Reload API
-
-    /// The host's colour baseline now: the configured colours, palette and
-    /// declared scheme that OSC 104/110-119 and RIS reset to.
+    /// Current host colour baseline.
     #[inline]
     #[must_use]
     pub fn color_baseline(&self) -> ColorBaseline {
@@ -129,16 +109,7 @@ impl Terminal {
         }
     }
 
-    /// Move the theme baseline and keep a program's colours (OSC 4/10/11/12/
-    /// 17/19/21) as diffs on top: the colour half of
-    /// [`apply_config`](Self::apply_config), for hosts that install a theme
-    /// without a whole [`TerminalConfig`](crate::config::TerminalConfig) (the
-    /// web embeds). OSC 104/110-119 and RIS then reset to the new baseline,
-    /// slots the program never touched follow it, and a program's palette diff
-    /// is replayed only under
-    /// [`allow_palette_reconfigure`](Self::allow_palette_reconfigure). The
-    /// reported scheme is reconciled once, after the colours (at most one
-    /// `CSI ? 997` push). Marks full damage when any live colour moved.
+    /// Update the theme baseline while preserving active OSC colour overrides on top.
     #[inline]
     pub fn rebase_colors(&mut self, baseline: &ColorBaseline) -> ColorRebase {
         let rebase = self.rebase_colors_inner(baseline, self.modes.allow_palette_reconfigure);
@@ -148,8 +119,6 @@ impl Terminal {
         rebase
     }
 
-    /// [`Self::rebase_colors`] without the damage, under the palette gate the
-    /// caller is about to install (`apply_config` passes its config's).
     fn rebase_colors_inner(&mut self, b: &ColorBaseline, palette_gate: bool) -> ColorRebase {
         let before = LiveColors::of(&self.color);
         let overrides = self.color.capture_overrides();
@@ -168,9 +137,6 @@ impl Terminal {
         self.color.frame_foreground_authoritative = true;
         self.color.frame_background_authoritative = true;
         let after = LiveColors::of(&self.color);
-        // The reported scheme is judged once, on the new baseline, the new
-        // configured colours and the replayed overrides together: no transient
-        // value, at most one push.
         let scheme_changed = self.reconcile_color_scheme();
         ColorRebase {
             cursor_changed: before.cursor != after.cursor,
@@ -181,52 +147,6 @@ impl Terminal {
 
     /// Apply configuration changes to the terminal at runtime and return the
     /// aspects that changed.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use aterm_core::config::{ConfigChange, TerminalConfig};
-    /// use aterm_core::terminal::{CursorStyle, Terminal};
-    ///
-    /// let mut term = Terminal::new(24, 80);
-    ///
-    /// // Create new configuration: a STEADY bar, where the terminal's power-on
-    /// // cursor is a blinking block — both the shape and the blink move.
-    /// let mut config = TerminalConfig::default();
-    /// config.cursor_style = CursorStyle::SteadyBar;
-    ///
-    /// // Apply and check what changed
-    /// let changes = term.apply_config(&config);
-    /// assert!(changes.contains(&ConfigChange::CursorStyle));
-    /// assert!(changes.contains(&ConfigChange::CursorBlink));
-    /// ```
-    /// use aterm_core::config::{ConfigChange, TerminalConfig};
-    /// use aterm_core::terminal::{CursorStyle, Terminal};
-    ///
-    /// # Change detection
-    ///
-    /// Most settings apply when they differ from the current state. The
-    /// program-negotiated modes (`auto_wrap`/DECAWM, `bracketed_paste`/DEC 2004,
-    /// `focus_reporting`/DEC 1004) are instead diffed against the host's last
-    /// applied value, so a live mode moves only when the host's own value moves
-    /// and an unrelated reload never strips a shell's paste guards. See
-    /// `apply_negotiated_mode`.
-    ///
-    /// A program's colours (OSC 4/10/11/12/17/19/21) ride over the configured
-    /// ones and are replayed after the new baseline lands; a palette diff is
-    /// replayed only under `allow_palette_reconfigure`, so closing the gate
-    /// puts the theme palette back in the same call.
-    ///
-    /// # Settings applied
-    ///
-    /// - **Cursor**: style, blink, color, visibility
-    /// - **Font**: descriptor (family, size, weight, italic)
-    /// - **Colors**: foreground, background, cursor, selection background/
-    ///   foreground, palette
-    /// - **Modes**: auto-wrap, focus reporting, bracketed paste
-    /// - **Text policy**: ambiguous width, style attributes, BiDi projection
-    /// - **Performance**: memory budget, total scrollback line limit, and
-    ///   synchronized-output timeout
     #[allow(
         clippy::too_many_lines,
         reason = "flat field-by-field config application"
@@ -238,45 +158,19 @@ impl Terminal {
         use crate::config::ConfigChange;
 
         let mut changes = Vec::new();
-        // Render-time configuration can change the pixels of already-stored
-        // cells without writing the grid. Fold every such change into one
-        // damage decision at the end so damage-keyed frontends cannot retain
-        // an old frame after a config reload.
         let mut visual_repaint = false;
 
-        // Cursor style. Host configuration, so it also persists the default a
-        // later RIS/DECSTR restores. `CursorStyle` carries the blink bit the
-        // renderer and DEC mode 12 use, so the style is applied verbatim and
-        // `modes.cursor_blink` follows it below.
         self.default_cursor_style = config.cursor_style;
         if self.modes.cursor_style != config.cursor_style {
             self.modes.cursor_style = config.cursor_style;
             changes.push(ConfigChange::CursorStyle);
         }
 
-        // Cursor blink — the blink bit of the style applied just above, not a
-        // second flag beside it. Kept as a mirror so `TerminalModes::cursor_blink`
-        // and DEC mode 12 cannot drift from the cursor the user is looking at.
         if self.modes.cursor_blink != self.modes.cursor_style.blinks() {
             self.modes.cursor_blink = self.modes.cursor_style.blinks();
             changes.push(ConfigChange::CursorBlink);
         }
 
-        // Colours: the theme is the BASELINE, and a program's colours ride over
-        // it. Take the program's diff from the old baseline (OSC 4/10/11/12/17/
-        // 19/21 sets — what `capture_color_repr` carries across a handoff),
-        // move every baseline and set live = baseline, then replay the diff.
-        // So OSC 104/110-119 and RIS reset to the new theme, slots the program
-        // never touched follow it, and a reload (any key, a theme-folder edit,
-        // an OS appearance flip) preserves a base16 palette or an editor's
-        // OSC 11 background. The diff's palette entries are replayed only while
-        // the host allows palette sets, so turning the gate off takes a
-        // program's palette out of every live session at once; its fg/bg/
-        // cursor/selection sets are ungated and stay. The kitty stack holds
-        // diffs too, so it needs no rebase (a pop under a closed gate skips
-        // the palette). Change and damage are judged on the live colours.
-        // This is [`Self::rebase_colors`], with the gate this config installs;
-        // damage stays folded into the one decision below.
         let rebase = self.rebase_colors_inner(
             &ColorBaseline::of_config(config),
             config.allow_palette_reconfigure,
@@ -290,7 +184,6 @@ impl Terminal {
             visual_repaint = true;
         }
 
-        // Cursor visibility
         if self.modes.cursor_visible != config.cursor_visible {
             self.modes.cursor_visible = config.cursor_visible;
             changes.push(ConfigChange::CursorVisible);
@@ -301,10 +194,6 @@ impl Terminal {
             visual_repaint = true;
         }
 
-        // The three APP-negotiated modes (DECAWM, focus reporting, bracketed
-        // paste): each moves only when the host's value moved, so a reload for
-        // an unrelated setting cannot re-assert the power-on value over what the
-        // running program negotiated. See [`ConfiguredModes`].
         if apply_negotiated_mode(
             &mut self.modes.auto_wrap,
             &mut self.configured_modes.auto_wrap,
@@ -327,9 +216,6 @@ impl Terminal {
             changes.push(ConfigChange::BracketedPaste);
         }
 
-        // OSC 52 clipboard query policy — sync both the mirror bit on
-        // `modes` and the authoritative `clipboard_auth` capability state
-        //.
         if self.modes.allow_osc52_query != config.allow_osc52_query {
             self.modes.allow_osc52_query = config.allow_osc52_query;
             if config.allow_osc52_query {
@@ -340,35 +226,26 @@ impl Terminal {
             changes.push(ConfigChange::Osc52ClipboardQuery);
         }
 
-        // CSI t window manipulation policy
         if self.modes.allow_window_ops != config.allow_window_ops {
             self.modes.allow_window_ops = config.allow_window_ops;
             changes.push(ConfigChange::WindowOps);
         }
 
-        // Desktop notification policy (OSC 9/99/777).
         if self.modes.allow_notifications != config.allow_notifications {
             self.modes.allow_notifications = config.allow_notifications;
             changes.push(ConfigChange::Notifications);
         }
 
-        // OSC 4 / OSC 21 indexed palette reconfigure policy.
         if self.modes.allow_palette_reconfigure != config.allow_palette_reconfigure {
             self.set_allow_palette_reconfigure(config.allow_palette_reconfigure);
             changes.push(ConfigChange::PaletteReconfigure);
         }
 
-        // Ambiguous-width character mode
         if self.modes.ambiguous_width_double != config.ambiguous_width_double {
             self.modes.ambiguous_width_double = config.ambiguous_width_double;
             changes.push(ConfigChange::AmbiguousWidth);
         }
 
-        // Style-attribute policy: bold-to-bright promotion, faint opacity and
-        // the theme-pair contrast floor. This is resolved at render time, so
-        // existing cells do not need to be rewritten. They do need to be
-        // repainted: without full damage the frontend's damage-epoch early-out
-        // can swallow a style-only reload.
         let new_faint = if config.faint_opacity.is_finite() {
             config.faint_opacity.clamp(0.0, 1.0)
         } else {
@@ -390,7 +267,6 @@ impl Terminal {
             visual_repaint = true;
         }
 
-        // Memory budget
         let current_budget = self
             .main_grid()
             .scrollback_memory_budget()
@@ -402,27 +278,17 @@ impl Terminal {
                      budget stored but not fully enforced"
                 );
             }
-            // set_memory_budget clamps display_offset internally.
             changes.push(ConfigChange::MemoryBudget);
         }
 
-        // BiDi configuration
-        // Sync both the config storage and the terminal modes
         if self.bidi_state.config != config.bidi {
             self.bidi_state.config = config.bidi.clone();
-            // Sync config settings to terminal modes (escape sequences can override later)
             self.modes.bidi_mode = config.bidi.mode;
             self.modes.bidi_direction = config.bidi.direction;
-            // Note: bidi_box_mirroring, bidi_autodetection, bidi_arrow_swap are
-            // escape-sequence-only modes (DEC ?2500, ?2501, ?1243) with no config equivalent
             self.invalidate_bidi_all();
             changes.push(ConfigChange::BiDi);
         }
 
-        // Scrollback limit - apply immediately by truncating if needed. Routed
-        // through the Terminal-level setter so it reaches the primary-content
-        // grid (never the alt buffer's spec'd zero-scrollback ring) and clamps
-        // display_offset itself.
         let current_limit = self.scrollback_line_limit();
         let new_limit = config.scrollback_limit;
         if current_limit != new_limit {
@@ -430,21 +296,15 @@ impl Terminal {
             changes.push(ConfigChange::ScrollbackLimit);
         }
 
-        // Sync timeout
         let new_timeout = std::time::Duration::from_millis(config.sync_timeout_ms);
         if self.sync_timeout_duration != new_timeout {
             self.sync_timeout_duration = new_timeout;
             changes.push(ConfigChange::SyncTimeout);
         }
 
-        // The focus-report gate reads DEC 1004 from the lock-free `ModeMirror`,
-        // and apply_config can change it outside `process()`: republish.
         self.refresh_mode_mirror();
 
         if visual_repaint {
-            // A config-driven recolor/policy change repaints already-drawn cells
-            // without changing their content. Advance full-grid damage so a
-            // frontend keyed by `damage_epoch` cannot swallow the reload.
             self.grid.damage_mut().mark_full();
         }
 
@@ -454,10 +314,6 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests {
-
-    /// `ConfiguredModes::default` must equal the modes a default
-    /// `TerminalConfig` carries; otherwise the first `apply_config` of a
-    /// default config would override modes the program negotiated.
     #[test]
     fn the_mode_seed_holds_exactly_what_a_default_host_config_carries() {
         let host = crate::config::TerminalConfig::default();
@@ -655,8 +511,6 @@ mod tests {
             "pending unlimited value makes an identical reload a no-op"
         );
 
-        // RIS/host reset erases scrollback while the worker owns the old store.
-        // It must neither resurrect old history nor discard host settings.
         term.reset();
         assert!(
             term.finish_resize_offload(job.reflow()).is_none(),
@@ -672,7 +526,6 @@ mod tests {
             config.memory_budget
         );
 
-        // A second identical reload must be a true no-op after reconciliation.
         let changes = term.apply_config(&config);
         assert!(!changes.contains(&ConfigChange::MemoryBudget));
         assert!(!changes.contains(&ConfigChange::ScrollbackLimit));
@@ -733,9 +586,6 @@ mod tests {
         );
     }
 
-    /// A config reload must not un-negotiate DEC 2004: bracketed paste belongs
-    /// to the shell, and dropping it strips the `ESC[200~`/`ESC[201~` guards
-    /// from later pastes while the shell believes it is protected.
     #[test]
     fn a_config_reload_leaves_an_app_negotiated_bracketed_paste_alone() {
         let mut term = Terminal::new(4, 16);
@@ -758,10 +608,6 @@ mod tests {
         );
     }
 
-    /// The other two modes an application negotiates over the wire — DECAWM and
-    /// focus reporting (DEC 1004) — share the seam and the defect: a reload for
-    /// an unrelated setting must not re-assert the power-on value over what a
-    /// full-screen program asked for.
     #[test]
     fn a_config_reload_leaves_app_negotiated_wrap_and_focus_reporting_alone() {
         let mut term = Terminal::new(4, 16);
@@ -785,10 +631,6 @@ mod tests {
         assert!(!changes.contains(&ConfigChange::FocusReporting));
     }
 
-    /// The other half of the contract: a host that genuinely changes one of
-    /// these settings still reaches the terminal, and still reports the change
-    /// exactly once. Without it the seam would be indistinguishable from
-    /// deleting the three settings outright.
     #[test]
     fn a_real_host_change_to_a_negotiated_mode_still_reaches_the_terminal() {
         let mut term = Terminal::new(4, 16);
@@ -796,13 +638,9 @@ mod tests {
         term.apply_config(&config);
         term.process(b"\x1b[?2004h");
 
-        // The host now wants pastes unframed, over the app's own request.
         config.bracketed_paste = false;
         config.auto_wrap = false;
         config.focus_reporting = true;
-        // `bracketed_paste` held the same value in the previous config, so its
-        // seed did not move and the app's mode 2004 survives; only the two
-        // settings the host really changed are announced.
         let changes = term.apply_config(&config);
         assert!(changes.contains(&ConfigChange::AutoWrap));
         assert!(changes.contains(&ConfigChange::FocusReporting));
@@ -811,7 +649,6 @@ mod tests {
         assert!(term.focus_reporting_enabled());
         assert!(term.modes().bracketed_paste());
 
-        // Now the host really does move mode 2004, and it lands.
         config.bracketed_paste = true;
         assert!(
             term.apply_config(&config).is_empty(),
@@ -823,13 +660,9 @@ mod tests {
         assert!(!term.modes().bracketed_paste());
         assert_eq!(term.format_paste("a\nb"), b"a\rb", "no guards to emit");
 
-        // An identical reload stays a no-op for all three.
         assert!(term.apply_config(&config).is_empty());
     }
 
-    /// A reset returns these modes to the DEC power-on state, not the host's
-    /// configured seed (as `handle_decstr` and RIS do), and does not resurrect
-    /// the seed.
     #[test]
     fn a_reset_returns_a_negotiated_mode_to_the_power_on_value_not_the_config_seed() {
         let mut term = Terminal::new(4, 16);
@@ -863,8 +696,6 @@ mod tests {
         Rgb { r, g, b }
     }
 
-    /// A baseline whose every colour is derived from `seed`, so two seeds
-    /// differ in every slot.
     fn seeded_baseline(seed: u8) -> ColorBaseline {
         let mut palette = aterm_types::ColorPalette::new();
         for index in 0..16u8 {
@@ -908,8 +739,6 @@ mod tests {
             "OSC 104 → new palette"
         );
 
-        // Negative control: the legacy setter (live = baseline) loses the
-        // program's background.
         let mut legacy = Terminal::new(4, 16);
         legacy.rebase_colors(&seeded_baseline(200));
         legacy.process(b"\x1b]11;rgb:10/11/12\x07");
@@ -925,7 +754,6 @@ mod tests {
         let same = t.color_baseline();
         assert_eq!(t.rebase_colors(&same), ColorRebase::default());
         assert!(!t.has_damage(), "a no-op rebase leaves no damage");
-        // Non-vacuity: a different baseline is reported and damages.
         let moved = t.rebase_colors(&seeded_baseline(90));
         assert!(moved.colors_changed && moved.cursor_changed);
         assert!(t.has_damage());
@@ -942,7 +770,6 @@ mod tests {
         assert!(rebase.scheme_changed);
         assert_eq!(t.color_scheme(), aterm_types::Appearance::Light);
         assert_eq!(t.take_response().as_deref(), Some(&b"\x1b[?997;2n"[..]));
-        // The same baseline again: no push.
         assert!(!t.rebase_colors(&light).scheme_changed);
         assert_eq!(t.take_response(), None);
     }

@@ -1694,7 +1694,8 @@ fn prims_by_node(
     out
 }
 
-/// What the tops of the lists on `compiled` paint.
+/// What the tops of the lists on `compiled` paint: no line of words cut through by the
+/// list's top edge. The number of kept captions it read.
 fn assert_list_tops(
     compiled: &crate::native_ui::CompiledUi,
     room_bottom: f32,

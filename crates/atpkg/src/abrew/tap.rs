@@ -59,9 +59,6 @@ fn tap_path(prefix: &Prefix, user: &str, repo: &str) -> Result<PathBuf, String> 
     Ok(path)
 }
 
-/// Admit each path component before a mutation can traverse it. Add creates
-/// missing parents one at a time; untap never creates them. This is a
-/// point-in-time check, not an FD-relative namespace transaction.
 fn mutation_path(
     prefix: &Prefix,
     user: &str,
@@ -125,12 +122,6 @@ fn mutation_path(
     Ok((path, update))
 }
 
-/// Whether a remote the user spelled names a LOCAL source (a path
-/// or file:// URL) rather than a network remote. Only then may the
-/// file transport be allowed: the user naming their own directory
-/// is the consent, and tap files are only ever read as data. Every
-/// other remote stays behind the https/ssh-only pin (which is what
-/// keeps ext::/fd:: transport execution out).
 fn is_local_remote(remote: &str) -> bool {
     remote.starts_with('/')
         || remote.starts_with("./")
@@ -139,8 +130,6 @@ fn is_local_remote(remote: &str) -> bool {
         || remote.starts_with("file://")
 }
 
-/// The `-c protocol...` prefix for tap git invocations: deny all
-/// transports, then allow https/ssh — plus file for a local remote.
 fn git_protocol_args(local: bool) -> Vec<&'static str> {
     let mut args = vec![
         "-c",
@@ -243,9 +232,6 @@ fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Full names of installed packages whose receipted identity lives
-/// in `user/repo`, split by kind. Every retained version must be known:
-/// a partial presentation scan cannot authorize deleting its recipe.
 fn tap_installed_names(
     prefix: &Prefix,
     user: &str,

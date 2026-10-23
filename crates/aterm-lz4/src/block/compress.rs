@@ -64,6 +64,7 @@ const fn token_from_literal(lit_len: usize) -> u8 {
         // Since we can fit the literals length into it, there is no need for saturation.
         (lit_len as u8) << 4
     } else {
+        // We were unable to fit the literals into it, so we saturate to 0xF. We will later
         // write the extensional value.
         0xF0
     }
@@ -75,6 +76,7 @@ const fn token_from_literal_and_match_length(lit_len: usize, duplicate_length: u
         // Since we can fit the literals length into it, there is no need for saturation.
         (lit_len as u8) << 4
     } else {
+        // We were unable to fit the literals into it, so we saturate to 0xF. We will later
         // write the extensional value.
         0xF0
     };
@@ -106,6 +108,8 @@ fn count_same_bytes(input: &[u8], cur: &mut usize, source: &[u8], candidate: usi
         let match_block = usize::from_ne_bytes(*block2);
 
         if input_block == match_block {
+            // `num` counts matched bytes inside `cur_slice`, so it is bounded
+            // by a slice length and never actually saturates; saturating just
             // makes the no-overflow obligations provable.
             num = num.saturating_add(USIZE_SIZE);
         } else {
@@ -270,6 +274,7 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
                 candidate = candidate.saturating_sub(ext_dict_stream_offset);
                 candidate_source = ext_dict;
             } else {
+                // Match no longer reachable, e.g. tables kept across
                 // independent blocks with only `input_stream_offset` growing.
                 continue;
             }
@@ -358,6 +363,7 @@ pub(crate) fn compress_into_sink_with_dict<const USE_DICT: bool>(
 fn init_dict<T: HashTable>(dict: &mut T, dict_data: &mut &[u8]) {
     let data = *dict_data;
     if data.len() > WINDOW_SIZE {
+        // Plain `-` on purpose: the guard discharges underflow, and its value
         // proves the slice bound (`saturating_sub` would hide that relation).
         *dict_data = &data[data.len() - WINDOW_SIZE..];
     }
@@ -394,6 +400,7 @@ fn compress_into_vec_with_dict<const USE_DICT: bool>(
         let out = if prepend_size {
             // `max_compressed_size >= 24`; `get_mut` states it for the verifier.
             if let Some(header) = compressed.get_mut(..4) {
+                // The wire header is a `u32`; the mask makes the truncation
                 // `as u32` already does explicit for the verifier.
                 header.copy_from_slice(&((input.len() & u32::MAX as usize) as u32).to_le_bytes());
             }

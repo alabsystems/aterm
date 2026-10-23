@@ -705,7 +705,8 @@ pub struct Fresh {
 /// What a fresh reading says beside the one admitted before it ([`Fresh::beside`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Beside {
-    /// The last reading admitted was its own.
+    /// The last reading admitted was its own process's: what it reads now
+    /// was served since then ([`accounts::TapRead::seen_before`]).
     pub seen: bool,
     /// Per window (five-hour, week), the figure the vendor refilled it to.
     pub refilled: [Option<u32>; 2],

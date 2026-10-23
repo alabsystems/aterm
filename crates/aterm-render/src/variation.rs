@@ -35,6 +35,7 @@ pub struct VfProbe {
 #[inline]
 #[must_use]
 pub const fn clamp_axis(axis: &VfAxis, req: f32) -> f32 {
+    // `VfAxis` construction guarantees min <= def <= max, all finite; a hand-built
     // degenerate axis fails the range test and falls back to the default.
     if req.is_finite() && axis.min.is_finite() && axis.max.is_finite() && axis.min <= axis.max {
         req.clamp(axis.min, axis.max)
@@ -237,6 +238,7 @@ pub fn varied_metrics_units(
 ) -> Option<VariedMetricsUnits> {
     let mut face = aterm_font::Face::parse(bytes, index).ok()?;
     for &(tag, value) in coords {
+        // A miss means no such axis, unreachable since the coords were resolved
         // against this face's own axes; ignore it rather than fail the metrics.
         let _ = face.set_variation(aterm_font::Tag(tag), value);
     }

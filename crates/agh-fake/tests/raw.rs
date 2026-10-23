@@ -11,8 +11,6 @@ use std::time::Duration;
 /// The hang detector for an answer that must come.
 pub const HANG: Duration = Duration::from_secs(60);
 
-/// The credential header's name; the scheme is joined at runtime, so no file spells a
-/// credential-shaped literal.
 const CREDENTIAL: &str = "Authorization";
 
 /// One request to send.
@@ -169,7 +167,6 @@ pub struct Reply {
 }
 
 impl Reply {
-    /// Split `raw` at the head's end.
     fn parse(raw: Vec<u8>) -> Reply {
         let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
             return Reply {

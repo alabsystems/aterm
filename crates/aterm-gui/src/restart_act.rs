@@ -128,7 +128,7 @@ fn unavailable_for(
 
 /// Whether `snap`'s agent can be relaunched by its lane without a self-claim
 /// copy.
-fn lane_relaunches(snap: &aterm_agent::harness::relaunch::Snapshot) -> bool {
+const fn lane_relaunches(snap: &aterm_agent::harness::relaunch::Snapshot) -> bool {
     match &snap.run {
         aterm_agent::harness::relaunch::AgentRun::Claude
         | aterm_agent::harness::relaunch::AgentRun::Agy(_) => true,
@@ -829,7 +829,7 @@ enum Withheld {
 impl Withheld {
     /// The watch's word when the stamp stops standing with this the last
     /// thing it saw.
-    fn gave_up(self) -> &'static str {
+    const fn gave_up(self) -> &'static str {
         match self {
             Self::Away => "never led its tab again while its stamp stood; nothing sent",
             Self::Hand => "another hand held its tab while its stamp stood; nothing sent",
@@ -840,7 +840,7 @@ impl Withheld {
 
     /// The watch's word when the program ended by itself with this the last
     /// thing it saw.
-    fn ended(self) -> &'static str {
+    const fn ended(self) -> &'static str {
         match self {
             Self::Hand => "ended while another hand held its tab; nothing sent",
             Self::Unread => "ended before the host read it again; nothing sent",

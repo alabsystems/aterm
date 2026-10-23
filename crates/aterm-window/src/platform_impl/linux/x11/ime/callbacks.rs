@@ -4,9 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/callbacks.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's XIM
-// declarations, where upstream used x11-dl's.)
-
 use std::collections::HashMap;
 use std::os::raw::c_char;
 use std::ptr;
@@ -24,18 +21,10 @@ pub(crate) unsafe fn xim_set_callback(
     field: *const c_char,
     callback: *mut ffi::XIMCallback,
 ) -> Result<(), XError> {
-    // It's advisable to wrap variadic FFI functions in our own functions, as we want to minimize
-    // access that isn't type-checked.
     unsafe { (xconn.xlib.XSetIMValues)(xim, field, callback, ptr::null_mut::<()>()) };
     xconn.check_errors()
 }
 
-// Set a callback for when an input method matching the current locale modifiers becomes
-// available. Note that this has nothing to do with what input methods are open or able to be
-// opened, and simply uses the modifiers that are set when the callback is set.
-// * This is called per locale modifier, not per input method opened with that locale modifier.
-// * Trying to set this for multiple locale modifiers causes problems, i.e. one of the rebuilt input
-//   contexts would always silently fail to use the input method.
 pub(crate) unsafe fn set_instantiate_callback(
     xconn: &Arc<XConnection>,
     client_data: ffi::XPointer,
@@ -88,15 +77,11 @@ pub(crate) unsafe fn set_destroy_callback(
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)]
 enum ReplaceImError {
-    // Boxed to prevent large error type
     MethodOpenFailed(#[allow(dead_code)] Box<PotentialInputMethods>),
     ContextCreationFailed(#[allow(dead_code)] ImeContextCreationError),
     SetDestroyCallbackFailed(#[allow(dead_code)] XError),
 }
 
-// Attempt to replace current IM (which may or may not be presently valid) with a new one. This
-// includes replacing all existing input contexts and free'ing resources as necessary. This only
-// modifies existing state if all operations succeed.
 unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
     let xconn = unsafe { &(*inner).xconn };
 
@@ -113,8 +98,6 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
         )
     };
 
-    // It's important to always set a destroy callback, since there's otherwise potential for us
-    // to try to use or free a resource that's already been destroyed on the server.
     {
         let result = unsafe { set_destroy_callback(xconn, new_im.im, &*inner) };
         if result.is_err() {
@@ -126,10 +109,7 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
 
     let mut new_contexts = HashMap::new();
     for (window, old_context) in unsafe { (*inner).contexts.iter() } {
-        // Only the focused window's context is told its spot (`Ime::send_xim_spot`).
         let spot = unsafe { (*inner).spot_for_new_context(*window) };
-
-        // Check if the IME was allowed on that context.
         let is_allowed =
             old_context.as_ref().map(|old_context| old_context.is_allowed()).unwrap_or_default();
 
@@ -152,7 +132,6 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
         new_contexts.insert(*window, Some(new_context));
     }
 
-    // If we've made it this far, everything succeeded.
     unsafe {
         let _ = (*inner).destroy_all_contexts_if_necessary();
         let _ = (*inner).close_im_if_necessary();
@@ -161,7 +140,6 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
         (*inner).is_destroyed = false;
         (*inner).is_fallback = is_fallback;
         let _ = (*inner).refocus();
-        // A composition in an old context ended with it, unannounced (an IBus restart).
         (*inner).announce_contexts(false);
     }
     Ok(())
@@ -176,7 +154,6 @@ pub(crate) unsafe fn replace_im_for_test(inner: *mut ImeInner) -> bool {
 pub unsafe extern "C" fn xim_instantiate_callback(
     _display: *mut ffi::Display,
     client_data: ffi::XPointer,
-    // This field is unsupplied.
     _call_data: ffi::XPointer,
 ) {
     let inner: *mut ImeInner = client_data as _;
@@ -189,7 +166,6 @@ pub unsafe extern "C" fn xim_instantiate_callback(
             },
             Err(err) => unsafe {
                 if (*inner).is_destroyed {
-                    // We have no usable input methods!
                     panic!("Failed to reopen input method: {err:?}");
                 }
             },
@@ -197,13 +173,9 @@ pub unsafe extern "C" fn xim_instantiate_callback(
     }
 }
 
-// This callback is triggered when the input method is closed on the server end. When this
-// happens, XCloseIM/XDestroyIC doesn't need to be called, as the resources have already been
-// free'd (attempting to do so causes our connection to freeze).
 pub unsafe extern "C" fn xim_destroy_callback(
     _xim: ffi::XIM,
     client_data: ffi::XPointer,
-    // This field is unsupplied.
     _call_data: ffi::XPointer,
 ) {
     let inner: *mut ImeInner = client_data as _;
@@ -212,16 +184,13 @@ pub unsafe extern "C" fn xim_destroy_callback(
         let xconn = unsafe { &(*inner).xconn };
         if unsafe { !(*inner).is_fallback } {
             let _ = unsafe { set_instantiate_callback(xconn, client_data) };
-            // Attempt to open fallback input method.
             match unsafe { replace_im(inner) } {
                 Ok(()) => unsafe { (*inner).is_fallback = true },
                 Err(err) => {
-                    // We have no usable input methods!
                     panic!("Failed to open fallback input method: {err:?}");
                 },
             }
         } else {
-            // The fallback went too: no context is left, nor any composition in one.
             unsafe { (*inner).announce_contexts(true) };
         }
     }

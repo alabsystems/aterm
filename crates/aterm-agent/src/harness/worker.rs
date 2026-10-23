@@ -320,6 +320,8 @@ pub(super) fn line_of(
     env: &[(&str, &str)],
     fresh: &Fresh<'_>,
 ) -> Result<String, String> {
+    // Rootless: under the worker's own directory (a root alone, as Windows
+    // spells one with no drive, is not the worker's). An empty XDG base
     // directory is unset to the XDG rule, as it was to the starter.
     if let Some((name, value)) = env.iter().find(|(name, value)| {
         cli.dirs.contains(name)

@@ -367,7 +367,7 @@ struct DeferredVideoCleanup {
 }
 
 impl DeferredVideoCleanup {
-    fn arm_tombstone(&mut self) {
+    const fn arm_tombstone(&mut self) {
         self.tombstone_armed = true;
     }
 }
@@ -1024,6 +1024,8 @@ fn artifact_cleanup_worker(
 ) {
     loop {
         // Correctness-critical retention is checked before every bounded GC
+        // slice. New GC cannot overtake it, while each persistent cursor still
+        // makes progress by requeueing at the best-effort tail.
         if let Ok(task) = video_receiver.try_recv() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_video_retention_task(task);
@@ -2393,6 +2395,7 @@ impl ConfinedVideoDir {
         recording: &crate::pinned_dir::PinnedDir,
     ) -> std::io::Result<()> {
         // `recording` was derived from `instance` and retains its complete
+        // ancestor chain, so its full validation already covers the instance.
         recording.validate_path_identity()
     }
 
@@ -2733,7 +2736,7 @@ struct VideoPruneWork {
 }
 
 impl VideoPruneWork {
-    fn new(limit: usize) -> Self {
+    const fn new(limit: usize) -> Self {
         Self {
             remaining: limit,
             scanned: 0,
@@ -2743,7 +2746,7 @@ impl VideoPruneWork {
         }
     }
 
-    fn spend(&mut self, units: usize) -> bool {
+    const fn spend(&mut self, units: usize) -> bool {
         if self.remaining < units {
             return false;
         }
@@ -2795,6 +2798,9 @@ fn completed_recording(
     work: &mut VideoPruneWork,
 ) -> CompletionProbe {
     // Last-reader retention deliberately survives an ancestor rename. Every
+    // probe below is therefore relative to the already-authorized directory
+    // capability and revalidates its direct entry, without reopening the stale
+    // lexical namespace.
     if !work.file_open() {
         return CompletionProbe::Exhausted;
     }
@@ -3025,7 +3031,7 @@ pub(crate) const MAX_SUN_PATH: usize = if cfg!(any(
 
 /// Whether `path` fits inside `sockaddr_un` ([`MAX_SUN_PATH`]).
 #[must_use]
-pub(crate) fn sun_path_ok(path: &str) -> bool {
+pub(crate) const fn sun_path_ok(path: &str) -> bool {
     path.len() <= MAX_SUN_PATH
 }
 
@@ -3047,6 +3053,7 @@ fn resolve_socket_plan_for(
         SocketDirective::Disabled => SocketResolution::Disabled,
         SocketDirective::Explicit(p) => {
             // An oversized path can never bind (EINVAL), and its liveness probe would misread
+            // that as maybe-live.
             if !sun_path_ok(&p) {
                 return SocketResolution::PathTooLong {
                     path: p,
@@ -3331,7 +3338,7 @@ pub(crate) enum BindAction {
 
 /// Decide whether to remove and bind a socket path based on liveness.
 #[must_use]
-pub(crate) fn decide_bind(is_live: bool) -> BindAction {
+pub(crate) const fn decide_bind(is_live: bool) -> BindAction {
     if is_live {
         BindAction::RefuseLiveSocket
     } else {
@@ -3416,7 +3423,7 @@ pub(crate) struct ConfinedImage {
 
 impl ConfinedImage {
     /// Target-free sentinel for an inline in-memory image reply.
-    pub(crate) fn in_memory() -> Self {
+    pub(crate) const fn in_memory() -> Self {
         Self {
             dir: PathBuf::new(),
             file_name: std::ffi::OsString::new(),
@@ -3688,6 +3695,7 @@ mod tests {
             let initially_live = connect_socket_nonblocking(&path).is_ok();
             for _ in 0..128 {
                 // Only boundedness is promised here: a full backlog's errno
+                // is platform-dependent. The real binder still probes itself.
                 let _ = connect_socket_nonblocking(&path);
             }
             let _ = tx.send(initially_live);

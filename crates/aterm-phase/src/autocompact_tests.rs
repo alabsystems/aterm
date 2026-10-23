@@ -15,13 +15,10 @@ fn offer(rows: &[String]) -> Option<Offer> {
     parse_prompt_v2(rows).and_then(|p| p.autocompact_offer())
 }
 
-/// Whether `rows` read as the offer at all (any reading of it).
 fn is_offer(rows: &[String]) -> bool {
     parse_prompt_v2(rows).is_some_and(|p| p.kind == PromptKind::AutocompactOffer)
 }
 
-/// `rows` with the first row whose text is `from` replaced by the row `row`,
-/// drawn as given.
 fn swap(rows: &[String], from: &str, row: &str) -> Vec<String> {
     let mut out = rows.to_vec();
     let at = out
@@ -32,7 +29,6 @@ fn swap(rows: &[String], from: &str, row: &str) -> Vec<String> {
     out
 }
 
-/// `rows` with the first row whose text is `from` replaced by `to`.
 fn edit(rows: &[String], from: &str, to: &str) -> Vec<String> {
     let mut out = rows.to_vec();
     let at = out
@@ -112,8 +108,6 @@ fn the_fullscreen_panel_and_the_more_text_warning_are_read() {
     assert_eq!((o.tokens, o.focused), (400_000, OfferFocus::Keep));
 }
 
-/// The reader names the box: authoritative prompt, so the supervisor's
-/// approval loop reads it (before: non-authoritative idle, no composer).
 #[test]
 fn the_offer_reads_as_an_authoritative_prompt() {
     for text in [AUTOCOMPACT_KEEP_FIRST, AUTOCOMPACT_LOWER_FIRST] {
@@ -125,15 +119,11 @@ fn the_offer_reads_as_an_authoritative_prompt() {
     }
 }
 
-/// CONTROL: an exit pending replaces the footer — a person's screen, never
-/// this kind.
 #[test]
 fn an_exit_pending_is_not_the_offer() {
     assert!(!is_offer(&screen(AUTOCOMPACT_PRESS_AGAIN)));
 }
 
-/// CONTROL: the dialog answered — its outcome line in the transcript, the
-/// composer back — reads idle with no box.
 #[test]
 fn the_saved_offer_reads_idle() {
     let rows = screen(AUTOCOMPACT_SAVED);
@@ -142,8 +132,6 @@ fn the_saved_offer_reads_idle() {
     assert!(r.prompt.is_none());
 }
 
-/// CONTROLS, one per condition: each edit of the keep-first screen is no
-/// offer, and the unedited screen is one.
 #[test]
 fn every_condition_is_needed() {
     let rows = screen(AUTOCOMPACT_KEEP_FIRST);
@@ -218,7 +206,6 @@ fn every_condition_is_needed() {
     assert!(!is_offer(&under), "a row under the footer");
 }
 
-/// The footer typed as a draft into the composer is no offer.
 #[test]
 fn the_footer_as_a_draft_is_not_the_offer() {
     let w = 120;
@@ -234,8 +221,6 @@ fn the_footer_as_a_draft_is_not_the_offer() {
     assert!(!is_offer(&rows));
 }
 
-/// A position label beside the title (`1 of 2`, the frame's `aside`) and a
-/// description drawn on the accept row itself are still the offer.
 #[test]
 fn a_position_label_and_an_inline_description_are_read() {
     let rows = screen(AUTOCOMPACT_KEEP_FIRST);
@@ -267,11 +252,6 @@ fn a_position_label_and_an_inline_description_are_read() {
     );
 }
 
-/// THE SIZE IS READ IN THE VENDOR'S WORDS, ANY SIZE IT CAN DRAW (a served
-/// list holds sizes off [`LADDER`]): `250k`, `350.5k`, `1m` beside the
-/// ladder's own, each drawn back the same by [`size_words`]. CONTROLS: a
-/// leading zero, a `.0` the vendor drops, two decimals, four digits, no
-/// unit, the screen-reader label, a trailing stop.
 #[test]
 fn accept_size_reads_every_size_the_vendor_draws() {
     for (words, tokens) in [
@@ -301,11 +281,6 @@ fn accept_size_reads_every_size_the_vendor_draws() {
     }
 }
 
-/// A SERVED SIZE OFF THE LADDER (350k, 450k, 250k: the 80-column screen
-/// with its stepper at 500k redrawn at each) is read whole, an
-/// authoritative prompt with its size — the dialog a ladder-only reader
-/// left unread, its walk stalled. CONTROL: the body asking another size than
-/// the accept row's is still no offer.
 #[test]
 fn a_served_size_off_the_ladder_is_read() {
     let rows = screen(AUTOCOMPACT_80COL_500K);

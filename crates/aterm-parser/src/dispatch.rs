@@ -77,6 +77,10 @@ trust_island! {
 /// The state machine's per-byte dispatch, expanded in `process_byte_inner`.
 macro_rules! process_byte_impl {
     ($self:expr, $byte:expr, $sink:expr) => {{
+        // The byte after the ESC that left a hooked DCS string decides how the
+        // string ends (`dcs_st_pending`): `\` completes the ST, so the string
+        // ends complete; any other byte breaks it off, and a broken-off string
+        // is canceled, as CAN and SUB cancel one (xterm answers or applies a DCS
         // only at ST). The byte itself is then read in `Escape` as always.
         if $self.dcs_st_pending {
             $self.dcs_st_pending = false;
@@ -181,6 +185,7 @@ macro_rules! process_byte_impl {
                     $self.add_param_digit($byte);
                 }
                 ActionType::EscDispatch => {
+                    // RIS (`ESC c`) resets the parser whole: a tmux passthrough
                     // wrapper it arrived in ends with it.
                     if $byte == b'c' && $self.intermediates.is_empty() {
                         $self.tmux = TmuxPassthrough::Off;
@@ -283,6 +288,8 @@ impl Parser {
                 b'\\' => {
                     self.tmux = TmuxPassthrough::Off;
                     if self.dcs_st_pending {
+                        // The payload already supplied its ESC: finish that
+                        // pending string terminator without canceling it with
                         // another ESC.
                         self.advance_plain(b"\\", sink);
                     } else if matches!(
@@ -454,6 +461,15 @@ impl Parser {
         mut remaining: &'a [u8],
         sink: &mut S,
     ) -> &'a [u8] {
+        // EQUIVALENT to the byte-by-byte slow path (do not "fix"): `n` is
+        // the position of the FIRST control byte, so every byte in [0..n)
+        // is a data byte the slow path maps to OscPut, which pushes only
+        // while `osc_put_keeps(osc_data.len())`. `osc_bulk_copy_len` keeps
+        // that same prefix and drops the rest (checked against that guard at
+        // every breakpoint of every `len`:
+        // `tests::string_bulk::osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint`), and
+        // `remaining.get(n..)` then lands on the control byte, which both
+        // paths process the same way. `osc_payload_cap_parity`
         // (tests/string_bulk.rs) drives both paths across the boundary.
         if self.state == State::OscString {
             let n = if self.c1_controls_enabled {
@@ -557,6 +573,10 @@ impl Parser {
 
     /// Parse and dispatch OSC data.
     fn dispatch_osc<S: ActionSink>(&mut self, sink: &mut S, bel_terminated: bool) {
+        // Parsing lives in `parse_and_dispatch_osc` (`&[u8]`, not `&mut self`)
+        // so the contract verifier sees it leave the `TypeInvariant` state
+        // alone; the only mutation here is `osc_data.clear()`. A string marked
+        // `osc_discard` (a carried tail, or one CAN/SUB canceled) ends without
         // dispatching.
         if self.osc_discard {
             self.osc_discard = false;
@@ -710,6 +730,7 @@ impl Parser {
                     | (u32::from(c0 & 0x3F) << 6)
                     | u32::from(c1 & 0x3F);
                 if cp >= 0x800 && !(0xD800..=0xDFFF).contains(&cp) {
+                    // Guards: >= 0x800 (not overlong), not a surrogate,
                     // <= 0xFFFF (lead < 0xF0) — `from_u32` is always `Some`.
                     char::from_u32(cp).map(|c| (c, 2))
                 } else {

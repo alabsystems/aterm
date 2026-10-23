@@ -229,7 +229,7 @@ fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)]) -> Vec<JobTab> {
         .collect()
 }
 
-fn state(s: probe::RunState) -> ProcState {
+const fn state(s: probe::RunState) -> ProcState {
     match s {
         probe::RunState::Running => ProcState::Running,
         probe::RunState::Sleeping => ProcState::Sleeping,
@@ -254,7 +254,7 @@ fn sweep_proc(p: &ProcessReading) -> SweepProc {
     }
 }
 
-fn tcp(s: probe::TcpState) -> TcpState {
+const fn tcp(s: probe::TcpState) -> TcpState {
     match s {
         probe::TcpState::Closed => TcpState::Closed,
         probe::TcpState::Listen => TcpState::Listen,
@@ -267,7 +267,7 @@ fn tcp(s: probe::TcpState) -> TcpState {
     }
 }
 
-fn filter(f: probe::KnoteFilter) -> KnoteFilter {
+const fn filter(f: probe::KnoteFilter) -> KnoteFilter {
     match f {
         probe::KnoteFilter::Read => KnoteFilter::Read,
         probe::KnoteFilter::Write => KnoteFilter::Write,

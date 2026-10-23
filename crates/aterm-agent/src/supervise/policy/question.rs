@@ -199,7 +199,9 @@ impl Pane {
     }
 }
 
-/// The column a free-text row's text starts at: after its number (`❯ 3.`
+/// The column a free-text row's text starts at: after its number (`❯ 3. `, the
+/// number at column 2) and, on a multi-select, its checkbox (`[ ] `): 5, or 9
+/// behind the checkbox, for a one-digit number.
 #[must_use]
 pub fn label_col(free_text: &FreeText) -> usize {
     let digits = free_text.n.to_string().len();
@@ -477,6 +479,7 @@ pub fn answer_question(
 ) -> Decision {
     let Some(dialog) = prompt.question_dialog.as_ref() else {
         // Muse Code's review of its answers: sent only when it holds the
+        // note the loop wrote and nothing else.
         if aterm_phase::muse::is_review(prompt) {
             return review_answer(prompt, rows, priority, own);
         }

@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// An oversized grid must not abort the process.
-//
-// The control-socket `resize` verb allows up to 4096 rows/cols (MAX_GRID_ROWS/
-// COLS) but does not bound pixels. The padded framebuffer (`cols·cell_w +
-// 2·pad`) sizes both the swapchain and the offscreen, and wgpu validates
-// textures against `max_texture_dimension_2d`; with no uncaptured-error handler
-// a violation panics and aborts. Both sites clamp the framebuffer to the device
-// limit, so an extreme grid renders a clipped view. These tests drive the
-// offscreen path (a swapchain needs a real window).
-//
-// A host without a GPU cannot run them (`common::gpu`).
+
+//! Tests that grids exceeding `max_texture_dimension_2d` clamp the offscreen framebuffer without aborting.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{GpuRenderer, PresentCrop, WindowGpu};
@@ -19,8 +9,7 @@ use aterm_render::Theme;
 
 use crate::common;
 
-/// Render a `rows × cols` blank grid to the offscreen and return the readback width
-/// (== the offscreen texture width == the clamped framebuffer width).
+/// Render a `rows × cols` blank grid and return the clamped offscreen width.
 fn offscreen_width(gpu: &mut GpuRenderer, win: &mut WindowGpu, rows: usize, cols: usize) -> usize {
     let mut term = Terminal::new(rows as u16, cols as u16);
     let input = term.cell_frame(rows, cols);
@@ -29,17 +18,12 @@ fn offscreen_width(gpu: &mut GpuRenderer, win: &mut WindowGpu, rows: usize, cols
 
 #[test]
 fn oversized_grid_clamps_offscreen_instead_of_aborting() {
-    // A large font so a modest column count (within MAX_GRID_COLS == 4096, so
-    // aterm-core keeps the grid) already blows past even a 32768-limit GPU.
     let mut gpu = common::gpu(40.0, Theme::default());
     let (cw, _ch) = gpu.cell_size();
     assert!(cw >= 1, "cell width must be positive");
 
     let mut win = WindowGpu::new();
 
-    // Two column counts whose padded widths both exceed any real
-    // `max_texture_dimension_2d` (<= 32768) while staying within MAX_GRID_COLS,
-    // targeting ~50k and ~90k px so they differ for any cell width.
     let rows = 2usize;
     let cols_a = (50_000usize / cw).clamp(2, 4096);
     let cols_b = (90_000usize / cw).clamp(2, 4096);
@@ -49,8 +33,6 @@ fn oversized_grid_clamps_offscreen_instead_of_aborting() {
     let w_a = offscreen_width(&mut gpu, &mut win, rows, cols_a);
     let w_b = offscreen_width(&mut gpu, &mut win, rows, cols_b);
 
-    // Both readback widths are valid and equal, i.e. clamped to one device
-    // limit.
     assert!(
         w_a >= 1 && w_b >= 1,
         "clamped widths must stay valid (>= 1)"
@@ -60,8 +42,6 @@ fn oversized_grid_clamps_offscreen_instead_of_aborting() {
         "two oversized grids (requested {req_a}px vs {req_b}px) must both clamp the offscreen \
          to the SAME device max_texture_dimension_2d"
     );
-    // And the clamp is strictly below the requested framebuffer (a real clamp, not a
-    // full-size allocation) whenever the two requests actually differ.
     if cols_a != cols_b {
         assert!(
             w_a < req_a && w_a < req_b,
@@ -74,9 +54,7 @@ fn oversized_grid_clamps_offscreen_instead_of_aborting() {
     );
 }
 
-/// A frontend crop is in logical raw-frame coordinates. For an oversized grid
-/// the resident offscreen is only the clamped top prefix, so a valid logical
-/// crop is normalized to that prefix rather than rejected.
+/// Logical raw-frame crops are normalized against the clamped resident offscreen prefix.
 #[test]
 fn oversized_tall_grid_normalizes_cropped_virtual_present() {
     let mut gpu = common::gpu(18.0, Theme::default());
@@ -101,9 +79,6 @@ fn oversized_tall_grid_normalizes_cropped_virtual_present() {
         "the resident offscreen clamps to the device limit"
     );
 
-    // Three rows removed above and two below is a valid asymmetric logical crop
-    // whose end lies below the resident prefix; the GPU trims its height to
-    // `resident_h - 3`.
     let valid = PresentCrop {
         source_y: 3,
         height: logical_h - 5,
@@ -122,8 +97,6 @@ fn oversized_tall_grid_normalizes_cropped_virtual_present() {
         "a valid logical crop must survive resident-source normalization"
     );
 
-    // Logically malformed intervals remain strict failures; normalization must
-    // never turn them into apparently valid resident crops.
     for malformed in [
         PresentCrop {
             source_y: 0,
@@ -133,8 +106,6 @@ fn oversized_tall_grid_normalizes_cropped_virtual_present() {
             source_y: logical_h - 1,
             height: 2,
         },
-        // Valid logically, but wholly below the resident prefix: empty on this
-        // device, therefore also a graceful failure.
         PresentCrop {
             source_y: resident_h + 1,
             height: 1,
@@ -161,39 +132,27 @@ fn oversized_tall_grid_normalizes_cropped_virtual_present() {
     );
 }
 
-// Instance streams are bounded by the clamped framebuffer: `encode_frame` skips
-// cells whose pixel origin is off-screen (they were clipped anyway), so a dense
-// MAX_GRID grid cannot request a vertex buffer past `max_buffer_size`, which
-// would abort.
 #[test]
 fn densely_filled_oversized_grid_bounds_instances_no_abort() {
     let mut gpu = common::gpu(40.0, Theme::default());
     let (cw, _ch) = gpu.cell_size();
     let mut win = WindowGpu::new();
 
-    // 4096 cols of a large cell is ~98k px, past any real limit, so the width
-    // clamps and the column loop-clip engages. Few rows keep the readback small.
     let rows = 8usize;
     let cols = 4096usize;
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Fill every cell with a non-space glyph (autowrap tiles the whole grid) so
-    // the GlyphInstance stream is maximal.
     term.process(&vec![b'X'; rows * cols]);
     let input = term.cell_frame(rows, cols);
 
     let frame = gpu.render_input(&mut win, &input, None);
     let total = gpu.last_instances();
 
-    // Reaching here == no abort.
     assert!(total >= 1, "a densely-filled grid must emit some instances");
-    // Streams are bounded by the on-screen area: unbounded code would build
-    // about two instances per cell.
     assert!(
         total < rows * cols,
         "instance streams must be bounded by the clamped framebuffer, not the grid: \
          got {total} instances for a {rows}x{cols} grid (cell_w={cw})"
     );
-    // The clamped offscreen was still produced (width clamped below the requested px).
     assert!(
         frame.width >= 1 && frame.width < cols * cw,
         "offscreen width {} must be clamped below the requested {}px",
@@ -209,11 +168,6 @@ fn densely_filled_oversized_grid_bounds_instances_no_abort() {
     );
 }
 
-// The scissored dirty-row band clamps its top and bottom to the clamped
-// framebuffer height: a change confined to a row below the clamp (the prompt on
-// the bottom row of a tall grid) would otherwise build a scissor outside the
-// render target, which wgpu rejects with an abort. The scissor counter shows the
-// dirty-row path ran.
 #[test]
 fn oversized_tall_grid_bottom_row_change_scissors_without_abort() {
     let mut gpu = common::gpu(18.0, Theme::default());
@@ -222,12 +176,9 @@ fn oversized_tall_grid_bottom_row_change_scissors_without_abort() {
     gpu.set_cursor_blink_phase(true);
     gpu.set_cursor_style_override(None);
 
-    // 2048 rows exceeds every current `max_texture_dimension_2d`, so the height
-    // clamps and bottom rows lie beyond it. Narrow keeps the readback cheap.
     let (rows, cols) = (2048usize, 4usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
 
-    // Frame 1: first paint (full repaint) primes the present-path prior frame.
     let mut input = term.cell_frame(rows, cols);
     input.cursor_visible = false; // keep the (row-0) cursor from dirtying an on-screen row
     let frame = gpu.present_input_readback(&mut win, &input);
@@ -238,20 +189,16 @@ fn oversized_tall_grid_bottom_row_change_scissors_without_abort() {
         frame.height
     );
 
-    // Frame 2: change only the bottom row, its pixel origin far below the clamp.
     term.process(format!("\x1b[{rows};1HZ").as_bytes());
     let mut input2 = term.cell_frame(rows, cols);
     input2.cursor_visible = false;
     let scissor_before = gpu.scissor_taken();
     let frame2 = gpu.present_input_readback(&mut win, &input2);
 
-    // Reaching here == no abort. The change was reusable (same dims/offset), so
-    // the scissor path, the one that built the out-of-bounds rect, must have run.
     assert!(
         gpu.scissor_taken() > scissor_before,
         "a bottom-row-only change on a reusable frame must take the scissor path"
     );
-    // The clipped view is unchanged (the changed row is off-screen).
     assert_eq!(
         (frame.width, frame.height),
         (frame2.width, frame2.height),

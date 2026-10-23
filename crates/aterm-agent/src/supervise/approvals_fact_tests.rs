@@ -10,10 +10,8 @@ use crate::supervise::policy::turn_end::{
     RULE_LIMIT_RESUME, RULE_LOGIN, RULE_MODEL_FALLBACK,
 };
 
-/// The session every row is of.
 const SID: &str = "@s-1";
 
-/// One of the session's rows at `ts`.
 fn row_at(ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str) -> String {
     Row {
         rule_id,
@@ -25,7 +23,6 @@ fn row_at(ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str)
     .to_json(ts, Some(SID))
 }
 
-/// The occupancy door's line at `ts`, booked as the door books it.
 fn fact_typed(ts: i64) -> String {
     let line = crate::supervise::occupancy::templates::wait_nudge(30 * 60_000);
     row_at(
@@ -37,18 +34,14 @@ fn fact_typed(ts: i64) -> String {
     )
 }
 
-/// `rows` as a ledger's text.
 fn body(rows: &[String]) -> String {
     rows.iter().map(|r| format!("{r}\n")).collect()
 }
 
-/// `read` reads the rows `before` as it reads them with a fact line typed after them; read as an
-/// act, the fact line moves it.
 fn invisible<T: PartialEq + std::fmt::Debug>(before: &[String], read: impl Fn(&str) -> T) {
     invisible_at(before, before.len(), read);
 }
 
-/// [`invisible`] with the fact line typed among `rows`, before the one at `at`.
 fn invisible_at<T: PartialEq + std::fmt::Debug>(
     rows: &[String],
     at: usize,
@@ -70,7 +63,6 @@ fn invisible_at<T: PartialEq + std::fmt::Debug>(
     );
 }
 
-/// A continuation typed at `ts`.
 fn continued(ts: i64) -> String {
     row_at(ts, RULE_CONTINUE, Outcome::Typed, "keep going", "-")
 }
@@ -211,9 +203,6 @@ fn a_fact_line_keeps_a_wall_open() {
     invisible(&[wall], |b| open_wall_in(b, Some(SID)).is_some());
 }
 
-/// The line itself opens with the harness's mark, so the conversation's task scan reads it as
-/// the harness's, never a person's task ([`crate::harness::upgrade::transcript_tasked`]); the
-/// same words without the mark task the conversation.
 #[test]
 fn a_fact_line_in_the_transcript_is_no_task() {
     let line = crate::supervise::occupancy::templates::wait_nudge(30 * 60_000);
@@ -238,8 +227,6 @@ fn a_fact_line_in_the_transcript_is_no_task() {
     ));
 }
 
-/// A usage limit's try typed, a fact line, then the try's answer read: the answer is still the
-/// first read after the try.
 #[test]
 fn a_fact_line_is_no_read_after_a_usage_try() {
     let resume = row_at(1_000, RULE_LIMIT_RESUME, Outcome::Typed, "go on", "-");
@@ -277,9 +264,6 @@ fn a_fact_line_asks_nothing_after_an_account_move() {
     });
 }
 
-/// NO ROW FORGES A FACT ROW ([`is_fact_line`]): a continuation whose command and reason spell a
-/// fact rule's field is an act, read as one. CONTROL: its line holds the fact rule's name, so a
-/// reader that matched the name alone would drop it.
 #[test]
 fn no_command_or_reason_forges_a_fact_row() {
     let spelled = format!(",\"rule_id\":\"{}\",", FactKind::Hold.rule());

@@ -231,7 +231,6 @@ pub(crate) fn orient(
 mod tests {
     use super::{ColorModel, convert_row, orient, ycbcr_to_rgb};
 
-    /// Mid-grey chroma leaves luma alone; full Cr is a red, full Cb a blue.
     #[test]
     fn ycbcr_converts_as_jfif_defines() {
         assert_eq!(ycbcr_to_rgb(100, 128, 128), [100, 100, 100]);
@@ -241,7 +240,6 @@ mod tests {
         assert!(blue[2] > 250 && blue[0] < 5 && blue[1] < 5, "{blue:?}");
     }
 
-    /// Adobe CMYK is stored inverted: full stored values are white.
     #[test]
     fn adobe_cmyk_is_read_inverted() {
         let rows = vec![vec![255], vec![255], vec![0], vec![255]];
@@ -250,8 +248,6 @@ mod tests {
         assert_eq!(out, [255, 255, 0, 255], "full yellow ink");
     }
 
-    /// Orientation 6 (rotate 90 degrees clockwise to view) swaps the sides
-    /// and moves the stored top-left pixel to the top-right.
     #[test]
     fn orientation_six_turns_the_image_clockwise() {
         let rgba = vec![255, 0, 0, 255, 0, 255, 0, 255];

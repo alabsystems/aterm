@@ -57,7 +57,9 @@ pub(crate) enum Mutant {
     SkipExitedRow,
     /// A relaunched bridge does not recover the mirror's pinned batch.
     FreshMirrorTake,
-    /// The attach records no witnessed.
+    /// The attach records no witnessed will: a row under another state dir's
+    /// mark whose will it read — a dead sibling's ([`Opts::sibling`]) — is not
+    /// its to retire, and that incarnation's ghost stands.
     IgnoreWitnessedWill,
     /// A will's incarnation is trusted without matching its writer's mark.
     WitnessByIncarnationAlone,
@@ -77,27 +79,49 @@ pub(crate) enum Mutant {
     RefuseTornAfterPowerCut,
     /// The sweep judges a file whole when its reader takes it.
     SweepByTheReaderAlone,
-    /// The first bridge of a boot after an unclean stop leaves every whole in-flight entry.
+    /// The first bridge of a boot after an unclean stop leaves every whole
+    /// in-flight entry where it is, and the attach publishes each again at its
+    /// sequence.
     RepublishInFlightOfAnEarlierBoot,
-    /// The first bridge of a boot after an unclean stop leaves a torn mirror pin where it.
+    /// The first bridge of a boot after an unclean stop leaves a torn mirror
+    /// pin where it is, as before its durable copies (`PinRules::set_aside_torn`
+    /// off): the mirror stops on it, for good.
     KeepTornPin,
     /// The alias key has no durable copy, as before `logkey`.
     KeyInThePinAlone,
     /// The total is read off the pin alone, as before `logfloor`.
     TotalInThePinAlone,
-    /// A bridge tells aterm what its start moved into the quarantine in place.
+    /// A bridge tells aterm what its start moved into the quarantine in place
+    /// of what the quarantine holds (`Bridge::tell_quarantine`, sim item S6):
+    /// a later boot that moves fewer understates what an earlier one left
+    /// there, and at 0 would end the owner's entry over bytes still held.
     TellMovedNotHeld,
     /// An offset of ours below the self-lane window's oldest is added to it, as before sim item S7.
     RememberBelowTheWindow,
-    /// A recovery step a write error stopped.
+    /// A recovery step a write error stopped — the torn files' sweep, the
+    /// earlier boot's in-flight retirement, the pin's reconcile — is said and
+    /// survived, and `run` written after it all the same, as before sim item
+    /// S7 (`Bridge::recover`).
     BeginRunPastAFailedRecovery,
-    /// The mirror judges its pin at the hello, the recovery that reconciles it complete.
+    /// The mirror judges its pin at the hello, the recovery that reconciles
+    /// it complete or not, as before sim item S7
+    /// (`Bridge::mirror_hello_answered`): a torn pin stops the mirror for the
+    /// bridge's life, a rolled-back one counts below its floor.
     JudgePinBeforeRecovery,
-    /// An own record whose `acked` write or in-flight entry's unlink failed is delivered.
+    /// An own record whose `acked` write or in-flight entry's unlink failed is
+    /// delivered with its entry standing, as before sim item S7
+    /// (`Bridge::settled_before_delivery`): a move that takes the record has
+    /// the next attach publish the entry again, a second copy in the
+    /// recipient's ring.
     DeliverPastAStandingEntry,
     /// The mirror's floor is trusted as it reads, as before sim item S7.
     TrustTheFloorThatReads,
-    /// An attach that could not write the state dir's witness of the log.
+    /// An attach that could not write the state dir's witness of the log —
+    /// a re-base onto a moved or replaced log, or a first witness where none
+    /// reads — goes on and delivers on it, as before sim item S7: the next
+    /// attach tells the endpoint the move from the older witness (or, with
+    /// none, a bare identity), and the endpoint forgets rows it holds — a
+    /// second delivery.
     AttachPastAnUnwrittenWitness,
     /// An in-flight entry the attach published again is cleared as it lands, as before sim item S7.
     DeliverBeforeTheDrain,
@@ -107,7 +131,7 @@ pub(crate) enum Mutant {
     CopyOnEveryTry,
 }
 
-/// What one run.
+/// What one run is.
 #[derive(Clone, Debug)]
 pub(crate) struct Opts {
     pub(crate) seed: u64,
@@ -177,7 +201,7 @@ impl Opts {
         }
     }
 
-    /// `self` with one bridge rule switched.
+    /// `self` with one bridge rule switched off.
     pub(crate) fn with(mut self, m: Mutant) -> Self {
         self.mutants.insert(m);
         self
@@ -255,7 +279,8 @@ pub(crate) struct Stats {
     pub(crate) sibling_retired: u64,
     /// The racing sibling ([`Opts::race`]), 1 or 0.
     pub(crate) sibling_raced: u64,
-    /// The alias injected a live sibling at the current incarnation and the real bridge's first.
+    /// The alias injected a live sibling at the current incarnation and the
+    /// real bridge's first node publish actually collided with its row.
     pub(crate) sibling_alias_collided: u64,
     /// The specific same-dir session observed live before the first bridge died.
     pub(crate) alias_ghost_retired: u64,
@@ -352,7 +377,8 @@ struct World {
     person_seq: u64,
     violations: Vec<String>,
     stats: Stats,
-    /// The lowest offset a broker restart cut back.
+    /// The lowest offset a broker restart cut back to: an offset at or above
+    /// it may name another record now than when it was handed out.
     lost_floor: Option<u64>,
     /// What a sibling's rows carry past the fields every row.
     sibling_mark: String,
@@ -683,6 +709,7 @@ impl World {
         let reqs = std::mem::take(&mut lock(&self.ep.state).requests);
         for r in reqs {
             // The link said down for a state-dir write the disk refused
+            // (sim item S7): an attach held back, a record held back.
             if r.starts_with("link down reason=error") {
                 self.stats.held_for_the_disk += 1;
             }
@@ -1067,6 +1094,7 @@ impl World {
         }
         if self.opts.write_errors {
             // The disk fills, or has room again (an emptied full disk sooner
+            // than a full one fills).
             menu.push((if self.core.device.is_full() { 4 } else { 1 }, 19));
         }
         let total: u64 = menu.iter().map(|(w, _)| w).sum();
@@ -2016,6 +2044,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     let mut w = World::new(opts.clone());
     if opts.alias {
         // exit_one preserves two sessions, so give the real first bridge a
+        // third to carry and then lose while it is down.
         w.open_one();
     }
     w.launch();

@@ -21,7 +21,7 @@ use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
-use crate::supervise::occupancy::{OccupancyReading, PaceGrant, RuleId, SlotsSeen};
+use crate::supervise::occupancy::{OccupancyReading, OccupancySaid, PaceGrant, RuleId, SlotsSeen};
 use crate::supervise::policy::exception::Exception;
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::reset::{
@@ -169,6 +169,8 @@ tape_arg_debug!(
     UsageWindow,
     // `occupancy_pace`'s rule: a closed enum, printed as its variant.
     RuleId,
+    // `occupancy_said`'s word: closed words and plain numbers, no `Instant`.
+    OccupancySaid,
 );
 
 /// A call's request as a tape holds it: `name=<Debug>` for each argument, a line each, in the signature's order; nothing for a call with none.

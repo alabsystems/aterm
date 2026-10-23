@@ -91,7 +91,6 @@ impl Toolchain {
     }
 }
 
-/// The variable the dynamic loader searches after a binary's own rpaths.
 const LOADER_VAR: Option<&str> = if cfg!(target_os = "macos") {
     Some("DYLD_FALLBACK_LIBRARY_PATH")
 } else if cfg!(unix) {
@@ -100,9 +99,6 @@ const LOADER_VAR: Option<&str> = if cfg!(target_os = "macos") {
     None
 };
 
-/// `lib` first, then `inherited`. An unset `DYLD_FALLBACK_LIBRARY_PATH` means
-/// dyld's default fallback, which setting the variable replaces, so that
-/// default follows `lib` as rustup keeps it.
 fn loader_path(var: &str, lib: &Path, inherited: Option<&OsStr>, home: Option<&OsStr>) -> OsString {
     let mut path = OsString::from(lib);
     match inherited.filter(|v| !v.is_empty()) {

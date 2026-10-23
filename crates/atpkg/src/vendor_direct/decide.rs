@@ -1,11 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The vendor lane's decision (design §1.3), pure: what to do with one program given the
-//! installed build, the vendor's head and the signed policy.
-//!
-//! Only a signed yank of the installed version can move a machine backwards; a head that
-//! regresses, freezes or vanishes is kept at, never followed.
+//! Pure vendor-lane upgrade, hold, and yank rollback decision logic.
 
 use super::policy::Policy;
 use super::version::{BuildDate, Version};
@@ -26,8 +22,7 @@ pub(crate) struct InstalledView {
 pub(crate) enum Installed {
     /// No build is active.
     Nothing,
-    /// A legacy ALab index build (no `.vendor` record): its store build number, and the
-    /// vendor version its artifact spells, when it spells one.
+    /// A legacy ALab index build (no `.vendor` record).
     Legacy {
         /// The index build number.
         build: u64,
@@ -66,8 +61,7 @@ pub(crate) struct Inputs<'a> {
     pub program: &'a str,
     /// The active build.
     pub installed: Installed,
-    /// The newest retained complete vendor build below the installed one — the only
-    /// rollback target a yank may move to.
+    /// The newest retained complete vendor build below the installed one.
     pub previous: Option<InstalledView>,
     /// The head, or `None` when it could not be reached or verified.
     pub head: Option<HeadView>,
@@ -75,17 +69,13 @@ pub(crate) struct Inputs<'a> {
     pub policy: &'a Policy,
     /// The compiled floor ([`super::VendorSpec::floor`]).
     pub floor: Version,
-    /// The stamp's high-water ([`super::ProgramStamp::high_water`]). It binds only while a
-    /// build is installed; a fresh install is bounded by the floor alone. After a
-    /// `ReplacesYanked` install or a `RollbackTo`, the lane records the new build with
-    /// `ProgramStamp::record_yank_move`, which is what lowers it.
+    /// The stamp's high-water ([`super::ProgramStamp::high_water`]).
     pub high_water: Option<Version>,
     /// The local hold (`atpkg pin`).
     pub held: bool,
     /// The compiled legacy ceiling ([`super::VendorSpec::legacy_ceiling`]).
     pub legacy_ceiling: u64,
-    /// A person asked for this program by name (`update <program>`, `install <program>`,
-    /// `claude update`): an unread legacy build above the ceiling is replaced all the same.
+    /// A person asked for this program by name.
     pub asked: bool,
 }
 
@@ -96,12 +86,10 @@ pub(crate) enum InstallReason {
     Fresh,
     /// The head is newer than the installed build.
     Newer,
-    /// The installed build is a legacy index build whose version could not be read. No
-    /// downgrade when the build is a legacy pin (1 up to the ceiling): the head is at or
-    /// above the compiled floor, which is at or above the version of every legacy pin
-    /// ([`super::VendorSpec::legacy_ceiling`]); any other, a person asked.
+    /// The installed build is a legacy index build whose version could not be read
+    /// ([`super::VendorSpec::legacy_ceiling`]).
     ReplacesLegacy,
-    /// The installed build is yanked and the head is admissible — possibly older.
+    /// The installed build is yanked and the head is admissible.
     ReplacesYanked,
 }
 
@@ -112,7 +100,7 @@ pub(crate) enum KeepReason {
     NoHead,
     /// The head is the installed version.
     UpToDate,
-    /// The head is older than the installed version: never an automatic downgrade.
+    /// The head is older than the installed version.
     HeadOlder,
     /// The head version is yanked.
     HeadYanked,
@@ -126,9 +114,7 @@ pub(crate) enum KeepReason {
     BuildDateRegressed,
     /// A local hold suppresses the upgrade.
     Held,
-    /// The installed build is a legacy index build that is no legacy pin (above the ceiling,
-    /// or any build of a program no index pinned), so its version may be above the floor; its
-    /// version could not be read and no person asked. Kept until either changes.
+    /// The installed build is a legacy index build that is no legacy pin.
     LegacyUnread,
 }
 
@@ -144,29 +130,13 @@ pub(crate) enum Decision {
     },
     /// Leave the installed build (or nothing) as it is.
     Keep(KeepReason),
-    /// Re-activate this retained build: the installed build is yanked and the head is not
-    /// admissible.
+    /// Re-activate this retained build.
     RollbackTo(u64),
-    /// The installed build is yanked and nothing admissible exists: mark unrunnable.
+    /// The installed build is yanked and nothing admissible exists.
     Tombstone,
 }
 
 /// Decide one program.
-///
-/// * A yanked installed build (by version, or a legacy build by its index build number)
-///   is the one sanctioned downgrade: the head if it is admissible (not yanked, at or
-///   above the floor, major at most one above), else the previous build if it is (not
-///   yanked, at or above the floor), else tombstone. A hold never keeps a yanked build.
-/// * Otherwise a hold keeps any active build, legacy included.
-/// * Otherwise install iff nothing is installed or the head is newer than the installed
-///   version (a legacy build of unknown version is replaced when its build is a legacy
-///   pin, 1 up to the ceiling, or a person asked), and the head is not yanked, at or above
-///   the floor, at most one major above, and — when both carry one — not older by
-///   `buildDate`; and, while a build is installed, at or above the high-water.
-///   A yanked high-water is no mark: the signed move off it went below it on purpose.
-///   With nothing installed the mark does not bind: the floor alone refuses a replayed
-///   head, and a vendor pulling back a release it shipped never leaves the program
-///   uninstallable.
 #[must_use]
 pub(crate) fn decide(i: &Inputs<'_>) -> Decision {
     let yanked = |v: Version| i.policy.is_yanked(i.program, v);
@@ -228,9 +198,6 @@ pub(crate) fn decide(i: &Inputs<'_>) -> Decision {
     }
     let reason = match i.installed {
         Installed::Nothing => InstallReason::Fresh,
-        // The floor vouches only for the legacy pins, builds 1 up to the ceiling (none for
-        // a program no index pinned): any other may carry a version above it, so an unread
-        // one moves only when a person asks.
         Installed::Legacy {
             build,
             version: None,
@@ -297,7 +264,6 @@ mod tests {
         Some(BuildDate::parse(text).unwrap())
     }
 
-    /// Nothing installed, head 2.1.281, floor 2.1.280, no yanks, no hold.
     fn base(policy: &Policy) -> Inputs<'_> {
         Inputs {
             program: "claude",
@@ -313,7 +279,6 @@ mod tests {
         }
     }
 
-    /// The legacy ceiling these tests decide under (the newest legacy pin they assume).
     const CEILING: u64 = 2_026_092_201;
 
     fn install(text: &str, reason: InstallReason) -> Decision {
@@ -383,7 +348,6 @@ mod tests {
             ..base(&none)
         };
         assert_eq!(decide(&below_hw), keep(KeepReason::BelowHighWater));
-        // Nothing installed: the floor alone bounds the head.
         let fresh_below_hw = Inputs {
             high_water: Some(v("2.1.285")),
             ..base(&none)
@@ -411,7 +375,6 @@ mod tests {
             ..base(&policy)
         };
         assert_eq!(decide(&upgrade), keep(KeepReason::HeadYanked));
-        // Another program's yank of the same version does not bind.
         let other = Policy::from_entries(["codex@2.1.281"]);
         assert_eq!(
             decide(&base(&other)),
@@ -441,7 +404,6 @@ mod tests {
             decide(&higher),
             install("2.1.286", InstallReason::ReplacesYanked)
         );
-        // A hold never keeps a yanked build.
         let held = Inputs {
             held: true,
             ..lower
@@ -536,7 +498,6 @@ mod tests {
             ..base(&none)
         };
         assert_eq!(decide(&plus_two), keep(KeepReason::MajorJump));
-        // A fresh install has no major to jump from.
         let fresh = Inputs {
             head: head("9.0.0"),
             ..base(&none)
@@ -596,8 +557,6 @@ mod tests {
             };
             assert_eq!(decide(&held), keep(KeepReason::Held), "{installed:?}");
         }
-        // A pin cannot outlive its build (`cmd_pin` refuses a program not installed), and
-        // with nothing active there is nothing to hold.
         let held_fresh = Inputs {
             held: true,
             ..base(&none)
@@ -608,8 +567,6 @@ mod tests {
         );
     }
 
-    /// A legacy build's version, when its artifact spells one, keeps every no-downgrade
-    /// rule; one of unknown version is replaced, but never below the high-water.
     #[test]
     fn a_legacy_build_is_never_downgraded() {
         let none = Policy::default();
@@ -647,9 +604,6 @@ mod tests {
         );
     }
 
-    /// An unread legacy build at or below the ceiling (the newest legacy pin this code knows)
-    /// is replaced on every lane; one above it is kept until its version is read or a person
-    /// asks, and a person's door is still bounded by the floor, the high-water and the yanks.
     #[test]
     fn an_unread_legacy_build_above_the_ceiling_moves_only_when_a_person_asks() {
         let none = Policy::default();
@@ -674,7 +628,6 @@ mod tests {
             decide(&asked),
             install("2.1.281", InstallReason::ReplacesLegacy)
         );
-        // Its version read, it is an ordinary legacy build again.
         for (version, want) in [
             ("2.1.290", keep(KeepReason::HeadOlder)),
             ("2.1.280", install("2.1.281", InstallReason::Newer)),
@@ -685,7 +638,6 @@ mod tests {
             };
             assert_eq!(decide(&read), want, "{version}");
         }
-        // The person's door keeps every other bound.
         let below_floor = Inputs {
             head: head("2.1.279"),
             ..asked
@@ -702,7 +654,6 @@ mod tests {
             ..asked
         };
         assert_eq!(decide(&yanked), keep(KeepReason::HeadYanked));
-        // A signed yank of the build itself moves it unattended, as below the ceiling.
         let build_yanked = Policy::from_entries(["claude@2026092202"]);
         let revoked = Inputs {
             policy: &build_yanked,
@@ -714,9 +665,6 @@ mod tests {
         );
     }
 
-    /// A program no index ever pinned ([`super::super::NEVER_INDEX_PINNED`]) has no vouched
-    /// legacy build: every unread non-vendor build, build 0 too, is kept until a person asks
-    /// or its version is read.
     #[test]
     fn a_never_pinned_program_keeps_every_unread_legacy_build() {
         let none = Policy::default();
@@ -742,8 +690,6 @@ mod tests {
             };
             assert_eq!(decide(&read), install("2.1.281", InstallReason::Newer));
         }
-        // The negative control: under a real ceiling, a pin up to it is replaced unattended
-        // (and build 0, never a pin, is not).
         let pinned = Inputs {
             installed: legacy(1, None),
             ..base(&none)
@@ -787,7 +733,6 @@ mod tests {
             };
             assert_eq!(decide(&stranded), Decision::Tombstone);
         }
-        // Another legacy build's yank does not bind, and never touches a vendor build.
         let other = Policy::from_entries(["claude@2026091801"]);
         let untouched = Inputs {
             installed: legacy(2_026_091_901, Some("2.1.278")),
@@ -802,8 +747,6 @@ mod tests {
         assert_eq!(decide(&on_vendor), keep(KeepReason::NoHead));
     }
 
-    /// A yank of the installed build prefers the admissible head over the retained
-    /// previous build.
     #[test]
     fn a_yanked_installed_version_prefers_the_head_to_a_rollback() {
         let policy = Policy::from_entries(["claude@2.1.285"]);
@@ -820,8 +763,6 @@ mod tests {
         );
     }
 
-    /// The pass after a signed downgrade: a head between the new build and the yanked one
-    /// installs, whether or not the stamp's mark was moved off the yanked version yet.
     #[test]
     fn a_signed_downgrade_does_not_strand_the_next_update() {
         let policy = Policy::from_entries(["codex@0.157.0"]);
@@ -852,7 +793,6 @@ mod tests {
             let regressed = codex(vendor("0.156.1"), "0.156.0", mark);
             assert_eq!(decide(&regressed), keep(KeepReason::HeadOlder), "{mark:?}");
         }
-        // The same after a rollback, and for an accidental major release pulled back.
         let rolled_back = codex(vendor("0.156.0"), "0.156.3", Some(v("0.157.0")));
         assert_eq!(
             decide(&rolled_back),
@@ -875,8 +815,6 @@ mod tests {
             ..pulled
         };
         assert_eq!(decide(&next), install("2.1.291", InstallReason::Newer));
-        // A mark that is not yanked still binds — why the lane moves it with
-        // `record_yank_move` after the move.
         let lifted = Inputs {
             policy: &Policy::default(),
             ..next

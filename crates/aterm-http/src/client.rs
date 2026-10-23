@@ -807,6 +807,8 @@ fn render_fields(
     }
     for (name, value) in headers {
         // A caller header never duplicates a generated one: two `Host` or
+        // `Content-Length` lines is a request-smuggling signature, and a second
+        // `Connection` could revive keep-alive under close framing.
         if is_reserved(name) {
             continue;
         }
@@ -1440,6 +1442,7 @@ fn decide_framing(
     headers: &[(String, String)],
 ) -> Result<Framing, Error> {
     // A final 101 switches to a protocol this client never asked for: no
+    // framing of this one describes what follows.
     if status == 101 {
         return Err(Error::Protocol(
             "unrequested 101 Switching Protocols".to_owned(),

@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A test's spawn record: [`Live`] with every run it makes written down first, as that run
-//! was asked for, so a test can say what was (and was not) spawned on the real host.
+//! Recording wrapper around [`Live`] that logs every spawned command.
 
 use super::{Cmd, Live, Ran, RunFailed, Scratch, Stat, System, User};
 use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
-/// Every run made through a real `System`, as that `System` spawns it: the [`Cmd`] (its
-/// program, arguments, environment and directory; [`Live::spawned`] gives the argv and the
-/// whole environment), plus the bytes it was handed on standard input.
+/// Records every command spawned through a [`Live`] system along with its standard input.
 pub(crate) struct Spawns<'a> {
     live: &'a Live,
     record: Mutex<Vec<(Cmd, Option<Vec<u8>>)>>,

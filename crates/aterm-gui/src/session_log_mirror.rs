@@ -646,7 +646,7 @@ fn push_slot(out: &mut String, sid: &str, s: &Slot) {
 }
 
 /// What one pair of a `log-landed` came to.
-fn landing_word(r: Result<Landed, LandRefused>) -> &'static str {
+const fn landing_word(r: Result<Landed, LandRefused>) -> &'static str {
     match r {
         Ok(Landed::Moved) => "ok",
         Ok(Landed::Stale) => "stale",

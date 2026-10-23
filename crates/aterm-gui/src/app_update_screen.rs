@@ -177,7 +177,7 @@ impl App {
     }
 
     /// A person's `aterm ctl update check` began or ended (`Wake::UpdateCheckAsked`).
-    pub(crate) fn note_update_check_asked(&mut self, begun: bool) {
+    pub(crate) const fn note_update_check_asked(&mut self, begun: bool) {
         self.update_ctl_checks = if begun {
             self.update_ctl_checks.saturating_add(1)
         } else {
@@ -1079,7 +1079,7 @@ impl App {
 
     /// Whether pressing the update row applies the staged build in place (requires
     /// `FlowPhase::Staged`, `staged_ready`, and `handoff_available`).
-    pub(crate) fn update_bar_press_applies(
+    pub(crate) const fn update_bar_press_applies(
         bar_is_staged: bool,
         staged_ready: bool,
         handoff_available: bool,

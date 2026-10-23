@@ -7,6 +7,7 @@
 #[must_use]
 #[inline]
 pub const fn visible_char(ch: char) -> char {
+    // NUL and the rest of `char::is_control` (general category Cc), spelled
     // out: `is_control` is not a `const fn` on stable Rust.
     if matches!(ch, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') {
         ' '

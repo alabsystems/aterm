@@ -514,6 +514,8 @@ impl GridStorage {
     pub(crate) fn resize_viewport_state(&mut self, new_rows: u16, new_cols: u16) {
         if new_cols != self.cols {
             // Only grow tab_stops, never shrink, preserving custom stops beyond
+            // the current width across a shrink+grow (as xterm does). Tab ops
+            // bounds-check via max_col, so a larger array is safe.
             if usize::from(new_cols) > self.tab_stops.len() {
                 let old_len = self.tab_stops.len();
                 self.tab_stops.resize(usize::from(new_cols), false);

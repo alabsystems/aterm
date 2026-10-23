@@ -453,7 +453,7 @@ fn name_width(base: f64, pt: f64, m: &FaceMetrics) -> f64 {
 }
 
 /// The deck's width in whole points.
-fn whole_width(w_pt: f64) -> f64 {
+const fn whole_width(w_pt: f64) -> f64 {
     if w_pt.is_finite() {
         w_pt.max(0.0).floor()
     } else {
@@ -551,7 +551,7 @@ pub(crate) struct Rows {
 }
 
 impl Rows {
-    fn full(kind: FullKind) -> Self {
+    const fn full(kind: FullKind) -> Self {
         let (pitch, cell, count, baseline, bar_h) = match kind {
             FullKind::Wide | FullKind::Mid => (12.0, 9.0, 7, 8.0, 6.0),
             FullKind::Narrow | FullKind::Slim => (10.5, 8.0, 8, 7.0, 5.0),
@@ -575,7 +575,7 @@ impl Rows {
         }
     }
 
-    fn folded(kind: BlockKind) -> Self {
+    const fn folded(kind: BlockKind) -> Self {
         Self {
             header_baseline: 9.5,
             top0: 14.0,
@@ -1466,7 +1466,7 @@ struct Header<'m> {
 }
 
 impl<'m> Header<'m> {
-    fn new(m: &'m FaceMetrics) -> Self {
+    const fn new(m: &'m FaceMetrics) -> Self {
         Self {
             m,
             labels: Vec::new(),

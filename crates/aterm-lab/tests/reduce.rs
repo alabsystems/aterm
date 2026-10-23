@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-lab reduce` reads the caller's paths as the caller gave them: the
-//! lab moves itself to `/` before it dispatches a verb (`sys::confine_env`),
-//! so a relative `<file>` or `--out FILE` is read against the directory the
-//! lab was run from (`paths::from_caller`), never against `/`.
+//! Verifies that `aterm-lab reduce` resolves relative input and `--out` paths against the caller's working directory.
 
 #![cfg(target_os = "macos")]
 
 use std::path::Path;
 
-/// The real binary, run from `dir` with `args`: its exit code and stderr.
 fn lab_in(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
     let out = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-lab"))
         .args(args)
@@ -23,9 +19,6 @@ fn lab_in(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
     )
 }
 
-/// A relative transcript and a relative `--out` are the caller's: the
-/// reduction is read from and written beside the caller's directory, and
-/// nothing is made at `/`.
 #[test]
 fn reduce_reads_and_writes_the_callers_relative_paths() {
     let dir = aterm_tempfile::tempdir().expect("a scratch dir");

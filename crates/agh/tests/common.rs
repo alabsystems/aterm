@@ -24,7 +24,6 @@ use agh_fake::FakeGithub;
 /// The hang detector for anything that must happen.
 pub const HANG: Duration = Duration::from_secs(60);
 
-/// The simulated clock's start, in Unix seconds.
 const SIM_START: u64 = 1_760_000_000;
 
 /// `text` as a repository name, which the test knows to be one.
@@ -61,13 +60,6 @@ pub fn write_token(dir: &Path, name: &str, token: &str) -> PathBuf {
 }
 
 // Writes `path` (`0600`) without `F_FULLFSYNC` to avoid volume-wide flush contention in tests.
-/// A test's setup file, 0600 when new, written whole (replacing what stood there) and NOT
-/// flushed. `write_private` (the
-/// writer agh's own store uses) ends each write with two `F_FULLFSYNC`s, a drive-cache
-/// flush that holds up most creates, renames and flushes on the volume while it runs;
-/// the suite's 614 tests made one or two each, and nothing a test reads depends on the
-/// drive's cache. Sampled in a full run, its threads waited in those flushes and in the
-/// renames and `mkdir`s behind them.
 #[cfg(unix)]
 fn setup_file(path: &Path, bytes: &[u8]) {
     use std::io::Write as _;

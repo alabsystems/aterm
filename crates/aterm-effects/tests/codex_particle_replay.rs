@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The band under Codex's composer is one run, on every frame, through word hops and edits.
-//!
-//! Codex (ratatui, per-cell diff) paints an ambient Braille particle field (`⠁ ⠄ ⠈ ⢀`, dim
-//! grey) into its composer's blank cells every ~150 ms inside a `?2026` bracket. The particles
-//! drift, so a typed space flips `' '` → `'⠈'` → `' '` while the words either side stand; a
-//! caret parked on such a cell (an Alt+Right hop lands on the space after the word) clears the
-//! particle and the next frame paints it back, and a typed space can even echo as a particle.
-//!
-//! This file replays Codex's real bytes (`fixtures/codex-particles-2026-09-16.ptylog`: a line,
-//! Alt+Left ×3, a word, Alt+Right ×3, two letters) through a real [`Terminal`] sampled as
-//! `app_render.rs`'s frame hold samples it, fed to [`CursorGlow`] with the app's hints, and
-//! censuses the plan's coverage on the composer row every 8 ms.
+//! Replays captured Codex PTY logs through `Terminal` and `CursorGlow` to verify composer ribbon continuity.
 
 use crate::common::{
     LIT_COV, caret_sample, coverage, geom, holes_of, is_arrow, note_blink, observe_caret_row,
@@ -25,35 +14,23 @@ use aterm_effects::rainbow_kitty::TypedClass;
 use aterm_models_effects::{rainbow_typed_continuity_model, same_caret_typed_echo_model};
 use std::time::{Duration, Instant};
 
-/// The take's grid and cell: `resize 32 100` in a headless instance, 7×14 px.
 const ROWS: usize = 32;
 const COLS: usize = 100;
 const CW: usize = 7;
 const CH: usize = 14;
-/// The frame train.
 const FRAME_MS: u64 = 8;
-/// Replay stops before the take's exit keys (Ctrl+C ×2, then Ctrl+D).
 const END_MS: u64 = 9_500;
 
 const FIXTURE: &str = include_str!("fixtures/codex-particles-2026-09-16.ptylog");
-/// Codex's wrapped composer at 56×137, 24 px. The first `a` key is at
-/// 8893 ms and its complete synchronized echo at 8916 ms; the `and ` run
-/// retires before the `introspection` continuation at 10887 ms.
 const WRAPPED_FIXTURE: &str = include_str!("fixtures/codex-wrapped-composer-2026-09-22.ptylog");
-/// A second 24 px take where the host first presented `and ` in one batch:
-/// `a` was 391 ms old at the 10.0 s frame while the trailing space was fresh.
 const STALLED_WRAPPED_FIXTURE: &str =
     include_str!("fixtures/codex-wrapped-composer-stalled-2026-09-22.ptylog");
-/// A take whose ordinary 22:2→3 `a` admission must stay cached for the first resumed frame.
 const FIRST_FRAME_FIXTURE: &str =
     include_str!("fixtures/codex-wrapped-composer-first-frame-2026-09-22.ptylog");
 
 enum Event {
-    /// Bytes the program wrote to the terminal.
     Out(Vec<u8>),
-    /// Bytes the keyboard sent to the program.
     In(Vec<u8>),
-    /// Controller `turn` fences the previous turn's movement licence.
     ClearLicence,
 }
 
@@ -79,7 +56,6 @@ fn events(fixture: &str) -> Vec<(u64, Event)> {
         .collect()
 }
 
-/// The config the take ran: rainbow kitty, tall body, intensity 1.0, dark.
 fn cfg() -> GlowConfig {
     GlowConfig {
         duration: Duration::from_millis(260),
@@ -88,8 +64,6 @@ fn cfg() -> GlowConfig {
     }
 }
 
-/// One frame's census of one row: the lit columns as a map, with the span's
-/// interior dark runs, and where the caret stood.
 struct RowCensus {
     ms: u64,
     row: u16,
@@ -97,10 +71,6 @@ struct RowCensus {
     map: String,
     lit: usize,
     holes: Vec<usize>,
-    /// Interior gaps in the ribbon's own live cells on the row: a column
-    /// between two live cells that no live cell owns. The plan's coverage
-    /// feathers across a one-cell gap, so this catches a dark column the
-    /// coverage census does not.
     cell_gaps: Vec<usize>,
 }
 
@@ -121,13 +91,9 @@ struct Host {
     row_buf: Vec<char>,
     blink: u64,
     scroll: Option<ContentScrollState>,
-    /// The composer row, learnt from the caret at the first typed key.
     composer_row: Option<u16>,
-    /// Reproduce a host frame slip while Codex echoes two keys separately.
     suppress_frames_ms: Option<(u64, u64)>,
     suppress_extra_ms: Option<(u64, u64)>,
-    /// The frame cadence: ordinary fixture tests keep the dense train, the
-    /// screenshot regression uses the glass capture's 5 Hz.
     frame_ms: u64,
     present_on_output: bool,
     census: Vec<RowCensus>,
@@ -166,7 +132,6 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// The host's order: `sync_cursor_effect_scroll`, the frame's samples, then the tick.
     fn frame(&mut self) {
         sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
         let (c, cur) = caret_sample(&self.term);
@@ -184,9 +149,6 @@ impl Host {
     fn run_to(&mut self, ms: u64) {
         let t = self.t0 + Duration::from_millis(ms);
         if !self.present_on_output {
-            // A live window presents on its own cadence even while PTY
-            // packets arrive more often than frames. Keep that cadence
-            // anchored to the fixture clock, not each packet's timestamp.
             let mut next = (self.ms() / self.frame_ms + 1) * self.frame_ms;
             while next <= ms {
                 self.now = self.t0 + Duration::from_millis(next);
@@ -215,10 +177,6 @@ impl Host {
                 .is_none_or(|(start, end)| !(start..end).contains(&self.ms()))
     }
 
-    /// The hint the app stamps for what the keyboard sent: a printable byte is
-    /// a typed key, Backspace erases one glyph, an arrow (plain or Alt) is a
-    /// navigation key. The terminal's replies to Codex's queries and the
-    /// take's exit chords stamp nothing.
     fn hint(&mut self, bytes: &[u8]) {
         match bytes {
             [b] if (0x20..0x7f).contains(b) => {
@@ -239,7 +197,6 @@ impl Host {
         }
     }
 
-    /// This frame's census of the plan's coverage on the composer row.
     fn record(&mut self, caret_row: u16, caret_col: u16) {
         let Some(row) = self.composer_row else { return };
         let cov = coverage(&self.glow, self.g, row);
@@ -330,9 +287,6 @@ fn replay_with(fixture: &str, end_ms: u64, mut h: Host) -> Host {
     h
 }
 
-/// A line, three word hops back, a word typed inside it, three word hops
-/// forward, two letters at the end: the two spaces the forward hops parked
-/// the caret on stay lit with the words either side of them.
 #[test]
 fn a_backward_edit_in_codex_never_punches_a_hole_in_the_band() {
     let h = replay();
@@ -344,13 +298,9 @@ fn a_backward_edit_in_codex_never_punches_a_hole_in_the_band() {
     assert!(h.broken().is_empty(), "{}", h.report("codex-g1"));
 }
 
-/// A space echoed as a particle is still the user's space. While the line
-/// is typed, with no navigation and nothing erased, the light under the
-/// first word still stands when the last word is typed, as it does in zsh.
 #[test]
 fn plain_typing_under_codex_keeps_the_whole_line_lit() {
     let h = replay();
-    // The line's last key lands at 5432 ms in the fixture; the first at 2356.
     let at_end: Vec<&RowCensus> = h
         .census
         .iter()
@@ -372,17 +322,9 @@ fn plain_typing_under_codex_keeps_the_whole_line_lit() {
     );
 }
 
-/// The hand's own cells are one interval while it types. The plan feathers
-/// coverage across a missing column, so this checks the ribbon's live cells:
-/// the first key of the mid-line insert, typed over a lit cell the hops
-/// brought the caret back onto, re-lays a cell there (`Ribbon::sweep`), and
-/// no frame from the insert to the last key has a gap at the insert column.
 #[test]
 fn a_key_typed_over_the_band_gets_its_own_cell() {
     let h = replay();
-    // From the insert's first echo (6289 ms) to the last key of the take,
-    // while the hand is on the row: the suffix's melting cells are
-    // `leaving` and excluded, so the live set is the band under the hand.
     let broken: Vec<&RowCensus> = h
         .census
         .iter()
@@ -419,9 +361,6 @@ fn first_echo_model_verdict(evidence: &str, typeahead: bool) -> bool {
     state["admitted"] == 1
 }
 
-/// Codex rewrites the first wrapped-row glyph under a same-position caret
-/// while an unrelated status row may become the last print anchor. The exact
-/// key glyph and changed, hand-owned cell make this one-key re-lay licensed.
 #[test]
 fn first_codex_key_on_wrapped_row_reowns_its_cell() {
     let h = replay_warm_wrapped(&wrapped_with_licence_clear(), 9_000);
@@ -439,12 +378,6 @@ fn first_codex_key_on_wrapped_row_reowns_its_cell() {
     );
 }
 
-/// A loaded child may emit only the first wrapped-row glyph after the short
-/// 250 ms key hint has expired. The press is still in flight, and the exact
-/// blank-to-`a` caret-row probe plus the new print generation identify its
-/// echo even though Codex returns the visible caret to the same cell and
-/// leaves its status row as the last print anchor. An ambient particle or a
-/// keyless same-row print must not borrow that in-flight credit.
 #[test]
 fn delayed_single_same_caret_echo_reowns_only_the_exact_typed_glyph() {
     let base = wrapped_with_licence_clear();
@@ -489,8 +422,6 @@ fn delayed_single_same_caret_echo_reowns_only_the_exact_typed_glyph() {
     );
 }
 
-/// An ambient particle at the same cell is a different glyph, and a matching
-/// program print before the press is too old to claim its credit.
 #[test]
 fn first_a_recovery_refuses_particle_and_pre_key_program_paint() {
     let base = wrapped_with_licence_clear();
@@ -541,10 +472,6 @@ fn first_a_recovery_refuses_particle_and_pre_key_program_paint() {
     );
 }
 
-/// A loaded host can miss the individual `a` frame and first observe the
-/// `a,n,d` bytes as one forward hop. The exact first glyph is re-laid before
-/// the ordinary batch spends its own credits; a Braille particle cannot be
-/// treated as that glyph.
 #[test]
 fn coalesced_wrapped_prefix_keeps_first_key_and_refuses_particle() {
     let base = wrapped_with_licence_clear();
@@ -583,10 +510,6 @@ fn coalesced_wrapped_prefix_keeps_first_key_and_refuses_particle() {
     );
 }
 
-/// The captured wrapped-composer screen just before its first `a`, then one longer
-/// synchronized echo. The 5 Hz train samples the blank row before the keys and misses every
-/// intermediate echo, so at the frame that sees the phrase the first key is past the hint
-/// window and the last is fresh.
 fn long_wrapped_batch(
     typed: &str,
     painted: &str,
@@ -596,9 +519,6 @@ fn long_wrapped_batch(
     assert_eq!(typed.len(), painted.len());
     assert!((9..=128).contains(&typed.len()));
     assert!(typed.is_ascii() && painted.is_ascii());
-    // The captured setup ends at 8287 ms. A full 128-key run needs 3810 ms
-    // before its first presentation, so move that replay's echo later while
-    // preserving the same 5 Hz frame train and the captured repaint bytes.
     let first_frame = if typed.len() <= 32 { 10_600 } else { 14_600 };
     let first = first_frame - 61 - (typed.len() as u64 - 1) * 30;
     let last = first + (typed.len() as u64 - 1) * 30;
@@ -700,9 +620,6 @@ fn nine_to_128_key_wrapped_batches_reown_the_first_glyph_on_their_first_frame() 
     }
 }
 
-/// The prefix repair needs every exact key: a keyless first glyph, a changed
-/// middle glyph (in a 9-key batch and in wide 33- and 128-key batches) and an
-/// interleaved unrelated key all leave the first cell unowned.
 #[test]
 fn long_wrapped_batch_refuses_keyless_mismatch_and_interleaved_prints() {
     let phrase = "abcdefghijklmnopqrstuvwxyzABCDEF".repeat(4);
@@ -729,10 +646,6 @@ fn long_wrapped_batch_refuses_keyless_mismatch_and_interleaved_prints() {
     }
 }
 
-/// In the stalled captured take the first presentation after `and ` is one
-/// 22:3→6 hop. The oldest `a` is past the short hint window, but the exact
-/// chronological a/n/d/space suffix is still in flight and the tail is fresh.
-/// A stale wrap-fill Space before that run must be retired, never reused.
 #[test]
 fn stalled_codex_batch_reowns_first_a_from_exact_inflight_run() {
     let base = STALLED_WRAPPED_FIXTURE
@@ -747,8 +660,6 @@ fn stalled_codex_batch_reowns_first_a_from_exact_inflight_run() {
         host.suppress_extra_ms = Some(extra);
         host
     };
-    // The loaded live take declined wrap-fill before `a`, so this branch
-    // must work without an old hand-owned cell at column 2.
     let before = replay_with(&base, 9_600, host((8_200, 8_800)));
     assert!(
         !before
@@ -846,10 +757,6 @@ fn ordinary_first_a_reanchor_is_cached_for_the_first_resumed_frame() {
     }
 }
 
-/// The `and ` prefix, lit on the wrapped row, swooshes out after a 1.74 s key gap while Codex
-/// leaves its text in place; the first resumed key rejoins that text on its own frame. The
-/// 5 Hz train with two warm-up frames matches the live cadence: presenting each PTY packet
-/// would hide the expiry under extra frames.
 #[test]
 fn codex_same_row_continuation_restores_the_exact_retired_prefix() {
     let separate_turns = wrapped_with_licence_clear();
@@ -901,9 +808,6 @@ fn dormant_typed_run_adds_no_idle_work_after_natural_exit() {
     );
 }
 
-/// The live `ctl turn` path clears movement credits between the two typing
-/// bursts. Content evidence survives that boundary, and still requires a
-/// fresh typed echo to rejoin it.
 fn wrapped_with_licence_clear() -> String {
     let fixture = WRAPPED_FIXTURE
         .replacen("8893 I 61\n", "8880 C\n8893 I 61\n", 1)
@@ -950,10 +854,6 @@ fn continuity_model_verdict(interruption: Option<&str>, typed: bool) -> bool {
     state["revived"] == 1
 }
 
-/// Same content, same position and a typed continuation are all required.
-/// A keyless paint, a row whose saved glyph changed, a navigation key with
-/// no observed motion, and a continuation past the chain window must not
-/// resurrect the old prefix.
 #[test]
 fn retired_prefix_rejoin_refuses_changed_keyless_navigated_and_stale_rows() {
     let base = wrapped_with_licence_clear();

@@ -77,6 +77,7 @@ where
     // SAFETY: `ctx` points to a uniquely borrowed `Job<F, R>` while the caller blocks in `dispatch_sync_f`.
     let job = unsafe { &mut *ctx.cast::<Job<F, R>>() };
     let Some(f) = job.f.take() else {
+        // Only if libdispatch ran one submission twice; leave `out` as `None`
         // and let the caller report it.
         return;
     };
@@ -98,13 +99,24 @@ where
 /// Runs `f` on the process main thread inside an autorelease pool and returns its result.
 /// # Panics
 /// Re-raises any panic from `f`, or panics with [`ContainedInRunOnMain`] if an `NSException` was contained.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use aterm_objc::run_on_main;
+/// let scale = run_on_main(|_mt| 2.0_f64);
+/// assert_eq!(scale, 2.0);
+/// ```
 pub fn run_on_main<F, R>(f: F) -> R
 where
     F: Send + FnOnce(MainThread) -> R,
     R: Send,
 {
+    // Hot: winit's `get_modifierless_char` reaches this on every ordinary
     // character key event, so `MainThread::new` caches its class lookup.
     if let Some(mt) = MainThread::new() {
+        // Already on the main thread: call directly, since `dispatch_sync_f`
+        // here would trap. The pool wraps the closure on this path too, so the
         // pool semantics do not depend on the calling thread.
         return autoreleasepool(|_pool| f(mt));
     }

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Fire-patch (`RenderInput.fire_patch`) CPU/GPU byte parity. Every covered pixel evaluates the
-// shared integer fire field (`aterm_render::fire_field` on the CPU, the `fs_fire_add` /
-// `fs_fire_over` WGSL equivalents on the GPU), so the bar is byte-exact CPU==GPU: a synthetic
-// burn field at two font sizes and several phases, mixed Add+Over (light-theme ink) fire, the
-// cached path, a chrome head band, split-patch seams, and run-to-run determinism.
-//
-// No GPU or no font: COULD NOT RUN. On a downlevel (sRGB-offscreen) adapter
-// (`additive_is_byte_exact`) a test runs its other checks, then ends COULD NOT
-// RUN naming the byte-exact comparisons it could not make (`common::ByteExact`).
+
+//! CPU/GPU byte-parity tests for `RenderInput.fire_patch`.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{FireMode, FirePatch, Theme, WindowCpu};
@@ -17,13 +9,10 @@ use aterm_render::{FireMode, FirePatch, Theme, WindowCpu};
 use crate::common::ByteExact;
 use crate::common::{assert_byte_exact, backends, bb, block_text_term, gg, max_channel_delta, rr};
 
-/// Summed-RGB luminance proxy (monotone per channel, so ordering is exact).
 fn luma(p: u32) -> i32 {
     rr(p) + gg(p) + bb(p)
 }
 
-/// One burn's parameters (grid-interior px), turned into legal per-row-band
-/// patches by [`emit_burn`].
 #[derive(Clone, Copy)]
 struct Burn {
     x: usize,
@@ -38,10 +27,6 @@ struct Burn {
     mode: FireMode,
 }
 
-/// Emit one burn as per-row-band patches: the rect spans the flame's reach
-/// (root at `base_y`, tongues up to ~1.2·peak_h above), clamped to the grid
-/// and split at cell-row boundaries. Each slice carries its own `row` and
-/// shares the burn's field parameters, so the field is continuous.
 fn emit_burn(out: &mut Vec<FirePatch>, b: Burn, ch: usize, grid_w: usize, grid_h: usize) {
     let x0 = b.x.min(grid_w);
     let x1 = (b.x + b.w).min(grid_w);
@@ -75,13 +60,9 @@ fn emit_burn(out: &mut Vec<FirePatch>, b: Burn, ch: usize, grid_w: usize, grid_h
     }
 }
 
-/// A synthetic multi-burn field exercising every FirePatch degree of freedom:
-/// temps across the range, strengths, both lean signs, differing cov_caps,
-/// multi-row reaches, and an edge-clipped burn.
 fn synthetic_burns(phase: u32, ch: usize, grid_w: usize, grid_h: usize) -> Vec<FirePatch> {
     let mut out = Vec::new();
     let burns = [
-        // A hot tall burn spanning several row bands.
         Burn {
             x: ch,
             w: 8 * ch,
@@ -94,7 +75,6 @@ fn synthetic_burns(phase: u32, ch: usize, grid_w: usize, grid_h: usize) -> Vec<F
             cov_cap: 200,
             mode: FireMode::Add,
         },
-        // A cool ember burn, opposite lean, tight cov_cap.
         Burn {
             x: 10 * ch,
             w: 5 * ch,
@@ -107,7 +87,6 @@ fn synthetic_burns(phase: u32, ch: usize, grid_w: usize, grid_h: usize) -> Vec<F
             cov_cap: 90,
             mode: FireMode::Add,
         },
-        // A mid burn clipped at the right grid edge.
         Burn {
             x: grid_w.saturating_sub(3 * ch),
             w: 4 * ch,
@@ -120,7 +99,6 @@ fn synthetic_burns(phase: u32, ch: usize, grid_w: usize, grid_h: usize) -> Vec<F
             cov_cap: 160,
             mode: FireMode::Add,
         },
-        // A short weak burn high in the grid (top rows).
         Burn {
             x: 2 * ch,
             w: 3 * ch,
@@ -140,8 +118,6 @@ fn synthetic_burns(phase: u32, ch: usize, grid_w: usize, grid_h: usize) -> Vec<F
     out
 }
 
-/// The base frame is byte-exact, so the fire delta is the stream's alone; the synthetic field
-/// over block text at several phases must be byte-identical on both backends.
 #[test]
 fn fire_patch_synthetic_field_is_byte_exact_over_text() {
     let exact = ByteExact::default();
@@ -153,7 +129,6 @@ fn fire_patch_synthetic_field_is_byte_exact_over_text() {
     let (_cw, ch) = cpu.cell_size();
     let (grid_w, grid_h) = (cols * cpu.cell_size().0, rows * ch);
 
-    // (a) Base (no fire): the effect-only premise — CPU==GPU exactly.
     let base_input = term.cell_frame(rows, cols);
     let cpu_base = cpu.render_input(&base_input);
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
@@ -163,12 +138,9 @@ fn fire_patch_synthetic_field_is_byte_exact_over_text() {
         "procedural-block base must be byte-exact so the fire delta is effect-only"
     );
 
-    // (b) The synthetic burn field at several quantized phases (16 ms steps
-    // and a large late-clock value exercising the wrapping offsets).
     for phase in [0u32, 91_750, 91_766, 1 << 20] {
         let mut input = term.cell_frame(rows, cols);
         input.fire_patch = synthetic_burns(phase, ch, grid_w, grid_h);
-        // Anti-vacuity: multi-quad, multi-row field.
         let mut qrows: Vec<u16> = input.fire_patch.iter().map(|q| q.row).collect();
         qrows.sort_unstable();
         qrows.dedup();
@@ -198,8 +170,6 @@ fn fire_patch_synthetic_field_is_byte_exact_over_text() {
     }
 }
 
-/// A calm light theme (white ground, near-black ink): additive fire light is invisible on it,
-/// which is what `FireMode::Over` exists for.
 fn light_theme() -> Theme {
     Theme {
         fg: 0x0020_2020,
@@ -208,18 +178,11 @@ fn light_theme() -> Theme {
     }
 }
 
-/// `FireMode::Over` parity: a mixed Add+Over field (Over ink overlapping an
-/// Add ember, exercising split order) over block text is byte-exact on a dark
-/// frame and a text-on-white frame. On white the ink fire must visibly darken
-/// the frame, so the check is non-vacuous.
 #[test]
 fn over_ink_fire_byte_exact_over_dark_and_light_frames() {
     over_ink_fire_parity("over_ink_fire_byte_exact_over_dark_and_light_frames", false);
 }
 
-/// [`over_ink_fire_byte_exact_over_dark_and_light_frames`] through the wgpu
-/// oracle arm on macOS and Linux, so `fs_fire_over` and wgpu's blend state
-/// (the live renderer on Windows and wasm) draw the ink fire here too.
 #[cfg(all(any(target_os = "macos", target_os = "linux"), wgpu_arm))]
 #[test]
 fn over_ink_fire_byte_exact_cpu_vs_wgpu_oracle() {
@@ -252,8 +215,6 @@ fn over_ink_fire_parity(test: &str, oracle: bool) {
         );
 
         let mut patches = Vec::new();
-        // An Add ember with an Over ink-burn dead on top of it (same span —
-        // the Add-then-Over order is visible in every overlapped byte).
         let ember = Burn {
             x: 4 * ch,
             w: 6 * ch,
@@ -279,7 +240,6 @@ fn over_ink_fire_parity(test: &str, oracle: bool) {
             grid_w,
             grid_h,
         );
-        // A pure ink burn spanning rows, clipped at the bottom-right corner.
         let ink = Burn {
             x: grid_w - 4 * ch,
             w: 5 * ch,
@@ -308,7 +268,6 @@ fn over_ink_fire_parity(test: &str, oracle: bool) {
             "({label}) the burns must actually paint (non-vacuous)"
         );
         if label == "light" {
-            // The law the mode exists for: ink fire darkens the white ground.
             let pad = (cpu_f.width - grid_w) / 2;
             let probe_x = pad + grid_w - 2 * ch;
             let probe_y = pad + grid_h - ch / 2;
@@ -335,9 +294,6 @@ fn over_ink_fire_parity(test: &str, oracle: bool) {
     }
 }
 
-/// Cached-path parity: frame A places a burn; frame B advances its phase one 16 ms tick and
-/// moves it to other rows. The change misses the dirty gate (`fire_patch_changed`), repaints
-/// prev∪cur patch rows, and lands byte-exact with no ghost.
 #[test]
 fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
     let exact = ByteExact::default();
@@ -375,14 +331,11 @@ fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
         v
     };
 
-    // Frame A: burn rooted near the bottom — primes both caches.
     let mut in_a = base_input.clone();
     in_a.fire_patch = burn_at(grid_h - 4, 70_000);
     let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
     let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
 
-    // Frame B: the burn animates (phase +16 ≈ one 60 fps tick) and moves up two rows, a real
-    // change on new and vacated rows.
     let mut in_b = base_input.clone();
     in_b.fire_patch = burn_at(grid_h - 2 * ch - 4, 70_016);
     let misses_before = gpu.gate_misses();
@@ -399,14 +352,11 @@ fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
         "an animating fire_patch must MISS the GPU dirty gate (real re-render)"
     );
 
-    // The damaged frame equals a fresh full render (no ghost flame at the vacated rows, no
-    // missing flame at the new rows) ...
     let cpu_fresh = cpu.render_input(&in_b).pixels.clone();
     assert_eq!(
         cpu_b, cpu_fresh,
         "CPU cached-damaged fire frame must equal a fresh full render"
     );
-    // ... and byte-exact across backends over the glyph-free background.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path fire_patch CPU vs GPU max per-channel delta = {delta}");
     if exact.holds(&gpu, "damaged-path byte-exact fire gate") {
@@ -417,9 +367,6 @@ fn damaged_path_fire_patch_parity_cpu_matches_gpu() {
     }
 }
 
-/// Seams: the field is a pure function of absolute pixel coordinates, so one
-/// wide patch and the same burn split into narrow patches render identical
-/// frames. Checked on the CPU and GPU (each against itself), both modes.
 #[test]
 fn seam_law_split_patches_byte_identical_to_one_wide() {
     let theme = Theme::default();
@@ -445,11 +392,8 @@ fn seam_law_split_patches_byte_identical_to_one_wide() {
             cov_cap: 200,
             mode,
         };
-        // (a) One wide patch per row band.
         let mut wide = term.cell_frame(rows, cols);
         emit_burn(&mut wide.fire_patch, burn, ch, grid_w, grid_h);
-        // (b) The same burn split into 3 px-wide slivers, sharing every
-        // field parameter (the producer's continuity contract).
         let mut split = term.cell_frame(rows, cols);
         let mut x = burn.x;
         while x < burn.x + burn.w {
@@ -489,10 +433,6 @@ fn seam_law_split_patches_byte_identical_to_one_wide() {
     }
 }
 
-/// Head-band parity: with a chrome head band (`set_head`) and padding
-/// (`set_pad`), a window-absolute burn rooted in the grid's top row whose
-/// tongues reach into the head band (row tag 0) renders byte-exact, and the
-/// band pixels carry flame on both backends.
 #[test]
 fn fire_patch_head_band_parity_cpu_matches_gpu() {
     let exact = ByteExact::default();
@@ -511,8 +451,6 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
     let (cw, ch) = cpu.cell_size();
     let grid_top = P + H;
 
-    // (a) Base (no fire): the head-band framing itself is byte-exact, and the
-    // frame carries the `head` extension (`rows·ch + 2·pad + head` tall).
     let base_input = term.cell_frame(rows, cols);
     let cpu_base = cpu.render_input(&base_input);
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
@@ -527,8 +465,6 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
         "head-band base must be byte-exact so the fire delta is effect-only"
     );
 
-    // One strong burn rooted in the first row, window-absolute: its tongues
-    // overshoot above `grid_top`; the above-grid slice carries row tag 0.
     let base_y = grid_top + ch / 2;
     let peak_h = (2 * ch) as u16;
     let reach = (peak_h as usize) * 6 / 5 + 2;
@@ -538,7 +474,6 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
     let mut patches = Vec::new();
     let mut y = y0;
     while y < base_y + 1 {
-        // Band split anchored at grid_top; the above-grid band tags row 0.
         let band = (y as i32 - grid_top as i32).div_euclid(ch as i32);
         let band_end = (grid_top as i32 + (band + 1) * ch as i32) as usize;
         let band_end = band_end.min(base_y + 1);
@@ -571,8 +506,6 @@ fn fire_patch_head_band_parity_cpu_matches_gpu() {
         "the head-band burn must actually paint (non-vacuous)"
     );
 
-    // The band carries flame on both backends: some pixel above the grid (`y < grid_top`)
-    // differs from that backend's base.
     let band_lit =
         |painted: &[u32], base: &[u32], w: usize| (0..grid_top * w).any(|i| painted[i] != base[i]);
     assert!(

@@ -1372,6 +1372,7 @@ fn a_text_in_doubt_is_remembered_and_never_written_again_one_not_written_is_not(
         m.send_replies.push_back(reply);
         m.vanish_after = Some(1);
         if tag == "partial" {
+            // The first wait after the hand-over (the reconcile's `meta`
             // uncounted): its connection drops.
             m.by_index.insert(11, closed());
         }

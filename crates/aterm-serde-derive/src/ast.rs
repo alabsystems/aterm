@@ -7,7 +7,7 @@
 // the checks that can fire on aterm's attribute set.
 // See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
 
-//! A Serde ast, parsed from the derive input and ready to generate Rust code.
+//! A Serde AST, parsed from the derive input and ready to generate Rust code.
 
 use aterm_macro_support::{
     Data as InputData, DeriveInput, Errors, Fields, GenericParam, Generics, ToTokens, Ty,
@@ -17,8 +17,7 @@ use proc_macro::{Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 
 use crate::attr;
 
-/// A source data structure annotated with `#[derive(Serialize)]` and/or `#[derive(Deserialize)]`,
-/// parsed into an internal representation.
+/// A source data structure annotated with `#[derive(Serialize)]` and/or `#[derive(Deserialize)]`.
 pub struct Container<'a> {
     /// The struct or enum name (without generics).
     pub ident: Ident,
@@ -33,8 +32,6 @@ pub struct Container<'a> {
 }
 
 /// The fields of a struct or enum.
-///
-/// Analogous to `syn::Data`.
 pub enum Data<'a> {
     Enum(Vec<Variant<'a>>),
     Struct(Style, Vec<Field<'a>>),
@@ -59,7 +56,7 @@ pub struct Field<'a> {
     pub original: &'a aterm_macro_support::Field,
 }
 
-/// A field's name in a member expression: `self.name` or `self.0`.
+/// A field's name in a member expression.
 #[derive(Clone)]
 pub enum Member {
     Named(Ident),
@@ -122,9 +119,6 @@ impl<'a> Container<'a> {
                 for variant in variants {
                     variant.attrs.rename_by_rules(attrs.rename_all_rule());
                     for field in &mut variant.fields {
-                        // aterm's set has neither a variant `rename_all` nor
-                        // `rename_all_fields`, so a variant's fields keep their
-                        // names.
                         field.attrs.rename_by_rules(attr::RenameRule::None);
                     }
                 }
@@ -165,9 +159,7 @@ impl<'a> Data<'a> {
 }
 
 impl Field<'_> {
-    /// The span upstream attaches to code generated for this field: its first
-    /// token (stable proc_macro cannot join spans, so upstream's
-    /// `field.span()` is the first token's span too).
+    /// The span upstream attaches to code generated for this field.
     pub const fn span(&self) -> Span {
         self.original.first_span
     }
@@ -236,8 +228,7 @@ fn fields_from_ast<'a>(
         .collect()
 }
 
-/// Cross-cutting checks that require looking at more than a single attrs
-/// object. Simpler checks should happen when parsing and building the attrs.
+/// Cross-cutting checks that require looking at more than a single attrs object.
 fn check(cx: &Errors, cont: &mut Container, derive: Derive) {
     check_default_on_tuple(cx, cont);
     check_flatten(cx, cont);
@@ -245,12 +236,6 @@ fn check(cx: &Errors, cont: &mut Container, derive: Derive) {
     check_transparent(cx, cont, derive);
 }
 
-// If some field of a tuple struct is marked #[serde(default)] then all fields
-// after it must also be marked with that attribute, or the struct must have a
-// container-level serde(default) attribute. A field's default value is only
-// used for tuple fields if the sequence is exhausted at that point; that means
-// all subsequent fields will fail to deserialize if they don't have their own
-// default.
 fn check_default_on_tuple(cx: &Errors, cont: &Container) {
     if let attr::Default::None = cont.attrs.default()
         && let Data::Struct(Style::Tuple, fields) = &cont.data
@@ -258,7 +243,6 @@ fn check_default_on_tuple(cx: &Errors, cont: &Container) {
         let mut first_default_index = None;
         for (i, field) in fields.iter().enumerate() {
             // Skipped fields automatically get the #[serde(default)]
-            // attribute. We are interested only on non-skipped fields here.
             if field.attrs.skip_deserializing() {
                 continue;
             }
@@ -279,7 +263,6 @@ fn check_default_on_tuple(cx: &Errors, cont: &Container) {
     }
 }
 
-// Flattening has some restrictions we can test.
 fn check_flatten(cx: &Errors, cont: &Container) {
     match &cont.data {
         Data::Enum(variants) => {
@@ -321,9 +304,6 @@ fn check_flatten_field(cx: &Errors, style: Style, field: &Field) {
     }
 }
 
-// The tag of an internally-tagged struct variant must not be the same as either
-// one of its fields, as this would result in duplicate keys in the serialized
-// output and/or ambiguity in the to-be-deserialized input.
 fn check_internal_tag_field_name_conflict(cx: &Errors, cont: &Container) {
     let Data::Enum(variants) = &cont.data else {
         return;
@@ -366,7 +346,6 @@ fn check_internal_tag_field_name_conflict(cx: &Errors, cont: &Container) {
     }
 }
 
-// Enums and unit structs cannot be transparent.
 fn check_transparent(cx: &Errors, cont: &mut Container, derive: Derive) {
     if !cont.attrs.transparent() {
         return;
@@ -445,9 +424,7 @@ fn allow_transparent(field: &Field, derive: Derive) -> bool {
     }
 }
 
-/// The input with `Self` in its field types and generics replaced by the
-/// type itself (`Self::X` by `<Type<..>>::X`): the generated code mentions the
-/// field types inside impls of other types, where `Self` means something else.
+/// The input with `Self` in its field types and generics replaced by the type itself.
 pub fn replace_receiver(input: &DeriveInput) -> DeriveInput {
     let mut self_ty: Vec<TokenTree> = vec![TokenTree::Ident(input.ident.clone())];
     self_ty.extend(input.generics.ty_generics());
@@ -520,9 +497,6 @@ fn replace_self(tokens: Vec<TokenTree>, self_ty: &[TokenTree]) -> Vec<TokenTree>
                     out.extend(respanned);
                 }
             }
-            // A macro owns the syntax in its delimited input. Its `Self`
-            // tokens need not denote the receiver, just as upstream's
-            // receiver visitor leaves `Type::Macro` tokens untouched.
             TokenTree::Group(group) if matches!(out.as_slice(), [.., TokenTree::Ident(_), TokenTree::Punct(bang)] if bang.as_char() == '!') =>
             {
                 out.push(TokenTree::Group(group));

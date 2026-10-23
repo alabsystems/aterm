@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `<prefix>/vendor/digests.toml` (claude's and codex's) and `digests-<program>.toml` (each
-//! later program's): the first authenticated payload digest this machine saw for each
-//! `(program, version, triple)`, a `sha256` or (for a vendor that signs only that) a `sha512`,
-//! under its algorithm's key. A later, different digest for the same key is refused: a vendor
-//! re-cutting a published version is a supply-chain signal, never an update. Only a digest its
-//! anchor vouched for is recorded, or one bad response would refuse the genuine one for good.
-//! Bounded to the newest [`KEEP_PER_PROGRAM`] versions per program. A log that exists but does
-//! not read is refused, never overwritten: its first sightings are the point.
+//! First-seen authenticated payload digest log per `(program, version, triple)`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -23,21 +16,14 @@ use super::version::Version;
 use crate::manifest::{DigestAlg, one_digest};
 use crate::store::Layout;
 
-/// The log's schema.
 const LOG_SCHEMA: u32 = 1;
 
 /// Entries kept per program: the highest versions win.
 pub(crate) const KEEP_PER_PROGRAM: usize = 64;
 
-/// Bound on a log read.
 const MAX_LOG_BYTES: usize = 128 * 1024;
 
-/// A payload digest from documents the program's anchor checked: claude's from the manifest
-/// whose signature verified, codex's once the release JSON and `SHA256SUMS` agree, agy's once its
-/// two Google manifests agree, muse's only once the Developer ID team pin passed the bytes its
-/// release manifest names (the manifest alone vouches for nothing,
-/// [`super::table::Anchor::vouches_before_download`]). Construct one only at that point;
-/// [`record_or_conflict`] takes nothing else.
+/// A payload digest from documents the program's anchor checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuthenticatedDigest {
     alg: DigestAlg,
@@ -52,9 +38,7 @@ impl AuthenticatedDigest {
         alg.is_lower_hex(&hex).then_some(Self { alg, hex })
     }
 
-    /// One read back from a record an earlier pass wrote when its anchor vouched for it:
-    /// the `sha256`/`sha512` pair of keys naming exactly one digest, in the lowercase it
-    /// was written in.
+    /// One read back from a record an earlier pass wrote when its anchor vouched for it.
     #[must_use]
     pub(crate) fn recorded(sha256: &str, sha512: &str) -> Option<Self> {
         let (alg, hex) = one_digest(sha256, sha512)?;
@@ -76,8 +60,7 @@ impl AuthenticatedDigest {
         &self.hex
     }
 
-    /// The `(sha256, sha512)` pair of keys a record writes it under: the digest under its
-    /// algorithm's key, the other empty.
+    /// The `(sha256, sha512)` pair of keys a record writes it under.
     #[must_use]
     pub(crate) fn keyed(&self) -> (String, String) {
         match self.alg {
@@ -108,7 +91,6 @@ struct LogFile {
     seen: Vec<Entry>,
 }
 
-/// One sighting: exactly one of `sha256`/`sha512` is set.
 #[derive(Serialize, Deserialize)]
 struct Entry {
     program: String,
@@ -120,13 +102,8 @@ struct Entry {
     sha512: String,
 }
 
-/// `(program, version, triple)`.
 type Key = (String, Version, String);
 
-/// The programs `digests.toml` has carried since it began, each vouched for by a sha256.
-/// Every client rewrites that file from only the rows it reads, so a later program's rows
-/// there would be erased by the first older client to log a claude or codex release: each
-/// later program keeps a log of its own, which no older client opens.
 const SHARED_LOG: [&str; 2] = ["claude", "codex"];
 
 /// `program`'s log: `<prefix>/vendor/digests.toml` for a [`SHARED_LOG`] program, else
@@ -141,13 +118,10 @@ pub(crate) fn digests_path(layout: &Layout, program: &str) -> PathBuf {
 }
 
 /// Check `digest` against the first digest seen for `(program, version, triple)` and, when
-/// `record`, record it if none was. Only a recorded [`DigestSeen::New`] writes; the read
-/// and the write hold the log's lock.
-///
+/// `record`, record it if none was.
 /// # Errors
-/// An argument is malformed (not a vendor program, or a triple that is not `[a-z0-9_.]`
-/// words joined by `-`), the log exists but does not read, or it could not be locked or
-/// written.
+/// An argument is malformed (not a vendor program, or a triple that is not `[a-z0-9_.]` words
+/// joined by `-`), the log exists but does not read, or it could not be locked or written.
 pub(crate) fn record_or_conflict(
     layout: &Layout,
     program: &str,
@@ -199,12 +173,6 @@ pub(crate) fn record_or_conflict(
     Ok(DigestSeen::New)
 }
 
-/// The log at `path` as a map, empty when there is none yet; entries that do not
-/// re-validate are dropped alone.
-///
-/// # Errors
-/// A log that exists but does not read (malformed, oversized, not a regular file, another
-/// schema): read as empty, its first sightings would be overwritten unseen.
 fn read_log(path: &Path) -> io::Result<BTreeMap<Key, AuthenticatedDigest>> {
     let unreadable = || {
         io::Error::new(
@@ -242,17 +210,14 @@ fn read_log(path: &Path) -> io::Result<BTreeMap<Key, AuthenticatedDigest>> {
     Ok(log)
 }
 
-/// Drop `program`'s lowest versions until [`KEEP_PER_PROGRAM`] remain.
 fn bound(log: &mut BTreeMap<Key, AuthenticatedDigest>, program: &str) {
     let mine: Vec<Key> = log.keys().filter(|k| k.0 == program).cloned().collect();
     let excess = mine.len().saturating_sub(KEEP_PER_PROGRAM);
-    // Keys sort by (program, version, triple), so the first are the lowest versions.
     for key in mine.into_iter().take(excess) {
         log.remove(&key);
     }
 }
 
-/// `aarch64-apple-darwin`-shaped: 2–5 `-`-joined words of `[a-z0-9_.]`, at most 64 bytes.
 fn triple_ok(t: &str) -> bool {
     let words = t.split('-').count();
     t.len() <= 64
@@ -282,17 +247,14 @@ mod tests {
         c.to_string().repeat(64)
     }
 
-    /// A sha256 the test vouches for.
     fn d256(hex: &str) -> AuthenticatedDigest {
         AuthenticatedDigest::authenticated(DigestAlg::Sha256, hex).unwrap()
     }
 
-    /// A sha512 of `c`s the test vouches for.
     fn d512(c: char) -> AuthenticatedDigest {
         AuthenticatedDigest::authenticated(DigestAlg::Sha512, &c.to_string().repeat(128)).unwrap()
     }
 
-    /// [`record_or_conflict`] of a sha256 the test vouches for.
     fn rec(
         l: &Layout,
         program: &str,
@@ -303,7 +265,6 @@ mod tests {
         record_or_conflict(l, program, version, triple, &d256(sha256), true)
     }
 
-    /// [`record_or_conflict`] of a sha512 of `c`s the test vouches for.
     fn rec512(l: &Layout, program: &str, version: &str, c: char) -> DigestSeen {
         record_or_conflict(l, program, v(version), T, &d512(c), true).unwrap()
     }
@@ -325,21 +286,18 @@ mod tests {
                 first: d256(&sha('a'))
             }
         );
-        // The conflict did not replace the first sighting.
         assert_eq!(
             seen("claude", "2.1.280", T, &sha('b')),
             DigestSeen::Conflict {
                 first: d256(&sha('a'))
             }
         );
-        // Other triples, versions and programs are other keys.
         assert_eq!(
             seen("claude", "2.1.280", "x86_64-apple-darwin", &sha('b')),
             DigestSeen::New
         );
         assert_eq!(seen("claude", "2.1.281", T, &sha('b')), DigestSeen::New);
         assert_eq!(seen("codex", "2.1.280", T, &sha('b')), DigestSeen::New);
-        // Checked without recording: a first sighting stays unrecorded, a conflict is one.
         let check =
             |ver, s: &str| record_or_conflict(&l, "claude", v(ver), T, &d256(s), false).unwrap();
         assert_eq!(check("2.1.290", &sha('a')), DigestSeen::New);
@@ -366,8 +324,6 @@ mod tests {
         assert!(!vendor_dir(&l).exists());
     }
 
-    /// Only a digest of the named algorithm authenticates (sample: agy 1.3.6's darwin_arm64
-    /// sha512 from Google's manifest), held lowercase.
     #[test]
     fn only_a_digest_of_its_algorithm_is_an_authenticated_digest() {
         const AGY_SHA512: &str = "473a34b685d0a09d48790e8b86bc3e545dfab889fe0d8fc81cb7e1fdfc336fe7\
@@ -397,7 +353,6 @@ mod tests {
             .unwrap();
         assert_eq!((d.alg(), d.as_str()), (DigestAlg::Sha512, AGY_SHA512));
         assert_eq!(d.keyed(), (String::new(), AGY_SHA512.to_string()));
-        // Read back from a record: exactly one key, as written.
         assert_eq!(AuthenticatedDigest::recorded("", AGY_SHA512), Some(d));
         for (sha256, sha512) in [
             (sha('a'), AGY_SHA512.to_string()),
@@ -414,9 +369,6 @@ mod tests {
         }
     }
 
-    /// A digest is logged under its algorithm's key, and a later program's in a log of its own,
-    /// so the shared log keeps only rows a pre-sha512 client reads and rewrites. Another
-    /// algorithm for a key is a conflict; an entry naming both digests or neither drops alone.
     #[test]
     fn each_digest_is_logged_under_its_algorithm() {
         let l = layout("alg");
@@ -437,7 +389,6 @@ mod tests {
             text.contains(&earlier),
             "the earlier entry is rewritten as it was: {text}"
         );
-        // A client from before sha512 requires every key of a row, `sha256` among them.
         #[derive(Deserialize)]
         struct EarlierEntry {
             program: String,
@@ -499,8 +450,6 @@ mod tests {
         );
     }
 
-    /// An older client rewrites the shared log from only the rows it reads — claude's and
-    /// codex's — so a later program's first sightings, in logs of their own, outlive it.
     #[test]
     fn a_later_programs_sightings_outlive_an_older_clients_rewrite() {
         let l = layout("older");
@@ -552,15 +501,12 @@ mod tests {
             log.keys().any(|k| k.0 == "claude"),
             "one program's bound never evicts another's"
         );
-        // An evicted version records afresh rather than conflicting.
         assert_eq!(
             rec(&l, "codex", v("1.0.0"), T, &sha('b')).unwrap(),
             DigestSeen::New
         );
     }
 
-    /// A log that does not read is refused and left as it is — never overwritten with a
-    /// fresh one that would accept a re-cut as a first sighting; one bad entry drops alone.
     #[test]
     fn an_unreadable_log_is_refused_and_a_bad_entry_drops_alone() {
         let l = layout("malformed");

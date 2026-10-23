@@ -3,18 +3,15 @@
 
 use super::TabIndex;
 
-/// Cmd-1..9: switch to an existing tab; out-of-range is a no-op.
 #[test]
 fn switch_to_clamps_to_range() {
     let mut t = TabIndex::new(2, 3); // tabs 0,1,2; active 2
     assert_eq!(t.switch_to(0), 0);
     assert_eq!(t.switch_to(1), 1);
-    // Out of range (Cmd-5 in a 3-tab window): no change.
     assert_eq!(t.switch_to(9), 1);
     assert_eq!(t.active, 1);
 }
 
-/// Cmd-Shift-]/[ cycles with wrap; one tab is a no-op.
 #[test]
 fn cycle_wraps_both_directions() {
     let mut t = TabIndex::new(0, 3);
@@ -23,7 +20,6 @@ fn cycle_wraps_both_directions() {
     assert_eq!(t.cycle(true), 0); // wrap forward 2 → 0
     assert_eq!(t.cycle(false), 2); // wrap backward 0 → 2
     assert_eq!(t.cycle(false), 1);
-    // One tab: cycling is a no-op in either direction.
     let mut one = TabIndex::new(0, 1);
     assert_eq!(one.cycle(true), 0);
     assert_eq!(one.cycle(false), 0);
@@ -36,12 +32,10 @@ fn cycle_wraps_both_directions() {
     );
 }
 
-/// Closing the last tab signals exit (returns true) without mutating state.
 #[test]
 fn close_last_tab_signals_exit() {
     let mut t = TabIndex::new(0, 1);
     assert!(t.close(0), "closing the only tab must signal exit");
-    // Out-of-range close is a no-op that does not signal exit.
     let mut t2 = TabIndex::new(0, 2);
     assert!(!t2.close(5));
     assert_eq!(
@@ -53,13 +47,10 @@ fn close_last_tab_signals_exit() {
     );
 }
 
-// Tier-1 conformance: the real `TabIndex`, projected to `(active, count)` after each
-// mutator, keeps `tab_nav_model()`'s invariants and moves only as its actions admit.
 use aterm_models_gui::tab_nav_model;
 use aterm_spec::derive::Model;
 use std::collections::BTreeMap;
 
-/// Project a real `TabIndex` onto the model's `{ count, active }` variables.
 fn project(t: &TabIndex) -> BTreeMap<&'static str, i64> {
     let mut s = BTreeMap::new();
     s.insert("count", t.count as i64);
@@ -67,7 +58,6 @@ fn project(t: &TabIndex) -> BTreeMap<&'static str, i64> {
     s
 }
 
-/// Assert both model invariants hold on a (projected) state.
 fn assert_invariants(m: &Model, s: &BTreeMap<&'static str, i64>, ctx: &str) {
     assert!(
         m.check_invariant("CountPositive", s),
@@ -79,7 +69,6 @@ fn assert_invariants(m: &Model, s: &BTreeMap<&'static str, i64>, ctx: &str) {
     );
 }
 
-/// Assert the real `prev -> next` step is one of the model `action`'s successors.
 fn assert_admissible(
     m: &Model,
     action: &str,
@@ -98,7 +87,6 @@ fn assert_admissible(
 fn real_tab_index_conforms_to_ty_proven_model() {
     let m = tab_nav_model();
 
-    // Start from a fresh window (one active tab) — the model's init state.
     let mut t = TabIndex::new(0, 1);
     assert_eq!(
         project(&t),
@@ -107,10 +95,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
     );
     assert_invariants(&m, &project(&t), "at init");
 
-    // A scripted run through every action, Close in the active-is-last shape that needs
-    // the re-clamp; after each mutator the invariants hold and the step is admissible.
-
-    // NewTab x3 -> 4 tabs (Cap); `add` makes each new last tab active.
     for _ in 0..3 {
         let prev = project(&t);
         let opened = t.add();
@@ -128,9 +112,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
         }
     );
 
-    // SelectTab: jump to an in-range index (Cmd-1..9). The model's SelectTab is
-    // nondeterministic (`active' \in 0..count-1`), so the real in-range landing
-    // must be one admissible successor.
     for i in [0usize, 2, 1, 3] {
         let prev = project(&t);
         assert_eq!(t.switch_to(i), i, "an in-range switch lands on its tab");
@@ -139,7 +120,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
         assert_invariants(&m, &next, "after SelectTab");
     }
 
-    // Cycle forward with wrap (Cmd-Shift-]): from each position incl. the wrap.
     for _ in 0..5 {
         let prev = project(&t);
         t.cycle(true);
@@ -147,8 +127,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
         assert_admissible(&m, "Cycle", &prev, &next);
         assert_invariants(&m, &next, "after Cycle");
     }
-    // Cycle backward (Cmd-Shift-[): the model has no backward action, so each step must
-    // be an admissible `SelectTab` landing exactly one tab back.
     for _ in 0..5 {
         let prev = project(&t);
         let back = (t.active + t.count - 1) % t.count;
@@ -158,9 +136,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
         assert_invariants(&m, &next, "after Cycle(backward)");
     }
 
-    // Close in the worst case for the range invariant: focus the last tab, then
-    // close it — the active index must re-clamp down to the new last. Repeat
-    // until one tab remains (the model's Close is guarded `count > 1`).
     while t.count > 1 {
         t.switch_to(t.count - 1); // active is the last tab
         let prev = project(&t);
@@ -178,9 +153,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
         }
     );
 
-    // Also exercise Close of an earlier tab (active shifts down): build back up,
-    // then close index 0 while active is later. The model's `Close` clamp covers
-    // this too (active <= count-2 stays in range after the shrink).
     t.add();
     t.add(); // 3 tabs, active 2
     t.switch_to(2);
@@ -198,8 +170,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
     assert_admissible(&m, "Close", &prev, &next);
     assert_invariants(&m, &next, "after Close(earlier tab)");
 
-    // Close a later tab (active unchanged) and the active middle tab (active keeps its
-    // index, now the tab that shifted in).
     t.add(); // 3 tabs, active 2
     t.switch_to(0);
     let prev = project(&t);
@@ -228,8 +198,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
     assert_admissible(&m, "Close", &prev, &project(&t));
     assert_invariants(&m, &project(&t), "after Close(active middle)");
 
-    // Negative control: `ActiveInRange` rejects an out-of-range state, so the asserts
-    // above are not vacuous.
     let mut bad = project(&t);
     bad.insert("active", bad["count"]); // active == count: one past the last tab
     assert!(
@@ -237,9 +205,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
         "ActiveInRange must REJECT active==count (else the conformance is vacuous)"
     );
 
-    // The forgot-to-re-clamp Close (count decremented, active left at the old last index)
-    // lands on a state `ActiveInRange` rejects and is no admissible `Close`: the real
-    // clamp is load-bearing.
     let last_focused = TabIndex {
         active: 2,
         count: 3,
@@ -260,7 +225,6 @@ fn real_tab_index_conforms_to_ty_proven_model() {
             .any(|s| s == &buggy_next),
         "the buggy unclamped Close is NOT an admissible transition of the correct model"
     );
-    // The real close on the same state re-clamps and conforms.
     let mut real = last_focused;
     assert!(!real.close(2));
     let real_next = project(&real);

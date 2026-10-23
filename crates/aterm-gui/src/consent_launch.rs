@@ -399,15 +399,15 @@ fn note_answered_at(path: &std::path::Path, bundle_id: &str) {
     );
 }
 
-fn inert_bundle_id() -> Option<&'static str> {
+const fn inert_bundle_id() -> Option<&'static str> {
     None
 }
 
-fn inert_answered(_bundle_id: &str) -> Option<bool> {
+const fn inert_answered(_bundle_id: &str) -> Option<bool> {
     Some(false)
 }
 
-fn inert_note_answered(_bundle_id: &str) {}
+const fn inert_note_answered(_bundle_id: &str) {}
 
 /// Where the launch warm-up stands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -458,7 +458,7 @@ impl LaunchConsent {
     }
 
     /// The state with an injected marker arm: the tests' stand-in for a window.
-    pub(crate) fn with_reach(reach: LaunchReach) -> Self {
+    pub(crate) const fn with_reach(reach: LaunchReach) -> Self {
         Self {
             reach,
             fda: FdaLaunch::Undecided,
@@ -473,7 +473,7 @@ impl LaunchConsent {
     }
 
     /// The launch check decided on the completed reading `fda`.
-    pub(crate) fn note_launch_read(&mut self, fda: FdaState) {
+    pub(crate) const fn note_launch_read(&mut self, fda: FdaState) {
         self.launch_read = Some(fda);
     }
 
@@ -484,7 +484,7 @@ impl LaunchConsent {
 
     /// Ask, once, for the signing identity to be read off the event loop: `true` the
     /// first time (the caller starts the read), `false` after.
-    pub(crate) fn ask_identity(&mut self) -> bool {
+    pub(crate) const fn ask_identity(&mut self) -> bool {
         !std::mem::replace(&mut self.identity_asked, true)
     }
 
@@ -504,7 +504,7 @@ impl LaunchConsent {
     }
 
     /// The Full Disk Access hand-over moved.
-    pub(crate) fn set_fda(&mut self, fda: FdaLaunch) {
+    pub(crate) const fn set_fda(&mut self, fda: FdaLaunch) {
         self.fda = fda;
     }
 
@@ -524,7 +524,7 @@ impl LaunchConsent {
     }
 
     /// Wait on what wakes the window itself: no timer.
-    pub(crate) fn wait(&mut self) {
+    pub(crate) const fn wait(&mut self) {
         self.next_look = None;
     }
 

@@ -16,15 +16,11 @@ fn root(comm: &str, children: &[i32]) -> RootAnswer {
     }))
 }
 
-/// Every branch of the decision, each with its negative control.
 #[test]
 fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
     let sh = root("zsh", &[]);
-    // Negative control: a shell at its prompt, holding its own foreground, with no child, ran
-    // nothing; a login shell's `-zsh` is a shell.
     assert_eq!(leaf_program(100, 100, &sh, Some((100, "zsh"))), None);
     assert_eq!(leaf_program(100, 100, &root("-zsh", &[]), None), None);
-    // A foreground job, named only for its own group (the quit's test).
     assert_eq!(
         leaf_program(200, 100, &sh, Some((200, "vim"))).as_deref(),
         Some("vim")
@@ -33,7 +29,6 @@ fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
         leaf_program(200, 100, &sh, Some((100, "zsh"))).as_deref(),
         Some("")
     );
-    // The root is the program (`aterm -e claude`, `exec vim`).
     assert_eq!(
         leaf_program(100, 100, &root("2.1.281", &[]), Some((100, "claude"))).as_deref(),
         Some("claude")
@@ -43,46 +38,28 @@ fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
         Some(""),
         "a name resolved before the exec still says the shell: unnamed"
     );
-    // A background or suspended job leaves the foreground at the shell.
     assert_eq!(
         leaf_program(100, 100, &root("bash", &[4242]), None).as_deref(),
         Some("")
     );
-    // The table could not answer: loud, unnamed.
     assert_eq!(
         leaf_program(100, 100, &RootAnswer::Read(None), None).as_deref(),
         Some("")
     );
-    // A platform whose job test covers the root's jobs is not asked.
     assert_eq!(leaf_program(100, 100, &RootAnswer::Unasked, None), None);
 }
 
-/// A PTY pair with both ends close-on-exec from birth (`aterm_pty::open_pty_pair`). Never
-/// `openpty(3)`, whose ends are inheritable: a leader spawned onto its pair keeps a copy of its
-/// own master, so closing the test's copy never hangs the terminal up, and at the leader's exit
-/// the tty waits in `?E` for output whose only reader is the exiting process.
+/// Open a close-on-exec PTY pair (`aterm_pty::open_pty_pair`) so the child cannot inherit the master FD.
 fn open_pty_pair() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
 
-/// `argv` as the session leader of a fresh PTY whose controlling
-/// terminal it is — a spawned tab's shape. Answers `(master, pid)`.
-/// Not waited here: the pid stays reserved until the test's `Session`
-/// drops, whose hang-up and reaper own it, exactly as a spawned tab's.
-///
-/// A leader is often a real interactive shell, so it is a hermetic one
-/// (§8.6 of the init design): `home` (the test's scratch) is its HOME and
-/// XDG base, and `HISTFILE` is `/dev/null`. With the environment cleared and
-/// no HOME, `/bin/sh -i` (bash) took its home from the password entry and
-/// saved each test's `exec /bin/sleep 30` into the person's own
-/// `~/.bash_history`: 461 of its 500 lines on 2026-10-20.
+/// Spawn `argv` as the session leader of a fresh PTY with a hermetic `HOME` and `HISTFILE=/dev/null`.
 #[allow(clippy::zombie_processes)]
 fn spawn_leader(argv: &[&str], home: &std::path::Path) -> (i32, i32) {
     let (master, slave) = open_pty_pair();
     // SAFETY: `slave` is an open fd the pair handed over; owned here.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
-    // std's Command on purpose: the leader needs `pre_exec` (setsid + TIOCSCTTY).
-    // The strip first: the leader holds its terminal and nothing else of this process.
     let mut cmd = std::process::Command::new(argv[0]);
     cmd.inherit_nothing()
         .args(&argv[1..])
@@ -110,8 +87,7 @@ fn spawn_leader(argv: &[&str], home: &std::path::Path) -> (i32, i32) {
     (master, pid)
 }
 
-/// What `master` has printed once `want` is in it, read as it comes: a
-/// hang detector ([`wait_for`]), never a latency budget.
+/// Read from `master` until `want` appears.
 #[track_caller]
 fn read_until(master: i32, want: &str) -> String {
     let mut seen = Vec::new();
@@ -136,15 +112,10 @@ fn read_until(master: i32, want: &str) -> String {
     String::from_utf8_lossy(&seen).into_owned()
 }
 
-/// A leader's shell sees its scratch HOME and saves no history: what it
-/// types lands in no one's home (§8.6 of the init design; [`spawn_leader`]
-/// says what it wrote before). RED before: `HOME=` and
-/// `HISTFILE=/Users/<you>/.bash_history`.
 #[test]
 fn a_leader_shell_has_a_scratch_home_and_saves_no_history() {
     let home = aterm_tempfile::tempdir().expect("scratch home");
     let (master, pid) = spawn_leader(&["/bin/sh", "-i"], home.path());
-    // Every way out of the test, a hang detector's panic included, kills it.
     struct Leader(i32, i32);
     impl Drop for Leader {
         fn drop(&mut self) {
@@ -164,9 +135,6 @@ fn type_line(master: i32, line: &str) {
     assert_eq!(usize::try_from(n).ok(), Some(line.len()), "write(master)");
 }
 
-/// Wait for what must happen — a shell reading its line, a child forking —
-/// as a hang detector ([`aterm_spec::wait::MUST_HAPPEN`]), never a latency
-/// budget: a loaded host only slows it.
 #[track_caller]
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
@@ -178,7 +146,6 @@ fn children(pid: i32) -> Vec<i32> {
     crate::quit_safety::session_root(pid).map_or_else(Vec::new, |r| r.children)
 }
 
-/// A real session `id` over `(master, pid)`, as a new tab of window 0.
 fn add_tab(app: &mut App, id: u64, (master, pid): (i32, i32)) {
     let mut session = crate::stub_session(id);
     session.master = master;
@@ -207,7 +174,6 @@ fn name_group(app: &App, id: u64, pgid: i32, program: &str) {
     timeline.set_program(pgid, Some(program.to_string()));
 }
 
-/// Kill everything this test started, by `SIGKILL` (AGENTS.md).
 fn kill_all(pids: &[i32], masters: &[i32]) {
     for pid in pids {
         // SAFETY: each pid is a process this test started (or its job),
@@ -220,11 +186,7 @@ fn kill_all(pids: &[i32], masters: &[i32]) {
     }
 }
 
-/// The capture over real sessions, by window and tab (the places `Reopened::lost` counts): tab 0
-/// a stub with no process (skipped), tab 1 a shell at its prompt (negative control: no entry),
-/// tab 2 a foreground `sleep` (named for its group), tab 3 a `sleep &` (unnamed), tab 4 `sleep`
-/// as the session root as `aterm -e` runs it (named), tab 5 a shell that `exec`ed `sleep` while
-/// the sweep's name still says the shell (unnamed).
+/// Verify crash-journal program capture across idle, foreground, background, direct-exec, and coview tabs.
 #[test]
 fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     let home = aterm_tempfile::tempdir().expect("scratch home");
@@ -255,8 +217,6 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     name_group(&app, 5, exec.1, "sh");
     let bg_jobs = children(bg.1);
 
-    // Tab 2's leaf carries the agent its session hosts (as the journal's capture fills it), so
-    // its entry is marked as that agent; no other entry is (the negative control).
     let mut manifest = app.capture_restore_manifest();
     let hosted = restore::AgentRestore {
         word: String::new(),
@@ -293,9 +253,6 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
         "tabs 0 (no process) and 1 (a shell at its prompt) have none"
     );
 
-    // Tabs 2, 4 and 3 shown again in a second window (`Open Session in New Window`): the agent
-    // comes back once, at its first place, and is lost in neither tab; `sleep` counts in both of
-    // its tabs; the `sleep &` counts in both tabs as one program.
     let mut coview = manifest.windows[0].clone();
     coview.restored_tabs = vec![
         coview.restored_tabs[2].clone(),
@@ -340,14 +297,7 @@ fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
     kill_all(&pids, &[idle.0, fg.0, bg.0, exe.0, exec.0]);
 }
 
-/// A pane a program held does not come back saying another machine's folder is missing. Two
-/// real sessions report a folder that is not here, under another host's name, as ssh's remote
-/// shell does: tab 2 with a foreground `sleep` standing in for ssh, tab 1 a shell at its prompt
-/// (the negative control). The durable capture marks tab 2's leaf held and not tab 1's; the
-/// update's layout marks neither, nor does the durable capture once tab 2's program is the agent
-/// aterm hosts. Through the wire the held leaf's restore does not ask for that folder and the
-/// reopened row counts it apart, while the shell's pane still asks and is counted as gone. A
-/// held pane whose folder is here keeps it.
+/// Verify that a pane held by a non-hosted foreground program does not request or count a missing remote folder on restore.
 #[test]
 fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
     let home = aterm_tempfile::tempdir().expect("scratch home");
@@ -406,9 +356,6 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
         !leaf(&handoff, 1).held && !leaf(&handoff, 2).held,
         "the update's layout records no program"
     );
-    // The agent aterm hosts in tab 2 runs on this machine: the pane is not
-    // held, so its folder is asked for (and said when it is not found),
-    // in a person's own quit's layout too, which carries no agent.
     let sid = {
         let store = app.store.read().unwrap_or_else(|p| p.into_inner());
         store
@@ -490,9 +437,7 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
     kill_all(&[group, idle.1, held.1], &[idle.0, held.0]);
 }
 
-/// A program starting in a tab marks the journal's lane dirty even when nothing else would wake
-/// a capture (the sweep's foreground group change). Negative control: a sweep that sees the same
-/// group leaves the lane clean.
+/// Verify that a foreground process-group change marks the crash journal dirty.
 #[test]
 fn a_foreground_change_owes_the_journal_a_capture() {
     let mut app = App::headless_for_test();

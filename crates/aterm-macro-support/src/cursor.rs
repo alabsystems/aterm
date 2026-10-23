@@ -7,23 +7,16 @@ use proc_macro::{Delimiter, Group, Ident, Punct, Spacing, Span, TokenStream, Tok
 
 use crate::error::Error;
 
-/// Reads one level of a token stream front to back.
-///
-/// The structural reads ([`Cursor::peek`], [`Cursor::next`] and everything
-/// built on them) first splice a None-delimited group at the front into the
-/// stream: `$vis:vis`, `$lit:literal` and `$e:expr` fragments arrive wrapped in
-/// one, and the grammar around them reads through it. The raw reads keep such a
-/// group whole, which is how a `$t:ty` field type stays one type.
+/// Reads one level of a token stream front to back ([`Cursor::peek`], [`Cursor::next`]).
 pub struct Cursor {
-    /// The unread tokens, last first: the next token is `rev.last()`.
+    /// The unread tokens, last first.
     rev: Vec<TokenTree>,
-    /// Where "unexpected end of input" points: the group's closing delimiter,
-    /// or the call site at the top level.
+    /// Where "unexpected end of input" points.
     end: Span,
 }
 
 impl Cursor {
-    /// A cursor over `stream`; `end` is where an error at its end points.
+    /// A cursor over `stream`.
     #[must_use]
     pub fn new(stream: TokenStream, end: Span) -> Self {
         let mut rev: Vec<TokenTree> = stream.into_iter().collect();
@@ -80,8 +73,7 @@ impl Cursor {
         self.rev.last()
     }
 
-    /// Whether every token has been read (an empty None-group reads as
-    /// nothing).
+    /// Whether every token has been read (an empty None-group reads as nothing).
     #[inline]
     pub fn is_empty(&mut self) -> bool {
         self.flatten();
@@ -123,8 +115,7 @@ impl Cursor {
         }
     }
 
-    /// Whether the next two tokens spell the two-character operator `op`
-    /// (`::`, `->`, `=>`): the first joint to the second.
+    /// Whether the next two tokens spell the two-character operator `op` (`::`, `->`, `=>`).
     pub fn peek_op(&mut self, op: &str) -> bool {
         self.flatten();
         let mut chars = op.chars();
@@ -138,8 +129,7 @@ impl Cursor {
         first && second
     }
 
-    /// Takes the two-character operator `op` if it is next; returns the span
-    /// of its first character.
+    /// Takes the two-character operator `op` if it is next.
     pub fn eat_op(&mut self, op: &str) -> Option<Span> {
         if self.peek_op(op) {
             let first = self.rev.pop().map(|tt| tt.span());
@@ -181,7 +171,6 @@ impl Cursor {
     }
 
     /// Takes an identifier, or says `expected {what}` at the next token.
-    ///
     /// # Errors
     /// The next token is not an identifier, or there is none.
     pub fn expect_ident(&mut self, what: &str) -> Result<Ident, Error> {
@@ -195,7 +184,6 @@ impl Cursor {
     }
 
     /// Takes the punctuation `ch`, or says `expected {what}`.
-    ///
     /// # Errors
     /// The next token is anything else.
     pub fn expect_punct(&mut self, ch: char, what: &str) -> Result<Punct, Error> {
@@ -205,17 +193,8 @@ impl Cursor {
         }
     }
 
-    /// Takes the tokens up to, not including, the first one `stop` accepts at
-    /// the top level, keeping None-delimited groups whole.
-    ///
-    /// Top level means outside every `<...>` the run opens itself (a bracketed
-    /// group is already one token). `->` closes no angle, and a `>` with no
-    /// open angle is handed to `stop` like any other token. `stop` sees the
-    /// token and whether it is at the top level.
-    ///
-    /// Every `<` opens an angle, which is right for a type, a bound or a where
-    /// clause and wrong for an expression, where `<` and `<<` compare and
-    /// shift: read one with [`Cursor::take_expr`].
+    /// Takes the tokens up to, not including, the first one `stop` accepts at the top level,
+    /// keeping None-delimited groups whole ([`Cursor::take_expr`]).
     pub fn take_run(&mut self, stop: impl Fn(&TokenTree, bool) -> bool) -> Vec<TokenTree> {
         let mut out = Vec::new();
         let mut depth = 0usize;
@@ -242,27 +221,14 @@ impl Cursor {
         out
     }
 
-    /// Takes an expression: the tokens up to, not including, the first comma
-    /// outside every generic-argument list the expression opens, keeping
-    /// None-delimited groups whole.
-    ///
-    /// An expression's `<` compares or shifts unless it opens generic
-    /// arguments, which it does after `::` (a turbofish), where an operand is
-    /// due (a qualified path, `<T as Trait>::C`), and in the type an `as` cast
-    /// or a `->` names (`x as u8 < 3` is the compiler's error too). Inside a
-    /// list every `<` and `>` counts, as in [`Cursor::take_run`]. So
-    /// `1 << 0, B` stops at the comma and `f::<A, B>() < 2, C` after the `2`.
-    ///
+    /// Takes an expression ([`Cursor::take_run`]).
     /// # Errors
-    /// A generic-argument list still open at the end of the input: the comma
-    /// that ends the expression is not to be found, and the tokens after it
-    /// must not be swallowed into it.
+    /// A generic-argument list still open at the end of the input.
     pub fn take_expr(&mut self) -> Result<Vec<TokenTree>, Error> {
         let mut out = Vec::new();
         let mut due = Due::Operand;
         let mut depth = 0usize;
         let mut opened = self.end;
-        // The punctuation just taken, when it is joined to this token.
         let mut joined: Option<char> = None;
         let mut label = false;
         while let Some(tt) = self.rev.last() {
@@ -285,7 +251,6 @@ impl Cursor {
                     TokenTree::Punct(p) => {
                         let ty = matches!(due, Due::TypeStart | Due::TypePath);
                         due = match (p.as_char(), joined) {
-                            // The second `<` of a `<<` shift.
                             ('<', Some('<')) => Due::Operand,
                             ('<', Some(':')) => {
                                 depth = 1;
@@ -313,7 +278,6 @@ impl Cursor {
                         let ty = matches!(due, Due::TypeStart | Due::TypePath);
                         due = if std::mem::take(&mut label) {
                             // A lifetime in a type, or a label before `:` or
-                            // after `break`.
                             if ty { Due::TypeStart } else { Due::Operand }
                         } else if word == "as" {
                             Due::TypeStart
@@ -383,40 +347,33 @@ pub fn is_keyword(tt: &TokenTree, word: &str) -> bool {
     matches!(tt, TokenTree::Ident(i) if i.to_string() == word)
 }
 
-/// What [`Cursor::take_expr`] expects next at the expression's top level,
-/// which decides what a `<` there is.
+/// What [`Cursor::take_expr`] expects next at the expression's top level.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Due {
-    /// An operand: at the start, after a binary or prefix operator, `::`, or a
-    /// keyword that takes an expression. A `<` opens a qualified path.
+    /// An operand: at the start.
     Operand,
-    /// An operator: an operand has been read. A `<` compares or shifts.
+    /// An operator: an operand has been read.
     Operator,
-    /// The start of the type after `as` or `->`: `&`, `*`, `mut`, `const`, a
-    /// lifetime, then a path. A `<` opens a qualified path.
+    /// The start of the type after `as` or `->`.
     TypeStart,
-    /// Inside that type's path. A `<` opens its generic arguments.
+    /// Inside that type's path.
     TypePath,
 }
 
-/// The keywords an operand follows: `if <T as Tr>::C == 1 { .. }`.
+/// The keywords an operand follows.
 const TAKES_OPERAND: &[&str] = &[
     "async", "box", "break", "const", "continue", "else", "for", "if", "in", "let", "loop",
     "match", "move", "mut", "ref", "return", "static", "unsafe", "while", "yield",
 ];
 
-/// Splits `tokens` at the top-level commas, keeping no empty trailing piece.
-///
-/// Top level is outside every `<...>` the tokens open (see
-/// [`Cursor::take_run`]).
+/// Splits `tokens` at the top-level commas ([`Cursor::take_run`]).
 #[inline]
 #[must_use]
 pub fn split_commas(tokens: Vec<TokenTree>) -> Vec<Vec<TokenTree>> {
     split_top(tokens, ',')
 }
 
-/// Splits `tokens` at the top-level `separator` punctuation (see
-/// [`split_commas`]).
+/// Splits `tokens` at the top-level `separator` punctuation (see [`split_commas`]).
 #[must_use]
 pub fn split_top(tokens: Vec<TokenTree>, separator: char) -> Vec<Vec<TokenTree>> {
     let mut reader = Cursor::new(tokens.into_iter().collect(), Span::call_site());

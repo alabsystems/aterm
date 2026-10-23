@@ -20,8 +20,6 @@ fn the_immutable_uri_encodes_every_byte_but_the_plain_ones() {
     );
 }
 
-/// No database file is no answer, and the reader is never asked: nothing
-/// there, or a link (never followed) to a real database.
 #[test]
 fn no_database_file_is_no_answer() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -37,9 +35,6 @@ fn no_database_file_is_no_answer() {
     }
 }
 
-/// A rollback journal with something in it beside the database is a write
-/// under way: no answer, the reader never asked. An empty one (a TRUNCATE
-/// journal at rest) is none.
 #[test]
 fn a_journal_beside_the_database_is_a_write_under_way() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -54,9 +49,6 @@ fn a_journal_beside_the_database_is_a_write_under_way() {
     assert_eq!(read(&db, |_| Some(7)), Ok(7), "an empty journal");
 }
 
-/// A file that changes while it is read is no answer: the database itself, a
-/// `-wal` that appears, a journal that appears. NEGATIVE CONTROL: the same
-/// reader with nothing changed answers.
 #[test]
 fn a_file_that_changes_during_the_read_is_no_answer() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -88,9 +80,6 @@ fn a_file_that_changes_during_the_read_is_no_answer() {
     assert_eq!(read(&db, |_| None::<()>), Err(Unread::Failed), "no answer");
 }
 
-/// With no `-wal` the reader gets the file itself as an immutable URI, and
-/// with one the path of a private copy beside a copy of the `-wal` (and no
-/// `-shm`), gone once it returns; nothing is written beside the live file.
 #[test]
 fn the_reader_gets_the_file_itself_or_a_private_copy() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -136,12 +125,8 @@ fn the_reader_gets_the_file_itself_or_a_private_copy() {
 mod live {
     use super::*;
 
-    /// SQLite's lock bytes on the main file: `PENDING_BYTE` (0x40000000), then
-    /// `RESERVED` and the 510 `SHARED` bytes.
     const DB_LOCKS: (u64, u64) = (0x4000_0000, 512);
 
-    /// Take `fcntl` locks on `file`'s bytes (`(start, len, exclusive)`), for as
-    /// long as the returned file is open.
     fn hold(file: &Path, locks: &[(u64, u64, bool)]) -> std::fs::File {
         use std::os::fd::AsRawFd as _;
         let f = std::fs::OpenOptions::new()
@@ -167,9 +152,6 @@ mod live {
         f
     }
 
-    /// Apple's `sqlite3` on `target` with the readers' options (`-nofollow`
-    /// among them: no link anywhere in the path); its stdout, or its stderr as
-    /// the error.
     fn sqlite(target: &str, sql: &str) -> Result<String, String> {
         let out = crate::spawnfd::command("/usr/bin/sqlite3")
             .args([
@@ -201,11 +183,6 @@ mod live {
         assert!(out.status.success(), "{out:?}");
     }
 
-    /// A ROLLBACK-JOURNAL database is read in place with no lock: with the lock
-    /// a committing writer holds (`EXCLUSIVE`, every lock byte), the read still
-    /// answers its rows. NEGATIVE CONTROL: SQLite's own read-only open of the
-    /// same file meets that lock (`database is locked`): it would have held
-    /// `SHARED`, the lock that fails such a writer's `COMMIT`.
     #[test]
     fn a_rollback_database_is_read_with_no_lock() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -225,13 +202,6 @@ mod live {
         assert_eq!(read(&db, |t| sqlite(t, sql).ok()), Ok("kept\n".to_owned()));
     }
 
-    /// A WAL database is read from a private copy of it and its `-wal`, which
-    /// holds rows no checkpoint moved into the file yet (its holder killed, as
-    /// a crash leaves it): with the live `-shm` held as a reader rebuilding its
-    /// index holds it (its first page zeroed, its write, checkpoint and recover
-    /// locks taken, the dead-man switch shared), the read answers those rows.
-    /// NEGATIVE CONTROL: SQLite's own read-only open of the live file meets
-    /// those locks at once, as a writer with no busy timeout does.
     #[test]
     fn a_wal_database_is_read_from_a_private_copy() {
         use std::io::{BufRead as _, Write as _};
@@ -283,9 +253,6 @@ mod live {
         );
     }
 
-    /// The witness catches a lock held across a read, freezes its holder while
-    /// `write` runs, and lets it run on. NEGATIVE CONTROL: with no lock held,
-    /// nothing is caught and `write` never runs.
     #[test]
     fn the_witness_freezes_a_holder_while_the_writer_runs() {
         use std::io::{BufRead as _, Write as _};

@@ -76,6 +76,9 @@ pub fn disk_full(rows: &[String]) -> Option<DiskFull> {
         })
         .or_else(|| {
             // The vendor's `⎿` rows of the LAST TURN, above the status row
+            // (the rows under it were read above): up to the last message a
+            // person sent (a `❯` row at the edge), never past it — a row of
+            // an earlier turn is an incident since answered.
             let end = block.status.unwrap_or(frame.top).min(frame.top);
             (0..end)
                 .rev()

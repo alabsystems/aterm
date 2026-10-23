@@ -1386,6 +1386,7 @@ impl MelodyV2 {
             let d = i32::from(rank) - i32::from(self.text.prev_rank);
             (d, d == 0)
         } else {
+            // The gap is a magnitude, never a repeat: two keys at the same
             // millisecond are the host's stamp failing, not a doubled letter.
             (gap as i32, false)
         };
@@ -1540,6 +1541,8 @@ impl MelodyV2 {
             .cascade_at
             .is_some_and(|c| at.saturating_sub(c) < CASCADE_RUN_MS);
         if in_run {
+            // The run walks the theme: later lines of one program's output take
+            // its phrase edges in turn. Only the base moves; the rate law below
             // is unchanged.
             self.text.walk = self.run_theme_step();
         } else {
@@ -2214,6 +2217,9 @@ impl TrailSynth {
 
     /// The v2 admission path (§16 row 9), reached only from [`TrailSynth::push_meta`]'s top-of-function branch, never by a v1 event.
     pub(super) fn push_v2(&mut self, ev: SoundEvent, meta: EventMeta) {
+        // The verdict forks first, above the trail preamble, none of which
+        // applies: the bus is already latched by the keyed Enter, the sky's
+        // hue does not drift, the bed is not kicked, and it does not count
         // toward the rate estimate (it is not a keystroke).
         if let SoundGesture::Output(OutputGesture::Verdict { failed, ice }) = ev.kind {
             let at = self.v2_at_ms(meta);
@@ -2313,6 +2319,8 @@ impl TrailSynth {
             }
             SoundKind::Land => {}
             SoundKind::Jump => {
+                // A keyed Return's own line-feed echo is not a cascade (A26):
+                // a Jump within `ENTER_ECHO_SWALLOW_MS` of that Enter is
                 // swallowed whole (no brrrring, no melody step, no beat).
                 if self.v2.jump_echoes_enter(at) {
                     return;
@@ -2387,6 +2395,8 @@ impl TrailSynth {
             plan.opens_shift,
         );
         if plan.repeat {
+            // §9.5 law 5: a same-pitch note damps the old voice first; two
+            // independently phased voices at one frequency comb. A word head's
             // common tone is as much the same pitch as a doubled letter.
             self.v2_damp(self.v2.lead, LANE_FADE_STEAL_S);
         }
@@ -2396,6 +2406,8 @@ impl TrailSynth {
         if hammer.ring {
             self.v2_duck_ting(TING_DUCK);
         } else if ev.shifted && classed {
+            // Under a shifted mark it yields further ([`TING_DUCK_MARK`]):
+            // in code a bell every few keys would make it louder than prose
             // (the design's C1).
             self.v2_duck_ting(TING_DUCK_MARK);
         }
@@ -2590,6 +2602,8 @@ impl TrailSynth {
         }
 
         if stops.room {
+            // The answering voice (§3.3): the head opening the line's reply to
+            // its subject is answered from above, a beat later, on the nearest
             // lit tone, in the droppable lane.
             if plan.answer_head && !plan.mallet_only {
                 let a_deg = self.v2.answer_deg_above(plan.deg) + i32::from(self.song_key);
@@ -3086,6 +3100,7 @@ impl TrailSynth {
     }
 
     fn v2_meteor(&mut self, ev: &SoundEvent, meta: EventMeta, dir: i8, cells: u16, armed: bool) {
+        // The floor (§12.3): a hop under the meteor distance is the nav tick
         // only, and an arm whose move turns out to be a short hop fizzles here.
         if cells < timing::JUMP_MIN_CELLS {
             self.v2_release_arm();
@@ -3248,6 +3263,7 @@ impl TrailSynth {
         let mut m = 0.0;
         for i in 0..3 {
             if b.var_f[i] <= 0.0 {
+                // First sample: seed at target so the pad enters on the
                 // chord instead of sweeping up from 0 Hz.
                 b.var_f[i] = tgt[i];
             }
@@ -3843,6 +3859,7 @@ mod tests {
                         let phrased =
                             matches!(class, DASH | CLOSE) || (!was_marked && s.v2.token_marked());
                         if prev_deg == Some(deg) {
+                            // Charged to the branch that produced the degree:
                             // an answered interval never consulted the alphabet.
                             if phrased {
                                 phr += 1;
@@ -5548,6 +5565,7 @@ for it up front.\n\
             let at = prose_prelude(&mut s);
             let mark = s.born_seq;
             if secret {
+                // The pan moves with the key, as a caret would — the tone
                 // must not.
                 push_secret(&mut s, at, ch, (ch as u32 % 7) as f32 / 7.0 - 0.4);
             } else {
@@ -7565,6 +7583,8 @@ for it up front.\n\
                         "{ch:?} at flow {flow} acquired a long hang"
                     );
                     if flow > 0.0 && plan.lit && plan.touch == Touch::Step && !plan.mallet_only {
+                        // A gate without the pluck check would admit this real
+                        // key and create the forbidden octave; the control is
                         // tied to a reachable lit step, not a synthetic flag.
                         caught_old_gate += 1;
                     }

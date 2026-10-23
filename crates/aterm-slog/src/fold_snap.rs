@@ -239,7 +239,7 @@ fn field_lines(out: &mut Vec<String>, owner: &str, f: &NodeFields) {
     }
 }
 
-/// A claim's tokens after its tag, each key prefixed `p` (`` for the line's
+/// A claim's tokens after its tag, each key prefixed `p` (`""` for the line's
 /// own claim, `t` for the trusted one riding it).
 fn push_claim(s: &mut String, p: &str, c: &Claim) {
     match (&c.word, &c.text) {

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The core protocol: the requests aterm sends, the replies it reads, and the
-//! connection setup the server answers with. Written against the X Window
-//! System Protocol (X11R7.7, section 9 and appendix B); each encoder's bytes
-//! are x11rb-protocol 0.13.2's for the same arguments
-//! (`tests/recorded/x11rb-protocol-0.13.2-requests.tsv`).
+//! Core X11 protocol requests, replies, and connection setup.
 
 use super::{ParseError, Reader, Reply, Request, ValueList, Void, Writer, reply_head};
 
@@ -152,8 +148,6 @@ pub mod grab_mode {
     pub const ASYNC: u8 = 1;
 }
 
-// ---------------------------------------------------------------- requests
-
 /// CreateWindow (1).
 #[allow(
     clippy::too_many_arguments,
@@ -225,8 +219,7 @@ pub fn unmap_window(window: Window) -> Request<Void> {
     Writer::new(10, 0).u32(window).finish()
 }
 
-/// ConfigureWindow (12). The mask is 16 bits on the wire; bits above it are
-/// not ConfigureWindow fields and are dropped.
+/// ConfigureWindow (12).
 pub fn configure_window(window: Window, values: &ValueList) -> Request<Void> {
     let mut w = Writer::new(12, 0);
     w.u32(window)
@@ -262,8 +255,7 @@ pub fn get_atom_name(atom: Atom) -> Request<GetAtomNameReply> {
     Writer::new(17, 0).u32(atom).finish()
 }
 
-/// ChangeProperty (18). `data` holds whole `format`-bit items (`format` 8,
-/// 16 or 32); a trailing partial item is not sent.
+/// ChangeProperty (18).
 pub fn change_property(
     mode: PropMode,
     window: Window,
@@ -449,8 +441,7 @@ pub fn set_input_focus(revert_to: u8, focus: Window, time: Timestamp) -> Request
     Writer::new(42, revert_to).u32(focus).u32(time).finish()
 }
 
-/// GetInputFocus (43). Also the cheapest round trip there is: a request the
-/// server answers after everything sent before it.
+/// GetInputFocus (43).
 pub fn get_input_focus() -> Request<GetInputFocusReply> {
     Writer::new(43, 0).finish()
 }
@@ -508,7 +499,7 @@ pub fn free_gc(gc: Gcontext) -> Request<Void> {
     Writer::new(60, 0).u32(gc).finish()
 }
 
-/// PutImage (72). `data` is sent whole and padded to a word.
+/// PutImage (72).
 #[allow(
     clippy::too_many_arguments,
     reason = "the request's own fields, in wire order"
@@ -570,8 +561,6 @@ pub fn query_extension(name: &[u8]) -> Request<QueryExtensionReply> {
 pub fn get_modifier_mapping() -> Request<GetModifierMappingReply> {
     Writer::new(119, 0).finish()
 }
-
-// ---------------------------------------------------------------- replies
 
 /// GetWindowAttributes' reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -711,8 +700,7 @@ impl Reply for GetAtomNameReply {
     }
 }
 
-/// GetProperty's reply. `value` is `value_len` items of `format` bits, as
-/// the server sent them.
+/// GetProperty's reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetPropertyReply {
     pub format: u8,
@@ -911,8 +899,7 @@ impl Reply for QueryExtensionReply {
     }
 }
 
-/// GetModifierMapping's reply: eight rows of `keycodes_per_modifier`
-/// keycodes (Shift, Lock, Control, Mod1-Mod5).
+/// GetModifierMapping's reply: eight rows of `keycodes_per_modifier` keycodes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetModifierMappingReply {
     pub keycodes_per_modifier: u8,
@@ -931,14 +918,10 @@ impl Reply for GetModifierMappingReply {
 }
 
 impl Reply for () {
-    /// A reply whose content nobody reads, checked only for its packet type
-    /// and length (the round trip after a batch of void requests).
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         reply_head(bytes).map(drop)
     }
 }
-
-// ---------------------------------------------------------------- setup
 
 /// A pixmap format the server supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1080,8 +1063,7 @@ impl Setup {
         })
     }
 
-    /// The length of the setup packet that starts `bytes` (its header's
-    /// length field), so a transport can bound what it hands [`Setup::parse`].
+    /// Length in bytes of the setup packet starting at `bytes`.
     pub fn packet_len(bytes: &[u8]) -> Result<usize, ParseError> {
         let mut r = Reader::new(bytes);
         r.skip(6)?;

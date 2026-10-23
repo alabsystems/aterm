@@ -111,7 +111,7 @@ pub enum TxnOutcome {
     },
 }
 
-/// Run one coherence group as an all-or-nothing transaction over injected actions (module docs).
+/// Run one coherence group as an all-or-nothing transaction over injected actions.
 pub fn transact(
     decisions: &[(String, ApplyDecision)],
     stage: &mut dyn FnMut(&str) -> Result<(), String>,

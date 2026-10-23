@@ -3772,6 +3772,8 @@ impl St {
                         || st.model_list == model.unwrap_or_default())
                     && !(matches!(st.phase, Phase::Failed(_)) && !st.same_process(from, who)) =>
             {
+                // Managed and native builds can share a version, and which one
+                // the session moves to follows its launch: until the restart
                 // begins, the label names the build the sweep would start now.
                 if matches!(st.phase, Phase::Pending | Phase::Announced { .. }) {
                     st.source = to.source.as_str().to_string();
@@ -3806,6 +3808,9 @@ impl St {
                     && st.pending_since < st.salt
                     && st.pending_since < who.started_s
                 {
+                    // A record an older build wrote whose age predates both its
+                    // own minting and the process now holding the conversation:
+                    // the age begins at the later of the salt and the process's
                     // start.
                     st.pending_since = st.salt.max(who.started_s);
                 }
@@ -5352,6 +5357,7 @@ mod record {
         }
         #[cfg(not(unix))]
         {
+            // Keep the existing portable replacement route, returning its
             // failure to the checked caller instead of hiding it.
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
@@ -5625,6 +5631,11 @@ fn host_candidates<'a>(
 }
 
 fn needs_upgrade_inspection(sf: &SessionFile, targets: &Targets, prior: Option<&St>) -> bool {
+    // A restart in flight, a release owed whatever build the agent runs now
+    // ([`release_visit`]), and an announced round whose notice carried a model
+    // ([`St::promised_model`]): the ride is the round's own state, so its READY
+    // must still be acted on or a barred ride dropped ([`ride_dropped`]). A
+    // gave-up round's late READY acts only while its release is owed, which
     // this lets through.
     if prior
         .is_some_and(|st| st.in_flight() || !st.release.is_empty() || st.promised_model().is_some())
@@ -8554,6 +8565,7 @@ fn visit_models(
         .map(|claim| claim.tab.clone())
         .or_else(|| args.env_var("ATERM_PARENT_SESSION_ID").map(str::to_owned))
     else {
+        // macOS may yield argv without env for another process. The unscoped
         // CLI has no PTY roster claim and must wait rather than guess a tab.
         return said(r, "wait:no-aterm-tab");
     };
@@ -8735,6 +8747,7 @@ fn visit_models(
         ModelVerdict::Keep(_) => None,
     };
     let Some(target) = target else {
+        // A dropped ride's round, as the drop left it: released, or a gave-up
         // round kept as it stopped (no retarget follows).
         if let (Some(dropped), Some(st)) = (&dropped, prior.as_ref()) {
             dropped.say(opts, &r, st, Retarget::Kept);
@@ -9040,6 +9053,7 @@ fn visit_models(
                 left_cut(&mut st, &mut c, &tab, &text);
             }
             if result.step.starts_with("announced:") {
+                // The ask the end of the agent's work led to is spent from
                 // the day's budget ([`St::work_end_open`]).
                 if facts.work_ended {
                     st.spend_work_end(now);
@@ -9065,6 +9079,8 @@ fn visit_models(
                 st.model_list = model_to.clone().unwrap_or_default();
             }
             if !fresh {
+                // What the agent ran, from the tail that just proved READY, and
+                // where that read ended (the resumed session's turns come
                 // after it); a restart that waits instead takes both again.
                 (st.model_before, st.mark) = model_and_mark(recent.as_ref());
             }

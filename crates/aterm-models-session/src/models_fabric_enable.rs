@@ -5,11 +5,7 @@
 
 use aterm_spec::derive::Model;
 
-/// A rejected mint cannot publish a replacement or reach broker supervision. Three grants bound
-/// the exhaustive model; Tier-1 runs the same counter with eight grants against the effect trace
-/// of the real command (`crates/aterm/tests/fabric_world/fabric_on.rs`), which also checks
-/// existing capability bytes and temporary-file cleanup at every mint and failure exit.
-/// `Buggy=1` adds continuing after a rejection and premature publication.
+/// A rejected mint cannot publish a replacement or reach broker supervision.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fabric_capability_publication_model() -> Model {

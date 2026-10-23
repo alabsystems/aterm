@@ -237,6 +237,7 @@ impl Spine {
             0.0
         };
         if floor > 0.0 {
+            // The combo freeze is stamped on the drive itself, so a drive under
             // an already hotter spine still freezes the ladder.
             self.driven_at = Some(now);
         }
@@ -269,6 +270,7 @@ impl Spine {
 
     /// Advance the display follower, resume memory and lay/flow clock to `now`.
     pub fn update(&mut self, now: Instant) {
+        // The hot-resume door closes by itself on the follower's tick, so a
         // session that goes dark re-earns its price.
         if self
             .verdict

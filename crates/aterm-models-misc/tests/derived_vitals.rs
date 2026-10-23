@@ -6,10 +6,6 @@ use aterm_models_misc::{
 };
 use aterm_spec::{interp, verify};
 
-/// THE STUCK VERDICT (`docs/DESIGN-system-awareness-2026-10-16.md` §17): it holds with no mutant
-/// on, each law is broken by its own `Buggy` value alone, the environment mutants each break the
-/// age law and the liveness alone, and the healthy lane reads as the design's curl row. Tier-1
-/// against the real step is `aterm-vitals`' `conformance_stuck_verdict`.
 #[test]
 fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
     let model = stuck_verdict_model();
@@ -77,10 +73,6 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
     assert_eq!((s["cls"], s["v"]), (2, 2));
 }
 
-/// END BY PROOF (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.4): the protocol holds with
-/// no mutant — no signal follows a read whose identity moved or whose tier was lost — and the
-/// mutant that signals without the judgment breaks that law. Tier-1 against the real
-/// `end_proven` is `aterm-verify`'s `conformance_end_by_proof`.
 #[test]
 fn the_end_by_proof_holds_and_its_mutant_signals_after_a_move() {
     let model = end_by_proof_model();
@@ -117,11 +109,6 @@ fn the_end_by_proof_holds_and_its_mutant_signals_after_a_move() {
     assert_eq!((s["v"], s["bad"]), (2, 0), "a lost tier sends nothing more");
 }
 
-/// THE SCOPE BALANCE (`docs/DESIGN-system-awareness-2026-10-16.md` §7.7, §17): it holds with no
-/// mutant on, each `Buggy` value breaks exactly the laws its row names, and a delegated member
-/// read ahead of its launcher's counter moves no more than the launcher's own figure, the excess
-/// shown as a negative residual. Tier-1 against the real split is `aterm-vitals`'
-/// `conformance_scope_balance`.
 #[test]
 fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
     let model = scope_balance_model();
@@ -148,10 +135,6 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
     );
 }
 
-/// THE EXPLANATION'S HONESTY (`docs/DESIGN-resource-details-2026-10-20.md` §17): it holds with no
-/// mutant on, each `Buggy` value breaks exactly its own law, and the Deck's clause shows on the
-/// third 5 s tick its candidate holds (10 s) and goes on the seventh it fails (30 s). Tier-1
-/// against the real engine is `aterm-vitals`' `conformance_explain`.
 #[test]
 fn the_explanations_honesty_holds_and_each_law_has_its_own_mutant() {
     let model = explain_honesty_model();

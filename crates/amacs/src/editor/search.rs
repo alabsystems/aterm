@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Incremental search matches forward from its origin as it is typed.
-//! Explicit next/previous navigation shares those matches and wraps at an edge.
+//! Incremental search and explicit next/previous match navigation.
 
 use std::ops::Range;
 
@@ -32,8 +31,7 @@ impl EditorWorkspace {
         Ok(show_match(view, &query, found, origin))
     }
 
-    /// Keep a selected match only while its current bytes still match the
-    /// query. Another view may have edited them since the query last ran.
+    /// Keeps a selected match only while its current bytes still match the query.
     pub(super) fn accept_search_match(
         &self,
         store: &DocumentStore,
@@ -91,9 +89,6 @@ impl EditorWorkspace {
     }
 }
 
-/// Literal, case-sensitive matches. A step excludes the current selection by
-/// starting at its end (forward) or start (backward); wrapping can select that
-/// same match again when it is the only one.
 fn search_match(
     text: &str,
     query: &str,

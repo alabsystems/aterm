@@ -86,14 +86,16 @@
 
 use std::time::{Duration, Instant};
 
-use super::super::config::SupervisorConfig;
+use super::super::config::{Occupancy, SupervisorConfig};
 use super::super::facts::{EpisodeKey, FactKind, FactsState};
 use super::super::memory;
 use super::super::occupancy::door::{self, AtWrite, PaceGrant, StatusSeen, Told};
 use super::super::occupancy::fault::{Fault, armed};
 use super::super::occupancy::hold::{self, Close, HoldChange, HoldClock, HoldEvent, RowSaid};
 use super::super::occupancy::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict};
-use super::super::occupancy::{FactLine, OccupancyReading};
+use super::super::occupancy::{
+    FactLine, OccupancyReading, OccupancySaid, SaidHold, SaidRule, SaidVerdict,
+};
 use super::super::policy::turn_end::{HostTurn, Reach};
 use super::approvals::Outcome;
 use super::*;
@@ -150,6 +152,13 @@ struct DoorWatch {
     /// ([`ASK_EVERY_MS`]), so a person's keys or a machine pace cost one `status` read, one
     /// composer read and one pace a look, not one a settled read (the safety review's F-D).
     again: Option<(u64, i64)>,
+    /// When each rule's word last changed ([`Self::said`]), unix ms.
+    said_at: [i64; 2],
+    /// What the last break judged beside the verdicts: the ready proxy, the guards, and the
+    /// reading the decider judged ([`OccupancySaid`]).
+    seen: Option<(bool, Guards, OccupancyReading)>,
+    /// What the host was last told ([`Session::occupancy_tell`]): once a change.
+    told: Option<OccupancySaid>,
 }
 
 /// A due line under `prompt`, between the decider and the write at the same break.
@@ -193,12 +202,28 @@ enum Said {
     Spent,
     /// Under `prompt`: this episode typed.
     Typed(u64),
-    /// Under `prompt`: this episode's write skipped.
-    Skipped(u64),
+    /// Under `prompt`: this episode's write skipped, and why.
+    Skipped(u64, &'static str),
     /// Under `prompt`: this episode told already.
     Told(u64),
     /// Under `prompt`: the host's pace held it.
     HostPaced(PaceGrant),
+}
+
+impl Said {
+    /// The word the host is told ([`SaidVerdict`]).
+    const fn verdict(self) -> SaidVerdict {
+        match self {
+            Said::Would(_) => SaidVerdict::Would,
+            Said::Held(guard) => SaidVerdict::Held(guard),
+            Said::Paced => SaidVerdict::Paced,
+            Said::Spent => SaidVerdict::Spent,
+            Said::Typed(_) => SaidVerdict::Typed,
+            Said::Skipped(_, why) => SaidVerdict::Skipped(why),
+            Said::Told(_) => SaidVerdict::Told,
+            Said::HostPaced(pace) => SaidVerdict::HostPaced(pace),
+        }
+    }
 }
 
 /// What a loop before this one left of the hold.
@@ -445,6 +470,7 @@ impl<C: Ctl> Session<'_, C> {
         // Another hold's verdicts are not this one's: each is said afresh.
         if self.hold.door.books.hold_since_ms() != Some(since_ms) {
             self.hold.door.said = [None; 2];
+            self.hold.door.said_at = [0; 2];
         }
         self.hold.door.books.hold(since_ms);
         let reading = if rules::wants_reading(Some(hold), &self.hold.door.books, now_ms) {
@@ -458,6 +484,7 @@ impl<C: Ctl> Session<'_, C> {
         // `prompt` as `observe`) replays as it was recorded: its due lines are would-be rows.
         let prompt = cfg.occupancy.grant().is_some()
             && !self.fx.replay_lacks_host_door("host.occupancy_pace");
+        let ready = rules::ready(&reading, Some(hold), now_ms);
         for (rule, verdict) in verdicts {
             if prompt && let Verdict::Due(line) = &verdict {
                 self.occupancy_due(screen.seq, rule, line, hold, (now_ms, now));
@@ -465,6 +492,68 @@ impl<C: Ctl> Session<'_, C> {
             }
             self.occupancy_said(screen.seq, rule, verdict, hold, now_ms, review);
         }
+        self.hold.door.seen = Some((ready, guards, reading));
+        // The mode the break ran under: a tape from a build with no write ran `prompt` as
+        // `observe`, and says so.
+        let mode = if cfg.occupancy == Occupancy::Prompt && !prompt {
+            Occupancy::Observe
+        } else {
+            cfg.occupancy
+        };
+        self.occupancy_tell(mode, self.hold_wall_ms(now_ms));
+    }
+
+    /// WHAT THE DOOR SAYS NOW, TOLD THE HOST once a change (`IdleHost::occupancy_said`,
+    /// design §6): the mode the break ran under, the open hold, the last break's ready proxy,
+    /// first guard and reading, and each rule's last word, composed from what the loop holds.
+    /// Nothing is read for it and nothing typed. A tape from a build with no such door replays
+    /// as it was recorded: nothing is told.
+    fn occupancy_tell(&mut self, mode: Occupancy, at_ms: i64) {
+        if self.fx.replay_lacks_host_door("host.occupancy_said") {
+            return;
+        }
+        let Some(host) = self.stall_host.clone() else {
+            return;
+        };
+        let hold = self.hold.clock.since_ms().map(|since_ms| SaidHold {
+            since_ms: self.hold_wall_ms(since_ms),
+            declared: self.hold.clock.declared(),
+        });
+        let door = &self.hold.door;
+        let rules = RuleId::ALL.map(|rule| {
+            let said = door.said[rule.index()].filter(|_| hold.is_some());
+            SaidRule {
+                rule,
+                verdict: said.map_or(SaidVerdict::Quiet, Said::verdict),
+                at_ms: if said.is_some() {
+                    door.said_at[rule.index()]
+                } else {
+                    0
+                },
+            }
+        });
+        let (ready, guards, reading) = door.seen.clone().map_or(
+            (false, None, OccupancyReading::default()),
+            |(ready, guards, reading)| (ready, Some(guards), reading),
+        );
+        let said = OccupancySaid {
+            mode,
+            hold,
+            ready: ready && hold.is_some(),
+            guards,
+            rules,
+            at_ms,
+            reading,
+        };
+        if door
+            .told
+            .as_ref()
+            .is_some_and(|told| told.same_change(&said))
+        {
+            return;
+        }
+        host.occupancy_said(&said);
+        self.hold.door.told = Some(said);
     }
 
     /// UNDER `prompt`, A DUE LINE kept for the write at this same break
@@ -569,6 +658,7 @@ impl<C: Ctl> Session<'_, C> {
             wrote
         };
         self.door_said(&due, wrote, review);
+        self.occupancy_tell(cfg.occupancy, self.hold_wall_ms(due.now_ms));
         Ok(wrote == Wrote::Typed)
     }
 
@@ -742,13 +832,17 @@ impl<C: Ctl> Session<'_, C> {
             ),
             Wrote::Paced(pace) => (Said::HostPaced(pace), format!("paced why={}", pace.word())),
             Wrote::Typed => (Said::Typed(due.episode), "typed".to_string()),
-            Wrote::Skipped(why) => (Said::Skipped(due.episode), format!("skipped why={why}")),
+            Wrote::Skipped(why) => (
+                Said::Skipped(due.episode, why),
+                format!("skipped why={why}"),
+            ),
         };
         let last = &mut self.hold.door.said[due.rule.index()];
         if *last == Some(said) {
             return;
         }
         *last = Some(said);
+        self.hold.door.said_at[due.rule.index()] = self.hold_wall_ms(due.now_ms);
         review.note(&format!(
             "OCCUPANCY seq={} rule={} rev=builtin episode={:016x} door=break {words}",
             due.seq,
@@ -864,6 +958,7 @@ impl<C: Ctl> Session<'_, C> {
             return;
         }
         *last = said;
+        self.hold.door.said_at[rule.index()] = self.hold_wall_ms(now_ms);
         if said.is_none() {
             return;
         }
@@ -963,6 +1058,36 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
+    /// THE LOOP ENDS (`Session::drive`, any end): where its host was last told an open hold, it
+    /// is told none, once — no loop measures that hold now, so the window's board counts it
+    /// neither in `occupancy_hold=` nor in `ready=`. A policy whose occupancy moved hands the tab
+    /// to a successor loop (the host's `cfg_gen`), which under `off` tells nothing; under
+    /// `observe` or `prompt` its first break tells the hold again. The word is the last one told
+    /// with its hold, its ready proxy, its guards and its rules' words emptied, stamped as that
+    /// one was: nothing is read for it and nothing typed. A tape from a build with no such door
+    /// told nothing, so it tells nothing here either.
+    pub(super) fn occupancy_untold(&mut self) {
+        let Some(told) = self.hold.door.told.as_ref().filter(|t| t.hold.is_some()) else {
+            return;
+        };
+        let Some(host) = self.stall_host.clone() else {
+            return;
+        };
+        let said = OccupancySaid {
+            hold: None,
+            ready: false,
+            guards: None,
+            rules: RuleId::ALL.map(|rule| SaidRule {
+                rule,
+                verdict: SaidVerdict::Quiet,
+                at_ms: 0,
+            }),
+            ..told.clone()
+        };
+        host.occupancy_said(&said);
+        self.hold.door.told = Some(said);
+    }
+
     /// One change, said: its journal line, and its row where the hold is booked (a stale seed's
     /// close always: its open row stands).
     fn hold_said(&mut self, seq: u64, change: HoldChange, review: &mut dyn Review) {
@@ -1003,6 +1128,15 @@ impl<C: Ctl> Session<'_, C> {
         };
         if let Some(said) = row {
             self.hold_row(seq, said);
+        }
+        // A close is told where the host was told the hold: its status no longer shows it.
+        if let HoldChange::Closed { held_ms, .. } = change
+            && let Some(told) = &self.hold.door.told
+        {
+            let at_ms = told
+                .hold
+                .map_or(told.at_ms, |hold| hold.since_ms.saturating_add(held_ms));
+            self.occupancy_tell(told.mode, at_ms);
         }
     }
 

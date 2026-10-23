@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Check completion provenance, joins, scheduler/boot lock release, and two processes
-//! arming one staged build.
+//! Models for update-check provenance, joins, lock release, and two-process staged-build apply.
 use aterm_spec::derive::Model;
 
 #[must_use]
@@ -113,12 +112,7 @@ pub fn native_update_boot_health_lock_model() -> Model {
     }
 }
 
-/// Two processes arm one staged build and it is swapped in once. Every window and session
-/// runs the apply lane; B may finish its pre-lock peek (`BPeek`) while A holds `apply_lock`,
-/// swaps and retires the marker (`ASwap`). B's apply under the lock (`BApply`) must follow
-/// the marker as it reads then. `Buggy=1` acts on the pre-lock peek and swaps twice
-/// (`OneSwapPerBuild`). Tier-1: aterm-update `install_tests.rs`,
-/// `two_processes_arming_one_build_swap_it_once`.
+/// Two processes arm one staged build and it is swapped in once.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_two_process_apply_model() -> Model {

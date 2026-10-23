@@ -199,7 +199,8 @@ pub(crate) fn check_ready_or_exit(number: i32) {
 /// Take descriptor `number` over as this instance's ready signal.
 pub(crate) fn adopt_ready_or_exit(number: i32) {
     check_ready_or_exit(number);
-    // SAFETY: `number` was just checked open; this process owns it from here (the harness handed.
+    // SAFETY: `number` was just checked open; this process owns it from here (the harness
+    // handed it over, and nothing else here names it).
     let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(number) };
     if !set_close_on_exec(number, true) {
         crate::logging::stderr_line!(

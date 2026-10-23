@@ -597,6 +597,7 @@ impl PetBrain {
                 && a.uniform_up_rows == b.uniform_up_rows
         });
         if fixed_view {
+            // Multiple coherent reads may precede one tick. A duplicate
             // observation cannot erase new local ink already observed.
             if let Some(old) = old_ink
                 && let Some(r) = self.console.last_body
@@ -606,6 +607,7 @@ impl PetBrain {
                     old.iter().zip(new).any(|(old, new)| new & !old != 0);
             }
         } else {
+            // Moving existing ink through a pane-local mask is not contact
             // from newly displayed text. Reflow/unknown snapshots revoke too.
             self.console.contact_changed = false;
         }
@@ -1011,6 +1013,8 @@ impl PetBrain {
     }
 
     pub(super) fn reseat_unshown_console_body(&mut self, sense: PetSense, width: f32) {
+        // Nothing was on glass last emission, so a first appearance or a
+        // fully faded resident may start its fade at a current safe station;
         // a body the user can still see must use locomotion.
         if self.console.on_glass
             || self.console.resident
@@ -1436,6 +1440,8 @@ impl PetBrain {
                     .copied()
             })
         }) {
+            // One content anchor may survive a completed command; no timer
+            // grants another excursion. The perch is a visit, not a tenancy:
             // [`PERCH_DWELL`] bounds it and `console_deadline` offers its end.
             if sense
                 .now
@@ -2273,6 +2279,7 @@ impl PetBrain {
                     .or_else(|| resting.and_then(keep_any_clear))
             })
             .or_else(|| {
+                // The search requires a finite reach. Cover the whole pane,
                 // including a stand whose column lies outside it.
                 world.nearest_clear_perch(body, CLEARANCE, pane_reach(), from)
             })
@@ -2342,6 +2349,8 @@ impl PetBrain {
     #[inline]
     fn console_walled(world: &PetWorld, from: PetRect, to: PetRect, passing: bool) -> bool {
         if passing {
+            // The way the feet go: chrome over the ground is walked under
+            // ([`Self::console_escorting`]), chrome on it or across it is a
             // wall.
             world.ground_corridor_walled(PetWorld::feet_row_of(from), PetWorld::feet_row_of(to))
         } else {

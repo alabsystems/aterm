@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A Settings page's frame, timed: the native compile a frame of a preview's
-//! clock runs (`App::compiled_native_ui`, which renders the page and lays it
-//! out), on the headless App, at a short window whose page sheds its chrome
-//! and at a shipped one whose page keeps it. MEASURED by the
-//! `settings_frame_cost` bench; that a frame of the clock decides no chrome
-//! is ASSERTED by `a_short_windows_chrome_is_decided_once_per_layout_input`.
-//! Compiled under the `bench-support` feature only.
+//! Benchmarks native Settings page frame compilation (`App::compiled_native_ui`) across window sizes.
 
 use super::*;
 
@@ -21,8 +15,7 @@ pub(crate) struct FrameCost {
     pub(crate) p99_us: f64,
 }
 
-/// `frames` frames of `route` at each window: the page compiled again with
-/// nothing changed but the clock, each frame timed.
+/// Measures `frames` frames of `route` across window sizes.
 pub(crate) fn settings_frame_cost(frames: usize) -> Vec<FrameCost> {
     let cases: [(
         &'static str,

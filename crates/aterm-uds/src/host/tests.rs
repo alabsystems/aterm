@@ -3,8 +3,6 @@
 
 use super::*;
 
-/// The preflight works on injected process limits: no test changes the
-/// runner's limits, and a successful write is never its own readback proof.
 #[cfg(unix)]
 #[test]
 fn descriptor_room_preserves_limits_and_reports_the_actual_result() {
@@ -94,14 +92,11 @@ fn descriptor_room_preserves_limits_and_reports_the_actual_result() {
     );
 }
 
-/// A file at `path` (its directory made): what the resolver looks for is a file.
 fn stand_in(path: &Path) {
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
     std::fs::write(path, "#!/bin/sh\n").expect("write a stand-in");
 }
 
-/// A row like the fish row, whose usual install path is a stand-in this test owns, so the
-/// order is measured on any host (this Mac's /opt/homebrew/bin/fish included).
 fn fish_like(fixed: &'static str) -> Tool {
     Tool {
         at: Box::leak(vec![fixed].into_boxed_slice()),
@@ -113,10 +108,6 @@ fn leak(path: &Path) -> &'static str {
     Box::leak(path.to_string_lossy().into_owned().into_boxed_str())
 }
 
-/// §10 S2: a stand-in at `fish-<pinned>/bin/fish` in a scratch tooling dir, stamped as
-/// `verify provision` stamps what it places, is found ahead of the usual install paths,
-/// and `$ATERM_TEST_FISH` still comes first. NEGATIVE CONTROL: the same copy without its
-/// stamp (laid by hand) is passed over for the usual path.
 #[test]
 fn the_pinned_copy_in_the_tooling_cache_comes_before_the_usual_paths() {
     let scratch = aterm_tempfile::tempdir().expect("scratch");
@@ -166,8 +157,6 @@ fn the_pinned_copy_in_the_tooling_cache_comes_before_the_usual_paths() {
     assert_eq!(tool("fish").find_in(&lookup), Some(pinned));
 }
 
-/// A copy at another version is never the pin: the resolver reads exactly the pinned one,
-/// so a stale build is never what a test runs.
 #[test]
 fn a_copy_at_another_version_is_not_the_pin() {
     let scratch = aterm_tempfile::tempdir().expect("scratch");
@@ -211,9 +200,6 @@ fn a_copy_at_another_version_is_not_the_pin() {
     );
 }
 
-/// The refusal names the provider's one command, never a hand install, and never a command
-/// that does not exist (#89): a pinned tool's is the `verify provision` run that provides
-/// it, with the variable that names another copy after it.
 #[test]
 fn the_refusal_names_its_provider() {
     let mac = "macos-aarch64";
@@ -274,10 +260,6 @@ fn the_refusal_names_its_provider() {
     }
 }
 
-/// Every pinned row's remedy, on a host it is pinned for, is the `verify provision` run its
-/// `when` names, with that run's flag and no other, and no row names `aterm init
-/// --develop` before S8 lands it. NEGATIVE CONTROL: a `--linux` row's words without the
-/// flag would send a person to a run that skips it.
 #[test]
 fn every_workspace_row_names_the_run_that_provides_it() {
     let mut seen = 0;
@@ -308,10 +290,6 @@ fn every_workspace_row_names_the_run_that_provides_it() {
     );
 }
 
-/// On a host the tree pins nothing for, a pinned row's refusal says aterm provides none
-/// there and which hosts the run covers, rather than naming a run that would answer
-/// "nothing is pinned". NEGATIVE CONTROL: the same rows on a Mac name their run, and a row
-/// built wherever targo runs (wasm-bindgen) names it on Linux too.
 #[test]
 fn a_host_the_tree_pins_nothing_for_is_told_so() {
     for name in ["fish", "pwsh", "wasm-opt", "limactl"] {
@@ -333,8 +311,6 @@ fn a_host_the_tree_pins_nothing_for_is_told_so() {
     assert!(bindgen.contains("builds the pinned 0.2.108"), "{bindgen}");
 }
 
-/// A pin's directory is its package's, so a program a package carries under another name
-/// resolves where `verify provision` lays the package.
 #[test]
 fn a_pin_lives_under_its_package() {
     let t = Path::new("/t");
@@ -356,9 +332,6 @@ fn a_pin_lives_under_its_package() {
     assert_eq!(tool("rustup").pinned_in(t), None);
 }
 
-/// §8.3's third step before its fourth: a row's usual install path is found ahead of
-/// the same name on `$PATH`, and `$PATH` only once no usual path holds it, so a host
-/// whose PATH leads with another copy still tests the one the row names.
 #[test]
 fn the_usual_paths_come_before_path() {
     let scratch = aterm_tempfile::tempdir().expect("scratch");
@@ -385,8 +358,6 @@ fn the_usual_paths_come_before_path() {
     );
 }
 
-/// §10 S2: a missing vim ends COULD NOT RUN, with the provider in the words, never a pass
-/// and never a FAIL.
 #[test]
 fn a_missing_tool_ends_could_not_run_naming_its_provider() {
     let nowhere = Tool {
@@ -459,4 +430,27 @@ fn the_user_cache_follows_each_platform_convention() {
         Some(PathBuf::from("/h/.cache/aterm/browser"))
     );
     assert_eq!(user_cache("linux", None, None, "browser"), None);
+}
+
+/// node is a release host's alone (`ship site`'s firebase-tools, until S17): no dev lane
+/// runs it, since every wasm driver runs in the pinned chrome-headless-shell (init-system
+/// S10), and its refusal names `ship provision`, never an install. The browser it moved to
+/// is a pinned row.
+#[test]
+fn node_is_only_a_release_hosts() {
+    let rows: Vec<&Tool> = TOOLS.iter().filter(|t| t.name == "node").collect();
+    assert_eq!(rows.len(), 1, "one node row");
+    assert_eq!(rows[0].provider, Provider::ReleaseHost);
+    assert_eq!(rows[0].provided_by(), "release host");
+    assert!(
+        rows[0].remedy().contains("ship provision"),
+        "{}",
+        rows[0].remedy()
+    );
+    let browser = tool("chrome-headless-shell");
+    assert!(
+        matches!(browser.provider, Provider::Workspace { when: When::Always }),
+        "{:?}",
+        browser.provider
+    );
 }

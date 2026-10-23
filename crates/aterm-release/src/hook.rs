@@ -32,6 +32,8 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     match args.first().map(String::as_str) {
         Some("pre-promote") if rest.is_empty() => {
             // A signal is recorded, never fatal: the commit's cutter (in this process
+            // group, so a terminal's Ctrl-C reaches it too) ends, the worktree goes, and
+            // the hook exits as the signal would have it.
             crate::interrupt::install();
             let facts = PrePromote::from_process();
             let mut check = |asked: Asked<'_>, full: &str| {
@@ -348,7 +350,9 @@ impl Drop for Worktree {
     }
 }
 
-/// Would a real cut of the engine's commit pass its pre-claim gates? `check` answers as.
+/// Would a real cut of the engine's commit pass its pre-claim gates? `check` answers as
+/// the running release's cutter ([`PrePromote::cutter`]) when one is named, else in a
+/// worktree of exactly that commit, its submodules at the gitlinks it records.
 pub fn pre_promote(
     facts: &PrePromote,
     cwd: &Path,

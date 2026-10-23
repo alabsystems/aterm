@@ -270,11 +270,11 @@ pub(crate) struct PaneGeom {
 }
 
 impl PaneGeom {
-    fn frame_row(self, r: usize) -> usize {
+    const fn frame_row(self, r: usize) -> usize {
         self.strip + self.row_off + r
     }
 
-    fn frame_col(self, c: usize) -> usize {
+    const fn frame_col(self, c: usize) -> usize {
         self.col_off + c
     }
 }
@@ -338,7 +338,7 @@ impl CardLine {
     }
 
     /// Starting `(frame_row, col)` key of this edit.
-    pub(crate) fn at(&self) -> (usize, usize) {
+    pub(crate) const fn at(&self) -> (usize, usize) {
         (self.frame_row, self.col)
     }
 }
@@ -488,7 +488,7 @@ impl CardEntry {
     }
 
     /// Whether this card is shown and still wants animation or deferred-show frames.
-    fn live(&self) -> bool {
+    const fn live(&self) -> bool {
         !self.asked && (self.deferred.is_some() || self.shown && !self.card.at_rest())
     }
 }
@@ -505,7 +505,7 @@ pub(crate) struct CardPainted {
 }
 
 impl CardPainted {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.layers.is_empty()
             && self.under.is_empty()
             && self.halo.is_empty()
@@ -659,19 +659,19 @@ impl WindowCards {
     }
 
     /// Borrow the agents panel state and painted record together.
-    pub(crate) fn panels_and_painted(
+    pub(crate) const fn panels_and_painted(
         &mut self,
     ) -> (&mut crate::claude_panel::WindowPanels, &mut CardPainted) {
         (&mut self.panels, &mut self.painted)
     }
 
     /// Borrow the agents panel state.
-    pub(crate) fn panels(&self) -> &crate::claude_panel::WindowPanels {
+    pub(crate) const fn panels(&self) -> &crate::claude_panel::WindowPanels {
         &self.panels
     }
 
     /// Mutably borrow the agents panel state.
-    pub(crate) fn panels_mut(&mut self) -> &mut crate::claude_panel::WindowPanels {
+    pub(crate) const fn panels_mut(&mut self) -> &mut crate::claude_panel::WindowPanels {
         &mut self.panels
     }
 
@@ -947,7 +947,7 @@ fn quad_key(q: &GlowQuad) -> EntryKey {
     ]
 }
 
-fn halo_key(h: &RainHalo) -> EntryKey {
+const fn halo_key(h: &RainHalo) -> EntryKey {
     let [a, b, c] = h.damage_words();
     [a, b, c]
 }
@@ -1156,7 +1156,7 @@ fn pinned_seed() -> Option<u64> {
     }
 }
 
-fn mix(mut x: u64) -> u64 {
+const fn mix(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -1288,11 +1288,9 @@ fn make_line_texts_for(agent: Option<&str>, view: AutopilotView, end: LineEnd) -
     let facts = VersionFacts::this_build();
     let mut texts = Vec::with_capacity(7);
     let tag = agent.map_or_else(String::new, |a| {
-        if a == "agy" {
-            let v = aterm_phase::Program::Agy.harness_version().unwrap_or("0.1");
-            format!(" \u{b7} {a} v{v}")
-        } else {
-            format!(" \u{b7} {a}")
+        match aterm_phase::program_of(a).and_then(aterm_phase::Program::harness_version) {
+            Some(v) => format!(" \u{b7} {a} v{v}"),
+            None => format!(" \u{b7} {a}"),
         }
     });
     if let Some(full) = version_signature(facts, VersionRung::Full) {
@@ -1422,7 +1420,7 @@ impl PaneRow<'_> {
     }
 }
 
-fn sits_in(place: &CardPlace, pane: PaneGeom) -> bool {
+const fn sits_in(place: &CardPlace, pane: PaneGeom) -> bool {
     matches!(place.rows, 1 | 3 | 4) && place.top + place.rows <= pane.rows && pane.cols >= 2
 }
 
@@ -1700,7 +1698,7 @@ fn kitty_width(key: &LaidKey) -> usize {
     }
 }
 
-fn pane_cells<'a>(scratch: &'a RenderInput, key: &LaidKey) -> PaneCells<'a> {
+const fn pane_cells<'a>(scratch: &'a RenderInput, key: &LaidKey) -> PaneCells<'a> {
     PaneCells {
         scratch,
         pane: key.pane,
@@ -2062,7 +2060,7 @@ pub(crate) struct FenceFrame {
 
 impl FenceFrame {
     /// Extract the holder fence from `scratch`.
-    pub(crate) fn of(scratch: &RenderInput) -> Self {
+    pub(crate) const fn of(scratch: &RenderInput) -> Self {
         Self {
             holder: scratch.holder,
             base_y: scratch.base_y,
@@ -2090,7 +2088,7 @@ pub(crate) fn admit(
     }
 }
 
-fn token_holds(gate: &crate::holder_image::CardGate, fence: &FenceFrame) -> Result<(), Bare> {
+const fn token_holds(gate: &crate::holder_image::CardGate, fence: &FenceFrame) -> Result<(), Bare> {
     if gate.token == 0 || fence.holder.token != gate.token {
         return Err(Bare::Token);
     }
@@ -2133,7 +2131,10 @@ pub(crate) struct GateCheck {
 
 impl GateCheck {
     /// Create a gate check for a pane's current drawer `gate` and `fence`.
-    pub(crate) fn new(gate: Option<crate::holder_image::CardGate>, fence: FenceFrame) -> Self {
+    pub(crate) const fn new(
+        gate: Option<crate::holder_image::CardGate>,
+        fence: FenceFrame,
+    ) -> Self {
         Self {
             gate,
             fence,
@@ -2282,7 +2283,7 @@ pub(crate) fn drawerless_leaf(leaf_index: usize, session: u64, pane: PaneGeom) -
 
 impl CardLeaf {
     /// Whether this leaf actively read `index`'s card text cache.
-    pub(crate) fn reads(&self, index: usize) -> bool {
+    pub(crate) const fn reads(&self, index: usize) -> bool {
         self.leaf_index == index && !self.drawerless
     }
 }

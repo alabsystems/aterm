@@ -18184,6 +18184,8 @@ fn a_limits_track_dropped_with_no_work_ends_its_try_for_a_loop_that_follows() {
             if control {
                 met
             } else {
+                // A person's turn read busy ends the remembered wall (and its
+                // row closes the ledger's): the `/clear` then ends the
                 // policy's track alone.
                 if how.contains("busy") {
                     s.set_clock(try_at + 3 * 60, PDT);
@@ -25033,9 +25035,11 @@ fn a_try_inside_its_take_window_is_awaited_by_a_loop_that_follows() {
             continue;
         };
         let ok = if work.is_some() {
+            // Thirty minutes from the wall the try's own turn ended on; the
             // successor's busy read wrote the take.
             mine == end_at + 30 * 60 && theirs == mine && taken == 1
         } else {
+            // The try's rung, two hours from its answer (the window's end for
             // the first loop, the wall's row for the successor).
             mine == try_at + 40 + 120 * 60 && theirs + 40 >= mine && theirs <= mine
         };
@@ -26240,7 +26244,12 @@ fn a_loop_started_inside_the_login_a_loop_before_typed_carries_it_on() {
 }
 
 /// THE CREDITS HOLD IN THE LOOP (the owner, 2026-10-19: *"for continuing on
-/// credits, that's an optional additional feature that's off by default.
+/// credits, that's an optional additional feature that's off by default. use
+/// subscriptions."*): the notice credits started on (2.1.300, measured:
+/// `You're now using usage credits · Your session limit resets 9:43am (…)`),
+/// read by the loop's own read before the point, gives the point that shows
+/// only the lasting `Now using usage credits` its reset: nothing is typed,
+/// and the point waits for 9:43 and the grace.
 #[test]
 fn the_loop_holds_its_own_turns_on_usage_credits_until_the_notices_reset() {
     use crate::supervise::policy::turn_end::{CREDITS_HOLD_TOLD, RULE_CREDITS_HOLD};

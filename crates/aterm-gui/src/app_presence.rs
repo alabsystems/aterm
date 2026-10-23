@@ -51,11 +51,11 @@ pub(crate) enum ChromeRegridBatch {
 }
 
 impl ChromeRegridBatch {
-    pub(crate) fn all(&mut self) {
+    pub(crate) const fn all(&mut self) {
         *self = Self::All;
     }
 
-    fn covers(&self, _wid: WindowId) -> bool {
+    const fn covers(&self, _wid: WindowId) -> bool {
         matches!(self, Self::All)
     }
 }
@@ -112,7 +112,7 @@ fn need_unix_now() -> i64 {
 }
 
 /// Whether window `ws`'s grid re-grids when its chrome rows move: a real OS window, or a test's stand-in for one (a headless window keeps its inserted grid; its chrome caches are the whole re-grid).
-pub(crate) fn chrome_regrids_grid(ws: &crate::WindowState) -> bool {
+pub(crate) const fn chrome_regrids_grid(ws: &crate::WindowState) -> bool {
     #[cfg(test)]
     if ws.chrome_regrids_for_test {
         return true;
@@ -649,6 +649,8 @@ impl App {
         match fact {
             crate::HarnessFact::Act(act) => crate::harness_glass::on_act(self, session, act),
             crate::HarnessFact::Task(face) => {
+                // Nor is its face in the gap of the self-claim's own re-exec
+                // (`upgrade@v1`, then the claim given back and taken again):
                 // the self-claim's face stands across it.
                 if self.beside_proven_self_claim(session) || self.in_self_claim_reexec(session) {
                     self.clear_land_held(session);
@@ -680,6 +682,7 @@ impl App {
                 };
                 let mut holds = false;
                 for face in faces {
+                    // Nothing ends a Cruise or Off task. Open acts still
                     // apply, including one after a skipped landing.
                     if face == aterm_agent::harness::acts::TaskFace::Landed
                         && !self.self_claim_may_land(session)
@@ -1087,6 +1090,7 @@ impl App {
         if seen.end {
             self.restamp_for_end();
         } else if seen.task {
+            // The front tab wears no `•`, so only the menu bar's Done for
             // you can have moved.
             self.mark_status_dirty();
         }
@@ -1823,6 +1827,8 @@ impl Desk for App {
 
     fn herald(&mut self, session: u64) {
         if self.publish_need(session) {
+            // Settings ▸ Harness counts the sessions a harness's need stands
+            // on and leads a row's state line with it (§12.2.1): republished
             // where the verdict moved, while a view shows the page.
             self.harness_screen_moved();
         }

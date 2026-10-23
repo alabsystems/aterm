@@ -3205,7 +3205,7 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// THE MEASURED FAILURE, REPLAYED IN REAL SHELLS (module doc).
+    /// THE MEASURED FAILURE, REPLAYED IN REAL SHELLS.
     #[cfg(unix)]
     #[test]
     fn every_hook_dialect_orders_path_in_its_real_shell() {

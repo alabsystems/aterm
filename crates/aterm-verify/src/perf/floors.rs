@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
-use super::trend::utc_date;
+use super::trend::{PointFigure, utc_date};
 use super::workspace_root;
 use super::{LaneRun, Status, TrendSample};
 
@@ -141,6 +141,7 @@ pub(crate) fn gate_throughput(record: bool) -> LaneRun {
         metric: "median_mbps".to_string(),
         value: report.median_mbps,
         inverted: false,
+        at: Vec::new(),
     }];
     let path = baseline_path();
     let mut run = if record {
@@ -396,6 +397,14 @@ const EFFECTS_CPU_LANE: FloorLane = FloorLane {
     ..EFFECTS_LANE
 };
 
+/// The report keys whose figures are the operating point the effects lane's GPU keys are
+/// measured at: the reference full repaint's GPU p50 and the blank one's, in us. Every GPU
+/// key is a ratio against those frames, and its level moves with the GPU's state, which
+/// either figure alone misses: this box measured 175.9 and 195.3 us references with blank
+/// repaints of 117.6 and 80.4 us and episode ratios of 1.73 and 2.84 ([`PointFigure`]). The
+/// CPU keys count instructions, which the GPU's state does not move.
+const EFFECTS_GPU_POINT: &[&str] = &["ref_gpu_p50_us", "ref_blank_gpu_p50_us"];
+
 /// The features the effects harness is built with: its pass-economy ablation is a dev seam.
 const EFFECTS_FEATURES: &[&str] = &["dev-seams"];
 
@@ -520,6 +529,7 @@ pub(crate) fn judge_keyed(lane: &FloorLane, json: &Value, record: bool) -> LaneR
             metric: (*key).to_string(),
             value: *v,
             inverted: false,
+            at: Vec::new(),
         })
         .collect();
     let path = keyed_baseline_path(lane);
@@ -664,6 +674,7 @@ fn judge_effects(json: &Value, record: bool) -> LaneRun {
     };
     let mut run = judge_keyed(lane, json, record);
     run.unjudged.extend(missing.map(str::to_string));
+    at_gpu_point(&mut run, json);
     let reported = json.as_object().map_or(0, |o| o.len());
     eprintln!(
         "    UNGATED — {} more keys reported, not judged (the record: absolute costs, spreads, \
@@ -671,6 +682,39 @@ fn judge_effects(json: &Value, record: bool) -> LaneRun {
         reported.saturating_sub(lane.keys.len())
     );
     run
+}
+
+/// Pin each GPU trend sample to the GPU state the report measured it in, or keep it out of the
+/// trend when the report does not say: held against another state's rows, a state change reads
+/// as a regression.
+fn at_gpu_point(run: &mut LaneRun, json: &Value) {
+    let at: Option<Vec<PointFigure>> = EFFECTS_GPU_POINT
+        .iter()
+        .map(|&name| {
+            number(json, name)
+                .filter(|v| *v > 0.0)
+                .map(|value| PointFigure { name, value })
+        })
+        .collect();
+    let before = run.samples.len();
+    run.samples.retain_mut(|s| {
+        if !EFFECTS_GPU_KEYS.contains(&s.metric.as_str()) {
+            return true;
+        }
+        s.at.clone_from(at.as_ref().unwrap_or(&Vec::new()));
+        at.is_some()
+    });
+    let dropped = before - run.samples.len();
+    if dropped > 0 {
+        let figures = EFFECTS_GPU_POINT.join(", ");
+        eprintln!(
+            "    NO TREND SAMPLE for {dropped} GPU key(s) — the report lacks a positive \
+             {figures}, so it does not say which GPU state they were measured in."
+        );
+        run.unjudged.push(format!(
+            "effects GPU trend ({dropped} key(s); the report lacks {figures})"
+        ));
+    }
 }
 
 /// The lane that judges an effects report, and what this host could not measure for it; or the
@@ -772,6 +816,7 @@ fn judge_resize(json: &Value, record: bool) -> LaneRun {
                 metric: key.to_string(),
                 value: v,
                 inverted: true,
+                at: Vec::new(),
             }),
             None => eprintln!("    {key}: NO TREND SAMPLE — absent from the harness report."),
         }
@@ -791,6 +836,8 @@ fn judge_resize(json: &Value, record: bool) -> LaneRun {
         .filter(|k| !RESIZE_LANE.keys.contains(k) && !RESIZE_INVERTED_TREND_KEYS.contains(k))
         .collect();
     if !ungated.is_empty() {
+        // Several are the run's shape (ring_lines, n, warmup); converge_stale_width
+        // is a correctness outcome nothing here refuses. Which deserve a floor is
         // an owner call; the log says they were not judged.
         eprintln!("    UNGATED — reported, not judged: {}", ungated.join(", "));
     }
@@ -1199,6 +1246,68 @@ mod tests {
         }
         let neither = effects_report(Some("none"), Some("none"), &[], HEALTHY);
         assert!(matches!(chosen(&neither, false), Err(Status::Skip { .. })));
+    }
+
+    /// Each GPU trend sample names the reference and blank repaints' GPU p50s it was measured
+    /// at, and the CPU work samples name none; a report that lacks either figure sends no GPU
+    /// sample to the trend and says so. NEGATIVE CONTROL: the same report's CPU samples are
+    /// unchanged.
+    #[test]
+    fn effects_gpu_trend_samples_carry_the_reference_repaints_they_were_measured_at() {
+        let mut full = effects_report(
+            Some("metal"),
+            Some("instructions"),
+            EFFECTS_LANE.keys,
+            HEALTHY,
+        );
+        let unplaced = judge_effects(&full, false);
+        let mut half = full.clone();
+        if let Some(o) = full.as_object_mut() {
+            o.insert("ref_gpu_p50_us".to_string(), Value::from(535.667));
+            o.insert("ref_blank_gpu_p50_us".to_string(), Value::from(367.5));
+        }
+        if let Some(o) = half.as_object_mut() {
+            o.insert("ref_gpu_p50_us".to_string(), Value::from(535.667));
+        }
+        let run = judge_effects(&full, false);
+        assert!(!run.failed(), "{run:?}");
+        assert_eq!(run.samples.len(), EFFECTS_LANE.keys.len());
+        for s in &run.samples {
+            let gpu = EFFECTS_GPU_KEYS.contains(&s.metric.as_str());
+            let want = if gpu {
+                vec![
+                    PointFigure {
+                        name: "ref_gpu_p50_us",
+                        value: 535.667,
+                    },
+                    PointFigure {
+                        name: "ref_blank_gpu_p50_us",
+                        value: 367.5,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(s.at, want, "{}", s.metric);
+        }
+        for partial in [unplaced, judge_effects(&half, false)] {
+            assert!(!partial.failed(), "{partial:?}");
+            assert!(
+                partial
+                    .samples
+                    .iter()
+                    .all(|s| s.metric.ends_with("_per_ginsn") && s.at.is_empty()),
+                "{partial:?}"
+            );
+            assert_eq!(partial.samples.len(), EFFECTS_CPU_KEYS.len());
+            assert!(
+                partial
+                    .unjudged
+                    .iter()
+                    .any(|u| u.contains("ref_blank_gpu_p50_us")),
+                "{partial:?}"
+            );
+        }
     }
 
     /// A full report is judged on every gated key: one missing, or a report that does not say

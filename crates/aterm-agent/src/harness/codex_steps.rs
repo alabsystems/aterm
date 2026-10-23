@@ -106,7 +106,7 @@ fn word<'a>(v: Option<&'a Value>, key: &str) -> Option<&'a str> {
     v?.get(key)?.as_str()
 }
 
-/// THE CODEX STEP FOLD of one rollout (module docs).
+/// THE CODEX STEP FOLD of one rollout.
 #[derive(Clone, Debug)]
 pub struct CodexStepFold {
     /// The process's start (wall ms): older rows are history.
@@ -312,7 +312,7 @@ impl CodexStepFold {
         }
     }
 
-    /// Where the row stands against a copy (module docs): `true` when it is
+    /// Where the row stands against a copy: `true` when it is
     /// the thread's own and is read on, `false` when it steps nothing (a
     /// copied row, the first row, the line that ends a copy).
     fn past_copy(&mut self, v: &Value, stamp: Option<i64>) -> bool {
@@ -369,7 +369,7 @@ impl CodexStepFold {
     }
 
     /// The steps of one of the thread's own rows, into `out`; `true` when a
-    /// key it reads has the wrong shape (module docs).
+    /// key it reads has the wrong shape.
     fn row(&mut self, v: &Value, fresh: bool, live: bool, out: &mut Vec<StepEvent>) -> bool {
         let kind = v.get("type").and_then(Value::as_str);
         let payload = v.get("payload");

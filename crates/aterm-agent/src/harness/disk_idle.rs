@@ -641,6 +641,7 @@ fn resolve_local_reading(path: &Path, table: &Table) -> std::io::Result<Option<P
             at = root_of(&at);
         } else if matches!(to.components().next(), Some(Component::Prefix(_))) {
             // Windows' `C:x`: relative to a drive's current directory,
+            // which is the reading process's, not the link's.
             return Err(std::io::Error::other(format!(
                 "{} names a drive-relative path",
                 next.display()

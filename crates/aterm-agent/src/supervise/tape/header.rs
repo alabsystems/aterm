@@ -264,7 +264,7 @@ fn path_of(bytes: Vec<u8>) -> Result<PathBuf, String> {
         .map_err(|_| "a path that is not UTF-8".to_string())
 }
 
-/// One value's bytes as one line's text ([module docs](self)).
+/// One value's bytes as one line's text.
 pub(crate) fn escape(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
@@ -356,7 +356,7 @@ fn parse_duration(text: &str) -> Option<Duration> {
     Some(Duration::new(secs, nanos))
 }
 
-/// The header's text as it is written, section by section ([module docs](self)).
+/// The header's text as it is written, section by section.
 #[derive(Debug, Default)]
 pub(crate) struct Writer {
     out: String,
@@ -708,7 +708,7 @@ pub struct Header {
     pub idle_host: bool,
     /// THE HOST'S DOORS THE RECORDING BUILD HAD (`[opts] host_doors`, every method of its `IdleHost`).
     pub host_doors: Option<Vec<String>>,
-    /// The policy's rebuild gave back the very policy the run had ([module docs](self)).
+    /// The policy's rebuild gave back the very policy the run had.
     pub policy_exact: bool,
     /// What this build supplied where the header did not give it the run's own.
     pub supplied: Vec<String>,
@@ -762,7 +762,7 @@ impl Header {
         }
     }
 
-    /// The header's text ([module docs](self)).
+    /// The header's text.
     #[must_use]
     pub fn encode(&self) -> String {
         let Self {
@@ -820,6 +820,7 @@ impl Header {
         } = policy.policy_texts();
         for (key, value) in &keys {
             // The standing rules are a file the loop reads: under a root,
+            // as every path it opens.
             if key == RULES_FILE && !value.is_empty() {
                 w.path(key, Path::new(value), roots);
             } else {
@@ -836,7 +837,7 @@ impl Header {
         w.out
     }
 
-    /// A header's text, read back ([module docs](self)).
+    /// A header's text, read back.
     ///
     /// # Errors
     /// Not a header, a format this build does not read, or a key missing, unknown, said twice or unreadable — each named with its line.
@@ -968,6 +969,7 @@ impl Header {
         );
         if !policy_exact {
             // Said, so a replay's report never passes the rebuild off as the
+            // run's own policy (`Report::render` lists what was supplied).
             supplied.push(format!("[policy] {INEXACT}"));
         }
         Ok(Self {

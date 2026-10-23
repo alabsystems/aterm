@@ -5028,7 +5028,8 @@ fn a_level_result_suffix_names_the_key() {
 }
 
 /// A refused key (`<Key> needs dynamic workflows enabled …`, `<Key> isn't
-/// available on <model>.
+/// available on <model>. …`) answers its `/effort` row and decides nothing:
+/// the older answer's effort stands.
 #[test]
 fn a_refused_key_answers_its_command_and_decides_nothing() {
     let key = capital_key();

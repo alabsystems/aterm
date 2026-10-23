@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The toy module `verify wasm-glue` builds, binds with `verify glue`
-# and drives under node (drive.mjs): one export per boundary type of
+# and drives in a browser (drive.mjs): one export per boundary type of
 # aterm-wasm-abi. Its own workspace, so the aterm workspace never builds it
 # natively; it is built for wasm32-unknown-unknown only, on rustup's stable
 # (STOCK EXCEPTION: Trust has no wasm32 std). The check builds a staged copy:

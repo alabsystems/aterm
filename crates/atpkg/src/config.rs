@@ -473,6 +473,9 @@ pub fn parse_packages_at(text: &str, dev_seams: bool, home: Option<&Path>) -> Pa
     match aterm_toml::from_str::<PackagesOnly>(text) {
         Ok(root) => admit_packages(root.packages.unwrap_or_default(), dev_seams, home),
         Err(e) => {
+            // Said once per process wherever its unasked notices go ([`crate::notice`]):
+            // every layout resolution reads the file again. A file that is not TOML at all
+            // is said once for both tables ([`say_not_toml`]); only a shape error is this
             // table's.
             if !say_not_toml(text) {
                 crate::notice::say_once(&format!(
@@ -575,6 +578,8 @@ pub fn parse_machine(text: &str) -> MachineConfig {
     match aterm_toml::from_str::<MachineOnly>(text) {
         Ok(root) => root.machine.unwrap_or_default(),
         Err(e) => {
+            // `inert()` makes every resolver leave the machine alone; `unreadable` lets the
+            // CLI verdict, Settings' This Mac status and the `machine-state:` record say why
             // nothing is applied, rather than show a machine deliberately switched off.
             if !say_not_toml(text) {
                 crate::notice::say(&format!(

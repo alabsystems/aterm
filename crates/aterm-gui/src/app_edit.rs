@@ -98,7 +98,7 @@ impl OpenTicket {
             || matches!(&self.phase, Phase::Open { canonical_uri, .. } if canonical_uri == uri)
     }
 
-    fn view(&self) -> Option<ViewId> {
+    const fn view(&self) -> Option<ViewId> {
         match self.phase {
             Phase::Open { view, .. } => Some(view),
             Phase::Admitting { .. } => None,
@@ -108,7 +108,7 @@ impl OpenTicket {
     /// Whether a program waits on this ticket's answer now: it was asked to
     /// be waited on (or adopted), and its waiter has not been gone for
     /// [`ORPHAN_AFTER`].
-    fn client_waits(&self) -> bool {
+    const fn client_waits(&self) -> bool {
         self.awaited && !self.orphaned
     }
 
@@ -154,7 +154,7 @@ enum Ending {
 }
 
 impl Ending {
-    fn document(self) -> DocumentId {
+    const fn document(self) -> DocumentId {
         match self {
             Self::Finish { document, .. } | Self::Abort { document } => document,
         }
@@ -263,7 +263,7 @@ pub(crate) struct EditTickets {
 }
 
 impl EditTickets {
-    fn serves_headless(&self) -> bool {
+    const fn serves_headless(&self) -> bool {
         #[cfg(test)]
         {
             self.serve_headless
@@ -492,6 +492,7 @@ impl App {
             .is_some_and(|entry| matches!(entry.phase, Phase::Admitting { .. }));
         if !admitting {
             // Cancelled (its `edit` timed out or hung up): a late admission
+            // opens nothing.
             return Err(format!(
                 "edit ticket {ticket} was cancelled; its admission of {} is dropped",
                 key.uri
@@ -1262,6 +1263,7 @@ impl App {
         self.native_documents.edits.closing_behind = Some(view);
         let closed = if whole {
             // Selected for its close preflight only; the tab in front is put
+            // back in the same topology edit, before any sync.
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.tab_set.switch_to(tab);
             }

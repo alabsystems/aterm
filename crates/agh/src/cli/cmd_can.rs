@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh can` (design §10.2): whether the routed identity holds a permission.
+//! `agh can`: checks whether the routed identity holds a repository permission.
 
 use aterm_json::{Value, json};
 
@@ -24,9 +24,7 @@ fn permissions_value(p: &Permissions) -> Value {
     })
 }
 
-/// `agh can REPO pull|push|admin`: exit 0 with the Permission object when granted, Forbidden
-/// (exit 5, nothing on stdout) when not. `pull` is read as a Read; `push` and `admin` are
-/// judged as the writer (WriterRead).
+/// Checks whether the routed identity holds `pull`, `push`, or `admin` on `REPO`.
 ///
 /// # Errors
 ///

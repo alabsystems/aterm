@@ -350,8 +350,6 @@ pub fn sig(tts: &[Tt]) -> Result<Sig, Error> {
     })
 }
 
-/// The receiver `p` (the first parameter) spells, or `None` when `p` is an
-/// ordinary parameter.
 fn self_param(p: &[Tt]) -> Result<Option<Receiver>, String> {
     let without_lifetime: Vec<&Tt> = {
         let mut v = Vec::new();
@@ -379,7 +377,6 @@ fn self_param(p: &[Tt]) -> Result<Option<Receiver>, String> {
     }
 }
 
-/// Refuse the type forms no boundary type has.
 fn check_type(ty: &[Tt]) -> Result<(), String> {
     if ty.is_empty() {
         return Err("an empty type".to_string());

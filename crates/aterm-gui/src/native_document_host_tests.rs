@@ -117,10 +117,6 @@ fn manual_can_open_and_repair_config_above_the_semantic_admission_cap() {
     let _ = fs::remove_dir_all(path.parent().unwrap());
 }
 
-/// Two independent test processes capture the same disk generation, then
-/// race distinct desired bytes through the shipping lock/CAS primitive.
-/// Exactly one may commit; the loser must observe Conflict and cannot erase
-/// the winner. This also exercises PID-separated temporary names for real.
 #[test]
 fn cross_process_same_baseline_has_one_winner_and_no_temp_collision() {
     const CHILD: &str = "ATERM_CONFIG_COMMIT_TEST_CHILD";

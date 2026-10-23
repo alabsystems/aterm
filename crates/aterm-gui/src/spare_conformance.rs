@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `SpareLifecycle` (`aterm_models_gui::spare_lifecycle_model`,
-//! test U10 of `docs/DESIGN-warm-spare-2026-10-16.md`): the real slot and its
-//! transitions driven step for step beside the model, the code's state
-//! projected onto the model's after every step, and every action the model
-//! refuses refused by the code too. The model's invariants (I1–I6) are proven
-//! over its whole space at `Buggy = 0`; at `Buggy = 1` (run unproven, a stale
-//! or exited spare adopted, registered as it spawns, an effect delivered before
-//! adoption) each is caught — the negative control.
+//! Conformance test binding `SpareLifecycle` (`aterm_models_gui::spare_lifecycle_model`)
+//! to the spare slot transitions, state projection, and negative control (`Buggy = 1`).
 
 use super::*;
 use crate::tab_spawn::SpawnAsk;
@@ -17,7 +11,7 @@ use aterm_spec::interp;
 
 const GEN: u64 = 0x5EED;
 
-/// The real side: an app with one tab in `/tmp`, and the spare's world.
+/// Test rig with one tab in `/tmp` and spare-slot state.
 struct Rig {
     app: App,
     id: u64,
@@ -26,9 +20,7 @@ struct Rig {
 }
 
 impl Rig {
-    /// The rig: one tab whose pane reported `/tmp`. Not `new`: the lock-order
-    /// census resolves calls by name, and every `new` in the tree would then
-    /// seem to take a `term` lock.
+    /// Named `rigged` rather than `new` so the lock-order census does not treat every `new` as acquiring `term`.
     fn rigged() -> Self {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -37,13 +29,10 @@ impl Rig {
         app.push_stub_tab(wid, s);
         app.spares.captured = Some(Vec::new());
         app.spares.power = || false;
-        // Presence, like the power state, is a promotion's precondition the
-        // model leaves out: a person is taken as here.
         app.config.spare_shell_needs_person = Some(false);
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         Self {
             app,
-            // No spare yet: an id no session has (the stub tab took the first).
             id: u64::MAX,
             fifo_at: dir.path().join("fifo"),
             _dir: dir,
@@ -58,7 +47,7 @@ impl Rig {
             .expect("a spare")
     }
 
-    /// The code's state, in the model's vocabulary.
+    /// Project the code's spare state into the model's variables.
     fn project(&self) -> Vec<(&'static str, i64)> {
         let spares = &self.app.spares;
         let in_transit = spares.transit.iter().any(|t| t.id == self.id);
@@ -79,8 +68,6 @@ impl Rig {
             .unwrap_or_else(|p| p.into_inner())
             .by_local(self.id)
             .is_some();
-        // I1's two halves agree: the store and the pool hold a spare together
-        // or not at all (U4's registration half).
         assert_eq!(
             in_store,
             self.app.pool.get(self.id).is_some(),
@@ -123,8 +110,7 @@ impl Rig {
         ]
     }
 
-    /// Answer the last [`Job::Freshen`] the code asked, as the `aterm-spare`
-    /// thread does once it has stamped the generation.
+    /// Complete the latest [`Job::Freshen`] request by storing its generation into `shared.fresh`.
     fn answer_freshen(&mut self) {
         let asked = self.app.spares.captured.as_ref().and_then(|jobs| {
             jobs.iter().rev().find_map(|j| match j {
@@ -137,7 +123,7 @@ impl Rig {
         }
     }
 
-    /// The link of the current spare, wherever it is (slot, transit, landed).
+    /// Return the current spare's link across slot, transit, or landed state.
     fn link_any(&self) -> Arc<SpareLink> {
         LANDED.with(|landed| {
             landed
@@ -148,7 +134,7 @@ impl Rig {
         })
     }
 
-    /// Run `action` on the code; `false` when the code refuses it.
+    /// Execute `action` on the rig, returning `false` when refused.
     fn act(&mut self, action: &str) -> bool {
         let wid = WindowId(0);
         let now = Instant::now();
@@ -174,8 +160,6 @@ impl Rig {
                 if self.app.spares.slot.is_some() || !self.app.spares.transit.is_empty() {
                     return false;
                 }
-                // `spare_book_check`'s last gate for a shell with no PARKED
-                // hold: the WARM gates a `run` passes.
                 if self.app.spare_warm_gates(now, now).is_some() {
                     return false;
                 }
@@ -229,8 +213,6 @@ impl Rig {
                 if shared.eligible.load(Ordering::Acquire) {
                     return false;
                 }
-                // A gate opens for a generation of its own (a new one after a
-                // move), so a spare from before is stale beside it.
                 if shared.generation.load(Ordering::Acquire) == 0 {
                     shared.generation.store(GEN, Ordering::Release);
                 } else {
@@ -252,9 +234,6 @@ impl Rig {
                 let before = self.app.spares.slot.as_ref().map(|s| s.state);
                 let at = now + Duration::from_secs(3_600);
                 self.app.spare_promote(at);
-                // The `aterm-spare` thread's answer to the stamp the promotion
-                // asked for: the model's gate is always the disk's, so the
-                // mirror stands as it is.
                 self.answer_freshen();
                 self.app.spare_promote(at);
                 before == Some(SlotState::Parked)
@@ -282,7 +261,6 @@ impl Rig {
                 if slot.state != SlotState::Verifying {
                     return false;
                 }
-                // The thread's verdict: stale when the generation moved.
                 let stale =
                     self.app.spares.shared.generation.load(Ordering::Acquire) != slot.generation;
                 let verdict = if stale || slot.link.exited() {
@@ -314,7 +292,6 @@ impl Rig {
                     .try_adopt_spare(wid, Some(wid), grid, &SpawnAsk::new(None))
                 {
                     Ok((slot, session)) => {
-                        // `book_off_loop`'s bookkeeping for an adopted spare.
                         self.app.spares.transit.push(Transit {
                             id: slot.id,
                             link: Arc::clone(&slot.link),
@@ -374,14 +351,13 @@ impl Rig {
 }
 
 thread_local! {
-    /// An adopted spare's session between its adoption and its landing.
+    /// Adopted spare session awaiting `Land`.
     static PENDING: std::cell::RefCell<Option<Session>> = const { std::cell::RefCell::new(None) };
-    /// The landed spare's link (its state after it left the slot).
+    /// Link of the most recently landed spare.
     static LANDED: std::cell::RefCell<Option<Arc<SpareLink>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Drive `trace` on the model and the code together: each action fires on both
-/// or neither, and after each step the code's projection is the model's.
+/// Drive `trace` on the model and rig in lockstep, verifying projection equality and invariants at each step.
 fn lockstep(trace: &[&str]) {
     let model = spare_lifecycle_model();
     let mut state = model.init_state();
@@ -416,7 +392,6 @@ fn lockstep(trace: &[&str]) {
 #[test]
 fn the_spare_lifecycle_conforms_to_its_model() {
     let model = spare_lifecycle_model();
-    // The invariants hold over the whole space, and the Buggy variant breaks them.
     interp::prove_and_catch(&model);
     let caught = interp::violated_invariants(&interp::with_buggy(&model, 1));
     for inv in [
@@ -428,9 +403,7 @@ fn the_spare_lifecycle_conforms_to_its_model() {
         assert!(caught.contains(inv), "Buggy=1 must break {inv}: {caught:?}");
     }
 
-    // A parked spare adopted.
     lockstep(&["Book", "Spawned", "ParkMark", "Adopt", "Land"]);
-    // The warm path, and a promotion the closed gate refuses.
     lockstep(&[
         "Book",
         "Spawned",
@@ -443,8 +416,6 @@ fn the_spare_lifecycle_conforms_to_its_model() {
         "Adopt",
         "Land",
     ]);
-    // A spare adopted while its escape scan waits out its window, as a
-    // warming one is; the verdict after it finds no spare to act on.
     lockstep(&[
         "Book",
         "Spawned",
@@ -456,7 +427,6 @@ fn the_spare_lifecycle_conforms_to_its_model() {
         "Verified",
         "Land",
     ]);
-    // A generation that moves under a verifying spare: refused, then retired.
     lockstep(&[
         "Book",
         "Spawned",
@@ -468,7 +438,6 @@ fn the_spare_lifecycle_conforms_to_its_model() {
         "Adopt",
         "Retire",
     ]);
-    // A generation that moves under a ready spare: refused, then retired.
     lockstep(&[
         "Book",
         "Spawned",
@@ -482,7 +451,6 @@ fn the_spare_lifecycle_conforms_to_its_model() {
         "Retire",
         "Book",
     ]);
-    // The gate reopens for the NEW generation: the ready spare is still stale.
     lockstep(&[
         "Book",
         "Spawned",
@@ -496,12 +464,8 @@ fn the_spare_lifecycle_conforms_to_its_model() {
         "Adopt",
         "Retire",
     ]);
-    // A shell that exits: never adopted, retired.
     lockstep(&["Book", "Spawned", "ParkMark", "Exits", "Adopt", "Retire"]);
-    // A host effect before adoption delivers nothing.
     lockstep(&["Book", "Spawned", "ParkMark", "HostEffect", "Retire"]);
-    // A WARM-only spare (fish): booked only through an open gate, landed
-    // Warming, adopted once verified.
     lockstep(&[
         "BookWarm",
         "GateOpens",
@@ -513,8 +477,6 @@ fn the_spare_lifecycle_conforms_to_its_model() {
         "Adopt",
         "Land",
     ]);
-    // A generation that moves while it spawns: stale from its landing, and
-    // never adopted.
     lockstep(&[
         "GateOpens",
         "BookWarm",

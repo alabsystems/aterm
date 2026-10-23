@@ -3887,3 +3887,124 @@ fn a_silent_usage_tap_is_one_line_once_a_day_and_ends_with_the_last_tab() {
     assert!(note(&mut app, "s-3", true).is_empty(), "once a day");
     assert!(note(&mut app, "s-3", false).is_empty());
 }
+
+/// THE OWNER'S `occupancy = "prompt"` IS ONE ENTRY WHILE IT STANDS (occupancy 1e; the
+/// red-team's F14, R9): the policy wake alone — the watcher's post, which comes at every
+/// launch and on a read no config generation admits — whose root `[harness]` table says it
+/// raises the entry naming that the harness types occupancy lines, once however many posts say
+/// it, and the board takes the mode; a later post that no longer says it clears it. No config
+/// generation is applied here: the launch's unchanged file sends none. NEGATIVE CONTROLS:
+/// `observe`, `off`, a word that is no mode, and no key raise nothing, and a stale stamp
+/// changes nothing.
+#[test]
+fn the_owners_prompt_is_one_entry_while_the_policy_in_force_says_it() {
+    use crate::app_config::HarnessPolicy;
+    use crate::harness_policy_cell::HarnessStampSource;
+    use aterm_agent::supervise::Occupancy;
+    let mut app = App::headless_for_test();
+    let mut stamps = HarnessStampSource::new();
+    let prompt = "[harness]\noccupancy = \"prompt\"\n";
+    let stale = stamps.stamp(HarnessPolicy::read("[harness]\noccupancy = \"observe\"\n"));
+    app.adopt_harness_policy(stamps.stamp(HarnessPolicy::read(prompt)));
+    app.adopt_harness_policy(stamps.stamp(HarnessPolicy::read(prompt)));
+    let digest = app.messages.digest();
+    assert_eq!(digest.len(), 1, "{digest:?}");
+    let entry = &digest.entries[0];
+    assert_eq!(entry.key, mr::occupancy_prompt_key());
+    assert!(entry.key.starts_with(&Family::Occupancy.prefix()));
+    assert_eq!(crate::occupancy_host::mode(), Occupancy::Prompt);
+    mr::occupancy_prompt_entry()
+        .message()
+        .expect("the words pass the rule");
+    app.adopt_harness_policy(stale);
+    assert_eq!(
+        app.messages.digest().len(),
+        1,
+        "a stale stamp changes nothing"
+    );
+    assert_eq!(crate::occupancy_host::mode(), Occupancy::Prompt);
+    app.adopt_harness_policy(
+        stamps.stamp(HarnessPolicy::read("[harness]\noccupancy = \"observe\"\n")),
+    );
+    assert!(app.messages.digest().is_empty(), "observe ends it");
+    assert_eq!(crate::occupancy_host::mode(), Occupancy::Observe);
+    for (text, mode) in [
+        ("", Occupancy::Observe),
+        ("font_px = 14\n", Occupancy::Observe),
+        ("[harness]\noccupancy = \"off\"\n", Occupancy::Off),
+        ("[harness]\noccupancy = \"yes\"\n", Occupancy::Observe),
+        ("[harness]\nautopilot = \"cruise\"\n", Occupancy::Observe),
+    ] {
+        let mut app = App::headless_for_test();
+        app.adopt_harness_policy(stamps.stamp(HarnessPolicy::read(text)));
+        assert!(app.messages.digest().is_empty(), "{text:?}");
+        assert_eq!(crate::occupancy_host::mode(), mode, "{text:?}");
+    }
+    crate::occupancy_host::set_mode(Occupancy::Observe);
+}
+
+/// A TAB'S SPENT CAP UNDER `prompt` IS ITS HOLD ENTRY until its loop says otherwise (design §6,
+/// `occupancy.hold`): told through the host's note, a word under `prompt` with a rule spent
+/// raises the tab's entry — once while what is spent stands — and a word with nothing spent
+/// clears it. NEGATIVE CONTROL: the same spent word under `observe` raises nothing (nothing the
+/// owner sees was typed).
+#[test]
+fn a_spent_cap_under_prompt_is_the_tabs_hold_entry() {
+    use aterm_agent::supervise::Occupancy;
+    use aterm_agent::supervise::occupancy::{
+        OccupancyReading, OccupancySaid, RuleId, SaidHold, SaidRule, SaidVerdict,
+    };
+    let word = |mode: Occupancy, verdicts: [SaidVerdict; 2]| OccupancySaid {
+        mode,
+        hold: Some(SaidHold {
+            since_ms: 1_792_600_000_000,
+            declared: true,
+        }),
+        ready: false,
+        guards: None,
+        rules: [
+            SaidRule {
+                rule: RuleId::WaitNudge,
+                verdict: verdicts[0],
+                at_ms: 1_792_600_000_000,
+            },
+            SaidRule {
+                rule: RuleId::HoldRoom,
+                verdict: verdicts[1],
+                at_ms: 1_792_600_000_000,
+            },
+        ],
+        at_ms: 1_792_600_000_000,
+        reading: OccupancyReading::default(),
+    };
+    let sid = "s-occupancy-hold";
+    let mut app = App::headless_for_test();
+    let spent = [SaidVerdict::Quiet, SaidVerdict::Spent];
+    for _ in 0..2 {
+        app.note_harness_host(HostNote::OccupancySaid {
+            sid: sid.to_string(),
+            said: word(Occupancy::Prompt, spent),
+        });
+    }
+    let digest = app.messages.digest();
+    assert_eq!(digest.len(), 1, "{digest:?}");
+    assert_eq!(digest.entries[0].key, mr::occupancy_hold_key(sid));
+    mr::occupancy_hold_entry(sid, &[RuleId::WaitNudge, RuleId::HoldRoom])
+        .message()
+        .expect("the words pass the rule");
+    app.note_occupancy_said(sid, word(Occupancy::Prompt, [SaidVerdict::Spent; 2]));
+    assert_eq!(app.messages.digest().len(), 1, "one entry for the tab");
+    app.note_occupancy_said(
+        sid,
+        word(Occupancy::Prompt, [SaidVerdict::Quiet, SaidVerdict::Typed]),
+    );
+    assert!(app.messages.digest().is_empty(), "nothing spent ends it");
+
+    let mut observe = App::headless_for_test();
+    observe.note_occupancy_said(sid, word(Occupancy::Observe, [SaidVerdict::Spent; 2]));
+    assert!(
+        observe.messages.digest().is_empty(),
+        "observe raises nothing"
+    );
+    crate::occupancy_host::told(sid, None);
+}

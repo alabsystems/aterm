@@ -2,30 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Resize undo: a rows-only shrink on a grid that keeps no history, then a grow
-//! back with nothing drawn in between, is an exact identity.
-//!
-//! Without it an alternate screen's shrink evicts its demoted top row and a
-//! plain grow appends a blank, leaving every row one higher than the app
-//! painted it, which an app that repaints only on a changed size never heals.
-//!
-//! A Native rows-only shrink of a grid with no retention and no tiered store
-//! stashes what it takes off the screen, one entry per row in unit-shrink order
-//! (trimmed blanks, demoted top rows, pushed bottom rows, each with its extras).
-//! Later shrinks stack onto the stash; a grow pops it LIFO, re-inserting demoted
-//! rows above the viewport for the reveal to relabel and appending pushed rows
-//! where it would append blanks. A grow back to the first shrink's height
-//! restores that shrink's cursor picture and drops the stash.
-//!
-//! The stash holds only while `content_gen`, width, height and cursor picture
-//! are what the sealing resize left, the grid keeps no history and the policy
-//! is Native. `Terminal::process_at` drops it on any input (not every mutation
-//! bumps `content_gen`), as do an alt-screen switch and a reset.
-//!
-//! Session-only: never checkpointed or journalled beyond the counts in
-//! [`crate::ResizeShape`]. The host keeps the selection the first shrink found
-//! and restores it on [`crate::ResizeShape::undone`], keyed by
-//! [`Grid::resize_undo_serial`].
+//! Resize undo for rows-only shrink-and-grow round trips on history-free grids.
 
 use super::scroll_convert::ScrolledRowExtras;
 use super::{Cursor, Grid, HorizontalMargins, ScrollRegion};
@@ -43,8 +20,7 @@ pub(crate) enum UndoRow {
     Pushed(RowSnapshot, Option<Box<ScrolledRowExtras>>),
 }
 
-/// One row a grow puts back at the bottom: a pushed row with its extras
-/// (`Some`), or a trimmed blank (`None`).
+/// One row a grow puts back at the bottom.
 pub(crate) type BottomRow = Option<(RowSnapshot, Option<Box<ScrolledRowExtras>>)>;
 
 /// The cursor-owned state a resize resets or moves, compared whole.
@@ -65,23 +41,15 @@ pub(crate) struct CursorPicture {
 pub(crate) struct ResizeUndo {
     /// LIFO: the newest shrink's rows are at the end.
     pub(crate) entries: Vec<UndoRow>,
-    /// The width every entry was taken at.
     cols: u16,
-    /// The height the first shrink started from, and the cursor picture it
-    /// found there.
     rows_before: u16,
     pre: CursorPicture,
-    /// What the last resize that touched the stash left: height, content
-    /// generation, cursor picture.
     rows_after: u16,
     seal_gen: u64,
     after: CursorPicture,
-    /// Which stash this is, process-unique ([`Grid::resize_undo_serial`]).
     serial: u64,
 }
 
-/// The next stash's serial. Process-wide so two grids (or a stash that was
-/// dropped and a fresh one opened in its place) never share one.
 static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Grid {
@@ -113,8 +81,6 @@ impl Grid {
         s.has_horizontal_margins = p.has_margins;
     }
 
-    /// The grid shape a stash is kept for: no retention, no tiered store, no
-    /// history, under the Native policy.
     #[inline]
     fn keeps_resize_undo(&self, policy: ResizePolicy) -> bool {
         policy == ResizePolicy::Native
@@ -123,9 +89,7 @@ impl Grid {
             && self.storage.total_lines == usize::from(self.storage.visible_rows)
     }
 
-    /// Run first by every resize, before anything moves: keep the stash only if
-    /// nothing touched the screen since the resize that sealed it, and open a
-    /// fresh one for a rows-only shrink on a grid of the kept shape.
+    /// Run first by every resize, before anything moves.
     pub(super) fn admit_resize_undo(&mut self, new_rows: u16, new_cols: u16, policy: ResizePolicy) {
         let shape = self.keeps_resize_undo(policy) && new_cols == self.storage.cols;
         let picture = self.cursor_picture();
@@ -153,9 +117,9 @@ impl Grid {
         }
     }
 
-    /// Run last by every resize: seal the stash at what this resize left, or,
-    /// once a grow has handed every entry back on the first shrink's height,
-    /// put that shrink's cursor picture back and drop it.
+    /// Run last by every resize: seal the stash at what this resize left, or, once a grow has
+    /// handed every entry back on the first shrink's height, put that shrink's cursor picture back
+    /// and drop it.
     pub(super) fn seal_resize_undo(&mut self) {
         let Some(undo) = self.storage.resize_undo.as_ref() else {
             return;
@@ -179,14 +143,6 @@ impl Grid {
     }
 
     /// The Native rows-grow's half: pop up to `grow` entries (newest first).
-    /// Demoted rows are re-inserted above the viewport as history, oldest on
-    /// top, with their extras aligned in `ring_extras`, so the following reveal
-    /// relabels them into the viewport. Bottom entries (pushed rows as `Some`,
-    /// trimmed blanks as `None`) are returned in pop order, which is top-first,
-    /// for the caller to append in that order.
-    ///
-    /// A stash is only admitted on a grid with no history
-    /// (`keeps_resize_undo`), so every row inserted here is the whole history.
     pub(super) fn take_undo_rows(&mut self, grow: usize, cols: u16) -> Vec<BottomRow> {
         let Some(undo) = self.storage.resize_undo.as_mut() else {
             return Vec::new();
@@ -209,20 +165,17 @@ impl Grid {
             );
             let storage = &mut self.storage;
             storage.linearize_ring();
-            // Popped newest first; the oldest demoted row is the top one.
             demoted.reverse();
             let pages = &mut storage.pages;
             let rows: Vec<_> = demoted
                 .iter()
-                // SAFETY: the rows are stored in the same `GridStorage` that owns
-                // `pages`, and rows drop before the backing pages.
+                // SAFETY: the rows are stored in the same `GridStorage` that owns `pages`, and rows
+                // drop before the backing pages.
                 .map(|(row, _)| unsafe { crate::Row::from_snapshot(row, cols, pages) })
                 .collect();
             let n = rows.len();
             drop(storage.rows.splice(0..0, rows));
             storage.total_lines += n;
-            // No history means no history extras: the deque is realigned to
-            // exactly the rows just inserted, oldest first.
             storage.ring_extras.clear();
             storage
                 .ring_extras
@@ -232,8 +185,7 @@ impl Grid {
         bottom
     }
 
-    /// Forget the stash: the next grow appends blanks. Called on any output
-    /// (`Terminal::process_at`), an alternate-screen switch and a reset.
+    /// Forget the stash: the next grow appends blanks.
     #[inline]
     #[cfg_attr(
         any(test, debug_assertions),
@@ -249,19 +201,14 @@ impl Grid {
         }
     }
 
-    /// The open resize undo's serial (`None`: no undo). A host that keeps state
-    /// of its own across a flap (the Terminal's selection) keys it by this: the
-    /// same serial after a resize means the same stash, still unbroken, and
-    /// [`crate::ResizeShape::undone`] says when it has been handed back whole.
+    /// The open resize undo's serial (`None`: no undo).
     #[must_use]
     #[inline]
     pub fn resize_undo_serial(&self) -> Option<u64> {
         self.storage.resize_undo.as_ref().map(|u| u.serial)
     }
 
-    /// How many rows with content a grow could hand back right now: the demoted
-    /// and pushed rows the resize undo holds (0: no undo). Trimmed blank rows
-    /// are not counted; a grow rebuilds them as the blanks it appends.
+    /// How many rows with content a grow could hand back right now.
     #[must_use]
     pub fn resize_undo_rows(&self) -> usize {
         self.storage.resize_undo.as_ref().map_or(0, |u| {
@@ -277,9 +224,6 @@ impl Grid {
 mod tests {
     use crate::grid::Grid;
 
-    /// `rows` rows labelled `R0`, `R1`, … (every row non-blank, the full tail an
-    /// alt-screen TUI paints), cursor parked on `cursor_row`, ring retention
-    /// `max_scrollback` (0 is the alternate screen's shape).
     fn labelled(rows: u16, cols: u16, cursor_row: u16, max_scrollback: usize) -> Grid {
         let mut grid = Grid::with_scrollback(rows, cols, max_scrollback);
         for r in 0..rows {
@@ -298,8 +242,6 @@ mod tests {
             .collect()
     }
 
-    /// Everything a flap may not change: every row's text, the cursor, the
-    /// pending wrap, the scroll region and the horizontal margins.
     fn picture(grid: &Grid) -> (Vec<String>, u16, u16, bool, crate::ScrollRegion) {
         (
             screen(grid),
@@ -310,8 +252,6 @@ mod tests {
         )
     }
 
-    /// 121x52 on a grid that keeps no history, every row painted, cursor on the
-    /// bottom row, a scroll region set: 52→51→52 hands the demoted top row back.
     #[test]
     fn a_quiet_52_51_52_flap_is_an_identity() {
         let mut grid = labelled(52, 121, 51, 0);
@@ -338,8 +278,6 @@ mod tests {
         grid.assert_invariants();
     }
 
-    /// Stacked shrinks stack onto one undo, and a partial grow hands back only
-    /// the newest rows, one per grown row, in LIFO order.
     #[test]
     fn stacked_shrinks_and_partial_grows_unwind_in_order() {
         let mut grid = labelled(6, 10, 4, 0);
@@ -362,8 +300,6 @@ mod tests {
         grid.resize_no_reflow(6, 10);
         assert_eq!(picture(&grid), before, "and then the rest");
 
-        // A grow past the first shrink's height hands everything back and
-        // appends blanks for the rest.
         let mut grid = labelled(6, 10, 4, 0);
         grid.resize_no_reflow(5, 10);
         grid.resize_no_reflow(8, 10);
@@ -374,8 +310,6 @@ mod tests {
         grid.assert_invariants();
     }
 
-    /// The bottom-push corner (the cursor too high to demote) and a trim both
-    /// unwind too: pushed rows come back at the bottom, trimmed rows as blanks.
     #[test]
     fn pushed_and_trimmed_rows_come_back_where_they_were() {
         for cursor in [0, 1] {
@@ -398,7 +332,6 @@ mod tests {
             grid.assert_invariants();
         }
 
-        // A trim, then demotes: one blank row below the cursor.
         let mut grid = labelled(6, 10, 5, 0);
         grid.erase_line();
         grid.set_cursor(4, 1);
@@ -413,8 +346,6 @@ mod tests {
         assert_eq!(picture(&grid), before);
     }
 
-    /// A push then a trim, handed back by one grow: the trimmed blank sat above
-    /// the pushed row and comes back above it. Every unwind order agrees.
     #[test]
     fn a_trim_stacked_on_a_push_comes_back_above_it() {
         fn painted() -> Grid {
@@ -440,7 +371,6 @@ mod tests {
             grid.assert_invariants();
         }
 
-        // The grow's counts: one pushed row restored, one blank rebuilt.
         let mut grid = painted();
         grid.resize_no_reflow(7, 20);
         grid.resize_no_reflow(6, 20);
@@ -449,9 +379,6 @@ mod tests {
         assert_eq!((grow.restored_bottom, grow.appended), (1, 1));
     }
 
-    /// A blank band mid-screen that the first shrink leaves trailing below the
-    /// cursor is trimmed by the second, two rows at once: the undo keeps a
-    /// place for each, so the grow back puts every row where it was.
     #[test]
     fn a_blank_band_the_first_shrink_leaves_trailing_unwinds_through_its_trim() {
         let mut grid = labelled(15, 10, 1, 0);
@@ -470,8 +397,6 @@ mod tests {
         grid.assert_invariants();
     }
 
-    /// Anything between the halves that could have shown or changed the smaller
-    /// screen drops the undo: the grow appends and the screen stays shifted.
     #[test]
     fn a_write_a_cursor_move_or_a_width_change_drops_the_undo() {
         type Between = fn(&mut Grid);
@@ -492,7 +417,6 @@ mod tests {
             assert!(grid.row(5).unwrap().is_empty(), "{what}");
         }
 
-        // A width change between the halves.
         let mut grid = labelled(6, 10, 4, 0);
         grid.resize_no_reflow(5, 10);
         grid.resize_no_reflow(5, 12);
@@ -500,14 +424,11 @@ mod tests {
         grid.resize_no_reflow(6, 12);
         assert_eq!(grid.row(0).unwrap().to_string(), "R1");
 
-        // The ConPTY policy never keeps one.
         let mut grid = labelled(6, 10, 4, 0);
         grid.resize_with_policy(5, 10, crate::grid::reflow::ResizePolicy::ConPty);
         assert_eq!(grid.resize_undo_rows(), 0);
     }
 
-    /// A grid that keeps history never needs one: its flap is already an
-    /// identity through the ring (and a tiered store stages what it evicts).
     #[test]
     fn a_retaining_grid_keeps_no_undo() {
         let mut grid = labelled(6, 10, 4, 100);

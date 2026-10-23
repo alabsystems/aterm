@@ -2,15 +2,11 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `AghRouteWall`: which identity a GitHub request may carry, for each owner tier and
-//! access class, and that the one redirect hop carries none (design §6.5, §17.1).
+//! `AghRouteWall`: identity routing rules by owner tier, access class, and redirect hop.
 
 use aterm_spec::derive::*;
 
-/// THE ROUTE WALL: the tier wall, the named destination, no ambient token, nothing sent on
-/// a refusal or by anonymous, and the hop's dropped credential, over the canonical config
-/// (one dev, one release and one default-row owner). Tier-0: `tests/route_wall.rs`.
-/// Tier-1: agh's in-crate `src/policy_conformance_tests.rs`.
+/// Route-wall model over the canonical config (tier wall, named destination, and redirect hop).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn agh_route_wall_model() -> Model {
@@ -28,7 +24,6 @@ pub fn agh_route_wall_model() -> Model {
             var hop = 0;      // 1: the answer redirected and agh made the one hop
             var hopauth = 0;  // 1: the hop carried Authorization
 
-            // The world (waived): which request comes, and what the machine holds.
             action NextTier when (phase == 0) { tier = if tier == 2 { 0 } else { tier + 1 }; }
             action NextOp when (phase == 0) { op = if op == 2 { 0 } else { op + 1 }; }
             action ToggleNamed when (phase == 0) { named = 1 - named; }
@@ -37,7 +32,6 @@ pub fn agh_route_wall_model() -> Model {
             action ToggleAmbient when (phase == 0) { amb = 1 - amb; }
             action Reset when (phase > 0) { phase = 0; used = 0; hop = 0; hopauth = 0; }
 
-            // The router under the canonical config (bound to policy::Router::decide).
             action Decide when (phase == 0) {
                 phase = if (dev == 1 && (tier == 0 || op == 0))
                         || (tier == 1 && rel == 1 && (op == 1 || (op == 2 && named == 1))) { 1 }
@@ -47,10 +41,8 @@ pub fn agh_route_wall_model() -> Model {
                     else if tier == 1 && rel == 1 && (op == 1 || (op == 2 && named == 1)) { 2 }
                     else { 0 };
             }
-            // The one hop (bound to wire::hop::rebuild): reads and writer-reads only, no credential.
             action Hop when (phase > 0 && phase <= 2 && hop == 0 && op <= 1) { hop = 1; hopauth = 0; }
 
-            // Negative controls (Buggy = 1, waived): each breaks one law below.
             action BuggyDecideFallback when (Buggy == 1 && phase == 0 && tier == 1 && op == 1 && rel == 0 && dev == 1) { phase = 1; used = 1; }
             action BuggyDecideAlias when (Buggy == 1 && phase == 0 && tier == 1 && op == 2 && rel == 1 && named == 0) { phase = 1; used = 2; }
             action BuggyDecideReleaseAbroad when (Buggy == 1 && phase == 0 && tier == 2 && rel == 1) { phase = 1; used = 2; }

@@ -8,8 +8,6 @@ use crate::recovery_ledger::{EndClass, LaunchKind, Pressure, PrevRun, Tri, parse
 
 const T0: u64 = 1_790_000_000;
 
-/// A cold launch at `day` (days after T0) with `pid`, whose run before was `prev_pid`
-/// ending `class`, and whose link was `keeper`.
 fn launch(day: u64, pid: u32, prev_pid: u32, class: EndClass, keeper: KeeperAtLaunch) -> Row {
     Row {
         at: T0 + day * DAY,
@@ -41,8 +39,6 @@ fn exact(n: u32) -> Restores {
     }
 }
 
-/// Sixteen days of the keeper on, three kills each recovered exactly (two sessions each),
-/// quits between them: the bar met.
 fn met_ledger() -> Vec<Row> {
     let mut rows = Vec::new();
     let mut pid = 100;
@@ -77,7 +73,6 @@ fn criterion<'a>(soak: &'a Soak, name: &str) -> &'a Criterion {
         .unwrap_or_else(|| panic!("no criterion {name}"))
 }
 
-/// Every criterion other than `broken` is met, and `broken` is not.
 #[track_caller]
 fn only_broken(soak: &Soak, broken: &str) {
     for c in &soak.criteria {
@@ -106,7 +101,6 @@ fn a_ledger_that_meets_the_bar_is_met() {
     );
 }
 
-/// The judge reads the rows as the ledger writes them: through their lines.
 #[test]
 fn the_judge_reads_the_rows_the_ledger_writes() {
     let rows = met_ledger();
@@ -180,8 +174,6 @@ fn the_newest_launch_with_the_link_off_has_no_streak() {
     );
 }
 
-/// A launch no keeper answered, and an update's successor, keep the streak: their links
-/// were on.
 #[test]
 fn absent_and_armed_launches_keep_the_streak() {
     let mut rows = met_ledger();
@@ -206,7 +198,6 @@ fn two_kills_are_not_enough() {
     only_broken(&soak, "real-kills");
 }
 
-/// A fatal signal and a panic are kills; a recovery after a quit is not.
 #[test]
 fn a_kill_is_an_unexpected_end_and_a_quit_is_not() {
     let mut rows = met_ledger();
@@ -236,7 +227,6 @@ fn too_few_exact_sessions_are_not_met() {
     assert_eq!(soak.restores.in_flight_lost, 512);
 }
 
-/// Nine in ten exactly is the floor, met.
 #[test]
 fn the_exact_floor_is_inclusive() {
     let mut rows = met_ledger();
@@ -267,8 +257,6 @@ fn a_blank_screen_is_not_met() {
     only_broken(&soak, "none-blank");
 }
 
-/// A kill of a run whose keeper took its terminals, then a launch a keeper answered that
-/// recovered nothing, is a miss — and only that.
 #[test]
 fn a_kill_the_keeper_did_not_bring_back_is_a_miss() {
     let mut rows = met_ledger();
@@ -310,8 +298,6 @@ fn a_kill_the_keeper_did_not_bring_back_is_a_miss() {
     assert_eq!(judge(&armed, now_after(&armed), &P4).misses.len(), 1);
 }
 
-/// A kill whose recovery brought some sessions back and refused others: the refused ones
-/// count against `exact` and are a miss, though the rest came back exactly.
 #[test]
 fn a_session_the_recovery_refused_is_a_miss() {
     let mut rows = met_ledger();
@@ -344,8 +330,6 @@ fn a_session_the_recovery_refused_is_a_miss() {
     assert!(!criterion(&soak, "real-kills").met);
 }
 
-/// A recovery after a run whose end the ledger cannot say is reported apart from one after
-/// a run that ended on purpose; neither is a kill.
 #[test]
 fn a_recovery_after_an_unknown_end_is_not_said_to_be_on_purpose() {
     let mut rows = met_ledger();
@@ -367,7 +351,6 @@ fn a_recovery_after_an_unknown_end_is_not_said_to_be_on_purpose() {
     assert_eq!(soak.kills_recovered, 3);
 }
 
-/// The recoveries' losses and words are summed, word by word.
 #[test]
 fn the_losses_are_summed() {
     let mut rows = met_ledger();

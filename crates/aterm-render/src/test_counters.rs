@@ -6,12 +6,7 @@
 use std::cell::Cell;
 
 thread_local! {
-    /// Window cell geometries derived off the primary face (what
-    /// `Renderer::cell_geometry` does when it has none kept for the px): a
-    /// metrics read, and a face parse for an instantiated variable primary.
     static CELL_GEOMETRY_DERIVATIONS: Cell<usize> = const { Cell::new(0) };
-    /// Font files whose every mapped code point the script supplement's
-    /// candidate pass classified by script (its per-file census).
     static SCRIPT_CENSUSES: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -34,8 +29,6 @@ pub fn take_script_censuses() -> usize {
 }
 
 thread_local! {
-    /// Arts built by the registry's builders (`fx::indexed`, `fx::pieces`,
-    /// `fx::rgba`), interned or not: the work a producer's memo spares.
     static ART_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -49,8 +42,6 @@ pub fn take_art_builds() -> usize {
 }
 
 thread_local! {
-    /// Sprite column tables the fx rasterizer built (`fx_raster::SpriteCols`):
-    /// the work its key and its laziness spare.
     static SPRITE_COLS_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -64,8 +55,6 @@ pub fn take_sprite_cols_builds() -> usize {
 }
 
 thread_local! {
-    /// Frame art budget rulings that walked their layers (`FxBudget::rule`):
-    /// the work its memo spares.
     static BUDGET_RULINGS: Cell<usize> = const { Cell::new(0) };
 }
 

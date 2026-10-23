@@ -478,7 +478,7 @@ impl KittyLog {
     }
 
     /// Whether there is nothing recorded (the flush no-op-skip predicate).
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.sightings == 0 && self.entries.is_empty() && self.collectibles.is_empty()
     }
 
@@ -1092,6 +1092,9 @@ fn run_kitty_writer(
     initial_tx: Option<std::sync::mpsc::SyncSender<KittyLog>>,
 ) -> KittyLog {
     // Startup ledger admission can stall on a remote/dead mount; keep it
+    // entirely off the UI thread. It is sampled before this worker accepts new
+    // deltas, so merging the one-shot result with session memory cannot
+    // double-count a flush.
     if let Some(initial_tx) = initial_tx {
         let _ = initial_tx.try_send(KittyLog::read_with_sidecar(&path));
     }
@@ -1262,7 +1265,7 @@ impl KittyLogHost {
     }
 
     /// [`Self::favourite_look`] as far as the ledger has loaded, for a reader that holds `&self` (the Settings preview's companion): it never polls, so before the first load lands it claims nothing.
-    pub(crate) fn favourite_look_loaded(&self) -> Option<KittyLook> {
+    pub(crate) const fn favourite_look_loaded(&self) -> Option<KittyLook> {
         self.favourite
     }
 
@@ -1338,6 +1341,8 @@ impl KittyLogHost {
             let stamp = now_rfc3339();
             if self.mem.record(&s, lexicon, &stamp) && source == SightingSource::Typed {
                 // A typed discovery reports itself but never re-dresses the
+                // companion (only a pin changes the cat); an ambient one gets
+                // nothing back.
                 discovery = Some(s.look.normalized());
             }
             let _ = self.delta.record(&s, lexicon, &stamp);
@@ -1451,6 +1456,7 @@ impl KittyLogHost {
         }
         let Some(writer) = self.writer.as_ref() else {
             // Pre-arm failed. Keep the accumulated in-memory delta; never retry
+            // thread creation from a render frame or perform synchronous exit IO.
             return;
         };
         self.last_flush = Some(now);
@@ -1496,6 +1502,7 @@ impl KittyLogHost {
                 && let Ok(unpersisted) = handle.join()
             {
                 // Retry exhaustion is not an ownership sink: keep the batch, so it
+                // stays visibly not durably accepted.
                 self.delta.merge_from(&unpersisted);
             }
         }

@@ -112,6 +112,7 @@ impl HandoffEnv {
     pub(crate) fn capture() -> Self {
         let mut slots = Vec::new();
         for key in HANDOFF_ENV_KEYS {
+            // `take` removes the name whether or not it was set, so no handoff name is left
             // for a helper, a shell or a later reader to observe.
             if let Some(value) = aterm_log::env::take(key.0) {
                 slots.push((*key, value));

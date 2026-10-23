@@ -596,7 +596,7 @@ impl<S: RegionStore> JournalWriter<S> {
             .map_err(WriteError::from)
     }
 
-    /// The tail append protocol (module doc): floor, copy, stream count, commit.
+    /// The tail append protocol: floor, copy, stream count, commit.
     fn append_record(
         &mut self,
         record: &TailRecord<'_>,
@@ -1164,7 +1164,7 @@ impl ControlWriter {
         self.write_record(to, geometry, seq, &record)
     }
 
-    /// The slot's write protocol (module doc): commit word 0, copy, length, commit word,
+    /// The slot's write protocol: commit word 0, copy, length, commit word,
     /// then the stale bytes past a shorter record zeroed.
     fn write_record<S: RegionStore + ?Sized>(
         &mut self,

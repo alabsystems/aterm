@@ -33,14 +33,16 @@ pub(crate) enum Follow {
     Path(String),
     /// Nothing pinned: with a session to follow.
     Flagless {
-        /// The rendezvous dir the call resolved.
+        /// The rendezvous dir the call resolved against.
         dir: PathBuf,
         /// The session whose host the call reached.
         sid: Option<String>,
     },
-    /// Behind a forward: the server this call dialled only relayed the request to the aterm.
+    /// Behind a forward: the server this call dialled only relayed the request
+    /// to the aterm hosting its session, and that host went away under it
+    /// ([`aterm_types::control_verbs::host_gone_line`]).
     Host {
-        /// The socket the gone host was reached.
+        /// The socket the gone host was reached at.
         sock: String,
         /// The session the request names (`@s-…`).
         sid: Option<String>,
@@ -67,19 +69,21 @@ pub(crate) struct Redial {
     bound: Duration,
     /// When a process started.
     started: fn(u32) -> Option<Stamp>,
-    /// The clock a hang-up is read.
+    /// The clock a hang-up is read on: [`Stamp::now`], or a test's stand-in.
     clock: fn() -> Stamp,
     /// Told the pid of each server whose exit this relay watches.
     #[cfg(test)]
     on_watch: Option<fn(u32)>,
 }
 
-/// What a hang-up turned out.
+/// What a hang-up turned out to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Hangup {
     /// The server we dialled still answers.
     StillServing,
-    /// A live server answers where this call follows, and it is not the one the stream.
+    /// A live server answers where this call follows, and it is not the one
+    /// the stream was on: another process, or the same pid through a fresh
+    /// listening socket ([`ListenerId`]).
     Successor { path: String, pid: u32 },
     /// Nothing answered within `waited`.
     Gone { waited: Duration, by_deadline: bool },
@@ -232,7 +236,9 @@ impl Redial {
         self.successor(dialed, old, listener, &wait, true)
     }
 
-    /// Classify a hang-up a forward said.
+    /// Classify a hang-up a forward said was its host's: `old`, reached at
+    /// `sock`, went away under the relay, which already looked for a deliberate
+    /// end.
     pub(crate) fn after_host_gone(&self, sock: &str, old: u32, until: Option<Instant>) -> Hangup {
         self.successor(sock, old, None, &Wait::from_now(self.bound, until), false)
     }
@@ -582,7 +588,9 @@ fn armed_wait<S: AsRef<str>>(request_parts: &[S]) -> Option<&'static str> {
     }
 }
 
-/// What a request cut by a replacement and not asked again ([`retries_across_replacement`]) tells.
+/// What a request cut by a replacement and not asked again
+/// ([`retries_across_replacement`]) tells its caller: why, and what to do
+/// instead.
 pub(crate) fn not_asked_again_note(request_parts: &[String]) -> String {
     match (verb_and_args(request_parts).0, armed_wait(request_parts)) {
         (Some("turn"), _) => {
@@ -831,7 +839,8 @@ fn names_its_sessions(request: &str) -> bool {
     pieces.peek().is_some() && pieces.all(|piece| piece != "@*" && !is_self_selector(piece))
 }
 
-/// Follows the push stream's framing just far enough to know when every subscribed session.
+/// Follows the push stream's framing just far enough to know when every
+/// subscribed session has said `EVENT <local> exited`.
 #[derive(Debug, Default)]
 pub(crate) struct FrameTracker {
     line: Vec<u8>,
@@ -1032,7 +1041,8 @@ const NO_SUCH_SESSION: &str = "ERR no such session";
 /// Which session a redialled leg relays, against the one the stream followed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LegSession {
-    /// The same one: the successor carried it (an update), so the event anchors go.
+    /// The same one: the successor carried it (an update), so the event
+    /// anchors go on.
     Same,
     /// A fresh successor's own session ([`after_refusal`]).
     Other,
@@ -1045,7 +1055,9 @@ pub(crate) struct Ask {
     pub(crate) session: LegSession,
 }
 
-/// What a successor lacking the stream's session is known.
+/// What a successor lacking the stream's session is known to be: where it
+/// answers and when it started relative to the hang-up, which tells a
+/// relaunch of the old instance from another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arrival {
     /// On the fixed socket the call named, started after the hang-up.
@@ -1108,7 +1120,8 @@ pub(crate) enum Unresumed {
     Predates,
     /// The successor lacks the self stream's session.
     Unknown,
-    /// The successor lacks the self stream's session and answers where any aterm.
+    /// The successor lacks the self stream's session and answers where any
+    /// aterm may ([`Arrival::Shared`]).
     Shared,
 }
 

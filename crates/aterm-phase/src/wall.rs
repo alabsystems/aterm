@@ -10,7 +10,8 @@ pub enum WallKind {
     UsageSession,
     /// The seven-day window (`You've hit your weekly limit · resets Sep 19 at 11am`).
     UsageWeekly,
-    /// A per-model bucket (`You've reached your Fable limit.`
+    /// A per-model bucket (`You've reached your Fable limit. Run /usage-credits to continue or
+    /// switch models with /model.`).
     ModelBucket { consent: bool },
     /// Money: a monthly spend limit, a shared budget, no usage credits left.
     Spend,
@@ -24,7 +25,9 @@ pub enum WallKind {
         retryable: bool,
         cause: ApiCause,
     },
-    /// The service is overloaded (`API Error: 529 Overloaded.`
+    /// The service is overloaded (`API Error: 529 Overloaded. This is a server-side issue,
+    /// usually temporary — try again in a moment.`, `Repeated 529 Overloaded errors`,
+    /// `Opus is experiencing high load`).
     Overloaded,
     /// Claude Code's critical-memory banner: indicates the process must be restarted and resumed on its conversation (`claude --resume <id>`, never `claude --continue`: [`memory_banner_head`]).
     Memory,
@@ -1078,6 +1081,8 @@ fn auto_continue_said(item: &str) -> Option<AutoContinue> {
     {
         Some(AutoContinue::Unkept)
     } else if opens("wall.auto_continue") || strip_ci(&text, "continuing shortly").is_some() {
+        // The countdown's own row opens with its words; the transcript's
+        // `Usage limit reached · continuing automatically at …` is the
         // limit's notice, and the walk stops there.
         Some(AutoContinue::Armed)
     } else {

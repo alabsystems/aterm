@@ -33,7 +33,7 @@ pub enum CharacterSet {
     German,
     /// Italian - Final byte 'Y'
     Italian,
-    /// Norwegian/Danish - Final byte 'E', '6', or '`'
+    /// Norwegian/Danish - Final byte 'E', '6', or '\`'
     NorwegianDanish,
     /// Spanish - Final byte 'Z'
     Spanish,
@@ -249,7 +249,7 @@ impl CharacterSet {
         }
     }
 
-    /// Translate using Norwegian/Danish NRCS (final byte 'E', '6', or '`').
+    /// Translate using Norwegian/Danish NRCS (final byte 'E', '6', or `` '`' ``).
     #[inline]
     const fn translate_norwegian_danish(c: char) -> char {
         match c {

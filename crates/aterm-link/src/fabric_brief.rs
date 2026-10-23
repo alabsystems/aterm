@@ -39,7 +39,7 @@ pub struct BriefOpts {
     pub budget: Option<usize>,
     /// `--cap-file <path>`: read under these caps instead of the node's.
     pub cap_files: Vec<String>,
-    /// `--json`: the machine form (the module doc).
+    /// `--json`: the machine form.
     pub json: bool,
 }
 
@@ -277,7 +277,7 @@ const fn line_tokens(line: &str) -> usize {
 
 /// Why a session's fold is partial, beyond where it was seeded: its close
 /// never reached the bus although its node or its own presence says it is
-/// gone (the module doc).
+/// gone.
 fn gone_without_close(r: &Read, node: &str, s: &Session) -> Option<&'static str> {
     if r.nodes_gone.iter().any(|n| n == node) {
         return Some("node-gone");

@@ -475,6 +475,8 @@ impl GridPresentationState {
         self.damage.reset(visible_rows);
         if was_full {
             // `reset` from `Full` installs a fresh tracker whose mark clock
+            // restarts at 0; rewind the fold's watermark in step, or the next
+            // real mark would compare equal and skip the fold.
             self.row_rev_folded_seq = 0;
         }
     }

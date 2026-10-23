@@ -171,7 +171,6 @@ fn a_start_commits_only_after_metadata_and_exact_lock_handoff() {
 
 #[test]
 fn an_uncommitted_start_aborts_before_releasing_its_exact_holder() {
-    // Reached ordinary start is a control, not an assumed ability to stage a child.
     let (sys, layout, opened) = setup(Fault::None);
     launch(&sys, &layout, &opened).unwrap();
     assert!(

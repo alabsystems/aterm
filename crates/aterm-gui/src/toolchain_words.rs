@@ -113,7 +113,7 @@ fn live_row(title: impl AsRef<str>, stale_after: Duration) -> Message {
 /// The loads a pass row may show over its life ([`pass_load`] and the announcement's network).
 pub(crate) const PASS_LOADS: [Load; 3] = [Load::Network, Load::Disk, Load::Cpu];
 
-/// A toolchain record (module doc): logged and listed by `appstatus` as a
+/// A toolchain record: logged and listed by `appstatus` as a
 /// finished activity (`outcome=warn` ⇔ Warn), never on glass.
 fn record(severity: Severity, title: impl AsRef<str>, detail: String) -> Message {
     row(severity, title).line(detail)
@@ -564,7 +564,7 @@ pub(crate) struct PerAgent([usize; aterm_agent::harness::upgrade::Agent::ALL.len
 
 impl PerAgent {
     /// One more of `agent`'s sessions.
-    pub(crate) fn count(&mut self, agent: aterm_agent::harness::upgrade::Agent) {
+    pub(crate) const fn count(&mut self, agent: aterm_agent::harness::upgrade::Agent) {
         self.0[agent as usize] += 1;
     }
 

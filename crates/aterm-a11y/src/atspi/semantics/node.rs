@@ -14,10 +14,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-CHROMIUM file.
 
-//! What one node is to an assistive technology, and how it answers each
-//! AT-SPI method: [`PlatformNode`] for a window's node, [`PlatformRoot`] for
-//! the application. Both hold their tree weakly; a node of a window that is
-//! gone answers [`Error::Defunct`].
+//! What one node is to an assistive technology (`PlatformNode` and `PlatformRoot`).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -41,8 +38,7 @@ use super::{
     ScrollType, State, StateSet,
 };
 
-/// One exported lifetime of a model node. Content updates keep this identity;
-/// removal/reinsertion and action-owner changes retire it.
+/// One exported lifetime of a model node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NodeIdentity {
     pub(crate) id: NodeId,
@@ -124,7 +120,6 @@ impl NodeWrapper<'_> {
         match self.0.role() {
             Role::Alert => AtspiRole::Notification,
             Role::AlertDialog => AtspiRole::Alert,
-            // TODO: See how to represent ARIA role="application"
             Role::Application => AtspiRole::Embedded,
             Role::Button => {
                 if self.0.toggled().is_some() {
@@ -155,12 +150,8 @@ impl NodeWrapper<'_> {
             Role::Tab => AtspiRole::PageTab,
             Role::TabList => AtspiRole::PageTabList,
             Role::TextInput | Role::MultilineTextInput | Role::SearchInput => AtspiRole::Entry,
-            // In AT-SPI, elements with `AtspiRole::Frame` are windows with titles and
-            // buttons, while those with `AtspiRole::Window` are windows without those
-            // elements.
             Role::Window => AtspiRole::Frame,
             Role::Terminal => AtspiRole::Terminal,
-            // TODO: Are there special cases to consider?
             Role::Unknown => AtspiRole::Unknown,
         }
     }
@@ -183,14 +174,12 @@ impl NodeWrapper<'_> {
         if state.is_text_input() && !state.is_read_only() {
             atspi_state.insert(State::Editable);
         }
-        // TODO: Focus and selection.
         if state.is_focusable(&filter) {
             atspi_state.insert(State::Focusable);
         }
         let filter_result = filter(self.0);
         if filter_result == FilterResult::Include {
             atspi_state.insert(State::Visible);
-            // Off screen in its scrolling container: there, not showing.
             if !state.is_offscreen() {
                 atspi_state.insert(State::Showing);
             }
@@ -221,12 +210,10 @@ impl NodeWrapper<'_> {
             });
         }
 
-        // Special case for indeterminate progressbar.
         if state.role() == Role::ProgressIndicator && state.numeric_value().is_none() {
             atspi_state.insert(State::Indeterminate);
         }
 
-        // Toggled state
         match state.toggled() {
             Some(Toggled::Mixed) => atspi_state.insert(State::Indeterminate),
             Some(Toggled::True) if atspi_role == AtspiRole::ToggleButton => {
@@ -375,7 +362,6 @@ impl NodeWrapper<'_> {
         let changed_states = old_state ^ new_state;
         for state in changed_states.iter() {
             if state == State::Focused {
-                // This is handled specially in `focus_moved`.
                 continue;
             }
             adapter.emit_object_event(
@@ -570,8 +556,6 @@ impl PlatformNode {
         self.resolve_for_text_with_context(|node, _, _| f(node))
     }
 
-    /// Hands the window the request `make` builds for `target`, if it is
-    /// still in the tree.
     fn request(
         context: &Context,
         state: &TreeState,
@@ -745,9 +729,7 @@ impl PlatformNode {
         .unwrap_or(State::Defunct.into())
     }
 
-    /// AT-SPI's object attributes: aterm's model sets none of the properties
-    /// accesskit_atspi_common read them from (placeholders, set positions
-    /// and sizes, braille labels).
+    /// AT-SPI's object attributes (always empty).
     pub(crate) fn attributes(&self) -> Result<HashMap<&'static str, String>> {
         self.resolve(|_| Ok(HashMap::new()))
     }
@@ -843,8 +825,7 @@ impl PlatformNode {
         })
     }
 
-    /// AT-SPI's layer: a window's layer is AT-SPI's `Window` role's, which
-    /// none of aterm's roles maps to, so every node is a widget.
+    /// AT-SPI's layer (`Layer::Widget` for every node).
     pub(crate) fn layer(&self) -> Result<Layer> {
         self.resolve(|_| Ok(Layer::Widget))
     }
@@ -957,8 +938,7 @@ impl PlatformNode {
         })
     }
 
-    /// Clicks child `child_index` (a filtered child) to select it, unless it
-    /// is selected already.
+    /// Clicks filtered child `child_index` to select it, unless selected already.
     pub(crate) fn select_child(&self, child_index: usize) -> Result<bool> {
         self.resolve_for_selection_with_context(|node, tree, context| {
             let child = node
@@ -1002,17 +982,14 @@ impl PlatformNode {
     }
 
     pub(crate) fn select_all(&self) -> Result<bool> {
-        // We don't support selecting all children at once.
         Ok(false)
     }
 
     pub(crate) fn clear_selection(&self) -> Result<bool> {
-        // We don't support deselecting all children at once.
         Ok(false)
     }
 
-    /// Clicks child `child_index` (a filtered child) to deselect it, unless
-    /// it is unselected already.
+    /// Clicks filtered child `child_index` to deselect it, unless unselected already.
     pub(crate) fn deselect_child(&self, child_index: usize) -> Result<bool> {
         self.resolve_for_selection_with_context(|node, tree, context| {
             let child = node
@@ -1110,8 +1087,7 @@ impl PlatformNode {
         })
     }
 
-    /// One text attribute at `offset`: aterm's model has none, so it is
-    /// empty for every name, once the offset is checked.
+    /// One text attribute at `offset` (always empty after checking the offset).
     pub(crate) fn text_attribute_value(
         &self,
         offset: i32,
@@ -1207,7 +1183,6 @@ impl PlatformNode {
     }
 
     pub(crate) fn add_selection(&self, start_offset: i32, end_offset: i32) -> Result<bool> {
-        // We only support one selection.
         self.set_selection(0, start_offset, end_offset)
     }
 
@@ -1217,8 +1192,6 @@ impl PlatformNode {
         }
 
         self.resolve_for_text_with_context(|node, tree, context| {
-            // Simply collapse the selection to the position of the caret if a caret is
-            // visible, otherwise set the selection to 0.
             let selection_end = node
                 .text_selection_focus()
                 .unwrap_or_else(|| node.document_range().start());
@@ -1284,10 +1257,7 @@ impl PlatformNode {
         })
     }
 
-    /// The attributes at `offset` and the run of text that shares them:
-    /// aterm's model has no text attributes, so the run is the whole
-    /// document (accesskit_atspi_common's format run is bounded only where
-    /// two runs' attributes differ).
+    /// The attributes at `offset` and the whole-document run of text that shares them.
     pub(crate) fn text_attribute_run(
         &self,
         offset: i32,

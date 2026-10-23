@@ -532,6 +532,10 @@ pub fn config(paths: &Paths) -> crate::Result<Option<Config>> {
         }
     } else if let Some(pin) = &signer {
         // No list: none was reached (a source.toml leaves an empty one out), or an aterm
+        // before `followed` wrote the file. Either way the cached version, which that pin
+        // signs, carries the keys it was reached through, as a server reads them off the
+        // version it holds: a machine that followed the removed admin's fork under such a
+        // build is pulled back too once a build retires the key the fork came from.
         followed = cached_chain(paths, pin);
     }
     let host = get("host").unwrap_or("machine").to_string();
@@ -955,18 +959,83 @@ pub enum Look {
     NoVault(String),
 }
 
-/// Probe whether a vault answers at `source` within `wait` without modifying local state.
-pub fn look(source: &Source, wait: Duration) -> Look {
+/// How long [`look`] waits between tries that fail [`transport::Unheard::held`].
+const LOOK_PAUSE: Duration = Duration::from_secs(2);
+
+/// What [`look`] reads and waits on: the network and the clock, or a test's.
+trait Tries {
+    /// One GET of the vault at `url` ([`transport::get_bounded`] within [`transport::LOOK_CONNECT`]).
+    fn get(&mut self, url: &str, wait: Duration) -> Result<transport::Answer, transport::Unheard>;
+    /// Now.
+    fn now(&mut self) -> Instant;
+    /// Wait `pause`.
+    fn pause(&mut self, pause: Duration);
+}
+
+/// The network and the clock.
+struct LiveTries;
+
+impl Tries for LiveTries {
+    fn get(&mut self, url: &str, wait: Duration) -> Result<transport::Answer, transport::Unheard> {
+        transport::get_bounded(url, None, wait, Some(transport::LOOK_CONNECT))
+    }
+
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+
+    fn pause(&mut self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
+}
+
+/// Probe whether a vault answers at `source` within `wait` without modifying local state. A
+/// URL whose tries fail [`transport::Unheard::held`] is tried every few seconds for up to
+/// `patience` (the last try may run `wait` past it): a new app's lookups and LAN connects wait
+/// on the Local Network question macOS asks a person, and the try after the answer reaches the
+/// vault. `held` hears the first such failure's reason, before the first pause. Any other
+/// answer ends the look at once.
+pub fn look(source: &Source, wait: Duration, patience: Duration, held: &dyn Fn(&str)) -> Look {
+    look_with(source, wait, patience, held, &mut LiveTries)
+}
+
+fn look_with(
+    source: &Source,
+    wait: Duration,
+    patience: Duration,
+    held: &dyn Fn(&str),
+    tries: &mut dyn Tries,
+) -> Look {
     let shown = match source {
         Source::Url(url) => transport::describe(url),
         Source::Path(path) => path.display().to_string(),
     };
     let fetched = match source {
-        Source::Url(url) => match transport::get(url, None, wait) {
-            Ok(transport::Answer::Fetched(fetched)) => fetched,
-            Ok(transport::Answer::Foreign(why)) => return Look::NoVault(why),
-            Err(error) => return Look::Unreached(error.to_string()),
-        },
+        Source::Url(url) => {
+            let start = tries.now();
+            let mut told = false;
+            loop {
+                match tries.get(url, wait) {
+                    Ok(transport::Answer::Fetched(fetched)) => break fetched,
+                    Ok(transport::Answer::Foreign(why)) => return Look::NoVault(why),
+                    Err(unheard)
+                        if unheard.held
+                            && tries
+                                .now()
+                                .saturating_duration_since(start)
+                                .saturating_add(LOOK_PAUSE)
+                                < patience =>
+                    {
+                        if !told {
+                            told = true;
+                            held(&unheard.why.0);
+                        }
+                        tries.pause(LOOK_PAUSE);
+                    }
+                    Err(unheard) => return Look::Unreached(unheard.why.0),
+                }
+            }
+        }
         Source::Path(_) => match transport::fetch(source, None, wait) {
             Ok(fetched) => fetched,
             Err(error) => return Look::Unreached(error.to_string()),
@@ -1097,6 +1166,8 @@ fn floor(paths: &Paths, state: &State, name: &str, config: &Config) -> Option<Fl
     if state.membership != Stored::None {
         let Some(digest) = state.digest else {
             // No digest beside a membership: a pass whose pin gave way forgot what it held and
+            // was cut short, perhaps after it cached the version that replaces it, which must
+            // not floor itself as already applied, nor let an older one in.
             return Some(Floor::below(&verified(cached?)?));
         };
         let held = cached
@@ -1217,6 +1288,7 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
     let lock = StateLock::take(paths)?;
     if self::config(paths)?.as_ref() != Some(&config) {
         // A join moved this machine to another source while the fetch was out: the next pass
+        // reads that one.
         return Ok(SyncOutcome::Unchanged { seq: before.seq });
     }
     let mut state = load_state(paths)?;
@@ -1285,6 +1357,7 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
         && envelope::parse(&bytes).is_ok_and(|parsed| parsed.seq <= state.seq)
     {
         // Another command applied a version while this fetch was out: nothing to do, and no
+        // rollback to report.
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
     }
     let Some(pin) = config.signer else {
@@ -2514,6 +2587,7 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
         Ok(plain) => plain,
         Err(age::AgeError::NoMatch) => {
             // By its code, never the name it asked for: that one may be another machine's
+            // (it was admitted under a free name), and `admins add` would reach that key.
             return Err(Error::new(format!(
                 "this machine is not an admin of {}: an admin can run aterm secrets admins add {}",
                 config.name,
@@ -3315,28 +3389,214 @@ mod tests {
         let plain = root.path().join("team.secrets");
         let missing = Source::Path(root.path().join("unplugged").join("team.vault"));
         assert!(
-            matches!(look(&missing, HANG_DETECTOR), Look::NoVault(why) if why.ends_with("team.vault: no vault there"))
+            matches!(look(&missing, HANG_DETECTOR, Duration::ZERO, &|_| {}), Look::NoVault(why) if why.ends_with("team.vault: no vault there"))
         );
         fsx::write_atomic(&plain, b"token=inert-token\n", 0o600).expect("plain vault");
-        assert_eq!(look(&Source::Path(plain), HANG_DETECTOR), Look::Answers);
+        assert_eq!(
+            look(&Source::Path(plain), HANG_DETECTOR, Duration::ZERO, &|_| {}),
+            Look::Answers
+        );
 
         let running = serve(&root.path().join("store"), &bound());
         let url = format!("http://{}/v1/alab", running.addr);
         let source = Source::Url(url.clone());
         assert_eq!(
-            look(&source, HANG_DETECTOR),
+            look(&source, HANG_DETECTOR, Duration::ZERO, &|_| {}),
             Look::NoVault(format!("{url}: no vault there"))
         );
         let admin = Paths::for_home(&root.path().join("ma"));
         create(&admin, &url, None, Some("ma")).expect("create");
-        assert_eq!(look(&source, HANG_DETECTOR), Look::Answers);
+        assert_eq!(
+            look(&source, HANG_DETECTOR, Duration::ZERO, &|_| {}),
+            Look::Answers
+        );
         running.stop();
         assert!(
-            matches!(look(&source, HANG_DETECTOR), Look::Unreached(why) if why.starts_with(&format!("fetching {url}"))),
+            matches!(look(&source, HANG_DETECTOR, Duration::ZERO, &|_| {}), Look::Unreached(why) if why.starts_with(&format!("fetching {url}"))),
             "{:?}",
-            look(&source, HANG_DETECTOR)
+            look(&source, HANG_DETECTOR, Duration::ZERO, &|_| {})
         );
         assert!(!reader.dir.exists(), "a look makes nothing");
+    }
+
+    /// A look's network and clock, scripted: each GET takes `took` and answers the next of
+    /// `answers`, and a pause passes on the clock.
+    struct ScriptedTries {
+        answers: std::collections::VecDeque<Result<transport::Answer, transport::Unheard>>,
+        now: Instant,
+        took: Duration,
+        gets: usize,
+        pauses: Vec<Duration>,
+    }
+
+    impl ScriptedTries {
+        fn new(
+            took: Duration,
+            answers: impl IntoIterator<Item = Result<transport::Answer, transport::Unheard>>,
+        ) -> Self {
+            Self {
+                answers: answers.into_iter().collect(),
+                now: Instant::now(),
+                took,
+                gets: 0,
+                pauses: Vec::new(),
+            }
+        }
+    }
+
+    impl Tries for ScriptedTries {
+        fn get(
+            &mut self,
+            url: &str,
+            wait: Duration,
+        ) -> Result<transport::Answer, transport::Unheard> {
+            assert_eq!(url, "http://alab-secrets.local:7484/v1/alab");
+            assert_eq!(
+                wait, HANG_DETECTOR,
+                "every try waits as long as the look's wait"
+            );
+            self.gets += 1;
+            self.now += self.took;
+            self.answers
+                .pop_front()
+                .expect("a GET the script has no answer for")
+        }
+
+        fn now(&mut self) -> Instant {
+            self.now
+        }
+
+        fn pause(&mut self, pause: Duration) {
+            self.pauses.push(pause);
+            self.now += pause;
+        }
+    }
+
+    fn unheard(why: &str, held: bool) -> Result<transport::Answer, transport::Unheard> {
+        Err(transport::Unheard {
+            why: Error::new(why),
+            held,
+        })
+    }
+
+    fn served_vault() -> Result<transport::Answer, transport::Unheard> {
+        Ok(transport::Answer::Fetched(Fetched::Body(
+            envelope::MAGIC.as_bytes().to_vec(),
+        )))
+    }
+
+    fn alab() -> Source {
+        Source::Url("http://alab-secrets.local:7484/v1/alab".into())
+    }
+
+    /// While macOS holds a new app's lookups for a person's answer to its Local Network
+    /// question, the look tries again every few seconds and hears the vault on the first try
+    /// after the answer, saying the first held reason once. Negative controls: with no
+    /// patience a held try is the only one, and a failure that is not held (a definite "no
+    /// such name") ends the look at once.
+    #[test]
+    fn a_look_held_for_the_local_network_answer_hears_the_vault_after_it() {
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |why: &str| said.borrow_mut().push(why.to_owned());
+        let patience = Duration::from_secs(180);
+        let mut tries = ScriptedTries::new(
+            transport::LOOK_CONNECT,
+            [
+                unheard("dns: no answer within 8000ms", true),
+                unheard("dns: no answer within 7999ms", true),
+                served_vault(),
+            ],
+        );
+        assert_eq!(
+            look_with(&alab(), HANG_DETECTOR, patience, &say, &mut tries),
+            Look::Answers
+        );
+        assert_eq!(tries.gets, 3);
+        assert_eq!(tries.pauses, [LOOK_PAUSE, LOOK_PAUSE]);
+        assert_eq!(*said.borrow(), ["dns: no answer within 8000ms"]);
+
+        said.borrow_mut().clear();
+        let mut tries = ScriptedTries::new(
+            transport::LOOK_CONNECT,
+            [
+                unheard("dns: no answer within 8000ms", true),
+                served_vault(),
+            ],
+        );
+        assert_eq!(
+            look_with(&alab(), HANG_DETECTOR, Duration::ZERO, &say, &mut tries),
+            Look::Unreached("dns: no answer within 8000ms".into())
+        );
+        assert_eq!((tries.gets, tries.pauses.len()), (1, 0));
+        assert!(
+            said.borrow().is_empty(),
+            "a look that gives up says nothing held"
+        );
+
+        let mut tries = ScriptedTries::new(
+            transport::LOOK_CONNECT,
+            [
+                unheard("dns: no answer within 8000ms", true),
+                unheard("fetching …: Connection refused", false),
+                served_vault(),
+            ],
+        );
+        assert_eq!(
+            look_with(&alab(), HANG_DETECTOR, patience, &say, &mut tries),
+            Look::Unreached("fetching …: Connection refused".into()),
+            "a held look ends at the first failure that is not held"
+        );
+        assert_eq!((tries.gets, tries.pauses.len()), (2, 1));
+        assert_eq!(*said.borrow(), ["dns: no answer within 8000ms"]);
+
+        said.borrow_mut().clear();
+        let mut tries = ScriptedTries::new(
+            Duration::from_secs(5),
+            [
+                unheard(
+                    "dns: alab-secrets.local: nodename nor servname provided",
+                    false,
+                ),
+                served_vault(),
+            ],
+        );
+        assert_eq!(
+            look_with(&alab(), HANG_DETECTOR, patience, &say, &mut tries),
+            Look::Unreached("dns: alab-secrets.local: nodename nor servname provided".into())
+        );
+        assert_eq!((tries.gets, tries.pauses.len()), (1, 0));
+        assert!(said.borrow().is_empty());
+    }
+
+    /// Held tries stop once the next could not start within `patience`, answering the last
+    /// reason; a held look that meets something other than a vault server ends there.
+    #[test]
+    fn a_held_look_ends_with_its_patience_or_at_a_foreign_answer() {
+        let patience = Duration::from_secs(60);
+        let reasons: Vec<String> = (1..=6).map(|n| format!("try {n}")).collect();
+        let mut tries = ScriptedTries::new(
+            transport::LOOK_CONNECT,
+            reasons.iter().map(|why| unheard(why, true)),
+        );
+        assert_eq!(
+            look_with(&alab(), HANG_DETECTOR, patience, &|_| {}, &mut tries),
+            Look::Unreached("try 6".into())
+        );
+        assert_eq!(tries.gets, 6, "tries at 0, 10, 20, 30, 40 and 50 s");
+        assert_eq!(tries.pauses, [LOOK_PAUSE; 5]);
+
+        let mut tries = ScriptedTries::new(
+            transport::LOOK_CONNECT,
+            [
+                unheard("dns: no answer within 8000ms", true),
+                Ok(transport::Answer::Foreign("a login page".into())),
+            ],
+        );
+        assert_eq!(
+            look_with(&alab(), HANG_DETECTOR, patience, &|_| {}, &mut tries),
+            Look::NoVault("a login page".into())
+        );
+        assert_eq!(tries.gets, 2);
     }
 
     /// A kept copy of this machine's vault files, copied back with a sync after, puts it in
@@ -4259,113 +4519,120 @@ mod tests {
 
     #[test]
     fn a_reader_the_removed_admin_led_off_follows_the_vault_once_its_build_retires_the_key() {
-        for (fork, rejoin, bare) in [
-            (true, false, false),
-            (false, false, false),
-            (true, true, false),
-            (true, false, true),
-        ] {
-            let root = aterm_tempfile::tempdir().expect("tempdir");
-            let store = root.path().join("store");
-            let socket = bound();
-            let running = serve(&store, &socket);
-            let url = format!("http://{}/v1/alab", running.addr);
-            let admin = Paths::for_home(&root.path().join("ma"));
-            let created = create(&admin, &url, None, Some("ma")).expect("create");
-            let reader = Paths::for_home(&root.path().join("mb"));
-            join_pinned(&reader, &format!("{url}#{}", created.signer), "mb");
-            approve(&admin);
-            assert!(matches!(
-                sync(&reader, None).expect("sync"),
-                SyncOutcome::Applied { seq: 2, .. }
-            ));
-            let stale = std::fs::read(store.join("alab.vault")).expect("the store's copy");
-
-            let old = admin_open(&admin).expect("open").seed;
-            let old_key = envelope::signer_public(&old).expect("public");
-            rotate(&admin);
-            let new_key = pinned(&admin).signer.expect("pinned");
-
-            running.stop();
-            let spoof = serve(&root.path().join("spoof"), &socket);
-            let mut signer = old;
-            let mut fed = Unsigned {
-                name: "alab".to_string(),
-                seq: 1 << 40,
-                time: 0,
-                handoff: Vec::new(),
-                lockers: Vec::new(),
-            };
-            if fork {
-                aterm_uds::rand::fill(&mut signer).expect("random");
-                let key = envelope::signer_public(&signer).expect("public");
-                let endorsement = envelope::endorse(&old, "alab", &key).expect("endorsed");
-                fed.handoff = vec![(old_key, endorsement)];
-            }
-            let fed = envelope::sign(&fed, &signer).expect("signed");
-            transport::publish(&Source::Url(url.clone()), &fed).expect("the spoof takes it");
-            assert_eq!(sync(&reader, None).expect("taken"), SyncOutcome::NotIn);
-            assert_eq!(
-                pinned(&reader).signer,
-                Some(envelope::signer_public(&signer).expect("public"))
-            );
-            if bare {
-                let text = std::fs::read_to_string(reader.source_file()).expect("source.toml");
-                let kept: String = text
-                    .lines()
-                    .filter(|line| !line.contains("followed"))
-                    .map(|line| format!("{line}\n"))
-                    .collect();
-                assert_ne!(kept, text, "the fork's lineage was written");
-                std::fs::write(reader.source_file(), kept).expect("written");
-            }
-            spoof.stop();
-
-            let lost = serve(&root.path().join("lost"), &socket);
-            transport::publish(&Source::Url(url.clone()), &stale).expect("the stale copy");
-            let poll = Some(Duration::from_millis(100));
-            assert_eq!(
-                sync(&reader, poll).expect("polled"),
-                SyncOutcome::Unchanged { seq: 1 << 40 }
-            );
-            assert_eq!(
-                std::fs::read(root.path().join("lost").join("alab.vault")).ok(),
-                Some(stale),
-                "nothing put back"
-            );
-            lost.stop();
-
-            let running = serve(&store, &socket);
-            let error = sync(&reader, None).expect_err("kept off");
-            let why = if fork {
-                "endorsed no handoff"
-            } else {
-                "rollback"
-            };
-            assert!(error.0.contains(why), "{error}");
-            assert_eq!(
-                sync(&reader, poll).expect("polled"),
-                SyncOutcome::Unchanged { seq: 1 << 40 }
-            );
-            assert_eq!(load_state(&reader).expect("state").seq, 1 << 40);
-            retiring(vec![old_key], new_key, || {
-                if rejoin {
+        // Each case is its own store, socket and homes, and waits out its polls: side by side.
+        std::thread::scope(|scope| {
+            for (fork, rejoin, bare) in [
+                (true, false, false),
+                (false, false, false),
+                (true, true, false),
+                (true, false, true),
+            ] {
+                scope.spawn(move || {
+                    let root = aterm_tempfile::tempdir().expect("tempdir");
+                    let store = root.path().join("store");
+                    let socket = bound();
+                    let running = serve(&store, &socket);
+                    let url = format!("http://{}/v1/alab", running.addr);
+                    let admin = Paths::for_home(&root.path().join("ma"));
+                    let created = create(&admin, &url, None, Some("ma")).expect("create");
+                    let reader = Paths::for_home(&root.path().join("mb"));
+                    join_pinned(&reader, &format!("{url}#{}", created.signer), "mb");
+                    approve(&admin);
                     assert!(matches!(
-                        join_pinned(&reader, &url, "mb"),
-                        JoinOutcome::Joined { seq: 3, .. }
+                        sync(&reader, None).expect("sync"),
+                        SyncOutcome::Applied { seq: 2, .. }
                     ));
-                } else {
-                    assert!(matches!(
-                        sync(&reader, poll).expect("sync"),
-                        SyncOutcome::Applied { seq: 3, .. }
-                    ));
-                }
-            });
-            let config = pinned(&reader);
-            assert_eq!(config.signer, Some(new_key));
-            assert_eq!(config.followed, vec![old_key]);
-            running.stop();
-        }
+                    let stale = std::fs::read(store.join("alab.vault")).expect("the store's copy");
+
+                    let old = admin_open(&admin).expect("open").seed;
+                    let old_key = envelope::signer_public(&old).expect("public");
+                    rotate(&admin);
+                    let new_key = pinned(&admin).signer.expect("pinned");
+
+                    running.stop();
+                    let spoof = serve(&root.path().join("spoof"), &socket);
+                    let mut signer = old;
+                    let mut fed = Unsigned {
+                        name: "alab".to_string(),
+                        seq: 1 << 40,
+                        time: 0,
+                        handoff: Vec::new(),
+                        lockers: Vec::new(),
+                    };
+                    if fork {
+                        aterm_uds::rand::fill(&mut signer).expect("random");
+                        let key = envelope::signer_public(&signer).expect("public");
+                        let endorsement = envelope::endorse(&old, "alab", &key).expect("endorsed");
+                        fed.handoff = vec![(old_key, endorsement)];
+                    }
+                    let fed = envelope::sign(&fed, &signer).expect("signed");
+                    transport::publish(&Source::Url(url.clone()), &fed)
+                        .expect("the spoof takes it");
+                    assert_eq!(sync(&reader, None).expect("taken"), SyncOutcome::NotIn);
+                    assert_eq!(
+                        pinned(&reader).signer,
+                        Some(envelope::signer_public(&signer).expect("public"))
+                    );
+                    if bare {
+                        let text =
+                            std::fs::read_to_string(reader.source_file()).expect("source.toml");
+                        let kept: String = text
+                            .lines()
+                            .filter(|line| !line.contains("followed"))
+                            .map(|line| format!("{line}\n"))
+                            .collect();
+                        assert_ne!(kept, text, "the fork's lineage was written");
+                        std::fs::write(reader.source_file(), kept).expect("written");
+                    }
+                    spoof.stop();
+
+                    let lost = serve(&root.path().join("lost"), &socket);
+                    transport::publish(&Source::Url(url.clone()), &stale).expect("the stale copy");
+                    let poll = Some(Duration::from_millis(100));
+                    assert_eq!(
+                        sync(&reader, poll).expect("polled"),
+                        SyncOutcome::Unchanged { seq: 1 << 40 }
+                    );
+                    assert_eq!(
+                        std::fs::read(root.path().join("lost").join("alab.vault")).ok(),
+                        Some(stale),
+                        "nothing put back"
+                    );
+                    lost.stop();
+
+                    let running = serve(&store, &socket);
+                    let error = sync(&reader, None).expect_err("kept off");
+                    let why = if fork {
+                        "endorsed no handoff"
+                    } else {
+                        "rollback"
+                    };
+                    assert!(error.0.contains(why), "{error}");
+                    assert_eq!(
+                        sync(&reader, poll).expect("polled"),
+                        SyncOutcome::Unchanged { seq: 1 << 40 }
+                    );
+                    assert_eq!(load_state(&reader).expect("state").seq, 1 << 40);
+                    retiring(vec![old_key], new_key, || {
+                        if rejoin {
+                            assert!(matches!(
+                                join_pinned(&reader, &url, "mb"),
+                                JoinOutcome::Joined { seq: 3, .. }
+                            ));
+                        } else {
+                            assert!(matches!(
+                                sync(&reader, poll).expect("sync"),
+                                SyncOutcome::Applied { seq: 3, .. }
+                            ));
+                        }
+                    });
+                    let config = pinned(&reader);
+                    assert_eq!(config.signer, Some(new_key));
+                    assert_eq!(config.followed, vec![old_key]);
+                    running.stop();
+                });
+            }
+        });
     }
 
     #[test]

@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-/// One member of a fixture tar.
 enum Member<'a> {
     Dir,
     File(&'a [u8], u32),
@@ -23,7 +22,6 @@ fn octal(field: &mut [u8], value: u64) {
     field[digits] = 0;
 }
 
-/// A ustar archive of `members`.
 fn tar(members: &[(&str, Member<'_>)]) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, member) in members {
@@ -52,8 +50,6 @@ fn tar(members: &[(&str, Member<'_>)]) -> Vec<u8> {
     out
 }
 
-/// `data` gzipped in stored DEFLATE blocks: no encoder between the fixture and the bytes
-/// the extractor reads.
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
     let mut rest = data;
@@ -74,8 +70,6 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A thin 64-bit arm64 Mach-O loading `dylibs`, with `tail` after its load commands
-/// (where the fake codesign reads a team).
 fn macho(dylibs: &[&str], tail: &[u8]) -> Vec<u8> {
     let mut commands = Vec::new();
     for name in dylibs {
@@ -106,7 +100,6 @@ fn macho(dylibs: &[&str], tail: &[u8]) -> Vec<u8> {
 
 const LIBSYSTEM: &str = "/usr/lib/libSystem.B.dylib";
 const HOMEBREW_PCRE2: &str = "/opt/homebrew/lib/libpcre2-32.dylib";
-/// What the fake codesign reads as another team's signature.
 const OTHER_TEAM: &[u8] = b"TEAM=OTHERTEAM1";
 
 fn sha256(bytes: &[u8]) -> String {
@@ -119,7 +112,6 @@ fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
-/// A row over one fixture archive served at `url`, pinned to `sha256` and `bytes`.
 fn fixture_row(
     name: &'static str,
     tool: &'static str,
@@ -141,8 +133,6 @@ fn fixture_row(
     }
 }
 
-/// rustup holding everything the rustup row asks for: stable with every target and
-/// clippy, the wasm32 pin with its target.
 struct Provisioned {
     pin: String,
 }
@@ -171,8 +161,6 @@ impl stable::Rustup for Provisioned {
     }
 }
 
-/// A machine with no rustup: rustup-init lays one, and every later command succeeds. Each
-/// call is recorded with whether its program was executable when it ran.
 #[derive(Default)]
 struct Bare {
     calls: RefCell<Vec<(PathBuf, bool, String)>>,
@@ -203,28 +191,19 @@ impl stable::Rustup for Bare {
 }
 
 struct Fake {
-    /// URL -> the fixture bytes it serves.
     served: BTreeMap<String, Vec<u8>>,
     fetched: RefCell<Vec<String>>,
-    /// Where each download was written, and the cap it was handed.
     fetched_into: RefCell<Vec<(PathBuf, u64)>>,
     spawns: RefCell<Vec<Spawn>>,
     signed: RefCell<Vec<PathBuf>>,
-    /// What the fake fish build lays at `<target>/release/fish`.
     built_fish: Vec<u8>,
-    /// What the built fish answers to `--version`.
     fish_answers: String,
     fish_error: Option<&'static str>,
     fish_panics: bool,
-    /// What a wasm-bindgen outside a scratch answers to `--version` (one this run builds,
-    /// in its scratch, answers the pin).
     bindgen_answers: String,
-    /// What the fake `ditto -x -k` lays in its tree: each file with its bytes (made
-    /// executable), then each link with its target.
     zip_files: Vec<(&'static str, Vec<u8>)>,
     zip_links: Vec<(&'static str, PathBuf)>,
     rustup: Provisioned,
-    /// A machine with no rustup, where one is asked for.
     bare: Option<Bare>,
 }
 
@@ -378,7 +357,6 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// A scratch HOME's machine: its caches empty, rustup's homes holding a stub rustup.
 fn machine(home: &Path) -> Machine {
     let rustup = home.join(".cargo/bin/rustup");
     std::fs::create_dir_all(rustup.parent().unwrap()).unwrap();
@@ -402,7 +380,6 @@ fn machine(home: &Path) -> Machine {
     }
 }
 
-/// Every name in `dir`, sorted (none where it does not exist).
 fn names(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .map(|d| {
@@ -454,9 +431,6 @@ fn binaryen_row(sha256: &str, bytes: u64) -> Row {
     )
 }
 
-/// §10 S7: a wrong sha256 refuses the row and leaves nothing: no install directory, no
-/// scratch. NEGATIVE CONTROL: the same archive under its own sha256 is placed whole,
-/// stamped and executable, and a size the archive does not have is refused first.
 #[test]
 fn a_wrong_sha256_refuses_the_row_and_leaves_nothing() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -555,10 +529,6 @@ fn pwsh_row(archive: &[u8]) -> Row {
     )
 }
 
-/// §10 S7: a Mach-O signed by another team refuses pwsh, and nothing is placed.
-/// NEGATIVE CONTROL: the same tree with every Mach-O Microsoft's is placed, each Mach-O
-/// checked, the modes set on unpack (pwsh 0755 from the archive's 0700) and the licence
-/// and notices kept; without the notices it is refused.
 #[test]
 fn another_teams_mach_o_refuses_pwsh() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -606,8 +576,6 @@ fn another_teams_mach_o_refuses_pwsh() {
     assert_eq!(names(&m.tooling), ["pwsh-7.6.7"]);
 }
 
-/// A copy in place with no stamp, or a stamp of another sha256, is replaced by the pin's;
-/// the old one goes with the scratch.
 #[test]
 fn an_unstamped_or_stale_copy_is_replaced() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -678,9 +646,6 @@ fn fish_row(source: &[u8]) -> Row {
     }
 }
 
-/// §10 S7: a fish build whose binary links Homebrew's dynamic PCRE2 is refused by name,
-/// and nothing is placed. NEGATIVE CONTROL: the same build linking only libSystem is
-/// placed, its stamp recording the tarball's sha256, `fish --version` and the features.
 #[test]
 fn a_fish_build_linking_homebrew_pcre2_is_refused() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -723,9 +688,6 @@ fn a_fish_build_linking_homebrew_pcre2_is_refused() {
     );
 }
 
-/// A build that answers another version than the pin's (a tarball of another tag under
-/// the pin's name) is refused, and nothing is placed. NEGATIVE CONTROL: the same build
-/// answering the pin is placed (the PCRE2 test above).
 #[test]
 fn a_fish_build_answering_another_version_is_refused() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -788,11 +750,6 @@ fn a_fish_build_answering_another_version_is_refused() {
     }
 }
 
-/// §10 S7: the fish build's argv and environment are the row's, read from the spawn
-/// record: `--no-default-features`, `FISH_BUILD_DOCS=0` and `PCRE2_SYS_STATIC=1` set, no
-/// `RUSTFLAGS` set and every inherited one removed, a `*.noindex` target directory under
-/// the tooling cache, run from outside the unpacked tree. The command it becomes drops
-/// the inherited flags and `cargo run`'s words, and keeps the rest of the environment.
 #[test]
 fn the_fish_build_is_the_rows_argv_and_environment() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -910,8 +867,6 @@ fn the_fish_build_is_the_rows_argv_and_environment() {
     assert_eq!(envs.get("PATH"), None, "the rest is inherited untouched");
 }
 
-/// Lay every row a bare run wants as already in place on `m`: each install directory
-/// stamped with its real pin, the browsers' too.
 fn all_in_place(m: &Machine) {
     for row in select(&Options::default()) {
         let Some(t) = target(row, m) else {
@@ -924,10 +879,6 @@ fn all_in_place(m: &Machine) {
     }
 }
 
-/// §10 S7: `--record` alone fetches wasm-bindgen. A bare run over a machine holding
-/// every other row fetches and builds nothing; `--record` builds the CLI at the pin with
-/// targo, `--locked`, and places it stamped. NEGATIVE CONTROL: neither a bare run nor
-/// `--linux` selects it.
 #[test]
 fn record_alone_fetches_wasm_bindgen() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -991,10 +942,6 @@ fn record_alone_fetches_wasm_bindgen() {
     );
 }
 
-/// A wasm-bindgen already at the pin with no stamp (cargo's records and its `--version`
-/// both the pin's, as the retired `ship provision` laid one) is rebuilt at the pin, never
-/// adopted: nothing ties its bytes to crates.io, and nothing runs it. NEGATIVE CONTROL:
-/// the copy this run builds is run, in its scratch, and placed stamped.
 #[test]
 fn a_bindgen_found_in_place_is_rebuilt_and_never_run() {
     let pin = crate::wasm_glue::BINDGEN;
@@ -1045,8 +992,6 @@ fn a_bindgen_found_in_place_is_rebuilt_and_never_run() {
     assert!(matches!(check(row, &m, &Fake::new()), State::Present(_)));
 }
 
-/// `--check` reads and changes nothing: a bare machine is every row missing, nothing is
-/// fetched or created, and the exit is a failure.
 #[test]
 fn check_changes_nothing() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1069,7 +1014,6 @@ fn check_changes_nothing() {
     assert!(!m.tooling.exists() && !m.browser.exists());
 }
 
-/// A fixture browser pin served at a fixture URL, placed under `m`'s browser cache.
 fn browser_fixture(m: &Machine, zip: &[u8]) -> (crate::browser::Pin, Target) {
     let pin = crate::browser::Pin {
         what: "chrome-headless-shell 0.0.1".into(),
@@ -1091,11 +1035,6 @@ fn browser_fixture(m: &Machine, zip: &[u8]) -> (crate::browser::Pin, Target) {
     (pin, t)
 }
 
-/// A missing browser is fetched into a scratch under the tooling cache (where the reclaim
-/// finds one a killed run left), unzipped by ditto, held to its binary, stamped for this
-/// host and renamed into the lane's cache; a copy there without this pin's stamp is
-/// replaced, never adopted. NEGATIVE CONTROL: bytes off the real pin are refused before
-/// anything unzips.
 #[test]
 fn a_browser_is_placed_where_the_lane_looks() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1149,10 +1088,62 @@ fn a_browser_is_placed_where_the_lane_looks() {
     assert_eq!(names(&m.browser), ["chrome-headless-shell-0.0.1-mac-arm64"]);
 }
 
-/// A zip whose link leads outside its tree is refused, and nothing is placed; a zip that
-/// lays its own `stamp.json` as a link into the tree gets a stamp of its own, written as
-/// a new file, never through the link. NEGATIVE CONTROL: the program the link named keeps
-/// its bytes, and the same zip without the escaping link is placed.
+/// The wasm drivers' browser is the pin exactly as `verify provision` placed it: nothing
+/// placed, a copy laid by hand with no stamp, and one stamped for another pin are each no
+/// browser (the browser lane's `find` would take the hand-laid copy, or an installed
+/// Chrome), and `ATERM_BROWSER` is the one override. NEGATIVE CONTROL: the same copy with
+/// the pin's own stamp is found.
+#[test]
+fn the_drivers_browser_is_only_the_pin_provision_placed() {
+    use crate::browser::chromium::pinned_from;
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let t = target(row("chrome-headless-shell").unwrap(), &m).expect("pinned for macos-aarch64");
+    let exe = t.dir.join(&t.exe);
+    let none = |why: &str| {
+        let refused = pinned_from(None, Some(&m)).expect_err(why);
+        assert!(
+            refused.contains("no pinned chrome-headless-shell")
+                && refused.contains("an installed Chrome is not the pin"),
+            "{why}: {refused}"
+        );
+    };
+    none("nothing placed");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, "hand-laid").unwrap();
+    none("a copy laid by hand");
+    let mut other = t.stamp("chrome-headless-shell", None, "sha256", None);
+    other.version = "0.0.1".into();
+    place::write_stamp(&t.dir, &other).unwrap();
+    none("another pin's stamp");
+    let mut adopted = t.stamp("chrome-headless-shell", None, "sha256", None);
+    adopted.adopted = true;
+    place::write_stamp(&t.dir, &adopted).unwrap();
+    none("an adopted copy");
+    place::write_stamp(
+        &t.dir,
+        &t.stamp("chrome-headless-shell", None, "sha256", None),
+    )
+    .unwrap();
+    let found = pinned_from(None, Some(&m)).expect("the placed pin");
+    assert_eq!((found.path.as_path(), found.shell), (exe.as_path(), true));
+    assert!(found.source.starts_with("pinned chrome-headless-shell"));
+
+    let named = pinned_from(Some(home.path().join("rc").into()), None).expect_err("no file");
+    assert!(
+        named.contains("ATERM_BROWSER names") && named.contains("not a file"),
+        "{named}"
+    );
+    let chrome = home.path().join("Chromium");
+    std::fs::write(&chrome, "").unwrap();
+    let named = pinned_from(Some(chrome.clone().into()), Some(&m)).expect("the override");
+    assert_eq!(
+        (named.path, named.source.as_str()),
+        (chrome, "ATERM_BROWSER")
+    );
+    assert!(pinned_from(None, None).unwrap_err().contains("no $HOME"));
+}
+
 #[test]
 fn a_browser_zip_with_a_link_out_of_its_tree_is_refused() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1199,7 +1190,6 @@ fn a_browser_zip_with_a_link_out_of_its_tree_is_refused() {
     assert!(complete(&t));
 }
 
-/// A host nothing is pinned for: every row says so, and the run is COULD NOT RUN.
 #[test]
 fn a_host_nothing_is_pinned_for_could_not_run() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1240,10 +1230,6 @@ fn the_command_line_names_rows_and_flags_only() {
     );
 }
 
-/// Every pinned row's version, directory and program are its tool row's, so what this
-/// verb places is what the resolver reads; each archive URL names that version, and a row
-/// fetches for exactly the hosts its tool row's pin names, so a refusal names this verb
-/// only where it provides the tool.
 #[test]
 fn each_row_places_what_its_tool_row_resolves() {
     for row in ROWS {
@@ -1277,10 +1263,6 @@ fn each_row_places_what_its_tool_row_resolves() {
     }
 }
 
-/// rustup-init is fetched at its pin into a scratch of its own and held to its size and
-/// sha256 before it runs: off its pin it never runs, and nothing is left. NEGATIVE
-/// CONTROL: the same bytes under their own sha256 run from that scratch, executable, and
-/// the scratch goes with the run.
 #[test]
 fn a_rustup_init_off_its_pin_never_runs() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1353,8 +1335,6 @@ fn a_rustup_init_off_its_pin_never_runs() {
     assert_eq!(names(&m.tooling), Vec::<String>::new(), "the scratch went");
 }
 
-/// The real rustup row pins rustup-init for each host it runs on, each URL naming the
-/// version.
 #[test]
 fn rustup_init_is_pinned_for_every_host_rustup_serves() {
     let row = super::row("rustup").unwrap();
@@ -1378,9 +1358,6 @@ fn rustup_init_is_pinned_for_every_host_rustup_serves() {
     assert_eq!(init.len(), 4);
 }
 
-/// A tree without `publish/` (the public snapshot, which excludes it) wants no wasm32 pin:
-/// the rustup row is in place on stable alone, and a run passes. NEGATIVE CONTROL: a tree
-/// whose `publish/config.sh` has no wasm32 clause is told so, and its run fails.
 #[test]
 fn a_tree_without_publish_wants_no_wasm32_pin() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1416,10 +1393,6 @@ fn a_tree_without_publish_wants_no_wasm32_pin() {
     }
 }
 
-/// A stamp is this pin's only for this host and this build: one placed for another host,
-/// one naming other features, one the retired adoption wrote and one of another version
-/// are each missing to `--check` and replaced by a run. NEGATIVE CONTROL: the stamp a run
-/// writes is in place.
 #[test]
 fn a_stamp_for_another_host_or_build_is_not_the_pin() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1453,9 +1426,6 @@ fn a_stamp_for_another_host_or_build_is_not_the_pin() {
     assert!(complete(&t));
 }
 
-/// A run that finds a row in place marks its stamp used, which the reclaim's idle rule
-/// reads as use. NEGATIVE CONTROL: `--check` finds it in place and leaves the stamp as it
-/// was.
 #[test]
 fn a_row_found_in_place_is_marked_used() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -1486,8 +1456,6 @@ fn a_row_found_in_place_is_marked_used() {
     );
 }
 
-/// The download reads no `~/.curlrc` (`-q` first, as curl requires), keeps to https
-/// through every redirect, and stops once the body passes the pin's size.
 #[test]
 fn the_download_is_capped_at_the_pins_size_and_reads_no_curlrc() {
     let dest = Path::new("/scratch/.provision-x/download/a.tar.gz");
@@ -1518,8 +1486,6 @@ fn the_download_is_capped_at_the_pins_size_and_reads_no_curlrc() {
     );
 }
 
-/// A Mac's tools are the machine's: an x86_64 build under Rosetta provisions the arm64
-/// rows a native run placed, and nothing else changes the host.
 #[test]
 fn a_translated_run_provisions_the_macs_own_rows() {
     assert_eq!(platform_of("macos", "x86_64", true), "macos-aarch64");

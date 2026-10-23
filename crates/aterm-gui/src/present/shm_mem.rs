@@ -12,10 +12,7 @@ use std::ptr::NonNull;
 pub(crate) struct ShmMem {
     fd: OwnedFd,
     map: NonNull<u8>,
-    /// The mapping's length, which the server is told; 0 when unmapped.
     len: usize,
-    /// The file's size: `len` or more (a grow whose mapping failed left it
-    /// larger, and the seal keeps it from shrinking).
     file_len: usize,
 }
 
@@ -133,9 +130,6 @@ impl Drop for ShmMem {
 mod tests {
     use super::*;
 
-    /// A grow the file refuses leaves the memory as it was: its length and
-    /// its words, for the presenter to keep drawing in; a later grow keeps
-    /// the words too.
     #[test]
     fn a_refused_grow_leaves_the_memory_as_it_was() {
         let mut mem = ShmMem::new(c"aterm-shm-test", 4096).expect("memfd");

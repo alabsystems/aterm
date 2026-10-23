@@ -606,6 +606,7 @@ impl WatcherSet {
             match &w.spec {
                 WatcherSpec::SeqAdvanced { after } => {
                     // `after` is per grid: compare only within the same grid and
+                    // generation; crossing a swap latches on the identity change.
                     if alt != w.armed_alt || epoch != w.armed_epoch || content_seq > *after {
                         new_latch = Some(here);
                     }
@@ -797,6 +798,7 @@ impl super::Terminal {
         let id = self.watchers.arm(spec, now)?;
         if arm_eval {
             // The baseline was just seeded, so this pass sees `advanced == false` and stamps no
+            // activity; `SeqAdvanced` latches on `content_seq > after` regardless.
             let _ = self.observe_at(now);
         }
         Some(id)

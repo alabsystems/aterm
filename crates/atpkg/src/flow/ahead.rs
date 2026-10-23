@@ -173,6 +173,7 @@ impl Ahead {
                 Next::Fetch(i) => i,
                 Next::Again => continue,
                 Next::Exit => {
+                    // An inline success can land after the loop's count and before next's
                     // final locked decision. Tell it before leaving, outside the lock.
                     if self.archives_in() > told {
                         landed(self);
@@ -234,6 +235,7 @@ impl Ahead {
             return Next::Exit;
         }
         let Some(i) = self.pick(&state, bump) else {
+            // Nothing left to start. The pass's own download of an archive this lane failed
             // is still news to tell ([`fetched_inline`]): wait for it, until the pass is done.
             if state
                 .slots

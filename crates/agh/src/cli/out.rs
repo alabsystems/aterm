@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! THE output door (design §8): stdout carries data only; a failure is two stderr lines.
-//! `emit` renders a verb's answer: the projection (`--fields` or the noun's default), then
-//! `--jq`, `--raw` or `--format`, then the write and the receipt (the plan's §9.1).
+//! Output rendering (`emit`), stderr error/receipt formatting, and terminal safety filtering.
 
 use std::io::Write as _;
 
@@ -50,17 +48,13 @@ impl OutputOpts {
     }
 }
 
-/// Render and write `outcome`: 0, the FailedWith error's exit, or `write_stdout`'s answer when
-/// it is not 0 (1 when stdout could not be written, 3 for a replay's divergence). Any error
-/// in rendering (a bad `--fields`, a `--jq` that does not compile or fails) goes out through
-/// `fail` before anything has reached stdout.
+/// Renders and writes `outcome` to stdout/stderr, returning the process exit code.
 pub fn emit(ctx: &mut Ctx, outcome: Outcome, opts: &OutputOpts) -> u8 {
     let Outcome {
         answer,
         mut receipt,
     } = outcome;
     let rendered = match answer {
-        // Written before anything else is read: no flag can refuse it.
         Answer::FailedWith { value, error } => {
             let bytes = format!("{value}\n");
             let code = write_stdout(ctx, bytes.as_bytes(), 0);
@@ -69,8 +63,6 @@ pub fn emit(ctx: &mut Ctx, outcome: Outcome, opts: &OutputOpts) -> u8 {
             }
             return fail(ctx, &receipt.verb, &error);
         }
-        // The verb has already written a stream's bytes, so nothing after it may fail: the
-        // flags were refused before the verb ran (`refuse_projection_flags`).
         Answer::Streamed { written } => {
             receipt.notes.push(("bytes".into(), written.to_string()));
             Ok(None)
@@ -104,8 +96,7 @@ pub fn emit(ctx: &mut Ctx, outcome: Outcome, opts: &OutputOpts) -> u8 {
     0
 }
 
-/// A usage error that still carries the exit table's template next (`agh help <verb>`) names
-/// this verb's page instead, as the parser's own errors do; a jq error keeps `agh help jq`.
+/// Replaces the default usage `next` template (`agh help <verb>`) with `verb`'s help command.
 pub(crate) fn with_verb_help(error: Error, verb: &str) -> Error {
     if error.kind == Kind::Usage && error.next == Kind::Usage.next_action() {
         let words = verb.replace('.', " ");
@@ -114,14 +105,11 @@ pub(crate) fn with_verb_help(error: Error, verb: &str) -> Error {
     error
 }
 
-/// The refusal of the output flags for a verb that prints bytes, a `Bytes` answer or a stream
-/// to stdout: usage `{verb} prints bytes: --fields, --jq, --raw and --format do not apply`
-/// when any of them is given. `cli::run` checks it for `--output -` before the verb runs, so
-/// a stream never ends in an error.
+/// Rejects `--fields`, `--jq`, `--raw`, and non-JSON `--format` for verbs that output raw bytes.
 ///
 /// # Errors
 ///
-/// As above.
+/// Returns a `Kind::Usage` error when any projection or format flag is set.
 pub(crate) fn refuse_projection_flags(verb: &str, opts: &OutputOpts) -> Result<()> {
     if opts.fields.is_some() || opts.jq.is_some() || opts.raw || opts.format != Format::Json {
         return Err(Error::usage(format!(
@@ -131,9 +119,7 @@ pub(crate) fn refuse_projection_flags(verb: &str, opts: &OutputOpts) -> Result<(
     Ok(())
 }
 
-/// The part of the output flags no answer can change: `--fields` parses, `--jq` compiles and
-/// `--raw` has its one path. `cli::run` checks it before the verb runs, so a typo spends no
-/// request, no wait and no file; `emit` checks it again with the answer in hand.
+/// Validates `--fields`, `--jq`, and `--raw` before a verb executes.
 ///
 /// # Errors
 ///
@@ -226,8 +212,7 @@ fn download_row(row: &FileWritten) -> Value {
     Value::Object(map)
 }
 
-/// `--fields`, when given, validated once against `sample` (the first item's source), before
-/// any item is projected.
+/// Validates `--fields`, when given, against `sample`.
 fn validate(noun: Noun, plan: &Plan, sample: Option<&Value>) -> Result<()> {
     match &plan.fields {
         Some(fields) => project::validate_fields(noun, fields, sample),
@@ -235,8 +220,7 @@ fn validate(noun: Noun, plan: &Plan, sample: Option<&Value>) -> Result<()> {
     }
 }
 
-/// One item's projection: `--fields` (already validated), the whole value, or the noun's
-/// default.
+/// Projects `source` using `--fields`, the whole value, or `defaults`.
 fn projection(noun: Noun, source: &Value, plan: &Plan, defaults: &[FieldPath]) -> Value {
     match &plan.fields {
         Some(fields) => project::project(source, fields),
@@ -245,9 +229,7 @@ fn projection(noun: Noun, source: &Value, plan: &Plan, defaults: &[FieldPath]) -
     }
 }
 
-/// The columns `tsv` and `text` print: the `--fields` paths, the defaults, or for a
-/// whole-value noun the values' top-level keys, sorted, and the empty path when a value is
-/// not an object.
+/// Returns the column paths for `tsv` and `text` rendering.
 fn columns(noun: Noun, plan: &Plan, defaults: Vec<FieldPath>, values: &[Value]) -> Vec<FieldPath> {
     if let Some(fields) = &plan.fields {
         return fields.clone();
@@ -268,8 +250,6 @@ fn columns(noun: Noun, plan: &Plan, defaults: Vec<FieldPath>, values: &[Value]) 
             steps: vec![project::Step::Key(key.clone())],
         })
         .collect();
-    // A row that is not an object (`agh api`'s array of strings) has no keys: the row itself
-    // is its one cell, under the empty path, which reads the whole value and is headed `.`.
     if values.iter().any(|value| !value.is_object()) {
         columns.push(FieldPath { steps: Vec::new() });
     }
@@ -285,10 +265,6 @@ fn raw_line(projected: &Value, plan: &Plan) -> String {
 
 /// An `Object` answer's bytes.
 fn render_object(noun: Noun, value: &Value, plan: &Plan, opts: &OutputOpts) -> Result<Vec<u8>> {
-    // A whole value that is an array (`schema exit`, `nouns`, `verbs`) has no top-level keys
-    // to make columns of: under `tsv`, `text`, `--fields` and `--raw` its elements are the
-    // rows, as a list's items are. `json`, `ndjson` and `--jq` alone keep plan §9.1 step 3: the
-    // array is one value, on one line.
     let by_rows =
         plan.fields.is_some() || opts.raw || matches!(opts.format, Format::Tsv | Format::Text);
     if project::is_whole(noun)
@@ -328,7 +304,6 @@ fn render_items(noun: Noun, items: &[Value], plan: &Plan, opts: &OutputOpts) -> 
     if let Some(program) = &plan.program
         && plan.fields.is_none()
     {
-        // `--jq` alone reads the items as they are: no projection is made to throw away.
         let input = Value::Array(
             items
                 .iter()
@@ -340,7 +315,6 @@ fn render_items(noun: Noun, items: &[Value], plan: &Plan, opts: &OutputOpts) -> 
     }
     let mut projected = Vec::with_capacity(items.len());
     for item in items {
-        // The first item's source is the sample, already derived.
         let source = sample
             .take()
             .unwrap_or_else(|| project::with_derived(noun, item));
@@ -358,9 +332,7 @@ fn render_items(noun: Noun, items: &[Value], plan: &Plan, opts: &OutputOpts) -> 
     Ok(format::render(&projected, true, opts.format, opts.header, &columns).into_bytes())
 }
 
-/// `error`'s two lines on stderr (`Error::line`, then `to_json` compact), each with `\n`, both
-/// through `ctx.redactor`, then the terminal filter when `ctx.stderr_is_terminal`;
-/// `error.exit()`.
+/// Writes `error`'s two redacted lines to stderr and returns `error.exit()`.
 pub fn fail(ctx: &mut Ctx, verb: &str, error: &Error) -> u8 {
     let line = error.line(verb, &ctx.redactor);
     let json = error.to_json(&ctx.redactor);
@@ -368,9 +340,7 @@ pub fn fail(ctx: &mut Ctx, verb: &str, error: &Error) -> u8 {
     error.exit()
 }
 
-/// `text` on stderr, made terminal-safe (`aterm_codec::tty::safe`) when
-/// `ctx.stderr_is_terminal`: GitHub's texts reach these lines, and the line's escapes do not
-/// cover DEL, C1 controls or bidi marks. A failed write is ignored.
+/// Writes `text` to stderr, applying `aterm_codec::tty::safe` when `ctx.stderr_is_terminal`.
 fn write_stderr(ctx: &mut Ctx, text: &str) {
     let text = if ctx.stderr_is_terminal {
         aterm_codec::tty::safe(text.as_bytes())
@@ -381,11 +351,7 @@ fn write_stderr(ctx: &mut Ctx, text: &str) {
     let _ = ctx.stderr.flush();
 }
 
-/// `bytes` on stdout: `code`, or 1 with `aterm_uds::stdout::answer_status`'s line on stderr
-/// when the write failed for any reason but a gone reader. In order: the exact bytes cross
-/// `ctx.fx.emit_stdout(bytes)` (an `Err` there writes nothing and answers 3); when
-/// `ctx.stdout_is_terminal`, the bytes are made terminal-safe (`aterm_codec::tty::safe`); then
-/// the write.
+/// Writes `bytes` to stdout through `ctx.fx` and terminal filtering, returning the exit status.
 pub fn write_stdout(ctx: &mut Ctx, bytes: &[u8], code: u8) -> u8 {
     if ctx.fx.emit_stdout(bytes).is_err() {
         return 3;
@@ -410,20 +376,13 @@ pub fn write_stdout(ctx: &mut Ctx, bytes: &[u8], code: u8) -> u8 {
     }
 }
 
-/// One stderr line (a heartbeat, a receipt) through the redactor, with `\n`, then the terminal
-/// filter when `ctx.stderr_is_terminal`. A failed write is ignored.
-///
-/// The caller redacts each value with `Redactor::apply` as it builds the line (`receipt_line`
-/// does). The whole line then passes `Redactor::learned_and_tokens` only, because rules 2 and
-/// 3 over a line joined from fields would match across a field boundary: `bearer` ending one
-/// value would take the next `key=value` for a credential.
+/// Writes one redacted status or receipt line to stderr.
 pub fn note(ctx: &mut Ctx, line: &str) {
     let text = format!("{}\n", ctx.redactor.learned_and_tokens(line));
     write_stderr(ctx, &text);
 }
 
-/// A receipt value, quoted with the error line's escapes when it holds a space, `"` or a byte
-/// below 0x20. The caller has redacted it.
+/// Appends a redacted receipt value to `out`, quoting when it contains spaces, quotes, or control bytes.
 pub(crate) fn receipt_value(out: &mut String, value: &str) {
     if value.bytes().any(|b| b == b' ' || b == b'"' || b < 0x20) {
         out.push('"');
@@ -434,9 +393,7 @@ pub(crate) fn receipt_value(out: &mut String, value: &str) {
     }
 }
 
-/// `agh: ok verb={verb} [repo={repo}] [as={as}] reqs={requests} pages={pages}
-/// complete={0|1} [consistency={slug}] ms={elapsed_ms} [rate={rate.line()}] [{k}={v}]…`.
-/// Each value passes `redactor.apply` raw, before it is quoted, as `Error::line`'s do.
+/// Formats `receipt` as an `agh: ok verb=...` line with redacted values.
 #[must_use]
 pub fn receipt_line(receipt: &Receipt, redactor: &Redactor) -> String {
     let mut pairs: Vec<(&str, String)> = vec![("verb", receipt.verb.clone())];

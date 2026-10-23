@@ -19,8 +19,6 @@ fn modeled_park_choice(end: &ParkEnd) -> i64 {
         ParkEnd::IndexPublished(_) => 3,
         ParkEnd::VendorMoved(_) => 4,
         ParkEnd::SwitchedOff => 0,
-        // A due held toolchain flip is a local wish, like a bump, and outranks every
-        // network hint: the model's choice 1.
         ParkEnd::FlipDue => 1,
     }
 }
@@ -41,8 +39,7 @@ fn store_with_legacy_claude(label: &str) -> atpkg::store::Layout {
     layout
 }
 
-/// The claude head at `version` (its ETag the version), a 304 to that ETag, and a
-/// log of every GET's `If-None-Match`.
+/// The claude head at `version`.
 fn vendor(
     version: &'static str,
     asked: Arc<Mutex<Vec<Option<String>>>>,
@@ -62,8 +59,6 @@ fn vendor(
     }
 }
 
-/// A targeted pass is `update <program> --head-watch` on the lane's flags; only the loop's
-/// whole pass carries `--defer-busy-flip`, and never the argv of a person's pass ([`pass_args`]).
 #[test]
 fn a_targeted_pass_names_its_program_on_the_lanes_own_argv() {
     let layout = atpkg::store::Layout {
@@ -124,8 +119,6 @@ fn a_targeted_pass_names_its_program_on_the_lanes_own_argv() {
         "a published wake carries its target into the lock waiter and pass-end record"
     );
     assert_eq!(words(PassVerb::Seed, None), ["seed", "--wait-lock", "1800"]);
-    // A person's pass flips at once: the Settings Check spawns `pass_args`, which must
-    // never carry the defer flag, for any verb or hint.
     for verb in [
         PassVerb::Update,
         PassVerb::Seed,
@@ -152,7 +145,6 @@ fn a_targeted_pass_names_its_program_on_the_lanes_own_argv() {
     assert!(!PassVerb::UpdateProgram("claude").refusal_is_a_failure());
 }
 
-/// A VendorMoved trigger is one targeted update per program, in the watch's order.
 #[test]
 fn a_vendor_moved_trigger_maps_to_targeted_update_verbs() {
     assert_eq!(
@@ -188,9 +180,6 @@ fn park_20ms_reading(
     )
 }
 
-/// A window holds the watch on a store with no vendor program: its park takes the claim at
-/// the first slice, so `aterm pkg doctor` names it and a terminal session stands by.
-/// Negative control: before the park, nobody watches.
 #[test]
 fn a_window_park_holds_the_watch_with_no_vendor_program_to_watch() {
     use atpkg::vendor_direct::watch::{Host, Watcher, watcher};
@@ -219,8 +208,6 @@ fn a_window_park_holds_the_watch_with_no_vendor_program_to_watch() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// While a session holds the exclusive rendezvous for its quiet look, the window neither reads
-/// the flip nor advances its one-minute recheck; its next slice that wins the claim does.
 #[test]
 fn a_refused_window_claim_defers_its_held_flip_look() {
     use atpkg::quiet::{Due, DueFlip, RECHECK};
@@ -238,8 +225,6 @@ fn a_refused_window_claim_defers_its_held_flip_look() {
     let mut watch = BumpWatch::default();
     let t0 = Instant::now();
     let looks = std::cell::Cell::new(0);
-    // Captures `looks` by shared reference only (`Cell::set` takes `&self`),
-    // so the closure is `Copy` and each call below takes it by value.
     let due = |_: &atpkg::store::Layout| {
         looks.set(looks.get() + 1);
         Some(DueFlip {
@@ -255,9 +240,6 @@ fn a_refused_window_claim_defers_its_held_flip_look() {
         due,
     ));
     assert_eq!(looks.get(), 0, "the session still owns the store look");
-    // Released by LOCK_UN (the guard's drop), not by the close alone: a child another
-    // test is forking holds this descriptor until it execs, and the next slice makes one
-    // shared try.
     drop(held);
     assert!(!deferred_flip_due_if_watching(
         window.sit(&layout),
@@ -277,8 +259,6 @@ fn a_refused_window_claim_defers_its_held_flip_look() {
     assert_eq!(looks.get(), 2, "the second quiet look wakes the pass");
 }
 
-/// A session may finish the held move while the window parks behind its whole pass: the GUI
-/// pass gate retires the old `FlipDue`, while an unchanged record still permits its pass.
 #[test]
 fn a_window_does_not_repeat_a_sessions_completed_held_move() {
     use atpkg::quiet::{Deferral, Due, DueFlip, Recheck};
@@ -386,8 +366,6 @@ fn a_window_does_not_repeat_a_sessions_completed_held_move() {
     assert_eq!(why, PassWhy::Walk);
 }
 
-/// A vendor watcher with no resolvable store has due heads but no round to launch: the park
-/// sleeps, not spins (thread CPU time tells them apart under any load).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_due_vendor_without_a_store_does_not_spin_the_package_lane() {
@@ -428,8 +406,6 @@ fn a_due_vendor_without_a_store_does_not_spin_the_package_lane() {
     );
 }
 
-/// A completed vendor hint leaves the park while the index probe still waits on its host; a
-/// completed index answer, and a local bump, keep priority when both answers are in.
 #[test]
 fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     let model = aterm_models_atpkg::atpkg_index_pending_park_model();
@@ -443,8 +419,6 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
         last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
         ..BumpWatch::default()
     };
-    // The index probe blocks until released after the park. Its ten-minute wait outlasts
-    // the park, or a lane holding the vendor behind it could still return `VendorMoved`.
     start_index_probe(&layout, &mut watch, true, Instant::now(), move |_| {
         release_rx.recv_timeout(Duration::from_secs(600)).unwrap();
         atpkg::index_probe::Probe::Published(77)
@@ -453,9 +427,6 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     assert!(watch.pending_index_probe.is_some());
     assert_eq!(state["phase"], 1);
     assert_eq!(modeled_index_owner(&watch), 1);
-    // One minute-long slice of park: the vendor worker's completion must unpark the lane
-    // (`HeadWatch::park_for_hint`); a lane holding the hint behind the blocked index
-    // probe wakes at the slice's timeout and answers `Elapsed`.
     let park = aterm_spec::wait::MUST_HAPPEN;
     set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
@@ -476,7 +447,6 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
         watch.pending_index_probe.is_some(),
         "one owned probe remains"
     );
-    // Even a minute later, the lane cannot start a second index worker.
     start_index_probe(
         &layout,
         &mut watch,
@@ -485,7 +455,6 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
         |_| panic!("a second network worker must not start"),
     );
     release_tx.send(()).unwrap();
-    // The released worker must finish: a hang detector.
     let deadline = Instant::now() + Duration::from_secs(60);
     while !watch
         .pending_index_probe
@@ -507,8 +476,6 @@ fn slow_index_probe_does_not_hold_a_ready_vendor_hint() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `AtpkgIndexSharedHandoff`: a window arriving near a sibling's shared-stamp expiry keeps the
-/// remaining wait, then probes at that expiry, with no early request or added local interval.
 #[test]
 fn a_suppressed_window_index_probe_uses_the_shared_expiry() {
     use aterm_models_atpkg::atpkg_index_shared_handoff_model;
@@ -561,9 +528,6 @@ fn a_suppressed_window_index_probe_uses_the_shared_expiry() {
     assert_eq!(requests.load(Ordering::SeqCst), state["requests"] as u64);
 }
 
-/// `AtpkgIndexProbeCompletionCadence`: the shared file's mtime is stamped after the worker's
-/// HEADs, so the next probe is paced from completion; paced from the start, it would hit the
-/// still-fresh stamp and push the next real HEAD to twice the interval.
 #[test]
 fn next_index_probe_is_paced_from_worker_completion() {
     let model = aterm_models_atpkg::atpkg_index_probe_completion_cadence_model();
@@ -571,8 +535,6 @@ fn next_index_probe_is_paced_from_worker_completion() {
     let layout = atpkg::store::Layout {
         prefix: std::env::temp_dir().join("aterm-index-completion-cadence-absent"),
     };
-    // Five seconds of elapsed network time, without sleeping; the worker's real completion
-    // stamp is still read through its handle.
     let launched_at = Instant::now() - Duration::from_secs(5);
     let mut watch = BumpWatch {
         last_index_probe: Some(launched_at - atpkg::index_probe::INTERVAL),
@@ -624,7 +586,6 @@ fn next_index_probe_is_paced_from_worker_completion() {
     );
     assert_eq!(state["phase"], 3);
     assert!(watch.pending_index_probe.is_some(), "one real next probe");
-    // Own the helper through its end, including the synthetic future tick.
     watch
         .pending_index_probe
         .take()
@@ -634,8 +595,6 @@ fn next_index_probe_is_paced_from_worker_completion() {
         .unwrap();
 }
 
-/// A positive near HEAD wakes the signed pass without waiting for the worker's far HEAD or
-/// listing; the worker stays owned through the pass, which invalidates its later answer.
 #[test]
 fn near_index_wakes_while_unrelated_probe_helpers_are_still_running() {
     let model = aterm_models_atpkg::atpkg_index_pending_park_model();
@@ -708,8 +667,6 @@ fn near_index_wakes_while_unrelated_probe_helpers_are_still_running() {
     assert!(model.check_invariant("NoStaleAnswerApplied", &state));
 }
 
-/// A new index starts its signed pass as soon as its near HEAD lands, even with the lane
-/// parked inside the vendor-head watcher; the final probe stays blocked to prove it.
 #[test]
 fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
     let layout = atpkg::store::Layout {
@@ -745,8 +702,6 @@ fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
         std::thread::sleep(Duration::from_millis(100));
         near_tx.send(()).unwrap();
     });
-    // The near hint must beat the slice's one-minute timeout; a missed unpark answers
-    // `Elapsed`.
     let park = aterm_spec::wait::MUST_HAPPEN;
     set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
@@ -776,9 +731,6 @@ fn near_index_unparks_the_vendor_head_wait_without_a_poll_tick() {
     );
 }
 
-/// A final answer interrupts the ordinary slice with no vendor watch admitted. The `done`
-/// publication closes the race between unpark delivery and `JoinHandle::is_finished`
-/// turning true.
 #[test]
 fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
     let layout = atpkg::store::Layout {
@@ -790,7 +742,6 @@ fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
         last_index_probe: Some(Instant::now() - atpkg::index_probe::INTERVAL),
         ..BumpWatch::default()
     };
-    // The release must come; the minute is a hang detector.
     start_index_probe_with_near_hint(&layout, &mut watch, true, Instant::now(), move |_, _| {
         finish_rx.recv_timeout(Duration::from_secs(60)).unwrap();
         atpkg::index_probe::Probe::Published(45)
@@ -799,7 +750,6 @@ fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
         std::thread::sleep(Duration::from_millis(100));
         finish_tx.send(()).unwrap();
     });
-    // A one-minute slice, so a missed unpark answers `Elapsed`.
     let park = aterm_spec::wait::MUST_HAPPEN;
     set_park_slice_for_this_thread(park);
     let end = sleep_interval_watching_bump(
@@ -816,9 +766,6 @@ fn final_index_answer_unparks_a_package_lane_without_vendor_heads() {
     release.join().unwrap();
 }
 
-/// A second near HEAD can publish while the signed pass for the first reads an older
-/// listing: the still-owned worker offers the higher build at once, and its older
-/// far/listing answer stays invalidated.
 #[test]
 fn higher_near_index_after_pass_start_wakes_before_unrelated_helpers_finish() {
     let model = aterm_models_atpkg::atpkg_index_pending_park_model();
@@ -895,9 +842,6 @@ fn higher_near_index_after_pass_start_wakes_before_unrelated_helpers_finish() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// Joining a worker and seeing its final answer must not hide a higher near
-/// HEAD it published just before finishing. A floor already at that build
-/// does suppress the wake, including without leaving a ready-loop behind.
 #[test]
 fn finished_stale_probe_keeps_newer_near_hint_unless_the_floor_landed_it() {
     for (label, landed, expected) in [("unlanded", 44, Some(45)), ("landed", 45, None)] {
@@ -1031,7 +975,6 @@ fn stale_missing_index_answer_keeps_the_new_full_pass_mark() {
     assert!(model.fire("Start", &mut state));
     assert_eq!(modeled_index_owner(&watch), 1);
 
-    // The same park's local bump wins before the blocked network answer.
     std::fs::write(layout.bump_file(), "claude\n").unwrap();
     let end = sleep_interval_watching_bump(
         Some(&layout),
@@ -1049,8 +992,6 @@ fn stale_missing_index_answer_keeps_the_new_full_pass_mark() {
     assert_eq!(modeled_park_choice(&end), 1);
     std::fs::remove_file(layout.bump_file()).unwrap();
 
-    // The full pass finishes with a newer unlanded decision. Its start
-    // invalidates the older probe, but does not release the worker slot.
     watch.note_full_pass_started();
     watch.unlanded = Some(88);
     assert!(model.fire("FullPass", &mut state));
@@ -1081,8 +1022,6 @@ fn stale_missing_index_answer_keeps_the_new_full_pass_mark() {
     assert_eq!(watch.unlanded, Some(88));
     assert_eq!(modeled_index_owner(&watch), 0);
 
-    // Negative control: applying that old Missing answer without the
-    // generation check would erase the full pass's newer suppression mark.
     let mut without_generation = BumpWatch {
         unlanded: Some(88),
         ..BumpWatch::default()
@@ -1122,8 +1061,6 @@ fn a_ready_index_wins_before_a_ready_vendor_get() {
             .is_some_and(|pending| pending.worker.is_finished())
     });
     assert!(model.fire("FinishPublished", &mut state));
-    // A local wish and an elapsed full-pass deadline both win. A store-lock
-    // contention park holds the answer for its next index-enabled park.
     std::fs::write(layout.bump_file(), "claude\n").unwrap();
     let bump_end = sleep_interval_watching_bump(
         Some(&layout),
@@ -1168,9 +1105,6 @@ fn a_ready_index_wins_before_a_ready_vendor_get() {
     );
     assert!(watch.pending_index_probe.is_some());
     assert!(model.fire("VendorReady", &mut state));
-    // The ready answer ends this park at its first look; its deadline is the
-    // one-minute hang detector, since a due deadline outranks the index (as
-    // `full_end` shows) and a loaded host can spend 20 ms before that look.
     let index_end = sleep_interval_watching_bump(
         Some(&layout),
         &mut (SystemTime::now() + Duration::from_secs(60)),
@@ -1184,8 +1118,6 @@ fn a_ready_index_wins_before_a_ready_vendor_get() {
     assert!(model.fire("Harvest", &mut state));
     assert!(model.fire("ChooseIndex", &mut state));
     assert_eq!(modeled_park_choice(&index_end), state["chosen"]);
-    // Negative control: the conformance projection rejects a vendor-first
-    // decision if a completed index answer was available at that decision.
     assert_ne!(
         modeled_park_choice(&ParkEnd::VendorMoved(vec!["claude"])),
         state["chosen"]
@@ -1271,9 +1203,6 @@ fn a_vendor_hint_harvested_with_a_higher_priority_event_survives_to_the_next_par
         assert_eq!(state["vendor"], 1, "{label}: model retains the hint");
         assert!(heads.0.due(SystemTime::now()), "{label}: real hint is due");
 
-        // A coalesced full pass can stand down behind another process; if
-        // that pass did not land Claude, the next park must deliver this
-        // exact hint without another GET or a five-minute reoffer wait.
         let replay = sleep_interval_watching_bump(
             Some(&layout),
             &mut (SystemTime::now() + Duration::from_secs(2)),
@@ -1291,8 +1220,6 @@ fn a_vendor_hint_harvested_with_a_higher_priority_event_survives_to_the_next_par
     }
 }
 
-/// `[packages].exclude` reaches the head watch live: an excluded program is not asked
-/// (no GET, no pass), and one taken off the list is asked within a slice, no relaunch.
 #[test]
 fn an_exclusion_edited_in_a_running_window_reaches_the_head_watch() {
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -1301,7 +1228,6 @@ fn an_exclusion_edited_in_a_running_window_reaches_the_head_watch() {
     let config = layout.prefix.join("aterm.toml");
     std::fs::write(&config, "[packages]\nexclude = [\"claude\"]\n").unwrap();
     let mut switch = LiveSwitch::new(Some(config.clone()), LoopGate::On);
-    // The launch watch, as the thread builds it: nothing excluded yet.
     let mut heads: VendorHeads = (HeadWatch::new(&[]), get);
     assert_eq!(
         park_20ms_reading(&layout, Some(&mut heads), &mut switch),
@@ -1309,9 +1235,6 @@ fn an_exclusion_edited_in_a_running_window_reaches_the_head_watch() {
     );
     assert!(asked.lock().unwrap().is_empty(), "excluded: never asked");
     std::fs::write(&config, "[packages]\nexclude = []\n").unwrap();
-    // Counted in slices, not time: park until one slice's poll has read the edit. With
-    // no probes, bump or held flip, that slice proceeds straight to the head check with
-    // the new list and starts claude's GET on a worker.
     let heard = Instant::now() + MUST_HAPPEN;
     let mut end = ParkEnd::Elapsed;
     while !switch.exclude().is_empty() {
@@ -1321,12 +1244,9 @@ fn an_exclusion_edited_in_a_running_window_reaches_the_head_watch() {
         );
         end = park_20ms_reading(&layout, Some(&mut heads), &mut switch);
     }
-    // Parking no further: the worker's GET must come. A watch that hears the
-    // edit a slice late, or never, started none, and fails here.
     wait_for_what_must_happen("the slice that read the edit asked claude", || {
         !asked.lock().unwrap().is_empty()
     });
-    // Later slices harvest the worker's answer; any end but `Elapsed` stops the walk.
     let harvested = Instant::now() + MUST_HAPPEN;
     while matches!(end, ParkEnd::Elapsed) {
         assert!(
@@ -1344,14 +1264,10 @@ fn an_exclusion_edited_in_a_running_window_reaches_the_head_watch() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The park is on the wall clock: a deadline already past ends it at once,
-/// and so does one further out than the park's own length — a clock set back, which
-/// must not strand the loop until the clock comes round again.
 #[test]
 fn the_park_ends_at_a_wall_clock_deadline_and_never_strands_on_a_clock_set_back() {
     let layout = store_with_legacy_claude("wall");
     let five_minutes = Duration::from_secs(300);
-    // Both parks run on a thread of their own; the minute is a hang detector.
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let parked = layout.clone();
     std::thread::spawn(move || {
@@ -1382,14 +1298,8 @@ fn the_park_ends_at_a_wall_clock_deadline_and_never_strands_on_a_clock_set_back(
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The park ends early with the programs whose head moved, and a park resumed after
-/// the passes runs out without asking again: the head is on the cadence now. A bump
-/// ends a park before a due head is asked; with no watch, or nothing installed, no
-/// vendor is asked.
 #[test]
 fn a_moved_head_ends_the_park_with_its_programs() {
-    // The due head runs on its own worker, which a busy host may not schedule within a
-    // 20 ms park; a later park harvests it.
     fn park_until_moved(layout: &atpkg::store::Layout, heads: &mut VendorHeads) -> ParkEnd {
         let deadline = Instant::now() + MUST_HAPPEN;
         loop {
@@ -1412,16 +1322,13 @@ fn a_moved_head_ends_the_park_with_its_programs() {
     assert_eq!(asked.lock().unwrap().as_slice(), [None]);
     assert_eq!(park_20ms(&layout, Some(&mut heads)), ParkEnd::Elapsed);
     assert_eq!(asked.lock().unwrap().len(), 1, "resumed: not asked again");
-    // A bump written while a head is due: the bump, and no GET.
     let mut due: VendorHeads = (HeadWatch::new(&[]), Arc::clone(&get));
     std::fs::write(layout.bump_file(), "claude\n").unwrap();
     assert_eq!(park_20ms(&layout, Some(&mut due)), ParkEnd::Bumped);
     assert_eq!(asked.lock().unwrap().len(), 1, "the bump first: no GET");
     std::fs::remove_file(layout.bump_file()).unwrap();
-    // No watch (the manager off, a `dir:` registry): no GET.
     assert_eq!(park_20ms(&layout, None), ParkEnd::Elapsed);
     assert_eq!(asked.lock().unwrap().len(), 1, "no watch: no GET");
-    // The negative control: that watch was due.
     assert_eq!(
         park_until_moved(&layout, &mut due),
         ParkEnd::VendorMoved(vec!["claude"])
@@ -1437,8 +1344,6 @@ fn a_moved_head_ends_the_park_with_its_programs() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A ready Codex hint starts its targeted pass while the independent Claude request is
-/// still stalled, through the GUI package lane itself, not only two overlapping GETs.
 #[cfg(unix)]
 #[test]
 fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
@@ -1460,10 +1365,6 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     )
     .unwrap();
     std::fs::set_permissions(&atpkg, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // The stub's first exec can wait tens of seconds on macOS's assessment of a freshly
-    // written file; pay it here, under the first exec's own hang detector
-    // (`aterm_spec::wait::FIRST_EXEC`), before Claude's stall starts its clock.
-    // Spawned the way the lane spawns it; the log keeps only the pass's argv.
     aterm_uds::deadline::output_until(
         &mut crate::qos::atpkg_command(&atpkg),
         std::time::Instant::now() + aterm_spec::wait::FIRST_EXEC,
@@ -1475,9 +1376,6 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     let claude_finished = Arc::new(AtomicBool::new(false));
     let gate = Arc::clone(&release);
     let finished = Arc::clone(&claude_finished);
-    // Claude's ten-minute stall outlasts every wait before the test releases it, the Codex
-    // minute among them: a lane that held Codex behind Claude fails at that minute, never
-    // passes on a GET that gave up on its own.
     let get: Arc<ConcurrentVendorGetFn<'static>> = Arc::new(move |program, url, _, _| {
         let bytes = if program == "claude" {
             let (lock, ready) = &*gate;
@@ -1513,7 +1411,6 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
         None
     );
     assert_eq!(head_watch.pending_count(), 2);
-    // Codex's GET answers at once; the minute is a hang detector.
     let deadline = Instant::now() + MUST_HAPPEN;
     let moved = loop {
         head_watch.park_for_hint(Duration::from_millis(100));
@@ -1561,8 +1458,6 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     let (lock, ready) = &*release;
     *lock.lock().unwrap() = true;
     ready.notify_all();
-    // A thread park can return spuriously or on a stale token: wait for Claude's GET
-    // through the lane's own recheck-and-park loop. The minute is a hang detector.
     let deadline = Instant::now() + MUST_HAPPEN;
     let moved = loop {
         head_watch.park_for_hint(deadline.saturating_duration_since(Instant::now()));
@@ -1584,9 +1479,6 @@ fn ready_codex_starts_its_pass_before_stalled_claude_finishes() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// A trigger runs every program while its passes run, and a pass that ran starts the contention
-/// tally over; the first to stand aside at the lock counts on the tally and ends the trigger (the
-/// next program does not queue behind the same holder); none runs while the holder looks wedged.
 #[cfg(unix)]
 #[test]
 fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
@@ -1639,7 +1531,6 @@ fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
         0,
         "a pass that ran starts the tally over"
     );
-    // A holder that looks wedged: no targeted pass queues behind it.
     for _ in 0..CONTENTION_WEDGE_CYCLES {
         let _ = lane.backoff.park(false);
     }
@@ -1650,9 +1541,6 @@ fn a_targeted_pass_that_stood_aside_ends_the_trigger_on_the_tally() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A private window's passes (seed, whole and targeted updates) lead with
-/// [`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`]; the owner's carry nothing new. Driven through the
-/// lane's real spawn over a fake `atpkg` that logs its argv.
 #[cfg(unix)]
 #[test]
 fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
@@ -1712,14 +1600,6 @@ fn a_private_windows_passes_lead_with_the_flag_and_the_owners_do_not() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// TC-5 — THE LANE'S FIRST-RUN ROW AND EACH CHILD'S PATH. A lane holding the row
-/// ahead posts it open before its seed and again before a retried one, hands it to
-/// the whole update with no word of its own, and withdraws it before a park instead
-/// (once). An update that stood aside at the lock (exit 75) only waited: its exit is
-/// carried like a seed's and the busy park withdraws the row, as it is for one whose only
-/// answer was a fact about the machine (an unserved architecture). The seeds run with this
-/// process's PATH and never ask for the update's; the update (a first run: no store) gets a
-/// first run's ([`crate::spawn::atpkg_update_path`]).
 #[cfg(unix)]
 #[test]
 fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path() {
@@ -1801,7 +1681,6 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
         std::fs::read_to_string(&said).unwrap(),
         format!("seed {process_path}\nseed {process_path}\nupdate /first-run/bin:/usr/bin:/bin\n")
     );
-    // No update after the seed: the park withdraws the row, once.
     lane.ahead = true;
     lane.run(PassVerb::Seed, None);
     let _ = lane.park(
@@ -1819,8 +1698,6 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
         None,
     );
     assert_eq!(rows(&posted), ["open", "ended", "withdraw"]);
-    // An update that stood aside at the lock, or found no network before announcing, wrote
-    // no outcome: the lane still holds the row, and the next park withdraws it.
     for exit in [
         atpkg::lock::CONTENDED_EXIT,
         aterm_update_core::pkg_check::PASS_OFFLINE_EXIT,
@@ -1842,16 +1719,11 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
         );
         assert_eq!(rows(&posted), ["withdraw"], "exit {exit}");
     }
-    // A failed update takes the row over, and its exit folds it.
     lane.ahead = true;
     std::fs::write(&code, "1\n").unwrap();
     lane.run(PassVerb::Update, None);
     assert_eq!(rows(&posted), ["ended"]);
     assert!(!lane.ahead);
-    // An update whose only answer is a fact about this machine (the empty-store arm's
-    // informational `seed-unusable:` line, exit 2) carries the row for the park to withdraw,
-    // never a Fault for an architecture no build serves. An exclusion that leaves nothing is
-    // a failure a person can act on, and takes the row over.
     let unusable = |body: &str| format!("atpkg: {}{body}\n", atpkg::cli::SEED_UNUSABLE_MARKER);
     let unserved = unusable(&format!(
         "ALab publishes no build {} (x86_64-apple-darwin) \u{2014} it builds for \
@@ -1884,15 +1756,6 @@ fn the_lane_holds_the_first_run_row_ahead_and_only_an_update_asks_the_login_path
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// PKG-6 #9/#10 — THE FIRST RUN A PERSON WAITS ON NEITHER WAITS FOR THE LOGIN SHELL NOR
-/// RUNS CLAMPED. The lane asks for an update child's PATH, and picks its band, by whether a
-/// person waits on the pass ([`pass_is_waited_on`]): over a store whose first install is
-/// still ahead the update asks as a first run, which never waits on the person's rc chain
-/// ([`crate::spawn::atpkg_update_path`]), and runs at the default band; over a stocked
-/// store, and over one a pass already served that still holds no ALab program (an
-/// unserved architecture, a declined machine updating its agents), it asks as a routine
-/// pass, which waits for the login shell's answer, and runs behind the utility clamp (on
-/// macOS, read off the child: `ps` pri 20 or below, against the default band's 31).
 #[cfg(unix)]
 #[test]
 fn only_the_first_run_a_person_waits_on_skips_the_login_path_and_the_clamp() {
@@ -1982,10 +1845,6 @@ fn only_the_first_run_a_person_waits_on_skips_the_login_path_and_the_clamp() {
     }
 }
 
-/// PKG-6 #10 — THE LANE THREAD RUNS AT ITS FIRST RUN'S BAND WHILE IT HOLDS IT, read off the
-/// running thread. A lane that holds the first run ahead is raised from launch, across its
-/// seed, until the update takes the row over; then it rests at the background band it was
-/// spawned at, as it does when a park withdraws the row instead.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_lane_thread_is_raised_while_it_holds_the_first_run_and_rests_after() {
@@ -2041,9 +1900,6 @@ fn the_lane_thread_is_raised_while_it_holds_the_first_run_and_rests_after() {
     .expect("the lane thread's assertions");
 }
 
-/// The lane starts before the event loop exists: what it posts meanwhile is delivered once
-/// the loop goes live, in order and exactly once, and later posts go straight through behind
-/// them.
 #[test]
 fn lane_posts_before_the_loop_exists_are_delivered_when_it_goes_live() {
     use std::sync::Arc;
@@ -2069,11 +1925,6 @@ fn lane_posts_before_the_loop_exists_are_delivered_when_it_goes_live() {
     );
 }
 
-/// LAG-11 — session 0's reader posts through the same sink, spawned before the
-/// event loop exists. A post the sink queues is accepted, so the reader's output
-/// latch stays armed for the wake it stands for, and that wake is delivered at
-/// go-live; once live, each post answers what the loop answered, so the reader
-/// hears that the loop is gone.
 #[test]
 fn a_reader_posting_through_the_sink_is_accepted_then_answered_by_the_loop() {
     use crate::spawn::WakeTarget as _;
@@ -2103,9 +1954,6 @@ fn a_reader_posting_through_the_sink_is_accepted_then_answered_by_the_loop() {
     assert_eq!(delivered.load(Ordering::SeqCst), 3);
 }
 
-/// The row opens ahead only for a first run this machine consents to and no pass has served:
-/// an empty consenting store, never a declined one, an `auto_install = false` one, one holding
-/// an ALab program, one a pass already reached the index for, or no store at all.
 #[test]
 fn the_first_run_row_opens_ahead_only_where_the_seed_will_adopt() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -2154,10 +2002,6 @@ fn the_first_run_row_opens_ahead_only_where_the_seed_will_adopt() {
     assert!(!first_run_ahead(Some(&stocked), &consenting));
 }
 
-/// The store at the pass's start decides the first run (no program: first run; a program:
-/// routine), which the child's own landing cannot flip. Every exit posts `PkgPassEnded`, clean
-/// only for a whole pass that exited 0 with no failure marker. A refused vendor head-watch pass
-/// raises no row (its `error:` row is what the badge reads).
 #[cfg(unix)]
 #[test]
 fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
@@ -2180,7 +2024,6 @@ fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
         prefix: dir.join("empty"),
     };
     std::fs::create_dir_all(&empty.prefix).unwrap();
-    // One installed program, as a pass leaves it: its build and the shim into it.
     let stocked = atpkg::store::Layout {
         prefix: dir.join("stocked"),
     };
@@ -2192,8 +2035,6 @@ fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
     assert!(pass_is_first_run(None), "no store: nothing of it is here");
     assert!(pass_is_first_run(Some(&empty)));
     assert!(!pass_is_first_run(Some(&stocked)));
-    // Agents do not count: a first pass cut short after claude leaves a store whose
-    // next pass is still a first run.
     let agents_only = atpkg::store::Layout {
         prefix: dir.join("agents-only"),
     };
@@ -2272,7 +2113,6 @@ fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
         Some(false),
         "a failure marker at exit 0 is not clean"
     );
-    // The refused vendor program: a head-watch pass, exit 1, no marker.
     fake("atpkg: codex 0.157.0 refused: SHA256SUMS disagrees", 1);
     let refused = drive(&stocked, PassVerb::UpdateProgram("codex"));
     assert!(
@@ -2297,8 +2137,6 @@ fn a_pass_is_a_first_run_only_on_an_empty_store_and_reports_its_exit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An unlaunchable atpkg is a failure for a whole pass (the badge is the only place it
-/// is said); a targeted pass stays a log line. Every exit reports itself, not clean.
 #[test]
 fn a_whole_pass_that_cannot_launch_is_a_failure() {
     use std::sync::{Arc, Mutex};
@@ -2339,10 +2177,6 @@ fn a_whole_pass_that_cannot_launch_is_a_failure() {
     }
 }
 
-/// A `seed-unusable:` stating a fact (unserved architecture, or every served program
-/// removed on purpose) is no failure: no badge, still clean. An exclusion leaving nothing
-/// stays a failure, as do other markers. The bodies are atpkg's own words (pinned by its
-/// `an_unserved_architecture_and_a_removal_are_facts_an_exclusion_is_not`).
 #[test]
 fn an_informational_unusable_marker_is_no_failure() {
     let unusable = |detail: &str| Wake::PkgSeedUnusable {
@@ -2365,7 +2199,6 @@ fn an_informational_unusable_marker_is_no_failure() {
     }));
 }
 
-/// The tag rides the announcement only; every other event passes untouched.
 #[test]
 fn only_the_announcement_carries_the_first_run_tag() {
     let tagged = tag_first_run(
@@ -2391,8 +2224,6 @@ fn only_the_announcement_carries_the_first_run_tag() {
     assert!(matches!(other, Wake::PkgSeedDone { .. }));
 }
 
-/// One slice at a time: due at once, then on the cadence; a wake asks again 20 s
-/// later, conditionally, and a 304 is nothing.
 #[test]
 fn the_slice_asks_when_due_and_twenty_seconds_after_a_wake() {
     let asked = Arc::new(Mutex::new(Vec::new()));
@@ -2409,7 +2240,6 @@ fn the_slice_asks_when_due_and_twenty_seconds_after_a_wake() {
         None,
         "launched the head worker"
     );
-    // The worker's completion ends each park; the minute is a hang detector.
     heads.park_for_hint(MUST_HAPPEN);
     assert_eq!(
         slice(&mut heads, t0 + Duration::from_secs(1), five),

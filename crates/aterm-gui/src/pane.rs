@@ -59,7 +59,7 @@ pub(crate) const MIN_PANE_COLS: u16 = 16;
 
 /// Whether a `rows` × `cols` allocation can be split in `dir` while keeping both children at least `MIN_PANE_ROWS` × `MIN_PANE_COLS`.
 #[must_use]
-pub(crate) fn split_fits_in(dir: SplitDir, rows: u16, cols: u16) -> bool {
+pub(crate) const fn split_fits_in(dir: SplitDir, rows: u16, cols: u16) -> bool {
     let min_rows = MIN_PANE_ROWS + 1; // each child also owns a subtab header
     match dir {
         SplitDir::Vertical => rows >= min_rows && cols.saturating_sub(1) >= 2 * MIN_PANE_COLS,
@@ -69,7 +69,7 @@ pub(crate) fn split_fits_in(dir: SplitDir, rows: u16, cols: u16) -> bool {
 
 /// Minimum `(rows, cols)` required to split a pane in `dir`.
 #[must_use]
-pub(crate) fn split_needs(dir: SplitDir) -> (u16, u16) {
+pub(crate) const fn split_needs(dir: SplitDir) -> (u16, u16) {
     match dir {
         SplitDir::Vertical => (MIN_PANE_ROWS + 1, 2 * MIN_PANE_COLS + 1),
         SplitDir::Horizontal => (2 * (MIN_PANE_ROWS + 1) + 1, MIN_PANE_COLS),
@@ -78,7 +78,7 @@ pub(crate) fn split_needs(dir: SplitDir) -> (u16, u16) {
 
 impl SplitDir {
     /// User-facing name for this split direction.
-    pub(crate) fn human(self) -> &'static str {
+    pub(crate) const fn human(self) -> &'static str {
         match self {
             SplitDir::Vertical => "left/right",
             SplitDir::Horizontal => "top/bottom",
@@ -98,7 +98,7 @@ pub(crate) struct DividerHit {
 impl PaneTree {
     /// Create a single-pane tree focused on `session`.
     #[must_use]
-    pub(crate) fn new(session: u64) -> Self {
+    pub(crate) const fn new(session: u64) -> Self {
         PaneTree {
             root: PaneNode::Leaf(session),
             focus: session,
@@ -114,7 +114,7 @@ impl PaneTree {
 
     /// Focused leaf session ID.
     #[must_use]
-    pub(crate) fn focus(&self) -> u64 {
+    pub(crate) const fn focus(&self) -> u64 {
         self.focus
     }
 
@@ -147,7 +147,7 @@ impl PaneTree {
     }
 
     #[must_use]
-    pub(crate) fn is_zoomed(&self) -> bool {
+    pub(crate) const fn is_zoomed(&self) -> bool {
         self.zoomed
     }
 
@@ -474,7 +474,7 @@ pub(crate) enum CloseOutcome {
 impl CloseOutcome {
     /// Session ID of the removed pane.
     #[must_use]
-    pub(crate) fn closed(self) -> u64 {
+    pub(crate) const fn closed(self) -> u64 {
         match self {
             CloseOutcome::Collapsed { closed } | CloseOutcome::LastPane { closed } => closed,
         }

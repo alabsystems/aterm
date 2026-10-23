@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The publisher against its two oracles that run on any unix:
-//!
-//! * zbus's bytes: the messages registry zbus 5.16.0 built for aterm-dbus's
-//!   oracle (`crates/aterm-dbus/tests/recorded/zbus-5.16.0-messages.tsv`,
-//!   recorded outside the workspace), which this module's events, error
-//!   answers and `Embed` call must equal byte for byte;
-//! * a whole session over scripted buses: a session bus and an
-//!   accessibility bus played by the test over socket pairs, the test also
-//!   playing the assistive technology. It walks the tree, drives the actions
-//!   an AT can send, kills the accessibility bus mid-session (the publisher
-//!   logs it, tells the window, and rejoins a second bus) and turns the
-//!   status off.
-//!
-//! The Linux lane (`targo --unverified lab linux baseline`) holds the same
-//! publisher to the recorded tree walks and event streams of a real aterm
-//! under at-spi2-core.
+//! Tests for the AT-SPI publisher against recorded zbus bytes and scripted session/accessibility buses.
 
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
@@ -43,14 +28,12 @@ use super::{
     ActionHandler, ActivationHandler, Buses, DeactivationHandler, Publisher, events, proxies,
 };
 
-/// A wait for something that must happen: a hang detector, not a budget.
+/// Hang-detector timeout for operations that must complete.
 const HANG: Duration = Duration::from_secs(60);
 
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const AT: &str = ":1.9";
 const ME: &str = ":1.42";
-
-// --- the fixture ---------------------------------------------------------
 
 const WINDOW: LocalId = LocalId(0);
 const TERMINAL: LocalId = LocalId(1);
@@ -68,8 +51,7 @@ fn run(text: &str) -> Node {
     node
 }
 
-/// A window like aterm's: a terminal document of two rows, a button, a link
-/// and a slider. `second` is the terminal's second row.
+/// Build a window fixture with a two-row terminal, button, link, and slider.
 fn fixture(second: &str) -> TreeUpdate {
     let mut window = Node::new(Role::Window);
     window.set_label("~");
@@ -119,9 +101,7 @@ fn fixture(second: &str) -> TreeUpdate {
     }
 }
 
-// --- the dispatcher alone -------------------------------------------------
-
-/// The semantics layer's registrations, as the publisher thread gets them.
+/// Semantics registrations and events captured for the publisher.
 #[derive(Clone, Default)]
 struct Recorder {
     registered: Arc<Mutex<Vec<(PlatformNode, InterfaceSet)>>>,
@@ -197,7 +177,6 @@ impl Served {
     fn path(&self, local: LocalId) -> String {
         let registered = self.recorder.registered.lock().unwrap();
         assert!(registered.is_empty());
-        // Node ids are the local id in the high word over tree index 0.
         let id = (u128::from(local.0) << 64).to_string();
         format!("/org/a11y/atspi/accessible/{}/{id}", self._semantics.id())
     }
@@ -284,7 +263,6 @@ fn the_root_and_its_window_answer_a_walk() {
         names(&s.ok(ROOT_PATH, ACCESSIBLE, "GetInterfaces", vec![])[0]),
         ["org.a11y.atspi.Accessible", "org.a11y.atspi.Application"]
     );
-    // The root never had GetAttributes: the recorded walks read this error.
     assert_eq!(
         s.fault(ROOT_PATH, ACCESSIBLE, "GetAttributes", vec![]),
         Fault {
@@ -425,7 +403,6 @@ fn a_link_is_a_hyperlink_and_a_slider_a_value() {
     let value = "org.a11y.atspi.Value";
     assert_eq!(s.get(&slider, value, "CurrentValue"), Value::F64(3.0));
     assert_eq!(s.get(&slider, value, "MaximumValue"), Value::F64(10.0));
-    // Set: the AT's SetValue, announced before the reply as zbus did.
     let set = s.call(
         &slider,
         serve::PROPERTIES,
@@ -460,10 +437,7 @@ fn a_link_is_a_hyperlink_and_a_slider_a_value() {
     );
 }
 
-/// A load bar reads as a level bar holding its value, and a heatmap of
-/// cores as a table: the stats bars' meters (`Role::Meter`) and core grid
-/// (`Role::Grid`). Negative control: the slider beside them is still a
-/// slider.
+/// `Role::Meter` maps to an AT-SPI level bar with `Value`, and `Role::Grid` maps to a table.
 #[test]
 fn a_meter_is_a_level_bar_and_a_grid_a_table() {
     const METER: LocalId = LocalId(30);
@@ -504,9 +478,7 @@ fn a_meter_is_a_level_bar_and_a_grid_a_table() {
     );
 }
 
-/// A window holding a button and, after it, a list box of two options: ON
-/// selected, OFF not, over the button where the list would scroll it to,
-/// marked off screen when `offscreen`.
+/// Build a window fixture with a button and a two-option list box whose second option may be offscreen.
 fn list_fixture(offscreen: bool) -> TreeUpdate {
     const LIST: LocalId = LocalId(20);
     let mut window = Node::new(Role::Window);
@@ -547,11 +519,7 @@ fn list_fixture(offscreen: bool) -> TreeUpdate {
     }
 }
 
-/// An option its list holds off screen is in the tree, visible and
-/// selectable but not showing, and owns no point: the button drawn where
-/// its bounds lie answers there. The list's Selection counts its options:
-/// child 0 is selected, child 1 is not and can be. Negative control: the
-/// same option on screen answers its point and shows.
+/// An offscreen list option remains visible and selectable in the tree without `Showing` or hit-testing.
 #[test]
 fn an_offscreen_option_is_listed_not_showing_and_owns_no_point() {
     const LIST: LocalId = LocalId(20);
@@ -619,7 +587,6 @@ fn unknown_objects_interfaces_and_members_answer_as_zbus_did() {
             text: "Unknown interface 'org.a11y.atspi.Text'".into(),
         }
     );
-    // An ancestor of a served path exists, with only the standard interfaces.
     assert_eq!(
         s.fault("/org/a11y/atspi", ACCESSIBLE, "GetRole", vec![])
             .name,
@@ -643,7 +610,6 @@ fn a_closed_window_s_paths_are_forgotten() {
             text: format!("Unknown object '{window}'"),
         }
     );
-    // The application root stays.
     assert_eq!(
         s.ok(ROOT_PATH, ACCESSIBLE, "GetRole", vec![]),
         vec![Value::U32(75)]
@@ -702,7 +668,6 @@ fn the_actions_an_at_can_send_reach_the_window() {
         heard,
         [Action::Click, Action::Focus, Action::SetTextSelection]
     );
-    // Routine content updates retain the exported object and its held handle.
     let held = s._semantics.platform_node(node(BUTTON.0));
     let mut unchanged_owner = scoped(7);
     unchanged_owner
@@ -727,8 +692,6 @@ fn the_actions_an_at_can_send_reach_the_window() {
             .all(|(_, interfaces)| interfaces.bits() == 0)
     );
 
-    // A replaced owner retires both a retained object path and a held node.
-    // Old queued requests retain gen7; an old path cannot acquire gen8.
     s.recorder.events.lock().unwrap().clear();
     s._semantics.update(scoped(8));
     for (node, interfaces) in s.recorder.registered.lock().unwrap().drain(..) {
@@ -805,7 +768,6 @@ fn the_actions_an_at_can_send_reach_the_window() {
         );
     }
 
-    // Removal/reinsertion also retires an object, even with unchanged owner context.
     let mut absent = scoped(8);
     absent.nodes.retain(|(id, _)| *id != BUTTON);
     absent
@@ -839,8 +801,6 @@ fn the_actions_an_at_can_send_reach_the_window() {
     assert_eq!(s.actions.requests.lock().unwrap().len(), 6);
 }
 
-// --- zbus's bytes ---------------------------------------------------------
-
 fn recorded(name: &str) -> Vec<u8> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -859,7 +819,7 @@ fn recorded(name: &str) -> Vec<u8> {
         .collect()
 }
 
-/// `msg` as the recorder built its twin: at `path`, with `serial`.
+/// Encode `msg` at `path` with `serial`.
 fn bytes(mut msg: Message, path: &str, serial: u32) -> Vec<u8> {
     msg.path = Some(aterm_dbus::ObjectPath::new(path).unwrap());
     msg.serial = serial;
@@ -894,7 +854,6 @@ fn events_are_zbus_s_bytes() {
         },
     );
     assert_eq!(bytes(text, path, 8), recorded("text_changed"));
-    // The negative control: one field off and the bytes differ.
     let off = events::object_event(
         ME,
         0,
@@ -906,8 +865,6 @@ fn events_are_zbus_s_bytes() {
 
 #[test]
 fn a_cache_addition_is_zbus_s_flattened_body() {
-    // The recorder's terminal item: a Button-role (43) node with Accessible
-    // and Text, two children, described "Terminal", Active | Horizontal.
     let item = CacheNode {
         adapter_id: 0,
         id: node(7),
@@ -921,7 +878,6 @@ fn a_cache_addition_is_zbus_s_flattened_body() {
         states: State::Active | State::Horizontal,
     };
     let mut add = events::cache_add(ME, item);
-    // The recorder named the node by a short path; the rest is the item's.
     add.body[0] = Value::Struct(vec![
         ME.into(),
         Value::path("/org/a11y/atspi/accessible/7").unwrap(),
@@ -931,8 +887,6 @@ fn a_cache_addition_is_zbus_s_flattened_body() {
         bytes(add.clone(), wire::CACHE_PATH, 9),
         recorded("cache_add")
     );
-    // The negative control: the item as the one struct argument the AT-SPI
-    // specification names is not what zbus sent.
     let mut one = add.clone();
     one.body = vec![Value::Struct(add.body)];
     assert_ne!(bytes(one, wire::CACHE_PATH, 9), recorded("cache_add"));
@@ -951,7 +905,6 @@ fn the_embed_call_and_an_unknown_object_are_zbus_s_bytes() {
     embed.serial = 6;
     assert_eq!(embed.encode().unwrap(), recorded("embed"));
 
-    // The recorder's AT asked an application with no such node.
     let call = Message::decode(&recorded("get_role")).unwrap();
     let app = AppContext::new(None);
     let mut objects = Objects::new(ME, PlatformRoot::new(&app));
@@ -961,8 +914,6 @@ fn the_embed_call_and_an_unknown_object_are_zbus_s_bytes() {
     error.serial = 11;
     assert_eq!(error.encode().unwrap(), recorded("get_role_error"));
 }
-
-// --- a whole session over scripted buses -----------------------------------
 
 fn line(s: &mut CtlStream) -> Vec<u8> {
     let mut out = Vec::new();
@@ -974,9 +925,7 @@ fn line(s: &mut CtlStream) -> Vec<u8> {
     out
 }
 
-/// The bus's side of one connection, which the test plays: the bus itself
-/// (`Hello`, `AddMatch`, at-spi2-core's and the registry's answers) and the
-/// assistive technology calling the publisher.
+/// Bus-side connection peer simulating the bus daemon and assistive technology.
 struct Peer {
     stream: CtlStream,
     buf: Vec<u8>,
@@ -985,8 +934,7 @@ struct Peer {
 }
 
 impl Peer {
-    /// Runs the server half of the handshake on another thread, naming the
-    /// client `unique`.
+    /// Run the server half of the handshake on another thread, assigning `unique`.
     fn accept(mut stream: CtlStream, unique: &'static str) -> std::thread::JoinHandle<Peer> {
         std::thread::spawn(move || {
             stream.set_read_timeout(Some(HANG)).unwrap();
@@ -1008,7 +956,7 @@ impl Peer {
         })
     }
 
-    /// The next message the publisher wrote; `None` once it hung up.
+    /// Read the next message from the publisher, or `None` on EOF.
     fn try_read(&mut self) -> Option<Message> {
         loop {
             if let Some(n) = message::frame_len(&self.buf).unwrap()
@@ -1053,7 +1001,7 @@ impl Peer {
         msg
     }
 
-    /// The next signal named `member`, past any other.
+    /// Return the next signal named `member`, skipping other messages.
     fn expect_signal(&mut self, member: &str) -> Message {
         loop {
             let msg = self.next();
@@ -1063,8 +1011,7 @@ impl Peer {
         }
     }
 
-    /// The AT calls the publisher and waits for the answer; signals that
-    /// arrive first are held for [`Peer::expect_signal`].
+    /// Send a method call from the AT and wait for the reply, queuing intervening signals.
     fn ask(
         &mut self,
         to: &str,
@@ -1094,12 +1041,9 @@ struct TestBuses {
     session: Option<CtlStream>,
     accessibility: VecDeque<CtlStream>,
     opened: Sender<String>,
-    /// How many `open`s fail, as a bus that is not there yet fails, before
-    /// the queue's buses are handed out.
+    /// Number of initial `open` calls that fail with `NotFound`.
     refuse: usize,
-    /// [`Buses::write_timeout`]'s answer.
     write_timeout: Option<Duration>,
-    /// [`Buses::rejoin_first`]'s answer.
     rejoin_first: Duration,
 }
 
@@ -1176,7 +1120,7 @@ impl DeactivationHandler for Window {
     }
 }
 
-/// Every log line, for the lines the publisher must write.
+/// Captured log lines written by the publisher.
 struct Captured {
     lines: Mutex<Vec<String>>,
 }
@@ -1209,7 +1153,7 @@ fn heard(rx: &Receiver<Heard>) -> Heard {
     rx.recv_timeout(HANG).expect("the window heard nothing")
 }
 
-/// The session bus's opening, through to the accessibility bus's address.
+/// Complete the session bus opening handshake and status query.
 fn open_session(session: &mut Peer, enabled: bool) {
     let rule = session.expect_call("AddMatch");
     assert_eq!(rule.body, vec![Value::from(proxies::STATUS_RULE)]);
@@ -1234,7 +1178,7 @@ fn answer_status(session: &mut Peer, enabled: bool) {
     }
 }
 
-/// The registry's side of `Embed`.
+/// Answer the registry's `Embed` call on `bus`.
 fn embedded(bus: &mut Peer, me: &str) {
     let embed = bus.expect_call("Embed");
     assert_eq!(
@@ -1245,7 +1189,7 @@ fn embedded(bus: &mut Peer, me: &str) {
     bus.answer(&embed, vec![wire::object_ref(":1.3", ObjectId::Root)]);
 }
 
-/// at-spi2-core's announcement that `IsEnabled` is now `enabled`.
+/// Build an `IsEnabled` `PropertiesChanged` signal from `at-spi2-core`.
 fn status_changed(enabled: bool) -> Message {
     let mut changed = Message::signal("/org/a11y/bus", serve::PROPERTIES, "PropertiesChanged")
         .unwrap()
@@ -1302,7 +1246,6 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     adapter.update_window_focus_state(true);
     adapter.update_if_active(|| fixture("hi\n"));
 
-    // The window arrives under the root, and the AT walks to it.
     let added = bus.expect_signal("ChildrenChanged");
     assert_eq!(added.path.as_ref().unwrap().as_str(), ROOT_PATH);
     assert_eq!(added.body[0], Value::from("add"));
@@ -1336,7 +1279,6 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     );
     assert_eq!(text.body, vec![Value::from("lane$ echo hi\nhi\n")]);
 
-    // A change is an event; an action is the window's.
     adapter.update_if_active(|| fixture("hi there\n"));
     let changed = bus.expect_signal("TextChanged");
     assert_eq!(changed.path.as_ref().unwrap().as_str(), terminal);
@@ -1350,8 +1292,6 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     assert_eq!(grab.body, vec![Value::Bool(true)]);
     assert_eq!(heard(&window_heard), Heard::Action(Action::Focus));
 
-    // The accessibility bus dies: logged, the window told, no panic; the
-    // publisher asks at-spi2-core again and rejoins the bus it now names.
     drop(bus);
     assert_eq!(heard(&window_heard), Heard::Deactivated);
     answer_status(&mut session, true);
@@ -1371,14 +1311,11 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     let children = bus.ask(":1.21", ROOT_PATH, ACCESSIBLE, "GetChildren", vec![]);
     assert_eq!(child_path(&children), window);
 
-    // Assistive technologies turned off: the publisher leaves the bus.
     session.write(status_changed(false));
     answer_status(&mut session, false);
     assert_eq!(heard(&window_heard), Heard::Deactivated);
     while bus.try_read().is_some() {}
 
-    // The session bus dies: the publisher ends, quietly, and a window made
-    // afterwards is simply never activated.
     drop(session);
     let late = publisher.adapter(
         Window(mpsc::channel().0),
@@ -1390,7 +1327,7 @@ fn a_session_survives_losing_the_bus_and_rejoins() {
     drop(publisher);
 }
 
-/// The events that show an AT a window and where its focus is.
+/// Signal members announcing a window and its focus to an AT.
 const ANNOUNCING: [&str; 4] = [
     "ChildrenChanged",
     "Activate",
@@ -1398,9 +1335,7 @@ const ANNOUNCING: [&str; 4] = [
     "ActiveDescendantChanged",
 ];
 
-/// What an AT on the bus hears of a window's first tree and its focus, up to
-/// the focus itself, when the window had the keyboard focus before its tree
-/// (`focus_first`) or after it: each event's member and kind.
+/// Record `(member, kind)` announcing signals through initial focus when focused before or after the first tree.
 fn first_announcement(focus_first: bool) -> Vec<(String, String)> {
     let _log = captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
@@ -1450,10 +1385,7 @@ fn first_announcement(focus_first: bool) -> Vec<(String, String)> {
     heard_events
 }
 
-/// A window focused before its first tree reached the bus is announced as one
-/// focused after it: activated, then its focus. Orca names a window only
-/// when it hears it activated (the Linux lane's Orca row, x86_64, 2026-10-19,
-/// heard the terminal's text and no frame).
+/// A window focused before its first tree reaches the bus announces activation before focus, matching post-tree focus.
 #[test]
 fn a_window_focused_before_its_tree_is_announced_activated() {
     let event = |member: &str, kind: &str| (member.to_owned(), kind.to_owned());
@@ -1468,23 +1400,17 @@ fn a_window_focused_before_its_tree_is_announced_activated() {
     assert_eq!(first_announcement(true), announced, "focus before the tree");
 }
 
-// --- a tree on its way when the bus dies ------------------------------------
-
-/// What the window had sent the publisher thread, still unread, when the
-/// first accessibility bus died.
+/// Update queued behind a status re-check when the first accessibility bus dies.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Queued {
-    /// Nothing: the negative control, whose loss the poll finds.
     Nothing,
-    /// Its whole first tree.
     FirstTree,
-    /// An update adding a node to a tree already published.
     NewNode,
 }
 
 const EXTRA: LocalId = LocalId(5);
 
-/// [`fixture`] with one more button, `EXTRA`.
+/// Return [`fixture`] with an extra button `EXTRA`.
 fn with_extra() -> TreeUpdate {
     let mut update = fixture("hi\n");
     let mut button = Node::new(Role::Button);
@@ -1495,9 +1421,7 @@ fn with_extra() -> TreeUpdate {
     update
 }
 
-/// What the AT met on the second bus, once the window had published its
-/// tree there: every signal before its last answer, the terminal's text,
-/// and `EXTRA`'s role.
+/// Signals and replies observed on the second bus after rejoining.
 struct Rejoined {
     signals: Vec<Message>,
     text: Message,
@@ -1505,10 +1429,7 @@ struct Rejoined {
     extra_path: String,
 }
 
-/// A session whose first accessibility bus dies with `queued` behind a
-/// status re-check the publisher thread is parked in, so that the thread
-/// finds the loss, and rejoins the second bus, with the old tree's
-/// registrations and events still to read.
+/// Drop the first accessibility bus with `queued` pending, rejoin the second bus, and walk the republished tree.
 fn rejoin_after_a_loss(queued: Queued) -> Rejoined {
     let _log = captured();
     let (session_client, session_bus) = CtlStream::pair().unwrap();
@@ -1534,9 +1455,6 @@ fn rejoin_after_a_loss(queued: Queued) -> Rejoined {
         bus.expect_signal("ChildrenChanged");
     }
 
-    // Park the thread in a status re-check, queue the update behind it,
-    // kill the bus, and let the thread go: it reads the queue, finds the
-    // bus gone, and asks at-spi2-core again.
     session.write(status_changed(true));
     let get = session.expect_call("Get");
     match queued {
@@ -1552,7 +1470,6 @@ fn rejoin_after_a_loss(queued: Queued) -> Rejoined {
     embedded(&mut bus, ":1.21");
     assert_eq!(heard(&window_heard), Heard::Activated);
 
-    // The window's tree as it now stands, then the AT's walk.
     let current = if queued == Queued::NewNode {
         with_extra()
     } else {
@@ -1604,8 +1521,7 @@ fn rejoin_after_a_loss(queued: Queued) -> Rejoined {
     }
 }
 
-/// The second bus carried only the live tree's arrival under the root: no
-/// event of the tree the first bus took with it.
+/// Assert the second bus received only the live tree's `ChildrenChanged` addition at the root.
 fn only_the_live_tree_arrived(r: &Rejoined) {
     let at_root: Vec<_> = r
         .signals
@@ -1637,8 +1553,6 @@ fn extra_is_unknown(r: &Rejoined) {
 
 #[test]
 fn a_rejoin_with_nothing_queued_serves_the_live_tree() {
-    // The negative control: the same walk, with no tree of the first bus
-    // left to read.
     let r = rejoin_after_a_loss(Queued::Nothing);
     the_terminal_reads(&r);
     extra_is_unknown(&r);
@@ -1661,16 +1575,10 @@ fn a_node_queued_when_the_bus_dies_is_served_live_on_the_next() {
     only_the_live_tree_arrived(&r);
 }
 
-// --- a bus that stops reading -------------------------------------------------
-
-/// How long a write may wait here for a bus that stopped reading. The bus
-/// reads nothing at all, so the bound under test is the publisher's, never
-/// the machine's speed.
+/// Write timeout used when testing a bus that stops reading.
 const STALL: Duration = Duration::from_millis(100);
 
-/// Updates the window's text one line at a time until `until` says the
-/// window heard what it waits for, or `count` updates are sent when it
-/// waits for nothing (`until` is `None`).
+/// Push text updates until `window_heard` receives `until`, or `count` updates when `until` is `None`.
 fn keep_changing(
     adapter: &mut super::Adapter,
     window_heard: &Receiver<Heard>,
@@ -1698,11 +1606,7 @@ fn keep_changing(
     }
 }
 
-/// A session over accessibility buses whose writes wait `write_timeout`;
-/// the first bus is joined, and the window's tree published there. With a
-/// deadline there is a second bus to rejoin (`second`); without one the
-/// publisher never leaves the first, and no second bus waits on a join that
-/// never comes.
+/// Session fixture over accessibility buses configured with `write_timeout`.
 struct Stalling {
     publisher: Publisher,
     adapter: super::Adapter,
@@ -1756,8 +1660,6 @@ fn stalling(write_timeout: Option<Duration>) -> Stalling {
 fn a_bus_that_stops_reading_is_left_and_the_next_one_joined() {
     let log = captured();
     let mut s = stalling(Some(STALL));
-    // The first bus reads nothing more while the text keeps changing: its
-    // socket fills, a write waits out its bound, and the window is told.
     keep_changing(&mut s.adapter, &s.window_heard, Some(Heard::Deactivated), 0);
     assert!(
         log.lines
@@ -1767,7 +1669,6 @@ fn a_bus_that_stops_reading_is_left_and_the_next_one_joined() {
             .any(|l| l.contains("the AT-SPI bus stopped reading")),
         "the stall is logged"
     );
-    // The publisher asks at-spi2-core again and joins the bus it names.
     answer_status(&mut s.session, true);
     let mut bus = s.second.take().expect("a second bus").join().unwrap();
     embedded(&mut bus, ":1.21");
@@ -1801,10 +1702,6 @@ fn a_bus_that_stops_reading_is_left_and_the_next_one_joined() {
 
 #[test]
 fn without_a_write_deadline_a_bus_that_stops_reading_holds_the_publisher() {
-    // The negative control: the same bus, with writes that wait for as long
-    // as the bus does. Ten times the bound above passes and the window is
-    // still not told; once the bus reads again, every change it held
-    // arrives, and the window was never let go.
     const CHANGES: usize = 2000;
     let mut s = stalling(None);
     keep_changing(&mut s.adapter, &s.window_heard, None, CHANGES);
@@ -1850,10 +1747,8 @@ fn a_join_that_fails_is_tried_again() {
     let (tx, window_heard) = mpsc::channel();
     let adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
     let mut session = session_peer.join().unwrap();
-    // The first join fails, and nothing on the session bus changes after it.
     open_session(&mut session, true);
     opened.recv_timeout(HANG).unwrap();
-    // A second later the publisher asks again, unprompted, and joins.
     answer_status(&mut session, true);
     opened.recv_timeout(HANG).unwrap();
     let mut bus = bus_peer.join().unwrap();
@@ -1871,11 +1766,7 @@ fn a_join_that_fails_is_tried_again() {
     drop(publisher);
 }
 
-/// A status read that fails while the publisher waits to rejoin (at-spi2-core
-/// busy, or answering an error) keeps the wait going, longer, instead of
-/// ending the attempts until the next status signal. The schedule starts at
-/// 100 ms here, not [`super::publisher::REJOIN_FIRST`]: the order of the
-/// attempts is the claim, and the real 1 s and 2 s were this test's 3 s.
+/// A failed status read during rejoin backoff extends the backoff rather than stopping retries.
 #[test]
 fn a_status_unanswered_during_the_backoff_keeps_it() {
     let (session_client, session_bus) = CtlStream::pair().unwrap();
@@ -1894,8 +1785,6 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
     let (tx, window_heard) = mpsc::channel();
     let adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
     let mut session = session_peer.join().unwrap();
-    // The first join fails; its first wait later the status read that would
-    // retry it is answered with an error.
     open_session(&mut session, true);
     opened.recv_timeout(HANG).unwrap();
     let get = session.expect_call("Get");
@@ -1907,7 +1796,6 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
     .unwrap();
     failed.sender = Some("org.freedesktop.DBus".into());
     session.write(failed);
-    // Twice that wait later, unprompted, the publisher asks again and joins.
     answer_status(&mut session, true);
     opened.recv_timeout(HANG).unwrap();
     let mut bus = bus_peer.join().unwrap();
@@ -1917,10 +1805,7 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
     drop(publisher);
 }
 
-/// The desktop's join of the accessibility bus gives up on a daemon that
-/// never answers its handshake (a frozen one's listener still takes the
-/// connection into its backlog) within its own bound ([`super::WRITE`] on the
-/// desktop, 100 ms here), not aterm-dbus's 25 s handshake default.
+/// `SessionBuses::joining_within` times out within its own bound when a bus listener accepts without answering.
 #[test]
 fn the_desktop_s_join_gives_up_on_a_silent_bus_within_its_bound() {
     let path = std::env::temp_dir().join(format!("aterm-a11y-frozen-{}", std::process::id()));
@@ -1935,7 +1820,6 @@ fn the_desktop_s_join_gives_up_on_a_silent_bus_within_its_bound() {
         "{:?}",
         joined.err()
     );
-    // The two bounds compared, not the machine's speed.
     assert!(
         waited < aterm_dbus::conn::HANDSHAKE_TIMEOUT,
         "the join gave up after {waited:?}, the handshake default's, not its own bound"

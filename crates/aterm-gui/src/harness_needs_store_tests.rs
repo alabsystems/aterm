@@ -122,6 +122,7 @@ impl Desk {
         let fact_tx = Mutex::new(fact_tx);
         let mine = sid;
         h.fact = Arc::new(move |sid, fact| {
+            // The needs fact alone: a run's end also tells `Task(None)` and
             // `Pause(None)`, which other tests read.
             if sid == mine && fact == crate::HarnessFact::Needs {
                 let _ = fact_tx.lock().unwrap().send(fact);

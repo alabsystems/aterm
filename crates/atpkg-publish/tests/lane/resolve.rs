@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A pinned build number back to its commit, on real git graphs: the first-parent binary
-//! search, the merge-bracket scan, and the refusals.
+//! Build-number-to-commit resolution tests over git graphs.
 
 use std::path::{Path, PathBuf};
 
@@ -35,8 +34,7 @@ fn a_build_on_the_first_parent_chain_is_found_by_binary_search() {
     }
 }
 
-/// main: A(1) B(2) C(3) M(7), where M merges a side branch S1(2) S2(3) S3(4) off A. The
-/// first-parent chain counts 7, 3, 2, 1: a count of 4 exists only inside the merge.
+/// main: A(1) B(2) C(3) M(7), where M merges a side branch S1(2) S2(3) S3(4) off A.
 fn merged(at: &Path) -> (PathBuf, String) {
     let origin = at.join("origin");
     repo(&origin, 0);

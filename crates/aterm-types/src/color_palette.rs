@@ -139,6 +139,7 @@ impl ColorPalette {
     #[inline]
     #[must_use]
     pub const fn get(&self, index: u8) -> Rgb {
+        // `as usize`, not `usize::from`: Trust cannot see into the trait call and leaves the
         // bounds obligation unproved, while the primitive cast proves it.
         self.cache[index as usize]
     }
@@ -154,6 +155,7 @@ impl ColorPalette {
                 self.overrides.swap_remove(p);
             }
         } else if let Some(p) = pos {
+            // `p` came from `position` on this vec; the total `get_mut` shows the Trust gate
             // it is in bounds.
             if let Some(slot) = self.overrides.get_mut(p) {
                 slot.1 = color;

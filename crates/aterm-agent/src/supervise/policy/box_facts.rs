@@ -162,7 +162,7 @@ impl ApprovalCtx {
     }
 }
 
-/// The facts as a mark holds them: every field optional ([module docs](self)).
+/// The facts as a mark holds them: every field optional.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Wire {

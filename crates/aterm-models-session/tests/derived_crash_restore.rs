@@ -7,7 +7,6 @@ use aterm_models_session::crash_restore_journal_model;
 use aterm_spec::interp;
 use aterm_spec::walk::{only, walk};
 
-/// Every action, so a guard tightened by mistake shows up as a dead action, not a quieter proof.
 const ACTIONS: [&str; 16] = [
     "Gather",
     "Slice",
@@ -39,7 +38,6 @@ fn crash_restore_journal_fires_every_committed_move() {
     }
 }
 
-/// Each defect breaks the invariant written for it, alone: the plan's mutant table.
 #[test]
 fn crash_restore_journal_each_defect_breaks_its_own_invariant() {
     let model = crash_restore_journal_model();
@@ -64,9 +62,6 @@ fn crash_restore_journal_each_defect_breaks_its_own_invariant() {
     }
 }
 
-/// The plan's hand-traced counterexamples, one per defect, walked on the mutant: each ends in
-/// the state its invariant forbids, and the same walk on the committed machine either cannot be
-/// taken or ends in a state that keeps the invariant.
 #[test]
 fn crash_restore_journal_the_traced_counterexamples_end_where_the_plan_says() {
     let model = crash_restore_journal_model();
@@ -145,9 +140,6 @@ fn crash_restore_journal_the_traced_counterexamples_end_where_the_plan_says() {
     }
 }
 
-/// The ends a restore meets: an idle session comes back exactly, output gathered but not
-/// processed is never called exact, a keyframe older than the floor restores alone, a poisoned
-/// tail is retried once without it, and a poisoned keyframe falls to the META rung.
 #[test]
 fn crash_restore_journal_walks_the_ends_a_restore_meets() {
     let m = crash_restore_journal_model();

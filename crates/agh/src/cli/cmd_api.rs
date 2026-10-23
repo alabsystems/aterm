@@ -17,7 +17,6 @@ use crate::policy::{ExplicitTarget, Named, RouteRequest, RouteTarget, Router};
 use crate::slug::Slug;
 use crate::wire::{Method, Origin};
 
-/// `-X`, ASCII case-insensitive: GET (the default) or HEAD.
 fn method(inv: &Invocation) -> Result<Method> {
     let text = inv.flag("--method").unwrap_or("GET").to_ascii_uppercase();
     match text.as_str() {
@@ -31,14 +30,10 @@ fn method(inv: &Invocation) -> Result<Method> {
 }
 
 // Treat `+` as space before percent-decoding.
-/// One query key or value as GitHub reads it: `+` is a space (gh sends a typed query
-/// verbatim, so `q=tetris+language:assembly` searches two terms), then percent-decoded.
-/// `path::query` encodes the space as `%20` and a typed `%2B` as `%2B` again.
 fn query_text(text: &str) -> String {
     aterm_codec::pct::decode(&text.replace('+', " "))
 }
 
-/// The path as sent (the api origin stripped, a leading `/`) and its query's pairs, decoded.
 fn path_and_query(
     inv: &Invocation,
     typed: &str,
@@ -83,7 +78,6 @@ fn path_and_query(
     Ok((path, pairs))
 }
 
-/// `-f k=v` and `-F k=v`, in the order given: each a query pair.
 fn fields(inv: &Invocation) -> Result<Vec<(String, String)>> {
     let mut pairs = Vec::new();
     for (name, value) in &inv.flags {
@@ -104,9 +98,6 @@ fn fields(inv: &Invocation) -> Result<Vec<(String, String)>> {
     Ok(pairs)
 }
 
-/// What the path is about, and how it was named. The segments are judged percent-decoded,
-/// as GitHub reads them, so `/repos/fixture%2Ddev/app` routes as `fixture-dev/app`. A
-/// `/repositories/{id}` path also hands back its id, which `api` holds to `-R`'s.
 fn target(
     inv: &Invocation,
     path: &str,
@@ -157,10 +148,6 @@ fn target(
 }
 
 // Verify that `/repositories/{id}` matches the `-R` repository's id.
-/// A `/repositories/{id}` path is routed as `-R`'s repository, so the id must be that
-/// repository's: otherwise a profile `-R` routes could be sent to read any repository, of any
-/// tier. `-R`'s id is read once (`Github::repo_id`'s memo, at most one request). The requests
-/// it sent.
 fn hold_id_to_repo(
     inv: &Invocation,
     gh: &crate::client::Github,
@@ -184,7 +171,6 @@ fn hold_id_to_repo(
     Ok(requests)
 }
 
-/// `--include`'s headers: each name lowercased, repeats joined by `, `.
 fn headers_value(headers: &[(String, String)]) -> Value {
     let mut joined = Map::new();
     for (name, value) in headers {

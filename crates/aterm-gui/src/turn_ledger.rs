@@ -62,7 +62,7 @@ pub(crate) enum TurnBy {
 impl TurnBy {
     /// The stable wire word (`harness|ctl|bridge|<sid>|-`).
     #[must_use]
-    pub(crate) fn as_wire(&self) -> &str {
+    pub(crate) const fn as_wire(&self) -> &str {
         match self {
             TurnBy::Harness => "harness",
             TurnBy::Ctl => "ctl",
@@ -257,7 +257,7 @@ impl TurnLedger {
     }
 
     /// The text the window harness typed and has not submitted, taken: by the next write that reaches the session, which submits it or leaves it to no record, and by the end of the hand it was typed under.
-    pub(crate) fn take_typed(&mut self) -> Option<Typed> {
+    pub(crate) const fn take_typed(&mut self) -> Option<Typed> {
         self.typed.take()
     }
 

@@ -317,6 +317,15 @@ pub fn max_level() -> LevelFilter {
 }
 
 /// Log at the error level.
+///
+/// ```
+/// // Never called: a disabled callsite evaluates nothing, here or upstream.
+/// #[allow(dead_code)]
+/// fn never_called() -> u32 { unreachable!() }
+///
+/// log::error!("Root index {} is not bound", never_called());
+/// log::error!(target: "sctk", "unknown decoration mode 0x{:x}", never_called());
+/// ```
 #[macro_export]
 macro_rules! error {
     ($($discarded:tt)*) => {{}};
@@ -347,12 +356,24 @@ macro_rules! trace {
 }
 
 /// Log at a runtime-chosen [`Level`].
+///
+/// ```
+/// use log::{log, Level};
+///
+/// let level = Level::Warn;
+/// assert_eq!(level, Level::Warn);
+/// log!(level, "EGL '{}' code 0x{:x}", "eglInitialize", 0x3001);
+/// ```
 #[macro_export]
 macro_rules! log {
     ($($discarded:tt)*) => {{}};
 }
 
 /// Whether a callsite at the given [`Level`] would emit.
+///
+/// ```
+/// assert!(!log::log_enabled!(log::Level::Debug));
+/// ```
 #[macro_export]
 macro_rules! log_enabled {
     ($($discarded:tt)*) => {

@@ -698,6 +698,7 @@ fn typed_ab(p: &mut Predictor, start: Start) -> Instant {
         at += p.glitch_window_for_test() + Duration::from_millis(1);
     }
     if start.scrolled {
+        // The Enter's output scrolled the screen: the frame it drew, before
         // the next prompt's first key, reads `G`.
         reconcile(p, "", 0, at);
     }

@@ -317,7 +317,6 @@ pub(crate) fn kept_body(kept: &str) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct OutcomeWatch {
     /// The outcome last reported; `None` before the first pass.
-    /// The outcome last reported; `None` before the first pass.
     last: Option<String>,
 }
 

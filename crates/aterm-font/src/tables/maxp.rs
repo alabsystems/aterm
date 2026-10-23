@@ -5,14 +5,13 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Maximum Profile Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/maxp) implementation.
+//! Maximum Profile Table (`maxp`) implementation.
 
 use core::num::NonZeroU16;
 
 use crate::parser::Stream;
 
-/// A [Maximum Profile Table](https://docs.microsoft.com/en-us/typography/opentype/spec/maxp).
+/// A Maximum Profile Table (`maxp`).
 #[derive(Clone, Copy, Debug)]
 pub struct Table {
     /// The total number of glyphs in the face.

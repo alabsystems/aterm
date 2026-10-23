@@ -8,7 +8,6 @@ use aterm_grapheme::{
     str_grid_columns,
 };
 
-/// The code points `emoji-data.txt` gives `property`.
 fn property(property: &str) -> Vec<bool> {
     let data = include_str!("data/emoji-data-16.0.0.txt");
     let mut set = vec![false; 0x11_0000];
@@ -36,7 +35,6 @@ fn scalars() -> impl Iterator<Item = char> {
     (0..=0x10_FFFF).filter_map(char::from_u32)
 }
 
-/// `ours` answers exactly `ucd` for every scalar value.
 fn agrees(name: &str, ours: fn(char) -> bool, ucd: impl Fn(usize) -> bool) {
     let (missing, extra): (Vec<char>, Vec<char>) = scalars()
         .filter(|&c| ours(c) != ucd(c as usize))
@@ -69,9 +67,6 @@ fn the_emoji_tables_are_the_ucds() {
     });
 }
 
-/// `grapheme_display_width` and the grid agree on what VS16 does to any
-/// printing character: it widens a narrow text-default emoji (`⬆️` is two
-/// cells) and nothing else (`a️`, `✓️` stay one).
 #[test]
 fn a_base_and_vs16_are_as_wide_as_the_grid_draws_them() {
     let disagree: Vec<(char, usize, usize)> = scalars()

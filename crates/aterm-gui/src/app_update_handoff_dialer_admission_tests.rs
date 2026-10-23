@@ -329,6 +329,7 @@ fn through_the_gate(claim_is_right: bool, code: &DialerCode) -> (bool, usize) {
         Err(error) if held_for_trustd(error) => trustd_silent(error),
         Err(RendezvousError::Cancelled) => {
             // The stand-in has exited: its own failure is named with its output before any
+            // refusal is judged the gate's.
             let received = received_by(running);
             if claim_is_right {
                 assert!(

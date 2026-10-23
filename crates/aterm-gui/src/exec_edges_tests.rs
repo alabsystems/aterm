@@ -14,9 +14,7 @@ use super::ExecEdges;
 use crate::foreground_handback::FgCutter;
 use crate::holder_image::{EdgeKind, HolderImage};
 
-/// Each group's image as the next read finds it.
 static IMAGES: Mutex<Option<HashMap<i32, HolderImage>>> = Mutex::new(None);
-/// Each group's reads so far: the last image each was given to keep.
 static READS: Mutex<Option<HashMap<i32, Vec<Option<HolderImage>>>>> = Mutex::new(None);
 
 fn scripted_read(pgid: i32, last: Option<&HolderImage>) -> HolderImage {
@@ -35,7 +33,6 @@ fn scripted_read(pgid: i32, last: Option<&HolderImage>) -> HolderImage {
         .unwrap_or_else(|| HolderImage::unread(pgid))
 }
 
-/// The last image each read of `pgid` so far was given.
 fn reads_of(pgid: i32) -> Vec<Option<HolderImage>> {
     READS
         .lock()
@@ -97,8 +94,6 @@ fn launcher(pgid: i32) -> HolderImage {
     )
 }
 
-/// A gather's half on a scripted watch of `shell`, its cutter seeded with
-/// `seed`, the held image known as `held` (as after a first edge).
 fn rig(shell_pid: i32, seed: i32, held: HolderImage) -> (ExecEdges, ProcScript, FgCutter) {
     let (watch, script) = ProcWatch::scripted(shell_pid).expect("pipe");
     let mut x = ExecEdges::new(watch, scripted_read, seed);
@@ -115,10 +110,6 @@ fn exec(pid: i32, late: bool) -> ProcEvent {
     }
 }
 
-/// A launch typed at a prompt: the job's `exec` of atpkg's shim is a Group
-/// edge read at the event, then the shim's `exec` of the store build an Exec
-/// edge cut at the last clean poll; a `/usr/bin/true` in the same place
-/// folds, and so does a member's `exec`.
 #[test]
 fn a_drawer_launch_is_cut_at_each_exec_and_a_tool_folds() {
     const SH: i32 = 51_000;
@@ -163,8 +154,6 @@ fn a_drawer_launch_is_cut_at_each_exec_and_a_tool_folds() {
     assert!(c.take_edge().is_none());
 }
 
-/// A late `exec` (found done at registration) is an edge only where its image
-/// differs from the one held: a sampled edge may already have read it.
 #[test]
 fn a_late_exec_that_restates_the_held_image_folds() {
     const SH: i32 = 52_000;
@@ -183,8 +172,6 @@ fn a_late_exec_that_restates_the_held_image_folds() {
     assert!(c.take_edge().is_some());
 }
 
-/// An `exec` heard while the batch already carries its edge waits, and goes
-/// out after the batch as a byte-free edge of its own.
 #[test]
 fn an_exec_heard_after_the_batch_edge_waits_for_a_byte_free_one() {
     const SH: i32 = 53_000;
@@ -209,9 +196,6 @@ fn an_exec_heard_after_the_batch_edge_waits_for_a_byte_free_one() {
     assert!(!x.has_deferred());
 }
 
-/// A sampled edge watches its new leader, then hears what is queued: that
-/// leader's `exec` is the edge's own (its run begins at the batch's end);
-/// anything else waits for after the batch.
 #[test]
 fn a_sampled_edge_absorbs_its_leaders_exec() {
     const SH: i32 = 54_000;
@@ -228,8 +212,6 @@ fn a_sampled_edge_absorbs_its_leaders_exec() {
     assert!(x.read_edge(JOB, true).drawer.is_some());
 }
 
-/// Leaving an image this gather never read (an adopted holder) fails toward
-/// cutting: the first `exec` of its leader is an edge whatever it becomes.
 #[test]
 fn an_exec_out_of_an_unknown_image_is_an_edge() {
     const SH: i32 = 55_000;
@@ -252,8 +234,6 @@ fn an_exec_out_of_an_unknown_image_is_an_edge() {
     assert!(!x.heard(&mut c, || JOB, 0));
 }
 
-/// `tcgetpgrp` is read once for a drain that holds an `exec`, and not at all
-/// for one that holds only forks and exits: most of a fork loop's wakes.
 #[test]
 fn a_drain_reads_the_foreground_once_and_only_for_an_exec() {
     const SH: i32 = 56_000;
@@ -284,10 +264,6 @@ fn a_drain_reads_the_foreground_once_and_only_for_an_exec() {
     assert_eq!(reads, 1, "two execs: one read");
 }
 
-/// THE READ AT A KERNEL EXEC IS FRESH: the kernel says the image changed, so
-/// the read keeps nothing, not even the image held for that group (a kept
-/// read cannot see atpkg's `sh` reroute stub `exec`ing its `sh` twin, the
-/// same executable and start).
 #[test]
 fn a_kernel_exec_reads_its_image_afresh() {
     const SH: i32 = 57_000;
@@ -303,10 +279,6 @@ fn a_kernel_exec_reads_its_image_afresh() {
     assert_eq!(reads_of(SH), [None, None]);
 }
 
-/// ONE READ PER COMMAND: a command whose `exec` folds hands the image read at
-/// the event to the sampled edge's read of its group, which keeps it when the
-/// leader's start and executable are unchanged; an `exec` of its leader since
-/// (heard, if not an edge) retires it, and so does one the edge absorbed.
 #[test]
 fn a_folded_exec_hands_its_image_to_the_sampled_edge() {
     const SH: i32 = 58_000;
@@ -352,10 +324,6 @@ fn a_folded_exec_hands_its_image_to_the_sampled_edge() {
     assert_eq!(reads_of(ABSORBED), [None, None]);
 }
 
-/// Every drain that holds a process event (a fork, an `exec`, an exit: a job
-/// may have started or ended) tells the stuck engine's kernel edge, from a
-/// heard batch and from an absorbing edge alike. NEGATIVE CONTROL: a drain
-/// that finds nothing tells it nothing.
 #[test]
 fn a_drain_with_a_process_event_tells_the_kernel_edge() {
     static EDGE: crate::vitals_host::ProcEdge = crate::vitals_host::ProcEdge::new();

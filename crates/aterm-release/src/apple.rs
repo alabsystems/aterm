@@ -179,6 +179,7 @@ pub(crate) fn acquire(id: &str, may_change: bool, cert_dir: Option<&Path>) -> Ou
     }
 
     if !seen.identities.is_empty() {
+        // The spent request is public and finished, so it is removed silently. The
         // private key is never touched automatically: its slot cannot be reclaimed.
         if let Some(csr) = &seen.csr
             && paired_with_installed(&seen.key, &seen.identities[0])

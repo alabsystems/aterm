@@ -55,7 +55,7 @@ pub(crate) struct SysWait {
 }
 
 /// The disk watch's level a `disk=` word names.
-fn level(word: DiskWord) -> Level {
+const fn level(word: DiskWord) -> Level {
     match word {
         DiskWord::Ok => Level::Ok,
         DiskWord::Low => Level::Low,
@@ -123,7 +123,7 @@ pub(crate) enum Decision {
 }
 
 /// THE DECISION, pure: met on a reading that holds.
-pub(crate) fn decide(f: &Facts) -> Decision {
+pub(crate) const fn decide(f: &Facts) -> Decision {
     if f.met {
         Decision::Met
     } else if f.demand && f.spent {
@@ -350,6 +350,7 @@ pub(crate) fn run(shelf: &Shelf, wait: &SysWait, who: &Who, env: &Env<'_>) -> St
     if let (Some(need), true) = (need, who.owner_class)
         && row.reading.free < need
     {
+        // No disk watch runs in this process (`[harness]` off): no pass would
         // ever adopt the demand, and none runs for one here.
         if !shelf.board_lock().watched {
             return NO_WATCH.to_owned();

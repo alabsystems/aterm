@@ -129,7 +129,7 @@ pub(crate) enum PaletteTarget {
 }
 
 impl PaletteTarget {
-    fn menu(&self) -> Option<MenuAction> {
+    const fn menu(&self) -> Option<MenuAction> {
         match self {
             Self::Menu(action) => Some(*action),
             Self::Native(_) | Self::Theme(_) => None,
@@ -411,7 +411,7 @@ impl PaletteState {
     }
 
     /// Whether the palette is scoped to the Theme section.
-    pub(crate) fn is_themes_only(&self) -> bool {
+    pub(crate) const fn is_themes_only(&self) -> bool {
         self.themes_only
     }
 
@@ -565,6 +565,7 @@ impl PaletteState {
         for row in &mut self.rows {
             let Some(action) = row.menu() else {
                 // Native enabled state is reducer-owned command metadata. It is revalidated
+                // immediately before dispatch as well as represented faithfully here.
                 continue;
             };
             row.shortcut = match live.menu_accels.iter().find(|(a, _)| *a == action) {
@@ -866,7 +867,7 @@ impl PaletteState {
         (changed, activate)
     }
 
-    pub(crate) fn pointer_over_row(&self) -> bool {
+    pub(crate) const fn pointer_over_row(&self) -> bool {
         self.pointer_over.is_some()
     }
 
@@ -1107,7 +1108,7 @@ pub(crate) fn a11y_slot_for(
 
 /// Folds a 64-bit hash into a non-`u32::MAX` accessibility epoch.
 #[cfg(a11y_tree)]
-pub(crate) fn a11y_epoch_from(hash: u64) -> u32 {
+pub(crate) const fn a11y_epoch_from(hash: u64) -> u32 {
     let epoch = hash as u32;
     if epoch == u32::MAX {
         u32::MAX - 1
@@ -1223,6 +1224,7 @@ impl PaletteState {
 /// key-equivalent.
 fn accel(mods: MenuMods, key: &str) -> String {
     // Off macOS there is no ⌘ key and the real chord differs (see `platform_accel`): blank,
+    // and `resolve` writes the true chord from `PaletteLive::menu_accels` into `shortcut`.
     if key.is_empty() || !cfg!(target_os = "macos") {
         return String::new();
     }
@@ -1592,7 +1594,7 @@ pub(crate) fn palette_tray(
 
 /// The secondary words of a list overlay: the palette's placeholder, count and
 /// section chips, and every overlay's key-hint footer.
-fn overlay_secondary_ink(r: &Roles) -> [u8; 3] {
+const fn overlay_secondary_ink(r: &Roles) -> [u8; 3] {
     if PALETTE_FLUENT {
         r.text_secondary
     } else {

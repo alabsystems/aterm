@@ -409,6 +409,7 @@ impl Session {
             self.export();
         }
         if self.term.history_fence().clear_gen != clear_gen {
+            // An ED3 or a RIS: the window learns it from the fence (the worker's reset)
             // and the next slice end forces the clear's keyframe.
             self.policy.note_clear();
         }

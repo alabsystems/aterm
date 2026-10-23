@@ -773,8 +773,10 @@ struct ColdCopy {
 /// `--pages cold`: `aterm` copied into the world (its whole bundle when it is a bundle's
 /// executable), run once with `--version`, then every page of the copy dropped from the page
 /// cache ([`crate::sys::evict_pages`]) and checked gone, so the launch pays aterm's own page-ins
-/// and nothing else.
-///
+/// and nothing else. The run is the proof the copy ran from its file: macOS scans a new file at
+/// its first exec (0.5 s for a 66 MB build, more for the universal app) and keeps the verdict,
+/// which no write or rename has voided by the launch. The dyld shared cache and the system's
+/// own files stay as warm as they were (r6 sweep #19, `docs/measured/cold-pages-2026-10-20.md`).
 /// # Errors
 /// The copy, its run or its eviction failed, or a page of it stayed resident (or it had none,
 /// which proves nothing). A copy whose run gave no proof keeps the world (removing a file
@@ -893,8 +895,9 @@ fn reveal_pending(rows: &str) -> bool {
 /// THE BAND SETTLED: no live row still in its reveal's grace, read through
 /// `messages live` (the review of the login carry, 2026-10-20: `--pre
 /// 'login-notice si' --image` waited half a second of quiet and imaged a
-/// band with no ask on it, the ask's two-second grace still running).
-///
+/// band with no ask on it, the ask's two-second grace still running). A
+/// one-minute hang detector, never a budget; an instance whose `messages`
+/// does not answer has no band to wait for.
 /// # Errors
 /// A row still pending after a minute, or the run interrupted.
 fn await_band(inst: &Instance) -> Result<(), Fail> {

@@ -38,11 +38,6 @@ fn open() -> HoldClock {
     c
 }
 
-/// THE 10-19 DAY: 24 short idle windows inside 10 h, each a new break (the loop starts a
-/// break's settle over after every read that is none), and the hold's `since` never moves, so it
-/// reaches 2 h; a point that decides nothing while the work still shows keeps it too (F5).
-/// NEGATIVE CONTROL: the same windows each ended by a decided point that finds no background work
-/// close and reopen the hold, and it never reaches 2 h — the assertion sees a restarted clock.
 #[test]
 fn short_idle_reads_never_restart_the_hold() {
     let windows = |c: &mut HoldClock, between: Option<HoldEvent>| -> i64 {
@@ -76,8 +71,6 @@ fn short_idle_reads_never_restart_the_hold() {
     );
 }
 
-/// A DECIDED POINT closes the hold where it acts or finds no background work, and keeps it where
-/// it decides nothing while the work still shows (F5).
 #[test]
 fn a_point_closes_the_hold_unless_it_decides_nothing_over_the_work() {
     for (acts, background, closes) in [
@@ -98,10 +91,6 @@ fn a_point_closes_the_hold_unless_it_decides_nothing_over_the_work() {
     }
 }
 
-/// A LIVE TURN THE HARNESS DID NOT TYPE ends the hold, at its edge; the harness's own line, its
-/// live turn and the point that ends its answer neither end it nor restart it. Only the edge is
-/// classified: a later read of the same turn is no new turn. NEGATIVE CONTROL: with a break read
-/// between, the same foreign read is an edge and closes it.
 #[test]
 fn only_a_foreign_live_edge_or_a_later_point_ends_the_hold() {
     let mut c = open();
@@ -162,9 +151,6 @@ fn only_a_foreign_live_edge_or_a_later_point_ends_the_hold() {
     );
 }
 
-/// `WAITING:` AT A LINE'S START declares the hold, read at the first break after the harness's
-/// line, and nothing of the words is kept. NEGATIVE CONTROLS: `WAITING` without its colon, a
-/// mid-line `WAITING:`, another case, and a tail read with no harness line typed declare nothing.
 #[test]
 fn a_waiting_line_declares_the_hold_and_no_words_are_kept() {
     for (tail, declares) in [
@@ -207,7 +193,6 @@ fn a_waiting_line_declares_the_hold_and_no_words_are_kept() {
     assert!(!c.declared());
 }
 
-/// A SEED carries a hold only into a clock with none open, declared as its row said.
 #[test]
 fn a_seed_opens_only_a_clock_with_no_hold() {
     let mut c = HoldClock::default();
@@ -232,12 +217,6 @@ fn row(ts: i64, sid: &str, rule: &str, reason: &str) -> String {
     )
 }
 
-/// THE LEDGER'S OPEN HOLD is the session's last `fact-hold@v1` row where it says open or
-/// declared, with its stamp and how long it had held; a close after it leaves none. Rows of
-/// another session or of another fact's rule, and a reason this build never wrote, are passed
-/// over; a row of the session's under any other rule after it marks it FOLLOWED (no last word
-/// of the loop that watched it, the red-team's F3), and a hold row after that one reads afresh.
-/// NEGATIVE CONTROL: every reason [`row_reason`] writes reads back.
 #[test]
 fn the_ledgers_open_hold_is_its_last_hold_row() {
     let rule = crate::supervise::facts::FactKind::Hold.rule();

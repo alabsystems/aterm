@@ -1,58 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Thread-local work and heap-allocation counters for `cfg(test)` regression
-//! tests (`work_count_tests.rs`, `claude_card_tests.rs`).
+//! Thread-local work and heap-allocation counters for `cfg(test)` regression tests.
 
 use std::cell::Cell;
 
 thread_local! {
-    /// Layout plans built (`App::plan_tab`).
     static PLANS_BUILT: Cell<usize> = const { Cell::new(0) };
-    /// Output stamps touched by the present walk.
     static LATENCY_STAMPS_TOUCHED: Cell<usize> = const { Cell::new(0) };
-    /// Sessions probed by the status sweep.
     static STATUS_PROBES: Cell<usize> = const { Cell::new(0) };
-    /// Clipboard workers started (`spawn::install_clipboard`).
     static CLIPBOARD_WORKERS: Cell<usize> = const { Cell::new(0) };
-    /// Tabs walked by the title-drift gate.
     static TITLE_TAB_TOUCHES: Cell<usize> = const { Cell::new(0) };
-    /// The subscribe idle wake: retained ledger records (shell blocks, turns, timeline events)
-    /// an `events` digest touched.
     static RETAINED_RECORDS_TOUCHED: Cell<usize> = const { Cell::new(0) };
-    /// Ring rows (`history`, `timeline`, `exits`) formatted into a reply.
     static RING_ROWS_FORMATTED: Cell<usize> = const { Cell::new(0) };
-    /// Styled frames gathered off a terminal (`gather_styled_frame`): one per
-    /// frame change per session, however many readers want it.
     static STYLED_FRAMES_GATHERED: Cell<usize> = const { Cell::new(0) };
-    /// Inline images base64-encoded for the wire (`image_payload_memo`): one
-    /// per image while the memo keeps it, however many frames carry it.
     static IMAGES_ENCODED: Cell<usize> = const { Cell::new(0) };
-    /// Engine samples an `events` read took (`subscribe::sample_engine_events`):
-    /// the session's term lock, held for its blocks, title, bell and resize
-    /// counters. At most one per `EVENTS_PACE` per watch under a flood, plus
-    /// one per record (`session_watch::Watchers::ring_record`).
     static ENGINE_SAMPLES: Cell<usize> = const { Cell::new(0) };
-    /// `events` reads a push pass made for an owed read come due, not for a
-    /// ring or a record of its own (`subscribe::pass_streams`): a read that
-    /// waited out the pace.
     static OWED_EVENTS_READS: Cell<usize> = const { Cell::new(0) };
-    /// Subscribe watches read by a push pass (`subscribe::frames_for_watch`):
-    /// the watches whose session rang, not every watch per wake.
     static WATCHES_VISITED: Cell<usize> = const { Cell::new(0) };
-    /// Subscribe watches probed against the store for liveness
-    /// (`subscribe::prune_closed`): none while the roster journal stands.
     static WATCHES_PROBED: Cell<usize> = const { Cell::new(0) };
-    /// Windows asked whether they are on screen
-    /// (`messages_host::band_on_screen`: on Windows, a call into the window
-    /// system).
     static ON_SCREEN_ASKS: Cell<usize> = const { Cell::new(0) };
-    /// Strip re-stamps a task's end asked for (`App::restamp_for_end`,
-    /// design §11.2.3 item 7): one per end, one per look that quiets one.
     static END_RESTAMPS: Cell<usize> = const { Cell::new(0) };
-    /// Timed choices resolved to an instant (`App::resolve_timer_choice`, one
-    /// wall read): one per press of the `Every session` row's Timer, however
-    /// many sessions it arms, so they all land at that one instant.
     static TIMER_RESOLVES: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -179,25 +147,13 @@ pub(crate) fn take_timer_resolves() -> usize {
     take(&TIMER_RESOLVES)
 }
 
-// The strip's hovers, as pushed
-
 thread_local! {
-    /// Each window's tab hovers as its strip was last stamped
-    /// (`App::refresh_window_tabs`): what a native toolbar would show,
-    /// which a headless window has none of. A hover is composed only at a
-    /// push, so a test reads here whether a move stamped the strip again
-    /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3), where
-    /// `App::tab_tooltips`, composed on the call, would always read fresh.
     static TOOLTIPS_PUSHED: std::cell::RefCell<Vec<(crate::WindowId, Vec<Option<String>>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
-    /// Strip stamps (`App::refresh_window_tabs`), every window's: one per
-    /// push, so a test can say a move stamped a strip once, not twice.
     static TOOLTIP_PUSHES: Cell<usize> = const { Cell::new(0) };
-    /// Redraws the hover's restamp asked for (`App::restamp_for_hover`):
-    /// only where the stamp moved the strip's fingerprint.
     static HOVER_REDRAWS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -239,20 +195,11 @@ pub(crate) fn last_tooltips_pushed(window: crate::WindowId) -> Option<Vec<Option
     })
 }
 
-// Heap allocations, per thread
-
 thread_local! {
-    /// Whether [`allocations_in`] is counting on this thread.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
-    /// Allocations and reallocations made on this thread while counting.
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// The test binary's allocator: `System`'s, and a count of the calls a
-/// thread inside [`allocations_in`] makes. Thread-local, as the counters
-/// above are, so the suite's other threads never bleed into a count; a
-/// const-initialised `Cell` has no destructor and never allocates, and
-/// `try_with` answers nothing (no count) on a thread being torn down.
 struct CountingAlloc;
 
 impl CountingAlloc {
@@ -305,121 +252,37 @@ pub(crate) fn allocations_in<R>(f: impl FnOnce() -> R) -> (R, usize) {
     (out, ALLOCATIONS.with(|n| n.replace(0)))
 }
 
-// The harness card and chips (`claude_card`, `claude_lights`)
-
 thread_local! {
-    /// Clock reads the harness's per-frame and per-wake paths made
-    /// (`claude_card::card_now`, the Autopilot's claim check, a chip
-    /// click's read-back): none for a card at rest, a session with no
-    /// lapsing claim or a window with no card.
     static HARNESS_CLOCK_READS: Cell<usize> = const { Cell::new(0) };
-    /// Harness card frames the emitter DREW (`HarnessCard::draw`), as
-    /// against a settled frame replayed (`HarnessCard::replay`).
     static CARD_TICKS: Cell<usize> = const { Cell::new(0) };
-    /// Harness card layouts computed over the pane's cells
-    /// (`claude_card::layout`).
     static CARD_LAYOUTS: Cell<usize> = const { Cell::new(0) };
-    /// Launch cards parsed off a pane's text (`claude_card::read_card`).
     static CARD_READS: Cell<usize> = const { Cell::new(0) };
-    /// Update notices scanned for under a placed card
-    /// (`claude_footer::PaneTextCache::update_notice`), as against a scan
-    /// kept from the last rebuild of the pane's text.
     static CARD_NOTICE_READS: Cell<usize> = const { Cell::new(0) };
-    /// Sessions' Autopilot reads (`App::session_autopilot`: one metadata
-    /// lock each).
     static AUTOPILOT_READS: Cell<usize> = const { Cell::new(0) };
-    /// Harness card lines and banners whose ink was laid
-    /// (`HarnessCard::line_ink_into`, from `claude_card::ink_words`), as
-    /// against a line or a banner kept from the last frame.
     static CARD_LINE_INKS: Cell<usize> = const { Cell::new(0) };
-    /// Session timeline locks the footer's splice took
-    /// (`App::splice_claude_footer`, the harness card's leaf beside it): the
-    /// PTY reader holds that lock while output streams, so each one is a
-    /// chance for the frame to wait.
     static FOOTER_TIMELINE_LOCKS: Cell<usize> = const { Cell::new(0) };
-    /// Session timeline locks the dev card probe took to record a card
-    /// pass's outcome (`App::compose_claude_cards` under
-    /// `ATERM_DEV_CARD_PROBE=1`, card engine §8): one per pane the pass
-    /// judged, none with the probe off.
     static CARD_PROBE_LOCKS: Cell<usize> = const { Cell::new(0) };
-    /// Rebuilds of a Claude Code pane's text (`claude_footer::PaneTextCache`):
-    /// what a frame whose revision moved costs the footer, card or none.
     static PANE_TEXT_REBUILDS: Cell<usize> = const { Cell::new(0) };
-    /// Clock reads the footer's own per-frame paths made (the lights' repaint
-    /// key and block, `claude_lights::lights_now`): the floor the harness's
-    /// pass is measured against.
     static FOOTER_CLOCK_READS: Cell<usize> = const { Cell::new(0) };
-    /// Pane cells the harness card's layout tested, or tested again to keep
-    /// a layout (`claude_card::PaneRow::blank`, `PaneCells::wide`): one a
-    /// cell a test.
     static CARD_CELLS_READ: Cell<usize> = const { Cell::new(0) };
-    /// Sorts of the card's recorded keys to take its light back out of a
-    /// stream (`claude_card::remove_each_once`), as against a tail truncated
-    /// or a stream that holds none of it.
     static CARD_STRIP_SORTS: Cell<usize> = const { Cell::new(0) };
-    /// Frame cells the footer's write copied into the frame
-    /// (`claude_footer::write_edits`): the chips' and the facts' cells and the
-    /// card's line, never the rule's own glyphs between them.
     static FOOTER_CELLS_WRITTEN: Cell<usize> = const { Cell::new(0) };
-    /// Claude Code panes' rows read for the footer and the lights
-    /// (`claude_footer::read_pane`): the composer's frame searched for and
-    /// the rule's mode row and the lights' pill read under it, as against
-    /// readings kept from the last rebuild of the pane's text.
     static FOOTER_PANE_READS: Cell<usize> = const { Cell::new(0) };
-    /// The composer's frame searched for again to say whether a rebuild's
-    /// changed rows moved it (`claude_footer::Readings::after`): none where
-    /// every changed row is above the rows the search read.
     static FOOTER_FRAME_SEARCHES: Cell<usize> = const { Cell::new(0) };
-    /// Launch cards read off a pane's text for the footer's open model or
-    /// effort (`claude_footer::PaneTextCache::footer_card`).
     static FOOTER_CARD_READS: Cell<usize> = const { Cell::new(0) };
-    /// Footer rules fitted and composed from the facts and the chips
-    /// (`claude_footer::PaneFooter::compose`), as against a composition kept
-    /// from a frame whose inputs were the same.
     static FOOTER_RULES_COMPOSED: Cell<usize> = const { Cell::new(0) };
-    /// Composer rules read off the frame for the cells the footer may cover
-    /// (`claude_footer::PaneTextCache::rule_run`), as against a reading kept
-    /// with the pane's rows.
     static FOOTER_RULE_MASKS: Cell<usize> = const { Cell::new(0) };
-    /// Chrome band tones derived from a theme (`chrome_band::band_colors`),
-    /// as against the last derivation's kept for the same theme.
     static BAND_DERIVES: Cell<usize> = const { Cell::new(0) };
-    /// Owned copies of a window's staged model a capture took to rasterize
-    /// (`App::take_rerender_input`), as against reading the presented scratch
-    /// in place or copying the presented destination.
     static CAPTURE_INPUTS_CLONED: Cell<usize> = const { Cell::new(0) };
-    /// Output→present latency samples booked at presents a capture's barrier
-    /// forced (`metrics::record_present`'s `capture_forced`): this thread's
-    /// share of the `capture_presents` metrics key.
     static CAPTURE_FORCED_SAMPLES: Cell<usize> = const { Cell::new(0) };
-    /// Output→present latency samples booked at every other present.
     static UNFORCED_SAMPLES: Cell<usize> = const { Cell::new(0) };
-    /// Keystroke input→present slices a present booked
-    /// (`metrics::record_present`): this thread's share of `n_input`.
     static INPUT_SLICES_BOOKED: Cell<usize> = const { Cell::new(0) };
-    /// Of those, the slices a proven prediction closed, before the key's
-    /// echo: this thread's share of `input_predicted`.
     static INPUT_SLICES_PREDICTED: Cell<usize> = const { Cell::new(0) };
-    /// Chip blocks fitted and laid (`App::claude_lights_block`), as against
-    /// a pane's block kept from a frame whose fit key was the same.
     static FOOTER_BLOCK_FITS: Cell<usize> = const { Cell::new(0) };
-    /// The traffic published beside a session's facts read for its card
-    /// (`App::fact_menu_rows`): at the card's open and its wakes, never by a
-    /// frame or a shut card.
     static TRAFFIC_SIDE_READS: Cell<usize> = const { Cell::new(0) };
-    /// Autopilot chip titles built (`claude_lights::autopilot_title`): one
-    /// where a reading starts or its inputs moved, none while nobody reads.
     static AUTOPILOT_TITLES_BUILT: Cell<usize> = const { Cell::new(0) };
-    /// Pane rows whose text a footer rebuild compared with the last
-    /// rebuild's (`claude_footer::PaneTextCache::rows_as`), as against rows
-    /// the engine's revisions vouch unchanged.
     static FOOTER_ROWS_COMPARED: Cell<usize> = const { Cell::new(0) };
-    /// Composer top rules read off the frame for their plain run
-    /// (`claude_footer::PaneTextCache::top_run`), as against a reading kept
-    /// with the pane's rows.
     static FOOTER_TOP_READS: Cell<usize> = const { Cell::new(0) };
-    /// Composer top rules composed (`claude_footer::compose_top`), as
-    /// against a composition kept from a frame whose inputs were the same.
     static FOOTER_TOPS_COMPOSED: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -638,15 +501,8 @@ pub(crate) fn take_footer_rows_compared() -> usize {
 }
 
 thread_local! {
-    /// Agents panels located and their cells read off a frame
-    /// (`claude_panel::read_panel`): at most once per rebuild of a Claude
-    /// Code pane's text, and only where the panel's gate holds.
     static PANEL_READS: Cell<usize> = const { Cell::new(0) };
-    /// Folds and retimes of a panel's dots (`claude_panel`): a reading that
-    /// moved, or a dot's next turn come due — never a frame at rest.
     static PANEL_FOLDS: Cell<usize> = const { Cell::new(0) };
-    /// A panel's look made anew (its ink, halos and slabs), as against one
-    /// kept from a frame of the same key and put on the glass as it is.
     static PANEL_LOOKS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -672,10 +528,7 @@ pub(crate) fn take_panel_looks() -> usize {
 }
 
 thread_local! {
-    /// Footer wakes armed (`claude_lights::wake_after`): one sleeping lane
-    /// thread each, posting one wake.
     static FOOTER_WAKES_ARMED: Cell<usize> = const { Cell::new(0) };
-    /// Claude's mode pill read for its relabel (`claude_footer::read_pane`).
     static PILL_RELABEL_READS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -695,13 +548,9 @@ pub(crate) fn take_footer_wakes_armed() -> usize {
     take(&FOOTER_WAKES_ARMED)
 }
 
-// The renderer's (`aterm_render::test_counters`)
-
 /// Window cell geometries the renderer derived off its primary face
 /// (`aterm_render::Renderer::cell_geometry` with none kept for the px): a
 /// metrics read, and a face parse for a variable primary such as SF Mono.
-/// Counted where the renderer derives, on this thread. The renderer keeps no
-/// counters in a build without debug assertions, so there this reads 0.
 pub(crate) fn take_cell_geometry_derivations() -> usize {
     #[cfg(debug_assertions)]
     let taken = aterm_render::test_counters::take_cell_geometry_derivations();

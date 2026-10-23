@@ -2,59 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! term-write: a host writes into a session's terminal only under a
-//! `TermGuard`.
-//!
-//! A write into a session's engine reaches its `screen`, `cursor` and `cells`
-//! subscribers only by a ring. The PTY reader rings after each burst; every
-//! other write rings as its hold ends, from the drop of the `TermGuard` that
-//! `term_lock`, `term_try_lock` and `term_lock_ui` return
-//! (`crates/aterm-gui/src/lib.rs`), which compares the frame key across the
-//! hold. Nothing reads a content watch on a timer, so a write made through a
-//! raw `MutexGuard` is pushed to nobody until something else rings.
-//!
-//! A raw `.lock()`, `.try_lock()` or `.lock_or_recover()` of a session's
-//! terminal (a receiver named `term`: `term`, `s.term`, `pool.get(id)?.term`,
-//! the one name the crate gives that mutex) is held to reading by the
-//! compiler while its guard is bound without `mut` or borrowed `&`. Read over
-//! the GUI's shipped code ([`Corpus::test_only`] files aside), each of these
-//! can write, and is a finding:
-//!
-//! - a `let`, `if let` or `while let` that binds it `mut` (`let mut t =`,
-//!   `let Ok(mut t) =`, `Some(mut t)`), or a `match` on it with an arm that
-//!   does;
-//! - a closure that takes it `mut` (`.map(|mut t| …)`);
-//! - a `&mut` borrow of it (`&mut term.lock()…`, `&mut *term.lock()…`);
-//! - a method called on the guard itself (`term.lock().unwrap().resize(…)`),
-//!   which may take it `&mut`, or an assignment through it;
-//! - `MutexGuard<…Terminal>` named outside lib.rs: a function that returns or
-//!   takes one hands a raw guard to code no lock site shows.
-//!
-//! Not detected: a guard passed by value or returned through a call
-//! (`patiently(|| term.try_lock())`), a deferred `let t; t = …`, and a
-//! terminal mutex under another name.
-//!
-//! [`Corpus::test_only`]: super::Corpus::test_only
+//! term-write: a host writes into a session's terminal only under a `TermGuard`.
 
 use super::rules::test_path;
 use super::{Bound, Finding, Rule, Tree, has, hits, is_word};
 
-/// The crate whose code holds the session terminals.
 const GUI: &str = "crates/aterm-gui/src/";
 
-/// Where `TermGuard` wraps the raw guard.
 const GUARD_HOME: &str = "crates/aterm-gui/src/lib.rs";
 
-/// The `Mutex` methods that return a raw guard, and whether the guard comes
-/// back bare (not in a `Result`).
 const LOCKS: &[(&str, bool)] = &[
     ("lock", false),
     ("try_lock", false),
     ("lock_or_recover", true),
 ];
 
-/// The methods that keep the chain's value the guard: unwrapping its
-/// `Result`, or a `PoisonError`'s.
 const UNWRAPS: &[&str] = &["unwrap", "expect", "unwrap_or_else", "into_inner"];
 
 pub(super) const TERM_WRITE: Rule = Rule {
@@ -93,8 +55,6 @@ fn term_write(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Each raw lock of a `term` in `code` whose guard can be written through:
-/// the offset to report and what the lock site does.
 fn writes(code: &str) -> Vec<(usize, &'static str)> {
     let b = code.as_bytes();
     let mut out = Vec::new();
@@ -129,18 +89,12 @@ fn writes(code: &str) -> Vec<(usize, &'static str)> {
     out
 }
 
-/// Where the chain after a raw lock leaves its guard.
 enum Chain {
-    /// The chain writes through it (at this offset).
     Writes(usize, &'static str),
-    /// The chain ends in a read the compiler holds to reading (a closure
-    /// that takes it immutably, a test of the `Result`).
     Read,
-    /// The chain's value is still the guard, or its `Result`, up to here.
     Flows(usize),
 }
 
-/// Follow the method chain from `from`, just past the lock's `()`.
 fn chain(code: &str, mut from: usize, bare: bool) -> Chain {
     let b = code.as_bytes();
     let mut guard = bare;
@@ -180,8 +134,6 @@ fn chain(code: &str, mut from: usize, bare: bool) -> Chain {
     }
 }
 
-/// What the expression `code[start..end]`, a raw guard or its `Result`, is
-/// bound or borrowed as, when that can write.
 fn flows_into(code: &str, start: usize, end: usize) -> Option<&'static str> {
     let b = code.as_bytes();
     let after = ws_fwd(b, end);
@@ -213,8 +165,6 @@ fn flows_into(code: &str, start: usize, end: usize) -> Option<&'static str> {
     binds_mut(pattern).then_some("binds the raw guard `mut`")
 }
 
-/// Whether a `match` whose block opens at `open` has an arm whose pattern
-/// binds `mut`.
 fn arm_binding_mut(code: &str, open: usize) -> Option<&'static str> {
     let b = code.as_bytes();
     if b.get(open) != Some(&b'{') {
@@ -231,7 +181,6 @@ fn arm_binding_mut(code: &str, open: usize) -> Option<&'static str> {
             b')' | b']' => depth = depth.saturating_sub(1),
             b'}' => {
                 depth = depth.saturating_sub(1);
-                // A block arm ends with its `}`, unless an `else` follows.
                 if depth == 0 && !in_pattern && !word_at(code, ws_fwd(b, i + 1), "else") {
                     in_pattern = true;
                     pattern = i + 1;
@@ -255,7 +204,6 @@ fn arm_binding_mut(code: &str, open: usize) -> Option<&'static str> {
     None
 }
 
-/// Whether `args` hold a closure whose parameters bind `mut`.
 fn closure_takes_mut(args: &str) -> bool {
     let b = args.as_bytes();
     let mut i = 0;
@@ -276,13 +224,11 @@ fn closure_takes_mut(args: &str) -> bool {
     false
 }
 
-/// Whether a pattern binds `mut` (a `&mut` in it matches a reference).
 fn binds_mut(pattern: &str) -> bool {
     let b = pattern.as_bytes();
     hits(pattern, "mut", Bound::Word).any(|at| !b[..ws_back(b, at)].ends_with(b"&"))
 }
 
-/// `MutexGuard<…Terminal…>` named in `code`.
 fn raw_guard_types(code: &str) -> Vec<(usize, &'static str)> {
     let b = code.as_bytes();
     hits(code, "MutexGuard", Bound::Word)
@@ -301,9 +247,6 @@ fn raw_guard_types(code: &str) -> Vec<(usize, &'static str)> {
         .collect()
 }
 
-/// The start of the receiver whose last segment starts at `start`: back over
-/// each `segment.` before it, a segment being a path, a call, an index or a
-/// `?` (`self.pool.get(id)?.term`).
 fn receiver_start(b: &[u8], mut start: usize) -> usize {
     loop {
         let dot = ws_back(b, start);
@@ -365,17 +308,14 @@ fn word_end(b: &[u8], mut at: usize) -> usize {
     at
 }
 
-/// Whether `code[..end]` ends with the whole word `word`.
 fn ends_with_word(code: &str, end: usize, word: &str) -> bool {
     code[..end].ends_with(word) && word_start(code.as_bytes(), end) == end - word.len()
 }
 
-/// Whether the whole word `word` starts at `at`.
 fn word_at(code: &str, at: usize, word: &str) -> bool {
     code[at..].starts_with(word) && word_end(code.as_bytes(), at) == at + word.len()
 }
 
-/// The `)` or `]` that closes the bracket at `open`.
 fn closer(b: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (i, &c) in b.iter().enumerate().skip(open) {
@@ -393,7 +333,6 @@ fn closer(b: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-/// The `(` or `[` that opens the bracket closed at `close`.
 fn opener(b: &[u8], close: usize) -> Option<usize> {
     let mut depth = 0usize;
     for i in (0..=close).rev() {
@@ -411,7 +350,6 @@ fn opener(b: &[u8], close: usize) -> Option<usize> {
     None
 }
 
-/// The `>` that closes the generic list opened at `open`.
 fn angle_closer(b: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (i, &c) in b.iter().enumerate().skip(open) {
@@ -441,9 +379,6 @@ mod tests {
         spots(&run(&TERM_WRITE, &[(AT, src)]))
     }
 
-    /// Each shape of a write through a raw guard, with the line it fires on.
-    /// The first is the review's: Kitty's step was this shape until it moved
-    /// to `term_try_lock`.
     #[test]
     fn every_shape_of_a_write_through_a_raw_guard_is_found() {
         let cases: &[(&str, &str, usize)] = &[
@@ -529,10 +464,6 @@ mod tests {
         }
     }
 
-    /// A raw guard bound immutably, borrowed `&` or read in a closure is held
-    /// to reading by the compiler; so is every lock that is not a `term`'s, the
-    /// guard type in lib.rs, test code by its own gate or its parent's, and
-    /// prose.
     #[test]
     fn reads_other_locks_test_code_and_prose_are_silent() {
         let reads = "fn f(s: &S, term: &Mutex<Terminal>) -> Option<u16> {\n\
@@ -573,7 +504,6 @@ mod tests {
             ],
         );
         assert!(found.is_empty(), "{found:?}");
-        // The negative control: the same writer, declared without a gate.
         let found = run(
             &TERM_WRITE,
             &[

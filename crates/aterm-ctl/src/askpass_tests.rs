@@ -5,24 +5,18 @@
 
 use super::*;
 
-/// A well-formed hex reply decodes to the exact bytes.
 #[test]
 fn decode_secret_round_trips() {
-    // "pw" = 0x70 0x77
     let s = decode_secret("7077").expect("valid hex");
     assert_eq!(s.as_bytes(), b"pw");
 }
 
-/// An empty secret decodes to empty (the helper then writes nothing).
 #[test]
 fn decode_secret_empty_is_empty() {
     let s = decode_secret("").expect("empty is valid");
     assert!(s.is_empty());
 }
 
-/// A reply the helper cannot read is rejected, never guessed: odd length,
-/// non-hex, over-long, or carrying a byte sudo's line read would cut (CR, LF,
-/// NUL). Each must refuse rather than deliver a wrong or truncated password.
 #[test]
 fn decode_secret_rejects_malformed_and_line_cutting_bytes() {
     assert!(decode_secret("abc").is_none(), "odd length");
@@ -36,8 +30,6 @@ fn decode_secret_rejects_malformed_and_line_cutting_bytes() {
     );
 }
 
-/// Unknown server text is not a safe diagnostic: it can contain a payload
-/// that was meant for sudo's pipe. Known protocol outcomes remain useful.
 #[test]
 fn an_unknown_reply_never_reaches_the_refusal_diagnostic() {
     let unknown = b"ERR askpass secret=public-synthetic-canary";

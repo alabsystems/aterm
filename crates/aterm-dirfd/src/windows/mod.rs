@@ -61,7 +61,9 @@ impl Errno {
     pub const FOREIGN_REPARSE: Self = Self(CUSTOMER | 1);
     /// This crate's own: the name no longer carries the identity the caller expected ([`unlinkat`])
     pub const CHANGED: Self = Self(CUSTOMER | 2);
-    /// This crate's own: [`pin`] was handed a path that does not start at a local volume's own root
+    /// This crate's own: [`pin`] was handed a path that does not start at a
+    /// local volume's own root — a UNC path, a mapped network drive, a
+    /// `subst` letter — and walked none of it.
     pub const NOT_VOLUME_ROOT: Self = Self(CUSTOMER | 3);
     /// This crate's own: the name is a folder a volume is mounted.
     pub const MOUNT_POINT: Self = Self(CUSTOMER | 4);
@@ -278,7 +280,9 @@ pub struct ExposedPlaceholders {
     _thread: std::marker::PhantomData<*const ()>,
 }
 
-/// Switch this thread to seeing cloud placeholders as reparse points until the returned guard.
+/// Switch this thread to seeing cloud placeholders as reparse points until
+/// the returned guard drops ([`ExposedPlaceholders`]).
+///
 /// # Errors
 /// [`Errno::PLACEHOLDERS_HIDDEN`] when the system refused the mode (it
 /// answers so only for an invalid mode or a thread with no TEB): the caller
@@ -359,7 +363,7 @@ impl Stat {
         }
     }
 
-    /// What kind of entry.
+    /// What kind of entry this is.
     #[must_use]
     pub const fn file_type(&self) -> FileType {
         FileType::from_attributes(self.attributes, self.reparse_tag)
@@ -420,7 +424,7 @@ impl FileType {
         self.attributes & ffi::FILE_ATTRIBUTE_DIRECTORY == 0 && !self.is_reparse()
     }
 
-    /// `FILE_ATTRIBUTE_READONLY`, which [`unlinkat`] deletes.
+    /// `FILE_ATTRIBUTE_READONLY`, which [`unlinkat`] deletes through.
     #[must_use]
     pub const fn is_readonly(self) -> bool {
         self.attributes & ffi::FILE_ATTRIBUTE_READONLY != 0
@@ -482,7 +486,9 @@ fn kind_of(fd: BorrowedHandle<'_>) -> Result<FileType> {
     ))
 }
 
-/// The identity of what `fd` is open.
+/// The identity of what `fd` is open on: one `FileIdInfo` query, the cheap
+/// half of [`fstat`].
+///
 /// # Errors
 /// The query's code — `ERROR_INVALID_PARAMETER` on a file system with no
 /// `FileIdInfo` (FAT, exFAT), which has no identity to give.
@@ -607,6 +613,7 @@ impl Sid {
     #[must_use]
     pub fn administrators() -> Self {
         // Revision 1, two sub-authorities, SECURITY_NT_AUTHORITY (5),
+        // SECURITY_BUILTIN_DOMAIN_RID (32), DOMAIN_ALIAS_RID_ADMINS (544).
         Self(vec![1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 0x02, 0, 0])
     }
 
@@ -614,6 +621,7 @@ impl Sid {
     #[must_use]
     pub fn local_system() -> Self {
         // Revision 1, one sub-authority, SECURITY_NT_AUTHORITY (5),
+        // SECURITY_LOCAL_SYSTEM_RID (18).
         Self(vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0])
     }
 
@@ -707,7 +715,11 @@ impl std::fmt::Debug for Sid {
     }
 }
 
-/// The owner of the file or directory `fd` is open.
+/// The owner of the file or directory `fd` is open on, read through that
+/// handle (`GetSecurityInfo(OWNER_SECURITY_INFORMATION)`): `fd` needs
+/// `READ_CONTROL`, which [`OFlags::PATH`] asks for (and a file's
+/// [`OFlags::RDONLY`]).
+///
 /// # Errors
 /// The query's code (`ERROR_ACCESS_DENIED` without `READ_CONTROL`), or
 /// `ERROR_INVALID_DATA` for a descriptor with no owner.
@@ -733,7 +745,8 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     }
     // SAFETY: On success `owner` is null or points into `descriptor`, which stays allocated.
     let sid = unsafe { Sid::copied(owner) };
-    // SAFETY: `descriptor` was allocated by GetSecurityInfo for this caller and is freed.
+    // SAFETY: `descriptor` was allocated by GetSecurityInfo for this caller
+    // and is freed once, here.
     unsafe { ffi::LocalFree(descriptor) };
     sid
 }
@@ -1129,8 +1142,8 @@ pub fn unlinkat<Fd: AsHandle, P: Arg>(
 /// a folder a VOLUME is mounted on: an `IO_REPARSE_TAG_MOUNT_POINT` whose
 /// target is a volume's GUID name (`\??\Volume{…}`, what
 /// `SetVolumeMountPointW` writes), where a junction's names a path
-/// (`\??\C:\dir`).
-///
+/// (`\??\C:\dir`). Read through `fd` itself, so the reparse point judged is
+/// the one about to be deleted. Any other kind answers `false` unread.
 /// # Errors
 /// `FSCTL_GET_REPARSE_POINT`'s code, or `ERROR_INVALID_DATA` for data that
 /// does not hold the name it says it does: the caller keeps what it could
@@ -1277,7 +1290,7 @@ impl DirEntry {
         self.ino
     }
 
-    /// What kind of entry.
+    /// What kind of entry this is.
     #[must_use]
     pub const fn file_type(&self) -> FileType {
         FileType::from_attributes(self.attributes, self.reparse_tag)
@@ -1530,12 +1543,17 @@ pub mod seam {
     use std::os::windows::ffi::OsStrExt as _;
     use std::path::Path;
 
-    /// On this thread, read listings with `FileIdBothDirectoryInfo` and delete with the legacy.
+    /// On this thread, read listings with `FileIdBothDirectoryInfo` and delete
+    /// with the legacy `FileDispositionInfo` — the paths a file system without
+    /// the extended classes takes — until turned off.
     pub fn legacy_classes(on: bool) {
         super::LEGACY.with(|legacy| legacy.set(on));
     }
 
-    /// On this thread, every [`super::ExposedPlaceholders`] leaves the thread's mode as it.
+    /// On this thread, every [`super::ExposedPlaceholders`] leaves the
+    /// thread's mode as it is — a process's default disguises a placeholder
+    /// as a plain file — until turned off: the negative control of the
+    /// placeholder rule, what this crate saw before it exposed them.
     pub fn leave_placeholders_disguised(on: bool) {
         super::DISGUISED.with(|disguised| disguised.set(on));
     }

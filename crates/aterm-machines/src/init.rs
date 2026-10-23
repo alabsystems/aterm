@@ -594,6 +594,7 @@ impl Workstation {
         let mut changes = Vec::new();
         let mut snapshots = Vec::new();
         for item in &self.items {
+            // A held item changes nothing in this pass ([`Workstation::hold`]): no key of
             // it is backed up for, or activated after, a change nobody makes.
             if self.held.iter().any(|(id, _)| *id == item.id()) {
                 snapshots.push(Ok(Vec::new()));

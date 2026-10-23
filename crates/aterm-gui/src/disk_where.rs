@@ -330,7 +330,7 @@ fn rows(
 }
 
 /// What frees a build directory found by `origin`, in words.
-fn remedy(origin: &Origin) -> &'static str {
+const fn remedy(origin: &Origin) -> &'static str {
     match origin {
         Origin::Bootstrap { slim: true, .. } => "x.py bootstrap: scripts/slim_build.py",
         Origin::Bootstrap { slim: false, .. } => "x.py bootstrap: `./x.py clean`",

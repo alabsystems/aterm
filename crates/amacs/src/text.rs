@@ -194,8 +194,6 @@ fn branch(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
 }
 
 trust_contract_fn! {
-    /// The taller of two subtree heights, the one a branch over them stands
-    /// one above: never below either child, and always one of them.
     fn taller_child(left: u8, right: u8) -> u8
     clauses [ensures result >= left && result >= right by taller_child_covers_both
              ensures result == left || result == right by taller_child_is_a_child]
@@ -392,10 +390,6 @@ fn is_boundary(node: &Node, offset: usize) -> bool {
 }
 
 trust_contract_fn! {
-    /// Whether a character starts at a byte of UTF-8 text: an ASCII byte
-    /// (below 0x80) or a lead byte (0xC0 and up), never a continuation byte
-    /// (0x80..=0xBF). Inside a leaf, the char boundaries are exactly the
-    /// offsets of such bytes, and its end.
     #[expect(
         clippy::manual_range_contains,
         reason = "Trust kernel-imports a bool tree of comparisons, not a call to `Range::contains` (E6 refuses calls)"

@@ -1,15 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// GENERATED — do not edit by hand. Regenerate with
-//     targo --unverified run -p aterm-grapheme --example unicode_tables -- \
-//         mirroring <BidiMirroring.txt> crates/aterm-bidi/src/mirroring.rs
-// from the Unicode Character Database, whose data is under the Unicode License v3
-// (UNICODE-LICENSE.txt at the repo root).
+// Unicode Character Database data under the Unicode License v3 (UNICODE-LICENSE.txt).
 
-/// Every Bidi_Mirroring_Glyph pair of BidiMirroring-16.0.0.txt, `source, mirror`
-/// flattened and sorted by source: a source is at an even index, its mirror
-/// right after it.
+/// Flattened `Bidi_Mirroring_Glyph` `(source, mirror)` pairs sorted by `source`.
 pub(crate) static MIRROR_PAIRS: [u32; 856] = [
     0x00028, 0x00029, 0x00029, 0x00028, 0x0003C, 0x0003E, 0x0003E, 0x0003C, 0x0005B, 0x0005D,
     0x0005D, 0x0005B, 0x0007B, 0x0007D, 0x0007D, 0x0007B, 0x000AB, 0x000BB, 0x000BB, 0x000AB,

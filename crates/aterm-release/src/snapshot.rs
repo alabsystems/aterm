@@ -54,6 +54,7 @@ impl CacheHold {
 
 impl Drop for CacheHold {
     fn drop(&mut self) {
+        // Before the lock goes (fields drop after this body), so the note never names
         // a holder that has let go.
         let _ = fs::remove_file(self.cache.root.join("holder"));
     }

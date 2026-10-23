@@ -275,6 +275,7 @@ impl PetWorldFacts {
             let mut used = 0;
             for block in term.all_blocks().rev().take(MAX_BLOCK_PROBES) {
                 // Collapsed geometry is host-owned; absolute output rows no
+                // longer certify where that output was presented.
                 if block.collapsed {
                     continue;
                 }

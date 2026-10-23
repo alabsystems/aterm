@@ -315,6 +315,7 @@ impl<T: Eq, const N: usize> Eq for SmallVec<T, N> {}
 
 impl<T, const N: usize> Drop for SmallVec<T, N> {
     fn drop(&mut self) {
+        // Reuse the (bounds-clamped) clear — drops the inline elements without a
         // separate out-of-bounds obligation; the heap Vec drops itself.
         self.clear();
     }
@@ -343,6 +344,34 @@ impl<T, const N: usize> Extend<T> for SmallVec<T, N> {
 }
 
 /// Owned, by-value iterator over a [`SmallVec`] ([`alloc::vec::IntoIter`], [`Drop`]).
+///
+/// The representation is private, as upstream `smallvec`'s is. `next`,
+/// `next_back` and `Drop` read `buf[start..end]` as initialized, so safe code
+/// that could name the fields could forge an iterator over an uninitialized
+/// buffer or rewind the cursor and move one element out twice. Neither form
+/// compiles:
+///
+/// ```compile_fail,E0223
+/// use aterm_alloc::{IntoIter, SmallVec};
+/// let mut sv: SmallVec<String, 4> = SmallVec::new();
+/// sv.push(String::from("moved out twice if the cursor rewinds"));
+/// let mut it = sv.into_iter();
+/// let first = it.next();
+/// if let IntoIter::Inline { start, .. } = &mut it {
+///     *start = 0;
+/// }
+/// ```
+///
+/// ```compile_fail,E0223
+/// use aterm_alloc::IntoIter;
+/// use core::mem::MaybeUninit;
+/// let mut forged: IntoIter<Box<u64>, 2> = IntoIter::Inline {
+///     buf: [const { MaybeUninit::uninit() }; 2],
+///     start: 0,
+///     end: 2,
+/// };
+/// let uninit_box = forged.next();
+/// ```
 pub struct IntoIter<T, const N: usize> {
     repr: IntoIterRepr<T, N>,
 }

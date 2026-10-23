@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `sys why` (`docs/DESIGN-resource-details-2026-10-20.md` §2): who uses the
-//! machine's CPU or memory and why, as text and JSON, rendered from the cause
-//! engine's [`Account`] ([`crate::explain`]), the one the CPU close-up's Why
-//! now renders, so the two cannot disagree.
-//!
-//! TEXT, one record per line, each starting with its key: the `why` sentence
-//! (closed words and numbers only, never a name a process chose); for the
-//! CPU, `split`, `you`, the `who` rows, `more` and `withheld`, the `cause`
-//! lines, `pass`, `do` (or `cannot what=remedy` in its place) and the
-//! `cannot` lines; for memory, two `classes` lines, `you` and `owners` before
-//! the same rows. A calm bare `why` is the sentence and `you` alone.
-//!
-//! WHO MAY SEE A ROW: an owner-class caller sees every `who` row; a scoped
-//! one only a coalition whose live members are all in its tab (never
-//! aterm's own, and none while the sweep is cut), the rest summed on
-//! `withheld`, so the rows still add up. A scoped caller's `cause` lines
-//! leave out other tabs' `tab-work` and `app-work`'s `coalition=`, and its
-//! sentence calls another tab's work `another tab's work`.
-//!
-//! SIZE: rows past `top=`, and in a text reply with no `top=` the rows past
-//! [`REPLY_MAX`] bytes with the header, move from the bottom into `more`.
+//! `sys why` text and JSON rendering from the cause engine's [`Account`] ([`crate::explain`]).
 
 use super::json::Jv;
 use super::query::{ScopeArg, SysQuery, View};
@@ -37,12 +17,9 @@ use crate::explain::{
 use crate::model::{Snapshot, Throttle};
 use crate::words;
 
-/// A text reply's most bytes with its header line, as the server sends it,
-/// unless `top=` was given.
+/// Maximum byte length of a `sys why` text reply (including its header) when `top=` is unset.
 pub const REPLY_MAX: usize = 2048;
 
-/// What `q` reads over `snap`: its subject, or the bare reply's choice
-/// (the CPU before any snapshot).
 fn resolve(q: &SysQuery, snap: Option<&Snapshot>) -> Bare {
     match (q.subject, snap) {
         (Some(subject), _) => Bare::Subject(subject),
@@ -51,8 +28,7 @@ fn resolve(q: &SysQuery, snap: Option<&Snapshot>) -> Bare {
     }
 }
 
-/// The header's `subject=` word for `q` over `snap`: `global.cpu`,
-/// `global.mem`, or `global` for the calm reply; `None` off `why`.
+/// Return the header's `subject=` word for `q` over `snap`, or `None` outside `why`.
 #[must_use]
 pub fn subject_word(q: &SysQuery, snap: Option<&Snapshot>) -> Option<&'static str> {
     (q.view == View::Why).then(|| match resolve(q, snap) {
@@ -70,7 +46,6 @@ fn line(key: impl Into<String>, text: impl Into<String>) -> Line {
     }
 }
 
-/// A team id as `team=` prints it: ten capital letters or digits.
 fn team_word(team: &str) -> bool {
     team.len() == 10
         && team
@@ -78,41 +53,29 @@ fn team_word(team: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
-/// Millicores as cores-worth.
 fn cores(mc: i64) -> f32 {
     mc as f32 / 1000.0
 }
 
-/// A figure that cannot be below 0 (bytes, ms, millicores), as JSON's
-/// unsigned ints take it.
 fn nonneg(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
-/// The split's parts as they print: the caller's tab, the rest of aterm,
-/// others, services and the residual, with the bounds a missing reap credit
-/// puts on the tab pair (§3.2).
 #[derive(Clone, Copy, Debug)]
 struct Printed {
-    /// The tab's figure; `Err` with the word where it is not read.
     tab: Result<i64, &'static str>,
-    /// `≥` on the tab's figure.
     tab_low: bool,
     aterm_rest: i64,
-    /// `≤` on the rest of aterm's.
     rest_high: bool,
     others: i64,
     services: i64,
-    /// The signed residual; `None` by subtraction, where services holds it.
     unaccounted: Option<i64>,
 }
 
-/// One reply's reading: the account and who asks.
 struct Reading<'a> {
     ctx: &'a Ctx<'a>,
     s: &'a Snapshot,
     a: Account,
-    /// The caller's tab: its sessions.
     panes: Vec<u64>,
 }
 
@@ -127,14 +90,10 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// Whether the caller may see tab `key`'s work.
     fn tab_shown(&self, key: u64) -> bool {
         self.ctx.owner_class || self.panes.contains(&key)
     }
 
-    /// Whether the caller may see coalition `r`'s row: never aterm's, and
-    /// none while the sweep is cut, since a member it dropped could be
-    /// outside the tab.
     fn row_shown(&self, r: &CoalRow) -> bool {
         let cut =
             self.s.procs_truncated || self.a.facts.as_deref().is_some_and(|f| f.procs_truncated);
@@ -146,7 +105,6 @@ impl<'a> Reading<'a> {
                     .is_some_and(|keys| keys.iter().all(|k| self.panes.contains(k))))
     }
 
-    /// The causes the caller may see: no other tab's work.
     fn causes(&self) -> impl Iterator<Item = &Shown> {
         self.a.causes.iter().filter(|c| match c.cause.id {
             CauseId::TabWork(k) => self.tab_shown(k),
@@ -154,7 +112,6 @@ impl<'a> Reading<'a> {
         })
     }
 
-    /// Why the split is not read: still to come, or never on this reading.
     fn split_missing(&self) -> &'static str {
         if self.s.coal_lane.on() || self.s.procs_window_ns.is_none() {
             "warming"
@@ -188,8 +145,6 @@ impl<'a> Reading<'a> {
         })
     }
 
-    /// The figure the CPU's sentence and `figure` read: the split's busy
-    /// cores over its window, or the snapshot's where no split is read.
     fn busy_mc(&self) -> Option<i64> {
         match self.a.facts.as_deref() {
             Some(f) => Some(f.split.global_mc),
@@ -218,7 +173,6 @@ impl<'a> Reading<'a> {
         )
     }
 
-    /// A part's people word.
     fn part_word(&self, part: Part) -> &'static str {
         match part {
             Part::Services => self.ctx.machine.services_word(),
@@ -227,7 +181,6 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// `mostly macOS services (2.17c)`: the largest part.
     fn mostly(&self) -> Option<String> {
         let p = self.printed()?;
         let aterm = p.tab.unwrap_or(0) + p.aterm_rest;
@@ -244,10 +197,8 @@ impl<'a> Reading<'a> {
         (mc > 0).then(|| format!("mostly {} ({})", self.part_word(part), c2(cores(mc))))
     }
 
-    /// The headline in Why now's first-row words, with no mark, name or chip.
     fn headline(&self, subject: WhySubject) -> String {
         let Some((id, context)) = self.a.headline else {
-            // The CPU's covering causes are read with its split.
             return match (subject, self.a.facts.is_some(), self.split_missing()) {
                 (WhySubject::Cpu, false, "warming") => "causes not read yet",
                 (WhySubject::Cpu, false, _) => "causes not read now",
@@ -299,7 +250,6 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// The tab clause, by the `you` role.
     fn tab_clause(&self) -> &'static str {
         match self.a.you.role {
             Role::Main => "this tab is the main cause",
@@ -433,8 +383,6 @@ impl<'a> Reading<'a> {
         line("you", t)
     }
 
-    /// Every coalition that answered, ranked for `subject`: CPU, or
-    /// footprint (an unread one last).
     fn ranked(&self, subject: WhySubject) -> Vec<&CoalRow> {
         let Some(f) = self.a.facts.as_deref().filter(|f| f.lane.on()) else {
             return Vec::new();
@@ -446,9 +394,6 @@ impl<'a> Reading<'a> {
         rows
     }
 
-    /// A row's figure for `subject`: millicores, or footprint bytes; `None`
-    /// where unread (a coalition the window did not measure, or a footprint
-    /// the kernel did not write).
     fn figure(r: &CoalRow, subject: WhySubject) -> Option<i64> {
         match subject {
             WhySubject::Cpu => r.measured.then_some(r.cpu_mc),
@@ -456,9 +401,6 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// `rows`' figures summed; `None` where a footprint is unread, never a
-    /// 0 for it. An unmeasured coalition's CPU is the residual's, so it adds
-    /// nothing and the rows still close against `unaccounted`.
     fn sum(rows: &[&CoalRow], subject: WhySubject) -> Option<i64> {
         rows.iter()
             .try_fold(0_i64, |sum, r| match (Self::figure(r, subject), subject) {
@@ -468,7 +410,6 @@ impl<'a> Reading<'a> {
             })
     }
 
-    /// The covering cause a row's coalition is covered by.
     fn cause_of(&self, r: &CoalRow) -> Option<CauseId> {
         self.a
             .causes
@@ -477,8 +418,6 @@ impl<'a> Reading<'a> {
             .map(|c| c.cause.id)
     }
 
-    /// The named activity whose highest-ranked member row `r` is: its read
-    /// rate and deferred share print there, once.
     fn activity_head(&self, r: &CoalRow) -> Option<(u64, Option<u16>)> {
         self.a
             .causes
@@ -555,7 +494,6 @@ impl<'a> Reading<'a> {
         line(format!("who {}", r.id), t)
     }
 
-    /// `more`/`withheld who=<n> cpu_mc=|fp_bytes=<sum>`.
     fn sum_line(key: &str, rows: &[&CoalRow], subject: WhySubject) -> Line {
         let unit = match subject {
             WhySubject::Cpu => "cpu_mc",
@@ -623,9 +561,6 @@ impl<'a> Reading<'a> {
             _ => {}
         }
         t.push_str(&format!(" sure=held src={}", cause.src().join(",")));
-        // One app-work holds at most (the busiest coalition outside aterm's),
-        // so its key names no coalition: a `since=` reply's `same` line
-        // prints keys, the scoped caller's too.
         let key = match cause.id {
             CauseId::TabWork(k) => format!("cause {} {k}", cause.id.word()),
             id => format!("cause {}", id.word()),
@@ -633,8 +568,6 @@ impl<'a> Reading<'a> {
         line(key, t)
     }
 
-    /// The figure's trend word; `None` while the cores are unread (the first
-    /// sample), which the text prints as `unavailable(warming)`.
     fn pass_word(&self, subject: WhySubject) -> Option<&'static str> {
         let motion = match subject {
             WhySubject::Cpu => self.s.cpu.as_ref()?.busy.motion(words::CORES_GATE),
@@ -652,8 +585,6 @@ impl<'a> Reading<'a> {
             .map_or_else(|| Jv::why("warming"), Jv::s)
     }
 
-    /// The `pass`, `do` (or the remedy's `cannot` in its place) and `cannot`
-    /// lines.
     fn tail(&self, subject: WhySubject) -> Vec<Line> {
         let mut out = vec![line(
             "pass",
@@ -719,8 +650,6 @@ impl<'a> Reading<'a> {
     }
 }
 
-/// The rows a reply lists: those the caller may see, at most `top` of them;
-/// the rest it may see; and those it may not.
 struct Rows<'r> {
     shown: Vec<&'r CoalRow>,
     more: Vec<&'r CoalRow>,
@@ -739,7 +668,6 @@ impl<'r> Rows<'r> {
         }
     }
 
-    /// Move the last listed row into `more`.
     fn cut_one(&mut self) -> bool {
         match self.shown.pop() {
             Some(r) => {
@@ -762,8 +690,7 @@ impl<'r> Rows<'r> {
     }
 }
 
-/// `sys why`'s text body for `q` over `s`, after the `lines` already in the
-/// reply and before its `events` (both counted in the byte cut).
+/// Append `sys why`'s text body for `q` over `s` into `lines`.
 pub fn why_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>, events: &[Line]) {
     let subject = match resolve(q, Some(s)) {
         Bare::Calm => {
@@ -795,8 +722,6 @@ pub fn why_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>
     loop {
         let body = rows.lines(&w, subject);
         let n = lines.len() + head.len() + body.len() + tail.len() + events.len();
-        // A `since=` reply's header may say ` delta=1`: counted, so the cut
-        // holds whatever folds.
         let header = header_line(
             View::Why,
             None,
@@ -824,7 +749,6 @@ pub fn why_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>
     }
 }
 
-/// One `{fact, <key>, src}` item of a cause's evidence.
 fn fact(fact: &str, key: &str, value: Jv, src: &str) -> Jv {
     Jv::obj([("fact", Jv::s(fact)), (key, value), ("src", Jv::s(src))])
 }
@@ -1133,8 +1057,7 @@ impl Reading<'_> {
     }
 }
 
-/// `sys why`'s JSON for `q` over `s`, into the reply object `o` (no
-/// sentence: a top-level `why` key would read as an unknown, §2.4).
+/// Populate `sys why`'s JSON fields for `q` over `s` into `o`.
 pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
     let subject = match resolve(q, Some(s)) {
         Bare::Calm => {

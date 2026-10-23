@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The durable first-launch plan. Every stage is independently retryable; a
-//! password lives only in the caller's secret buffer and never enters a record.
+//! The durable first-launch plan.
 
 use super::*;
 use aterm_machines::init_secrets::Replaces;
@@ -69,28 +68,18 @@ struct Progress {
     running: Option<Stage>,
     plan: [u8; 32],
     revision: u64,
-    /// The vault this Mac was in when the run was admitted.
     admitted_vault: AdmittedVault,
 }
 
-/// Which vault this Mac was configured for when a run was admitted. A vault configured
-/// since (joined from a terminal or by another tool) was not there when the run was chosen,
-/// and the run's Secrets stage leaves it in place rather than join the plan's
-/// ([`AdmittedVault::stands_in`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum AdmittedVault {
-    /// Not known: a run an older build admitted, or a configuration that could not be read.
-    /// Its stage joins the plan's vault, as it did before this was kept.
     #[default]
     Unknown,
-    /// None was configured.
     None,
-    /// The vault of this identity ([`ConfiguredVault::identity`]).
     Configured([u8; 32]),
 }
 
 impl AdmittedVault {
-    /// What a run admitted now keeps of the `configured` vault (a read of `source.toml`).
     fn of(configured: Result<Option<ConfiguredVault>, String>) -> Self {
         match configured {
             Ok(None) => Self::None,
@@ -99,12 +88,6 @@ impl AdmittedVault {
         }
     }
 
-    /// Whether the Secrets stage of a run admitted with this record leaves `configured`,
-    /// the vault this Mac is in now, in place of the one `plan` names: it is not the plan's
-    /// vault (the rule the stage's item joins by,
-    /// [`aterm_machines::init_secrets::selected_vault`]), and it was configured after the
-    /// run was admitted. A run admitted while it was configured is a switch someone asked
-    /// for, and joins.
     fn stands_in(self, plan: &Plan, configured: &ConfiguredVault) -> bool {
         let since = match self {
             Self::Unknown => false,
@@ -122,7 +105,6 @@ impl AdmittedVault {
             )
     }
 
-    /// The record's value: none for [`Self::Unknown`], which an older build's record reads as.
     fn record(self) -> Option<Value> {
         match self {
             Self::Unknown => None,
@@ -224,7 +206,6 @@ fn progress(root: &Path) -> Result<Option<Progress>, String> {
                 .ok_or("invalid initial setup vault at admission")?,
         ),
     };
-    // A visible rename from a failed write is not a durable stage completion.
     flush_record_with(&path, durable_directory)?;
     Ok(Some(Progress {
         done,
@@ -239,8 +220,6 @@ fn progress(root: &Path) -> Result<Option<Progress>, String> {
 
 fn save_progress(root: &Path, progress: Progress) -> Result<(), String> {
     let mut record = json!({"profile":PROFILE,"state":if progress.completed {"completed"} else {"pending"},"admitted":progress.admitted,"done":progress.done,"running":progress.running.map(Stage::bit),"plan":aterm_secrets::b64::encode_padded(&progress.plan),"revision":progress.revision});
-    // Left out for a run that keeps no vault, as an older build writes it; an older build
-    // ignores the field.
     if let (Some(fields), Some(vault)) = (record.as_object_mut(), progress.admitted_vault.record())
     {
         fields.insert("admitted_vault".into(), vault);
@@ -314,9 +293,6 @@ pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> 
     let Some(mut progress) = progress(root)? else {
         let plan = Plan::from(Selection::all().workstation());
         if stopped {
-            // Retire legacy run zero before clearing its stop. A successful
-            // explicit profile pass completes this original-eight-only run,
-            // whose plan selects no vault.
             return restart_in_vault(root, &plan, AdmittedVault::Unknown).map(|_| ());
         }
         save_workstation_authorization(root, &plan)?;
@@ -330,8 +306,6 @@ pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> 
     }
     let admitted = progress.admitted;
     if stopped {
-        // An older worker may retain a password across its backoff. Publish
-        // its retirement before replacing Cancel/Restore, including on crash.
         progress.admitted = false;
         save_progress(root, progress)?;
     }
@@ -340,11 +314,6 @@ pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> 
             plan.selection.set(setting, true);
         }
     }
-    // Invalidate the old subset's completion before publishing its expanded
-    // plan or clearing its done bit. If explicit preflight fails, the existing
-    // worker must retry these settings rather than accept that stale marker.
-    // A live run retains its revision and vault password; reviving a stopped
-    // run above deliberately retires those workers.
     save_workstation_authorization(root, &plan)?;
     save_plan(root, &plan)?;
     progress.plan = plan_digest(&plan);
@@ -371,17 +340,13 @@ pub(super) fn complete_explicit_workstation_plan(root: &Path) -> Result<(), Stri
     save_progress(root, progress)
 }
 
-/// The vault this Mac is configured for (`source.toml`), which the plan System State
-/// and the startup review offer is presented in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfiguredVault {
     config: aterm_secrets::client::Config,
-    /// The home a plan's `~/` path resolves against.
     home: PathBuf,
 }
 
 impl ConfiguredVault {
-    /// The vault configured under `paths`, or None when none is.
     fn read(paths: &aterm_secrets::client::Paths) -> Result<Option<Self>, String> {
         Ok(aterm_secrets::client::config(paths)
             .map_err(|error| error.to_string())?
@@ -391,8 +356,6 @@ impl ConfiguredVault {
             }))
     }
 
-    /// What a run's progress keeps of this vault ([`AdmittedVault::Configured`]): a digest
-    /// of its source and name, so the record holds no URL, query or pin.
     fn identity(&self) -> [u8; 32] {
         let source = match &self.config.source {
             aterm_secrets::transport::Source::Url(url) => format!("url\0{url}"),
@@ -403,10 +366,6 @@ impl ConfiguredVault {
         aterm_digest::Sha256::digest(format!("{source}\0{}", self.config.name).as_bytes())
     }
 
-    /// What the Secrets row says when setup leaves this vault in place of the one `plan`
-    /// names ([`AdmittedVault::stands_in`]): each by its name and where it is, never a URL's
-    /// query or a pin. The same vault under another signer than the plan's pin admits is
-    /// said so, not named twice.
     fn left_in_place(&self, plan: &Plan) -> String {
         let joined = vault_label(&self.config.name, &self.config.source);
         let named = aterm_secrets::transport::parse_source(&plan.vault_url, &self.home)
@@ -431,10 +390,6 @@ impl ConfiguredVault {
         }
     }
 
-    /// `plan` with this vault as its source unless it names this vault already, where
-    /// its source stays as typed (a pin with it). A saved source that names another vault
-    /// gives way, so an Apply left as offered resumes the vault this Mac is in and never
-    /// joins the one an earlier run saved; a person who means another vault types it.
     fn present(&self, mut plan: Plan) -> Plan {
         let names_this = aterm_secrets::transport::parse_source(&plan.vault_url, &self.home)
             .is_ok_and(|(source, _)| source == self.config.source);
@@ -448,7 +403,6 @@ impl ConfiguredVault {
     }
 }
 
-/// `vault <name> (<where>)`: a URL without its query or fragment, a path as it is.
 fn vault_label(name: &str, source: &aterm_secrets::transport::Source) -> String {
     let at = match source {
         aterm_secrets::transport::Source::Url(url) => aterm_secrets::transport::describe(url),
@@ -457,15 +411,11 @@ fn vault_label(name: &str, source: &aterm_secrets::transport::Source) -> String 
     format!("vault {name} ({at})")
 }
 
-/// This user's configured vault ([`ConfiguredVault::read`]).
 fn live_configured_vault() -> Result<Option<ConfiguredVault>, String> {
     let paths = aterm_secrets::client::Paths::live().map_err(|error| error.to_string())?;
     ConfiguredVault::read(&paths)
 }
 
-/// The plan offered from the `saved` record, in the `configured` vault. A modern record
-/// that names its source is kept as it is when the configuration cannot be read; a
-/// legacy record or none needs it, since the LAN default stands in for its source.
 fn offered_plan(
     saved: Option<(Plan, bool)>,
     configured: Result<Option<ConfiguredVault>, String>,
@@ -483,10 +433,7 @@ fn offered_plan(
     }
 }
 
-/// Authorize the exact selected stages and source before any OS probes. A
-/// password must be supplied separately to [`apply_initial_setup`] and is never saved.
-/// Returns None if an earlier finished decision won, or the exact run revision
-/// after this choice is durably admitted, including an empty checklist.
+/// Authorize the exact selected stages and source before any OS probes.
 pub fn authorize_initial_setup(plan: &Plan) -> Result<Option<u64>, String> {
     authorize_initial_setup_observed(plan).result
 }
@@ -499,8 +446,7 @@ pub fn authorize_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<Opt
     )
 }
 
-/// Explicitly run the selected plan again, superseding an earlier completion,
-/// cancellation or restoration. Original preference before-images are retained.
+/// Explicitly run the selected plan again, superseding an earlier completion or cancellation.
 pub fn restart_initial_setup(plan: &Plan) -> Result<u64, String> {
     restart_initial_setup_observed(plan).result
 }
@@ -513,9 +459,7 @@ pub fn restart_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<u64> 
     )
 }
 
-/// One explicit restart, retaining ownership only while its final admission
-/// save needs recovery. Keep the original plan, password and UI receipt until
-/// this returns a revision or is no longer pending; never reuse a finished attempt.
+/// One explicit restart, retaining ownership only while its final admission save needs recovery.
 #[derive(Default)]
 pub struct InitialSetupRestart {
     started: bool,
@@ -532,17 +476,11 @@ struct RestartCommit {
 
 impl InitialSetupRestart {
     /// Whether the same final admission step can still be confirmed or retried.
-    /// Errors before that step do not leave a pending operation.
     pub const fn pending(&self) -> bool {
         self.final_commit.is_some()
     }
 
-    /// Persist this exact restart. Some is its durably admitted revision; None
-    /// means it was superseded or already ended. Retry errors only while pending.
-    /// `vault_typed`: the person typed the plan's vault in System State's field. One left
-    /// as the field showed it asks for the vault System State shows now
-    /// ([`shown_in_vault`]), so a tab shown before this Mac joined a vault from a terminal
-    /// never moves it out of that vault; a typed one moves it.
+    /// Persist this exact restart.
     pub fn persist_observed(
         &mut self,
         plan: &Plan,
@@ -563,8 +501,6 @@ impl InitialSetupRestart {
         )
     }
 
-    /// `read`: which vault this Mac is in now, read once by a first attempt, whose run
-    /// keeps it.
     fn persist_with(
         &mut self,
         root: &Path,
@@ -574,8 +510,6 @@ impl InitialSetupRestart {
         commit: impl FnOnce(&Path, Progress) -> Result<(), String>,
         observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
     ) -> Result<Option<u64>, String> {
-        // The caller holds profile.lock for staging, confirmation, and any
-        // final write. A durable stop wins even if other records are unreadable.
         if self.pending() {
             if !owns_publications(root, &self.final_commit.as_ref().unwrap().publications)? {
                 self.final_commit = None;
@@ -645,16 +579,11 @@ impl InitialSetupRestart {
                 Ok(Some(next.revision))
             }
             Err(why) => {
-                // A failed flush can leave either the staged file or our new
-                // admitted file visible. Pin its identity before unlocking,
-                // without relying on reads or another flush to succeed now.
                 match observation::publications(root) {
                     Ok(publications) => {
                         self.final_commit.as_mut().unwrap().publications = publications;
                     }
                     Err(_) => {
-                        // An unbound failure must never adopt whatever becomes
-                        // readable later as this operation's publication.
                         self.final_commit = None;
                     }
                 }
@@ -669,8 +598,6 @@ fn owns_publications(root: &Path, expected: &observation::Publications) -> Resul
     if matches!(stop, Ok(Some(_))) {
         return Ok(false);
     }
-    // A malformed replacement is still supersession. Only an error reading
-    // our unchanged decision belongs to this operation and remains retryable.
     if observation::publications(root)? != *expected {
         return Ok(false);
     }
@@ -678,13 +605,11 @@ fn owns_publications(root: &Path, expected: &observation::Publications) -> Resul
     Ok(true)
 }
 
-/// A restart from a scratch home, which is in no vault.
 #[cfg(test)]
 fn restart_at(root: &Path, plan: &Plan) -> Result<u64, String> {
     restart_reading(root, plan, || Ok(None))
 }
 
-/// Restart `plan`'s run in the vault `read` finds this Mac in now, which the run keeps.
 fn restart_reading(
     root: &Path,
     plan: &Plan,
@@ -693,7 +618,6 @@ fn restart_reading(
     restart_in_vault(root, plan, AdmittedVault::of(read()))
 }
 
-/// Restart `plan`'s run while this Mac is in `vault`, which the run keeps.
 fn restart_in_vault(root: &Path, plan: &Plan, vault: AdmittedVault) -> Result<u64, String> {
     restart_with(root, plan, vault, save_progress)
 }
@@ -718,9 +642,6 @@ fn stage_restart(root: &Path, plan: &Plan, vault: AdmittedVault) -> Result<Progr
     };
     save_plan(root, plan)?;
     save_progress(root, next)?;
-    // The new run's automatic attempts start afresh: its cooldown, and the items an
-    // earlier run's attempt left held (`automatic_pass`), which a new revision already
-    // retires, so that an unreadable record cannot outlive a person's rerun either.
     for (record, what) in [
         ("automatic-attempt.json", "the automatic retry cooldown"),
         (HELD_RECORD, "the held automatic setup items"),
@@ -732,8 +653,6 @@ fn stage_restart(root: &Path, plan: &Plan, vault: AdmittedVault) -> Result<Progr
             Err(error) => return Err(format!("cannot reset {what}: {error}")),
         }
     }
-    // Release an earlier stop only after the new plan and progress are durable.
-    // The final admission record is still required before any setup can run.
     save_workstation_authorization(root, plan)?;
     Ok(next)
 }
@@ -749,13 +668,11 @@ fn save_workstation_authorization(root: &Path, plan: &Plan) -> Result<(), String
     )
 }
 
-/// An authorization from a scratch home, which is in no vault.
 #[cfg(test)]
 fn authorize_at(root: &Path, plan: &Plan) -> Result<Option<u64>, String> {
     authorize_reading(root, plan, || Ok(None))
 }
 
-/// Authorize `plan` in the vault `read` finds this Mac in now, which the run keeps.
 fn authorize_reading(
     root: &Path,
     plan: &Plan,
@@ -791,13 +708,9 @@ fn authorize_with(
     current.admitted_vault = vault;
     save_plan(root, plan)?;
     save_progress(root, current)?;
-    // Original doctor APIs retain their own marker. Workstation completion must
-    // not complete the independent vault, repository and permissions stages.
     if current.done & Stage::Workstation.bit() == 0 {
         save_workstation_authorization(root, plan)?;
     }
-    // This is the multi-file authorization commit. Earlier records can be
-    // visible after an interrupted write without releasing permission UI.
     current.admitted = true;
     commit(root, current)?;
     Ok(Some(current.revision))
@@ -830,21 +743,16 @@ fn completed_at(root: &Path) -> Result<bool, String> {
         Some(progress) => Ok(saved_plan(root)?.is_some_and(|plan| {
             progress.belongs_to(&plan) && progress.admitted && progress.completed
         })),
-        // Preserve decisions made before unified setup existed.
         None => first_run_complete(root),
     }
 }
 
-/// Whether every selected setup stage finished, or the person cancelled or
-/// restored it. Completed legacy workstation decisions remain honored.
+/// Whether every selected setup stage finished, or the person cancelled or restored it.
 pub fn initial_setup_finished() -> Result<bool, String> {
     finished_at(&state_root()?)
 }
 
-/// The durable identity of the current setup run. Retry workers must compare it
-/// after reacquiring the automatic claim, before using any retained password.
-/// Zero means no modern run exists. An interrupted plan/progress pair is refused
-/// until authorization repairs it, rather than returning an older run's revision.
+/// The durable identity of the current setup run.
 pub fn initial_setup_revision() -> Result<u64, String> {
     revision_at(&state_root()?)
 }
@@ -867,8 +775,7 @@ fn plan_revision(progress: Option<Progress>, plan: Option<&Plan>) -> Result<u64,
     Ok(progress.revision)
 }
 
-/// A coherent observation of a durably admitted modern setup run. This does
-/// not grant an execution lease; workers must still fence effects by revision.
+/// A coherent observation of a durably admitted modern setup run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitialSetupAdmission {
     pub plan: Plan,
@@ -876,10 +783,7 @@ pub struct InitialSetupAdmission {
     pub completed: bool,
 }
 
-/// Read the admitted run without loading fallback vault configuration, probing
-/// the OS or changing records. Staged choices and stopped runs return None;
-/// a durable stop takes precedence over unreadable plan/progress records.
-/// Otherwise unreadable or changing records are errors, not missing admission.
+/// Read the admitted run without loading fallback vault configuration or probing the OS.
 pub fn initial_setup_admission() -> Result<Option<InitialSetupAdmission>, String> {
     admission_at(&state_root()?)
 }
@@ -908,20 +812,15 @@ fn admission_at(root: &Path) -> Result<Option<InitialSetupAdmission>, String> {
 }
 
 /// One observation of the saved plan, its progress and the permission decision.
-/// A finished run includes Cancel and Restore; callers must use the explicit
-/// permission decision rather than infer permission guidance from completion.
 #[derive(Debug)]
 pub struct InitialSetupSnapshot {
-    /// The saved plan; from [`initial_setup_snapshot`], in the vault this Mac is
-    /// configured for unless its run still joins the vault it saved, which System
-    /// State's fields start from.
+    /// Saved plan from [`initial_setup_snapshot`].
     pub plan: Plan,
     pub finished: bool,
     pub rows: Vec<Row>,
     /// Zero means that no matching modern setup run exists.
     pub revision: u64,
-    /// Whether existing native permission guidance may run. Errors or absent
-    /// authorization must be treated as false by callers.
+    /// Whether existing native permission guidance may run.
     pub permissions_allowed: bool,
     /// Identity of the same coherent records used for these rows and policy.
     pub observation: InitialSetupObservation,
@@ -945,8 +844,7 @@ impl std::fmt::Display for InitialSetupSnapshotError {
 
 impl std::error::Error for InitialSetupSnapshotError {}
 
-/// Observe only existing setup records. This neither authorizes work nor
-/// waits behind a profile pass; callers must discard results on read failure.
+/// Observe only existing setup records.
 pub fn initial_setup_observation() -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
     observation_at(&state_root().map_err(InitialSetupSnapshotError::Read)?)
 }
@@ -996,8 +894,6 @@ pub(super) fn observe_mutation_at<T>(
         Err(why) => return InitialSetupObserved::new(Err(why), before),
     };
     let result = operation(root);
-    // Capture errors too: Restore may have durably stopped the run before a
-    // later recovery failure. The writer lock still excludes a newer choice.
     InitialSetupObserved::new(result, observation_at(root).ok())
 }
 
@@ -1014,26 +910,17 @@ pub(super) fn observe_read_only<T>(
     let result = operation(&root);
     let after = observation_at(&root).ok();
     let idle_after = HeldLock::profile_active(&root).is_ok_and(|active| !active);
-    // Restore publishes its stop before its effects. Matching records alone
-    // cannot certify a Check that overlaps that already-running writer.
     let observation =
         before.filter(|before| idle_before && idle_after && Some(before) == after.as_ref());
     InitialSetupObserved::new(result, observation)
 }
 
-/// Read only aterm's records/configuration, without probing OS grants, accounts
-/// or preferences. Concurrent record changes are refused for the caller to retry;
-/// this never waits for a long-running profile pass to release its lock.
+/// Read only aterm's records/configuration, without probing OS grants, accounts or preferences.
 pub fn initial_setup_snapshot() -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     let root = state_root().map_err(InitialSetupSnapshotError::Read)?;
     snapshot_in_vault(&root, live_configured_vault())
 }
 
-/// The snapshot of the records under `root`, its plan in the `configured` vault
-/// ([`offered_plan`]), which System State's fields start from, except while the saved
-/// plan's run still joins the vault it saved ([`joining_saved_vault`]): the run's retries
-/// join that one, so the field keeps it as saved. Its rows, revision and permission policy
-/// are the saved plan's: the progress they read belongs to it.
 fn snapshot_in_vault(
     root: &Path,
     configured: Result<Option<ConfiguredVault>, String>,
@@ -1048,9 +935,6 @@ fn snapshot_in_vault(
     Ok(snapshot)
 }
 
-/// `plan` with the vault System State shows while this Mac is in `configured` and its
-/// records are `records`: that vault ([`ConfiguredVault::present`]), except while the
-/// saved plan's run still joins the vault it saved ([`joining_saved_vault`]).
 fn shown_in_vault(plan: Plan, records: &Records, configured: &ConfiguredVault) -> Plan {
     if joining_saved_vault(records, configured) {
         plan
@@ -1059,11 +943,6 @@ fn shown_in_vault(plan: Plan, records: &Records, configured: &ConfiguredVault) -
     }
 }
 
-/// Whether the saved plan's run still joins the vault it saved while this Mac is in
-/// `configured`: a modern record that selects Secrets, its run admitted and neither
-/// completed nor stopped, and its Secrets stage still to do, which does not leave
-/// `configured` in place ([`AdmittedVault::stands_in`]). A vault typed in System State
-/// whose join failed is such a run, and the worker joins it again on each retry.
 fn joining_saved_vault(records: &Records, configured: &ConfiguredVault) -> bool {
     let Some((plan, true)) = &records.plan else {
         return false;
@@ -1088,8 +967,7 @@ pub fn initial_setup_snapshot_at(
     snapshot_at(root, fallback)
 }
 
-/// The saved plan and recorded stage progress for System State. The boolean
-/// means the automatic run has ended, including Cancel or Restore.
+/// The saved plan and recorded stage progress for System State.
 pub fn initial_setup_status() -> Result<(Plan, bool, Vec<Row>), String> {
     let snapshot = initial_setup_snapshot().map_err(|error| error.to_string())?;
     Ok((snapshot.plan, snapshot.finished, snapshot.rows))
@@ -1163,8 +1041,6 @@ fn snapshot_with(
     if records != read().map_err(InitialSetupSnapshotError::Read)? {
         return Err(InitialSetupSnapshotError::Updating);
     }
-    // This is a current liveness sample, not an execution lease. No shared
-    // observation lock spans the record durability reads or the UI's work.
     let active = activity().map_err(InitialSetupSnapshotError::Read)?;
     Ok(snapshot_from_observation(
         fallback,
@@ -1216,8 +1092,6 @@ fn snapshot_from_observation(
         .filter(|stage| stage.selected(&plan))
         .map(|stage| {
             let completed = progress.is_some_and(|progress| progress.done & stage.bit() != 0);
-            // Restore stops convergence before any preference writes. Its marker
-            // therefore cannot certify either the profile or successful restoration.
             let restoring = stopped == Some(Stop::Restored) && *stage == Stage::Workstation;
             let recorded_running =
                 progress.is_some_and(|progress| progress.running == Some(*stage));
@@ -1268,29 +1142,19 @@ trait InitialHost {
     fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String>;
     fn spotlight(&mut self) -> Result<Vec<Row>, String>;
     fn permissions(&mut self) -> Result<Vec<Row>, String>;
-    /// One try of the Secrets stage, whose join replaces only the vault configuration
-    /// `replaces` admits. `password` is the join password System State was given, taken
-    /// once a join used it and left for the next try otherwise.
     fn secrets(
         &mut self,
         plan: &Plan,
         replaces: Replaces,
         password: &mut Option<SecretBytes>,
     ) -> Result<Vec<Row>, String>;
-    /// What can change a Secrets try's answer without the person ([`secrets_retry`]):
-    /// `None` paces nothing, a try each pass.
     fn secrets_pace(&mut self) -> Option<Pace>;
-    /// The vault this Mac is configured for now ([`ConfiguredVault::read`]).
     fn configured_vault(&mut self) -> Result<Option<ConfiguredVault>, String>;
     fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String>;
     fn repositories(&mut self) -> Result<Vec<Row>, String>;
-    /// Reach what a Workstation pass left alone for want of Full Disk Access, once this
-    /// process holds it ([`super::follow_up_at`]); `None` when nothing ran. The caller holds
-    /// the profile lock.
     fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String>;
 }
 
-/// This Mac's setup stages. `reads`: what paces the Secrets stage ([`secrets_retry::Live`]).
 struct LiveInitial<R> {
     reads: R,
     spotlight_result: Option<Result<Vec<Row>, String>>,
@@ -1298,7 +1162,6 @@ struct LiveInitial<R> {
 }
 
 impl LiveInitial<secrets_retry::Live> {
-    /// This Mac's stages, the Secrets stage paced by this Mac's network and vault.
     const fn live() -> Self {
         Self {
             reads: secrets_retry::Live,
@@ -1314,7 +1177,6 @@ impl<R> LiveInitial<R> {
     }
 }
 
-/// The vault item's rows under the stage's own name, as the checklist shows it.
 fn secrets_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
     item_rows(rows)
         .into_iter()
@@ -1533,9 +1395,6 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         replaces: Replaces,
         password: &mut Option<SecretBytes>,
     ) -> Result<Vec<Row>, String> {
-        // `aterm init`'s vault item, unattended: every change it makes (this Mac's key and
-        // source, its join request, the subscriber, the files) comes after its line in the
-        // converge journal, and a vault that does not answer is stood aside before any.
         let sys = aterm_machines::port::Live::new();
         let ctx = self.context()?;
         let ops = aterm_machines::init_secrets::unattended(&ctx)?;
@@ -1578,11 +1437,6 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
     }
 }
 
-/// How long the setup's join waits for the vault to let this Mac in. An admin Mac's
-/// subscriber reads the join queue every 2 s, so an open vault, or a request that proves the
-/// join password, is approved and synced well within it; past it the row says the Mac waits,
-/// and the subscriber finishes the join once approved (the stage's next try sees it at the
-/// worker's next pass once the subscriber wrote it).
 const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn readiness_row(name: &str, ready: bool, detail: String) -> Row {
@@ -1600,17 +1454,11 @@ fn rows_ready(rows: &[Row]) -> bool {
             .all(|row| matches!(row.status.as_str(), "ok" | "applied"))
 }
 
-/// What the Secrets stage of a run does with the vault this Mac is in now.
 enum SecretsTry {
-    /// Leaves it in place of the one the plan names ([`AdmittedVault::stands_in`]).
     LeaveInPlace(ConfiguredVault),
-    /// Runs the vault item, whose join replaces only the configuration this read found.
     RunItem(Replaces),
 }
 
-/// What the Secrets stage of a run admitted with `admitted` does with the vault this Mac is
-/// in now. A run an older build admitted reads nothing, and its join replaces whatever its
-/// probe reads.
 fn secrets_try(
     host: &mut dyn InitialHost,
     plan: &Plan,
@@ -1640,12 +1488,9 @@ fn execute_initial(
         return Ok(None);
     };
     let Some(mut progress) = progress(root)? else {
-        // A legacy plan authorized its original workstation rows only.
         return host.workstation(root);
     };
     if !progress.belongs_to(&plan) || !progress.admitted {
-        // A partially published choice, including a pending record from before
-        // admission was explicit, needs authorization before any OS work.
         return Ok(None);
     }
     let mut report = Report {
@@ -1660,10 +1505,6 @@ fn execute_initial(
         }
         if stage == Stage::Repositories && Stage::Secrets.selected(&plan) {
             if progress.done & Stage::Secrets.bit() != 0 {
-                // A subscriber can fail to materialize a later version while
-                // repository setup is pending. Historical completion never
-                // admits stale credentials into a new repository attempt. The
-                // vault read is the one the Secrets stage left in place, if any.
                 let current = secrets_try(host, &plan, progress.admitted_vault).and_then(|read| {
                     host.current_vault(&match read {
                         SecretsTry::LeaveInPlace(vault) => vault.present(plan.clone()),
@@ -1693,8 +1534,6 @@ fn execute_initial(
                 continue;
             }
         }
-        // A Secrets try that did not finish pauses the next until its time or a change
-        // that can alter its answer; meanwhile its rows stand.
         let paced = if stage == Stage::Secrets {
             host.secrets_pace()
         } else {
@@ -1726,11 +1565,6 @@ fn execute_initial(
             },
             Stage::Spotlight => host.spotlight(),
             Stage::Permissions => host.permissions(),
-            // A vault this Mac joined after the run was admitted stays: nothing is joined,
-            // made or journaled, and the row says how to move the Mac. The stage is done
-            // once that vault reads synced with its subscriber running, as repository setup
-            // reads it; until then its rows say what it waits for. One that cannot be read
-            // is not joined over either; the try changed nothing, so it is no failure.
             Stage::Secrets => match secrets_try(host, &plan, progress.admitted_vault) {
                 Ok(SecretsTry::LeaveInPlace(vault)) => {
                     let mut rows = vec![readiness_row(
@@ -1780,14 +1614,6 @@ fn execute_initial(
         }
         report.rows.extend(rows);
     }
-    // What a Workstation pass left alone in another app's container for want of Full Disk
-    // Access (Notification Center's widgets) is reached once this process holds the grant:
-    // once per pass, after the stages, so a grant the Permissions stage's hand-over brings,
-    // or a record this pass of the Workstation stage writes, is reached in the same pass;
-    // whether the Workstation stage is done or still pending (its automatic passes hold the
-    // row as it is once it settled for its other keys, and say the list is this step's,
-    // [`super::SETTLED_OWED`]); silently, never a stage of its own, so no stage waits on it
-    // and nothing reruns without the grant.
     match host.withheld(root) {
         Ok(Some(follow_up)) => report.rows.extend(follow_up.rows),
         Ok(None) => {}
@@ -1807,10 +1633,7 @@ fn execute_initial(
     Ok(Some(report))
 }
 
-/// Apply independently selected setup stages after authorization. Pending
-/// enrollment, permissions and offline services remain retryable. This never
-/// reads a terminal or stores the optional join password; a join that sent it
-/// takes it (`None` afterwards), and one that failed leaves it for the next pass.
+/// Apply independently selected setup stages after authorization.
 pub fn apply_initial_setup(
     expected_revision: u64,
     password: &mut Option<SecretBytes>,
@@ -1837,8 +1660,6 @@ fn execute_initial_for_revision(
     expected_revision: u64,
     password: &mut Option<SecretBytes>,
 ) -> Result<Option<Report>, String> {
-    // The caller holds profile.lock: a legacy doctor Apply can revive a stopped
-    // run without taking automatic.lock after a scheduler's earlier revision read.
     if revision_at(root)? != expected_revision {
         return Ok(None);
     }
@@ -1860,13 +1681,9 @@ mod tests {
         vault_blocked: bool,
         vault_error: bool,
         vault_url: Option<String>,
-        /// What [`InitialHost::secrets_pace`] reads: `None` tries the stage each pass.
         pace: Option<Pace>,
-        /// The vault this Mac is in ([`InitialHost::configured_vault`]).
         configured: Option<ConfiguredVault>,
-        /// Its configuration cannot be read.
         configured_unreadable: bool,
-        /// The source the last [`InitialHost::current_vault`] read was asked about.
         checked_url: Option<String>,
     }
 
@@ -1973,8 +1790,6 @@ mod tests {
         let baseline = observation_at(root.path()).unwrap();
         let mut authorization = InitialSetupAuthorization::capture_at(root.path()).unwrap();
         assert_eq!(revision_at(root.path()).unwrap(), 0);
-        // Restore stops first even when recovery preflight fails. Doctor Apply
-        // then revives only its eight groups before hitting the same bad backup.
         std::fs::write(
             root.path().join("original-preferences.json"),
             b"invalid backup",
@@ -1989,8 +1804,6 @@ mod tests {
         let before = observation_at(root.path()).unwrap();
         assert_ne!(before, baseline);
 
-        // The intervening stop is already gone when the old window's untouched
-        // timer returns Begin. Its captured publications must still fence it.
         let accepted = authorization
             .persist_at(root.path(), &offered)
             .result
@@ -2035,8 +1848,6 @@ mod tests {
         observation_at(root).map_err(|error| error.to_string())
     }
 
-    /// System State's Apply of `plan` (`vault_typed`: its vault typed in the field) while
-    /// this Mac is in the vault `read` finds: the admitted run's revision.
     fn system_state_apply(
         root: &Path,
         plan: &Plan,
@@ -2649,8 +2460,6 @@ mod tests {
         assert!(snapshot.finished);
         assert_eq!(snapshot.observation, restored);
 
-        // Publication can be delayed until after another process accepts Apply.
-        // The old failure must retain its original context rather than borrow it.
         restart_at(root.path(), &plan).unwrap();
         assert_ne!(observation_at(root.path()).unwrap(), restored);
     }
@@ -2770,13 +2579,10 @@ mod tests {
         authorize_at(root.path(), &plan).unwrap();
         let original = revision_at(root.path()).unwrap();
         let mut cancel = InitialSetupCancellation::default();
-        // Another process is still applying this run when Cancel is chosen.
         let active = HeldLock::take(root.path()).unwrap();
         assert!(cancel.persist_at(root.path()).is_err());
         drop(active);
 
-        // That process can accept a new Apply while the old Cancel retains
-        // only its own process's busy reservation during the retry backoff.
         restart_at(root.path(), &plan).unwrap();
         assert!(revision_at(root.path()).unwrap() > original);
         assert!(!cancel.persist_at(root.path()).unwrap());
@@ -2804,8 +2610,6 @@ mod tests {
                 current > original,
                 "{stop}: explicit apply revived an older worker's password"
             );
-            // The scheduler can have read the old revision immediately before
-            // this revival. Its actual effect boundary must check under lock.
             let _profile = HeldLock::take(root.path()).unwrap();
             let password = SecretBytes::from(b"test-only-old-run-password".as_slice());
             let mut host = Fake::default();
@@ -2881,8 +2685,6 @@ mod tests {
         assert_eq!(snapshot.revision, 0);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 
-        // A new plan may be published before its progress record. An older
-        // successful Mac decision must not authorize the new permission group.
         write_json(
             &root.path().join("first-run.json"),
             &json!({"profile":PROFILE,"state":"applied","accounts_verified":true}),
@@ -2922,7 +2724,6 @@ mod tests {
         authorize_at(root.path(), &plan).unwrap();
         let revision = snapshot_at(root.path(), Plan::default()).unwrap().revision;
         for state in ["cancelled", "restored"] {
-            // Restore publishes this before preference work and may fail later.
             write_json(
                 &root.path().join("first-run.json"),
                 &json!({"profile":PROFILE,"state":state}),
@@ -3047,8 +2848,6 @@ mod tests {
         execute_initial(&mut Fake::default(), root.path(), &mut None).unwrap();
         let next = selected(&[Setting::Widgets, Setting::Permissions]);
 
-        // The first publication still has the old, admitted progress. Its plan
-        // binding must hold permissions until the reset and admission complete.
         save_plan(root.path(), &next).unwrap();
         let published = snapshot_at(root.path(), Plan::default()).unwrap();
         assert!(!published.permissions_allowed);
@@ -3158,7 +2957,6 @@ mod tests {
         assert_eq!(host.calls, Stage::ALL[..4]);
         assert!(first_run_complete(root.path()).unwrap());
         assert!(!finished_at(root.path()).unwrap());
-        // Another launch must still be able to claim this unfinished plan.
         assert!(claim_automatic_setup_at(root.path()).unwrap().is_some());
         host.calls.clear();
         host.pending = None;
@@ -3186,8 +2984,6 @@ mod tests {
             interrupted.running = Some(Stage::Repositories);
             save_progress(root.path(), interrupted).unwrap();
 
-            // A background sync now has incomplete files (or unreadable state).
-            // No repository configuration, credential or clone operation may run.
             host.calls.clear();
             host.failure = None;
             host.vault_blocked = !readiness_error;
@@ -3205,8 +3001,6 @@ mod tests {
             assert_eq!(progress(root.path()).unwrap().unwrap().running, None);
             assert!(!finished_at(root.path()).unwrap());
 
-            // The next pass repairs the vault before its fresh admission check;
-            // preferences, Spotlight and permissions retain their prior history.
             host.vault_blocked = false;
             host.vault_error = false;
             execute_initial(&mut host, root.path(), &mut None).unwrap();
@@ -3240,11 +3034,6 @@ mod tests {
         assert!(finished_at(empty.path()).unwrap());
     }
 
-    /// The worker's stages over the doctor of a widgets row whose Notification Center key
-    /// waits for Full Disk Access ([`super::super::tests::Withholding`]): its Workstation
-    /// stage is that doctor's automatic pass, and its follow-up after the stages that
-    /// doctor's; every other stage is [`Fake`]'s. With `grant_in_permissions`, macOS gives
-    /// aterm the grant while the Permissions stage runs, as its hand-over brings it.
     struct WithholdingStages {
         doctor: super::super::tests::Withholding,
         rest: Fake,
@@ -3299,17 +3088,6 @@ mod tests {
         }
     }
 
-    /// The real item boundary through the worker's stage loop: the widgets row is one item of
-    /// the Window Manager's key and Notification Center's list, the Dock never verifies, and
-    /// the Mac has no Full Disk Access. The first retry hides the desktop widgets and leaves
-    /// Notification Center alone; the person shows their desktop widgets again; thirty more
-    /// retries, the stage still pending, write no Window Manager key and relaunch the Dock
-    /// only for the Dock's own second try. The grant then arrives while the stage is still
-    /// pending: the follow-up after that retry's stage pass clears Notification Center and
-    /// relaunches it once, and writes no Window Manager key and relaunches no Dock; no later
-    /// retry touches either again. Negative controls: a Mac that never grants it keeps
-    /// Notification Center as it is; following up only once the stage is done (the old gate
-    /// in `execute_initial`) never clears it while the stage is pending.
     #[test]
     fn the_grant_that_arrives_while_the_stage_is_pending_clears_notification_center_once() {
         for granted in [true, false] {
@@ -3368,17 +3146,6 @@ mod tests {
         }
     }
 
-    /// The widgets row a retry reports never says aterm set Notification Center's widget list
-    /// and the person changed it since (aterm never set it, and nobody changed it), when the
-    /// grant arrives while the stage is pending (the Dock never verifies), and each retry
-    /// adds at most one follow-up row. The first retry with the grant holds the row as it is
-    /// and says the list is the follow-up's ([`SETTLED_OWED`]), beside the follow-up's own
-    /// row after its stages. When the clear takes, later retries find the list cleared and
-    /// their rows name it no more, nor run the follow-up; when Notification Center never
-    /// keeps it (two tries, ten minutes apart, then held), every retry says so again, beside
-    /// one follow-up row. Negative controls: holding the row with [`SETTLED`] alone
-    /// (`Automatic::holds` ignoring what is owed) fails both arms; a follow-up called twice
-    /// in a retry adds a second follow-up row.
     #[test]
     fn the_widgets_row_never_says_aterm_set_the_list_the_follow_up_still_owes() {
         use super::super::tests::{WIDGETS, Withholding, nc_widgets};
@@ -3432,15 +3199,6 @@ mod tests {
         }
     }
 
-    /// The worker's stages over a widgets row whose Notification Center key waits for Full
-    /// Disk Access, with the aterm permissions stage waiting for the same grant: the
-    /// Workstation stage ends without the key, and no retry touches it while the grant is
-    /// missing. The grant then arrives during a retry's Permissions stage, after its
-    /// Workstation stage is long done: the follow-up after that retry's stages clears
-    /// Notification Center's widgets, once, as setup completes, and nothing runs after it.
-    /// Negative controls: a Mac that never grants it finishes setup with the key untouched;
-    /// no follow-up after the stages (one before them alone, or none) finishes setup with
-    /// Notification Center uncleared, and nothing clears it after.
     #[test]
     fn the_grant_that_arrives_during_the_permissions_stage_is_followed_up_as_setup_completes() {
         for granted in [true, false] {
@@ -3489,11 +3247,6 @@ mod tests {
         }
     }
 
-    /// The vault's remedy, Apply with the vault row on and every Mac settings row off, runs no
-    /// Mac settings and withdraws nothing setup still owes: once the grant arrives, that run's
-    /// follow-up clears Notification Center's widgets. A choice that still runs Mac settings
-    /// without the widgets row withdraws them. Negative control: reading any choice without
-    /// the row as a withdrawal leaves them uncleared after the remedy.
     #[test]
     fn the_vault_remedy_withdraws_no_clear_setup_owes() {
         use super::super::tests::{WIDGETS, Withholding};
@@ -3523,11 +3276,6 @@ mod tests {
         }
     }
 
-    /// The follow-up's tries belong to the setup run that spent them, as the run's own
-    /// record's do: a run the startup review admits after explicit passes spent them, or one
-    /// System State's Apply restarts, starts them afresh and keeps what the record owes,
-    /// while the same run keeps them. Negative control: reading the tries whatever run spent
-    /// them holds the new run's first try back.
     #[test]
     fn a_new_setup_run_starts_the_follow_ups_tries_afresh() {
         use super::super::{load_withheld, record_withheld};
@@ -3542,14 +3290,12 @@ mod tests {
             assert_eq!(owed.failed.len(), 1, "{:?}", owed.failed);
             assert_eq!(owed.failed[0].tries, 2);
         };
-        // Explicit passes before any run was admitted, then the startup review's answer.
         spend(root.path());
         let plan = selected(&[Setting::Widgets]);
         authorize_at(root.path(), &plan).unwrap().unwrap();
         let owed = load_withheld(root.path()).unwrap();
         assert_eq!(owed.items, std::slice::from_ref(&widgets));
         assert!(owed.failed.is_empty(), "{:?}", owed.failed);
-        // Spent in this run, they stay spent until Apply restarts it.
         spend(root.path());
         restart_at(root.path(), &plan).unwrap();
         let owed = load_withheld(root.path()).unwrap();
@@ -3557,15 +3303,6 @@ mod tests {
         assert!(owed.failed.is_empty(), "{:?}", owed.failed);
     }
 
-    /// One budget of tries for Notification Center's clear, whichever pass makes each, on the
-    /// real item boundary through the worker's stage loop: the widgets row's first try,
-    /// without the grant, does not verify (its Window Manager key's reader is slow), and once
-    /// the grant arrives Notification Center never keeps a clear. The follow-up makes the
-    /// first try; the setup pass, whose own wait ends first, waits for the follow-up's too and
-    /// makes the second; then neither tries again in that build. So the clear is tried exactly
-    /// twice, never twice within [`SECOND_TRY_AFTER`], and no retry makes two tries. Negative
-    /// control: holding the setup pass by its own record's tries alone makes the second try
-    /// less than ten minutes after the first.
     #[test]
     fn notification_centers_clear_is_tried_twice_per_build_whichever_pass_makes_each_try() {
         use super::super::tests::Withholding;
@@ -3603,11 +3340,6 @@ mod tests {
         assert!(apart >= SECOND_TRY_AFTER, "{apart:?}");
     }
 
-    /// System State's Apply, which the held row names, starts the clear's tries afresh: once
-    /// both tries of a build are spent, a restart of the same plan keeps Notification Center's
-    /// list owed and its first retry tries the clear again, with a budget of two as the first
-    /// run had. Negative control: a restart that leaves the follow-up record's tries in place
-    /// holds the whole widgets row (and the follow-up) HELD in every later run of the build.
     #[test]
     fn apply_in_system_state_tries_a_held_clear_again() {
         use super::super::tests::Withholding;
@@ -3643,13 +3375,6 @@ mod tests {
         }
     }
 
-    /// THE VAULT LINES' REMEDY TOUCHES THE VAULT AND NOTHING THE PERSON KEEPS. After the
-    /// default setup finished, System State's Apply with the vault row on and the Mac
-    /// settings rows off, the other rows as they were (what the vault's digest lines ask),
-    /// runs no Mac settings pass (no Dock or sign-out), keeps first-run complete, and keeps
-    /// aterm's permission asks allowed, since the permissions row stays on. The Secrets row
-    /// alone would end those asks on every later launch, and every row on runs the Mac
-    /// settings again.
     #[test]
     fn the_vault_lines_apply_leaves_the_mac_settings_and_the_permission_asks_alone() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -3694,13 +3419,6 @@ mod tests {
         assert!(host.calls.contains(&Stage::Workstation), "{:?}", host.calls);
     }
 
-    /// The worker's stage loop over a Mac setting macOS never keeps: every retry runs
-    /// the Workstation stage again through the worker's own entry, and it stays pending,
-    /// but only two retries ten minutes apart make the change, relaunch the Dock and put
-    /// the change back. Every other retry writes and relaunches nothing while the other
-    /// stages go on retrying. Negative control: an automatic pass that holds nothing
-    /// (`host.hold(&[])` in `automatic_pass`) relaunches the Dock on every retry, as the
-    /// worker did every minute on 2026-10-22.
     #[test]
     fn a_workstation_stage_that_never_verifies_disrupts_twice_across_worker_retries() {
         struct Stages {
@@ -3751,7 +3469,6 @@ mod tests {
                 ..Fake::default()
             },
         };
-        // Each retry is a minute after the last; `why` is what the held Dock row says.
         let retries = |stages: &mut Stages, count: usize, why: &str| {
             for retry in 0..count {
                 let report = execute_initial_for_revision(stages, root.path(), revision, &mut None)
@@ -3780,7 +3497,6 @@ mod tests {
             once,
             "nothing between the tries"
         );
-        // The first retry ten minutes after the first try is the second; after it, none.
         execute_initial_for_revision(&mut stages, root.path(), revision, &mut None).unwrap();
         let twice = (stages.doctor.changes(), stages.doctor.relaunches());
         assert_eq!(twice.1, 2);
@@ -3805,11 +3521,6 @@ mod tests {
         );
     }
 
-    /// A rerun of the plan (System State's Apply) starts its automatic attempts afresh,
-    /// so a held-items record the worker cannot read, which fails every automatic pass,
-    /// does not outlive the person's rerun. Negative control: leaving [`HELD_RECORD`]
-    /// out of `stage_restart`'s resets keeps the unreadable record, and the rerun's
-    /// Workstation stage fails.
     #[test]
     fn a_rerun_retires_an_unreadable_held_record() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -3851,7 +3562,6 @@ mod tests {
         assert!(report.needs_attention());
         assert_eq!(host.calls, [Stage::Permissions, Stage::Secrets]);
         assert!(!finished_at(root.path()).unwrap());
-        // Mac completion alone cannot prevent a later Cancel from persisting.
         assert!(first_run_complete(root.path()).unwrap());
         cancel_automatic_setup_at(root.path()).unwrap();
         assert!(finished_at(root.path()).unwrap());
@@ -3914,8 +3624,6 @@ mod tests {
         assert!(rows.iter().all(|row| row.status == "applied"));
         let history = std::fs::read(root.path().join("initial-setup.json")).unwrap();
 
-        // This is also the durable state when Restore's preference writes fail:
-        // the stop marker precedes those writes and says nothing about success.
         write_json(
             &root.path().join("first-run.json"),
             &json!({"profile":PROFILE,"state":"restored"}),
@@ -3954,8 +3662,6 @@ mod tests {
         std::fs::write(&invalid, b"invalid recovery record").unwrap();
         assert!(super::super::tests::restore_without_effects(root.path()).is_err());
 
-        // A fresh reader after process exit must retain the stop even though
-        // the recovery record prevented Restore from changing preferences.
         let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
         assert!(snapshot.finished, "Restore did not stop the durable run");
         assert!(!snapshot.permissions_allowed);
@@ -4052,8 +3758,6 @@ mod tests {
         let revision = revision_at(root.path()).unwrap();
 
         save_explicit_workstation_plan(root.path()).unwrap();
-        // Inject the error a preference preflight can return after the explicit
-        // plan was staged, before it reaches its own pending-marker write.
         host.calls.clear();
         host.failure = Some(Stage::Workstation);
         let report = execute_initial(&mut host, root.path(), &mut None)
@@ -4111,8 +3815,6 @@ mod tests {
         assert_eq!(host.calls, [Stage::Spotlight, Stage::Secrets]);
     }
 
-    /// The vault at `url` (an http(s) URL ending in its name) configured under the scratch
-    /// `paths`, as a join writes it, read back.
     fn configure_vault(paths: &aterm_secrets::client::Paths, url: &str) -> ConfiguredVault {
         use std::os::unix::fs::PermissionsExt;
         let name = url.rsplit('/').next().unwrap();
@@ -4131,13 +3833,6 @@ mod tests {
         ConfiguredVault::read(paths).unwrap().expect("configured")
     }
 
-    /// THE OFFERED PLAN IS IN THE VAULT THIS MAC IS IN. A finished run saved the ALab
-    /// vault; this Mac joined another since (from a terminal). System State's snapshot and
-    /// the startup review offer the configured source, with the saved plan's rows and
-    /// revision; an Apply left as offered saves it, and its Secrets stage resumes that vault
-    /// where the saved source would have joined ALab. A saved source naming the configured
-    /// vault stays as typed (its pin with it), and a modern plan stays as saved when the
-    /// configuration cannot be read.
     #[test]
     fn an_unedited_apply_resumes_the_configured_vault_instead_of_the_saved_one() {
         use aterm_secrets::client::{Membership, Paths, Status};
@@ -4196,8 +3891,6 @@ mod tests {
             membership: Membership::In { seq: 3, heard: 3 },
             names: Vec::new(),
         };
-        // The rule the stage's vault item joins by: the configured vault is read as it is,
-        // and any other source is joined.
         let reads = |url: &str| {
             aterm_machines::init_secrets::selected_vault(url, home.path(), status.config.as_ref())
                 .unwrap()
@@ -4232,11 +3925,6 @@ mod tests {
         );
     }
 
-    /// A VAULT TYPED IN SYSTEM STATE STAYS THERE WHILE SETUP STILL JOINS IT. This Mac is in
-    /// one vault, and an Apply asked for another whose join failed. The run's retries join
-    /// the typed vault, so every status read keeps it in the field beside its error, never
-    /// the vault this Mac is in, and an Apply left as shown asks for it again. Once the run
-    /// stops (Cancel), nothing joins it, and the snapshot offers the vault this Mac is in.
     #[test]
     fn a_vault_typed_in_system_state_stays_while_setup_still_joins_it() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -4246,8 +3934,6 @@ mod tests {
         let other = "http://other.example:7484/v1/other";
         let configured = Some(configure_vault(&paths, team));
         let shown = || snapshot_in_vault(root.path(), Ok(configured.clone())).unwrap();
-        // Each Apply is made in the vault this Mac is in, its vault typed when the field no
-        // longer shows what the snapshot showed.
         let apply = |plan: &Plan| {
             let typed = plan.vault_url != shown().plan.vault_url;
             system_state_apply(root.path(), plan, typed, || Ok(configured.clone()))
@@ -4266,7 +3952,6 @@ mod tests {
         };
         let revision = apply(&typed);
         assert_eq!(shown().plan, typed);
-        // The Apply's pass, then the worker's retry of the same run.
         for pass in 0..2 {
             let mut host = failing();
             execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
@@ -4283,7 +3968,6 @@ mod tests {
                 snapshot.rows
             );
         }
-        // An Apply left as shown asks for the typed vault again.
         let revision = apply(&shown().plan);
         let mut host = failing();
         execute_initial_for_revision(&mut host, root.path(), revision, &mut None).unwrap();
@@ -4350,7 +4034,6 @@ mod tests {
         execute_initial(&mut Fake::default(), root.path(), &mut None).unwrap();
         assert!(finished_at(root.path()).unwrap());
         let new = selected(&[Setting::Dock, Setting::Secrets]);
-        // Simulate a crash after the plan rename, before its progress reset.
         save_plan(root.path(), &new).unwrap();
         assert!(!finished_at(root.path()).unwrap());
         let (_, _, rows) = status_at(root.path(), Plan::default()).unwrap();
@@ -4383,7 +4066,6 @@ mod tests {
         };
         execute_initial(&mut host, root.path(), &mut None).unwrap();
         assert_eq!(revision_at(root.path()).unwrap(), first);
-        // A new offer can carry a corrected password for the same plan.
         authorize_at(root.path(), &plan).unwrap();
         assert_eq!(revision_at(root.path()).unwrap(), first + 1);
         restart_at(root.path(), &plan).unwrap();
@@ -4421,9 +4103,6 @@ mod tests {
         assert_eq!(revision_at(root.path()).unwrap(), u64::MAX);
     }
 
-    /// The Secrets stage over a vault on a network: [`aterm_machines::init_secrets`]'s
-    /// item, run by the stage's own entry, against this Mac's vault state as the client
-    /// keeps it. `log` holds each journal line and each change, in order.
     mod vault {
         use super::*;
         use aterm_machines::init_secrets::SecretsOps;
@@ -4503,7 +4182,6 @@ mod tests {
             }
         }
 
-        /// This Mac's vault state after a join of the vault at `source`, with its key.
         fn member(source: &str, membership: Membership) -> Status {
             let recipient = aterm_secrets::age::Identity::from_secret_bytes([31; 32]).recipient();
             let code = aterm_secrets::client::join_code(&recipient);
@@ -4646,8 +4324,6 @@ mod tests {
             }
         }
 
-        /// The converge journal, into the vault's log (`refuse`: it refuses every line, as
-        /// a full disk does).
         struct Lines(Arc<Lan>, bool);
 
         impl aterm_converge::Journal for Lines {
@@ -4683,7 +4359,6 @@ mod tests {
             pub(super) marks_vault: bool,
             pub(super) build: String,
             pub(super) now: u64,
-            /// When each try came, in seconds since the epoch.
             tries: Vec<u64>,
             /// The vault the person joins from a terminal just after the stage's next read
             /// of which vault this Mac is in ([`InitialHost::configured_vault`]).
@@ -4784,8 +4459,6 @@ mod tests {
                 }
                 Ok(read)
             }
-            /// The live read of this Mac's vault state ([`check::vault_rows`]): the files its
-            /// vault wrote are as written, and its subscriber runs or not.
             fn current_vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
                 let subscribed = *self.lan.subscribed.lock().unwrap();
                 check::vault_rows(
@@ -4848,11 +4521,6 @@ mod tests {
         SecretBytes::from(b"test-only-setup-join-password".as_slice())
     }
 
-    /// A vault that does not answer (the owner's Mac off the ALab LAN, 2026-10-22, asked
-    /// every minute) is asked at growing pauses: a minute, two, then every four, and
-    /// nothing is journaled or changed at any try. Between tries the stage shows its last
-    /// try's row as it was, so the worker's log keeps one line until the next. Negative
-    /// control: a stage that is not paced asks at every pass.
     #[test]
     fn an_unreachable_vault_is_asked_at_growing_pauses_and_nothing_is_changed() {
         use vault::{Lan, NO_ROUTE, Vaulted, authorized, passes};
@@ -4913,9 +4581,6 @@ mod tests {
         assert!(lan.log().is_empty());
     }
 
-    /// A pause ends at once with a change that can alter the answer: another network,
-    /// another build of aterm, or the person's Apply (a new run). Each starts the pauses
-    /// again from a minute.
     #[test]
     fn a_paused_try_comes_at_once_on_a_new_network_build_or_run() {
         use vault::{Lan, Vaulted, authorized, passes};
@@ -4945,12 +4610,6 @@ mod tests {
         assert_eq!(host.minutes(), [14], "the person's Apply tries at once");
     }
 
-    /// A Mac waiting for an admin's approval is picked up at the worker's next pass once
-    /// its subscriber wrote the version that let it in (its vault state changed), and
-    /// never later than [`secrets_retry::LONGEST`] after its last try even when nothing
-    /// the marks read changed. The join that asked made each of its changes after the
-    /// journal's line and spent the password. Negative control: marks that read only the
-    /// network pick it up later, at the paused try.
     #[test]
     fn an_approval_is_picked_up_at_the_next_pass_and_within_the_longest_pause() {
         use vault::{Lan, START, Vaulted, authorized, passes};
@@ -5006,11 +4665,6 @@ mod tests {
         }
     }
 
-    /// The live host paces every Secrets try by what its reads read now
-    /// ([`secrets_retry::pace`]): another network, a change in this Mac's vault state (an
-    /// approval its subscriber wrote) or in whether the subscriber runs, and another build
-    /// each change the pace; the subscriber hearing from the vault does not. Negative
-    /// control: marks that do not read the vault state miss the approval.
     #[test]
     fn the_live_host_paces_each_secrets_try_by_the_network_and_the_vault_state() {
         use aterm_secrets::client::{Membership, Status};
@@ -5045,7 +4699,6 @@ mod tests {
         host_marks.push(secrets_retry::pace(&host.reads).marks);
         lan.approve(vault::START);
         host_marks.push(secrets_retry::pace(&host.reads).marks);
-        // The subscriber heard from the vault again: no change.
         lan.approve(vault::START + 600);
         assert_eq!(
             secrets_retry::pace(&host.reads).marks,
@@ -5057,7 +4710,6 @@ mod tests {
         let distinct: std::collections::BTreeSet<&String> = host_marks.iter().collect();
         assert_eq!(distinct.len(), host_marks.len(), "{host_marks:?}");
 
-        // The control: without the vault state, the approval changes nothing.
         let unread = || secrets_retry::pace(&reads(false)).marks;
         let before = unread();
         lan.approve(vault::START + 900);
@@ -5069,10 +4721,6 @@ mod tests {
         assert_eq!(unread(), before);
     }
 
-    /// Two aterm builds taking turns (an updated app beside a session of the build before)
-    /// share the pause of a vault that does not answer once each has tried: the vault is
-    /// asked about as often as by one build, not at every pass. Negative control: a build
-    /// that has not tried yet tries at once.
     #[test]
     fn builds_taking_turns_share_the_pause_of_a_vault_that_does_not_answer() {
         use vault::{Lan, Vaulted, authorized, passes};
@@ -5108,11 +4756,6 @@ mod tests {
         assert_eq!(*host.minutes().last().unwrap(), 21, "the control");
     }
 
-    /// A join that fails for a reason only a person can fix (a vault whose signer nothing
-    /// pins) is journaled and made twice, then waits for a change: a day of passes writes two
-    /// journal lines, not one every four minutes, and the row says what brings the next try.
-    /// A new network brings two more. Negative control: a vault that does not answer, whose
-    /// tries journal nothing, is still asked at its pace.
     #[test]
     fn a_join_that_keeps_failing_is_journaled_twice_then_waits_for_a_change() {
         use vault::{Lan, Vaulted, authorized, passes};
@@ -5174,11 +4817,6 @@ mod tests {
         assert_eq!(lines(&lan), 0);
     }
 
-    /// System State's setup opened from aterm's disk image installs no subscriber: its
-    /// Secrets row waits (blocked, never an error, so no try counts toward the hold), says to
-    /// open aterm from Applications, and is paced as any wait; the first pass of an aterm
-    /// opened from where it is installed tries at once and installs it. Negative control: an
-    /// aterm still on its disk image keeps the pause.
     #[test]
     fn a_setup_from_a_disk_image_waits_and_tries_at_once_from_applications() {
         use vault::{Lan, START, Vaulted, authorized, passes};
@@ -5226,9 +4864,6 @@ mod tests {
         }
     }
 
-    /// A refused journal line refuses the change: no key, no request, no subscriber, the
-    /// password kept, and the row says why. Negative control: the next try, its line
-    /// taken, joins.
     #[test]
     fn a_refused_journal_line_refuses_the_secrets_stages_change() {
         use vault::{Lan, Vaulted, authorized, passes};
@@ -5269,20 +4904,8 @@ mod tests {
         assert!(password.is_none());
     }
 
-    /// The vault a person joins from a terminal after setup began, its URL with a query.
     const JOINED_SINCE: &str = "http://vault.example:7484/v1/team?k=fixture-query";
 
-    /// A VAULT JOINED AFTER SETUP BEGAN STAYS. First-run setup was admitted for the ALab
-    /// vault while this Mac was in none, and off the ALab network its Secrets stage stood
-    /// aside. The person then joined their own vault from a terminal. When ALab answers
-    /// again (an office visit), the worker's retry joins nothing: no key, request or journal
-    /// line. Its row names the vault this Mac is in, never its URL's query, and how to move
-    /// it, beside that vault's own rows, read as repository setup reads them: the stage is
-    /// done, and the run finishes, once that vault's subscriber runs. Before that retry
-    /// System State's field offers the vault this Mac is in, so an Apply left as shown keeps
-    /// it. Negative controls: a stage that always runs the vault item joins ALab here, a
-    /// snapshot blind to the vault kept at admission offers ALab, and a stage that reads
-    /// nothing of the vault it leaves finishes with no subscriber running.
     #[test]
     fn a_vault_joined_after_setup_began_stays_when_the_setup_vault_answers() {
         use vault::{Lan, START, Vaulted, authorized, passes};
@@ -5333,7 +4956,6 @@ mod tests {
         );
         assert!(!finished_at(root.path()).unwrap());
 
-        // The subscriber the terminal's join installed runs: the next pass reads it.
         lan.set(joined.clone(), true);
         host.now = START + 120;
         let report = execute_initial_for_revision(&mut host, root.path(), revision, &mut None)
@@ -5346,10 +4968,6 @@ mod tests {
         assert!(!root.path().join(secrets_retry::RECORD).exists());
     }
 
-    /// A vault left in place that waits for an admin's approval is not read as synced: the
-    /// stage's rows say it waits, the run stays open and nothing is joined, and once the
-    /// approval reaches it the stage is done. Negative control: a stage that reads nothing
-    /// of the vault it leaves reports it ready while it waits.
     #[test]
     fn a_vault_left_in_place_that_waits_for_approval_is_not_done() {
         use aterm_secrets::client::Membership;
@@ -5388,9 +5006,6 @@ mod tests {
         assert!(lan.log().is_empty(), "{:?}", lan.log());
     }
 
-    /// The vault the plan names under another signer than its pin admits, joined since, is
-    /// said so rather than named twice. Negative control: the plain wording names it as the
-    /// vault left in place and as the one to move to.
     #[test]
     fn the_same_vault_under_another_signer_is_said_so() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -5408,13 +5023,6 @@ mod tests {
         );
     }
 
-    /// AN APPLY FROM A TAB SHOWN BEFORE A TERMINAL JOIN KEEPS THAT VAULT. Setup finished in
-    /// the ALab vault, and the System State tab still shows it. The person joins their own
-    /// vault from a terminal, then ticks Spotlight in that tab and presses Apply without
-    /// touching the vault field: the run asks for the vault this Mac is in now, so its
-    /// Secrets stage resumes that one rather than join ALab over it. A vault typed in the
-    /// same tab still moves the Mac. Negative control: an Apply admitted with its field as
-    /// submitted, typed or not, joins ALab.
     #[test]
     fn an_apply_from_a_tab_shown_before_a_terminal_join_keeps_that_vault() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -5458,11 +5066,6 @@ mod tests {
         assert_eq!(host.vault_url.as_deref(), Some(other));
     }
 
-    /// The Secrets stage's join replaces only the vault configuration the stage read: a
-    /// vault joined from a terminal just after that read, before the vault item reads it, is
-    /// not joined over (no line, key or join, and an unverified row that counts no failure),
-    /// and the next try, reading it, leaves it in place. Negative control: a vault item that
-    /// ignores the stage's read joins ALab over it.
     #[test]
     fn a_vault_joined_after_the_stage_read_it_is_not_joined_over() {
         use vault::{Lan, Vaulted, authorized, passes};
@@ -5505,10 +5108,6 @@ mod tests {
         assert!(lan.log().is_empty(), "{:?}", lan.log());
     }
 
-    /// Repository setup reads the vault the Secrets stage left in place, not the one the
-    /// plan names, so a run of every stage finishes in the vault this Mac joined since,
-    /// without the stage's join. Negative control: a repository gate that reads the plan's
-    /// vault asks about ALab, which the live read finds this Mac not in.
     #[test]
     fn repository_setup_reads_the_vault_the_secrets_stage_left_in_place() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -5532,11 +5131,6 @@ mod tests {
         assert!(finished_at(root.path()).unwrap());
     }
 
-    /// A configuration that cannot be read is not joined over: the Secrets stage runs no
-    /// vault item and its row is unverified, an unfinished try that changed nothing, so it
-    /// is retried at its pace and never counts toward the hold of a failing change. A run an
-    /// older build admitted does not read it. Negative control: a read failure reported as
-    /// the stage's error.
     #[test]
     fn an_unreadable_vault_configuration_joins_nothing_and_counts_no_failure() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -5580,11 +5174,6 @@ mod tests {
         assert_eq!(host.calls, [Stage::Secrets]);
     }
 
-    /// A VAULT TYPED IN SYSTEM STATE STILL MOVES THE MAC. This Mac is in one vault, and the
-    /// person typed another in System State and pressed Apply: the run, admitted while this
-    /// Mac was in the first, joins the second as asked, keeping the first's settings to put
-    /// back. Its record keeps a digest of the first, never its URL. Negative control: a rule
-    /// that leaves any vault but the plan's in place joins nothing here.
     #[test]
     fn a_vault_typed_in_system_state_while_in_another_still_moves_the_mac() {
         use vault::{Lan, START, Vaulted, passes};
@@ -5617,10 +5206,6 @@ mod tests {
         assert!(log.contains(&format!("join {}", plan.vault_url)), "{log:?}");
     }
 
-    /// The plan's own vault is read as before: a run admitted while this Mac was in none,
-    /// whose plan names the vault the person then joined from a terminal, runs the vault item,
-    /// which reads that vault and starts its subscriber, joining nothing. Negative control: a
-    /// rule that leaves every vault configured since in place runs no vault item here.
     #[test]
     fn a_run_whose_plan_names_the_vault_joined_since_reads_it_as_before() {
         use vault::{Lan, START, Vaulted, passes};
@@ -5652,10 +5237,6 @@ mod tests {
         assert!(finished_at(root.path()).unwrap());
     }
 
-    /// A run an older build admitted, whose record keeps no vault (and which such a build
-    /// writes back without one), joins the plan's vault as it did then, whatever vault this
-    /// Mac is in. Negative control: a record without the field read as admitted in no vault
-    /// leaves the vault in place.
     #[test]
     fn a_run_an_older_build_admitted_joins_as_before() {
         use vault::{Lan, START, Vaulted, authorized, passes};
@@ -5684,11 +5265,6 @@ mod tests {
         assert!(lan.log().contains(&joined), "{:?}", lan.log());
     }
 
-    /// Every admission keeps the vault its reader finds this Mac in when the run is chosen,
-    /// through the entry its public door passes `live_configured_vault`: the startup
-    /// review's (as its offer was loaded), System State's Apply and its retried restart, and
-    /// a doctor authorization; a stage's progress keeps it after. Negative control: an
-    /// admission that drops it keeps none.
     #[test]
     fn every_admission_keeps_the_vault_this_mac_is_in() {
         let home = aterm_tempfile::tempdir().unwrap();
@@ -5738,13 +5314,6 @@ mod tests {
         }
     }
 
-    /// THE STARTUP REVIEW KEEPS THE VAULT ITS OFFER WAS LOADED IN, not the one at its
-    /// capture. Captured in no vault (the review then backs off while System State is busy),
-    /// the person joins a vault from a terminal and the offer loads in it: a vault typed in
-    /// that offer is a switch they asked for, so the run keeps the vault the offer was loaded
-    /// in and its stage joins the typed one. An offer loaded in no vault keeps none, so a
-    /// vault joined while it is shown stays. Negative control: a ticket that keeps the vault
-    /// of its capture leaves the vault in place of the typed one.
     #[test]
     fn the_startup_review_keeps_the_vault_its_offer_was_loaded_in() {
         let root = aterm_tempfile::tempdir().unwrap();

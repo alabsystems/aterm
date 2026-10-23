@@ -575,6 +575,7 @@ const PX: [f32; 8] = [8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 32.0];
 /// dropped, 17 s).
 const fn guard_corpus() -> (&'static [f32], usize, usize) {
     if cfg!(debug_assertions) {
+        // 12 px is the desktop size the shipped path is tuned around; 32 px is
         // where a coarse flattening degrades worst.
         (&[12.0, 32.0], 4, 130)
     } else {

@@ -15,7 +15,7 @@ use crate::type_scale::StepPx;
 /// RGBA8, straight (non-premultiplied) alpha. `a < 255` is the frosted-card glass.
 pub(crate) type Rgba = [u8; 4];
 
-pub(crate) fn rgba(c: [u8; 3], a: u8) -> Rgba {
+pub(crate) const fn rgba(c: [u8; 3], a: u8) -> Rgba {
     [c[0], c[1], c[2], a]
 }
 
@@ -52,14 +52,14 @@ pub(crate) struct SemanticVariation {
 }
 
 impl SemanticVariation {
-    pub(crate) fn new(tag: u32, value: f32) -> Self {
+    pub(crate) const fn new(tag: u32, value: f32) -> Self {
         Self {
             tag,
             value_bits: value.to_bits(),
         }
     }
 
-    pub(crate) fn value(self) -> f32 {
+    pub(crate) const fn value(self) -> f32 {
         f32::from_bits(self.value_bits)
     }
 }
@@ -107,7 +107,7 @@ impl Default for SemanticFontCandidate {
 }
 
 impl SemanticFontCandidate {
-    pub(crate) fn is_host(&self) -> bool {
+    pub(crate) const fn is_host(&self) -> bool {
         self.regular.is_none()
             && self.bold.is_none()
             && self.italic.is_none()
@@ -178,7 +178,7 @@ pub(crate) struct SpecimenWallpaper {
 impl SpecimenWallpaper {
     /// Everything the prepared pixels depend on but the frame: the asset, its
     /// size, the dim and the tint.
-    pub(crate) fn identity(&self) -> (u64, usize, usize, u32, bool) {
+    pub(crate) const fn identity(&self) -> (u64, usize, usize, u32, bool) {
         (self.fp, self.w, self.h, self.dim.to_bits(), self.tint)
     }
 }

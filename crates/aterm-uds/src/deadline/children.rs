@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use super::{DRAIN_GRACE, ExitWait, OUTPUT_KEEP, POLL_MAX, POLL_MIN, RunError, reap_within};
 use crate::spawnfd::{Child, Command, Stdio};
 
-/// `struct pollfd`: the same layout on Darwin, the BSDs and Linux.
 #[repr(C)]
 struct PollFd {
     fd: RawFd,
@@ -20,15 +19,10 @@ struct PollFd {
     revents: i16,
 }
 
-/// `POLLIN`: the same bit on Darwin, the BSDs and Linux. A pipe whose writer
-/// closed reports `POLLHUP` in `revents` whatever was asked, which any
-/// nonzero `revents` covers.
 const POLLIN: i16 = 0x1;
 
-/// `POLLHUP`: the same bit on Darwin, the BSDs and Linux.
 const POLLHUP: i16 = 0x10;
 
-/// `ESRCH`: the same number on Darwin, the BSDs and Linux.
 const ESRCH: i32 = 3;
 
 /// Whether every writer of the pipe `fd` reads has closed it.
@@ -46,7 +40,6 @@ pub(super) fn descendant_may_hold(fd: BorrowedFd<'_>, group: Option<u32>) -> boo
     !writers_gone(fd) && group.is_none_or(group_left)
 }
 
-/// Whether any process is left in the process group `group`.
 fn group_left(group: u32) -> bool {
     let Ok(group) = i32::try_from(group) else {
         return true;
@@ -60,9 +53,6 @@ fn group_left(group: u32) -> bool {
     !none
 }
 
-/// `poll(2)` over `fds` for at most `timeout` (rounded UP to a millisecond,
-/// so a wait never returns early and spins), retrying `EINTR` while time remains.
-/// `Ok(false)` when the timeout ran out with nothing ready.
 #[cfg_attr(trust_verify, trust::skip)]
 fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
@@ -116,7 +106,6 @@ pub(super) fn kill_group(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// One stream of one child: the pipe while it is open, and its tail so far.
 struct Stream {
     pipe: Option<File>,
     tail: Vec<u8>,
@@ -130,8 +119,6 @@ impl Stream {
         }
     }
 
-    /// One read of a pipe `poll` reported ready, which therefore cannot block:
-    /// keep the tail, and close the pipe at its end (or on an error).
     fn read_ready(&mut self) {
         let Some(pipe) = self.pipe.as_mut() else {
             return;
@@ -151,9 +138,7 @@ impl Stream {
     }
 }
 
-/// One child of [`outputs_until`].
 struct Run {
-    /// `Err` when it could not be started.
     child: Result<Child, io::Error>,
     exit: Option<ExitWait>,
     status: Option<ExitStatus>,
@@ -175,8 +160,6 @@ impl Run {
         Self::of(prepare(cmd).spawn())
     }
 
-    /// A child [`prepare`]d and started (or why it was not), from here on run
-    /// like the others.
     fn of(spawned: io::Result<Child>) -> Self {
         match spawned {
             Ok(mut child) => {
@@ -205,12 +188,10 @@ impl Run {
         }
     }
 
-    /// Started, not yet exited, not given up on.
     const fn running(&self) -> bool {
         self.child.is_ok() && self.status.is_none() && self.failed.is_none()
     }
 
-    /// Nothing left to wait for.
     fn settled(&self) -> bool {
         self.child.is_err()
             || self.failed.is_some()
@@ -223,8 +204,6 @@ impl Run {
         }
     }
 
-    /// Close the streams a descendant may still hold open; one nothing else holds is read
-    /// on, to its end or the deadline (as [`super::Grace`] says).
     fn close_held_streams(&mut self) {
         let group = self.child.as_ref().ok().map(Child::id);
         for stream in &mut self.streams {
@@ -238,7 +217,6 @@ impl Run {
         }
     }
 
-    /// Reap it if it has exited; a wait that fails kills it.
     fn observe(&mut self, now: Instant, reap_by: Instant) {
         let Ok(child) = self.child.as_mut() else {
             return;
@@ -302,7 +280,6 @@ pub(super) fn output_of_until(
         .unwrap_or(Err(RunError::TimedOut))
 }
 
-/// The runs to their ends, or to `deadline` and the `reap` reserve after it.
 fn run_until(
     mut runs: Vec<Run>,
     deadline: Instant,
@@ -416,9 +393,6 @@ mod tests {
 
     use super::writers_gone;
 
-    /// A pipe is writer-less once its last writer closes it, with data left in it or not.
-    /// A child another test's thread forks meanwhile holds a copy until its exec, so the
-    /// last look waits (a hang detector) for it to let go.
     #[test]
     fn a_pipe_is_writer_less_once_its_last_writer_closes() {
         let (reader, mut writer) = std::io::pipe().expect("pipe");

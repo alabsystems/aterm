@@ -125,7 +125,6 @@ pub trait Arg {
     /// # Errors
     /// [`Errno::INVAL`] if the name contains an interior NUL (truncating would
     /// address a different file).
-    /// address a different file).
     fn with_c_str<T>(self, f: impl FnOnce(&CStr) -> Result<T>) -> Result<T>;
 }
 

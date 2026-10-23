@@ -265,6 +265,7 @@ pub fn write_atomically(
     if replace {
         again_while_refused(|| std::fs::rename(&tmp, dest)).map_err(|e| failed(dest, e))
     } else {
+        // Only an exclusive operation can publish without replacement: a
         // theme may appear after any check that the name is free.
         publish_new(&tmp, dest, |from, to| std::fs::hard_link(from, to))
     }

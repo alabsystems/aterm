@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The effect frontier: a shadow compares each request with the next record before handing
-//! back its result, submits nothing live, and stops for good at the first divergence.
+//! Effect frontier shadow replay and divergence tests.
 
 use std::cell::Cell;
 
@@ -145,8 +144,6 @@ fn the_frontier_is_sticky_even_for_a_request_that_would_match_a_later_record() {
     let recs = recorded();
     let mut shadow = ShadowPort::new(&recs);
     let first = shadow.submit(req(7, 10, b"ab")).unwrap_err();
-    // These would match records 0 and 1; past the frontier nothing is answered from the
-    // recording.
     assert_eq!(shadow.submit(req(1, 10, b"ab")), Err(first));
     assert_eq!(shadow.submit(req(2, 20, b"cd")), Err(first));
     assert_eq!(shadow.frontier(), Some(&first));
@@ -180,7 +177,6 @@ fn shadow_replay_of_a_recorded_run_reproduces_it_and_submits_nothing_live() {
         &mut rec,
     );
     let records = rec.into_records();
-    // The record pass did reach the live sink: the counter observes submissions.
     assert_eq!(live_calls.get(), 2);
     assert_eq!(records.len(), 2);
 
@@ -278,7 +274,6 @@ fn a_candidate_whose_effects_differ_halts_at_the_frontier_and_runs_nothing_after
         assert_eq!(shadow.finish(), Err(want), "{variant:?}");
     }
 
-    // Omitting an effect submits nothing new, and is still a divergence at finish.
     let mut shadow = ShadowPort::new(&records);
     let run = replay(
         &schema,

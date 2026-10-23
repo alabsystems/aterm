@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use aterm_core::terminal::program_state::{ProgramState, ProgramStateReport};
 
-/// One session's gate (see the module doc).
+/// One session's gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramStateGate {
     /// The engine sequence the last sweep saw.
@@ -29,7 +29,7 @@ pub(crate) struct ProgramStateGate {
     /// When the gate counted the latest of those starts.
     turn_started: Option<Instant>,
     /// The engine's count of turns begun (`ProgramStateReport::turns`) at the
-    /// last sweep's reading, honoured or not (the module doc).
+    /// last sweep's reading, honoured or not.
     turns: u64,
 }
 
@@ -44,6 +44,7 @@ impl ProgramStateGate {
     ) -> bool {
         self.turns = report.turns;
         if group_moved {
+            // Discard reports already seen under the previous group. An
             // unseen report remains eligible; its writer is not attributable.
             self.floor_seq = self.seen_seq;
         }
@@ -71,27 +72,27 @@ impl ProgramStateGate {
     }
 
     /// When the latest turn the gate counted began ([`Self::turn_starts`]), on the sweep's clock.
-    pub(crate) fn turn_started(&self) -> Option<Instant> {
+    pub(crate) const fn turn_started(&self) -> Option<Instant> {
         self.turn_started
     }
 
     /// How many turn ends this session's program has reported ([`ends_a_turn`]), as shown.
-    pub(crate) fn turn_ends(&self) -> u64 {
+    pub(crate) const fn turn_ends(&self) -> u64 {
         self.turn_ends
     }
 
     /// How many turns this session's program has begun ([`starts_a_turn`]), as shown.
-    pub(crate) fn turn_starts(&self) -> u64 {
+    pub(crate) const fn turn_starts(&self) -> u64 {
         self.turn_starts
     }
 
     /// The report shown, and since when.
-    pub(crate) fn shown(&self) -> Option<(ProgramState, Instant)> {
+    pub(crate) const fn shown(&self) -> Option<(ProgramState, Instant)> {
         self.shown
     }
 
-    /// The engine's count of turns begun as the last sweep read it, whatever the gate shows (the module doc).
-    pub(crate) fn turns(&self) -> u64 {
+    /// The engine's count of turns begun as the last sweep read it, whatever the gate shows.
+    pub(crate) const fn turns(&self) -> u64 {
         self.turns
     }
 }
@@ -138,7 +139,7 @@ pub(crate) fn wire(shown: Option<(ProgramState, Instant)>) -> String {
 }
 
 /// The hover's word for a shown report (`presence::state_line`), when the screen's reader names no phase.
-pub(crate) fn row_word(state: ProgramState) -> &'static str {
+pub(crate) const fn row_word(state: ProgramState) -> &'static str {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
     match state.state {
         W::Idle => "codex idle",

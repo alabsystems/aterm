@@ -4,7 +4,7 @@
 //! Tier-1 conformance tests binding `OccupancyDoor` to `occupancy::decide`, `write_held`,
 //! `HoldClock`, and `Books`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use aterm_agent::harness::disk::Level;
 use aterm_agent::supervise::facts::{EpisodeKey, FactKind, FactsState, SeedOutcome};
@@ -231,7 +231,7 @@ fn agrees(m: &Model, st: &State, said: &Said) -> bool {
     }
 }
 
-/// Whether the walk follows `action` from `st`: what the real loop can do ([module docs](self)).
+/// Whether the walk follows `action` from `st`: what the real loop can do.
 fn realizable(st: &State, action: &str, r: &Real, rule: RuleId) -> bool {
     let eager = (st["due"] > 0 && st["intent"] == 0 && st["cond"] == 0)
         || (st["intent"] == 1 && st["cond"] == 0);
@@ -325,6 +325,8 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
         }
         "Turn" => {
             if st["door"] == 2 && !std::mem::take(&mut r.pointed) {
+                // The point decided nothing that closed the hold: the one that ends a harness
+                // line's answer (decided as one that would close it), or one that decided
                 // nothing while the work showed.
                 r.clock.step(point(st["owed"] == 1, run.variant));
             }
@@ -402,7 +404,7 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
 /// The walk's result: every state reached, those where the real side disagreed, how often each
 /// action was mirrored, and each decision seen.
 struct Walked {
-    states: BTreeSet<State>,
+    states: HashSet<Vec<i64>>,
     off: Vec<State>,
     fired: BTreeMap<&'static str, usize>,
     said: BTreeSet<String>,
@@ -458,23 +460,28 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
             host_line: false,
         };
         let mut w = Walked {
-            states: BTreeSet::new(),
+            states: HashSet::new(),
             off: Vec::new(),
             fired: BTreeMap::new(),
             said: BTreeSet::new(),
         };
-        let mut seen: BTreeSet<(State, usize)> = BTreeSet::new();
+        let mut seen: HashSet<(Vec<i64>, usize)> = HashSet::new();
         w.check(m, &m.init_state(), &init, true, strict, run);
         let mut queue = VecDeque::from([(m.init_state(), init)]);
         while let Some((st, real)) = queue.pop_front() {
-            if !seen.insert((st.clone(), typed(&real))) {
+            // Every state binds every variable, so its values in name order are its identity.
+            let key: Vec<i64> = st.values().copied().collect();
+            if !seen.insert((key.clone(), typed(&real))) {
                 continue;
             }
-            w.states.insert(st.clone());
+            w.states.insert(key);
+            // `Model::fire`'s step, its environment built once for the state's every action.
+            let env = m.eval_env(&st);
             for action in &m.actions {
-                let mut next = st.clone();
-                if !m.fire(action.name, &mut next) || !realizable(&st, action.name, &real, run.rule)
-                {
+                let Some(next) = m.successors_in(action, &env, &st).into_iter().next() else {
+                    continue;
+                };
+                if !realizable(&st, action.name, &real, run.rule) {
                     continue;
                 }
                 let mut r = real.clone();

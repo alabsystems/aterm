@@ -136,8 +136,7 @@ pub(super) fn step(g: &mut MomentumGlow, clock: &Clock, ev: &Ev) -> Obs {
     }
 }
 
-/// Assert every key, query and instant in `evs` is admitted under [`MOMENTUM_PROFILE`] (ticks are
-/// admitted by [`step`]).
+/// Assert every input in `evs` is admitted under [`MOMENTUM_PROFILE`].
 pub(super) fn assert_admitted(evs: &[Ev]) {
     let p = &MOMENTUM_PROFILE;
     let mut last = None;

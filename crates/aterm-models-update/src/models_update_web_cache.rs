@@ -5,10 +5,7 @@
 
 use aterm_spec::derive::*;
 
-/// A cached tag may avoid a fresh release fetch only for its authorizing build
-/// and source, with a publishable covering stage when the release is newer.
-/// Status writes carry that authorization; they do not mint a new one. Tier-1
-/// exercises the real status writer/reader, stage files, and web acquisition.
+/// Formal model for the native updater's cached web-head shortcut.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_web_cache_model() -> Model {

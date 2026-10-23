@@ -498,7 +498,10 @@ fn a_hosted_candidate_that_parks_diverges_at_the_press() {
 
 /// THE CONTINUATION SWITCHED OFF: a run that typed Cruise's continuation
 /// (`config::CONTINUE_TEXT`, `[aterm harness] Autopilot is Cruise: keep
-/// going.
+/// going. …`) at a turn's end (`continue@v1`), replayed with
+/// `continue = false` — the candidate decides nothing there and goes on to
+/// wait for the screen after the continuation, which the recorded run waited
+/// for only once it had typed.
 #[test]
 fn a_candidate_that_skips_the_continuation_diverges_at_it() {
     let mut m = Mock::new(vec![

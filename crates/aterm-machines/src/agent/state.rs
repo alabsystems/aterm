@@ -9,11 +9,9 @@ use crate::port::System;
 use crate::protocol::Floor;
 use serde::{Deserialize, Serialize};
 
-/// `state/floors.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FloorsFile {
-    /// `[[floor]] principal, serial`.
     #[serde(default)]
     floor: Vec<Floor>,
 }
@@ -48,7 +46,6 @@ pub fn floor_of(floors: &[Floor], principal: &str) -> u64 {
 }
 
 /// The floors as a list, or why they cannot be trusted.
-///
 /// # Errors
 /// One line when the file exists and cannot be read.
 pub fn floors_or_refuse(sys: &dyn System, layout: &Layout) -> Result<Vec<Floor>, String> {
@@ -63,7 +60,6 @@ pub fn floors_or_refuse(sys: &dyn System, layout: &Layout) -> Result<Vec<Floor>,
 }
 
 /// Raise `principal`'s floor to `serial` (never lowers it).
-///
 /// # Errors
 /// One line; the caller must not act on the envelope then.
 pub fn raise_floor(
@@ -87,7 +83,6 @@ pub fn raise_floor(
 }
 
 /// Raise each of `principals` to at least the highest floor any principal has.
-///
 /// # Errors
 /// One line when `floors.toml` cannot be read or written.
 pub fn inherit_floors(
@@ -198,10 +193,8 @@ pub fn running(sys: &dyn System, layout: &Layout, run: &str) -> bool {
     holder(sys, layout).is_some_and(|h| h.run == run && holder_live(sys, &h))
 }
 
-/// How long a change of the run lock waits for another one to finish.
 const GUARD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Hold `state/run.lock.guard` for one change of the run lock.
 fn guard(sys: &dyn System, layout: &Layout) -> Result<Box<dyn std::any::Any>, String> {
     sys.exclusive(&layout.lock_guard(), GUARD_LIMIT)
         .map_err(|e| format!("{}: {e}", layout.lock_guard().display()))
@@ -220,7 +213,6 @@ pub enum Lock {
 }
 
 /// Take `state/run.lock` for `run`, held by `pid`: an exclusive create.
-///
 /// # Errors
 /// One line when the guard or the lock file cannot be had.
 pub fn take_lock(sys: &dyn System, layout: &Layout, run: &str, pid: u32) -> Result<Lock, String> {
@@ -246,7 +238,6 @@ pub fn take_lock(sys: &dyn System, layout: &Layout, run: &str, pid: u32) -> Resu
 }
 
 /// Hand the lock for `run` to `pid` (the detached job).
-///
 /// # Errors
 /// One line.
 pub fn hand_lock(sys: &dyn System, layout: &Layout, run: &str, pid: u32) -> Result<(), String> {
@@ -271,7 +262,6 @@ pub fn hand_lock(sys: &dyn System, layout: &Layout, run: &str, pid: u32) -> Resu
 }
 
 /// Hand only the exact observed holder to a known, still-uncommitted child.
-///
 /// # Errors
 /// The holder changed, the child lacks a start identity, or the atomic write failed.
 pub(super) fn hand_lock_from(
@@ -292,7 +282,6 @@ pub(super) fn hand_lock_from(
 }
 
 /// Release only this exact holder, never a later owner with the same run name.
-///
 /// # Errors
 /// The lock guard or removal failed; no unowned replacement is removed.
 pub(super) fn release_holder(
@@ -309,7 +298,6 @@ pub(super) fn release_holder(
 }
 
 /// Join an internal gated job to its current PID and known recorded start identity.
-///
 /// # Errors
 /// Missing/changed holder, another PID, or an unmeasured/mismatched start identity.
 pub(super) fn job_holder(
@@ -392,7 +380,6 @@ pub struct Managed {
 }
 
 /// Read `managed.toml`.
-///
 /// # Errors
 /// One line when it is missing or does not parse (the host was not enrolled by this agent).
 pub fn managed(sys: &dyn System, layout: &Layout) -> Result<Managed, String> {
@@ -404,7 +391,6 @@ pub fn managed(sys: &dyn System, layout: &Layout) -> Result<Managed, String> {
 }
 
 /// Write `managed.toml`.
-///
 /// # Errors
 /// One line.
 pub fn save_managed(sys: &dyn System, layout: &Layout, m: &Managed) -> Result<(), String> {

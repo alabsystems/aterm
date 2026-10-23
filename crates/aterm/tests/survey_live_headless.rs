@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SURVEY THROUGH THE ONE `aterm` BINARY against a real `aterm
-//! --headless` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §3): two
-//! shells — one at its prompt with a hostile OSC title, one running a
-//! command — read by `aterm ctl survey` in its three forms. The text names
-//! the instance once with its label and each session on one line, the
-//! running one by its program; no character of the title's bidi override
-//! reaches the reader raw; `--sid` gives one session's record with its last
-//! rows; `--json` every record. The published need on the wire
-//! (`docs/DESIGN-owner-surfaces-2026-10-16.md` §10, "Real aterm"): typed
-//! attention, a task marked stalled, and an agent stopped with input queued,
-//! each read through `status needs=`.
-//!
-//! Every wait is a one-minute hang detector on something that must happen:
-//! the shell running the command, the title the shell printed.
-//!
-//! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs` (a
-//! product that cannot start fails; a scratch/spawn refusal is COULD NOT RUN,
-//! `boot_with`).
+//! Live headless `aterm ctl survey` and `status needs=` tests: survey output across plain text,
+//! `--sid`, and `--json` (including bidi-override stripping), plus wire-published needs for keyed
+//! attention, stalled tasks, and stopped agents with queued input.
 
 #![cfg(unix)]
 
@@ -28,8 +13,7 @@ use crate::headless_boot;
 
 use headless_boot::{Instance, boot_session, ctl, ctl_ok, type_line};
 
-/// A refused boot ends the test COULD NOT RUN, never a pass that checked
-/// nothing (`headless_boot::boot_with`).
+/// Boot a 24×100 headless instance via `headless_boot::boot_with`.
 fn boot() -> Instance {
     headless_boot::boot_with(
         "asrv",
@@ -68,7 +52,7 @@ fn the_survey_reads_every_session_of_an_instance() {
     let (_, a) = boot_session(&inst);
     let b = spawn(&inst);
     type_line(&inst, &b, "echo survey-marker; sleep 600");
-    // A title with an override (U+202E) in it, as a hostile program sets one.
+    // Hostile OSC title containing a bidi override (U+202E).
     type_line(&inst, &a, r"printf '\033]2;build \342\200\256gnp.exe\007'");
 
     let record = until_within(MUST_HAPPEN, "b running `sleep`, its rows read", || {
@@ -79,7 +63,6 @@ fn the_survey_reads_every_session_of_an_instance() {
     });
     assert_eq!(sid_field(&record, "agent"), Some("-"), "{record}");
     assert_eq!(sid_field(&record, "state"), Some("alive"), "{record}");
-    // The data line, the instance's header, then the session's line.
     assert!(
         record
             .lines()
@@ -93,8 +76,6 @@ fn the_survey_reads_every_session_of_an_instance() {
         let text = survey(&inst, &[]);
         text.contains("build ").then_some(text)
     });
-    // The first line says what everything under it is, ahead of anything a
-    // session wrote; then the instance's block.
     let (data, rest) = text.split_once('\n').expect("a first line");
     assert!(
         data.starts_with("# ") && data.contains("trust=screen"),
@@ -115,19 +96,14 @@ fn the_survey_reads_every_session_of_an_instance() {
         "{text}"
     );
     assert!(lines[2].starts_with(&format!("{a} ")), "{text}");
-    // Who typed into it last (this test's `aterm ctl`, S9) is said before
-    // the title.
     assert!(lines[2].contains(" idle typed by "), "{text}");
-    // The engine drops the override from the title it keeps; whatever a title
-    // holds, none of it reaches the reader raw (the client's own escaping is
-    // unit-tested with titles the engine would not keep).
+    // The engine strips the bidi override from the stored title.
     assert!(lines[2].contains(" ago | build "), "{text}");
     assert!(
         !text.contains('\u{202e}'),
         "the override reached the reader: {text:?}"
     );
 
-    // The whole record of every session, for a file.
     let json = survey(&inst, &["--json"]);
     assert!(json.starts_with("[{\"label\":\"pid "), "{json}");
     for sid in [&a, &b] {
@@ -135,7 +111,6 @@ fn the_survey_reads_every_session_of_an_instance() {
     }
     assert!(json.contains("\"level\":\"content\""), "{json}");
 
-    // A stray argument is the usage line, and nothing is asked.
     let bad = ctl(&inst, &["survey", "--everything"]);
     assert_eq!(bad.status.code(), Some(1), "{bad:?}");
     assert!(
@@ -151,8 +126,7 @@ fn wire_field(line: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The `"needs"` member of session `sid`'s record in a `survey --json` read:
-/// the first one after its `"sid"` member, which leads the record's need.
+/// The `"needs"` field of session `sid`'s record in `survey --json`.
 fn json_needs(json: &str, sid: &str) -> Option<String> {
     let at = json.find(&format!("\"sid\":\"{sid}\""))?;
     let rest = &json[at..];
@@ -161,24 +135,10 @@ fn json_needs(json: &str, sid: &str) -> Option<String> {
     Some(rest[start..start + end].to_string())
 }
 
-/// THE PUBLISHED NEED ON THE WIRE (`docs/DESIGN-owner-surfaces-2026-10-16.md`
-/// §9 S1-S2), against a real headless aterm: a keyed attention of kind ask is
-/// a need every reader names — `status needs=ask`, the survey's record, the
-/// menu-bar item's chrome line counting one warning — and a wait is none.
-/// The waiting tab's verdict is seen to MOVE, so its `needs=-` is a
-/// publication, never the default before one: it first holds a person's bare
-/// ask (`needs=ask`), then the supervisor's newer wait — under which the
-/// survey's attention excerpt is still the ask's words — and the bare entry's
-/// clear — which moves no effective value, only an entry under it — must
-/// still reach the need. The clear's own wake is
-/// pinned in-process (`needs_tests::clearing_an_older_ask_under_a_newer_wait_
-/// moves_the_need`): a live instance republishes a session on more than one
-/// path (its screen re-read among them). NEGATIVE CONTROL: the wait — read without its kind, the
-/// supervisor's entry is an ask, and the waiting tab never reads `-`.
+/// Keyed `kind=ask` attention publishes `needs=ask` across `status`, `survey`, and `chrome`, while
+/// `kind=wait` publishes no need once an older bare ask is cleared.
 #[test]
 fn a_kind_ask_attention_is_a_need_every_reader_names_and_a_wait_is_none() {
-    // A world of its own: the tests of this file run in parallel, and the
-    // label names the scratch root.
     let inst = headless_boot::boot_with(
         "asnd",
         |_, cmd| {
@@ -229,8 +189,7 @@ fn a_kind_ask_attention_is_a_need_every_reader_names_and_a_wait_is_none() {
         Some("ask"),
         "the older ask stands"
     );
-    // The survey's excerpt is the ask the waiter is ranked by, never the
-    // newer wait's words.
+    // The survey excerpt reflects the older ask rather than the newer wait.
     let record = survey(&inst, &["--sid", &waiter]);
     assert_eq!(sid_field(&record, "attention"), Some("lunch"), "{record}");
     meta(&waiter, &["unset", "attention"]);
@@ -253,10 +212,7 @@ fn a_kind_ask_attention_is_a_need_every_reader_names_and_a_wait_is_none() {
     assert_eq!(wire_field(line, "stuck").as_deref(), Some("0"), "{line}");
 }
 
-/// A fake agent that is the PTY's own child: run as `claude` (`exec -a`) in
-/// place of the session's shell, so no job-control shell takes the terminal
-/// back when it stops. It writes its pid to `$1`, then reads nothing until
-/// the file `$2` exists, then reads lines.
+/// Fake agent run via `exec -a claude` as the PTY leader; writes its pid to `$1`, waits for `$2`, then reads lines.
 const FAKE_LEADER: &str = r#"#!/bin/sh
 echo $$ > "$1"
 printf 'fake agent up\n'
@@ -264,8 +220,7 @@ while [ ! -e "$2" ]; do sleep 0.1; done
 while IFS= read -r line; do printf 'read %s\n' "$line"; done
 "#;
 
-/// SIGKILLs the fake by its pid when the test ends, however it ends: a
-/// stopped process outlives its terminal's hangup.
+/// SIGKILLs the fake process on drop so a stopped child does not outlive terminal hangup.
 struct KillOnDrop(i32);
 
 impl Drop for KillOnDrop {
@@ -275,15 +230,8 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// THE TASK AND THE STALL ON THE WIRE (`docs/DESIGN-owner-surfaces-2026-10-16.md`
-/// §10, "Real aterm"), against a real headless aterm: a task marked stalled
-/// over the wire is `status needs=stalled` once its wake lands (§9 S3), and a
-/// worker that is moving again needs nothing; an identified agent that is
-/// the PTY's own child, stopped with input queued, is `needs=stopped` with
-/// its verdict `wall:unresponsive` detail `stopped` — never `frozen` — and
-/// the remedy, `signal cont`, clears it. NEGATIVE CONTROLS: the task's
-/// session reads `-` before its mark and after its move; the stopped agent
-/// with nothing queued is no stall, and the remedy's read is `-` again.
+/// A stalled task publishes `status needs=stalled` until marked working, and a stopped PTY-leader
+/// agent with queued input publishes `needs=stopped` (`wall:unresponsive`, `stopped`) until `signal cont`.
 #[test]
 fn a_stalled_task_and_a_stopped_agent_are_needs_on_the_wire() {
     let inst = headless_boot::boot_with(
@@ -304,7 +252,6 @@ fn a_stalled_task_and_a_stopped_agent_are_needs_on_the_wire() {
         })
     };
 
-    // The task leg.
     assert_eq!(wire_field(&status(&worker), "needs").as_deref(), Some("-"));
     let marked = ctl_ok(
         &inst,
@@ -318,16 +265,11 @@ fn a_stalled_task_and_a_stopped_agent_are_needs_on_the_wire() {
     );
     until_needs(&worker, "-");
 
-    // The stall leg reads the agent's unread input
-    // (`aterm_pty::input_queue_len`), which only macOS answers: a Linux
-    // master's FIONREAD counts the other direction, so there a stopped agent
-    // with input queued is no stall aterm can see (on the Linux lane this leg
-    // waited out its minute for `needs=stopped`).
+    // `aterm_pty::input_queue_len` requires macOS (Linux master FIONREAD counts the opposite direction).
     if !cfg!(target_os = "macos") {
         return;
     }
 
-    // The stall leg: the fake replaces the session's shell.
     let script = inst.tmp.join("fake-leader.sh");
     let pid_file = inst.tmp.join("fake-leader.pid");
     let go = inst.tmp.join("fake-leader.go");
@@ -369,8 +311,7 @@ fn a_stalled_task_and_a_stopped_agent_are_needs_on_the_wire() {
         Some("-"),
         "stopped with nothing queued is no stall"
     );
-    // One write, the line and its newline: a second write behind a stopped
-    // job's queued input is refused.
+    // Send the line and newline in one write before queued input blocks a second write.
     ctl_ok(&inst, &[&at(&agent), "feed", "780a"]);
     let stopped = until_needs(&agent, "stopped");
     assert_eq!(
@@ -383,7 +324,6 @@ fn a_stalled_task_and_a_stopped_agent_are_needs_on_the_wire() {
         Some("stopped"),
         "{stopped}"
     );
-    // The remedy: resumed, the fake reads the line, and nothing is needed.
     std::fs::write(&go, b"").expect("create the go file");
     ctl_ok(&inst, &[&at(&agent), "signal", "cont"]);
     until_needs(&agent, "-");

@@ -1,45 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `forge serde-attrs`: every `#[serde(...)]` attribute key and form the
-//! workspace writes, so the first-party derive (docs/AUDIT-third-party-2026-10-15.md,
-//! SP.5) accepts exactly that closed set and rejects every other key with
-//! `compile_error!`. A re-run shows what has been added since:
-//!
-//! ```sh
-//! targo --unverified forge serde-attrs > docs/measured/third-party-2026-10-15/serde-attrs.tsv
-//! ```
-//!
-//! It lexes every `.rs` file under `crates/` (comments and literals skipped;
-//! the astream submodule is its own workspace, outside aterm's serde graph)
-//! except `crates/aterm-serde`, and finds each attribute written directly
-//! (`#[serde(...)]`) or under `#[cfg_attr(<cond>, serde(...))]`. Each item is
-//! classified by where it sits: `container` (a struct or enum), `variant`, or
-//! `field` (a named or tuple field of a struct or of an enum variant). Derive
-//! sites are counted the same way, from `derive(...)` lists naming `Serialize`
-//! or `Deserialize`, and so are hand-written impls of either trait.
-//!
-//! `crates/aterm-serde` is the serde implementation, not a model: its std
-//! impls are not aterm's hand-written ones, and its suite exercises the derive
-//! rather than adding to what it must accept. The derive
-//! (crates/aterm-serde-derive) refuses every key, position and form outside
-//! the recorded set at compile time, so that suite compiling is what holds it
-//! to the set. Name paths to list them instead of the default tree. This
-//! lexer reads source, not expansions, and finds a struct's body by its first
-//! bracket, so the suite's parser-shape tests (tests/derive_input.rs) list a
-//! `#[serde(rename = $key)]` inside a `macro_rules!` as written and misplace a
-//! field attribute after a where clause with an `Fn(..)` bound:
-//!
-//! ```sh
-//! targo --unverified forge serde-attrs crates/aterm-serde
-//! ```
+//! `forge serde-attrs`: inventory of every `#[serde(...)]` attribute key and form in the workspace.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// Keys whose string value is part of the form (the derive implements each
-/// value); every other `key = "..."` is recorded as taking a string.
 const VALUE_FORMS: &[&str] = &["rename_all"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,9 +38,6 @@ const fn ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// The tokens of a Rust source: identifiers, string contents, other literals
-/// and single punctuation characters, each with its 1-based line. Comments
-/// and whitespace are dropped.
 fn lex(src: &str) -> Vec<Tok> {
     let b: Vec<char> = src.chars().collect();
     let n = b.len();
@@ -154,8 +118,6 @@ fn lex(src: &str) -> Vec<Tok> {
     out
 }
 
-/// A string literal opening at `i`: `(raw, hashes, index of its opening quote)`.
-/// A prefix is one of `br cr r b c`; `#`s are a raw string's only.
 fn string_start(b: &[char], i: usize) -> Option<(bool, usize, usize)> {
     for prefix in ["br", "cr", "r", "b", "c", ""] {
         let p: Vec<char> = prefix.chars().collect();
@@ -166,15 +128,12 @@ fn string_start(b: &[char], i: usize) -> Option<(bool, usize, usize)> {
         let hashes = b[at..].iter().take_while(|&&c| c == '#').count();
         let raw = prefix.contains('r');
         if b.get(at + hashes) == Some(&'"') {
-            // `#"` with no `r` is a `#` and then a string, never a string with hashes.
             return (hashes == 0 || raw).then_some((raw, hashes, at + hashes));
         }
     }
     None
 }
 
-/// The end of a char literal at `i` (`'a'`, `'\n'`, `'\x7f'`, `'\u{1F600}'`):
-/// an escape's longer forms first, then the escaped character alone.
 fn char_end(b: &[char], i: usize) -> Option<usize> {
     let at = i + 1;
     let first = *b.get(at)?;
@@ -208,7 +167,6 @@ fn char_end(b: &[char], i: usize) -> Option<usize> {
         .map(|body| at + body + 1)
 }
 
-/// The end of a lifetime or label at `i` (`'a`, `'static`).
 fn lifetime_end(b: &[char], i: usize) -> Option<usize> {
     if !ident_start(*b.get(i + 1)?) {
         return None;
@@ -220,7 +178,6 @@ fn lifetime_end(b: &[char], i: usize) -> Option<usize> {
     )
 }
 
-/// The index just past the delimited group opening at `toks[i]`.
 fn group_end(toks: &[Tok], i: usize) -> usize {
     let close = |t: &str| match t {
         "(" => Some(")"),
@@ -246,7 +203,6 @@ fn group_end(toks: &[Tok], i: usize) -> usize {
     i
 }
 
-/// `toks` split at its top-level commas, empty pieces dropped.
 fn split_commas(toks: &[Tok]) -> Vec<&[Tok]> {
     let (mut items, mut start, mut depth) = (Vec::new(), 0usize, 0i32);
     for (k, t) in toks.iter().enumerate() {
@@ -270,7 +226,6 @@ fn split_commas(toks: &[Tok]) -> Vec<&[Tok]> {
     items
 }
 
-/// The arguments of `name(...)` when `attr` is that call, else `None`.
 fn call_args<'a>(attr: &'a [Tok], name: &str) -> Option<&'a [Tok]> {
     if attr.first()?.kind != Kind::Ident || attr[0].text != name || attr.get(1)?.text != "(" {
         return None;
@@ -279,7 +234,6 @@ fn call_args<'a>(attr: &'a [Tok], name: &str) -> Option<&'a [Tok]> {
     Some(&attr[2..end.saturating_sub(1).max(2)])
 }
 
-/// Each serde meta item of one attribute, and whether it came through `cfg_attr`.
 fn serde_items(attr: &[Tok]) -> Vec<(&[Tok], bool)> {
     if let Some(args) = call_args(attr, "serde") {
         return split_commas(args).into_iter().map(|i| (i, false)).collect();
@@ -294,7 +248,6 @@ fn serde_items(attr: &[Tok]) -> Vec<(&[Tok], bool)> {
     Vec::new()
 }
 
-/// `Serialize`/`Deserialize` named by one `derive(...)` attribute, with `cfg_attr`.
 fn derives(attr: &[Tok]) -> Vec<(String, bool)> {
     if let Some(args) = call_args(attr, "derive") {
         return split_commas(args)
@@ -315,7 +268,6 @@ fn derives(attr: &[Tok]) -> Vec<(String, bool)> {
     Vec::new()
 }
 
-/// One meta item's key and the form it takes.
 fn form_of(item: &[Tok]) -> (String, String) {
     let key = item[0].text.clone();
     if item.len() == 1 {
@@ -343,8 +295,6 @@ fn form_of(item: &[Tok]) -> (String, String) {
     (key, format!("?{}", rest.join(" ")))
 }
 
-/// Is `rel` test code by aterm-census's rule: a `_`-separated word of a path
-/// segment starts with `test`.
 fn test_path(rel: &str) -> bool {
     rel.split('/').any(|part| {
         part.strip_suffix(".rs")
@@ -354,7 +304,6 @@ fn test_path(rel: &str) -> bool {
     })
 }
 
-/// One attribute item waiting for what it sits on.
 struct Pending {
     key: String,
     form: String,
@@ -362,7 +311,6 @@ struct Pending {
     line: usize,
 }
 
-/// Where an item sits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Position {
     Container,
@@ -380,7 +328,6 @@ impl Position {
     }
 }
 
-/// A brace or paren's context: an enum's body, a struct's or variant's fields, or other.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctx {
     Enum,
@@ -390,13 +337,9 @@ enum Ctx {
 
 #[derive(Default)]
 struct Inventory {
-    /// (position, key, form) → each site and whether it came through `cfg_attr`.
     rows: BTreeMap<(Position, String, String), Vec<(String, bool)>>,
-    /// (position, the item's whole key set) → each item's first site.
     combos: BTreeMap<(Position, String), Vec<String>>,
-    /// (trait, `struct`/`enum`/`union`) → each derive site.
     derive_sites: BTreeMap<(String, String), Vec<(String, bool)>>,
-    /// trait → each hand-written impl's site.
     manual: BTreeMap<String, Vec<String>>,
 }
 
@@ -524,7 +467,6 @@ impl Inventory {
         }
     }
 
-    /// `impl<...> [serde::]Deserialize<'de> for X` / `impl Serialize for X` at `toks[i]`.
     fn impl_site(&mut self, toks: &[Tok], i: usize, rel: &str) {
         let n = toks.len();
         let mut k = i + 1;
@@ -613,9 +555,6 @@ impl Inventory {
     }
 }
 
-/// Every `.rs` file under `dir`, a directory's files before its
-/// subdirectories, each in name order; `target/` and `skip` skipped, links not
-/// followed.
 fn rs_files(
     dir: &Path,
     skip: Option<&Path>,
@@ -644,10 +583,8 @@ fn rs_files(
     Ok(())
 }
 
-/// The inventory of the checkout at `root`, as the TSV the module docs
-/// describe: of `paths` (relative to `root`) when any are named, else of
-/// `crates/` less the implementation.
-///
+/// The TSV inventory of the checkout at `root`: of `paths` (relative to `root`) when any are named,
+/// else of `crates/` less `crates/aterm-serde`.
 /// # Errors
 /// A tree could not be walked or a file could not be read as UTF-8.
 pub fn inventory(root: &Path, paths: &[std::path::PathBuf]) -> Result<String, String> {
@@ -686,7 +623,6 @@ pub fn inventory(root: &Path, paths: &[std::path::PathBuf]) -> Result<String, St
 }
 
 /// The `serde-attrs` verb: the inventory on stdout.
-///
 /// # Errors
 /// As [`inventory`].
 pub fn run(root: &Path, paths: &[std::path::PathBuf]) -> Result<crate::Outcome, String> {
@@ -788,7 +724,6 @@ mod tests {
         assert!(test_path("crates/a/src/foo_tests.rs") && !test_path("crates/a/src/latest.rs"));
     }
 
-    /// The default tree leaves the implementation out; naming it lists it.
     #[test]
     fn the_implementation_is_listed_only_when_named() {
         let root = std::env::temp_dir().join(format!("forge-serde-{}", std::process::id()));

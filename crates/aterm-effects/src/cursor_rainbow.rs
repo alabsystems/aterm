@@ -202,6 +202,9 @@ fn release_forecast(now_v: f32, prev_v: f32, dt: f32, ahead: f32) -> Option<f32>
     }
     if dt <= 0.0 || prev_v <= now_v {
         // A live (> `SETTLED_ENERGY`) envelope that has not begun decaying
+        // (such as `caret_paint`'s 180 ms flat landing re-light hold) cannot be
+        // extrapolated as stationary across `SETTLE_POLL_CAP`: return `None` so
+        // the caller stays on frame cadence until the decay slope is observed.
         return (now_v <= SETTLED_ENERGY).then_some(now_v);
     }
     let ratio = (now_v / prev_v).clamp(1e-3, 1.0);
@@ -328,6 +331,7 @@ impl CursorRainbow {
         }
         let Some(probe_in) = self.settle_probe else {
             // A painted caret with no latched tick cannot come out of `tick`
+            // (which latches on every non-inert return); fail onto the cadence.
             return Some(now + frame_interval);
         };
         let wake = match self.settle_memo {
@@ -529,6 +533,7 @@ impl CursorRainbow {
         }
         if painted {
             // Wrap on the reflected sweep's own period (2.0,
+            // `rainbow_sweep_reflect`); `fract()` would jump half a period.
             self.spin = (self.spin + dt_spin * RIM_SPIN_TURNS_PER_S * paint).rem_euclid(2.0);
         }
         let spectrum_phase = family
@@ -683,6 +688,7 @@ impl CursorRainbow {
                 }
                 let ring_arc = if layer == 0 {
                     // The innermost ring touches the ribbon nozzle and wears
+                    // its exact emitted hue; outer rings fan through the family.
                     rainbow
                 } else {
                     shade(spectrum_at(ring_sweep, t * hue_spread), sat, val)

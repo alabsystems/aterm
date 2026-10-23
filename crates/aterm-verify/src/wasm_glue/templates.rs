@@ -64,7 +64,7 @@ function passArray{S}ToWasm0(arg, malloc) {
 }
 ";
 
-/// `getStringFromWasm0` and its decoder ([`DECODE_TEXT_WEB`], [`DECODE_TEXT_NODE`]).
+/// `getStringFromWasm0` and its decoder ([`DECODE_TEXT_WEB`]).
 pub(crate) const GET_STRING: &str = "\
 function getStringFromWasm0(ptr, len) {
     ptr = ptr >>> 0;
@@ -86,13 +86,6 @@ function decodeText(ptr, len) {
         cachedTextDecoder.decode();
         numBytesDecoded = len;
     }
-    return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
-}
-";
-
-/// `decodeText` under node.
-pub(crate) const DECODE_TEXT_NODE: &str = "\
-function decodeText(ptr, len) {
     return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
 }
 ";
@@ -272,14 +265,6 @@ const {C}Finalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.{FREE}(ptr >>> 0, 1));
 ";
-
-/// The `--target nodejs` loader.
-pub(crate) const NODE_LOADER: &str = "\
-const wasmPath = __dirname + '/' + {FILE};
-const wasmBytes = require('fs').readFileSync(wasmPath);
-const wasmModule = new WebAssembly.Module(wasmBytes);
-const wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
-{INIT}";
 
 /// The `--target web` loader.
 pub(crate) const WEB_LOADER: &str = "\

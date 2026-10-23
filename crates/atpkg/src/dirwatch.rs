@@ -276,6 +276,7 @@ mod imp {
                         .unwrap_or_else(|p| p.into_inner())
                         .get_mut(&id)
                 {
+                    // The knote stays on the removed vnode and never fires
                     // again; a new object at the path is another vnode.
                     open.gone = true;
                 }
@@ -384,6 +385,7 @@ mod imp {
             let mask = match kind {
                 Kind::Dir => DIR_MASK,
                 Kind::File => {
+                    // `IN_DONT_FOLLOW` would watch a symlink itself rather
                     // than refuse it; the kind is checked on the link.
                     if !std::fs::symlink_metadata(path)?.is_file() {
                         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -507,6 +509,9 @@ mod imp {
                         ids.extend(of_wd.iter().copied());
                     }
                     if mask & IN_IGNORED != 0 {
+                        // The kernel took the watch off (its object went):
+                        // its ids stay known, so their removal is quiet, and
+                        // are gone, though a later watch may get this
                         // descriptor's number.
                         if let Some(of_wd) = wds.ids.remove(&wd) {
                             wds.gone.extend(of_wd);

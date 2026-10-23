@@ -112,6 +112,8 @@ pub(crate) fn program_of(pid: i32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn platform_argv_head(pid: i32) -> Option<(String, Option<String>)> {
+    // aterm-uds's reader, whose buffer holds the whole answer: one sized by a
+    // size query first was given only the argc of a shell that exec'd between
     // the two calls.
     argv_head_from_procargs2(&aterm_uds::procargs::read(u32::try_from(pid).ok()?)?)
 }
@@ -155,7 +157,7 @@ pub(crate) enum PathVerdict {
 
 impl PathVerdict {
     /// The `path=` word: a reroute-only PATH reaches the managed twin, so it is `live`.
-    pub(crate) fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Live | Self::RerouteOnly => "live",
             Self::Frozen => "frozen",

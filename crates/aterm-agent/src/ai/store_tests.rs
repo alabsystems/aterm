@@ -41,7 +41,6 @@ fn a_note_writes_the_record_and_the_wake() {
     assert_eq!(r.ended_why, Some(Ended::ReviewAuth));
     assert_eq!(r.used_at, Some(100), "an end is not a use");
 
-    // A use after the end lifts it.
     store
         .note("codex", How::Review, Outcome::Worked, 300)
         .expect("note");

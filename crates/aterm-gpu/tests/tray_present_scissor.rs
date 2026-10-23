@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// A resident tray card (settings panel, transient card, build badge) must not
-// disable the scissored present, and must still look identical. The card
-// composites over the throwaway `present_offscreen` copy (as the comet halo
-// does), so the persistent offscreen stays a clean scissor base. The tests drive
-// `present_virtual` (the same `present_to_view` body as the swapchain arm) and
-// harvest the presented bytes through the video tap.
-//
-// No GPU or no font: COULD NOT RUN.
+
+//! Tray card compositing over scissored presents.
 
 use aterm_core::terminal::Terminal;
 #[cfg(wgpu_arm)]
@@ -32,10 +25,6 @@ fn opts() -> CaptureOpts {
     }
 }
 
-/// Present `seq` (input + tray per frame) through the virtual target with the
-/// tap armed and harvest every frame's bytes. A fresh `WindowGpu` per call, so
-/// each arm starts without a prior frame; only renderer state (atlas,
-/// pipelines) carries across arms.
 fn harvest(
     gpu: &mut GpuRenderer,
     w: u32,
@@ -63,21 +52,16 @@ fn harvest(
     take
 }
 
-/// A small grid with the cursor hidden (so no blink phase can perturb an A/B),
-/// plus a second frame differing from it in one row.
 fn two_frames(rows: usize, cols: usize) -> (RenderInput, RenderInput) {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     term.process(b"alpha\r\nbravo\r\ncharlie\r\ndelta");
     let a = term.cell_frame(rows, cols);
-    // One row changes and everything else is byte-identical, so presenting `a`
-    // then `b` gives a small dirty set that must take the scissored path.
     term.process(b"\x1b[3;1Hbravissimo");
     let b = term.cell_frame(rows, cols);
     (a, b)
 }
 
-/// A `pw`×`ph` card of one straight-alpha colour.
 fn card(pw: u32, ph: u32, rgba: [u8; 4]) -> Vec<u8> {
     rgba.repeat((pw * ph) as usize)
 }
@@ -101,8 +85,6 @@ fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
 
-    // Arm A: two presents on one window with the card resident throughout; the
-    // second has a prior frame to diff against, so it is the frame under test.
     let scissors_before = gpu.scissor_taken();
     let fulls_before = gpu.full_repaints();
     let seq = [(&a, Some(quad)), (&b, Some(quad))];
@@ -110,16 +92,12 @@ fn tray_present_scissors_and_stays_byte_identical_to_a_full_repaint() {
     let scissored = gpu.scissor_taken() - scissors_before;
     let fulls = gpu.full_repaints() - fulls_before;
 
-    // A resident card does not cost the scissor: the first present is Full (no
-    // prior frame) and the second scissors its one dirty row.
     assert_eq!(
         (scissored, fulls),
         (1, 1),
         "a resident tray card must not disable the scissored repaint"
     );
 
-    // Arm B: the same frame presented into a fresh window, a full repaint by
-    // construction. The scissored frame must be byte-identical.
     let full = harvest(&mut gpu, fw, fh, &[(&b, Some(quad))]);
     assert!(
         incremental.frames[1].rgba == full.frames[0].rgba,
@@ -152,8 +130,6 @@ fn dropping_the_tray_leaves_no_stale_card_pixels() {
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
 
-    // Card up, then card gone, with the same input: any difference between the
-    // drop frame and a never-carded present is a stranded card pixel.
     let dropped = harvest(&mut gpu, fw, fh, &[(&a, Some(quad)), (&a, None)]);
     let never = harvest(&mut gpu, fw, fh, &[(&a, None)]);
     assert!(
@@ -178,8 +154,6 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
     let (rows, cols) = (6usize, 20usize);
     let (plain, _) = two_frames(rows, cols);
     let (cw, ch) = gpu.cell_size();
-    // A live comet: additive glow quads mid-grid. With bloom on (the default)
-    // this takes the `fx_present` route the card also composites on.
     let mut glowing = plain.clone();
     for i in 0..3u16 {
         glowing.cursor_glow_add.push(GlowQuad {
@@ -189,7 +163,6 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(0x00FF_6A00, 220),
-            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(0x00FF_6A00, 220),
             alpha2: 0,
@@ -198,8 +171,6 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
     let (fw, fh) = gpu.frame_size(rows, cols);
     let (fw, fh) = (fw as u32, fh as u32);
 
-    // Negative control first: with no card, the glow must change the frame,
-    // or the equality below could pass because the halo never drew.
     let bare_glow = harvest(&mut gpu, fw, fh, &[(&glowing, None)]);
     let bare_plain = harvest(&mut gpu, fw, fh, &[(&plain, None)]);
     assert!(
@@ -207,9 +178,6 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
         "negative control: the comet halo must reach the presented frame"
     );
 
-    // A fully opaque full-frame card. Above the halo it hides it entirely, so
-    // glowing and plain frames present identically; below it, the additive
-    // light would show through.
     let pixels = card(fw, fh, [18, 20, 24, 255]);
     let quad = TrayQuad {
         rgba: &pixels,
@@ -233,15 +201,6 @@ fn an_opaque_tray_still_covers_the_comet_halo() {
     );
 }
 
-/// A scrim is the window-sized smoke layer a modal used to bake into its card:
-/// a small opaque card over a scrim presents byte-identical to a frame-sized
-/// card of the scrim colour with that card painted into it (rows above the
-/// scrim's `top` clear), a steady scrim does not deepen frame over frame, and
-/// closing it leaves none behind. Negative control: the scrim reaches the
-/// presented frame. On the wgpu arm, the one that draws a scrim: the Metal and
-/// GL arms' platforms show none, and they refuse one in debug builds
-/// (`TrayQuad::scrim`), so on macOS and Linux this runs on the oracle arm
-/// (`--features wgpu-oracle`).
 #[cfg(wgpu_arm)]
 #[test]
 fn a_tray_scrim_presents_as_the_frame_sized_card_it_replaces() {

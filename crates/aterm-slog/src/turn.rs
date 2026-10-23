@@ -1122,6 +1122,8 @@ impl TurnTracker {
             });
             if binds(what) {
                 // An accepted input waiting on the lead binds the first
+                // approval or question step to open within it, with none
+                // closing between (T1).
                 if let Some(l) = self.lead.take()
                     && l.opens == self.opens
                     && l.closes == self.closes
@@ -1676,6 +1678,7 @@ impl TurnTracker {
             TxEvent::Prompt { vref } => self.tx_prompt(log, vref, state, conf, row, now),
             TxEvent::Interrupt => {
                 // An unmeasured source may end its own vendor turn below,
+                // but must not change the screen turn's eventual outcome.
                 if state == TxState::On {
                     self.note_interrupted();
                 }

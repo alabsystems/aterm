@@ -17,7 +17,8 @@ pub enum HttpError {
     Transport(String),
     /// The `-w`-appended status trailer was not a number.
     Malformed(String),
-    /// A status the vendor lane.
+    /// A status the vendor lane ([`vendor_get`], [`vendor_content_length`],
+    /// [`vendor_download_to`]) does not accept.
     VendorStatus { code: u16, url: String },
     /// A vendor-lane verdict about the request or the document, returned on the first attempt.
     VendorRefused(String),
@@ -238,7 +239,8 @@ fn transient_status(code: &str) -> bool {
     matches!(code, "408" | "500" | "502" | "503" | "504")
 }
 
-/// What a redirect-refusing HEAD came back.
+/// What a redirect-refusing HEAD came back with: the status and the `Location` header, if
+/// any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadAnswer {
     /// The HTTP status of the first hop (no redirect is followed).
@@ -290,7 +292,9 @@ fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<Head
     head_attempts(url, args, 1, attempts)
 }
 
-/// What the first attempt of a [`head_no_redirect`] came.
+/// What the first attempt of a [`head_no_redirect`] came to, apart from its retries
+/// ([`head_no_redirect_again`]), so a caller asking several HEADs at once reads the link
+/// from every first attempt before any of them backs off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FirstHead {
     /// Settled on that attempt.
@@ -583,7 +587,7 @@ fn part_path(dest: &Path) -> Option<std::path::PathBuf> {
 /// `max_filesize - offset` and the total written stays bounded by `max_filesize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResumePlan {
-    /// Byte offset to continue.
+    /// Byte offset to continue from; `0` is a fresh transfer with no `--continue-at`.
     offset: u64,
     /// What to pass as `--max-filesize`.
     remaining_cap: u64,
@@ -830,7 +834,8 @@ enum ResumeLane {
 enum Sink {
     /// `<dest>.part`, kept across calls for the next one to continue and renamed onto `dest`.
     Part,
-    /// `dest` itself, cut to nothing in place as every call begins ([`clear_sink`]) and left as it.
+    /// `dest` itself, cut to nothing in place as every call begins ([`clear_sink`]) and left
+    /// as it stands after a failure for its caller to remove: [`download_to`].
     Dest,
 }
 

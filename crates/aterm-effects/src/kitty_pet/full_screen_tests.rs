@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A full-screen program's repaint is not output
-//! (`crate::companion::pet_output_burst`, [`PetBrain::note_full_screen`]).
-//!
-//! On a TUI's alternate screen OSC 133 C..D holds for the program's whole life
-//! and every spinner tick, streamed token and echoed key moves the content
-//! clock, so the burst law alone reads it as a stream: the cat perks, hugs the
-//! footer under the composer and crouches in vigil. [`full_screen_repaint_model`]
-//! states the law; the replays drive a recorded Claude Code take and a streamed
-//! answer through a real `Terminal` and `CompanionOwner`, projecting every
-//! presented frame onto the model's invariants.
+//! Alternate-screen repaint suppression tests for [`PetBrain::note_full_screen`].
 
 use core::time::Duration;
 use std::collections::BTreeMap;
@@ -27,16 +18,6 @@ use crate::host::{CaptureMode, FrameGeom, HostFrameInput, SingFacts, TerminalFac
 use crate::pet_world::{PetPane, PetWorldFacts};
 use crate::word_decorations::{DecoConfig, WordDecorations};
 
-/// The law, per presented frame under an executing shell at the live bottom.
-/// Environment actions move the terminal (`Enter`/`Leave` the alt screen, a
-/// `Write`, the caret's line-event `Stream`) and the heat (`Heat` needs a burst,
-/// `Cool` is its decay); `Present` reads the pre-state (`seen_alt` is the screen
-/// the last present saw, so `alt == 1 && seen_alt == 0` is the full screen's
-/// arrival); `Capped` is the stare running out, which arms the vigil.
-///
-/// `Buggy`: 1 never reads the screen; 2 over-corrects and stops every burst; 3
-/// is the burst law without the brain's own gates (a watch heated on the main
-/// screen, or a line-event stream, carried onto the full screen).
 fn full_screen_repaint_model() -> Model {
     aterm_spec::ty_model! {
         FullScreenRepaint {
@@ -68,8 +49,6 @@ fn full_screen_repaint_model() -> Model {
                 } else {
                     if wrote == 1 && (alt == 0 || Buggy == 1) { 1 } else { 0 }
                 };
-                // The full screen's arrival ends the watch: the heat and an
-                // armed vigil drop with it.
                 hot = if alt == 1 && seen_alt == 0 && (Buggy == 0 || Buggy == 2) {
                     0
                 } else {
@@ -85,7 +64,6 @@ fn full_screen_repaint_model() -> Model {
                 } else {
                     vigil
                 };
-                // While it is up, no live-edge hug from either witness.
                 hug = if alt == 0 || Buggy == 1 || Buggy == 3 {
                     if stream == 1 { 1 } else { hot }
                 } else {
@@ -101,7 +79,6 @@ fn full_screen_repaint_model() -> Model {
     }
 }
 
-/// The full-screen invariants, each of which the screen-blind law breaks.
 const FULL_SCREEN_INVARIANTS: [&str; 4] = [
     "FullScreenIsNotOutput",
     "NoStareOnFullScreen",
@@ -113,9 +90,6 @@ const FULL_SCREEN_INVARIANTS: [&str; 4] = [
 fn full_screen_repaint_model_proves_and_catches() {
     let model = full_screen_repaint_model();
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
-    // Each invariant alone catches a mutant: the screen-blind law breaks every
-    // full-screen one, the burst law without the brain's gates the three that
-    // ride the heat and the stream, the over-correction the main-screen one.
     let catches = |inv: &str, buggy: i64| {
         let mut alone = aterm_spec::interp::with_buggy(&model, buggy);
         alone.invariants.retain(|i| i.name == inv);
@@ -135,42 +109,22 @@ fn full_screen_repaint_model_proves_and_catches() {
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 const SESSION: u64 = 7;
-/// The present cadence: one vsync at 60 Hz.
 const VSYNC: Duration = Duration::from_millis(16);
-/// Ink's render throttle (~30 fps): one synchronized repaint per tick while
-/// Claude Code streams an answer.
 const REPAINT: Duration = Duration::from_millis(33);
-/// How long a transcript redraw stays open across reads (~280 ms measured via
-/// `Terminal::sync_frame_unfinished`), past the host's 150 ms hold, so it
-/// presents torn.
 const TORN_OPEN: Duration = Duration::from_millis(280);
 
 const TAKE: &str = include_str!("../../tests/fixtures/claude-composer-2026-09-21.ptylog");
 
-/// One replay: the recorded take, then a streamed answer, then optionally a
-/// full-screen monitor.
 #[derive(Clone, Copy)]
 struct Run {
-    /// Strip the take's `?1049h`: the same console drawn inline on the main
-    /// screen.
     inline: bool,
-    /// Withhold the alt-screen fact from the owner: the screen-blind law.
     blind: bool,
-    /// How long Claude Code streams its answer after the take.
     answer: Duration,
-    /// Then hand the terminal to a full-screen monitor whose clock ticks once
-    /// a second for this long.
     monitor: Duration,
-    /// Each answer repaint is an unbracketed transcript redraw that parks the
-    /// hidden caret on the token's row for [`TORN_OPEN`], raising the caret's
-    /// line-event stream (`PetBrain::stream`), the hug's other witness. (A DEC-2026
-    /// bracket held that long raises none: `pet_holds_through_a_torn_frame.rs`.)
     torn: bool,
 }
 
 impl Run {
-    /// The recorded take (15 s), then an answer long enough for a vigil to come
-    /// due.
     const FULL_SCREEN: Self = Self {
         inline: false,
         blind: false,
@@ -180,7 +134,6 @@ impl Run {
     };
 }
 
-/// What a replay measured over the frames under the shell's Execute phase.
 #[derive(Debug, Default)]
 struct Take {
     frames: u32,
@@ -190,16 +143,11 @@ struct Take {
     hugs: u32,
     vigil_armed: u32,
     vigil_crouch: u32,
-    /// Vigil-crouch frames on the alternate screen.
     alt_crouch: u32,
-    /// Frames on the alternate screen with the caret's line-event stream up.
     alt_stream: u32,
-    /// The lowest row the cat stood on once typing started.
     max_row: f32,
     composer: u16,
-    /// Seconds from the shell's `133;C` to the last present.
     executed: f32,
-    /// Frames on which each model invariant failed on the projected state.
     violations: BTreeMap<&'static str, u32>,
 }
 
@@ -245,9 +193,6 @@ impl Host {
         }
     }
 
-    /// One present, as the hosts run it: the facts, the world, the owner's
-    /// frame, then the word engine's rescan (so the pet reads the last completed
-    /// scan, one frame stale by construction).
     fn present(&mut self) {
         let state = self.term.content_scroll_state();
         let scrolled = matches!(
@@ -323,9 +268,6 @@ impl Host {
         }
     }
 
-    /// The present loop up to `t`: a present on each vsync that has something
-    /// to show — output since the last present, a brain asking for frames,
-    /// or a brain deadline that fell due.
     fn run_to(&mut self, t: Instant) {
         while self.vsync <= t {
             let at = self.vsync;
@@ -351,13 +293,11 @@ impl Host {
         self.dirty = true;
     }
 
-    /// A key press, as the host's input path notes it.
     fn key(&mut self, at: Instant, bytes: &[u8]) {
         self.run_to(at);
         let kind = match bytes {
             [c] if c.is_ascii_graphic() || *c == b' ' => PetInputKind::Text,
             [0x1b, b'[', .., b'C' | b'D'] => PetInputKind::Navigate,
-            // Terminal replies (DA, DECRQM, kitty graphics) are not keys.
             _ => return,
         };
         if self.take.composer == 0 {
@@ -368,9 +308,6 @@ impl Host {
 }
 
 impl Take {
-    /// Projects one presented frame onto the model: the screen, whether the
-    /// content clock moved, the owner's burst verdict, whether the stare owned
-    /// the tick (`watch_t` grows nowhere else), and the brain's hug and vigil.
     fn observe(
         &mut self,
         model: &Model,
@@ -388,8 +325,6 @@ impl Take {
         self.vigil_crouch += u32::from(brain.vigil);
         self.alt_crouch += u32::from(brain.vigil && alt);
         self.alt_stream += u32::from(brain.stream && alt);
-        // From the first key, once the composer is known: the cat's arrival
-        // from the prompt row is not measured.
         if frame.on_glass && self.composer != 0 {
             self.max_row = self.max_row.max(frame.pet.row);
         }
@@ -423,10 +358,6 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// The shell runs `claude`; the recorded take plays up to its Ctrl-C; then
-/// Claude Code streams an answer, each repaint writing the next word and the
-/// spinner line and returning the caret to the composer inside one DEC-2026
-/// frame. Then, if asked, a full-screen monitor takes the terminal.
 fn replay(run: Run) -> Take {
     let mut h = Host::new(run.blind);
     let t0 = h.now;
@@ -482,8 +413,6 @@ fn replay(run: Run) -> Take {
             row = if row >= 33 { 2 } else { row + 1 };
         }
         if run.torn {
-            // The first read ends at the spinner line, caret hidden on the
-            // token's row — and no bracket, so the frame is not unfinished.
             let frame = frame.replace("\x1b[?2026h", "").replace("\x1b[?2026l", "");
             let cut = frame.find("\x1b[35;1H").expect("the spinner line");
             h.output(at, &frame.as_bytes()[..cut]);
@@ -512,16 +441,11 @@ fn replay(run: Run) -> Take {
     h.take
 }
 
-/// On the full screen, through typing and a streamed answer past
-/// [`VIGIL_AFTER`], no frame is a burst, the stare never holds, the cat never
-/// hugs the footer and no vigil arms.
 #[test]
 fn a_full_screen_repaint_is_not_output() {
     let run = Run::FULL_SCREEN;
     let t = replay(run);
     println!("full screen: {t:?}");
-    // The only main-screen frames are Claude Code's start-up, before its
-    // `?1049h`.
     assert!(
         t.alt_frames > 1000 && t.frames - t.alt_frames < 30,
         "fixture: the replay presented on the alt screen: {t:?}"
@@ -542,9 +466,6 @@ fn a_full_screen_repaint_is_not_output() {
     assert!(t.violations.is_empty(), "{:?}", t.violations);
 }
 
-/// Negative control: with the alt-screen fact withheld the same replay bursts,
-/// stares, hops to the footer and arms the vigil, breaking every full-screen
-/// invariant.
 #[test]
 fn the_shipped_law_reads_the_same_take_as_a_stream() {
     let t = replay(Run {
@@ -569,8 +490,6 @@ fn the_shipped_law_reads_the_same_take_as_a_stream() {
     }
 }
 
-/// The same console drawn inline on the main screen is still a stream (bursts,
-/// stare, hug, vigil), so the zeros above are the screen's doing.
 #[test]
 fn a_main_screen_stream_still_perks_hugs_and_waits() {
     let t = replay(Run {
@@ -590,8 +509,6 @@ fn a_main_screen_stream_still_perks_hugs_and_waits() {
     assert!(t.violations.is_empty(), "{:?}", t.violations);
 }
 
-/// Torn transcript redraws on the full screen raise a line-event stream with no
-/// burst behind it; only the brain's own gate keeps the hug from arming off it.
 #[test]
 fn a_torn_redraw_stream_arms_no_hug() {
     let t = replay(Run {
@@ -607,9 +524,6 @@ fn a_torn_redraw_stream_arms_no_hug() {
     assert!(t.violations.is_empty(), "{:?}", t.violations);
 }
 
-/// A vigil armed by an inline stream stands down the frame a full-screen
-/// monitor takes the glass, past [`VIGIL_AFTER`]; the control (alt-screen fact
-/// withheld) keeps it armed and crouches.
 #[test]
 fn a_full_screen_program_stands_down_a_vigil_armed_before_it() {
     let run = Run {
@@ -643,10 +557,6 @@ fn a_full_screen_program_stands_down_a_vigil_armed_before_it() {
     );
 }
 
-/// The same gates on the brain alone, where a live stare can meet the full screen with no
-/// caret move between (a real program's caret chase hides it): told the full screen is
-/// up, the stare lets go on that tick, and neither the heat nor a caret's line-event
-/// stream arms the hug. Told nothing, the brain keeps staring and hugs from either.
 #[test]
 fn a_live_stare_lets_go_the_tick_the_full_screen_comes_up() {
     fn sense(now: Instant, col: u16, burst: bool) -> PetSense {
@@ -664,8 +574,6 @@ fn a_live_stare_lets_go_the_tick_the_full_screen_comes_up() {
             pointer: None,
         }
     }
-    // Two keys wake the cat by the caret; then a stream heats the stare for a
-    // second, well inside its cap.
     let heated = || {
         let mut pet = PetBrain::default();
         let mut t = Instant::now();
@@ -683,20 +591,16 @@ fn a_live_stare_lets_go_the_tick_the_full_screen_comes_up() {
         (pet, t)
     };
     for told in [true, false] {
-        // The stare, with no ink map so the hug stays out of it.
         let (mut pet, t) = heated();
         pet.note_full_screen(told);
         let stare = pet.watch_t;
         let _ = pet.tick(sense(t + VSYNC, 12, false));
         assert_eq!(pet.watch_t > stare, !told, "the stare, told={told}");
-        // The hug, toward a live edge ten rows under the cat.
         let (mut pet, t) = heated();
         pet.sense_ink(0, &[(0, 14); 13], Some(12));
         pet.note_full_screen(told);
         let _ = pet.tick(sense(t + VSYNC, 12, false));
         assert_eq!(pet.hug_armed, !told, "the hug, told={told}");
-        // The hug's other witness, the heat cold: a caret walking rows (a torn
-        // repaint's write position) arms the line-event stream.
         let mut pet = PetBrain::default();
         let mut t = Instant::now();
         for k in 0..160u16 {

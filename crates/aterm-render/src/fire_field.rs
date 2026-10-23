@@ -2,35 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The shared pure-integer procedural fire field behind `FirePatch`.
-//!
-//! [`FireRow`] samples the field along a scanline and [`fire_shade_add`] /
-//! [`fire_shade_over`] turn each sample into premultiplied additive light or straight ink
-//! plus alpha, using only `i32`/`u32` ops: no state, floats or tables. aterm-gpu's
-//! `fs_fire_add`/`fs_fire_over` shaders (WGSL in `renderer.rs`, Metal in `cell.metal`)
-//! mirror it op for op, so CPU and GPU produce identical bytes
-//! (`aterm-gpu/tests/fire_patch_parity.rs`).
-//!
-//! Field anatomy (fixed point, 8 fractional bits unless noted):
-//!
-//! * Silhouette ridge: per-column tongue height from 2-octave value noise advected in time
-//!   (`phase`), folded (`255 − |2n − 255|`) and squared into pointed crests.
-//! * Upward advection: body noise samples at `v − phase·rise_speed`, so pockets change as
-//!   they rise; rise and churn speed up with `temp`.
-//! * Body: three octaves (1×, 2×, 4×) modulate palette index and coverage.
-//! * Lean shear: the sample column drifts `lean/4` px per full rise.
-//! * AA: coverage rolls off over ~`cell_h/4` px inside the silhouette, and a root ramp
-//!   lifts the flame off its fuel line.
-//! * Palette: a 5-anchor black-body LUT interpolated over 1024 steps; white only at a hot
-//!   root, tips die into deep red. [`FireMode::Over`](crate::render_api::FireMode::Over)
-//!   uses a red-brown ink ramp that reads on white.
-//!
-//! Time-advected lattice axes are masked so the `u32` ring wraps onto itself
-//! (`(phase·speed) >> 10` spans `2^22` fp8 units). The field is a pure function of absolute
-//! window coordinates, so patches sharing a burn's parameters are continuous across patch
-//! boundaries.
 
-/// Per-patch field parameters in window pixel space (pad already applied), built the same
-/// way by both backends from a `FirePatch`.
+/// Per-patch field parameters in window pixel space (pad already applied).
 #[derive(Clone, Copy, Debug)]
 pub struct FireFieldParams {
     /// Flame root y in window px (field `v = base_y − py`; flames rise upward).
@@ -43,39 +16,31 @@ pub struct FireFieldParams {
     pub temp: i32,
     /// Per-cell envelope `0..=255`.
     pub strength: i32,
-    /// Horizontal shear: `lean/4` px drift at full rise. `-128..=127`.
+    /// Horizontal shear: `lean/4` px drift at full rise.
     pub lean: i32,
     /// Coverage/alpha ceiling `0..=255`.
     pub cov_cap: i32,
     /// Cell height in px (the field's spatial unit); clamped to `>= 2`.
     pub cell_h: i32,
-    /// Top-edge fade anchor: the window-px y of the grid top (the render pad). Coverage is
-    /// 0 there and full two cells below ([`fire_top_fade`]); anchored at the grid top, not
-    /// framebuffer 0, so a letterboxed window fades at its visible edge.
+    /// Top-edge fade anchor: the window-px y of the grid top (the render pad).
     pub top_fade_y: i32,
 }
 
-// Hash / mix constants (splitmix-style avalanche over lattice coordinates).
 const FIRE_P0: u32 = 0x9E37_79B1;
 const FIRE_P1: u32 = 0x85EB_CA77;
 const FIRE_P2: u32 = 0xC2B2_AE3D;
 const FIRE_M0: u32 = 0x2C1B_3C6D;
 const FIRE_M1: u32 = 0x297A_2D39;
 
-// Per-octave seeds: ridge (2), body (3).
 const FIRE_SEED_R0: u32 = 0x51F0_A3B7;
 const FIRE_SEED_R1: u32 = 0x9D2C_5680;
 const FIRE_SEED_B0: u32 = 0xB529_7A4D;
 const FIRE_SEED_B1: u32 = 0x68E3_1DA4;
 const FIRE_SEED_B2: u32 = 0x1B56_C4E9;
 
-/// Legibility ceiling on the palette index (`0..=1023`). The ramp's top is near-white
-/// (`0xFFF0C0`), which makes white glyphs vanish; capping here keeps the hottest pixel
-/// amber-gold (`~0xFFCF6E`). Both GPU shaders repeat the literal `850`.
 const FIRE_IDX_MAX: i32 = 850;
 
-/// Integer lattice hash → 32 avalanche bits, all wrapping `u32` so the shader agrees
-/// bit-for-bit.
+/// Integer lattice hash → 32 avalanche bits, all wrapping `u32` so the shader agrees bit-for-bit.
 #[inline]
 #[must_use]
 pub const fn fire_hash(x: u32, y: u32, seed: u32) -> u32 {
@@ -98,9 +63,7 @@ pub const fn fire_fade(t: i32) -> i32 {
     (t * t * (768 - 2 * t)) >> 16
 }
 
-/// 2-D integer value noise at fp8 `(x, y)` → `0..=255`. `ymask` masks the time-advected Y
-/// lattice index so the `2^22` ring wraps seamlessly (`0x3FFF`/`0x7FFF`/`0xFFFF` for
-/// 1×/2×/4×); X is spatial and unmasked.
+/// 2-D integer value noise at fp8 `(x, y)` → `0..=255`.
 #[inline]
 #[must_use]
 pub const fn fire_vnoise(x: u32, y: u32, ymask: u32, seed: u32) -> i32 {
@@ -121,8 +84,7 @@ pub const fn fire_vnoise(x: u32, y: u32, ymask: u32, seed: u32) -> i32 {
     (a * (256 - uy) + b * uy) >> 16
 }
 
-/// The field decomposition at one window pixel, shared by both emitters. A dead pixel is
-/// all-zero with `q = 256`.
+/// The field decomposition at one window pixel, shared by both emitters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FireCore {
     /// Palette index `0..=1023`.
@@ -135,8 +97,7 @@ pub struct FireCore {
     pub body: i32,
     /// Root lift ramp `0..=256`.
     pub root: i32,
-    /// Rim proximity `0..=256` (256 at the outline, 0 deep inside): the cross-section cue,
-    /// a cooler sheath on Add, pooled ink on Over.
+    /// Rim proximity `0..=256` (256 at the outline, 0 deep inside).
     pub rim: i32,
 }
 
@@ -149,9 +110,7 @@ const FIRE_DEAD: FireCore = FireCore {
     rim: 0,
 };
 
-/// The patch-constant field terms (from cell_h, peak_h, phase, temp), computed once per
-/// patch by [`fire_precomp`]. A CPU-only hoist: the shader recomputes them per fragment
-/// and the bytes are identical.
+/// Patch-constant field terms computed once per patch by [`fire_precomp`].
 #[derive(Clone, Copy, Debug)]
 pub struct FirePrecomp {
     ch: i32,
@@ -192,10 +151,6 @@ pub const fn fire_precomp(p: &FireFieldParams) -> FirePrecomp {
     }
 }
 
-/// One value-noise octave cached along a left-to-right sweep of a fixed row. The y side is
-/// row-constant and the x lattice index only advances, so a step shifts `n10→n00`,
-/// `n11→n01` and hashes the two trailing corners: about `2/lattice-period` hashes per pixel
-/// instead of [`fire_vnoise`]'s 4. `x` must be non-decreasing across calls.
 #[derive(Clone, Copy, Debug)]
 struct FireOctave {
     seed: u32,
@@ -229,8 +184,6 @@ impl FireOctave {
         }
     }
 
-    /// Sample at fp8 `x` (`>=` the previous call's); equal to
-    /// `fire_vnoise(x, y, ymask, seed)`.
     #[inline]
     const fn sample(&mut self, x: u32) -> i32 {
         let ix = x >> 8;
@@ -249,20 +202,13 @@ impl FireOctave {
     }
 }
 
-/// The shared field sampler: walks one scanline left to right (`px` non-decreasing) and
-/// returns the [`FireCore`] both emitters build on. Total for any input. The five octaves
-/// use `FireOctave` caches instead of per-pixel [`fire_vnoise`] calls; the interpolant is
-/// the same, so every sample matches the shader's `fire_core`.
+/// Scanline field sampler returning the [`FireCore`] both emitters build on.
 pub struct FireRow<'a> {
     p: &'a FireFieldParams,
     pc: &'a FirePrecomp,
-    /// Root-lift ramp from the height above the root (row-constant).
     root: i32,
-    /// Height above the root in fp8 (row-constant).
     vv: i32,
-    /// `lean·vn/4` shear (row-constant).
     shear: i32,
-    /// The 5 octaves: ridge n0/n1, body m0/m1/m2.
     n0: FireOctave,
     n1: FireOctave,
     m0: FireOctave,
@@ -271,27 +217,18 @@ pub struct FireRow<'a> {
 }
 
 impl<'a> FireRow<'a> {
-    /// Set up the scanline at `py` with first sample column `x_start` (device px), priming
-    /// the row-constant terms and octave caches.
+    /// Set up the scanline at `py` starting at column `x_start` (device px).
     #[inline]
     #[must_use]
     pub const fn new(py: i32, x_start: i32, p: &'a FireFieldParams, pc: &'a FirePrecomp) -> Self {
-        // v: height above the root. Below it the envelope mirrors 5x-compressed, an ember
-        // bed that dissolves into the glyph row instead of a hard horizontal cut; it draws
-        // in the under-ink fire slot, so glyphs still paint over it.
         let v = p.base_y - py;
         let v = if v >= 0 { v } else { -v * 5 };
         let vv = v * 256;
-        // vn: rise fraction of the envelope (fp8, capped at 2×). The shear drifts lean/4 px
-        // at full rise.
         let vn_raw = (v * 256) / pc.peak;
         let vn = if vn_raw < 512 { vn_raw } else { 512 };
         let shear = p.lean * vn / 4;
-        // The first sheared fp8 x, where each octave primes its cache.
         let xq = (x_start * 256 + shear + (1 << 22)) as u32;
         let sx = (xq * 4) / (5 * pc.chu);
-        // Body advection axis: one lattice cell per 1.5·cell_h px (tongues are taller than
-        // wide), sampled at v − phase·rise so pockets change as they rise.
         let sy = ((vv as u32) * 2) / (3 * pc.chu);
         let by = sy.wrapping_sub(pc.offr);
         let root_raw = (v * 1536) / pc.ch;
@@ -326,21 +263,15 @@ impl<'a> FireRow<'a> {
         let p = self.p;
         let pc = self.pc;
 
-        // Sheared window-px fp8 x, offset +16384 px so lattice math stays positive; one
-        // lattice cell per 1.25·cell_h px.
         let xq = (px * 256 + self.shear + (1 << 22)) as u32;
         let sx = (xq * 4) / (5 * pc.chu);
 
-        // Silhouette ridge: 2-octave noise over (column, churn time), folded and squared.
         let n0 = self.n0.sample(sx);
         let n1 = self.n1.sample(sx * 2 + 12799);
         let n = (n0 * 9 + n1 * 7) >> 4;
         let ridge = 255 - (2 * n - 255).abs();
-        // Exponent ~2.5 (square blended with cube): pointed crests over wide valleys.
         let hs2 = (ridge * ridge) >> 8;
         let hshape = (hs2 * (256 + ridge)) >> 9;
-        // Tongue height, fp8 px: a ~12% floor keeps dark valleys between tongues; crests
-        // reach ~1.12·peak; scaled by strength.
         let hq = 30 + ((hshape * 260) >> 8);
         let hcol = (pc.peak * hq * p.strength) / 255;
 
@@ -349,10 +280,8 @@ impl<'a> FireRow<'a> {
         if d <= 0 {
             return FIRE_DEAD;
         }
-        // Silhouette AA: coverage ramps over ~cell_h/4 px inside the edge.
         let edge_raw = (d * 256) / pc.aa;
         let edge = if edge_raw < 256 { edge_raw } else { 256 };
-        // RIM: 256 at the outline, fading to 0 by 2·aa inside — the sheath band.
         let rim_raw = (2 * pc.aa - d) * 256 / pc.aa;
         let rim = if rim_raw < 0 {
             0
@@ -361,19 +290,14 @@ impl<'a> FireRow<'a> {
         } else {
             rim_raw
         };
-        // q: relative height inside the local tongue (0 root → 255 tip).
         let q = (vv * 256) / hcol;
 
-        // Interior body: three upward-advected octaves, sampled for live pixels only.
         let m0 = self.m0.sample(sx * 3 / 2 + 5023);
         let m1 = self.m1.sample(sx * 3 + 9531);
         let m2 = self.m2.sample(sx * 6 + 26251);
         let body0 = (m0 * 4 + m1 * 3 + m2) >> 3;
-        // Turbulence flattens toward neutral across the AA fringe, keeping outlines clean.
         let body = 128 + (((body0 - 128) * edge) >> 8);
 
-        // Palette index: heat falls root → tip, reaches whiter when hot, modulated by the
-        // body turbulence.
         let heat = ((256 - q) * (112 + ((p.temp * 120) >> 8))) >> 6;
         let idx_raw = (heat * (150 + ((body * 212) >> 8))) >> 8;
         let idx = if idx_raw < 0 {
@@ -384,8 +308,6 @@ impl<'a> FireRow<'a> {
             idx_raw
         };
 
-        // Root lift over cell_h/6 px, slightly cooling the extreme root (an amber fuel
-        // line, not a white strip).
         let root = self.root;
         let idx = (idx * (192 + (root >> 2))) >> 8;
         FireCore {
@@ -399,7 +321,6 @@ impl<'a> FireRow<'a> {
     }
 }
 
-// Black-body anchors (aterm-effects' `fire_ramp` colours): deep red → near-white.
 const FIRE_PAL_ADD: [[i32; 3]; 5] = [
     [0x2A, 0x00, 0x00],
     [0x8B, 0x1A, 0x00],
@@ -408,23 +329,13 @@ const FIRE_PAL_ADD: [[i32; 3]; 5] = [
     [0xFF, 0xF0, 0xC0],
 ];
 
-/// The brightest light the additive fire ([`FireMode::Add`](crate::render_api::FireMode::Add))
-/// lays per unit coverage: its palette at the legibility ceiling [`FIRE_IDX_MAX`] (rim and
-/// root cooling only lower the index, and every anchor's channels rise along the ramp). The
-/// effects side solves the dark flame's ceiling under a letter against it.
+/// Brightest light per unit coverage laid by additive fire ([`FIRE_IDX_MAX`]).
 pub const FIRE_ADD_HOTTEST: u32 = {
     let (r, g, b) = fire_pal(&FIRE_PAL_ADD, FIRE_IDX_MAX);
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 };
 
-/// The brightest light per unit coverage the additive fire lays on scanline `py` of a
-/// patch with params `p` ([`FIRE_ADD_HOTTEST`] at most): its palette at the highest index
-/// any column reaches there. The tallest crest a column can raise gives the least relative
-/// height, the hottest body turbulence the most heat; the root lift and the rim only cool
-/// it, and every anchor's channels rise along the ramp. `0` where no tongue reaches. Lets
-/// the effects side solve a ceiling against the flame's colour at that height instead of
-/// its hottest anywhere: a tongue's upper body is orange and red, not its root's
-/// white-yellow. CPU-only; no shader evaluates it.
+/// Brightest light per unit coverage laid by additive fire on scanline `py`.
 #[inline]
 #[must_use]
 pub const fn fire_add_hottest_at(p: &FireFieldParams, py: i32) -> u32 {
@@ -432,9 +343,7 @@ pub const fn fire_add_hottest_at(p: &FireFieldParams, py: i32) -> u32 {
     if idx < 0 { 0 } else { fire_add_light(idx) }
 }
 
-/// The palette index behind [`fire_add_hottest_at`]: the highest any column of a patch
-/// with params `p` reaches on scanline `py`, `0..=`[`FIRE_IDX_MAX`]; `-1` where no tongue
-/// reaches.
+/// The palette index behind [`fire_add_hottest_at`].
 #[inline]
 #[must_use]
 pub const fn fire_add_index_at(p: &FireFieldParams, py: i32) -> i32 {
@@ -448,14 +357,12 @@ pub const fn fire_add_index_at(p: &FireFieldParams, py: i32) -> i32 {
     } else {
         p.peak_h
     };
-    // The silhouette's tallest crest: `hq` reaches 30 + 256 at the folded ridge's top.
     let hcol = (peak * FIRE_HQ_MAX * p.strength) / 255;
     if hcol <= vv {
         return -1;
     }
     let q = (vv * 256) / hcol;
     let heat = ((256 - q) * (112 + ((p.temp * 120) >> 8))) >> 6;
-    // The body turbulence at its most (`body` 255).
     let idx_raw = (heat * (150 + ((255 * 212) >> 8))) >> 8;
     let idx = if idx_raw > FIRE_IDX_MAX {
         FIRE_IDX_MAX
@@ -468,8 +375,7 @@ pub const fn fire_add_index_at(p: &FireFieldParams, py: i32) -> i32 {
     (idx * (192 + (root >> 2))) >> 8
 }
 
-/// The additive fire's light per unit coverage at palette index `idx` (`0..=1023`,
-/// clamped), `0x00RRGGBB`: what [`fire_shade_add`] lays at that index before coverage.
+/// Additive fire light per unit coverage at palette index `idx` (`0..=1023`, clamped).
 #[inline]
 #[must_use]
 pub const fn fire_add_light(idx: i32) -> u32 {
@@ -484,17 +390,11 @@ pub const fn fire_add_light(idx: i32) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-/// The tallest a column's tongue stands, fp8 of the patch's `peak_h` ([`FireRow::core`]'s
-/// `hq` at the ridge's top).
 const FIRE_HQ_MAX: i32 = 30 + ((((((255 * 255) >> 8) * (256 + 255)) >> 9) * 260) >> 8);
 
-/// The darkest ink the ink-fire ([`FireMode::Over`](crate::render_api::FireMode::Over))
-/// lays: its first palette anchor, where rim darkening drives the index. The
-/// effects side solves the flame's light-ground coverage ceiling against it
-/// (the theme's text must stay legible over the darkest flame).
+/// The darkest ink the ink-fire ([`FireMode::Over`](crate::render_api::FireMode::Over)) lays.
 pub const FIRE_OVER_RIM_INK: u32 = 0x0066_1804;
 
-// Ink palette (FireMode::Over): red-browns and burnt oranges that read on white.
 const FIRE_PAL_OVER: [[i32; 3]; 5] = [
     [
         ((FIRE_OVER_RIM_INK >> 16) & 0xFF) as i32,
@@ -507,7 +407,6 @@ const FIRE_PAL_OVER: [[i32; 3]; 5] = [
     [0xFF, 0xA6, 0x1E],
 ];
 
-/// Piecewise-linear palette fetch: `idx 0..=1023` across 4 segments of 256.
 #[inline]
 const fn fire_pal(pal: &[[i32; 3]; 5], idx: i32) -> (i32, i32, i32) {
     let seg_raw = idx >> 8;
@@ -528,8 +427,7 @@ const fn fire_pal(pal: &[[i32; 3]; 5], idx: i32) -> (i32, i32, i32) {
     (mix(a[0], b[0], f), mix(a[1], b[1], f), mix(a[2], b[2], f))
 }
 
-/// The [`FireMode::Add`](crate::render_api::FireMode::Add) coverage law: silhouette AA ×
-/// temp density × interior pockets × root lift, capped. `0..=cov_cap`.
+/// The [`FireMode::Add`](crate::render_api::FireMode::Add) coverage law.
 #[inline]
 #[must_use]
 pub const fn fire_cov_add(c: &FireCore, p: &FireFieldParams) -> i32 {
@@ -539,8 +437,7 @@ pub const fn fire_cov_add(c: &FireCore, p: &FireFieldParams) -> i32 {
     if cov < p.cov_cap { cov } else { p.cov_cap }
 }
 
-/// The [`FireMode::Over`](crate::render_api::FireMode::Over) alpha law: the Add shaping
-/// with a gentler interior grain, rim pooling and a root→tip fade. `0..=cov_cap`.
+/// The [`FireMode::Over`](crate::render_api::FireMode::Over) alpha law.
 #[inline]
 #[must_use]
 pub const fn fire_alpha_over(c: &FireCore, p: &FireFieldParams) -> i32 {
@@ -551,9 +448,7 @@ pub const fn fire_alpha_over(c: &FireCore, p: &FireFieldParams) -> i32 {
     if a < p.cov_cap { a } else { p.cov_cap }
 }
 
-/// Top-edge fade `0..=255`: `0` at the grid top (`py == top_fade_y`), smoothstepping to
-/// `255` two cells below, so a flame on the top row dissipates instead of clipping against
-/// the edge. Rows lower down get `255`, no effect.
+/// Top-edge fade `0..=255` from `0` at `top_fade_y` to `255` two cells below.
 #[inline]
 #[must_use]
 pub const fn fire_top_fade(py: i32, p: &FireFieldParams) -> i32 {
@@ -569,10 +464,7 @@ pub const fn fire_top_fade(py: i32, p: &FireFieldParams) -> i32 {
     fire_fade(t)
 }
 
-/// [`FireMode::Add`](crate::render_api::FireMode::Add) emission for one [`FireRow`]
-/// sample: premultiplied `0x00RRGGBB` light for `add_sat` (`(c·cov + 127)/255` per
-/// channel, the single rounding point, as in `fs_fire_add`); `0` outside the flame. `tf`
-/// is the row's [`fire_top_fade`]; `tf == 255` skips the multiply, which is exact.
+/// [`FireMode::Add`](crate::render_api::FireMode::Add) emission for one [`FireRow`] sample.
 #[inline]
 #[must_use]
 pub const fn fire_shade_add(c: &FireCore, p: &FireFieldParams, tf: i32) -> u32 {
@@ -581,7 +473,6 @@ pub const fn fire_shade_add(c: &FireCore, p: &FireFieldParams, tf: i32) -> u32 {
     if cov <= 0 {
         return 0;
     }
-    // Rim cooling: the outline drops toward deep red while the core stays hot.
     let idx = (c.idx * (256 - ((c.rim * 112) >> 8))) >> 8;
     let (r, g, b) = fire_pal(&FIRE_PAL_ADD, idx);
     #[inline]
@@ -591,9 +482,7 @@ pub const fn fire_shade_add(c: &FireCore, p: &FireFieldParams, tf: i32) -> u32 {
     (m(r, cov) << 16) | (m(g, cov) << 8) | m(b, cov)
 }
 
-/// [`FireMode::Over`](crate::render_api::FireMode::Over) emission for one [`FireRow`]
-/// sample: `(straight 0x00RRGGBB ink, alpha)` for `over_rgb` / SrcAlpha-OneMinusSrcAlpha;
-/// `(0, 0)` outside. `tf` is the row's top fade, as for [`fire_shade_add`].
+/// [`FireMode::Over`](crate::render_api::FireMode::Over) emission for one [`FireRow`] sample.
 #[inline]
 #[must_use]
 pub const fn fire_shade_over(c: &FireCore, p: &FireFieldParams, tf: i32) -> (u32, u8) {
@@ -602,7 +491,6 @@ pub const fn fire_shade_over(c: &FireCore, p: &FireFieldParams, tf: i32) -> (u32
     if a <= 0 {
         return (0, 0);
     }
-    // Rim darkening: ink pools at the outline, a red-brown contour around amber.
     let idx = (c.idx * (256 - ((c.rim * 128) >> 8))) >> 8;
     let (r, g, b) = fire_pal(&FIRE_PAL_OVER, idx);
     let a_clamped = if a > 255 { 255 } else { a };
@@ -630,13 +518,10 @@ mod tests {
         }
     }
 
-    /// The field at one window pixel, through the shipping [`FireRow`] sampler.
     fn core_at(px: i32, py: i32, p: &FireFieldParams) -> FireCore {
         FireRow::new(py, px, p, &fire_precomp(p)).core(px)
     }
 
-    /// Below the root the envelope mirrors 5x-compressed: live just under `base_y`, equal to
-    /// the mirrored sample above, and dead a fifth of the peak below.
     #[test]
     fn root_skirt_mirrors_compressed_below_the_root() {
         let p = FireFieldParams {
@@ -651,21 +536,16 @@ mod tests {
             top_fade_y: 0,
         };
         for px in [3, 40, 77] {
-            // d px below the root samples the envelope 5·d above.
             for d in 1..=4 {
                 let below = core_at(px, p.base_y + d, &p);
                 let above = core_at(px, p.base_y - 5 * d, &p);
                 assert_eq!(below, above, "5x mirror at d={d} px={px}");
             }
-            // Dead within peak/5 (+1 for the mirror rounding).
             let deep = core_at(px, p.base_y + p.peak_h / 5 + 2, &p);
             assert_eq!(deep.idx, 0, "skirt extinct below peak/5: px={px}");
         }
     }
 
-    /// No vertically adjacent coverage/alpha step exceeds 0.6·cov_cap. The analytic budget
-    /// (AA ramp, root lift, turbulence, rim pool, tip fade and cross terms) is ≈ 0.55·cov_cap
-    /// at aa = ch/4, so a full-cap texel edge cannot occur.
     #[test]
     fn aa_law_no_hard_silhouette_edges() {
         let mut worst = 0i32;
@@ -675,7 +555,6 @@ mod tests {
                 let bound = (p.cov_cap * 3) / 5; // 120 at cap 200
                 for px in 0..200 {
                     let mut prev = 0i32;
-                    // Walk tip → root so each column crosses the edge.
                     for py in 40..=200 {
                         let c = core_at(px, py, &p);
                         let cov = fire_cov_add(&c, &p).max(fire_alpha_over(&c, &p));
@@ -693,7 +572,6 @@ mod tests {
         eprintln!("aa law: worst adjacent cov/alpha step = {worst} (bound 120, cap 200)");
     }
 
-    /// Degenerate params (zero peak or cell_h, saturated values) neither panic nor overflow.
     #[test]
     fn field_is_total_on_degenerate_params() {
         let degens = [
@@ -747,8 +625,6 @@ mod tests {
         }
     }
 
-    /// A hot patch is substantially lit, its root reaches the amber/white range, and its
-    /// tips stay cooler than its root.
     #[test]
     fn field_burns_with_structure() {
         let p = params(230, 0, 4096);
@@ -783,10 +659,6 @@ mod tests {
         );
     }
 
-    /// No additive sample is brighter, per channel and per unit coverage, than
-    /// [`FIRE_ADD_HOTTEST`], the light a ceiling under a letter is solved
-    /// against. Negative control: the palette's amber anchor, one segment
-    /// cooler, is passed by the hot field's cores.
     #[test]
     fn the_hottest_light_bounds_every_additive_sample() {
         let over = |bound: u32| {
@@ -825,11 +697,6 @@ mod tests {
         );
     }
 
-    /// No additive sample on a scanline is brighter, per channel and per unit coverage,
-    /// than [`fire_add_hottest_at`] says for that scanline, at any heat, strength and
-    /// lean; and high in a tongue that light is well under [`FIRE_ADD_HOTTEST`] (a
-    /// ceiling solved against it there buys the flame its orange). Negative control: the
-    /// bound read a third of the peak higher up the tongue is passed.
     #[test]
     fn the_light_at_a_height_bounds_every_sample_on_it() {
         let over = |up: i32| {

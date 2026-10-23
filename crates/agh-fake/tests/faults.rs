@@ -14,8 +14,6 @@ use aterm_json::json;
 
 use crate::raw::{api, plain, send_bytes, send_cut};
 
-/// A fake with `fixture-dev-bot` (push) on the public `fixture-dev/app` and one published
-/// release; the token and the release id.
 fn fake() -> (FakeGithub, String, u64) {
     let fake = FakeGithub::start();
     let dev = token("dev");
@@ -31,7 +29,6 @@ fn fake() -> (FakeGithub, String, u64) {
     (fake, dev, release)
 }
 
-/// A 500 with an empty body and no headers.
 fn status_500() -> Fault {
     Fault::Status {
         status: 500,
@@ -723,8 +720,6 @@ fn tokens_are_seeded_hex_of_their_shape() {
     assert!(aterm_codec::hex::is_lower(&fine[11..], 64));
 }
 
-/// A fake with the asset `a.bin` on its release; the token and the CDN target the asset's
-/// 302 names.
 fn fake_with_asset() -> (FakeGithub, String, String) {
     let (fake, dev, release) = fake();
     let ports = fake.ports();

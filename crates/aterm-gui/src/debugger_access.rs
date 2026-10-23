@@ -346,6 +346,7 @@ pub(crate) fn settle_markers_detached(
         "aterm-debugger-marker",
         crate::qos::Role::Background,
         move || {
+            // Background: it takes no lock the UI thread contends (only this
             // module's own marker mutex and the change lock).
             settle_markers(&config_path, observed, release.as_ref());
         },
@@ -623,7 +624,7 @@ impl DebuggerAccessFlow {
     }
 
     /// Whether a probe is taken now: idle, or after the child exited (the model's `Probe` guard).
-    pub(crate) fn accepts_probe(&self) -> bool {
+    pub(crate) const fn accepts_probe(&self) -> bool {
         matches!(self.phase, Phase::Idle | Phase::Exited(_))
     }
 
@@ -685,7 +686,7 @@ impl DebuggerAccessFlow {
     }
 
     /// The worker's re-read showed the precondition and the child started.
-    pub(crate) fn on_child_spawned(&mut self, child: DevtoolsChild, since: u64) -> bool {
+    pub(crate) const fn on_child_spawned(&mut self, child: DevtoolsChild, since: u64) -> bool {
         let Phase::Rechecking(change) = self.phase else {
             return false;
         };
@@ -699,7 +700,7 @@ impl DebuggerAccessFlow {
     }
 
     /// The worker's re-read did not show the precondition: nothing was spawned, and what it read is the flow's observation now.
-    pub(crate) fn on_not_due(&mut self, observed: DebuggerProbe) -> Option<Outcome> {
+    pub(crate) const fn on_not_due(&mut self, observed: DebuggerProbe) -> Option<Outcome> {
         let Phase::Rechecking(change) = self.phase else {
             return None;
         };
@@ -711,7 +712,7 @@ impl DebuggerAccessFlow {
     }
 
     /// Another aterm holds the change lock: nothing was read or spawned for the change being re-checked.
-    pub(crate) fn on_peer_busy(&mut self) -> Option<Outcome> {
+    pub(crate) const fn on_peer_busy(&mut self) -> Option<Outcome> {
         let Phase::Rechecking(change) = self.phase else {
             return None;
         };
@@ -722,7 +723,7 @@ impl DebuggerAccessFlow {
     }
 
     /// No child was started for the change being re-checked.
-    pub(crate) fn on_not_started(&mut self) -> Option<Outcome> {
+    pub(crate) const fn on_not_started(&mut self) -> Option<Outcome> {
         let Phase::Rechecking(change) = self.phase else {
             return None;
         };
@@ -733,7 +734,7 @@ impl DebuggerAccessFlow {
     }
 
     /// The park took the exited child's result, or the child is gone with none (lost).
-    pub(crate) fn on_child_exit(&mut self) -> bool {
+    pub(crate) const fn on_child_exit(&mut self) -> bool {
         let Phase::InFlight { change, .. } = self.phase else {
             return false;
         };
@@ -1349,13 +1350,14 @@ impl DebuggerChangeLane {
         *self.ask_records().lock().unwrap_or_else(|p| p.into_inner()) = Some(read);
     }
 
-    /// Record why the last confirmed change.
-    pub(crate) fn note_refusal(&mut self, refusal: Option<Refusal>) {
+    /// Record why the last confirmed change — a press, or the launch ask's yes —
+    /// started nothing (the page shows it until the next one starts).
+    pub(crate) const fn note_refusal(&mut self, refusal: Option<Refusal>) {
         self.refusal = refusal;
     }
 
     /// Whether the park must keep re-reading: a change under way, or the records asked for and not yet read.
-    pub(crate) fn needs_poll(&self) -> bool {
+    pub(crate) const fn needs_poll(&self) -> bool {
         (self.records_asked && !self.flow.records_read())
             || matches!(
                 self.flow.phase(),
@@ -1374,7 +1376,7 @@ impl DebuggerChangeLane {
     }
 
     /// Whether the flow waits for a fresh probe to end the change.
-    pub(crate) fn awaiting_probe(&self) -> bool {
+    pub(crate) const fn awaiting_probe(&self) -> bool {
         matches!(self.flow.phase(), Phase::Exited(_))
     }
 
@@ -1543,6 +1545,7 @@ impl DebuggerChangeLane {
         if let Some(read) = records_read {
             self.records_out = false;
             if read.unsettled {
+                // A worker holds the lock with no marker yet: read again
                 // once it has written one, or let go.
                 self.records_again_at = Some(now_wall.saturating_add(RESULT_RECHECK.as_secs()));
             } else {
@@ -1553,6 +1556,7 @@ impl DebuggerChangeLane {
                 {
                     self.settling = stale.map(|m| m.child);
                 } else {
+                    // Something is under way here: nobody re-reads that
                     // change, so its dead marker goes now.
                     step.remove_change_marker = stale.map(|m| m.child);
                 }
@@ -1879,6 +1883,7 @@ pub(crate) struct OfferDisk {
 impl OfferDisk {
     /// THE DISK HALF OF A LAUNCH OFFER.
     pub(crate) fn prepare(self, config_path: &Path, host: &str, now: u64) -> OfferPrep {
+        // A first launch may have no config directory yet. The record writer
         // already creates it; the lock must be able to precede that write.
         if let Some(parent) = config_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2220,7 +2225,7 @@ impl DebuggerChangeLane {
         }
     }
 
-    fn offer_prepared(&mut self, prepared: OfferPrep, now_wall: u64) -> Result<(), OfferEnd> {
+    const fn offer_prepared(&mut self, prepared: OfferPrep, now_wall: u64) -> Result<(), OfferEnd> {
         match prepared {
             OfferPrep::Recorded => Ok(()),
             OfferPrep::Change { read_records } => {
@@ -2372,7 +2377,7 @@ impl LaunchAskQueue {
     }
 
     /// Look again at `at`.
-    pub(crate) fn look_later(&mut self, at: Instant) {
+    pub(crate) const fn look_later(&mut self, at: Instant) {
         self.next_look = Some(at);
     }
 
@@ -2503,7 +2508,7 @@ impl LaunchAskQueue {
     }
 
     /// The ask is over for this process.
-    pub(crate) fn end(&mut self) {
+    pub(crate) const fn end(&mut self) {
         self.queued = false;
         self.next_look = None;
     }

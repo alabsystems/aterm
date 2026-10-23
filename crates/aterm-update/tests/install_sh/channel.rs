@@ -7,8 +7,6 @@ use crate::support::{Lib, Scratch, follows_redirects, q, read, s};
 
 const DOWNLOAD: &str = "https://github.com/example/aterm/releases/download";
 
-/// A `web_curl` that records its argv and answers with the bytes of
-/// `$STUB_FILE` and the status `$STUB_STATUS`.
 fn stub_transport(lib: &mut Lib, scratch: &Scratch) -> std::path::PathBuf {
     let args = scratch.join("stub-args");
     lib.step(format!(
@@ -24,8 +22,6 @@ fn answer(lib: &mut Lib, scratch: &Scratch, name: &str, body: &str, status: i32)
     lib.step(format!("STUB_FILE={} STUB_STATUS={status}", q(s(&file))));
 }
 
-/// Presence is one redirect-refusing HEAD of the tag-specific URL: 302 is
-/// published, 404 absent, anything else no answer.
 #[test]
 fn asset_presence_is_one_redirect_refusing_head() {
     let scratch = Scratch::new();
@@ -74,8 +70,6 @@ fn asset_presence_is_one_redirect_refusing_head() {
     );
 }
 
-/// The size is the FINAL hop's Content-Length of a HEAD that follows the
-/// redirect, held to 1..<max>.
 #[test]
 fn asset_size_is_the_final_hops_content_length_within_its_bound() {
     let scratch = Scratch::new();
@@ -145,8 +139,6 @@ fn asset_size_is_the_final_hops_content_length_within_its_bound() {
     }
 }
 
-/// The GET is bounded by the named size and addressed to the tag-specific URL,
-/// and the bytes written are held to exactly that size.
 #[test]
 fn a_download_is_held_to_the_named_size() {
     let scratch = Scratch::new();
@@ -191,10 +183,6 @@ fn a_download_is_held_to_the_named_size() {
     assert_eq!(recs[failed].rc, 1, "a failed GET is a failed download");
 }
 
-/// One `linux_target_preflight` row: the tag, the head, the arch, the skip
-/// reason's key fact (empty: installable), the appcast it binds, and the
-/// requests it makes (`None`: not checked). A tag other than the head is a
-/// `--version` pin; the head is the unpinned run's.
 struct Target {
     tag: &'static str,
     head: &'static str,
@@ -204,9 +192,6 @@ struct Target {
     requests: Option<&'static [&'static str]>,
 }
 
-/// The Linux target is chosen from the head alone: at or below it, this
-/// architecture's signed binary published, and an appcast to bind it — the
-/// current name, else the archived one. No answer is never read as absent.
 #[test]
 fn the_linux_target_is_chosen_from_the_head_alone() {
     let scratch = Scratch::new();

@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A live check of the stuck-process engine on this host: the job probe
-//! (`aterm_sysprobe::jobs::JobsReader`) read every 2 s and handed to the pure
-//! engine (`aterm_vitals::jobs::Jobs`), exactly as the host will each probe
-//! tick. This process stands in for a tab's shell, and each child it starts
-//! in a session of its own is an agent call (`a<pid>`):
-//!
-//! * `sleep 60` (a timed wait);
-//! * a busy loop that prints a line every few hundred milliseconds into an
-//!   output file (CPU and line progress);
-//! * a silent spin (CPU, no output: BUSY-SILENT);
-//! * `cat` blocked reading a FIFO nobody writes (it holds the FIFO open
-//!   read-write itself, so the read never ends);
-//! * `cat` blocked reading a pipe whose write end this process holds and
-//!   never writes (this process is the call's consumer, so the reader serves
-//!   it: a legitimate wait).
-//!
-//! The rows are printed in the engine's wire form at 2, 10 and 20 s, at 7 and
-//! 20 minutes, and whenever a verdict changes, with the machine's stretch (its
-//! load per CPU, as the host computes it) that BUSY-SILENT and POLLING read
-//! through. Then, with `--hold` (the default), the two
-//! blocked readers' last reading is held — nobody will ever write to them, so
-//! their kernel state cannot change — and fed on with the clock advanced to
-//! 7 and 20 minutes, labelled `held`: what the engine will say about them
-//! then. `--secs N` runs live for `N` seconds (default 24); a run of 1300 s
-//! reads those minutes for real. Dev only; nothing ships it.
-//!
-//! ```sh
-//! targo --unverified run -q -p aterm-sysprobe --example stuck_live
-//! targo --unverified run -q -p aterm-sysprobe --example stuck_live -- --secs 1300 --no-hold
-//! ```
-//!
-//! A unix host's check: its calls start in sessions of their own and read a
-//! FIFO and a pipe. Elsewhere it builds, says so and exits 1.
+//! A live check of the stuck-process engine on this host.
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::collections::BTreeMap;
@@ -47,10 +15,7 @@ use aterm_vitals::jobs::{
     LanesSeen, Machine, ProcState, SweepProc, TcpState, ThreadState, Verdict,
 };
 
-/// The probe tick.
 const TICK: Duration = Duration::from_secs(2);
-/// The engine's clock at this process's start (any origin: the engine only
-/// subtracts).
 const BASE_MS: u64 = 10_000_000;
 
 fn main() {
@@ -69,7 +34,6 @@ fn main() {
     }
 }
 
-/// The children, killed by pid and reaped when this ends (a panic too).
 struct Kids(Vec<(&'static str, Child)>);
 
 impl Drop for Kids {
@@ -81,7 +45,6 @@ impl Drop for Kids {
     }
 }
 
-/// Off unix there are no sessions to start the calls in.
 #[cfg(not(unix))]
 fn run(_secs: u64, _hold: bool) -> std::io::Result<()> {
     Err(std::io::Error::new(
@@ -101,7 +64,6 @@ fn run(secs: u64, hold: bool) -> std::io::Result<()> {
         return Err(std::io::Error::other(format!("mkfifo failed: {made}")));
     }
     let out = std::fs::File::create(scratch.path().join("busy.out"))?;
-    // This process keeps the write end and never writes.
     let (pipe_read, _pipe_write) = std::io::pipe()?;
 
     let mut kids = Kids(Vec::new());
@@ -197,10 +159,6 @@ fn run(secs: u64, hold: bool) -> std::io::Result<()> {
     };
 
     if hold {
-        // The blocked readers and what they wait on (this process holds the
-        // pipe's write end): that reading is the one they will keep. The
-        // others are dropped, not held: a held reading of a process that
-        // runs would read as a stall.
         let blocked = [fifo_cat, pipe_cat];
         let moving = [sleep, busy, spin];
         let mut held = tick;
@@ -228,7 +186,6 @@ fn run(secs: u64, hold: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Print every row whose verdict changed, or every row at a mark.
 fn print_changes(at: &str, view: &JobsView, said: &mut BTreeMap<String, Verdict>, mark: bool) {
     let changed: Vec<_> = view
         .rows
@@ -248,8 +205,6 @@ fn print_changes(at: &str, view: &JobsView, said: &mut BTreeMap<String, Verdict>
     }
 }
 
-/// What the host does each probe tick, by hand: one tab (this process as
-/// its shell), the machine's sweep, the members the engine asks for.
 struct Host {
     jobs: Jobs,
     reader: JobsReader,
@@ -307,11 +262,6 @@ impl Host {
     }
 }
 
-/// The machine's stretch, times 1000, as the host computes it
-/// (`aterm_session::input_backlog::Contention::factor_milli` over aterm-gui's
-/// `machine_contention`): the worse of the 1- and 5-minute load averages per
-/// online CPU, at least 1 and at most 10. Read here from `vm.loadavg` (macOS)
-/// or `/proc/loadavg` (Linux); 1 when unread.
 fn stretch_milli() -> u32 {
     #[cfg(target_os = "macos")]
     let text = command("/usr/sbin/sysctl")

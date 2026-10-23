@@ -18,7 +18,7 @@ impl RecordLock {
     /// Take `file`'s exclusive lock without blocking.
     ///
     /// # Errors
-    /// `WouldBlock` while another handle holds it; the OS error otherwise.
+    /// `WouldBlock` while another handle holds it.
     pub fn try_lock(file: File, record: u64) -> Result<Self, std::fs::TryLockError> {
         let file: std::fs::File = file;
         #[cfg(windows)]
@@ -125,7 +125,7 @@ mod record_range {
     pub(super) fn try_lock(file: &File, record: u64) -> Result<(), std::fs::TryLockError> {
         let (mut overlapped, low, high) = range(record);
         // SAFETY: `file` is an open, synchronous handle and `overlapped` a live `OVERLAPPED` for
-        // the call; FAIL_IMMEDIATELY refuses contention rather than parking a request.
+        // the call.
         let ok = unsafe {
             LockFileEx(
                 file.as_raw_handle(),

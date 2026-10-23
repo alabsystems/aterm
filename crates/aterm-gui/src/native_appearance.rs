@@ -668,7 +668,7 @@ fn pack_rgb(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
 }
 
-fn packed_rgb(c: u32) -> [u8; 3] {
+const fn packed_rgb(c: u32) -> [u8; 3] {
     [
         ((c >> 16) & 0xff) as u8,
         ((c >> 8) & 0xff) as u8,

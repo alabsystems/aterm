@@ -97,7 +97,6 @@ fn a_managed_or_vendor_path_names_its_cli() {
     }
 }
 
-/// A process tree: pid → (parent, exec path, argv).
 struct Tree(Vec<(u32, u32, &'static str, Vec<String>)>);
 
 impl Procs for Tree {
@@ -153,7 +152,6 @@ fn the_nearest_ai_cli_above_is_the_asker() {
     assert_eq!(asker(&person, &none), Asker::Person);
 }
 
-/// Permission-looking words in a value or after `--` are data, not a launch mode.
 #[test]
 fn permission_looking_argument_data_never_raises_the_inherited_level() {
     let plan = argv(&["--permission-mode", "plan"]);
@@ -181,7 +179,6 @@ fn permission_looking_argument_data_never_raises_the_inherited_level() {
     );
 }
 
-/// Meta's launcher execs its versioned build; the canonical reader already knows it.
 #[test]
 fn a_versioned_muse_executable_keeps_its_permission_custody() {
     let known = Tree(vec![(40, 1, "/x/muse", argv(&["muse", "--yolo"]))]);
@@ -195,9 +192,6 @@ fn a_versioned_muse_executable_keeps_its_permission_custody() {
     assert_eq!(asker(&build, &|| None).agent(), Some(("muse", Level::Yolo)));
 }
 
-/// atpkg's `codex-old` (OpenAI's own Codex beside codex-alab) runs as that name, and a
-/// review it asks for inherits its own launch's sandbox: a read-only one plans, never
-/// the person's Yolo the walk past an unknown name would prove.
 #[test]
 fn a_codex_old_keeps_codexs_permission_custody() {
     let store = "/x/pkg/store/codex-old/1000000000163000000/bin/codex-old";
@@ -219,7 +213,6 @@ fn a_codex_old_keeps_codexs_permission_custody() {
     assert_eq!(asker(&lookalike, &|| None), Asker::Person);
 }
 
-/// The kernel's conventional interpreter argv has the script at argv[1].
 #[test]
 fn a_script_runtime_keeps_its_agents_script_and_permission_arguments() {
     let direct = Tree(vec![(40, 1, "/x/agy", argv(&["agy", "--mode", "plan"]))]);
@@ -299,7 +292,6 @@ fn an_incomplete_walk_and_an_unresolved_runtime_are_unknown() {
     }
 }
 
-/// Removing a sandbox does not establish that approval prompts are bypassed.
 #[test]
 fn a_sandbox_without_approval_bypass_does_not_prove_yolo() {
     for words in [

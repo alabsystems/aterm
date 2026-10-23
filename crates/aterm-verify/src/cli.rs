@@ -249,8 +249,8 @@ Run aterm's checks in place, alone or in any combination.
   verify perf [LANE...]           the performance lanes (`verify perf --list`)
   verify soak [--ledger PATH]     the crash restore's soak (keeper P4): this
                                   machine's recovery ledger, not the tree
-  verify glue <in.wasm> <out-dir> --flavor web|nodejs
-                                  a wasm module's JS glue (`verify glue --help`)
+  verify glue <in.wasm> <out-dir>
+                                  a wasm module's ES module glue (`verify glue --help`)
   verify provision [--linux] [--record] [--check] [ROW...]
                                   the tools this checkout pins (fish, pwsh,
                                   binaryen, the browsers, rustup's stock

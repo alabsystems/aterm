@@ -23,13 +23,11 @@ pub fn from_json<T: FromJson>(value: &Value) -> Result<T> {
     T::from_json(value)
 }
 
-/// `aterm_json::from_value`, its error as `FromJson`'s.
 fn decode<T: serde::de::DeserializeOwned>(value: &Value, name: &str) -> Result<T> {
     aterm_json::from_value(value.clone())
         .map_err(|e| Error::protocol(format!("GitHub's answer does not fit {name}: {e}")))
 }
 
-/// `FromJson` for models whose only nested raw is their own.
 macro_rules! from_json_raw {
     ($($model:ident),* $(,)?) => {$(
         impl FromJson for $model {
@@ -435,7 +433,6 @@ from_json_raw!(
 );
 
 impl FromJson for ReleaseObject {
-    /// Each asset's `raw` is filled too.
     fn from_json(value: &Value) -> Result<Self> {
         let mut release: ReleaseObject = decode(value, "ReleaseObject")?;
         release.raw = value.clone();
@@ -537,7 +534,6 @@ impl std::fmt::Debug for Sha256Digest {
     }
 }
 
-/// GitHub's cap on the files a comparison lists.
 const COMPARE_FILES_CAP: usize = 300;
 
 impl CommitObject {

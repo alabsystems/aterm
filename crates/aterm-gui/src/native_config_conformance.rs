@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for versioned native Settings transactions.
-//!
-//! Drives the real `aterm-toml`-backed service and projects its revisions and values
-//! into `NativeConfigTransaction`. Pending-request and undo metadata come from the
-//! test driver; `accepted`/`external_edits` count the service's `Applied` answers and
-//! the external edits handed to it; key values and revisions always come from the
-//! service, so `RevisionCountsWrites` checks one revision per write.
+//! Tier-1 conformance tests for versioned native Settings transactions and config catalogs.
 
 #![cfg(test)]
 
@@ -31,8 +25,6 @@ const KEY_B: &str = "cursor_blink";
 struct ControllerProjection {
     baseline_revision: u64,
     patch_active: bool,
-    /// The request's base revision. Not projected: the model has no law about it
-    /// (the service refuses a base it never published — its own unit test).
     patch_base: u64,
     expected_a: i64,
     undo_ready: bool,
@@ -130,8 +122,6 @@ fn manual_completion_selection_and_responsive_window_conform_to_the_model() {
     assert_eq!(real["selected"], 3);
     assert_eq!(real["window_start"], 3);
 
-    // Negative control: a fixed first-page projection can select result four while
-    // leaving it outside the compiled responsive window.
     let mut before_page = model.successors("EnterSelection", &initial)[0].clone();
     before_page = model.successors("MoveNext", &before_page)[0].clone();
     before_page = model.successors("MoveNext", &before_page)[0].clone();
@@ -244,8 +234,6 @@ fn settings_manual_handoff_conforms_for_selection_fallback_reuse_and_path_author
     let AppViewState::Editor(editor) = app.native_runtime.view_state(reused_view).unwrap() else {
         panic!("Manual editor view");
     };
-    // The absent key is in the buffer, unsaved, its value selected, and no
-    // Search was started.
     let document = app.native_runtime.document_id(instance).unwrap();
     let text = app.document_store.snapshot(document).unwrap().text;
     let added = crate::native_config_language::config_key_source_range(&text, "gpu")
@@ -269,8 +257,6 @@ fn settings_manual_handoff_conforms_for_selection_fallback_reuse_and_path_author
     fallback.insert("completion_ready", 1);
     assert_transition(&model, &selected, &fallback, "AddAbsentKey");
 
-    // Negative control: a target-supplied path or a duplicate second editor is
-    // not a transition admitted by the shipping model.
     let mut redirected = selected.clone();
     redirected.insert("canonical_path_authority", 0);
     assert_eq!(admits(&model, &initial, &redirected), None);
@@ -329,7 +315,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     let mut controller = ControllerProjection::new(&service);
     assert_eq!(project(&model, &service, controller), model.init_state());
 
-    // A stale Settings edit may rebase across an unrelated external key.
     begin_patch(&model, &service, &mut controller);
     let before_external_b = project(&model, &service, controller);
     service
@@ -351,8 +336,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert_eq!(after_commit["revision"], before_commit["revision"] + 1);
     assert_eq!(service.value(KEY_B).unwrap().as_deref(), Some("false"));
 
-    // Negative control: a service that skips the one revision bump every
-    // accepted write shares publishes this commit under the revision it found.
     let mut unpublished_commit = after_commit.clone();
     unpublished_commit.insert("revision", before_commit["revision"]);
     assert_eq!(
@@ -363,7 +346,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert!(!model.check_invariant("RevisionCountsWrites", &unpublished_commit));
     assert!(service.snapshot().text.contains("custom = \"preserve\""));
 
-    // Conditional undo restores only A and preserves the unrelated B change.
     let before_undo = project(&model, &service, controller);
     applied(service.undo(undo));
     controller.undo_ready = false;
@@ -372,8 +354,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert_transition(&model, &before_undo, &after_undo, "UndoPatchA");
     assert_eq!(after_undo["revision"], before_undo["revision"] + 1);
 
-    // Negative control: the undo reaches the same bump through `patch`; skipped, it
-    // publishes under the revision it found, which open Settings views discard.
     let mut unpublished_undo = after_undo.clone();
     unpublished_undo.insert("revision", before_undo["revision"]);
     assert_eq!(
@@ -385,8 +365,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert_eq!(service.value(KEY_A).unwrap().as_deref(), Some("Nord"));
     assert_eq!(service.value(KEY_B).unwrap().as_deref(), Some("false"));
 
-    // A same-key watcher edit makes the queued request stale. The genuine OCC
-    // lane reports Conflict and changes neither bytes nor revision.
     begin_patch(&model, &service, &mut controller);
     let before_external_a = project(&model, &service, controller);
     service
@@ -419,7 +397,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
         "RejectPatchConflict",
     );
 
-    // Negative control: a blind stale writer cannot masquerade as that rejection.
     let mut blind_overwrite = before_conflict.clone();
     blind_overwrite.insert("revision", before_conflict["revision"] + 1);
     blind_overwrite.insert("key_a", 0);
@@ -428,8 +405,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert_eq!(admits(&model, &before_conflict, &blind_overwrite), None);
     assert!(!model.check_invariant("NoBlindOverwrite", &blind_overwrite));
 
-    // Commit from the current external value, then change the same key while
-    // its undo token is pending. Conditional undo must now conflict.
     begin_patch(&model, &service, &mut controller);
     let before_second_commit = project(&model, &service, controller);
     let second_undo = applied(service.patch(remove_a_request(controller)));
@@ -477,8 +452,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
         "RejectUndoConflict",
     );
 
-    // Reset All is one genuine service transform and one revision. Unknown
-    // hand-authored keys survive; there is no observable half-reset state.
     let before_reset = project(&model, &service, controller);
     let reset_revision = service.snapshot().revision;
     applied(service.reset_all(reset_revision, [KEY_A.to_string(), KEY_B.to_string()]));
@@ -491,8 +464,6 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert_eq!(service.value(KEY_B).unwrap(), None);
     assert!(service.snapshot().text.contains("custom = \"preserve\""));
 
-    // Negative control: publishing only the first reset key is neither admitted
-    // nor invariant-safe at Buggy=0.
     let mut partial_reset = before_reset.clone();
     partial_reset.insert("revision", before_reset["revision"] + 1);
     partial_reset.insert("key_a", 0);
@@ -501,10 +472,7 @@ fn real_config_service_conforms_for_rebase_conflict_undo_and_atomic_reset() {
     assert!(!model.check_invariant("AtomicResetVisibility", &partial_reset));
 }
 
-/// Tier-1 bind for the shared filesystem commit authority, through the shipping hosts:
-/// Manual uses the Editor save reducer and `finish_native_document_save`; Settings uses
-/// `save_prefs_snapshot` then `finish_native_config_write`. Covers the completion code
-/// that publishes into the process-global config service, not just the atomic write.
+/// Conformance test for the shared filesystem commit CAS authority across Manual and Settings.
 #[test]
 fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() {
     use crate::app_native::NativeConfigOrigin;
@@ -575,7 +543,6 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
     std::fs::create_dir_all(&root).unwrap();
     let model = config_file_commit_cas_model();
 
-    // Interleaving 1: Manual acquires the real lock and publishes first.
     let path = root.join("manual-wins.toml");
     std::fs::write(&path, "theme = \"Default\"\n").unwrap();
     let mut app = App::headless_for_test();
@@ -613,8 +580,6 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
         "theme = \"Dracula\"\n"
     );
 
-    // Negative control: a blind second publication from that exact stale real
-    // pre-state is neither an admitted transition nor invariant-safe.
     let mut blind = before_reject.clone();
     blind.insert("disk", 2);
     blind.insert("service", 2);
@@ -627,7 +592,6 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
     assert!(!model.check_invariant("SameBaselineHasOneWinner", &blind));
     assert!(!model.check_invariant("NoStalePublication", &blind));
 
-    // Interleaving 2: structured Settings acquires the same primitive first.
     let path = root.join("settings-wins.toml");
     std::fs::write(&path, "theme = \"Default\"\n").unwrap();
     let mut app = App::headless_for_test();
@@ -667,9 +631,6 @@ fn real_config_commit_cas_conforms_for_both_winners_and_rejects_blind_publish() 
         "theme = \"Nord\"\n"
     );
 
-    // A final config symlink is an admitted, identity-bound capability: the model
-    // admits the baseline, then advances link and target generations when the real
-    // link is replaced. Resolution must conflict without redirecting bytes.
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
@@ -775,9 +736,7 @@ impl KittyFixtures {
     }
 }
 
-/// Render one deterministic classic companion through the effects state the config
-/// installer populated. Returns the addressed atlas texel with the destination so both
-/// placement and source pixels are compared (a retained `Arc` alone passes stale keys).
+/// Render one deterministic classic companion and return its sprite and first atlas texel.
 fn installed_custom_kitty_projection(
     app: &mut crate::App,
     wid: crate::WindowId,
@@ -792,9 +751,6 @@ fn installed_custom_kitty_projection(
         rows: ws.rows,
         cols: ws.cols,
     };
-    // A presented frame admits one companion body and the headless host already spent
-    // this frame's budget; open a fresh host frame (as `app_render` does per frame) so
-    // this probe is that frame's single emission.
     ws.fx.decos_mut().begin_host_frame();
     let cursor = (3, 5);
     let mut free = Vec::new();
@@ -912,8 +868,6 @@ fn config_catalog_projection(
                 snapshot.assets.sparkle_spec_consumers.as_ref(),
             ) {
                 (Some(candidate), Some(observed)) => std::sync::Arc::ptr_eq(candidate, observed),
-                // Preliminary catalogs are never publishable; keeping an identity here
-                // keeps diagnostic projections total so the predicate above fails them.
                 (None, None) => std::sync::Arc::ptr_eq(candidate, &snapshot.assets),
                 _ => false,
             }
@@ -945,11 +899,7 @@ fn config_catalog_projection(
     state
 }
 
-/// Tier-1 binding for the revisioned snapshot/catalog protocol through the config
-/// reducer, Settings runtime, live host/window installer and capture preparation. Every
-/// consumer receives the same outer Arc; stale-trail-style and stale-rainbow kitty
-/// negative controls keep the asset aggregate non-vacuous. Theme-directory staleness has
-/// its own test below, since config edits retain that catalog.
+/// Tier-1 binding for the revisioned snapshot/catalog protocol.
 #[test]
 fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delivery() {
     use std::sync::Arc;
@@ -1136,14 +1086,10 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         before_publish = after_publish;
     }
 
-    // Delete every authored PNG after admission: the live and capture paths must
-    // install the retained Ready Arc, so any presentation-time reopen would fail.
     for source in &sprites.sources {
         std::fs::remove_file(source).expect("remove admitted source before presentation");
     }
 
-    // The genuine live host and window effects state receive the same outer Arc
-    // and the effects engine retains the exact Ready RGBA allocation.
     let mut app = crate::App::headless_for_test();
     let wid = crate::WindowId(0);
     assert_eq!(app.publish_config_assets(Arc::clone(&external.assets)), 1);
@@ -1208,9 +1154,6 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     );
     assert_transition(&model, &before_publish, &after_live, "PublishLive");
 
-    // Negative control: a live host installed from a worker-prepared generation before
-    // the service admits it runs an unpublished config (the external generation, while
-    // the service still holds the patch). The real host holds the admitted `Arc`.
     let unadmitted = aterm_spec::interp::with_buggy(&model, 1)
         .successors("PublishLiveUnadmitted", &patched_state)
         .into_iter()
@@ -1220,8 +1163,6 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert_eq!(admits(&model, &patched_state, &unadmitted), None);
     assert!(!model.check_invariant("ViewsNeverAhead", &unadmitted));
 
-    // Force the actual capture preparation seam to reinstall. It must land the
-    // identical outer catalog and RGBA Arc without resolving any source again.
     {
         let window = app.windows.get_mut(&wid).expect("headless window");
         window.installed_config_assets = None;
@@ -1277,8 +1218,6 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     );
     assert_transition(&model, &after_live, &after_capture, "PublishCapture");
 
-    // Independent negative control 1: external text/rainbow kitty paired with the stale
-    // initial trail-style generation must be rejected.
     let stale_trail = ConfigSnapshot {
         revision: external.revision,
         analysis_generation: external.analysis_generation,
@@ -1309,8 +1248,6 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert_eq!(admits(&model, &patched_state, &stale_trail_state), None);
     assert!(!model.check_invariant("SnapshotAtomic", &stale_trail_state));
 
-    // Independent negative control 2: external text/trail style paired with the stale
-    // initial rainbow kitty generation must also be rejected.
     let stale_kitty = ConfigSnapshot {
         revision: external.revision,
         analysis_generation: external.analysis_generation,
@@ -1341,8 +1278,6 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert_eq!(admits(&model, &patched_state, &stale_kitty_state), None);
     assert!(!model.check_invariant("SnapshotAtomic", &stale_kitty_state));
 
-    // Negative control 3: external-generation visual assets paired with the stale
-    // initial custom-spec projection must be rejected.
     let stale_sparkle = ConfigSnapshot {
         revision: external.revision,
         analysis_generation: external.analysis_generation,
@@ -1374,8 +1309,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     assert!(!model.check_invariant("SnapshotAtomic", &stale_sparkle_state));
 }
 
-/// Tier-1 binding for the byte-identical external refresh: a referenced sprite
-/// changes while `aterm.toml` does not, and the service publishes a new snapshot.
+/// Tier-1 binding for byte-identical external config refreshes.
 #[test]
 fn byte_equal_external_refresh_conforms_to_atomic_catalog_model() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1428,16 +1362,13 @@ fn byte_equal_external_refresh_conforms_to_atomic_catalog_model() {
     assert_transition(&model, &model.init_state(), &projected, "RefreshAssets");
     assert!(model.check_invariant("SnapshotAtomic", &projected));
 
-    // Negative control: retaining the genuine initial sprite would be the
-    // stale mixed-generation state forbidden by the model.
     let mut stale = projected;
     stale.insert("kitty_generation", 0);
     assert!(!model.check_invariant("SnapshotAtomic", &stale));
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Tier-1 binding for the background theme-directory refresh: the reducer receives a
-/// parsed catalog and advances one outer snapshot, moving every generation atomically.
+/// Tier-1 binding for background theme-directory refreshes.
 #[test]
 fn parsed_theme_catalog_refresh_conforms_to_atomic_catalog_model() {
     use std::sync::Arc;

@@ -2,30 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The call-graph guards: which function a line belongs to, whether it is a
-//! test's, and what a function reaches through calls of its own file.
-//!
-//! Lexical and per file, by name: a call through another file's function, a
-//! function pointer or selector dispatch is not followed.
+//! Lexical per-file call-graph guards.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use super::{Bound, Finding, Line, Rule, SourceFile, Tree, calls, is_word};
 
-/// One line of code, attributed to the innermost `fn` whose body holds it (or
-/// whose signature it is), and whether that is a test's.
+/// One line of code, attributed to the innermost `fn` whose body holds it (or whose signature it
+/// is), and whether that is a test's.
 pub(super) struct FnLine<'a> {
     pub(super) line: Line<'a>,
     pub(super) func: Option<&'a str>,
     pub(super) in_test: bool,
 }
 
-/// The first `fn <name>` a line of code defines.
 fn fn_name(code: &str) -> Option<&str> {
     super::hits(code, "fn", Bound::Word).find_map(|at| fn_name_at(&code[at..]))
 }
 
-/// The name a `fn` keyword at the start of `s` defines (`fn(` is a type).
 fn fn_name_at(s: &str) -> Option<&str> {
     let rest = s.strip_prefix("fn")?;
     let name = rest.trim_start_matches([' ', '\t']);
@@ -36,10 +30,7 @@ fn fn_name_at(s: &str) -> Option<&str> {
     (end > 0 && !name.as_bytes()[0].is_ascii_digit()).then(|| &name[..end])
 }
 
-/// Every line of `file`, attributed by brace depth: a `fn` line opens a frame
-/// at its first `{` (a `;` first ends a body-less declaration), and a frame
-/// closes when the depth falls back to where it opened. A `#[test]` marks the
-/// next `fn`, and every line inside a test frame is a test's.
+/// Every line of `file`, attributed by brace depth.
 pub(super) fn attribute(file: &SourceFile) -> Vec<FnLine<'_>> {
     struct Frame<'a> {
         name: &'a str,
@@ -87,13 +78,11 @@ pub(super) fn attribute(file: &SourceFile) -> Vec<FnLine<'_>> {
     out
 }
 
-/// `sel!(<selector>)`, spaces allowed, in a line of code.
 fn sends(code: &str, selector: &str) -> bool {
     code.match_indices("sel!")
         .any(|(at, _)| sel_at(&code[at..], selector))
 }
 
-/// Does `code` start with `sel!(<selector>)`?
 fn sel_at(code: &str, selector: &str) -> bool {
     code.strip_prefix("sel!")
         .and_then(|r| super::after_ws(r, "("))
@@ -102,8 +91,6 @@ fn sel_at(code: &str, selector: &str) -> bool {
         .is_some()
 }
 
-/// `class(c"<name>")`: the code view shows the call and where its literal
-/// sits (the `c` prefix blanked with the contents), the text view the name.
 fn builds_class(line: Line<'_>, name: &str) -> bool {
     line.code.match_indices("class").any(|(at, _)| {
         let Some(arg) = super::after_ws(&line.code[at + 5..], "(") else {
@@ -121,8 +108,7 @@ fn builds_class(line: Line<'_>, name: &str) -> bool {
     })
 }
 
-/// The breadth-first reach over `edges` from `starts`: each reached name and
-/// the name it was reached from (`None` for a start).
+/// The breadth-first reach over `edges` from `starts`.
 pub(super) fn reach<'a>(
     starts: impl IntoIterator<Item = &'a str>,
     edges: &BTreeMap<&'a str, Vec<&'a str>>,
@@ -145,7 +131,6 @@ pub(super) fn reach<'a>(
     from
 }
 
-/// `start`, then each name `links` leads to, until one leads nowhere.
 fn walk<'a>(links: &BTreeMap<&'a str, Option<&'a str>>, start: &'a str) -> Vec<&'a str> {
     let mut path = vec![start];
     let mut at = start;
@@ -155,9 +140,6 @@ fn walk<'a>(links: &BTreeMap<&'a str, Option<&'a str>>, start: &'a str) -> Vec<&
     }
     path
 }
-
-// test-appkit-door: the AppKit calls measured opening a WindowServer
-// connection from a test binary.
 
 pub(super) const TEST_APPKIT_DOOR: Rule = Rule {
     id: "test-appkit-door",
@@ -172,7 +154,6 @@ pub(super) const TEST_APPKIT_DOOR: Rule = Rule {
 
 const DOOR_NEEDLES: &[&str] = &["separatorItem", "setToolTip:", "NSToolbarItem"];
 
-/// The door a line of code opens, by name.
 fn appkit_door(line: Line<'_>) -> Option<&'static str> {
     if sends(line.code, "separatorItem") {
         Some("+[NSMenuItem separatorItem]")
@@ -193,8 +174,6 @@ fn test_appkit_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Every test line of `file` that opens a door or calls a function of the
-/// file that reaches one.
 fn appkit_door_findings(file: &SourceFile) -> Vec<Finding> {
     let lines = attribute(file);
     let mut doors: BTreeMap<&str, &str> = BTreeMap::new();
@@ -214,7 +193,6 @@ fn appkit_door_findings(file: &SourceFile) -> Vec<Finding> {
             }
         }
     }
-    // Toward the door: each function that reaches one, and the next hop.
     let hop = reach(door_order.iter().copied(), &callers);
     let chain = |f| {
         let mut path = walk(&hop, f);
@@ -251,18 +229,6 @@ fn appkit_door_findings(file: &SourceFile) -> Vec<Finding> {
     out
 }
 
-// shared-application: +[NSApplication sharedApplication] creates the
-// application object, and with it a WindowServer connection.
-
-/// The proof only a windowed launch mints (`platform::Windowed`). A send is
-/// held by it when its function takes the proof (a `Windowed` parameter, or
-/// the `self` of a method of `impl Windowed`), or answers without it before
-/// the send, in the send's block or one enclosing it:
-/// `Windowed::get()?`, `let Some(..) = Windowed::get() else { .. };` or
-/// `if Windowed::get().is_none() { return .. }`. A headless process then
-/// answers without sending, and the proof, not this rule, keeps the send
-/// windowed. Naming the proof holds nothing: `let _ = Windowed::get();`, an
-/// assertion, an `Option<Windowed>` parameter or return.
 const WINDOWED_TOKEN: &str = "Windowed";
 
 pub(super) const SHARED_APPLICATION: Rule = Rule {
@@ -275,11 +241,8 @@ pub(super) const SHARED_APPLICATION: Rule = Rule {
     check: shared_application,
 };
 
-/// The source the rule reads: aterm-gui's, the window crate's and its
-/// split-out libraries' (`crates/aterm-gui-*`).
 const GUI_SOURCE: &[&str] = &["crates/aterm-gui/src/", "crates/aterm-gui-"];
 
-/// Every send no proof holds.
 fn shared_application(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(GUI_SOURCE) {
         if !file.mentions(&["sharedApplication"]) {
@@ -302,38 +265,23 @@ fn shared_application(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// One `sel!(sharedApplication)` in a file's code.
 #[derive(Debug)]
 struct AppSend<'a> {
     line: usize,
-    /// The innermost `fn` whose body holds it.
     func: Option<&'a str>,
-    /// Does the [`WINDOWED_TOKEN`] proof hold it?
     windowed: bool,
 }
 
-/// Every `sel!(sharedApplication)` in a file's code. A frame opens at the `{`
-/// its `fn` (or `impl`) is waiting for (a `;` at the signature's own depth,
-/// outside brackets, ends a body-less one) and closes with its matching `}`, so
-/// a nested `fn` is its own frame and a send after it closes is the outer
-/// one's. An `impl` inside a pending `fn` signature (`-> impl Trait`) is a type.
-/// A proof the signature takes holds the whole body; one answered for in the
-/// body holds from there to the end of the block it sits in.
 fn shared_application_sends(code: &str) -> Vec<AppSend<'_>> {
     struct Frame<'a> {
-        /// The `fn`'s name; `None` for an `impl` block.
         func: Option<&'a str>,
         depth: i64,
-        /// An `impl` whose self type is the proof.
         impl_of_proof: bool,
-        /// The depth of the block the proof holds this `fn`'s sends from.
         held_from: Option<i64>,
     }
     let b = code.as_bytes();
     let mut out = Vec::new();
     let mut frames: Vec<Frame<'_>> = Vec::new();
-    // A `fn` or `impl` waiting for its body: name (None for an impl), the
-    // depth and bracket count it was met at, and where its header starts.
     let mut pending: Option<(Option<&str>, i64, i64, usize)> = None;
     let (mut depth, mut brackets, mut line) = (0i64, 0i64, 1usize);
     let mut i = 0;
@@ -424,9 +372,6 @@ fn shared_application_sends(code: &str) -> Vec<AppSend<'_>> {
     out
 }
 
-/// Does the [`WINDOWED_TOKEN`] at `at` fetch the proof and answer without it
-/// before going on: `Windowed::get()?`, `let Some(..) = Windowed::get() else`,
-/// or `if Windowed::get().is_none() { return`? The path before it is free.
 fn answers_without_proof(code: &str, at: usize) -> bool {
     let Some(rest) = code[at..]
         .strip_prefix(WINDOWED_TOKEN)
@@ -438,7 +383,6 @@ fn answers_without_proof(code: &str, at: usize) -> bool {
     if rest.starts_with('?') {
         return true;
     }
-    // The statement before the proof's path.
     let start = code[..at].rfind([';', '{', '}']).map_or(0, |p| p + 1);
     let lead = path_tail_trimmed(&code[start..at]).trim();
     if word_at(rest, "else") {
@@ -450,7 +394,6 @@ fn answers_without_proof(code: &str, at: usize) -> bool {
         .is_some_and(|block| lead == "if" && word_at(block.trim_start(), "return"))
 }
 
-/// `s` without the `a::b::` path that ends it (spaces between allowed).
 fn path_tail_trimmed(s: &str) -> &str {
     let mut s = s.trim_end();
     while let Some(r) = s.strip_suffix("::") {
@@ -462,15 +405,11 @@ fn path_tail_trimmed(s: &str) -> &str {
     s
 }
 
-/// Does `s` start with the word `word`?
 fn word_at(s: &str, word: &str) -> bool {
     s.strip_prefix(word)
         .is_some_and(|r| !r.bytes().next().is_some_and(is_word))
 }
 
-/// Does a `fn` header (from `fn` to its body's `{`) take the proof: a
-/// parameter whose type is the proof itself or a reference to it, or the
-/// `self` of a method of `impl Windowed` (`in_proof_impl`)?
 fn takes_proof(header: &str, in_proof_impl: bool) -> bool {
     let Some(params) = param_list(header) else {
         return false;
@@ -486,8 +425,6 @@ fn takes_proof(header: &str, in_proof_impl: bool) -> bool {
         })
 }
 
-/// The text inside a `fn` header's parameter parentheses: the first `(`
-/// outside its generics (`fn f<F: Fn(u8) -> u8>(f: F)`).
 fn param_list(header: &str) -> Option<&str> {
     let b = header.as_bytes();
     let (mut angle, mut open) = (0i64, None);
@@ -519,8 +456,6 @@ fn param_list(header: &str) -> Option<&str> {
     None
 }
 
-/// `s` split at each `sep` outside brackets of any kind (`->` is no closing
-/// angle); a `:` of a `::` is no separator.
 fn top_level(s: &str, sep: u8) -> Vec<&str> {
     let b = s.as_bytes();
     let (mut nest, mut from, mut out) = (0i64, 0, Vec::new());
@@ -544,14 +479,12 @@ fn top_level(s: &str, sep: u8) -> Vec<&str> {
     out
 }
 
-/// `self`, `mut self`, `&self`, `&'a mut self`, `self: Box<Self>`.
 fn is_self_receiver(param: &str) -> bool {
     let s = without_reference(param);
     s.strip_prefix("self")
         .is_some_and(|r| r.trim_start().is_empty() || r.trim_start().starts_with(':'))
 }
 
-/// A type with any leading `&`, lifetime and `mut` dropped.
 fn without_reference(ty: &str) -> &str {
     let mut s = ty.trim_start();
     if let Some(r) = s.strip_prefix('&') {
@@ -570,15 +503,11 @@ fn without_reference(ty: &str) -> &str {
     s.trim_end()
 }
 
-/// Is `ty` the proof, by value or by reference, however its path is spelled
-/// (`Windowed`, `&crate::platform::Windowed`)? `Option<Windowed>` is not.
 fn is_proof_type(ty: &str) -> bool {
     let t = without_reference(ty);
     !t.contains(['<', '[', '(']) && t.rsplit("::").next().map(str::trim) == Some(WINDOWED_TOKEN)
 }
 
-/// Is an `impl` header (from `impl` to its `{`) one whose self type is the
-/// proof (`impl Windowed`, `impl Clone for Windowed`)?
 fn impl_of_proof(header: &str) -> bool {
     let mut h = header.strip_prefix("impl").unwrap_or(header).trim_start();
     if h.starts_with('<') {
@@ -593,7 +522,6 @@ fn impl_of_proof(header: &str) -> bool {
     is_proof_type(self_ty)
 }
 
-/// `s` (which opens with `<`) after its matching `>`; empty when unclosed.
 fn after_generics(s: &str) -> &str {
     let b = s.as_bytes();
     let mut angle = 0i64;
@@ -620,7 +548,6 @@ mod tests {
 
     const HEADER: &str = "// SPDX-License-Identifier: Apache-2.0\n";
 
-    /// The door finding for one file played as aterm-gui source.
     fn doors(src: &str) -> Vec<Finding> {
         run(&TEST_APPKIT_DOOR, &[("crates/aterm-gui/src/menu.rs", src)])
     }
@@ -633,7 +560,6 @@ mod tests {
 }
 ";
 
-    /// Each way a test reaches a door, with the chain its finding prints.
     #[test]
     fn every_test_that_reaches_a_door_is_found_with_its_chain() {
         let cases: &[(&str, String, &str)] = &[
@@ -720,12 +646,10 @@ mod tests {
         assert!(found.is_empty(), "CRIES WOLF: {found:?}");
     }
 
-    /// The application object's sends no proof holds, in `files`.
     fn app_sends(files: &[(&str, &str)]) -> Vec<Finding> {
         run(&SHARED_APPLICATION, files)
     }
 
-    /// The functions named by the findings for one file of `src`.
     fn unheld(src: &str) -> Vec<String> {
         app_sends(&[("crates/aterm-gui/src/status_item.rs", src)])
             .into_iter()
@@ -790,8 +714,6 @@ mod tests {
         assert!(found.is_empty(), "CRIES WOLF: {found:?}");
     }
 
-    /// Each shape that holds the proof before the send, in the spellings the
-    /// windowed functions use.
     #[test]
     fn a_proof_taken_or_answered_for_before_the_send_holds_it() {
         let held = format!(
@@ -806,9 +728,6 @@ mod tests {
         assert_eq!(unheld(&held), Vec::<String>::new());
     }
 
-    /// Naming the proof holds nothing: a fetch that goes on without it, an
-    /// `Option` of it, an associated fn with no `self`, or an answer that
-    /// comes after the send or inside a block the send is not in.
     #[test]
     fn a_proof_named_but_not_answered_for_holds_nothing() {
         let cases: &[(&str, String)] = &[

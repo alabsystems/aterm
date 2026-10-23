@@ -247,7 +247,6 @@ fn newtype_newtype() {
 fn newtype_map() {
     let value = InternallyTagged::NewtypeMap(BTreeMap::new());
 
-    // Special case: empty map
     assert_tokens(
         &value,
         &[
@@ -272,7 +271,6 @@ fn newtype_map() {
         "value".to_string(),
     )]));
 
-    // Special case: tag field ("tag") is the first field
     assert_tokens(
         &value,
         &[
@@ -296,7 +294,6 @@ fn newtype_map() {
         ],
     );
 
-    // General case: tag field ("tag") is not the first field
     assert_de_tokens(
         &value,
         &[
@@ -336,7 +333,6 @@ fn newtype_map() {
 fn newtype_struct() {
     let value = InternallyTagged::NewtypeStruct(Struct { f: 6 });
 
-    // Special case: tag field ("tag") is the first field
     assert_tokens(
         &value,
         &[
@@ -366,7 +362,6 @@ fn newtype_struct() {
         ],
     );
 
-    // General case: tag field ("tag") is not the first field
     assert_de_tokens(
         &value,
         &[
@@ -423,7 +418,6 @@ mod newtype_enum {
     fn unit() {
         let value = InternallyTagged::NewtypeEnum(Enum::Unit);
 
-        // Special case: tag field ("tag") is the first field
         assert_tokens(
             &value,
             &[
@@ -447,7 +441,6 @@ mod newtype_enum {
             ],
         );
 
-        // General case: tag field ("tag") is not the first field
         assert_de_tokens(
             &value,
             &[
@@ -476,7 +469,6 @@ mod newtype_enum {
     fn newtype() {
         let value = InternallyTagged::NewtypeEnum(Enum::Newtype(1));
 
-        // Special case: tag field ("tag") is the first field
         assert_tokens(
             &value,
             &[
@@ -500,7 +492,6 @@ mod newtype_enum {
             ],
         );
 
-        // General case: tag field ("tag") is not the first field
         assert_de_tokens(
             &value,
             &[
@@ -529,7 +520,6 @@ mod newtype_enum {
     fn tuple() {
         let value = InternallyTagged::NewtypeEnum(Enum::Tuple(1, 1));
 
-        // Special case: tag field ("tag") is the first field
         assert_tokens(
             &value,
             &[
@@ -565,10 +555,6 @@ mod newtype_enum {
             ],
         );
 
-        // Special case: tag field ("tag") is not the first field
-        // Reaches crate::private::de::content::VariantDeserializer::tuple_variant
-        // Content::Seq case
-        // via ContentDeserializer::deserialize_enum
         assert_de_tokens(
             &value,
             &[
@@ -609,7 +595,6 @@ mod newtype_enum {
     fn struct_() {
         let value = InternallyTagged::NewtypeEnum(Enum::Struct { f: 1 });
 
-        // Special case: tag field ("tag") is the first field
         assert_tokens(
             &value,
             &[
@@ -645,10 +630,6 @@ mod newtype_enum {
             ],
         );
 
-        // General case: tag field ("tag") is not the first field
-        // Reaches crate::private::de::content::VariantDeserializer::struct_variant
-        // Content::Map case
-        // via ContentDeserializer::deserialize_enum
         assert_de_tokens(
             &value,
             &[
@@ -684,7 +665,6 @@ mod newtype_enum {
             ],
         );
 
-        // Special case: tag field ("tag") is the first field
         assert_de_tokens(
             &value,
             &[
@@ -712,10 +692,6 @@ mod newtype_enum {
             ],
         );
 
-        // General case: tag field ("tag") is not the first field
-        // Reaches crate::private::de::content::VariantDeserializer::struct_variant
-        // Content::Seq case
-        // via ContentDeserializer::deserialize_enum
         assert_de_tokens(
             &value,
             &[
@@ -749,7 +725,6 @@ mod newtype_enum {
 fn struct_() {
     let value = InternallyTagged::Struct { a: 1 };
 
-    // Special case: tag field ("tag") is the first field
     assert_tokens(
         &value,
         &[
@@ -779,7 +754,6 @@ fn struct_() {
         ],
     );
 
-    // General case: tag field ("tag") is not the first field
     assert_de_tokens(
         &value,
         &[
@@ -809,7 +783,6 @@ fn struct_() {
         ],
     );
 
-    // Special case: tag field ("tag") is the first field
     assert_de_tokens(
         &value,
         &[
@@ -833,7 +806,6 @@ fn struct_() {
         ],
     );
 
-    // General case: tag field ("tag") is not the first field
     assert_de_tokens(
         &value,
         &[
@@ -893,7 +865,6 @@ mod struct_enum {
 
         let value = InternallyTagged::StructEnum { enum_: Enum::Unit };
 
-        // Special case: tag field ("tag") is the first field
         assert_tokens(
             &value,
             &[
@@ -927,7 +898,6 @@ mod struct_enum {
             ],
         );
 
-        // General case: tag field ("tag") is not the first field
         assert_de_tokens(
             &value,
             &[
@@ -961,7 +931,6 @@ mod struct_enum {
             ],
         );
 
-        // Special case: tag field ("tag") is the first field
         assert_de_tokens(
             &value,
             &[
@@ -989,7 +958,6 @@ mod struct_enum {
             ],
         );
 
-        // General case: tag field ("tag") is not the first field
         assert_de_tokens(
             &value,
             &[
@@ -1069,8 +1037,6 @@ fn wrong_tag() {
     );
 }
 
-// Upstream's with_skipped_conflict without its skipped variant (aterm skips
-// fields, never a variant): a struct variant whose only field is skipped.
 #[test]
 fn with_skipped_field() {
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -1152,7 +1118,6 @@ fn unit_variant_with_unknown_fields() {
         ],
     );
 
-    // Unknown elements are not allowed in sequences
     assert_de_tokens_error::<InternallyTagged>(
         &[
             Token::Seq { len: None },

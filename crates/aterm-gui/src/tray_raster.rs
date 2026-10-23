@@ -527,7 +527,7 @@ mod synthesized {
         (0.08..=0.64).contains(&y) && ((0.07..=0.23).contains(&x) || (0.37..=0.53).contains(&x))
     }
 
-    fn design(ch: char) -> Option<&'static Design> {
+    const fn design(ch: char) -> Option<&'static Design> {
         match ch {
             '\u{2139}' => Some(&INFO),
             '\u{23f8}' => Some(&PAUSE),
@@ -1089,7 +1089,7 @@ impl PreparedSemanticFont {
     }
 
     /// Whether this immutable snapshot can paint the real terminal specimen.
-    pub(crate) fn is_ready(&self) -> bool {
+    pub(crate) const fn is_ready(&self) -> bool {
         self.renderer.is_some()
     }
 
@@ -1547,7 +1547,7 @@ pub(crate) fn prepared_semantic_font_for_direct_view_test(
 }
 
 /// Which face of the chrome stack draws a glyph: the pure policy (no font I/O).
-pub(crate) fn select_chrome_face(
+pub(crate) const fn select_chrome_face(
     bold_run: bool,
     bold_has: bool,
     primary_has: bool,
@@ -2012,6 +2012,8 @@ pub(crate) fn prepare_semantic_font(
             drop(fonts);
             let memo = renderer.clone();
             SEMANTIC_FORK_MEMO.with(|slot| {
+                // A `None` fork is cached too — a candidate with no installable
+                // renderer must not re-attempt the fork every frame, and the
                 // epoch moves the moment one lands.
                 *slot.borrow_mut() = Some((candidate.clone(), snapshot.ready_epoch, memo));
             });
@@ -2272,6 +2274,7 @@ fn resolve_ui_font_assets_with(files: &mut UiFontFiles) -> UiFontAssets {
     }
     match first_regular {
         Some((regular, bytes, index)) => {
+            // No static semibold anywhere: a variable regular can still instance its own, so
             // the band's active label keeps its weight where `UiBold` falls back to the regular.
             ui_font_assets(regular, None, bytes, index)
         }
@@ -2961,7 +2964,7 @@ impl RimMemo {
             .map(|(_, became)| *became)
     }
 
-    fn put(&mut self, key: (u32, u32), became: [u8; 4]) {
+    const fn put(&mut self, key: (u32, u32), became: [u8; 4]) {
         self.entries[self.next] = Some((key, became));
         self.next = (self.next + 1) % self.entries.len();
     }
@@ -3342,6 +3345,9 @@ impl Canvas {
     }
 
     fn composite_at(&mut self, i: usize, c: [u8; 4], cov: f32, a: f32) {
+        // A fully covered opaque source replaces the destination exactly. The
+        // general linear-light source-over equation reduces to this copy, so do
+        // not pay three lookup/searches for the large opaque surfaces used by
         // native views and modal cards.
         if c[3] == u8::MAX && cov >= 1.0 {
             self.px[i..i + 4].copy_from_slice(&c);
@@ -5147,6 +5153,7 @@ mod tests {
         let cold = strip_band_font_epoch();
         prepare_ui_fonts_for_direct_view_test();
         if !strip_band_ui_ready() {
+            // Host without a resolvable system UI face (CI): the decline
             // branch above is the whole contract.
             aterm_spec::host::could_not_run("no system UI face here for the strip band");
         }

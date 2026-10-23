@@ -1176,6 +1176,7 @@ fn ob2_version_equality(root: &Path, forks: &[VendoredFork], log: &mut String) -
             continue;
         }
         for (manifest, req) in workspace_requirements(root, &fork.name) {
+            // A renamed row answers for its own version line only: a
             // requirement on another line is another row's, or the registry's.
             if !crate::policy::in_row_scope(fork.renamed, Some(&fork.version), &req) {
                 continue;

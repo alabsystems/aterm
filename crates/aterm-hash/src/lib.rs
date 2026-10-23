@@ -2,6 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Fast non-cryptographic hashing for aterm.
+//!
+//! # Example
+//!
+//! ```rust
+//! use aterm_hash::FxHashMap;
+//!
+//! let mut map: FxHashMap<u32, u32> = FxHashMap::default();
+//! map.insert(22, 44);
+//! assert_eq!(map[&22], 44);
+//! ```
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
@@ -23,6 +33,15 @@ pub type FxHashSet<V> = HashSet<V, FxBuildHasher>;
 pub type KeyedHashMap<K, V> = HashMap<K, V, KeyedState>;
 
 /// [`KeyedHashMap`]'s hasher builder.
+///
+/// ```
+/// use std::hash::BuildHasher;
+/// use aterm_hash::KeyedState;
+/// let state = KeyedState::default();
+/// assert_eq!(state.hash_one("same"), state.hash_one("same"));
+/// // Each map's state carries a key of its own.
+/// assert_ne!(state.hash_one("same"), KeyedState::default().hash_one("same"));
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct KeyedState(std::hash::RandomState);
 
@@ -256,6 +275,14 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 /// [`FxHasher`] over `bytes` alone.
+///
+/// ```
+/// use std::hash::Hasher;
+/// use aterm_hash::{FxHasher, fx_hash_bytes};
+/// let mut h = FxHasher::default();
+/// h.write(b"the same bytes");
+/// assert_eq!(fx_hash_bytes(b"the same bytes"), h.finish());
+/// ```
 #[inline(never)]
 #[must_use]
 pub fn fx_hash_bytes(bytes: &[u8]) -> u64 {
@@ -265,6 +292,12 @@ pub fn fx_hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 /// A zero-sized [`BuildHasher`] that produces [`FxHasher`]s.
+///
+/// ```
+/// use std::hash::BuildHasher;
+/// use aterm_hash::FxBuildHasher;
+/// assert_ne!(FxBuildHasher.hash_one(1), FxBuildHasher.hash_one(2));
+/// ```
 #[derive(Copy, Clone, Default)]
 pub struct FxBuildHasher;
 

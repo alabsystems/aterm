@@ -68,7 +68,7 @@ impl FgCutter {
     }
 
     /// Start a new batch: nothing read yet, no edge.
-    pub(crate) fn begin(&mut self) {
+    pub(crate) const fn begin(&mut self) {
         self.cut = 0;
         self.clean = 0;
         self.parked = None;
@@ -77,14 +77,14 @@ impl FgCutter {
 
     /// The park after the last pre-park sample ended without the watch: that
     /// sample's offset is clean.
-    fn settle(&mut self) {
+    const fn settle(&mut self) {
         if let Some(parked) = self.parked.take() {
             self.clean = parked;
         }
     }
 
     /// Whether this batch already carries its one edge (a process event heard now waits for the next batch, or goes byte-free after this one).
-    pub(crate) fn carries_edge(&self) -> bool {
+    pub(crate) const fn carries_edge(&self) -> bool {
         self.edge.is_some()
     }
 
@@ -191,7 +191,7 @@ impl FgCutter {
     }
 
     /// This batch's edge, if any, with no batch-end sample.
-    pub(crate) fn take_edge(&mut self) -> Option<FgEdge> {
+    pub(crate) const fn take_edge(&mut self) -> Option<FgEdge> {
         self.parked = None;
         self.edge.take()
     }
@@ -214,7 +214,7 @@ impl FgCutter {
     }
 
     /// The current holder (`0` = none seen yet): after [`Self::finish`], the group whose bytes end the batch.
-    pub(crate) fn holder(&self) -> i32 {
+    pub(crate) const fn holder(&self) -> i32 {
         self.running
     }
 }

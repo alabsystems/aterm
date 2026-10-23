@@ -5,8 +5,6 @@
 
 use super::*;
 
-/// Flare law: a real cursor jump slams Fire's flare to full, and it cools on its
-/// own tau, gone within about a second, so the burst reads as an event.
 #[test]
 fn fire_jump_flares_and_cools() {
     let g = geom();
@@ -44,9 +42,6 @@ fn fire_jump_flares_and_cools() {
     );
 }
 
-/// A move down one row anchors no fire beyond the single wake spark at the landing. A typing wrap
-/// (from the last column) flies no inter-line meteor, which would sweep the line on every wrap; a
-/// deliberate jump from a short column still flies one (the positive control).
 #[test]
 fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     let g = geom();
@@ -103,8 +98,6 @@ fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     );
 }
 
-/// One-shot causality: a scripted jump may fly one meteor, and an unlicensed
-/// second repaint hop neither retargets it, mints a second, nor kills it.
 #[test]
 fn fire_meteor_survives_an_unlicensed_second_hop_without_retargeting() {
     let g = geom();
@@ -152,12 +145,6 @@ fn fire_meteor_survives_an_unlicensed_second_hop_without_retargeting() {
     );
 }
 
-/// Window-space effects layer: with a real head band (origin_y = pad 8 + head 40
-/// = 48) a row-0 blaze climbs above the grid into the chrome band (patches with
-/// `y < origin_y`, tagged damage row 0) while the flame keeps its natural
-/// root in the row's ascender band (`base_y == origin_y + ch ·
-/// FIRE_DARK_ROOT`), and the engulf gate keys only real
-/// grid rows (no u16 wrap from a negative band).
 #[test]
 fn fire_rises_into_the_chrome_band() {
     let g = Geom {
@@ -209,11 +196,6 @@ fn fire_rises_into_the_chrome_band() {
     );
 }
 
-/// The identity law at a real host origin: with a nonzero origin but `head == 0`
-/// (no chrome band: Linux, `ATERM_NO_FULLSIZE_CONTENT`, fullscreen) the fire
-/// reproduces the pad-relative behaviour translated by origin: the row-0 root is
-/// forced one cell down (`origin_y + ch`) and no patch pixel rises above the
-/// grid top (`y >= origin_y`).
 #[test]
 fn fire_identity_at_origin_without_head() {
     let g = Geom {
@@ -251,8 +233,6 @@ fn fire_identity_at_origin_without_head() {
     }
 }
 
-/// The bounded thermal-tier machine (cold, warm, hot, smoking as tiers 0..=3):
-/// stoking climbs one tier at a time; quenching and cooling only descend.
 fn emberforge_thermal_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -275,10 +255,6 @@ fn emberforge_thermal_model_proves_and_catches_heating_quench() {
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 }
 
-/// Tier-1 conformance: drive the real fire integrators through a stoke burst, a
-/// backspace quench run and an idle cool-down, project `disp_t` onto the model's
-/// tier, and check every observed transition against the derived machine (no
-/// frame moves more than one tier).
 #[test]
 fn emberforge_real_thermal_conforms_to_model() {
     let model = emberforge_thermal_model();
@@ -345,9 +321,6 @@ fn emberforge_real_thermal_conforms_to_model() {
     assert_eq!(glow.disp_t, 0.0, "display temperature snaps to exactly 0");
 }
 
-/// Backspace quenches, never stokes: a delete run monotonically cools the
-/// display temperature, the quench meter escalates with consecutive deletes,
-/// and arrow-left navigation (no key hint) earns no heat.
 #[test]
 fn fire_backspace_quenches_and_navigation_never_heats() {
     let g = geom();
@@ -407,9 +380,6 @@ fn fire_backspace_quenches_and_navigation_never_heats() {
     assert!(nav.disp_t < 0.05, "backward navigation stays cold");
 }
 
-/// The forge cursor: metal heats under sustained blaze, holds heat longer than
-/// the flames (hysteresis), yields a black-body fill (red dominant), and cools
-/// back to its resting ember and inactive (never the theme's cursor colour).
 #[test]
 fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
     let g = geom();
@@ -482,11 +452,6 @@ fn fire_forge_cursor_heats_holds_and_cools_to_ember() {
     assert!(!glow.is_active(), "the animation timer disarms");
 }
 
-/// The forge caret reads on its page at rest and at every heat: the block
-/// draws the glyph beneath it in the page colour, so the fill keeps
-/// [`ForgeBand::PAGE_CONTRAST`] against the page on the shipped dark default,
-/// GitHub Light and the other common grounds, resting and heating (breath
-/// included), as a warm point of the black-body ramp.
 #[test]
 fn the_forge_caret_reads_on_its_page_at_rest_and_hot() {
     let g = geom();
@@ -546,9 +511,6 @@ fn the_forge_caret_reads_on_its_page_at_rest_and_hot() {
     );
 }
 
-/// The budget law on a window-space layout (a real head band and padding): full
-/// blaze plus the monster jump stays under MAX_QUADS with `origin > 0` and
-/// window extents wider than the grid.
 #[test]
 fn fire_field_full_blaze_respects_quad_budget_with_head_band() {
     let g = Geom {
@@ -588,9 +550,6 @@ fn fire_field_full_blaze_respects_quad_budget_with_head_band() {
     }
 }
 
-/// Round light: fire's embers, crown and impact flash are radial halos, and the
-/// halo stream obeys the quads' invariants (per-row bands, grid-interior, radii
-/// ≥ 1, decays to empty, folded into the fingerprint).
 #[test]
 fn fire_light_is_radial_halos_not_squares() {
     let g = geom();
@@ -641,8 +600,6 @@ fn fire_light_is_radial_halos_not_squares() {
     assert_eq!(fp, 0);
 }
 
-/// The halo stream is folded into the tick fingerprint: an ember-only change (same quads) still
-/// changes the fp, so the frame presents.
 #[test]
 fn halo_changes_change_the_fingerprint() {
     let g = geom();
@@ -670,8 +627,6 @@ fn halo_changes_change_the_fingerprint() {
     assert_ne!(fp1, fp2, "animating halos re-present frame to frame");
 }
 
-/// Cursor-private streams retain their plane/order identity, their private
-/// record coverage, and the scheduler's exact idle sentinel.
 #[test]
 fn frame_fingerprint_preserves_private_stream_identity_and_idle_zero() {
     fn glow_hash(tag: u64, q: GlowQuad) -> u64 {
@@ -792,9 +747,6 @@ fn frame_fingerprint_preserves_private_stream_identity_and_idle_zero() {
     assert_ne!(forge_a.finish(), forge_b.finish(), "forge fill");
 }
 
-/// Smoke law: a cursor forged hot sheds smoke wisps continuously while the metal
-/// is above the smoking point, and the smoke stops (vapor drains, timer
-/// disarms) once it cools.
 #[test]
 fn hot_cursor_smokes_and_cool_cursor_stops() {
     let g = geom();
@@ -833,9 +785,6 @@ fn hot_cursor_smokes_and_cool_cursor_stops() {
     assert!(!glow.is_active(), "idle returns to zero work");
 }
 
-/// Dark-core law: at a towering blaze the flame body is emitted as per-pixel
-/// [`FirePatch`]es (drawn at the under-ink seam), and everything decays back to
-/// exactly empty.
 #[test]
 fn towering_blaze_chars_the_engulfed_rows_and_decays() {
     let g = geom();
@@ -880,9 +829,6 @@ fn towering_blaze_chars_the_engulfed_rows_and_decays() {
     assert_eq!(fp, 0);
 }
 
-/// The contrast-halo law: a hot blaze emits colour-free halo strengths for the
-/// cells the flame engulfs, rising toward the head where the fire is brightest,
-/// while ink is never recoloured (no charred entries).
 #[test]
 fn hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors() {
     let g = geom();
@@ -928,11 +874,6 @@ fn hot_blaze_emits_halo_strengths_rising_toward_the_head_and_never_recolors() {
     );
 }
 
-/// On a LIGHT theme the fire is ink tongues beneath the letters: no field
-/// patch, only source-over paint in the under-ink stream, in warm colours
-/// (orange at the root to pale yellow at the tips), rooted in the typed row
-/// and never more than two rows tall above it, its opacity melting toward
-/// the tips and the sides of the run rather than ending on a hard edge.
 #[test]
 fn light_theme_fire_is_ink_tongues_beneath_the_letters() {
     let g = tall_geom();
@@ -1037,9 +978,6 @@ fn light_theme_fire_is_ink_tongues_beneath_the_letters() {
     );
 }
 
-/// Fire embers keep off the letters: an ember over a cell the row probe shows
-/// as a glyph is not drawn (light over a letter is a smear on it), while one
-/// over a blank cell (a gap, the airspace) keeps full punch.
 #[test]
 fn fire_embers_keep_off_probed_glyph_cells() {
     let g = geom();
@@ -1085,8 +1023,6 @@ fn fire_embers_keep_off_probed_glyph_cells() {
     assert_eq!(over_glyph, 0, "an ember lands on a probed glyph cell");
 }
 
-/// Fire drops its additive "mouth of fire" crown on a light theme, where it
-/// would lift trailing glyphs toward the white ground.
 #[test]
 fn fire_light_drops_the_additive_crown() {
     let g = geom();
@@ -1118,8 +1054,6 @@ fn fire_light_drops_the_additive_crown() {
     );
 }
 
-/// A line change snuffs the typed trail: type hot on one row (long chained spark
-/// lives), press Enter, and within a beat the old row emits nothing.
 #[test]
 fn fire_row_change_snuffs_the_old_lines_trail() {
     let g = geom();
@@ -1153,10 +1087,6 @@ fn fire_row_change_snuffs_the_old_lines_trail() {
     );
 }
 
-/// One composited light frame of a fire engine: the white page, the under-ink
-/// stream and the ink-fire `patches` (the engine's own, or a control's), the
-/// glyph ink of `ink` (cells and their colours), then the over-ink streams, in
-/// the renderer's painter order.
 fn fire_light_glass(
     glow: &CursorGlow,
     out: &[GlowQuad],
@@ -1192,17 +1122,12 @@ fn fire_light_glass(
     f
 }
 
-/// Whether a fire frame lays any additive light: an Add halo, an alpha-0
-/// (additive) quad in either quad stream, or an additive field patch.
 fn fire_frame_is_additive(glow: &CursorGlow, out: &[GlowQuad]) -> bool {
     glow.halos().iter().any(|h| h.mode == HaloMode::Add)
         || out.iter().chain(glow.under_quads()).any(|q| q.alpha == 0)
         || glow.patches().iter().any(|p| p.mode == FireMode::Add)
 }
 
-/// Fire on a light ground is ink, never light: a hot typed run and a jump emit
-/// no additive halo, quad or field (additive light only lifts the letters
-/// toward a white page), and still show fire.
 #[test]
 fn fire_on_a_light_ground_is_ink_never_light() {
     let g = tall_geom();
@@ -1556,7 +1481,6 @@ fn fire_on_a_light_ground_is_ink_never_light() {
     );
 }
 
-/// A premultiplied colour at opacity `a` back to its straight colour.
 fn unpremul(c: u32, a: u8) -> u32 {
     if a == 0 {
         return 0;
@@ -1565,13 +1489,8 @@ fn unpremul(c: u32, a: u8) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// The shipped default dark pair the over-ink budgets are solved on: the
-/// default dark theme's foreground on its background.
 const DARK_PAIR: (u32, u32) = (0x00D0_D0D0, 0x0011_1318);
 
-/// One composited dark frame of a fire engine's own light: the page, the
-/// under-ink stream and the flame field, the glyph ink of `ink` cells, then
-/// the over-ink quads `out` and the halos, in the renderer's painter order.
 fn fire_dark_glass(glow: &CursorGlow, out: &[GlowQuad], g: Geom, ink: &[(u16, u16)]) -> Glass {
     let mut f = Glass::new(g, DARK_PAIR.1);
     f.add_quads(glow.under_quads());
@@ -1586,16 +1505,11 @@ fn fire_dark_glass(glow: &CursorGlow, out: &[GlowQuad], g: Geom, ink: &[(u16, u1
     f
 }
 
-/// The host's frame step for a fire run: [`CursorFx`] with the typing-momentum
-/// glow switched as `momentum_glow`, a 13 × 26 cell, the caret's row probed
-/// every frame (the GUI captures no neighbour rows for fire).
 struct FireHost {
     fx: crate::cursor_fx::CursorFx,
     cfg: GlowConfig,
     momentum_glow: bool,
     text: Vec<char>,
-    /// The frame's cells the host hands over each frame (the caret's row
-    /// takes the typed glyphs); `None` hands none.
     rows: Option<Vec<Vec<aterm_core::terminal::RenderCell>>>,
 }
 
@@ -1604,7 +1518,6 @@ impl FireHost {
         Self::styled(GlowStyle::Fire, DARK_PAIR, momentum_glow, unbudgeted)
     }
 
-    /// The host for `style` on the page `pair` (`(text, page)`).
     fn styled(style: GlowStyle, pair: (u32, u32), momentum_glow: bool, unbudgeted: bool) -> Self {
         let dark = aterm_render::theme_is_dark(pair.1);
         let mut cfg = cfg(style, true);
@@ -1622,7 +1535,6 @@ impl FireHost {
         }
     }
 
-    /// One frame at `now` with the caret at `cur`; `key` types a glyph first.
     fn frame(&mut self, now: Instant, cur: (u16, u16), key: bool) {
         let g = tall_geom();
         self.fx.begin(true, true);
@@ -1672,18 +1584,6 @@ impl FireHost {
     }
 }
 
-/// THE TYPING GLOW KEEPS OFF THE PROMPT'S BAR AND THE LINE BELOW: on a dark
-/// page the momentum glow lights the caret's line and the page round it,
-/// never a band of warm fog over the inked rows next to it (round 1: over a
-/// powerline prompt's bar above the caret it lifted the end of `main +2` and
-/// laid a grey-beige haze over the bar; under it, over a selected line).
-/// Typed hot under a bar (a coloured segment of letters, then a grey bar to
-/// the edge) with a selection under the caret's line, the glow's own light
-/// (the host's frame less its twin's without the glow) over those rows is a
-/// small share of what it lays when the rows are air, while it still lights
-/// the caret's own row. NEGATIVE CONTROL: with the frame's cells withheld
-/// (rows nobody read are air to the glow, as it always drew them) the glow
-/// lays its whole light over the same rows.
 #[test]
 fn the_typing_glow_keeps_off_the_prompt_bar_and_the_line_below() {
     let g = tall_geom();
@@ -1712,9 +1612,6 @@ fn the_typing_glow_keeps_off_the_prompt_bar_and_the_line_below() {
         }
         rows
     };
-    // The glow's own light over rows `row - 1` and `row + 1` past the hold's
-    // feather off the caret row's edges ([`CursorGlow::NEIGHBOUR_HOLD_Y`]),
-    // and over the caret's row, summed (premultiplied channels × pixels).
     let (top, bot) = (
         i32::from(row) * g.ch as i32,
         i32::from(row + 1) * g.ch as i32,
@@ -1776,10 +1673,6 @@ fn the_typing_glow_keeps_off_the_prompt_bar_and_the_line_below() {
     );
 }
 
-/// The worst contrast the three newest letters keep over a hot run typed
-/// through the host's frame step at `gap_ms` a key (the gallery's 57 ms and
-/// a 40 ms burst), judged at every key from the tenth on and through 120 ms
-/// after the last, with the momentum glow on as shipped: `(own, combined)`.
 fn newest_letters_under_fire(gap_ms: u64, unbudgeted: bool) -> (f32, f32) {
     let g = tall_geom();
     let (row, start) = (3u16, 2u16);
@@ -1826,11 +1719,6 @@ fn newest_letters_under_fire(gap_ms: u64, unbudgeted: bool) -> (f32, f32) {
     (own, combined)
 }
 
-/// The head of a hot fire keeps the newest letters readable on a dark ground:
-/// the streak, the crown, the forge and the ember shower spend one over-ink
-/// account per text cell ([`InkLedger`]), so their sum over the letters just
-/// typed leaves them 4.5:1 or better, at the gallery's cadence and in a fast
-/// burst, driven through the host's own frame step with the momentum glow on.
 #[test]
 fn a_hot_fire_keeps_the_newest_letters_readable_on_dark() {
     for gap_ms in [57u64, 40] {
@@ -1852,10 +1740,6 @@ fn a_hot_fire_keeps_the_newest_letters_readable_on_dark() {
     }
 }
 
-/// A held Backspace through a hot fire on a dark ground keeps its steam off
-/// the line above: twelve deletes at 50 ms leave every pixel of the row above
-/// (which the host did not probe) under the clip, and its letters 3:1 or
-/// better through the run and the cloud's fade.
 #[test]
 fn a_backspace_run_keeps_its_steam_off_the_line_above() {
     let run = |unbudgeted: bool| {
@@ -1920,11 +1804,6 @@ fn a_backspace_run_keeps_its_steam_off_the_line_above() {
     );
 }
 
-/// Wide glyphs typed into fire on a dark ground: each CJK key's echo is a
-/// two-cell typed hop, and it heats the fire as a Latin key does (the forward
-/// momentum law counts the typed echo run, not only a one-cell step), flies
-/// no meteor, lights both cells of every glyph, and the newest glyph keeps
-/// 4.5:1 under the over-ink account.
 #[test]
 fn fire_typed_in_wide_glyphs_heats_and_keeps_them_readable() {
     let g = tall_geom();
@@ -1988,11 +1867,6 @@ fn fire_typed_in_wide_glyphs_heats_and_keeps_them_readable() {
     }
 }
 
-/// Reduce Motion leaves fire nothing to draw, so the GPU heat shimmer (which
-/// runs only while a frame carries a fire field and glow quads,
-/// `GpuRenderer::shimmer_live`) cannot arm: the motion policy hands the
-/// cursor family a zero amplitude, and at zero intensity a hot fire emits no
-/// field, no quads and no halos.
 #[test]
 fn reduced_motion_leaves_fire_no_field_for_the_heat_shimmer() {
     let g = geom();
@@ -2021,9 +1895,6 @@ fn reduced_motion_leaves_fire_no_field_for_the_heat_shimmer() {
     assert!(glow.halos().is_empty(), "no halos under reduced motion");
 }
 
-/// A dark burst of fire on the tall cell: `keys` keys `gap_ms` apart along
-/// row 4 from column 2, the host handing each frame's cells (`above` fills
-/// the row over the typed line, `None` leaves it blank); returns the engine.
 fn dark_fire_burst(
     keys: u16,
     gap_ms: u64,
@@ -2033,9 +1904,6 @@ fn dark_fire_burst(
     dark_fire_burst_with(keys, gap_ms, above, frame_text, None, &|_| {}).0
 }
 
-/// [`dark_fire_burst`] with the burning row's frame cells coloured by
-/// `on_row` (its glyphs stay the typed ones) and `setup` run on the fresh
-/// engine first; returns the engine and its last frame's over-ink quads.
 fn dark_fire_burst_with(
     keys: u16,
     gap_ms: u64,
@@ -2088,12 +1956,6 @@ fn dark_fire_burst_with(
     (glow, out)
 }
 
-/// On a dark ground the fire rises in tongues, never as a one-cell slab:
-/// over a hot typed run the flame's height climbs and falls off along the
-/// line a little at a time from column to column (no square side on a cell
-/// edge, where the newest cell's flame once stood alone as a dim maroon
-/// column); over the blank row above it burns brighter than the translucent
-/// tint it keeps over a line of text; and it dies toward its tips.
 #[test]
 fn the_dark_fire_rises_in_tongues_not_a_slab() {
     let g = tall_geom();
@@ -2201,13 +2063,6 @@ fn the_dark_fire_rises_in_tongues_not_a_slab() {
     );
 }
 
-/// The contrast halo (the dark ring stamped around a letter the blaze
-/// engulfs) goes only around letters lighter than their ground: in a hot
-/// run's own row (kept there under the line of text above), a powerline
-/// cell of dark ink on a yellow ground gets no ring (it only smeared the
-/// stroke), a light letter on the page beside it does.
-/// Negative control: with no frame cells handed over (the colours unknown)
-/// the yellow cells are ringed as before.
 #[test]
 fn the_fire_halo_spares_a_dark_letter_on_a_bright_ground() {
     let row = 4u16;
@@ -2240,8 +2095,6 @@ fn the_fire_halo_spares_a_dark_letter_on_a_bright_ground() {
         bg: [0x11, 0x13, 0x18],
         ..Default::default()
     };
-    // A long hot run, so the blaze engulfs its row on both sides of the
-    // split.
     let (glow, _) = dark_fire_burst_with(22, 35, Some(&text_above), true, Some(&mixed), &|_| {});
     assert!(
         ringed(&glow, false),
@@ -2258,13 +2111,6 @@ fn the_fire_halo_spares_a_dark_letter_on_a_bright_ground() {
     );
 }
 
-/// OVER A BLANK ROW A COOL FIRE STILL RAISES A TONGUE OVER EACH OF THE LAST
-/// LETTERS: ten keys at the gallery's cadence (the fire barely warm) light
-/// the blank row above each of the four newest letters, the newest the
-/// tallest, with a core that reaches orange or yellow rather than a deep red
-/// ember, and a flame stands on the typed row with no unlit line between
-/// the two (the flame roots on the burning row's top edge and its foot fades
-/// in from nothing there; a lit slab under a dim foot leaves a dark seam).
 #[test]
 fn a_cool_fire_raises_a_tongue_over_each_of_the_last_letters() {
     let g = tall_geom();
@@ -2384,15 +2230,6 @@ fn a_cool_fire_raises_a_tongue_over_each_of_the_last_letters() {
     );
 }
 
-/// THE DARK FIRE BURNS ABOVE THE LETTERS, NOT THROUGH THEM: typed under a
-/// blank row, every flame patch lies in the air over the burning row (rooted
-/// on its top edge, no dim slab over the letters' ascenders), and the
-/// fire's streak lays no light over the typed letters (it read as a warm
-/// smear through their x-height). Under a line of text the flame keeps to
-/// its own row instead
-/// (`under_a_line_of_text_the_dark_fire_burns_in_its_own_row`). Negative
-/// control: the streak with its over-ink budget off still lights the
-/// letters.
 #[test]
 fn the_dark_fire_burns_above_the_letters_not_through_them() {
     let g = tall_geom();
@@ -2406,8 +2243,6 @@ fn the_dark_fire_burns_above_the_letters_not_through_them() {
         .filter(|p| i32::from(p.y) + i32::from(p.h) > row_top)
         .count();
     assert_eq!(below, 0, "{below} flame patches lie in the burning row");
-    // The streak: the additive light over the typed letters (short of the
-    // caret's cell) in the last frame of a hot burst.
     let streak_over_letters = |unbudgeted: bool| -> u64 {
         let mut c = cfg(GlowStyle::Fire, true);
         c.intensity = 1.0;
@@ -2459,11 +2294,6 @@ fn the_dark_fire_burns_above_the_letters_not_through_them() {
     );
 }
 
-/// The fire's own light (its patches and the cores in the under-ink stream)
-/// over a black page in pixel rows `ys`, classed by hue as the judges' census
-/// classes it (a pixel of saturation 0.3 and value 0.25 or more): `(orange,
-/// yellow, green or blue)` pixels (18–45°, 45–75°, 75° and up), and the light
-/// summed along each pixel row.
 fn fire_hues(
     glow: &CursorGlow,
     g: Geom,
@@ -2495,17 +2325,6 @@ fn fire_hues(
     (orange, yellow, green, by_y)
 }
 
-/// UNDER A LINE OF TEXT THE DARK FIRE BURNS IN ITS OWN ROW: typed under a
-/// line of text, every flame patch lies in the burning row (rooted under the
-/// letters' baseline, dying before the line above), so that line keeps its
-/// contrast; the tongues burn orange from a cold start, and at a blaze their
-/// cores burn yellow (hue 45° or more, as the judges' census reads yellow)
-/// in the band under the letters' baseline, never green, and fall off
-/// smoothly toward the row's top (no lid); and every letter they
-/// burn under, the newest among them, keeps 4.5:1 or better in the composed
-/// frame. Negative controls: the flame let rise into the line above as it
-/// once did lays patches there; and with no letter held to the row bar the
-/// flame under the typed letters washes one below 4.5:1.
 #[test]
 fn under_a_line_of_text_the_dark_fire_burns_in_its_own_row() {
     let g = tall_geom();
@@ -2551,8 +2370,6 @@ fn under_a_line_of_text_the_dark_fire_burns_in_its_own_row() {
         field_yellow, 0,
         "control: the field alone burns {field_yellow} yellow px"
     );
-    // A smooth falloff: the top quarter of the row carries a small share of
-    // the light of its middle half.
     let q = (ch / 4) as usize;
     let (top, middle) = (
         by_y[..q].iter().sum::<u32>() as f32 / q as f32,
@@ -2562,8 +2379,6 @@ fn under_a_line_of_text_the_dark_fire_burns_in_its_own_row() {
         top < 0.35 * middle,
         "the flame stands to the row's top: {top:.0} against {middle:.0} a pixel row"
     );
-    // Every letter, the typed ones and the line above's, in the composed
-    // frame, of a run `n` keys long.
     let worst = |glow: &CursorGlow, out: &[GlowQuad], n: u16| {
         let mut ink: Vec<(u16, u16)> = (start..start + n).map(|c| (row, c)).collect();
         ink.extend((0..g.cols as u16).map(|c| (row - 1, c)));
@@ -2606,15 +2421,6 @@ fn under_a_line_of_text_the_dark_fire_burns_in_its_own_row() {
     );
 }
 
-/// THE DARK FIRE HOLDS ONLY THE TONGUES UNDER INK, AND RISES IN THE AIR
-/// WITH YELLOW CORES: with a lone `40` at the far left of the row above
-/// (round 1 held the whole row's flame in it, and the band of flames over
-/// `fox` was gone), the tongues under the clear cells rise into the row
-/// above while none stands over the `40`; and over the blank row a blaze's
-/// tongues burn with cores the judges' census reads yellow (hue 45° or
-/// more), never green. Negative controls: with letters all along the row
-/// above no tongue rises into it; and the field alone (no cores) burns no
-/// yellow.
 #[test]
 fn the_dark_fire_holds_only_the_tongues_under_ink() {
     let g = tall_geom();
@@ -2678,9 +2484,6 @@ fn the_dark_fire_holds_only_the_tongues_under_ink() {
     );
 }
 
-/// THE FIRE'S SMOKE KEEPS OFF A LINE OF TEXT: a puff whose centre lies over
-/// a line the frame shows (a prompt bar, a status line over the burning
-/// row) is not drawn, and the same puff over a blank row is.
 #[test]
 fn the_fire_smoke_keeps_off_a_line_of_text() {
     let g = tall_geom();
@@ -2725,12 +2528,6 @@ fn the_fire_smoke_keeps_off_a_line_of_text() {
     );
 }
 
-/// ON PAPER THE FIRE STANDS UP OUT OF THE LINE: typed under a blank row on
-/// GitHub Light, the ink-fire's tongues rise from the letters' x-height
-/// well into the row above (paint of a visible opacity reaches more than
-/// half a row over the burning row's top), and an ember is a round bead of
-/// ember ink, its middle row wider than its top and bottom and its rim the
-/// deep red of a smoulder.
 #[test]
 fn the_light_fire_stands_up_out_of_the_line_and_its_embers_are_beads() {
     let g = tall_geom();
@@ -2832,9 +2629,6 @@ fn the_light_fire_stands_up_out_of_the_line_and_its_embers_are_beads() {
     );
 }
 
-/// AN ENTER AT THE BOTTOM LAYS NO SPARK ON THE LINES IT PRINTED: a hot run
-/// typed on the pane's last row, then Enter: the pane scrolls the command up
-/// two rows under its output and the caret leaps home.
 #[test]
 fn an_enter_at_the_bottom_lays_no_spark_on_the_lines_it_printed() {
     use aterm_core::terminal::RenderCell;
@@ -2964,10 +2758,6 @@ fn an_enter_at_the_bottom_lays_no_spark_on_the_lines_it_printed() {
     );
 }
 
-/// THE DARK TONGUES STAND ON CURLED FEET, NOT ONE FLAT BASE: over a blank
-/// row the lowest lit pixel of the flame rises and falls along the burning
-/// run (each tongue's foot curls up at its sides), so the flames never read
-/// as bars on a common baseline.
 #[test]
 fn the_dark_tongues_stand_on_curled_feet() {
     let g = tall_geom();
@@ -3027,10 +2817,6 @@ fn the_dark_tongues_stand_on_curled_feet() {
     );
 }
 
-/// A LIGHT TONGUE NEVER CLIMBS INTO ANOTHER LINE'S LETTERS: typed under a
-/// line of text, the light fire's tongues stand only as tall as reaches that
-/// line's foot (shorter, but there): no paint lands in its letters' cells,
-/// while the burning row keeps its tongues.
 #[test]
 fn a_light_tongue_never_climbs_into_the_line_above() {
     let g = tall_geom();
@@ -3108,9 +2894,6 @@ fn a_light_tongue_never_climbs_into_the_line_above() {
     );
 }
 
-/// How many pixels of `glass` in window rows `ys` read olive: a dim yellow
-/// over the dark (hue 45°-70°, value 0.15-0.55, saturation over 0.35), the
-/// judges' census (round 2: `(95,91,42)` at the dark tongues' roots).
 fn olive_px(glass: &Glass, g: Geom, ys: std::ops::Range<i32>) -> usize {
     let mut n = 0;
     for y in ys {
@@ -3124,15 +2907,6 @@ fn olive_px(glass: &Glass, g: Geom, ys: std::ops::Range<i32>) -> usize {
     n
 }
 
-/// THE DARK FIRE IS NEVER OLIVE (round-2 judges, item 2: the tongues over a
-/// blank row rooted in olive, `(95,91,42)`, and the cores of a kept flame
-/// thinned to khaki). Over a blank row and kept under a line of text, cool
-/// and in a blaze, no pixel of the composed frame round the burning row
-/// reads olive: where a core's light thins (its foot, its sides, a thin
-/// core) it burns amber or orange, and a tongue over a blank row fades in
-/// no longer than the field's own cooled root. Negative control: the cores
-/// burnt in their height's colour alone ([`CursorGlow::fire_core_uncooled`])
-/// lay olive the census reads.
 #[test]
 fn the_dark_fire_is_never_olive() {
     let g = tall_geom();
@@ -3174,17 +2948,6 @@ fn the_dark_fire_is_never_olive() {
     );
 }
 
-/// THE KEPT FLAME BURNS ITS BODY OVER THE LETTERS (round-2 judges, items 1
-/// and 7: under a line of text the dark flame was a hot line at the baseline
-/// under dim brown tongues, a stubby flat-topped strip). Kept in its row under
-/// a line of text, cool and in a blaze, over the newest four letters: the
-/// flame's silhouette fades to the row's top with no one-pixel step down any
-/// letter-free column over 35% of that column's brightest; it lays at least
-/// two thirds as much light in their counters as in the band under the
-/// baseline; and every letter it burns under keeps 6.2:1 (the row's bar) in
-/// the composed frame. Negative control: burnt as round 2 burnt it
-/// ([`CursorGlow::fire_kept_strip`]) the strip's flat top steps down at
-/// least 60% of its brightest in one pixel.
 #[test]
 fn the_kept_flame_burns_its_body_over_the_letters() {
     let g = tall_geom();
@@ -3204,8 +2967,6 @@ fn the_kept_flame_burns_its_body_over_the_letters() {
     };
     let (top, ch) = (i32::from(row) * g.ch as i32, g.ch as i32);
     for (what, keys, gap) in [("cool", 10u16, 60u64), ("blaze", 30, 57)] {
-        // `(hardest step, counter light, under-baseline light, worst
-        // contrast)` over the newest four letters.
         let run = |strip: bool| -> (f32, f32, f32, f32) {
             let (glow, out) =
                 dark_fire_burst_with(keys, gap, Some(&text_above), true, None, &|glow| {
@@ -3234,7 +2995,6 @@ fn the_kept_flame_burns_its_body_over_the_letters() {
                         nl += 1.0;
                     }
                 }
-                // The columns no stroke of the glyph crosses.
                 for dx in [0, 1, 4, 5, 8, 9, 12] {
                     let col_lift: Vec<f32> = (top..top + ch * 3 / 4)
                         .map(|y| lift(glass.at(y, x0 + dx)))
@@ -3271,18 +3031,6 @@ fn the_kept_flame_burns_its_body_over_the_letters() {
     }
 }
 
-/// A FIRE METEOR STREAKS WITHOUT A TICK AT ITS JOINS (round-2 judges, item 7:
-/// fire dark's Return leap stood a hard vertical tick in its root, where the
-/// white head's wedge began). Over its flight a dark Return meteor's
-/// brightest light per pixel column rises to its head and falls away from it
-/// with no other column standing over both its neighbours by more than a
-/// twentieth of the streak's peak, and no column-to-column step over half
-/// of it (the head eases in from the orange behind it over most of a cell
-/// and feathers into the landing over half of one). Negative control: its
-/// pieces drawn each from its own colour and width to their joins unsnapped
-/// and its head whole to the landing ([`CursorGlow::fire_meteor_joined`])
-/// add twice in the column they share and stand cut at the landing: a tick
-/// of at least a fifth of the peak and a step of at least four fifths.
 #[test]
 fn a_fire_meteor_streaks_without_a_tick_at_its_joins() {
     let g = tall_geom();
@@ -3290,7 +3038,6 @@ fn a_fire_meteor_streaks_without_a_tick_at_its_joins() {
     c.intensity = 1.0;
     (c.theme_fg, c.theme_bg) = DARK_PAIR;
     let floor = rel_luminance(DARK_PAIR.1);
-    // `(tick, step)` over the flight.
     let run = |joined: bool| -> (f32, f32) {
         let mut glow = CursorGlow {
             fire_meteor_joined: joined,
@@ -3304,7 +3051,6 @@ fn a_fire_meteor_streaks_without_a_tick_at_its_joins() {
         assert_eq!(glow.fire_meteors.len(), 1, "the Return flies one meteor");
         let life = glow.fire_meteors[0].life;
         let (mut tick, mut step) = (0.0f32, 0.0f32);
-        // In flight, before the strike erupts at the landing.
         for k in 1..=5 {
             out.clear();
             let now = t0 + Duration::from_secs_f32(life * k as f32 / 10.0);
@@ -3349,9 +3095,6 @@ fn a_fire_meteor_streaks_without_a_tick_at_its_joins() {
     );
 }
 
-/// The page's cells for a dark typing-halo run on row 4 of [`tall_geom`]:
-/// all air, or (`inked`) a prompt's bar on the row above (a yellow segment
-/// of letters, then a grey bar) and a selected line of letters below.
 fn halo_rows(inked: bool) -> Vec<Vec<aterm_core::terminal::RenderCell>> {
     let g = tall_geom();
     let row = 4usize;
@@ -3377,9 +3120,6 @@ fn halo_rows(inked: bool) -> Vec<Vec<aterm_core::terminal::RenderCell>> {
     rows
 }
 
-/// The momentum glow's own quads (the host's frame past its twin's without
-/// that glow) after 24 keys at 57 ms on `row` of [`tall_geom`] from column
-/// 2, over `rows`, the host set up by `setup` first.
 fn fire_typing_halo(
     row: u16,
     rows: Vec<Vec<aterm_core::terminal::RenderCell>>,
@@ -3407,13 +3147,6 @@ fn fire_typing_halo(
     host.fx.glow_scratch[n..].to_vec()
 }
 
-/// THE FIRE'S TYPING HALO IS THE FORGE'S WARM LIGHT (round-2 judges, item 6:
-/// fire dark's caret halo read as a grey box). Typed hot on a dark page, the
-/// momentum glow's additive light round a fire caret carries at least 40% of
-/// its brightest channel as colour (warm: red over blue), and no channel of
-/// it is brighter than the ramp laid it. Negative control: left as the
-/// momentum ramp lays it ([`crate::cursor_fx::CursorFx::momentum_unwarmed`])
-/// its white-hot grey carries under a quarter.
 #[test]
 fn the_fire_typing_halo_is_the_forges_warm_light() {
     let chroma = |quads: &[GlowQuad]| -> (f32, f32, u64) {
@@ -3450,16 +3183,6 @@ fn the_fire_typing_halo_is_the_forges_warm_light() {
     );
 }
 
-/// THE TYPING HALO EASES OFF A NEIGHBOUR ROW WITH NO EDGE (round-2 judges,
-/// item 6: fire dark's caret halo stood a box with hard horizontal edges at
-/// the caret row's edges, where the hold off the prompt's bar and the
-/// selected line began). Typed hot between a bar and a selection, the
-/// momentum glow's light, composed on the page and averaged across the
-/// columns round the caret, falls across each edge of the caret's row with
-/// no one-pixel step over three tenths of its level in the row (the halo's
-/// bands are two pixels tall, so an even fall over a dozen pixels steps a
-/// little under a quarter). Negative control: held off from the edge itself
-/// ([`CursorGlow::neighbour_hold_hard`]) it steps half its level there.
 #[test]
 fn the_typing_halo_eases_off_a_neighbour_row_with_no_edge() {
     let g = tall_geom();
@@ -3505,13 +3228,6 @@ fn the_typing_halo_eases_off_a_neighbour_row_with_no_edge() {
     );
 }
 
-/// THE FIRE'S TYPING HALO MELTS INTO THE GRID'S BOTTOM (round-2 judges, item
-/// 6: fire dark's caret halo stood cut along the grid's bottom). Typed hot
-/// on the last row of a dark page, the momentum glow lays in the effects
-/// box's last pixel row at most a fifth of what the same run on a row mid
-/// grid lays at the same offset under its caret's row top. Negative control:
-/// mid grid that offset is lit, so a straight cut at the box's edge would
-/// have stood there.
 #[test]
 fn the_fire_typing_halo_melts_into_the_grid_bottom() {
     let g = tall_geom();
@@ -3542,13 +3258,6 @@ fn the_fire_typing_halo_melts_into_the_grid_bottom() {
     );
 }
 
-/// SPARKLE'S TYPING HALO ON PAPER IS ITS GOLD (round-2 judges, item 9: the
-/// glow round sparkle's caret on paper read caramel). Typed hot on white,
-/// the momentum glow's ink round a sparkle caret (automatic colour) stands
-/// within 2.5° of hue of the paper gold sparkle's body lays (its mean hue,
-/// weighted by opacity and area). Negative control: worn in the caret's own
-/// colour ([`crate::cursor_fx::CursorFx::momentum_unwarmed`]) its ink stands
-/// at least 5° toward orange of that gold, the caramel the judges saw.
 #[test]
 fn sparkle_typing_halo_on_paper_is_its_gold() {
     const PAPER: (u32, u32) = (0x001F_2328, 0x00FF_FFFF);
@@ -3569,8 +3278,6 @@ fn sparkle_typing_halo_on_paper_is_its_gold() {
             host.frame(t, (row, start + k), true);
             twin.frame(t, (row, start + k), true);
         }
-        // The halo's ink, wherever it was laid: the host's streams past its
-        // twin's, weighted by opacity × area.
         let mut quads: Vec<GlowQuad> = host.fx.glow_scratch[twin.fx.glow_scratch.len()..].to_vec();
         let under = host.fx.glow.under_quads();
         quads.extend_from_slice(&under[twin.fx.glow.under_quads().len().min(under.len())..]);
@@ -3597,14 +3304,6 @@ fn sparkle_typing_halo_on_paper_is_its_gold() {
     );
 }
 
-/// THE KEPT FLAME HOLDS EACH HEIGHT AT ITS OWN HEAT (round-2 judges, item 1:
-/// the kept flame's tongues were a dim brown over the letters). Kept in its
-/// row under a line of text, a cool run's flame is held over each letter at
-/// the light its field lays at each height, not at its hottest anywhere: in
-/// the composed frame it lays at least a tenth more light in the counters of
-/// the letters it burns under than the same flame held at its hottest, and
-/// every letter keeps the row's bar. Negative control: held at its hottest
-/// ([`CursorGlow::fire_held_hottest`]) it is the dimmer of the two.
 #[test]
 fn the_kept_flame_holds_each_height_at_its_own_heat() {
     let g = tall_geom();
@@ -3656,15 +3355,6 @@ fn the_kept_flame_holds_each_height_at_its_own_heat() {
     );
 }
 
-/// THE KEPT FLAME'S CORES BURN GOLD (round-2 judges, item 1: a dark flame
-/// kept in its row under a line of text wants yellow cores in its words'
-/// gaps and under its baseline; round 3's first capture burnt them amber,
-/// not a gold pixel among them). Typed as `echo the quick brown fox` under a
-/// line of text, quick and slower, the newest six cells show gold (hue
-/// 38°-58°, value 0.6 or more) in the word's gap and under the letters'
-/// baseline, and nothing round the row reads olive. Negative control: each
-/// core burnt as round 3's first capture burnt it
-/// ([`CursorGlow::fire_kept_core_from_base`]) lays no gold in the gap.
 #[test]
 fn the_kept_flames_cores_burn_gold_in_the_gaps_and_under_the_line() {
     for gap_ms in [57u64, 90] {
@@ -3686,11 +3376,6 @@ fn the_kept_flames_cores_burn_gold_in_the_gaps_and_under_the_line() {
     }
 }
 
-/// A dark fire kept in its row under a line of text (a row of `m` above),
-/// typed as `echo the quick brown fox` `gap_ms` apart: the gold pixels
-/// (hue 38°-58°, saturation over 0.4, value 0.6 or more) its last six cells
-/// show under their letters' baseline (`.0`) and in their blank cells
-/// (`.1`), and the olive ones round the row.
 fn kept_phrase_gold(gap_ms: u64, from_base: bool) -> ((usize, usize), usize) {
     let g = tall_geom();
     let (row, start) = (4u16, 2u16);

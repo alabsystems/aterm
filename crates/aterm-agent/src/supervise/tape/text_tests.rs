@@ -31,10 +31,6 @@ fn bytes_of(rng: &mut XorShift, max: usize) -> Vec<u8> {
     }
 }
 
-/// A screen read's reply text, as `text --json` writes one or nearly: its
-/// rows any text (escaped as JSON), its final newline or not — and, one in
-/// three, broken the ways the row cutter must decline or survive: cut short
-/// anywhere, a space or a raw newline between rows, a row that is no string.
 fn screen_of(rng: &mut XorShift) -> String {
     let rows: Vec<String> = (0..rng.index(6))
         .map(|_| crate::supervise::journal::json_str(&text_of(rng, 16)))
@@ -152,8 +148,6 @@ fn item_of(rng: &mut XorShift) -> Item {
     Item::Effect { record, stamp }
 }
 
-/// Generated tapes, many seeds over, read back from their text exactly —
-/// with and without a header — and every kind of item was generated.
 #[test]
 fn every_item_reads_back_from_its_text() {
     let mut kinds = std::collections::BTreeSet::new();
@@ -177,9 +171,6 @@ fn every_item_reads_back_from_its_text() {
     assert_eq!(kinds.len(), 10, "every kind generated: {kinds:?}");
 }
 
-/// A control round trip reads as its words and reply; its stdout's final
-/// newline is its last, empty line; and the same bytes padded out (a varint
-/// in another spelling) are written raw and read back as they were.
 #[test]
 fn a_control_round_trip_is_words_and_a_reply_unless_its_bytes_say_otherwise() {
     let reply = Ok(CtlReply {
@@ -217,9 +208,6 @@ fn a_control_round_trip_is_words_and_a_reply_unless_its_bytes_say_otherwise() {
     assert_eq!(parse(&text).expect("reads").1, vec![raw]);
 }
 
-/// Text this build did not write is refused, by line: another first line, an
-/// unknown item, a body missing, a broken escape, a control reply that is
-/// not one.
 #[test]
 fn text_it_did_not_write_is_refused_by_line() {
     for (text, says) in [
@@ -249,11 +237,6 @@ fn text_it_did_not_write_is_refused_by_line() {
     );
 }
 
-/// A SCREEN IS WRITTEN A ROW TO A LINE (the plan's §6.6): each row of a
-/// `text --json` reply on a line of its own behind `=`, read back to the
-/// very same bytes — and two tapes whose screens differ in one row differ
-/// in one line of their text, so a corpus diff reads as the row that
-/// changed.
 #[test]
 fn a_screen_is_written_a_row_to_a_line_and_diffs_as_the_row_that_changed() {
     let screen = |last: &str| {
@@ -317,8 +300,6 @@ fn a_screen_is_written_a_row_to_a_line_and_diffs_as_the_row_that_changed() {
     }
 }
 
-/// Human-readable tape text keeps ordinary Unicode readable while active
-/// display characters remain inert and every original byte reads back.
 #[test]
 fn tape_text_is_inert_and_round_trips_active_unicode() {
     let round_trip = |value: &str| {
@@ -370,9 +351,6 @@ fn tape_text_is_inert_and_round_trips_active_unicode() {
     );
 }
 
-/// agh's tapes are a subset of atape-text 1 (design §21.3 of docs/DESIGN-agh-2026-10-19.md):
-/// a fixture agh recorded from GitHub reads here as effects alone, with no stamp, and renders
-/// back to the very same text. aterm-agent never links agh; it reads agh's file.
 #[test]
 fn agh_fixture_tape_is_atape_text() {
     let text = include_str!("../../../../agh/tests/tapes/repo-view.atape");

@@ -1147,6 +1147,7 @@ fn panel_title(row: &str) -> Option<(String, &str)> {
     for (title, key) in PANEL_TITLES {
         if let Some(rest) = t.strip_prefix(title) {
             // `Current week (all models)` must not also match a longer
+            // display name, so the remainder may not open another word.
             if rest.starts_with(|c: char| c.is_alphanumeric()) {
                 continue;
             }

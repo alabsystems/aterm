@@ -9,7 +9,6 @@ const P3: u64 = 0x1656_67B1_9E37_79F9;
 const P4: u64 = 0x85EB_CA77_C2B2_AE63;
 const P5: u64 = 0x27D4_EB2F_1656_67C5;
 
-/// Bytes per stripe: four 8-byte lanes, one per accumulator.
 const STRIPE: usize = 32;
 
 /// XXH64 of `bytes` under `seed` in one call.
@@ -27,10 +26,8 @@ pub fn xxh64(seed: u64, bytes: &[u8]) -> u64 {
 pub struct Xxh64 {
     seed: u64,
     acc: [u64; 4],
-    /// The start of a stripe not yet consumed; `buf[..buffered]` is live.
     buf: [u8; STRIPE],
     buffered: usize,
-    /// Every byte fed, modulo 2^64 (the reference's `total_len`).
     total: u64,
 }
 
@@ -144,8 +141,6 @@ const fn merge(acc: u64, v: u64) -> u64 {
 mod tests {
     use super::{STRIPE, Xxh64, xxh64};
 
-    /// xxhsum's sanity buffer: byte i is the top byte of the generator after
-    /// i steps (start 2654435761, multiply by 11400714785074694797 mod 2^64).
     fn sanity(len: usize) -> Vec<u8> {
         let mut g: u64 = 2_654_435_761;
         (0..len)
@@ -157,8 +152,6 @@ mod tests {
             .collect()
     }
 
-    /// Every way of cutting the input into two or three pieces lands on the
-    /// one-shot answer, across the stripe boundary.
     #[test]
     fn split_feeding_matches_one_shot() {
         let buf = sanity(3 * STRIPE + 5);
@@ -179,7 +172,6 @@ mod tests {
         assert_eq!(bytewise.digest(), want);
     }
 
-    /// `digest` reads the state without consuming it.
     #[test]
     fn digest_then_continue() {
         let buf = sanity(100);

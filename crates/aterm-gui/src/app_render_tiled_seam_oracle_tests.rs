@@ -12,12 +12,6 @@ use super::{
 };
 use crate::{App, WindowId, pane, term_lock};
 
-/// Every per-row channel of a composed frame the retention lane can skip
-/// rebuilding: clusters, combining marks, inline-image placements, DEC line
-/// size and both span lanes, besides the cells. The fill rebuilds all seven
-/// on a rebuilt row and touches none on a retained one, so the differential
-/// compares all seven. Images are recorded by column: `ImageRef` is
-/// `Arc`-backed and the two arms never share one.
 #[derive(Clone, PartialEq, Debug)]
 struct Composed {
     cells: Vec<Vec<RenderCell>>,
@@ -48,13 +42,8 @@ impl Composed {
 }
 
 const FRAME: Duration = Duration::from_millis(16);
-/// The four glyphs the active-pane mark can put in a divider gap; no
-/// terminal in this corpus ever prints one.
 const MARK_GLYPHS: [char; 4] = ['\u{2581}', '\u{2594}', '\u{2590}', '\u{258c}'];
 
-/// The stamp the coverage oracle floods the composed scratch with between
-/// frames. Nothing in the corpus prints a snowman and no theme resolves
-/// `[1, 2, 3]` on `[4, 5, 6]`, so a surviving one is unambiguous.
 fn poison_cell() -> RenderCell {
     RenderCell {
         ch: '\u{2603}',
@@ -64,7 +53,6 @@ fn poison_cell() -> RenderCell {
     }
 }
 
-/// What the corpus armed, counted while it ran.
 #[derive(Default)]
 struct Armed {
     frames: usize,
@@ -81,21 +69,14 @@ struct Armed {
     preedit_frames: usize,
     prediction_frames: usize,
     close_frames: usize,
-    /// Composed rows this corpus retained and rebuilt, the frames with at least one retained
-    /// row, and the soundness witness.
     retained_rows: u64,
     rebuilt_rows: u64,
     retain_frames: usize,
     unsound: u64,
-    /// `(step label, rows retained, rows composed)` per frame — the reach
-    /// witness a failing census prints, so "the lane did not arm" names the
-    /// step it did not arm on.
     retain_log: Vec<(String, u64, usize)>,
 }
 
 impl Armed {
-    /// Every clause names a producer that can put a cell into a split
-    /// composite; a zero means the oracles never saw it on.
     fn assert_non_vacuous(&self) {
         assert!(
             self.frames >= 27,
@@ -160,9 +141,6 @@ impl Armed {
         );
     }
 
-    /// Which per-row verdict the retention lane reached: the rebuild-every-row form
-    /// satisfies the differential oracle for free, so a run in which retention never
-    /// armed proves nothing.
     fn assert_retention(&self, on: bool) {
         assert_eq!(
             self.unsound, 0,
@@ -209,8 +187,6 @@ impl Armed {
         }
     }
 
-    /// Which seam pass the corpus exercised: the whole-grid fill satisfies the oracles
-    /// for free, so a run that never tiled proves nothing.
     fn assert_seam_pass(&self, tiled: bool) {
         let (t, w) = (self.tiled_seam_passes, self.whole_grid_seam_passes);
         if tiled {
@@ -233,8 +209,6 @@ impl Armed {
     }
 }
 
-/// The corpus driver: a real headless `App` composing through the shipping
-/// `redraw_compose`, one recorded frame per step.
 struct Corpus {
     app: App,
     wid: WindowId,
@@ -253,8 +227,6 @@ impl Corpus {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.windows.get_mut(&wid).expect("test window").focused = true;
-        // The prediction ghosts are one of the producers under test and
-        // they are off by default policy, not by construction.
         app.config.predictive_echo = Some("always".to_string());
         app.predict_mode_cache = None;
         Self {
@@ -339,19 +311,11 @@ impl Corpus {
         self.armed.close_frames += 1;
     }
 
-    /// One recorded corpus frame, driving output into the focused pane.
     fn step(&mut self, label: &str) {
         let focus = self.focus();
         self.step_feeding(focus, label);
     }
 
-    /// One recorded corpus frame. Every step first feeds some visible pane a byte, so
-    /// the `RepaintKey` always moves: a frame that took the early-out would compose
-    /// nothing, and the coverage oracle would read its poison as a tiling failure.
-    ///
-    /// The pane is a parameter because the prediction ghosts are guessed at the
-    /// focused pane's caret and dropped the moment the engine echoes there, so those
-    /// steps feed a background pane.
     fn step_feeding(&mut self, session: u64, label: &str) {
         self.feed(session, b"x");
         let (rows, cols) = self.dims();
@@ -377,11 +341,6 @@ impl Corpus {
         );
 
         let seam = divider_cell(self.app.theme);
-        // The Fluent split (Windows) draws its seam as hairline glyphs in the
-        // gap (`crate::pane_chrome::stamp_seam_lines`) and its ring as overlay
-        // pixels beside them (`crate::pane_chrome::push_focus_ring`), whose
-        // pixel columns stand for the mark's here; the Classic one as the slab
-        // and the half-block mark.
         let fluent = crate::pane_chrome::split_chrome() == crate::pane_chrome::SplitChrome::Fluent;
         let inks = crate::pane_chrome::SeamInks::derive(
             self.app
@@ -474,12 +433,10 @@ impl Corpus {
     }
 }
 
-/// The corpus: one script, run by both oracles.
 fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     let mut c = Corpus::new(poison, retain);
     let wid = c.wid;
 
-    // 1. Two panes side by side, both carrying text.
     let right = c.app.split_active_stub_tab(wid);
     let left = *c
         .sessions()
@@ -491,14 +448,12 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     c.step("two panes established");
     c.step("two panes, echo");
 
-    // 2. The focus change moves the mark across the shared divider column.
     c.set_focus(left);
     c.step("focus moved to the left pane");
     c.set_focus(right);
     c.step("focus moved back to the right pane");
     c.step("two panes settled after the focus move");
 
-    // 3. Three panes, then four: a layout change under the composite.
     let third = c
         .app
         .split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
@@ -511,15 +466,12 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     c.step("four panes");
     c.step("four panes settled");
 
-    // 4. The divider drag, as a geometry change: the window grid and every
-    //    pane rectangle move.
     c.resize(31, 97);
     c.step("window grid shrunk under four panes");
     c.resize(44, 123);
     c.step("window grid grown under four panes");
     c.step("settled at the grown grid");
 
-    // 5. The alternate screen in one pane, beside three ordinary ones.
     c.feed(left, b"\x1b[?1049h\x1b[Halt screen here\r\n");
     {
         let term = c.app.pool.get(left).expect("left session").term.clone();
@@ -532,8 +484,6 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     c.step("one pane on the alternate screen");
     c.step("settled with one pane on the alternate screen");
 
-    // 6. A scrolled-back background pane beside a live one (the focused pane
-    //    stays at the live bottom so the composition and ghosts below paint).
     for i in 0..60 {
         c.feed(third, format!("history line {i:03}\r\n").as_bytes());
     }
@@ -549,10 +499,6 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     c.step("a scrolled-back pane beside live ones");
     c.step("settled with a scrolled-back pane beside live ones");
 
-    // 6b. Back to the live bottom: the scrolled pane shares composed rows
-    //     with the focused one, and leaving it parked would keep those rows
-    //     from retaining, so the `focus_quiet` clause guarding the mutators
-    //     below would never be reached.
     {
         let term = c.app.pool.get(third).expect("third session").term.clone();
         term_lock(&term).grid_mut().scroll_display(-12);
@@ -565,8 +511,6 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     c.step("the scrolled pane returned to the live bottom");
     c.step("settled with every pane live again");
 
-    // 7. The IME composition, which writes engine cells into the focused
-    //    pane's snapshot on the compose path.
     {
         let ws = c.app.windows.get_mut(&wid).expect("test window");
         ws.preedit = "\u{3053}\u{3093}".to_string();
@@ -586,8 +530,6 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     }
     c.step("IME preedit committed away");
 
-    // 8. The prediction ghosts, guessed at the focused pane's own caret: the
-    //    compose path drops guesses parked anywhere else.
     {
         let focus = c.focus();
         let (caret, coords) = {
@@ -611,8 +553,6 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     c.step_feeding(left, "prediction ghosts on the focused pane");
     c.step_feeding(left, "prediction ghosts settling");
 
-    // 9. A pane closing, twice: the layout shrinks under the composite it
-    //    was tiled against.
     c.close_focused_pane();
     c.step("a pane closed");
     c.step("settled after the close");
@@ -630,8 +570,6 @@ fn drive_corpus(poison: bool, retain: bool) -> (Vec<Composed>, Armed) {
     (c.frames, c.armed)
 }
 
-/// Compare two corpus runs frame for frame, channel for channel, naming the
-/// first divergence exactly.
 fn assert_frames_agree(a: &[Composed], b: &[Composed], a_name: &str, b_name: &str) {
     assert_eq!(
         a.len(),
@@ -690,13 +628,6 @@ fn assert_frames_agree(a: &[Composed], b: &[Composed], a_name: &str, b_name: &st
     }
 }
 
-/// The two clauses of [`super::seed_seam_cells`] the App-level corpus cannot
-/// reach, checked against the whole-grid fill:
-///
-/// * The shortfall: `cell_frame_fill` stamps the requested dimensions, so
-///   only a hand-shortened snapshot arms [`super::seam_declared_shortfall`].
-/// * The out-of-range tile: no layout produces a rectangle past the window
-///   edge.
 #[test]
 fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
     use aterm_render::{RenderInput, Theme};
@@ -710,9 +641,6 @@ fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
         bg: [7, 7, 7],
         ..RenderCell::default()
     };
-    // A 4x9 window: pane at (0,0) 4x4, divider column 4, pane at (0,5) 4x4. Nine columns,
-    // not five, because the pane-count clause caps the tiling at `n * (n + 1) <= cols`
-    // and two panes need six.
     let rect = |session, row_off, col_off, rows, cols| pane::PaneRect {
         session,
         row_off,
@@ -722,8 +650,6 @@ fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
     };
     let tiles = [rect(0, 0, 0, 4, 4), rect(1, 0, 5, 4, 4)];
 
-    // A pane snapshot of `rows`x`cols` filled with one cell, with every
-    // per-row channel `blit_pane_into` indexes sized to match.
     let snapshot = |rows: usize, cols: usize, cell: RenderCell| RenderInput {
         rows,
         cols,
@@ -736,12 +662,7 @@ fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
         default_bg_spans: vec![Vec::new(); rows],
         ..RenderInput::default()
     };
-    // The short snapshot: declared 4x4, filled 2x2. Whatever the blit does not reach
-    // inside the declared rectangle is the shortfall.
     let short = snapshot(2, 2, blank);
-    // The full snapshot carries a glyph no seam or blank produces. Frame one blits it, so
-    // the cells the short frame fails to reach read as pane content; without it both arms
-    // would read "seam" and the test would pass vacuously.
     let full = snapshot(
         4,
         4,
@@ -755,9 +676,6 @@ fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
 
     let compose = |tiled: bool, shortfall: bool| {
         let mut dst = RenderInput::default();
-        // Two frames into one buffer: frame one fills every rectangle with
-        // pane content, frame two's snapshot is short. Whatever the second
-        // frame does not write is the first frame's `Z`s.
         for src in [&full, &short] {
             if tiled {
                 fill_divider_grid_tiled(&mut dst, 4, 9, theme, None, tiles.iter().copied());
@@ -801,7 +719,6 @@ fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
          test is not exercising it"
     );
 
-    // An out-of-range tile disowns the tiling for the whole frame.
     let mut off_grid = RenderInput::default();
     let over = [rect(0, 0, 0, 4, 4), rect(1, 0, 5, 4, 99)];
     for _ in 0..2 {
@@ -818,14 +735,9 @@ fn the_unreachable_seam_clauses_fall_back_to_the_whole_grid_fill() {
     );
 }
 
-/// Coverage: every composed cell is written every frame, by the seam pass or by a pane
-/// blit. Nothing survives from the frame before.
 #[test]
 fn the_tiled_compose_leaves_no_composed_cell_unwritten_over_the_corpus() {
     COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));
-    // Retention is off: the poison flood writes into the composite without bumping
-    // `snapshot_seq`, so the lane would (per its contract) retain rows the poison
-    // overwrote. Retention correctness is `the_retained_tiled_and_whole_grid_composites_agree`.
     let (frames, armed) = drive_corpus(true, false);
     armed.assert_non_vacuous();
     armed.assert_seam_pass(true);
@@ -833,9 +745,6 @@ fn the_tiled_compose_leaves_no_composed_cell_unwritten_over_the_corpus() {
     assert!(!frames.is_empty());
 }
 
-/// A settled four-pane split whose only change is one echoed keystroke in
-/// the focused pane retains every composed row but the one the echo
-/// touched: the arming witness the differential oracle cannot provide.
 #[test]
 fn a_settled_split_retains_every_row_but_the_one_the_keystroke_touched() {
     let (mut c, rows) = four_pane_split(true);
@@ -853,11 +762,6 @@ fn a_settled_split_retains_every_row_but_the_one_the_keystroke_touched() {
     );
 }
 
-/// The second clock at the `App` level. A host write into the finished
-/// composite bumps `snapshot_seq` only; the next frame then retains nothing
-/// and the intruding cells are gone. A write without the bump is invisible
-/// to the lane and its cells survive: the lane relies on that discipline,
-/// not on inspecting cells.
 #[test]
 fn a_host_write_into_the_composite_revokes_the_retention_only_when_it_says_so() {
     for declared in [true, false] {
@@ -912,8 +816,6 @@ fn a_host_write_into_the_composite_revokes_the_retention_only_when_it_says_so() 
     }
 }
 
-/// A four-pane split with every leaf carrying materialized rows, plus the
-/// composed row count. `retain` chooses the arm.
 fn four_pane_split(retain: bool) -> (Corpus, usize) {
     let mut c = Corpus::new(false, retain);
     let wid = c.wid;
@@ -936,9 +838,6 @@ fn four_pane_split(retain: bool) -> (Corpus, usize) {
     (c, rows)
 }
 
-/// One settled frame: a keystroke echo into the focused pane (CR then one
-/// glyph: exactly one damaged row, no wrap or scroll), composed. Returns how
-/// many composed rows the retention lane left alone.
 fn settled_frame(c: &mut Corpus, i: u8) -> usize {
     let focus = c.focus();
     c.feed(focus, if i.is_multiple_of(2) { b"\rx" } else { b"\ry" });
@@ -955,14 +854,6 @@ fn settled_frame(c: &mut Corpus, i: u8) -> usize {
     c.app.windows[&wid].composed_retain.retained_rows()
 }
 
-/// Two differentials over three runs of the same corpus through independent
-/// `App`s (retained, rebuilt-and-tiled, rebuilt whole-grid):
-///
-/// * the retained composite equals the one that rebuilds every row, cells
-///   and all six per-row channels, on every frame (a wrongly retained row is
-///   stale content on screen);
-/// * the tiled composite equals the whole-grid one, cell for cell; both of
-///   these rebuild every row, so the comparison is about the seam pass.
 #[test]
 fn the_retained_tiled_and_whole_grid_composites_agree() {
     COMPOSE_SEAM_UNTILED.with(|untiled| untiled.set(false));

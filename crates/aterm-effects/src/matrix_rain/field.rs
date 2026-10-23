@@ -1,29 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Phosphor rain field: the pure `(seed, tick)` math (matrix-rain design §4).
-//!
-//! Everything here is a total function of `(seed32, config-derived params,
-//! tick)` on u32 lattice math through the one hash [`rain_hash32`], so the
-//! field ports bit-exactly to WGSL (which has no u64). No `Instant`, no
-//! allocation, no state beyond the caller-owned [`DensityRing`].
+//! Pure `(seed32, FieldParams, tick)` u32 lattice math for the phosphor rain field.
 
-/// GPU-path quad budget (contract §4): the hard cap both backends size for.
+/// Hard per-frame quad cap on the GPU path.
 pub const MAX_RAIN_QUADS: usize = 2048;
-/// CPU texel budget: the CPU stamp cost scales with cell area, so the quad cap
-/// on that path derives from texels (`2048 · (10·20)`), floored at 256 quads.
+/// CPU texel budget (`2048 * 10 * 20`), floored at 256 quads in [`quad_cap`].
 pub const MAX_RAIN_TEXELS: usize = 409_600;
-/// Bright-head additive halo budget (`rain_add` GlowQuads per frame).
+/// Bright-head additive halo budget (`rain_add` `GlowQuad`s per frame).
 pub const MAX_RAIN_ADD: usize = 64;
-/// Head-brightness trail depth: levels are `0..=15` (16 ramp tints).
+/// Head-brightness trail depth (`0..=15`, 16 ramp tints).
 pub const LEVELS: u32 = 15;
-/// Glyph ROM size — `glyph_from_epoch` reduces the hash modulo this.
+/// Glyph ROM size modulo which [`glyph_from_epoch`] reduces its hash.
 pub const GLYPH_COUNT: u32 = 64;
-/// Density change-point ring capacity: cycle starts are at most `C·p` ticks
-/// old and the quantized staircase steps a handful of times per weather front.
+/// Capacity of [`DensityRing`] for density change points.
 pub const DENSITY_RING: usize = 8;
 
-/// murmur3 finalizer — the one field hash (WGSL-trivial, bit-exact in u32).
+/// Murmur3 32-bit finalizer used as the single field hash.
 #[must_use]
 #[inline]
 pub const fn rain_hash32(mut x: u32) -> u32 {
@@ -35,47 +28,42 @@ pub const fn rain_hash32(mut x: u32) -> u32 {
     x
 }
 
-/// Half-open LSB-first bit slice `(x >> a) & ((1 << (b-a)) - 1)` — the doc
-/// notation `x.bits(a..b)`.
+/// Half-open LSB-first bit slice `(x >> a) & ((1 << (b - a)) - 1)`.
 #[must_use]
 #[inline]
 pub const fn bits(x: u32, a: u32, b: u32) -> u32 {
     (x >> a) & ((1 << (b - a)) - 1)
 }
 
-/// 32-bit cell packing `(row << 16) | col` (grids < 2^16 on both axes).
+/// Pack `(row, col)` into a 32-bit key `(row << 16) | col` for grids `< 2^16`.
 #[must_use]
 #[inline]
 pub const fn pack(row: u32, col: u32) -> u32 {
     (row << 16) | col
 }
 
-/// Config + geometry derived field parameters, rebuilt only on
-/// `set_config` / geometry change — every per-tick field call threads this.
+/// Config- and geometry-derived field parameters rebuilt on config or viewport change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldParams {
-    /// Host-mixed 32-bit seed (the u64 config seed diffused once, host-side).
+    /// Host-mixed 32-bit seed.
     pub seed32: u32,
-    /// Viewport rows (the live value — the flash floor must see real geometry).
+    /// Live viewport row count used by the flash floor.
     pub rows: u32,
-    /// Base tick period in ms (`1000 / fps`).
+    /// Base tick period in milliseconds (`1000 / fps`).
     pub tick_ms: u32,
-    /// Speed knob `1..=10` (5 = neutral); shifts the per-column step period.
+    /// Speed knob `1..=10` (`5` = neutral) shifting the column step period.
     pub speed: u32,
-    /// Trail knob `1..=10` (5 = neutral); scales the per-column trail length.
+    /// Trail knob `1..=10` (`5` = neutral) scaling the column trail length.
     pub trail: u32,
     /// Mutation quantum in ticks: `max(1, round(mutation_ms / tick_ms))`.
     pub mq: u32,
-    /// Dither quantum: smallest multiple of `mq` at or above `ticks(350ms)`
-    /// (the `TWINKLE_GRID_MS` floor) — every dither boundary lands on a
-    /// mutation tick, so non-mutation ticks touch only stepped rows.
+    /// Dither quantum: smallest multiple of `mq` at or above `ticks_of(350, tick_ms)`.
     pub dq: u32,
-    /// Stammer quantum: `ticks(~500ms)` — bright heads hold one extra tick,
-    /// in unison, once per 8 stammer windows.
+    /// Stammer quantum (`ticks_of(500, tick_ms)`), holding bright heads once every 8 windows.
     pub sq: u32,
 }
 
-/// Round `ms` to whole ticks, floored at 1.
+/// Round `ms` to whole ticks of `tick_ms`, floored at 1.
 #[must_use]
 #[inline]
 pub const fn ticks_of(ms: u32, tick_ms: u32) -> u32 {
@@ -85,8 +73,7 @@ pub const fn ticks_of(ms: u32, tick_ms: u32) -> u32 {
 }
 
 impl FieldParams {
-    /// Derive the tick quanta from a tick period + mutation window. `dq` is
-    /// the smallest multiple of `mq` at or above `ticks(350ms)`.
+    /// Derive `(mq, dq, sq)` in ticks from `tick_ms` and `mutation_ms`.
     #[must_use]
     #[inline]
     pub const fn quanta(tick_ms: u32, mutation_ms: u32) -> (u32, u32, u32) {
@@ -98,39 +85,30 @@ impl FieldParams {
     }
 }
 
-/// Per-column derived parameters (pure function of `(seed32, col, params)`).
+/// Per-column derived parameters from `(seed32, col, FieldParams)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColParams {
-    /// Column hash root `rain_hash32(seed32 ^ ((c<<1)|1))`.
+    /// Column hash root `rain_hash32(seed32 ^ ((col << 1) | 1))`.
     pub h: u32,
-    /// Step period in ticks/row (`>= 2` — a head advances at most 1 row/tick
-    /// by construction, the structural speed clamp).
+    /// Step period in ticks per row (`2..=16`).
     pub p: u32,
     /// Trail length in rows (`3..=rows`).
     pub l: u32,
-    /// Off-screen gap in rows, extended so the flash floor holds (see below).
+    /// Off-screen gap in rows, extended to satisfy the 1 Hz flash floor.
     pub g: u32,
     /// Cycle length `rows + l + g`.
     pub c: u32,
-    /// Phase offset in ticks, `< c·p`.
+    /// Phase offset in ticks (`< c * p`).
     pub phi: u32,
 }
 
-/// Column parameters with the geometry-aware flash floor: `g` is extended at
-/// runtime so `c·p·tick_ms >= 1000` holds for the live `rows` (a config-space
-/// clamp cannot see an 8-row split pane), keeping per-cell re-ignition under
-/// 1 Hz (WCAG 2.3.1).
+/// Compute column parameters with `g` extended so `c * p * tick_ms >= 1000` (WCAG 2.3.1 `< 1 Hz` re-ignition).
 #[must_use]
 #[inline]
 pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
-    // Floor at 3: the trail clamps below are `.clamp(3, rows)`, which panics
-    // when `min > max`, so a 1–2-row viewport derives its cycle from a 3-row
-    // virtual field. Drawing is bounded by the real rows elsewhere, so the
-    // only effect is a slightly longer off-screen cycle.
+    // Floor at 3 rows so trail clamping `3..=rows` remains well-ordered on 1–2-row viewports.
     let rows = if fp.rows > 3 { fp.rows } else { 3 };
     let h = rain_hash32(fp.seed32 ^ ((col << 1) | 1));
-    // Step period 2..=5 from the hash, then the speed-knob shift (5 =
-    // neutral; faster knobs shorten the period), clamped >= 2.
     let p0 = (2 + bits(h, 0, 2)) as i64;
     let speed = if fp.speed < 1 {
         1
@@ -147,8 +125,6 @@ pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
     } else {
         p_raw as u32
     };
-    // Trail: 3/8..6/8 of the viewport from the hash, then the trail knob
-    // (5 = neutral), clamped 3..=rows.
     let l0_raw = rows * (3 + bits(h, 2, 4)) / 8;
     let l0 = if l0_raw < 3 {
         3
@@ -172,8 +148,6 @@ pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
     } else {
         l_raw
     };
-    // Gap: styled `l/2 + bits·l/8`, extended to the flash floor
-    // `ceil(1000 / (p·tick_ms)) - rows - l` so `c·p·tick_ms >= 1000`.
     let g_style = l / 2 + bits(h, 4, 7) * l / 8;
     let tick_ms = if fp.tick_ms > 1 { fp.tick_ms } else { 1 };
     let floor_c = 1000u32.div_ceil(p * tick_ms);
@@ -184,8 +158,7 @@ pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
     ColParams { h, p, l, g, c, phi }
 }
 
-/// Stammer (design §2): bright-head columns hold one extra tick, in unison,
-/// once per 8 stammer windows — `tick' = tick - ((tick/sq) % 8 == 7)`.
+/// Hold bright-head columns one extra tick in the 8th stammer window: `tick - ((tick / sq) % 8 == 7)`.
 #[must_use]
 #[inline]
 pub const fn stammer_tick(tick: u64, sq: u32) -> u64 {
@@ -193,25 +166,22 @@ pub const fn stammer_tick(tick: u64, sq: u32) -> u64 {
     tick - ((tick / sq) % 8 == 7) as u64
 }
 
-/// A column's resolved cycle state at `tick`.
+/// Resolved cycle state for a column at `tick`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CycleView {
-    /// The column's effective tick (stammer-adjusted for bright heads).
+    /// Effective tick after bright-head stammer adjustment.
     pub eff_tick: u64,
-    /// Head position within the cycle, `0..c` (on-screen while `< rows`).
+    /// Head position within the cycle (`0..c`, on-screen while `< rows`).
     pub head_row: u32,
     /// Cycle index.
     pub k: u64,
     /// Per-cycle re-roll hash `rain_hash32(h ^ k)`.
     pub hk: u32,
-    /// Bright head this cycle (`(hk & 7) < 2` — ~1 stream in 4).
+    /// Whether this cycle has a bright head (`(hk & 7) < 2`).
     pub bright: bool,
 }
 
-/// Resolve a column's cycle at `tick`. Brightness is probed from the
-/// unadjusted tick first (the stammer adjustment depends on it); at a cycle
-/// boundary the two probes can disagree for one tick, which is deterministic
-/// and visually free (the stammer is a single held tick).
+/// Resolve a column's cycle at `tick`, probing initial brightness before applying [`stammer_tick`].
 #[must_use]
 #[inline]
 pub const fn cycle_at(cp: &ColParams, fp: &FieldParams, tick: u64) -> CycleView {
@@ -228,8 +198,6 @@ pub const fn cycle_at(cp: &ColParams, fp: &FieldParams, tick: u64) -> CycleView 
     };
     let s = (eff_tick + phi) / p;
     let k = s / c;
-    // rain_hash32 is a pure murmur3 finalizer, so when the stammer does not
-    // cross a cycle boundary (k == k0) the k0 hash is bit-identical — reuse it.
     let hk = if k == k0 {
         ha
     } else {
@@ -244,27 +212,21 @@ pub const fn cycle_at(cp: &ColParams, fp: &FieldParams, tick: u64) -> CycleView 
     }
 }
 
-/// The tick at which cycle `k` started (head at row 0) — the density-ring
-/// lookup key for cycle admission.
+/// Tick at which cycle `k` started (head at row 0), used as the [`DensityRing`] lookup key.
 #[must_use]
 #[inline]
 pub const fn cycle_start_tick(cp: &ColParams, k: u64) -> u64 {
     (k * cp.c as u64 * cp.p as u64).saturating_sub(cp.phi as u64)
 }
 
-/// Cycle admission: the column rains this cycle iff its re-roll byte clears
-/// the density staircase at the cycle start — admission flips only at cycle
-/// boundaries, so intensity changes read as weather fronts, never popping.
+/// Return whether a column rains in cycle `k` (`((hk >> 8) & 0xFF) < density_byte`).
 #[must_use]
 #[inline]
 pub const fn cycle_active(hk: u32, density_byte: u8) -> bool {
     ((hk >> 8) & 0xFF) < density_byte as u32
 }
 
-/// Step-stable, time-based trail level (design §4): decay keys to elapsed
-/// ticks since the head passed (`tick_ign = (k·c + r)·p - phi`), so per
-/// stepping column only head/tail/`ceil(15/p)` bucket rows change per tick.
-/// Returns the level `0..=15`, or `None` when unlit.
+/// Time-based trail level `0..=15` at `row` from elapsed ticks since head ignition, or `None` when unlit.
 #[must_use]
 #[inline]
 pub const fn trail_level(cp: &ColParams, eff_tick: u64, k: u64, row: u32) -> Option<u32> {
@@ -278,17 +240,14 @@ pub const fn trail_level(cp: &ColParams, eff_tick: u64, k: u64, row: u32) -> Opt
     Some(if lvl < LEVELS { lvl } else { LEVELS })
 }
 
-/// Flicker dither from a precomputed epoch: a per-row subtractive twinkle
-/// `0..=3`. The epoch is `tick / dq` folded once per frame by the caller; this
-/// is the single hash site so the byte layout cannot drift.
+/// Per-row subtractive twinkle `0..=3` hashed from `(h, row, epoch)`.
 #[must_use]
 #[inline]
 pub const fn dither(h: u32, row: u32, epoch: u32) -> u32 {
     rain_hash32(h ^ row ^ epoch) & 3
 }
 
-/// The frame-invariant dither epoch `tick / dq` (`dq` a multiple of the
-/// mutation quantum at/above the 350 ms floor). Hoisted once per frame.
+/// Frame-invariant dither epoch `tick / dq`.
 #[must_use]
 #[inline]
 pub const fn dither_epoch(tick: u64, dq: u32) -> u32 {
@@ -296,9 +255,7 @@ pub const fn dither_epoch(tick: u64, dq: u32) -> u32 {
     (tick / dq) as u32
 }
 
-/// Glyph choice + mirror bit from a precomputed epoch:
-/// `rain_hash32(seed ^ pack(r,c) ^ glyph_epoch)` — the single hash site, so the
-/// byte layout cannot drift. The mirror rides bit 8 of the same hash.
+/// Glyph index (`0..GLYPH_COUNT`) and horizontal mirror bit (bit 8) for `(row, col, glyph_epoch)`.
 #[must_use]
 #[inline]
 pub const fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u32, bool) {
@@ -306,8 +263,7 @@ pub const fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32)
     (g % GLYPH_COUNT, (g >> 8) & 1 == 1)
 }
 
-/// The frame-invariant glyph epoch `tick / mq`. `mq` is global, so swaps are
-/// synchronized screen-wide and iso-luminant. Hoisted once per frame.
+/// Frame-invariant glyph mutation epoch `tick / mq`.
 #[must_use]
 #[inline]
 pub const fn glyph_epoch(tick: u64, mq: u32) -> u32 {
@@ -315,9 +271,7 @@ pub const fn glyph_epoch(tick: u64, mq: u32) -> u32 {
     (tick / mq) as u32
 }
 
-/// The effective per-frame quad cap: the GPU budget intersected with the
-/// texel-derived CPU cap (`max(256, MAX_RAIN_TEXELS / (cw·ch))`) — retina
-/// cells thin uniformly instead of blowing the CPU stamp bar.
+/// Effective per-frame quad cap: `min(MAX_RAIN_QUADS, max(256, MAX_RAIN_TEXELS / (cell_w * cell_h)))`.
 #[must_use]
 #[inline]
 pub const fn quad_cap(cell_w: u32, cell_h: u32) -> usize {
@@ -332,9 +286,7 @@ pub const fn quad_cap(cell_w: u32, cell_h: u32) -> usize {
     }
 }
 
-/// Bounded ring of density-staircase change points `(tick, density_byte)`:
-/// cycle admission looks up the density at the cycle-start tick, so the
-/// weather history the field replays from is explicit engine state.
+/// Bounded ring of density-staircase change points `(tick, density_byte)` for cycle-start lookups.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DensityRing {
     entries: [(u64, u8); DENSITY_RING],
@@ -343,8 +295,7 @@ pub struct DensityRing {
 }
 
 impl DensityRing {
-    /// Record a change point. Push only when the quantized byte changes —
-    /// the caller (the weather EMA) owns that dedupe.
+    /// Record a `(tick, density)` change point once deduplicated by the caller.
     #[inline]
     pub const fn push(&mut self, tick: u64, density: u8) {
         self.entries[self.head] = (tick, density);
@@ -357,9 +308,7 @@ impl DensityRing {
         };
     }
 
-    /// The density in force at `tick`: the newest change point at or before
-    /// it. Ticks older than the whole ring resolve to the oldest retained
-    /// entry (bounded history, best effort); an empty ring is density 0.
+    /// Return the newest density change point at or before `tick` (or the oldest retained entry, or `0` if empty).
     #[must_use]
     #[inline]
     pub const fn at(&self, tick: u64) -> u8 {
@@ -367,7 +316,6 @@ impl DensityRing {
         let mut idx = self.head;
         let mut i = 0;
         while i < self.len {
-            // Newest-first walk: head-1 is the most recent entry.
             idx = if idx == 0 { DENSITY_RING - 1 } else { idx - 1 };
             let (t, d) = self.entries[idx];
             if t <= tick {
@@ -379,7 +327,7 @@ impl DensityRing {
         oldest
     }
 
-    /// Drop all change points (config rebuild / reset).
+    /// Clear all recorded change points.
     #[inline]
     pub const fn clear(&mut self) {
         self.len = 0;
@@ -405,9 +353,7 @@ mod tests {
         }
     }
 
-    /// Flash floor (design §4): for every clamped config and short-pane
-    /// geometry, `c·p·tick_ms >= 1000`, so re-ignition stays under 1 Hz. Rows
-    /// 3..=8 are the small grids.
+    /// Verify `c * p * tick_ms >= 1000` across clamped configs and viewport heights.
     #[test]
     fn flash_floor_holds_at_all_clamped_configs() {
         for rows in [3u32, 4, 5, 6, 7, 8, 50, 120] {
@@ -433,9 +379,7 @@ mod tests {
         }
     }
 
-    /// A 1- or 2-row field (tiny split pane or window) never panics: the
-    /// virtual 3-row cycle keeps the trail at its 3-row floor, `p >= 2`, and
-    /// the flash floor.
+    /// Verify that 1–2-row viewports clamp cleanly to a 3-row virtual cycle.
     #[test]
     fn tiny_viewports_never_panic_and_keep_invariants() {
         for rows in [1u32, 2, 3] {
@@ -444,8 +388,6 @@ mod tests {
                     let fp = params(rows, 83, speed, trail);
                     for col in 0..100 {
                         let cp = col_params(&fp, col);
-                        // rows <= 3 ⇒ the virtual field is exactly 3 rows,
-                        // so the trail clamp pins l to its 3-row floor.
                         assert_eq!(cp.l, 3);
                         assert!(cp.p >= 2);
                         assert!(
@@ -458,8 +400,7 @@ mod tests {
         }
     }
 
-    /// The dither quantum is a multiple of the mutation quantum at or above
-    /// the 350 ms `TWINKLE_GRID_MS` floor.
+    /// Verify that `dq` is a multiple of `mq` at or above the 350 ms floor.
     #[test]
     fn dither_quantum_rides_the_mutation_grid() {
         for tick_ms in [16u32, 33, 83] {
@@ -485,7 +426,6 @@ mod tests {
         assert_eq!(ring.at(10), 42);
         assert_eq!(ring.at(60), 126);
         assert_eq!(ring.at(1000), 63);
-        // Overflow retains the newest DENSITY_RING entries.
         for i in 0..12u64 {
             ring.push(100 + i, i as u8);
         }

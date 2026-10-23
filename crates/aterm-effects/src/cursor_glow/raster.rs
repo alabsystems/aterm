@@ -269,6 +269,8 @@ const _: () = assert!(
 #[inline]
 pub(super) fn rainbow_cycle_phase(p: f32) -> f32 {
     // Fast path: most callers pass a value already inside one turn, and the
+    // hot ribbon calls this per slab per vertex, so avoid `rem_euclid` (a
+    // library `fmod`) there.
     if (0.0..RAINBOW_CYCLE).contains(&p) {
         return p;
     }
@@ -444,6 +446,7 @@ pub(super) enum GlyphInkSide {
 #[inline]
 pub(super) fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f32)> {
     // A sentinel (or any set high byte) is not a colour: masking it would read
+    // as pure black and flip the side.
     if fg > 0x00FF_FFFF || bg > 0x00FF_FFFF || fg == bg {
         return None;
     }

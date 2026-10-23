@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE READER-RESUME LAW (`aterm-link`'s `state.rs`.
+//! THE READER-RESUME LAW (`aterm-link`'s `state.rs`, `LogWitness::continues` and
+//! `StateDir::forget_log_offsets`; its `durability` module's docs): where a reader
+//! that kept offsets into the bus log resumes after the broker MOVED the log's
+//! generation — a power loss under a weak tier, a torn batch cut, a repair's cut — so
+//! that it never skips a record it did not read, across any number of moves.
 
 use aterm_spec::derive::Model;
 

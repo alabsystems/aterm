@@ -125,6 +125,7 @@ impl HandshakeScan {
             self.matched = if b == WIN32_INPUT_REQUEST[self.matched] {
                 self.matched + 1
             } else {
+                // ESC occurs only at the pattern's start, so a mismatch can
                 // restart a match only on an ESC.
                 usize::from(b == ESC)
             };
@@ -467,6 +468,7 @@ impl ResizeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     /// A guard that has seen conhost's request, at a known size.
     fn armed_guard() -> ResizeGuard {
@@ -926,16 +928,8 @@ mod tests {
     fn records_that_outgrow_the_pipe_go_in_writes_it_takes_whole() {
         let g = armed_guard();
         let paste = "😀".repeat(1024);
-        let wires = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
-        let pipe = |b: &[u8]| -> io::Result<usize> {
-            let mut wires = wires.borrow_mut();
-            wires.push(b.to_vec());
-            Ok(if wires.len() == 1 {
-                b.len().min(INPUT_WRITE_MAX)
-            } else {
-                0
-            })
-        };
+        let wires = RefCell::new(Vec::new());
+        let pipe = stopping_pipe(&wires);
         let fit = (INPUT_WRITE_MAX - GUARD_RECORD.len()) / GRIN_RECORDS.len();
         let first = g
             .write_with(paste.as_bytes(), &pipe)
@@ -965,11 +959,72 @@ mod tests {
         );
     }
 
+    /// A pipe that takes the first write, at most its quota, and releases
+    /// every later one, as a stop does; `wires` keeps each write it was handed.
+    fn stopping_pipe(wires: &RefCell<Vec<Vec<u8>>>) -> impl Fn(&[u8]) -> io::Result<usize> + '_ {
+        move |b| {
+            let mut wires = wires.borrow_mut();
+            wires.push(b.to_vec());
+            Ok(if wires.len() == 1 {
+                b.len().min(INPUT_WRITE_MAX)
+            } else {
+                0
+            })
+        }
+    }
+
+    /// The quota counts every byte of a write of records, not the records
+    /// alone: the text that follows them (a 4 KiB slice of 905 characters then
+    /// 476 `a`, whose records and first 376 `a` fill it to the byte), the text
+    /// before them (behind 17 `x`, the 910th character's records end one byte
+    /// past it, so 909 go) and the record a resize puts in front (behind it and
+    /// `ab`, 909 characters fit, where without it 910 would). The pipe takes
+    /// each such write whole, so a stop that releases the next one leaves the
+    /// paste `Stopped`, not failed.
+    #[test]
+    fn the_quota_counts_the_text_after_records_and_the_record_before_them() {
+        let after = INPUT_WRITE_MAX - 905 * GRIN_RECORDS.len();
+        let before = INPUT_WRITE_MAX + 1 - 910 * GRIN_RECORDS.len();
+        let behind = (INPUT_WRITE_MAX - GUARD_RECORD.len() - 2) / GRIN_RECORDS.len();
+        for (what, g, slice, took, wire) in [
+            (
+                "text after records",
+                asked(ConsoleHostKind::Inbox),
+                ["😀".repeat(905), "a".repeat(after + 100)].concat(),
+                905 * 4 + after,
+                [GRIN_RECORDS.repeat(905), vec![b'a'; after]].concat(),
+            ),
+            (
+                "text before records that end one byte past it",
+                asked(ConsoleHostKind::Inbox),
+                ["x".repeat(before), "😀".repeat(910)].concat(),
+                before + 909 * 4,
+                [vec![b'x'; before], GRIN_RECORDS.repeat(909)].concat(),
+            ),
+            (
+                "the record before them",
+                armed_guard(),
+                ["ab".to_owned(), "😀".repeat(1023)].concat(),
+                2 + behind * 4,
+                guarded(&[b"ab".as_slice(), &GRIN_RECORDS.repeat(behind)].concat()),
+            ),
+        ] {
+            let wires = RefCell::new(Vec::new());
+            let reply = g
+                .write_with(slice.as_bytes(), stopping_pipe(&wires))
+                .map_err(|e| e.kind());
+            let wires = wires.into_inner();
+            let sizes: Vec<usize> = wires.iter().map(Vec::len).collect();
+            assert_eq!((reply, sizes), (Ok(took), vec![wire.len()]), "{what}");
+            assert!(wires[0] == wire, "{what}: the wire");
+        }
+    }
+
     /// An OpenConsole session's first write after a size change runs `client`
     /// once with the new size; unchanged sizes and conhost sessions never run it.
     #[test]
     fn an_openconsole_resize_runs_the_client_once_before_the_next_write() {
-        let runs = std::cell::RefCell::new(Vec::new());
+        let runs = RefCell::new(Vec::new());
         let client = |rows, cols| runs.borrow_mut().push((rows, cols));
         let run = |g: &ResizeGuard, bytes: &[u8]| {
             g.write_with_client(bytes, Writer::Input, |b| Ok(b.len()), client, || true)

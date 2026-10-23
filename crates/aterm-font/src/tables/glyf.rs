@@ -5,8 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Glyph Data Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/glyf) implementation.
+//! OpenType `glyf` (Glyph Data) table implementation.
 
 use core::num::NonZeroU16;
 
@@ -31,8 +30,6 @@ pub(crate) struct Builder<'a> {
     pub tap: Option<&'a mut dyn PointSink>,
     pub transform: Transform,
     is_default_ts: bool, // `bool` is faster than `Option` or `is_default`.
-    // We have to always calculate the bbox, because `gvar` doesn't store one
-    // and in case of a malformed bbox in `glyf`.
     pub bbox: RectF,
     first_on_curve: Option<Point>,
     first_off_curve: Option<Point>,
@@ -99,10 +96,6 @@ impl<'a> Builder<'a> {
         self.builder.quad_to(x1, y1, x, y);
     }
 
-    // Useful links:
-    //
-    // - https://developer.apple.com/fonts/TrueType-Reference-Manual/RM01/Chap1.html
-    // - https://stackoverflow.com/a/20772557
     #[inline]
     pub fn push_point(&mut self, x: f32, y: f32, on_curve_point: bool, last_point: bool) {
         if let Some(tap) = self.tap.as_deref_mut() {
@@ -241,7 +234,6 @@ impl<'a> Iterator for CompositeGlyphIter<'a> {
         }
 
         if !flags.more_components() {
-            // Finish the iterator even if stream still has some data.
             self.stream.jump_to_end();
         }
 
@@ -253,10 +245,6 @@ impl<'a> Iterator for CompositeGlyphIter<'a> {
     }
 }
 
-// Due to some optimization magic, using f32 instead of i16
-// makes the code ~10% slower. At least on my machine.
-// I guess it's due to the fact that with i16 the struct
-// fits into the machine word.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GlyphPoint {
     pub x: i16,
@@ -290,8 +278,6 @@ impl<'a> Iterator for GlyphPointsIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         self.points_left = self.points_left.checked_sub(1)?;
 
-        // TODO: skip empty contours
-
         let last_point = self.endpoints.next();
         let flags = self.flags.next()?;
         Some(GlyphPoint {
@@ -307,10 +293,6 @@ impl<'a> Iterator for GlyphPointsIter<'a> {
     }
 }
 
-/// A simple flattening iterator for glyph's endpoints.
-///
-/// Translates endpoints like: 2 4 7
-/// into flags: 0 0 1 0 1 0 0 1
 #[derive(Clone, Copy, Default)]
 struct EndpointsIter<'a> {
     endpoints: LazyArray16<'a, u16>, // Each endpoint indicates a contour end.
@@ -333,13 +315,10 @@ impl<'a> EndpointsIter<'a> {
         if self.left == 0 {
             if let Some(end) = self.endpoints.get(self.index) {
                 let prev = self.endpoints.get(self.index - 1).unwrap_or(0);
-                // Malformed font can have endpoints not in increasing order,
-                // so we have to use checked_sub.
                 self.left = end.saturating_sub(prev);
                 self.left = self.left.saturating_sub(1);
             }
 
-            // Always advance the index, so we can check the current contour number.
             if let Some(n) = self.index.checked_add(1) {
                 self.index = n;
             }
@@ -355,8 +334,6 @@ impl<'a> EndpointsIter<'a> {
 #[derive(Clone, Default)]
 struct FlagsIter<'a> {
     stream: Stream<'a>,
-    // Number of times the `flags` should be used
-    // before reading the next one from `stream`.
     repeats: u8,
     flags: SimpleGlyphFlags,
 }
@@ -407,11 +384,6 @@ impl<'a> CoordsIter<'a> {
 
     #[inline]
     fn next(&mut self, is_short: bool, is_same_or_short: bool) -> i16 {
-        // See https://docs.microsoft.com/en-us/typography/opentype/spec/glyf#simple-glyph-description
-        // for details about Simple Glyph Flags processing.
-
-        // We've already checked the coords data, so it's safe to fallback to 0.
-
         let mut n = 0;
         if is_short {
             n = i16::from(self.stream.read::<u8>().unwrap_or(0));
@@ -443,7 +415,6 @@ impl Point {
     }
 }
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/glyf#simple-glyph-description
 #[derive(Clone, Copy, Default)]
 struct SimpleGlyphFlags(u8);
 
@@ -457,7 +428,6 @@ impl SimpleGlyphFlags {
     #[inline] fn y_is_same_or_positive_short(self) -> bool { self.0 & 0x20 != 0 }
 }
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/glyf#composite-glyph-description
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CompositeGlyphFlags(u16);
 
@@ -471,7 +441,6 @@ impl CompositeGlyphFlags {
     #[inline] pub fn we_have_a_two_by_two(self) -> bool { self.0 & 0x0080 != 0 }
 }
 
-// It's not defined in the spec, so we are using our own value.
 pub(crate) const MAX_COMPONENTS: u8 = 32;
 
 #[allow(clippy::comparison_chain)]
@@ -494,9 +463,6 @@ fn outline_impl(
     s.advance(8); // Skip bbox. We use calculated one.
 
     if number_of_contours > 0 {
-        // Simple glyph.
-
-        // u16 casting is safe, since we already checked that the value is positive.
         let number_of_contours = NonZeroU16::new(number_of_contours as u16)?;
         for point in parse_simple_outline(s.tail()?, number_of_contours)? {
             work.take()?;
@@ -508,7 +474,6 @@ fn outline_impl(
             );
         }
     } else if number_of_contours < 0 {
-        // Composite glyph.
         for comp in CompositeGlyphIter::new(s.tail()?) {
             if let Some(range) = loca_table.glyph_range(comp.glyph_id) {
                 if let Some(glyph_data) = glyf_table.get(range) {
@@ -521,7 +486,6 @@ fn outline_impl(
                     );
                     outline_impl(loca_table, glyf_table, glyph_data, depth + 1, &mut b, work)?;
 
-                    // Take updated bbox.
                     builder.bbox = b.bbox;
                 }
             }
@@ -545,13 +509,10 @@ pub(crate) fn parse_simple_outline(
 
     let points_total = endpoints.last()?.checked_add(1)?;
 
-    // Contours with a single point should be ignored.
-    // But this is not an error, so we should return an "empty" iterator.
     if points_total == 1 {
         return Some(GlyphPointsIter::default());
     }
 
-    // Skip instructions byte code.
     let instructions_len = s.read::<u16>()?;
     s.advance(usize::from(instructions_len));
 
@@ -570,9 +531,6 @@ pub(crate) fn parse_simple_outline(
     })
 }
 
-/// Resolves coordinate arrays length.
-///
-/// The length depends on *Simple Glyph Flags*, so we have to process them all to find it.
 fn resolve_coords_len(s: &mut Stream, points_total: u16) -> Option<(u32, u32)> {
     let mut flags_left = u32::from(points_total);
     let mut repeats;
@@ -581,7 +539,6 @@ fn resolve_coords_len(s: &mut Stream, points_total: u16) -> Option<(u32, u32)> {
     while flags_left > 0 {
         let flags = SimpleGlyphFlags(s.read::<u8>()?);
 
-        // The number of times a glyph point repeats.
         repeats = if flags.repeat_flag() {
             let repeats = s.read::<u8>()?;
             u32::from(repeats) + 1
@@ -592,26 +549,6 @@ fn resolve_coords_len(s: &mut Stream, points_total: u16) -> Option<(u32, u32)> {
         if repeats > flags_left {
             return None;
         }
-
-        // No need to check for `*_coords_len` overflow since u32 is more than enough.
-
-        // Non-obfuscated code below.
-        // Branchless version is surprisingly faster.
-        //
-        // if flags.x_short() {
-        //     // Coordinate is 1 byte long.
-        //     x_coords_len += repeats;
-        // } else if !flags.x_is_same_or_positive_short() {
-        //     // Coordinate is 2 bytes long.
-        //     x_coords_len += repeats * 2;
-        // }
-        // if flags.y_short() {
-        //     // Coordinate is 1 byte long.
-        //     y_coords_len += repeats;
-        // } else if !flags.y_is_same_or_positive_short() {
-        //     // Coordinate is 2 bytes long.
-        //     y_coords_len += repeats * 2;
-        // }
 
         x_coords_len += (flags.0 & 0x02 != 0) as u32 * repeats;
         x_coords_len += (flags.0 & (0x02 | 0x10) == 0) as u32 * (repeats * 2);
@@ -625,8 +562,7 @@ fn resolve_coords_len(s: &mut Stream, points_total: u16) -> Option<(u32, u32)> {
     Some((x_coords_len, y_coords_len))
 }
 
-/// A [Glyph Data Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/glyf).
+/// OpenType `glyf` (Glyph Data) table.
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
     pub(crate) data: &'a [u8],
@@ -680,16 +616,12 @@ impl<'a> Table<'a> {
         )?
     }
 
-    /// The bounding box of the glyph. Unlike the `outline` method, this method does not
-    /// calculate the bounding box manually by outlining the glyph, but instead uses the
-    /// bounding box in the `glyf` program. As a result, this method will be much faster,
-    /// but the bounding box could be more inaccurate.
+    /// Returns the glyph bounding box recorded in the `glyf` table.
     #[inline]
     pub fn bbox(&self, glyph_id: GlyphId) -> Option<Rect> {
         let glyph_data = self.get(glyph_id)?;
 
         let mut s = Stream::new(glyph_data);
-        // number of contours
         let _ = s.read::<i16>()?;
         Some(Rect {
             x_min: s.read::<i16>()?,
@@ -715,20 +647,16 @@ impl<'a> Table<'a> {
         let mut s = Stream::new(data);
         let number_of_contours = s.read::<i16>()?;
 
-        // Skip bbox.
         s.advance(8);
 
         if number_of_contours > 0 {
-            // Simple glyph.
             let number_of_contours = NonZeroU16::new(number_of_contours as u16)?;
             let glyph_points = parse_simple_outline(s.tail()?, number_of_contours)?;
             Some(glyph_points.points_left)
         } else if number_of_contours < 0 {
-            // Composite glyph.
             let components = CompositeGlyphIter::new(s.tail()?);
             Some(components.clone().count() as u16)
         } else {
-            // An empty glyph.
             None
         }
     }

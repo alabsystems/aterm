@@ -162,6 +162,8 @@ impl Default for ColorScheme {
         let mut ansi = [Rgb::new(0, 0, 0); 16];
         for (i, slot) in ansi.iter_mut().enumerate() {
             // `i` indexes a 16-entry array, so `i <= 15` and `& 0xF` is
+            // identity — the mask only proves the narrowing lossless to the
+            // Trust gate.
             *slot = ColorPalette::default_color((i & 0xF) as u8);
         }
         Self {
@@ -186,6 +188,8 @@ impl ColorScheme {
         let mut p = ColorPalette::new();
         for (i, c) in self.ansi.iter().enumerate() {
             // `i` indexes the 16-entry `ansi` array, so `i <= 15` and `& 0xF`
+            // is identity — the mask only proves the narrowing lossless to the
+            // Trust gate.
             p.set((i & 0xF) as u8, *c);
         }
         if self.palette_generate {
@@ -2489,6 +2493,7 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
                     (ThemeKey::Palette, Some(slot)) => ansi[usize::from(slot)] = colour,
                     (key, _) => {
                         // The chrome keys; the table types no other key as a
+                        // colour.
                         if let Some(slot) = chrome.slot_mut(key) {
                             *slot = Some(colour);
                         }
@@ -2591,6 +2596,7 @@ fn parse_theme_lines(text: &str) -> Result<(ParsedTheme, ThemeKeyLines), ThemeEr
     }
     let (Some(foreground), Some(background)) = (foreground, background) else {
         // Unreachable while the table marks both required (the
+        // `theme_key_table_drives_the_parser` test); refused, not defaulted.
         return Err(missing_key(if foreground.is_none() {
             "foreground"
         } else {

@@ -400,6 +400,8 @@ impl<C: Ctl> Session<'_, C> {
         };
         if changed {
             // Persist scope even when the screen draws no wall. A later
+            // hostless successor must not reinterpret this admitted seed, nor
+            // any successor hold a scope no read can bind.
             self.persist_wall(seq);
         }
     }

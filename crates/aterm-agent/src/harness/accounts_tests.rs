@@ -1178,6 +1178,13 @@ fn the_signed_out_labels_are_the_enrolled_ones_in_roster_order() {
     );
     assert_eq!(signed_out(&r, &s, &here, NOW), ["main", "work-2"]);
     assert_eq!(signed_out(&r, &s, &BTreeSet::new(), NOW), ["main"]);
+    let mut with_email = r.clone();
+    with_email.rows[1].email = Some("work-2@example.com".to_string());
+    assert_eq!(
+        signed_out(&with_email, &s, &all(&with_email), NOW),
+        ["main", "pool-a"],
+        "rows with an email renew automatically and are excluded from the manual signed-out list"
+    );
 
     let mut s = state();
     limited(&mut s, "work-2", NOW + HOUR);
@@ -7997,7 +8004,8 @@ fn a_tap_reading_keeps_the_largest_figure_within_a_window_and_writes_only_news()
 /// or above [`LOW_WEEK_PCT`] (97%), or overage credits carrying a session
 /// ([`Credits::InUse`]) marks the subscription [`Condition::Low`], ranks it
 /// behind fresh accounts (`WhyNot::LowAheadOfAWall` ahead of a wall, `Rank {
-/// low: true, ..
+/// low: true, .. }` at one), and moves the session to the next fresh
+/// subscription at a turn end in [`Mode::Early`] without typing `/usage`.
 #[test]
 fn warnings_and_credits_in_use_mark_an_account_low_and_rotate_early_ahead_of_the_wall() {
     let r = three();

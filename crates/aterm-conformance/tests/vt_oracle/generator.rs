@@ -203,6 +203,7 @@ impl Track {
                 }
                 if mode == 1049 {
                     if set {
+                        // `?1049h` saves into the slot of the buffer it
                         // leaves (or of the alternate one, already up).
                         self.save();
                     }

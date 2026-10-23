@@ -308,6 +308,7 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
                             prev_segment.last_ix = point_ix as u16;
                             state.apply_to_segment(prev_segment, flat_threshold);
                         } else {
+                            // We have different directions; use the
                             // properties of the longer segment
                             if (prev_state.max_coord - prev_state.min_coord).abs()
                                 > (state.max_coord - state.min_coord).abs()

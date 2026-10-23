@@ -35,7 +35,6 @@ impl<'a> DeltaSetIndexMap<'a> {
             return None;
         }
 
-        // 'If a given glyph ID is greater than mapCount-1, then the last entry is used.'
         if index >= map_count {
             index = map_count - 1;
         }

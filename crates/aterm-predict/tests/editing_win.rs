@@ -909,6 +909,7 @@ impl Meter<'_> {
             );
             if cells_now.len() == before {
                 // Every painted cell is one of the line's own glyphs: the drawn
+                // cursor is what no state of the line shows.
                 cells_now.push((row, if drawn.0 == row { drawn.1 } else { 0 }));
             }
             let cells = (cells_now.len() - before) as u64;

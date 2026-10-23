@@ -76,8 +76,6 @@ pub(crate) fn simple_glyph(
     })
 }
 
-/// What simple and composite glyphs share: zero the deltas, then add each
-/// active tuple's (a dense tuple directly, a sparse one by `apply_sparse`).
 fn compute_deltas_for_glyph(
     gvar: &Gvar,
     glyph_id: u16,
@@ -103,8 +101,6 @@ fn compute_deltas_for_glyph(
 }
 
 // FreeType ttgxvar.c `tt_interpolate_deltas`.
-/// Interpolates the points without deltas, as the IUP instruction does
-/// (FreeType ttgxvar.c `tt_interpolate_deltas`).
 fn interpolate_deltas(
     points: &[Point<i32>],
     flags: &[PointFlags],
@@ -162,8 +158,6 @@ struct Jiggler<'a> {
 
 impl Jiggler<'_> {
     // FreeType ttgxvar.c `tt_delta_shift`.
-    /// Shifts every point in `range` but the reference by the reference
-    /// point's delta (FreeType ttgxvar.c `tt_delta_shift`).
     fn shift(&mut self, range: RangeInclusive<usize>, ref_ix: usize) -> Option<()> {
         let ref_in = self.points.get(ref_ix)?.map(Fixed::from_i32);
         let ref_out = self.out_points.get(ref_ix)?;
@@ -181,8 +175,6 @@ impl Jiggler<'_> {
     }
 
     // FreeType ttgxvar.c `tt_delta_interpolate`.
-    /// Interpolates the points in `range` between two reference points
-    /// (FreeType ttgxvar.c `tt_delta_interpolate`).
     fn interpolate(&mut self, range: RangeInclusive<usize>, ref_points: RefPoints) -> Option<()> {
         if range.is_empty() {
             return Some(());

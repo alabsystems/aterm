@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Replay: determinism, restore-at-every-boundary against the straight fold (with its
-//! negative control), the observation chain, and the first divergence between two runs.
+//! Replay determinism, boundary restore, observation chain, and divergence tests.
 
 use aterm_aos::checkpoint::{Checkpoint, Provenance};
 use aterm_aos::effects::NoEffects;
@@ -106,10 +105,6 @@ fn negative_control_a_restore_that_drops_a_field_diverges_at_some_boundary() {
             diverged.push(k);
         }
     }
-    // A restore while hot loses the flag. The loss shows where the next thing to read it is
-    // the stranded tick (boundaries 1 and 6) or the end state (boundary 8); where an add or a
-    // reset rewrites the flag first (2, 3, 5, 7), or it was already clear (0, 4), the runs
-    // agree — which is why the sweep covers every boundary.
     assert_eq!(diverged, vec![1, 6, 8]);
 }
 

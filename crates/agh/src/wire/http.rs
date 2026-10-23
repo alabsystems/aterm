@@ -57,7 +57,6 @@ impl std::fmt::Debug for HttpTransport {
     }
 }
 
-/// agh's environment source, handed to aterm-http's generic `exchange_with_env`.
 struct EnvAdapter<'a>(&'a (dyn EnvSource + Send + Sync));
 
 impl EnvSource for EnvAdapter<'_> {
@@ -66,7 +65,6 @@ impl EnvSource for EnvAdapter<'_> {
     }
 }
 
-/// A refusal before any connection: nothing is sent.
 const fn refused(detail: String) -> WireError {
     WireError {
         phase: Phase::NotSent,
@@ -75,7 +73,6 @@ const fn refused(detail: String) -> WireError {
     }
 }
 
-/// Step 0: the method, then the credential's origin (plan §8). `None` when the request may go.
 fn guard(req: &WireRequest<'_>) -> Option<WireError> {
     if !req.method.is_read() {
         return Some(refused(format!(
@@ -95,7 +92,6 @@ fn guard(req: &WireRequest<'_>) -> Option<WireError> {
     )))
 }
 
-/// agh's method as aterm-http's.
 const fn http_method(method: Method) -> aterm_http::Method {
     match method {
         Method::Get => aterm_http::Method::Get,
@@ -107,18 +103,12 @@ const fn http_method(method: Method) -> aterm_http::Method {
     }
 }
 
-/// Whether aterm-http's `Invalid` text is its refusal of a proxy variable: it starts with the
-/// variable's name (`HTTPS_PROXY`, `http_proxy`, `ALL_PROXY`, …), then a space.
 fn names_a_proxy_variable(message: &str) -> bool {
     message
         .split_once(' ')
         .is_some_and(|(name, _)| name.to_ascii_lowercase().ends_with("_proxy"))
 }
 
-/// The kind of a failed exchange, by the first row of plan §8's table that matches, after two rows
-/// beside it: a proxy failure aterm-http reports as `Protocol` (the CONNECT refused) or as
-/// `Invalid` (an unusable proxy variable), at NotSent, is Proxy (design §7.2's wire row), where
-/// the table's own `Io … proxy` row matches no text aterm-http writes.
 fn kind_of(phase: Phase, error: &aterm_http::Error) -> WireKind {
     use std::io::ErrorKind as K;
     match error {
@@ -152,7 +142,6 @@ fn kind_of(phase: Phase, error: &aterm_http::Error) -> WireKind {
     }
 }
 
-/// aterm-http's phase as agh's.
 const fn phase_of(phase: aterm_http::Phase) -> Phase {
     match phase {
         aterm_http::Phase::NotSent => Phase::NotSent,
@@ -162,7 +151,6 @@ const fn phase_of(phase: aterm_http::Phase) -> Phase {
 }
 
 impl crate::wire::Transport for HttpTransport {
-    /// plan §8's steps: the two guards, then one aterm-http exchange whose body is left unread.
     fn round_trip(&self, req: WireRequest<'_>) -> Result<WireResponse, WireError> {
         if let Some(refusal) = guard(&req) {
             return Err(refusal);

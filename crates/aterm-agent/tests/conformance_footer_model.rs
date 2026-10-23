@@ -350,6 +350,8 @@ impl World {
                 }
             }
             "Resume" => {
+                // An in-REPL `/resume`: into A first, then B. Claude restores
+                // the conversation's model onto a process nothing pinned —
                 // only A can meet one — and the restore pins it.
                 if self.reader == Reader::RestoreNoPin && self.restore_pinned && !self.chose {
                     self.forget_the_restore_pin();

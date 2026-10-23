@@ -656,6 +656,7 @@ impl Parser {
                 at += 1;
             } else if i == 0 && first_optional {
                 // Under -R, CONTENT may be left out: the repository's root at its default
+                // branch.
             } else {
                 return Err(self.usage(format!("{name} is required")));
             }

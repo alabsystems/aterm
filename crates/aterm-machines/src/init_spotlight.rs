@@ -81,12 +81,18 @@ impl BuildNoindex {
                 continue;
             }
             let path = store.join(&name);
-            let noindex = store.join(format!("{name}.noindex"));
-            if sys.stat(&noindex).is_ok() {
-                continue;
-            }
             match sys.stat(&path) {
-                Ok(s) if s.dir && !s.symlink => plain.push(name),
+                Ok(s) if s.dir && !s.symlink => {
+                    let noindex = store.join(format!("{name}.noindex"));
+                    if Self::present(sys, &noindex)? {
+                        return Err(format!(
+                            "both {} and {} exist; left unchanged",
+                            path.display(),
+                            noindex.display()
+                        ));
+                    }
+                    plain.push(name);
+                }
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -104,25 +110,39 @@ impl BuildNoindex {
         }
     }
 
+    fn present(sys: &dyn System, path: &Path) -> Result<bool, String> {
+        match sys.stat(path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
     /// Cargo/Rust `target` or `build` directories under `self.home` indexed by Spotlight.
     fn spotlit_build_dirs(&self, sys: &dyn System) -> Result<Vec<PathBuf>, String> {
         let mdfind_bin = Path::new("/usr/bin/mdfind");
-        if sys.stat(mdfind_bin).is_err() {
-            return Ok(Vec::new());
-        }
+        sys.stat(mdfind_bin)
+            .map_err(|e| format!("{}: {e}", mdfind_bin.display()))?;
         let cmd = Cmd::new(mdfind_bin).as_user(&self.user).args([
             "-onlyin",
             &self.home.to_string_lossy(),
             "-0",
             "kMDItemFSName == \"*.rmeta\"",
         ]);
-        let ran = match sys.run(&cmd) {
-            Ok(ran) if ran.success() => ran,
-            _ => return Ok(Vec::new()),
-        };
+        let ran = sys
+            .run_complete_stdout(&cmd)
+            .map_err(|e| format!("{}: {e}", cmd.display()))?;
+        if !ran.success() {
+            return Err(format!("{}: {}", cmd.display(), ran.describe()));
+        }
+        let text = std::str::from_utf8(&ran.stdout)
+            .map_err(|_| "Spotlight inventory is not UTF-8".to_owned())?;
+        if !text.is_empty() && !text.ends_with('\0') {
+            return Err("Spotlight inventory is not a complete NUL-delimited list".into());
+        }
         let home_prefix = format!("{}/", self.home.to_string_lossy());
         let mut candidates = BTreeSet::new();
-        for raw in ran.out().split('\0').filter(|p| !p.is_empty()) {
+        for raw in text.split('\0').filter(|p| !p.is_empty()) {
             if raw.split('/').any(|c| c.ends_with(".noindex")) {
                 continue;
             }
@@ -152,15 +172,19 @@ impl BuildNoindex {
             let Some(name) = cand.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let noindex = cand.with_file_name(format!("{name}.noindex"));
-            if sys.stat(&noindex).is_ok() {
-                continue;
-            }
             if Self::dir_present(sys, &cand)?
-                && (sys.stat(&cand.join("CACHEDIR.TAG")).is_ok()
-                    || sys.stat(&cand.join("debug")).is_ok()
-                    || sys.stat(&cand.join("release")).is_ok())
+                && (Self::present(sys, &cand.join("CACHEDIR.TAG"))?
+                    || Self::present(sys, &cand.join("debug"))?
+                    || Self::present(sys, &cand.join("release"))?)
             {
+                let noindex = cand.with_file_name(format!("{name}.noindex"));
+                if Self::present(sys, &noindex)? {
+                    return Err(format!(
+                        "both {} and {} exist; left unchanged",
+                        cand.display(),
+                        noindex.display()
+                    ));
+                }
                 out.push(cand);
             }
         }
@@ -190,7 +214,11 @@ impl Item for BuildNoindex {
             Ok(v) => v,
             Err(why) => return Probe::Unusable { why },
         };
-        if !has_caches && !has_store {
+        let spotlit_builds = match self.spotlit_build_dirs(sys) {
+            Ok(dirs) => dirs,
+            Err(why) => return Probe::Unusable { why },
+        };
+        if !has_caches && !has_store && spotlit_builds.is_empty() {
             return Probe::NotApplicable {
                 why: format!(
                     "neither {} nor {} exists",
@@ -222,16 +250,15 @@ impl Item for BuildNoindex {
             Ok(_) => {}
             Err(why) => return Probe::Unusable { why },
         }
-        match self.spotlit_build_dirs(sys) {
-            Ok(dirs) if !dirs.is_empty() => {
-                let names: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
-                missing.push(format!(
-                    "build folder(s) {} indexed by Spotlight",
-                    names.join(", ")
-                ));
-            }
-            Ok(_) => {}
-            Err(why) => return Probe::Unusable { why },
+        if !spotlit_builds.is_empty() {
+            let names: Vec<String> = spotlit_builds
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect();
+            missing.push(format!(
+                "build folder(s) {} indexed by Spotlight",
+                names.join(", ")
+            ));
         }
         if missing.is_empty() {
             Probe::Ok {
@@ -247,6 +274,9 @@ impl Item for BuildNoindex {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        // Admit both inventories before creating or moving any cache directory.
+        let trust_builds = self.plain_trust_builds(sys)?;
+        let spotlit_builds = self.spotlit_build_dirs(sys)?;
         if Self::dir_present(sys, &self.caches_parent())? {
             for dir in [self.cargo_build_noindex(), self.tooling_noindex()] {
                 if !Self::dir_present(sys, &dir)? {
@@ -256,7 +286,7 @@ impl Item for BuildNoindex {
             }
         }
         let store = self.trust_store();
-        for name in self.plain_trust_builds(sys)? {
+        for name in trust_builds {
             let plain = store.join(&name);
             let noindex_name = format!("{name}.noindex");
             let noindex = store.join(&noindex_name);
@@ -271,7 +301,7 @@ impl Item for BuildNoindex {
                 return Err(format!("{}: {}", ln.display(), ran.describe()));
             }
         }
-        for plain in self.spotlit_build_dirs(sys)? {
+        for plain in spotlit_builds {
             let Some(name) = plain.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
@@ -600,6 +630,10 @@ mod tests {
             home: "/Users//alice".into(),
         };
         let sys = Fake::root();
+        sys.file("/usr/bin/mdfind", b"").on(
+            "alice$ /usr/bin/mdfind -onlyin /Users//alice -0 'kMDItemFSName == \"*.rmeta\"'",
+            Ran::ok(""),
+        );
         sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
             .unwrap();
         sys.create_dir_all(
@@ -634,6 +668,27 @@ mod tests {
                 .is_some_and(|f| f.contains("cargo-build.noindex absent") && f.contains("15698")),
             "{planned:?}"
         );
+        let build = "/Users//alice/Library/Application Support/aterm/pkg/store/trust/15698";
+        let kept = format!("{build}/retained");
+        sys.file(&kept, b"existing toolchain bytes");
+        sys.create_dir_all(Path::new(&format!("{build}.noindex")), 0o755)
+            .unwrap();
+        assert!(matches!(
+            items[0].probe(&sys, &context()),
+            Probe::Unusable { .. }
+        ));
+        assert!(items[0].apply(&sys, &context()).is_err());
+        assert_eq!(
+            sys.read_file(Path::new(&kept)).unwrap(),
+            b"existing toolchain bytes"
+        );
+        assert!(
+            sys.stat(Path::new(
+                "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
+            ))
+            .is_err()
+        );
+        assert!(!sys.calls().contains(&ln.to_owned()));
     }
 
     #[test]
@@ -675,10 +730,93 @@ mod tests {
             "{planned:?}"
         );
 
-        // If target.noindex already exists alongside target, probe and apply agree not to clobber it.
+        let kept = "/Users//alice/work/demo/target/retained";
+        sys.file(kept, b"existing build bytes");
         sys.create_dir_all(Path::new("/Users//alice/work/demo/target.noindex"), 0o755)
             .unwrap();
         let after = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
-        assert_eq!(after[0].outcome, Outcome::Ok, "{after:?}");
+        assert_eq!(after[0].outcome, Outcome::Unknown, "{after:?}");
+        assert!(items[0].apply(&sys, &context()).is_err());
+        assert_eq!(
+            sys.read_file(Path::new(kept)).unwrap(),
+            b"existing build bytes"
+        );
+        assert!(
+            sys.stat(Path::new("/Users//alice/work/demo/target"))
+                .unwrap()
+                .dir
+        );
+        assert!(!sys.calls().iter().any(|call| call.contains("/bin/ln")));
+
+        let census = |reply| {
+            let sys = Fake::root();
+            sys.create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
+                .unwrap();
+            sys.file("/usr/bin/mdfind", b"").on(mdfind, reply);
+            sys
+        };
+        for reply in [
+            Ran::exit(1, "census failed"),
+            Ran::ok("/Users//alice/work/demo/target/debug/incomplete.rmeta"),
+        ] {
+            let unknown = census(reply);
+            assert!(matches!(
+                items[0].probe(&unknown, &context()),
+                Probe::Unusable { .. }
+            ));
+            assert!(items[0].apply(&unknown, &context()).is_err());
+            assert!(
+                unknown
+                    .stat(Path::new(
+                        "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
+                    ))
+                    .is_err()
+            );
+        }
+        let incomplete = census(Ran::ok(""));
+        incomplete.refuse_complete_stdout(mdfind, "complete capture unavailable");
+        assert!(matches!(
+            items[0].probe(&incomplete, &context()),
+            Probe::Unusable { .. }
+        ));
+        assert!(items[0].apply(&incomplete, &context()).is_err());
+        assert!(
+            incomplete
+                .stat(Path::new(
+                    "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
+                ))
+                .is_err()
+        );
+
+        let missing = Fake::root();
+        missing
+            .create_dir_all(Path::new("/Users//alice/Library/Caches"), 0o755)
+            .unwrap();
+        assert!(matches!(
+            items[0].probe(&missing, &context()),
+            Probe::Unusable { .. }
+        ));
+        assert!(items[0].apply(&missing, &context()).is_err());
+        assert!(
+            missing
+                .stat(Path::new(
+                    "/Users//alice/Library/Caches/aterm/cargo-build.noindex"
+                ))
+                .is_err()
+        );
+
+        let empty = census(Ran::ok(""));
+        for name in ["cargo-build.noindex", "tooling.noindex"] {
+            empty
+                .create_dir_all(
+                    &Path::new("/Users//alice/Library/Caches/aterm").join(name),
+                    0o755,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            items[0].probe(&empty, &context()),
+            Probe::Ok { .. }
+        ));
     }
 }

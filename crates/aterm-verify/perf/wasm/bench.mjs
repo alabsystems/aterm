@@ -2,11 +2,13 @@
 // Copyright 2026 Andrew Yates
 //
 // WASM-BENCH scenarios (E0): drive the REAL exports of the two shipped
-// renderer modules (both modules' glue from `verify glue`) under node and
-// report medians as one flat JSON
-// line on stdout (the harness convention the perf lanes parse). Human
-// notes go to stderr. Deterministic corpora, median-of-N + warmup — the same
-// non-flake discipline as the native harnesses.
+// renderer modules (both modules' ES module glue from `verify glue`) in a
+// page of the pinned chrome-headless-shell, V8 as the site's visitors run
+// it, and answer the medians as one flat object (`run({ cpu, gpu, font })`,
+// each by URL). Human notes go to the console, each section's after it,
+// with a yield, so the lane's hang detector hears the page between them.
+// Deterministic corpora, median-of-N + warmup — the same non-flake
+// discipline as the native harnesses.
 //
 // What each scenario fences (all BIGGER-IS-BETTER):
 //   wasm_cpu_ingest_mixed_mbps    Terminal::process over the mixed-VT workload
@@ -30,9 +32,10 @@
 //   wasm_cpu_search_build_klps    first search() after a content change — the
 //                                 all-or-nothing index rebuild in wasm.
 //   wasm_cpu_search_query_qps     repeat search() on the cached index.
-//   wasm_cpu_search_lines_per_mib indexed lines per MiB of wasm-heap GROWTH
-//                                 across the first build (RSS proxy: the linear
-//                                 memory never shrinks, so growth ≈ peak added).
+//                                 (The index's memory is the native search
+//                                 harness's counting-allocator floor: a wasm
+//                                 memory reuses what earlier scenarios freed, so
+//                                 its growth here would read 0.)
 //   wasm_cpu_restore_hz           serialize() -> fresh engine -> full replay.
 //   wasm_cpu_uniform_flood_present_fps
 //                                 bottom-pinned flood of byte-identical lines +
@@ -54,19 +57,10 @@
 //   wasm_gpu_frame_build_fps      render() WITHOUT WebGL init: pump + cell_frame
 //                                 + effects + stamp + spill run, then the GPU
 //                                 access errors — i.e. the GPU path's per-frame
-//                                 wasm-side cost. GL submission needs a browser
-//                                 (on-glass half: aterm-ctl metrics / arena).
+//                                 wasm-side cost. GL submission is the browser
+//                                 lane's (`verify browser`) and the on-glass
+//                                 half's (aterm-ctl metrics / arena).
 //   wasm_gpu_scroll_frame_build_fps  same, while scrolled through history.
-
-import { readFileSync, statSync } from 'node:fs'
-import { createRequire } from 'node:module'
-
-const require = createRequire(import.meta.url)
-const outDir = process.argv[2]
-if (!outDir) {
-  console.error('usage: node bench.mjs <dir with the cpu/ and gpu/ CommonJS glue>')
-  process.exit(2)
-}
 
 const N = 5
 const WARMUP = 1
@@ -74,26 +68,6 @@ const ROWS = 24
 const COLS = 80
 const PX = 16.0
 const THEME = [0x00e0e0e0, 0x00101010, 0x00e0e0e0, 0x00404060]
-
-// A monospace face for the ctor (the host injects font bytes on the web; here
-// the host is this harness). First readable candidate wins.
-const FONT_CANDIDATES = [
-  '/System/Library/Fonts/Monaco.ttf',
-  '/System/Library/Fonts/Supplemental/Courier New.ttf',
-  '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
-  '/usr/share/fonts/TTF/DejaVuSansMono.ttf'
-]
-function loadFont() {
-  for (const p of FONT_CANDIDATES) {
-    try {
-      return { path: p, bytes: readFileSync(p) }
-    } catch {
-      /* next candidate */
-    }
-  }
-  console.error('wasm-bench: no monospace font found among candidates', FONT_CANDIDATES)
-  process.exit(1)
-}
 
 // --- deterministic corpora (byte-identical every run: no RNG, no clock) -----
 function mixedWorkload(bytes) {
@@ -182,43 +156,48 @@ function median(samples) {
   const n = v.length
   return n % 2 === 1 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2
 }
-/** Median work-rate of `iter` (a fn returning {work, secs}) over N runs. */
-function rate(iter) {
+/** Each rate's N samples, by key, answered beside the medians (never gated). */
+const SAMPLES = {}
+/** Median work-rate of `iter` (a fn returning {work, secs}) over N runs,
+ * its samples kept under `key`. */
+function rate(key, iter) {
   for (let i = 0; i < WARMUP; i++) iter()
   const samples = []
   for (let i = 0; i < N; i++) {
     const { work, secs } = iter()
     samples.push(secs > 0 ? work / secs : Infinity)
   }
+  SAMPLES[key] = samples.map((v) => Number(v.toFixed(3)))
   return median(samples)
 }
 function timeIt(f) {
-  const t0 = process.hrtime.bigint()
+  const t0 = performance.now()
   f()
-  return Number(process.hrtime.bigint() - t0) / 1e9
+  return (performance.now() - t0) / 1e3
+}
+/** A section's line, then a yield: the page's console reaches the lane
+ * between tasks, and the lane's hang detector waits on it. */
+async function note(line) {
+  console.error(line)
+  await new Promise((r) => setTimeout(r, 0))
 }
 
-const font = loadFont()
-console.error(`wasm-bench: node ${process.version}, font ${font.path}`)
+export async function run(urls) {
+const r = await fetch(urls.font)
+if (!r.ok) throw new Error(`${urls.font}: HTTP ${r.status}`)
+const font = new Uint8Array(await r.arrayBuffer())
+await note(`wasm-bench: ${navigator.userAgent}`)
 
-const cpu = require(`${outDir}/cpu/aterm_wasm.js`)
-const gpu = require(`${outDir}/gpu/aterm_gpu_web.js`)
-const cpuWasmBytes = statSync(`${outDir}/cpu/aterm_wasm_bg.wasm`).size
-const gpuWasmBytes = statSync(`${outDir}/gpu/aterm_gpu_web_bg.wasm`).size
+const cpu = await import(urls.cpu)
+const gpu = await import(urls.gpu)
+await cpu.default()
+await gpu.default()
 
 function newCpuTerm(rows = ROWS, cols = COLS) {
-  return new cpu.AtermTerminal(rows, cols, font.bytes, PX, ...THEME)
+  return new cpu.AtermTerminal(rows, cols, font, PX, ...THEME)
 }
 function newGpuTerm(rows = ROWS, cols = COLS) {
-  return new gpu.AtermGpuTerminal(rows, cols, font.bytes, PX, ...THEME)
-}
-/** Process RSS after a GC pass (the wasm lane passes --expose-gc). The nodejs-target
- * glue keeps the wasm instance private, so linear-memory growth is observed as
- * an RSS delta — a PROXY (JS garbage pollutes it), reported but never gated;
- * the native search harness owns the precise counting-allocator floor. */
-function rssBytes() {
-  globalThis.gc?.()
-  return process.memoryUsage().rss
+  return new gpu.AtermGpuTerminal(rows, cols, font, PX, ...THEME)
 }
 
 const report = {}
@@ -226,13 +205,13 @@ const report = {}
 // --- CPU ingest -------------------------------------------------------------
 const MIX = mixedWorkload(8 << 20)
 const REPLOG = replogWorkload(8 << 20)
-report.wasm_cpu_ingest_mixed_mbps = rate(() => {
+report.wasm_cpu_ingest_mixed_mbps = rate('wasm_cpu_ingest_mixed_mbps', () => {
   const t = newCpuTerm()
   const secs = timeIt(() => t.process(MIX))
   t.free()
   return { work: MIX.length / 1e6, secs }
 })
-report.wasm_cpu_ingest_replog_mbps = rate(() => {
+report.wasm_cpu_ingest_replog_mbps = rate('wasm_cpu_ingest_replog_mbps', () => {
   const t = newCpuTerm()
   const secs = timeIt(() => t.process(REPLOG))
   t.free()
@@ -245,14 +224,14 @@ for (const [key, text] of [
   ['wasm_cpu_ingest_str_nonascii_mbps', LOG_NONASCII]
 ]) {
   const mb = utf8Length(text) / 1e6
-  report[key] = rate(() => {
+  report[key] = rate(key, () => {
     const t = newCpuTerm()
     const secs = timeIt(() => t.process_str(text))
     t.free()
     return { work: mb, secs }
   })
 }
-console.error(
+await note(
   `wasm-bench: cpu ingest mixed ${report.wasm_cpu_ingest_mixed_mbps.toFixed(1)} MB/s | ` +
     `replog ${report.wasm_cpu_ingest_replog_mbps.toFixed(1)} MB/s | ` +
     `str ascii ${report.wasm_cpu_ingest_str_ascii_mbps.toFixed(1)} MB/s | ` +
@@ -266,7 +245,7 @@ console.error(
   t.process(new TextEncoder().encode(rotatingLines(12000)))
   t.render() // settle the first full paint outside the timers
   const SCROLL_FRAMES = 200
-  report.wasm_cpu_scroll_present_fps = rate(() => {
+  report.wasm_cpu_scroll_present_fps = rate('wasm_cpu_scroll_present_fps', () => {
     t.scroll_to_bottom()
     const secs = timeIt(() => {
       for (let i = 0; i < SCROLL_FRAMES; i++) {
@@ -278,7 +257,7 @@ console.error(
   })
   const TYPE_FRAMES = 200
   t.scroll_to_bottom()
-  report.wasm_cpu_typing_present_fps = rate(() => {
+  report.wasm_cpu_typing_present_fps = rate('wasm_cpu_typing_present_fps', () => {
     const secs = timeIt(() => {
       for (let i = 0; i < TYPE_FRAMES; i++) {
         t.process_str('x')
@@ -289,45 +268,37 @@ console.error(
   })
   report.wasm_cpu_present_px = t.width * t.height
   t.free()
-  console.error(
+  await note(
     `wasm-bench: cpu scroll+present ${report.wasm_cpu_scroll_present_fps.toFixed(1)} fps | ` +
       `typing+present ${report.wasm_cpu_typing_present_fps.toFixed(1)} fps ` +
       `(${report.wasm_cpu_present_px} px frame)`
   )
 }
 
-// --- CPU search build/query/heap --------------------------------------------
+// --- CPU search build/query --------------------------------------------------
 {
   const SEARCH_LINES = 20000
   const t = newCpuTerm()
   t.set_scrollback_limit(25000)
   t.process(new TextEncoder().encode(rotatingLines(SEARCH_LINES)))
-  const before = rssBytes()
   const firstMatches = t.search('jkl', true, false)
-  const growth = rssBytes() - before
   report.wasm_cpu_search_matches = firstMatches.length / 3
-  if (growth > 0) {
-    report.wasm_cpu_search_rss_bytes_per_line = growth / SEARCH_LINES
-  }
-  report.wasm_cpu_search_build_klps = rate(() => {
+  report.wasm_cpu_search_build_klps = rate('wasm_cpu_search_build_klps', () => {
     t.process_str('x') // content change -> next search pays the full rebuild
     const secs = timeIt(() => t.search('jkl', true, false))
     return { work: SEARCH_LINES / 1000, secs }
   })
   const QUERY_BATCH = 20
-  report.wasm_cpu_search_query_qps = rate(() => {
+  report.wasm_cpu_search_query_qps = rate('wasm_cpu_search_query_qps', () => {
     const secs = timeIt(() => {
       for (let i = 0; i < QUERY_BATCH; i++) t.search('jkl', true, false)
     })
     return { work: QUERY_BATCH, secs }
   })
   t.free()
-  console.error(
+  await note(
     `wasm-bench: cpu search build ${report.wasm_cpu_search_build_klps.toFixed(1)} klines/s | ` +
-      `query ${report.wasm_cpu_search_query_qps.toFixed(0)} q/s | rss-proxy ` +
-      (report.wasm_cpu_search_rss_bytes_per_line != null
-        ? `${report.wasm_cpu_search_rss_bytes_per_line.toFixed(0)} B/line`
-        : 'unavailable')
+      `query ${report.wasm_cpu_search_query_qps.toFixed(0)} q/s`
   )
 }
 
@@ -339,14 +310,14 @@ console.error(
   const payload = source.serialize(undefined)
   source.free()
   report.wasm_cpu_restore_payload_bytes = payload.length
-  report.wasm_cpu_restore_hz = rate(() => {
+  report.wasm_cpu_restore_hz = rate('wasm_cpu_restore_hz', () => {
     const t = newCpuTerm()
     t.set_scrollback_limit(10000)
     const secs = timeIt(() => t.process_str(payload))
     t.free()
     return { work: 1, secs }
   })
-  console.error(
+  await note(
     `wasm-bench: cpu restore ${report.wasm_cpu_restore_hz.toFixed(1)} restores/s ` +
       `(${(payload.length / 1024).toFixed(0)} KiB payload)`
   )
@@ -377,7 +348,7 @@ function styledLines(n) {
   for (let i = 0; i < 2 * ROWS; i++) t.process(LINE)
   t.render()
   let bands = 0
-  report.wasm_cpu_uniform_flood_present_fps = rate(() => {
+  report.wasm_cpu_uniform_flood_present_fps = rate('wasm_cpu_uniform_flood_present_fps', () => {
     bands = 0
     const secs = timeIt(() => {
       for (let i = 0; i < FRAMES; i++) {
@@ -389,8 +360,7 @@ function styledLines(n) {
     return { work: FRAMES, secs }
   })
   if (bands !== 0) {
-    console.error(`wasm-bench: uniform flood presented ${bands} band(s) in its last run; the shape is zero-band`)
-    process.exit(1)
+    throw new Error(`wasm-bench: uniform flood presented ${bands} band(s) in its last run; the shape is zero-band`)
   }
   t.free()
 }
@@ -403,7 +373,7 @@ function styledLines(n) {
   t.render()
   let repinned = true
   let line = 0
-  report.wasm_cpu_scrolled_stream_present_fps = rate(() => {
+  report.wasm_cpu_scrolled_stream_present_fps = rate('wasm_cpu_scrolled_stream_present_fps', () => {
     const secs = timeIt(() => {
       for (let i = 0; i < FRAMES; i++) {
         const before = t.display_offset
@@ -415,8 +385,7 @@ function styledLines(n) {
     return { work: FRAMES, secs }
   })
   if (!repinned) {
-    console.error('wasm-bench: the scrolled stream stopped re-pinning the viewport; the shape is a repin')
-    process.exit(1)
+    throw new Error('wasm-bench: the scrolled stream stopped re-pinning the viewport; the shape is a repin')
   }
   t.free()
 }
@@ -426,7 +395,7 @@ function styledLines(n) {
   t.set_scrollback_limit(15000)
   t.process(new TextEncoder().encode(styledLines(12000)))
   t.render()
-  report.wasm_cpu_styled_scrub_present_fps = rate(() => {
+  report.wasm_cpu_styled_scrub_present_fps = rate('wasm_cpu_styled_scrub_present_fps', () => {
     t.scroll_to_bottom()
     const secs = timeIt(() => {
       for (let i = 0; i < FRAMES; i++) {
@@ -438,14 +407,14 @@ function styledLines(n) {
   })
   t.free()
 }
-console.error(
+await note(
   `wasm-bench: cpu uniform-flood ${report.wasm_cpu_uniform_flood_present_fps.toFixed(1)} fps | ` +
     `scrolled-stream ${report.wasm_cpu_scrolled_stream_present_fps.toFixed(1)} fps | ` +
     `styled-scrub ${report.wasm_cpu_styled_scrub_present_fps.toFixed(1)} fps`
 )
 
 // --- GPU module: ingest + per-frame wasm-side build cost --------------------
-report.wasm_gpu_ingest_mixed_mbps = rate(() => {
+report.wasm_gpu_ingest_mixed_mbps = rate('wasm_gpu_ingest_mixed_mbps', () => {
   const t = newGpuTerm()
   const secs = timeIt(() => t.process(MIX))
   t.free()
@@ -466,25 +435,24 @@ report.wasm_gpu_ingest_mixed_mbps = rate(() => {
     seam = String(e)
   }
   if (!seam.includes('before init()')) {
-    console.error(`wasm-bench: unexpected gpu render() seam: ${JSON.stringify(seam)}`)
-    process.exit(1)
+    throw new Error(`wasm-bench: unexpected gpu render() seam: ${JSON.stringify(seam)}`)
   }
   const FRAMES = 200
   const oneChar = new TextEncoder().encode('x')
-  report.wasm_gpu_frame_build_fps = rate(() => {
+  report.wasm_gpu_frame_build_fps = rate('wasm_gpu_frame_build_fps', () => {
     const secs = timeIt(() => {
       for (let i = 0; i < FRAMES; i++) {
         t.process(oneChar) // the GPU module has no process_str export
         try {
           t.render()
         } catch {
-          /* expected: no GL in node */
+          /* expected: no init(), so no GL */
         }
       }
     })
     return { work: FRAMES, secs }
   })
-  report.wasm_gpu_scroll_frame_build_fps = rate(() => {
+  report.wasm_gpu_scroll_frame_build_fps = rate('wasm_gpu_scroll_frame_build_fps', () => {
     t.scroll_to_bottom()
     const secs = timeIt(() => {
       for (let i = 0; i < FRAMES; i++) {
@@ -492,26 +460,26 @@ report.wasm_gpu_ingest_mixed_mbps = rate(() => {
         try {
           t.render()
         } catch {
-          /* expected: no GL in node */
+          /* expected: no init(), so no GL */
         }
       }
     })
     return { work: FRAMES, secs }
   })
   t.free()
-  console.error(
+  await note(
     `wasm-bench: gpu ingest ${report.wasm_gpu_ingest_mixed_mbps.toFixed(1)} MB/s | ` +
       `frame-build ${report.wasm_gpu_frame_build_fps.toFixed(1)} fps | ` +
       `scroll frame-build ${report.wasm_gpu_scroll_frame_build_fps.toFixed(1)} fps`
   )
 }
 
-// --- meta + the single JSON report line -------------------------------------
-report.wasm_cpu_module_bytes = cpuWasmBytes
-report.wasm_gpu_module_bytes = gpuWasmBytes
+// --- meta + the report (the lane adds the modules' sizes) --------------------
 report.n = N
 report.warmup = WARMUP
-const ordered = Object.fromEntries(
+const answer = Object.fromEntries(
   Object.entries(report).map(([k, v]) => [k, typeof v === 'number' ? Number(v.toFixed(3)) : v])
 )
-console.log(JSON.stringify(ordered))
+answer.samples = SAMPLES
+return answer
+}

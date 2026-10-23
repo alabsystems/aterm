@@ -1168,6 +1168,8 @@ fn is_twin(path: &Path) -> bool {
 /// Whether `path` is one of our stubs: a regular file (never a symlink), small, UTF-8, whose second line is [`STUB_MARKER`].
 #[must_use]
 pub fn is_reroute_stub(path: &Path) -> bool {
+    // A symlink is never ours (stubs are laid as regular files), and the bounded
+    // same-handle reader refuses a special or large file on the handle it reads, so a
     // swapped FIFO cannot block it.
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return false;

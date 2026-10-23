@@ -243,7 +243,7 @@ fn run(command: Command, version: &str) -> ExitCode {
         Command::Startup(set) => mac::startup(set),
         Command::Quit { own } => mac::quit(own),
         Command::Serve => mac::serve(version),
-        Command::Bridge => crate::macos::bridge(),
+        Command::Bridge => mac::bridge(),
     }
 }
 
@@ -291,27 +291,39 @@ mod mac {
     /// verb run with a scratch `$HOME` or a private state root (`ATERM_STATE_HOME`, a test's) would
     /// start a real mug that never reads what it wrote, and report on files that mug never writes,
     /// so it is refused.
-    fn login_paths() -> Result<Paths, String> {
+    pub(super) fn login_paths() -> Result<Paths, String> {
         let paths = Paths::from_env().ok_or("no home directory")?;
-        if aterm_types::dirs::runs_under_private_state_root() {
-            return Err(
+        let refusal = login_refusal(
+            aterm_types::dirs::runs_under_private_state_root(),
+            aterm_types::dirs::home_dir().as_deref(),
+            aterm_uds::account::home().as_deref(),
+        );
+        refusal.map_or(Ok(paths), Err)
+    }
+
+    /// Why a process with a private state root, or whose `home` is not the login's `account`
+    /// home, is not the login's ([`login_paths`]); `None` when it is.
+    pub(super) fn login_refusal(
+        private_root: bool,
+        home: Option<&Path>,
+        account: Option<&Path>,
+    ) -> Option<String> {
+        if private_root {
+            return Some(
                 "this process has a private state root (ATERM_STATE_HOME); the mug is the \
                  login's, and reads only the login's own files"
                     .to_string(),
             );
         }
-        if let (Some(home), Some(account)) =
-            (aterm_types::dirs::home_dir(), aterm_uds::account::home())
-            && !same_dir(&home, &account)
-        {
-            return Err(format!(
+        let (home, account) = (home?, account?);
+        (!same_dir(home, account)).then(|| {
+            format!(
                 "HOME is {}, not this login's home {}; the mug is the login's, and reads only \
                  the login's own files",
                 home.display(),
                 account.display()
-            ));
-        }
-        Ok(paths)
+            )
+        })
     }
 
     /// Whether `a` and `b` name one directory: resolved when both resolve, else as spelled.
@@ -583,6 +595,17 @@ mod mac {
         ExitCode::SUCCESS
     }
 
+    /// A bridge, refused as the mug is ([`login_paths`]): a mug that passed starts one in its
+    /// own environment, and one root ran by hand would leave its pid file root's. A refusal
+    /// exits 1, never 0, which the mug would read as a bridge that found nothing to hold.
+    pub(super) fn bridge() -> ExitCode {
+        if let Err(why) = login_paths() {
+            eprintln!("{VERB}: bridge: {why}");
+            return ExitCode::FAILURE;
+        }
+        crate::macos::bridge()
+    }
+
     /// Write the job this mug is beside its pid in the lock ([`Instance::set_label`]); a lock left
     /// without it is read as the asking build's job.
     fn name_job(instance: &mut Instance, label: &str, lock: &Path) {
@@ -591,9 +614,13 @@ mod mac {
         }
     }
 
+    /// The mug's entry, refused where every verb that acts is ([`login_paths`]): root under
+    /// sudo, which keeps the person's HOME, would otherwise make the lock and the copy theirs
+    /// to open no more, and a scratch HOME would run a second mug beside the login's.
     pub(super) fn serve(version: &str) -> ExitCode {
-        let Some(paths) = Paths::from_env() else {
-            return refuse(None, "no home directory");
+        let paths = match login_paths() {
+            Ok(paths) => paths,
+            Err(why) => return refuse(None, why),
         };
         let code_dir = paths.code_dir();
         let lock = paths.lock_file();
@@ -724,6 +751,44 @@ mod tests {
 
     fn parsed(line: &str) -> Result<Command, String> {
         parse(&words(line))
+    }
+
+    /// The judgement every verb that acts makes first ([`mac::login_paths`]): a process is the
+    /// login's only under the login's own home (one directory, however it is spelled) and no
+    /// private state root; with no HOME there is nothing to judge. This test binary has a
+    /// private root, so the live check refuses it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_the_logins_roots_run_the_mug() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let (login, other, link) = (
+            dir.path().join("login"),
+            dir.path().join("other"),
+            dir.path().join("link"),
+        );
+        std::fs::create_dir(&login).expect("login");
+        std::fs::create_dir(&other).expect("other");
+        std::os::unix::fs::symlink(&login, &link).expect("link");
+        assert_eq!(mac::login_refusal(false, Some(&login), Some(&login)), None);
+        assert_eq!(
+            mac::login_refusal(false, Some(&link), Some(&login)),
+            None,
+            "one directory, spelled twice"
+        );
+        let why = mac::login_refusal(false, Some(&other), Some(&login)).expect("another home");
+        assert!(
+            why.starts_with(&format!("HOME is {}", other.display())),
+            "{why}"
+        );
+        let why = mac::login_refusal(true, Some(&login), Some(&login)).expect("a private root");
+        assert!(why.contains("ATERM_STATE_HOME"), "{why}");
+        assert_eq!(
+            mac::login_refusal(false, None, Some(&login)),
+            None,
+            "no HOME to judge"
+        );
+        let why = mac::login_paths().expect_err("a test binary's private root");
+        assert!(why.contains("ATERM_STATE_HOME"), "{why}");
     }
 
     /// A `serve` that will not run lets a bridge an update restart left go, and exits 0; one

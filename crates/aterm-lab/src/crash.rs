@@ -158,6 +158,8 @@ fn require_instance(run: &Run, pid: i32, ops: &mut impl Ops) -> Result<(), Fail>
 /// running), the instance did not end, interrupted, or the relaunch did not
 /// come up.
 fn crash(run: &mut Run, a: &Asked, ops: &mut impl Ops) -> Result<Crashed, Fail> {
+    // A WINDOWED LAB (`forever --window`) is not crashed: the pid it records
+    // may be the keeper that holds its window's lifeline, whose SIGKILL would
     // leave the window's aterm running beside the relaunch.
     if crate::lab::windowed(run) {
         return Err(Fail::usage(format!(

@@ -49,8 +49,6 @@ pub fn run(options: &Options, observer: &mut dyn Observer) -> Report {
     run.report
 }
 
-/// The fix for locked dependencies this machine lacks. `--locked`, so a stale
-/// lock is reported online instead of silently rewritten.
 const FETCH_ONLINE: &str =
     "fetch them once online: targo fetch --locked --manifest-path libc-oracle/Cargo.toml";
 
@@ -61,8 +59,6 @@ fn stale_lock(outcome: &Outcome) -> Finding {
     }
 }
 
-/// A refused `targo metadata --locked --offline`, as a finding or as the reason
-/// the run stops.
 fn metadata_refusal(outcome: &Outcome) -> Result<Finding, CouldNotRun> {
     match outcome.locked_failure() {
         Some(LockedFailure::StaleLock) => Ok(stale_lock(outcome)),
@@ -114,7 +110,6 @@ impl Run<'_> {
         self.report.findings.extend(findings);
     }
 
-    /// Name each phase not yet reported as skipped for `why`, once any ran.
     fn skip_rest(&mut self, why: &str) {
         if self.report.phases.is_empty() {
             return;
@@ -216,9 +211,6 @@ impl Run<'_> {
         self.controls(&trust, root, cell, &reference)
     }
 
-    /// The checked-in inputs: a current lockfile, the locked dependencies on
-    /// this machine, and the cell's `union.json` names. `None` when an input is
-    /// a finding, after which no build can mean anything.
     fn inputs(
         &mut self,
         ws: &Workspace<'_>,
@@ -305,8 +297,6 @@ impl Run<'_> {
         self.phase(Phase::Siblings, since, detail, findings);
     }
 
-    /// Document both crates and compare their shapes and symbols. Returns the
-    /// reference over the cell, or `None` when the shim did not document.
     fn surface(
         &mut self,
         ws: &Workspace<'_>,
@@ -410,18 +400,12 @@ impl Run<'_> {
     }
 }
 
-/// Why the cell's names could not be had from `union.json` ([`union_names`]).
 #[derive(Debug)]
 enum UnionStop {
-    /// The file is missing: the checkout lacks an input, so nothing is decided.
     CouldNotRun(CouldNotRun),
-    /// The file is unreadable or malformed, or names no list for the cell.
     Finding(Finding),
 }
 
-/// The cell's names from the checkout's `union.json`. A missing file decides nothing
-/// (COULD NOT RUN, exit 3): no build can say anything about a cell whose list is
-/// absent. A file that is there and unusable stays a finding (FAIL, exit 1).
 fn union_names(root: &Path, cell: &Cell) -> Result<Vec<String>, UnionStop> {
     let finding = |detail| {
         UnionStop::Finding(Finding::Input {
@@ -456,8 +440,6 @@ fn read_doc(path: &Path) -> Result<Doc, CouldNotRun> {
 mod tests {
     use super::*;
 
-    /// A missing `union.json` decides nothing (COULD NOT RUN, exit 3); one that is
-    /// there and malformed is a finding (FAIL, exit 1).
     #[test]
     fn a_missing_union_could_not_run_and_a_malformed_one_is_a_finding() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");

@@ -12,8 +12,6 @@ use aterm_json::{Value, json};
 
 use crate::raw::{api, plain};
 
-/// A fake with `fixture-dev-bot` (push) and `fixture-reader` (pull) on the public
-/// `fixture-dev/app`, their tokens registered.
 fn fake() -> (FakeGithub, String, String) {
     let fake = FakeGithub::start();
     let (dev, reader) = (token("dev"), token("reader"));
@@ -28,7 +26,6 @@ fn fake() -> (FakeGithub, String, String) {
     (fake, dev, reader)
 }
 
-/// The GET's array as a list of `key` values.
 fn values(reply: &crate::raw::Reply, key: &str) -> Vec<Value> {
     reply
         .json()
@@ -792,7 +789,6 @@ fn the_default_branch_with_no_sha_set_reads_as_its_newest_commit() {
     }
 }
 
-/// A commit touching `path`.
 fn commit(sha: char, date: &str, login: Option<&str>, path: &str) -> CommitSpec {
     CommitSpec {
         sha: sha.to_string().repeat(40),

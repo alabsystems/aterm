@@ -224,7 +224,9 @@ pub fn read<T>(db: &Path, reader: impl FnOnce(&str) -> Option<T>) -> Result<T, U
 pub mod witness {
     use std::path::Path;
 
-    /// The pid of a process other than this one holding a lock on `file`'s bytes `[start.
+    /// The pid of a process other than this one holding a lock on `file`'s bytes
+    /// `[start, start + len)` that a writer's exclusive lock there would meet
+    /// (`F_GETLK`, which takes nothing), if one does now.
     fn holder(file: &std::fs::File, start: u64, len: u64) -> Option<i32> {
         use std::os::fd::AsRawFd as _;
         // SAFETY: A zeroed `flock` is a valid value of the plain C struct.

@@ -13,10 +13,8 @@ use std::time::Duration;
 use aterm_http::proxy::EnvSource;
 use aterm_http::{Body, Client, Error, Method, Phase, ProxyMode, Trust};
 
-/// A wait for something that must happen is a hang detector, never a latency budget.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// An environment with no variable set: no proxy, whatever the process has.
 struct NoEnv;
 
 impl EnvSource for NoEnv {
@@ -25,12 +23,10 @@ impl EnvSource for NoEnv {
     }
 }
 
-/// A plain-HTTP client whose deadline is the hang detector.
 fn client() -> Client {
     Client::new(Trust::Roots(Vec::new()), ProxyMode::Direct, HANG_DETECTOR)
 }
 
-/// Read one request: the head to its blank line, then `Content-Length` body bytes.
 fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     let mut seen = Vec::new();
     let mut byte = [0u8; 1];
@@ -57,11 +53,6 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     seen
 }
 
-/// A listener that answers `connections` requests in turn with `response`,
-/// reporting each request's bytes. With `hold`, each connection stays open
-/// after the answer until the test drops the returned sender, so a client
-/// that waits for body bytes the answer never sends would hang rather than
-/// see EOF.
 fn serve(
     response: &[u8],
     connections: usize,
@@ -90,7 +81,6 @@ fn serve(
     (port, rx, release)
 }
 
-/// The head of a recorded request, lowercased, for header-presence checks.
 fn lower_head(seen: &[u8]) -> String {
     let text = String::from_utf8_lossy(seen).to_ascii_lowercase();
     text.split("\r\n\r\n").next().unwrap_or_default().to_owned()
@@ -100,7 +90,6 @@ fn url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/m")
 }
 
-/// Send `method` with `body` to a fresh listener and return what it recorded.
 fn recorded(method: Method, body: Body<'_>) -> Vec<u8> {
     let (port, rx, _release) = serve(b"HTTP/1.1 204 No Content\r\n\r\n", 1, false);
     let exchange = client()

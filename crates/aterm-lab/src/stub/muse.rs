@@ -198,7 +198,7 @@ pub fn role_of(header: Option<&str>) -> String {
     if r.is_empty() { "main".into() } else { r }
 }
 
-/// One answer in Muse Code's stream ([module docs](self)): the events go out
+/// One answer in Muse Code's stream: the events go out
 /// numbered, and the items it sent are listed again by `response.completed`.
 struct Sse {
     seq: i64,

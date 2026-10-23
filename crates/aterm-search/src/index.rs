@@ -1389,6 +1389,8 @@ impl SearchIndex {
                 SearchDirection::Forward => {
                     for cap in scan.by_ref() {
                         // Skip zero-length matches (e.g. `^`, `\b`, `x*` at
+                        // non-matching positions), including byte spans that
+                        // resolve to zero display columns.
                         if cap.start() == cap.end() {
                             continue;
                         }
@@ -1926,6 +1928,7 @@ impl SearchIndex {
                     true
                 } else {
                     // Matches are ascending within the line. Once the boundary
+                    // is reached, no later match on this line can qualify.
                     false
                 }
             });

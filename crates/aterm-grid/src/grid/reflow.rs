@@ -74,7 +74,8 @@ struct ReflowResult {
 struct Laid {
     /// The blank rows under the cursor the rows end on, which the bottom-anchoring fill leaves.
     tail: usize,
-    /// The owed window's top in rows below the screen's top (above it when negative) once the top.
+    /// The owed window's top in rows below the screen's top (above it when
+    /// negative) once the top rows are pushed, before the fill moves it down.
     top: isize,
     /// The window's rows past the height under a cursor too near the top to push more top rows.
     pushed: usize,
@@ -199,7 +200,8 @@ fn resize_double_width_row_in_place(
     new_extras: &mut CellExtras,
 ) {
     let content_len = row.len() as usize;
-    // SAFETY: `new_row` is appended to `new_rows` and returned alongside `new_pages` in the same.
+    // SAFETY: `new_row` is appended to `new_rows` and returned alongside
+    // `new_pages` in the same reflow result.
     let mut new_row = unsafe { Row::new(new_cols, new_pages) };
     new_row.set_line_size(row.line_size());
     if row.is_wrapped() {
@@ -245,7 +247,10 @@ impl Grid {
     }
 
     /// Resize the grid with explicit reflow mode.
-    // COST: UNBOUNDED(scrollback-width-reflow)
+    // COST: UNBOUNDED(scrollback-width-reflow) — the width branch rewraps the
+    // whole scrollback synchronously; on the main thread under the `term` lock
+    // that can freeze the UI (`aterm-census --mainloop`). The offloaded path
+    // detaches history first.
     pub fn resize_with_reflow_mode(
         &mut self,
         new_rows: u16,
@@ -460,6 +465,7 @@ impl Grid {
         }
         let staged_before_reflow = self.storage.lazy_buffer.len();
         if staged_before_reflow > 0 && new_cols != old_cols && reflow {
+            // Only a detach window keeps rows staged through a width change:
             // they stay at the width they left at until its re-attach.
             self.storage.staged_width_stale = true;
         }
@@ -483,6 +489,7 @@ impl Grid {
                 rewrap_plan,
             );
         } else if new_cols != old_cols {
+            // No reflow - just resize each row, after counting what a
             // narrowing cuts off the screen (`ResizeShape::cut`).
             if new_cols < old_cols {
                 self.storage.last_resize_shape.cut = self.drawn_columns_past(new_cols);
@@ -552,6 +559,12 @@ impl Grid {
             self.restore_reflowed_scrollback(lines, new_cols, staged_before_reflow);
         }
         if let (Some(laid), Some(plan)) = (laid, rewrap_plan) {
+            // From a plan the fill leaves the window's blank rows that fit and
+            // pulls history for the rest; what is owed after is where that
+            // leaves the window. Inside a detach window the re-attach pays the
+            // rows this could not pull and settles what is owed with them
+            // (`Grid::settle_fill`). A window that pushed rows off the bottom
+            // fills the screen with its own rows: nothing is pulled, and its
             // blank rows are owed.
             if laid.pushed > 0 {
                 self.drop_fill_debt();
@@ -744,6 +757,8 @@ impl Grid {
             let from_back = excess - from_front;
             self.storage.last_resize_shape.pushed = row_u16(from_back);
             if from_front > 0 {
+                // Stage front rows when a retaining store is attached (without
+                // one `drain_lazy_buffer` would discard them) or detached for an
                 // off-thread reflow (flushed on re-attach).
                 if self.storage.stages_evicted_rows() {
                     let drained_rows: Vec<Row> = self.storage.rows.drain(..from_front).collect();
@@ -759,6 +774,8 @@ impl Grid {
                 }
             }
             if from_back > 0 {
+                // Push bottom visible rows to lazy scrollback before discarding,
+                // so a height shrink does not lose them, wherever a store keeps
                 // them or a detached reflow will flush them (as above).
                 if self.storage.stages_evicted_rows() {
                     let start = self.storage.rows.len() - from_back;
@@ -1325,7 +1342,8 @@ impl Grid {
         drop(std::mem::take(&mut self.storage.rows));
         self.storage.pages = result.pages;
 
-        // SAFETY: Each padding row is created against `self.storage.pages`, which remains owned.
+        // SAFETY: Each padding row is created against `self.storage.pages`, which
+        // remains owned by `self` for the lifetime of the inserted rows.
         while result.rows.len() < target_rows {
             result
                 .rows

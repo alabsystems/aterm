@@ -21,9 +21,6 @@ fn plist(app: &Path, id: &str) {
     );
 }
 
-/// What may happen at `$DEST/aterm.app`: nothing there, an aterm bundle
-/// (replaced), a damaged aterm whose binary answers (repaired), or anything
-/// else (left in place, with the remedy when it might be a damaged aterm).
 #[test]
 fn the_app_destination_verdict() {
     let scratch = Scratch::new();
@@ -91,9 +88,6 @@ fn the_app_destination_verdict() {
     }
 }
 
-/// What may happen at `$BIN_DIR/aterm`: nothing there, our symlink (into a
-/// bundle or the store, dangling or not), a pre-store regular file that
-/// answers as aterm (replaced), or anything else (left, SKIPPED).
 #[test]
 fn the_bin_entry_verdict() {
     let scratch = Scratch::new();
@@ -169,14 +163,8 @@ fn the_bin_entry_verdict() {
     }
 }
 
-/// Reads its stdin to the end, then says it is not aterm.
 const READER: &str = "#!/bin/sh\ncat >/dev/null\necho \"not-aterm 1.0\"\n";
 
-/// Says `$STALL_ANSWER`; then, unless its first argument is `$STALL_FINISHES`,
-/// parks a child (a second process: a kill of the staller's pid alone leaves it),
-/// writes its own pid and the child's to `$STALL_PARKED` (the line that shows it
-/// ran) and waits on it: a run that outlasts the hang detector unless something
-/// ends it.
 fn staller() -> String {
     format!(
         "#!/bin/sh\necho \"${{STALL_ANSWER:?}}\"\n[ \"$1\" = \"${{STALL_FINISHES:-}}\" ] && exit 0\n\
@@ -184,10 +172,6 @@ fn staller() -> String {
     )
 }
 
-/// The batch's clock as a bound reads it: a look at a parked [`staller`] (`$!`, the
-/// run the bound watches, is the pid it wrote) costs the clock an hour and no real
-/// time, and is counted in `$STALL_PARKED.looks`; every other sleep is real. And
-/// `uname` says Darwin, where find_bundle_cli looks.
 const PARKED_CLOCK: &str = r#"sleep() {
 	local run watched
 	watched="$(set +u; printf %s "$!")"
@@ -200,8 +184,6 @@ const PARKED_CLOCK: &str = r#"sleep() {
 }
 uname() { echo Darwin; }"#;
 
-/// Every place the installer asks a binary what it is runs it off the
-/// installer's stdin: under `curl … | bash` that is the rest of the script.
 #[test]
 fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
     let scratch = Scratch::new();
@@ -286,9 +268,6 @@ fn a_binary_asked_what_it_is_cannot_swallow_the_installers_stdin() {
     }
 }
 
-/// A whole run on the bundle lane hands its stdin to no binary it runs: the
-/// installed bundle's aterm, found, linked, asked what it is and set up, reads
-/// /dev/null each time.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_whole_run_hands_its_stdin_to_no_binary() {
@@ -318,10 +297,6 @@ fn a_whole_run_hands_its_stdin_to_no_binary() {
     assert_eq!(read(&read_log), "", "a run read the installer's stdin");
 }
 
-/// Every place the installer asks a binary what it is cuts off a run that
-/// never finishes once the hang detector has passed on the clock, process
-/// group and all, and takes what it printed before as no answer; setup_aterm
-/// bounds its `pkg help <verb>` likewise.
 #[test]
 fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
     let scratch = Scratch::new();
@@ -445,9 +420,6 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
     }
 }
 
-/// setup_aterm asks each binary once, whichever names reach it: the placed
-/// path, our bin link and the store's path are often one file, and a binary
-/// that never answers costs one hang detector, not one per name.
 #[test]
 fn setup_aterm_asks_each_binary_once() {
     let scratch = Scratch::new();

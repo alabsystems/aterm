@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of `aterm_models_update::native_update_editor_carry_model`
-//! (`NativeUpdateEditorCarry`): an unsaved native editor tab rides a
-//! self-update instead of holding it.
-//!
-//! Each schedule drives two real `App`s sharing one `drafts/` journal directory through the
-//! shipping code: the editor's input, the preflight and Commit revalidation
-//! (`revalidate_native_update_safety`), the successor's restore (`restore_into_window`, which
-//! reopens the file and replays the journal) and the rollback (the completion reducer, and the
-//! launched lane's stand-down). After each step the state projected from real state must equal
-//! the model's after the named actions, the real Start and Commit verdicts must be the model's
-//! guards, and at each refusal a defect machine admits what the real code refused.
+//! Tier-1 conformance tests for [`aterm_models_update::native_update_editor_carry_model`].
 
 use std::path::PathBuf;
 
@@ -26,12 +16,9 @@ use crate::native_app::{AppEvent, AppKind, AppViewState, TextInputEvent};
 use crate::native_document_io::{ContentFingerprint, JournalDocumentKey, recover_journal_for};
 use crate::{App, WindowId};
 
-/// The model's `Placeholder`: the successor's leaf is a Recovery tab.
 const PLACEHOLDER: i64 = 9;
 const DISK: &str = "base line\n";
 
-/// One outgoing App with one Editor tab over one file, the successor it hands to, and the
-/// bookkeeping that names each buffer version the model counts.
 struct Rig {
     dir: aterm_tempfile::TempDir,
     journals: PathBuf,
@@ -39,9 +26,7 @@ struct Rig {
     file: PathBuf,
     parent: App,
     document: DocumentId,
-    /// Version → the editor's text; version 0 is the file on disk.
     texts: Vec<String>,
-    /// Version → the outgoing document's sequence at that text.
     seqs: Vec<aterm_buffer::Seq>,
     phase: i64,
     successor: Option<App>,
@@ -122,7 +107,6 @@ impl Rig {
         .unwrap()
     }
 
-    /// Every model variable, read from real state.
     fn project(&self) -> State {
         let mut state = self.model.init_state();
         let head = self.parent.document_store.snapshot(self.document).unwrap();
@@ -172,8 +156,6 @@ impl Rig {
         state
     }
 
-    /// The real step `op` is the model's `actions`, fired in order from the state it started in,
-    /// and every invariant holds after it.
     fn step(&mut self, label: &str, actions: &[&str], op: impl FnOnce(&mut Self)) {
         let before = self.project();
         op(self);
@@ -181,7 +163,6 @@ impl Rig {
         crate::conformance_support::assert_fired(&self.model, label, actions, &before, &after);
     }
 
-    /// One keystroke in the outgoing editor, and the version it makes.
     fn type_key(&mut self, label: &str, key: &str, actions: &[&str]) {
         let key = key.to_string();
         self.step(label, actions, |rig| {
@@ -197,9 +178,6 @@ impl Rig {
         });
     }
 
-    /// The real preflight must be the model's Start guard. When admitted, the attempt parks at
-    /// once (the fork lane), installing the attempt record the Commit check and the journal
-    /// fences read.
     fn start(&mut self, label: &str) -> bool {
         let before = self.project();
         let real = self.parent.revalidate_native_update_safety().is_ok();
@@ -217,8 +195,6 @@ impl Rig {
         real
     }
 
-    /// The successor boots from the layout the outgoing process captures now and restores the
-    /// editor leaf exactly as the update's successor does.
     fn successor_restores(&mut self, label: &str, action: &str) {
         let layout = editor_only_layout(&self.parent.capture_restore_manifest());
         let journals = self.journals.clone();
@@ -242,7 +218,6 @@ impl Rig {
         });
     }
 
-    /// The real Commit revalidation must be the model's Commit guard.
     fn commit(&mut self, label: &str) -> bool {
         let before = self.project();
         let real = self.parent.revalidate_native_update_safety().is_ok();
@@ -257,8 +232,6 @@ impl Rig {
         real
     }
 
-    /// The candidate is killed and the outgoing process rolls back through the real completion
-    /// reducer.
     fn rollback(&mut self, label: &str, actions: &[&str]) {
         self.step(label, actions, |rig| {
             rig.successor = None;
@@ -307,11 +280,8 @@ impl Rig {
     }
 }
 
-/// The fork lane's attempt: launched and parked at once.
 const FORKED: u64 = 1;
 
-/// The attempt record the park installs, with the same-image QA seam's authority so the
-/// completion reducer writes no update ledger.
 fn parked_record(attempt_id: u64) -> crate::PendingUpdateHandoff {
     let (cancel, _cancelled) = std::sync::mpsc::sync_channel(1);
     crate::PendingUpdateHandoff {
@@ -343,8 +313,6 @@ fn parked_record(attempt_id: u64) -> crate::PendingUpdateHandoff {
     }
 }
 
-/// Window 0 of `manifest` with only its editor tab: what the successor's restore does with an
-/// editor leaf, without spawning shells for the rest.
 fn editor_only_layout(manifest: &crate::restore::RestoreManifest) -> crate::restore::WindowLayout {
     let window = manifest.windows.first().expect("window 0");
     let editor = window
@@ -378,9 +346,6 @@ fn editor_only_layout(manifest: &crate::restore::RestoreManifest) -> crate::rest
     }
 }
 
-/// A draft typed, journaled and verified rides the update: the successor's editor holds exactly
-/// the outgoing text, dirty, with the caret in place and a status saying the draft was carried;
-/// the file on disk is untouched.
 #[test]
 fn a_journaled_draft_is_carried_and_restored_exactly() {
     let mut rig = Rig::new("round-trip");
@@ -411,9 +376,6 @@ fn a_journaled_draft_is_carried_and_restored_exactly() {
     rig.assert_file_untouched();
 }
 
-/// Typing into the outgoing editor during the overlap holds the Commit (the successor restored
-/// the older text), and the rollback gives the journal back, so the next attempt carries the
-/// newer draft.
 #[test]
 fn typing_during_the_overlap_holds_the_commit_and_the_rollback_reseats() {
     let mut rig = Rig::new("overlap-typing");
@@ -446,8 +408,6 @@ fn typing_during_the_overlap_holds_the_commit_and_the_rollback_reseats() {
     rig.assert_file_untouched();
 }
 
-/// A rollback that forgets the successor's image leaves the outgoing journal refusing every
-/// append: with the re-seat, the next keystroke is durable.
 #[test]
 fn a_rollback_without_its_reseat_would_wedge_the_journal() {
     let mut rig = Rig::new("forgotten-image");
@@ -472,9 +432,6 @@ fn a_rollback_without_its_reseat_would_wedge_the_journal() {
     );
 }
 
-/// An append on the worker when the update parks lands on the successor's byte-identical
-/// republication after the successor read the older image: the image replays to the outgoing
-/// text, which the successor does not hold, so the `late` fact refuses the Commit.
 #[test]
 fn an_append_landing_after_the_park_holds_the_commit() {
     let mut rig = Rig::new("late-landing");
@@ -506,9 +463,6 @@ fn an_append_landing_after_the_park_holds_the_commit() {
     rig.rollback("rollback", &["Rollback", "Reseat"]);
 }
 
-/// A successor whose restore fails leaves a Recovery tab, and the journal it would reopen holds
-/// the draft, so the Commit may proceed and nothing is lost. Its Retry replays the draft once the
-/// journal is free.
 #[test]
 fn a_failed_successor_restore_leaves_the_draft_in_the_journal() {
     let mut rig = Rig::new("failed-restore");
@@ -520,8 +474,6 @@ fn a_failed_successor_restore_leaves_the_draft_in_the_journal() {
         .unwrap();
     let lock = crate::native_document_journal::hold_journal_lock_for_test(&path);
     rig.successor_restores("restore refused busy", "RestoreFails");
-    // The guard releases by LOCK_UN, not by close alone: a child another test is forking holds
-    // this descriptor until it execs, and the successor's open has a 25 ms lock budget.
     drop(lock);
     assert!(
         rig.commit("commit"),
@@ -541,19 +493,13 @@ fn a_failed_successor_restore_leaves_the_draft_in_the_journal() {
     rig.assert_file_untouched();
 }
 
-/// A crash between journal and Commit loses nothing either way: the outgoing process dying
-/// after the successor restored leaves the draft in the successor; the successor dying leaves it
-/// in the outgoing process and in the journal, for whichever process opens the file next.
 #[test]
 fn a_crash_between_the_journal_and_the_commit_keeps_the_draft() {
     let mut rig = Rig::new("crash");
     rig.type_key("draft", "a", &["Type", "Plan", "Land"]);
     assert!(rig.start("start"));
     rig.successor_restores("restore", "Restore");
-    // The outgoing process dies here: the successor already holds the draft.
     assert_eq!(rig.successor_editor().0, rig.texts[1]);
-    // …and the successor dies instead: the outgoing process still holds it, and a process
-    // opening the file next replays it from the journal.
     rig.successor = None;
     assert_eq!(
         &*rig
@@ -578,9 +524,6 @@ fn a_crash_between_the_journal_and_the_commit_keeps_the_draft() {
     rig.assert_file_untouched();
 }
 
-/// A digest mismatch holds the update and says so: an image that no longer replays to the
-/// editor's text (another text's journal written over it), or one that does not decode, is never
-/// carried; saving clears the blocker.
 #[test]
 fn a_journal_that_does_not_verify_holds_the_update_with_a_reason() {
     let mut rig = Rig::new("digest");
@@ -591,7 +534,6 @@ fn a_journal_that_does_not_verify_holds_the_update_with_a_reason() {
         .unwrap();
     let good = std::fs::read(&path).unwrap();
 
-    // One flipped byte in the draft payload: a record checksum fails.
     let mut flipped = good.clone();
     let last = flipped.len() - 12;
     flipped[last] ^= 0x20;
@@ -615,7 +557,6 @@ fn a_journal_that_does_not_verify_holds_the_update_with_a_reason() {
         "and the row tells the person what clears it"
     );
 
-    // A well-formed image of a different text: it decodes, and still is not this editor's buffer.
     let other = crate::document_store::DocumentSnapshot {
         id: rig.document,
         seq: aterm_buffer::Seq(1),
@@ -632,7 +573,6 @@ fn a_journal_that_does_not_verify_holds_the_update_with_a_reason() {
     };
     assert!(why.contains("current text"), "{why}");
 
-    // The image restored: carried again.
     std::fs::write(&path, &good).unwrap();
     assert!(matches!(
         rig.parent.draft_carry(rig.document),
@@ -641,10 +581,6 @@ fn a_journal_that_does_not_verify_holds_the_update_with_a_reason() {
     rig.assert_file_untouched();
 }
 
-/// The file changed under the update: the successor finds contents the draft was not made
-/// against, so it preserves the journal aside and opens the file as it now is. The Commit check
-/// reads the successor's republication, which no longer replays to the outgoing text, and
-/// refuses, so the outgoing process keeps the draft.
 #[test]
 fn a_file_changed_before_the_successor_read_it_holds_the_commit() {
     let mut rig = Rig::new("disk-changed");
@@ -726,7 +662,6 @@ fn prelaunch_record() -> crate::HandoffPrelaunch {
     }
 }
 
-/// The worker's completion for a candidate it killed and reaped.
 fn rejected(attempt_id: u64) -> crate::UpdateHandoffCompletion {
     crate::UpdateHandoffCompletion {
         attempt_id,
@@ -742,10 +677,6 @@ fn rejected(attempt_id: u64) -> crate::UpdateHandoffCompletion {
     }
 }
 
-/// The launched lane (macOS): the successor is launched and held before the park while the
-/// outgoing editor journals normally. Stood down after the park, the re-seat is fenced (nothing
-/// is appended over the successor's image) until the completion that retires the attempt
-/// record runs it. Stood down before the park, nothing is owed.
 #[test]
 fn the_launched_lane_journals_through_the_hold_and_reseats_after_its_stand_down() {
     let mut rig = Rig::new("launched-lane");
@@ -804,8 +735,6 @@ fn the_launched_lane_journals_through_the_hold_and_reseats_after_its_stand_down(
     rig.assert_file_untouched();
 }
 
-/// A draft whose latest edit is still on the worker is waited out without a word to the person
-/// (`Wait:`), never carried and never a Save row.
 #[test]
 fn a_draft_still_being_journaled_is_waited_out() {
     let mut rig = Rig::new("writing");
@@ -829,14 +758,8 @@ fn a_draft_still_being_journaled_is_waited_out() {
     assert!(rig.start("start"));
 }
 
-/// A journal that keeps refusing is reported, not waited on. The update retries a failed append
-/// itself (`App::drive_owed_document_journals`) just before the preflight, so a retry is always
-/// in flight when it reads the draft; a recurring failure (another writer's image, a full disk)
-/// must still reach the person as the row asking them to save. The probe is the real update
-/// entry (`apply_debug_seamless_update`).
 #[test]
 fn a_journal_that_keeps_refusing_holds_the_update_out_loud() {
-    // A blocked attempt writes the shared apply ledger (`record_apply_outcome_in_ledger`).
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut rig = Rig::new("refusing-journal");
     rig.parent.hold_journal_appends_for_test();
@@ -851,8 +774,6 @@ fn a_journal_that_keeps_refusing_holds_the_update_out_loud() {
         .document_journal_path_for_test(rig.document)
         .unwrap();
     let ours = std::fs::read(&path).unwrap();
-    // Another writer republishes the journal: every append this store plans against its own
-    // image fails from now on.
     let foreign = crate::native_document_io::encode_journal(&[
         crate::native_document_io::JournalRecord::snapshot_for(
             rig.key(),
@@ -893,7 +814,6 @@ fn a_journal_that_keeps_refusing_holds_the_update_out_loud() {
             "probe {probe}: {reasons:?}"
         );
     }
-    // The update's own retry is on the worker: with the image this store's again it lands.
     std::fs::write(&path, &ours).unwrap();
     assert!(rig.parent.run_held_journal_append_for_test());
     let token = rig
@@ -904,10 +824,6 @@ fn a_journal_that_keeps_refusing_holds_the_update_out_loud() {
     rig.assert_file_untouched();
 }
 
-/// A clean document's failing re-seat (owed by every journal after a rollback) carries and
-/// reports nothing, so the update does not retry it, which would read as a write in flight at
-/// every probe. Only an unsaved draft's failed write is retried by the update; a clean one at
-/// its document's next drive and after a rollback.
 #[test]
 fn a_clean_documents_failing_reseat_does_not_hold_the_update_in_silence() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -940,7 +856,6 @@ fn a_clean_documents_failing_reseat_does_not_hold_the_update_in_silence() {
                 "probe {probe}: the re-seat failed and is owed again"
             );
         }
-        // The automatic lane's order: drive the owed journals, then ask.
         rig.parent.drive_owed_document_journals();
         verdicts.push(rig.parent.revalidate_native_update_safety().map(|_| ()));
     }
@@ -958,8 +873,6 @@ fn a_clean_documents_failing_reseat_does_not_hold_the_update_in_silence() {
     rig.assert_file_untouched();
 }
 
-/// A headless successor restores no document tab (`main_entry` takes the handoff layout only
-/// with a window), so a headless process never carries a draft: the update waits and says why.
 #[test]
 fn a_headless_process_never_carries_a_draft() {
     let mut rig = Rig::new("headless");
@@ -994,10 +907,6 @@ fn a_headless_process_never_carries_a_draft() {
     );
 }
 
-/// A child forked while the journal lock is held keeps a copy of its open file description
-/// until it execs, so a lock released only by close would refuse the keystroke's inline append.
-/// The copy is kept past the keystrokes here; each step is still `Type`, `Plan`, `Land`
-/// because the holder releases by `LOCK_UN`.
 #[test]
 fn a_shell_forked_while_the_journal_lock_is_held_costs_no_keystroke_its_draft() {
     let forked = crate::native_document_journal::ForkedJournalLockCopies::start();
@@ -1024,9 +933,6 @@ fn a_shell_forked_while_the_journal_lock_is_held_costs_no_keystroke_its_draft() 
     );
 }
 
-/// An update carries at most `CARRIED_DRAFTS_CAP_BYTES` of unsaved text,
-/// summed over every draft. At the cap everything rides; one byte over and
-/// nothing does, each draft held.
 #[test]
 fn the_carry_is_capped_past_it() {
     let at_cap = DraftCarryTally::of(
@@ -1056,8 +962,6 @@ fn the_carry_is_capped_past_it() {
     assert_eq!(over.refused.len(), 2, "every draft is held");
 }
 
-/// A token that carries a draft is refused by the cold lane (no layout is handed over, so the
-/// editor tab would close), with the refusal a person clears by saving.
 #[test]
 fn a_carried_draft_never_rides_the_cold_lane() {
     let mut rig = Rig::new("cold-lane");

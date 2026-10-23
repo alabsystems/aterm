@@ -32,7 +32,7 @@ pub const GLINT_RISE_CELLS: f32 = 0.9;
 /// How far the echo runs behind its ring, in cells.
 pub const GLINT_ECHO_CELLS: f32 = 3.5;
 
-/// The echo's strength.
+/// The echo's strength against its ring's.
 pub const GLINT_ECHO_GAIN: f32 = 0.4;
 
 /// A cell row's height in cells of width, for [`cell_distance`].

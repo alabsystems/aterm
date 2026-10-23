@@ -238,6 +238,8 @@ where
     let (tx, rx) = mpsc::sync_channel(1);
     let helper_host = host.to_owned();
     spawn(Box::new(move || {
+        // The receiver may be gone (the request timed out): the answer is
+        // dropped, which is all a late lookup can do. A failed spawn drops
         // this closure without invoking the resolver.
         let _ = tx.send(lookup(resolver, &helper_host, port));
     }))

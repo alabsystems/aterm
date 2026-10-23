@@ -268,8 +268,9 @@ fn cruise_judged(
 }
 
 /// Before aterm ends on a Cruise control: the tab's `autopilot` (its
-/// `status`'s word) must be Cruise.
-///
+/// `status`'s word) must be Cruise. Under Land or Off — a config default
+/// (`LAB_HARNESS_KEYS`) — the control would prove nothing of Cruise's
+/// carry-on: COULD NOT RUN.
 /// # Errors
 /// The tab is not under Cruise.
 fn cruise_is_the_control(autopilot: &str) -> Result<(), Fail> {
@@ -314,6 +315,7 @@ fn leaf_carries(text: &str, sid: &str, on_leaf: fn(&aterm_toml::Table) -> bool) 
 }
 
 /// The status word `key=` of the door's tab as its `status` prints it (`?`
+/// where it does not).
 fn status_word(door: &Door<'_>, key: &str) -> String {
     door.out(&["status"])
         .split_whitespace()
@@ -323,8 +325,10 @@ fn status_word(door: &Door<'_>, key: &str) -> String {
 }
 
 /// Before the run puts the tab under Land: its `autopilot` (its `status`'s
-/// word) must not be Land already.
-///
+/// word) must not be Land already. A config default of Land
+/// (`LAB_HARNESS_KEYS`) reopens every tab under Land whatever the layout
+/// held, so the restored tab's Land would prove nothing of the crash
+/// journal (review LAB-3): COULD NOT RUN.
 /// # Errors
 /// The tab is under Land already.
 fn land_proves_the_journal(autopilot: &str) -> Result<(), Fail> {
@@ -628,8 +632,13 @@ pub(crate) fn hold_tab(run: &Run, door: &Door<'_>) -> Result<(), Fail> {
 /// The owner's word on tab `sid`, just said at `t0` (a hold, a Land),
 /// reaches the layout the next launch reads before aterm ends: the live
 /// instance's own crash journal ([`own_journal_carries`]) carries it on the
-/// tab's leaf (`on_leaf`; 30 s, said either way).
-///
+/// tab's leaf (`on_leaf`; 30 s, said either way). aterm journals such a word
+/// on the loop turn that moved it (`crash_journal::Lane::note_owner_words`);
+/// a run that ended aterm without waiting measured the write throttle, not
+/// the restore (the live lab of 2026-10-17). One whose journal never carries
+/// it has FAILED before any restore, and says so — aterm is not ended, and no
+/// restore is judged, so the fault is never pinned on the restore (reviews
+/// OW-L2 and LAB-2).
 /// # Errors
 /// The journal never carried the word (FAIL, exit 1), or interrupted.
 fn journal_carries(

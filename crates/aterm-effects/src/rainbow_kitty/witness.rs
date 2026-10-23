@@ -133,6 +133,7 @@ fn shift_block(
                 } else if there.is_blank() {
                     tail = true;
                 } else {
+                    // A glyph of the tail standing on other text: a
                     // rewrite, not a move.
                     return None;
                 }
@@ -1200,12 +1201,16 @@ impl Witness {
                         self.seen[i].deferred = true;
                     }
                 } else if self.was_blank(cell) {
+                    // No verdict this walk: it keeps what the witness knew
                     // ([`Witness::blank_seen`]).
                     self.blank_next.push((cell.row, cell.col, cell.born));
                 }
                 continue;
             }
             if cell.leaving() {
+                // A cell a partial release stamped onto the retract keeps its
+                // released record while resident, so an identical redraw can
+                // still restore it ([`Witness::restored_runs`],
                 // `Ribbon::restore_releases`).
                 if cell.released_at.is_some()
                     && let Some(i) = self.find(cell.row, cell.col, cell.born)
@@ -1216,6 +1221,8 @@ impl Witness {
                         !unit.is_blank() && unit != self.seen[i].unit
                     });
                     if replaced {
+                        // A dark partial release is still an identity claim:
+                        // different content revokes it rather than letting a
                         // later coincidentally identical repaint restore it.
                         Self::push_unit(retire, cell.row, cell.col, cell.born, self.seen[i].unit);
                     } else {
@@ -1794,6 +1801,8 @@ impl Witness {
             .filter(|c| !c.leaving() && cohorts.binary_search(&c.cohort).is_ok())
         {
             if let Some(i) = self.find(cell.row, cell.col, cell.born) {
+                // A held blank goes back to never-armed: un-released, it would
+                // be a blank record no walk can name (blank over blank is a
                 // redraw), and a later whole-line clear would read as partial.
                 if self.seen[i].unit.is_blank() {
                     self.seen.remove(i);

@@ -14,7 +14,6 @@ use aterm_dbus::conn::HANDSHAKE_TIMEOUT;
 use aterm_dbus::{Connection, Error, Message, Value};
 use aterm_uds::CtlStream;
 
-/// A wait for something that must happen: a hang detector, not a budget.
 const HANG: Duration = Duration::from_secs(60);
 
 fn recorded(name: &str) -> Vec<u8> {
@@ -35,8 +34,6 @@ fn line(s: &mut CtlStream) -> Vec<u8> {
     out
 }
 
-/// A bus that accepts the handshake, answers Hello, then writes `after` and
-/// either reads until the client closes or (`hang_up`) closes its end.
 fn bus_then(after: Vec<u8>, hang_up: bool) -> (CtlStream, thread::JoinHandle<()>) {
     let (ours, mut bus) = CtlStream::pair().unwrap();
     let served = thread::spawn(move || {
@@ -192,9 +189,6 @@ fn a_hangup_is_closed_and_a_refusal_fails_the_handshake() {
     assert!(matches!(conn.recv(Some(HANG)), Err(Error::Closed)));
 }
 
-/// A bus that answers the handshake and then reads nothing more: a daemon
-/// frozen (SIGSTOP) or wedged after the client joined. The server's end comes
-/// back from the thread, unread, so its socket stays open.
 fn silent_bus() -> (CtlStream, thread::JoinHandle<CtlStream>) {
     let (ours, mut bus) = CtlStream::pair().unwrap();
     let served = thread::spawn(move || {
@@ -211,15 +205,12 @@ fn silent_bus() -> (CtlStream, thread::JoinHandle<CtlStream>) {
     (ours, served)
 }
 
-/// A signal larger than any socket buffer, so a bus that reads nothing can
-/// never take all of it.
 fn too_big_to_buffer() -> Message {
     Message::signal("/org/aterm/test", "org.aterm.Test", "Flood")
         .unwrap()
         .with_body(vec![Value::Str("x".repeat(8 << 20))])
 }
 
-/// Sends `msg` on another thread; what the send returned, once it returned.
 fn sending(
     mut conn: Connection,
     msg: Message,

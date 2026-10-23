@@ -1,46 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HOW MUCH OF EACH MAPPED FONT FILE THE FONT STACK TOUCHES ON WINDOWS — the
-//! "pages fault in only when touched" half of the mapped-font case, which
-//! `docs/measured/win-heap-2026-08-29.md` §6.1 says main has not measured. A
-//! measurement, not a gate:
-//!
-//! ```sh
-//! targo --unverified bench -p aterm-render --bench font_residency
-//! ```
-//!
-//! For each file of the Windows font seal (§2 of that record) that
-//! `font_file::admit_font_file` maps (`MAPPABLE_FONT_ROOTS`), every arm takes a
-//! fresh mapping of its own, so a page one arm faulted in is never counted by
-//! the next, and asks the kernel (`QueryWorkingSetEx`) how many of the view's
-//! pages are valid in this process's working set, and how many of those are
-//! shared (file-backed, not private commit), after:
-//!
-//! - `map`: the admission alone (open, size bound, map), nothing read;
-//! - `admit`: the admission's verdict, `aterm_font::Face::parse` and a non-zero
-//!   `units_per_em`, what `face_admissible` asks before a face enters the chain;
-//! - `cmap`: that, then the render thread's coverage question for one code point
-//!   of every script the chain carries (`Face::glyph_index`);
-//! - `parse`: the face materialised (`Font::from_shared`, what a chain face's
-//!   first draw runs through `LazyFontdue::get`);
-//! - `draw`: that, then each covered sample rasterized at 16 px.
-//!
-//! NON-VACUITY: a file that was not mapped, or that the admission refused, is
-//! named and fails the run, since its counts would measure a copy or a failed
-//! parse; a file that is absent is named as not measured.
-//!
-//! Re-derived on 2026-10-19 from win/font-mmap ede86746e2's `font_mmap::residency`
-//! probe and its `#[ignore]`d `how_much_of_each_font_file_the_font_stack_actually_touches`
-//! (2026-08-29, tag `archive/win-font-mmap`), whose arms measured that branch's
-//! fontdue admission; these measure main's. Public API only, as
-//! `first_frame_per_script`. Windows only: elsewhere it says so and exits.
-//! Type-checked for Windows from macOS (`verify cells --cell win --cell win-arm`);
-//! its first run is owed to a Windows host (`docs/WINDOWS_PARAGON_DESIGN.md` §8).
+//! Measures how many pages of each mapped Windows font file the font stack faults in.
 
-/// The files the Windows seal reads (`docs/measured/win-heap-2026-08-29.md` §2):
-/// the fallback chain in `FALLBACK_CANDIDATES`' order, then the symbol and
-/// colour faces.
+/// The fallback, symbol, and colour font files measured on Windows.
 #[cfg(windows)]
 const SEAL_FILES: &[&str] = &[
     "msyh.ttc",
@@ -56,9 +19,7 @@ const SEAL_FILES: &[&str] = &[
     "seguiemj.ttf",
 ];
 
-/// One code point per script the chain names a face for
-/// (`windows_fallback_chain_covers_the_scripts_it_claims`), then the symbol
-/// slot's and the colour slot's.
+/// One sample code point per fallback script, plus the symbol and colour slots.
 #[cfg(windows)]
 const SCRIPT_SAMPLES: &[char] = &[
     '\u{4E2D}',  // Han
@@ -88,8 +49,7 @@ const SCRIPT_SAMPLES: &[char] = &[
     '\u{1F600}', // the colour slot
 ];
 
-/// The kernel's answer for one view: which of its pages are in this process's
-/// working set.
+/// Queries which pages of a mapped view are in this process's working set.
 #[cfg(windows)]
 mod residency {
     use std::ffi::c_void;
@@ -114,14 +74,11 @@ mod residency {
     /// The small page on both Windows triples aterm builds (x86_64, aarch64).
     pub(crate) const PAGE: usize = 4096;
 
-    /// How many of `view`'s pages are VALID in this process's working set, and
-    /// how many of those the kernel reports SHARED (a section other processes
-    /// can map too, not private commit).
+    /// Returns `(resident, shared)` page counts for `view` in this process's working set.
     pub(crate) fn resident_pages(view: &[u8]) -> (usize, usize) {
         let base = view.as_ptr();
         let mut info: Vec<WorkingSetExInformation> = (0..view.len().div_ceil(PAGE))
             .map(|page| WorkingSetExInformation {
-                // Inside the view: `page * PAGE < len` for every page counted.
                 virtual_address: base.wrapping_add(page * PAGE).cast_mut().cast::<c_void>(),
                 attributes: 0,
             })
@@ -160,9 +117,7 @@ mod residency {
     }
 }
 
-/// One arm's pages: `work` runs on a fresh mapping of `path`, and the pages
-/// valid after it are counted, with the shared ones among them. `Err` names a
-/// file that was not mapped.
+/// Runs `work` on a fresh mapping of `path` and returns its `(resident, shared)` page counts.
 #[cfg(windows)]
 fn pages_after(
     path: &std::path::Path,
@@ -197,8 +152,7 @@ fn covered(bytes: &[u8]) -> usize {
     })
 }
 
-/// One file's five arms, each on its own mapping, in the module note's order,
-/// with the admission's verdict and the samples face 0 covers.
+/// Five residency arms for a single font file, with its admission verdict and coverage count.
 #[cfg(windows)]
 struct Arms {
     pages: [(usize, usize); 5],

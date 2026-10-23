@@ -61,7 +61,6 @@ impl Api {
             .map_err(fetch::GetError::into_message)
     }
 
-    /// Keep response status typed until per-package absence is classified.
     fn doc_checked(
         &self,
         rel_url: &str,
@@ -355,7 +354,6 @@ pub(super) fn cask_record(v: &Value, token: &str) -> Result<Cask, String> {
     Ok(c)
 }
 
-/// GET one API document, bounded like every cached one.
 fn get_document(rel_url: &str) -> Result<Vec<u8>, fetch::GetError> {
     let bytes = fetch::curl_get_with_status(&format!("{API_BASE}/{rel_url}"), &[])?;
     if bytes.len() > API_BYTES {
@@ -382,7 +380,6 @@ pub struct IndexRow {
     pub auto_updates: bool,
 }
 
-/// Report rows from a whole-index document.
 fn index_rows(v: &Value, casks: bool) -> Vec<IndexRow> {
     let mut out = Vec::new();
     if let Some(arr) = v.as_array() {
@@ -512,8 +509,6 @@ pub(super) fn dependency_formula(
     Ok(formula)
 }
 
-/// A 404 from the per-package API is a plain "no such package",
-/// not a transport failure worth showing curl's stderr for.
 fn not_found_error(error: fetch::GetError, kind: &str, name: &str) -> String {
     if error.is_not_found() {
         format!("abrew: no such {kind}: {name}")
@@ -526,8 +521,6 @@ fn parse_json(bytes: &[u8]) -> Result<Value, String> {
     aterm_json::from_slice(bytes).map_err(|e| format!("abrew: bad API JSON: {e}"))
 }
 
-/// A GHCR bearer token for one bottle blob repository, e.g.
-/// `homebrew/core/wget` (bottle files live on ghcr.io).
 fn percent_encode(value: &str) -> String {
     let mut out = String::new();
     for b in value.bytes() {

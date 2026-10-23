@@ -12,7 +12,8 @@ pub const WARN_AFTER: Duration = Duration::from_secs(1);
 /// The base age at which a stall is published for a program spinning meanwhile.
 pub const STALL_AFTER: Duration = Duration::from_secs(10);
 
-/// The base age at which a program asleep (little CPU.
+/// The base age at which a program asleep (little CPU, nothing drawn) with input
+/// waiting is published as stalled, stretched like [`STALL_AFTER`].
 pub const QUIET_STALL_AFTER: Duration = Duration::from_secs(300);
 
 /// How contended the machine's CPUs are while a watch looks.
@@ -369,7 +370,8 @@ pub struct InputBacklog {
     pub output_backlog: Option<usize>,
 }
 
-/// How many bytes a non-canonical slave's input queue takes before a write into the master.
+/// How many bytes a non-canonical slave's input queue takes before a write into
+/// the master answers EAGAIN (xnu's `TTYHOG - 2`, cbreak and raw alike).
 pub const KERNEL_QUEUE_ROOM: usize = 1022;
 
 impl InputBacklog {

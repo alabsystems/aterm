@@ -73,7 +73,8 @@ unsafe fn cell<'a, T: Class>(ptr: usize) -> Result<&'a Cell<T>, Thrown> {
     if ptr == 0 {
         return Err(Thrown::Error(NULL.to_string()));
     }
-    // SAFETY: a live handle of any class is a `Cell<_>` whose first field, at offset 0.
+    // SAFETY: a live handle of any class is a `Cell<_>` whose first field,
+    // at offset 0 (`repr(C)`), is exactly this Header, at its own alignment.
     let header = unsafe { &*(ptr as *const Header) };
     if header.type_id != TypeId::of::<T>() || header.tag.get() != T::TAG {
         return Err(Thrown::Error(WRONG_CLASS.to_string()));
@@ -258,7 +259,8 @@ mod tests {
         }
         assert_eq!(CUzpSYPuOo::TAG, CPmqmZnSBt::TAG, "a genuine collision");
         let ptr = into_raw(CUzpSYPuOo(7));
-        // SAFETY: ptr stays a live handle, both types have the same valid representation, and no.
+        // SAFETY: ptr stays a live handle, both types have the same valid
+        // representation, and no wrongly admitted value is dereferenced.
         let (shared, exclusive) = unsafe {
             let shared = borrow::<CPmqmZnSBt>(ptr).err();
             let exclusive = borrow_mut::<CPmqmZnSBt>(ptr).err();

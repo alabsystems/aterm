@@ -478,6 +478,7 @@ fn a_stall_between_two_reads_changes_nothing() {
         Some(TYPED_BEFORE_MS),
         Build::Shipped,
         |m, _| {
+            // The box's first read is the second read: the busy screen's is
             // the first.
             m.stall_after_read.insert(2, Duration::from_millis(4_500));
         },

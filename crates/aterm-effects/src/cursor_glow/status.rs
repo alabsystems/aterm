@@ -718,6 +718,7 @@ impl CursorGlow {
     #[must_use]
     pub const fn rainbow_phase(&self) -> f32 {
         // While v2 owns the frame the shared phase ring is v2's spine clock; at
+        // rest the ring is at its origin.
         if self.v2.engaged() {
             return self.v2.phase();
         }
@@ -747,6 +748,7 @@ impl CursorGlow {
     #[must_use]
     pub fn rainbow_head_rgb(&self, cfg: &GlowConfig) -> Option<u32> {
         // While v2 owns the frame the head colour is read off the seated stop,
+        // so a cell death under a parked caret cannot move it.
         if self.v2.engaged() {
             let v2_cfg = rk::Config::from_glow(cfg, self.reduced_motion);
             return match self.v2_stop {

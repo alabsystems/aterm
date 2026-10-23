@@ -137,7 +137,7 @@ impl OverlayKind {
 
     /// The variant tag [`Overlay::fingerprint`] seals the inner hash with. Distinct per
     /// kind.
-    fn tag(self) -> u64 {
+    const fn tag(self) -> u64 {
         match self {
             OverlayKind::Palette => 3,
             OverlayKind::Overview => 7,
@@ -148,7 +148,7 @@ impl OverlayKind {
 /// Fold a variant tag into a surface's inner fingerprint: rotated into the top byte so
 /// two kinds with equal inner hashes still differ, and `| 1` so the result is never the
 /// closed sentinel `0`.
-fn seal(tag: u64, inner: u64) -> u64 {
+const fn seal(tag: u64, inner: u64) -> u64 {
     (tag.rotate_left(56) ^ inner) | 1
 }
 
@@ -178,7 +178,7 @@ impl Overlay {
     }
 
     /// Which surface this slot holds.
-    pub(crate) fn kind(&self) -> OverlayKind {
+    pub(crate) const fn kind(&self) -> OverlayKind {
         match self {
             Overlay::Palette(_) => OverlayKind::Palette,
             Overlay::Overview(_) => OverlayKind::Overview,

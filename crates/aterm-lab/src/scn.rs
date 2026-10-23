@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The frame-stream tools: survey scenarios against the REAL Claude Code, and
-//! `selftest`'s cycle, `watch` and `catch` on a lab that is up.
-//!
-//! ```text
-//! aterm-lab scn list                          the scenario names
-//! aterm-lab scn run <scenario> [--n N] [--start K]   N fresh labs, numbered from K (1)
-//! aterm-lab scn show <run>                    one run's summary.json (`show x-tail-dump-53-01`)
-//! aterm-lab scn agg [<scenario>]              min/median/max of the survey cycle over <scenario>-NN (s1-plain)
-//! ```
-//!
-//! One fresh lab per run (tag `survey`, or `$LAB_TAG`): the forced card is
-//! shown once per Claude process, and the harness is fresh. Every run writes
-//! `$LAB_STATE/results/<scenario>-<k>/{frames.jsonl, journal.jsonl,
-//! timeline.txt, summary.json, cast.jsonl, status.txt, stub.log, tapes/}`,
-//! each afresh (`tapes/` holds the run's own harness tapes, its loops ended
-//! first: `crate::tape`). Run one scenario at a time: every run is a lab
-//! with the same tag. A person is simulated with `ctl send` one character
-//! at a time, 60 ms apart; `drive phase` is the hosted loop's own reader.
-//! Fixtures and PNGs are named `claude-<the lab's Claude Code
-//! version>-<name>`.
-//!
-//! Groups: `s1` the plain cycle (what `selftest` runs); `s2*` a person's text
-//! or digit at card +x s, `s2c` the arrival sweep, `s2-lease-hold` a drive
-//! lease as another driver's hand; `s3` a draft standing or submitted; `s4` a
-//! slow turn first, Esc mid-turn; `s5` double and early zeros; `s6` Esc on the
-//! card, a numbered reply, rating then undo; `s7` a `0` then a guarded Enter;
-//! `s8` a card over a background shell (the `bg` mode), lease TTLs;
-//! `x-startup-*`, `x-reader-*`, `x-tall-*`, `x-tail-dump-*` startup cards and
-//! pane heights; `c1-approval`, `c2-question`, `c3-wall`, `c4-read` the
-//! harness tape corpus's own — a Bash box approved, a question answered, an
-//! API 500 wall waited out and continued past, a Read box outside the project
-//! approved on the policy's two looks at the disk (`crate::tape`: `tape
-//! promote`, `tape rerecord`).
+//! Frame-stream survey scenarios against real Claude Code, plus `selftest`, `watch`, and `catch`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -117,9 +85,7 @@ pub struct Ctx {
     /// The run's number.
     pub k: u32,
     attached: bool,
-    /// The lab is this run's own, so its harness's loops are this run's to
-    /// end before their tapes are kept ([`crate::tape::end_loops`]): a lab it
-    /// brought up, or the selftest's, attached but the selftest's to end.
+    /// The lab is this run's own ([`crate::tape::end_loops`]).
     pub ends_loops: bool,
     /// Where the run's records go (`None`: kept nowhere).
     pub dir: Option<PathBuf>,
@@ -154,8 +120,7 @@ fn repr_opt(s: Option<&str>) -> String {
 }
 
 impl Ctx {
-    /// A run of `name` number `k` on the lab `tag`; `attached`: the lab is up
-    /// already and not this run's to take down; `keep`: records are written.
+    /// A run of `name` number `k` on the lab `tag`.
     #[must_use]
     pub fn new(
         name: &str,
@@ -188,7 +153,6 @@ impl Ctx {
     }
 
     /// The lab's door.
-    ///
     /// # Errors
     /// No aterm to test.
     pub fn door(&self) -> R<Door<'_>> {
@@ -219,7 +183,6 @@ impl Ctx {
     }
 
     /// Bring the lab up (or attach to it) and start the frame stream and the journal tail.
-    ///
     /// # Errors
     /// The lab did not come up, or the stream could not start.
     pub fn start(&mut self) -> R {
@@ -239,7 +202,6 @@ impl Ctx {
         }
         self.run = Run::load(&self.tag)?;
         Door::new(&self.run)?;
-        // the session id of the tab the instance opened
         for _ in 0..50 {
             let ls = self.ctl(&["ls"]).stdout;
             if let Some(sid) = ls
@@ -270,15 +232,12 @@ impl Ctx {
         self.rec.as_ref().expect("started")
     }
 
-    /// The stub's scripted `bg` mode: `bgstart` runs `sleep <sleep_s>` in the
-    /// background, the wake is answered with `<slow_s>` ticks (and `Bash(sleep …)`
-    /// is allowed in the scratch settings).
+    /// The stub's scripted `bg` mode.
     pub fn setup_bg(&self, sleep_s: u32, slow_s: u32) {
         self.mode(&format!("bg:{sleep_s}:{slow_s}"));
     }
 
     /// Launch Claude Code in the tab and wait for its composer.
-    ///
     /// # Errors
     /// The composer never showed.
     pub fn launch(&mut self, timeout: f64, extra: Launch) -> R {
@@ -299,12 +258,11 @@ impl Ctx {
             return Err(ScnErr::Failed("the composer never showed".into()));
         }
         self.mark("composer up", None);
-        // the harness's first look (EVENT idle) and Claude's startup settle
         stop::sleep(std::time::Duration::from_millis(2500))?;
         Ok(())
     }
 
-    /// The cast, status and stub log for the record; the streams stopped; the lab down unless attached.
+    /// The cast, status and stub log for the record.
     pub fn finish(&mut self) {
         self.mark("finish", None);
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -334,13 +292,6 @@ impl Ctx {
         if let Some(mut j) = self.jr.take() {
             j.stop();
         }
-        // The hosted loops' harness tapes (`crate::tape`). A lab that is this
-        // run's own has its loops ended first, as a person ends them, so each
-        // tape carries its end ([`crate::tape::end_loops`]: `down`'s TERM
-        // would cut each off mid-wait); then they are copied from the kept
-        // logs once `down` has ended the instance, else from the running
-        // lab's state root — where an attached lab's still run, and are
-        // counted open.
         let mut tapes_from = self.run.state().join("drive").join("tapes");
         if self.dir.is_some() && self.ends_loops {
             let ended = self
@@ -380,12 +331,6 @@ impl Ctx {
             self.sumd.set("down", J::s(tail));
         }
         if let Some(d) = &self.dir {
-            // THIS run's tapes: the results directory is reused by every run
-            // of this scenario and number, which writes its every other
-            // record afresh (`frames.jsonl` is made anew), so the tapes an
-            // earlier run left are removed first — copies, each, of what that
-            // run's `down` kept in the logs — and what is counted below is
-            // this run's alone, never a sum over every run before it.
             let kept = d.join("tapes");
             let _ = fs::remove_dir_all(&kept);
             keep_tree(&tapes_from, &kept);
@@ -405,23 +350,16 @@ impl Ctx {
         }
     }
 
-    /// Note `label` at `t` (now when `None`); the time.
+    /// Note `label` at `t` (now when `None`).
     pub fn mark(&mut self, label: &str, t: Option<f64>) -> f64 {
         let t = t.unwrap_or_else(now);
         self.marks.push((t, label.to_string()));
         t
     }
 
-    /// `CLAUDE_FORCE_DISPLAY_SURVEY=1` live in the running Claude's settings
-    /// env, returned once Claude Code reported re-reading the file after the
-    /// write ([`crate::settings_witness`]: a flag written and taken on trust
-    /// was missed under load, and the card never drew). The summary keeps the
-    /// writes it took and the seconds to the re-read (`arm_writes`,
-    /// `arm_reread_s`).
-    ///
+    /// Arms `CLAUDE_FORCE_DISPLAY_SURVEY=1` in the running Claude's settings ([`crate::settings_witness`]).
     /// # Errors
-    /// Interrupted, or Claude Code reported no re-read within the hang
-    /// detector ([`crate::settings_witness::HANG`]: one minute).
+    /// Returns an error if interrupted or if no re-read arrives within [`crate::settings_witness::HANG`].
     pub fn arm(&mut self) -> R {
         self.arm_with_wait(&crate::settings_witness::WallWait::new())
     }
@@ -451,8 +389,7 @@ impl Ctx {
         Ok(())
     }
 
-    /// Type like a person: one character per control write, `gap` seconds apart.
-    ///
+    /// Type like a person.
     /// # Errors
     /// Interrupted.
     pub fn type_text(&mut self, text: &str, gap: f64) -> R<f64> {
@@ -468,8 +405,7 @@ impl Ctx {
         Ok(self.mark(&format!("type {} end", py_repr(text)), None))
     }
 
-    /// A prompt and Enter, 0.3 s apart; when the prompt was sent.
-    ///
+    /// A prompt and Enter, 0.3 s apart.
     /// # Errors
     /// Interrupted.
     pub fn turn(&mut self, text: &str) -> R<f64> {
@@ -482,7 +418,6 @@ impl Ctx {
     }
 
     /// The turn's done row with no spinner.
-    ///
     /// # Errors
     /// Interrupted.
     pub fn wait_idle_row(&mut self, since: usize, timeout: f64) -> R<Option<Frame>> {
@@ -494,7 +429,6 @@ impl Ctx {
     }
 
     /// The survey card.
-    ///
     /// # Errors
     /// Interrupted.
     pub fn wait_card(&mut self, since: usize, timeout: f64) -> R<Option<Frame>> {
@@ -506,7 +440,6 @@ impl Ctx {
     }
 
     /// The first frame `pred` holds of, from `since`, within `timeout` seconds.
-    ///
     /// # Errors
     /// Interrupted.
     pub fn wait_for(
@@ -656,7 +589,7 @@ impl Ctx {
     }
 }
 
-/// What a frame says that is worth a line: the card, the composer row, the status row, the rating rows.
+/// What a frame says that is worth a line.
 type FrameKey = (bool, Option<String>, Option<String>, Vec<String>);
 
 fn rating_row(r: &str) -> bool {
@@ -716,8 +649,7 @@ fn comp_j(c: Option<String>) -> J {
     c.map_or(J::Null, J::Str)
 }
 
-/// The survey cycle measured from the frames: idle, card, the zero, gone, the
-/// composer afterwards, the journal; and the deltas between them.
+/// The survey cycle measured from the frames: idle.
 #[must_use]
 pub fn cycle_stats(frames: &[Frame], journal: &[(f64, J)], t_turn: f64) -> J {
     let mut d = J::Obj(Vec::new());
@@ -741,7 +673,6 @@ pub fn cycle_stats(frames: &[Frame], journal: &[(f64, J)], t_turn: f64) -> J {
             "composer_after",
             comp_j(frames.last().and_then(Frame::comp)),
         );
-        // every composer state seen after the card appeared
         let mut seen: Vec<Option<String>> = Vec::new();
         for f in frames.iter().filter(|f| f.wall >= card.wall) {
             let c = f.comp();
@@ -794,10 +725,7 @@ pub fn cycle_stats(frames: &[Frame], journal: &[(f64, J)], t_turn: f64) -> J {
     d
 }
 
-/// What is wrong with a measured survey cycle (empty: it held). The harness's
-/// press (the 0 in the composer) is a transient a loaded machine can step
-/// over, so it is printed, never required: the card, the card going, the
-/// journaled DISMISSED and an empty composer afterwards are what a dismissal IS.
+/// What is wrong with a measured survey cycle (empty: it held).
 #[must_use]
 pub fn judge_cycle(d: &J) -> Vec<String> {
     if !d.get("t_card").is_some_and(J::truthy) {
@@ -823,9 +751,7 @@ pub fn judge_cycle(d: &J) -> Vec<String> {
     bad
 }
 
-// ------------------------------------------------------------------ shared scenario steps
-
-/// Arm the forced survey, take one stub turn, wait for the card: (turn time, card frame).
+/// Arm the forced survey, take one stub turn, wait for the card.
 fn card_cycle(ctx: &mut Ctx, text: &str) -> R<(f64, Option<Frame>)> {
     ctx.arm()?;
     let n0 = ctx.n_frames();
@@ -834,9 +760,7 @@ fn card_cycle(ctx: &mut Ctx, text: &str) -> R<(f64, Option<Frame>)> {
     Ok((t, card))
 }
 
-/// THE survey cycle: the card, it going, the harness's DISMISSED journaled,
-/// then `settle` seconds for a late stray; the measurements land in the
-/// summary. `s1-plain` is this, and so is `selftest`.
+/// THE survey cycle: the card.
 fn plain_cycle(ctx: &mut Ctx, settle: f64) -> R<(f64, Option<Frame>)> {
     let (t, card) = card_cycle(ctx, "hi")?;
     let Some(card) = card else {
@@ -877,7 +801,7 @@ fn secs(s: f64) -> R {
     Ok(stop::sleep(std::time::Duration::from_secs_f64(s))?)
 }
 
-/// Composer/card states seen between two wall times, on change: `[rel, card, composer]`.
+/// Composer/card states seen between two wall times, on change.
 fn comp_states(ctx: &Ctx, t_from: f64, t_to: Option<f64>) -> J {
     let mut out = Vec::new();
     let mut last: Option<(bool, Option<String>)> = None;
@@ -898,7 +822,7 @@ fn comp_states(ctx: &Ctx, t_from: f64, t_to: Option<f64>) -> J {
     J::Arr(out)
 }
 
-/// Journal lines from `t_from - 0.5`: `[rel, kind, line]`.
+/// Journal lines from `t_from - 0.5`.
 fn journal_lines(ctx: &Ctx, t_from: f64) -> J {
     J::Arr(
         ctx.journal()
@@ -915,8 +839,7 @@ fn journal_lines(ctx: &Ctx, t_from: f64) -> J {
     )
 }
 
-/// The journal lines, then whether one of them is the harness's DISMISSED: summary.json's
-/// key order, which its readers keep.
+/// The journal lines, then whether one of them is the harness's DISMISSED.
 fn put_journal(ctx: &mut Ctx, jl: J) {
     let dismissed = dismissed_in(&jl);
     ctx.put("journal", jl);
@@ -978,8 +901,6 @@ fn status_of(ctx: &Ctx, key: &str) -> J {
     field(&ctx.ctl(&["status"]).stdout, key).map_or(J::Null, J::Str)
 }
 
-// ------------------------------------------------------------------ the scenarios
-
 /// What a scenario does, typed.
 #[derive(Clone, Copy, Debug)]
 pub enum Plan {
@@ -1013,7 +934,7 @@ pub enum Plan {
     S6e,
     /// A drive lease stands in for a person's hand.
     S2Lease,
-    /// A person's text at card + offset, short: the arrival sweep.
+    /// A person's text at card + offset, short.
     TextSweep(f64),
     /// A 0 then a guarded Enter at card +0.9 s.
     S7,
@@ -1039,16 +960,13 @@ pub enum Plan {
     S8Lease(u32),
     /// What the hosted loop reads while the card is up.
     TailDump(u32),
-    /// THE CORPUS: a Bash box the harness approves (Claude Code launched in
-    /// its manual mode, which asks for every tool).
+    /// THE CORPUS: a Bash box the harness approves.
     CorpusApproval,
     /// THE CORPUS: an `AskUserQuestion` dialog the harness answers.
     CorpusQuestion,
     /// THE CORPUS: an API 500 wall the harness waits out and continues past.
     CorpusWall,
-    /// THE CORPUS: a Read box outside the project (`/etc/hosts`, under a
-    /// system Read root) the harness approves after its two looks at the
-    /// disk: where the path's links lead, and no hidden twin on its way.
+    /// THE CORPUS: a Read box outside the project.
     CorpusRead,
 }
 
@@ -1073,7 +991,6 @@ const HELD_QUIET: &str = "human_grace_s = 3\ncontinue = false";
 #[must_use]
 pub fn scenarios() -> Vec<Scenario> {
     let mut v = Vec::new();
-    // a name is how `scn run` finds its scenario: a second one under it could never run
     let mut add = |name: String, hk: &'static str, kw: LabKw, plan: Plan| {
         assert!(
             !v.iter().any(|s: &Scenario| s.name == name),
@@ -1228,8 +1145,6 @@ pub fn scenarios() -> Vec<Scenario> {
     for n in [53, 50] {
         add(format!("x-tail-dump-{n}"), "", lines(n), Plan::TailDump(n));
     }
-    // The tape corpus's own (`crate::tape`'s `promote`, `rerecord`): one
-    // box or wall each, so each tape is one decision a reader can follow.
     add("c1-approval".into(), "", none, Plan::CorpusApproval);
     add("c2-question".into(), "", none, Plan::CorpusQuestion);
     add("c3-wall".into(), "", none, Plan::CorpusWall);
@@ -1237,14 +1152,10 @@ pub fn scenarios() -> Vec<Scenario> {
     v
 }
 
-/// THE STUB'S ONE-SHOT API 500 (`c3-wall`): Anthropic's `api_error`,
-/// answered once with `x-should-retry: false` (so Claude Code's client draws
-/// the wall at once instead of retrying it for minutes), then `ok`.
+/// THE STUB'S ONE-SHOT API 500 (`c3-wall`).
 const WALL_500: &str = r#"{"status": 500, "headers": {"x-should-retry": "false"}, "json": {"type": "error", "error": {"type": "api_error", "message": "Internal server error"}}, "times": 1}"#;
 
-/// The index of the first journal line past the first `from` that holds
-/// `needle`, once one arrives within `timeout` seconds — a hang detector,
-/// never a budget — else `None`, the run's `error` naming what never came.
+/// The index of the first journal line past the first `from` that holds `needle`.
 fn journaled_after(ctx: &mut Ctx, from: usize, needle: &str, timeout: f64) -> R<Option<usize>> {
     let end = now() + timeout;
     loop {
@@ -1265,15 +1176,7 @@ fn journaled_after(ctx: &mut Ctx, from: usize, needle: &str, timeout: f64) -> R<
     }
 }
 
-/// A corpus scenario's one decision: `start` begins it (a tool script and
-/// `toolstart`, or a wall and a prompt), then the harness's journal line
-/// holding `decided` must arrive within `timeout` seconds, and the turn it
-/// lets go on must end (`EVENT idle`, on a line past the decision's own)
-/// within a minute of it; the loop is ended as the run finishes
-/// ([`Ctx::finish`]), so its tape carries its end. The idle is looked for
-/// past the decision's line, never past what the journal held when the
-/// decision was seen: a question's answer ends a stub turn at once, and its
-/// idle can be journaled in the same breath.
+/// A corpus scenario's one decision: `start` begins it ([`Ctx::finish`]).
 fn corpus_decision(
     ctx: &mut Ctx,
     start: impl FnOnce(&mut Ctx) -> R,
@@ -1511,7 +1414,6 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             };
             at(idle.wall, 0.4)?;
             ctx.type_text("next", 0.06)?;
-            // the survey opens (invisible) once the gate and the typing flag have passed
             secs(4.5)?;
             let before = ctx.frames().iter().any(|f| f.card() && f.wall > idle.wall);
             ctx.put("card_before_submit", before);
@@ -1901,7 +1803,6 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             );
             ctx.ctl(&["send", "0"]);
             secs(0.05)?;
-            // the harness's own fence on the card's head row
             let guard = format!(
                 "if=^●.{}",
                 aterm_phase::anchors::guard_prefix("survey.question", 4)
@@ -2033,7 +1934,6 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
         }
         Plan::Startup => {
             let first_run = ctx.kw.first_run;
-            // the card was forced at LAUNCH: what the harness and the server make of it for 25 s
             let t0 = now();
             ctx.mark("startup observation begins", None);
             let mut samples = Vec::new();
@@ -2111,8 +2011,6 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             secs(1.0)?;
             let at_sid = format!("@{}", ctx.sid);
             ctx.put("phase_1", ctx.drive(&["phase", &at_sid]));
-            // `aterm drive read` is gone (`aterm drive` is classify, phase,
-            // answer and ledger): the screen's own text stands for it.
             ctx.put("read", ctx.ctl(&["text"]).stdout.trim().to_string());
             ctx.put(
                 "ctl_text_rows",
@@ -2166,7 +2064,6 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
                 format!("lease acquire ttl={ttl_ms} -> {said}")
             };
             let t_lease = ctx.mark(&label, None);
-            // wait for the worker to be busy again with the card parked over it
             if let Some(b) = ctx.wait_for(
                 |f| f.card() && status_row(&f.rows).is_some() && f.wall > card.wall + 1.0,
                 60.0,
@@ -2303,7 +2200,6 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             let Some(card) = card else {
                 return no_card(ctx);
             };
-            // before the harness's 0 at ~1.8 s
             secs(0.6)?;
             let tail = ctx.ctl(&["text", "--json", "tail=40"]).stdout;
             let whole = ctx.ctl(&["text", "--json"]).stdout;
@@ -2389,9 +2285,6 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             "CHOSE",
             60.0,
         )?,
-        // The harness waits out the wall on its server ladder (its first
-        // rung a minute after it reads the wall) before it continues: a
-        // minute past that is the hang detector.
         Plan::CorpusWall => corpus_decision(
             ctx,
             |ctx| {
@@ -2419,8 +2312,7 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
     Ok(())
 }
 
-/// The card on a pane of `lines` rows, after a `hi` turn or forced at launch:
-/// does the hosted loop see it? `drive phase` is its reader; the journal says what it did.
+/// The card on a pane of `lines` rows.
 fn tall(ctx: &mut Ctx, lines: u32, startup: bool) -> R {
     let t0 = now();
     let card = if startup {
@@ -2452,7 +2344,6 @@ fn tall(ctx: &mut Ctx, lines: u32, startup: bool) -> R {
     ctx.put("card_row_index", J::Null);
     let jl = journal_lines(ctx, t0);
     put_journal(ctx, jl);
-    // where on the grid the card sits
     let text = ctx.ctl(&["text"]).stdout;
     if let Some(i) = text
         .split('\n')
@@ -2470,10 +2361,7 @@ fn tall(ctx: &mut Ctx, lines: u32, startup: bool) -> R {
     Ok(())
 }
 
-// ------------------------------------------------------------------ runner
-
 /// Run scenario `s` once, as run number `k`, on a fresh lab.
-///
 /// # Errors
 /// Interrupted (the lab is taken down first).
 pub fn run_one(s: &Scenario, k: u32, tag: &str) -> Result<Ctx, Stopped> {
@@ -2483,8 +2371,6 @@ pub fn run_one(s: &Scenario, k: u32, tag: &str) -> Result<Ctx, Stopped> {
         if s.name.starts_with("s8-") {
             ctx.setup_bg(14, 40);
         }
-        // A box needs Claude Code's manual mode: its auto mode runs the
-        // Bash call unasked.
         let launch = match s.plan {
             Plan::CorpusApproval | Plan::CorpusRead => Launch {
                 args: vec!["--permission-mode".into(), "manual".into()],
@@ -2689,20 +2575,11 @@ fn agg(pat: &str) {
     }
 }
 
-// ------------------------------------------------------------------ on a lab that is up
-
-/// `selftest`'s cycle: launch Claude Code in the tab (the harness answers the
-/// folder-trust dialog), take the `hi` turn, force the survey card live and
-/// judge the cycle from the frames. 0 it held, 1 it did not, 2 Claude Code never drew its composer.
-///
+/// `selftest`'s cycle.
 /// # Errors
 /// Interrupted.
 pub fn run_selftest(tag: &str) -> Result<i32, Stopped> {
     let mut ctx = Ctx::new("selftest", 1, tag, "", LabKw::default(), true, true);
-    // Attached, but the selftest's own lab, which it takes down itself: its
-    // harness's loops are ended as the cycle finishes, so the tapes this run
-    // keeps and the ones `down` keeps each carry their end, and replay
-    // REPRODUCED (the selftest's tenth check).
     ctx.ends_loops = true;
     let result = (|| -> R<i32> {
         ctx.start()?;
@@ -2783,8 +2660,7 @@ pub fn run_selftest(tag: &str) -> Result<i32, Stopped> {
     }
 }
 
-/// `watch [tag] [secs]`: the screen's changes (the card, the composer row, the
-/// status row), the EVENT lines and the harness journal's lines as they happen, on one clock.
+/// `watch [tag] [secs]`.
 pub fn cmd_watch(args: &[String]) -> crate::Res {
     let mut a = args.to_vec();
     let tag = crate::run::take_tag(&mut a)?;
@@ -2847,9 +2723,7 @@ pub fn cmd_watch(args: &[String]) -> crate::Res {
     Ok(0)
 }
 
-/// `catch [tag] <egrep> <name> "<what>" [secs]`: save the screen the moment a
-/// row matches (a dialog the harness answers within a second): the rows as
-/// `ctl text` prints them, in the repo's fixture shape, and a PNG.
+/// `catch [tag] <egrep> <name> "<what>" [secs]`.
 pub fn cmd_catch(args: &[String]) -> crate::Res {
     let mut a = args.to_vec();
     let tag = crate::run::take_tag(&mut a)?;
@@ -2906,17 +2780,10 @@ mod tests {
         }
     }
 
-    /// A DECISION AND THE IDLE IT LETS GO ON, JOURNALED IN ONE BREATH: a
-    /// question's answer ends a stub turn at once, so the harness journals
-    /// the turn's `EVENT idle` in the same read of the journal as the
-    /// decision (c2-question-01: CHOSE, then its idle 67 ms later, and "no
-    /// EVENT idle journaled"). The idle is looked for past the decision's
-    /// own line, not past what the journal held when the decision was seen.
     #[test]
     fn the_idle_a_decision_lets_go_on_is_found_journaled_with_it() {
         use std::time::{Duration, Instant};
         let owned = aterm_tempfile::tempdir().expect("owned scratch");
-        // The tail reads through no link on its whole path; `/var` is one.
         let path = std::fs::canonicalize(owned.path())
             .expect("a physical scratch")
             .join("journal");
@@ -2929,7 +2796,6 @@ mod tests {
         std::fs::write(&path, line("event", "EVENT idle seq=1")).expect("a journal");
         let mut ctx = Ctx::new("t", 1, "lab", "", LabKw::default(), true, false);
         ctx.jr = Some(Journal::start(path.clone(), None));
-        // A hang detector, never a budget.
         let held = |ctx: &Ctx, n: usize| {
             let by = Instant::now() + Duration::from_secs(60);
             while ctx.journal().len() < n {
@@ -2958,22 +2824,11 @@ mod tests {
         assert_eq!(ctx.sumd.get("decided").and_then(J::as_str), Some("CHOSE"));
     }
 
-    /// THE SURVEY ARM RETURNS ONLY ONCE CLAUDE CODE REPORTED A RE-READ, AND
-    /// WRITES AGAIN UNTIL THEN: the watcher's stand-in misses the first write
-    /// and answers the second, so `arm` returns with the line in the log,
-    /// the flag in the settings and its writes counted (`arm_writes` = 2).
-    /// The clock steps a third of `REWRITE_EVERY`, so the arm's pace shows in
-    /// its writes. NEGATIVE CONTROLS: a watcher that never answers, and one
-    /// whose line names another settings file, fail the arm as "the survey
-    /// flag was not armed", at the hang detector, after one write every
-    /// `REWRITE_EVERY` (`HANG / REWRITE_EVERY` writes); an arm that wrote and
-    /// slept would return with no line in the log.
     #[test]
     fn the_survey_arm_returns_only_once_claude_code_reported_a_reread() {
         use crate::settings_witness::{HANG, LOG, REWRITE_EVERY, SteppedWait, Wait as _};
         use std::cell::Cell;
         let owned = aterm_tempfile::tempdir().expect("owned scratch");
-        // The scratch is read through no link on its whole path; `/var` is one.
         let w = std::fs::canonicalize(owned.path()).expect("a physical scratch");
         for (what, answers, same_file) in [
             ("reread", true, true),
@@ -3008,9 +2863,6 @@ mod tests {
                     "the actual writer set the flag before pausing"
                 );
                 pauses.set(pauses.get() + 1);
-                // Each controlled pause advances a third of the rewrite
-                // period: the second write comes after the third pause. The
-                // first write is missed; the line answers the second.
                 if answers && pauses.get() == 4 {
                     let line = J::obj([
                         ("hook_event_name", J::s("ConfigChange")),

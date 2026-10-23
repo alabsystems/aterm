@@ -442,6 +442,7 @@ impl Places {
                 .get(&a.dir)
                 .is_some_and(|placed| placed.level == a.dir.join(SESSIONS));
             if !in_place {
+                // No registry directory, so no row: its watch, if any, is on
                 // a file that is gone.
                 if let Some(filed) = self.files.remove(&row) {
                     live.remove(filed.id);

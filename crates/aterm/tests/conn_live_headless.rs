@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless end-to-end test for `aterm conn` (docs/design/SESSION_CONNECTIONS.md §9
-//! [v5.1]): against a live headless instance, an add/set/rm round trip equals the wire verbs
-//! byte for byte in `edges` output. Everything runs through the one `aterm` binary:
-//! `aterm --headless` boots the engine and control socket, `aterm ctl …` speaks the raw wire,
-//! `aterm conn …` is under test.
-//!
-//! Isolation is `support/launch_isolation.rs`'s, and every client call is pinned with `--sock`.
-//! The test process is not an aterm session, so the `@self` forms run both without
-//! `$ATERM_PARENT_SESSION_ID` (the documented refusal) and with it set to the boot session.
+//! Live-headless end-to-end test for `aterm conn` against a real `aterm --headless` instance.
 
 #![cfg(unix)]
 #![allow(
@@ -28,27 +20,16 @@ use crate::{ctl_accept, headless_boot, launch_isolation};
 
 use headless_boot::Instance;
 
-/// Boot one real headless instance under the scratch world, 40x120
-/// ([`headless_boot::boot`]: an environment refusal is COULD NOT RUN; a product
-/// that cannot start fails the test).
 fn boot() -> Instance {
     headless_boot::boot("atconn", &["--lines", "40", "--columns", "120"])
 }
 
 const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
 
-/// Run one `aterm <args…>` client call with the hermetic environment plus `extra_env`, bounded
-/// by [`CLIENT_EXIT_DEADLINE`]: drain threads keep the pipes flowing, so a hung client is a
-/// panic, never a hung harness. A call the instance has not yet accepted, or answered busy, is
-/// asked again, a fresh client each time ([`ctl_accept::until_served`]): the client's own 10 s
-/// accept budget is a person's, and a loaded machine can miss it. An `aterm conn` call goes
-/// through here too: it talks with no accept probe (`converse`, its own 60 s deadline), so it
-/// never says "so none was sent", and only a busy answer is asked again.
 fn run_client(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     ctl_accept::until_served(|| run_client_once(inst, args, extra_env))
 }
 
-/// One attempt of [`run_client`].
 fn run_client_once(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(launch_isolation::aterm_executable());
     cmd.args(args)
@@ -94,7 +75,6 @@ fn run_client_once(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -
     }
 }
 
-/// [`run_client`] asserting success, returning stdout as UTF-8.
 fn client_ok(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> String {
     let out = run_client(inst, args, extra_env);
     assert!(
@@ -106,8 +86,6 @@ fn client_ok(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Stri
     String::from_utf8(out.stdout).expect("client stdout is UTF-8")
 }
 
-/// Parse the raw `sessions` rows, `<local> <sid> <parent|-> <state> <title> [meta=…]` (the
-/// title pct-encoded and absent when empty), into `(local, sid, title)` triples.
 fn parse_sessions(body: &str) -> Vec<(u64, String, String)> {
     let mut rows = Vec::new();
     for line in body.lines() {
@@ -130,26 +108,15 @@ fn parse_sessions(body: &str) -> Vec<(u64, String, String)> {
     rows
 }
 
-/// The quoted-title fetch for one sid, fresh from the wire (titles are live
-/// state; each byte-pin reads them immediately before rendering its
-/// expectation, exactly as `aterm conn` itself does).
 fn titles(inst: &Instance, sock: &str) -> Vec<(u64, String, String)> {
     parse_sessions(&client_ok(inst, &["ctl", "--sock", sock, "sessions"], &[]))
 }
 
-/// The whole §9 [v5.1] loop against one live instance: spawn a second session, wire both
-/// directions with `conn add`, narrow to pull with `conn set` and pin the raw `edges --json`
-/// bytes, then `conn rm` both pairs. A fresh read grant stays usable on its established
-/// connection after the destination closes, until the owner revokes it through the real
-/// dispatch path. One test: the steps are one causal story.
 #[test]
 fn conn_round_trips_against_a_live_headless_instance() {
     let inst = boot();
     let sock = inst.sock.clone();
 
-    // --- the two sessions -------------------------------------------------
-    // The boot session is a fresh instance's only row; the second is minted over the wire
-    // (`spawn`, reply `OK <sid>`, addressable at once).
     let rows = titles(&inst, &sock);
     assert_eq!(
         rows.len(),
@@ -166,9 +133,6 @@ fn conn_round_trips_against_a_live_headless_instance() {
     assert!(sid2.starts_with("s-"), "minted sid shape: {sid2}");
     assert_ne!(sid1, sid2);
 
-    // --- (a) the shell-less refusal, then the hosted add ------------------
-    // Without $ATERM_PARENT_SESSION_ID the default direction's `@self` half refuses with the
-    // documented error naming the variable (§6.1).
     let refused = run_client(
         &inst,
         &["conn", "--sock", &sock, "add", &format!("@{sid2}")],
@@ -183,16 +147,12 @@ fn conn_round_trips_against_a_live_headless_instance() {
         "the refusal names the env var: {:?}",
         String::from_utf8_lossy(&refused.stderr)
     );
-    // The harness hosts the session context the way a real in-session shell
-    // would: $ATERM_PARENT_SESSION_ID = the boot session's actual sid.
     let in_session: &[(&str, &str)] = &[("ATERM_PARENT_SESSION_ID", sid1.as_str())];
     client_ok(
         &inst,
         &["conn", "--sock", &sock, "add", &format!("@{sid2}")],
         in_session,
     );
-    // The incoming half (§9: the no-arg form shows BOTH directions): invite
-    // the peer as a pull-only controller of this session.
     client_ok(
         &inst,
         &[
@@ -210,8 +170,6 @@ fn conn_round_trips_against_a_live_headless_instance() {
     let got = client_ok(&inst, &["conn", "--sock", &sock, "ls"], &[]);
     assert_eq!(got.lines().count(), 2, "one line per directed pair: {got}");
 
-    // --- (c) set --kind pull, then the raw-wire byte pin -------------------
-    // Drop the incoming half first so exactly one pair remains under test.
     client_ok(
         &inst,
         &[
@@ -237,8 +195,6 @@ fn conn_round_trips_against_a_live_headless_instance() {
         ],
         in_session,
     );
-    // The §9 wire-equivalence pin: after the both→pull set, the raw `edges --json` body (the
-    // server's own emitter) holds exactly the read-screen row.
     let got = client_ok(
         &inst,
         &[
@@ -259,7 +215,6 @@ fn conn_round_trips_against_a_live_headless_instance() {
         )
     );
 
-    // --- (d) rm, then verify empty ----------------------------------------
     client_ok(
         &inst,
         &["conn", "--sock", &sock, "rm", &format!("@{sid2}")],
@@ -287,8 +242,6 @@ fn conn_round_trips_against_a_live_headless_instance() {
         &[],
     );
     let token = grant.trim().strip_prefix("OK ").expect("read grant token");
-    // Edge authentication uses the active live session. Keep the authenticated
-    // connection across its close; the closed index does not mint new authority.
     let mut stream = UnixStream::connect(&sock).expect("connect read edge");
     let hang = Some(Duration::from_secs(60));
     stream.set_read_timeout(hang).unwrap();

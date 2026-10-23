@@ -87,6 +87,9 @@ impl CursorGlow {
         cfg: &GlowConfig,
         geom: Geom,
     ) -> Option<(u16, u16)> {
+        // A hidden repaint can return from a proved foreign-row park beyond the
+        // hide bridge's reach; only the original input row and its paid
+        // forward echo claim custody. The return is paid as a move on the
         // park's own row ([`Self::judging_on_rows`]), as on the visible lane.
         if let (Some(p), Some((row, col))) = (self.held_park, cur)
             && p.cross_row
@@ -160,6 +163,7 @@ impl CursorGlow {
             self.crown_window_ms = if dist <= 1 {
                 Self::CROWN_TYPING_MS
             } else if matches!(cfg.style, GlowStyle::Fire) {
+                // The crown must survive the meteor's flight (≤320 ms) so the
                 // arrival flare still has a live crown to erupt through.
                 Self::CROWN_MS + 320
             } else {
@@ -221,6 +225,8 @@ impl CursorGlow {
                 }
             }
         } else if declined_hidden_relocation {
+            // Log the refusal when a key asked for it, so a licensed press
+            // whose move died here shows in `aterm ctl trail`. Program
             // relocations (no fresh licence) stay unlogged.
             if self.move_licensed(now)
                 && let (Some((origin, _)), Some(target)) = (self.last_visible, cur)
@@ -233,6 +239,8 @@ impl CursorGlow {
         } else if completed_hidden_reappearance {
             self.retire_hidden_movement_provenance(now);
         } else if unseeded_visible {
+            // A fresh or reset engine has no truthful source cell: seed the
+            // anchor but consume every classifier dark, so the next unrelated
             // CUP cannot borrow a pre-first-draw licence.
             self.retire_all_movement_provenance();
         }
@@ -1345,6 +1353,8 @@ impl CursorGlow {
             return;
         }
         if usize::from(ac - pc) > bound {
+            // Past the cap with a stamp fresh and no receipt yet: the drop's
+            // echo seen a frame before its receipt, remembered for one
             // delivery to claim ([`PendingHop`]).
             if !was_tainted {
                 self.remember_refused_hop(ar, pc, ac, now, cfg);
@@ -1358,6 +1368,8 @@ impl CursorGlow {
                 .last_licensed_row
                 .is_some_and(|(row, at)| row != ar && younger_than_stamp(at));
         if tainted || spoken_for {
+            // Logged when contested (a typed stamp fresh, the in-flight batch,
+            // or an insert-width advance); a lone spinner tick is refused
             // silently so it cannot push the drop's verdict out of the ring.
             if typed_fresh || in_flight || insert_admits.is_some() {
                 self.log_decline(now, (ar, pc), (ar, ac), Self::DECLINE_PROGRAM_ROW);
@@ -1521,6 +1533,7 @@ impl CursorGlow {
     pub(super) fn flush_park(&mut self, p: HeldPark) {
         self.in_flight_tally.park_flushed += 1;
         if p.cross_row {
+            // This landing had positive evidence of being a background
             // park. Time passing is not a new glyph or a keyboard licence.
             if self.v2.engaged() {
                 self.v2.observe_caret((p.landing_row, p.landing));
@@ -1658,6 +1671,9 @@ impl CursorGlow {
             return false;
         }
         if cr == pr {
+            // A lifted word is the composer's re-wrap, not Ink's park; no
+            // return follows ([`Self::lifted_word`]). A retreat the
+            // Backspaces still owe is their echo, however late
             // ([`Self::erase_hop`]).
             if cc >= pc
                 || self.lifted_word(pr, pc, cr, cc).is_some()
@@ -2202,6 +2218,12 @@ impl CursorGlow {
         lane: SpawnLane,
         call: SpawnCall,
     ) -> bool {
+        // A line pasted with its line break ([`Self::line_insert_echo`]): its
+        // echo draws the line and the break's new line in one frame, the caret
+        // going down a row to the new line's start. The insert pays for its
+        // line, laid as its sweep on its own row; the rest of the move, from the
+        // line's end to the new line, is judged as any other (the line's band
+        // then leaves at its rest, as a typed line's does when the hand goes
         // down a line), and its verdict is the move's.
         if lane == SpawnLane::Visible
             && let Some((ins, end)) = self.line_insert_echo((pr, pc), (cr, cc), now, cfg, geom)
@@ -2248,6 +2270,9 @@ impl CursorGlow {
             && exact_run.is_none()
         {
             if cr == pr && cc > pc {
+                // A refused same-row forward hop is remembered for one delivery
+                // receipt still in flight ([`PendingHop`]). The pool is kept:
+                // it is empty, or one credit against a wider hop, which belongs
                 // to the insert receipt and the next key's ledger bridge.
                 self.remember_refused_hop(cr, pc, cc, now, cfg);
             } else {

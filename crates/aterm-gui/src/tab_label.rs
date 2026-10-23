@@ -241,7 +241,7 @@ pub(crate) struct Informative<'a> {
 impl Informative<'_> {
     /// Whether no informative title text remains.
     #[must_use]
-    pub(crate) fn is_empty(self) -> bool {
+    pub(crate) const fn is_empty(self) -> bool {
         !self.home && self.rest.is_empty()
     }
 

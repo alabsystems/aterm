@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The effect seam (the plan's §4.6.27): its live and simulated modes, the canonical forms,
-//! the tape subset and its sink, and recording, replaying and rerecording over a scripted
-//! transport, with each divergence typed.
+//! Effect seam live and simulated modes, canonical forms, tape subset, and record/replay.
 
 use std::io::Read;
 use std::path::Path;
@@ -40,13 +38,12 @@ fn get(limit: u64) -> WireRequest<'static> {
     )
 }
 
-/// The kept names in the order `twenty_headers` sends them: reversed, so not sorted.
+/// The kept names in the order `twenty_headers` sends them.
 fn sent_order() -> Vec<&'static str> {
     KEPT_HEADERS.iter().rev().copied().collect()
 }
 
-/// Twenty headers: the fifteen kept ones in upper case and in reverse order, among five that
-/// are not.
+/// Twenty headers: the fifteen kept ones in upper case and in reverse order.
 fn twenty_headers() -> Vec<(String, String)> {
     let mut headers = Vec::new();
     for (i, name) in KEPT_HEADERS.iter().enumerate().rev() {
@@ -120,8 +117,6 @@ fn gh_keeps_the_kept_headers_and_reads_the_body() {
     assert_eq!(body, b"{\"login\":\"x\"}");
 }
 
-// A body over the limit comes back cut one byte past it, with its head, for the pipeline's
-// whole read to refuse with the status, request id and rate in hand.
 #[test]
 fn gh_cuts_a_body_over_the_limit_and_keeps_its_head() {
     let fx = Fx::simulated(1_760_000_000);
@@ -239,8 +234,6 @@ fn kept_and_keep() {
     assert_eq!(keep(&e, api.clone()), api);
 }
 
-// ---- The canonical request ----
-
 /// A GET of `url` with `headers`.
 fn get_with<'a>(url: &str, headers: &[(&str, &str)]) -> WireRequest<'a> {
     WireRequest::new(
@@ -266,7 +259,7 @@ fn shape(e: &agh::Error) -> (Kind, Option<String>, u8) {
     (e.kind, e.sub.slug(), e.exit())
 }
 
-/// A replay's stop: CouldNotRun, `replay.{slug}`, exit 3.
+/// A replay's stop.
 fn replay_stop(slug: &str) -> (Kind, Option<String>, u8) {
     (Kind::CouldNotRun, Some(format!("replay.{slug}")), 3)
 }
@@ -394,8 +387,6 @@ fn a_url_on_no_origin_is_a_protocol_error() {
     }
 }
 
-// ---- The canonical reply and failure ----
-
 /// The bodies every round trip test carries.
 fn bodies() -> Vec<Vec<u8>> {
     vec![
@@ -506,7 +497,6 @@ fn a_body_over_the_tape_max_is_taped_by_its_digest() {
     let refused = canon::decode(&bytes).expect_err("by digest");
     assert_eq!(shape(&refused), replay_stop("body_not_taped"));
     assert!(refused.why.contains(&(BODY_TAPE_MAX + 1).to_string()));
-    // Not `retry later`: no tape holds this answer, so the next runs it live.
     assert!(refused.next.contains("--replay"), "{}", refused.next);
     let at_the_max = vec![b'a'; BODY_TAPE_MAX];
     let whole = canon::decode(&canon::reply(200, &[], &at_the_max))
@@ -536,8 +526,6 @@ fn bytes_reply_did_not_write_are_a_format_error() {
         assert!(refused.next.contains("--record"), "{}", refused.next);
     }
 }
-
-// ---- The tape ----
 
 /// A header for these tests.
 fn header(argv: &[&str]) -> TapeHeader {
@@ -700,7 +688,6 @@ fn a_header_agh_cannot_replay_is_refused() {
         (lines[..4].join("\n"), 5),
         (format!("{good}\nextra line"), 6),
         (with(2, "argv a\\q"), 3),
-        // More arguments than any exec takes (1 << 20), and a run of extra lines.
         (with(2, &format!("argv{}", " a".repeat((1 << 20) + 1))), 3),
         (format!("{good}{}", "\n".repeat(1000)), 6),
     ] {
@@ -717,7 +704,6 @@ fn a_header_agh_cannot_replay_is_refused() {
 #[test]
 fn the_parser_refuses_what_is_outside_the_subset() {
     let base = tape::render(&header(&["version"]), &[]);
-    // MAGIC, `header` and five header lines: the first item is line 8.
     assert_eq!(base.lines().count(), 7);
     for (tail, at) in [
         ("mono 5 stamp=1,2\n", 8),
@@ -763,8 +749,6 @@ fn the_parser_refuses_what_is_outside_the_subset() {
             "{tail:?}: {}",
             refused.why
         );
-        // Every replay of it is refused the same: the next names a new tape, never `retry
-        // later`.
         assert!(
             refused.next.contains("--record"),
             "{tail:?}: {}",
@@ -788,8 +772,6 @@ fn the_parser_refuses_what_is_outside_the_subset() {
     assert!(refused.why.starts_with("line 4: "), "{}", refused.why);
 }
 
-// ---- The sink ----
-
 #[test]
 fn a_sink_never_overwrites() {
     let dir = scratch("fx");
@@ -800,8 +782,6 @@ fn a_sink_never_overwrites() {
         (refused.kind, refused.sub.clone()),
         (Kind::CouldNotRun, Sub::Local)
     );
-    // `--record` never wrote what is in the way: the why names it, and the next names a path
-    // only for a tape (which it may remove).
     let named = |e: &agh::Error, path: &Path| e.next.contains(&path.display().to_string());
     assert!(refused.why.contains(&path.display().to_string()));
     assert!(!named(&refused, &path), "{}", refused.next);
@@ -826,7 +806,6 @@ fn a_sink_never_overwrites() {
     std::fs::write(&taped, tape::render(&header(&["version"]), &[])).expect("a tape");
     let refused = TapeSink::create(&taped, &header(&["version"])).expect_err("a tape");
     assert!(named(&refused, &taped), "{}", refused.next);
-    // A tape at a path with a space: the next names it as one shell word.
     let spaced = dir.path().join("a tape.atape");
     std::fs::write(&spaced, tape::render(&header(&["version"]), &[])).expect("a tape");
     let refused = TapeSink::create(&spaced, &header(&["version"])).expect_err("a tape");
@@ -858,8 +837,7 @@ fn a_tape_is_private() {
     assert_eq!(mode & 0o777, 0o600);
 }
 
-/// A directory made readable again (0700) when this drops, a panic included, so the scratch
-/// directory's own drop can list and remove it.
+/// A directory made readable again.
 #[cfg(unix)]
 struct Readable<'a>(&'a Path);
 
@@ -871,7 +849,6 @@ impl Drop for Readable<'_> {
     }
 }
 
-// Opening a FIFO waits for a writer, so the refusal for one at the path must not open it.
 #[cfg(unix)]
 #[test]
 fn a_sink_refuses_a_fifo_without_opening_it() {
@@ -908,15 +885,12 @@ fn a_sink_refuses_a_fifo_without_opening_it() {
 fn a_directory_that_cannot_be_flushed_keeps_the_whole_tape() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("fx");
-    // Write and search, no read (the shape of a drop box): the file can be made and read by
-    // its path, but the directory cannot be opened to flush its entry.
     let sealed = dir.path().join("write-only");
     std::fs::create_dir(&sealed).expect("the parent");
     std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o300))
         .expect("write and search only");
     let _readable = Readable(&sealed);
     if std::fs::read_dir(&sealed).is_ok() {
-        // A user the mode does not bind (root): no directory here fails to flush.
         return;
     }
     let path = sealed.join("new.atape");
@@ -927,7 +901,6 @@ fn a_directory_that_cannot_be_flushed_keeps_the_whole_tape() {
         (refused.kind, refused.sub.clone()),
         (Kind::CouldNotRun, Sub::Local)
     );
-    // The next names the tape, which is kept and replays.
     assert!(
         refused.next.contains(&path.display().to_string()),
         "{}",
@@ -983,8 +956,6 @@ fn a_sink_redacts_each_record_and_latches_an_unknown_kind() {
 fn a_sink_redacts_the_raw_bytes_never_their_escaped_rendering() {
     let dir = scratch("fx");
     let path = tape_path(dir.path(), "forms");
-    // Each form the shapes catch in raw text, which the tape's escape would hide from them:
-    // a JSON object quoted inside a JSON string (`\"`), and a quoted bearer value.
     let forms: [(&str, &[u8]); 2] = [
         (
             "SEKRITONE1",
@@ -1013,7 +984,6 @@ fn a_sink_redacts_the_raw_bytes_never_their_escaped_rendering() {
     let (taped, records) = tape::parse(&text).expect("a tape");
     assert_eq!(taped.argv.len(), 2);
     assert_eq!(records.len(), 4);
-    // Every JSON body the sink redacted is still JSON.
     for record in &records {
         if let EffectRecord::Emit { bytes, .. } = record
             && bytes.starts_with(b"{")
@@ -1027,10 +997,6 @@ fn a_sink_redacts_the_raw_bytes_never_their_escaped_rendering() {
 #[test]
 fn a_sink_writes_no_line_the_shapes_would_still_change() {
     let dir = scratch("fx");
-    // Raw bytes the shapes leave (a run cut short by a CR, or too short for rule 3), or
-    // redact, whose escaped rendering they would change: the escape writes a CR `\r` and a
-    // control byte `\xHH` (a form feed among them), each longer than the byte and neither a
-    // blank. (A tab's `\t` is a blank to the shapes, so a tab's rendering is not among them.)
     let records = [
         EffectRecord::Emit {
             door: DOOR_STDOUT.to_string(),
@@ -1066,14 +1032,11 @@ fn a_sink_writes_no_line_the_shapes_would_still_change() {
             (refused.kind, refused.sub.clone()),
             (Kind::CouldNotRun, Sub::Local)
         );
-        // Every run would be refused the same: the file, which holds no exit, is gone, so a
-        // second `--record` to the path is not refused for a file that exists.
         assert!(!path.exists(), "{record:?}");
         assert!(refused.next.contains("--record"), "{}", refused.next);
         assert_eq!(sink.finish().expect_err("still latched"), refused);
     }
 
-    // A tab after the header is a blank raw and escaped, so the record is written, redacted.
     let path = tape_path(dir.path(), "shaped-tab");
     let sink = TapeSink::create(&path, &header(&["api", "/x"])).expect("a sink");
     sink.append(&EffectRecord::Exchange {
@@ -1087,8 +1050,6 @@ fn a_sink_writes_no_line_the_shapes_would_still_change() {
     assert!(!text.contains("SEKRITTHREE"), "{text}");
     assert_eq!(agh::redact::Redactor::shapes(&text), text);
 
-    // A header the same: arguments that read as a shape once joined, or once their spaces
-    // are written `\x20`. No file is made.
     for argv in [
         vec!["api", "Bearer", "abcdefghij"],
         vec!["api", "search", "q=Authorization: token SEKRITARG1"],
@@ -1119,7 +1080,6 @@ fn a_finished_sink_writes_no_record_after_the_exit() {
         (refused.kind, refused.sub.clone()),
         (Kind::CouldNotRun, Sub::Local)
     );
-    // The tape is whole, its exit its last record: it is kept, and the next names it.
     assert!(refused.next.contains(&path.display().to_string()));
     let text = std::fs::read_to_string(&path).expect("the tape");
     assert_eq!(
@@ -1157,13 +1117,9 @@ fn a_sink_never_writes_a_tape_a_replay_would_refuse_for_its_size() {
     );
 
     let path = tape_path(dir.path(), "big");
-    // The bound a test can reach in kilobytes (`TapeSink::create_within`; `create`'s is
-    // `TAPE_MAX`, the most a replay reads).
     const MAX: u64 = 16 << 10;
     let sink = TapeSink::create_within(&path, &header, MAX).expect("a sink");
     sink.append(&EffectRecord::Mono(1));
-    // Each control byte is written `\x01`, four bytes: this one record would take the file
-    // past the bound, though its own bytes are a quarter of it.
     let quarter = usize::try_from(MAX / 4).expect("fits") + 1;
     sink.append(&EffectRecord::Emit {
         door: DOOR_STDOUT.to_string(),
@@ -1183,7 +1139,6 @@ fn a_sink_never_writes_a_tape_a_replay_would_refuse_for_its_size() {
         (refused.kind, refused.sub.clone()),
         (Kind::CouldNotRun, Sub::Local)
     );
-    // Every run would be refused the same, and the file holds no exit: it is gone.
     assert!(!path.exists());
     assert!(refused.next.contains("--record"), "{}", refused.next);
 }
@@ -1192,8 +1147,6 @@ fn a_sink_never_writes_a_tape_a_replay_would_refuse_for_its_size() {
 fn a_recording_whose_output_no_tape_can_hold_leaves_no_file() {
     let dir = scratch("fx");
     let path = tape_path(dir.path(), "cr");
-    // Plain stdout whose rendered `\r` makes the run after `Bearer ` long enough to read as a
-    // shape: every run of it is refused the same.
     let stdout: &[u8] = b"OAuth uses Bearer tokens\r\n";
     for attempt in 0..2 {
         let recording =
@@ -1237,8 +1190,6 @@ fn a_rerecording_whose_output_no_tape_can_hold_leaves_no_new_tape() {
     );
 }
 
-// ---- Recording, then replaying ----
-
 /// The two answers the record and replay test is scripted with.
 fn two_answers(transport: &ScriptedTransport) {
     transport.answer(
@@ -1261,7 +1212,7 @@ fn two_answers(transport: &ScriptedTransport) {
 /// An answer as status, headers and body.
 type Parts = (u16, Vec<(String, String)>, Vec<u8>);
 
-/// What one driven run saw: the clocks, the two answers.
+/// What one driven run saw.
 #[derive(Debug, PartialEq, Eq)]
 struct Seen {
     mono: Duration,
@@ -1277,8 +1228,7 @@ fn parts(answer: Result<WireResponse, WireError>) -> Parts {
     (answer.status, answer.headers, body)
 }
 
-/// Drive `fx` through every door: mono, wall_secs, sleep(1 ms), two `gh`, `emit_stdout` and
-/// `finish(0)`.
+/// Drive `fx` through every door.
 fn drive(fx: &Fx, transport: &ScriptedTransport) -> Seen {
     let e = Endpoints::github_com();
     let mono = fx.mono().expect("mono");
@@ -1344,17 +1294,12 @@ fn a_recorded_run_replays_offline_to_the_same_answers() {
     assert_eq!(replayed, recorded);
     assert_eq!(offline.remaining(), 1);
     assert!(offline.requests().is_empty());
-    // That a replayed sleep takes no time is held by `a_replayed_hour_takes_no_real_time`:
-    // `slept` lists simulated sleeps alone, so it is empty here whatever the replay did.
 }
 
 #[test]
 fn a_recording_never_tapes_an_answer_that_holds_a_token_shape() {
     let dir = scratch("fx");
     let e = Endpoints::github_com();
-    // Each body a replay could not answer as the run saw it: a quoted credential the raw
-    // shapes rewrite (its decoded `--jq .body` would render other stdout than its replay),
-    // and two that only the decoded JSON string shows, behind a `\t` and a `\u0009` escape.
     let bodies: [&[u8]; 3] = [
         br#"{"body":"curl -H \"Authorization: Bearer SEKRITVALUE\" https://api.github.com"}"#,
         br#"{"body":"Bearer\tSEKRITVALUE"}"#,
@@ -1403,8 +1348,6 @@ fn stdout_that_shows_a_token_shape_replays_as_it_was_recorded() {
     let dir = scratch("fx");
     let path = tape_path(dir.path(), "rendered");
     let e = Endpoints::github_com();
-    // No string of this answer holds a shape, but a rendering that joins two of its fields
-    // with a tab does: the tape holds that stdout shaped, and the replay's is compared so.
     let body = br#"{"a":"Bearer","b":"SEKRITVALUE9"}"#;
     let rendered = b"Bearer\tSEKRITVALUE9\n";
     let live = ScriptedTransport::new();
@@ -1434,7 +1377,6 @@ fn stdout_that_shows_a_token_shape_replays_as_it_was_recorded() {
 fn a_replayed_answer_holds_the_kept_headers_alone() {
     let dir = scratch("fx");
     let e = Endpoints::github_com();
-    // A tape this build did not write: its reply holds a header no live run keeps.
     let reply = canon::reply(
         200,
         &[
@@ -1482,7 +1424,6 @@ fn a_recorded_wire_failure_replays_as_the_same_failure() {
         .gh_for_tests(&live, &e, get(1 << 20))
         .expect("taped");
     assert_eq!(first.expect_err("the failure"), failure);
-    // Over the limit: the head, the body cut one byte past it, taped as it was handed on.
     let cut = parts(recording.gh_for_tests(&live, &e, get(4)).expect("taped"));
     assert_eq!(cut.2, b"01234");
     recording.finish(1).expect("finish");
@@ -1501,8 +1442,6 @@ fn a_recorded_wire_failure_replays_as_the_same_failure() {
     assert!(offline.requests().is_empty());
 }
 
-// A cut is `req.limit + 1` bytes; at a limit of `BODY_TAPE_MAX` it is one byte past what a
-// tape holds whole, so it is taped by its digest and its replay refuses by name (16.12).
 #[test]
 fn a_cut_past_the_tape_max_is_taped_by_its_digest() {
     let dir = scratch("fx");
@@ -1541,7 +1480,6 @@ fn a_tape_refuses_a_stream_and_a_body_before_anything_is_sent() {
         .expect_err("streamed");
     assert_eq!(shape(&refused), replay_stop("stream_not_taped"));
     assert!(refused.next.contains("--record"), "{}", refused.next);
-    // The refusal is latched: every later door answers it.
     let later = recording.mono().expect_err("latched");
     assert_eq!(later, refused);
     assert!(live.requests().is_empty());
@@ -1579,8 +1517,6 @@ fn a_replayed_hour_takes_no_real_time() {
     assert_eq!(slept, Some(true));
 }
 
-// ---- Divergences ----
-
 /// A replaying Fx over a tape of `records`, kept in `dir`.
 fn replaying(dir: &Path, label: &str, records: &[EffectRecord]) -> Fx {
     let path = tape_path(dir, label);
@@ -1598,8 +1534,7 @@ fn gh_exchange(path: &str, body: &[u8]) -> EffectRecord {
     }
 }
 
-/// A seam divergence's next is a live record: replaying or rerecording the tape again would
-/// meet the same divergence.
+/// A seam divergence's next is a live record.
 fn points_live(first: &agh::Error) {
     assert!(
         first.next.contains("--record") && !first.next.contains("--replay"),
@@ -1664,7 +1599,6 @@ fn each_divergence_is_typed_and_latched() {
         )
         .expect_err("another path");
     assert_eq!(shape(&first), replay_stop("request"));
-    // plan §12a.3: a request divergence's next re-records the tape, as `Error::replay` names it.
     assert!(first.next.contains("--replay") && first.next.contains("--record"));
     every_door_answers(&fx, &first);
 
@@ -1675,7 +1609,6 @@ fn each_divergence_is_typed_and_latched() {
     let fx = replaying(dir.path(), "output", &[stdout]);
     let first = fx.emit_stdout(b"other\n").expect_err("other bytes");
     assert_eq!(shape(&first), replay_stop("output"));
-    // A rerecording writes this run's stdout, so the output's next re-records the tape.
     assert!(first.next.contains("--replay") && first.next.contains("--record"));
     every_door_answers(&fx, &first);
 
@@ -1733,8 +1666,6 @@ fn a_tape_that_cannot_be_read_is_named() {
     assert_eq!(refused.sub, Sub::Replay(Replay::Format));
     assert!(refused.next.contains("--record"), "{}", refused.next);
 }
-
-// ---- Rerecording ----
 
 #[test]
 fn a_rerecording_keeps_the_old_exchanges_and_takes_this_runs_output() {
@@ -1837,8 +1768,6 @@ fn a_rerecording_still_stops_at_a_divergence() {
     fx.mono().expect("mono");
     let first = fx.finish(0).expect_err("a clock left");
     assert_eq!(shape(&first), replay_stop("unconsumed"));
-    // A rerecording that diverged can never replay: the new tape is gone, so the live record
-    // its next names is not refused for a file that exists.
     assert!(!new.exists());
     assert!(first.next.contains("--record") && !first.next.contains("--replay"));
 }
@@ -1848,7 +1777,6 @@ fn a_rerecording_asked_another_question_points_at_a_live_record() {
     let dir = scratch("fx");
     let old = tape_path(dir.path(), "old");
     let new = tape_path(dir.path(), "new");
-    // Arguments a shell would split or read: each comes back as one word of the next.
     let argv = ["api", "/meta", "--jq", ".[] | .name", "-f", "q=it's"];
     let old_text = tape::render(&header(&argv), &[gh_exchange("/meta", b"{}")]);
     std::fs::write(&old, &old_text).expect("the old tape");

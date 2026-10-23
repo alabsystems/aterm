@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the rule at the door ([`crate::need`]) and the digest ([`crate::digest`]):
-//! what each lock makes unwritable, that the digest never seats a band row, and that a
-//! dismissal and an open exception survive a restart.
+//! Tests for message admission rules ([`crate::need`]) and the digest ([`crate::digest`]).
 
 use crate::center::{MessageCenter, Outcome, PostOutcome};
 use crate::log::{LogLine, LogState, MessageLog, Retired};
@@ -103,9 +101,6 @@ fn working(title: &str) -> Message {
         .key("update.progress")
 }
 
-// ---- the locks the types make -------------------------------------------------
-
-/// An `Ask` derives its hold; the reporter never chooses one.
 #[test]
 fn an_ask_derives_its_hold_and_leads_with_the_reason_and_the_action() {
     let m = flash();
@@ -131,8 +126,6 @@ fn an_ask_derives_its_hold_and_leads_with_the_reason_and_the_action() {
     assert_eq!(s.need().class().as_str(), "now");
 }
 
-/// `LaterAsk::outlasted` is `None` until the fact has gone on for its named
-/// horizon: the only way to show a self-healing fact is to wait it out.
 #[test]
 fn a_wait_is_not_an_exception_until_it_outlasts_its_horizon() {
     let mk = |age_h: u64| {
@@ -154,8 +147,6 @@ fn a_wait_is_not_an_exception_until_it_outlasts_its_horizon() {
     );
 }
 
-/// A fingerprint is a key: held to the key cap, a long subject shortened by a
-/// stable hash, two long subjects that differ at the end still differ.
 #[test]
 fn a_fingerprint_fits_the_key_cap_and_stays_distinct() {
     let long_a = "s-3e79b5bde172ad0088ad".repeat(3);
@@ -181,11 +172,6 @@ fn a_fingerprint_fits_the_key_cap_and_stays_distinct() {
     assert_eq!(short.as_str().chars().count(), 47);
 }
 
-// ---- the door -----------------------------------------------------------------
-
-/// A persistent hold cannot be written by hand outside the crate; one copied onto an
-/// unclassified message from another message's `hold` stands on nothing: a record,
-/// counted and named. A classified row cannot stand on declines either.
 #[test]
 fn a_persistent_hold_copied_from_another_message_is_a_record() {
     let now = t0();
@@ -213,7 +199,6 @@ fn a_persistent_hold_copied_from_another_message_is_a_record() {
             tab: "s-1".into(),
             to: "2.1.284".into(),
         });
-        // The field is public, so the copy is possible: the door is the lock.
         m.hold = earned;
         m
     };
@@ -225,8 +210,6 @@ fn a_persistent_hold_copied_from_another_message_is_a_record() {
     assert_eq!(c.demotions(), 1);
     assert_eq!(c.last_demoted(), Some("harness.upgrade.s-1"));
     assert_eq!(c.log().get(posted.id).unwrap().severity, Severity::Warn);
-    // The same words classified (a standing ask with only snoozes for capsules) are a
-    // record too.
     let classified = row().now(Ask::standing(
         StandingWhy::OnlyYou(Reason::new("its own work holds the move")),
         Then::step("Stop that work in the tab"),
@@ -237,21 +220,15 @@ fn a_persistent_hold_copied_from_another_message_is_a_record() {
     assert_eq!(d.demotions(), 1);
 }
 
-/// A carried row from an older parent had no need: the parent admitted it, so
-/// the successor adopts it (and counts no demotion).
 #[test]
 fn a_carried_standing_row_is_adopted_not_demoted() {
     let now = t0();
     let mut parent = fresh(now);
     let id = parent.post(agent_down(), stamp(0), now).id;
-    // A standing row is born late (`reveal_after(PROGRESS_GRACE)`): a parent
-    // hands the successor rows that are on its glass.
     let _ = parent.settle(now + crate::PROGRESS_GRACE, true);
     let mut carry = parent.carried();
     assert_eq!(carry.live.len(), 1);
     assert_eq!(carry.live[0].hold, "standing");
-    // The successor's decoder has no `need` field to read (an older parent's
-    // carry): the row arrives Unclassified + Carried.
     carry.live[0].id = id.raw();
     let mut child = fresh(now);
     child.seed_carried(&carry, stamp(1), now);
@@ -261,8 +238,6 @@ fn a_carried_standing_row_is_adopted_not_demoted() {
     assert!(matches!(live.msg.need(), Need::Now(_)));
 }
 
-/// A restatement may shorten a hold or end it; it cannot stretch a transient
-/// row past its class's span.
 #[test]
 fn a_restatement_cannot_stretch_a_transient_row() {
     let now = t0();
@@ -299,7 +274,6 @@ fn a_restatement_cannot_stretch_a_transient_row() {
     assert_eq!(c.demotions(), 2, "and the cut is counted");
 }
 
-/// A `Now` whose reason or action says nothing is a record.
 #[test]
 fn an_ask_that_says_nothing_is_a_record() {
     let now = t0();
@@ -314,9 +288,6 @@ fn an_ask_that_says_nothing_is_a_record() {
     assert_eq!(c.demotions(), 1);
 }
 
-// ---- the digest never seats ------------------------------------------------------
-
-/// An exception asks for no row, moves no band revision and arms no timer.
 #[test]
 fn a_later_never_wants_a_row() {
     let now = t0();
@@ -333,14 +304,9 @@ fn a_later_never_wants_a_row() {
     assert_eq!(c.deadline(true), None, "no timer for an entry");
     assert_eq!(c.digest().len(), 1);
     assert_eq!(c.commit_rows(now + Duration::from_secs(10), 30), None);
-    // the digest's own revision moved; nothing else did
     assert!(c.digest_revision() > 0);
 }
 
-/// The metamorphic property, over random operation sequences: two centers see
-/// the same operations, but only one is also posted exceptions and dismissals.
-/// The band-facing state never differs by a single row (a seated exception
-/// would move `wanted_rows` on its first step).
 #[test]
 fn the_digest_is_invisible_to_the_band() {
     let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
@@ -408,7 +374,6 @@ fn the_digest_is_invisible_to_the_band() {
                         "round {seed_round} step {step}: commit"
                     );
                 }
-                // The exceptions: only `with` sees them.
                 9 => {
                     let tab = format!("tab {}", next(20));
                     with.post(own_work(&tab), wall, now);
@@ -462,10 +427,6 @@ fn the_digest_is_invisible_to_the_band() {
     }
 }
 
-// ---- posting, dismissing, quiet ---------------------------------------------------
-
-/// Same fact, same words: a duplicate. Same fact, new words: restated in
-/// place (same entry, same place in the order). A new fact: a new entry.
 #[test]
 fn an_exception_is_deduplicated_restated_or_new() {
     let now = t0();
@@ -479,8 +440,6 @@ fn an_exception_is_deduplicated_restated_or_new() {
     let changed = Message::new(tags::HARNESS, Severity::Warn, "Claude in tab 1 is behind")
         .line("held by pid 3109 (zsh, 9m)")
         .later(own_work_ask("tab 1"));
-    // Words alone restate an entry at most once per RESTATE_QUIET (a holder
-    // count moves every look): inside it the change is a duplicate.
     let early = c.post(changed.clone(), stamp(2_000), now + Duration::from_secs(60));
     assert_eq!((early.id, early.outcome), (a.id, PostOutcome::Duplicate));
     let r = c.post(changed, stamp(2_000), now + RESTATE_QUIET);
@@ -500,7 +459,6 @@ fn an_exception_is_deduplicated_restated_or_new() {
     assert_eq!(c.digest().entries[0].id, a.id, "longest waiting first");
 }
 
-/// Worst first, then longest waiting.
 #[test]
 fn the_digest_reads_worst_first_then_oldest() {
     let now = t0();
@@ -513,8 +471,6 @@ fn the_digest_reads_worst_first_then_oldest() {
     assert_eq!(c.digest().worst(), Some(Severity::Warn));
 }
 
-/// Dismiss all: one press files every entry at one wall stamp, each with its
-/// own retirement line and its final words; the facts are quiet after it.
 #[test]
 fn dismiss_all_files_every_entry_to_the_log_in_one_batch() {
     let now = t0();
@@ -534,7 +490,6 @@ fn dismiss_all_files_every_entry_to_the_log_in_one_batch() {
         );
         assert!(!rec.title.is_empty(), "the final words are kept");
     }
-    // both facts are quiet
     let again = c.post(own_work("tab 1"), stamp(6_000), now);
     assert_eq!(again.outcome, PostOutcome::Suppressed);
     assert_eq!(again.id, a, "the record that made it quiet");
@@ -545,8 +500,6 @@ fn dismiss_all_files_every_entry_to_the_log_in_one_batch() {
     assert!(c.digest().is_empty());
 }
 
-/// A dismissal holds for the fact's resurface span, then the fact may be
-/// shown again; a changed cause is a different fact and is never suppressed.
 #[test]
 fn a_dismissal_holds_for_its_span_and_a_new_cause_is_news() {
     let now = t0();
@@ -561,7 +514,6 @@ fn a_dismissal_holds_for_its_span_and_a_new_cause_is_news() {
         PostOutcome::New,
         "a persisting fact may return after its span"
     );
-    // another cause for the same tab is a different fingerprint
     let draft = LaterAsk::outlasted(
         Reason::new("a typed draft nobody sent"),
         Horizon::OWN_WORK,
@@ -580,8 +532,6 @@ fn a_dismissal_holds_for_its_span_and_a_new_cause_is_news() {
     assert_eq!(news.outcome, PostOutcome::New);
 }
 
-/// A fact that resolved (its cause ended) is not filed by the owner, so its
-/// return is news, not a suppression.
 #[test]
 fn a_resolved_exception_is_not_quiet() {
     let now = t0();
@@ -596,7 +546,6 @@ fn a_resolved_exception_is_not_quiet() {
     );
 }
 
-/// The cap files the oldest lowest-severity entry, with its log line.
 #[test]
 fn the_cap_files_the_oldest_lowest_severity_entry() {
     let now = t0();
@@ -614,7 +563,6 @@ fn the_cap_files_the_oldest_lowest_severity_entry() {
     );
 }
 
-/// An entry nobody looked at files itself after two weeks.
 #[test]
 fn an_entry_nobody_reviewed_files_itself_after_two_weeks() {
     let now = t0();
@@ -631,8 +579,6 @@ fn an_entry_nobody_reviewed_files_itself_after_two_weeks() {
     );
 }
 
-/// Pressing an entry's capsule logs the press; a decline that closes the row
-/// answers the entry.
 #[test]
 fn a_capsule_press_on_an_entry_is_logged_and_a_decline_answers_it() {
     let now = t0();
@@ -652,8 +598,6 @@ fn a_capsule_press_on_an_entry_is_logged_and_a_decline_answers_it() {
         "Open Settings",
         "the ask's button leads"
     );
-    // The entry's one action, done: answered (not `Resolved`: nobody saw the cause end;
-    // not `Dismissed`: the owner acted).
     let open = c.act_digest(id, ActionIndex(0), stamp(1), now).unwrap();
     assert!(matches!(open, Intent::OpenSystemPane { .. }));
     assert!(c.digest().is_empty(), "the owner did what it asked");
@@ -661,7 +605,6 @@ fn a_capsule_press_on_an_entry_is_logged_and_a_decline_answers_it() {
         c.log().get(id).unwrap().state,
         LogState::Retired(Retired::Answered { ref label }) if label == "Open Settings"
     ));
-    // ... and stays put away for its quiet span, exactly as a dismissal would.
     assert_eq!(
         c.post(
             Message::new(
@@ -678,8 +621,6 @@ fn a_capsule_press_on_an_entry_is_logged_and_a_decline_answers_it() {
     );
 }
 
-/// A decline the entry carries answers it too; a navigation beside the action (`Show
-/// tab`) leaves it until the cause or the owner ends it.
 #[test]
 fn a_decline_answers_an_entry_and_a_navigation_leaves_it() {
     let now = t0();
@@ -708,8 +649,6 @@ fn a_decline_answers_an_entry_and_a_navigation_leaves_it() {
     );
 }
 
-/// One fact, one place: a row that takes over a key retires the entry, and an
-/// entry that takes over a key retires the row.
 #[test]
 fn a_fact_lives_in_one_place() {
     let now = t0();
@@ -734,8 +673,6 @@ fn a_fact_lives_in_one_place() {
     assert_eq!(c.wanted_rows(), 0);
 }
 
-// ---- across a restart ---------------------------------------------------------------
-
 fn restart(c: &mut MessageCenter, now: Instant) -> MessageCenter {
     let lines: Vec<String> = c
         .drain_new_for_persist()
@@ -747,9 +684,6 @@ fn restart(c: &mut MessageCenter, now: Instant) -> MessageCenter {
     MessageCenter::new(log, now)
 }
 
-/// An entry open at quit is still open at launch (every other posted-and-never-
-/// retired line loads as Stale), under its old id, and its reporter's first
-/// look replaces the words in place.
 #[test]
 fn an_open_exception_survives_a_restart() {
     let now = t0();
@@ -768,14 +702,11 @@ fn an_open_exception_survives_a_restart() {
         view.entries[0].why,
         "its own background work holds the move (for over 1 d)"
     );
-    // the reporter's first look re-asserts it: same words -> a duplicate
     let again = next.post(own_work("tab 1"), stamp(120_000), now);
     assert_eq!((again.id, again.outcome), (id, PostOutcome::Duplicate));
     assert_eq!(next.wanted_rows(), 0);
 }
 
-/// An entry adopted after a restart carries a stand-in ask (no `Mover`); the reporter's
-/// next look brings the real one, and a press on the entry's own button answers it.
 #[test]
 fn a_press_after_a_restart_answers_the_entry_on_the_reporters_ask() {
     let now = t0();
@@ -796,8 +727,6 @@ fn a_press_after_a_restart_answers_the_entry_on_the_reporters_ask() {
     ));
 }
 
-/// A dismissal stamped under a wall clock that ran years ahead (and was
-/// corrected) does not keep the fact quiet until that future time.
 #[test]
 fn a_filing_from_a_clock_that_ran_ahead_keeps_nothing_quiet() {
     let now = t0();
@@ -811,8 +740,6 @@ fn a_filing_from_a_clock_that_ran_ahead_keeps_nothing_quiet() {
     );
 }
 
-/// A dismissal made before a restart still holds after it: the quiet span is
-/// read from the replayed ring, with no state of its own.
 #[test]
 fn a_dismissal_holds_across_a_restart() {
     let now = t0();
@@ -832,8 +759,6 @@ fn a_dismissal_holds_across_a_restart() {
     );
 }
 
-/// A decoded record of an exception is `need=later`; a record of anything else
-/// carries no such key (an older build ignores the key it does not know).
 #[test]
 fn the_log_marks_only_exceptions() {
     let now = t0();
@@ -861,8 +786,6 @@ fn the_log_marks_only_exceptions() {
     );
 }
 
-/// A live row and a record are what they were: the class helpers derive their
-/// hold and none leaves the digest a hold.
 #[test]
 fn every_class_constructor_is_coherent() {
     let w = working("Downloading");
@@ -886,17 +809,12 @@ fn every_class_constructor_is_coherent() {
     );
 }
 
-// ---- over the wire: `aterm ctl messages` / `notice dismiss` --------------------------
-
 fn wire_rows(c: &MessageCenter, args: &str) -> Vec<String> {
     let q = crate::wire::parse_read_args(args).expect("a query");
     let enc = |s: &str| s.replace(' ', "%20");
     crate::wire::message_rows(c, &q, stamp(0).unix_ms + 10_000, &enc)
 }
 
-/// The digest is readable over the wire in the grammar of every other row:
-/// `state=review` while open, `need=later` open and filed, the current words after a
-/// restatement; `need=later` selects exactly the entries.
 #[test]
 fn the_digest_is_readable_over_the_wire() {
     let now = t0();
@@ -938,7 +856,6 @@ fn the_digest_is_readable_over_the_wire() {
         "an unclassified row says nothing"
     );
 
-    // a restatement is never logged: the row reads the entry's current words
     let changed = Message::new(tags::HARNESS, Severity::Warn, "Claude in tab 1 is behind")
         .line("held by pid 3109 (zsh, 9m)")
         .later(own_work_ask("tab 1"));
@@ -949,7 +866,6 @@ fn the_digest_is_readable_over_the_wire() {
         .unwrap();
     assert!(row.contains("held%20by%20pid%203109"), "{row}");
 
-    // filed entries stay `need=later`, with the way they left
     c.file_digest(stamp(9_000), now);
     let filed = wire_rows(&c, "need=later");
     assert_eq!(filed.len(), 2);
@@ -962,7 +878,6 @@ fn the_digest_is_readable_over_the_wire() {
     }
 }
 
-/// `notice dismiss review` files them all; `notice dismiss <id>` files one.
 #[test]
 fn notice_dismiss_files_the_digest() {
     use crate::wire::{NoticeRequest, WireGate, apply};
@@ -995,9 +910,6 @@ fn notice_dismiss_files_the_digest() {
     assert!(NoticeRequest::parse("dismiss review please").is_err());
 }
 
-/// The owner's own Dismiss of an exception keeps it "declined" for its back-off span
-/// (`dismissed_quiet`), and nothing else does: an answer is no decline, and the span
-/// runs out.
 #[test]
 fn only_the_owners_dismiss_reads_as_a_decline_for_its_span() {
     let now = t0();
@@ -1018,7 +930,6 @@ fn only_the_owners_dismiss_reads_as_a_decline_for_its_span() {
     );
     assert!(!c.dismissed_quiet("privacy.other", Resurface::CHOICE, stamp(10_000)));
 
-    // Pressing the entry's action (Open Settings) is an answer, never a decline.
     let mut answered = fresh(now);
     answered.post(fda(), stamp(0), now);
     let id = answered.digest().entries[0].id;
@@ -1026,15 +937,12 @@ fn only_the_owners_dismiss_reads_as_a_decline_for_its_span() {
     assert!(!answered.dismissed_quiet(&key, Resurface::CHOICE, stamp(10_000)));
 }
 
-/// The report lists the open entries worst first, marking a warning, and a filed
-/// entry whose cause ended says "fixed" in a person's words with no action left.
 #[test]
 fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() {
     let now = t0();
     let mut c = fresh(now);
     c.post(fda(), stamp(0), now);
     c.post(own_work("tab 1"), stamp(1), now);
-    // The file so far, replayed into a fresh log as a reader would.
     let mut file: Vec<String> = Vec::new();
     let mut replay = |c: &mut MessageCenter| {
         file.extend(c.drain_new_for_persist().iter().map(LogLine::encode));
@@ -1073,7 +981,6 @@ fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() 
         "{filed:#?}"
     );
 
-    // A cause that ended unfixed still stands: its action stays.
     let mut c = fresh(now);
     c.post(fda(), stamp(0), now);
     assert_eq!(c.resolve_digest_prefix("privacy", Outcome::Warn, now), 1);
@@ -1094,8 +1001,6 @@ fn the_exceptions_report_ranks_warnings_first_and_drops_a_fixed_entrys_action() 
     );
 }
 
-/// The default report lists the open entries and only the newest filings
-/// (newest first) and says how many it left out; the whole history is `All`.
 #[test]
 fn the_latest_report_caps_the_filed_list_at_the_newest() {
     let now = t0();
@@ -1131,10 +1036,6 @@ fn the_latest_report_caps_the_filed_list_at_the_newest() {
     assert!(all.iter().any(|l| l == "Filed (12)"), "{all:#?}");
 }
 
-// ---- a standing row is raised once ---------------------------------------------------
-
-/// A standing row the owner read (it folded) is not raised again inside a day, and a
-/// return after the span is news.
 #[test]
 fn a_standing_row_the_owner_read_is_not_raised_again_for_a_day() {
     let now = t0();
@@ -1154,11 +1055,6 @@ fn a_standing_row_the_owner_read_is_not_raised_again_for_a_day() {
     );
 }
 
-/// A standing row's fact that is new (the occurrence the owner read ended and another
-/// began, with no live row between them to withdraw) is news once the reporter says so
-/// (`end_standing_quiet`): the read no longer keeps the key quiet, and it is on record as
-/// withdrawn. Control: without the call the read keeps the next post quiet; with a live
-/// row, or no read to end, the call changes nothing.
 #[test]
 fn a_standing_row_whose_read_occurrence_ended_is_news_when_another_begins() {
     let now = t0();
@@ -1192,8 +1088,6 @@ fn a_standing_row_whose_read_occurrence_ended_is_news_when_another_begins() {
     assert_ne!(next.id, id);
 }
 
-/// A row whose cause ended (resolved or withdrawn) is not filed by the owner:
-/// its return is news at once.
 #[test]
 fn a_standing_row_that_ended_is_news_when_it_returns() {
     let now = t0();
@@ -1206,8 +1100,6 @@ fn a_standing_row_that_ended_is_news_when_it_returns() {
     );
 }
 
-/// A standing row with no key cannot be superseded, resolved or remembered:
-/// the door records it.
 #[test]
 fn a_standing_row_without_a_key_is_a_record() {
     let now = t0();
@@ -1221,12 +1113,6 @@ fn a_standing_row_without_a_key_is_a_record() {
     assert_eq!(c.demotions(), 1);
 }
 
-// ---- the words that say nothing ---------------------------------------------------------
-
-/// A snooze in words, two actions in a sentence, "it is waiting" as a reason:
-/// none is a Need. The door records the message and counts it, so a roster of
-/// every reporter's messages (each asserting `demotions() == 0`) fails on the
-/// author who wrote one.
 #[test]
 fn a_snooze_a_pair_of_actions_or_a_wait_is_no_need() {
     let now = t0();
@@ -1287,7 +1173,6 @@ fn a_snooze_a_pair_of_actions_or_a_wait_is_no_need() {
         assert_eq!(c.demotions(), 1, "{name}: counted");
         assert_eq!(c.wanted_rows(), 0, "{name}");
     }
-    // ...and the same words in a digest entry
     let mut c = fresh(now);
     let later = LaterAsk::person(
         Why::OnlyYou(Reason::new("a build waits on you")),
@@ -1302,20 +1187,15 @@ fn a_snooze_a_pair_of_actions_or_a_wait_is_no_need() {
     );
     assert!(c.digest().is_empty());
     assert_eq!(c.demotions(), 1);
-    // the wordings this design ships pass
     for ask in [own_work_ask("tab 1"), fda_ask()] {
         assert_eq!(ask.fault(), None, "{ask:?}");
     }
 }
 
-// ---- the memory of a filing -------------------------------------------------------------
-
 fn unrelated(i: usize) -> Message {
     Message::new(tags::UPDATE, Severity::Info, format!("record {i}")).record()
 }
 
-/// A dismissal is remembered for its span after the dismissal, not for `LOG_CAP` records
-/// after the entry's posting: the ring turns over twice and the fact is still quiet.
 #[test]
 fn a_dismissal_outlives_512_later_records() {
     let now = t0();
@@ -1334,7 +1214,6 @@ fn a_dismissal_outlives_512_later_records() {
         PostOutcome::Suppressed,
         "a fact dismissed half an hour ago (span 30 days) is still quiet"
     );
-    // ... and 181 days on, with the ring turning again, the filing is let go.
     for i in 0..600 {
         c.post(unrelated(3_000 + i), stamp(181 * DAY_MS + i as u64), now);
     }
@@ -1344,9 +1223,6 @@ fn a_dismissal_outlives_512_later_records() {
     );
 }
 
-/// The latest word is the latest by time: a record under an entry's key, posted after
-/// the entry opened and before the dismissal, sits later in the ring but is an older
-/// word; it neither erases the dismissal nor counts as one.
 #[test]
 fn a_record_under_the_key_never_erases_a_dismissal() {
     let now = t0();
@@ -1356,7 +1232,6 @@ fn a_record_under_the_key_never_erases_a_dismissal() {
             .key(key)
             .record()
     };
-    // The record before the entry.
     let mut before = fresh(now);
     before.post(record(), stamp(0), now);
     before.post(fda(), stamp(1), now);
@@ -1365,7 +1240,6 @@ fn a_record_under_the_key_never_erases_a_dismissal() {
         before.post(fda(), stamp(3), now).outcome,
         PostOutcome::Suppressed
     );
-    // The record between the entry's posting and the dismissal.
     let mut between = fresh(now);
     between.post(fda(), stamp(1), now);
     between.post(record(), stamp(2), now);
@@ -1375,7 +1249,6 @@ fn a_record_under_the_key_never_erases_a_dismissal() {
         PostOutcome::Suppressed,
         "the dismissal is the latest word on the fact"
     );
-    // A record after the dismissal is another fact's word: still quiet.
     between.post(record(), stamp(5), now);
     assert_eq!(
         between.post(fda(), stamp(6), now).outcome,
@@ -1383,8 +1256,6 @@ fn a_record_under_the_key_never_erases_a_dismissal() {
     );
 }
 
-/// A fact dismissed again backs off: a week, then four weeks, then 90 days, where it
-/// stays, never for good.
 #[test]
 fn a_fact_dismissed_again_backs_off() {
     let now = t0();
@@ -1398,7 +1269,6 @@ fn a_fact_dismissed_again_backs_off() {
     let mut day = 0u64;
     let mut quiet_days = Vec::new();
     for _ in 0..5 {
-        // How many days until it is news again?
         let mut d = 1;
         while c.post(own_work("tab 1"), at(day + d), now).outcome == PostOutcome::Suppressed {
             d += 1;
@@ -1415,10 +1285,6 @@ fn a_fact_dismissed_again_backs_off() {
     assert_eq!(Resurface::WAIT.backed_off(u32::MAX), 90 * DAY_MS);
 }
 
-/// An entry adopted after a restart ends at the real wall time: anchored at the wall clock
-/// of its adoption, not its old ingress stamp plus the minutes since. Every way an entry
-/// ends without a stamp of its own (a later family look, the reporter's clear, a
-/// key-prefix sweep) is held to it.
 #[test]
 fn an_adopted_entry_is_ended_with_the_real_wall_time() {
     let now = t0();
@@ -1439,8 +1305,6 @@ fn an_adopted_entry_is_ended_with_the_real_wall_time() {
     let real = |secs: u64| stamp(3 * DAY_MS).unix_ms + secs * 1_000;
     let logged = |c: &MessageCenter, id| c.log().get(id).unwrap().retired_unix_ms.unwrap();
     let near = |a: u64, b: u64| a.abs_diff(b) < 10_000;
-    // 1. A family look that names only tab 3: tab 1 and tab 2's clocks start at
-    //    +300 s, and a look 600 s later ends them.
     let at = |secs: u64| now + Duration::from_secs(secs);
     let only_three = || vec![own_work("tab 3")];
     next.sync_digest(
@@ -1461,14 +1325,12 @@ fn an_adopted_entry_is_ended_with_the_real_wall_time() {
         "a later look: real time"
     );
     assert!(near(logged(&next, ids[1]), real(900)));
-    // 2. The reporter's clear.
     let key = next.digest().entries[0].key.clone();
     assert!(next.clear_digest(&key, at(2_000)));
     assert!(
         near(logged(&next, ids[2]), real(2_000)),
         "the clear: real time"
     );
-    // 3. A key-prefix sweep, on a fresh adoption.
     let mut c2 = fresh(now);
     let id = c2.post(own_work("tab 9"), stamp(0), now).id;
     let mut lines: Vec<String> = c2
@@ -1490,9 +1352,6 @@ fn an_adopted_entry_is_ended_with_the_real_wall_time() {
     );
 }
 
-/// A reporter that changed a family from a standing row to a record never re-asserts the
-/// row its parent carried across the update: the newer build's classified record under
-/// the adopted row's key retires it.
 #[test]
 fn a_classified_record_under_an_adopted_rows_key_retires_it() {
     let now = t0();
@@ -1532,7 +1391,6 @@ fn a_classified_record_under_an_adopted_rows_key_retires_it() {
         later + Duration::from_secs(1),
     );
     assert_eq!(s.live_rows().count(), 0, "the newer build's record ends it");
-    // ... but a row the current build posted is not retired by a record.
     s.post(
         Message::new(
             tags::UPDATE,
@@ -1561,8 +1419,6 @@ fn a_classified_record_under_an_adopted_rows_key_retires_it() {
     );
 }
 
-/// A builder that wrote its own detail lines keeps them: the ask's reason and action lead
-/// the detail only for a message that brought none.
 #[test]
 fn a_builders_own_detail_lines_are_not_reordered_by_the_ask() {
     let m = Message::new(tags::A11Y, Severity::Error, "Screen reader access lost")
@@ -1577,7 +1433,6 @@ fn a_builders_own_detail_lines_are_not_reordered_by_the_ask() {
             Then::step("restart aterm to retry"),
         ));
     assert_eq!(m.detail, vec!["restart aterm to retry", "bus gone"]);
-    // ... and a message that brought none gets the shape.
     let bare = agent_down();
     assert_eq!(bare.detail.len(), 2);
     assert_eq!(bare.detail[1], "Type claude --resume in the tab");

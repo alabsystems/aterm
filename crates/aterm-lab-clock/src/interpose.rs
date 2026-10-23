@@ -18,28 +18,22 @@ use crate::model::{
     shift_ticks, shift_timespec, shift_timeval, shifted,
 };
 
-/// The variable that names the offset file.
 const FILE_VAR: &str = "LABCLOCK_FILE";
-/// The variable that names the directory of `<pid>.txt` records.
 const DIR_VAR: &str = "LABCLOCK_DIR";
-/// The variable whose `1` shifts the clocks that count a sleep too.
 const CONTINUOUS_VAR: &str = "LABCLOCK_CONTINUOUS";
 
-/// `struct timespec`.
 #[repr(C)]
 struct Timespec {
     tv_sec: i64,
     tv_nsec: i64,
 }
 
-/// `struct timeval` (`suseconds_t` is 32 bits on Darwin).
 #[repr(C)]
 struct Timeval {
     tv_sec: i64,
     tv_usec: i32,
 }
 
-/// `mach_timebase_info_data_t`.
 #[repr(C)]
 #[derive(Default)]
 struct Timebase {
@@ -58,8 +52,6 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut Timebase) -> c_int;
 }
 
-/// What the constructor read once: the lab's variables, this executable, and
-/// the look intervals in Mach ticks.
 struct Config {
     file: Option<PathBuf>,
     dir: Option<PathBuf>,
@@ -67,28 +59,19 @@ struct Config {
     exe: String,
     numer: u32,
     denom: u32,
-    /// 20 ms: how often the offset file is looked at, at most.
     look: u64,
-    /// 2 s: how often the record is written while clocks are read.
     record: u64,
 }
 
-/// Set once the constructor has run; until then every read passes unshifted.
 static CONFIG: OnceLock<Config> = OnceLock::new();
-/// The offset, in nanoseconds.
 static OFF_NS: AtomicI64 = AtomicI64::new(0);
-/// The uptime tick from which the offset file is looked at again.
 static NEXT_LOOK: AtomicU64 = AtomicU64::new(0);
-/// The uptime tick from which the record is written again.
 static NEXT_RECORD: AtomicU64 = AtomicU64::new(0);
-/// Held by the one thread looking at the file.
 static LOOKING: AtomicBool = AtomicBool::new(false);
-/// The offset file last read: its inode, size and modification time.
 static SEEN_INO: AtomicU64 = AtomicU64::new(0);
 static SEEN_SIZE: AtomicI64 = AtomicI64::new(-1);
 static SEEN_MTIME: AtomicI64 = AtomicI64::new(0);
 static SEEN_MTIME_NS: AtomicI64 = AtomicI64::new(0);
-/// The reads of the offset file and of each clock call.
 static FILE_READS: AtomicU64 = AtomicU64::new(0);
 static N_CLOCK_GETTIME: [AtomicU64; NCLOCK] = [const { AtomicU64::new(0) }; NCLOCK];
 static N_NSEC_NP: [AtomicU64; NCLOCK] = [const { AtomicU64::new(0) }; NCLOCK];
@@ -98,13 +81,9 @@ static N_CONTINUOUS: AtomicU64 = AtomicU64::new(0);
 static N_CONTINUOUS_APPROX: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    /// Whether this thread is inside a wrapper already.
     static INSIDE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// This thread's way into a wrapper: `None` when it is inside one already (a
-/// call the system makes inside a wrapped one, which passes through) or its
-/// thread-locals are gone.
 struct Outer;
 
 impl Outer {
@@ -122,14 +101,12 @@ impl Drop for Outer {
     }
 }
 
-/// Count one read of `clock` in `table`.
 fn count(table: &[AtomicU64; NCLOCK], clock: u32) {
     if let Some(n) = usize::try_from(clock).ok().and_then(|i| table.get(i)) {
         n.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// The configuration and this thread's way in, when a read may be shifted.
 fn shifting() -> Option<(&'static Config, Outer)> {
     let config = CONFIG.get()?;
     let outer = Outer::enter()?;
@@ -137,8 +114,6 @@ fn shifting() -> Option<(&'static Config, Outer)> {
     Some((config, outer))
 }
 
-/// Look at the offset file when 20 ms of uptime have passed since the last
-/// look, and write the record when the offset changed or 2 s have passed.
 fn look(config: &Config) {
     let Some(file) = &config.file else {
         return;
@@ -156,8 +131,6 @@ fn look(config: &Config) {
     LOOKING.store(false, Ordering::Release);
 }
 
-/// Read the offset file again when it is not the one last read: whether a
-/// new offset was taken.
 fn reread(file: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(file) else {
         return false;
@@ -186,7 +159,6 @@ fn reread(file: &Path) -> bool {
     true
 }
 
-/// Write `<dir>/<pid>.txt` by rename, when the lab named a directory.
 fn write_record(config: &Config) {
     let Some(dir) = &config.dir else {
         return;
@@ -334,8 +306,6 @@ extern "C" fn lab_mach_continuous_approximate_time() -> u64 {
     }
 }
 
-/// The constructor: read the lab's variables, the timebase and this
-/// executable once, take the offset, and write the first record.
 extern "C" fn init() {
     let mut tb = Timebase::default();
     // SAFETY: a timebase of our own to fill.
@@ -375,7 +345,6 @@ extern "C" fn init() {
     write_record(config);
 }
 
-/// One dyld interposing tuple: the wrapper, and the function it stands in for.
 #[repr(C)]
 struct Tuple {
     replacement: *const c_void,

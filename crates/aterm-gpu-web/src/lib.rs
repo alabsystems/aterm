@@ -213,6 +213,8 @@ impl AtermGpuTerminal {
         }
         if let Some(arc) = self.emoji_font.as_ref() {
             // Already an interned Arc: install the shared blob rather than
+            // deep-copying the ~180 MB colour face per pane (wasm memory never
+            // shrinks).
             cpu.set_color_font_arc(std::sync::Arc::clone(arc))?;
         }
         if let Some(bytes) = self.bold_font.as_deref() {
@@ -878,6 +880,7 @@ impl AtermGpuTerminal {
         if let Some(pending) = self.term.resize_offloading_scrollback(rows, cols) {
             if pending.line_count() <= INLINE_REFLOW_MAX_LINES {
                 // Small history: rewrap now. A follow-up job would wedge the
+                // detach window if dropped, so route any to the pump.
                 if let Some(follow) = self.term.finish_resize_offload(pending.reflow()) {
                     self.pending_reflow = Some(follow);
                     self.reflow_grace = REFLOW_PUMP_GRACE_RENDERS;
@@ -1277,6 +1280,7 @@ impl AtermGpuTerminal {
         ));
         if presented.is_err() {
             // The canvas did not receive this frame; drop the key so the
+            // host's retry draws.
             self.last_frame_key = None;
         }
         presented
@@ -1751,6 +1755,7 @@ mod tests {
         let mut saw_active = false;
         for i in 0u32..60 {
             // Real output now and then: rain holds still on a pane that is only
+            // being read, where closing the gate is correct.
             if i.is_multiple_of(10) {
                 t.process(b"x");
             }

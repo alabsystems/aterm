@@ -15,9 +15,7 @@ impl Row {
         let _ = self.insert_chars_fill(col, count, Cell::EMPTY);
     }
 
-    /// Insert `count` cells filled with the BCE `fill` at `col`, shifting
-    /// existing cells right (ICH); cells pushed past the row end are dropped.
-    /// Returns where the wide halves it blanked ended up.
+    /// Insert `count` cells filled with `fill` at `col`, shifting existing cells right (ICH).
     pub fn insert_chars_fill(&mut self, col: u16, count: u16, fill: Cell) -> BlankedHalves {
         let mut blanked = BlankedHalves::default();
         if count == 0 || col >= self.cols() {
@@ -30,34 +28,20 @@ impl Row {
         let old_len = self.len as usize;
         let shift_end = cols.saturating_sub(count);
 
-        // Left boundary: inserting at a wide continuation bisects the pair, so
-        // both halves get `fill`. Clearing only the head would shift the
-        // continuation right with a stale WIDE_CONTINUATION bit, and a later
-        // edit there would treat its left neighbour as a wide head.
-        //
-        // `is_cell_wide_continuation` needs bit 10 on cells[col] and a WIDE head
-        // at col-1: bit 10 aliases PROTECTED, so a raw bit test fires on a
-        // protected cell, and a lone `cells[col-1].WIDE` test on a head whose
-        // continuation a narrow cell overwrote.
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
             self.cells[col] = fill;
-            // The head stays; the continuation rides the shift (or is refilled
-            // with the vacated span when nothing shifts).
             blanked[0] = Some(u16_from_usize(col - 1));
             if shift_end > col {
                 blanked[1] = Some(u16_from_usize(col + count));
             }
         }
 
-        // Right boundary: cells from shift_end are discarded, so a WIDE head at
-        // shift_end-1 loses its continuation.
         if shift_end > 0
             && shift_end < cols
             && self.cells[shift_end - 1].flags().contains(CellFlags::WIDE)
         {
             self.cells[shift_end - 1] = fill;
-            // A head inside the shifted span moves to the row's last column.
             let head = shift_end - 1;
             blanked[2] = Some(u16_from_usize(if head >= col {
                 head + count
@@ -76,11 +60,9 @@ impl Row {
         }
 
         self.flags |= RowFlags::DIRTY;
-        // The shift rewrote the last cell: an early-wrap hole there is gone.
         self.note_write_through(cols);
         if old_len == 0 || col >= old_len {
             // Nothing was shifted. A BCE fill's blanks at [col, fill_end) are
-            // content `len` must count, or render_row hides them.
             if !fill.is_empty() {
                 self.recalculate_len_up_to(fill_end);
             }
@@ -107,9 +89,7 @@ impl Row {
         let _ = self.delete_chars_fill(col, count, Cell::EMPTY);
     }
 
-    /// Delete `count` cells at `col`, shifting the rest left and filling the
-    /// vacated end with the BCE `fill` (DCH). Returns where the wide halves it
-    /// blanked ended up.
+    /// Delete `count` cells at `col`, shifting left and filling vacated cells with `fill` (DCH).
     pub fn delete_chars_fill(&mut self, col: u16, count: u16, fill: Cell) -> BlankedHalves {
         let mut blanked = BlankedHalves::default();
         if count == 0 || col >= self.cols() {
@@ -121,24 +101,17 @@ impl Row {
         let cols = self.cells.len();
         let old_len = self.len as usize;
 
-        // Left boundary: deleting a continuation orphans its head at col-1
-        // (context-aware check, see `insert_chars_fill`).
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
             blanked[0] = Some(u16_from_usize(col - 1));
         }
 
-        // Right boundary: if the last deleted cell is WIDE, its continuation
-        // at col+count shifts left (to col) and becomes orphaned.
         let last_deleted = (col + count - 1).min(cols - 1);
         let src_start = (col + count).min(cols);
         if self.cells[last_deleted].flags().contains(CellFlags::WIDE) && src_start < cols {
             self.cells[src_start] = fill;
             blanked[1] = Some(u16_from_usize(col));
         }
-        // No separate WIDE_CONTINUATION check on cells[src_start]: a genuine
-        // orphan there has its head at src_start-1 == last_deleted, handled above,
-        // and a raw bit test would fire on a protected cell shifting into col.
 
         let shift_len = cols - src_start;
         if shift_len > 0 {
@@ -152,28 +125,20 @@ impl Row {
         }
 
         self.flags |= RowFlags::DIRTY;
-        // The shift rewrote the last cell: an early-wrap hole there is gone.
         self.note_write_through(cols);
         if old_len == 0 || col >= old_len {
             // Nothing was shifted. A BCE fill's blanks at [fill_start, cols)
-            // are content `len` must count, or render_row hides them.
             if !fill.is_empty() {
                 self.recalculate_len_up_to(cols);
             }
             return blanked;
         }
-        // A BCE fill makes the vacated right-margin cells content, so `len`
-        // reaches the row edge; `old_len - count` holds only for EMPTY.
         if !fill.is_empty() {
             self.recalculate_len_up_to(cols);
             return blanked;
         }
         let delete_end = col + count;
         if delete_end < old_len {
-            // A dense tail shrinks by exactly `count`, unless the right
-            // boundary fixup also cleared the deleted head's continuation and
-            // that was the last content (old_len == col+count+1): recalculate
-            // when the new last cell is empty (never over-shrinks).
             let cand = old_len - count;
             self.len = u16_from_usize(cand);
             if cand > 0 && self.cells[cand - 1].is_empty() {
@@ -185,10 +150,7 @@ impl Row {
         blanked
     }
 
-    /// Insert `count` cells at `col`, shifting cells right up to `right_bound`,
-    /// with BCE fill. Cells shifted past `right_bound` are discarded; used when
-    /// DECLRMM horizontal margins restrict the shift region. Returns where the
-    /// wide halves it blanked ended up.
+    /// Insert `count` cells at `col`, shifting cells right up to `right_bound`, with BCE fill.
     pub fn insert_chars_bounded_fill(
         &mut self,
         col: u16,
@@ -207,8 +169,6 @@ impl Row {
         let rb = right_bound as usize;
         let shift_end = rb.saturating_sub(count);
 
-        // Context-aware left-boundary fixup; both halves get `fill` (see
-        // `insert_chars_fill`).
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
             self.cells[col] = fill;
@@ -218,8 +178,6 @@ impl Row {
             }
         }
 
-        // Right boundary: a WIDE head at shift_end-1 loses its continuation,
-        // which the shift discards; the head moves to rb-1.
         if shift_end > col
             && shift_end < rb
             && self.cells[shift_end - 1].flags().contains(CellFlags::WIDE)
@@ -228,9 +186,6 @@ impl Row {
             blanked[2] = Some(u16_from_usize(rb - 1));
         }
 
-        // Wide fixup at the outer right boundary: if cells[rb-1] is WIDE, its
-        // continuation at cells[rb] is outside the region and is orphaned when
-        // the shift overwrites cells[rb-1].
         if rb < self.cells.len() && self.cells[rb - 1].flags().contains(CellFlags::WIDE) {
             self.cells[rb] = fill;
             blanked[3] = Some(u16_from_usize(rb));
@@ -246,14 +201,12 @@ impl Row {
         }
 
         self.flags |= RowFlags::DIRTY;
-        // A shift through the row end rewrote the last cell.
         self.note_write_through(rb);
         self.recalculate_len_up_to(self.cells.len());
         blanked
     }
 
-    /// Delete `count` cells at `col`, shifting cells left within `right_bound`,
-    /// with BCE fill. Returns where the wide halves it blanked ended up.
+    /// Delete `count` cells at `col`, shifting cells left within `right_bound`, with BCE fill.
     pub fn delete_chars_bounded_fill(
         &mut self,
         col: u16,
@@ -271,7 +224,6 @@ impl Row {
         let count = count as usize;
         let rb = right_bound as usize;
 
-        // Context-aware left-boundary fixup (see `insert_chars_fill`).
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
             blanked[0] = Some(u16_from_usize(col - 1));
@@ -280,18 +232,11 @@ impl Row {
         let last_deleted = (col + count - 1).min(rb - 1);
         let src_start = (col + count).min(rb);
 
-        // The last deleted cell's continuation is orphaned, and shifts to col.
         if self.cells[last_deleted].flags().contains(CellFlags::WIDE) && src_start < rb {
             self.cells[src_start] = fill;
             blanked[1] = Some(u16_from_usize(col));
         }
-        // No separate WIDE_CONTINUATION check on cells[src_start]: a genuine
-        // orphan there has its head at src_start-1 == last_deleted, handled
-        // above, and a raw bit test would fire on a protected cell.
 
-        // Wide fixup at the outer right boundary: if cells[rb-1] is WIDE, its
-        // continuation at cells[rb] is outside the region and is orphaned when
-        // the fill overwrites cells[rb-1].
         if rb < self.cells.len() && self.cells[rb - 1].flags().contains(CellFlags::WIDE) {
             self.cells[rb] = fill;
             blanked[2] = Some(u16_from_usize(rb));
@@ -309,7 +254,6 @@ impl Row {
         }
 
         self.flags |= RowFlags::DIRTY;
-        // A shift through the row end rewrote the last cell.
         self.note_write_through(rb);
         self.recalculate_len_up_to(self.cells.len());
         blanked
@@ -321,8 +265,7 @@ impl Row {
         let _ = self.erase_chars_with(col, count, Cell::EMPTY);
     }
 
-    /// Erase `count` cells from `col` in place (ECH) with the BCE `fill`
-    /// (VT420/xterm). Returns the wide halves it blanked outside the range.
+    /// Erase `count` cells from `col` in place (ECH) with the BCE `fill` (VT420/xterm).
     pub fn erase_chars_with(&mut self, col: u16, count: u16, fill: Cell) -> BlankedHalves {
         let mut blanked = BlankedHalves::default();
         if count == 0 || col >= self.cols() {
@@ -335,15 +278,11 @@ impl Row {
         let end = (col + count).min(cols);
         let old_len = self.len as usize;
 
-        // Left boundary: erasing a continuation orphans its head at col-1
-        // (context-aware check, see `insert_chars_fill`).
         if self.is_cell_wide_continuation(col as u16) {
             self.cells[col - 1] = fill;
             blanked[0] = Some(u16_from_usize(col - 1));
         }
 
-        // Right boundary: the last erased cell's continuation at `end` is
-        // orphaned.
         if end > col && end < cols && self.cells[end - 1].flags().contains(CellFlags::WIDE) {
             self.cells[end] = fill;
             blanked[1] = Some(u16_from_usize(end));
@@ -355,20 +294,15 @@ impl Row {
 
         self.flags |= RowFlags::DIRTY;
         if fill.colors() != Cell::EMPTY.colors() {
-            // A BCE background is content: renderers draw it across the range.
             let new_end = end.max(old_len);
             self.len = u16_from_usize(new_end);
         } else if col < old_len && self.cells[old_len - 1].is_empty() {
-            // The old last content cell is now empty: it was in the range, or
-            // it was the wide continuation cleared at `end` (which an
-            // `end >= old_len` guard would miss).
             self.recalculate_len_up_to(old_len);
         }
         blanked
     }
 
-    /// [`erase_chars`](Self::erase_chars), skipping DECSCA-protected cells:
-    /// per VT420/VT510, ECH honours character protection.
+    /// [`erase_chars`](Self::erase_chars), skipping DECSCA-protected cells.
     #[cfg(test)]
     pub fn selective_erase_chars(&mut self, col: u16, count: u16, fill: Cell) {
         if count == 0 || col >= self.cols() {
@@ -382,9 +316,6 @@ impl Row {
         let old_len = self.len as usize;
         let mut any_erased = false;
 
-        // Left boundary: a continuation of an unprotected WIDE head outside the
-        // range is cleared with its head here; once the head is non-WIDE, the
-        // loop would read the continuation's bit 10 as PROTECTED and skip it.
         if col > 0
             && self.cells[col]
                 .flags()
@@ -410,7 +341,6 @@ impl Row {
 
         if any_erased {
             self.flags |= RowFlags::DIRTY;
-            // Not gated on `end >= old_len` (see `selective_clear_range`).
             if col < old_len && self.cells[old_len - 1].is_empty() {
                 self.recalculate_len_up_to(old_len);
             }

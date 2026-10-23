@@ -14,6 +14,8 @@ pub fn serialize_lines(lines: &[Line]) -> Vec<u8> {
         .map(Line::serialized_size_estimate)
         .fold(4usize, usize::saturating_add);
     let mut result = if estimate < crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES {
+        // The `.min(MAX - 1)` is a no-op in this branch; it restates the branch
+        // condition on the allocation count for the strict L0 gate's
         // unbounded-allocation check.
         Vec::with_capacity(estimate.min(crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES - 1))
     } else {
@@ -238,6 +240,9 @@ pub(crate) const MAX_DECODE_PAGE_LINES: usize = 1 << 20;
 #[cfg(test)]
 thread_local! {
     /// Serialized line records this thread's block walks have accepted: the
+    /// decode work every read of a warm block or cold page pays. Counted at the
+    /// one walk both the decode and the eviction's framing check run, so a
+    /// regression that decompresses the whole scrollback to trim one line shows
     /// as a count proportional to the scrollback. Thread-local for parallel tests.
     static RECORDS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -283,6 +288,7 @@ fn walk_records(
         };
 
         if accept(record_bytes) {
+            // Bounded by `max_lines` (the loop guard); saturation is dead code
             // carrying the no-overflow proof.
             accepted = accepted.saturating_add(1);
         }

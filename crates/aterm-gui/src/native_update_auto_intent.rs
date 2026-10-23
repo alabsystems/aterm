@@ -40,7 +40,7 @@ pub(crate) enum ApplyPhase {
 impl ApplyPhase {
     /// The wire spelling (`aterm ctl update status` prints it as `apply_phase=`).
     #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::PreferIdle => "prefer-idle",
             Self::PreferOutputGap => "prefer-output-gap",
@@ -51,7 +51,7 @@ impl ApplyPhase {
 
     /// What the lane is waiting for in this phase, for the log line that announces the phase.
     #[must_use]
-    pub(crate) fn waits_for(self) -> &'static str {
+    pub(crate) const fn waits_for(self) -> &'static str {
         match self {
             Self::PreferIdle => "a quiet moment (no input, no output)",
             Self::PreferOutputGap => {
@@ -125,7 +125,7 @@ pub(crate) fn restored_hold_line(build: u64, holding: bool, said: &mut bool) -> 
 
 /// Why the automatic lane will not park in `phase` given `facts`, or `None` when it may.
 #[must_use]
-pub(crate) fn automatic_park_refusal(
+pub(crate) const fn automatic_park_refusal(
     phase: ApplyPhase,
     facts: ActivityFacts,
 ) -> Option<&'static str> {
@@ -173,7 +173,7 @@ pub(crate) enum ArmDecision {
 /// Whether arming `incoming_build` owes the candidate's pre-park read (its verdict and the handoff policy it seals) now: whenever it is newer than the running build and nothing armed outranks it, not only when the automatic lane takes it.
 #[cfg(any(unix, test))]
 #[must_use]
-pub(crate) fn arm_reads_candidate(
+pub(crate) const fn arm_reads_candidate(
     decision: ArmDecision,
     incoming_build: u64,
     current_build: u64,
@@ -424,7 +424,7 @@ pub(crate) enum AttemptDisposition {
 
 /// Only cheap native-state blocks receive a bounded retry.
 #[must_use]
-pub(crate) fn finish(result: AttemptResult) -> AttemptDisposition {
+pub(crate) const fn finish(result: AttemptResult) -> AttemptDisposition {
     match result {
         AttemptResult::Accepted => AttemptDisposition::Complete,
         #[cfg(any(unix, test))]

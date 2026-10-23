@@ -240,7 +240,6 @@ fn await_refusal(proof: &Proof, leg: &Leg, step: &str) -> Result<Option<ReplyWri
     Ok(observed)
 }
 
-/// Match the completed HTTP 400 write, not the model's planned response.
 fn refusal_written(rows: &[J], head: &str, now: i64) -> Option<ReplyWrite> {
     let row = rows.iter().find(|row| str_of(row, "tag") == head)?;
     let id = row.get("request_id")?.as_i64()?;

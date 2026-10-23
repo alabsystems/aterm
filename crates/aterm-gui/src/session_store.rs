@@ -23,7 +23,7 @@ pub(crate) enum SessionState {
 impl SessionState {
     /// Stable wire token for the `sessions` control verb.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             SessionState::Spawning => "spawning",
             SessionState::Alive => "alive",
@@ -247,7 +247,7 @@ impl SessionRecord {
 
     /// Returns whether the successor's in-GUI host should grant adopted-claim grace to this session.
     #[must_use]
-    pub(crate) fn claim_grace(&self) -> bool {
+    pub(crate) const fn claim_grace(&self) -> bool {
         !self.claim_known || self.supervisor.is_some()
     }
 }
@@ -393,13 +393,13 @@ where
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the field by reference"
 )]
-fn is_zero(count: &u64) -> bool {
+const fn is_zero(count: &u64) -> bool {
     *count == 0
 }
 
 /// Returns whether `outgoing_build` predates automatic `<prefix>/bin` PATH self-healing.
 #[must_use]
-pub(crate) fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
+pub(crate) const fn predates_path_self_heal(outgoing_build: Option<u64>) -> bool {
     outgoing_build.is_none()
 }
 
@@ -550,7 +550,7 @@ pub struct CarriedMessage {
     pub repeats: u32,
 }
 
-fn carried_repeats() -> u32 {
+const fn carried_repeats() -> u32 {
     1
 }
 
@@ -558,11 +558,11 @@ fn carried_repeats() -> u32 {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the field by reference"
 )]
-fn is_carried_repeats(repeats: &u32) -> bool {
+const fn is_carried_repeats(repeats: &u32) -> bool {
     *repeats == 1
 }
 
-fn carried_excerpt() -> bool {
+const fn carried_excerpt() -> bool {
     true
 }
 
@@ -570,7 +570,7 @@ fn carried_excerpt() -> bool {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if hands the field by reference"
 )]
-fn is_carried_excerpt(excerpt: &bool) -> bool {
+const fn is_carried_excerpt(excerpt: &bool) -> bool {
     *excerpt
 }
 
@@ -1015,7 +1015,7 @@ impl ExitReason {
 
     /// Stable wire token for `reason=<token>`.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             ExitReason::ShellExit => "shell-exit",
             ExitReason::CtlClose => "ctl-close",
@@ -1042,7 +1042,7 @@ pub(crate) enum ExitActor {
 impl ExitActor {
     /// Stable wire token for `by=<actor>`.
     #[must_use]
-    pub(crate) fn as_wire(&self) -> &str {
+    pub(crate) const fn as_wire(&self) -> &str {
         match self {
             ExitActor::Sid(sid) => sid.as_str(),
             ExitActor::Human => "human",
@@ -1266,12 +1266,12 @@ impl SessionStore {
 
     /// Returns the window's current [`crate::autopilot::HarnessPosture`].
     #[must_use]
-    pub(crate) fn harness_posture(&self) -> crate::autopilot::HarnessPosture {
+    pub(crate) const fn harness_posture(&self) -> crate::autopilot::HarnessPosture {
         self.harness_posture
     }
 
     /// Updates the window's published [`crate::autopilot::HarnessPosture`].
-    pub(crate) fn set_harness_posture(&mut self, posture: crate::autopilot::HarnessPosture) {
+    pub(crate) const fn set_harness_posture(&mut self, posture: crate::autopilot::HarnessPosture) {
         self.harness_posture = posture;
     }
 
@@ -1490,12 +1490,12 @@ impl SessionStore {
     }
 
     /// Returns the bounded [`crate::session_log::ClosedLogs`] index.
-    pub(crate) fn closed_logs(&self) -> &crate::session_log::ClosedLogs {
+    pub(crate) const fn closed_logs(&self) -> &crate::session_log::ClosedLogs {
         &self.closed_logs
     }
 
     /// Returns the bus session-log mirror state.
-    pub(crate) fn mirror(&self) -> &crate::session_log_mirror::StoreMirror {
+    pub(crate) const fn mirror(&self) -> &crate::session_log_mirror::StoreMirror {
         &self.mirror
     }
 
@@ -1568,7 +1568,7 @@ impl SessionStore {
 
     /// Returns the highest sequence number in the roster lifecycle journal.
     #[must_use]
-    pub(crate) fn roster_seq(&self) -> u64 {
+    pub(crate) const fn roster_seq(&self) -> u64 {
         self.roster_seq
     }
 

@@ -1,65 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CARRY (design §5.2, phase 2A): a session's log as text lines a
-//! seamless update hands the process that adopts the session, and back.
-//!
-//! Records alone are not the log: the successor needs the ring's accounting
-//! (seqs, losses, the seqs it never held), the open nodes with their rollups
-//! so far, the node index (parents of nodes whose open records are gone),
-//! the fold as it stands ([`Fold::snapshot`]: a refold of a shed subset would
-//! change totals, needs and claims), and the host's producer state, which
-//! this crate passes through unread (`host` lines). So a carry is:
-//!
-//! ```text
-//! slog-carry v=1 ep=<e> base=<b> first=<f> last=<l> lost=<n> newest_lost=<m> ids=<r>,<t>,<s> carried=<k> shed=<j> lines=<n>
-//! sess kind=<spawn|adopt|restore> opened=<0|1> t=<ms> roll=<18 counts>
-//! hole <lo> <hi>
-//! cpar <node> <parent>
-//! node <node> par=<node|?> open=<0|1> below=<seq>   (the session, open nodes)
-//! kids <parent|?> <node>,<node>,…          (closed nodes whose open record does not cross)
-//! open <node> kind=<k> par=<node> t=<ms> orphan=<0|1> roll=<18 counts>
-//! fold …                                    (Fold::snapshot)
-//! host <opaque>                             (at most 16 lines, 4 KiB)
-//! r <record>                                (encoded at the host tier, oldest first)
-//! R <ms> <record>                           (a bus-class record of a mirrored log, phase 4)
-//! ```
-//!
-//! THE MIRROR (phase 4) adds nothing to a log no bridge ever took from: its
-//! carry is the bytes it was. A mirrored log's header ends
-//! ` ms=<head> mirror=<ep>:<seq>:<ms> snap=<ms>[ prior=<ep>:<seq>:<ms>:<head>]`
-//! and each of its bus-class records crosses as `R <ms> <record>`, so the
-//! successor goes on numbering the bus class where the predecessor stopped
-//! and takes from the cursor the export drew. A carry without `ms=` (a 2A or
-//! 2B writer's, or an unmirrored log's) is read as it always was: its
-//! bus-class records are numbered densely from 1 in seq order, `ms`'s head
-//! is their count, and no cursor crosses.
-//!
-//! THE CUT. The open records of open nodes, the session's own open and the
-//! record appended last (with the closes above it) always cross; the rest
-//! is cut to the budget in the eviction order ([`super::evict_class`]):
-//! closed detail first, then the opens of closed runs and turns, closes
-//! while they pass half, current detail, the remaining closes. So the carry
-//! sheds exactly what memory would, and each record it sheds is counted as
-//! the ring counts an eviction: into `lost=` and its nearest open node's
-//! rollup. A carry whose mandatory part passes its skeleton budget is not
-//! made: the update carries no records for that session ([`Log::carry`]).
-//!
-//! THE CONTENT TIER DOES NOT CROSS: records are encoded at the host tier, so
-//! a carried title mark keeps its record without its `title=` (§3.6 keeps the
-//! OSC title in RAM only).
-//!
-//! READING BACK ([`Log::from_carry`]) is bounded before anything is
-//! allocated past the lines themselves, and fail-closed: a version, tag or
-//! value this build does not read, seqs out of order, a node past the
-//! carried counters, an open node whose parent is not open or whose open
-//! record is missing, more than a ring or a fold holds — any of it refuses
-//! the whole carry, and the update then carries no records for that session
-//! (the host's uncarried path). The successor's log continues the carried one
-//! at its next epoch: it writes `mark - handoff carried=<k> shed=<j>
-//! epoch=<e>` above the seqs the predecessor could still have used, and
-//! leaves every carried run, turn and step OPEN, measured from then on by
-//! the wall clock (§3.5).
+//! Session log carry encoding and decoding across seamless updates.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
@@ -77,16 +19,14 @@ use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
 
 /// A carry's byte budget (design §5.2): 128 KiB.
 pub const CARRY_TOTAL_BYTES: usize = 128 * 1024;
-/// The most the mandatory part of a carry may take (the open path, the
-/// skeleton's state, the fold and the host's lines): 32 KiB.
+/// The most the mandatory part of a carry may take (the open path, the skeleton's state, the fold
+/// and the host's lines): 32 KiB.
 pub const CARRY_SKELETON_BYTES: usize = 32 * 1024;
 /// The longest carry line a receiver reads.
 pub const CARRY_MAX_LINE: usize = 1024;
-/// The most carry lines a receiver reads: a full ring, a full fold's fields
-/// and the skeleton's lines.
+/// The most carry lines a receiver reads.
 pub const CARRY_MAX_LINES: usize = 8192;
-/// The most carry bytes a receiver reads: the budget, and the node lines the
-/// cut adds for the records it keeps.
+/// The most carry bytes a receiver reads.
 pub const CARRY_MAX_BYTES: usize = CARRY_TOTAL_BYTES + 16 * 1024;
 /// The most host lines a carry passes through, and their bytes.
 pub const CARRY_MAX_HOST_LINES: usize = 16;
@@ -105,8 +45,7 @@ pub struct CarryBudget {
 }
 
 impl CarryBudget {
-    /// A session's (§5.2): 128 KiB, the skeleton within 32 KiB, a ring's
-    /// records.
+    /// A session's (§5.2): 128 KiB, the skeleton within 32 KiB, a ring's records.
     pub const SESSION: CarryBudget = CarryBudget {
         total: CARRY_TOTAL_BYTES,
         skeleton: CARRY_SKELETON_BYTES,
@@ -169,11 +108,8 @@ impl CarryError {
 pub struct CarryAdopt {
     /// Its epoch: above the carried one.
     pub ep: u32,
-    /// Its first seq: above every seq the predecessor could have used (the
-    /// manifest's count plus one). A carry whose head is not below it, or
-    /// either past [`super::SEQ_LIMIT`], is refused: the manifest's count is
-    /// drawn before the carry is taken and a Commit that lands has kept to
-    /// it, so a head at or above it is a file that does not hold together.
+    /// Its first seq: above every seq the predecessor could have used (the manifest's count plus
+    /// one).
     pub next_seq: u64,
     /// The node-id counters the manifest carried (with their reserve).
     pub ids: IdCounters,
@@ -190,32 +126,18 @@ pub struct CarryStats {
     pub carried: u64,
     /// Records the predecessor's cut shed.
     pub shed: u64,
-    /// The carried log's last seq (its `last=`): the predecessor's readers'
-    /// fence, which a successor's journal starts after when the predecessor
-    /// journaled up to it.
+    /// The carried log's last seq (its `last=`).
     pub head: u64,
 }
 
-/// One record of a carry snapshot past the ones that always cross, in the
-/// order the cut sheds them.
 #[derive(Clone, Debug)]
 struct Victim {
     rec: Rec,
-    /// Whose rollup counts it when it is shed (`None`: the session's).
     target: Option<Node>,
-    /// Its carry line's bytes at most (its newline counted): the ring's own
-    /// encoded size of it, at the content tier, which the host tier's line
-    /// never passes, plus the `r ` tag. A cut sized by these is within its
-    /// budget, and only the records that cross are ever encoded.
     est: usize,
 }
 
-/// Everything a carry needs of a log, copied under its lock: the records that
-/// always cross are encoded after the lock is released, once
-/// ([`CarrySnapshot::prepare`]); the rest are cut by the sizes the ring
-/// already knows and encoded only when a cut keeps them, so the lock is held
-/// only for the copy, and a session whose detail does not cross pays for no
-/// encoding of it.
+/// Everything a carry needs of a log, copied under its lock.
 #[derive(Clone, Debug)]
 pub struct CarrySnapshot {
     closed: bool,
@@ -234,17 +156,14 @@ pub struct CarrySnapshot {
     fold_lines: Vec<String>,
     keep: Vec<Rec>,
     victims: Vec<Victim>,
-    /// The bus class's count, the mirror's state and each live bus-class
-    /// record's `ms` by seq: only for a mirrored log (none otherwise, so its
-    /// carry is the bytes it was).
     ms_head: u64,
     mirror: Option<super::mirror::Mirror>,
     ms_of: BTreeMap<u64, u64>,
 }
 
-/// One `hole <lo> <hi>` line: an update's overlap as before, any
-/// other range (a journal read's, `Log::from_journal`) with its ` why=<w>`,
-/// which a reader that predates it skips as an unknown token.
+/// One `hole <lo> <hi>` line: an update's overlap as before, any other range (a journal read's,
+/// `Log::from_journal`) with its ` why=<w>`, which a reader that predates it skips as an unknown
+/// token.
 pub(super) fn hole_line(lo: u64, hi: u64, why: GapWhy) -> String {
     if why == GapWhy::Handoff {
         format!("hole {lo} {hi}")
@@ -253,15 +172,13 @@ pub(super) fn hole_line(lo: u64, hi: u64, why: GapWhy) -> String {
     }
 }
 
-/// The why of a `hole` line's remaining tokens: its ` why=<w>`, else (an
-/// older writer's, or a word this build does not know) an update's overlap.
+/// The why of a `hole` line's remaining tokens.
 pub(super) fn hole_why<'a>(mut rest: impl Iterator<Item = &'a str>) -> GapWhy {
     rest.find_map(|t| t.strip_prefix("why="))
         .and_then(GapWhy::from_word)
         .unwrap_or(GapWhy::Handoff)
 }
 
-/// A rollup as one `roll=` value: eight counters, then the ten tool counts.
 fn roll_word(r: &Rollup) -> String {
     let mut s = format!(
         "{},{},{},{},{},{},{},{}",
@@ -296,9 +213,6 @@ fn read_roll(raw: &str) -> Option<Rollup> {
     })
 }
 
-/// The carry line of `r`, or `None` when it no longer fits (never for a
-/// record the log accepted): `R <ms> <record>` for a mirrored log's
-/// bus-class record, `r <record>` otherwise.
 fn rec_line(r: &Rec, ms: Option<u64>) -> Option<String> {
     let l = encode(r, Tier::Host).ok()?;
     Some(match ms {
@@ -307,7 +221,6 @@ fn rec_line(r: &Rec, ms: Option<u64>) -> Option<String> {
     })
 }
 
-/// The decimal digits of `n`.
 const fn digits(mut n: u64) -> usize {
     let mut d = 1;
     while n >= 10 {
@@ -322,10 +235,8 @@ fn line_bytes(lines: &[String]) -> usize {
 }
 
 impl Log {
-    /// The snapshot a carry is cut from: the log's state, its fold's
-    /// snapshot, and its records in the order the cut sheds them. O(n)
-    /// clones; call it under the log's lock and [`CarrySnapshot::encode`]
-    /// after.
+    /// The snapshot a carry is cut from: the log's state, its fold's snapshot, and its records in
+    /// the order the cut sheds them.
     #[must_use]
     pub fn carry_snapshot(&self) -> CarrySnapshot {
         let n = self.ring.len();
@@ -349,8 +260,6 @@ impl Log {
                 None => keep.push(i),
             }
         }
-        // How many of the oldest closes go before current detail: those that
-        // take the closes down to half (§5.1's third class).
         let lim = self.effective_limits();
         let (mut count, mut bytes, mut early) = (self.close_count, self.close_bytes, 0);
         for &i in &buckets[2] {
@@ -367,7 +276,6 @@ impl Log {
             .chain(&buckets[2][..early])
             .chain(&buckets[3])
             .chain(&buckets[2][early..]);
-        // A mirrored log's bus-class record crosses with its `ms` (`R <ms> `).
         let mirrored = self.mirror.is_some();
         let ms_cost = |e: &super::Entry| {
             if mirrored && e.ms > 0 {
@@ -430,8 +338,6 @@ impl Log {
         }
     }
 
-    /// The nearest open ancestor-or-self of `node` (`None`: the session):
-    /// whose rollup counts a loss of its record.
     fn loss_target(&self, node: Node) -> Option<Node> {
         let mut at = node;
         for _ in 0..MAX_DEPTH {
@@ -449,25 +355,13 @@ impl Log {
         None
     }
 
-    /// This log as a carry within `budget`, the host's `host` lines passed
-    /// through: [`Log::carry_snapshot`] then [`CarrySnapshot::encode`].
-    /// `None` for a closed session or when the mandatory part exceeds any
-    /// requested bound: the session then hands off with no records.
+    /// This log as a carry within `budget`, the host's `host` lines passed through.
     #[must_use]
     pub fn carry(&self, budget: CarryBudget, host: &[String]) -> Option<CarryOut> {
         self.carry_snapshot().prepare().encode(budget, host)
     }
 
-    /// Fence this log's readers at its head (the carry an update just took,
-    /// design §5.2): until [`Log::lift_read_fence`], a read sees no record
-    /// past it and [`Log::reader_state`] is the fold as it stood. The
-    /// outgoing process goes on writing to its Commit, and its successor
-    /// continues the carry, not those records: a reader shown them would see
-    /// a turn closed here and again there, or a step that never closes. The
-    /// fenced records are not evicted meanwhile (what a reader is shown is
-    /// what the carry holds, but for what its cut shed, which the successor
-    /// counts lost); the records after the fence are, so the ring stays
-    /// within its bounds plus the one record just appended.
+    /// Fence this log's readers at its head (the carry an update just took, design §5.2).
     pub fn fence_reads(&mut self) {
         self.fence = Some(Box::new((self.last_seq, self.fold.clone())));
         self.fence_ms = self.ms_head;
@@ -477,8 +371,6 @@ impl Log {
     /// Lift the readers' fence (the update stood down; this process goes on).
     pub fn lift_read_fence(&mut self) {
         self.fence = None;
-        // The marks the fence kept past their quota, and the program marks
-        // past their share, go now (`log_quota`).
         self.enforce_mark_quota();
         self.enforce_program_share(None);
         self.rang();
@@ -490,8 +382,8 @@ impl Log {
         self.fence.as_ref().map(|f| f.0)
     }
 
-    /// The state a reader is shown: the fold's, or, while fenced, the fold
-    /// as it stood at the fence.
+    /// The state a reader is shown: the fold's, or, while fenced, the fold as it stood at the
+    /// fence.
     #[must_use]
     pub fn reader_state(&self) -> &crate::fold::SessionState {
         self.fence
@@ -505,17 +397,9 @@ impl Log {
         self.read_fence().unwrap_or(self.last_seq)
     }
 
-    /// The successor's log from a carry `lines` wrote ([`Log::carry`]), at
-    /// `a.ep`, its seqs from `a.next_seq`, its node ids at least `a.ids`,
-    /// its first new record `mark - handoff carried=<k> shed=<j>
-    /// epoch=<ep>`. Every carried open node stays open, measured by the
-    /// wall clock. Returns the log, the host's lines (their `host ` tag
-    /// taken off), and what crossed.
-    ///
+    /// Reconstruct the successor's log from a carry `lines` wrote ([`Log::carry`]).
     /// # Errors
-    ///
-    /// A [`CarryError`] for anything this build does not read or that does
-    /// not hold together; nothing is kept of a refused carry.
+    /// A [`CarryError`] for anything this build does not read or that does not hold together.
     pub fn from_carry(
         lines: &[String],
         a: CarryAdopt,
@@ -523,12 +407,8 @@ impl Log {
         Log::from_carry_built(lines, a, None)
     }
 
-    /// [`Log::from_carry`], its handoff mark naming the predecessor's build
-    /// (`mark - handoff … build=<n>`) when the update
-    /// said it.
-    ///
+    /// Reconstruct the successor's log from `lines`, recording optional predecessor `build`.
     /// # Errors
-    ///
     /// As [`Log::from_carry`].
     pub fn from_carry_built(
         lines: &[String],
@@ -570,9 +450,6 @@ impl Log {
             .ok_or(CarryError::Line("a carry header's ids"))?;
         let ep = u32::try_from(ep).map_err(|_| CarryError::Line("an epoch"))?;
         let base = u32::try_from(base).map_err(|_| CarryError::Line("an epoch"))?;
-        // THE MIRROR'S KEYS (phase 4): present only in a mirrored log's
-        // carry. Without them the carried bus class is numbered afresh;
-        // with them each bus-class record crosses as an `R` line.
         let ms_head: Option<u64> = match kv_of(head, 2, "ms") {
             Some(v) => Some(
                 v.parse()
@@ -610,15 +487,9 @@ impl Log {
         if !(base <= ep && ep < a.ep) || first == 0 || first > last.saturating_add(1) {
             return Err(CarryError::Shape("a carry's epochs or seqs out of order"));
         }
-        // Seqs no log reaches, or a head the manifest's count does not clear:
-        // continuing either would reuse a seq or draw a ceiling below the
-        // head, which stands every later update's Commit down.
         if last > super::SEQ_LIMIT || a.next_seq > super::SEQ_LIMIT.saturating_add(1) {
             return Err(CarryError::Bound("a seq past the limit"));
         }
-        // A bus-class count cannot exceed the sequence head it counts.
-        // Read these bounds before a carried number enters a live Log:
-        // bus_copy uses ms + 1, and a prior-space cover uses its head too.
         if ms_head.is_some_and(|head| head > last) {
             return Err(CarryError::Bound("a mirror count past the sequence head"));
         }
@@ -655,7 +526,6 @@ impl Log {
         let mut fold_lines: Vec<&str> = Vec::new();
         let mut host: Vec<String> = Vec::new();
         let mut recs: Vec<Rec> = Vec::new();
-        // Each carried record's `ms` (0 for a local-class one).
         let mut rec_ms: Vec<u64> = Vec::new();
         for line in &lines[1..] {
             let (tag, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
@@ -815,15 +685,6 @@ impl Log {
                     let r = decode(rest)
                         .map_err(|_| CarryError::Record("a record that does not decode"))?;
                     match ms_head {
-                        // A mirrored carry's numbers rise and stay within its
-                        // head: the format's own law. WHICH records carry one
-                        // is the writer's bus class, which a newer build may
-                        // have grown or narrowed, so it is not judged by this
-                        // build's: a record this build calls bus class with
-                        // no `ms` stays unnumbered (its writer never mirrored
-                        // it), and one it calls local keeps its `ms` (said on
-                        // the bus as a cover when a take reaches it, never a
-                        // hole).
                         Some(h) => {
                             let prev = rec_ms.iter().rev().find(|m| **m > 0).copied().unwrap_or(0);
                             if ms > h || (ms > 0 && ms <= prev) {
@@ -841,9 +702,6 @@ impl Log {
                     if !is_issued(r.node) || r.par.is_some_and(|p| !is_issued(p)) {
                         return Err(CarryError::Shape("a node past the carried counters"));
                     }
-                    // A legal ring may retain its open path, the newest record and
-                    // ancestor closes above a tiny cap. Bound decoding first;
-                    // validate that every excess record is mandatory below.
                     let ceiling = a.limits.records.max(MAX_OPEN + MAX_DEPTH + 3);
                     if recs.len() >= ceiling {
                         return Err(CarryError::Bound("more records than a ring holds"));
@@ -930,8 +788,6 @@ impl Log {
         }
         log.nodes = index;
         log.open = open;
-        // The bus class's numbering: carried, or (a carry without it)
-        // densely from 1 in seq order over the carried bus-class records.
         let mut dense = 0u64;
         for (rec, ms) in recs.into_iter().zip(rec_ms) {
             let bytes = encoded_size(&rec, Tier::Content)
@@ -946,9 +802,6 @@ impl Log {
             };
             log.index_carried(&rec, bytes);
             log.heap = log.heap.saturating_add(super::entry_heap(&rec));
-            // The carry writes no process-clock reading (6F-1): a carried
-            // record reads its wall time on this process's clock, clamped as
-            // a carried open node's does.
             let mono = rebase(rec.t, a.at).mono_ms;
             log.ring.push_back(super::Entry {
                 rec: rec.into(),
@@ -984,8 +837,6 @@ impl Log {
         }
         log.skip_to(a.next_seq);
         let mut f = Fields::new();
-        // Each value is of its key's shape and the record far under the byte
-        // bound: none of these can be refused.
         let _ = f.set(crate::field::Key::Carried, Val::U(carried));
         let _ = f.set(crate::field::Key::Shed, Val::U(shed));
         let _ = f.set(crate::field::Key::Epoch, Val::U(u64::from(a.ep)));
@@ -1010,10 +861,6 @@ impl Log {
         ))
     }
 
-    /// A ring over its ordinary limits may hold only the open path, the
-    /// newest record and its ancestor closes. Match opens to the carried
-    /// skeleton and reject duplicate opens/closes: repeated purported pinned
-    /// records are not an exemption from the receiver's bounds.
     fn only_mandatory_records(&self) -> bool {
         let Some(newest) = self.ring.back() else {
             return true;
@@ -1057,9 +904,6 @@ impl Log {
         })
     }
 
-    /// Index a carried record (its node's entry from the carry's own lines,
-    /// or a new one), without applying it to the fold: the fold crossed as
-    /// it stood.
     fn index_carried(&mut self, rec: &Rec, bytes: usize) {
         if !self.nodes.contains_key(&rec.node) {
             let parent = rec
@@ -1077,8 +921,6 @@ impl Log {
                 },
             );
         }
-        // The session's own open is pinned as `session_bytes`, below, as
-        // `index_push` counts it: never its node's `open_bytes` too.
         if rec.op == Op::Open
             && rec.node != Node::SESSION
             && let Some(info) = self.nodes.get_mut(&rec.node)
@@ -1125,12 +967,6 @@ fn flag(raw: &str) -> Result<bool, CarryError> {
     }
 }
 
-/// The host's lines a carry passes, in order: each one the receiver reads
-/// (with its `host ` tag, within [`CARRY_MAX_LINE`]), as many as fit
-/// [`CARRY_MAX_HOST_LINES`] and [`CARRY_MAX_HOST_BYTES`]. A line past them is
-/// left out, never written: the receiver refuses a whole carry for one line
-/// past its bound, where the host reads each of its lines on its own and a
-/// missing one costs only that piece of its state.
 fn host_within_bounds(host: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut bytes = 0usize;
@@ -1148,7 +984,6 @@ fn host_within_bounds(host: &[String]) -> Vec<String> {
 }
 
 impl CarrySnapshot {
-    /// One header format for both byte reservation and final output.
     fn header(&self, carried: usize, shed: usize, newest_lost: u64, lines: usize) -> String {
         let mut h = format!(
             "slog-carry v=1 ep={} base={} first={} last={} lost={} newest_lost={} ids={},{},{} carried={carried} shed={shed} lines={lines}",
@@ -1162,8 +997,6 @@ impl CarrySnapshot {
             self.issued[1],
             self.issued[2],
         );
-        // Only a mirrored log's header says more: an older
-        // reader reads the keys it knows and skips these.
         if let Some(m) = &self.mirror {
             let _ = write!(
                 h,
@@ -1179,16 +1012,10 @@ impl CarrySnapshot {
         h
     }
 
-    /// A record's carry line, with its `ms` when the log is mirrored.
     fn line_of(&self, r: &Rec) -> Option<String> {
         rec_line(r, self.ms_of.get(&r.seq).copied())
     }
 
-    /// The bytes of the lines that always cross: the header, the session,
-    /// the holes, closed parents and open path, the fold, the host's lines
-    /// and the records that are never cut (the open path's own, the newest).
-    /// The node lines the kept records need are counted with them as the cut
-    /// keeps them.
     fn fixed_lines(&self, host: &[String]) -> Vec<String> {
         let mut out = Vec::new();
         out.push(format!(
@@ -1211,11 +1038,6 @@ impl CarrySnapshot {
         out
     }
 
-    /// The index lines the records `recs` need: a `node` line for the
-    /// session and each open node (its parent, and the newest close beneath
-    /// it, which the eviction class reads), and `kids <parent> <node>,…`
-    /// lines naming the parent of every other node on the records' parent
-    /// chains whose own open record (which names it) does not cross.
     fn index_lines<'a>(&self, recs: impl Iterator<Item = &'a Rec> + Clone) -> Vec<String> {
         let opened: std::collections::BTreeSet<Node> = recs
             .clone()
@@ -1282,10 +1104,8 @@ impl CarrySnapshot {
         out
     }
 
-    /// Encode the carry lines of the records that always cross, once (after
-    /// the log's lock is released): the [`PreparedCarry`] every cut is made
-    /// from. A record that no longer encodes (never one the log accepted) is
-    /// left out.
+    /// Encode the carry lines of the records that always cross, once (after the log's lock is
+    /// released): the [`PreparedCarry`] every cut is made from.
     #[must_use]
     pub fn prepare(mut self) -> PreparedCarry {
         let mut keep_lines = Vec::with_capacity(self.keep.len());
@@ -1305,15 +1125,12 @@ impl CarrySnapshot {
         }
     }
 
-    /// The carry within `budget`, the host's lines passed through: the
-    /// snapshot prepared ([`CarrySnapshot::prepare`]) and cut once
-    /// ([`PreparedCarry::encode`]).
+    /// The carry within `budget`, the host's lines passed through.
     #[must_use]
     pub fn encode(&self, budget: CarryBudget, host: &[String]) -> Option<CarryOut> {
         self.clone().prepare().encode(budget, host)
     }
 
-    /// The session line with `roll` as its rollup.
     fn clone_session_with(&self, roll: Rollup) -> Vec<String> {
         vec![format!(
             "sess kind={} opened={} closed=0 t={} roll={}",
@@ -1337,20 +1154,15 @@ impl CarrySnapshot {
     }
 }
 
-/// A carry snapshot whose records that always cross are encoded
-/// ([`CarrySnapshot::prepare`]): carries of any budget are cut from it, each
-/// encoding only the other records it keeps.
+/// A carry snapshot whose records that always cross are encoded ([`CarrySnapshot::prepare`]).
 #[derive(Clone, Debug)]
 pub struct PreparedCarry {
     snap: CarrySnapshot,
-    /// The carry line of each of `snap.keep`, in its order.
     keep_lines: Vec<String>,
 }
 
 impl PreparedCarry {
     /// Only the mandatory part, within the session's skeleton byte bound.
-    /// No optional record crosses; `None` for a closed session or a skeleton
-    /// that cannot fit. Hosts use this to reserve each session's minimum.
     #[must_use]
     pub fn skeleton(&self, host: &[String]) -> Option<CarryOut> {
         self.encode(
@@ -1363,27 +1175,19 @@ impl PreparedCarry {
         )
     }
 
-    /// The bytes the records past the skeleton take as carry lines, at most:
-    /// what a carry with room for all of them adds to its skeleton's (the
-    /// node lines they need aside).
+    /// The bytes the records past the skeleton take as carry lines, at most.
     #[must_use]
     pub fn detail_bytes(&self) -> usize {
         self.snap.victims.iter().map(|v| v.est).sum()
     }
 
-    /// How many records past the skeleton a carry with room for all of them
-    /// adds.
+    /// How many records past the skeleton a carry with room for all of them adds.
     #[must_use]
     pub const fn detail_records(&self) -> usize {
         self.snap.victims.len()
     }
 
-    /// The carry within `budget`, the host's lines passed through (each one
-    /// the receiver reads: [`host_within_bounds`]), or `None` when the part
-    /// that always crosses exceeds any requested bound, or the session is
-    /// closed. Every line it writes is
-    /// within [`CARRY_MAX_LINE`]: a record within [`crate::MAX_RECORD_BYTES`],
-    /// a fold line within its keys' caps, a `kids` line cut to the bound.
+    /// Encode the carry within `budget` with `host` lines passed through, or `None` if over budget.
     #[must_use]
     pub fn encode(&self, budget: CarryBudget, host: &[String]) -> Option<CarryOut> {
         let snap = &self.snap;
@@ -1412,9 +1216,6 @@ impl PreparedCarry {
                 })
                 .collect()
         };
-        // Reserve the header and rollup widths for any cut. Each loss counter
-        // can grow by at most the number of optional records; line count uses
-        // its type's maximum so no fixed numeric-width estimate can underflow.
         let maximum_loss = u32::try_from(snap.victims.len()).unwrap_or(u32::MAX);
         let maximum_extra = vec![maximum_loss; snap.open.len()];
         let mut maximum_session = snap.session.3;
@@ -1439,7 +1240,6 @@ impl PreparedCarry {
         {
             return None;
         }
-        // The cut: shed victims, first first, until the rest fits.
         let mut cut = 0usize;
         let room = budget.total.saturating_sub(skeleton);
         let records_room = budget.records.saturating_sub(snap.keep.len());
@@ -1466,9 +1266,6 @@ impl PreparedCarry {
             if over == 0 || cut == n {
                 break;
             }
-            // The nodes the kept records need did not fit: shed as many more
-            // as free that much (shedding them frees node lines too, so a
-            // pass or two settles it).
             let mut freed = 0;
             while cut < n && freed < over {
                 freed += victim_bytes(cut);
@@ -1476,8 +1273,6 @@ impl PreparedCarry {
                 cut += 1;
             }
         }
-        // What the cut shed counts as an eviction does: in `lost=`, the
-        // newest such seq, and its nearest open node's rollup.
         let shed = &snap.victims[..cut];
         let mut extra = vec![0u32; snap.open.len()];
         let mut session_roll = snap.session.3;
@@ -1496,8 +1291,6 @@ impl PreparedCarry {
             .max()
             .unwrap_or(0)
             .max(snap.newest_lost);
-        // The records that cross, in seq order, each with its line: the
-        // cut's own encoded now, the only time they are.
         let crossing: Vec<(&Rec, String)> = snap.victims[cut..]
             .iter()
             .filter_map(|v| snap.line_of(&v.rec).map(|l| (&v.rec, l)))
@@ -1542,11 +1335,7 @@ impl PreparedCarry {
         self.snap.last_seq
     }
 
-    /// THE MIRROR UNDER THE FENCE: the landed cursor and
-    /// the `ms` head as the snapshot (and the readers' fence beside it) drew
-    /// them, for a mirrored log; `None` for one nothing ever mirrored. What a
-    /// successor that does not get this carry says of the old space's tail:
-    /// exact, because no landing passes the fence.
+    /// Landed cursor and `ms` head for a mirrored log, or `None` if never mirrored.
     #[must_use]
     pub fn mirror_prior(&self) -> Option<super::Prior> {
         self.snap.mirror.as_ref().map(|m| super::Prior {

@@ -191,6 +191,40 @@ impl AttachedKeyboard {
         }
         parse_hid_mappings(&ran.out())
     }
+
+    fn set_mappings(&self, sys: &dyn System, mappings: &[(i64, i64)]) -> Result<(), String> {
+        let values: Vec<aterm_json::Value> = mappings
+            .iter()
+            .map(|(src, dst)| aterm_json::json!({SRC: src, DST: dst}))
+            .collect();
+        let value = aterm_json::to_string(&aterm_json::json!({"UserKeyMapping": values}))
+            .map_err(|e| e.to_string())?;
+        run(sys, &self.command().args(["--set", &value]))?;
+        Ok(())
+    }
+}
+
+/// Remove only Caps Lock's live mapping for a verifier's OFF stage, retaining every
+/// other mapping. Unknown or conflicting service state cannot authorize a write.
+pub(crate) fn clear_attached_caps_lock(
+    sys: &dyn System,
+    user: &User,
+    model: keyboard::Model,
+) -> Result<(), String> {
+    let item = AttachedKeyboard {
+        model,
+        user: user.clone(),
+    };
+    let maps = item.mappings(sys)?;
+    let want = common_other_mappings(&maps)?;
+    if maps.iter().any(|map| *map != want) {
+        item.set_mappings(sys, &want)?;
+    }
+    let readback = item.mappings(sys)?;
+    if readback.is_empty() || readback.iter().any(|map| *map != want) {
+        return Err("Caps Lock OFF did not read back with the other mappings preserved".into());
+    }
+    Ok(())
 }
 
 impl Item for AttachedKeyboard {
@@ -229,13 +263,7 @@ impl Item for AttachedKeyboard {
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         let maps = self.mappings(sys)?;
         if let Some(want) = merged_mapping(&maps)? {
-            let values: Vec<aterm_json::Value> = want
-                .into_iter()
-                .map(|(src, dst)| aterm_json::json!({SRC: src, DST: dst}))
-                .collect();
-            let value = aterm_json::to_string(&aterm_json::json!({"UserKeyMapping": values}))
-                .map_err(|e| e.to_string())?;
-            run(sys, &self.command().args(["--set", &value]))?;
+            self.set_mappings(sys, &want)?;
         }
         Ok(())
     }
@@ -263,18 +291,26 @@ fn merged_mapping(maps: &[Vec<(i64, i64)>]) -> Result<Option<Vec<(i64, i64)>>, S
     if maps.iter().all(correct) {
         return Ok(None);
     }
+    let mut want = common_other_mappings(maps)?;
+    want.push((keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL));
+    Ok(Some(want))
+}
+
+fn common_other_mappings(maps: &[Vec<(i64, i64)>]) -> Result<Vec<(i64, i64)>, String> {
+    let Some(first) = maps.first() else {
+        return Err("the attached keyboard has no HID service; left untouched".into());
+    };
     let others = |map: &Vec<(i64, i64)>| {
         map.iter()
             .copied()
             .filter(|(s, _)| *s != keyboard::CAPS_LOCK)
             .collect::<Vec<_>>()
     };
-    let mut want = others(&maps[0]);
+    let want = others(first);
     if maps.iter().skip(1).any(|map| others(map) != want) {
         return Err("keyboard services have different unrelated remaps; left untouched".into());
     }
-    want.push((keyboard::CAPS_LOCK, keyboard::LEFT_CONTROL));
-    Ok(Some(want))
+    Ok(want)
 }
 
 /// `hidutil property --get` prints a table of RegistryIDs followed by Foundation's
@@ -1414,6 +1450,43 @@ mod tests {
         sys.on(&get, Ran::ok("RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingDst = 30064771296; HIDKeyboardModifierMappingSrc = 30064771129; } )\n"));
         let _ = item.mappings(&sys).unwrap();
         assert!(matches!(item.probe(&sys, &c), Probe::Ok { .. }));
+
+        let before = "RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; }, { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; }, { HIDKeyboardModifierMappingSrc = 30064771129; HIDKeyboardModifierMappingDst = 30064771296; } )\n";
+        let after = "RegistryID Key Value\n10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; } )\n100021604 UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; } )\n";
+        let off = Fake::root();
+        off.on(&get, Ran::ok(before)).on(&get, Ran::ok(after));
+        let set_others = item.command().args(["--set", "{\"UserKeyMapping\":[{\"HIDKeyboardModifierMappingDst\":456,\"HIDKeyboardModifierMappingSrc\":123}]}"]).display();
+        off.on(&set_others, Ran::ok(""));
+        clear_attached_caps_lock(&off, &item.user, item.model).unwrap();
+        assert!(off.calls().contains(&set_others));
+        assert!(
+            off.calls()
+                .iter()
+                .all(|call| call.contains("PrimaryUsagePage") && call.contains("PrimaryUsage"))
+        );
+
+        for unknown in [
+            "RegistryID Key Value\n",
+            "10002160e UserKeyMapping (garbage)",
+            "10002160e UserKeyMapping ( { HIDKeyboardModifierMappingSrc = 123; HIDKeyboardModifierMappingDst = 456; } )\n100021604 UserKeyMapping (null)\n",
+        ] {
+            let off = Fake::root();
+            off.on(&get, Ran::ok(unknown));
+            assert!(clear_attached_caps_lock(&off, &item.user, item.model).is_err());
+            assert!(!off.calls().iter().any(|call| call.contains("--set")));
+        }
+        let refused = Fake::root();
+        refused.on(&get, Ran::ok(before));
+        refused.refuse_complete_stdout(&get, "incomplete service inventory");
+        assert!(clear_attached_caps_lock(&refused, &item.user, item.model).is_err());
+        assert!(!refused.calls().iter().any(|call| call.contains("--set")));
+
+        let unchanged = Fake::root();
+        unchanged
+            .on(&get, Ran::ok(before))
+            .on(&set_others, Ran::ok(""));
+        assert!(clear_attached_caps_lock(&unchanged, &item.user, item.model).is_err());
+        assert!(unchanged.calls().contains(&set_others));
     }
 
     #[test]

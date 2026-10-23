@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the build-directory reclaim: what a profile is, when it is idle, and that only an
-//! idle profile's `incremental/` is removed, under every one of cargo's locks.
-//!
-//! Fixtures are laid out as cargo lays a build directory ([`lay_target`]: locks in each
-//! profile, none at the root), each in its own scratch directory; no test touches the owner's
-//! files or reads the process table.
+//! Tests for build-directory reclaim: profile discovery, idle clocks, lock discipline, and
+//! removing only idle `incremental/` caches in scratch directories.
 
 use super::*;
 use crate::harness::disk::DEFAULT_TARGET_STALE_DAYS as STALE;
@@ -16,14 +12,12 @@ use crate::harness::disk::tests::{
 
 const DAY: i64 = 86_400;
 
-/// An hour before the stale window closes at `now`: a profile last written then is still in
-/// use.
+/// Timestamp an hour before the stale window closes at `now`.
 fn inside_window(now: i64) -> i64 {
     now - (STALE * DAY - 3_600)
 }
 
-/// The judge every test reclaims under: `now`, the default stale window, any
-/// device.
+/// Default reclaim judge at `now`.
 fn judge(now: i64) -> Judge {
     Judge {
         now,
@@ -33,40 +27,36 @@ fn judge(now: i64) -> Judge {
     }
 }
 
-/// One build directory assessed with the shipped bounds.
+/// Assess one build directory with the shipped bounds.
 fn assessed(path: &Path, now: i64) -> TargetDir {
     assess(path, now, STALE, WalkBudget::SHIPPED).expect("a directory")
 }
 
-/// `rel` (`/`-separated) under `base`, one component at a time: under a verbatim `\\?\` base
-/// (what `canonicalize` answers on Windows) a `/` is a character of a name, not a separator.
+/// Join `/`-separated `rel` under `base` one component at a time (safe under verbatim `\\?\`).
 fn at(base: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(base.to_path_buf(), |p, c| p.join(c))
 }
 
-/// The bytes the blocks of the file at `p` take.
+/// Allocated byte count of the file at `p`.
 #[cfg(unix)]
 fn blocks(p: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt as _;
     std::fs::symlink_metadata(p).expect("stat").blocks() * 512
 }
 
-/// The bytes the file at `p` holds allocated (its `FILE_STANDARD_INFO` allocation, read
-/// through its handle): what deleting its last name releases.
+/// Allocated byte count (`FILE_STANDARD_INFO`) of the file at `p`.
 #[cfg(windows)]
 fn blocks(p: &Path) -> u64 {
     let f = std::fs::File::open(p).expect("open");
     aterm_dirfd::fstat(&f).expect("stat").allocation
 }
 
-/// Set the mtime of the directory or file at `path` to `at` (unix seconds).
+/// Set the mtime of `path` to `at` (unix seconds).
 fn set_mtime(path: &Path, at: i64) {
     let when = std::time::UNIX_EPOCH
         + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
     #[cfg(unix)]
     let file = std::fs::File::open(path);
-    // A directory opens only with backup semantics, and a time is written with
-    // `FILE_WRITE_ATTRIBUTES` alone.
     #[cfg(windows)]
     let file = {
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -80,17 +70,14 @@ fn set_mtime(path: &Path, at: i64) {
     file.and_then(|f| f.set_modified(when)).expect("set mtime");
 }
 
-/// `p` without its verbatim `\\?\` prefix: what `cmd` takes as a working directory or a
-/// `mklink` operand.
+/// Strip any verbatim `\\?\` prefix from `p` for `cmd` / `mklink`.
 #[cfg(windows)]
 fn plain(p: &Path) -> String {
     let text = p.to_str().expect("test paths are UTF-8");
     text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()
 }
 
-/// A directory link at `link` to the directory `target`: a symlink on unix, a junction on
-/// Windows (`cmd /C mklink /J`, which needs no privilege; it refuses the verbatim spelling
-/// `canonicalize` answers, so the plain one is passed).
+/// Create a directory symlink (unix) or junction (Windows) at `link` pointing to `target`.
 fn link_dir(target: &Path, link: &Path) {
     #[cfg(unix)]
     std::os::unix::fs::symlink(target, link).expect("link");
@@ -107,9 +94,7 @@ fn link_dir(target: &Path, link: &Path) {
     }
 }
 
-/// A file under `dir` (made here, 8 KiB) that no delete can take until this is dropped: on
-/// unix its directory made read-only (`0555`); on Windows the file held open without delete
-/// sharing, which refuses a delete of it with a sharing violation.
+/// Undeletable 8 KiB file under `dir` (`0555` parent on unix; held without delete sharing on Windows).
 struct Stuck {
     #[cfg(unix)]
     dir: PathBuf,
@@ -154,8 +139,7 @@ impl Drop for Stuck {
     }
 }
 
-/// Take `lock` exclusively, as a build would, through [`HeldLock::try_take`] so the release
-/// is by `LOCK_UN` too.
+/// Acquire `lock` exclusively via [`HeldLock::try_take`].
 fn take(lock: &Path) -> HeldLock {
     let f = std::fs::File::open(lock).expect("the lock exists");
     HeldLock::try_take(f)
@@ -163,92 +147,112 @@ fn take(lock: &Path) -> HeldLock {
         .expect("the test takes the lock")
 }
 
-/// Is `lock` held by someone right now? The probe releases by `LOCK_UN` ([`HeldLock`]): by
-/// close alone it would stay held in a child a sibling test is spawning.
+/// Probe whether `lock` is currently held, releasing via `LOCK_UN`.
 fn held(lock: &Path) -> bool {
     let f = std::fs::File::open(lock).expect("lock");
     !matches!(HeldLock::try_take(f), Ok(Some(_)))
 }
 
-/// A child forked from another thread and kept short of its exec, holding a copy of every
-/// descriptor open at the fork, as every child does until its exec. [`Parked::fork`] returns
-/// once the child exists; it execs only at [`Parked::exec`] (a handshake over two pipes).
+/// Forked child parked before exit, holding inherited file descriptors until [`Parked::exec`].
 #[cfg(unix)]
 struct Parked {
-    spawner: std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>,
-    go: std::io::PipeWriter,
+    pid: libc::pid_t,
+    go: Option<std::io::PipeWriter>,
+    reaped: std::cell::Cell<Option<std::process::ExitStatus>>,
 }
 
 #[cfg(unix)]
 impl Parked {
     fn fork() -> Parked {
-        use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
-        use std::os::unix::process::CommandExt as _;
-        // `forked`: the child says it exists. `go`: the test lets it exec.
-        let (mut forked_r, forked_w) = std::io::pipe().expect("pipe");
         let (go_r, go_w) = std::io::pipe().expect("pipe");
-        let (forked_fd, go_fd, go_w_fd) =
-            (forked_w.as_raw_fd(), go_r.as_raw_fd(), go_w.as_raw_fd());
-        let spawner = std::thread::spawn(move || {
-            let mut cmd = std::process::Command::new("/bin/sh");
-            cmd.args(["-c", "exit 0"]);
-            // SAFETY: the hook runs in the forked child before exec and calls
-            // only async-signal-safe functions (close, write, read, and errno)
-            // on descriptors opened before the spawn. It drops its own copy of
-            // `go`'s write end first, so the test's end closing — a panic
-            // included — lets it exec rather than wait.
+        let (go_fd, go_w_fd) = (go_r.as_raw_fd(), go_w.as_raw_fd());
+        // SAFETY: the child calls only async-signal-safe functions (`close`, `read`, `_exit`,
+        // and errno) on descriptors opened before `fork`, then exits without unwinding.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            let interrupted =
+                || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
             unsafe {
-                cmd.pre_exec(move || {
-                    let interrupted = || {
-                        std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-                    };
-                    libc::close(go_w_fd);
-                    if libc::write(forked_fd, b"f".as_ptr().cast(), 1) != 1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    let mut b = 0u8;
-                    while libc::read(go_fd, (&raw mut b).cast(), 1) < 0 {
-                        if !interrupted() {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                    }
-                    Ok(())
-                });
+                libc::close(go_w_fd);
             }
-            let status = cmd.status();
-            // A child that failed before its byte: the read below ends.
-            drop((forked_w, go_r));
-            status
-        });
-        let mut b = [0u8; 1];
-        forked_r.read_exact(&mut b).expect("the child forked");
-        Parked { spawner, go: go_w }
+            let mut b = 0u8;
+            loop {
+                let n = unsafe { libc::read(go_fd, (&raw mut b).cast(), 1) };
+                if n >= 0 {
+                    break;
+                }
+                if !interrupted() {
+                    unsafe { libc::_exit(1) };
+                }
+            }
+            unsafe { libc::_exit(0) };
+        }
+        drop(go_r);
+        Parked {
+            pid,
+            go: Some(go_w),
+            reaped: std::cell::Cell::new(None),
+        }
     }
 
-    /// Has the child yet to exec? The spawn returns only at its exec, which
-    /// waits for `go`.
+    /// Returns `true` while the parked child has not yet exited.
     fn pending(&self) -> bool {
-        !self.spawner.is_finished()
+        use std::os::unix::process::ExitStatusExt as _;
+        if self.reaped.get().is_some() {
+            return false;
+        }
+        let mut status: libc::c_int = 0;
+        // SAFETY: `WNOHANG` polls the child owned by `self.pid` without blocking.
+        let r = unsafe { libc::waitpid(self.pid, &raw mut status, libc::WNOHANG) };
+        if r == self.pid {
+            self.reaped
+                .set(Some(std::process::ExitStatus::from_raw(status)));
+            return false;
+        }
+        r == 0
     }
 
-    /// Let the child exec; its exit status.
+    /// Release the child and return its exit status.
     fn exec(mut self) -> std::process::ExitStatus {
+        self.reap().expect("the child ran")
+    }
+
+    fn reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
         use std::io::Write as _;
-        self.go.write_all(b"g").expect("let the child exec");
-        self.spawner
-            .join()
-            .expect("the spawner")
-            .expect("the child ran")
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(mut go) = self.go.take() {
+            let _ = go.write_all(b"g");
+        }
+        if let Some(status) = self.reaped.take() {
+            return Ok(status);
+        }
+        let mut status: libc::c_int = 0;
+        loop {
+            // SAFETY: `self.pid` is the live child forked in `Parked::fork`.
+            let r = unsafe { libc::waitpid(self.pid, &raw mut status, 0) };
+            if r >= 0 {
+                return Ok(std::process::ExitStatus::from_raw(status));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
     }
 }
 
-/// A build directory with everything a real one also holds and must keep:
-/// the uplifted binary `debug/lay` (a hard link of its `deps/` twin, as cargo
-/// uplifts), `debug/lay.d`, `debug/examples/ex`, a criterion baseline, a
-/// `doc/` page, and a link an uplift left (`debug/lay.dSYM`: on unix a symlink
-/// to the twin; on Windows, where a file symlink needs a privilege, a junction
-/// to `deps/`).
+#[cfg(unix)]
+impl Drop for Parked {
+    fn drop(&mut self) {
+        if self.go.is_some() || self.reaped.get().is_none() {
+            let _ = self.reap();
+        }
+    }
+}
+
+/// Build directory populated with uplifted binaries, `.d`, `examples/`, `criterion/`, `doc/`, and `.dSYM`.
 fn furnished(tmp: &Tmp, name: &str) -> PathBuf {
     let t = synthetic_target(tmp, name);
     let debug = t.join("debug");
@@ -271,9 +275,7 @@ fn furnished(tmp: &Tmp, name: &str) -> PathBuf {
     t
 }
 
-/// Every entry under `root` — its path relative to `root`, its kind, and its
-/// bytes (a file's content, a link's text) — except what lies under a path
-/// `skip` names. What "byte-identical" is checked against.
+/// Snapshot every entry under `root` except paths matching `skip`.
 fn snapshot(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<(PathBuf, String, Vec<u8>)> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -296,9 +298,6 @@ fn snapshot(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<(PathBuf, String, 
                 out.push((rel, "dir".to_owned(), Vec::new()));
                 stack.push(p);
             } else if cfg!(windows) && CARGO_LOCKS.iter().any(|l| e.file_name() == *l) {
-                // A Windows lock is mandatory: a lock file a test's build holds
-                // cannot be read through another handle, so its length stands
-                // for its bytes (cargo's are empty).
                 out.push((rel, "lock".to_owned(), meta.len().to_le_bytes().to_vec()));
             } else {
                 out.push((rel, "file".to_owned(), std::fs::read(&p).expect("read")));
@@ -315,8 +314,7 @@ fn in_incremental(rel: &Path) -> bool {
         .any(|c| c.as_os_str() == std::ffi::OsStr::new(INCREMENTAL))
 }
 
-/// An idle profile loses only its `incremental/`: every other entry of a furnished build
-/// directory is byte-identical afterwards, and the bytes counted are the blocks released.
+/// An idle profile loses only its `incremental/` cache and releases its locks.
 #[test]
 fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_identical() {
     let tmp = Tmp::new("only-incremental");
@@ -353,7 +351,6 @@ fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_
         "every lock released"
     );
 
-    // Reclaimed, it is no longer a candidate: nothing is left to take.
     let again = assessed(&t, now);
     let why = target_witness(&again, now, STALE).expect_err("nothing to reclaim");
     assert!(
@@ -364,9 +361,7 @@ fn an_idle_profile_loses_only_its_incremental_cache_and_everything_else_is_byte_
     assert!(err.to_string().contains("nothing reclaimed"), "{err}");
 }
 
-/// Profiles are found at any depth (`debug`, `<triple>/release`,
-/// `conformance-release/release`) and each is judged alone: one written inside the window
-/// keeps its `incremental/`.
+/// Profiles are discovered at any depth and judged independently.
 #[test]
 fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
     let tmp = Tmp::new("nested");
@@ -374,8 +369,6 @@ fn profiles_are_found_at_any_depth_and_each_is_judged_alone() {
     lay_profile(&at(&t, "aarch64-apple-darwin/release"));
     lay_profile(&at(&t, "conformance-release/release"));
     let now = now_after_write(STALE + 1);
-    // The triple's profile was compiled into inside the window (as `now`
-    // reads it).
     set_mtime(
         &at(&t, "aarch64-apple-darwin/release/deps"),
         inside_window(now),
@@ -438,12 +431,10 @@ fn a_walk_cut_short_makes_the_whole_directory_not_a_candidate() {
         let why = target_witness(&td, now, STALE).expect_err("not a candidate");
         assert!(why.contains("not all known"), "{why}");
     }
-    // Control: the shipped bounds read it all.
     assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
 }
 
-/// A size bounded by a deadline that has passed reads nothing more and says it was cut
-/// short; one whose deadline is far off is the whole size, as [`total_bytes`] gives it.
+/// A size walk past its deadline stops immediately and reports truncation.
 #[test]
 fn a_size_past_its_deadline_is_cut_short() {
     let tmp = Tmp::new("size-deadline");
@@ -458,8 +449,7 @@ fn a_size_past_its_deadline_is_cut_short() {
     );
 }
 
-/// The idle clock is [`CLOCK_DIRS`], never a lock's or the profile directory's: a fresh lock
-/// or profile directory is not a use; a fresh `deps/` or `examples/` is.
+/// The idle clock is [`CLOCK_DIRS`], never a lock or profile directory mtime.
 #[test]
 fn the_idle_clock_is_the_cache_directories_only() {
     let tmp = Tmp::new("clock");
@@ -472,11 +462,9 @@ fn the_idle_clock_is_the_cache_directories_only() {
     }
     std::fs::create_dir_all(debug.join("examples")).expect("examples");
     set_mtime(&debug.join("examples"), old);
-    // A fresh lock and a fresh profile directory: not a use.
     set_mtime(&debug.join(".cargo-lock"), now);
     set_mtime(&debug, now);
     assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
-    // A fresh deps/ (a compile): in use, whatever the lock says.
     set_mtime(&debug.join(".cargo-lock"), old);
     set_mtime(&debug.join("deps"), inside_window(now));
     let why = target_witness(&assessed(&t, now), now, STALE).expect_err("in use");
@@ -484,14 +472,12 @@ fn the_idle_clock_is_the_cache_directories_only() {
         why.contains(&format!("written into {}d ago", STALE - 1)),
         "{why}"
     );
-    // A fresh examples/ alone: in use too.
     set_mtime(&debug.join("deps"), old);
     set_mtime(&debug.join("examples"), inside_window(now));
     assert!(target_witness(&assessed(&t, now), now, STALE).is_err());
 }
 
-/// A build holding any one of cargo's locks keeps its profile, in the report and in the
-/// reclaim, while an idle sibling profile is still reclaimed.
+/// A build holding any cargo lock preserves its profile while idle siblings are reclaimed.
 #[test]
 fn a_build_holding_any_lock_keeps_its_profile() {
     let now = now_after_write(STALE + 1);
@@ -561,9 +547,7 @@ fn every_lock_is_held_for_the_whole_delete_and_released_after() {
     );
 }
 
-/// The reclaim's locks are free once it is done, though a child forked under them has yet to
-/// exec ([`Parked`]). Negative control: with [`HeldLock`]'s drop reduced to a plain close,
-/// every lock reads held at `Released`.
+/// Reclaim locks are released via `LOCK_UN` even while a forked child has not yet exec'd.
 #[test]
 #[cfg(unix)]
 fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
@@ -596,9 +580,7 @@ fn a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec() {
     assert!(!debug.join(INCREMENTAL).exists());
 }
 
-/// The report's probe ([`locks_held`]) releases each lock by `LOCK_UN`, so a child forked
-/// under it ([`Parked`]) does not keep it held. Negative control: with the probe releasing by
-/// close alone, each lock reads held after the probe and the reclaim fails.
+/// [`locks_held`] releases each probed lock via `LOCK_UN` even across a concurrent fork.
 #[test]
 #[cfg(unix)]
 fn a_probed_lock_is_released_while_a_child_forked_under_the_probe_has_yet_to_exec() {
@@ -609,11 +591,9 @@ fn a_probed_lock_is_released_while_a_child_forked_under_the_probe_has_yet_to_exe
     let mut parked: Vec<Parked> = Vec::new();
     let mut under = Vec::new();
     let verdict = locks_held_with(&debug, &mut |lock| {
-        // The hook runs while the probe holds `lock`.
         under.push(held(lock));
         parked.push(Parked::fork());
     });
-    // Everything read while every child is parked short of its exec.
     let after: Vec<bool> = CARGO_LOCKS.iter().map(|l| held(&debug.join(l))).collect();
     let again = locks_held(&debug);
     let done = reclaim(&t, &judge(now));
@@ -657,8 +637,7 @@ fn a_compile_since_the_survey_keeps_the_profile() {
     assert!(debug.join(INCREMENTAL).exists());
 }
 
-/// A profile whose clock could not be read is refused by both passes with that reason, never
-/// dated "written into 0d ago".
+/// An unreadable clock is refused as unreadable, never dated `0d ago`.
 #[test]
 fn an_unread_clock_is_said_never_dated_zero_days() {
     let now = 2_000_000_000;
@@ -670,8 +649,6 @@ fn an_unread_clock_is_said_never_dated_zero_days() {
         seen: now,
     };
     assert_eq!(lru.refuses(None, &judge(now)).as_deref(), Some(unread));
-    // The dated arms: past the window it is idle, inside it the days are said, and at a
-    // 0-day window the ten minutes are.
     assert_eq!(
         idle.refuses(Some(now - (STALE + 1) * DAY), &judge(now)),
         None
@@ -695,9 +672,7 @@ fn an_unread_clock_is_said_never_dated_zero_days() {
     );
 }
 
-/// A missing lock is created only when the removal proceeds (an older cargo's profile holds
-/// only `.cargo-lock`), never while a build holds one, and a failure to create one (ENOSPC,
-/// a read-only profile) skips the profile whole.
+/// Missing locks are created only when removal proceeds, and creation failure skips the profile.
 #[test]
 fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skips() {
     let now = now_after_write(STALE + 1);
@@ -716,11 +691,9 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
             .count()
     };
 
-    // The report creates nothing.
     let t = old_cargo(&tmp, "report");
     assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
     assert_eq!(only(&t), 1, "the report wrote no lock");
-    // The reclaim creates the missing two, and holds all three.
     let mut all_held = false;
     reclaim_with(&t, &judge(now), &mut |stage, _| {
         if stage == Stage::Deleting {
@@ -731,7 +704,6 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
     assert!(all_held);
     assert_eq!(only(&t), 3, "created now that the removal proceeds");
 
-    // `.cargo-lock` held: skipped, and nothing created.
     let t = old_cargo(&tmp, "held");
     let hold = take(&at(&t, "debug/.cargo-lock"));
     let err = reclaim(&t, &judge(now)).expect_err("held");
@@ -739,7 +711,6 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
     assert_eq!(only(&t), 1, "nothing created while a build holds one");
     drop(hold);
 
-    // A full disk: the missing lock cannot be created — skipped.
     let t = old_cargo(&tmp, "full");
     inject_create_lock_fault(true);
     let err = reclaim(&t, &judge(now)).expect_err("cannot lock");
@@ -747,8 +718,6 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
     assert!(err.to_string().contains("could not be created"), "{err}");
     assert!(t.join("debug").join(INCREMENTAL).exists(), "cache intact");
 
-    // A read-only profile: the same (unix: a Windows directory's read-only
-    // attribute does not keep a file from being created in it).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -763,9 +732,7 @@ fn a_missing_lock_is_created_only_when_the_removal_proceeds_and_its_failure_skip
     }
 }
 
-/// Nothing is reached through a symlink: a path component swapped for a link refuses the
-/// reclaim; a linked `incremental` is no candidate; a link inside `incremental/` is unlinked,
-/// its target kept; a profile swapped for a link under the locks redirects nothing.
+/// Symlinks in path components, `incremental`, or swapped profiles are never followed.
 #[test]
 fn nothing_is_reached_through_a_symlink() {
     let tmp = Tmp::new("links");
@@ -774,7 +741,6 @@ fn nothing_is_reached_through_a_symlink() {
     lay_target(&victim);
     let victim_before = snapshot(&victim, &|_| false);
 
-    // 1. A path component swapped for a link after the survey.
     let parent = tmp.path().join("repo");
     let t = lay_target(&parent.join("target"));
     let t = std::fs::canonicalize(&t).expect("canonical");
@@ -782,19 +748,15 @@ fn nothing_is_reached_through_a_symlink() {
     let parent = std::fs::canonicalize(&parent).expect("canonical");
     std::fs::rename(&parent, tmp.path().join("repo.moved")).expect("move");
     link_dir(&victim, &parent);
-    // `victim` holds a `target/`? It does not; give the link one to find.
     std::fs::create_dir_all(victim.join("target")).expect("decoy");
     lay_target(&victim.join("target"));
     let decoy_before = snapshot(&victim.join("target"), &|_| false);
     let err = reclaim(&t, &judge(now)).expect_err("a link in the path");
     assert!(err.to_string().contains("symlink"), "{err}");
-    // A link is said as one, never as a cloud sync root (Windows says that of a
-    // reparse point that is no link alone).
     assert!(!err.to_string().contains(IN_SYNC_ROOT), "{err}");
     assert_eq!(snapshot(&victim.join("target"), &|_| false), decoy_before);
     std::fs::remove_dir_all(victim.join("target")).expect("decoy away");
 
-    // 2. `incremental` itself a link: never followed, never a candidate.
     let t = synthetic_target(&tmp, "linked-inc");
     std::fs::remove_dir_all(at(&t, "debug/incremental")).expect("real one away");
     link_dir(
@@ -809,15 +771,11 @@ fn nothing_is_reached_through_a_symlink() {
     assert!(reclaim(&t, &judge(now)).is_err());
     assert!(std::fs::symlink_metadata(at(&t, "debug/incremental")).is_ok());
 
-    // 3. A link inside incremental/: the link goes, its target stays.
     let t = synthetic_target(&tmp, "inner-link");
     link_dir(&victim, &at(&t, "debug/incremental/escape"));
     reclaim(&t, &judge(now)).expect("reclaimed");
     assert!(!at(&t, "debug/incremental").exists());
 
-    // 4. The profile swapped for a link under the locks. On Windows the swap
-    // itself is refused: NTFS renames no directory with a handle open beneath
-    // it, and the reclaim holds the profile and its locks open.
     let t = synthetic_target(&tmp, "swap");
     let debug = t.join("debug");
     let moved = t.join("debug.moved");
@@ -855,8 +813,7 @@ fn nothing_is_reached_through_a_symlink() {
     );
 }
 
-/// The delete never enters a directory on another device (reported, uncounted), and a build
-/// directory on another volume than the one measured is refused.
+/// Deletion never crosses onto another device or volume.
 #[test]
 fn the_delete_never_enters_another_device() {
     let tmp = Tmp::new("device");
@@ -881,7 +838,6 @@ fn the_delete_never_enters_another_device() {
         "nothing on the other device is counted"
     );
 
-    // A build directory on another volume than the one measured is refused.
     let t = synthetic_target(&tmp, "volume");
     let dev = dev_of(&t).expect("dev");
     let elsewhere = Judge {
@@ -893,11 +849,7 @@ fn the_delete_never_enters_another_device() {
     assert!(t.join("debug").join(INCREMENTAL).exists());
 }
 
-/// A VOLUME'S GUID IS ITS OWN NAME, AND THE FENCE'S SECOND READING HOLDS TO IT
-/// ([`same_volume`], pure): a GUID reads in any case and is spelled back as the mount manager
-/// spells it; only a Windows volume's key carries one; the measured GUID and the one read
-/// through the build directory's handle must be one, and either unread refuses. NEGATIVE
-/// CONTROLS: every malformed spelling reads as none, and two GUIDs one bit apart differ.
+/// [`VolumeGuid`] parses case-insensitively, rejects malformed strings, and [`same_volume`] requires matching GUIDs.
 #[test]
 fn a_volume_guid_reads_in_any_case_and_the_fence_holds_to_it() {
     use aterm_sysprobe::volumes::VolumeKey;
@@ -940,9 +892,7 @@ fn a_volume_guid_reads_in_any_case_and_the_fence_holds_to_it() {
     }
 }
 
-/// The bytes counted are what the unlinks released: a file hard-linked into `deps/` counts
-/// nothing, a sparse file its blocks (unix; on Windows a file extended without the sparse flag
-/// is allocated whole); the report's estimate and the reclaim's count agree.
+/// Counted bytes match the blocks actually released by unlinking (excluding hard-linked files and unallocated sparse ranges).
 #[test]
 fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
     let tmp = Tmp::new("bytes");
@@ -975,8 +925,7 @@ fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
     );
 }
 
-/// An undeletable entry is reported and uncounted, its siblings deleted and counted, and the
-/// non-empty `incremental/` not claimed as gone.
+/// An undeletable entry is reported and uncounted while its siblings are still removed.
 #[test]
 fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
     let tmp = Tmp::new("undeletable");
@@ -1008,8 +957,7 @@ fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
     );
 }
 
-/// A source tree is never a candidate: a directory holding a `Cargo.toml`
-/// or `src/` at its root is not build output, whatever it holds.
+/// A directory holding `Cargo.toml` or `src/` at its root is never a reclaim candidate.
 #[test]
 fn a_directory_holding_source_is_never_a_candidate() {
     let tmp = Tmp::new("source");
@@ -1023,8 +971,7 @@ fn a_directory_holding_source_is_never_a_candidate() {
     assert!(t.join("debug").join(INCREMENTAL).exists());
 }
 
-/// A reclaim cut short leaves the profile idle: its unlinks write `incremental/`'s mtime,
-/// which is not part of the idle clock, so the next reclaim takes what is left.
+/// Partial deletion updating `incremental/`'s mtime leaves the profile idle for the next reclaim.
 #[test]
 fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
     let tmp = Tmp::new("cut-short");
@@ -1033,7 +980,6 @@ fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
     let inc = debug.join(INCREMENTAL);
     let stuck = inc.join("stuck");
     let held = Stuck::at(&stuck);
-    // Judged at the real time, with every directory last written a month ago.
     let now = now_after_write(0);
     let old = now - 30 * DAY;
     for d in [
@@ -1062,8 +1008,7 @@ fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
     assert!(!inc.exists());
 }
 
-/// A lock the reclaim creates gets the mode cargo's `OpenOptions` gives it (`0666` under the
-/// umask), never a private `0600` that locks out a shared build directory's group.
+/// Created locks inherit the standard `OpenOptions` mode under the process umask.
 #[test]
 #[cfg(unix)]
 fn a_created_lock_takes_the_mode_cargo_gives_it() {
@@ -1075,8 +1020,6 @@ fn a_created_lock_takes_the_mode_cargo_gives_it() {
         std::fs::remove_file(debug.join(lock)).expect("an older cargo's");
     }
     reclaim(&t, &judge(now_after_write(STALE + 1))).expect("reclaimed");
-    // What cargo's `OpenOptions::new().read(true).write(true).create(true)`
-    // makes under this process's umask.
     let reference = tmp.path().join("as-cargo-makes-it");
     std::fs::OpenOptions::new()
         .read(true)
@@ -1095,8 +1038,7 @@ fn a_created_lock_takes_the_mode_cargo_gives_it() {
     }
 }
 
-/// An idle profile with an empty `incremental/` (a release or `CARGO_INCREMENTAL=0` build) is
-/// not a candidate and gets no lock, while an idle sibling is reclaimed.
+/// An idle profile with an empty `incremental/` is skipped without creating locks.
 #[test]
 fn an_empty_incremental_is_not_a_candidate_and_gets_no_lock() {
     let tmp = Tmp::new("empty-inc");
@@ -1129,7 +1071,6 @@ fn an_empty_incremental_is_not_a_candidate_and_gets_no_lock() {
         "no lock created for nothing"
     );
 
-    // Alone, it makes the directory no candidate at all.
     std::fs::remove_dir_all(t.join("debug")).expect("only release left");
     let why = target_witness(&assessed(&t, now), now, STALE).expect_err("nothing to take");
     assert!(
@@ -1140,8 +1081,7 @@ fn an_empty_incremental_is_not_a_candidate_and_gets_no_lock() {
     assert!(!release.join(".cargo-artifact-lock").exists());
 }
 
-/// `dev_of` follows a link, as the free-space figure does, so a home linked to another volume
-/// fences the reclaim to that volume. The fixture links to `/dev` (devfs, its own volume).
+/// `dev_of` follows symlinks so a linked home fences reclaim to its target volume.
 #[test]
 #[cfg(unix)]
 fn the_device_of_a_link_is_the_one_it_resolves_to() {
@@ -1158,7 +1098,7 @@ fn the_device_of_a_link_is_the_one_it_resolves_to() {
     assert_eq!(dev_of(&link), Some(devfs));
 }
 
-/// Date `profile` last used at `at`: what a compile writes, written then.
+/// Date `profile` last used at `at` across [`CLOCK_DIRS`].
 fn last_used(profile: &Path, at: i64) {
     for c in CLOCK_DIRS {
         let d = profile.join(c);
@@ -1168,8 +1108,7 @@ fn last_used(profile: &Path, at: i64) {
     }
 }
 
-/// Under pressure [`reclaim_lru`] takes only the named recent profile's `incremental/`, under
-/// all of its locks, and leaves everything else byte-identical.
+/// [`reclaim_lru`] removes only the named profile's `incremental/` under all cargo locks.
 #[test]
 fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
     let tmp = Tmp::new("lru-one");
@@ -1212,8 +1151,7 @@ fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
     );
 }
 
-/// Under the locks the pressure pick is derived again, and refused when written since the
-/// survey, written within [`PRESSURE_MIN_IDLE_S`], or not one of the directory's profiles.
+/// [`reclaim_lru`] refuses profiles modified since the survey, within [`PRESSURE_MIN_IDLE_S`], or unknown.
 #[test]
 fn reclaim_lru_refuses_a_profile_used_since_the_survey_or_just_built() {
     let tmp = Tmp::new("lru-refuse");
@@ -1223,7 +1161,6 @@ fn reclaim_lru_refuses_a_profile_used_since_the_survey_or_just_built() {
     let then = now - 3 * 3_600;
     last_used(&debug, then);
 
-    // A compile lands once the locks are taken: refused under them.
     let err = reclaim_lru_with(&t, &debug, &judge(now), then, &mut |stage, _| {
         if stage == Stage::Locked {
             set_mtime(&debug.join("deps"), then + 60);
@@ -1232,23 +1169,18 @@ fn reclaim_lru_refuses_a_profile_used_since_the_survey_or_just_built() {
     .expect_err("used since the survey");
     assert!(err.to_string().contains("since the survey"), "{err}");
     assert!(debug.join(INCREMENTAL).exists());
-    // Or before them: refused without a lock taken.
     let err = reclaim_lru(&t, &debug, &judge(now), then).expect_err("used since");
     assert!(err.to_string().contains("since the survey"), "{err}");
 
-    // Built five minutes ago: no reclaim takes a profile that recent.
     last_used(&debug, now - 5 * 60);
     reclaim_lru(&t, &debug, &judge(now), now - 5 * 60).expect_err("just built");
     assert!(debug.join(INCREMENTAL).exists());
 
-    // Not a profile of this build directory.
     reclaim_lru(&t, &t.join("nope"), &judge(now), then).expect_err("no such profile");
     assert!(debug.join(INCREMENTAL).exists());
 }
 
-/// A whole removal refuses when a profile appears after it locked the rest, and deletes only
-/// through the handle it pinned: a directory swapped in under the name is never entered.
-/// Control: left alone, the directory goes whole.
+/// Whole-directory removal refuses unlocked newcomer profiles and deletes only through its pinned handle.
 #[test]
 fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_handle() {
     let now = now_after_write(2);
@@ -1297,9 +1229,6 @@ fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_hand
             "{done:?}"
         );
     }
-    // NTFS renames no directory with a handle open beneath it: the reclaim
-    // holds the pinned directory and every lock open, so no swap happens and
-    // the directory goes whole.
     #[cfg(windows)]
     {
         swapped.expect_err("NTFS refuses the rename while the reclaim holds the directory");
@@ -1315,7 +1244,6 @@ fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_hand
     assert_eq!(done.units, std::slice::from_ref(&t));
     assert!(!t.exists());
 
-    // The caller's check, under the locks, refuses with its own reason.
     let tmp = Tmp::new("whole-check");
     let t = std::fs::canonicalize(lay_target(&tmp.path().join("target"))).expect("canonical");
     let err = reclaim_whole_with(
@@ -1331,8 +1259,7 @@ fn a_whole_removal_takes_no_profile_it_did_not_lock_and_deletes_through_its_hand
     assert!(at(&t, "debug/deps/liblay.rlib").exists());
 }
 
-/// Windows' unhashed twin: the same name with `-` read as `_` and an extension, never a
-/// hashed name, a bare name or another extension.
+/// [`unhashed_twin`] matches only the unhashed stem (`-` as `_`) with the same extension.
 #[test]
 fn an_unhashed_twin_is_the_same_name_with_an_extension() {
     for (name, dep) in [
@@ -1355,9 +1282,7 @@ fn an_unhashed_twin_is_the_same_name_with_an_extension() {
     }
 }
 
-/// The Windows volume fence: only a local fixed disk passes; a volume no mount holds, one
-/// off the local device allowlist (a share, an unmeasured device), a removable one and one
-/// whose kind could not be read each refuse, saying why.
+/// [`fixed_verdict`] accepts only a local fixed disk volume.
 #[test]
 fn only_a_local_fixed_disk_passes_the_volume_fence() {
     assert_eq!(fixed_verdict(Some((true, Some(true)))), Ok(()));

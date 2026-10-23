@@ -25,7 +25,7 @@ fn create_marker(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn child(root: &Path) {
     TERM_SEEN.store(false, AtomicOrdering::SeqCst);
     // SAFETY: the handler lives for this re-executed test process and only stores a lock-free
-    // atomic; this child runs one exact test, then exits.
+    // atomic.
     let previous = unsafe { libc::signal(libc::SIGTERM, term_seen as extern "C" fn(i32) as usize) };
     assert_ne!(previous, libc::SIG_ERR, "install TERM handler");
     create_marker(&root.join("ready"), b"ready\n").expect("ready marker");
@@ -40,8 +40,6 @@ fn child(root: &Path) {
     create_marker(&root.join("returned"), b"returned\n").expect("normal TERM return marker");
 }
 
-/// Own the exact Child before any ready read or assertion. Drop deregisters
-/// Live before collecting a status, then kills only this retained direct child.
 struct Owned {
     child: Option<std::process::Child>,
     live: Option<group::Live>,

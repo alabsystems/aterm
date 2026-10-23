@@ -123,6 +123,7 @@ fn simulate(
         *steps = steps.saturating_add(1);
         if matched.is_none() {
             if prog.start_anchored {
+                // An anchored program starts threads only at 0; once the list empties
                 // nothing can revive it.
                 if pos > 0 && clist.dense.is_empty() {
                     return Ok(None);
@@ -204,6 +205,8 @@ fn skip_to_candidate(prog: &Program, first: &Prefilter, text: &str, mut pos: usi
     let bytes = text.as_bytes();
     while let Some(&b) = bytes.get(pos) {
         if first.lead_bytes[b as usize] {
+            // When this byte is ASCII, test the second byte before decoding: an ASCII
+            // lead byte is its whole code point, so the next one starts at `pos + 1`, and
             // a decode plus the walk over `pcs` costs far more than a lookup.
             if b < 0x80
                 && let Some(second) = first.second_bytes.as_ref()

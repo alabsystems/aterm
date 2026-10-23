@@ -3,18 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Equivalence tests for `DeferredLine` lazy scrollback promotion.
-//!
-//! `DeferredLine::to_line()` and `into_line()` produce the same `Line` as the
-//! eager `row_to_line_with_stored_extras()` for empty, ASCII, complex, combining,
-//! hyperlinked, RGB, wrapped and mixed rows.
 
 use std::sync::Arc;
 
 use super::super::scroll_convert::{DeferredLine, ScrolledRowExtras};
 use crate::{Cell, CellFlags, Grid, PackedColor, Row};
 
-/// Compare the text, attribute count, and wrapped state of two Lines.
-/// Uses the public accessors of `aterm_scrollback::Line`.
+/// Compare the text, attributes, hyperlinks, and wrapped state of two `Line`s.
 fn assert_lines_equivalent(
     eager: &aterm_scrollback::Line,
     lazy: &aterm_scrollback::Line,
@@ -75,9 +70,7 @@ impl RowBuilder {
     }
 }
 
-/// `DeferredLine::to_line` and `into_line` build the same `Line` as the eager
-/// `row_to_line_with_stored_extras` — text, wrap flag, per-char attrs and
-/// hyperlink spans — for every row shape and every extras kind.
+/// `DeferredLine::to_line` and `into_line` match `row_to_line_with_stored_extras` across row shapes and extras.
 #[test]
 fn deferred_line_matches_the_eager_conversion() {
     use aterm_alloc::SmallVec;
@@ -211,8 +204,6 @@ fn deferred_line_matches_the_eager_conversion() {
     }
 }
 
-// Lazy buffer integration: drain produces equivalent lines
-
 #[test]
 fn lazy_buffer_drain_produces_equivalent_lines() {
     use crate::grid::scroll_convert::LazyBuffer;
@@ -254,11 +245,6 @@ fn lazy_buffer_drain_produces_equivalent_lines() {
     assert_lines_equivalent(&eager2, &drained[1], "lazy buffer drain line 2");
 }
 
-// Cell-body recycling: every row scrolling off the ring becomes a
-// `DeferredLine` whose cell snapshot reuses a pooled body instead of a malloc
-// per newline under the PTY reader's lock. A reused body carries no state from
-// its previous line, and the free list is bounded.
-
 #[test]
 fn recycled_cell_body_carries_no_state_from_the_previous_line() {
     use crate::grid::scroll_convert::LazyBuffer;
@@ -266,7 +252,6 @@ fn recycled_cell_body_carries_no_state_from_the_previous_line() {
     let mut rb = RowBuilder::new();
     let mut buf = LazyBuffer::new();
 
-    // A long plain line first: its body is the one that gets recycled.
     let long_cells: Vec<Cell> = (0..60u8)
         .map(|i| Cell::from_ascii_fast(b'a' + i % 26))
         .collect();
@@ -279,8 +264,6 @@ fn recycled_cell_body_carries_no_state_from_the_previous_line() {
         "a materialized line must hand its cell body back"
     );
 
-    // A shorter, differently styled, wrapped line reuses that body; a leaked old
-    // length or cells would show as trailing 'a'..'z'.
     let fg = PackedColor::rgb(255, 128, 0);
     let bg = PackedColor::rgb(0, 64, 128);
     let short_cells: Vec<Cell> = b"hi"
@@ -317,8 +300,6 @@ fn recycled_cell_body_carries_no_state_from_the_previous_line() {
 fn flood_backpressure_drop_recycles_bodies() {
     use crate::grid::scroll_convert::LazyBuffer;
 
-    // `drop_oldest` is the backpressure path, which runs while the reader
-    // allocates bodies under its lock; its bodies go back to the pool.
     let mut rb = RowBuilder::new();
     let mut buf = LazyBuffer::new();
     let cells: Vec<Cell> = b"dropped under flood"
@@ -335,8 +316,6 @@ fn flood_backpressure_drop_recycles_bodies() {
         3,
         "every dropped line is counted into the cut"
     );
-    // Two staged lines remain, plus the marker row the cut now presents ahead
-    // of them — dropped lines are never silently gone.
     assert_eq!(buf.len(), 3, "drop_oldest still drops the staged lines");
     assert_eq!(buf.cut_dropped(), 3, "the cut remembers what it lost");
     assert_eq!(
@@ -356,8 +335,6 @@ fn flood_backpressure_drop_recycles_bodies() {
 fn front_rows_over_sheds_the_fewest_rows_that_fit_and_keeps_the_floor() {
     use crate::grid::scroll_convert::LazyBuffer;
 
-    // Rows of three widths, so no row count can stand in for bytes; the
-    // running sum must match a fresh walk after every kind of removal.
     let mut rb = RowBuilder::new();
     let fill = |buf: &mut LazyBuffer, rb: &mut RowBuilder| {
         for i in 0..30 {
@@ -372,7 +349,6 @@ fn front_rows_over_sheds_the_fewest_rows_that_fit_and_keeps_the_floor() {
     let total = buf.staged_bytes();
     assert_eq!(buf.front_rows_over(total, 0), 0, "it fits: nothing to shed");
 
-    // `n` is the fewest front rows whose going brings it under the budget.
     let budget = total * 2 / 3;
     let n = buf.front_rows_over(budget, 0);
     assert!(n > 0);
@@ -383,8 +359,6 @@ fn front_rows_over_sheds_the_fewest_rows_that_fit_and_keeps_the_floor() {
     probe.shed_oldest(1, 0);
     assert!(probe.staged_bytes() <= budget, "`n` rows do");
 
-    // Never below `keep`, however far over budget — an open cut's marker
-    // counts as one of the kept rows, as it does in `len`.
     assert_eq!(buf.front_rows_over(0, 25), 5);
     assert_eq!(buf.front_rows_over(0, 40), 0);
     assert_eq!(buf.drop_oldest(2), 2);
@@ -394,7 +368,6 @@ fn front_rows_over_sheds_the_fewest_rows_that_fit_and_keeps_the_floor() {
         "28 rows + the marker, keep 25"
     );
 
-    // The drains keep the sum honest too.
     assert_eq!(buf.drain_front(7).count(), 7);
     assert!(buf.staged_bytes() > 0);
     assert_eq!(buf.drain_all().count(), 22);
@@ -405,8 +378,6 @@ fn front_rows_over_sheds_the_fewest_rows_that_fit_and_keeps_the_floor() {
 fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
     use crate::grid::scroll_convert::LazyBuffer;
 
-    // Depth cap: many narrow bodies. Unbounded, a 700-line backlog drain would
-    // park 700 bodies forever.
     let mut rb = RowBuilder::new();
     let mut buf = LazyBuffer::new();
     let narrow: Vec<Cell> = b"narrow"
@@ -424,8 +395,6 @@ fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
         "free-list depth must be capped (POOL_MAX_BUFFERS), got {depth}"
     );
 
-    // Cell budget: the depth cap alone is a per-width bound (512 × cols × 8 B),
-    // which a very wide window would turn into megabytes of idle free-list.
     let mut buf = LazyBuffer::new();
     let wide: Vec<Cell> = (0..900u16).map(|_| Cell::from_ascii_fast(b'w')).collect();
     let wide_row = rb.build(&wide, 1000, false);
@@ -438,8 +407,6 @@ fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
         wide_depth < 200,
         "the cell budget must bite long before the depth cap, got {wide_depth}"
     );
-    // 512 KiB of bodies + the (drained, empty) deque and free-list spines. The
-    // un-pooled bodies alone would have been 200 × 900 × 8 B ≈ 1.4 MB.
     let used = buf.memory_used();
     assert!(
         used < 640 * 1024,
@@ -451,8 +418,6 @@ fn cell_pool_is_bounded_by_depth_and_by_total_cells() {
 fn width_change_drops_recycled_bodies_and_history_survives() {
     use aterm_scrollback::Scrollback;
 
-    // Old-width bodies are dropped after a resize; content is unaffected since a
-    // body is cleared and refilled from the row.
     let scrollback = Scrollback::new(100, 1000, 100_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     for i in 0..40usize {
@@ -475,7 +440,6 @@ fn width_change_drops_recycled_bodies_and_history_survives() {
         "a width change must drop the old-width free-list"
     );
 
-    // A rows-only resize keeps the pool (nothing about the bodies went stale).
     grid.resize(5, 40);
     let history: Vec<String> = (0..grid.scrollback_lines())
         .rev()
@@ -496,8 +460,6 @@ fn width_change_drops_recycled_bodies_and_history_survives() {
 fn recycling_preserves_flooded_scrollback_content() {
     use aterm_scrollback::Scrollback;
 
-    // Cycle bodies through the pool many times; history stays exactly
-    // L0..L299 in order.
     let scrollback = Scrollback::new(400, 1000, 100_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 80, 2, scrollback);
     for i in 0..300usize {
@@ -506,8 +468,6 @@ fn recycling_preserves_flooded_scrollback_content() {
             grid.write_char(c);
         }
         grid.line_feed();
-        // Drain every few lines so the pool is exercised (fill → recycle → refill)
-        // rather than simply growing to a single big backlog.
         if i % 7 == 0 {
             grid.drain_lazy_bounded(4);
         }

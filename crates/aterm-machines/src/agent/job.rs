@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `agent run-job <run>`: one run, detached from the SSH session that asked for it
-//! (design §4.4–§4.6).
-//!
-//! `apply` starts it after verifying the envelope and writing `state/runs/<run>/`. The job
-//! accepts only a run directory the agent wrote (root's, 0600 envelope, the run lock naming
-//! it) and re-reads the envelope from there, so nothing it acts on came from anyone but a
-//! verified signer. Each item's row goes to `progress.ndjson` as it finishes, then the
-//! whole report to `report.json`.
+//! Detached `agent run-job` execution, progress streaming, and report generation.
 
 use super::apply::Signer;
 use super::{Layout, chain, state};
@@ -23,13 +16,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// The Developer ID team an `app-zip` upgrade must be signed by (design §4.5, §8).
+/// Developer ID team an `app-zip` upgrade must be signed by.
 pub const ATERM_TEAM: &str = "A66A9P66Z7";
 
 /// The journal is rotated past this size (one previous generation is kept).
 const JOURNAL_ROTATE: usize = 1 << 20;
 
-/// The longest an `exec` may run: a day.
+/// The longest an `exec` may run.
 const EXEC_BUDGET_MAX: u64 = 24 * 3600;
 
 /// `agent run-job <run>`.
@@ -37,8 +30,6 @@ pub fn run_job(sys: &dyn System, layout: &Layout, exe: &Path, run: &str) -> Exit
     run_job_at(sys, layout, exe, run, std::process::id())
 }
 
-// The supplied PID is the current process in shipping code; the pure fixture uses a
-// virtual child identity. This does not bypass either the gate or holder admission.
 fn run_job_at(sys: &dyn System, layout: &Layout, exe: &Path, run: &str, pid: u32) -> ExitCode {
     if sys.euid() != 0 {
         eprintln!("refused: run-job runs as root, started by apply");
@@ -66,17 +57,12 @@ fn run_job_at(sys: &dyn System, layout: &Layout, exe: &Path, run: &str, pid: u32
     let (envelope, signer) = match checked {
         Ok(v) => v,
         Err(why) => {
-            // Nothing is written into a run directory the job does not trust: the refusal
-            // goes to the job's log, and `apply`'s stream reports a job without a report.
             eprintln!("refused: {why}");
             let _ = state::release_holder(sys, layout, &holder);
             return ExitCode::from(super::REFUSED);
         }
     };
     let mut progress = Progress::resume(sys, &layout.run_dir(run));
-    // Once per run, with this job's own Full Disk Access (`HostFacts::full_disk_access`:
-    // root's open of the system TCC database, never aterm's grant), which decides whether
-    // an item may touch another app's container (`items::defaults::withheld`).
     let mut facts = crate::facts::gather(sys);
     facts.cached = super::hello::cached(sys, layout);
     let mut report = HostReport {
@@ -129,8 +115,7 @@ fn run_job_at(sys: &dyn System, layout: &Layout, exe: &Path, run: &str, pid: u32
     }
 }
 
-/// The checks before the job trusts its run directory: root's, not writable by anyone
-/// else, the envelope 0600 root-owned, and the run lock naming this run.
+/// The checks before the job trusts its run directory.
 fn accept(sys: &dyn System, layout: &Layout, run: &str) -> Result<(Envelope, Signer), String> {
     let dir = layout.run_dir(run);
     for (path, want_dir) in [(dir.clone(), true), (dir.join("envelope"), false)] {
@@ -185,8 +170,7 @@ fn finish(
     let _ = state::release_holder(sys, layout, holder);
 }
 
-/// `progress.ndjson`, rewritten whole (atomically) after each line, so a reader never sees
-/// half a line.
+/// `progress.ndjson`.
 pub struct Progress<'a> {
     sys: &'a dyn System,
     path: PathBuf,
@@ -215,7 +199,7 @@ impl<'a> Progress<'a> {
     }
 }
 
-/// `state/journal.ndjson`: one line per change, before the change is applied.
+/// `state/journal.ndjson`.
 pub struct FileJournal<'a> {
     sys: &'a dyn System,
     path: PathBuf,
@@ -265,7 +249,7 @@ impl Journal for FileJournal<'_> {
     }
 }
 
-/// Whether a change may disrupt someone at the Mac now (design §5.3).
+/// Whether a change may disrupt someone at the Mac now.
 #[must_use]
 pub fn may_disrupt(e: &Envelope, facts: &HostFacts) -> bool {
     match e.disrupt {
@@ -316,7 +300,7 @@ fn baseline_run(
     .map_err(|refused| refused.to_string())
 }
 
-/// Remember every item id an apply run touched (design §4.2 step 5's `managed.toml`).
+/// Records every item id an apply run touched in `managed.toml`.
 fn record_managed(sys: &dyn System, layout: &Layout, rows: &[ItemReport]) {
     let Ok(mut m) = state::managed(sys, layout) else {
         return;
@@ -367,15 +351,7 @@ fn tail(text: &str, max: usize) -> &str {
 /// The most of each output stream an `exec` row keeps (the end of it).
 const EXEC_KEEP: usize = 64 << 10;
 
-/// `exec` (design §4.6): one argv as root or as a named user, no shell.
-///
-/// The row is how the run travels back, and [`exec_ran`] reads it back: `detail` is
-/// standard output and `why` standard error (each its last 64 KiB, trailing whitespace
-/// trimmed, absent when empty); `to` is `exit <n>`, or `killed` when a signal ended it.
-/// A failed run that printed nothing on standard error says so in `why` (`exit 1`,
-/// `killed by a signal`). A program that never ran (it could not start, it outran its
-/// budget, the port refused it) has no `to`, and `why` says what happened. The outcome
-/// is `changed` on exit 0 and `failed` otherwise.
+/// Runs an `exec` job ([`exec_ran`]).
 fn exec(sys: &dyn System, e: &Envelope) -> Result<ItemReport, String> {
     let x = e
         .exec
@@ -387,8 +363,6 @@ fn exec(sys: &dyn System, e: &Envelope) -> Result<ItemReport, String> {
     if !program.starts_with('/') {
         return Err(format!("exec: {program:?} is not an absolute path"));
     }
-    // Bounded: `Instant + Duration` panics past the clock's range, which would kill the
-    // job without a report.
     let mut cmd = Cmd::new(program)
         .args(args)
         .budget(Duration::from_secs(x.budget_secs.clamp(1, EXEC_BUDGET_MAX)));
@@ -422,12 +396,7 @@ fn exec(sys: &dyn System, e: &Envelope) -> Result<ItemReport, String> {
     Ok(r)
 }
 
-/// The run an [`exec`] row reports, rebuilt from it: the inverse the controller uses to
-/// read a program it ran on a host as if it had run it itself (a person step's probe).
-/// Standard output and error come back as the row kept them: their last 64 KiB, without
-/// trailing whitespace. A failed run whose `why` is only how it ended (`exit 1`, `killed
-/// by a signal`) printed nothing on standard error.
-///
+/// The run an [`exec`] row reports, rebuilt from it.
 /// # Errors
 /// One line when the row says the program never ran (its `why`), or is not an exec row.
 pub fn exec_ran(row: &ItemReport) -> Result<Ran, String> {
@@ -464,8 +433,7 @@ pub fn exec_ran(row: &ItemReport) -> Result<Ran, String> {
     })
 }
 
-/// `rekey`: replace `allowed_signers` with a checked document (design §3.1). Floors stay,
-/// so a principal that returns keeps its floor.
+/// Replaces `allowed_signers` with a checked document.
 fn rekey(sys: &dyn System, layout: &Layout, e: &Envelope) -> Result<ItemReport, String> {
     let text = e
         .rekey
@@ -477,8 +445,6 @@ fn rekey(sys: &dyn System, layout: &Layout, e: &Envelope) -> Result<ItemReport, 
         .ok()
         .and_then(|b| envelope::check_signers(&String::from_utf8_lossy(&b)).ok())
         .unwrap_or_default();
-    // Before the new list can verify anything: a key it names under a new principal must
-    // not start that principal at floor 0.
     state::inherit_floors(sys, layout, &principals)?;
     sys.write_file(&layout.allowed_signers(), text.as_bytes(), 0o644)
         .map_err(|e| format!("{}: {e}", layout.allowed_signers().display()))?;
@@ -488,12 +454,7 @@ fn rekey(sys: &dyn System, layout: &Layout, e: &Envelope) -> Result<ItemReport, 
     Ok(r)
 }
 
-/// The agent executable inside an expanded archive, relative to `dir`: for a bundle,
-/// `<name>.app/Contents/MacOS/aterm`, from `aterm.app` or else the one `.app` at the top
-/// (`ship dev-app`'s `aterm (dev).app`, a renamed copy); else the one regular file at the
-/// top (a dev binary). Enrollment runs the executable the controller names, and its
-/// install refuses one this would not find, so every enrolled agent can be upgraded.
-///
+/// The agent executable inside an expanded archive.
 /// # Errors
 /// One line when the archive holds none of these.
 pub fn find_executable(sys: &dyn System, dir: &Path) -> Result<(PathBuf, bool), String> {
@@ -526,11 +487,7 @@ pub fn find_executable(sys: &dyn System, dir: &Path) -> Result<(PathBuf, bool), 
     }
 }
 
-/// `upgrade` (design §4.5): the archive from the root cache, expanded in the stage,
-/// checked (Developer ID for `app-zip`, the signed hash alone for `dev-zip`), asked its
-/// version, then swapped into `agent/` with the old one kept in `agent.prev/`, and the
-/// sudoers digest rewritten; the archive then leaves the cache. A failed check changes
-/// nothing.
+/// Installs an `upgrade` archive from the root cache.
 fn upgrade(
     sys: &dyn System,
     layout: &Layout,
@@ -569,7 +526,6 @@ fn upgrade(
     let (rel, bundle) = find_executable(sys, &expanded)?;
     match (u.kind.as_str(), bundle) {
         ("app-zip", true) => {
-            // The bundle the executable is in, whatever it is named: the seal covers it.
             let name = rel.iter().next().map(PathBuf::from).unwrap_or_default();
             let app = expanded.join(&name);
             let requirement = format!(
@@ -618,7 +574,6 @@ fn upgrade(
         .map_err(|err| format!("upgrade: {err}"))?;
     let sudoers =
         super::install::check_sudoers(sys, layout, &managed_admin(sys, layout)?, &digest)?;
-    // The swap: agent → agent.prev, payload → agent.
     let old_target = sys.read_link(&layout.exe_link()).ok();
     let old_digest = old_target
         .as_ref()
@@ -636,8 +591,6 @@ fn upgrade(
             .map_err(|err| format!("upgrade: {}: {err}", crate::SUDOERS_FILE))
     });
     if let Err(why) = landed {
-        // The sudoers rule still pins the old agent's digest: a new agent left in place
-        // would be refused every later envelope. Put the old one back.
         let _ = sys.rename(&layout.agent(), &work.join("failed"));
         let _ = sys.rename(&layout.previous(), &layout.agent());
         if let Some(target) = &old_target {
@@ -646,8 +599,6 @@ fn upgrade(
         return Err(format!("{why}; the previous agent was put back"));
     }
     let _ = super::remove_tree(sys, &work);
-    // The archive did its one job: the new agent is in agent/ and the old one in
-    // agent.prev/. Each build would otherwise leave tens of megabytes in the cache.
     let _ = sys.remove(&archive);
     let mut m = state::managed(sys, layout)?;
     let from = std::mem::replace(&mut m.agent_version, version.clone());
@@ -660,15 +611,12 @@ fn upgrade(
         "agent",
         "aterm's helper on this Mac, switched to the controller's build".into(),
     );
-    // Two builds of one version differ only by their executables' hashes.
     let build = |version: &str, digest: &str| match digest.get(..12) {
         Some(short) => format!("{version} ({short})"),
         None => version.to_owned(),
     };
     r.from = Some(build(&from, &old_digest));
     r.to = Some(build(&version, &digest));
-    // `apply` upgrades any host whose agent is not the controller's own build (design
-    // §4.5), so an older aterm's apply brings its own agent back.
     r.revert = Some(format!(
         "`aterm machines apply <host>` from the older aterm puts its agent back; the previous \
          agent stays in {} until the next upgrade",
@@ -677,9 +625,7 @@ fn upgrade(
     Ok(r)
 }
 
-/// Make an expanded archive root's: `ditto -x` as root keeps the owners the zip recorded
-/// (measured in the VM: an archive made by uid 501 on the controller expanded as
-/// `admin:wheel`), and a writable bit for anyone else would fail the path chain.
+/// Make an expanded archive root's.
 pub(crate) fn own_tree(sys: &dyn System, dir: &Path) -> Result<(), String> {
     for cmd in [
         Cmd::new("/usr/sbin/chown")
@@ -795,7 +741,6 @@ mod tests {
         );
         let err = accept(&fake, &layout(), "1-5").unwrap_err();
         assert!(err.contains("not the agent's own"), "{err}");
-        // A world-readable envelope is not one apply wrote.
         let fake = Fake::root();
         fake.stat_of("/A/state/runs/1-5", root_dir());
         fake.file("/A/state/runs/1-5/envelope", b"x");
@@ -853,7 +798,6 @@ mod tests {
         assert_eq!(r.detail.as_deref(), Some("half"));
         assert_eq!(r.why.as_deref(), Some("no\nreally"));
         assert_eq!(r.to.as_deref(), Some("exit 1"));
-        // Never started: no status, and why says what happened.
         let r = exec(&fake, &exec_of(&["/usr/bin/missing"])).unwrap();
         assert_eq!(r.outcome, Outcome::Failed);
         assert_eq!(r.to, None);
@@ -874,7 +818,6 @@ mod tests {
                     stderr: denied.as_bytes().to_vec(),
                 },
             ),
-            // `git config --get` of an unset key: exit 1 and nothing printed at all.
             (["/usr/bin/git", "config"], Ran::exit(1, "")),
             (
                 ["/bin/sleep", "60"],
@@ -897,7 +840,6 @@ mod tests {
                 .as_deref(),
             Some("killed")
         );
-        // A program that never ran has no run to read back.
         let row = exec(&fake, &exec_of(&["/usr/bin/missing"])).unwrap();
         assert_eq!(exec_ran(&row), Err(row.why.clone().unwrap()));
         let mut other = row;
@@ -924,7 +866,6 @@ mod tests {
     #[test]
     fn a_key_rekeyed_under_a_new_principal_keeps_its_floor() {
         let fake = Fake::root();
-        // `signing@ctl` has consumed serials up to 7.
         fake.file(
             "/A/state/floors.toml",
             b"[[floor]]\nprincipal = \"signing@ctl\"\nserial = 7\n",
@@ -935,7 +876,6 @@ mod tests {
             "daily@ctl namespaces=\"aterm-machines\" ssh-ed25519 {blob}\n"
         ));
         rekey(&fake, &layout(), &e).unwrap();
-        // Envelopes that key signed as signing@ctl (serials 1–7) do not replay as daily@ctl.
         let floors = state::floors_or_refuse(&fake, &layout()).unwrap();
         assert_eq!(state::floor_of(&floors, "daily@ctl"), 7);
         let calls = fake.calls();
@@ -979,7 +919,6 @@ mod tests {
 
     #[test]
     fn a_bundle_of_any_name_is_found_when_it_is_the_only_one_and_holds_aterm() {
-        // `ship dev-app`'s bundle, as `ditto -c -k --keepParent` archives it.
         let fake = Fake::root();
         listed_dir(&fake, "/P/aterm (dev).app");
         fake.file("/P/aterm (dev).app/Contents/MacOS/aterm", b"x");
@@ -987,19 +926,16 @@ mod tests {
             find_executable(&fake, Path::new("/P")).unwrap(),
             (PathBuf::from("aterm (dev).app/Contents/MacOS/aterm"), true)
         );
-        // Two bundles, neither aterm.app: which one is the agent is not the agent's guess.
         listed_dir(&fake, "/P/Other.app");
         fake.file("/P/Other.app/Contents/MacOS/aterm", b"y");
         assert!(find_executable(&fake, Path::new("/P")).is_err());
-        // One bundle without Contents/MacOS/aterm is not an agent.
         let fake = Fake::root();
         listed_dir(&fake, "/P/Other.app");
         fake.file("/P/Other.app/Contents/MacOS/other", b"x");
         assert!(find_executable(&fake, Path::new("/P")).is_err());
     }
 
-    /// A host mid-upgrade: the archive cached, `ditto` expanded it into the stage with the
-    /// new agent at `rel` inside it, and the expansion is root's (or not, per `exe_uid`).
+    /// A host mid-upgrade.
     fn upgrading_at(rel: &str, exe_uid: u32) -> (Fake, Envelope) {
         let fake = Fake::root();
         let mut hasher = aterm_digest::Sha256::new();
@@ -1085,7 +1021,6 @@ mod tests {
         let (fake, e) = upgrading(0);
         let r = upgrade(&fake, &layout(), &e, "1-5").unwrap();
         assert_eq!(r.outcome, Outcome::Changed);
-        // The revert names where the previous agent is.
         let revert = r.revert.unwrap();
         assert!(revert.contains("/A/agent.prev"), "{revert}");
         let calls = fake.calls();
@@ -1108,7 +1043,6 @@ mod tests {
             .sha256(Path::new("/A/agent/aterm-machines-dev"))
             .unwrap();
         assert!(sudoers.contains(&format!("sha256:{digest} ")), "{sudoers}");
-        // The archive is not kept: the cache would grow by one archive a build.
         assert!(rule < at(&format!("remove {}", cached_archive(&e))));
         assert!(fake.written(&cached_archive(&e)).is_none());
     }
@@ -1141,7 +1075,6 @@ mod tests {
             )),
             crate::port::shell_word("/A/stage/upgrade-1-5/payload/aterm (dev).app"),
         );
-        // A locally signed bundle: not the team's.
         fake.on(
             &codesign,
             Ran::exit(
@@ -1154,7 +1087,6 @@ mod tests {
         let calls = fake.calls();
         assert!(calls.contains(&codesign), "{calls:#?}");
         assert!(!calls.iter().any(|c| c.starts_with("rename")), "{calls:#?}");
-        // A refused upgrade keeps its archive: the next apply sends the same one.
         assert!(fake.written(&cached_archive(&e)).is_some());
     }
 

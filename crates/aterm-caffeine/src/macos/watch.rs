@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Update watch: whether the mug's origin code was replaced, so it can end with
-//! [`crate::launchd::EXIT_RESTART`].
+//! Update watch: exits with [`crate::launchd::EXIT_RESTART`] when the mug binary is replaced.
 
 use std::path::{Path, PathBuf};
 
 use crate::code::code_fingerprint;
 
-/// What the origin's code looked like when read ([`code_fingerprint`]).
 type Print = Vec<u8>;
 
 /// The print the mug started with, and the rule that says when the code changed.
 #[derive(Debug)]
 pub(super) struct Watch {
-    /// The executable the mug was started as.
     origin: PathBuf,
     baseline: Option<Print>,
 }
@@ -35,10 +32,6 @@ impl Watch {
     }
 }
 
-/// The rule [`Watch::replaced`] applies to `baseline`, the print `now` and a second read
-/// `again`: a print that cannot be read says nothing (an update in the middle of its swap is
-/// read at the next tick); with no baseline the first clean read becomes it; a changed print
-/// counts only when a second read agrees with it, so a half-written file is not a new build.
 fn replaced(
     baseline: &mut Option<Print>,
     now: Option<Print>,
@@ -91,8 +84,6 @@ mod tests {
         assert!(replaced(&mut base, plist("2"), || plist("2")));
     }
 
-    /// The watch on a bundle's executable: its Info.plist is the print; a bundle with none yet
-    /// (the middle of a swap) takes the first one read as its baseline.
     #[test]
     fn a_bundles_new_info_plist_is_a_new_build() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -110,9 +101,6 @@ mod tests {
         assert!(watch.replaced());
     }
 
-    /// The baseline is the running copy's code, not the origin's as it reads at the start: an
-    /// update landed while the copy was made and first run is a replaced origin. NEGATIVE
-    /// CONTROL: a watch taking the origin's print at its start never restarts onto it.
     #[test]
     fn an_update_during_the_copys_first_exec_is_a_replaced_origin() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");

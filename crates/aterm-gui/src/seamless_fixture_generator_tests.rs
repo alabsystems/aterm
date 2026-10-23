@@ -3605,7 +3605,7 @@ fn fx_agent(
 }
 
 /// THE STATE A SESSION, ITS WINDOW AND ITS DESK CARRY BESIDE THE SCREENS
-/// (v0.108.0 on's U10): every field the producer writes
+/// (v0.108.0 on): every field the producer writes
 /// only for a session someone supervises, escalates, halts, subscribes or
 /// tasks, a window someone zoomed, warned or posted to, and a desk with a
 /// bridge `fabric attach` armed — the shapes no other desk carries, each
@@ -4179,9 +4179,8 @@ fn fx_two_drawers(flavour: u8) -> Terminal {
     t
 }
 
-/// THE ENGINE STATE A CARRIED SCREEN HOLDS BEYOND ITS CELLS (v0.108.0 on;
-/// 's U10), one session for each shape no other desk carries,
-/// each its own tab:
+/// THE ENGINE STATE A CARRIED SCREEN HOLDS BEYOND ITS CELLS (v0.108.0 on),
+/// one session for each shape no other desk carries, each its own tab.
 fn fx_engine_state_desk() -> FxDesk {
     use crate::restore::RestoreManifest;
     let cwd = "/home/dev/src/aterm";
@@ -4327,7 +4326,7 @@ fn fx_engine_state_desk() -> FxDesk {
     }
 }
 
-/// A DESK PAST THE LAYOUT'S WINDOW CAP (v0.108.0 on's U10): a
+/// A DESK PAST THE LAYOUT'S WINDOW CAP (v0.108.0 on): a
 /// shell in front, and behind it a document in each of [`MAX_WINDOWS`] windows
 /// — the config open in the Editor with two selections, notes read in Markdown,
 /// one with a passage selected — so the capture folds the last window's tab
@@ -4406,8 +4405,8 @@ fn fx_fold_desk() -> FxDesk {
     }
 }
 
-/// EVERY VARIANT A CARRIED ENUM TAKES THAT NO OTHER DESK DOES (v0.108.0 on;
-/// 's U10), each as a program or the host sets it:
+/// EVERY VARIANT A CARRIED ENUM TAKES THAT NO OTHER DESK DOES (v0.108.0 on),
+/// each as a program or the host sets it.
 fn fx_variants_desk() -> FxDesk {
     use crate::restore::{
         PlaceholderLeafRestore, RestoreBranch, RestoreManifest, RestoredSplitTree, RestoredTab,
@@ -4585,7 +4584,7 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 
 /// THE CARRIED FIELDS AND VARIANTS NO HANDOFF WRITES, so no desk can: each one
 /// the update's producer never sets (written by another writer of its struct,
-/// retired, or set by nothing in this build), beside why.
+/// retired, or set by nothing in this build).
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("control", "Wire.turn_ids"),
     ("manifest", "WindowCarry.presence_row"),

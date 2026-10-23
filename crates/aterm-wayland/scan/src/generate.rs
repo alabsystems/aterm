@@ -28,8 +28,6 @@ pub const FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The most signature arguments a message whose arguments name no interface
-/// may have: the length of `crate::iface::NULLS`.
 const NULLS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -195,9 +193,6 @@ fn read(dir: &Path, file: &str, copying: &str) -> Result<Protocol, String> {
     })
 }
 
-/// wayland-scanner's signature: the since-version when above 1, then per
-/// argument `?` for a nullable one and its type code; a `new_id` without an
-/// interface is `sun` (the interface's name, its version, the id).
 fn signature(m: &Msg) -> String {
     let mut s = String::new();
     if m.since > 1 {
@@ -248,7 +243,6 @@ fn konst(name: &str) -> String {
     }
 }
 
-/// A summary as one doc line: no rustdoc link or HTML syntax.
 fn doc(s: &str) -> String {
     let words = s.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = String::with_capacity(words.len());
@@ -261,7 +255,6 @@ fn doc(s: &str) -> String {
     out
 }
 
-/// Where each interface's module lives.
 fn paths(protocols: &[Protocol]) -> Vec<(String, String)> {
     protocols
         .iter()
@@ -523,9 +516,6 @@ fn header(p: &Protocol) -> String {
     h
 }
 
-/// The tables live in one inline module the formatter skips (a
-/// `#[rustfmt::skip]` on an item is stable, an inner one is not), re-exported
-/// whole, so the generator's layout is the committed one.
 const OPEN: &str = "pub use self::tables::*;\n\n#[rustfmt::skip]\nmod tables {\n";
 const CLOSE: &str = "}\n";
 

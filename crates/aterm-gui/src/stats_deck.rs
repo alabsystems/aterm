@@ -673,7 +673,7 @@ fn period_ix(strip: &Strip) -> usize {
 }
 
 /// Which amount ladder a table draws (§6.0 "Amount ladders").
-fn ladder_ix(details: bool, cols: bool) -> usize {
+const fn ladder_ix(details: bool, cols: bool) -> usize {
     match (details, cols) {
         (true, _) => 0,
         (false, true) => 1,
@@ -797,7 +797,7 @@ struct HeadState<'w> {
 }
 
 /// A state's ink: the mark's ink its words take in the deck's rows and the lens's answer line (§9.3).
-pub(crate) fn kind_ink(i: &VitalsInks, k: InkKind) -> Rgb {
+pub(crate) const fn kind_ink(i: &VitalsInks, k: InkKind) -> Rgb {
     match k {
         InkKind::Words => i.words,
         InkKind::Words2 => i.words2,
@@ -902,7 +902,7 @@ impl<'a> Deck<'a> {
 
     /// The boxes T-G4 checks are recorded only under test.
     #[cfg(not(test))]
-    fn note(&mut self, _: BoxKind, _: [f64; 4], _: &str, _: Option<(f64, f64)>) {}
+    const fn note(&mut self, _: BoxKind, _: [f64; 4], _: &str, _: Option<(f64, f64)>) {}
 
     fn ink(&self, k: InkKind) -> Rgb {
         kind_ink(&self.inks, k)
@@ -927,7 +927,7 @@ impl<'a> Deck<'a> {
     }
 
     /// A scope's ink, its `_ic` variant under Increase Contrast (§9.4).
-    fn scope_ink(&self, bar: Bar) -> Rgb {
+    const fn scope_ink(&self, bar: Bar) -> Rgb {
         let i = &self.inks;
         match (bar, self.ic) {
             (Bar::Global, false) => i.machine,

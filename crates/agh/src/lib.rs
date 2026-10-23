@@ -2,19 +2,12 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro under
-// them (build.rs; crates/aterm-spec-anchor/anchor_rules.rs). Every anchor is a test and debug
-// item, so a release build names no such feature, as aterm-core's root does.
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 #![forbid(unsafe_code)]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![warn(missing_docs)]
 
-//! agh: aterm's GitHub client (docs/DESIGN-agh-2026-10-19.md). The library is the client:
-//! routed identities, the one Authorization door, typed outcomes, complete listings and
-//! checked downloads. The CLI (`cli`, run as `aterm agh` or argv0 `agh`) is a thin layer
-//! over it, and nothing in the library prints. Every clock read, sleep and round trip
-//! crosses one effect seam (`fx`), so a CLI run can be taped and replayed offline.
+//! `agh`: `aterm`'s GitHub client with routed identities, typed outcomes, and checked downloads.
 
 pub mod classify;
 pub mod cli;

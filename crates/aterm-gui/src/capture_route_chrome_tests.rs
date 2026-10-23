@@ -10,10 +10,8 @@ use std::time::{Duration, Instant};
 
 const WID: WindowId = WindowId(0);
 
-/// A wait for a reply that must come: a hang detector, not a latency budget.
 const HANG: Duration = Duration::from_secs(60);
 
-/// The route shapes a window can show.
 #[derive(Clone, Copy, Debug)]
 enum Shape {
     TerminalSingle,
@@ -40,9 +38,6 @@ impl Shape {
     }
 }
 
-/// A scripted app (`crate::scripted_redraw_fixture`) whose front window shows
-/// `shape`. Its captures run without the surface (`headless`), so each
-/// rasterizes its own frame.
 fn shaped(shape: Shape) -> App {
     let mut app = scripted_app();
     match shape {
@@ -65,7 +60,6 @@ fn shaped(shape: Shape) -> App {
     app
 }
 
-/// Present the front window through the real redraw and return its glass.
 fn present(app: &mut App) -> Vec<u32> {
     let serial = app.windows[&WID].capture_present_serial;
     app.windows.get_mut(&WID).expect("window").last_present = None;
@@ -78,7 +72,6 @@ fn present(app: &mut App) -> Vec<u32> {
     glass(app).1
 }
 
-/// A headless `image` of the front window: `(width, height, rgba)`.
 fn image(app: &mut App) -> (usize, usize, Vec<u8>) {
     headless(app, image_now)
 }
@@ -106,7 +99,6 @@ fn image_now(app: &mut App) -> (usize, usize, Vec<u8>) {
     (width, height, rgba)
 }
 
-/// A headless SIGUSR1 snapshot of the front window, written and published.
 fn snapshot(app: &mut App) {
     headless(app, snapshot_now);
 }
@@ -131,7 +123,6 @@ fn snapshot_now(app: &mut App) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Whether a capture ran the present's layers in the present's order.
 fn one_order(present: &[ChromeStep], capture: &[ChromeStep]) -> bool {
     present == capture
 }
@@ -198,8 +189,6 @@ fn every_route_layers_chrome_through_one_composition() {
     );
 }
 
-/// The footer, Autopilot-menu and link steps the native present gained write
-/// nothing on a frame with no terminal leaf.
 #[test]
 fn native_present_is_unchanged_by_the_footer_menu_and_link_steps() {
     const STEPS: [ChromeStep; 3] = [
@@ -261,7 +250,6 @@ fn native_present_is_unchanged_by_the_footer_menu_and_link_steps() {
     );
 }
 
-/// A headless capture layers what the glass layers: the configured wallpaper.
 #[test]
 fn headless_capture_shows_the_wallpaper() {
     let mut app = scripted_app();
@@ -292,8 +280,6 @@ fn headless_capture_shows_the_wallpaper() {
     assert_ne!(bare, papered, "the wallpaper is in the capture");
 }
 
-/// The terminal present paints the bell and the overlay `host_visual_state`
-/// resolves at its frame clock, and commits them beside its serial.
 #[test]
 fn terminal_present_visuals_equal_host_visual_state() {
     let mut app = scripted_app();

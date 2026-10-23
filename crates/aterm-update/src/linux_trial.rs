@@ -27,7 +27,9 @@ pub(crate) fn start_rolls_back(starts: u32, previous_start_unix: i64, now_unix: 
     starts > crate::LINUX_TRIAL_LAUNCHES && !start_is_young(previous_start_unix, now_unix)
 }
 
-/// The stamp the start just counted (`starts` includes it) leaves for the next start to be judged.
+/// The stamp the start just counted (`starts` includes it) leaves for the next start to be
+/// judged against ([`start_rolls_back`]): its own time while the trial is within its
+/// budget, the stamp as it stood once past it.
 #[inline]
 pub(crate) fn start_stamp<T>(starts: u32, previous_start: T, now: T) -> T {
     if starts <= crate::LINUX_TRIAL_LAUNCHES {
@@ -91,7 +93,7 @@ pub(crate) const LOST_STAMP_SPARES: u32 = 8;
 pub(crate) enum Lane {
     /// The GUI entry with a window.
     Window,
-    /// An interactive terminal session.
+    /// An interactive terminal session, or a `--headless` instance.
     Session,
 }
 

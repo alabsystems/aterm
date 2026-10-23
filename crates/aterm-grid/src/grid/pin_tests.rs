@@ -6,9 +6,6 @@
 
 use crate::Grid;
 
-/// A restore continues the source's numbering: the counter moves to the
-/// carried value, bounded below by what the grid holds and above by the
-/// overflow ceiling.
 #[test]
 fn continue_absolute_numbering_is_bounded_both_ways() {
     let mut grid = Grid::new(4, 10);

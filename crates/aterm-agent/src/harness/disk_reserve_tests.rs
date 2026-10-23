@@ -6,9 +6,6 @@
 use super::*;
 use crate::harness::disk::tests::Tmp;
 
-/// THE RESERVE IS WRITTEN, KEPT AND RELEASED: `ensure` writes it whole (its
-/// blocks allocated, mode 0600) once and then leaves it; `release` unlinks
-/// it and says what it held; a second release finds nothing.
 #[test]
 fn the_reserve_is_written_once_and_released_by_one_unlink() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -43,9 +40,6 @@ fn the_reserve_is_written_once_and_released_by_one_unlink() {
     );
 }
 
-/// NEGATIVE CONTROLS: a link in the reserve's place (to a victim file) and a
-/// folder that is a link are refused by both `release` and `ensure`; the
-/// victim survives byte for byte, and so does the link.
 #[test]
 fn a_link_in_the_reserves_place_is_never_followed_or_removed() {
     let tmp = Tmp::new("reserve-link");
@@ -85,11 +79,6 @@ fn a_link_in_the_reserves_place_is_never_followed_or_removed() {
     );
 }
 
-/// ONE PASS AT A TIME: the pass lock beside the reserve is taken without
-/// waiting, and a second taker (another instance's watch: a second open, as
-/// another process makes) finds it held; once the first lets go, by `LOCK_UN`,
-/// the next takes it. NEGATIVE CONTROL: a link planted at the lock's name is
-/// never followed.
 #[test]
 fn the_pass_lock_lets_one_pass_run_at_a_time() {
     let tmp = Tmp::new("pass-lock");

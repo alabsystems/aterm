@@ -223,6 +223,25 @@ mod sys {
 }
 
 /// Declare a table of entry points read from one [`Library`].
+///
+/// ```
+/// aterm_dl::table! {
+///     /// Two libc entry points.
+///     pub struct Clock {
+///         getpid = c"getpid": unsafe extern "C" fn() -> i32;
+///     }
+///     optional {
+///         gettid = c"gettid": unsafe extern "C" fn() -> i32;
+///     }
+/// }
+/// static LIBC: &[&std::ffi::CStr] = &[c"libc.so.6"];
+/// if let Ok(lib) = aterm_dl::Library::open(LIBC) {
+///     // SAFETY: both rows are glibc's prototypes.
+///     let clock = unsafe { Clock::load(&lib) }.unwrap();
+///     // SAFETY: getpid takes nothing and cannot fail.
+///     assert!(unsafe { (clock.getpid)() } > 0);
+/// }
+/// ```
 #[macro_export]
 macro_rules! table {
     (

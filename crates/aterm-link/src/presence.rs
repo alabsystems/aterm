@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 /// Minimum time between two presence records for one session.
 pub const REPUBLISH_MIN: Duration = Duration::from_secs(2);
 
-/// [`REPUBLISH_MIN`] at test pace: a quarter, as the round it is matched to
-/// runs a quarter (`bridge.rs`'s `FAST_ROSTER_REFRESH`), so a change inside the
+/// [`REPUBLISH_MIN`] at test pace: a tenth, as the round it is matched to
+/// runs a tenth (`bridge.rs`'s `FAST_ROSTER_REFRESH`), so a change inside the
 /// window is still carried by the next round and a row still costs at most one
 /// record per session per round.
-const FAST_REPUBLISH_MIN: Duration = Duration::from_millis(500);
+const FAST_REPUBLISH_MIN: Duration = Duration::from_millis(200);
 
 /// The republish window in this process: [`REPUBLISH_MIN`], or
 /// [`FAST_REPUBLISH_MIN`] when the bridge runs at test pace

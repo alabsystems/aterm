@@ -54,10 +54,6 @@ pub fn exit_of(door: &Door<'_>, cmd: &str) -> Option<i64> {
     block_exit(json, cmd)
 }
 
-/// The stub's dumps of the turns (`req-NNNNN.json`), newest index first:
-/// never a side call's (`side-NNNNN.json`, [`crate::stub::is_side`]), whose
-/// copy of the conversation — a Muse Code reminder observer's carries the
-/// harness's continuation and its words — is no request of the turn's.
 fn dumps(run: &Run) -> Vec<(u64, PathBuf)> {
     crate::stub::turn_dumps(&run.w.join("dump"))
 }
@@ -127,7 +123,6 @@ pub fn lines_since(log: &str, ms: i64) -> Vec<String> {
         .collect()
 }
 
-/// The instance's own log lines (`logs/aterm.log`) stamped at or after `ms`.
 fn host_log_since(run: &Run, ms: i64) -> Vec<String> {
     lines_since(
         &crate::util::scratch_text(&run.state().join("logs/aterm.log")),
@@ -196,8 +191,6 @@ pub fn unobserved(what: &str, why: &str, list: &mut Vec<String>) {
 mod tests {
     use super::*;
 
-    /// A program's words are read by its path, spaces and all. NEGATIVE
-    /// CONTROLS: another program, a path that only begins like it.
     #[test]
     fn a_programs_words_are_read_by_its_path() {
         let bin = "/Users//u/Library/Application Support/aterm/pkg/store/agy/1/bin/agy";
@@ -208,8 +201,6 @@ mod tests {
         assert_eq!(words_of(&format!("{bin}-x --effort high"), bin), None);
     }
 
-    /// The exit of the newest finished block running a command. NEGATIVE
-    /// CONTROLS: a block still running, another command's, no blocks.
     #[test]
     fn a_blocks_exit_is_read_by_its_command() {
         let json = r#"{"blocks":[{"id":1,"state":"complete","exit":137,"cmdline":"sh /r/muse.sh"},{"id":2,"state":"complete","exit":0,"cmdline":" ( cd -- '/w' && exec '/p/agents/muse' 'resume' 's1' )"},{"id":3,"state":"executing","exit":null,"cmdline":"sh /r/muse.sh resume s1"}]}"#;
@@ -219,9 +210,6 @@ mod tests {
         assert_eq!(block_exit(r#"{"blocks":[]}"#, "muse"), None);
     }
 
-    /// The host's log is read from a stamp on, its decision found by its
-    /// words. NEGATIVE CONTROLS: a line before the stamp, a line with no
-    /// stamp.
     #[test]
     fn the_hosts_log_is_read_from_a_stamp_on() {
         let log = "1792253947.285 96443 INFO h: harness @s-1: the agent exited; read at the exit: removed\n\

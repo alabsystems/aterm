@@ -476,6 +476,7 @@ pub fn deadline<D: Desk>(d: &D, now: Instant) -> Option<Instant> {
         }
     };
     d.each_view(&mut |w, v| {
+        // An occluded, minimized or headless window's pill is read by
         // nobody, so its age arms nothing (`chrome` composes it at the read).
         if v.pill.as_ref().is_some_and(|p| p.since.is_some()) && d.pill_visible(w) {
             fold(v.pill_due.map_or(now, |x| x.max(now)));

@@ -40,9 +40,7 @@ fn refused() -> Answered {
     ))
 }
 
-/// Each first request is refused. Exactly the policy-aware advance succeeds,
-/// except for the repeated-refusal control. Later automatic work must retain
-/// its boundary. Unexpected prompts remain visible as their own request tag.
+/// Each first request is refused.
 pub fn answer(body: &J, leg: &str) -> Option<Answered> {
     if !matches!(
         leg,

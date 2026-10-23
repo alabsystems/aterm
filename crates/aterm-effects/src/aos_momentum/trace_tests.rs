@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The trace file: it round-trips, a cut or altered byte anywhere is refused, and a replay on
-//! another epoch reaches the recorded head or is refused naming what it reached instead.
+//! Trace file round-trip, tamper refusal, and replay verification tests.
 
 use aterm_aos::Digest;
 use aterm_aos::log::{EventLog, LogFault, Tail};
@@ -16,7 +15,6 @@ use super::{
     TRACE_FILE_MAGIC, TraceFault,
 };
 
-/// A shipped glow typed into (eight keys) and run until its lane parks.
 fn typed(t0: Instant) -> MomentumHost {
     let mut host = attached(t0, MomentumCode::Shipped);
     let c = cfg(true);
@@ -27,7 +25,6 @@ fn typed(t0: Instant) -> MomentumHost {
     host
 }
 
-/// The same trace with its log replaced by `log` (re-encoded under the trace's schema).
 fn with_log(
     trace: &MomentumTrace,
     schema: &MomentumSchema,
@@ -152,7 +149,6 @@ fn a_trace_whose_log_is_unsealed_broken_or_of_another_checkpoint_is_refused() {
     let schema = b.schema();
     let log = b.log().expect("attached");
 
-    // The seal is the log's last record: without it the log is unsealed.
     let cut = trace.log.len() - seal_record_len(&trace);
     let unsealed = MomentumTrace {
         log: trace.log[..cut].to_vec(),
@@ -163,7 +159,6 @@ fn a_trace_whose_log_is_unsealed_broken_or_of_another_checkpoint_is_refused() {
         Some(TraceFault::Tail(Tail::Unsealed { events: log.len() }))
     );
 
-    // A broken log decodes, but no replay of it is the live run.
     let mut broken = EventLog::<MomentumSchema>::new(log.header().clone(), 1 << 16);
     for ev in log.inputs() {
         broken.push(*ev).expect("room");
@@ -178,7 +173,6 @@ fn a_trace_whose_log_is_unsealed_broken_or_of_another_checkpoint_is_refused() {
         })
     );
 
-    // The same log beside another window's checkpoint.
     let other = typed_other(t0);
     let paired = MomentumTrace {
         checkpoint: other.checkpoint.clone(),
@@ -202,8 +196,6 @@ fn a_trace_whose_log_is_unsealed_broken_or_of_another_checkpoint_is_refused() {
     );
 }
 
-/// A host whose ancestor checkpoint differs from [`typed`]'s: attached after one key, so its
-/// checkpoint holds a glow that has seen a key.
 fn typed_other(t0: Instant) -> MomentumTrace {
     let mut glow = MomentumHost::default();
     glow.on_key(t0 + ms(1), super::test_fixtures::TAU);
@@ -212,8 +204,6 @@ fn typed_other(t0: Instant) -> MomentumTrace {
     glow.aos_trace().expect("attached")
 }
 
-/// How many bytes the log's seal record takes: the log less its sealless prefix, found as the
-/// longest cut that decodes `Unsealed` with every event.
 fn seal_record_len(trace: &MomentumTrace) -> usize {
     let schema = MomentumSchema::new(Instant::now());
     let ancestor = aterm_aos::checkpoint::Checkpoint::decode(&trace.checkpoint)
@@ -254,7 +244,6 @@ fn right_after_a_commit_the_trace_is_the_new_checkpoint_with_the_empty_chain() {
     let r = trace.replay(t0, BUILD).expect("the fresh log replays");
     assert_eq!(r.counts, EventCounts::default());
     assert_eq!(r.state_digest, trace.head_state);
-    // The first input after the commit starts the chain of the fresh log.
     let _ = host.next_change_deadline(end + ms(1), LANE);
     let trace = host.aos_trace().expect("attached");
     assert_ne!(trace.head_chain, empty_chain());

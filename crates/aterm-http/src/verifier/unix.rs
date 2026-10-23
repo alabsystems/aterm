@@ -80,6 +80,7 @@ const CERTIFICATE_DIRS: &[&str] = &["/etc/ssl/certs"];
 /// so the tests need not mutate the process environment.
 fn bundle_file(configured: Option<PathBuf>) -> Option<PathBuf> {
     if configured.is_some() {
+        // A set variable suppresses the built-in search even when its path is
         // missing.
         return configured.filter(|path| path.exists());
     }
@@ -107,6 +108,7 @@ fn bundle_dirs(configured: Option<PathBuf>) -> Vec<PathBuf> {
 
 /// Decode every certificate in one PEM file, tolerating anything else in it.
 fn read_pem_file(path: &Path, out: &mut Vec<Vec<u8>>) {
+    // An unreadable or non-UTF-8 file contributes nothing; only an empty store
     // overall (`Verifier::from_ders`) is a failure.
     if let Ok(text) = std::fs::read_to_string(path) {
         out.extend(crate::pem::decode_certificates_lossy(&text));

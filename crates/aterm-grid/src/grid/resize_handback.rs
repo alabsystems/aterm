@@ -48,7 +48,7 @@ impl ResizeLaw {
     }
 }
 
-/// The edge moves a resize the other way undoes first (see the module doc).
+/// The edge moves a resize the other way undoes first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Edge {
     /// Nothing owed.
@@ -302,6 +302,8 @@ impl Edge {
                         seams,
                     }
                 } else {
+                    // Trims or demotes after pushes (a blank row the pushes
+                    // left at the bottom, or output between): the older
                     // moves are forgotten.
                     fresh_only
                 }
@@ -324,6 +326,7 @@ impl Edge {
                         seams,
                     }
                 } else {
+                    // Trims after demotes (output drew a blank tail between):
                     // the older moves are forgotten.
                     fresh_only
                 }
@@ -394,6 +397,7 @@ impl Edge {
                         above: appended_fresh,
                     }
                 } else {
+                    // Reveals after appends (output scrolled history in
                     // between): the older moves are forgotten.
                     Self::revealed(revealed_fresh, appended_fresh)
                 }

@@ -59,7 +59,7 @@ struct Weighed {
     verdict: Option<TrustedRoster>,
 }
 
-/// Verify-then-select over `candidates` (see the module docs).
+/// Verify-then-select over `candidates`.
 #[must_use]
 pub fn select_index(
     anchor: &Anchor,

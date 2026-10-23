@@ -139,6 +139,8 @@ pub fn admit_roster(
     now_unix: i64,
 ) -> Result<TrustedRoster, Reject> {
     // Step 1, the direction that must never invert. `verify_roster` refuses an empty keyset
+    // too; stated here because skipping and accepting every candidate are one negated
+    // condition apart.
     if !anchor.is_armed() {
         return Err(Reject::Disabled);
     }
@@ -233,6 +235,7 @@ impl TrustedIndex {
     #[must_use]
     pub fn authorizing_seq(&self) -> u64 {
         // An index that declares no generation cannot waive a generation floor: 0 is never
+        // strictly greater than a recorded floor.
         self.index.roster_seq.unwrap_or(0)
     }
 

@@ -15,12 +15,9 @@ use agh_fake::{AssetSpec, Change, FakeGithub, ReleaseSpec, RepoSpec};
 
 use crate::common;
 
-/// The repository most tests read: public, the dev bot holding push.
 const APP: &str = "fixture-dev/app";
-/// A public repository on which the dev bot holds pull only.
 const PULLED: &str = "fixture-dev/pulled";
 
-/// A fake, its scratch root and a client over the canonical config with both token files.
 struct World {
     _root: aterm_tempfile::TempDir,
     fake: FakeGithub,
@@ -47,7 +44,6 @@ impl World {
         self.fake.add_release(repo, spec)
     }
 
-    /// `GET /repos/{repo}` requests seen so far.
     fn repo_reads(&self, repo: &str) -> usize {
         let path = format!("/repos/{repo}");
         self.fake

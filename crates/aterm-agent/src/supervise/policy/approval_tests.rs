@@ -1449,7 +1449,7 @@ const OLD_GRANT: &str = "Use your reset now (2 left, until Oct 5)";
 const WEEKLY_RESET: &str = "Reset your session limit now";
 const WAIT_OCT_9: &str = "Wait here, then continue automatically at Oct 9 at 5am";
 
-/// `ctx` with `[harness] limit_reset`.
+/// `ctx` with `[harness] limit_reset` on.
 fn resetting(ctx: ApprovalCtx) -> ApprovalCtx {
     ApprovalCtx {
         limit_reset: true,
@@ -2134,6 +2134,7 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
             if head == "off" {
                 unread(&d, &what);
             } else {
+                // A dialog of no kind aterm reads, its title on the screen:
                 // declined, never spent and never allowed.
                 assert_eq!(approved(&d), Some(RULE_DECLINE), "{what}: {d:?}");
             }
@@ -2571,7 +2572,7 @@ fn the_claude_tmp_root_is_the_uids_own() {
     }
 }
 
-/// The trust dialog's rows for `folder` in place of the captured.
+/// The trust dialog's rows for `folder` in place of the captured one's.
 fn trust_rows(folder: &str) -> Vec<String> {
     lines(CAP_TRUST)
         .into_iter()
@@ -4363,7 +4364,7 @@ fn full_power_answers_agy_boxes_by_role() {
     );
 }
 
-/// Gemini CLI's screens (measured on 0.46.0) under `node`, the name its process runs.
+/// Gemini CLI's screens (measured on 0.46.0) under `node`, the name its process runs as.
 fn gemini_box(fixture: &str) -> (Vec<String>, Decision) {
     let rows = phase_fixtures::screen(fixture);
     let d = decide_screen(Some("node"), &rows, &full()).expect("a box");
@@ -6952,7 +6953,8 @@ fn a_fixed_refusal_label_under_the_focus_is_no_open_input() {
 /// A real 527-line Bash command.
 pub(crate) const OWNER_COMMAND: &str = include_str!("fixtures/owner-bash-command-2026-09-24.txt");
 
-/// The captured screen's width, and the command.
+/// The captured screen's width, and the command text's: a command with a
+/// newline is drawn as `   │ ` rows inside the dialog's padding.
 const WIDTH: usize = 160;
 const TEXT_WIDTH: usize = 152;
 

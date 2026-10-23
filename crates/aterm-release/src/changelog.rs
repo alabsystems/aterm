@@ -119,6 +119,7 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
 
 /// Roll `## [Unreleased]` → `## [<version>] - <date>` (spec §3): the new heading is inserted right below the Unreleased header with one blank line between — the whole current body changes ownership to the release and a fresh EMPTY `[Unreleased]` scaffold is what remains on top.
 pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
+    // Double-roll guard: a second `## [X.Y.Z]` would split the notes across two headings,
     // and recut detection keys on this section's presence.
     if has_section(text, version) {
         return Err(Error::new(format!(
@@ -150,7 +151,14 @@ pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
     Ok(rolled)
 }
 
-/// The two changelogs a release claim writes, from the published commit's `source` and main's current `main`:
+/// The two changelogs a release claim writes, from the published commit's `source` and
+/// main's current `main`:
+///
+/// * the release commit's: `source` rolled ([`roll`]), so the notes that ship are exactly
+///   the entries the published commit carried (taken as it stands if already rolled);
+/// * main's: [`roll_shipped`], the same section with the same shipped body, while main's
+///   `[Unreleased]` keeps every entry added after the publish, for the next release
+///   (taken as it stands if it already has the section, from an earlier wedged claim).
 pub fn claim_changelogs(
     source: &str,
     main: &str,

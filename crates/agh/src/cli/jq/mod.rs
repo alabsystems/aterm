@@ -88,7 +88,6 @@ pub(crate) struct FuncSpec {
     pub(crate) func: Func,
 }
 
-/// A function row.
 const fn f(name: &'static str, arities: &'static [usize], func: Func) -> FuncSpec {
     FuncSpec {
         name,
@@ -144,7 +143,6 @@ pub(crate) struct RefusedJq {
     pub(crate) next: &'static str,
 }
 
-/// A refusal row.
 const fn r(names: &'static [&'static str], next: &'static str) -> RefusedJq {
     RefusedJq { names, next }
 }
@@ -223,35 +221,28 @@ pub(crate) static DIVERGENCES: &[&str] = &[
 /// Maximum nesting depth for `jq` expressions.
 pub(crate) const MAX_DEPTH: usize = 128;
 
-/// `jq: the program nests deeper than {MAX_DEPTH} at byte {at}`.
 fn too_deep(at: usize) -> Error {
     syntax(&format!("the program nests deeper than {MAX_DEPTH}"), at)
 }
 
-/// The help next of every jq error that has no rewrite of its own.
 const HELP_JQ: &str = "agh help jq";
 
-/// `jq: {what} at byte {offset}`.
 fn syntax(what: &str, at: usize) -> Error {
     Error::usage(format!("jq: {what} at byte {at}")).with_next(HELP_JQ)
 }
 
-/// A runtime error: `jq: {what}`.
 fn runtime(what: &str) -> Error {
     Error::usage(format!("jq: {what}")).with_next(HELP_JQ)
 }
 
-/// `jq: {name} is not in agh's jq subset`, with `next`.
 fn not_in_subset(name: &str, next: &str) -> Error {
     Error::usage(format!("jq: {name} is not in agh's jq subset")).with_next(next)
 }
 
-/// The refusal of `construct`, a spelling some `REFUSED_JQ` row names.
 fn refused(construct: &str) -> Error {
     refused_name(construct).unwrap_or_else(|| not_in_subset(construct, HELP_JQ))
 }
 
-/// The refusal of `name` when a `REFUSED_JQ` row names it.
 fn refused_name(name: &str) -> Option<Error> {
     REFUSED_JQ
         .iter()
@@ -259,12 +250,10 @@ fn refused_name(name: &str) -> Option<Error> {
         .map(|row| not_in_subset(name, row.next))
 }
 
-/// The refusal of a name that is neither a function, a keyword nor refused.
 fn unknown_name(name: &str) -> Error {
     not_in_subset(name, HELP_JQ)
 }
 
-/// The function `name` names.
 fn find_function(name: &str) -> Option<&'static FuncSpec> {
     FUNCTIONS.iter().find(|spec| spec.name == name)
 }

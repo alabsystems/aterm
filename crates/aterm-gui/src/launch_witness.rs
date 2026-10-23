@@ -26,7 +26,7 @@ pub(crate) enum Why {
 
 impl Why {
     /// The wire word.
-    pub(crate) fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Person => "person",
             Self::Since => "since",

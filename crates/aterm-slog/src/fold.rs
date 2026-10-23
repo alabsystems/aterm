@@ -1148,6 +1148,7 @@ impl Fold {
         match r.k {
             Kind::Need => {
                 // A mark's need is the session's: it outlives the node the
+                // mark attached to, and only a `clear` lifts it.
                 if let Some(w) = need_raised(r) {
                     self.raise(Need {
                         word: w,

@@ -322,7 +322,7 @@ pub(crate) struct Took {
 
 impl Took {
     /// Whether any surface read by the chip, title, or page changed.
-    pub(crate) fn any(self) -> bool {
+    pub(crate) const fn any(self) -> bool {
         self.lit || self.trail
     }
 }
@@ -472,7 +472,7 @@ impl SessionGlass {
     }
 
     /// Marks `serial` as cheered if it matches the standing end, returning whether it changed.
-    pub(crate) fn cheer_end(&mut self, serial: u32) -> bool {
+    pub(crate) const fn cheer_end(&mut self, serial: u32) -> bool {
         match self.end.as_mut() {
             Some(end) if end.serial == serial && end.uncheered() => {
                 end.cheered = serial;
@@ -483,7 +483,7 @@ impl SessionGlass {
     }
 
     /// Marks the standing end as seen, returning whether it changed.
-    pub(crate) fn see_end(&mut self) -> bool {
+    pub(crate) const fn see_end(&mut self) -> bool {
         match self.end.as_mut() {
             Some(end) if end.unseen() => {
                 end.seen = end.serial;
@@ -584,7 +584,7 @@ impl SessionGlass {
     /// The trail's generation, whole (the chip carries its low byte).
     #[must_use]
     /// Full generation counter of the trail.
-    pub(crate) fn trail_gen(&self) -> u64 {
+    pub(crate) const fn trail_gen(&self) -> u64 {
         self.trail_gen
     }
 
@@ -1158,7 +1158,7 @@ impl App {
 
 impl SessionGlass {
     /// Adopts a carried task end from a seamless update, returning whether it took effect.
-    pub(crate) fn carry_end(&mut self, face: EndFace, at: Option<Stamp>, seen: bool) -> bool {
+    pub(crate) const fn carry_end(&mut self, face: EndFace, at: Option<Stamp>, seen: bool) -> bool {
         if self.end.is_some() {
             return false;
         }

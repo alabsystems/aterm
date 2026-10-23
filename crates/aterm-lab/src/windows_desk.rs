@@ -13,8 +13,26 @@ pub const DESK: &str = r"C:\lane\desk";
 /// Where [`HELPER`] is copied.
 pub const HELPER_PATH: &str = r"C:\lane\desk\desk.ps1";
 
-/// The desk helper (`desk.ps1 <verb> ...`), Windows PowerShell 5.1 with C# compiled by `Add-Type`,
-/// per-monitor-v2 aware so every rectangle is in physical pixels:
+/// The desk helper (`desk.ps1 <verb> ...`), Windows PowerShell 5.1 with C#
+/// compiled by `Add-Type`, per-monitor-v2 aware so every rectangle is in
+/// physical pixels:
+///
+/// - `windows <pid>`: a `window ...` line per visible top-level window of
+///   `pid`;
+/// - `monitors`: a `monitor ...` line per monitor;
+/// - `primary <name>`: that monitor primary at (0,0), every other to its
+///   right, saved; then `monitors`;
+/// - `scale <name> <steps>`: that monitor's display scaling set to `steps`
+///   above its recommended one (Settings' list, 25 % apart from 100 %); then
+///   `monitors`;
+/// - `launch <bin-dir> <dir> <config-base64> [word]...`: `aterm-gui
+///   --control-sock <dir>\aterm.sock [word]... -e powershell.exe -NoLogo
+///   -NoProfile` with `XDG_CONFIG_HOME` and `ATERM_STATE_HOME` in `<dir>`,
+///   its stdout and stderr kept there; its pid written to `<dir>\pid`, then
+///   its exit status to `<dir>\exit` when it ends;
+/// - `readback <pid> <class> <ppm>`: the client area of `pid`'s window of
+///   `class` as its DC holds it (`BitBlt` into a bitmap, then `GetDIBits`),
+///   written as a binary PPM: the pixels a CPU present put on the window.
 pub const HELPER: &str = r##"$ErrorActionPreference = 'Stop'
 $verb = $args[0]
 if ($verb -eq 'launch') {

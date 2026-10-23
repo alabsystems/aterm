@@ -25,7 +25,10 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
     let w = World::boot_with(
         "r21ghost",
         &[],
-        &[("ATERM_LINK_FAULT", "sweep-ghosts-at-once-while-marked")],
+        &[
+            ("ATERM_LINK_FAULT", "sweep-ghosts-at-once-while-marked"),
+            harness::FAST_TIMERS,
+        ],
     );
     w.wait_ready();
     let (a, _b) = w.two_sessions();
@@ -137,7 +140,10 @@ fn a_later_bridge_of_the_state_dir_retires_an_earlier_ones_ghost() {
     let w = World::boot_with(
         "f4chain",
         &[],
-        &[("ATERM_LINK_FAULT", "sweep-ghosts-at-once-while-marked")],
+        &[
+            ("ATERM_LINK_FAULT", "sweep-ghosts-at-once-while-marked"),
+            harness::FAST_TIMERS,
+        ],
     );
     w.wait_ready();
     let (a, _b) = w.two_sessions();

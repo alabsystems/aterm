@@ -1,48 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The beam family's streak over text on a dark ground, through the whole cursor frame step ([`crate::cursor_fx::CursorFx::tick`]): the under-ink bed the letters sit on, and every additive light that still lands on them (the crown, the particles, the caret's body and the momentum glow).
+//! Tests for the beam family's streak over text on a dark ground through [`crate::cursor_fx::CursorFx::tick`].
 
 use super::*;
 use crate::cursor_fx::{CursorFx, CursorFxInput};
 use crate::cursor_momentum::MOMENTUM_GLOW_TAU_S;
 use aterm_core::terminal::CursorStyle;
 
-/// The shipped dark theme's pair, which the gallery captures on.
 const FG: u32 = CursorGlow::STREAK_REF_INK;
 const BG: u32 = CursorGlow::STREAK_REF_GROUND;
-/// The shipped dark theme's cursor colour.
 const CURSOR: u32 = 0x0054_F97A;
-/// The gallery's typing line, after its `$ ` prompt.
 const LINE: &str = "echo the quick brown fox";
 const ROW: u16 = 3;
 const START: u16 = 2;
 
-/// Which negative control a burst runs under.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Control {
-    /// The shipped engine.
     None,
-    /// The streak as light over the letters, with no bed and no account.
     Unbudgeted,
-    /// The bed in each stop at full value, not solved to the bar.
     Unsolved,
-    /// The bed, but no over-ink account.
     NoAccount,
 }
 
-/// One captured frame of a burst.
 struct Shot {
     name: &'static str,
-    /// The worst of the three glyphs left of the caret, every light on.
     newest: f32,
-    /// The same glyphs over the under-ink stack alone (bed, cell tint).
     bed: f32,
 }
 
-/// The shipped knobs and spelling of `style` (`mono` picks `classic mono`
-/// for [`GlowStyle::Classic`]) on the dark default page, and the comet
-/// body's config.
 fn style_cfg(style: GlowStyle, mono: bool) -> (GlowConfig, TrailConfig) {
     use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
     let glow = resolve_glow_config(
@@ -81,9 +67,6 @@ fn style_cfg(style: GlowStyle, mono: bool) -> (GlowConfig, TrailConfig) {
     (glow, trail)
 }
 
-/// The frame as the renderer composites it: the page, the comet's cell
-/// tint, the under-ink stream and fire's field, the glyph ink, then (with
-/// `light`) the additive quads and halos.
 fn composite(fx: &CursorFx, tint: u32, g: Geom, typed: usize, light: bool) -> Glass {
     let mut glass = Glass::new(g, BG);
     for cell in &fx.trail_scratch {
@@ -112,15 +95,10 @@ fn composite(fx: &CursorFx, tint: u32, g: Geom, typed: usize, light: bool) -> Gl
     glass
 }
 
-/// Type the gallery's line at its cadence (60 ms a key) through the whole
-/// frame step with the momentum glow on, the row probe fed as the GUI feeds
-/// it, and capture the gallery's frames: `mid` (13 keys), `t0` (the last
-/// key), `t120`.
 fn burst(style: GlowStyle, control: Control) -> Vec<Shot> {
     burst_face(style, false, control)
 }
 
-/// [`burst`] with the classic wake's face named ([`style_cfg`]).
 fn burst_face(style: GlowStyle, mono: bool, control: Control) -> Vec<Shot> {
     let g = tall_geom();
     let (glow_cfg, trail_cfg) = style_cfg(style, mono);
@@ -211,9 +189,6 @@ fn burst_face(style: GlowStyle, mono: bool, control: Control) -> Vec<Shot> {
     shots
 }
 
-/// The styles whose dark streak lies under the letters as a solved bed: the
-/// beam family but sparkle, whose gold rides its rail, its bridge and its
-/// crown with nothing under its letters.
 fn bedded() -> [GlowStyle; 5] {
     [
         GlowStyle::Lumen,
@@ -224,11 +199,6 @@ fn bedded() -> [GlowStyle; 5] {
     ]
 }
 
-/// The newest letters of a typed burst on the dark default page, at the
-/// gallery's frames, through the whole frame step with the momentum glow
-/// on: over the bed alone they read 4.5:1 or better, and with every light
-/// laid (the crown, the grains, the caret's body, the momentum glow) 3:1 or
-/// better.
 #[test]
 fn each_dark_streak_lays_the_newest_letters_on_a_bed_at_the_bar() {
     let clean = crate::color_math::contrast_ratio(FG, BG);
@@ -312,8 +282,6 @@ fn each_dark_streak_lays_the_newest_letters_on_a_bed_at_the_bar() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The opacity of the bed at one cell's middle column, over the row's spine
-/// (the most any of its pieces lays there).
 fn bed_alpha_at(under: &[GlowQuad], x: u16) -> u8 {
     under
         .iter()
@@ -323,9 +291,6 @@ fn bed_alpha_at(under: &[GlowQuad], x: u16) -> u8 {
         .unwrap_or(0)
 }
 
-/// One typed cell's bed over its life, beside its sample's coverage, from
-/// the last key of a burst until the cell has faded: `(bed opacity, sample
-/// coverage)` per 8 ms, and whether both reached nothing.
 fn one_bed_over_its_life(style: GlowStyle) -> (Vec<(u8, u8)>, bool) {
     let g = tall_geom();
     let mut c = cfg(style, true);
@@ -366,10 +331,6 @@ fn one_bed_over_its_life(style: GlowStyle) -> (Vec<(u8, u8)>, bool) {
     (life, false)
 }
 
-/// Whether a cell's bed follows its sample's fade: never above what its
-/// coverage asks of the cap (within the bed's dither and a level of each
-/// byte's truncation), so as the sample fades the bed comes down with it,
-/// and out when it is out.
 fn tracks_the_fade(life: &[(u8, u8)], full: f32) -> Result<(), String> {
     for &(alpha, cov) in life {
         let want = crate::cursor_glow::bed::DARK_BED_ALPHA_CAP * (f32::from(cov) / full).min(1.0);
@@ -382,14 +343,6 @@ fn tracks_the_fade(life: &[(u8, u8)], full: f32) -> Result<(), String> {
     Ok(())
 }
 
-/// The bed keeps each streak's own fade over the text: one typed cell's bed
-/// opacity never stands above its coverage's share of the bed's cap, frame
-/// by frame, from fresh to gone, so the comet's taper, the laser's bright
-/// fresh cell and the beam's power-down play out under the letters as they
-/// did in light; outside the laser's ripple it never rises as the cell
-/// ages; and the cell starts well up the cap (the newest letter, a cell
-/// behind a comet's head, keeps most of its wedge) and fades to nothing,
-/// or the probe proves nothing.
 #[test]
 fn the_bed_keeps_each_streaks_fade() {
     let mut failures = Vec::new();
@@ -427,13 +380,6 @@ fn the_bed_keeps_each_streaks_fade() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Over cells with no text the streak is light at full strength: a leap
-/// along a row the probe shows blank lights the cells it crosses exactly as
-/// the streak with no bed and no account does, pixel for pixel, with the bed
-/// under it besides (but the beam's, whose leap is its tube alone:
-/// [`a_beam_leap_is_its_ice_tube_and_only_the_comet_burns_a_head`]). Over a
-/// typed run the bridge onto the caret's cell keeps the head as bright as it
-/// was: the bed takes the letters, not the caret's light.
 #[test]
 fn the_dark_beam_keeps_full_strength_over_air_and_onto_the_caret() {
     let g = tall_geom();
@@ -517,17 +463,11 @@ fn the_dark_beam_keeps_full_strength_over_air_and_onto_the_caret() {
     }
 }
 
-/// One burst's t0 frame (the last key) as [`burst_face`] types it, every
-/// light on, with the control flags `set` applies to the engine; returns
-/// the composite and the caret's column.
 fn t0_frame(style: GlowStyle, set: &dyn Fn(&mut CursorFx)) -> (Glass, u16) {
     let (lit, _, caret, _) = typed_frame(style, set, LINE.chars().count());
     (lit, caret)
 }
 
-/// The burst typed to its `typed`th key: the frame with every light on,
-/// the same frame with only the under-ink stack (the bed, the tint), the
-/// caret's column, and the engine as it stands.
 fn typed_frame(
     style: GlowStyle,
     set: &dyn Fn(&mut CursorFx),
@@ -585,20 +525,16 @@ fn typed_frame(
     )
 }
 
-/// An `0x00RRGGBB` colour's HSV hue (degrees), saturation and value.
 fn hsv(rgb: u32) -> (f32, f32, f32) {
     crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF)
 }
 
-/// A premultiplied quad colour at opacity `alpha` back to its straight
-/// colour.
 fn straight(premul: u32, alpha: u8) -> u32 {
     let a = u32::from(alpha.max(1));
     let ch = |sh: u32| ((((premul >> sh) & 0xff) * 255 + a / 2) / a).min(255);
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// Sparkle on a dark ground is a gold comet with nothing under its letters.
 #[test]
 fn the_sparkle_comet_burns_gold_with_nothing_under_its_letters() {
     use crate::cursor_glow::bed::{BedScratch, BedShape, lay_dark_bed};
@@ -706,10 +642,6 @@ fn the_sparkle_comet_burns_gold_with_nothing_under_its_letters() {
     );
 }
 
-/// The phaser's dark bed keeps the night arc: every saturated colour it lays
-/// under the letters of the typed row, over every frame of the burst, is a
-/// blue, a violet or a magenta, never the olive or brown a warm or green
-/// stop becomes at the bar's luminance.
 #[test]
 fn the_phaser_bed_keeps_the_night_arc() {
     let g = tall_geom();
@@ -742,11 +674,6 @@ fn the_phaser_bed_keeps_the_night_arc() {
     );
 }
 
-/// The over-ink account holds back only the light over the letters: over
-/// the blank cells around the caret (the two cells ahead of it, and the
-/// blank rows above and below them) the caret's bloom, its body and the
-/// momentum glow land exactly as they do with no account at all, and they
-/// are there to see.
 #[test]
 fn the_bloom_stays_whole_over_the_blank_cells_around_the_caret() {
     let mut failures = Vec::new();
@@ -797,10 +724,6 @@ fn the_bloom_stays_whole_over_the_blank_cells_around_the_caret() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// A leap over rows the frame shows blank (a clear homes the caret) is the
-/// style's light, not its bed: handed the frame's cells, the leap down the
-/// column lights it bright (its median luminance well over the bed's bar), for bedded
-/// styles and the classic wake's mono face alike.
 #[test]
 fn a_leap_over_rows_the_frame_shows_blank_is_light() {
     let g = tall_geom();
@@ -870,11 +793,6 @@ fn a_leap_over_rows_the_frame_shows_blank_is_light() {
     }
 }
 
-/// A style's vivid rail lies in the leading under the run, where no letter
-/// of the row stands: over a blank row below, every under-ink quad below the
-/// typed row's bottom is within a fifth of a cell of it and brighter than
-/// the bar's bed (its ink at the rail's luminance floor), and some is
-/// there; nothing under the ink reaches above the row.
 #[test]
 fn the_rail_lies_in_the_leading_under_the_run() {
     let g = tall_geom();
@@ -945,10 +863,6 @@ fn the_rail_lies_in_the_leading_under_the_run() {
     }
 }
 
-/// The night arc holds every hue on blue, violet and magenta, where a bed at
-/// the bar keeps its colour, and rolls through them without a jump: each
-/// whole degree of the wheel lands in [195°, 330°], a degree on moves it at
-/// most a few degrees, and the arc is the bed's hue for the spectrum styles.
 #[test]
 fn the_night_arc_keeps_the_spectrum_beds_on_blue_violet_and_magenta() {
     use crate::cursor_glow::bed::{night_hue, night_rgb};
@@ -973,11 +887,6 @@ fn the_night_arc_keeps_the_spectrum_beds_on_blue_violet_and_magenta() {
     assert!(outside, "control: the raw spectrum never leaves the arc");
 }
 
-/// A comet's bed is a wedge and every typed run's bed rises from nothing at
-/// its tail: laid under a run of fresh cells, the comet's bed is whole
-/// under the caret, thins with each cell behind it and is gone three and a
-/// half cells back, and a lumen run's bed is nothing at its tail's outer
-/// edge and whole a cell and a half in.
 #[test]
 fn the_comet_bed_is_a_wedge_and_every_run_rises_from_its_tail() {
     use crate::cursor_glow::bed::{BedScratch, BedShape, lay_dark_bed};
@@ -1046,12 +955,10 @@ fn the_comet_bed_is_a_wedge_and_every_run_rises_from_its_tail() {
     );
 }
 
-/// The bed opacity at pixel column `x` (any quad over it).
 fn bed_alpha_at_column(under: &[GlowQuad], x: u16) -> u8 {
     bed_alpha_at(under, x)
 }
 
-/// Lumen's bed under `run`, alone.
 fn lumen_under(
     run: &[CometSample],
     g: Geom,
@@ -1075,10 +982,6 @@ fn lumen_under(
     under
 }
 
-/// The head's bridge onto the caret's cell is the caret's light, kept in
-/// that cell: typed over text, a streak's own additive light (no crown, no
-/// body) lies inside the typed row, never a stub above and below the
-/// caret.
 #[test]
 fn the_bridge_onto_the_caret_stays_in_its_cell() {
     let g = tall_geom();
@@ -1135,12 +1038,6 @@ fn the_bridge_onto_the_caret_stays_in_its_cell() {
     assert!(spills, "control: no whole streak leaves its row");
 }
 
-/// The account holds the lines around the caret's to the text bar: one
-/// bright light laid over the caret's line and the line of output above
-/// it, admitted at the momentum glow's tier, leaves a letter above at 4.5:1
-/// or better while it washes the caret line's letter down toward its own
-/// tier's floor, under 4.5:1 (the control: the same light, the same ledger,
-/// only the line differs).
 #[test]
 fn the_lines_around_the_caret_keep_the_text_bar() {
     let g = tall_geom();
@@ -1198,11 +1095,6 @@ fn the_lines_around_the_caret_keep_the_text_bar() {
     );
 }
 
-/// A letter is held against the colours it is really drawn in: with the
-/// frame's own cells handed over (its first row empty, as a host may hand a
-/// blank row), one bright light over a selected line
-/// above the caret's (its ground the selection's, `#33415E`) leaves its
-/// letters 4.5:1 or better on that ground.
 #[test]
 fn the_account_holds_a_letter_on_its_own_ground() {
     const SELECTION: u32 = 0x0033_415E;
@@ -1272,15 +1164,6 @@ fn the_account_holds_a_letter_on_its_own_ground() {
     );
 }
 
-/// A LEAP'S BED IS ONE TUBE ACROSS A SHORT STRETCH OF AIR: an Enter-like
-/// leap down from the end of one line to the start of the next crosses a
-/// cell or two past the lower line's end before it reaches its letters; the
-/// bed lays one tube through them (two tubes with a gap between read as two
-/// offset slabs). Negative control: across a long stretch of air the bed
-/// still leaves the air to the beam (no tube in the middle of the gap). A
-/// shape whose leap leaves the air to its light (the phaser's); the comet's,
-/// the beam's, the lumen's and the laser's lay the whole leap
-/// ([`BedShape::leap_air`]).
 #[test]
 fn a_leap_bed_is_one_tube_across_a_short_gap() {
     use crate::cursor_glow::bed::{BedScratch, BedShape, lay_dark_bed};
@@ -1290,8 +1173,6 @@ fn a_leap_bed_is_one_tube_across_a_short_gap() {
         !shape.leap_air,
         "fixture: the phaser's leap leaves the air to its light"
     );
-    // The leap's cells: row 2 from col 14 left, then row 3; the lower line's
-    // text ends `gap` cells before the leap reaches it.
     let tube_at_gap = |gap: u16| -> u32 {
         let end3 = 11 - gap;
         let cells: Vec<(u16, u16)> = (11..=14u16)
@@ -1360,11 +1241,6 @@ fn a_leap_bed_is_one_tube_across_a_short_gap() {
     );
 }
 
-/// A COMET COMPLETION LAYS THE PATH `LENGTH` CUTS UNDER THE LETTERS IT
-/// CROSSES (audit r14 PV7): on a dark ground the comet's swept runs are its
-/// bed under the text, and every one-row run used to be redrawn as the
-/// fixed 3.5-cell typing wedge, so a Tab completion over letters looked the
-/// same at every Trail length (only the beam over air was cut by it).
 #[test]
 fn a_comet_completion_lays_the_path_length_cuts_under_its_letters() {
     use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
@@ -1497,13 +1373,6 @@ fn a_comet_completion_lays_the_path_length_cuts_under_its_letters() {
     );
 }
 
-/// One dark Enter's leap, as the trail gallery's `enter-bottom` shoots it:
-/// the command's line `$ echo the quick brown fox` on row 2, its output
-/// `the quick brown fox` on row 3, the new prompt `$ ` on row 4, and the
-/// caret leaping from the end of the command's line to the prompt. `split`
-/// is the negative control [`CursorGlow::leap_split`]. The composite with
-/// every light on, the under-ink stream alone, how many particles the leap
-/// shed, and the leap's two ends (window px).
 fn enter_leap(style: GlowStyle, split: bool) -> (Glass, Glass, usize, (f32, f32), (f32, f32)) {
     let g = tall_geom();
     let (c, _) = style_cfg(style, false);
@@ -1544,8 +1413,6 @@ fn enter_leap(style: GlowStyle, split: bool) -> (Glass, Glass, usize, (f32, f32)
     )
 }
 
-/// The points of the straight leap from `a` to `b` (window px), one a
-/// pixel, from `skip_a` px past `a` to `skip_b` px short of `b`.
 fn along(a: (f32, f32), b: (f32, f32), skip_a: f32, skip_b: f32) -> Vec<(f32, f32)> {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len = (dx * dx + dy * dy).sqrt();
@@ -1558,8 +1425,6 @@ fn along(a: (f32, f32), b: (f32, f32), skip_a: f32, skip_b: f32) -> Vec<(f32, f3
         .collect()
 }
 
-/// The most a glass lifts the page in a short column across the spine at
-/// `(x, y)`: the leap's light or tube, wherever it crosses that column.
 fn lift_across(glass: &Glass, (x, y): (f32, f32), bg: i32) -> i32 {
     (-5..=5)
         .map(|k| glass.level(y as i32 + k, x as i32) - bg)
@@ -1567,27 +1432,15 @@ fn lift_across(glass: &Glass, (x, y): (f32, f32), bg: i32) -> i32 {
         .unwrap_or(0)
 }
 
-/// How white a pixel is: its least channel.
 fn whiteness(p: u32) -> u32 {
     ((p >> 16) & 0xff).min((p >> 8) & 0xff).min(p & 0xff)
 }
 
-/// THE BEAM'S LEAP IS ITS ICE TUBE (2026-10-22, the owner: the beam must not
-/// borrow the comet's Return or jump look). On a dark Enter the beam arrives
-/// as the steady tube it is while typing: no additive light anywhere along
-/// the leap short of the caret's own glow (the composite there is its tube
-/// alone, pixel for pixel, and never white), its tube over the air the leap
-/// crosses as well as under the letters, and no dust. NEGATIVE CONTROL: the
-/// comet, whose head and dust these are, burns a white-hot head over the
-/// same air and sheds its dust.
 #[test]
 fn a_beam_leap_is_its_ice_tube_and_only_the_comet_burns_a_head() {
     let bg = Glass::new(tall_geom(), BG).level(0, 0);
     let (lit, under, dust, a, b) = enter_leap(GlowStyle::Beam, false);
     let cell = tall_geom().cw as f32;
-    // From the leap's first spark (born a cell and a half along it,
-    // [`CursorGlow::LEAP_BIRTH_SKIP_CELLS`]) to two cells and a half short of
-    // the caret's centre, clear of its own glow.
     let path = along(a, b, 2.0 * cell, 2.5 * cell);
     for &(x, y) in &path {
         for k in -6..=6 {
@@ -1631,23 +1484,8 @@ fn a_beam_leap_is_its_ice_tube_and_only_the_comet_burns_a_head() {
     assert!(dust > 0, "control: the comet's leap sheds no dust");
 }
 
-/// THE LEAP IS ONE PIECE (2026-10-22: the beam's, the comet's, the lumen's
-/// and the laser's Return leap came out in two, a dim tube under the
-/// letters and the light over the air apart from it across a gap with a
-/// hard edge). Along the whole leap, from its first spark to half a cell
-/// short of the caret, what lifts the page (each point the median of the
-/// seven around it along the leap, so a grain of the comet's dust is not
-/// the leap) never falls below [`DIP`] of the most it lifted in the cell and
-/// a half behind: the comet's, the lumen's and the laser's heads rise over
-/// their own tubes, and the beam is its tube. NEGATIVE CONTROL: the leap split as it was
-/// ([`CursorGlow::leap_split`]: the tube under the text alone, the light
-/// over the air alone) dips where they meet.
 #[test]
 fn an_enter_leap_is_one_piece_from_its_tail_to_its_head() {
-    /// The least share of the lift just behind that a point keeps: the
-    /// laser's white strike over the air steps down onto its violet cable
-    /// under the letters (about two thirds of it), which is no gap; a split
-    /// leap falls to a quarter or less.
     const DIP: f32 = 0.6;
     let bg = Glass::new(tall_geom(), BG).level(0, 0);
     let cell = tall_geom().cw as f32;
@@ -1695,11 +1533,6 @@ fn an_enter_leap_is_one_piece_from_its_tail_to_its_head() {
     }
 }
 
-/// `style`'s under-ink stream (the bed, the band) `after_ms` past an Enter
-/// that leaves a typed line: `echo the quick brown fox` typed on row 2 after
-/// its `$ ` at 60 ms a key, then the caret leaps to row 4's home. On `dark`
-/// the shipped dark pair, else GitHub Light's; `square` lays the heads cut
-/// square ([`CursorGlow::heads_square`]). Returns the glass and its page.
 fn left_head(style: GlowStyle, dark: bool, square: bool, after_ms: u64) -> (Glass, u32) {
     use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
     let g = tall_geom();
@@ -1793,16 +1626,6 @@ fn left_head(style: GlowStyle, dark: bool, square: bool, after_ms: u64) -> (Glas
     (glass, bg)
 }
 
-/// A RUN THE HAND HAS LEFT MELTS OUT OVER ITS LAST LETTER (round-2 judges,
-/// item 5: on a Return the phaser's bar stood cut square where its emitter
-/// had stood, on dark at the far edge of `fox`'s `x`, on paper through it).
-/// After an Enter leaves a typed line, the under-ink light across the run's
-/// last letter and the cell past it (the one the caret left) never drops by
-/// more than three tenths of the bar's level from one pixel column to the
-/// next (about a sixth, measured), and the cell past it holds none of it, on
-/// dark and on paper. Negative control: the heads laid cut square
-/// ([`CursorGlow::heads_square`]) drop by more than three fifths of it at
-/// the letter's edge (nine tenths and more, measured).
 #[test]
 fn a_run_the_hand_has_left_melts_out_over_its_last_letter() {
     let g = tall_geom();
@@ -1810,8 +1633,6 @@ fn a_run_the_hand_has_left_melts_out_over_its_last_letter() {
     let last = i32::from(START) + LINE.len() as i32 - 1;
     let (y0, y1) = (2 * g.ch as i32, 3 * g.ch as i32);
     for dark in [true, false] {
-        // Per pixel column of row 2, the most the under-ink stream moves the
-        // page there (its largest channel's change).
         let profile = |glass: &Glass, page: u32| -> Vec<i32> {
             (0..g.win_w as i32)
                 .map(|x| {

@@ -7,21 +7,11 @@ use std::path::Path;
 use super::*;
 use crate::guards::Corpus;
 
-/// A made-up word the synthetic extras forbid, standing in for the account
-/// word (which no test spells); [`scrubbed`] redacts it as `owner0000`, its
-/// width.
 const WORD: &str = "zebrafish";
 
-/// A home and a toolchain checkout, spelled in halves: written whole, the
-/// export's rewrites (aterm-release `transforms.rs`) would change them in the
-/// exported copy of this test, whose leaky capture would then leak nothing.
 const HOME: &str = concat!("/Us", "ers/someone");
 const CHECKOUT: &str = concat!("~", "/trust");
 
-/// A capture recording what a home shell and Claude Code's banner print: a cwd
-/// report naming a home, the word inside a prompt an SGR splits, the banner's
-/// plan, a session id and a toolchain checkout's title. One record each, so a
-/// finding's line is its record.
 fn leaky() -> String {
     let cwd = format!("\x1b]7;file://host{HOME}/proj\x07");
     let title = format!("\x1b]0;{CHECKOUT}\x07");
@@ -41,8 +31,6 @@ fn leaky() -> String {
     ])
 }
 
-/// [`leaky`] scrubbed: each identifying run replaced by neutral text of its
-/// width, the home keeping the export's doubled separator.
 fn scrubbed() -> String {
     ptylog_text(&[
         ("O", b"\x1b]7;file://host/Users//owner/proj\x07"),
@@ -60,8 +48,6 @@ fn scrubbed() -> String {
     ])
 }
 
-/// The rule's tests judge without this host's engine baseline, so no file
-/// outside the synthetic tree moves a finding.
 const NO_BASELINE: &str = "no engine baseline in tests";
 
 fn rows() -> Vec<Row> {
@@ -197,8 +183,6 @@ fn a_finding_names_the_record_holding_the_match_not_the_first() {
     assert_eq!(spots(&found), ["t/late.ptylog:3".to_string()].into());
 }
 
-/// Every row of the checkout's own extras compiles here (a public snapshot
-/// withholds `publish/`, so there the capture rows alone are held).
 #[test]
 fn the_exports_rows_compile_and_every_capture_row_does() {
     assert_eq!(capture_rows().len(), CAPTURE_ROWS.len());
@@ -217,8 +201,6 @@ fn the_exports_rows_compile_and_every_capture_row_does() {
     assert!(rows.len() >= 2, "{} rows", rows.len());
 }
 
-/// A tree whose captures carry no extras file (a public snapshot's) is still
-/// held to the capture rows, and the census notes what it judged without.
 #[test]
 fn without_the_exports_rows_the_capture_rows_still_hold() {
     use crate::scan_set::test_fixtures::disk_tree;
@@ -271,9 +253,6 @@ fn the_redaction_shapes_pass_every_capture_row() {
     }
 }
 
-/// A word typed with a slip and fixed reads as the screen shows it: the
-/// shell's echo of the erase (`\b \b`) and the typed DEL each take back the
-/// slip, and no erase reaches back past a line break.
 #[test]
 fn the_edited_view_reads_a_word_fixed_while_it_was_typed() {
     let echo = View::printable(b"zebx\x08 \x08rafish\r\n\x08ok", Read::Edited);
@@ -298,8 +277,6 @@ fn the_edited_view_reads_a_word_fixed_while_it_was_typed() {
     );
 }
 
-/// The engine's baseline, when the host has it, is held beside the export's
-/// rows: a capture carrying only a baseline word fails at its record.
 #[test]
 fn the_engines_baseline_rows_are_held_when_the_host_has_them() {
     use crate::scan_set::test_fixtures::disk_tree;

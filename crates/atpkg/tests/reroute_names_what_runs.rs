@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! End-to-end tests for `atpkg __reroute`: verifies that the signpost names
-//! the resolved compiler (Trust vs. stock) and refuses stock `rustc` inside a
-//! Trust source checkout.
-//!
-//! Each case places a fake `rustc` (and optionally `cargo`) on `PATH` under a
-//! temporary `HOME`. Fakes are content-addressed beside the test binary and
-//! warmed once with `-vV` so `syspolicyd`'s first-exec assessment happens
-//! outside the reroute's probe timeout.
+//! End-to-end tests for `atpkg __reroute` compiler identification and Trust checkout guards.
 
 #![cfg(unix)]
 #![allow(
@@ -20,7 +13,6 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// What each fake prints for anything but `-vV`, and its exit code.
 const RAN_EXIT: i32 = 3;
 
 const TRUST_RUSTC: &str = "#!/bin/sh\n\
@@ -37,9 +29,6 @@ printf '%s\\n' 'rustc 1.97.1 (8bab26f4f 2026-07-14)' 'binary: rustc' \
 'host: aarch64-apple-darwin' 'release: 1.97.1' 'LLVM version: 22.1.6'\n\
 exit 0\nfi\necho \"stock rustc ran: $*\"\nexit 3\n";
 
-/// A wrapper on PATH — the shape of one around rustup's proxy (a devcontainer's, an
-/// asdf-style shim): it runs the `+<toolchain>` it is handed, stock for any channel but
-/// `trust`, and Trust when handed none.
 const WRAPPER_RUSTC: &str = "#!/bin/sh\n\
 tc=trust\n\
 case \"$1\" in +*) tc=${1#+}; shift;; esac\n\
@@ -55,10 +44,6 @@ printf '%s\\n' 'rustc 1.97.1 (8bab26f4f 2026-07-14)' 'binary: rustc' \
 fi\n\
 exit 0\nfi\necho \"$tc rustc ran: $*\"\nexit 3\n";
 
-/// A stock `rustc` whose `-vV` leaves a process behind holding its output, as a wrapper does
-/// that backgrounds a usage logger or starts a server: with `$LEFT_BEHIND_PIDFILE` set it
-/// starts a `/bin/sleep 600` (the fixture's PATH holds only the fake) that inherits its
-/// stdout and stderr, and writes its pid there.
 const LEFT_BEHIND_RUSTC: &str = "#!/bin/sh\n\
 if [ \"$1\" = -vV ]; then\n\
 if [ -n \"$LEFT_BEHIND_PIDFILE\" ]; then /bin/sleep 600 & echo $! > \"$LEFT_BEHIND_PIDFILE\"; fi\n\
@@ -67,10 +52,6 @@ printf '%s\\n' 'rustc 1.97.1 (8bab26f4f 2026-07-14)' 'binary: rustc' \
 'host: aarch64-apple-darwin' 'release: 1.97.1' 'LLVM version: 22.1.6'\n\
 exit 0\nfi\necho \"stock rustc ran: $*\"\nexit 3\n";
 
-/// A Trust `cargo` whose subcommand spawns `rustc +1.97.1 main.rs` BY NAME and exits with
-/// its code — a cargo subcommand, `cargo run -p xtask`, a build script that runs `rustc
-/// +<channel>`, Trust's own miri-script (`rustc +miri`), under a Trust cargo the reroute
-/// allowed.
 const TRUST_CARGO_SPAWNING_STOCK: &str = "#!/bin/sh\n\
 if [ \"$1\" = -vV ]; then\n\
 printf '%s\\n' 'cargo 1.99.0-dev (7d5533b2b 2026-09-23)' 'release: 1.99.0-dev' \
@@ -78,11 +59,6 @@ printf '%s\\n' 'cargo 1.99.0-dev (7d5533b2b 2026-09-23)' 'release: 1.99.0-dev' \
 'host: aarch64-apple-darwin' 'trust: 0.1.0'\n\
 exit 0\nfi\necho \"trust cargo ran: $*\"\nrustc +1.97.1 main.rs\n";
 
-/// The program whose body is `body`, one file per distinct body, shared by every run — laid
-/// and first run under one lock: every test thread lays through the same temporary name, and
-/// without the lock two tests laying one body from a cold directory rename it from under
-/// each other (`NotFound` at the `set_permissions` or the `rename`). `atpkg`'s unit tests
-/// share the same discipline (`test_programs::assessed`).
 fn program(name: &str, body: &str) -> PathBuf {
     use std::hash::{Hash as _, Hasher as _};
     static LAYING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -103,8 +79,6 @@ fn program(name: &str, body: &str) -> PathBuf {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::rename(&tmp, &path).unwrap();
     }
-    // The first exec's assessment, paid here. Just written: past the `ETXTBSY` a sibling
-    // test's fork can hold it in.
     let warmed =
         aterm_spec::wait::past_text_busy(|| Command::new(&path).arg("-vV").output()).unwrap();
     assert!(warmed.status.success(), "{name}: {warmed:?}");
@@ -120,7 +94,6 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// A fixture whose PATH holds one `rustc`: `body`.
     fn new(case: &str, name: &str, body: &str) -> Self {
         let root =
             std::env::temp_dir().join(format!("atpkg-reroute-names-{}-{case}", std::process::id()));
@@ -144,14 +117,10 @@ impl Fixture {
         }
     }
 
-    /// Another program on the fixture's PATH: `bin/<as_name>` runs `body`.
     fn add(&self, as_name: &str, name: &str, body: &str) {
         std::os::unix::fs::symlink(program(name, body), self.bin.join(as_name)).unwrap();
     }
 
-    /// The `cargo` and `rustc` stubs a session puts first on PATH, as `atpkg::reroute::lay`
-    /// leaves them (the marker file beside them), naming this test's `atpkg`; the PATH
-    /// `stubs:bin`.
     fn stubs(&self) -> String {
         let stubs = self.root.join("stubs");
         std::fs::create_dir_all(&stubs).unwrap();
@@ -177,8 +146,6 @@ impl Fixture {
         format!("{}:{}", stubs.display(), self.bin.display())
     }
 
-    /// `x.py` and a `src/stage0` naming `channel` under `work/checkout`; the directory to
-    /// run in, two levels below its root.
     fn checkout(&self, channel: &str) -> PathBuf {
         let root = self.work.join("checkout");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -195,12 +162,10 @@ impl Fixture {
         sub
     }
 
-    /// `atpkg __reroute rustc main.rs` in `cwd`, from a clean environment.
     fn rustc(&self, cwd: &Path) -> Output {
         self.rustc_with(cwd, &["main.rs"])
     }
 
-    /// `atpkg __reroute rustc <args…>` in `cwd`, from a clean environment.
     fn rustc_with(&self, cwd: &Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_atpkg"))
             .args(["__reroute", "rustc"])
@@ -225,8 +190,6 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// A bare `rustc` that IS Trust is announced as Trust — by its commit — never as "upstream"
-/// with "no proof claim"; the fake then runs with the caller's arguments and its exit code.
 #[test]
 fn a_rustc_that_resolves_to_trust_is_named_trust() {
     let fx = Fixture::new("trust", "trust-rustc", TRUST_RUSTC);
@@ -244,8 +207,6 @@ fn a_rustc_that_resolves_to_trust_is_named_trust() {
     assert_eq!(out.status.code(), Some(RAN_EXIT), "{stderr}");
 }
 
-/// A bare `rustc` that is STOCK says so, with its version, and that it is not Trust — and
-/// still runs (outside a Trust source checkout a SIGNPOST announces; it does not prevent).
 #[test]
 fn a_rustc_that_resolves_to_stock_is_named_stock_and_runs() {
     let fx = Fixture::new("stock", "stock-rustc", STOCK_RUSTC);
@@ -259,9 +220,6 @@ fn a_rustc_that_resolves_to_stock_is_named_stock_and_runs() {
     assert_eq!(out.status.code(), Some(RAN_EXIT), "{stderr}");
 }
 
-/// Inside a Trust source checkout a stock `rustc` does not run: exit 2, stdout clean, and
-/// the line names what it resolved to and the checkout. Trust there runs as anywhere, and an
-/// upstream Rust checkout (channel `nightly`) is not Trust's — the negative controls.
 #[test]
 fn inside_a_trust_checkout_a_stock_rustc_is_refused_and_trust_runs() {
     let fx = Fixture::new("checkout-stock", "stock-rustc", STOCK_RUSTC);
@@ -276,13 +234,11 @@ fn inside_a_trust_checkout_a_stock_rustc_is_refused_and_trust_runs() {
     );
     assert!(stderr.contains("STOCK rustc 1.97.1"), "{stderr}");
 
-    // Negative control: the same stock rustc in an UPSTREAM Rust checkout runs.
     let upstream = Fixture::new("checkout-upstream", "stock-rustc", STOCK_RUSTC);
     let out = upstream.rustc(&upstream.checkout("nightly"));
     assert_eq!(out.status.code(), Some(RAN_EXIT), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "stock rustc ran: main.rs\n");
 
-    // Trust inside the Trust checkout runs.
     let trust = Fixture::new("checkout-trust", "trust-rustc", TRUST_RUSTC);
     let out = trust.rustc(&trust.checkout("trust"));
     let stderr = text(&out.stderr);
@@ -291,11 +247,6 @@ fn inside_a_trust_checkout_a_stock_rustc_is_refused_and_trust_runs() {
     assert!(stderr.contains("Trust 7d5533b2"), "{stderr}");
 }
 
-/// A `+<toolchain>` is part of what runs, so it is part of what is asked: a wrapper on PATH
-/// that is not rustup's own proxy hands `+1.97.1` on and runs stock, and is named STOCK for
-/// it — and inside a Trust source checkout it does not run (a question that dropped it
-/// said `-> Trust 7d5533b2` over a stock run). The same wrapper handed nothing is Trust,
-/// and runs.
 #[test]
 fn a_toolchain_handed_to_a_wrapper_is_part_of_the_question() {
     let fx = Fixture::new("plus", "rustc-wrapper", WRAPPER_RUSTC);
@@ -319,10 +270,6 @@ fn a_toolchain_handed_to_a_wrapper_is_part_of_the_question() {
     assert_eq!(out.status.code(), Some(RAN_EXIT), "{stderr}");
 }
 
-/// A process the copy leaves behind never holds the command: the copy is asked what it is,
-/// and the command runs, while that process still lives: a probe that reads the copy's
-/// pipes to their end waits as long as the leftover holds them open, forever for one that
-/// never exits. A minute is the hang detector, not a budget: the command needs no wait.
 #[test]
 fn a_process_the_copy_leaves_behind_never_holds_the_command() {
     let fx = Fixture::new("left-behind", "left-behind-rustc", LEFT_BEHIND_RUSTC);
@@ -351,7 +298,6 @@ fn a_process_the_copy_leaves_behind_never_holds_the_command() {
             .output()
             .is_ok_and(|out| out.status.success())
     };
-    // The left-behind process dies by SIGKILL once judged, on every path.
     let reap = |pid: Option<String>| {
         if let Some(pid) = pid {
             let _ = Command::new("kill").args(["-KILL", &pid]).output();
@@ -393,9 +339,6 @@ fn a_process_the_copy_leaves_behind_never_holds_the_command() {
     assert_eq!(status.code(), Some(RAN_EXIT), "{stderr}");
 }
 
-/// A stock `rustc` spawned by name beneath an allowed Trust `cargo` is still
-/// judged and refused inside a Trust checkout, runs unannounced outside one,
-/// and is bypassed under `PASSTHROUGH_ENV`.
 #[test]
 fn a_stock_rustc_a_trust_cargo_spawns_by_name_is_judged_in_a_trust_checkout() {
     let fx = Fixture::new("child", "rustc-wrapper", WRAPPER_RUSTC);
@@ -441,7 +384,6 @@ fn a_stock_rustc_a_trust_cargo_spawns_by_name_is_judged_in_a_trust_checkout() {
         "cargo fails with the refusal's exit — {stderr}"
     );
 
-    // Outside a checkout the child runs, and is not announced a second time.
     let (code, stdout, stderr) = cargo_demo(&fx.work, &[]);
     assert_eq!(
         stdout, "trust cargo ran: demo\n1.97.1 rustc ran: main.rs\n",
@@ -454,7 +396,6 @@ fn a_stock_rustc_a_trust_cargo_spawns_by_name_is_judged_in_a_trust_checkout() {
     );
     assert_eq!(code, Some(RAN_EXIT), "{stderr}");
 
-    // The escape (`aterm --no-reroute`'s marker) is still the escape: nothing judged or said.
     let (code, stdout, stderr) = cargo_demo(&inside, &[(atpkg::reroute::PASSTHROUGH_ENV, "1")]);
     assert_eq!(
         stdout, "trust cargo ran: demo\n1.97.1 rustc ran: main.rs\n",
@@ -464,17 +405,9 @@ fn a_stock_rustc_a_trust_cargo_spawns_by_name_is_judged_in_a_trust_checkout() {
     assert_eq!(code, Some(RAN_EXIT));
 }
 
-/// With `HOME` unset (and `PASSWD_FILE_SEAM` empty so no store resolves), a
-/// stock `rustc` inside a Trust checkout is still refused, named STOCK outside
-/// one, and Trust runs in the checkout.
 #[test]
 fn with_no_store_a_stock_rustc_in_a_trust_checkout_is_refused() {
     // `HOME` unset leaves no home only for an account the passwd file does not list
-    // (macOS keeps local accounts in Directory Services; a container may run an
-    // unlisted uid). Linux's /etc/passwd lists this one, and then the home, and with it
-    // this account's REAL store, would resolve, which no run here may touch. So every run
-    // reads an empty passwd file through the dev seam, which `atpkg` compiles wherever
-    // this test's own build has debug assertions.
     if !cfg!(debug_assertions) {
         aterm_spec::host::could_not_run(
             "a build without debug assertions reads no passwd-file seam, so `HOME` unset \
@@ -499,13 +432,11 @@ fn with_no_store_a_stock_rustc_in_a_trust_checkout_is_refused() {
     assert!(stderr.contains("STOCK rustc 1.97.1"), "{stderr}");
     assert_eq!(code, Some(2), "{stderr}");
 
-    // Elsewhere it runs, named STOCK — never "upstream".
     let (code, stdout, stderr) = storeless(&fx, &fx.work);
     assert_eq!(stdout, "stock rustc ran: main.rs\n", "{stderr}");
     assert!(stderr.contains("STOCK rustc 1.97.1"), "{stderr}");
     assert_eq!(code, Some(RAN_EXIT), "{stderr}");
 
-    // Trust in the checkout runs, named Trust.
     let trust = Fixture::new("storeless-trust", "trust-rustc", TRUST_RUSTC);
     let (code, stdout, stderr) = storeless(&trust, &trust.checkout("trust"));
     assert_eq!(stdout, "trust rustc ran: main.rs\n", "{stderr}");
@@ -513,13 +444,6 @@ fn with_no_store_a_stock_rustc_in_a_trust_checkout_is_refused() {
     assert_eq!(code, Some(RAN_EXIT), "{stderr}");
 }
 
-/// A STOCK CARGO'S OWN COMPILE IS JUDGED IN A TRUST CHECKOUT. cargo marks every compile
-/// it spawns for a crate with `CARGO_CRATE_NAME`, and the `rustc` stub takes that mark as
-/// it takes a child of a command the reroute ran: said nothing, run as the cargo chose.
-/// Sent down the escape's walk before atpkg is asked, a stock cargo started by its path,
-/// whose `rustc -vV` cargo had cached, would compile stock inside a Trust checkout with
-/// nothing judged. End to end through the real stub and `atpkg`: refused there, with the
-/// refusal its only line; run with no line anywhere else; Trust runs there, quietly.
 #[test]
 fn a_stock_cargos_compile_is_judged_in_a_trust_checkout() {
     let compile = |fx: &Fixture, path: &str, cwd: &Path| {
@@ -549,7 +473,6 @@ fn a_stock_cargos_compile_is_judged_in_a_trust_checkout() {
     );
     assert_eq!(code, Some(2), "{stderr}");
 
-    // Outside a checkout the compile runs, and says nothing.
     let (code, stdout, stderr) = compile(&fx, &path, &fx.work);
     assert_eq!(
         stdout, "stock rustc ran: --crate-name dep1 main.rs\n",
@@ -558,7 +481,6 @@ fn a_stock_cargos_compile_is_judged_in_a_trust_checkout() {
     assert_eq!(stderr, "", "a compile is said nothing");
     assert_eq!(code, Some(RAN_EXIT));
 
-    // Trust's compile in the Trust checkout runs, and says nothing either.
     let trust = Fixture::new("compile-trust", "trust-rustc", TRUST_RUSTC);
     let path = trust.stubs();
     let (code, stdout, stderr) = compile(&trust, &path, &trust.checkout("trust"));

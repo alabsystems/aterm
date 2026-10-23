@@ -6,15 +6,10 @@ use crate::App;
 use crate::motion::{MotionEffect, MotionPolicy};
 use std::time::{Duration, Instant};
 
-/// `App::motion_policy` folds config `motion`, the OS Reduce Motion flag and
-/// window focus: `auto` (default) follows the system flag, `full` overrides
-/// it, and nothing overrides the unfocused demotion.
 #[test]
 fn app_motion_policy_folds_config_flag_and_focus() {
     let mut app = App::headless_for_test();
-    // Default: auto + no system reduce + focused ⇒ Full.
     assert_eq!(app.motion_policy(true), MotionPolicy::Full);
-    // The OS flag flips (what the Wake::ReduceMotionChanged handler stores).
     app.system_reduce_motion = true;
     assert_eq!(app.motion_policy(true), MotionPolicy::Reduced);
     assert_eq!(
@@ -22,21 +17,14 @@ fn app_motion_policy_folds_config_flag_and_focus() {
         0.0,
         "a Reduced policy zeroes the aurora amplitude"
     );
-    // motion = "full" overrides the OS flag…
     app.config.motion = Some("full".into());
     assert_eq!(app.motion_policy(true), MotionPolicy::Full);
-    // …but never the unfocused demotion.
     assert_eq!(app.motion_policy(false), MotionPolicy::Reduced);
-    // motion = "reduced" forces static even with the OS flag off.
     app.system_reduce_motion = false;
     app.config.motion = Some("reduced".into());
     assert_eq!(app.motion_policy(true), MotionPolicy::Reduced);
 }
 
-/// The typed wake (`App::cursor_fx_focus`): a key/text egress into a window
-/// pins the motion policy's focus input for that window alone while the
-/// wake is live. It never touches the mode inputs: OS Reduce Motion still
-/// demotes a woken window.
 #[test]
 fn typed_wake_pins_cursor_fx_focus() {
     use std::time::{Duration, Instant};
@@ -45,14 +33,12 @@ fn typed_wake_pins_cursor_fx_focus() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let t0 = Instant::now();
-    // Idle + unfocused: the baseline demotion holds.
     assert!(!app.cursor_fx_focus(wid, false, t0));
     assert_eq!(
         app.motion_policy(app.cursor_fx_focus(wid, false, t0)),
         MotionPolicy::Reduced,
         "an idle unfocused window stays demoted"
     );
-    // One key egress stamps the wake (`last_key_at`, both input sources)…
     app.windows.get_mut(&wid).expect("window").last_key_at = Some(t0);
     assert!(
         app.cursor_fx_focus(wid, false, t0 + Duration::from_millis(1)),
@@ -63,13 +49,10 @@ fn typed_wake_pins_cursor_fx_focus() {
         MotionPolicy::Full,
         "a typed-into unfocused window animates its earned trail"
     );
-    // …for the typed window only (a sibling stays demoted)…
     assert!(
         !app.cursor_fx_focus(WindowId(1), false, t0 + Duration::from_millis(1)),
         "the wake is per-window, not app-global"
     );
-    // …and it expires: past the hold the demotion re-engages, so an idle
-    // unfocused window does no decorative work.
     assert!(
         !app.cursor_fx_focus(
             wid,
@@ -78,7 +61,6 @@ fn typed_wake_pins_cursor_fx_focus() {
         ),
         "an expired wake demotes again"
     );
-    // The wake never overrides the accessibility mode.
     app.system_reduce_motion = true;
     assert_eq!(
         app.motion_policy(app.cursor_fx_focus(wid, false, t0 + Duration::from_millis(1))),
@@ -87,10 +69,6 @@ fn typed_wake_pins_cursor_fx_focus() {
     );
 }
 
-/// `cursor_frame` on an unfocused window with a live typed wake lays the
-/// comet's tail (its streak's bed under the swept cells), and an idle tick
-/// past the wake's expiry drains back to the demoted state with no resident
-/// trail.
 #[test]
 fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
     use std::time::{Duration, Instant};
@@ -106,7 +84,6 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
     let t0 = Instant::now();
     app.windows.get_mut(&wid).expect("window").focused = false;
 
-    // Seed the engines on the unfocused window (no wake yet): demoted.
     let mut seed = CursorFxInputs::sample_for_test(t0);
     seed.cur = Some((2, 2));
     let seeded = app.cursor_frame(wid, seed).expect("seed cursor engines");
@@ -115,9 +92,6 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
         "unfocused + idle: W11b demotes (negative control)"
     );
 
-    // A keystroke as the input path delivers it: `last_key_at` stamped, the
-    // cadence heated, a typed move. The next tick paints the trail though the
-    // window never held OS key focus.
     let typed = t0 + Duration::from_millis(1);
     {
         let ws = app.windows.get_mut(&wid).expect("window");
@@ -141,8 +115,6 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
          (the v0.48–v0.50 real-window blackout frame)"
     );
 
-    // Past the wake's hold (which outlives every effect decay) the
-    // demotion re-engages and the engines drain to proven-zero.
     let mut idle = CursorFxInputs::sample_for_test(
         typed + super::CURSOR_FX_TYPED_WAKE + Duration::from_millis(1),
     );
@@ -159,10 +131,6 @@ fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
     );
 }
 
-/// The typed wake's scheduler half: `terminal_effect_frame_active` folds the
-/// same predicate as `cursor_fx_focus`, so an unfocused typed window keeps
-/// getting frames and its comet does not freeze mid-decay. Headless captures
-/// run their own clock, so only this test covers the scheduler half.
 #[test]
 fn typed_wake_arms_the_frame_train_on_an_unfocused_window() {
     use std::time::{Duration, Instant};
@@ -178,14 +146,10 @@ fn typed_wake_arms_the_frame_train_on_an_unfocused_window() {
     let t0 = Instant::now();
     app.windows.get_mut(&wid).expect("window").focused = false;
 
-    // Seed the engines' position the way a real window does, so the live
-    // tick below is a genuine move rather than a first sighting.
     let mut seed = CursorFxInputs::sample_for_test(t0);
     seed.cur = Some((2, 2));
     app.cursor_frame(wid, seed).expect("seed cursor engines");
 
-    // Charge the engines the way the typed window really does: a keystroke
-    // stamps the wake, the engines see the move, one tick commits it.
     let typed = t0 + Duration::from_millis(1);
     {
         let ws = app.windows.get_mut(&wid).expect("window");
@@ -211,8 +175,6 @@ fn typed_wake_arms_the_frame_train_on_an_unfocused_window() {
         "the typed wake arms the frame train, not just the paint policy"
     );
 
-    // Without the wake the same live engines on an unfocused window park;
-    // they are charged, so the park is the focus fold's doing.
     app.windows.get_mut(&wid).expect("window").last_key_at = None;
     let ws = app.windows.get(&wid).expect("window");
     assert!(ws.cursor_fx_active(at, false), "the engines are still live");
@@ -221,8 +183,6 @@ fn typed_wake_arms_the_frame_train_on_an_unfocused_window() {
         "unfocused and untyped: W11b parks the 60 fps lane"
     );
 
-    // And the wake expires with the policy: past the hold the lane parks
-    // again, again asserted against a live engine set.
     let late = typed + super::CURSOR_FX_TYPED_WAKE + Duration::from_millis(1);
     app.windows.get_mut(&wid).expect("window").last_key_at = Some(typed);
     let ws = app.windows.get(&wid).expect("window");
@@ -235,8 +195,6 @@ fn typed_wake_arms_the_frame_train_on_an_unfocused_window() {
         "an expired wake parks the lane again (FL-1's settle)"
     );
 
-    // Policy and scheduler read one predicate: a wake that paints but never
-    // schedules, or the reverse, freezes or blacks out the trail.
     for probe in [t0, typed, typed + Duration::from_secs(1), late] {
         let ws = app.windows.get(&wid).expect("window");
         assert_eq!(
@@ -247,10 +205,6 @@ fn typed_wake_arms_the_frame_train_on_an_unfocused_window() {
     }
 }
 
-/// The `trail status` row resolves focus through the frame path's own fold
-/// (`cursor_fx_focus`), not the bare `motion_focus` seam, so an unfocused
-/// window typed into over the control socket reports the focus its frames
-/// painted with.
 #[test]
 fn trail_status_reads_the_focus_the_frame_path_used() {
     use std::time::Instant;
@@ -267,7 +221,6 @@ fn trail_status_reads_the_focus_the_frame_path_used() {
         "the fixture's front window"
     );
 
-    // Unfocused and idle: the demotion is real, and the row says so.
     {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.focused = false;
@@ -278,8 +231,6 @@ fn trail_status_reads_the_focus_the_frame_path_used() {
         assert!(idle.contains(key), "missing {key:?} in {idle}");
     }
 
-    // …then one keystroke lands on that same unfocused window: the frame path
-    // composes at full amplitude, and the sensor agrees with the glass.
     app.windows.get_mut(&wid).expect("window").last_key_at = Some(Instant::now());
     let typed = app.trail_status().expect("a front window exists");
     for key in [" focused=true", " motion_stage=full"] {
@@ -291,9 +242,6 @@ fn trail_status_reads_the_focus_the_frame_path_used() {
     );
 }
 
-/// `intensity` folds the enable gate beside the policy and shed multiplies:
-/// `enabled = false` emits no geometry whatever the amplitude, so the row
-/// must not print a live intensity beside `glow_active=false`.
 #[test]
 fn trail_status_intensity_folds_the_enable_gate() {
     use crate::WindowId;
@@ -314,8 +262,6 @@ fn trail_status_intensity_folds_the_enable_gate() {
         assert!(dark.contains(key), "missing {key:?} in {dark}");
     }
 
-    // Negative control: with the knob on, the same window reports the live
-    // amplitude again.
     app.config.cursor_trail = Some(true);
     let lit = app.trail_status().expect("a front window exists");
     assert!(lit.contains(" effective=true"), "{lit}");
@@ -325,10 +271,6 @@ fn trail_status_intensity_folds_the_enable_gate() {
     );
 }
 
-/// The `motion_focus` recording pin: an in-flight `video` capture feeds
-/// `true` into the policy's focus input for the recorded window only, so the
-/// unfocused demotion does not zero the effects the recording observes. OS
-/// Reduce Motion still demotes a recorded window.
 #[test]
 fn video_recording_pins_motion_focus() {
     use crate::WindowId;
@@ -338,14 +280,12 @@ fn video_recording_pins_motion_focus() {
     app.config.trail_sounds = Some(false);
     let wid = WindowId(0);
     app.windows.get_mut(&wid).expect("window").focused = false;
-    // Unfocused, no recording: the baseline demotion holds.
     assert!(!app.motion_focus(wid, false));
     assert_eq!(
         app.motion_policy(app.motion_focus(wid, false)),
         MotionPolicy::Reduced,
         "unfocused + unrecorded stays demoted"
     );
-    // Start a recording of this window: the focus input pins true…
     let root =
         std::env::temp_dir().join(format!("aterm-motion-focus-video-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -386,8 +326,6 @@ fn video_recording_pins_motion_focus() {
         "fixture is the formerly clockless unpaced windowed recording"
     );
 
-    // The recording that grants Full motion also keeps the cursor-effect
-    // scheduler on a frame deadline, though `VideoRec` owns no `pace` clock.
     let tick_at = Instant::now();
     let mut seed = CursorFxInputs::sample_for_test(tick_at);
     seed.cur = Some((2, 3));
@@ -429,12 +367,10 @@ fn video_recording_pins_motion_focus() {
         None,
         "without OS focus, typed wake, or recording watcher no new clock is minted"
     );
-    // …for the recorded window only (a sibling stays demoted)…
     assert!(
         !app.motion_focus(WindowId(1), false),
         "the pin is per-window, not app-global"
     );
-    // …and never overrides the accessibility mode.
     app.system_reduce_motion = true;
     assert_eq!(
         app.motion_policy(app.motion_focus(wid, false)),
@@ -445,16 +381,6 @@ fn video_recording_pins_motion_focus() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Load-adaptive shedding: the EMA + hysteresis latch sets `perf_reduced`
-/// only after K consecutive over-budget content presents and clears it only
-/// after K under-budget ones. Under the default (auto) policy a set latch
-/// forces `Reduced`; `motion = "full"` and `load_adaptive_motion = false`
-/// keep animating. The render cost is injected.
-/// THE LOAD-SHED SWITCH DOES NOTHING UNDER ALWAYS ANIMATE, AND ONLY THERE:
-/// with the latch tripped, flipping `load_adaptive_motion` changes neither
-/// the latch the motion policy reads nor the shed envelope exactly when
-/// `MotionMode::admits_load_shed` is false, the one rule Settings' note on
-/// that switch reads.
 #[test]
 fn the_load_shed_switch_is_inert_exactly_where_the_mode_refuses_the_shed() {
     use crate::motion::MotionMode;
@@ -481,8 +407,6 @@ fn the_load_shed_switch_is_inert_exactly_where_the_mode_refuses_the_shed() {
 fn perf_reduced_hysteresis_and_motion_fold() {
     use std::time::Duration;
     let mut app = App::headless_for_test();
-    // Auto + focused + no OS reduce would otherwise animate at full
-    // amplitude; the shed latch is what forces Reduced under this policy.
     app.config.motion = Some("auto".into());
     app.system_reduce_motion = false;
     assert_eq!(
@@ -491,15 +415,12 @@ fn perf_reduced_hysteresis_and_motion_fold() {
         "baseline: an unloaded focused window animates"
     );
 
-    // 60 Hz budget: shed above 1.5×16 = 24 ms, re-engage below 0.8×16 = 12.8 ms.
     let fi = Duration::from_millis(16);
     let slow = 25_000_000u64; // 25 ms render — just over the 24 ms shed threshold.
     let fast = 0u64; // an instant render — well under the 12.8 ms clear threshold.
-    // Synthetic frame clock: the timing is injected.
     let t0 = std::time::Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
 
-    // A single slow frame must not trip the latch (hysteresis).
     assert!(
         !app.note_present_cost(slow, fi, at(0)),
         "one slow frame is not a transition"
@@ -509,7 +430,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
         "hysteresis: a lone slow present does not shed"
     );
     assert_eq!(app.motion_policy(true), MotionPolicy::Full);
-    // The 2nd extends the run; the 3rd (K = 3) trips it and reports the edge.
     assert!(
         !app.note_present_cost(slow, fi, at(16)),
         "second slow frame: still no transition"
@@ -525,7 +445,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
         "the raw latch is effective under default auto policy"
     );
 
-    // Under the default (auto) policy a load-shed window forces Reduced …
     assert_eq!(
         app.motion_policy(true),
         MotionPolicy::Reduced,
@@ -537,8 +456,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
         "shed ⇒ the aurora amplitude is exactly 0 (the proven Reduced state)"
     );
 
-    // … but explicit intent overrides the shed while it is still latched.
-    // `motion = "full"` means "always animate":
     app.config.motion = Some("full".into());
     assert_eq!(
         app.motion_policy(true),
@@ -549,7 +466,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
         !app.load_shed_active(),
         "direct effect gates must honor the same Full override"
     );
-    // …and opting out of the heuristic (auto + load_adaptive_motion = false) does too:
     app.config.motion = Some("auto".into());
     app.config.load_adaptive_motion = Some(false);
     assert_eq!(
@@ -561,7 +477,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
         !app.load_shed_active(),
         "direct effect gates must honor the adaptive opt-out"
     );
-    // Restore the default (auto + shedding on): the latch is still set, so Reduced.
     app.config.load_adaptive_motion = None;
     assert_eq!(
         app.motion_policy(true),
@@ -570,7 +485,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
     );
     assert!(app.load_shed_active());
 
-    // A single fast frame must not clear the latch (hysteresis the other way).
     assert!(
         !app.note_present_cost(fast, fi, at(48)),
         "one fast frame is not a transition"
@@ -580,8 +494,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
         "hysteresis: a lone fast present does not re-engage"
     );
     assert_eq!(app.motion_policy(true), MotionPolicy::Reduced);
-    // Even a sustained fast run does not clear before the dwell: the
-    // post-shed cost lacks the effects' own cost.
     assert!(
         !app.note_present_cost(fast, fi, at(64)),
         "second fast frame: still shed"
@@ -591,7 +503,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
         "K-th fast frame INSIDE the dwell must not clear"
     );
     assert!(app.perf_reduced, "dwell holds the latch shed");
-    // Past the dwell the accumulated fast run clears it on the next sample.
     assert!(
         app.note_present_cost(fast, fi, at(32 + 1600)),
         "a fast frame past the dwell clears the latch"
@@ -605,9 +516,6 @@ fn perf_reduced_hysteresis_and_motion_fold() {
     );
 }
 
-/// One huge present never sheds: a spike ~8× the threshold (a theme switch
-/// invalidating every cache) keeps the decaying EMA over threshold for a few
-/// frames, so the shed qualifier reads the raw sample.
 #[test]
 fn a_single_spike_present_never_sheds() {
     use std::time::Duration;
@@ -615,25 +523,19 @@ fn a_single_spike_present_never_sheds() {
     app.config.motion = Some("auto".into());
     app.system_reduce_motion = false;
 
-    // 60 Hz budget: shed threshold 1.5×16 ≈ 24 ms.
     let fi = Duration::from_millis(16);
     let steady = 1_000_000u64; // 1 ms — a healthy frame.
     let spike = 250_000_000u64; // 250 ms — a theme-reload invalidation storm.
     let t0 = std::time::Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
 
-    // A settled, healthy cadence…
     for i in 0..4 {
         assert!(!app.note_present_cost(steady, fi, at(i * 16)));
     }
-    // …one invalidation-storm present…
     assert!(
         !app.note_present_cost(spike, fi, at(64)),
         "the spike itself is not a transition"
     );
-    // …and the EMA's decay tail (125 → 63 → 31 ms, all over the 24 ms
-    // threshold) must not be mistaken for a sustained overload once the
-    // per-frame cost is instantly healthy again.
     for i in 0..5 {
         assert!(
             !app.note_present_cost(steady, fi, at(80 + i * 16)),
@@ -651,9 +553,6 @@ fn a_single_spike_present_never_sheds() {
     }
 }
 
-/// The shed signal includes the CPU time of GPU encode/submit: a compose-only
-/// sample is blind to it, the causal sample trips the latch, and the cheaper
-/// shed frame then clears it. No claim is made about shader execution.
 #[test]
 fn gpu_submit_cpu_work_is_part_of_the_load_shed_feedback_signal() {
     use std::time::Duration;
@@ -665,8 +564,6 @@ fn gpu_submit_cpu_work_is_part_of_the_load_shed_feedback_signal() {
     let t0 = std::time::Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
 
-    // A compose-only signal stays below the 24 ms threshold even while fake
-    // GPU encode/submit CPU work costs 28 ms.
     let mut compose_only = App::headless_for_test();
     for frame in 0..PERF_HYSTERESIS_FRAMES {
         assert!(!compose_only.note_present_cost(compose_ns, fi, at(u64::from(frame) * 16)));
@@ -691,8 +588,6 @@ fn gpu_submit_cpu_work_is_part_of_the_load_shed_feedback_signal() {
         "causal GPU-submit CPU work trips effect shedding"
     );
 
-    // Shedding lowers the encode/submit cost: the sample falls at once, and
-    // past the dwell the EMA and clear hysteresis restore the full policy.
     let reduced = causal_render_cost_ns(compose_ns, reduced_gpu_submit_cpu_ns);
     assert!(reduced < heavy, "shedding must lower its own causal signal");
     let mut cleared = false;
@@ -706,18 +601,12 @@ fn gpu_submit_cpu_work_is_part_of_the_load_shed_feedback_signal() {
     assert!(!app.perf_reduced);
 }
 
-/// The shed metric includes the effects' cost only while they run, so an
-/// effect-heavy session would oscillate between shed and restore. The dwell
-/// and flap backoff bound the flip rate: each re-shed inside the quick
-/// window doubles the next dwell.
 #[test]
 fn shed_latch_flap_backoff_bounds_transitions() {
     use std::time::Duration;
     let mut app = App::headless_for_test();
     let fi = Duration::from_millis(16);
     let t0 = std::time::Instant::now();
-    // Worst-case oscillator input: over budget whenever effects are on,
-    // instantly under budget whenever they are shed.
     let heavy = 30_000_000u64;
     let cheap = 1_000_000u64;
     let mut transitions = 0u32;
@@ -746,10 +635,6 @@ fn shed_latch_flap_backoff_bounds_transitions() {
     );
 }
 
-/// The shed clears at the sparse cadence a shed window presents at: with
-/// cheap presents every 400 ms (the first inside the wall-clock dwell), the
-/// latch clears within the dwell plus `PERF_HYSTERESIS_FRAMES` presents and
-/// motion returns.
 #[test]
 fn a_shed_clears_at_a_sparse_keystroke_echo_cadence() {
     use std::time::Duration;
@@ -799,10 +684,6 @@ fn a_shed_clears_at_a_sparse_keystroke_echo_cadence() {
     );
 }
 
-/// The load-shed latch keeps its fold for the flying head and every
-/// decoration, and never reaches the resident pet: its posture and its
-/// scheduler gate resolve through the accessibility fold alone, which
-/// still pins it.
 #[test]
 fn a_performance_shed_never_pins_the_pet_and_preserves_head_policy() {
     use std::time::Duration;
@@ -836,8 +717,6 @@ fn a_performance_shed_never_pins_the_pet_and_preserves_head_policy() {
     assert!(!app.resident_pet_motion(), "serious mode retires it");
 }
 
-/// A latch flip drives the cursor glow/trail through the soft envelope: it
-/// ramps over the fade window and anchors mid-fade on reversal.
 #[test]
 fn shed_envelope_fades_and_anchors_mid_fade() {
     use std::time::Duration;
@@ -850,7 +729,6 @@ fn shed_envelope_fades_and_anchors_mid_fade() {
         app.note_present_cost(30_000_000, fi, at(f * 16));
     }
     assert!(app.perf_reduced, "latched at t=32ms");
-    // Fade-out: full at the flip, ~half at half the window, 0 after.
     assert_eq!(app.shed_envelope(at(32)), 1.0);
     let mid = app.shed_envelope(at(32 + 225));
     assert!(
@@ -862,8 +740,6 @@ fn shed_envelope_fades_and_anchors_mid_fade() {
         0.0,
         "fade-out completes to the proven zero"
     );
-    // Restore past the dwell (the EMA needs several fast frames to clear):
-    // the envelope ramps back up from where it was.
     for f in 0..8u64 {
         app.note_present_cost(1_000_000, fi, at(2000 + f * 16));
     }
@@ -954,10 +830,6 @@ fn motion_transition_settlement_invalidates_retained_native_frame() {
     );
 }
 
-/// Smooth scroll survives load shedding: under a latch engaged as production
-/// engages it, a wheel notch in a focused window still arms a glide, the
-/// mid-ease tick keeps it armed, the compose tail presents the sub-row band,
-/// and the settle leaves it alone. OS Reduce Motion still lands the glide.
 #[test]
 fn load_shed_latch_never_demotes_smooth_scroll() {
     use crate::{WindowId, term_lock};
@@ -983,8 +855,6 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
         );
     }
 
-    // Engage the latch the way production does: K consecutive presents
-    // over 1.5× the 8.33 ms budget of a 120 Hz panel (13 ms > 12.5 ms).
     let fi = Duration::from_micros(8_333);
     let t0 = Instant::now();
     for frame in 0..PERF_HYSTERESIS_FRAMES {
@@ -994,7 +864,6 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
             t0 + Duration::from_millis(u64::from(frame) * 8),
         );
     }
-    // Controls: the latch is engaged and decoration is shed.
     assert!(app.load_shed_active(), "control: the latch engaged");
     assert_eq!(
         app.motion_policy(true),
@@ -1006,7 +875,6 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
         MotionPolicy::Reduced,
         "control: a decorative effect resolves through the latch"
     );
-    // The functional pair resolves through accessibility alone.
     assert_eq!(
         app.effect_policy(MotionEffect::SmoothScroll, true),
         MotionPolicy::Full
@@ -1017,7 +885,6 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
     );
     assert!(app.smooth_scroll_animates(wid));
 
-    // A wheel notch under the latch arms a glide.
     let offset_before = term_lock(&term).grid().display_offset();
     let wheel_at = Instant::now();
     app.scroll_wheel_animated(wid, &term, 3);
@@ -1030,15 +897,11 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
         offset_before,
         "the notch eases; it does not snap the engine whole-row"
     );
-    // Mid-ease (≤ 90 ms of a 180 ms glide) the tick samples and keeps the
-    // glide armed instead of landing it.
     app.tick_scroll_glide(wid, wheel_at + Duration::from_millis(90));
     assert!(
         app.windows[&wid].scroll_glide.is_some(),
         "the mid-ease tick must not land the glide under the latch"
     );
-    // The compose tail presents whatever the bank holds (a known residual,
-    // so the assertion does not depend on the ease's wall-clock sample).
     app.windows.get_mut(&wid).unwrap().scroll_frac_px = 5;
     app.set_scroll_band(wid);
     assert_eq!(
@@ -1049,9 +912,6 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
         !app.settle_scroll_motion_if_reduced(wid, Instant::now()),
         "the shared settle resolves Full and leaves the glide alone"
     );
-    // A latch edge under a live glide leaves it armed: clear the latch (K
-    // fast presents after the 1.5 s dwell) and re-shed with the glide in
-    // flight.
     for frame in 0..PERF_HYSTERESIS_FRAMES {
         app.note_present_cost(
             0,
@@ -1073,7 +933,6 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
         "a shed edge must not land a glide in flight"
     );
 
-    // The exemption is narrow: accessibility still demotes.
     app.system_reduce_motion = true;
     assert_eq!(
         app.effect_policy(MotionEffect::SmoothScroll, true),
@@ -1087,7 +946,6 @@ fn load_shed_latch_never_demotes_smooth_scroll() {
     assert_eq!(app.windows[&wid].scroll_frac_px, 0);
     app.set_scroll_band(wid);
     assert_eq!(app.windows[&wid].input_scratch.scroll_frac_px, 0);
-    // …and so does the unfocused demotion, latch or no latch.
     app.system_reduce_motion = false;
     assert_eq!(
         app.effect_policy(MotionEffect::SmoothScroll, false),

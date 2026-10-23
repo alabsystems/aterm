@@ -124,6 +124,8 @@ impl Rig {
         match self.core.companion_view(R) {
             None => {
                 // The record is gone: any companion the core still holds anywhere (there is no
+                // other record) is one its master's close left behind. That the server closes
+                // the descriptors the core lets go is `server.rs`'s test.
                 st.insert("state", 3);
                 st.insert(
                     "comp",
@@ -195,6 +197,7 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
     match action {
         "Release" => {
             // The last claim closes the tab: the reader's, or the outgoing window's once its
+            // successor's claim ended.
             let last = if before["live"] == 1 {
                 reader
             } else {
@@ -204,6 +207,7 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
         }
         "SuccessorCommits" => {
             // The reader names window `next` as its successor; the successor says HELLO as a
+            // window that journals, and registers the master at its Commit.
             let now = rig.tick();
             rig.live.insert(pid_of(next));
             rig.core.pending(conn_of(reader), pid_of(next), now, None);
@@ -217,6 +221,7 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
         }
         "OutgoingEnds" => {
             // The outgoing window's process ends by a signal (its Commit's own `exit(0)` inside
+            // the death grace is a hold, which the model leaves to `PtyKeeperCustody`).
             rig.die(before["outgoing"]);
             env.insert("outgoing", 0);
         }

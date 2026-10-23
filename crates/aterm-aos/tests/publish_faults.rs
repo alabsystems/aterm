@@ -17,7 +17,6 @@ use crate::toy::{
 
 use ToyInput::{Add, Reset, Tick};
 
-/// Everything that makes up the installed pair, as one comparable value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PairView {
     code: ArtifactId,
@@ -59,7 +58,6 @@ fn classify(v: &PairView, old: &PairView, new: &PairView) -> Installed {
     }
 }
 
-/// A paused boundary over the stranded code with two inputs queued, and its ancestor.
 fn paused_base() -> (ToyBoundary, Checkpoint) {
     let mut b = attached(Variant::Stranded, 4);
     let c0 = b.checkpoint().unwrap().clone();
@@ -70,10 +68,6 @@ fn paused_base() -> (ToyBoundary, Checkpoint) {
     (b, c0)
 }
 
-/// The pair a commit of the good candidate over [`paused_base`] installs, built from the
-/// documented contract rather than read back from a commit: the candidate code, its replayed
-/// state, the next revision on the same branch at the paused cursors, and a fresh checkpoint
-/// of that state (parent: the old ancestor) that opens log epoch 2.
 #[cfg(debug_assertions)]
 fn new_view(base: &ToyBoundary, c0: &Checkpoint) -> PairView {
     use aterm_aos::task::state_digest;

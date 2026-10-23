@@ -1827,6 +1827,7 @@ pub fn scan_frames(
         let exclude: Vec<PixelBox> = animal_box.filter(|_| !fused).into_iter().collect();
 
         let metrics = if frame_no == 0 || duplicate {
+            // Frame 0 is the baseline; a resample inherits its predecessor's
             // shape and adds no ink.
             prev_metrics.clone()
         } else {

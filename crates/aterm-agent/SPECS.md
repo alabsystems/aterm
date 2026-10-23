@@ -3100,9 +3100,9 @@ Status 2026-10-17: the rows of those six are gone, and so is the **move-to-bench
 1. Fixed 2026-10-16: `event_record`/`err_record` escape addressing fields as well as bodies; `federated_addresses_cannot_break_ndjson` covers peer-provided channel identities.
 2. `src/drive_cli.rs::a_listener_replaced_after_the_route_is_picked_is_sent_its_own_token`: the assert message names the token the route was picked by, but the asserted value is the successor's token.
 4. `src/drive_cli.rs::the_round_11_flags_belong_to_their_verbs`: the name is a review-round label, not a property; rename on migration.
-5. `src/harness/accounts_tests.rs::the_signed_out_labels_are_the_enrolled_ones_in_roster_order`: signed_out also excludes rows with an email; no test samples that clause.
+5. Fixed 2026-10-22: `src/harness/accounts_tests.rs::the_signed_out_labels_are_the_enrolled_ones_in_roster_order` samples `signed_out` excluding rows with an email.
 6. Several cli and disk tests date fixtures against the real wall clock (`now_after_write`, `idle_now`), contrary to the module docs' clock-independence claim.
-7. `src/harness/disk_target_tests.rs::a_lock_is_released_while_a_child_forked_under_it_has_yet_to_exec` spawns with a bare `std::process::Command` + `pre_exec`, bypassing `aterm_uds::spawnfd::command`; check it carries the sanctioned-use expect.
+7. Fixed 2026-10-22: `src/harness/disk_target_tests.rs::Parked` forks directly via `libc::fork` + `libc::_exit` without a bare `std::process::Command` or `pre_exec` error pipe.
 8. `src/harness/footer_tests.rs::the_tail_takes_the_newest_main_thread_model_and_effort`: scan() decides effort from any non-sidechain row with an `effort` key, contradicting TailFacts::effort's doc; the fixture cannot tell which is intended.
 10. `src/harness/transcript_corpus_tests.rs::transcript_projections_answer_as_recorded`: its Err halves pin aterm_json's Display text (prose pinning).
 11. `src/harness/footer_tests.rs::tail_cache_reuses_only_one_process_and_one_unchanged_file` sleeps 20 ms with no effect on what is asserted; drop the sleep.

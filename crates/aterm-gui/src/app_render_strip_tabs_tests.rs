@@ -5,8 +5,6 @@
 
 use crate::{App, WindowId, tab_bar, term_lock};
 
-/// Fill the window's render scratch from the engine, as the redraw does before
-/// its splices.
 fn fill_scratch(app: &mut App, wid: WindowId) {
     let (rows, cols) = {
         let ws = &app.windows[&wid];
@@ -22,7 +20,6 @@ fn fill_scratch(app: &mut App, wid: WindowId) {
     term.cell_frame_into(&mut ws.input_scratch, rows, cols);
 }
 
-/// Start a find for `query` the way typing does, and run it.
 fn find(app: &mut App, wid: WindowId, query: &str) {
     app.search_enter();
     app.windows
@@ -35,13 +32,6 @@ fn find(app: &mut App, wid: WindowId, query: &str) {
     app.search_recompute();
 }
 
-/// THE FLOOR FOLLOWS THE FRAME (Windows tabs): an unsplit terminal is the
-/// ground; the find panel on the top row and the message band are the band's
-/// tone, which the selected tab cannot take; a split's pane headers wear the
-/// ground (the Fluent chrome), so the tab opens into them; Settings in front is
-/// its page's surface. NEGATIVE CONTROL: the 2026-10-18 splice read no floor,
-/// and the selected tab was the ground over all of them (the judges'
-/// `selected-tab-opens-onto-grey-band`, `settings-tab-ground-mismatch`).
 #[test]
 fn the_strip_floor_is_what_the_frame_puts_under_the_seam() {
     if !tab_bar::SELECTED_TAB_IS_GROUND {
@@ -102,10 +92,6 @@ fn the_strip_floor_is_what_the_frame_puts_under_the_seam() {
     );
 }
 
-/// The strip splice's reading of the find panel ([`App::find_panel_meets_strip`])
-/// agrees with where `splice_find_bar` then paints it: on the top row while the
-/// current match is clear of it, floated to the bottom while the match sits
-/// under it (the strip then opens onto the grid again).
 #[test]
 fn find_panel_placement_matches_the_strip_floor() {
     for (output, top) in [
@@ -135,10 +121,6 @@ fn find_panel_placement_matches_the_strip_floor() {
     }
 }
 
-/// The floor is a strip cache term: opening the find panel under an unchanged
-/// strip rebuilds the band, which closes the seam under the selected tab.
-/// NEGATIVE CONTROL: a cache keyed without the floor kept the open tab over the
-/// panel until the next title or hover change.
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn a_floor_change_rebuilds_the_strip_band() {

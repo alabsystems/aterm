@@ -288,13 +288,6 @@ pub(super) fn is_dmg(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".dmg")
 }
 
-/// Bounded copy of a mounted image's tree into `dir`, under the
-/// same entry/byte ceilings and in-root symlink vetting as archive
-/// extraction. A symlink the vetting refuses (the customary
-/// `Applications -> /Applications` Finder alias) is skipped, not
-/// followed and not fatal; the cask artifact census still judges
-/// what must be present afterwards. Anything that is not a
-/// directory, regular file or symlink is a hard refusal.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
     use crate::install::{MAX_ENTRIES, UNSIGNED_SIZE_CAP};
@@ -544,8 +537,8 @@ fn run_dmg_helper(
     .unwrap_or(Err(aterm_uds::deadline::RunError::TimedOut))
 }
 
-/// Extract a disk image by mounting it read-only and copying the payload out under the bounded,
-/// vetted [`copy_mounted_tree`].
+/// Extract a disk image by mounting it read-only and copying the payload out with
+/// [`copy_mounted_tree`].
 #[cfg(target_os = "macos")]
 pub(super) fn extract_dmg(dmg: &Path, dir: &Path) -> Result<(), DmgError> {
     let root = aterm_tempfile::tempdir().map_err(|e| DmgError::Attach(e.to_string()))?;
@@ -605,7 +598,7 @@ pub(super) fn extract_dmg(_dmg: &Path, _dir: &Path) -> Result<(), DmgError> {
     Err(DmgError::Attach("disk images need macOS".to_string()))
 }
 
-/// Copy one already-verified regular cache file.
+/// Copy one regular file, refusing a symlink or any other non-regular source.
 pub(super) fn copy_regular(src: &Path, dst: &Path) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(src).map_err(|e| format!("abrew: {e}"))?;
     if !meta.file_type().is_file() {

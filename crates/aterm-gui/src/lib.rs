@@ -433,6 +433,7 @@ mod message_reporters;
 mod messages_host;
 mod messages_store;
 mod occupancy_host;
+mod occupancy_ring;
 mod owned_endpoint;
 mod palette;
 mod paste_banner;
@@ -823,7 +824,7 @@ fn plain_path_at(
 }
 
 /// The GUI's default font family, tried ahead of the library's `FONT_CANDIDATES`.
-pub(crate) fn default_font_family() -> Option<&'static str> {
+pub(crate) const fn default_font_family() -> Option<&'static str> {
     None
 }
 
@@ -1109,7 +1110,7 @@ fn effect_present_interval_with(panel: Option<Duration>, periods: u32) -> Durati
     effect_tick_interval(panel) * periods.max(1)
 }
 
-fn present_queue_admits_panel_rate(queue: PresentQueue) -> bool {
+const fn present_queue_admits_panel_rate(queue: PresentQueue) -> bool {
     match queue {
         PresentQueue::NonBlocking | PresentQueue::Unknown => true,
         PresentQueue::Fifo(queued) => queued >= 2,
@@ -1614,7 +1615,7 @@ mod wake_census {
         ADMISSION_WINDOWS.with(Cell::get)
     }
 
-    /// `` as of the last admission entry, and forget it.
+    /// `(pool visits, terminal locks)` as of the last admission entry, and forget it.
     pub(crate) fn take_at_admission() -> Option<(u64, u64)> {
         AT_ADMISSION.with(Cell::take)
     }
@@ -1964,6 +1965,7 @@ impl std::ops::DerefMut for TermGuard<'_> {
 
 impl Drop for TermGuard<'_> {
     fn drop(&mut self) {
+        // A panicking holder may have left the engine half-written: its frame
         // is not read.
         if let FrameHold::Watched(watchers, before) = &self.frame
             && !std::thread::panicking()
@@ -2074,7 +2076,7 @@ fn paste_needs_confirm(text: &str, bracketed: bool) -> bool {
     !bracketed && text.contains(['\n', '\r'])
 }
 
-fn launch_alert_wanted(headless: bool, stderr_is_tty: bool) -> bool {
+const fn launch_alert_wanted(headless: bool, stderr_is_tty: bool) -> bool {
     !headless && !stderr_is_tty
 }
 
@@ -2113,6 +2115,7 @@ fn fatal_launch_error(headless: bool, detail: &str) -> ! {
 /// Leave the process with `code` now, with no `atexit` handlers, static destructors or runtime cleanup.
 #[cfg(unix)]
 pub(crate) fn exit_without_process_teardown(code: i32) -> ! {
+    // `_exit`, after removing this process's crash marker: a launch-fatal is a
     // diagnosed exit, not a kill, and must not read as one at the next launch.
     crash_signal::clean_exit_now(code)
 }
@@ -2138,6 +2141,7 @@ mod launch_fatal_exit_tests {
     }
 
     extern "C" fn the_driver_destructors_ran() {
+        // `_exit`, through the crate's one spelling of it: no further handler
         // or destructor runs, and nothing returns.
         crate::crash_signal::clean_exit_now(HANDLER_RAN)
     }
@@ -2276,6 +2280,7 @@ mod win32 {
             }
             for (kind, handle) in parent {
                 if !absent(handle) {
+                    // The parent supplied this one (a redirection or an inherited
                     // pipe): put it back over the console handle.
                     let _ = SetStdHandle(kind, handle);
                 }
@@ -2619,7 +2624,7 @@ struct SelectionFingerprint {
 }
 
 impl SelectionFingerprint {
-    fn of(sel: &aterm_core::selection::TextSelection) -> Self {
+    const fn of(sel: &aterm_core::selection::TextSelection) -> Self {
         SelectionFingerprint {
             state: sel.state(),
             kind: sel.selection_type(),
@@ -3676,7 +3681,7 @@ struct ScrollbackReclaim {
 }
 
 impl ScrollbackReclaim {
-    fn record(&mut self, shed: aterm_core::terminal::HistoryShed) {
+    const fn record(&mut self, shed: aterm_core::terminal::HistoryShed) {
         self.reached += 1;
         if shed.freed() > 0 {
             self.trimmed += 1;
@@ -3722,7 +3727,7 @@ pub(crate) enum TabAction {
 }
 
 impl Wake {
-    fn redraw(session: u64) -> Wake {
+    const fn redraw(session: u64) -> Wake {
         Wake::Output {
             session,
             window: WindowId(0),
@@ -3765,6 +3770,7 @@ impl GpuBackend {
         let changed = self.renderer.pad() != pad;
         self.renderer.set_pad(pad);
         if changed {
+            // `Renderer::set_pad` starts a fresh symmetric regime on a real
             // change. Mirror that rule in the visible authority.
             self.visible_pad_top = pad;
         }
@@ -3804,7 +3810,7 @@ impl std::ops::DerefMut for GpuBackend {
     }
 }
 
-fn visible_frame_height(raw_height: usize, pad: usize, pad_top: usize) -> usize {
+const fn visible_frame_height(raw_height: usize, pad: usize, pad_top: usize) -> usize {
     raw_height.saturating_sub(pad.saturating_sub(pad_top))
 }
 
@@ -4455,18 +4461,18 @@ impl Backend {
         }
     }
 
-    fn is_gpu(&self) -> bool {
+    const fn is_gpu(&self) -> bool {
         matches!(self, Backend::Gpu(_))
     }
 
-    fn gpu_mut(&mut self) -> Option<&mut aterm_gpu::GpuRenderer> {
+    const fn gpu_mut(&mut self) -> Option<&mut aterm_gpu::GpuRenderer> {
         match self {
             Backend::Gpu(g) => Some(&mut g.renderer),
             Backend::Cpu(_) => None,
         }
     }
 
-    fn gpu_ref(&self) -> Option<&aterm_gpu::GpuRenderer> {
+    const fn gpu_ref(&self) -> Option<&aterm_gpu::GpuRenderer> {
         match self {
             Backend::Gpu(g) => Some(&g.renderer),
             Backend::Cpu(_) => None,
@@ -4877,7 +4883,7 @@ impl BackendSlot {
         }
     }
 
-    fn is_pending(&self) -> bool {
+    const fn is_pending(&self) -> bool {
         matches!(self, BackendSlot::Pending(_))
     }
 
@@ -5134,7 +5140,7 @@ impl Lease {
 
     /// Whether this lease still blocks a new lease/`turn` acquisition at `now_us`.
     #[must_use]
-    pub fn is_live(&self, now_us: u64) -> bool {
+    pub const fn is_live(&self, now_us: u64) -> bool {
         match self {
             Lease::Turn { .. } => true,
             Lease::Drive { expires_us, .. } => *expires_us > now_us,
@@ -5143,7 +5149,7 @@ impl Lease {
 
     /// Whether a driver may still type into the session at `now_us` (a `turn` before settle, or a live drive lease).
     #[must_use]
-    pub(crate) fn driver_may_type(&self, now_us: u64) -> bool {
+    pub(crate) const fn driver_may_type(&self, now_us: u64) -> bool {
         match self {
             Lease::Turn { typing, .. } => *typing,
             Lease::Drive { expires_us, .. } => *expires_us > now_us,
@@ -5299,24 +5305,24 @@ struct TabIndex {
 }
 
 impl TabIndex {
-    fn new(active: usize, count: usize) -> Self {
+    const fn new(active: usize, count: usize) -> Self {
         TabIndex { active, count }
     }
 
-    fn add(&mut self) -> usize {
+    const fn add(&mut self) -> usize {
         self.count += 1;
         self.active = self.count - 1;
         self.active
     }
 
-    fn switch_to(&mut self, i: usize) -> usize {
+    const fn switch_to(&mut self, i: usize) -> usize {
         if i < self.count {
             self.active = i;
         }
         self.active
     }
 
-    fn cycle(&mut self, forward: bool) -> usize {
+    const fn cycle(&mut self, forward: bool) -> usize {
         if self.count <= 1 {
             return self.active;
         }
@@ -5328,7 +5334,7 @@ impl TabIndex {
         self.active
     }
 
-    fn close(&mut self, i: usize) -> bool {
+    const fn close(&mut self, i: usize) -> bool {
         // Distinct branch.
         if i >= self.count {
             // Distinct branch.
@@ -5519,7 +5525,7 @@ impl SessionPool {
             &p.session
         })
     }
-    fn insert_epoch(&self) -> u64 {
+    const fn insert_epoch(&self) -> u64 {
         self.insert_epoch
     }
     #[cfg(unix)]
@@ -5598,12 +5604,13 @@ pub(crate) struct OverlayCoordinateTransform {
 }
 
 /// Resolve the matrix-rain `seed = 0` sentinel into a deterministic per-window seed.
-pub(crate) fn rain_config_for_window(
+pub(crate) const fn rain_config_for_window(
     mut cfg: matrix_rain::RainConfig,
     wid: WindowId,
 ) -> matrix_rain::RainConfig {
     // Distinct branch.
     if cfg.seed == 0 {
+        // splitmix64 finalizer (never returns 0); the salt keeps window 0 off
         // the raw-zero input.
         cfg.seed = aterm_effects::genome::mix(wid.0 ^ 0x5048_4F53_5048_4F52); // "PHOSPHOR"
     }
@@ -5620,7 +5627,7 @@ const TRANSLUCENT_CAPTURE_ERROR: &str = "full-window artifact is unavailable for
 client because the compositor/backdrop pixels are not renderer-owned; use `image` for raw \
 application-rendered pixels or set background_opacity = 1";
 
-fn raw_present_capture_guard(
+const fn raw_present_capture_guard(
     background_opacity: f32,
     compositor_blends_client: bool,
 ) -> Result<(), &'static str> {
@@ -5664,7 +5671,7 @@ const HOST_CAPTURE: PlatformCaptureTraits = if cfg!(target_os = "macos") {
     LINUX_CAPTURE
 };
 
-fn translucent_gpu_client(
+const fn translucent_gpu_client(
     knobs: &app_config::RenderKnobs,
     backend_is_gpu: bool,
     has_gpu_surface: bool,
@@ -5694,7 +5701,7 @@ fn platform_capture_guards(
     }
 }
 
-fn video_post_present_should_finalize(
+const fn video_post_present_should_finalize(
     deadline_reached: bool,
     resized_or_format_stopped: bool,
 ) -> bool {
@@ -5714,7 +5721,7 @@ pub(crate) enum VideoMode {
 
 impl VideoMode {
     /// The index.json `meta.mode` string.
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             VideoMode::SwapchainTap => "swapchain-tap",
             VideoMode::OffscreenPresentReal => "offscreen-present-real",
@@ -5722,7 +5729,7 @@ impl VideoMode {
     }
 
     /// The index.json `meta.stamp_semantics` disclosure for this mode.
-    pub(crate) fn stamp_semantics(self) -> &'static str {
+    pub(crate) const fn stamp_semantics(self) -> &'static str {
         match self {
             VideoMode::SwapchainTap => {
                 "CPU time frame.present() returned; submitted to WSI present; compositor visibility and scanout not observed"
@@ -5734,7 +5741,7 @@ impl VideoMode {
     }
 }
 
-fn video_capture_mode(
+const fn video_capture_mode(
     has_glass: bool,
     has_gpu_surface: bool,
     gpu_backend: bool,
@@ -6023,7 +6030,7 @@ impl VideoInputSample {
     }
 }
 
-fn video_sample_for_key(key: &aterm_types::keyboard::Key) -> Option<VideoInputSample> {
+const fn video_sample_for_key(key: &aterm_types::keyboard::Key) -> Option<VideoInputSample> {
     use aterm_types::keyboard::{Key, NamedKey};
     match key {
         Key::Character(ch) => Some(VideoInputSample::Char(*ch)),
@@ -6371,7 +6378,7 @@ impl PresentRetry {
         }
     }
 
-    fn present_attempt_allowed(&self) -> bool {
+    const fn present_attempt_allowed(&self) -> bool {
         self.deadline.is_none() && !self.parked
     }
 
@@ -6386,7 +6393,7 @@ impl PresentRetry {
         };
     }
 
-    fn on_recovery_redraw_serviced(&mut self) {
+    const fn on_recovery_redraw_serviced(&mut self) {
         self.recovery_redraw_outstanding = false;
     }
 
@@ -6490,7 +6497,7 @@ struct GpuAcquireWait {
 }
 
 impl GpuAcquireWait {
-    fn begin(&mut self, surface: u64) {
+    const fn begin(&mut self, surface: u64) {
         self.pending_surface = Some(surface);
     }
 
@@ -6886,11 +6893,11 @@ impl WindowState {
         self.last_present = Some(key);
     }
 
-    fn on_present_dropped(&mut self) {
+    const fn on_present_dropped(&mut self) {
         self.last_present = None;
     }
 
-    fn current_gpu_acquire_id(&self) -> Option<u64> {
+    const fn current_gpu_acquire_id(&self) -> Option<u64> {
         match self.present.as_ref() {
             Some(PresentTarget::Gpu { gpu_surface, .. }) => Some(gpu_surface.acquire_id()),
             _ => None,
@@ -7000,11 +7007,13 @@ impl WindowState {
         self.capture_present_serial = self.capture_present_serial.wrapping_add(1);
     }
 
-    fn painted_for_handoff(&self) -> bool {
+    const fn painted_for_handoff(&self) -> bool {
         self.capture_present_serial > 0 && self.pending_reveal.is_none()
     }
 
     fn cursor_fx_active(&self, now: Instant, animate_cursor_cat: bool) -> bool {
+        // Every engine below paints terminal content. A native or empty front may retain
+        // latched animation state for when its terminal is visible again, but that state
         // must never own the native app's scheduler.
         if self.front_terminal().is_none() {
             return false;
@@ -7067,7 +7076,7 @@ impl WindowState {
         }
     }
 
-    fn note_acquire_wait(&mut self, acquire_wait_ns: u64) {
+    const fn note_acquire_wait(&mut self, acquire_wait_ns: u64) {
         if acquire_wait_ns >= EFFECT_LANE_ACQUIRE_PARK_NS {
             self.effect_lane_parked = true;
         }
@@ -7271,6 +7280,8 @@ impl WindowState {
             && self.cursor_fx_active(now, cursor_cat_motion)
             && let Some(d) = self.next_trail_tick
         {
+            // Presentability-edge settle: a focus or typed-wake expiry seen just before
+            // the armed deadline keeps only the already-owned slot, so the demoted
             // redraw paints settled pixels; without one, no wake train is created.
             Some(d)
         } else if has_glass
@@ -7314,7 +7325,7 @@ impl WindowState {
             .flatten()
     }
 
-    fn park_terminal_effect_scheduler(&mut self) {
+    const fn park_terminal_effect_scheduler(&mut self) {
         self.next_trail_tick = None;
         self.last_trail_fire = None;
         self.effect_lane_parked = false;
@@ -7377,28 +7388,28 @@ impl WindowState {
         self.sync_holding_gauge.set(self.sync_hold_until.is_some());
     }
 
-    fn palette(&self) -> Option<&crate::palette::PaletteState> {
+    const fn palette(&self) -> Option<&crate::palette::PaletteState> {
         match &self.overlay {
             Some(crate::overlay::Overlay::Palette(p)) => Some(p),
             _ => None,
         }
     }
 
-    fn palette_mut(&mut self) -> Option<&mut crate::palette::PaletteState> {
+    const fn palette_mut(&mut self) -> Option<&mut crate::palette::PaletteState> {
         match &mut self.overlay {
             Some(crate::overlay::Overlay::Palette(p)) => Some(p),
             _ => None,
         }
     }
 
-    fn overview(&self) -> Option<&crate::overview::OverviewState> {
+    const fn overview(&self) -> Option<&crate::overview::OverviewState> {
         match &self.overlay {
             Some(crate::overlay::Overlay::Overview(m)) => Some(m),
             _ => None,
         }
     }
 
-    fn overview_mut(&mut self) -> Option<&mut crate::overview::OverviewState> {
+    const fn overview_mut(&mut self) -> Option<&mut crate::overview::OverviewState> {
         match &mut self.overlay {
             Some(crate::overlay::Overlay::Overview(m)) => Some(m),
             _ => None,
@@ -7421,11 +7432,11 @@ impl WindowState {
             .map_or(0, crate::overlay::Overlay::fingerprint)
     }
 
-    fn overlay(&self) -> Option<&crate::overlay::Overlay> {
+    const fn overlay(&self) -> Option<&crate::overlay::Overlay> {
         self.overlay.as_ref()
     }
 
-    fn overlay_open(&self) -> bool {
+    const fn overlay_open(&self) -> bool {
         self.overlay.is_some()
     }
 
@@ -7873,7 +7884,7 @@ fn hands_off_keys(focused: bool, last_keystroke_at: Option<Instant>, now: Instan
             .is_none_or(|at| now.saturating_duration_since(at) >= AUTOMATIC_UPDATE_KEYSTROKE_GAP)
 }
 
-fn os_window_focused(ws: &WindowState) -> bool {
+const fn os_window_focused(ws: &WindowState) -> bool {
     #[cfg(test)]
     if ws.os_window_for_test {
         return ws.focused;
@@ -7883,7 +7894,7 @@ fn os_window_focused(ws: &WindowState) -> bool {
 
 /// True once the latest consumed PTY burst is old enough for automatic update admission.
 #[inline]
-pub(crate) fn automatic_output_activity_quiet(now_ns: u64, latest_output_ns: u64) -> bool {
+pub(crate) const fn automatic_output_activity_quiet(now_ns: u64, latest_output_ns: u64) -> bool {
     latest_output_ns == 0
         || now_ns.saturating_sub(latest_output_ns) >= AUTOMATIC_UPDATE_QUIET_EPOCH_NS
 }
@@ -8142,7 +8153,7 @@ enum UpdateHandoffEventClass {
 }
 
 #[must_use]
-fn update_handoff_window_event_class(event: &WindowEvent) -> UpdateHandoffEventClass {
+const fn update_handoff_window_event_class(event: &WindowEvent) -> UpdateHandoffEventClass {
     match event {
         WindowEvent::RedrawRequested | WindowEvent::Occluded(_) | WindowEvent::Focused(_) => {
             UpdateHandoffEventClass::Exempt
@@ -8226,7 +8237,7 @@ mod focus_replayed_press_tests {
     }
 }
 
-fn handoff_deferrable_input(event: &WindowEvent) -> bool {
+const fn handoff_deferrable_input(event: &WindowEvent) -> bool {
     matches!(
         event,
         WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_) | WindowEvent::Ime(_)
@@ -8234,7 +8245,7 @@ fn handoff_deferrable_input(event: &WindowEvent) -> bool {
 }
 
 #[must_use]
-fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
+const fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
     match ev {
         Wake::Output { .. }
         | Wake::QueuedKeyDelivered { .. }
@@ -8268,7 +8279,7 @@ fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
 }
 
 #[must_use]
-fn input_event_handoff_class(ev: &input::InputEvent) -> UpdateHandoffEventClass {
+const fn input_event_handoff_class(ev: &input::InputEvent) -> UpdateHandoffEventClass {
     match ev {
         input::InputEvent::Key { .. }
         | input::InputEvent::Text(_)
@@ -8511,26 +8522,26 @@ impl UpdateHandoffStartError {
     }
 
     #[cfg(unix)]
-    fn is_activity_deferred(&self) -> bool {
+    const fn is_activity_deferred(&self) -> bool {
         matches!(self, Self::ActivityDeferred(_))
     }
 
-    fn is_refused(&self) -> bool {
+    const fn is_refused(&self) -> bool {
         matches!(self, Self::Refused(_))
     }
 
     #[cfg(unix)]
-    fn is_park_missed(&self) -> bool {
+    const fn is_park_missed(&self) -> bool {
         matches!(self, Self::ParkMissed(_))
     }
 
     #[cfg(unix)]
-    fn is_capture_refused(&self) -> bool {
+    const fn is_capture_refused(&self) -> bool {
         matches!(self, Self::CaptureRefused(_))
     }
 
     #[cfg(unix)]
-    fn held_for_read_of(&self) -> Option<HeldPersonApply> {
+    const fn held_for_read_of(&self) -> Option<HeldPersonApply> {
         match self {
             Self::HeldForRead {
                 target_build,
@@ -8600,6 +8611,7 @@ fn release_committed_readers(
 #[must_use]
 fn handoff_proof_term(master: i32, device_term: bool) -> Option<i32> {
     if !device_term {
+        // Inherited: `execve` copied the parent's descriptor table verbatim, so
         // the number is a value both sides compute and agree on.
         return Some(master);
     }
@@ -8757,7 +8769,7 @@ fn fold_auto_apply_deadline(
 }
 
 #[must_use]
-fn should_dispatch_boot_health_confirmation(
+const fn should_dispatch_boot_health_confirmation(
     headless: bool,
     headless_ready: bool,
     first_present_done: bool,
@@ -8789,7 +8801,7 @@ enum RestorePassSite {
 }
 
 #[must_use]
-fn restore_pass_due(
+const fn restore_pass_due(
     site: RestorePassSite,
     handoff_lane: bool,
     first_present_done: bool,
@@ -8852,7 +8864,7 @@ impl SessionChromeExpiryScan {
         }
     }
 
-    fn pending(&self) -> bool {
+    const fn pending(&self) -> bool {
         self.session.is_some()
     }
 }
@@ -8888,7 +8900,7 @@ mod resample_cause_tests {
 }
 
 #[cfg(any(target_os = "macos", windows, test))]
-fn resample_wants_repair_frame(cause: ResampleCause) -> bool {
+const fn resample_wants_repair_frame(cause: ResampleCause) -> bool {
     cfg!(windows) && matches!(cause, ResampleCause::SettingsBurst)
 }
 
@@ -9377,13 +9389,13 @@ type PasteConfirmPayload = std::rc::Rc<
 impl App {
     /// Read-only effective serious-mode status for menu/palette/control wiring.
     #[must_use]
-    pub(crate) fn serious_mode_enabled(&self) -> bool {
+    pub(crate) const fn serious_mode_enabled(&self) -> bool {
         self.serious_mode
     }
 
     /// The decorative-output projection shared by transitions and render/audio gates.
     #[must_use]
-    pub(crate) fn serious_mode_policy(&self) -> crate::motion::SeriousModePolicy {
+    pub(crate) const fn serious_mode_policy(&self) -> crate::motion::SeriousModePolicy {
         crate::motion::SeriousModePolicy::resolve(self.serious_mode)
     }
 
@@ -9583,6 +9595,9 @@ impl App {
             )
             && !committed_reader_wake
         {
+            // Before Commit this child is a painted candidate, not a workspace: control, menu
+            // and structural mutations are frozen so it cannot close or replace an adopted
+            // session. Clear the output latch first, or `gated_output_wake` suppresses every
             // later post until the lost-wake watchdog heals it.
             if let Wake::Output { session, .. } = ev
                 && let Some(s) = self.pool.get(*session)
@@ -9713,7 +9728,7 @@ impl App {
     }
 
     /// Whether an overlap handoff is in flight, parked (`pending_update_handoff`) or prelaunched (`update_handoff_prelaunch`).
-    pub(crate) fn update_handoff_in_flight(&self) -> bool {
+    pub(crate) const fn update_handoff_in_flight(&self) -> bool {
         #[cfg(any(target_os = "macos", all(test, unix)))]
         {
             self.pending_update_handoff.is_some() || self.update_handoff_prelaunch.is_some()
@@ -9729,7 +9744,7 @@ impl App {
     }
 
     /// Whether an overlap handoff has parked this process's readers (the first shape of [`Self::update_handoff_in_flight`]).
-    pub(crate) fn update_handoff_parked(&self) -> bool {
+    pub(crate) const fn update_handoff_parked(&self) -> bool {
         #[cfg(unix)]
         {
             self.pending_update_handoff.is_some()
@@ -9987,6 +10002,7 @@ impl App {
         deadline: &mut Option<Instant>,
         owner: &mut metrics::DeadlineOwner,
     ) {
+        // Setup owns the decision to release the permission lanes. Its timer
         // and progress polling must keep waking while those lanes are held.
         if let Some(wake) = self.workstation_setup.deadline(now) {
             fold_owned_deadline(deadline, owner, wake, metrics::DeadlineOwner::ConsentCard);
@@ -10125,6 +10141,7 @@ impl App {
             .devtools_watch
             .take_return_prime(list_read, row.grant())
         {
+            // Back from the page aterm brought them to, with the list out of sight:
             // macOS is asked about aterm again whatever they did there.
             let _ = self.devtools_helper.refresh_verdict();
         }
@@ -10140,6 +10157,7 @@ impl App {
             devtools_watch::Step::Clear => {
                 self.except_clear(crate::message_reporters::DEVTOOLS_KEY);
                 if self.devtools_watch.take_refresh() {
+                    // This process was checked before the switch went on: macOS
                     // keeps that verdict until a fresh aterm process asks.
                     let _ = self.devtools_helper.refresh_verdict();
                 }
@@ -10455,6 +10473,8 @@ impl App {
                         self.consent.invalidate_devtools();
                         self.devtools_watch.note_handed_over();
                         if self.devtools_watch.note_switched_on() {
+                            // The owner says the switch is on, where aterm cannot read the
+                            // list: macOS is asked about aterm again, and its answer is the
                             // reading that confirms the press.
                             let _ = self.devtools_helper.refresh_verdict();
                         }
@@ -10466,8 +10486,11 @@ impl App {
                     }
                 }
                 devtools_helper::Page::FullDiskAccess => {
+                    // A grant is the window's own probe's to read
                     // ([`Self::tick_fda_hand_over`]); the panel reads no list.
                     if asks.recheck {
+                        // "I've switched it on": the card's Open Settings by another
+                        // door — the `opened` marker, a fresh probe and the watch
                         // for the ✓.
                         self.note_macos_access_settings_opened(now);
                     }
@@ -10634,6 +10657,8 @@ impl App {
         use debugger_access::HostAsked;
         let ended = self.debugger_launch.host_read_ended();
         if let Some(host) = self.debugger_launch.warm_host() {
+            // The record beside `aterm.toml`, read once, off the event loop: it
+            // lives in the home folder, which can sit on a volume that stopped
             // answering (`debugger_access::RecordRead::Thread`).
             if let Some((slot, read)) = self.debugger_launch.start_record_read(host) {
                 let config = config.to_path_buf();
@@ -10641,10 +10666,13 @@ impl App {
                     let _ = slot.set(debugger_access::read_asked(&config, host));
                 };
                 if !self.launch_ask_disk("aterm-launch-asked", answer) {
+                    // No thread to read it on: fail toward not asking, as a
                     // record that cannot be read does (the ask drops).
                     return (HostAsked::Asked, Some(host));
                 }
                 if read == debugger_access::RecordRead::Thread {
+                    // The look that started the read waits for it, however fast
+                    // it ends: its end wakes the window, and the next look acts
                     // on it.
                     return (HostAsked::Cold, None);
                 }
@@ -10790,6 +10818,7 @@ impl App {
                     read = self.debugger_access_facts_from(row);
                 }
                 None => {
+                    // Retiring the old answer also voids a read still out for it;
                     // the next is dispatched once that one has ended.
                     if cached.is_some() {
                         self.consent.invalidate_debugger();
@@ -10843,6 +10872,11 @@ impl App {
         use debugger_access::OfferEnd;
         match end {
             OfferEnd::Refused(why) if !recorded => {
+                // A peer's change, most likely: the lane reads the records at once
+                // (`DebuggerChangeLane::offer`), follows or adopts it, and the next
+                // look settles; after a peer's own offer held the lock, the next
+                // offer finds this Mac in the record. Bounded, so no disk state
+                // holds the folder warm-up (which waits while the ask is queued)
                 // for longer.
                 if self.debugger_launch.refused(now) {
                     aterm_log::debug!("debugger launch ask: not yet: {}", why.words());
@@ -11137,6 +11171,8 @@ impl App {
             return;
         }
         if read.fda == aterm_containment::consent::FdaState::Granted {
+            // The owner switched it on while the hand-over waited: recorded as a
+            // panel's watch records it, and nothing comes up. A reading that is not
             // aterm's own (in-process under another terminal) records nothing.
             if !self.consent.window_reads_own_grant() {
                 self.devtools_helper.drop_queued_fda();
@@ -11510,6 +11546,7 @@ impl App {
         }
         match self.consent_card.phase() {
             consent_card::CardPhase::Idle => {
+                // Not while an incoming handoff is uncommitted: `user_event` drops the verdict
                 // wake until Commit. Ask at the first park after.
                 if self.incoming_handoff_pending {
                     return;
@@ -11672,7 +11709,7 @@ impl App {
         self.begin_fda_need_decision(cause, now);
     }
 
-    fn keep_fda_need(&mut self, cause: consent_card::NeedCause) {
+    const fn keep_fda_need(&mut self, cause: consent_card::NeedCause) {
         self.consent_card_host.kept_need = Some(cause);
         self.consent_card.defer_need();
     }
@@ -11760,7 +11797,7 @@ impl App {
     }
 
     /// What the `access_card` line of `aterm ctl privacy` reads from the card host.
-    pub(crate) fn access_card_inputs(&self) -> privacy_report::AccessCardInputs {
+    pub(crate) const fn access_card_inputs(&self) -> privacy_report::AccessCardInputs {
         let host = &self.consent_card_host;
         privacy_report::AccessCardInputs {
             marker: host.marker,
@@ -11875,6 +11912,11 @@ impl App {
                                 self.retract_macos_access_rows(now);
                             }
                             consent_card::NotDue::Granted => {
+                                // The window's own probe reads aterm's own grant held on
+                                // this Mac, never asked for: recorded silently (no check
+                                // mark), so a later switch-off here is not taken for a new
+                                // Mac. In-process under another terminal it reads that
+                                // terminal's grant, and records nothing; nor does a build
                                 // whose grant the next build loses.
                                 if self.consent.window_reads_own_grant()
                                     && (self.devtools_helper.reach().grant_stable)()
@@ -11990,6 +12032,7 @@ impl App {
 
     /// Record a marker beside `aterm.toml`, off the UI thread (a tiny file, but still a disk write).
     pub(crate) fn record_macos_access_marker(&mut self, marker: consent_card::Marker) {
+        // The cache follows the file's own rule: an `opened` never replaces a
         // `not-now`.
         if !(marker == consent_card::Marker::Opened
             && self.consent_card_host.marker == Some(consent_card::Marker::NotNow))
@@ -12215,6 +12258,7 @@ impl App {
             self.post_consent_notification(notice);
         }
         if outcome.refresh_status_item {
+            // Call the existing menu-bar renderer; it re-fingerprints and
             // rebuilds only if something actually moved.
             self.mark_status_dirty();
         }
@@ -12238,6 +12282,10 @@ impl App {
     }
 
     fn note_warmup_denials(&mut self) {
+        // The launch pass asks on aterm's own initiative, after the Full Disk Access
+        // page was left or declined: a Don't Allow there is the owner's answer, not a
+        // need for the card to ask Full Disk Access again — on every wake that reports
+        // its rows, during the pass or after. A refused read in a session, or the
         // owner's own pass, still raises it.
         if self
             .consent_launch
@@ -12398,6 +12446,7 @@ impl App {
     }
 
     fn service_video_wake(&mut self) {
+        // A timeout or unwind in the blocking control handler flips this token: retire the tap
         // rather than export bytes for an absent client.
         if self
             .video_rec
@@ -13153,6 +13202,10 @@ impl App {
         ws.selecting = false;
         ws.gesture = None;
         if front_changed {
+            // Park the outgoing session's learned link estimate and install the incoming
+            // one. `take_link_estimate` clears the predictor as `reset_session` would;
+            // only the RTT/latch knowledge follows the session, with the bindings its
+            // line editor taught (Home, End, Ctrl-A, Ctrl-E, Delete), which the
             // estimate carries.
             if let Some(front_content::FrontContent::Terminal { session, .. }) = previous_front {
                 link_estimates.insert(session, ws.predictor.take_link_estimate());
@@ -14749,6 +14802,7 @@ impl App {
                     rain.note_bell();
                 }
                 if pet_bell {
+                    // Latch only (`kitty_pet::note_bell`, the note-never-act law): the redraw
                     // ticks the brain, and the bell expires by its TTL.
                     ws.fx.companion_mut().note_bell(now);
                 }
@@ -15286,7 +15340,7 @@ impl App {
     }
 
     /// The one mutator of the intent after construction.
-    pub(crate) fn set_deferred_gpu(&mut self, on: bool) {
+    pub(crate) const fn set_deferred_gpu(&mut self, on: bool) {
         self.deferred_gpu = on;
     }
 
@@ -15424,21 +15478,24 @@ impl App {
         self.pin_backend_render_config_core();
     }
 
-    fn restore_pass_queued(&self) -> bool {
+    const fn restore_pass_queued(&self) -> bool {
         self.pending_restore.is_some()
             || self.restore_drain.is_some()
             || !self.seamless_adopt.is_empty()
     }
 
-    fn restore_pass_carries_shells(&self) -> bool {
+    const fn restore_pass_carries_shells(&self) -> bool {
         self.handoff_successor || self.handoff_ready.is_some() || !self.seamless_adopt.is_empty()
     }
 
-    fn restore_pass_handoff_lane(&self) -> bool {
+    const fn restore_pass_handoff_lane(&self) -> bool {
         self.handoff_ready.is_some() && !self.handoff_degraded
     }
 
     fn run_restore_pass(&mut self, el: &ActiveEventLoop, site: RestorePassSite) {
+        // A drain the person's quit (or last window's close) cut short lands
+        // nothing more: no window made and no shell forked for a process on
+        // its way out. The quit's layout already carries what it owed
         // (`app_restore::RestoreDrain::carry_owed`).
         if self.restore_drain.is_some() && el.exiting() {
             return;
@@ -15898,7 +15955,11 @@ impl App {
     }
 }
 
-fn blink_clock_armed(cursor_visible: bool, style: CursorStyle, rainbow_caret_policy: bool) -> bool {
+const fn blink_clock_armed(
+    cursor_visible: bool,
+    style: CursorStyle,
+    rainbow_caret_policy: bool,
+) -> bool {
     let rainbow_owns_caret = rainbow_caret_policy && matches!(style, CursorStyle::BlinkingBlock);
     cursor_visible
         && matches!(
@@ -16218,6 +16279,7 @@ impl ApplicationHandler<Wake> for App {
         #[cfg(unix)]
         self.retry_owed_layout_take_back(park_now);
         if self.lapse_expired_auto_apply_manual_only() {
+            // Reconcile first, so whatever stage is on disk is armed rather than a possibly
             // superseded snapshot; the direct rearm is the fallback.
             if !self
                 .request_native_update_reconcile(app_native::NativeUpdateReconcilePurpose::Refresh)
@@ -16380,6 +16442,7 @@ impl ApplicationHandler<Wake> for App {
                 );
             }
             let blinking: Option<bool> = if !surface_attempt_allowed {
+                // A failed/parked surface cannot show the phase edge: disarm the cosmetic
                 // clock; recovery recomputes it from live terminal state.
                 Some(false)
             } else if !headless && ws.os_window.is_some() && ws.focused {
@@ -16419,6 +16482,8 @@ impl ApplicationHandler<Wake> for App {
                     }
                 }
                 None => {
+                    // Engine mid-process: keep any armed deadline. A deadline expired
+                    // mid-turn flips on the next `new_events`; only one stale by a whole
                     // half-period is rolled on its own grid (`roll_stale_blink_forward`).
                     if let Some(armed) = ws.next_blink {
                         let d = match roll_stale_blink_forward(armed, native_preview_now) {
@@ -16831,6 +16896,7 @@ impl ApplicationHandler<Wake> for App {
         }
         let healed = wake_pass.healed > 0;
         if healed {
+            // Rare path: repaint everything; the RepaintKey early-out makes untouched
             // windows near-free.
             self.request_redraw_all_windows();
         }
@@ -16849,6 +16915,7 @@ impl ApplicationHandler<Wake> for App {
                 .collect();
             for sid in due {
                 if !self.flush_title_drift(sid, drift_now) {
+                    // Contended (the reader is mid-`process()`): restart the debounce window
                     // rather than re-arm an expired deadline, which would hot-spin the loop.
                     self.title_drift.last_flush.insert(sid, drift_now);
                 }
@@ -17141,6 +17208,7 @@ impl ApplicationHandler<Wake> for App {
                     self.landing_at_commit = Some(build);
                     self.spawn_upgrade_surge_continued(build);
                 } else {
+                    // The cold lane lands here. Its record waits for the first present: a
                     // re-grid inside `resumed` would precede the Linux initial-frame settle.
                     self.landed_row_pending = Some(build);
                 }
@@ -17554,6 +17622,7 @@ impl App {
                 let capture_serviced =
                     service_captures && self.resume_deferred_gpu_captures(window, surface);
                 if !capture_serviced && (redraw_hidden || service_captures) {
+                    // Hidden AppKit windows can suppress request_redraw, so consume this
                     // completion directly (as `resumed`'s handoff paint does).
                     self.redraw_window(window);
                 }
@@ -17677,6 +17746,9 @@ impl App {
                 self.cancel_session_rename(window, session);
             }
             Wake::TabCmd { action, by, reply } => {
+                // Native drag gestures and controller tab commands share this wake; the
+                // wire close policy, exit attribution and last-tab escalation live in
+                // `App::tab_cmd_front` beside `App::tab_cmd_aimed`, which answer
                 // `reply` (a `tab new` once its tab lands).
                 self.tab_cmd_front(el, action, by, reply);
             }
@@ -18504,6 +18576,12 @@ impl App {
                 let echo = self.echo_probe_open(wid, session);
                 let mut outcome = InputOutcome::Ok;
                 for ev in batch {
+                    // A controller `focus <in|out>` drives the whole focus seam through
+                    // `on_focus` (a driven window gets no `WindowEvent::Focused`, so the
+                    // cursor's focus look is reachable only there; it writes the DEC 1004
+                    // report itself, through the account). A pinned focus takes this route
+                    // only while `wid` still shows that session; otherwise
+                    // `input_to_session` routes it, so the report never reaches a tab that
                     // became front after authorization.
                     if let (InputEvent::Focus(f), Source::Controller) = (&ev, &src)
                         && session.is_none_or(|target| {
@@ -18586,6 +18664,7 @@ impl App {
                 framing,
                 proceed,
             } => {
+                // Retire the confirmation and its key interceptor by id, so an answer never
                 // drops a newer sheet's interceptor.
                 if self.paste_confirm.as_ref().is_some_and(|c| c.id == id) {
                     self.paste_confirm = None;
@@ -18744,6 +18823,8 @@ impl App {
                 self.on_modifiers_changed(wid, m.state());
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Latency trace: stamp the hardware-key arrival before any encode/write,
+                // backdated by the NSEvent queue age (X11: the server's key stamp), so
                 // time queued behind a parked loop is measured. Presses only.
                 if event.state == aterm_window::event::ElementState::Pressed {
                     let queued_ns = crate::platform::current_event_queue_age_ns().unwrap_or(0);
@@ -18785,6 +18866,7 @@ impl App {
             WindowEvent::HoveredFile(_path) => self.set_drag_hover(wid, true),
             WindowEvent::HoveredFileCancelled => self.set_drag_hover(wid, false),
             WindowEvent::Resized(size) => {
+                // Ignore zero-size resizes (a Windows minimize is 0x0), which would shrink
                 // every PTY to 1x1 and rewrap all scrollback.
                 if size.width == 0 || size.height == 0 {
                     return;
@@ -19256,7 +19338,7 @@ impl PkgPostGate {
         self.all || moved
     }
 
-    fn tick(&self, ticks: PkgProgressTicks) -> Duration {
+    const fn tick(&self, ticks: PkgProgressTicks) -> Duration {
         if self.all { ticks.visible } else { ticks.quiet }
     }
 }
@@ -19326,7 +19408,7 @@ impl Drop for IndexProbeCompletionWake {
 }
 
 impl BumpWatch {
-    fn note_full_pass_started(&mut self) {
+    const fn note_full_pass_started(&mut self) {
         // Wrapping back to an owned probe's generation would take 2^64 passes.
         self.pass_generation = self.pass_generation.wrapping_add(1);
     }
@@ -19342,7 +19424,7 @@ fn index_probe_due(last: Option<Instant>, shared_retry_at: Option<Instant>, now:
     })
 }
 
-fn first_index_probe_wakes_park(
+const fn first_index_probe_wakes_park(
     probe_index: bool,
     layout: Option<&atpkg::store::Layout>,
     watch: &BumpWatch,
@@ -19802,6 +19884,7 @@ fn bump_fired(l: &atpkg::store::Layout, watch: &mut BumpWatch) -> bool {
         return false;
     }
     if !bump_pass_allowed(Instant::now(), watch.last_trigger) {
+        // Floored: leave the mtime unconsumed, so a wish made in the cooldown is delayed,
         // never lost.
         return false;
     }
@@ -19809,6 +19892,7 @@ fn bump_fired(l: &atpkg::store::Layout, watch: &mut BumpWatch) -> bool {
     let progress = atpkg::progress::read_progress(l);
     watch.acted_mtime = Some(mtime);
     if !bump_should_trigger(&names, progress.as_ref()) {
+        // Nothing actionable (garbage, or every name's failure already recorded): consume
         // the mtime so it is not re-evaluated every slice.
         return false;
     }
@@ -20006,11 +20090,11 @@ impl Backoff {
         Duration::from_secs(self.first.as_secs().saturating_mul(1u64 << n.min(16))).min(self.cap)
     }
 
-    fn reset(&mut self) {
+    const fn reset(&mut self) {
         self.consecutive = 0;
     }
 
-    fn cycles(&self) -> u32 {
+    const fn cycles(&self) -> u32 {
         self.consecutive
     }
 }
@@ -20174,7 +20258,7 @@ impl PassWhy {
         }
     }
 
-    fn after_park(self, busy: bool, failing: bool) -> Self {
+    const fn after_park(self, busy: bool, failing: bool) -> Self {
         if busy {
             self
         } else if failing {
@@ -20458,14 +20542,14 @@ enum PassVerb {
 }
 
 impl PassVerb {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Seed => "seed",
             Self::Update | Self::UpdateProgram(_) => "update",
         }
     }
 
-    fn program(self) -> Option<&'static str> {
+    const fn program(self) -> Option<&'static str> {
         match self {
             Self::UpdateProgram(program) => Some(program),
             Self::Seed | Self::Update => None,
@@ -20821,6 +20905,7 @@ impl<P: Fn(Wake) + Clone + Send + 'static> PkgLane<'_, P> {
     }
 
     fn run(&mut self, verb: PassVerb, published_index: Option<u64>) -> Option<PassRun> {
+        // The first-run row the lane holds: opened (or carried) over a seed, handed to the
         // whole update that follows, whose announcement restates it and whose exit folds it.
         if self.ahead && verb == PassVerb::Seed {
             self.post(Wake::PkgFirstRunAhead { open: true });
@@ -21294,7 +21379,7 @@ enum LoopGate {
 }
 
 impl LoopGate {
-    fn of(enabled: bool) -> Self {
+    const fn of(enabled: bool) -> Self {
         if enabled { Self::On } else { Self::Off }
     }
 }
@@ -21307,7 +21392,7 @@ struct LiveSwitch {
 }
 
 impl LiveSwitch {
-    fn new(path: Option<std::path::PathBuf>, gate: LoopGate) -> Self {
+    const fn new(path: Option<std::path::PathBuf>, gate: LoopGate) -> Self {
         Self {
             path,
             seen: None,
@@ -21739,6 +21824,8 @@ fn spawn_pkg_update_check(config: &Config, proxy: LaneSink) -> bool {
             lane.launch_update_why(just_updated, &mut bump_watch, head_watch.as_mut(), false)
         };
         loop {
+            // Read the switch before every pass: off stands the loop down; on again, the
+            // launch rule decides whether a pass is owed and the re-check dedups it. An
             // owed launch pass that never ran is still owed.
             if lane.switch.poll() != LoopGate::On {
                 aterm_log::info!(
@@ -21779,6 +21866,8 @@ fn spawn_pkg_update_check(config: &Config, proxy: LaneSink) -> bool {
                 );
             }
             if let Some((park, then)) = scheduled {
+                // The five-second local holder recheck is intentionally
+                // quiet. Logging it every time would turn a long package
                 // install into a steady stream of identical disk writes.
                 if !(stamps.in_flight
                     && matches!(why, PassWhy::Published(_))
@@ -21933,7 +22022,7 @@ fn r6_marker_body<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
         .filter(|t| !t.is_empty())
 }
 
-fn seed_event_is_terminal(event: &Wake) -> bool {
+const fn seed_event_is_terminal(event: &Wake) -> bool {
     matches!(
         event,
         Wake::PkgSeed { .. }
@@ -21987,6 +22076,7 @@ fn read_seed_markers<R: std::io::BufRead>(out: R, mut post: impl FnMut(Wake)) ->
                 // Only an opened announcement leaves a held card to retire.
                 seen.saw_start = true;
             } else if matches!(event, Wake::PkgLockWaiting { .. }) {
+                // Its `lock-acquired:` touches neither flag; the wait stays seen for the
                 // lane's exit accounting.
                 seen.saw_lock_wait = true;
             } else if seed_event_is_terminal(&event) {
@@ -22014,7 +22104,7 @@ enum SeedRetire {
     FinishedEmpty,
 }
 
-fn seed_retire(seen: SeedMarkers, ok: bool, store_holds_programs: bool) -> SeedRetire {
+const fn seed_retire(seen: SeedMarkers, ok: bool, store_holds_programs: bool) -> SeedRetire {
     if !seen.saw_start || seen.saw_terminal {
         return SeedRetire::Nothing;
     }
@@ -22941,6 +23031,10 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
             "aterm-metal-warm",
             crate::qos::Role::Responsive,
             move || {
+                // `Responsive` on every order, the pre-dial one included: the first
+                // window's mint waits on this compile, and the
+                // compiler service runs at the requester's class, so at utility the
+                // post-claim attach would wait on a demoted compile inside the update
                 // freeze. It still ranks below the outgoing terminal's UI thread.
                 if let Err(error) = warm.run(knobs) {
                     aterm_log::debug!(
@@ -22986,6 +23080,7 @@ fn warm_config(headless: bool, zoom: app_config::CarriedZoom) -> WarmConfig {
         "aterm-chrome-font-warm",
         crate::qos::Role::Responsive,
         || {
+            // `Responsive`, not `Background`: the UI thread's first chrome raster blocks on
             // this `OnceLock` init, so a demoted initializer would be a priority inversion.
             crate::tray_raster::warm_chrome_font_assets();
         },
@@ -23315,6 +23410,7 @@ fn warm_prologue(
     if let Some(dir) = &reroute_dir {
         env_add.push((atpkg::reroute::REROUTE_DIR_ENV.to_string(), dir.clone()));
     } else if std::env::var_os(atpkg::reroute::REROUTE_DIR_ENV).is_some() {
+        // An enclosing session's directory came in by inheritance: blank it so the
         // integration's re-assert stays inert ("no export" must mean "not set").
         env_add.push((atpkg::reroute::REROUTE_DIR_ENV.to_string(), String::new()));
     }
@@ -23377,7 +23473,7 @@ fn warm_prologue(
     }
 }
 
-fn withhold_bootstrap_payload(
+const fn withhold_bootstrap_payload(
     exec_command: &mut Option<Vec<std::ffi::OsString>>,
     relaunch_of_running: bool,
 ) -> Option<Vec<std::ffi::OsString>> {
@@ -23389,7 +23485,7 @@ fn withhold_bootstrap_payload(
 }
 
 #[must_use]
-fn boot_trial_witness(headless: bool) -> aterm_update::TrialWitness {
+const fn boot_trial_witness(headless: bool) -> aterm_update::TrialWitness {
     if headless {
         aterm_update::TrialWitness::Headless
     } else {
@@ -23399,7 +23495,7 @@ fn boot_trial_witness(headless: bool) -> aterm_update::TrialWitness {
 
 #[cfg(target_os = "macos")]
 #[must_use]
-fn launch_image_replacement(
+const fn launch_image_replacement(
     handoff_successor: bool,
     rendezvous: bool,
     headless: bool,
@@ -24960,6 +25056,9 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         })
     });
 
+    // The board's mode is the launch policy's before the host's first look (the ring is
+    // written only while it observes); the policy's Entry follows once the app is built.
+    occupancy_host::set_mode(config.harness.policy.occupancy);
     let harness = sock_plan.as_ref().map(|plan| {
         let host = harness_host::start_default(
             store.clone(),
@@ -25765,6 +25864,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         app.except_clear(&update_words::launch_unregistered_entry(0).key());
     }
     app.note_removed_settings(&startup_config_snapshot.text);
+    app.note_occupancy_mode(app.harness_policy.get().policy.occupancy);
     if headless {
         app.pin_backend_render_config_core();
         app.warn_font_feature_issues();
@@ -27302,6 +27402,8 @@ mod ime_cursor_area_tests {
         let origin = app.frame_origin(wid);
         assert!(origin.0 > 0, "fixture needs a horizontal frame remainder");
         if cfg!(target_os = "linux") {
+            // Top-pinned vertical placement: the remainder lands below the
+            // frame, so the IME rect's Y is origin-invariant by construction
             // and the X axis carries the origin-shift assertion.
             assert_eq!(origin.1, 0, "Linux pins the frame top");
         } else {

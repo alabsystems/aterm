@@ -45,7 +45,7 @@ pub(crate) struct JournalOwner {
 }
 
 impl JournalOwner {
-    pub(crate) fn id(&self) -> JournalOwnerId {
+    pub(crate) const fn id(&self) -> JournalOwnerId {
         self.id
     }
 }
@@ -596,11 +596,11 @@ mod sys {
             }
         }
 
-        pub(super) fn len(&self) -> u64 {
+        pub(super) const fn len(&self) -> u64 {
             self.len
         }
 
-        pub(super) fn same_file(&self, other: &Self) -> bool {
+        pub(super) const fn same_file(&self, other: &Self) -> bool {
             self.dev == other.dev && self.ino == other.ino
         }
     }

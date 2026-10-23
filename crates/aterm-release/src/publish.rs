@@ -872,6 +872,7 @@ impl PublisherProbe for LocalProbe {
     }
 
     fn pid_state(&self, pid: u32) -> PidState {
+        // Neither of these can be a publisher, and both are exactly what a
         // corrupt or truncated field parses to. Ambiguous ⇒ never an answer.
         if pid == 0 {
             return PidState::Unknown("pid 0 is not a real process id".to_string());
@@ -2845,6 +2846,7 @@ pub fn verify_live_channel_head_signature(
     journal_pubkey: Option<&str>,
 ) -> Result<bool> {
     let Some(journal_pubkey) = journal_pubkey else {
+        // Unsigned channel: gh auth + SHA-256 + monotonic build number are the
         // trust. No ratchet — older `.sig` assets never demand a signed head.
         return Ok(false);
     };
@@ -2943,6 +2945,7 @@ pub fn resume_apple_tier(
     credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<sign::AppleTier> {
     if journal.is_done("sign") {
+        // Not a claim that the tier is off: nothing remaining will sign or notarize,
         // and `Inactive` makes every hook a no-op if one were somehow reached.
         return Ok(sign::AppleTier::Inactive);
     }
@@ -3162,6 +3165,7 @@ fn release_target_matches(observed: &str, expected: &str) -> bool {
     if is_oid(observed) && is_oid(expected) {
         observed.eq_ignore_ascii_case(expected)
     } else {
+        // Git ref and branch names are case-sensitive. Never normalize a
         // symbolic release target into a different mutation capability.
         observed == expected
     }
@@ -6145,6 +6149,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         );
     }
     if fresh_cut_journal_triage(existing.as_ref(), kind)? {
+        // A finished cut's journal — whichever cutter wrote it — is just history: clear
         // it and move on.
         let _ = fs::remove_file(&journal_path);
     }
@@ -6182,6 +6187,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         )
     })?;
     if kind == CutKind::Real {
+        // The tree's own statement of its repository, bound again: the one read
         // before the placement was this checkout's.
         assert_origin_repo_binding(&git, &origin_slug)?;
     }
@@ -6228,6 +6234,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             },
         )?
     } else {
+        // A dry run never rolls, so there is no recut concept: the version
         // is the workspace's; notes come from [Unreleased].
         (release_version.clone(), false)
     };
@@ -6314,6 +6321,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     );
     step("gate", &verified.line);
     if kind != CutKind::Real && !opts.linux_workers.is_empty() {
+        // A Linux worker fetches the commit it builds from origin, and only a real
         // claim puts the release commit there.
         return Err(Error::new(format!(
             "a dry run signs its release's reserved commit {}, which is pushed \
@@ -7280,6 +7288,7 @@ pub fn selfcheck_signing(
         ))
     })?;
     if team.is_empty() {
+        // A cut that claims no team (a fork's tier) has no notarization promise to
         // keep: no Apple tool is spawned.
         return Ok("");
     }

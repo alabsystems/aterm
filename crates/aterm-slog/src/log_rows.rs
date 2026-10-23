@@ -8,7 +8,8 @@ use std::sync::Arc;
 use super::{Limits, Log, MAX_RECORDS, SEQ_LIMIT};
 use crate::rec::Rec;
 
-/// How many timeline rows a record stands for (0.
+/// How many timeline rows a record stands for (0: none), as a host's
+/// grammar prints it: what [`Log::keep_rows`] installs.
 pub type RowRule = fn(&Rec) -> u8;
 
 /// The most rows one record stands for (a session close: its reason's row and its last state's).

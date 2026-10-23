@@ -259,39 +259,39 @@ impl Layout {
         }
     }
 
-    pub(crate) fn height(mut self, height: Length) -> Self {
+    pub(crate) const fn height(mut self, height: Length) -> Self {
         self.height = height;
         self
     }
 
-    pub(crate) fn width(mut self, width: Length) -> Self {
+    pub(crate) const fn width(mut self, width: Length) -> Self {
         self.width = width;
         self
     }
 
-    pub(crate) fn padding(mut self, padding: Insets) -> Self {
+    pub(crate) const fn padding(mut self, padding: Insets) -> Self {
         self.padding = padding;
         self
     }
 
-    pub(crate) fn gap(mut self, gap: f32) -> Self {
+    pub(crate) const fn gap(mut self, gap: f32) -> Self {
         self.gap = gap;
         self
     }
 
-    pub(crate) fn clipped(mut self) -> Self {
+    pub(crate) const fn clipped(mut self) -> Self {
         self.clip = true;
         self
     }
 
     /// Scroll the children `offset` along the flow ([`Self::offset`]).
-    pub(crate) fn scrolled(mut self, offset: f32) -> Self {
+    pub(crate) const fn scrolled(mut self, offset: f32) -> Self {
         self.offset = offset;
         self
     }
 
     /// Reach `outdent` past the parent's content rect ([`Self::outdent`]).
-    pub(crate) fn outdent(mut self, outdent: Insets) -> Self {
+    pub(crate) const fn outdent(mut self, outdent: Insets) -> Self {
         self.outdent = outdent;
         self
     }
@@ -422,12 +422,12 @@ impl<T> Control<T> {
     }
 
     /// Ask for a look before a pointer press ([`Self::look_first`]).
-    pub(crate) fn look_first(mut self) -> Self {
+    pub(crate) const fn look_first(mut self) -> Self {
         self.look_first = true;
         self
     }
 
-    pub(crate) fn role(mut self, role: SemanticRole) -> Self {
+    pub(crate) const fn role(mut self, role: SemanticRole) -> Self {
         self.role = Some(role);
         self
     }
@@ -437,12 +437,12 @@ impl<T> Control<T> {
         self
     }
 
-    pub(crate) fn state(mut self, state: ControlState) -> Self {
+    pub(crate) const fn state(mut self, state: ControlState) -> Self {
         self.state = state;
         self
     }
 
-    pub(crate) fn style(mut self, style: StyleRef) -> Self {
+    pub(crate) const fn style(mut self, style: StyleRef) -> Self {
         self.style = style;
         self
     }
@@ -464,7 +464,7 @@ impl GroupSpec {
         }
     }
 
-    pub(crate) fn unlabeled(role: SemanticRole) -> Self {
+    pub(crate) const fn unlabeled(role: SemanticRole) -> Self {
         Self {
             label: None,
             role,
@@ -472,13 +472,13 @@ impl GroupSpec {
         }
     }
 
-    pub(crate) fn style(mut self, style: StyleRef) -> Self {
+    pub(crate) const fn style(mut self, style: StyleRef) -> Self {
         self.style = style;
         self
     }
 
     /// Whether the group paints a backdrop of its own, so all of its rect is drawn, not only its children.
-    pub(crate) fn paints_backdrop(&self) -> bool {
+    pub(crate) const fn paints_backdrop(&self) -> bool {
         matches!(
             self.role,
             SemanticRole::Application | SemanticRole::Navigation
@@ -590,7 +590,7 @@ impl ButtonSpec {
     }
 
     /// Wear the attention badge ([`Self::badge`]) or not.
-    pub(crate) fn badge(mut self, on: bool) -> Self {
+    pub(crate) const fn badge(mut self, on: bool) -> Self {
         self.badge = on;
         self
     }
@@ -606,7 +606,7 @@ impl ButtonSpec {
         self
     }
 
-    pub(crate) fn trailing_icon(mut self, icon: ButtonIcon) -> Self {
+    pub(crate) const fn trailing_icon(mut self, icon: ButtonIcon) -> Self {
         self.trailing_icon = Some(icon);
         self
     }
@@ -1155,6 +1155,8 @@ pub(crate) fn text_field_geometry(
         let mark = crate::tray_raster::ui_text_width(TEXT_FIELD_ELLIPSIS, text_px);
         let room = (available - mark).max(0.0);
         if reads_as_path(text) {
+            // Its components whole either side of the ellipsis where a form
+            // of it fits ([`path_forms`]): `/Users/…/dotfiles/ai-fleet.toml`,
             // never a folder cut inside its name.
             if let Some((_, head_end, tail_start)) = path_forms(text)
                 .into_iter()
@@ -1888,6 +1890,7 @@ pub(crate) fn editor_painted_line_capacity_with_palette(
 }
 
 fn whole_editor_rows(geometry: &TextViewportGeometry) -> usize {
+    // A hair of slack: a body that is a whole number of rows tall in exact
     // arithmetic must not lose its last row to float rounding.
     (((geometry.body_h + 0.01) / geometry.line_h).floor() as usize).clamp(1, 256)
 }
@@ -1956,7 +1959,7 @@ pub(crate) enum UiContent {
 }
 
 impl UiContent {
-    fn look_first(&self) -> bool {
+    const fn look_first(&self) -> bool {
         match self {
             Self::Button(control) => control.look_first,
             Self::Switch(control) => control.look_first,
@@ -2148,7 +2151,7 @@ pub(crate) struct Joins {
 
 impl Joins {
     /// Whether the box is closed at both ends.
-    pub(crate) fn closed(self) -> bool {
+    pub(crate) const fn closed(self) -> bool {
         !self.above && self.below.is_none()
     }
 }
@@ -2180,12 +2183,12 @@ impl UiNode {
     }
 
     /// A SEGMENTED CONTROL.
-    pub(crate) fn segmented(mut self) -> Self {
+    pub(crate) const fn segmented(mut self) -> Self {
         self.segmented = true;
         self
     }
 
-    pub(crate) fn layout(mut self, layout: Layout) -> Self {
+    pub(crate) const fn layout(mut self, layout: Layout) -> Self {
         self.layout = layout;
         self
     }
@@ -2195,7 +2198,7 @@ impl UiNode {
         self
     }
 
-    pub(crate) fn paint_only(mut self) -> Self {
+    pub(crate) const fn paint_only(mut self) -> Self {
         self.paint_only = true;
         self
     }
@@ -2212,7 +2215,7 @@ impl UiNode {
     }
 
     /// Make this clipped column a scrolling list whose ROOM is the first `height` of it (THE LIST'S EDGE RULE).
-    pub(crate) fn room(mut self, height: f32, fades: bool) -> Self {
+    pub(crate) const fn room(mut self, height: f32, fades: bool) -> Self {
         self.room = Some(ListRoom {
             height,
             fades,
@@ -2227,7 +2230,7 @@ impl UiNode {
     }
 
     /// Mark this subtree a scrolling list's row OFF ITS SCREEN.
-    pub(crate) fn offscreen(mut self) -> Self {
+    pub(crate) const fn offscreen(mut self) -> Self {
         self.offscreen = true;
         self
     }
@@ -2239,7 +2242,7 @@ pub(crate) struct UiTree {
 }
 
 impl UiTree {
-    pub(crate) fn new(root: UiNode) -> Self {
+    pub(crate) const fn new(root: UiNode) -> Self {
         Self { root }
     }
 
@@ -2625,7 +2628,7 @@ struct ListContext {
 /// The least of a control a list's edge may leave in view.
 pub(crate) const LIST_PEEK_MIN: f32 = 16.0;
 
-fn is_list_control(node: &UiNode) -> bool {
+const fn is_list_control(node: &UiNode) -> bool {
     !node.paint_only
         && match &node.content {
             UiContent::Button(_)
@@ -3679,7 +3682,7 @@ fn navigation_is_chip(control: &Control<ButtonSpec>) -> bool {
         && control.spec.visual_label.is_some()
 }
 
-fn centres_its_label(control: &Control<ButtonSpec>) -> bool {
+const fn centres_its_label(control: &Control<ButtonSpec>) -> bool {
     matches!(control.style, StyleRef::Navigation | StyleRef::Chip)
         && control.spec.visual_icon.is_none()
         && control.spec.visual_label.is_some()
@@ -3703,11 +3706,11 @@ fn navigation_label_type(
     }
 }
 
-fn badge_reserve(spec: &ButtonSpec) -> f32 {
+const fn badge_reserve(spec: &ButtonSpec) -> f32 {
     if spec.badge { 16.0 } else { 0.0 }
 }
 
-fn navigation_trailing_reserve(spec: &ButtonSpec) -> f32 {
+const fn navigation_trailing_reserve(spec: &ButtonSpec) -> f32 {
     if spec.trailing_icon.is_some() {
         34.0
     } else {
@@ -3772,7 +3775,7 @@ pub(crate) fn text_button_label_room(spec: &ButtonSpec, width: f32) -> f32 {
     (width - 10.0 - text_button_trailing_reserve(spec) - button_end_reserve(spec)).max(0.0)
 }
 
-fn text_button_trailing_reserve(spec: &ButtonSpec) -> f32 {
+const fn text_button_trailing_reserve(spec: &ButtonSpec) -> f32 {
     if spec.trailing_icon.is_some() {
         38.0
     } else {
@@ -3821,6 +3824,7 @@ fn paint_badge(
 }
 
 fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
+    // A node whose words the edge of a kept caption cuts through paints none
     // of them ([`drop_cut_marks`]): it has no words to fit.
     if node.cut_edges.any()
         && !node
@@ -4675,6 +4679,7 @@ fn paint_compiled_node(
                 roles.accent
             };
             let fill = if chip_selected {
+                // A luminance step from a resting chip, not only a hue: the
                 // accent itself, a little deeper under the pointer or a press.
                 if control.state.pressed || control.state.hovered {
                     mix_rgb(mark, roles.text_primary, 0.12)
@@ -5342,6 +5347,7 @@ fn paint_compiled_node(
             }
         }
         UiContent::Custom(spec) => {
+            // These custom nodes carry their own raster lowering; every other custom node keeps
             // the plain label projection below.
             if spec.audit_id == MESSAGES_SEVERITY_AUDIT {
                 paint_messages_severity(prims, rect, spec.value.as_deref(), &roles);
@@ -7104,7 +7110,7 @@ fn paint_editor_text_range(
     }
 }
 
-fn column_offset(column: usize, origin: usize) -> usize {
+const fn column_offset(column: usize, origin: usize) -> usize {
     column.saturating_sub(origin)
 }
 
@@ -7591,9 +7597,11 @@ fn paint_control_surface(
 
 fn control_text_color(state: ControlState, roles: &crate::settings::Roles) -> [u8; 3] {
     if !state.enabled {
+        // Disabled stays visibly subordinate but never vanishes into the surface, which
         // matters most for icon-only document actions.
         mix_rgb(roles.text_tertiary, roles.text_secondary, 0.35)
     } else if state.muted {
+        // Idle ([`ControlState::muted`]): the value is said in quiet ink, a
         // step below a live control's, and still legible — the control works.
         quiet_text(roles)
     } else {
@@ -7711,6 +7719,13 @@ pub(crate) fn joined_as_named(visual: &str, name: &str) -> String {
 
 /// THE WORDS A CONTROL PAINTS ARE IN ITS NAME (WCAG 2.5.3, Label in Name).
 pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
+    // A label painted on lines ([`native_button_label_lines`]) is its words
+    // with spaces between; one broken inside a word ends its line in a `-` or
+    // after a `/`, which joins the word again — a hyphen the break added, or
+    // one the word has; a code identifier broken with no mark (an
+    // aterm.toml key) is its lines joined as they are; and a label that has
+    // both (words wrapped, and an identifier among them broken at its own
+    // joints with no mark: "Open" / "aterm" / ".toml") joins each break as
     // the name writes the two halves ([`joined_as_named`]).
     if visual.contains('\n') {
         let joined = |hyphen: &str| {
@@ -7886,6 +7901,7 @@ impl Compiler {
 
         let own_clip = inherited_clip.intersect(rect);
         let Some(visible) = own_clip else {
+            // A row the list's edge cuts away entirely is off its screen in a
             // list that holds every row in the tree ([`UiNode::offscreen`]).
             if list.is_some_and(|list| list.lists_all) {
                 return self.offscreen_node(

@@ -6,10 +6,6 @@ use crate::{App, WindowId};
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal, TerminalBuilder};
 use std::time::{Duration, Instant};
 
-/// An erase rewrites cells in place, so it is not a coordinate change and must not reach the glow
-/// reset in `EffectsPipeline::sync_scroll`, which would kill the earned ribbon at every shell
-/// prompt redraw. The reset stays for real grid motion (it stops phantom comets); the mixed
-/// scroll batch below is the vacuity control.
 #[test]
 fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     let mut app = App::headless_for_test();
@@ -27,9 +23,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
         win_h: 160,
         head: 0,
     };
-    // The invalidation seam stamps its curtain from the wall clock, so the
-    // script runs 500 ms in the past: the band is earned and inside its grace
-    // when the real present arrives.
     let t0 = Instant::now() - Duration::from_millis(500);
 
     let mut term = Terminal::new(10, 40);
@@ -55,7 +48,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     let earned = ws.fx.cursor_mut().glow.ribbon_segments();
     assert!(earned > 0, "the take must start with a ribbon to lose");
 
-    // A bare erase, exactly what a zsh prompt redraw writes, with no key, caret move or resize.
     for spelling in [
         &b"\x1b[J"[..],
         &b"\x1b[1J"[..],
@@ -84,9 +76,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
         );
     }
 
-    // A partial-region scroll moves rows exactly: the band `{1, 2, -1}` is
-    // replayed onto both engines, the ribbon on row 0 is outside it, and
-    // nothing is retired.
     let before_band = ws.fx.scroll_baseline().expect("the take has a baseline");
     term.process(b"\x1b[2;3r\x1b[3;1H\n");
     assert_eq!(
@@ -101,9 +90,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     assert!(!change.invalidated, "an explained band never retires");
     assert_eq!(change.band_moves, 1);
     assert!(change.changed(), "the coordinates under the light did move");
-    // Band translation retires the derived paint plan. Rebuild it at the
-    // same fixture instant before asking the last-frame visibility metric;
-    // an empty plan between frames does not mean the earned cells died.
     ws.fx.cursor_mut().glow.tick(
         Some((0, 9)),
         t0 + Duration::from_millis(364),
@@ -117,8 +103,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
         "row 0 is outside the band [1..=2]: the typed ribbon is untouched"
     );
 
-    // Vacuity control: a mixed batch (a whole-screen line feed and a region
-    // scroll) is not one transform, so the reset must still fire.
     term.process(b"\x1b[r\x1b[10;1H\n\x1b[2;3r\x1b[3;1H\n");
     assert_eq!(
         ContentScrollState::delta_since(ws.fx.scroll_baseline(), term.content_scroll_state()),
@@ -128,8 +112,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     );
     let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
     assert!(change.invalidated);
-    // The retirement is a 0.24 s curtain into the caret the band last stood under: armed now,
-    // exactly gone by its end.
     assert!(
         ws.fx
             .cursor_mut()
@@ -168,10 +150,6 @@ fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
     );
 }
 
-/// Seventeen band moves between two presents overflow the ring
-/// ([`CONTENT_SCROLL_BAND_RING`](aterm_core::terminal::CONTENT_SCROLL_BAND_RING) = 16, about one
-/// `SYNC_HOLD_CAP` of streamed lines at their fastest), so a present stall longer than a hold
-/// takes the wholesale retirement, never a replay of overwritten slots.
 #[test]
 fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
     let mut app = App::headless_for_test();
@@ -189,11 +167,8 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
         win_h: 320,
         head: 0,
     };
-    // 500 ms in the past, as above: the curtain is stamped from the wall clock.
     let t0 = Instant::now() - Duration::from_millis(500);
 
-    // One interior-region line feed per parser batch: 16 of them, with the
-    // host never presenting in between.
     let mut term = Terminal::new(20, 40);
     term.process(b"the quick brown fox");
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
@@ -232,8 +207,6 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
         "a full ring is still exact"
     );
 
-    // The seventeenth move overwrote the slot the first move lives in, so
-    // there is no longer an oldest-first replay to make.
     term.process(b"\x1b[10;19r\x1b[19;1H\n");
     let seventeen = term.content_scroll_state();
     assert_eq!(seventeen.band_seq, before.band_seq + 17);
@@ -248,7 +221,6 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
     let change = sync_cursor_effect_scroll(ws, seventeen);
     assert!(change.invalidated);
     assert_eq!(change.band_moves, 0);
-    // The overflow takes the 0.24 s curtain: armed here, exactly gone at its end.
     assert!(
         ws.fx
             .cursor_mut()
@@ -272,18 +244,6 @@ fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
     );
 }
 
-/// Codex streaming a ~40-line answer, replayed byte for byte from a real 57×151 capture:
-///
-/// * Phase A (viewport not yet at the screen bottom):
-///   `ESC[{vt};57r ESC[{vt};1H RI ESC[r ESC[1;{vt}r …` is a reverse index at an interior region
-///   top: nothing archived, and band `{vt-1, 56, +1}` carries the composer and its ribbon down
-///   one row.
-/// * Phase B (viewport at the bottom): `ESC[1;52r ESC[52;1H \r\n` is a top-anchored archival
-///   scroll: band `{0, 51, -1}`, with the composer at row 54 outside it and unmoved.
-///
-/// Every batch decides `Bands`: earned cells age like an unmoved ribbon, with no reset or renewed
-/// lifetime, and momentum keeps decaying. The capture's keystrokes arrive as bytes with no
-/// key-time licence, so they mint nothing.
 #[test]
 fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
     /// `(milliseconds after record 642, the bytes of that record)`.
@@ -412,14 +372,10 @@ fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
     };
     let t0 = Instant::now();
 
-    // The window the capture was taken on, with history: phase B's archival
-    // scroll only takes the top-anchored path when the ring can hold a line.
     let mut term = TerminalBuilder::new()
         .size(57, 151)
         .ring_buffer_size(1000)
         .build();
-    // The composer as the capture left it right before record 642: the caret
-    // on row 26 (0-based), column 9, which is 1-based `ESC[27;10H`.
     term.process(b"\x1b[27;10H");
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.fx.set_scroll_baseline(Some(term.content_scroll_state()));
@@ -487,8 +443,6 @@ fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
             spawns,
             "record {k}: program output minted light (T1)"
         );
-        // The same earned ribbon held still is the ageing reference: a band must neither kill it
-        // early nor renew it (a 2.4 s answer may outlive its light).
         unmoved.tick(Some((26, 9)), at, &cfg, geom, &mut unmoved_out);
         let reference_cells = unmoved.v2_status().expect("reference engaged").cells;
         if k == 0 {
@@ -527,8 +481,6 @@ fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
         39,
         "the glow was handed every one of them"
     );
-    // 26 + 28 phase-A rows: the composer rode its band all the way down and
-    // phase B, whose band is [0..=51], then left it exactly where it was.
     assert_eq!(caret.row, 54, "the composer's row at the end of the answer");
     assert_eq!(
         ws.fx
@@ -564,8 +516,6 @@ fn invalidation_runs_before_current_alt_context_and_drops_old_blink() {
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     ws.fx
         .set_scroll_baseline(Some(ContentScrollState::default()));
-    // A blink from the invalidated content must not survive. Production
-    // then re-feeds the current alt context after sync/reset.
     ws.fx.cursor_mut().glow.note_repaint_blink(now);
     let change = sync_cursor_effect_scroll(
         ws,

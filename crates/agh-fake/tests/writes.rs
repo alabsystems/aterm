@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The write routes: create, edit and delete a release, upload, rename and delete an asset,
-//! each refused to anonymous, to a login that cannot see the repository and to one without
-//! push.
+//! Write route tests for release creation, editing, deletion, and asset management.
 
 use agh_fake::{AssetSpec, FakeGithub, ReleaseSpec, RepoSpec, token};
 use aterm_json::json;
@@ -13,7 +11,6 @@ use crate::raw::api;
 
 const SLUG: &str = "fixture-dev/app";
 
-/// A fake with `fixture-dev-bot` (push) and `fixture-reader` (pull) on the public `SLUG`.
 fn fake() -> (FakeGithub, String, String) {
     let fake = FakeGithub::start();
     let (dev, reader) = (token("dev"), token("reader"));
@@ -55,7 +52,6 @@ fn a_push_login_creates_uploads_publishes_and_deletes() {
     let asset = upload("a.bin", b"the bytes");
     assert_eq!(asset.status, 201);
     assert_eq!(asset.json()["size"], json!(9));
-    // The same name again is GitHub's 422 `already_exists`.
     let again = upload("a.bin", b"other bytes");
     assert_eq!(again.status, 422);
     assert_eq!(again.json()["errors"][0]["code"], json!("already_exists"));
@@ -75,7 +71,6 @@ fn a_push_login_creates_uploads_publishes_and_deletes() {
     assert_eq!(edit.status, 200);
     assert_eq!(edit.json()["draft"], json!(false));
     assert_eq!(edit.json()["prerelease"], json!(true));
-    // A published tag takes no second release.
     let twice = api("/repos/fixture-dev/app/releases")
         .method("POST")
         .token(&dev)
@@ -83,7 +78,6 @@ fn a_push_login_creates_uploads_publishes_and_deletes() {
         .send(api_port);
     assert_eq!(twice.status, 422);
     let asset_id = asset.json()["id"].as_u64().expect("an asset id");
-    // A rename onto a name another asset holds is GitHub's 422; onto a free one, done.
     let second = upload("b.bin", b"second").json()["id"]
         .as_u64()
         .expect("an asset id");
@@ -143,7 +137,6 @@ fn anonymous_a_hidden_repository_and_pull_alone_are_refused() {
         .body(json!({"tag_name": "v1"}).to_string().as_bytes())
         .send(port);
     assert_eq!(hidden.status, 404);
-    // Control: nothing changed, so a refusal really was one.
     assert!(!fake.release_state(id).expect("the release").0.draft);
     let upload = api(&format!(
         "/repos/fixture-dev/app/releases/{id}/assets?name=b.bin"

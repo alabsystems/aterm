@@ -75,7 +75,7 @@ pub(crate) enum AdmissionDecision {
 
 /// Choose the only safe replacement lane for the supplied runtime facts.
 #[must_use]
-pub(crate) fn classify(facts: AdmissionFacts) -> AdmissionDecision {
+pub(crate) const fn classify(facts: AdmissionFacts) -> AdmissionDecision {
     if !facts.staged_verified {
         return AdmissionDecision::Block(AdmissionBlock::UnverifiedStage);
     }

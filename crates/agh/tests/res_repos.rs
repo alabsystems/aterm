@@ -14,9 +14,7 @@ use agh_fake::{FakeGithub, FakeOrigin, RepoSpec};
 
 use crate::common;
 
-/// Public, the dev bot holding push.
 const APP: &str = "fixture-dev/app";
-/// Public, the dev bot holding pull only.
 const PULLED: &str = "fixture-dev/pulled";
 
 struct World {
@@ -26,7 +24,6 @@ struct World {
 }
 
 impl World {
-    /// The canonical config with classic tokens.
     fn new(label: &str) -> World {
         let root = common::scratch(label);
         let fake = FakeGithub::start();
@@ -35,8 +32,6 @@ impl World {
         World::over(root, fake, &text)
     }
 
-    /// The dev profile's token file holds a fine-grained token; its row carries
-    /// `drafts_fp = "{fp}"` when `fp` is given.
     fn fine_grained(label: &str, vouch: bool) -> World {
         let root = common::scratch(label);
         let fake = FakeGithub::start();

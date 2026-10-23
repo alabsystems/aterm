@@ -1,37 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A line revived after a rest wears the stops it had.
-//!
-//! The take: a shell line typed at 12 cps, a rest past the swoosh (every cell gone, inside the
-//! five-second chain window), then a key at the line's end. The seam's typed-run revive
-//! (`CursorGlow::hand_v2_typed_sweep`) re-lays the retired run on the key's frame; every revived
-//! column takes back its stop (C2, `Cohort::anchor_col`) and the key's cell continues the walk
-//! one step past the line's last cell. Left alone, the re-lay would mint a cohort continuing
-//! `last_walk` at the run's first column, shifting every column `len` stops on. How it holds:
-//!
-//! * a cell laid beside a run still lit on its row joins that run's walk by position
-//!   (`Ribbon::join_cohort`);
-//! * when the key's echo lands a frame late the key is held and the re-lay goes first, carrying
-//!   the walk origin read off the run's standing cells (`RecentTypedRun::origin`,
-//!   `ribbon::Revive`);
-//! * a run no later key saw standing has its walk read on the frame that lays it
-//!   (`CursorGlow::read_fresh_run_origin`);
-//! * a typed fold's landing is remembered as the row's typed run
-//!   (`CursorGlow::remember_fold_landing`), so the revive re-lays the fold glyph too.
-//!
-//! Folds are read behind each shape `walk_census`'s [`Fold`] models.
+//! Tests that a typed line revived after a rest keeps its rainbow stops.
 
 use crate::walk_census::*;
 use aterm_effects::rainbow_kitty::ribbon::{CHAIN_GAP_MAX, WALK_LAY_RATE, walk_t};
 
-/// The line and the rest.
 const LINE_CELLS: usize = 30;
 const REST_MS: u64 = 2_500;
-/// The frames after the key's echo the reading waits (the edge-in).
 const SETTLE_MS: u64 = 48;
 
-/// The last snap's `t` per text cell (`None` dark).
 fn stops(s: &Shell) -> Vec<Option<f32>> {
     s.snaps
         .last()
@@ -42,17 +20,14 @@ fn stops(s: &Shell) -> Vec<Option<f32>> {
         .collect()
 }
 
-/// `n` cells typed, the band read settled; returns the shell and the stops.
 fn typed(n: usize) -> (Shell, Vec<Option<f32>>) {
     typed_echo(n, Echo::After(2))
 }
 
-/// [`typed`] behind a shell whose echo lands `echo` after each press.
 fn typed_echo(n: usize, echo: Echo) -> (Shell, Vec<Option<f32>>) {
     typed_shaped(n, echo, Fold::Readline)
 }
 
-/// [`typed_echo`] behind a shell that folds its line as `fold` does.
 fn typed_shaped(n: usize, echo: Echo, fold: Fold) -> (Shell, Vec<Option<f32>>) {
     let mut s = Shell::new(60, 83, echo).folding(fold);
     s.type_str(&prose(n));
@@ -61,8 +36,6 @@ fn typed_shaped(n: usize, echo: Echo, fold: Fold) -> (Shell, Vec<Option<f32>>) {
     (s, before)
 }
 
-/// The premise every take stands on: the line was laid on a cold walk —
-/// every lit cell at `walk_t(i)`, the `lit` range lit.
 fn assert_cold_walk(before: &[Option<f32>], lit: std::ops::Range<usize>, what: &str) {
     for i in lit {
         let t = before[i].unwrap_or_else(|| panic!("{what}: text {i} is lit before the rest"));
@@ -74,8 +47,6 @@ fn assert_cold_walk(before: &[Option<f32>], lit: std::ops::Range<usize>, what: &
     }
 }
 
-/// The rest: every text cell dark and the ribbon empty at its end, inside
-/// the chain window.
 fn rest(s: &mut Shell, what: &str) {
     s.idle(REST_MS);
     let dark = s.snaps.last().expect("a frame").pos.iter().all(|p| !p.lit);
@@ -96,8 +67,6 @@ fn rest(s: &mut Shell, what: &str) {
     );
 }
 
-/// One take: `n` cells, the rest, one key at the line's end; the stops
-/// before the rest and after the key.
 fn revived(
     n: usize,
     row: std::ops::Range<usize>,
@@ -106,7 +75,6 @@ fn revived(
     revived_echo(n, row, what, Echo::After(2))
 }
 
-/// [`revived`] behind a shell whose echo lands `echo` after each press.
 fn revived_echo(
     n: usize,
     row: std::ops::Range<usize>,
@@ -116,7 +84,6 @@ fn revived_echo(
     revived_shaped(n, row, what, echo, Fold::Readline)
 }
 
-/// [`revived_echo`] behind a shell that folds its line as `fold` does.
 fn revived_shaped(
     n: usize,
     row: std::ops::Range<usize>,
@@ -125,8 +92,6 @@ fn revived_shaped(
     fold: Fold,
 ) -> (Shell, Vec<Option<f32>>, Vec<Option<f32>>) {
     let (mut s, before) = typed_shaped(n, echo, fold);
-    // The premise on the row the revive re-lays (a wrapped line's first row
-    // has already flowed into its fold by the last key).
     assert_cold_walk(&before, row, what);
     rest(&mut s, what);
     s.key(' ');
@@ -135,10 +100,6 @@ fn revived_shaped(
     (s, before, after)
 }
 
-/// The colour law for one revived take: every lit column of `row` kept its
-/// stop, and the key's cell (text `n`) is `walk_t(n)`, one step past the
-/// line's last cell on the cold walk ([`assert_cold_walk`]). `None` when it
-/// holds, else what broke.
 fn stops_kept(
     s: &Shell,
     n: usize,
@@ -174,14 +135,9 @@ fn stops_kept(
     })
 }
 
-/// A line of 80 cells behind the `$ ` prompt at 60 columns: its second row
-/// holds text `58..80`, the fold's own glyph first.
 const WRAPPED: usize = 80;
 const ROW2: std::ops::Range<usize> = 58..80;
 
-/// The colour law: after a rest past the swoosh, the key typed at the line's end
-/// brings the line back in its stops, and its own cell is the walk one step past
-/// the line's last cell, on one row and on a wrapped line's second row.
 #[test]
 fn a_line_revived_after_a_rest_keeps_its_stops_and_the_key_continues_its_walk() {
     let mut broken = Vec::new();
@@ -190,9 +146,6 @@ fn a_line_revived_after_a_rest_keeps_its_stops_and_the_key_continues_its_walk() 
         ("a wrapped line's second row", WRAPPED, ROW2),
     ] {
         let (s, before, after) = revived(n, row.clone(), what);
-        // Premise: the revive fired and the whole row is lit again on the key's
-        // frame ([`stops_kept`] compares only cells lit before and after, so a
-        // dark cell would slip past it).
         let relit = row.clone().filter(|&i| after[i].is_some()).count();
         assert!(
             relit == row.len(),
@@ -224,15 +177,9 @@ fn a_line_revived_after_a_rest_keeps_its_stops_and_the_key_continues_its_walk() 
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
-/// Echo lag of a shell whose echo lands on the frame after its key's: longer
-/// than one 16 ms frame, so a frame always presents the press alone first.
 const LATE_ECHO_MS: u64 = 20;
-/// The frame train's period.
 const FRAME_MS: u64 = 16;
 
-/// The same law when the key's echo lands a frame late: the engine holds the
-/// key (`Ribbon::hold_typed`), the re-lay mints with no run lit on its row, so
-/// the position law cannot place it and the seam's named revive must.
 #[test]
 fn a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops() {
     let mut broken = Vec::new();
@@ -249,8 +196,6 @@ fn a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops() {
             ROW2,
             Fold::Readline,
         ),
-        // The fold glyph laid by the terminal's own wrap: the revive re-lays the
-        // continuation row from column 0 behind a held key too.
         (
             "a wrapped line's second row, kernel echo a frame late",
             WRAPPED,
@@ -265,8 +210,6 @@ fn a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops() {
         s.key(' ');
         s.idle(SETTLE_MS);
         let after = stops(&s);
-        // The premise: the key was held — a frame presented between its
-        // press and its echo, the line's text not yet grown.
         let held = s
             .snaps
             .iter()
@@ -278,9 +221,6 @@ fn a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops() {
             held > 0,
             "{what}: the premise — a frame presented the press before its echo"
         );
-        // Premise: the revive fired and the whole row is lit again, the fold
-        // glyph included ([`stops_kept`] alone compares only cells lit before
-        // and after).
         let relit = row.clone().filter(|&i| after[i].is_some()).count();
         assert!(
             relit == row.len(),
@@ -293,13 +233,8 @@ fn a_line_revived_when_the_key_s_echo_lands_a_frame_late_keeps_its_stops() {
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
-/// A run no key saw standing (one key; the kernel fold glyph alone, or two or
-/// three under a coalesced fold) has its walk read on the frame that lays it
-/// (`CursorGlow::read_fresh_run_origin`), so it comes back on its stops even
-/// behind a frame-late echo, where the re-lay is laid before the key's cell.
 #[test]
 fn a_run_no_key_saw_standing_comes_back_on_its_own_walk() {
-    // (what, line, the run's text range, fold, echo ms, coalesced fold)
     let takes = [
         ("one key", 1, 0..1, Fold::Readline, 2, false),
         (
@@ -326,8 +261,6 @@ fn a_run_no_key_saw_standing_comes_back_on_its_own_walk() {
             LATE_ECHO_MS,
             false,
         ),
-        // Readline folds on the key that fills the margin: text 58 is the
-        // continuation row's first key, a run of one.
         (
             "readline's first key on the continuation row, echo a frame late",
             59,
@@ -358,8 +291,6 @@ fn a_run_no_key_saw_standing_comes_back_on_its_own_walk() {
         let mut s = Shell::new(60, 83, Echo::After(echo)).folding(fold);
         let line = prose(n);
         if coalesced {
-            // Three keys 3 ms apart across the margin, each echoed 40 ms
-            // late: their echoes land in one frame.
             let (a, b) = line.split_at(n - 3);
             s.type_str(a);
             s.type_lagged(b, 3, 40);
@@ -400,11 +331,6 @@ fn a_run_no_key_saw_standing_comes_back_on_its_own_walk() {
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
-/// No hole at the fold. Behind the kernel's cooked-mode echo ([`Fold::Kernel`]) the glyph after
-/// the margin is written at the next row's column 0 by the terminal's wrap, and that landing is
-/// remembered as the row's typed run; readline and zle fold on the key that fills the margin, so
-/// their run already starts at column 0. Each shape behind a 2 ms echo and a frame-late one.
-/// Control: the single-row line.
 #[test]
 fn a_wrapped_line_revived_after_a_rest_lights_its_second_row_from_its_first_glyph() {
     let (_, _, after) = revived(LINE_CELLS, 0..LINE_CELLS, "one row");
@@ -418,8 +344,6 @@ fn a_wrapped_line_revived_after_a_rest_lights_its_second_row_from_its_first_glyp
         ("kernel echo", Fold::Kernel, Echo::After(2)),
         ("readline", Fold::Readline, Echo::After(2)),
         ("zle", Fold::Zle, Echo::After(2)),
-        // …and each behind an echo a frame late (§43: the key held, the
-        // revive's re-lay laid before its cell).
         (
             "kernel echo a frame late",
             Fold::Kernel,
@@ -452,13 +376,8 @@ fn a_wrapped_line_revived_after_a_rest_lights_its_second_row_from_its_first_glyp
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
 
-/// Controls: the same key inside the grace (band live) keeps every stop and
-/// continues the walk; after the same rest with the prefix's first glyph
-/// rewritten by the program (no revive) the key's cell is exactly the walk
-/// continued one step past the line's last cell, and the prefix stays dark.
 #[test]
 fn without_the_revive_the_key_continues_the_walk_and_no_stop_moves() {
-    // Inside the grace.
     let (mut s, before) = typed(LINE_CELLS);
     assert_cold_walk(&before, 0..LINE_CELLS, "grace");
     s.idle(600);
@@ -479,7 +398,6 @@ fn without_the_revive_the_key_continues_the_walk_and_no_stop_moves() {
         "grace: the key continues the walk ({key} against {want})"
     );
 
-    // Past the swoosh, the prefix's first glyph rewritten during the rest.
     let (mut s, before) = typed(LINE_CELLS);
     s.idle(REST_MS / 2);
     s.h.term.process(b"\x1b[3;3HT\x1b[3;33H");
@@ -502,11 +420,6 @@ fn without_the_revive_the_key_continues_the_walk_and_no_stop_moves() {
     );
 }
 
-/// Claude Code's composer from real bytes
-/// (`fixtures/claude-wrap-2026-09-23-end.ptylog`: v2.1.280, 40×120, a line typed
-/// at 8–12 cps, the box growing a row at `[image`), replayed at the host seam
-/// with `rest_ms` of rest before the 62nd key (`however`, 62 cells into the
-/// composer's first row).
 fn composer(rest_ms: u64) -> Vec<Snap> {
     replay(&Capture {
         name: "claude-wrap-end",
@@ -521,9 +434,6 @@ fn composer(rest_ms: u64) -> Vec<Snap> {
     })
 }
 
-/// The same in Claude Code's composer: after a 2.5 s rest the first key revives
-/// the line (62 cells lit on its frame) with every glyph at its own stop. The
-/// take as captured (no rest) shows no recolour or discontinuity (the control).
 #[test]
 fn claude_codes_composer_revived_after_a_rest_keeps_its_stops() {
     let control = composer(0);

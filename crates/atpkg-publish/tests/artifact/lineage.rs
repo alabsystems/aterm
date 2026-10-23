@@ -11,14 +11,10 @@ use atpkg::lineage::{
 };
 use atpkg_publish::artifact::lineage;
 
-/// A Trust compiler's commit (the 7d5533b2 seal's).
 const TRUST: &str = "7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15";
-/// Stock 1.97.1's commit (store ay 8256 embeds it 451 times).
 const STOCK: &str = "8bab26f4f68e0e26f0bb7960be334d5b520ea452";
-/// A Mach-O thin 64-bit head: what the client's `native_head` admits.
 const MACHO: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
 
-/// A scratch dir (removed on drop however the test ends), and its path.
 fn tmp(label: &str) -> (aterm_tempfile::TempDir, PathBuf) {
     let dir = aterm_tempfile::Builder::new()
         .prefix(&format!("atpkg-publish-lineage-{label}-"))
@@ -36,8 +32,6 @@ fn object(bytes: &[u8]) -> Vec<u8> {
     v
 }
 
-/// A crate-metadata header, as rustc writes it (`rustc_serialize`'s `emit_str`): the
-/// length as unsigned LEB128, the string, then the `0xc1` string sentinel.
 fn metadata_header(version: &str) -> Vec<u8> {
     let mut v = b"rust\0\0\0\n\0\0\0\0\0\0\0\0".to_vec();
     let mut len = version.len();
@@ -64,8 +58,6 @@ fn trust_vv(commit: &str) -> String {
     )
 }
 
-/// A toolchain root: bin/{trustc,targo} and lib/librustc_driver-<h>.dylib, each a
-/// Mach-O-headed file carrying `extra`.
 fn toolchain(root: &Path, extra: &[u8]) -> PathBuf {
     std::fs::create_dir_all(root.join("bin")).expect("mkdir");
     std::fs::create_dir_all(root.join("lib")).expect("mkdir");
@@ -91,8 +83,6 @@ fn sha(path: &Path) -> String {
     atpkg::tree::sha256_file(path).expect("hash")
 }
 
-/// A SEED-MINT for the toolchain at `root` (commit `commit`), comparing trustc and the
-/// driver, with `kv` fields replaced.
 fn seed_mint(root: &Path, commit: &str, kv: &[(&str, &str)]) {
     let tree = "a".repeat(64);
     let mut fields: Vec<(String, String)> = [
@@ -160,10 +150,6 @@ fn scan_tree_reads_compiled_output_only() {
     assert_eq!(files, vec!["bin/ay", "lib/rustlib/t/lib/libstd-1.rlib"]);
 }
 
-/// The bundle's round trip: a seal admitted by SEED-MINT is staged, its bytes change
-/// (strip, relocate, re-sign), LINEAGE is stamped over the SHIPPED bytes, and the
-/// staged tree is then admitted by LINEAGE — and refused the moment the record or a
-/// byte it names is edited.
 #[test]
 fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
     let (_dir, d) = tmp("stamp");

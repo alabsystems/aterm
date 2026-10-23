@@ -7,13 +7,13 @@
 // owns the content, the comparison and the verdict; this file only drives
 // the module the way a site page does.
 //
-//   cpu.html     aterm-wasm, the CPU module, through the glue `verify glue
-//                --flavor web` writes: construct, then per frame process_str
+//   cpu.html     aterm-wasm, the CPU module, through the ES module glue
+//                `verify glue` writes: construct, then per frame process_str
 //                + render(), the RGBA put on the page's 2D canvas as the site
 //                puts it, and rgba() handed back.
 //   gpu.html     aterm-gpu-web, aterm-gpu's GL arm on WebGL2 through the
-//                module's `aterm_gl` imports, through the glue `verify glue
-//                --flavor web` writes: construct, `await init(canvas)`, then
+//                module's `aterm_gl` imports, through the ES module glue
+//                `verify glue` writes: construct, `await init(canvas)`, then
 //                per frame process_str + render(), a real WebGL2 present onto
 //                the page's canvas, and that canvas read back in the same
 //                task. init is synchronous (wasm-platform WP.5), awaited here

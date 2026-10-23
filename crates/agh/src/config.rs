@@ -271,7 +271,7 @@ const TOKEN_FLOOR: usize = 20;
 /// A parser message with every value it quotes taken out. A double-quoted run (serde's
 /// `string "…"`) becomes `"…"`; a backticked run becomes `` `…` `` unless it is a short key
 /// (dot-separated identifier segments) or short punctuation (`` `]` ``, `` `=` ``), so
-/// `unknown field `legacy_loose`` still names its key; and any remaining run of
+/// `` unknown field `legacy_loose` `` still names its key; and any remaining run of
 /// `[A-Za-z0-9_]` of `TOKEN_FLOOR` bytes or more becomes `…`.
 fn unquoted(message: &str) -> String {
     let mut out = String::with_capacity(message.len());

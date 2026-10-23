@@ -220,6 +220,7 @@ impl Scrollback {
         };
         let accepted = self.cold.push_block(&block);
         if accepted == 0 && block.line_count() > 0 {
+            // decompress() already incremented the failure counter when it
             // failed inside cold.push_block → to_cold_compressed → decompress.
             if block.is_quarantined() {
                 let lost = block.line_count();

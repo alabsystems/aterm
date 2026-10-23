@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for the server-published agent verdict and program identity
-//! (`status program= agent= …`, `EVENT <local> agent <word> rev=<n> gen=<e.s> fp=<hex16>`,
-//! `await agent`), driven through the one `aterm` binary against a real headless instance.
-//! Fake agents are POSIX `sh` scripts run as `claude` via `exec -a`, drawing measured Claude
-//! Code screens. Isolation is `support/launch_isolation.rs`'s: scratch HOME/XDG roots, a
-//! private control socket, every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`.
+//! Live-headless conformance tests for server-published agent verdict and program identity.
 
 #![cfg(unix)]
 
@@ -21,8 +16,7 @@ use headless_boot::{
     until_served,
 };
 
-/// Boot one headless instance, 40x120 ([`headless_boot::boot`]: an environment
-/// refusal is COULD NOT RUN; a product that cannot start fails the test).
+/// Boot one headless instance ([`headless_boot::boot`]).
 fn boot(tag: &str) -> Instance {
     boot_rows(tag, 40)
 }
@@ -35,13 +29,11 @@ fn boot_rows(tag: &str, lines: u16) -> Instance {
     )
 }
 
-/// How long a wait for something that must happen may take before it is read as a hang
-/// (AGENTS.md).
+/// How long a wait for something that must happen may take before it is read as a hang (AGENTS.md).
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 
-/// Poll `status` until `pred` holds, returning the matching record, or panic
-/// with the last record after `within`.
+/// Poll `status` until `pred` holds.
 fn status_until(
     inst: &Instance,
     sid: &str,
@@ -58,8 +50,6 @@ fn status_until(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // The screen rides along: a status that never moves says nothing of whether
-    // the launch line was typed, echoed, run or failed.
     let screen = ctl_ok(inst, &[&format!("@{sid}"), "text"]);
     let tree = headless_boot::process_tree(inst);
     panic!(
@@ -68,9 +58,7 @@ fn status_until(
     );
 }
 
-/// The fake worker: a Claude-shaped busy screen (transcript row, spinner, composer between two
-/// rules, footer) redrawn until `go` exists, then the rm circuit-breaker box measured on
-/// 2.1.280, its top transcript row ticking every 0.2 s. POSIX sh + printf only.
+/// The fake worker.
 const FAKE_WORKER: &str = r#"#!/bin/sh
 go="$1"
 rule=$(printf '%120s' '' | sed 's/ /─/g')
@@ -108,8 +96,6 @@ while :; do
 done
 "#;
 
-/// The box under a ticking row reaches `status agent=prompt`, `EVENT <local> agent prompt` is
-/// pushed, and `await agent prompt` latches, while `revision=` holds still.
 #[test]
 fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let inst = boot("b");
@@ -118,7 +104,6 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let go = inst.tmp.join("go");
     std::fs::write(&script, FAKE_WORKER).expect("write the fake worker");
 
-    // The events stream, acknowledged before anything moves.
     let mut sub = subscribed(&inst, &[&format!("@{sid}"), "events"]);
     let events = sub.stdout.take().expect("subscribe stdout");
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -130,8 +115,6 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         }
     });
 
-    // Run it as `claude` in a job of its own (the shell's job control gives it
-    // its own foreground group, the shape a real `claude` has).
     type_line(
         &inst,
         &sid,
@@ -147,11 +130,6 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let program = status_until(&inst, &sid, HANG, "program=claude", |s| {
         field(s, "program") == Some("claude")
     });
-    // Pin the revision once the FSM has published the running job, never on a timer:
-    // `agent=busy` can lead the FSM's `running` (held for its 750 ms dwell, then published on
-    // a sweep) by most of a second. After that nothing moves the revision while the fake
-    // ticks, short of a 5 s stall (`quiet_after`), so the control below still fails for a
-    // gate that bumps it when the box is drawn.
     let before = status_until(
         &inst,
         &sid,
@@ -166,21 +144,16 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     assert_eq!(field(&before, "agent"), Some("busy"), "{before}");
     let revision = field(&before, "revision").unwrap().to_string();
 
-    // A parked waiter, armed before the box exists.
     let waiter = std::thread::spawn({
         let mut cmd = client_command(
             &inst,
             &[&format!("@{sid}"), "await", "agent", "prompt", HANG_MS],
         );
-        // Asked again while the instance has not yet accepted it, or answers it busy: the
-        // verdict is latched, so a waiter armed late still answers it.
         move || until_served(|| cmd.output().expect("await agent"))
     });
     std::thread::sleep(Duration::from_millis(200));
 
     std::fs::write(&go, b"").expect("create the go file");
-    // Until the verdict names the box's kind: its frame can be read before its body is drawn
-    // (honestly `prompt` with `agent_detail=other`), and the drawn body then moves the detail.
     let prompt = status_until(
         &inst,
         &sid,
@@ -200,16 +173,12 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     assert_eq!(field(&prompt, "level"), Some("attention"), "{prompt}");
     assert_eq!(field(&prompt, "why"), Some("prompt"), "{prompt}");
     assert_eq!(field(&prompt, "program"), Some("claude"), "{prompt}");
-    // Negative control: the FSM's revision did not move across the change (the screen kept
-    // moving, the job kept running), so a verdict gated on it would still say busy.
     assert_eq!(
         field(&prompt, "revision"),
         Some(revision.as_str()),
         "NEGATIVE CONTROL: revision= moved, so this run does not prove the gate: {before} / {prompt}"
     );
     let rev = field(&prompt, "agent_rev").unwrap().to_string();
-    // The verdict names the screen it was read from: a generation and a
-    // screen hash, the values a press decided from it fences on.
     let agent_gen = field(&prompt, "agent_gen").unwrap_or("-");
     let agent_fp = field(&prompt, "agent_fp").unwrap_or("-");
     assert!(
@@ -220,15 +189,12 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         "{prompt}"
     );
 
-    // The parked waiter latched.
     let waited = waiter.join().expect("await thread");
     let waited = String::from_utf8_lossy(&waited.stdout).into_owned();
     assert!(
         waited.contains("OK agent prompt rev="),
         "await agent: {waited}"
     );
-    // Already true: a fresh await answers on the same revision. A wait that
-    // parked answers only at its timeout (exit 124, which fails `ctl_ok`).
     let latched = ctl_ok(
         &inst,
         &[&format!("@{sid}"), "await", "agent", "busy,prompt", HANG_MS],
@@ -237,7 +203,6 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         latched.contains(&format!("OK agent prompt rev={rev}")),
         "{latched}"
     );
-    // An unknown word is a usage error, not a wait.
     let bad = ctl(&inst, &[&format!("@{sid}"), "await", "agent", "promtp"]);
     assert!(
         String::from_utf8_lossy(&bad.stdout).contains("ERR usage")
@@ -245,7 +210,6 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
         "{bad:?}"
     );
 
-    // The push.
     let want = format!("EVENT {local} agent prompt rev={rev} gen=");
     let deadline = Instant::now() + HANG;
     let mut seen = Vec::new();
@@ -262,16 +226,12 @@ fn a_box_under_a_ticking_row_is_published_pushed_and_awaitable() {
     let _ = sub.wait();
     assert!(pushed, "no `{want}` on the events stream: {seen:?}");
 
-    // The roster says the same.
     let roster = ctl_ok(&inst, &["sessions"]);
     let row = roster.lines().find(|l| l.contains(&sid)).expect("row");
     assert_eq!(field(row, "program"), Some("claude"), "{row}");
     assert_eq!(field(row, "agent"), Some("prompt"), "{row}");
 }
 
-/// A plain shell running `echo "…?"; sleep 300` is named by its foreground program
-/// (`program=sleep`, no shell integration) and is not an agent: `agent=-`, never
-/// `level=attention`. The `sleep` outlives every wait; the instance's hangup ends it.
 #[test]
 fn a_shell_question_is_not_an_agent_and_its_program_is_named() {
     let inst = boot("s");
@@ -293,9 +253,7 @@ fn a_shell_question_is_not_an_agent_and_its_program_is_named() {
     );
 }
 
-/// A fake Claude Code that draws its idle frame — the cursor on its caret
-/// row at column 2, where Claude Code keeps it — waits for `die` to exist,
-/// then clears the screen (as Claude restores the terminal) and exits.
+/// A fake Claude Code that draws its idle frame.
 const FAKE_EXIT: &str = r#"#!/bin/sh
 die="$1"
 rule=$(printf '%120s' '' | sed 's/ /─/g')
@@ -308,9 +266,6 @@ printf '\033[2J\033[H'
 exit 0
 "#;
 
-/// An agent that exits is no agent from its exit on: three times over, a fake Claude Code
-/// exits to its bash, `program=` names the shell, `agent=-` is pushed, and no agent verdict is
-/// published after the exit (the shell's prompt is never judged under Claude Code's reader).
 #[test]
 fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
     let inst = boot("x");
@@ -319,7 +274,6 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
     let die = inst.tmp.join("die");
     std::fs::write(&script, FAKE_EXIT).expect("write the fake");
 
-    // One subscription for all three rounds, acknowledged before anything moves.
     let mut sub = subscribed(&inst, &[&format!("@{sid}"), "events"]);
     let stream = sub.stdout.take().expect("subscribe stdout");
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -350,8 +304,6 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
             field(s, "program") == Some("claude")
                 && matches!(field(s, "agent"), Some("idle" | "question"))
         });
-        // Everything pushed so far is the fake's life; the stream is read from
-        // its exit on.
         while rx.try_recv().is_ok() {}
         std::fs::write(&die, b"").expect("the exit");
         let t0 = Instant::now();
@@ -404,16 +356,7 @@ fn an_agent_that_exits_is_no_agent_from_its_exit_on() {
     let _ = sub.wait();
 }
 
-/// A fake Claude Code launch, drawn as 2.1.283 draws one (aterm-phase's `LAUNCH_*` fixtures):
-/// nothing on the screen until `go` exists, then its REPL on the alternate screen (banner,
-/// composer between its two rules, mode footer, top row down), the cursor on the caret row at
-/// column 2.
-///
-/// It first writes and erases one cell (`x`, backspace, space, backspace), as a real Claude
-/// Code moves the screen the moment it runs. The status sweep names a foreground group when it
-/// changes and once more 500 ms later (`PROGRAM_NAME_CONFIRM`), then only when the screen moves
-/// (a cursor-only move does not count), so a silent launch read between `exec -a`'s fork and
-/// exec would leave `program=` at the interpreter.
+/// A fake Claude Code launch, drawn as 2.1.283 draws one (aterm-phase's `LAUNCH_*` fixtures).
 const FAKE_LAUNCH: &str = r#"#!/bin/sh
 go="$1"
 printf 'x\b \b'
@@ -425,11 +368,7 @@ printf '\033[4;3H'
 while :; do sleep 1; done
 "#;
 
-/// The same launch under Claude Code's inline (main-screen) renderer, measured on 2.1.283
-/// (aterm-phase's `INLINE_*` fixtures): the REPL drawn on the main grid under the launch line,
-/// the cursor on the caret row at column 2, the start-up cell as in [`FAKE_LAUNCH`]. Once
-/// `quit` exists it exits as Claude Code does: its prompt box left on the grid, the cursor on
-/// the row under its footer.
+/// The same launch under Claude Code's inline ([`FAKE_LAUNCH`]).
 const FAKE_INLINE_LAUNCH: &str = r#"#!/bin/sh
 go="$1"
 quit="$2"
@@ -442,11 +381,6 @@ while [ ! -e "$quit" ]; do sleep 0.05; done
 printf '\033[3B\r'
 "#;
 
-/// `await agent idle` on a Claude Code that has started but not drawn its REPL parks (the
-/// shell's rows under Claude Code's reader are `agent=unknown`) and latches once the composer
-/// is on the screen; a first prompt typed earlier would be lost. In a pane taller than the
-/// verdict's 40 rows the REPL leaves blank rows below it, and the verdict reads the last 40
-/// drawn rows: the wait latches at 50 rows and at 80. The two instances run side by side.
 #[test]
 fn await_agent_idle_waits_for_a_composer_above_the_last_40_rows() {
     std::thread::scope(|scope| {
@@ -460,9 +394,7 @@ fn await_agent_idle_waits_for_a_composer_above_the_last_40_rows() {
     });
 }
 
-/// Launch `fake` as `claude` in a `lines`-row instance: `await agent idle`
-/// parks while nothing of the REPL is drawn (`agent=unknown`), and latches
-/// on the REPL once it is.
+/// Launch `fake` as `claude` in a `lines`-row instance.
 fn waits_for_the_composer(tag: &str, lines: u16, fake: &str) {
     let inst = boot_rows(tag, lines);
     let (_, sid) = boot_session(&inst);
@@ -471,8 +403,6 @@ fn waits_for_the_composer(tag: &str, lines: u16, fake: &str) {
     let go = inst.tmp.join("go");
     launch_fake(&inst, &sid, &script, &go, &inst.tmp.join("quit"));
     let screen = parks_then_latches(&inst, &sid, &go, &format!("{lines} rows"));
-    // The geometry under test: in a pane taller than 40 rows, the caret sits
-    // above the grid's last 40 rows (40 or more rows below it).
     let below = screen
         .lines()
         .rev()
@@ -486,11 +416,6 @@ fn waits_for_the_composer(tag: &str, lines: u16, fake: &str) {
     }
 }
 
-/// Claude Code's inline renderer, relaunched in the tab it exited in, leaves the previous
-/// run's prompt box above the new launch line; a verdict read from that box's frame would
-/// answer `await agent idle` before the new REPL is drawn. In a 50-row pane the second launch
-/// reads `agent=unknown` and the wait latches on the new REPL, whose caret is under the second
-/// launch line. Control: the first run latches the same way.
 #[test]
 fn await_agent_idle_waits_for_the_relaunched_repl_in_the_same_tab() {
     let inst = boot_rows("r", 50);
@@ -535,12 +460,8 @@ fn await_agent_idle_waits_for_the_relaunched_repl_in_the_same_tab() {
     );
 }
 
-/// Type the launch of `script` as `claude` (`exec -a`), its go-file `go` and
-/// quit-file `quit`.
+/// Type the launch of `script` as `claude` (`exec -a`), its go-file `go` and quit-file `quit`.
 fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path) {
-    // The shell first: a line typed before bash draws its prompt is echoed twice (raw by the
-    // tty in canonical mode, again when readline redisplays the pending input), so every
-    // launch waits for a prompt row, as a person would.
     ctl_ok(
         inst,
         &[&format!("@{sid}"), "await", "match", r"[$#]\s*$", HANG_MS],
@@ -557,26 +478,18 @@ fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path
     );
 }
 
-/// With a fake launched and nothing of its REPL drawn, `await agent idle` does not
-/// answer (`agent=unknown`): the server's own latched predicate, asked with `timeout=0`,
-/// says not yet, with no sleep standing in for it. Then `go` is created and the parked
-/// wait latches on the REPL. Returns the screen it answered on.
+/// With a fake launched and nothing of its REPL drawn.
 fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> String {
     let named = status_until(inst, sid, HANG, "program=claude, read as an agent", |s| {
         field(s, "program") == Some("claude") && field(s, "agent") != Some("-")
     });
-    // A waiter parked on idle while nothing of the REPL is drawn.
     let waiter = std::thread::spawn({
         let mut cmd = client_command(
             inst,
             &[&format!("@{sid}"), "await", "agent", "idle", HANG_MS],
         );
-        // Asked again while the instance has not yet accepted it, or answers it busy: the
-        // verdict is latched, so a waiter armed late still answers it.
         move || until_served(|| cmd.output().expect("await agent idle"))
     });
-    // The verdict is LATCHED (`await agent`): a wait arriving now answers at once if
-    // `idle` is already published, so `timeout=0` is the check itself.
     let now = ctl(
         inst,
         &[&format!("@{sid}"), "await", "agent", "idle", "timeout=0"],
@@ -606,8 +519,7 @@ fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> Stri
     screen
 }
 
-/// A fake Claude Code that draws the rows of the file `$1` top down (one per
-/// grid row) and sits until the file `$2` exists.
+/// A fake Claude Code that draws the rows of the file `$1` top down.
 const FAKE_SCREEN: &str = r#"#!/bin/sh
 printf '\033[?1049h\033[2J'
 r=0
@@ -619,10 +531,6 @@ while [ ! -e "$2" ]; do sleep 0.1; done
 printf '\033[?1049l'
 "#;
 
-/// A Claude screen at its weekly limit with a background shell counted on it (`· 1 shell ·`,
-/// `1 shell still running`) is `agent=wall:usage-weekly`, not busy, and
-/// `await agent wall:usage-weekly` latches. Negative control: the same screen with the
-/// agent's spinner under it is `agent=busy`.
 #[test]
 fn a_weekly_wall_behind_a_shell_is_a_wall_not_busy() {
     const WALL: &str = include_str!(
@@ -682,7 +590,6 @@ fn a_weekly_wall_behind_a_shell_is_a_wall_not_busy() {
         ],
     );
     assert!(held.starts_with("OK"), "the wait latches: {held}");
-    // Negative control: the live screen is busy.
     std::fs::write(&quit, "").expect("quit");
     status_until(&inst, &sid, HANG, "the fake gone", |s| {
         field(s, "program") != Some("claude")

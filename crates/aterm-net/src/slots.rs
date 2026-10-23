@@ -138,7 +138,7 @@ fn pick_displaced(held: &[Held], source: IpAddr, now: Instant, grace: Duration) 
 
 /// One connection a listener holds a slot for, handshaking or served.
 struct Slot {
-    /// Which connection: its [`SlotTenure`] frees the slot.
+    /// Which connection: its [`SlotTenure`] frees the slot by this.
     id: u64,
     /// The address it is counted against ([`source_of`]).
     source: IpAddr,
@@ -160,7 +160,8 @@ pub(crate) struct Slots {
 }
 
 impl Slots {
-    /// No slot held yet: at most `capacity`.
+    /// No slot held yet: at most `capacity` at once, an unauthenticated one
+    /// given up to a newcomer from a no-heavier address once `grace` old.
     pub(crate) const fn new(capacity: usize, grace: Duration) -> Self {
         Self {
             held: Mutex::new(Vec::new()),
@@ -374,6 +375,8 @@ impl HandshakeWatchdog {
                 let remaining = handshake_timeout.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
                     // Deadline reached: claim FIRED iff still running. A lost
+                    // claim is re-read above: the handshake's leaves the socket
+                    // alone, an eviction's still closes it.
                     if claim_deadline(&wd_state) {
                         break true;
                     }

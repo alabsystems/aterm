@@ -4,10 +4,7 @@
 
 use super::is_pending_stub;
 
-/// A `ty` search a resource limit stopped is never a verdict: exit 5, or a
-/// `Model checking stopped:` line under exit 0 (the shape a memory budget
-/// shrunk by concurrent processes takes), reads as stopped; a clean run and a
-/// refutation do not.
+/// Exit 5 or a `Model checking stopped:` line under exit 0 reads as stopped, never a verdict.
 #[cfg(unix)]
 #[test]
 fn a_stopped_search_is_never_a_verdict() {
@@ -32,8 +29,7 @@ fn a_stopped_search_is_never_a_verdict() {
     )));
 }
 
-/// The per-invariant form of [`super::uncaught_invariants`], an isolated `bmc` per invariant at
-/// `Buggy = 1`: the oracle the one-walk form is held to.
+/// Per-invariant oracle for [`super::uncaught_invariants`]: an isolated `bmc` per invariant at `Buggy = 1`.
 fn uncaught_invariants_one_walk_per_invariant(m: &super::Model) -> Vec<&'static str> {
     let buggy = super::interp::with_buggy(m, 1);
     m.invariants
@@ -47,28 +43,18 @@ fn uncaught_invariants_one_walk_per_invariant(m: &super::Model) -> Vec<&'static 
         .collect()
 }
 
-/// The one-walk ghost sweep returns exactly what one isolated walk per invariant returns: the
-/// same set in the same order, and a panic where the per-invariant form panics (a function-valued
-/// model).
-///
-/// The sample is chosen by outcome, not name: registry models are filed by what the sweep says
-/// (an uncaught invariant, fully caught, or uninterpretable) and the first `PER_OUTCOME` of each
-/// are held to the oracle, so paying a ghost down never weakens the test (`tests/non_vacuity.rs`
-/// checks the whole registry). Two controls built from the first fully-caught model cover every
-/// outcome whatever the census: it plus a tautology (one ghost beside caught invariants, so the
-/// walk runs to the end), and it plus a function-valued invariant (both forms must panic).
+/// The one-walk ghost sweep matches the per-invariant oracle across uncaught, fully caught, and
+/// uninterpretable models (both forms panic on function-valued invariants).
 #[test]
 fn the_one_walk_ghost_sweep_matches_the_per_invariant_oracle() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::derive::{Expr, Invariant};
 
-    /// Models of each outcome held to the oracle. The oracle costs one walk per invariant, so the
-    /// sample is a few of each kind.
+    /// Number of models per outcome held to the oracle.
     const PER_OUTCOME: usize = 3;
 
-    /// Hold one model to the oracle; `Some(uncaught)` if it is
-    /// interpretable, `None` if both forms panicked.
+    /// Compare `m` against the oracle; returns `None` if both panicked.
     fn compare(m: &super::Model) -> Option<Vec<&'static str>> {
         let oracle = catch_unwind(AssertUnwindSafe(|| {
             uncaught_invariants_one_walk_per_invariant(m)
@@ -145,8 +131,7 @@ fn the_one_walk_ghost_sweep_matches_the_per_invariant_oracle() {
     );
 }
 
-/// A pending-program stub on PATH is not the tool: discovery skips it, or a harness would read its
-/// refusal as tool output.
+/// Discovery skips `atpkg` pending-program stubs on `PATH`.
 #[test]
 fn a_pending_stub_is_not_the_tool() {
     let dir = std::env::temp_dir().join(format!("aterm_stub_probe_{}", std::process::id()));
@@ -175,8 +160,7 @@ use super::*;
 use crate::test_models::{config_catalog_snapshot_model, ring_model};
 use crate::ty_model;
 
-/// A dangling store shim never satisfies discovery; a live one (a symlink or an exec stub)
-/// resolves to the real store target (what the caller will execute), not the shim.
+/// Store shim resolution fails closed on missing, dangling, or tombstone shims and resolves live targets.
 #[cfg(unix)]
 #[test]
 fn store_shim_resolution_is_fail_closed() {
@@ -184,13 +168,10 @@ fn store_shim_resolution_is_fail_closed() {
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     let shim = d.join("ty");
-    // Absent → None.
     assert_eq!(resolve_store_shim(&shim), None);
-    // Dangling symlink → None (a GC'd store build must not satisfy).
     std::os::unix::fs::symlink(d.join("store/gone/ty"), &shim).unwrap();
     assert_eq!(resolve_store_shim(&shim), None);
-    // A tombstone (the refusal script atpkg writes for a yanked build) reads as absent, or a
-    // revoked build would shadow a working tool on PATH.
+    // Tombstone refusal scripts read as absent.
     std::fs::remove_file(&shim).unwrap();
     std::fs::write(&shim, b"#!/bin/sh\necho revoked >&2\nexit 1\n").unwrap();
     assert_eq!(
@@ -198,15 +179,13 @@ fn store_shim_resolution_is_fail_closed() {
         None,
         "a tombstone shim must never satisfy discovery"
     );
-    // Live shim → the resolved store path.
     std::fs::remove_file(&shim).unwrap();
     let target = d.join("real-ty");
     std::fs::write(&target, b"#!/bin/sh\n").unwrap();
     std::os::unix::fs::symlink(&target, &shim).unwrap();
     let got = resolve_store_shim(&shim).expect("live shim resolves");
     assert_eq!(got, std::fs::canonicalize(&target).unwrap());
-    // The shape atpkg lays: a `#!/bin/sh` exec stub whose first `exec '<path>' "$@"` line is the
-    // target, here a path with a quote in it.
+    // Exec stub with a single-quoted target containing an escaped quote.
     std::fs::remove_file(&shim).unwrap();
     let quoted = d.join("store/it's/ty");
     std::fs::create_dir_all(quoted.parent().unwrap()).unwrap();
@@ -228,8 +207,7 @@ fn store_shim_resolution_is_fail_closed() {
         Some(std::fs::canonicalize(&quoted).unwrap()),
         "an exec stub resolves to the file it execs"
     );
-    // A stub naming a reclaimed build is absent, and so is one naming a relative path, which
-    // would resolve against the cwd (where `Cargo.toml` is a real file).
+    // Reclaimed builds and relative targets read as absent.
     stub(&d.join("store/gone/ty").to_string_lossy());
     assert_eq!(
         resolve_store_shim(&shim),
@@ -246,7 +224,6 @@ fn store_shim_resolution_is_fail_closed() {
         None,
         "a relative target is absent"
     );
-    // atpkg's pending-program stub execs `"$ATPKG"`, never a quoted literal path.
     std::fs::remove_file(&shim).unwrap();
     std::fs::write(
         &shim,
@@ -258,11 +235,7 @@ fn store_shim_resolution_is_fail_closed() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
-// Discovery. Every test below runs over a temp home and store prefix through the explicit-env
-// resolver, so none reads or mutates the process environment or depends on what is installed.
-
-/// A scratch HOME and atpkg prefix for one test (unix, as every test using it is: the store's
-/// `current` links and the `/bin/sh` stand-ins).
+/// Scratch `HOME` and store prefix for discovery tests.
 #[cfg(unix)]
 struct Scratch {
     root: aterm_tempfile::TempDir,
@@ -271,8 +244,7 @@ struct Scratch {
 #[cfg(unix)]
 impl Scratch {
     fn new(tag: &str) -> Self {
-        // Canonical, so `~` shortening matches the paths discovery returns
-        // (macOS temp_dir is itself behind the /var -> /private/var link).
+        // Canonicalize so macOS `/var` -> `/private/var` symlinks match discovered paths.
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let root = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-spec-prov-{tag}-"))
@@ -306,8 +278,7 @@ impl Scratch {
     }
 }
 
-/// The order: the store shim beats PATH, and a developer tree under home (a cargo build, a
-/// bootstrap stage) is never a candidate: a stale one would shadow the store.
+/// Store shims take precedence over `PATH`, and developer trees under `HOME` are ignored.
 #[cfg(unix)]
 #[test]
 fn discovery_order_is_store_then_path_and_no_developer_tree() {
@@ -328,9 +299,7 @@ fn discovery_order_is_store_then_path_and_no_developer_tree() {
     assert_eq!((got.origin, got.path), (TrustBinOrigin::Store, store));
 }
 
-/// Rewrite the file at `p` in place (same inode) with `body`, of its
-/// current length, and put its mtime back — until the filesystem's ctime
-/// clock has ticked, so only the ctime differs from before.
+/// Rewrite `p` in place with same-length `body` and restore `mtime` once `ctime` advances.
 #[cfg(unix)]
 fn rewrite_keeping_mtime(p: &Path, body: &str) {
     use std::os::unix::fs::MetadataExt as _;
@@ -366,9 +335,7 @@ fn write_exec(p: &Path, body: &str) {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A forwarder's exec target is read only when the shell would expand
-/// nothing in it, and the rest of the line comes back as written (its
-/// separating blank included), quoted or bare.
+/// `shell_literal_word` extracts an unexpanded word and preserves the trailing remainder.
 #[test]
 fn a_shell_literal_word_is_read_only_when_nothing_expands() {
     let cases: &[(&str, Option<(&str, &str)>)] = &[
@@ -401,10 +368,7 @@ fn a_shell_literal_word_is_read_only_when_nothing_expands() {
     }
 }
 
-/// A8: the capabilities are `ty capabilities --json`'s list, in its order;
-/// a `ty` without the command (exit 2, `unrecognized subcommand`), a
-/// killed probe or a reply that is not the document all have none — the
-/// per-process protocol every `ty` speaks.
+/// `caps_from` parses `ty capabilities --json` and returns empty on non-zero exit, signal, or non-JSON output.
 #[test]
 fn ty_capabilities_are_the_json_list_and_an_older_ty_has_none() {
     let json = b"{\"ty\":\"0.15.0\",\"capabilities\":[\"check-no-cache-v1\",\"trace-cases-v1\"]}\n";
@@ -420,10 +384,7 @@ fn ty_capabilities_are_the_json_list_and_an_older_ty_has_none() {
     );
 }
 
-/// A probe that never answers is killed at the bound it was given, and is no
-/// answer: a wedged `ty --version` cannot hang the suite. The wedged stand-in
-/// lives 300 s (`exec`, so the kill reaches the sleep itself) under a 300 ms
-/// bound, so the minute hang detector still tells killed from waited out.
+/// A probe that exceeds its timeout is killed and returns `None`.
 #[cfg(unix)]
 #[test]
 fn a_wedged_probe_is_killed_at_its_bound() {
@@ -451,10 +412,7 @@ fn stand_in(dir: &Path, body: &str) -> PathBuf {
     bin
 }
 
-/// A stand-in `ty` for the `--cases` pool (A10): it advertises the cases mode, runs `cases` (shell)
-/// as `trace validate --cases -`, logging each such spawn to `<dir>/spawns`, and answers the
-/// per-process form with `per-process` and exit 1, a refusal, so a case the pool did not answer is
-/// visibly the fallback's. A child that must die abnormally dies by SIGKILL.
+/// Stand-in `ty` advertising `--cases`, logging pool spawns to `<dir>/spawns`, and failing per-process calls.
 #[cfg(unix)]
 fn cases_stand_in(dir: &Path, model: &str, cases: &str) -> PathBuf {
     let header = format!(
@@ -475,8 +433,7 @@ fn cases_stand_in(dir: &Path, model: &str, cases: &str) -> PathBuf {
     )
 }
 
-/// A stand-in's `--cases` body: the header, then one verdict per request,
-/// `{"id":<the request's>,<rest>}`, then `after` (shell).
+/// Emit the `--cases` header and reply `{"id":<id>,<rest>}` per request, running `after` after each.
 #[cfg(unix)]
 fn answering(rest: &str, after: &str) -> String {
     format!(
@@ -502,8 +459,7 @@ fn spawns(dir: &Path) -> usize {
     std::fs::read_to_string(dir.join("spawns")).map_or(0, |s| s.lines().count())
 }
 
-/// A12: a co-process `class: "error"` verdict is no refusal to agree with —
-/// it panics, naming why.
+/// A co-process `class: "error"` verdict panics rather than counting as a refutation.
 #[cfg(unix)]
 #[test]
 #[should_panic(expected = "ty COULD NOT EVALUATE")]
@@ -523,9 +479,7 @@ fn an_evaluation_error_is_not_a_refutation() {
     let _ = ty_trace_verdict(&ty, model, spec, "C\n".into(), x_trace(model, 0), model);
 }
 
-/// A request with no verdict line has no verdict, never an accept. A child that closes stdout,
-/// echoes another request's id (with `ok: true`), or writes a non-verdict line leaves the case to
-/// the per-process fallback, which here refuses.
+/// Missing, mismatched-id, or non-JSON co-process replies fall back to per-process validation.
 #[cfg(unix)]
 #[test]
 fn a_case_with_no_verdict_line_is_never_an_accept() {
@@ -551,10 +505,7 @@ fn a_case_with_no_verdict_line_is_never_an_accept() {
     }
 }
 
-/// The `ty` verdict memo replays a verdict only for the same rendered files asked of the same
-/// binary. A `ty` rewritten in place is asked again, even at the same length with its mtime put
-/// back; so is one whose path was repointed while it ran, even once the path names the first
-/// binary again; and a binary that cannot be stat'ed is never memoized.
+/// `memoized_verdict` caches by binary identity (`mtime`/`ctime`) and input, invalidating on in-place rewrites or mid-run swaps.
 #[cfg(unix)]
 #[test]
 fn a_ty_verdict_is_replayed_only_for_the_same_binary_and_files() {
@@ -592,7 +543,6 @@ fn a_ty_verdict_is_replayed_only_for_the_same_binary_and_files() {
         "another spec is another question"
     );
 
-    // Rewritten in place: same path, length and inode; the mtime moves.
     std::fs::write(&a, "v2").unwrap();
     let set_mtime = |t: SystemTime| {
         let f = std::fs::File::options().write(true).open(&a).unwrap();
@@ -601,8 +551,6 @@ fn a_ty_verdict_is_replayed_only_for_the_same_binary_and_files() {
     set_mtime(SystemTime::now() + Duration::from_secs(60));
     assert_eq!(ask("spec"), "run 3", "a binary replaced in place");
 
-    // Rewritten in place again with the mtime put back: only the ctime
-    // tells.
     rewrite_keeping_mtime(&a, "v3");
     assert_eq!(
         ask("spec"),
@@ -610,7 +558,6 @@ fn a_ty_verdict_is_replayed_only_for_the_same_binary_and_files() {
         "a same-length rewrite, mtime put back"
     );
 
-    // Repointed while it ran, then pointed back.
     std::fs::write(&b, "another build").unwrap();
     assert_eq!(ask_while("asked mid-swap", &|| point_ty_at(&b)), "run 5");
     point_ty_at(&a);
@@ -626,9 +573,7 @@ fn a_ty_verdict_is_replayed_only_for_the_same_binary_and_files() {
     assert_eq!(ask("spec"), "run 8 (no checker)", "is never memoized");
 }
 
-/// A PATH `ty` that is a wrapper is the checker its target is: when only the binary it execs is
-/// rebuilt, the memo asks again, and the checker handed to the run (which keys the `--cases` pool)
-/// is a new one naming the binary behind the wrapper.
+/// Rebuilding the binary behind a wrapper script invalidates the memo and updates `TyChecker`.
 #[cfg(unix)]
 #[test]
 fn a_ty_verdict_behind_a_wrapper_is_asked_again_when_only_its_target_changes() {
@@ -675,10 +620,7 @@ fn a_ty_verdict_behind_a_wrapper_is_asked_again_when_only_its_target_changes() {
     assert_eq!(ends, [Some(real.clone()), Some(real.clone())]);
 }
 
-/// The `--cases` pool and the verdict memo answer only for the build the provenance line names:
-/// once `ty` is re-laid at its path by rename (the old build's live child keeps its own file), an
-/// answered step is asked again and a new step of the same (spec, cfg) goes to a child of the new
-/// build.
+/// Replacing `ty` by rename invalidates the memo and spawns a new `--cases` co-process.
 #[cfg(unix)]
 #[test]
 fn the_cases_pool_and_the_memo_answer_only_for_the_build_in_use() {
@@ -728,12 +670,76 @@ fn the_cases_pool_and_the_memo_answer_only_for_the_build_in_use() {
     );
 }
 
-/// The five committed-dead `ConfigCatalogSnapshot` mutants are verified
-/// negative controls (dial present, fire at Buggy=1, caught at Buggy=1), and the
-/// relaxation fails closed: an empty `ty` dead set while the interpreter finds
-/// dead actions (a `ty` output-format drift cannot silently grant it), an action
-/// the model does not declare, and a model whose `Buggy` is not committed to 0
-/// (no catch config, so real vacuity) are each refused.
+/// A pooled `--cases` co-process is killed and reaped before the process that pooled it exits,
+/// so no member of that process's group outlives it. The pooling process is this test binary
+/// re-run on this one test in a group of its own; its stand-in lingers after its stdin's EOF (as
+/// a real `ty` exiting does for a moment), which a pool left to that EOF leaves in the group
+/// (aterm-verify's sweep at the leader's exit named it `? ×1`).
+#[cfg(unix)]
+#[test]
+fn a_pooled_co_process_ends_before_the_process_that_pooled_it() {
+    use std::time::Duration;
+    const POOLING: &str = "ATERM_SPEC_TEST_POOLING_DIR";
+    let model = "PoolEndsAtExit";
+    if let Some(dir) = std::env::var_os(POOLING) {
+        let dir = PathBuf::from(dir);
+        let cases = format!(
+            "{}\nexec sleep 60",
+            answering("\"ok\":true,\"steps\":2,\"warnings\":[]", "")
+        );
+        let ty = cases_stand_in(&dir, model, &cases);
+        let spec = format!("---- MODULE {model} ----\n====\n");
+        let (ok, why) = ty_trace_verdict(&ty, model, spec, "C\n".into(), x_trace(model, 0), model);
+        assert!(
+            ok && why.starts_with("ty (cases) "),
+            "a co-process verdict: {why}"
+        );
+        return;
+    }
+    let s = Scratch::new("cases-exit");
+    let test = std::thread::current()
+        .name()
+        .expect("libtest names each test's thread after it")
+        .to_string();
+    let log = s.root.path().join("pooling.log");
+    let out = std::fs::File::create(&log).unwrap();
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+    let mut pooling = cmd
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(POOLING, s.home())
+        .process_group(0)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
+        .spawn()
+        .expect("start the pooling process");
+    let pgid = i32::try_from(pooling.id()).unwrap();
+    let status = crate::wait::within(Duration::from_secs(60), Duration::from_millis(5), || {
+        pooling.try_wait().expect("the pooling process's exit")
+    });
+    if status.is_none() {
+        let _ = pooling.kill();
+        let _ = pooling.wait();
+    }
+    // SAFETY: signal 0 to the pooling process's own group only asks whether a member is left.
+    let left = unsafe { libc::killpg(pgid, 0) } == 0;
+    if left {
+        // SAFETY: SIGKILL to the group this test made, so a failure leaves nothing running.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the pooling process ({status:?}):\n{text}"
+    );
+    assert_eq!(spawns(&s.home()), 1, "the pooling process pooled one child");
+    assert!(
+        !left,
+        "a pooled co-process outlived the process that pooled it:\n{text}"
+    );
+}
+
+/// `audit_dead_negative_controls` accepts committed-dead mutants caught at `Buggy = 1` and rejects tier drift, unknown actions, or uncommitted dials.
 #[test]
 fn audit_dead_negative_controls_needs_tier_agreement_and_a_committed_dial() {
     let m = config_catalog_snapshot_model();
@@ -774,12 +780,9 @@ fn audit_dead_negative_controls_needs_tier_agreement_and_a_committed_dial() {
     }
 }
 
-/// An action that fires under no mutant dial either (a typo'd guard, not a mutant) is real
-/// vacuity, and a mutant no invariant catches proves nothing: both are rejected.
+/// `audit_dead_negative_controls` rejects actions that never fire or violate no invariant at `Buggy = 1`.
 #[test]
 fn audit_rejects_never_firing_and_uncaught_mutants() {
-    // `Stuck` cannot fire at any config: its guard needs count > Cap while
-    // count never exceeds Cap.
     let never = ty_model! {
         NeverFires {
             const Buggy = 0;
@@ -797,8 +800,6 @@ fn audit_rejects_never_firing_and_uncaught_mutants() {
         "{r:?}"
     );
 
-    // `Harmless` fires at Buggy=1 but violates nothing there — the "mutant"
-    // is caught by no invariant, so it proves nothing.
     let uncaught = ty_model! {
         UncaughtMutant {
             const Buggy = 0;
@@ -816,8 +817,7 @@ fn audit_rejects_never_firing_and_uncaught_mutants() {
     );
 }
 
-/// One caught mutant must not launder a second, harmless one through a shared `Buggy = 1`
-/// counterexample: a dead action is credited only for a violation of its own.
+/// Each dead mutant must be independently caught at `Buggy = 1`.
 #[test]
 fn audit_rejects_two_mutants_when_only_one_is_independently_caught() {
     let partly_vacuous = ty_model! {
@@ -841,9 +841,7 @@ fn audit_rejects_two_mutants_when_only_one_is_independently_caught() {
     );
 }
 
-/// A dead action that breaks a law from every lawful state it fires in is a violation step and is
-/// credited, even where another `Buggy` branch (`Tab`) breaks a law too. One that fires only where
-/// a law is already broken shows nothing of its own.
+/// `audit_dead_negative_controls` credits dead actions that violate a law from a lawful state, not actions after a prior violation.
 #[test]
 fn audit_credits_a_violation_step_and_not_a_step_after_one() {
     let consequence = ty_model! {
@@ -866,8 +864,6 @@ fn audit_credits_a_violation_step_and_not_a_step_after_one() {
     };
     assert_eq!(audit_dead_negative_controls(&[consequence]), Ok(1));
 
-    // `NeverStray` breaks on the very step that enables `Shrug`, so every state `Shrug` fires in
-    // is unlawful before it moves.
     let after = ty_model! {
         StepAfterAViolation {
             const Buggy = 0;
@@ -887,10 +883,7 @@ fn audit_credits_a_violation_step_and_not_a_step_after_one() {
     );
 }
 
-/// A dead action that fires only after another dead one has (`Fire` needs `Arm`'s state,
-/// and only from where `Arm` already broke a law) is no violation step and, added alone to
-/// the baseline, never fires: it is no negative control of its own, and is named as one
-/// that fires only beside another.
+/// Dead actions that fire only after another dead action are rejected.
 #[test]
 fn audit_rejects_a_mutant_that_fires_only_beside_another() {
     let beside = ty_model! {
@@ -913,8 +906,7 @@ fn audit_rejects_a_mutant_that_fires_only_beside_another() {
     );
 }
 
-/// An action only a declared scenario reaches is not dead: it fires in a
-/// configuration the real code runs under. Without the scenario it is.
+/// Actions reachable in a declared scenario are not reported as dead.
 #[test]
 fn a_scenario_keeps_its_own_actions_alive() {
     let capped = ty_model! {
@@ -940,8 +932,7 @@ fn a_scenario_keeps_its_own_actions_alive() {
     assert_eq!(audit_dead_negative_controls(&[capped, scenario]), Ok(0));
 }
 
-/// The state count is read from `ty`'s statistics block and only from it; on drift it is `None`,
-/// which the caller turns into a failure.
+/// `ty_states_explored` parses the `States found:` line from `ty`'s statistics block.
 #[test]
 fn ty_state_count_is_parsed_or_refused() {
     let real = "Model checking complete: No errors found (exhaustive).\n\n\
@@ -951,20 +942,15 @@ fn ty_state_count_is_parsed_or_refused() {
         ty_states_explored("Statistics:\n  States found: 1\n"),
         Some(1)
     );
-    // Drift / no statistics block / non-numeric — all refusals, not zeros.
     assert_eq!(ty_states_explored("No errors found (exhaustive)."), None);
     assert_eq!(ty_states_explored("  States explored: 128\n"), None);
     assert_eq!(ty_states_explored("  States found: many\n"), None);
 }
 
-/// The guard does not fail open on a clean `ty` verdict over a model the interpreter knows is
-/// violated: the caller's report is `ty`'s exit status, which is exactly what cannot be trusted
-/// here.
+/// `assert_ty_saw_whole_space` panics if `ty` reports a clean verdict on a model violated in the interpreter.
 #[test]
 fn a_clean_ty_verdict_over_a_violated_model_is_a_false_proof_not_a_coverage_gap() {
-    // The guard forces `Buggy = 0` itself, so the violation must come from elsewhere:
-    // `LenBounded` is `seq - lo + 1 <= Cap` and the ring starts at `seq = 0, lo = 1`, so
-    // `Cap = -1` is violated in the initial state.
+    // `Cap = -1` violates `LenBounded` at `Buggy = 0` in the initial state.
     let m = interp::with_consts(&ring_model(), &[("Cap", -1)]);
     assert!(
         interp::bmc(&interp::with_buggy(&m, 0)).is_err(),
@@ -984,13 +970,7 @@ fn a_clean_ty_verdict_over_a_violated_model_is_a_false_proof_not_a_coverage_gap(
     );
 }
 
-/// The explored-space law refuses every transcript that does not show `ty`
-/// walking exactly the interpreter's space. A `ty` once reported "No errors
-/// found (exhaustive)" for `RainbowJumpBurstLifecycle` after exploring ONE of
-/// its 128 reachable states (a singleton ample set formed from the stutter
-/// action): a SMALLER count is a false proof. A LARGER one means the emitted
-/// TLA+ admits states the model does not, so the tiers are not checking the
-/// same machine. A clean verdict with no count credits nothing.
+/// `assert_same_space_explored` rejects `ty` transcripts whose state count is smaller, larger, or missing.
 #[test]
 fn a_ty_verdict_over_another_space_is_not_a_proof() {
     let m = ring_model();

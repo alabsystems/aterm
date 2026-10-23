@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's persistence and config surfaces, recorded while every model
-//! derived through registry serde (docs/AUDIT-third-party-2026-10-15.md, SP.3);
-//! since the switch (SP.6) the first-party serde must answer each the same:
-//!
-//! - `aterm.toml` ([`Config`]): container `default`, unknown keys ignored, the one
-//!   `alias`, the `skip`ped `[harness]`, a hand-written `FontList`;
-//! - the restore layout ([`RestoreManifest`]): internally tagged enums, a
-//!   `deny_unknown_fields` tag, an untagged lenient reader;
-//! - the seamless handoff manifest ([`SessionHandoff`]): lenient `deserialize_with`
-//!   readers that turn a bad value into "unreadable", never a refused manifest;
-//! - the checkpoint meta ([`CheckpointMeta`]), JSON whose bytes are hashed into the
-//!   adoption proof;
-//! - the `FIELDS` list the derive hands `deserialize_struct`, read by the config
-//!   language's probe (`reader_fields`).
-//!
-//! Old builds' state is the bytes every shipped producer wrote under
-//! `tests/fixtures/handoff/v*/`: each manifest, layout and meta there is read and
-//! written back out.
+//! Corpus tests for the window's persistence and config surfaces.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;
@@ -33,8 +16,6 @@ use crate::native_config_language::reader_fields;
 use crate::restore::{CellMetricsCache, RestoreManifest};
 use crate::session_store::SessionHandoff;
 
-/// `base` with each `(from, to)` applied; `from` must occur exactly once, so
-/// a mutation can never silently leave the document as it was.
 fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     let mut doc = base.to_string();
     for (from, to) in edits {
@@ -44,17 +25,12 @@ fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     doc
 }
 
-/// A [`Config`] written out (it has no `Serialize`): its `{:#?}` on one line, `None`
-/// fields left out. The `skip`ped `[harness]` is always its default here
-/// (`Config::parse` reads it by line, not through serde), so it is said once.
 fn config_answer(config: &Config) -> String {
     let harness = if config.harness == crate::app_config::HarnessPolicy::default() {
         "harness=default"
     } else {
         "harness=SET"
     };
-    // The two skipped fields (`harness`, `ai`) are filled by `Config::parse`,
-    // never by serde: the reader answers for them without their bodies.
     assert!(
         config.ai == crate::app_config::AiPolicy::default(),
         "serde never fills `ai`"
@@ -115,7 +91,6 @@ fn config_documents_answer_as_recorded() {
     corpus.record("base", read(CONFIG));
     corpus.record("empty", read(""));
     let cases: &[(&str, &[(&str, &str)])] = &[
-        // Container default: unknown keys are ignored at every level.
         (
             "unknown-key/root",
             &[("gpu = false\n", "gpu = false\nshader = \"crt\"\n")],
@@ -133,12 +108,10 @@ fn config_documents_answer_as_recorded() {
             &[("words = [\"shipit\"]\n", "words = [\"shipit\"]\nport = 1\n")],
         ),
         ("unknown-key/table-header", &[("[render]", "[renderer]")]),
-        // The skipped field: the reader never sees `[harness]`.
         (
             "skip/harness-scalar",
             &[("[harness]\nmax_sessions = 4\n", "")],
         ),
-        // FontList: a string or a list, and nothing else.
         (
             "fontlist/array",
             &[(
@@ -167,7 +140,6 @@ fn config_documents_answer_as_recorded() {
                 "fallback_fonts = { first = \"Menlo\" }",
             )],
         ),
-        // Wrong types.
         ("wrong-type/gpu-string", &[("gpu = false", "gpu = \"no\"")]),
         (
             "wrong-type/font-px-string",
@@ -195,7 +167,6 @@ fn config_documents_answer_as_recorded() {
             "wrong-type/render-string",
             &[("[render]\nrepaint_nudge = \"log\"\n", "render = \"log\"\n")],
         ),
-        // Tables written as arrays, and the other way about.
         (
             "array-for-table/render-empty",
             &[("[render]\nrepaint_nudge = \"log\"\n", "render = []\n")],
@@ -218,7 +189,6 @@ fn config_documents_answer_as_recorded() {
             "table-for-array/custom",
             &[("[[sparkle_words.custom]]", "[sparkle_words.custom]")],
         ),
-        // Integers at and past each width.
         (
             "int/columns-u16-overflow",
             &[("columns = 120", "columns = 65536")],
@@ -242,7 +212,6 @@ fn config_documents_answer_as_recorded() {
             &[("scrollback_lines = 20000", "scrollback_lines = 20000.0")],
         ),
         ("int/font-px-int", &[("font_px = 15.5", "font_px = 15")]),
-        // Signed zero and the non-finite floats.
         (
             "zero/columns-negative-int",
             &[("columns = 120", "columns = -0")],
@@ -261,7 +230,6 @@ fn config_documents_answer_as_recorded() {
             "float/font-px-subnormal",
             &[("font_px = 15.5", "font_px = 1e-45")],
         ),
-        // The document itself.
         (
             "toml/duplicate-table",
             &[(
@@ -280,8 +248,6 @@ fn config_documents_answer_as_recorded() {
     corpus.finish();
 }
 
-/// The `FIELDS` list of `T`'s derived table at `path`, as the derive hands it
-/// to `deserialize_struct`.
 fn fields_at<T: serde::de::DeserializeOwned>(
     path: &[&'static str],
 ) -> Result<String, &'static str> {
@@ -290,8 +256,6 @@ fn fields_at<T: serde::de::DeserializeOwned>(
         .ok_or("not a derived table")
 }
 
-/// Every derived table of `T` reachable from `path` through named fields and
-/// `Option`s, each recorded as its `FIELDS`.
 fn record_tables<T: serde::de::DeserializeOwned>(
     corpus: &mut Corpus,
     name: &str,
@@ -322,17 +286,13 @@ fn derived_field_lists_answer_as_recorded() {
     record_tables::<CheckpointMeta>(&mut corpus, "CheckpointMeta", &mut Vec::new());
     record_tables::<aterm_policy::Policy>(&mut corpus, "Policy", &mut Vec::new());
     record_tables::<atpkg::manifest::Index>(&mut corpus, "Index", &mut Vec::new());
-    // Under `flatten` the derive asks for a map, not a struct: no FIELDS.
     corpus.record("Status/(root)", fields_at::<atpkg::status::Status>(&[]));
-    // Negative control: not a derived table at all.
     corpus.record("Vec<String>/(root)", fields_at::<Vec<String>>(&[]));
     corpus.record("Config/keybindings", fields_at::<Config>(&["keybindings"]));
     corpus.record("Config/font_px", fields_at::<Config>(&["font_px"]));
     corpus.finish();
 }
 
-/// A layout shaped like a 0.104.0 crash journal (values made up), with a Settings
-/// leaf carrying an unsaved draft.
 const LAYOUT: &str = r#"schema = 2
 
 [[windows]]
@@ -412,7 +372,6 @@ written_unix_ms = 1792108451973
 stamps_quit = true
 "#;
 
-/// A layout schema 1 wrote: terminal tabs only, no order, no restored tabs.
 const LEGACY_LAYOUT: &str = r#"schema = 1
 
 [[windows]]
@@ -439,7 +398,6 @@ fn restore_layouts_answer_as_recorded() {
     corpus.record("legacy-schema-1", read(LEGACY_LAYOUT));
     corpus.record("missing-key/windows", read("schema = 2\n"));
     let cases: &[(&str, &[(&str, &str)])] = &[
-        // Internally tagged: the tag missing, unknown, mistyped, repeated.
         (
             "tag/missing-node",
             &[(
@@ -488,7 +446,6 @@ fn restore_layouts_answer_as_recorded() {
             "tag/pane-missing-kind",
             &[("[[windows.tabs]]\nkind = \"leaf\"\n", "[[windows.tabs]]\n")],
         ),
-        // Tagged with deny_unknown_fields: an extra key refuses the entry.
         (
             "deny/native-tab-extra-key",
             &[(
@@ -524,7 +481,6 @@ fn restore_layouts_answer_as_recorded() {
                 "kind = \"terminal\"\nindex = \"0\"\n",
             )],
         ),
-        // Not denied: an unknown key in a leaf or a window is dropped.
         (
             "unknown-key/terminal-view",
             &[(
@@ -536,7 +492,6 @@ fn restore_layouts_answer_as_recorded() {
             "unknown-key/window",
             &[("active_item = 0\n", "active_item = 0\nspace = 3\n")],
         ),
-        // The untagged lenient drafts reader.
         (
             "drafts/string",
             &[(
@@ -565,11 +520,9 @@ fn restore_layouts_answer_as_recorded() {
                 "settings_drafts = { key = \"font_px\", text = \"15\" }",
             )],
         ),
-        // Required keys.
         ("missing-key/rows", &[("rows = 47\n", "")]),
         ("missing-key/split-ratio", &[("ratio = 0.61\n", "")]),
         ("missing-key/defaulted-zoomed", &[("zoomed = false\n", "")]),
-        // Shapes and widths.
         (
             "fixed-array/inner-px-three",
             &[("inner_px = [1954, 1424]", "inner_px = [1954, 1424, 2]")],
@@ -622,7 +575,6 @@ fn restore_layouts_answer_as_recorded() {
     for (id, edits) in cases {
         corpus.record(*id, read(&mutate(LAYOUT, edits)));
     }
-    // The real cache's shape (cell-metrics.toml, 0.104.0).
     let cache = |doc: &str| {
         aterm_toml::from_str::<CellMetricsCache>(doc)
             .map_err(|e| e.to_string())
@@ -641,7 +593,6 @@ fn restore_layouts_answer_as_recorded() {
     corpus.finish();
 }
 
-/// A small manifest shaped like a 0.104.0 producer's, every lenient field set.
 const HANDOFF: &str = r#"schema = 1
 next_turn_id = 4096
 outgoing_build = 1792088595
@@ -673,7 +624,6 @@ fn handoff_manifests_answer_as_recorded() {
     };
     corpus.record("base", read(HANDOFF));
     let cases: &[(&str, &[(&str, &str)])] = &[
-        // Each lenient reader: a value of the wrong type is unreadable, never an error.
         (
             "lenient/hold-int",
             &[("hold = \"halt reason=manual\"", "hold = 5")],
@@ -750,11 +700,6 @@ fn handoff_manifests_answer_as_recorded() {
             "lenient/fabric-attached-int",
             &[("fabric_attached = [\"s-1\"]", "fabric_attached = 5")],
         ),
-        // The Autopilot's carried end (`SessionRecord::autopilot_end`):
-        // a row reads as written and is written back; a value of another type
-        // reads as an unreadable row (`""`, which `EndCarry::parse` refuses),
-        // never a refused manifest. A record with none writes no key (`base`),
-        // so an older reader sees the wire it always saw.
         (
             "autopilot-end/row",
             &[(
@@ -776,7 +721,6 @@ fn handoff_manifests_answer_as_recorded() {
                 "journal_key = \"663:1\"\nautopilot_end = { end = \"landed\" }\n",
             )],
         ),
-        // Not lenient: these still refuse the manifest.
         (
             "strict/local-id-string",
             &[("local_id = 0", "local_id = \"0\"")],
@@ -793,7 +737,6 @@ fn handoff_manifests_answer_as_recorded() {
             "strict/next-turn-negative",
             &[("next_turn_id = 4096", "next_turn_id = -1")],
         ),
-        // Missing keys, and the Option without `default`.
         ("missing-key/sid", &[("sid = \"s-1\"\n", "")]),
         ("missing-key/sessions", &[("[[sessions]]", "[[sessions_]]")]),
         (
@@ -819,9 +762,6 @@ fn handoff_manifests_answer_as_recorded() {
     for (id, edits) in cases {
         corpus.record(*id, read(&mutate(HANDOFF, edits)));
     }
-    // A carry that reads goes through the untagged reader's buffer whole:
-    // nested posts and receipts, integers buffered and then read as `u64`. A
-    // carry that does not read is dropped, the manifest kept.
     let fabric_cases: &[(&str, &[(&str, &str)])] = &[
         ("lenient/fabric-readable", &[]),
         (
@@ -847,8 +787,6 @@ fn handoff_manifests_answer_as_recorded() {
     corpus.finish();
 }
 
-/// A session's carried mailbox, appended to [`HANDOFF`]'s one session: every
-/// counter, a post with each optional field and one with none, an owed receipt.
 const FABRIC: &str = r#"
 [sessions.fabric]
 last_msg_id = 3
@@ -881,7 +819,6 @@ kind = "ask"
 from = "@s-ops"
 "#;
 
-/// One meta a shipped producer wrote, for the mutations below.
 const META_FIXTURE: &str = "v0.104.0/claude-code-1049/s0.meta.json";
 
 #[test]
@@ -959,7 +896,6 @@ fn checkpoint_metas_answer_as_recorded() {
                 "\"absolute_row_counter\":18446744073709551616,",
             )],
         ),
-        // The lenient readers: title, parser, output state.
         ("lenient/title-int", &[("\"title\":{}", "\"title\":5")]),
         (
             "lenient/title-wrong-field",
@@ -997,7 +933,6 @@ fn checkpoint_metas_answer_as_recorded() {
                 "\"output_state\":{\"rep\":\"s\"},\"parser\":null",
             )],
         ),
-        // Externally tagged unit enums.
         (
             "enum/cursor-style-unknown",
             &[(
@@ -1026,7 +961,6 @@ fn checkpoint_metas_answer_as_recorded() {
                 "\"gl\":0,\"single_shift\":\"None\",\"gr\":\"G2\",\"g1_96\":null,\"g2_96\":null,\"g3_96\":null},\"pending_wrap\"",
             )],
         ),
-        // A struct written as an array: the derive takes it positionally.
         (
             "array-for-table/xterm-keyboard",
             &[(
@@ -1059,8 +993,6 @@ fn checkpoint_metas_answer_as_recorded() {
     corpus.finish();
 }
 
-/// A fixture as its producer wrote it. The producers escape a carriage return in JSON
-/// and TOML alike, so a raw CRLF is only a Windows `core.autocrlf` checkout's.
 fn checkout_text(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()))
@@ -1071,7 +1003,6 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/handoff")
 }
 
-/// Every file under `dir`, recursively, in name order.
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("a fixture directory")
@@ -1087,11 +1018,6 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every file of the fixture root `root` as `(its path under the root, where it is read from)`,
-/// in the order the shipped-state sweep records them: by that path, component by component, the
-/// order a walk of sorted entries visits them in. With `release` (`(tag, dir)`), release `tag`'s
-/// files are read from `dir` in place of `root/<tag>`, as they read once `dir` is checked in
-/// there.
 fn shipped_files(root: &Path, release: Option<(&str, &Path)>) -> Vec<(PathBuf, PathBuf)> {
     let under = |base: &Path, prefix: &Path| {
         let mut files = Vec::new();
@@ -1113,23 +1039,16 @@ fn shipped_files(root: &Path, release: Option<(&str, &Path)>) -> Vec<(PathBuf, P
     files
 }
 
-/// The shipped-state sweep's cases over [`shipped_files`]: every handoff manifest, layout and
-/// checkpoint meta read by this build's models and written back out, then the negative control.
-/// Beside the corpus, how many of each it read, and the ids of `release`'s own cases that this
-/// build refused.
 fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], Vec<String>) {
     let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "shipped-state");
     let (mut manifests, mut layouts, mut metas) = (0, 0, 0);
     let mut refused = Vec::new();
-    // Each `Ok` is pinned by the digest of the fixture read and written back.
     for (rel, path) in shipped_files(&fixtures(), release) {
         let name = rel
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        // The id names the desk with `/` whatever the host's separator, so a
-        // Windows run reads the same answers file.
         let desk = rel
             .parent()
             .expect("a desk under the root")
@@ -1152,8 +1071,6 @@ fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], 
             (format!("{desk}/layout"), layout)
         } else if name.starts_with("seamless-") && name.ends_with(".toml") {
             manifests += 1;
-            // The first line binds the file to its attempt's nonce; the TOML
-            // follows it (`seamless`'s reader splits them the same way).
             let text = read_text();
             let (_nonce, toml) = text.split_once('\n').unwrap_or(("", ""));
             let manifest = aterm_toml::from_str::<SessionHandoff>(toml)
@@ -1168,8 +1085,6 @@ fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], 
         }
         corpus.record(id, answer.map(|bytes| answers::digest(&bytes)));
     }
-    // Negative control: a manifest whose schema line is torn, as a truncated
-    // write leaves it.
     corpus.record(
         "negative-control/torn-manifest",
         aterm_toml::from_str::<SessionHandoff>("schema = ").map(|_| String::new()),
@@ -1177,13 +1092,9 @@ fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], 
     (corpus, [manifests, layouts, metas], refused)
 }
 
-/// Every handoff manifest, layout and checkpoint meta each shipped release's producer
-/// committed under `tests/fixtures/handoff/`, read by this build's models and written back.
 #[test]
 fn state_written_by_shipped_producers_answers_as_recorded() {
     let (corpus, [manifests, layouts, metas], _) = shipped_state_corpus(None);
-    // A moved fixture tree leaves nothing of a kind to read (and the answers
-    // file names every fixture it read, so a lost one is a red too).
     assert!(
         manifests > 0 && layouts > 0 && metas > 0,
         "the shipped-producer sweep read {manifests} manifests, {layouts} layouts, {metas} metas"
@@ -1191,14 +1102,7 @@ fn state_written_by_shipped_producers_answers_as_recorded() {
     corpus.finish();
 }
 
-/// THE ANSWERS A RELEASE'S DESKS ADD: the answers file
-/// [`state_written_by_shipped_producers_answers_as_recorded`] records once `dir` (the desks the
-/// generator just wrote, `fixture_generator::generate_handoff_fixtures`) is checked in as release
-/// `tag`'s, `tests/fixtures/handoff/<tag>/`. A release's cut stages it beside its desks, and its
-/// landing (`aterm-release`'s `fixtures.rs`) records the release's own cases in the committed
-/// file with them, so the commit that adds the desks leaves this sweep green. Refuses unless this
-/// build reads back every manifest, layout and meta the release's desks hold. Unix, as the
-/// generator that calls it is.
+/// Render the shipped-state corpus including release `tag`'s desks in `dir`.
 #[cfg(unix)]
 pub(crate) fn shipped_state_with(tag: &str, dir: &Path) -> String {
     let (corpus, _, refused) = shipped_state_corpus(Some((tag, dir)));

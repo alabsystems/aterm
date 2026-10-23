@@ -697,6 +697,7 @@ impl Host {
                     if s.split_ms == 0 {
                         self.run(Job::KeyFrame);
                     } else {
+                        // The composer is busy: the frame lands later, with
                         // every key typed meanwhile folded in.
                         self.cc_frame_at = Some(self.now + Duration::from_millis(s.split_ms));
                     }

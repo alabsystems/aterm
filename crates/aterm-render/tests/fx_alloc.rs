@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Allocation gate for the CPU fx-layer rasterizer (docs/DESIGN-card-engine-
-// 2026-10-19.md §4.9, "zero cost at rest"). Its own test binary because the
-// process-global counting allocator must not instrument unrelated renderer
-// tests.
+
+//! Allocation gate for the CPU fx-layer rasterizer.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -45,8 +42,8 @@ unsafe impl GlobalAlloc for CountingAlloc {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         note_alloc();
-        // SAFETY: `ptr` and `layout` came from this pass-through allocator; the
-        // requested size is forwarded unchanged.
+        // SAFETY: `ptr` and `layout` came from this pass-through allocator; `new_size` is
+        // forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
@@ -67,11 +64,7 @@ fn counted<R>(f: impl FnOnce() -> R) -> (R, u64) {
     (result, ALLOCS.load(Ordering::Relaxed))
 }
 
-/// A card-like set of layers over every slot and both blends: an additive
-/// border rect and ramps under the text, a dithered Index8 kitty and an
-/// additive Premul star at Glow, a translucent rect over the chrome, and a
-/// Straight sprite in each Linear group. Items span several rows, so every
-/// damaged frame slices them.
+/// A card-like set of layers over every slot and both blends.
 fn layers(cw: usize, ch: usize, dy: i32) -> Vec<FxLayer> {
     let (cw, ch) = (cw as i32, ch as i32);
     let kitty: Vec<u8> = (0..8 * 6)
@@ -229,8 +222,7 @@ fn frames(
     out
 }
 
-/// Render `inputs` alternately, warm, then count the allocations of 32 more
-/// frames and check each took the damage path `want`.
+/// Render `inputs` alternately.
 fn steady_allocs(
     renderer: &mut Renderer,
     window: &mut WindowCpu,
@@ -255,16 +247,6 @@ fn steady_allocs(
     allocs
 }
 
-/// ZERO COST AT REST, AND NO ALLOCATION IN MOTION: once warm, the CPU fx path
-/// allocates nothing, whether no layer is live, settled layers are sliced on
-/// `Rows` frames, or every frame hands new content `Arc`s and moved layers
-/// (`Rows` frames too: the fx damage arm marks their bands without a
-/// fingerprint or a payload clone).
-///
-/// The negative control is a mutation (run by hand, recorded in the design's
-/// §7 note): rebuilding the occluder pieces in a fresh `Vec` per item, not the
-/// resident `FxScratch`, fails it at the settled arm (256 allocations in 32
-/// frames).
 #[test]
 fn the_fx_path_allocates_nothing_once_warm() {
     let mut renderer = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())

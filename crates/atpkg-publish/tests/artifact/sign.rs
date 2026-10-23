@@ -20,7 +20,6 @@ use atpkg_publish::triple::AARCH64_APPLE_DARWIN;
 use super::fixture::{DORMANT_LEDGER, MINTED_LEDGER, client_verifies, put, scratch, trust_repo};
 use super::pkgdoc::{header, provenance, row};
 
-/// A channel whose head (index 41) this machine signed, and its context.
 fn channel(keys: &Keys, home: &Path) -> (Ctx, Arc<FakeHost>) {
     let host = Arc::new(FakeHost::new());
     let ctx = keys.ctx(home, host.clone());
@@ -39,21 +38,17 @@ fn staged(dir: &Path, r: &Row) -> PathBuf {
     pkg
 }
 
-/// A master-signed roster pair: `(bytes, sig)`.
 fn pair(keys: &Keys, roster: &aterm_update_core::Roster) -> (Vec<u8>, Vec<u8>) {
     let bytes = roster.to_toml().expect("the roster emits").into_bytes();
     let sig = keys.master_sign(&bytes);
     (bytes, sig)
 }
 
-/// Install a roster pair where this machine keeps its own (`~/.aterm/roster/`).
 fn install_roster(ctx: &Ctx, (bytes, sig): &(Vec<u8>, Vec<u8>)) {
     put(&ctx.identity.roster, bytes);
     put(&sign::sig_path(&ctx.identity.roster), sig);
 }
 
-/// Publish index `n` on the channel carrying this roster pair (the index's own bytes
-/// are no part of who may sign a pack).
 fn publish_roster(host: &FakeHost, slug: &Slug, n: u64, (bytes, sig): &(Vec<u8>, Vec<u8>)) {
     let tag = index_tag(n);
     host.put_asset(slug, &tag, QUAD_FILES[0], b"index".to_vec());
@@ -269,8 +264,6 @@ fn the_verb_reads_the_switch_from_the_trust_repo_it_names() {
     .expect("dormant where the verb was pointed");
 }
 
-/// THE ROSTER IS ELECTED ONCE PER PROCESS (A9): every pack of a lane or a group loads a
-/// signer, and each used to list the channel and download the head's roster pair again.
 #[test]
 fn packs_of_one_run_read_the_channel_head_once() {
     let tmp = scratch("sign-once");

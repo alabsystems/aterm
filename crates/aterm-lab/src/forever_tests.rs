@@ -3440,11 +3440,12 @@ fn the_orchestrator_turns_come_once_at_their_time_and_cap_is_watched_to_its_verd
     assert!(cover::cap_watched(&broken, T0 + 900_000));
 }
 
+/// The record of a wall's track ending (`wall-wait-end@v1`).
+const WALL_END: &str = "wall-wait-end@v1";
+
 /// W1's records: the wall raised at the first point (+6 s), land@v1 meeting
 /// it, the limited point read and waited out, the resume typed past the
 /// reset (+300 s) and its grace, and the clean defense landing it.
-const WALL_END: &str = "wall-wait-end@v1";
-
 fn walled() -> Seen {
     Seen {
         journal: vec![

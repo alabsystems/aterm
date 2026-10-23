@@ -121,6 +121,7 @@ pub(crate) fn prune_dead_entry(entry: &Path, seen: &str) -> bool {
     }
     let unchanged = std::fs::read_to_string(&aside).is_ok_and(|now| now == seen);
     if !unchanged {
+        // Rewritten under us: restore it, unless a newer entry already holds
         // the name (then that one is the live answer and ours is older).
         let _ = std::fs::hard_link(&aside, entry);
     }

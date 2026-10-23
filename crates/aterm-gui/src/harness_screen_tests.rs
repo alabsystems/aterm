@@ -1448,6 +1448,68 @@ fn what_the_harness_did_draws_every_family_the_fold_keeps() {
     );
 }
 
+/// WHAT THE OCCUPANCY DOOR SAID, BY KIND (occupancy 1e): a week whose ledger holds fact lines
+/// draws a told row and a would-be row a kind, today's and the week's counts, and the facts
+/// ring's idle-while-ready slot-minutes draw their row where a ring was read. NEGATIVE
+/// CONTROLS: a week with no fact line draws no facts row, and no ring draws no idle row.
+#[test]
+fn what_the_harness_did_counts_the_occupancy_facts() {
+    let mut today = HarnessStats::new(0);
+    today.rows = 3;
+    today.facts_would.insert("hold".to_string(), 2);
+    let mut week = HarnessStats::new(0);
+    week.rows = 9;
+    week.facts_would.insert("hold".to_string(), 5);
+    week.facts_told.insert("hold".to_string(), 1);
+    let mut state = HarnessState::unobserved();
+    state.observed = true;
+    let report = |today: &HarnessStats, week: &HarnessStats, idle: Option<u64>| {
+        let mut report =
+            HarnessStatsReport::new(today.clone(), week.clone(), 1_000_000_000, Some(0), &|_| {
+                Some(0)
+            });
+        report.idle_ready_min = idle;
+        Some(std::sync::Arc::new(report))
+    };
+    let numbers = |words: &str| -> Vec<u64> {
+        words
+            .split_whitespace()
+            .filter_map(|w| w.parse().ok())
+            .collect()
+    };
+    state.stats.report = report(&today, &week, Some(12));
+    let rows = state.projection().did_rows;
+    let words = |label: &str| {
+        rows.iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, w)| w.clone())
+            .unwrap_or_else(|| panic!("no {label} row: {rows:?}"))
+    };
+    // Today's count, then the week's (the row's words name the week's span too).
+    assert_eq!(
+        numbers(&words("Facts told (hold)"))[..2],
+        [0, 1],
+        "{rows:?}"
+    );
+    assert_eq!(
+        numbers(&words("Facts it would tell (hold)"))[..2],
+        [2, 5],
+        "{rows:?}"
+    );
+    assert_eq!(numbers(&words("Idle while ready")), [12], "{rows:?}");
+
+    week.facts_would.clear();
+    week.facts_told.clear();
+    today.facts_would.clear();
+    state.stats.report = report(&today, &week, None);
+    let rows = state.projection().did_rows;
+    assert!(
+        rows.iter()
+            .all(|(l, _)| !l.starts_with("Facts") && l != "Idle while ready"),
+        "{rows:?}"
+    );
+}
+
 /// ONE NAME FOR EACH COUNT, FROM THE CHIP TO THE PAGE (owner-eye-6):
 /// STATUS's today line, a SESSIONS row's day line
 /// and WHAT THE HARNESS DID say every count in one table's words — the

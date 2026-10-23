@@ -298,6 +298,8 @@ fn run(
     let mut unread = String::new();
     if matches!(end, End::MidResize | End::MidCapture) {
         if end == End::MidCapture {
+            // Quiet until the captures the row's own wakes owed are taken and
+            // the write interval has run out, so the resize's wake owes one
             // due on its own turn.
             std::thread::sleep(CAPTURE_QUIET);
         }

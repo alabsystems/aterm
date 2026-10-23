@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The status item's AppKit: the mug button, its two template images, the menu (built once,
-//! retitled in place) and the pop-up that shows it.
+//! AppKit status item, mug button, template images, and popup menu.
 
 use aterm_objc::send::{
     alloc, send_bool, send_id, send_id_cptr_usize, send_id_f64, send_id_id, send_id_id_id_sel,
@@ -17,47 +16,28 @@ use crate::menu::Row;
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
 
-/// `NSVariableStatusItemLength`: as wide as the image.
 const VARIABLE_LENGTH: f64 = -1.0;
-/// `NSImageOnly` (`NSCellImagePosition`): the button shows its image and no title.
 const IMAGE_ONLY: usize = 1;
-/// `NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp`: the button's action fires on either
-/// button's release, and the target tells them apart.
 const CLICK_MASK: usize = (1 << 2) | (1 << 4);
-/// `NSControlStateValueOn` / `Off`: a menu item's checkmark.
 const STATE_ON: isize = 1;
 const STATE_OFF: isize = 0;
-/// The icon's side in points ([`icon::SIZE_POINTS`]) and its backing scales: 1x and 2x
-/// displays.
 const POINTS: u32 = 18;
 const SCALES: [u32; 2] = [1, 2];
-/// How far below the button the menu's top edge sits, in points.
 const POPUP_GAP: f64 = 3.0;
-/// The button's custom accessibility action, which opens the menu: VoiceOver lists it among the
-/// item's actions (VO-Command-Space).
+/// The button's custom accessibility action, which opens the menu.
 pub(super) const SHOW_MENU: &str = "Show Menu";
 
-/// `-[NSMenu popUpMenuPositioningItem:atLocation:inView:]`, `B48@0:8@16{CGPoint=dd}24@40`:
-/// no helper has this shape.
 type PopUpFn = unsafe extern "C-unwind" fn(Id, Sel, Id, CGPoint, Id) -> Bool;
 
 /// The mug in the menu bar.
 pub(super) struct StatusUi {
-    /// The bar item; releasing it would also take it off the bar.
     item: Obj,
-    /// Its button, retained so a pop-up can hold it past the borrow it was read under.
     button: Obj,
-    /// The menu, built once by [`install`].
     menu: Obj,
-    /// The menu's items as built, one per row (`None` for a separator).
     items: Vec<Option<Obj>>,
-    /// The rows the items show now.
     rows: Vec<Row>,
-    /// The off (empty mug) and lit (full mug) template images.
     images: [Obj; 2],
-    /// Which image the button shows, once one is set.
     shown_lit: Option<bool>,
-    /// The tooltip the button shows, once one is set.
     shown_tip: Option<String>,
 }
 
@@ -67,9 +47,7 @@ pub(super) struct Popup {
     button: Obj,
 }
 
-/// Put the mug in the menu bar: a variable-length item whose button sends `click` to `target` on a
-/// left or right release and `show` (`- (BOOL)x:(id)action`) for its [`SHOW_MENU`] accessibility
-/// action, and the menu of `rows` whose items send `choose` to `target` with their action's tag.
+/// Install the mug status item and menu in the system menu bar.
 pub(super) fn install(
     target: Id,
     click: Sel,
@@ -145,8 +123,7 @@ impl StatusUi {
         });
     }
 
-    /// Make the menu show `rows`: the rows that changed are retitled (and their checkmark and tag
-    /// set) in place; a menu of another shape is built again, items sending `choose` to `target`.
+    /// Update the menu to show `rows`, retitling in place when the shape matches.
     pub(super) fn refresh_menu(&mut self, target: Id, choose: Sel, rows: Vec<Row>) {
         autoreleasepool(|_| match changed_rows(&self.rows, &rows) {
             Some(changed) => {
@@ -165,8 +142,7 @@ impl StatusUi {
         self.rows = rows;
     }
 
-    /// The menu and its button, retained for [`pop_up`], which runs while no borrow of the app's
-    /// state is held (a choice in the menu changes that state).
+    /// Retain the menu and its button for [`pop_up`].
     pub(super) fn popup(&self) -> Popup {
         Popup {
             menu: self.menu.clone_retained(),
@@ -190,8 +166,7 @@ impl Drop for StatusUi {
     }
 }
 
-/// Show the menu just below its button, the button highlighted while it is open, and return when it
-/// closes (a choice has been sent to its target by then or will be from the run loop).
+/// Show the menu below its button and return when it closes.
 pub(super) fn pop_up(popup: &Popup) {
     autoreleasepool(|_| {
         // SAFETY: main-thread AppKit sends on the live menu and button `popup` retains, each in its
@@ -216,8 +191,7 @@ pub(super) fn pop_up(popup: &Popup) {
     });
 }
 
-/// Where the menu's top-left corner goes for a button with `bounds`: its left edge, a gap below its
-/// bottom edge, which is the larger y in a flipped view and the smaller in an unflipped one.
+/// Where the menu's top-left corner goes for a button with `bounds`.
 pub(super) fn popup_point(bounds: CGRect, flipped: bool) -> CGPoint {
     let y = if flipped {
         bounds.origin.y + bounds.size.height + POPUP_GAP
@@ -247,15 +221,11 @@ pub(super) fn changed_rows(shown: &[Row], now: &[Row]) -> Option<Vec<usize>> {
     )
 }
 
-/// What the mug says it is, lit or not: its image's description and the button's accessibility
-/// label once it shows one ([`StatusUi::show`]).
+/// What the mug says it is, lit or not.
 pub(super) const fn state_text(lit: bool) -> &'static str {
     if lit { "Caffeine on" } else { "Caffeine off" }
 }
 
-/// A template image of the mug, lit or not, from the icon's 1x and 2x PNGs: an `NSImage`
-/// (+1) of [`icon::SIZE_POINTS`] holding one bitmap per scale, marked as a template so the
-/// menu bar tints it for its appearance and for the highlighted state.
 fn template_image(lit: bool) -> Option<Obj> {
     let side = icon::SIZE_POINTS;
     let size = CGSize {
@@ -291,8 +261,6 @@ fn template_image(lit: bool) -> Option<Obj> {
     Some(image)
 }
 
-/// `png` decoded into an `NSBitmapImageRep` (retained, +1); `None` when it is empty or
-/// ImageIO cannot read it. Raster work, no WindowServer.
 fn bitmap(png: &[u8]) -> Option<Obj> {
     if png.is_empty() {
         return None;
@@ -317,8 +285,6 @@ fn bitmap(png: &[u8]) -> Option<Obj> {
     })
 }
 
-/// Give `button` the one custom accessibility action [`SHOW_MENU`], which sends `target`
-/// `show`. A refusal leaves the button without it (the clicks still work).
 fn set_show_menu_action(button: Id, target: Id, show: Sel) {
     let Some(name) = aterm_objc::ns_string(SHOW_MENU) else {
         return;
@@ -345,7 +311,6 @@ fn set_show_menu_action(button: Id, target: Id, show: Sel) {
     }
 }
 
-/// A fresh `NSMenu` (+1) whose items' enabled flags are the ones set here.
 fn new_menu() -> Option<Obj> {
     // SAFETY: `-init` is `@16@0:8`, consuming the `+alloc` and answering +1;
     // `-setAutoenablesItems:` is `v20@0:8B16`.
@@ -356,8 +321,6 @@ fn new_menu() -> Option<Obj> {
     }
 }
 
-/// Append `rows` to `menu`: the items, one per row as built (`None` for a separator or
-/// a row Foundation refused).
 fn add_rows(menu: Id, target: Id, choose: Sel, rows: &[Row]) -> Vec<Option<Obj>> {
     rows.iter()
         .map(|row| match row {
@@ -375,7 +338,6 @@ fn add_rows(menu: Id, target: Id, choose: Sel, rows: &[Row]) -> Vec<Option<Obj>>
         .collect()
 }
 
-/// A row's title, and an action row's tag and checkmark; `None` for a separator.
 const fn parts(row: &Row) -> Option<(&str, Option<(isize, bool)>)> {
     match row {
         Row::Info(text) => Some((text.as_str(), None)),
@@ -388,17 +350,13 @@ const fn parts(row: &Row) -> Option<(&str, Option<(isize, bool)>)> {
     }
 }
 
-/// An `NSMenuItem` (+1) for an info or action row: an info row has no action and is
-/// disabled; an action row sends `choose` to `target` with its tag.
 fn new_item(row: &Row, target: Id, choose: Sel) -> Option<Obj> {
     let (title, tagged) = parts(row)?;
     let title = aterm_objc::ns_string(title)?;
     let empty = aterm_objc::ns_string("")?;
     let action = if tagged.is_some() { choose } else { Sel::NULL };
     // SAFETY: `-initWithTitle:action:keyEquivalent:` is `@40@0:8@16:24@32`, consuming the `+alloc`
-    // and answering +1; a nil action is its "no action". Both strings are live and copied.
-    // `-setTarget:` is `v24@0:8@16` (held weakly: the caller keeps `target` alive), `-setEnabled:`
-    // `v20@0:8B16`, `-setTag:` and `-setState:` `v24@0:8q16`.
+    // and answering +1; a nil action is its "no action".
     unsafe {
         let item = Obj::from_owned(send_id_id_sel_id(
             alloc(class(c"NSMenuItem")),
@@ -417,7 +375,6 @@ fn new_item(row: &Row, target: Id, choose: Sel) -> Option<Obj> {
     }
 }
 
-/// Give `item` `row`'s title, and an action row's tag and checkmark.
 fn update_item(item: Id, row: &Row) {
     let Some((title, tagged)) = parts(row) else {
         return;
@@ -435,12 +392,10 @@ fn update_item(item: Id, row: &Row) {
     }
 }
 
-/// The `NSControlStateValue` of a checkmark.
 const fn state(checked: bool) -> isize {
     if checked { STATE_ON } else { STATE_OFF }
 }
 
-/// Append a separator line.
 fn add_separator(menu: Id) {
     // SAFETY: `+separatorItem` is `@16@0:8` and answers a fresh item at +0, inside the caller's
     // pool; `-addItem:` retains it into the live menu.
@@ -476,9 +431,6 @@ mod tests {
         assert_eq!(f64::from(POINTS), icon::SIZE_POINTS);
     }
 
-    /// The icon's PNGs decode, through the path the menu-bar images take, into bitmaps of
-    /// 18 and 36 pixels a side (raster work only, as aterm-gui's wallpaper decode through
-    /// `NSBitmapImageRep` in its tests); what is not one does not.
     #[test]
     fn the_icons_pngs_decode_to_a_bitmap_per_scale() {
         use aterm_objc::send::send_isize;
@@ -542,13 +494,10 @@ mod tests {
         assert_eq!(changed_rows(&off, &kinds), None);
     }
 
-    /// `ret@:args`, the offset-free encoding a prototype has.
     fn types(ret: &str, args: &[&str]) -> String {
         format!("{ret}@:{}", args.concat())
     }
 
-    /// The runtime's encoding of `sel` on the class named `cls` (on its metaclass for a
-    /// class method), offsets stripped.
     fn runtime(cls: &'static std::ffi::CStr, sel: Sel, class_method: bool) -> Option<String> {
         let cls = class(cls);
         assert!(!cls.is_null(), "{cls:?}");
@@ -564,8 +513,6 @@ mod tests {
         }
     }
 
-    /// Every prototype this file sends with, against what the runtime says the selector
-    /// takes: a wrong width or sign here would corrupt registers in an app no test runs.
     #[test]
     fn every_send_here_has_the_prototype_the_runtime_reports() {
         let (v, id, b, sel_, q, uq, d) = (

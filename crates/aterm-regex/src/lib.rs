@@ -2,6 +2,16 @@
 // Copyright 2026 Andrew Yates
 
 //! Linear-time Thompson NFA / Pike VM regular expression engine.
+//!
+//! ```
+//! use aterm_regex::Regex;
+//!
+//! let re = Regex::new(r"\b[0-9a-fA-F]{7,40}\b")?;
+//! let hash = re.find("commit 66390b5c8f is the release")
+//!     .map(|m| (m.start(), m.end(), m.as_str()));
+//! assert_eq!(hash, Some((7, 17, "66390b5c8f")));
+//! # Ok::<(), aterm_regex::Error>(())
+//! ```
 
 #![forbid(unsafe_code)]
 
@@ -377,6 +387,21 @@ impl std::iter::FusedIterator for Matches<'_, '_> {}
 impl std::error::Error for Error {}
 
 /// Compile a pattern with non-default limits or flags.
+///
+/// ```
+/// use aterm_regex::RegexBuilder;
+///
+/// // The bounds aterm's untrusted-pattern entry points use: one on the
+/// // program, one on the scan.
+/// let re = RegexBuilder::new(r"\d{1,5}")
+///     .size_limit(128 * 1024)
+///     .dfa_size_limit(1 << 20)
+///     .step_limit(1 << 22)
+///     .build()?;
+/// assert!(re.is_match("port 8080"));
+/// assert!(!re.step_limit_exceeded(), "a real pattern never comes near the budget");
+/// # Ok::<(), aterm_regex::Error>(())
+/// ```
 #[derive(Clone, Debug)]
 /// Builder for compiling a [`Regex`] with custom limits.
 pub struct RegexBuilder {
@@ -464,6 +489,7 @@ pub fn escape(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
     for c in pattern.chars() {
         // Whitespace is escaped too, so the result still means itself if it is
+        // ever spliced into a pattern that turns on `(?x)`.
         if META.contains(c) || c.is_whitespace() {
             out.push('\\');
         }

@@ -5,8 +5,6 @@
 
 use crate::raster::{Point, Rasterizer, point};
 
-/// Fill a `w`×`h` grid and read the coverage back as a flat row-major
-/// buffer — the shape every caller in this crate consumes.
 fn cov(w: usize, h: usize, f: impl FnOnce(&mut Rasterizer)) -> Vec<f32> {
     let mut r = Rasterizer::new(w, h);
     f(&mut r);
@@ -15,7 +13,6 @@ fn cov(w: usize, h: usize, f: impl FnOnce(&mut Rasterizer)) -> Vec<f32> {
     out
 }
 
-/// Close a polygon into the rasterizer, edge by edge.
 fn polygon(r: &mut Rasterizer, pts: &[Point]) {
     for (i, p) in pts.iter().enumerate() {
         let next = pts.get(i + 1).unwrap_or(&pts[0]);
@@ -23,8 +20,6 @@ fn polygon(r: &mut Rasterizer, pts: &[Point]) {
     }
 }
 
-/// Compare against a pinned grid to 1e-6, because antialiased coverage is where
-/// "close enough" hides a visible bug.
 #[track_caller]
 fn assert_grid(actual: &[f32], expected: &[f32], w: usize, what: &str) {
     assert_eq!(actual.len(), expected.len(), "{what}: grid size");
@@ -38,9 +33,6 @@ fn assert_grid(actual: &[f32], expected: &[f32], w: usize, what: &str) {
     }
 }
 
-/// An axis-aligned unit square on whole-pixel boundaries: the case where
-/// coverage must be exactly 1.0 inside and exactly 0.0 outside, with no
-/// antialiasing anywhere.
 #[test]
 fn golden_integer_aligned_square() {
     let got = cov(5, 5, |r| {
@@ -65,9 +57,6 @@ fn golden_integer_aligned_square() {
     assert_grid(&got, &want, 5, "integer-aligned square");
 }
 
-/// A triangle on fractional coordinates: every edge crosses columns at a
-/// different sub-cell offset, so this exercises the trapezoid split, the
-/// two-cell fast path and the interior slabs in one figure.
 #[test]
 fn golden_fractional_triangle() {
     let got = cov(4, 4, |r| {
@@ -83,9 +72,6 @@ fn golden_fractional_triangle() {
     assert_grid(&got, &want, 4, "fractional triangle");
 }
 
-/// Winding cancels exactly: an edge and its reverse leave the grid at
-/// literal zero, which is what lets `for_each_pixel` carry one accumulator
-/// across every row of the buffer.
 #[test]
 fn reversed_edges_cancel_to_exact_zero() {
     let got = cov(8, 8, |r| {
@@ -103,9 +89,6 @@ fn reversed_edges_cancel_to_exact_zero() {
     }
 }
 
-/// `|acc|` is reported unclamped: two overlapping same-winding contours
-/// push a cell above 1.0, and every caller clamps on its way to 8 bits. A
-/// `.min(1.0)` here would silently darken every overlapping contour.
 #[test]
 fn overlapping_contours_report_above_one_unclamped() {
     let got = cov(4, 4, |r| {
@@ -128,8 +111,6 @@ fn overlapping_contours_report_above_one_unclamped() {
     );
 }
 
-/// A reference square plus an escaping contour: the escape may cost its own area,
-/// but must not hang, panic or leave a non-finite cell.
 fn escape_case(what: &str, escape: impl FnOnce(&mut Rasterizer)) {
     let mut r = Rasterizer::new(8, 8);
     polygon(
@@ -149,9 +130,6 @@ fn escape_case(what: &str, escape: impl FnOnce(&mut Rasterizer)) {
     }
 }
 
-/// Far left of the grid, including from a row past the first, where the
-/// `linestart + x0i < 0` guard does not fire and the interior slab loop's
-/// lower bound is the thing doing the work.
 #[test]
 fn an_edge_far_left_of_the_grid_terminates() {
     escape_case("far left, row 0", |r| {
@@ -165,8 +143,6 @@ fn an_edge_far_left_of_the_grid_terminates() {
     });
 }
 
-/// Far right of the grid, where the interior loop's upper bound and
-/// [`Rasterizer::add`]'s drop are what keep it bounded.
 #[test]
 fn an_edge_far_right_of_the_grid_terminates() {
     escape_case("far right", |r| {
@@ -177,8 +153,6 @@ fn an_edge_far_right_of_the_grid_terminates() {
     });
 }
 
-/// A span so wide an unclamped interior loop would run tens of millions of
-/// iterations per scanline: the call must return.
 #[test]
 fn an_absurdly_wide_span_terminates() {
     let mut r = Rasterizer::new(4096, 4096);
@@ -193,9 +167,6 @@ fn an_absurdly_wide_span_terminates() {
     assert_eq!(nonzero, 0, "an edge and its reverse must still cancel");
 }
 
-/// A quadratic whose control point is astronomically far away asks the
-/// deviation heuristic for millions of flattening segments. The cap is what
-/// makes it return.
 #[test]
 fn an_absurd_quadratic_terminates() {
     escape_case("absurd quad", |r| {
@@ -211,9 +182,6 @@ fn an_absurd_quadratic_terminates() {
     });
 }
 
-/// Non-finite input (a font coordinate that scales to infinity or NaN) must not hang
-/// or panic. Output finiteness is not promised (a NaN poisons the prefix sum), but the
-/// callers' 8-bit quantisation still yields bytes: `NaN as u8` is zero, a blank glyph.
 #[test]
 fn non_finite_coordinates_terminate_without_panicking() {
     for (what, escape) in [
@@ -255,7 +223,6 @@ fn non_finite_coordinates_terminate_without_panicking() {
     }
 }
 
-/// A degenerate grid must not panic on construction or on a fill.
 #[test]
 fn degenerate_grids_are_inert() {
     for (w, h) in [(0usize, 0usize), (0, 4), (4, 0), (1, 1)] {

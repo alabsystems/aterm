@@ -16,10 +16,8 @@ use agh::{Call, Github, Kind, Sub};
 
 use crate::common;
 
-/// The scripted api origin's port.
 const API: u16 = 47_401;
 
-/// A Read of `path` on `fixture-dev/repo`.
 fn repo_call(path: &str) -> Call {
     Call::get(
         path,
@@ -31,7 +29,6 @@ fn header_names(seen: &SeenRequest) -> Vec<&str> {
     seen.headers.iter().map(|(n, _)| n.as_str()).collect()
 }
 
-/// The non-read methods.
 const WRITES: [Method; 4] = [Method::Post, Method::Patch, Method::Put, Method::Delete];
 
 fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
@@ -505,7 +502,6 @@ fn an_id_answer_that_is_not_json_names_the_repository() {
     assert_eq!(error.repo.as_deref(), Some("fixture-dev/repo"));
 }
 
-/// The asset download as `call_stream` makes it, with the hop.
 fn asset_stream() -> Call {
     repo_call("/repos/fixture-dev/repo/releases/assets/1")
         .accept(agh::Accept::OctetStream)
@@ -643,9 +639,6 @@ fn a_whole_read_under_a_small_limit_still_classifies_a_failure() {
     assert_eq!(transport.requests().len(), 3);
 }
 
-/// A 2xx longer than the wire's 64 KiB floor: `Fx::gh` hands it on cut one byte past the
-/// floor, with its head, so the refusal keeps the status, the request id and the rate, and its
-/// why names the call's own limit, the same limit a shorter over-limit body names.
 #[test]
 fn a_whole_read_over_the_wire_floor_is_too_large_at_the_call_limit() {
     let transport = Arc::new(ScriptedTransport::new());
@@ -785,15 +778,12 @@ fn answer_any_hands_back_any_status() {
     assert_eq!(transport.requests()[0].method, Method::Head);
 }
 
-/// The canonical config with both token files: the routed cases (plan §1 rule 12: file
-/// credentials are unix-only).
 #[cfg(unix)]
 mod routed {
     use super::*;
     use agh::policy::Named;
     use agh::wire::scripted::Scripted;
 
-    /// A scratch root holding the canonical config's token files.
     struct World {
         root: aterm_tempfile::TempDir,
     }
@@ -1048,7 +1038,6 @@ mod routed {
         }
     }
 
-    /// A 404 under the repository, then the probe's 200, as `token`.
     fn probed_404(label: &str, token: &str) -> agh::Error {
         let world = World::new(label, Some(token), false);
         let transport = Arc::new(ScriptedTransport::new());

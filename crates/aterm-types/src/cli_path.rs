@@ -5,12 +5,7 @@
 
 use std::path::Path;
 
-/// Prefer the installed app selected by `~/.local/bin/aterm`, behind the managed
-/// reroute and agent directories. A source binary, regular file or broken link is
-/// left to the inherited PATH. Package `bin/` and every other entry keep their order.
-///
-/// This changes only a child's environment; the running window and its helpers
-/// continue using their own bundle. Other platforms retain their existing policy.
+/// Prefers the installed app selected by `~/.local/bin/aterm` behind the managed reroute and agent directories.
 #[must_use]
 pub fn selected_path(
     home: Option<&Path>,

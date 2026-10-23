@@ -1,61 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The crate's one reader of presence rows: `Last{/f/<F>/pub/*/*/presence}` parsed into
-//! [`Row`]s, for `aterm fabric status` ([`read`]) and `notify --on attention` ([`Row::parse`]).
+//! Reader and parser for fleet presence rows (`Last{/f/<F>/pub/*/*/presence}`).
 //!
-//! A row is the `Last` answer, not a summary: every `key=value` body token is kept verbatim
-//! under its own name, unknown ones included, so two readers of one fleet cannot disagree. The
-//! [`RESERVED`] names come from the subject the broker handed back, and a body token of one is
-//! dropped, or a node could publish itself as somebody else's session. `attention=` and
-//! `fabric=` are always present (`-` when missing).
-//!
-//! Bounds: [`MAX_ROWS`] rows, with a cut answer marked [`Glance::truncated`]; [`FIELD_CAP`]
-//! bytes per key and value and [`FIELDS_MAX`] tokens per row, since a record may be 16 MiB at
-//! the broker. Values stay pct-encoded as they crossed the bus: decoding here would put a
-//! publisher-chosen newline or ESC into every rendered string, so a reader decodes when it
-//! shows a value.
+//! Keeps verbatim `key=value` body tokens bounded by [`MAX_ROWS`], [`FIELD_CAP`],
+//! and [`FIELDS_MAX`], while reserving [`RESERVED`] subject fields and guaranteeing
+//! `attention=` and `fabric=`.
 
 use std::collections::BTreeMap;
 use std::io;
 
 use crate::transport::Conn;
 
-/// The most rows one roster read may hold: a `Last` answer is one row per subject ever hosted.
+/// Maximum rows one roster read may hold.
 pub const MAX_ROWS: usize = 4096;
 
-/// The byte cap on any one key or value a row carries, including the `…` that marks a cut.
-/// 256 holds every token the bridge's presence rows carry (`attention=` sits at exactly this cap).
+/// Byte cap on any single key or value in a row, including the truncation `…`.
 pub const FIELD_CAP: usize = 256;
 
-/// The byte cap on `attention=`, matching aterm's own (§4.1) and [`FIELD_CAP`].
+/// Byte cap on `attention=`, matching [`FIELD_CAP`].
 pub const ATTENTION_CAP: usize = FIELD_CAP;
 
-/// The most `key=value` tokens one row keeps, bounding a row at [`FIELDS_MAX`] × 2 ×
-/// [`FIELD_CAP`] bytes. Tokens past it are dropped but the row is kept: a node that pads its
-/// row must not erase itself from an operator's view.
+/// Maximum `key=value` tokens kept per row.
 pub const FIELDS_MAX: usize = 64;
 
-/// The two tokens every row carries whether or not the publisher wrote them.
+/// Two tokens every row carries whether or not the publisher wrote them.
 const GUARANTEED: [&str; 2] = ["attention", "fabric"];
 
-/// The row keys [`Row::parse`] fills from the cap-forced subject; [`fields_of`] drops a body
-/// token of any of these names.
+/// Row keys filled from the subject; matching body tokens are dropped by [`fields_of`].
 pub const RESERVED: [&str; 4] = ["subject", "offset", "node", "owner"];
 
-/// The value a missing token reads as — the same dash `ls` prints.
+/// Placeholder value for a missing token.
 pub const ABSENT: &str = "-";
 
-/// The `state=` a NODE's will writes on its presence row: the broker fires it
-/// when the bridge's connection ends without the next incarnation fencing it —
-/// a crash, a `kill -9`, a lost link, an exit. The node is AWAY, not over: its
-/// sessions' rows stay as they were (each reads `away` with it), mail to them
-/// queues on the bus, and a bridge that comes back as the node publishes
-/// `live` above it. A session that is over says so on its own row, `exited`.
+/// Presence `state=` value written by a node's broker will when its connection ends unfenced.
 pub const AWAY: &str = "away";
 
-/// Whether a node row's `state=` is its WILL: [`AWAY`], or `gone` as a bridge
-/// before 2026-10-15 wrote the same will.
+/// Whether a node row's `state=` represents a broker will ([`AWAY`] or legacy `gone`).
 #[must_use]
 pub fn is_will(state: &str) -> bool {
     state == AWAY || state == "gone"
@@ -72,8 +53,7 @@ pub struct Row {
     pub node: String,
     /// The face the row describes: a literal `node`, or a hosted `s-<hex>`.
     pub owner: String,
-    /// Every `key=value` token of the body, verbatim and pct-encoded as
-    /// published, plus the two [`GUARANTEED`] ones.
+    /// Verbatim pct-encoded `key=value` body tokens plus the [`GUARANTEED`] keys.
     pub fields: BTreeMap<String, String>,
 }
 
@@ -84,15 +64,10 @@ impl Row {
         self.fields.get(key).map_or(ABSENT, String::as_str)
     }
 
-    /// Parse one `Last` record into a row, or refuse it.
-    ///
-    /// The broker's filter should admit nothing else, but a rendered row is the
-    /// wrong place to trust a filter: the shape is re-checked by position from
-    /// the left, as `subject::parse_in` does.
+    /// Parses one `Last` record into a [`Row`], validating the subject shape by position.
     #[must_use]
     pub fn parse(fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Row> {
         let segs: Vec<&str> = subject.split('/').collect();
-        // `["", "f", "<F>", "pub", "<node>", "<owner>", "presence"]`
         if segs.len() != 7 || !segs[0].is_empty() {
             return None;
         }
@@ -116,12 +91,7 @@ impl Row {
     }
 }
 
-/// Every `key=value` token of a presence body's first line, verbatim — except a
-/// token whose key is [`RESERVED`].
-///
-/// Total over arbitrary bytes, like [`crate::body::Body::decode`]: lossy UTF-8,
-/// first line only (a body must not smuggle a second row), a token without `=`
-/// skipped, and a repeated key keeps the last occurrence.
+/// Extracts bounded `key=value` tokens from the first line of `body`, dropping [`RESERVED`] keys.
 fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
     let line = String::from_utf8_lossy(body);
     let line = line.split('\n').next().unwrap_or("");
@@ -134,13 +104,9 @@ fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
             continue;
         }
         let key = truncate(k, FIELD_CAP);
-        // A body may not name a fact the subject names. Dropped, not renamed:
-        // a renamed `node` is a second thing for a reader to get wrong.
         if RESERVED.contains(&key.as_str()) {
             continue;
         }
-        // The count is bounded too; [`GUARANTEED`] tokens pass it so padding cannot push them
-        // off, and a key already in the map is never refused (last occurrence wins).
         if out.len() >= FIELDS_MAX && !GUARANTEED.contains(&key.as_str()) && !out.contains_key(&key)
         {
             continue;
@@ -154,8 +120,7 @@ fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
     out
 }
 
-/// Truncate `v` to at most `cap` bytes on a char boundary, counting the `…` that marks a cut;
-/// a `cap` too small for the mark cuts without one.
+/// Truncates `v` to at most `cap` bytes on a UTF-8 char boundary, appending `…` when cut.
 fn truncate(v: &str, cap: usize) -> String {
     if v.len() <= cap {
         return v.to_string();
@@ -172,21 +137,18 @@ fn truncate(v: &str, cap: usize) -> String {
     format!("{}{MARK}", &v[..end])
 }
 
-/// The whole answer: every presence row of the fleet, in ascending subject
-/// order, [`MAX_ROWS`]-bounded.
+/// All presence rows of a fleet in ascending subject order, bounded by [`MAX_ROWS`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Glance {
     /// The fleet the rows were read from.
     pub fleet: String,
-    /// The rows, ascending by subject — the order `Last` answers in.
+    /// The rows, ascending by subject.
     pub rows: Vec<Row>,
     /// Whether [`MAX_ROWS`] cut the answer short.
     pub truncated: bool,
 }
 
-/// Read every presence row of `fleet` through one connection, with astream's
-/// [`astream_broker::Client::last_walk`] (§5.2: a short page is not the end of the answer).
-/// [`Glance::truncated`] is set only when a further row exists past [`MAX_ROWS`].
+/// Reads all presence rows of `fleet` using [`astream_broker::Client::last_walk`].
 ///
 /// # Errors
 ///
@@ -213,9 +175,7 @@ pub fn read(conn: &mut Conn, fleet: &str) -> io::Result<Glance> {
     })
 }
 
-/// Render one JSON string. Every byte outside printable ASCII becomes a `\u`
-/// escape, so a value that arrived off the bus can never close the string, open
-/// a new key, or put a control byte into a file another program renders.
+/// Renders `s` as a JSON string with non-ASCII and control characters escaped as `\uXXXX`.
 pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -264,8 +224,7 @@ mod tests {
         assert_eq!(bare.field("attention"), ABSENT);
     }
 
-    /// The subject shape is re-checked here, by position, whatever the broker's filter
-    /// promised. Right-anchored, the eight-segment forgery's tail would read as node `n-a`'s row.
+    /// Only a valid presence subject of `fleet` parses into a [`Row`].
     #[test]
     fn only_a_presence_subject_of_this_fleet_becomes_a_row() {
         for bad in [
@@ -290,7 +249,6 @@ mod tests {
         let got = r.field("attention");
         assert!(got.len() <= ATTENTION_CAP, "{}", got.len());
         assert!(got.ends_with('…'));
-        // Not capped, not marked: a value that fits is untouched.
         let short = row("/f/f1/pub/n-a/node/presence", "attention=needs%20you");
         assert_eq!(short.field("attention"), "needs%20you");
     }
@@ -316,8 +274,6 @@ mod tests {
             "{}",
             r.fields.len()
         );
-        // The two tokens a human reads survive a row padded to the bound: a node
-        // must not be able to hide its own escalation by filling the map.
         let padded = format!("{many} attention=needs%20you");
         let r = row("/f/f1/pub/n-a/node/presence", &padded);
         assert_eq!(r.field("attention"), "needs%20you");
@@ -336,7 +292,6 @@ mod tests {
         for k in RESERVED {
             assert!(!r.fields.contains_key(k), "{k}= survived into the fields");
         }
-        // Tokens that are not reserved are untouched.
         assert_eq!(r.field("state"), "live");
     }
 }

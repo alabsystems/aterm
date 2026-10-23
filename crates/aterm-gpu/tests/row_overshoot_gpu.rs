@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// The GPU twin of aterm-render's `tests/row_overshoot.rs`:
-// glyphs that ink above their own cell (accented capitals at some sizes) beside
-// the scissored dirty-row repaint. `present_input` keeps the prior frame
-// (`LoadOp::Load`), scissors to the hull of the dirty bands and draws only the
-// dirty rows, so at the edge of a marked run it must neither draw a rebuilt
-// row's overshoot a second time into a kept band above it, nor lose a kept
-// row-below's overshoot from a rebuilt band, nor keep a changed row's old
-// overshoot. Swept over px 11..=20 × glyph class × stream, every presented
-// frame byte for byte against a full repaint of the same input.
-//
-// Without a GPU it ends as could-not-run (`common::gpu`).
 
 use std::sync::Arc;
 
@@ -27,8 +15,7 @@ use crate::common;
 
 const ROWS: usize = 8;
 const COLS: usize = 22;
-/// The row the "one" class carries its accented capitals on and the typing
-/// streams edit.
+/// Row carrying accented capitals in the `"one"` class and edited by typing streams.
 const HOT: usize = 3;
 /// Frames per case after the warm frame.
 const FRAMES: usize = 6;
@@ -37,7 +24,6 @@ const ACCENTS: &str = "\u{c9}\u{c1}\u{d1}\u{c5}\u{ca}\u{cd}";
 fn gpu_px(px: f32) -> GpuRenderer {
     let mut g = common::gpu(px, Theme::default());
     g.debug_block_on_lazy_fallbacks();
-    // Wall-clock shimmer off, so two renders of one input agree.
     g.set_shimmer(false);
     g
 }
@@ -68,8 +54,7 @@ fn screen(class: &str, cursor: Option<(usize, usize)>) -> Terminal {
     t
 }
 
-/// A steady flame filling row `r`'s band, with the contrast halo on its first
-/// twelve cells (the twin of aterm-render's `tests/row_overshoot.rs`).
+/// Steady flame filling row `r`'s band with a contrast halo on its first twelve cells.
 fn flames(g: Geo, r: usize, i: &mut RenderInput) {
     i.fire_patch = vec![FirePatch {
         row: r as u16,
@@ -117,15 +102,6 @@ fn frames(class: &str, stream: &str, g: Geo) -> Vec<RenderInput> {
             }
             out
         }
-        // One quad on the hot row, or a pair on row 0 and the hot row: two
-        // marked runs with kept rows between them inside the scissor hull, so
-        // the hot row's upper seam is the glyph window's to keep. Or one above
-        // a kept row in steady flames whose glyphs carry the contrast halo, a
-        // ring two pixels past the ink that the lower apron draws too.
-        //
-        // Or the cursor parked on the hot row's `Å` (the accent the fixture face
-        // raises above its cell) under a quad two rows below it: the cursor's
-        // row is rebuilt every frame with its glyphs unchanged.
         "glow_under" | "glow_pair" | "fire_halo" | "cursor_parked" => {
             let parked = stream == "cursor_parked";
             let mut t = screen(class, parked.then_some((HOT, 3)));
@@ -227,8 +203,7 @@ const STREAMS: [&str; 11] = [
     "type_below",
 ];
 
-/// THE GATE: every frame of the scissored present byte-identical to a full
-/// repaint of the same input, with the scissored path carrying the frames.
+/// Every scissored present frame is byte-identical to a full repaint of the same input.
 #[test]
 fn scissored_rows_beside_overshooting_glyphs_are_byte_exact() {
     let mut failures: Vec<String> = Vec::new();
@@ -293,16 +268,13 @@ fn scissored_rows_beside_overshooting_glyphs_are_byte_exact() {
         "the scissored present differs from a full repaint:\n{}",
         failures.join("\n")
     );
-    // Exact by the rule, not by its safety net (a surprise re-encodes Full): no
-    // row inked above its band where `row_may_ink_above` said it could not.
     assert!(
         widened.is_empty(),
         "a raster widened the overshoot rule at px {widened:?}"
     );
 }
 
-/// The instances each keystroke encodes, typing `keys` one frame each after
-/// `prompt` on row [`HOT`] under plain rows, every frame scissored.
+/// Instances encoded per keystroke when typing `keys` after `prompt` on row [`HOT`].
 fn typing_instances(g: &mut GpuRenderer, prompt: &str, keys: &[&str]) -> Vec<usize> {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     for row in 0..ROWS {
@@ -324,9 +296,7 @@ fn typing_instances(g: &mut GpuRenderer, prompt: &str, keys: &[&str]) -> Vec<usi
         .collect()
 }
 
-/// The first px of the sweep at which `glyph` on row 1 inks into row 0's band, by the
-/// CPU renderer over the GPU's own face (the JetBrains Mono fixture, [`common::cpu`]):
-/// px 13 for `Å` as macOS rasters it; where it overshoots is the host's rasterizer's.
+/// First px in `11..=20` where `glyph` on row 1 inks into row 0's band.
 fn an_overshooting_px(glyph: &str) -> f32 {
     let inks_above = |px: f32| {
         let mut r = common::cpu(px, Theme::default());
@@ -347,10 +317,7 @@ fn an_overshooting_px(glyph: &str) -> f32 {
         .unwrap_or_else(|| panic!("{glyph:?} inks above its cell at no px in 11..=20"))
 }
 
-/// The GPU twin of aterm-render's `typing_at_a_symbol_prompt_repaints_only_its_row`:
-/// typing ASCII at a `❯`, `λ` or `→` prompt encodes what typing at a `$` prompt does
-/// (the prompt's row alone), at every px, while an `Å` prompt, at a px where it inks
-/// above its cell in the host's face, encodes the row above it too.
+/// Typing ASCII at symbol prompts (`❯`, `λ`, `→`) encodes only the prompt's row, while an overshooting `Å` prompt encodes the row above too.
 #[test]
 fn typing_at_a_symbol_prompt_encodes_only_its_row() {
     let keys = ["l", "s", " ", "-"];
@@ -373,10 +340,7 @@ fn typing_at_a_symbol_prompt_encodes_only_its_row() {
     );
 }
 
-/// The GPU twin of aterm-render's `ascii_inking_above_its_cell_repaints_in_full_once`:
-/// at line height 0.7 some ASCII inks above its cell, which the default rule takes on
-/// trust not to. The scissored present that first draws it re-encodes Full, once, and
-/// every frame stays byte for byte a full repaint.
+/// ASCII inking above its cell at line height 0.7 triggers one full re-encode and stays byte-identical to a full repaint.
 #[test]
 fn ascii_inking_above_its_cell_reencodes_in_full_once() {
     let mut caught = Vec::new();
@@ -416,8 +380,6 @@ fn ascii_inking_above_its_cell_reencodes_in_full_once() {
             caught.push(size);
         }
     }
-    // Non-vacuity: the net has a raster to catch (at px 13 in macOS's face; where
-    // a face inks ASCII above its cell at line height 0.7 is the face's).
     assert!(
         !caught.is_empty(),
         "no ASCII inked above its cell at any px"

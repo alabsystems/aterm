@@ -188,7 +188,7 @@ impl PreviewTrailStyle {
         Self::from_resolution(crate::app_config::resolve_trail_style(value))
     }
 
-    pub(crate) fn from_resolution(resolved: crate::app_config::ResolvedTrailStyle) -> Self {
+    pub(crate) const fn from_resolution(resolved: crate::app_config::ResolvedTrailStyle) -> Self {
         match resolved.style {
             Some(GlowStyle::Lumen) => Self::Lumen,
             Some(GlowStyle::Phaser) => Self::Phaser,
@@ -656,7 +656,7 @@ pub(crate) struct ThemeDemoSpec {
     pub(crate) max_rows: usize,
 }
 
-/// The most rows and columns the demo terminal is laid out.
+/// The most rows and columns the demo terminal is laid out at.
 pub(crate) const DEMO_MAX_ROWS: usize = 40;
 pub(crate) const DEMO_MAX_COLS: usize = 100;
 /// The demo window's tab strip height.
@@ -664,7 +664,9 @@ pub(crate) const DEMO_STRIP_HEIGHT: f32 = 28.0;
 /// The inset between the demo window's edge and its grid.
 pub(crate) const DEMO_GRID_INSET: f32 = 8.0;
 
-/// The window the Themes demo frames its terminal.
+/// The window the Themes demo frames its terminal in: the one aterm's own
+/// window looks like on this platform, so a theme is shown in the chrome it
+/// will be worn in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DemoFrame {
     /// A Windows 11 aterm window, whose tab row is its title bar.
@@ -697,7 +699,8 @@ impl DemoFrame {
         }
     }
 
-    /// The faces the two tabs' titles paint.
+    /// The faces the two tabs' titles paint in: Windows sets its selected
+    /// title semibold.
     pub(crate) const fn faces(self) -> [TextFace; 2] {
         match self {
             Self::Windows => [TextFace::UiBold, TextFace::Ui],
@@ -860,7 +863,7 @@ pub(crate) enum StyleTrial {
 
 impl StyleTrial {
     /// The header's hint for keeping the tried style, where a gesture keeps it.
-    pub(crate) fn save_hint(self) -> Option<&'static str> {
+    pub(crate) const fn save_hint(self) -> Option<&'static str> {
         match self {
             Self::Keyboard => Some("Return to save"),
             Self::Pointer => Some("Click to save"),
@@ -869,7 +872,7 @@ impl StyleTrial {
     }
 
     /// The spoken value's words for an unsaved, tried style.
-    pub(crate) fn spoken(self) -> &'static str {
+    pub(crate) const fn spoken(self) -> &'static str {
         match self {
             Self::Keyboard => "not saved; Return saves, Escape goes back",
             Self::Pointer => "not saved; click saves, Escape goes back",
@@ -929,9 +932,11 @@ pub(crate) struct SettingsPreviewSpec {
     pub(crate) pause: PreviewPause,
     /// The Themes demo's playback.
     pub(crate) demo: ThemeDemoSpec,
-    /// The wallpaper the terminal draws under its default backgrounds, as a tab.
+    /// The wallpaper the terminal draws under its default backgrounds, as a
+    /// tab does: the Wallpaper page's preview, and the Appearance color
+    /// sample while one is set.
     pub(crate) wallpaper: Option<crate::widget::SpecimenWallpaper>,
-    /// The width the host lays this preview out at, which its header wraps.
+    /// The width the host lays this preview out at, which its header wraps to.
     pub(crate) measure_width: Option<f32>,
     /// The candidate's font slots whose names a resolver did not find, each with the name.
     pub(crate) refused_fonts: Vec<(&'static str, String)>,
@@ -1026,7 +1031,7 @@ impl SettingsPreviewSpec {
     }
 
     /// The chrome colours the candidate theme authors, alone.
-    pub(crate) fn with_authored_chrome(
+    pub(crate) const fn with_authored_chrome(
         mut self,
         chrome: aterm_messages::tokens::AuthoredChrome,
     ) -> Self {
@@ -1054,7 +1059,7 @@ impl SettingsPreviewSpec {
         }
     }
 
-    pub(crate) fn with_phase(mut self, phase_ms: u64) -> Self {
+    pub(crate) const fn with_phase(mut self, phase_ms: u64) -> Self {
         self.phase_ms = phase_ms;
         self
     }
@@ -1065,12 +1070,12 @@ impl SettingsPreviewSpec {
         self.with_phase(phase_ms)
     }
 
-    pub(crate) fn with_reduced_motion(mut self, reduced_motion: bool) -> Self {
+    pub(crate) const fn with_reduced_motion(mut self, reduced_motion: bool) -> Self {
         self.reduced_motion = reduced_motion;
         self
     }
 
-    pub(crate) fn with_paused(mut self, paused: bool) -> Self {
+    pub(crate) const fn with_paused(mut self, paused: bool) -> Self {
         self.paused = paused;
         self
     }
@@ -1084,12 +1089,15 @@ impl SettingsPreviewSpec {
         }
     }
 
-    pub(crate) fn with_pause(mut self, pause: PreviewPause) -> Self {
+    pub(crate) const fn with_pause(mut self, pause: PreviewPause) -> Self {
         self.pause = pause;
         self
     }
 
-    pub(crate) fn with_terminal_theme(mut self, terminal_theme: PreviewTerminalTheme) -> Self {
+    pub(crate) const fn with_terminal_theme(
+        mut self,
+        terminal_theme: PreviewTerminalTheme,
+    ) -> Self {
         self.terminal_theme = Some(terminal_theme);
         self
     }
@@ -1099,7 +1107,7 @@ impl SettingsPreviewSpec {
         self
     }
 
-    pub(crate) fn with_typography(
+    pub(crate) const fn with_typography(
         mut self,
         line_height: f32,
         baseline_adjust: i32,
@@ -1136,7 +1144,7 @@ impl SettingsPreviewSpec {
     }
 
     /// Mark the focused theme as a sample this preview alone draws.
-    pub(crate) fn with_theme_sample(mut self, sample: bool) -> Self {
+    pub(crate) const fn with_theme_sample(mut self, sample: bool) -> Self {
         self.theme_sample = sample;
         self
     }
@@ -1158,13 +1166,13 @@ impl SettingsPreviewSpec {
     }
 
     /// The width the host lays this preview out at ([`Self::measure_width`]).
-    pub(crate) fn with_measure_width(mut self, width: f32) -> Self {
+    pub(crate) const fn with_measure_width(mut self, width: f32) -> Self {
         self.measure_width = Some(width);
         self
     }
 
     /// Mark the focused cursor style as tried, not saved.
-    pub(crate) fn with_style_trial(mut self, trial: Option<StyleTrial>) -> Self {
+    pub(crate) const fn with_style_trial(mut self, trial: Option<StyleTrial>) -> Self {
         self.style_trial = trial;
         self
     }
@@ -1403,6 +1411,7 @@ impl SettingsPreviewSpec {
             // A name no resolver found, in the words its row uses.
             "Not found"
         } else if status.contains("unavailable") || status.contains("fallback active") {
+            // The capsule names the authored family/axis; the specimen around it
             // already shows the fallback face.
             "Unavailable"
         } else if self.prepared_font.snapshot.pending
@@ -1410,6 +1419,7 @@ impl SettingsPreviewSpec {
             || status.contains("queued")
             || status.contains("ready for host preparation")
         {
+            // The header names the font being loaded; the pill only says
             // the glyphs below are not it yet.
             return Some(("Loading font".to_string(), false));
         } else {
@@ -1594,6 +1604,8 @@ impl SettingsPreviewSpec {
                         None => format!("{} trail", spec.cursor.trail_style_label()),
                     }
                 } else if spec.cursor.trail_enabled && spec.cursor.momentum_glow {
+                    // The typing glow is light on a dark ground and warm ink
+                    // on a light one (`aterm_effects::cursor_momentum`): a
                     // glow either way, round any cursor shape.
                     "no trail, glowing as you type".to_string()
                 } else {
@@ -2266,7 +2278,7 @@ impl SettingsPreviewSpec {
         minimum.max(self.typography_height(TYPOGRAPHY_KEPT_ROWS))
     }
 
-    /// The least height this preview still demonstrates.
+    /// The least height this preview still demonstrates at.
     pub(crate) fn minimum_height(&self, floor: f32) -> f32 {
         let mut spec = self.normalized();
         floor.max(match self.scene {
@@ -2327,7 +2339,8 @@ impl SettingsPreviewSpec {
         )
     }
 
-    /// The height at which a color specimen shows every row it.
+    /// The height at which a color specimen shows every row it has; a host
+    /// with more room would only add empty terminal under the last one.
     pub(crate) fn whole_color_sample_height(&self) -> Option<f32> {
         self.color_sample_height_at_most(f32::INFINITY)
     }
@@ -2660,6 +2673,8 @@ impl SettingsPreviewSpec {
 
     /// What changing this spec to `next` repaints of a node drawn in `rect`.
     pub(crate) fn repaint_rect(&self, next: &Self, rect: LogicalRect) -> LogicalRect {
+        // Two specs that paint the same pixels repaint nothing: a still
+        // preview whose phase moved on (every spec carries the page's clock)
         // is not re-rastered on another preview's tick.
         if self.paint_fingerprint() == next.paint_fingerprint() {
             return LogicalRect::new(rect.x, rect.y, 0.0, 0.0);
@@ -3064,6 +3079,7 @@ impl SettingsPreviewSpec {
             && let Some(identity) = &self.terminal_theme_identity
             && crate::prefs::theme_mode(Some(raw)) == crate::prefs::ThemeMode::FollowSystem
         {
+            // A Follow system pair previews one side: the theme drawn, never
             // the raw `dark:…,light:…` value.
             identity.label.clone()
         } else if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE && !self.cursor.trail_enabled {
@@ -3072,6 +3088,8 @@ impl SettingsPreviewSpec {
         } else if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE
             && raw.trim() == self.cursor.effective_trail_style_raw()
         {
+            // The style's name, as its row on Cursor Styles says it, with an
+            // unknown spelling it stands in for ("Rainbow kitty (unknown
             // "comett")").
             crate::native_settings::cursor_style_name(raw)
         } else if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE {
@@ -3203,6 +3221,7 @@ fn paint_font_candidate_pill_at_scale(
     let text_size = TypeStep::Caption.px(11.5).scaled(text_scale);
     let pill_h = pill.height;
     if terminal.height < pill_h + 8.0 {
+        // A pill squeezed under its own text height cuts its label in half;
         // the header still names the font.
         return;
     }
@@ -3263,7 +3282,7 @@ struct PillLayout {
     warning: bool,
     /// The caption's size.
     px: f32,
-    /// The room a line.
+    /// The room a line has.
     budget: f32,
     /// The pill's height: one line's, and a line pitch for each further one.
     height: f32,
@@ -3433,7 +3452,7 @@ struct WindowBand {
 
 const APPEARANCE_WINDOW_SAMPLE_GAP: f32 = 6.0;
 
-fn appearance_window_sample_width(terminal: LogicalRect) -> f32 {
+const fn appearance_window_sample_width(terminal: LogicalRect) -> f32 {
     terminal.width.min(112.0)
 }
 
@@ -3590,7 +3609,7 @@ pub(crate) const fn pack_rgb(color: aterm_types::Rgb) -> u32 {
     ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
 }
 
-fn packed_rgb(value: u32) -> aterm_types::Rgb {
+const fn packed_rgb(value: u32) -> aterm_types::Rgb {
     aterm_types::Rgb::new(
         ((value >> 16) & 0xff) as u8,
         ((value >> 8) & 0xff) as u8,
@@ -3960,7 +3979,7 @@ impl TypedLine {
         scene_cells_at(offset).min(self.end - self.start)
     }
 
-    fn caret(self, shown: usize) -> usize {
+    const fn caret(self, shown: usize) -> usize {
         self.start + shown
     }
 }
@@ -3986,7 +4005,9 @@ pub(crate) struct CursorScene {
     /// The blink phase (and the cursor style) show the caret.
     caret_shown: bool,
     companion: SceneCompanion,
-    /// The Flying kitty is the selected.
+    /// The Flying kitty is the selected style's, so the real cursor cat
+    /// (`aterm_effects::kitty_cursor::CursorCat`) earns it as the terminal
+    /// does; the sprite control's diagnostic kitty shows at once.
     flying_earned: bool,
     /// The whole rows the card shows (`None`: every row of the grid).
     card_rows: Option<usize>,
@@ -4054,6 +4075,8 @@ impl CursorScene {
         let companion = if !spec.cursor.trail_enabled {
             SceneCompanion::None
         } else if sprite_diagnostic {
+            // The sprite control previews the asset it edits even when the
+            // selected companion is a resident pet. This focused specimen is
             // diagnostic, never a claim that the flying sprite is active.
             if spec.reduced_motion {
                 SceneCompanion::None
@@ -4108,11 +4131,11 @@ impl CursorScene {
     }
 
     /// The scripted typing plays, so every frame differs.
-    pub(crate) fn is_moving(&self) -> bool {
+    pub(crate) const fn is_moving(&self) -> bool {
         self.typing && !self.held
     }
 
-    fn warm_cycles(&self) -> u64 {
+    const fn warm_cycles(&self) -> u64 {
         if self.flying_earned {
             1
         } else {
@@ -4120,7 +4143,7 @@ impl CursorScene {
         }
     }
 
-    fn shown_offset(&self) -> u64 {
+    const fn shown_offset(&self) -> u64 {
         self.phase_ms - self.phase_ms % MOTION_STEP_MS
     }
 
@@ -5007,7 +5030,7 @@ fn push_demo_shadow(
     }
 }
 
-fn finite_or(value: f32, fallback: f32) -> f32 {
+const fn finite_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
 }
 
@@ -5126,6 +5149,7 @@ mod tests {
             crate::native_appearance::AppearancePreferences::default(),
         );
         thread_local! {
+            // Another font-mutating test can run on this libtest worker in between, so
             // track the cascade generation, not a one-way boolean.
             static INSTALLED_EPOCH: Cell<Option<u64>> = const { Cell::new(None) };
         }
@@ -7095,6 +7119,7 @@ mod tests {
                             let pitch = normalized.row_height_at(specimen.font_px);
                             let rows = specimen.input.rows.min(most);
                             let shown = if scene == "cursor" {
+                                // The cursor grid keeps a blank row under its
                                 // prompt: count what the card's body holds.
                                 ((terminal.height / pitch).floor() as usize).min(most)
                             } else {

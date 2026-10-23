@@ -79,7 +79,7 @@ pub struct KeyframePolicy {
     deferred: Option<Reason>,
     /// A width change or a rows grow reached the tail since the last keyframe (K7).
     regrid_pending: bool,
-    /// A K5 deferral parked the session (module doc): it reads clean to the parse
+    /// A K5 deferral parked the session: it reads clean to the parse
     /// thread's wait until the next slice or resize reaches the tail.
     parked: bool,
     /// The host renumbered the history with no output ([`Reason::Renumbered`]).

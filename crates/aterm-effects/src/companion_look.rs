@@ -187,6 +187,7 @@ impl KittyTenure {
                 self.arrival = if insert_lru(&mut self.roster, &id.id, now) {
                     self.floor(now)
                 } else {
+                    // Every slot holds a debt: refuse the insert rather than
                     // drop one. The only way a stranger's hello is lost.
                     PetArrival::Quiet
                 };
@@ -265,7 +266,10 @@ const fn dwell_for(candidate: Option<&AppIdentity>) -> Duration {
     if candidate.is_some() { TENURE } else { RELEASE }
 }
 
-/// The companion precedence law, stated only here (every dressing surface goes through [`LookPolicy::verdict`]):
+/// The companion precedence law, stated only here (every dressing surface goes
+/// through [`LookPolicy::verdict`]):
+///
+///   favourite > program (with tenure) > launch kitty
 #[inline]
 #[must_use]
 pub const fn companion_precedence(

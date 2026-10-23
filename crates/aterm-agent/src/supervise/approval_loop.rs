@@ -378,42 +378,11 @@ fn identity_of(v2: &aterm_phase::PromptV2, rows: &[String]) -> String {
     key
 }
 
-/// How long before the vendor's auto-deny a person's hold on a box ends when
-/// nobody has touched its episode ([`Session::held_for_person`],
-/// [`Episode`]) — so the policy's answer is
-/// pressed and seen taken before Claude Code denies the box (`⚠ Claude Code
-/// will automatically deny this request in 1:44, …`,
-/// [`aterm_phase::PromptV2::auto_deny_left`]). The deny is the outcome nobody
-/// chose: the worker's command fails, and the work it was part of stalls.
-/// Fifteen seconds holds what the press needs with room to spare: the deny
-/// as read, which may fall up to about a second after the vendor's
-/// ([`Countdown`]: the frame read may be a tick old), the look at the hold's
-/// end (its read, `status` and `meta`, milliseconds on the local socket), a
-/// fenced press skipped because the countdown ticked between the read and
-/// the key and decided again, a refused one's first back-offs
-/// ([`REFUSAL_PAUSE`] doubling), and the box seen leaving after the key
-/// ([`leave_wait`]). It leaves a person 1:45 of the vendor's 2:00 to touch
-/// the session, which makes the box theirs.
+/// Margin before Claude Code's auto-deny when an untouched hold ends so the policy's answer lands first.
 pub(super) const DENY_MARGIN: Duration = Duration::from_secs(15);
 
-/// How long a press inside [`DENY_MARGIN`] of its box's auto-deny waits for
-/// the box to leave ([`leave_wait`]) before it reads the box as not taken: a
-/// taken key takes a ticking box down within about a second (within 5 ms the
-/// vendor wipes its countdown, and the box is gone some 550 ms on; 2.1.283,
-/// measured), so three seconds leave room before the deny for a few more
-/// presses where the loop presses again, or for a person to answer a box it
-/// hands them.
 const LEAVE_NEAR_DENY: Duration = Duration::from_secs(3);
 
-/// How long a press made `now` waits for its box to leave
-/// ([`Session::box_left`]): one [`WAIT_STEP`]; on a box Claude Code denies
-/// at `deny` ([`Session::deny_at`]), until [`DENY_MARGIN`] before the deny
-/// if that is sooner, and [`LEAVE_NEAR_DENY`] for a press inside that
-/// margin. A key the box did not take is then seen not taken before the
-/// deny — pressed again under `approve = "all"` (and for a question's answer
-/// or a limit dialog's row), handed to a person under `safe`, with time left
-/// to answer it: a whole step there would end only when the vendor's deny
-/// took the box down, the approval ledgered for a box Claude Code denied.
 fn leave_wait(now: Instant, deny: Option<Instant>) -> Duration {
     let Some(deny) = deny else {
         return WAIT_STEP;
@@ -424,69 +393,24 @@ fn leave_wait(now: Instant, deny: Option<Instant>) -> Duration {
     to_margin.max(LEAVE_NEAR_DENY).min(WAIT_STEP)
 }
 
-/// How far apart two reads may place the deny and still read one countdown
-/// running with the loop's clock ([`Countdown`]): a frame up to a tick old,
-/// seconds rounded down and the PTY's lag put one read's placing up to about
-/// two seconds from another's. A countdown a later read places further off
-/// than this is none that runs with the clock; a time a read shows that
-/// stood longer than this has stopped.
 const TICK_SLACK: Duration = Duration::from_secs(3);
 
-/// How soon a hold looks again at a box whose countdown is not seen ticking
-/// ([`DenyClock::Unseen`]): Claude Code redraws its countdown every second,
-/// so a read a second on shows it a second lower.
+/// Recheck interval for a box whose auto-deny countdown has not yet been seen ticking.
 pub(super) const TICK_LOOK: Duration = Duration::from_secs(1);
 
-/// THE AUTO-DENY COUNTDOWN a read showed on a box ([`Session::countdown`],
-/// kept on every read: [`Session::keep_countdown`]), believed only once seen
-/// TICKING.
-/// The text is read only where Claude Code draws it
-/// ([`aterm_phase::PromptV2::auto_deny`]), and even there it is believed only
-/// once a later read shows less time left, in step with the loop's clock:
-/// two reads placing the deny within [`TICK_SLACK`] of each other. Nothing
-/// the worker writes ticks — a description, a command or a question that
-/// spells a countdown stands still — so no text of the worker's ends
-/// anyone's hold (2026-10-15). A time that stands longer than [`TICK_SLACK`]
-/// is a countdown that stopped, believed no longer; a time that rises is
-/// the countdown started over, believed again once it ticks. Whatever
-/// Claude Code redraws of the box between two reads — its `1 of 2` label,
-/// its rows re-wrapped, the loop's own decline in its input, another box
-/// drawn in its place — two placings in step are one countdown ticking: the
-/// deny is where they put it, so a redraw never holds the box a second more
-/// to see it tick.
-///
-/// The deny is placed on the loop's clock at the instant the read was asked
-/// for plus the time it showed, by the first read that showed that time:
-/// within about a second of the vendor's own deadline either way. Claude
-/// Code redraws the countdown once a second, so the frame a read returns was
-/// mostly drawn before the read was asked for and may be up to a tick old
-/// (later than the deadline, by that age and the PTY's lag), and its seconds
-/// are rounded down (earlier); [`DENY_MARGIN`] absorbs both.
+/// Auto-deny countdown read from a box, trusted only once seen ticking in step with the loop's clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Countdown {
-    /// The box, as [`box_identity`] keys it.
     identity: String,
-    /// The time the read showed.
     left: Duration,
-    /// When the countdown runs out, by the first read that showed `left`.
     deny_at: Instant,
-    /// When that first read was asked for.
     since: Instant,
-    /// When this read was asked for.
     asked: Instant,
-    /// A read showed less time than the one before it, in step with the
-    /// clock, and the time has not stood still since.
     ticking: bool,
-    /// The journal said this countdown's hold's end (`HOLD-ENDED`,
-    /// [`Session::held_for_person`]): said once a countdown.
     ended_said: bool,
 }
 
-/// The countdown of the box on `rows`, read by a request asked at `asked`
-/// ([`Countdown`]), not yet seen ticking: `None` with no box, or a box whose
-/// countdown says no time this build reads (none drawn where Claude Code
-/// draws it, the screen-reader form). A screen with no `⚠` on it is not
-/// parsed: the countdown is led by one, its words wrapped over rows or not.
+/// Parses the auto-deny countdown on `rows` from a read requested at `asked`.
 pub(super) fn countdown_of(rows: &[String], asked: Instant) -> Option<Countdown> {
     if !rows.iter().any(|r| r.contains('⚠')) {
         return None;
@@ -505,12 +429,7 @@ pub(super) fn countdown_of(rows: &[String], asked: Instant) -> Option<Countdown>
 }
 
 impl Countdown {
-    /// This read's countdown, after `before` (the last read's), whatever box
-    /// each was drawn on: the same time keeps its placing — and its tick,
-    /// while it has stood no longer than [`TICK_SLACK`] — and less time in
-    /// step with the clock is a tick, both the same countdown (its hold's end
-    /// said or not). More time is the countdown started over, and less out
-    /// of step with the clock another one: each starts afresh.
+    /// Advances this read's countdown from `before`, marking it ticking when `left` drops in step with the clock.
     pub(super) fn after(mut self, before: Option<&Self>) -> Self {
         let Some(b) = before.filter(|b| self.left <= b.left) else {
             return self;
@@ -533,92 +452,34 @@ impl Countdown {
         self
     }
 
-    /// When Claude Code denies the box: `None` until its countdown is seen
-    /// ticking.
+    /// Returns when Claude Code denies the box, or `None` until the countdown is seen ticking.
     pub(super) fn deny(&self) -> Option<Instant> {
         self.ticking.then_some(self.deny_at)
     }
 }
 
-/// What the loop knows of Claude Code's auto-deny of the box a read shows
-/// ([`Session::deny_clock`]).
+/// Auto-deny deadline state for the box on a read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DenyClock {
-    /// No countdown on the box is believed: the hold stands as it always has.
     None,
-    /// A countdown is drawn where Claude Code draws it but is not seen
-    /// ticking ([`Countdown`]): not yet, or no longer (its time stood longer
-    /// than [`TICK_SLACK`], a redraw the vendor stalled). A hold on an
-    /// untouched box looks again within [`TICK_LOOK`] to see it tick, for as
-    /// long as it is drawn: the read that sees it running again places the
-    /// deny.
     Unseen,
-    /// Claude Code denies the box at `deny`: no hold on it runs past
-    /// [`DENY_MARGIN`] before that, unless someone has touched its episode
-    /// ([`Episode`]).
     At { deny: Instant },
 }
 
-/// THE BOX EPISODE, and whether anyone touched the session while it ran:
-/// the one rule that decides whether a hold on a box may end before the
-/// vendor's deny. An episode runs from the first read that shows any box to
-/// the first read that shows none ([`Session::keep_episode`], every read): a
-/// box Claude Code redraws, re-wraps, relabels (`1 of 2`, another ask
-/// stacked behind it) or replaces with another box within it is the same
-/// episode, and keeps what the episode knows. An episode someone TOUCHED is
-/// theirs: no hold on any box of it ends at [`DENY_MARGIN`], it is held as it
-/// always was, and Claude Code's deny stands for the answer they left
-/// unfinished (they were there). The cap ends only a person's hold in an
-/// episode nobody touched: the incident's, typed near 22 s before the box
-/// came up. A touch is a fact the server records, latched for the whole
-/// episode, and never read off a box's face, which Claude Code redraws by
-/// itself (a footer cut to the pane, a stacked-asks label):
-///
-/// * A PERSON'S GESTURE: the session's person count (`human_seq`) on a read
-///   of the episode above its BASELINE, the count on the newest read before
-///   the episode's first — so a gesture in the gap between that read and the
-///   first counts. The loop's own keys are never counted (control verbs).
-///   That read may be a whole wait step ([`WAIT_STEP`]) before the box while
-///   the worker is busy. So the cap's reach rests on `human_grace_s`: at the
-///   default, the vendor's own two minutes, the grace outlasts the deny
-///   only from a gesture in the last moments before the box, which mostly
-///   falls after that read, a touch; a longer grace runs past it from a
-///   gesture up to the grace less two minutes before the box, and the cap
-///   ends those holds where that gesture came before that read (the
-///   CHANGELOG says so).
-/// * ANOTHER DRIVER'S HAND on the session (`status hand=`: a drive lease, a
-///   named turn), on a status read made while the episode runs
-///   ([`Session::foreground_program`]; every decision that may answer a box
-///   of it reads one first, [`Session::decide_box`]): their keys carry no
-///   count. A hand only a status read before the episode found (a lease let
-///   go before the box came up) is none: the episode's own status read says
-///   whether it is still on.
-/// * WHAT CANNOT BE TOLD: an episode whose first read is the loop's first
-///   read of the session (a loop that attached mid-box, or started on it); a
-///   read of it without the person count or the person stamp (a host older
-///   than them, which no press can fence on the person either); a count
-///   below the baseline (one that started over: a session adopted across a
-///   seamless update counts from 0 again).
+/// Contiguous box episode tracking whether a person or another driver touched the session while a box was up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Episode {
-    /// The person count of the newest read before the episode's first:
-    /// `None` with no such read, or one that carried none.
     baseline: Option<u64>,
-    /// What touched the episode, for the journal: `None` while nothing has.
     by: Option<&'static str>,
 }
 
-/// What touched an episode another driver's hand was on ([`Episode`]).
 const BY_DRIVER: &str = "another driver's hand was on the session while it was up";
 
 impl Episode {
-    /// `by` touched the episode, unless something did before.
     fn touch(&mut self, by: &'static str) {
         self.by.get_or_insert(by);
     }
 
-    /// One read of the episode (`screen`) against its baseline: what touched
-    /// it, the first touch kept.
     fn read(&mut self, screen: &Screen) {
         let by = match (self.baseline, screen.human_seq, screen.human) {
             (None, _, _) | (_, None, _) | (_, _, HumanInput::Unknown) => {
@@ -1297,7 +1158,6 @@ impl<C: Ctl> Session<'_, C> {
         );
         review.say(&line).map_err(Fail::Hard)?;
         if self.tell_own {
-            // question or its answer.
             let _ = self.call(&["story", "chose", word]);
         }
         Ok(())
@@ -1403,8 +1263,6 @@ impl<C: Ctl> Session<'_, C> {
         reason: &str,
         box_seq: u64,
     ) {
-        // ([`approvals::left_after_typed`]). A fact line is typed, and no act: none of what
-        // follows an act follows it ([`approvals::is_fact_rule`]), only its row.
         let policy_act = outcome == approvals::Outcome::Typed && !approvals::is_fact_rule(rule_id);
         if policy_act {
             self.left_keys = std::mem::take(&mut self.left_keys)
@@ -2080,15 +1938,6 @@ impl<C: Ctl> Session<'_, C> {
             (Act::Approve { .. }, _) => unproven.clone().unwrap_or_default(),
         };
         let grace = self.box_grace(opts, &turn.screen);
-        // A press past a person's hold (a box episode nobody touched, within
-        // [`DENY_MARGIN`] of its auto-deny, their grace still running) is
-        // fenced on the person (`if-human=`), every key of it, as a
-        // question's and a decline's keys always are, on the episode's
-        // baseline ([`Self::person_fence`]): one who gestured since skips it
-        // ([`Press::Yielded`]), and that gesture touched the episode, so the
-        // box is theirs from the next read on ([`Episode`]). A digit is
-        // always fenced on the judged read's count, which in an untouched
-        // episode is that baseline ([`Self::press_one_guarded`]).
         let past_hold = self.hold_over(&turn.screen) && self.hands_off_until(opts).is_some();
         let person = past_hold.then(|| self.person_fence(&turn.screen)).flatten();
         let pressing = match &act {
@@ -2411,7 +2260,7 @@ const PRESS_RETRY_MAX: Duration = Duration::from_secs(60);
 /// How long a box whose presses keep missing is tried before the session is badged.
 pub(super) const PRESS_BADGE_AFTER: Duration = Duration::from_secs(120);
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG ([`RULE_LIMIT_RETRY`]).
+/// Gemini CLI usage-limit dialog retry state ([`RULE_LIMIT_RETRY`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LimitRetry {
     program: Program,
@@ -2422,82 +2271,50 @@ pub(super) struct LimitRetry {
     tries: u32,
     looks: u32,
     last_unix: Option<i64>,
-    /// The last try was the resume typed at the error the dialog's `Stop`
-    /// left ([`Session::limit_resume_typed`]), not a `Keep trying`: a dialog
-    /// drawn again on it says so.
     resumed: bool,
-    /// The point whose badge the dialog naming no reset raised
-    /// ([`Session::limit_retry_hold`]), or the error its `Stop` left
-    /// ([`Session::limit_stopped_badge`]): it stands through a try's
-    /// spinner, and moves between the dialog and that error
-    /// ([`Session::limit_badge_carry`]).
     badge: Option<String>,
-    /// The model the footer named where the error its `Stop` left was first
-    /// read ([`Session::limit_stopped_seat`]; the dialog draws no footer):
-    /// the model the limit is (`Usage limit reached for <model>.`) was read
-    /// under. `None` until then.
     model: Option<String>,
-    /// THE AGENT LEFT THE TAB WHILE THE EPISODE STOOD (E1 of the review of
-    /// walls-3; [`Session::limit_retry_away`]): a point of no agent's (a
-    /// shell's prompt: it crashed, exited or upgraded) was read while the
-    /// dialog was held, and the episode kept through it — so the relaunched
-    /// agent's first point is read as the limit still
-    /// ([`Session::limit_stopped`]), its ladder climbing on.
     away: bool,
-    /// At that first point: whether the relaunch's seat is vouched for — the
-    /// host's own relaunch, or the account its screen names
-    /// (`TurnEndState::seat_vouched`). `Some(false)`: the limit binds it no
-    /// longer, and the resume is typed at once, a try of the episode.
     relaunch: Option<bool>,
 }
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG AS A READ DREW IT ([`Session::note_limit_dialog`]),
-/// a point or not: the reset it names (`None`: none, a key's per-day quota)
-/// and when that was first read. Where the dialog is answered `Stop` before
-/// any point decided it (a person at the keyboard inside the settle), no
-/// episode ([`LimitRetry`]) stands for the error it leaves to be read as
-/// that limit: this read is what names it ([`Session::limit_stopped_adopt`]).
+/// Last observed Gemini CLI usage-limit dialog read ([`Session::note_limit_dialog`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LimitDialogRead {
     program: Program,
     reset: Option<aterm_phase::gemini::LimitReset>,
     seen_unix: i64,
-    /// The last read that drew it ([`LIMIT_DIALOG_FRAME_S`]).
     last_unix: i64,
 }
 
 #[cfg(test)]
 impl LimitRetry {
-    /// Tests: the reset placed ([`Self::at_unix`]).
+    /// Returns the placed reset timestamp ([`Self::at_unix`]).
     pub(super) fn placed_unix(&self) -> Option<i64> {
         self.at_unix
     }
 }
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG ANSWERED `Stop` BY ANOTHER HAND while the loop waited on it, on the reset it names or on the ladder where it names none ([`Session::limit_stopped`]).
+/// Gemini CLI usage-limit dialog answered `Stop` or relaunched while the loop waited on it ([`Session::limit_stopped`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StoppedLimit {
     pub(super) wall: aterm_phase::Wall,
     pub(super) reset_unix: i64,
 }
 
-/// The first back-off after a `Keep trying` the dialog came back on, doubled at each further one.
+/// Initial back-off after a `Keep trying` when the dialog returns, doubled on each retry.
 pub(super) const LIMIT_RETRY_BACKOFF_S: i64 = 120;
 
-/// The back-off's ceiling ([`LimitRetry`]).
+/// Maximum retry back-off ([`LimitRetry`]).
 pub(super) const LIMIT_RETRY_BACKOFF_MAX_S: i64 = 1800;
 
-/// The longest a reset is waited on before its first `Keep trying`, and one placed in the machine's zone between its looks ([`LimitRetry`]).
+/// Maximum wait before the first `Keep trying` or between looks in the machine's zone ([`LimitRetry`]).
 pub(super) const LIMIT_RETRY_RELOOK_S: i64 = LIMIT_RETRY_BACKOFF_MAX_S;
 
-/// How long after a `Keep trying` a busy read is that try in flight ([`Session::limit_retry_busy`]).
+/// Window after `Keep trying` during which a busy read counts as that try in flight ([`Session::limit_retry_busy`]).
 pub(super) const LIMIT_RETRY_ANSWER_S: i64 = 300;
 
-/// How long after the last read that drew Gemini CLI's usage-limit dialog a
-/// busy read may still be a frame between the dialog and the error its
-/// `Stop` leaves ([`Session::note_limit_dialog`]): the CLI ends the turn on
-/// that error at the key, so a spinner past this is a turn running past the
-/// dialog (a try's, or the work that got through), never the `Stop`'s.
+/// Window after the last usage-limit dialog read during which a busy frame may precede `Stop`'s error ([`Session::note_limit_dialog`]).
 pub(super) const LIMIT_DIALOG_FRAME_S: i64 = 10;
 
 const LIMIT_RETRY_AHEAD_MAX_S: i64 = 23 * 3600;
@@ -2645,10 +2462,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// A NEW EPISODE of `program`'s usage-limit dialog naming `reset`, first
-    /// read at `seen_unix` ([`LimitRetry`]): the reset placed in the zone it
-    /// names (else the machine's) by [`LIMIT_RETRY_AHEAD_MAX_S`]'s rule from
-    /// that read, no try made yet.
     fn limit_retry_open(
         &mut self,
         program: Program,
@@ -2667,8 +2480,6 @@ impl<C: Ctl> Session<'_, C> {
                 });
                 (at, zone.is_some())
             }
-            // A clock the loop cannot read is no reset it can place: the
-            // ladder's, as on the dialog that names none.
             None => (None, false),
         };
         LimitRetry {
@@ -2688,25 +2499,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// GEMINI CLI'S USAGE-LIMIT DIALOG ON A READ OF `program`'s `rows`, a
-    /// point or not ([`LimitDialogRead`]): kept, the first read of the reset
-    /// it names with it. Forgotten at a read of another box (the no-access
-    /// dialog, whose `Stop` leaves the same error) — the dialog with its head
-    /// off the rows included, which the reader names no usage-limit dialog
-    /// (`aterm_phase::gemini`'s `read_box`: kind `Other`) — and at a read of
-    /// the worker WORKING (`busy`, the reader's phase) more than
-    /// [`LIMIT_DIALOG_FRAME_S`] after the dialog was last drawn: the dialog
-    /// was answered and a turn runs past it (a `Keep trying`'s spinner, the
-    /// work that got through), so an error that ends a later turn answered
-    /// no dialog this read drew. So too where the loop pressed `Keep trying`
-    /// itself ([`Self::limit_retry_pressed`]). Any other read keeps it: a
-    /// frame between the dialog and the error its `Stop` leaves is neither,
-    /// and the point that is neither forgets it ([`Self::turn_end_at_point`]).
-    /// Measured before (the review of walls-3, A1): the read survived an
-    /// hour of the worker's work after a `Keep trying`, and an unrelated
-    /// `[API Error: An unknown error occurred.]` ending a later turn was
-    /// adopted as the per-day limit — `usage-resume@v1` typed at once and a
-    /// NEEDS YOU raised where nothing named a limit.
+    /// Records or clears the usage-limit dialog read on `rows` ([`LimitDialogRead`]).
     pub(super) fn note_limit_dialog(&mut self, program: Program, rows: &[String], busy: bool) {
         let now = self.now_unix();
         let past_frame =
@@ -2738,16 +2531,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// THE ERROR A STOP LEAVES, NO EPISODE STANDING: Gemini CLI's
-    /// `✕ [API Error: An unknown error occurred.]` on `reading`, where no
-    /// point decided the dialog it answered (a person's `Stop` inside the
-    /// settle), but a read since the last point drew the usage-limit dialog
-    /// ([`Self::note_limit_dialog`]): that dialog's episode opens here, from
-    /// its first read, so the error is read as its limit
-    /// ([`Self::limit_stopped`]). The error with no such read is still a
-    /// person's: nothing names a limit (the no-access dialog's `Stop` leaves
-    /// the same words). With `limit_wait` off, no dialog is waited on, and
-    /// none is opened.
+    /// Opens a [`LimitRetry`] episode from [`Self::note_limit_dialog`] when `Stop`'s error is reached before any point decided the dialog.
     pub(super) fn limit_stopped_adopt(
         &mut self,
         reading: &aterm_phase::Reading,
@@ -2808,13 +2592,7 @@ impl<C: Ctl> Session<'_, C> {
         Some(until_unix)
     }
 
-    /// Return whether Gemini CLI's usage-limit dialog was answered `Stop` by
-    /// another hand, or its agent relaunched while the dialog was held
-    /// ([`LimitRetry::away`]): the limit, its reset placed where the dialog's
-    /// next `Keep trying` was due (on the ladder's next rung where it names
-    /// none the loop can place), or now where another model was named since
-    /// ([`Self::limit_stopped_seat`]) or the relaunch's seat is vouched for by
-    /// nothing ([`LimitRetry::relaunch`]).
+    /// Returns the [`StoppedLimit`] when Gemini CLI's usage-limit dialog was answered `Stop` or its agent relaunched while held.
     pub(super) fn limit_stopped(
         &self,
         reading: &aterm_phase::Reading,
@@ -2843,10 +2621,6 @@ impl<C: Ctl> Session<'_, C> {
             .zip(aterm_phase::gemini::footer_model(rows))
             .is_some_and(|(was, now)| *was != now)
             || (relaunched && retry.relaunch == Some(false));
-        // Due when the dialog's next `Keep trying` was (past the reset and
-        // the grace, no sooner than its look or back-off; on the ladder's
-        // next rung where it names none the loop placed): the turn-end
-        // policy adds the same grace past the reset it is given.
         let due = if moved {
             self.now_unix()
         } else {
@@ -2871,8 +2645,6 @@ impl<C: Ctl> Session<'_, C> {
             ),
             (None, None) => format!("{title} the session's model; {how}. It names no reset."),
         };
-        // The relaunched screen draws no notice: the limit stands for its
-        // last row drawn, as the error's row does for the `Stop`'s.
         let (row, placement) = match stopped {
             Some(w) => (w.row, w.placement),
             None => (
@@ -2895,20 +2667,7 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// THE EPISODE KEPT THROUGH ITS AGENT'S ABSENCE (E1 of the review of
-    /// walls-3), at a point of `program`'s `rows` that is neither Gemini
-    /// CLI's usage-limit dialog nor the error its `Stop` leaves, the
-    /// turn-end policy waiting on no limit of its: a point of NO AGENT'S (a
-    /// shell's prompt: the CLI crashed, exited or upgraded while the dialog
-    /// was held, its normal state for hours on the ladder's later rungs)
-    /// keeps the episode and marks it away ([`LimitRetry::away`]); the
-    /// episode's own program's first point after it is the relaunch's
-    /// start-up, kept, and read as the limit ([`Self::limit_stopped`]),
-    /// its seat judged once there ([`LimitRetry::relaunch`]: the host's own
-    /// relaunch, `IdleHost::relaunch_owed`, or the account the tab's
-    /// earlier screens named, `TurnEndState::seat_vouched`). `true`: kept.
-    /// Any other point (another agent's, or the program's own with no
-    /// absence before it) keeps nothing here.
+    /// Keeps the [`LimitRetry`] episode across the agent's absence and judges the relaunch's seat on its return.
     pub(super) fn limit_retry_away(
         &mut self,
         program: Program,
@@ -2943,15 +2702,12 @@ impl<C: Ctl> Session<'_, C> {
         true
     }
 
-    /// The episode is away ([`LimitRetry::away`]): kept at a point that is
-    /// not its dialog, its error or its policy's track.
+    /// Returns whether the [`LimitRetry`] episode is currently marked away.
     pub(super) fn limit_retry_is_away(&self) -> bool {
         self.limit_retry.as_ref().is_some_and(|r| r.away)
     }
 
-    /// The relaunched start-up was read as the limit and the turn-end
-    /// policy's track took it ([`Self::limit_ladder_kept`]): the absence is
-    /// over, the ladder kept by the track from here.
+    /// Clears the away state once the turn-end policy's limit track takes over after a relaunch.
     pub(super) fn limit_retry_back(&mut self) {
         if self.limit_ladder_kept()
             && let Some(retry) = self.limit_retry.as_mut()
@@ -2961,10 +2717,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// THE MODEL THE ERROR A `Stop` LEFT WAS FIRST READ UNDER
-    /// ([`LimitRetry::model`]): the footer's model on `rows`, kept from the
-    /// first read of that error while the episode stands — what
-    /// [`Self::limit_stopped`] tells a person's `/model` by.
+    /// Records the footer model when `Stop`'s error is first read under a [`LimitRetry`] episode.
     pub(super) fn limit_stopped_seat(&mut self, reading: &aterm_phase::Reading, rows: &[String]) {
         let Some(retry) = self.limit_retry.as_mut().filter(|r| r.model.is_none()) else {
             return;
@@ -2979,15 +2732,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// THE BADGE OF GEMINI CLI'S USAGE LIMIT THAT NAMES NO RESET, ITS DIALOG
-    /// ANSWERED `Stop` ([`Self::limit_stopped`]): the reason to raise it at
-    /// `point`, the error that `Stop` left, where the badge the dialog
-    /// raised is not carried there ([`Self::limit_badge_carry`]: no point
-    /// decided the dialog, [`Self::limit_stopped_adopt`]). `None` where the
-    /// episode's badge stands at this point already, on a reset the loop
-    /// placed (waited out with no one needed, as the dialog naming it is),
-    /// and on any other screen. FOREVER: the resume is typed on the ladder
-    /// all the same; this tells the person.
+    /// Returns the badge reason at `Stop`'s error when the usage-limit dialog named no placeable reset and no badge is up yet.
     pub(super) fn limit_stopped_badge(&self, point: &Turn, key: &str) -> Option<String> {
         let retry = self.limit_retry.as_ref()?;
         if retry.at_unix.is_some()
@@ -3003,37 +2748,14 @@ impl<C: Ctl> Session<'_, C> {
         ))
     }
 
-    /// The badge [`Self::limit_stopped_badge`] named raised at the point
-    /// keyed `key`: the episode's, carried as the dialog's is.
+    /// Records that the episode's badge was raised at the point keyed `key`.
     pub(super) fn limit_badge_raised(&mut self, key: &str) {
         if let Some(retry) = self.limit_retry.as_mut() {
             retry.badge = Some(key.to_string());
         }
     }
 
-    /// THE EPISODE'S BADGE CARRIED TO `turn` (keyed `key`): the badge
-    /// Gemini CLI's usage limit that names no reset raised
-    /// ([`LimitRetry::badge`]) is the one up, and `turn` is that limit
-    /// still — its dialog drawn again, or the error its `Stop` left
-    /// ([`Self::limit_stopped`]) — so the badge moves to it instead of
-    /// going with the point that left: NEEDS YOU stands from the dialog's
-    /// first read, through its `Stop`, each resume typed and each return,
-    /// till a try gets through (FOREVER: loud, never blocking). `true`:
-    /// carried. Taken down there and raised again, the badge would flap at
-    /// each step of the climb.
-    ///
-    /// AND WHILE THE LIMIT STANDS ELSEWHERE (B1 of the review of walls-3):
-    /// any point of the episode's own program or of no agent's — a
-    /// relaunch's shell and banner, the output of the `/stats model` the
-    /// badge itself suggests — carries it too, the episode standing: whether
-    /// the limit still stands there is the point's fold's to say, and where
-    /// that fold ends it (work past the limit: a try that got through), the
-    /// episode goes and the badge with it (`Session::look`'s close after the
-    /// decision, [`Self::limit_badge_stands`]). Another agent's point ends
-    /// it here (`met_under_another`). Measured before (the review's probe
-    /// `zz_b`): `CLEARED … box` at the stats' point and at a shell's, while
-    /// the same limit was still waited on, and raised again only at the next
-    /// dialog, up to six hours on.
+    /// Carries the episode's badge to `turn` (keyed `key`) while the usage limit still stands.
     pub(super) fn limit_badge_carry(&mut self, turn: &Turn, key: &str) -> bool {
         let rows = &turn.screen.rows;
         let program = self.reader(rows).program();
@@ -3060,12 +2782,7 @@ impl<C: Ctl> Session<'_, C> {
         true
     }
 
-    /// THE BADGE CARRIED OFF ITS LIMIT'S SCREEN, ITS EPISODE ENDED
-    /// ([`Self::limit_badge_carry`]): the box up is the one the badge was
-    /// carried to at a point that is neither the dialog nor its error, and
-    /// the episode is gone (the point's fold read work past the limit) or
-    /// keeps another badge. `true`: it goes now. Asked once a point's fold
-    /// is done; the carry is forgotten either way once its episode is.
+    /// Returns whether a badge carried off its limit screen should now be cleared because its episode ended.
     pub(super) fn limit_badge_off_ended(&mut self) -> bool {
         let Some(key) = self.limit_badge_away.as_deref() else {
             return false;
@@ -3081,7 +2798,7 @@ impl<C: Ctl> Session<'_, C> {
         up && !stands
     }
 
-    /// The resume typed at Gemini CLI's usage limit whose dialog was answered `Stop` ([`Self::limit_stopped`]) on `rows`, or where the ladder is kept past a relaunch ([`Self::limit_ladder_kept`]).
+    /// Records a resume typed at `Stop`'s error or while the ladder is kept across a relaunch.
     pub(super) fn limit_resume_typed(&mut self, rows: &[String]) {
         if aterm_phase::gemini::wall(rows).is_some_and(|w| aterm_phase::gemini::stopped_error(&w))
             || self.limit_ladder_kept()
@@ -3093,18 +2810,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// GEMINI CLI'S LADDER KEPT OFF ITS DIALOG (X2 of the walls-3 stage):
-    /// the episode ([`LimitRetry`]) stands, and the turn-end policy still
-    /// waits on that program's limit — the error a `Stop` left read as it
-    /// ([`Self::limit_stopped`]), held through the agent's relaunch
-    /// (`TurnEndState::relaunch_startup`). A point that is neither the
-    /// dialog nor that error keeps the episode then, so the dialog a resume
-    /// meets after the relaunch climbs from the tries before it (EVERY
-    /// RETURN CLIMBS) and its badge stands, instead of starting over at the
-    /// ladder's first rung. Measured before: the first point off the dialog
-    /// and the error (a relaunch's banner) ended the episode, and its ladder
-    /// with it. Work past the limit ends the policy's wait, and the episode
-    /// with it.
+    /// Returns whether the [`LimitRetry`] episode and the turn-end policy's limit track both stand for the same program.
     pub(super) fn limit_ladder_kept(&self) -> bool {
         self.limit_retry
             .as_ref()
@@ -3153,8 +2859,6 @@ impl<C: Ctl> Session<'_, C> {
             .and_then(|r| r.at_unix.is_none().then_some(r.reset.as_ref()).flatten())
             .map(ToString::to_string);
         let retry = aterm_phase::anchor("gemini.usage.retry");
-        // The try the dialog's options offer: its `Keep trying`, or, on the
-        // bucket's (a switch over `Stop`), its `Stop` and the typed resume.
         let labels: Vec<&str> = p.options.iter().map(|o| o.label.as_str()).collect();
         let tries_by = LimitTry::of(&labels).unwrap_or(LimitTry::KeepTrying);
         let pressed = tries_by.pressed();
@@ -3180,8 +2884,6 @@ impl<C: Ctl> Session<'_, C> {
             .as_ref()
             .is_some_and(|d| d.why == why && (d.unix_ms.div_euclid(1000) - until_unix).abs() <= 1);
         if !told {
-            // Drawn again on the resume typed at its `Stop`'s error, the
-            // line says so: that try was no `Keep trying`.
             let back = match (tries, resumed) {
                 (0, _) => String::new(),
                 (n, true) => format!(" (drawn again after its typed resume, try {n})"),
@@ -3237,19 +2939,15 @@ impl<C: Ctl> Session<'_, C> {
             retry.last_unix = Some(now);
             retry.resumed = false;
         }
-        // The dialog this press answered names no later error
-        // ([`Self::note_limit_dialog`]).
         self.limit_dialog_read = None;
     }
 
-    /// A BUSY READ while Gemini CLI's usage-limit dialog is kept trying ([`LimitRetry`]), the worker's (never one only `writing`).
+    /// Handles a busy read while a [`LimitRetry`] episode stands.
     pub(super) fn limit_retry_busy(&mut self) -> bool {
         let now = self.now_unix();
         let Some(retry) = self.limit_retry.as_ref() else {
             return false;
         };
-        // The agent away (a relaunch's start-up drawing its conversation,
-        // read busy): no try got through ([`LimitRetry::away`]).
         let in_flight = retry.away
             || retry
                 .last_unix
@@ -3575,7 +3273,6 @@ impl<C: Ctl> Session<'_, C> {
             let (now, moved) = match self.moved_past(since, by, step)? {
                 Past::Moved => (self.screen()?, true),
                 Past::Still(Some(now)) => (now, false),
-                // The step from the press ran out, the budget did not.
                 Past::Still(None) if self.fx.mono() < deadline => (self.screen()?, false),
                 still => return Ok(still),
             };
@@ -3583,11 +3280,6 @@ impl<C: Ctl> Session<'_, C> {
                 self.box_gone();
                 return Ok(Past::Moved);
             }
-            // The deny as this read shows it: a countdown first seen ticking
-            // places it, and the wait shortens to it; a countdown the read no
-            // longer shows is the deny called off (Claude Code wipes it once a
-            // key reaches the box), and the wait is the whole step again, so a
-            // box slow to leave after its key is not pressed a second time.
             until = pressed + leave_wait(pressed, self.deny_at(&now.rows));
             if !moved || self.fx.mono() >= until {
                 return Ok(Past::Still(Some(now)));

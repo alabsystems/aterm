@@ -17,7 +17,7 @@ pub const UTF8_TAIL_MAX: usize = 3;
 /// The state a hooked DCS string is carried in ([`Parser::carry_unhooking`]): the SOS/PM/APC string state with no APC consumer, whose transitions are `DcsPassthrough`'s for every byte (`tests::carry::the_hooked_string_carry_reads_every_byte_as_the_hooked_string`).
 pub const HOOKED_STRING_CARRY: State = State::SosPmApcString;
 
-/// A parser's partial state, as data (see the module docs).
+/// A parser's partial state, as data.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParserCarry {
     /// The parser state.
@@ -173,7 +173,14 @@ impl Parser {
         })
     }
 
-    /// Whether [`Parser::carry`] holds this parser's partial sequence only as one to swallow, where the live parser would still deliver it:
+    /// Whether [`Parser::carry`] holds this parser's partial sequence only as
+    /// one to swallow, where the live parser would still deliver it:
+    ///
+    /// * an OSC string whose payload is over [`OSC_CARRY_CAP`] (the live parser
+    ///   keeps up to [`MAX_OSC_DATA`], so an OSC 52 write or OSC 1337 image
+    ///   would dispatch);
+    /// * an APC string whose consumer was started (`apc_start`), which the carry
+    ///   cannot reach.
     #[inline]
     #[must_use]
     pub fn carry_swallows_sequence(&self) -> bool {

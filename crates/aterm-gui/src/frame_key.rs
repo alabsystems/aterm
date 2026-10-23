@@ -20,7 +20,7 @@ pub(crate) struct TextKey {
 
 impl TextKey {
     /// Read the current [`TextKey`] of `t` under its lock in O(1).
-    pub(crate) fn read(t: &Terminal) -> TextKey {
+    pub(crate) const fn read(t: &Terminal) -> TextKey {
         TextKey {
             identity: t.render_identity(),
             epoch: t.content_scroll_state().invalidation_epoch,
@@ -59,17 +59,17 @@ impl FrameKey {
     }
 
     /// Return the visible-text key subset.
-    pub(crate) fn text(&self) -> TextKey {
+    pub(crate) const fn text(&self) -> TextKey {
         self.text
     }
 
     /// Content sequence number at the read.
-    pub(crate) fn seq(&self) -> u64 {
+    pub(crate) const fn seq(&self) -> u64 {
         self.text.seq
     }
 
     /// Screen generation (`gen=`) at the read.
-    pub(crate) fn generation(&self) -> ScreenGen {
+    pub(crate) const fn generation(&self) -> ScreenGen {
         ScreenGen {
             epoch: self.text.epoch,
             seq: self.text.seq,

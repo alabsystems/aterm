@@ -1173,12 +1173,14 @@ impl CursorCat {
             CatReaction::Cruise | CatReaction::Discovery => {
                 if self.meteor.is_some_and(|m| now < m.squint_until()) {
                     // The flight's squint: through the flight and a beat past the
+                    // landing, outranking the idle blink.
                     EyesFrame::Happy
                 } else if crate::companion::sing_face_live(self.sing) {
                     // Singing outranks blink and uses happy eyes.
                     EyesFrame::Happy
                 } else if self.blink_active(now) {
                     // A blink outranks the cruising face (`disp` is pinned at 1.0 while typing,
+                    // so a blink gated below the happy face would never fire).
                     EyesFrame::Blink
                 } else if self.disp >= HAPPY_GATE {
                     EyesFrame::Happy

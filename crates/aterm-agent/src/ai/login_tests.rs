@@ -146,7 +146,6 @@ fn codexs_login_runs_only_when_codex_is_signed_out_because_it_revokes_first() {
             "{state:?}: a working login was left alone"
         );
     }
-    // The control: signed out, it runs, then reads its status on the login it made.
     let runner = FakeRunner::with(|call| {
         Ok(if call.args == ["login", "status"] {
             ran(0, "", "Logged in using ChatGPT\n")
@@ -218,7 +217,6 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
     let store = Store::at(&b.state);
     let shim = b.pkg.agents_dir().join("claude");
     let rig = Rig::new(&[]);
-    // No renewable row: the email is asked for, the own login listed, then renewed.
     let runner = FakeRunner::quiet();
     let done = rig.sign_in(
         &runner,
@@ -243,9 +241,7 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
         ]
     );
     assert_eq!(calls[1].args, ["harness", "accounts", "renew", "main"]);
-    // Nothing of Claude's own ran: no `claude auth login`, no `auth status`.
     assert!(calls.iter().all(|c| c.program != "claude"));
-    // A renewable row renews at once, under its label.
     let mut f = facts(&CLAUDE, shim.clone());
     f.accounts = Some(ClaudeAccounts {
         label: "m7".into(),
@@ -274,7 +270,6 @@ fn claude_signs_in_only_through_accounts_v2s_renewal() {
             .collect::<Vec<_>>(),
         [vec!["harness", "accounts", "renew", "m7"]]
     );
-    // No email given: nothing runs.
     let runner = FakeRunner::quiet();
     let done = rig.sign_in(
         &runner,
@@ -386,7 +381,6 @@ fn a_sign_in_under_another_home_records_nothing() {
     );
     assert_eq!(done, Done::SignedOut);
     assert_eq!(store.load().expect("load").of("codex"), Record::default());
-    // The control: on the default home the same answer is recorded.
     let done = Rig::new(&[]).sign_in(
         &runner,
         &store,

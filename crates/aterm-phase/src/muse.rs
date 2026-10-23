@@ -10,6 +10,9 @@ use crate::text::blank;
 use crate::turn::{CardPlace, LaunchCard};
 use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
+/// Version of the Muse Code (`muse`) harness, tracked independently per harness starting at `"0.1"`.
+pub const HARNESS_VERSION: &str = "0.1";
+
 #[derive(Debug, Clone, Copy)]
 struct Frame {
     top: usize,

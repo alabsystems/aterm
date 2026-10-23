@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `report`, over a scripted host: the joins, the start, every reason, and the
-//! requests it makes. Screens are synthetic, shaped like Claude Code's.
+//! Tests for `Session::report` over a scripted [`Ctl`] host.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -11,8 +10,7 @@ use super::super::phase::transcript_end;
 use super::super::prompt::fixtures::{composer, rows};
 use super::*;
 
-/// A scripted host: replies per request or verb, in order; every request
-/// recorded.
+/// Scripted [`Ctl`] host that records requests and returns queued replies per verb or request.
 #[derive(Default)]
 struct Host {
     replies: BTreeMap<String, VecDeque<CtlReply>>,
@@ -206,8 +204,7 @@ fn recheck(breaks: u64) -> CtlReply {
     }
 }
 
-/// A Claude Code screen: the transcript, the live zone under it (a status
-/// row and what hangs under it), the composer frame and a footer.
+/// Build a Claude Code screen from `transcript` rows, `live` status rows, and a composer frame.
 fn claude(transcript: &[&str], live: &[&str]) -> Vec<String> {
     let mut r = rows(transcript);
     r.extend(rows(live));
@@ -217,7 +214,6 @@ fn claude(transcript: &[&str], live: &[&str]) -> Vec<String> {
 
 fn fixture(text: &str) -> Vec<String> {
     let mut r: Vec<String> = text.lines().map(str::to_string).collect();
-    // The capture's own first and last lines are not the screen.
     if r.first().is_some_and(|l| l.starts_with("== ")) {
         r.remove(0);
     }
@@ -236,9 +232,6 @@ fn run(host: &mut Host, opts: ReportOpts) -> Report {
 const LEVER: &str = "Go on the amended lever, with one correction: the ghost-key \
                      site comment says that entry is not safe to replay.";
 
-/// The whole path: the ledger's mark, one `offscreen` read, the `back` rows skipped, the live
-/// zone cut, and the start at a user row whose first 60 characters wrap; every transcript row
-/// is kept.
 #[test]
 fn a_turn_that_scrolled_off_is_joined_back_from_its_user_row() {
     let screen = claude(
@@ -314,8 +307,6 @@ fn a_turn_that_scrolled_off_is_joined_back_from_its_user_row() {
             "",
             "⏺ Waiting for your go on the checker?",
             "",
-            // The done row that ends the turn is the transcript's, not the
-            // live zone's: kept.
             "✻ Cooked for 4s · done 2:41 PM",
         ])
     );
@@ -323,15 +314,12 @@ fn a_turn_that_scrolled_off_is_joined_back_from_its_user_row() {
         report.render(),
         format!("{}\n--\n{}\n", report.header(), report.rows.join("\n"))
     );
-    // The same read through a raw client (the header as stdout's first line)
-    // is the same report.
     let mut host = Host::default()
         .on("history", history(&[(42, true, "7730:100", LEVER)]))
         .on("offscreen", read.raw());
     assert_eq!(run(&mut host, ReportOpts::default()), report);
 }
 
-/// A user block wrapped over seven rows (`wait_bg2`), nothing archived yet, is the start.
 #[test]
 fn a_wrapped_user_block_on_the_screen_is_the_start() {
     let screen = fixture(super::super::prompt::fixtures::WAIT_BG2);
@@ -352,14 +340,6 @@ fn a_wrapped_user_block_on_the_screen_is_the_start() {
     assert!(report.rows[6].starts_with("  Report after each site"));
 }
 
-/// THE WINDOW HARNESS'S OWN TURNS NEVER HIDE THE ONE A REPORT STARTS FROM.
-/// Each `keep going`, done check and `/usage` it types is a ledger row
-/// (`by=harness`), so more of them since the manager's turn than the first
-/// read holds (`history 8`) leave that read with no turn to start from: the
-/// report then reads the whole ledger (`history`) and starts at the
-/// manager's turn (`marker=ledger turn=9`), never at the newest `❯` row,
-/// the harness's own. NEGATIVE CONTROL: with the manager's turn among the
-/// newest eight, one read.
 #[test]
 fn a_report_reads_past_the_harness_turns_to_the_managers() {
     let screen = fixture(super::super::prompt::fixtures::WAIT_BG2);
@@ -404,8 +384,6 @@ fn a_report_reads_past_the_harness_turns_to_the_managers() {
         report.header()
     );
 
-    // NEGATIVE CONTROL: the manager's turn within the first read (it and
-    // seven of the harness's).
     let near = ledger(10..17);
     let mut host = Host::default()
         .on("history", newest(&near, 8))
@@ -427,12 +405,6 @@ fn a_report_reads_past_the_harness_turns_to_the_managers() {
     );
 }
 
-/// THE REPORT'S SCREEN IS A WHOLE FRAME (F4 of the half-drawn frame review, 2026-10-22): an
-/// `offscreen … screen=1` read whose screen half caught the program's DEC 2026 frame unfinished
-/// (`frame=open`, the server's word under the rows' lock) is read again after `await frame`, as
-/// every supervisor read of the screen is ([`Session::whole_frame`]); the report is the whole
-/// frame's. NEGATIVE CONTROL: a read with no `frame=open` (closed, or a host before the field) is
-/// read once. MUTANT: the open read taken as it stands reports the half-drawn screen.
 #[test]
 fn an_offscreen_read_of_an_open_frame_is_read_again_whole() {
     let whole = claude(
@@ -445,7 +417,6 @@ fn an_offscreen_read_of_an_open_frame_is_read_again_whole() {
         ],
         &["✶ Deliberating… (4s)"],
     );
-    // The redraw caught after its first rows: the transcript's top, no live zone, no composer.
     let half: Vec<String> = whole[..3].to_vec();
     let mut open = Read::new(1, &[], half);
     open.open = true;
@@ -466,7 +437,6 @@ fn an_offscreen_read_of_an_open_frame_is_read_again_whole() {
     );
     assert_eq!(report.rows, rows(&["❯ second message", "⏺ working on it"]));
 
-    // NEGATIVE CONTROL: the whole read is read once.
     let mut host = Host::default()
         .on("history", no_history())
         .on("offscreen", Read::new(1, &[], whole).ctl());
@@ -481,8 +451,6 @@ fn an_offscreen_read_of_an_open_frame_is_read_again_whole() {
     assert_eq!(report.rows, rows(&["❯ second message", "⏺ working on it"]));
 }
 
-/// Without a ledger turn the report opens at the last transcript `❯` row, never a message
-/// queued under the status row; a ledger turn only in that queue is marker-not-found.
 #[test]
 fn a_queued_message_under_the_status_row_is_not_a_marker() {
     let screen = claude(
@@ -525,7 +493,6 @@ fn a_queued_message_under_the_status_row_is_not_a_marker() {
     let report = run(&mut host, ReportOpts::default());
     assert_eq!(report.reasons, [Reason::MarkerNotFound]);
     assert_eq!(report.rows.len(), 4, "everything read, from the top");
-    // Blank rows at either end are not rows the report holds.
     let read = Read::new(1, &["", "⏺ a", ""], claude(&["", "⏺ b", ""], &[]));
     let mut host = Host::default()
         .on("history", history(&[(3, true, "7730:0", "nowhere")]))
@@ -535,8 +502,6 @@ fn a_queued_message_under_the_status_row_is_not_a_marker() {
     assert_eq!((report.archived, report.screen), (2, 2));
 }
 
-/// A message starting with `1.` is a user row (a prompt's options are indented), and a newest
-/// turn whose submit did not land is passed over.
 #[test]
 fn a_message_that_starts_with_a_number_is_found() {
     let screen = claude(
@@ -584,7 +549,6 @@ fn a_message_that_starts_with_a_number_is_found() {
     );
 }
 
-/// A long paste opens at the last `[Pasted text #N …]` row, not the earlier turn's above it.
 #[test]
 fn a_long_paste_opens_at_the_last_pasted_row() {
     let text: String = (1..=40)
@@ -610,8 +574,6 @@ fn a_long_paste_opens_at_the_last_pasted_row() {
     );
 }
 
-/// A host without `offscreen` (`ERR unknown verb`, or `ERR denied` across sessions) or a client
-/// that relays no header falls back to the whole screen, no-archive.
 #[test]
 fn an_old_host_reports_from_the_screen_alone() {
     let screen = claude(&["❯ Keep going", "⏺ Kept going.", ""], &[]);
@@ -630,8 +592,6 @@ fn an_old_host_reports_from_the_screen_alone() {
         stdout: "⏺ some row\n".to_string(),
         stderr: String::new(),
     };
-    // An `aterm ctl` that predates `offscreen` frames the unknown verb as a
-    // STATUS line: `OK <n> first=…` on stdout, the rows dropped.
     let status_only = ok(
         "OK 12 first=1 last=5 lost=0 breaks=0 back=0 epoch=1 origin=7730 alt=1 seq=9 \
          screen_rows=7\n",
@@ -656,7 +616,6 @@ fn an_old_host_reports_from_the_screen_alone() {
         );
         assert_eq!(report.rows, rows(&["❯ Keep going", "⏺ Kept going."]));
     }
-    // A host that has neither `history` nor `offscreen` (nor `status`).
     let mut host = Host::default()
         .on("history", err("unknown verb (try: help)"))
         .on("offscreen", err("unknown verb (try: help)"))
@@ -667,7 +626,6 @@ fn an_old_host_reports_from_the_screen_alone() {
     assert_eq!(report.reasons, [Reason::NoArchive]);
 }
 
-/// An archive other than the mark's (a restart, a handoff) is archive-reset.
 #[test]
 fn another_origin_is_an_archive_reset() {
     let mut read = Read::new(
@@ -691,8 +649,6 @@ fn another_origin_is_an_archive_reset() {
     );
 }
 
-/// A gap at the mark leaves the report complete, one after the start is archive-gap, and a
-/// start on the screen needs no second read.
 #[test]
 fn a_gap_after_the_mark_counts_only_after_the_start() {
     let archived = ["⏺ before", "❯ Keep going", "⏺ Kept going."];
@@ -711,7 +667,6 @@ fn a_gap_after_the_mark_counts_only_after_the_start() {
         assert_eq!(report.reasons, want);
         assert_eq!(report.archived, 2);
     }
-    // The start on the screen: no second read.
     let mut read = Read::new(
         103,
         &["⏺ before"],
@@ -725,7 +680,6 @@ fn a_gap_after_the_mark_counts_only_after_the_start() {
     let report = run(&mut host, ReportOpts::default());
     assert_eq!(host.requests.len(), 2);
     assert!(report.complete(), "{}", report.header());
-    // A lost connection on the second read is not a gap: it is an error.
     let mut read = Read::new(103, &archived, claude(&["⏺ More."], &[]));
     read.breaks = 1;
     let mut host = Host::default()
@@ -738,14 +692,9 @@ fn a_gap_after_the_mark_counts_only_after_the_start() {
     assert!(err.contains("server closed the connection"), "{err}");
 }
 
-/// After `--since` every row counts: an eviction, a gap or a cut page makes it incomplete, and
-/// a cut page keeps the screen's rows it did not read.
 #[test]
 fn since_counts_every_row_after_it() {
     let since = Mark::parse("7730:200");
-    // Rows 203..=206 were archived; the page held 203 and 204 (`last=` is the
-    // page's own last row). The screen's top three rows are 204..=206: 204 was
-    // read, the other two were not.
     let mut read = Read::new(
         203,
         &["⏺ a", "⏺ b"],
@@ -774,7 +723,6 @@ fn since_counts_every_row_after_it() {
          archived=2 screen=3 last=7730:204"
     );
     assert_eq!(report.rows, rows(&["⏺ a", "⏺ b", "⏺ c", "⏺ d", "⏺ e"]));
-    // Read to the end, the `back` rows at the top of the screen are skipped.
     let mut read = Read::new(203, &["⏺ a", "⏺ b"], claude(&["⏺ b", "⏺ c"], &[]));
     read.back = 1;
     let mut host = Host::default().on("offscreen", read.ctl());
@@ -789,9 +737,6 @@ fn since_counts_every_row_after_it() {
     assert_eq!(report.rows, rows(&["⏺ a", "⏺ b", "⏺ c"]));
 }
 
-/// The ledger's page cut short by `--max-rows` misses the middle (max-rows);
-/// a worker off the alternate screen that draws no main-screen transcript
-/// this report reads (Claude Code's inline renderer) is main-screen.
 #[test]
 fn a_cut_page_and_the_main_screen_are_incomplete() {
     let mut read = Read::new(101, &["❯ Keep going", "⏺ one"], claude(&["⏺ ten"], &[]));
@@ -821,7 +766,6 @@ fn a_cut_page_and_the_main_screen_are_incomplete() {
     assert_eq!(report.rows, rows(&["❯ Keep going", "ok", "$"]));
 }
 
-/// A request not served, or a session gone, is an error, never an empty report.
 #[test]
 fn a_lost_or_gone_session_is_an_error() {
     let mut host = Host::default().on("history", closed());
@@ -838,8 +782,6 @@ fn a_lost_or_gone_session_is_an_error() {
     assert!(e.contains("offscreen failed: aterm-ctl: ERR exited"), "{e}");
 }
 
-/// A mark, a `history` line and an `offscreen` header in each place a client leaves it, and
-/// every way one can be wrong.
 #[test]
 fn the_readers_match_the_wire() {
     assert_eq!(
@@ -895,8 +837,6 @@ fn the_readers_match_the_wire() {
             },
         ]
     );
-    // The harness's own turn is never the report's start, newer and
-    // submitted as it is; without it the newest submitted turn is.
     assert_eq!(newest_turn(turns.clone()).map(|t| t.id), Some(4));
     assert_eq!(newest_turn(turns[..2].to_vec()).map(|t| t.id), Some(4));
     assert_eq!(newest_turn(turns[1..2].to_vec()).map(|t| t.id), Some(5));
@@ -907,8 +847,6 @@ fn the_readers_match_the_wire() {
     );
     assert_eq!(newest_turn(vec![]), None);
 
-    // An empty archive and screen: `aterm ctl` prints the header with its
-    // no-results note.
     let empty = CtlReply {
         code: 0,
         stdout: String::new(),
@@ -919,13 +857,11 @@ fn the_readers_match_the_wire() {
     let off = parse_offscreen(&empty).expect("parses");
     assert_eq!((off.first, off.last, off.origin), (1, 0, 5));
     assert!(off.archived.is_empty() && off.screen.is_empty() && off.alt);
-    // Blank rows are rows.
     let read = Read::new(7, &["", "x", ""], rows(&["", ""]));
     let off = parse_offscreen(&read.ctl()).expect("parses");
     assert_eq!(off.archived, rows(&["", "x", ""]));
     assert_eq!(off.screen, rows(&["", ""]));
     assert_eq!(parse_offscreen(&read.raw()), Ok(off));
-    // What does not add up.
     let mut short = read.ctl();
     short.stdout.push_str("one too many\n");
     assert!(matches!(
@@ -956,8 +892,6 @@ fn the_readers_match_the_wire() {
     );
 }
 
-/// The transcript ends by position: at the status row; above an idle composer and what is
-/// parked there; without a frame, after the last non-blank row.
 #[test]
 fn the_transcript_ends_at_the_live_zone() {
     let idle = fixture(super::super::prompt::fixtures::IDLE_AFTER_LIMIT_AND_MODEL_SWITCH);
@@ -976,7 +910,6 @@ fn the_transcript_ends_at_the_live_zone() {
             "  ⎿  Tip: Share Claude Code and earn credits",
             "● How is Claude doing this session? (optional)",
             "  1: Bad    2: Fine   3: Good   0: Dismiss",
-            // Parked against the right edge: two columns short of the rule.
             &format!("{:>118}", "✔ Update installed"),
             "",
         ],
@@ -989,9 +922,6 @@ fn the_transcript_ends_at_the_live_zone() {
     assert_eq!(transcript_end(&rows(&["", ""])), 0);
 }
 
-// ---- report opening and row edge cases
-
-/// A short turn is never a paste: an earlier turn's paste row is not its start.
 #[test]
 fn the_paste_fallback_never_claims_an_older_turns_paste() {
     let screen = claude(
@@ -1020,7 +950,6 @@ fn the_paste_fallback_never_claims_an_older_turns_paste() {
     );
 }
 
-/// A draft starting with `1.` in the composer is the composer, not an option row or the start.
 #[test]
 fn a_numbered_draft_in_the_composer_is_not_the_start() {
     let rule = "─".repeat(120);
@@ -1048,8 +977,6 @@ fn a_numbered_draft_in_the_composer_is_not_the_start() {
     );
 }
 
-/// Above an idle composer, a last row indented 20+ columns is code and kept; a hint is parked
-/// against the right edge.
 #[test]
 fn indented_code_above_an_idle_composer_survives() {
     let screen = claude(
@@ -1073,7 +1000,6 @@ fn indented_code_above_an_idle_composer_survives() {
     );
 }
 
-/// The done row that ends an idle turn is kept verbatim, not cut as the status row.
 #[test]
 fn the_done_row_that_ends_a_turn_is_kept() {
     let screen = claude(
@@ -1102,7 +1028,6 @@ fn the_done_row_that_ends_a_turn_is_kept() {
     );
 }
 
-/// An archive that is off (`enabled=0`) is no-archive even with the start found.
 #[test]
 fn an_archive_that_is_off_is_no_archive() {
     let screen = claude(&["❯ Keep going", "⏺ Kept going.", ""], &[]);
@@ -1117,8 +1042,6 @@ fn an_archive_that_is_off_is_no_archive() {
     assert_eq!(report.rows, rows(&["❯ Keep going", "⏺ Kept going."]));
 }
 
-/// Re-shown rows at `pin..pin+back` are skipped, the pinned header above them is not, and a
-/// re-shown row this read did not get is kept from the screen.
 #[test]
 fn the_join_skips_the_reshown_rows_under_a_pinned_header() {
     let screen = claude(&["== pinned header ==", "⏺ b", "⏺ c"], &[]);
@@ -1135,7 +1058,6 @@ fn the_join_skips_the_reshown_rows_under_a_pinned_header() {
         report.rows,
         rows(&["❯ Go", "⏺ a", "⏺ b", "== pinned header ==", "⏺ c"])
     );
-    // `back_at=` past what the page got: nothing is skipped.
     let mut read = Read::new(101, &["❯ Go", "⏺ a"], screen);
     read.back = 1;
     read.pin = 1;
@@ -1151,8 +1073,6 @@ fn the_join_skips_the_reshown_rows_under_a_pinned_header() {
     );
 }
 
-/// The last paste row is the turn's only when its line count fits the text; an older paste
-/// row further up is never reached for.
 #[test]
 fn a_paste_row_that_does_not_fit_the_turn_is_not_the_start() {
     let text: String = (1..=12).map(|i| format!("step {i}\n")).collect();
@@ -1177,11 +1097,6 @@ fn a_paste_row_that_does_not_fit_the_turn_is_not_the_start() {
     );
 }
 
-// ---- the report's two views
-
-/// On a real worker's screen: the default view is byte-identical to the view-less report,
-/// `--final` is the last message and its done row, and `--messages` keeps the message blocks,
-/// the `❯` row and the done rows while dropping every tool row and its `⎿` output.
 #[test]
 fn the_views_keep_the_worker_words_and_drop_the_tool_rows() {
     let screen = fixture(super::super::prompt::fixtures::IDLE_AFTER_LIMIT_AND_MODEL_SWITCH);
@@ -1195,7 +1110,6 @@ fn the_views_keep_the_worker_words_and_drop_the_tool_rows() {
     };
     let host = || Host::default().on("offscreen", Read::new(1, &[], screen.clone()).ctl());
     let report = run(&mut host(), opts(View::All));
-    // The default is unchanged: the same bytes, no `view=` in the header.
     assert_eq!(report.render_view(View::All), report.render());
     assert!(!report.header().contains("view="), "{}", report.header());
 
@@ -1244,7 +1158,6 @@ fn the_views_keep_the_worker_words_and_drop_the_tool_rows() {
             "the messages view kept a tool row: {row:?}"
         );
     }
-    // Every kept row is a row the report holds, in its order.
     let mut at = 0;
     for row in &kept {
         if row.is_empty() {
@@ -1258,8 +1171,6 @@ fn the_views_keep_the_worker_words_and_drop_the_tool_rows() {
     }
 }
 
-/// `--final` on a worker whose message head scrolled off (`wait_bg3`) keeps its words and the
-/// done row; the composer, its footer and the live zone are not report rows.
 #[test]
 fn a_final_view_of_a_headless_message_keeps_its_words_and_its_done_row() {
     let screen = fixture(super::super::prompt::fixtures::WAIT_BG3);

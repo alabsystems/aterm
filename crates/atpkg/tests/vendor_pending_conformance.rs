@@ -15,8 +15,6 @@ use atpkg::flow::{VendorFetchError, VendorGet};
 use atpkg::store::Layout;
 use atpkg::vendor_direct::watch::{ConcurrentVendorGetFn, HeadWatch};
 
-/// A store of the test's own: its prefix is a fresh directory that goes with the
-/// fixture, failed or not.
 struct Fixture {
     layout: Layout,
     _scratch: aterm_tempfile::TempDir,
@@ -54,14 +52,8 @@ fn modeled_pending(state: &BTreeMap<&'static str, i64>) -> usize {
         .count()
 }
 
-/// The longest one park waits for a worker's wake. Not a budget: a finished worker
-/// unparks the watch at once, and this only bounds a wake that raced the park.
 const HINT_SLICE: Duration = Duration::from_millis(20);
 
-/// Park for the workers' hints and harvest at `now`, collecting every offer into
-/// `offers`, until `arrived` holds — at once if it already does. A wait for what
-/// MUST happen: a hang detector at [`MUST_HAPPEN`], never a latency budget, so a
-/// loaded host only slows it and a watch that never delivers is named at the minute.
 fn harvest_until(
     watch: &mut HeadWatch,
     layout: &Layout,

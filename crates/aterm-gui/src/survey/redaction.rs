@@ -230,7 +230,7 @@ fn contains_ascii_word_pair(text: &str, first: &str, second: &str) -> bool {
 /// Where the token-shape rule splits a line into the tokens it judges with
 /// [`looks_like_raw_credential`]: whitespace, quotes and the punctuation that wraps a value in
 /// prose or structured text.
-pub(super) fn is_token_break(ch: char) -> bool {
+pub(super) const fn is_token_break(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
             ch,

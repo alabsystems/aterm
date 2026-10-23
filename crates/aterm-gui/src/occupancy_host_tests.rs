@@ -165,10 +165,11 @@ fn the_board_logs_a_change_of_its_slots_or_disk_word_only() {
 }
 
 /// A look stores the board it took, whatever the process holds, and every
-/// host reads it (the only test that touches the stored board).
+/// host reads it (the only test that touches the stored board). A poke's
+/// look, which takes no ring row.
 #[test]
 fn a_look_stores_the_board_it_took() {
-    look(NOW, &[]);
+    look(NOW, &[], Look::Poke);
     let r = reading_for("any");
     assert_eq!(r.taken_ms, NOW);
     assert_eq!(r.held_slot_last_ms, None);
@@ -749,4 +750,408 @@ fn a_stale_board_reserves_no_slot() {
         board_with(&mut j, NOW, 2, None);
         assert_eq!(j.pace("a", RuleId::HoldRoom, NOW, at), grant, "{at}");
     }
+}
+
+// SURFACING (slice 1e): the told word, the ready proxy, the slot-minutes idle while ready, the
+// status fields and the `occupancy` verb's replies.
+
+use aterm_agent::supervise::occupancy::rules::Guards;
+use aterm_agent::supervise::occupancy::{SaidHold, SaidRule, SaidVerdict};
+use aterm_agent::supervise::{Autopilot, Guard};
+
+const HOUR_MS: i64 = 60 * MIN_MS;
+
+/// A word told under `mode` with a hold begun at `since` (none for `None`), each rule `verdicts`,
+/// `guard` holding at its break (a brake where it is neither a person's nor a draft's).
+fn said(
+    mode: Occupancy,
+    since: Option<i64>,
+    verdicts: [SaidVerdict; 2],
+    guard: Option<Guard>,
+) -> OccupancySaid {
+    OccupancySaid {
+        mode,
+        hold: since.map(|since_ms| SaidHold {
+            since_ms,
+            declared: false,
+        }),
+        ready: false,
+        guards: Some(Guards {
+            person: guard == Some(Guard::Person),
+            draft: guard == Some(Guard::Draft),
+            brake: guard.filter(|g| !matches!(g, Guard::Person | Guard::Draft)),
+            ..Guards::clear(Autopilot::Cruise)
+        }),
+        rules: [
+            SaidRule {
+                rule: RuleId::WaitNudge,
+                verdict: verdicts[0],
+                at_ms: NOW,
+            },
+            SaidRule {
+                rule: RuleId::HoldRoom,
+                verdict: verdicts[1],
+                at_ms: NOW,
+            },
+        ],
+        at_ms: NOW,
+        reading: OccupancyReading::default(),
+    }
+}
+
+const QUIET: [SaidVerdict; 2] = [SaidVerdict::Quiet, SaidVerdict::Quiet];
+
+/// Thirty-one looks a minute apart from [`NOW`], one slot of three free and holders in tab 7
+/// (session `a`'s) and tab 9 (session `b`'s), the machine with room: what each look's row says.
+fn thirty_minutes(j: &mut Judged, sessions: &[(u64, String)]) -> Vec<RingRow> {
+    (0..=30)
+        .map(|m| {
+            let t = NOW + m * MIN_MS;
+            let snap = at(
+                t,
+                THREE_ONE_FREE,
+                Pressure::Normal,
+                Some(0),
+                Some(vec![7, 9]),
+            );
+            step(j, &snap, t, sessions);
+            j.look_row(sessions, t)
+        })
+        .collect()
+}
+
+/// THE READY PROXY AND THE SLOT-MINUTES IDLE WHILE READY: a told hold past two hours in a
+/// session whose tab held a slot reads ready once the board's slot term spans its twenty
+/// minutes, and each look from then counts one slot-minute (one usable slot, one ready
+/// session). NEGATIVE CONTROLS: a hold under two hours (in a tab that held a slot too, so the
+/// two hours are all it lacks), a closed hold, and a session nothing was told of are never
+/// ready, and with none ready no minute counts.
+#[test]
+fn a_told_hold_past_two_hours_is_ready_while_a_slot_stands_free() {
+    let sessions = [
+        (7, "a".to_string()),
+        (9, "b".to_string()),
+        (11, "c".to_string()),
+    ];
+    let mut j = Judged::default();
+    j.tell(
+        "a",
+        Some(said(
+            Occupancy::Observe,
+            Some(NOW - 3 * HOUR_MS),
+            QUIET,
+            Some(Guard::Person),
+        )),
+    );
+    j.tell(
+        "b",
+        Some(said(
+            Occupancy::Observe,
+            Some(NOW - 10 * MIN_MS),
+            QUIET,
+            None,
+        )),
+    );
+    let rows = thirty_minutes(&mut j, &sessions);
+    let ready = |row: &RingRow, sid: &str| row.session(sid).is_some_and(|s| s.ready);
+    let first = rows
+        .iter()
+        .position(|row| ready(row, "a"))
+        .expect("a reads ready");
+    assert!(
+        rows[first].at >= NOW + 20 * MIN_MS,
+        "the slot term's twenty minutes"
+    );
+    assert!(rows[first..].iter().all(|row| ready(row, "a")));
+    assert!(
+        rows.iter()
+            .all(|row| row.session("b").and_then(|s| s.held_ms) == Some(row.at)),
+        "b's tab holds a slot at every look: only its hold's age keeps it from ready"
+    );
+    assert!(rows.iter().all(|row| !ready(row, "b") && !ready(row, "c")));
+    assert_eq!(
+        rows[0].session("a").and_then(|s| s.guard.as_deref()),
+        Some("person"),
+        "the told guard is the row's"
+    );
+    assert_eq!(rows[0].session("a").and_then(|s| s.held_ms), Some(NOW));
+    let looks = u64::try_from(rows.len() - first).unwrap();
+    assert_eq!(j.ready_now(), 1);
+    assert_eq!(j.idle_ready_min(NOW + 30 * MIN_MS), looks);
+
+    // A closed hold is no longer ready, and the minutes stop.
+    j.tell("a", Some(said(Occupancy::Observe, None, QUIET, None)));
+    let t = NOW + 31 * MIN_MS;
+    step(
+        &mut j,
+        &at(t, THREE_ONE_FREE, Pressure::Normal, Some(0), Some(vec![7])),
+        t,
+        &sessions,
+    );
+    let row = j.look_row(&sessions, t);
+    assert!(!ready(&row, "a"));
+    assert_eq!(j.ready_now(), 0);
+    assert_eq!(j.idle_ready_min(t), looks, "no minute added");
+}
+
+/// The rows a predecessor's ring left are taken once, the newest day of them.
+#[test]
+fn the_ring_seeds_the_rows_once() {
+    let row = |at: i64| RingRow {
+        at,
+        ..RingRow::default()
+    };
+    let mut j = Judged::default();
+    let total = ring::RING_ROWS + 5;
+    j.seed_rows(
+        (0..total)
+            .map(|i| row(NOW + i64::try_from(i).unwrap()))
+            .collect(),
+    );
+    assert_eq!(j.rows.len(), ring::RING_ROWS);
+    assert_eq!(j.rows.front().map(|r| r.at), Some(NOW + 5));
+    j.seed_rows(vec![row(0)]);
+    assert_eq!(j.rows.len(), ring::RING_ROWS, "taken once");
+}
+
+/// The status fields name the owner's mode, the session's told hold, the sessions ready, the
+/// board's slots and the idle minutes: asserted by key, not by the whole line.
+#[test]
+fn the_status_fields_say_the_mode_the_hold_and_the_slots() {
+    let fields = |words: &str| -> BTreeMap<String, String> {
+        words
+            .split(' ')
+            .filter_map(|w| w.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let keys = |words: &str| -> Vec<String> {
+        words
+            .split(' ')
+            .filter_map(|w| w.split_once('=').map(|(k, _)| k.to_string()))
+            .collect()
+    };
+    let none = status_words(Occupancy::Observe, None, Some("a"), NOW);
+    assert_eq!(
+        keys(&none),
+        [
+            "occupancy",
+            "occupancy_hold",
+            "ready",
+            "slots",
+            "idle_ready_min"
+        ]
+    );
+    let f = fields(&none);
+    assert_eq!(f["occupancy"], "observe");
+    assert_eq!(f["occupancy_hold"], "none");
+    assert_eq!(f["slots"], "-");
+    assert_eq!(f["ready"], "0");
+
+    let sessions = [(7, "a".to_string())];
+    let mut j = Judged::default();
+    j.tell(
+        "a",
+        Some(said(
+            Occupancy::Prompt,
+            Some(NOW - 3 * HOUR_MS),
+            QUIET,
+            None,
+        )),
+    );
+    let _ = thirty_minutes(&mut j, &sessions);
+    let now = NOW + 30 * MIN_MS;
+    let words = status_words(Occupancy::Prompt, Some(&j), Some("a"), now);
+    assert_eq!(keys(&words), keys(&none), "one field set");
+    let f = fields(&words);
+    assert_eq!(f["occupancy"], "prompt");
+    assert_eq!(f["occupancy_hold"], "undeclared");
+    assert_eq!(f["ready"], "1");
+    assert_eq!(f["slots"], "1/3");
+    assert_eq!(f["idle_ready_min"], j.idle_ready_min(now).to_string());
+    // Another session's hold is its own.
+    let other = fields(&status_words(Occupancy::Prompt, Some(&j), Some("z"), now));
+    assert_eq!(other["occupancy_hold"], "none");
+    assert_eq!(
+        fields(&status_words(Occupancy::Off, Some(&j), None, now))["occupancy"],
+        "off"
+    );
+}
+
+/// The reply's `OK <n>` and its lines.
+fn reply_lines(reply: &str) -> Vec<String> {
+    let mut lines = reply.lines();
+    let head = lines.next().expect("a head");
+    let n: usize = head
+        .strip_prefix("OK ")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("an OK head: {reply}"));
+    let lines: Vec<String> = lines.map(str::to_string).collect();
+    assert_eq!(lines.len(), n, "{reply}");
+    lines
+}
+
+/// `occupancy why` against a scripted word: the head line names the mode, a line each rule,
+/// and the guards' line; with nothing told, the mode and `unsaid`.
+#[test]
+fn why_answers_the_told_word_or_unsaid() {
+    let s = said(
+        Occupancy::Observe,
+        Some(NOW - 45 * MIN_MS),
+        [SaidVerdict::Would, SaidVerdict::Held(Guard::Draft)],
+        Some(Guard::Draft),
+    );
+    let lines = reply_lines(&why_reply(Occupancy::Observe, Some(&s), NOW, 0));
+    assert_eq!(lines.len(), 4, "{lines:#?}");
+    assert!(
+        lines[0].starts_with("occupancy=observe hold undeclared "),
+        "{lines:#?}"
+    );
+    assert!(
+        lines[1].starts_with("wait-nudge@v1 rev=builtin would "),
+        "{lines:#?}"
+    );
+    assert!(
+        lines[2].starts_with("hold-room@v1 rev=builtin held:draft "),
+        "{lines:#?}"
+    );
+    assert!(lines[3].trim_start().starts_with("guards: "), "{lines:#?}");
+    assert!(lines[3].contains("draft ✗"), "{lines:#?}");
+    assert_eq!(
+        lines[3].matches('✗').count(),
+        1,
+        "draft alone holds: {lines:#?}"
+    );
+    let unsaid = reply_lines(&why_reply(Occupancy::Prompt, None, NOW, 0));
+    assert_eq!(unsaid, ["occupancy=prompt unsaid"]);
+}
+
+/// A `fact-hold@v1` ledger row of session `sid` at `ts` with `reason`, as the loop books it.
+fn hold_row(ts: i64, sid: &str, reason: &str) -> String {
+    format!(
+        "{{\"ts\":{ts},\"sid\":\"{sid}\",\"rule_id\":\"fact-hold@v1\",\"decision\":\"waiting\",\
+         \"command\":\"\",\"reason\":\"{reason}\"}}"
+    )
+}
+
+/// `occupancy check --replay` over the board's own rows and the session's ledger: the hold the
+/// ledger opened three hours back gives the nudge at the first look and `hold-room` once the
+/// slot term spans its twenty minutes. NEGATIVE CONTROL: a ledger with no hold rows gives no
+/// line of either.
+#[test]
+fn check_replay_runs_the_decider_over_the_rows_and_the_ledger() {
+    let sessions = [(7, "a".to_string())];
+    let mut j = Judged::default();
+    let rows = thirty_minutes(&mut j, &sessions);
+    let since = NOW - 3 * HOUR_MS;
+    let ledger = format!(
+        "{}\n{}\n",
+        hold_row(since + 10 * MIN_MS, "a", "hold=open held_ms=600000"),
+        hold_row(
+            since + 20 * MIN_MS,
+            "b",
+            "hold=closed why=point held_ms=600000"
+        ),
+    );
+    let window = (NOW, NOW + 30 * MIN_MS);
+    let lines = reply_lines(&replay_reply("a", &rows, &ledger, window, 0));
+    assert!(
+        lines[0].contains(&format!("looks={}", rows.len())),
+        "{lines:#?}"
+    );
+    assert!(lines[0].ends_with("holds=1"), "{lines:#?}");
+    let changes: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.split_once(' ').map(|(_, rest)| rest))
+        .filter(|rest| rest.ends_with(" would"))
+        .collect();
+    assert_eq!(
+        changes,
+        ["wait-nudge@v1 would", "hold-room@v1 would"],
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.ends_with("first would never")),
+        "{lines:#?}"
+    );
+
+    let none = reply_lines(&replay_reply("a", &rows, "", window, 0));
+    assert!(none[0].ends_with("holds=0"), "{none:#?}");
+    assert_eq!(
+        none.iter()
+            .filter(|l| l.ends_with("first would never"))
+            .count(),
+        2,
+        "{none:#?}"
+    );
+    assert!(!none.iter().any(|l| l.ends_with(" would")), "{none:#?}");
+}
+
+/// The verb's forms: `why` (also bare), `check --replay <dur>` with a window it takes; anything
+/// else is its usage.
+#[test]
+fn the_verb_takes_its_forms_and_refuses_others() {
+    for rest in ["", "why", "  why  "] {
+        assert!(
+            cmd_occupancy(Some("s-none"), rest).starts_with("OK 1\noccupancy="),
+            "{rest:?}"
+        );
+    }
+    assert!(cmd_occupancy(Some("s-none"), "check --replay 24h").starts_with("OK "));
+    for rest in [
+        "check",
+        "check --replay",
+        "check --replay 3d",
+        "check --replay soon",
+        "why not",
+        "bogus",
+    ] {
+        assert_eq!(cmd_occupancy(Some("s-none"), rest), USAGE, "{rest:?}");
+    }
+    assert!(cmd_occupancy(None, "check --replay 1h").starts_with("ERR occupancy"));
+}
+
+/// A POKE BETWEEN THE MINUTE'S LOOKS TAKES NO ROW (the facts ring is a row a minute, §6): the
+/// board is taken afresh, but the rows, the sessions ready and the slot-minutes are the ticks'
+/// alone, so a day of rows stays a day however often the disk watch is poked. NEGATIVE
+/// CONTROL: each tick takes its row.
+#[test]
+fn a_poke_between_ticks_takes_no_row() {
+    let sessions = [(7, "a".to_string())];
+    let mut j = Judged::default();
+    j.tell(
+        "a",
+        Some(said(
+            Occupancy::Observe,
+            Some(NOW - 3 * HOUR_MS),
+            QUIET,
+            None,
+        )),
+    );
+    let mut ticks = 0;
+    for m in 0..=30 {
+        let t = NOW + m * MIN_MS;
+        let snap = at(t, THREE_ONE_FREE, Pressure::Normal, Some(0), Some(vec![7]));
+        step(&mut j, &snap, t, &sessions);
+        assert!(j.looked(&sessions, t, Look::Tick).is_some(), "a tick's row");
+        ticks += 1;
+        for poke in 1..=3 {
+            let t = t + poke * 10_000;
+            let snap = at(t, THREE_ONE_FREE, Pressure::Normal, Some(0), Some(vec![7]));
+            step(&mut j, &snap, t, &sessions);
+            assert!(
+                j.looked(&sessions, t, Look::Poke).is_none(),
+                "a poke's none"
+            );
+        }
+    }
+    assert_eq!(j.rows.len(), ticks, "a row a tick");
+    assert!(
+        j.rows
+            .iter()
+            .zip(j.rows.iter().skip(1))
+            .all(|(a, b)| b.at - a.at == MIN_MS),
+        "a minute apart"
+    );
+    assert_eq!(j.ready_now(), 1);
 }

@@ -134,12 +134,12 @@ pub(crate) fn stamp_at_wall(at: Stamp, wall_ms: u64) -> Stamp {
     Stamp::new(wall, at.mono_ms.saturating_sub(at.wall_ms - wall))
 }
 
-fn later(a: Stamp, b: Stamp) -> Stamp {
+const fn later(a: Stamp, b: Stamp) -> Stamp {
     if b.wall_ms > a.wall_ms { b } else { a }
 }
 
 /// Whether the wall instant `wall_ms`, read at `at`, lies before this process's monotonic clock began (a command a predecessor started before a seamless update): [`stamp_at_wall`] can only clamp it to 0 there, and a `dur_ms` measured from it would be this process's uptime, not the run's.
-pub(crate) fn predates_clock(at: Stamp, wall_ms: u64) -> bool {
+pub(crate) const fn predates_clock(at: Stamp, wall_ms: u64) -> bool {
     at.wall_ms.saturating_sub(wall_ms) > at.mono_ms
 }
 
@@ -503,7 +503,7 @@ pub(crate) fn sid_actor(sid: &str) -> Option<Actor> {
 }
 
 /// The session outcome an `ExitReason` names.
-pub(crate) fn exit_out(reason: crate::session_store::ExitReason) -> SessionOut {
+pub(crate) const fn exit_out(reason: crate::session_store::ExitReason) -> SessionOut {
     use crate::session_store::ExitReason;
     match reason {
         ExitReason::ShellExit => SessionOut::ShellExit,
@@ -529,12 +529,12 @@ fn tok(key: Key, raw: &str) -> Option<Val> {
 
 impl SessionLog {
     /// The log.
-    pub(crate) fn log(&self) -> &Log {
+    pub(crate) const fn log(&self) -> &Log {
         &self.log
     }
 
     /// The log, for the journal writer's one write into it: installing its wake on a log that has none (a log made before the lane published it).
-    pub(crate) fn log_mut_for_journal(&mut self) -> &mut Log {
+    pub(crate) const fn log_mut_for_journal(&mut self) -> &mut Log {
         &mut self.log
     }
 
@@ -595,7 +595,7 @@ impl SessionLog {
     }
 
     /// Where this process's journal starts this session's records (after the predecessor's journaled head, `journal_start`), or `None`: from its first.
-    pub(crate) fn journal_start(&self) -> Option<u64> {
+    pub(crate) const fn journal_start(&self) -> Option<u64> {
         self.journal_start
     }
 
@@ -610,12 +610,12 @@ impl SessionLog {
     }
 
     /// Continue the timeline's row ids past `carried`, the count a seamless update's manifest carried (`SessionRecord::timeline_id`, which holds the predecessor's overlap reserve): called before the successor's first record ([`crate::session_timeline::SessionTimeline::continue_ids`]).
-    pub(crate) fn continue_rows(&mut self, carried: u64) {
+    pub(crate) const fn continue_rows(&mut self, carried: u64) {
         self.log.continue_rows(carried);
     }
 
     /// The last timeline row id this log issued, or the count it was continued at (the seamless update's id ceiling; the view's head).
-    pub(crate) fn row_head(&self) -> u64 {
+    pub(crate) const fn row_head(&self) -> u64 {
         self.log.row_head()
     }
 
@@ -796,7 +796,7 @@ impl SessionLog {
     }
 
     /// The first session of the chain of restores this one continues, or `None` when it began it.
-    pub(crate) fn lineage(&self) -> Option<ShortId> {
+    pub(crate) const fn lineage(&self) -> Option<ShortId> {
         self.lineage
     }
 
@@ -883,7 +883,7 @@ impl SessionLog {
     }
 
     /// When the session node opened here (wall ms): a block that finished before it is another process's, which the block read passes over without counting it against its cap.
-    pub(crate) fn opened_wall(&self) -> Option<u64> {
+    pub(crate) const fn opened_wall(&self) -> Option<u64> {
         self.opened_wall
     }
 
@@ -908,6 +908,7 @@ impl SessionLog {
                 }
                 (None, _) if self.last_blk.is_some_and(|l| fact.id <= l) => {}
                 (None, end) => {
+                    // A newer block: the open one ended unseen, before this
                     // one began.
                     if let Some(c) = self.cmd.take() {
                         let began = stamp_at_wall(at, fact.started_ms.unwrap_or(at.wall_ms));
@@ -1232,7 +1233,7 @@ impl SessionLog {
     }
 
     /// The session's own process group: its shell, which in front is the session at its prompt.
-    pub(crate) fn note_root(&mut self, pgid: i32) {
+    pub(crate) const fn note_root(&mut self, pgid: i32) {
         self.root_pgid = pgid;
     }
 
@@ -1307,6 +1308,8 @@ impl SessionLog {
             return;
         }
         if let Some(fg) = self.fg.filter(|f| f.pgid == pgid) {
+            // The same group naming the program it already runs: nothing
+            // changed (a seamless update's successor, whose resolver names
             // every group again, keeps the run, its agent and its turn).
             if name.is_some() && fg.name_fp == name_fp(name) {
                 return;
@@ -1426,6 +1429,7 @@ impl SessionLog {
 
     fn close_agent(&mut self, at: Stamp) {
         if let Some(a) = self.agent.take() {
+            // The named agent's run is the front run: closing it is the
             // front run's to do (`foreground_moved`).
             if self.fg.is_none_or(|f| f.node != a.node) {
                 self.close_run(a.node, RunOut::Unknown, at);
@@ -1555,7 +1559,7 @@ impl SessionLog {
 
     /// The `human` rows the burst marks owe the timeline, not taken (the timeline's debug cross-check).
     #[cfg(debug_assertions)]
-    pub(crate) fn burst_rows_owed(&self) -> u32 {
+    pub(crate) const fn burst_rows_owed(&self) -> u32 {
         self.burst_rows
     }
 
@@ -1647,7 +1651,7 @@ impl SessionLog {
 
     /// What the handoff manifest carries: the epoch and the node-id counters plus [`LOG_ID_RESERVE`], remembered as this process's ceiling.
     #[cfg(any(unix, test))]
-    pub(crate) fn handoff_carry(&mut self) -> LogCarry {
+    pub(crate) const fn handoff_carry(&mut self) -> LogCarry {
         let ids = self.log.id_counters();
         let reserved = IdCounters {
             run: ids.run.saturating_add(LOG_ID_RESERVE),
@@ -1668,7 +1672,7 @@ impl SessionLog {
 
     /// What the handoff manifest carries of the seq count (`SessionRecord::log_seq`): the last seq plus [`LOG_SEQ_RESERVE`], remembered as this process's ceiling.
     #[cfg(any(unix, test))]
-    pub(crate) fn handoff_seq(&mut self) -> u64 {
+    pub(crate) const fn handoff_seq(&mut self) -> u64 {
         let last = self.log.last_seq();
         if last > aterm_slog::SEQ_LIMIT {
             self.seq_ceiling = None;
@@ -2027,7 +2031,7 @@ pub(crate) struct LogQuery {
     pub(crate) json: bool,
 }
 
-fn cursor_of(since: Option<u64>, ep: Option<u32>) -> Result<Option<Cursor>, ()> {
+const fn cursor_of(since: Option<u64>, ep: Option<u32>) -> Result<Option<Cursor>, ()> {
     match (since, ep) {
         (None, None) => Ok(None),
         (Some(s), Some(e)) => Ok(Some(Cursor::new(e, s))),
@@ -2293,7 +2297,7 @@ impl LogCopy {
     }
 
     /// The copy with its header handing out `c` (`as_of=` its seq, `ep=` its epoch) in place of the log's head: a journal reply's (`aterm_slog::journal::View::reply_cursor`), which names none of the records the reply derived past the journal's head.
-    pub(crate) fn handing(mut self, c: Cursor) -> LogCopy {
+    pub(crate) const fn handing(mut self, c: Cursor) -> LogCopy {
         self.as_of = c.seq;
         self.ep = c.ep;
         self
@@ -2387,7 +2391,7 @@ impl BriefCopy {
     }
 
     /// The copy with its header handing out `c` in place of the log's head ([`LogCopy::handing`]).
-    pub(crate) fn handing(mut self, c: Cursor) -> BriefCopy {
+    pub(crate) const fn handing(mut self, c: Cursor) -> BriefCopy {
         self.state.as_of = c.seq;
         self.state.ep = c.ep;
         self

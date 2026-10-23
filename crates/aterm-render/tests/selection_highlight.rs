@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Selection highlight on the CPU renderer: selected cells take
-// `Theme::selection` instead of their own background, the glyph keeps its
-// foreground, nothing outside the selection changes, and the viewport row
-// mapping honours the display offset. CPU fills are exact, so the checks use
-// exact pixel equality.
+
+//! Selection highlight tests for the CPU renderer.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{Terminal, TerminalBuilder};
@@ -21,7 +17,6 @@ fn b(p: u32) -> i32 {
     (p & 0xff) as i32
 }
 
-/// All pixels inside cell (row, col), given cell size.
 fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u32> {
     let mut out = Vec::with_capacity(cw * ch);
     for y in row * ch..(row * ch + ch).min(f.height) {
@@ -32,7 +27,6 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
     out
 }
 
-/// Pixels exactly equal to a packed colour (CPU fills are exact).
 fn count_eq(px: &[u32], color: u32) -> usize {
     px.iter().filter(|&&p| p == color).count()
 }
@@ -42,7 +36,6 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// "hello" / "world" on a 4x10 grid with row 0 cols 1..=3 selected.
 fn selected_term() -> Terminal {
     let mut term = Terminal::new(4, 10);
     term.process(b"hello\r\nworld");
@@ -61,7 +54,6 @@ fn selected_cells_get_selection_background() {
     let f = rend.render_input(&term.cell_frame(4, 10));
     let sel = Theme::default().selection;
 
-    // Every selected cell (0,1)..(0,3) is dominated by the selection fill.
     for c in 1..=3usize {
         let px = cell_pixels(&f, cw, ch, 0, c);
         let n = count_eq(&px, sel);
@@ -72,7 +64,6 @@ fn selected_cells_get_selection_background() {
         );
     }
 
-    // The glyph is still drawn in the (light) foreground over the highlight.
     let px = cell_pixels(&f, cw, ch, 0, 2); // 'l'
     let fg_drawn = px.iter().any(|&p| r(p) > 150 && g(p) > 150 && b(p) > 150);
     assert!(
@@ -221,10 +212,6 @@ fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
         assert_eq!(count_eq(&pixels, input.selection_bg), 0);
     }
 
-    // A card can cover a selected wide lead but leave its continuation just
-    // outside its right edge. The host keeps that selected half and clips
-    // the selection to it. The logical row span is then empty; the actual
-    // cell predicate and the pixels must still keep the continuation.
     let mut term = Terminal::new(1, 6);
     term.process("日 ".as_bytes());
     let selection = term.text_selection_mut();
@@ -234,8 +221,6 @@ fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
     let mut wide = term.cell_frame(1, 6);
     wide.cursor_visible = false;
     wide.selection_bg = 0x0021_4365;
-    // The card overwrites its lead cell; blank ink keeps this fill test
-    // independent of CJK font routing. The continuation remains materialized.
     wide.cells[0][0].ch = ' ';
     assert!(wide.cells[0][1].wide);
     for (clip, lead, continuation) in [
@@ -262,9 +247,6 @@ fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
             );
         }
     }
-    // The same edge on the shipping persistent-cache path: both logical keys
-    // are empty, but a colour change and then a clip that removes the half
-    // must repaint it, byte-identically to a fresh full draw.
     let mut cache = aterm_render::WindowCpu::new();
     let cached = |renderer: &mut Renderer,
                   cache: &mut aterm_render::WindowCpu,
@@ -294,10 +276,6 @@ fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
     );
     assert_eq!(cleared.pixels, rend.render_input(&wide).pixels);
 
-    // BiDi moves the wide pair as a unit from logical 0/1 to painted 2/3.
-    // A painted clip beginning at 3 is farther than one column from the
-    // selected logical lead, so widening that logical window by one is not
-    // enough. Its continuation-only -> empty transition still repaints.
     wide.cells[0].resize(6, term.implicit_blank_render_cell());
     wide.cells[0].swap(0, 2);
     wide.cells[0].swap(1, 3);
@@ -316,8 +294,6 @@ fn multiline_selection_clip_blocks_sibling_and_divider_backgrounds() {
     );
     assert_eq!(moved_clear.pixels, rend.render_input(&wide).pixels);
 
-    // No selection still takes the fast path and paints neither half.
-    // Remove the prior empty clip first, or this control would be vacuous.
     wide.selection_clip = None;
     assert_eq!(wide.selection_hit(0, 2, true, false), Some(0));
     wide.selection.clear();
@@ -337,8 +313,6 @@ fn wide_char_block_selection_highlights_both_halves() {
     let mut term = Terminal::new(2, 6);
     term.process("日x".as_bytes()); // 日 occupies cols 0-1, 'x' col 2
     let sel = term.text_selection_mut();
-    // Block-select only column 0, the wide lead: `contains_cell` snaps the
-    // highlight to whole characters, so both halves light up.
     sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Block);
     sel.update_selection(0, 0, SelectionSide::Right);
     sel.complete_selection();
@@ -362,20 +336,17 @@ fn wide_char_block_selection_highlights_both_halves() {
 fn scrolled_viewport_maps_selection_rows() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
-    // 3 visible rows + scrollback; 4 lines pushes "aa" off the live screen.
     let mut term = TerminalBuilder::new()
         .size(3, 8)
         .ring_buffer_size(64)
         .build();
     term.process(b"aa\r\nbb\r\ncc\r\ndd");
-    // Select live row 0 ("bb"), cols 0..=1.
     let sel = term.text_selection_mut();
     sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(0, 1, SelectionSide::Right);
     sel.complete_selection();
     let selc = Theme::default().selection;
 
-    // Live view: the highlight sits on viewport row 0.
     let live = rend.render_input(&term.cell_frame(3, 8));
     assert!(
         count_eq(&cell_pixels(&live, cw, ch, 0, 0), selc) > 0,
@@ -387,8 +358,6 @@ fn scrolled_viewport_maps_selection_rows() {
         "live: row 1 clean"
     );
 
-    // Scroll back one line: viewport row 0 now shows scrollback ("aa"), and the
-    // selected live row 0 is displayed at viewport row 1.
     term.grid_mut().scroll_display(1);
     assert_eq!(
         term.grid().display_offset(),
@@ -407,10 +376,6 @@ fn scrolled_viewport_maps_selection_rows() {
     );
 }
 
-/// Per-pane selection colour resolution on the CPU face, which needs no GPU
-/// adapter. `per_pane_selection_colours_gpu_match_cpu` (aterm-gpu) holds the
-/// GPU to the same fixture but passes vacuously with no wgpu adapter; this half
-/// always runs.
 #[test]
 fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
     use aterm_core::render::{COLOR_UNSET, PaneSelection};
@@ -421,7 +386,6 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
 
     let (rows, cols) = (2usize, 17usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Two panes of 8 columns with a 1-cell divider at column 8.
     term.process(b"\x1b[?25lleft one|right on\r\nleft two|right tw");
     let mut input = term.cell_frame(rows, cols);
 
@@ -439,7 +403,6 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
         }
     };
     input.selections = vec![
-        // Focused pane: a live OSC 17 band with an explicit OSC 19 ink.
         pane(
             0,
             7,
@@ -448,7 +411,6 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
             0x00fe_dcba,
             false,
         ),
-        // Unfocused pane: no live colour, so the theme's inactive derivation.
         pane(
             9,
             16,
@@ -464,8 +426,6 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
     let dim = aterm_render::derive_inactive_selection_bg(theme.selection, theme.bg);
     assert_ne!(live, dim, "the fixture's two bands must differ");
 
-    // Each entry resolves its own colour; one scalar hoisted out of the loop
-    // makes these two equal.
     assert!(
         count_eq(&cell_pixels(&frame, cw, ch, 0, 7), live) > 0,
         "the focused pane's band is its own live OSC 17 colour"
@@ -481,8 +441,6 @@ fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
         "the divider between them takes neither band"
     );
 
-    // …and without the list the scalar authority paints nothing here, so the
-    // list produced those bands.
     let plain = term.cell_frame(rows, cols);
     assert_ne!(frame.pixels, rend.render_input(&plain).pixels);
 }

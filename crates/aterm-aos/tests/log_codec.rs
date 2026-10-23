@@ -17,7 +17,6 @@ use crate::toy::{ToyInput, ToySchema, Variant, identity};
 
 type ToyLog = EventLog<ToySchema>;
 
-/// The ancestor checkpoint every sample log extends.
 fn ancestor() -> Digest {
     Digest::of(b"log-codec-test-ancestor\0", &[b"C0"])
 }
@@ -87,7 +86,6 @@ fn header_body(magic: [u8; 8], id: &TaskIdentity, first_cursor: u64, broken: u8)
     e.finish()
 }
 
-/// A seal record body naming `count` events and `digest`.
 fn seal_body(count: u64, digest: &Digest) -> Vec<u8> {
     let mut e = Enc::new();
     e.u8(RECORD_VERSION);
@@ -97,7 +95,6 @@ fn seal_body(count: u64, digest: &Digest) -> Vec<u8> {
     e.finish()
 }
 
-/// The length of a seal record (every seal record has the same length).
 fn seal_len() -> usize {
     log_of(&[]).encode(&ToySchema::new()).unwrap().len() - good_header().len()
 }
@@ -159,9 +156,6 @@ fn every_byte_flip_of_a_log_is_refused_or_reported_torn_never_misread() {
     assert!(torn > 0 && refused > 0, "torn {torn}, refused {refused}");
 }
 
-/// Every proper prefix of a log's bytes is a refusal, a torn tail or a cut reported
-/// `Unsealed` (a record-boundary cut after `k` of `n` events, the seal gone); only the whole
-/// bytes, ending in the seal, decode `Clean`.
 #[test]
 fn every_truncation_of_a_log_is_its_prefix_reported_torn_or_unsealed_or_a_refusal() {
     let inputs = sample_inputs();
@@ -205,8 +199,6 @@ fn every_truncation_of_a_log_is_its_prefix_reported_torn_or_unsealed_or_a_refusa
     assert_eq!((whole.inputs(), tail), (&inputs[..], Tail::Clean));
 }
 
-/// The seal is the event count and the whole log's trace digest; a seal naming another count
-/// or another digest is refused with both values, and a broken log is sealed like any other.
 #[test]
 fn a_seal_names_its_event_count_and_digest_and_a_seal_naming_others_is_refused() {
     let schema = ToySchema::new();
@@ -246,8 +238,6 @@ fn a_seal_names_its_event_count_and_digest_and_a_seal_naming_others_is_refused()
     assert!(back.broken().is_some());
 }
 
-/// A seal can stand only last: one before an event, or a second seal, is a record of the
-/// wrong kind at its step.
 #[test]
 fn a_seal_anywhere_but_last_is_refused_as_a_record_of_the_wrong_kind() {
     let schema = ToySchema::new();
@@ -273,9 +263,6 @@ fn a_seal_anywhere_but_last_is_refused_as_a_record_of_the_wrong_kind() {
     );
 }
 
-/// The header binds the log to its ancestor checkpoint: read beside another checkpoint, the
-/// log is refused naming both, though its identity, epoch and first cursor are those the
-/// reader expects.
 #[test]
 fn a_log_read_beside_another_checkpoint_is_refused_naming_both() {
     let (_, bytes) = sample();

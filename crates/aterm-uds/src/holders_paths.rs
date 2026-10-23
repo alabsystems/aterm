@@ -508,6 +508,7 @@ fn linux_uses(proc_dir: &Path, pid: u32, dirs: &[PathBuf]) -> Result<Option<Path
                 }
             }
             Err(e) if gone(&e) => {
+                // A process with no executable (a kernel thread) has none to
                 // read; one that exited has no directory left either.
                 if std::fs::symlink_metadata(proc_dir).is_err() {
                     return Ok(None);
@@ -868,6 +869,7 @@ mod win {
                 )
             };
             if ok == 0 {
+                // A process exiting, or not yet initialized, refuses the module
                 // list; the caller reads that as unknown unless it has exited.
                 return None;
             }
@@ -1054,7 +1056,7 @@ mod win {
         String::from_utf16(&wide).ok()
     }
 
-    /// Is `name`, a file object's kernel name, a disk device itself.
+    /// Is `name`, a file object's kernel name, a disk device itself?
     pub(super) fn disk_device_itself(name: &str) -> bool {
         let numbered = |s: &str, prefix: &str| {
             s.strip_prefix(prefix)

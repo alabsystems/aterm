@@ -341,6 +341,8 @@ pub fn reduce_file_watch(input: FileWatchInput) -> FileWatchReduction {
     if input.save_in_flight {
         FileWatchReduction::DeferredSaving { change }
     } else if content_is_equivalent(input.baseline, input.observed) {
+        // A save CAS still treats identity/metadata as decisive. This narrower verdict is
+        // safe only after the host revalidated the path/symlink capability, and it never
         // authorizes a write by itself.
         FileWatchReduction::RebindEquivalent { change }
     } else if input.document_dirty {
@@ -1080,7 +1082,8 @@ impl JournalOwnerId {
     }
 }
 
-/// Where no image can carry an owner set.
+/// Where no image can carry an owner set (neither an extended attribute nor an
+/// alternate data stream), no process is an owner: the type has no value.
 #[cfg(not(any(unix, windows)))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JournalOwnerId {}

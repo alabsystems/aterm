@@ -2,26 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Typing inside a lit line keeps the tail it pushes lit.
-//!
-//! The take: a line typed at 12 cps, the caret walked back into it with ← (stamped as the host
-//! stamps a navigation key: `clear_typed_keeping_hand`, then `note_motion`), a rest, then six keys
-//! typed inside the line, each an insert the program answers by rewriting the rest of the line
-//! one column on. The shift pass (`Witness::shift_runs`, `Ribbon::shift_run`, run by
-//! `Engine::follow_rows` before the tick) finds the tail's glyphs where the insert pushed them and
-//! moves their light with them, clocks intact; a key a hidden-caret composer reports at the
-//! print's end is laid at the insert it made (`Ribbon::insert_landing`).
-//!
-//! The shift pass (`Witness::shift_runs`, `Ribbon::shift_run`, run by
-//! `Engine::follow_rows` before the tick) finds the tail's glyphs where the
-//! insert pushed them and moves their light with them, clocks intact; a key a
-//! hidden-caret composer reports at the print's end is laid at the insert it
-//! made (`Ribbon::insert_landing`).
-//!
-//! The repaint arrives in six shapes ([`Shape`]): the Ink-shaped split
-//! whole-line redraw, the same bytes in one read, the hide alone in the first
-//! read, Claude Code's own diff frame whole or torn after its hide, and
-//! readline's visible reprint-and-`CUB`. The census is the plan's coverage on
-//! the composer row: `#` at ≥ 20 coverage, `.` dark.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, coverage, geom, holes_of, note_blink, observe_caret_row,
@@ -36,37 +16,21 @@ const CW: usize = 8;
 const CH: usize = 16;
 const ROWS: usize = 60;
 const COLS: usize = 140;
-/// 12 cps.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
-/// The Ink-shaped composer's pause between a redraw's two reads.
 const INK_SPLIT_MS: u64 = 30;
-/// A hole standing longer than this many frames is the defect.
 const HOLE_FRAMES_MAX: usize = 3;
 
-/// How the composer's repaint reaches the glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// The Ink-shaped redraw: hide, home, clear, the whole line | present |
-    /// 30 ms | the caret placed and shown | present.
     InkSplit,
-    /// The same bytes in one read, one present.
     InkWhole,
-    /// The hide alone in the first read | present | 30 ms | the line, the
-    /// caret, the show | present: a frame torn before its glyphs.
     InkHideFirst,
-    /// Claude Code's diff frame, the recorded shape: `?2026h ?25l`, the
-    /// changed glyphs on the composer row, a CUP to the hint row, the
-    /// caret's CUP, `?25h ?2026l` — one read, one present.
     ClaudeWhole,
-    /// The same frame torn after `?2026h ?25l`: the hold capped, the rest
-    /// a read later.
     ClaudeTorn,
-    /// readline at a visible caret: the edit column on reprinted, then `CUB` back to the caret.
     Visible,
 }
 
-/// One frame's census of the composer row.
 #[derive(Clone, Debug)]
 struct Census {
     ms: u64,
@@ -74,11 +38,9 @@ struct Census {
     text: String,
     lit: String,
     holes: Vec<u16>,
-    /// Columns of the row that carry a cell of any cohort, leaving or not.
     cells: Vec<u16>,
 }
 
-/// The host: one terminal, the kitty, one clock, the composer's state.
 struct Host {
     term: Terminal,
     glow: CursorGlow,
@@ -90,7 +52,6 @@ struct Host {
     row_buf: Vec<char>,
     blink: u64,
     shape: Shape,
-    /// The composer's row, and the grid column of its text's first glyph.
     row: u16,
     col0: usize,
     text: String,
@@ -105,8 +66,6 @@ impl Host {
         let now = Instant::now();
         let mut glow = CursorGlow::default();
         glow.note_pane_columns(0, COLS);
-        // Ink's composer at the top of the alt screen; Claude Code's in its
-        // bottom-pinned box behind `│ > `.
         let (row, col0) = match shape {
             Shape::ClaudeWhole | Shape::ClaudeTorn => ((ROWS - 3) as u16, 4),
             _ => (2, 0),
@@ -141,9 +100,6 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// The render path: the frame hold's caret row and every ribbon row whether or not the caret
-    /// is visible, the print anchor fed just before the tick (`app_render.rs`), the tick, then
-    /// the census.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
@@ -160,7 +116,6 @@ impl Host {
     fn record(&mut self) {
         let row = self.row;
         let cov = coverage(&self.glow, geom(ROWS, COLS, CW, CH), row);
-        // Every dark column between the first and last lit one.
         let holes = holes_of(&cov)
             .into_iter()
             .flat_map(|(s, n)| s..s + n)
@@ -211,7 +166,6 @@ impl Host {
         self.idle_to(t);
     }
 
-    /// The frames up to `ms` after the last event, then that instant.
     fn schedule(&mut self, ms: u64) {
         let t = self.last_event + Duration::from_millis(ms);
         self.idle_to(t);
@@ -219,13 +173,10 @@ impl Host {
         self.last_event = self.now;
     }
 
-    /// The CUP to text column `col` of the composer.
     fn cup(&self, col: usize) -> String {
         format!("\x1b[{};{}H", self.row + 1, self.col0 + col + 1)
     }
 
-    /// The Ink redraw's two halves: hide, home, clear, `line`; the caret
-    /// placed and shown.
     fn ink_halves(&self, line: &str) -> (String, String) {
         (
             format!("\x1b[?25l\x1b[{};1H\x1b[2K{line}", self.row + 1),
@@ -233,8 +184,6 @@ impl Host {
         )
     }
 
-    /// The program's repaint after its text went from `before` to
-    /// `self.text` (the caret at `self.caret`), in this host's shape.
     fn repaint(&mut self, before: &str) {
         match self.shape {
             Shape::InkSplit => {
@@ -256,8 +205,6 @@ impl Host {
                 self.term.process(format!("{head}{tail}").as_bytes());
             }
             Shape::ClaudeWhole | Shape::ClaudeTorn => {
-                // The diff: from the first changed text column on, the
-                // rest of the row erased behind it.
                 let first = before
                     .chars()
                     .zip(self.text.chars())
@@ -280,8 +227,6 @@ impl Host {
                 }
             }
             Shape::Visible => {
-                // readline: the edit column on, reprinted, then CUB back to
-                // the caret — at a visible caret, one read.
                 let first = before
                     .chars()
                     .zip(self.text.chars())
@@ -298,8 +243,6 @@ impl Host {
         self.frame();
     }
 
-    /// One typed key `KEY_MS` after the last event, stamped as the host
-    /// stamps it.
     fn key(&mut self, ch: char) {
         self.schedule(KEY_MS);
         let (shifted, class) = class_of(ch);
@@ -310,8 +253,6 @@ impl Host {
         self.repaint(&before);
     }
 
-    /// One Left arrow `ms` after the last event, stamped as the host stamps
-    /// a navigation key (`clear_typed_keeping_hand` then `note_motion`).
     fn left(&mut self, ms: u64) {
         self.schedule(ms);
         self.glow.clear_typed_keeping_hand(self.now);
@@ -332,7 +273,6 @@ impl Host {
         }
     }
 
-    /// Runs of consecutive frames with a hole: `(first, last, widest)`.
     fn hole_runs(&self) -> Vec<(usize, usize, Vec<u16>)> {
         let mut runs: Vec<(usize, usize, Vec<u16>)> = Vec::new();
         for (i, f) in self.census.iter().enumerate() {
@@ -363,8 +303,6 @@ impl Host {
         s
     }
 
-    /// No hole stands longer than [`HOLE_FRAMES_MAX`] frames; the frames
-    /// around the longest when one does.
     fn assert_no_standing_hole(&self, what: &str) {
         let runs = self.hole_runs();
         if let Some((a, b, cols)) = runs.iter().max_by_key(|(a, b, _)| b - a) {
@@ -378,11 +316,8 @@ impl Host {
     }
 }
 
-/// The line the hand types first.
 const LINE: &str = "hello there this is a rainbow line";
-/// What it types inside the line once it has walked back into it.
 const MID: &str = "abcdef";
-/// A settled frame: this long after a mid key's echo, inside the key gap.
 const SETTLE_MS: u64 = 70;
 
 const SHAPES: [Shape; 6] = [
@@ -394,9 +329,6 @@ const SHAPES: [Shape; 6] = [
     Shape::Visible,
 ];
 
-/// The take: [`LINE`] at 12 cps, `back` ← at `left_ms`, a 300 ms rest,
-/// then [`MID`] typed inside the line. Returns the host and the census
-/// index of every mid key's settled frame.
 fn take(shape: Shape, back: usize, left_ms: u64) -> (Host, Vec<usize>) {
     let mut h = Host::new(shape);
     h.label = "type";
@@ -418,7 +350,6 @@ fn take(shape: Shape, back: usize, left_ms: u64) -> (Host, Vec<usize>) {
     (h, settled)
 }
 
-/// Every text column of the composer row dark on census frame `i`.
 fn dark_text_cols(h: &Host, i: usize) -> Vec<usize> {
     let f = &h.census[i];
     let end = f.text.chars().count();
@@ -427,13 +358,8 @@ fn dark_text_cols(h: &Host, i: usize) -> Vec<usize> {
         .collect()
 }
 
-/// On every shape, at three depths and two arrow paces: every settled frame
-/// after a key typed inside the line has the band covering the whole text
-/// (prefix, keys, and the pushed tail) with no hole.
 #[test]
 fn typing_inside_a_lit_line_keeps_the_tail_it_pushes_lit() {
-    // The 36 takes replay on their own hosts and clocks on the binary's threads (`par_map`); the
-    // first failing take in this order raises its panic.
     let takes: Vec<(Shape, usize, u64)> = SHAPES
         .into_iter()
         .flat_map(|shape| {
@@ -467,10 +393,6 @@ fn typing_inside_a_lit_line_keeps_the_tail_it_pushes_lit() {
     });
 }
 
-/// Negative control: the same lit line, then no key; the program rewrites the
-/// tail with other text (a completion, a reflow). No tail block stands
-/// anywhere on the row, so nothing is carried and the light under the
-/// replaced letters melts.
 #[test]
 fn a_tail_the_program_rewrote_still_leaves() {
     for shape in [Shape::Visible, Shape::InkWhole, Shape::ClaudeWhole] {
@@ -481,7 +403,6 @@ fn a_tail_the_program_rewrote_still_leaves() {
         let at = LINE.find("rainbow").expect("the word is in the line");
         h.text.replace_range(at.., "XQZJKVWPUY");
         if shape == Shape::Visible {
-            // A program's own reprint at a visible caret.
             let s = format!("{}{}\x1b[K", h.cup(at), &h.text[at..]);
             h.term.process(s.as_bytes());
             h.frame();
@@ -491,8 +412,6 @@ fn a_tail_the_program_rewrote_still_leaves() {
         h.idle(400);
         let last = h.census.len() - 1;
         let f = &h.census[last];
-        // By cell, not by the lit map: the plan feathers the band's edge one
-        // column past its last cell.
         let kept: Vec<u16> = f
             .cells
             .iter()

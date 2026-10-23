@@ -78,9 +78,8 @@ fn parse(text: &str, what: &str) -> Result<Value, Unknown> {
     aterm_toml::from_str(text).map_err(|e| Unknown::Other(format!("{what} is not TOML: {e}")))
 }
 
-/// Per Mac architecture, the stable channel's `{program: build}` pins with that darwin
-/// triple's `pin_by_target` overlay laid over them, restricted to the programs the
-/// index names.
+/// The stable channel's `{program: build}` pins per Mac architecture, with that triple's
+/// `pin_by_target` overlay applied, restricted to the programs the index names.
 ///
 /// # Errors
 /// Not exactly one stable channel, or a pin that is not a program name and a build.

@@ -143,6 +143,7 @@ impl EncodeSession {
 
 impl Drop for EncodeSession {
     fn drop(&mut self) {
+        // Free the latch's session slot so a rebuild (the device-loss path)
         // can construct a successor. The queue itself is released by `Obj`.
         self.latch.unbind_encode_session();
     }
@@ -162,6 +163,8 @@ impl<'s> CommandBuffer<'s> {
         &'cb mut self,
         desc: &RenderPassDesc<'_>,
     ) -> Result<PassEncoder<'cb, 's>, String> {
+        // A target stamped with another loss domain would be rendered on a
+        // queue that domain's present does not order against; refuse before
         // any FFI, by pointer identity.
         if !Arc::ptr_eq(desc.target.latch(), &self.session.latch) {
             return Err("render pass refused: the target texture was minted in a \

@@ -127,7 +127,9 @@ fn service_unanswered() -> rustls::Error {
     rustls::Error::Other(rustls::OtherError(Arc::new(ServiceUnanswered)))
 }
 
-/// Whether `error` is the platform verifier refusing because the OS trust service.
+/// Whether `error` is the platform verifier refusing because the OS trust
+/// service (macOS's `trustd`) did not answer in time, rather than a verdict on
+/// the certificate.
 #[must_use]
 pub fn is_service_unanswered(error: &rustls::Error) -> bool {
     #[cfg(target_vendor = "apple")]
@@ -163,7 +165,7 @@ impl PlatformVerifier {
         Self::build(Vec::new(), provider)
     }
 
-    /// Test only (see the module docs): the platform's trust anchors plus
+    /// Test only: the platform's trust anchors plus
     /// `extra_roots`, which add to the system set rather than replace it.
     #[cfg(test)]
     fn new_with_extra_roots(

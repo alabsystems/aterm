@@ -546,7 +546,8 @@ pub fn refusals_for(absent: &[&str]) -> Option<String> {
 /// The name of the machine-wide directory [`Provider::Workspace`] tools install into.
 pub const TOOLING: &str = "tooling";
 
-/// The prefix of a `verify provision` row's scratch in a cache it places.
+/// The prefix of a `verify provision` row's scratch in a cache it places into: a
+/// download, an unpack or a build not yet renamed into place.
 pub const TOOLING_SCRATCH: &str = ".provision-";
 
 /// Aterm's directory `name` in this user's cache, by each platform's rule.

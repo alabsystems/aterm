@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The flows of docs/DESIGN-secrets-2026-10-20.md §7–§9 end to end on loopback: one server,
-//! an admin's home and machines' homes, each a scratch directory. Every value is synthetic and
-//! made here; nothing reads the real `~/.secrets`.
+//! End-to-end loopback tests for secrets flows.
 
 #![cfg(unix)]
 
@@ -20,7 +18,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A value no real credential looks like.
 fn synthetic(label: &str) -> String {
     format!(
         "synthetic-{label}-{}",
@@ -30,8 +27,6 @@ fn synthetic(label: &str) -> String {
 
 struct Lab {
     root: aterm_tempfile::TempDir,
-    /// The server's socket, kept so a restart listens at the same address with no moment
-    /// another test could be handed its port: each server listens on a copy.
     socket: std::net::TcpListener,
     server: Option<Running>,
     url: String,
@@ -65,13 +60,10 @@ impl Lab {
         Lab::holding(vault, Duration::from_secs(50))
     }
 
-    /// A lab whose server holds a long-poll at most `hold`.
     fn holding(vault: &str, hold: Duration) -> Lab {
         Lab::tuned(vault, hold, server::JOIN_CHANGE_GAP)
     }
 
-    /// A lab whose server lets a key change its join request at once (no
-    /// [`server::JOIN_CHANGE_GAP`] sat out on a real clock).
     fn changing(vault: &str) -> Lab {
         Lab::tuned(vault, Duration::from_secs(50), Duration::ZERO)
     }
@@ -92,7 +84,6 @@ impl Lab {
         }
     }
 
-    /// The server's Mac lost its store: a new server, empty, at the same address.
     fn restart_empty(&mut self) {
         self.server.take().expect("running").stop();
         let store = self.root.path().join("store");
@@ -101,7 +92,6 @@ impl Lab {
         self.server = Some(start(copy, store, self.hold, self.gap));
     }
 
-    /// A machine's home, with its `~/.secrets` absent.
     fn home(&self, name: &str) -> Paths {
         let home = self.root.path().join(name);
         std::fs::create_dir_all(&home).expect("home");
@@ -139,7 +129,6 @@ fn join_unattended(paths: &Paths, source: &str, host: &str) -> aterm_secrets::Re
     join_with(paths, source, host, None)
 }
 
-/// An unattended join that types `password` when asked for the join password.
 fn join_with(
     paths: &Paths,
     source: &str,
@@ -166,7 +155,6 @@ fn join_with(
     outcome
 }
 
-/// Approve every pending request at the admin's URL.
 fn approve_all(admin_paths: &Paths) -> u64 {
     let admin = client::admin_open(admin_paths).expect("admin opens");
     let mut doc = admin.doc.clone();
@@ -207,7 +195,6 @@ fn a_lan_vault_from_create_to_revoke() {
     write_private(&admin.home.join(".secrets/gh_access_token"), &token);
     write_private(&admin.home.join(".secrets/other"), &other);
 
-    // The admin's existing files become the vault, and stay exactly where they were.
     let created = client::create(
         &admin,
         &lab.url,
@@ -233,7 +220,6 @@ fn a_lan_vault_from_create_to_revoke() {
         "a second create over a live vault is refused"
     );
 
-    // A machine asks; nothing opens until an admin approves its code.
     let machine = lab.home("mb");
     let pinned = format!("{}#{}", lab.url, created.signer);
     let JoinOutcome::Pending { code, host } =
@@ -269,7 +255,6 @@ fn a_lan_vault_from_create_to_revoke() {
             .is_empty()
     );
 
-    // A host section reaches only its host.
     let release = synthetic("release");
     assert_eq!(
         set(
@@ -287,7 +272,6 @@ fn a_lan_vault_from_create_to_revoke() {
         Some(release.as_str())
     );
 
-    // A long-poll returns with the next version.
     let waiting = {
         let machine = machine.clone();
         std::thread::spawn(move || client::sync(&machine, Some(Duration::from_secs(50))))
@@ -302,7 +286,6 @@ fn a_lan_vault_from_create_to_revoke() {
         SyncOutcome::Unchanged { seq: 4 }
     );
 
-    // Unset removes the file it wrote; a file changed by hand is moved aside, never lost.
     {
         let admin_vault = client::admin_open(&admin).expect("open");
         let mut doc = admin_vault.doc.clone();
@@ -330,7 +313,6 @@ fn a_lan_vault_from_create_to_revoke() {
     assert_eq!(name, "other");
     assert_eq!(std::fs::read_to_string(aside).expect("aside"), by_hand);
 
-    // Revoked: the next version has no locker for it.
     {
         let admin_vault = client::admin_open(&admin).expect("open");
         let mut doc = admin_vault.doc.clone();
@@ -346,7 +328,6 @@ fn a_lan_vault_from_create_to_revoke() {
         Membership::Revoked { .. }
     ));
 
-    // Nothing printed about either machine carries a value.
     for paths in [&admin, &machine] {
         let shown = format!("{:?}", client::status(paths).expect("status"));
         for value in [&token, &other, &release, &fresh, &replacement] {
@@ -386,7 +367,6 @@ fn the_server_and_every_reader_refuse_a_key_the_vault_never_endorsed() {
         Membership::In { seq: 1, .. }
     ));
 
-    // A reader pinned to another key refuses the real vault outright.
     let stranger = envelope::signer_public(&seed).expect("public");
     let wrong = format!(
         "{}#{}",
@@ -395,12 +375,10 @@ fn the_server_and_every_reader_refuse_a_key_the_vault_never_endorsed() {
     );
     assert!(join_unattended(&lab.home("mc"), &wrong, "mc").is_err());
 
-    // An unattended join of an unpinned source is refused before it trusts anything.
     let machine = lab.home("mb");
     assert!(join_unattended(&machine, &lab.url, "mb").is_err());
     assert_eq!(client::config(&machine).expect("config"), None);
 
-    // At a terminal, the person compares the fingerprint.
     let shown = std::cell::RefCell::new(String::new());
     let outcome = client::join(
         &machine,
@@ -468,7 +446,6 @@ fn removing_an_admin_rotates_the_key_and_every_machine_re_pins() {
         "mb is no longer an admin"
     );
 
-    // The new key keeps publishing, and every reader keeps following.
     let after = synthetic("after");
     set(&admin, &Audience::Everyone, "after", &after);
     applied(client::sync(&machine, None).expect("sync"));
@@ -548,7 +525,6 @@ fn a_plain_text_file_at_a_path_is_read_as_is() {
     );
     assert_eq!(report.removed, ["only_mb"]);
 
-    // A world-readable file of secrets is refused rather than trusted.
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     assert!(client::sync(&machine, None).is_err());
 }
@@ -573,13 +549,11 @@ fn a_machine_that_knows_the_join_password_is_let_in_by_the_admins_subscriber() {
         .expect("create makes a join password");
     let pinned = format!("{}#{}", lab.url, created.signer);
 
-    // A wrong password asks too, but nothing lets it in.
     let stranger = lab.home("mx");
     assert!(matches!(
         join_with(&stranger, &pinned, "mx", Some(b"not-the-password-at-all")).expect("join"),
         JoinOutcome::Pending { .. }
     ));
-    // The right one, typed with blanks around it.
     let machine = lab.home("mb");
     let mut typed = b"  ".to_vec();
     typed.extend_from_slice(password.as_slice());
@@ -588,7 +562,6 @@ fn a_machine_that_knows_the_join_password_is_let_in_by_the_admins_subscriber() {
         join_with(&machine, &pinned, "mb", Some(&typed)).expect("join"),
         JoinOutcome::Pending { .. }
     ));
-    // No password: the code path, which the subscriber leaves to a person.
     let by_code = lab.home("mc");
     join_unattended(&by_code, &pinned, "mc").expect("join");
 
@@ -615,12 +588,10 @@ fn a_machine_that_knows_the_join_password_is_let_in_by_the_admins_subscriber() {
     hosts.sort_unstable();
     assert_eq!(hosts, ["mc", "mx"], "the others still wait for a person");
 
-    // A second pass approves nothing new and publishes nothing.
     let again = client::auto_approve(&admin).expect("auto-approve");
     assert!(again.approved.is_empty());
     assert_eq!(again.seq, None);
 
-    // The password never reaches a machine that is not an admin.
     let shown = std::fs::read_dir(machine.home.join(".secrets"))
         .expect("dir")
         .filter_map(Result::ok)
@@ -652,15 +623,11 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
         .join_password()
         .expect("create makes a join password");
     let pinned = format!("{}#{}", lab.url, created.signer);
-    // Before the vault is open, a machine that asks with no password waits for a person.
     let early = lab.home("me");
     join_unattended(&early, &pinned, "me").expect("join");
     let closed = client::auto_approve(&admin).expect("approve");
     assert!(closed.approved.is_empty(), "{:?}", closed.approved);
 
-    // The admin opens it: the password goes, and only admins could ever read either. The
-    // machine already waiting joins only by code: it may be one let go while the vault was
-    // closed, its approved request still queued.
     let opened = client::admin_open(&admin).expect("open");
     let me = client::requests(&admin, Some(&opened.doc)).expect("requests")[0]
         .recipient
@@ -677,8 +644,6 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     assert_eq!(doc.code_only(), std::slice::from_ref(&me));
     assert_eq!(Approval::of(&doc), Some(Approval::Open));
 
-    // A machine that asks with no password, and one that still sends a proof of the old
-    // password, are both let in in one publish; the one that asked before is not.
     let machine = lab.home("mb");
     assert!(matches!(
         join_unattended(&machine, &pinned, "mb").expect("join"),
@@ -702,7 +667,6 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
         client::sync(&early, None).expect("sync"),
         SyncOutcome::NotIn
     );
-    // Approved by its code, it is in, and its line goes.
     approve_key(&admin, "me", &me);
     assert!(
         client::admin_open(&admin)
@@ -718,8 +682,6 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
             Some(token.as_str())
         );
     }
-    // The approved requests stay queued: the new version judges them once, as members,
-    // publishes nothing, and the approver rests.
     let seq = held(&admin);
     assert!(settled.due(&source, seq, &listed(), approval));
     let again = client::auto_approve(&admin).expect("approve");
@@ -729,8 +691,6 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     settled.settle(again.judged);
     assert!(!settled.due(&source, held(&admin), &listed(), approval));
 
-    // Letting a machine go puts its key on a `code-only` line, so the request mb joined
-    // with, still queued, does not let it straight back in, nor does asking again.
     let open = client::admin_open(&admin).expect("open");
     let mb = recipient_of(&open.doc, "mb");
     let mut doc = open.doc.clone();
@@ -749,13 +709,11 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
         client::sync(&machine, None).expect("sync"),
         SyncOutcome::NotIn
     );
-    // A version that lets nobody go leaves the lines be.
     set(&admin, &Audience::Everyone, "note", "kept");
     let noted = client::admin_open(&admin).expect("open").doc.clone();
     assert!(noted.open());
     assert_eq!(noted.code_only(), std::slice::from_ref(&mb));
 
-    // Closed to approval by code, a machine that asks waits for a person again.
     let open = client::admin_open(&admin).expect("open");
     let mut doc = open.doc.clone();
     doc.set_open(false).expect("close");
@@ -769,8 +727,6 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     assert!(refused.approved.is_empty(), "{:?}", refused.approved);
     assert_eq!(client::sync(&late, None).expect("sync"), SyncOutcome::NotIn);
 
-    // Opened again, the machine let go is still kept out (its line outlived closing and
-    // opening), and the one that asked while it was closed joins only by code too.
     let open = client::admin_open(&admin).expect("open");
     let md = client::requests(&admin, Some(&open.doc))
         .expect("requests")
@@ -791,14 +747,12 @@ fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
     want.sort_unstable();
     assert_eq!(waiting, want);
 
-    // Approved by its code, the machine let go is back, and its line is gone; md's stays.
     approve_key(&admin, "mb", &mb);
     let back = client::admin_open(&admin).expect("open").doc.clone();
     assert_eq!(back.code_only(), std::slice::from_ref(&md));
     applied(client::sync(&machine, None).expect("sync"));
 }
 
-/// Admit `key` as `host` by hand, as `aterm secrets approve <code>` does.
 fn approve_key(admin_paths: &Paths, host: &str, key: &str) {
     let open = client::admin_open(admin_paths).expect("open");
     let mut doc = open.doc.clone();
@@ -807,7 +761,6 @@ fn approve_key(admin_paths: &Paths, host: &str, key: &str) {
     client::admin_publish(admin_paths, &open, &doc).expect("publish");
 }
 
-/// The key of `doc`'s machine `name`.
 fn recipient_of(doc: &Document, name: &str) -> String {
     doc.machines()
         .into_iter()
@@ -845,7 +798,6 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
     );
     applied(client::sync(&machine, None).expect("sync"));
 
-    // Revoked: the version that lets it go carries a new password...
     let open = client::admin_open(&admin).expect("open");
     let mb = recipient_of(&open.doc, "mb");
     let mut doc = open.doc.clone();
@@ -858,14 +810,12 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
         .join_password()
         .expect("still a join password");
     assert_ne!(renewed.as_slice(), password.as_slice());
-    // ...so the request it queued with the old one is not approved again,
     let again = client::auto_approve(&admin).expect("approve");
     assert!(again.approved.is_empty(), "{:?}", again.approved);
     assert_eq!(
         client::sync(&machine, None).expect("sync"),
         SyncOutcome::NotIn
     );
-    // nor one under a new key that proves the old one; the new one still admits.
     let stale = lab.home("mc");
     join_with(&stale, &pinned, "mc", Some(password.as_slice())).expect("join");
     let fresh = lab.home("md");
@@ -873,7 +823,6 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
     let admitted = client::auto_approve(&admin).expect("approve");
     assert_eq!(admitted.approved, ["md"]);
 
-    // A version that lets nobody go keeps the password.
     set(&admin, &Audience::Everyone, "note", "kept");
     let kept = client::admin_open(&admin)
         .expect("open")
@@ -882,9 +831,6 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
         .expect("a join password");
     assert_eq!(kept.as_slice(), renewed.as_slice());
 
-    // A closed vault writes no `code-only` line (an older aterm could not read it), but
-    // opening it while the request mb joined with is still queued holds every waiting
-    // request for its code: mb's, and mc's, which never was one.
     let open = client::admin_open(&admin).expect("open");
     assert!(open.doc.code_only().is_empty());
     let mut doc = open.doc.clone();
@@ -904,7 +850,6 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
 
 #[test]
 fn a_join_whose_subscriber_applied_the_approval_first_is_done() {
-    // A short hold, so the join's wait answers within a second of each pass.
     let lab = Lab::holding("race", Duration::from_secs(1));
     let admin = lab.home("ma");
     write_private(
@@ -924,9 +869,6 @@ fn a_join_whose_subscriber_applied_the_approval_first_is_done() {
         .join_password()
         .expect("create makes a join password");
     let machine = lab.home("mb");
-    // The subscriber the request hook installs runs at once: the admin's approver lets the
-    // machine in and the machine's subscriber applies that version before the join's own
-    // wait looks.
     let subscriber = || {
         assert_eq!(
             client::auto_approve(&admin).expect("approve").approved,
@@ -940,7 +882,6 @@ fn a_join_whose_subscriber_applied_the_approval_first_is_done() {
             source: format!("{}#{}", lab.url, created.signer),
             host: Some("mb".into()),
             interactive: false,
-            // A hang detector: the join is done at its first pass.
             wait: Duration::from_secs(60),
             confirm: &|_| panic!("an unattended join never asks"),
             password: &|| Some(SecretBytes::from(password.as_slice())),
@@ -984,7 +925,6 @@ fn removing_an_admin_by_any_publish_rotates_and_later_versions_carry_the_handoff
     }
     applied(client::sync(&asleep, None).expect("sync"));
 
-    // A plain publish that drops an admin rotates by itself.
     {
         let vault = client::admin_open(&admin).expect("open");
         let mut doc = vault.doc.clone();
@@ -995,7 +935,6 @@ fn removing_an_admin_by_any_publish_rotates_and_later_versions_carry_the_handoff
                 .rotated
         );
     }
-    // mc sleeps through the rotating version and two more.
     set(&admin, &Audience::Everyone, "one", &synthetic("one"));
     let last = synthetic("two");
     set(&admin, &Audience::Everyone, "two", &last);
@@ -1028,8 +967,6 @@ fn every_version_carries_the_whole_chain_so_the_first_key_still_admits() {
     let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
     let token = synthetic("token");
     set(&admin, &Audience::Everyone, "token", &token);
-    // What a build that carries the vault's first key pins (`ALAB_SIGNER` before a release
-    // catches up with a rotation).
     let first = format!("{}#{}", lab.url, created.signer);
     let asleep = lab.home("mz");
     join_unattended(&asleep, &first, "mz").expect("join");
@@ -1041,12 +978,10 @@ fn every_version_carries_the_whole_chain_so_the_first_key_still_admits() {
         let doc = vault.doc.clone();
         let done = client::admin_rotate(&admin, &vault, &doc).expect("rotate");
         assert!(done.rotated);
-        // The version that makes the second pair is the one builds before chains cannot read.
         assert_eq!(done.first_long_chain, rotations == 2, "{rotations}");
         if rotations == 1 {
             continue;
         }
-        // A new Mac pinned to the first key, two rotations on and three.
         let host = format!("m{rotations}");
         let machine = lab.home(&host);
         assert!(matches!(
@@ -1063,8 +998,6 @@ fn every_version_carries_the_whole_chain_so_the_first_key_still_admits() {
         applied(client::sync(&machine, None).expect("sync"));
         assert_eq!(read(&machine, "token").as_deref(), Some(token.as_str()));
     }
-    // A machine asleep across all three rotations follows the chain too, and keeps the keys
-    // it was reached through, which a build that retires them judges the pin by.
     assert_ne!(pinned_signer(&asleep), pinned_signer(&admin));
     applied(client::sync(&asleep, None).expect("sync"));
     assert_eq!(pinned_signer(&asleep), pinned_signer(&admin));
@@ -1129,17 +1062,14 @@ fn a_probe_names_a_vault_only_under_its_signer() {
     };
     assert_eq!(probed.seq, 1);
     assert_eq!(probed.fingerprint, created.fingerprint);
-    // Another signer's vault answered: not the one asked for, which no later try changes.
     let other = client::probe(&lab.url, &[7u8; 32], Duration::ZERO);
     assert!(
         matches!(other, Ok(ProbeOutcome::NotThisVault(_))),
         "{other:?}"
     );
-    // Nothing answering is a failure to reach the server, which a later try may get past.
     assert!(client::probe("http://127.0.0.1:9/v1/probed", &pin, Duration::ZERO).is_err());
 }
 
-/// A fresh machine key, as `age1…`.
 fn new_key() -> String {
     Identity::generate()
         .expect("random")
@@ -1147,7 +1077,6 @@ fn new_key() -> String {
         .to_bech32()
 }
 
-/// The version `paths` holds, as a machine in the vault.
 fn held(paths: &Paths) -> u64 {
     match client::status(paths).expect("status").membership {
         Membership::In { seq, .. } => seq,
@@ -1186,7 +1115,6 @@ fn removing_an_admin_renews_the_join_password_it_read() {
         .join_password()
         .expect("mb reads the password");
 
-    // `admins remove` keeps mb in [machines]; the version that drops it carries a new password,
     let vault = client::admin_open(&admin).expect("open");
     let mut doc = vault.doc.clone();
     assert!(doc.remove_admin("mb").expect("remove admin"));
@@ -1199,14 +1127,12 @@ fn removing_an_admin_renews_the_join_password_it_read() {
         .expect("still a join password");
     assert_ne!(renewed.as_slice(), known.as_slice());
     applied(client::sync(&second, None).expect("mb is still a machine"));
-    // so a key mb mints and proves with the password it read is not let in.
     let minted = lab.home("mb-minted");
     join_with(&minted, &pinned, "mbx", Some(known.as_slice())).expect("join");
     let refused = client::auto_approve(&admin).expect("approve");
     assert!(refused.approved.is_empty(), "{:?}", refused.approved);
     assert_eq!(refused.refused.len(), 1);
 
-    // A rotate-key that drops no admin keeps the password.
     let vault = client::admin_open(&admin).expect("open");
     let doc = vault.doc.clone();
     let done = client::admin_rotate(&admin, &vault, &doc).expect("rotate");
@@ -1234,8 +1160,6 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
     let listed = || client::requests(&admin, None).expect("requests");
     let mut settled = client::Settled::default();
 
-    // The person mistypes the password: the approver judges the request once, refuses it and
-    // leaves it be.
     let machine = lab.home("mb");
     assert!(matches!(
         join_with(
@@ -1258,8 +1182,6 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
         "a refused proof is not judged again"
     );
 
-    // They join again and type it right, the server letting the key change its request
-    // (`Lab::changing`): the new proof is judged at once, with nothing published between.
     join_with(&machine, &pinned, "mb", Some(password.as_slice())).expect("join");
     assert_eq!(held(&admin), 1, "nothing was published since");
     assert!(
@@ -1272,8 +1194,6 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
     settled.settle(approved.judged);
     applied(client::sync(&machine, None).expect("sync"));
 
-    // The approved request stays queued for days: the version that let it in is judged once,
-    // finding mb a machine, and then the approver rests.
     assert!(listed().iter().any(|request| request.host == "mb"));
     assert!(
         settled.due(&source, held(&admin), &listed(), Approval::Password),
@@ -1288,8 +1208,6 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
         "nothing is left to judge"
     );
 
-    // Another open vault at the same sequence can receive the identical request (including
-    // a proof of the old vault's password). Its judgment cannot inherit this vault's rest.
     let other = Lab::new("other");
     let other_admin = other.home("other-admin");
     let created = client::create(&other_admin, &other.url, None, Some("other-admin"))
@@ -1331,7 +1249,6 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
 
 #[test]
 fn a_taken_name_of_62_or_63_characters_still_gets_a_free_one() {
-    // A cut that falls just after a `-` leaves no `-` before the suffix.
     let cases = [
         ("b".repeat(62), Vec::new(), format!("{}-2", "b".repeat(61))),
         (
@@ -1350,7 +1267,6 @@ fn a_taken_name_of_62_or_63_characters_still_gets_a_free_one() {
             }
             let _ = sent.send(client::free_name(&doc, &asked));
         });
-        // A hang detector: the search ends at once.
         let name = got
             .recv_timeout(Duration::from_secs(60))
             .expect("free_name returns");
@@ -1364,10 +1280,8 @@ fn an_edit_saved_over_a_machine_admitted_meanwhile_keeps_it() {
     let (ma, mb, mc, md) = (new_key(), new_key(), new_key(), new_key());
     let mut base = Document::new_vault("ma", &ma);
     base.add_machine("mb", &mb).expect("add");
-    // The approver admits mc while the person edits...
     let mut current = base.clone();
     current.add_machine("mc", &mc).expect("add");
-    // ...who deletes mb, and adds a machine of their own under the name mc.
     let mut edited = base.clone();
     assert!(edited.remove_machine("mb", false).expect("remove"));
     edited.add_machine("mc", &md).expect("add");
@@ -1407,14 +1321,11 @@ fn an_edit_saved_over_an_open_vault_that_let_a_machine_go_keeps_it_out() {
     base.add_machine("mb", &mb).expect("add");
     base.add_machine("mc", &mc).expect("add");
     base.set_open(true).expect("open");
-    // Another admin lets mb and mc go while the person edits, which puts their keys on
-    // `code-only` lines...
     let mut current = base.clone();
     for (name, key) in [("mb", &mb), ("mc", &mc)] {
         assert!(current.remove_machine(name, false).expect("remove"));
         current.add_code_only(key).expect("code-only");
     }
-    // ...and the person's text, which began with both in, deletes mb and leaves mc be.
     let mut edited = base.clone();
     assert!(edited.remove_machine("mb", false).expect("remove"));
     client::keep_admitted(&base, &current, &mut edited).expect("merge");
@@ -1443,8 +1354,6 @@ fn an_edit_saved_over_another_admins_changes_to_who_is_in_keeps_them() {
         .expect("mc's own section");
     base.set_join_password(Some(b"synthetic-join-password-one"))
         .expect("password");
-    // While the person edits, another admin removes mb from [admins], revokes mc with its
-    // section, makes md an admin, and renews the join password...
     let mut current = base.clone();
     assert!(current.remove_admin("mb").expect("demote"));
     assert!(current.remove_machine("mc", true).expect("revoke"));
@@ -1452,7 +1361,6 @@ fn an_edit_saved_over_another_admins_changes_to_who_is_in_keeps_them() {
     current
         .set_join_password(Some(b"synthetic-join-password-two"))
         .expect("renew");
-    // ...and the person's text changes an entry and nothing of who is in.
     let mut edited = base.clone();
     edited
         .set_entry(&Audience::Everyone, "note", b"synthetic-note")
@@ -1474,7 +1382,6 @@ fn an_edit_saved_over_another_admins_changes_to_who_is_in_keeps_them() {
     assert!(edited.entry(&Audience::Everyone, "note").is_some());
     let password = |doc: &Document| doc.join_password().map(|p| p.as_slice().to_vec());
     assert_eq!(password(&edited), password(&current));
-    // What the person changed themselves stands: a password of their own, md deleted.
     let mut edited = base.clone();
     edited
         .set_join_password(Some(b"synthetic-join-password-mine"))
@@ -1486,8 +1393,6 @@ fn an_edit_saved_over_another_admins_changes_to_who_is_in_keeps_them() {
         Some(b"synthetic-join-password-mine".to_vec())
     );
     assert_eq!(edited.admins(), ["ma"]);
-    // A name another key took is the person's to give: refused, naming the key, until the
-    // text says.
     let rekeyed = new_key();
     let spelled = |doc: &Document, key: &str| {
         let text = String::from_utf8(doc.render().as_slice().to_vec()).expect("utf-8");
@@ -1530,7 +1435,6 @@ fn an_edit_that_lands_after_a_revocation_keeps_the_machine_out() {
         ["mb"]
     );
     applied(client::sync(&machine, None).expect("mb is in"));
-    // The edit begins; meanwhile another admin revokes mb, which renews the join password.
     let began = client::admin_open(&admin).expect("open");
     let base = began.doc.clone();
     {
@@ -1564,7 +1468,6 @@ fn an_edit_that_lands_after_a_revocation_keeps_the_machine_out() {
         client::sync(&machine, None).expect("sync"),
         SyncOutcome::NotIn
     );
-    // The request mb joined with, which the server keeps, is not approved again.
     assert!(
         client::auto_approve(&admin)
             .expect("approve")
@@ -1578,7 +1481,6 @@ fn an_edit_that_lands_after_the_approver_keeps_the_machine_and_the_password() {
     let lab = Lab::new("edit");
     let admin = lab.home("ma");
     let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
-    // The edit begins; mb proves the password and is let in while the editor is open.
     let began = client::admin_open(&admin).expect("open");
     let base = began.doc.clone();
     let password = base.join_password().expect("create makes a join password");
@@ -1631,7 +1533,6 @@ fn a_revoked_machine_that_joins_again_waits_and_asks_again() {
         Membership::Revoked { .. }
     ));
 
-    // Asking again makes it a machine that waits, whose subscriber re-asks hourly.
     assert!(matches!(
         join_unattended(&machine, &pinned, "mb").expect("join"),
         JoinOutcome::Pending { .. }
@@ -1662,10 +1563,8 @@ fn a_join_beside_another_vaults_leftover_state_starts_afresh() {
     }
     applied(client::sync(&machine, None).expect("sync"));
     assert_eq!(held(&machine), 5);
-    // source.toml is gone (moved aside, or a restore that missed it); state.toml stays.
     std::fs::remove_file(machine.dir.join("source.toml")).expect("remove source.toml");
 
-    // Another vault, at a lower version than the leftover state holds.
     let second = Lab::new("second");
     let other = second.home("mz");
     let theirs = client::create(&other, &second.url, None, Some("mz")).expect("create");
@@ -1683,13 +1582,10 @@ fn a_join_beside_another_vaults_leftover_state_starts_afresh() {
 
 #[test]
 fn a_join_with_the_password_says_how_to_fix_a_mistyped_one_before_it_waits() {
-    // A short hold, so each join's one-second wait ends with its first long-poll.
     let lab = Lab::holding("hint", Duration::from_secs(1));
     let admin = lab.home("ma");
     let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
     let pinned = format!("{}#{}", lab.url, created.signer);
-    // At a terminal the join asks for the password again; with it piped in, it is piped again,
-    // since a join without a terminal that is not given it asks by code alone.
     for (host, interactive) in [("mb", true), ("mc", false)] {
         let said = std::cell::RefCell::new(Vec::<String>::new());
         let outcome = client::join(
@@ -1713,7 +1609,6 @@ fn a_join_with_the_password_says_how_to_fix_a_mistyped_one_before_it_waits() {
         else {
             panic!("{said:?}");
         };
-        // On screen before the wait, which a Ctrl-C may end.
         assert!(hint < waiting, "{said:?}");
         let line = &said[hint];
         assert!(
@@ -1733,11 +1628,6 @@ fn a_join_with_the_password_says_how_to_fix_a_mistyped_one_before_it_waits() {
     }
 }
 
-/// A machine admitted under another name than it asked for (another machine holds that one:
-/// two Macs with one default name, or a Mac set up again) never learns it, so what it says of
-/// itself names it by its code. An admin command's refusal there names `admins add <code>`,
-/// which reaches its key, never the key that holds the name it asked for; and a word shaped
-/// like a code is never read as a name, which any machine may ask for.
 #[test]
 fn a_machine_admitted_under_another_name_is_named_by_its_code() {
     let lab = Lab::new("names");
@@ -1777,7 +1667,6 @@ fn a_machine_admitted_under_another_name_is_named_by_its_code() {
     );
     assert!(!refused.ends_with("admins add mb"), "{refused}");
 
-    // What the admin runs reaches the machine that showed the code.
     let vault = client::admin_open(&admin).expect("open");
     let named = client::machine_named(&vault.doc, &code.to_uppercase()).expect("its code");
     assert_eq!(named, "mb-2");
@@ -1791,9 +1680,6 @@ fn a_machine_admitted_under_another_name_is_named_by_its_code() {
         "the machine that holds the name it asked for is not"
     );
 
-    // A name passes through; a code no machine's key has is refused, even when a machine is
-    // so named (an older approver let one in under a code-shaped name): typed for a machine
-    // not yet in, it would reach that one.
     let shaped = "aaaa-bbbb-cccc-dddd";
     assert!(client::machine_named(&doc, shaped).is_err());
     doc.add_machine(shaped, &new_key())
@@ -1802,10 +1688,6 @@ fn a_machine_admitted_under_another_name_is_named_by_its_code() {
     assert!(client::machine_named(&doc, shaped).is_err());
 }
 
-/// A MACHINE THAT ASKS TO BE CALLED BY ANOTHER'S CODE (an open vault's queue is anyone's to
-/// read, codes and all) is let in under another name: a code stays the name of one key, so
-/// what an admin types to reach the machine that showed it (`admins add`, `revoke`, `set
-/// --for`) never reaches the one that asked for it, on this build or an older one.
 #[test]
 fn a_machine_asking_for_another_machines_code_as_its_name_is_let_in_under_another() {
     let lab = Lab::new("squat");
@@ -1845,7 +1727,6 @@ fn an_edit_at_a_path_that_lands_after_another_admin_keeps_the_machine_it_admitte
     let admin = Paths::for_home(&root.path().join("ma"));
     let created =
         client::create(&admin, shared.to_str().expect("utf-8"), None, Some("ma")).expect("create");
-    // The edit begins; meanwhile another admin admits mc, which joined the path.
     let began = client::admin_open(&admin).expect("open");
     let base = began.doc.clone();
     let machine = Paths::for_home(&root.path().join("mc"));
@@ -1868,7 +1749,6 @@ fn an_edit_at_a_path_that_lands_after_another_admin_keeps_the_machine_it_admitte
     edited
         .set_entry(&Audience::Everyone, "note", b"synthetic-note")
         .expect("set");
-    // The path, like the server, refuses a version that is not newer than the one it holds.
     assert!(
         client::admin_publish(&admin, &began, &edited).is_err(),
         "the save lands on a vault that moved"
@@ -1883,12 +1763,8 @@ fn an_edit_at_a_path_that_lands_after_another_admin_keeps_the_machine_it_admitte
     assert_eq!(read(&machine, "note").as_deref(), Some("synthetic-note"));
 }
 
-/// A wait for something that must happen: a hang detector, never a latency budget.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// Something at a loopback address that is no vault server: it reads one request head, sends
-/// `reply` (nothing at all when it is empty), closes, and hands the head back. Read with a
-/// hang detector, so a probe that never connects fails the test instead of hanging it.
 fn answer_once(reply: &'static [u8]) -> (String, std::sync::mpsc::Receiver<String>) {
     use std::io::{Read as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1911,10 +1787,6 @@ fn answer_once(reply: &'static [u8]) -> (String, std::sync::mpsc::Receiver<Strin
     (url, head)
 }
 
-/// Something that is no vault server answering at the vault's address (a web page on its
-/// port, a router's redirect or login, another protocol) is not the vault either: an answer
-/// no later try changes, not a failure to reach it. What the vault server itself can say
-/// stays a failure, since a later try may get past it.
 #[test]
 fn a_probe_answered_by_something_else_is_not_the_vault() {
     let probed = |reply: &'static [u8]| {
@@ -1928,12 +1800,10 @@ fn a_probe_answered_by_something_else_is_not_the_vault() {
     };
     for reply in [
         &b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 35\r\n\r\n<html><body>It works!</body></html>"[..],
-        // The vault server never redirects, and asks no credentials of a GET.
         b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://alab-secrets.local/v1/alab\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
         b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
-        // Not HTTP at all, and a body larger than any envelope.
         b"SSH-2.0-synthetic\r\n",
         b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n",
     ] {
@@ -1944,8 +1814,6 @@ fn a_probe_answered_by_something_else_is_not_the_vault() {
             String::from_utf8_lossy(reply)
         );
     }
-    // A cap the vault server met, and a connection closed with nothing said (a server that
-    // stopped mid-request).
     for reply in [
         &b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"[..],
         b"",

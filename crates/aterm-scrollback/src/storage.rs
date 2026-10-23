@@ -32,6 +32,7 @@ impl Iterator for ScrollbackStorageIter<'_> {
             match self.storage.read_segment(self.idx) {
                 Ok(lines) => {
                     if lines.is_empty() {
+                        // In-range index with no data (stale count or short
                         // decode): end of data.
                         return None;
                     }
@@ -39,6 +40,7 @@ impl Iterator for ScrollbackStorageIter<'_> {
                 }
                 Err((e, skip)) => {
                     // Direct `warn!`: an error cannot go through a log shim (see
+                    // log_shim.rs), which leaves one documented full-verify gap.
                     aterm_log::warn!("storage iter: skipping {skip} line(s) at {}: {e}", self.idx);
                     let skip = skip.min(total.saturating_sub(self.idx)).max(1);
                     self.idx = self.idx.saturating_add(skip);
@@ -54,6 +56,25 @@ impl Iterator for ScrollbackStorageIter<'_> {
 }
 
 /// Unified scrollback storage abstraction.
+///
+/// # Examples
+///
+/// Using with memory storage (default):
+///
+/// ```
+/// use aterm_scrollback::{ScrollbackStorage, Scrollback, Line};
+///
+/// // Create from Scrollback
+/// let mut storage: ScrollbackStorage = Scrollback::with_defaults().into();
+///
+/// // Push lines (returns Result: the trait's I/O-shaped signature)
+/// storage.push_line(Line::from("Hello")).unwrap();
+/// storage.push_line(Line::from("World")).unwrap();
+///
+/// // Access lines
+/// assert_eq!(storage.line_count(), 2);
+/// assert_eq!(storage.get_line_rev(0).unwrap().unwrap().to_string(), "World");
+/// ```
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ScrollbackStorage {

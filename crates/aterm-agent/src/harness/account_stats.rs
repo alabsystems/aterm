@@ -62,7 +62,7 @@ pub enum Missing {
     NoReading,
     /// The window's reset passed with no reading.
     WindowReset,
-    /// A limit reset was used inside the window, with no reading.
+    /// A limit reset was used inside the window, with no reading since.
     ResetUsed,
     /// No `/usage` was seen on this home.
     NoUsageSeen,

@@ -82,14 +82,14 @@ impl InputMark {
 
     /// The input's `act=`: what it means for the box it
     /// dismisses, read only from a proven author.
-    pub(crate) fn acting(mut self, act: Option<aterm_slog::ActWord>) -> Self {
+    pub(crate) const fn acting(mut self, act: Option<aterm_slog::ActWord>) -> Self {
         self.act = act;
         self
     }
 
     /// The request read this before validating its cause. A reset at any later
     /// point makes its eventual diagnostic observation ineligible, not retargeted.
-    pub(crate) fn within_epoch(mut self, epoch: Option<u32>) -> Self {
+    pub(crate) const fn within_epoch(mut self, epoch: Option<u32>) -> Self {
         self.epoch = epoch;
         self
     }
@@ -105,7 +105,7 @@ impl InputMark {
         self
     }
 
-    pub(crate) fn targets(&self, session: u64) -> bool {
+    pub(crate) const fn targets(&self, session: u64) -> bool {
         self.session == session
     }
 

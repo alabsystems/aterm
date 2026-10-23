@@ -69,6 +69,8 @@ fn exit_code(code: ExitCode) -> i32 {
         crate::exit::PASS
     } else if code == ExitCode::from(2) {
         crate::exit::USAGE
+    } else if code == ExitCode::from(3) {
+        crate::exit::COULD_NOT_RUN
     } else {
         crate::exit::FAILED
     }
@@ -203,7 +205,10 @@ impl Lane {
                 "harness card, cursor glow and inline-scroll frames: emission, CPU raster, GPU \
                  encode and GPU time, and the pass-economy ablation"
             }
-            Lane::Wasm => "the shipped wasm modules under node, plus their module-size ceilings",
+            Lane::Wasm => {
+                "the shipped wasm modules in the pinned chrome-headless-shell, plus their \
+                 module-size ceilings"
+            }
             Lane::Start => "fresh-process real-window startup timing of one aterm",
             Lane::Compare => "paired ABBA startup A/B of two aterm binaries",
             Lane::Cat => "cat 150 MB ascii + unicode, aterm vs the pinned ghostty tip",
@@ -236,7 +241,10 @@ impl Lane {
                 "targo (release build of aterm-bench with dev-seams), a GPU (its GPU keys need \
                  Metal, or wgpu with timestamp queries)"
             }
-            Lane::Wasm => "node, rustup stable + wasm32-unknown-unknown, wasm-opt",
+            Lane::Wasm => {
+                "chrome-headless-shell (verify provision), rustup stable + \
+                 wasm32-unknown-unknown, wasm-opt"
+            }
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
             Lane::Cat => "macOS on the M4-class bench box (or --dev-smoke), curl",
@@ -276,6 +284,11 @@ pub(crate) enum Status {
     Measured(String),
     /// It could not measure on this box: why, and what to do about it.
     Skip { why: String, fix: String },
+    /// A tool it needs, which a provider gives every develop machine, is
+    /// missing or did not start (docs/DESIGN-init-system-2026-10-20.md §8
+    /// rules 2 and 5): why, and the provider's remedy. Never a pass and never
+    /// a finding.
+    CouldNotRun { why: String, fix: String },
     /// A floor, fence or validation failed.
     Fail(Vec<String>),
 }
@@ -325,6 +338,16 @@ impl LaneRun {
     pub(crate) fn skip(why: impl Into<String>, fix: impl Into<String>) -> Self {
         Self {
             status: Status::Skip {
+                why: why.into(),
+                fix: fix.into(),
+            },
+            ..Self::pass()
+        }
+    }
+
+    pub(crate) fn could_not_run(why: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self {
+            status: Status::CouldNotRun {
                 why: why.into(),
                 fix: fix.into(),
             },
@@ -910,20 +933,22 @@ fn main(args: &[String]) -> ExitCode {
     if let Some((run, secs)) = &trend_run {
         rows.push(("trend", run, *secs));
     }
-    let (text, failed) = verdict(&rows);
+    let (text, code) = verdict(&rows);
     print!("{text}");
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    match code {
+        crate::exit::PASS => ExitCode::SUCCESS,
+        crate::exit::COULD_NOT_RUN => ExitCode::from(3),
+        _ => ExitCode::FAILURE,
     }
 }
 
-/// The closing ladder: one line per lane, then the verdict. Pure
-/// (unit-tested); `true` when a lane failed.
-pub(crate) fn verdict(rows: &[(&str, &LaneRun, f64)]) -> (String, bool) {
+/// The closing ladder: one line per lane, then the verdict, and its exit
+/// code: FAILED when a lane failed, else COULD NOT RUN when one could not
+/// run, else PASS. Pure (unit-tested).
+pub(crate) fn verdict(rows: &[(&str, &LaneRun, f64)]) -> (String, i32) {
     let mut s = String::from("== verify perf ==\n");
     let mut failed = Vec::new();
+    let mut unrun = Vec::new();
     let mut unmeasured = Vec::new();
     let judged = rows
         .iter()
@@ -937,11 +962,13 @@ pub(crate) fn verdict(rows: &[(&str, &LaneRun, f64)]) -> (String, bool) {
             Status::Recorded(path) => ("rec", format!("baseline rewritten -> {}", path.display())),
             Status::Measured(at) => ("meas", format!("measured, no floor to judge — {at}")),
             Status::Skip { why, fix } => ("skip", format!("{why} — {fix}")),
+            Status::CouldNotRun { why, fix } => ("NRUN", format!("COULD NOT RUN: {why} — {fix}")),
             Status::Fail(findings) => ("FAIL", findings.join("; ")),
         };
         s.push_str(&format!("{tag:<5} {name:<13} {secs:>7.1}s  {detail}\n"));
         match &run.status {
             Status::Fail(_) => failed.push(*name),
+            Status::CouldNotRun { .. } => unrun.push(*name),
             Status::Skip { .. } => unmeasured.push(format!("{name} (skipped)")),
             Status::Recorded(_) => unmeasured.push(format!("{name} (recorded, not compared)")),
             Status::Measured(_) => unmeasured.push(format!("{name} (measured; no floor)")),
@@ -950,8 +977,21 @@ pub(crate) fn verdict(rows: &[(&str, &LaneRun, f64)]) -> (String, bool) {
         }
     }
     if !failed.is_empty() {
-        s.push_str(&format!("verify perf: FAILED — {}\n", failed.join(", ")));
-    } else if unmeasured.is_empty() {
+        let mut head = failed.join(", ");
+        if !unrun.is_empty() {
+            head.push_str(&format!("; {} could not run", unrun.join(", ")));
+        }
+        s.push_str(&format!("verify perf: FAILED — {head}\n"));
+        return (s, crate::exit::FAILED);
+    }
+    if !unrun.is_empty() {
+        s.push_str(&format!(
+            "verify perf: COULD NOT RUN — {} could not run\n",
+            unrun.join(", ")
+        ));
+        return (s, crate::exit::COULD_NOT_RUN);
+    }
+    if unmeasured.is_empty() {
         s.push_str("verify perf: GREEN — every lane that ran was judged and held\n");
     } else if judged == 0 {
         s.push_str(&format!(
@@ -964,7 +1004,7 @@ pub(crate) fn verdict(rows: &[(&str, &LaneRun, f64)]) -> (String, bool) {
             unmeasured.join(", ")
         ));
     }
-    (s, !failed.is_empty())
+    (s, crate::exit::PASS)
 }
 
 #[cfg(test)]
@@ -1181,42 +1221,42 @@ mod tests {
     fn the_verdict_fails_on_a_failure_and_names_what_was_not_judged() {
         let pass = LaneRun::pass();
         let partial = LaneRun::not_judged("no baseline");
-        let skip = LaneRun::skip("no node", "install node");
+        let skip = LaneRun::skip("no Metal device", "run it on a Mac with a GPU");
         let fail = LaneRun::fail("x < floor");
         let measured = LaneRun::measured("ledger docs/measured/arena/x.md");
-        let (text, failed) = verdict(&[("throughput", &pass, 1.0)]);
-        assert!(!failed);
+        let (text, code) = verdict(&[("throughput", &pass, 1.0)]);
+        assert_eq!(code, crate::exit::PASS);
         assert!(text.contains("GREEN — every lane"), "{text}");
-        let (text, failed) = verdict(&[
+        let (text, code) = verdict(&[
             ("throughput", &pass, 1.0),
             ("restore", &partial, 1.0),
             ("wasm", &skip, 0.1),
         ]);
-        assert!(!failed);
+        assert_eq!(code, crate::exit::PASS);
         assert!(
             text.contains("NOT JUDGED: restore (no baseline), wasm (skipped)"),
             "{text}"
         );
         assert!(text.contains("skip  wasm"), "{text}");
         // A lane that measured without a floor never reads as judged.
-        let (text, failed) = verdict(&[("throughput", &pass, 1.0), ("compare", &measured, 60.0)]);
-        assert!(!failed);
+        let (text, code) = verdict(&[("throughput", &pass, 1.0), ("compare", &measured, 60.0)]);
+        assert_eq!(code, crate::exit::PASS);
         assert!(text.contains("meas  compare"), "{text}");
         assert!(
             text.contains("NOT JUDGED: compare (measured; no floor)"),
             "{text}"
         );
         assert!(!text.contains("GREEN — every lane"), "{text}");
-        let (text, failed) = verdict(&[("compare", &measured, 60.0)]);
-        assert!(!failed);
+        let (text, code) = verdict(&[("compare", &measured, 60.0)]);
+        assert_eq!(code, crate::exit::PASS);
         assert!(
             text.contains("NOTHING JUDGED — compare (measured; no floor)"),
             "{text}"
         );
         // A lane with no baseline judged nothing, so it is never "GREEN for
         // what was judged".
-        let (text, failed) = verdict(&[("throughput", &partial, 1.0), ("wasm", &skip, 0.1)]);
-        assert!(!failed);
+        let (text, code) = verdict(&[("throughput", &partial, 1.0), ("wasm", &skip, 0.1)]);
+        assert_eq!(code, crate::exit::PASS);
         assert!(
             text.contains("NOTHING JUDGED — throughput (no baseline), wasm (skipped)"),
             "{text}"
@@ -1229,9 +1269,29 @@ mod tests {
             text.contains("GREEN for what was judged; NOT JUDGED: resize floors (no baseline)"),
             "{text}"
         );
-        let (text, failed) = verdict(&[("throughput", &pass, 1.0), ("search", &fail, 2.0)]);
-        assert!(failed);
+        let (text, code) = verdict(&[("throughput", &pass, 1.0), ("search", &fail, 2.0)]);
+        assert_eq!(code, crate::exit::FAILED);
         assert!(text.contains("FAILED — search"), "{text}");
+        // A lane missing a provided tool could not run: never GREEN, never
+        // a skip, and a failure beside it still fails the run.
+        let unrun = LaneRun::could_not_run(
+            "no pinned chrome-headless-shell",
+            "targo --unverified verify provision",
+        );
+        let (text, code) = verdict(&[("throughput", &pass, 1.0), ("wasm", &unrun, 0.1)]);
+        assert_eq!(code, crate::exit::COULD_NOT_RUN);
+        assert!(text.contains("NRUN  wasm"), "{text}");
+        assert!(
+            text.contains("verify perf: COULD NOT RUN — wasm could not run"),
+            "{text}"
+        );
+        assert!(!text.contains("GREEN"), "{text}");
+        let (text, code) = verdict(&[("search", &fail, 1.0), ("wasm", &unrun, 0.1)]);
+        assert_eq!(code, crate::exit::FAILED);
+        assert!(
+            text.contains("FAILED — search; wasm could not run"),
+            "{text}"
+        );
     }
 
     #[test]

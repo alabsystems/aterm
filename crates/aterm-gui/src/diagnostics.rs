@@ -48,7 +48,7 @@ pub(crate) enum ConfigPresence {
 
 impl ConfigPresence {
     /// The bracketed token beside the path; a rejected file's names the consequence.
-    fn token(&self) -> &'static str {
+    const fn token(&self) -> &'static str {
         match self {
             Self::Absent => "absent — defaults",
             Self::Loaded => "present",
@@ -56,7 +56,7 @@ impl ConfigPresence {
         }
     }
 
-    fn rejection_reason(&self) -> Option<&str> {
+    const fn rejection_reason(&self) -> Option<&str> {
         match self {
             Self::Rejected(reason) => Some(reason.as_str()),
             _ => None,
@@ -106,7 +106,7 @@ fn report_config_target(launch_failure: Option<&str>) -> (String, ConfigPresence
     (path.display().to_string(), presence)
 }
 
-fn checkbox(on: bool) -> char {
+const fn checkbox(on: bool) -> char {
     if on { 'x' } else { ' ' }
 }
 
@@ -217,7 +217,7 @@ const GPU_BACKEND_LABEL: &str = "gpu (vulkan)";
 
 /// The renderer label: the platform GPU backend when GPU is the resolved default
 /// ([`crate::app_config::resolve_want_gpu`]), else `cpu`.
-fn renderer_label(gpu: bool) -> &'static str {
+const fn renderer_label(gpu: bool) -> &'static str {
     if gpu { GPU_BACKEND_LABEL } else { "cpu" }
 }
 
@@ -590,6 +590,7 @@ pub(crate) fn config_semantic_warnings(
     ));
     if let Some(privacy) = config.privacy.as_ref() {
         // Reserved and unimplemented: aterm answers no macOS consent or password dialog
+        // (docs/DESIGN-macos-debugger-access-2026-09-29.md §3.9).
         if privacy.auto_accept == Some(true) {
             warnings.push(ConfigSemanticWarning {
                 key: "privacy.auto_accept",
@@ -1169,6 +1170,8 @@ fn shell_config_warning(shell: &str) -> Option<String> {
 #[cfg(windows)]
 fn shell_config_warning(shell: &str) -> Option<String> {
     // `shell` names one program: a quoted value reaches `lpApplicationName` as a
+    // filename containing `"` (ERROR_INVALID_NAME, measured) whatever is inside, so it
+    // is checked first. Unquoted arguments are caught as a refinement below.
     if shell.contains('"') {
         return Some(format!(
             "shell: {shell:?} is quoted, and `shell` names one program rather than a \
@@ -1521,6 +1524,11 @@ pub(crate) fn config_backend_capability_warnings(
         ConfigCapabilityPlatform::Unsupported | ConfigCapabilityPlatform::Linux
     ) {
         // `confirm_multiline_paste` has NO warning here any more: it is live on
+        // every platform — the macOS sheet, the Windows MessageBoxW, and the
+        // Linux in-window `paste_banner` (the clipboard sweep closed the
+        // audited silent no-op this arm used to describe). Nor has
+        // `allow_notifications` on Linux, which delivers through the session
+        // bus's `org.freedesktop.Notifications` (`notify::deliver`).
         if platform == ConfigCapabilityPlatform::Unsupported && config.allow_notifications.is_some()
         {
             warnings.push(ConfigSemanticWarning {
@@ -2103,7 +2111,7 @@ fn theme_list(
     }
 }
 
-fn appearance_word(appearance: aterm_types::Appearance) -> &'static str {
+const fn appearance_word(appearance: aterm_types::Appearance) -> &'static str {
     match appearance {
         aterm_types::Appearance::Dark => "dark",
         aterm_types::Appearance::Light => "light",

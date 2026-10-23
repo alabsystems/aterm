@@ -261,8 +261,7 @@ mod tests {
     }
 
     /// The byte loop and the word fold `fnv1a_64_mix_u64` are astream-wire's;
-    /// [`fnv_mix_u64`] is this file's copy of that fold (its doc says why it is
-    /// not yet a call).
+    /// [`fnv_mix_u64`] is this file's copy of that fold.
     #[test]
     fn the_word_fold_agrees_with_astreams_byte_loop() {
         let fold = |prime: u64, bytes: &[u8]| {

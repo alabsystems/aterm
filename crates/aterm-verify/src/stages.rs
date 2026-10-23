@@ -1906,8 +1906,8 @@ fn linux_lane(ctx: &Ctx, r: &mut Report) {
 
 /// The `wasm-glue` check, two rows in the cells lane's directory:
 /// [`crate::wasm_glue`]'s toy (aterm-wasm-abi's toy module built on rustup's
-/// stable, bound in both flavors and held to its goldens, driven under node,
-/// and a planted conversion bug the driver must catch), then its oracle (the
+/// stable, bound and held to its goldens, driven in a headless Chromium, and
+/// a planted conversion bug the driver must catch), then its oracle (the
 /// goldens and the driver held to wasm-bindgen 0.2.108 on the toy's
 /// `#[wasm_bindgen]` twin, with its negative controls).
 fn wasm_glue(ctx: &Ctx, r: &mut Report) {
@@ -1916,7 +1916,7 @@ fn wasm_glue(ctx: &Ctx, r: &mut Report) {
     glue_row(
         ctx,
         r,
-        "wasm-glue (the generator on aterm-wasm-abi's toy, under node)",
+        "wasm-glue (the generator on aterm-wasm-abi's toy, in a browser)",
         "the toy",
         {
             let (root, work) = (root.clone(), work.clone());
@@ -1950,6 +1950,9 @@ fn glue_row(
         Ok((run, log)) => {
             r.raw(log);
             match run.status {
+                crate::perf::Status::CouldNotRun { why, fix } => {
+                    r.cannot_run(format!("{label} — {why} (fix: {fix})"));
+                }
                 crate::perf::Status::Skip { why, fix } => {
                     r.skip(format!("{label} — {why} (fix: {fix})"));
                 }
@@ -1966,6 +1969,7 @@ fn glue_row(
 }
 
 /// The `cells` check ([`crate::cells`]): the forge cells no fleet machine
+/// hosts (or each `--cell`), each linted for its own triple on rustup's
 /// toolchain (a STOCK EXCEPTION), one row per cell.
 fn foreign_cells(ctx: &Ctx, r: &mut Report) {
     if in_checkout(ctx, r, "cells") {
@@ -2128,6 +2132,44 @@ mod tests {
         measuring_tests(&c, &mut r);
         let (outcome, label) = r.outcomes().next().expect("a decision");
         assert_eq!(outcome, crate::Outcome::Skip, "{label}");
+    }
+
+    /// A `wasm-glue` row whose gate found no pinned browser (or another tool
+    /// a provider gives every develop machine) is COULD NOT RUN, naming the
+    /// fix once: never a skip, which `verify` reads as a pass. NEGATIVE
+    /// CONTROL: a record-only tool's absence stays a named skip, and a page
+    /// that failed is a FAIL.
+    #[test]
+    fn a_glue_row_without_its_browser_could_not_run() {
+        use crate::wasm_page::Refused;
+        let c = ctx(Scope::workspace());
+        let row = |run: crate::perf::LaneRun| {
+            let mut r = Report::new("wasm-glue");
+            glue_row(&c, &mut r, "wasm-glue (the toy)", "the toy", move |_| run);
+            r.outcomes()
+                .next()
+                .map(|(o, l)| (o, l.to_string()))
+                .expect("a row")
+        };
+        let (outcome, label) = row(Refused::Unavailable(
+            "no pinned chrome-headless-shell placed".into(),
+        )
+        .verdict("the toy's driver"));
+        assert_eq!(outcome, Outcome::Fail(Severity::CouldNotRun), "{label}");
+        assert_eq!(label.matches("fix:").count(), 1, "{label}");
+        assert!(
+            label.contains("no pinned chrome-headless-shell placed")
+                && label.contains("verify provision"),
+            "{label}"
+        );
+        let (outcome, label) = row(crate::perf::LaneRun::skip(
+            "wasm-bindgen 0.2.108 is not on PATH",
+            "targo --unverified verify provision --record",
+        ));
+        assert_eq!(outcome, Outcome::Skip, "{label}");
+        let (outcome, label) =
+            row(Refused::Failed("drive.mjs threw".into()).verdict("the toy's driver"));
+        assert_eq!(outcome, Outcome::Fail(Severity::GateFailed), "{label}");
     }
 
     /// The oracle's own verdicts are read as given: 1 is a finding even beside

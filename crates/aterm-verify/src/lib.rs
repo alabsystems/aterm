@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-verify`.
+//! `aterm-verify` — every aterm check as one CLI: `targo --unverified verify [CHECK|SET ...]`.
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: the verify CLI spawns its checks"
@@ -42,6 +42,7 @@ pub mod testrun;
 /// THE toolchain resolution, shared with atpkg (`aterm help rust`), the libc oracle's gate and the release cutter.
 pub use aterm_toolchain::discovery as toolchain;
 pub mod wasm_glue;
+mod wasm_page;
 pub mod wasm_smoke;
 
 use std::ffi::{OsStr, OsString};
@@ -993,6 +994,9 @@ pub fn checkout_root(cwd: &Path) -> Option<PathBuf> {
 /// The whole CLI, in-process.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
+    // `perf`, `soak`, `glue`, `provision` and the browser lane's verbs
+    // (`browser-site`, `browser-drive`) parse their own arguments, and none
+    // needs targo to start: a host without Trust drives the browser lane, and
     // `provision` names what provides targo where a row needs it.
     if args.first().is_some_and(|a| a == "perf") {
         return perf::run(&args[1..]);

@@ -867,9 +867,8 @@ struct Flow {
     began_list: bool,
 }
 
-/// The disk's side of the checks ("On the disk" in the module docs): the
-/// session cwd, the home directory and the scratch roots, each where it
-/// leads.
+/// The disk's side of the checks: the session cwd, the home directory and
+/// the scratch roots, each where it leads.
 struct Disk {
     cwd: Result<Vec<String>, String>,
     home: Option<Vec<String>>,
@@ -1160,6 +1159,10 @@ fn arith_words(head: &str, words: &[String], parts: &[Word]) -> Reading {
                 }
                 if w != "-v" {
                     // Any other `-` word is zsh's format (`printf -%d S=5`
+                    // sets `S`; `printf '--- %s ---\n' S=5` does not), which
+                    // bash refuses as an unknown option, assigning nothing
+                    // (bash 3.2 knows only `-v`, and stops at a cluster's
+                    // first unknown letter).
                     break;
                 }
                 k += 2;
@@ -1201,7 +1204,7 @@ fn arith_words(head: &str, words: &[String], parts: &[Word]) -> Reading {
 
 /// The words `test`/`[` read as a string or a file operand (numbered from
 /// the command's head, 0), by POSIX's rules for 1, 2 and 3 arguments, every
-/// operator a literal: `[ X ]`, `[ ! X ]`, `[ -n X ]`, `[ X = Y ]`, `[ !
+/// operator a literal: `[ X ]`, `[ ! X ]`, `[ -n X ]`, `[ X = Y ]`, `[ ! -d X ]`.
 fn test_operands(head: &str, words: &[Word]) -> Vec<usize> {
     let args = match (head, words.get(1..).unwrap_or_default()) {
         ("test", args) => args,
@@ -1348,6 +1351,7 @@ impl Eval<'_> {
         let (implies, guarded) = self.simple(cmd, &made, surely)?;
         if surely {
             // Its `${D:?}` expanded, or the shell exited: that `D` was not
+            // empty, and its run made, from here on.
             self.made = union(&self.made, &guarded);
         }
         self.prev = Flow {
@@ -1597,6 +1601,7 @@ impl Eval<'_> {
             }
             let names: Vec<&str> = if cluster {
                 // What is glued after the first option letter: `-vS` → `S`,
+                // `-rvS` → `vS`, `S`.
                 (2..t.len()).map(|k| &t[k..]).collect()
             } else {
                 t.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -1742,6 +1747,7 @@ impl Eval<'_> {
                         text.push_str(&t);
                         if *nonempty && w {
                             // `${D:?}`: the shell exits rather than go on
+                            // with `D` empty.
                             failed.push_str(&t);
                         } else {
                             failed.push_str(&f);

@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Irrelevant broadcast cursor movement may checkpoint late, but a delivered
-//! record must commit its topic cursor before a bridge restart can replay it.
+//! Broadcast cursor checkpointing model for topic delivery and crash recovery.
 
 use aterm_spec::derive::Model;
 
-/// One subscribed topic over four broadcast records. `Irrelevant` is the live
-/// frontier sweep, `Checkpoint` is its optional sharded state-file write,
-/// `Deliver` is the accounted delivery followed by the immediate state-file
-/// write, and `Crash` reloads that file. `Buggy=1` removes the delivered write:
-/// a crash then re-offers a record the endpoint already received.
+/// Formal model of broadcast topic cursor checkpointing across delivery and crash recovery.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn broadcast_cursor_checkpoint_model() -> Model {

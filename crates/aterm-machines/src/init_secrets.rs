@@ -14,6 +14,7 @@ use aterm_secrets::transport::Source;
 use std::cell::{Cell, OnceCell};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,35 @@ pub const PROBE_WAIT: Duration = Duration::from_secs(3);
 
 /// How long the look before a join or a sync waits for the vault ([`SecretsOps::reachable`]): the join's own fetch's bound, so a vault the join would reach is never stood aside from.
 pub const REACH_WAIT: Duration = Duration::from_secs(30);
+
+/// How long that look keeps trying while macOS holds this app's lookups and LAN connects for a person's answer to its Local Network question (`aterm_secrets::transport::Unheard::held`): a new Mac's first launch asks it beside its other questions, and the try after the answer reaches the vault within seconds. Once per process ([`CONSENT_SPENT`]).
+pub const CONSENT_WAIT: Duration = Duration::from_secs(3 * 60);
+
+/// A look of this process was held to the end of [`CONSENT_WAIT`] and reached nothing. macOS asks its question once per app, so the question was not answered in time, or was answered Don't Allow, or the failure was never the question (a server that takes a request and never answers, an address that drops packets): each later look tries once, as before, rather than hold every try of the setup, and the System State actions it refuses meanwhile, for another three minutes.
+static CONSENT_SPENT: AtomicBool = AtomicBool::new(false);
+
+/// `look`, given [`CONSENT_WAIT`] while `spent` is unset and no patience after; `held` hears what `look` says of its first held try. A look that was held and still found nothing sets `spent`; one that then heard an answer, or was never held, leaves it.
+fn patient_look(
+    spent: &AtomicBool,
+    held: &dyn Fn(&str),
+    look: impl FnOnce(Duration, &dyn Fn(&str)) -> Look,
+) -> Look {
+    let patience = if spent.load(Ordering::Relaxed) {
+        Duration::ZERO
+    } else {
+        CONSENT_WAIT
+    };
+    let was_held = Cell::new(false);
+    let told = |why: &str| {
+        was_held.set(true);
+        held(why);
+    };
+    let answer = look(patience, &told);
+    if was_held.get() && matches!(answer, Look::Unreached(_)) {
+        spent.store(true, Ordering::Relaxed);
+    }
+    answer
+}
 
 /// Why a run has no vault to join, when it may not ask for one.
 const UNCONFIGURED: &str =
@@ -78,7 +108,7 @@ pub trait SecretsOps: Send + Sync {
     /// Nothing answered, or the server refused the GET as the vault server can (a `5xx`).
     fn probe_alab(&self) -> aterm_secrets::Result<ProbeOutcome>;
 
-    /// What the vault at `source` answers now ([`aterm_secrets::client::look`]: one GET of a URL bounded by [`REACH_WAIT`], a read of a path): a vault, nothing (the network, or a server a later try may get past), or no vault there (no file at the path, a `404`, a login page).
+    /// What the vault at `source` answers now ([`aterm_secrets::client::look`]: a GET of a URL bounded by [`REACH_WAIT`], tried again for up to [`CONSENT_WAIT`] while macOS holds it, or a read of a path): a vault, nothing (the network, or a server a later try may get past), or no vault there (no file at the path, a `404`, a login page).
     fn reachable(&self, source: &Source) -> Look;
 
     /// Copy this Mac's vault files (`source.toml`, `state.toml`) into `into` before a join
@@ -245,7 +275,15 @@ impl SecretsOps for LiveSecrets {
     }
 
     fn reachable(&self, source: &Source) -> Look {
-        aterm_secrets::client::look(source, REACH_WAIT)
+        let held = |why: &str| {
+            self.say(&format!(
+                "the vault does not answer yet ({why}); if macOS asks whether this app may find devices on your local network, Allow lets this Mac reach it; aterm keeps trying for up to {} minutes",
+                CONSENT_WAIT.as_secs() / 60
+            ));
+        };
+        patient_look(&CONSENT_SPENT, &held, |patience, held| {
+            aterm_secrets::client::look(source, REACH_WAIT, patience, held)
+        })
     }
 
     fn keep(&self, into: &Path, replaces: &Replaces) -> aterm_secrets::Result<()> {
@@ -795,8 +833,12 @@ impl Vault {
 
     /// Put the subscriber in place when the probe planned it: install it
     /// ([`Vault::install`]), or for a selected vault only when it does not run, so an
-    /// unattended retry does not restart a running one.
-    ///
+    /// unattended retry does not restart a running one. One that stopped after the probe is
+    /// the next try's: its line's revert names undoing it. Answers whether it is in place:
+    /// System State's setup, run from a copy of aterm that goes away
+    /// ([`SecretsOps::fleeting`]), installs none and stands aside until aterm is opened from
+    /// where it is installed, where the next try installs it; a terminal's `aterm init`
+    /// keeps the refusal, whose `--program` it can pass.
     /// # Errors
     /// The install failed.
     fn subscribe(&self) -> Result<bool, String> {
@@ -1749,6 +1791,72 @@ mod tests {
         fn now(&self) -> u64 {
             self.inner.now()
         }
+    }
+
+    /// The look gets [`CONSENT_WAIT`] until one was held and still reached nothing; every
+    /// look after tries once. A look that was never held, one held that then heard the
+    /// vault, and one held that heard no vault there spend nothing. `held` hears the look's
+    /// held reason. Negative control: a fresh flag gives the wait again.
+    #[test]
+    fn only_a_look_held_to_no_answer_spends_the_consent_wait() {
+        let spent = AtomicBool::new(false);
+        let heard = std::cell::RefCell::new(Vec::new());
+        let held = |why: &str| heard.borrow_mut().push(why.to_owned());
+        let given = std::cell::RefCell::new(Vec::new());
+        let look = |answer: Look, holds: bool| {
+            let given = &given;
+            move |patience: Duration, told: &dyn Fn(&str)| {
+                given.borrow_mut().push(patience);
+                if holds {
+                    told("dns: no answer within 8000ms");
+                }
+                answer
+            }
+        };
+        let refused = || Look::Unreached("fetching …: Connection refused".into());
+        assert_eq!(
+            patient_look(&spent, &held, look(refused(), false)),
+            refused()
+        );
+        assert_eq!(
+            patient_look(&spent, &held, look(Look::Answers, true)),
+            Look::Answers
+        );
+        let none = Look::NoVault("a login page".into());
+        assert_eq!(patient_look(&spent, &held, look(none.clone(), true)), none);
+        assert!(!spent.load(Ordering::Relaxed));
+        let unheard = Look::Unreached("dns: no answer within 8000ms".into());
+        assert_eq!(
+            patient_look(&spent, &held, look(unheard.clone(), true)),
+            unheard
+        );
+        assert!(spent.load(Ordering::Relaxed));
+        assert_eq!(
+            patient_look(&spent, &held, look(unheard.clone(), false)),
+            unheard
+        );
+        assert_eq!(
+            *given.borrow(),
+            [
+                CONSENT_WAIT,
+                CONSENT_WAIT,
+                CONSENT_WAIT,
+                CONSENT_WAIT,
+                Duration::ZERO
+            ]
+        );
+        assert_eq!(heard.borrow().len(), 3);
+        assert!(
+            heard
+                .borrow()
+                .iter()
+                .all(|why| why == "dns: no answer within 8000ms")
+        );
+
+        let fresh = AtomicBool::new(false);
+        given.borrow_mut().clear();
+        patient_look(&fresh, &held, look(unheard, false));
+        assert_eq!(*given.borrow(), [CONSENT_WAIT]);
     }
 
     #[test]

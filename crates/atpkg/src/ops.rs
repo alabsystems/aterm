@@ -177,11 +177,16 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
 pub(crate) fn active_builds_in(scan: &BinScan) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for target in scan.targets() {
+        // A shim that names a build is not a build that is there, so the target is stat'd
+        // and `list`, `which` and `doctor` agree
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Only proved absence drops
+        // it: a store this user may execute but not stat (EACCES, EPERM, EIO) is still
         // there ([`crate::store::Presence`]).
         if crate::store::presence(target).is_absent() {
             continue;
         }
         if let Some((program, build)) = program_build_of_target(target) {
+            // Last write wins (`read_dir` order where a program's tools disagree): never
             // make a destructive decision from this number.
             out.insert(program, build);
         }
@@ -244,6 +249,7 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
             for b in builds.flatten() {
                 let bname_os = b.file_name();
                 if let Some(n) = bname_os.to_str().and_then(crate::store::parse_build_name) {
+                    // Only complete builds count: a tree a crash left partial has no
                     // marker, and counting it would report up to date and never repair it.
                     if crate::store::build_is_complete(&b.path()) {
                         out.push((pname.clone(), n));

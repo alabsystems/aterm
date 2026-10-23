@@ -327,6 +327,7 @@ impl CatBaker {
     /// Peek [`CatBaker::host_tile`]'s cache without supplying texels: the same lookup and LRU touch as its hit branch, `None` on a miss, no version bump or budget spend.
     #[inline]
     pub fn host_peek(&mut self, host_id: u64) -> Option<CatTile> {
+        // Mirrors `host_tile`'s uninitialised refusal; `begin_frame` clears the
         // slots on any metric change, so nothing could match anyway.
         if self.cell_h == 0 {
             return None;
@@ -534,6 +535,7 @@ impl CatColorKey {
         let accent = if s < 0.12 {
             12
         } else {
+            // Round to the nearest 30° family; the half-bucket offset makes 359°
             // and 1° share family 0.
             (((h + 15.0) / 30.0).floor() as u8) % 12
         };
@@ -738,6 +740,8 @@ fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
 #[inline]
 #[must_use]
 pub const fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, f32), f32) {
+    // Whiskers reach onto the terminal background, so they need the outline's
+    // contrast guarantee. Internal face ink stays fixed so expressions survive
     // on pale coats.
     if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {
         return (fills.outline, 1.0);

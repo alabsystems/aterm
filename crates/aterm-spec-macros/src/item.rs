@@ -23,8 +23,6 @@ impl FnItem {
         self.tokens.iter().cloned().collect()
     }
 
-    /// The top-level tokens with None-delimited groups read through, for
-    /// looking at; never emitted.
     fn flat(&self) -> Vec<TokenTree> {
         Cursor::new(self.stream(), Span::call_site()).collect()
     }
@@ -95,8 +93,6 @@ impl FnItem {
     }
 }
 
-/// `body` (a `{ ... }` block, or a None-delimited group a `$b:block` fragment
-/// wrapped it in) with `probe` after its inner attributes.
 fn prepend(body: &TokenTree, probe: &TokenStream) -> Option<TokenTree> {
     let TokenTree::Group(group) = body else {
         return None;

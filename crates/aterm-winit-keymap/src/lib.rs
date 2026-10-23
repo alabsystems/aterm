@@ -323,7 +323,8 @@ const fn is_unicode_scalar(v: u32) -> bool {
     v <= 0xD7FF || (v >= 0xE000 && v <= 0x10_FFFF)
 }
 
-/// Encode a Kitty key event descriptor `` into a 14-byte little-endian wire frame.
+/// Encode a Kitty key event descriptor `(unicode_key, shifted_key, base_layout_key,
+/// modifiers_mask, event_type)` into a 14-byte little-endian wire frame.
 #[inline]
 #[must_use]
 pub const fn encode_kitty_key_wire_le(
@@ -359,7 +360,8 @@ pub const fn encode_kitty_key_wire_le(
     ])
 }
 
-/// Decode a 14-byte little-endian Kitty key event wire frame produced.
+/// Decode a 14-byte little-endian Kitty key event wire frame produced by
+/// [`encode_kitty_key_wire_le`].
 #[inline]
 #[must_use]
 pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, char, u8, u8)> {
@@ -392,7 +394,8 @@ pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, ch
     Some((u, s, b, modifiers_mask, event_type))
 }
 
-/// Encode a Kitty key event descriptor `` into a 14-byte big-endian wire frame.
+/// Encode a Kitty key event descriptor `(unicode_key, shifted_key, base_layout_key,
+/// modifiers_mask, event_type)` into a 14-byte big-endian wire frame.
 #[inline]
 #[must_use]
 pub const fn encode_kitty_key_wire_be(

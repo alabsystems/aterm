@@ -252,7 +252,7 @@ fn factory() -> Result<Com, StepError> {
     )
 }
 
-/// Decode `bytes` to straight sRGB RGBA8, top-down: ``.
+/// Decode `bytes` to straight sRGB RGBA8, top-down: `(rgba, width, height)`.
 pub(crate) fn decode_rgba8(
     bytes: &[u8],
     max_dimension: usize,

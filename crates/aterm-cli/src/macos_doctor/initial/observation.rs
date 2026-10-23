@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Read-only result identity. Open descriptors pin atomic publications so a
-//! record that changes and returns to the same contents cannot revive old rows.
+//! Read-only result identity.
 
 use super::{InitialSetupSnapshotError, Path, Records};
 use std::fs::File;
@@ -23,8 +22,7 @@ impl PartialEq for Publication {
 
 impl Eq for Publication {}
 
-/// Pinned namespace identity only. This neither reads records nor proves that
-/// a failed writer flushed them; recovery must compare a later strict observation.
+/// Pinned namespace identity only.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Publications([Option<Publication>; 3]);
 
@@ -62,7 +60,6 @@ pub(super) fn publications(root: &Path) -> Result<Publications, String> {
 }
 
 /// An opaque observation of setup records, not permission to perform setup.
-/// Cloning retains the publications against inode reuse until cached rows expire.
 #[derive(Clone, PartialEq, Eq)]
 pub struct InitialSetupObservation {
     pub(super) records: Records,
@@ -83,8 +80,7 @@ impl std::fmt::Debug for InitialSetupObservation {
     }
 }
 
-/// An operation's original result and the state it observed. An absent
-/// observation must never be attached to a later state by the caller.
+/// An operation's original result and the state it observed.
 #[derive(Debug)]
 pub struct InitialSetupObserved<T> {
     pub result: Result<T, String>,
