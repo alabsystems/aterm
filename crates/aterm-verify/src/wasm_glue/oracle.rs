@@ -271,6 +271,8 @@ fn read(path: &Path) -> Result<String, String> {
 }
 
 /// The twin's source: the toy's, with `#[export]` spelled `#[wasm_bindgen]`
+/// and `export_runtime!()` replaced by wasm-bindgen imports ([`TWIN_HOST`]).
+///
 /// # Errors
 /// The toy no longer has a line the rewrite needs.
 fn twin_source(toy: &str) -> Result<String, String> {
@@ -293,6 +295,8 @@ fn twin_source(toy: &str) -> Result<String, String> {
 }
 
 /// The staged toy manifest with its `[dependencies]` table replaced: the
+/// pinned wasm-bindgen, and aterm-wasm-abi without the export layer.
+///
 /// # Errors
 /// The manifest has no `[dependencies]` table to replace.
 fn twin_manifest(staged: &str) -> Result<String, String> {

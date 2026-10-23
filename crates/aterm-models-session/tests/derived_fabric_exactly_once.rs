@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `FabricExactlyOnce`, exactly once across the bridge's round at one inbox
-//! offset (`aterm-link`'s `bridge.rs`, the endpoint's `cmd_deliver` and `cmd_link_log`):
-//! proved at `Buggy = 0` with every action firing, each of the five defects caught on the
-//! invariant written for it, and the hand-traced counterexamples walked step by step.
-//! Tier-1 is `aterm-link`'s deterministic simulation (`sim`,
-//! `the_round_refines_its_exactly_once_model`).
+//! Tier-0 tests for `FabricExactlyOnce`: action coverage, mutant invariant checks, and counterexample traces.
 
 use aterm_models_session::fabric_exactly_once_model;
 use aterm_spec::interp;
@@ -74,18 +69,12 @@ fn fabric_exactly_once_each_defect_breaks_its_own_invariant() {
 fn fabric_exactly_once_the_traced_counterexamples_end_where_the_doc_says() {
     let model = fabric_exactly_once_model();
     let traces: [(i64, &str, Vec<&str>); 5] = [
-        // 1: a kill before the commit; the relaunch's group hands the record over again,
-        // and an endpoint with no dedup makes it a second row.
         (
             1,
             "NoDuplicate",
             vec!["Publish", "Deliver", "Kill", "Relaunch", "Deliver"],
         ),
-        // 2: the group is committed past the record before it is delivered, and the
-        // bridge dies: the record is never a row and never offered again.
         (2, "NoSkip", vec!["Publish", "CommitEarly"]),
-        // 3: a move takes the record; the endpoint keeps its offset, and the record the
-        // offset names now is answered as the old one's row and committed past.
         (
             3,
             "NoSkip",
@@ -100,8 +89,6 @@ fn fabric_exactly_once_the_traced_counterexamples_end_where_the_doc_says() {
                 "Commit",
             ],
         ),
-        // 4: a move that kept the record and only its commit; an endpoint that forgets
-        // every offset at any move takes the redelivery as a new row.
         (
             4,
             "NoDuplicate",
@@ -114,8 +101,6 @@ fn fabric_exactly_once_the_traced_counterexamples_end_where_the_doc_says() {
                 "Deliver",
             ],
         ),
-        // 5: the owed commit outlives a move that took the record: the next record at
-        // the offset is committed past before anything delivers it.
         (
             5,
             "NoSkip",

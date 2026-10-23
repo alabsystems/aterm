@@ -67,7 +67,8 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Pull as many whole bytes as fit into the accumulator.
+    /// Pull as many whole bytes as fit into the accumulator. The `<= 56` guard
+    /// keeps the shift below 64.
     fn refill(&mut self) {
         let mut bits = self.bits_in_buffer;
         let mut buf = self.bit_buffer;
@@ -170,7 +171,9 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// Bits consulted by the flat root lookup table.
+/// Bits consulted by the flat root lookup table. Nine covers the whole fixed
+/// literal/length alphabet; longer codes fall back to the bit-at-a-time walk,
+/// so the table stays one flat level with no new error paths.
 const ROOT_BITS: u32 = 9;
 /// Entries in the root table: one per distinct `ROOT_BITS`-bit prefix.
 const ROOT_SIZE: usize = 1 << ROOT_BITS;
@@ -330,7 +333,8 @@ impl Huffman {
         self.decode_bitwise(br)
     }
 
-    /// Build this alphabet's root table if it does not have one yet.
+    /// Build this alphabet's root table if it does not have one yet. Called
+    /// once per block after `ROOT_BUILD_AFTER` symbols; kept out of line.
     #[cold]
     #[inline(never)]
     fn arm_root(&mut self) {
@@ -339,7 +343,8 @@ impl Huffman {
         }
     }
 
-    /// Decode one symbol one bit at a time (the `puff.c` walk).
+    /// Decode one symbol one bit at a time (the `puff.c` walk). `#[inline]` so
+    /// an alphabet with no root table runs this with no extra call layer.
     #[inline]
     fn decode_bitwise(&self, br: &mut BitReader) -> Result<u16, InflateError> {
         let mut code: i32 = 0;
@@ -533,7 +538,8 @@ fn inflate_block(
     block_loop::<true>(br, out, max_output, lit, dist, 0).map(|_| ())
 }
 
-/// The literal/match loop.
+/// The literal/match loop. `TABLE` selects the root-table decoder over the
+/// walk, so each phase compiles to a loop with only its own decoder.
 fn block_loop<const TABLE: bool>(
     br: &mut BitReader,
     out: &mut Vec<u8>,

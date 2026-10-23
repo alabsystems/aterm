@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `IncarnationLease`, the incarnation lease (`aterm-link`'s `state.rs`, "The
-//! incarnation lease"): proved at `Buggy = 0` with every action firing, each of the four
-//! defects caught on the invariant written for it and on the fence itself, and the
-//! hand-traced counterexamples walked step by step. Tier-1 is `aterm-link/src/state.rs`'s
-//! `the_incarnation_lease_refines_its_model`.
+//! Tier-0 conformance tests for the `IncarnationLease` model.
 
 use aterm_models_session::incarnation_lease_model;
 use aterm_spec::interp;
@@ -70,8 +66,6 @@ fn incarnation_lease_each_defect_breaks_its_own_invariant_and_the_fence() {
 #[test]
 fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
     let model = incarnation_lease_model();
-    // Two attaches of the first boot share one flush; the second lease's record of what
-    // was taken is written back, and the power goes.
     let first_boot: &[&str] = &[
         "Plan",
         "TakeFlushed",
@@ -81,17 +75,12 @@ fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
         "Take",
         "Present",
     ];
-    // Then a third attach runs the lease out and is killed after its rename.
     let run_out: &[&str] = &["Plan", "KillRenamed"];
     let traces: [(i64, Vec<&str>); 4] = [
-        // 1: the next boot trusts the written-back lease (`used = 1`, top 2 — the top the
-        // media holds) and takes 2 again.
         (
             1,
             [first_boot, &["PowerLoss", "Plan", "Take", "Present"]].concat(),
         ),
-        // 2: the retry trusts the lease although `inc` (renamed in, not flushed) is not its
-        // top, takes 3 under the unflushed top, and the power goes before the top lands.
         (
             2,
             [
@@ -109,8 +98,6 @@ fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
             ]
             .concat(),
         ),
-        // 3: the lease is written before its top is flushed; the kill after the rename
-        // leaves a lease that names the unflushed top, and the retry trusts it.
         (
             3,
             [
@@ -128,8 +115,6 @@ fn incarnation_lease_the_traced_counterexamples_end_where_the_doc_says() {
             ]
             .concat(),
         ),
-        // 4: the will goes out while the first flush is still in flight; the power goes
-        // before it lands, and the next boot takes the same incarnation.
         (
             4,
             vec![

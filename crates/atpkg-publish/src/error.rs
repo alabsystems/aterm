@@ -1,21 +1,18 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The one error type, and the exit code each kind is: `0` done, `1` a gate refused, `2`
-//! the command line is wrong, `3` could not run (something this run needs is missing, so
-//! nothing was decided).
+//! Error type and process exit codes (`0` done, `1` refused, `2` usage, `3` could not run).
 
 use std::fmt;
 
 /// Why a verb did not finish.
 #[derive(Debug)]
 pub enum Error {
-    /// A gate refused. The message says what is wrong and names the fix.
+    /// A gate refused.
     Refused(String),
     /// The command line is wrong.
     Usage(String),
-    /// Something this run needs is missing or did not answer — a tool, a file, the
-    /// network — so nothing was decided.
+    /// Something this run needs is missing or did not answer.
     CannotRun(String),
 }
 
@@ -42,7 +39,7 @@ impl Error {
 
     /// The process exit code this error is.
     #[must_use]
-    pub fn exit_code(&self) -> u8 {
+    pub const fn exit_code(&self) -> u8 {
         match self {
             Self::Refused(_) => 1,
             Self::Usage(_) => 2,

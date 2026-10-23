@@ -55,6 +55,8 @@ fn post(ctl: &mut Ctl, clock: Clock, from: &str, to: &str, text: &str) -> (u64, 
 }
 
 /// Park on `sid`'s inbox until a note row newer than `since` is there: `(the
+/// newest such row's id, the stamp when the answer arrived)`.
+///
 /// # Errors
 ///
 /// Any answer but a row — `OK timeout` after the hang detector — as the
@@ -189,6 +191,10 @@ struct Consumed {
 }
 
 /// Read `sid`'s inbox like a reader until `want` DISTINCT messages whose text
+/// is `<prefix><j>` have arrived: each wake is followed by a listing, and a
+/// row is stamped VISIBLE at the wake that covered it (or at the listing, for
+/// one that arrived between the two).
+///
 /// # Errors
 ///
 /// A wait that timed out, or a row whose text is not `<prefix><j>` — a stray,
@@ -327,6 +333,8 @@ impl Credit {
     }
 
     /// Wait until post `posted` may go out. `false` when the reader stopped
+    /// first: its own answer says why.
+    ///
     /// # Panics
     ///
     /// After [`DEADLINE`] with the reader still running and no room — the hang
@@ -430,7 +438,12 @@ fn ms_opt(a: Option<u64>, b: Option<u64>) -> Option<f64> {
     Some(ms(a?, b?))
 }
 
-/// THE LAST RECORDS, SEEN DURABLE.
+/// THE LAST RECORDS, SEEN DURABLE. On a broker that serves ordered, wait until
+/// its durable head has caught up with its acked head as it stands now — the
+/// horizon's full flush, at most the horizon plus a batch and a flush away —
+/// so the phases' last records are seen durable before the sampler stops
+/// (without it, the burst's whole "every record durable" milestone falls
+/// after the run).
 fn await_durable(broker: &Broker) {
     if broker.served_durability().served != astream_broker::Tier::Ordered {
         return;
@@ -541,7 +554,9 @@ fn ticks_line(t: Ticks) -> String {
 /// Publishes in one yardstick block.
 const CALIBRATION_PUBLISHES: usize = 50;
 
-/// The producer id the yardstick publishes under.
+/// The producer id the yardstick publishes under. No bridge's (a bridge's is
+/// its own, bound to its node's cap), so its records never meet a bridge's
+/// dedup; its subject (`/f/<F>/bench/…`) is under no filter a bridge holds.
 const CALIBRATION_PRODUCER: u64 = 0x0fab_0be7_0000_0001;
 
 /// THE YARDSTICK: blocks of `CALIBRATION_PUBLISHES` bare publishes, one at a
@@ -1356,7 +1371,9 @@ struct AttachRows {
 }
 
 impl AttachRows {
-    /// The last of them, the node row included: when the attach is done.
+    /// The last of them, the node row included: when the attach is done. (A
+    /// bridge that wrote its node row after a session's would otherwise be
+    /// "done" before its node said live.)
     fn last(&self) -> u64 {
         self.sessions
             .iter()
@@ -1761,7 +1778,9 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     (json, md)
 }
 
-/// What the run's broker promised, for the report's head and its JSON.
+/// What the run's broker promised, for the report's head and its JSON. Each
+/// world's section also says what its broker SERVES, read from the broker
+/// (astream serves ordered strict off Apple and off the boot volume).
 fn broker_note(spec: &Spec) -> String {
     match spec.durability {
         Tier::Strict => "astream Broker::open_opts with aterm's strict options (Durability::Strict: \

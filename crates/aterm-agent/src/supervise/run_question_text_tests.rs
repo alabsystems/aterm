@@ -598,7 +598,8 @@ fn two_questions_and_their_review_are_answered_by_text_then_submitted() {
     );
 }
 
-/// The session's word `short-term` answers over the window's `recommended`.
+/// The session's word `short-term` answers over the window's `recommended`. Negative control:
+/// with the word unset, the recommended option is pressed and nothing written.
 #[test]
 fn the_sessions_short_term_word_answers_over_a_global_recommended() {
     for word in [Some("short-term"), None] {
@@ -1075,7 +1076,8 @@ fn a_persons_key_between_the_read_and_the_send_skips_the_policy_text() {
     );
 }
 
-/// A word changed after the loop's first key on a dialog hands it over, no Enter.
+/// A word changed after the loop's first key on a dialog hands it over, no Enter. Negative
+/// control: a change before the first key simply applies.
 #[test]
 fn a_word_changed_after_the_first_key_hands_the_dialog_over() {
     let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);

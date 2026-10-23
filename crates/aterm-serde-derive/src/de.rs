@@ -187,13 +187,13 @@ fn build_generics(cx: &Errors, cont: &Container, borrowed: &BorrowedLifetimes) -
 // Fields with a `skip` or `deserialize_with` attribute are not deserialized by
 // us so we do not generate a bound. All other fields may need a `T:
 // Deserialize` bound where T is the type of the field.
-fn needs_deserialize_bound(field: &attr::Field) -> bool {
+const fn needs_deserialize_bound(field: &attr::Field) -> bool {
     !field.skip_deserializing() && field.deserialize_with().is_none()
 }
 
 // Fields with a `default` attribute (not `default=...`), and fields with a
 // `skip` attribute that do not also have `default=...`.
-fn requires_default(field: &attr::Field) -> bool {
+const fn requires_default(field: &attr::Field) -> bool {
     matches!(field.default(), attr::Default::Default)
 }
 

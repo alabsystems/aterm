@@ -80,7 +80,8 @@ enum Seam {
         len: usize,
         /// The new tape.
         to: tape::TapeSink,
-        /// The `next` of a divergence: `record it live: agh --record NEW {argv}`.
+        /// The `next` of a divergence: `record it live: agh --record NEW {argv}`. Rerecording
+        /// again cannot help, because `from` holds no answer to the run's new question.
         live: String,
     },
 }
@@ -255,7 +256,7 @@ pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectReco
 
 impl Fx {
     /// An Fx over `seam`, its latch empty.
-    fn over(seam: Seam) -> Fx {
+    const fn over(seam: Seam) -> Fx {
         Fx {
             seam,
             latch: Mutex::new(None),
@@ -271,7 +272,7 @@ impl Fx {
     /// Tests: `mono` starts at 0 and `wall_secs` at `start_unix_secs`.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn simulated(start_unix_secs: u64) -> Fx {
+    pub const fn simulated(start_unix_secs: u64) -> Fx {
         Fx::over(Seam::Simulated(sim::SimClock::new(start_unix_secs)))
     }
 
@@ -371,7 +372,7 @@ impl Fx {
 
     /// Which world the doors reach.
     #[must_use]
-    pub fn mode(&self) -> Mode {
+    pub const fn mode(&self) -> Mode {
         match &self.seam {
             Seam::Live(_) => Mode::Live,
             #[cfg(any(test, debug_assertions))]

@@ -16,15 +16,11 @@ use crate::error::{Error, Kind, Result};
 use crate::identity::tilde;
 use crate::redact::Redactor;
 
-/// `agh policy check [--config PATH]`. It reads the file itself, under `config::load`'s rules:
-/// with `--config PATH`, PATH's directory and name; else `dirs.config` and `agh.toml`. A
-/// missing file, named or not, is `present: false`, `ok: true`, exit 0 (load's rule: no
-/// file is no policy); any fault is the report on stdout and Invalid (exit 10) on stderr.
-///
+/// `agh policy check [--config PATH]`.
 /// # Errors
-///
-/// Usage for a `--config` path with no file name (such as `/` or `..`); CouldNotRun when
-/// the platform names no config directory and no `--config` was given.
+/// Usage for a `--config` path with no file name (such as `/` or `..`), or a `~/` one with no
+/// home directory; CouldNotRun when the platform names no config directory and no `--config`
+/// was given.
 pub(crate) fn policy_check(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let home = ctx
         .dirs
@@ -32,9 +28,6 @@ pub(crate) fn policy_check(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         .map_or_else(PathBuf::new, |dirs| dirs.home.clone());
     let (dir, name) = match inv.flag("--config") {
         Some(text) => {
-            // A leading `~/` is the home directory, by agh's path rule (token_file's,
-            // `config::expand`): a shell leaves it unexpanded in `--config=~/…`, and an
-            // exec-style caller never expands it.
             let path = match text.strip_prefix("~/") {
                 Some(_) if home.as_os_str().is_empty() => {
                     return Err(Error::usage(format!(

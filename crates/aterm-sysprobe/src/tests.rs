@@ -1177,7 +1177,9 @@ fn every_core_is_read_on_this_host_and_its_ticks_only_grow() {
     }
 }
 
-/// Live: memory by page class on this host.
+/// Live: memory by page class on this host. Each physical class is within
+/// physical memory, and wired + active + inactive + speculative + free +
+/// compressed is within 10% of it (the rest is memory the VM never manages).
 #[cfg(target_os = "macos")]
 #[test]
 fn memory_by_page_class_reads_on_this_host_and_adds_up() {
@@ -1213,7 +1215,9 @@ fn memory_by_page_class_reads_on_this_host_and_adds_up() {
     assert!(m.pressure.is_some());
 }
 
-/// Live: the GPU on this host.
+/// Live: the GPU on this host. An Apple silicon Mac always has its
+/// accelerator, with a name and a core count; each percentage is at most
+/// 100.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_gpu_reads_on_this_host_in_whole_percent() {
@@ -1700,7 +1704,9 @@ fn the_smaller_known_ceiling_wins_and_infinity_is_none() {
     assert_eq!(machine::rlimit_ceiling(u64::MAX, u64::MAX), None);
 }
 
-/// Live: the process table's ceilings on this host.
+/// Live: the process table's ceilings on this host. The machine's is known
+/// and positive; one user's, where known, is no larger (macOS clamps
+/// `kern.maxprocperuid` to `kern.maxproc`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_process_tables_ceilings_read_on_this_host() {
@@ -1721,7 +1727,11 @@ fn the_load_average_reads_on_this_host() {
     assert!(load.iter().all(|l| l.is_finite() && *l >= 0.0), "{load:?}");
 }
 
-/// Live: this Mac's interfaces.
+/// Live: this Mac's interfaces. Each has a name and a distinct index; the
+/// loopback `lo0` is up, a loopback, and not the machine's traffic; every
+/// link the machine filter refuses by name (a tunnel, a bridge, a
+/// peer-to-peer or coprocessor link) reads other, whatever its functional
+/// type.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_network_links_read_a_structurally_valid_snapshot_on_this_host() {

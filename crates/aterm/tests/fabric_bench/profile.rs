@@ -21,7 +21,7 @@ impl Profile {
 
     /// The arm's name: the lane's `--profile` value and the bench's report.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Profile::Dev => "dev",
             Profile::Opt => "opt",
@@ -42,7 +42,7 @@ impl Profile {
 
     /// Explicit cargo profile name for this arm.
     #[must_use]
-    pub fn cargo_profile(self) -> &'static str {
+    pub const fn cargo_profile(self) -> &'static str {
         match self {
             Profile::Dev => "test",
             Profile::Opt => "opt-test",
@@ -51,7 +51,7 @@ impl Profile {
 
     /// The directory under the target dir cargo writes the arm's binaries to.
     #[must_use]
-    pub fn dir(self) -> &'static str {
+    pub const fn dir(self) -> &'static str {
         match self {
             Profile::Dev => "debug",
             Profile::Opt => "opt-test",
@@ -60,7 +60,7 @@ impl Profile {
 
     /// The code generation the arm stands for, for the report and the ledger.
     #[must_use]
-    pub fn describe(self) -> &'static str {
+    pub const fn describe(self) -> &'static str {
         match self {
             Profile::Dev => {
                 "cargo `test` profile (inherits dev): opt-level 0 but the per-crate speed rows \
@@ -77,7 +77,7 @@ impl Profile {
 
     /// Required opt-level across all crates on the measured path, or `None` for dev.
     #[must_use]
-    pub fn every_crate_at(self) -> Option<&'static str> {
+    pub const fn every_crate_at(self) -> Option<&'static str> {
         match self {
             Profile::Dev => None,
             Profile::Opt => Some("3"),

@@ -99,7 +99,7 @@ impl TranscriptEnd {
 
     /// Returns whether the transcript tail has not yet flushed the completed turn shown on screen.
     #[must_use]
-    pub(crate) fn lagging(&self) -> bool {
+    pub(crate) const fn lagging(&self) -> bool {
         !self.closed && !matches!(self.last, Entry::Notice { .. })
     }
 }
@@ -433,7 +433,7 @@ pub(crate) enum Class {
 }
 
 /// Maps a [`WallKind`] to its policy [`Class`].
-pub(crate) fn class(kind: WallKind) -> Class {
+pub(crate) const fn class(kind: WallKind) -> Class {
     if kind.reads_limited() {
         return Class::Limit;
     }

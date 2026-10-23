@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The tables the TF.1 reader corpus reaches only through system faces this
-//! host may not have, on synthetic faces every host builds: `CBLC`/`CBDT`
-//! (Noto Color Emoji, aterm's Linux colour face; no committed or macOS face
-//! carries it) and `MVAR` (the corpus's `MVAR` faces are Apple's SF faces).
-//! Each answer is worked out by hand from the OpenType spec below, and
-//! registry ttf-parser 0.25.1 gives the same ones (checked 2026-10-16 by
-//! running these two tests, `aterm_font` renamed to `ttf_parser`, in a
-//! scratch crate outside the workspace); each test also shows that the table
-//! is what moves the answer.
+//! Synthetic `CBLC`/`CBDT`, `MVAR`, and `head.macStyle` font table tests.
 
 use aterm_font::{Face, GlyphId, RasterImageFormat, Tag};
 
@@ -23,7 +15,6 @@ fn be32(v: u32) -> [u8; 4] {
     v.to_be_bytes()
 }
 
-/// One `CBDT` glyph, image format 17: small metrics and PNG bytes.
 struct Bitmap {
     height: u8,
     width: u8,
@@ -32,15 +23,12 @@ struct Bitmap {
     png: &'static [u8],
 }
 
-/// A `CBLC` + `CBDT` pair: one bitmap size table per strike, each covering
-/// glyphs 1..=2 through one index subtable (format 1, image format 17).
 fn cbdt_tables(strikes: &[(u8, [Bitmap; 2])]) -> (Vec<u8>, Vec<u8>) {
     let mut cbdt: Vec<u8> = be32(0x0003_0000).to_vec();
     let sizes_end = 8 + 48 * strikes.len() as u32;
     let mut sizes: Vec<u8> = Vec::new();
     let mut arrays: Vec<u8> = Vec::new();
     for (ppem, glyphs) in strikes {
-        // The glyph data, and its offsets from this strike's image data start.
         let image_data_offset = cbdt.len() as u32;
         let mut offsets = vec![0u32];
         for g in glyphs {
@@ -49,19 +37,16 @@ fn cbdt_tables(strikes: &[(u8, [Bitmap; 2])]) -> (Vec<u8>, Vec<u8>) {
             cbdt.extend(g.png);
             offsets.push(cbdt.len() as u32 - image_data_offset);
         }
-        // IndexSubTableArray (one entry) then the format 1 index subtable.
         let array_offset = sizes_end + arrays.len() as u32;
         arrays.extend(be16(1));
         arrays.extend(be16(2));
-        arrays.extend(be32(8)); // the subtable follows this 8-byte entry
-        arrays.extend(be16(1)); // indexFormat
-        arrays.extend(be16(17)); // imageFormat: small metrics + PNG
+        arrays.extend(be32(8));
+        arrays.extend(be16(1));
+        arrays.extend(be16(17));
         arrays.extend(be32(image_data_offset));
         for o in offsets {
             arrays.extend(be32(o));
         }
-        // BitmapSize: offsets, counts, two zeroed line metrics, glyph range,
-        // ppem, bit depth 32.
         sizes.extend(be32(array_offset));
         sizes.extend(be32(0));
         sizes.extend(be32(1));
@@ -78,9 +63,7 @@ fn cbdt_tables(strikes: &[(u8, [Bitmap; 2])]) -> (Vec<u8>, Vec<u8>) {
     (cblc, cbdt)
 }
 
-/// A face of four glyphs whose 1 and 2 have `CBDT` bitmaps in two strikes,
-/// 20 and 109 ppem. The never-panic fuzz mutates it too, so the format
-/// Linux's colour face uses is fuzzed on every host.
+/// Synthetic 4-glyph face with `CBDT` bitmaps in 20 and 109 ppem strikes.
 pub(crate) fn cbdt_face() -> Vec<u8> {
     let (cblc, cbdt) = cbdt_tables(&[
         (
@@ -125,9 +108,6 @@ pub(crate) fn cbdt_face() -> Vec<u8> {
     sfnt(4, &[(b"CBLC", &cblc), (b"CBDT", &cbdt)])
 }
 
-/// `CBDT` strike selection and glyph records: the smallest strike at least
-/// the requested size, else the largest; `y` is the bitmap's bottom edge
-/// (`bearingY - height`), as ttf-parser reports it.
 #[test]
 fn cbdt_glyphs_are_read_from_the_right_strike() {
     let bytes = cbdt_face();
@@ -150,7 +130,6 @@ fn cbdt_glyphs_are_read_from_the_right_strike() {
         (-2, 8 - 10, 12, 10, &b"png 20/2!"[..])
     );
 
-    // Past the small strike, the large one; past every strike, the largest.
     for ppem in [21, 64, 109, 200, u16::MAX] {
         let large = image(1, ppem).expect("glyph 1");
         assert_eq!(
@@ -161,7 +140,6 @@ fn cbdt_glyphs_are_read_from_the_right_strike() {
     }
     assert_eq!(image(2, 64).map(|i| i.data), Some(&b"png 109/2"[..]));
 
-    // Outside every strike's glyph range, and with no bitmap tables at all.
     assert!(image(0, 20).is_none());
     assert!(image(3, 20).is_none());
     let plain = sfnt(4, &[]);
@@ -169,13 +147,8 @@ fn cbdt_glyphs_are_read_from_the_right_strike() {
     assert!(plain.glyph_raster_image(GlyphId(1), 20).is_none());
 }
 
-/// A face with one variation axis, `wght` 100..=900 (default 400), an OS/2
-/// v4 table asking for its typographic metrics (ascender 800), a `post`
-/// underline at -100 / 50, and, when `mvar`, an `MVAR` table moving `hasc`
-/// and `undo` by +100 units at full weight.
 fn mvar_face(mvar: bool) -> Vec<u8> {
     let fixed = |v: i32| be32((v << 16) as u32);
-    // fvar: one axis, no instances.
     let mut fvar: Vec<u8> = be32(0x0001_0000).to_vec();
     for v in [16u16, 2, 1, 20, 0, 8] {
         fvar.extend(be16(v));
@@ -185,19 +158,14 @@ fn mvar_face(mvar: bool) -> Vec<u8> {
     fvar.extend(fixed(400));
     fvar.extend(fixed(900));
     fvar.extend([0, 0, 1, 0]);
-    // OS/2 version 4: typoAscender at 68, fsSelection bit 7 (USE_TYPO_METRICS).
     let mut os2 = vec![0u8; 96];
     os2[0..2].copy_from_slice(&be16(4));
     os2[62..64].copy_from_slice(&be16(0x80));
     os2[68..70].copy_from_slice(&be16(800));
-    // post 3.0: underline position -100, thickness 50.
     let mut post = vec![0u8; 32];
     post[0..4].copy_from_slice(&be32(0x0003_0000));
     post[8..10].copy_from_slice(&(-100i16).to_be_bytes());
     post[10..12].copy_from_slice(&be16(50));
-    // MVAR: two records (sorted by tag) naming delta set 0/0, then an item
-    // variation store with one region (wght peaking at +1.0) and one delta
-    // set: +100.
     let mut table: Vec<u8> = be32(0x0001_0000).to_vec();
     for v in [0u16, 8, 2, 28] {
         table.extend(be16(v));
@@ -206,15 +174,14 @@ fn mvar_face(mvar: bool) -> Vec<u8> {
         table.extend(tag);
         table.extend([0, 0, 0, 0]);
     }
-    table.extend(be16(1)); // store format
-    table.extend(be32(12)); // region list
     table.extend(be16(1));
-    table.extend(be32(22)); // the one ItemVariationData
-    table.extend(be16(1)); // region list: 1 axis, 1 region
+    table.extend(be32(12));
     table.extend(be16(1));
-    table.extend([0, 0, 0x40, 0, 0x40, 0]); // start 0, peak 1, end 1
+    table.extend(be32(22));
+    table.extend(be16(1));
+    table.extend(be16(1));
+    table.extend([0, 0, 0x40, 0, 0x40, 0]);
     for v in [1u16, 1, 1, 0] {
-        // 1 item, 1 word delta, 1 region index: region 0
         table.extend(be16(v));
     }
     table.extend(be16(100));
@@ -226,9 +193,6 @@ fn mvar_face(mvar: bool) -> Vec<u8> {
     sfnt(1, &tables)
 }
 
-/// `MVAR` moves the line metrics with the instance: +100 units at full weight,
-/// +50 halfway, nothing at the default; a metric it does not name stays put,
-/// and without the table nothing moves.
 #[test]
 fn mvar_moves_the_line_metrics_with_the_instance() {
     let wght = Tag::from_bytes(b"wght");
@@ -246,16 +210,10 @@ fn mvar_moves_the_line_metrics_with_the_instance() {
     assert_eq!(metrics(true, Some(400.0)), (800, -100, 50));
     assert_eq!(metrics(true, Some(650.0)), (850, -50, 50));
     assert_eq!(metrics(true, Some(900.0)), (900, 0, 50));
-    // Below the default the region is off: no delta.
     assert_eq!(metrics(true, Some(100.0)), (800, -100, 50));
-    // The table is what moves them.
     assert_eq!(metrics(false, Some(900.0)), (800, -100, 50));
 }
 
-/// A face with no `OS/2` table states its style only in `head.macStyle`
-/// (Apple's `Courier.ttc`: Bold, Oblique and Bold Oblique are bits 0b01,
-/// 0b10 and 0b11 there). Without the fallback every such face read as a
-/// Regular, so a bold face was filed and loaded as one.
 #[test]
 fn a_face_without_os2_takes_its_style_from_mac_style() {
     let face_with = |mac_style: u16| {

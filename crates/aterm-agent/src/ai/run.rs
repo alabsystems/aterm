@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A PRIVATE RUN DIRECTORY for one sign-in or one reviewer (design §9.1):
-//! `<aterm state>/ai/run/<pid>-<16 hex>/`, made 0700 and refused if it already exists,
-//! removed when the guard drops, and swept at the next start once its process is gone. A
-//! CLI started there finds no project settings to load and no folder to trust; a reviewer's
-//! request and answer files live there, made `O_CREAT|O_EXCL|O_NOFOLLOW`, 0600.
+//! Private per-process run directory under `<aterm state>/ai/run/<pid>-<16 hex>/`.
 
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -20,11 +16,9 @@ pub struct RunDir {
 }
 
 impl RunDir {
-    /// Makes a fresh run directory under `store_dir` (the AI store's directory), after
-    /// sweeping those whose process has gone.
+    /// Makes a fresh run directory under `store_dir` after sweeping dead-process directories.
     ///
     /// # Errors
-    ///
     /// The directory cannot be made, or one by that name already exists.
     pub fn make(store_dir: &Path) -> io::Result<RunDir> {
         let root = store_dir.join(DIR);
@@ -52,7 +46,6 @@ impl RunDir {
     /// Writes a new private file `name` here with `text`.
     ///
     /// # Errors
-    ///
     /// It exists already, or the write failed.
     pub fn write(&self, name: &str, text: &str) -> io::Result<PathBuf> {
         let path = self.path.join(name);
@@ -71,7 +64,6 @@ impl RunDir {
     /// Makes an empty private subdirectory `name` (a reviewer's starting directory).
     ///
     /// # Errors
-    ///
     /// It exists already, or it could not be made.
     pub fn subdir(&self, name: &str) -> io::Result<PathBuf> {
         let path = self.path.join(name);

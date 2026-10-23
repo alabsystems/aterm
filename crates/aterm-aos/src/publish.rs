@@ -246,7 +246,9 @@ pub enum PublishRefusal {
     },
     /// The witness does not match this boundary's own ancestor, log or pair (the named part).
     WitnessMismatch(&'static str),
-    /// The queue holds `cap` inputs.
+    /// The queue holds `cap` inputs. No operation of this boundary returns it: an input that
+    /// finds the queue full rejects the update instead ([`Admit::Rejected`]), so nothing is
+    /// ever dropped.
     QueueFull {
         /// The queue's capacity.
         /// The queue's capacity.
@@ -413,7 +415,8 @@ enum Pending {
     Admitted { recorded: bool },
 }
 
-/// The gate every primitive store of `commit` passes.
+/// The gate every primitive store of `commit` passes. The production gate never stops
+/// (its stop type is uninhabited); the fault-injection gate stops after its `k`-th store.
 trait StoreGate {
     type Stop;
     fn store(&mut self) -> Result<(), Self::Stop>;

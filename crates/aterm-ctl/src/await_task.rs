@@ -74,7 +74,9 @@ fn usage() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, USAGE)
 }
 
-/// Parse `[@<sel>] await task <words…>`.
+/// Parse `[@<sel>] await task <words…>`. A leading selector is the one target;
+/// otherwise the list names them; neither is the session the call resolves to
+/// (`@.`).
 fn parse(parts: &[String]) -> io::Result<Request> {
     let (leading, rest) = match parts.first() {
         Some(sel) if sel.starts_with('@') => (Some(sel.as_str()), &parts[1..]),
@@ -143,7 +145,10 @@ fn parse(parts: &[String]) -> io::Result<Request> {
     Ok(request)
 }
 
-/// One list element, `@<sel>` or `@<sel>:<rev>`.
+/// One list element, `@<sel>` or `@<sel>:<rev>`. A selector that names
+/// nothing (`@`, `@:3`, an empty `@$W` in `@$W1,@$W2`) is refused
+/// ([`aterm_types::control_verbs::EMPTY_SELECTOR`]), never waited on as the
+/// session the call resolves to.
 fn target(element: &str) -> io::Result<Target> {
     let body = element.strip_prefix('@').ok_or_else(usage)?;
     let (selector, since) = match body.split_once(':') {

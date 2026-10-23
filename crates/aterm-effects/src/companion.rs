@@ -518,7 +518,8 @@ pub struct PetGlass {
     pub rows: u16,
 }
 
-/// The pet's per-session latches.
+/// The pet's per-session latches. Every key carries the session, so a tab or
+/// pane switch re-baselines silently.
 #[derive(Clone, Copy, Debug, Default)]
 struct Latches {
     /// `(session, completed_command_seq)`: the once-per-completion latch.
@@ -586,7 +587,8 @@ pub struct CompanionOwner {
     /// The last tick's base presentation gate: the word-cat bat reaches only a
     /// pet that could be seen.
     last_visible: bool,
-    /// The resolved posture of the last frame.
+    /// The resolved posture of the last frame. Static presentation does not
+    /// inherit the brain's full-motion settle clocks or animation offers.
     last_static: bool,
     /// The last tick under the load-shed latch: no offer lands sooner than
     /// [`RESIDENT_SHED_CADENCE`] after it.
@@ -599,7 +601,9 @@ pub struct CompanionOwner {
     /// The pixel frame (pane origin and cell metrics) the last tick drew the
     /// resident in; `None` when it put nothing on glass.
     drawn_frame: Option<PixelFrame>,
-    /// The pixel frame a pending re-sighting ghost was drawn in.
+    /// The pixel frame a pending re-sighting ghost was drawn in. The ghost stands
+    /// for pixels the user saw, so the next tick spends it only where those pixels
+    /// still are: the same frame, or its own glass beside the new surface.
     resight_frame: Option<PixelFrame>,
     /// The pixel frame of each pane a ghost still fades on beside the focused
     /// surface.

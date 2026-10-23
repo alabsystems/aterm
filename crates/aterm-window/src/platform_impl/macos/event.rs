@@ -632,7 +632,8 @@ mod option_only_tests {
     const GRAVE: u16 = 50;
     const CIRCUMFLEX: u16 = 10;
 
-    /// The keys these rows press, as the U.S.
+    /// The keys these rows press, as the U.S. layout has them (`UCKeyTranslate`, keyboard
+    /// type 91): no Option character is an ASCII one only Option reaches.
     fn us() -> Table {
         Table(HashMap::from([
             ((L, 0), 'l'),

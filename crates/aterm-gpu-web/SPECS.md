@@ -236,13 +236,13 @@ tests/cpu_gpu_parity.rs	web_cpu_gpu_rgba8_parity	cpu-gpu-parity
    If either advances `damage_epoch`, `needs_frame() = false` is followed by a drawn frame.
    Prove that those calls never move the epoch (which `frame-gate` then states), or weaken the
    doc.
-3. **Latent real-clock dependence in the predict tests.**
-   `always_tracks_paints_and_retires_through_the_export`, `backspace_cancels_and_disable_is_fully_inert`
-   and `only_a_line_terminator_carries_the_guesses_in_flight` assert a non-empty overlay right
-   after `predict_char` on the monotonic clock; a stall past the ~250 ms guess expiry empties
-   it. The state-machine claims belong in aterm-predict with an injected clock, and the facade
-   should take its clock through an injected field so `predict-facade-gates` is about a pure
-   function.
+3. **The predict facade's clock is a test pin, not an injected field.** Every export reads
+   one clock (`predict_api::clock`), which the predict tests pin ten seconds back: no stall
+   ages a guess, and an overlay that read the real clock instead fails them on their first
+   run. Production reads the real clock there, so
+   `predict-facade-gates` is not yet about a pure function: the state-machine claims belong in
+   aterm-predict with an injected clock, and the facade should take its clock through an
+   injected field.
 4. **The messages glue is copy-pasted between the two web crates.** The `messages_api.rs` twin
    tests (`the_gpu_band_has_the_twins_exports`, `the_gpu_page_is_the_twins_page`,
    `the_gpu_page_offers_what_the_twin_offers`, `a_still_pointers_chip_never_lights_the_echo`,

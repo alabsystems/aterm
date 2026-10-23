@@ -64,7 +64,8 @@ fn draw_carve(
     Some(h.hex())
 }
 
-/// Returns every font file under the host's system font directories, `dir`, and `extra`, sorted.
+/// Returns every font file under the host's system font directories, `dir`'s `assets` and
+/// `tests/fixtures`, and `extra`, sorted.
 pub(crate) fn face_files(dir: &str, extra: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let roots = [

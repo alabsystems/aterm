@@ -44,7 +44,9 @@ fn fire_jump_flares_and_cools() {
     );
 }
 
-/// A move down one row anchors no fire beyond the single wake spark at the landing.
+/// A move down one row anchors no fire beyond the single wake spark at the landing. A typing wrap
+/// (from the last column) flies no inter-line meteor, which would sweep the line on every wrap; a
+/// deliberate jump from a short column still flies one (the positive control).
 #[test]
 fn typing_wrap_no_meteor_deliberate_enter_still_meteors() {
     let g = geom();

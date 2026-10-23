@@ -293,7 +293,9 @@ fn every_row_clear(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRa
 struct ActivityClock {
     last_seq: u64,
     last_at: Option<Instant>,
-    /// Which grid `last_seq` was read from.
+    /// Which grid `last_seq` was read from. `content_seq` is per grid: entering the alt screen
+    /// installs a grid whose counter restarts at 1, and leaving restores the main grid's higher
+    /// value, so a flip is a resync rather than a comparison.
     alt: bool,
     /// The screen generation `last_seq` was read in: the terminal's
     /// [`invalidation_epoch`](super::ContentScrollState::invalidation_epoch),
@@ -866,7 +868,8 @@ impl super::Terminal {
     }
 }
 
-/// The local engine is a [`SurfaceSource`].
+/// The local engine is a [`SurfaceSource`]. (Inherent methods shadow the trait
+/// methods, so these do not recurse.)
 impl SurfaceSource for super::Terminal {
     #[inline]
     fn content_seq(&self) -> u64 {

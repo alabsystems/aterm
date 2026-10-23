@@ -586,7 +586,7 @@ pub(crate) struct Tables<'a> {
 }
 
 impl<'a> Outlines<'a> {
-    /// `None` without `head`.
+    /// `None` without `loca`, `glyf`, `hhea` or `hmtx`, or with a short `head` or `hhea` or a `loca` of partial offsets.
     pub(crate) fn new(tables: &Tables<'a>) -> Option<Self> {
         if tables.head.len() < 54 {
             return None;

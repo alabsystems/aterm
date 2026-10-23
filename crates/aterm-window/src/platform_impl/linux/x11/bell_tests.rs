@@ -4,16 +4,9 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A window's bell (`UnownedWindow::ring_bell`, `platform::x11::WindowExtX11::ring_x11_bell`) is
-//! an XKB bell request naming the window, which the X server announces to every client that
-//! selected XKB's `BellNotify`; mutter, one of them, plays the desktop's bell for it. Before this,
-//! aterm's audible bell had no Linux arm and a BEL made no sound on GNOME on Xorg, where GNOME
-//! Terminal's beeps (the desk audit, 2026-10-22). A stand-in listener, its own Xlib connection,
-//! selects `BellNotify` and must see one naming the window after the call, and none before it.
-//! The negative control: the request taken out of `ring_bell`, and the wait for the bell ends the
-//! test.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! A window's bell (`UnownedWindow::ring_bell`, `platform::x11::WindowExtX11::ring_x11_bell`) is an
+//! XKB bell request naming the window, which the X server announces to every client that selected
+//! XKB's `BellNotify`; mutter, one of them, plays the desktop's bell for it.
 
 use std::ffi::{c_int, c_ulong};
 use std::time::{Duration, Instant};
@@ -103,8 +96,6 @@ fn a_windows_bell_is_announced_naming_the_window() {
     // SAFETY: `listener` is open. The round trip lands the selection.
     unsafe { (xlib.XSync)(listener, xlib::FALSE) };
 
-    // Before the call: the window's requests and then the listener's round trip have reached the
-    // server, so a bell either one caused would already be in the listener's queue.
     window.xconn.sync_with_server().expect("the window's requests reach the server");
     // SAFETY: `listener` is open.
     unsafe { (xlib.XSync)(listener, xlib::FALSE) };

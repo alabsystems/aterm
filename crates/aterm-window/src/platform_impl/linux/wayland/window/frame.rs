@@ -4,17 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! The shadow margin's subsurfaces (docs/AUDIT-third-party-2026-10-15.md, L-HEADER-LW7,
-//! lw5-button-layout-shadow): the four border parts `crate::frame_shadow` paints, shown around
-//! a client-decorated window as sctk-adwaita showed them before LW.5.
-//!
-//! Each part is a `wl_subsurface` of the window's surface in its default synchronized mode, so
-//! a part's new buffer, place and input region apply with the window's next commit (the
-//! application's next frame, which every configure asks for): the shadow moves with the window
-//! it surrounds. A part's buffer is a fresh `wl_shm` pool of its own each redraw, never written
-//! again; a buffer the part no longer shows is destroyed once the compositor releases it.
-//! Hidden (server-side decorations, maximized, fullscreen, decorations off), each part has no
-//! buffer and so no pixels and no input.
+//! Synchronized `wl_subsurface` shadow border parts around a client-decorated Wayland window.
 
 use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -70,14 +60,12 @@ pub(crate) struct ShadowFrame {
 }
 
 impl ShadowFrame {
-    /// The parts, made as subsurfaces of `parent` (the window's surface) and left hidden; `None`
-    /// where the compositor would not make one.
+    /// Creates the four border subsurfaces of `parent` in hidden state.
     pub(crate) fn new(globals: &FrameGlobals, parent: Proxy) -> Option<ShadowFrame> {
         let make = || -> Option<PartSurface> {
             // SAFETY: the live compositor; the surface is this part's.
             let surface = unsafe { wl_compositor::create_surface(globals.compositor.proxy()) }?;
-            // SAFETY: a surface made here, owned by the part; its events have no listener (no
-            // part reads its outputs or scale).
+            // SAFETY: a surface made here, owned by the part; its events have no listener.
             let surface = unsafe { Owned::new(surface, wl_surface::destroy) };
             // SAFETY: the live subcompositor, the role-less surface made above and the window's
             // live surface.
@@ -119,9 +107,7 @@ impl ShadowFrame {
             return false;
         }
         self.retired.retain(|buffer| !buffer.released.load(Ordering::Relaxed));
-        // A compositor need not release a buffer it never applied (one the next replaced before
-        // the window's commit); past a few redraws such a buffer is no part's pending state, so
-        // destroying it is allowed (its memory is never written again) and keeps them bounded.
+        // A compositor need not release a buffer superseded before commit; cap retired buffers.
         let excess = self.retired.len().saturating_sub(MAX_RETIRED);
         self.retired.drain(..excess);
         match look {
@@ -177,8 +163,6 @@ impl ShadowFrame {
                     i32::try_from(input.height).unwrap_or(i32::MAX),
                 );
                 wl_region::add(region, input.x, input.y, w, h);
-                // The surface copies the region at commit (double-buffered state), so the
-                // region goes at once.
                 wl_surface::set_input_region(surface, Some(region));
                 wl_region::destroy(region);
             }

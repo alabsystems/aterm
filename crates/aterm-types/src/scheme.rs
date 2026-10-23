@@ -3436,7 +3436,11 @@ mod tests {
         assert_eq!(builtin_names()[0], "Default");
     }
 
-    /// Law: every built-in, Default included, is legible as shipped.
+    /// Law: every built-in, Default included, is legible as shipped. Body
+    /// text clears 4.5:1, the selection band reads as a band (1.5:1 on the
+    /// background), the cursor clears 3:1, and no ANSI slot is the
+    /// background (text in it would be invisible, and outside Windows'
+    /// theme-pair floor nothing rescues it by default).
     #[test]
     fn builtins_are_legible() {
         for theme in builtin_theme_list() {
@@ -3952,7 +3956,9 @@ color15 = #c0caf5
         }
     }
 
-    /// No spelling (name or alias, stem or plain) belongs to two rows.
+    /// No spelling (name or alias, stem or plain) belongs to two rows. (That
+    /// every key has its row is the compiler's: `ThemeKey::row` is exhaustive
+    /// and a const assertion checks the table's order.)
     #[test]
     fn no_theme_key_spelling_names_two_keys() {
         let mut spellings = std::collections::HashSet::new();

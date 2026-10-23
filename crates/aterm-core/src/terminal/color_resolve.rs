@@ -470,7 +470,10 @@ struct TransferTables {
     to_linear: [f32; 256],
     /// `thresholds[q - 1]` is the first non-negative f32 that rounds to sRGB byte `q` (`1..=255`).
     thresholds: [f32; 255],
-    /// Result at each bucket's lower edge.
+    /// Result at each bucket's lower edge. An sRGB byte boundary is wider than an
+    /// 1/8192 linear bucket; the correction below is therefore normally zero or one
+    /// comparison (the defensive reverse correction keeps the law honest if the
+    /// transfer constants ever change).
     bucket_base: [u8; LINEAR_BUCKETS],
 }
 

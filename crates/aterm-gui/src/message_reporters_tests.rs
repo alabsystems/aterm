@@ -2281,7 +2281,9 @@ fn a_relaunch_that_lost_nothing_is_a_record_and_a_lost_program_is_named() {
     );
 }
 
-/// A RETIRED SPELLING IS NOT AN UNKNOWN KEY (design ruling 42).
+/// A RETIRED SPELLING IS NOT AN UNKNOWN KEY (design ruling 42). atpkg
+/// still reads `[packages] auto_update = false` as `enabled = false`, so
+/// it is its own family: a record that never reaches the glass.
 #[test]
 fn a_retired_spelling_is_a_record_and_never_counted_as_an_unknown_key() {
     let mut warns = ConfigWarnings::default();

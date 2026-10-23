@@ -134,7 +134,8 @@ struct Catalog {
     limits: Limits,
     files: Vec<PathBuf>,
     stats: Stats,
-    /// Bytes already read for a name-table probe.
+    /// Bytes already read for a name-table probe. Reused as the immutable
+    /// admitted asset if that path wins, closing a second-read TOCTOU window.
     bytes: HashMap<PathBuf, Arc<Vec<u8>>>,
     /// Every directory the walk asked `read_dir` of (roots, absent and unreadable ones
     /// included) with the mtime seen then: the validity key of the [`system_font_files`] memo.
@@ -636,7 +637,10 @@ fn memoized_font_files_walked(roots: &[PathBuf]) -> (Vec<PathBuf>, bool) {
     (inventory.files.clone(), walked)
 }
 
-/// [`memoized_font_files_walked`] returning the memo itself.
+/// [`memoized_font_files_walked`] returning the memo itself. Every walk is a
+/// new `Arc`, so an answer keyed on it ([`monospace_families`]) also sees a
+/// file renamed over one of the same name, which moves its directory's mtime
+/// but not the file list.
 fn memoized_font_inventory_walked(roots: &[PathBuf]) -> (Arc<FontFilesMemo>, bool) {
     let remembered = || {
         let memos = FONT_FILES_MEMOS
@@ -1316,7 +1320,10 @@ mod tests {
         (name, admitted.index)
     }
 
-    /// `PTMono.ttc`'s shape: Bold at face 0, Regular at face 1.
+    /// `PTMono.ttc`'s shape: Bold at face 0, Regular at face 1. A family is
+    /// its Regular face, a face's own name is that face, and a family asked
+    /// for its bold slot is its Bold — through the name pass (a file named
+    /// unlike the family) and through the stem pass alike.
     #[test]
     fn a_collection_resolves_each_request_to_its_own_face() {
         let collection = ttc_of(&[JB_BOLD, JB_REGULAR]);

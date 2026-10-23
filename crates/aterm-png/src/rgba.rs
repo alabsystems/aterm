@@ -1,42 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one hardened PNG → packed RGBA8 decode every consumer shares: the
-//! renderer's inline images and colour-emoji strikes, the wallpaper lane, and
-//! the engine's Kitty frame composition.
+//! Hardened PNG to packed RGBA8 decoder.
 
 use crate::{BitDepth, ColorType, Decoder, Limits, Transformations};
 
-/// Floor of the output budget (64 MiB): what a caller with a small
-/// `max_dimension` may still decode. The dimension check in [`decode_rgba8`] is
-/// the load-bearing guard against the IHDR-dimension allocation bomb.
+/// Floor of the output budget (64 MiB) ([`decode_rgba8`]).
 const DECODE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 
-/// Decode an 8-bit PNG (16-bit channels folded to 8, palettes and `tRNS`
-/// expanded) to packed RGBA8, returning `(rgba, width, height)`.
-///
-/// Hardened against the allocation-bomb DoS a tiny file declaring huge IHDR
-/// dimensions would be: either axis past `max_dimension` is refused after IHDR
-/// is parsed and BEFORE the output buffer is allocated, and the output budget
-/// scales with that dimension budget (never below [`DECODE_BYTE_LIMIT`]). The
-/// decoder's limit IS that budget; encoded input also has the derived ceiling
-/// described by [`Limits`]. Any failure — a corrupt file, an overflowing
-/// pixel count, an unsupported layout — is `None`: never a panic, never an
-/// unbounded allocation.
+/// Decode a PNG to packed RGBA8: `None` past `max_dimension` on either axis or past an output
+/// budget never below [`DECODE_BYTE_LIMIT`] ([`Limits`]).
 #[must_use]
 pub fn decode_rgba8(bytes: &[u8], max_dimension: u32) -> Option<(Vec<u8>, usize, usize)> {
-    // Checked math so a pixel-count overflow bails instead of wrapping.
     let out_budget = (max_dimension as usize)
         .saturating_mul(max_dimension as usize)
         .saturating_mul(4)
         .max(DECODE_BYTE_LIMIT);
     let mut decoder = Decoder::new(bytes);
     decoder.set_limits(Limits { bytes: out_budget });
-    // EXPAND palette (Indexed) → RGB(A) and apply tRNS transparency; STRIP_16
-    // folds any 16-bit channel to 8-bit. Noto Color Emoji's CBDT strikes are
-    // INDEXED PNGs (palette + tRNS) — without EXPAND they cannot be read and
-    // every emoji renders blank. RGB/RGBA PNGs (Apple sbix) are unaffected
-    // (EXPAND is a no-op for them, save honouring a tRNS chunk).
     decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
     let (w, h) = (reader.info().width, reader.info().height);
@@ -58,10 +39,7 @@ pub fn decode_rgba8(bytes: &[u8], max_dimension: u32) -> Option<(Vec<u8>, usize,
     Some((rgba, width, height))
 }
 
-/// Convert a decoded 8-bit buffer to packed RGBA8. After EXPAND, palette images
-/// arrive as RGB/RGBA, so the cases are RGBA, RGB, and grayscale with or
-/// without alpha; anything else is `None`. RGBA is already packed RGBA8 and is
-/// handed back as it is, so the common case holds one image-sized buffer.
+/// Convert a decoded 8-bit buffer to packed RGBA8.
 fn to_rgba8(mut buf: Vec<u8>, color_type: ColorType, w: usize, h: usize) -> Option<Vec<u8>> {
     let n = w.checked_mul(h)?;
     let len = n.checked_mul(color_type.samples())?;
@@ -89,7 +67,6 @@ fn to_rgba8(mut buf: Vec<u8>, color_type: ColorType, w: usize, h: usize) -> Opti
                 out.extend_from_slice(&[g, g, g, 255]);
             }
         }
-        // RGBA was handed back above; an index means EXPAND did not run.
         ColorType::Rgba | ColorType::Indexed => return None,
     }
     Some(out)

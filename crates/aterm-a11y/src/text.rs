@@ -9,15 +9,7 @@
 // longer stalls or misplaces a paragraph search (see
 // `Position::backward_to_line_start` and `Position::is_paragraph_start`).
 
-//! Text documents: a node whose text runs are its text, positions in it,
-//! ranges between them, and the navigation by character, word, line and
-//! paragraph that AT-SPI's `GetStringAtOffset` and its kin answer from.
-//!
-//! A document is a text input, a label, a document or a terminal with at
-//! least one `Role::TextRun` under it. Each run is one line; a run whose
-//! text ends in a line break ends a paragraph. A run's characters are the
-//! model's `character_lengths` (a character may be several code points), and
-//! offsets on the bus count Unicode scalar values.
+//! Text documents: positions, ranges, and navigation by character, word, line, and paragraph.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -25,8 +17,7 @@ use std::fmt;
 use crate::model::{Point, Rect, Role, TextDirection, TextPosition as WeakPosition, TextSelection};
 use crate::tree::{FilterResult, Node, NodeId};
 
-/// A position in a document: a run, and a character index in it (its length
-/// when at its end).
+/// A position in a document: a run, and a character index in it (its length when at its end).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InnerPosition<'a> {
     pub(crate) node: Node<'a>,
@@ -176,11 +167,7 @@ impl<'a> Position<'a> {
         self.inner.is_line_start()
     }
 
-    /// A line start with no text before it, or whose text before it ends in
-    /// a line break. accesskit_consumer looked only at the line just before,
-    /// so a line after an empty one never started a paragraph, and a
-    /// paragraph search from it went on past the break to the paragraph
-    /// before, one that does not hold the offset.
+    /// A line start with no text before it, or whose text before it ends in a line break.
     pub(crate) fn is_paragraph_start(&self) -> bool {
         self.is_line_start()
             && self
@@ -205,8 +192,7 @@ impl<'a> Position<'a> {
         Range::new(self.root_node, self.inner, self.inner)
     }
 
-    /// The position's offset in Unicode scalar values from the document's
-    /// start: AT-SPI's text offset.
+    /// The position's offset in Unicode scalar values from the document's start.
     pub(crate) fn to_global_usv_index(self) -> usize {
         let mut total_length = 0usize;
         for node in self.root_node.text_runs() {
@@ -238,8 +224,6 @@ impl<'a> Position<'a> {
 
     pub(crate) fn forward_to_word_start(&self) -> Self {
         let pos = self.inner.biased_to_start(&self.root_node);
-        // Wrap the following in a scope to make sure we can't misuse the
-        // `word_starts` local later.
         {
             let word_starts = pos.node.data().word_starts();
             let index = match word_starts.binary_search(&(pos.character_index as u8)) {
@@ -285,8 +269,6 @@ impl<'a> Position<'a> {
     }
 
     pub(crate) fn backward_to_word_start(&self) -> Self {
-        // Wrap the following in a scope to make sure we can't misuse the
-        // `word_starts` local later.
         {
             let word_starts = self.inner.node.data().word_starts();
             let index = match word_starts.binary_search(&(self.inner.character_index as u8)) {
@@ -347,14 +329,7 @@ impl<'a> Position<'a> {
         }
     }
 
-    /// The start of the line before this position (this line's, when inside
-    /// it): a position strictly before this one, or the document's start.
-    /// An empty line's start biases forward to the line after it, so when
-    /// the walk lands where it began it goes on to the line before, and with
-    /// no line before it answers the first line's own start, the document's
-    /// start, which every paragraph search stops at. accesskit_consumer
-    /// returned the starting point in both cases, and its paragraph search
-    /// looped forever on a blank line anywhere in a document.
+    /// The start of the line before this position (this line's, when inside it).
     pub(crate) fn backward_to_line_start(&self) -> Self {
         let here = self.inner.comparable(&self.root_node);
         let mut pos = self.inner.biased_to_end(&self.root_node);
@@ -479,9 +454,6 @@ impl<'a> Range<'a> {
     where
         F: FnMut(&Node<'a>) -> Option<T>,
     {
-        // If the range is degenerate, we don't want to normalize it.
-        // This is important e.g. when getting the bounding rectangle
-        // of the caret range when the caret is at the end of a wrapped line.
         let (start, end) = if self.is_degenerate() {
             (self.start, self.start)
         } else {
@@ -555,18 +527,11 @@ impl<'a> Range<'a> {
 
     pub(crate) fn text(&self) -> String {
         let mut result = String::new();
-        // Writing to a String cannot fail.
         let _ = self.write_text(&mut result);
         result
     }
 
-    /// Returns the range's transformed bounding boxes relative to the tree's
-    /// container (e.g. window).
-    ///
-    /// If the return value is empty, it means that the source tree doesn't
-    /// provide enough information to calculate bounding boxes. Otherwise,
-    /// there will always be at least one box, even if it's zero-width,
-    /// as it is for a degenerate range.
+    /// Returns the range's transformed bounding boxes relative to the tree's container.
     pub(crate) fn bounding_boxes(&self) -> Vec<Rect> {
         let mut result = Vec::new();
         self.walk(|node| {
@@ -629,9 +594,6 @@ impl<'a> Range<'a> {
                         rect.x1 = orig_right - pixel_start;
                         rect.x0 = orig_right - pixel_end;
                     }
-                    // Note: The following directions assume that the rectangle,
-                    // in the node's coordinate space, is y-down. TBD: Will we
-                    // ever encounter a case where this isn't true?
                     TextDirection::TopToBottom => {
                         let orig_top = rect.y0;
                         rect.y0 = orig_top + pixel_start;
@@ -659,8 +621,6 @@ impl<'a> Range<'a> {
     pub(crate) fn set_end(&mut self, pos: Position<'a>) {
         assert_eq!(pos.root_node.id(), self.node.id());
         self.end = pos.inner;
-        // We use `>=` here because if the two endpoints are equivalent
-        // but with a different bias, we want to normalize the bias.
         if self.start.comparable(&self.node) >= self.end.comparable(&self.node) {
             self.start = self.end;
         }
@@ -683,8 +643,6 @@ impl PartialEq for Range<'_> {
 
 impl Eq for Range<'_> {}
 
-/// A document's own node and its runs; any other node between them is
-/// looked through.
 fn text_node_filter(root_id: NodeId, node: &Node) -> FilterResult {
     if node.id() == root_id || node.role() == Role::TextRun {
         FilterResult::Include
@@ -694,7 +652,6 @@ fn text_node_filter(root_id: NodeId, node: &Node) -> FilterResult {
 }
 
 fn character_index_at_point(node: &Node, point: Point) -> usize {
-    // A hit test returned the node, so it has bounds.
     let Some(rect) = node.data().bounds() else {
         return 0;
     };
@@ -721,9 +678,6 @@ fn character_index_at_point(node: &Node, point: Point) -> usize {
         let relative_pos = match direction {
             TextDirection::LeftToRight => point.x - rect.x0,
             TextDirection::RightToLeft => rect.x1 - point.x,
-            // Note: The following directions assume that the rectangle,
-            // in the node's coordinate space, is y-down. TBD: Will we
-            // ever encounter a case where this isn't true?
             TextDirection::TopToBottom => point.y - rect.y0,
             TextDirection::BottomToTop => rect.y1 - point.y,
         };
@@ -822,8 +776,7 @@ impl<'a> Node<'a> {
         })
     }
 
-    /// Returns the nearest text position to the given point
-    /// in this node's coordinate space.
+    /// Returns the nearest text position to the given point in this node's coordinate space.
     pub(crate) fn text_position_at_point(&self, point: Point) -> Position<'a> {
         let id = self.id();
         if let Some((node, point)) = self.hit_test(point, &move |node| text_node_filter(id, node))
@@ -838,9 +791,6 @@ impl<'a> Node<'a> {
                 inner: pos,
             };
         }
-
-        // The following tests can assume that the point is not within
-        // any text run.
 
         if let Some(node) = self.text_runs().next()
             && let Some(rect) = node.bounding_box_in_coordinate_space(self)
@@ -862,9 +812,6 @@ impl<'a> Node<'a> {
                     TextDirection::RightToLeft => {
                         point.y >= rect.y0 && point.y < rect.y1 && point.x < rect.x0
                     }
-                    // Note: The following directions assume that the rectangle,
-                    // in the root node's coordinate space, is y-down. TBD: Will we
-                    // ever encounter a case where this isn't true?
                     TextDirection::TopToBottom => {
                         point.x >= rect.x0 && point.x < rect.x1 && point.y >= rect.y1
                     }
@@ -887,8 +834,7 @@ impl<'a> Node<'a> {
         self.document_end()
     }
 
-    /// The position `index` Unicode scalar values into the document, or its
-    /// end when `index` is its length; `None` past that.
+    /// The position `index` Unicode scalar values into the document (`None` past its length).
     pub(crate) fn text_position_from_global_usv_index(&self, index: usize) -> Option<Position<'a>> {
         let mut total_length = 0usize;
         for node in self.text_runs() {

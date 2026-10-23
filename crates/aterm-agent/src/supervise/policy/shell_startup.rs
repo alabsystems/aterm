@@ -18,7 +18,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Zsh => "zsh",
             Self::Bash => "bash",
@@ -52,7 +52,7 @@ const REPARSE: &[&str] = &["eval", "trap", "emulate", "sched", "fc"];
 impl ShellStartup {
     /// Whether the Bash tool may run the line under zsh.
     #[must_use]
-    pub fn may_run_zsh(&self) -> bool {
+    pub const fn may_run_zsh(&self) -> bool {
         self.zsh
     }
 
@@ -64,7 +64,7 @@ impl ShellStartup {
 
     /// The startup [`Self::names`] and [`Self::may_run_zsh`] describe.
     #[must_use]
-    pub fn of_parts(names: Vec<(String, String, bool)>, zsh: bool) -> Self {
+    pub const fn of_parts(names: Vec<(String, String, bool)>, zsh: bool) -> Self {
         Self { names, zsh }
     }
 

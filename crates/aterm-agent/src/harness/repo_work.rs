@@ -45,7 +45,7 @@ pub struct RepoWork {
 impl RepoWork {
     /// Whether anything was found.
     #[must_use]
-    pub fn found(&self) -> bool {
+    pub const fn found(&self) -> bool {
         self.changed > 0
             || self.untracked > 0
             || self.stashes > 0

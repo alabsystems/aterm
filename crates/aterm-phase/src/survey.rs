@@ -206,7 +206,9 @@ fn kind_of(question: &str) -> SurveyKind {
     }
 }
 
-/// `^●.` and the first four words of `question`, as a `key if=` token.
+/// `^●.` and the first four words of `question`, as a `key if=` token. Each word must
+/// be plain text (letters, digits and the punctuation a question uses); the guard ends
+/// before the first word that is not, and is empty under three words.
 fn guard_of(question: &str) -> String {
     let words: Vec<&str> = question
         .split_whitespace()

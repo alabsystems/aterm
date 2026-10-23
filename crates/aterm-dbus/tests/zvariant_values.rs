@@ -2,15 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! aterm-dbus's marshalling against zvariant 5.12.0's, recorded in
-//! tests/recorded/zvariant-5.12.0-values.tsv: every value encodes to the
-//! recorded bytes and the recorded bytes decode to it, in both byte orders and
-//! at the recorded offsets.
-//!
-//! Negative controls, so a match cannot be vacuous: every case is recorded and
-//! every recording has a case; a neighbouring value misses every recording;
-//! and no single-bit flip of a recording decodes to the recorded value. The
-//! decoder accepts only canonical bytes, so a flipped recording either fails
-//! or re-encodes to exactly the flipped bytes.
+//! tests/recorded/zvariant-5.12.0-values.tsv: every value encodes to the recorded bytes and the
+//! recorded bytes decode to it, in both byte orders and at the recorded offsets.
 
 use std::collections::BTreeMap;
 

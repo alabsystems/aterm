@@ -1113,7 +1113,9 @@ impl Bufs {
     }
 }
 
-/// Plays the recorded calls into `g`.
+/// Plays the recorded calls into `g`. A tick's call includes the lane's two predicate reads
+/// after it (`is_active`, `settling`), as the host makes them; a query is
+/// `next_change_deadline`.
 fn play<M: Meter>(
     g: &mut impl Glow,
     t0: Instant,
@@ -1984,7 +1986,8 @@ const COLD_OPS: [&str; 7] = [
     "repair",
 ];
 
-/// OP's first run in this process.
+/// OP's first run in this process. The story was generated first (that ran the engine's
+/// tick and deadline code once, closed loop); every other setup step is named in `setup`.
 fn cold(op: &str, story: &Story, cal: &Calibration) -> Result<Obj, String> {
     let schema = MomentumSchema::new(story.t0);
     let code = PrebuiltMomentum::new(MomentumCode::Shipped, BUILD);

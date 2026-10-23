@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use crate::sdk_consts;
 use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_const_decl};
 
-/// `(Rust constant, the SDK spelling it claims to equal)`.
+/// `(Rust constant, the SDK spelling it claims to equal)`. The SDK name is written out, not
+/// derived: `NS_APPKIT_VERSION_NUMBER_10_12` and `NS_CRITICAL_REQUEST` are not the mechanical
+/// camel-case of their Rust spelling.
 #[rustfmt::skip]
 const ROWS: &[(&str, &str)] = &[
     ("NS_WINDOW_STYLE_MASK_TITLED", "NSWindowStyleMaskTitled"),

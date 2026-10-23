@@ -33,6 +33,8 @@ impl IdleHost for Present {
     }
 }
 
+/// `posix` (`/st/drive`) as an absolute path of this host: itself on unix, on
+/// drive `C:` on Windows (where a `/`-rooted path names no drive, and a header
 /// takes it for a relative one).
 fn abs(posix: &str) -> PathBuf {
     if cfg!(windows) {
@@ -42,6 +44,8 @@ fn abs(posix: &str) -> PathBuf {
     }
 }
 
+/// Where a remapped decode puts the recorded absolute path `recorded` beneath
+/// `base`: its names, on Windows under its drive's own namespace first
 /// (`disk-43/path` for `C:`, [`Roots::remapped`]).
 fn remapped_at(base: &Path, recorded: &Path) -> PathBuf {
     let mut at = base.to_path_buf();
@@ -60,6 +64,7 @@ fn remapped_at(base: &Path, recorded: &Path) -> PathBuf {
     at
 }
 
+/// A loop's setup for `@s-1`, its ledger under `/st/drive`, the approval
 /// policy's home `/h` and `$TMPDIR` `/tmpd`.
 fn watched() -> SessionSetup {
     let mut ctl = NoCtl;
@@ -99,6 +104,7 @@ fn every_option() -> SuperviseOpts {
     }
 }
 
+/// Every field of the options, the policy aside: `SuperviseOpts` has no
 /// equality of its own (its host is a trait object).
 fn assert_same_opts(a: &SuperviseOpts, b: &SuperviseOpts) {
     let SuperviseOpts {
@@ -122,6 +128,8 @@ fn assert_same_opts(a: &SuperviseOpts, b: &SuperviseOpts) {
     assert_eq!(*tasks, b.tasks);
 }
 
+/// THE HEADER ROUND TRIP: the run's facts, the setup, every option and the
+/// policy come back; a host comes back as its presence, never the host; the
 /// text written again from what was read is the text read.
 #[test]
 fn a_header_gives_back_what_the_run_was_given() {
@@ -153,6 +161,12 @@ fn a_header_gives_back_what_the_run_was_given() {
     assert!(!back.idle_host);
 }
 
+/// The policy comes back through the HEADER, by the owner's own reader, for
+/// any one thing moved off the default — each key to a value of its own
+/// ([`SupervisorConfig::moved_off_default`], so every key is written at a
+/// value that is not its default's and none merely round-trips the default
+/// again), each agent switched off, each withheld rule — with nothing
+/// supplied. The standing rules' file is the one value the
 /// header holds as the loop opens it: a relative one by its absolute path.
 #[test]
 fn the_policy_comes_back_through_the_header_for_any_one_key_moved() {
@@ -192,6 +206,8 @@ fn the_policy_comes_back_through_the_header_for_any_one_key_moved() {
     }
 }
 
+/// A policy no file can spell — a trust root with a comma in it, which
+/// `set` reads as two — is said to be one the rebuild does not give back
 /// (`exact=false`), not passed off as the run's.
 #[test]
 fn a_policy_its_texts_cannot_give_back_is_marked_inexact() {
@@ -216,6 +232,12 @@ fn a_policy_its_texts_cannot_give_back_is_marked_inexact() {
     );
 }
 
+/// A policy marked inexact because the owner's reader REFUSES one of its
+/// values — an `autocompact_offer` off Claude Code's ladder, which a test
+/// builds as it likes — still decodes: the value is read as the owner's file
+/// reads it (its default kept) and named in what the build supplied, beside
+/// the inexactness, so the tape replays and says what it could not take.
+/// The same text claiming `exact=true` is refused (the negative control):
 /// there a value no reader takes is damage.
 #[test]
 fn a_policy_marked_inexact_decodes_where_the_reader_refuses_a_value() {
@@ -261,6 +283,12 @@ fn a_policy_marked_inexact_decodes_where_the_reader_refuses_a_value() {
     assert!(e.contains("autocompact_offer"), "{e}");
 }
 
+/// THE ROOTS: each file the loop opens is written under the most specific
+/// root that holds it, the same directory twice is one root, a path under
+/// none is written as it is (one starting with `@` escaped), and a replay's
+/// remapped decode moves every one of them under its base — while the
+/// approval policy's home and `$TMPDIR`, values it reads the screen with,
+/// stay put (`replay_loop_tests.rs` replays a run that looked under the
 /// home, and moves the home as the negative control).
 #[test]
 fn paths_are_written_under_their_roots_and_move_with_them() {
@@ -310,6 +338,7 @@ fn setup_and_paths(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Roots: the most specific wins, the encoding is exact under `Path`'s
 /// equality, and a path under a root the header does not name is refused.
 #[test]
 fn roots_encode_and_decode_paths() {
@@ -334,6 +363,7 @@ fn roots_encode_and_decode_paths() {
     assert!(e.contains("@home"), "{e}");
 }
 
+/// A value comes back byte for byte: every control character, a backslash,
 /// non-ASCII text — and, on unix, a path's bytes that are not UTF-8.
 #[test]
 fn values_come_back_byte_for_byte() {
@@ -369,6 +399,7 @@ fn values_come_back_byte_for_byte() {
     }
 }
 
+/// A duration is exact to the nanosecond in its largest unit; `max` is the
 /// unbounded budget; anything else is no duration.
 #[test]
 fn durations_are_exact() {
@@ -398,6 +429,8 @@ fn durations_are_exact() {
     }
 }
 
+/// A header this build did not write is refused by name: a newer format, a
+/// key it does not have, one missing, one said twice, a value that does not
 /// read, a root it does not name, a loop it does not run.
 #[test]
 fn a_header_this_build_did_not_write_is_refused_by_name() {
@@ -459,6 +492,12 @@ fn a_header_this_build_did_not_write_is_refused_by_name() {
     );
 }
 
+/// A DAMAGED OR HOSTILE HEADER is refused as fast as it can be read: half a
+/// million distinct keys in one section — a header frame holds up to 64 MiB,
+/// and a tape may come from elsewhere — are read in one pass and the first
+/// key this build does not have is refused by name. Checked against every
+/// earlier line, as each key once was, the same header cost ~10^11
+/// comparisons and decoding it hung instead of refusing it: the wait for the
 /// refusal is a one-minute hang detector, not a latency budget.
 #[test]
 fn a_header_of_half_a_million_keys_is_refused_in_one_pass() {
@@ -505,6 +544,7 @@ fn replace_header_field(text: &str, section: &str, key: &str, value: &str) -> St
     out
 }
 
+/// Remapping is a file-path boundary, not just string substitution. Each file slot
 /// refuses a root-resetting suffix, parent traversal and an unrooted path.
 #[test]
 fn remapped_file_paths_cannot_escape_the_named_roots() {
@@ -548,6 +588,12 @@ fn remapped_file_paths_cannot_escape_the_named_roots() {
     );
 }
 
+/// A FILE GIVEN RELATIVE (a journal of `run.jsonl`, a `rules_file` of
+/// `standing.md`, a ledger) is one the loop opens from its own directory: the
+/// header names it from there, under a root, so a replay moves it under its
+/// base like every other — never hands the relative path back, which a
+/// replay started in the recording's directory would open as the live
+/// journal. An absolute path under no root still decodes as it was, but no
 /// remapped decode admits it.
 #[test]
 fn relative_file_paths_are_rooted_and_move_with_a_remap() {
@@ -599,6 +645,15 @@ fn relative_file_paths_are_rooted_and_move_with_a_remap() {
     Header::decode_remapped(&text, base).expect_err("no root holds it");
 }
 
+/// A TAPE AN OLDER BUILD WROTE: it lacks every key that build did not have
+/// yet — here a `[harness]` key (`land_at` came after the first tapes), an
+/// agent's switch, the two setup knobs a shipped build did not write
+/// before every build carried them, the three timings that came after the
+/// format (the host's wait step, the box call's lag step and the refusal's
+/// back-off rungs), the hand the loop types under, the tasks directory and
+/// the recording build's host doors. It
+/// decodes: each policy key at its full-power default, each knob at this
+/// build's shipped value, everything the tape said as it said it, and every
 /// key supplied named.
 #[test]
 fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
@@ -665,6 +720,10 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
     assert!(back.policy_exact);
 }
 
+/// THE HEADER NAMES THE RECORDING BUILD'S HOST DOORS (the occupancy red-team's
+/// F8): every method of the window's host, `host.occupancy` among them, and
+/// they read back as written; an older build's header, which named none,
+/// reads back as naming none — what a replay keys a door newer than the tape
 /// on (`ReplayCore::lacks_door`).
 #[test]
 fn the_header_names_the_recording_builds_host_doors() {
@@ -693,6 +752,7 @@ fn the_header_names_the_recording_builds_host_doors() {
     );
 }
 
+/// Real Windows path prefixes stay distinct, while a ledger keeps its place
 /// under the state root. These paths are values: no directory is opened.
 #[cfg(windows)]
 #[test]
@@ -778,6 +838,8 @@ fn remapped_roots_keep_their_windows_namespace_and_nesting() {
     );
 }
 
+/// Format-one Claude headers also wrote the retired Codex setup durations.
+/// They remain typed input, but cannot restore the retired behavior. A new
 /// header still needs none of them; other unknown and malformed input is refused.
 #[test]
 fn a_claude_header_keeps_reading_its_retired_setup_durations() {

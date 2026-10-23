@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The engine (design §5) is `aterm_converge`'s (docs/DESIGN-init-system-2026-10-20.md
-//! §3): this module binds machines items, which take their `System` and context per call,
-//! to it ([`Bound`]), so the sixteen families keep their code.
+//! Convergence engine binding for machines items ([`Bound`]).
 
 use crate::items::{Activation, Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe};
@@ -15,9 +13,7 @@ use std::sync::Arc;
 pub use aterm_converge::NoJournal;
 pub use aterm_converge::{Journal, Refusal};
 
-/// Where a machines item sits in the desired state. Its family does not say: the
-/// `keyboard` family is a workstation preference under `aterm init` and a fleet setting
-/// under `aterm machines`, so the surface that composes the run places it.
+/// Where a machines item sits in the desired state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
     /// The layer.
@@ -26,27 +22,22 @@ pub struct Place {
     pub class: Class,
     /// Where it may run.
     pub requires: Requires,
-    /// The act that makes a change of this run's: the surface's own command.
+    /// The act that makes a change of this run's.
     pub remedy: Remedy,
 }
 
 impl Place {
-    /// A fleet item's place, by its family (the baseline table it came from), for
-    /// `aterm machines here` and the agent.
+    /// A fleet item's place, by its family.
     #[must_use]
     pub fn fleet(family: &str, remedy: Remedy) -> Self {
         let (layer, class) = match family {
-            // `base.clt` is this family's item (design §4.2), installed as root.
             "developer" => (Layer::Base, Class::Elevate),
-            // The app and each user's toolset, from the network.
             "aterm" => (Layer::Base, Class::Install),
             "app" | "homebrew" | "github" => (Layer::Workstation, Class::Install),
             "person" => (Layer::Workstation, Class::Person),
             "keyboard" | "consumer" | "setup" | "defaults" => {
                 (Layer::Workstation, Class::Preference)
             }
-            // names, sharing, firewall, time, power, updates: the Mac's own settings, as
-            // root.
             _ => (Layer::Workstation, Class::Elevate),
         };
         Self {
@@ -58,10 +49,7 @@ impl Place {
     }
 }
 
-/// A machines [`Item`] with the `System` and context it runs against: an
-/// [`aterm_converge::Item`]. It forwards the item's id, family, title, probe, apply,
-/// refresh, activation, detail, revert, effect and stood-aside lines, and takes its layer,
-/// class and precondition from its [`Place`].
+/// A machines [`Item`] bound to its `System` and context ([`aterm_converge::Item`], [`Place`]).
 pub struct Bound<'a> {
     item: &'a dyn Item,
     sys: &'a dyn System,
@@ -84,13 +72,7 @@ impl<'a> Bound<'a> {
     }
 }
 
-/// Bind the items of one run. Each item's `after` is narrowed to the items the run holds:
-/// a family names prerequisites from other baseline tables (`homebrew.pkg` after
-/// `developer.command-line-tools`), and a baseline without that table, or an
-/// `--only <table>` run (`baseline::keep_only`), leaves them out, which the machines
-/// engine always read as no constraint. The converge engine refuses an edge that names no
-/// item, so an edge is kept only when it names one here, by the engine's own rule
-/// ([`aterm_converge::named_by`]).
+/// Bind the items of one run ([`aterm_converge::named_by`]).
 #[must_use]
 pub fn bind<'a>(
     items: impl IntoIterator<Item = (&'a dyn Item, Place)>,
@@ -169,13 +151,10 @@ impl aterm_converge::Item for Bound<'_> {
                 },
             ),
             Probe::Ok { now } => (now.clone(), Remedy::None),
-            // A missing precondition this item cannot lift; its line says which.
             Probe::NotApplicable { why } | Probe::Blocked { why } => (why.clone(), Remedy::None),
             Probe::Change { from, to } => {
                 (format!("{from}; wanted: {to}"), self.place.remedy.clone())
             }
-            // The surface's next run: after the prerequisite, when the Mac is idle, when
-            // the read answers.
             Probe::Waits { why, .. } | Probe::Deferred { why } | Probe::Unusable { why } => {
                 (why.clone(), self.place.remedy.clone())
             }
@@ -233,13 +212,10 @@ impl aterm_converge::Activation for BoundActivation<'_> {
     }
 }
 
-/// Run a fleet baseline's `items` (`aterm machines here`, the agent's run job), each placed
-/// by its family with `remedy` as the surface's own command, handing each row to `on_row`
-/// as soon as its item finishes: the agent's run job streams them to `progress.ndjson`
-/// (design §4.4).
+/// Run a fleet baseline's `items`.
 ///
 /// # Errors
-/// The items cannot be ordered ([`aterm_converge::order`]); nothing was probed.
+/// The items cannot be ordered ([`aterm_converge::order`]).
 pub fn run_with(
     items: &[Box<dyn Item>],
     mode: Mode,
@@ -259,8 +235,7 @@ pub fn run_with(
     aterm_converge::run_with(&bound, mode, journal, on_row)
 }
 
-/// [`run_with`] as the families' tests call it: placed as a fleet run, no stream, and a
-/// composition that cannot be ordered fails the test.
+/// [`run_with`] as the families' tests call it.
 #[cfg(test)]
 pub fn run(
     items: &[Box<dyn Item>],
@@ -292,8 +267,7 @@ mod tests {
         }
     }
 
-    /// A machines item that reads the `System` and context it is handed, so a test sees
-    /// that the binding passes them through.
+    /// A machines item that reads the `System` and context it is handed.
     struct Seen {
         id: &'static str,
         family: &'static str,
@@ -380,12 +354,10 @@ mod tests {
         let items: Vec<Box<dyn Item>> = vec![Box::new(item)];
         let rows = run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
         assert_eq!(rows[0].outcome, Outcome::Ok);
-        // `--only <table>` merges a report by each row's family.
         assert_eq!(rows[0].family, "keyboard");
         assert_eq!(rows[0].detail.as_deref(), Some("key for h"));
         assert_eq!(rows[0].layer, Some(Layer::Workstation));
         assert_eq!(rows[0].class, Some(Class::Preference));
-        // One refresh in an apply, and its read-back: both probes saw this sys and ctx.
         assert_eq!(refreshes.load(Ordering::SeqCst), 1);
         assert_eq!(*hosts.lock().unwrap(), ["h@501", "h@501"]);
     }
@@ -425,9 +397,7 @@ mod tests {
                 rows[0].stood_aside.as_ref().map(StoodAside::exit_status),
                 Some(status)
             );
-            // Probed once: no `aterm pkg doctor` as the user after atpkg stood aside.
             assert_eq!(hosts.lock().unwrap().len(), 1, "{aside:?} was read back");
-            // A lock is the surface's next run; offline is the network's.
             assert_eq!(
                 rows[0].explain,
                 Some(Explain {
@@ -440,9 +410,6 @@ mod tests {
 
     #[test]
     fn a_failed_refresh_is_explained_as_a_failure_the_next_run_retries() {
-        // init's trackpad: the saved preference reads as wanted and the native refresh
-        // refuses. The row fails, and `aterm init` again is what retries it; "nothing
-        // aterm can do" would be the Ok read's explanation.
         let mut item = Seen::new(
             "init.trackpad.scroll-direction@alice",
             "trackpad",
@@ -473,13 +440,11 @@ mod tests {
 
     #[test]
     fn an_edge_to_a_table_the_run_does_not_hold_is_no_constraint_and_one_it_holds_orders() {
-        // `apply --only homebrew`: no developer table, so no Command Line Tools item.
         let mut brew = Seen::new("homebrew.pkg", "homebrew", vec![ok()]);
         brew.after = vec!["developer.command-line-tools".into()];
         let items: Vec<Box<dyn Item>> = vec![Box::new(brew)];
         let rows = run(&items, Mode::Apply, &Fake::root(), &ctx(), &mut NoJournal);
         assert_eq!(rows[0].outcome, Outcome::Ok);
-        // With the developer table, composed after it, the edge orders the run and blocks.
         let mut brew = Seen::new("homebrew.pkg", "homebrew", vec![ok()]);
         brew.after = vec!["developer.*".into()];
         let clt = Seen::new(
@@ -497,7 +462,6 @@ mod tests {
             rows[1].why.as_deref(),
             Some("waits for developer.command-line-tools")
         );
-        // Two items that wait on each other are still refused.
         let mut a = Seen::new("names.a", "names", vec![ok()]);
         a.after = vec!["names.b".into()];
         let mut b = Seen::new("names.b", "names", vec![ok()]);

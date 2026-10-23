@@ -14,6 +14,7 @@ use crate::util::one_line;
 /// The fixed fake key the lab gives Gemini CLI and agy: never a credential anywhere.
 pub const LAB_GEMINI_KEY: &str = "lab-gemini-not-a-key";
 
+/// The `thoughtSignature` of a call the stub makes (base64 of a fixed text):
 /// agy echoes it back with the call's result, Gemini CLI stores it.
 const SIGNATURE: &str = "bGFiLXN0dWItdGhvdWdodC1zaWduYXR1cmU=";
 
@@ -925,6 +926,7 @@ impl Stub {
         self.gemini_answer(t, &summary, steps, &[], out)
     }
 
+    /// An answer of `steps`: streamed as SSE chunks (each after its pause, the
     /// last one finishing), or merged into one JSON answer for `generateContent`.
     #[allow(clippy::type_complexity)]
     fn gemini_answer(

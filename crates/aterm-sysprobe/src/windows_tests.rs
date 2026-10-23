@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows decoders on buffers laid out by hand at the SDK's offsets
-//! (written as numbers here, not through the crate's structs, so a struct
-//! transcribed wrong fails these tests rather than agreeing with itself).
+//! Tests for Windows decoders on buffers laid out at SDK offsets.
 
 use crate::windows::{
     self, CpuSet, MemoryStatusEx, PerformanceInformation64, cpu_sets, drive_is_local, drive_root,
@@ -11,8 +9,6 @@ use crate::windows::{
 };
 use crate::{Commit, CoreTicks, MemoryLevel};
 
-/// One process as the sweep tests compare it: pid, parent, name, CPU
-/// time and footprint.
 type Row<'a> = (u32, u32, &'a str, Option<u64>, Option<u64>);
 
 fn put_u16(buf: &mut [u8], at: usize, v: u16) {
@@ -28,10 +24,6 @@ fn put_i64(buf: &mut [u8], at: usize, v: i64) {
     buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-/// `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION`: 48 bytes, `IdleTime` at 0,
-/// `KernelTime` (idle included) at 8, `UserTime` at 16. A trailing partial
-/// record is left out; a kernel time below idle (never written) reads 0
-/// system, and a negative time reads 0.
 #[test]
 fn processor_times_split_kernel_time_from_idle() {
     let mut buf = vec![0u8; 48 * 3 + 20];
@@ -42,7 +34,7 @@ fn processor_times_split_kernel_time_from_idle() {
         put_i64(&mut buf, i * 48, idle);
         put_i64(&mut buf, i * 48 + 8, kernel);
         put_i64(&mut buf, i * 48 + 16, user);
-        put_i64(&mut buf, i * 48 + 24, 77); // DPC time, inside kernel time
+        put_i64(&mut buf, i * 48 + 24, 77);
     }
     let ticks = |user, system, idle| CoreTicks {
         user,
@@ -57,9 +49,6 @@ fn processor_times_split_kernel_time_from_idle() {
     assert!(processor_times(&buf[..47]).is_empty());
 }
 
-/// One `SYSTEM_CPU_SET_INFORMATION` record: `Size` at 0, `Type` at 4,
-/// `Group` at 12, `LogicalProcessorIndex` at 14, `EfficiencyClass` at 18,
-/// `AllFlags` at 19 (bit 0 parked).
 fn cpu_set(group: u16, index: u8, efficiency: u8, parked: bool) -> Vec<u8> {
     let mut rec = vec![0u8; 32];
     put_u32(&mut rec, 0, 32);
@@ -69,13 +58,10 @@ fn cpu_set(group: u16, index: u8, efficiency: u8, parked: bool) -> Vec<u8> {
     rec[14] = index;
     rec[15] = index / 2;
     rec[18] = efficiency;
-    rec[19] = u8::from(parked) | 0b10; // bit 1 (allocated) is not parked
+    rec[19] = u8::from(parked) | 0b10;
     rec
 }
 
-/// An Alder Lake laptop (i7-1260P) in one group: 4 SMT P-cores at
-/// efficiency class 1, 8 E-cores at 0, one E-core parked. A record of
-/// another type is skipped by its size.
 #[test]
 fn cpu_sets_of_a_hybrid_laptop_split_by_efficiency_class() {
     let mut buf = Vec::new();
@@ -116,11 +102,6 @@ fn cpu_sets_of_a_hybrid_laptop_split_by_efficiency_class() {
     assert_eq!(parked, [13]);
 }
 
-/// Processor groups number their processors from 0 each: a set's logical
-/// id adds the widths of the groups before it. A set outside the widths is
-/// left out, and alike cores are one `"CPU"` cluster. NEGATIVE CONTROLS: a
-/// record too short for the fields, and one that runs past the buffer, end
-/// the walk; no sets is no layout.
 #[test]
 fn cpu_sets_across_groups_and_cut_buffers() {
     let sets = [
@@ -180,9 +161,6 @@ fn cpu_sets_across_groups_and_cut_buffers() {
     assert!(cpu_sets(&[]).is_empty());
 }
 
-/// `SYSTEM_PAGEFILE_INFORMATION`: `NextEntryOffset` at 0 (past the name
-/// that follows the record), `TotalSize` at 4, `TotalInUse` at 8, pages.
-/// NEGATIVE CONTROLS: a record cut short, and an offset past the buffer.
 #[test]
 fn page_files_sum_every_page_file() {
     let mut buf = vec![0u8; 48 + 32];
@@ -202,9 +180,6 @@ fn page_files_sum_every_page_file() {
 const GIB: u64 = 1 << 30;
 const PAGE: u64 = 4096;
 
-/// A 16 GiB machine: 6 GiB available of which 4 GiB is the standby cache,
-/// 1 GiB of kernel pools, 20 GiB committed of a 24 GiB limit, an 8 GiB page
-/// file a quarter used.
 fn machine() -> (MemoryStatusEx, PerformanceInformation64) {
     let status = MemoryStatusEx {
         length: 64,
@@ -227,8 +202,6 @@ fn machine() -> (MemoryStatusEx, PerformanceInformation64) {
     (status, perf)
 }
 
-/// Design §9.6's Windows classes: they add up to the machine, commit is
-/// exact, and no class Windows does not report reads a number.
 #[test]
 fn memory_detail_maps_the_windows_classes() {
     let (status, perf) = machine();
@@ -268,11 +241,6 @@ fn memory_detail_maps_the_windows_classes() {
     );
 }
 
-/// Pressure on Windows is the commit charge (warn at 90 % of the limit) or
-/// the low-memory notification; it never reads critical. A cache or pool
-/// larger than its share is capped, so classes never pass the total.
-/// NEGATIVE CONTROLS: a zero page size or no memory is no reading, and a
-/// zero commit limit is no level.
 #[test]
 fn commit_drives_the_windows_pressure_level() {
     let (status, mut perf) = machine();
@@ -326,12 +294,6 @@ fn commit_drives_the_windows_pressure_level() {
 
 const BASE: u64 = 0x7FF6_1000_0000;
 
-/// One `SYSTEM_PROCESS_INFORMATION` (256 bytes on 64-bit): `NextEntryOffset`
-/// at 0, `CreateTime` 32, `UserTime` 40, `KernelTime` 48, `ImageName` 56
-/// (`Length` 56, `Buffer` 64), `UniqueProcessId` 80,
-/// `InheritedFromUniqueProcessId` 88, `PrivatePageCount` 200. Its name goes
-/// in `names` (as the kernel puts it after the records) and `Buffer`
-/// points at it.
 struct Proc<'a> {
     pid: u64,
     ppid: u64,
@@ -374,10 +336,6 @@ fn process_buffer(procs: &[Proc<'_>]) -> Vec<u8> {
     buf
 }
 
-/// A sweep: the System Idle Process (pid 0) is left out, names lose `.exe`
-/// in any case, CPU time is user plus kernel in nanoseconds, footprint the
-/// private commit. A parent that exited keeps its pid in `ppid`; a pid
-/// reused by a process created after the child is cut to 0.
 #[test]
 fn the_process_sweep_decodes_names_times_and_parents() {
     let p = |pid, ppid, created, name| Proc {
@@ -433,9 +391,6 @@ fn the_process_sweep_decodes_names_times_and_parents() {
     }
 }
 
-/// NEGATIVE CONTROLS: a name pointer outside the buffer (or a buffer read
-/// at the wrong base) reads an empty name, never stray bytes; an entry cut
-/// short and an offset smaller than a record end the walk.
 #[test]
 fn a_bad_process_buffer_reads_no_garbage() {
     let one = |name| Proc {
@@ -457,10 +412,6 @@ fn a_bad_process_buffer_reads_no_garbage() {
     assert_eq!(processes(&two, BASE).procs.len(), 1);
 }
 
-/// A path's drive from its spelling alone, and which drives are read.
-/// NEGATIVE CONTROLS: UNC paths, volume GUID and device paths, a
-/// drive-relative path and a relative one name no drive; a network,
-/// removable, optical or unknown drive is not read.
 #[test]
 fn drives_are_judged_from_the_spelling_and_the_drive_type() {
     for (path, want) in [

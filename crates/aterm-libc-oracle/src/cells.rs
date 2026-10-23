@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE cell table: every ABI cell `crates/aterm-libc` declares, once.
-//!
-//! A cell is decided on a box native to it, under Trust alone (Trust ships std
-//! for the host triple only), so a run decides exactly one row of this table.
-//! The other rows still matter here: the hand-written body sections are text, and
-//! each same-OS pair is compared on every box ([`crate::siblings`]).
-//!
-//! The Windows and wasm targets are not rows: the shim declares nothing there
-//! beyond the `core::ffi` primitives, and `libc-oracle/conformance`'s `cell_zero`
-//! pins that surface wherever it is compiled.
+//! ABI declaration cell table and sibling comparisons ([`crate::siblings`]).
 
-/// The operating-system family of a declaration cell; its hand-written bodies are
-/// per family, so the two architectures of one family must carry the same text.
+/// The operating-system family of a declaration cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Os {
     Darwin,
@@ -35,8 +25,7 @@ impl Os {
 pub struct Cell {
     /// The target triple a box must be native to for this cell to be decided.
     pub triple: &'static str,
-    /// The cell's key in `libc-oracle/union.json` and its conformance module
-    /// (`libc-oracle/conformance/src/cell_<key>.rs`).
+    /// The cell's key in `libc-oracle/union.json` and its conformance module.
     pub key: &'static str,
     pub os: Os,
     /// `target_arch` as the cell's `#[cfg]` spells it.
@@ -88,8 +77,7 @@ pub fn triples() -> Vec<&'static str> {
     CELLS.iter().map(|cell| cell.triple).collect()
 }
 
-/// The same-OS pairs whose hand-written body sections must be identical: each
-/// family's first cell against every later one, in table order.
+/// The same-OS pairs whose hand-written body sections must be identical.
 #[must_use]
 pub fn sibling_pairs() -> Vec<(Os, &'static Cell, &'static Cell)> {
     let mut pairs = Vec::new();

@@ -272,7 +272,11 @@ impl std::error::Error for StoreLockError {}
 /// The exit code a CLI-edge contention refusal carries: sysexits `EX_TEMPFAIL` (75), the one code atpkg reserves for "try again later", so a machine caller (the window's launch lanes, `install.sh`) classifies by code, never by the sentence.
 pub const CONTENDED_EXIT: u8 = 75;
 
-/// How often a waiting acquisition re-tries the lock ([`repoll_store_lock`]).
+/// How often a waiting acquisition re-tries the lock ([`repoll_store_lock`]). A poll is
+/// write-free and never re-hardens the prefix: a same-value `setxattr` bumps ctime on APFS,
+/// so hardening every poll would make a half-hour wait tens of thousands of journaled
+/// metadata writes, each an FSEvents change for the backup watchers the attribute keeps
+/// away.
 const WAIT_POLL: Duration = Duration::from_millis(50);
 
 /// How long a waiter stays silent before it announces the wait (`on_first_contention`).
@@ -281,7 +285,8 @@ pub const WAIT_ANNOUNCE_GRACE: Duration = Duration::from_secs(2);
 /// A development seam (`aterm_types::dev_seam!`; a shipped binary does not read it): the grace in milliseconds, so a test that needs only the announcement does not wait it out.
 pub const WAIT_ANNOUNCE_GRACE_SEAM: &str = "ATPKG_WAIT_ANNOUNCE_GRACE_MS";
 
-/// The longest wait a caller can ask for.
+/// The longest wait a caller can ask for. A `--wait-lock` value is parsed from argv,
+/// and `u64::MAX` seconds must not overflow the deadline arithmetic.
 const WAIT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Acquire the store lock, waiting up to `timeout` for a holder to release it: one [`try_lock_store`], then write-free re-opens ([`repoll_store_lock`]) every [`WAIT_POLL`] until it succeeds, the deadline passes, or `still_wanted` says the caller has gone (both `Err(Contended)`, so a waiter whose window quit stands down instead of racing a successor's waiter).
@@ -910,7 +915,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&target.prefix);
     }
 
-    /// A holder that releases inside the grace is waited out silently.
+    /// A holder that releases inside the grace is waited out silently. It lets go at the
+    /// waiter's first poll, so the wait is one poll long whatever the load.
     #[test]
     fn lock_store_waiting_acquires_when_the_holder_drops_and_stays_silent_inside_the_grace() {
         let a = temp_layout("wait-drop");

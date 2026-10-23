@@ -320,6 +320,7 @@ pub(crate) fn zlib_compress(data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Round-trip through aterm's OWN inflate — the decoder this crate's PNG
     /// reader uses, so a stream that survives this is a stream aterm can read.
     fn roundtrip(data: &[u8]) {
         let z = zlib_compress(data);
@@ -344,6 +345,7 @@ mod tests {
         roundtrip(&repeated);
     }
 
+    /// A maximal match (258 bytes) and a maximal distance (32768) must both be
     /// expressible — the two ends of the code tables.
     #[test]
     fn roundtrips_extreme_match_geometry() {
@@ -353,6 +355,8 @@ mod tests {
         roundtrip(&data);
     }
 
+    /// Pseudo-random bytes are incompressible; the stream must still be valid
+    /// (this is where a fixed block is at its worst and the bit packing is most
     /// likely to be caught out).
     #[test]
     fn roundtrips_incompressible_noise() {
@@ -366,6 +370,13 @@ mod tests {
         roundtrip(&noise);
     }
 
+    /// Structured, image-like input. Two shapes, because they stress different
+    /// halves of the matcher:
+    ///
+    /// * a raw RGBA gradient, which is only WEAKLY compressible byte-wise (its
+    ///   per-pixel bytes all change) and is here for round-trip correctness;
+    /// * the same image AFTER PNG filtering, which is what the encoder actually
+    ///   hands this compressor — long runs of small residuals — and which must
     ///   compress hard or the encoder is not earning its place.
     #[test]
     fn roundtrips_image_like_input() {
@@ -494,6 +505,8 @@ mod tests {
         out
     }
 
+    /// Seeded inputs that reach every part of the window logic: noise,
+    /// filtered-scanline shapes, runs far longer than the window, and repeats
     /// at distances on both sides of it.
     fn window_cases() -> Vec<(&'static str, Vec<u8>)> {
         let mut state = 0x2545_F491u32;
@@ -573,6 +586,8 @@ mod tests {
         }
     }
 
+    /// The compressor's memory is bounded by [`STATE_BYTES`], not by its input:
+    /// a 1 MiB write and a scanline-at-a-time stream leave the window at the
     /// capacity it was born with, and the chains at one window.
     #[test]
     fn the_window_never_outgrows_its_capacity() {

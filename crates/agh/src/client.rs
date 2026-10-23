@@ -132,7 +132,7 @@ impl Call {
     /// The same call on `origin`.
     #[inline]
     #[must_use]
-    pub fn origin(mut self, origin: OriginRole) -> Call {
+    pub const fn origin(mut self, origin: OriginRole) -> Call {
         self.origin = origin;
         self
     }
@@ -156,7 +156,7 @@ impl Call {
     /// The same call with `limit`.
     #[inline]
     #[must_use]
-    pub fn limit(mut self, limit: u64) -> Call {
+    pub const fn limit(mut self, limit: u64) -> Call {
         self.limit = limit;
         self
     }
@@ -164,7 +164,7 @@ impl Call {
     /// The same call with `deadlines`.
     #[inline]
     #[must_use]
-    pub fn deadlines(mut self, deadlines: Deadlines) -> Call {
+    pub const fn deadlines(mut self, deadlines: Deadlines) -> Call {
         self.deadlines = deadlines;
         self
     }
@@ -180,7 +180,7 @@ impl Call {
     /// The same call with the 404 probe on or off.
     #[inline]
     #[must_use]
-    pub fn probe_404(mut self, probe: bool) -> Call {
+    pub const fn probe_404(mut self, probe: bool) -> Call {
         self.probe_404 = probe;
         self
     }
@@ -188,7 +188,7 @@ impl Call {
     /// The same call following a 301 or not.
     #[inline]
     #[must_use]
-    pub fn follow_moved(mut self, follow: bool) -> Call {
+    pub const fn follow_moved(mut self, follow: bool) -> Call {
         self.follow_moved = follow;
         self
     }
@@ -196,7 +196,7 @@ impl Call {
     /// The same call hopping or not (for `call_stream`; see the field).
     #[inline]
     #[must_use]
-    pub fn hop(mut self, hop: bool) -> Call {
+    pub const fn hop(mut self, hop: bool) -> Call {
         self.hop = hop;
         self
     }
@@ -204,7 +204,7 @@ impl Call {
     /// The same call with its own retry policy.
     #[inline]
     #[must_use]
-    pub fn retry(mut self, policy: Option<RetryPolicy>) -> Call {
+    pub const fn retry(mut self, policy: Option<RetryPolicy>) -> Call {
         self.retry = policy;
         self
     }
@@ -212,7 +212,7 @@ impl Call {
     /// The same call answering any status or not.
     #[inline]
     #[must_use]
-    pub fn answer_any(mut self, any: bool) -> Call {
+    pub const fn answer_any(mut self, any: bool) -> Call {
         self.answer_any = any;
         self
     }
@@ -435,7 +435,7 @@ impl GithubBuilder {
 
     /// The retry policy.
     #[must_use]
-    pub fn retry(mut self, policy: RetryPolicy) -> GithubBuilder {
+    pub const fn retry(mut self, policy: RetryPolicy) -> GithubBuilder {
         self.retry = policy;
         self
     }
@@ -449,7 +449,7 @@ impl GithubBuilder {
 
     /// Every call's backstop, when set (`--timeout`): replaces `call.deadlines.backstop`.
     #[must_use]
-    pub fn backstop(mut self, backstop: Option<Duration>) -> GithubBuilder {
+    pub const fn backstop(mut self, backstop: Option<Duration>) -> GithubBuilder {
         self.backstop = backstop;
         self
     }
@@ -716,7 +716,9 @@ enum Body {
     Stream(Box<dyn Read + Send>),
 }
 
-/// A streamed 2xx body held to the call's limit (plan §8 step 9).
+/// A streamed 2xx body held to the call's limit (plan §8 step 9). Byte `limit + 1` is an io error
+/// whose inner error is aterm-http's `TooLarge`, the error aterm-http's own limit gives, so
+/// `wire_kind_of` reads both alike.
 struct Bounded {
     inner: Box<dyn Read + Send>,
     limit: u64,
@@ -804,7 +806,8 @@ impl Got {
         }
     }
 
-    /// `call`'s answer.
+    /// `call`'s answer. A streamed body is read whole here, and a read failure is the
+    /// call's error, as in `Prepared::held`, never a truncated answer.
     fn into_answered(self) -> Result<Answered> {
         let body = match self.body {
             Body::Whole(bytes) => bytes,
@@ -870,7 +873,9 @@ struct Prepared {
 }
 
 impl Prepared {
-    /// The wire request this attempt sends.
+    /// The wire request this attempt sends. Its wire limit is at least `HEAD_MAX`, whole or
+    /// streamed, so a failed answer's body is read to classify it even under a small call
+    /// limit (a file or an asset shorter than GitHub's error JSON).
     fn request(&self) -> WireRequest<'_> {
         WireRequest {
             method: self.method,
@@ -917,7 +922,7 @@ fn is_success(status: u16, reading: Reading) -> bool {
 }
 
 /// The repository a route is about.
-fn repo_of(route: &RouteRequest) -> Option<&Slug> {
+const fn repo_of(route: &RouteRequest) -> Option<&Slug> {
     match &route.target {
         RouteTarget::Repo(slug) => Some(slug),
         _ => None,
@@ -973,7 +978,9 @@ fn method_gate(call: &Call) -> Result<()> {
     }
 }
 
-/// A failed answer's kept headers and the first 64 KiB of its body.
+/// A failed answer's kept headers and the first 64 KiB of its body. A read that fails part
+/// way (a body cut short) is classified on the bytes it read: `read_to_end` keeps them, and
+/// the status and headers alone still classify the answer.
 fn head_of(response: WireResponse) -> (Vec<(String, String)>, Vec<u8>) {
     let WireResponse { headers, body, .. } = response;
     let mut head = Vec::new();
@@ -1324,7 +1331,9 @@ impl Github {
         }
     }
 
-    /// Step 5: follow a 301 to `/repositories/{id}` once.
+    /// Step 5: follow a 301 to `/repositories/{id}` once. The id is looked up anonymously,
+    /// the original access is routed again for the new slug, and the request is issued once
+    /// more under `/repos/{new}` with `follow_moved` off.
     fn follow_move(
         &self,
         call: &Call,
@@ -1393,7 +1402,8 @@ impl Github {
         Ok(got)
     }
 
-    /// Step 6: the one hop, sent with no credential (`hop::rebuild`).
+    /// Step 6: the one hop, sent with no credential (`hop::rebuild`). Its 2xx is the answer;
+    /// another redirect is CouldNotRun `Protocol`; any other status is classified.
     fn hop(
         &self,
         call: &Call,

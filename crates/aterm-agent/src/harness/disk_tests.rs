@@ -592,7 +592,10 @@ fn nothing_under_the_transcripts_root_is_ever_removed_even_when_it_is_on_the_rep
     );
 }
 
-/// WINDOWS: THE TRANSCRIPTS FENCE HOLDS IN EVERY SPELLING.
+/// WINDOWS: THE TRANSCRIPTS FENCE HOLDS IN EVERY SPELLING. The root is
+/// spelled plain (`home.join(".claude").join("projects")`) and a row as
+/// `canonicalize` spells it (`\\?\C:\…`, the case on disk) or in capitals:
+/// both are refused, on the report or not.
 #[cfg(windows)]
 #[test]
 fn the_transcripts_fence_holds_in_every_windows_spelling() {
@@ -625,7 +628,11 @@ fn the_transcripts_fence_holds_in_every_windows_spelling() {
     assert_eq!(placed_under(&beside, &root), Some(false));
 }
 
-/// WINDOWS: THE TRANSCRIPTS FENCE SEES THROUGH A LINKED `~\.claude`.
+/// WINDOWS: THE TRANSCRIPTS FENCE SEES THROUGH A LINKED `~\.claude`. The
+/// root comes as the home names it, through a junction to another folder of
+/// the same drive, where the key alone reads a canonical row under the real
+/// folder as beside it: the row is refused all the same, on the report or
+/// not, by the root's file identity among the row's ancestors.
 #[cfg(windows)]
 #[test]
 fn the_transcripts_fence_sees_through_a_linked_claude_folder() {
@@ -743,7 +750,10 @@ fn remove_tree_refuses_a_symlink() {
     let _ = link;
 }
 
-/// A STALE VERSION IN A REAL CLOUD SYNC ROOT STAYS.
+/// A STALE VERSION IN A REAL CLOUD SYNC ROOT STAYS. A scratch folder registered as a cloud
+/// sync root ([`aterm_dirfd::seam::SyncRoot`]) holds a versions folder whose version file and
+/// version folder are in-sync placeholders; [`remove_tree`] refuses both and every byte stays,
+/// whatever placeholder mode the calling thread is in.
 #[cfg(windows)]
 #[test]
 fn remove_tree_refuses_a_version_in_a_cloud_sync_root() {

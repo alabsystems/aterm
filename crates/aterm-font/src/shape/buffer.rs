@@ -6,14 +6,7 @@
 // project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! The shaping buffer: the run's characters going in, its glyphs coming out.
-//!
-//! Upstream's `hb_buffer_t`, cut to what the shaper here runs. Gone: the
-//! glyph flags (unsafe-to-break, unsafe-to-concat, safe-to-insert-tatweel),
-//! which only line breakers read, the pre/post context, the cluster levels
-//! other than the default (monotone graphemes), and the serializer. The out
-//! buffer is its own vector rather than an alias of the position array, so
-//! nothing here is `unsafe` or needs `bytemuck`.
+//! Shaping buffer for input characters and output glyphs.
 
 use super::Direction;
 use aterm_grapheme::{GeneralCategory, Script};
@@ -21,23 +14,19 @@ use aterm_grapheme::{GeneralCategory, Script};
 /// One glyph of the output (one character of the input before shaping).
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphInfo {
-    /// The glyph id after shaping; the input code point before.
+    /// The glyph id after shaping.
     pub glyph_id: u32,
-    /// The UTF-8 byte offset, in the shaped string, of the first character of
-    /// the grapheme cluster this glyph belongs to (the `cluster` passed to
-    /// [`super::UnicodeBuffer::add`] for a buffer built by hand).
+    /// The UTF-8 byte offset.
     pub cluster: u32,
     pub(crate) mask: u32,
-    /// The character's general category (upstream keeps it in the low five
-    /// bits of `unicode_props`).
+    /// The character's general category.
     pub(crate) gc: GeneralCategory,
     pub(crate) unicode_props: u16,
     pub(crate) glyph_props: u16,
     pub(crate) lig_props: u8,
     /// The Arabic joining action (upstream's `ot_shaper_var_u8_auxiliary`).
     pub(crate) shaper_action: u8,
-    /// The glyph the character maps to, set while the characters are mapped
-    /// and copied into `glyph_id` after.
+    /// The glyph the character maps to, copied into `glyph_id` after mapping.
     pub(crate) glyph_index: u32,
 }
 
@@ -74,7 +63,6 @@ impl Default for GlyphInfo {
 impl GlyphInfo {
     #[inline]
     pub(crate) const fn as_char(&self) -> char {
-        // Only ever a code point while it is read as one: `add` stores a `char`.
         match char::from_u32(self.glyph_id) {
             Some(c) => c,
             None => '\u{FFFD}',
@@ -92,18 +80,15 @@ pub(crate) mod unicode_props {
     /// Mongolian free variation selectors, TAG characters, CGJ.
     pub(crate) const HIDDEN: u16 = 0x0040;
     pub(crate) const CONTINUATION: u16 = 0x0080;
-    // With GENERAL_CATEGORY = Format, the top byte:
     pub(crate) const CF_ZWJ: u16 = 0x0100;
     pub(crate) const CF_ZWNJ: u16 = 0x0200;
     pub(crate) const CF_VS: u16 = 0x0400;
 }
 
 pub(crate) mod glyph_props {
-    // The three classes match the lookup flags' Ignore* bits.
     pub(crate) const BASE_GLYPH: u16 = 0x02;
     pub(crate) const LIGATURE: u16 = 0x04;
     pub(crate) const MARK: u16 = 0x08;
-    // Internal, not from GDEF.
     pub(crate) const SUBSTITUTED: u16 = 0x10;
     pub(crate) const LIGATED: u16 = 0x20;
     pub(crate) const MULTIPLIED: u16 = 0x40;
@@ -326,8 +311,7 @@ impl Buffer {
         start
     }
 
-    /// The first script that is not Common, Inherited or Unknown, and the
-    /// direction it is written in (left to right when there is none).
+    /// Sets an unset script to the first that is not Common, Inherited or Unknown, and an unset direction to its own (left to right by default).
     pub(crate) fn guess_segment_properties(&mut self) {
         if self.script.is_none() {
             for info in &self.info[..self.len] {
@@ -450,8 +434,7 @@ impl Buffer {
         self.out_len += 1;
     }
 
-    /// Copies the glyph at `idx` to the output and advances (just advances
-    /// when there is no output).
+    /// Copies the glyph at `idx` to the output and advances.
     #[inline]
     pub(crate) fn next_glyph(&mut self) {
         if self.have_output {
@@ -504,16 +487,11 @@ impl Buffer {
         for i in start + 1..end {
             cluster = cluster.min(self.info[i].cluster);
         }
-        // Extend end.
         if cluster != self.info[end - 1].cluster {
             while end < self.len && self.info[end - 1].cluster == self.info[end].cluster {
                 end += 1;
             }
         }
-        // Upstream's "extend start" loop runs `while end < start`, which never
-        // holds; it is left out, and with it the same answers.
-        //
-        // If we hit the start of buffer, continue in out-buffer.
         if self.idx == start && self.info[start].cluster != cluster {
             let old = self.info[start].cluster;
             let mut i = self.out_len;
@@ -533,12 +511,10 @@ impl Buffer {
         if (self.idx + 1 < self.len && cluster == self.info[self.idx + 1].cluster)
             || (self.out_len != 0 && cluster == self.out_info()[self.out_len - 1].cluster)
         {
-            // Cluster survives; do nothing.
             self.skip_glyph();
             return;
         }
         if self.out_len != 0 {
-            // Merge cluster backward.
             let old_cluster = self.out_info()[self.out_len - 1].cluster;
             if cluster < old_cluster {
                 let mut i = self.out_len;
@@ -551,25 +527,20 @@ impl Buffer {
             return;
         }
         if self.idx + 1 < self.len {
-            // Merge cluster forward.
             self.merge_clusters(self.idx, self.idx + 2);
         }
         self.skip_glyph();
     }
 
     pub(crate) fn delete_glyphs_inplace(&mut self, filter: impl Fn(&GlyphInfo) -> bool) {
-        // Merge clusters and delete filtered glyphs; positions are live, so no
-        // out buffer.
         let mut j = 0;
         for i in 0..self.len {
             if filter(&self.info[i]) {
                 let cluster = self.info[i].cluster;
                 if i + 1 < self.len && cluster == self.info[i + 1].cluster {
-                    // Cluster survives; do nothing.
                     continue;
                 }
                 if j != 0 {
-                    // Merge cluster backward.
                     let old_cluster = self.info[j - 1].cluster;
                     if cluster < old_cluster {
                         let mut k = j;
@@ -581,7 +552,6 @@ impl Buffer {
                     continue;
                 }
                 if i + 1 < self.len {
-                    // Merge cluster forward.
                     self.merge_clusters(i, i + 2);
                 }
                 continue;
@@ -617,7 +587,6 @@ impl Buffer {
             self.idx += count;
             self.out_len += count;
         } else if self.out_len > i {
-            // Rewinding.
             let count = self.out_len - i;
             if self.idx < count {
                 self.shift_forward(count - self.idx);
@@ -691,7 +660,7 @@ impl Buffer {
         self.idx += count;
     }
 
-    /// Called around shaping: the length and work budgets scale with the input.
+    /// Called around shaping.
     #[inline]
     pub(crate) fn enter(&mut self) {
         self.serial = 0;
@@ -715,8 +684,6 @@ impl Buffer {
 
     #[inline]
     pub(crate) fn allocate_lig_id(&mut self) -> u8 {
-        // Upstream recurses until the id is non-zero; the serial is never 0,
-        // so at most eight more draws find one.
         loop {
             let lig_id = self.next_serial() & 0x07;
             if lig_id != 0 {
@@ -726,7 +693,7 @@ impl Buffer {
     }
 }
 
-/// Grapheme groups: a glyph continues the group before it.
+/// Grapheme groups.
 #[inline]
 pub(crate) const fn grapheme_group(_: &GlyphInfo, b: &GlyphInfo) -> bool {
     b.unicode_props & unicode_props::CONTINUATION != 0

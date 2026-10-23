@@ -334,7 +334,9 @@ pub struct Rescue {
 }
 
 impl Rescue {
-    /// The `ranges` key's value read as a list of rescues.
+    /// The `ranges` key's value read as a list of rescues. `strict` is the
+    /// cutter's read: no key a table does not define, a reason, and a knob that
+    /// asks something.
     fn list_of(value: &aterm_toml::Value, strict: bool) -> Result<Vec<Self>, String> {
         let tables = value
             .as_array()

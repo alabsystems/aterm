@@ -51,7 +51,10 @@ fn item(rows: &[MenuRow], key: &str) -> MenuRow {
         .unwrap_or_else(|| panic!("no row {key}"))
 }
 
-/// THE MODEL UNDER EACH POSTURE (§9.3.3).
+/// THE MODEL UNDER EACH POSTURE (§9.3.3). Carrying a mode: the three modes,
+/// the effective one checked; 1 h, 2 h and 4 h; until `[harness] land_at`
+/// only where it is set; the cancel only while a timer is armed, naming its
+/// time (and its weekday on another day); Settings — every choice on.
 #[test]
 fn the_menus_rows_follow_the_posture_the_offer_and_the_timer() {
     let rows = rows(&facts(AutopilotView::Cruise));

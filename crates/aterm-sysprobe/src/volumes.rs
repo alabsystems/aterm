@@ -364,7 +364,7 @@ pub(crate) fn long_spelling_in<'p>(
 
 /// Resolve 8.3 short names in an existing path via `GetLongPathNameW` on Windows (`None` elsewhere).
 #[must_use]
-pub const fn long_name(path: &Path) -> Option<PathBuf> {
+pub fn long_name(path: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         crate::win_paths::long_path(path).ok()

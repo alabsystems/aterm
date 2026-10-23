@@ -110,7 +110,9 @@ impl Program {
     }
 }
 
-/// The terminal state the cross-token [subset] rules read.
+/// The terminal state the cross-token [subset] rules read. Which buffer is up
+/// is exactly known here, since only alternate-screen tokens and RIS change
+/// it.
 #[derive(Clone, Copy, Debug, Default)]
 struct Track {
     in_alt: bool,
@@ -247,7 +249,8 @@ impl Track {
 const COLS: [u16; 11] = [1, 2, 3, 4, 5, 8, 10, 13, 16, 20, 33];
 const ROWS: [u16; 8] = [1, 2, 3, 4, 5, 6, 8, 10];
 
-/// Printable glyphs.
+/// Printable glyphs. All one cell wide in both engines: ASCII, and narrow
+/// non-ASCII (Latin-1 letters, a box-drawing rule).
 const GLYPHS: &[char] = &[
     'a', 'b', 'c', 'x', 'y', 'z', 'A', 'M', 'Z', '0', '7', '9', ' ', '-', '#', '~', '[', ';', 'q',
     'l', '_', '^', '`', '{', '}', '\u{e9}', '\u{df}', '\u{f1}', '\u{2500}',
@@ -291,7 +294,8 @@ fn run_len(r: &mut Rng, cols: u16) -> usize {
     }
 }
 
-/// An SGR parameter list.
+/// An SGR parameter list. Foreground and the three attributes always; the
+/// background only when `bg` (see `Gen::token` for when that is safe).
 fn sgr(r: &mut Rng, bg: bool) -> Vec<u8> {
     let mut parts: Vec<String> = Vec::new();
     let n = r.below(4);
@@ -330,7 +334,10 @@ fn sgr(r: &mut Rng, bg: bool) -> Vec<u8> {
     csi(&parts.join(";"), 'm')
 }
 
-/// After a cursor restore.
+/// After a cursor restore. [subset] While the pinned fold restores the
+/// position only, the pen is put back to a known state at once: xterm's
+/// DECRC (and `?1049l`) restore the SGR rendition with the cursor, and the
+/// pen the program saved is not the oracle's to compare.
 fn after_restore(caps: Caps, mut t: Vec<u8>) -> Vec<u8> {
     if !caps.decsc_saves_pen {
         t.extend_from_slice(b"\x1b[0m");
@@ -338,7 +345,10 @@ fn after_restore(caps: Caps, mut t: Vec<u8>) -> Vec<u8> {
     t
 }
 
-/// A motion that resolves a pending wrap.
+/// A motion that resolves a pending wrap. [subset] While the pinned fold
+/// erases past a parked glyph (the xterm.js reading) instead of through it
+/// (xterm's `ClearRight`), every erase is preceded by one of these, so no
+/// erase starts from a pending wrap.
 fn resolve_wrap(r: &mut Rng, cols: u16, rows: u16) -> Vec<u8> {
     match r.below(3) {
         0 => csi(
@@ -384,7 +394,11 @@ struct Gen {
 }
 
 impl Gen {
-    /// An alternate-screen switch, shaped to what [`Track`] admits.
+    /// An alternate-screen switch, shaped to what [`Track`] admits. [subset]
+    /// While the pinned fold carries a pending wrap across `?1049h` and
+    /// `?1047l` (each of which xterm ends or starts with `ClearScreen`, and so
+    /// `ResetWrap`), those two are preceded by a motion that resolves the
+    /// wrap.
     fn alt_switch(&mut self) -> (Kind, Vec<u8>) {
         let caps = self.caps;
         let mut modes = vec![1049, 1047];

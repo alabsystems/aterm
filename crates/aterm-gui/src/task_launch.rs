@@ -305,7 +305,8 @@ impl TaskSeed {
         })
     }
 
-    /// The exclusive file write and its ownership handover.
+    /// The exclusive file write and its ownership handover. The filesystem
+    /// operation runs without the state lock, so discard never waits on it.
     fn write_in_using(
         &self,
         dir: &Path,

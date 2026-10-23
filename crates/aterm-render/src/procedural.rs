@@ -220,7 +220,9 @@ fn soft_square(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
     px.min(fw - px).min(py.min(fh - py)).clamp(0.0, 1.0)
 }
 
-/// A coverage canvas: `w * h` bytes.
+/// A coverage canvas: `w * h` bytes. The hard painters ([`Canvas::set`],
+/// [`Canvas::rect`]) write 0/255 only; [`Canvas::paint_aa`] writes box-filtered
+/// 8-bit coverage for the anti-aliased families.
 struct Canvas {
     w: usize,
     h: usize,
@@ -579,7 +581,10 @@ fn dash_v(c: &mut Canvas, m: &Metrics, n: usize, t: usize) {
     }
 }
 
-/// Double-line glyphs U+2550–256C.
+/// Double-line glyphs U+2550–256C. Rails sit at the outer thirds of the heavy
+/// envelope (`Metrics` docs); junction shapes follow the Unicode charts: outer
+/// rails meet at the outer corner, inner rails at the inner corner, and a
+/// branch breaks only the rail it attaches to.
 fn draw_double(c: &mut Canvas, m: &Metrics, cp: u32) {
     let t = m.light;
     let (w, h) = (m.w, m.h);
@@ -793,7 +798,11 @@ fn draw_arc(c: &mut Canvas, m: &Metrics, cp: u32) {
     }
 }
 
-/// Light diagonals U+2571–2573, corner to corner.
+/// Light diagonals U+2571–2573, corner to corner. A subsample is lit when it
+/// lies within half a light stroke of the ideal line, measured PERPENDICULAR
+/// to it (floored at 0.6 so the line stays visually connected — and meets the
+/// cell corners, so diagonals in adjacent cells chain without a break; the
+/// corner texels are edge-hardened back to 255).
 fn draw_diag(c: &mut Canvas, m: &Metrics, fwd: bool, back: bool) {
     let (wf, hf) = (m.w as f32, m.h as f32);
     let half = (m.light as f32 / 2.0).max(0.6);
@@ -877,7 +886,9 @@ fn quadrants(c: &mut Canvas, cp: u32) {
     }
 }
 
-/// Distance from `(px, py)` to the segment `(ax, ay)..(bx, by)`.
+/// Distance from `(px, py)` to the segment `(ax, ay)..(bx, by)`. The Powerline chevron
+/// stroke: a band `dist <= t/2` is `t` thick perpendicular to the edge at every slope,
+/// where a per-row fill of width `t` thins to `t / sqrt(1 + slope²)` (beads at 45°).
 fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (dx, dy) = (bx - ax, by - ay);
     let len2 = dx * dx + dy * dy;
@@ -943,7 +954,9 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
     });
 }
 
-/// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells.
+/// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells. The 60 code points map
+/// to the 6-bit masks 1..=62 except 21 (left column) and 42 (right column), which, like 0
+/// (space) and 63 (full block), have their own characters.
 fn draw_sextant(c: &mut Canvas, cp: u32) {
     let k = cp - 0x1FB00;
     let mask = k + 1 + u32::from(k >= 20) + u32::from(k >= 40);
@@ -992,7 +1005,9 @@ const OCTANT_MASKS: [u8; 230] = [
     0xF7, 0xF8, 0xF9, 0xFB, 0xFD, 0xFE,
 ];
 
-/// Draw one octant mask.
+/// Draw one octant mask. The column split is `eighth(4, w)`, the sextants'
+/// and ▌'s; the row splits are `eighth(2|4|6, h)`, the upper quarter /
+/// half / three-quarter blocks' (U+1FB82, ▀, U+1FB85).
 fn draw_octant(c: &mut Canvas, mask: u8) {
     let (w, h) = (c.w, c.h);
     let xs = [0, eighth(4, w), w];

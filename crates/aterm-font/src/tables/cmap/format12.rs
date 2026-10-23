@@ -74,11 +74,7 @@ impl<'a> Subtable12<'a> {
         u16::try_from(id).ok().map(GlyphId)
     }
 
-    /// Calls `f` for each code point a group maps. A group's end past
-    /// U+10FFFF (no Unicode scalar, and up to four billion calls from a
-    /// 12-byte record in a hostile font) is cut at U+10FFFF, and the calls
-    /// stop at [`super::CODE_POINTS`]: disjoint groups, as the spec requires,
-    /// never reach it, and overlapping ones cannot multiply the work.
+    /// Calls `f` for each code point a group maps, capped at U+10FFFF and [`super::CODE_POINTS`].
     pub fn codepoints(&self, mut f: impl FnMut(u32)) {
         let mut left = super::CODE_POINTS;
         for group in self.groups {

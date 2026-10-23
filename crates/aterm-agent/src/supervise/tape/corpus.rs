@@ -166,13 +166,13 @@ pub struct Scrub {
 }
 
 /// Whether a path's last name goes on with `b` ([`Scrub`]).
-fn path_goes_on(b: u8) -> bool {
+const fn path_goes_on(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
 }
 
 /// Whether a word goes on with `b` ([`Scrub`]): an ASCII letter, or a byte of
 /// a character past ASCII.
-fn word_goes_on(b: u8) -> bool {
+const fn word_goes_on(b: u8) -> bool {
     b.is_ascii_alphabetic() || b >= 0x80
 }
 

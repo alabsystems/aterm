@@ -223,7 +223,7 @@ impl WaylandPresenter {
         let Some(NativeWindow::Wayland { display, surface }) = window.native_window() else {
             return Err(WaylandPresentError::NotWayland);
         };
-        // SAFETY: Winit's live display and surface.
+        // SAFETY: Winit's live display and surface, which `_window` keeps alive.
         let (display, surface) = unsafe { (Display::from_ptr(display), Proxy::from_ptr(surface)) };
         let queue = Queue::new(display)?;
         let registry = Registry::new(&queue)?;
@@ -314,7 +314,7 @@ impl WaylandPresenter {
 impl Drop for WaylandPresenter {
     fn drop(&mut self) {
         self.buffers = None;
-        // SAFETY: The wl_shm this presenter bound (version 1 has no release request).
+        // SAFETY: The wl_shm this presenter bound, destroyed once (version 1 has no release request).
         unsafe { self.shm.destroy() };
         self.registry = None;
         let _ = self.display.flush();

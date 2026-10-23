@@ -55,8 +55,8 @@ impl Drop for FixtureGuard {
     }
 }
 
-/// The client every call speaks through: the release org's token when its file holds one (the
-/// module's rule), else anonymous.
+/// The client every call speaks through: the release org's token when its file holds one, else
+/// anonymous.
 /// # Errors
 /// A token file that cannot be read, or holds a token [`Token::new`] refuses.
 pub(crate) fn client() -> Result<Client> {
@@ -94,7 +94,7 @@ fn base_client() -> Result<Client> {
     Ok(Client::new(Origins::github(), token))
 }
 
-/// curl started as `launch` starts a child, with the release's `StepChildren` and interrupt guard.
+/// curl started as `L` starts a child (the release's `StepChildren`, or `ship site`'s `Plain`).
 #[derive(Clone, Debug)]
 pub(crate) struct Launched<L>(pub(crate) L);
 

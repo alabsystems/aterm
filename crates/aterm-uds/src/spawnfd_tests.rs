@@ -275,7 +275,9 @@ pub(super) fn raise_soft_limit(want: u64) -> u64 {
     }
 }
 
-/// The lane child inherits its two lanes and nothing else above stdio.
+/// The lane child inherits its two lanes and nothing else above stdio. An
+/// unflagged descriptor of this process (from 64 up) must not reach it, while
+/// fds 3 and 4 still round-trip.
 #[test]
 fn the_two_fd_child_inherits_nothing_but_its_two_lanes() {
     let held = unflagged_at_or_above(64);
@@ -699,7 +701,9 @@ fn staged_above_old_cap() {
     println!("STAGED above-old-cap ok fd={fd}");
 }
 
-/// An unflagged descriptor above 65,536 reaches neither child.
+/// An unflagged descriptor above 65,536 reaches neither child. Darwin allocates
+/// up to `kern.maxfilesperproc`; a stand-in at 70,000 must reach a leaky spawn
+/// (the control) and neither the lane spawn nor an [`InheritStrip`]ped one.
 #[test]
 fn an_unflagged_descriptor_above_the_old_cap_reaches_no_child() {
     const NAME: &str = "spawnfd::tests::an_unflagged_descriptor_above_the_old_cap_reaches_no_child";
@@ -814,7 +818,9 @@ fn staged_race() {
     assert_eq!(lost_lane, 0, "a lane child lacked fd 3 or 4: {tally:?}");
 }
 
-/// Zero leaks under a racing thread over 500 spawns.
+/// Zero leaks under a racing thread over 500 spawns. A thread lowers and raises
+/// the soft limit and opens unflagged descriptors (at 2000 and above 65,536)
+/// while this one spawns.
 #[test]
 fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
     const NAME: &str =
@@ -828,7 +834,9 @@ fn no_descriptor_reaches_a_lane_child_while_another_thread_races_the_spawn() {
     print!("{out}");
 }
 
-/// A stripped child inherits nothing above stdio.
+/// A stripped child inherits nothing above stdio. A descriptor this process
+/// holds without close-on-exec rides a leaky spawn (the control) and not a
+/// fork that runs the strip, while the child's stdio still arrives.
 #[test]
 fn a_stripped_child_inherits_nothing_above_stdio() {
     let held = unflagged_at_or_above(64);

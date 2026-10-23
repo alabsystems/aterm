@@ -11,7 +11,8 @@ use crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
 use crate::cursor_glow::{Geom, push_ripple_ring};
 use crate::effect_util::{push_soft_disc, water_ramp};
 
-/// Slosh rate in turns/second, at rest and at full surge.
+/// Slosh rate in turns/second, at rest and at full surge. The phase advances
+/// only on rendered frames, so a settled bead sways at the blink cadence.
 const SLOSH_IDLE: f32 = 0.9;
 const SLOSH_ACTIVE: f32 = 4.2;
 
@@ -20,7 +21,8 @@ const SLOSH_ACTIVE: f32 = 4.2;
 const RADIUS_IDLE: f32 = 0.52;
 const RADIUS_MAX: f32 = 0.78;
 
-/// Innermost-disc coverage before intensity, at rest and at full surge.
+/// Innermost-disc coverage before intensity, at rest and at full surge. The
+/// outer discs scale down from it, each clamped by [`COV_CAP`].
 const COV_IDLE: f32 = 60.0;
 const COV_MAX: f32 = 148.0;
 /// Per-quad additive coverage ceiling: inner discs saturate here over the
@@ -32,7 +34,8 @@ const COV_CAP: f32 = 92.0;
 /// edge: this much more coverage keeps the bead as bright to the eye.
 const DISC_SOFT_GAIN: f32 = 1.35;
 
-/// Ripple cadence in rings/second, at rest and at full surge.
+/// Ripple cadence in rings/second, at rest and at full surge. Two rings run
+/// half a cycle apart.
 const RIPPLE_IDLE: f32 = 0.35;
 const RIPPLE_ACTIVE: f32 = 1.15;
 /// How far a ring rolls out, in bead-radii, over its life (`u` 0→1).

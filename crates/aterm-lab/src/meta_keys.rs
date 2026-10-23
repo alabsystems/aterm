@@ -1027,7 +1027,8 @@ mod tests {
         }
     }
 
-    /// The U.S.
+    /// The U.S. keys these tests use: a (0), 1 (18), 2 (19), [ (33), e (14),
+    /// u (32), ; (41) and b (11).
     fn us() -> Table {
         Table::default()
             .key(0, 0, "a")
@@ -1057,7 +1058,9 @@ mod tests {
         cases.iter().map(|c| c.what.as_str()).collect()
     }
 
-    /// On the U.S.
+    /// On the U.S. layout the rows are the ones measured on 2026-10-19, read off
+    /// the layout: each Option dead key as ESC and its letter, the control's
+    /// composition and Option chord.
     #[test]
     fn the_us_rows_come_from_the_us_layout() {
         let r = rows(&us(), &us());
@@ -1081,7 +1084,9 @@ mod tests {
         assert_eq!(r.meta[4].keys, ["1 mods=alt+shift"]);
     }
 
-    /// A French-shaped layout: a bare dead `^` on the U.S.
+    /// A French-shaped layout: a bare dead `^` on the U.S. `[` key, `é` on the `2`
+    /// key, `&` with Shift `1` on the `1` key, an Option dead key on `&`, and `{`
+    /// under Option on the U.S. `;` key.
     fn fr() -> Table {
         Table::default()
             .key(0, 0, "q")
@@ -1105,7 +1110,8 @@ mod tests {
             .after(4, 14, "ê")
     }
 
-    /// A foreign layout's rows press the U.S.
+    /// A foreign layout's rows press the U.S. names of its keys and want the
+    /// layout's own characters.
     #[test]
     fn a_foreign_layouts_rows_want_its_own_characters() {
         let r = rows(&fr(), &us());
@@ -1142,7 +1148,9 @@ mod tests {
         assert_eq!(r.meta[6].want, "ê".as_bytes());
     }
 
-    /// A German-shaped layout: `@` only under Option on the U.S.
+    /// A German-shaped layout: `@` only under Option on the U.S. `l` key, the tilde
+    /// dead key (its `~` reached no other way) under Option on `n`, and `'` under
+    /// Option on the U.S. `\` key, whose Shift types `'` too.
     fn de() -> Table {
         Table::default()
             .key(0, 0, "a")
@@ -1225,7 +1233,8 @@ mod tests {
         }
     }
 
-    /// A key the U.S.
+    /// A key the U.S. layout types no printable ASCII on (here `§`) cannot be named to
+    /// `hwkey`, so it makes no row.
     #[test]
     fn a_key_with_no_us_name_makes_no_row() {
         let only = Table::default().key(10, 0, "§").key(10, OPTION, "dead:1");

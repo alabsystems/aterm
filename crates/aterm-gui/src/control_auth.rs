@@ -150,7 +150,9 @@ pub(crate) fn automatic_capture_name(stem: &str) -> String {
 pub(crate) struct ArtifactPathLease {
     key: Option<PathBuf>,
     os_lock: Option<crate::native_document_host::HeldAdvisoryLock>,
-    /// Capability local to this lease.
+    /// Capability local to this lease. It shares the lease owner's admitted
+    /// directory chain and therefore can never outlive that owner's capacity
+    /// charge.
     video_sweep: Option<VideoRetentionSweep>,
     /// Automatic-image namespace GC is armed by both the target and its wire
     /// lease.
@@ -243,7 +245,10 @@ fn artifact_path_leases() -> &'static (
     })
 }
 
-/// Serialize each bounded retention census with its mutations.
+/// Serialize each bounded retention census with its mutations. Per-artifact
+/// leases stop a sweep from touching a live reply, but they cannot by themselves
+/// stop two stale namespace censuses from deleting disjoint candidates below the
+/// keep cap.
 fn retention_sweep_gate() -> &'static std::sync::Mutex<()> {
     static GATE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     GATE.get_or_init(|| std::sync::Mutex::new(()))
@@ -273,7 +278,9 @@ struct ArtifactLeaseState {
     video_sweep_requested: bool,
     /// A count-zero entry remains present while its capability-bound sweep runs.
     sweeping: bool,
-    /// Reserved when this distinct video key first enters the registry.
+    /// Reserved when this distinct video key first enters the registry. The
+    /// final armed lease transfers it to the priority cleanup lane, so Drop
+    /// never races best-effort GC for admission or waits for queue capacity.
     video_retention: Option<crate::control::VideoRetentionPermit>,
 }
 
@@ -1685,12 +1692,15 @@ fn open_private_namespace_lock(
     Ok(file)
 }
 
-/// Open the launch-identity lease.
+/// Open the launch-identity lease. Unlike the PID embedded in the namespace
+/// name, its advisory lock cannot be fooled by PID reuse.
 fn open_instance_lease(namespace: &Path, create: bool) -> std::io::Result<std::fs::File> {
     open_private_namespace_lock(namespace, std::ffi::OsStr::new(INSTANCE_LEASE_FILE), create)
 }
 
-/// Hold the current launch's lease until process exit.
+/// Hold the current launch's lease until process exit. A process can have both
+/// an automatic-image and a video namespace, so the static owns one locked file
+/// per canonical namespace rather than one global file.
 fn hold_current_instance_lease(namespace: &Path) -> std::io::Result<()> {
     type Held = crate::native_document_host::HeldAdvisoryLock;
     static LEASES: std::sync::OnceLock<std::sync::Mutex<Vec<(PathBuf, Held)>>> =
@@ -1715,7 +1725,9 @@ fn hold_current_instance_lease(namespace: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Remove only namespaces proven abandoned.
+/// Remove only namespaces proven abandoned. New namespaces carry an advisory
+/// lease: an exclusive try-lock proves the exact launch is gone even if its PID
+/// has been reused.
 const DEAD_INSTANCE_SCAN_LIMIT: usize = 256;
 const DEAD_INSTANCE_DELETE_LIMIT: usize = 16_384;
 const DEAD_INSTANCE_TOMBSTONE_PREFIX: &str = ".instance-prune-";
@@ -1792,7 +1804,8 @@ impl DeadNamespaceSweep {
         })
     }
 
-    /// Consume one bounded slice of a persistent directory cursor.
+    /// Consume one bounded slice of a persistent directory cursor. Returning
+    /// `true` means the cursor is exhausted or its retained root was replaced.
     fn run_batch(&mut self, pid_alive: impl FnMut(u32) -> bool) -> bool {
         self.run_batch_with_hook(DEAD_INSTANCE_DELETE_LIMIT, pid_alive, || {})
     }
@@ -1971,7 +1984,8 @@ fn fresh_video_tombstone_name() -> std::ffi::OsString {
 struct PendingVideoTombstoneSweep {
     root: PathBuf,
     expected_root: crate::pinned_dir::PinnedDirIdentity,
-    /// A tombstone arrived after the current persistent cursor began.
+    /// A tombstone arrived after the current persistent cursor began. Restart
+    /// once after EOF so directory-iteration snapshot semantics cannot lose it.
     dirty: bool,
 }
 
@@ -2062,7 +2076,8 @@ impl VideoTombstoneSweep {
         })
     }
 
-    /// Consume one bounded slice.
+    /// Consume one bounded slice. `true` means this cursor reached EOF or its
+    /// lexical root no longer names the retained identity.
     fn run_batch(&mut self) -> bool {
         self.run_batch_within(VIDEO_PRUNE_WORK_LIMIT)
     }
@@ -2691,7 +2706,9 @@ pub(crate) fn cleanup_failed_automatic_image(target: &ConfinedImage) {
     }
 }
 
-/// Recordings kept on disk, including the one just created.
+/// Recordings kept on disk, including the one just created. Each can hold a full frame
+/// budget of PNGs (hundreds of MiB at `full`), so a looping recorder would otherwise grow
+/// its namespace without bound.
 const VIDEO_KEEP: usize = 8;
 
 /// Video retention (`prune_video_dirs`) deletes completed recordings beyond [`VIDEO_KEEP`],
@@ -3392,7 +3409,8 @@ pub(crate) struct ConfinedImage {
     /// Every absolute ancestor plus the exact output directory, retained from
     /// confinement until the encode worker commits or refuses the reply.
     pinned: Option<crate::pinned_dir::PinnedDir>,
-    /// Last field.
+    /// Last field. The target and its path lease share this kick, so stale
+    /// namespace GC starts only after the final retained path capability closes.
     deferred_cleanup: Option<std::sync::Arc<DeferredImageCleanup>>,
 }
 
@@ -4725,7 +4743,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The launch sweep against a real directory.
+    /// The launch sweep against a real directory. With the day margin only the dead pid's
+    /// zero-byte file goes; younger files (two real sockets among them) are not probed, and a
+    /// token, a file with bytes and the `latest` alias are never candidates.
     #[test]
     fn launch_sweep_removes_only_aged_empty_socks_nobody_listens_on() {
         use std::time::{Duration, SystemTime};
@@ -5503,7 +5523,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Automatic-image namespace GC owns another retained directory chain.
+    /// Automatic-image namespace GC owns another retained directory chain. It
+    /// must not start until the target, sealed file, and reply lease release
+    /// theirs, especially when only one file-open worth of headroom remains.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn automatic_image_gc_waits_for_final_capability_under_low_nofile() {
@@ -5570,7 +5592,9 @@ mod tests {
         );
     }
 
-    /// Scanning keeps names, not one open directory per recording.
+    /// Scanning keeps names, not one open directory per recording. Run the
+    /// complete retention pass below a descriptor limit that cannot hold all
+    /// candidate directories simultaneously.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn video_prune_directory_handles_stay_bounded() {

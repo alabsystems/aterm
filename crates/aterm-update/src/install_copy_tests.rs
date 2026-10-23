@@ -50,8 +50,6 @@ fn isolated_copy_proves_and_catches() {
     aterm_spec::verify::prove_and_catch_scalar(&publication_model(), "isolated update copy");
 }
 
-// `isolated == false` is the negative control: ditto writes the caller's reusable path
-// directly, and success needs no promotion.
 fn copy_with_policy(
     isolated: bool,
     args: &[std::ffi::OsString],
@@ -102,8 +100,6 @@ fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
                 std::fs::create_dir_all(&bundle).unwrap();
                 std::fs::write(bundle.join("id"), "OLD-COPY").unwrap();
                 old_payload = Some(payload);
-                // Open the old job's destination only after the retry has materialized,
-                // and hold it open across the retry's publication or exchange.
                 writer = Some(std::thread::spawn(move || {
                     open_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
                     let mut file = std::fs::OpenOptions::new()
@@ -135,8 +131,6 @@ fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
                 .1 = i64::from(!isolated);
             let mut state = model.init_state();
             copy_model_step(&model, &mut state, "Timeout");
-            // Real callers reclaim their requested destination after a failure; the
-            // isolated attempt lies outside that cleanup.
             remove_path_no_follow(&destination).unwrap();
             if shape == "zip" {
                 std::fs::create_dir(&destination).unwrap();
@@ -192,8 +186,6 @@ fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
                     roster_seq: None,
                     roster_confirmed_at: Some(crate::install::now_rfc3339()),
                 };
-                // The fixture models already-verified bytes; publication and
-                // the apply lock below are the genuine shipping transaction.
                 publish_verified_stage(&staging, &bundle_in(&destination), &ready).unwrap();
                 staging.staged_app.clone()
             };
@@ -216,9 +208,6 @@ fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
     }
 }
 
-/// The reaper's contract: it reclaims an attempt past every writer's ceiling whose
-/// caller gave it up or is gone. It never takes a live caller's attempt it has not
-/// given up, or one a writer could still be filling.
 fn reaper_model() -> aterm_spec::derive::Model {
     aterm_spec::ty_model! {
         AbandonedCopyReclamation {
@@ -292,8 +281,6 @@ fn reaper_case(
     state.insert("owner_gone", i64::from(owner_gone));
     state.insert("lapsed", i64::from(lapsed));
     let admitted = model.action_enabled("Reap", &state);
-    // Creating an apply/copy attempt must not recursively sweep predecessors,
-    // even when their cleanup is already authorized.
     let next = IsolatedCopy::create(&staging.root.join("next-destination")).unwrap();
     assert!(
         attempt.root.exists(),
@@ -319,8 +306,6 @@ fn reaper_case(
         );
     }
     if !abandoned && !owner_gone && lapsed {
-        // Negative control: a complete payload, however old, is not authority to
-        // delete the live caller's not-yet-promoted output.
         std::fs::remove_dir_all(&attempt.root).unwrap();
         state.insert("reaped", 1);
         assert!(

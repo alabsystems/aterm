@@ -43,7 +43,7 @@ impl<'a> Door<'a> {
 
     /// The lab this door opens.
     #[must_use]
-    pub fn run(&self) -> &Run {
+    pub const fn run(&self) -> &Run {
         self.run
     }
 

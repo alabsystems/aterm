@@ -1066,7 +1066,8 @@ impl EffectsPipeline {
         }
     }
 
-    /// (Re)compile the lexicon + resolved config.
+    /// (Re)compile the lexicon + resolved config. `force` builds even when
+    /// currently off (the master-enable path).
     fn rebuild_sparkle(&mut self, force: bool) {
         if self.sparkle.is_none() && !force {
             return;
@@ -1260,7 +1261,10 @@ impl EffectsPipeline {
         self.set_reduced_motion(on);
     }
 
-    /// Bind cursor geometry to this exact frame.
+    /// Bind cursor geometry to this exact frame. A changed cell grid, metric,
+    /// or chrome origin invalidates every retained cell/pixel endpoint before
+    /// the next cursor sample; the current scroll snapshot is re-baselined so
+    /// the same layout transition cannot also replay as content motion.
     #[inline]
     fn sync_cursor_coordinate_space(
         &mut self,
@@ -4347,7 +4351,12 @@ mod tests {
         }
     }
 
-    /// A page keeps its wake through the momentum glow's cool-down.
+    /// A page keeps its wake through the momentum glow's cool-down. After a
+    /// typed burst under `classic` (no body of its own, so the caret's tint
+    /// and halo are the momentum glow's), the page is driven as an embedder's
+    /// loop drives it — a rAF frame on `Frames`, a timer to the instant on
+    /// `At` — and goes `Idle` only after a frame with no momentum caret and a
+    /// cold glow.
     #[test]
     fn a_page_keeps_its_wake_until_the_momentum_glow_is_cold() {
         let mut p = EffectsPipeline::new();

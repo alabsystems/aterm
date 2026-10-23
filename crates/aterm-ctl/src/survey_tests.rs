@@ -780,7 +780,11 @@ fn thirty_hosts_render_within_the_budget_one_row_each() {
     );
 }
 
-/// A PEER'S HEADER keeps what a reader acts on.
+/// A PEER'S HEADER keeps what a reader acts on. Dialled by its address with
+/// its own long `host=` beside it, a LAN peer's header carries its name, pid,
+/// version, state counts and what its reply cap left out whole (a
+/// thirty-machine fleet read, `targo --unverified lab fleet-sim`, showed every
+/// peer's header cut at 100 characters to `· 3 sessions…`, its counts gone).
 #[test]
 fn a_peer_header_keeps_its_counts_and_its_reply_cap() {
     let row = |sid: &str, agent: &str| {

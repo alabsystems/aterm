@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The emoji properties against the UCD's own `emoji-data.txt` (Unicode
-//! 16.0.0, the version of the crate's tables), every code point checked.
-//!
-//! VS16 (U+FE0F) makes a character an emoji only where Unicode defines an
-//! emoji presentation sequence for it, which is exactly the characters that
-//! are `Emoji=Yes` but default to text (`Emoji_Presentation=No`):
-//! `emoji-variation-sequences.txt` lists every one of them, and every other
-//! base it lists is already a wide emoji. Each is narrow until a VS16 follows.
+//! Emoji property tests against UCD `emoji-data.txt` (Unicode 16.0.0) across all code points.
 
 use aterm_grapheme::{
     grapheme_display_width, is_emoji_modifier_base, is_emoji_presentation, is_vs16_emoji_capable,

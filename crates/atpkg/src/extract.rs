@@ -83,7 +83,9 @@ pub(crate) enum FrameChecksum {
     Required,
 }
 
-/// Steps 2–4 of [`vet_entry`]: the pure component walk.
+/// Steps 2–4 of [`vet_entry`]: the pure component walk. Accepts only `Normal` segments
+/// (`.` dropped; `..` is traversal; a root/prefix component is an absolute escape) and
+/// refuses a path that names nothing.
 fn vet_components(raw: &Path) -> Result<PathBuf, ExtractReject> {
     // An absolute entry path can never be made relative to the root.
     if raw.is_absolute() {
@@ -104,7 +106,8 @@ fn vet_components(raw: &Path) -> Result<PathBuf, ExtractReject> {
     Ok(rel)
 }
 
-/// Drop the first `strip` components of an already-vetted relative path.
+/// Drop the first `strip` components of an already-vetted relative path. `None` when
+/// nothing remains — the entry is skipped, as GNU tar skips it.
 fn strip_leading(rel: &Path, strip: u32) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     let mut dropped: u32 = 0;
@@ -452,7 +455,8 @@ enum Node {
 /// Extraction-time accumulator for [`crate::tree::tree_root`].
 #[derive(Debug)]
 pub(crate) struct TreeAccumulator {
-    /// relpath bytes → index into `nodes`: which node that path currently names.
+    /// relpath bytes → index into `nodes`: which node that path currently names. Sorted,
+    /// as the fold wants the lines.
     paths: std::collections::BTreeMap<Vec<u8>, usize>,
     /// One entry per distinct node laid down.
     nodes: Vec<Node>,
@@ -512,7 +516,9 @@ impl TreeAccumulator {
             .is_some_and(|&node| matches!(self.nodes.get(node), Some(Node::File(..))))
     }
 
-    /// Record a hardlink at `rel` aliasing the already-extracted `target_rel`.
+    /// Record a hardlink at `rel` aliasing the already-extracted `target_rel`. False (fail
+    /// closed) when the target is not a regular file this extraction wrote under exactly
+    /// these bytes; [`Layer::hardlink`] checks [`Self::wrote_file`] first.
     fn record_alias(&mut self, rel: Vec<u8>, target_rel: &[u8]) -> bool {
         let Some(&node) = self.paths.get(target_rel) else {
             return false;
@@ -663,7 +669,8 @@ struct Layer<'a> {
     /// [`TreeAccumulator`]) — so `verify_and_stage` need not walk the payload a second
     /// time.
     tree: Option<TreeAccumulator>,
-    /// Whether any symlink has been laid yet.
+    /// Whether any symlink has been laid yet. Until one has, no entry can pass through or
+    /// land on a link, so the per-entry `lstat` walks are skipped.
     laid_symlink: bool,
     /// The parent directory the last laid entry needed, known to be a directory
     /// ([`Layer::ensure_parent`]).
@@ -775,7 +782,9 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Make directory `dir` and its missing ancestors.
+    /// Make directory `dir` and its missing ancestors. A folding lane makes each
+    /// component under its exact name or refuses it ([`make_dir_exact`]): its root began
+    /// empty, so a name already there that it did not make is a filesystem fold.
     fn ensure_dir(&mut self, dir: &Path, raw: &Path) -> Result<(), ExtractError> {
         match self.tree.as_mut() {
             Some(tree) => make_dir_exact(self.root, dir, raw, tree),
@@ -783,7 +792,9 @@ impl<'a> Layer<'a> {
         }
     }
 
-    /// Lay down a directory entry.
+    /// Lay down a directory entry. A non-zero `declared_size` (the effective body size) is
+    /// a bomb the content cap never sees, since the reader skips the body, so it is
+    /// refused on the header.
     fn directory(&mut self, raw: &Path, declared_size: u64, mode: u32) -> Result<(), ExtractError> {
         if declared_size != 0 {
             return Err(ExtractError::TooLarge(TooLargeReason::DirectoryWithBody(
@@ -1137,14 +1148,18 @@ fn folded(tree: Option<TreeAccumulator>) -> Result<TreeAccumulator, ExtractError
 /// anything else the stream holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Trailer {
-    /// Left unread.
+    /// Left unread. The `tar-gz` lane: its reader refuses trailing bytes that are not a
+    /// gzip member, which a vendor archive padded past its last member would hit.
     Unread,
     /// Read to the end of the stream, under one entry's structural budget and charged to
     /// the structure allowance like any other tar structure.
     Drained,
 }
 
-/// The one tar extraction body, over an already-decompressed `decoded` stream.
+/// The one tar extraction body, over an already-decompressed `decoded` stream. `fold`
+/// decides whether it also accumulates the [`crate::tree::tree_root`] of what it writes
+/// (see [`extract_tar_zst_tree`]) or performs the historical write-only pass
+/// ([`extract_tar_zst`]); `trailer` what happens past the tar's end.
 fn extract_stream(
     decoded: impl Read,
     dest_root: &Path,

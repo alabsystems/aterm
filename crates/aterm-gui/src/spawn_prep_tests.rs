@@ -81,7 +81,6 @@ fn provisions_wait_under_their_control_dir_and_an_untaken_one_removes_its_file()
 #[test]
 fn a_dir_that_refuses_the_file_leaves_no_provision() {
     let scratch = aterm_tempfile::tempdir().expect("scratch");
-    // `edges` is a file, so no edge-token file can be written under it.
     std::fs::write(scratch.path().join("edges"), b"").expect("a file in the way");
     let ready = Mutex::new(Vec::new());
     fill_provisions(
@@ -109,7 +108,6 @@ fn a_fill_after_the_release_leaves_no_file() {
         edge_files(dir.path()).is_empty(),
         "the exit's take removed them"
     );
-    // The exit's flag lands while the fill mints its first.
     let mint = |d: &Path| {
         released.store(true, Ordering::Release);
         Provision::prepare(d)
@@ -120,8 +118,6 @@ fn a_fill_after_the_release_leaves_no_file() {
         "nothing kept after the release"
     );
     assert!(edge_files(dir.path()).is_empty(), "and no file left");
-    // A retirement already queued is the worker's; one after release must
-    // complete inline, beyond the exit's final Flush rather than behind it.
     let (tx, rx) = channel();
     let tx = Mutex::new(tx);
     let retiring = AtomicBool::new(false);

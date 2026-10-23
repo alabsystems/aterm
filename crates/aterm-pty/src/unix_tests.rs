@@ -1006,7 +1006,8 @@ fn fd_flags(fd: libc::c_int, what: &str) -> libc::c_int {
     flags
 }
 
-/// `poll(fd, POLLIN)` for at most `budget`: the revents once any arrive, else 0.
+/// `poll(fd, POLLIN)` for at most `budget`: the revents once any arrive, else 0. The
+/// shape of `handoff_masters_closed`'s poll; with `events: 0` macOS reports nothing.
 fn poll_revents(fd: libc::c_int, budget: std::time::Duration) -> libc::c_short {
     let deadline = std::time::Instant::now() + budget;
     loop {
@@ -1167,7 +1168,11 @@ fn a_stranger_holding_the_write_end_cannot_block_the_status_wait_forever() {
     );
 }
 
-/// [`wait_readable_briefly`] WAKES when a fifo's last writer closes.
+/// [`wait_readable_briefly`] WAKES when a fifo's last writer closes. On macOS
+/// `poll(2)` and `kqueue` never report a fifo's EOF, only `select(2)` does; a
+/// wait built on either sleeps out its whole slice, which leaves every
+/// correctness test green and adds up to [`EXEC_STATUS_SLICE`] to every
+/// successful spawn.
 #[cfg(target_os = "macos")]
 #[test]
 fn wait_readable_briefly_wakes_when_a_fifos_last_writer_closes() {
@@ -1208,7 +1213,8 @@ fn an_unset_tmpdir_puts_the_status_fifo_in_tmp() {
     assert_eq!(dir(Some("")), "/");
 }
 
-/// One real spawn through the seam, checked from both sides.
+/// One real spawn through the seam, checked from both sides. The child is a
+/// probe that reports, then parks.
 #[test]
 fn a_spawned_child_gets_its_own_ctty_our_winsize_and_no_other_descriptor() {
     spawn_probe_checks_the_child(None);

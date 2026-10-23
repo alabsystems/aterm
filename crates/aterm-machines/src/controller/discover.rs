@@ -26,7 +26,8 @@ pub const SFTP_SERVICE: &str = "_sftp-ssh._tcp";
 /// How long one `dns-sd -L` resolve runs.
 pub const RESOLVE_BUDGET: Duration = Duration::from_secs(2);
 
-/// Resolves run at once.
+/// Resolves run at once. Each `dns-sd -L` runs its whole budget (it never exits), so a lab
+/// of 65 Macs resolves in three rounds.
 const RESOLVE_PARALLEL: usize = 32;
 
 /// Apple's host-key scanner.

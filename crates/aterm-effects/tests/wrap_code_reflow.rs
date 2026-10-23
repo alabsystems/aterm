@@ -957,7 +957,9 @@ fn a_word_begun_at_a_navigated_caret_keeps_its_first_glyph_when_it_wraps_down() 
     );
 }
 
-/// B2: nothing is laid on the continuation row's blank indent.
+/// B2: nothing is laid on the continuation row's blank indent. The Space after
+/// the last word came with the pasted chip, so the last typed Space is the one
+/// before `have`.
 #[test]
 fn a_stale_typed_space_lays_nothing_on_the_continuation_indent() {
     let mut cc = typed_but_the_last_space(ROW1_ONE_FITS);
@@ -984,7 +986,9 @@ const PROG: &str = "the aterm window had this prompt appear.";
 /// Frames of a census, as `(ms after the event, columns)`.
 type FrameCols = Vec<(u64, Vec<usize>)>;
 
-/// A re-wrap's census from the wrap key's echo at `wrap` ms.
+/// A re-wrap's census from the wrap key's echo at `wrap` ms. `dark`: frames
+/// 30..=400 ms after it where a column of the moved word (`word`) on row 2 is
+/// dark.
 fn rewrap_faults(
     cc: &Cc,
     wrap: u64,
@@ -1198,7 +1202,9 @@ fn soft_wrap_then(keys: &str, echo: &str) -> (Cc, u64) {
     (cc, ms)
 }
 
-/// D: the key that reflows the soft-wrapped word carries its light down.
+/// D: the key that reflows the soft-wrapped word carries its light down. `b`
+/// after the soft-wrapped `I` makes `Ib` one word: the `I` is erased from row
+/// 1's end and `Ib` written from the indent, caret (17, 4).
 #[test]
 fn a_soft_wrapped_word_the_next_key_reflows_comes_down_with_its_light() {
     let echo = format!(
@@ -1230,7 +1236,10 @@ fn a_soft_wrapped_word_the_next_key_reflows_comes_down_with_its_light() {
     );
 }
 
-/// D: a word that stayed on its row keeps its light there.
+/// D: a word that stayed on its row keeps its light there. The same
+/// soft-wrapped `I`, then a Space and `b` answered by one chunk (a burst or
+/// paste): `I` stays at row 1's end, the Space and `b` are written from the
+/// indent, and the caret hops (17, 2) → (17, 4).
 #[test]
 fn a_soft_wrapped_word_that_stays_on_its_row_keeps_its_light_there() {
     let echo = format!(

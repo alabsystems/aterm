@@ -548,7 +548,7 @@ impl Holds {
     }
 
     /// Whether any hold stands.
-    pub fn is_held(&self) -> bool {
+    pub const fn is_held(&self) -> bool {
         self.person.is_some()
             || self.fleet.is_some()
             || self.local.is_some()
@@ -561,12 +561,12 @@ impl Holds {
     }
 
     /// The remote node's hold, when another Mac holds the tab.
-    pub fn remote(&self) -> Option<&RemoteHold> {
+    pub const fn remote(&self) -> Option<&RemoteHold> {
         self.remote.as_ref()
     }
 
     /// The slot hand back lifts ([`person_hold`]).
-    pub fn hand_back_origin(&self) -> Option<&'static str> {
+    pub const fn hand_back_origin(&self) -> Option<&'static str> {
         if self.person.is_some() {
             Some(PERSON_ORIGIN)
         } else if self.local.is_some() {
@@ -579,7 +579,7 @@ impl Holds {
     }
 
     /// Whose hold the session shows (`status hold_by=`, the survey's `hold_by=`, the need classifier's [`aterm_types::needs::HoldWord`]).
-    pub fn word(&self) -> Option<aterm_types::needs::HoldWord> {
+    pub const fn word(&self) -> Option<aterm_types::needs::HoldWord> {
         use aterm_types::needs::HoldWord;
         if self.person.is_some() {
             Some(HoldWord::Person)
@@ -816,7 +816,7 @@ pub struct FabricCarry {
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(n: &u64) -> bool {
+const fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
@@ -3381,7 +3381,7 @@ enum HoldAct<'a> {
 }
 
 impl HoldAct<'_> {
-    fn origin(&self) -> Option<&str> {
+    const fn origin(&self) -> Option<&str> {
         match self {
             Self::Set(hold) => Some(hold.origin.as_str()),
             Self::Lift(origin) => Some(origin),

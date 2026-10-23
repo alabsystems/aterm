@@ -569,7 +569,13 @@ fn a_secret_a_soft_wrap_split_is_judged_whole() {
     assert!(!by_row.contains(&format!("{}…", &key[..12])), "{by_row}");
 }
 
-/// A SECRET AT THE EXCERPT CAP is never quoted in part.
+/// A SECRET AT THE EXCERPT CAP is never quoted in part. The harness keeps
+/// `said` capped at [`excerpt::EXCERPT_BYTES`] as it reads it, before the
+/// survey's redaction, and the cap ends before a word it would cut (a
+/// finished turn's, kept by its end, starts after one): a
+/// 40-character mixed-case token straddling byte 400 leaves none of its
+/// characters in the row, where its first 17 — under the credential rule's
+/// 32 — would read as no credential.
 #[test]
 fn a_secret_at_the_excerpt_cap_is_never_quoted_in_part() {
     let secret = "Qm7xT2vR".repeat(5);

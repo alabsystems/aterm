@@ -136,7 +136,8 @@ fn parent_of(process: HANDLE) -> Option<u32> {
     u32::try_from(info.InheritedFromUniqueProcessId).ok()
 }
 
-/// Whether `job` holds the process behind `process`, so the job ends it.
+/// Whether `job` holds the process behind `process`, so the job ends it. A
+/// query that fails answers yes: the narrower act, leaving it to the job.
 fn held_by(process: HANDLE, job: HANDLE) -> bool {
     let mut held = 0i32;
     // SAFETY: a process handle the caller holds, the session's live job, an out-param.

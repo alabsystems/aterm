@@ -1325,7 +1325,8 @@ fn cmdline_as_run(pid: u32) -> Option<(Vec<u8>, bool)> {
     cmdline_from_read(bytes, PROCESS_ARGV_MAX, || shared_interpreter(pid))
 }
 
-/// Admit one whole bounded read before changing its words.
+/// Admit one whole bounded read before changing its words. `limit` is the reader's
+/// bound; captured controls use a small one.
 #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
 fn cmdline_from_read(
     mut bytes: Vec<u8>,

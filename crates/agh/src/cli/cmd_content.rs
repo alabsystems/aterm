@@ -11,14 +11,9 @@ use crate::error::{Error, Kind, Result, Sub};
 use crate::page::End;
 use crate::policy::Access;
 
-/// `cat`'s default `--max-bytes`: 32 MiB.
 const MAX_BYTES: u64 = 33_554_432;
 
 /// `agh cat REPO[@REF]:PATH [--max-bytes N]`: the file's bytes, exactly.
-///
-/// # Errors
-///
-/// Usage for no `:PATH` or a bad `--max-bytes`; the read's error.
 pub(crate) fn cat(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
     let (slug, named, at) = inv.content(gh.router())?;
@@ -44,12 +39,7 @@ pub(crate) fn cat(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// `agh ls REPO[@REF][:PATH]`: one directory's entries, sorted by name, `--limit` after the
-/// sort.
-///
-/// # Errors
-///
-/// The listing's error.
+/// `agh ls REPO[@REF][:PATH]`: one directory's entries, sorted by name, `--limit` after the sort.
 pub(crate) fn ls(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
     let (slug, named, at) = inv.content(gh.router())?;
@@ -79,13 +69,7 @@ pub(crate) fn ls(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// `agh find REPO[@REF] [PREFIX] [--type blob|tree] [--match RE]`: the recursive tree's
-/// entries, filtered and sorted by path, `--limit` after the sort.
-///
-/// # Errors
-///
-/// Usage for a `:PATH`, a bad `--type` or `--match`; Incomplete `TruncatedTree` when GitHub
-/// truncated the tree (a `Partial` answer under `--partial`); the read's error.
+/// `agh find REPO[@REF] [PREFIX] [--type blob|tree] [--match RE]`.
 pub(crate) fn find(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
     let (slug, named, at) = inv.content(gh.router())?;
@@ -136,7 +120,6 @@ pub(crate) fn find(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         })
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    // A truncated tree (under `--partial`) stays Partial whatever the cut.
     let end = crate::page::cut(End::Complete, &mut entries, inv.global.limit);
     let completeness = if tree.truncated {
         Completeness::Partial {

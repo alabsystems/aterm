@@ -63,7 +63,7 @@ struct Inner<'a> {
 }
 
 impl<'a> Inner<'a> {
-    fn new(ast: Option<&'a Ast>) -> Self {
+    const fn new(ast: Option<&'a Ast>) -> Self {
         Inner { ast, run: None }
     }
 
@@ -122,12 +122,12 @@ fn step(result: Result<Value>, opt: bool, out: &mut Vec<Value>) -> Result<()> {
 }
 
 /// jq's truthiness: everything but `false` and `null`.
-fn truthy(value: &Value) -> bool {
+const fn truthy(value: &Value) -> bool {
     !matches!(value, Value::Null | Value::Bool(false))
 }
 
 /// jq's type name.
-fn type_name(value: &Value) -> &'static str {
+const fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -562,7 +562,7 @@ fn sub(a: &Value, b: &Value) -> Result<Value> {
 }
 
 /// A value's place in jq's type order.
-fn rank(value: &Value) -> u8 {
+const fn rank(value: &Value) -> u8 {
     match value {
         Value::Null => 0,
         Value::Bool(false) => 1,

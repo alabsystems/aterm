@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE APP-CONTAINER LANE END TO END: one whole background check, over the real
-//! `/usr/bin/curl`, against a channel a scratch master signs, served from this process. The
-//! pointer's 302, the roster chain, the container download (`aterm_update_core::download_to`,
-//! the lane PKG-8 taught to resume a silently dead transfer within the call), the digest, the
-//! unzip, the codesign gate and the published stage all run as shipped; only the world is
-//! scratch ([`CheckWorld`]: the staging root, the master, an empty Team ID for an ad hoc
-//! stand-in). The check runs in a child (the probe below), because curl is swapped through
-//! the process-wide [`aterm_update_core::CURL_SEAM`].
+//! End-to-end tests for the app-container background update check over real `/usr/bin/curl`.
 
 use super::*;
 
@@ -24,8 +17,7 @@ const VERSION: &str = "0.20.0";
 const TAG: &str = "v0.20.0";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// How much of the container the first GET sends before it goes silent: no byte, no FIN,
-/// no reset, until the client gives up on it.
+/// Bytes sent on the first container GET before going silent.
 const HOLD_AT: usize = 64 * 1024;
 
 /// A wait for something that must happen: a hang detector, never a latency budget. The
@@ -33,14 +25,10 @@ const HOLD_AT: usize = 64 * 1024;
 /// [`FRESH_STALL_SECS`]; the pre-PKG-8 lane waited 120 s on it.
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The shipped quick stall bound (`--speed-time`) of a download's attempt from byte 0
-/// (aterm-update-core's `StallBound::Quick`), the one bound the curl stand-in cuts: spelled
-/// here, so a lane that opens on any other bound still waits that bound out.
+/// Quick stall bound (`--speed-time`) for byte-0 download attempts.
 const QUICK_STALL_SECS: &str = "8";
 
-/// What the curl stand-in cuts [`QUICK_STALL_SECS`] to for an attempt from byte 0. curl's
-/// speed is a moving average over its last five seconds, so the hold is noticed about that
-/// long plus this after its last byte (about 14 s at the shipped bound).
+/// Shortened stall bound substituted by the curl wrapper for byte-0 attempts.
 const FRESH_STALL_SECS: u32 = 2;
 
 /// The scratch updates root under `dir`, laid out as [`Staging::resolve`] lays the real one.
@@ -84,15 +72,11 @@ fn probe_one_check_over_real_curl() {
     let pending = dir.join("said.pending");
     std::fs::write(&pending, said).unwrap();
     std::fs::rename(pending, dir.join("said")).unwrap();
-    // The parent ends this process's group once it has read the answer; staying up until
-    // then keeps the answer ahead of this exit in the parent's loop. A parent that died
-    // first leaves no orphan behind for longer than the hang detector.
+    // Stay alive until the parent reads `said` and kills the process group.
     std::thread::sleep(HANG);
 }
 
-/// The release's `aterm.app` at `dir`: an ad hoc signed stand-in sealed as [`BUILD`] /
-/// [`COMMIT`], whose executable answers `--version` (the stage's start probe), carrying a
-/// MiB of incompressible resource so its zip outlasts the hold.
+/// Builds an ad hoc signed stand-in `aterm.app` with 1 MiB of incompressible payload.
 fn stand_in_app(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let app = dir.join("aterm.app");
@@ -205,11 +189,8 @@ fn release_assets(zip: &[u8]) -> Vec<(String, Vec<u8>)> {
 /// One request the scratch host answered: method, path, `Range` (or `none`).
 type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 
-/// The scratch download host on `listener`, one thread per connection, as github.com
-/// answers: the evergreen appcast is a 302 to the tag-specific URL of [`TAG`], every asset
-/// of [`TAG`] is served by its tag-specific path (a `Range` past byte 0 is a 206), the
-/// container's FIRST GET goes silent after [`HOLD_AT`] bytes, and anything else is a 404.
-/// The threads end with the process (the test binary's).
+/// Serves the evergreen 302 redirect and tag assets, stalling the first container GET after
+/// [`HOLD_AT`] bytes.
 fn serve(listener: std::net::TcpListener, assets: Vec<(String, Vec<u8>)>, seen: Seen) {
     use std::io::{Read as _, Write as _};
     let assets = std::sync::Arc::new(assets);
@@ -306,10 +287,6 @@ fn serve(listener: std::net::TcpListener, assets: Vec<(String, Vec<u8>)>, seen: 
 /// that build — the ready marker and the sealed bundle in place, the ledger saying so — on
 /// exactly one HEAD of the evergreen URL, tag-specific GETs only, and two GETs of the
 /// container, the second resuming where the dead one stopped.
-///
-/// NEGATIVE CONTROL (run when this test was written): `download_to` back on the pre-PKG-8
-/// lane, which let curl wait out its patient 120 s on the dead transfer, hits the hang
-/// detector with one container GET.
 #[test]
 fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -326,11 +303,7 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
 
     let world = dir.path().join("world");
     std::fs::create_dir_all(world.join("Applications")).unwrap();
-    // The real curl, every option as the lane wrote it, the github.com URL (the last
-    // argument) sent to the scratch host instead — but for a fresh attempt's quick stall
-    // bound, cut to FRESH_STALL_SECS, so the silent hold is noticed in seconds. Only that
-    // bound of an attempt from byte 0: the attempt that continues the file, and any other
-    // bound (the patient 120 s, or the pre-PKG-8 lane's), run as the lane wrote them.
+    // Rewrite github.com URLs to the loopback host and shorten the byte-0 quick stall bound.
     let quick = QUICK_STALL_SECS;
     let wrapper = dir.path().join("curl");
     std::fs::write(
@@ -393,8 +366,6 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
         "the ledger says what was staged: {status}"
     );
 
-    // The request ledger: one HEAD of the evergreen URL, first; every other request
-    // tag-specific; the container fetched twice, the second resuming at the hold.
     let evergreen = "/alabsystems/aterm/releases/latest/download/aterm-appcast.toml";
     assert_eq!(seen[0].0, "HEAD", "{seen:?}");
     assert_eq!(seen[0].1, evergreen, "{seen:?}");

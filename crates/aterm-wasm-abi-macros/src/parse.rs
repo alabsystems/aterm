@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reading what `#[export]` is applied to: attributes, the item's kind, and
-//! a function signature down to its parameter and return types.
-//!
-//! The grammar is the subset an exported item may use. Anything outside it
-//! (generics, `async`, `self` by value, `&mut` parameters, patterns) is an
-//! error naming the construct, never a guess.
+//! Parser for `#[export]` attributes, items, and function signatures.
 
 use crate::tt::{Delim, Tt, str_value, to_source};
 
@@ -45,8 +40,7 @@ pub enum Receiver {
 /// One parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Param {
-    /// The binding's name, a raw identifier's without its `r#` (`argN` for
-    /// `_`), as wasm-bindgen names it.
+    /// Binding name without `r#` (`argN` for `_`).
     pub name: String,
     /// The type; for a `&T` parameter, `T`.
     pub ty: Vec<Tt>,
@@ -93,8 +87,7 @@ pub enum Item {
     },
 }
 
-/// The leading `#[...]` attributes of `tts`: each one's bracket contents and
-/// the index of the token after the last.
+/// Leading `#[...]` attributes of `tts` and the token index after the last.
 pub fn attrs(tts: &[Tt]) -> (Vec<(usize, &[Tt])>, usize) {
     let mut out = Vec::new();
     let mut i = 0;
@@ -108,8 +101,7 @@ pub fn attrs(tts: &[Tt]) -> (Vec<(usize, &[Tt])>, usize) {
     (out, i)
 }
 
-/// The doc comment the `doc` attributes among `attrs` spell, one line per
-/// attribute, each as written after `///` (its leading space kept).
+/// Doc comment assembled from `#[doc = "..."]` attributes in `attrs`.
 pub fn docs(attrs: &[(usize, &[Tt])]) -> String {
     let mut lines = Vec::new();
     for (_, a) in attrs {
@@ -124,8 +116,7 @@ pub fn docs(attrs: &[(usize, &[Tt])]) -> String {
     lines.join("\n")
 }
 
-/// When `attr` (an attribute's bracket contents) is `export` or
-/// `export(...)` under any path, its options.
+/// Parse `attr` if it is an `export` or `export(...)` attribute.
 ///
 /// # Errors
 /// Unknown or malformed options.
@@ -144,10 +135,11 @@ pub fn export_attr(attr: &[Tt]) -> Option<Result<Opts, Error>> {
     (last == "export" && is_path).then(|| opts(args))
 }
 
-/// `#[export(...)]`'s options from its argument tokens.
+/// Parse `#[export(...)]` options from argument tokens.
 ///
 /// # Errors
-/// Anything but `getter`, `constructor` and `js_name = <name>`.
+/// Anything other than `getter`, `constructor`, or `js_name = <name>`; also both `getter` and
+/// `constructor`.
 pub fn opts(args: &[Tt]) -> Result<Opts, Error> {
     let mut out = Opts::default();
     for arg in split_commas(args) {
@@ -180,11 +172,10 @@ pub fn opts(args: &[Tt]) -> Result<Opts, Error> {
     Ok(out)
 }
 
-/// The item `tts` (an attribute macro's input) is.
+/// Parse the item `tts` starts with.
 ///
 /// # Errors
-/// An item `#[export]` does not take, or one using a construct it cannot
-/// export.
+/// Unsupported item kinds or constructs.
 pub fn item(tts: &[Tt]) -> Result<Item, Error> {
     let (attrs, mut i) = attrs(tts);
     let docs = docs(&attrs);
@@ -242,13 +233,10 @@ pub fn item(tts: &[Tt]) -> Result<Item, Error> {
     }
 }
 
-/// The signature of the function `tts` starts with (after its attributes
-/// and visibility).
+/// Parse the function signature in `tts` (after attributes and visibility).
 ///
 /// # Errors
-/// What an exported function cannot be: generic, `async`, `unsafe`,
-/// `extern`, with a `where` clause, `self` by value or typed, `&mut` or
-/// pattern parameters, `impl Trait` types.
+/// Unsupported qualifiers, generics, receivers, patterns, or parameter/return types.
 pub fn sig(tts: &[Tt]) -> Result<Sig, Error> {
     let mut i = 0;
     while let Some(t) = tts.get(i) {
@@ -408,8 +396,7 @@ fn check_type(ty: &[Tt]) -> Result<(), String> {
     Ok(())
 }
 
-/// `tts` split at its top-level commas, `<..>` nesting respected (`->` does
-/// not close one).
+/// Split `tts` at top-level commas, respecting `<..>` nesting (ignoring `->`).
 pub fn split_commas(tts: &[Tt]) -> Vec<&[Tt]> {
     let mut out = Vec::new();
     let mut depth = 0i32;
@@ -429,8 +416,7 @@ pub fn split_commas(tts: &[Tt]) -> Vec<&[Tt]> {
     out
 }
 
-/// Where each `pub fn` item of an impl body begins: the index of its first
-/// attribute (or of `pub`), so a marker attribute can go in front of it.
+/// Token start indices of each plain `pub fn` item in an impl body.
 pub fn impl_pub_fns(body: &[Tt]) -> Vec<usize> {
     let mut starts = Vec::new();
     let mut i = 0;

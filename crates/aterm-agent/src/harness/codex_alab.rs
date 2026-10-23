@@ -16,7 +16,8 @@ pub const PACKAGE_JSON: &str = "codex-package.json";
 /// The file an ALab build of Codex (codex-alab) carries in its package root.
 pub const ALAB_BUILD_JSON: &str = "alab-build.json";
 
-/// Optional package metadata is small.
+/// Optional package metadata is small. A malformed package must not park a
+/// sweep or rollout reader on a FIFO, or allocate an unbounded manifest.
 const MAX_PACKAGE_BYTES: u64 = 1024 * 1024;
 
 fn package_text(path: &Path) -> Option<String> {
@@ -118,7 +119,8 @@ pub(crate) enum Fate {
     Refuse,
 }
 
-/// Codex's interactive options (`codex --help`, `codex resume --help`).
+/// Codex's interactive options (`codex --help`, `codex resume --help`). A flag
+/// missing here refuses the rewrite; new flags are added once known safe.
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("-a", Arity::One, Fate::Keep),
     ("--add-dir", Arity::One, Fate::Keep),
@@ -169,7 +171,8 @@ pub(crate) fn flag(name: &str) -> Option<(Arity, Fate)> {
         .map(|(_, a, f)| (*a, *f))
 }
 
-/// Codex's subcommands.
+/// Codex's subcommands. Only none, `resume` and `fork` run the interactive TUI
+/// a relaunch resumes; the rest are refused ([`ArgvRefusal::NotResumable`]).
 const SUBCOMMANDS: &[&str] = &[
     "agents",
     "exec",

@@ -1040,7 +1040,11 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     }
 }
 
-/// `detail0` shaped to at most `target` cells under `width`.
+/// `detail0` shaped to at most `target` cells under `width`. [`shape_detail`]
+/// cuts by chars; under a wide measure its result can still be too wide, so
+/// the char cap is lowered until the cells fit, to the largest cap that
+/// does, so what is shown at one width is shown at every wider one and the
+/// excerpt never flickers during a resize.
 fn shape_to_cells(detail0: &str, target: usize, width: &dyn Fn(&str) -> usize) -> Option<String> {
     let whole = detail0.chars().count();
     let mut cap = target;

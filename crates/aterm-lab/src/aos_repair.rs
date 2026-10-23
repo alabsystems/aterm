@@ -425,7 +425,7 @@ pub struct Gate {
     pub observed: String,
 }
 
-fn gate(name: &'static str, pass: bool, observed: String) -> Gate {
+const fn gate(name: &'static str, pass: bool, observed: String) -> Gate {
     Gate {
         name,
         pass,

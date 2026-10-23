@@ -146,7 +146,9 @@ pub(crate) fn discover_shell(name: &str) -> Option<OsString> {
     }
 }
 
-/// Locate Git for Windows' `bash.exe`.
+/// Locate Git for Windows' `bash.exe`. First beside a PATH-resolved `git.exe`
+/// (`<gitroot>\bin\bash.exe`, where `git.exe` sits in `<gitroot>\cmd`), then the
+/// standard machine + per-user install roots.
 fn discover_git_bash() -> Option<OsString> {
     // Beside git.exe: cmd\git.exe → ..\bin\bash.exe.
     if let Some(git) = search_path("git") {
@@ -569,7 +571,11 @@ mod tests {
         assert!(!is_wsl_shell(OsStr::new("bash.exe")));
     }
 
-    /// The verdict config validation reads.
+    /// The verdict config validation reads. A bare name that RESOLVES is the
+    /// normal Windows spelling — the whole reason `--validate-config` must not
+    /// warn about `pwsh` — and `resolve_shell_name` must be exactly this
+    /// classification with the verdict collapsed, so the spawn and the
+    /// validator cannot disagree about the same string.
     #[test]
     fn classify_shell_name_is_the_resolution_the_spawn_performs() {
         let cmd = classify_shell_name(OsStr::new("cmd"));

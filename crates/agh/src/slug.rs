@@ -202,7 +202,8 @@ impl ContentRef {
     ///
     /// # Errors
     ///
-    /// Returns a usage error for an empty `@REF`, a dot-segment, or an invalid `RepoArg`.
+    /// Returns a usage error for an empty `@REF`, text that is not `[@REF][:PATH]`, a dot-segment,
+    /// or an invalid `RepoArg`.
     pub fn parse(text: &str, with_repo: bool) -> Result<ContentRef> {
         let mut rest = text;
         let mut repo = None;

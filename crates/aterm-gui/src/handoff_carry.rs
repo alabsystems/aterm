@@ -27,7 +27,9 @@ pub(crate) const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 /// How many of the newest SUBMITTED turns' marks the carried tail reaches back to: a reader of `history 8` that reads on from the newest submitted turn's `arch=` mark (`offscreen since=`) finds its rows.
 #[cfg(any(unix, test))]
 pub(crate) const TAIL_TURNS: usize = 8;
-/// The sidecar's layout version.
+/// The sidecar's layout version. Unknown fields are skipped and missing ones
+/// default, so it moves only when a field changes meaning; a receiver drops a
+/// version it does not know.
 const WIRE_VERSION: u64 = 1;
 /// The highest turn id a handoff carries: what the manifest can hold (a TOML integer is an `i64`).
 pub(crate) const MAX_TURN_ID: u64 = i64::MAX as u64;
@@ -137,7 +139,9 @@ impl StatusWords {
         }
     }
 
-    /// `status` in these words.
+    /// `status` in these words. A build from before `hangup` has no word for a
+    /// turn whose caller hung up during its settle (that build never recorded
+    /// one); its nearest is `timeout`, a settle nobody saw end.
     fn spell(self, status: &'static str) -> &'static str {
         match (self, status) {
             (Self::PreHangup, "hangup") => "timeout",
@@ -1033,7 +1037,9 @@ struct TurnWire {
     started_ms: u64,
     dur_ms: u64,
     submitted: bool,
-    /// `settled`, `timeout` or `hangup` — a word, never a code.
+    /// `settled`, `timeout` or `hangup` — a word, never a code. A
+    /// [`crate::turn_ledger::STATUS_PRESSED`] record says `timeout` here, a
+    /// word every build reads, and [`Self::pressed`].
     status: String,
     text: String,
     screen_hash: u64,

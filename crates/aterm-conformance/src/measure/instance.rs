@@ -12,7 +12,8 @@ use aterm_uds::spawnfd;
 /// A wait for something that must happen: a hang detector, never a latency budget.
 pub const MUST_HAPPEN: Duration = Duration::from_secs(60);
 
-/// The gap between two observations of a bounded poll.
+/// The gap between two observations of a bounded poll. Not synchronisation:
+/// the observation decides; this only keeps the poll off a core.
 const POLL_GAP: Duration = Duration::from_millis(50);
 
 /// The most a single `ctl --timeout` asks for, in seconds: past every
@@ -134,7 +135,7 @@ impl Scratch {
     }
 
     /// Leave the directory behind when this is dropped.
-    pub fn keep(&mut self) {
+    pub const fn keep(&mut self) {
         std::mem::forget(self.dir.take());
     }
 }

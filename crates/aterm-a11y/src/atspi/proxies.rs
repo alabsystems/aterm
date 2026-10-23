@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The three calls the publisher makes of others, which accesskit_unix made
-//! through atspi-proxies: at-spi2-core's `org.a11y.Bus` on the session bus
-//! (`GetAddress`, the accessibility bus's address) and `org.a11y.Status`
-//! (`IsEnabled`, whether an assistive technology wants the tree), and the
-//! registry's `org.a11y.atspi.Socket.Embed`, which lists this application.
+//! The three calls the publisher makes of others, which accesskit_unix made through atspi-proxies.
 
 use std::time::Duration;
 
@@ -14,8 +10,7 @@ use aterm_dbus::{Connection, Kind, Message, Value};
 use super::serve::PROPERTIES;
 use super::wire::{self, ObjectId, ROOT_PATH};
 
-/// How long a call waits for its answer: the D-Bus reference
-/// implementation's default reply timeout.
+/// How long a call waits for its answer.
 pub(crate) const CALL: Duration = Duration::from_secs(25);
 
 const A11Y_BUS: &str = "org.a11y.Bus";
@@ -24,16 +19,12 @@ const STATUS: &str = "org.a11y.Status";
 const REGISTRY: &str = "org.a11y.atspi.Registry";
 const SOCKET: &str = "org.a11y.atspi.Socket";
 
-/// The session-bus match rule for `org.a11y.Status` changes: zbus's for
-/// accesskit_unix's `StatusProxy::receive_is_enabled_changed`.
+/// The session-bus match rule for `org.a11y.Status` changes.
 pub(crate) const STATUS_RULE: &str = "type='signal',sender='org.a11y.Bus',path='/org/a11y/bus',\
                                       interface='org.freedesktop.DBus.Properties',\
                                       member='PropertiesChanged',arg0='org.a11y.Status'";
 
-/// The session-bus match rule for `org.a11y.Bus` changing hands: at-spi2-core
-/// starting (or restarting) the accessibility bus's launcher. accesskit_unix
-/// had no such rule; the publisher uses it to come back after the
-/// accessibility bus is lost.
+/// The session-bus match rule for `org.a11y.Bus` changing hands.
 pub(crate) const OWNER_RULE: &str = "type='signal',sender='org.freedesktop.DBus',\
                                      path='/org/freedesktop/DBus',interface='org.freedesktop.DBus',\
                                      member='NameOwnerChanged',arg0='org.a11y.Bus'";
@@ -50,7 +41,7 @@ fn call(
     conn.call(msg.with_body(body), CALL)
 }
 
-/// `org.a11y.Status.IsEnabled`. A bus without at-spi2-core answers an error.
+/// `org.a11y.Status.IsEnabled`.
 pub(crate) fn is_enabled(session: &mut Connection) -> aterm_dbus::Result<bool> {
     let reply = call(
         session,
@@ -95,10 +86,7 @@ pub(crate) fn embed(bus: &mut Connection) -> aterm_dbus::Result<()> {
     call(bus, REGISTRY, ROOT_PATH, SOCKET, "Embed", vec![plug]).map(drop)
 }
 
-/// Whether `msg` says the accessibility status may have changed: a
-/// `PropertiesChanged` of `org.a11y.Status`, or `org.a11y.Bus` changing
-/// owner. The value is never taken from the signal, which any process on the
-/// bus can send to this connection directly; the caller asks `IsEnabled`.
+/// Whether `msg` says the accessibility status may have changed.
 pub(crate) fn status_may_have_changed(msg: &Message) -> bool {
     if msg.kind != Kind::Signal {
         return false;

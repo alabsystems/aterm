@@ -36,7 +36,7 @@ pub enum Program {
 impl Program {
     /// Its name on the command line.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Program::Claude => "claude",
             Program::Codex => "codex",
@@ -44,7 +44,7 @@ impl Program {
     }
 
     /// The key a row names its build by.
-    fn build_key(self) -> &'static str {
+    const fn build_key(self) -> &'static str {
         match self {
             Program::Claude => "version",
             Program::Codex => "cli_version",
@@ -579,11 +579,11 @@ pub fn stamp_day(s: &str) -> Option<(i64, u32, u32)> {
     zone.then_some(day)
 }
 
-fn leap(y: i64) -> bool {
+const fn leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-fn days_in(y: i64, m: u32) -> u32 {
+const fn days_in(y: i64, m: u32) -> u32 {
     match m {
         2 if leap(y) => 29,
         2 => 28,
@@ -1753,7 +1753,7 @@ impl OneToOne {
 }
 
 /// A step's kind, as a failure names it.
-fn kind(e: &StepEvent) -> &'static str {
+const fn kind(e: &StepEvent) -> &'static str {
     match e {
         StepEvent::Bind { .. } => "bind",
         StepEvent::Prompt { .. } => "prompt",

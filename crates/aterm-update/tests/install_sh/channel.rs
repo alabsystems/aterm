@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one transport — github.com's release download host, through
-//! `web_curl`, stubbed here — and the Linux lane's head-only target choice.
-//! Every request is a tag-specific URL, bounded by the size the host names.
+//! Release download transport (`web_curl`) and Linux head-only target selection tests.
 
 use crate::support::{Lib, Scratch, follows_redirects, q, read, s};
 
@@ -316,8 +314,6 @@ fail v0.96.0/aterm-appcast.toml
         },
     ];
     let mut lib = Lib::new();
-    // Answers by URL from the table above (`fail` is a curl that could not
-    // connect), 404 for the rest, and every URL asked is logged.
     lib.step(format!(
         "REPO_SLUG=example/aterm
 		web_curl() {{
@@ -375,9 +371,6 @@ fail v0.96.0/aterm-appcast.toml
             assert_eq!(asked, want, "{label}");
         }
     }
-    // A missing binary never names a tarball. Unpinned, the head is the one
-    // release the run inspected: it says that one publishes none and offers no
-    // `--version` it cannot back; a pin names the pin as the remedy.
     let unpinned = recs[calls[1].0].var("LINUX_TARGET_SKIP");
     assert!(
         !unpinned.contains("--version") && !unpinned.contains("tarball"),

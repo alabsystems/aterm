@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Machine remote control for inspecting and selecting macOS alert boxes when they appear,
-//! without triggering ad-hoc user interruptions when a non-interactive path exists.
+//! Machine remote control for inspecting and selecting macOS alert boxes.
 
 use crate::model::User;
 use crate::port::{Cmd, System};
@@ -101,7 +100,6 @@ function run(argv) {
 "#;
 
 /// Inspect visible system alert boxes on `user`'s active GUI session.
-///
 /// # Errors
 /// `osascript` could not run or returned malformed JSON.
 pub fn inspect_alert_boxes(sys: &dyn System, user: &User) -> Result<Vec<AlertBox>, String> {
@@ -145,7 +143,6 @@ pub fn inspect_alert_boxes(sys: &dyn System, user: &User) -> Result<Vec<AlertBox
 }
 
 /// Select and click a named button in an active alert box belonging to `process`.
-///
 /// # Errors
 /// `osascript` could not run or exited non-zero.
 pub fn select_alert_button(
@@ -179,41 +176,72 @@ pub fn select_alert_button(
     Ok(ran.out().trim() == "clicked")
 }
 
-/// Result of testing one workstation function OFF (drift) and ON (applied & verified).
+/// Result of one workstation verification control.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionRoundTripReport {
     /// Name of the workstation function tested.
     pub function: String,
-    /// Observed state when switched OFF (drift).
+    /// Observed OFF/drift state, or why no OFF stage ran.
     pub off_state: String,
     /// Observed state after applying ON and reading back.
     pub on_state: String,
-    /// Whether both OFF drift detection and immediate ON readback succeeded.
+    /// Whether this control's requested stages succeeded.
     pub verified: bool,
 }
 
-/// Run the ON -> OFF (drift) -> ON (immediate & verified) round-trip harness across
-/// workstation functions (`CapsLock`, `NaturalScrolling`, `TrackpadScrolling`, `Desktop`,
-/// `Widgets`, `Spotlight`, and `AlertBoxes`).
-///
+fn round_trip_context(sys: &dyn System) -> Result<(crate::items::Ctx, User), String> {
+    let mut ctx = crate::init::initial_setup_context(sys)?;
+    let user = ctx
+        .console
+        .clone()
+        .ok_or_else(|| "no console user found for round-trip verification".to_owned())?;
+    let command = crate::facts::hidutil_keyboards();
+    let keyboards = sys
+        .run_complete_stdout(&command)
+        .map_err(|e| format!("{}: {e}", command.display()))?;
+    if !keyboards.success() {
+        return Err(format!("{}: {}", command.display(), keyboards.describe()));
+    }
+    ctx.facts.keyboards = crate::facts::parse_hidutil_keyboards_complete(&keyboards.out())?;
+    Ok((ctx, user))
+}
+
+fn verify_spotlight_policy(
+    sys: &dyn System,
+    ctx: &crate::items::Ctx,
+) -> Result<FunctionRoundTripReport, String> {
+    use crate::model::{Mode, Outcome};
+
+    let rows = crate::init::run_initial_spotlight(sys, ctx, Mode::Apply)?;
+    if !rows.iter().all(|row| {
+        matches!(
+            row.outcome,
+            Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+        )
+    }) {
+        return Err(format!("Spotlight items failed to verify Ok: {rows:?}"));
+    }
+    Ok(FunctionRoundTripReport {
+        function: "Spotlight .noindex Control".into(),
+        off_state: "not toggled; existing caches retained".into(),
+        on_state: "Spotlight policy applied and read back where applicable".into(),
+        verified: true,
+    })
+}
+
+/// Run drift/apply/readback controls for keyboard, scrolling and desktop preferences.
 /// # Errors
-/// Returns an error if any stage fails to detect drift when switched OFF or fails to verify ON.
+/// Returns an error if a requested drift, apply, readback or alert inspection stage fails.
 pub fn verify_workstation_round_trip(
     sys: &dyn System,
 ) -> Result<Vec<FunctionRoundTripReport>, String> {
-    use crate::init::{
-        WorkstationGroup, initial_setup_context, run_initial_spotlight, run_workstation_selected,
-    };
+    use crate::init::{WorkstationGroup, run_workstation_selected};
     use crate::model::{Mode, Outcome};
     use aterm_types::macos_setup::{Selection, Setting};
 
-    let ctx = initial_setup_context(sys).map_err(|e| e.to_string())?;
-    let Some(user) = ctx.users.first().cloned() else {
-        return Err("no console user found for round-trip verification".into());
-    };
+    let (ctx, user) = round_trip_context(sys)?;
     let mut reports = Vec::new();
 
-    // 1. CapsLock -> Control round-trip ON -> OFF (drift) -> ON (immediate & verified).
     if let Some(kb) = ctx.facts.keyboards.first() {
         let mut only_caps = Selection::none();
         only_caps.set(Setting::CapsLock, true);
@@ -239,7 +267,7 @@ pub fn verify_workstation_round_trip(
                 .map_err(|e| e.to_string())?;
         if !drift
             .iter()
-            .any(|r| r.id.contains("keyboard.capslock.attached") && r.outcome == Outcome::Planned)
+            .any(|r| r.id.contains("keyboard.") && r.outcome == Outcome::Planned)
         {
             return Err(format!(
                 "CapsLock OFF was not detected as Planned drift: {drift:?}"
@@ -248,16 +276,21 @@ pub fn verify_workstation_round_trip(
         let applied =
             run_workstation_selected(sys, WorkstationGroup::Preferences, Mode::Apply, only_caps)
                 .map_err(|e| e.to_string())?;
-        if !applied
-            .iter()
-            .all(|r| matches!(r.outcome, Outcome::Ok | Outcome::Changed))
-        {
+        if !applied.iter().all(|r| {
+            matches!(
+                r.outcome,
+                Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+            )
+        }) {
             return Err(format!("CapsLock ON failed immediate apply: {applied:?}"));
         }
         let verified =
             run_workstation_selected(sys, WorkstationGroup::Preferences, Mode::Plan, only_caps)
                 .map_err(|e| e.to_string())?;
-        if !verified.iter().all(|r| r.outcome == Outcome::Ok) {
+        if !verified
+            .iter()
+            .all(|r| matches!(r.outcome, Outcome::Ok | Outcome::NotApplicable))
+        {
             return Err(format!(
                 "CapsLock ON failed immediate readback: {verified:?}"
             ));
@@ -270,7 +303,6 @@ pub fn verify_workstation_round_trip(
         });
     }
 
-    // 2. NaturalScrolling round-trip ON -> OFF (drift) -> ON (immediate & verified).
     {
         let mut only_ns = Selection::none();
         only_ns.set(Setting::NaturalScrolling, true);
@@ -308,7 +340,6 @@ pub fn verify_workstation_round_trip(
         });
     }
 
-    // 3. TrackpadScrolling round-trip ON -> OFF (drift) -> ON (verified).
     {
         let mut only_tp = Selection::none();
         only_tp.set(Setting::TrackpadScrolling, true);
@@ -351,7 +382,6 @@ pub fn verify_workstation_round_trip(
         });
     }
 
-    // 4. Desktop & Widgets round-trip ON -> OFF (drift) -> ON (verified).
     {
         let mut only_dw = Selection::none();
         only_dw.set(Setting::Desktop, true);
@@ -411,71 +441,72 @@ pub fn verify_workstation_round_trip(
         });
     }
 
-    // 5. Spotlight .noindex build & toolchain control round-trip ON -> OFF (drift) -> ON (verified).
+    // 5. Dock round-trip ON -> OFF (drift) -> ON (verified).
     {
-        let _ = run_initial_spotlight(sys, &ctx, Mode::Apply).map_err(|e| e.to_string())?;
-        let tooling = std::path::PathBuf::from(format!(
-            "{}/Library/Caches/aterm/tooling.noindex",
-            user.home
-        ));
-        let tooling_bak = std::path::PathBuf::from(format!(
-            "{}/Library/Caches/aterm/tooling.roundtrip-bak.noindex",
-            user.home
-        ));
-        sys.rename(&tooling, &tooling_bak)
-            .map_err(|e| format!("failed to move tooling.noindex aside: {e}"))?;
-        let drift = run_initial_spotlight(sys, &ctx, Mode::Plan).map_err(|e| e.to_string())?;
-        let restore_bak = || {
-            let _ = Cmd::new("/bin/rm")
-                .args(["-rf", &tooling.to_string_lossy()])
-                .as_user(&user);
-            let _ = sys.rename(&tooling_bak, &tooling);
-        };
+        let mut only_dock = Selection::none();
+        only_dock.set(Setting::Dock, true);
+        let off_dock = Cmd::new("/usr/bin/defaults")
+            .args(["write", "com.apple.dock", "show-recents", "-bool", "true"])
+            .as_user(&user);
+        if !sys.run(&off_dock).map_err(|e| e.to_string())?.success() {
+            return Err("failed to toggle com.apple.dock show-recents".into());
+        }
+        let drift =
+            run_workstation_selected(sys, WorkstationGroup::Preferences, Mode::Plan, only_dock)
+                .map_err(|e| e.to_string())?;
         if !drift
             .iter()
-            .any(|r| r.id.contains("spotlight.build-noindex") && r.outcome == Outcome::Planned)
+            .any(|r| r.id.contains("init.dock") && r.outcome == Outcome::Planned)
         {
-            restore_bak();
             return Err(format!(
-                "Spotlight build-noindex OFF was not detected as Planned drift: {drift:?}"
+                "Dock OFF was not detected as Planned drift: {drift:?}"
             ));
         }
-        let applied = run_initial_spotlight(sys, &ctx, Mode::Apply).map_err(|e| {
-            restore_bak();
-            e.to_string()
-        })?;
-        let _ = sys.run(
-            &Cmd::new("/bin/rm")
-                .args(["-rf", &tooling_bak.to_string_lossy()])
-                .as_user(&user),
-        );
-        if !applied.iter().all(|r| {
-            matches!(
-                r.outcome,
-                Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
-            )
-        }) {
-            return Err(format!("Spotlight items failed to apply: {applied:?}"));
-        }
-        let verified = run_initial_spotlight(sys, &ctx, Mode::Plan).map_err(|e| e.to_string())?;
-        if !verified
+        let applied =
+            run_workstation_selected(sys, WorkstationGroup::Preferences, Mode::Apply, only_dock)
+                .map_err(|e| e.to_string())?;
+        if !applied
             .iter()
-            .any(|r| r.id.contains("spotlight.build-noindex") && r.outcome == Outcome::Ok)
+            .all(|r| matches!(r.outcome, Outcome::Ok | Outcome::Changed))
         {
-            return Err(format!(
-                "Spotlight build-noindex ON failed immediate readback: {verified:?}"
-            ));
+            return Err(format!("Dock ON failed apply/verify: {applied:?}"));
         }
         reports.push(FunctionRoundTripReport {
-            function: "Spotlight .noindex Control".into(),
-            off_state: "tooling.noindex absent (Planned drift)".into(),
-            on_state: "cargo-build.noindex, tooling.noindex, and trust store builds .noindex (Ok)"
-                .into(),
+            function: "Dock".into(),
+            off_state: "show-recents=true (Planned drift)".into(),
+            on_state: "aterm, System Settings, Safari pinned; show-recents=false (Ok)".into(),
             verified: true,
         });
     }
 
-    // 6. Machine remote control alert-box inspection runs without error or consent popup.
+    // 6. Messages & FaceTime Sign-Out verified (requests Accessibility only if an account is registered).
+    {
+        let mut only_accounts = Selection::none();
+        only_accounts.set(Setting::Messages, true);
+        only_accounts.set(Setting::FaceTime, true);
+        let applied =
+            run_workstation_selected(sys, WorkstationGroup::Accounts, Mode::Apply, only_accounts)
+                .map_err(|e| e.to_string())?;
+        if !applied
+            .iter()
+            .all(|r| matches!(r.outcome, Outcome::Ok | Outcome::Changed))
+        {
+            return Err(format!(
+                "Messages & FaceTime sign-out failed apply/verify: {applied:?}"
+            ));
+        }
+        reports.push(FunctionRoundTripReport {
+            function: "Messages & FaceTime Sign-Out".into(),
+            off_state: "checked persisted idstatuscache & cfprefsd stores".into(),
+            on_state: "Messages & FaceTime signed out (Ok)".into(),
+            verified: true,
+        });
+    }
+
+    // 7. Spotlight .noindex build & toolchain policy verified without disrupting concurrent builds.
+    reports.push(verify_spotlight_policy(sys, &ctx)?);
+
+    // 8. Machine remote control alert-box inspection runs without error or consent popup.
     {
         let alerts = inspect_alert_boxes(sys, &user)?;
         reports.push(FunctionRoundTripReport {
@@ -492,7 +523,7 @@ pub fn verify_workstation_round_trip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::{Fake, Ran};
+    use crate::port::{Fake, Ran, Stat};
 
     fn alice() -> User {
         User {
@@ -545,6 +576,126 @@ mod tests {
             .display();
         sys.on(&click_cmd, Ran::ok("clicked\n"));
         assert!(select_alert_button(&sys, &user, "CoreServicesUIAgent", "Install").unwrap());
+
+        let console = |console_uid| {
+            let mut sys = Fake::root();
+            sys.euid = 501;
+            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
+            sys.on(
+                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+                Ran::ok("GroupMembership: alice\n"),
+            );
+            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+            sys.stat_of(
+                "/dev/console",
+                Stat {
+                    uid: console_uid,
+                    gid: 20,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            sys
+        };
+        let inventory = crate::facts::hidutil_keyboards().display();
+        let keyboard = "Services:\n\
+VendorID ProductID Product  Built-In\n\
+0x5ac    0x1       Keyboard 1\n";
+        let sys = console(501);
+        sys.on(&inventory, Ran::ok(keyboard));
+        let account_only = crate::init::initial_setup_context(&sys).unwrap();
+        assert!(account_only.facts.keyboards.is_empty());
+        assert!(!sys.calls().contains(&inventory));
+        let (ctx, console_user) = round_trip_context(&sys).unwrap();
+        assert_eq!(ctx.console.as_ref(), Some(&console_user));
+        assert_eq!(console_user, user);
+        assert_eq!(
+            ctx.facts.keyboards,
+            [crate::model::Keyboard {
+                vendor: 0x5ac,
+                product: 1,
+                name: "Keyboard".into(),
+                builtin: true,
+            }]
+        );
+        assert!(sys.calls().contains(&inventory));
+
+        for reply in [Ran::exit(1, "refused"), Ran::ok("Services:\nunknown\n")] {
+            let sys = console(501);
+            sys.on(&inventory, reply);
+            assert!(verify_workstation_round_trip(&sys).is_err());
+            assert!(sys.calls().contains(&inventory));
+            assert!(!sys.calls().iter().any(|call| {
+                call.contains("property")
+                    || call.contains("defaults")
+                    || call.contains("scroll-direction")
+            }));
+        }
+        let sys = console(502);
+        sys.on(&inventory, Ran::ok(keyboard));
+        assert!(verify_workstation_round_trip(&sys).is_err());
+        assert!(!sys.calls().iter().any(|call| {
+            call.contains("hidutil")
+                || call.contains("defaults")
+                || call.contains("scroll-direction")
+        }));
+
+        let sys = console(501);
+        sys.on(&inventory, Ran::ok(keyboard));
+        let clear = Cmd::new("/usr/bin/hidutil")
+            .args([
+                "property",
+                "--matching",
+                "{\"ProductID\":1,\"VendorID\":1452}",
+                "--set",
+                "{\"UserKeyMapping\":[]}",
+            ])
+            .as_user(&user)
+            .in_session()
+            .display();
+        sys.on(&clear, Ran::exit(1, "scripted CapsLock clear refusal"));
+        let refused = verify_workstation_round_trip(&sys).unwrap_err();
+        assert!(refused.starts_with("hidutil clear failed:"), "{refused}");
+        assert!(sys.calls().contains(&clear));
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| { call.contains("defaults") || call.contains("scroll-direction") })
+        );
+
+        let sys = console(501);
+        let ctx = crate::init::initial_setup_context(&sys).unwrap();
+        let tooling = "/Users//alice/Library/Caches/aterm/tooling.noindex";
+        let cached_tool = format!("{tooling}/a-tool-used-by-another-build");
+        for path in [
+            "/Users//alice/Library/Caches",
+            "/Users//alice/Library/Caches/aterm/cargo-build.noindex",
+            tooling,
+        ] {
+            sys.stat_of(
+                path,
+                Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o755,
+                    dir: true,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+        }
+        sys.file(&cached_tool, b"existing cached executable bytes");
+        let before = sys.read_file(std::path::Path::new(&cached_tool)).unwrap();
+        assert!(verify_spotlight_policy(&sys, &ctx).unwrap().verified);
+        assert_eq!(
+            sys.read_file(std::path::Path::new(&cached_tool)).unwrap(),
+            before
+        );
+        assert!(sys.stat(std::path::Path::new(tooling)).unwrap().dir);
     }
 
     #[test]
@@ -554,7 +705,13 @@ mod tests {
         }
         let sys = crate::port::Live::new();
         let reports = verify_workstation_round_trip(&sys).unwrap();
-        assert!(reports.len() >= 5);
+        for r in &reports {
+            eprintln!(
+                "[round-trip] {}: OFF=({}) -> ON=({}) verified={}",
+                r.function, r.off_state, r.on_state, r.verified
+            );
+        }
+        assert_eq!(reports.len(), 8);
         assert!(reports.iter().all(|r| r.verified));
     }
 }

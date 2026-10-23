@@ -45,7 +45,7 @@ impl Claim {
     }
 
     /// Whether aterm's remedies that act from outside the agent (the stall's explicit restart) stand down: behind another supervisor, which answers for the session — never beside a proven self-claim, whose agent cannot restart itself out of a stall.
-    pub(crate) fn remedies_withheld(&self) -> bool {
+    pub(crate) const fn remedies_withheld(&self) -> bool {
         matches!(self, Claim::Behind { .. })
     }
 
@@ -185,7 +185,8 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Ask for the claim once: what the answer says to say, if anything.
+    /// Ask for the claim once: what the answer says to say, if anything. A
+    /// request not served leaves it pending, due at the next request.
     fn try_claim(&mut self) -> Option<String> {
         match self.set_claim() {
             Some(r) => self.claim_from(&r),

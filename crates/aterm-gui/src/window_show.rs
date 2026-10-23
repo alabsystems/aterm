@@ -469,7 +469,10 @@ impl crate::App {
             .is_some_and(|carried| carried.fullscreen_pending(window))
     }
 
-    /// Perform one operation on the window's OS window.
+    /// Perform one operation on the window's OS window. A window with none — a
+    /// headless instance, or one whose attach failed — is skipped: this is the
+    /// only place the show state reaches AppKit, and it goes through the
+    /// window's own winit handle, never a process-global query.
     fn perform_show_op(&self, op: ShowOp<WindowId>) {
         let (ShowOp::Minimize(window) | ShowOp::Raise(window) | ShowOp::EnterFullScreen(window)) =
             op;

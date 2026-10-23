@@ -187,7 +187,8 @@ impl WarmLatch {
         self.settled.notify_all();
     }
 
-    /// Release window waits if this lane returns an error or unwinds.
+    /// Release window waits if this lane returns an error or unwinds. A
+    /// successful lane leaves the other lane's work in flight.
     fn run_lane(&self, run: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         struct SettleUnlessOk<'a> {
             latch: &'a WarmLatch,

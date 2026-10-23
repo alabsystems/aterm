@@ -114,7 +114,7 @@ pub enum PickerGate {
 
 /// Classifies who owns the `/login` method picker ([`super::turn_end::TurnEndState::login_typed`]).
 #[must_use]
-pub fn picker_gate(typed: bool, shared: Option<&LoginShared>, renewed: bool) -> PickerGate {
+pub const fn picker_gate(typed: bool, shared: Option<&LoginShared>, renewed: bool) -> PickerGate {
     match (typed, shared) {
         (false, _) => PickerGate::Persons,
         (true, Some(LoginShared::Back { .. })) => PickerGate::Back,
@@ -125,7 +125,7 @@ pub fn picker_gate(typed: bool, shared: Option<&LoginShared>, renewed: bool) -> 
 
 /// Returns whether the session's lost login was superseded by a renewal that the tab will follow.
 #[must_use]
-pub fn renewal_followed(superseded: bool, cfg: &SupervisorConfig, restartable: bool) -> bool {
+pub const fn renewal_followed(superseded: bool, cfg: &SupervisorConfig, restartable: bool) -> bool {
     superseded && cfg.logins && cfg.resume_limits && cfg.relaunch && restartable
 }
 

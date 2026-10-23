@@ -104,7 +104,7 @@ pub enum Marker {
 }
 
 impl Marker {
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Marker::Ledger => "ledger",
             Marker::UserRow => "user-row",
@@ -131,7 +131,7 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Reason::NoArchive => "no-archive",
             Reason::MainScreen => "main-screen",
@@ -163,7 +163,7 @@ pub struct Report {
 
 impl Report {
     /// Nothing was lost between the start and the end.
-    pub fn complete(&self) -> bool {
+    pub const fn complete(&self) -> bool {
         self.reasons.is_empty()
     }
 
@@ -370,7 +370,8 @@ pub fn parse_offscreen(reply: &CtlReply) -> Result<Offscreen, OffscreenError> {
     })
 }
 
-/// `OK <n> key=value…` with a `last=` field: the count and the fields.
+/// `OK <n> key=value…` with a `last=` field: the count and the fields. Words
+/// without `=` (`aterm ctl`'s `(offscreen: no results)` note) are ignored.
 fn header(line: &str) -> Option<(usize, Vec<(&str, &str)>)> {
     let rest = line.trim().strip_prefix("OK ")?;
     let mut words = rest.split_whitespace();

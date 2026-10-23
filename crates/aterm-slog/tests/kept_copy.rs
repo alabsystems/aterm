@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CLOSED SESSION'S COPY (`Log::kept_within`, design §6): what a host's
-//! closed-session index keeps of a log reads as the log did, its accounting
-//! exact, within the bytes it was given.
+//! Closed-session copy tests (`Log::kept_within`).
 
 use aterm_slog::{Actor, Close, Conf, Cursor, GapWhy, Log, Op, Out, SessionOut, Src, Tier, encode};
 
@@ -77,7 +75,6 @@ fn a_kept_copy_reads_like_the_log_it_was_from_any_cursor() {
             assert_eq!(copy.gap.map(|g| g.why), Some(GapWhy::Evicted));
         }
     }
-    // Every kept record's chain walks as it did (a `log <node>` subtree).
     for r in kept.window() {
         let mut n = r.node;
         for _ in 0..8 {
@@ -88,7 +85,6 @@ fn a_kept_copy_reads_like_the_log_it_was_from_any_cursor() {
             }
         }
     }
-    // The session's own open and close are kept.
     assert_eq!(kept.window().next().map(|r| r.op), Some(Op::Open));
     assert_eq!(kept.window().last().map(|r| r.op), Some(Op::Close));
 }
@@ -171,7 +167,6 @@ fn a_closed_summary_keeps_to_a_kilobyte_and_reads_as_the_log_did() {
     let carried = |turns: u64, updates: u64| -> Log {
         let mut log = realistic_log(turns);
         for u in 0..updates {
-            // An overlap a carried update leaves (`Log::skip_to`), then more.
             log.skip_to(log.last_seq() + 1_000 + u);
             log.mark(
                 aterm_slog::Mark::new(aterm_slog::Kind::Bell, Src::Engine, Conf::Exact),
@@ -208,7 +203,6 @@ fn a_closed_summary_keeps_to_a_kilobyte_and_reads_as_the_log_did() {
         if updates < 3 {
             assert_eq!(back.first_seq(), log.first_seq(), "every overlap kept");
         }
-        // Whole only past what it left out (the close, at the head, is kept).
         assert!(back.complete_from() >= log.complete_from());
         assert!(back.complete_from() <= log.last_seq());
         let seqs: Vec<u64> = log.window().map(|r| r.seq).collect();
@@ -233,7 +227,6 @@ fn a_closed_summary_keeps_to_a_kilobyte_and_reads_as_the_log_did() {
             }
         }
     }
-    // NEGATIVE CONTROL: the copy the index kept before.
     let old = closed_session(700).kept_within(0);
     assert!(
         old.footprint() > 4 * CLOSED_SUMMARY_BYTES,

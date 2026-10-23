@@ -289,7 +289,7 @@ pub struct ApiLog {
 impl ApiLog {
     /// Start a fresh proof's journal.
     #[must_use]
-    pub fn new(path: PathBuf, clock: Instant) -> Self {
+    pub const fn new(path: PathBuf, clock: Instant) -> Self {
         Self {
             path,
             clock,

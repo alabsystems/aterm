@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The jq lexer: the tokens of design §8.4, the refused tokens (`..`, `?//` and every
-//! assignment) refused here by their `REFUSED_JQ` row, and every `$NAME` a `REFUSED_JQ` row
-//! names (`$ENV`) and every `@NAME` that is not a format refused by name.
+//! Lexer for `agh`'s `jq` expression subset and refused operators.
 
 use aterm_json::Value;
 
@@ -116,12 +114,12 @@ struct Lexer<'a> {
 }
 
 /// Whether `b` may start a name.
-fn name_start(b: u8) -> bool {
+const fn name_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
 /// Whether `b` may continue a name.
-fn name_byte(b: u8) -> bool {
+const fn name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
@@ -153,8 +151,7 @@ impl Lexer<'_> {
         self.src.get(self.pos + ahead).copied()
     }
 
-    /// Tokens up to the end, or (when `nested`) up to and including the `)` that closes an
-    /// interpolation.
+    /// Tokens up to the end or the matching interpolation `)`.
     fn tokens(&mut self, nested: bool) -> Result<Vec<Spanned>> {
         let mut out: Vec<Spanned> = Vec::new();
         let mut depth = 0usize;
@@ -283,7 +280,7 @@ impl Lexer<'_> {
         }
     }
 
-    fn one(&mut self, tok: Tok) -> Tok {
+    const fn one(&mut self, tok: Tok) -> Tok {
         self.pos += 1;
         tok
     }
@@ -312,9 +309,7 @@ impl Lexer<'_> {
         Ok(self.text[start..self.pos].to_string())
     }
 
-    /// Digits with an optional fraction and an optional exponent (`[eE][+-]?digits`), the `-`
-    /// (when `negative`) already read. A number with an exponent is a double, written as a
-    /// whole number when it is one within 2^53, as jq's arithmetic writes it.
+    /// Digits with an optional fraction and an optional exponent.
     fn number(&mut self, negative: bool) -> Tok {
         let start = self.pos;
         while self.peek(0).is_some_and(|b| b.is_ascii_digit()) {
@@ -402,7 +397,6 @@ impl Lexer<'_> {
                     }
                 }
                 _ => {
-                    // One whole UTF-8 character: `pos` is always on a character boundary.
                     let c = self.text[self.pos..].chars().next().unwrap_or('\u{fffd}');
                     lit.push(c);
                     self.pos += c.len_utf8();

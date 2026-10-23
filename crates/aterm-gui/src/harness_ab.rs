@@ -557,7 +557,8 @@ impl AbTask {
         }
     }
 
-    /// The session's mode is Land (`lands`) or not, read at `at_ms`.
+    /// The session's mode is Land (`lands`) or not, read at `at_ms`. A mode
+    /// first read as Land has no start.
     fn mode(&mut self, lands: bool, at_ms: u64) {
         self.land_from = match (self.lands, lands) {
             (Some(true), true) => self.land_from,

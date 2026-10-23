@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of `TrickFlashLifecycle` (`aterm_models_effects::trick_flash_lifecycle_model`):
-//! the real `WordDecorations` over a real terminal, driven the way the split
-//! host drives it, its `trick_flash_phase` checked against the model after
-//! every call. A call the model names no step for (a bind between panes, a
-//! rescan with nothing to find) must leave the phase where it was.
-//!
-//! The negative control is the bug the bind's `found_in_a_pane` fixed: closing
-//! the bound sibling left the engine unbound, and the next bind's pane-space
-//! reset took pane 1's flash with it.
+//! Tier-1 conformance tests for `TrickFlashLifecycle` against `WordDecorations`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -106,7 +98,6 @@ impl Rig {
 
 #[test]
 fn the_real_flash_refines_the_lifecycle_model() {
-    // A split: the key goes to pane 1, then the bound pane 2 closes.
     let mut r = Rig::new();
     r.step(Some("Rebind"), |r| r.wd.bind_pane(1, (0, 0)));
     r.step(None, Rig::rescan);
@@ -119,8 +110,6 @@ fn the_real_flash_refines_the_lifecycle_model() {
     });
     r.step(None, |r| r.wd.bind_pane(2, (400, 0)));
     r.step(Some("CloseOther"), |r| r.wd.retain_panes(|pane| pane != 2));
-    // The engine before the fix showed Idle after the next bind: refused, and
-    // admitted by the mutant.
     let lost = observed(&r.model, &r.state, "Rebind", 0);
     let (ok, why) =
         verify::validate_transition_tiered(&r.model, &[], &r.state, &lost, None, "lost");
@@ -137,8 +126,6 @@ fn the_real_flash_refines_the_lifecycle_model() {
     r.step(Some("CloseOwn"), |r| r.wd.retain_panes(|pane| pane != 1));
     let mut fired = r.fired;
 
-    // One grid: a revoke before the echo drops the word; the window's own
-    // flash goes with the bind that splits the window.
     let mut r = Rig::new();
     r.step(None, Rig::rescan);
     r.step(Some("NoteWindow"), |r| {
@@ -155,8 +142,6 @@ fn the_real_flash_refines_the_lifecycle_model() {
     r.step(Some("Rebind"), |r| r.wd.bind_pane(1, (0, 0)));
     fired.extend(r.fired);
 
-    // The unsplit host names its session: a word noted there and not yet
-    // found has a caret in the grid the split changes, and goes with it.
     let mut r = Rig::new();
     r.step(None, |r| {
         r.wd.set_scan_session(Some(1));

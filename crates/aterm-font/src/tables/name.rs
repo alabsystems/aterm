@@ -5,8 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Naming Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/name) implementation.
+//! OpenType [Naming Table](https://docs.microsoft.com/en-us/typography/opentype/spec/name) parser.
 
 pub use super::PlatformId;
 use crate::parser::{FromData, LazyArray16, Offset, Offset16, Stream};
@@ -30,7 +29,6 @@ pub mod name_id {
     pub const DESIGNER_URL: u16 = 12;
     pub const LICENSE: u16 = 13;
     pub const LICENSE_URL: u16 = 14;
-    //        RESERVED                                  = 15
     pub const TYPOGRAPHIC_FAMILY: u16 = 16;
     pub const TYPOGRAPHIC_SUBFAMILY: u16 = 17;
     pub const COMPATIBLE_FULL: u16 = 18;
@@ -45,7 +43,6 @@ pub mod name_id {
 
 #[inline]
 fn is_unicode_encoding(platform_id: PlatformId, encoding_id: u16) -> bool {
-    // https://docs.microsoft.com/en-us/typography/opentype/spec/name#windows-encoding-ids
     const WINDOWS_SYMBOL_ENCODING_ID: u16 = 0;
     const WINDOWS_UNICODE_BMP_ENCODING_ID: u16 = 1;
 
@@ -96,25 +93,13 @@ pub struct Name<'a> {
     /// A language ID.
     pub language_id: u16,
     /// A [Name ID](https://docs.microsoft.com/en-us/typography/opentype/spec/name#name-ids).
-    ///
-    /// A predefined list of ID's can be found in the [`name_id`](name_id/index.html) module.
     pub name_id: u16,
-    /// A raw name data.
-    ///
-    /// Can be in any encoding. Can be empty.
+    /// Raw name bytes in the record's encoding.
     pub name: &'a [u8],
 }
 
 impl<'a> Name<'a> {
-    /// Returns the Name's data as a UTF-8 string.
-    ///
-    /// Only Unicode names are supported. And since they are stored as UTF-16BE,
-    /// we can't return `&str` and have to allocate a `String`.
-    ///
-    /// Supports:
-    /// - Unicode Platform ID
-    /// - Windows Platform ID + Symbol
-    /// - Windows Platform ID + Unicode BMP
+    /// Decodes a Unicode-encoded name record from UTF-16BE into a UTF-8 `String`.
     #[inline(never)]
     pub fn to_string(&self) -> Option<String> {
         if self.is_unicode() {
@@ -235,8 +220,7 @@ impl<'a> Iterator for NamesIter<'a> {
     }
 }
 
-/// A [Naming Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/name).
+/// A [Naming Table](https://docs.microsoft.com/en-us/typography/opentype/spec/name).
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Table<'a> {
     /// A list of names.
@@ -246,7 +230,6 @@ pub struct Table<'a> {
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
     pub fn parse(data: &'a [u8]) -> Option<Self> {
-        // https://docs.microsoft.com/en-us/typography/opentype/spec/name#naming-table-format-1
         const LANG_TAG_RECORD_SIZE: u16 = 4;
 
         let mut s = Stream::new(data);
@@ -259,9 +242,8 @@ impl<'a> Table<'a> {
         } else if version == 1 {
             let lang_tag_count = s.read::<u16>()?;
             let lang_tag_len = lang_tag_count.checked_mul(LANG_TAG_RECORD_SIZE)?;
-            s.advance(usize::from(lang_tag_len)); // langTagRecords
+            s.advance(usize::from(lang_tag_len));
         } else {
-            // Unsupported version.
             return None;
         }
 

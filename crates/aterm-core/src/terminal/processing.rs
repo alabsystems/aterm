@@ -446,7 +446,9 @@ impl Terminal {
     }
 }
 
-/// Exhaustive destructure of every `Terminal` field: a compile-time guard.
+/// Exhaustive destructure of every `Terminal` field: a compile-time guard. A new field fails to
+/// compile here until it is either forwarded to `TerminalHandler` (`define_terminal_handler!` in
+/// handler.rs) or listed as session-only.
 const fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
     let Terminal {
         grid: _,

@@ -235,14 +235,14 @@ pub fn gb(mib: u64) -> String {
 }
 
 /// The swap rate as the banner writes it, MB/s rounded.
-fn mb_s(swap_kib_s: u32) -> u32 {
+const fn mb_s(swap_kib_s: u32) -> u32 {
     swap_kib_s.saturating_add(512) / 1024
 }
 
 impl MemoryOver {
     /// Whether the measure is acted on (a restart at the next idle point.
     #[must_use]
-    pub fn acts(&self) -> bool {
+    pub const fn acts(&self) -> bool {
         self.strain.is_some() && self.dominant
     }
 
@@ -289,7 +289,7 @@ impl MemoryOver {
 
     /// What the warning says comes next, `restarts` being whether the host makes a restart.
     #[must_use]
-    pub fn verdict(&self, restarts: bool) -> Verdict {
+    pub const fn verdict(&self, restarts: bool) -> Verdict {
         match (self.acts(), restarts) {
             (true, true) => Verdict::Restart,
             (true, false) => Verdict::Person,
@@ -354,7 +354,9 @@ mod tests {
 
     const GIB: u64 = 1024;
 
-    /// The automatic ceiling follows [`MemoryCeiling::ceiling_mib`].
+    /// The automatic ceiling follows [`MemoryCeiling::ceiling_mib`]. Negative
+    /// control: more available means a higher ceiling; an owner's number does
+    /// not move.
     #[test]
     fn the_automatic_ceiling_moves_with_the_available_memory() {
         let auto = |p: Option<u64>, a: Option<u64>| {

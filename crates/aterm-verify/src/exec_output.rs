@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A bounded walk's children. The walk can be stuck in Rust or filesystem IO,
-//! but its output calls have one cancellable owner. Closing admission and
-//! acquiring a child permit share a lock, so no child can start after close
-//! has returned. Success follows a reap. On cancellation or unwind, the owner
-//! attempts kill/reap before releasing its permit; errors or interruption can
-//! leave the child unreaped. The permit counts active calls, not proven exits.
+//! Bounded child process permit scope and cancellable output execution.
 
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::io;
@@ -58,8 +53,6 @@ impl Scope {
     }
 
     pub(super) fn output(&self, command: &mut Command) -> io::Result<Output> {
-        // File capture preserves complete cargo-tree/metadata output without
-        // pipe reader threads that a descendant could keep blocked forever.
         let directory = aterm_tempfile::tempdir()?;
         let stdout = directory.path().join("stdout");
         let stderr = directory.path().join("stderr");
@@ -69,8 +62,6 @@ impl Scope {
             .stderr(std::fs::File::create(&stderr)?);
         let permit = self.enter()?;
         let status = OwnedChild::run(command, self);
-        // Success means the child was reaped; an error can leave cleanup
-        // unproven. File reads do not retain the active-call permit.
         drop(permit);
         Ok(Output {
             status: status?,
@@ -105,9 +96,6 @@ struct OwnedChild {
 
 impl OwnedChild {
     fn run(command: &mut Command, scope: &Scope) -> io::Result<ExitStatus> {
-        // The group/reaping fence below is defined on the two Unix hosts the
-        // check runner supports. Refuse another Unix rather than spawn a child
-        // whose whole group this executor cannot safely own.
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
         {
             let _ = (command, scope);
@@ -142,8 +130,6 @@ impl OwnedChild {
             let mut nap = Duration::from_millis(1);
             loop {
                 if scope.closed() {
-                    // Drop attempts SIGKILL/reap before the permit can leave;
-                    // an error or interruption can leave the child unreaped.
                     return Err(cancelled());
                 }
                 if let Some(status) = owned.poll()? {
@@ -189,10 +175,6 @@ impl Drop for OwnedChild {
         };
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            // Signal while this exact leader is held unreaped, then attempt
-            // the one reap. On error/stop, forgetting the wrapper prevents its
-            // Drop from reaping behind the interrupt handler; it does not
-            // establish that cleanup completed.
             if self.live.holds(child.id()) && self.live.kill().is_err() {
                 let _ = child.kill();
             }

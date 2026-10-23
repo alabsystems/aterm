@@ -540,7 +540,12 @@ pub(crate) fn of(facts: &NeedFacts) -> Verdict {
     }
 }
 
-/// The published stall: frozen, or stopped with input queued.
+/// The published stall: frozen, or stopped with input queued. Its words are
+/// the person's: the stall's own text up to its remedy (`perl is frozen: not
+/// reading input since 14:02 (1 B queued)`), since the remedy that text ends
+/// with is an agent's command line (`— restart it: aterm ctl @s-… signal
+/// term`), and a person's remedy in its place where the pill carries no act
+/// for it ([`stall_remedy`]).
 fn stall_need(facts: &NeedFacts) -> Option<Need> {
     let stall = facts.stall.as_ref()?;
     let words = stall_words(&stall.text);

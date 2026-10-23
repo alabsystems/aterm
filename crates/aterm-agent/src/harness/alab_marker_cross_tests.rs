@@ -1,19 +1,14 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! ONE ANSWER TO "IS THIS CODEX ALAB'S?" atpkg classifies a build by its own marker check
-//! (`atpkg::alab`: the lane that installs codex-alab may not call into the harness that
-//! supervises it), and the harness keeps its own (`codex_alab::alab_bytes`, the proven
-//! self-claim's image fact). Over one corpus of package shapes the two must agree, or a
-//! build atpkg keeps as ALab's would be one the Codex lane moves as the vendor's.
+//! Cross-checks between `atpkg` and harness ALab package marker classification.
 
 use std::path::Path;
 
 use super::codex_alab as cx;
 use crate::supervise::ScratchDir;
 
-/// `<root>/bin/codex` under a `codex-package.json` of `manifest`, with `alab-build.json`
-/// as `marker` says.
+/// `<root>/bin/codex` under a `codex-package.json` of `manifest`.
 fn lay(root: &Path, manifest: &str, marker: Marker) {
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/codex"), b"x").expect("exe");
@@ -104,8 +99,6 @@ fn atpkg_and_the_harness_give_one_answer_on_every_package_shape() {
             "{name}: the entrypoint"
         );
     }
-    // Reached through a link, as the twin's stable path (`store/codex/exec/codex`, a link
-    // to the build's entrypoint) and a link to the package's directory reach it.
     #[cfg(unix)]
     {
         let link = dir.join("current");
@@ -117,10 +110,6 @@ fn atpkg_and_the_harness_give_one_answer_on_every_package_shape() {
             assert!(atpkg::alab::exe_is_alab(&exe), "{}", exe.display());
         }
     }
-    // Where the two readings differ — a manifest, an entrypoint or a marker that is itself
-    // a link, which no store build holds (a pack with a link is refused) — atpkg is the
-    // stricter: it never calls such a package ALab, so nothing atpkg keeps as ALab's is a
-    // build the harness would move as the vendor's.
     #[cfg(unix)]
     for (name, linked) in [
         ("linked-manifest", cx::PACKAGE_JSON),

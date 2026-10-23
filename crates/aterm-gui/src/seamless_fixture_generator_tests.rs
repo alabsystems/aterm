@@ -95,7 +95,11 @@ fn fx_rfc3339(epoch: u64) -> String {
     )
 }
 
-/// The release's own build stamp, installed before anything reads provenance.
+/// The release's own build stamp, installed before anything reads provenance. The shipped binary's
+/// stamp comes from `crates/aterm/build.rs` (installed by `main`) and this test binary reads a
+/// fixed one, so the generator reads the three pins the release build hands that script
+/// (`ATERM_BUILD_GIT_COMMIT`, `ATERM_BUILD_GIT_COMMIT_FULL`, `SOURCE_DATE_EPOCH`) and installs what
+/// it stamps from them: a clean tree at that commit.
 fn fx_install_release_stamp() {
     let var = |name: &str| {
         std::env::var(name)
@@ -712,7 +716,11 @@ fn fx_claude(local_id: u64, rows: u16, cols: u16, before: usize) -> FxSession {
     }
 }
 
-/// The park's policy, as an install of this release reads it.
+/// The park's policy, as an install of this release reads it. The cut copies the successor's
+/// `publish/handoff-policy.toml` into its bundle at `BUNDLE_PATH`; the producer's pre-verification
+/// reads it there (`handoff_policy::read_from_bundle`, after the codesign check) and keeps what it
+/// must follow (`handoff_policy::adopt`), which every park reads by the attempt's key
+/// (`App::park_policy`).
 fn fx_park_policy(
     scratch: &std::path::Path,
     want: aterm_update_core::handoff_policy::CarryCeiling,
@@ -2680,7 +2688,10 @@ fn fx_shell_integration_desk() -> FxDesk {
     }
 }
 
-/// The shapes v0.93.0 and v0.94.0 changed.
+/// The shapes v0.93.0 and v0.94.0 changed. The history carry: a shell whose history is deeper
+/// than the checkpoint's 256 lines, and one running `less` in 1049, whose checkpoint carries none
+/// of its shell's history (the saved primary rides at its visible rows), so the `.hist` sidecar
+/// carries all of it.
 fn fx_history_carry_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, RestoredSplitTree, RestoredView, SplitKind};
     let deep = fx_shell(40, 120, 1500, "/home/dev/src/aterm", 6);
@@ -3011,7 +3022,10 @@ fn fx_link_dense_desk() -> FxDesk {
     }
 }
 
-/// The shape v0.98.0 changed: a link-dense line in the history a `.hist` sidecar carries.
+/// The shape v0.98.0 changed: a link-dense line in the history a `.hist` sidecar carries. Exports
+/// from v0.94.0 through v0.97.0 wrote such a line as the engine serialized it, and v0.97.0's import
+/// refuses the whole sidecar for it (a frame is 1,024 lines, decoded whether or not the line is
+/// inside the checkpoint's 256).
 fn fx_link_dense_history_desk() -> FxDesk {
     use crate::restore::{
         NativeLeafRestore, RestoreManifest, RestoredSplitTree, RestoredView, SettingsDraftRestore,
@@ -3258,7 +3272,10 @@ fn fx_policy_repaint_desk() -> FxDesk {
     }
 }
 
-/// The shape v0.100.0 added: panes kept open by `--hold` after their command exited.
+/// The shape v0.100.0 added: panes kept open by `--hold` after their command exited. They are in
+/// the layout but never handed (no process, no PTY), so they have no session record; their final
+/// screens ride the manifest's `held` list, each with how its command ended, in `.h<id>.heldgrid`
+/// (and, for a screen left in 1049, `.heldalt`) sidecars outside every digest.
 fn fx_held_pane_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
     let mut make = fx_shell(ROWS, COLS, 30, "/home/dev/src/aterm", 4);

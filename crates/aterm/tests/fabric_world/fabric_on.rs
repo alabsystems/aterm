@@ -409,7 +409,9 @@ fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
     }
 }
 
-/// End to end, twice.
+/// End to end, twice. With no fabric command and no broker, the first `on` provisions the
+/// root, node id, secret and cap, then fails at the broker (`--service none` starts none),
+/// naming the guarded broker to run.
 #[test]
 fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     let bin = harness::aterm();
@@ -1303,7 +1305,9 @@ fn a_usage_error_is_refused_before_anything_is_written() {
     assert_eq!(code, 2, "{out}");
 }
 
-/// An unreadable or invalid role is not a new one-host fabric.
+/// An unreadable or invalid role is not a new one-host fabric. Even without
+/// the login's rendezvous file, the refusing command must leave the previous
+/// node and its cap untouched and mint no secret of its own.
 #[test]
 fn role_identity_unreadable_state_never_writes() {
     let bin = harness::aterm();
@@ -1643,7 +1647,8 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
     }
 }
 
-/// Wait for `@<sid> status` to read `hold=<want>`.
+/// Wait for `@<sid> status` to read `hold=<want>`. A hang detector (the
+/// latency is printed as a measurement, never bounded), so the harness's minute.
 fn until_hold(gui: &Gui, sid: &str, want: u8) -> std::time::Duration {
     let started = std::time::Instant::now();
     loop {

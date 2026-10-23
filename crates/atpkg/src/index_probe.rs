@@ -80,7 +80,8 @@ pub fn probes_this_source() -> bool {
     standard_public_source(&source.owner, &crate::discovery::index_repo())
 }
 
-/// One store-scoped probe.
+/// One store-scoped probe. The HEAD closure is injectable so the URL, response
+/// classification and cross-process request bound are tested without network.
 #[cfg(test)]
 pub(crate) fn successor_with(
     layout: &Layout,

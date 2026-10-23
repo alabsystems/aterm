@@ -4,16 +4,8 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A press's server time is what a launch for it carries (`platform::x11::user_time`, which
-//! aterm hands `xdg-open` as `DESKTOP_STARTUP_ID=_TIME<t>`). mutter refuses an activation stamped
-//! before the newest press it knows of, so a browser that presented its window with its own older
-//! user time stayed behind aterm, marked "is ready" (the desk audit, GNOME 46 on Xorg,
-//! 2026-10-22). Here the event loop's button handler is fed a press and a later release: the
-//! press's time is noted, and the release's is not.
-//!
-//! The negative control: without the note in `xinput2_button_input`, `user_time` stays `None`.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! A press's server time is what a launch for it carries (`platform::x11::user_time`, which aterm
+//! hands `xdg-open` as `DESKTOP_STARTUP_ID=_TIME<t>`).
 
 use super::ffi::XIDeviceEvent;
 use crate::event::ElementState;

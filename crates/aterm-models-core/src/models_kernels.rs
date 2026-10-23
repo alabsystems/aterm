@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Two small kernels: the run-length codec's local compaction and the grapheme scanner's
-//! ASCII fast path.
+//! Models for RLE local compaction and the grapheme scanner's ASCII fast path.
 
 use aterm_spec::derive::Model;
 
 /// Local compaction around the spliced `mid` run in `Rle::split_range_*`.
-///
-/// Models a 3-slot neighborhood `(left_val, mid_val, right_val)` surrounded by
-/// compact outer neighbors `(outer_left_val != left_val, right_val != outer_right_val)`:
-/// * At `Buggy = 0`, `compact_around(mid)` merges `mid` with `left` if equal and
-///   with `right` if equal, establishing `NoAdjacentEqual` across the whole
-///   neighborhood in $O(1)$ without scanning the outer runs.
-/// * At `Buggy = 1`, omitting the right-neighbor check after a left merge leaves
-///   adjacent runs with identical values when `left_val == mid_val == right_val`
-///   (e.g. healing `[1, 2, 1]` by setting the middle run to `1`), caught by
-///   `NoAdjacentEqual`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn rle_local_compact_model() -> Model {
@@ -58,15 +47,6 @@ pub fn rle_local_compact_model() -> Model {
 }
 
 /// Printable ASCII pair fast path in `aterm_grapheme::find_first_cluster_end`.
-///
-/// Models a 2-character prefix `(c0_ascii, c1_ascii, c1_extend)`:
-/// * At `Buggy = 0`, the $O(1)$ fast path returns `cluster_end = 1` only when
-///   BOTH `c0_ascii == 1` and `c1_ascii == 1` (`c1_extend == 0`), falling back
-///   to the full UAX #29 scanner when `c1` is a non-ASCII combining mark
-///   (`c1_extend == 1`), proving `CombiningMarkNeverSplit`.
-/// * At `Buggy = 1`, returning `cluster_end = 1` after checking only `c0_ascii == 1`
-///   splits a base ASCII character from its following combining mark (`a\u{0301}`),
-///   caught by `CombiningMarkNeverSplit`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ascii_grapheme_fast_path_model() -> Model {

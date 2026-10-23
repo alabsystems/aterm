@@ -1393,7 +1393,10 @@ fn a_stamp_banks_split_and_merge_match_one_by_one_banking_at_every_fill() {
     }
 }
 
-/// The band's walk is the hand's, whatever the echo's lag.
+/// The band's walk is the hand's, whatever the echo's lag. A cell's `t` is a function of its
+/// column (`Cohort::t_at`), never a clock, and the seam dates a typed sweep at the key's clock
+/// (the press's stamp, or the oldest unpaid press for a stalled batch), floored one stamp window
+/// before the echo (`rainbow_kitty::SWEEP_BIRTH_FLOOR_S`).
 #[test]
 fn the_bands_walk_is_the_hands_whatever_the_echos_lag() {
     let g = wide_geom();
@@ -1649,7 +1652,9 @@ fn a_typed_re_anchor_lays_its_landing_only_under_a_live_press_s_glyph() {
     }
 }
 
-/// The landing gate reads the cell a soft-wrapped caret lays.
+/// The landing gate reads the cell a soft-wrapped caret lays. One `a`: the glyph lands at the
+/// row's last text column (3, 17) and the caret alone wraps to the indent (4, 2); the re-anchor
+/// lays the origin ([`CursorGlow::soft_wrapped_caret`]), so the gate reads the origin.
 #[test]
 fn a_soft_wrapped_re_anchor_is_witnessed_at_the_origin_it_lays() {
     let g = wide_geom();
@@ -1761,7 +1766,9 @@ fn a_foreign_landing_restores_the_prior_licensed_hand_row() {
     );
 }
 
-/// A lifted word lays no landing, so the landing gate stands down.
+/// A lifted word lays no landing, so the landing gate stands down. In a bordered composer a Space
+/// lets `already` on row 4 fit row 3, and the caret stays at (4, 1): a same-row typed retreat
+/// whose `landing − 1` is `│`.
 #[test]
 fn a_lifted_word_is_not_refused_by_the_landing_gate() {
     let g = wide_geom();
@@ -1864,7 +1871,9 @@ fn a_flushed_park_is_witnessed_by_the_glyph_it_was_held_over() {
     }
 }
 
-/// A recall at the next key leaves that key's hand on its row ([`TornLay`]).
+/// A recall at the next key leaves that key's hand on its row ([`TornLay`]). Shape: a typed lay
+/// made with the hand off its row (the print ends on the row below), the caret walked back onto
+/// the lay, and the next key's echo before the caret rested.
 #[test]
 fn a_recall_at_the_next_key_leaves_that_key_s_hand_on_its_row() {
     let g = wide_geom();

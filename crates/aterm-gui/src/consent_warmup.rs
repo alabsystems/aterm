@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use aterm_containment::consent;
 use aterm_containment::consent::Folder;
 
-/// Bound on the warm-up result queue.
+/// Bound on the warm-up result queue. A pass posts at most `2n + 1` messages for its `n`
+/// de-duplicated folders (`n <= Folder::ALL.len()`), so the bound is never reached; it exists
+/// because the worker must not block on its output.
 const RESULT_QUEUE_CAP: usize = 16;
 
 /// What one folder's listing attempt returned.
@@ -358,7 +360,8 @@ impl WarmupState {
         true
     }
 
-    /// Retire the live pass.
+    /// Retire the live pass. A row still `asking` becomes `unknown`: nobody learned the answer,
+    /// which is not a denial.
     fn end_pass(&mut self) {
         self.live = None;
         self.rx = None;
@@ -475,7 +478,8 @@ fn post(tx: &SyncSender<WarmupProgress>, poke: &(impl Fn() + ?Sized), message: W
     poke();
 }
 
-/// Walk the folders in sequence.
+/// Walk the folders in sequence. Each listing may park indefinitely behind a system dialog,
+/// so this runs on a detached thread nothing joins.
 fn run_pass(
     generation: u64,
     walk: &[(Folder, PathBuf)],

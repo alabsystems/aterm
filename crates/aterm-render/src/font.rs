@@ -725,7 +725,11 @@ mod tests {
         }
     }
 
-    /// NOTHING A FACE DRAWS RIGHT TODAY MOVES.
+    /// NOTHING A FACE DRAWS RIGHT TODAY MOVES. The embedded faces carry a Mac
+    /// Roman subtable BEFORE their Unicode ones, so the enumeration already
+    /// gives every printable char its Unicode glyph; the Unicode answer agrees
+    /// with it on all of them and differs only on control codes the Mac
+    /// subtable maps and the Unicode ones do not.
     #[cfg(feature = "embedded-font")]
     #[test]
     fn the_unicode_answer_keeps_every_printable_char_of_the_shipped_faces() {

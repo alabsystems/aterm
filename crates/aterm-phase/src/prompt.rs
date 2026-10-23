@@ -647,6 +647,13 @@ pub enum RmBreakerKind {
     TooManySubstitutions,
     /// Command contains nested commands or function substitutions that could not be analyzed.
     NestedUnanalyzed,
+    /// Any other `not ruled out — <why>`: the vendor could not rule a removal out, for a reason
+    /// this reader has no kind of its own for. The note's template (`Dangerous ${rm|rmdir}
+    /// operation ${r}`) is the breaker's whatever the why, so a new why is still the breaker:
+    /// 2.1.309 added `the shell may read this command differently than it was parsed`, drawn
+    /// over a command whose parse tree is an error at its root, rm or no rm (`echo $(`,
+    /// MEASURED). [`RmBreaker::target`] holds the why as drawn.
+    NotRuledOut,
 }
 
 /// Parsed vendor `rm`/`rmdir` circuit-breaker warning note.
@@ -717,19 +724,27 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
                 .map(|t| (kind, t))
         })
         .or_else(|| {
-            let why = rest
-                .strip_prefix(const { anchor_text("box.rm_breaker.not_ruled_out") })
-                .unwrap_or(rest)
-                .strip_prefix("— ")?;
-            if let Some(n) = why
-                .strip_prefix(const { anchor_text("box.rm_breaker.too_many") })
-                .and_then(|n| n.strip_suffix(')'))
-            {
-                return (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                    .then_some((RmBreakerKind::TooManySubstitutions, n));
+            let qualified =
+                rest.strip_prefix(const { anchor_text("box.rm_breaker.not_ruled_out") });
+            let why = qualified.unwrap_or(rest).strip_prefix("— ")?;
+            let too_many = const { anchor_text("box.rm_breaker.too_many") };
+            if why.starts_with(too_many.trim_end_matches('(').trim_end()) {
+                // The too-many why names its count; one that does not is no note of the vendor's.
+                return why
+                    .strip_prefix(too_many)
+                    .and_then(|n| n.strip_suffix(')'))
+                    .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    .map(|n| (RmBreakerKind::TooManySubstitutions, n));
             }
-            (why == const { anchor_text("box.rm_breaker.nested_unanalyzed") })
-                .then_some((RmBreakerKind::NestedUnanalyzed, why))
+            let nested = const { anchor_text("box.rm_breaker.nested_unanalyzed") };
+            if why.starts_with(nested) {
+                // The nested why is drawn whole; more after it is no note of the vendor's.
+                return (why == nested).then_some((RmBreakerKind::NestedUnanalyzed, why));
+            }
+            // Any other why, after the vendor's own `not ruled out` (2.1.307 on): the
+            // breaker's template whatever it names. The bare `— <why>` form (2.1.306 and
+            // older) only ever named too many substitutions.
+            qualified.map(|_| (RmBreakerKind::NotRuledOut, why))
         })?;
     let target = crate::text::trim(target);
     (!target.is_empty()).then(|| RmBreaker {
@@ -3681,6 +3696,19 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.308-box-bash-statement-follows-16-subs.txt");
     pub const BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308: &str =
         include_str!("fixtures/claude-2.1.308-box-bash-rm-too-many-no-rm-bypass.txt");
+    pub const BOX_BASH_TOUCH_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-box-bash-touch.txt");
+    pub const BOX_WRITE_CREATE_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-box-write-create.txt");
+    pub const BOX_EDIT_2_1_309: &str = include_str!("fixtures/claude-2.1.309-box-edit.txt");
+    pub const BOX_BASH_ASK_RULE_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-box-bash-ask-rule.txt");
+    pub const BOX_BASH_HOOK_ASK_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-box-bash-hook-ask.txt");
+    pub const BOX_RM_PARSE_DIVERGED_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-box-bash-rm-parse-diverged.txt");
+    pub const TOOL_DISK_FULL_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-disk-full-printed.txt");
     pub const PLAN_READY: &str = include_str!("fixtures/claude-2.1.282-plan-ready.txt");
     pub const PLAN_APPROVAL_60_2_1_300: &str =
         include_str!("fixtures/claude-2.1.300-plan-approval-60col.txt");
@@ -5474,6 +5502,20 @@ mod tests {
                 NestedUnanalyzed,
                 "some nested commands or function substitutions could not be analyzed",
             ),
+            // 2.1.309's new why (MEASURED, `claude-2.1.309-box-bash-rm-parse-diverged`), and
+            // any why a later build adds after the vendor's `not ruled out`.
+            (
+                "Dangerous rm operation not ruled out — the shell may read this command differently than it was parsed",
+                RmCommand::Rm,
+                NotRuledOut,
+                "the shell may read this command differently than it was parsed",
+            ),
+            (
+                "Dangerous rmdir operation not ruled out — something new",
+                RmCommand::Rmdir,
+                NotRuledOut,
+                "something new",
+            ),
             (
                 "Dangerous rmdir operation on statically-unresolvable target: /tmp/a/*",
                 RmCommand::Rmdir,
@@ -5501,8 +5543,14 @@ mod tests {
             "Dangerous rm operation on critical path: ",
             "Dangerous rm operation — too many command substitutions to analyze (lots)",
             "Dangerous rm operation not ruled out — too many command substitutions to analyze (lots)",
-            "Dangerous rm operation not ruled out — something new",
+            "Dangerous rm operation not ruled out — too many command substitutions to analyze",
+            "Dangerous rm operation not ruled out — some nested commands or function substitutions could not be analyzed (2)",
+            // A why with no `not ruled out` before it is the old form, which named only
+            // the too-many count.
+            "Dangerous rm operation — something new",
+            "Dangerous rm operation — the shell may read this command differently than it was parsed",
             "Dangerous rm operation not ruled out — ",
+            "Dangerous rm operation not ruled out —",
             "Dangerous rm operation not ruled out on critical path: /usr",
             "Dangerous rm operation on mounted drive path: ",
             "Dangerous rm operation on mounted drive: /Volumes/x",
@@ -5611,6 +5659,14 @@ mod tests {
                 BOX_EDIT_2_1_308,
                 BOX_BASH_ASK_RULE_2_1_308,
                 BOX_BASH_HOOK_ASK_2_1_308,
+            ),
+            (
+                "2.1.309",
+                BOX_BASH_TOUCH_2_1_309,
+                BOX_WRITE_CREATE_2_1_309,
+                BOX_EDIT_2_1_309,
+                BOX_BASH_ASK_RULE_2_1_309,
+                BOX_BASH_HOOK_ASK_2_1_309,
             ),
         ] {
             for (what, text, kind, subject, description, roles, review) in [
@@ -5780,6 +5836,13 @@ mod tests {
                 RmBreakerKind::NestedUnanalyzed,
                 "some nested commands or function substitutions could not be analyzed",
             ),
+            (
+                "2.1.309 parse diverged, no rm",
+                BOX_RM_PARSE_DIVERGED_2_1_309,
+                Some("echo $("),
+                RmBreakerKind::NotRuledOut,
+                "the shell may read this command differently than it was parsed",
+            ),
         ] {
             let r = screen(text);
             assert_eq!(
@@ -5809,7 +5872,13 @@ mod tests {
             let (top, _) = prompt_box_span(&r).expect("the span");
             assert_eq!(parse_prompt_v2(&r[..top]), None, "{what}: cut above");
         }
-        for text in [BOX_BASH_TOUCH_2_1_307, BOX_BASH_TOUCH_2_1_308] {
+        for text in [
+            BOX_BASH_TOUCH_2_1_307,
+            BOX_BASH_TOUCH_2_1_308,
+            BOX_BASH_TOUCH_2_1_309,
+            BOX_BASH_ASK_RULE_2_1_309,
+            BOX_BASH_HOOK_ASK_2_1_309,
+        ] {
             let plain = parse_prompt_v2(&screen(text)).expect("the box");
             assert_eq!(plain.rm_breaker(), None);
         }

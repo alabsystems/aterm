@@ -2,10 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The read verbs through `run_cli`: exits, stdout values and the error line's fields.
+//! Read verb tests through `run_cli`: exit codes, stdout values, and error fields.
 
-// Every case routes through the canonical config's profiles, private token files (plan §1,
-// rule 12).
 #![cfg(unix)]
 
 use std::path::Path;
@@ -160,8 +158,6 @@ fn strings(value: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------- every usage error of plan §10.2
-
 #[test]
 fn every_usage_error_is_exit_2_with_the_verb_s_help() {
     let w = World::new("cli-usage");
@@ -171,7 +167,6 @@ fn every_usage_error_is_exit_2_with_the_verb_s_help() {
     let missing = w.root.path().join("missing").display().to_string();
     let file = w.root.path().join("f").display().to_string();
     let part_file = w.root.path().join("f.agh-part").display().to_string();
-    // The api origin's base with one more digit on its port: a prefix of it, another origin.
     let lookalike = format!(
         "http://127.0.0.1:{}0/repos/fixture-dev/app",
         w.fake.ports().api
@@ -257,7 +252,6 @@ fn every_usage_error_is_exit_2_with_the_verb_s_help() {
         (vec!["api", "/search/code", "-f", "q"], "api"),
         (vec!["api", "/repos/fixture-dev/app", "-R", PULLED], "api"),
         (vec!["api", "/repositories/1000"], "api"),
-        // PULLED is repository 1001: the path's id is not -R's.
         (vec!["api", "/repositories/1001", "-R", APP], "api"),
         (vec!["api", "/repositories/app", "-R", APP], "api"),
         (vec!["api", &lookalike], "api"),
@@ -276,7 +270,6 @@ fn every_usage_error_is_exit_2_with_the_verb_s_help() {
             ],
             "api",
         ),
-        // `x.agh-part` is the part file of `x`, which the download of `x` removes first.
         (
             vec![
                 "release",
@@ -298,7 +291,6 @@ fn every_usage_error_is_exit_2_with_the_verb_s_help() {
             ],
             "release download",
         ),
-        // An `--output` that names no file, as a separate value or after `=`.
         (
             vec![
                 "release", "download", APP, "v1", "--asset", "x", "--output", "",
@@ -348,13 +340,9 @@ fn a_hidden_dot_segment_or_an_empty_tag_part_is_usage_with_nothing_sent() {
     let w = World::new("cli-hidden-dots");
     w.files();
     let cases: Vec<Vec<&str>> = vec![
-        // A `..` behind an encoded `/`, which a front end that decodes `%2F` before it removes
-        // dot-segments would resolve onto another path than the one routed.
         vec!["api", "user/..%2Fusers%2Fx"],
         vec!["api", "/repos/fixture-dev/app/..%2F..%2Fx"],
         vec!["api", "/repos/fixture-dev/app/..%5C..%5Cx"],
-        // A tag with an empty part, which a slash-merging server reads as another tag, on
-        // both of `view`'s branches.
         vec!["release", "view", APP, "a//b"],
         vec!["release", "view", APP, "v1/"],
         vec!["release", "assets", APP, "a//b"],
@@ -365,13 +353,10 @@ fn a_hidden_dot_segment_or_an_empty_tag_part_is_usage_with_nothing_sent() {
         w.run(&args).failed(2, "usage", None);
         assert!(w.fake.seen().is_empty(), "{args:?}: {:?}", w.fake.seen());
     }
-    // An encoded `/` that hides no dot-segment is no refusal.
     let fine = w.run(&["api", "/repos/fixture-dev/app/contents/a%2Fb.md"]);
     assert_ne!(fine.exit, 2, "{}", fine.stderr);
     w.fake.assert_clean();
 }
-
-// ---------------------------------------------------------------- content
 
 #[test]
 fn cat_prints_the_bytes_and_judges_absence() {
@@ -423,8 +408,6 @@ fn find_filters_and_a_truncated_tree_needs_partial() {
     w.fake.assert_clean();
 }
 
-// ---------------------------------------------------------------- history
-
 #[test]
 fn compare_of_unrelated_refs_is_exit_0_unrelated() {
     let w = World::new("cli-compare");
@@ -453,8 +436,6 @@ fn compare_of_unrelated_refs_is_exit_0_unrelated() {
     assert_eq!(value["total_commits"], Value::from(0u64));
     w.fake.assert_clean();
 }
-
-// ---------------------------------------------------------------- releases
 
 #[test]
 fn release_list_reads_latest_only_when_projected_and_drafts_need_push() {
@@ -492,8 +473,6 @@ fn release_list_reads_latest_only_when_projected_and_drafts_need_push() {
 
 #[test]
 fn a_writer_outside_the_read_chain_still_reads_latest() {
-    // alabsystems reads through dev and anonymous and writes as release: `--as release` names
-    // the writer, who reads the latest pointer too (a WriterRead, where release is at home).
     let w = World::new("cli-release-writer");
     let channel = "alabsystems/aterm";
     w.fake
@@ -541,7 +520,6 @@ fn a_writer_outside_the_read_chain_still_reads_latest() {
 
 #[test]
 fn a_private_repository_s_latest_is_read_as_the_writer() {
-    // Only the release bot sees this private repository; its read chain's dev bot gets a 404.
     let w = World::new("cli-release-private-latest");
     let channel = "alabsystems/hidden";
     w.fake
@@ -666,8 +644,6 @@ fn release_download_writes_files_or_stdout() {
     w.fake.assert_clean();
 }
 
-// ---------------------------------------------------------------- can
-
 #[test]
 fn can_is_exit_5_when_not_granted_and_granted_otherwise() {
     let w = World::new("cli-can");
@@ -684,8 +660,6 @@ fn can_is_exit_5_when_not_granted_and_granted_otherwise() {
     assert_eq!(pull.json()["permissions"]["pull"], Value::Bool(true));
     w.fake.assert_clean();
 }
-
-// ---------------------------------------------------------------- api
 
 #[test]
 fn api_routes_each_path_class() {
@@ -735,8 +709,6 @@ fn api_routes_each_path_class() {
 
 #[test]
 fn api_reads_a_by_id_user_path_through_the_read_chain_never_as_a_release_profile() {
-    // `/user/{account_id}/repos` (GitHub's next link for `/users/{login}/repos`) names
-    // fixture-dev, a dev-tier owner, by id: the release token never goes there.
     let w = World::new("cli-api-user-id");
     let owner = w.run(&["api", "/users/fixture-dev"]);
     assert_eq!(owner.exit, 0, "{}", owner.stderr);
@@ -905,8 +877,6 @@ fn api_all_holds_limit_to_items_and_a_partial_cap_is_incomplete() {
     w.fake.assert_clean();
 }
 
-// ---------------------------------------------------------------- stream, limit and route edges
-
 /// stdout whose reader goes away after its first write (`| head -c N`).
 struct GoneAfterFirst {
     took: usize,
@@ -932,7 +902,6 @@ fn release_download_to_a_reader_that_went_away_is_exit_0_and_quiet() {
     let release = w
         .fake
         .add_release(APP, ReleaseSpec::published("v1", "2026-01-01T00:00:00Z"));
-    // Larger than one 64 KiB chunk, so a second write meets the closed pipe.
     let big = vec![b'x'; 200 * 1024];
     w.fake
         .add_asset(release, AssetSpec::uploaded("big.bin", &big));
@@ -983,8 +952,6 @@ fn an_asset_named_like_a_part_file_is_usage_under_dir_only() {
     ran.failed(2, "usage", None);
     assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
     assert!(!dir.join("x").exists());
-    // Only `--dir` makes the asset's name a file's: to stdout, or to a file the caller
-    // names, such an asset downloads.
     let ran = w.run(&[
         "release",
         "download",
@@ -1017,7 +984,6 @@ fn an_asset_named_like_a_part_file_is_usage_under_dir_only() {
 #[test]
 fn release_list_capped_under_partial_stays_incomplete_when_limited() {
     let w = World::new("cli-release-cap-limit");
-    // 101 releases: one more than a page.
     for i in 0..101u32 {
         let day = i % 28 + 1;
         let month = i / 28 + 1;
@@ -1076,7 +1042,6 @@ fn api_prints_a_raw_file_s_bytes_even_when_they_parse() {
     assert_eq!(ran.exit, 0, "{}", ran.stderr);
     assert_eq!(ran.text(), body);
 
-    // Elsewhere GitHub labels JSON objects `raw+json` too: those stay JSON.
     let issue = format!("/repos/{APP}/issues/1");
     w.fake.fault(Match::api(&issue), labelled());
     let ran = w.run(&["api", &issue, "--accept", "application/vnd.github.raw+json"]);
@@ -1087,7 +1052,6 @@ fn api_prints_a_raw_file_s_bytes_even_when_they_parse() {
 
 #[test]
 fn api_judges_the_route_on_the_path_a_fragment_leaves() {
-    // A `#fragment` is never sent, so the route is judged on the path GitHub receives.
     let root = common::scratch("cli-api-fragment");
     let fake = FakeGithub::start();
     common::canonical_tokens(root.path(), &fake, true, true);
@@ -1102,17 +1066,14 @@ fn api_judges_the_route_on_the_path_a_fragment_leaves() {
     fake.add_repo("fixture-anon/app", RepoSpec::public());
     let w = World { root, fake };
 
-    // `/user#` is the Identity path `/user`: refused without `--as`, nothing sent.
     let identity = w.run(&["api", "/user#"]);
     identity.failed(2, "usage", Some("policy.identity_needs_as"));
     assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
 
-    // `-R` is held to the path's repository with its fragment cut.
     let other = w.run(&["api", "/repos/fixture-dev/app#", "-R", PULLED]);
     other.failed(2, "usage", None);
     assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
 
-    // An owner whose read chain is anonymous only still reads with no credential.
     let anon = w.run(&["api", "/repos/fixture-anon/app#x"]);
     assert_eq!(anon.exit, 0, "{}", anon.stderr);
     let seen = w.fake.seen();
@@ -1140,8 +1101,6 @@ fn api_honours_no_probe() {
 
 #[test]
 fn raw_get_refuses_a_fragment_before_any_request() {
-    // A library caller's `#` would be cut by the wire: the route would be judged for one path
-    // and another sent, so `Raw::get` refuses it.
     let w = World::new("cli-raw-fragment");
     let router = common::router(&common::canonical_config(w.root.path()), w.root.path());
     let gh = common::github(router, &w.fake);
@@ -1157,7 +1116,6 @@ fn raw_get_refuses_a_fragment_before_any_request() {
     };
     let error = gh.raw().get(&request).expect_err("a fragment");
     assert_eq!(error.kind, agh::Kind::Usage);
-    // A dot-segment, typed or encoded, in the path or in `all`'s owner-id lookup, likewise.
     for (path, all) in [
         ("/users/../repos", false),
         ("/users/%2e%2e/repos", true),
@@ -1188,9 +1146,7 @@ fn a_download_destination_outside_dir_or_not_a_file_is_usage_with_nothing_sent()
     let dir_text = dir.display().to_string();
     let escape = w.root.path().join("escaped").display().to_string();
     let cases: Vec<Vec<&str>> = vec![
-        // `--output` naming an existing directory.
         vec!["--asset", "x", "--output", &dir_text],
-        // Names `dir.join` would carry outside `--dir`.
         vec!["--asset", "../x", "--dir", &dir_text],
         vec!["--asset", "a/x", "--dir", &dir_text],
         vec!["--asset", &escape, "--dir", &dir_text],
@@ -1209,7 +1165,6 @@ fn a_download_destination_outside_dir_or_not_a_file_is_usage_with_nothing_sent()
         );
         assert!(w.fake.seen().is_empty(), "{case:?}: {:?}", w.fake.seen());
     }
-    // A directory where `--dir`'s file would go.
     std::fs::create_dir(dir.join("x")).expect("a directory where x would go");
     w.fake.clear_seen();
     let ran = w.run(&[

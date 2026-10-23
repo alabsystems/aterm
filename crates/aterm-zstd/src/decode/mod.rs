@@ -91,7 +91,8 @@ impl<R: BufRead> Decoder<R> {
         self
     }
 
-    /// Advances one frame header or block.
+    /// Advances one frame header or block. `Ok(false)` once the stream has
+    /// ended cleanly.
     fn step(&mut self) -> io::Result<bool> {
         match self.state {
             State::FrameStart => self.start_frame(),

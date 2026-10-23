@@ -853,7 +853,9 @@ pub(crate) mod imp {
         None
     }
 
-    /// `fstat` of an open descriptor: (dev, ino, allocated bytes, flags).
+    /// `fstat` of an open descriptor: (dev, ino, allocated bytes, flags). Every cast reads a
+    /// field through its `libc` alias (`dev_t`, `ino_t`, `blkcnt_t`), which clippy leaves alone
+    /// on every platform, so no cast lint is expected here.
     fn fstat_of(fd: &OwnedFd) -> Result<(u64, u64, u64, u32), Refusal> {
         // SAFETY: `stat` is integers: all-zero is a value.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };

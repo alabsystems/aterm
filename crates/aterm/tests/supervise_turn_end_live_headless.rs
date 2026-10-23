@@ -88,7 +88,8 @@ fn submit(inst: &Instance, sid: &str, line: &str) {
     );
 }
 
-/// `await match <re>` on the session: the server's latched watcher.
+/// `await match <re>` on the session: the server's latched watcher. `<re>`
+/// is one wire token (`.` for a space).
 fn await_match(inst: &Instance, sid: &str, re: &str) {
     if let Err(reply) = awaited(inst, sid, re) {
         panic!("`{re}` never reached the screen: {reply}");
@@ -672,7 +673,8 @@ impl Supervisor {
         Self::start_with(inst, sid, timing, no_answers())
     }
 
-    /// [`Self::start`] under `policy`.
+    /// [`Self::start`] under `policy`. Returns once the loop has LOOKED — its
+    /// journal holds the first point it read ([`Self::looked`]).
     fn start_with(
         inst: &Instance,
         sid: &str,
@@ -1263,7 +1265,10 @@ fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_ent
     );
 }
 
-/// A DRAFT LEFT AT THE WALL, LIVE.
+/// A DRAFT LEFT AT THE WALL, LIVE. A person typed into the composer before the
+/// limit hit and went away: at the reset and its grace the loop SUBMITS what
+/// stands there under the wall's rule (a bare Enter), and never types `keep
+/// going` over it.
 #[test]
 fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
     let inst = boot("j");

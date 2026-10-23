@@ -17,7 +17,10 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// The variant's canonical name — identical to its `Debug` rendering.
+    /// The variant's canonical name — identical to its `Debug` rendering. Used
+    /// by the hand-written `Debug`/`Display` impls so they can format through
+    /// [`std::fmt::Formatter::write_str`] (a single static-string write) rather
+    /// than the `write!`/`format_args!` machinery.
     #[inline]
     #[must_use]
     const fn name(self) -> &'static str {

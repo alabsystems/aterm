@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The whole cursor-family frame step, read as a host reads it: the knob
-//! law against what the frame draws, and the light ground's bodies.
+//! The whole cursor-family frame step, read as a host reads it.
 
 use super::*;
 use crate::cursor_glow::{KnobContext, TrailKnob};
@@ -113,10 +112,6 @@ impl Session {
     fn frame(&mut self, ms: u64, cur: (u16, u16), hash: &mut impl Hasher) {
         let now = self.t0 + std::time::Duration::from_millis(ms);
         self.fx.begin(true, true);
-        // As both hosts do every frame: the caret's row probed (blank, the
-        // script types no glyphs of its own) with its neighbours, so a light
-        // laid by the rows around the caret (a rail in the leading under it)
-        // is judged as a host would see it.
         let blank = vec![' '; geom().cols];
         self.fx.glow.observe_row(cur.0, cur.1, &blank, now);
         self.fx
@@ -254,8 +249,6 @@ fn the_knob_law_is_what_the_frame_reads() {
         let style = GlowSpelling::parse(raw).style.expect("a built-in style");
         for ground in [DARK, LIGHT] {
             for bar in [false, true] {
-                // A session is a function of its knobs: each distinct set runs
-                // once (a turn's "off" is often another turn's, or the base).
                 let mut scripted: Vec<(String, u64)> = Vec::new();
                 let mut session = |k: GlowKnobs| {
                     let key = format!("{k:?}");
@@ -299,8 +292,6 @@ fn the_knob_law_is_what_the_frame_reads() {
         }
     }
     assert!(wrong.is_empty(), "knob law vs frame:\n{}", wrong.join("\n"));
-    // Negative control: a knob the frame plainly reads is caught, so the
-    // harness is not blind (Lumen's colour on a dark block).
     let mut red = knobs();
     red.color = Some(0x00FF_2020);
     assert_ne!(
@@ -431,14 +422,12 @@ fn the_light_comet_carries_a_body_and_a_round_head() {
         comet >= 0.75 * beam,
         "the comet's body: {comet:.0} vs the beam's {beam:.0}"
     );
-    // At rest, 1.5 s on: the comet's round head.
     let rest = |raw: &str| {
         let mut s = typed(raw);
         let mut hash = aterm_hash::FxHasher::default();
         s.frame(60 * 6 + 1500, (2, 10), &mut hash);
         s
     };
-    // The ink's vertical extent in one pixel column.
     let column_height = |s: &Session, x: u16| -> u16 {
         let covering = || {
             s.fx.glow

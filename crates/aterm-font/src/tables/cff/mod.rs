@@ -125,11 +125,6 @@ fn conv_subroutine_index_impl(index: f32, bias: u16) -> Option<u32> {
     u32::try_from(index).ok()
 }
 
-// Adobe Technical Note #5176, Chapter 16 "Local / Global Subrs INDEXes"
-//
-// The `ensures` states the bias a caller adds; prover 321aaeda7 does not
-// lower the `cfg_attr` contract form, so it counts as unknown (see
-// `parser::i16_bound`).
 #[inline]
 #[cfg_attr(trust_verify, trust::ensures(result == 107 || result == 1131 || result == 32768))]
 pub fn calc_subroutine_bias(len: u32) -> u16 {

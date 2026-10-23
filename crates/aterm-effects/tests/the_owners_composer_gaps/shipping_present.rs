@@ -509,7 +509,11 @@ fn boxgrow_take(
     (s, c, row0)
 }
 
-/// F1: light follows its text through a box growth's same-row re-anchor.
+/// F1: light follows its text through a box growth's same-row re-anchor. A
+/// glued word typed into the last columns of the composer's last line wraps
+/// whole to the next row's indent and the box grows a row (the caret keeps
+/// its screen row): the relaid word is lit there, and no light stays on the
+/// blanks it left.
 #[test]
 fn a_glued_word_a_box_growth_relays_is_lit_where_it_lands() {
     let mut fails = Vec::new();
@@ -710,7 +714,11 @@ fn probe_f3_control_typed_space() {
     );
 }
 
-/// F2: light stands only over its own text, also while it leaves.
+/// F2: light stands only over its own text, also while it leaves. A mid-line
+/// insert whose word crosses the right edge relays to the next row's indent
+/// with no box growth (the tail already stands there): the cells it vacated
+/// at the old row's end are blank and keep no light past 200 ms, and the
+/// relaid word is lit.
 #[test]
 fn probe_f2_midline_wrap_vacated_light() {
     let mut fails = Vec::new();
@@ -793,7 +801,11 @@ fn probe_f2_midline_wrap_vacated_light() {
     );
 }
 
-/// F4a: the band rides with its text through a hidden repaint.
+/// F4a: the band rides with its text through a hidden repaint. The owner's
+/// long mid-line insert with the app silent for seconds, its catch-up
+/// relaying the tail and growing the box, drawn whole, torn at the hand's row
+/// or torn before the park: the band is not retired, no reappearance is
+/// declined as a hidden relocation, and the hand's text is lit.
 #[test]
 fn probe_f4a_synthetic_torn_catchup() {
     let insert = "(versus system wide) is running and what disk space is being used and especially all the subtrees and such. so that every processtree of the system stays visible at a glance";
@@ -903,7 +915,11 @@ fn probe_f4a_synthetic_torn_catchup() {
     );
 }
 
-/// F4b: a held park never swallows later moves.
+/// F4b: a held park never swallows later moves. F2's word crossing the right
+/// edge with the app silent from the key that fills the row while the hand
+/// types on; the catch-up relays the word to the next row (a cross-row move,
+/// every stamp stale, the presses unpaid) and later keys echo at once: every
+/// later move is judged, and the keys typed after the catch-up are lit.
 #[test]
 fn probe_f4b_park_custody() {
     let mut fails = Vec::new();
@@ -1023,7 +1039,12 @@ fn probe_f5_backspace_hold_retract_linger() {
     );
 }
 
-/// F5: an erased cell's light goes with its text, not its glyph.
+/// F5: an erased cell's light goes with its text, not its glyph. `…all the
+/// subtr` typed mid-line before the tail, the box growing at `t` and
+/// shrinking at the second Backspace, then Backspace held: a twin glyph of
+/// the tail that slides into an erased column neither keeps nor restores that
+/// cell's light, so no live cell stands right of the caret beside retracting
+/// ones.
 #[test]
 fn probe_f5_twin_slides_into_an_erased_cell() {
     let mut fails = Vec::new();

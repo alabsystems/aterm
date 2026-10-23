@@ -2,15 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! THE COMMAND: `aterm ai` (design §7–§9).
-//!
-//! * `aterm ai` — the doctor, read-only: one row per AI CLI and the health. Exit 0.
-//! * `aterm ai doctor [--read-only] [--json] [--on <host>,… | --fleet]` — looks, then on a
-//!   terminal a person is at signs in each CLI that needs it through the vendor's own flow,
-//!   one after another, and looks again. Exit 1 when a wanted CLI is definitely missing
-//!   its installation or login.
-//! * `aterm ai login <id>` — one CLI's sign-in.
-//! * `aterm ai review […]` and `aterm ai review --show <id>` — reviews across AIs.
-//! * `aterm ai fleet […]` — the fleet document: its status, a fetch, and the owner's signing.
 
 use std::ffi::OsString;
 use std::io::{self, Read as _, Write};
@@ -84,8 +75,8 @@ pub struct Env {
     pub stdin_tty: bool,
     /// This program.
     pub exe: Option<PathBuf>,
-    /// The nearest AI CLI among this process's ancestors, and the permission level its own
-    /// launch flags name; incomplete observations remain Unknown.
+    /// The nearest AI CLI among this process's ancestors, and the permission level its own launch
+    /// flags name; incomplete observations remain Unknown.
     pub asker: Asker,
 }
 
@@ -197,8 +188,7 @@ fn held_of(s: &Settings, ai_dir: Option<&Path>) -> Option<Held> {
     fleet::held_state(ai_dir?).filter(|h| h.of(url, key))
 }
 
-/// Fetches the fleet document from the URL `[ai] fleet` names: when due, or now with
-/// `force`. `None`: no URL is named.
+/// Fetches the fleet document from the URL `[ai] fleet` names: when due, or now with `force`.
 pub fn fleet_fetch(env: &Env, fetcher: &dyn Fetcher, force: bool) -> Option<Fetched> {
     let text = env.config.as_deref().and_then(|p| {
         crate::harness::accounts::read_bounded(p, config::CONFIG_MAX_BYTES)
@@ -703,7 +693,6 @@ fn doctor_here(
                 let _ = writeln!(out, "{}: not installed: {why}", row.connector.id);
                 continue;
             }
-            // The install laid the copy: read again, then sign in.
             let again = look(env);
             let (Some(r), Some(f)) = (
                 again
@@ -850,7 +839,6 @@ fn fleet_poll(
             cwd: None,
             budget: Duration::from_secs(30),
         });
-        // An answer over 64 KiB is no doctor's: it is not read at all.
         let states = ran
             .ok()
             .filter(|r| r.stdout.len() <= 64 * 1024)
@@ -970,13 +958,10 @@ fn doctor_away(
             return ExitCode::from(2);
         }
     };
-    // A poll reads every machine and signs in nowhere: asked for JSON, read-only, with no
-    // terminal, or under an agent. Otherwise each machine's own doctor runs on this terminal.
     if json || may_fix(env, read_only).is_err() {
         return fleet_poll(env, runner, &hosts, json, out, err);
     }
     let here = doctor_here(env, runner, false, false, out, err);
-    // A person at this terminal: each machine's own doctor, on this terminal, one deep.
     let mut code = here;
     for (host, aterm) in &hosts {
         let _ = writeln!(out, "\n══ {host} ══");
@@ -1232,8 +1217,6 @@ fn review_verb(
     } else {
         None
     };
-    // By default only the CLIs used here review; a CLI named with --with or --all is asked
-    // whatever its `use` (its row says why it cannot answer, if it cannot).
     let pool: Vec<&'static Connector> = match &asked {
         Some(ids) => ids
             .iter()
@@ -1480,7 +1463,6 @@ fn fleet_keygen(path: &Path, out: &mut dyn Write) -> Result<(), String> {
         }
     })?;
     file.write_all(format!("{text}\n").as_bytes())
-        // Durable: the person is told the key is saved and is to be kept.
         .and_then(|()| crate::durable::sync_all(&file))
         .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
     let _ = writeln!(
@@ -1506,11 +1488,8 @@ fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String>
     let sig = fleet::sign(&secret, &bytes)?;
     let public = fleet::public_of(&secret)?;
     let to = sig_path(doc);
-    // Ordered: a signature lost to a power loss is made again from the document and
-    // the key, and a stale one is refused by every verifier.
     crate::harness::upgrade_models::write_atomic_ordered(&to, &format!("{sig}\n"))
         .map_err(|e| crate::harness::one_line(&e.to_string(), 120))?;
-    // The signature is published beside the document: readable by the web server.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1702,8 +1681,6 @@ pub fn run(
             }
             let read_only = flag("--read-only");
             let json = flag("--json");
-            // The doctor fetches a fleet document from its URL when one is due; what the
-            // fetch came to shows in the look (`fleet:`, and a note when it failed).
             let _ = fleet_fetch(env, fetcher, false);
             if fleet || on.is_some() {
                 doctor_away(env, runner, on.as_deref(), read_only, json, out, err)

@@ -150,6 +150,8 @@ pub struct EditorWorkspace {
     pub(super) kill_ring_changed: bool,
 }
 
+/// The workspace aterm's native Editor view uses: the GUI keymap of the host
+/// platform. The terminal face builds its own with
 /// [`EditorWorkspace::with_keymap`] and [`Profile::Terminal`].
 impl Default for EditorWorkspace {
     fn default() -> Self {

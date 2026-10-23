@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Bundling Homebrew into atpkg with aterm (design §5, deliverable 1)
-//! and `Brewfile` handling over abrew state.
+//! Bundling Homebrew into atpkg and `Brewfile` handling over abrew state.
 
 use std::path::Path;
 
@@ -9,16 +8,12 @@ use super::fetch;
 use super::install::InstallError;
 use super::prefix::{Kind, Prefix, json_escape, publish_directory};
 
-/// The pinned Homebrew/brew release abrew bundles by default, and the
-/// SHA-256 of its `archive/refs/tags/<tag>.tar.gz`. A `--version`
-/// override must supply its own `--sha256` (fail-closed, design §5).
-/// Bump both together; `abrew bundle status` shows what stands.
+/// The pinned Homebrew/brew release abrew bundles by default.
 pub const HOMEBREW_BUNDLE_VERSION: &str = "4.5.8";
 pub const HOMEBREW_BUNDLE_SHA256: &str =
     "6a5a18e6c5bea214983ec102dea3126cbc2d162540f8d93387fa9730d1f03be3";
 
-/// The ownership receipt moves with the bundle, so publication cannot leave a
-/// new executable paired with an old external record.
+/// The ownership receipt moves with the bundle.
 const BUNDLE_RECEIPT: &str = ".abrew-bundle.json";
 
 fn bundle_record(directory: &Path) -> Option<String> {
@@ -71,8 +66,7 @@ fn valid_sha256(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Lay verified Homebrew with its receipt in a private stage, then publish the
-/// directory. Forced replacement exchanges two owned trees atomically.
+/// Lay verified Homebrew with its receipt in a private stage, then publish the directory.
 pub fn install_bundle(
     prefix: &Prefix,
     version: Option<&str>,
@@ -176,9 +170,7 @@ pub fn install_bundle(
     Ok(())
 }
 
-/// The bundled brew abrew may execute: only a tree carrying a valid
-/// abrew bundle receipt with a runnable `bin/brew`. A hand-planted
-/// executable without the receipt is never the fallback.
+/// The bundled brew abrew may execute.
 pub(super) fn bundled_brew(prefix: &Prefix) -> Option<std::path::PathBuf> {
     let directory = prefix.homebrew_bundle();
     bundle_record(&directory)?;
@@ -188,7 +180,7 @@ pub(super) fn bundled_brew(prefix: &Prefix) -> Option<std::path::PathBuf> {
     Some(directory.join("bin/brew"))
 }
 
-/// `abrew bundle status`. Unknown legacy/foreign trees are reported separately.
+/// `abrew bundle status`.
 pub fn bundle_status(prefix: &Prefix) {
     let directory = prefix.homebrew_bundle();
     if let Some(record) = bundle_record(&directory) {
@@ -229,7 +221,7 @@ pub fn bundle_remove(prefix: &Prefix) -> Result<(), InstallError> {
     Ok(())
 }
 
-/// `abrew bundle dump`: a Brewfile describing abrew's installed set.
+/// `abrew bundle dump`.
 #[must_use]
 pub fn brewfile_dump(prefix: &Prefix) -> String {
     let mut out = String::new();
@@ -238,17 +230,9 @@ pub fn brewfile_dump(prefix: &Prefix) -> String {
     }
     for i in prefix.installed(Kind::Formula) {
         let keg = prefix.keg(&i.name, &i.version);
-        // Like brew, dump only what was installed on request:
-        // dependencies ride along implicitly on reinstall, and
-        // dumping them would promote them to on-request (changing
-        // leaves/autoremove semantics on round-trip). A receipt
-        // that does not say "false" counts as requested — losing a
-        // package from the dump is worse than keeping one extra.
         if super::prefix::receipt_word(&keg, "installed_on_request").as_deref() == Some("false") {
             continue;
         }
-        // Tap formulae keep their qualified identity so the
-        // round-trip reinstalls from the same tap, not core.
         let shown = match super::prefix::receipt_word(&keg, "full_name") {
             Some(full) if full.contains('/') => full,
             _ => i.name.clone(),
@@ -269,8 +253,7 @@ pub enum BrewfileEntry {
     Cask(String),
 }
 
-/// Parse a Brewfile's `tap`/`brew`/`cask "name"` lines (the rest —
-/// `mas`, options hashes, expressions — requires whole-command passthrough).
+/// Parse a Brewfile's `tap`/`brew`/`cask "name"` lines.
 #[must_use]
 pub fn parse_brewfile(text: &str) -> (Vec<BrewfileEntry>, Vec<String>) {
     let mut entries = Vec::new();
@@ -351,7 +334,6 @@ mod tests {
                 ("full_name", "someone/tap/taptool"),
             ],
         );
-        // A legacy receipt without the field still dumps.
         mk("legacy", "0.9", &[]);
         let text = brewfile_dump(&p);
         assert!(text.contains("brew \"wget\"\n"), "{text}");

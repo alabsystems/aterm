@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The snapshot install and its units, in a scratch home with a fake build and a recording
-//! service manager (nothing touches launchd, systemd or a machine key), plus the snapshot
-//! self-check `lane run` makes against its own executable.
+//! Snapshot install, service unit, and `lane run` self-check tests in a scratch home.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,11 +18,9 @@ use atpkg_publish::triple::Os;
 
 use super::fixture::{Fx, git};
 
-/// Writes a "binary" whose bytes name the build.
 #[derive(Default)]
 struct FakeBuild {
     n: Mutex<u32>,
-    /// A file of the checkout this build edits while it runs (another session at work).
     edit: Option<&'static str>,
 }
 
@@ -45,7 +41,6 @@ impl SnapshotBuilder for FakeBuild {
     }
 }
 
-/// Records what it was asked; lints for real where the linter exists.
 #[derive(Clone, Default)]
 struct Recorder(Arc<Mutex<Vec<String>>>);
 
@@ -95,7 +90,6 @@ struct Box_ {
     machine: Machine,
 }
 
-/// A rostered scratch machine whose checkout is a clean git repo with build inputs.
 fn machine(label: &str, os: Os) -> Box_ {
     let mut fx = Fx::new(label);
     let repo = fx.path("checkout");
@@ -148,13 +142,11 @@ fn the_snapshot_self_check_pins_a_run_to_the_bytes_its_unit_names() {
         self_check(exe, Some(&hex.to_uppercase()), false, state).expect("case-blind"),
         Some(hex.clone())
     );
-    // A build of one's own, run with its own hash, is not a snapshot.
     let own = b.fx.path("target/release/atpkg-publish");
     std::fs::create_dir_all(own.parent().expect("parent")).expect("mkdir");
     std::fs::copy(exe, &own).expect("copy");
     let e = self_check(&own, Some(&hex), false, state).expect_err("not a snapshot");
     assert!(e.to_string().contains("is not a snapshot"), "{e}");
-    // A snapshot whose record names other bytes.
     let record = done.snapshot.join("INSTALLED-FROM");
     let text = std::fs::read_to_string(&record).expect("record");
     std::fs::write(&record, text.replace(&hex, &"0".repeat(64))).expect("rewrite");
@@ -223,7 +215,6 @@ fn the_launchd_agent_runs_the_snapshot_with_its_hash() {
     assert!(!t.contains("/tools/"), "the agent never runs a checkout");
 }
 
-/// plutil lints property lists on macOS only.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_rendered_agent_lints_with_plutil() {
@@ -273,7 +264,6 @@ fn the_systemd_units_run_the_snapshot_hourly_with_their_words_escaped() {
     );
 }
 
-/// systemd-analyze verifies units on Linux only.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_rendered_units_verify_with_systemd_analyze() {
@@ -294,8 +284,6 @@ fn the_rendered_units_verify_with_systemd_analyze() {
             p
         })
         .collect();
-    // The lane's units are systemd's: a Linux host without its verifier fails here rather
-    // than passing a lint that never ran.
     assert_eq!(
         install::lint_systemd(&paths).expect("verifies"),
         Lint::Passed
@@ -311,7 +299,6 @@ fn install_refuses_the_wrong_os_and_a_box_with_no_machine_identity() {
             .to_string()
             .contains("the alab lane runs on macOS")
     );
-    // The key without its record: the first signing run would refuse, so install does.
     std::fs::remove_file(&b.fx.ctx.identity.record).expect("rm record");
     let (r, _) = install(&b, LaneKind::Linux, InstallFlags::default());
     let e = r.expect_err("no record");
@@ -387,7 +374,6 @@ fn an_edit_that_lands_during_the_build_is_never_snapshotted() {
         !b.fx.ctx.state_dir.join("lane").exists(),
         "nothing snapshotted"
     );
-    // A tree dirty on purpose is held to the bytes it had when the install read it.
     let (r, _) = install(
         &b,
         LaneKind::Alab,

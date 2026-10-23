@@ -445,7 +445,7 @@ fn enclosing_fn(source: &str, at: usize) -> Option<String> {
 }
 
 /// Is `hay[at..at + needle.len()]` a whole-word occurrence of `needle`?
-fn word_at(hay: &str, at: usize, needle: &str) -> bool {
+const fn word_at(hay: &str, at: usize, needle: &str) -> bool {
     let b = hay.as_bytes();
     let before_ok = at == 0 || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
     let end = at + needle.len();

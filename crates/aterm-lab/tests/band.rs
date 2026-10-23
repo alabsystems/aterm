@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests that `aterm-lab band-launch` runs in its own app coalition and removes the job.
+//! Tests that an `aterm-lab band-launch` job runs its program as an app in its own coalition and
+//! is removed once that program ends.
 
 #![cfg(target_os = "macos")]
 

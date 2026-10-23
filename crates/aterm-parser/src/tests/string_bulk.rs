@@ -2,23 +2,11 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! String-state bulk paths (OSC/DCS): the fast path's bulk copies agree with
-//! the per-byte state machine.
+//! String-state bulk paths (OSC/DCS): bulk copies agree with the per-byte state machine.
 
 use super::super::*;
 use super::RecordingSink;
 
-/// In `OscString` the fast path appends `osc_bulk_copy_len(len, n)` of the `n`
-/// data bytes before the first control byte; the per-byte path's `OscPut`
-/// pushes data byte `i` onto a buffer of `L(i) = min(len + i, MAX)` bytes only
-/// while `osc_put_keeps(L(i))`. At every breakpoint of the two piecewise-linear
-/// functions — `n` and `i` at 0, 1 and next to `n - 1` and `room = MAX - len`
-/// — byte `i` is pushed exactly when the bulk copy keeps it, `OscPut` takes
-/// `L(i)` to `L(i + 1)`, both paths end the run at the same length, and that
-/// length is within the cap. Placed relative to `room`, those points are every
-/// branch either function has at a given `len`, so `len` runs over both ends
-/// of the buffer in full and a prime stride between (every `len` would take
-/// seconds and reach no other branch).
 #[test]
 fn osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint() {
     use crate::dispatch::{osc_bulk_copy_len, osc_put_keeps};
@@ -65,13 +53,6 @@ fn osc_bulk_copy_agrees_with_per_byte_puts_at_every_breakpoint() {
     }
 }
 
-/// The OSC payload fed whole (the bulk path) and one byte per read deliver the
-/// same payload below the cap,
-/// at exactly the cap (the `copy_len < n` branch: the buffer fills before the
-/// C0) and well over it, where both truncate to `MAX_OSC_DATA` bytes of
-/// `0;` + payload. The byte-per-read side reads one byte at a time from 4 KiB
-/// below the cap on; the bytes before that only append, so it takes them in one
-/// read (one byte per read across 8 MiB took seconds).
 #[test]
 fn osc_payload_cap_parity() {
     for (payload_len, delivered) in [
@@ -106,20 +87,8 @@ fn osc_payload_cap_parity() {
     }
 }
 
-// --- DCS passthrough bulk fast-path vs. byte-by-byte equivalence for 0x7F ---
-//
-// In DcsPassthrough the transition table maps 0x7F (DEL) to ActionType::Ignore
-// (stays in the state, emits NOTHING). The bulk fast path in dispatch.rs must
-// therefore stop bulk-copying at 0x7F (via find_dcs_passthrough_boundary) and
-// let the byte-by-byte path drop it — otherwise a bulk read would leak DEL into
-// the DCS sink while a one-byte read strips it. These tests pin that parity so
-// the fast path can never re-diverge. NOTE: this is DCS-specific; APC legitimately
-// emits 0x7F as ApcPut data and is intentionally unaffected.
-
 #[test]
 fn dcs_passthrough_del_parity_whole_vs_per_byte() {
-    // The byte-by-byte path Ignores 0x7F; the bulk fast path must produce the
-    // identical DCS output. BEL is genuine data.
     let cases: &[(&[u8], &[u8])] = &[
         (&[0x1B, b'P', b'q', b'A', 0x7F, b'B', 0x1B, b'\\'], b"AB"),
         (&[0x1B, b'P', b'q', 0x7F, b'A', 0x1B, b'\\'], b"A"),

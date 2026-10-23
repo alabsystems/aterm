@@ -502,7 +502,8 @@ impl Probe {
             .collect()
     }
 
-    /// What the resize rows after `base` show, each row and pair printed.
+    /// What the resize rows after `base` show, each row and pair printed. A rise
+    /// nothing has taken back yet is waited for, up to [`HANG`].
     fn measured_since(&self, base: u64) -> Result<Measured, Stopped> {
         let deadline = Instant::now() + HANG;
         let mut rows = self.rows_since(base);

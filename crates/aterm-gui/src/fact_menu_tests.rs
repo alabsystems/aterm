@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The facts' menus' rows, pure (`crate::fact_menu`): each fact's value, the
-//! rows that act on it, its Hide, and a Show for every fact hidden; and the
-//! usage's Traffic card, its bands, axis and ground. The menus on the glass
-//! are `claude_lights::fact_menu_glass_tests`'.
+//! Unit tests for `crate::fact_menu` rows and the traffic card.
 
 use std::path::PathBuf;
 
@@ -155,14 +152,12 @@ fn each_fact_menu_offers_its_rows_and_its_hide() {
             "note \u{26c1}  2 worktrees \u{b7} worktrees 512.0 MiB \u{b7} build/temp 2.0 GiB \u{b7} 120.0 GiB free",
         ]
     );
-    // Nothing else types: every other row's act is no `Type`.
     for fact in [Fact::Path, Fact::Branch, Fact::Usage] {
         assert!(
             !shown(&rows(fact, &on)).iter().any(|r| r.contains("/type/")),
             "{fact:?}"
         );
     }
-    // CONTROL: no side.
     let off = menu_facts(FactMask::default(), false);
     assert_eq!(
         shown(&rows(Fact::Path, &off))[2..4],
@@ -214,9 +209,7 @@ fn the_typed_rows_say_what_they_type_and_wait_under_a_note() {
     let effort = shown(&rows(Fact::Effort, &typing));
     assert!(effort[2].ends_with("[fact-menu/effort/type/key-on] false"));
     assert!(effort[3].ends_with("[fact-menu/effort/type/effort] false"));
-    // The Hide row is no typed row: it stays on.
     assert!(effort[5].ends_with("[fact-menu/effort/hide/effort] true"));
-    // CONTROL: no key row.
     let unkeyed = FactMenuFacts {
         key_row: None,
         ..menu_facts(FactMask::default(), true)
@@ -285,7 +278,6 @@ fn texts(rows: &[MenuRow]) -> Vec<String> {
 /// is `No traffic yet` and no graph.
 #[test]
 fn the_traffic_card_paints_two_bands_and_its_axis() {
-    // 30 content cells: a 6-cell label and 24 columns of 10 s each.
     let rows = traffic_rows(&traffic(), T0 + 240, Some(0), 30);
     let text = texts(&rows);
     assert_eq!(text.len(), 7, "{text:#?}");
@@ -307,7 +299,6 @@ fn the_traffic_card_paints_two_bands_and_its_axis() {
             "note peak \u{2191}667 \u{b7} \u{2193}7 per 10s",
         ]
     );
-    // Each band in its own ink, the axis in the secondary.
     let ink = |row: usize| match &rows[row] {
         MenuRow::Plot(cells) => cells[10].ink,
         _ => unreachable!("a graph row"),
@@ -316,11 +307,9 @@ fn the_traffic_card_paints_two_bands_and_its_axis() {
         (ink(0), ink(2), ink(4)),
         (PlotInk::In, PlotInk::Out, PlotInk::Axis)
     );
-    // The minute with no traffic is blank in both bands.
     for (row, line) in text.iter().enumerate().take(4) {
         assert_eq!(line.chars().nth(6 + 7), Some(' '), "row {row}");
     }
-    // A pending row the graph could not place is said.
     let unread = TrafficView {
         unread: 3,
         ..traffic()
@@ -329,7 +318,6 @@ fn the_traffic_card_paints_two_bands_and_its_axis() {
         texts(&traffic_rows(&unread, T0 + 240, Some(0), 30)).last(),
         Some(&"note +3 unread not graphed".to_string())
     );
-    // CONTROL: no traffic.
     assert_eq!(
         texts(&traffic_rows(&TrafficView::default(), T0, Some(0), 30)),
         ["note No traffic yet"]
@@ -352,8 +340,6 @@ fn a_band_peak_fills_both_rows_and_a_trickle_is_at_least_one_eighth() {
     assert_eq!(band_glyphs(4), (' ', '\u{2584}'));
     assert_eq!(band_level(0, 667), 0);
     assert_eq!(band_glyphs(0), (' ', ' '));
-    // On the card: the peak minute's columns are full in both rows of the in
-    // band, the first minute's a quarter of the way up.
     let text = texts(&traffic_rows(&traffic(), T0 + 240, Some(0), 30));
     let at = |row: usize, col: usize| text[row].chars().nth(6 + col);
     assert_eq!((at(0, 12), at(1, 12)), (Some('\u{2588}'), Some('\u{2588}')));
@@ -377,7 +363,6 @@ fn busy_columns_take_the_shaded_ground() {
     card.extend(traffic_rows(&traffic(), T0 + 240, Some(0), 30));
     let rect = place(&card, (20, 0), (0..20, 0..80), (80, 21), 0).expect("a card");
     let painted = paint(rect, &card, None, theme);
-    // The in band's bottom row: the card's second row, under the header.
     let row = &painted[3];
     let text = row.iter().map(|cell| cell.ch).collect::<String>();
     let lead = text
@@ -391,7 +376,6 @@ fn busy_columns_take_the_shaded_ground() {
         crate::chrome_band::mix3(c.card_bg, c.band.accent, 0.10)
     );
     assert_eq!(busy.fg, c.band.accent);
-    // CONTROL: the first minute's column was idle.
     assert_eq!(row[lead].bg, c.card_bg);
 }
 
@@ -454,8 +438,6 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
         ]
     );
 
-    // The click carries the displayed identity across a roster reload. It
-    // must never clear another account's walls because file order changed.
     use aterm_agent::harness::accounts;
     let chosen = menu
         .iter()
@@ -479,7 +461,6 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
             })
             .collect(),
     };
-    // Enrolled facts only: this aggregate never examines login directories.
     let enrolled = labels.iter().map(|label| (*label).to_string()).collect();
     const NOW: i64 = 1_790_000_000;
     let mut before = accounts::State::default();

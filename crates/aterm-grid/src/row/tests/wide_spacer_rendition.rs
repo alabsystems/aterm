@@ -1,20 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
-//
-// A wide char's continuation spacer carries its lead's rendition plus only its own role bit
-// (`CellFlags::wide_continuation_of`), so SGR 7 and ruled decorations span both columns.
 
 use super::super::*;
 use super::make_row;
 use crate::{CellFlags, PackedColor};
 
-/// Every visual attribute bit a spacer inherits.
 const EVERY_RENDITION: CellFlags = CellFlags::from_bits(CellFlags::SPACER_RENDITION_MASK);
 
 #[test]
 fn wide_continuation_of_keeps_every_rendition_and_only_its_own_role_bit() {
-    // A lead carrying every rendition bit plus both structural bits.
     let lead = EVERY_RENDITION
         .union(CellFlags::WIDE)
         .union(CellFlags::COMPLEX);
@@ -45,8 +40,6 @@ fn wide_continuation_of_keeps_every_rendition_and_only_its_own_role_bit() {
 
 #[test]
 fn wide_continuation_of_a_bare_lead_is_the_bare_role_bit() {
-    // Bit 10 aliases PROTECTED: a spacer must never gain DECSCA protection just
-    // because its lead had it, and a plain lead must not gain anything at all.
     assert_eq!(
         CellFlags::empty().wide_continuation_of(),
         CellFlags::WIDE_CONTINUATION
@@ -58,7 +51,6 @@ fn wide_continuation_of_a_bare_lead_is_the_bare_role_bit() {
     );
 }
 
-/// The primary CJK path (`write_wide_char` -> `write_wide_char_packed`).
 #[test]
 fn write_wide_char_inverse_reaches_the_spacer() {
     let (_pages, mut row) = make_row(10);
@@ -87,8 +79,6 @@ fn write_wide_char_inverse_reaches_the_spacer() {
     );
 }
 
-/// The batch-run twin. A divergence here would highlight a wide run correctly
-/// only when the writer happened to take the slow path.
 #[test]
 fn write_wide_char_no_fixup_matches_the_checked_path() {
     let (_pages, mut checked) = make_row(10);

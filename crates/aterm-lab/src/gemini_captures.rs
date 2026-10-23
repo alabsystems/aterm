@@ -68,7 +68,7 @@ const AGY: Screens = Screens {
 };
 
 /// The `tool` scripts of the agent's four boxes: shell, write, edit, question.
-fn scripts(agent: Agent) -> [&'static str; 4] {
+const fn scripts(agent: Agent) -> [&'static str; 4] {
     match agent {
         Agent::Gemini => [
             r#"{"name":"run_shell_command","input":{"command":"touch lab-probe.txt","description":"Make an empty lab-probe.txt in the project."}}"#,
@@ -89,14 +89,14 @@ fn scripts(agent: Agent) -> [&'static str; 4] {
 const SURVEY: &str = "How's the CLI experience so far";
 
 impl Cap {
-    fn screens(&self) -> &'static Screens {
+    const fn screens(&self) -> &'static Screens {
         match self.agent {
             Agent::Gemini => &GEMINI,
             Agent::Agy => &AGY,
         }
     }
 
-    fn name(&self) -> &'static str {
+    const fn name(&self) -> &'static str {
         self.agent.name()
     }
 

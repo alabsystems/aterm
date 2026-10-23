@@ -76,7 +76,8 @@ pub const SCREEN_SHARING_LABEL: &str = "com.apple.screensharing";
 /// TCC client identifier for the Screen Sharing agent.
 pub const SCREEN_SHARING_AGENT: &str = "com.apple.screensharing.agent";
 
-/// How long one read may take.
+/// How long one read may take. A probe never waits for a person; this only catches a hung
+/// tool.
 const READ_BUDGET: Duration = Duration::from_secs(20);
 
 /// Known application short names and their macOS bundle identifiers.

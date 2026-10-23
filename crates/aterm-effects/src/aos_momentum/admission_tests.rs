@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Admission in attached mode: every input outside the momentum profile is refused before
-//! the engine sees it, as a total step (the observation names the exact refusal, the state
-//! and both streams are untouched) that is still recorded, so a replay refuses it
-//! identically. Unattached hosts admit nothing (`host_tests` feeds them the same inputs).
-//! A live time that went back, or predates the epoch, is not refused but recorded at the
-//! task's logical time (`clock_tests`).
+//! Attached-mode admission and refusal tests for momentum glow.
 
 use std::time::Duration;
 
@@ -27,7 +22,7 @@ fn digest(host: &MomentumHost) -> aterm_aos::Digest {
 /// How a case sends its input to the host, at the instant the burst left off.
 type Sender = Box<dyn Fn(&mut MomentumHost, Instant)>;
 
-/// One refused input: what it is, how the host sends it, and the exact refusal.
+/// One refused input.
 struct Case {
     name: &'static str,
     send: Sender,
@@ -95,9 +90,6 @@ fn every_refusal_in_attached_mode_is_a_total_step_that_replays_identically() {
             }),
             refusal: AdmitRefusal::Tau(61.0f32.to_bits()),
         },
-        // A live call stamped past the horizon ends the attach instead (`host_tests`); a key
-        // queued during a pause reaches the step with its own time when the queue is
-        // delivered, as this one does.
         Case {
             name: "a key past the horizon, delivered from the queue",
             send: Box::new(move |h, _| {
@@ -171,7 +163,6 @@ fn every_refusal_in_attached_mode_is_a_total_step_that_replays_identically() {
         );
         expected.push((cursor, case.name, case.refusal));
     }
-    // The glow is still the one the burst left: the next frame draws it.
     assert!(matches!(
         draw(&mut host, Some(cell), last + ms(1), geom(), &c, 0),
         super::test_fixtures::Seen::Frame { frame, .. } if frame.hot

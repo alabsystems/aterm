@@ -371,7 +371,10 @@ impl App {
         Ok(())
     }
 
-    /// [`Self::open_overview`] on `wid`, which comes forward with it.
+    /// [`Self::open_overview`] on `wid`, which comes forward with it. Where
+    /// this aterm's fabric is configured, the card lists what the last read
+    /// of the fabric's log said ("On the fabric") and kicks the
+    /// next read ([`Self::kick_fabric_read`]), whose landing re-renders it.
     fn open_overview_on(&mut self, wid: WindowId) -> Result<(), String> {
         let (groups, manages) = self.overview_parts();
         self.agents.overview_read_at = Some(std::time::Instant::now());
@@ -553,7 +556,9 @@ impl App {
         }
     }
 
-    /// One key's act on the open card: `t`, `r` or ⌫.
+    /// One key's act on the open card: `t`, `r` or ⌫. A ⌫ carries whose
+    /// hand pressed it ([`Self::person_gesture_refused`]), so a confirm one
+    /// hand armed is resolved by no other's.
     fn overview_key(&mut self, wid: WindowId, key: OverviewKey) {
         let controller = self.person_gesture_refused();
         let act = self
@@ -1317,7 +1322,12 @@ mod tests {
         }
     }
 
-    /// A WORKER WITH ONLY ITS SHELL IN FRONT IS NOT "STOPPED".
+    /// A WORKER WITH ONLY ITS SHELL IN FRONT IS NOT "STOPPED". Its SIGTERM
+    /// would go to the interactive shell, which ignores it while `killpg`
+    /// reports it sent, so the stop would say done and end nothing: the
+    /// confirmed ⌫⌫ and the tab menu's Stop are refused before any signal
+    /// (no sheet is asked), and the person's failed gesture is one row on
+    /// the glass with the act that still ends it.
     #[test]
     fn a_worker_with_only_its_shell_in_front_is_refused() {
         use crate::app_overview::StopRefused;

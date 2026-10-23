@@ -1105,7 +1105,8 @@ fn a_damaged_tail_stops_at_its_first_fault_and_counts_the_rest() {
     }
 }
 
-/// Header words are absolute counters, not wrapping ring offsets.
+/// Header words are absolute counters, not wrapping ring offsets. Both the skipped
+/// tail gap and history wrap must refuse an unrepresentable next boundary.
 #[test]
 fn absolute_ring_counters_refuse_wraparound_without_reading_it() {
     let geometry = Geometry::custom(64 * 1024, 256, 2048).expect("small region");

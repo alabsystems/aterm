@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! RandR 1.5's requests the window system's monitor handling sends: the
-//! version, notification, the screen's resources (CRTCs, outputs, modes), an
-//! output's and a CRTC's state, the primary output, and a CRTC's
-//! configuration (fullscreen video modes). Written against randrproto's
-//! protocol description (xcbproto `randr.xml`); bytes held to
-//! x11rb-protocol 0.13.2's (`tests/recorded/`).
+//! RandR 1.5 requests and replies for X11 monitor handling.
 
 use super::{ParseError, Reader, Reply, Request, Timestamp, Void, Window, Writer, reply_head};
 
@@ -54,7 +49,7 @@ pub fn select_input(major: u8, window: Window, enable: u16) -> Request<Void> {
         .finish()
 }
 
-/// GetScreenResources (8): probes the outputs, which may be slow.
+/// GetScreenResources (8).
 pub fn get_screen_resources(major: u8, window: Window) -> Request<ScreenResourcesReply> {
     Writer::new(major, 8).u32(window).finish()
 }
@@ -114,7 +109,7 @@ pub fn set_crtc_config(
     w.finish()
 }
 
-/// GetScreenResourcesCurrent (25): the resources as last probed, at once.
+/// GetScreenResourcesCurrent (25).
 pub fn get_screen_resources_current(major: u8, window: Window) -> Request<ScreenResourcesReply> {
     Writer::new(major, 25).u32(window).finish()
 }
@@ -167,7 +162,7 @@ pub struct ScreenResourcesReply {
     pub crtcs: Vec<Crtc>,
     pub outputs: Vec<Output>,
     pub modes: Vec<ModeInfo>,
-    /// The modes' names, back to back; each mode's `name_len` bytes in order.
+    /// The modes' names, back to back.
     pub names: Vec<u8>,
 }
 

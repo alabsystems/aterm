@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::DeadlineOwner;
 
-/// Detection threshold AND clamp distance for the stale-arm heal.
+/// Detection threshold AND clamp distance for the stale-arm heal. At the
+/// observation-gate scale (the status classifier's 250 ms `min_interval`) on
+/// purpose: a healed spin degrades to <= 4 Hz, and no legitimate late arm —
+/// a busy turn runs tens of milliseconds, not hundreds — ever trips it.
 const STALE_ARM_HEAL_FLOOR_NS: u64 = 250_000_000;
 const STALE_ARM_HEAL_FLOOR: Duration = Duration::from_nanos(STALE_ARM_HEAL_FLOOR_NS);
 
@@ -15,7 +18,9 @@ const PAST_ARM_WINDOW: u32 = 32;
 /// `> 90%` of the 32-arm window: `ceil(0.9 * 32) + ...` — the smallest count
 /// strictly greater than 28.8 past arms.
 const PAST_ARM_WINDOW_TRIGGER: u32 = 29;
-/// One 60 Hz display frame: the clamp cadence for a windowed-streak spin.
+/// One 60 Hz display frame: the clamp cadence for a windowed-streak spin. The
+/// producer's own work still runs (its deadline stays armed and near), but at
+/// frame rate rather than event-loop rate.
 const PAST_ARM_STREAK_CLAMP_NS: u64 = 16_666_667;
 const PAST_ARM_STREAK_CLAMP: Duration = Duration::from_nanos(PAST_ARM_STREAK_CLAMP_NS);
 const PAST_ARM_BITS_MASK: u64 = 0xFFFF_FFFF;
@@ -44,7 +49,8 @@ pub(crate) struct DeadlineHealer {
     streak: DeadlineOwner,
     /// Whether this streak's episode has logged its line.
     episode_logged: bool,
-    /// Per owner, by `index()`.
+    /// Per owner, by `index()`. Low 32 bits: the last-32-arms past bits
+    /// (bit 0 = newest; 1 = armed already past).
     windows: [u64; DeadlineOwner::COUNT],
 }
 
@@ -157,7 +163,11 @@ mod tests {
         }
     }
 
-    /// HEAL-AT-THE-FOLD (busy-rearm audit, item 3).
+    /// HEAL-AT-THE-FOLD (busy-rearm audit, item 3). One late arm is legal — a
+    /// busy turn computes its deadline after real work — but the SAME owner
+    /// arming more than the floor in the past on CONSECUTIVE turns is a
+    /// self-rearming `WaitUntil(past)` spin, and the fold must clamp it to
+    /// `now + floor` and say so, so the loop survives the whole class visibly.
     #[test]
     fn consecutive_same_owner_stale_arms_heal_to_the_floor() {
         let mut healer = DeadlineHealer::default();

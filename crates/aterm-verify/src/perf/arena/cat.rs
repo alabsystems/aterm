@@ -35,7 +35,7 @@ pub(crate) enum Corpus {
 }
 
 impl Corpus {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Corpus::Ascii => "ascii",
             Corpus::Unicode => "unicode",
@@ -43,7 +43,7 @@ impl Corpus {
     }
 
     /// The repeated unit; a corpus is whole units up to the target size.
-    fn unit(self) -> &'static str {
+    const fn unit(self) -> &'static str {
         match self {
             Corpus::Ascii => "the quick brown fox jumps over the lazy dog 0123456789\r\n",
             Corpus::Unicode => {
@@ -105,7 +105,7 @@ pub(crate) enum Term {
 }
 
 impl Term {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Term::Aterm => "aterm",
             Term::Ghostty => "ghostty",
@@ -115,7 +115,7 @@ impl Term {
 
 /// Odd trials aterm first, even trials ghostty first (rule zero §2: never
 /// all-of-A then all-of-B).
-pub(crate) fn order(trial: u32) -> [Term; 2] {
+pub(crate) const fn order(trial: u32) -> [Term; 2] {
     if trial % 2 == 1 {
         [Term::Aterm, Term::Ghostty]
     } else {

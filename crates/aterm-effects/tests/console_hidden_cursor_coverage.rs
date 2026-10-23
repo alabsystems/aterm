@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Hidden cursor custody must retain a freshly observed resident home even
-//! when the pane exceeds the bounded world map.
+//! Hidden cursor custody retention tests when panes exceed the bounded world map.
 use aterm_core::terminal::Terminal;
 use aterm_effects::kitty_pet::{PetBrain, PetFrame, PetSense};
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
@@ -28,9 +27,6 @@ fn tick_with_surface(
     *now += Duration::from_millis(16);
     let mut input = term.cell_frame(usize::from(rows), usize::from(cols));
     if incoherent {
-        // A snapshot extracted before a scroll the facts already saw: the
-        // observation refuses it. (A sub-row scroll offset is coherent — the
-        // renderer translates the pet's sprite with the grid band.)
         input.base_y += 1;
     }
     let facts = PetWorldFacts::read(term, 7);
@@ -74,7 +70,6 @@ fn check_hidden(rows: u16, cols: u16, caret: (u16, u16)) {
         (hidden.col - shown.col).abs() < 1.0 && (hidden.row - shown.row).abs() < 1.0,
         "{rows}x{cols}: hiding the caret must hold its existing home"
     );
-    // Losing one observation must not lose the remembered sampling center.
     let unknown = tick_with_surface(&mut term, &mut brain, &mut now, rows, cols, true);
     assert_eq!(
         unknown.alpha, hidden.alpha,
@@ -86,8 +81,6 @@ fn check_hidden(rows: u16, cols: u16, caret: (u16, u16)) {
     assert!((recovered.col - hidden.col).abs() < 0.01 && (recovered.row - hidden.row).abs() < 0.01);
     assert_eq!(brain.console_input_seq(), 0);
 
-    // The hint re-samples current cells; it cannot preserve old permission
-    // after the user selects the entire surface.
     use aterm_core::selection::{SelectionSide, SelectionType};
     term.text_selection_mut()
         .start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
@@ -96,8 +89,6 @@ fn check_hidden(rows: u16, cols: u16, caret: (u16, u16)) {
     assert_eq!(tick(&mut term, &mut brain, &mut now, rows, cols).alpha, 0);
 }
 
-/// A pane inside the bounded world map (the control), wider, taller, and
-/// both.
 #[test]
 fn a_hidden_caret_keeps_the_resident_home_at_every_pane_size() {
     for (rows, cols, caret) in [

@@ -43,8 +43,6 @@ fn keep_settings_trial(
     view: crate::tab_model::ViewId,
     action: &str,
 ) {
-    // Hold the actual config queue at its worker boundary. The real reducer
-    // and host enqueue path still run; no worker or owner file is involved.
     app.native_config_inflight = true;
     let effects = app
         .native_runtime
@@ -183,8 +181,6 @@ fn settings_keep_is_newer_intent_than_an_older_queued_theme_set() {
         app.installed_colors.id, "Nord",
         "the later Keep still owns the overlay"
     );
-    // The old Settings OCC patch may conflict after A; either outcome still
-    // has its own completion authority and must not be inferred from a timer.
     assert!(app.theme_preview.as_ref().unwrap().commit_request.is_some());
 }
 
@@ -225,9 +221,6 @@ fn pending_font_text_save() -> (App, crate::tab_model::ViewId) {
     let key = crate::native_ui::UiKey::new("settings/control/font_family");
     app.dispatch_native_event(wid, AppEvent::FocusChanged(Some(key.clone())))
         .unwrap();
-    // Typing on the actual font-list row opens its list, searching what was
-    // typed; no installed font matches, so Other… is highlighted, and Return
-    // opens the row's text entry holding the typed name.
     assert!(app.native_input_event(
         wid,
         &crate::input::InputEvent::Text("Saved Mono".to_string())
@@ -249,8 +242,6 @@ fn pending_font_text_save() -> (App, crate::tab_model::ViewId) {
     assert_eq!(field.role, crate::native_ui::SemanticRole::TextField);
     assert!(field.state.is_none_or(|state| state.enabled));
 
-    // Hold the existing worker boundary; the real semantic SetValue, host
-    // enqueue, ConfigService patch and completion paths still run.
     app.native_config_inflight = true;
     app.dispatch_native_event(
         wid,
@@ -267,7 +258,6 @@ fn pending_font_text_save() -> (App, crate::tab_model::ViewId) {
     let field = pending
         .semantic(&key)
         .expect("the pending field stays visible");
-    // It takes the next press while its save is on its way.
     assert!(
         field
             .state
@@ -296,8 +286,6 @@ fn text_save_completion_preserves_newer_same_text_undo_history() {
     let (mut app, view) = pending_font_text_save();
     let submitted = font_input(&app, view).unwrap();
     let wid = WindowId(0);
-    // These go through the real keyboard route while the save is on its
-    // way. Undo restores the text, not its old history.
     assert!(app.native_input_event(wid, &crate::input::InputEvent::Text("X".to_string())));
     assert!(app.native_input_event(
         wid,
@@ -350,7 +338,6 @@ fn text_save_completion_retires_unchanged_draft_only_on_success() {
 fn a_held_arrow_installs_once_per_frame() {
     let mut app = app();
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
-    // A frame lays the list out: the arrows walk the rows it listed.
     let _ = app.read_aux_controls(crate::app_introspect::AuxTarget::Prefs);
     let (_, instance, view, state) = app.native_settings_view_target().unwrap();
     let order = state.showcase.listed();

@@ -387,7 +387,9 @@ pub(crate) enum RecoveryCapability {
     Document {
         kind: AppKind,
         uri: String,
-        /// Preserve the privileged config-editor reducer on Retry.
+        /// Preserve the privileged config-editor reducer on Retry. Treating
+        /// this document as an ordinary Editor would bypass schema diagnostics
+        /// and the versioned config save lane after a failed restore.
         config_editor: bool,
     },
 }
@@ -5367,7 +5369,9 @@ fn markdown_range_from_action(action: &str) -> Option<std::ops::Range<usize>> {
     Some(start.parse().ok()?..end.parse().ok()?)
 }
 
-/// Resolve only the link rows intersecting a materialized source window.
+/// Resolve only the link rows intersecting a materialized source window. Links
+/// are parser-ordered, so the initial partition is logarithmic and the remainder
+/// is capped by `limit` rather than total document size.
 fn markdown_links_in_range(
     document: &crate::native_markdown::MarkdownDocument,
     source: std::ops::Range<usize>,
@@ -5503,7 +5507,9 @@ fn bounded_markdown_text(text: &str, limit: usize) -> String {
     output
 }
 
-/// Bounded visual label projection.
+/// Bounded visual label projection. Unlike byte caps used for clipboard and
+/// semantic block materialization, chrome is sized in displayed characters so
+/// compact layouts receive a deliberate ellipsis instead of relying on clipping.
 fn bounded_markdown_label(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -5529,7 +5535,9 @@ fn markdown_toolbar_label_width(label: &str, minimum: f32, text_scale: f32) -> f
         .max(minimum)
 }
 
-/// Filename-like chrome keeps both identity-bearing ends.
+/// Filename-like chrome keeps both identity-bearing ends. A long document title
+/// should retain its extension and distinguishing prefix instead of relying on a
+/// parent clip that can also cover the cursor/save indicators beside it.
 fn bounded_middle_label(text: &str, max_chars: usize) -> String {
     bounded_middle_label_from_graphemes(&text.graphemes().collect::<Vec<_>>(), max_chars)
 }
@@ -6918,7 +6926,9 @@ fn command_palette_status(matches: usize, compact: bool) -> String {
     }
 }
 
-/// Scanning form: derives the caret's line by walking the document.
+/// Scanning form: derives the caret's line by walking the document. Kept for
+/// one-shot callers; the render path uses [`editor_cursor_label_with`] with the
+/// resident line index instead of re-scanning every frame.
 #[cfg(test)]
 fn editor_cursor_label(text: &str, view: &crate::native_editor::EditorBufferView) -> String {
     editor_cursor_label_with(&crate::native_editor::EditorLines::scanning(text), view)

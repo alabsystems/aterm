@@ -66,7 +66,9 @@ const SPECTRUM_CROSSING_ENTRY_CAP: usize = 167;
 /// Where the seven names landed, in table indices.
 pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = [0, 58, 130, 237, 404, 474, 510];
 
-/// Cubic smoothstep `0..1`, clamping: the segment's eased coordinate.
+/// Cubic smoothstep `0..1`, clamping: the segment's eased coordinate. It gives
+/// the arc zero hue slope at every anchor, so the reflected sweep is C¹ at both
+/// turnarounds.
 #[inline]
 #[cfg(test)]
 const fn smoothstep01(x: f64) -> f64 {
@@ -474,7 +476,10 @@ pub const fn spectrum_stop(i: usize) -> u32 {
     SPECTRUM_LUT[SPECTRUM_ANCHOR_AT[idx]]
 }
 
-/// Midpoints between consecutive [`SPECTRUM_ANCHOR_AT`] entries.
+/// Midpoints between consecutive [`SPECTRUM_ANCHOR_AT`] entries. Because the
+/// anchor table is strictly increasing, `x > SPECTRUM_SNAP_MIDS[k]` is
+/// identical to `(x - at[k + 1]).abs() < (x - at[k]).abs()`, and ties (`x == mid`)
+/// stay with the lower stop `k` just like a strict `<` scan.
 const SPECTRUM_SNAP_MIDS: [f32; SPECTRUM_STOPS - 1] = {
     let mut mids = [0.0f32; SPECTRUM_STOPS - 1];
     let mut k = 0;

@@ -11,6 +11,8 @@ use super::aterm_objc_seam::consts::{
     NS_EVENT_MODIFIER_FLAG_COMMAND, NS_EVENT_MODIFIER_FLAG_OPTION,
 };
 
+/// LOCAL PATCH (aterm): the key is an `Id` borrowed from a live `NSString`
+/// rather than an `&NSString`, and the mask is the raw `NSUInteger` the setter
 /// takes rather than an `NSEventModifierFlags` bitflags value.
 struct KeyEquivalent {
     key: Id,
@@ -105,6 +107,9 @@ unsafe fn append(a: Id, b: Id) -> Id {
     unsafe { send_id_id(a, sel!(stringByAppendingString:), b) }
 }
 
+/// LOCAL PATCH (aterm): objc2's `ns_string!` built a STATIC `NSString` at
+/// compile time. `aterm_objc::ns_string` answers a +1 [`Obj`]; this wrapper
+/// autoreleases it so the call sites read as they did, at the cost of one
 /// object per literal per launch that the enclosing pool reclaims.
 fn nsstr(s: &str) -> Id {
     aterm_objc::ns_string(s).expect("Foundation to accept a menu title").autorelease()

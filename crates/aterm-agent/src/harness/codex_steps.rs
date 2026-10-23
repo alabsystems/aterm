@@ -98,7 +98,7 @@ pub fn tool_class(namespace: Option<&str>, name: &str) -> (&'static str, bool) {
 const NO_STAMP: i64 = i64::MAX;
 
 /// An id as the fold compares it (never kept).
-fn fingerprint(id: &str) -> u64 {
+const fn fingerprint(id: &str) -> u64 {
     aterm_hash::fnv1a_64(id.as_bytes())
 }
 
@@ -151,7 +151,7 @@ pub struct CodexStepFold {
 impl CodexStepFold {
     /// A fold whose rows older than `floor_ms` (wall ms) are history.
     #[must_use]
-    pub fn new(floor_ms: u64) -> CodexStepFold {
+    pub const fn new(floor_ms: u64) -> CodexStepFold {
         CodexStepFold {
             floor_ms,
             bound: None,
@@ -205,7 +205,7 @@ impl CodexStepFold {
 
     /// Whether a rollout is bound.
     #[must_use]
-    pub fn is_bound(&self) -> bool {
+    pub const fn is_bound(&self) -> bool {
         self.bound.is_some()
     }
 
@@ -237,7 +237,7 @@ impl CodexStepFold {
 
     /// Whether the fold latched off.
     #[must_use]
-    pub fn broken(&self) -> bool {
+    pub const fn broken(&self) -> bool {
         self.broken
     }
 
@@ -252,7 +252,7 @@ impl CodexStepFold {
     }
 
     /// A line the reader could not hand on, ending at `end`.
-    pub fn lost_line(&mut self, end: u64) {
+    pub const fn lost_line(&mut self, end: u64) {
         if self.bound.is_some() && end > self.seed {
             self.lost = self.lost.saturating_add(1);
         }
@@ -480,7 +480,7 @@ impl CodexStepFold {
     }
 
     /// The open turn ended or was interrupted: its tokens start over.
-    fn ended(&mut self) {
+    const fn ended(&mut self) {
         self.open = None;
         self.tok_in = 0;
         self.tok_out = 0;

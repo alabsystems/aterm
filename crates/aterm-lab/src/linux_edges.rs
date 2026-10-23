@@ -145,7 +145,8 @@ impl Edge {
     }
 }
 
-/// How a row ended: its verdict and detail.
+/// How a row ended: its verdict and detail. A row whose display or helper
+/// did not come up did not run.
 type Ended = (Verdict, String);
 
 fn not_run(why: impl Into<String>) -> Ended {
@@ -447,7 +448,7 @@ struct Run<'a> {
 }
 
 impl Run<'_> {
-    fn up(&self) -> &Up {
+    const fn up(&self) -> &Up {
         self.cell.up
     }
 
@@ -1120,7 +1121,7 @@ impl Run<'_> {
 
     /// The window's top-left in the layout: the pointer was put at the
     /// layout's centre and the window read it at `px`.
-    fn origin(px: (i32, i32)) -> (i32, i32) {
+    const fn origin(px: (i32, i32)) -> (i32, i32) {
         (LAYOUT.0 / 2 - px.0, LAYOUT.1 / 2 - px.1)
     }
 

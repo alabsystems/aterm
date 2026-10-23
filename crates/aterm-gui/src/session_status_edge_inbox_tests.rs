@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE EDGED INBOX through the real status sweep (card engine §3.5, §7 "Edged
-//! inbox"), with no process and no PTY: the group in front is the injected
-//! probe's (`SessionFactory::fg_probe`), asked about a master no file holds,
-//! and the program resolver's reads are scripted
-//! (`ProgramResolver::with_lookup`). A drawer's edge on a session that is not
-//! due is named on the next wake, and so is an `exec` in place, which moves
-//! no group; a visit the PTY reader's hold refuses goes back in the inbox,
-//! charged no interval unless the session was due anyway; with the sweep
-//! off, the inbox keeps nothing. NEGATIVE CONTROL: without the inbox, the
-//! same sweep names nothing before the session's next observation.
+//! Edged inbox status-sweep tests with scripted foreground probes and resolvers.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -24,12 +15,11 @@ thread_local! {
     static FRONT: Cell<i32> = const { Cell::new(-1) };
 }
 
-/// The injected probe: the group this test put in front.
+/// The injected probe.
 fn front(_master: i32) -> i32 {
     FRONT.with(Cell::get)
 }
 
-// Groups no process holds: past every pid the kernel issues.
 const SHELL: i32 = 2_000_000_101;
 const CLAUDE: i32 = 2_000_000_102;
 
@@ -38,14 +28,12 @@ struct Bed {
     session: u64,
     /// Every group the resolver was asked to name, in order.
     asked: Arc<Mutex<Vec<i32>>>,
-    /// What the resolver names each group: its leader's image, which an
-    /// `exec` in place changes with no group moving.
+    /// What the resolver names each group.
     names: Arc<Mutex<HashMap<i32, &'static str>>>,
 }
 
 impl Bed {
-    /// A headless App whose front session's shell is in front and named,
-    /// and whose next observation is a whole interval away.
+    /// A headless App whose front session's shell is in front and named.
     fn new() -> (Self, Instant) {
         let mut app = App::headless_for_test();
         app.session_factory.fg_probe = front;
@@ -67,8 +55,6 @@ impl Bed {
             .front_terminal(WindowId(0))
             .expect("a front terminal")
             .session;
-        // The sweep asks the probe only for a session with a master: an fd
-        // number no file holds (its shell pid stays the stub's).
         app.pool
             .sessions
             .get_mut(&session)
@@ -193,7 +179,6 @@ fn a_contended_edged_visit_is_retried_with_no_interval_charged() {
     let _ = sweep_mut(&mut bed, t2);
     assert_eq!(bed.requested_at(), Some(t2));
     bed.wait_named("claude");
-    // The control: a due, un-edged session refused by the same hold.
     let due = bed.next_due();
     {
         let _held = term.lock().unwrap();

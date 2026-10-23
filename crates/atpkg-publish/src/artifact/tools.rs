@@ -50,7 +50,7 @@ impl Run {
 
     /// The same, bounded by [`HANG`].
     #[must_use]
-    pub fn bounded(mut self) -> Self {
+    pub const fn bounded(mut self) -> Self {
         self.deadline = Some(HANG);
         self
     }

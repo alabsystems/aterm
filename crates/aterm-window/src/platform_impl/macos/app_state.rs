@@ -489,6 +489,8 @@ fn min_timeout(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 }
 
 /// A hack to make activation of multiple windows work when creating them before
+/// `applicationDidFinishLaunching:` / `Event::NewEvents(StartCause::Init)`.
+///
 /// # Safety
 /// `app` must be the live shared `NSApplication`.
 unsafe fn window_activation_hack(app: Id) {

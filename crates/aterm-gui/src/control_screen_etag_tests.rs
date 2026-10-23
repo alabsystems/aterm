@@ -289,6 +289,9 @@ fn run_corpus(etags: &[Etag]) -> Pass {
     pass
 }
 
+/// A config reload of `bold_is_bright` or `faint_opacity` re-colours bold and dim cells while
+/// moving none of the counters the etag reads (no output, seq, generation or viewport; asserted
+/// as premises). Only `render_sig` carries it, so a poller holding the old etag gets the
 /// re-coloured frame.
 #[test]
 fn a_host_style_policy_reload_is_not_unchanged() {
@@ -527,6 +530,10 @@ fn walk_steps(mut visit: impl FnMut(usize, &'static str, &Rig) -> bool) {
     }
 }
 
+/// The shipped etag over the walk: no two visited frames share an etag, and
+/// the walk had reach — it moved the screen, and it came back to etags it had
+/// already handed out (a repeat etag is the case that matters). The negative
+/// control, `content_seq` alone, must be caught handing one etag to two
 /// frames, or the walk has no teeth.
 #[test]
 fn no_two_visited_states_share_an_etag_unless_they_share_a_frame() {
@@ -552,6 +559,15 @@ fn no_two_visited_states_share_an_etag_unless_they_share_a_frame() {
     );
 }
 
+/// THE PUBLISHED FRAME IS THE FRESH ONE. A session's slot, read over the
+/// seeded walk the way every reader reads it (a look, the keys compared under
+/// the hold, a miss built and published), serves at every step exactly what a
+/// fresh read of the same state builds: the text ([`screen_text`]), its hash
+/// ([`screen_hash`]), and the styled frame. A `cells` hold keeps the frame, as
+/// a `subscribe … cells` watch does. The walk must also HIT, on both halves,
+/// or nothing published was ever served. NEGATIVE CONTROL: a frame memo keyed
+/// on `content_seq` alone is caught serving a stale frame on the same walk (the
+/// text half's control is `frame_memo`'s alt re-entry test: over this walk the
 /// text never changes at an unchanged seq).
 #[test]
 fn the_published_frame_equals_a_fresh_read_over_the_walk() {
@@ -615,6 +631,7 @@ fn the_published_frame_equals_a_fresh_read_over_the_walk() {
     );
 }
 
+/// The shipped etag over the corpus misses no arm, and the negative control
 /// (`content_seq` alone) is caught, so the corpus has teeth.
 #[test]
 fn every_incomplete_etag_is_caught_missing_real_frame_changes() {
@@ -655,6 +672,9 @@ fn viewport_view(t: &Terminal) -> (Vec<&'static str>, Vec<(usize, usize)>) {
     (line_sizes, images)
 }
 
+/// NEGATIVE CONTROL: that premise, a viewport-relative read of the same
+/// screen ([`viewport_view`]), moves on every scroll; an etag folding the
+/// display offset cost every `screen since=` poller a full frame each time
 /// the person touched the wheel.
 #[test]
 fn a_viewport_scroll_moves_neither_the_frame_nor_the_etag() {

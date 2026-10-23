@@ -103,8 +103,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let document = store.open(uri.to_string(), "base".to_string());
     let disk = store.snapshot(document).unwrap();
     let decision = journals.inspect_open(uri, disk.text.as_bytes()).unwrap();
-    // The event-loop budget refuses rather than parks, so the caller retries —
-    // here the harness, in the product the user. See `settle_busy`.
     crate::native_document_journal::settle_busy(|| {
         journals.initialize(decision.clone(), &disk, &disk)
     })
@@ -123,7 +121,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         disk_conflict_rejected: false,
     };
 
-    // A genuine committed edit becomes the latest desired journal head.
     let before = projection(&model, &store, &journals, document, protocol);
     append(&mut store, document, "-one");
     journals
@@ -132,7 +129,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "Edit");
 
-    // The real reducer admits one in-flight record and freezes its exact target.
     let before = after;
     let JournalEffect::Append {
         path,
@@ -149,7 +145,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "BeginJournal");
 
-    // A rapid edit while fsync is pending replaces desired, not the frozen plan.
     let before = after;
     append(&mut store, document, "-two");
     journals
@@ -169,8 +164,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "AcceptJournal");
 
-    // Catch-up plans directly to the latest desired head. A wrong generation is
-    // a genuine stale decision and changes no durable reducer state.
     let before = after;
     let JournalEffect::Append {
         path,
@@ -205,8 +198,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let after_stale = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before_stale, &after_stale, "RejectStaleProof");
 
-    // Negative control: accepting that stale proof as future durability is not a
-    // Buggy=0 transition and violates both exact-proof invariants.
     let mut stale_accept = before_stale.clone();
     stale_accept.insert("durable_seq", before_stale["desired_seq"] + 1);
     stale_accept.insert("stale_accepted", 1);
@@ -225,7 +216,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "AcceptJournal");
 
-    // The accepted atomic file-save proof arms a checkpoint baseline.
     let saved = store.snapshot(document).unwrap();
     let before = after;
     let mut save = SaveReducer::new(
@@ -253,7 +243,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "ProveFileSave");
 
-    // A newer edit remains in the rewritten journal beyond the saved baseline.
     let before = after;
     append(&mut store, document, "-newer");
     journals
@@ -262,8 +251,6 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let after = projection(&model, &store, &journals, document, protocol);
     assert_transition(&model, &before, &after, "Edit");
 
-    // Negative control: pruning through the newer draft without another file
-    // proof is forbidden and the executable model rejects it.
     let mut unsafe_prune = after.clone();
     unsafe_prune.insert("baseline_seq", after["desired_seq"]);
     unsafe_prune.insert("unsafe_prune", 1);

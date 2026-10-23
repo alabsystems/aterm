@@ -44,7 +44,7 @@ impl Qos {
     }
 
     #[must_use]
-    pub fn from_raw(raw: u32) -> Option<Self> {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
         Some(match raw {
             0x21 => Self::UserInteractive,
             0x19 => Self::UserInitiated,
@@ -59,12 +59,12 @@ impl Qos {
     /// A tier where every take is starved by construction: the remedy is the
     /// tier, not another take.
     #[must_use]
-    pub fn clamped(self) -> bool {
+    pub const fn clamped(self) -> bool {
         matches!(self, Self::Utility | Self::Background)
     }
 
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::UserInteractive => "user-interactive",
             Self::UserInitiated => "user-initiated",
@@ -153,7 +153,7 @@ pub enum Disposition {
 
 impl Starvation {
     #[must_use]
-    pub fn label(&self) -> Starved {
+    pub const fn label(&self) -> Starved {
         match self {
             Self::NoTake | Self::NoSamples => Starved::Unknown,
             Self::Descheduled { .. } | Self::CadenceBlown { .. } | Self::BudgetPressure { .. } => {
@@ -245,7 +245,7 @@ pub struct SchedInputs {
 /// Read one take's starvation. Unknown outranks everything: with no samples
 /// the question was not asked.
 #[must_use]
-pub fn classify(i: &SchedInputs) -> Starvation {
+pub const fn classify(i: &SchedInputs) -> Starvation {
     if !i.produced_take {
         return Starvation::NoTake;
     }
@@ -283,7 +283,7 @@ pub fn classify(i: &SchedInputs) -> Starvation {
 /// instrument cannot stand behind is unproved; a fail stays a fail. A function
 /// of one take, so repeating a starved take accumulates nothing.
 #[must_use]
-pub fn paint_verdict(shape: ShapeVerdict, evidence: Evidence) -> Disposition {
+pub const fn paint_verdict(shape: ShapeVerdict, evidence: Evidence) -> Disposition {
     match (shape, evidence) {
         (ShapeVerdict::Pass, Evidence::Sound) => Disposition::Pass,
         (ShapeVerdict::Pass, Evidence::Unproved) => Disposition::Unproved,
@@ -337,7 +337,7 @@ impl SchedReading {
     /// sampled at all (a deschedule outside it cannot change a frame), the
     /// whole life's otherwise.
     #[must_use]
-    pub fn deciding(&self) -> (u64, u64) {
+    pub const fn deciding(&self) -> (u64, u64) {
         if self.win_ticks > 0 {
             (self.win_ticks, self.win_late_max_us)
         } else {

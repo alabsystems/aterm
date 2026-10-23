@@ -100,7 +100,8 @@ impl Rig {
         self.age = boundary(a1).expect("a band that ends");
     }
 
-    /// The instant a reading is taken as of.
+    /// The instant a reading is taken as of. At age zero, the instant before the
+    /// oldest unread write, ahead of every ledger stamp (a wait of zero).
     fn now(&self) -> Instant {
         match (self.unread.front(), self.unread.back()) {
             (Some(&(_, sent, _)), _) if self.age.is_zero() => sent,

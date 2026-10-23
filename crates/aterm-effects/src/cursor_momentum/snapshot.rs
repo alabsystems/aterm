@@ -539,7 +539,9 @@ const fn canonical_f32(
     Ok(bits)
 }
 
-/// Writes the fixed layout front to back.
+/// Writes the fixed layout front to back. Each `put` takes a fixed-size
+/// chunk; the layout's total is [`MomentumGlowSnapshot::LEN`], so no chunk
+/// ever runs short, and if one did it would be skipped rather than panic.
 struct Writer<'a>(&'a mut [u8]);
 
 impl Writer<'_> {

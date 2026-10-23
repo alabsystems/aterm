@@ -111,7 +111,6 @@ fn a_status_fault_s_own_headers_replace_the_fake_s() {
     assert_eq!(r.all("connection"), ["close"]);
     assert_eq!(r.all("x-ratelimit-limit"), ["60"]);
     assert_eq!(r.body, b"<html>busy</html>");
-    // With no Content-Type of its own, the fault's body is served as JSON.
     fake.fault(Match::api("/repos/"), status_500());
     assert_eq!(
         api("/repos/fixture-dev/app").send(port).all("content-type"),
@@ -215,7 +214,6 @@ fn rate_limit_faults_carry_their_headers() {
     assert_eq!(primary.header("x-ratelimit-reset"), Some("1760009999"));
     assert_eq!(primary.header("x-ratelimit-limit"), Some("5000"));
     assert_eq!(primary.header("x-ratelimit-used"), Some("5000"));
-    // Off the api origin the fault still carries the headers that define it.
     fake.fault(
         Match::uploads("/"),
         Fault::PrimaryExhausted {
@@ -260,7 +258,6 @@ fn redirect_to_and_second_hop_answer_their_location() {
     assert_eq!(again.header("location"), Some(location.as_str()));
     assert_eq!(again.header("x-github-request-id"), None);
     assert_eq!(plain(&target).send(ports.cdn).body, b"a");
-    // Off-label on the api origin, the 302 is still an api answer: its request id and rate.
     fake.fault(Match::api("/repos/"), Fault::SecondHop);
     let api_hop = api("/repos/fixture-dev/app").send(ports.api);
     assert_eq!(api_hop.status, 302);
@@ -332,7 +329,6 @@ fn after_applies_a_change_once_its_count_is_answered() {
             .token(&dev)
             .send(port)
     };
-    // Other paths do not count.
     assert_eq!(api("/repos/fixture-dev/app").send(port).status, 200);
     assert_eq!(tag().status, 404);
     assert_eq!(tag().status, 404);
@@ -412,7 +408,6 @@ fn an_after_change_gone_stale_is_a_violation_and_the_answer_still_comes() {
         },
     );
     fake.after(m, 1, Change::Publish { release_id: draft });
-    // Deleted before the change is due: it is stale when it fires.
     fake.apply(Change::DeleteRelease {
         release_id: release,
     });
@@ -420,7 +415,6 @@ fn an_after_change_gone_stale_is_a_violation_and_the_answer_still_comes() {
     let v = fake.violations();
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains(&release.to_string()), "{}", v[0]);
-    // The other change of the same batch still applied, and the fake still answers.
     let published = api(&format!("/repos/fixture-dev/app/releases/{draft}"))
         .token(&dev)
         .send(port);
@@ -542,8 +536,6 @@ fn each_wire_breach_is_one_violation() {
         .send(ports.api);
     let over = "/repos/fixture-dev/app/releases?per_page=101";
     api(over).send(ports.api);
-    // One line per breach, in order, each checked for the data it carries (rule 8): the
-    // origin, the method, the path, the header and the number.
     let v = fake.violations();
     assert_eq!(v.len(), 10, "{v:?}");
     let has = |line: &str, data: &[&str]| data.iter().all(|d| line.contains(d));
@@ -580,8 +572,6 @@ fn each_wire_breach_is_one_violation() {
 fn a_chunked_request_answers_400_and_its_body_is_drained() {
     let (fake, _, _) = fake();
     let port = fake.ports().api;
-    // 256 KiB in 4 KiB chunks: more than the sockets buffer, so an unread body would reset
-    // the connection.
     let chunk = vec![b'x'; 4096];
     let mut body = Vec::new();
     for _ in 0..64 {
@@ -604,17 +594,14 @@ fn a_malformed_head_answers_400_and_is_logged() {
     let (fake, _, _) = fake();
     let port = fake.ports().api;
     let app = "/repos/fixture-dev/app";
-    // A header value that is not UTF-8 is read lossily, and answered.
     let mut lossy = format!("GET {app} HTTP/1.1\r\nUser-Agent: probe ").into_bytes();
     lossy.extend_from_slice(b"\xff\r\nX-GitHub-Api-Version: 2022-11-28\r\n\r\n");
     assert_eq!(send_bytes(port, &lossy).status, 200);
     assert!(fake.violations().is_empty());
-    // A header line with no `:` is a 400, logged and recorded.
     let colonless = format!(
         "GET {app} HTTP/1.1\r\nUser-Agent: probe\r\nX-GitHub-Api-Version: 2022-11-28\r\nno-colon-here\r\n\r\n"
     );
     assert_eq!(send_bytes(port, colonless.as_bytes()).status, 400);
-    // So is a head over 64 KiB.
     let long = format!(
         "GET {app} HTTP/1.1\r\nUser-Agent: probe\r\nX-GitHub-Api-Version: 2022-11-28\r\nX-Big: {}\r\n\r\n",
         "y".repeat(70 * 1024)
@@ -629,8 +616,6 @@ fn a_malformed_head_answers_400_and_is_logged() {
         v.iter()
             .all(|line| line.contains("GET") && line.contains(app))
     );
-    // A request line over 64 KiB with no end is read only that far, then logged and
-    // answered 400 too.
     let endless = format!("GET {app}/{}", "z".repeat(70 * 1024));
     assert_eq!(send_bytes(port, endless.as_bytes()).status, 400);
     let seen = fake.seen();
@@ -675,7 +660,6 @@ fn every_credential_header_at_the_web_and_cdn_is_a_violation() {
         assert!(line.contains(origin) && line.contains(path), "{line}");
         assert!(!line.contains(&dev), "{line}");
     }
-    // None reaches the log, and each request is marked as having carried one.
     for seen in fake.seen() {
         assert!(seen.had_authorization);
         assert!(seen.headers.iter().all(|(_, v)| !v.contains(&dev)));
@@ -686,7 +670,6 @@ fn every_credential_header_at_the_web_and_cdn_is_a_violation() {
                     && !n.eq_ignore_ascii_case("proxy-authorization"))
         );
     }
-    // The api origin reads only its own credential header; a cookie there is no violation.
     api("/repos/fixture-dev/app")
         .header("Cookie", "a=b")
         .send(ports.api);
@@ -776,8 +759,6 @@ fn a_token_in_the_target_is_a_violation_at_every_origin() {
         );
         assert!(!line.contains(&dev), "{line}");
     }
-    // The log shows the target with the token replaced; the web and CDN hops are marked as
-    // having carried a credential, the api one (which reads only its header) is not.
     let seen = fake.seen();
     assert_eq!(seen.len(), 3);
     for s in &seen {
@@ -813,7 +794,6 @@ fn two_credential_headers_at_the_api_or_uploads_origin_are_refused() {
             "{line}"
         );
     }
-    // One credential header is still read as before.
     assert_eq!(api(app).token(&dev).send(ports.api).status, 200);
     assert_eq!(fake.violations().len(), 2);
 }
@@ -853,7 +833,6 @@ fn a_head_cut_before_its_final_lf_is_malformed() {
     let v = fake.violations();
     assert_eq!(v.len(), 1, "{v:?}");
     assert!(v[0].contains("GET") && v[0].contains(app), "{}", v[0]);
-    // The whole head, then the same half-close, is answered.
     assert_eq!(send_cut(port, bytes).status, 200);
     assert_eq!(fake.violations().len(), 1);
 }

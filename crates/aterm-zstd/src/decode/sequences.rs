@@ -435,6 +435,8 @@ impl<'t> State<'t> {
 /// Decodes `header.num_sequences` sequences from `source` (table descriptions, then the bitstream)
 /// and executes each against the first `lit_count` bytes of `literals` (which runs [`SLACK`] bytes
 /// past them); the literals left over follow the last sequence.
+///
+/// [`SLACK`]: super::window::SLACK
 pub(crate) fn execute(
     header: &Header,
     source: &[u8],

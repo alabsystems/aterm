@@ -50,7 +50,8 @@ fn place_fake(at: &Path, who: &str) -> PathBuf {
     at.to_path_buf()
 }
 
-/// `stub` run the way the kernel runs its `#!/bin/sh` line (see [`assessed`]).
+/// `stub` run the way the kernel runs its `#!/bin/sh` line (see [`assessed`]). Only a stub
+/// the kernel would hand to `/bin/sh`: executable, first line `#!/bin/sh`.
 #[cfg(unix)]
 fn sh(stub: &Path) -> std::process::Command {
     let mode = std::fs::metadata(stub).unwrap().permissions().mode();

@@ -4,7 +4,6 @@
 
 //! `repos()` over agh-fake: a repository, its permissions and an owner's listing.
 
-// Every test routes through a profile's private token file (plan §1, rule 12).
 #![cfg(unix)]
 
 use agh::github::RepoListKind;
@@ -279,8 +278,6 @@ fn the_profile_s_own_login_lists_through_user_repos() {
 
 #[test]
 fn a_writer_listing_looks_the_owner_up_as_a_read() {
-    // alabsystems reads through dev and writes as release: under `How::writer()` the
-    // owner lookup is a Read (the dev bot), and only the listing is the writer's.
     let root = common::scratch("repo-writer-owner");
     let fake = FakeGithub::start();
     common::canonical_tokens(root.path(), &fake, true, true);
@@ -309,8 +306,6 @@ fn a_writer_listing_looks_the_owner_up_as_a_read() {
 
 #[test]
 fn a_writer_named_with_as_still_looks_the_owner_up_through_the_read_chain() {
-    // `--as release` names the writer, who is not in alabsystems's read chain: the owner
-    // lookup is a Read, so it drops the `--as` and reads as dev instead of being refused.
     let root = common::scratch("repo-writer-as-owner");
     let fake = FakeGithub::start();
     common::canonical_tokens(root.path(), &fake, true, true);
@@ -339,9 +334,6 @@ fn a_writer_named_with_as_still_looks_the_owner_up_through_the_read_chain() {
 
 #[test]
 fn a_writer_listing_of_the_writer_s_own_login_reads_user_repos() {
-    // An owner row for the dev bot's own login, written as dev: under `How::writer()` the
-    // writer decision picks dev, whose login is the owner, and the listing is an Identity
-    // read as dev (an Identity WriterRead would be refused).
     let root = common::scratch("repo-writer-own");
     let fake = FakeGithub::start();
     common::canonical_tokens(root.path(), &fake, true, false);

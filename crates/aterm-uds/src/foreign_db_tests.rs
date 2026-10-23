@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `foreign_db`: the read takes no lock on the live files and keeps no answer
-//! from files that changed or carry a write under way.
+//! Tests for `foreign_db` lock-free and snapshot reads.
 
 use super::*;
 
@@ -315,7 +314,6 @@ mod live {
                 .expect("ps");
             String::from_utf8_lossy(&out.stdout).trim().to_owned()
         };
-        // The read ends once the writer ran (a one-minute hang detector).
         let (read, caught) = witness::while_read(
             &db,
             DB_LOCKS.0,

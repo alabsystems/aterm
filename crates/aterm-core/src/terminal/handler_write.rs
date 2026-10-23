@@ -362,7 +362,9 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Shared write path: insert, write at cursor, apply extras, advance.
+    /// Shared write path: insert, write at cursor, apply extras, advance. Extras
+    /// (hyperlinks, non-BMP overflow, underline colors, RGB) are applied before
+    /// the cursor advances, since an autowrap scroll would move the written row.
     fn write_char_core(&mut self, c: char, width: usize) {
         let mut flags = if self.style.protected {
             self.style.flags.union(CellFlags::PROTECTED)
@@ -829,7 +831,8 @@ impl TerminalHandler<'_> {
     }
 }
 
-/// Whether a character is a regional indicator (U+1F1E6-U+1F1FF).
+/// Whether a character is a regional indicator (U+1F1E6-U+1F1FF). A local
+/// copy of aterm-grapheme's, which its private `width` module keeps for its grid.
 #[inline]
 const fn is_regional_indicator(c: char) -> bool {
     matches!(c as u32, 0x1F1E6..=0x1F1FF)

@@ -110,7 +110,7 @@ impl QuestionPriority {
 
     /// Its word: `recommended`, `long-term`, `short-term`.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::Recommended => Self::WORDS[0],
             Self::LongTerm => Self::WORDS[1],
@@ -120,7 +120,7 @@ impl QuestionPriority {
 
     /// The rule a question dialog answered under it is ledgered as.
     #[must_use]
-    pub fn rule_id(self) -> &'static str {
+    pub const fn rule_id(self) -> &'static str {
         match self {
             Self::Recommended => super::question::RULE_ANSWER_RECOMMENDED,
             Self::LongTerm => RULE_ANSWER_LONG_TERM,
@@ -130,7 +130,7 @@ impl QuestionPriority {
 
     /// The rule a prose question answered under it is ledgered as.
     #[must_use]
-    pub fn prose_rule_id(self) -> &'static str {
+    pub const fn prose_rule_id(self) -> &'static str {
         match self {
             Self::Recommended => super::turn_end::RULE_ANSWER,
             Self::LongTerm => RULE_PROSE_LONG_TERM,
@@ -140,7 +140,7 @@ impl QuestionPriority {
 
     /// The fixed policy text written into a free-text row (and used for prose).
     #[must_use]
-    pub fn text(self) -> Option<&'static str> {
+    pub const fn text(self) -> Option<&'static str> {
         match self {
             Self::Recommended => None,
             Self::LongTerm => Some(super::question::LONG_TERM_TEXT),
@@ -186,7 +186,7 @@ pub enum Answer {
 impl Answer {
     /// Where the answer's Enter goes.
     #[must_use]
-    pub fn enter_target(&self) -> Option<AnswerTarget> {
+    pub const fn enter_target(&self) -> Option<AnswerTarget> {
         match self {
             Self::FocusEnter { target, .. } => Some(*target),
             Self::Type { .. } => None,
@@ -195,7 +195,7 @@ impl Answer {
 
     /// The priority whose policy text the answer writes.
     #[must_use]
-    pub fn typed(&self) -> Option<QuestionPriority> {
+    pub const fn typed(&self) -> Option<QuestionPriority> {
         match self {
             Self::FocusEnter { .. } => None,
             Self::Type { text, .. } => Some(*text),
@@ -204,7 +204,7 @@ impl Answer {
 
     /// The rows the focus is moved first (down when positive).
     #[must_use]
-    pub fn steps(&self) -> i32 {
+    pub const fn steps(&self) -> i32 {
         match self {
             Self::FocusEnter { steps, .. } | Self::Type { steps, .. } => *steps,
         }
@@ -250,7 +250,7 @@ impl Decision {
 
     /// The rule that approved or declined (`None` for an escalation).
     #[must_use]
-    pub fn rule_id(&self) -> Option<&'static str> {
+    pub const fn rule_id(&self) -> Option<&'static str> {
         match self {
             Self::Approve { rule_id, .. } | Self::Decline { rule_id, .. } => Some(rule_id),
             Self::Escalate { .. } => None,
@@ -719,7 +719,7 @@ fn keeps_reset(opt: &Opt) -> bool {
     (opt.role == Role::Deny || waits(opt)) && !buys(opt)
 }
 
-fn draws_claude_boxes(program: Program) -> bool {
+const fn draws_claude_boxes(program: Program) -> bool {
     match program {
         Program::Claude => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
@@ -728,14 +728,14 @@ fn draws_claude_boxes(program: Program) -> bool {
 
 /// Whether `program`'s usage-limit dialog is kept trying past the reset it names ([`limit_retry`], [`RULE_LIMIT_RETRY`]).
 #[must_use]
-pub fn keeps_trying_its_limit(program: Program) -> bool {
+pub const fn keeps_trying_its_limit(program: Program) -> bool {
     match program {
         Program::Gemini => true,
         Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
     }
 }
 
-fn foreign_limit(program: Program) -> &'static str {
+const fn foreign_limit(program: Program) -> &'static str {
     match program {
         Program::Gemini => {
             "Gemini CLI's usage limit: neither Keep trying nor Stop is pressed; /stats model in \
@@ -1180,7 +1180,17 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
     if let Err(not) = yes_no_to_proceed(prompt, rows) {
         return handed_over(Some(not));
     }
-    let fix = if rm_breaker_of(&note).is_some_and(|b| breaker_not_ruled_out(&b)) {
+    let breaker = rm_breaker_of(&note);
+    let fix = if breaker
+        .as_ref()
+        .is_some_and(|b| b.kind == RmBreakerKind::NotRuledOut)
+    {
+        // A why aterm has no reading of: no advice about substitutions.
+        format!(
+            "Split it into shorter, plainer commands, run one at a time, any removal among them \
+             on its own, {TALL_RM_PATHS}"
+        )
+    } else if breaker.as_ref().is_some_and(breaker_not_ruled_out) {
         format!(
             "Split it into shorter commands with fewer substitutions, run one at a time, any \
              removal among them on its own, {TALL_RM_PATHS}"
@@ -1936,7 +1946,7 @@ fn scan_double(c: &[char], mut i: usize, visit: &mut dyn FnMut(&[char], usize)) 
 
 /// The index past the `'` that closes single-quoted text starting at
 /// `c[i]`; `ansi` (`$'…'`): a backslash escapes its next character.
-fn past_single(c: &[char], mut i: usize, ansi: bool) -> usize {
+const fn past_single(c: &[char], mut i: usize, ansi: bool) -> usize {
     while i < c.len() {
         match c[i] {
             '\\' if ansi => i += 2,
@@ -2036,6 +2046,9 @@ const NESTED_UNPROVEN: &str = "the vendor draws this only over a shell keyword r
                                `${ …; }` function substitutions, neither of which aterm's \
                                classifier proves a read";
 
+const NOT_RULED_OUT_UNPROVEN: &str = "aterm proves a read past the breaker only on its too-many \
+                                      note, never on a reason it has no reading of";
+
 fn breaker_read_only(
     prompt: &PromptV2,
     rows: &[String],
@@ -2045,8 +2058,10 @@ fn breaker_read_only(
 ) -> Decision {
     let label = rm_breaker_label(b);
     let refused = |why: String| Decision::escalate(format!("{label}: {why}"));
-    if b.kind != RmBreakerKind::TooManySubstitutions {
-        return refused(NESTED_UNPROVEN.to_string());
+    match b.kind {
+        RmBreakerKind::TooManySubstitutions => {}
+        RmBreakerKind::NestedUnanalyzed => return refused(NESTED_UNPROVEN.to_string()),
+        _ => return refused(NOT_RULED_OUT_UNPROVEN.to_string()),
     }
     if let Err(why) = yes_no_to_proceed(prompt, rows) {
         return refused(why);
@@ -2126,12 +2141,18 @@ pub fn rm_breaker_label(b: &RmBreaker) -> String {
         RmBreakerKind::MountedDrivePath => "box.rm_breaker.mounted_drive",
         RmBreakerKind::TooManySubstitutions => "box.rm_breaker.too_many",
         RmBreakerKind::NestedUnanalyzed => "box.rm_breaker.nested_unanalyzed",
+        // A why with no kind of its own is named in the note's own words.
+        RmBreakerKind::NotRuledOut => "",
     };
-    let why = anchor(id)
-        .trim()
-        .trim_start_matches("on ")
-        .trim_end_matches([':', '('])
-        .trim();
+    let why = if id.is_empty() {
+        b.target.trim()
+    } else {
+        anchor(id)
+            .trim()
+            .trim_start_matches("on ")
+            .trim_end_matches([':', '('])
+            .trim()
+    };
     let command = match b.command {
         RmCommand::Rm => "rm",
         RmCommand::Rmdir => "rmdir",
@@ -2146,10 +2167,12 @@ pub fn rm_breaker_label(b: &RmBreaker) -> String {
     format!("the {command} circuit breaker ({why})")
 }
 
-fn breaker_not_ruled_out(b: &RmBreaker) -> bool {
+const fn breaker_not_ruled_out(b: &RmBreaker) -> bool {
     matches!(
         b.kind,
-        RmBreakerKind::TooManySubstitutions | RmBreakerKind::NestedUnanalyzed
+        RmBreakerKind::TooManySubstitutions
+            | RmBreakerKind::NestedUnanalyzed
+            | RmBreakerKind::NotRuledOut
     )
 }
 
@@ -2642,7 +2665,7 @@ fn gemini_worker_trust(program: Program, p: &PromptV2, ctx: &ApprovalCtx) -> Opt
     })
 }
 
-fn relaunches_at_trust(program: Program) -> bool {
+const fn relaunches_at_trust(program: Program) -> bool {
     match program {
         Program::Gemini => true,
         Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,

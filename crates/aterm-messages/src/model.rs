@@ -1780,7 +1780,10 @@ mod tests {
         assert!(Severity::Info > Severity::Success);
     }
 
-    /// Invariant 23: one label table.
+    /// Invariant 23: one label table. Every variant has a non-empty label
+    /// ≤ 16 chars and a short ≤ 8 (the width law's budget); only `NotNow`
+    /// closes its row or asks; a consequential press (the Primary chip,
+    /// ruling 18) never closes its row and is never a decline (ruling 403).
     #[test]
     fn labels_are_one_table() {
         for intent in every_intent() {

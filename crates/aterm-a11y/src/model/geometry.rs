@@ -7,13 +7,11 @@
 // src/geometry.rs, itself derived from kurbo (Apache-2.0 OR MIT), and cut by
 // the aterm project in 2026 to the operations aterm's tree and publisher use.
 
-//! The geometry of an accessibility tree: points, sizes and rectangles in a
-//! node's coordinate space, and the affine transforms between spaces.
+//! Accessibility tree points, sizes, rectangles, and 2D affine transforms.
 
 use std::ops::{Add, Mul};
 
-/// A 2D affine transform: `[a, b, c, d, e, f]` maps `(x, y)` to
-/// `(a x + c y + e, b x + d y + f)`.
+/// A 2D affine transform.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Affine([f64; 6]);
 
@@ -52,8 +50,7 @@ impl Affine {
         self.0[0] * self.0[3] - self.0[1] * self.0[2]
     }
 
-    /// The inverse transform. A singular transform's has non-finite
-    /// coefficients.
+    /// The inverse transform.
     #[inline]
     pub fn inverse(self) -> Affine {
         let inv_det = self.determinant().recip();
@@ -156,8 +153,7 @@ impl Add<Vec2> for Point {
     }
 }
 
-/// A rectangle by its two corners: `(x0, y0)` the top left, `(x1, y1)` the
-/// bottom right, y growing down.
+/// A rectangle by its two corners.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x0: f64,
@@ -233,8 +229,7 @@ impl Rect {
         self.area() == 0.0
     }
 
-    /// Whether `point` is inside: the top and left edges are, the bottom and
-    /// right ones are not.
+    /// Whether `point` is inside.
     #[inline]
     pub const fn contains(&self, point: Point) -> bool {
         point.x >= self.x0 && point.x < self.x1 && point.y >= self.y0 && point.y < self.y1

@@ -8,15 +8,13 @@
 // recording that replays to an `OutlineSink`.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
-//! TrueType-style points to path segments, as `FT_Outline_Decompose` does
-//! it: a contour that starts off the curve starts at its last point if that
-//! one is on it, else at the implied midpoint of the two.
+//! TrueType 26.6 contour point decomposition to path segments.
 
 use super::fixed::F26Dot6;
 use super::glyf::PointFlags;
 use crate::OutlineSink;
 
-/// A point the path conversion reads: 26.6 coordinates and curve flags.
+/// A point the path conversion reads.
 #[derive(Copy, Clone, Default, Debug)]
 pub(crate) struct ContourPoint {
     pub x: F26Dot6,
@@ -29,8 +27,7 @@ impl ContourPoint {
         (self.x.to_f32(), self.y.to_f32())
     }
 
-    /// The midpoint, by FreeType's integer division on 26.6 (wrapping, as
-    /// only a broken font can overflow it); it takes `other`'s flags.
+    /// The midpoint, by FreeType's integer division on 26.6.
     fn midpoint(&self, other: Self) -> Self {
         let mid =
             |a: F26Dot6, b: F26Dot6| F26Dot6::from_bits(a.to_bits().wrapping_add(b.to_bits()) / 2);
@@ -42,32 +39,26 @@ impl ContourPoint {
     }
 }
 
-/// Converts one contour to path segments. The last point is passed apart
-/// (and also yielded by `points`) for the FreeType start-point rule.
+/// Converts one contour to path segments.
 pub(crate) fn contour_to_path(
     points: impl ExactSizeIterator<Item = ContourPoint>,
     first_point: ContourPoint,
     last_point: ContourPoint,
     pen: &mut impl OutlineSink,
 ) -> Result<(), ()> {
-    // An off curve cubic cannot start a contour.
     if first_point.flags.is_off_curve_cubic() {
         return Err(());
     }
     let mut points = points.enumerate();
-    // The last point is omitted when the contour starts there.
     let mut omit_last = false;
     let start_point = if first_point.flags.is_off_curve_quad() {
         if last_point.flags.is_on_curve() {
-            // The last point is on the curve: start there.
             omit_last = true;
             last_point
         } else {
-            // Also off the curve: start at the implied midpoint.
             last_point.midpoint(first_point)
         }
     } else {
-        // On the curve: start here, consuming the point.
         points.next();
         first_point
     };
@@ -169,7 +160,6 @@ impl PendingState {
         match self {
             Self::Empty => {}
             _ => {
-                // Always end on an explicit on curve point.
                 start_point.flags = PointFlags::on_curve();
                 self.emit(start_point, pen)?;
             }
@@ -189,8 +179,7 @@ enum Segment {
     Close,
 }
 
-/// A path held until the whole glyph has converted, so a failed glyph
-/// draws nothing.
+/// A path held until the whole glyph has converted, so a failed glyph draws nothing.
 #[derive(Default)]
 pub(crate) struct Recorded(Vec<Segment>);
 
@@ -233,8 +222,6 @@ impl OutlineSink for Recorded {
 
 #[cfg(test)]
 mod tests {
-    // skrifa 0.46.2 src/outline/path.rs `all_off_curve_to_path_scan_backward`
-    // and `start_off_curve_to_path_scan_backward` (the FreeType style).
     use super::*;
 
     fn path_of(all_off_curve: bool) -> Vec<Segment> {
@@ -247,9 +234,6 @@ mod tests {
                 PointFlags::off_curve_quad()
             },
         };
-        // A contour of all off curve points starts at the midpoint of its
-        // first and last: [(640, 128) + (128, 128)] / 2 = (384, 128) in
-        // 26.6, (6.0, 2.0) in pixels.
         let points = [
             pt(640, 128, false),
             pt(256, 64, !all_off_curve),

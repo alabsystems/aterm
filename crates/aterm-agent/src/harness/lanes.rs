@@ -26,7 +26,7 @@ impl Lanes {
 
 /// Returns the [`Lanes`] supported by `program`.
 #[must_use]
-pub fn lanes(program: Program) -> Lanes {
+pub const fn lanes(program: Program) -> Lanes {
     match program {
         Program::Claude => Lanes {
             relaunch: true,
@@ -54,7 +54,7 @@ pub fn lanes(program: Program) -> Lanes {
 
 /// Returns whether the background sweep carries an in-flight relaunch for `program`.
 #[must_use]
-pub fn sweep_carries_relaunch(program: Program) -> bool {
+pub const fn sweep_carries_relaunch(program: Program) -> bool {
     match program {
         Program::Claude | Program::Codex => true,
         Program::Muse | Program::Agy | Program::Gemini | Program::Generic => false,

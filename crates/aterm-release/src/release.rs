@@ -131,7 +131,7 @@ impl Step {
 
     /// The step's name on the transcript, in its log's file name and in `steps.tsv`.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Step::Checks => "checks",
             Step::Sync => "sync",
@@ -164,7 +164,7 @@ impl Step {
 
     /// What a step takes before this machine has timed it: the plan's estimates, until
     /// `steps.tsv` holds this machine's own.
-    fn default_secs(self) -> u64 {
+    const fn default_secs(self) -> u64 {
         match self {
             Step::Sync | Step::Ready => 15,
             Step::Checks | Step::Commit | Step::AfterCut => 60,
@@ -207,7 +207,7 @@ impl Refusal {
     }
 
     #[must_use]
-    pub fn could_not_run(mut self) -> Self {
+    pub const fn could_not_run(mut self) -> Self {
         self.could_not_run = true;
         self
     }
@@ -229,7 +229,7 @@ pub struct LinuxDecl {
 impl LinuxDecl {
     /// Whether a declaration was made at all.
     #[must_use]
-    pub fn declared(&self) -> bool {
+    pub const fn declared(&self) -> bool {
         self.mac_only || self.artifacts.is_some()
     }
 
@@ -924,7 +924,8 @@ pub trait Backend {
     fn stage(&mut self, c: &Candidate, prover: &Prover) -> Result<Ran, Refusal>;
     /// `pub publish`, the engine synced before it; `Err` when that sync failed.
     fn publish(&mut self, prover: &Prover) -> Result<Ran, Refusal>;
-    /// The published source's signed manifest pair, read from the channel now.
+    /// The published source's signed manifest pair, read from the channel now. A
+    /// ledger row alone can survive a publish that failed before signing it.
     fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal>;
     fn cut(&mut self, args: &[String], prover: &Prover) -> Ran;
     /// The published release's shape, then the site; `Err` with the step's why.
@@ -2889,7 +2890,11 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// STEP 4, THE REAL STAGE FIRST.
+    /// STEP 4, THE REAL STAGE FIRST. The preflight — R's own pre-claim gates that read
+    /// only the commit and the engine's readiness, seconds — refuses before anything
+    /// else, and its pass is journaled for R ([`COMMIT_GATES`]: the fact the cut reads
+    /// instead of judging R's tree again); a judge of the records that could not answer
+    /// stops here too.
     fn stage(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());

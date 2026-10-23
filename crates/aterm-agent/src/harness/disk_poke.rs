@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE POKE: anything in this process that SEES the disk full.
+//! THE POKE: anything in this process that SEES the disk full asks the window's disk watch to look
+//! now.
 
 use std::sync::{Arc, Mutex, PoisonError};
 

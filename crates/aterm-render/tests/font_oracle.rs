@@ -4,7 +4,8 @@
 //! The font oracle (TF.1 of docs/AUDIT-third-party-2026-10-15.md): answers recorded from the third-party font crates, which the first-party code replacing them is held to.
 
 mod corpus;
-/// aterm-font's shaper, which answers the `shape` lines here.
+/// aterm-font's shaper, which answers the `shape` lines here. `probe.rs`, the
+/// rustybuzz half that recorded them, is the recorder's alone.
 mod shaper;
 /// The reader `reader.rs` answers the `read` lines with: aterm-font, under
 /// ttf-parser's names (its outline sink trait is `OutlineSink`).
@@ -365,7 +366,10 @@ fn visual_runs(logical: &str) -> Vec<String> {
         .collect()
 }
 
-/// Devanagari and CJK.
+/// Devanagari and CJK. Apart from `deva.bare` and `cjk.halfwidth-kana`, these
+/// are engine probes, not runs aterm feeds: virama and vowel signs ride their
+/// base cell as a cluster and a wide cell is never shapeable
+/// (`cell_is_shapeable`), so the run shaper sees neither.
 fn complex_cases() -> Vec<Case> {
     [
         ("deva.namaste", "\u{928}\u{92E}\u{938}\u{94D}\u{924}\u{947}"),
@@ -520,7 +524,9 @@ fn shaping_plan(gate: &Gate, tier: Tier) -> Vec<(Features, Case)> {
     out
 }
 
-/// Shape every case `l`'s roles ask for.
+/// Shape every case `l`'s roles ask for. `gates` holds each primary's [`Gate`]
+/// by label, filled as the primaries go by (a styled face is listed after its
+/// primary); a styled face whose primary this host lacks is never reached.
 fn shaping_lines(l: &Loaded, gates: &mut BTreeMap<&'static str, Gate>, out: &mut Vec<Line>) {
     if l.face.roles & corpus::PRIMARY != 0 {
         gates.insert(l.face.label, Gate::of(&l.bytes));
@@ -888,7 +894,9 @@ fn blessing() -> bool {
     std::env::var_os("ATERM_BLESS_GOLDEN").is_some()
 }
 
-/// Bless `got` into `{name}.txt`, or hold it to that file.
+/// Bless `got` into `{name}.txt`, or hold it to that file. The recorded lines
+/// of the kinds in `elsewhere` are answered only by a bless; another test
+/// replays them.
 fn finish(name: &str, mut got: Vec<Line>, present: &Present, elsewhere: &[&str]) {
     let path = format!(
         "{}/tests/fixtures/font-oracle/{name}.txt",

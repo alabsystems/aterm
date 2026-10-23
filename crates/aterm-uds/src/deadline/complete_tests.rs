@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure injected-Read controls of the actual strict drain; no child or host file is opened.
+//! Pure injected-`Read` tests for strict stdout draining.
 
 use super::*;
 use std::io::Cursor;
@@ -85,8 +85,7 @@ fn complete_stdout_refuses_every_discarded_byte_after_eof() {
     assert!(matches!(error, CompleteOutputError::StdoutTooLarge { limit } if limit == OUTPUT_KEEP));
 }
 
-/// The test knows the reader is waiting for release before EOF; no scheduling duration
-/// stands in for completion. Drop reports that the reader's owned input was released.
+/// The test knows the reader is waiting for release before EOF.
 struct GatedEof {
     prefix: Cursor<Vec<u8>>,
     entered: mpsc::SyncSender<()>,
@@ -143,7 +142,6 @@ fn complete_stdout_refuses_a_still_open_stream_and_accepts_proven_completion() {
     entered
         .recv_timeout(HANG)
         .expect("the reader reached the EOF gate");
-    // The empty release channel proves no EOF is possible, regardless of scheduling.
     let incomplete = reader.collect(&Grace::at(Instant::now()));
     release.send(()).expect("release this owned reader");
     dropped
@@ -169,9 +167,6 @@ fn complete_stdout_refuses_a_still_open_stream_and_accepts_proven_completion() {
         .expect("the completed reader released its input");
 }
 
-/// Stdout on a pipe no writer holds is complete past the grace, however late its reader
-/// runs; a reader still behind the grace on a held pipe is refused (above). Negative
-/// control: refusing at `by` whatever the pipe gives refuses this.
 #[cfg(unix)]
 #[test]
 fn complete_stdout_reads_a_pipe_no_writer_holds_to_its_end() {
@@ -183,8 +178,6 @@ fn complete_stdout_reads_a_pipe_no_writer_holds_to_its_end() {
     let pipe = pipe_end(&reader);
     let (release, held) = mpsc::channel();
     let drain = drain_stdout(pipe, Late { held, reader }).expect("reader");
-    // An empty group: a child another test's thread forks meanwhile, holding a copy of the
-    // writer until its exec, is read past too.
     let grace = Grace {
         by: Instant::now(),
         until: Instant::now() + HANG,
@@ -197,9 +190,6 @@ fn complete_stdout_reads_a_pipe_no_writer_holds_to_its_end() {
     assert_eq!(drain.collect(&grace).unwrap(), b"owned prefix");
 }
 
-/// Stdout on a pipe only something outside the exited child's group holds is complete
-/// once that holder lets go, within the call's deadline. Negative control: refusing at
-/// `by` refuses this.
 #[cfg(unix)]
 #[test]
 fn complete_stdout_reads_a_pipe_held_outside_the_childs_group_until_it_lets_go() {

@@ -887,7 +887,8 @@ pub(crate) const UNSERVED_HEADLINE: &str = "ALab tools aren\u{2019}t available f
 pub(crate) const IGNORED_PREFIX_HEADLINE: &str =
     "Automatic installs are paused — [packages] prefix is set";
 
-/// The card's detail while a verb runs: where its progress is.
+/// The card's detail while a verb runs: where its progress is. Work that ends inside the
+/// band's progress grace never shows a row, so the card promises none.
 const BUSY_DETAIL: &str = "If it takes a while, its progress shows at the top of the window.";
 
 /// Which command result a Packages headline presents, as the `NativePackagesWorker` model counts it (`presented_result`: 0 none, 1 success, 2 failure).
@@ -1736,15 +1737,19 @@ pub(crate) struct PackagesState {
     tool_observed: bool,
     report: PackagesStatusReport,
     busy: Option<PackagesBusy>,
-    /// Any worker is inflight, the silent status refresh (`busy` `None`) included.
+    /// Any worker is inflight, the silent status refresh (`busy` `None`) included. Actions
+    /// gate on this, not `busy`: the host's one-worker rule would drop a click admitted
+    /// during a silent refresh, so the buttons disable for that brief window.
     inflight: bool,
-    /// Final result of the most recent UI-initiated verb.
+    /// Final result of the most recent UI-initiated verb. Silent refreshes keep
+    /// it; starting a new verb clears it.
     last_command: Option<PackagesCommandOutcome>,
     /// Resolved `[packages]` flags (`enabled`, the retired `auto_update` folded in, and
     /// `auto_install`), display only; the switches edit the config keys.
     master_enabled: bool,
     auto_install: bool,
-    /// The background updater thread started for this process.
+    /// The background updater thread started for this process. What it runs follows the
+    /// saved switches live, so only its absence needs saying.
     loop_running: bool,
     /// The `[machine]` host settings as confirmed by the machine read worker.
     machine: MachinePosture,

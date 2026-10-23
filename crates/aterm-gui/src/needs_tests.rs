@@ -786,7 +786,8 @@ impl Gen {
         of[at].clone()
     }
 
-    /// One session's facts.
+    /// One session's facts. Each attention text is a distinct token the
+    /// privacy leg looks for.
     fn facts(&mut self, case: u64) -> NeedFacts {
         let words: [&'static str; 14] = [
             "busy",

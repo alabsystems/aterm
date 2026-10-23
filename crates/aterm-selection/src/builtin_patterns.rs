@@ -3,10 +3,6 @@
 // Author: Andrew Yates
 
 //! Built-in selection rule patterns.
-//!
-//! Regex patterns for recognizing semantic text units: URLs, file paths,
-//! email addresses, IP addresses, git hashes, quoted strings, UUIDs,
-//! and semantic versions.
 
 use super::rules::{RulePriority, SelectionRule, SelectionRuleKind};
 
@@ -14,43 +10,28 @@ use super::rules::{RulePriority, SelectionRule, SelectionRuleKind};
 pub(crate) struct BuiltinRules;
 
 impl BuiltinRules {
-    // http, https, ftp and file URLs; the last character excludes trailing
-    // punctuation.
     const URL_PATTERN: &'static str =
         r#"(?i)(?:https?|ftp|file)://[^\s<>\[\](){}'"`,;|\\^]+[^\s<>\[\](){}'"`,;|\\^.!?:]"#;
 
-    // One or more `/`-joined segments with an optional prefix: `~`, `.`/`..`, or a
-    // bare first segment (`crates/x/y.rs`; without it the match would start at the
-    // first slash and drop that segment). Windows drive paths are a second
-    // alternative.
     const FILE_PATH_PATTERN: &'static str = r"(?:~|\.{1,2}|[a-zA-Z0-9._-]+)?(?:/[a-zA-Z0-9._-]+)+/?|[A-Za-z]:[/\\](?:[a-zA-Z0-9._-]+[/\\])*[a-zA-Z0-9._-]+";
 
-    // Email pattern: RFC 5321 compliant (simplified)
     const EMAIL_PATTERN: &'static str = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}";
 
-    // IPv4 pattern with optional port
     const IPV4_PATTERN: &'static str = r"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(?::\d{1,5})?";
 
-    // IPv6 pattern (simplified - matches most common formats)
     const IPV6_PATTERN: &'static str = r"\[?(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,7}:|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}|::)\]?(?::\d{1,5})?";
 
-    // Git hash: 7-40 hex characters between word boundaries.
     const GIT_HASH_PATTERN: &'static str = r"\b[0-9a-fA-F]{7,40}\b";
 
-    // Double-quoted string
     const DOUBLE_QUOTED_PATTERN: &'static str = r#""(?:[^"\\]|\\.)*""#;
 
-    // Single-quoted string
     const SINGLE_QUOTED_PATTERN: &'static str = r"'(?:[^'\\]|\\.)*'";
 
-    // Backtick-quoted string (common in markdown and shells)
     const BACKTICK_QUOTED_PATTERN: &'static str = r"`(?:[^`\\]|\\.)*`";
 
-    // UUID pattern (8-4-4-4-12 hex format)
     const UUID_PATTERN: &'static str =
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 
-    // Semantic version pattern
     const SEMVER_PATTERN: &'static str = r"v?\d+\.\d+\.\d+(?:-[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*)?(?:\+[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*)?";
 
     /// Create the URL selection rule.
@@ -131,11 +112,6 @@ impl BuiltinRules {
     }
 
     /// Create the UUID selection rule.
-    ///
-    /// High priority so the full 8-4-4-4-12 UUID outranks the generic
-    /// `git_hash` rule, whose `[0-9a-fA-F]{7,40}` pattern would otherwise
-    /// cannibalize a UUID's 8- and 12-hex groups at equal priority and
-    /// truncate the selection to that segment.
     #[must_use]
     pub(crate) fn uuid() -> SelectionRule {
         SelectionRule::new("uuid", SelectionRuleKind::Uuid, Self::UUID_PATTERN)

@@ -219,7 +219,7 @@ fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or("-".to_string(), |v| v.to_string())
 }
 
-/// What ttf-parser answers for face `index` of `bytes` at `coords`, as `(query, answer)` pairs.
+/// What `font` answers for face `index` of `bytes` at `coords`, as `(query, answer)` pairs.
 pub(crate) fn read(bytes: &[u8], index: u32, coords: &[([u8; 4], f32)]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut face = match font::Face::parse(bytes, index) {

@@ -134,7 +134,9 @@ impl Route {
 /// The watcher, the route of each watch, and the forwarder reading them.
 struct Live {
     watcher: Arc<Watcher>,
-    /// The forwarder's map from a fired watch to what it tells.
+    /// The forwarder's map from a fired watch to what it tells. Held across
+    /// each registration and its route, so an event that fires at once is
+    /// not missed for want of its route.
     routes: Arc<Mutex<HashMap<WatchId, Route>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,

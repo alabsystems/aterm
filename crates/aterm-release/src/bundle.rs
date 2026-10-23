@@ -388,7 +388,10 @@ pub fn place_handoff_policy(
     Ok(policy)
 }
 
-/// The bundle executable's mode: runnable, and writable by nobody.
+/// The bundle executable's mode: runnable, and writable by nobody. `~/.local/bin/aterm` is
+/// a link to this file, so a `cp build ~/.local/bin/aterm` with a write bit here opens the
+/// RUNNING app's own inode: the kernel kills every aterm window (CODESIGNING, Invalid
+/// Page) and a copy cut short with them leaves an app that cannot start (2026-10-19).
 #[cfg(unix)]
 const EXE_MODE: u32 = 0o555;
 
@@ -455,7 +458,7 @@ pub fn write_provenance(
     Ok(path)
 }
 
-fn yes_no(b: bool) -> &'static str {
+const fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 

@@ -40,7 +40,8 @@ pub(super) enum Ast {
     Str(Vec<StrPiece>),
     /// `$name`.
     Var(String),
-    /// `target[key]` (and `.key`, `."key"`): the key runs on the input, not the target.
+    /// `target[key]` (and `.key`, `."key"`): the key runs on the input, not the target. The flag
+    /// is a `?` right after the step: a target the key cannot index is skipped.
     Index(Box<Ast>, Box<Ast>, bool),
     /// `target[lo:hi]`, and its `?` flag, as `Index`'s.
     Slice(Box<Ast>, Option<Box<Ast>>, Option<Box<Ast>>, bool),
@@ -190,7 +191,7 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn leave(&mut self) {
+    const fn leave(&mut self) {
         self.nest -= 1;
     }
 

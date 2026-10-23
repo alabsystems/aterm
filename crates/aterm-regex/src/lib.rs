@@ -18,7 +18,8 @@ use compile::Program;
 use parse::Flags;
 use pikevm::Cache;
 
-/// Default ceiling on a compiled program, in bytes.
+/// Default ceiling on a compiled program, in bytes. Matches the `regex` crate's
+/// default so a call site that does not set one behaves the same.
 const DEFAULT_SIZE_LIMIT: usize = 10 * (1 << 20);
 
 /// Default ceiling on the work one search may do; see [`RegexBuilder::step_limit`].
@@ -147,7 +148,8 @@ impl Regex {
             .map(|(start, end)| Match { text, start, end }))
     }
 
-    /// The work ceiling one search on this pattern may spend.
+    /// The work ceiling one search on this pattern may spend. See
+    /// [`RegexBuilder::step_limit`].
     #[inline]
     #[must_use]
     /// Per-search work ceiling ([`RegexBuilder::step_limit`]).
@@ -302,7 +304,8 @@ impl<'t> Match<'t> {
     }
 }
 
-/// Iterator over the non-overlapping matches in a haystack.
+/// Iterator over the non-overlapping matches in a haystack. See
+/// [`Regex::find_iter`].
 #[derive(Debug)]
 /// Iterator over non-overlapping matches in a haystack ([`Regex::find_iter`]).
 pub struct Matches<'r, 't> {
@@ -453,7 +456,9 @@ impl RegexBuilder {
 #[must_use]
 /// Escape all regex metacharacters in `pattern` so it matches literally.
 pub fn escape(pattern: &str) -> String {
-    /// The characters this engine reads as syntax.
+    /// The characters this engine reads as syntax. `<` and `>` are pointedly
+    /// absent: they are ordinary literals, and `\<` / `\>` are the word-boundary
+    /// assertions, so escaping them would change what the pattern means.
     const META: &str = r"\.+*?()|[]{}^$#&-~";
 
     let mut out = String::with_capacity(pattern.len());
@@ -739,7 +744,8 @@ mod step_budget_tests {
         }
     }
 
-    /// The default budget refuses each amplifier's 3 MB scan.
+    /// The default budget refuses each amplifier's 3 MB scan. It still answers one row,
+    /// which is why the call sites pass a tighter budget.
     #[test]
     fn the_default_budget_stops_the_runaway_scan() {
         let scrollback = scrollback();

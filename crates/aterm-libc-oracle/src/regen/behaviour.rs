@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The behaviour sweeps the oracle runs over the shim's hand-written bodies.
-//!
-//! Signature equality does not constrain a C macro reimplemented as Rust, nor a
-//! `siginfo_t` accessor reading a private union arm: only behaviour does. Each
-//! sweep compares the shim (`@S@`) with the reference (`@R@`) over inputs that
-//! pin the result: every status word plus signed and high-bit extremes, device
-//! samples, every `fd` both singly and accumulated, every byte of `siginfo_t`.
-//! A body with no sweep here is a coverage-audit failure ([`super::oracle`]).
+//! Behaviour sweeps the oracle ([`super::oracle`]) runs over the shim's hand-written bodies.
 
 use super::oracle::{REAL, SHIM};
 
@@ -21,8 +14,7 @@ pub fn crates(template: &str) -> String {
 /// Every status word, then the extremes the loop does not reach.
 const STATUS: &str = r#"let mut s: i32 = -1; while s < 0x1_0000 { assert!(@S@::@N@(s) == @R@::@N@(s), "@N@ differs"); s += 1; } let edge = [i32::MIN, i32::MIN + 1, -0x1_0000, -0x8001, 0x1_0000, 0x1234_5678, i32::MAX]; let mut i = 0; while i < edge.len() { let s = edge[i]; assert!(@S@::@N@(s) == @R@::@N@(s), "@N@ differs"); i += 1; }"#;
 
-/// The sweeps that can run at compile time when the macro is a `const fn`, in
-/// emission order.
+/// Sweeps that run at compile time when the macro is a `const fn`, in emission order.
 #[must_use]
 pub fn evaluable() -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = [
@@ -45,12 +37,7 @@ pub fn evaluable() -> Vec<(&'static str, String)> {
     out
 }
 
-/// The sweeps that write through pointers, so run only as native tests.
-///
-/// `FD_SET` compares every one-fd map and every accumulated prefix: comparing
-/// only the final all-ones bitmap passes every permutation. `FD_ISSET` reads a
-/// bitmap only the reference's `FD_SET` wrote, so a permutation shared by the
-/// shim's two functions cannot hide itself.
+/// Sweeps that write through pointers and run only as native tests.
 pub const NATIVE: [(&str, &str); 6] = [
     (
         "FD_ZERO",
@@ -93,8 +80,7 @@ pub fn siginfo_projection(method: &str) -> Option<&'static str> {
     })
 }
 
-/// The accessor's sweep: every byte of `siginfo_t` set to each of four values,
-/// the two crates' results compared.
+/// Builds the byte-sweep comparison for a `siginfo_t` accessor.
 #[must_use]
 pub fn siginfo(method: &str, projection: &str) -> String {
     let template = r#"unsafe { assert_eq!(::core::mem::size_of::<@S@::siginfo_t>(), ::core::mem::size_of::<@R@::siginfo_t>()); for byte in 0..::core::mem::size_of::<@S@::siginfo_t>() { for value in [1u8, 0x5a, 0x80, 0xff] { let mut a: @S@::siginfo_t = ::core::mem::zeroed(); let mut b: @R@::siginfo_t = ::core::mem::zeroed(); ((&mut a as *mut @S@::siginfo_t).cast::<u8>().add(byte)).write(value); ((&mut b as *mut @R@::siginfo_t).cast::<u8>().add(byte)).write(value); assert_eq!(@A@, @B@, "siginfo_t::@M@ differs at byte {} value {:#x}", byte, value); } } }"#;

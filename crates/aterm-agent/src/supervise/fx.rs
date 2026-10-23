@@ -50,6 +50,7 @@ enum Mode {
     Live,
     /// Passes every read through and hands each value to the run's recorder.
     Record(Arc<TapeCore>),
+    /// Reads nothing live: every value is the tape's, every request and
     /// output checked against the recorded one ([`ReplayCore`]).
     Replay(Arc<ReplayCore>),
 }
@@ -81,7 +82,7 @@ impl Fx {
     }
 
     /// A door that REPLAYS a tape through `core`.
-    pub(crate) fn replay(core: Arc<ReplayCore>) -> Self {
+    pub(crate) const fn replay(core: Arc<ReplayCore>) -> Self {
         Self {
             clock: ClockSource::Os,
             mode: Mode::Replay(core),
@@ -89,12 +90,12 @@ impl Fx {
     }
 
     /// Whether this door replays a tape.
-    pub(crate) fn replaying(&self) -> bool {
+    pub(crate) const fn replaying(&self) -> bool {
         matches!(self.mode, Mode::Replay(_))
     }
 
     /// Whether this door neither records nor replays: the shipped loop's.
-    pub(crate) fn is_live(&self) -> bool {
+    pub(crate) const fn is_live(&self) -> bool {
         matches!(self.mode, Mode::Live)
     }
 
@@ -107,7 +108,7 @@ impl Fx {
     }
 
     /// Whether the files a run writes beside its loop (its journal.
-    pub(crate) fn opens_files(&self) -> bool {
+    pub(crate) const fn opens_files(&self) -> bool {
         !self.replaying()
     }
 
@@ -360,6 +361,7 @@ impl Fx {
         }
     }
 
+    /// [`Self::exchange`]'s body, its value written by `put` and read back by
     /// `take`, each handed the tape's origin.
     fn exchange_as<A>(
         &self,
@@ -596,6 +598,8 @@ impl ClockSource {
         }
     }
 
+    /// The monotonic clock and the loop's wall clock (Unix milliseconds),
+    /// read without making a read: a scripted clock's staged jump is not
     /// swapped in, a virtual clock does not move ([module docs](self)).
     fn peek(&self) -> (Instant, i64) {
         match self {
@@ -670,6 +674,10 @@ impl ClockSource {
     }
 }
 
+/// The machine's count of its sleep, read off the kernel, on the boot
+/// astream names (`astream_sys::boot_session`: the reading aterm-link's
+/// broker opens its log in, the all-zero id a damaged answer reads as
+/// refused, so the supervisor and the bus name a boot one way), spelled as
 /// this host's kernel spells it ([`Boot::kernel`]).
 #[cfg(not(test))]
 fn os_asleep() -> Option<SleepStamp> {
@@ -679,6 +687,8 @@ fn os_asleep() -> Option<SleepStamp> {
     })
 }
 
+/// A test build's system clocks count no sleep: a loop over them reads a
+/// sleep by its clocks alone, as on a machine that keeps no count, and no
 /// test reads the machine it runs on (the inert arm of a platform probe).
 #[cfg(test)]
 fn os_asleep() -> Option<SleepStamp> {
@@ -699,6 +709,7 @@ fn os_last_sleep() -> Option<(i64, i64)> {
 
 #[cfg(test)]
 thread_local! {
+    /// A test's PLANTED VARIANT of the loop: a build that reads the clock
     /// once more before each screen it reads ([`planted_clock_read`]).
     static PLANTED_CLOCK_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -731,24 +742,39 @@ struct Script {
     phase_ms: i64,
     /// How far it jumps ahead after its next read ([`ScriptedClock::set_jump`]).
     jump: i64,
+    /// The jump once that read is made: swapped in at every read, so the read
     /// after `set_jump` still sees the old time and every later one the jump.
     skew: i64,
+    /// The instant it starts RUNNING from, keeping pace with the monotonic
     /// clock ([`ScriptedClock::set_running`]); `None`: it stands still.
     runs_from: Option<Instant>,
+    /// Where the monotonic clock STANDS ([`ScriptedClock::stand_mono`]);
     /// `None`: the system's.
     mono_stands: Option<Instant>,
+    /// A sleep through the door SKIPS its length instead of sleeping it
     /// ([`ScriptedClock::run_virtual`]).
     sleeps_skip: bool,
+    /// The time SKIPPED ([`ScriptedClock::skip`]), which the monotonic clock
     /// stands ahead of the system's (or of where it stands) by.
     skipped: Duration,
+    /// The jump the last read saw (its `skew`): a sleep staged lands in the
     /// machine's count at the read that first shows it (`staged_ms`).
     seen: i64,
+    /// THE MACHINE'S COUNT OF ITS SLEEP, in milliseconds
+    /// ([`ScriptedClock::asleep`]); `None` — a machine that keeps no count,
+    /// whose loop reads a sleep by its clocks alone, as every test that
     /// counts none did — until a test counts ([`ScriptedClock::count_sleeps`]).
     counted_ms: Option<i64>,
+    /// A sleep staged by a jump ([`ScriptedClock::set_jump`],
+    /// [`ScriptedClock::slept`]) and not yet shown: counted at the read of the
+    /// wall clock that shows the jump, as the machine counts a sleep as the
     /// wall clock runs through it.
     staged_ms: i64,
+    /// The boot the count is on ([`ScriptedClock::set_boot`]); `None`:
     /// [`TEST_BOOT`].
     boot: Option<[u8; 16]>,
+    /// The machine's record of its last sleep (unix ms, asleep and woke):
+    /// the last one a counting test staged, or what it set
     /// ([`ScriptedClock::set_last_sleep`]).
     last_sleep: Option<(i64, i64)>,
 }
@@ -767,11 +793,14 @@ pub(crate) const OTHER_TEST_BOOT: [u8; 16] = [
 
 #[cfg(test)]
 impl Script {
+    /// The monotonic clock now: where it stands, else the system's, the time
     /// skipped ahead.
     fn mono(&self) -> Instant {
         self.mono_stands.unwrap_or_else(Instant::now) + self.skipped
     }
 
+    /// A sleep of `secs` staged from `at` (the fixed clock's milliseconds
+    /// then): counted once a read shows it, and the machine's record of its
     /// last sleep, while it counts.
     fn staged_last(&mut self, at: Option<i64>, secs: i64) {
         if self.counted_ms.is_some()
@@ -851,6 +880,8 @@ impl ScriptedClock {
         self.script().last_sleep = last;
     }
 
+    /// The machine's count of its sleep now, a staged sleep in it once a
+    /// read of the wall clock showed it; `None` until a test counts
     /// ([`Self::count_sleeps`]).
     fn asleep(&self) -> Option<SleepStamp> {
         let s = self.script();
@@ -904,6 +935,7 @@ impl ScriptedClock {
         }
     }
 
+    /// The fixed clock's milliseconds now, the staged jump's swap made (or
     /// not, for a `peek`).
     fn read_ms(&self, peek: bool) -> Option<i64> {
         let mut s = self.script();
@@ -928,12 +960,15 @@ impl ScriptedClock {
         Some((fixed + skew) * 1000 + s.phase_ms + run)
     }
 
+    /// The loop's wall clock, Unix milliseconds: the fixed clock (its whole
+    /// seconds, the staged jump swapped in, plus its phase and its run), else
     /// the system's.
     fn wall_ms(&self) -> i64 {
         self.read_ms(false)
             .unwrap_or_else(super::limit::unix_now_ms)
     }
 
+    /// The loop's wall clock, Unix seconds: the fixed clock's milliseconds
     /// (one read: the swap is made) floored, else the system's seconds.
     fn wall_s(&self) -> i64 {
         self.read_ms(false)
@@ -1005,6 +1040,7 @@ impl VirtualClock {
         (s.slept, s.last.filter(|_| s.counts))
     }
 
+    /// The machine's count of its sleep: every sleep, on [`TEST_BOOT`];
     /// `None` until it counts ([`Self::count_sleeps`]).
     fn asleep(&self) -> Option<SleepStamp> {
         let s = self.sleeps_mut();

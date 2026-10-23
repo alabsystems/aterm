@@ -1658,7 +1658,8 @@ fn same_text(text: &str, cells: Option<&[RenderCell]>) -> bool {
     rest.is_empty()
 }
 
-/// The loop proxy [`post_changed`] wakes through.
+/// The loop proxy [`post_changed`] wakes through. Installed once at launch; a
+/// headless test App installs nothing and a post is then a no-op.
 static PROXY: OnceLock<EventLoopProxy<Wake>> = OnceLock::new();
 
 /// Installs the event-loop proxy used to post `Wake::ClaudeFooter` notifications.
@@ -1673,7 +1674,13 @@ pub(crate) fn post_changed(session: u64) {
     }
 }
 
-/// The follow-up reads after every request, measured from it.
+/// The follow-up reads after every request, measured from it. Two cases need
+/// them, and both were seen on a dev build (2026-09-24): Claude Code writes
+/// `sessions/<pid>.json` a moment AFTER it takes the foreground, so the read
+/// that fires on first sight of `claude` found nothing (now the registry
+/// watch's to catch, [`crate::claude_registry`]); and a turn's final
+/// transcript row lands as the screen settles, after the last sweep that
+/// asked.
 const FOLLOW_UPS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(6)];
 
 /// Why one read ran: the `registry-read` dev row's `cause=`, which a live
@@ -2683,7 +2690,8 @@ fn login_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<account
     accounts::ProcessLogin::of_exec_env(&args?.env)
 }
 
-/// Reuse an image's auth verdict only for its exact captured environment.
+/// Reuse an image's auth verdict only for its exact captured environment. Lengths
+/// separate entries, and no raw credential value is retained in the identity cache.
 fn exec_env_stamp(env: &[String]) -> [u8; 32] {
     let mut digest = aterm_digest::Sha256::new();
     for entry in env {
@@ -2834,7 +2842,9 @@ fn offset_at_cached(zone: Option<&str>, unix: i64) -> Option<i64> {
 /// was read, and the offset.
 type OffsetAnswer = (Option<String>, i64, std::time::Instant, i64);
 
-/// [`offset_at_cached`] over `answers` at `now`, asking `read` on a miss.
+/// [`offset_at_cached`] over `answers` at `now`, asking `read` on a miss. Only an answer is
+/// kept: a read that failed (a `date` that could not be spawned under process pressure) is
+/// asked again next time rather than hiding a standing wall for the hour an answer is kept.
 fn cached_offset(
     answers: &mut Vec<OffsetAnswer>,
     zone: Option<&str>,
@@ -3272,7 +3282,8 @@ fn resolve_facts_at_with_cwd(
     )
 }
 
-/// One known reset occurrence has arrived.
+/// One known reset occurrence has arrived. Shared by the resolver and a
+/// new frame observation; an unplaced reset never expires on a guess.
 fn muse_weekly_expired(reset_at: Option<i64>, now: i64) -> bool {
     reset_at.is_some_and(|at| at <= now)
 }
@@ -3288,7 +3299,8 @@ fn muse_weekly_reset_at(reset: &str, clock: &footer::ReadClock<'_>) -> Option<i6
     ))
 }
 
-/// Admit one card observation.
+/// Admit one card observation. An unchanged reset reuses its occurrence
+/// and its expiry tombstone; settled frames need no clock, parsing or copy.
 fn muse_weekly_observation<'a>(
     (weekly, reset): (&'a str, Option<&'a str>),
     kept: Option<&aterm_agent::harness::profile::SubscriptionDisplay>,
@@ -3823,7 +3835,8 @@ impl FooterUndo {
             .map(|r| (r.frame_row, r.col_off, r.painted.len()))
     }
 
-    /// Add native text only where this splice actually wrote its cells.
+    /// Add native text only where this splice actually wrote its cells. A skipped
+    /// vendor-owned span gets no metadata, and undo verifies these exact payloads.
     fn publish_text(
         &mut self,
         scratch: &mut RenderInput,
@@ -3967,7 +3980,9 @@ impl crate::accessibility::CellRows for ProgramCells<'_> {
     }
 }
 
-/// The pane's exact terminal extraction that supplied its cells to this frame.
+/// The pane's exact terminal extraction that supplied its cells to this frame. The
+/// terminal can mutate between that extraction and the footer splice; reading it again
+/// would contend with the PTY writer and mix generations.
 fn frame_source<'a>(
     ws: &'a crate::WindowState,
     route: VisibleContentRoute,
@@ -6105,7 +6120,12 @@ fn fitted_switch_face(paint: SwitchPaint, room: usize) -> Option<(usize, SwitchF
         .find(|(_, face)| face.len + 4 <= room)
 }
 
-/// A face cell in its ink on `blank`'s ground.
+/// A face cell in its ink on `blank`'s ground. Where the line wears a theme
+/// (`palette`), the switch's glyphs walk its arc ([`SwitchInk::Arc`]) in the
+/// switch's letter law ([`brand_letter_fg`]: Cruise's spectrum, Land's
+/// sunset, Off's white moonbow, the print law's inks on paper) — bold while
+/// on, regular while off (hands off reads quieter), and quieted 30% toward
+/// the ground while it turns on.
 fn switch_cell(
     ch: char,
     ink: SwitchInk,
@@ -7647,7 +7667,9 @@ fn agy_bottom_dialog_top(rows: &[String], max_rows: usize, cols: usize) -> Optio
     None
 }
 
-/// Collect glass-only undoable markdown edits for an `agy` or `muse` pane.
+/// Collect glass-only undoable markdown edits for an `agy` or `muse` pane. Row
+/// text alone does not prove startup or tool-output provenance, so no transcript
+/// row is deleted as cruft.
 #[allow(clippy::too_many_arguments)]
 fn collect_agy_transcript_edits(
     scratch: &RenderInput,
@@ -8838,7 +8860,8 @@ mod tests {
         }
     }
 
-    /// A reader that panics on a pane's rows paints no rule and the frame goes on.
+    /// A reader that panics on a pane's rows paints no rule and the frame goes on. Control:
+    /// the real reader finds the rule and its mode row on the same rows.
     #[test]
     fn a_reader_panic_paints_no_footer_row() {
         let rows = vec![
@@ -12972,7 +12995,12 @@ mod tests {
         );
     }
 
-    /// A READING GOES WITH CLAUDE CODE'S INDICATOR.
+    /// A READING GOES WITH CLAUDE CODE'S INDICATOR. The rule draws
+    /// `◐ ctx 61% left` while 2.1.306's mode row ends with `61% until auto-compact`, and keeps
+    /// it while Claude Code's `◐ medium · /effort` holds the indicator's slot, while the `/`
+    /// menu stands in the mode row's place and while a box stands over the composer; once the
+    /// mode row stands with its slot empty (as after `/compact`) the fact goes, from
+    /// the rule and from the session's facts, and comes back with the indicator.
     #[test]
     fn a_context_reading_goes_when_claude_code_stops_showing_it() {
         const COLS: usize = 160;

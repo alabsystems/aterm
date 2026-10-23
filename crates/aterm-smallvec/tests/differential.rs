@@ -1,17 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The facade against a `Vec` model of upstream `smallvec` 1.15.1's contract,
-//! operation for operation, over many seeds and inline sizes.
-//!
-//! `upstream_transcript.rs` pins one long script to what the registry crate
-//! printed. This file goes wide instead: a deterministic-LCG fuzz at inline
-//! sizes 0, 1, 2, 4 and 8, 40 seeds each, comparing after every step the
-//! contents, length, `spilled()` (upstream's rule: a vector spills when it
-//! must hold more than the inline size, and `from_vec`/`with_capacity` key on
-//! capacity), the capacity's consistency with it, `Debug`, `Hash` and whether
-//! the operation panicked. No registry `smallvec` is a dev-dependency: inside
-//! this workspace `[patch.crates-io]` would redirect it here.
+//! Differential LCG fuzz tests comparing `SmallVec` against a `Vec`-plus-spill-bit
+//! model across inline sizes 0, 1, 2, 4, and 8.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -272,7 +263,6 @@ fn constructors_follow_upstreams_spill_rules() {
     let with: SmallVec<[u32; 4]> = SmallVec::with_capacity(5);
     assert!(with.spilled() && with.capacity() >= 5);
 
-    // from_vec keys on capacity: a short Vec with a long buffer stays spilled.
     let mut long_buffer = Vec::with_capacity(32);
     long_buffer.push(1u32);
     let v: SmallVec<[u32; 4]> = SmallVec::from_vec(long_buffer);
@@ -288,7 +278,6 @@ fn constructors_follow_upstreams_spill_rules() {
     let v: SmallVec<[u32; 2]> = SmallVec::from_slice(&[1, 2, 3]);
     assert!(v.spilled() && v.capacity() >= 3);
 
-    // A clone of a spilled vector whose items fit inline is inline.
     let mut v: SmallVec<[u32; 2]> = SmallVec::from_slice(&[1, 2, 3]);
     v.pop();
     assert!(v.spilled());

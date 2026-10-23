@@ -74,7 +74,8 @@ pub(crate) fn relaunch_descriptor() -> Option<i32> {
     RELAUNCH_COPY.get().map(std::os::fd::AsRawFd::as_raw_fd)
 }
 
-/// Set by the watcher as soon as its read returns, before the quit wake.
+/// Set by the watcher as soon as its read returns, before the quit wake. macOS hands a FIFO's
+/// end-of-file to one reader only, so a lifeline already cut here must not be handed on.
 static CUT_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The relaunch copy made inheritable until the guard drops.

@@ -1,77 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACTS' MENUS (owner, 2026-10-19: "I need to also be able to click the
-//! other text on that line"): a right-click on a fact of Claude Code's
-//! composer rule — a ctrl-click on macOS, `↓`, shift+F10 or the Menu key on
-//! a fact the keyboard selected, a screen reader's context menu, `open
-//! fact-menu <model|effort|path|branch|context|usage>` — opens that fact's glass menu: the
-//! Autopilot menu's card (`crate::autopilot_menu`, owned by the fact), hung
-//! from the fact's first cell.
-//!
-//! ```text
-//!  Folder · tab 1 “fix the footer”
-//!  ⌂  ~/aterm
-//!  +  New tab here
-//!  ⧉  Copy path
-//!  ──────────────────────────────
-//!  ○  Hide folder
-//!  ●  Show branch                      for each other fact hidden here
-//! ```
-//!
-//! **Three rows type, and only Claude's own commands** (owner: "clicking
-//! [the top-effort key] toggles it on and off … and likewise for model,
-//! effort"): the model's `⋯  Change model…  /model` and the effort's
-//! `⋯  Effort slider…  /effort` open Claude's own picker, where the person
-//! picks and aterm presses nothing; the effort's `◈  Turn <key> on|off for
-//! this session` — offered on Claude Code newer than 2.1.303, while Claude
-//! has not refused the key for the model — types the session-only toggle.
-//! Each goes through the facts' one typing path
-//! (`crate::claude_slash::App::press_slash`), decided as the row is chosen;
-//! a refusal keeps the menu open, its rows built again under a note naming
-//! why, the typed rows disabled.
-//!
-//! **No other row types into any program.** The folder's rows act on the session's
-//! absolute working directory as the resolver published it beside the facts
-//! (`claude_footer::FactSide`): a new tab there, or the path on the clipboard
-//! — both off where no side was published. The branch's copies its name, and
-//! opens a new tab at the repository's root where the climb found one.
-//! Nothing opens a path in Finder (a directory named `.app` would launch),
-//! nothing switches a branch and nothing runs git. Hide and Show flip the
-//! session's mask as a click on the fact does (`crate::claude_facts`); every
-//! menu of the session lists `●  Show <fact>` for each fact hidden there, so
-//! a stub the rule gave up for room is still shown again. A copy or a new
-//! tab says so for two seconds in the lights' title slot, where a block of
-//! chips is drawn (`✓ copied`, `✓ new tab`).
-//!
-//! **The usage's card is a graph over time** (owner: "the traffic shows a
-//! graph over time"): a click on `Σ` — Return, Space or `↓` on it selected,
-//! a right-click, `open fact-menu usage` — opens the Traffic card, the
-//! session's tokens in (`↑`) and out (`↓`) as two bands of two rows each,
-//! sixteen levels a band, each linear in its own peak; a column in which
-//! Claude was working stands on a shaded ground; under them the axis (the
-//! first bucket's local time, the span, `now`) and the totals
-//! ([`traffic_rows`]). It reads the traffic the resolver published beside the
-//! facts (`claude_footer::FactSide::traffic`) at the open and at each wake
-//! of the facts while it is open — never on a frame, and nothing while shut.
-//! A second click on `Σ` lands off the card, and closes it.
-//!
-//! ```text
-//!  Traffic · tab 1 “fix the footer”
-//!  ↑ in       ▂▅█▃      ▁
-//!          ▁▃▇████▂   ▁▂█
-//!  ↓ out        ▃
-//!          ▂▁▂███▅▁    ▃
-//!        14:02     6m33s     now
-//!  6m33s working · ↑20M in · ↓82k out
-//!  peak ↑1.2M · ↓9.8k per 2m00s
-//! ```
-//!
-//! **It stays while its fact slides along its row** (a fact before it grew
-//! or shrank) and closes at the first painted frame whose glass shows the
-//! fact on its row no more, on a focus or tab change, on Esc, on any other
-//! key and on a click outside it — the Autopilot menu's rules. One menu is
-//! open at a time: opening one closes the other.
+//! Context menus and traffic cards for Claude Code footer facts.
 
 use std::path::PathBuf;
 
@@ -86,8 +16,7 @@ use crate::claude_lights::{Clock, Fact, FactNotice, GlassAt};
 use crate::claude_slash::Slash;
 use crate::{App, WindowId};
 
-/// An admitted roster label, kept with the menu action rather than a row's
-/// position. The roster's bounded ASCII grammar lets actions remain `Copy`.
+/// An admitted roster label kept with a menu action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AccountLabel {
     bytes: [u8; aterm_agent::harness::accounts::LABEL_MAX],
@@ -120,8 +49,7 @@ impl AccountLabel {
     }
 }
 
-/// What a fact menu's row does when chosen. Only [`FactAct::Type`] types,
-/// and only Claude's own command, through `App::press_slash`.
+/// Action performed when a fact menu row is chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FactAct {
     /// The absolute working directory onto the clipboard.
@@ -178,8 +106,7 @@ pub(crate) struct AccountMenuRow {
     pub(crate) enabled: bool,
 }
 
-/// Format a weekly availability string (`"weekly 73% left"`) with a 5-cell
-/// meter bar (`"▰▰▰▰▱  weekly 73% left"`).
+/// Format a weekly availability string with a 5-cell meter bar.
 #[must_use]
 pub(crate) fn weekly_meter_bar(text: &str) -> String {
     let pct = text
@@ -203,8 +130,7 @@ pub(crate) fn weekly_meter_bar(text: &str) -> String {
     bar
 }
 
-/// What a fact's menu is built from, read at the open and again whenever the
-/// facts move under it ([`App::refresh_fact_menu`]).
+/// Inputs used to build a fact menu.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FactMenuFacts {
     /// The menu's name: the fact and the session's place (`Folder · tab 1`).
@@ -232,27 +158,21 @@ pub(crate) struct FactMenuFacts {
     pub(crate) auto_rotate: bool,
     /// The facts hidden in this session.
     pub(crate) off: FactMask,
-    /// The absolute working directory and the repository's root the
-    /// resolver published beside the facts (`claude_footer::FactSide`).
+    /// The session's absolute working directory.
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) repo_root: Option<PathBuf>,
     /// Folder / worktree / temp disk hygiene notes for [`Fact::Path`] (`repo_work::RepoHygiene`).
     pub(crate) folder_hygiene: Vec<String>,
     /// Repository hygiene & drift notes for [`Fact::Branch`] (`repo_work::RepoHygiene`).
     pub(crate) git_hygiene: Vec<String>,
-    /// The top-effort key's row: `Some(true)` offers to turn it on,
-    /// `Some(false)` off (the ENGINE's top rule shows its tag); `None`, no
-    /// row (Claude Code 2.1.303 or older, the key latched off by Claude's
-    /// refusal, no composer to read).
+    /// Whether the top-effort key toggle row offers to turn the key on (`Some(true)`) or off (`Some(false)`).
     pub(crate) key_row: Option<bool>,
-    /// Why the last typed row chosen here was refused: said over the typed
-    /// rows, which it disables.
+    /// Refusal note shown above disabled typed rows.
     pub(crate) note: Option<String>,
     /// A slash press is in flight for the session: the typed rows wait.
     pub(crate) typing: bool,
 }
 
-/// The facts a menu can hide or show, in the rule's order.
 const HIDEABLE: [FactKind; 5] = [
     FactKind::Model,
     FactKind::Effort,
@@ -261,7 +181,6 @@ const HIDEABLE: [FactKind; 5] = [
     FactKind::Context,
 ];
 
-/// One choice of `fact`'s menu, on or off.
 fn item(fact: Fact, glyph: &'static str, label: &str, act: FactAct, enabled: bool) -> MenuRow {
     MenuRow::Item {
         glyph,
@@ -273,12 +192,7 @@ fn item(fact: Fact, glyph: &'static str, label: &str, act: FactAct, enabled: boo
     }
 }
 
-/// THE MODEL of `fact`'s menu (design §10.6.14): its header, the value it shows, the
-/// rows that act on it where it has any, then — under a rule — its own Hide
-/// (or Show, while it is hidden) and a Show for every other fact hidden
-/// here. The usage has no menu of rows (its Traffic card is its own): its
-/// header alone. The top rule's key's menu is the effort's, hung from the
-/// key. Pure.
+/// Build the menu rows for `fact` from `facts`.
 #[must_use]
 pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
     let mut out = autopilot_menu::header_rows(&facts.title, facts.name.as_deref(), facts.room);
@@ -441,7 +355,6 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
         Fact::Usage => return out,
     }
     out.push(MenuRow::Rule);
-    // The top rule's key's menu is the effort's own.
     let own = fact.kind().unwrap_or(FactKind::Effort);
     let show = |kind: FactKind| {
         item(
@@ -472,12 +385,9 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
     out
 }
 
-/// The cells a band's label takes at the graph's left (`↑ in  `, `↓ out `).
 const LABEL_CELLS: usize = 6;
 
-/// A band's level for `v` against the band's own `peak`: none for no
-/// tokens, else one to sixteen eighths of its two rows, linear, and never
-/// less than one — a trickle is still seen.
+/// Map `v` against `peak` into 0..=16 eighths across a two-row band.
 #[must_use]
 pub(crate) fn band_level(v: u64, peak: u64) -> u32 {
     if v == 0 || peak == 0 {
@@ -487,9 +397,7 @@ pub(crate) fn band_level(v: u64, peak: u64) -> u32 {
     u32::try_from(level).unwrap_or(16)
 }
 
-/// The two rows' glyphs of a band column at `level` (`(top, bottom)`): the
-/// bottom row fills first, in eighths (`▁` … `▇`, then `█`), and the top
-/// row takes the rest; none for none.
+/// Return the `(top, bottom)` block glyphs for a band column at `level`.
 #[must_use]
 pub(crate) fn band_glyphs(level: u32) -> (char, char) {
     let eighths = |n: u32| char::from_u32(0x2580 + n).unwrap_or(' ');
@@ -502,9 +410,6 @@ pub(crate) fn band_glyphs(level: u32) -> (char, char) {
     (top, bottom)
 }
 
-/// `plot` cells of axis: `left` at the start, `right` at the end and `mid`
-/// between, centred, where they fit with a blank between each; then `left`
-/// and `right`; then `right` alone.
 fn axis_text(plot: usize, left: &str, mid: &str, right: &str) -> Vec<char> {
     let mut out = vec![' '; plot];
     let put = |out: &mut Vec<char>, at: usize, text: &str| {
@@ -531,14 +436,7 @@ fn axis_text(plot: usize, left: &str, mid: &str, right: &str) -> Vec<char> {
     out
 }
 
-/// THE TRAFFIC CARD'S BODY (under its header), `cols` content cells wide:
-/// the in band and the out band, two rows each — a label, then one column
-/// per slice of `view`'s span from its first bucket to `now_s`
-/// ([`TrafficView::columns`]), each at its band's level ([`band_level`],
-/// [`band_glyphs`]), shaded where Claude was working — the axis (the start
-/// at the local `offset`, the span, `now`), the totals, the peaks per
-/// column's slice, and the rows no graph could place. An empty series is
-/// `No traffic yet`. Pure.
+/// Build the Traffic card's body rows (`cols` content cells wide) from `view`.
 #[must_use]
 pub(crate) fn traffic_rows(
     view: &TrafficView,
@@ -645,9 +543,7 @@ pub(crate) fn traffic_rows(
 
 #[cfg(test)]
 thread_local! {
-    /// The folders a new tab was asked for, in a test build: a headless App
-    /// has no event loop to spawn the tab's shell on, so the ask is what a
-    /// test can see.
+    /// Folders requested for new tabs in test builds.
     pub(crate) static NEW_TABS_ASKED: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -792,8 +688,6 @@ pub(crate) fn account_menu_rows_from(
 }
 
 impl App {
-    /// What `session`'s `fact` menu is built from, read once: an event's
-    /// read, never a frame's.
     fn fact_menu_facts(&self, session: u64, fact: Fact) -> FactMenuFacts {
         let (place, name) = self.menu_place_and_name(session);
         let what = fact.name();
@@ -898,18 +792,12 @@ impl App {
                 out.git_hygiene = hygiene.notes();
             }
         }
-        // The key's row says what a choice does from the ENGINE's top rule
-        // as it is now: off while Claude draws its tag, else on.
         if key {
             out.key_row = self.engine_top_tag(session).map(|tag| !tag);
         }
         out
     }
 
-    /// `session`'s `fact` menu's rows and its name in words, for a card in
-    /// window `wid`: the fact's rows ([`rows`]), or for the usage the Traffic
-    /// card ([`traffic_rows`]) from the traffic published beside the facts —
-    /// read here, at an open or a wake of the facts, never on a frame.
     fn fact_menu_rows(&self, wid: WindowId, session: u64, fact: Fact) -> (Vec<MenuRow>, String) {
         let pane_cols = self.autopilot_menu_pane(wid, session).1.len();
         if fact != Fact::Usage {
@@ -943,8 +831,6 @@ impl App {
         (out, spoken)
     }
 
-    /// The hits of `session`'s `fact` on this frame's glass of window `wid`
-    /// that no band covers.
     fn visible_fact_hits(
         &self,
         wid: WindowId,
@@ -962,9 +848,7 @@ impl App {
             })
     }
 
-    /// Whether this frame's glass shows `session`'s `fact` on frame row `row`
-    /// of window `wid`, no band over it: what keeps its open menu, wherever
-    /// along the row the fact slid.
+    /// Whether window `wid` visibly shows `session`'s `fact` on frame row `row`.
     pub(crate) fn shows_fact_on_row(
         &self,
         wid: WindowId,
@@ -976,8 +860,7 @@ impl App {
             .any(|hit| hit.frame_row == row)
     }
 
-    /// The first cell of `session`'s `fact` as this frame's glass shows it in
-    /// window `wid`, no band over it: where its menu hangs.
+    /// Return the first visible `(frame_row, col)` cell of `session`'s `fact` in window `wid`.
     pub(crate) fn fact_anchor(
         &self,
         wid: WindowId,
@@ -989,10 +872,7 @@ impl App {
             .min()
     }
 
-    /// OPEN `session`'s `fact` menu in window `wid` — the usage's Traffic
-    /// card — hung from the fact's first cell `anchor`. A keyboard open
-    /// lights the first choice; a pointer's lights none (a card has none).
-    /// Any menu open elsewhere closes. One frame.
+    /// Open `session`'s `fact` menu in window `wid` anchored at `anchor`.
     pub(crate) fn open_fact_menu(
         &mut self,
         wid: WindowId,
@@ -1001,7 +881,6 @@ impl App {
         anchor: (usize, usize),
         keyboard: bool,
     ) {
-        // A fresh open says no refusal of an earlier choice.
         if let Some(f) = self.claude_facts.get_mut(&session) {
             f.menu_note = None;
         }
@@ -1018,8 +897,6 @@ impl App {
         keyboard: bool,
     ) {
         self.close_autopilot_menu();
-        // A card up again: a double-click's second half is no longer the
-        // next press (`App::spends_menu_follow_up`).
         self.autopilot_menu_spent = None;
         let (rows, spoken) = self.fact_menu_rows(wid, session, fact);
         let highlight = keyboard
@@ -1049,9 +926,7 @@ impl App {
         self.request_menu_frame(wid);
     }
 
-    /// A press on a fact at window pixel `(x, y)` that asks for its menu (a
-    /// right-click, a ctrl-click on macOS): opened, hung from the fact's
-    /// first cell. Whether it opened.
+    /// Open a fact menu at window pixel `(x, y)` in `wid`, returning whether one opened.
     pub(crate) fn open_fact_menu_at(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
         let Some((session, GlassAt::Fact(fact, _))) = self.claude_glass_at(wid, x, y) else {
             return false;
@@ -1063,11 +938,7 @@ impl App {
         true
     }
 
-    /// THE OPEN FACT MENU FOLLOWS ITS FACTS: `session`'s facts, its side or
-    /// its hidden facts moved under it, so its rows are built again — in the
-    /// places the shown rows hold (`autopilot_menu::keep_places`), the
-    /// highlight kept on a choice still offered in the same words. Nothing
-    /// (one `Option` test) unless a fact menu is open on `session`.
+    /// Rebuild the open fact menu's rows when `session`'s facts change.
     pub(crate) fn refresh_fact_menu(&mut self, session: u64) {
         let Some((wid, fact)) = self
             .autopilot_menu
@@ -1088,11 +959,7 @@ impl App {
         }
     }
 
-    /// CHOOSE a typed row of `session`'s `fact` menu in window `wid`, the
-    /// menu still open, hung from `anchor`: `slash` pressed as the person's
-    /// (`App::press_slash`), decided now. Begun, the menu closes; refused,
-    /// it stays open — rebuilt under a note naming why, its typed rows
-    /// disabled — and the press typed nothing.
+    /// Execute a typed `slash` row from `session`'s `fact` menu in window `wid`.
     pub(crate) fn choose_fact_type(
         &mut self,
         wid: WindowId,
@@ -1117,10 +984,7 @@ impl App {
         }
     }
 
-    /// CHOOSE `act` of a fact menu of `session`, chosen in window `wid` (the
-    /// menu already closed): each read from what is published now, never
-    /// from the rows' snapshot. Nothing reaches any program — a typed row
-    /// goes through [`Self::choose_fact_type`] before the menu closes.
+    /// Execute non-typed action `act` from `session`'s fact menu in window `wid`.
     pub(crate) fn choose_fact_act(&mut self, wid: WindowId, session: u64, act: FactAct) {
         let (side, branch) = self
             .pool
@@ -1203,8 +1067,6 @@ impl App {
                             )
                             && let Ok(request) = store.request_pin(&row.label, now)
                         {
-                            // A sign-in only an instance run as its account's own starts: never
-                            // a test's, whose upkeep is inert by construction.
                             let worker_request = request.clone();
                             let started = std::thread::Builder::new()
                                 .name("aterm-acct-renew".to_string())
@@ -1244,7 +1106,6 @@ impl App {
                                 .into_iter()
                                 .collect())
                         });
-                    // The host's own upkeep arm, inert in every test instance.
                     let upkeep = crate::harness_host::live_accounts_upkeep();
                     let _ = std::thread::Builder::new()
                         .name("aterm-acct-rotate".to_string())
@@ -1275,14 +1136,11 @@ impl App {
                     self.note_fact_notice(wid, session, FactNotice::NewTab);
                 }
             }
-            // Chosen with the menu open ([`Self::choose_fact_type`]).
             FactAct::Type(_) => {}
         }
     }
 
-    /// `open fact-menu <fact>`: the front window's focused session's `fact`
-    /// menu, hung from the fact as this frame's glass shows it, its first
-    /// choice lit as for a keyboard open.
+    /// Open `fact`'s menu for the focused session of the front window.
     pub(crate) fn open_front_fact_menu(&mut self, fact: Fact) -> Result<(), String> {
         let wid = self
             .frontmost_window
@@ -1297,8 +1155,7 @@ impl App {
         Ok(())
     }
 
-    /// `open fact-menu close`: the fact menu closed, wherever it is open; an
-    /// open Autopilot menu stays.
+    /// Close any open fact menu while leaving an open Autopilot menu intact.
     pub(crate) fn close_fact_menu(&mut self) {
         if self
             .autopilot_menu
@@ -1309,8 +1166,7 @@ impl App {
         }
     }
 
-    /// `controls fact-menu`: the open fact menu of the front window, or
-    /// `fact-menu open=false`.
+    /// Return `controls fact-menu` lines for the front window.
     #[must_use]
     pub(crate) fn fact_menu_controls(&self) -> Vec<String> {
         match self.autopilot_menu.as_ref().filter(|m| {
@@ -1328,10 +1184,7 @@ impl App {
         }
     }
 
-    /// A screen reader asked for `session`'s `fact` menu on window `wid`
-    /// (`Action::ShowContextMenu`): opened as the keyboard opens it, while
-    /// the fact is on that window's glass and no band covers it. Whether it
-    /// opened.
+    /// Open `session`'s `fact` menu in window `wid` for a screen reader context-menu action.
     #[cfg(a11y_tree)]
     pub(crate) fn open_fact_menu_for_reader(
         &mut self,

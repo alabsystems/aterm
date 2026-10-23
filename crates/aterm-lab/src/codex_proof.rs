@@ -77,7 +77,7 @@ impl Tally {
     }
 }
 
-fn ok(b: bool) -> Verdict {
+const fn ok(b: bool) -> Verdict {
     if b { Verdict::Ok } else { Verdict::Fail }
 }
 

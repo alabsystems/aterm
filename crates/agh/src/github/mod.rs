@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Resources (design §10.1): typed reads over the client.
+//! Typed GitHub resource readers over the client.
 
 pub mod contents;
 pub mod git;
@@ -25,8 +25,7 @@ use crate::policy::{Access, Named, RouteRequest, RouteTarget};
 use crate::retry::RetryPolicy;
 use crate::slug::Slug;
 
-/// `limit` applied to a listing already in its final order: [`crate::page::cut`] on its items
-/// and end.
+/// `limit` applied to a listing already in its final order ([`crate::page::cut`]).
 pub(crate) fn limit_after_sort<T>(listing: &mut crate::page::Listing<T>, limit: Option<usize>) {
     listing.end = crate::page::cut(listing.end, &mut listing.items, limit);
 }
@@ -40,12 +39,7 @@ pub(crate) fn repo_root(slug: &Slug) -> String {
     )
 }
 
-/// How a resource call is routed. Default: Read, routed, `Named::Default`, the probe on, the
-/// client's retry policy. `#[non_exhaustive]`: M2 adds `rate_book` and `sleep_budget`
-/// (design §7.4) as fields with builders. A caller outside agh therefore starts from
-/// `How::read()` or `How::writer()` and never writes a struct literal, so that change stays
-/// additive. `Default` is derived while every field's default is the read default; a field M2
-/// adds whose default is `true` (`rate_book`) replaces the derive with a hand `impl Default`.
+/// How a resource call is routed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct How {
@@ -81,7 +75,7 @@ impl How {
 
     /// The same routing with `anonymous`.
     #[must_use]
-    pub fn anonymous(mut self, anonymous: bool) -> How {
+    pub const fn anonymous(mut self, anonymous: bool) -> How {
         self.anonymous = anonymous;
         self
     }
@@ -102,14 +96,14 @@ impl How {
 
     /// The same routing with the probe off or on.
     #[must_use]
-    pub fn no_probe(mut self, no_probe: bool) -> How {
+    pub const fn no_probe(mut self, no_probe: bool) -> How {
         self.no_probe = no_probe;
         self
     }
 
     /// The same routing with its own retry policy.
     #[must_use]
-    pub fn retry_policy(mut self, policy: RetryPolicy) -> How {
+    pub const fn retry_policy(mut self, policy: RetryPolicy) -> How {
         self.retry = Some(policy);
         self
     }
@@ -125,8 +119,7 @@ impl How {
         route
     }
 
-    /// `Call::get(path, self.route(target))` with this routing's probe and retry policy: how
-    /// every resource builds its calls.
+    /// `Call::get(path, self.route(target))` with this routing's probe and retry policy.
     pub(crate) fn get(&self, path: impl Into<String>, target: RouteTarget) -> Call {
         Call::get(path, self.route(target))
             .probe_404(!self.no_probe)
@@ -141,11 +134,7 @@ impl How {
         }
     }
 
-    /// This routing as a Read, for a sub-read a resource makes whatever its own access (an
-    /// owner lookup, `newest`'s listing). Under a non-Read access `--as` named the writer,
-    /// who need not be in the owner's read chain (a release-tier owner reads through `dev` and
-    /// writes as `release`), so the Read drops `as_profile` and goes through the read chain; a
-    /// Read keeps its `--as`.
+    /// This routing as a Read, for a sub-read a resource makes whatever its own access.
     pub(crate) fn as_read(&self) -> How {
         let mut read = self.with_access(Access::Read);
         if self.access != Access::Read {
@@ -182,19 +171,19 @@ impl Github {
 
     /// Users and the rate limit.
     #[must_use]
-    pub fn users(&self) -> Users<'_> {
+    pub const fn users(&self) -> Users<'_> {
         Users::new(self)
     }
 
     /// The anonymous download host.
     #[must_use]
-    pub fn public(&self) -> Public<'_> {
+    pub const fn public(&self) -> Public<'_> {
         Public::new(self)
     }
 
     /// `agh api`.
     #[must_use]
-    pub fn raw(&self) -> Raw<'_> {
+    pub const fn raw(&self) -> Raw<'_> {
         Raw::new(self)
     }
 }

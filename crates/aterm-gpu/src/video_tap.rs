@@ -381,7 +381,9 @@ struct Slot {
     state: SlotState,
 }
 
-/// Which backend's staging buffer a slot holds.
+/// Which backend's staging buffer a slot holds. A ring is homogeneous; the
+/// cross-arm enqueue guards finalize a recording if a disarm switches the
+/// present path mid-take.
 enum SlotBuf {
     #[cfg(wgpu_arm)]
     Wgpu(wgpu::Buffer),
@@ -474,7 +476,8 @@ pub struct VideoTap {
     src_w: u32,
     src_h: u32,
     format: crate::device_layer::TexelFormat,
-    /// First source encoding actually copied.
+    /// First source encoding actually copied. Later metadata changes are
+    /// transformed per-slot and make the aggregate source label explicit.
     first_capture_encoding: Option<CaptureEncoding>,
     mixed_capture_encoding: bool,
     bpp: u32,
@@ -490,7 +493,9 @@ const RING: usize = 4;
 /// Default RAM budget for the harvested store (bytes).
 pub const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
 
-/// Upper bound on conversions dispatched and not yet adopted.
+/// Upper bound on conversions dispatched and not yet adopted. At ring depth, so
+/// transient raw-copy memory stays within what the ring already commits; a
+/// worker this far behind counts a drop instead of slowing the present thread.
 #[cfg(not(target_arch = "wasm32"))]
 const CONVERT_BACKLOG: usize = RING;
 
@@ -504,7 +509,9 @@ struct ConvertJob {
     capture_encoding: CaptureEncoding,
 }
 
-/// The recording's conversion lane.
+/// The recording's conversion lane. The worker lives as long as the tap (its
+/// job sender drops at `finish`), runs [`mapped_to_rgba8`] per job, and returns
+/// `Some(frame)` or `None` on error (one counted loss).
 #[cfg(not(target_arch = "wasm32"))]
 struct ConvertWorker {
     job_tx: mpsc::Sender<ConvertJob>,
@@ -1498,7 +1505,10 @@ impl VideoTap {
         }
     }
 
-    /// The `fps=` gate, pure on `(self, now_us)`.
+    /// The `fps=` gate, pure on `(self, now_us)`. With no cap every frame is
+    /// accepted; with cap `n` a frame is accepted iff at least `1_000_000 / n` µs
+    /// have passed since the last accepted frame (rejections accrue no catch-up
+    /// debt).
     fn should_capture(&mut self, now_us: u64) -> bool {
         let Some(fps) = self.fps_cap else {
             return true;
@@ -1666,7 +1676,9 @@ impl VideoTap {
         self.adopt_converted();
     }
 
-    /// Route one mapped slot's bytes toward RGBA8.
+    /// Route one mapped slot's bytes toward RGBA8. With a live worker the bytes
+    /// are copied out and converted off-thread (adopted later by
+    /// [`Self::adopt_converted`]), returning `None`.
     #[cfg(wgpu_arm)]
     fn convert_or_dispatch(
         &mut self,
@@ -1703,7 +1715,8 @@ impl VideoTap {
         Some(self.copy_out(idx, seq, t_us, capture_encoding))
     }
 
-    /// Adopt finished conversions into the store without blocking.
+    /// Adopt finished conversions into the store without blocking. A failure is
+    /// one counted loss.
     fn adopt_converted(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         loop {
@@ -3031,7 +3044,8 @@ mod tests {
     use super::*;
     use aterm_render::srgb_to_linear;
 
-    /// Device-free tap for the store and gate laws.
+    /// Device-free tap for the store and gate laws. `budget_bytes` is taken as
+    /// given (no 16 MiB floor), so a tiny budget evicts.
     fn test_tap(budget_bytes: usize, fps_cap: Option<u32>) -> VideoTap {
         #[cfg(wgpu_arm)]
         let (done_tx, done_rx) = mpsc::channel();
@@ -3660,7 +3674,8 @@ mod tests {
         (in_f32, encoded * 255.0 + 0.5)
     }
 
-    /// The table is the definition for every `f32`.
+    /// The table is the definition for every `f32`. Inside each window the two
+    /// are compared one value at a time.
     #[test]
     fn encode_thresholds_are_exact_and_locally_monotone() {
         let thresholds = &*SRGB8_ENCODE_THRESHOLDS;

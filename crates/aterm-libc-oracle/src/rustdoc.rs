@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One crate's rustdoc JSON, read as the crate-root public surface by namespace.
-//!
-//! Namespaces matter: `stat`, `statvfs`, `sigaction` and `kevent` are each BOTH a
-//! type and a function in libc, so a name-keyed index would check only one.
+//! Crate-root public surface extracted from rustdoc JSON by namespace.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use aterm_json::Value;
-/// A document that is not the rustdoc JSON this gate reads (a trustdoc format
-/// change): nothing about the shim was decided.
+/// A document that is not the rustdoc JSON this gate reads (a trustdoc format change).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FormatError(pub String);
 
@@ -27,8 +23,7 @@ fn missing(what: impl fmt::Display) -> FormatError {
     FormatError(format!("rustdoc JSON lacks {what}"))
 }
 
-/// The rustdoc namespace an item kind lives in; other kinds are not public API
-/// this gate compares.
+/// The rustdoc namespace an item kind lives in; other kinds are not public API this gate compares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Namespace {
     Type,
@@ -54,7 +49,7 @@ impl Namespace {
     }
 }
 
-/// One crate-root public item: its kind (`inner`'s key) and the whole item.
+/// One crate-root public item.
 #[derive(Clone, Copy, Debug)]
 pub struct Entry<'d> {
     pub kind: &'d str,
@@ -93,8 +88,7 @@ pub fn kind_of(item: &Value) -> Option<(&str, &Value)> {
         .map(|(kind, inner)| (kind.as_str(), inner))
 }
 
-/// An item id as the index keys it: rustdoc writes ids as numbers and keys the
-/// index by their decimal text.
+/// An item id as the index keys it.
 #[must_use]
 pub fn id_key(id: &Value) -> Option<String> {
     match id {
@@ -133,9 +127,7 @@ impl Doc {
         self.doc.get("paths")?.get(&id_key(id)?)
     }
 
-    /// The crate-root public surface: the root module's items, glob re-exports
-    /// walked into, single re-exports resolved to their target (modules are not
-    /// items here). The first item a name meets in a namespace wins.
+    /// The crate-root public surface.
     ///
     /// # Errors
     /// When the root module is not in the index.
@@ -202,8 +194,7 @@ impl Doc {
         }
     }
 
-    /// The impls rustdoc lists on a nominal type, each as its `inner.impl`
-    /// object; `inner` is the type's `inner.<kind>`.
+    /// The impls rustdoc lists on a nominal type, each as its `inner.impl` object.
     pub fn impls<'d>(&'d self, inner: &'d Value) -> impl Iterator<Item = &'d Value> {
         inner
             .get("impls")
@@ -214,8 +205,6 @@ impl Doc {
     }
 
     /// The trait impls written on a type, each with its trait `Path`.
-    /// Compiler-synthesized auto-trait verdicts and generic blanket impls are
-    /// nobody's declaration on the type.
     pub fn declared_trait_impls<'d>(
         &'d self,
         inner: &'d Value,
@@ -228,8 +217,7 @@ impl Doc {
         })
     }
 
-    /// The public items of a type's inherent impls; trait items are not
-    /// inherent API.
+    /// The public items of a type's inherent impls.
     pub fn public_inherent_items<'d>(
         &'d self,
         inner: &'d Value,
@@ -262,8 +250,7 @@ fn put<'d>(out: &mut Public<'d>, name: Option<&'d str>, kind: &'d str, item: &'d
 pub(crate) mod fixture {
     //! Synthetic rustdoc documents for the unit tests.
 
-    /// A document whose root module (id 0) lists `items`, with `extra` index
-    /// entries and `paths` summaries, all as raw JSON object members.
+    /// Fixture rustdoc JSON document with root module `items`.
     pub fn doc(items: &[u64], index: &str, paths: &str) -> String {
         let items: Vec<String> = items.iter().map(u64::to_string).collect();
         let sep = if index.is_empty() { "" } else { "," };
@@ -327,8 +314,6 @@ mod tests {
 
     #[test]
     fn globs_are_walked_renames_resolve_and_modules_are_not_items() {
-        // 1: `pub use self::unix::*` (glob into module 3); 2: `pub use x as y`
-        // (rename of 5); 3: module with function 4; 6: a submodule, never walked.
         let index = [
             r#""1":{"id":1,"inner":{"use":{"source":"self::unix","name":"unix","id":3,"is_glob":true}}}"#,
             r#""2":{"id":2,"inner":{"use":{"source":"x","name":"y","id":5,"is_glob":false}}}"#,

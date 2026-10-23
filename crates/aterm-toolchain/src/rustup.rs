@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! RUSTUP, FOUND ONE WAY: its home, its binary, and the two listings the stock
-//! lanes read. The toolchain walk ([`crate::discovery`]) reads rustup's home for the
-//! `trust` entry; `aterm-verify`'s STOCK EXCEPTION lanes (the foreign cells, the wasm
-//! lanes) and `aterm-release`'s provisioning (through `atpkg::toolchain`) find the
-//! `rustup` binary here, so a machine where one finds it is a machine where all do.
+//! Rustup home and binary discovery for [`crate::discovery`] and STOCK EXCEPTION lanes.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::discovery::{is_executable_file, tool_file};
 
-/// Rustup's home: a non-empty `$RUSTUP_HOME` (passed in as `env_rustup_home`), else
-/// `<home>/.rustup` — rustup's own rule, which `atpkg::seam::rustup_home_with` (and
-/// through it `aterm-release`) calls. A SET-BUT-EMPTY `$RUSTUP_HOME` is unset:
-/// `RUSTUP_HOME= cmd` means "the default", never "the current directory".
+/// Rustup's home: a non-empty `$RUSTUP_HOME`, else `<home>/.rustup`.
 #[must_use]
 pub fn rustup_home(env_rustup_home: Option<&OsStr>, home: &Path) -> PathBuf {
     match env_rustup_home {
@@ -24,8 +17,7 @@ pub fn rustup_home(env_rustup_home: Option<&OsStr>, home: &Path) -> PathBuf {
     }
 }
 
-/// [`rustup_home`] when `$HOME` may be unknown (`None`): a non-empty `$RUSTUP_HOME`
-/// still answers; nothing else does.
+/// [`rustup_home`] when `$HOME` may be unknown (`None`): a non-empty `$RUSTUP_HOME` still answers.
 #[must_use]
 pub fn rustup_home_with(env_rustup_home: Option<&OsStr>, home: Option<&Path>) -> Option<PathBuf> {
     match home {
@@ -51,11 +43,7 @@ pub fn find_rustup() -> Option<PathBuf> {
     )
 }
 
-/// The first executable `rustup` on PATH, then where rustup-init installs it
-/// (`$CARGO_HOME/bin`, `~/.cargo/bin`), then Homebrew's keg ([`HOMEBREW_RUSTUP`]): a
-/// machine provisioned through atpkg need not have `~/.cargo/bin` on PATH. Relative
-/// PATH entries and relative homes are passed over, so the answer never depends on the
-/// cwd. [`find_rustup_among`] with the keg.
+/// Executable `rustup` on PATH or fallback ([`HOMEBREW_RUSTUP`], [`find_rustup_among`]).
 #[must_use]
 pub fn find_rustup_in(
     path: Option<&OsStr>,
@@ -65,8 +53,7 @@ pub fn find_rustup_in(
     find_rustup_among(path, cargo_home, home, Some(Path::new(HOMEBREW_RUSTUP)))
 }
 
-/// [`find_rustup_in`] with Homebrew's keg an input: `keg` is looked at last, and only when
-/// given, so a caller whose homes are a test's scratch dirs finds nothing of this machine's.
+/// [`find_rustup_in`] with Homebrew's keg an input.
 #[must_use]
 pub fn find_rustup_among(
     path: Option<&OsStr>,
@@ -74,7 +61,6 @@ pub fn find_rustup_among(
     home: Option<&OsStr>,
     keg: Option<&Path>,
 ) -> Option<PathBuf> {
-    // `rustup.exe` on Windows: the lookups read metadata, which appends no suffix.
     let rustup = tool_file("rustup");
     let mut candidates: Vec<PathBuf> = path
         .map(|p| {
@@ -95,15 +81,13 @@ pub fn find_rustup_among(
     candidates.into_iter().find(|p| is_executable_file(p))
 }
 
-/// Does `listing` (`rustup target list --installed`) name exactly `target`?
-/// Line-exact: `wasm32-wasip1` is not `wasm32-unknown-unknown`.
+/// Does `listing` (`rustup target list --installed`) name exactly `target`? Line-exact.
 #[must_use]
 pub fn lists_target(listing: &str, target: &str) -> bool {
     listing.lines().any(|l| l.trim() == target)
 }
 
-/// The toolchain names in `rustup toolchain list`, without rustup's
-/// ` (active, default)` marker.
+/// The toolchain names in `rustup toolchain list`, without rustup's ` (active, default)` marker.
 #[must_use]
 pub fn toolchain_names(listing: &str) -> Vec<String> {
     listing
@@ -193,7 +177,6 @@ mod tests {
             ),
             Some(on_path)
         );
-        // The keg is last, and looked at only when given.
         let keg = dir.join("keg/bin/rustup");
         exe(&keg, 0o755);
         assert_eq!(find_rustup_among(None, None, None, Some(&keg)), Some(keg));

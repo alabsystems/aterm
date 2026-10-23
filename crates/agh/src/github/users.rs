@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Users and the rate limit (design §6.7, §13.2): `GET /user` as one profile, `GET /users/{login}`
-//! and the free `GET /rate_limit`.
+//! GitHub user profile (`GET /user`, `GET /users/{login}`) and rate-limit queries.
 
 use aterm_json::Value;
 
@@ -21,14 +20,13 @@ pub struct Users<'a> {
 
 impl<'a> Users<'a> {
     /// Users over the client.
-    pub(crate) fn new(gh: &'a Github) -> Users<'a> {
+    pub(crate) const fn new(gh: &'a Github) -> Users<'a> {
         Users { gh }
     }
 
     /// `GET /user`, as `profile` (an Identity route).
     ///
     /// # Errors
-    ///
     /// The call's error.
     pub fn me(&self, profile: &str) -> Result<UserObject> {
         let route = RouteRequest::read(RouteTarget::Identity).with_as(Some(profile.to_string()));
@@ -39,14 +37,8 @@ impl<'a> Users<'a> {
     /// `GET /users/{login}` (an Owner route, Read).
     ///
     /// # Errors
-    ///
-    /// Usage, before any request, for a login that is empty or a dot-segment (`.`, `..`),
-    /// which a server that normalises paths would resolve off this Owner route
-    /// (`path::has_dot_segment`'s contract); otherwise the call's error.
+    /// Usage error for an empty or dot-segment login, or the call's error.
     pub fn get(&self, login: &str) -> Result<UserObject> {
-        // `segment` encodes `/`, so only the whole text can be a dot-segment. A bot's login
-        // (`name[bot]`) is no owner name, yet `/users/` answers it, so the owner rule is not
-        // applied.
         if login.is_empty() {
             return Err(Error::usage("an empty login: agh sends no empty path part")
                 .with_next("name a GitHub login"));
@@ -58,13 +50,11 @@ impl<'a> Users<'a> {
         from_json(&answered.json()?)
     }
 
-    /// `GET /rate_limit`: `None` anonymous, `Some(p)` as `p` (an Identity route). One snapshot
-    /// per `resources` entry, sorted by resource. `/rate_limit` costs no quota.
+    /// `GET /rate_limit`.
     ///
     /// # Errors
-    ///
-    /// The call's error; CouldNotRun `Protocol` when the answer has no `resources` object or
-    /// an entry lacks a numeric `limit`, `remaining` or `reset`.
+    /// The call's error; a protocol error when the answer lacks `resources` or an entry's `limit`,
+    /// `remaining` or `reset`.
     pub fn rate(&self, who: Option<&str>) -> Result<Vec<RateSnapshot>> {
         let route = match who {
             Some(profile) => {

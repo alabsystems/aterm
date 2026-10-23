@@ -972,7 +972,8 @@ mod tests {
         assert_eq!(resumed(&words("-i --resume")), None);
     }
 
-    /// The headers of a session file, its duplicate appended too.
+    /// The headers of a session file, its duplicate appended too. NEGATIVE
+    /// CONTROLS: a message and a `$set` are no headers.
     #[test]
     fn a_session_files_headers_are_read() {
         let text = r#"{"sessionId":"s1","projectHash":"h","startTime":"2026-10-18T07:00:00.000Z","lastUpdated":"x","kind":"main"}

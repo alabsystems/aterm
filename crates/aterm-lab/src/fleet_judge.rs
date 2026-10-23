@@ -157,7 +157,7 @@ struct Seen {
 impl Seen {
     /// Whether both its excerpt lines show — each perhaps cut to its width,
     /// as the narrowing judges ([`judge_narrowing`]).
-    fn both_shown(&self) -> bool {
+    const fn both_shown(&self) -> bool {
         self.asked && self.said
     }
 }

@@ -13,6 +13,9 @@ use super::{Args, Halt, Scratch, await_socket, private, sha256_file, without_ate
 use crate::perf::LaneRun;
 use crate::perf::stats::{median, tail_summary};
 
+/// Every launch's scratch `aterm.toml`: no persisted window, no update or
+/// package cadence, and the audible bell off (this window is never the
+/// owner's terminal, so a BEL its shell rings must not play their alert
 /// sound; the key is read once with the rest and costs the start nothing).
 const CONFIG: &str = "restore_session = false\nbell_sound = false\n\n\
                       [update]\nenabled = false\nauto_apply = false\n\
@@ -22,6 +25,8 @@ const CONFIG: &str = "restore_session = false\nbell_sound = false\n\n\
 pub(crate) const COLS: u64 = 110;
 pub(crate) const ROWS: u64 = 32;
 
+/// The metrics JSON rounds every phase and total to 0.01 ms, so a sum of eight
+/// reconciles within 0.05 ms; this is that wire-rounding allowance, not a
 /// timing tolerance.
 const ROUNDING_MS: f64 = 0.06;
 
@@ -54,6 +59,7 @@ pub(crate) const PREPARE: [&str; 10] = [
     "startup_prepare_arm_ms",
 ];
 
+/// The kernel's birth record to Rust `main`: the loader's share, outside every
 /// partition. `null` where the binary cannot read it.
 const BIRTH: &str = "process_birth_to_rust_main_ms";
 
@@ -134,7 +140,7 @@ pub(crate) enum BackendRequest {
 }
 
 impl BackendRequest {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             BackendRequest::Auto => "auto",
             BackendRequest::Cpu => "cpu",
@@ -571,7 +577,7 @@ impl Sample {
         })
     }
 
-    pub(crate) fn shape(&self) -> Shape {
+    pub(crate) const fn shape(&self) -> Shape {
         Shape {
             router: self.rust_main_ms.is_some(),
             visible: self.visible_ms.is_some(),
@@ -687,6 +693,7 @@ pub(crate) struct Launcher {
     pub timeout: Duration,
 }
 
+/// The persisted cell box a primer must leave for the launch after it to be
 /// warm.
 fn cell_metrics_cache(home: &Path) -> PathBuf {
     home.join("Library/Application Support/aterm/cell-metrics.toml")
@@ -821,7 +828,7 @@ impl Launcher {
     }
 }
 
-fn trim_ascii(b: &[u8]) -> &[u8] {
+const fn trim_ascii(b: &[u8]) -> &[u8] {
     b.trim_ascii()
 }
 
@@ -843,6 +850,9 @@ pub(crate) struct Frozen {
 /// How long a child may run past its own budget before it is called hung.
 const HUNG: Duration = Duration::from_secs(60);
 
+/// How long a new copy's first run may take: the system assesses a new file at
+/// its first exec, which a loaded host has held for minutes (a fresh 167 MB
+/// debug build took 64 s, `aterm_spec::wait::FIRST_EXEC`). A hang detector of
 /// its own, never a budget.
 const FIRST_EXEC: Duration = Duration::from_secs(10 * 60);
 
@@ -907,6 +917,7 @@ pub(crate) fn freeze(label: &str, source: &Path, dir: &Path) -> Result<Frozen, S
     })
 }
 
+/// Without `--binary`: the profiling build when present, else the release
 /// build, wherever `targo` puts the target directory.
 fn default_binary() -> Result<PathBuf, String> {
     let target = super::target_dir()?;
@@ -1171,6 +1182,7 @@ fn print_summary(samples: &[Sample]) {
     );
 }
 
+/// Each of `names` with its values across samples, when every sample carries
 /// the group `pick` reads (in `names` order).
 fn named(
     samples: &[Sample],
@@ -1190,6 +1202,7 @@ fn named(
     )
 }
 
+/// The per-slot cell pipelines, each with its values across the samples that
 /// built it (the slots are the binary's, not this lane's).
 fn cell_pipelines(samples: &[Sample]) -> Vec<(String, Vec<f64>)> {
     let mut slots: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
@@ -1265,6 +1278,8 @@ fn start_json(artifact: &Frozen, chip: &str, args: &Args, samples: &[Sample]) ->
 pub(crate) mod tests {
     use super::*;
 
+    /// Every launch starts with the audible bell off (aterm's default is on)
+    /// and the restore, update and package lanes off, as one document
     /// aterm's parser reads.
     #[test]
     fn a_start_launch_has_the_audible_bell_off() {
@@ -1327,6 +1342,9 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         );
     }
 
+    /// A valid current-schema metrics read: every partition reconciles, the
+    /// reveal sits BELOW first-present (an early-reveal platform), and `bias`
+    /// rides the whole reconciling chain (both totals, the attach phase and its
     /// window-setup child) so a slot offset survives every sum check.
     pub(crate) fn metrics(bias: f64) -> Value {
         json!({
@@ -1546,6 +1564,8 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         );
     }
 
+    /// [`metrics`] plus a valid worker drill-down (gpu_build 4.0) and a GPU
+    /// drill-down whose legs close against it and whose pipeline groups
     /// (0.1 each) fill their 0.8 parent.
     fn drilled() -> Value {
         let mut m = metrics(0.0);
@@ -1680,6 +1700,8 @@ case \"$0\" in *-aterm) echo '{frozen_says}' ;; \
         );
     }
 
+    /// [`metrics`] plus the loader's share and a valid preparation split: ten
+    /// phases filling its 1.0 ms `startup_gui_prepare_ms` (binary fractions,
     /// so the sum is exact).
     fn prepared() -> Value {
         let mut m = with(metrics(0.0), BIRTH, json!(3.5));

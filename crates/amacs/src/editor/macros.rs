@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Keyboard macros: the one last macro, recorded command by command with each
-//! command's own argument, and its replay.
+//! Keyboard macros: recording and replaying the last macro.
 
 use super::command::{EditorCommand, PrefixArgument};
 use super::view::EditorBufferView;
 use super::workspace::{EditorEffect, EditorError, EditorWorkspace, Recorded};
 use crate::store::DocumentStore;
 
-/// One recorded step of a keyboard macro. A command carries the `C-u`
-/// argument it took, so neither `C-u` nor the digits after it are steps of
-/// their own: an argument nothing took (one pending at `C-x )`) records
-/// nothing, and a replay hands each command exactly the argument it had. It
-/// carries the answers its minibuffer took too (`kill-buffer`'s buffer,
-/// `goto-line`'s line), so a replay runs it with them instead of asking.
+/// One recorded step of a keyboard macro.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MacroStep {
     Command(EditorCommand, Option<PrefixArgument>, Vec<String>),
@@ -36,9 +30,7 @@ impl EditorWorkspace {
         vec![EditorEffect::Status("Keyboard macro defined".into())]
     }
 
-    /// `call-last-kbd-macro` (C-x e): replay the last macro's steps, and
-    /// return what they asked of the host (a save, a buffer to kill, their
-    /// statuses) in order, for the host to carry out once the macro is done.
+    /// `call-last-kbd-macro` (C-x e): replays the last macro's steps and returns host actions.
     pub(super) fn play_macro(
         &mut self,
         store: &mut DocumentStore,
@@ -54,9 +46,6 @@ impl EditorWorkspace {
             for step in steps {
                 match step {
                     MacroStep::Command(command, argument, args) => {
-                        // The step hands its command the argument it took when
-                        // recorded, and the argument never outlives the step,
-                        // even when the command refuses to run.
                         view.prefix_argument = argument;
                         let result = self.execute_with(store, view, command, args, Recorded::No);
                         view.take_prefix_argument();
@@ -104,8 +93,6 @@ mod tests {
             }
         };
 
-        // C-u 2 C-n, the digit sent as text (as the host sends it) and then as
-        // a key: each records and replays a two-line move.
         for digit_as_text in [true, false] {
             let (mut store, mut workspace, mut view, document) = editor(&text);
             press(&mut store, &mut workspace, &mut view, "C-x ( C-u");
@@ -125,8 +112,6 @@ mod tests {
             assert_eq!(store.snapshot(document).unwrap().text.as_ref(), text);
         }
 
-        // C-x ( C-f C-u C-x ): the trailing C-u argued with C-x ), not with the
-        // macro, so C-x e moves one character and leaves nothing pending.
         let (mut store, mut workspace, mut view, _) = editor(&text);
         press(&mut store, &mut workspace, &mut view, "C-x ( C-f C-u C-x )");
         assert_eq!(view.primary_selection().head, 1);

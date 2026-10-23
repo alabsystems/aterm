@@ -4,8 +4,6 @@
 
 //! `download::fetch`: routed and anonymous downloads, their digests and part files.
 
-// Every test routes through the canonical config's dev profile, a private token file (plan §1,
-// rule 12).
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -236,7 +234,6 @@ fn a_destination_with_other_bytes_needs_clobber() {
     w.fake.clear_seen();
     let error = w.file(&dest, &asset, false).expect_err("different bytes");
     assert_eq!(error.kind, Kind::Conflict);
-    // The digest is known, so the Conflict is certain before a byte moves: nothing is sent.
     assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
     assert_eq!(std::fs::read(&dest).expect("kept"), b"other bytes");
     assert!(!part_path(&dest).exists());
@@ -299,8 +296,6 @@ fn an_anonymous_download_goes_through_the_web_url_and_still_checks_the_digest() 
 
 #[test]
 fn a_bracket_recheck_that_retries_counts_every_request() {
-    // Anonymous, so the download goes through the web URL and the recheck is the only api
-    // request under the asset's path: the one 502 lands on it, and its retry is counted.
     let w = World::new("dl-recheck-retry");
     let mut spec = AssetSpec::uploaded("a.bin", BYTES);
     spec.digest = DigestSpec::Null;
@@ -347,7 +342,6 @@ fn a_bracket_recheck_that_retries_counts_every_request() {
 fn a_destination_named_like_a_part_file_is_usage_before_any_request() {
     let w = World::new("dl-part-name");
     let asset = w.asset(AssetSpec::uploaded("x.agh-part", BYTES));
-    // A finished file a later download of `x` would remove as its leftover part file.
     let finished = w.dest("x.agh-part");
     std::fs::write(&finished, BYTES).expect("a finished file");
     w.fake.clear_seen();
@@ -355,7 +349,6 @@ fn a_destination_named_like_a_part_file_is_usage_before_any_request() {
     assert_eq!(error.kind, Kind::Usage, "{}", error.why);
     assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
     assert_eq!(std::fs::read(&finished).expect("still there"), BYTES);
-    // A case-insensitive volume gives `Y.AGH-PART` and `Y.agh-part` one file.
     let upper = w.asset(AssetSpec::uploaded("Y.AGH-PART", BYTES));
     let shouted = w.dest("Y.AGH-PART");
     std::fs::write(&shouted, BYTES).expect("a finished file");

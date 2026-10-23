@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `<state_dir>/converge/journal.ndjson`: one line per change, on stable media before the
-//! change is made (design §3.3).
+//! `<state_dir>/converge/journal.ndjson`: one line per change, flushed to stable media before applying.
 
 use crate::engine::Journal;
 use serde::Serialize;
@@ -11,16 +10,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The journal every surface but the machines agent keeps (`aterm init`, `aterm machines
-/// here`; the doctors and repair as they move onto the engine). The agent keeps its own
-/// `state/journal.ndjson` under its root.
-///
-/// Each line is `{"time", "id", "from", "to", "revert"}`. The file is bounded to
-/// [`FileJournal::BOUND`] bytes: a line that would carry it past the bound first moves it
-/// to `journal.1.ndjson`, replacing the one kept before, so the two together never hold
-/// more than twice the bound. A writer holds [`FileJournal::LOCK`] from its look at the
-/// journal's size to its flushed line, so two runs that cross the bound together rotate
-/// once, and neither loses the other's history or refuses its change.
+/// Bounded NDJSON change journal (`{"time", "id", "from", "to", "revert"}`) with single-rotation locking.
 #[derive(Debug, Clone)]
 pub struct FileJournal {
     dir: PathBuf,
@@ -49,13 +39,10 @@ impl FileJournal {
     pub const BOUND: u64 = 1 << 20;
     /// The advisory lock each append holds, beside the journal.
     pub const LOCK: &'static str = "journal.lock";
-    /// The longest an append waits for another writer's: a writer holds the lock for one
-    /// line, so a longer hold is a stopped process, and the change is refused rather than
-    /// the run hung behind it.
+    /// Maximum lock wait before refusing an append.
     pub const WAIT: Duration = Duration::from_secs(60);
 
-    /// The journal under `state_dir` (`aterm_types::dirs::state_dir()` for the account
-    /// that runs). Nothing is touched until the first change.
+    /// Returns a journal rooted at `<state_dir>/converge`.
     #[must_use]
     pub fn under(state_dir: &Path) -> Self {
         Self {
@@ -97,8 +84,6 @@ impl FileJournal {
         let path = self.path();
         let shown = |e: io::Error, at: &Path| format!("{}: {e}", at.display());
         make_dir(&self.dir).map_err(|e| shown(e, &self.dir))?;
-        // Held until this function returns: another writer's size, rotation and line all
-        // fall before or after this one's.
         let lock_path = self.dir.join(Self::LOCK);
         let _held = Held::take(&lock_path, self.wait).map_err(|e| shown(e, &lock_path))?;
         let held = match fs::symlink_metadata(&path) {
@@ -119,13 +104,8 @@ impl FileJournal {
         let fresh = held == 0 || held.saturating_add(len) > self.bound;
         let mut file = open_append(&path).map_err(|e| shown(e, &path))?;
         file.write_all(line).map_err(|e| shown(e, &path))?;
-        // The line must outlive a power loss that comes after the change it records: the
-        // change is made outside this device's write order, so only a durable flush keeps
-        // the promise.
         aterm_durable::durable_data(&file).map_err(|e| shown(e, &path))?;
         if fresh {
-            // A new entry (the first line, or the first after a rotation) is metadata of
-            // the folder.
             aterm_durable::durable_dir(&self.dir).map_err(|e| shown(e, &self.dir))?;
         }
         Ok(())
@@ -179,7 +159,6 @@ impl Held {
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        // The lock-order census's File evidence (as atpkg's `lock::Flock`).
         let file: std::fs::File = options.open(path)?;
         let deadline = Instant::now() + wait;
         loop {
@@ -355,7 +334,6 @@ mod tests {
             sorted,
             [FileJournal::ROTATED, FileJournal::LOCK, FileJournal::FILE]
         );
-        // The newest line is the journal's last, and the rotation holds the lines before.
         let current = lines(&journal.path());
         assert_eq!(current.last().unwrap()["id"].as_str(), Some("item.39"));
         let older = lines(&journal.rotated());
@@ -408,13 +386,10 @@ mod tests {
         let bound = 200;
         let mut journal = FileJournal::bounded(scratch.path(), bound);
         let recording = Recording::start();
-        // The first line makes the file: its data, then the folder that names it.
         journal.before_change("item.0", "from", "to", None).unwrap();
         assert_eq!(recording.take(), [Flush::Durable, Flush::Durable]);
-        // A later line in the same file: its data.
         journal.before_change("item.1", "from", "to", None).unwrap();
         assert_eq!(recording.take(), [Flush::Durable]);
-        // The line that rotates the file makes a new one: data and folder again.
         let mut flushes = Vec::new();
         while fs::metadata(journal.rotated()).is_err() {
             journal.before_change("item.n", "from", "to", None).unwrap();
@@ -431,7 +406,6 @@ mod tests {
             ..FileJournal::under(scratch.path())
         };
         journal.before_change("item.0", "a", "b", None).unwrap();
-        // Another run's append, mid-line.
         let other = Held::take(
             &scratch
                 .path()
@@ -449,7 +423,6 @@ mod tests {
         assert!(why.contains("another run held the journal"), "{why}");
         assert_eq!(applies.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(lines(&journal.path()).len(), 1);
-        // Its line done, the next one takes the lock.
         drop(other);
         journal.before_change("item.1", "a", "b", None).unwrap();
         assert_eq!(lines(&journal.path()).len(), 2);
@@ -457,10 +430,6 @@ mod tests {
 
     #[test]
     fn writers_that_cross_the_bound_together_rotate_once_and_none_is_refused() {
-        // Two runs at once (`aterm init` twice, or beside a doctor's repair as the same
-        // account): each writer's look at the size, its rotation and its line are one
-        // step. Unlocked, a second rename finds no journal and refuses its change, or moves
-        // a fresh journal over the rotation and loses the history it held.
         let scratch = aterm_tempfile::tempdir().unwrap();
         let bound: u64 = 400;
         let writers: Vec<_> = (0..4)
@@ -470,7 +439,6 @@ mod tests {
                     let mut journal = FileJournal::bounded(&dir, bound);
                     let mut rotations = Vec::new();
                     for n in 0..64 {
-                        // Every id the same length, so every line is.
                         let id = format!("writer.{writer}.item.{n:02}");
                         journal
                             .before_change(&id, "from", "to", None)
@@ -499,7 +467,6 @@ mod tests {
             panic!("lines of more than one length, or torn: {text}");
         };
         assert!(!rotations.is_empty(), "the run never rotated");
-        // A rotation is a journal one more line would have carried past the bound.
         for len in rotations {
             assert!(
                 len + line > bound,

@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use super::bus::{self, ArmMutant, Escalation, Stop, Tier};
@@ -1500,7 +1500,11 @@ impl World {
         bad
     }
 
-    /// THE MIRROR NEVER STOPS FOR ITS PIN.
+    /// THE MIRROR NEVER STOPS FOR ITS PIN. Every atomic batch pin or send
+    /// has its durable copies on the media first — the alias key in
+    /// `logkey`, a floor at or above its total and its batch in `logfloor` —
+    /// while the first version fence (and each open's admission) is durable
+    /// before those copies.
     fn mirror_stopped_for_its_pin(&self) -> Option<String> {
         let n = lock(&self.ep.state).pin_stops;
         (n > 0).then(|| format!("mirror: stopped for its pin {n} times"))
@@ -1974,8 +1978,41 @@ fn quarantine_copies(dir: &std::path::Path, names: &[String]) -> Vec<String> {
     bad
 }
 
+/// Worlds that may run at once in this process, one per two cores. A world's work is real file
+/// and socket traffic, so more worlds contend in the kernel instead of running: the crate's
+/// tests took the same 30-33 s with one world per core and with one per two cores, and spent
+/// 227 s and 144 s in the kernel (35 s and 226 s with every sweep's 4 workers unbounded).
+static WORLD_SLOTS: LazyLock<(Mutex<usize>, Condvar)> = LazyLock::new(|| {
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    (Mutex::new((cores / 2).max(1)), Condvar::new())
+});
+
+/// One of [`WORLD_SLOTS`], given back when the world ends (a panic included).
+struct WorldSlot;
+
+impl WorldSlot {
+    fn take() -> Self {
+        let (free, freed) = &*WORLD_SLOTS;
+        let mut free = lock(free);
+        while *free == 0 {
+            free = freed.wait(free).unwrap_or_else(PoisonError::into_inner);
+        }
+        *free -= 1;
+        Self
+    }
+}
+
+impl Drop for WorldSlot {
+    fn drop(&mut self) {
+        let (free, freed) = &*WORLD_SLOTS;
+        *lock(free) += 1;
+        freed.notify_one();
+    }
+}
+
 /// Run one seed: the fault phase, the settle phase, the oracle.
 pub(crate) fn run(opts: &Opts) -> Outcome {
+    let _slot = WorldSlot::take();
     let mut w = World::new(opts.clone());
     if opts.alias {
         // exit_one preserves two sessions, so give the real first bridge a

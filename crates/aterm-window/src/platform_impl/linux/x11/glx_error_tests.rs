@@ -85,7 +85,7 @@ fn raise_a_glx_error_and_an_ordinary_one() {
     assert!(!sym.is_null(), "libGLX.so.0 has glXMakeContextCurrent");
     type MakeContextCurrent =
         unsafe extern "C" fn(*mut ffi::Display, c_ulong, c_ulong, *mut c_void) -> c_int;
-    // SAFETY: GlXMakeContextCurrent's GLX 1.3 signature.
+    // SAFETY: `glXMakeContextCurrent`'s GLX 1.3 signature.
     let make_current = unsafe { std::mem::transmute::<*mut c_void, MakeContextCurrent>(sym) };
     // SAFETY: The backend's live display; its root window as both drawables.
     let root = unsafe { (xconn.xlib.XDefaultRootWindow)(xconn.display) };

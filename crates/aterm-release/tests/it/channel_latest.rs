@@ -197,7 +197,8 @@ impl FakeGithub {
         id
     }
 
-    /// `POST /releases`.
+    /// `POST /releases`. GitHub's rule: a full release (not a draft or prerelease) takes
+    /// `latest` (`make_latest` defaults to `"true"`).
     fn create(&mut self, tag: &str, draft: bool, prerelease: bool, assets: &[&str]) -> usize {
         self.releases.push(Release {
             tag: tag.into(),
@@ -313,7 +314,8 @@ impl FakeGithub {
     }
 }
 
-/// The cut's view of its channel release, through the trait the real step drives.
+/// The cut's view of its channel release, through the trait the real step drives. `id` is the
+/// release the bind will find; as live, every release call before the bind is refused.
 struct FakeChannel<'a> {
     github: &'a mut FakeGithub,
     id: usize,

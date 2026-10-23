@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for native screenshot present ordering: the pure decision is exhausted
-//! over every reachable attempt and both present outcomes, and the bounded production loop is
-//! driven over its outcome lattice and projected step by step onto the derived model.
+//! Tier-1 conformance tests for native screenshot present ordering and bounded retry decisions.
 
 use crate::{
     CaptureAfterPresentDecision, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
@@ -62,8 +60,6 @@ fn shipping_decision(input: Inputs) -> CaptureAfterPresentDecision {
     )
 }
 
-/// Negative control: a dropped present falls through to compositor capture, returning the
-/// pixels from before the native control mutation.
 fn stale_capture_mutant(_input: Inputs) -> CaptureAfterPresentDecision {
     CaptureAfterPresentDecision::Capture
 }
@@ -166,8 +162,6 @@ fn complete_shipping_barrier_trace_conforms_and_calls_present_at_most_three_time
     assert_eq!(NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, 3);
     let mut terminal_paths_seen = [false; 4];
 
-    // Exhaust every possible three-call result sequence. Early success stops the
-    // real loop, so several masks intentionally share a shorter observed prefix.
     for mask in 0u8..8 {
         let mut calls = 0usize;
         let mut observed = Vec::new();
@@ -257,8 +251,6 @@ fn stale_capture_negative_control_is_rejected() {
     assert_eq!(rejected, 3);
 }
 
-/// The model's `BuggyRetryAtLimit` slip: the retry arm reads `attempts <= limit`,
-/// so the last dropped present asks for a retry instead of failing closed.
 fn late_retry_mutant(input: Inputs) -> CaptureAfterPresentDecision {
     if input.present_succeeded {
         CaptureAfterPresentDecision::Capture
@@ -280,8 +272,6 @@ fn late_retry_negative_control_is_rejected_only_at_the_bound() {
         let before = project_before(&model, input);
         let forged = project_after(&before, input, late_retry_mutant(input));
         let at_bound = attempts == NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT;
-        // Below the bound the slip agrees with the shipping decision, so the
-        // control is not vacuous: it is the bound itself that is refused.
         assert_eq!(
             admits(&model, &before, &forged).is_none(),
             at_bound,

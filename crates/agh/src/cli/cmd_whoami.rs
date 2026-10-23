@@ -20,7 +20,7 @@ use crate::redact::Redactor;
 /// A presence as one word: `present`, `absent` or `unusable`. An unusable row's `why` starts
 /// with the load error's slug (`loose: …`), as `login_mismatch: …` and `github_refused: 401`
 /// do.
-fn presence_word(presence: Presence) -> &'static str {
+const fn presence_word(presence: Presence) -> &'static str {
     match presence {
         Presence::Present => "present",
         Presence::Absent => "absent",

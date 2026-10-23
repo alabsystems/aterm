@@ -66,7 +66,8 @@ pub(crate) enum ObserverMode {
     Full,
 }
 
-/// Bound on the observer's event queue.
+/// Bound on the observer's event queue. `tccd` is bursty, so it can fill: overflow is dropped,
+/// which loses at most one correlation, and a lost correlation expires into no verdict.
 const EVENT_QUEUE_CAP: usize = 256;
 
 /// Bound on the in-flight correlation table, a ring fed by a stream this process does not
@@ -80,7 +81,8 @@ pub(crate) const PENDING_MAX_AGE: Duration = Duration::from_secs(600);
 /// Minimum unanswered duration (`3s`) before an `AUTHREQ_CTX` counts as a pending prompt.
 pub(crate) const PENDING_PROMPT_THRESHOLD: Duration = Duration::from_secs(3);
 
-/// Bound on the announced-`msgID` ring.
+/// Bound on the announced-`msgID` ring. Large enough that a normal session's
+/// dialogs are never re-announced, small enough to be a fixed cost.
 const ANNOUNCED_CAP: usize = 64;
 
 /// How many consecutive `AUTHREQ_*` lines may fail to parse, with nothing ever parsed, before
@@ -199,7 +201,9 @@ pub(crate) enum TccEvent {
     Unparsed,
 }
 
-/// The value after `key`, up to the first `,`, `}` or whitespace.
+/// The value after `key`, up to the first `,`, `}` or whitespace. Deliberately naive: the
+/// format is undocumented, so only the shapes recorded in the tests are claimed, and everything
+/// else is [`TccEvent::Unparsed`].
 #[cfg(any(target_os = "macos", test))]
 fn field_after<'a>(haystack: &'a str, key: &str) -> Option<&'a str> {
     let start = haystack.find(key)? + key.len();
@@ -287,7 +291,9 @@ pub(crate) fn parse_line(line: &str) -> Option<TccEvent> {
     None
 }
 
-/// The first `pid=` inside one named attribution block.
+/// The first `pid=` inside one named attribution block. The blocks share one line and the first
+/// is `responsible=` (the terminal application, the same pid for every session), so a pid is
+/// never read off the line as a whole.
 #[cfg(any(target_os = "macos", test))]
 fn pid_in_block(body: &str, block: &str) -> Option<i32> {
     let at = body.find(block)?;
@@ -377,7 +383,8 @@ pub(crate) struct PendingTable {
     entries: VecDeque<PendingEntry>,
     /// Consecutive [`TccEvent::Unparsed`] since the last understood event.
     unparsed_run: u32,
-    /// How many events this table has ever understood.
+    /// How many events this table has ever understood. Zero plus a long
+    /// unparsed run is the format-change signature.
     parsed_total: u64,
 }
 
@@ -986,7 +993,8 @@ pub(crate) struct ObserverState {
     /// verdict pass found it: the pass's deadline on a loop nothing else
     /// wakes.
     verdict_due: Option<Instant>,
-    /// Announced prompts and their tab owner.
+    /// Announced prompts and their tab owner. Only a matching result answers
+    /// a pending prompt; lost observations and expired correlations do not.
     announced: VecDeque<AnnouncedPrompt>,
     /// A tab contribution moved since the host last pushed its chrome.
     attention_dirty: bool,
@@ -1101,7 +1109,9 @@ impl ObserverState {
         StartOutcome::Started
     }
 
-    /// A fresh channel and the worker's end of it.
+    /// A fresh channel and the worker's end of it. The child slot (its stop
+    /// flag and pid) and the poke latch are new too, so nothing a stopped
+    /// worker still holds reaches the new stream.
     fn channel<P>(&mut self, poke: P) -> (StreamSink, Receiver<ObserverEvent>)
     where
         P: Fn() + Send + 'static,
@@ -1500,7 +1510,8 @@ struct ChildCell {
 }
 
 impl ChildCell {
-    /// Signal the child when one stands unreaped.
+    /// Signal the child when one stands unreaped. Pid `0` is never signalled:
+    /// `kill(0, …)` reaches aterm's own process group.
     fn signal_if_unreaped(&self, signal: Signal, kill: impl Fn(i32, Signal)) {
         if self.pid > 0 {
             kill(self.pid, signal);
@@ -1536,7 +1547,8 @@ impl ChildSlot {
 /// The worker's side, which only the macOS arm runs.
 #[cfg(any(target_os = "macos", test))]
 impl ChildSlot {
-    /// Publish a spawned child's pid.
+    /// Publish a spawned child's pid. `false` when a stop came first: the
+    /// child is signalled here, and the worker reaps it without reading.
     fn publish(&self, pid: i32, kill: impl Fn(i32, Signal)) -> bool {
         let mut cell = self.lock();
         cell.pid = pid;
@@ -1579,7 +1591,8 @@ impl ChildSlot {
     }
 }
 
-/// Deliver `signal` to `pid`.
+/// Deliver `signal` to `pid`. NON-BLOCKING by construction: it signals and
+/// returns, and the worker that spawned the child is what reaps it.
 #[cfg(unix)]
 fn send_signal(pid: i32, signal: Signal) {
     let signal = match signal {
@@ -1673,7 +1686,8 @@ const PROMPT_TITLE: &str = "aterm · permission waiting";
 pub(crate) struct AttentionGate {
     /// Whether the one notification has been spent.
     spent: bool,
-    /// Live sessions whose own protected read was refused.
+    /// Live sessions whose own protected read was refused. This contribution
+    /// ends on a verified grant or session retirement, not on a dismissal.
     denied_sessions: Vec<(u64, Instant)>,
 }
 
@@ -1731,7 +1745,8 @@ impl AttentionGate {
         }
     }
 
-    /// An observed `EPERM` under a protected root.
+    /// An observed `EPERM` under a protected root. The tab mark is raised every
+    /// time (it is per-tab and idempotent); the notification is spent once.
     fn note_eperm(&mut self, session: Option<u64>) -> AttentionOutcome {
         if self.spent {
             return AttentionOutcome {
@@ -2205,7 +2220,11 @@ mod tests {
         assert!(!observer.is_live());
     }
 
-    /// Reconcile acts on a CHANGED wish only.
+    /// Reconcile acts on a CHANGED wish only. The inert arm's worker ends by
+    /// itself after its one message, the shape of a stream that lost its log
+    /// access: asking again for the mode it had respawns nothing, while a
+    /// different mode starts, and `Off` reads `off` rather than
+    /// `unavailable`.
     #[test]
     fn reconcile_restarts_only_on_a_changed_mode() {
         let mut observer = ObserverState::inert();
@@ -2551,7 +2570,9 @@ mod tests {
         assert_eq!(observer.verdict_deadline(), None, "nothing left to cross");
     }
 
-    /// One wake per drain.
+    /// One wake per drain. Five posts before a drain poke once; the drain
+    /// clears the latch before it reads, so the next post pokes again (the
+    /// negative control: a latch that never re-arms would strand it).
     #[test]
     fn pokes_coalesce_until_the_queue_is_drained() {
         let pokes = Arc::new(AtomicUsize::new(0));

@@ -108,7 +108,8 @@ fn capture_interval_us(frames: &[(u64, u64)]) -> Option<u64> {
     Some(gaps[gaps.len() / 2])
 }
 
-/// Median gap between attempts adjacent in time (the typing cadence).
+/// Median gap between attempts adjacent in time (the typing cadence). `None`
+/// for fewer than two attempts.
 fn attempt_gap_p50_us(inputs: &[(u64, String)]) -> Option<u64> {
     let mut stamps: Vec<u64> = inputs.iter().map(|(t, _)| *t).collect();
     stamps.sort_unstable();

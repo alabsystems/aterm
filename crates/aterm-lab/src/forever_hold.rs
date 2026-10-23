@@ -9,21 +9,28 @@ use super::super::{at, word};
 use super::{Ctx, Seen, Verdict, observed, page_field, told};
 use crate::util::one_line;
 
+/// How far before the land act's journal line a read may already show its
 /// hold (the hold is told as the act is typed, the line written after).
 const TOLD_SLACK_MS: i64 = 2_000;
 
+/// How long after a nudge's journal line a read may still count the
 /// nudges before it (a read between the tell and the line).
 const NUDGE_SLACK_MS: i64 = 5_000;
 
+/// How long after `status` first reads a hold the strip may still show the
+/// hover from before it: the hold is on the timeline as the loop's call
+/// returns, the strip stamped again when the window's wake for it is
 /// applied, a look or two later at most.
 const HOVER_SLACK_MS: i64 = 10_000;
 
+/// One `status` read's hold, `[land_held, land_nudges, land_since]`;
 /// `None` where it prints no such field (`?`).
 fn fields(s: &str) -> Option<[String; 3]> {
     let f = |k: &str| word(s, k).filter(|v| v != "?");
     Some([f("land_held")?, f("land_nudges")?, f("land_since")?])
 }
 
+/// The first land act (`land@v1`): its journal time and its ledger row's
 /// second.
 fn began(seen: &Seen) -> Option<(i64, Option<i64>)> {
     let t = seen.acts(turn_end::RULE_LAND).first()?.0;
@@ -33,6 +40,7 @@ fn began(seen: &Seen) -> Option<(i64, Option<i64>)> {
     Some((t, row))
 }
 
+/// When the landing after `t` was journaled (`DONE `); past the watch where
 /// none was.
 fn landed_after(seen: &Seen, t: i64) -> i64 {
     seen.first_after("DONE ", t)
@@ -47,6 +55,7 @@ fn nudges_between(seen: &Seen, from: i64, until: i64) -> usize {
         .count()
 }
 
+/// Whether a read at `t` printing `n` nudges counts those typed since
 /// `from`: the nudges journaled before it, or before it less the slack.
 fn counts_nudges(seen: &Seen, from: i64, t: i64, n: &str) -> bool {
     let n = n.parse::<usize>().ok();
@@ -54,11 +63,13 @@ fn counts_nudges(seen: &Seen, from: i64, t: i64, n: &str) -> bool {
         || n == Some(nudges_between(seen, from, t - NUDGE_SLACK_MS))
 }
 
+/// The actual `status` reads in `(from, until)`, each with its hold
 /// fields; the first read with none, where one is.
 fn reads(seen: &Seen, from: i64, until: i64) -> Result<Vec<(i64, [String; 3])>, String> {
     reads_of(observed(&seen.status, &seen.status_reads, from, until))
 }
 
+/// The `status` reads of `list`, each with its hold fields; the first read
 /// with none, where one is.
 fn reads_of(list: Vec<(i64, &str)>) -> Result<Vec<(i64, [String; 3])>, String> {
     let mut out = Vec::new();
@@ -264,6 +275,9 @@ pub const L11: Legs = Legs {
     not: &others(4),
 };
 
+/// The words the open leg in `line` names (`open work in its report:
+/// follow-up, still open; …`: `follow-up`, `still open`), up to the next
+/// leg, the line's next part or the hover's end; split as the nudge's suffix
 /// is ([`nudge_named`]), so a word with a comma in it splits alike on both.
 fn named_words(line: &str) -> Vec<&str> {
     let Some((_, rest)) = line.split_once("open work in its report: ") else {
@@ -277,6 +291,7 @@ fn named_words(line: &str) -> Vec<&str> {
     rest[..end].split(", ").collect()
 }
 
+/// L2: the words the nudge after `t1` named open (`Your report still names
 /// open work (<words>): …`); `None` before a nudge.
 fn nudge_named(seen: &Seen, t1: i64) -> Option<Vec<String>> {
     let nudge = seen

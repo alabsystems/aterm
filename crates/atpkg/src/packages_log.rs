@@ -651,7 +651,8 @@ fn redact_tokens(text: &str) -> String {
     out
 }
 
-/// Whether `key` (lowercase, unquoted) names a credential.
+/// Whether `key` (lowercase, unquoted) names a credential. A bare `key` counts only glued
+/// with `=` (`key=…`): `the refused key: x` is prose atpkg writes.
 fn is_credential_key(key: &str, equals: bool) -> bool {
     const NAMES: [&str; 12] = [
         "token",

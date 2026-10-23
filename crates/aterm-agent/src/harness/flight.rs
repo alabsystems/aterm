@@ -126,7 +126,7 @@ pub struct FlightFold {
 }
 
 /// A `toolu_…` id's hash.
-fn id_hash(id: &str) -> u64 {
+const fn id_hash(id: &str) -> u64 {
     text_hash(id)
 }
 
@@ -139,13 +139,13 @@ impl FlightFold {
 
     /// Unix timestamp (ms) of the transcript's first timestamped row.
     #[must_use]
-    pub fn start_ms(&self) -> Option<i64> {
+    pub const fn start_ms(&self) -> Option<i64> {
         self.start_ms
     }
 
     /// Generation counter incremented whenever the fold's output changes.
     #[must_use]
-    pub fn generation(&self) -> u64 {
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 
@@ -392,7 +392,7 @@ impl Flyer {
 
     /// Builds a [`Flyer`] for a workflow run from its script slug and combined flight.
     #[must_use]
-    pub fn workflow(slug: &str, start_ms: i64, flight: FileFlight) -> Self {
+    pub const fn workflow(slug: &str, start_ms: i64, flight: FileFlight) -> Self {
         Self {
             kind: RowKind::Workflow,
             name_hash: text_hash(slug),

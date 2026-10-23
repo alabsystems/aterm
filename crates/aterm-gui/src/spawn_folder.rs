@@ -39,7 +39,9 @@ impl Fault {
 /// Where a shell starts when neither its folder nor the home folder answers.
 pub(crate) const LOCAL_STAND_IN: &str = "/";
 
-/// How long a spawn waits for the folder check.
+/// How long a spawn waits for the folder check. A local folder answers in
+/// microseconds; a hung network mount would hold the thread for its whole
+/// timeout.
 #[cfg(all(unix, not(test)))]
 const CHECK_BUDGET: Duration = Duration::from_millis(250);
 
@@ -60,7 +62,13 @@ const CHECKS_IN_FLIGHT_MAX: usize = if cfg!(test) { 64 } else { 4 };
 #[cfg(unix)]
 static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
-/// Each check still running, by its folder and when it started.
+/// Each check still running, by its folder and when it started. A folder whose
+/// check has run past the budget did not answer, and the next spawn asked to
+/// start there — the control socket's `spawn cwd=` checks before the spawn
+/// does, a person presses New Tab again — is answered at once ([`within`]),
+/// instead of waiting out the budget again beside it: half the wait for a
+/// `spawn cwd=` into a hung share (515 ms, both checks, measured on the Linux
+/// lane, 2026-10-17), and none for every New Tab after the first.
 #[cfg(unix)]
 static CHECKS_RUNNING: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 
@@ -248,7 +256,10 @@ fn canonical_in(
     within(in_flight, budget, dir, check).flatten()
 }
 
-/// [`canonical_folder`] without the time limit.
+/// [`canonical_folder`] without the time limit. On Windows it is spelled
+/// without the verbatim prefix `canonicalize` answers with
+/// ([`without_verbatim`]): the harness compares it with the folder Claude
+/// Code's folder-trust dialog shows, `C:\…`, never `\\?\C:\…`.
 fn canonical_now(dir: &str) -> Option<String> {
     let canonical = std::fs::canonicalize(dir).ok()?;
     let canonical = canonical.to_string_lossy().into_owned();
@@ -564,7 +575,10 @@ fn mount_table() -> Vec<(std::path::PathBuf, bool)> {
     Vec::new()
 }
 
-/// PURE: `table`'s mount points, each with whether its volume is local.
+/// PURE: `table`'s mount points, each with whether its volume is local. A table
+/// that is not whole — cut at the reader's cap, or holding a line it could not
+/// read — proves no folder local: a share mounted after the cut is not in it,
+/// and the mount listed below it would judge a folder on it local.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn judged(table: aterm_sysprobe::volumes::Table) -> Vec<(PathBuf, bool)> {
     let whole = table.complete;
@@ -858,7 +872,11 @@ fn kernel_path(dir: &str) -> Option<String> {
     String::from_utf8(text.get(..len)?.to_vec()).ok()
 }
 
-/// See the macOS twin.
+/// See the macOS twin. Linux: the path the kernel names for the folder's own
+/// entry, the one `getcwd()` names there (both are `d_path` of it: every
+/// symlink resolved, through this process's mounts), read back from a
+/// descriptor opened `O_PATH`, which reads nothing of the folder and needs no
+/// permission on it.
 #[cfg(target_os = "linux")]
 fn kernel_path(dir: &str) -> Option<String> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -874,7 +892,9 @@ fn kernel_path(dir: &str) -> Option<String> {
 }
 
 static NOTED_PENDING: AtomicBool = AtomicBool::new(false);
-/// The folders noted since the last park, oldest first, each once.
+/// The folders noted since the last park, oldest first, each once. Every
+/// entry is a shell that was spawned, so the list is as long as the person's
+/// own new tabs, and the park empties it.
 static NOTED: Mutex<Vec<(String, Fault)>> = Mutex::new(Vec::new());
 
 /// Note a folder a shell was asked to start in and could not, for the next

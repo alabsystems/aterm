@@ -97,7 +97,10 @@ impl Watchers {
         HeldRings(self.clone())
     }
 
-    /// Whether a hold stands, owing `ring` to its release when one does.
+    /// Whether a hold stands, owing `ring` to its release when one does. The
+    /// owed bit is set BEFORE the second look at the holds, and a release
+    /// drops its count before it takes the owed bits, so a ring that races the
+    /// last release is rung by one of the two, never by neither.
     fn owes(&self, ring: u8) -> bool {
         if self.holds.load(Ordering::SeqCst) == 0 {
             return false;
@@ -193,7 +196,8 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
 /// Single-slot watcher notification handle registered across one or more [`Watchers`] lists.
 pub(crate) struct Subscription {
     token: u64,
-    /// The blocking end [`Self::wait`] parks on.
+    /// The blocking end [`Self::wait`] parks on. It never reads a hang-up:
+    /// `notify` below keeps a sender alive for the subscription's life.
     rx: Receiver<()>,
     /// The send end, cloned into each list [`Self::watch`] registers on.
     notify: SyncSender<()>,
@@ -343,7 +347,10 @@ mod tests {
         b.ring_watchers();
     }
 
-    /// A FULL SLOT NEVER LOSES A DIRTY FLAG.
+    /// A FULL SLOT NEVER LOSES A DIRTY FLAG. A ring into a slot that already
+    /// holds a wake sends nothing, so the flag is the only record of which list
+    /// rang: it is set whether or not the send lands, and the one pending wake
+    /// finds both lists' flags.
     #[test]
     fn a_full_slot_never_loses_a_dirty_flag() {
         let (a, b, c) = (
@@ -376,7 +383,10 @@ mod tests {
         );
     }
 
-    /// A HELD LIST RINGS ONCE, AT ITS LAST HOLD'S RELEASE.
+    /// A HELD LIST RINGS ONCE, AT ITS LAST HOLD'S RELEASE. Rings made under a
+    /// hold wake nobody and set no flag; the inner hold's release rings
+    /// nothing while the outer one stands; the outer one's rings the watchers
+    /// once, each flag set.
     #[test]
     fn a_held_list_rings_once_at_its_last_holds_release() {
         let list = Arc::<Watchers>::default();

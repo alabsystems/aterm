@@ -202,6 +202,10 @@ pub fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The test seam for what another process does inside a window between a check and its
+/// use: litter at the temporary name just drawn, a lock file swapped after it was opened, a
+/// write that lands between ours and its read-back. A test arms one act for one named
+/// window on its own thread ([`with`](window::with)); the code under test marks the window
 /// with [`reached`](window::reached). Test builds only: a release build has no window.
 #[cfg(test)]
 pub(crate) mod window {
@@ -213,6 +217,8 @@ pub(crate) mod window {
         static ARMED: RefCell<Option<(&'static str, Act)>> = const { RefCell::new(None) };
     }
 
+    /// Run `f` with `act` armed for the window `name` on this thread. It fires once, with
+    /// the path the window names. Panics if `f` never reached the window, so a test cannot
     /// pass without its act having run. Disarmed after, unwinding included.
     pub(crate) fn with<R>(
         name: &'static str,
@@ -257,6 +263,7 @@ mod tests {
         crate::testdir::dir(&format!("atpkg-keys-fsio-{name}-"))
     }
 
+    /// The ordinary case: the file is replaced, and no temporary is left beside it. Both
     /// the staged bytes and the renamed entry are made durable.
     #[test]
     fn an_atomic_write_replaces_the_file_and_leaves_nothing_behind() {
@@ -318,6 +325,7 @@ mod tests {
         assert_eq!(leftovers, ["pins.rs", "roster.toml"], "no litter");
     }
 
+    /// A read is bounded at the cap, not one byte short of it, and refuses a file that is
     /// not regular before reading a byte.
     #[test]
     fn a_read_is_bounded_at_its_cap_and_refuses_non_regular_files() {
@@ -362,6 +370,7 @@ mod tests {
         );
     }
 
+    /// `create_new` + `write_all` would expose a zero-length key under its final name and
     /// `write_bytes_atomic` would clobber; link-after-fsync is whole, private and never replaces.
     #[test]
     fn an_owner_file_is_complete_private_and_never_replaced() {

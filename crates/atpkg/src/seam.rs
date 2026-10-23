@@ -287,6 +287,9 @@ fn bin_plan(src_bin: &Path) -> io::Result<BinPlan> {
 }
 
 /// Lay a view's `bin/` at `dst_bin` (created here, empty) from the build's `bin/`: one clone
+/// per [`BinPlan`] entry, so each stock name is byte-identical to its Trust tool and a
+/// stock-name copy the bundle shipped is never cloned.
+///
 /// # Errors
 /// The build's `bin/` cannot be listed, or a clone cannot be made (the store on another
 /// volume: it refuses rather than byte-copy the toolchain).
@@ -1327,7 +1330,12 @@ enum Heal {
     No,
 }
 
-/// Whether an unattended re-assertion re-points a foreign link.
+/// Whether an unattended re-assertion re-points a foreign link. rust-analyzer, `cargo +trust`
+/// and every rustup proxy run whatever the entry names, so the narrowest always-wrong case
+/// heals by itself: `name` is [`DEFAULT_SEAM`] (`trust-dev` is by name the channel a person
+/// points at a tree they are building), the target is a live build tree
+/// ([`live_build_tree`]), and its compiler is older than the store's
+/// ([`stale_against_store`]).
 fn unattended_heal(layout: &Layout, name: &str, entry: &Path, target: &Path) -> Heal {
     // A target that is not UTF-8 could not be recorded as it is (`status.toml` is text), and
     if name != DEFAULT_SEAM || target.to_str().is_none() || !live_build_tree(target) {
@@ -1440,7 +1448,8 @@ pub fn replaced_note(layout: &Layout, rustup_home: &Path, name: &str) -> Option<
     }
 }
 
-/// Why an `attach` or [`detach`] did not happen.
+/// Why an `attach` or [`detach`] did not happen. Every variant is fail-closed:
+/// nothing on disk changed.
 #[derive(Debug)]
 /// Fail-closed reason an `attach` or [`detach`] was refused.
 pub enum Refusal {
@@ -1528,7 +1537,8 @@ type LeftView = (PathBuf, Deferred);
 /// call, a test's own refresh — an injected process table, a failed re-lay — in a test.
 type Refresh<'a> = &'a dyn Fn(&Layout, &str) -> io::Result<Refreshed>;
 
-/// `attach`, also answering whether the view was left behind ([`LeftView`]).
+/// `attach`, also answering whether the view was left behind ([`LeftView`]). The entry is
+/// laid, adopted or re-pointed either way: a view one pass stale still presents a compiler.
 fn attach_reporting(
     layout: &Layout,
     rustup_home: &Path,
@@ -2069,7 +2079,9 @@ pub fn attached_keys(layout: &Layout) -> Vec<String> {
         .collect()
 }
 
-/// Add `rustup:<name>` to `status.toml`'s `seams`.
+/// Add `rustup:<name>` to `status.toml`'s `seams`. Idempotent. Seeded through
+/// [`crate::status::seed_for_rewrite`]: the save rewrites the whole record, whose `seams` list
+/// is what `uninstall --all` walks.
 fn record(layout: &Layout, name: &str) -> io::Result<()> {
     let key = record_key(name);
     let (replacing, replaced) = (replacing_prefix(name), replaced_prefix(name));

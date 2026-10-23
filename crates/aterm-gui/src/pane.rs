@@ -332,7 +332,9 @@ impl PaneTree {
         rects
     }
 
-    /// Outer pane allocations before subtab header rows are reserved.
+    /// Outer pane allocations before subtab header rows are reserved. Zoom is an
+    /// argument because [`Self::focused_rect`] measures unzoomed: a split un-zooms,
+    /// so a zoomed pane's full-window rect would admit a split that does not fit.
     #[must_use]
     fn layout_cells(&self, rows: u16, cols: u16, zoomed: bool) -> Vec<PaneRect> {
         let win_rows = rows.max(1);

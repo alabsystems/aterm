@@ -389,7 +389,10 @@ fn level_aware_eviction_keeps_the_open_path_and_every_rollup() {
     assert_eq!(read.recs.len(), log.len());
 }
 
-/// THE POLICY ORDER, by what a ring keeps.
+/// THE POLICY ORDER, by what a ring keeps. Closes under half: as a busy
+/// open turn's marks push the ring past its bound, the batch takes the closed
+/// turn's detail, then the opens of closed commands and turns, then the open
+/// turn's OLDEST detail, and every close stays.
 #[test]
 fn eviction_takes_classes_in_policy_order() {
     let build = |cmds: u64| {

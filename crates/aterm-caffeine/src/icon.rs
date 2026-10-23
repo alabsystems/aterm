@@ -1,31 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The menu-bar icon: a coffee mug with an "a" on it, drawn here as coverage (pure, testable
-//! everywhere) and handed to AppKit as a PNG it marks as a template image, so the menu bar
-//! tints it for light, dark and highlighted bars itself.
-//!
-//! Off is an empty mug (an outline, the "a" drawn inside it); on is a full one (the body
-//! solid, the "a" cut out of it, steam above). Both states share the body and the handle, so
-//! a click changes the fill and the steam and nothing moves.
-//!
-//! The drawing is one design in points (the 18-point square, y down), sampled 8 x 8 times
-//! per pixel at either scale. Its straight edges sit on whole points (the 1x pixel grid) and
-//! the wall and the letter's stroke are whole or half points, so their straight runs land on
-//! whole pixels at 2x and whole or half pixels at 1x: the body is 11 points
-//! square with a 1.5-point wall, the "a" is a double-storey letter 5 points square drawn with
-//! a 1-point stroke (at 18 pixels a single-storey one reads as an "o"), and the steam is three
-//! S-shaped wisps above the rim.
+//! Menu-bar coffee-mug icon rasterized as coverage and encoded as a template PNG.
 
-/// The icon's width and height in points; [`coverage`] and [`png`] draw it at `px` pixels a
-/// side (18 for a 1x display, 36 for 2x).
+/// The icon's width and height in points.
 pub const SIZE_POINTS: f64 = 18.0;
 
-/// Point samples per pixel along each axis: an edge lands on one of 65 coverage levels.
 const SUBSAMPLES: u32 = 8;
 
-/// The icon at `px` × `px` pixels: one coverage byte per pixel (0 clear, 255 ink), rows from
-/// the top. `lit` is the full mug (keeping awake), else the empty one.
+/// The icon at `px` × `px` pixels: one coverage byte per pixel (0 clear, 255 ink).
 #[must_use]
 pub fn coverage(lit: bool, px: u32) -> Vec<u8> {
     let n = px as usize;
@@ -48,15 +31,13 @@ pub fn coverage(lit: bool, px: u32) -> Vec<u8> {
                     hits += u32::from(ink(lit, p));
                 }
             }
-            // Rounded to the nearest byte: no sample is 0 and every sample is 255.
             *cell = ((hits * 255 + samples / 2) / samples) as u8;
         }
     }
     out
 }
 
-/// [`coverage`] as an 8-bit RGBA PNG: black, with the coverage as alpha (what a template
-/// image wants). Empty if the encoder refuses (it does not for any `px` from 1 up).
+/// [`coverage`] as an 8-bit RGBA template PNG (black with coverage as alpha).
 #[must_use]
 pub fn png(lit: bool, px: u32) -> Vec<u8> {
     let alpha = coverage(lit, px);
@@ -79,32 +60,16 @@ pub fn png(lit: bool, px: u32) -> Vec<u8> {
     out
 }
 
-// The design, in points.
-
-/// The body: left, top, right, bottom. The mug and its handle span x 2..16 (centred in the
-/// square); the body fills the lower two thirds, the steam the top third.
 const BODY: [f64; 4] = [2.0, 6.0, 13.0, 17.0];
-/// The body's top corners' radius (the rim) and its bottom corners' (the base).
 const BODY_RADII: [f64; 2] = [1.0, 3.0];
-/// The empty mug's wall.
 const WALL: f64 = 1.5;
-/// The handle: a ring about a point on the body's right side, of which the part outside the
-/// body shows. Centre x and y, outer and inner radius.
 const HANDLE: [f64; 4] = [13.0, 11.0, 3.0, 1.5];
-/// The "a": left, top, width, height and stroke. It sits 1.5 points inside the empty mug's
-/// wall on every side.
 const LETTER: [f64; 5] = [5.0, 9.0, 5.0, 5.0, 1.0];
-/// The radius of the bowl's left corners and of the arch's turn into the stem.
 const LETTER_TURN: f64 = 1.0;
-/// The steam's wisps: the centre x of each, under the body's centre and 3 points apart.
 const STEAM_X: [f64; 3] = [4.5, 7.5, 10.5];
-/// A wisp's centre line: top and bottom y, then its swing either side of its centre x.
-/// One S per wisp: left of centre in its upper half, right in its lower.
 const STEAM_LINE: [f64; 3] = [1.5, 4.5, 0.75];
-/// A wisp's stroke.
 const STEAM_STROKE: f64 = 0.9;
 
-/// A point in the 18-point square, y down.
 #[derive(Clone, Copy)]
 struct Pt {
     x: f64,
@@ -118,8 +83,6 @@ impl Pt {
     }
 }
 
-/// Whether the point is ink. Each shape is a signed distance (negative inside); a union is
-/// the minimum, a cut the maximum with the negated cutter.
 #[inline]
 fn ink(lit: bool, p: Pt) -> bool {
     let body = body(p);
@@ -134,22 +97,17 @@ fn ink(lit: bool, p: Pt) -> bool {
     d <= 0.0
 }
 
-/// The body's signed distance.
 #[inline]
 fn body(p: Pt) -> f64 {
     let [rim, base] = BODY_RADII;
     round_rect(p, BODY, [rim, rim, base, base])
 }
 
-/// The double-storey "a": a bar along the top that turns down into a stem on the right, and
-/// a bowl below the bar whose right side is the stem. Rows of the 1x letter: the bar, the
-/// stem alone, the bowl's top, its counter, its foot.
 #[inline]
 fn letter_a(p: Pt) -> f64 {
     let [left, top, width, height, stroke] = LETTER;
     let half = stroke / 2.0;
     let r = LETTER_TURN;
-    // Centre lines: the bar's y, the stem's x, the bowl's top and foot.
     let bar_y = top + half;
     let stem_x = left + width - half;
     let bowl_top = top + 2.0 * stroke + half;
@@ -176,11 +134,6 @@ fn letter_a(p: Pt) -> f64 {
     arch.min(stem).min(bowl)
 }
 
-/// The steam's signed distance where that is within the stroke, else a positive lower bound
-/// of it: the same ink either way. A wisp's centre line stays inside the box its top, bottom
-/// and swing span, so a point farther than the stroke from that box is clear without
-/// walking the line. That keeps the full mug as cheap to draw as the empty one: without it
-/// every sample of the body walks all three polylines.
 fn steam(p: Pt) -> f64 {
     let [top, bottom, swing] = STEAM_LINE;
     let half = STEAM_STROKE / 2.0;
@@ -196,8 +149,6 @@ fn steam(p: Pt) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-/// Distance to one wisp's centre line: a sine period down [`STEAM_LINE`] about `cx`, as a
-/// polyline fine enough that no pixel at 2x sees its corners.
 fn wisp(p: Pt, cx: f64) -> f64 {
     const STEPS: u32 = 24;
     let [top, bottom, swing] = STEAM_LINE;
@@ -213,7 +164,6 @@ fn wisp(p: Pt, cx: f64) -> f64 {
         .fold(f64::INFINITY, f64::min)
 }
 
-/// Distance to the upper right quarter of the circle of radius `r` about `c`.
 #[inline]
 fn quarter_arc(p: Pt, c: Pt, r: f64) -> f64 {
     let (dx, dy) = (p.x - c.x, p.y - c.y);
@@ -226,8 +176,6 @@ fn quarter_arc(p: Pt, c: Pt, r: f64) -> f64 {
     }
 }
 
-/// Signed distance to the rectangle `[left, top, right, bottom]` whose corners are rounded by
-/// `[top left, top right, bottom right, bottom left]` (each at most half the shorter side).
 #[inline]
 fn round_rect(p: Pt, [x0, y0, x1, y1]: [f64; 4], radii: [f64; 4]) -> f64 {
     let (cx, cy) = (f64::midpoint(x0, x1), f64::midpoint(y0, y1));
@@ -242,14 +190,12 @@ fn round_rect(p: Pt, [x0, y0, x1, y1]: [f64; 4], radii: [f64; 4]) -> f64 {
     qx.max(qy).min(0.0) + qx.max(0.0).hypot(qy.max(0.0)) - r
 }
 
-/// Signed distance to the ring between radii `ri` and `ro` about (`cx`, `cy`).
 #[inline]
 fn ring(p: Pt, [cx, cy, ro, ri]: [f64; 4]) -> f64 {
     let r = (p.x - cx).hypot(p.y - cy);
     (r - ro).max(ri - r)
 }
 
-/// Distance to the segment from `a` to `b`.
 #[inline]
 fn segment(p: Pt, a: Pt, b: Pt) -> f64 {
     let (dx, dy) = (b.x - a.x, b.y - a.y);
@@ -266,26 +212,19 @@ fn segment(p: Pt, a: Pt, b: Pt) -> f64 {
 mod tests {
     use super::*;
 
-    /// Both scales the menu bar asks for.
     const SCALES: [u32; 2] = [18, 36];
 
-    /// Where the steam is, in points: above the rim, across the body's width.
     const STEAM_REGION: [f64; 4] = [2.0, 0.0, 13.0, 5.0];
-    /// Where only the handle is, in points: right of the body, below the steam.
     const HANDLE_REGION: [f64; 4] = [13.0, 5.0, 18.0, 18.0];
-    /// A point on the "a"'s stem.
     const ON_THE_A: Pt = Pt::new(9.5, 12.5);
-    /// A point inside the body, between the wall and the "a".
     const IN_THE_BODY: Pt = Pt::new(4.25, 12.25);
 
-    /// The coverage of the pixel holding the point.
     fn at(cov: &[u8], px: u32, p: Pt) -> u8 {
         let k = f64::from(px) / SIZE_POINTS;
         let (col, row) = ((p.x * k).floor() as usize, (p.y * k).floor() as usize);
         cov[row * px as usize + col]
     }
 
-    /// The coverage of every pixel inside a rectangle of points.
     fn region(cov: &[u8], px: u32, [x0, y0, x1, y1]: [f64; 4]) -> Vec<u8> {
         let k = f64::from(px) / SIZE_POINTS;
         let n = px as usize;
@@ -313,8 +252,6 @@ mod tests {
 
     #[test]
     fn skipping_the_far_steam_changes_no_ink() {
-        // The box test in `steam` only skips work: over the square on a fine grid, it marks
-        // the same points ink as walking every wisp's line does.
         let exact = |p: Pt| {
             STEAM_X
                 .iter()
@@ -389,8 +326,6 @@ mod tests {
 
     #[test]
     fn the_full_mug_is_the_empty_one_filled() {
-        // Away from the "a" and the steam, a click only fills: the outline's every edge pixel
-        // is where it was, so nothing jumps.
         let [left, top, width, height, _] = LETTER;
         for px in SCALES {
             let (off, on) = (coverage(false, px), coverage(true, px));

@@ -441,7 +441,8 @@ fn validate_request(
     })
 }
 
-/// What is wrong with an environment key, if anything.
+/// What is wrong with an environment key, if anything. The faults are checked in order (empty,
+/// NUL, `=`) so the message names the most fundamental problem.
 fn env_key_fault(key: &str) -> Option<TextFault> {
     if key.is_empty() {
         Some(TextFault::Empty)
@@ -454,7 +455,9 @@ fn env_key_fault(key: &str) -> Option<TextFault> {
     }
 }
 
-/// Off macOS there is no LaunchServices and so no per-instance launchd job to be had.
+/// Off macOS there is no LaunchServices and so no per-instance launchd job to be had. The
+/// request is still validated first ([`begin_launch`]) and named in the log, so a fallback says
+/// which bundle it declined.
 #[cfg(not(target_os = "macos"))]
 fn begin_launch_validated(
     request: &LaunchRequest,
@@ -709,7 +712,8 @@ struct LaunchSlot {
 
 #[cfg(target_os = "macos")]
 impl LaunchSlot {
-    /// Record the first answer and wake the waiter.
+    /// Record the first answer and wake the waiter. Later answers are dropped: AppKit calls a
+    /// completion handler once, and a second call must never overwrite an answer already acted on.
     fn deliver(&self, answer: Result<LaunchedSuccessor, LaunchError>) {
         let mut slot = self.answer.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_none() {
@@ -797,7 +801,11 @@ impl LaunchWatch {
     }
 }
 
-/// How long is left of `budget` after `waited`, or `None` once it is spent.
+/// How long is left of `budget` after `waited`, or `None` once it is spent. `None` rather than
+/// `Some(ZERO)` for an exactly-spent budget, because `Condvar::wait_timeout(ZERO)` returns at
+/// once and a caller would spin the deadline; saturating because `waited` can exceed `budget`
+/// (the thread may be descheduled), and a panic there would be in a worker holding the
+/// user's sessions.
 #[cfg(target_os = "macos")]
 fn remaining_budget(budget: Duration, waited: Duration) -> Option<Duration> {
     budget.checked_sub(waited).filter(|left| !left.is_zero())
@@ -886,7 +894,9 @@ mod tests {
         );
     }
 
-    /// An environment no shell could carry is refused.
+    /// An environment no shell could carry is refused. A NUL in a VALUE is
+    /// the quiet one: every C-string consumer past `execve` would truncate
+    /// there.
     #[test]
     fn a_malformed_environment_is_refused() {
         let (_root, bundle) = scratch_bundle("bad-env");

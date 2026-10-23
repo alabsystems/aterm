@@ -470,7 +470,8 @@ impl DeviceHandle<'_> {
             .unwrap_or_else(|e| panic!("device layer: {label}: {e}"))
     }
 
-    /// The one buffer constructor behind the three roles.
+    /// The one buffer constructor behind the three roles. Metal storage is
+    /// shared for every role, so only wgpu reads `role`.
     fn try_create_buffer(
         &self,
         label: &'static str,

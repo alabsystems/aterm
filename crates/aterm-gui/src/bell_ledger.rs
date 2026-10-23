@@ -46,7 +46,7 @@ pub(crate) struct Rang {
     /// When it arrived (unix ms).
     pub(crate) at_unix_ms: u64,
     /// The program in front of the session then, as `status program=` names it, or the process name
-    /// of a foreground group the sweep had not yet named (`App::bell_program`).
+    /// of a foreground group the sweep had not yet named (`crate::bell_program`).
     pub(crate) program: Option<String>,
     /// What became of its sound.
     pub(crate) sound: BellSound,

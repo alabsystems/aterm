@@ -46,7 +46,7 @@ mod winsock {
     const SIO_TCP_INITIAL_RTO: u32 = 0x9800_0011;
     /// `TCP_INITIAL_RTO_UNSPECIFIED_RTT`: the system's initial RTO, untouched.
     const RTT_UNSPECIFIED: u16 = u16::MAX;
-    /// The one SYN retransmission kept (see the module).
+    /// The one SYN retransmission kept: a refusal arrives promptly, and a lost SYN still gets a retry.
     const SYN_RETRANSMISSIONS: u8 = 1;
     const WSAEWOULDBLOCK: i32 = 10035;
     /// Winsock 2.2, what std asks for.

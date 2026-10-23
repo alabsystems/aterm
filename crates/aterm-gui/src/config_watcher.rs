@@ -24,7 +24,8 @@ mod protocol_island;
 #[path = "config_watcher_binding_island.rs"]
 mod binding_island;
 
-/// How often the watcher observes the config file.
+/// How often the watcher observes the config file. 500 ms is imperceptible for
+/// an interactive "save and see it apply" loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A stable theme directory needs a bounded rescan, but not four directory
@@ -204,7 +205,8 @@ fn failure_message(kind: WatchFailureKind) -> &'static str {
     }
 }
 
-/// Worker-side failure latch.
+/// Worker-side failure latch. `transition` is the sole constructor of status
+/// wakes, making repeated identical polls presentation-inert by construction.
 #[derive(Default)]
 struct FailureLatch {
     kind: Option<WatchFailureKind>,
@@ -268,7 +270,9 @@ pub(crate) fn spawn(
     });
 }
 
-/// The config-watcher thread [`spawn`] starts.
+/// The config-watcher thread [`spawn`] starts. A fn, not the closure, because it makes the
+/// policy's one stamp source, in a body the source's seal names in `madeBy`
+/// (`harness_policy_cell_island.rs`): a closure could be handed on and run elsewhere.
 fn watch(
     path: Option<std::path::PathBuf>,
     startup_config_baseline: Option<crate::native_document_host::AtomicFileBaseline>,
@@ -630,7 +634,8 @@ fn initial_config_observation_changed(
     startup != Some(&observed.baseline)
 }
 
-/// Cheap identity/metadata stamp for the config's logical path.
+/// Cheap identity/metadata stamp for the config's logical path. No config byte
+/// is opened or read here.
 fn config_path_stamp(path: &std::path::Path) -> Result<ConfigPathStamp, WatchFailureKind> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     "aterm-config-metadata-v1".hash(&mut hasher);
@@ -792,7 +797,8 @@ impl ThemePollSchedule {
     }
 }
 
-/// Cheap bounded identity/metadata stamp for the theme directory.
+/// Cheap bounded identity/metadata stamp for the theme directory. No theme file
+/// is opened and no content byte is read here.
 fn theme_directory_stamp(path: &std::path::Path) -> Result<ThemeDirectoryStamp, WatchFailureKind> {
     theme_directory_stamp_capped(path, crate::app_config::ThemeScanCaps::PRODUCTION)
 }

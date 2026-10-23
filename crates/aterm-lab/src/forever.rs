@@ -208,7 +208,7 @@ pub fn wall_grace_ms(program: &str) -> i64 {
 
 /// The claim the stub's wall is raised with on harness `h` ([`wall_step`]): a five-hour window, which Claude Code reads off the unified-limit headers and Muse Code off the `usage_limit_reached` body; on agy's Gemini API key the claim names nothing and the stub answers the key's spent per-day quota; Gemini CLI gets a Google account's spent usage limit ([`crate::stub::gemini::ACCOUNT_CLAIM`]), the 429 on which its usage-limit dialog names the reset.
 #[must_use]
-pub fn wall_claim(h: Harness) -> &'static str {
+pub const fn wall_claim(h: Harness) -> &'static str {
     match h {
         Harness::Gemini => crate::stub::gemini::ACCOUNT_CLAIM,
         Harness::Claude | Harness::Agy | Harness::Muse => WALL_CLAIM,
@@ -217,7 +217,7 @@ pub fn wall_claim(h: Harness) -> &'static str {
 
 /// The unix second a wall raised at `now` (ms) resets at: the first whole minute at least `ahead` ms on (W1's [`WALL_AHEAD_MS`], W2's further, [`Chain::wall_ahead_ms`]).
 #[must_use]
-pub fn reset_s_ahead(now: i64, ahead: i64) -> i64 {
+pub const fn reset_s_ahead(now: i64, ahead: i64) -> i64 {
     (now + ahead + 59_999) / 60_000 * 60
 }
 
@@ -473,7 +473,7 @@ pub enum HideBy {
 impl Hide {
     /// The command or the option, as the report names it.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self.by {
             HideBy::Command(c) | HideBy::Option(c) => c,
         }
@@ -481,7 +481,7 @@ impl Hide {
 }
 
 /// [`Hide`] of harness `h`, or why none takes its notice away.
-pub fn hide_of(h: Harness) -> Result<Hide, &'static str> {
+pub const fn hide_of(h: Harness) -> Result<Hide, &'static str> {
     match h {
         Harness::Muse => Ok(Hide {
             by: HideBy::Command(HIDE_COMMAND),
@@ -526,7 +526,7 @@ impl Harness {
 
     /// The verb's word, the lab's `agent`, the reader's program word (the needs entry's `<program>`: `Program::name`).
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
             Harness::Gemini => "gemini",
@@ -623,7 +623,7 @@ impl Mode {
 
     /// A mode of the stub's usage wall, on a lab of its own on each harness it reaches ([`wall_out_of_reach`]), and its one scenario.
     #[must_use]
-    pub fn walled(self) -> Option<Scenario> {
+    pub const fn walled(self) -> Option<Scenario> {
         match self {
             Mode::Wall | Mode::WallDay | Mode::WallClimb => Some(Scenario::W1),
             Mode::WallHid => Some(Scenario::W2),
@@ -666,7 +666,7 @@ pub enum Repo {
 impl Repo {
     /// What the repository suffix must name of it (`RepoWork::summary`'s words), and the words of the other legs it must not.
     #[must_use]
-    pub fn named(self) -> (&'static [&'static str], &'static [&'static str]) {
+    pub const fn named(self) -> (&'static [&'static str], &'static [&'static str]) {
         match self {
             Repo::Clean => (&[], &[]),
             Repo::Untracked => (
@@ -692,7 +692,7 @@ impl Repo {
         }
     }
 
-    fn says(self) -> &'static str {
+    const fn says(self) -> &'static str {
         match self {
             Repo::Clean => "clean and pushed",
             Repo::Untracked => "wip-notes.txt untracked",
@@ -870,7 +870,7 @@ pub enum Scenario {
 
 impl Scenario {
     #[must_use]
-    pub fn id(self) -> &'static str {
+    pub const fn id(self) -> &'static str {
         match self {
             Scenario::W2 => "W2",
             Scenario::W3 => "W3",
@@ -925,7 +925,7 @@ impl Scenario {
 
     /// What it holds, for the summary.
     #[must_use]
-    pub fn what(self) -> &'static str {
+    pub const fn what(self) -> &'static str {
         match self {
             Scenario::L1 => "a work reply: land@v1 typed",
             Scenario::L2 => "a defense beside a leftover: a nudge naming it",
@@ -1185,7 +1185,7 @@ impl Chain {
     /// It meets the stub's usage wall ([`wall_step`]): W1's chains, W2's,
     /// and W3's to W10's.
     #[must_use]
-    pub fn walled(self) -> bool {
+    pub const fn walled(self) -> bool {
         matches!(
             self,
             Chain::Wall
@@ -1243,7 +1243,7 @@ impl Chain {
 
     /// How far ahead of its raising its wall resets, at least ([`wall_step`]).
     #[must_use]
-    pub fn wall_ahead_ms(self) -> i64 {
+    pub const fn wall_ahead_ms(self) -> i64 {
         match self {
             Chain::WallHid => WALL_HID_AHEAD_MS,
             Chain::WallDay | Chain::DayStopWall => WALL_DAY_AHEAD_MS,
@@ -1258,7 +1258,7 @@ impl Chain {
 
     /// The claim its wall is raised with on harness `h` ([`wall_step`]): [`wall_claim`]'s, but on the per-day quota's chain the one on which the stub answers the Gemini API's key a spent per-day quota ([`WALL_CLAIM`]: it names no Code Assist limit), whose dialog names no reset; on the bucket's the account's limit on the Pro model ([`crate::stub::gemini::BUCKET_CLAIM`]).
     #[must_use]
-    pub fn wall_claim_on(self, h: Harness) -> &'static str {
+    pub const fn wall_claim_on(self, h: Harness) -> &'static str {
         match self {
             Chain::WallDay | Chain::WallClimb | Chain::DayStopWall => WALL_CLAIM,
             Chain::BucketWall => crate::stub::gemini::BUCKET_CLAIM,
@@ -1268,7 +1268,7 @@ impl Chain {
 
     /// How its conversation opens.
     #[must_use]
-    pub fn opening(self) -> Opening {
+    pub const fn opening(self) -> Opening {
         match self {
             Chain::LandP => Opening::Person,
             Chain::Mgr => Opening::Idle,
@@ -1279,7 +1279,7 @@ impl Chain {
 
     /// Its hang detector: how long it may take to reach what it waits for.
     #[must_use]
-    pub fn limit_ms(self) -> i64 {
+    pub const fn limit_ms(self) -> i64 {
         match self {
             Chain::Cap => CAP_LIMIT_MS,
             Chain::CruiseN => CRUISE_N_LIMIT_MS,
@@ -1304,7 +1304,7 @@ impl Chain {
     }
 
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Chain::LandA => "land-a",
             Chain::LandB => "land-b",
@@ -1359,7 +1359,7 @@ impl Chain {
 
     /// The Autopilot word its tab is set to.
     #[must_use]
-    pub fn autopilot(self) -> &'static str {
+    pub const fn autopilot(self) -> &'static str {
         match self {
             Chain::Cruise
             | Chain::InstantCruise
@@ -1377,7 +1377,7 @@ impl Chain {
     }
 
     #[must_use]
-    pub fn scenarios(self) -> &'static [Scenario] {
+    pub const fn scenarios(self) -> &'static [Scenario] {
         match self {
             Chain::LandA => &[Scenario::L1, Scenario::L3, Scenario::L5],
             Chain::LandB => &[Scenario::L2],
@@ -1425,7 +1425,7 @@ impl Chain {
 
     /// What its repository holds beside its pushed `main`.
     #[must_use]
-    pub fn repo(self) -> Repo {
+    pub const fn repo(self) -> Repo {
         match self {
             Chain::LandC => Repo::Untracked,
             Chain::LandF => Repo::Changed,
@@ -1438,13 +1438,13 @@ impl Chain {
 
     /// Its tab carries a worker's task record (`task mark working from=ctl` before the agent starts): a manager waits on it.
     #[must_use]
-    pub fn tasked(self) -> bool {
+    pub const fn tasked(self) -> bool {
         matches!(self, Chain::LandE | Chain::LandT)
     }
 
     /// Its landing is the scenario: watched past the ladder's next step after it, and the stub's dumps read for a new turn after it.
     #[must_use]
-    pub fn lands(self) -> bool {
+    pub const fn lands(self) -> bool {
         matches!(
             self,
             Chain::LandA
@@ -1469,7 +1469,7 @@ impl Chain {
 
     /// Its replies are sent at once: no delay before the first byte, no pause between deltas (P4: a turn over before any read sees the worker busy).
     #[must_use]
-    pub fn instant(self) -> bool {
+    pub const fn instant(self) -> bool {
         matches!(
             self,
             Chain::InstantLand
@@ -1687,7 +1687,7 @@ impl Chain {
 
     /// The orchestrator's turn the lab types into its tab mid-watch, and when ([`orchestrator_due`]).
     #[must_use]
-    pub fn orchestrated(self) -> Option<&'static str> {
+    pub const fn orchestrated(self) -> Option<&'static str> {
         match self {
             Chain::LandP => Some(ORCHESTRATED),
             Chain::Cap => Some(RESUMED),
@@ -1797,7 +1797,7 @@ pub enum Verdict {
 
 impl Verdict {
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             Verdict::Pass(_) => "PASS",
             Verdict::Fail(_) => "FAIL",
@@ -2468,7 +2468,7 @@ struct Want {
 }
 
 impl Want {
-    fn open() -> Want {
+    const fn open() -> Want {
         Want {
             head: OPEN_SUFFIX,
             named: &[],
@@ -2477,7 +2477,7 @@ impl Want {
         }
     }
 
-    fn repo(repo: Repo) -> Want {
+    const fn repo(repo: Repo) -> Want {
         let (named, not_named) = repo.named();
         Want {
             head: REPO_SUFFIX,

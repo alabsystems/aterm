@@ -17,7 +17,9 @@ use crate::native_document_io::parse_hex16;
 /// The directory beside the journals that holds every owner's lease.
 const OWNERS_DIR: &str = ".owners";
 
-/// At most this many owners on one image.
+/// At most this many owners on one image. A set past it (more live processes
+/// than ever share one document) is not written, so that image is marked
+/// [`UNKNOWN_HOLDERS`] and never taken: dropping an owner would let it go.
 const MAX_OWNERS: usize = 32;
 
 /// The mark naming an image's owners: `<the image's fingerprint>:<id>,<id>…`,

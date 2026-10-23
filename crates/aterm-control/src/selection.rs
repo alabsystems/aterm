@@ -14,7 +14,9 @@ use crate::wire::{
     pct_encode_into, push_visible, trimmed_len, wait_ms,
 };
 
-/// The host does not resolve the target sid.
+/// The host does not resolve the target sid. Unreachable from a dispatcher that
+/// resolves the session before dispatch (aterm-gui's does); it exists so a
+/// multi-session host cannot answer a stale sid with another session's state.
 const NO_SESSION: &str = "ERR no such session\n";
 
 /// The `blocks [N]` argument: the last `N` blocks, or all of them when `N` is
@@ -131,7 +133,9 @@ fn frame_open(t: &Terminal) -> &'static str {
     frame_open_tail(frame_unfinished_now(t))
 }
 
-/// Block `id`'s raw output text, or the reply line that refuses it.
+/// Block `id`'s raw output text, or the reply line that refuses it. The enum
+/// `block_output_text` answers is an explicit signal for an evicted block,
+/// never silently shifted or empty text.
 fn block_text(t: &Terminal, id: u64) -> Result<String, &'static str> {
     use aterm_core::terminal::BlockText;
     let block = t.block_by_id(id).ok_or("ERR no such block\n")?;
@@ -142,7 +146,9 @@ fn block_text(t: &Terminal, id: u64) -> Result<String, &'static str> {
     }
 }
 
-/// Frame block output `text` (see [`blocktext`]).
+/// Frame block output `text` (see [`blocktext`]). Runs with no lock held. The
+/// blank tail is counted on the raw lines ([`trimmed_len`] reads a raw line as
+/// its shown form), so the header is written first and every row once.
 fn frame_block_text(text: &str, trim: bool, open: &str) -> String {
     use std::fmt::Write as _;
     #[cfg(test)]
@@ -478,7 +484,9 @@ pub fn cmd_copy(host: &impl SessionHost, sid: u64) -> String {
     }
 }
 
-/// Click gestures against soft wraps.
+/// Click gestures against soft wraps. A soft-wrapped line is one logical line
+/// to the copy path, so a gesture bound to the physical row would highlight
+/// edge-to-edge while copying a prefix.
 #[cfg(test)]
 mod gesture_tests {
     use aterm_core::selection::SelectionType;
@@ -625,7 +633,10 @@ mod gesture_tests {
         assert_eq!(term.selection_to_string().as_deref(), Some("STRADDLEWORD"));
     }
 
-    /// A double-click on a word after an Indic conjunct selects that word.
+    /// A double-click on a word after an Indic conjunct selects that word. The
+    /// conjunct `न्दी` is one cluster the grid lays out in three cells, so the
+    /// window join and the past-the-text guard must charge it three cells, not
+    /// its display width of one.
     #[test]
     fn a_word_click_after_an_indic_conjunct_selects_the_word() {
         let c = "\u{0928}\u{094D}\u{0926}\u{0940}";

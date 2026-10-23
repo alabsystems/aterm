@@ -1138,7 +1138,13 @@ mod tests {
         }
     }
 
-    /// THE DEFERRED WRAP FOLLOWS XTERM'S util.c.
+    /// THE DEFERRED WRAP FOLLOWS XTERM'S util.c. Every EL/ED resets it (ED 3
+    /// touches only history and keeps it); DECSEL 0 / DECSED 0 away from the
+    /// origin end in `ClearRight`'s unconditional `ResetWrap`, even over a
+    /// protected parked glyph; DECSEL 1/2 and DECSED 1/2 reach `ResetWrap`
+    /// through `ClearInLine2` only when their span holds an unprotected cell;
+    /// and at the origin (DECSED 0) or bottom-right (DECSED 1) xterm reduces to
+    /// the DECSED 2 loop.
     #[test]
     fn erases_reset_the_pending_wrap_as_xterm_does() {
         const ROW_0: &[(u16, u16)] = &[(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)];

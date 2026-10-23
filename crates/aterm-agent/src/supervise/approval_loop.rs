@@ -280,7 +280,7 @@ pub(super) struct AutopilotWord {
 
 impl AutopilotWord {
     /// A decision begins: the word last read is no longer this decision's own.
-    pub(super) fn begin(&mut self) {
+    pub(super) const fn begin(&mut self) {
         self.fresh = false;
     }
 
@@ -295,26 +295,26 @@ impl AutopilotWord {
     }
 
     /// Whether a decision should read the word.
-    pub(super) fn worth_a_read(&self) -> bool {
+    pub(super) const fn worth_a_read(&self) -> bool {
         self.kept || !self.read
     }
 
     /// Whether a bare `meta` reply was ever read ([`Self::read`]).
-    pub(super) fn read(&self) -> bool {
+    pub(super) const fn read(&self) -> bool {
         self.read
     }
 
     /// The session's own word as the last reply read named it ([`Self::word`]).
-    pub(super) fn word(&self) -> Option<Autopilot> {
+    pub(super) const fn word(&self) -> Option<Autopilot> {
         self.word
     }
 
     /// Whether the host ever answered a bare `meta`, read or refused.
-    pub(super) fn answered(&self) -> bool {
+    pub(super) const fn answered(&self) -> bool {
         self.answered
     }
 
-    fn refused(&mut self) {
+    const fn refused(&mut self) {
         self.fresh = true;
         self.answered = true;
     }
@@ -335,7 +335,7 @@ pub(super) fn question_key(dialog: &QuestionDialog, rows: &[String]) -> String {
     }
 }
 
-fn answers(dialog: &QuestionDialog, target: AnswerTarget) -> bool {
+const fn answers(dialog: &QuestionDialog, target: AnswerTarget) -> bool {
     !matches!(
         (&dialog.form, target),
         (QuestionForm::Multi { .. }, AnswerTarget::Option(_))
@@ -1546,7 +1546,7 @@ impl<C: Ctl> Session<'_, C> {
         decision
     }
 
-    fn stepper_pressed(&mut self) {
+    const fn stepper_pressed(&mut self) {
         if let Some(pressed) = self.stepper.deciding.take() {
             self.stepper.last = Some(pressed);
             self.stepper.keys += 1;
@@ -1725,7 +1725,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The one person count every key of an answer names: an untouched episode's baseline, else
     /// `seen`'s.
-    pub(super) fn person_fence(&self, seen: &Screen) -> Option<u64> {
+    pub(super) const fn person_fence(&self, seen: &Screen) -> Option<u64> {
         match &self.episode {
             Some(e) if e.by.is_none() => e.baseline,
             _ => seen.human_seq,
@@ -3607,7 +3607,7 @@ fn note_unproven(review: &mut dyn Review, seq: u64, rule_id: &str, unproven: Opt
     }
 }
 
-fn is_muse(program: &Program) -> bool {
+const fn is_muse(program: &Program) -> bool {
     match program {
         Program::Muse => true,
         Program::Claude | Program::Codex | Program::Agy | Program::Gemini | Program::Generic => {

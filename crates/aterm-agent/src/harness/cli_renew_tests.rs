@@ -428,7 +428,9 @@ fn a_staging_home_is_never_a_rows_login_directory() {
     assert!(err.contains("already held files"), "{err}");
 }
 
-/// THE WRONG ACCOUNT: the browser signed in another account.
+/// THE WRONG ACCOUNT: the browser signed in another account. Nothing live
+/// changes — no binding, no auth word, the staging home gone — and the
+/// attempt is recorded by label.
 #[test]
 fn a_renewal_that_answers_another_account_changes_nothing_live() {
     let (_tmp, env) = renew_env("renew-wrong");
@@ -591,7 +593,8 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     assert!(quiet.flows.borrow().is_empty());
 }
 
-/// Due selection needs the auth observations.
+/// Due selection needs the auth observations. A state this build cannot
+/// read must refuse the whole sitting before any local flow or remote run.
 #[test]
 fn due_renewal_refuses_foreign_state_before_local_or_remote_actions() {
     let (_tmp, env) = renew_env("renew-due-foreign-state");

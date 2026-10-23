@@ -13,6 +13,8 @@ use aterm_forge::model::PkgId;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The specimen fork: zeroize is in rustls's closure, which aterm keeps in every native
+/// cell, so the repository's lock always carries it and a fetched checkout has it
 /// unpacked. Its license, `Apache-2.0 OR MIT`, elects the MIT arm ([OB-7]).
 const FORK: &str = "zeroize";
 const FORK_LICENSE: &str = "Apache-2.0 OR MIT";
@@ -44,6 +46,8 @@ fn workspace_manifest(members_extra: &str, patch_extra: &str) -> String {
     )
 }
 
+/// The forge verb over one cell (`targo --unverified forge check --cell
+/// mac-arm`, i.e. [`aterm_forge::check::run`]), folded to `(green, transcript)`:
 /// could-not-run is red, with the reason and the transcript so far.
 fn check_one_cell(root: &Path) -> (bool, String) {
     match aterm_forge::check::run(
@@ -56,6 +60,9 @@ fn check_one_cell(root: &Path) -> (bool, String) {
     }
 }
 
+/// The forge verb over every default cell (`targo --unverified forge check`
+/// with no `--cell`, as `verify forge` runs it), folded as [`check_one_cell`]
+/// folds it. A cell rooted at a package aterm does not ship, or at a triple
 /// cargo cannot resolve, is could-not-run, so red.
 fn check_every_cell(root: &Path) -> (bool, String) {
     match aterm_forge::check::run(&aterm_forge::resolve::Cargo::from_env(), root, &[]) {
@@ -64,6 +71,8 @@ fn check_every_cell(root: &Path) -> (bool, String) {
     }
 }
 
+/// A miniature aterm workspace, rebuilt from scratch for each test in a directory of its own
+/// under the cargo target tmpdir, removed with it: two runs of this binary at once (a check
 /// beside a hand run) never build in, or remove, one another's.
 struct Fixture {
     root: PathBuf,
@@ -71,6 +80,8 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// The green baseline: one reviewed, fully-provenanced fork ([`FORK`]),
+    /// live in every cell, named in NOTICE and in the fork ledger, with no
     /// carve rows and no ratchet file.
     fn baseline(name: &str) -> Self {
         let tmp = env!("CARGO_TARGET_TMPDIR");
@@ -185,6 +196,7 @@ impl Fixture {
         self.write("NOTICE", &text);
     }
 
+    /// The fork ledger `[OB-17]` holds to the tree: the method header, one
     /// block for [`FORK`], then `extra` (more blocks, or carve rows).
     fn write_ledger(&self, extra: &str) {
         let mut text = format!(
@@ -210,6 +222,7 @@ impl Fixture {
         self.write("vendor/forge.toml", &text);
     }
 
+    /// Re-resolve after a manifest edit. `check` resolves with `--locked`, so a
     /// stale lockfile would fail the cell rather than the obligation under test.
     fn regen_lock(&self) {
         let exe = std::env::var_os("CARGO").unwrap_or_else(|| "targo".into());
@@ -227,6 +240,7 @@ impl Fixture {
         );
     }
 
+    /// A complete, well-formed fork kit, so a planted fork is wrong only in
     /// the way the test is about.
     fn add_wellformed_fork(&self, name: &str, version: &str) {
         let dir = format!("vendor/{name}");
@@ -299,6 +313,7 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+/// The carved path is the fork's `src/x86.rs`, a real module of zeroize compiled
 /// only for x86 targets; the fixture deletes it.
 #[test]
 fn a_reinstated_carved_module_reds_the_forge_verb() {
@@ -333,6 +348,9 @@ fn a_reinstated_carved_module_reds_the_forge_verb() {
     );
 }
 
+/// `[OB-11]` the census review: a `[patch.crates-io]` entry with no `[[fork]]`
+/// block in `vendor/forge.toml`, the ledger the census reads its review from.
+/// The planted fork is otherwise complete, so the red can only come from the
 /// missing review.
 #[test]
 fn an_unreviewed_patch_entry_reds_the_forge_verb() {
@@ -397,6 +415,7 @@ fn a_notice_that_omits_a_registered_fork_reds_the_forge_verb() {
     );
 }
 
+/// `[OB-17]` the fork ledger: a `[[fork]]` block describing another copy turns
 /// the verb red.
 #[test]
 fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
@@ -438,6 +457,9 @@ fn a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb() {
     assert!(!ok && log.contains("FAIL [OB-17]"), "{planted}\n{log}");
 }
 
+/// `[OB-12]` patch liveness: a second, unpatched copy of a patched crate
+/// resolving beside the fork. Cargo reports nothing (the build is green and
+/// `cargo metadata` says the patch is in force), so it is synthesized here as
 /// two path packages.
 #[test]
 fn an_unpatched_sibling_version_reds_the_forge_verb() {

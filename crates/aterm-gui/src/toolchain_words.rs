@@ -72,7 +72,8 @@ fn packages() -> Intent {
     }
 }
 
-/// A glyph from the band's closed set.
+/// A glyph from the band's closed set. A test checks every glyph this module
+/// names is in it, so the fallback is unreachable here.
 fn glyph(ch: char) -> Glyph {
     Glyph::or_fallback(ch)
 }
@@ -619,7 +620,12 @@ pub(crate) fn managed_current_words(
     )
 }
 
-/// The managed-current title over `items`, `None` when there are none.
+/// The managed-current title over `items`, `None` when there are none. Every
+/// program is named: those at their vendor's head first, "current" (or
+/// "installed" while an agent session runs an older build, `lagging`), then the
+/// others grouped by what is said of them (`Claude Code 2.1.287 and Muse Code
+/// 1.4.9-R6297.1 not checked`). Versions are shown as `current_versions` and
+/// `other_versions` say; the parenthesis never is.
 fn managed_title(
     items: &[ManagedItem],
     lagging: bool,
@@ -1089,7 +1095,10 @@ pub(crate) fn pass_load(f: &atpkg::progress::ProgressFile) -> Option<Load> {
     }
 }
 
-/// The overall meter: programs, each weighted by phase.
+/// The overall meter: programs, each weighted by phase. A finished program
+/// (done, failed or skipped) counts whole; one in flight counts its download
+/// as the first half (by bytes), a verify as half, its extraction as the
+/// second half (by bytes, to 99 %), a link as 99 %.
 fn overall_fill(f: &atpkg::progress::ProgressFile) -> Option<u16> {
     let total = u64::from(f.overall.programs_total);
     if total == 0 {

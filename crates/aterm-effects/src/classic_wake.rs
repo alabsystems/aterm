@@ -81,7 +81,9 @@ pub struct ClassicWake {
     /// Resident run-builder pool, so the comet reuses its nested buffers every
     /// redraw.
     comet_runs: Vec<Vec<CometSample>>,
-    /// Index of the run being filled.
+    /// Index of the run being filled. `comet_live + 1` slots are live once
+    /// anything is pushed; a split only leaves a non-empty run behind, so no
+    /// live slot is empty.
     comet_live: usize,
     /// Resident light-ground stroke scratch ([`Self::emit_light_comet`]), so
     /// a light frame allocates nothing after the first growth.
@@ -129,7 +131,8 @@ pub fn comet_color(mono: bool, color: u32, accent: u32, hue: f32, pos: f32) -> u
 impl ClassicWake {
     /// Hard cap on emitted quads (defends the renderer + the per-frame upload).
     const MAX_QUADS: usize = 8192;
-    /// Hard cap on live swept-path samples.
+    /// Hard cap on live swept-path samples. `cfg.length` bounds one move; this
+    /// bounds an accumulation of moves at the same instant.
     const MAX_SPARKS: usize = 512;
     /// Bloom-crown fade window (the crown follows the head this long post-move).
     const CROWN_MS: u64 = 200;
@@ -940,7 +943,13 @@ impl ClassicWake {
     /// stroke's gain ([`Self::LIGHT_STROKE_GAIN`]), capped at the body cap.
     const LIGHT_CROWN_COV: f32 = 100.0 * Self::LIGHT_STROKE_GAIN;
 
-    /// The crown on a light ground: the box crown's bloom as ink.
+    /// The crown on a light ground: the box crown's bloom as ink. One round
+    /// mark beneath the letters on the caret's cell ([`push_ink_ellipse`],
+    /// held inside the caret's row so the lines above and below stay paper),
+    /// as far past the cell as the box crown reaches (the Glow size knob),
+    /// with its window, fade and typing heat, in the box crown's colour (the
+    /// rolling spectrum, or the one-colour face's colour) as the light body's
+    /// ink, solved against the theme's text ([`LightGround::body_ink`]).
     fn emit_light_crown(
         &self,
         now: Instant,
@@ -1062,7 +1071,8 @@ impl ClassicWake {
         push_soft_veil(halos, geom, centre, radii, veil, cap);
     }
 
-    /// The comet colour at path position `pos` (0 tail ..
+    /// The comet colour at path position `pos` (0 tail .. 1 head) in this
+    /// config's face ([`comet_color`]).
     #[inline]
     fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
         comet_color(cfg.classic_mono, cfg.color, cfg.accent, self.hue, pos)

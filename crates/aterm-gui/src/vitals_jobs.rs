@@ -539,6 +539,7 @@ pub(crate) mod tests {
     fn a_tab_keeps_its_session_key_shell_and_number_and_its_own_terminal_word() {
         let root = |key, label: &str| TabRoot {
             key,
+            tab: key,
             shell_pid: 900 + u32::try_from(key).expect("small"),
             label: label.into(),
             program: String::new(),
@@ -567,6 +568,7 @@ pub(crate) mod tests {
         let me = std::process::id();
         let tabs = [TabRoot {
             key: 1,
+            tab: 1,
             shell_pid: me,
             label: "Tab 1".into(),
             program: String::new(),
@@ -601,6 +603,7 @@ pub(crate) mod tests {
         let me = std::process::id();
         let tabs = [TabRoot {
             key: 1,
+            tab: 1,
             shell_pid: me,
             label: "Tab 1".into(),
             program: String::new(),

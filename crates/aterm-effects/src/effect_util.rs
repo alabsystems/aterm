@@ -292,7 +292,8 @@ const FIRE_STOPS: [(f32, u32); 5] = [
     (1.0, 0x00FF_F0C0),
 ];
 
-/// The water ramp's stops: abyss → open-ocean blue → turquoise → aqua crest → foam.
+/// The water ramp's stops: abyss → open-ocean blue → turquoise → aqua crest → foam. Saturated
+/// and green-leaning through the midband (pale sky-cyan reads as ice).
 const WATER_STOPS: [(f32, u32); 5] = [
     (0.0, 0x0005_2C48),
     (0.35, 0x000E_66B4),
@@ -301,7 +302,10 @@ const WATER_STOPS: [(f32, u32); 5] = [
     (1.0, 0x00C2_F2F5),
 ];
 
-/// The shared 5-stop ramp core.
+/// The shared 5-stop ramp core. The window index is the count of interior stop positions
+/// strictly below `t` (three compares, no branch), feeding `(t - t0) / (t1 - t0)` into
+/// [`lerp_rgb`], so every output is bit-equal to the windowed walk ("first window with
+/// `t <= t1`"), pinned by `ramp_rewrite_is_bit_identical_to_the_stop_walk`.
 #[allow(clippy::manual_clamp)]
 #[inline]
 const fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {

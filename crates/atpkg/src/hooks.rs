@@ -717,7 +717,8 @@ fn read_rc_ledger(home: &Path) -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Record `real` as wired, best-effort (0600, temp + rename).
+/// Record `real` as wired, best-effort (0600, temp + rename). Already recorded means no
+/// write, so the ordinary pass touches nothing.
 #[cfg(unix)]
 fn record_rc_wired(home: &Path, real: &Path, ledger: &mut std::collections::BTreeSet<String>) {
     let entry = real.to_string_lossy().into_owned();
@@ -2328,7 +2329,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// THE STORE SELF-HEAL (`docs/DESIGN-amacs-2026-10-19.md` §8.1).
+    /// THE STORE SELF-HEAL (`docs/DESIGN-amacs-2026-10-19.md` §8.1). A store install.sh laid
+    /// before a name existed gains it beside the binary, spelled as install.sh spells its
+    /// own (a link to `aterm`), and a second pass lays nothing.
     #[cfg(unix)]
     #[test]
     fn store_aliases_self_heal_lays_missing_and_never_replaces_a_file() {

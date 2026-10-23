@@ -1791,6 +1791,68 @@ fn every_pages_first_frame_is_its_second() {
     });
 }
 
+/// Customize's first frame is its second: opened before the page drew or after, drawn again with nothing between, the sheet draws the same screen.
+#[test]
+fn the_customize_sheets_first_frame_is_its_second() {
+    at_each_text_scale(&[1.0, 2.0], "Customize's first frames", |scale| {
+        let mut windows = Vec::new();
+        for theme in ["Dracula", "GitHub Light"] {
+            for (width, height) in [
+                (178.0, 348.0),
+                (444.0, 180.0),
+                (444.0, 292.0),
+                (584.0, 348.0),
+                (1_095.0, 700.0),
+            ] {
+                for drawn_first in [false, true] {
+                    windows.push((theme, width, height, drawn_first));
+                }
+            }
+        }
+        on_workers(
+            &windows,
+            "Customize's first frames",
+            |&(theme, width, height, drawn_first)| {
+                let cx = view_cx_at(width, height);
+                let (mut runtime, instance, view) = setup();
+                replace_settings_source(&mut runtime, view, format!("theme = \"{theme}\"\n"));
+                go_to_route(&mut runtime, instance, view, SettingsRoute::Themes);
+                if drawn_first {
+                    let _ = compile_settings_view(&runtime, instance, view, &cx);
+                }
+                runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: ActionId::new("settings/showcase/customize"),
+                            value: None,
+                        }),
+                    )
+                    .unwrap();
+                let first = compile_settings_view(&runtime, instance, view, &cx);
+                assert!(
+                    first
+                        .semantic(&UiKey::new("settings/showcase/customize-done"))
+                        .is_some(),
+                    "{theme} {width}\u{d7}{height} at {scale}\u{d7}: the sheet is open"
+                );
+                let second = compile_settings_view(&runtime, instance, view, &cx);
+                assert!(
+                    first == second,
+                    "{theme} {width}\u{d7}{height} at {scale}\u{d7}, Customize opened \
+                     {}: the second frame draws another screen: {}",
+                    if drawn_first {
+                        "on a drawn page"
+                    } else {
+                        "before the page drew"
+                    },
+                    first_apart(&first, &second)
+                );
+            },
+        );
+    });
+}
 /// Where two compiles of one screen first differ, both sides whole.
 fn first_apart(was: &crate::native_ui::CompiledUi, now: &crate::native_ui::CompiledUi) -> String {
     fn apart<T: PartialEq + std::fmt::Debug>(what: &str, was: &[T], now: &[T]) -> Option<String> {

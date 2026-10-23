@@ -437,7 +437,7 @@ fn by_subtraction_aterms_own_work_is_never_below_zero() {
         services: 0.5,
         ..Split::default()
     };
-    let s = CoalSplit::by_subtraction(&built, &[tab(1, 0.2), tab(2, 0.2)]);
+    let s = CoalSplit::by_subtraction(&built, &[tab(1, 0.2), tab(2, 0.2)], &[]);
     assert_eq!((s.aterm_mc, s.tabs.len(), s.own_mc), (300, 2, 0));
 }
 

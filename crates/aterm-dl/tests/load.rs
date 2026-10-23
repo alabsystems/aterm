@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The loader against the C library every Linux process already has mapped
-//! (`libc.so.6`), and its refusals by name. Off Linux, the one answer is
-//! `Unsupported`.
+//! Dynamic loader tests against `libc.so.6` and refusal cases.
 
-// The tables are read only by the Linux rows.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::ffi::CStr;
@@ -13,7 +10,6 @@ use std::ffi::CStr;
 use aterm_dl::{Error, Library};
 
 aterm_dl::table! {
-    /// Real glibc entry points, one of them optional.
     struct Libc {
         getpid = c"getpid": unsafe extern "C" fn() -> i32;
         strlen = c"strlen": unsafe extern "C" fn(*const core::ffi::c_char) -> usize;
@@ -31,7 +27,6 @@ aterm_dl::table! {
 }
 
 aterm_dl::table! {
-    /// A table whose second row the library does not export.
     struct Broken {
         getpid = c"getpid": unsafe extern "C" fn() -> i32;
         missing = c"aterm_dl_missing_row": unsafe extern "C" fn();

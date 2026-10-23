@@ -496,7 +496,8 @@ pub mod env {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Acquire [`ENV_LOCK`], recovering from poisoning.
+    /// Acquire [`ENV_LOCK`], recovering from poisoning. Named `env_lock` (not
+    /// `lock`) so `aterm-census` registers it in `GUARD_HELPERS`.
     fn env_lock() -> MutexGuard<'static, ()> {
         match ENV_LOCK.lock() {
             Ok(guard) => guard,

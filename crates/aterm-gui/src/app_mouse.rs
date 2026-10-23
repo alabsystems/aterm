@@ -1207,6 +1207,8 @@ impl App {
     }
 
     /// `true` when the pointer's last window cell lies inside the focused pane's rect, i.e.
+    /// `last_mouse_cell` translates where the pointer is rather than clamping where it is
+    /// not.
     pub(crate) fn pointer_is_inside_focused_pane(&self, wid: WindowId) -> bool {
         let Some((wr, wc)) = self.windows.get(&wid).map(|ws| ws.last_mouse_window_cell) else {
             return false;

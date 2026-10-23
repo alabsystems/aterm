@@ -63,7 +63,7 @@ pub enum Theme {
 
 impl Theme {
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Theme::Dark => "dark",
             Theme::Light => "light",
@@ -74,7 +74,7 @@ impl Theme {
     /// (aterm-types scheme.rs: the renderer default #33415e, GitHub Light
     /// #b6e3ff): `context` PAINTS its selected row, since a keypress clears a
     /// real selection.
-    fn selection(self) -> &'static str {
+    const fn selection(self) -> &'static str {
         match self {
             Theme::Dark => "51;65;94",
             Theme::Light => "182;227;255",
@@ -113,7 +113,7 @@ impl Scenario {
     ];
 
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Scenario::Typing => "typing",
             Scenario::Context => "context",

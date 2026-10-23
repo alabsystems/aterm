@@ -1,24 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Chromium the browser lane drives: found, pinned at a version and
-//! sha256 that `verify provision` fetches into a cache, and launched headless
-//! with its DevTools protocol on two pipes.
-//!
-//! In order, the lane takes `ATERM_BROWSER` (any Chromium-family executable),
-//! then the pinned chrome-headless-shell in this machine's cache
-//! (`verify provision` puts it there), then an installed Chromium or
-//! Chrome. None of them is a COULD NOT RUN naming the fetch.
+//! The Chromium the browser lane drives: found, pinned at a version and sha256 that `verify
+//! provision` fetches into a cache, and launched headless with its DevTools protocol on two pipes.
 
 use std::path::{Path, PathBuf};
 
-/// The Chrome for Testing release the lane pins (the Stable channel's on
-/// 2026-10-16, published 2026-10-14).
+/// The Chrome for Testing release the lane pins (the Stable channel's on 2026-10-16, published
+/// 2026-10-14).
 pub(crate) const PIN_VERSION: &str = "155.0.8059.84";
 
-/// One platform's pinned `chrome-headless-shell-<platform>.zip`: its sha256
-/// and size, measured on the download and cross-checked against the
-/// bucket's own MD5 (`x-goog-hash`) when pinned.
+/// One platform's pinned `chrome-headless-shell-<platform>.zip`: its sha256 and size, measured on
+/// the download and cross-checked against the bucket's own MD5 (`x-goog-hash`) when pinned.
 pub(crate) struct Pinned {
     pub platform: &'static str,
     pub sha256: &'static str,
@@ -75,17 +68,14 @@ pub(crate) fn archive_url(platform: &str) -> String {
     )
 }
 
-/// The cache the pinned browser is unpacked into, aterm's `browser` in this
-/// host's user cache ([`crate::user_cache`]): on macOS
-/// `~/Library/Caches/aterm/browser.noindex`, elsewhere
-/// `$XDG_CACHE_HOME/aterm/browser`, else `~/.cache/aterm/browser`. The lane's
-/// Firefox and WebKit are unpacked beside the Chromium.
+/// The cache the pinned browser is unpacked into, aterm's `browser` in this host's user cache
+/// ([`crate::user_cache`]): on macOS `~/Library/Caches/aterm/browser.noindex`, elsewhere
+/// `$XDG_CACHE_HOME/aterm/browser`, else `~/.cache/aterm/browser`.
 pub(crate) fn host_cache_root() -> Option<PathBuf> {
     crate::host_user_cache("browser")
 }
 
-/// The unpacked pin's directory under `root`. It exists only complete:
-/// `verify provision` unpacks beside it and renames.
+/// The unpacked pin's directory under `root`.
 pub(crate) fn pinned_dir(root: &Path, platform: &str) -> PathBuf {
     root.join(format!("chrome-headless-shell-{PIN_VERSION}-{platform}"))
 }
@@ -101,8 +91,7 @@ pub(crate) fn pinned_binary(dir: &Path, platform: &str) -> PathBuf {
 #[derive(Debug, Clone)]
 pub(crate) struct Browser {
     pub path: PathBuf,
-    /// chrome-headless-shell is headless by construction; a full Chrome or
-    /// Chromium is asked for `--headless`.
+    /// chrome-headless-shell is headless by construction.
     pub shell: bool,
     /// Where it came from, for the report.
     pub source: String,
@@ -147,8 +136,7 @@ fn is_shell(path: &Path) -> bool {
         .is_some_and(|n| n.contains("headless-shell") || n.contains("headless_shell"))
 }
 
-/// The browser to drive, or why there is none (a COULD NOT RUN sentence,
-/// naming [`FETCH_FIX`]).
+/// The browser to drive, or why there is none (a COULD NOT RUN sentence, naming [`FETCH_FIX`]).
 pub(crate) fn find() -> Result<Browser, String> {
     if let Some(named) = std::env::var_os(BROWSER_ENV).filter(|v| !v.is_empty()) {
         let path = PathBuf::from(named);
@@ -192,32 +180,25 @@ pub(crate) fn find() -> Result<Browser, String> {
     ))
 }
 
-/// An ANGLE backend a session asks WebGL2 to run on (`--use-angle`). The
-/// pinned shell offers two on macOS, Metal and SwiftShader; its log names
-/// them when another is asked for (`allowed implementations:
-/// [(gl=egl-angle,angle=metal),(gl=egl-angle,angle=swiftshader)]`).
+/// An ANGLE backend a session asks WebGL2 to run on (`--use-angle`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Angle {
     /// The Mac's GPU, through ANGLE's Metal backend.
     Metal,
-    /// SwiftShader, a CPU Vulkan under ANGLE: Chromium's software WebGL,
-    /// no GPU needed.
+    /// SwiftShader, a CPU Vulkan under ANGLE: Chromium's software WebGL, no GPU needed.
     SwiftShader,
 }
 
 impl Angle {
     /// The `--use-angle` value, and the backend's name in the lane's rows.
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Angle::Metal => "metal",
             Angle::SwiftShader => "swiftshader",
         }
     }
 
-    /// Whether `adapter`, the unmasked renderer the GPU page reports, is
-    /// this backend's. A browser that cannot give the backend asked for
-    /// falls back to another (SwiftShader) without failing the page, so a
-    /// session is held to the backend its adapter names.
+    /// Whether `adapter`, the unmasked renderer the GPU page reports, is this backend's.
     pub(crate) fn drew(self, adapter: &str) -> bool {
         adapter.contains(match self {
             Angle::Metal => "ANGLE Metal Renderer",
@@ -226,10 +207,9 @@ impl Angle {
     }
 }
 
-/// The backends the lane runs, one browser session each: on macOS Metal
-/// (the GPU the wgpu-WebGL recording was drawn on) and SwiftShader;
-/// elsewhere SwiftShader, which needs no GPU.
-pub(crate) fn angle_backends() -> &'static [Angle] {
+/// The backends the lane runs, one browser session each: on macOS Metal (the GPU the wgpu-WebGL
+/// recording was drawn on) and SwiftShader; elsewhere SwiftShader, which needs no GPU.
+pub(crate) const fn angle_backends() -> &'static [Angle] {
     if cfg!(target_os = "macos") {
         &[Angle::Metal, Angle::SwiftShader]
     } else {
@@ -238,29 +218,13 @@ pub(crate) fn angle_backends() -> &'static [Angle] {
 }
 
 /// Whether the lane runs Chromium without its sandbox on `os`: on Linux.
-/// Ubuntu 23.10 and later let no unconfined program make the user namespace
-/// Chromium's sandbox needs (AppArmor's
-/// `kernel.apparmor_restrict_unprivileged_userns`), and a chrome-headless-shell
-/// unpacked into a user cache has neither an AppArmor profile nor a setuid
-/// helper, so it aborts at start ("No usable sandbox!", measured with the
-/// linux64 pin in the Linux lane's Ubuntu 24.04 guest). The lane's browser
-/// opens only the pages its own loopback server serves, the same trust
-/// `--enable-unsafe-swiftshader` already places in them. On macOS the
-/// sandbox stays on.
 pub(crate) fn sandbox_off(os: &str) -> bool {
     os == "linux"
 }
 
-/// The browser's arguments: headless, a private profile under `profile`,
-/// DevTools on fds 3 and 4, WebGL2 on `angle`, without the sandbox where
-/// [`sandbox_off`], and nothing that throttles a page the lane is waiting
-/// on. Every session takes
-/// `--enable-unsafe-swiftshader`, Chromium's opt-in to software WebGL for
-/// trusted content. Under SwiftShader it silences the deprecation the
-/// software path logs without it; under Metal it lets a GPU process that
-/// cannot start fall back to SwiftShader (without it the page gets no
-/// WebGL2 at all), and [`Angle::drew`] then names the session as not run
-/// instead of the page failing for want of a GPU.
+/// The browser's arguments: headless, a private profile under `profile`, DevTools on fds 3 and 4,
+/// WebGL2 on `angle`, without the sandbox where [`sandbox_off`], and nothing that throttles a page
+/// the lane is waiting on.
 pub(crate) fn launch_args(
     browser: &Browser,
     profile: &Path,
@@ -363,7 +327,6 @@ mod tests {
         let metal = "ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version) (Gl)";
         let swiftshader = "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) \
                            (0x0000C0DE)), SwiftShader driver) (Gl)";
-        // The linux64 pin's SwiftShader JITs with Subzero, not LLVM.
         let subzero = "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) \
                        (0x0000C0DE)), SwiftShader driver) (Gl)";
         assert!(Angle::Metal.drew(metal) && !Angle::Metal.drew(swiftshader));

@@ -31,7 +31,11 @@ fn scratch_sock(tag: &str) -> (aterm_tempfile::TempDir, PathBuf) {
     (dir, sock)
 }
 
-/// A scripted fake server on `listener`, in its own thread.
+/// A scripted fake server on `listener`, in its own thread. It answers every
+/// `version` probe `OK` (the redial's liveness test), ignores a connection that
+/// hangs up without a request, answers the first other request (recorded in
+/// `seen`) with `reply` and closes it, and stops on a `stop` request
+/// ([`stop`]).
 #[cfg(unix)]
 fn fake_server(
     listener: aterm_uds::CtlListener,
@@ -187,7 +191,10 @@ fn the_tracker_ends_a_session_only_on_every_targets_exited_frame() {
     assert!(!t.session_over());
 }
 
-/// What a resumed `subscribe` asks the successor.
+/// What a resumed `subscribe` asks the successor. `since=` (an old-process
+/// screen seq) goes; the carried event anchors (`since-block`, `since-turn`,
+/// ids the handoff carries) ride — never below the anchor the stream was
+/// opened with, and never on a multi-target stream.
 #[test]
 fn a_resumed_subscribe_carries_only_what_the_successor_can_answer() {
     let none = EventAnchors::default();
@@ -415,7 +422,8 @@ fn a_fallback_to_self_survives_a_leg_that_was_pinned() {
     );
 }
 
-/// A successor's start after any hang-up: a fresh instance.
+/// A successor's start after any hang-up: a fresh instance. Without it the
+/// in-process fake successor is this test process, started long before.
 #[cfg(unix)]
 fn started_later(_: u32) -> Option<Stamp> {
     Some(Stamp {

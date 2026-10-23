@@ -1,9 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
-//
-// Basic row operations: new, write, clear, resize, wrapped flag,
-// insert/delete/erase chars, and wide-char overwrite.
 
 use super::super::*;
 use super::make_row;
@@ -15,7 +12,6 @@ fn row_resize_shrink() {
     // SAFETY: Test-local `pages` outlives `row` for the full scope.
     unsafe { row.resize(40, &mut pages) };
     assert_eq!(row.cols(), 40);
-    // Cell at 60 is now gone
     assert!(
         row.get(60).is_none(),
         "column 60 should not exist after shrink to 40"
@@ -31,7 +27,6 @@ fn row_insert_chars() {
     assert_eq!(row.to_string(), "ABCDEFGHIJ");
 
     row.insert_chars(3, 2);
-    // "ABC  DEFGH" - IJ are pushed off the end
     assert_eq!(row.get(0).unwrap().char(), 'A');
     assert_eq!(row.get(1).unwrap().char(), 'B');
     assert_eq!(row.get(2).unwrap().char(), 'C');
@@ -51,7 +46,6 @@ fn row_delete_chars() {
     assert_eq!(row.to_string(), "ABCDEFGHIJ");
 
     row.delete_chars(3, 2);
-    // "ABCFGHIJ  " - shifted left, blanks at end
     assert_eq!(row.get(0).unwrap().char(), 'A');
     assert_eq!(row.get(1).unwrap().char(), 'B');
     assert_eq!(row.get(2).unwrap().char(), 'C');
@@ -95,7 +89,6 @@ fn row_delete_chars_more_than_remaining() {
     }
 
     row.delete_chars(5, 20);
-    // "ABCDE     "
     assert_eq!(row.get(0).unwrap().char(), 'A');
     assert_eq!(row.get(4).unwrap().char(), 'E');
     assert_eq!(row.get(5).unwrap().char(), ' ');
@@ -110,7 +103,6 @@ fn row_erase_chars() {
     assert_eq!(row.to_string(), "ABCDEFGHIJ");
 
     row.erase_chars(3, 3);
-    // "ABC   GHIJ" - no shifting, just blanks in place
     assert_eq!(row.get(0).unwrap().char(), 'A');
     assert_eq!(row.get(1).unwrap().char(), 'B');
     assert_eq!(row.get(2).unwrap().char(), 'C');
@@ -164,8 +156,6 @@ fn row_write_overwrite_wide_continuation() {
     assert_eq!(cell0_after.char(), ' ', "Cell 0 should be cleared to space");
 }
 
-// fill_cell_run
-
 #[test]
 fn fill_cell_run_with_style() {
     use crate::{CellFlags, PackedColors};
@@ -187,7 +177,6 @@ fn fill_cell_run_with_style() {
 fn fill_cell_run_clamps_to_row_end() {
     let (_pages, mut row) = make_row(10);
     let template = Cell::from_ascii_fast(b'Z');
-    // Request 20 cells but only 7 fit (cols 3..10).
     let written = row.fill_cell_run(3, 20, template);
     assert_eq!(written, 7);
     assert_eq!(row.len(), 10);
@@ -217,7 +206,6 @@ fn fill_cell_run_overwrites_wide_chars() {
     assert!(row.get(4).unwrap().is_wide());
     assert!(row.get(5).unwrap().is_wide_continuation());
 
-    // Filling over the continuation clears the orphaned head at col 4.
     let template = Cell::from_ascii_fast(b'A');
     row.fill_cell_run(5, 3, template);
     assert_eq!(

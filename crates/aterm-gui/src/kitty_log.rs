@@ -166,7 +166,8 @@ impl KittyCollectible {
     }
 }
 
-/// The rollback-safe collectible sidecar.
+/// The rollback-safe collectible sidecar. `legacy_mirror` is the roster last
+/// published as the embedded-replica baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct KittyCollectibleStore {
     #[serde(default)]
@@ -250,7 +251,10 @@ fn max_ts(a: &str, b: &str) -> String {
     }
 }
 
-/// Chronological order for first-seen stamps.
+/// Chronological order for first-seen stamps. Missing legacy stamps sort before
+/// known instants so they can never masquerade as the latest discovery; the
+/// semantic key breaks timestamp ties deterministically across processes whose
+/// second-resolution wall clocks coincide.
 fn collectible_order(a: &KittyCollectible, b: &KittyCollectible) -> std::cmp::Ordering {
     match (a.first_seen.is_empty(), b.first_seen.is_empty()) {
         (false, true) => std::cmp::Ordering::Greater,
@@ -395,7 +399,9 @@ impl KittyLog {
         merged.collectibles
     }
 
-    /// Count the events represented by a rollback-written replica row.
+    /// Count the events represented by a rollback-written replica row. A
+    /// normal collectible-aware rollback preserves the baseline `first_seen`,
+    /// so only its counter advance is new.
     fn collectible_replica_delta(
         candidate: &KittyCollectible,
         baseline: Option<&KittyCollectible>,
@@ -430,7 +436,8 @@ impl KittyLog {
         self.merge_collectible_with(&mut candidate, true);
     }
 
-    /// Merge a second physical copy of the same logical ledger.
+    /// Merge a second physical copy of the same logical ledger. Counts take
+    /// `max` rather than sum because neither replica is an independent stream.
     fn merge_collectible_replica(&mut self, mut candidate: KittyCollectible) {
         self.merge_collectible_with(&mut candidate, false);
     }
@@ -475,7 +482,9 @@ impl KittyLog {
         self.sightings == 0 && self.entries.is_empty() && self.collectibles.is_empty()
     }
 
-    /// Count one generated glyph unlock/encounter.
+    /// Count one generated glyph unlock/encounter. The semantic roster key is
+    /// validated before insert, making the persisted vector structurally
+    /// bounded by `GLYPH_IDS.len()` even when merging an edited/corrupt file.
     fn record_collectible(
         &mut self,
         key: &str,
@@ -934,7 +943,9 @@ fn try_lock(path: &Path) -> Option<HeldAdvisoryLock> {
     Some(held)
 }
 
-/// Both ledger locks, legacy first (the order every writer takes them in).
+/// Both ledger locks, legacy first (the order every writer takes them in). A
+/// refused sidecar lock drops the legacy guard already taken, which releases it
+/// by `LOCK_UN` too.
 fn lock_pair(
     legacy_path: &Path,
     sidecar_path: &Path,
@@ -992,7 +1003,10 @@ pub(crate) struct KittyLogHost {
     /// or a memory-only pin under `log = false`), so cursor frames read a `Copy`
     /// value instead of scanning the ledger.
     favourite: Option<KittyLook>,
-    /// The user pinned a favourite in this process.
+    /// The user pinned a favourite in this process. The one-shot startup import
+    /// ([`Self::absorb_initial`]) can land after such a press, and its election must
+    /// leave the explicit pick alone: under `log = false` a memory-only pin has no
+    /// roster row to win the election on its own.
     pinned_this_session: bool,
     /// Recently-logged `(session, ident)` episodes (≤ [`RING_SLOTS`], TTL
     /// [`RING_TTL`], stamp refreshed on hit): shared-session multi-window
@@ -1008,16 +1022,23 @@ pub(crate) struct KittyLogHost {
     writer: Option<KittyWriter>,
 }
 
-/// The single background flush thread and its bounded delivery channel.
+/// The single background flush thread and its bounded delivery channel. One
+/// long-lived worker parked on `recv` (no CPU while idle) does every
+/// read-merge-write, so the UI thread only `try_send`s a delta and never spawns or
+/// joins a thread on the hot path.
 struct KittyWriter {
     /// Bounded so a pathologically slow disk can't grow an unbounded backlog;
     /// the sender `try_send`s and coalesces on full (see `maybe_flush`).
     tx: std::sync::mpsc::SyncSender<KittyLog>,
-    /// Dedicated one-shot exit lane.
+    /// Dedicated one-shot exit lane. This queue is empty for the worker's
+    /// entire runtime and receives at most the final debounced tail, so a full
+    /// ordinary queue can never make shutdown silently discard that tail.
     exit_tx: std::sync::mpsc::SyncSender<KittyLog>,
     /// One-shot startup admission produced by this same background worker.
     initial: Option<std::sync::mpsc::Receiver<KittyLog>>,
-    /// The worker; joined only when it finishes within the quit deadline.
+    /// The worker; joined only when it finishes within the quit deadline. A
+    /// completed worker returns any batch that exhausted its finite exit-flush
+    /// budget so the host, rather than thread teardown, retains ownership.
     handle: std::thread::JoinHandle<KittyLog>,
 }
 
@@ -1127,7 +1148,9 @@ impl KittyLogHost {
         Self::load_with_writer_spawn(config_path, KittyWriter::spawn)
     }
 
-    /// Construction seam for the pre-armed writer.
+    /// Construction seam for the pre-armed writer. Only `load` can spawn, so
+    /// [`Self::observe`] / [`Self::maybe_flush`] cannot create a thread on the
+    /// render path; tests inject a failed pre-arm.
     fn load_with_writer_spawn(
         config_path: Option<PathBuf>,
         spawn: impl FnOnce(PathBuf) -> Option<KittyWriter>,
@@ -1187,7 +1210,10 @@ impl KittyLogHost {
         }
     }
 
-    /// Import the worker's one-shot startup ledger without waiting.
+    /// Import the worker's one-shot startup ledger without waiting. The worker
+    /// samples before processing any session delta; combining that immutable
+    /// base with `mem` therefore preserves sightings recorded while admission
+    /// was in flight without duplicating a persisted batch.
     fn poll_initial_load(&mut self) {
         let loaded = self.writer.as_mut().and_then(|writer| {
             let receiver = writer.initial.as_ref()?;
@@ -1207,7 +1233,9 @@ impl KittyLogHost {
         self.absorb_initial(loaded);
     }
 
-    /// Merge one startup ledger in and re-run the restart election.
+    /// Merge one startup ledger in and re-run the restart election. Shared by the
+    /// non-blocking render-path poll and the blocking test wait, so the two cannot
+    /// drift.
     fn absorb_initial(&mut self, loaded: KittyLog) {
         let mut loaded = loaded;
         loaded.merge_from(&self.mem);
@@ -1281,7 +1309,9 @@ impl KittyLogHost {
         );
     }
 
-    /// The shared drain core.
+    /// The shared drain core. `source` is the one difference between the entry
+    /// points: only [`SightingSource::Typed`] returns a discovery (neither repoints
+    /// the companion).
     fn observe_from<I>(
         &mut self,
         session: u64,
@@ -2513,7 +2543,9 @@ mod tests {
         assert_eq!(carried.count, 0, "a wear is not an observation");
     }
 
-    /// The logical-clock tick `n` as the RFC3339 stamp a wear writes.
+    /// The logical-clock tick `n` as the RFC3339 stamp a wear writes. Fixed
+    /// width, so lexicographic order is the clock's order — exactly the
+    /// property `max_ts` rests on.
     fn pin_stamp(n: i64) -> String {
         format!("2026-09-25T00:00:{n:02}Z")
     }
@@ -2557,7 +2589,9 @@ mod tests {
         }
     }
 
-    /// Walk `model`'s reachable space on two real replicas.
+    /// Walk `model`'s reachable space on two real replicas. A wear is the real
+    /// [`KittyLog::wear`] at the next clock stamp; a flush is `flush` of one replica
+    /// into the other.
     fn pin_merge_walk(model: &Model, flush: PinFlush) -> Result<(usize, usize), String> {
         let lex = Lexicon::builtin();
         let mut replica = KittyLog::default();

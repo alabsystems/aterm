@@ -38,7 +38,8 @@ type Rows = HashMap<String, BTreeMap<String, u64>>;
 
 #[derive(Default)]
 struct ViewState {
-    /// Which open this content belongs to.
+    /// Which open this content belongs to. A reader from another open writes
+    /// nothing and is told to stop.
     generation: u64,
     phase: Phase,
     /// The offset the view is EXACT up to: just past every record applied —
@@ -376,7 +377,9 @@ where
         .map(drop)
 }
 
-/// [`spawn_reader`]'s body, once dialled.
+/// [`spawn_reader`]'s body, once dialled. `Ok` for an end the view asked for
+/// (another generation took over) or the broker closing; `Err` for a refusal,
+/// a transport failure or a silent link.
 fn follow(
     mut conn: Conn,
     closer: &Closer,

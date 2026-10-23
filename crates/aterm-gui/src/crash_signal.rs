@@ -162,7 +162,9 @@ pub(crate) fn remove_marker_on_clean_exit() {
     imp_windows::release_marker();
 }
 
-/// Launch-unique marker path: `crash-signal-<pid>-<nanos>.log`.
+/// Launch-unique marker path: `crash-signal-<pid>-<nanos>.log`. Windows recycles PIDs
+/// aggressively; the startup timestamp keeps a later launch with a crashed instance's PID from
+/// truncating its marker.
 #[cfg(windows)]
 fn marker_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join(format!(
@@ -196,7 +198,9 @@ fn startup_nanos() -> u128 {
     aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
 }
 
-/// Delete zero-length `crash-signal-*.log` files left in `dir` (Windows).
+/// Delete zero-length `crash-signal-*.log` files left in `dir` (Windows). A clean exit removes
+/// its own ([`remove_marker_on_clean_exit`]), but a kill or a crash that wrote nothing cannot, so
+/// without this sweep they accumulate.
 #[cfg(windows)]
 fn sweep_stale_markers(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -481,7 +485,10 @@ pub(crate) mod markers {
         pub(crate) locked: bool,
     }
 
-    /// Arm this launch's marker in `dir`: [`create_locked`] under `owner`'s name.
+    /// Arm this launch's marker in `dir`: [`create_locked`] under `owner`'s name. When that
+    /// fails (a filesystem without `flock`, a refused rename, a stale pending name), an unlocked
+    /// marker is created directly under its final name, so a native crash still leaves its
+    /// banner on disk.
     pub(crate) fn arm(dir: &Path, pid: u32, nanos: u128, owner: MarkerOwner) -> Option<Armed> {
         if let Some((fd, path)) = create_locked(dir, &file_name(pid, nanos, owner)) {
             return Some(Armed {
@@ -520,7 +527,8 @@ pub(crate) mod markers {
 mod imp {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
-    /// Fatal signals we trap.
+    /// Fatal signals we trap. Each bypasses the Rust panic hook entirely, so
+    /// without this handler they leave no on-disk trace for a windowed app.
     const FATAL_SIGNALS: [i32; 5] = [
         libc::SIGSEGV,
         libc::SIGABRT,
@@ -611,7 +619,13 @@ mod imp {
     }
 
     unsafe extern "C" {
-        /// `stdlib.h`: register a handler for `exit(3)`.
+        /// `stdlib.h`: register a handler for `exit(3)`. Declared here, as the
+        /// launch-fatal fixture in `lib.rs` declares it, rather than added to
+        /// `aterm-libc`: this marker's removal and `aterm.log`'s queue flush
+        /// (`logging::flush_at_exit`, registered later, so run first) are the
+        /// handlers the product registers, and they run on `exit(3)` only —
+        /// every `_exit` path (the launch-fatal law) does both itself, through
+        /// [`super::clean_exit_now`].
         fn atexit(cb: extern "C" fn()) -> libc::c_int;
     }
 
@@ -763,7 +777,8 @@ mod imp {
         }
     }
 
-    /// Arm async-signal-safe capture of the fatal signals.
+    /// Arm async-signal-safe capture of the fatal signals. Idempotent: the
+    /// marker fd is opened (and handlers installed) only on the first call.
     pub(super) fn install_signal_handlers(arming: super::Arming) {
         if ARMED.swap(true, Ordering::SeqCst) {
             // already armed
@@ -940,7 +955,11 @@ mod marker_tests {
         let_go(fd);
     }
 
-    /// `arm` takes the locked lifecycle when it can.
+    /// `arm` takes the locked lifecycle when it can. When it cannot (here a stale pending entry
+    /// the exclusive create cannot replace, standing in for a filesystem without `flock` or a
+    /// refused rename), the launch still gets a marker, so a native crash still leaves its
+    /// banner; it is unlocked and so named `other` even for an `app` launch, never evidence of a
+    /// killed daily driver.
     #[test]
     fn a_launch_that_cannot_lock_still_gets_an_unlocked_marker_that_is_never_news() {
         let dir = scratch("marker-arm");
@@ -1223,7 +1242,9 @@ mod imp_windows {
     const BANNER_AV_AT: &[u8] = b" @ 0x";
     const BANNER_SUFFIX: &[u8] = b"\n";
 
-    /// Raw HANDLE of the pre-opened crash-marker file, or `-1` when none was opened.
+    /// Raw HANDLE of the pre-opened crash-marker file, or `-1` when none was opened. `AtomicIsize`
+    /// so the filter reads it without a lock; stored once by `install`, swapped back to `-1` by
+    /// `release_marker` at a clean exit.
     pub(super) static MARKER_HANDLE: AtomicIsize = AtomicIsize::new(-1);
 
     /// This launch's marker path, parked by `open_marker_handle` when the open succeeded, so
@@ -1255,7 +1276,8 @@ mod imp_windows {
         &buf[..]
     }
 
-    /// Allocation-free `WriteFile` loop over short writes.
+    /// Allocation-free `WriteFile` loop over short writes. Errors are swallowed: the filter must
+    /// still return so the default termination proceeds.
     fn write_all_handle(handle: isize, bytes: &[u8]) {
         if handle == INVALID_HANDLE_VALUE || handle == 0 {
             return;
@@ -1381,7 +1403,8 @@ mod imp_windows {
         }
     }
 
-    /// Arm the unhandled-exception filter.
+    /// Arm the unhandled-exception filter. Idempotent: the marker handle is
+    /// opened (and the filter registered) only on the first call.
     pub(crate) fn install() {
         if ARMED.swap(true, Ordering::SeqCst) {
             // already armed

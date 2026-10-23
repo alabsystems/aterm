@@ -805,7 +805,8 @@ fn http_exchange(
     }
 }
 
-/// Deliberately narrow admission, not a URL or cookie standard.
+/// Deliberately narrow admission, not a URL or cookie standard. This is
+/// the Claude origin the existing opener contract names.
 fn provider_url(url: &str) -> bool {
     url.starts_with("https://claude.ai/")
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())

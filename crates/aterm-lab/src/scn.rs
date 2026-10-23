@@ -266,7 +266,7 @@ impl Ctx {
         Ok(())
     }
 
-    fn rec(&self) -> &Recorder {
+    const fn rec(&self) -> &Recorder {
         self.rec.as_ref().expect("started")
     }
 
@@ -2540,7 +2540,7 @@ fn brief(ctx: &Ctx) -> J {
     b
 }
 
-fn pyline() -> Style {
+const fn pyline() -> Style {
     Style {
         indent: None,
         compact: false,

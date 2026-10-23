@@ -781,7 +781,8 @@ impl Report {
     }
 }
 
-/// One pass of the script through `d` from `t0`.
+/// One pass of the script through `d` from `t0`. `measured` turns on timers and
+/// the allocation counter.
 fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Report, Instant) {
     let mut rep = Report::default();
     let n_measured = sc.ticks.saturating_sub(sc.measure_from);
@@ -900,7 +901,10 @@ fn run(d: &mut dyn Driver, sc: &Scenario, t0: Instant, measured: bool) -> (Repor
     (rep, now)
 }
 
-/// Warm-up passes before the measured one, at most.
+/// Warm-up passes before the measured one, at most. The cold pass grows every
+/// demand-grown pool and a second can still grow the ribbon, so the gate
+/// measures after a pass that allocated nothing: a failure is a per-frame
+/// allocation, not one-time growth.
 const WARMUP_PASSES_MAX: usize = 3;
 
 /// Warm the driver until a whole pass (script + idle run-out) allocates

@@ -62,7 +62,8 @@ impl<T> MainThreadBound<T> {
 }
 
 impl<T> Drop for MainThreadBound<T> {
-    /// Obligation 3.
+    /// Obligation 3. A `T` with no destructor is dropped in place, so it never
+    /// blocks; anything else is dropped on the main thread.
     fn drop(&mut self) {
         if !std::mem::needs_drop::<T>() {
             return;

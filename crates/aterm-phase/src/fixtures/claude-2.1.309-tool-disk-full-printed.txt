@@ -1,0 +1,50 @@
+# claude-code 2.1.309 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.117.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a failed Bash call (exit 1) whose stdout opens with the words of 2.1.309's disk-full notice (its statfs form), printed by the command itself: the place Claude Code draws the notice it prefixes to a failed command's stdout
+
+⏺ Bash(touch x)
+  ⎿  Done
+
+⏺ Tool call done.
+
+✻ Baked for 0s · done 6:56 PM
+
+❯ toolstart
+
+⏺ Write(w.txt)
+  ⎿  Wrote 1 line to w.txt
+      1 hello
+
+⏺ Tool call done.
+
+✻ Cooked for 0s · done 6:57 PM
+
+❯ toolstart
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(notes.txt)
+  ⎿  Added 1 line, removed 1 line
+      1 -seed
+      1 +sprout
+
+⏺ Tool call done.
+
+✻ Churned for 0s · done 6:57 PM
+
+❯ toolstart
+
+⏺ Bash(printf '%s\n' "Disk full: this computer's volume holding /private/tmp/claude-502 (Claude Code's temporary directory) has 3 MB free, so
+      whatever this command pri…)
+  ⎿  Error: Exit code 1
+     Disk full: this computer's volume holding /private/tmp/claude-502 (Claude Code's temporary directory) has 3 MB free, so whatever this
+     command printed was lost and its own writes may have failed with "No space left on device". Free space on that volume, or restart Claude
+     Code with CLAUDE_CODE_TMPDIR set to a directory on another one, then retry. If this is the user's own computer, tell them before deleting
+     anything to make room.
+
+⏺ Tool call done.
+
+✻ Crunched for 0s · done 6:57 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts

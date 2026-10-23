@@ -63,7 +63,10 @@ const HALO_LAYERS: i32 = 4;
 const HALO_RADIUS_IDLE: f32 = 0.06;
 const HALO_RADIUS_MAX: f32 = 0.22;
 const HALO_BASE_COV: f32 = 28.0;
-/// Brightness kept while idle (× the breath).
+/// Brightness kept while idle (× the breath). The settled ember's coverage is
+/// `HALO_BASE_COV · HALO_IDLE_FLOOR · (0.35 + PULSE_DEPTH · breath)` truncated
+/// to `u8`; much below 0.30 the innermost ring quantizes to zero and the idle
+/// glow vanishes.
 const HALO_IDLE_FLOOR: f32 = 0.30;
 /// Hue spread across the halo rings (turns): each ring sits further along the
 /// wheel than the one inside it, so the rim ripples outward as a rainbow.
@@ -90,9 +93,12 @@ const MOMENTUM_FLARE_STEPS: [f32; 4] = [0.25, 0.50, 0.75, 1.00];
 /// A rung re-arms only once the paint has fallen this far below it, so a spine
 /// hovering on a rung cannot re-fire on jitter.
 const MOMENTUM_FLARE_HYST: f32 = 0.06;
-/// Flare length (seconds).
+/// Flare length (seconds). Shorter than the spine's travel between two rungs
+/// at any human typing rate, so each flare completes before the next fires.
 const TWINKLE_DUR: f32 = 0.16;
-/// The white hold on a v2 meteor's birth frame.
+/// The white hold on a v2 meteor's birth frame. `flare_at` is the tick's own
+/// `now`, so frame 0 sees age 0; under half a 120 Hz frame, so frame 1 is on
+/// the spring at any refresh rate while frame-0 jitter still reads white.
 const FLARE_WHITE_HOLD_S: f32 = 0.004;
 /// §7.1: the four halo rings pop radius ×1.4 on the flare's edge …
 const FLARE_RING_POP: f32 = 0.4;
@@ -123,7 +129,9 @@ const MAX_DT: f32 = 0.6;
 /// How many frame steps [`CursorRainbow::next_change_deadline`] dry-runs before
 /// it hands the host a poll.
 const SETTLE_LOOKAHEAD: u32 = 24;
-/// The coarsest the colour release is sampled.
+/// The coarsest the colour release is sampled. Bounds the sleep a probe asks
+/// for at the fade's slow end and how far a mispredicted paint drifts before the
+/// next real tick.
 const SETTLE_POLL_CAP: Duration = Duration::from_millis(250);
 
 /// The inputs of the last real tick, latched so
@@ -233,7 +241,9 @@ pub struct RainbowFrame {
 /// Per-window rainbow-cursor animation state: the standalone hue fallback, idle breath, twinkle, and the colour release's settle probe.
 #[derive(Clone, Default)]
 pub struct CursorRainbow {
-    /// Responsive standalone spin in unit turns `0..1`.
+    /// Responsive standalone spin in unit turns `0..1`. It is lifted onto one
+    /// complete family sweep by [`rainbow_phase_from_unit_turn`] when a host
+    /// does not provide the ribbon's shared phase.
     phase: f32,
     /// Idle-breath phase in turns `0..1`.
     pulse: f32,
@@ -271,7 +281,8 @@ pub struct CursorRainbow {
     /// Memoised [`Self::equalise_rim_light`] and no-twinkle [`Self::rim_light_peak`]
     /// for the last integer ring geometry and palette.
     rim_memo: Option<RimMemo>,
-    /// The last real tick's inputs, for the colour release's dry run.
+    /// The last real tick's inputs, for the colour release's dry run. `None`
+    /// before the first tick and across every inert early-out.
     settle_probe: Option<SettleProbe>,
     /// The dry run's answer for the frame interval it was asked at, cleared by
     /// every real tick, so repeated plans between two ticks cost one dry run.
@@ -1043,7 +1054,9 @@ impl CursorRainbow {
         peak
     }
 
-    /// The largest rim, in pixels, [`Self::rim_light_peak`] lays out.
+    /// The largest rim, in pixels, [`Self::rim_light_peak`] lays out. A
+    /// backstop: the emitters already bound the rim to one cell plus a hem
+    /// ([`HALO_RADIUS_MAX`], [`TWINKLE_REACH`]).
     const CARET_RASTER_MAX: usize = 1 << 16;
 }
 
@@ -1139,7 +1152,9 @@ const fn shade(rgb: u32, s: f32, v: f32) -> u32 {
     (ch(hi, s, v, r) << 16) | (ch(hi, s, v, g) << 8) | ch(hi, s, v, b)
 }
 
-/// How much of the energy range the caret's light floor takes to arrive.
+/// How much of the energy range the caret's light floor takes to arrive. Short,
+/// because the sparkle field competes from the first keystroke; the floor is
+/// exactly zero at rest, where the block is the cursor's own colour.
 const CARET_LIGHT_KNEE: f32 = 0.25;
 
 /// Lift a colour toward white until its relative luminance reaches `floor`.
@@ -1576,7 +1591,9 @@ mod tests {
         )
     }
 
-    /// The rim-headroom law may only move the composed caret toward white.
+    /// The rim-headroom law may only move the composed caret toward white. The
+    /// phase and ribbon-head tests care which chromatic ray owns the block, not
+    /// how far §8(d) must climb that ray for this frame's ornament.
     fn assert_white_lift_of(actual: u32, source: u32, context: &str) {
         let channels = |rgb: u32| {
             [
@@ -1662,7 +1679,9 @@ mod tests {
         }
     }
 
-    /// A hot rainbow caret rasterizes its rim's light peak every frame.
+    /// A hot rainbow caret rasterizes its rim's light peak every frame. Its
+    /// output and raster buffers are resident scratch, so a warmed frame must
+    /// not grow either allocation even as the rim hue advances.
     #[test]
     fn active_rim_reuses_its_warmed_scratch() {
         let g = geom();
@@ -1751,7 +1770,10 @@ mod tests {
         );
     }
 
-    /// The host's cursor colour is the block, on either theme polarity.
+    /// The host's cursor colour is the block, on either theme polarity. The
+    /// fill becomes `RenderInput::cursor_fill_override`, which the renderer
+    /// applies instead of `frame_cursor(input)`, so a settled caret must be the
+    /// host's colour, and two colours never collapse to one block.
     #[test]
     fn host_base_is_the_settled_block_on_either_polarity() {
         let g = geom();
@@ -2138,7 +2160,10 @@ mod tests {
         );
     }
 
-    /// Only a blinking block's charged rung crossing twinkles.
+    /// Only a blinking block's charged rung crossing twinkles. Idle-zero:
+    /// phase flips at settled energy never arm the effect timer (the phase is
+    /// not read and a resting paint crosses no rung), so twenty half-periods
+    /// leave the animator idle.
     #[test]
     fn idle_phase_flips_never_arm_effect_timer() {
         let g = geom();
@@ -2787,7 +2812,10 @@ mod tests {
     /// sweep positions agrees within `RIM_LIGHT_TOLERANCE` and rises strictly with paint.
     #[test]
     fn the_rim_light_is_hue_invariant_and_monotone_in_paint() {
-        /// Ratio `max/min` of the pile's light across the sweep.
+        /// Ratio `max/min` of the pile's light across the sweep. The budget is
+        /// the premultiply's rounding: the two bracketing candidates are one
+        /// byte apart on the inner ring, so the nearest pile sits within about
+        /// ±2 % of the grey's.
         const RIM_LIGHT_TOLERANCE: f64 = 1.05;
         const RIM_LIGHT_TOLERANCE_IDLE: f64 = 1.25;
         const GROUNDS: [u32; 2] = [0x0011_1318, 0x001A_1B26];
@@ -3264,7 +3292,9 @@ mod tests {
         out
     }
 
-    /// The colour release is drawn to its last step, on demand.
+    /// The colour release is drawn to its last step, on demand. The caret keeps cooling on the
+    /// paint spine one u8 step every few frames, so two identical frames arrive long before the
+    /// fade ends.
     #[test]
     fn the_caret_colour_release_is_drawn_to_its_last_step_on_demand() {
         const HEAD: u32 = 0x00FF_5A4E;

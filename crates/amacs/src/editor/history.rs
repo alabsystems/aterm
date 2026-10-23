@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Undo and redo: each document's linear stacks of atomic frames, and the
-//! one recorded write path that pushes them.
+//! Undo and redo: per-document linear stacks of atomic frames.
 
 use aterm_buffer::Seq;
 
@@ -36,9 +35,7 @@ impl EditorWorkspace {
             .is_some_and(|history| !history.redo.is_empty())
     }
 
-    /// Take the synchronous mutation lane's most recent commit projection. The host
-    /// uses this to rebase every other view of the same canonical document before
-    /// routing another input event.
+    /// Take the synchronous mutation lane's most recent commit projection.
     pub fn take_last_commit(&mut self, document: DocumentId) -> Option<(Seq, Vec<EditDelta>)> {
         let (committed_document, seq, deltas) = self.last_commit.take()?;
         if committed_document == document {
@@ -101,9 +98,6 @@ impl EditorWorkspace {
         self.last_commit = Some((view.document, seq, deltas.clone()));
         self.rebase_marks(view.document, &deltas);
         let history = self.histories.entry(view.document).or_default();
-        // The undo is a new commit: the frame under it now applies to the
-        // text at THIS sequence (its own edit's result, put back), so a
-        // second Undo goes on back instead of reading as diverged.
         if let Some(next) = history.undo.last_mut() {
             next.expected_seq = seq;
         }
@@ -144,8 +138,6 @@ impl EditorWorkspace {
         self.last_commit = Some((view.document, seq, deltas.clone()));
         self.rebase_marks(view.document, &deltas);
         let history = self.histories.entry(view.document).or_default();
-        // As in [`Self::undo`]: the next Redo applies to the text at this
-        // sequence.
         if let Some(next) = history.redo.last_mut() {
             next.expected_seq = seq;
         }
@@ -216,9 +208,6 @@ mod tests {
         assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "aXYZc");
     }
 
-    /// UNDO GOES ON BACK, AND REDO ON FORWARD: each is a commit of its own,
-    /// so the frame after it applies at that commit's sequence, never read
-    /// as a history another view diverged.
     #[test]
     fn undo_and_redo_step_through_more_than_one_edit() {
         let (mut store, mut workspace, mut view, document) = editor("abc");

@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aos [status|attach [code=<name>]|pause|repair [code=<name>]|resume|detach|trace]`:
-//! THE FRONT WINDOW'S MOMENTUM GLOW AS AN AOS TASK, in a debug or test build
-//! (`docs/DESIGN-aos-hosted-execution-2026-10-21.md` §5). `attach` checkpoints the
-//! glow and records every key, frame and scheduler query; `repair` replays the live
-//! code and a candidate from that checkpoint over the recorded trace and publishes the
-//! candidate's code and replayed state as one value when the corrected contract
-//! passes; fresh keys then reach the published pair through the normal key path.
-//!
-//! This module is the control thread's half: a pure [`parse`], the answer lines (pure
-//! functions of what the main thread hands back), and [`cmd`], which hops to the main
-//! thread (`Wake::Aos`, answered by [`crate::App::control_aos`] in `aos_host`).
+//! Control-thread parser, formatter, and main-thread dispatch for the `aos` verb.
 
 use aterm_aos::contract::Verdict;
 use aterm_aos::evidence::EvidenceGrade;
@@ -49,7 +39,7 @@ pub(crate) enum Asked {
     Trace,
 }
 
-/// The verb's arguments, refused where this build does not host. Pure.
+/// The verb's arguments, refused where this build does not host.
 pub(crate) fn parse(rest: &str, enabled: bool) -> Result<Asked, String> {
     if !enabled {
         return Err(NEEDS_DEBUG.to_string());
@@ -108,8 +98,7 @@ fn token(v: Option<&str>) -> String {
     v.map_or_else(|| "none".to_string(), |s| s.replace(' ', "_"))
 }
 
-/// The `status` answer: the window, then the glow as [`MomentumAosStatus`] holds it,
-/// one `k=v` line. Times are signed ns from the recording epoch.
+/// Formats the `status` answer as a single `k=v` line with signed-nanosecond epoch offsets.
 pub(crate) fn status_line(window: u64, s: &MomentumAosStatus) -> String {
     let mut line = format!(
         "window={window} attached={} code={} hot={} active={} settling={}",
@@ -223,9 +212,7 @@ pub(crate) fn resume_line(r: &Resumed) -> String {
     )
 }
 
-/// The `trace` answer: the exported trace, decoded back. It ends with `sealed=true` (a
-/// trace is answered only when its log ends with its seal) and how many of each kind of
-/// input the decoded log holds.
+/// Formats the `trace` answer from the decoded trace summary and per-kind input counts.
 pub(crate) fn trace_line(t: &TraceSummary) -> String {
     let mut line = format!(
         "window={} log={} log_epoch={} first={} end={} trace={} checkpoint={} identity={} \

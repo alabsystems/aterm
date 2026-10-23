@@ -123,7 +123,7 @@ impl Profile {
 
     /// The same profile with `covers_all_repos`.
     #[must_use]
-    pub fn with_covers_all_repos(mut self, covers: bool) -> Profile {
+    pub const fn with_covers_all_repos(mut self, covers: bool) -> Profile {
         self.covers_all_repos = covers;
         self
     }
@@ -162,13 +162,13 @@ impl Credential {
 
     /// The profile's tier.
     #[must_use]
-    pub fn tier(&self) -> Tier {
+    pub const fn tier(&self) -> Tier {
         self.tier
     }
 
     /// The token's kind.
     #[must_use]
-    pub fn kind(&self) -> TokenKind {
+    pub const fn kind(&self) -> TokenKind {
         self.kind
     }
 
@@ -180,12 +180,12 @@ impl Credential {
 
     /// The token file's `(dev, ino)` as opened; `None` for an env source.
     #[must_use]
-    pub fn file_id(&self) -> Option<(u64, u64)> {
+    pub const fn file_id(&self) -> Option<(u64, u64)> {
         self.file_id
     }
 
     /// Returns the raw token bytes for `door::AuthHeader` and the redactor.
-    pub(crate) fn expose(&self) -> &[u8] {
+    pub(crate) const fn expose(&self) -> &[u8] {
         self.secret.expose()
     }
 
@@ -239,7 +239,7 @@ pub enum LoadError {
 impl LoadError {
     /// Maps `Missing` and `Unavailable` to `Presence::Absent` and others to `Presence::Unusable`.
     #[must_use]
-    pub fn presence(&self) -> Presence {
+    pub const fn presence(&self) -> Presence {
         match self {
             LoadError::Missing | LoadError::Unavailable(_) => Presence::Absent,
             other => Presence::Unusable(other.slug()),

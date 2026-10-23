@@ -40,7 +40,8 @@ pub struct TokenBucket {
     /// Hard cap on a single `try_consume(amount)` call, independent of
     /// the bucket level.
     per_sequence_max: u64,
-    /// Last refill instant.
+    /// Last refill instant. `None` until the first `try_consume` seeds it,
+    /// so construction needs no clock.
     last_refill: Option<Instant>,
 }
 

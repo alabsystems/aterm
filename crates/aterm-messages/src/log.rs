@@ -944,7 +944,9 @@ impl MessageLog {
         }
     }
 
-    /// Into the ring; past [`LOG_CAP`] the oldest retired record goes.
+    /// Into the ring; past [`LOG_CAP`] the oldest retired record goes. A live row's
+    /// record stays while the band paints it (the `messages` verb and the Settings page
+    /// read it there; the Retired line merges its final words into it).
     fn push_record(&mut self, rec: LogRecord) {
         if self.ring.len() >= LOG_CAP {
             self.evict_one(rec.stamp.unix_ms);
@@ -1998,7 +2000,9 @@ pub(crate) mod tests {
         assert_eq!(log.len() - wire_n, LOG_CAP - WIRE_LOG_SHARE);
     }
 
-    /// A message at the crate's own caps reads back from its own line.
+    /// A message at the crate's own caps reads back from its own line. The caps are in
+    /// chars; [`MAX_LINE_BYTES`] is in bytes, sized from the caps at four bytes a char
+    /// with room to spare, so a line this encoder wrote is never `TooLong`.
     #[test]
     fn codec_reads_back_a_message_at_the_crates_own_caps() {
         for (name, unit) in [

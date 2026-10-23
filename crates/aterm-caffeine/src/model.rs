@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Whether, and until when, this Mac is kept awake: the mug's whole model, pure.
-//!
-//! Times are whole seconds since the Unix epoch (wall clock), passed in by the caller, so a
-//! deadline does not move when the Mac sleeps and every rule here is a plain function.
+//! Pure state and deadline model for caffeine wake assertions.
 
 /// Seconds in an hour.
 pub const HOUR: u64 = 60 * 60;
 
-/// The longest span `aterm caffeine on <span>` takes: a year. Forever is its own mode.
+/// The longest span `aterm caffeine on <span>` takes.
 pub const MAX_SPAN: u64 = 365 * 24 * HOUR;
 
 /// One of the menu's Activate choices.
@@ -21,7 +18,7 @@ pub enum Choice {
     Hours8,
     /// Activate for 24 Hours.
     Hours24,
-    /// Activate Forever: until a click turns it off.
+    /// Activate Forever.
     Forever,
 }
 
@@ -86,8 +83,7 @@ pub enum Mode {
     Off,
     /// Keeping it awake until turned off.
     Forever,
-    /// Keeping it awake until `deadline` (seconds since the Unix epoch), set as a span of
-    /// `span` seconds (what the menu checks).
+    /// Keeping it awake until `deadline`.
     Until {
         /// When it turns off.
         deadline: u64,
@@ -97,7 +93,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// On for `span` seconds from `now`, or [`Mode::Forever`] for `None`. A zero span is off.
+    /// On for `span` seconds from `now`, or [`Mode::Forever`] for `None`.
     #[inline]
     #[must_use]
     pub const fn activate(span: Option<u64>, now: u64) -> Self {
@@ -129,7 +125,7 @@ impl Mode {
         }
     }
 
-    /// This mode as it stands at `now`: a deadline that has passed is off.
+    /// This mode as it stands at `now`.
     #[inline]
     #[must_use]
     pub const fn settled(self, now: u64) -> Self {
@@ -150,7 +146,7 @@ impl Mode {
         }
     }
 
-    /// Seconds left at `now` of a timed mode; `None` when off or forever.
+    /// Seconds left at `now` of a timed mode.
     #[inline]
     #[must_use]
     pub const fn remaining(self, now: u64) -> Option<u64> {
@@ -160,8 +156,7 @@ impl Mode {
         }
     }
 
-    /// The menu choice this mode was set by at `now`: none when off or when the span is not a
-    /// menu one (`aterm caffeine on 90m`).
+    /// The menu choice this mode was set by at `now`.
     #[inline]
     #[must_use]
     pub const fn choice(self, now: u64) -> Option<Choice> {
@@ -173,11 +168,9 @@ impl Mode {
     }
 }
 
-/// Parse a span word: `forever`, a menu word (`1h`, `8h`, `24h`), or `<n>h` / `<n>m` up to
-/// [`MAX_SPAN`]. `Ok(None)` is forever.
+/// Parse a span word: `forever` (`Ok(None)`), or `<n>h` / `<n>m` up to [`MAX_SPAN`].
 ///
 /// # Errors
-///
 /// A word that is none of those, a zero span, or one longer than a year.
 pub fn parse_span(word: &str) -> Result<Option<u64>, String> {
     if word == "forever" {
@@ -200,7 +193,7 @@ pub fn parse_span(word: &str) -> Result<Option<u64>, String> {
     }
 }
 
-/// `secs` left, as a person reads it: `7 h 12 min`, `52 min`, `1 h`, `less than a minute`.
+/// `secs` left, as a person reads it.
 #[must_use]
 pub fn describe_left(secs: u64) -> String {
     let minutes = secs / 60;
@@ -226,7 +219,6 @@ mod tests {
         assert_eq!(on.toggled(NOW + 5), Mode::Off);
         let timed = Mode::chosen(Choice::Hours8, NOW);
         assert_eq!(timed.toggled(NOW + 1), Mode::Off);
-        // A deadline that passed is off, so the click turns it on again.
         assert_eq!(timed.toggled(NOW + 8 * HOUR), Mode::Forever);
     }
 
@@ -262,7 +254,6 @@ mod tests {
         assert_eq!(Mode::Forever.remaining(NOW), None);
         assert_eq!(Mode::Forever.settled(u64::MAX), Mode::Forever);
         assert_eq!(Mode::activate(Some(0), NOW), Mode::Off);
-        // A deadline past the end of time saturates instead of wrapping.
         assert_eq!(
             Mode::activate(Some(HOUR), u64::MAX),
             Mode::Until {

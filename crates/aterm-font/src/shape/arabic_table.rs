@@ -8,10 +8,7 @@
 // with `get` for the indexing.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! The Arabic shaper's joining types, by code point.
-//!
-//! `joining_type` scans `JOINING_BLOCKS` where upstream matched on the code
-//! point's 4096 block first; the answers are the same.
+//! Arabic shaper joining types by code point.
 
 use super::arabic::JoiningType::{self, D, GroupAlaph as A, GroupDalathRish as DR, L, R, T, U, X};
 

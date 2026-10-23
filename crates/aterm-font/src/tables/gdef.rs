@@ -5,8 +5,8 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Glyph Definition Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/gdef) implementation.
+//! A [Glyph Definition Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/gdef)
+//! implementation.
 
 use crate::GlyphId;
 use crate::opentype_layout::{Class, ClassDefinition, Coverage};
@@ -15,7 +15,8 @@ use crate::parser::{FromSlice, LazyArray16, Offset, Offset16, Offset32, Stream};
 use crate::NormalizedCoordinate;
 use crate::var_store::ItemVariationStore;
 
-/// A [glyph class](https://docs.microsoft.com/en-us/typography/opentype/spec/gdef#glyph-class-definition-table).
+/// A [glyph
+/// class](https://docs.microsoft.com/en-us/typography/opentype/spec/gdef#glyph-class-definition-table).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
 pub enum GlyphClass {
@@ -45,8 +46,8 @@ impl<'a> Table<'a> {
         }
 
         let glyph_class_def_offset = s.read::<Option<Offset16>>()?;
-        s.skip::<Offset16>(); // attachListOffset
-        s.skip::<Offset16>(); // ligCaretListOffset
+        s.skip::<Offset16>();
+        s.skip::<Offset16>();
         let mark_attach_class_def_offset = s.read::<Option<Offset16>>()?;
 
         let mut mark_glyph_sets_def_offset: Option<Offset16> = None;
@@ -104,20 +105,15 @@ impl<'a> Table<'a> {
         Some(table)
     }
 
-    /// Checks that face has
-    /// [Glyph Class Definition Table](
+    /// Checks that face has [Glyph Class Definition Table](
     /// https://docs.microsoft.com/en-us/typography/opentype/spec/gdef#glyph-class-definition-table).
     #[inline]
     pub const fn has_glyph_classes(&self) -> bool {
         self.glyph_classes.is_some()
     }
 
-    /// Returns glyph's class according to
-    /// [Glyph Class Definition Table](
+    /// Returns glyph's class according to [Glyph Class Definition Table](
     /// https://docs.microsoft.com/en-us/typography/opentype/spec/gdef#glyph-class-definition-table).
-    ///
-    /// Returns `None` when *Glyph Class Definition Table* is not set
-    /// or glyph class is not set or invalid.
     #[inline]
     pub fn glyph_class(&self, glyph_id: GlyphId) -> Option<GlyphClass> {
         match self.glyph_classes?.get(glyph_id) {
@@ -129,11 +125,8 @@ impl<'a> Table<'a> {
         }
     }
 
-    /// Returns glyph's mark attachment class according to
-    /// [Mark Attachment Class Definition Table](
+    /// Returns glyph's mark attachment class according to [Mark Attachment Class Definition Table](
     /// https://docs.microsoft.com/en-us/typography/opentype/spec/gdef#mark-attachment-class-definition-table).
-    ///
-    /// All glyphs not assigned to a class fall into Class 0.
     #[inline]
     pub fn glyph_mark_attachment_class(&self, glyph_id: GlyphId) -> Class {
         self.mark_attach_classes
@@ -141,19 +134,15 @@ impl<'a> Table<'a> {
             .unwrap_or(0)
     }
 
-    /// Checks that glyph is a mark according to
-    /// [Mark Glyph Sets Table](
+    /// Checks that glyph is a mark according to [Mark Glyph Sets Table](
     /// https://docs.microsoft.com/en-us/typography/opentype/spec/gdef#mark-glyph-sets-table).
-    ///
-    /// `set_index` allows checking a specific glyph coverage set.
-    /// Otherwise all sets will be checked.
     #[inline]
     pub fn is_mark_glyph(&self, glyph_id: GlyphId, set_index: Option<u16>) -> bool {
         is_mark_glyph_impl(self, glyph_id, set_index).is_some()
     }
 
-    /// Returns glyph's variation delta at a specified index according to
-    /// [Item Variation Store Table](
+    /// Returns glyph's variation delta at a specified index according to [Item Variation Store
+    /// Table](
     /// https://docs.microsoft.com/en-us/typography/opentype/spec/gdef#item-variation-store-table).
     #[inline]
     pub fn glyph_variation_delta(

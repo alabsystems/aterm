@@ -218,7 +218,8 @@ impl ProgressTrack {
         self.overdue_grace = ETA_OVERDUE_MIN.max(at.saturating_duration_since(now) / 5);
     }
 
-    /// When the latch runs out: its completion instant plus the grace.
+    /// When the latch runs out: its completion instant plus the grace. Past
+    /// it, with nothing new, the estimate is no longer an estimate.
     fn overdue_at(&self) -> Option<Instant> {
         self.anchor?.checked_add(self.overdue_grace)
     }
@@ -352,7 +353,9 @@ fn secs_up(d: Duration) -> u64 {
     ms(d).div_ceil(1000)
 }
 
-/// The words for `s` whole seconds left; `None` past a day.
+/// The words for `s` whole seconds left; `None` past a day. Under five
+/// seconds the honest word is `<5 s left` (`5 s` beside 0.5 s left reads as a
+/// promise of five more seconds).
 fn eta_words_secs(s: u64, short: bool) -> Option<String> {
     let (n, long_unit, short_unit) = if s < 5 {
         return Some(if short { "<5s left" } else { "<5 s left" }.to_string());

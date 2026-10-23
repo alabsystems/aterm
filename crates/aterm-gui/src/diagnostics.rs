@@ -1303,7 +1303,8 @@ fn first_authored_package_key(config: &crate::app_config::Config) -> Option<&'st
     }
 }
 
-/// Pure atpkg admission projection.
+/// Pure atpkg admission projection. The package preferences remain parseable in an
+/// unpinned build, but no package operation may act without a verification root.
 fn package_capability_warnings(
     config: &crate::app_config::Config,
     root_available: bool,
@@ -1334,7 +1335,8 @@ pub(crate) enum ConfigCapabilityPlatform {
 }
 
 impl ConfigCapabilityPlatform {
-    /// The build host's family.
+    /// The build host's family. `cfg!` rather than `#[cfg]` constants, so every variant
+    /// stays a live value and the validator is testable for all four on any host.
     const CURRENT: Self = if cfg!(target_os = "macos") {
         Self::MacOs
     } else if cfg!(windows) {
@@ -2338,7 +2340,9 @@ pub(crate) fn list_keybinds() -> String {
     s
 }
 
-/// The inline annotation for one user `[keybindings]` row in [`list_keybinds`].
+/// The inline annotation for one user `[keybindings]` row in [`list_keybinds`]. The
+/// unbind spelling is checked first: `"f11" = "none"` is the documented way to free a
+/// seeded default.
 fn user_keybinding_note(chord: &str, action: &str) -> String {
     user_keybinding_note_for(action, crate::keybinding::builtin_shadow_label(chord))
 }

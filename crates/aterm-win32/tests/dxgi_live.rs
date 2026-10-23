@@ -86,6 +86,10 @@ fn monitors() -> Vec<usize> {
 }
 
 /// The reference a successful call wrote to `out`, owned.
+///
+/// # Safety
+///
+/// `out` is what the call whose result is `hr` wrote.
 unsafe fn owned(hr: i32, out: *mut c_void) -> Option<Com> {
     // SAFETY: The caller's contract.
     (hr >= 0).then(|| unsafe { Com::from_raw(out) }).flatten()

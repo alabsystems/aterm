@@ -53,7 +53,7 @@ pub(crate) fn golden_dir(root: &Path, flavor: Flavor) -> PathBuf {
     toy_dir(root).join("golden").join(flavor_name(flavor))
 }
 
-pub(crate) fn flavor_name(flavor: Flavor) -> &'static str {
+pub(crate) const fn flavor_name(flavor: Flavor) -> &'static str {
     match flavor {
         Flavor::Web => "web",
         Flavor::Nodejs => "nodejs",

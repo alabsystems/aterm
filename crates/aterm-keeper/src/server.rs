@@ -432,7 +432,8 @@ impl Server {
         self.apply(outs);
     }
 
-    /// Watch `pid`'s exit (a PENDING successor, an orphan's leader).
+    /// Watch `pid`'s exit (a PENDING successor, an orphan's leader). A pid
+    /// already gone cannot be watched: whatever waited on it is judged now.
     fn watch_pid(&mut self, pid: u32) {
         if self.watches.contains_key(&pid) {
             return;
@@ -714,7 +715,9 @@ impl Server {
         }
     }
 
-    /// Write one frame to `conn`.
+    /// Write one frame to `conn`. A failed write (the peer died or closed its end, or took nothing
+    /// for [`IO_TIMEOUT`]) ends the keeper's writing to that connection, never its reading: what
+    /// the peer wrote before is still read, in order, through its EOF (§5.3 step 4).
     fn send(&mut self, conn: ConnId, frame: &Frame, fd: Option<&OwnedFd>) {
         let Some(c) = self.conns.get(&conn) else {
             return;
@@ -1052,7 +1055,9 @@ mod tests {
         }
     }
 
-    /// Turn until the one connection's EOF drops it.
+    /// Turn until the one connection's EOF drops it. The peer's end is closed
+    /// only when every copy of it is: a child a sibling test thread has
+    /// forked and not yet exec'd holds one for a while.
     fn until_its_eof(server: &mut Server) {
         let started = Instant::now();
         while !server.conns.is_empty() {

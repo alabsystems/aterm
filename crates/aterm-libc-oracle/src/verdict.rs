@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a run decided, as data: each phase's status, every finding, and the
-//! reason the run could not go on, if it stopped. Exit codes: 0 pass, 1 finding,
-//! 2 usage, 3 could not run. A finding outranks a stop: what was decided before
-//! the machine failed is still a defect in the tree.
+//! Run verdict: each phase's status, every finding, and any early-stop reason.
 
 use std::fmt;
 
@@ -18,7 +15,7 @@ pub const EXIT_FINDING: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_COULD_NOT_RUN: u8 = 3;
 
-/// The run could not go on: a prerequisite is missing. Says what, and the fix.
+/// The run could not go on: a prerequisite is missing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CouldNotRun {
     pub what: String,
@@ -57,8 +54,7 @@ impl fmt::Display for CouldNotRun {
 /// A defect in the tree: the shim, its generated oracle, or their inputs.
 #[derive(Clone, Debug)]
 pub enum Finding {
-    /// A checked-in input the oracle reads is unusable (a stale `Cargo.lock`,
-    /// an unreadable `union.json`).
+    /// A checked-in input the oracle reads is unusable (such as `Cargo.lock` or `union.json`).
     Input {
         what: String,
         detail: String,
@@ -153,8 +149,7 @@ impl Phase {
 pub enum Status {
     Ok,
     Fail,
-    /// Not run: an earlier phase made its verdict meaningless, or the run
-    /// stopped before it.
+    /// Not run: an earlier phase made its verdict meaningless, or the run stopped before it.
     Skip,
 }
 

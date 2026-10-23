@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`super::System::catch_stops`]'s live arm: SIGINT, SIGTERM and SIGHUP noted instead of
-//! ending the process, so `screen` can close its relay and lock a session the admin logged in
-//! to over it before it exits (design §6).
-//!
-//! The handler only stores the signal's number in one atomic, which is all a handler may
-//! safely do; the walk's waits read it between requests. A caught (not ignored) disposition
-//! is reset to the default across `exec`, so the `ssh` runs the walk starts meet each signal
-//! as they would have. The dispositions are the whole process's, so one flow holds them at a
-//! time: `screen` is the only caller. The host's screen watcher only ignores hang-ups
-//! ([`ignore_hangups`]).
+//! [`super::System::catch_stops`]'s live arm: SIGINT, SIGTERM and SIGHUP noted instead of ending
+//! the process, so `screen` can close its relay and lock a session the admin logged in to over it
+//! before it exits (design §6).
 
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -41,15 +34,13 @@ impl Drop for Catching {
     }
 }
 
-/// Catch [`STOPS`] until the handle drops. A signal whose disposition could not be set keeps
-/// its own (it ends the process as before).
+/// Catch [`STOPS`] until the handle drops.
 pub(super) fn catch() -> Box<dyn std::any::Any> {
     CAUGHT.store(0, Ordering::SeqCst);
-    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask,
-    // no flags).
+    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no
+    // flags).
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = note as extern "C" fn(c_int) as libc::sighandler_t;
-    // A wait the signal lands in carries on; the walk notices at its next reading.
     action.sa_flags = libc::SA_RESTART;
     Box::new(Catching(STOPS.map(|sig| {
         // SAFETY: as above.
@@ -60,9 +51,7 @@ pub(super) fn catch() -> Box<dyn std::any::Any> {
     })))
 }
 
-/// Set SIGHUP and SIGPIPE to `SIG_IGN` for good ([`super::System::ignore_hangups`]). An
-/// ignored disposition survives `exec`, but `aterm_uds::spawnfd` puts SIGPIPE back to its
-/// default in every child, and nothing the watcher runs reads SIGHUP.
+/// Set SIGHUP and SIGPIPE to `SIG_IGN` for good ([`super::System::ignore_hangups`]).
 pub(super) fn ignore_hangups() {
     for sig in [libc::SIGHUP, libc::SIGPIPE] {
         // SAFETY: as in `catch`.
@@ -126,7 +115,6 @@ mod tests {
         assert_eq!(caught(), None);
         hang_up();
         assert_eq!(caught(), Some(libc::SIGHUP));
-        // The first signal is the one kept.
         hang_up();
         assert_eq!(caught(), Some(libc::SIGHUP));
         drop(held);

@@ -6,10 +6,7 @@
 // aterm project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! A glyph-set digest: three 64-bit masks over the glyph id at shifts 4, 0
-//! and 9. A digest answers "may contain" with no false negatives, so a
-//! lookup whose coverage digest misses every glyph in the buffer cannot
-//! apply and is skipped. It only saves work: skipping changes no answer.
+//! A glyph-set digest: three 64-bit masks over the glyph id at shifts 4, 0 and 9.
 
 use crate::GlyphId;
 
@@ -44,8 +41,6 @@ impl Digest {
             if *mask == u64::MAX {
                 continue;
             }
-            // Upstream's arithmetic is C's: it wraps, so a range whose end is
-            // below its start (a malformed font) fills the mask.
             let span = (u64::from(b.0) >> shift).wrapping_sub(u64::from(a.0) >> shift);
             if span >= 63 {
                 *mask = u64::MAX;
@@ -89,7 +84,6 @@ mod tests {
         for g in [2u16, 70, 300, 65_535, 1000, 1050, 1100, 60, 63, 64, 66] {
             assert!(d.may_have_glyph(GlyphId(g)), "{g}");
         }
-        // A glyph in no shift's mask is told apart.
         let mut one = Digest::new();
         one.add(GlyphId(5));
         assert!(!one.may_have_glyph(GlyphId(6)));
@@ -98,7 +92,6 @@ mod tests {
         assert!(!one.may_have(&other));
         other.add(GlyphId(5));
         assert!(one.may_have(&other));
-        // An inverted range fills the masks rather than wrapping into a gap.
         let mut inverted = Digest::new();
         inverted.add_range(GlyphId(500), GlyphId(10));
         assert!(inverted.may_have_glyph(GlyphId(123)));

@@ -132,6 +132,8 @@ pub fn require_terminals(verb: &str, stdin_tty: bool, stderr_tty: bool) -> Resul
 /// The host, as the flow reaches it.
 pub trait Remote {
     /// Run `exec` on the host as one signed request and return how it ended and what it
+    /// printed.
+    ///
     /// # Errors
     /// One line when the request did not run (unreachable, refused, not signed).
     fn exec(&self, exec: &Exec) -> Result<Ran, String>;
@@ -373,7 +375,10 @@ fn arm_watch(remote: &dyn Remote, admin: &User) -> Result<String, String> {
     })
 }
 
-/// Disarm the host's screen watch `id` ([`disarm_cmd`]).
+/// Disarm the host's screen watch `id` ([`disarm_cmd`]). A watcher that had ended first (it
+/// locked during an outage, say) is one line saying what it did; a disarm that did not go
+/// through is one line too, and changes nothing else: the watcher then reads the session
+/// itself and locks it if it is there, which is harmless.
 fn disarm_watch(remote: &dyn Remote, say: &dyn Fn(&str), admin: &User, id: &str) {
     let failed = match remote.exec(&disarm_cmd(id)) {
         Ok(ran) if ran.success() => {
@@ -407,7 +412,11 @@ fn disarm_watch(remote: &dyn Remote, say: &dyn Fn(&str), admin: &User, id: &str)
 /// How long a walk with the screen watch armed may go between two requests that ran before it arms the watch again.
 pub const REARM: Duration = Duration::from_secs(watch::QUIET.as_secs() / 2);
 
-/// `screen`'s requests to the host once its screen watch is armed.
+/// `screen`'s requests to the host once its screen watch is armed. A watcher that locked
+/// while the walk still ran (an outage shorter than the walk, another command's run holding
+/// the host, a host a login keeps busy that long) has ended, and the person may unlock the
+/// session over the relay once the host answers again: a kill after that would leave the Mac
+/// unlocked.
 struct Watched<'a> {
     remote: &'a dyn Remote,
     clock: &'a dyn Clock,
@@ -578,6 +587,11 @@ pub fn await_granted(flow: &Flow<'_>, step: &PersonStep) -> Result<String, Strin
 }
 
 /// Open `url` in `admin`'s session ([`open_pane_cmd`]). A request that did not run is sent
+/// again every [`POLL`], as the walk's readings are: right after a login over the relay the
+/// host can be too busy to answer for a while (VM, 27.0: `Connection timed out during banner
+/// exchange` on the walk's first two requests after the login, and the walk ended with the
+/// step not granted).
+///
 /// # Errors
 /// How the open ran, when it failed; the last reason it did not run once [`Flow::hang`]
 /// passes; or the signal that stopped the walk ([`System::stopped`]).
@@ -697,7 +711,8 @@ fn await_session_observed(
     }
 }
 
-/// Walk `steps` in order.
+/// Walk `steps` in order. A step that needs the Mac's keyboard is left as
+/// [`Done::AtConsole`] unless `at_console`.
 fn walk(flow: &Flow<'_>, admin: &User, steps: &[Step], at_console: bool) -> Vec<Walked> {
     let mut out = Vec::with_capacity(steps.len());
     let mut stopped: Option<String> = None;
@@ -848,7 +863,10 @@ pub struct Screened {
     pub stops: Box<dyn std::any::Any>,
 }
 
-/// Lock the session `admin` logged in to over the relay ([`lock_cmd`]).
+/// Lock the session `admin` logged in to over the relay ([`lock_cmd`]). macOS leaves a login
+/// made over Screen Sharing unlocked at the Mac's display when the connection closes (VM,
+/// 27.0: 3 of 3 logins, watched for 5 minutes), so `screen` does what ScreensharingAgent does
+/// for a session it found locked.
 fn lock_session(flow: &Flow<'_>, admin: &User, unread: Option<String>, watched: bool) -> Session {
     let why = match flow.remote.exec(&lock_cmd(admin)) {
         Ok(ran) if ran.success() => {
@@ -891,7 +909,9 @@ fn logged_in_line(admin: &User, watched: bool) -> String {
     )
 }
 
-/// After the relay closed: the steps, and the session decided.
+/// After the relay closed: the steps, and the session decided. A session there before the
+/// relay ([`Found::Existing`]) is kept; one the walk saw begin ([`Found::LoggedIn`]) is
+/// locked.
 fn decide(
     flow: &Flow<'_>,
     admin: &User,

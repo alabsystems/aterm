@@ -17,7 +17,6 @@ fn signer() -> Signer {
     Signer { secret, public }
 }
 
-/// Serves `text`, signed by `by`, at [`URL`].
 fn serve(net: &FakeFetcher, by: &Signer, text: &str) {
     net.serve(URL, text.as_bytes());
     let sig = sign(&by.secret, text.as_bytes()).expect("sign");
@@ -30,7 +29,6 @@ fn a_signature_verifies_only_its_own_bytes_under_its_own_key() {
     let doc = b"schema = 1\nseq = 1\n";
     let sig = sign(&a.secret, doc).expect("sign");
     assert_eq!(verify(doc, sig.as_bytes(), &a.public), Ok(()));
-    // Raw bytes read as well as base64 text.
     let raw = sig_bytes(sig.as_bytes()).expect("64 bytes");
     assert_eq!(verify(doc, &raw, &a.public), Ok(()));
     assert!(verify(b"schema = 1\nseq = 2\n", sig.as_bytes(), &a.public).is_err());
@@ -74,7 +72,6 @@ fn a_fetch_verifies_holds_and_reads_back() {
     assert!(text.contains("preferred = \"codex\""), "{text}");
     let h = held_state(dir.path()).expect("state");
     assert_eq!((h.seq, h.fetched_at, h.error), (Some(2), Some(NOW), None));
-    // Held under one key, it is no document under another.
     assert!(held(dir.path(), URL, &signer().public, NOW).is_err());
 }
 
@@ -122,23 +119,18 @@ fn a_bad_document_is_refused_and_the_held_one_stands() {
         Fetched::Fresh(5)
     );
     for (text, by, why) in [
-        // Another signer.
         ("schema = 1\nseq = 6\n", signer(), "does not verify"),
-        // An older document, replayed.
         (
             "schema = 1\nseq = 4\n",
             a_again(&a),
             "older than the one held",
         ),
-        // No seq.
         ("schema = 1\n", a_again(&a), "no `seq`"),
-        // Past its own expiry.
         (
             "schema = 1\nseq = 7\nvalid_until = 1700000000\n",
             a_again(&a),
             "expired",
         ),
-        // Another schema.
         ("schema = 2\nseq = 8\n", a_again(&a), "schema 2"),
     ] {
         serve(&net, &by, text);
@@ -150,7 +142,6 @@ fn a_bad_document_is_refused_and_the_held_one_stands() {
         assert!(held.contains("seq = 5"), "{text:?}: {held}");
         assert!(held_state(dir.path()).and_then(|h| h.error).is_some());
     }
-    // Unreachable: the held one stands too.
     let empty = FakeFetcher::default();
     assert!(matches!(
         fetch(dir.path(), URL, &a.public, NOW, &empty, true),

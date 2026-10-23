@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The lane's verdict: each GPU frame against the CPU frame of the same
-//! content, within crates/aterm-gpu-web/tests/cpu_gpu_parity.rs's tolerance,
-//! never blank, and a control that the comparison tells frames apart; and
-//! the GPU module's `init` synchronous, its throw still rejecting an async
-//! caller that awaits it (wasm-platform WP.5).
+//! Browser lane verdicts: GPU frames and offscreen readback against CPU frames, worker frames
+//! against the GPU page's, and a synchronous `init`.
 
 use aterm_json::Value;
 
-/// cpu_gpu_parity.rs's tolerance: the largest RGBA8 byte delta between the
-/// CPU and GPU frames of one grid (round-vs-floor coverage rounding at glyph
-/// edges).
+/// Maximum RGBA8 byte delta allowed between CPU and GPU frames of one grid.
 pub(crate) const TOLERANCE: u8 = 8;
 
 /// One frame a page handed back.
@@ -34,9 +29,7 @@ pub(crate) struct Init {
     pub probe_error: String,
 }
 
-/// Where the GPU frames were drawn: the global scope's and the canvases'
-/// constructor names (`Window` and `HTMLCanvasElement` on the gpu page,
-/// `DedicatedWorkerGlobalScope` and `OffscreenCanvas` in its worker).
+/// Global scope and canvas constructor names where GPU frames were drawn.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Where {
     pub scope: String,
@@ -52,11 +45,9 @@ pub(crate) struct Answer {
     /// `navigator.userAgent` where the page ran; empty if it sent none.
     pub user_agent: String,
     pub frames: Vec<Frame>,
-    /// The GPU page's differential frames (`spec.diff`); the CPU page has
-    /// none.
+    /// Differential frames (`spec.diff`) from the GPU page.
     pub diff: Vec<Frame>,
-    /// The GPU page's `render_offscreen()` + `rgba()` of its last frame; the
-    /// CPU page has none.
+    /// Offscreen readback (`render_offscreen()` + `rgba()`) of the last GPU frame.
     pub readback: Option<Frame>,
     pub timings: Value,
     /// The GPU page's `init` report; the CPU page has none.
@@ -197,8 +188,7 @@ pub(crate) fn max_byte_delta(a: &[u8], b: &[u8]) -> u8 {
         .unwrap_or(0)
 }
 
-/// Pixels of the red glyph the first line draws (cpu_gpu_parity.rs's test:
-/// red above 140, green and blue under 90).
+/// Count red glyph pixels (`r > 140 && g < 90 && b < 90`) in `rgba`.
 pub(crate) fn red_pixels(rgba: &[u8]) -> usize {
     rgba.as_chunks::<4>()
         .0
@@ -214,13 +204,7 @@ pub(crate) struct Verdict {
     pub failures: Vec<String>,
 }
 
-/// Judge the GPU page's `frames` frames against the CPU page's.
-///
-/// Each GPU frame must have the CPU frame's size, lie within [`TOLERANCE`]
-/// of it, and show the red glyph. NEGATIVE CONTROL: each GPU frame after the
-/// first must lie OUTSIDE the tolerance of the CPU frame before it (one more
-/// line of content), so a comparison that cannot tell two frames apart, or
-/// a GPU page that stopped presenting, cannot pass.
+/// Judge the GPU page's `frames` against the CPU page's within [`TOLERANCE`], including `init`, readback, and negative-control checks.
 pub(crate) fn judge(cpu: &Answer, gpu: &Answer, frames: usize) -> Verdict {
     let mut v = Verdict::default();
     for (who, a) in [("cpu", cpu), ("gpu", gpu)] {
@@ -287,11 +271,7 @@ pub(crate) fn judge(cpu: &Answer, gpu: &Answer, frames: usize) -> Verdict {
     v
 }
 
-/// A later backend's session against the first backend's: the CPU module
-/// draws in wasm whatever WebGL2 runs on, so its frames must be
-/// byte-identical across backends (each backend's GPU frames are judged
-/// against them); the GPU frames' distance from the first backend's is
-/// reported, frame by frame, as the measure of what the backend moved.
+/// Compare a later backend's session against the first backend's: CPU frames must be byte-identical, and GPU frame deltas are reported.
 pub(crate) fn across(
     first: &str,
     first_cpu: &[Frame],
@@ -346,16 +326,14 @@ pub(crate) fn across(
 
 /// The scope and canvases the gpu page draws in.
 pub(crate) const DOCUMENT: [&str; 3] = ["Window", "HTMLCanvasElement", "HTMLCanvasElement"];
-/// The scope and canvases its worker draws in: the page's canvas
-/// transferred to it, then an OffscreenCanvas of its own.
+/// The scope and canvases the worker draws in.
 pub(crate) const WORKER: [&str; 3] = [
     "DedicatedWorkerGlobalScope",
     "OffscreenCanvas",
     "OffscreenCanvas",
 ];
 
-/// Whether `answer` says it drew in `want` (scope, canvas, differential
-/// canvas); the failure naming what it drew in, if not.
+/// Check whether `answer` drew in `want` (`[scope, canvas, diff_canvas]`), returning a failure message on mismatch.
 pub(crate) fn drawn_in(who: &str, answer: &Answer, want: [&str; 3]) -> Option<String> {
     let Some(w) = answer.drawn.as_ref() else {
         return Some(format!(
@@ -371,13 +349,7 @@ pub(crate) fn drawn_in(who: &str, answer: &Answer, want: [&str; 3]) -> Option<St
     })
 }
 
-/// The worker's run (init_offscreen on a transferred OffscreenCanvas, then
-/// one of its own) against the gpu page's (init on the document's canvases)
-/// in the same session: the same module on the same adapter issues the same
-/// GL calls, so every frame and the harness readback must be byte-identical.
-/// NEGATIVE CONTROL: each must have drawn where it says it did, so a worker
-/// page that drew on the document, or a gpu page in a worker, cannot pass as
-/// the other.
+/// Compare the worker's run against the GPU page's run in the same session, requiring byte-identical frames and readback on their expected canvases.
 pub(crate) fn worker(gpu: &Answer, worker: &Answer) -> Verdict {
     let mut v = Verdict::default();
     v.failures.extend(drawn_in("gpu page", gpu, DOCUMENT));
@@ -761,7 +733,6 @@ mod tests {
             worker(&page, &moved).failures,
             ["diff-1: the worker's frame differs from the gpu page's (max byte delta 1, 1 bytes)"]
         );
-        // The control: a "worker" that drew on the document's canvas.
         let mut on_page = at(WORKER);
         on_page.drawn = place(["Window", "HTMLCanvasElement", "OffscreenCanvas"]);
         let v = worker(&page, &on_page);

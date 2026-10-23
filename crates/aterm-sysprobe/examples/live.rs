@@ -235,6 +235,7 @@ fn qos_check(layout: &aterm_sysprobe::CpuLayout) {
             (0..cores).map(move |_| {
                 let stop = Arc::clone(stop);
                 let handle = std::thread::spawn(move || {
+                    // SAFETY: sets this thread's own QoS class; no pointers.
                     unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
                     let mut seen = [0u64; MAX];
                     while !stop.load(Ordering::Relaxed) {

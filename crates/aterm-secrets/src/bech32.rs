@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bech32 (BIP 173, the original checksum constant 1, not bech32m) as age uses it for
-//! `age1…` recipients and `AGE-SECRET-KEY-1…` identities: no length limit, all-lowercase or
-//! all-uppercase, the checksum computed over the lowercase form.
-//!
-//! Identities pass through here, so every scratch copy of the text and of its 5-bit groups
-//! is wiped before it is dropped.
+//! Zeroizing Bech32 (BIP 173) codec for age recipients and identities.
 
 use zeroize::Zeroize;
 
@@ -36,8 +31,7 @@ pub struct Decoded {
     pub uppercase: bool,
 }
 
-/// Encode `data` under `hrp` (which must be lowercase ASCII 33..=126 without `1`... the
-/// caller passes "age" or "age-secret-key-"), lowercase output.
+/// Encode `data` under lowercase ASCII `hrp`.
 pub fn encode(hrp: &str, data: &[u8]) -> String {
     let mut groups = to_groups(data);
     let text = encode_groups(hrp, &groups);
@@ -45,8 +39,7 @@ pub fn encode(hrp: &str, data: &[u8]) -> String {
     text
 }
 
-/// Decode a Bech32 string: refuses mixed case, a missing separator, characters outside
-/// the charset, a bad checksum, and non-zero padding bits. `None` on any refusal.
+/// Decode a Bech32 string.
 pub fn decode(text: &str) -> Option<Decoded> {
     let (hrp, mut groups, uppercase) = decode_groups(text)?;
     let data = from_groups(&groups);
@@ -99,7 +92,7 @@ pub(crate) fn encode_groups(hrp: &str, groups: &[u8]) -> String {
 }
 
 /// The lowercased HRP, the 5-bit data groups (checksum removed) and whether the string was
-/// uppercase: BIP 173's decoder without its 90-character limit.
+/// uppercase.
 pub(crate) fn decode_groups(text: &str) -> Option<(String, Vec<u8>, bool)> {
     let bytes = text.as_bytes();
     if bytes.iter().any(|&c| !(33..=126).contains(&c)) {
@@ -157,8 +150,7 @@ fn to_groups(data: &[u8]) -> Vec<u8> {
     groups
 }
 
-/// 5-bit groups regrouped into bytes: `None` when five or more bits are left over beyond
-/// the last byte (a whole spare group) or any leftover bit is set.
+/// 5-bit groups regrouped into bytes.
 fn from_groups(groups: &[u8]) -> Option<Vec<u8>> {
     let mut data = Vec::with_capacity(groups.len() * 5 / 8);
     let mut acc: u32 = 0;
@@ -195,8 +187,7 @@ mod tests {
         "?1ezyfcl",
     ];
 
-    /// BIP 173's valid segwit addresses (valid Bech32 strings) and the scriptPubKey each
-    /// stands for: witness version byte (OP_n), program length, program.
+    /// BIP 173's valid segwit addresses.
     const SEGWIT: &[(&str, &str)] = &[
         (
             "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
@@ -240,7 +231,6 @@ mod tests {
                 text.to_ascii_lowercase(),
                 "{text}"
             );
-            // Every checksum character matters.
             let mut flipped = text.to_ascii_lowercase().into_bytes();
             let last = flipped.len() - 1;
             flipped[last] = if flipped[last] == b'q' { b'p' } else { b'q' };
@@ -251,7 +241,6 @@ mod tests {
 
     #[test]
     fn bip173_valid_strings_decode_to_bytes() {
-        // Their data parts happen to carry clean padding, so the byte layer reads them too.
         assert_eq!(decode("A12UEL5L").expect("valid").data, Vec::<u8>::new());
         let decoded = decode("abcdef1qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw").expect("valid");
         assert_eq!(decoded.hrp, "abcdef");
@@ -293,7 +282,6 @@ mod tests {
             "A1G7SGD8",
             "10a06t8",
             "1qzzfhee",
-            // Segwit-level invalid strings that are invalid Bech32 too.
             "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5",
             "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sL5k7",
         ] {
@@ -316,16 +304,12 @@ mod tests {
 
     #[test]
     fn padding_must_be_short_and_zero() {
-        // BIP 173's "zero padding of more than 4 bits" and "non-zero padding" cases, at the
-        // byte layer age uses (no witness version group).
-        // One byte is two groups: 10 bits, 2 of them padding.
         let mut groups = to_groups(&[0x75]);
         assert_eq!(groups.len(), 2);
         assert_eq!(
             decode(&encode_groups("age", &groups)).expect("clean").data,
             vec![0x75]
         );
-        // A third group leaves 7 bits over the byte: a whole spare group.
         groups.push(0);
         assert_eq!(
             decode(&encode_groups("age", &groups)),
@@ -339,7 +323,6 @@ mod tests {
             None,
             "a set padding bit"
         );
-        // Two bytes are four groups: 20 bits, 4 of them padding, still clean.
         let groups = to_groups(&[0x75, 0x1e]);
         assert_eq!(groups.len(), 4);
         assert_eq!(
@@ -365,7 +348,6 @@ mod tests {
                 assert!(upper.uppercase);
             }
         }
-        // 32 bytes is 52 groups + 6 checksum characters: the age spellings' lengths.
         assert_eq!(encode("age", &[0u8; 32]).len(), 3 + 1 + 52 + 6);
         assert_eq!(encode("age-secret-key-", &[0u8; 32]).len(), 15 + 1 + 52 + 6);
     }
@@ -374,7 +356,6 @@ mod tests {
     fn mixed_case_is_refused() {
         let text = encode("age", &[9u8; 32]);
         let mut mixed = text.clone().into_bytes();
-        // Uppercase one letter of the data part.
         let at = mixed
             .iter()
             .rposition(u8::is_ascii_lowercase)
@@ -397,7 +378,6 @@ mod tests {
             let at = bytes.len() - 10;
             bytes[at] = bad as u8;
             let candidate = String::from_utf8(bytes).expect("ascii");
-            // A '1' moves the separator instead; the checksum refuses it all the same.
             assert_eq!(decode(&candidate), None, "{bad:?}");
         }
         assert_eq!(decode(""), None);

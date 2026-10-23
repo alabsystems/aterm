@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The release verbs (design §11): list, view, latest, newest, assets and download.
+//! Release CLI verbs: list, view, latest, newest, assets, and download.
 
 use std::path::{Path, PathBuf};
 
@@ -52,10 +52,8 @@ fn release_value(release: ReleaseObject, slug: &Slug, latest_id: Option<Option<u
     value
 }
 
-/// GitHub's latest release's id, read once, when the answer projects `latest`. It is read as
-/// the identity the verb already read with (the writer under `--drafts` or
-/// `--include-drafts`, whose push check the verb's own read ran), since a private
-/// repository's pointer is visible only to who can see the repository.
+/// Reads GitHub's latest release id when the output projection includes `latest`, reusing
+/// the caller's `how` so private repos remain visible.
 fn latest_if_wanted(
     gh: &Github,
     slug: &Slug,
@@ -141,8 +139,7 @@ fn named_release(gh: &Github, inv: &Invocation) -> Result<(Slug, How, ReleaseObj
             crate::path::digits::<u64>(id)
                 .ok_or_else(|| inv.usage("--id wants a release id (digits)"))?,
         ),
-        // Before any request on either branch: `published_by_tag` refuses the same tag, but
-        // the drafts branch lists releases first.
+        // Validate tag syntax before any request; the drafts branch lists releases first.
         (Some(tag), None) => {
             crate::path::refuse_bad_tag(tag)?;
             Which::Tag(tag)
@@ -341,8 +338,7 @@ fn download_target(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
         }
     }
     let out = output(ctx, inv, names)?;
-    // Each destination file is judged now, so a directory or a FIFO there is usage before any
-    // request (a download refuses one too, but only after the release was read).
+    // Validate destination paths before making any network request.
     let dests: Vec<PathBuf> = match &out {
         Out::Stdout => Vec::new(),
         Out::File(file) => vec![file.clone()],
@@ -353,8 +349,6 @@ fn download_target(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
                         "--asset {name} is not a plain file name, so --dir cannot hold it"
                     )));
                 }
-                // Under `--dir` the asset's name is the file's: `X.agh-part` there is the part
-                // file of a download of `X`, which removes it first.
                 if crate::download::is_part_name(Path::new(name)) {
                     return Err(inv.usage(format!(
                         "--asset {name} ends in {}, the suffix of agh's own part files, so \
@@ -389,7 +383,6 @@ fn output(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
         (None, Some(_)) if names.len() > 1 => {
             Err(inv.usage("--output names one file: give one --asset, or use --dir"))
         }
-        // "", ".", "..", "/" and `d/..` name no file: the part file would land beside nothing.
         (None, Some(file)) if Path::new(file).file_name().is_none() => Err(inv.usage(format!(
             "--output {file:?} names no file: give a file name, or - for stdout"
         ))),
@@ -412,14 +405,12 @@ fn output(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
 }
 
 /// `agh release download REPO TAG | --id ID --asset NAME… [--dir D | --output F |
-/// --output -] [--clobber] [--include-drafts]`: each asset by id, checked, in the order
-/// given. The first error stops the verb; files already finished stay, each whole and
-/// verified.
+/// --output -] [--clobber] [--include-drafts]`.
 ///
 /// # Errors
 ///
-/// Usage for the argument checks; NotFound for an asset name the release lacks (every name
-/// is checked before the first byte moves); `download::fetch`'s errors.
+/// Usage for the argument checks; NotFound for an asset name the release lacks;
+/// `download::fetch`'s errors.
 pub(crate) fn release_download(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let names = inv.flag_all("--asset");
     let target = download_target(ctx, inv, &names)?;
@@ -463,9 +454,7 @@ pub(crate) fn release_download(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcom
             .download(asset, sink, expect)
         {
             Ok(done) => done,
-            // stdout's reader went away (`| head -c N`): it has had all it wanted, so the
-            // stream ends there, exit 0 and nothing on stderr (design §8.1). The failed write
-            // stopped the copy, so no more bytes are read.
+            // If stdout's reader closed early, end the stream cleanly with exit 0.
             Err(_) if stdout.gone => break,
             Err(error) => return Err(error),
         };

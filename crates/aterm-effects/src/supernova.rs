@@ -815,7 +815,9 @@ fn peak_shade_quadratic(decos: &[WordDecoration]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Bound the eclipse's full-cell source-over opacity per host cell.
+/// Bound the eclipse's full-cell source-over opacity per host cell. Every
+/// supernova Shade is cell-confined with zero jitter, so `(row, col)` is an
+/// exact overlap class.
 #[inline]
 fn bound_shade_opacity(decos: &mut [WordDecoration]) {
     if decos.is_empty() {

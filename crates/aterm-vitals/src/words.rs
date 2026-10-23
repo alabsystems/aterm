@@ -383,7 +383,8 @@ pub struct StateWords {
 /// Candidate text forms (longest first) and ink for an `aterm` or `Tab` scope cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeCell {
-    /// The forms, longest first.
+    /// The forms, longest first. A figure that does not fit shortens its
+    /// number, never its label.
     pub forms: Vec<String>,
     /// Its ink: words for a figure, words2 for a phrase saying there is none.
     pub ink: InkKind,

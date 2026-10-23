@@ -2,13 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Conservative reading of an ordinary answer to an upgrade notice.
-//!
-//! This is only the answer's words. The caller ties them to the current
-//! notice and checks the turn end, idle session and empty process tree.
 
-/// An unconditional readiness statement in the agent's own prose. Quoted
-/// examples and code are not statements; a condition, refusal or live work
-/// anywhere in the answer withholds consent, even beside an affirmation.
+/// Checks whether `words` states unconditional readiness for an upgrade restart.
 pub(super) fn says_ready(words: &str) -> bool {
     let Some((prose, caution)) = prose(words) else {
         return false;
@@ -164,8 +159,6 @@ fn restart_target(target: &str) -> bool {
 
 fn withholds(clause: &str) -> bool {
     let tokens: Vec<&str> = clause.split_whitespace().collect();
-    // Negating an activity can confirm idleness; other negations can leave
-    // work undone ("not all changes are saved") and withhold readiness.
     if tokens.iter().enumerate().any(|(index, word)| {
         *word == "not"
             && !matches!(
@@ -249,8 +242,6 @@ fn withholds(clause: &str) -> bool {
         if !activity {
             return false;
         }
-        // Negation applies only to this activity. "The build is not running
-        // and the deploy is pending" does not negate the deploy.
         let prefix = &tokens[..index];
         let start = prefix
             .iter()

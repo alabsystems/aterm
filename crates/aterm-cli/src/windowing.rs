@@ -476,7 +476,8 @@ mod tests {
         assert_eq!(some.window_args(), args(&["-d", "/tmp/x"]));
     }
 
-    /// The narrow gate.
+    /// The narrow gate. Everything that is not a bare window launch spawns,
+    /// under either policy — these are the invocations a forward would corrupt.
     #[test]
     fn only_a_bare_window_launch_is_policy_eligible() {
         let plain = LaunchEnv::default();

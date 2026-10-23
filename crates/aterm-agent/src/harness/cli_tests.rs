@@ -1684,7 +1684,10 @@ fn tick_below_floor(
     done
 }
 
-/// The shipped idle window takes a two-day-old profile.
+/// The shipped idle window takes a two-day-old profile. With no config file,
+/// on the real clock, one build directory holds a profile untouched for two
+/// days (`release/`) and one built just now (`debug/`): below the floor the
+/// idle one's `incremental/` goes and the fresh one's stays.
 #[cfg(unix)]
 #[test]
 fn the_default_window_reclaims_a_profile_idle_two_days_and_keeps_one_built_today() {
@@ -1764,7 +1767,13 @@ fn a_tick_cut_short_mid_removal_leaves_the_intent_in_the_journal() {
     );
 }
 
-/// WINDOWS: ONE VOLUME, WHATEVER SPELLS IT, BY ITS SERIAL AND ITS GUID.
+/// WINDOWS: ONE VOLUME, WHATEVER SPELLS IT, BY ITS SERIAL AND ITS GUID. A
+/// path's volume is its serial through the one identity export and its
+/// volume's GUID — the key its free-space reading carries — so a build
+/// directory spelled verbatim (`\\?\C:\…`, as discovery records it) or in
+/// capitals is on the volume a plain working directory measures (the drive
+/// prefix this replaced read `\\?\C:` and `C:` apart and surveyed nothing
+/// discovery found).
 #[cfg(windows)]
 #[test]
 fn a_windows_volume_is_named_by_its_serial_and_guid_in_every_spelling() {
@@ -3285,7 +3294,10 @@ fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
     assert!(lines[1].contains(r#""pending_for_s":null"#), "{}", lines[1]);
 }
 
-/// `harness limits` says the time the supervisor will continue at.
+/// `harness limits` says the time the supervisor will continue at. A weekly wall hit at 8 pm
+/// that says `resets 9am` resets tomorrow, 13 hours off (the done row's clock is the print),
+/// where the session window's five-hour rule would put it 11 hours in the past; a session
+/// window's `9am` is still today's.
 #[test]
 fn the_view_places_a_weekly_walls_bare_clock_after_its_print() {
     use aterm_phase::prompt::fixtures::{composer, rows};
@@ -4063,7 +4075,10 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     assert_ne!(wake_id(&store), woken, "a login that works wakes");
 }
 
-/// A FLOW THAT EXITS 0 IS NOT A LOGIN THAT WORKS.
+/// A FLOW THAT EXITS 0 IS NOT A LOGIN THAT WORKS. One whose login then
+/// answers signed out is exit 1, and the state says so with a ledger row
+/// (one that could not be asked:
+/// `a_login_that_could_not_be_asked_is_said_and_never_recorded`).
 #[test]
 fn a_flow_that_ends_signed_out_is_recorded_so_and_exits_1() {
     let tmp = tmp_dir("accounts-login-signed-out");
@@ -4383,7 +4398,10 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
     assert_eq!(state.account("work-2").auth, Auth::Ok);
 }
 
-/// The secrecy control: `claude auth status --json` names an email and an organization.
+/// The secrecy control: `claude auth status --json` names an email and an organization. The
+/// fake host's output carries both (in a document that answers, in plain text, and inside the
+/// `loggedIn` key) and no byte of them reaches stdout, stderr, any file `accounts login` wrote,
+/// the report or the ledger view.
 #[test]
 fn login_keeps_no_byte_of_the_vendors_output() {
     let tmp = tmp_dir("accounts-secrecy");
@@ -4803,7 +4821,10 @@ fn the_check_after_a_sign_in_needs_user_or_logname() {
     );
 }
 
-/// A STATE FILE THAT IS NOT OURS IS NEVER SAVED OVER.
+/// A STATE FILE THAT IS NOT OURS IS NEVER SAVED OVER. A `state.json` of
+/// another schema — a newer build's, with this older one still on the
+/// machine — used to load as the empty state and be written over by the next
+/// `login` or `use`: the pin, every wall and every signed-out word gone.
 #[test]
 fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() {
     let tmp = tmp_dir("accounts-not-ours");
@@ -5032,7 +5053,11 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     );
 }
 
-/// A SIGN-IN AFTER THE CLOCK WAS SET BACK IS STILL RECORDED.
+/// A SIGN-IN AFTER THE CLOCK WAS SET BACK IS STILL RECORDED. A word stamped
+/// ahead of the clock used to make every later answer "older than the one
+/// held": the verb printed `signed in` and recorded nothing, for as long as
+/// the clock was behind the stamp, and the account stayed signed-out to
+/// `use` and to every rotation.
 #[test]
 fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
     let tmp = tmp_dir("accounts-login-clock");

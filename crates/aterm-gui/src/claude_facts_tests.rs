@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The clicked facts' pure parts: what a click hides or shows again, and
-//! what a title and a screen reader say of a fact (`crate::claude_facts`).
+//! Tests for footer fact click masks, hover titles, and screen-reader labels.
 
 use std::path::Path;
 
@@ -37,9 +36,6 @@ fn mask(kinds: &[FactKind]) -> FactMask {
         .fold(FactMask::default(), |m, k| m.with(*k, true))
 }
 
-/// A click on a shown fact hides it and only it; a click on a stub shows
-/// its own facts again and leaves the others hidden (a mask a stub carries
-/// with two facts shows both). The usage is never hidden by a click.
 #[test]
 fn a_click_hides_its_fact_and_a_stub_click_shows_its_own_again() {
     let none = FactMask::default();
@@ -66,16 +62,12 @@ fn a_click_hides_its_fact_and_a_stub_click_shows_its_own_again() {
         mask(&[FactKind::Model, FactKind::Branch]),
         "an effort stub shows the effort alone"
     );
-    // CONTROL: the mask is no toggle — a second hide of a hidden fact keeps
-    // it hidden; only its stub shows it again.
     assert_eq!(
         mask_after(mask(&[FactKind::Branch]), Fact::Branch, none),
         mask(&[FactKind::Branch])
     );
 }
 
-/// Every hovered fact's title names its value and what a click does; a
-/// hidden fact's that a click shows it again (design §10.6.14).
 #[test]
 fn a_title_names_the_value_and_the_click() {
     let shown = facts();
@@ -129,7 +121,6 @@ fn a_title_names_the_value_and_the_click() {
         off: mask(&[FactKind::Model, FactKind::Effort]),
         ..facts()
     };
-    // Both hidden are two stubs, each its own fact's.
     assert_eq!(
         title(&both, Fact::Model).0,
         "model hidden \u{b7} click shows it"
@@ -138,7 +129,6 @@ fn a_title_names_the_value_and_the_click() {
         title(&both, Fact::Effort).0,
         "effort hidden \u{b7} click shows it"
     );
-    // CONTROL: a model hidden alone is the model's stub.
     let model = FooterFacts {
         off: mask(&[FactKind::Model]),
         ..facts()
@@ -149,7 +139,6 @@ fn a_title_names_the_value_and_the_click() {
     );
 }
 
-/// A reader hears each fact named in words, and what a press does.
 #[test]
 fn a_reader_hears_each_fact_in_words() {
     let shown = facts();

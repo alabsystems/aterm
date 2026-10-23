@@ -129,7 +129,8 @@ fn child_still_ours(pid: libc::pid_t, within: std::time::Duration) -> bool {
     }
 }
 
-/// A timed-out read reaps the child it owns.
+/// A timed-out read reaps the child it owns. The child sleeps `JOB`, far past the budget, so a
+/// read that waited for the child instead of its budget is caught by cause.
 #[cfg(unix)]
 #[test]
 fn machine_command_timeout_reaps_owned_child() {
@@ -158,7 +159,9 @@ fn machine_command_timeout_reaps_owned_child() {
     );
 }
 
-/// An exited child is not stdout EOF, and a flood is capped; both bounded by cause.
+/// An exited child is not stdout EOF, and a flood is capped; both bounded by cause. The grandchild
+/// holding the inherited stdout sleeps `JOB`, far past the budget, so a read waiting for EOF
+/// instead of the budget returns after `JOB`.
 #[cfg(unix)]
 #[test]
 fn machine_command_bounds_inherited_pipe_eof_and_output_flood() {
@@ -2528,7 +2531,9 @@ fn linux_status_holding(running: u64, staged: Option<u64>) -> DurableUpdateStatu
     durable
 }
 
-/// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND.
+/// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND. With
+/// automatic install off, a Linux check downloads a newer build and holds it for
+/// `aterm update apply`.
 #[test]
 fn a_linux_build_held_for_a_person_is_said_once_and_leaves_with_its_stage() {
     let mut app = App::headless_for_test();
@@ -2841,7 +2846,10 @@ fn installed_environment_repair_conforms_and_preserves_unrelated_budgets() {
     }
 }
 
-/// A non-writable install location is the person's.
+/// A non-writable install location is the person's. A standard user runs a signed aterm.app from
+/// an admin-owned /Applications: the pre-park check refuses with the install location's refusal,
+/// and the synchronous arm's automatic attempt books it as the environment block a person must
+/// clear, so nothing re-arms the attempt the folder refuses.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_non_writable_install_location_is_booked_as_the_persons_at_the_arm() {
@@ -3152,7 +3160,9 @@ fn a_returned_attempt_the_folder_refused_is_the_persons_not_the_builds() {
     }
 }
 
-/// A standing block names its own remedy over a later booking.
+/// A standing block names its own remedy over a later booking. With the folder's block standing
+/// for build 11, a press fails on a passing refusal (the staged `codesign` past its budget) before
+/// the folder is asked, and the ledger books that reason.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_standing_block_names_its_own_remedy_over_a_later_booking() {
@@ -3215,7 +3225,9 @@ fn a_standing_block_names_its_own_remedy_over_a_later_booking() {
     }
 }
 
-/// A press the folder answered is not sent back to the folder.
+/// A press the folder answered is not sent back to the folder. With the folder's block standing
+/// for build 11, the person fixes the folder and presses Install now: the worker's pre-park check
+/// passes and keeps its pass, then the successor dies.
 #[cfg(unix)]
 #[test]
 fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
@@ -3291,7 +3303,9 @@ fn a_press_the_folder_answered_is_not_sent_back_to_the_folder() {
     }
 }
 
-/// A later refusal of another cause names the standing block.
+/// A later refusal of another cause names the standing block. With the folder's block standing
+/// for build 11, the person retries and the press's pre-park check passes the folder but refuses
+/// the installed copy ("cannot be the rollback source"), which only a person can clear too.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_later_refusal_of_another_cause_names_the_standing_block() {
@@ -4926,7 +4940,10 @@ fn real_passing_refusal_keeps_a_deadline_as_the_model_s_passing_failure() {
     assert!(!buggy.check_invariant("APassingFailureNeverConverges", &held));
 }
 
-/// A cold relaunch that keeps being refused converges, like any failure inside one process.
+/// A cold relaunch that keeps being refused converges, like any failure inside one process. Each
+/// relaunch is a new process, so the budget is carried across them; otherwise a boot swap that
+/// keeps refusing for a reason the pre-park read cannot see (an apply lock held by a stopped
+/// sibling, a candidate that cannot start) is booked as the first failure every time.
 #[cfg(unix)]
 #[test]
 fn a_refused_cold_relaunch_converges_across_its_own_relaunches() {
@@ -5340,7 +5357,10 @@ fn press_held_for_the_read(app: &mut App, build: u64) {
     });
 }
 
-/// A person's install held for the candidate's read runs when the read ends.
+/// A person's install held for the candidate's read runs when the read ends. With `[update]
+/// auto_apply = false`, while the read runs the press stands held: its row still says it
+/// installs, a second press joins it and starts nothing, and the loop looks again within the
+/// poll.
 #[cfg(unix)]
 #[test]
 fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended() {
@@ -6093,7 +6113,12 @@ fn a_stage_waiting_for_its_roster_confirmation_is_held_and_never_a_failure() {
     );
 }
 
-/// AN ARMED LANE LOOKS AT ONCE AND STARTS AS ITS CANDIDATE'S PRE-PARK READ ENDS.
+/// AN ARMED LANE LOOKS AT ONCE AND STARTS AS ITS CANDIDATE'S PRE-PARK READ ENDS. The arm makes the
+/// intent due at once (the quiet gate reads the epoch behind it, so a first look one epoch out only
+/// waited); while the arm-time read of exactly these bytes runs, a look holds the attempt (intent
+/// kept, nothing spent, looked at again [`super::PREVERIFY_READ_POLL`] later) instead of letting
+/// its worker verify the same bytes beside it; the first look after the read ends makes the
+/// attempt (stopped here at the preflight by a Settings draft, which counts it).
 #[cfg(unix)]
 #[test]
 fn an_armed_lane_looks_at_once_and_starts_as_its_pre_park_read_ends() {
@@ -6232,7 +6257,11 @@ fn the_arm_time_read_holds_the_lane_before_its_first_attempt() {
     assert_eq!(app.auto_apply_intent.map(|intent| intent.attempts), Some(1));
 }
 
-/// A cold relaunch whose boot swap waits for a roster confirmation books nothing.
+/// A cold relaunch whose boot swap waits for a roster confirmation books nothing. On a desk with
+/// no terminal the cold lane execs into its own build, whose gate 4d waits for a check: the launch
+/// seeds a hold, not a refusal verdict (nothing kept apart, the carried budget put back as it
+/// was), so the first attempt is never made, the cold lane defers (for a person's press too)
+/// instead of relaunching again, and nothing is booked, latched or spent.
 #[cfg(unix)]
 #[test]
 fn a_cold_relaunch_waiting_for_its_roster_confirmation_holds_and_books_nothing() {
@@ -6735,7 +6764,10 @@ fn an_automatic_probe_is_silent_while_a_person_s_apply_still_surfaces_recovery()
     }
 }
 
-/// The pre-park verdict answers for one artifact only.
+/// The pre-park verdict answers for one artifact only. A downloaded `.app` and the same build
+/// installed under our executable share (build, commit) but are different bytes: the download's
+/// `passed` must not skip the activation's last codesign check, and a corrupt download's `false`
+/// must not refuse a good installed bundle.
 #[cfg(unix)]
 #[test]
 fn a_pre_park_verdict_answers_only_for_its_own_artifact() {
@@ -8622,7 +8654,8 @@ fn older_theme_save_completion_preserves_a_newer_committing_preview() {
     }
 }
 
-/// The queue pump can complete unchanged work inline.
+/// The queue pump can complete unchanged work inline. Binding after that
+/// completion would resurrect a hold whose completion has already happened.
 #[test]
 fn control_theme_commit_inline_completion_or_queue_refusal_leaves_no_hold() {
     for admitted in [true, false] {

@@ -114,7 +114,8 @@ pub struct Spine {
     /// integrator, gained only in [`Spine::target`]; consumers want
     /// [`Spine::disp`].
     momentum: TypingMomentum,
-    /// The eased display value the art reads.
+    /// The eased display value the art reads. Advanced only in
+    /// [`Spine::update`].
     disp: f32,
     /// The resume memory: the follower's recent peak, forgetting on
     /// [`DISP_PEAK_HALF_LIFE_S`].
@@ -128,7 +129,8 @@ pub struct Spine {
     /// until the follower is within [`DISP_SNAP_ZERO`] of its target (or the
     /// target falls below it).
     slamming: bool,
-    /// The pending [`EraseMark`], if the last edge was a Backspace.
+    /// The pending [`EraseMark`], if the last edge was a Backspace. Cleared by
+    /// the next typed advance, a kill, and [`Spine::reset`].
     mark: Option<EraseMark>,
     /// The flow run: keys typed at [`FLOW_KEY_DISP`] or above with no delete
     /// since it began.

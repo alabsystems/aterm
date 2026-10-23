@@ -243,7 +243,9 @@ impl Rig {
         .collect()
     }
 
-    /// Every `modes-restored` payload once at least `n` are recorded.
+    /// Every `modes-restored` payload once at least `n` are recorded. The reader records the event
+    /// just after it releases the term lock, so a screen a `write` saw finished can precede its
+    /// event.
     fn restored_n(&self, n: usize) -> Vec<String> {
         wait_for("the reader's modes-restored event", || {
             self.restored().len() >= n
@@ -417,7 +419,8 @@ fn die_and_hand_back(rig: &mut Rig, model: &Model, s: &mut State) {
     assert_one_handback(rig, JOB, SHELL);
 }
 
-/// The incident, step by step, on the real reader.
+/// The incident, step by step, on the real reader. Returns the rig at its
+/// end state and the model's state after the whole schedule.
 fn run_incident(rig: &mut Rig, model: &Model) -> State {
     let mut s = model.init_state();
     rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);

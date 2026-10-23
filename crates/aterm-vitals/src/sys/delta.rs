@@ -100,6 +100,7 @@ mod tests {
         Reply {
             view: View::Overview,
             scope: None,
+            subject: None,
             lines,
             json: None,
         }

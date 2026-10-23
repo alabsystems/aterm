@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **A REPLACED BUS LOG'S OFFSETS ARE ANOTHER LOG'S** (r2-01) — the broker
-//! comes back on a fresh bus.log (deleted, or moved aside after the broker
-//! refused it), whose records are numbered from 0 again. Nothing kept against
-//! the old log's offsets may answer for the new log's records: not the
-//! endpoint's delivery dedup, and not a receipt owed for an old row.
-//!
-//! Every wait is an `until`, a one-minute hang detector; nothing is timed.
+//! **A REPLACED BUS LOG'S OFFSETS ARE ANOTHER LOG'S** (r2-01).
 
 use crate::harness;
 
@@ -36,10 +30,6 @@ fn replace_the_log(w: &mut World) {
 /// appended — mail lost while the bridge, told `OK`, committed past it. Forty
 /// rows land on the old log; the log is replaced under the running instance;
 /// forty more land on the new one, their offsets overlapping the old forty's.
-/// Every one of the eighty is in the session's ring, and the new log says the
-/// node re-based (`log-replaced … log=<new> was_log=<old>`). Negative control:
-/// an endpoint that is not told the log changed keeps the old offsets, and the
-/// rows at the shared offsets never arrive (the hang detector fails).
 #[test]
 fn a_fresh_logs_records_at_the_old_logs_offsets_all_reach_the_session() {
     let mut w = World::boot("replaced-log-offsets", &[]);
@@ -110,11 +100,9 @@ fn a_receipt_owed_for_the_old_logs_row_is_retired_not_published_on_the_new_one()
     let off = off_of(ask.header());
     let id = until("the ask to reach b", || id_at_off(&w, &b, off));
 
-    // THE BROKER GOES, and b decides with no broker to take the receipt.
     w.stop_broker();
     let seen = w.verb(&format!("@{b} inbox seen {id} handled"));
     assert!(seen.ok(), "inbox seen: {}", seen.header());
-    // THE LOG GOES WITH IT: the broker comes back on a fresh one.
     std::fs::rename(&w.broker_log, w.tmp.join("bus.log.aside")).expect("move the log aside");
     w.start_broker();
 

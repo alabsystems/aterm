@@ -825,7 +825,11 @@ const PAIR_RACE_SPAWNS: usize = 400;
 #[cfg(target_vendor = "apple")]
 const PAIR_RACE_CONTROL_SPAWNS: usize = 200;
 
-/// The staged half of the pair race.
+/// The staged half of the pair race. A thread makes `UnixStream::pair()`s as
+/// fast as it can — Darwin has no `SOCK_CLOEXEC`, so each end is unflagged from
+/// its `socketpair` to its `F_SETFD` — while this one spawns children that
+/// report any descriptor at 3..=31 (a fresh staged table hands the pair ends
+/// out from 3 up).
 #[cfg(target_vendor = "apple")]
 fn staged_pair_race() {
     use std::sync::atomic::{AtomicBool, Ordering};

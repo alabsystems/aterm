@@ -284,7 +284,12 @@ fn stub_content_sh(tool: &ToolName, comes_with: Option<&str>, atpkg: &Path) -> S
     s
 }
 
-/// The first line of the batch stub's body, `@echo off` and its CRLF: 11 bytes.
+/// The first line of the batch stub's body, `@echo off` and its CRLF: 11 bytes. `cmd`
+/// resumes a rewritten batch file only after a line end of the old file, and the only old
+/// line end that can fall inside the frame head ([`crate::platform::CMD_FRAME_HEAD`], 13
+/// bytes) is the first line's: a pre-frame stub's ends on the head's own CRLF, byte 11,
+/// which reads as an empty line; a byte shorter would end on `n` of `:main` and run the
+/// body again.
 const CMD_STUB_FIRST_LINE: &str = "@echo off\r\n";
 
 const _: () = assert!(CMD_STUB_FIRST_LINE.len() >= crate::platform::CMD_FRAME_HEAD.len() - 2);
@@ -1070,7 +1075,8 @@ mod tests {
         assert!(body.contains("ATPKG='/x'\\''y/atpkg'"));
     }
 
-    /// The batch twin's shape, what cmd.exe runs in the `<tool>.cmd` slot.
+    /// The batch twin's shape, what cmd.exe runs in the `<tool>.cmd` slot. Pinned from
+    /// every build host (pure string).
     #[test]
     fn cmd_stub_shape_marker_and_safety() {
         let body = stub_content_cmd(

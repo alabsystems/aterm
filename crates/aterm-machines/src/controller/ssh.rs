@@ -180,7 +180,8 @@ fn build(paths: &Paths, target: &Target, mux: Mux<'_>) -> Vec<OsString> {
     out
 }
 
-/// `path` as an `-o` value.
+/// `path` as an `-o` value. `ssh` reads `-o` as a config line: it splits a value at blanks
+/// unless it is double-quoted, and expands `%` tokens in these paths.
 fn config_path(path: &Path) -> String {
     let text = path.to_string_lossy().replace('%', "%%");
     if text

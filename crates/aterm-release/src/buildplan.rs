@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The release's one build (`artifact.rs` keeps what it makes).
-
+//!
 //! STOCK EXCEPTION: the compat slice builds with `RUSTUP_TOOLCHAIN=stable`, because Trust
 //! has no x86_64-apple-darwin std in the aarch64 sysroot (`targo --unverified check
 //! --target x86_64-apple-darwin -p aterm` fails with E0463).
@@ -1159,7 +1159,9 @@ fn wait_with_peak(
     Ok((child.wait()?, None))
 }
 
-/// Refuse, with the remediation, when stable's target std (or rustup) is absent.
+/// Refuse, with the remediation, when stable's target std (or rustup) is absent. Probes
+/// stable explicitly: a bare `rustup target list` would resolve the repo's `trust`
+/// toolchain, which never carries rustup-managed targets.
 fn require_rustup_target(triple: &str) -> Result<(), String> {
     let home = std::env::var_os("HOME").ok_or("compat target probe requires HOME")?;
     let rustup_home = release_rustup_home(&home)?;
@@ -1740,7 +1742,9 @@ fn verify_built_slice_update_pins(
 /// so the report's `shell-int:` line exercises the slice's zsh loader-prepare path.
 const X86_64_PROBE_SHELL: &str = "/bin/zsh";
 
-/// What the session turn types into a slice's shell.
+/// What the session turn types into a slice's shell. A shell spawned by a process
+/// runs that process's slice — a Rosetta-translated one its x86_64 slice — so the
+/// screen answers the slice's own architecture ([`SliceArch::uname`]).
 const SLICE_TURN_TEXT: &str = "uname -m";
 
 /// How long a slice's headless instance may take to open its control socket: a hang
@@ -1756,7 +1760,7 @@ pub(crate) enum SliceArch {
 
 impl SliceArch {
     /// `arch`'s flag for the slice.
-    fn arch_flag(self) -> &'static str {
+    const fn arch_flag(self) -> &'static str {
         match self {
             SliceArch::Arm64 => "-arm64",
             SliceArch::X86_64 => "-x86_64",
@@ -1764,7 +1768,7 @@ impl SliceArch {
     }
 
     /// What `uname -m` prints in a shell the slice spawned.
-    fn uname(self) -> &'static str {
+    const fn uname(self) -> &'static str {
         match self {
             SliceArch::Arm64 => "arm64",
             SliceArch::X86_64 => "x86_64",
@@ -1772,7 +1776,7 @@ impl SliceArch {
     }
 
     /// How the transcript names where the slice ran.
-    fn under(self) -> &'static str {
+    const fn under(self) -> &'static str {
         match self {
             SliceArch::Arm64 => "natively",
             SliceArch::X86_64 => "under Rosetta",
@@ -2226,7 +2230,10 @@ mod tests {
         x86_64_slice_runs,
     };
 
-    /// §3.1 of DESIGN-intel-just-works: a universal cut RUNS its x86_64 slice.
+    /// §3.1 of DESIGN-intel-just-works: a universal cut RUNS its x86_64 slice. A builder
+    /// without Rosetta is refused with the remedy (and the escape) named, before the slice
+    /// is ever tried; a slice that does not answer is refused; one that answers returns
+    /// its report — and every spawn goes through `arch -x86_64`.
     #[test]
     fn the_universal_cut_runs_its_x86_64_slice_under_rosetta() {
         use std::os::unix::process::ExitStatusExt as _;
@@ -2641,7 +2648,11 @@ mod tests {
         );
     }
 
-    /// THE CUTTER NEVER COMPILES A DEVELOPMENT SEAM.
+    /// THE CUTTER NEVER COMPILES A DEVELOPMENT SEAM. Every
+    /// `aterm_types::dev_seam!` read — `ATPKG_REGISTRY`, `ATERM_UPDATE_ROOT`, the
+    /// handoff deadlines, the `ATERM_DEBUG_*` seams — and every development setting
+    /// (`[update]` owner/repo/require_team_id, `[packages]` prefix/account/repo links)
+    /// compiles only under `cfg(any(debug_assertions, feature = "dev-seams"))`.
     #[test]
     fn the_release_build_enables_no_development_seam() {
         let config = std::path::Path::new("/private/take/.cargo/config.toml");

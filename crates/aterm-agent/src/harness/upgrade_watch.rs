@@ -52,7 +52,7 @@ impl Watched {
 
     /// Whether anything reached the record.
     #[must_use]
-    pub fn wrote(&self) -> bool {
+    pub const fn wrote(&self) -> bool {
         !self.wrote.is_empty()
     }
 
@@ -266,7 +266,7 @@ fn look_at(
 }
 
 /// Whether the watch reads `agent`'s record as Claude Code's ([`look_word`], [`sanctioned`]).
-fn reads_transcript(agent: upgrade::Agent) -> bool {
+const fn reads_transcript(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex

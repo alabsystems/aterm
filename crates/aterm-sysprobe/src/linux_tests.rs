@@ -88,7 +88,9 @@ fn a_hybrid_laptop_with_an_offline_core_keeps_its_split() {
     assert_eq!(names(&one), [("CPU", present.clone())]);
 }
 
-/// ARM boards name no level; `cpu_capacity` ranks them.
+/// ARM boards name no level; `cpu_capacity` ranks them. An RK3588 (four
+/// Cortex-A55 at 414, four A76 at 1024) reads two levels, fastest first; a
+/// phone SoC's three (160, 498, 1024) reads Performance, Mid, Efficiency.
 #[test]
 fn an_arm_board_is_split_by_cpu_capacity() {
     let mut files = vec![(
@@ -138,7 +140,9 @@ fn an_arm_board_is_split_by_cpu_capacity() {
     );
 }
 
-/// A machine whose cores are alike is one `"CPU"` cluster.
+/// A machine whose cores are alike is one `"CPU"` cluster. NEGATIVE
+/// CONTROLS: equal capacities; a capacity missing for one core; PMUs that
+/// overlap or leave a present core out; a single PMU.
 #[test]
 fn alike_cores_and_inconsistent_sources_are_one_cpu_cluster() {
     let present: Vec<u16> = (0..4).collect();
@@ -493,7 +497,11 @@ fn the_throttle_reader_sees_zones_and_a_rise_in_the_counters() {
     );
 }
 
-/// The GPU from DRM sysfs, never waking a card or holding one awake.
+/// The GPU from DRM sysfs, never waking a card or holding one awake. An
+/// awake amdgpu card answers its busy percent only where the read cannot
+/// move its runtime PM (forbidden `on`, runtime PM `unsupported`, or the
+/// boot display), and is then picked over an i915 iGPU that cannot answer;
+/// a hybrid laptop's awake dGPU (`auto`, not the boot display) is not read.
 #[test]
 fn the_gpu_reads_drm_sysfs_without_waking_a_sleeping_card() {
     let root = tree(&[
@@ -774,7 +782,8 @@ fn an_nvidia_card_reads_through_the_roots_nvml_arm() {
     assert_eq!(linux::no_nvml("000f:01:00.0"), Err(Why::NotRead));
 }
 
-/// `status`'s anonymous memory, resident and swapped.
+/// `status`'s anonymous memory, resident and swapped. NEGATIVE CONTROL: a
+/// kernel thread's status has no `RssAnon`.
 #[test]
 fn a_status_file_gives_anonymous_memory_resident_and_swapped() {
     let status = "Name:\tclaude\nState:\tS (sleeping)\nPPid:\t4100\nVmRSS:\t  412000 kB\n\

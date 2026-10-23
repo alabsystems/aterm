@@ -49,10 +49,10 @@ pub struct CtlReply {
 }
 
 impl CtlReply {
-    pub fn ok(&self) -> bool {
+    pub const fn ok(&self) -> bool {
         self.code == 0
     }
-    pub fn timed_out(&self) -> bool {
+    pub const fn timed_out(&self) -> bool {
         self.code == 124
     }
     /// Returns `true` if the server rejected the verb form as a usage error.
@@ -412,7 +412,7 @@ impl Guard {
 
     /// Returns the short token (`guard=`) for this guard.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Guard::NotBusy => "not-busy",
             Guard::NoBackgroundWait => "no-background-wait",
@@ -521,7 +521,7 @@ pub struct UsageSeen {
 impl UsageSeen {
     /// Returns `true` if either a credits notice or usage warning is present.
     #[must_use]
-    pub fn says(&self) -> bool {
+    pub const fn says(&self) -> bool {
         self.credits.is_some() || self.warning.is_some()
     }
 }
@@ -563,7 +563,7 @@ pub enum ProbeMiss {
 impl ProbeMiss {
     /// Returns the short token for this probe miss.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             ProbeMiss::NotWritten => "not-written",
             ProbeMiss::NotOpened => "not-opened",
@@ -613,7 +613,7 @@ impl ProbeNo {
 
     /// Returns the short token for this probe refusal.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             ProbeNo::NoAccounts => "no-accounts",
             ProbeNo::Mode => "not-early",
@@ -807,7 +807,7 @@ const RESET_GRACE: Duration = Duration::from_secs(10 * 60);
 
 const SLEPT_THROUGH_S: i64 = 60;
 
-pub(super) fn slept_through(wall_delta_s: i64, mono_delta_s: i64) -> bool {
+pub(super) const fn slept_through(wall_delta_s: i64, mono_delta_s: i64) -> bool {
     wall_delta_s - mono_delta_s > SLEPT_THROUGH_S
 }
 const RESET_HORIZON: Duration = Duration::from_secs(8 * 86_400);
@@ -915,7 +915,7 @@ fn live_rows(reader: &dyn ScreenReader, screen: &Screen) -> (usize, Option<(usiz
 }
 
 /// Returns `true` if usage-limit reset times for `p` are anchored to when the notice was printed.
-pub(crate) fn places_resets_on_print(p: Program) -> bool {
+pub(crate) const fn places_resets_on_print(p: Program) -> bool {
     match p {
         Program::Claude | Program::Generic => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini => false,
@@ -2331,7 +2331,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     /// Configures whether turn-end continuations may type while a user hand is active.
-    pub fn type_under_hand(&mut self, on: bool) {
+    pub const fn type_under_hand(&mut self, on: bool) {
         self.setup.types_under_hand = on;
     }
 
@@ -2368,7 +2368,7 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     /// Returns the [`SessionSetup`] for this session.
     #[must_use]
-    pub fn setup(&self) -> &SessionSetup {
+    pub const fn setup(&self) -> &SessionSetup {
         &self.setup
     }
 
@@ -2558,7 +2558,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     /// Sets the maximum outage ride-out duration (`--reconnect-s`).
-    pub fn set_reconnect(&mut self, window: Duration) {
+    pub const fn set_reconnect(&mut self, window: Duration) {
         self.setup.reconnect = window;
     }
 
@@ -5613,7 +5613,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(wall || badge)
     }
 
-    pub(super) fn mark_memory_badge(&mut self) {
+    pub(super) const fn mark_memory_badge(&mut self) {
         if let Some(b) = self.box_ask.as_mut() {
             b.memory = true;
         }

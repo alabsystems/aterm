@@ -2,11 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The route-wall conformance: `Router::decide` and `hop::rebuild` bound to
-//! `AghRouteWall` (design §17.1, Tier 1). Every phase-0 state of the model is built as a real
-//! agh.toml and real token files in a scratch root, judged by the real `identity::presence`,
-//! and decided by the real router; every state the model hops from is rebuilt by the real
-//! hop. Each call runs inside its own `StepEvidence` window.
+//! Route-wall Tier-1 conformance tests for `Router::decide` and `hop::rebuild` (`AghRouteWall`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -142,7 +138,6 @@ fn world(dev: bool, rel: bool) -> World {
         .tempdir()
         .expect("a scratch root");
     let base = root.path();
-    // Filled one way for both in-crate modules: escaped for a TOML basic string.
     let text = super::tests::canonical_text(base);
     let dirs = Dirs::under(base);
     let parent = dirs.config.parent().expect("the config's parent");
@@ -259,8 +254,6 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
 
     let mut real: BTreeMap<Key, (i64, i64)> = BTreeMap::new();
 
-    // 2. Every phase-0 state: the real decision projects to the model's Decide successor,
-    // and (5) the same decision with GH_TOKEN set as without.
     for state in states.iter().filter(|s| var(s, "phase") == 0) {
         let (dev, rel) = (var(state, "dev") == 1, var(state, "rel") == 1);
         let world = world(dev, rel);
@@ -276,7 +269,6 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
                 projection,
                 "{state:?}: {decision:?}"
             );
-            // The opposite environment, in its own window like every real call.
             let opposite = env(var(state, "amb") != 1);
             let other = decide(&world.router, &req, &opposite, Some(&mut ev));
             assert_eq!(
@@ -293,8 +285,6 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
         real.insert(key(state), projected.into_iter().next().expect("one"));
     }
 
-    // 3. Every state the model hops from: the real hop drops the credential; a PATCH in op 2
-    // is refused.
     let endpoints = Endpoints::github_com();
     let cred = Credential::for_tests("dev", Tier::Dev, agh_fake::token("dev").as_bytes());
     let header = AuthHeader::for_origin(&cred, &endpoints, endpoints.api())
@@ -328,14 +318,11 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
         }
     }
 
-    // 4. Negative controls: every mutant's successor differs from the real projection, and
-    // the law the mutant breaks holds on the real one.
     let buggy = interp::with_buggy(&model, 1);
     for state in &states {
         for (mutant, law) in MUTANTS {
             for wrong in buggy.successors(mutant, state) {
                 let lawful = if mutant.starts_with("BuggyHop") {
-                    // The real hop: a read rebuilt with no credential; a write not at all.
                     let mut next = state.clone();
                     if var(state, "op") <= 1 {
                         next.insert("hop", 1);
@@ -357,8 +344,6 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
             }
         }
     }
-
-    // 6. The forged floor: outside the model, so the laws, not the successor.
 
     for state in states
         .iter()
@@ -383,8 +368,6 @@ fn the_real_router_and_hop_conform_to_the_route_wall() {
         }
     }
 
-    // 7. The audit: both bound actions driven and witnessed, nothing stray; the anchors
-    // name exactly those two, and the waivers the other sixteen.
     let audit = ev.audit();
     assert!(audit.is_complete(), "{audit:?}");
     assert_eq!(

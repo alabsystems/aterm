@@ -83,10 +83,12 @@ const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-fleet-v1";
 /// ```
 pub const CERT_DER: &[u8] = include_bytes!("fleet_cert.der");
 
-/// [`CERT_DER`]'s private key, PKCS#8 DER.
+/// [`CERT_DER`]'s private key, PKCS#8 DER. **NOT A SECRET**, like the
+/// certificate: every aterm carries it.
 const KEY_DER: &[u8] = include_bytes!("fleet_key.der");
 
-/// The name a dialer sends (SNI): the certificate's.
+/// The name a dialer sends (SNI): the certificate's. Identity is the proof,
+/// never the name.
 const SERVER_NAME: &str = "aterm-fleet";
 
 /// The longest handshake line: the longest word, a space, a 64-digit tag and
@@ -448,6 +450,8 @@ fn node_line(me: Option<&NodeIdentity>, end: Signer, exporter: &[u8]) -> String 
 }
 
 /// Read `end`'s node line on this channel and check its signature: the
+/// proof, or `None` for `node -`.
+///
 /// # Errors
 /// [`FleetError::NodeProof`] for a signature that does not verify,
 /// [`FleetError::Malformed`] for a line that is no node line, or the read's
@@ -2030,7 +2034,9 @@ mod tests {
         assert_eq!(answer.as_deref(), Some("NO proof"));
     }
 
-    /// THE NEGATIVE CONTROL.
+    /// THE NEGATIVE CONTROL. A dialer that holds no secret sends the listener
+    /// its own proof back — a genuine tag for this very channel, refused only
+    /// because the roles' keys differ.
     #[test]
     fn a_reflected_proof_is_refused() {
         let (listened, (reflected, exporter, answer)) = over_loopback(

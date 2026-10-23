@@ -4,16 +4,9 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A window's theme is its `_GTK_THEME_VARIANT`: `dark` and `light` for a chosen theme, and no
-//! hint at all for `None`, the system's theme, so the window manager draws the frame in its own
-//! default, the desktop's. Upstream set `dark` for `None`, so a window that asked to follow the
-//! desktop told a window manager that reads the hint to draw a dark frame on a light desktop (the
-//! desk audit, 2026-10-22). GNOME 46's mutter reads no hint at all: on :7 a window mapped with
-//! `dark` got the same light frame as one with none, under a light desktop; mutter-x11-frames
-//! follows `org.gnome.desktop.interface color-scheme` alone. The negative control: `None` mapped
-//! back to `dark` in `theme_variant`, and both tests fail.
-//!
-//! The windowed test runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! A window's theme is its `_GTK_THEME_VARIANT`: `dark` and `light` for a chosen theme, and no hint
+//! at all for `None`, the system's theme, so the window manager draws the frame in its own default,
+//! the desktop's.
 
 use aterm_x11::proto::{atom, xproto, NONE};
 use aterm_x11::Connection;

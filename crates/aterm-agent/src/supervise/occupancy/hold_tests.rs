@@ -45,7 +45,6 @@ fn open() -> HoldClock {
 /// close and reopen the hold, and it never reaches 2 h — the assertion sees a restarted clock.
 #[test]
 fn short_idle_reads_never_restart_the_hold() {
-    // Window `i` starts 25 min apart; each is a break read unsettled, then settled.
     let windows = |c: &mut HoldClock, between: Option<HoldEvent>| -> i64 {
         let mut longest = 0;
         for i in 0..24_i64 {
@@ -58,7 +57,6 @@ fn short_idle_reads_never_restart_the_hold() {
             c.step(settled(start, start + 20_000));
             c.step(settled(start, start + 20 * MIN));
             longest = longest.max(c.held_ms(start + 20 * MIN).unwrap_or(0));
-            // The short idle window that ends it.
             if let Some(ev) = between {
                 c.step(ev);
             }
@@ -71,7 +69,6 @@ fn short_idle_reads_never_restart_the_hold() {
     let mut c = HoldClock::default();
     assert!(windows(&mut c, Some(point(false, true))) >= 9 * HOUR);
     assert_eq!(c.since_ms(), Some(0), "nothing decided over the work: kept");
-    // The control.
     let mut c = HoldClock::default();
     assert!(
         windows(&mut c, Some(point(false, false))) < 2 * HOUR,
@@ -115,7 +112,6 @@ fn only_a_foreign_live_edge_or_a_later_point_ends_the_hold() {
             held_ms: 30_000,
         })
     );
-    // The harness's line, answered with an idle point.
     let mut c = open();
     for ev in [HoldEvent::HarnessLine, live(true), point(true, false)] {
         assert_eq!(c.step(ev), None, "{ev:?}");
@@ -128,7 +124,6 @@ fn only_a_foreign_live_edge_or_a_later_point_ends_the_hold() {
             ..
         })
     ));
-    // The harness's line, answered with a break.
     let mut c = open();
     for ev in [
         HoldEvent::HarnessLine,
@@ -141,7 +136,6 @@ fn only_a_foreign_live_edge_or_a_later_point_ends_the_hold() {
         assert_eq!(c.step(ev), None, "{ev:?}");
     }
     assert_eq!(c.since_ms(), Some(0), "the answer's break restarts nothing");
-    // Edge only.
     let mut c = open();
     assert_eq!(c.step(live(true)), None, "an act's live turn");
     assert_eq!(
@@ -150,7 +144,6 @@ fn only_a_foreign_live_edge_or_a_later_point_ends_the_hold() {
         "the same turn read again: no edge"
     );
     assert_eq!(c.since_ms(), Some(0));
-    // The control: a break between, so the foreign read is an edge.
     c.step(settled(9 * MIN, 10 * MIN));
     assert!(matches!(
         c.step(live(false)),
@@ -159,7 +152,6 @@ fn only_a_foreign_live_edge_or_a_later_point_ends_the_hold() {
             ..
         })
     ));
-    // A closed hold opens afresh at the next settled break, at that break's start.
     assert_eq!(
         c.step(settled(11 * MIN, 12 * MIN)),
         Some(HoldChange::Opened {
@@ -198,18 +190,15 @@ fn a_waiting_line_declares_the_hold_and_no_words_are_kept() {
     );
     assert!(c.declared() && !c.wants_tail());
     assert!(!format!("{c:?}").contains("mint"), "{c:?}");
-    // Read before the answer's turn ran: the line may still be answered.
     let mut c = open();
     c.step(HoldEvent::HarnessLine);
     c.step(HoldEvent::AnswerTail {
         waiting_line: false,
     });
     assert!(c.wants_tail(), "still owed");
-    // The control: no line typed, no tail asked, and a tail given declares nothing.
     let mut c = open();
     assert_eq!(c.step(HoldEvent::AnswerTail { waiting_line: true }), None);
     assert!(!c.declared());
-    // A new hold starts undeclared.
     let mut c = open();
     c.step(HoldEvent::HarnessLine);
     c.step(HoldEvent::AnswerTail { waiting_line: true });
@@ -331,8 +320,6 @@ fn the_ledgers_open_hold_is_its_last_hold_row() {
         seed(&[&open]),
         "passed over"
     );
-    // A row of the session's under another rule (a continuation typed, a point recorded)
-    // follows the open hold: followed. One before it, or another session's, does not.
     let typed = row(1_150_000, "s-1", "continue@v1", "-");
     let followed = |rows: &[&str]| seed(rows).map(|s| s.followed);
     assert_eq!(followed(&[&open, &typed]), Some(true));

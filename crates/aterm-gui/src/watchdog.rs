@@ -27,7 +27,8 @@ const STALL_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// THE MAIN THREAD'S WATCH: the cells [`beat`] stamps and the sampler, the control workers and a forking worker read.
 pub(crate) struct MainWatch {
-    /// Monotonic main-thread liveness counter.
+    /// Monotonic main-thread liveness counter. [`beat`] increments it on every
+    /// winit root entry; the sampler watches it for a frozen span.
     heartbeat: AtomicU64,
     /// The last main-loop root [`beat`] was called from, as a [`Breadcrumb`]
     /// `u8`.
@@ -86,7 +87,8 @@ label_enum! {
     /// The main-loop roots the watchdog can pin a stall to.
     #[repr(u8)]
     pub(crate) enum Breadcrumb {
-        /// Before the event loop runs (synchronous launch).
+        /// Before the event loop runs (synchronous launch). Park point: startup does
+        /// heavy main-thread work by design and must not trip the guard.
         Startup => "startup",
         /// The loop has finished `about_to_wait`'s work and is parked in the OS
         /// event wait (stamped as that handler returns, [`enter_about_to_wait`]).
@@ -252,7 +254,8 @@ struct Sampler {
     /// When the current contiguous stall was last reported, for the repeat
     /// cadence.
     last_report: Option<Instant>,
-    /// How many times this contiguous stall has been reported.
+    /// How many times this contiguous stall has been reported. Per-stall state, so it
+    /// re-arms on recovery and a later stall reports as a first.
     reports: u32,
     /// The bar this sampler judges against — [`STALL_THRESHOLD`] for the dev
     /// lane, [`RELEASE_STALL_THRESHOLD`] for a shipped binary.
@@ -265,7 +268,8 @@ struct Sampler {
     /// The reported stall that has not ended yet, until the main thread moves (a heartbeat,
     /// or a CPU reading that finds a spin reported at a park point quiet).
     open: Option<OpenStall>,
-    /// A reported stall that has since ended, waiting for [`Sampler::take_ended`].
+    /// A reported stall that has since ended, waiting for [`Sampler::take_ended`]. Its line
+    /// lets the recovery census tell a stall the run survived from one it died in.
     ended: Option<Ended>,
 }
 
@@ -377,7 +381,9 @@ impl Sampler {
         self.poll_with(now, cur_beat, bc, None).map(|hit| hit.root)
     }
 
-    /// Fold one sample.
+    /// Fold one sample. Returns a [`Hit`] when this sample should be reported: once when a
+    /// contiguous stall crosses the threshold, then once per [`STALL_REPEAT_INTERVAL`] while
+    /// it lasts.
     fn poll_with(
         &mut self,
         now: Instant,
@@ -459,7 +465,9 @@ impl Sampler {
         }
     }
 
-    /// Track whether the main thread stayed on-CPU between samples.
+    /// Track whether the main thread stayed on-CPU between samples. Returns
+    /// whether the interval since the previous sample was busy, or `None` when
+    /// there is no pair of readings to judge it by.
     fn fold_cpu(&mut self, now: Instant, cpu: Option<Duration>) -> Option<bool> {
         let Some(cpu) = cpu else {
             self.cpu_sample = None;
@@ -587,7 +595,10 @@ struct Elapsed {
     pass: Duration,
 }
 
-/// Both clocks, read together at one sampler wake.
+/// Both clocks, read together at one sampler wake. The sampler keeps the previous wake's
+/// reading and measures the next wake from it, never from the start of that wake's own
+/// sleep, so a gap in the report pass (the stall line, the stack capture) is seen rather
+/// than charged to the main thread.
 #[derive(Clone, Copy)]
 struct Clocks {
     mono: Instant,
@@ -1191,7 +1202,11 @@ pub(crate) struct PhaseGuard {
 }
 
 impl Drop for PhaseGuard {
-    /// Restore `previous` only over this guard's own announcement.
+    /// Restore `previous` only over this guard's own announcement. Anything
+    /// else in the cell means a [`beat`] cleared it for a new root (guards
+    /// are stack-scoped on one thread, so a later announcement is always
+    /// dropped before this one), and a stale guard leaves that clean slate
+    /// alone rather than naming work the new root is not doing.
     fn drop(&mut self) {
         let _ = self.cell.compare_exchange(
             self.written as u8,
@@ -1278,7 +1293,9 @@ fn stall_ended_message(ended: Ended) -> String {
     }
 }
 
-/// The prefix of every stack line.
+/// The prefix of every stack line. It contains `MAIN-THREAD STALL`, which the
+/// recovery census reads as a stall (`recovery_census::STALL_LINE`), so a
+/// stack is only ever logged after the stall line it belongs to.
 const STACK_LINE: &str = "MAIN-THREAD STALL stack:";
 
 /// Between two frames of a stack line.
@@ -1707,7 +1724,11 @@ mod tests {
         );
     }
 
-    /// THE CENSUS IS ON THE HOT PATH, not beside it.
+    /// THE CENSUS IS ON THE HOT PATH, not beside it. The rule above is only
+    /// worth anything if the winit roots actually feed it: `beat` is what every
+    /// root calls, so this drives the real stamp-close-bump sequence and pins
+    /// that the turn it closes is booked to the root that OWNED it — the
+    /// `user_event` park, not the `about_to_wait` that ended it.
     #[test]
     fn a_beat_books_the_turn_it_closes_to_the_root_that_owned_it() {
         let _serial = beat_serial();
@@ -2860,7 +2881,9 @@ mod tests {
         );
     }
 
-    /// The quiet rule ends only a spin reported at a park point.
+    /// The quiet rule ends only a spin reported at a park point. A work-root stall (parked
+    /// on a lock, `busy` false) meets a park point under an unmoved heartbeat only when a
+    /// sample reads the next root's breadcrumb before its beat, and that beat ends it.
     #[test]
     fn a_work_root_stall_ends_by_its_beat_never_as_a_quiet_spin() {
         let t0 = Instant::now();

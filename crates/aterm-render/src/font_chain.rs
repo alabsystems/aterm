@@ -212,6 +212,7 @@ pub fn resolve_chain<P: ChainProbe + ?Sized>(probe: &mut P, policy: ChainPolicy)
     synthetic_or_notdef(probe)
 }
 
+/// The chain's final tier, shared by both give-up exits: the fontless symbol synthesis, else
 /// `.notdef`. It is the highest tier index, so probing it last keeps P2's order on either exit.
 #[inline]
 fn synthetic_or_notdef<P: ChainProbe + ?Sized>(probe: &mut P) -> Resolution {

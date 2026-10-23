@@ -123,7 +123,8 @@ pub enum DragEvent {
     Drop,
 }
 
-/// An offer this device received.
+/// An offer this device received. Dropping it destroys it, then frees its
+/// listener; the device drops its offers with the book unlocked.
 struct OfferSlot {
     kind: Kind,
     proxy: Proxy,
@@ -161,7 +162,10 @@ struct Drag {
     dropped: bool,
 }
 
-/// What a device's listener and the caller share.
+/// What a device's listener and the caller share. As `seat::SeatBook`, it is
+/// a leaf of the lock graph: nothing the lock census resolves by name is
+/// called while it is held, and offers are made and destroyed, and the
+/// caller's sink called, with it unlocked.
 struct DeviceBook {
     /// Every live offer, in arrival order.
     offers: Vec<OfferSlot>,
@@ -793,6 +797,8 @@ impl Drop for Source {
 }
 
 /// Listen to a source: each request, decoded, goes to `sink` (a
+/// cancellation is also kept, for [`Source::cancelled`]).
+///
 /// # Safety
 /// `proxy` is a live source of `kind` this module made, without a listener,
 /// destroyed before the listener is freed.

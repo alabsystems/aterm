@@ -5,8 +5,8 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [OS/2 and Windows Metrics Table](https://docs.microsoft.com/en-us/typography/opentype/spec/os2)
-//! implementation.
+//! A [OS/2 and Windows Metrics
+//! Table](https://docs.microsoft.com/en-us/typography/opentype/spec/os2) implementation.
 
 use crate::LineMetrics;
 use crate::parser::Stream;
@@ -173,7 +173,6 @@ pub struct ScriptMetrics {
     pub y_offset: i16,
 }
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/os2#fsselection
 #[derive(Clone, Copy)]
 struct SelectionFlags(u16);
 
@@ -181,7 +180,6 @@ struct SelectionFlags(u16);
 impl SelectionFlags {
     #[inline] fn italic(self) -> bool { self.0 & (1 << 0) != 0 }
     #[inline] fn bold(self) -> bool { self.0 & (1 << 5) != 0 }
-    // #[inline] fn regular(self) -> bool { self.0 & (1 << 6) != 0 }
     #[inline] fn use_typo_metrics(self) -> bool { self.0 & (1 << 7) != 0 }
     #[inline] fn oblique(self) -> bool { self.0 & (1 << 9) != 0 }
 }
@@ -279,7 +277,6 @@ fn char_range_index(c: char) -> i8 {
         0x3200..=0x32FF => 54,
         0x3300..=0x33FF => 55,
         0xAC00..=0xD7AF => 56,
-        // Ignore Non-Plane 0 (57), since this is not a real range.
         0x10900..=0x1091F => 58,
         0x4E00..=0x9FFF => 59,
         0x2E80..=0x2FDF => 59,
@@ -366,7 +363,8 @@ fn char_range_index(c: char) -> i8 {
     }
 }
 
-/// A [OS/2 and Windows Metrics Table](https://docs.microsoft.com/en-us/typography/opentype/spec/os2).
+/// A [OS/2 and Windows Metrics
+/// Table](https://docs.microsoft.com/en-us/typography/opentype/spec/os2).
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
     /// Table version.
@@ -390,8 +388,6 @@ impl<'a> Table<'a> {
             _ => return None,
         };
 
-        // Do not check the exact length, because some fonts include
-        // padding in table's length in table records, which is incorrect.
         if data.len() < table_len {
             return None;
         }
@@ -426,14 +422,10 @@ impl<'a> Table<'a> {
     }
 
     /// Returns face permissions.
-    ///
-    /// Returns `None` in case of a malformed value.
     #[inline]
     pub fn permissions(&self) -> Option<Permissions> {
         let n = Stream::read_at::<u16>(self.data, TYPE_OFFSET).unwrap_or(0);
         if self.version <= 2 {
-            // Version 2 and prior, applications are allowed to take
-            // the most permissive of provided flags
             let permission = if n & 0xF == 0 {
                 Permissions::Installable
             } else if n & 8 != 0 {
@@ -446,7 +438,6 @@ impl<'a> Table<'a> {
 
             Some(permission)
         } else {
-            // Version 3 onwards, flags must be mutually exclusive.
             match n & 0xF {
                 0 => Some(Permissions::Installable),
                 2 => Some(Permissions::Restricted),
@@ -461,7 +452,6 @@ impl<'a> Table<'a> {
     #[inline]
     pub fn is_subsetting_allowed(&self) -> bool {
         if self.version <= 1 {
-            // Flag introduced in version 2
             true
         } else {
             let n = Stream::read_at::<u16>(self.data, TYPE_OFFSET).unwrap_or(0);
@@ -470,14 +460,9 @@ impl<'a> Table<'a> {
     }
 
     /// Checks if the face allows outline data to be embedded.
-    ///
-    /// If false, only bitmaps may be embedded in accordance with [`Self::permissions`].
-    ///
-    /// If the font contains no bitmaps and this flag is not set, it implies no embedding is allowed.
     #[inline]
     pub fn is_outline_embedding_allowed(&self) -> bool {
         if self.version <= 1 {
-            // Flag introduced in version 2
             true
         } else {
             let n = Stream::read_at::<u16>(self.data, TYPE_OFFSET).unwrap_or(0);
@@ -521,8 +506,6 @@ impl<'a> Table<'a> {
     /// Returns Unicode ranges.
     #[inline]
     pub fn unicode_ranges(&self) -> UnicodeRanges {
-        // `parse` checked the table is at least 78 bytes, so this offset is
-        // inside it; an empty stream would read zeros all the same.
         let mut s = Stream::new_at(self.data, UNICODE_RANGES_OFFSET).unwrap_or_default();
         let n1 = s.read::<u32>().unwrap_or(0) as u128;
         let n2 = s.read::<u32>().unwrap_or(0) as u128;
@@ -549,8 +532,6 @@ impl<'a> Table<'a> {
     }
 
     /// Checks if face is bold.
-    ///
-    /// Do not confuse with [`Weight::Bold`].
     #[inline]
     pub fn is_bold(&self) -> bool {
         SelectionFlags(self.fs_selection()).bold()
@@ -593,16 +574,12 @@ impl<'a> Table<'a> {
     /// Returns Windows descender.
     #[inline]
     pub fn windows_descender(&self) -> i16 {
-        // Should be negated. Wrapping, as upstream's release build does: a
-        // `usWinDescent` of 0x8000 stays i16::MIN instead of overflowing.
         Stream::read_at::<i16>(self.data, WIN_DESCENT)
             .unwrap_or(0)
             .wrapping_neg()
     }
 
     /// Returns x height.
-    ///
-    /// Returns `None` version is < 2.
     #[inline]
     pub fn x_height(&self) -> Option<i16> {
         if self.version < 2 {
@@ -613,8 +590,6 @@ impl<'a> Table<'a> {
     }
 
     /// Returns capital height.
-    ///
-    /// Returns `None` version is < 2.
     #[inline]
     pub fn capital_height(&self) -> Option<i16> {
         if self.version < 2 {

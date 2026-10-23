@@ -13,6 +13,9 @@ pub const XTERM_CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 /// How many slots the derivation fills: 16 through 255.
 pub const EXTENDED_SLOTS: usize = 240;
 
+/// The ANSI slot of each colour corner of the cube, by corner bits
+/// `r<<2 | g<<1 | b` (`0` and `7`, black and white, are the anchors):
+/// bright blue, bright green, bright cyan, bright red, bright magenta,
 /// bright yellow.
 const CORNER_SLOTS: [usize; 8] = [0, 12, 10, 14, 9, 13, 11, 15];
 
@@ -129,12 +132,15 @@ pub fn oklab_to_linear(lab: (f64, f64, f64)) -> (f64, f64, f64) {
     )
 }
 
+/// How far outside `[0, 1]` a linear channel may sit and still count as in
 /// gamut: float noise on a colour that round-trips, far under half a step.
 const GAMUT_EPSILON: f64 = 1e-7;
 
 /// Bisection steps toward the largest in-gamut chroma.
 const CHROMA_STEPS: u32 = 20;
 
+/// The sRGB colour of an `OkLab` point: outside the gamut, the same
+/// lightness and hue at the largest chroma that fits (a fixed bisection),
 /// then encoded and rounded half up.
 #[cfg_attr(trust_verify, trust::skip)]
 fn oklab_to_rgb(lab: (f64, f64, f64)) -> Rgb {
@@ -232,6 +238,10 @@ mod tests {
     const COLOUR_CORNERS: [(u8, usize); 6] =
         [(196, 9), (46, 10), (226, 11), (21, 12), (201, 13), (51, 14)];
 
+    /// Spec `scheme-generated-palette`: the cube's eight corners are the
+    /// theme's anchors and bright row, byte for byte, and a light theme's
+    /// white corner is its page while its black corner stays dark ink.
+    /// Negative control: with the flag off, slot 196 is xterm's `#FF0000`,
     /// not the theme's bright red.
     #[test]
     fn generated_corners_are_the_theme_anchors() {
@@ -285,6 +295,11 @@ mod tests {
         ls.windows(2).all(|w| w[0] < w[1])
     }
 
+    /// Spec `scheme-generated-palette`: the grey ramp rises in lightness from
+    /// the dark anchor to the light one on every theme, light ones included,
+    /// and swapping `color0` and `color15` leaves it unchanged. NEGATIVE
+    /// CONTROL: the naive `color0` → `color15` ramp on Aterm Day (whose
+    /// bright white is its darkest ink) does not rise, so the test sees
     /// direction.
     #[test]
     fn grey_ramp_follows_black_to_white() {

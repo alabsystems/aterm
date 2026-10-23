@@ -28,7 +28,9 @@ type CGFloat = f64;
 type CGDataProviderReleaseDataCallback =
     unsafe extern "C" fn(info: *mut c_void, data: *const c_void, size: usize);
 
-/// `kCGImageAlphaNoneSkipFirst` — the high byte is padding, not alpha.
+/// `kCGImageAlphaNoneSkipFirst` — the high byte is padding, not alpha. With the
+/// little-endian 32-bit byte order below this describes exactly the frontend's
+/// `0x00RRGGBB` word.
 const K_CG_IMAGE_ALPHA_NONE_SKIP_FIRST: u32 = 6;
 /// `kCGBitmapByteOrder32Little` (`2 << 12`, `CGImage.h`).
 const K_CG_BITMAP_BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
@@ -49,7 +51,9 @@ unsafe extern "C" {
     /// The generic device RGB space, as `softbuffer`'s CG backend uses.
     fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
 
-    /// Wrap caller-owned bytes in a data provider.
+    /// Wrap caller-owned bytes in a data provider. `release_data` is invoked
+    /// exactly once, when the provider's last reference goes away, and is how
+    /// ownership of the buffer comes back to Rust.
     fn CGDataProviderCreateWithData(
         info: *mut c_void,
         data: *const c_void,
@@ -58,7 +62,8 @@ unsafe extern "C" {
     ) -> CGDataProviderRef;
     fn CGDataProviderRelease(provider: CGDataProviderRef);
 
-    /// Build an image over a data provider.
+    /// Build an image over a data provider. The image retains the provider, so
+    /// the caller's create-reference is released immediately afterwards.
     fn CGImageCreate(
         width: usize,
         height: usize,

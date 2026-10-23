@@ -31,7 +31,7 @@ pub enum Source {
 impl Source {
     /// The one wire spelling. Schema 1 everywhere it is printed.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Source::None => "none",
             Source::Grid => "grid",

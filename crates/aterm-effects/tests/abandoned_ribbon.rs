@@ -97,7 +97,8 @@ impl Host {
         self.frame();
     }
 
-    /// Type `s` a key at a time.
+    /// Type `s` a key at a time. Only ASCII and CJK are typed, so a non-ASCII
+    /// char is priced at two cells, as the host does (`note_typed_cells`).
     fn type_str(&mut self, s: &str) {
         for ch in s.chars() {
             let cells = if ch.is_ascii() { 1 } else { 2 };
@@ -209,7 +210,11 @@ fn hello(row: u16) -> Host {
     h
 }
 
-/// A plain shell wrap: a line typed past the right margin at 90 ms a key.
+/// A plain shell wrap: a line typed past the right margin at 90 ms a key. The first row stops
+/// being renewed the moment the caret leaves it (row scope: `aterm-models-effects`'
+/// `ribbon_row_hold_model`, `OnlyOwnerRenews`) and flows out from its own last key
+/// (`leave_row`, `Cohort::flow`), gone by `FLOW_TOTAL_S`; the second row's band stays under the
+/// hand.
 #[test]
 fn a_wrapped_line_s_first_row_goes_out_on_its_own_clock_while_the_hand_types_on_the_second() {
     let mut h = Host::at_row(5);
@@ -322,7 +327,9 @@ fn a_shell_fold_continues_the_walk_at_the_pace_the_row_above_had_reached() {
     }
 }
 
-/// The fold's seam is one step, not a repeated stop.
+/// The fold's seam is one step, not a repeated stop. On the frame the 81st key
+/// folds onto row 6, both its cell `(6,0)` and the 80th key's pending-wrap cell
+/// `(5,79)` are laid, `(6,0)` first.
 #[test]
 fn a_shell_fold_s_first_cell_is_the_row_above_s_last_glyph_continued_one_step() {
     let (mut h, pace) = typed_to_the_margin();
@@ -370,7 +377,9 @@ fn dark_after(h: &mut Host, row: u16, since: Instant, flowed: &mut bool) -> Opti
     None
 }
 
-/// A Backspace back up through a shell fold holds the row under the parked hand.
+/// A Backspace back up through a shell fold holds the row under the parked hand. Row 5 typed to
+/// the margin, `x` folds onto `(6, 0)` and row 5 flows; one Backspace erases `x`, a second goes
+/// up through the fold to `(5, 79)`.
 #[test]
 fn a_backspace_back_up_through_a_shell_fold_holds_the_row_under_the_parked_hand() {
     for pause_ms in [0u64, 1000] {
@@ -540,7 +549,8 @@ fn a_fold_s_seam_holds_when_two_keys_echoes_land_on_one_frame() {
     }
 }
 
-/// Claude Code's box-growth wrap, then typing on.
+/// Claude Code's box-growth wrap, then typing on. The growth key re-lays line 1 a row up while
+/// the caret stays on its row and jumps left.
 #[test]
 fn the_box_growth_wrap_carries_the_band_up_with_its_text_and_the_flush_pays_its_landing() {
     let mut h = hello(6);
@@ -677,7 +687,9 @@ fn a_relocated_input_box_carries_the_band_with_its_text_and_stamps_nothing() {
     assert!(!h.lit(5));
 }
 
-/// Negative control of the follow: a killed line under its own twin.
+/// Negative control of the follow: a killed line under its own twin. Row 4
+/// holds `$ cd ..`; the hand types `cd ..` on row 5 and readline's Ctrl-U
+/// redraw (`\r$ \x1b[K`, no key hint) blanks it.
 #[test]
 fn a_killed_line_under_an_identical_line_is_released_not_followed_onto_it() {
     for above in ["cd ..", "ls -la"] {
@@ -992,7 +1004,9 @@ fn a_re_anchor_onto_the_pane_s_first_column_lights_nothing_in_the_pane_beside_it
     );
 }
 
-/// A key typed back over a cell an abandoned cohort still owns keeps its own light.
+/// A key typed back over a cell an abandoned cohort still owns keeps its own light. `hello
+/// world`, Up, Down, Left×3, `X` at `(5,8)`: the Up abandons the band, so the key mints a second
+/// cell there.
 #[test]
 fn a_key_typed_over_an_abandoned_cohorts_cell_keeps_its_own_light() {
     let mut h = hello(5);

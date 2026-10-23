@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! NAMED SECURITY POSTURES, one catalog for the unit tests and for a development build's
-//! `security-posture` verb ([`crate::security_posture`]), so a capture of a headless instance and a
-//! unit assertion show the same MACOS ACCESS block.
+//! Named security postures shared by unit tests and `security-posture` ([`crate::security_posture`]).
 
 use aterm_containment::FdaScope;
 use aterm_containment::consent::{
@@ -12,8 +10,6 @@ use aterm_containment::consent::{
 
 use crate::native_settings::{DevToolsFacts, MacosAccess, MacosAccessRow};
 
-/// The fixture copy's reset subject, `com.example.fixture`: read once from a
-/// exclusively owned scratch bundle, the only way a [`ResetSubject`] exists.
 fn fixture_subject() -> Option<ResetSubject> {
     static SUBJECT: std::sync::OnceLock<Option<ResetSubject>> = std::sync::OnceLock::new();
     SUBJECT
@@ -35,8 +31,7 @@ fn fixture_subject() -> Option<ResetSubject> {
         .clone()
 }
 
-/// The base posture: an installed copy with the healthy anchor, Full Disk Access `fda`, a
-/// designated requirement of class `dr`, and the measured `scope` of a grant.
+/// Base posture with healthy anchor, Full Disk Access `fda`, requirement `dr`, and `scope`.
 pub(crate) fn access(fda: FdaState, dr: DrClass, scope: FdaScope) -> MacosAccess {
     MacosAccess {
         enabled: true,
@@ -83,8 +78,7 @@ pub(crate) fn access(fda: FdaState, dr: DrClass, scope: FdaScope) -> MacosAccess
     }
 }
 
-/// A census with the running copy (Developer ID when `running_stable`, else ad hoc), an ad-hoc
-/// `.rollback` beside it and a Developer-ID copy from another team.
+/// Census with the running copy, an ad-hoc `.rollback` beside it, and a foreign Developer-ID copy.
 pub(crate) fn census(running_stable: bool) -> aterm_containment::consent::Claimants {
     use aterm_containment::consent::{Claimant, Claimants, Enumeration, classify_dr};
     let copy = |path: &str, dr_text: &str, signing: &'static str, team: Option<&str>| Claimant {
@@ -202,7 +196,6 @@ pub(crate) fn named(name: &str) -> Option<MacosAccess> {
 mod tests {
     use super::*;
 
-    /// Every name the verb lists stages a posture, and the postures differ.
     #[test]
     fn every_listed_name_is_a_distinct_posture() {
         let postures: Vec<MacosAccess> = NAMES

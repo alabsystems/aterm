@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 /// The dev-build override for `[fabric] command`, read only through [`aterm_types::dev_seam!`].
 const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";
 
-/// The back-off between relaunches, and its ceiling.
+/// The back-off between relaunches, and its ceiling. A bridge that fails at
+/// startup (a bad cap file, an unreachable broker) must not become a fork bomb;
+/// a bridge that was killed once must come back promptly.
 const RELAUNCH_MIN: Duration = Duration::from_millis(200);
 const RELAUNCH_MAX: Duration = Duration::from_secs(30);
 
@@ -20,7 +22,11 @@ const RELAUNCH_MAX: Duration = Duration::from_secs(30);
 /// rather than "it cannot start".
 const RELAUNCH_HEALTHY: Duration = Duration::from_secs(5);
 
-/// How long a QUIT waits for its bridge to take `bye quit` ([`bye`]).
+/// How long a QUIT waits for its bridge to take `bye quit` ([`bye`]). The
+/// bridge answers before it publishes anything — the withdrawal needs aterm no
+/// longer once the word is read — so this is a push-loop wake and one verb
+/// round trip; the bound is for a bridge that is wedged, and then the quit
+/// goes on without the withdrawal (the node's will reads `away`).
 pub(crate) const BYE_WAIT: Duration = Duration::from_secs(1);
 
 /// A development build's QA seam: `ATERM_DEBUG_QUIT_BYE=handoff` makes a quit
@@ -95,12 +101,14 @@ fn supervisor() -> std::sync::MutexGuard<'static, Supervisor> {
 pub(crate) enum ArmError {
     /// The argv was empty. Nothing is armed.
     NoCommand,
-    /// `argv[0]` cannot be executed ([`preflight`] gives `reason`).
+    /// `argv[0]` cannot be executed ([`preflight`] gives `reason`). Refused before the latch
+    /// closes, so nothing is armed and a corrected `attach` is allowed.
     NotExecutable {
         program: String,
         reason: &'static str,
     },
-    /// One is already running, with this argv.
+    /// One is already running, with this argv. The request's argv did not take, which is why
+    /// this is an error and not `OK already`.
     AlreadySupervised(Vec<String>),
     /// The thread could not be spawned. Nothing is armed; a retry is allowed.
     Thread(std::io::Error),
@@ -122,7 +130,8 @@ pub(crate) fn status() -> SupervisorStatus {
     }
 }
 
-/// Launch and supervise the bridge, if one is configured or carried.
+/// Launch and supervise the bridge, if one is configured or carried. Returns whether a
+/// supervisor thread started; `false` never means a half-attached bridge.
 pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
     crate::fabric::set_hold_on_bridge_lost(hold_on_bridge_lost(config));
     let configured = configured_command(config);
@@ -238,7 +247,9 @@ fn preflight(program: &str, path: Option<&std::ffi::OsStr>) -> Result<(), &'stat
     if found { Ok(()) } else { Err("not-on-path") }
 }
 
-/// Any execute bit, as `execve` requires of the mode.
+/// Any execute bit, as `execve` requires of the mode. The uid-specific check (`access(2)`) is
+/// not attempted: a wrong pass falls back to the supervisor's logged retry, a wrong refusal
+/// would block a program that runs.
 fn is_executable(md: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     md.permissions().mode() & 0o111 != 0
@@ -518,7 +529,9 @@ mod tests {
         Config::parse(text).map_err(|e| e.to_string())
     }
 
-    /// A tiny real bridge: a program that exits at once.
+    /// A tiny real bridge: a program that exits at once. Enough to pass the
+    /// pre-flight and prove a supervisor thread started; the thread outlives
+    /// the test and only re-spawns `true` under the back-off.
     fn true_program() -> String {
         ["/usr/bin/true", "/bin/true"]
             .into_iter()
@@ -632,7 +645,9 @@ mod tests {
         );
     }
 
-    /// A lane the bridge half-closed is retired too.
+    /// A lane the bridge half-closed is retired too. The stand-in (`perl`: a shell cannot
+    /// `shutdown`) shuts its verb lane's write half and exits, leaving a holder of both far
+    /// ends; once it is reaped, a write to the lane must fail.
     #[test]
     fn a_lane_the_bridge_half_closed_is_retired_whoever_else_holds_a_far_end() {
         use std::io::{BufRead as _, Write as _};
@@ -686,7 +701,9 @@ mod tests {
         );
     }
 
-    /// DEFAULT OFF.
+    /// DEFAULT OFF. An instance with no `[fabric]` table and no env var launches
+    /// nothing — the secure default, and the reason a fabric-unaware machine
+    /// pays nothing for the feature existing.
     #[test]
     fn the_fabric_is_off_unless_it_is_configured() {
         crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {

@@ -15,7 +15,8 @@ const H_PAD: usize = 1;
 /// Narrowest the card may be, in content cells: a menu whose rows read
 /// `Copy…`/`Close…` is worse than one that runs a little wide.
 const MIN_CONTENT: usize = 16;
-/// Widest the card may be, in content cells.
+/// Widest the card may be, in content cells. Headers (whose description can reach
+/// [`crate::session_chrome::DESCRIPTION_DISPLAY_MAX`] graphemes) ellipsize to this.
 const MAX_CONTENT: usize = 44;
 
 /// Open in-grid tab context menu state for one window.
@@ -267,7 +268,9 @@ pub(crate) enum MenuNav {
     First,
     /// End — jump to the last enabled row.
     Last,
-    /// A bare modifier or lock press: swallowed, card stays.
+    /// A bare modifier or lock press: swallowed, card stays. Otherwise the Shift half
+    /// of Shift+F10 would dismiss the card it re-opens (the same class
+    /// `is_bare_modifier_key` guards the rename field from).
     Inert,
 }
 

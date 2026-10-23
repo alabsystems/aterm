@@ -72,7 +72,7 @@ pub enum ActClass {
 impl ActClass {
     /// The class's word, as a report says it.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::Act => "act",
             Self::Housekeeping => "housekeeping",
@@ -217,7 +217,7 @@ pub struct ActsAccount {
 impl ActsAccount {
     /// Whether the candidate followed the tape record for record, as a strict replay would: nothing dropped, repeated, keyed, tainted, made up or left unmatched.
     #[must_use]
-    pub fn exact(&self) -> bool {
+    pub const fn exact(&self) -> bool {
         self.dropped == 0
             && self.repeated == 0
             && self.keyed == 0
@@ -414,7 +414,7 @@ impl ActsCursor {
     }
 
     /// The next record not consumed or dropped (the effect's ordinal).
-    pub(crate) fn position(&self) -> usize {
+    pub(crate) const fn position(&self) -> usize {
         self.pos
     }
 
@@ -430,7 +430,7 @@ impl ActsCursor {
     }
 
     /// The first record of the loop's segment.
-    pub(crate) fn segment_start(&self) -> usize {
+    pub(crate) const fn segment_start(&self) -> usize {
         self.seg_start
     }
 
@@ -485,13 +485,13 @@ impl ActsCursor {
     }
 
     /// A request served without consuming a record.
-    fn unconsumed(&mut self) {
+    const fn unconsumed(&mut self) {
         self.idle += 1;
         self.strayed = true;
     }
 
     /// Time passes with no record: a sleep, or a wait served again.
-    fn pass(&mut self, ns: u64) {
+    const fn pass(&mut self, ns: u64) {
         self.slept_mono = self.slept_mono.saturating_add(ns);
         self.slept_wall = self.slept_wall.saturating_add(ns);
     }

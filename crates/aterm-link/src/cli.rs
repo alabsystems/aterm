@@ -1003,7 +1003,8 @@ impl RunningImage {
     }
 }
 
-/// The supervisor's invocation, without resolving its final symlink.
+/// The supervisor's invocation, without resolving its final symlink. Watching
+/// `current_exe` on Linux instead would pin the old symlink target forever.
 fn invocation_path(
     argv0: &std::ffi::OsStr,
     path: Option<&std::ffi::OsStr>,

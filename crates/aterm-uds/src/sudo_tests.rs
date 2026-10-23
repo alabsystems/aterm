@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the `sudo` askpass primitives. Behaviour and security only — no
-//! wording pins, no timing. These run as an ordinary test binary (no sudo
-//! parent), which is itself a useful control: the test process is NOT a child
-//! of `/usr/bin/sudo`, so `attest_sudo` on its own parent must refuse.
+//! Tests for the `sudo` askpass primitives.
 
 use super::*;
 
@@ -27,7 +24,6 @@ fn secret_round_trips_caps_and_redacts() {
     let capped = Secret::from_bytes(&long);
     assert_eq!(capped.as_bytes().len(), 1023);
 
-    // The Debug never prints the bytes.
     let shown = format!("{:?}", Secret::from_bytes(b"topsecret"));
     assert!(shown.contains("redacted"), "{shown}");
     assert!(!shown.contains("topsecret"), "{shown}");
@@ -42,8 +38,6 @@ fn attesting_a_non_sudo_parent_refuses() {
     let ppid = parent_pid();
     #[cfg(target_vendor = "apple")]
     {
-        // The parent exists (the test runner), so this is a real refusal by
-        // the facts, not a "gone" miss.
         assert!(ppid > 0, "a test has a parent");
         let r = attest_sudo(ppid);
         assert!(r.is_err(), "the test runner is not /usr/bin/sudo: {r:?}");

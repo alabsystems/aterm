@@ -316,7 +316,8 @@ impl ColdTier {
         self.cache_next.set(0);
     }
 
-    /// Live (non-dropped) region of the cumulative index.
+    /// Live (non-dropped) region of the cumulative index. Total `get` keeps
+    /// it panic-free; `cum_start <= len` is a maintained invariant.
     #[inline]
     fn live_cumulative(&self) -> &[usize] {
         self.cumulative_lines.get(self.cum_start..).unwrap_or(&[])

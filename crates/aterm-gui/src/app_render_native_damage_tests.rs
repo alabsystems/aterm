@@ -1394,7 +1394,10 @@ fn heterogeneous_bail_after_a_leaf_rasters_drops_the_reusable_card() {
     );
 }
 
-/// A mixed native/terminal split has one focused metadata authority.
+/// A mixed native/terminal split has one focused metadata authority. OSC 12
+/// and absolute-row anchors follow a focused terminal's exact extracted
+/// snapshot, while focusing the native sibling returns those terminal-only
+/// fields to neutral instead of retaining a stale prior frame.
 #[test]
 fn heterogeneous_focus_projects_terminal_cursor_color_and_row_metadata() {
     let mut app = App::headless_for_test();

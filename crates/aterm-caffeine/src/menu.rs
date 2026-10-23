@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The mug's clicks and its right-click menu, pure: what a click means, which rows the menu
-//! shows, and the stable tags its items carry to the AppKit target.
+//! Caffeine status-item click classification, right-click menu composition, and menu item tags.
 
 use crate::launchd::Startup;
 use crate::model::{Choice, Mode, describe_left};
@@ -16,8 +15,7 @@ pub enum Click {
     Menu,
 }
 
-/// A click with the right button, or with the left while Control is held, opens the menu;
-/// any other click toggles.
+/// Classify a status-item click as [`Click::Menu`] (right click or Control-click) or [`Click::Toggle`].
 #[inline]
 #[must_use]
 pub const fn classify_click(right_button: bool, control_held: bool) -> Click {
@@ -50,8 +48,7 @@ impl MenuAction {
         Self::Quit,
     ];
 
-    /// The `NSMenuItem.tag` this action rides in. Stable once assigned; `0` is never used, so
-    /// an untagged item decodes to nothing.
+    /// Nonzero `NSMenuItem.tag` value for this action.
     #[inline]
     #[must_use]
     pub const fn tag(self) -> isize {
@@ -112,15 +109,10 @@ pub fn about_line(version: &str) -> String {
 pub const QUIT_LABEL: &str = "Quit Caffeine";
 /// The title of Enable at Startup.
 pub const STARTUP_LABEL: &str = "Enable at Startup";
-/// Its title while Login Items' switch keeps its login plist from loading
-/// ([`Startup::Blocked`]): choosing it opens Login Items, where the person turns it on.
+/// Menu title for Enable at Startup when blocked in Login Items ([`Startup::Blocked`]).
 pub const STARTUP_BLOCKED_LABEL: &str = "Enable at Startup \u{2014} Allow in Login Items\u{2026}";
 
-/// The menu at `now` for `mode`, with Enable at Startup checked when `startup` is on (and
-/// titled for Login Items while it is blocked there; unchecked then, and while launchd has
-/// it disabled, where choosing it lifts that): the about row, the four
-/// Activate choices (the one in effect checked, a timed one with its time left), Enable at
-/// Startup, and Quit.
+/// Compose the menu rows at `now` for `mode`, `startup`, and `version`.
 #[must_use]
 pub fn compose(mode: Mode, now: u64, startup: Startup, version: &str) -> Vec<Row> {
     let current = mode.choice(now);
@@ -160,8 +152,7 @@ pub fn compose(mode: Mode, now: u64, startup: Startup, version: &str) -> Vec<Row
     rows
 }
 
-/// The mug's tooltip in `mode` at `now`. A keep-awake activity that could not begin has
-/// already turned the mode off, so the tooltip reads off then too.
+/// Status-item tooltip for `mode` at `now`.
 #[must_use]
 pub fn tooltip(mode: Mode, now: u64) -> String {
     match mode.settled(now) {
@@ -271,7 +262,6 @@ mod tests {
             .map(|(l, _, _)| l.as_str())
             .collect();
         assert_eq!(checked, ["Activate Forever"]);
-        // Expired: nothing checked, no time left shown.
         let expired = actions(&compose(mode, NOW + 8 * HOUR, Startup::Off, "1"));
         assert!(expired.iter().all(|(l, _, c)| !c && !l.contains("left")));
     }

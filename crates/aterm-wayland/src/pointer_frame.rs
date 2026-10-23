@@ -6,23 +6,14 @@
 // modified by the aterm project in 2026. See ../LICENSE-MIT for the upstream
 // MIT license.
 
-//! A pointer's events, grouped by `wl_pointer.frame` as the winit fork has
-//! seen them through smithay-client-toolkit until LW.7: each event names the
-//! surface the pointer is on and its position there; a frame's axis events
-//! merge into one (both axes, the source, discrete steps and the stop); a
-//! pointer before version 5, which sends no frames, hands each event out at
-//! once. An event with no entered surface is dropped.
-//!
-//! [`Frames`] is the state machine, fed the decoded events one at a time
-//! ([`crate::seat`] decodes them); it is generic over the surface, so it is
-//! tested without a compositor.
+//! `wl_pointer.frame` event grouping state machine ([`Frames`], [`crate::seat`]).
 
 /// A scroll along one axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AxisScroll {
     /// In surface-local pixels.
     pub absolute: f64,
-    /// In steps (a wheel's clicks); 0 from a continuous source.
+    /// In steps (a wheel's clicks).
     pub discrete: i32,
     /// The scroll stopped (a finger lifted).
     pub stop: bool,
@@ -75,7 +66,7 @@ pub enum PointerKind {
     },
 }
 
-/// One pointer event: on which surface, where, what.
+/// One pointer event.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointerEvent<S> {
     pub surface: S,
@@ -146,8 +137,7 @@ pub struct Frames<S> {
     latest_button: Option<u32>,
 }
 
-/// One axis scroll's two axes, `value` on `axis` (`None` for an axis the
-/// protocol does not name).
+/// One axis scroll's two axes, `value` on `axis` (`None` for an axis the protocol does not name).
 fn on_axis(axis: u32, set: impl FnOnce(&mut AxisScroll)) -> Option<(AxisScroll, AxisScroll)> {
     let (mut horizontal, mut vertical) = (AxisScroll::default(), AxisScroll::default());
     match axis {
@@ -209,8 +199,6 @@ impl<S: Copy + PartialEq> Frames<S> {
                 PointerKind::Enter { serial }
             }
             Raw::Leave { serial, surface } => {
-                // A surface the client destroyed arrives as none: the
-                // pointer has left whatever it was on.
                 let left = surface.or(self.surface);
                 if self.surface == left {
                     self.surface = None;
@@ -300,11 +288,8 @@ impl<S: Copy + PartialEq> Frames<S> {
             kind,
         };
         if self.version < 5 {
-            // No frames before version 5: each event is its own.
             return Some(vec![event]);
         }
-        // A frame's axis events merge into the one before them: one scroll,
-        // diagonal when both axes moved.
         if let (
             Some(PointerEvent {
                 kind:
@@ -324,7 +309,6 @@ impl<S: Copy + PartialEq> Frames<S> {
             },
         ) = (self.pending.last_mut(), &event.kind)
         {
-            // A time of 0 is "not said": take a real one.
             if *ot == 0 {
                 *ot = *nt;
             }

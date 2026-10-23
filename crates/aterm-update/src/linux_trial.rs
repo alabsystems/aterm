@@ -149,7 +149,9 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    /// The start rule as a machine.
+    /// The start rule as a machine. `young`: the stamped start (the latest within the
+    /// budget) may still confirm; `Settle`: its window passes unconfirmed; `lost`: a
+    /// rollback taken over a start that could still have confirmed.
     fn start_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             LinuxTrialStartSettles {
@@ -323,7 +325,10 @@ mod tests {
     /// Seconds per tick of [`deferral_model`]: its settle window `W` is two ticks.
     const TICK_SECS: i64 = START_SETTLES_SECS / 2;
 
-    /// How long the verdict waits, as a machine with a clock.
+    /// How long the verdict waits, as a machine with a clock. `age` is ticks since the
+    /// stamp (capped at the window `W`), `wait` ticks since the first start kept past the
+    /// budget (capped just past `W` + 1), and `late` records a start kept past the budget
+    /// more than `W` ticks after the first: the verdict deferred past its bound.
     fn deferral_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             LinuxTrialDeferralBounded {

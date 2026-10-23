@@ -291,7 +291,7 @@ enum Pointer {
     Fact,
 }
 
-/// THE PROBE: for each kind of frame.
+/// THE PROBE: `passes` footer passes timed for each kind of frame, after a warm-up.
 #[cfg(feature = "bench-support")]
 pub(crate) fn footer_pass_cost(passes: usize) -> Vec<PassCost> {
     let kinds: [(&'static str, Option<Change>, Pointer); 6] = [

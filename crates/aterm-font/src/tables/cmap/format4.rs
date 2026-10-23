@@ -10,7 +10,8 @@ use core::convert::TryFrom;
 use crate::GlyphId;
 use crate::parser::{LazyArray16, Stream};
 
-/// A [format 4](https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-4-segment-mapping-to-delta-values)
+/// A [format
+/// 4](https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-4-segment-mapping-to-delta-values)
 /// subtable.
 #[derive(Clone, Copy)]
 pub struct Subtable4<'a> {
@@ -19,7 +20,6 @@ pub struct Subtable4<'a> {
     id_deltas: LazyArray16<'a, i16>,
     id_range_offsets: LazyArray16<'a, u16>,
     id_range_offset_pos: usize,
-    // The whole subtable data.
     data: &'a [u8],
 }
 
@@ -28,17 +28,17 @@ impl<'a> Subtable4<'a> {
     #[inline]
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
-        s.advance(6); // format + length + language
+        s.advance(6);
         let seg_count_x2 = s.read::<u16>()?;
         if seg_count_x2 < 2 {
             return None;
         }
 
         let seg_count = seg_count_x2 / 2;
-        s.advance(6); // searchRange + entrySelector + rangeShift
+        s.advance(6);
 
         let end_codes = s.read_array16::<u16>(seg_count)?;
-        s.skip::<u16>(); // reservedPad
+        s.skip::<u16>();
         let start_codes = s.read_array16::<u16>(seg_count)?;
         let id_deltas = s.read_array16::<i16>(seg_count)?;
         let id_range_offset_pos = s.offset();
@@ -55,14 +55,10 @@ impl<'a> Subtable4<'a> {
     }
 
     /// Returns a glyph index for a code point.
-    ///
-    /// Returns `None` when `code_point` is larger than `u16`.
     #[inline]
     pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
-        // This subtable supports code points only in a u16 range.
         let code_point = u16::try_from(code_point).ok()?;
 
-        // A custom binary search.
         let mut start = 0;
         let mut end = self.start_codes.len();
         while end > start {
@@ -78,8 +74,6 @@ impl<'a> Subtable4<'a> {
                     if id_range_offset == 0 {
                         return Some(GlyphId(code_point.wrapping_add(id_delta as u16)));
                     } else if id_range_offset == 0xFFFF {
-                        // Some malformed fonts have 0xFFFF as the last offset,
-                        // which is invalid and should be ignored.
                         return None;
                     }
 
@@ -93,7 +87,6 @@ impl<'a> Subtable4<'a> {
 
                     let glyph_array_value: u16 = Stream::read_at(self.data, usize::from(pos))?;
 
-                    // 0 indicates missing glyph.
                     if glyph_array_value == 0 {
                         return None;
                     }
@@ -109,14 +102,10 @@ impl<'a> Subtable4<'a> {
         None
     }
 
-    /// Calls `f` for each codepoint defined in this table. The calls stop
-    /// at 0x10000, one per BMP code point: disjoint segments, as the spec
-    /// requires, never reach it, and overlapping ones (up to 32,767 of them,
-    /// each up to 65,536 code points) cannot multiply the work.
+    /// Calls `f` for each codepoint defined in this table.
     pub fn codepoints(&self, mut f: impl FnMut(u32)) {
         let mut left = 0x10000u32;
         for (start, end) in self.start_codes.into_iter().zip(self.end_codes) {
-            // OxFFFF value is special and indicates codes end.
             if start == end && start == 0xFFFF {
                 break;
             }

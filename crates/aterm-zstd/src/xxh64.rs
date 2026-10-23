@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! XXH64, written from the xxHash specification (Yann Collet,
-//! `doc/xxhash_spec.md`, "XXH64 Algorithm Description").
-//!
-//! A zstd frame's `Content_Checksum` is the low 32 bits of XXH64 over the
-//! decompressed content with seed 0, stored little-endian (RFC 8878 §3.1.1).
-//! The answers are the reference C code's: tests/xxh64_recorded.rs holds it
-//! to 577 answers recorded from libzstd's own `ZSTD_XXH64` over xxhsum's
-//! sanity buffer.
+//! XXH64 hash for zstd frame content checksums (RFC 8878 §3.1.1).
 
 const P1: u64 = 0x9E37_79B1_85EB_CA87;
 const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
@@ -28,9 +21,8 @@ pub fn xxh64(seed: u64, bytes: &[u8]) -> u64 {
     h.digest()
 }
 
-/// Streaming XXH64: [`update`](Self::update) any number of times, in pieces
-/// of any size, then [`digest`](Self::digest). The answer is the one-shot
-/// [`xxh64`] of everything fed, however it was split.
+/// Streaming [`xxh64`] hasher fed by [`update`](Self::update) and finalized with
+/// [`digest`](Self::digest).
 #[derive(Clone, Debug)]
 pub struct Xxh64 {
     seed: u64,
@@ -110,7 +102,6 @@ impl Xxh64 {
             h ^= round(0, u64::from_le_bytes(*word));
             h = h.rotate_left(27).wrapping_mul(P1).wrapping_add(P4);
         }
-        // At most one 4-byte word remains (fewer than 8 bytes are left).
         let (quads, bytes) = rest.as_chunks::<4>();
         for quad in quads {
             h ^= u64::from(u32::from_le_bytes(*quad)).wrapping_mul(P1);

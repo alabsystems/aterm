@@ -5098,7 +5098,12 @@ mod tests {
     }
 }
 
-/// The lights' gestures, end to end, in process.
+/// The lights' gestures, end to end, in process. The control socket cannot drive them
+/// (`pointer move` reaches `App::on_cursor_moved` only; `key`/`mouse` enter below `App::on_key`
+/// and `App::on_mouse_input`), so these drive a headless App's winit-level handlers: a real
+/// engine drawing Claude Code's bottom block, one frame through the capture route's splices,
+/// the pointer at the painted chip's pixel, a real press, and the PTY bytes read back off a
+/// private socket.
 #[cfg(all(test, unix))]
 mod gesture_tests {
     use std::io::{ErrorKind, Read};

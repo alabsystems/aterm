@@ -37,8 +37,6 @@ impl FromData for Metrics {
 
 /// A [Horizontal/Vertical Metrics Table](
 /// https://docs.microsoft.com/en-us/typography/opentype/spec/hmtx).
-///
-/// `hmtx` and `vmtx` tables has the same structure, so we're reusing the same struct for both.
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of metrics indexed by glyph ID.
@@ -51,9 +49,6 @@ pub struct Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    ///
-    /// - `number_of_metrics` is from the `hhea`/`vhea` table.
-    /// - `number_of_glyphs` is from the `maxp` table.
     pub fn parse(
         mut number_of_metrics: u16,
         number_of_glyphs: NonZeroU16,
@@ -66,16 +61,9 @@ impl<'a> Table<'a> {
         let mut s = Stream::new(data);
         let metrics = s.read_array16::<Metrics>(number_of_metrics)?;
 
-        // 'If the number_of_metrics is less than the total number of glyphs,
-        // then that array is followed by an array for the left side bearing values
-        // of the remaining glyphs.'
         let bearings_count = number_of_glyphs.get().checked_sub(number_of_metrics);
         let bearings = if let Some(count) = bearings_count {
             number_of_metrics += count;
-            // Some malformed fonts can skip "left side bearing values"
-            // even when they are expected.
-            // Therefore if we weren't able to parser them, simply fallback to an empty array.
-            // No need to mark the whole table as malformed.
             s.read_array16::<i16>(count).unwrap_or_default()
         } else {
             LazyArray16::default()
@@ -98,9 +86,6 @@ impl<'a> Table<'a> {
         if let Some(metrics) = self.metrics.get(glyph_id.0) {
             Some(metrics.advance)
         } else {
-            // 'As an optimization, the number of records can be less than the number of glyphs,
-            // in which case the advance value of the last record applies
-            // to all remaining glyph IDs.'
             self.metrics.last().map(|m| m.advance)
         }
     }
@@ -111,9 +96,6 @@ impl<'a> Table<'a> {
         if let Some(metrics) = self.metrics.get(glyph_id.0) {
             Some(metrics.side_bearing)
         } else {
-            // 'If the number_of_metrics is less than the total number of glyphs,
-            // then that array is followed by an array for the side bearing values
-            // of the remaining glyphs.'
             self.bearings
                 .get(glyph_id.0.checked_sub(self.metrics.len())?)
         }

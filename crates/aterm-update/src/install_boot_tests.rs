@@ -163,7 +163,8 @@ fn a_crash_loop_reverts_swap_and_quarantine_take_the_install_tier() {
     assert_eq!(elsewhere, [Durable; 5], "another device");
 }
 
-/// The pure law behind `check_boot_health`'s count.
+/// The pure law behind `check_boot_health`'s count. The arm's first launch always counts,
+/// and an unreadable age counts the launch (fail toward counting, never toward silence).
 #[test]
 fn a_launch_inside_the_burst_window_of_a_counted_one_is_not_counted_again() {
     use std::time::Duration;

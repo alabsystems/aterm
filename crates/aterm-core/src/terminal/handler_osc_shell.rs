@@ -84,7 +84,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Shell mark C: Command execution starting.
+    /// Shell mark C: Command execution starting. Counted
+    /// (`started_seq`) whether or not a block holds it.
     fn shell_execution_start(&mut self, row: u64) {
         self.shell.started_seq = self.shell.started_seq.saturating_add(1);
         if let Some(ref mut mark) = self.shell.current_mark {
@@ -214,7 +215,11 @@ impl TerminalHandler<'_> {
             }
     }
 
-    /// Gate OSC 133/633 on the capability nonce.
+    /// Gate OSC 133/633 on the capability nonce. With
+    /// [`super::types::TerminalModes::require_shell_integration_nonce`] set, a
+    /// mark passes only with an `id=<64-hex>` matching the host-authorized nonce
+    /// (others are dropped and counted); an attached policy engine's Deny drops it
+    /// first.
     #[inline]
     fn shell_nonce_gate_ok(&mut self, command: u32, params: &[&[u8]]) -> bool {
         if !self.modes.require_shell_integration_nonce {

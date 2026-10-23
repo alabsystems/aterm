@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! DECDWL/DECDHL reflow tests: double-width/height lines (half the usable
-//! columns) are resized in place, never split or merged with adjacent lines.
+//! DECDWL/DECDHL reflow tests: double-width and double-height lines resize in place without splitting or merging.
 
 use crate::{CellFlags, Grid, LineSize};
 
@@ -37,7 +36,6 @@ fn decdhl_top_bottom_preserved_on_shrink() {
 
 #[test]
 fn decdwl_round_trip_shrink_then_grow() {
-    // Content within the shrunk width survives the round trip.
     let mut grid = Grid::new(5, 80);
     for i in 0..20u16 {
         grid.write_char((b'A' + (i % 26) as u8) as char);
@@ -58,7 +56,6 @@ fn decdwl_round_trip_shrink_then_grow() {
 
 #[test]
 fn decdwl_mixed_with_normal_rows_on_shrink() {
-    // A grid with interleaved DECDWL and normal rows: only normal rows reflow.
     let mut grid = Grid::new(5, 20);
 
     for c in "ABCDEFGHIJ".chars() {
@@ -89,8 +86,6 @@ fn decdwl_mixed_with_normal_rows_on_shrink() {
 
 #[test]
 fn decdwl_continuation_row_survives_shrink_merge() {
-    // A DECDWL row that is itself a wrap continuation (autowrap onto it, then ESC # 6) resizes in
-    // place, keeping its wrapped flag and DoubleWidth attribute.
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJKL".chars() {
         grid.write_char_wrap(c);
@@ -120,7 +115,6 @@ fn decdwl_continuation_row_survives_shrink_merge() {
 
 #[test]
 fn decdwl_continuation_row_not_merged_on_grow() {
-    // The grow direction: the head row does not absorb its wrapped DECDWL successor.
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJKL".chars() {
         grid.write_char_wrap(c);
@@ -152,9 +146,6 @@ fn decdwl_continuation_row_not_merged_on_grow() {
 
 #[test]
 fn decdwl_shrink_blanks_a_wide_char_cut_at_the_new_edge() {
-    // The in-place resize truncates, so a wide char whose head lands in the new last column is
-    // blanked (as `Row::resize` does). At 100 wide, DECDWL clears only `cells[50..]`, so the pair
-    // at 39/40 is intact until the resize to 40 cuts it.
     let mut grid = Grid::new(3, 100);
     grid.row_mut(0)
         .unwrap()

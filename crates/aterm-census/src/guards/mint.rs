@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! launcher-mint: the root-authority mint stays in the two launchers.
-//!
-//! `aterm_cap::Authority::root_authority` mints every capability
-//! (docs/ATERM_DESIGN.md §5.4). Its `launcher-mint` cfg seals it only in a
-//! graph with no launcher: cargo unifies features, so in the shipped `aterm`
-//! build, where aterm-gui and aterm-cli enable it, every crate that depends on
-//! aterm-cap could name it. So outside those two crates no shipped code may name
-//! the mint and no shipped manifest table may turn the feature on. Tests mint
-//! freely: test items, test files and dev-dependency edges are not read.
+//! launcher-mint: ensures `root_authority` and the `launcher-mint` feature are only used in launcher crates outside tests.
 
 use std::path::Path;
 

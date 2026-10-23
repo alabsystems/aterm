@@ -103,7 +103,7 @@ impl Outcome {
 
     /// The row's `decision` word ([`Self::from_word`] reads it back).
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Outcome::Approved => "approved",
             Outcome::Declined => "declined",
@@ -415,7 +415,7 @@ struct CutWork {
 }
 
 impl CutWork {
-    fn for_cut() -> Self {
+    const fn for_cut() -> Self {
         Self {
             entries: 65_536,
             visits: 1_048_576,
@@ -779,7 +779,7 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    pub fn off() -> Self {
+    pub const fn off() -> Self {
         Self {
             journal: Journal::off(),
             sid: None,
@@ -1848,7 +1848,7 @@ pub fn land_episode(path: &Path, sid: Option<&str>) -> Option<LandSeed> {
     land_episode_in(&std::fs::read_to_string(path).ok()?, sid)
 }
 
-fn of_try(kind: Option<aterm_phase::WallKind>, limit: LimitTry) -> bool {
+const fn of_try(kind: Option<aterm_phase::WallKind>, limit: LimitTry) -> bool {
     use aterm_phase::WallKind;
     match kind {
         Some(WallKind::ModelBucket { .. }) => limit.bucket,
@@ -1868,7 +1868,7 @@ const IN_LIMITS_PLACE: &str = "in the limit's place";
 
 const LIMITS_TRY: &str = "the limit's try";
 
-fn limit_word(bucket: bool) -> &'static str {
+const fn limit_word(bucket: bool) -> &'static str {
     if bucket { "bucket" } else { "usage" }
 }
 
@@ -2376,7 +2376,7 @@ pub fn open_model_switch(path: &Path, sid: Option<&str>) -> Option<OpenSwitch> {
 
 pub const ACCOUNT_MOVE_COMMAND: &str = "relaunch under account ";
 
-fn account_at_word(at: super::policy::turn_end::AccountAt) -> &'static str {
+const fn account_at_word(at: super::policy::turn_end::AccountAt) -> &'static str {
     match at {
         super::policy::turn_end::AccountAt::Wall => "wall",
         super::policy::turn_end::AccountAt::Ahead => "ahead",

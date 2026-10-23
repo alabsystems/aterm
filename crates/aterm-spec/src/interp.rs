@@ -13,7 +13,9 @@ use crate::derive::{Liveness, Model, Value};
 /// One concrete interpreter state: every scalar variable's value.
 pub type State = BTreeMap<&'static str, i64>;
 
-/// A compiled walk's reached states, each numbered in the order first seen.
+/// A compiled walk's reached states, each numbered in the order first seen. Only membership
+/// and that number are asked, so it is an open-addressed hash table of numbers, placed by
+/// [`key_hash`] and probed linearly.
 #[derive(Default)]
 struct Seen {
     /// Slot -> the top half of a key's hash, above 1 + that key's number (0 for an empty
@@ -43,6 +45,7 @@ impl Seen {
     #[inline]
     const fn home(&self, tag: u64) -> usize {
         // A power-of-two length of at least 16 and below 2^32 slots: `tag >> shift` is a
+        // slot.
         (tag >> (64 - self.table.len().trailing_zeros())) as usize
     }
 
@@ -111,7 +114,10 @@ const fn key_hash(key: &[i64]) -> u64 {
     h
 }
 
-/// `0..n`, counted by a type of this crate's own.
+/// `0..n`, counted by a type of this crate's own. The walks loop over actions and successors
+/// once per state; a `Range<usize>` loop there runs a dependency's unoptimized copy of
+/// `Range::next` (an opt-level-1 crate links the generic copies its dependencies export rather
+/// than inlining its own), which took about a tenth of the non-vacuity sweep.
 struct Upto {
     at: usize,
     end: usize,
@@ -135,7 +141,9 @@ impl Iterator for Upto {
     }
 }
 
-/// A walk's reached states, numbered in the order first seen.
+/// A walk's reached states, numbered in the order first seen. Every walk here is breadth-first
+/// and queues a state exactly when it numbers it, so the numbers ARE the queue: the state to
+/// expand next is the lowest number not yet expanded, and no state is held twice.
 trait Reached<S: ?Sized>: Default {
     /// How many states are numbered.
     fn len(&self) -> usize;
@@ -250,7 +258,8 @@ impl Walker for ByName<'_> {
     }
 }
 
-/// The model resolved once: [`Walker`] over value slices in sorted-name order.
+/// The model resolved once: [`Walker`] over value slices in sorted-name order. Every state of
+/// a compiled model binds the same names, so its values are its identity.
 impl Walker for Compiled {
     type S = [i64];
     type Reached = Seen;
@@ -1011,7 +1020,8 @@ fn explore_on<W: Walker>(m: &Model, w: &W) -> (StateGraph, W::Reached) {
     (graph, walk.reached)
 }
 
-/// The action indices a fairness list names.
+/// The action indices a fairness list names. An undeclared name panics: dropping a typo
+/// silently would change what the verdict assumes.
 #[cfg_attr(trust_verify, trust::skip)]
 fn fair_indices(m: &Model, names: &[&str], kind: &str) -> Vec<usize> {
     let mut out = Vec::new();

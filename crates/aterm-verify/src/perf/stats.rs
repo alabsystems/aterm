@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The small statistics the arena lanes report: medians, nearest-rank tails,
-//! and the ABBA round fold with the intervals that say what a run resolves.
+//! Summary statistics, nearest-rank tails, and order-balanced ABBA round intervals.
 
 use aterm_json::{Value, json};
 
-/// The median of `values` (the mean of the middle two for an even count).
-/// `NaN` for an empty slice.
+/// The median of `values` (`NaN` for an empty slice).
 pub(crate) fn median(values: &[f64]) -> f64 {
     if values.is_empty() {
         return f64::NAN;
@@ -34,8 +32,7 @@ pub(crate) fn percentile_nearest_rank(values: &[f64], p: f64) -> f64 {
     v[rank.saturating_sub(1).min(v.len() - 1)]
 }
 
-/// A p95 needs at least this many values; below it a tail is reported as the
-/// maximum, never as a p95.
+/// Minimum sample count required to report a p95 instead of the maximum.
 pub(crate) const P95_MIN_N: usize = 20;
 
 /// `median=… p95_nearest_rank=…` or `max=… (p95 omitted…)`, for a summary line.
@@ -62,16 +59,7 @@ pub(crate) fn distribution(values: &[f64]) -> Value {
     })
 }
 
-/// Fold AB/BA pair deltas into order-balanced ABBA round deltas.
-///
-/// A per-slot offset depends on WHERE in the pair a launch sits rather than on
-/// its bytes (the previous launch's warm state, drift across the two
-/// launches). Consecutive pairs 2k-1 and 2k are the quad A B B A, so averaging
-/// their deltas gives each arm mean slot position 2.5 and one repeat and one
-/// switch launch: any offset that is a function of slot position, and any
-/// linear drift across the four launches, cancels inside the reported unit.
-/// The mean over rounds equals the mean over pairs; a trailing odd pair has no
-/// partner and is left out.
+/// Folds consecutive AB/BA pair deltas into order-balanced ABBA round deltas.
 pub(crate) fn fold_rounds(deltas: &[f64]) -> Vec<f64> {
     deltas
         .as_chunks::<2>()
@@ -81,9 +69,7 @@ pub(crate) fn fold_rounds(deltas: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// A distribution-free interval for the median from order statistics: the
-/// widest symmetric pair whose exact binomial coverage is still at least 95%.
-/// `None` when none exists (n < 6). Descriptive only.
+/// Distribution-free symmetric order-statistic interval for the median (>= 95% coverage).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct MedianInterval {
     pub low: f64,
@@ -106,9 +92,7 @@ pub(crate) fn median_sign_interval(values: &[f64]) -> Option<MedianInterval> {
         p *= (n - k) as f64 / (k + 1) as f64;
     }
     for rank in (0..=(n - 1) / 2).rev() {
-        // Coverage of [x_(rank+1), x_(n-rank)] is 1 - 2 P(Bin <= rank). The tail
-        // INCLUDES rank: dropping it would claim a narrower interval than the
-        // run earned, the one direction a resolution claim must never err in.
+        // Coverage of [x_(rank+1), x_(n-rank)] is 1 - 2 P(Bin <= rank).
         let tail: f64 = pmf[..=rank].iter().sum();
         let coverage = 1.0 - 2.0 * tail;
         if coverage >= 0.95 {
@@ -138,9 +122,7 @@ pub(crate) struct MeanInterval {
     pub half_width: f64,
 }
 
-/// The interval on the mean of the round deltas: the estimator in which an
-/// additive per-slot offset cancels exactly, so its half-width is the run's
-/// working resolution. `None` below two values.
+/// Computes the 95% Student-t interval on the mean of `values` (`None` below two values).
 pub(crate) fn mean_interval(values: &[f64]) -> Option<MeanInterval> {
     let n = values.len();
     if n < 2 {
@@ -157,8 +139,7 @@ pub(crate) fn mean_interval(values: &[f64]) -> Option<MeanInterval> {
     })
 }
 
-/// The headline statistic over candidate-faster deltas: order-balanced
-/// rounds, their spread, and the resolution the run earned.
+/// Summary over order-balanced ABBA round deltas and their intervals.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Rounds {
     pub values: Vec<f64>,
@@ -210,8 +191,7 @@ impl Rounds {
     }
 }
 
-/// The per-PAIR deltas, kept for drill-down and marked order-contaminated:
-/// each carries the whole slot-1-vs-slot-2 offset.
+/// Formats per-pair deltas as JSON, marked `order_contaminated`.
 pub(crate) fn paired_json(deltas: &[f64]) -> Value {
     let mut v = distribution(deltas);
     if let Some(o) = v.as_object_mut() {
@@ -288,7 +268,6 @@ mod tests {
 
     #[test]
     fn the_t_interval_uses_the_quantile_for_its_degrees_of_freedom() {
-        // n=3, sd=1: half = 4.303 / sqrt(3).
         let i = mean_interval(&[1.0, 2.0, 3.0]).expect("n=3");
         assert!((i.half_width - 4.303 / 3f64.sqrt()).abs() < 1e-9, "{i:?}");
         assert!(mean_interval(&[1.0]).is_none());

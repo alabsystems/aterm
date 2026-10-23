@@ -174,7 +174,7 @@ impl ReleaseCredentials {
 
     /// The notarytool auth the profile names.
     #[must_use]
-    pub fn notary(&self) -> Option<&NotaryAuth> {
+    pub const fn notary(&self) -> Option<&NotaryAuth> {
         self.notary.as_ref()
     }
 
@@ -242,7 +242,8 @@ pub(crate) fn credentials_value<'a>(text: &'a str, want: &str) -> Result<Option<
     Ok(None)
 }
 
-/// The one key of record.
+/// The one key of record. Absent is an error here (unlike the optional Apple keys):
+/// a profile was named on the command line precisely to supply it.
 fn credentials_signing_key(text: &str) -> Result<&str, String> {
     credentials_value(text, "signing_key")?
         .ok_or_else(|| "no `signing_key` in the credentials profile".to_string())
@@ -334,7 +335,9 @@ impl DevIdIdentity {
     }
 }
 
-/// The prefix of every Developer-ID code-signing certificate's common name.
+/// The prefix of every Developer-ID code-signing certificate's common name. Matching on it,
+/// not on the Team ID alone, keeps out a same-team "Developer ID Installer" certificate,
+/// which would sign a bundle but cannot notarize one.
 const DEVID_APP_PREFIX: &str = "Developer ID Application: ";
 
 /// Choose the signing certificate from `security find-identity -v -p codesigning` output.
@@ -396,7 +399,9 @@ fn describe_candidates(candidates: &[DevIdIdentity]) -> String {
         .join("; ")
 }
 
-/// Parse one `  1) <40-hex> "<common name>"` listing line.
+/// Parse one `  1) <40-hex> "<common name>"` listing line. Anything else —
+/// the trailing "N valid identities found" summary, blank lines, a policy
+/// notice — yields `None` and is skipped.
 fn parse_find_identity_line(line: &str) -> Option<DevIdIdentity> {
     let (_, rest) = line.trim().split_once(") ")?;
     let (sha1, rest) = rest.split_once(' ')?;
@@ -425,7 +430,7 @@ pub enum AppleTier {
 impl AppleTier {
     /// The certificate this cut signs with.
     #[must_use]
-    pub fn identity(&self) -> Option<&DevIdIdentity> {
+    pub const fn identity(&self) -> Option<&DevIdIdentity> {
         match self {
             AppleTier::Active { identity, .. } => Some(identity),
             AppleTier::Inactive => None,
@@ -886,7 +891,8 @@ pub fn spctl_argv(kind: GatekeeperKind) -> Vec<&'static str> {
 /// The real tools.
 pub struct RealAppleTools;
 
-/// Run a verification tool over `target` and report only whether it passed.
+/// Run a verification tool over `target` and report only whether it passed. A spawn failure
+/// is an error, not `false`: a missing tool must not read as a failed check.
 fn tool_ok(argv: &[&str], target: &Path) -> Result<bool, String> {
     let (program, args) = argv
         .split_first()

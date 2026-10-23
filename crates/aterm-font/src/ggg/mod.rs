@@ -6,8 +6,6 @@
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
 //! Common data types used by GDEF/GPOS/GSUB tables.
-//!
-//! <https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2>
 
 // A heavily modified port of https://github.com/harfbuzz/rustybuzz implementation
 // originally written by https://github.com/laurmaedje
@@ -30,9 +28,9 @@ pub use lookup::*;
 /// A record that describes a range of glyph IDs.
 #[derive(Clone, Copy, Debug)]
 pub struct RangeRecord {
-    /// First glyph ID in the range
+    /// First glyph ID in the range.
     pub start: GlyphId,
-    /// Last glyph ID in the range
+    /// Last glyph ID in the range.
     pub end: GlyphId,
     /// Coverage Index of first glyph ID in range.
     pub value: u16,
@@ -69,8 +67,7 @@ impl FromData for RangeRecord {
     }
 }
 
-/// A [Coverage Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#coverage-table).
+/// An OpenType Coverage Table.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub enum Coverage<'a> {
@@ -125,12 +122,10 @@ impl<'a> Coverage<'a> {
     }
 }
 
-/// A value of [Class Definition Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#class-definition-table).
+/// A glyph class value from a Class Definition Table.
 pub type Class = u16;
 
-/// A [Class Definition Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#class-definition-table).
+/// An OpenType Class Definition Table.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub enum ClassDefinition<'a> {

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: `notice later`, the wire's door to the digest. One keyed entry per fact
-//! however often a tool says it, the owner's dismissal holding against every repeat, the
-//! tool's `done` ending it, a cap that leaves aterm's own entries their place, and the
-//! one button that opens a web page and nothing else.
+//! Tests for `notice later` digest entries, dismissal retention, `done`, caps, and browser actions.
 
 use crate::center::MessageCenter;
 use crate::exceptions::{Entry, Family};
@@ -102,7 +99,6 @@ fn notice_later_parses_its_form_and_refuses_junk() {
             ],
         }
     );
-    // The least form: no tag, no url, no detail.
     let Ok(NoticeRequest::Later(bare)) = NoticeRequest::parse(&line("k", "Renew it")) else {
         panic!();
     };
@@ -110,7 +106,6 @@ fn notice_later_parses_its_form_and_refuses_junk() {
         (bare.tag, bare.url, bare.detail.len()),
         (tags::SCRIPT, None, 0)
     );
-    // Fields at their caps stand whole.
     let reason90 = format!("only you {}", "a".repeat(81));
     let step90 = format!("Renew {}", "b".repeat(84));
     let detail240 = "c".repeat(240);
@@ -213,8 +208,6 @@ fn notice_later_parses_its_form_and_refuses_junk() {
     for (line, want) in &refused {
         assert_eq!(NoticeRequest::parse(line), Err(*want), "{line:?}");
     }
-    // A refusal of `later` is never the unknown-form usage an older aterm answers,
-    // which the tool reads as "no `later` here".
     for (line, _) in &refused {
         let err = NoticeRequest::parse(line).unwrap_err();
         assert!(!err.starts_with("usage: notice <post|"), "{line:?}: {err}");
@@ -263,7 +256,6 @@ fn a_repeated_later_key_folds_into_one_entry() {
             "Add a passkey or an authenticator app",
         ]
     );
-    // Every tab of every launch says it again: one entry, and the budget untouched.
     for _ in 0..WIRE_MINTS_PER_WINDOW + 5 {
         let again = notice(&mut c, &mut g, SETUP, 0, now);
         assert_eq!(later_reply(&again), (id, "duplicate".into()));
@@ -274,7 +266,6 @@ fn a_repeated_later_key_folds_into_one_entry() {
         c.digest().entries[0].repeats,
         1 + WIRE_MINTS_PER_WINDOW as u32 + 5
     );
-    // A new step is news at once, in place under the same id.
     let reworded = SETUP.replace("Finish the setup", "Complete the setup");
     let r = notice(&mut c, &mut g, &reworded, 0, now);
     assert_eq!(later_reply(&r), (id, "restated".into()));
@@ -282,12 +273,10 @@ fn a_repeated_later_key_folds_into_one_entry() {
         c.digest().entries[0].then,
         "Complete the setup in your browser"
     );
-    // A 40-character key is kept whole too, not cut to a 20-character cause.
     let k40 = format!("codex.{}", "a".repeat(34));
     let k40b = format!("codex.{}b", "a".repeat(33));
     notice(&mut c, &mut g, &line(&k40, "Renew it"), 0, now);
     notice(&mut c, &mut g, &line(&k40b, "Renew it"), 0, now);
-    // Negative control: three keys, three entries.
     let keys: Vec<String> = c.digest().entries.iter().map(|e| e.key.clone()).collect();
     assert_eq!(keys.len(), 3, "{keys:?}");
     assert!(keys.contains(&format!("wire.{k40}")) && keys.contains(&format!("wire.{k40b}")));
@@ -312,15 +301,12 @@ fn the_owners_dismissal_of_a_later_entry_holds() {
     }
     assert!(c.digest().is_empty(), "quiet: nothing shown");
     assert_eq!(c.log().records().count(), records, "quiet: nothing logged");
-    // Negative control: a different key is news.
     let other = notice(&mut c, &mut g, &line("other", "Renew it"), 2 * DAY_MS, now);
     assert_eq!(later_reply(&other).1, "new");
-    // A week after the dismissal, the fact may be shown again.
     let back = notice(&mut c, &mut g, SETUP, 8 * DAY_MS + 1, now);
     let (again, how) = later_reply(&back);
     assert_eq!(how, "new");
     assert_ne!(again, id, "a new entry");
-    // A second dismissal backs off: four weeks, not one.
     notice(&mut c, &mut g, &format!("dismiss {again}"), 9 * DAY_MS, now);
     let q = notice(&mut c, &mut g, SETUP, 20 * DAY_MS, now);
     assert_eq!(later_reply(&q).1, "quiet");
@@ -342,7 +328,6 @@ fn a_flood_of_wire_records_never_evicts_the_owners_dismissal() {
     notice(&mut c, &mut g, &other, DAY_MS, now);
     notice(&mut c, &mut g, "done other", DAY_MS, now);
     for i in 0..2 * LOG_CAP {
-        // A fresh gate per line: the budget is the wire's pacing, not this test's subject.
         let rec = notice(
             &mut c,
             &mut WireGate::default(),
@@ -403,8 +388,6 @@ fn notice_done_ends_a_later_entry() {
     assert_eq!(gone.reply, "OK done=- how=gone");
     assert!(!gone.note, "an already resolved record is unchanged");
 
-    // Filing is not proof that the cause ended. Without done it stays quiet, but a
-    // confirmed end after either kind of filing allows a genuinely new occurrence.
     for (answered, progress) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut c, mut g) = fresh(now);
         let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
@@ -487,7 +470,6 @@ fn notice_done_ends_a_later_entry() {
 fn the_wire_caps_its_later_entries_and_never_evicts_aterms_own() {
     let now = Instant::now();
     let (mut c, mut g) = fresh(now);
-    // aterm's own come first, so they are the oldest the cap would file.
     for i in 0..DIGEST_CAP - WIRE_LATER_CAP {
         own_entry(&mut c, &format!("vol{i}"), 1 + i as u64, now);
     }
@@ -515,16 +497,13 @@ fn the_wire_caps_its_later_entries_and_never_evicts_aterms_own() {
         before,
         "side-effect free"
     );
-    // An open key still folds, and new words still restate it.
     let again = notice(&mut c, &mut g, &line("k1", "Renew it"), 100, now);
     assert_eq!(later_reply(&again).1, "duplicate");
     let reworded = notice(&mut c, &mut g, &line("k1", "Rotate it"), 100, now);
     assert_eq!(later_reply(&reworded).1, "restated");
-    // Under the cap and with room, a new key is filed.
     notice(&mut c, &mut g, "done k4", 100, now);
     let room = notice(&mut c, &mut g, &line("k6", "Renew it"), 100, now);
     assert_eq!(later_reply(&room).1, "new");
-    // Under the cap but with the list full of aterm's own, it is refused.
     notice(&mut c, &mut g, "done k6", 100, now);
     own_entry(&mut c, "vol-last", 200, now);
     assert_eq!(c.digest().len(), DIGEST_CAP);
@@ -541,7 +520,6 @@ fn the_wire_caps_its_later_entries_and_never_evicts_aterms_own() {
         own_before,
         "none of aterm's evicted"
     );
-    // Negative control: a post let into the full list files its oldest entry.
     own_entry(&mut c, "vol-over", 400, now);
     assert_eq!(c.digest().len(), DIGEST_CAP);
     assert!(
@@ -575,7 +553,6 @@ fn a_press_of_open_in_browser_files_the_entry_answered() {
     );
     let q = notice(&mut c, &mut g, SETUP, 2 * DAY_MS, now);
     assert_eq!(later_reply(&q), (id, "quiet".into()));
-    // The entry's words survive the log's codec with the link on it.
     let line = crate::log::LogLine::Posted(c.log().get(id).unwrap().clone()).encode();
     let back = crate::log::LogLine::decode(&line).unwrap();
     let crate::log::LogLine::Posted(rec) = back else {

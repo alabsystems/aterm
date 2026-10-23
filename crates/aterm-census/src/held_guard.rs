@@ -112,11 +112,11 @@ pub(crate) fn scan_source(text: &str) -> (Vec<usize>, usize) {
     (hits, acquires)
 }
 
-fn is_ident_start(c: char) -> bool {
+const fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
-fn is_ident(c: char) -> bool {
+const fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 

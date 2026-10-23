@@ -21,6 +21,11 @@ const EDIT_PENDING: &str =
 /// A Bash `sed -i … notes.txt` waiting on its box.
 const SED_PENDING: &str =
     include_str!("../fixtures/claude-2.1.300-transcript-box-bash-sed-pending.jsonl");
+/// The same two calls under a PreToolUse hook on every tool (`*`, `exit 0`)
+/// in manual mode, each transcript as it stood 350 ms after its box was
+/// drawn — past the loop's 300 ms settle (MEASURED 2026-10-15 on 2.1.300,
+/// the lab's stub; `api-request` rows cut, attachment rows cut to their
+/// type). The stub answers at once, so the prompt row lands after the Read's
 /// call: the prompt clears the Read, its result clears nothing more.
 const EDIT_STAR_HOOK: &str =
     include_str!("../fixtures/claude-2.1.300-transcript-box-edit-star-hook-pending.jsonl");
@@ -72,6 +77,7 @@ fn with(jsonl: &str, rows: &[String]) -> String {
     out
 }
 
+/// The transcripts read as the calls waiting: the Edit alone (its Read was
 /// answered), and the sed, which names no file but its command.
 #[test]
 fn the_captured_transcripts_name_the_call_each_box_waits_on() {
@@ -100,6 +106,9 @@ fn the_captured_transcripts_name_the_call_each_box_waits_on() {
     );
 }
 
+/// THE OVER-HOLD'S OWN CASE, live: under a `*` hook in manual mode the
+/// transcript at the loop's settle proves the Edit tool's box the Edit's —
+/// the hook's rows (attachments) neither add nor clear a call — and never
 /// proves the sed's box (negative control).
 #[test]
 fn under_a_star_hook_the_settled_transcript_proves_the_edit_and_not_the_sed() {
@@ -116,6 +125,10 @@ fn under_a_star_hook_the_settled_transcript_proves_the_edit_and_not_the_sed() {
     );
 }
 
+/// The Edit tool's own box, its call waiting in the main chain: proved the
+/// Edit's, by that call — also with the tail's first line torn, a hook's
+/// attachment row after it, or an earlier Edit of the same file whose box
+/// has left still waiting on its result row (spent, passed over), and for a
 /// box path of two components the call's path ends in.
 #[test]
 fn an_edit_box_whose_call_the_transcript_names_is_proved_the_edits() {
@@ -154,6 +167,12 @@ fn an_edit_box_whose_call_the_transcript_names_is_proved_the_edits() {
     assert_eq!(proved(&deeper, EDIT_PENDING), want, "proj/notes.txt");
 }
 
+/// NEGATIVE CONTROLS: nothing is proved for the sed's box (a Bash call names
+/// no file); for the Edit's box with its call not written yet (the measured
+/// lag), answered, beside a pending Bash or Read call, naming another file,
+/// a subagent's, or after a prompt row; for a box whose path the call's does
+/// not end in (`sub/notes.txt` for `…/proj/notes.txt`); for a box that may be a subagent's (an origin in its title, the
+/// background agents' note in its footer, a footer cut short); for a box
 /// only one tool draws; and for the one spent call alone.
 #[test]
 fn a_box_the_transcript_does_not_prove_is_not_proved() {
@@ -249,6 +268,9 @@ fn a_box_the_transcript_does_not_prove_is_not_proved() {
     );
 }
 
+/// The re-read rule: the transcript lags while no call waiting (less the
+/// spent) is of a tool the box may be — nothing, a Read whose result row
+/// has not landed, a spent Edit — and never once a Bash call waits (a sed is
 /// never provable) or the box's own call does.
 #[test]
 fn the_transcript_lags_until_a_call_the_box_may_be_waits() {
@@ -268,6 +290,8 @@ fn the_transcript_lags_until_a_call_the_box_may_be_waits() {
     assert!(!lags(SED_PENDING, &[]), "the sed");
 }
 
+/// A box's path names a call's file where its components end the call's:
+/// `./` dropped, `~/` the home (none: nothing), an absolute path the whole
 /// file, `..` nothing.
 #[test]
 fn a_box_path_names_the_file_whose_components_it_ends() {
@@ -290,6 +314,9 @@ fn a_box_path_names_the_file_whose_components_it_ends() {
     }
 }
 
+/// A fresh session's first turn as 2.1.308 wrote it (the real-Claude lab
+/// `b3p1`, 2026-10-22): the Edit call of notes.txt waiting on its box, its
+/// assistant row written BEFORE the prompt row `toolstart @notes.txt` and
 /// the attachment rows its `parentUuid` chain runs up through.
 const FIRST_EDIT: &str =
     include_str!("../fixtures/claude-2.1.308-transcript-first-turn-edit-pending.jsonl");
@@ -313,6 +340,10 @@ fn field_of(jsonl: &str, marker: &str, key: &str) -> String {
         .to_string()
 }
 
+/// NEGATIVE CONTROLS: a later prompt (a constructed row whose parent is the
+/// call's row) ends the call; the call row's chain cut (its `parentUuid` a
+/// uuid the tail does not hold) cannot show the prompt is its own, and the
+/// prompt written after it ends it; the call's result, written anywhere,
 /// answers it.
 #[test]
 fn a_first_turns_call_written_before_its_prompt_row_still_waits() {
@@ -382,6 +413,7 @@ fn a_first_turns_call_written_before_its_prompt_row_still_waits() {
     );
 }
 
+/// NEGATIVE CONTROLS: with no prompt after it, or the prompt written before
 /// it, the call waits.
 #[test]
 fn a_call_row_with_no_uuid_is_ended_by_a_later_prompt() {

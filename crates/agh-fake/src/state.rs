@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The fake's state: owners, repositories, releases, assets, files, commits, refs, faults,
-//! changes, the rate counters and the request log. Every setup call and every request takes
-//! the one lock, so a change a request triggers is in place before its answer is written.
+//! Fake GitHub state: owners, repositories, releases, assets, files, commits, refs, and faults.
 
 use std::collections::BTreeMap;
 
@@ -100,8 +98,7 @@ impl Repo {
         !self.spec.private || self.is_member(login)
     }
 
-    /// A branch or tag name's sha; the default branch with no sha set names the newest
-    /// commit, when there is one; else the reference itself.
+    /// Resolves a branch or tag name (or the default branch) to its commit SHA.
     pub(crate) fn resolve(&self, reference: &str) -> String {
         if let Some(sha) = self.branches.get(reference) {
             return sha.clone();
@@ -117,9 +114,7 @@ impl Repo {
         reference.to_string()
     }
 
-    /// Whether `reference` names something the repository holds: a branch, a tag, a commit
-    /// (the default branch with no sha set names the newest), or a reference some file was
-    /// put under.
+    /// Whether `reference` names something the repository holds.
     pub(crate) fn knows(&self, reference: &str) -> bool {
         let sha = self.resolve(reference);
         self.branches.contains_key(reference)
@@ -128,8 +123,7 @@ impl Repo {
             || self.files.iter().any(|f| self.resolve(&f.reference) == sha)
     }
 
-    /// The files laid under `reference` (compared by what each reference resolves to), one
-    /// per path: of a path put under two spellings of one commit, the last put wins.
+    /// The files laid under `reference` (last put wins per path).
     pub(crate) fn files_at(&self, reference: &str) -> Vec<&File> {
         let sha = self.resolve(reference);
         let mut out: Vec<&File> = Vec::new();
@@ -146,8 +140,7 @@ impl Repo {
         out
     }
 
-    /// The index of the commit `reference` names: a branch or tag's sha, or a sha (the
-    /// default branch with no sha set is the newest commit, by `resolve`).
+    /// The index of the commit `reference` names.
     pub(crate) fn commit_index(&self, reference: &str) -> Option<usize> {
         let sha = self.resolve(reference);
         self.commits.iter().position(|c| c.sha == sha)
@@ -198,8 +191,7 @@ pub(crate) struct Pending {
     pub(crate) answered: usize,
     /// The change.
     pub(crate) change: Change,
-    /// The id of the repository a `SetLatest` or `Hide` names, bound when registered, so a
-    /// rename before the change fires cannot make it stale.
+    /// The repository id bound when a `SetLatest` or `Hide` change is registered.
     pub(crate) repo: Option<u64>,
 }
 
@@ -229,6 +221,8 @@ pub(crate) struct State {
     pub(crate) seen: Vec<Seen>,
     /// Every breach of the wire rules.
     pub(crate) violations: Vec<String>,
+    /// Every [`crate::Fault::Hang`] ends now, held or asked for later ([`crate::FakeGithub::end_hangs`]).
+    pub(crate) hangs_ended: bool,
     next_owner: u64,
     next_repo: u64,
     next_release: u64,
@@ -251,9 +245,8 @@ pub(crate) fn matches(m: &Match, origin: FakeOrigin, method: &str, target: &str)
 }
 
 impl State {
-    /// Nothing yet: owners count from 100, repositories from 1000, releases from 5000, assets
-    /// from 9000.
-    pub(crate) fn new() -> State {
+    /// Creates an empty state.
+    pub(crate) const fn new() -> State {
         State {
             ports: Ports {
                 api: 0,
@@ -268,6 +261,7 @@ impl State {
             releases: Vec::new(),
             rules: Vec::new(),
             pending: Vec::new(),
+            hangs_ended: false,
             used: BTreeMap::new(),
             requests: 0,
             seen: Vec::new(),
@@ -480,8 +474,7 @@ impl State {
             .map(|r| r.id)
     }
 
-    /// Apply `change` now. A change naming nothing the fake holds is a test's mistake, and
-    /// panics on the caller's thread.
+    /// Apply `change` now.
     pub(crate) fn apply(&mut self, change: Change) {
         if let Some(why) = self.missing(&change) {
             panic!("agh-fake: {why}");
@@ -541,8 +534,7 @@ impl State {
         }
     }
 
-    /// See `FakeGithub::after`. A change naming nothing the fake holds panics here, on the
-    /// caller's thread, so the mistake fails the test at its own line.
+    /// See `FakeGithub::after`.
     pub(crate) fn after(&mut self, m: Match, count: usize, change: Change) {
         if let Some(why) = self.missing(&change) {
             panic!("agh-fake: {why}");
@@ -581,9 +573,7 @@ impl State {
         }
     }
 
-    /// The armed fault for this request, disarming a once-only one. A matching once-only
-    /// fault comes before any always fault, so it fires on the next matching request even
-    /// under an overlapping `fault_always`; among faults of one form, the first added fires.
+    /// The armed fault for this request, disarming a once-only one.
     pub(crate) fn take_fault(
         &mut self,
         origin: FakeOrigin,
@@ -598,11 +588,7 @@ impl State {
         Some(self.rules[index].fault.clone())
     }
 
-    /// Count one answered request against every waiting change, applying those now due. This
-    /// runs inside a connection thread, under the lock, before the answer is written, so it
-    /// never panics: a due change that something since has made stale (a release deleted, a
-    /// `Torn` fault) is skipped and recorded as a violation, the others still apply, and the
-    /// answer is still written.
+    /// Count one answered request against every waiting change, applying those now due.
     pub(crate) fn count_answered(&mut self, origin: FakeOrigin, method: &str, target: &str) {
         let mut due = Vec::new();
         let mut index = 0;

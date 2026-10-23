@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The part of the wasm binary format the generator reads and rewrites:
-//! function types, imports, the function section, exports and custom
-//! sections. Every other section is copied through as bytes.
+//! The part of the wasm binary format the generator reads and rewrites.
 
 use aterm_wasm_abi::descriptor::ValType;
 
-/// A function signature, each value type as its one-byte code (`0x7f`
-/// i32, `0x7e` i64, `0x7d` f32, `0x7c` f64; `0x7b` v128 and the reference
-/// types a module may use internally are kept as they are).
+/// A function signature, each value type encoded as its one-byte wasm code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FuncType {
     pub(crate) params: Vec<u8>,
@@ -17,7 +13,7 @@ pub(crate) struct FuncType {
 }
 
 /// The binary code of a value type.
-pub(crate) fn code(v: ValType) -> u8 {
+pub(crate) const fn code(v: ValType) -> u8 {
     match v {
         ValType::I32 => 0x7f,
         ValType::I64 => 0x7e,
@@ -86,7 +82,7 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8], pos: usize) -> Self {
+    const fn new(bytes: &'a [u8], pos: usize) -> Self {
         Self { bytes, pos }
     }
 
@@ -228,7 +224,6 @@ impl<'a> Module<'a> {
     }
 
     /// The bytes of each custom section called `name`, in order.
-    /// The names of the module's custom sections, in order.
     pub(crate) fn custom_names(&self) -> impl Iterator<Item = &str> {
         self.sections.iter().filter_map(|s| s.name.as_deref())
     }
@@ -239,7 +234,6 @@ impl<'a> Module<'a> {
             .filter(|s| s.name.as_deref() == Some(name))
             .map(|s| {
                 let mut r = Reader::new(self.bytes, s.start);
-                // Skip the section's own name.
                 let _ = r.name();
                 &self.bytes[r.pos..s.end]
             })
@@ -260,9 +254,7 @@ impl<'a> Module<'a> {
         self.types.get(ty as usize)
     }
 
-    /// The module without the custom sections named in `drop_custom` and
-    /// without the exports named in `drop_exports`; every other byte as it
-    /// was.
+    /// Rebuilds the module without custom sections in `drop_custom` or exports in `drop_exports`.
     pub(crate) fn rewrite(&self, drop_custom: &[&str], drop_exports: &[&str]) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
         for s in &self.sections {
@@ -392,15 +384,10 @@ pub(crate) mod tests {
             out.extend(payload);
         }
         let mut m = MAGIC.to_vec();
-        // (i32, i64) -> f64 ; () -> ()
         section(&mut m, TYPE, &[2, 0x60, 2, 0x7f, 0x7e, 1, 0x7c, 0x60, 0, 0]);
-        // import env.f : type 1
         section(&mut m, IMPORT, &[1, 3, b'e', b'n', b'v', 1, b'f', 0, 1]);
-        // two defined functions: types 0 and 1
         section(&mut m, FUNCTION, &[2, 0, 1]);
-        // memory 1
         section(&mut m, 5, &[1, 0, 1]);
-        // exports: memory, "g" = func 1 (defined #0), "h" = func 2, "__data_end" global 0
         let mut e = vec![4];
         for (name, k, i) in [
             ("memory", 2u8, 0u8),
@@ -419,7 +406,6 @@ pub(crate) mod tests {
             c.extend(*bytes);
             section(&mut m, CUSTOM, &c);
         }
-        // a code section the reader passes through
         section(&mut m, 10, &[2, 2, 0, 0x0b, 2, 0, 0x0b]);
         m
     }
@@ -463,7 +449,6 @@ pub(crate) mod tests {
         let names: Vec<&str> = r.exports.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["memory", "g", "h"]);
         assert_eq!(r.funcs, m.funcs);
-        // Nothing dropped: the same bytes.
         assert_eq!(m.rewrite(&[], &[]), bytes);
     }
 

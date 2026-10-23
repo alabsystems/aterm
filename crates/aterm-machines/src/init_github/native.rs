@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The unified setup's native GitHub transport. agh owns authenticated HTTP; the token is
-//! stored by `git credential approve` through CLT git's osxkeychain helper on private stdin
-//! and read back ([`crate::git_credential`], no gh), and clone URLs contain only IDs.
+//! Native GitHub transport using `agh` and [`crate::git_credential`].
 
 use super::{Github, INPUT_MAX, decode, get, identity, read_token, repos};
 use crate::engine::Place;
@@ -15,11 +13,6 @@ use aterm_converge::{Class, Layer, Remedy, Requires};
 use std::io;
 use std::path::Path;
 
-// GitHub's authenticated endpoint includes owned, collaborator and organization
-// repositories. Never add `type`: GitHub refuses it alongside affiliation.
-// https://docs.github.com/en/rest/repos/repos#list-repositories-for-the-authenticated-user
-// Omit affiliation to use its documented all-three default; this also avoids
-// comma-encoding differences in the API's pagination links.
 const ACCESSIBLE: &str = "/user/repos?visibility=all&per_page=30&sort=full_name&direction=asc";
 
 pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemReport>, String> {
@@ -41,14 +34,9 @@ pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemRep
         ctx,
     );
     if mode == Mode::Apply {
-        // The journal of the account `sys` acts as: the item's own port, never one this
-        // process resolves beside it.
         let mut journal = sys.journal()?;
         aterm_converge::run(&bound, mode, journal.as_mut())
     } else {
-        // A plan or a check changes nothing, so it records nothing: the
-        // read-only journal, which refuses a record (`NoJournal` is a test's
-        // and is not in a release build).
         aterm_converge::run(&bound, mode, &mut aterm_converge::ReadOnly)
     }
     .map_err(|why| why.to_string())
@@ -93,7 +81,6 @@ impl Item for NativeRepositories {
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         let plan = self.plan(sys)?;
-        // Resolve every name/collision before persisting credentials or cloning.
         let missing = repos::missing(sys, &self.user, &plan.repositories)?;
         install_credentials(sys, &self.user, &plan.account, &plan.token)?;
         for repo in missing {
@@ -203,9 +190,7 @@ fn credential_ready(
         .is_some_and(|stored| stored.bytes() == token.bytes()))
 }
 
-/// Store the synced token through `git credential approve` (read back by the store itself)
-/// unless the keychain already holds it, then point git's github.com settings at the helper
-/// and read them back.
+/// Store the synced token through `git credential approve`.
 fn install_credentials(
     sys: &dyn System,
     user: &User,
@@ -443,8 +428,7 @@ mod tests {
         );
     }
 
-    /// git's github.com settings unset, then as `configure` leaves them; the keychain empty,
-    /// then holding `keychain` once `approve` ran.
+    /// git's github.com settings unset, then as `configure` leaves them.
     fn credential_commands(sys: &Fake, user: &User, keychain: &str) {
         script::unconfigured(sys, user);
         script::configured(sys, user, "alice");
@@ -469,7 +453,6 @@ mod tests {
         let calls = sys.calls();
         let approve = script::credential(Some(&item.user), "approve");
         let at = |key: &str| calls.iter().position(|call| call == key);
-        // Stored through approve, read back, then git's settings written and read back.
         assert!(at(&approve).is_some(), "{calls:?}");
         let writes = script::configure(&sys, &item.user, "alice");
         assert!(at(&approve) < at(&writes[0]), "{calls:?}");
@@ -487,7 +470,6 @@ mod tests {
             && !call.contains("auth login")));
         assert!(sys.fed().is_empty());
 
-        // Negative control: a keychain that already holds the token is not written again.
         let (sys, item) = fixture();
         answer(
             &sys,

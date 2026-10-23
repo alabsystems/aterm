@@ -462,6 +462,8 @@ fn conforms(script: &[(HostInputs, GlowStyle, Grid)], seen: &mut Seen<'_>) {
     }
 }
 
+/// Every host input on every style and grid, every ordered pair of inputs on
+/// the default style, and class pairs across a style switch and a grid change
 /// conform, and the run covers the model's whole reachable space.
 #[test]
 fn the_shipping_seam_conforms_to_the_trail_sound_seam_model() {
@@ -575,6 +577,7 @@ fn lit() -> HostInputs {
     }
 }
 
+/// Negative control 1: the dark-is-silent fold is rejected at a `TickDarkMotion` step for
 /// both causes, while the shipping fold passes the same script.
 #[test]
 fn the_pre_fix_fold_is_rejected_by_the_conformance() {
@@ -626,6 +629,8 @@ fn the_pre_fix_fold_is_rejected_by_the_conformance() {
     }
 }
 
+/// Negative control 2: the enabled-only `trail_on` reads a user-dimmed aurora as
+/// `closed:engine-silent` and is rejected at the `Tone` step only (`app_input`'s
 /// `a_dimmed_aurora_reads_trail_off_never_engine_silent` covers the call site).
 #[test]
 fn the_pre_fix_verb_is_rejected_by_the_conformance() {
@@ -650,6 +655,8 @@ fn the_pre_fix_verb_is_rejected_by_the_conformance() {
     }
 }
 
+/// Negative control 3: a classic wake keeping the previous tick's seam, and a degenerate
+/// grid closing it like the master switch, are each rejected at the tick and on exactly
 /// the classes they get wrong.
 #[test]
 fn the_pre_fix_classic_and_empty_grid_seams_are_rejected() {
@@ -685,6 +692,8 @@ fn the_pre_fix_classic_and_empty_grid_seams_are_rejected() {
     assert!(err.contains("`TickDarkUnfocused`"), "{err}");
 }
 
+/// Before the first frame the verb's answer is read, never substituted: with no seam
+/// resolved, the verb with every gate open says `closed:engine-silent`, so the model's
 /// `EngineSilentIsUnreachable` is not overread.
 #[test]
 fn the_verb_before_the_first_frame_is_read_not_invented() {

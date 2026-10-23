@@ -166,7 +166,7 @@ pub fn pulled_in(text: &str) -> Option<Vec<Pull>> {
     Some(v)
 }
 
-/// Does `text` hold a doctest rustdoc would compile (the module doc's list)?
+/// Does `text` hold a doctest rustdoc would compile?
 #[must_use]
 pub fn docs_hold_a_doctest(text: &str) -> bool {
     let mut doc = DocText::default();

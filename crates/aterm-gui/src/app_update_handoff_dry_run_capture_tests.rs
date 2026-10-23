@@ -568,7 +568,9 @@ fn a_fork_after_park_is_not_held_to_the_rendezvous_session_limit() {
     release_pty(&mut app, pty);
 }
 
-/// A launchd-limited producer makes room for its own park.
+/// A launchd-limited producer makes room for its own park. A window started from the Dock,
+/// Finder or a login item runs at launchd's soft 256 descriptors: about 30 of its own and
+/// three per session, so a 63-session desk leaves 37 where the park's duplicates need 63.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
@@ -1082,7 +1084,10 @@ fn a_missed_park_resumes_the_history_export_for_the_repark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE PARK NEVER WAITS ON THE EXPORT'S LAST LOOK.
+/// THE PARK NEVER WAITS ON THE EXPORT'S LAST LOOK. Every park — and
+/// so every free mid-sequence re-park of a flood — pauses the history export before it freezes
+/// anything, and the export's worker answers only after its last look: on a desk of 32
+/// flooding tabs, 10–20 ms each, measured.
 #[test]
 fn a_park_asks_the_export_to_pause_and_never_waits_for_its_last_look() {
     use crate::handoff_history::{HistoryExporter, HistoryPlan};
@@ -1194,7 +1199,11 @@ fn a_park_asks_the_export_to_pause_and_never_waits_for_its_last_look() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A MISSED PARK'S ROLLBACK NEVER WAITS ON AN ENGINE.
+/// A MISSED PARK'S ROLLBACK NEVER WAITS ON AN ENGINE. A park whose
+/// capture misses because another thread holds a session's engine
+/// (`CaptureFailure::EngineBusy`) rolls back before any successor held a PTY: nothing resized
+/// one, so no size is put back, and the rollback must not wait the holder out while every
+/// reader is still parked.
 #[test]
 fn a_missed_parks_rollback_never_waits_on_an_engine() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();

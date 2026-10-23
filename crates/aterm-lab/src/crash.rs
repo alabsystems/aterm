@@ -96,6 +96,8 @@ pub(crate) trait Ops {
     /// Interrupted.
     fn sleep(&mut self, d: Duration) -> Result<(), Fail>;
     /// Start the lab's instance again ([`crate::restore::relaunch_instance`]):
+    /// when the launch began and when its socket came up.
+    ///
     /// # Errors
     /// It did not come up.
     fn relaunch(

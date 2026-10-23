@@ -41,7 +41,6 @@ fn the_first_tab_carries_the_sign_in_and_the_others_read_it_back() {
     );
     l.back("default", "@2");
     assert_eq!(l.shared("default", "@2"), None, "its own loss over");
-    // A tab whose turn met the wall again takes a sign-in of its own.
     assert_eq!(l.carry("default", "@3"), Ok(()));
     assert_eq!(l.shared("default", "@3"), None);
 
@@ -79,7 +78,6 @@ fn the_carrier_reads_the_login_back_where_it_came_back_elsewhere() {
     l.back("default", "@1");
     assert_eq!(l.shared("default", "@1"), None, "its own loss over");
     assert_eq!(l.shared("default", "@2"), back_in("@3"));
-    // NEGATIVE CONTROL: back in the carrier's own tab.
     let l = LoginLatches::default();
     assert_eq!(l.carry("default", "@1"), Ok(()));
     l.back("default", "@1");
@@ -101,13 +99,9 @@ fn each_login_has_its_own_sign_in() {
         })
     );
     assert_eq!(l.carry("dir:/work/b", "@3"), Err("@2".to_string()));
-    // @2's process signs in with the default login now: b's sign-in is
-    // nobody's, and @2 waits on @1's.
     assert_eq!(l.carry("default", "@2"), Err("@1".to_string()));
     assert_eq!(l.shared("dir:/work/b", "@3"), None);
     assert_eq!(l.carry("dir:/work/b", "@3"), Ok(()));
-    // @3's process relaunched onto another login, back there: b's sign-in
-    // is nobody's, and the tab that waited on it takes its own.
     assert!(l.shared("dir:/work/b", "@4").is_some());
     l.back("dir:/work/c", "@3");
     assert_eq!(l.shared("dir:/work/b", "@4"), None);
@@ -169,7 +163,6 @@ fn the_rows_carried_are_those_a_tab_signs_in_now() {
         BTreeSet::from(["work-a".to_string()]),
         "a carry with no row names none"
     );
-    // Another tab waiting on it carries nothing of its own.
     assert_eq!(
         l.carry_for("dir:/a", "@3", &owner, Some("work-a")),
         Err("@1".to_string())

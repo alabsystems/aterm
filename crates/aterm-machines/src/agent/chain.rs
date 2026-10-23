@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The path-chain check the root agent runs before it acts (design §3.4): its executable and
-//! every directory from there up to `/` must be root-owned and writable by nobody else, so
-//! no other account could have replaced what sudo just ran as root.
-//!
-//! The executable may be named through one link, the stable `bin/aterm`, which must itself
-//! be root-owned; the link's target is checked the same way, and no other link is allowed
-//! anywhere in either chain.
+//! The path-chain check the root agent runs before it acts (design §3.4).
 
 use crate::port::System;
 use std::path::{Component, Path, PathBuf};
 
 /// Check `exe` (the path this process was started as) and its chain.
-///
 /// # Errors
 /// One line naming the first component that is not root's alone.
 pub fn check(sys: &dyn System, exe: &Path) -> Result<(), String> {

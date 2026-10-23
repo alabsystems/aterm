@@ -154,7 +154,9 @@ struct Shelf {
     x: u32,
 }
 
-/// A best-fit shelf packer over a `side × side` square.
+/// A best-fit shelf packer over a `side × side` square. No gutter: the
+/// fragment reads texels by integer address, never filtered, so a neighbour's
+/// texel is never sampled.
 #[derive(Debug, Default)]
 struct ShelfPack {
     side: u32,

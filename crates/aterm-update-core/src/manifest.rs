@@ -106,7 +106,9 @@ impl Manifest {
         Ok(m)
     }
 
-    /// Wire invariants shared by parsing and emission.
+    /// Wire invariants shared by parsing and emission. A manifest may retire older builds but
+    /// cannot demand one newer than itself, which would wedge the ratcheted client floor above
+    /// every published successor.
     fn validate(&self) -> Result<(), String> {
         if self.schema > SUPPORTED_SCHEMA {
             return Err(format!(

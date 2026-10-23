@@ -401,7 +401,7 @@ fn param_is_raw_ptr(sig: &str, name: &str) -> bool {
 }
 
 /// Byte index of the `(` matching the `)` at `close` (scanning backwards).
-fn match_paren_back(line: &str, close: usize) -> Option<usize> {
+const fn match_paren_back(line: &str, close: usize) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut depth = 0usize;
     let mut i = close;
@@ -510,7 +510,7 @@ struct AcqSite {
 
 impl AcqSite {
     /// Does this site join the mutex order graph?
-    fn graphed(&self) -> bool {
+    const fn graphed(&self) -> bool {
         self.advisory.is_none() && self.raw_ptr.is_none()
     }
 
@@ -764,7 +764,7 @@ struct ImplSpan {
 }
 
 /// Is `b` an identifier byte (for keyword-boundary checks)?
-fn is_ident_byte(b: u8) -> bool {
+const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 

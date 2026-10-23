@@ -274,7 +274,8 @@ impl Rig {
         .holding(&crate::restore::quit_also_of(&text))
     }
 
-    /// A later launch's real claim.
+    /// A later launch's real claim. On the consumed pass, a windowed launch that does not claim
+    /// first reads (and renames) every run's evidence, as its boot does.
     fn claim(&mut self) {
         if self.consumed_first {
             let killed =
@@ -448,7 +449,9 @@ fn transition_cover(
     cover.iter().filter(|s| !longer(s)).cloned().collect()
 }
 
-/// Replay `schedule` on the real owner and claim on `desk` (handed back emptied).
+/// Replay `schedule` on the real owner and claim on `desk` (handed back emptied). With
+/// `consumed_first`, a launch that does not claim reads the evidence before every claim
+/// (`consumed` counts the reads that found some).
 fn replay(
     desk: Desk,
     schedule: &[&'static str],

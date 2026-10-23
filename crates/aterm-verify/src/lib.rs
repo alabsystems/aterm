@@ -410,14 +410,14 @@ impl Ctx {
 
     /// The `release` set ([`Ctx::release`]).
     #[must_use]
-    pub fn with_release(mut self, release: bool) -> Self {
+    pub const fn with_release(mut self, release: bool) -> Self {
         self.release = release;
         self
     }
 
     /// `--fix` ([`Ctx::fix`]).
     #[must_use]
-    pub fn with_fix(mut self, fix: bool) -> Self {
+    pub const fn with_fix(mut self, fix: bool) -> Self {
         self.fix = fix;
         self
     }
@@ -476,7 +476,7 @@ impl Ctx {
 
     /// `--test-jobs <n>`.
     #[must_use]
-    pub fn with_test_jobs(mut self, jobs: Option<std::num::NonZeroU32>) -> Self {
+    pub const fn with_test_jobs(mut self, jobs: Option<std::num::NonZeroU32>) -> Self {
         if let Some(n) = jobs {
             self.test_jobs = n.get();
         }
@@ -496,14 +496,14 @@ impl Ctx {
 
     /// Move the stage-child ceiling (`--timeout`; `None` is `off`).
     #[must_use]
-    pub fn with_child_ceiling(mut self, ceiling: Option<Duration>) -> Self {
+    pub const fn with_child_ceiling(mut self, ceiling: Option<Duration>) -> Self {
         self.child_ceiling = ceiling;
         self
     }
 
     /// `--no-windows`.
     #[must_use]
-    pub fn with_no_windows(mut self, no_windows: bool) -> Self {
+    pub const fn with_no_windows(mut self, no_windows: bool) -> Self {
         self.no_windows = no_windows;
         self
     }

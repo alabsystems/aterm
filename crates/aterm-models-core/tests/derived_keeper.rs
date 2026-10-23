@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of the PTY keeper's four machines (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.4,
-//! §6.1, §6.2, and the crash-restore plan §7.2): `PtyKeeperCustody`, `KeeperRelaunchBrake`,
-//! `KeeperDeathJudgement` and `KeeperCompanionCustody`. Each is proved at `Buggy = 0` and caught
-//! on every design invariant (`KeeperCompanionCustody` by one `Buggy` value each), and the
-//! lifecycles a person meets are walked by name. Tier-1 is
-//! `crates/aterm-keeper/src/conformance_custody.rs` and `conformance_companion.rs`.
+//! Tier-0 conformance tests for the PTY keeper's four state machines.
 
 use aterm_models_core::{
     keeper_companion_custody_model, keeper_death_judgement_model, keeper_relaunch_brake_model,
@@ -60,8 +55,6 @@ fn pty_keeper_custody_fires_every_committed_move() {
 fn pty_keeper_custody_walks_the_lifecycles() {
     let m = pty_keeper_custody_model();
 
-    // A crash with both masters registered: both kept, both offered to the
-    // relaunched window, the keeper still holding its copies.
     let s = walk(
         &m,
         &[
@@ -87,8 +80,6 @@ fn pty_keeper_custody_walks_the_lifecycles() {
     );
     assert_eq!((s["lost_a"], s["lost_b"]), (0, 0));
 
-    // The relaunched window crashes too: the keeper's copy keeps the shells,
-    // and they are orphans again.
     let s2 = {
         let mut s2 = s.clone();
         assert!(m.fire("RelaunchedWindowCrashes", &mut s2));
@@ -96,13 +87,10 @@ fn pty_keeper_custody_walks_the_lifecycles() {
     };
     assert_eq!((s2["orphan_a"], s2["lost_a"]), (1, 0), "{s2:?}");
 
-    // A crash inside the spawn-to-REGISTER window loses that shell: the
-    // accepted loss window, which the invariant names.
     let early = walk(&m, &["RegisterA", "WindowCrashes"]);
     assert_eq!((early["lost_a"], early["lost_b"]), (0, 1), "{early:?}");
     assert_eq!(early["ever_registered_b"], 0);
 
-    // A quit: the keeper closes its copies and never relaunches.
     let quit = walk(&m, &["RegisterA", "RegisterB", "Quit", "KeeperHonoursBye"]);
     assert_eq!((quit["k_holds_a"], quit["k_holds_b"]), (0, 0), "{quit:?}");
     assert!(
@@ -110,7 +98,6 @@ fn pty_keeper_custody_walks_the_lifecycles() {
         "no relaunch after a quit"
     );
 
-    // A closed tab is released and never offered.
     let closed = walk(
         &m,
         &[
@@ -124,8 +111,6 @@ fn pty_keeper_custody_walks_the_lifecycles() {
     assert!(!m.action_enabled("OfferA", &closed), "{closed:?}");
     assert!(m.action_enabled("OfferB", &closed), "{closed:?}");
 
-    // A committed update is a hold: nothing to relaunch while the successor
-    // reads, and nothing offered.
     let update = walk(&m, &["RegisterA", "RegisterB", "StartSuccessor", "Commit"]);
     assert_eq!(
         (update["s_reads_a"], update["orphan_a"]),
@@ -134,8 +119,6 @@ fn pty_keeper_custody_walks_the_lifecycles() {
     );
     assert!(!m.action_enabled("Relaunch", &update));
 
-    // The window crashes mid-update: the successor fail-stops, and only then are the masters
-    // orphans.
     let mid = walk(
         &m,
         &["RegisterA", "RegisterB", "StartSuccessor", "WindowCrashes"],
@@ -188,7 +171,6 @@ fn pty_keeper_custody_an_offer_returns_when_its_link_drops() {
         assert_eq!(quit["bye"], 1, "{quit:?}");
         assert!(!m.action_enabled("Relaunch", &quit), "{quit:?}");
     }
-    // Each mutant's step, from the committed machine's own state.
     let buggy = interp::with_buggy(&m, 1);
     let mut stuck = walk(&m, &offered[..4]);
     assert!(buggy.fire("RelaunchedLinkDrops", &mut stuck));
@@ -232,8 +214,6 @@ fn pty_keeper_custody_a_release_from_one_of_two_claimants_keeps_the_copy() {
         "the mutant loses the shell with no keeper fault: {lost:?}"
     );
     assert!(!buggy.check_invariant("LossNeedsKeeperFaultA", &lost));
-    // The step that loses the copy is the release: before it both runs hold it, after it only
-    // the committed one does.
     let upto = walk(&base, &schedule[..3]);
     let upto_buggy = walk(&buggy, &schedule[..3]);
     assert_eq!((upto["k_holds_a"], upto_buggy["k_holds_a"]), (1, 1));
@@ -243,9 +223,6 @@ fn pty_keeper_custody_a_release_from_one_of_two_claimants_keeps_the_copy() {
     assert!(buggy.fire("OutgoingReleasesA", &mut closed));
     assert_eq!((kept["k_holds_a"], closed["k_holds_a"]), (1, 0));
 
-    // The other direction: the successor closes the tab while the outgoing
-    // window still claims it. The copy stays for that claimant's end, and its
-    // end closes it (the shell was hung up) — never an orphan.
     let s = walk(
         &base,
         &[
@@ -410,11 +387,8 @@ fn keeper_death_judgement_fires_every_committed_move() {
 #[test]
 fn keeper_death_judgement_walks_the_ends() {
     let m = keeper_death_judgement_model();
-    // A quit whose BYE was lost: exit(0) and the marker gone — closed.
     let lost = walk(&m, &["QuitByeLost", "Judge"]);
     assert_eq!((lost["judged_quit"], lost["orphaned"]), (1, 0), "{lost:?}");
-    // SIGKILL: the marker stays with its lock free — an orphan, even when a
-    // sweep removes the marker (the status still says a signal).
     for tail in [
         &["Judge"][..],
         &["MarkerSwept", "Judge"],
@@ -429,24 +403,18 @@ fn keeper_death_judgement_walks_the_ends() {
             "{schedule:?}: {s:?}"
         );
     }
-    // A panic's exit path removes the marker too, but its status is 101.
     let panic = walk(&m, &["PanicExit", "Judge"]);
     assert_eq!(panic["orphaned"], 1, "{panic:?}");
-    // A P3 window's lost BYE has no marker to prove the quit: the design's
-    // exception, judged a crash.
     let p3 = walk(&m, &["PickP3Window", "QuitByeLost", "Judge"]);
     assert_eq!(p3["orphaned"], 1, "{p3:?}");
-    // A pre-BYE window's exit(0) is closed.
     let old = walk(&m, &["PickPreByeWindow", "QuitWithBye", "Judge"]);
     assert_eq!((old["bye"], old["judged_quit"]), (0, 1), "{old:?}");
-    // An orphan whose shell dies is pruned when the keeper reads the exit.
     let pruned = walk(&m, &["Killed", "Judge", "ShellDies", "KeeperSeesShellExit"]);
     assert_eq!(
         (pruned["orphaned"], pruned["watch_pending"]),
         (0, 0),
         "{pruned:?}"
     );
-    // A shell that died before the judgement is never orphaned at all.
     let early = walk(&m, &["Killed", "ShellDies", "Judge"]);
     assert_eq!(
         (early["orphaned"], early["watch_pending"]),
@@ -461,7 +429,6 @@ fn keeper_death_judgement_walks_the_ends() {
 fn keeper_death_judgement_the_defects_are_caught_on_every_invariant() {
     let base = keeper_death_judgement_model();
     let m = interp::with_buggy(&base, 1);
-    // No marker: a clean quit whose BYE was lost is orphaned.
     let (resurrected, _) =
         interp::bmc(&only(&m, "CleanQuitNeverResurrected")).expect_err("the marker ignored");
     assert_eq!(
@@ -475,7 +442,6 @@ fn keeper_death_judgement_the_defects_are_caught_on_every_invariant() {
     );
     let replay = walk(&m, &["QuitByeLost", "Judge"]);
     assert!(!m.check_invariant("CleanQuitNeverResurrected", &replay));
-    // The marker trusted alone: a panic read as a quit.
     let (closed, _) = interp::bmc(&only(&m, "CrashNeverClosed")).expect_err("the marker alone");
     assert_eq!(
         (closed["quit"], closed["judged_quit"]),
@@ -484,7 +450,6 @@ fn keeper_death_judgement_the_defects_are_caught_on_every_invariant() {
     );
     let replay = walk(&m, &["PanicExit", "Judge"]);
     assert!(!m.check_invariant("CrashNeverClosed", &replay));
-    // No prune: an orphan listed after its shell died.
     let (stale, _) = interp::bmc(&only(&m, "NeverListsTheDead")).expect_err("no prune");
     assert_eq!(
         (
@@ -554,8 +519,6 @@ fn keeper_companion_custody_each_defect_breaks_its_own_invariant() {
 fn keeper_companion_custody_the_traced_counterexamples_end_where_the_plan_says() {
     let model = keeper_companion_custody_model();
     let traces: [(i64, &str, &[&str]); 5] = [
-        // The first reader dies settled, the next one dies before its COMPANION: uncounted,
-        // the first reader's region is offered at attempts 0 as if it were the second's.
         (
             1,
             "ExactOnlyFromTheReader",
@@ -563,7 +526,6 @@ fn keeper_companion_custody_the_traced_counterexamples_end_where_the_plan_says()
         ),
         (2, "NeverToAnOldWindow", &["ReaderDies", "OfferOld"]),
         (3, "ReleasedCompanionClosed", &["Release"]),
-        // Two recovering windows die on the region; uncapped, it is offered a third time.
         (
             4,
             "PoisonBounded",
@@ -576,9 +538,6 @@ fn keeper_companion_custody_the_traced_counterexamples_end_where_the_plan_says()
                 "OfferNew",
             ],
         ),
-        // An update's successor dies before its COMPANION while the outgoing window drains;
-        // promoted, the outgoing window's region is offered at attempts 0 when it ends too,
-        // without what the successor read after the Commit (the defect review found).
         (
             5,
             "ExactOnlyFromTheReader",
@@ -604,8 +563,6 @@ fn keeper_companion_custody_the_traced_counterexamples_end_where_the_plan_says()
 #[test]
 fn keeper_companion_custody_walks_the_lifecycles() {
     let m = keeper_companion_custody_model();
-    // A crash, a recovery that settles, and a second crash: each offer carries the region of
-    // the reader that died, at attempts 0.
     let s = walk(
         &m,
         &[
@@ -621,8 +578,6 @@ fn keeper_companion_custody_walks_the_lifecycles() {
         (2, 2, 0, 1),
         "{s:?}"
     );
-    // One poisoned restore: the next offer carries the first region at attempts 1; a second
-    // closes it.
     let once = walk(&m, &["ReaderDies", "OfferNew", "Claim", "ReaderDies"]);
     assert_eq!((once["comp"], once["attempts"]), (1, 1), "{once:?}");
     let twice = walk(
@@ -637,8 +592,6 @@ fn keeper_companion_custody_walks_the_lifecycles() {
         ],
     );
     assert_eq!((twice["comp"], twice["attempts"]), (0, 2), "{twice:?}");
-    // A window that does not journal: its offer's return costs nothing, its claim closes the
-    // region.
     let old = walk(&m, &["ReaderDies", "OfferOld", "RecipientDrops"]);
     assert_eq!((old["comp"], old["attempts"]), (1, 0), "{old:?}");
     let claimed = walk(&m, &["ReaderDies", "OfferOld", "Claim"]);
@@ -647,7 +600,6 @@ fn keeper_companion_custody_walks_the_lifecycles() {
         !m.action_enabled("ReaderCompanion", &claimed),
         "a window that does not journal sends no region"
     );
-    // A window with no region of its own settles with none.
     let released = walk(
         &m,
         &[
@@ -663,8 +615,6 @@ fn keeper_companion_custody_walks_the_lifecycles() {
         (0, 0),
         "{released:?}"
     );
-    // An update: the successor settles and the outgoing window ends at its Commit; the
-    // successor's crash offers its own region at attempts 0.
     let update = walk(
         &m,
         &[
@@ -684,9 +634,6 @@ fn keeper_companion_custody_walks_the_lifecycles() {
         (2, 2, 0, 1),
         "{update:?}"
     );
-    // The successor dies first, settled or not, and the outgoing window after it: the
-    // successor's region at attempts 0, or the outgoing window's with the attempt its
-    // unsettled end costs, never the outgoing window's at attempts 0.
     let settled = walk(
         &m,
         &[

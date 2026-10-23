@@ -50,8 +50,6 @@ impl<'a> FromSlice<'a> for Lookup<'a> {
 }
 
 /// A trait for parsing Lookup subtables.
-///
-/// Internal use only.
 pub trait LookupSubtable<'a>: Sized {
     /// Parses raw data.
     fn parse(data: &'a [u8], kind: u16) -> Option<Self>;
@@ -84,13 +82,8 @@ impl<'a> LookupSubtables<'a> {
         self.offsets.is_empty()
     }
 
-    /// Parses a subtable at index.
-    ///
-    /// Accepts either
-    /// [`PositioningSubtable`](crate::gpos::PositioningSubtable)
-    /// or [`SubstitutionSubtable`](crate::gsub::SubstitutionSubtable).
-    ///
-    /// Technically, we can enforce it at compile time, but it makes code too convoluted.
+    /// Parses a subtable at index ([`PositioningSubtable`](crate::gpos::PositioningSubtable),
+    /// [`SubstitutionSubtable`](crate::gsub::SubstitutionSubtable)).
     #[inline]
     pub fn get<T: LookupSubtable<'a>>(&self, index: u16) -> Option<T> {
         let offset = self.offsets.get(index)?.to_usize();
@@ -99,8 +92,6 @@ impl<'a> LookupSubtables<'a> {
     }
 
     /// Creates an iterator over subtables.
-    ///
-    /// We cannot use `IntoIterator` here, because we have to use user-provided base type.
     #[allow(clippy::should_implement_trait)]
     #[inline]
     pub const fn into_iter<T: LookupSubtable<'a>>(self) -> LookupSubtablesIter<'a, T> {

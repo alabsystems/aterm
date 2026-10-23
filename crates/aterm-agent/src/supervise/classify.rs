@@ -66,7 +66,9 @@ const ARITHMETIC_RUNS: &str = "an arithmetic evaluation ($((…)) or ((…)): it
 /// Default `--allow-python` glob list (empty).
 pub const DEFAULT_PYTHON_ALLOW: &[&str] = &[];
 
-/// Programs a segment may start with and still be a read.
+/// Programs a segment may start with and still be a read. Shell keywords are
+/// here because a `for`/`if` segment's head is the keyword; the command after
+/// `do`/`then` is checked too ([`segment_head`]).
 const READ_ONLY: &[&str] = &[
     "git",
     "ls",
@@ -1276,7 +1278,12 @@ fn is_alarm_body(body: &str) -> bool {
     rest.is_empty() || rest == ";"
 }
 
-/// Replace every quoted string with `""`.
+/// Replace every quoted string with `""`. A substitution inside double quotes
+/// stays glued to that `""`, preceded by [`QUOTE_SUB_MARK`] (so `x="$(…)"` is
+/// still one assignment and [`split_segments`] reads a
+/// [`QUOTED_SUBSTITUTION`]); a parameter inside double quotes becomes
+/// [`QUOTED_PARAMETER`]; find's `\(`/`\)` become bare parens; other escapes
+/// stay verbatim.
 fn strip_quotes(src: &str) -> String {
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
@@ -2838,7 +2845,8 @@ const ATERM_CTL_READ: &[&str] = &[
     "whoami",
 ];
 
-/// `aterm pkg` and `aterm drive` verbs that only read.
+/// `aterm pkg` and `aterm drive` verbs that only read. `drive ledger` reads
+/// too, unless `--out` names a file it writes ([`aterm_drive_read`]).
 const ATERM_PKG_READ: &[&str] = &["list", "which", "doctor"];
 const ATERM_DRIVE_READ: &[&str] = &["phase", "classify", "help", "-h", "--help"];
 

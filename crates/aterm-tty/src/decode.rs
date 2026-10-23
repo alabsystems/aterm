@@ -20,7 +20,8 @@ pub const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most of one bracketed paste kept.
 pub const MAX_PASTE_BYTES: usize = 32 * 1024 * 1024;
 
-/// The most of one control sequence or string kept.
+/// The most of one control sequence or string kept. A reply is far shorter; one that
+/// is not is read to its end and reported [`Event::Unknown`] with this much of it.
 const MAX_SEQUENCE_BYTES: usize = 4096;
 
 const ESC: u8 = 0x1b;
@@ -1152,7 +1153,8 @@ fn resize(fields: &[Field]) -> Option<Event> {
     }
 }
 
-/// A mouse report's event from xterm's `Cb` and 1-based cell.
+/// A mouse report's event from xterm's `Cb` and 1-based cell. `legacy` reads `Cb` 3
+/// as a release of an unnamed button, as X10 sends one.
 fn mouse(cb: u32, col: u32, row: u32, release: bool, legacy: bool) -> Option<Event> {
     let cb = u8::try_from(cb).ok()?;
     let mut mods = Modifiers::empty();

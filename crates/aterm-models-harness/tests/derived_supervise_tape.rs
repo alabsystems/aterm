@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of the harness tape's models (the replay plan's §9):
-//! `SuperviseTapeRecovery` (model 1, §6.4), `SuperviseReplayCursor` (model 2,
-//! §5.2's strict arm and its acts arm, a scenario) and `SupervisorRaisedLatch`
-//! (model 3) — each proved at `Buggy = 0` and caught at `Buggy = 1`, each
-//! invariant broken by the mutant written to break it, and walked the way a
-//! tape meets its ends, a replay (and a counterfactual) its tape and a raised
-//! flag its loop. Tier-1 is
-//! `aterm-agent/src/supervise/tape/conformance_tests.rs`.
+//! Tier-0 of the harness tape's models (the replay plan's §9).
 
 use aterm_models_harness::supervise_tape_recovery_model;
 use aterm_spec::walk::{only, walk};
@@ -96,8 +89,6 @@ fn supervise_tape_recovery_walks_the_ends_a_tape_meets() {
         "a damaged last frame is the torn tail: {last:?}"
     );
 
-    // The magic is read before any frame: damaged, the file is refused, even
-    // when the header is the only whole frame and no frame follows it.
     for schedule in [
         ["Write", "Crash", "RotMagic", "Recover"].as_slice(),
         &["Write", "Write", "Write", "Crash", "RotMagic", "Recover"],
@@ -121,9 +112,6 @@ fn supervise_tape_recovery_walks_the_ends_a_tape_meets() {
         "one damage per tape: {damaged:?}"
     );
 
-    // Whole frames repeated, dropped or moved are refused, the header's
-    // repeat on a one-frame tape too; a tape torn mid-frame has no whole
-    // frames to arrange past its tear, and is the torn tail.
     for schedule in [
         ["Write", "Crash", "Misplace", "Recover"].as_slice(),
         &["Write", "Write", "Write", "Crash", "Misplace", "Recover"],
@@ -142,8 +130,6 @@ fn supervise_tape_recovery_walks_the_ends_a_tape_meets() {
         "one damage per tape: {damaged:?}"
     );
 }
-
-// -- model 2: a replay's cursor, both arms -----------------------------------
 
 /// Every move of model 2, each of which fires in both arms.
 const CURSOR_MOVES: [&str; 7] = [
@@ -296,8 +282,6 @@ fn supervise_replay_cursor_walks_a_counterfactual() {
         "the future served, the cursor still: {served:?}"
     );
 }
-
-// -- model 3: the stop flag's latch ------------------------------------------
 
 /// Tier-0 of `SupervisorRaisedLatch` (model 3): every move fires at the committed
 /// configuration (`aterm-models`' `non_vacuity` proves and catches it).

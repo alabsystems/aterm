@@ -12,7 +12,9 @@ pub const MASTER_PHRASE_LEN: usize = 52;
 /// `i l o u`.
 const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-/// Overwrite `buf` with zeroes the optimizer may not delete.
+/// Overwrite `buf` with zeroes the optimizer may not delete. A zeroing loop on a buffer never
+/// read again is dead-store elimination's textbook case; `write_volatile` cannot be removed
+/// and the fence stops the writes sinking past the buffer's death.
 fn scrub(buf: &mut [u8]) {
     for b in buf.iter_mut() {
         // SAFETY: `b` is a live, uniquely borrowed, aligned `u8`.
@@ -29,7 +31,9 @@ fn scrub_u32(v: &mut u32) {
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Ask the kernel to keep `buf` out of swap.
+/// Ask the kernel to keep `buf` out of swap. Best-effort: `mlock` is bounded by
+/// `RLIMIT_MEMLOCK` and its failure is ignored, so a machine with a tight limit can still
+/// mint.
 fn try_lock(buf: &[u8]) {
     // SAFETY: `buf` points to `buf.len()` live bytes for the duration of the `mlock` call.
     unsafe {
@@ -157,7 +161,8 @@ impl MasterPhrase {
     }
 }
 
-/// The 5-bit value of one phrase character.
+/// The 5-bit value of one phrase character. Called only on alphabet bytes; the unreachable
+/// fallback returns 0 rather than panicking with the master live in memory.
 const fn b32_val(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
@@ -463,7 +468,8 @@ mod tests {
 
     const SYNTHETIC: &str = "0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0";
 
-    /// The refusal for an input that must not parse.
+    /// The refusal for an input that must not parse. [`MasterPhrase`] has no `PartialEq` on
+    /// purpose: equality on secret material invites comparison and timing side channels.
     fn refused(input: &str) -> PhraseError {
         // cannot spill phrase bytes into the panic message.
         parse_master(input).expect_err("this input must be refused")
@@ -576,7 +582,10 @@ mod tests {
         assert_eq!(parse_master(a.as_str()).unwrap().as_str(), a.as_str());
     }
 
-    /// THE PAPER IS THE SEED.
+    /// THE PAPER IS THE SEED. A phrase decodes to exactly the 32 bytes it was spelled
+    /// from, its last character carries zero padding bits (one canonical spelling), and
+    /// the derivation is a cross-version contract: paper written under an earlier build
+    /// names the same master in this one.
     #[test]
     fn a_phrase_decodes_to_exactly_the_seed_it_spells() {
         for raw in [

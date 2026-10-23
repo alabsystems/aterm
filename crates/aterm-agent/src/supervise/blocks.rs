@@ -44,7 +44,7 @@ pub enum View {
 
 impl View {
     /// The header's `view=` word (`All` prints none).
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             View::All => "all",
             View::Final => "final",

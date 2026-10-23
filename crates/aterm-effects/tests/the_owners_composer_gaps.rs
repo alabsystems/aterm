@@ -461,7 +461,9 @@ impl Sim {
         }
     }
 
-    /// Echo every pending key: the composer repaints.
+    /// Echo every pending key: the composer repaints. With `torn` only the
+    /// bytes before the park are processed and the rest is returned for the
+    /// caller to land.
     fn render_head(&mut self, torn: bool) -> Option<Vec<u8>> {
         let keys: Vec<char> = std::mem::take(&mut self.pending);
         if keys.is_empty() {
@@ -805,7 +807,12 @@ fn old_line(typed: usize) -> String {
 /// Where the hand edits the old text.
 const EDIT_COL: u16 = 40;
 
-/// An edit inside old text whose key grows the box.
+/// An edit inside old text whose key grows the box. The hand reaches column
+/// [`EDIT_COL`] by a hop from the line's end (Home, a word hop, a long arrow
+/// run: one navigation, one jump) with `hop`, else with no key (a click);
+/// then `typed`, the growth key and one more key, `gap` ms apart, each echoed
+/// 3 ms after it except the growth key's, echoed `late` ms after it or torn
+/// for `torn` ms.
 fn edit_that_grows_the_box(
     typed: &str,
     hop: bool,
@@ -852,7 +859,10 @@ fn band_rode(s: &Sim, row: u16, col: u16, before: u64) -> bool {
         .any(|c| c.row == row && (c.col0..c.col1).contains(&col) && c.born < before)
 }
 
-/// The hop's wake rides with the hand.
+/// The hop's wake rides with the hand. Inside a hop's wake the typed keys'
+/// band holds the wake's cells too (`Ribbon::fold_wakes_into_band`), and the
+/// growth key's insert pushes that tail along, so its every record reads as
+/// a hole one row up.
 #[test]
 fn a_growth_echo_inside_a_hops_wake_lights_its_own_cell() {
     for (late, torn) in [(600u64, None), (3, Some(200u64))] {
@@ -880,7 +890,11 @@ fn a_growth_echo_inside_a_hops_wake_lights_its_own_cell() {
     }
 }
 
-/// One typed glyph on the hand's line before the growth key.
+/// One typed glyph on the hand's line before the growth key. With the caret
+/// shown on the grown row the caret is the second witness to the glyph's
+/// move; with the caret withheld by a torn present the glyph waits for it
+/// (`Witness::await_caret`), so the growth echo lights its own cell either
+/// way and the glyph's band rides up with its line.
 #[test]
 fn a_growth_echo_after_one_typed_glyph_lights_its_own_cell() {
     for (late, torn) in [(3u64, None), (600, None), (3, Some(200u64))] {

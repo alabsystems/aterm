@@ -5,30 +5,21 @@
 // project in 2026.
 // See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
 
-//! Binary parsing utils.
-//!
-//! This module should not be used directly, unless you're planning to parse
-//! some tables manually.
+//! Binary parsing utilities.
 
 use core::convert::{TryFrom, TryInto};
 use core::ops::Range;
 
-/// A trait for parsing raw binary data of fixed size.
-///
-/// This is a low-level, internal trait that should not be used directly.
+/// Parses raw binary data of fixed size.
 pub trait FromData: Sized {
-    /// Object's raw data size.
-    ///
-    /// Not always the same as `mem::size_of`.
+    /// Raw data size in bytes.
     const SIZE: usize;
 
     /// Parses an object from a raw data.
     fn parse(data: &[u8]) -> Option<Self>;
 }
 
-/// A trait for parsing raw binary data of variable size.
-///
-/// This is a low-level, internal trait that should not be used directly.
+/// Parses raw binary data of variable size.
 pub trait FromSlice<'a>: Sized {
     /// Parses an object from a raw data.
     fn parse(data: &'a [u8]) -> Option<Self>;
@@ -106,11 +97,7 @@ impl FromData for u64 {
     }
 }
 
-/// A u24 number.
-///
-/// Stored as u32, but encoded as 3 bytes in the font.
-///
-/// <https://docs.microsoft.com/en-us/typography/opentype/spec/otff#data-types>
+/// A 24-bit unsigned integer stored as `u32`.
 #[derive(Clone, Copy, Debug)]
 pub struct U24(pub u32);
 
@@ -168,16 +155,11 @@ impl FromData for Fixed {
 
     #[inline]
     fn parse(data: &[u8]) -> Option<Self> {
-        // TODO: is it safe to cast?
         i32::parse(data).map(|n| Fixed(n as f32 / 65536.0))
     }
 }
 
-/// A safe u32 to usize casting.
-///
-/// Rust doesn't implement `From<u32> for usize`,
-/// because it has to support 16 bit targets.
-/// We don't, so we can allow this.
+/// Lossless `u32`/`char` to `usize` conversion on 32/64-bit targets.
 pub trait NumFrom<T>: Sized {
     /// Converts u32 into usize.
     fn num_from(_: T) -> Self;
@@ -190,8 +172,6 @@ impl NumFrom<u32> for usize {
         {
             v as usize
         }
-
-        // compilation error on 16 bit targets
     }
 }
 
@@ -202,8 +182,6 @@ impl NumFrom<char> for usize {
         {
             v as usize
         }
-
-        // compilation error on 16 bit targets
     }
 }
 
@@ -238,16 +216,8 @@ impl TryNumFrom<f32> for u16 {
 impl TryNumFrom<f32> for i32 {
     #[inline]
     fn try_num_from(v: f32) -> Option<Self> {
-        // Based on https://github.com/rust-num/num-traits/blob/master/src/cast.rs
-
-        // Float as int truncates toward zero, so we want to allow values
-        // in the exclusive range `(MIN-1, MAX+1)`.
-
-        // We can't represent `MIN-1` exactly, but there's no fractional part
-        // at this magnitude, so we can just use a `MIN` inclusive boundary.
+        // Truncates toward zero; allow `[MIN, MAX + 1)` (`i32::MAX as f32` rounds up to `MAX + 1`).
         const MIN: f32 = i32::MIN as f32;
-        // We can't represent `MAX` exactly, but it will round up to exactly
-        // `MAX+1` (a power of two) when we cast it.
         const MAX_P1: f32 = i32::MAX as f32;
         if v >= MIN && v < MAX_P1 {
             Some(v as i32)
@@ -257,9 +227,7 @@ impl TryNumFrom<f32> for i32 {
     }
 }
 
-/// A slice-like container that converts internal binary data only on access.
-///
-/// Array values are stored in a continuous data chunk.
+/// A slice-like container that parses fixed-size binary elements on access.
 #[derive(Clone, Copy)]
 pub struct LazyArray16<'a, T> {
     data: &'a [u8],
@@ -346,8 +314,6 @@ impl<'a, T: FromData> LazyArray16<'a, T> {
     where
         F: FnMut(&T) -> core::cmp::Ordering,
     {
-        // Based on Rust std implementation.
-
         use core::cmp::Ordering;
 
         let mut size = self.len();
@@ -359,15 +325,11 @@ impl<'a, T: FromData> LazyArray16<'a, T> {
         while size > 1 {
             let half = size / 2;
             let mid = base + half;
-            // mid is always in [0, size), that means mid is >= 0 and < size.
-            // mid >= 0: by definition
-            // mid < size: mid = size / 2 + size / 4 + size / 8 ...
             let cmp = f(&self.get(mid)?);
             base = if cmp == Ordering::Greater { base } else { mid };
             size -= half;
         }
 
-        // base is always in [0, size) because base <= mid.
         let value = self.get(base)?;
         if f(&value) == Ordering::Equal {
             Some((base, value))
@@ -419,8 +381,6 @@ impl<'a, T: FromData> Iterator for LazyArrayIter16<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        // Saturating: an array of u16::MAX/u32::MAX elements ends here
-        // instead of overflowing the index (upstream wrapped or panicked).
         let item = self.data.get(self.index);
         self.index = self.index.saturating_add(1);
         item
@@ -432,9 +392,7 @@ impl<'a, T: FromData> Iterator for LazyArrayIter16<'a, T> {
     }
 }
 
-/// A slice-like container that converts internal binary data only on access.
-///
-/// This is a low-level, internal structure that should not be used directly.
+/// A slice-like container that parses fixed-size binary elements on `u32` index access.
 #[derive(Clone, Copy)]
 pub struct LazyArray32<'a, T> {
     data: &'a [u8],
@@ -500,8 +458,6 @@ impl<'a, T: FromData> LazyArray32<'a, T> {
     where
         F: FnMut(&T) -> core::cmp::Ordering,
     {
-        // Based on Rust std implementation.
-
         use core::cmp::Ordering;
 
         let mut size = self.len();
@@ -513,15 +469,11 @@ impl<'a, T: FromData> LazyArray32<'a, T> {
         while size > 1 {
             let half = size / 2;
             let mid = base + half;
-            // mid is always in [0, size), that means mid is >= 0 and < size.
-            // mid >= 0: by definition
-            // mid < size: mid = size / 2 + size / 4 + size / 8 ...
             let cmp = f(&self.get(mid)?);
             base = if cmp == Ordering::Greater { base } else { mid };
             size -= half;
         }
 
-        // base is always in [0, size) because base <= mid.
         let value = self.get(base)?;
         if f(&value) == Ordering::Equal {
             Some((base, value))
@@ -563,8 +515,6 @@ impl<'a, T: FromData> Iterator for LazyArrayIter32<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        // Saturating: an array of u16::MAX/u32::MAX elements ends here
-        // instead of overflowing the index (upstream wrapped or panicked).
         let item = self.data.get(self.index);
         self.index = self.index.saturating_add(1);
         item
@@ -576,15 +526,10 @@ impl<'a, T: FromData> Iterator for LazyArrayIter32<'a, T> {
     }
 }
 
-/// A [`LazyArray16`]-like container, but data is accessed by offsets.
-///
-/// Unlike [`LazyArray16`], internal storage is not continuous.
-///
-/// Multiple offsets can point to the same data.
+/// A [`LazyArray16`]-like container accessed via `Offset16` entries.
 #[derive(Clone, Copy)]
 pub struct LazyOffsetArray16<'a, T: FromSlice<'a>> {
     data: &'a [u8],
-    // Zero offsets must be ignored, therefore we're using `Option<Offset16>`.
     offsets: LazyArray16<'a, Option<Offset16>>,
     data_type: core::marker::PhantomData<T>,
 }
@@ -670,7 +615,6 @@ impl<'a, T: FromSlice<'a>> Iterator for LazyOffsetArrayIter16<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.index < self.array.len() {
             let item = self.array.get(self.index);
-            // `index < len <= u16::MAX`: the increment cannot overflow.
             self.index += 1;
             item
         } else {
@@ -698,9 +642,7 @@ impl<'a> Stream<'a> {
         Stream { data, offset: 0 }
     }
 
-    /// Creates a new `Stream` parser at offset.
-    ///
-    /// Returns `None` when `offset` is out of bounds.
+    /// Creates a new `Stream` parser at `offset`, or `None` if out of bounds.
     #[inline]
     pub const fn new_at(data: &'a [u8], offset: usize) -> Option<Self> {
         if offset <= data.len() {
@@ -717,8 +659,6 @@ impl<'a> Stream<'a> {
     }
 
     /// Jumps to the end of the stream.
-    ///
-    /// Useful to indicate that we parsed all the data.
     #[inline]
     pub const fn jump_to_end(&mut self) {
         self.offset = self.data.len();
@@ -730,28 +670,21 @@ impl<'a> Stream<'a> {
         self.offset
     }
 
-    /// Returns the trailing data.
-    ///
-    /// Returns `None` when `Stream` is reached the end.
+    /// Returns the trailing data, or `None` past the end of the data.
     #[inline]
     pub fn tail(&self) -> Option<&'a [u8]> {
         self.data.get(self.offset..)
     }
 
-    /// Advances by `FromData::SIZE`.
-    ///
-    /// Doesn't check bounds.
+    /// Advances by `FromData::SIZE` without checking bounds.
     #[inline]
     pub const fn skip<T: FromData>(&mut self) {
         self.advance(T::SIZE);
     }
 
-    /// Advances by the specified `len`.
-    ///
-    /// Doesn't check bounds.
+    /// Advances by `len` without checking bounds.
     #[inline]
     pub const fn advance(&mut self, len: usize) {
-        // Saturating: past the end every read fails, as it would at end + len.
         self.offset = self.offset.saturating_add(len);
     }
 
@@ -769,10 +702,7 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// Parses the type from the steam.
-    ///
-    /// Returns `None` when there is not enough data left in the stream
-    /// or the type parsing failed.
+    /// Parses `T` from the stream.
     #[inline]
     pub fn read<T: FromData>(&mut self) -> Option<T> {
         self.read_bytes(T::SIZE).and_then(T::parse)
@@ -924,12 +854,7 @@ impl FromData for Option<Offset32> {
     }
 }
 
-/// `val` clamped to `min..=max`: upstream's `max(min, min(max, val))`,
-/// spelled as comparisons. The bound is stated as a contract in the
-/// `cfg_attr` form the stock cross-cell builds parse; prover 321aaeda7 does
-/// not lower that form, so the `ensures` (and this `requires`) count as
-/// unknown, and only the `requires` at the call site (`lib.rs`,
-/// `NormalizedCoordinate::from`) is proved.
+/// Clamps `val` to `min..=max`.
 #[inline]
 #[cfg_attr(trust_verify, trust::requires(min <= max))]
 #[cfg_attr(trust_verify, trust::ensures(min <= result && result <= max))]
@@ -940,9 +865,7 @@ pub const fn i16_bound(min: i16, val: i16, max: i16) -> i16 {
 
 #[inline]
 pub const fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
-    // Upstream debug-asserted finite inputs; a caller's NaN or infinity is
-    // input like any other here. NaN compares false both ways and passes
-    // through, and every caller maps it to a finite value.
+    // NaN compares false both ways and passes through.
     if val > max {
         return max;
     } else if val < min {

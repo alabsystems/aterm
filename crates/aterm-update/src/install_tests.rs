@@ -404,7 +404,9 @@ fn incoming_stage(s: &Staging, build: u64, commit: &str) -> PathBuf {
     incoming
 }
 
-/// A STAGE WITHDRAWN WHILE IT DOWNLOADED IS NEVER PUBLISHED.
+/// A STAGE WITHDRAWN WHILE IT DOWNLOADED IS NEVER PUBLISHED. The publish shares the
+/// revert's and the retirement's apply lock and re-reads, under it, what a sibling
+/// may have recorded meanwhile.
 #[test]
 fn a_stage_withdrawn_while_it_downloaded_is_never_published() {
     let commit = "0123456789abcdef0123456789abcdef01234567";
@@ -527,7 +529,12 @@ fn publish_confirmed_stage(
     ready
 }
 
-/// A COLD LAUNCH DOES NOT SWAP IN A STAGE NO CHECK HAS CONFIRMED FOR A DAY.
+/// A COLD LAUNCH DOES NOT SWAP IN A STAGE NO CHECK HAS CONFIRMED FOR A DAY. Build
+/// 20, signed by machine m11, was staged and confirmed
+/// against roster generation 9 two days ago; the app was quit before the
+/// in-session lane applied it, and the owner may since have revoked m11 in a
+/// release no check on this Mac has read (gate 4c reads only revocations a check
+/// has seen, and the floor here has seen none).
 #[test]
 fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
     let (s, root) = temp_staging();
@@ -1035,7 +1042,10 @@ fn read_ready_classifies_all_states() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// THE SHARED STAGE'S STATE IS A MOMENT, NOT A VERDICT ON THE BUILD.
+/// THE SHARED STAGE'S STATE IS A MOMENT, NOT A VERDICT ON THE BUILD. A sibling
+/// aterm that landed the same update first retires `ready.toml`; one that published a newer stage
+/// mid-attempt replaces it; a read the kernel refused for a moment (`EMFILE`
+/// in a Dock-launched window) reads as an unreadable marker.
 #[test]
 fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {
     let (s, root) = temp_staging();
@@ -1610,7 +1620,9 @@ fn expected_handoff_authority_is_exact_build_commit_and_digest() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A QUARANTINE RECORD THAT COULD NOT BE READ ADMITS NOTHING.
+/// A QUARANTINE RECORD THAT COULD NOT BE READ ADMITS NOTHING. Build 20 crash-looped
+/// here and was quarantined; another build's stage failure then replaced
+/// `failed.toml`, so `quarantine.toml` alone names it.
 #[test]
 fn a_quarantine_record_that_could_not_be_read_admits_no_stage() {
     use std::os::unix::fs::PermissionsExt;
@@ -2826,7 +2838,10 @@ fn a_trial_armed_below_the_running_build_is_retired_not_kept_forever() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A trial belongs to the install it swapped.
+/// A trial belongs to the install it swapped. A same-build process launched from
+/// another bundle (`~/Applications/aterm.app` beside `/Applications/aterm.app`)
+/// must not count launches against it, confirm it, or disarm it as dead
+/// authority.
 #[test]
 fn a_trial_is_owned_by_the_install_it_swapped_and_no_sibling_bundle() {
     let (s, root) = temp_staging();
@@ -2929,7 +2944,9 @@ fn a_present_owners_trial_survives_a_siblings_budget_until_the_owner_is_long_idl
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A live trial belonging to another installation is never disarmed.
+/// A live trial belonging to another installation is never disarmed. The staging
+/// root is per user, so another copy shares this sentinel, and disarming its
+/// trial would strip crash-loop protection from the build that is crash-looping.
 #[test]
 fn a_foreign_trial_whose_owner_is_still_launching_is_never_disarmed() {
     let (s, root) = temp_staging();
@@ -3678,7 +3695,15 @@ fn zip_claim_reads_every_directory_a_publisher_could_write() {
     }
 }
 
-/// What the claim refuses, each for its own reason.
+/// What the claim refuses, each for its own reason. These build central directories
+/// by hand, since the shapes that matter are ones a real archiver will not produce:
+/// a size past the cap (`u32::MAX - 1`, the largest a classic entry states without
+/// the ZIP64 escape) and a count past it (zero bytes each: the inode cost bytes
+/// cannot see); a directory cut mid-header (a truncated upload) or one whose walk
+/// disagrees with its trailer; a saturated ZIP64 sentinel with no locator behind it,
+/// or an entry escaping to ZIP64 with no extra field (unresolved, not a literal
+/// ~4 GiB); two trailers that both run exactly to EOF (the bound might be measured
+/// off a record `ditto` does not follow); and a file with no end record at all.
 #[test]
 fn zip_claim_refuses_every_directory_it_cannot_bound() {
     let over = usize::try_from(MAX_EXTRACT_ENTRIES).unwrap() + 1;

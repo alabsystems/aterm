@@ -317,7 +317,7 @@ impl Reading {
 
     /// Whether it carries a figure.
     #[must_use]
-    pub fn has_figures(&self) -> bool {
+    pub const fn has_figures(&self) -> bool {
         self.five_hour.is_some() || self.seven_day.is_some()
     }
 
@@ -846,7 +846,7 @@ impl Silence {
 
     /// Whether the process is marked silent.
     #[must_use]
-    pub fn silent(&self) -> bool {
+    pub const fn silent(&self) -> bool {
         self.silent
     }
 }

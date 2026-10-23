@@ -5,8 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Font Variations Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/fvar) implementation.
+//! A [Font Variations Table](https://docs.microsoft.com/en-us/typography/opentype/spec/fvar).
 
 use core::num::NonZeroU16;
 
@@ -53,9 +52,6 @@ impl FromData for VariationAxis {
 impl VariationAxis {
     /// Returns a normalized variation coordinate for this axis.
     pub(crate) fn normalized_value(&self, mut v: f32) -> NormalizedCoordinate {
-        // Based on
-        // https://docs.microsoft.com/en-us/typography/opentype/spec/avar#overview
-
         v = f32_bound(self.min_value, v, self.max_value);
         if v == self.def_value {
             v = 0.0;
@@ -69,8 +65,7 @@ impl VariationAxis {
     }
 }
 
-/// A [Font Variations Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/fvar).
+/// A [Font Variations Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/fvar).
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of variation axes.
@@ -90,9 +85,6 @@ impl<'a> Table<'a> {
         s.skip::<u16>(); // reserved
         let axis_count = s.read::<u16>()?;
 
-        // 'If axisCount is zero, then the font is not functional as a variable font,
-        // and must be treated as a non-variable font;
-        // any variation-specific tables or data is ignored.'
         let axis_count = NonZeroU16::new(axis_count)?;
 
         let mut s = Stream::new_at(data, axes_array_offset.to_usize())?;

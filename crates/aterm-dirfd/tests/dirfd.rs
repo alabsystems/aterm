@@ -646,7 +646,9 @@ fn reading_a_directory_leaves_the_callers_descriptor_usable() {
     );
 }
 
-/// THE property.
+/// THE property. A retained directory descriptor keeps addressing the inode it
+/// was opened on, even after the pathname it came from has been repointed at a
+/// different directory.
 #[test]
 fn a_retained_descriptor_never_follows_a_swapped_pathname() {
     let base = aterm_tempfile::tempdir().unwrap();

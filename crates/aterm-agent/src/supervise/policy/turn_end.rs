@@ -585,7 +585,7 @@ enum Reads {
 }
 
 impl Reads {
-    fn common(self) -> bool {
+    const fn common(self) -> bool {
         matches!(
             self,
             Self::End
@@ -3768,7 +3768,7 @@ struct Stand<'f> {
 }
 
 impl Stand<'_> {
-    fn end(&self) -> usize {
+    const fn end(&self) -> usize {
         self.at + self.len
     }
 
@@ -8182,21 +8182,21 @@ pub(super) fn sign_in_how(program: Program, message: &str) -> String {
     }
 }
 
-fn how_leads(program: Program) -> bool {
+const fn how_leads(program: Program) -> bool {
     match program {
         Program::Gemini => true,
         Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
     }
 }
 
-fn login_command(program: Program) -> Option<&'static str> {
+const fn login_command(program: Program) -> Option<&'static str> {
     match program {
         Program::Claude => Some("/login"),
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => None,
     }
 }
 
-fn compact_command(program: Program) -> Option<&'static str> {
+const fn compact_command(program: Program) -> Option<&'static str> {
     match program {
         Program::Claude | Program::Muse => Some("/compact"),
         Program::Codex | Program::Agy | Program::Gemini | Program::Generic => None,
@@ -8373,7 +8373,7 @@ impl ProbeGate {
 
     /// The word the journal's `SKIPPED … gate=<word>` line carries.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             ProbeGate::NotDue => "not-due",
             ProbeGate::NotIdle => "not-idle",
@@ -8481,7 +8481,7 @@ impl Unmade {
 impl Restart {
     /// The one word the journal names it by (`restart:<word>`).
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             Restart::Memory => "memory",
             Restart::Model { .. } => "model",
@@ -8641,7 +8641,7 @@ pub enum AccountPoint {
 impl AccountPoint {
     /// Whether the session stands at a wall here, not at a plain turn end.
     #[must_use]
-    pub fn at_wall(self) -> bool {
+    pub const fn at_wall(self) -> bool {
         !matches!(self, AccountPoint::TurnEnd)
     }
 }
@@ -9346,7 +9346,7 @@ impl TurnEndTiming {
     }
 }
 
-fn auto_continues(program: Program) -> bool {
+const fn auto_continues(program: Program) -> bool {
     match program {
         Program::Claude => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
@@ -9423,7 +9423,7 @@ pub enum Composer {
 impl Composer {
     /// Whether text stands in the composer: a draft, or aterm's own words.
     #[must_use]
-    pub fn drafted(&self) -> bool {
+    pub const fn drafted(&self) -> bool {
         matches!(self, Composer::Typed | Composer::Own | Composer::Diverted)
     }
 }
@@ -9495,7 +9495,7 @@ impl Conversation {
         }
     }
 
-    pub(crate) fn unread(host: bool, program: Program) -> Self {
+    pub(crate) const fn unread(host: bool, program: Program) -> Self {
         if host && !screen_alone(program) {
             Self::Unknown
         } else {
@@ -9505,7 +9505,7 @@ impl Conversation {
 }
 
 #[must_use]
-pub(crate) fn reads_conversation(program: Program) -> bool {
+pub(crate) const fn reads_conversation(program: Program) -> bool {
     match program {
         Program::Claude => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
@@ -9513,7 +9513,7 @@ pub(crate) fn reads_conversation(program: Program) -> bool {
 }
 
 #[must_use]
-pub(crate) fn screen_alone(program: Program) -> bool {
+pub(crate) const fn screen_alone(program: Program) -> bool {
     match program {
         Program::Agy | Program::Muse | Program::Gemini => true,
         Program::Claude | Program::Codex | Program::Generic => false,
@@ -9601,7 +9601,7 @@ impl Seat {
 /// limit reached for <model>.`, its quota per model) and agy's (`You have
 /// exhausted your quota on this model.`, its 429's `QuotaFailure` per
 /// model). Muse Code's is its account's.
-fn limit_per_model(program: Program) -> bool {
+const fn limit_per_model(program: Program) -> bool {
     match program {
         Program::Gemini | Program::Agy => true,
         Program::Claude | Program::Codex | Program::Muse | Program::Generic => false,
@@ -9738,7 +9738,7 @@ impl TurnEndReading {
 
     /// THE SCREEN SHOWS A STANDING WALL.
     #[must_use]
-    pub fn wall_drawn(&self) -> bool {
+    pub const fn wall_drawn(&self) -> bool {
         self.wall.is_some() && !(self.wall_remembered && self.since_limit.is_none())
     }
 
@@ -9982,7 +9982,7 @@ impl TurnEndReading {
         }
     }
 
-    fn at_point(&self, stale_input: bool) -> bool {
+    const fn at_point(&self, stale_input: bool) -> bool {
         matches!(
             self.phase,
             Phase::Idle | Phase::Question | Phase::Limited { .. }
@@ -9992,7 +9992,7 @@ impl TurnEndReading {
             && (!self.pending_input || stale_input)
     }
 
-    fn answered_point(&self) -> bool {
+    const fn answered_point(&self) -> bool {
         matches!(self.phase, Phase::Idle | Phase::Question)
             && self.authoritative
             && !self.survey
@@ -10086,7 +10086,7 @@ pub enum TurnEndAction {
 impl TurnEndAction {
     /// The rule an act is taken under (`None` for no act).
     #[must_use]
-    pub fn rule_id(&self) -> Option<&'static str> {
+    pub const fn rule_id(&self) -> Option<&'static str> {
         match self {
             TurnEndAction::Type { rule_id, .. }
             | TurnEndAction::Accept { rule_id, .. }
@@ -10109,7 +10109,7 @@ enum WallClass {
     Memory,
 }
 
-fn class_of(kind: WallKind) -> WallClass {
+const fn class_of(kind: WallKind) -> WallClass {
     match kind {
         WallKind::Overloaded | WallKind::ApiError { .. } => WallClass::Retry,
         WallKind::UsageSession | WallKind::UsageWeekly | WallKind::Spend => WallClass::Usage,
@@ -10120,7 +10120,7 @@ fn class_of(kind: WallKind) -> WallClass {
     }
 }
 
-fn named_class(class: WallClass) -> bool {
+const fn named_class(class: WallClass) -> bool {
     matches!(class, WallClass::Usage | WallClass::Model)
 }
 
@@ -10307,7 +10307,7 @@ pub fn ended_under(
     since.is_some_and(|s| s.served || s.fired) && notice_of(since, kind, said)
 }
 
-fn work_is_its_cause(kind: WallKind) -> bool {
+const fn work_is_its_cause(kind: WallKind) -> bool {
     matches!(
         kind,
         WallKind::ApiError {
@@ -10848,7 +10848,7 @@ impl TurnEndState {
     }
 
     /// THE CARRY THE SEEDED ACTS GAVE IS OVER (`crate::supervise::approvals::carry_ended_in`).
-    pub fn seed_carry_over(&mut self) {
+    pub const fn seed_carry_over(&mut self) {
         self.carrying = false;
     }
 
@@ -11131,7 +11131,7 @@ impl TurnEndState {
     }
 
     /// THE DONE CHECK A LOOP BEFORE THIS ONE ASKED IS OWED ITS ANSWER ([`crate::supervise::approvals::done_check_owed`]).
-    pub fn seed_done_check(&mut self, rule: &'static str, cut: bool, answered: bool) {
+    pub const fn seed_done_check(&mut self, rule: &'static str, cut: bool, answered: bool) {
         self.seeded_check = Some(rule);
         if cut {
             self.cut_check = true;
@@ -11142,7 +11142,7 @@ impl TurnEndState {
     }
 
     /// THE DONE CHECK A FULL CONTEXT CUT.
-    pub fn seed_compact_check(&mut self, rule: &'static str) {
+    pub const fn seed_compact_check(&mut self, rule: &'static str) {
         self.seeded_check = Some(rule);
         self.compact_owes = Some(CompactOwes {
             check: true,
@@ -11152,17 +11152,17 @@ impl TurnEndState {
     }
 
     /// THE CHECK WHOSE ANSWER THE POINT A LOOP BEFORE THIS ONE JUDGED LAST WAS.
-    pub fn seed_check_point(&mut self, rule: &'static str) {
+    pub const fn seed_check_point(&mut self, rule: &'static str) {
         self.check_point_seed = Some(rule);
     }
 
     /// THE LAND ACT A LOOP BEFORE THIS ONE TYPED.
-    pub fn seed_land_owed(&mut self, rule: &'static str) {
+    pub const fn seed_land_owed(&mut self, rule: &'static str) {
         self.seeded_land = Some(rule);
     }
 
     /// THE LAND ACT A FULL CONTEXT CUT.
-    pub fn seed_compact_land(&mut self) {
+    pub const fn seed_compact_land(&mut self) {
         self.compact_owes = Some(CompactOwes {
             check: false,
             land: true,
@@ -11171,7 +11171,7 @@ impl TurnEndState {
     }
 
     /// THE LAND ACT WHOSE ANSWER THE POINT A LOOP BEFORE THIS ONE JUDGED LAST WAS.
-    pub fn seed_land_point(&mut self) {
+    pub const fn seed_land_point(&mut self) {
         self.land_point_seed = true;
     }
 
@@ -11201,7 +11201,7 @@ impl TurnEndState {
     }
 
     /// THE LIMIT'S TRY A LOOP BEFORE THIS ONE TYPED LAST WAS TAKEN.
-    pub fn seed_try_taken(&mut self) {
+    pub const fn seed_try_taken(&mut self) {
         self.gap = true;
     }
 
@@ -11209,7 +11209,7 @@ impl TurnEndState {
         std::mem::take(&mut self.gap) && self.awaiting.is_none()
     }
 
-    pub(crate) fn launched_since_books(&mut self) {
+    pub(crate) const fn launched_since_books(&mut self) {
         self.gap = false;
         self.ran_turn_seed = None;
     }
@@ -11264,7 +11264,7 @@ impl TurnEndState {
 
     /// A LAND ACT A LOOP BEFORE THIS ONE TYPED IS OWED ITS ANSWER at this state's first point ([`Self::seed_land_act`]).
     #[must_use]
-    pub fn land_act_seeded(&self) -> bool {
+    pub const fn land_act_seeded(&self) -> bool {
         self.landing && self.landing_act.is_some() && self.point_at.is_none()
     }
 
@@ -11292,7 +11292,7 @@ impl TurnEndState {
     }
 
     /// Seed the consecutive short-turn streak recorded by a previous loop.
-    pub fn seed_short(&mut self, short: u32) {
+    pub const fn seed_short(&mut self, short: u32) {
         self.short = short;
         self.point_last = false;
     }
@@ -11304,13 +11304,13 @@ impl TurnEndState {
     }
 
     /// A PERSON'S ESC STOOD AT THE POINT SEEDED ([`Self::seed_point`]), as its record says (`approvals::StreakSeed::esc`).
-    pub fn seed_esc(&mut self) {
+    pub const fn seed_esc(&mut self) {
         self.esc_seed = true;
     }
 
     /// Whether a person's Esc stands at the point now ([`Self::esc_at`]).
     #[must_use]
-    pub fn persons_esc_stands(&self) -> bool {
+    pub const fn persons_esc_stands(&self) -> bool {
         self.esc_at.is_some()
     }
 
@@ -11338,7 +11338,7 @@ impl TurnEndState {
     }
 
     #[must_use]
-    pub(crate) fn left_judged(&self) -> bool {
+    pub(crate) const fn left_judged(&self) -> bool {
         self.left_judged
     }
 
@@ -11640,13 +11640,13 @@ impl TurnEndState {
 
     /// Short turns in a row.
     #[must_use]
-    pub fn short_streak(&self) -> u32 {
+    pub const fn short_streak(&self) -> u32 {
         self.short
     }
 
     /// Where the task stands.
     #[must_use]
-    pub fn done_reports(&self) -> u8 {
+    pub const fn done_reports(&self) -> u8 {
         self.done
     }
 
@@ -11664,7 +11664,7 @@ impl TurnEndState {
 
     /// THE TASK IS DONE.
     #[must_use]
-    pub fn task_done(&self) -> bool {
+    pub const fn task_done(&self) -> bool {
         self.done >= 2
     }
 
@@ -11703,7 +11703,7 @@ impl TurnEndState {
 
     /// `/login`'s success state was answered with its Enter and has not left since.
     #[must_use]
-    pub fn login_confirmed(&self) -> bool {
+    pub const fn login_confirmed(&self) -> bool {
         self.login_confirmed
     }
 
@@ -11715,7 +11715,7 @@ impl TurnEndState {
 
     /// What the session's repository held that no remote main has at the current point's done claim ([`Self::repo`]; `None`: nothing found).
     #[must_use]
-    pub fn repo_owed(&self) -> Option<&crate::harness::repo_work::RepoWork> {
+    pub const fn repo_owed(&self) -> Option<&crate::harness::repo_work::RepoWork> {
         self.repo.as_ref()
     }
 
@@ -11727,7 +11727,7 @@ impl TurnEndState {
 
     /// The key of the needs standing ([`needs::needs_key`]; `0` for none).
     #[must_use]
-    pub fn needs_key(&self) -> u64 {
+    pub const fn needs_key(&self) -> u64 {
         self.needs.key
     }
 
@@ -11746,13 +11746,13 @@ impl TurnEndState {
 
     /// The task was landed.
     #[must_use]
-    pub fn landed(&self) -> bool {
+    pub const fn landed(&self) -> bool {
         self.task_done() && self.landed
     }
 
     /// The Land episode in hand has had its instruction ([`LAND`]) typed, and how many nudges ([`LAND_NUDGE`]) since.
     #[must_use]
-    pub fn land_episode(&self) -> (bool, u32) {
+    pub const fn land_episode(&self) -> (bool, u32) {
         (self.land.typed, self.land.nudges)
     }
 
@@ -11787,7 +11787,7 @@ impl TurnEndState {
     }
 
     /// THE LOOP ENDS (`Session::tell_hold_ended`).
-    pub fn held_ended(&mut self) -> bool {
+    pub const fn held_ended(&mut self) -> bool {
         matches!(self.held_told.replace(None), Some(Some(_)))
     }
 
@@ -11800,13 +11800,13 @@ impl TurnEndState {
     }
 
     /// …AND WHERE THAT EPISODE'S HOLD BEGAN.
-    pub fn seed_land_hold(&mut self, hold: HoldStart) {
+    pub const fn seed_land_hold(&mut self, hold: HoldStart) {
         if self.land.typed {
             self.land.hold = hold;
         }
     }
 
-    fn hold_landed(&mut self) {
+    const fn hold_landed(&mut self) {
         self.land.hold = HoldStart::LANDED;
         self.land.unstamped = false;
         self.land.legs = None;
@@ -11843,14 +11843,14 @@ impl TurnEndState {
     }
 
     /// THE LANDING A LOOP BEFORE THIS ONE LANDED (the Autopilot design's §9.4.5).
-    pub fn seed_landed(&mut self, words: Option<u64>) {
+    pub const fn seed_landed(&mut self, words: Option<u64>) {
         self.landed_seed = Some(true);
         self.landed_words = words;
         self.seed_by_wake = false;
     }
 
     /// THE SEEDED LANDING ([`Self::seed_landed`]) WAS KEPT THROUGH THE TASK'S OWN WAKE by the loop before this one.
-    pub fn seed_landed_by_wake(&mut self) {
+    pub const fn seed_landed_by_wake(&mut self) {
         if self.landed_seed.is_some() {
             self.seed_by_wake = true;
         }
@@ -11858,7 +11858,7 @@ impl TurnEndState {
 
     /// The landing this state holds was kept through the task's own wake ([`Self::seed_landed_by_wake`]).
     #[must_use]
-    pub fn landed_by_wake(&self) -> bool {
+    pub const fn landed_by_wake(&self) -> bool {
         self.landed && self.by_wake
     }
 
@@ -11879,12 +11879,12 @@ impl TurnEndState {
 
     /// A landing seeded from a loop before this one is armed, not yet taken up or dropped ([`Self::seed_landed`]).
     #[must_use]
-    pub fn landed_seed_armed(&self) -> bool {
+    pub const fn landed_seed_armed(&self) -> bool {
         self.landed_seed.is_some()
     }
 
     /// THE TIME THE SEEDED LANDING WAS NOTED (§10.2.7).
-    pub fn seed_noted_at(&mut self, noted_ms: i64) {
+    pub const fn seed_noted_at(&mut self, noted_ms: i64) {
         self.seed_noted_ms = Some(noted_ms);
     }
 
@@ -11917,7 +11917,7 @@ impl TurnEndState {
 
     /// A live turn of someone else's has been read since the last point ([`Self::other_turn`]).
     #[must_use]
-    pub fn other_turn(&self) -> bool {
+    pub const fn other_turn(&self) -> bool {
         self.other_turn
     }
 
@@ -11946,13 +11946,13 @@ impl TurnEndState {
 
     /// The task is done because the turn was a person's own exchange.
     #[must_use]
-    pub fn left_to_person(&self) -> bool {
+    pub const fn left_to_person(&self) -> bool {
         self.task_done() && self.exchange
     }
 
     /// The act the point last judged followed.
     #[must_use]
-    pub fn followed(&self) -> Option<&'static str> {
+    pub const fn followed(&self) -> Option<&'static str> {
         self.followed
     }
 
@@ -11964,18 +11964,18 @@ impl TurnEndState {
 
     /// WHEN THE DONE STANDING NOW WAS DECIDED, on the loop's clock.
     #[must_use]
-    pub fn done_shown(&self) -> Option<Instant> {
+    pub const fn done_shown(&self) -> Option<Instant> {
         self.done_at
     }
 
     /// A MANAGER WAITS ON THIS SESSION (`managed`).
-    pub fn set_managed(&mut self, managed: bool) {
+    pub const fn set_managed(&mut self, managed: bool) {
         self.managed = managed;
     }
 
     /// Whether a manager waits on this session ([`Self::set_managed`]).
     #[must_use]
-    pub fn managed(&self) -> bool {
+    pub const fn managed(&self) -> bool {
         self.managed
     }
 
@@ -12006,19 +12006,19 @@ impl TurnEndState {
 
     /// WHETHER A LANDING THE TASK RECORD NAMES CAN STAND AT THE POINT JUDGED LAST (`supervise::task_mark`'s seed, before [`Self::seed_task_done`]).
     #[must_use]
-    pub fn record_landing_holds(&self) -> bool {
+    pub const fn record_landing_holds(&self) -> bool {
         self.point_clean
     }
 
     /// The work of the person's exchange in all so far.
     #[must_use]
-    pub fn exchange_work(&self) -> Duration {
+    pub const fn exchange_work(&self) -> Duration {
         self.exchange_work
     }
 
     /// A PERSON'S OWN EXCHANGE STANDS AT A WALL.
     #[must_use]
-    pub fn exchange_at_wall(&self) -> bool {
+    pub const fn exchange_at_wall(&self) -> bool {
         self.exchange && self.wall.is_some() && !self.task_done()
     }
 
@@ -12059,7 +12059,7 @@ impl TurnEndState {
 
     /// The account move's answer waits on the act awaited.
     #[must_use]
-    pub fn account_answer_awaited(&self, reading: &TurnEndReading) -> bool {
+    pub const fn account_answer_awaited(&self, reading: &TurnEndReading) -> bool {
         self.account.is_some()
             && !self.account_told
             && self.awaiting.is_some()
@@ -12087,7 +12087,7 @@ impl TurnEndState {
     /// take it ([`Self::took`]), which holds the next break ([`Self::act_untaken`]) and reads
     /// that turn as the harness's ([`Self::typed_untaken`]). The land, check, compact, open,
     /// repo and account state that [`Self::host_typed`] resets are the task's, and stand.
-    pub fn fact_typed(&mut self) {
+    pub const fn fact_typed(&mut self) {
         self.keyed_by_harness();
         self.fact = Some(FactAwaited { taken: false });
     }
@@ -12213,7 +12213,7 @@ impl TurnEndState {
 
     /// A LANDED TASK'S OWN WAKE IS READ AT ITS START ([`Self::took_quiet`]) and THIS STATE SAW THE POINT IT BEGAN AFTER.
     #[must_use]
-    pub fn wake_start_owed(&self) -> bool {
+    pub const fn wake_start_owed(&self) -> bool {
         self.quiet_wake && self.point_at.is_some() && self.wake_repo.is_none()
     }
 
@@ -12258,7 +12258,7 @@ impl TurnEndState {
         }
     }
 
-    fn new_point(&mut self, now: Instant) {
+    const fn new_point(&mut self, now: Instant) {
         self.point_at = Some(now);
         self.points = self.points.saturating_add(1);
     }
@@ -12369,7 +12369,7 @@ impl TurnEndState {
 
     /// The model switch in force, if any.
     #[must_use]
-    pub fn model_switch(&self) -> Option<&ModelSwitch> {
+    pub const fn model_switch(&self) -> Option<&ModelSwitch> {
         self.model.as_ref()
     }
 
@@ -12381,13 +12381,13 @@ impl TurnEndState {
 
     /// THE LIMIT'S TRY the act [`Self::acted`] last recorded was, if it was one ([`LimitTry`]).
     #[must_use]
-    pub fn limit_try(&self) -> Option<LimitTry> {
+    pub const fn limit_try(&self) -> Option<LimitTry> {
         self.limit_try
     }
 
     /// A LIMIT'S TRACK ENDED at the last fold ([`Self::observe`]), by no act of this policy's.
     #[must_use]
-    pub fn limit_ended(&self) -> bool {
+    pub const fn limit_ended(&self) -> bool {
         self.limit_ended
     }
 
@@ -12399,7 +12399,7 @@ impl TurnEndState {
     /// ([`crate::supervise::approvals::LIMIT_ENDED_ELSEWHERE`]) — the work-or-wall
     /// words it shared before named neither.
     #[must_use]
-    pub fn limit_ended_elsewhere(&self) -> bool {
+    pub const fn limit_ended_elsewhere(&self) -> bool {
         self.limit_ended && self.limit_ended_elsewhere
     }
 
@@ -12471,25 +12471,25 @@ impl TurnEndState {
 
     /// Whether the fallback relaunch for the bucket being worked was refused for good ([`Self::restarted`] with `made` false).
     #[must_use]
-    pub fn fallback_refused(&self) -> bool {
+    pub const fn fallback_refused(&self) -> bool {
         self.fallback_unmade
     }
 
     /// The account move made and not answered yet, if any.
     #[must_use]
-    pub fn account_move(&self) -> Option<&AccountMove> {
+    pub const fn account_move(&self) -> Option<&AccountMove> {
         self.account.as_ref()
     }
 
     /// Whether an account move asked for at the wall being worked could not be made ([`Self::restarted`] with `made` false).
     #[must_use]
-    pub fn account_refused(&self) -> bool {
+    pub const fn account_refused(&self) -> bool {
         self.account_unmade.is_some()
     }
 
     /// What the host's word for that move says of asking it again ([`Unmade`]; [`Self::restart_unmade`]).
     #[must_use]
-    pub fn account_refusal(&self) -> Option<Unmade> {
+    pub const fn account_refusal(&self) -> Option<Unmade> {
         self.account_unmade
     }
 
@@ -12503,7 +12503,7 @@ impl TurnEndState {
 
     /// Whether the wall's resume is owed after a move this session's host made at a wall ([`Self::account_resume`]).
     #[must_use]
-    pub fn account_resume_owed(&self) -> bool {
+    pub const fn account_resume_owed(&self) -> bool {
         self.account_resume
     }
 
@@ -12585,7 +12585,7 @@ impl TurnEndState {
             && !self.account_told
     }
 
-    fn login_drew(&self, reading: &TurnEndReading) -> bool {
+    const fn login_drew(&self, reading: &TurnEndReading) -> bool {
         self.wall.is_some()
             && reading.worked.is_some()
             && (reading.login_screen.is_some() || reading.login_interrupted || reading.login_back)
@@ -12630,36 +12630,36 @@ impl TurnEndState {
     }
 
     /// THE FALLBACK'S RELAUNCH WAS MADE at `unix` (seconds), told by the loop after [`Self::restarted`] made it.
-    pub fn fallback_made_at(&mut self, unix: i64) {
+    pub const fn fallback_made_at(&mut self, unix: i64) {
         self.fallback_unix = Some(unix);
         self.fallback_started = None;
     }
 
     /// WHEN THE TRANSCRIPT'S NOTICE WAS WRITTEN, at this decision's read, told by the loop (`supervise/wall_confirm.rs`).
-    pub fn notice_written_at(&mut self, unix: Option<i64>) {
+    pub const fn notice_written_at(&mut self, unix: Option<i64>) {
         self.notice_unix = unix;
     }
 
     /// When the transcript's notice the last decision read was written.
     #[must_use]
-    pub fn notice_written(&self) -> Option<i64> {
+    pub const fn notice_written(&self) -> Option<i64> {
         self.notice_unix
     }
 
     /// THE FALLBACK'S RELAUNCH WAS MADE AND NO TURN ASKED since ([`Self::bucket_left`]'s latch).
     #[must_use]
-    pub fn fallback_unasked(&self) -> bool {
+    pub const fn fallback_unasked(&self) -> bool {
         self.fallback_unasked
     }
 
     /// Seed a fallback relaunch from a previous loop where no turn has been asked yet.
-    pub fn seed_fallback_unasked(&mut self, made_at: i64) {
+    pub const fn seed_fallback_unasked(&mut self, made_at: i64) {
         self.fallback_unasked = self.model.is_some();
         self.fallback_unix = Some(made_at);
         self.fallback_started = None;
     }
 
-    fn ran_under_move(&self, reading: &TurnEndReading) -> bool {
+    const fn ran_under_move(&self, reading: &TurnEndReading) -> bool {
         self.account.is_some()
             && reading.worked.is_some()
             && !reading.pending_input
@@ -12867,7 +12867,7 @@ impl TurnEndState {
         }
     }
 
-    fn credits_bound(&self) -> Duration {
+    const fn credits_bound(&self) -> Duration {
         self.timing.credits_bound
     }
 
@@ -13847,7 +13847,7 @@ impl TurnEndState {
             .map(|work| work.min(since))
     }
 
-    fn submitted_since(&self, reading: &TurnEndReading) -> Option<bool> {
+    const fn submitted_since(&self, reading: &TurnEndReading) -> Option<bool> {
         match (reading.submits, self.point_submits) {
             (Some(now), Some(then)) if now >= then => Some(now > then),
             _ => None,
@@ -13858,7 +13858,7 @@ impl TurnEndState {
         reading.screen_mark.is_some() && reading.screen_mark != self.point_screen
     }
 
-    fn keyed_by_harness(&mut self) {
+    const fn keyed_by_harness(&mut self) {
         self.point_submits = None;
         self.point_screen = None;
         self.point_tasked = false;
@@ -13866,7 +13866,7 @@ impl TurnEndState {
     }
 
     /// THE COUNT READ AGAIN ONCE THE HARNESS'S OWN KEYS WERE SEEN TO LAND.
-    pub fn counted_after_harness(&mut self, at: Option<(u64, u64)>) {
+    pub const fn counted_after_harness(&mut self, at: Option<(u64, u64)>) {
         if let Some((submits, screen)) = at {
             self.point_submits = Some(submits);
             self.point_screen = Some(screen);
@@ -13879,13 +13879,13 @@ impl TurnEndState {
     }
 
     /// THE HOST'S STEP AT AN IDLE POINT MOVED THE SESSION: its keys are the harness's own.
-    pub fn host_moved(&mut self) {
+    pub const fn host_moved(&mut self) {
         self.keyed_by_harness();
     }
 
     /// A SCREEN READ AS NO TASK YET THAT IS THE CONVERSATION OF THE POINT JUDGED LAST, REDRAWN.
     #[must_use]
-    pub fn redrawn_fresh(&self, submits: Option<u64>, inputs: Option<u64>) -> bool {
+    pub const fn redrawn_fresh(&self, submits: Option<u64>, inputs: Option<u64>) -> bool {
         self.point_tasked
             && matches!((submits, self.point_submits), (Some(now), Some(then)) if now == then)
             && matches!((inputs, self.point_inputs), (Some(now), Some(then)) if now == then)
@@ -15055,7 +15055,7 @@ pub fn is_challenge_text(typed: &str) -> bool {
 
 const OPEN_NAMED: usize = 4;
 
-fn reversible_clause(irreversible: bool) -> &'static str {
+const fn reversible_clause(irreversible: bool) -> &'static str {
     if irreversible {
         DONE_CHECK_REVERSIBLE
     } else {
@@ -15063,7 +15063,7 @@ fn reversible_clause(irreversible: bool) -> &'static str {
     }
 }
 
-fn ack_clause(ack: bool) -> &'static str {
+const fn ack_clause(ack: bool) -> &'static str {
     if ack { NEEDS_ACK } else { "" }
 }
 
@@ -16072,7 +16072,7 @@ fn goes_on_by_itself(
             .is_some_and(|n| state.named_countdown_gone(&n))
 }
 
-pub(crate) fn entitlement_ladder(placed: bool, kind: WallKind) -> bool {
+pub(crate) const fn entitlement_ladder(placed: bool, kind: WallKind) -> bool {
     !placed && matches!(kind, WallKind::Spend | WallKind::ModelBucket { .. })
 }
 
@@ -16301,7 +16301,7 @@ fn limit_conversation_ours(t: &WallTrack, reading: &TurnEndReading) -> bool {
     limit_conversation_known(t, reading) && t.conversation == reading.conversation
 }
 
-fn limit_conversation_known(t: &WallTrack, reading: &TurnEndReading) -> bool {
+const fn limit_conversation_known(t: &WallTrack, reading: &TurnEndReading) -> bool {
     matches!(
         (&t.conversation, &reading.conversation),
         (Conversation::Hostless, Conversation::Hostless)
@@ -16317,7 +16317,7 @@ fn retry_wait(state: &TurnEndState, attempts: usize) -> Option<Duration> {
     crate::supervise::ladder::Ladder(&state.timing.retry_backoff).at(attempts)
 }
 
-fn moves_accounts(program: Program) -> bool {
+const fn moves_accounts(program: Program) -> bool {
     match program {
         Program::Claude => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
@@ -16332,7 +16332,7 @@ fn login_follows(state: &TurnEndState, reading: &TurnEndReading, cfg: &Superviso
     cfg.logins && reading.login_label.is_some() && relaunch_askable(state, reading, cfg)
 }
 
-fn relaunch_askable(
+const fn relaunch_askable(
     state: &TurnEndState,
     reading: &TurnEndReading,
     cfg: &SupervisorConfig,
@@ -16349,12 +16349,12 @@ pub(super) fn relaunch_reaches(reading: &TurnEndReading, cfg: &SupervisorConfig)
     cfg.resume_limits && relaunch_on(reading, cfg) && relaunch_lane(reading)
 }
 
-pub(super) fn relaunch_lane(reading: &TurnEndReading) -> bool {
+pub(super) const fn relaunch_lane(reading: &TurnEndReading) -> bool {
     moves_accounts(reading.program)
         && (reading.restartable || reading.relaunch_off || reading.upgrading)
 }
 
-pub(super) fn relaunch_on(reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {
+pub(super) const fn relaunch_on(reading: &TurnEndReading, cfg: &SupervisorConfig) -> bool {
     cfg.relaunch && !reading.relaunch_off
 }
 

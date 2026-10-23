@@ -337,7 +337,10 @@ impl Terminal {
         SelectionRow { history, continues }
     }
 
-    /// Whether selection-space `row` continues the previous row (a soft wrap).
+    /// Whether selection-space `row` continues the previous row (a soft wrap). The one place
+    /// selection reads the wrap bit: [`Self::push_linear_selection`] (newlines in the copy)
+    /// and [`Self::logical_line_span`] (click reach) must agree, or highlight and clipboard
+    /// describe different text.
     #[allow(
         clippy::redundant_closure_for_method_calls,
         reason = "private row/line types prevent method-reference shorthand"

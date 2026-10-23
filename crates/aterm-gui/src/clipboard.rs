@@ -419,6 +419,9 @@ mod tests {
         }
     }
 
+    /// Unset, the seam leaves every clipboard read and write on the platform;
+    /// set, its file stands in whatever the path — an empty value included,
+    /// which names no file, so a copy fails and a read finds nothing and the
     /// platform clipboard is untouched. PRIMARY rides a sibling file.
     #[test]
     fn the_seam_routes_to_the_system_clipboard_or_its_file() {
@@ -438,6 +441,8 @@ mod tests {
         );
     }
 
+    /// The stand-in file behaves as a clipboard: a missing file is empty, a copy
+    /// overwrites it with the latest text (no temporary left beside it), an empty
     /// copy reads as empty, and a directory that is not there refuses the copy.
     #[test]
     fn the_file_stands_in_for_the_clipboard() {

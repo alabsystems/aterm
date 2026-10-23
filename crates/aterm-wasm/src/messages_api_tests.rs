@@ -471,7 +471,8 @@ fn details_chip(t: &AtermTerminal, row: usize) -> (usize, usize) {
     (c.col, c.width)
 }
 
-/// THE POINTER ON THE WEB (c).
+/// THE POINTER ON THE WEB (c). Without a Details view the links are
+/// withheld: the row body lights nothing and a press there does nothing.
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -1051,7 +1052,11 @@ fn pct_encode_is_the_control_wires() {
     }
 }
 
-/// The band row under frame pixel row `y` is `y.checked_sub(grid_top)?
+/// The band row under frame pixel row `y` is `y.checked_sub(grid_top)? /
+/// cell_h.max(1)` (the expression `band_row` replaced in `cell_under`,
+/// guard first so the verifier proves the subtraction): `None` above the
+/// band, a zero cell height read as one, the same quotient out to
+/// `usize::MAX`.
 #[test]
 fn band_row_is_the_pixel_rows_band_row() {
     assert_eq!(band_row(9, 10, 16), None, "above the band");

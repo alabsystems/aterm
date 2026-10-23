@@ -64,7 +64,9 @@ impl LaunchFlags {
     }
 }
 
-/// The process's launch flags.
+/// The process's launch flags. Written only by [`parse_cli`] (single-threaded
+/// startup, so a diagnostic verb later on the same command line — `--columns 120
+/// --show-config` — reports what the flags before it asked for).
 static LAUNCH_FLAGS: RwLock<LaunchFlags> = RwLock::new(LaunchFlags::NONE);
 
 /// This process's launch flags (a copy; a poisoned lock still yields its value).
@@ -170,7 +172,9 @@ const HELP_HEAD: &str = concat!(
     "    -V, --version                  Print the version and exit.\n\n",
 );
 
-/// The macOS keyboard-shortcut help: the common Cmd-* chords.
+/// The macOS keyboard-shortcut help: the common Cmd-* chords. Other platforms list the
+/// Ctrl+Shift defaults seeded by [`crate::keybinding::Keybindings::platform_defaults`] (no Cmd
+/// key there, and the desktop grabs Super).
 #[cfg(target_os = "macos")]
 const KEYS_HELP: &str = concat!(
     "KEYS (in the window):\n",
@@ -645,7 +649,9 @@ fn answered_onto_an_unwaited_console() -> bool {
     crate::win32::attached_a_console() && std::io::stdout().is_terminal()
 }
 
-/// The one stderr line under such an answer.
+/// The one stderr line under such an answer. Nothing can make the prompt wait (it would not wait
+/// for a child of this process either), so the line names the spelling a prompt does wait for:
+/// `aterm --window` with the same flags, whose answer is this parser's byte for byte.
 #[cfg(any(windows, test))]
 fn unwaited_answer_line(argv: &[String]) -> String {
     let flags: Vec<String> = argv

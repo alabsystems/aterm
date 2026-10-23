@@ -1283,7 +1283,9 @@ mod tests {
         );
     }
 
-    /// A real winit press for the seam.
+    /// A real winit press for the seam. `location` is what says keypad, so
+    /// the event carries it exactly as the desktop backends deliver it; a
+    /// `Character` logical key carries its text, as a press does.
     fn press_at(
         code: KeyCode,
         logical: WinitKey,
@@ -1405,7 +1407,9 @@ mod tests {
         );
     }
 
-    /// The negative control: the main block is untouched.
+    /// The negative control: the main block is untouched. `5` above `R` stays
+    /// `Character('5')` and types `5` under DECKPAM and disambiguate alike; the
+    /// main Return stays `Enter` and CR under DECKPAM.
     #[test]
     fn main_row_digit_is_unchanged() {
         use aterm_types::keyboard::NamedKey;
@@ -1715,7 +1719,10 @@ mod tests {
         );
     }
 
-    /// A CHORD UNDER XKB'S CAPS LOCK TAKES SHIFT'S CASE.
+    /// A CHORD UNDER XKB'S CAPS LOCK TAKES SHIFT'S CASE. On X11 and
+    /// Wayland xkb cancels Shift against Caps Lock on an alphabetic key, so Turkish Caps
+    /// Lock + Alt+Shift+i arrives with the text `i`, and the chord took `i`'s default
+    /// capital, ESC `I`, where Alt+Shift+i without the lock is ESC `İ`.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_xkb_chord_under_caps_lock_takes_shifts_capital() {

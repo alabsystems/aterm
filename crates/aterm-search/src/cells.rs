@@ -20,6 +20,8 @@ pub struct LineCells {
     truncated: bool,
 }
 
+/// `count` cells of one shape: cell `i` holds bytes
+/// `byte + i·bytes .. byte + (i+1)·bytes` and is drawn from column
 /// `col + i·width`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CellRun {
@@ -54,6 +56,7 @@ impl CellRun {
         self.cell(self.count).byte
     }
 
+    /// Whether `next` continues this run: the same shape, starting where the
     /// run ends in both bytes and columns.
     #[inline]
     const fn continued_by(self, next: Self) -> bool {
@@ -319,6 +322,8 @@ mod tests {
             .collect()
     }
 
+    /// A row of one shape is one run; a change of shape, a gap in the
+    /// columns or a gap in the bytes starts another, and every cell reads
     /// back as pushed.
     #[test]
     fn cells_read_back_as_pushed_in_runs_of_one_shape() {
@@ -347,6 +352,7 @@ mod tests {
         assert_eq!(cells.end_col(), 12);
     }
 
+    /// A cell with no text, or one that would overlap the previous cell's
     /// text, is not recorded.
     #[test]
     fn empty_and_overlapping_cells_are_not_recorded() {
@@ -357,6 +363,7 @@ mod tests {
         assert_eq!(spans(&cells), vec![(0, 3, 0, 2)]);
     }
 
+    /// Joining shifts a row's cells by the bytes and columns before it, and
     /// a run that continues across the join stays one run.
     #[test]
     fn appended_cells_are_shifted_and_merged() {
@@ -380,6 +387,7 @@ mod tests {
         );
     }
 
+    /// A joined line stops short of its end when any row joined into it does, its
     /// head or a continuation, wherever the joins pad or shift its cells.
     #[test]
     fn a_joined_line_stops_short_when_a_row_does() {
@@ -399,6 +407,8 @@ mod tests {
         }
     }
 
+    /// A soft-wrapped row joins at its stride, whatever its text measures: after a
+    /// three-column row ending in a one-cell VS16 base the next row starts at column 3,
     /// not 4, and a short or empty row is padded out with one-column spaces.
     #[test]
     fn a_wrapped_row_joins_at_its_stride() {
@@ -431,6 +441,7 @@ mod tests {
         );
     }
 
+    /// A column names the cell drawn over it (either column of a wide cell),
     /// and a column no cell covers names none.
     #[test]
     fn a_column_names_the_cell_drawn_over_it() {
@@ -448,6 +459,8 @@ mod tests {
         assert_eq!(cells.columns_of(text, 8, 9), (5, 6));
     }
 
+    /// A column range takes the bytes of every cell drawn over any of its
+    /// columns, a wide cell either edge cuts whole, and names none where no
     /// cell is drawn.
     #[test]
     fn a_column_range_takes_the_cells_drawn_over_it() {

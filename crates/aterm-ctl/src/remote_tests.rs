@@ -262,8 +262,6 @@ fn a_workers_task_crosses_only_after_go() {
         ExitCode::FAILURE
     );
     let seen = SEEN.lock().unwrap();
-    // What the stream held when it first answered: the line alone, both
-    // times — the task followed the GO.
     assert_eq!(*seen, [head.clone(), head]);
 }
 

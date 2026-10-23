@@ -425,7 +425,9 @@ mod tests {
         );
     }
 
-    /// `reset flush` where nothing can be flushed answers `discarded=-`, never `discarded=0`.
+    /// `reset flush` where nothing can be flushed answers `discarded=-`, never `discarded=0`. The
+    /// stub's sink has no tty (`master = -1`), the same `None` every Linux and Windows session
+    /// gets.
     #[test]
     fn reset_flush_that_flushes_nothing_says_so() {
         let s = crate::stub_session(11);

@@ -37,7 +37,7 @@ pub(crate) enum Arm {
 }
 
 impl Arm {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Arm::Baseline => "baseline",
             Arm::Candidate => "candidate",
@@ -136,11 +136,11 @@ pub(crate) struct Eligibility {
 }
 
 impl Eligibility {
-    pub(crate) fn thermal(&self) -> bool {
+    pub(crate) const fn thermal(&self) -> bool {
         self.thermal_available && self.thermal_no_warning
     }
 
-    pub(crate) fn all(&self) -> bool {
+    pub(crate) const fn all(&self) -> bool {
         self.hardware
             && self.sample_count
             && self.thermal()

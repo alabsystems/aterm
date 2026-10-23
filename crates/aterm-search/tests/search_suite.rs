@@ -1,17 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The aterm-search integration files as modules of ONE test binary: each file
-//! stays at its own path and keeps its own `#[test]`s.
-//!
-//! The binary installs a counting `#[global_allocator]` ([`heap`]) for the two
-//! heap files, `index_release_memory` and `index_column_map_memory`. Its
-//! counters are per thread and aterm-search spawns none, so each test reads
-//! the bytes its own thread holds, and sibling tests running at the same time
-//! move nothing it reads.
-//!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
+//! Combined integration test binary for `aterm-search`, with a per-thread
+//! counting `#[global_allocator]` ([`heap`]) for memory tests.
 
 mod index_column_map_memory;
 mod index_release_memory;
@@ -27,6 +18,7 @@ mod heap {
         static ALLOCATED: Cell<u64> = const { Cell::new(0) };
     }
 
+    // Const-initialized and drop-free so thread-locals never allocate during teardown.
     /// Const-initialized and drop-free, so these thread-locals never allocate
     /// and stay readable while a thread is torn down.
     fn note(grow: usize, shrink: usize) {

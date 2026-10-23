@@ -33,7 +33,10 @@ const TEXT_ROW: usize = 28;
 const OLD_ROW: u16 = (TEXT_ROW - 1) as u16;
 const NEW_ROW: u16 = OLD_ROW - 1;
 
-/// The synchronized-output bracket.
+/// The synchronized-output bracket. Ink wraps every repaint in DEC 2026 (sync-begin, hide,
+/// rewrite, show, sync-end; see `tests/ink_wrap_line_fill_repro.rs`), and the seam reads the
+/// hide inside it as the repaint blink that admits an alt-screen re-anchor
+/// (`Terminal::repaint_blink_epoch`, `CursorGlow::blink_fresh`).
 const SYNC_BEGIN: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
 
@@ -599,7 +602,8 @@ fn the_followed_row_flows_into_the_fold_and_is_dark_by_the_flows_end() {
 /// restarted its fast phase at the fold is caught.
 const AFTER_LONG: &str = " ATERM claude code how is the rainbow now";
 
-/// The new row keeps the old row's pace.
+/// The new row keeps the old row's pace. The old row was typed 86 cells from its first, so it
+/// lays at [`WALK_LAY_RATE`] a cell (asserted from its `W`/`H` cells).
 #[test]
 fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
     let (mut h, _, _, t_w) = typed_to_the_wrap();
@@ -668,7 +672,9 @@ fn the_new_row_continues_the_old_rows_walk_at_the_pace_it_had_reached() {
     }
 }
 
-/// Negative control: a true re-layout still melts.
+/// Negative control: a true re-layout still melts. The same bytes with different text a row
+/// up: nothing follows, the old cells retire on the melt (`ribbon_retired=` counts the band,
+/// `ribbon_followed=` stays 0), and the row the text went to is dark.
 #[test]
 fn a_true_re_layout_with_different_text_a_row_up_still_melts_the_old_band() {
     let (mut h, _, n_pre, _) = typed_to_the_wrap();
@@ -726,7 +732,9 @@ fn unwrap_bytes(line: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A Backspace back through the fold re-wets the row the hand came back to.
+/// A Backspace back through the fold re-wets the row the hand came back to. After the wrap, a
+/// Backspace unwraps and the follow pass carries the flowing band back down onto the caret's
+/// row, where the hand keeps backspacing.
 #[test]
 fn a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to() {
     fn backspace_run(h: &mut Host, from_col: usize, n: usize) -> Vec<(u64, f32)> {
@@ -794,7 +802,10 @@ fn a_backspace_back_through_the_fold_rewets_the_row_the_hand_returned_to() {
     }
 }
 
-/// An unwrap takes the seam off the line the hand came back to.
+/// An unwrap takes the seam off the line the hand came back to. The wrap armed the new-line
+/// seam on the caret's row; the unwrap carries line 1 back down onto that row, which no longer
+/// holds a continued line, so the seam must clear or its floor lights the whole tail under the
+/// Backspace run.
 #[test]
 fn an_unwrap_takes_the_seam_off_the_line_the_hand_came_back_to() {
     const TAIL_FROM: u16 = 12;

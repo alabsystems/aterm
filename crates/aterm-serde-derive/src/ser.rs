@@ -97,7 +97,7 @@ fn build_generics(cont: &Container) -> Generics {
 // Fields with a `skip` attribute are not serialized by us so we do not
 // generate a bound. All other fields may need a `T: Serialize` bound where T is
 // the type of the field.
-fn needs_serialize_bound(field: &attr::Field) -> bool {
+const fn needs_serialize_bound(field: &attr::Field) -> bool {
     !field.skip_serializing()
 }
 

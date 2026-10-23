@@ -58,7 +58,8 @@ pub(crate) mod queue_ffi_census {
 /// The owner of the render queue (see the module header).
 #[derive(Debug)]
 pub(crate) struct EncodeSession {
-    /// The one `MTLCommandQueue` of the encode and present path.
+    /// The one `MTLCommandQueue` of the encode and present path. Lent only to
+    /// the blocking one-shot helpers via [`Self::one_shot_queue`].
     queue: Obj,
     /// The process device-loss latch every submission answers to.
     latch: Arc<loss::LossLatch>,
@@ -770,7 +771,9 @@ unsafe impl Send for CbProbe {}
 pub(crate) struct Submitted {
     cb: Obj,
     latch: Arc<loss::LossLatch>,
-    /// The classified terminal outcome once one exists.
+    /// The classified terminal outcome once one exists. The first terminal
+    /// wait or poll feeds the latch and fills this; later calls answer from it,
+    /// so each command buffer feeds the latch exactly once.
     settled: std::cell::Cell<Option<loss::CbOutcome>>,
 }
 

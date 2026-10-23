@@ -465,7 +465,9 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     }
 }
 
-/// The objc drives stage runs every row, whatever one row did.
+/// The objc drives stage runs every row, whatever one row did. A driver whose
+/// build failed and a driver that found a defect each leave their own rows,
+/// and every other driver still runs and says so.
 #[test]
 fn the_objc_drives_run_every_row_after_a_failure() {
     if !cfg!(target_os = "macos") {

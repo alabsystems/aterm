@@ -2,10 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! METHODS ON THE WIRE (design §5.2): which requests carry `Content-Length`,
-//! who owns `Accept`, which answers have no body whatever they declare, and how
-//! a caller reads repeated headers. Every case is asserted on the bytes a
-//! loopback listener records, or on what the client reads back from one.
+//! Wire tests for HTTP methods, `Content-Length`, `Accept`, bodiless responses, and headers.
 
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read, Write};
@@ -132,8 +129,6 @@ fn get_and_head_carry_no_content_length() {
 
 #[test]
 fn a_head_answer_that_declares_a_length_reads_as_an_empty_body_at_once() {
-    // The connection stays open after the head: a client that waited for the
-    // ten declared bytes would sit here until the hang detector.
     let (port, _rx, release) = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n", 1, true);
     let exchange = client()
         .request(Method::Head, &url(port))
@@ -199,8 +194,6 @@ fn a_body_on_a_get_or_head_is_refused_before_any_connection() {
         assert_eq!(failed.phase, Phase::NotSent);
         assert!(matches!(failed.error, Error::Invalid(_)), "{failed:?}");
     }
-    // A connect that happened completed before the refusal returned, so an
-    // empty accept queue now proves there was none.
     listener.set_nonblocking(true).unwrap();
     match listener.accept() {
         Err(error) if error.kind() == ErrorKind::WouldBlock => {}

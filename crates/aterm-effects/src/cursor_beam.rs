@@ -13,14 +13,17 @@ use crate::effect_util::TWINKLE_FLASH_BOUND_HZ;
 use crate::effect_util::push_fx_rect as push_rect;
 use crate::effect_util::{lerp_rgb, push_fx_ramp};
 
-/// Breathing rate in turns/second: a slow, calm shimmer.
+/// Breathing rate in turns/second: a slow, calm shimmer. The phase advances
+/// only when frames render, so a settled rod breathes at the blink cadence.
 const BREATHE_IDLE: f32 = 0.55;
 const BREATHE_ACTIVE: f32 = 1.6;
 
 /// Sparkle's shimmer runs the same sine this many times faster: a glitter
 /// tremble rather than a breath.
 const SHIMMER_RATE_MUL: f32 = 4.5;
-/// The shimmer's ceiling in turns/second.
+/// The shimmer's ceiling in turns/second. The breath is one unrectified sine,
+/// one peak per turn, so turns/second is its flash rate, and it stays inside
+/// the crate's general-flash bound however hard the keys charge the rod.
 const SHIMMER_MAX_TURNS_PER_S: f32 = TWINKLE_FLASH_BOUND_HZ;
 const _: () = assert!(
     BREATHE_IDLE * SHIMMER_RATE_MUL <= SHIMMER_MAX_TURNS_PER_S
@@ -33,7 +36,8 @@ const _: () = assert!(
 const OVERSHOOT_IDLE: f32 = 0.06;
 const OVERSHOOT_MAX: f32 = 0.22;
 
-/// Axis coverage before intensity, rest → full blaze.
+/// Axis coverage before intensity, rest → full blaze. The sleeve layers scale
+/// down from it and every quad is clamped to [`COV_CAP`].
 const COV_IDLE: f32 = 70.0;
 const COV_MAX: f32 = 150.0;
 /// Per-quad additive coverage ceiling (the comet and droplet cursors use the

@@ -258,7 +258,7 @@ impl NetState {
 
     /// One probe's budget.
     #[must_use]
-    pub fn budget(&self) -> Duration {
+    pub const fn budget(&self) -> Duration {
         self.budget
     }
 
@@ -322,7 +322,7 @@ impl NetState {
     }
 
     /// A probe begins: `false` when one is in flight already (one at a time).
-    pub fn begin(&mut self, now: Instant) -> bool {
+    pub const fn begin(&mut self, now: Instant) -> bool {
         if self.flight.is_some() {
             return false;
         }

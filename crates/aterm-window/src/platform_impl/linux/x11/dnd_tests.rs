@@ -51,6 +51,7 @@ struct Source {
 }
 
 impl Source {
+    /// A conversion on a child of this test's target, not another client's request for the
     /// selection we own. A requestor destroyed before we read its request is no longer ours.
     fn for_target(&self, request: &SelectionRequest) -> bool {
         request.selection == self.selection
@@ -160,6 +161,7 @@ impl Source {
     }
 }
 
+/// `path` as a `file://` URI, escaped as GLib's `g_filename_to_uri` escapes it: every byte but
 /// the unreserved ones and `/` (a space is `%20`).
 fn file_uri(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
@@ -174,6 +176,7 @@ fn file_uri(path: &Path) -> String {
     uri
 }
 
+/// A window of the backend and a drag source over it, on `$DISPLAY`. The window holds the
 /// shared connection's turn while it lives. Fields drop in order: the window before its loop.
 struct Rig {
     _window: Window,
@@ -274,6 +277,7 @@ impl Rig {
         self.source.now(&mut self.got)
     }
 
+    /// Pump the window's event loop and read the source's events until `done` finds what it
     /// waits for in them, failing the test after [`HANG`].
     fn until<R>(&mut self, what: &str, mut done: impl FnMut(&[Seen], &[XEvent]) -> Option<R>) -> R {
         let Rig { event_loop, source, seen, got, .. } = self;
@@ -328,6 +332,7 @@ impl Rig {
         self.until("the drop's finish", |_, got| finished_with(got, finished))
     }
 
+    /// Begin answering `request` in ICCCM INCR chunks, as GTK answers a list over 256 KiB: an
     /// `INCR` property of `size`, whose deletion asks for the first chunk ([`Rig::chunk`]).
     fn begin_incr(&mut self, request: &SelectionRequest, size: usize) {
         let source = &self.source;
@@ -353,6 +358,7 @@ impl Rig {
         source.notify(request, request.property);
     }
 
+    /// Wait until the window has taken the property `n` times (the INCR property, then each
     /// chunk), then put `chunk` there.
     fn chunk(&mut self, request: &SelectionRequest, n: usize, chunk: &[u8]) {
         let (window, property) = (request.requestor, request.property);

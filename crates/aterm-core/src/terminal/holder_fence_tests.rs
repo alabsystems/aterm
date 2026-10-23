@@ -25,7 +25,8 @@ enum Who {
 }
 
 impl Who {
-    /// The writer's narrow glyph.
+    /// The writer's narrow glyph. A drawer's is a Cyrillic capital that no
+    /// other writer and no corpus draws.
     fn glyph(self) -> char {
         match self {
             Self::Shell => 's',
@@ -54,7 +55,9 @@ impl Who {
         }
     }
 
-    /// The writer's true-colour background.
+    /// The writer's true-colour background. A drawer's red is odd and its
+    /// green even: the style-churn corpus's per-cell `(b, r, g)` walk draws
+    /// all three channels with the cell's parity, so it never paints one.
     fn rgb(self) -> [u8; 3] {
         match self {
             Self::Shell => [2, 4, 6],
@@ -613,7 +616,8 @@ impl Sim {
         b
     }
 
-    /// 1049, 47 or 1047, set or reset.
+    /// 1049, 47 or 1047, set or reset. A screen swap renumbers no main row,
+    /// so it never loses the anchors (the swap's liveness).
     fn alt_step(&mut self) -> Result<(), String> {
         let mode = *self.rng.pick(&["1049", "47", "1047"]);
         let set = if self.rng.chance(55) { 'h' } else { 'l' };

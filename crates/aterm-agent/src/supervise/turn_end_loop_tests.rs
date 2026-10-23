@@ -2073,9 +2073,26 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
             .any(|n| n.starts_with("SKIPPED seq=") && n.ends_with(tail))
     };
     let lines = |r: &Ran| format!("{:#?}\n{:#?}", r.notes, r.requests);
-    for (input, word) in [(INPUT_PENDING, "pending"), (INPUT_TYPEAHEAD, "typeahead")] {
+    let held = [(INPUT_PENDING, "pending"), (INPUT_TYPEAHEAD, "typeahead")];
+    let controls = [INPUT_CLEAR, "input=- input_bytes=-", ""];
+    // Each run is a mock and a journal of its own: all ten run at once, judged in order below.
+    let mut cases = Vec::new();
+    for (input, _) in held {
+        cases.extend([
+            (input, Some(held_for), true),
+            (input, Some(held_for), false),
+        ]);
+    }
+    for input in controls {
+        cases.extend([(input, None, true), (input, None, false)]);
+    }
+    let mut ran = aterm_spec::check::each(&cases, |&(input, clear_after, sits)| {
+        run(input, clear_after, sits)
+    })
+    .into_iter();
+    for (_, word) in held {
         // THE SCREEN SITS: read, not drawn — held to the hang detector's end.
-        let r = run(input, Some(held_for), true);
+        let r = ran.next().expect("the run whose screen sits");
         assert!(skipped(&r, &unread(word)), "{word}: {}", lines(&r));
         assert!(
             skipped(&r, &undrawn),
@@ -2097,7 +2114,7 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
             lines(&r)
         );
         // THE SCREEN MOVES: continued once the queue is clear, with no `not drawn` hold.
-        let r = run(input, Some(held_for), false);
+        let r = ran.next().expect("the run whose screen moves");
         assert!(skipped(&r, &unread(word)), "{word}: {}", lines(&r));
         assert!(!skipped(&r, &undrawn), "{word}: {}", lines(&r));
         assert!(
@@ -2121,9 +2138,9 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
     }
     // NEGATIVE CONTROLS: nothing unread, or nothing measured — continued at once, whether the
     // screen sits or moves.
-    for input in [INPUT_CLEAR, "input=- input_bytes=-", ""] {
+    for input in controls {
         for sits in [true, false] {
-            let r = run(input, None, sits);
+            let r = ran.next().expect("a control's run");
             assert!(
                 !r.notes.iter().any(|n| n.contains("has not read the input")
                     || n.contains("has not drawn the input")),
@@ -7601,7 +7618,11 @@ fn memory_run_at(
     (m, lines, waits, dir)
 }
 
-/// THE UPDATE THAT APPLIES WHILE THE WALL IS SCROLLED OUT OF VIEW.
+/// THE UPDATE THAT APPLIES WHILE THE WALL IS SCROLLED OUT OF VIEW. The loop
+/// that waited on the wall wrote it down (a `wall-wait@v1` ledger row: the
+/// notice and the reset as it PLACED it); a loop that starts after it — a GUI
+/// replacement, a fault — finds a screen with none of its rows and takes the
+/// wall up from that row: remembered, and waited on to the same reset.
 #[test]
 fn a_hidden_wall_its_predecessor_waited_on_is_seeded_only_while_it_stands() {
     use crate::supervise::approvals::{self, Outcome, Row};
@@ -7871,7 +7892,10 @@ fn cleared_at_an_armed_limit() -> Vec<String> {
     )
 }
 
-/// A `/resume` at an armed limit types nothing into it (Claude Code 2.1.300).
+/// A `/resume` at an armed limit types nothing into it (Claude Code 2.1.300). Conversation B's
+/// five-hour limit stands, its countdown armed; a person `/resume`s conversation A, whose
+/// history is redrawn: A's own older limit and the vendor's continuation of it (`⏺ Usage limit
+/// reset · continuing automatically`), no `❯` row under it.
 #[test]
 fn a_resume_at_an_armed_limit_types_nothing_into_it() {
     let (m, lines, waits, jdir) = memory_run_for(
@@ -7931,7 +7955,10 @@ fn a_resume_at_an_armed_limit_waits_on_it_as_a_cancelled_one() {
     );
 }
 
-/// A `/resume` at an armed model bucket types nothing into it.
+/// A `/resume` at an armed model bucket types nothing into it. The lab's Sonnet bucket on Claude
+/// Code 2.1.300 (`resets Oct 17 at 4:20pm`, a month past the watch tests' clock), its countdown
+/// armed under the generic banner, is read as the bucket it is; no host here relaunches it on
+/// the fallback.
 #[test]
 fn a_resume_at_an_armed_bucket_types_nothing_into_it() {
     let armed = aterm_phase::prompt::fixtures::screen(
@@ -7957,7 +7984,10 @@ fn a_resume_at_an_armed_bucket_types_nothing_into_it() {
     );
 }
 
-/// A bucket whose countdown ended is waited on across a loop's restart.
+/// A bucket whose countdown ended is waited on across a loop's restart. The same `/resume` at
+/// the armed Sonnet bucket: the first loop waits on the bucket's reset and keeps its wall open
+/// in the ledger (no `wall-wait-end@v1`), and the loop that follows on the `/resume`d screen
+/// takes it up (the bucket's reset and its grace, `model-bucket resets`) and types nothing.
 #[test]
 fn a_bucket_whose_countdown_ended_is_waited_on_across_a_loop_restart() {
     let (ldir, ledger) = ledger_at("bucket-restart");
@@ -9539,7 +9569,11 @@ fn an_undated_cancelled_limit_is_placed_within_a_session_window() {
     assert_eq!(placed("11:50pm", false), 14 * hour + 55 * min);
 }
 
-/// EVERY UNIX SECOND IS ITSELF, AT EVERY PHASE OF THE CLOCK.
+/// EVERY UNIX SECOND IS ITSELF, AT EVERY PHASE OF THE CLOCK. One placement
+/// is one stamp, whatever part of a second each read fell in: a conversion
+/// that carries its read's sub-second phase puts a reading made before a
+/// second turns and a stamp made after it a second apart (`until=…:19Z`,
+/// then `until=…:20Z`, for one wait).
 #[test]
 fn a_unix_second_reads_back_and_stamps_as_itself_at_any_phase_of_the_clock() {
     let mut m = Mock::new(vec![busy_screen()]);
@@ -19541,7 +19575,10 @@ fn a_host_that_answers_a_short_wait_is_asked_again_when_it_runs_out() {
     assert!(waits > Duration::from_secs(3600), "{waits:?}");
 }
 
-/// ONE CONTINUATION A CLEARING, ACROSS LOOPS.
+/// ONE CONTINUATION A CLEARING, ACROSS LOOPS. Which clearing was answered is
+/// the policy's memory, and a loop's restart loses it: a loop that started at
+/// the same notice — the continuation not taken, or the account's answer not
+/// in the transcript yet — typed that clearing's continuation a second time.
 #[test]
 fn a_clearing_the_loop_before_answered_is_not_answered_again() {
     use crate::supervise::approvals::{Outcome, Row, act_reason};
@@ -19786,7 +19823,14 @@ fn other_skips(lines: &[String]) -> Vec<&String> {
         .collect()
 }
 
-/// THE PROBE, SETTLED.
+/// THE PROBE, SETTLED. At a turn end read live, where the host's advice is
+/// the probe and it grants the claim, the loop writes `/usage` and its Enter
+/// — each fenced on the person count, the judged read's generation and the
+/// composer's caret row — reads the panel until two reads in a row say
+/// SETTLED with the same windows (the first read here is the measured
+/// `Refreshing…` frame: no sample from it), hands the host the sample with
+/// its resets placed on the loop's clock, and only THEN presses one Escape,
+/// fenced on the person count and the panel's own header row.
 #[test]
 fn a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it() {
     let (dir, ledger) = ledger_at("probe-settled");
@@ -20122,7 +20166,11 @@ fn a_night_slept(s: &mut Session<'_, Mock>, _: &Turn, _: &ProbeHost, _: &mut Tur
     let _ = s.call(&["status"]).expect("a read at the wake");
 }
 
-/// A DUE PROBE THAT IS NOT RUN SAYS WHICH GATE SHUT.
+/// A DUE PROBE THAT IS NOT RUN SAYS WHICH GATE SHUT. One row a gate of
+/// the loop's — each the same world with ONE thing changed — and for each:
+/// nothing is written, and ONE line is said,
+/// `SKIPPED seq=<n> rule=usage-probe@v1 gate=<word>`, the claim's with the
+/// host's own word after it.
 #[test]
 fn a_due_probe_that_is_not_run_says_which_gate_shut_once_a_point() {
     let gates: [(&str, Shut); 16] = [
@@ -20609,7 +20657,9 @@ fn a_person_at_the_session_is_never_typed_under() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// REFUSALS.
+/// REFUSALS. An Escape the server turns away — `ERR halted`, then `ERR
+/// busy` — is parked on or backed off from, spends no try, and is SENT
+/// AGAIN: three Escapes asked, the third written.
 #[test]
 fn a_refused_escape_is_sent_again_and_never_a_second_usage() {
     let (dir, ledger) = ledger_at("probe-refused");
@@ -20676,7 +20726,10 @@ fn owed_ledger(path: &Path) {
     std::fs::write(path, format!("{}\n", row.to_json(1_000, None))).expect("the ledger");
 }
 
-/// THE LOOP DIED MID-PROBE.
+/// THE LOOP DIED MID-PROBE. Its successor finds the ledger's `typed` row
+/// with no `waiting` row after it and a Settings panel on the screen: it
+/// lets the panel stand ONE PERSON'S GRACE in its own sight (a second here)
+/// before its one guarded Escape.
 #[test]
 fn a_successor_closes_only_a_panel_the_ledger_says_the_harness_opened() {
     let (dir, ledger) = ledger_at("probe-successor");
@@ -23682,7 +23735,10 @@ fn a_box_the_loop_reads_makes_the_next_esc_a_new_one() {
     assert_eq!(read, None, "the box read since: {out}");
 }
 
-/// Esc on the vendor's retry is a person ending the turn, as anywhere (accounts v2 S5).
+/// Esc on the vendor's retry is a person ending the turn, as anywhere (accounts v2 S5). On
+/// 2.1.301, Esc on the row of a limit met mid-turn leaves `⎿  Interrupted · What should Claude
+/// do instead?` under the turn's Bash call; Esc on it at a turn's first request (the fullscreen
+/// renderer) puts the prompt back in the composer, as Esc before any answer does.
 #[test]
 fn esc_on_the_vendors_retry_is_an_ordinary_turn_a_person_ended() {
     use aterm_phase::prompt::fixtures::{
@@ -24172,7 +24228,9 @@ fn an_off_sessions_refused_escape_is_its_one_close() {
     assert!(!cruise.owed);
 }
 
-/// Under Off the one close promises nothing more and waits on no hold.
+/// Under Off the one close promises nothing more and waits on no hold. An Escape that does not
+/// take is journaled `WAITING … owed until the word turns` (never `Escape again in 5 s`: no
+/// Escape follows under Off) and the loop parks.
 #[test]
 fn an_off_sessions_one_close_promises_no_second_escape_and_waits_on_no_hold() {
     let parked = |run: &OffPanelRun| run.journal.iter().any(|l| l.starts_with("PARKED seq="));

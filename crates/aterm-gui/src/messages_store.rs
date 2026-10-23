@@ -150,7 +150,9 @@ fn decode_into(out: &mut Vec<LogLine>, text: &str) -> usize {
     skipped
 }
 
-/// One line as it lands on disk: the codec's form plus the newline.
+/// One line as it lands on disk: the codec's form plus the newline. A line
+/// past [`MAX_LINE_BYTES`] would never read back, so it is not written; the
+/// caps make that unreachable for a message the engine admitted.
 fn encoded(line: &LogLine) -> String {
     let mut s = line.encode();
     if s.len() >= MAX_LINE_BYTES {

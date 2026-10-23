@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The update pass and the update verb meet ALab's codex ([`crate::alab`]): a pin from
-//! ALab's repo moves a vendor codex onto the index lane; the live index's legacy row, an
-//! index that does not verify and a person's vendor choice leave the vendor lane as it is.
+//! The update pass and the update verb meet ALab's codex ([`crate::alab`]).
 
 use super::*;
 use crate::alab::tests::{self as at, Both};
@@ -47,7 +45,6 @@ fn codex() -> &'static crate::vendor_direct::VendorSpec {
     crate::vendor_direct::spec("codex").unwrap()
 }
 
-/// A store with the vendor's codex `version` installed by its own lane.
 fn vendor_codex(layout: &crate::store::Layout, vendor: &Fake, version: &str) -> u64 {
     vendor.publish_codex_default(version);
     let policy = crate::vendor_direct::policy::Policy::default();
@@ -80,14 +77,10 @@ fn active(layout: &crate::store::Layout) -> Option<u64> {
     crate::active_builds(layout).get("codex").copied()
 }
 
-/// P2 and P3 through the real pass: a vendor codex on an arm64 Mac moves to ALab's pinned
-/// build when the index names codex from `codex-alab`, and the vendor lane reads no codex
-/// head that pass. The controls: the live index's legacy row (`aterm`) leaves the vendor
-/// build exactly where it is, its vendor's lane answering for it as before.
 #[test]
 fn a_pass_moves_a_vendor_codex_onto_the_alab_pin_and_the_legacy_row_leaves_it() {
     if current_triple() != "aarch64-apple-darwin" {
-        return; // ALab builds codex for this target only; elsewhere the rule is the vendor's.
+        return;
     }
     for (label, repo, moves) in [
         ("alab-pin", "codex-alab", true),
@@ -144,8 +137,6 @@ fn a_pass_moves_a_vendor_codex_onto_the_alab_pin_and_the_legacy_row_leaves_it() 
     }
 }
 
-/// P5 through the real pass: with ALab's build installed, a pass under an index that pins
-/// none (the legacy row), or with no index at all, keeps it — never the newer vendor head.
 #[test]
 fn a_pass_keeps_an_installed_alab_codex_without_a_pin_and_reads_no_vendor_head() {
     if current_triple() != "aarch64-apple-darwin" {
@@ -173,7 +164,6 @@ fn a_pass_keeps_an_installed_alab_codex_without_a_pin_and_reads_no_vendor_head()
         false,
         &seams(&trust),
     );
-    // A fresh store installs nothing without set completion; the door does.
     let report = crate::flow::install(
         &both,
         &layout,
@@ -224,9 +214,6 @@ fn a_pass_keeps_an_installed_alab_codex_without_a_pin_and_reads_no_vendor_head()
     }
 }
 
-/// `update --vendor | --alab` is one answer about one ALab-built program: both together,
-/// none named, or a program ALab never builds are usage errors before anything is read or
-/// written.
 #[test]
 fn the_source_flags_refuse_before_anything_runs() {
     let argv = |a: &[&str]| -> Vec<String> { a.iter().map(|s| (*s).to_string()).collect() };
@@ -240,13 +227,10 @@ fn the_source_flags_refuse_before_anything_runs() {
         ExitCode::from(2)
     );
     assert_eq!(cmd_update_argv(&argv(&["ay", "--alab"])), ExitCode::from(2));
-    // The dispatch edge counts the flags as flags: one program operand.
     assert!(arity_refusal(&argv(&["codex", "--vendor"]), "update").is_none());
     assert!(arity_refusal(&argv(&["codex", "--alab", "--retry"]), "update").is_none());
 }
 
-/// B8: a link with no bin list to an ALab package directory links its entrypoint; any other
-/// checkout keeps the cargo default.
 #[test]
 fn a_link_of_a_package_directory_names_its_entrypoint() {
     let d = crate::testdir::dir("atpkg-cli-alab-link-");
@@ -266,9 +250,6 @@ fn a_link_of_a_package_directory_names_its_entrypoint() {
     assert_eq!(link_bins_for("claude", &pkg), default_link_bins("claude"));
 }
 
-/// A dev-linked codex says where `unlink` hands it back: ALab's build on a machine whose
-/// active build is ALab's, the vendor's latest once a person chose the vendor's build there,
-/// and the vendor's latest on a machine whose build is the vendor's (the control).
 #[test]
 fn a_dev_linked_codex_names_the_build_unlink_returns_to() {
     let alab = world::layout("alab-unlink-line");
@@ -308,9 +289,6 @@ fn a_dev_linked_codex_names_the_build_unlink_returns_to() {
     );
 }
 
-/// A rollback that lands on an ALab build of codex says the next update follows
-/// codex-alab's channel — never "OpenAI's latest", which that update never installs; a
-/// person's vendor choice and a vendor build keep the vendor's words (the controls).
 #[test]
 fn a_rollback_onto_an_alab_build_names_alab_s_channel() {
     let l = world::layout("alab-rollback-line");
@@ -344,8 +322,6 @@ fn a_rollback_onto_an_alab_build_names_alab_s_channel() {
     );
 }
 
-/// A complete, active store build of codex at [`at::BUILD`]: an ALab package whose record is
-/// `record`, its shims laid.
 fn alab_store_codex(layout: &crate::store::Layout, record: &[u8]) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = layout.build_dir("codex", at::BUILD);
@@ -374,9 +350,6 @@ fn alab_store_codex(layout: &crate::store::Layout, record: &[u8]) -> std::path::
     dir
 }
 
-/// `which codex` over an ALab store build says the upstream its record names after its
-/// state, read off the record (the binary only exits). A record from before the field says
-/// nothing more, and so does every malformed one: the line is the older one, byte for byte.
 #[test]
 fn which_codex_says_the_upstream_an_alab_build_records() {
     let layout = world::layout("alab-which-upstream");
@@ -422,8 +395,6 @@ fn which_codex_says_the_upstream_an_alab_build_records() {
     }
 }
 
-/// A dev link of an ALab package directory says the upstream its record names after the
-/// dev-linked words; a package from before the field keeps the words alone.
 #[test]
 fn which_codex_says_the_upstream_a_dev_linked_package_records() {
     use std::os::unix::fs::PermissionsExt as _;

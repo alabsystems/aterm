@@ -434,7 +434,8 @@ impl Worker {
         }
     }
 
-    /// Asks `IsEnabled` and attaches or detaches to match.
+    /// Asks `IsEnabled` and attaches or detaches to match. `Err` when the
+    /// session bus is gone.
     fn refresh_status(&mut self) -> Result<(), ()> {
         let enabled = match proxies::is_enabled(&mut self.session) {
             Ok(enabled) => enabled,

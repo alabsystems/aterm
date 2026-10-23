@@ -62,7 +62,8 @@ const fn check(error: CGError) -> Result<(), CGError> {
     }
 }
 
-/// Wrapper around a `CGDirectDisplayID`.
+/// One display, by ID. Any ID is a valid argument: CoreGraphics answers an unknown one with zeros,
+/// an empty rect or NULL, never by reading through it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CGDisplay {
     pub id: CGDirectDisplayID,

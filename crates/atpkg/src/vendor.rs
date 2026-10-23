@@ -85,7 +85,8 @@ pub const PAYLOADS: &[&str] = &[
 /// (`tar-gz-binary`); either way it is laid at `bin/<entry>`, mode `0755`.
 const BINARY_PAYLOADS: &[&str] = &["raw-binary", "tar-gz-binary"];
 
-/// The archive payloads — the only ones `strip_components` applies to.
+/// The archive payloads — the only ones `strip_components` applies to. A `tar-gz-binary`
+/// is a gzip tar too, but of one file the stage names itself: there is no tree to strip.
 const ARCHIVE_PAYLOADS: &[&str] = &["tar-gz", "tar-zst", "zip"];
 
 /// Whether `payload` names a single-binary lane (see [`BINARY_PAYLOADS`]).

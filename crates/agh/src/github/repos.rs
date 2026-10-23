@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Repositories (design §10.1): one repository, its permissions, and an owner's list.
+//! GitHub repository metadata, permissions, and owner repository listings.
 
 use crate::client::Github;
 use crate::error::{Error, Forbid, Kind, Result, Sub};
@@ -62,7 +62,7 @@ impl RepoListKind {
     }
 
     /// Whether `repo` is of this kind (the client-side filter).
-    fn keeps(self, repo: &RepoObject) -> bool {
+    const fn keeps(self, repo: &RepoObject) -> bool {
         match self {
             RepoListKind::All => true,
             RepoListKind::Public => !repo.private,
@@ -112,14 +112,11 @@ impl<'a> Repos<'a> {
         Ok(repo)
     }
 
-    /// The repository and the identity's permissions on it, read with `access`. Under
-    /// WriterRead a fine-grained writer whose drafts are not vouched for is refused before
-    /// anything is sent (design §6.4).
+    /// Reads the repository and the identity's permissions on it under `access`.
     ///
     /// # Errors
     ///
-    /// The call's error; Forbidden `drafts_unproven` for an unvouched fine-grained writer;
-    /// Forbidden `other` when a non-read answer carries no permissions block.
+    /// Request failure, `drafts_unproven`, or missing permissions on a non-read response.
     pub fn permissions(&self, slug: &Slug, access: Access) -> Result<(RepoObject, Permissions)> {
         let how = self.how.with_access(access);
         if access == Access::WriterRead
@@ -157,16 +154,11 @@ impl<'a> Repos<'a> {
         Ok((repo, permissions))
     }
 
-    /// An owner's repositories, sorted by full name (ASCII case-insensitive), `opts.limit`
-    /// applied after the sort: an Organization's through `/orgs/{o}/repos`, the routed
-    /// profile's own login's through `/user/repos?affiliation=owner`, anyone else's through
-    /// `/users/{o}/repos`.
+    /// Lists an owner's repositories sorted case-insensitively by full name, applying `opts.limit`.
     ///
     /// # Errors
     ///
-    /// Usage, before any request, for an `owner` GitHub cannot hold (`Slug::new`'s owner rule,
-    /// which refuses `.` and `..`, a dot-segment that would leave the owner's route); the
-    /// calls' errors.
+    /// Usage error for an invalid `owner` before any request, or request failure.
     pub fn list_for_owner(
         &self,
         owner: &str,
@@ -175,8 +167,6 @@ impl<'a> Repos<'a> {
     ) -> Result<Listing<RepoObject>> {
         Slug::new(owner, "repo")?;
         let target = RouteTarget::Owner(owner.to_string());
-        // The owner lookup is an Owner route, Read, whatever this resource's access says
-        // (`How::as_read`: a writer's `--as` need not be in the owner's read chain).
         let who = self.gh.call(
             &self
                 .how
@@ -197,9 +187,7 @@ impl<'a> Repos<'a> {
                 &LinkScope::Owner { id: user.id },
             )?
         } else if let Some(profile) = self.own_login(owner, &target) {
-            // An Identity route is read only (a WriterRead of one is refused), so the listing
-            // is a Read pinned to the profile this resource's own decision chose: the writer
-            // under WriterRead, which an Identity read with `as_profile` reaches with no wall.
+            // Identity routes are read-only; pin Read to the routed profile.
             let how = self.how.with_access(Access::Read).as_profile(Some(profile));
             let mut first = how
                 .get("/user/repos", RouteTarget::Identity)

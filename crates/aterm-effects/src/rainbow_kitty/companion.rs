@@ -412,7 +412,8 @@ const fn cell_span(x: i32, w: i32, cw: i32, cols: u16) -> (u16, u16) {
     (first as u16, last as u16)
 }
 
-/// Build the [`Seat`] for a resolved `x`/`y`.
+/// Build the [`Seat`] for a resolved `x`/`y`. `col` is read off the final `x`
+/// so the struct carries one position, not two.
 #[inline]
 const fn seat(
     query: &SeatQuery,
@@ -551,7 +552,8 @@ impl PetOffer {
     }
 }
 
-/// `at + ms`, saturating.
+/// `at + ms`, saturating. The module's one ms-to-`Instant` conversion, so nothing rounds to
+/// whole milliseconds and lands a frame early.
 #[inline]
 fn add_ms(at: Instant, ms: f32) -> Instant {
     at.checked_add(std::time::Duration::from_secs_f32(ms / 1000.0))

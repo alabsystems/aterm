@@ -16,7 +16,9 @@ const RESOURCE_ID: u16 = 1;
 /// `rc.exe` but no SDK headers on its include path would then fail to compile the resource.
 const RT_MANIFEST: u16 = 24;
 
-/// `VS_VERSION_INFO` as its raw id.
+/// `VS_VERSION_INFO` as its raw id. Without `#include <winver.h>` rc.exe takes the bare macro
+/// as a resource name string: the build succeeds, but `GetFileVersionInfo` looks up only
+/// `MAKEINTRESOURCE(1)`, finds nothing, and every property reads back empty.
 const VS_VERSION_INFO_ID: u16 = 1;
 
 fn main() {
@@ -100,7 +102,8 @@ fn report(why: &str) {
     }
 }
 
-/// Build the resource script text.
+/// Build the resource script text. Generated, not checked in: `VS_VERSION_INFO` carries the
+/// version four times, all from `CARGO_PKG_VERSION_*`, so it cannot drift from the crate's.
 fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> String {
     let major = env_num("CARGO_PKG_VERSION_MAJOR");
     let minor = env_num("CARGO_PKG_VERSION_MINOR");
@@ -177,7 +180,9 @@ END
     )
 }
 
-/// A path as it may appear inside an `.rc` string literal.
+/// A path as it may appear inside an `.rc` string literal. Backslash is the .rc escape
+/// character, so separators become `/`: every resource compiler in play (`rc.exe`, `llvm-rc`,
+/// `windres`) hands the path to a Win32 file open, which accepts it.
 fn rc_path_literal(p: &std::path::Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
@@ -206,7 +211,8 @@ mod build_stamp {
     use super::run;
     use std::path::PathBuf;
 
-    /// A build fact supplied by the caller instead of probed from git.
+    /// A build fact supplied by the caller instead of probed from git. Empty is
+    /// treated as absent, so `FOO=` cannot half-pin a build.
     fn pinned(key: &str) -> Option<String> {
         println!("cargo:rerun-if-env-changed={key}");
         std::env::var(key).ok().filter(|v| !v.trim().is_empty())
@@ -287,7 +293,9 @@ mod build_stamp {
         println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     }
 
-    /// A path git prints, made absolute.
+    /// A path git prints, made absolute. `--path-format=absolute` arrived after
+    /// `--git-common-dir`/`--git-path`, so an older git's relative answer is joined
+    /// to this script's working directory (the package root, where git ran).
     fn git_abs_path(args: &[&str]) -> Option<PathBuf> {
         let mut with_format = vec!["rev-parse", "--path-format=absolute"];
         with_format.extend_from_slice(args);

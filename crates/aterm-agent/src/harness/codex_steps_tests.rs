@@ -152,7 +152,14 @@ fn opening() -> String {
     meta_as(T0, PARENT, PARENT, None, Some(PAGINATED), None)
 }
 
-/// THE LAB'S ROLLOUT, FOLDED (5G-2; T9).
+/// THE LAB'S ROLLOUT, FOLDED (5G-2; T9). Each leg the lab ran on Codex
+/// 0.163.0 is its turn: a plain turn, a tool call (`exec`), an approval
+/// (`exec` again, its command escalated), a question
+/// (`request_user_input`), Esc (`turn_aborted`), the usage wall
+/// (`task_complete` with `usage_limit_exceeded`), a compaction (its count
+/// and `compacted` before its `turn_context`, so its compaction is said
+/// before its prompt and its tokens are its own) and a subagent
+/// (`spawn_agent` in `collaboration`).
 #[test]
 fn the_labs_rollout_folds_to_its_legs() {
     let batch = fold(MAIN);

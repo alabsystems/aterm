@@ -6,8 +6,7 @@
 // src/hb/ot_layout_gsub_table.rs and modified by the aterm project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! Applying `GSUB` subtables, lookup types 1 to 8 (an extension, type 7,
-//! is resolved by the reader into the subtable it wraps).
+//! Applying `GSUB` lookup subtables (types 1 to 8).
 
 use super::apply::{
     ApplyContext, apply_chain_context_lookup, apply_context_lookup, ligate_input, match_backtrack,
@@ -25,8 +24,7 @@ use crate::gsub::{
     ReverseChainSingleSubstitution, SingleSubstitution, SubstitutionSubtable,
 };
 
-/// Applies the first of the lookup's subtables that applies at the current
-/// glyph.
+/// Applies the first of the lookup's subtables that applies at the current glyph.
 #[inline]
 pub(crate) fn apply_lookup(ctx: &mut ApplyContext, lookup: &SubstLookup) -> Option<()> {
     if !lookup.digest.may_have_glyph(ctx.buffer.cur(0).as_glyph()) {
@@ -59,7 +57,6 @@ fn apply_single(ctx: &mut ApplyContext, table: &SingleSubstitution) -> Option<()
     let subst = match *table {
         SingleSubstitution::Format1 { coverage, delta } => {
             coverage.get(glyph)?;
-            // The Adobe Annotated OpenType Suite: the result wraps to 16 bits.
             GlyphId((i32::from(glyph.0) + i32::from(delta)) as u16)
         }
         SingleSubstitution::Format2 {
@@ -79,10 +76,7 @@ fn apply_multiple(ctx: &mut ApplyContext, table: &MultipleSubstitution) -> Optio
     let index = table.coverage.get(glyph)?;
     let seq = table.sequences.get(index)?;
     match seq.substitutes.len() {
-        // The spec disallows an empty sequence; Uniscribe deletes the glyph
-        // (harfbuzz#253).
         0 => ctx.buffer.delete_glyph(),
-        // In place, and not a "multiplied" substitution.
         1 => ctx.replace_glyph(seq.substitutes.get(0)?),
         _ => {
             let class = if is_ligature(ctx.buffer.cur(0)) {
@@ -92,9 +86,7 @@ fn apply_multiple(ctx: &mut ApplyContext, table: &MultipleSubstitution) -> Optio
             };
             let lig = lig_id(ctx.buffer.cur(0));
             for (i, subst) in seq.substitutes.into_iter().enumerate() {
-                // A glyph attached to a ligature keeps that (harfbuzz#3069).
                 if lig == 0 {
-                    // Components keep four bits, as upstream truncates.
                     set_lig_props_for_component(ctx.buffer.cur_mut(0), i as u8);
                 }
                 ctx.output_glyph_for_component(subst, class);
@@ -114,10 +106,8 @@ fn apply_alternate(ctx: &mut ApplyContext, table: &AlternateSubstitution) -> Opt
         return None;
     }
     let glyph_mask = ctx.buffer.cur(0).mask;
-    // This breaks if two features enabled the lookup together, as upstream.
     let shift = ctx.lookup_mask().trailing_zeros();
     let mut alt_index = (ctx.lookup_mask() & glyph_mask) >> shift;
-    // The `rand` feature's MAX_VALUE picks at random.
     if alt_index == MAX_VALUE && ctx.random {
         alt_index = ctx.random_number() % u32::from(len) + 1;
     }
@@ -131,7 +121,6 @@ fn apply_ligature(ctx: &mut ApplyContext, table: &LigatureSubstitution) -> Optio
     let index = table.coverage.get(glyph)?;
     let set = table.ligature_sets.get(index)?;
     for lig in set {
-        // An empty component list replaces in place, not as a ligature.
         if lig.components.is_empty() {
             ctx.replace_glyph(lig.glyph);
             return Some(());
@@ -176,7 +165,6 @@ fn apply_reverse_chain(
     if index >= table.substitutes.len() {
         return None;
     }
-    // No chaining to this type.
     if ctx.nesting_level_left != MAX_NESTING_LEVEL {
         return None;
     }
@@ -202,8 +190,6 @@ fn apply_reverse_chain(
         )
     {
         ctx.replace_glyph_inplace(subst);
-        // The main loop moves `idx`, not this: no surprise for a context
-        // lookup that calls in.
         return Some(());
     }
     None

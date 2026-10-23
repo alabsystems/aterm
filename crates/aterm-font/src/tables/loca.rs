@@ -5,8 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! An [Index to Location Table](https://docs.microsoft.com/en-us/typography/opentype/spec/loca)
-//! implementation.
+//! An [Index to Location Table](https://docs.microsoft.com/en-us/typography/opentype/spec/loca).
 
 use core::convert::TryFrom;
 use core::num::NonZeroU16;
@@ -26,30 +25,17 @@ pub enum Table<'a> {
 
 impl<'a> Table<'a> {
     /// Parses a table from raw data.
-    ///
-    /// - `number_of_glyphs` is from the `maxp` table.
-    /// - `format` is from the `head` table.
     pub fn parse(
         number_of_glyphs: NonZeroU16,
         format: IndexToLocationFormat,
         data: &'a [u8],
     ) -> Option<Self> {
-        // The number of ranges is `maxp.numGlyphs + 1`.
-        //
-        // Check for overflow first.
         let mut total = if number_of_glyphs.get() == u16::MAX {
             number_of_glyphs.get()
         } else {
             number_of_glyphs.get() + 1
         };
 
-        // By the spec, the number of `loca` offsets is `maxp.numGlyphs + 1`.
-        // But some malformed fonts can have less glyphs than that.
-        // In which case we try to parse only the available offsets
-        // and do not return an error, since the expected data length
-        // would go beyond table's length.
-        //
-        // In case when `loca` has more data than needed we simply ignore the rest.
         let actual_total = match format {
             IndexToLocationFormat::Short => data.len() / 2,
             IndexToLocationFormat::Long => data.len() / 4,
@@ -87,14 +73,12 @@ impl<'a> Table<'a> {
             return None;
         }
 
-        // Glyph ID must be smaller than total number of values in a `loca` array.
         if glyph_id + 1 >= self.len() {
             return None;
         }
 
         let range = match self {
             Table::Short(array) => {
-                // 'The actual local offset divided by 2 is stored.'
                 usize::from(array.get(glyph_id)?) * 2..usize::from(array.get(glyph_id + 1)?) * 2
             }
             Table::Long(array) => {
@@ -103,8 +87,6 @@ impl<'a> Table<'a> {
         };
 
         if range.start >= range.end {
-            // 'The offsets must be in ascending order.'
-            // And range cannot be empty.
             None
         } else {
             Some(range)

@@ -108,6 +108,9 @@ pub fn find_claude() -> Result<String, String> {
 }
 
 /// The managed Claude Code of the package store the lab's facts `p` name
+/// ([`crate::paths::Paths::store_home`], the account's whatever `HOME` says),
+/// as `aterm` reports it ([`pkg_which`]).
+///
 /// # Errors
 /// `aterm` could not be run, or named no managed Claude Code.
 fn store_claude(p: &crate::paths::Paths, aterm: &Path) -> Result<String, String> {
@@ -149,6 +152,11 @@ fn managed_store_bin_in(p: &crate::paths::Paths, aterm: &Path, name: &str) -> Op
 }
 
 /// The first line `aterm pkg which <name>` prints, run under a clean
+/// environment whose `HOME` is `home`: the home whose package store holds the
+/// managed agents ([`crate::paths::Paths::store_home`], the account's), never
+/// the caller's `HOME`, which under a scratch `HOME` holds no store and would
+/// leave every agent to a `LAB_*` variable set by hand.
+///
 /// # Errors
 /// `aterm` could not be run.
 fn pkg_which(aterm: &Path, home: &str, name: &str) -> Result<String, String> {
@@ -515,6 +523,10 @@ fn lifeline_flag() -> Vec<String> {
 const READY_HANG: Duration = Duration::from_secs(60);
 
 /// `sandbox-exec -f <jail> env -i <vars> <program…>` as a std `Command`, in a
+/// session of its own, started in the scratch, its output appended to `out`,
+/// every descriptor above stdio stripped first (`InheritNothing`): the jailed
+/// launch [`launch_ready`] and [`launch_window`] spawn.
+///
 /// # Errors
 /// `out` could not be opened.
 fn jailed_command(
@@ -548,6 +560,11 @@ fn jailed_command(
 }
 
 /// A WINDOWED instance launched in the jail ([`jailed_command`]): a window
+/// takes no ready signal (`--ready-fd` is a headless launch's, refused for a
+/// window a person sees come up), so it is ready once its control socket
+/// answers `version` through the lab's door, asked every 250 ms up to `hang`
+/// (the hang detector).
+///
 /// # Errors
 /// The launch failed, the child ended before its socket answered, it did not
 /// answer within `hang`, or the run was interrupted (`interrupted`).
@@ -575,6 +592,10 @@ fn launch_window(
 }
 
 /// A window's readiness ([`launch_window`]): `answers` (its control socket
+/// answered `version`) is asked first, then `alive` (the child still runs),
+/// then the hang detector `hang`; between the asks, `pause` (250 ms, which
+/// fails `interrupted` on an interrupt).
+///
 /// # Errors
 /// The child ended before an answer, nothing answered within `hang`, or
 /// `pause` failed.
@@ -863,6 +884,9 @@ pub(crate) fn names_this_lab(run: &Run, pid: i32) -> bool {
 }
 
 /// Whether `up` may make the lab `run` names at `now`: no lab of its tag is
+/// up (no `env.sh`), and no copy of the lab's program an earlier lab of the
+/// tag left is still unproven.
+///
 /// # Errors
 /// Why the tag cannot come up now.
 fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
@@ -1765,6 +1789,8 @@ fn relay_shown_running(run: &Run) -> bool {
 }
 
 /// Lay the relay for a launch behind it: this program under the name `node`,
+/// copied where jailed code cannot write (`relay/node`), ONCE per lab.
+///
 /// # Errors
 /// The copy could not be made.
 fn lay_relay(run: &Run) -> Result<(), Fail> {

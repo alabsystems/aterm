@@ -84,7 +84,9 @@ impl HostState {
         self.unlogged.take()
     }
 
-    /// The resolution of the current choice, made now if none was.
+    /// The resolution of the current choice, made now if none was. The first
+    /// resolution of a choice that names an OpenConsole (every one but
+    /// `inbox`, the default included) and found none is handed to the log.
     fn resolution(
         &mut self,
         resolve: impl FnOnce(&ConsoleHostChoice) -> Result<OpenConsoleExe, String>,

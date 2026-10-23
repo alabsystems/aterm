@@ -16,10 +16,7 @@ use aterm_uds::CtlStream;
 use super::run::{Ctl, CtlReply, Interrupter};
 use crate::RelayClient;
 
-/// How long a request that names no `timeout` may wait for its answer.
 const DEFAULT_REPLY_WAIT: Duration = Duration::from_secs(60);
-/// What an `await … timeout <ms>` may take past its own bound before the
-/// connection is judged hung.
 const AWAIT_MARGIN: Duration = Duration::from_secs(5);
 
 /// Where [`RelayCtl`] sends what no session's host answers: a named socket, or the one `aterm-ctl` would resolve (re-resolved at every dial).
@@ -34,48 +31,25 @@ pub enum Endpoint {
 /// Persistent, authenticated control connections behind the [`Ctl`] seam, one per instance that answers its requests.
 pub struct RelayCtl {
     endpoint: Endpoint,
-    /// A token given up front (the host's own) for the endpoint's socket;
-    /// `None` reads the one beside the socket at every dial, once that dial's
-    /// connect succeeded, as every dial to a session's host does.
     token: Option<String>,
-    /// The rendezvous dir whose graph entries name each session's host
-    /// ([`aterm_uds::control_socket_dir`]); `None` sends every request to the
-    /// endpoint.
     rendezvous: Option<PathBuf>,
-    /// The socket [`Endpoint::Resolved`] named at its last resolution, which
-    /// stands while a connection dialled there lives.
     resolved: Option<String>,
     conns: Vec<Conn>,
     next_id: u64,
-    /// A second handle on each live connection, by [`Conn::id`], for the
-    /// interrupter.
     shut: Arc<Mutex<Vec<(u64, CtlStream)>>>,
-    /// Set by the interrupter: every request from then on fails.
     cut: Arc<AtomicBool>,
-    /// The token given up front is one a listener may refuse (the in-GUI
-    /// harness's in-memory token, which only the process that minted it
-    /// knows): on `ERR auth` the transport drops it for good and reads the
-    /// one beside the socket, once ([`Self::preferring`]).
     beside_on_refusal: bool,
 }
 
-/// One connection [`RelayCtl`] holds.
 struct Conn {
     id: u64,
-    /// The socket it was dialled at.
     sock: String,
     carries: Carries,
     client: RelayClient<CtlStream>,
 }
 
-/// Which requests ride a [`Conn`].
 enum Carries {
-    /// Those the instance at its socket answers itself: requests naming no
-    /// session, and those naming one of `hosted`, the sessions whose graph
-    /// entries named that socket.
     Own { hosted: Vec<String> },
-    /// Only requests about this session, which the endpoint was not found to
-    /// host and may relay: after it does, the connection is the host's.
     Relayed(String),
 }
 
@@ -85,22 +59,14 @@ impl Carries {
     }
 }
 
-/// Which connection a request rides ([`RelayCtl::conn_for`]).
 enum Route<'a> {
-    /// It names no session and is aimed at none: the endpoint answers it.
     Endpoint,
-    /// It names this session ([`aterm_ctl::target_sid`]).
     Names(Sid<'a>),
-    /// It names none, but asks the instance hosting this one
-    /// ([`Ctl::call_at_host_of`]).
     HostOf(Sid<'a>),
 }
 
-/// Why a dial gave no connection.
 enum DialError {
-    /// Nothing listens at the socket (`ENOENT`, `ECONNREFUSED`).
     NoHost(String),
-    /// Anything else, the request's failure.
     Failed(String),
 }
 
@@ -128,7 +94,7 @@ impl RelayCtl {
         }
     }
 
-    /// A transport that presents `token` first and, should the listener answer `ERR auth` (a seamless update's successor rebound the socket, and does not know a token this process held only in memory), the token beside the socket from then on: the request is sent again on that connection, once — the refused one ran nothing (design §2.5).
+    /// A transport that tries `token` first and falls back to the token beside the socket on `ERR auth`.
     pub fn preferring(endpoint: Endpoint, token: String) -> Self {
         Self {
             beside_on_refusal: true,
@@ -136,8 +102,6 @@ impl RelayCtl {
         }
     }
 
-    /// [`Self::new`]'s transport reading the session graph in `dir` instead
-    /// (the tests' scratch rendezvous dirs).
     #[cfg(all(test, unix))]
     fn in_rendezvous(mut self, dir: &std::path::Path) -> Self {
         self.rendezvous = Some(dir.to_path_buf());
@@ -151,8 +115,6 @@ impl RelayCtl {
         self.conn_for(Route::Endpoint).map(|_| ())
     }
 
-    /// The endpoint's socket: the named one, or the one resolved for a live
-    /// connection, else resolved afresh.
     fn endpoint_sock(&mut self) -> Result<String, String> {
         let self_sid = match &self.endpoint {
             Endpoint::Socket(s) => return Ok(s.clone()),
@@ -169,7 +131,6 @@ impl RelayCtl {
         Ok(s)
     }
 
-    /// Whether `sock` is the endpoint's, the one socket the given token is for.
     fn is_endpoint(&self, sock: &str) -> bool {
         match &self.endpoint {
             Endpoint::Socket(s) => s == sock,
@@ -177,10 +138,6 @@ impl RelayCtl {
         }
     }
 
-    /// A connection to `sock`, authenticated: with the given token on the
-    /// endpoint's socket, else with the token beside `sock`, read once this
-    /// dial's connect succeeded, so it is the listener's that took it — never
-    /// one read for a socket an update's successor has since rebound.
     fn dial(&self, sock: &str) -> Result<RelayClient<CtlStream>, DialError> {
         let connect_failed = |e: &io::Error| {
             let words = format!("connect {sock}: {e}");
@@ -209,7 +166,6 @@ impl RelayCtl {
             .map_err(|e| DialError::Failed(format!("connect {sock}: {e}")))
     }
 
-    /// Hold `client`, dialled at `sock`, for the requests `carries` names.
     fn hold(&mut self, sock: String, carries: Carries, client: RelayClient<CtlStream>) -> usize {
         let id = self.next_id;
         self.next_id += 1;
@@ -228,7 +184,6 @@ impl RelayCtl {
         self.conns.len() - 1
     }
 
-    /// The endpoint's own connection, dialled when there is none.
     fn endpoint_conn(&mut self) -> Result<usize, String> {
         let sock = self.endpoint_sock()?;
         let own = |c: &Conn| c.sock == sock && matches!(c.carries, Carries::Own { .. });
@@ -239,7 +194,6 @@ impl RelayCtl {
         Ok(self.hold(sock, Carries::Own { hosted: Vec::new() }, client))
     }
 
-    /// The index of the connection `route` rides, dialled when none does.
     fn conn_for(&mut self, route: Route<'_>) -> Result<usize, String> {
         let (sid, named) = match route {
             Route::Endpoint => return self.endpoint_conn(),
@@ -283,9 +237,6 @@ impl RelayCtl {
         Ok(self.hold(sock, Carries::Relayed(s.to_string()), client))
     }
 
-    /// Let the connection at `at` go: a request that failed mid-exchange left
-    /// its stream at an unknown place, and the routes it carried are decided
-    /// again by the next request.
     fn drop_conn(&mut self, at: usize) {
         let conn = self.conns.swap_remove(at);
         self.shut
@@ -294,8 +245,6 @@ impl RelayCtl {
             .retain(|(id, _)| *id != conn.id);
     }
 
-    /// One request: on the connection its route names ([`Self::conn_for`]),
-    /// rendered as `aterm-ctl` prints the reply.
     fn exchange(&mut self, args: &[&str], host_of: Option<&str>) -> Result<CtlReply, String> {
         if self.cut.load(Ordering::SeqCst) {
             return Err("the supervisor was stopped".to_string());
@@ -355,7 +304,6 @@ impl RelayCtl {
     }
 }
 
-/// A failure the client itself reports, as `aterm-ctl` prints it.
 fn client_failure(text: &str) -> CtlReply {
     CtlReply {
         code: 1,
@@ -364,7 +312,6 @@ fn client_failure(text: &str) -> CtlReply {
     }
 }
 
-/// An I/O error on the connection, in the words [`CtlReply::lost`] knows.
 fn io_words(e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::UnexpectedEof => {
@@ -380,8 +327,6 @@ fn io_words(e: &io::Error) -> String {
     }
 }
 
-/// How long the answer to `args` may take: an `await`'s own `timeout <ms>`
-/// (or `timeout=<ms>`) plus a margin, else the default.
 fn reply_wait(args: &[&str]) -> Duration {
     let ms = args.iter().enumerate().find_map(|(i, a)| {
         if *a == "timeout" {
@@ -396,15 +341,11 @@ fn reply_wait(args: &[&str]) -> Duration {
     }
 }
 
-/// Whether a status line is a server-reported TIMEOUT (`aterm-ctl`'s exit
-/// 124): a bare `OK timeout`, or a verdict carrying `status=timeout`.
 fn is_timeout(status: &str) -> bool {
     let mut it = status.split_whitespace();
     it.next() == Some("OK") && (it.clone().eq(["timeout"]) || it.any(|w| w == "status=timeout"))
 }
 
-/// The body as text: valid UTF-8 (every counted reply) is taken as it is,
-/// anything else read lossily, as `aterm-ctl` prints it.
 fn lossy(body: Vec<u8>) -> String {
     String::from_utf8(body).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
@@ -425,7 +366,6 @@ pub(super) fn render(
     let mut stderr = String::new();
     let stdout = match framing {
         Framing::Lines => {
-            // `search`'s ` incomplete` marker: the note `aterm-ctl` prints.
             if verb == "search"
                 && let Some(note) = aterm_ctl::search_incomplete_note(tail)
             {
@@ -442,7 +382,6 @@ pub(super) fn render(
             } else if empty {
                 stderr.push_str(&format!("aterm-ctl: {header} ({verb}: no results)\n"));
             } else if !turn && let Some(note) = aterm_ctl::frame_open_note(tail) {
-                // `text`'s `frame=open`, whose header is not shown: the note `aterm-ctl` prints.
                 stderr.push_str(&format!("aterm-ctl: {note}\n"));
             }
             lossy(body)
@@ -491,9 +430,6 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    /// A server on a scratch socket: it takes the `AUTH` line, then answers
-    /// each request line with the next scripted reply (verbatim bytes),
-    /// recording the lines it read; `None` closes the connection unanswered.
     fn serve(
         tag: &str,
         replies: Vec<Option<&'static str>>,
@@ -542,11 +478,6 @@ mod tests {
         (path, h)
     }
 
-    /// R10 (phase 3A): a token given up front that the listener refuses
-    /// (`ERR auth`: an update's successor rebound the socket and never knew
-    /// a token held only in memory) is dropped for the one beside the socket,
-    /// and the request goes out again on that connection, once; every later
-    /// request uses it.
     #[test]
     fn a_refused_preferred_token_falls_back_to_the_one_beside_the_socket() {
         let dir = crate::supervise::test_scratch_path("relayctl", "prefer");
@@ -613,7 +544,6 @@ mod tests {
         );
     }
 
-    /// Every reply shape the loop reads comes out as `aterm-ctl` prints it.
     #[test]
     fn replies_render_as_aterm_ctl_prints_them() {
         let (sock, h) = serve(
@@ -674,8 +604,6 @@ mod tests {
                  1 incomplete older\n"
             )
         );
-        // A read of a frame the program had not finished: the rows on stdout, `aterm-ctl`'s
-        // note for its `frame=open` on stderr.
         let text = c.call(&["@s-1", "text"]).expect("text");
         assert_eq!(
             (text.stdout.as_str(), text.stderr.as_str()),
@@ -691,8 +619,6 @@ mod tests {
         assert_eq!(seen.len(), 11, "one connection, one AUTH: {seen:?}");
     }
 
-    /// A connection that closes unanswered is `lost` in `aterm-ctl`'s words,
-    /// and the next request dials again (a second AUTH) and is served.
     #[test]
     fn a_dropped_connection_is_lost_and_the_next_request_dials_again() {
         let (sock, h) = serve("drop", vec![None, Some("OK 0\n")]);
@@ -710,8 +636,6 @@ mod tests {
         );
     }
 
-    /// Negative control: a socket nothing listens on is `lost` too (the
-    /// `connect <path>: …` words), never a server answer.
     #[test]
     fn an_absent_socket_is_lost() {
         let mut c = RelayCtl::new(
@@ -722,7 +646,6 @@ mod tests {
         assert!(r.lost() && !r.ok(), "{r:?}");
     }
 
-    /// The interrupter cuts a parked request short and every one after it.
     #[test]
     fn the_interrupter_ends_a_parked_request() {
         let dir = std::env::temp_dir().join(format!("aterm-relayctl-cut-{}", std::process::id()));
@@ -757,8 +680,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The cut hangs up a connection its server half-closed (a relay passes its child's EOF on
-    /// so) while the transport still holds it: the server reads its end-of-file at the cut.
     #[test]
     fn the_interrupter_hangs_up_a_connection_its_server_half_closed() {
         use std::io::Read as _;
@@ -790,34 +711,21 @@ mod tests {
         drop(c);
     }
 
-    /// How a stand-in instance answers ([`instance`]).
     struct Stand {
-        /// Who answers: each request `OK <name>`, a `who` a roster of the one
-        /// row `<name>`.
         name: &'static str,
-        /// A session the instance relays, as a server forwards one it does not
-        /// host: the rest of a connection that carried a request naming it is
-        /// the host's, which answers as `<sid>-host`.
         relays: Option<&'static str>,
-        /// How many requests a connection is answered before the instance
-        /// hangs it up.
         answers: usize,
     }
 
-    /// A stand-in instance on a socket of a scratch rendezvous dir.
     struct Instance {
         sock: String,
-        /// Each connection's lines, its `AUTH` line first, in accept order.
         seen: Arc<Mutex<Vec<Vec<String>>>>,
-        /// A connection's number as it closes.
         ended: std::sync::mpsc::Receiver<usize>,
         stop: Arc<AtomicBool>,
         accept: std::thread::JoinHandle<()>,
     }
 
     impl Instance {
-        /// Stop accepting, wait for every connection to close, and give back
-        /// the lines each carried.
         fn finish(self) -> Vec<Vec<String>> {
             self.stop.store(true, Ordering::SeqCst);
             drop(std::os::unix::net::UnixStream::connect(&self.sock));
@@ -827,8 +735,6 @@ mod tests {
         }
     }
 
-    /// Serve `stand` on `sock`, each connection on its own thread, as a
-    /// server parks every connection a client holds.
     fn instance(sock: std::path::PathBuf, stand: Stand) -> Instance {
         let listener = UnixListener::bind(&sock).expect("bind");
         let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
@@ -904,7 +810,6 @@ mod tests {
         }
     }
 
-    /// Publish `sid`'s graph entry in the rendezvous dir `dir`, naming `sock`.
     fn publish(dir: &std::path::Path, sid: &str, sock: &str) {
         let graph = dir.join("graph");
         std::fs::create_dir_all(&graph).expect("graph dir");
@@ -916,11 +821,6 @@ mod tests {
         reply.expect("reply").stdout
     }
 
-    /// A WORKER ON ANOTHER INSTANCE GETS ITS OWN CONNECTION: a request naming
-    /// the session goes to the instance its graph entry names, on that
-    /// instance's one connection, authenticated with the token beside its
-    /// socket (the given token is the endpoint's alone), and so does a request
-    /// aimed at the session's host ([`Ctl::call_at_host_of`]).
     #[test]
     fn a_worker_on_another_instance_gets_its_own_connection() {
         let dir = crate::supervise::ScratchDir::new("relayctl", "hosts");
@@ -960,9 +860,6 @@ mod tests {
         );
     }
 
-    /// A SESSION NO HOST ANSWERS FOR RIDES A CONNECTION OF ITS OWN to the
-    /// endpoint, which may relay it: a graph entry naming a socket nothing
-    /// listens on (a crashed host), one naming a removed socket, and no entry.
     #[test]
     fn a_session_no_host_answers_for_rides_a_connection_of_its_own() {
         let dir = crate::supervise::ScratchDir::new("relayctl", "nohost");
@@ -1001,10 +898,6 @@ mod tests {
         );
     }
 
-    /// A HOST THAT HANGS UP IS FOUND AGAIN BY ITS GRAPH ENTRY: the request it
-    /// dropped is lost, in `aterm-ctl`'s words, and the next one reads the
-    /// entry again and reaches the successor it names now (a self-update's),
-    /// with that successor's token.
     #[test]
     fn a_host_that_hangs_up_is_found_again_by_its_graph_entry() {
         let dir = crate::supervise::ScratchDir::new("relayctl", "successor");
@@ -1035,9 +928,6 @@ mod tests {
         assert_eq!(new.finish(), [vec!["AUTH newtok", "@s-ab meta"]]);
     }
 
-    /// THE CUT HANGS UP EVERY CONNECTION the transport holds, the endpoint's
-    /// and each host's, while it still holds them, and every request after it
-    /// fails, whichever connection it would ride.
     #[test]
     fn the_interrupter_hangs_up_every_connection() {
         let dir = crate::supervise::ScratchDir::new("relayctl", "cut-all");

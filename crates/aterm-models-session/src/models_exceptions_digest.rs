@@ -1,20 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The exceptions digest never asks for a band row, never loses an entry, and
-//! never lets a dismissal be undone by the same fact.
+//! Formal model of the exceptions digest (`MessageCenter::digest`).
 
 use aterm_spec::derive::Model;
 
-/// `open` exceptions stand in the digest (`MessageCenter::digest`); `glass` is the band rows the
-/// center wants (`MessageCenter::wanted_rows`); `now_rows` is the ghost of what Working, Notice
-/// and Now messages earn, so `LaterNeverWantsARow` says a `Later` never wants a band row.
-/// `PostLaterAtCap` files the oldest entry with its log line (`filed` saturates to keep the space
-/// finite); `Cap` is `DIGEST_CAP`. `FileAll` is "Dismiss all", which quiets the facts it filed
-/// until `Resurface` (their span passing); `Suppress` is a dismissed fact raised inside its span.
-/// `Buggy=1` adds one mutant per invariant: a seated `Later`, a re-post through a dismissal, a cap
-/// that drops an entry without its line, and an over-cap post.
-/// Tier-1: `aterm-messages/tests/conformance_digest.rs`.
+/// Model verifying that `Later` exceptions never request a row, drop entries, or bypass dismissal.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exceptions_digest_model() -> Model {

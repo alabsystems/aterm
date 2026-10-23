@@ -44,7 +44,9 @@ pub(crate) struct UpdateState {
     /// The failing class (`apply`, `pipeline`, …) when `failing_persistent`: the most
     /// recent one, which is why it cannot decide [`Self::apply_is_failing`].
     failing_kind: String,
-    /// Consecutive apply failures.
+    /// Consecutive apply failures. `>= PERSISTENT_AFTER` is the exact statement "the
+    /// staged build will not start", whichever class failed last; any non-zero value is
+    /// already news (the threshold decides how loudly the person is told, not whether).
     failing_applies: u32,
     /// Why those applies failed: the ledger's `last_apply_error`, the prose the control
     /// socket prints as `apply_failure=`.
@@ -378,7 +380,11 @@ impl UpdateState {
         })
     }
 
-    /// A stage this copy cannot apply is not a stage for this copy.
+    /// A stage this copy cannot apply is not a stage for this copy. `aterm_update::status()`
+    /// reads a HOME-keyed Updates directory, so every copy for one user shares one
+    /// ready.toml, while `installable` is per-copy (`bundle::resolve()`): an older aterm.app
+    /// opened from a DMG would otherwise headline the installed copy's stage and offer an
+    /// Install whose apply returns `NotApplicable`.
     fn without_inapplicable_stage(mut self) -> Self {
         if self.linux_host {
             self.staged = None;

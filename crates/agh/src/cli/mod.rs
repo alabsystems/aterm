@@ -304,7 +304,7 @@ impl Ctx {
     /// The same context with these terminal flags.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn with_terminals(mut self, stdout: bool, stderr: bool) -> Ctx {
+    pub const fn with_terminals(mut self, stdout: bool, stderr: bool) -> Ctx {
         self.stdout_is_terminal = stdout;
         self.stderr_is_terminal = stderr;
         self
@@ -313,7 +313,7 @@ impl Ctx {
     /// The same context, its stdin a terminal or not.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn with_stdin_terminal(mut self, stdin: bool) -> Ctx {
+    pub const fn with_stdin_terminal(mut self, stdin: bool) -> Ctx {
         self.stdin_is_terminal = stdin;
         self
     }

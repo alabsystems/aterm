@@ -33,7 +33,9 @@ fn light_emitter_fill(hue: f32, e: f32) -> u32 {
     )
 }
 
-/// Charged breath (turns/sec of the wing pulse) and its depth.
+/// Charged breath (turns/sec of the wing pulse) and its depth. The phase freezes
+/// below [`SETTLED_ENERGY`], so an unrelated present after a long idle never
+/// advances a hidden clock and changes brightness.
 const PULSE_HZ: f32 = 0.30;
 const PULSE_DEPTH: f32 = 0.55;
 
@@ -190,7 +192,8 @@ impl CursorPhaser {
         }
     }
 
-    /// Emit the two lens-shaped wings as premultiplied additive quads.
+    /// Emit the two lens-shaped wings as premultiplied additive quads. Bounded by construction:
+    /// `WING_LAYERS.len()` layers × (cell_h / slab) slabs × 2 sides.
     #[allow(
         clippy::too_many_arguments,
         reason = "cursor cell + charge/hue + geometry/config; one internal call site"

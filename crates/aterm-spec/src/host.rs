@@ -19,6 +19,7 @@ pub use aterm_uds::host::{held_probe, sh_held, sh_held_any};
 #[must_use]
 pub fn oversubscribed() -> Option<String> {
     unsafe extern "C" {
+        /// `<stdlib.h>`; declared here, as `aterm-gui` does: aterm-libc does
         /// not export it.
         fn getloadavg(loadavg: *mut f64, nelem: libc::c_int) -> libc::c_int;
     }
@@ -94,6 +95,9 @@ pub fn shell_command(
 mod tests {
     use super::*;
 
+    /// docs/DESIGN-init-system-2026-10-20.md §10 S2: the hermetic helper's child prints the
+    /// scratch HOME and XDG dirs.
+    /// NEGATIVE CONTROL: the same child without the helper prints this process's
     /// own HOME. `/bin/sh -c printf` reads and writes nothing in either home.
     #[test]
     fn the_hermetic_childs_home_is_the_scratch_and_a_plain_childs_is_not() {

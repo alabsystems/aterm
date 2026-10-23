@@ -113,14 +113,6 @@ impl Encoding<'_> {
 
         let index = usize::from(code);
         match self.kind {
-            // Standard encodings store a StringID/SID and not GlyphID/GID.
-            // Therefore we have to get SID first and then convert it to GID via Charset.
-            // Custom encodings (FormatN) store GID directly.
-            //
-            // Indexing for predefined encodings never fails,
-            // because `code` is always `u8` and encodings have 256 entries.
-            //
-            // We treat `Expert` as `Standard` as well, since we allow only 8bit codepoints.
             EncodingKind::Standard | EncodingKind::Expert => {
                 let sid = StringId(u16::from(STANDARD_ENCODING[index]));
                 charset.sid_to_gid(sid)
@@ -134,7 +126,6 @@ impl Encoding<'_> {
                     .map(GlyphId)
             }
             EncodingKind::Format1(ref table) => {
-                // Starts from 1 because .notdef is implicit.
                 let mut gid: u16 = 1;
                 for range in table.into_iter() {
                     let end = range.first.saturating_add(range.left);
@@ -154,14 +145,11 @@ impl Encoding<'_> {
 
 pub(crate) fn parse_encoding<'a>(s: &mut Stream<'a>) -> Option<Encoding<'a>> {
     let format = s.read::<u8>()?;
-    // The first high-bit in format indicates that a Supplemental encoding is present.
-    // Check it and clear.
     let has_supplemental = format & 0x80 != 0;
     let format = format & 0x7f;
 
     let count = u16::from(s.read::<u8>()?);
     let kind = match format {
-        // TODO: read_array8?
         0 => s.read_array16::<u8>(count).map(EncodingKind::Format0)?,
         1 => s
             .read_array16::<Format1Range>(count)

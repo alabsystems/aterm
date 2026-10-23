@@ -1755,7 +1755,7 @@ fn missing_dir_reason() -> String {
         .to_string()
 }
 
-const fn other_elevation_note() -> Option<String> {
+fn other_elevation_note() -> Option<String> {
     #[cfg(windows)]
     {
         let elevated = aterm_uds::elevation::is_elevated();

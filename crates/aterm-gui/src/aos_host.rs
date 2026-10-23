@@ -110,7 +110,7 @@ impl App {
 
     /// A publication's (or resume's, or detach's) host half: the window's next frame is
     /// ticked by the pair now live. The lane is re-planned by `about_to_wait` on this
-    /// turn (module docs).
+    /// turn.
     fn aos_reconcile(&self, id: WindowId) {
         if let Some(w) = self.windows.get(&id).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();

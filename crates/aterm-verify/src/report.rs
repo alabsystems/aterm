@@ -30,7 +30,7 @@ pub struct CheckResult {
 
 /// The word a check's line opens with.
 #[must_use]
-pub fn word(o: Outcome) -> &'static str {
+pub const fn word(o: Outcome) -> &'static str {
     match o {
         Outcome::Ok => "ok",
         Outcome::Skip => "skip",

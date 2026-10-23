@@ -13,7 +13,11 @@ static GOT_CHLD: AtomicBool = AtomicBool::new(false);
 /// The write end of the loop's wake pipe ([`wake_pipe`]); -1 until it exists.
 static WAKE_WR: AtomicI32 = AtomicI32::new(-1);
 
-/// The handler of both signals the loop waits on.
+/// The handler of both signals the loop waits on. A flag alone is a lost
+/// wakeup: one raised between the loop's check and its `poll(2)` (or on
+/// another thread, where `poll` sees no `EINTR`) waits for the next I/O, a
+/// resize applied late and a shell's exit not seen while a job holds the
+/// slave.
 extern "C" fn on_signal(sig: libc::c_int) {
     let errno = errno_slot();
     // SAFETY: `errno` points to the calling thread's errno slot.
@@ -56,7 +60,9 @@ fn wake_pipe() -> Option<libc::c_int> {
     Some(rd)
 }
 
-/// Route `sig` to [`on_signal`].
+/// Route `sig` to [`on_signal`]. `SA_RESTART` keeps this process's other
+/// threads' blocking calls running through it; the loop's `poll(2)` is never
+/// restarted, and the wake pipe holds the byte by then anyway.
 fn catch(sig: libc::c_int, flags: libc::c_int) {
     // SAFETY: zeroed `sigaction` is valid and initialized before `sigaction`.
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };

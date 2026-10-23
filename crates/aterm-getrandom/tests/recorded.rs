@@ -1,16 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`Error`] answers as the crates.io getrandom 0.2.17 gave them, recorded on
-//! aarch64-apple-darwin before the `[patch.crates-io]` row replaced it (the
-//! recorder was an out-of-workspace crate pinning `getrandom = "=0.2.17"`, which
-//! the patch table cannot reach): each named constant's code, then per code
-//! `raw_os_error`, `Display`, `Debug`, and the `std::io::Error` it converts to.
-//!
-//! The OS rows use error numbers whose meaning and text Darwin and glibc
-//! share; upstream has no OS text off Unix, so they are Unix-only. The code
-//! just below `INTERNAL_START` is an errno no OS knows: upstream's
-//! `strerror_r` fails there and it prints `OS Error: N`.
+//! [`Error`] answers as the crates.io getrandom 0.2.17 gave them, recorded on aarch64-apple-darwin
+//! before the `[patch.crates-io]` row replaced it (the recorder was an out-of-workspace crate
+//! pinning `getrandom = "=0.2.17"`, which the patch table cannot reach): each named constant's
+//! code, then per code `raw_os_error`, `Display`, `Debug`, and the `std::io::Error` it converts to.
 
 use core::num::NonZeroU32;
 
@@ -322,11 +316,6 @@ fn check(rows: &[Row]) {
         assert_eq!(err.to_string(), display, "{code}");
         assert_eq!(format!("{err:?}"), debug, "{code}");
         let io = std::io::Error::from(err);
-        // An OS code converts as upstream converts it, through
-        // `io::Error::from_raw_os_error`, whose kind is the standard
-        // library's to name: a newer one names EIO `InputOutputError` where
-        // the recording's named it `Uncategorized` (stock 1.99.1 on the
-        // Linux lane). The recorded kind is the one any other code takes.
         match io_raw {
             Some(errno) => assert_eq!(
                 io.kind(),

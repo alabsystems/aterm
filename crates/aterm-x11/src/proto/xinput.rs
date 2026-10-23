@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! XInput 2's requests the window system's input handling sends: the
-//! version, event selection per device, and a pointer query. Written against
-//! inputproto's XI2 protocol description (xcbproto `xinput.xml`); bytes held
-//! to x11rb-protocol 0.13.2's (`tests/recorded/`). XI2's events arrive
-//! through Xlib (`XGetEventData`), not through this codec.
+//! XInput 2 protocol requests and replies.
 
 use super::{ParseError, Reply, Request, Void, Window, Writer, reply_head};
 

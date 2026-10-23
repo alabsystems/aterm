@@ -349,7 +349,7 @@ const CLASSES: [WallKind; 5] = [
     WallKind::Memory,
 ];
 
-fn bit(c: Class) -> u8 {
+const fn bit(c: Class) -> u8 {
     match c {
         Class::Limit => 1,
         Class::Context => 2,
@@ -713,7 +713,7 @@ struct TurnTokens {
 }
 
 impl TurnTokens {
-    fn add(&mut self, u: TokenUsage) {
+    const fn add(&mut self, u: TokenUsage) {
         self.tok_in = self
             .tok_in
             .saturating_add(u.input)
@@ -787,7 +787,7 @@ fn vref_of(obj: &Map) -> Option<StepId> {
 }
 
 /// A `promptId` as the fold compares it (any string, never kept).
-fn fingerprint(id: &str) -> u64 {
+const fn fingerprint(id: &str) -> u64 {
     aterm_hash::fnv1a_64(id.as_bytes())
 }
 
@@ -887,7 +887,7 @@ impl StepFold {
     }
 
     /// The registry read named session `sid` (its id's fingerprint) and no transcript for it.
-    pub fn note_vacant(&mut self, sid: u64) {
+    pub const fn note_vacant(&mut self, sid: u64) {
         self.vacant = Some(Vacancy { sid, fp: None });
     }
 
@@ -902,19 +902,19 @@ impl StepFold {
 
     /// Whether a file is bound.
     #[must_use]
-    pub fn is_bound(&self) -> bool {
+    pub const fn is_bound(&self) -> bool {
         self.bound.is_some()
     }
 
     /// The main chain's end.
     #[must_use]
-    pub fn end(&self) -> End {
+    pub const fn end(&self) -> End {
         self.end.end
     }
 
     /// Whether the fold latched off.
     #[must_use]
-    pub fn broken(&self) -> bool {
+    pub const fn broken(&self) -> bool {
         self.broken
     }
 
@@ -983,7 +983,7 @@ impl StepFold {
     }
 
     /// A line of the main transcript longer than the line bound, ending at `end`: counted lost when it is past the seed.
-    pub fn long_line(&mut self, end: u64) {
+    pub const fn long_line(&mut self, end: u64) {
         if end > self.seed {
             self.lost = self.lost.saturating_add(1);
         }
@@ -1143,7 +1143,7 @@ impl StepFold {
 
     /// End the opening hold: what it held goes on in the queue as it was
     /// read.
-    fn release(&mut self) {
+    const fn release(&mut self) {
         self.hold = None;
     }
 

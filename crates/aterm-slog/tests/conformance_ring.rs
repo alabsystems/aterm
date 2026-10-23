@@ -664,6 +664,9 @@ fn slog_ring_conforms_to_derived_model() {
     }
 }
 
+/// THE POLICY FUNCTIONS, by name: a batch starts where the model's append
+/// arms one (`over_limits`, the ring past `Cap`) and stops at the model's
+/// `Low` (`low_water`), and closes go before current detail exactly when
 /// the model's `Hf` says they pass half (`closes_over_half`).
 #[test]
 fn eviction_policy_is_the_models() {
@@ -682,6 +685,15 @@ fn eviction_policy_is_the_models() {
     }
 }
 
+/// THE OVER-HALF RULE IS THE MODEL'S, WHERE IT DECIDES: a three-record ring
+/// evicts two records a batch from at most three candidates, so closes and
+/// current detail are taken alike whichever goes first, and the rule never
+/// shows in the walk above. At the model's `Cap = 6` (`Low = 5`), five runs
+/// opened and closed, then session marks: a batch faces four closes (past
+/// half) and two current marks, and takes one close, then (the closes no
+/// longer past half) one mark. The real ring's step is the model's, by
+/// `EvictClose` then `EvictCurrentOut`. NEGATIVE CONTROL: the ring a rule
+/// without the half guard leaves (both marks taken, every close kept) is
 /// one the model never reaches, and so is the one that takes two closes.
 #[test]
 fn the_over_half_rule_is_the_models_where_it_decides() {

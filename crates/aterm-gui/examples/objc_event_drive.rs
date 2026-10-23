@@ -718,7 +718,8 @@ mod macos {
             events.iter().filter(|e| e.as_str() == name).count()
         }
 
-        /// Enter one row with one event and log the survival.
+        /// Enter one row with one event and log the survival. A nil event means the
+        /// shape could not be built, which is logged as NOT DRIVEN and fails the run.
         fn drive(&mut self, view: Id, row: Sel, row_name: &str, event: Id, shape: &str) {
             if event.is_null() {
                 let why = format!("{row_name} <- {shape}: the event could not be built");

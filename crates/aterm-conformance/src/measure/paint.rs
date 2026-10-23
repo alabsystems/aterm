@@ -50,7 +50,7 @@ pub enum Scene {
 impl Scene {
     /// The `fake-tui` shape the scene runs, if any.
     #[must_use]
-    pub fn tui(self) -> Option<&'static str> {
+    pub const fn tui(self) -> Option<&'static str> {
         match self {
             Self::Prompt => None,
             Self::FakeClaude | Self::ColdSpinner => Some("claude"),
@@ -60,7 +60,7 @@ impl Scene {
     }
 
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Prompt => "prompt",
             Self::FakeClaude => "fake-claude",
@@ -130,7 +130,7 @@ pub enum Style {
 impl Style {
     /// The config line, or `None` for the shipped default.
     #[must_use]
-    pub fn config_line(self) -> Option<&'static str> {
+    pub const fn config_line(self) -> Option<&'static str> {
         match self {
             Self::Classic => Some("cursor_trail_style = \"rainbow kitty\""),
             Self::Default => None,
@@ -145,7 +145,7 @@ impl Style {
     /// what it resolved to: a spelling that silently resolves elsewhere is a
     /// red row.
     #[must_use]
-    pub fn binding(self) -> (&'static str, &'static [(&'static str, &'static str)]) {
+    pub const fn binding(self) -> (&'static str, &'static [(&'static str, &'static str)]) {
         const TALL: &[(&str, &str)] = &[("resolved", "rainbow-kitty"), ("ribbon_look", "tall")];
         match self {
             Self::Classic => ("rainbow kitty", TALL),
@@ -161,7 +161,7 @@ impl Style {
     }
 
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Classic => "classic",
             Self::Default => "default",
@@ -250,7 +250,7 @@ impl PaintRow {
 
     /// What a red on this row means.
     #[must_use]
-    pub fn meaning(&self) -> &'static str {
+    pub const fn meaning(&self) -> &'static str {
         match (self.expect, self.capture) {
             (Expect::EffectOff, _) => {
                 "the canonical off style leaked trail geometry, or the scanner attributed unrelated \

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `key|send as=person` (the development seam, `control_input::PERSON_SEAM`)
-//! puts a write in as a person's gesture. A headless instance has no window to
-//! key, and there it moves `status human_ms=` and `human_seq=` as a keystroke
-//! at the window does, where the same write without it moves neither. A fenced
-//! `as=person` writes nothing. The suite's aterm is a debug build, so the seam
-//! is on; a shipped aterm's refusal is the parser's own unit test.
-//!
-//! ISOLATION: `support/launch_isolation.rs`; a headless instance opens no
-//! window. An environment refusal is COULD NOT RUN, never a pass.
+//! Headless tests for the `key|send as=person` development seam.
 
 #![cfg(unix)]
 
@@ -36,7 +28,6 @@ fn as_person_stamps_the_person_and_a_plain_write_never_does() {
     let (ms0, seq0) = person(&inst, &sid);
     assert_eq!(ms0, "-", "no person has keyed a fresh session");
 
-    // A controller's writes stamp no person (the control verbs' whole point).
     headless_boot::ctl_ok(&inst, &[&at, "key", "space"]);
     headless_boot::ctl_ok(&inst, &[&at, "send", "x"]);
     assert_eq!(
@@ -45,7 +36,6 @@ fn as_person_stamps_the_person_and_a_plain_write_never_does() {
         "a plain write is a controller's"
     );
 
-    // The seam's press is a person's: the clock is stamped and counted.
     headless_boot::ctl_ok(&inst, &[&at, "key", "as=person", "space"]);
     let (ms1, seq1) = person(&inst, &sid);
     assert!(
@@ -57,7 +47,6 @@ fn as_person_stamps_the_person_and_a_plain_write_never_does() {
     let (_, seq2) = person(&inst, &sid);
     assert!(seq2 > seq1, "a person's text is counted: {seq1} -> {seq2}");
 
-    // A person's keys take no fence: refused, and nothing is counted.
     let fenced = headless_boot::said(&headless_boot::ctl(
         &inst,
         &[&at, "key", "as=person", "if=.", "space"],

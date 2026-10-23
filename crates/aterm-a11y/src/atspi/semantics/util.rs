@@ -5,9 +5,7 @@
 // Derived from accesskit_atspi_common 0.19.0 (MIT OR Apache-2.0, used under
 // Apache-2.0) src/util.rs.
 
-//! Window coordinates and text offsets: AT-SPI's screen, window and parent
-//! coordinates against the tree's window-relative ones, and AT-SPI's text
-//! offsets (Unicode scalar values) as text positions and ranges.
+//! AT-SPI window coordinate conversions and text offset utilities.
 
 use crate::model::{Point, Rect, ScrollHint};
 use crate::text::{Position as TextPosition, Range as TextRange};
@@ -15,17 +13,14 @@ use crate::tree::Node;
 
 use super::{CoordType, Error, Granularity, ScrollType};
 
-/// Where a window's client area is on the screen: what screen coordinates
-/// are relative to.
+/// Where a window's client area is on the screen.
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct WindowBounds {
     pub(crate) inner: Rect,
 }
 
 impl WindowBounds {
-    /// A window's bounds from its outer rectangle (decorations included) and
-    /// inner one, in screen coordinates. Only the inner one places anything
-    /// (accesskit_atspi_common kept the outer one and never read it).
+    /// A window's bounds from its inner rectangle; the outer one is unused.
     pub(crate) fn new(_outer: Rect, inner: Rect) -> Self {
         Self { inner }
     }
@@ -152,8 +147,7 @@ mod tests {
     use crate::model::{Node as NodeData, NodeId as LocalId, Role, Tree as TreeData, TreeUpdate};
     use crate::tree::Tree;
 
-    /// A text viewport like aterm-gui's Settings editor: one run per line,
-    /// no line breaks, and a blank line between two others.
+    /// A text viewport like aterm-gui's Settings editor.
     fn viewport(lines: &[&str]) -> TreeUpdate {
         let mut root = NodeData::new(Role::MultilineTextInput);
         let runs: Vec<LocalId> = (1..=lines.len() as u64).map(LocalId).collect();
@@ -201,8 +195,7 @@ mod tests {
         out
     }
 
-    /// `answers`, on a thread: a wait for them is a one-minute hang
-    /// detector, so a search that never returns fails the test.
+    /// `answers`, on a thread.
     fn answered(lines: &'static [&'static str]) -> Answers {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -225,12 +218,10 @@ mod tests {
     #[test]
     fn a_blank_line_ends_no_paragraph_search() {
         let got = answered(&["ab", "", "cd"]);
-        // No line ends in a break, so the paragraph is the whole viewport.
         assert_eq!(at(&got, 3, Granularity::Paragraph), Some(("abcd", 0, 4)));
         assert_eq!(at(&got, 0, Granularity::Paragraph), Some(("abcd", 0, 4)));
         assert_eq!(at(&got, 3, Granularity::Line), Some(("cd", 2, 4)));
         assert_eq!(at(&got, 1, Granularity::Char), Some(("b", 1, 2)));
-        // The same lines without the blank one answer the same paragraph.
         let control = answered(&["ab", "cd"]);
         assert_eq!(
             at(&control, 3, Granularity::Paragraph),

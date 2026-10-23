@@ -648,7 +648,8 @@ impl<'a> RingCells<'a> {
 /// ([`advance_grapheme_unit_wide`]).
 const MAX_GRAPHEME_UNIT_BYTES: usize = 256;
 
-/// A Fitzpatrick emoji skin-tone modifier (U+1F3FB..=U+1F3FF).
+/// A Fitzpatrick emoji skin-tone modifier (U+1F3FB..=U+1F3FF). Mirrors the
+/// test-gated `aterm_grapheme::is_skin_tone_modifier` and the live writer's range.
 #[inline]
 const fn is_skin_tone_modifier(c: char) -> bool {
     matches!(c, '\u{1F3FB}'..='\u{1F3FF}')

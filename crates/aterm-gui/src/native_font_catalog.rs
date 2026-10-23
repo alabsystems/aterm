@@ -710,7 +710,11 @@ mod tests {
         );
     }
 
-    /// A DISPLAY FACE IS A LAYER OVER THE PERSON'S FONT.
+    /// A DISPLAY FACE IS A LAYER OVER THE PERSON'S FONT. The prepared
+    /// generation's primary — what sets the grid and what the chrome (Settings
+    /// code text, the palette, the Manual editor) draws in — is the
+    /// `font_family` face with display faces on exactly as with them off, and
+    /// the faces are drawn over it.
     #[test]
     fn a_display_face_is_drawn_over_the_font_family_never_in_its_place() {
         let dir = aterm_tempfile::Builder::new()

@@ -30,7 +30,9 @@ mod tests;
 
 use fs::{Appender, Held, JournalFs};
 
-/// The errnos the journal tells apart (module docs).
+/// The errnos the journal tells apart (module docs). A target without POSIX
+/// errnos (Windows) gets values no raw OS error carries, so there only the
+/// `io::ErrorKind` arms and the defaults decide.
 #[cfg(unix)]
 mod errno {
     pub(super) use libc::{EAGAIN, EDQUOT, EINTR, EIO, ENOLCK, ENOSPC, ENOTSUP, EWOULDBLOCK};
@@ -804,7 +806,8 @@ impl Retirements {
     }
 }
 
-/// Caller-owned before spawn, worker-owned afterward.
+/// Caller-owned before spawn, worker-owned afterward. The owner token
+/// prevents a late old guard from disarming a newer writer on that store.
 struct RetirementLease {
     store: crate::session_store::Store,
     owner: Arc<()>,

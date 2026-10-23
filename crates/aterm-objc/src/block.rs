@@ -10,9 +10,11 @@ use std::os::raw::{c_int, c_ulong};
 use std::ptr::NonNull;
 
 unsafe extern "C" {
-    /// The `isa` every stack block points at.
+    /// The `isa` every stack block points at. Lives in libSystem's libclosure,
+    /// which every Rust macOS binary already links.
     static _NSConcreteStackBlock: [*const c_void; 32];
-    /// Move a stack block to the heap, or retain a heap block.
+    /// Move a stack block to the heap, or retain a heap block. Returns nil on
+    /// allocation failure.
     fn _Block_copy(block: *const c_void) -> *mut c_void;
     /// Release a heap block; runs `dispose` and frees on the last reference.
     fn _Block_release(block: *const c_void);
@@ -88,6 +90,9 @@ impl BlockPtr {
     }
 
     /// The block's `invoke` slot as `F`, or `None` for a nil block. `"C-unwind"`
+    /// for the reason every send is: a raise inside the framework's block
+    /// unwinds through this frame to the caller's containment.
+    ///
     /// # Safety
     ///
     /// `self` must be nil or a live block, and `F` the exact function type of

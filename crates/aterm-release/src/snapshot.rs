@@ -47,7 +47,7 @@ pub struct CacheHold {
 impl CacheHold {
     /// The cache this hold is on: every take path ([`materialize`], the build's directories) is reached through a hold, never through a bare [`CacheRoot`].
     #[must_use]
-    pub fn cache(&self) -> &CacheRoot {
+    pub const fn cache(&self) -> &CacheRoot {
         &self.cache
     }
 }
@@ -648,7 +648,8 @@ struct RawEntry<'a> {
     id: String,
 }
 
-/// A tree object's entries, each id `raw_len` bytes.
+/// A tree object's entries, each id `raw_len` bytes. `None` when the bytes are not
+/// that, or a name is not one path component.
 fn tree_entries(data: &[u8], raw_len: usize) -> Option<Vec<RawEntry<'_>>> {
     let mut entries = Vec::new();
     let mut rest = data;
@@ -1301,7 +1302,10 @@ pub(crate) fn refuse_root_cargo_config() -> Result<(), String> {
     Ok(())
 }
 
-/// Remove any Cargo config from the vendoring `CARGO_HOME`.
+/// Remove any Cargo config from the vendoring `CARGO_HOME`. The cutter writes none, and
+/// one that is there persists across cuts and is read by `targo vendor`: a
+/// `[source.crates-io] replace-with` a directory source would vendor bytes no archive
+/// was checked for.
 fn clear_cargo_home_config(cargo_home: &Path) -> Result<(), String> {
     for name in ["config.toml", "config"] {
         let path = cargo_home.join(name);
@@ -1442,7 +1446,9 @@ fn vendor_into(
     Ok(locked.len())
 }
 
-/// Hand every file under `from` to `sync`, at `prefix`.
+/// Hand every file under `from` to `sync`, at `prefix`. A symbolic link is refused, as
+/// it is in the tree ([`list_tree`]): `cargo vendor` copies files, so a link here is
+/// one vendoring did not make.
 fn put_tree(sync: &mut Syncer, from: &Path, prefix: &Path) -> Result<(), String> {
     let mut dirs = vec![(from.to_path_buf(), prefix.to_path_buf())];
     while let Some((dir, rel)) = dirs.pop() {
@@ -1485,7 +1491,9 @@ fn is_exec(_meta: &fs::Metadata) -> bool {
     false
 }
 
-/// Every file under `root`, by relative path: `file\0<mode>\0<sha256>`.
+/// Every file under `root`, by relative path: `file\0<mode>\0<sha256>`. The sync
+/// writes no link, so one found here is something else's, recorded as
+/// `link\0-\0<target>` for [`Snapshot::verify`] to name.
 fn listing(root: &Path) -> Result<Listing, String> {
     let mut out = Listing::new();
     let mut dirs = vec![(root.to_path_buf(), Vec::new())];

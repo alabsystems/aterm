@@ -463,6 +463,12 @@ fn serve_fleet_port(
 }
 
 /// THE DRIVE GRANT (the step-in, `docs/DESIGN-sessions-as-subagents-2026-10-15.md`
+/// §5.1): the node that may drive this Mac on `served` — the one its peer
+/// proved under the key this Mac's book binds it to, read fresh, so a `peers
+/// rm` counts at once, when a `[fleet] drive_from` grant (`drivers`) names it
+/// with that same key ([`aterm_net::fleet_member::proven_driver`]) — named
+/// as a person reads it ([`driver_name`]).
+///
 /// # Errors
 /// Why the dialer may not drive: it proved no node bound here, a node no
 /// grant names, one whose grant holds another key, or one an old copy alone

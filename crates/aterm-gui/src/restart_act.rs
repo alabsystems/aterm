@@ -19,7 +19,9 @@ use crate::SessionCtx;
 /// How long after its `SIGTERM` a deaf program (its stall still published, nothing read since the drop) is given before the act's `SIGKILL`: the grace after which the stall's attention already names `signal kill` ([`crate::input_stall::RESTART_GRACE`]).
 pub(crate) const GRACE: Duration = crate::input_stall::RESTART_GRACE;
 
-/// Minimum test value of [`GRACE`].
+/// Minimum test value of [`GRACE`]. The grace decides which signal ends a
+/// program only when the stall marks it deaf ([`escalate`]); one with no stall
+/// published is given [`DEADLINE`].
 const GRACE_TEST_FLOOR: Duration = Duration::from_secs(1);
 
 /// The grace the act waits: [`GRACE`] in a shipped build, or its floored test
@@ -618,7 +620,10 @@ impl Watch {
         })
     }
 
-    /// Remaining wait duration for `tab`, or why the watch lets go.
+    /// Remaining wait duration for `tab`, or why the watch lets go. Unlists the
+    /// watch under [`ESCALATING`]'s lock in the same check that decides to let go
+    /// so a concurrent [`watch`] call either raises this watch before the check
+    /// or starts a new watch after it.
     fn left(&self, tab: &str) -> Result<Duration, LetGo> {
         with_watches(|listed| {
             let at = listed

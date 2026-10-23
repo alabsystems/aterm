@@ -127,7 +127,7 @@ pub enum Outcome {
 impl Outcome {
     /// Exit code (`0` pass, `1` fail, `2` undecided/could-not-run, `4` narrowed).
     #[must_use]
-    pub fn exit(&self) -> i32 {
+    pub const fn exit(&self) -> i32 {
         match self {
             Outcome::Pass => 0,
             Outcome::Fail(_) => 1,
@@ -428,6 +428,8 @@ pub fn lane_profile_args(rows: &BTreeSet<String>) -> Vec<String> {
 }
 
 /// The `[profile.dev.package.<spec>]` keys of a manifest or cargo config, none when it
+/// is not there.
+///
 /// # Errors
 /// A file that is there and does not parse: unread, it would verify optimized.
 fn dev_package_rows(path: &Path) -> Result<BTreeSet<String>, String> {
@@ -1024,10 +1026,14 @@ pub fn record(
 /// checks run beside that prover's trustd.
 trait Bench {
     /// The toolchain every compile of the run uses: [`Config::prover`], else the one
+    /// the cut builds with.
+    ///
     /// # Errors
     /// Why there is none.
     fn driver(&mut self, cfg: &Config) -> Result<Driver, String>;
     /// `targo metadata --format-version 1 --all-features` of `repo` by `driver`, as it
+    /// printed it.
+    ///
     /// # Errors
     /// Why it printed none.
     fn metadata(&mut self, driver: &Driver, repo: &Path) -> Result<Vec<u8>, String>;
@@ -1038,6 +1044,8 @@ trait Bench {
     /// ([`cache_base`]); `None` with no home to hold one.
     fn cache(&self) -> Option<PathBuf>;
     /// Run `jobs` on `slots` slots ([`run_slots`]) beside this prover's trustd, `done`
+    /// seeing each check as it ends.
+    ///
     /// # Errors
     /// Why nothing was decided: every check it started is ended.
     fn checks(
@@ -1742,7 +1750,8 @@ fn write_cost_file(path: &Path, header: &str, all: &BTreeMap<String, Cost>, out:
     }
 }
 
-/// `--obligations`: reduce the check's proof report beside its log.
+/// `--obligations`: reduce the check's proof report beside its log. Retire
+/// the raw directory only after success; a refusal keeps its input for diagnosis.
 fn reduce_report(job: &Job, repo: &Path) {
     let Some(report) = &job.report else {
         return;
@@ -1784,6 +1793,8 @@ fn tree_state(repo: &Path) -> Option<(String, String)> {
 }
 
 /// The slots are scratch: every check names its units by a fresh session nonce, so
+/// nothing one check builds is reused, and a kept slot only grows.
+///
 /// # Errors
 /// A slot that could not be removed (the first such error).
 fn clear_slots(root: &Path) -> std::io::Result<()> {
@@ -2040,6 +2051,10 @@ fn checkout_key(repo: &Path) -> String {
 }
 
 /// The default target root: `<repo>/target-trust.noindex` wherever `targo trust` admits it (no
+/// change on a checkout writable by its owner alone), else `<cache>/<key>` (`cache` from
+/// [`cache_base`], `key` from [`checkout_key`]), said on one line; `refused` answers for a
+/// path as [`refused_component`] does.
+///
 /// # Errors
 /// Neither is admitted: each refusal and its fix.
 fn choose_root(
@@ -2219,7 +2234,8 @@ fn write_checkout_record(root: &Path, repo: &Path) -> std::io::Result<()> {
     fs::rename(at, marker)
 }
 
-/// The checkout an automatic cleanup may act for.
+/// The checkout an automatic cleanup may act for. All authority files and the
+/// cache/child directory are admitted before a run lock can be opened or a PID read.
 fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
     if !owned_cache_dir(dir.parent()?) || !owned_cache_dir(dir) {
@@ -2241,7 +2257,8 @@ fn cleanup_checkout(dir: &Path) -> Option<PathBuf> {
     .then_some(checkout)
 }
 
-/// Retire an admitted fallback root under its own existing run lock.
+/// Retire an admitted fallback root under its own existing run lock. The selected
+/// explicit run-root cleanup remains separate.
 fn retire(dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let Some(checkout) = cleanup_checkout(dir) else {
@@ -2722,7 +2739,7 @@ pub mod proc_tree {
     }
 
     /// Configures `cmd` to start in a new session (`setsid`).
-    pub fn new_session(cmd: &mut aterm_uds::spawnfd::Command) {
+    pub const fn new_session(cmd: &mut aterm_uds::spawnfd::Command) {
         cmd.setsid(true);
     }
 
@@ -3122,7 +3139,8 @@ pub mod trustd {
     }
 
     impl Kept {
-        /// Register the cloned connection before waiting on it.
+        /// Register the cloned connection before waiting on it. A failed clone
+        /// or a stopping keeper refuses the wait: drop must be able to shut it.
         fn name(&self, stream: std::io::Result<UnixStream>) -> bool {
             let Ok(stream) = stream else { return false };
             let mut c = self

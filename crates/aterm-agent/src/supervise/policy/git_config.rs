@@ -253,7 +253,10 @@ impl std::fmt::Debug for WorkerEnv {
     }
 }
 
-/// Variables the probe does not pass on to its own git.
+/// Variables the probe does not pass on to its own git. `GIT_CONFIG` names
+/// the one file `git config` alone reads instead of the effective set — the
+/// probe's `git config --list` would list that file, not what a read loads;
+/// `GIT_TRACE*` would have the probe write trace files.
 fn withheld_from_probe(key: &str) -> bool {
     key == "GIT_CONFIG" || key.starts_with("GIT_TRACE")
 }
@@ -261,7 +264,7 @@ fn withheld_from_probe(key: &str) -> bool {
 impl WorkerEnv {
     /// The worker process `process`.
     #[must_use]
-    pub fn new(process: ProcArgs) -> Self {
+    pub const fn new(process: ProcArgs) -> Self {
         Self {
             process,
             pid: None,
@@ -304,14 +307,14 @@ impl WorkerEnv {
 
     /// The same worker, known as process `pid`.
     #[must_use]
-    pub fn with_pid(mut self, pid: u32) -> Self {
+    pub const fn with_pid(mut self, pid: u32) -> Self {
         self.pid = Some(pid);
         self
     }
 
     /// The worker's pid, where it was read.
     #[must_use]
-    pub fn pid(&self) -> Option<u32> {
+    pub const fn pid(&self) -> Option<u32> {
         self.pid
     }
 

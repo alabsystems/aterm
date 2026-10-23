@@ -409,7 +409,9 @@ pub fn build_custom(entries: &[RawCustomEntry]) -> (SpecTable, String) {
     (table, out)
 }
 
-/// Append one scanner-ready emphasis entry.
+/// Append one scanner-ready emphasis entry. Inline customs keep their
+/// control-character-dropping behaviour; strict Toy Packs reject such surfaces
+/// before reaching this.
 fn push_lexicon_entry(out: &mut String, lang: &str, forms: &[&str], is_cjk: bool) {
     if forms.is_empty() {
         return;

@@ -204,7 +204,9 @@ impl RingSpans for ComplexCharRing {
 /// Dense ring-buffer storage for cells whose only extra is fg/bg RGB (no hyperlink, underline colour or extended flags), laid out like `ComplexCharRing`.
 #[derive(Debug, Clone)]
 pub(crate) struct RgbColorRing {
-    /// FG entries, `fg[ring_row * stride + col]`.
+    /// FG entries, `fg[ring_row * stride + col]`. `None` until a true-colour fg
+    /// is stored: an absent plane reads as all-zero, so screens without
+    /// true-colour foregrounds skip the `capacity * 4 B` allocation.
     fg: Option<Box<[u32]>>,
     /// BG entries, laid out and allocated like `fg`.
     bg: Option<Box<[u32]>>,

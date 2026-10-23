@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Each fixture is one 33x21 picture (four coloured quadrants under a
-//! gradient and noise, `fixtures/source.ppm`) written by libjpeg-turbo's
-//! `cjpeg` in one coding mode, beside `djpeg`'s decode of it as the
-//! reference. The odd size crosses MCU edges on both axes, so padding,
-//! clipping and the edge rows of the upsamplers are all exercised.
-//!
-//! Regenerate with `cjpeg -quality 90 [mode flags] -outfile NAME.jpg
-//! source.ppm` and `djpeg -pnm -outfile NAME.ppm NAME.jpg`.
+//! JPEG decoder conformance tests against `djpeg` reference outputs across 33x21 MCU-crossing fixtures.
 
 use std::path::PathBuf;
 
@@ -216,7 +209,6 @@ fn the_exif_orientation_turns_the_image_upright() {
             assert_eq!(&turned[to..to + 4], &upright[from..from + 4], "({x},{y})");
         }
     }
-    // Orientation 1 changes nothing.
     let (same, ..) = aterm_jpeg::decode_rgba8(&with_orientation(&jpeg, 1), 8192).unwrap();
     assert_eq!(same, upright);
 }

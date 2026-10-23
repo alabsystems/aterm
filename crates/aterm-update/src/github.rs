@@ -53,7 +53,8 @@ fn app_build_in_flight(head: &str, known: Option<&str>) -> bool {
     }
 }
 
-/// Whether this process has already logged which channel it reads.
+/// Whether this process has already logged which channel it reads. Once per process: it
+/// is a standing condition, not an event.
 static ANNOUNCED_CHANNEL: AtomicBool = AtomicBool::new(false);
 
 /// Whether the last check was cut short by a deferral.
@@ -71,7 +72,9 @@ fn record_deferral(staging: &Staging, current_build: u64, outcome: &str) {
     crate::status::record(staging, current_build, outcome);
 }
 
-/// Whether `source` is the compiled-in public channel.
+/// Whether `source` is the compiled-in public channel. GitHub slugs are
+/// case-insensitive, so a development build's `[update] owner = "Alabsystems"` is the
+/// public channel too.
 fn is_default_channel(source: &Source) -> bool {
     is_slug(source, crate::DEFAULT_OWNER, crate::DEFAULT_REPO)
 }
@@ -205,7 +208,10 @@ fn authoritative_dmg_index(
     })
 }
 
-/// Which container a stage unpacks.
+/// Which container a stage unpacks. Both carry the same signed `aterm.app` and
+/// are verified identically once extracted; the difference is only that the zip
+/// needs no `hdiutil`, and therefore no live bootstrap context (see
+/// [`crate::install::stage_from_zip`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Container {
     Zip,
@@ -344,7 +350,8 @@ struct AuthoritativeFetch {
 }
 
 impl AuthoritativeFetch {
-    /// Refuse the candidate: warn the reason and carry it to the ledger.
+    /// Refuse the candidate: warn the reason and carry it to the ledger. Every rejection
+    /// arm goes through here, so `health.toml` records the reason the log printed.
     fn refuse(&mut self, reason: String) {
         crate::warn(&reason);
         self.manifest_rejected = true;
@@ -508,7 +515,8 @@ fn authorize_by_roster(
         })
 }
 
-/// Fetch and validate the one candidate the channel head names.
+/// Fetch and validate the one candidate the channel head names. Nothing older is ever
+/// downloaded: a head that cannot be authorized ends the check.
 fn fetch_authoritative_release(
     candidate: Option<AuthoritativeRelease>,
     download: &mut impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
@@ -655,7 +663,9 @@ fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
     })
 }
 
-/// Record in `status.toml` that a verified stage already covers this candidate.
+/// Record in `status.toml` that a verified stage already covers this candidate. The check's
+/// attribution note precedes this decision, so without it a machine holding a pending
+/// stage would show only who signed the release.
 fn record_covered_stage_status(staging: &Staging, current_build: u64, manifest: &Manifest) {
     let msg = match Ready::read_publishable(staging) {
         Some(ready) => covered_stage_line(
@@ -720,7 +730,9 @@ fn sweep_download_scratch(staging: &Staging) {
     }
 }
 
-/// An open stage-failure retry window, and what it may stop.
+/// An open stage-failure retry window, and what it may stop. The window in `failed.toml`
+/// stops only re-downloading (up to 2 GiB of) bytes that refused to become a verified
+/// bundle.
 #[derive(Debug)]
 struct StageBackoff {
     /// Seconds until the candidate named by the manifest may be downloaded again.
@@ -1105,7 +1117,10 @@ fn check_container_digest(
     Some(end_failed_stage(staging, current_build, manifest, error))
 }
 
-/// The bound on hashing the downloaded container ([`container_sha256`]).
+/// The bound on hashing the downloaded container ([`container_sha256`]). It reads
+/// the whole file — well under a second for a release container, which the
+/// download has just written, on any disk — so a hash still running after two
+/// minutes is a read that is not coming back.
 const CONTAINER_HASH_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// SHA-256 of the downloaded container, answered by `limit`: the checker thread holds

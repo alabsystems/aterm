@@ -3889,7 +3889,9 @@ impl Drop for Naming {
     }
 }
 
-/// Two loopback listeners on one port: `[::1]` and `127.0.0.1`.
+/// Two loopback listeners on one port: `[::1]` and `127.0.0.1`. Where there
+/// is no IPv6 loopback, or no port free on both, the test ends COULD NOT RUN
+/// (`aterm_spec::host::could_not_run`): never a pass that checked nothing.
 fn twin_listeners() -> (TcpListener, TcpListener, u16) {
     for _ in 0..16 {
         let Ok(v6) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) else {

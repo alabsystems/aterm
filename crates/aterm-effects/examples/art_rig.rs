@@ -1522,7 +1522,9 @@ mod pet {
             )]
         }
 
-        /// The eye line rides the skull's equator.
+        /// The eye line rides the skull's equator. Yawed, both eyes slide
+        /// toward the leading edge (the far eye most of the way to the nose
+        /// bridge) and ride a step higher, keeping the nose out of the near eye.
         fn eye_centres(p: &Pose) -> (Pt, Pt) {
             if p.front {
                 return (face_anchor(p, 0.42, 0.04), face_anchor(p, -0.42, 0.04));
@@ -1573,7 +1575,9 @@ mod pet {
             }
         }
 
-        /// A closed sleeping lid: a shallow downward arc with body.
+        /// A closed sleeping lid: a shallow downward arc with body. Fat on
+        /// purpose: a thin lid rasterizes to NOTHING at terminal sizes, and a
+        /// closed eye that renders zero pixels reads as no face at all.
         fn lid((x, y): Pt, r: f64, thick: f64) -> String {
             let w = r * 1.15;
             let t = 4.8 * thick;
@@ -1912,7 +1916,8 @@ mod pet {
             ]
         }
 
-        /// The tabby: three back bars and two tail rings, riding the torso.
+        /// The tabby: three back bars and two tail rings, riding the torso. A
+        /// CAT marking: the dog wears a plain coat.
         fn pattern_paths(p: &Pose) -> Vec<String> {
             if dog(p) {
                 return Vec::new();
@@ -2058,7 +2063,10 @@ mod pet {
                 .collect()
         }
 
-        /// The pose's (dx, dy) into the viewbox.
+        /// The pose's (dx, dy) into the viewbox. `dy` PLANTS the pose: the
+        /// lowest ink lands on [`GROUND_INK`], less the authored `airborne`
+        /// clearance, by measurement rather than by trusting the limb angles,
+        /// so the whole roster stands on one floor.
         fn registration(raw: &[Layer], p: &Pose) -> Pt {
             (OX, GROUND_INK - p.airborne - bbox(raw)[3])
         }

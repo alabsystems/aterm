@@ -2018,7 +2018,11 @@ fn with_journal_lock<T>(
     operation()
 }
 
-/// Take the journal's lock on the file its lock path names.
+/// Take the journal's lock on the file its lock path names. A release or the
+/// launch sweep (`owner`) unlinks a journal's lock file while it holds it, so a
+/// taker that opened the name before that unlink and waited would, once it has
+/// the lock, hold one nobody else will ever take — a later taker creates the
+/// name afresh — and two writers would be in at once.
 fn take_linked_journal_lock(
     lock_path: &Path,
     path: &Path,

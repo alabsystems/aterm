@@ -64,7 +64,9 @@ const TRACE_ENV: &str = "ATERM_FABRIC_TRACE";
 /// Test-only fault injection (a development seam): refuse the `<n>`th grant's mint.
 const FAIL_MINT_ENV: &str = "ATERM_FABRIC_FAIL_MINT_AT";
 
-/// Test-only development seam: the fabric root in place of `~/.local/share/aterm-fabric`.
+/// Test-only development seam: the fabric root in place of `~/.local/share/aterm-fabric`. Each
+/// test runs under its own, so the derived label and plist ([`Paths::label`]) keep it off the
+/// machine's real broker.
 const ROOT_SEAM: &str = "ATERM_FABRIC_HOME";
 
 /// [`ROOT_SEAM`], when a build that compiles seams has it set (and not empty).
@@ -742,7 +744,8 @@ impl Role {
     }
 }
 
-/// The fleet flag a repair must carry.
+/// The fleet flag a repair must carry. The default remains the usual short
+/// spelling, while a named fleet never silently becomes `local`.
 fn fleet_flag(fleet: Option<&str>) -> String {
     fleet
         .filter(|f| *f != DEFAULT_FLEET)
@@ -1524,7 +1527,8 @@ fn cap_is_for(path: &Path, node: &str, secret: &[u8]) -> Result<usize, String> {
     Ok(caps.len())
 }
 
-/// The test-only effect trace ([`TRACE_ENV`]).
+/// The test-only effect trace ([`TRACE_ENV`]). A failed write is ignored: the trace is evidence
+/// for a test, never a step of the command.
 fn trace(word: &str) {
     if let Some(path) = aterm_types::dev_seam!(TRACE_ENV) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -2135,7 +2139,8 @@ fn refuse_unmanaged(view: &fabric::BrokerView, sock: &str, out: &mut Out) -> boo
     false
 }
 
-/// Step 6: the broker, supervised.
+/// Step 6: the broker, supervised. `true` when it answers. `named`:
+/// `on --durability` chose the tier, rather than keeping one.
 fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut Out) -> bool {
     trace("Supervise");
     let sock = p.sock();
@@ -2378,7 +2383,9 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
     }
 }
 
-/// One running instance, as `on` sees it.
+/// One running instance, as `on` sees it. It keeps no token: each connection
+/// to it reads the one beside its socket once connected ([`Ctl::open`]), so
+/// an update's successor at the same socket is asked with its own.
 struct Instance {
     pid: u32,
     sock: String,
@@ -2425,7 +2432,9 @@ fn instances(out: &mut Out) -> (Vec<Instance>, Option<usize>) {
     (found, Some(running))
 }
 
-/// Ask the instance `pid` listening on `sock` for its `fabric status`.
+/// Ask the instance `pid` listening on `sock` for its `fabric status`. `Err`
+/// is an instance that could not be asked: `Some` the line that says why, for
+/// a live one; `None` for a listing whose process is gone.
 fn ask_instance(pid: u32, sock: String) -> Result<Instance, Option<String>> {
     let (stream, token) = match aterm_ctl::connect_then_read_token(&sock) {
         Ok(connected) => connected,
@@ -2480,7 +2489,9 @@ fn ask_instance(pid: u32, sock: String) -> Result<Instance, Option<String>> {
     })
 }
 
-/// Step 9: arm every running instance.
+/// Step 9: arm every running instance. Answers how many are running (`None`
+/// when they could not be listed), and the ones that carry this command
+/// (armed now or before), in the order they were listed.
 fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance>) {
     let ours = fabric::serve_flags(argv);
     let our_program = fabric::bridge_program(argv);
@@ -2631,7 +2642,10 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
     (running, armed)
 }
 
-/// The proof line when nothing is armed to post through.
+/// The proof line when nothing is armed to post through. Launching aterm is
+/// the fix only when the walk listed none running; otherwise (an instance that
+/// could not be asked, one armed with another command, a failed arm or
+/// bridge, a walk that failed) the lines above say why.
 fn proof_skipped(running: Option<usize>) -> &'static str {
     if running == Some(0) {
         "skipped: no aterm is running — launch one, then run this again"
@@ -4197,7 +4211,10 @@ mod tests {
         aterm_types::fabric_command::split_line(line)
     }
 
-    /// A bridge process is a bridge, whatever its link is doing.
+    /// A bridge process is a bridge, whatever its link is doing. The
+    /// refusal exists because a running bridge owns this node's publish
+    /// sequence, and that is true of a bridge whose link went `stale` and of
+    /// one whose `fabric status` this report could not read.
     #[test]
     fn running_bridge_sees_a_stale_one_and_a_bare_pid() {
         let inst = |fabric: Option<&str>, supervised, pids: Vec<u32>| fabric::InstanceView {
@@ -4259,7 +4276,10 @@ mod tests {
         assert_eq!(running_bridge(&[standby], "n-a"), None);
     }
 
-    /// A planted name is never written through.
+    /// A planted name is never written through. A file written into a
+    /// directory another user writes: a symlink planted at a guessable temp
+    /// name and its target are untouched, the file lands as a regular 0600
+    /// one, and no temp is left behind.
     #[test]
     fn write_atomic_never_writes_through_a_planted_name() {
         use std::os::unix::fs::PermissionsExt;
@@ -4511,7 +4531,12 @@ mod tests {
         assert_eq!(uid(), run("id", &["-u"]));
     }
 
-    /// The tier is in the job.
+    /// The tier is in the job. A named tier rides after the secret, on both
+    /// wires — `--durability relaxed`, and `--durability strict` too, so a job
+    /// that chose strict keeps it under a build whose default differs — and a
+    /// job that names none carries nothing, and runs the build's default:
+    /// ordered for this guarded broker (served strict where astream cannot
+    /// keep the order).
     #[test]
     fn the_tier_is_in_the_job_and_a_bare_on_keeps_it() {
         use crate::durability::Durability;
@@ -5569,7 +5594,12 @@ mod tests {
         );
     }
 
-    /// A poisoned log is the broker's, never this node's.
+    /// A poisoned log is the broker's, never this node's. A bridge's
+    /// `reason=poisoned` and a broker.err whose last line is the broker's exit
+    /// over a poisoned log ([`crate::broker_health::poisoned_line`], either
+    /// form) each get the poisoned remedy — the broker's own restart, never a
+    /// re-minted cap, a repair or "fix the quoted cause first", and never
+    /// `on`, which keeps a poisoned broker that still answers.
     #[test]
     fn a_poisoned_log_is_answered_by_the_brokers_restart() {
         let role = Role::default();
@@ -5868,7 +5898,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The node's cap never leaves for a broker the caller named.
+    /// The node's cap never leaves for a broker the caller named. A cap is
+    /// minted against one broker's secret; defaulting the rendezvous file's
+    /// `--cap-file` (and the `--state` holding the node identity it belongs
+    /// to) onto an explicit `--broker` would present this node's credential to
+    /// whatever the caller pointed at.
     #[test]
     fn an_explicit_broker_gets_no_rendezvous_cap_or_state() {
         for broker in ["/r/bus.sock", "127.0.0.1:7000"] {

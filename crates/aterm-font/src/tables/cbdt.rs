@@ -5,17 +5,13 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Color Bitmap Data Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/cbdt) implementation.
+//! Color Bitmap Data Table (`CBDT`) implementation.
 
 use super::cblc::{self, BitmapDataFormat, Metrics, MetricsFormat};
 use crate::parser::{NumFrom, Stream};
 use crate::{GlyphId, RasterGlyphImage, RasterImageFormat};
 
-/// A [Color Bitmap Data Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/cbdt).
-///
-/// EBDT and bdat also share the same structure, so this is re-used for them.
+/// A Color Bitmap Data Table (`CBDT`).
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
     locations: cblc::Table<'a>,
@@ -71,7 +67,6 @@ impl<'a> Table<'a> {
                 let data = s.read_bytes(usize::num_from(data_len))?;
                 Some(RasterGlyphImage {
                     x: i16::from(metrics.x),
-                    // `y` in CBDT is a bottom bound, not top one.
                     y: i16::from(metrics.y) - i16::from(metrics.height),
                     width: u16::from(metrics.width),
                     height: u16::from(metrics.height),
@@ -98,7 +93,6 @@ impl<'a> Table<'a> {
                 let data = s.read_bytes(usize::num_from(data_len))?;
                 Some(RasterGlyphImage {
                     x: i16::from(metrics.x),
-                    // `y` in CBDT is a bottom bound, not top one.
                     y: i16::from(metrics.y) - i16::from(metrics.height),
                     width: u16::from(metrics.width),
                     height: u16::from(metrics.height),
@@ -119,7 +113,6 @@ impl<'a> Table<'a> {
                 let data = s.read_bytes(usize::num_from(data_len))?;
                 Some(RasterGlyphImage {
                     x: i16::from(metrics.x),
-                    // `y` in CBDT is a bottom bound, not top one.
                     y: i16::from(metrics.y) - i16::from(metrics.height),
                     width: u16::from(metrics.width),
                     height: u16::from(metrics.height),

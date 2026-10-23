@@ -185,7 +185,9 @@ impl TerminalHandler<'_> {
         self.store_reported_cwd(report.path.as_deref(), report.host.as_deref());
     }
 
-    /// Parse a file:// URI into (host, path).
+    /// Parse a file:// URI into (host, path). The path is percent-decoded; the
+    /// host is returned verbatim (decoding could inject a `/`), normalized to
+    /// `None` for an empty host or `localhost`.
     fn parse_file_uri(uri: &str) -> Option<(Option<String>, String)> {
         let rest = uri.strip_prefix("file://")?;
         let path_start = rest.find('/')?;
@@ -288,7 +290,9 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 52 clipboard query (Pd = "?").
+    /// Handle OSC 52 clipboard query (Pd = "?"). Needs both a host-minted query
+    /// capability and the `ResponseCapability`, each unforgeable outside its
+    /// module (private `_seal`).
     fn handle_osc_52_query(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -322,7 +326,10 @@ impl TerminalHandler<'_> {
         self.send_response(cap, response.as_bytes());
     }
 
-    /// Handle OSC 52 clipboard clear (empty Pd).
+    /// Handle OSC 52 clipboard clear (empty Pd). Gated by the same
+    /// [`super::clipboard_auth::ClipboardWriteCapability`] as set (see
+    /// [`super::clipboard_auth::invoke_clear`]): clear is a strictly less
+    /// dangerous subset of set.
     fn handle_osc_52_clear(&mut self, selections: &[ClipboardSelection]) {
         let Some(token) = self
             .clipboard_auth
@@ -333,7 +340,9 @@ impl TerminalHandler<'_> {
         super::clipboard_auth::invoke_clear(&mut self.clipboard.callback, token, selections);
     }
 
-    /// Handle OSC 52 clipboard set (Pd = base64 data).
+    /// Handle OSC 52 clipboard set (Pd = base64 data). Without a host-minted
+    /// [`super::clipboard_auth::ClipboardWriteCapability`] no PTY bytes reach the
+    /// host clipboard.
     fn handle_osc_52_set(&mut self, selections: &[ClipboardSelection], data: &[u8]) {
         let Some(token) = self
             .clipboard_auth

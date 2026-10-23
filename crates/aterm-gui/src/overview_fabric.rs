@@ -231,7 +231,8 @@ pub(crate) struct FabricSlot {
     pub(crate) reads: u64,
 }
 
-/// Own one claimed read until it answers, fails to spawn, or unwinds.
+/// Own one claimed read until it answers, fails to spawn, or unwinds. Armed
+/// before the worker is spawned, so dropping its closure also ends the read.
 struct ReadCompletion {
     slot: Arc<Mutex<FabricSlot>>,
     proxy: Option<aterm_window::event_loop::EventLoopProxy<crate::Wake>>,

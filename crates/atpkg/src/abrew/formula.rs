@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Formula and cask models parsed from formulae.brew.sh JSON, plus
-//! Homebrew-shaped version comparison (design §3, §6).
+//! Formula and cask models parsed from formulae.brew.sh JSON.
 
 use std::cmp::Ordering;
 
@@ -9,8 +8,7 @@ use aterm_json::Value;
 
 use super::machine::Machine;
 
-/// A formula as abrew needs it. Parsed from the API object; fields
-/// abrew does not use are dropped on purpose.
+/// A formula as abrew needs it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Formula {
     pub name: String,
@@ -24,10 +22,7 @@ pub struct Formula {
     pub stable_sha256: String,
     /// Bottle files by tag (`arm64_tahoe`, `all`), sorted.
     pub bottle_files: Vec<Bottle>,
-    /// Why no bottle of this formula pours natively whatever its cellar: a
-    /// post-install recipe, a pour condition, requirements or conflicts abrew
-    /// cannot evaluate, a variation it cannot resolve. Such a pour, like a
-    /// relocating bottle's, uses the announced brew fallback.
+    /// Why no bottle of this formula pours natively whatever its cellar.
     pub pour_needs: Option<String>,
     /// `conflicts_with` names, evaluated against abrew's census at install.
     pub conflicts: Vec<String>,
@@ -53,9 +48,7 @@ pub struct Bottle {
     pub tag: String,
     pub url: String,
     pub sha256: String,
-    /// Where the bottle was built to live: `:any_skip_relocation`
-    /// needs no relocation; `:any` carries placeholder paths abrew
-    /// relocates at pour on macOS.
+    /// Where the bottle was built to live: `:any_skip_relocation` needs no relocation.
     pub cellar: String,
 }
 
@@ -82,7 +75,7 @@ fn empty_metadata(value: Option<&Value>) -> bool {
     }
 }
 
-/// A present array must retain every supplied string; filtering cannot prove completeness.
+/// A present array must retain every supplied string.
 fn plain_strings(value: Option<&Value>) -> Option<Vec<String>> {
     match value {
         None | Some(Value::Null) => Some(Vec::new()),
@@ -114,10 +107,7 @@ pub(super) fn numeric_macos_version(version: &str) -> bool {
         })
 }
 
-/// A cask artifact source as brew loads it from the API: `$APPDIR/` is the
-/// appdir, `/Applications/` by default, so `/Applications/WezTerm.app/…` names
-/// a file of the app wezterm installs there, wherever its payload keeps it
-/// (`cask::payload_source` resolves that), and `info` shows what brew shows.
+/// A cask artifact source as brew loads it from the API.
 fn appdir_source(source: &str) -> String {
     match source.strip_prefix("$APPDIR/") {
         Some(rest) => format!("/Applications/{rest}"),
@@ -125,13 +115,10 @@ fn appdir_source(source: &str) -> String {
     }
 }
 
-/// The supported Generic destination mapping without a concrete prefix. Shared
-/// by dual-target admission and the actual cask destination producer.
+/// The supported Generic destination mapping without a concrete prefix.
 pub(super) fn generic_target_relative(
     target: &str,
 ) -> Option<std::borrow::Cow<'_, std::path::Path>> {
-    // $APPDIR is the cask appdir: brew's /Applications, abrew's
-    // prefix Applications (where app artifacts already land).
     if let Some(rest) = target.strip_prefix("$APPDIR/") {
         let rest_path = std::path::Path::new(rest);
         if rest.is_empty()
@@ -162,9 +149,7 @@ pub(super) fn generic_target_relative(
     Some(std::borrow::Cow::Borrowed(path))
 }
 
-/// One formula `variations` entry: the fields that can change what a
-/// pour needs. Build/test/head-only fields are pour-irrelevant and
-/// dropped at parse; anything else marks the entry unsupported.
+/// One formula `variations` entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FormulaVariation {
     pub dependencies: Option<Vec<String>>,
@@ -209,7 +194,6 @@ fn parse_formula_variations(v: Option<&Value>) -> Vec<(String, FormulaVariation)
                     Ok(reqs) => variation.requirements = Some(reqs),
                     Err(()) => variation.requirements_unsupported = true,
                 },
-                // Pour-irrelevant: build/test/head inputs and prose.
                 "build_dependencies"
                 | "head_dependencies"
                 | "test_dependencies"
@@ -235,15 +219,11 @@ pub enum Requirement {
     MacosMax(String),
     /// `depends_on arch: :arm64` / `:x86_64`.
     Arch(String),
-    /// `depends_on xcode:` with an optional numeric floor, probed at
-    /// preflight from the selected Xcode's version plist (no
-    /// `xcodebuild` run).
+    /// `depends_on xcode:` with an optional numeric floor.
     XcodeMin(Option<String>),
 }
 
-/// Parse the API `requirements` list. Build/test contexts and
-/// non-stable specs never gate a bottle pour and are dropped. `Err`
-/// (unit) marks any richer shape unsupported.
+/// Parse the API `requirements` list.
 fn parse_requirements(v: Option<&Value>) -> Result<Vec<Requirement>, ()> {
     let mut out = Vec::new();
     let Some(items) = v.and_then(Value::as_array) else {
@@ -258,8 +238,6 @@ fn parse_requirements(v: Option<&Value>) -> Result<Vec<Requirement>, ()> {
             continue;
         }
         let contexts = plain_strings(item.get("contexts")).ok_or(())?;
-        // Build and test contexts never gate a bottle pour: abrew
-        // neither builds from source nor runs `brew test`.
         if !contexts.is_empty()
             && contexts
                 .iter()
@@ -377,8 +355,7 @@ impl Formula {
         })
     }
 
-    /// The bottle file for this machine, best tag first (design §3):
-    /// the first compatible OS tag supplied by the caller, then `all`.
+    /// The bottle file for this machine, best tag first.
     #[must_use]
     pub fn bottle_for(&self, tags: &[String]) -> Option<&Bottle> {
         tags.iter()
@@ -387,13 +364,7 @@ impl Formula {
             .find_map(|want| self.bottle_files.iter().find(|b| b.tag == want))
     }
 
-    /// The bottle for `tags` that pours natively, or why the pour needs
-    /// Homebrew's recipe: no bottle for this machine, what the formula as a
-    /// whole needs ([`Formula::pour_needs`]), or a bottle that relocates
-    /// some way abrew does not perform. A `:any` bottle (placeholder
-    /// paths) relocates natively on macOS, where the system Mach-O
-    /// tools stand; a bottle baked for a fixed foreign cellar still
-    /// needs Homebrew's build-prefix relocation.
+    /// The bottle for `tags` that pours natively, or why it cannot ([`Formula::pour_needs`]).
     pub fn native_bottle(&self, tags: &[String]) -> Result<&Bottle, String> {
         let bottle = self
             .bottle_for(tags)
@@ -409,12 +380,7 @@ impl Formula {
         Ok(bottle)
     }
 
-    /// Apply the variation for `machine`, mirroring cask selection:
-    /// the API's top-level fields are the default arm64-mac system, so
-    /// only an exact-system deviation applies (`arm64_<release>`, Intel
-    /// `x86_64_<release>`/bare `<release>`, `<arch>_linux`). An
-    /// applicable-but-unsupported entry makes every pour need Homebrew
-    /// (delegate), as does an unnameable system with variations present.
+    /// Apply the variation for `machine`, mirroring cask selection.
     pub(super) fn resolve_variations(&mut self, machine: &Machine) -> bool {
         if self.variations.is_empty() {
             return true;
@@ -435,8 +401,7 @@ impl Formula {
         self.resolve_variations_for_keys(&keys)
     }
 
-    /// Apply already-classified system keys. False preserves unknown variation work
-    /// as a refusal for checked dependency readers, not an empty dependency set.
+    /// Apply already-classified system keys.
     fn resolve_variations_for_keys(&mut self, keys: &[String]) -> bool {
         if self
             .variations
@@ -497,42 +462,35 @@ pub struct Cask {
     pub sha256: Option<String>,
     pub artifacts: Vec<Artifact>,
     pub auto_updates: bool,
-    /// The first top-level constraint the native resolver cannot evaluate
-    /// (`container`, `depends_on`, `variations`, `conflicts_with`).
+    /// The first top-level constraint the native resolver cannot evaluate.
     pub unsupported_constraints: Option<&'static str>,
-    /// The `depends_on macos: ">= X"` floor, when the API states one in
-    /// plain numeric form. Evaluated against the running OS at install.
+    /// The `depends_on macos: ">= X"` floor, when the API states one in plain numeric form.
     pub macos_min: Option<String>,
     /// The `depends_on macos: "== X"` exact-release bound.
     pub macos_exact: Option<String>,
-    /// `conflicts_with` cask/formula names; evaluated against abrew's
-    /// own installed census at install.
+    /// `conflicts_with` cask/formula names.
     pub conflicts: Vec<String>,
-    /// The `depends_on arch:` requirement ("arm64"/"x86_64"), when the
-    /// API states exactly one plain architecture.
+    /// The `depends_on arch:` requirement.
     pub arch: Option<String>,
     /// `depends_on formula:` names, installed before this cask.
     pub depends_formula: Vec<String>,
     /// `depends_on cask:` tokens, installed before this cask.
     pub depends_cask: Vec<String>,
-    /// Per-system overrides (`variations`), selected at install time by
-    /// macOS release and architecture. Empty for most casks.
+    /// Per-system overrides.
     pub variations: Vec<(String, Variation)>,
-    /// `container type: :naked` — the download is the payload file itself.
+    /// `container type: :naked`.
     pub naked: bool,
-    /// `container nested: "<path>"` — the real payload archive sits
-    /// at this path inside the downloaded outer archive.
+    /// `container nested: "<path>"`.
     pub nested: Option<String>,
 }
 
-/// One admitted `variations` entry: plain field overrides only.
+/// One admitted `variations` entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Variation {
-    /// This entry uses fields/shapes abrew cannot evaluate; it blocks
-    /// only when it is the entry selected for this machine.
+    /// This entry uses fields/shapes abrew cannot evaluate.
     pub unsupported: bool,
     pub url: Option<String>,
-    /// Outer None: field absent. Inner None: the variation says `no_check`.
+    /// Outer None: field absent.
     pub sha256: Option<Option<String>>,
     pub version: Option<String>,
     pub artifacts: Option<Vec<Artifact>>,
@@ -540,9 +498,7 @@ pub struct Variation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Artifact {
-    /// Source path as brew spells it (payload-relative, or where brew
-    /// installed it: `cask::payload_source`) and the installed name the
-    /// cask's `target:` rename asks for, when it names a plain file name.
+    /// Source path as brew spells it.
     App(String, Option<String>),
     Binary(String, Option<String>),
     Font(String, Option<String>),
@@ -553,16 +509,11 @@ pub enum Artifact {
     ScreenSaver(String, Option<String>),
     PrefPane(String, Option<String>),
     Service(String, Option<String>),
-    /// Generic `artifact` with its full stated target (mapped into the
-    /// prefix at install; unmappable targets delegate).
+    /// Generic `artifact` with its full stated target.
     Generic(String, Option<String>),
-    /// `command_wrapper`: wrapper name, executable payload source,
-    /// fixed leading args, installed-name rename. The wrapper script
-    /// itself is generated inside the payload at install.
+    /// `command_wrapper`.
     Wrapper(String, String, Vec<String>, Option<String>),
-    /// A plugin/completion artifact linked into a fixed prefix-relative
-    /// directory (`Library/QuickLook`, `share/zsh/site-functions`, …):
-    /// source, rename, directory.
+    /// A plugin/completion artifact linked into a fixed prefix-relative directory.
     Library(String, Option<String>, String),
     Other(String),
 }
@@ -577,11 +528,7 @@ struct Depends {
     cask: Vec<String>,
 }
 
-/// The admitted `depends_on` shapes: an optional `macos` floor
-/// (`{"macos": {">=": ["X"]}}` or an empty macos object), an optional
-/// single plain `arch` requirement, and plain `formula`/`cask`
-/// dependency name lists (installed first, like brew). None for
-/// every richer shape.
+/// The admitted `depends_on` shapes.
 fn parse_depends(v: Option<&Value>) -> Option<Depends> {
     let Value::Object(map) = v? else {
         return None;
@@ -662,8 +609,7 @@ fn parse_depends(v: Option<&Value>) -> Option<Depends> {
     Some(out)
 }
 
-/// The admitted `conflicts_with` shape: `{"cask": [...], "formula": [...]}`
-/// with plain name strings (either key optional).
+/// The admitted `conflicts_with` shape.
 fn parse_conflicts(v: Option<&Value>) -> Option<Vec<String>> {
     let Value::Object(map) = v? else {
         return None;
@@ -703,12 +649,6 @@ fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
                 ));
                 continue;
             }
-            // `target` is brew's computed destination for the sibling
-            // artifact in the same object. Rename-only artifacts use its
-            // file name; Generic artifacts compare their full mapping below.
-            // `uninstall`/`zap` entries
-            // describe removing a real-brew install and are not
-            // artifacts to place, so they never block a native install.
             let raw_target = a.get("target").and_then(Value::as_str).map(str::to_owned);
             let dest_name = a.get("target").and_then(Value::as_str).map(|t| {
                 std::path::Path::new(t)
@@ -721,9 +661,6 @@ fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
                         continue;
                     }
                     if kind == "command_wrapper" {
-                        // ["name", {"executable": "…", "args": […]}]: the
-                        // wrapper script is generated at install; arbitrary
-                        // `content` wrappers delegate.
                         let parsed = (|| {
                             let items = vals.as_array()?;
                             let [Value::String(name), Value::Object(opts)] = items.as_slice()
@@ -736,8 +673,6 @@ fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
                             {
                                 return None;
                             }
-                            // Args may reference the install tree only
-                            // through the two rewritable markers.
                             if let Some(Value::Array(items)) = opts.get("args") {
                                 for item in items {
                                     let arg = item.as_str()?;
@@ -786,19 +721,12 @@ fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
                     let simple = items
                         .and_then(|items| items.first())
                         .and_then(Value::as_str);
-                    // The two-item form carries the rename in-line:
-                    // ["src", {"target": "name"}]. Only that one
-                    // option is data abrew can act on.
                     let inline_target = items
                         .and_then(|items| items.get(1))
                         .and_then(|options| options.get("target"))
                         .and_then(Value::as_str);
                     if kind == "artifact"
                         && raw_target.as_deref().zip(inline_target).is_some_and(|(sibling, inline)| {
-                            // Identical spellings cannot conflict;
-                            // whether the shared target maps into the
-                            // prefix is map_generic_target's question,
-                            // answered (and messaged) there.
                             sibling != inline
                                 && !matches!((generic_target_relative(sibling), generic_target_relative(inline)),
                                     (Some(a), Some(b)) if a == b)
@@ -910,17 +838,13 @@ fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
     artifacts
 }
 
-/// The admitted `variations` shape: an object whose every entry holds
-/// only plain overrides (url/sha256/version/artifacts; `skip_livecheck`
-/// is update metadata and ignored). Anything richer delegates.
+/// The admitted `variations` shape.
 fn parse_variations(v: Option<&Value>) -> Option<Vec<(String, Variation)>> {
     let Value::Object(map) = v? else {
         return None;
     };
     let mut out = Vec::new();
     for (key, entry) in map {
-        // Per-entry admission: a rich entry for another system must not
-        // poison this machine's pour; it delegates only if selected.
         let mut variation = Variation::default();
         let Value::Object(fields) = entry else {
             variation.unsupported = true;
@@ -955,13 +879,7 @@ fn parse_variations(v: Option<&Value>) -> Option<Vec<(String, Variation)>> {
 }
 
 impl Cask {
-    /// The variation Homebrew would pick for `machine`. The API's
-    /// top-level fields are generated for the default system (arm64,
-    /// newest macOS), so they already ARE that system's variation:
-    /// bare release keys hold the Intel deviations and `arm64_<release>`
-    /// keys the older-OS arm deviations. The API materializes an entry
-    /// for every differing system, so selection is exact-OS. None means the
-    /// top-level fields stand.
+    /// The variation Homebrew would pick for `machine`.
     #[must_use]
     pub fn variation_for(&self, machine: &Machine) -> Option<&Variation> {
         machine.variation_keys()?.iter().find_map(|key| {
@@ -980,10 +898,6 @@ impl Cask {
         }
         let sha_raw = s(v.get("sha256"));
         let mut artifacts = parse_artifacts(v.get("artifacts"));
-        // Only the complete one-field naked and dmg containers and a
-        // plain `container nested:` naming a supported inner archive
-        // are data. A richer container must remain unsupported
-        // through artifact overrides.
         let naked = matches!(v.get("container"), Some(Value::Object(fields))
             if fields.len() == 1 && fields.get("type").and_then(Value::as_str) == Some("naked"));
         let dmg = matches!(v.get("container"), Some(Value::Object(fields))
@@ -1007,9 +921,6 @@ impl Cask {
             unsupported_constraints = unsupported_constraints.or(Some("container"));
             artifacts.push(Artifact::Other("unsupported container".to_string()));
         }
-        // `depends_on`/`conflicts_with` are admitted only in the plain
-        // data forms abrew can evaluate itself; anything richer stays a
-        // delegation (Artifact::Other), exactly like before.
         let mut macos_min = None;
         let mut macos_exact = None;
         let mut arch = None;
@@ -1055,8 +966,6 @@ impl Cask {
         } else if sha_raw.len() == 64 && sha_raw.bytes().all(|b| b.is_ascii_hexdigit()) {
             Some(sha_raw)
         } else {
-            // Absent or malformed is not `no_check`: never install
-            // unverified bytes on a truncated API field.
             return Err(format!(
                 "abrew: cask {token} has no usable sha256 (missing or malformed)"
             ));
@@ -1094,11 +1003,7 @@ impl Cask {
     }
 }
 
-/// Homebrew-shaped version comparison (design §6): dotted tokens,
-/// numeric tokens compare as numbers and outrank alpha tokens at the
-/// same slot except pre-release words (alpha < beta < rc < release),
-/// `_N`/`-N` revisions compare last. Exotic strings fall back to a
-/// tokenwise compare that never claims equality spuriously.
+/// Homebrew-shaped version comparison.
 #[must_use]
 pub fn version_cmp(a: &str, b: &str) -> Ordering {
     let (a_main, a_rev) = split_revision(a);
@@ -1171,8 +1076,6 @@ fn token_cmp(x: &str, y: &str) -> Ordering {
     let yn = y.parse::<u128>().ok();
     match (xn, yn) {
         (Some(a), Some(b)) => a.cmp(&b),
-        // An empty slot is a release: it outranks a pre-release word
-        // (1.0 > 1.0rc1) and equals a zero (1.0 == 1.0.0).
         (None, Some(0)) | (Some(0), None) if x.is_empty() || y.is_empty() => Ordering::Equal,
         (Some(_), None) => {
             if y.is_empty() || prerelease_rank(y).is_some() {
@@ -1274,8 +1177,6 @@ mod tests {
                 Err(needs.to_string())
             );
         }
-        // Data-evaluable requirements and conflicts keep the native tag;
-        // they are enforced against the machine/census at preflight.
         value = aterm_json::from_str(
             r#"{"name":"demo","conflicts_with":["other"],"requirements":[{"name":"macos","version":"13","contexts":[],"specs":["stable","head"]},{"name":"xcode","contexts":["build","test"]},{"name":"xcode","version":"14.0","contexts":[],"specs":["stable"]}],"pour_bottle_only_if":"clt_installed","bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
         )
@@ -1283,8 +1184,6 @@ mod tests {
         let f = Formula::from_api(&value).unwrap();
         assert_eq!(native(&f).as_deref(), Ok("all"));
         assert_eq!(f.conflicts, ["other"]);
-        // The build/test-context xcode row drops; the runtime xcode
-        // floor stays as data for the preflight probe.
         assert_eq!(
             f.requirements,
             [
@@ -1293,8 +1192,6 @@ mod tests {
             ]
         );
         assert!(f.pour_requires_clt);
-        // Variations parse as data and resolve exact-system: a Linux-only
-        // deviation never touches a macOS pour, an arm64_<this OS> one does.
         value = aterm_json::from_str(
             r#"{"name":"demo","dependencies":["base"],"variations":{"arm64_linux":{"dependencies":["linuxonly"]},"x86_64_linux":{"dependencies":["linuxonly"]}},"bottle":{"stable":{"files":{"all":{"cellar":":any_skip_relocation"}}}}}"#,
         )
@@ -1307,7 +1204,6 @@ mod tests {
         assert_eq!(native(&mac).as_deref(), Ok("all"));
         assert!(f.resolve_variations_for_keys(&["arm64_linux".to_string()]));
         assert_eq!(f.dependencies, ["linuxonly"]);
-        // A non-string condition/conflict is unknown metadata, not no condition.
         for field in [
             r#""pour_bottle_only_if":{"unknown":true}"#,
             r#""conflicts_with":{"formula":["other"]}"#,
@@ -1339,8 +1235,6 @@ mod tests {
                 Err(format!("its bottle relocates: cellar {cellar}"))
             );
         }
-        // A `:any` (placeholder) bottle relocates natively on macOS;
-        // elsewhere it still refuses.
         value = aterm_json::from_str(
             r#"{"name":"demo","bottle":{"stable":{"files":{"all":{"cellar":":any"}}}}}"#,
         )
@@ -1366,7 +1260,6 @@ mod tests {
             Cask::from_api(&simple).unwrap().artifacts,
             [Artifact::App("Demo.app".into(), None)]
         );
-        // A plain one-field dmg container is admitted data now.
         let dmg: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","container":{"type":"dmg"},"artifacts":[{"app":["Demo.app"]}]}"#).unwrap();
         let dmg = Cask::from_api(&dmg).unwrap();
         assert!(dmg.unsupported_constraints.is_none());
@@ -1384,9 +1277,6 @@ mod tests {
                     .any(|artifact| matches!(artifact, Artifact::Other(_)))
             );
         }
-        // Only the literal `no_check` waives verification; a missing or
-        // malformed sha256 refuses the document instead of installing
-        // unverified bytes.
         for json in [
             r#"{"token":"demo","artifacts":[{"app":["Demo.app"]}]}"#,
             r#"{"token":"demo","sha256":"short","artifacts":[{"app":["Demo.app"]}]}"#,
@@ -1394,8 +1284,6 @@ mod tests {
             let value: Value = aterm_json::from_str(json).unwrap();
             assert!(Cask::from_api(&value).is_err());
         }
-        // Plain-data depends_on/conflicts_with parse as evaluated fields,
-        // not unsupported work; richer shapes still refuse above.
         let constrained: Value = aterm_json::from_str(&format!(
             r#"{{"token":"demo","sha256":"{}","depends_on":{{"macos":{{">=":["12"]}}}},"conflicts_with":{{"cask":["other"],"formula":["wget"]}},"artifacts":[]}}"#,
             "a".repeat(64)
@@ -1428,7 +1316,6 @@ mod tests {
                 Some("demo".into())
             )]
         );
-        // Variations select by release, walking down from the running OS.
         let varied: Value = aterm_json::from_str(&format!(
             r#"{{"token":"demo","sha256":"{}","url":"https://x/base.zip","artifacts":[],"variations":{{"arm64_sonoma":{{"url":"https://x/sonoma.zip"}},"tahoe":{{"url":"https://x/tahoe.zip","sha256":"{}"}}}}}}"#,
             "a".repeat(64),
@@ -1437,8 +1324,6 @@ mod tests {
         .unwrap();
         let cask = Cask::from_api(&varied).unwrap();
         assert_eq!(cask.variations.len(), 2);
-        // Bare release keys are Intel deviations; arm64 keeps top-level
-        // unless an arm64_<release> deviation applies.
         assert!(
             cask.variation_for(&Machine::mac("arm64", "26.0", None, false))
                 .is_none()
@@ -1448,7 +1333,6 @@ mod tests {
                 .and_then(|v| v.url.as_deref()),
             Some("https://x/tahoe.zip")
         );
-        // Exact-OS only: a newer OS with no entry keeps the top-level.
         assert!(
             cask.variation_for(&Machine::mac("arm64", "27.0", None, false))
                 .is_none()
@@ -1462,8 +1346,6 @@ mod tests {
             cask.variation_for(&Machine::mac("x86_64", "13.0", None, false))
                 .is_none()
         );
-        // Real API artifacts carry a computed `target` (the rename) and
-        // casks carry uninstall/zap stanzas; neither blocks parsing.
         let real: Value = aterm_json::from_str(&format!(
             r#"{{"token":"demo","sha256":"{}","artifacts":[{{"uninstall":[{{"quit":"com.x"}}]}},{{"font":["ttf/F.ttf"],"target":"/$HOME/Library/Fonts/F.ttf"}},{{"zap":[{{"trash":["~/Library/Caches/x"]}}]}}]}}"#,
             "a".repeat(64)
@@ -1528,8 +1410,6 @@ mod tests {
                     .any(|artifact| matches!(artifact, Artifact::Other(_)))
             );
         }
-        // Full Generic destinations compare after the same mapping used by
-        // installation; rename-only artifacts keep their basename convention.
         let equivalent: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"no_check","artifacts":[{"artifact":["src",{"target":"$HOMEBREW_PREFIX/Library/Services/x"}],"target":"/$HOME/Library/Services/x"},{"binary":["tool",{"target":"x"}],"target":"$HOMEBREW_PREFIX/bin/x"}]}"#).unwrap();
         assert_eq!(
             Cask::from_api(&equivalent).unwrap().artifacts,
@@ -1541,7 +1421,6 @@ mod tests {
                 Artifact::Binary("tool".to_string(), Some("x".to_string())),
             ]
         );
-        // R5 keeps unsupported variation work local to the selected system.
         let per_system: Value = aterm_json::from_str(r#"{"token":"demo","sha256":"no_check","artifacts":[{"app":["Demo.app"]}],"variations":{"arm64_tahoe":{"unknown_recipe":true}}}"#).unwrap();
         let per_system = Cask::from_api(&per_system).unwrap();
         assert_eq!(per_system.unsupported_constraints, None);

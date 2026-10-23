@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A font is a FACE — a file and the face's collection index — everywhere a
-//! renderer loads one ([`crate::FaceRef`]). Collections are built from the
-//! bundled single-face JetBrains Mono files ([`crate::font_catalog::ttc_of`])
-//! in the shapes Apple ships: `PTMono.ttc` keeps its Bold at face 0 and its
-//! Regular at face 1.
+//! Font face collection identity tests ([`crate::FaceRef`], [`crate::font_catalog::ttc_of`]).
 
 use crate::font_catalog::ttc_of;
 use crate::{FaceRef, Renderer, StyleBits, Theme};
@@ -48,16 +44,12 @@ fn a_primary_inside_a_collection_draws_its_own_face_and_its_sibling_bold() {
         drawn(&mut standalone, 'M', StyleBits::REGULAR),
         "plain text is the collection's Regular face"
     );
-    // The family's Bold — face 0 — is the bold slot, and only it.
     let bold = drawn(&mut r, 'M', StyleBits::BOLD);
     assert_eq!(r.debug_styled_face_indices(), [Some(0), None, None]);
     let mut standalone_bold = Renderer::from_bytes(JB_BOLD, 24.0, Theme::default()).unwrap();
     assert_eq!(bold, drawn(&mut standalone_bold, 'M', StyleBits::REGULAR));
-    // Negative control: face 0 is the Bold, so a renderer of face 0 draws
-    // plain text bold — the bug.
     let mut first = Renderer::from_face(&collection, 0, 24.0, Theme::default()).unwrap();
     assert_eq!(drawn(&mut first, 'M', StyleBits::REGULAR), bold);
-    // A rebuild of the sealed generation keeps the face.
     r.seal_admitted_font_sources();
     let mut rebuilt = r.rebuild_from_admitted(24.0, Theme::default()).unwrap();
     assert_eq!(
@@ -87,7 +79,6 @@ fn an_injected_styled_face_inside_a_collection_draws_that_face() {
         drawn(&mut r, 'M', StyleBits::ITALIC),
         drawn(&mut italic, 'M', StyleBits::REGULAR)
     );
-    // Negative control: face 0 of the same bytes is the Regular.
     let mut wrong = Renderer::from_bytes(JB_REGULAR, 24.0, Theme::default()).unwrap();
     wrong.set_synthetic_styles(false);
     wrong.set_bold_face(&collection, 0).unwrap();
@@ -156,12 +147,8 @@ fn a_sealed_generation_reports_the_faces_each_style_draws() {
         ]
     );
 
-    // A face with no styled siblings: everything synthetic over it, and with
-    // synthesis off drawn regular.
     let mut lone = Renderer::from_bytes(JB_REGULAR, 16.0, Theme::default()).unwrap();
     lone.seal_admitted_font_sources();
-    // The same face with its `GSUB` record renamed has no ligatures to report
-    // (the negative control for `regular_has_ligatures`).
     let mut plain = JB_REGULAR.to_vec();
     let tables = usize::from(u16::from_be_bytes([plain[4], plain[5]]));
     let gsub = (0..tables)
@@ -189,7 +176,6 @@ fn a_sealed_generation_reports_the_faces_each_style_draws() {
             .all(|style| style.face.is_none() && style.synthetic == StyleBits::REGULAR)
     }));
 
-    // An injected bold serves bold, and bold italic with a synthetic italic.
     let mut injected = Renderer::from_bytes(JB_REGULAR, 16.0, Theme::default()).unwrap();
     injected.set_bold_face(JB_BOLD, 0).unwrap();
     injected.seal_admitted_font_sources();
@@ -202,7 +188,6 @@ fn a_sealed_generation_reports_the_faces_each_style_draws() {
         styles[2],
         draw(Some("JetBrains Mono Bold"), StyleBits::ITALIC)
     );
-    // A rebuild of the sealed generation reports the same.
     let rebuilt = injected
         .rebuild_from_admitted(20.0, Theme::default())
         .unwrap();

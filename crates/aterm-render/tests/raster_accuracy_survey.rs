@@ -83,9 +83,13 @@ fn record(face: &aterm_font::Face, gid: u16) -> Option<Rec> {
     Some(r)
 }
 
-/// Sub-scanlines per pixel row.
+/// Sub-scanlines per pixel row. 64 is "8x supersampled" squared in y; the x
+/// axis is not sampled at all (spans are integrated exactly).
 const SUB: usize = 64;
-/// Uniform subdivisions flattening a quad/cubic, for the reference only.
+/// Uniform subdivisions flattening a quad/cubic, for the reference only. A
+/// quadratic's max deviation from its `n`-segment polyline is `|dev| / (4n^2)`,
+/// `dev` the second difference in px; at n = 256 and a 32 px glyph (`|dev|`
+/// under ~12 px) that is under 5e-5 px.
 const REF_SEGMENTS: usize = 256;
 
 /// A flat edge list in grid space (px, y down, origin at the canvas top-left).

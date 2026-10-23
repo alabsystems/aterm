@@ -66,7 +66,8 @@ fn inject_entry_probe(item: &FnItem, entry_id: &str) -> Option<TokenStream> {
     item.with_probe(&probe)
 }
 
-/// The `key = "value"` list an anchor attribute takes, each key one of `keys`.
+/// The `key = "value"` list an anchor attribute takes, each key one of `keys`. A key
+/// written twice keeps its last value.
 struct Keys(Vec<(&'static str, String)>);
 
 impl Keys {

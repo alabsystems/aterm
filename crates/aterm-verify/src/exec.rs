@@ -101,21 +101,21 @@ impl Cmd {
     }
 
     #[must_use]
-    pub fn capture(mut self, c: Capture) -> Self {
+    pub const fn capture(mut self, c: Capture) -> Self {
         self.capture = c;
         self
     }
 
     /// Run this child at utility QoS (`taskpolicy -c utility`, where macOS has it), so a compile yields the CPU to the programs a person is typing into (`pri 20` against the inherited `31`).
     #[must_use]
-    pub fn demoted(mut self) -> Self {
+    pub const fn demoted(mut self) -> Self {
         self.demoted = true;
         self
     }
 
     /// At its ceiling, send this child's group `SIGTERM` and give it up to `grace` to tear down what it started (a lane that booted a VM stops it) before the group `SIGKILL`.
     #[must_use]
-    pub fn term_grace(mut self, grace: Duration) -> Self {
+    pub const fn term_grace(mut self, grace: Duration) -> Self {
         self.term_grace = Some(grace);
         self
     }
@@ -444,7 +444,9 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
     std::env::split_paths(path).any(|d| crate::is_executable_file(&cwd.join(d).join(program)))
 }
 
-/// Spawn and wait, under `ceiling`.
+/// Spawn and wait, under `ceiling`. Returns a [`Run`] whose `output` is empty
+/// unless the ceiling fired, beside the child's captured `log`, read once after
+/// the child is gone (lossy, so one stray byte costs nothing).
 fn finish(
     mut c: Command,
     cmd: &Cmd,
@@ -933,7 +935,8 @@ pub mod group {
         STOPPING.load(Ordering::SeqCst)
     }
 
-    /// Send `sig` to every listed group.
+    /// Send `sig` to every listed group. Async-signal-safe: atomic loads and
+    /// `killpg`.
     fn sweep(sig: i32) {
         for slot in &LIVE {
             let g = slot.load(Ordering::SeqCst);
@@ -982,6 +985,9 @@ pub mod group {
     }
 
     /// `raise(3)` of the interrupt the run was sent (`SIGHUP`, `SIGINT` or
+    /// `SIGTERM`, at its default action): the run dies of it, which writes no
+    /// crash report.
+    ///
     /// # Safety
     /// As `raise`: none beyond an integer argument.
     unsafe fn reraise(sig: i32) {
@@ -1250,7 +1256,8 @@ mod tests {
     #[cfg(unix)]
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-    /// Is `pid` gone (or a zombie) within `window`?
+    /// Is `pid` gone (or a zombie) within `window`? Polls, because a killed
+    /// grandchild is reaped by launchd, not by us.
     #[cfg(unix)]
     fn gone_within(pid: &str, window: Duration) -> bool {
         let deadline = Instant::now() + window;
@@ -1533,7 +1540,9 @@ mod tests {
         assert_eq!(hung, Err(Unfinished::TimedOut(ceiling)));
     }
 
-    /// The bounded walks' child: this test binary, no shell or real tools.
+    /// The bounded walks' child: this test binary, no shell or real tools. Unless
+    /// it is the normal case, it ends itself by `SIGKILL` once `stop` appears, so
+    /// no test signals a pid its owner may have reaped.
     #[cfg(unix)]
     #[test]
     fn bounded_output_stand_in() {

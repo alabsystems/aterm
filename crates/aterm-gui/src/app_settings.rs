@@ -722,7 +722,8 @@ impl App {
         }
     }
 
-    /// Consume the first confirmed request in the stable view traversal order.
+    /// Consume the first confirmed request in the stable view traversal order. Other
+    /// queued requests are drained as superseded, never reported as writes that ran.
     #[cfg(any(target_os = "macos", test))]
     fn apply_askpass_off_requests(
         &mut self,

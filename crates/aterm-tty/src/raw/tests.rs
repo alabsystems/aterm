@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The guard on a real terminal, a pty pair from aterm-pty: what it sets, and that a
-//! drop, a panic, a SIGTERM and a suspension each leave the pty's settings as they were
-//! and no private mode set, whatever order the modes were set in. The panic, the signal
-//! and the suspension happen in a child process (this test binary run again on one
-//! test, its stdin the pty's slave), whose death or stop the parent watches; the
-//! terminal it wrote to is read back through aterm's own engine. [`DevTty`], the
-//! terminal a program's loop reads and draws on, is driven on a pty here too.
+//! The guard on a real terminal, a pty pair from aterm-pty.
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
@@ -177,7 +171,6 @@ fn guard_restores_termios_on_drop() {
     for mode in ALL_MODES {
         guard.enable(mode).expect("set");
     }
-    // As a frame does: the cursor hidden, a style, synchronized output begun.
     guard
         .write(b"\x1b[?2026h\x1b[?25l\x1b[1;31m\x1b[5 q")
         .expect("drawn");
@@ -193,8 +186,6 @@ fn guard_restores_termios_on_drop() {
     assert_eq!(settings(&after), settings(&before), "the settings are back");
     assert_eq!(modes_after(seen.until(b"\x1b[?1049l")), untouched());
 
-    // The kitty entry pushed before the alternate screen is entered goes there with it,
-    // and is popped there: neither screen keeps the flags.
     let mut guard = RawGuard::enter(fd).expect("a guard again once the first is dropped");
     guard.enable(Mode::KittyKeys(5)).expect("kitty first");
     guard
@@ -304,7 +295,6 @@ fn dev_tty_waits_reads_takes_signals_and_hangs_up() {
     }
     assert_eq!(typed, b"a\r\x03");
 
-    // A resize: reported until taken, then the new size.
     set_size(&master, 120, 40);
     signal_self(libc::SIGWINCH);
     assert_eq!(wait(&mut tty, &mut buf), Readiness::Signal);
@@ -323,7 +313,6 @@ fn dev_tty_waits_reads_takes_signals_and_hangs_up() {
         "nothing pending"
     );
 
-    // Stopped and continued, the shell having put the settings back meanwhile.
     tty.enable(Mode::KittyKeys(5)).expect("set");
     tty.enable(Mode::AltScreen).expect("set");
     let raw = settings(&Termios::read(fd).expect("the raw settings"));
@@ -358,7 +347,6 @@ fn dev_tty_waits_reads_takes_signals_and_hangs_up() {
         "as it was"
     );
 
-    // Hung up: the terminal's other side gone.
     let (master, slave) = pty();
     let mut tty = DevTty::from_fd(slave).expect("raw");
     drop(master);
@@ -431,9 +419,6 @@ fn suspend_puts_back_then_reenters() {
     let fd = slave.as_raw_fd();
     let before = Termios::read(fd).expect("the slave's settings");
     let exe = std::env::current_exe().expect("the test binary");
-    // In a process group of its own: the kernel drops a stop signal sent to an orphaned
-    // group, and the group this test runs in may be one (its leader's parent in another
-    // session), while the child's, whose parent is this test, is not.
     let child = aterm_uds::spawnfd::command(exe)
         .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
         .env(CHILD, "suspend")
@@ -446,7 +431,6 @@ fn suspend_puts_back_then_reenters() {
     let mut child = Reap(child);
     let pid = libc::pid_t::try_from(child.0.id()).expect("a pid");
 
-    // Stopped by its own SIGTSTP, with its terminal put back.
     let stopped = aterm_spec::wait::within(MUST_HAPPEN, Duration::from_millis(10), || {
         let mut status = 0;
         // SAFETY: asks after this test's own child without waiting; a stop is not reaped.
@@ -471,7 +455,6 @@ fn suspend_puts_back_then_reenters() {
         "put back while stopped"
     );
 
-    // Continued: raw again, every mode set again, then put back by the drop.
     // SAFETY: SIGCONT to this test's own stopped child.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
     assert_ne!(
@@ -498,8 +481,6 @@ fn child() {
         return;
     };
     let mut guard = RawGuard::enter(0).expect("raw mode on the pty");
-    // On SIGTERM the modes are set in the other order: the kitty entry before the
-    // alternate screen, which carries it.
     let mut modes = ALL_MODES;
     if how == "sigterm" {
         modes.reverse();
@@ -513,7 +494,6 @@ fn child() {
     guard.write(RAW_MARK).expect("marked");
     match how.as_str() {
         "panic" => {
-            // The drop never runs: only the panic hook can put the terminal back.
             std::mem::forget(guard);
             panic!("the child panics with its terminal raw");
         }

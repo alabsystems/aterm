@@ -4,23 +4,14 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! The event loops' wait: a wake descriptor any thread may poke, and one
-//! `poll(2)` over it and a backend's own descriptors with a deadline. On X11 it
-//! replaces calloop's `Ping` and `EventLoop::dispatch`
-//! (docs/AUDIT-third-party-2026-10-15.md, LW.7); it grew from the headless
-//! loop's wake pipe and deadline rounding, which the headless loop now uses
-//! from here.
+//! Event loop `eventfd` waker and `poll(2)` dispatcher.
 
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// An eventfd: [`Waker::wake`] adds one from any thread, the loop polls it
-/// and [`Waker::drain`]s it. Non-blocking both ways: once the counter is set
-/// the loop is already going to wake, so a write that would block (the
-/// counter at its ceiling) is a redundant wake, not a lost one, and a read of
-/// a zero counter is "nothing posted".
+/// An eventfd waker ([`Waker::wake`], [`Waker::drain`]).
 #[derive(Clone, Debug)]
 pub(crate) struct Waker {
     fd: Arc<OwnedFd>,
@@ -28,8 +19,7 @@ pub(crate) struct Waker {
 
 impl Waker {
     pub(crate) fn new() -> io::Result<Waker> {
-        // SAFETY: eventfd(2) takes an initial value and flags, and returns a
-        // new descriptor or -1.
+        // SAFETY: eventfd(2) takes an initial value and flags, and returns a new descriptor or -1.
         let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -38,19 +28,17 @@ impl Waker {
         Ok(Waker { fd: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }) })
     }
 
-    /// Wake the loop. Never blocks; see the type.
+    /// Wake the loop.
     pub(crate) fn wake(&self) {
         let one = 1u64.to_ne_bytes();
-        // SAFETY: eight bytes from a live local to an owned descriptor; an
-        // eventfd takes exactly a u64.
+        // SAFETY: eight bytes from a live local to an owned descriptor.
         unsafe { libc::write(self.fd.as_raw_fd(), one.as_ptr().cast(), one.len()) };
     }
 
     /// Take every pending wake.
     pub(crate) fn drain(&self) {
         let mut count = [0u8; 8];
-        // SAFETY: eight bytes into a live local from an owned descriptor. One
-        // read zeroes the counter; EAGAIN means it already was.
+        // SAFETY: eight bytes into a live local from an owned descriptor.
         unsafe { libc::read(self.fd.as_raw_fd(), count.as_mut_ptr().cast(), count.len()) };
     }
 
@@ -69,9 +57,8 @@ pub(crate) fn ready(pfd: &libc::pollfd) -> bool {
     pfd.revents != 0
 }
 
-/// Wait until one of `fds` is ready or `timeout` elapses (`None` waits for
-/// ever). A signal cutting the wait short is an early return like any other
-/// wake: the caller works out what is due afresh.
+/// Wait until one of `fds` is ready, `timeout` elapses (`None` waits for ever) or a signal
+/// interrupts.
 pub(crate) fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<()> {
     let count = libc::nfds_t::try_from(fds.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many descriptors"))?;
@@ -86,10 +73,7 @@ pub(crate) fn wait(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::R
     Ok(())
 }
 
-/// `poll`'s timeout: whole milliseconds, rounded UP, so a wait never ends
-/// before its deadline (a 119.6 ms remainder truncated to 119 wakes early and
-/// costs a whole spurious turn). `None` is -1, no deadline; zero stays zero,
-/// so a busy loop gains no millisecond.
+/// `poll`'s timeout.
 pub(crate) fn timeout_millis(timeout: Option<Duration>) -> libc::c_int {
     match timeout {
         None => -1,

@@ -80,7 +80,8 @@ enum Hand {
     Stops,
 }
 
-/// Text long enough for three wraps at 90 columns.
+/// Text long enough for three wraps at 90 columns. `…AUDIT WH|Y` puts `WHY`
+/// under `HEY`, a twin.
 const NATURAL: &str = "HEY!!! [Image #1] in the other tab in aterm, I got this confirmation message. AUDIT WHY ATERM claude code harness introspection interface keeps losing the rainbow when the composer grows to a third row and then a fourth row while I keep typing at a steady pace so please make the old line flow and drift and fade away beautifully instead of vanishing at once like it does now";
 
 /// `tests/composer_box_growth_wrap.rs`'s config: rainbow kitty at 0.70 on
@@ -1040,7 +1041,9 @@ fn every_growth_at_the_glass_take_s_geometry_follows_its_text_and_flows() {
     }
 }
 
-/// One coincident letter does not change the exit.
+/// One coincident letter does not change the exit. A is the no-twin control: letters only,
+/// each line's case alternating, so no glyph stands under the same glyph on the line above
+/// (asserted).
 #[test]
 fn one_coincident_letter_does_not_change_the_exit() {
     let width = OWNER_90.cols - 4;

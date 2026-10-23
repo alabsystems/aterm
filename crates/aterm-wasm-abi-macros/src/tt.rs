@@ -41,7 +41,7 @@ impl Tt {
     }
 
     /// Whether this is the punctuation `c`.
-    pub fn is_punct(&self, c: char) -> bool {
+    pub const fn is_punct(&self, c: char) -> bool {
         matches!(self, Tt::Punct(p, _) if *p == c)
     }
 }

@@ -677,7 +677,9 @@ fn a_font_step_and_a_live_drag_keep_the_resident_on_glass() {
     }
 }
 
-/// Launching and quitting a full-screen program crossfades.
+/// Launching and quitting a full-screen program crossfades. The alternate screen
+/// enters (a TUI paints text where the pet sat) and exits, each through the owner
+/// fence (`CompanionOwner::resight_owner`).
 #[test]
 fn an_alt_screen_enter_and_exit_crossfade_instead_of_cutting() {
     let model = pet_surface_seam_model();
@@ -771,7 +773,8 @@ fn an_alt_screen_enter_and_exit_crossfade_instead_of_cutting() {
     assert!(ghost(&next).is_none());
 }
 
-/// A split-pane focus switch crossfades across panes.
+/// A split-pane focus switch crossfades across panes. The pet settled in the right
+/// pane; the focus moves left and the layout and owner fences run.
 #[test]
 fn a_split_pane_focus_switch_crossfades_across_panes() {
     let model = pet_surface_seam_model();
@@ -1051,7 +1054,10 @@ fn tui_bytes() -> Vec<u8> {
     b
 }
 
-/// A quick return continues the one cat it comes back to.
+/// A quick return continues the one cat it comes back to. The focus leaves a surface
+/// and comes back two frames later, while the body it left still fades as a ghost:
+/// a split pane (the ghost on its own glass) and a full-screen program that quits at
+/// once (the same glass).
 #[test]
 fn a_quick_return_continues_the_one_cat_it_comes_back_to() {
     let model = pet_surface_seam_model();
@@ -1246,7 +1252,10 @@ fn every_crossfade_ghost_leaves_glass_on_its_arrivers_full_frame() {
     }
 }
 
-/// An adopted body goes on in the look the user saw.
+/// An adopted body goes on in the look the user saw. A quick return adopts the ghost
+/// at the arriver's seat, and the body goes on in the ghost's pose and facing while
+/// it rests there: through the homecoming ramp and, for a still pose, until the
+/// brain's own look steps.
 #[test]
 fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
     let model = pet_surface_seam_model();
@@ -1381,7 +1390,10 @@ fn an_adopted_body_goes_on_in_the_look_the_user_saw() {
     }
 }
 
-/// Every ghost fades in its own pane across three panes.
+/// Every ghost fades in its own pane across three panes. A quick cycle M → L → R
+/// inside the first crossfade leaves two ghosts on two own glasses (M's and L's);
+/// each fades where it was drawn and reaches zero on the arriver's full frame, so no
+/// pane loses its cat in one frame and the cat never dips.
 #[test]
 fn every_ghost_fades_in_its_own_pane_across_three_panes() {
     let model = pet_surface_seam_model();
@@ -1511,7 +1523,10 @@ fn by_pane(shot: &Shot, cw: i32) -> [u16; 3] {
     out
 }
 
-/// An incoherent frame holds, and a sub-row scroll is not incoherent.
+/// An incoherent frame holds, and a sub-row scroll is not incoherent. A stale
+/// snapshot (cells extracted before a scroll the facts saw) certifies nothing, so
+/// the pet is held where it was drawn, at full opacity, for the visibility hold's
+/// blind grace, then faded.
 #[test]
 fn an_incoherent_frame_holds_the_pet_and_a_sub_row_scroll_moves_nothing() {
     let model = pet_surface_seam_model();
@@ -1580,7 +1595,10 @@ fn an_incoherent_frame_holds_the_pet_and_a_sub_row_scroll_moves_nothing() {
     assert!(!jumped(&before, &back), "{back:?}");
 }
 
-/// A tall screen crossfades the body it replaced.
+/// A tall screen crossfades the body it replaced. A surface is judged in a bounded
+/// window of rows around its caret (`pet_world::MAX_WORLD_ROWS`), so on a 90-row
+/// terminal a program with its caret at the bottom cannot see where the shell's body
+/// stood, nor the shell the program's.
 #[test]
 fn a_tall_screen_crossfades_the_body_it_replaced() {
     let model = pet_surface_seam_model();
@@ -1683,7 +1701,9 @@ fn protected_screen(feet: u16, caret_row: u16) -> Vec<u8> {
     screen
 }
 
-/// A refused ghost is handed over once.
+/// A refused ghost is handed over once. A full-screen program with expanded rows
+/// under the old body refuses its ghost, and the arriver carries its presence for
+/// good: the ghost leaves the lane on the frame it is refused.
 #[test]
 fn a_refused_ghost_is_handed_over_once() {
     for (case, k) in [
@@ -1760,7 +1780,10 @@ fn coat_presence(shot: &Shot, coat: u8) -> u16 {
         .sum()
 }
 
-/// The breed handoff's leaver crosses a boundary where it was drawn.
+/// The breed handoff's leaver crosses a boundary where it was drawn. A new cat takes
+/// over (`PetArrival::Ceremony`: the old coat runs off while the new fades up;
+/// `Quiet`: the old coat fades in place), and mid-handoff a full-screen program
+/// starts or the focus moves to the other pane.
 #[test]
 fn a_breed_leaver_crosses_a_boundary_where_it_was_drawn() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -1977,7 +2000,9 @@ fn a_ghost_its_own_glass_refuses_hands_its_presence_to_the_arriver() {
     assert!(low >= 245, "the cat dipped to {low}/255: {after:?}");
 }
 
-/// A carried ghost keeps its own tile.
+/// A carried ghost keeps its own tile. The emitter bakes at most two new tiles a
+/// frame and re-emits a ghost's held tile when its bake is deferred, the hold keyed
+/// on the ghost (`PetDepartureSprite::id`).
 #[test]
 fn a_carried_ghost_keeps_its_own_tile() {
     use aterm_effects::companion::CompanionRung;
@@ -2257,7 +2282,9 @@ fn ghosts_in_place(before: &Shot, after: &Shot) -> usize {
         .count()
 }
 
-/// A ghost wears the palette its body was drawn in.
+/// A ghost wears the palette its body was drawn in. The pet's contrast palette
+/// (`CatColorKey`) is frozen per appearance, sampled under the body, and an arriver
+/// on a new surface samples its own.
 #[test]
 fn a_ghost_wears_the_palette_its_body_was_drawn_in() {
     use aterm_effects::companion::CompanionRung;

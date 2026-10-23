@@ -75,7 +75,7 @@ pub(super) fn decline_box(q: &aterm_phase::PromptV2, rows: &[String]) -> String 
 }
 
 /// A decline keystroke, as its hand-over reason names it.
-fn keystroke_name(step: &DeclineStep) -> &'static str {
+const fn keystroke_name(step: &DeclineStep) -> &'static str {
     match step {
         DeclineStep::Move { .. } => "arrow",
         DeclineStep::Amend { .. } => "Tab",
@@ -659,7 +659,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// The latch ([`approval_loop::QuestionMemory::mode`]): the word of the
     /// decision in hand becomes the dialog's at the loop's first write on it.
-    fn latch_question_word(&mut self) {
+    const fn latch_question_word(&mut self) {
         if self.question.mode.is_none() {
             self.question.mode = self.question.deciding;
         }

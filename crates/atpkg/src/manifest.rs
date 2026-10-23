@@ -462,7 +462,8 @@ fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
     Ok(())
 }
 
-/// Strict UTF-8 and `toml` deserialize over verified bytes.
+/// Strict UTF-8 and `toml` deserialize over verified bytes. Invalid UTF-8 or any TOML or shape
+/// error (missing field, duplicate key, wrong type) is [`Reject::Malformed`].
 fn parse_toml<T: serde::de::DeserializeOwned>(verified: &VerifiedBytes) -> Result<T, Reject> {
     let text = std::str::from_utf8(verified.as_slice()).map_err(|_| Reject::Malformed)?;
     aterm_toml::from_str(text).map_err(|_| Reject::Malformed)

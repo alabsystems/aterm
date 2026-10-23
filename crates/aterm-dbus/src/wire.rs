@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The D-Bus marshalling format: each value aligned to its type's boundary,
-//! counted from the start of the message, in the message's byte order.
-//!
-//! The [`Reader`] takes bytes from any peer on the bus, so it never panics and
-//! never trusts a length: every read is bounds-checked, an array cannot read
-//! past its own declared length, padding must be zero, booleans 0 or 1,
-//! strings UTF-8 without NUL, names and signatures valid, and containers
-//! (arrays, structs, dict entries and variants together) nest at most
-//! [`MAX_DEPTH`] deep across variants. A value the reader returns is one the
-//! [`Writer`] encodes back to the same bytes. Types a caller builds are held to
-//! the signature parser's rules before a byte is read or written, so neither
-//! side meets a type the wire could not describe.
+//! D-Bus wire marshalling and bounds-checked decoding with container depth and size limits.
 
 use crate::error::{Error, Result};
 use crate::message::MAX_MESSAGE;
@@ -63,12 +52,7 @@ impl Endian {
     }
 }
 
-/// The first offset at or after `pos` that is a multiple of `align`. Every
-/// offset in a message is below 2^27, far from the bound the contract states
-/// (the prover's predicates name no `usize::MAX`, so it is a literal). The
-/// contract is in the `cfg_attr` form the stock cross-cell builds parse;
-/// prover 321aaeda7 does not lower that form (as with aterm-font's
-/// `i16_bound`), so its clauses count as unknown until it does.
+/// Return the first offset at or after `pos` that is a multiple of `align`.
 #[cfg_attr(trust_verify, trust::requires(align == 1 || align == 2 || align == 4 || align == 8))]
 #[cfg_attr(trust_verify, trust::requires(pos <= 4294967296))]
 #[cfg_attr(trust_verify, trust::ensures(result >= pos && result - pos < align && result % align == 0))]
@@ -79,14 +63,11 @@ pub const fn pad_to(pos: usize, align: usize) -> usize {
     if rem == 0 { pos } else { pos + (align - rem) }
 }
 
-/// Encodes `values` back to back as if the first byte sat at message offset
-/// `offset` (zvariant's `position`): a body is encoded at offset 0.
+/// Encode `values` back to back starting at message offset `offset`.
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] for a value the specification forbids, among them
-/// values whose types no signature can carry (see [`decode`]) and an offset
-/// past the longest message.
+/// Returns [`Error::Invalid`] if `values` or `offset` violate D-Bus marshalling limits.
 pub fn encode(values: &[Value], endian: Endian, offset: usize) -> Result<Vec<u8>> {
     check_types(
         &values.iter().map(Value::type_of).collect::<Vec<_>>(),
@@ -104,16 +85,11 @@ pub(crate) fn encode_checked(values: &[Value], endian: Endian, offset: usize) ->
     Ok(w.buf)
 }
 
-/// Decodes `bytes` as exactly the sequence `types`, the first byte at message
-/// offset `offset`.
+/// Decode `bytes` as the sequence `types` starting at message offset `offset`.
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] for `types` no signature can carry (an empty struct, a
-/// dict keyed by a container, past the length or nesting limits of [`sig`])
-/// or an offset past the longest message; [`Error::Malformed`] unless `bytes`
-/// hold exactly one value of each type; [`Error::Unsupported`] for a variant
-/// holding a unix descriptor.
+/// Returns [`Error::Invalid`], [`Error::Malformed`], or [`Error::Unsupported`] on invalid input.
 pub fn decode(bytes: &[u8], types: &[Type], endian: Endian, offset: usize) -> Result<Vec<Value>> {
     check_types(types, offset)?;
     decode_checked(bytes, types, endian, offset)
@@ -462,9 +438,7 @@ impl<'a> Reader<'a> {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    /// Reads an array's length and padding, then elements until exactly that
-    /// many bytes are consumed. Elements see only the array's own bytes, and
-    /// one that consumes none is refused, so the loop ends.
+    /// Read an array's byte length, padding, and elements until that byte length is consumed.
     pub(crate) fn array<T>(
         &mut self,
         elem_align: usize,
@@ -643,7 +617,6 @@ mod tests {
             malformed(de("05000000010203", "ay")),
             "array runs past the end"
         );
-        // An element that would run past its array's declared length.
         assert_eq!(
             malformed(de("02000000010000000200000000000000", "au")),
             "value runs past the end"
@@ -652,7 +625,6 @@ mod tests {
             de("0168000000000000", "v"),
             Err(Error::Unsupported(_))
         ));
-        // An empty a{sv} still pads to its first entry's boundary.
         assert_eq!(
             de("0000000000000000", "a{sv}").unwrap()[0]
                 .as_dict()
@@ -671,8 +643,6 @@ mod tests {
 
     #[test]
     fn nesting_is_bounded_across_variants() {
-        // A variant holding a variant holding ... a byte: 64 levels decode,
-        // 65 are refused, and nothing recurses without bound.
         let nested = |n: usize| {
             let mut v = Value::Byte(7);
             for _ in 0..n {
@@ -707,7 +677,6 @@ mod tests {
             encode(&[Value::Struct(vec![])], Endian::Little, 0),
             Err(Error::Invalid(_))
         ));
-        // A value whose signature breaks the array limit, beside one at it.
         let nested = |n: usize| {
             let mut v = Value::Byte(7);
             for _ in 0..n {
@@ -728,10 +697,6 @@ mod tests {
 
     #[test]
     fn caller_types_are_held_to_the_signature_rules() {
-        // The guards are checked in an order where a missing one fails rather
-        // than hangs: an element that reads nothing (its second call ends the
-        // loop), then a bare empty struct, then the array of them a peer could
-        // stall the reader on before the public check existed.
         let mut r = Reader::new(&[1, 0, 0, 0, 7], Endian::Little, 0);
         let mut calls = 0;
         let nothing = |_: &mut Reader<'_>| {
@@ -759,7 +724,6 @@ mod tests {
             refused(&[Type::array(empty)]),
             Error::Invalid("empty struct")
         ));
-        // The control: one field, and the same bytes are an `a(t)` of one 0.
         let one = decode(
             &bytes,
             &[Type::array(Type::structure([Type::U64]))],
@@ -788,7 +752,6 @@ mod tests {
 
     #[test]
     fn a_signature_value_may_name_a_descriptor() {
-        // `g` "h" and "a{hs}": naming the type passes no descriptor.
         for (hex, sig) in [("016800", "h"), ("05617b68737d00", "a{hs}")] {
             assert_eq!(
                 de(hex, "g").unwrap(),
@@ -799,7 +762,6 @@ mod tests {
             malformed(de("01280000", "g")),
             "signature ends inside a type"
         );
-        // A variant that holds an `h` value still is not read.
         assert!(matches!(
             de("0168000000000000", "v"),
             Err(Error::Unsupported(_))
@@ -819,8 +781,6 @@ mod tests {
         value
     }
 
-    // Build the wire independently: each outer variant names another variant,
-    // the innermost names a{yy}, and its array contains one two-byte entry.
     fn variant_dictionary_bytes(variants: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
         for _ in 1..variants {
@@ -840,7 +800,6 @@ mod tests {
 
     #[test]
     fn dictionary_entries_count_towards_the_encoder_depth_limit() {
-        // The dictionary contributes its array and its entry: 62 + 2 = 64.
         assert_eq!(
             encode(&[variant_dictionary(62)], Endian::Little, 0).unwrap(),
             variant_dictionary_bytes(62)

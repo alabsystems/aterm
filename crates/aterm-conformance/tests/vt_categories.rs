@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// VT conformance: save/restore cursor, insert/delete char & line, erase
-// variants, scroll region, alt-screen isolation, wide chars.
+
+//! VT conformance tests for cursor save/restore, insert/delete, erase, and scroll regions.
 
 use aterm_conformance::{Screen, run};
 
 #[test]
 fn decsc_decrc_save_and_restore_cursor() {
-    // move to (4,4), save, jump home + write X, restore, write Y
     let s = run(b"\x1b[5;5H\x1b7\x1b[1;1HX\x1b8Y");
     assert_eq!(s.row(0), "X");
-    // Y written at the restored position (row 4, col 4, 0-based)
     assert_eq!(s.row(4), "    Y");
     assert_eq!(s.cursor(), (4, 5));
 }
@@ -47,7 +44,6 @@ fn dl_deletes_a_line() {
 
 #[test]
 fn el1_erases_from_start_to_cursor() {
-    // abcdef, cursor to col 4 (1-based), erase start..cursor inclusive
     let s = run(b"abcdef\x1b[1;4H\x1b[1K");
     assert_eq!(s.row(0), "    ef");
 }
@@ -60,7 +56,6 @@ fn el2_erases_the_whole_line() {
 
 #[test]
 fn ed1_erases_above_the_cursor() {
-    // two lines, cursor on row 2; ED1 erases from start of screen to cursor
     let s = run(b"top\r\nbot\x1b[2;2H\x1b[1J");
     assert_eq!(s.row(0), ""); // row above fully erased
 }
@@ -73,8 +68,6 @@ fn alt_screen_isolates_then_restores() {
 
 #[test]
 fn scroll_region_index_scrolls_only_the_region() {
-    // 5-row screen; scroll region rows 2..4 (1-based); fill, IND at bottom scrolls
-    // only within [2,4], leaving row 1 and row 5 untouched.
     let mut s = Screen::new(5, 80);
     s.feed(b"\x1b[2;4r"); // DECSTBM rows 2-4
     s.feed(b"\x1b[1;1Ha"); // row 1
@@ -87,7 +80,6 @@ fn scroll_region_index_scrolls_only_the_region() {
 
 #[test]
 fn wide_char_advances_cursor_by_two() {
-    // a CJK wide char occupies 2 columns
     let s = run("世".as_bytes());
     assert_eq!(s.cursor(), (0, 2));
 }

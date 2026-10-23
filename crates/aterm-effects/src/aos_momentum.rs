@@ -83,7 +83,9 @@ pub const RUN_MATCHES_INPUTS: &str = "RunMatchesInputs";
 /// The entry law: the state is one the engine can reach (its snapshot validates).
 pub const SNAPSHOT_VALID: &str = "momentum-glow.snapshot-valid";
 
-/// `t − epoch` in signed nanoseconds.
+/// `t − epoch` in signed nanoseconds. Exact for every pair of instants a host can hold (an
+/// `i128` holds every `Duration`'s nanoseconds); the saturating fallbacks are unreachable,
+/// and admission refuses them as outside the horizon.
 #[inline]
 fn offset_of(epoch: Instant, t: Instant) -> i128 {
     if let Some(after) = t.checked_duration_since(epoch) {

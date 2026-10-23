@@ -594,7 +594,8 @@ fn a_second_fold_reads_only_the_appended_bytes() {
     assert_eq!(whole.read, (first_rows.len() + more.len()) as u64);
 }
 
-/// A failed directory read is not a complete empty home.
+/// A failed directory read is not a complete empty home. In particular it
+/// cannot discard the per-file streaming state which a later append needs.
 #[test]
 fn an_incomplete_walk_keeps_the_streaming_cursor_until_the_home_is_readable() {
     let home = Home::new("walk-refused");
@@ -1364,7 +1365,8 @@ fn the_error_bar_is_the_readings_resolution() {
     assert!(close(wall.usd, 10.0) && close(wall.pm_pct, 0.0));
 }
 
-/// THE FABLE BUCKET's dollars are its models' only.
+/// THE FABLE BUCKET's dollars are its models' only. Negative control: the
+/// whole window holds both.
 #[test]
 fn the_fable_bucket_sums_only_fable_models() {
     let now = 1_792_000_000 - 1_792_000_000 % 3600;

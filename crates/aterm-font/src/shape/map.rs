@@ -6,13 +6,7 @@
 // (`LayoutTableExt`) and modified by the aterm project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! The feature map: which features a plan turns on, the mask bits each one
-//! gets, and the `GSUB` lookups they select, stage by stage.
-//!
-//! The script and language system are chosen in `GSUB` and in `GPOS` alike,
-//! and a feature counts as found when either lists it, as upstream does (it
-//! decides which features get mask bits); only `GSUB` lookups are collected,
-//! since this shaper positions by advance alone.
+//! Feature map compilation: active features, mask bit allocation, and per-stage `GSUB` lookups.
 
 use super::ShapeFace;
 use super::buffer::Buffer;
@@ -22,8 +16,7 @@ use crate::opentype_layout::{
     FeatureIndex, LanguageIndex, LayoutTable, LookupIndex, ScriptIndex, VariationIndex,
 };
 
-/// A stage's pause: runs between stages; upstream's return value only
-/// refreshed its buffer digest, which this shaper does not keep.
+/// Callback invoked between shaping stages.
 pub(crate) type PauseFn = fn(&ShapePlan, &ShapeFace, &mut Buffer);
 
 pub(crate) const F_NONE: u32 = 0x0000;
@@ -172,9 +165,7 @@ fn select_script(table: &LayoutTable, script_tags: &[Tag]) -> Option<(bool, Scri
     }
     for tag in [
         Tag::from_bytes(b"DFLT"),
-        // Many fonts use the lowercase spelling.
         Tag::from_bytes(b"dflt"),
-        // Some old fonts list their features under Latin for every script.
         Tag::from_bytes(b"latn"),
     ] {
         if let Some(index) = table.scripts.index(tag) {
@@ -299,8 +290,6 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
     }
 
     pub(crate) fn compile(&mut self) -> Map {
-        // The required feature applies in stage 0, or in its own feature's
-        // stage when the shaper knows its tag.
         let mut required_index = [None; 2];
         let mut required_tag = [None; 2];
         for (i, table) in tables(self.face).iter().enumerate() {
@@ -336,7 +325,6 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
         let layout = tables(self.face);
         for info in &self.feature_infos {
             let bits_needed = if info.flags & F_GLOBAL != 0 && info.max_value == 1 {
-                // The global bit.
                 0
             } else {
                 let v = info.max_value;
@@ -445,7 +433,6 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
         let mut lookups: Vec<LookupMap> = Vec::new();
         let mut stages = Vec::new();
         let Some(table) = self.face.face.tables().gsub else {
-            // No GSUB: every stage is empty, but the pauses still run.
             for info in &self.stages[GSUB] {
                 stages.push(StageMap {
                     last_lookup: 0,
@@ -489,7 +476,6 @@ impl<'a, 'f> MapBuilder<'a, 'f> {
                     );
                 }
             }
-            // Sort the stage's lookups and merge duplicates.
             let len = lookups.len();
             if last_lookup + 1 < len {
                 lookups[last_lookup..].sort();

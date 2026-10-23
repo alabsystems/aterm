@@ -22,7 +22,9 @@ pub const REPLY_ROWS_MAX: usize = 1024 * 1024;
 pub struct Ctl {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
-    /// Latched on the first I/O failure.
+    /// Latched on the first I/O failure. A stream that failed mid-request may be
+    /// desynchronised, so nothing further is written to it and every later
+    /// request answers the same way.
     lost: bool,
 }
 

@@ -280,7 +280,8 @@ fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
     Err(Moved::NotUnlinked(e))
 }
 
-/// Zeroes and removes a regular file at `path`, or unlinks a symlink without following it.
+/// Zeroes and removes a regular file at `path` (one this user cannot read stays), or unlinks a
+/// symlink without following it.
 pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
     if kind(path)? == Kind::File {
         return wipe(path, |_| Ok(true)).map(drop);

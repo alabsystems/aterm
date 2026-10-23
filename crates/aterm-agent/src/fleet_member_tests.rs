@@ -1981,7 +1981,11 @@ fn peers_takes_a_timeout_up_to_the_surveys_longest() {
     ));
 }
 
-/// `aterm fleet allow`: a level this machine's person sets here alone.
+/// `aterm fleet allow`: a level this machine's person sets here alone. `drive`
+/// names each node by a word the book resolves to one bound to a key — never
+/// a peer named by hand, nor a node bound to none, nor a word that names no
+/// peer — and keeps the list; `facts`/`content` empty it, and `leave` takes
+/// it with the rest.
 #[test]
 fn allow_drive_names_only_the_nodes_the_book_binds() {
     let world = World::new("allow");

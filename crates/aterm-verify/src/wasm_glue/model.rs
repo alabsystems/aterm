@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The module's JS interface: the descriptor's records, checked against
-//! each other and against the module, and arranged as classes and
-//! functions. Every check fails closed with what was found and where.
+//! Validated JS class, function, and host import model built from Wasm descriptor records.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,17 +38,15 @@ pub(crate) enum Host {
     ErrorStack,
     PerformanceNow,
     DateNow,
-    /// `aterm_host.object_drop`: a JS object's slot released
-    /// (aterm-wasm-abi's `js`).
+    /// Releases a JS object table slot (`object_drop`).
     ObjectDrop,
-    /// `aterm_gl.<name>`: one of WebGL2's imports under aterm-gpu's GL arm,
-    /// by its index in [`super::webgl::IMPORTS`].
+    /// WebGL2 import by index in [`super::webgl::IMPORTS`].
     Gl(usize),
 }
 
 impl Host {
     /// The import's module and name, and its signature.
-    pub(crate) fn spec(self) -> (&'static str, &'static str, &'static [u8], &'static [u8]) {
+    pub(crate) const fn spec(self) -> (&'static str, &'static str, &'static [u8], &'static [u8]) {
         const I32: u8 = 0x7f;
         const F64: u8 = 0x7c;
         match self {
@@ -87,14 +83,11 @@ pub(crate) struct Interface {
     pub(crate) functions: Vec<Func>,
     /// The imports, in the module's order.
     pub(crate) imports: Vec<Host>,
-    /// Every exported function, by name, with its signature: the raw
-    /// interface `_bg.wasm.d.ts` and `InitOutput` describe.
+    /// Every exported function, by name, with its signature.
     pub(crate) raw: BTreeMap<String, FuncType>,
 }
 
-/// The prefix of the exports no record describes: the runtime's own below,
-/// and link-time seams other crates define for the module (aterm-time's
-/// `aterm_wasm_date_now`). Every other function export needs a record.
+/// Prefix of runtime and link-time exports that require no descriptor record.
 pub(crate) const UNRECORDED_PREFIX: &str = "aterm_";
 
 /// The runtime's own exports the glue calls.
@@ -103,8 +96,7 @@ pub(crate) const REALLOC: &str = "aterm_realloc";
 pub(crate) const FREE: &str = "aterm_free";
 pub(crate) const RET_SLOT: &str = "aterm_ret_slot";
 
-/// Exports the generator drops from the module it writes: the linker's
-/// layout globals, which no JS reads (wasm-bindgen drops them too).
+/// Linker layout globals omitted from the generated module exports.
 pub(crate) const DROPPED_EXPORTS: [&str; 2] = ["__data_end", "__heap_base"];
 
 /// Read and check the module's interface.
@@ -127,9 +119,6 @@ pub(crate) fn interface(m: &Module<'_>) -> Result<Interface, String> {
         identifier(&record.symbol)?;
         if !record.class.is_empty() {
             identifier(&record.class)?;
-            // Classes are unrenamed Rust struct identifiers. `$` belongs to
-            // the generator's private locals, which must never shadow a
-            // class used to lift a returned handle.
             if record.class.contains('$') {
                 return Err(format!(
                     "class `{}` is not a Rust struct identifier",
@@ -358,8 +347,7 @@ pub(crate) fn interface(m: &Module<'_>) -> Result<Interface, String> {
     })
 }
 
-/// JS reserved words: no class or function at a module's top level may be
-/// named so.
+/// JS reserved words disallowed for top-level class or function names.
 pub(crate) const RESERVED: &[&str] = &[
     "arguments",
     "await",
@@ -462,8 +450,6 @@ const GLUE_NAMES: &[&str] = &[
     "module",
     "__dirname",
     "__proto__",
-    // Host globals the helpers and loaders read. A public declaration in
-    // this module would shadow them even before its first call.
     "Object",
     "Symbol",
     "String",
@@ -496,9 +482,7 @@ const GLUE_NAMES: &[&str] = &[
     "SyncInitInput",
 ];
 
-/// Descriptor names become bare JS/TypeScript identifiers, never source.
-/// Keep this boundary's identifier alphabet explicit; an unsupported name
-/// fails before the caller can publish any glue.
+/// Validates that `name` is an ASCII JS identifier.
 fn identifier(name: &str) -> Result<(), String> {
     let mut bytes = name.bytes();
     let start = |b: u8| b.is_ascii_alphabetic() || b == b'_' || b == b'$';
@@ -508,8 +492,7 @@ fn identifier(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a class or function name the glue's module scope cannot hold: a
-/// JS reserved word, or one of the glue's own names.
+/// Rejects class or function names that collide with JS reserved words or glue declarations.
 fn top_level_name(name: &str) -> Result<(), String> {
     let glue = GLUE_NAMES.contains(&name)
         || name.starts_with("__wbg_")

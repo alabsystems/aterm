@@ -42,7 +42,8 @@ impl ColorType {
         }
     }
 
-    /// Parse an IHDR colour-type byte.
+    /// Parse an IHDR colour-type byte. `None` for the reserved values 1, 5 and
+    /// anything above 6 — a file using one is malformed, not merely exotic.
     #[inline]
     const fn from_u8(v: u8) -> Option<Self> {
         match v {

@@ -951,7 +951,8 @@ impl Host {
     }
 }
 
-/// Fold quads into per-cell ink pixels.
+/// Fold quads into per-cell ink pixels. `scratch` is a per-pixel max buffer,
+/// cleared before returning; only touched pixels are visited.
 fn fold(quads: &[GlowQuad], g: Geom, scratch: &mut [u8]) -> BTreeMap<(u16, u16), u32> {
     let w = g.cols * CW;
     let h = g.rows * CH;
@@ -1121,7 +1122,11 @@ fn whole_reads_lay_no_band_on_the_match_row_or_under_zle_s_fake_cursor() {
     assert!(bad.is_empty(), "the owner's shape lit:{bad}");
 }
 
-/// No ink on the match row when the match hops.
+/// No ink on the match row when the match hops. `hop` (`git log --stat` then
+/// `ls -la`, keys `log`: `l` hops four cells to `ls -la`'s last `l`) and `hop2`
+/// (`echo hello world` then `ls -la`, keys `lo w`: `l` hops four cells, `o`
+/// four more to `hello`'s `lo`), the latter also with the prompt on a full
+/// screen's last row.
 #[test]
 fn a_match_that_hops_along_its_row_lays_no_ink_there() {
     let mut bad = String::new();
@@ -1170,7 +1175,10 @@ fn a_match_that_hops_along_its_row_lays_no_ink_there() {
     );
 }
 
-/// An entry switch shaped like a soft-wrapped caret lays nothing.
+/// An entry switch shaped like a soft-wrapped caret lays nothing. `a` puts the
+/// caret on `cat a`'s `a` (R, 35); `ad` switches to an older two-line entry
+/// whose first line holds `d` at that column and whose indented second line
+/// starts with the match, caret (R+1, 2).
 #[test]
 fn an_entry_switch_shaped_like_a_soft_wrap_lays_nothing_on_the_match() {
     let mut bad = String::new();
@@ -1790,7 +1798,9 @@ fn one_torn_read_at_any_boundary_lays_no_band_on_the_match_row() {
     );
 }
 
-/// A footer does not displace an established typing row.
+/// A footer does not displace an established typing row. After an unowned
+/// parked row is refused, a classified navigation boundary restores ordinary
+/// typing on that row; neither path waits for a rest timer.
 #[test]
 fn ordinary_typing_keeps_its_row_and_a_classified_boundary_restores_it() {
     let mut h = Host::new(24, 100, APP);
@@ -1836,7 +1846,9 @@ fn ordinary_typing_keeps_its_row_and_a_classified_boundary_restores_it() {
     }
 }
 
-/// A licensed insert's echo puts the hand on its row (`CursorGlow::lay_insert`).
+/// A licensed insert's echo puts the hand on its row (`CursorGlow::lay_insert`). A click
+/// (the generic boundary) leaves the caret's row unowned, a footer tick parks it, and a
+/// paste (⌘V, which keeps whatever hand there is: none) lays its echo there.
 #[test]
 fn a_licensed_insert_takes_the_hand_s_row() {
     let mut h = Host::new(24, 100, APP);
@@ -1874,7 +1886,9 @@ fn a_licensed_insert_takes_the_hand_s_row() {
     );
 }
 
-/// A recalled lay hands back the doubt it settled.
+/// A recalled lay hands back the doubt it settled. After the Ctrl-R (the generic boundary)
+/// and before zle shows the search, a read torn at the first key's glyph lays `c` on the
+/// caret's row: that lay put the hand there and settled the row's doubt.
 #[test]
 fn a_recalled_lay_hands_back_the_row_s_doubt() {
     let mut h = Host::new(24, 100, APP);
@@ -1910,7 +1924,10 @@ fn a_recalled_lay_hands_back_the_row_s_doubt() {
     );
 }
 
-/// A row the hand put input on stays its own after the hand moves on.
+/// A row the hand put input on stays its own after the hand moves on. A click leaves the
+/// caret's row unowned; the hand's input lands there (a key's echo, or a paste's); a composer
+/// newline and a key put the hand on the next line; two Backspaces bring the caret back up; a
+/// footer tick parks the caret on the first row.
 #[test]
 fn a_row_the_hand_put_input_on_stays_its_own_after_the_hand_moves_on() {
     for paste in [false, true] {
@@ -1962,7 +1979,9 @@ fn a_row_the_hand_put_input_on_stays_its_own_after_the_hand_moves_on() {
     }
 }
 
-/// The recall's negative control.
+/// The recall's negative control. A highlighter's redraw (the key's echo, then back to the
+/// word's start and the word reprinted in its new colour), torn after every piece, walks the
+/// caret left of the echo mid-write but rests right of it: the key's cell stays.
 #[test]
 fn a_caret_resting_right_of_the_echo_or_behind_a_key_keeps_it() {
     let mut h = Host::new(24, 100, APP);

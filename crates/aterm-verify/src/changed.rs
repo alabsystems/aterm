@@ -47,7 +47,7 @@ impl Members {
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -821,7 +821,8 @@ fn flag_hidden_edits(root: &Path, path_env: &OsStr) -> Option<Vec<String>> {
     Some(gone)
 }
 
-/// A child's stdout on success, `None` on any failure.
+/// A child's stdout on success, `None` on any failure. Stdout only: a warning on
+/// stderr must never be parsed as part of the dependency graph.
 fn stdout_of(cmd: &mut Command, root: &Path, path_env: &OsStr) -> Option<String> {
     let out = cmd.current_dir(root).env("PATH", path_env).output().ok()?;
     out.status

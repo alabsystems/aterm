@@ -137,7 +137,9 @@ pub struct TurnTokens {
 }
 
 impl TurnTokens {
-    /// The counts of a usage object; a missing class reads 0.
+    /// The counts of a usage object; a missing class reads 0. `None` for
+    /// anything but an object holding `input_tokens` or `output_tokens` as a
+    /// whole number.
     fn of(v: Option<&Value>) -> Option<Self> {
         let o = v?.as_object()?;
         let n = |key: &str| o.get(key).and_then(Value::as_u64);

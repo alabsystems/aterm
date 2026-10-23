@@ -8,7 +8,7 @@ use super::*;
 
 impl<C: Ctl> Session<'_, C> {
     /// Whether this loop watches beside a proven self-claim ([`Self::set_beside`]).
-    pub(super) fn beside_self_claim(&self) -> bool {
+    pub(super) const fn beside_self_claim(&self) -> bool {
         self.setup.beside.is_some()
     }
 

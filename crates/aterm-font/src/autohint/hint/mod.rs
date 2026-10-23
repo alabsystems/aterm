@@ -18,8 +18,7 @@ use super::{
     topo::{self, Axis, Dimension},
 };
 
-/// Captures adjusted horizontal scale and outer edge positions to be used
-/// for horizontal metrics adjustments.
+/// Adjusted horizontal scale and outer edge positions for horizontal metrics adjustments.
 #[derive(Copy, Clone, PartialEq, Default, Debug)]
 pub(crate) struct EdgeMetrics {
     pub left_opos: i32,
@@ -31,16 +30,11 @@ pub(crate) struct EdgeMetrics {
 #[derive(Copy, Clone, PartialEq, Default, Debug)]
 pub(crate) struct HintedMetrics {
     pub x_scale: i32,
-    /// This will be `None` when we've identified fewer than two horizontal
-    /// edges in the outline. This will occur for empty outlines and outlines
-    /// that are degenerate (all x coordinates have the same value, within
-    /// a threshold). In these cases, horizontal metrics will not be adjusted.
+    /// This will be `None` when we've identified fewer than two horizontal edges in the outline.
     pub edge_metrics: Option<EdgeMetrics>,
 }
 
 /// Applies the complete hinting process to a latin outline.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3554>
 pub(crate) fn hint_outline(
     outline: &mut Outline,
     metrics: &UnscaledStyleMetrics,
@@ -57,9 +51,6 @@ pub(crate) fn hint_outline(
         ..Default::default()
     };
     let group = metrics.style_class().script.group;
-    // For default script group, we don't proceed with hinting if we're
-    // missing alignment zones. FreeType swaps in a "dummy" hinter here
-    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afglobal.c#L475>
     if group == ScriptGroup::Default && scaled_metrics.axes[1].blues.is_empty() {
         return hinted_metrics;
     }

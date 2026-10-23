@@ -147,6 +147,7 @@ impl Soak {
     }
 }
 
+/// Whether a row's link counts toward the streak: on, armed or absent (the link was on,
 /// whatever answered it).
 fn streak_link(row: &Row) -> Option<KeeperAtLaunch> {
     row.keeper.filter(|k| k.link_on())
@@ -334,6 +335,7 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
     }
 }
 
+/// Add one recovery's [`Restores`] to a running sum (the `restore_why` words by word, in
 /// the order each was first seen).
 fn add(sum: &mut Restores, r: &Restores) {
     sum.exact = sum.exact.saturating_add(r.exact);

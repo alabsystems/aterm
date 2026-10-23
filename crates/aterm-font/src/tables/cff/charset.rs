@@ -88,7 +88,6 @@ impl Charset<'_> {
                 None
             }
             Charset::Format2(array) => {
-                // The same as format 1, but Range::left is u16.
                 let mut glyph_id = GlyphId(1);
                 for range in *array {
                     let last = u32::from(range.first.0) + u32::from(range.left);
@@ -110,15 +109,12 @@ pub(crate) fn parse_charset<'a>(
     number_of_glyphs: NonZeroU16,
     s: &mut Stream<'a>,
 ) -> Option<Charset<'a>> {
-    // -1 everywhere, since `.notdef` is omitted.
     let format = s.read::<u8>()?;
     match format {
         0 => Some(Charset::Format0(
             s.read_array16::<StringId>(number_of_glyphs.get() - 1)?,
         )),
         1 => {
-            // The number of ranges is not defined, so we have to
-            // read until no glyphs are left.
             let mut count = 0;
             {
                 let mut s = s.clone();
@@ -134,7 +130,6 @@ pub(crate) fn parse_charset<'a>(
             s.read_array16::<Format1Range>(count).map(Charset::Format1)
         }
         2 => {
-            // The same as format 1, but Range::left is u16.
             let mut count = 0;
             {
                 let mut s = s.clone();

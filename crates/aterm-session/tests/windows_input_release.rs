@@ -52,7 +52,8 @@ mod k32 {
     }
 }
 
-/// Whether `thread` has I/O pending: a `WriteFile` it is blocked in.
+/// Whether `thread` has I/O pending: a `WriteFile` it is blocked in. A write
+/// the pipe has room for completes in the call and never shows here.
 fn io_pending<T>(thread: &JoinHandle<T>) -> bool {
     use std::os::windows::io::AsRawHandle;
     let mut pending = 0;
@@ -123,7 +124,11 @@ impl Tab {
         )
     }
 
-    /// `argv`, a counting program, held as [`Self::held`] holds it.
+    /// `argv`, a counting program, held as [`Self::held`] holds it. With
+    /// `handshake`, its first output is read as a tab's reader reads it, up to
+    /// the console host's request for win32-input-mode records (which the
+    /// session's guard watches the output for), on this thread, so no read of
+    /// the output is left pending.
     fn held_running(host: ConsoleHostKind, argv: &[&str], handshake: bool) -> Self {
         // SAFETY: a test process; the trusted-launcher contract trivially holds.
         let authority = unsafe { aterm_cap::Authority::root_authority() };

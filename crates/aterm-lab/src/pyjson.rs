@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! JSON the lab writes, spelled as the tools it replaces spelled it (Python's
-//! `json.dumps`: `", "` and `": "` between items unless compact, `indent=N`
-//! layout, non-ASCII escaped unless asked otherwise), over an ORDERED tree so
-//! a record's fields stay in the order they were measured. Input is parsed by
-//! `aterm_json`, whose objects come back in key order.
+//! Insertion-ordered JSON value with Python `json.dumps`-compatible formatting.
 
 use std::fmt::Write as _;
 
 /// A JSON value whose objects keep their insertion order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum J {
-    /// `null`
+    /// `null`.
     Null,
-    /// `true` / `false`
+    /// `true` or `false`.
     Bool(bool),
     /// An integer.
     Int(i64),
@@ -117,7 +113,6 @@ impl J {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             J::Int(i) => Some(*i),
-            // A whole float within range is the integer it spells.
             #[allow(clippy::cast_possible_truncation)]
             J::Float(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => Some(*f as i64),
             _ => None,
@@ -126,7 +121,7 @@ impl J {
 
     /// A number as a float.
     #[must_use]
-    pub fn as_f64(&self) -> Option<f64> {
+    pub const fn as_f64(&self) -> Option<f64> {
         match self {
             #[allow(clippy::cast_precision_loss)]
             J::Int(i) => Some(*i as f64),
@@ -311,8 +306,7 @@ impl<T: Into<J>> From<Vec<T>> for J {
     }
 }
 
-/// A float as Python's `repr` spells it: the shortest round trip, `.0` on a
-/// whole number, an exponent below 1e-4 and from 1e16.
+/// Formats `f` like Python's float `repr`.
 #[must_use]
 pub fn py_float(f: f64) -> String {
     if f.is_nan() {
@@ -362,8 +356,7 @@ fn write_str(out: &mut String, s: &str, ascii: bool) {
     out.push('"');
 }
 
-/// Python's `deep merge` of the lab's `settings` verb: `null` removes a key, an
-/// object merges into an object, anything else (a list included) replaces.
+/// Recursively merges `from` into `into`, removing keys set to `null`.
 pub fn merge(into: &mut J, from: &J) {
     let J::Obj(pairs) = from else { return };
     for (k, v) in pairs {

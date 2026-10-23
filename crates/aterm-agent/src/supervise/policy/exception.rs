@@ -29,7 +29,7 @@ pub enum Urgency {
 impl Urgency {
     /// The word the journal's `EXCEPTION … when=<word>` carries.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Urgency::Now => "now",
             Urgency::Later => "later",
@@ -426,7 +426,7 @@ fn spend_text(program: Program, message: &str) -> (&'static str, &'static str) {
 /// Gemini CLI's own `/stats model`, which its usage-limit dialog names
 /// (measured on 0.46.0);
 /// any other program's account, in words that name no vendor.
-fn futile_action(program: Program) -> &'static str {
+const fn futile_action(program: Program) -> &'static str {
     match program {
         Program::Claude => "Check claude.ai/settings/usage for what holds it.",
         Program::Agy => "Check agy's account usage for what holds it.",
@@ -471,7 +471,7 @@ fn login_text(program: Program, message: &str) -> (&'static str, String, &'stati
 const LOGIN_CLEARS: &str = "`Login successful` on the screen, or the agent working";
 
 /// A draft's notice asks for a step that can actually empty its prompt.
-fn draft_notice_text(text: &NoticeText, composer: &Composer) -> NoticeText {
+const fn draft_notice_text(text: &NoticeText, composer: &Composer) -> NoticeText {
     NoticeText {
         todo: match composer {
             Composer::Diverted => "Close the completion menu, then send the draft in the tab.",

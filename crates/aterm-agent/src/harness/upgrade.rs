@@ -144,7 +144,7 @@ pub enum Source {
 impl Source {
     /// Identifier word used in the ledger and notices.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Source::Managed => "managed",
             Source::Native => "native",
@@ -234,7 +234,7 @@ impl Agent {
 
     /// State-file identifier word (empty for Claude Code).
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Agent::Claude => "",
             Agent::Codex => "codex",
@@ -259,13 +259,13 @@ impl Agent {
 
     /// User-facing product name.
     #[must_use]
-    pub fn product(self) -> &'static str {
+    pub const fn product(self) -> &'static str {
         self.program().product()
     }
 
     /// Corresponding [`aterm_phase::Program`] for screen classification.
     #[must_use]
-    pub fn program(self) -> aterm_phase::Program {
+    pub const fn program(self) -> aterm_phase::Program {
         match self {
             Agent::Claude => aterm_phase::Program::Claude,
             Agent::Codex => aterm_phase::Program::Codex,
@@ -277,7 +277,7 @@ impl Agent {
 
     /// Maps a screen-reader [`aterm_phase::Program`] to its upgrade [`Agent`].
     #[must_use]
-    pub fn of(program: aterm_phase::Program) -> Option<Self> {
+    pub const fn of(program: aterm_phase::Program) -> Option<Self> {
         match program {
             aterm_phase::Program::Claude => Some(Agent::Claude),
             aterm_phase::Program::Codex => Some(Agent::Codex),
@@ -627,7 +627,7 @@ impl Dialect {
 
     /// File extension for this dialect's `atpkg` shell hook.
     #[must_use]
-    pub fn hook_ext(self) -> &'static str {
+    pub const fn hook_ext(self) -> &'static str {
         match self {
             Dialect::Zsh => "zsh",
             Dialect::Bash => "bash",
@@ -932,7 +932,7 @@ pub fn ready_marker(session_id: &str, to: &Version, salt: u64) -> String {
     )
 }
 
-fn marker_id(session_id: &str, to: &str, salt: u64) -> u64 {
+const fn marker_id(session_id: &str, to: &str, salt: u64) -> u64 {
     let mut h = aterm_hash::Fnv1a64::new();
     h.write(session_id.as_bytes());
     h.write(to.as_bytes());
@@ -1494,19 +1494,19 @@ impl FinishedScan {
 
     /// Returns whether the transcript scanned so far indicates the task is finished.
     #[must_use]
-    pub fn finished(&self) -> bool {
+    pub const fn finished(&self) -> bool {
         self.finished
     }
 
     /// Returns whether a decisive transcript row has settled the finish state.
     #[must_use]
-    pub fn settled(&self) -> bool {
+    pub const fn settled(&self) -> bool {
         self.settled
     }
 
     /// Returns whether the model's last text turn claims the work is done.
     #[must_use]
-    pub fn said_done(&self) -> bool {
+    pub const fn said_done(&self) -> bool {
         self.done_said
     }
 
@@ -1524,7 +1524,7 @@ impl FinishedScan {
 
     /// Returns whether the model's done report mentions an irreversible action.
     #[must_use]
-    pub fn said_irreversible(&self) -> bool {
+    pub const fn said_irreversible(&self) -> bool {
         self.done_said && self.done_irreversible
     }
 
@@ -2311,7 +2311,7 @@ impl LoginScan {
 
     /// Returns the Unix timestamp when the last login wall was lifted.
     #[must_use]
-    pub fn lifted_at(&self) -> Option<u64> {
+    pub const fn lifted_at(&self) -> Option<u64> {
         self.lifted
     }
 }
@@ -3009,13 +3009,13 @@ impl TaskScan {
 
     /// Returns whether the scanned transcript has a task.
     #[must_use]
-    pub fn tasked(&self) -> bool {
+    pub const fn tasked(&self) -> bool {
         self.tasked || self.command
     }
 
     /// Returns whether the task state is permanently settled.
     #[must_use]
-    pub fn settled(&self) -> bool {
+    pub const fn settled(&self) -> bool {
         self.tasked
     }
 }
@@ -3177,7 +3177,7 @@ pub enum Rung {
 impl Rung {
     /// Short identifier word for `--status`, ledger rows, and UI tables.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Rung::Prefer => "prefer",
             Rung::Settled => "settled",
@@ -3239,7 +3239,7 @@ pub fn rung(behind_s: u64) -> Rung {
 
 /// Effective [`Rung`] for `f` (`Rung::Land` under `owner_now`, otherwise [`rung`]).
 #[must_use]
-pub fn rung_in_force(f: &Facts) -> Rung {
+pub const fn rung_in_force(f: &Facts) -> Rung {
     if f.owner_now { Rung::Land } else { f.rung }
 }
 
@@ -3496,7 +3496,7 @@ pub fn rest_extension(streak: u32) -> u64 {
 
 /// Additional retry backoff in seconds after the `streak`-th unanswered round (`GAVE_UP`).
 #[must_use]
-pub fn unanswered_rest_extension(streak: u32) -> u64 {
+pub const fn unanswered_rest_extension(streak: u32) -> u64 {
     let multiples = match streak {
         0 | 1 => 0,
         2 => 1,
@@ -3749,7 +3749,7 @@ fn void_of(f: &Facts, w: &'static str, drained: bool) -> Option<&'static str> {
 
 /// Tracks the timestamp since which an actionable READY reply has stood.
 #[must_use]
-pub fn ready_since(prior: u64, ready: bool, f: &Facts, now_s: u64) -> u64 {
+pub const fn ready_since(prior: u64, ready: bool, f: &Facts, now_s: u64) -> u64 {
     if !ready {
         0
     } else if prior == 0 || f.limited || f.login {
@@ -4007,7 +4007,7 @@ pub fn requested_step(
     rearm_held(request, step, target, now_s)
 }
 
-fn held_word(request: &Request) -> &'static str {
+const fn held_word(request: &Request) -> &'static str {
     if matches!(request, Request::Skip(_)) {
         "skipped"
     } else {

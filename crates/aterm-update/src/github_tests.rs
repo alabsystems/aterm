@@ -1008,7 +1008,9 @@ fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
     assert!(unread.selected.is_none() && unread.manifest_rejected);
 }
 
-/// A marker written before the attribution fields existed names no machine.
+/// A marker written before the attribution fields existed names no machine. A
+/// revocation must LEAVE IT ALONE: "I cannot tell who signed this" is not evidence of
+/// withdrawal, and retiring on it would re-download on every check forever.
 #[test]
 fn a_revocation_leaves_an_unattributed_stage_alone() {
     let revoked = vec!["m11".to_string()];
@@ -1279,7 +1281,12 @@ fn an_unchanged_head_is_judged_again_when_the_stage_owes_its_roster_confirmation
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Tier-1 for `NativeUpdateRosterFreshness`.
+/// Tier-1 for `NativeUpdateRosterFreshness`. Every reachable
+/// state of the model with a stage on disk is laid out in a real staging root —
+/// build 20 by m11, its marker stamped at the state's confirmation tick (a tick
+/// is half the window of the real clock), the floor at the generation that
+/// authorized it; one root per distinct thing the real code reads — and the real
+/// code is asked.
 #[test]
 fn roster_freshness_conformance() {
     use aterm_spec::interp::State;
@@ -2159,7 +2166,11 @@ fn every_web_lane_failure_path_ends_without_an_api_request() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-/// Invariant (d): the pointer alone can never choose what is installed.
+/// Invariant (d): the pointer alone can never choose what is installed. The tag it
+/// names must equal `v` + the signed manifest's `version` (the `url` half is
+/// `the_url_bind_accepts_the_source_or_the_compiled_in_channel_and_nothing_else`):
+/// on the real fetch path, a pointer at v0.11.0 whose appcast says 0.10.0 is refused
+/// as a manifest defect, never staged, and every GET is addressed by the pointer's tag.
 #[test]
 fn the_pointers_tag_and_the_manifest_version_must_agree() {
     let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));

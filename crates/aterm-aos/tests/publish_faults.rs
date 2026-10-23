@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What a publication can never leave behind: a half-installed pair (fault injection at every
-//! store), a reused revision, a rewritten checkpoint, or a witness accepted on a boundary
-//! that did not produce it.
+//! Fault-injection and safety tests for AOS publication and checkpoint restore.
 
 use aterm_aos::checkpoint::{Checkpoint, Provenance, RestoreRefusal};
 use aterm_aos::log::IdentityMismatch;
@@ -42,8 +40,6 @@ fn view(b: &mut ToyBoundary) -> PairView {
     }
 }
 
-// The fault-injection seam exists only where `debug_assertions` is on (the library and this
-// test crate share the profile), so the tests over it and their helpers do too.
 #[cfg(debug_assertions)]
 #[derive(Debug, PartialEq, Eq)]
 enum Installed {
@@ -134,12 +130,8 @@ fn a_commit_stopped_after_any_number_of_stores_leaves_the_complete_old_pair_or_t
             None => {
                 let at = classify(&view(&mut b), &old, &new);
                 assert_ne!(at, Installed::Mixed, "k = {k}");
-                // The queue is delivered only after the pair is installed: a stop leaves it
-                // whole, and the boundary still paused.
                 assert!(b.is_paused(), "k = {k}");
                 assert_eq!(b.queued(), 2, "k = {k}");
-                // Whatever pair is installed receives the queue once, in order, into its
-                // own log.
                 assert_eq!(b.reject().len(), 2, "k = {k}");
                 let log = b.log().unwrap().inputs().to_vec();
                 assert_eq!(&log[log.len() - 2..], &[Add(5), Add(6)][..], "k = {k}");
@@ -176,7 +168,6 @@ fn negative_control_new_state_under_old_code_classifies_as_mixed_and_cannot_comm
     let new = new_view(&base, &c0);
     let p = base.prepare(code(Variant::Good)).unwrap();
 
-    // A host that wrote the candidate's state into the live pair without switching code.
     let mut b = base.clone();
     *b.pair_mut().1 = p.state().clone();
     let v = view(&mut b);
@@ -248,7 +239,6 @@ fn a_restore_mints_a_new_branch_and_revision_so_a_candidate_from_before_it_is_st
     let p = b.prepare(code(Variant::Good)).unwrap();
     b.reject();
     let restored = b.restore(&c1).unwrap();
-    // The same bytes at the same cursor under the same identity — and still another head.
     assert_eq!(restored.state_digest, h0.state_digest);
     assert_eq!(restored.input_cursor, h0.input_cursor);
     assert_eq!(restored.identity, h0.identity);
@@ -282,7 +272,6 @@ fn restore_refuses_while_paused_or_mid_step_and_leaves_the_boundary_as_it_was() 
     assert_eq!(b.head(), &h);
     b.withdraw();
     assert_eq!(b.stats().restores, 0);
-    // At a boundary it restores: the state and cursors of the checkpoint, on a new branch.
     let r = b.restore(&c0).unwrap();
     assert_eq!(b.pair().state, ToyState::default());
     assert_eq!(
@@ -301,7 +290,6 @@ fn a_checkpoint_of_another_identity_does_not_restore_even_one_from_before_a_repa
     b.commit(p).unwrap();
     let head = b.head().clone();
 
-    // The ancestor ran under the code the repair replaced.
     assert_eq!(
         b.restore(&c0).err(),
         Some(PublishRefusal::Restore(RestoreRefusal::Identity(
@@ -325,7 +313,6 @@ fn a_checkpoint_of_another_identity_does_not_restore_even_one_from_before_a_repa
             IdentityMismatch::Task
         )))
     );
-    // Right identity, but state bytes the live schema does not read.
     let unreadable = Checkpoint::capture(
         &ToySchema::lossy(),
         &ToyState::default(),
@@ -346,7 +333,6 @@ fn a_checkpoint_of_another_identity_does_not_restore_even_one_from_before_a_repa
     );
     assert_eq!(b.head(), &head);
     assert_eq!(b.stats().restores, 0);
-    // The repaired pair's own checkpoint restores.
     let c1 = b.checkpoint().unwrap().clone();
     assert!(b.restore(&c1).is_ok());
 }
@@ -378,7 +364,6 @@ fn revisions_stay_distinct_across_commits_and_restores() {
     assert_eq!(revisions, vec![0, 1, 2, 3, 4]);
     let branches: Vec<u64> = heads.iter().map(|h| h.branch.0).collect();
     assert_eq!(branches, vec![0, 0, 1, 1, 2]);
-    // A restore over equal state still yields a head no earlier head equals.
     assert_eq!(heads[4].state_digest, heads[3].state_digest);
     for (i, a) in heads.iter().enumerate() {
         for x in &heads[i + 1..] {
@@ -394,12 +379,9 @@ fn checkpoints_are_never_rewritten_and_each_new_ancestor_names_the_one_before() 
     let mut chain: Vec<(Checkpoint, Vec<u8>)> = Vec::new();
     keep(&b, &mut chain);
 
-    // Live inputs extend the log; the ancestor stays the same value.
     feed(&mut b, &[Add(1), Tick]);
     assert_eq!(b.checkpoint(), Some(&chain[0].0));
 
-    // Re-attach, commit and restore each start a new checkpoint whose parent is the one
-    // they replace (for a restore: the one restored).
     b.attach(5, 64).unwrap();
     keep(&b, &mut chain);
     feed(&mut b, &[Add(2), Tick]);
@@ -410,7 +392,6 @@ fn checkpoints_are_never_rewritten_and_each_new_ancestor_names_the_one_before() 
     feed(&mut b, &[Add(3)]);
     b.attach(8, 64).unwrap();
     keep(&b, &mut chain);
-    // chain[1] was taken under the stranded code: restore the repaired pair's own instead.
     let own = chain[2].0.clone();
     b.restore(&own).unwrap();
     keep(&b, &mut chain);
@@ -431,8 +412,6 @@ fn checkpoints_are_never_rewritten_and_each_new_ancestor_names_the_one_before() 
         .map(|(c, _)| c.provenance().log_epoch)
         .collect();
     assert_eq!(epochs, vec![1, 5, 6, 8, 9]);
-    // Every checkpoint still encodes to the bytes it had when it was taken, and decodes to
-    // itself.
     for (c, bytes) in &chain {
         assert_eq!(&c.encode().unwrap(), bytes);
         assert_eq!(&Checkpoint::decode(bytes).unwrap(), c);

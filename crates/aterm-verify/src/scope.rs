@@ -32,7 +32,7 @@ pub enum Scope {
 
 impl Scope {
     #[must_use]
-    pub fn workspace() -> Self {
+    pub const fn workspace() -> Self {
         Self::Workspace
     }
 
@@ -61,21 +61,21 @@ impl Scope {
     }
 
     #[must_use]
-    pub fn is_workspace(&self) -> bool {
+    pub const fn is_workspace(&self) -> bool {
         matches!(self, Self::Workspace)
     }
 
     /// The selection is empty: a cone no crate is in. The checks that compile ask
     /// before they build a command ([`Scope::args`]).
     #[must_use]
-    pub fn selects_nothing(&self) -> bool {
+    pub const fn selects_nothing(&self) -> bool {
         matches!(self, Self::Changed(c) if c.crates.is_empty())
     }
 
     /// Does the selection hold a package with a library target? Yes unless the
     /// cone proved otherwise: an unanswerable question leaves doctests running.
     #[must_use]
-    pub fn has_lib_target(&self) -> bool {
+    pub const fn has_lib_target(&self) -> bool {
         match self {
             Self::Changed(c) => c.any_lib,
             _ => true,

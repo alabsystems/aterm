@@ -30,7 +30,8 @@ unsafe extern "C" {
     /// `kCGColorSpaceExtendedLinearSRGB` (scRGB): linear transfer, sRGB
     /// primaries, unclamped components.
     static kCGColorSpaceExtendedLinearSRGB: *const c_void;
-    /// `kCGColorSpaceSRGB`, the SDR present's space.
+    /// `kCGColorSpaceSRGB`, the SDR present's space. Set explicitly because an
+    /// EDR-to-SDR flip on a live layer does not restore it.
     static kCGColorSpaceSRGB: *const c_void;
 }
 
@@ -76,7 +77,8 @@ unsafe impl aterm_objc::Encode for CgRect {
     const ENCODING: &'static str = "{CGRect={CGPoint=dd}{CGSize=dd}}";
 }
 
-/// Everything one swapchain configure sets.
+/// Everything one swapchain configure sets. `Self::aterm_present` builds the
+/// production values; tests build others to prove every setter is live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SwapchainConfig {
     /// The layer `pixelFormat`: [`PixelFormat::Bgra8Unorm`] (SDR) or
@@ -88,11 +90,14 @@ pub(crate) struct SwapchainConfig {
     /// `framebufferOnly`: `true` gives lossless drawable compression but no
     /// sampling or blit access.
     pub(crate) framebuffer_only: bool,
-    /// `displaySyncEnabled`.
+    /// `displaySyncEnabled`. `false` is wgpu's `Immediate`, the shipped macOS
+    /// choice; `true` is `Fifo` (`wgpu-hal surface.rs:74-78`).
     pub(crate) display_sync: bool,
-    /// `maximumDrawableCount`.
+    /// `maximumDrawableCount`. Legal range `[2, 3]` (`CAMetalLayer.h:104-108`;
+    /// out-of-range values throw); the shipped value is 3.
     pub(crate) maximum_drawables: usize,
-    /// `CALayer.opaque`.
+    /// `CALayer.opaque`. `false` for the `PostMultiplied` translucent
+    /// present.
     pub(crate) opaque: bool,
 }
 
@@ -142,7 +147,8 @@ impl SwapchainConfig {
     }
 }
 
-/// One configured `CAMetalLayer` and what every acquire needs.
+/// One configured `CAMetalLayer` and what every acquire needs. Thread-pinned
+/// raw-pointer holder; not `Send`/`Sync`.
 #[derive(Debug)]
 pub(crate) struct Swapchain {
     /// The +1 layer. Owned; released on drop.
@@ -185,7 +191,8 @@ impl Swapchain {
         })
     }
 
-    /// A swapchain parented under `parent` (any `CALayer`).
+    /// A swapchain parented under `parent` (any `CALayer`). Adds one sublayer
+    /// and never touches existing ones.
     pub(crate) fn attached(
         device: &Device,
         parent: &Obj,
@@ -548,7 +555,8 @@ impl Drop for Swapchain {
     }
 }
 
-/// A retained `CAMetalLayer` used only for `nextDrawable`.
+/// A retained `CAMetalLayer` used only for `nextDrawable`. The owner defers
+/// every layer setter, geometry sync and unparent until the request completes.
 pub(crate) struct LayerAcquire {
     layer: Option<Obj>,
 }
@@ -762,7 +770,10 @@ impl PresentTicket {
         self.settle_terminal(loss::outcome_of(self.cb.id()))
     }
 
-    /// Poll: `None` while in flight, `Some(outcome)` once terminal.
+    /// Poll: `None` while in flight, `Some(outcome)` once terminal. The first
+    /// terminal answer feeds the latch like [`Self::wait_outcome`] (same
+    /// contract as [`super::encoder::Submitted::try_outcome`]); later calls
+    /// answer from the cache and feed nothing.
     pub(crate) fn try_outcome(&self) -> Option<loss::CbOutcome> {
         if let Some(done) = self.settled.get() {
             return Some(done);
@@ -779,7 +790,10 @@ impl PresentTicket {
         self.settle(outcome)
     }
 
-    /// Record one classified outcome on the process latch and return it.
+    /// Record one classified outcome on the process latch and return it. Also
+    /// the injection seam, deliberately uncached: a real `Lost` cannot be
+    /// produced on a healthy GPU, so the end-to-end test drives a `PageFault`
+    /// through this on a real present's ticket.
     pub(crate) fn settle(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.latch.record(&outcome);
         outcome

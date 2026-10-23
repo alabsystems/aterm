@@ -53,7 +53,8 @@ pub enum Woke {
     HungUp,
 }
 
-/// Park on `wait` until it wakes or `until` comes ([`Lane::hung_up`]).
+/// Park on `wait` until it wakes or `until` comes, or, asked between slices, [`Lane::hung_up`]
+/// or `moved` answers `true`.
 pub fn park(
     mut wait: impl FnMut(Duration) -> bool,
     until: Instant,

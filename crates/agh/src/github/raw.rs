@@ -149,7 +149,7 @@ fn is_file_bytes(essence: &str, path: &str) -> bool {
 
 impl<'a> Raw<'a> {
     /// `agh api` over the client.
-    pub(crate) fn new(gh: &'a Github) -> Raw<'a> {
+    pub(crate) const fn new(gh: &'a Github) -> Raw<'a> {
         Raw { gh }
     }
 
@@ -166,7 +166,8 @@ impl<'a> Raw<'a> {
         }
     }
 
-    /// Execute `req`, reading one response or walking all pages when `req.all` is set.
+    /// Execute `req`, reading one response or walking all pages when `req.all` is set; a HEAD is
+    /// one response either way.
     ///
     /// # Errors
     ///

@@ -1,47 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SPLIT: the machine's busy CPU over one matched window, by coalition
-//! (SA §7.1, §7.7; RD §14.3).
-//!
-//! The window runs from one split tick's reading ([`CoalBase`]) to the next,
-//! and every part is over that same window (`MatchedWindowsOnly`), never a
-//! faster set's rate:
-//!
-//! * `global`: the cores' busy ticks over their total, times the cores.
-//! * Each listed coalition's CPU: its counter's growth over the window, from
-//!   0 for one made inside it, which is one listed above the highest id the
-//!   base listed (the kernel numbers coalitions in order and never reuses an
-//!   id). One
-//!   listed at the base but gone now ran work no part holds, which the
-//!   residual shows; so does one the base should have held and did not (not
-//!   read then, or a list that stopped short) and one whose counter went
-//!   back (a misread), which read 0, never a lifetime charged to one window,
-//!   and make the split heuristic.
-//! * `aterm`: every coalition whose part is [`Part::Aterm`]; `others` and
-//!   `services` the rest by part ([`super::name`]).
-//! * Each tab: its processes alive at both ends of the window (the same
-//!   kernel start), their CPU time's growth: the live figure. Reaped work has
-//!   no tab yet (reap credit, SA §7.5, is not read).
-//! * A delegated job's member under a launcher outside aterm: its live work
-//!   counts in its tab (or aterm's rest once its tab closed) and leaves its
-//!   launcher's part, capped at the launcher's own figure, so no part goes
-//!   below 0 and the work counts once.
-//! * `unaccounted = global − (aterm + delegated + others + services)`,
-//!   signed, never clamped. Each part is summed in ns and rounded once (half
-//!   up, as `global` is), so the residual holds no more than those few
-//!   roundings, never one per coalition of the many under a millicore.
-//!
-//! With the lane off the split is the built one by subtraction
-//! ([`CoalSplit::by_subtraction`]).
+//! Busy CPU split over one matched window, by coalition.
 
 use std::collections::HashMap;
 
 use super::{CoalRow, CoalSample, CoalSplit, CoalUsage, Named, Part, Via};
 use crate::model::{Membership, ProcSample, Sample, Split, TabRoot, TabView};
 
-/// The longest window a split reads, ns: a base older than this (no split
-/// tick for a minute) only starts the next window (`sys_host::WINDOW_MAX`).
+/// The longest window a split reads, ns.
 pub const WINDOW_MAX_NS: u64 = 60_000_000_000;
 
 /// One split tick's counters: where the next window starts.
@@ -57,10 +24,7 @@ pub struct CoalBase {
     pub cores: usize,
     /// Each listed coalition's counters, by id.
     pub coalitions: HashMap<u64, CoalUsage>,
-    /// The highest id the kernel listed, answered or not, where the list was
-    /// whole: one listed later above it was made after this reading. `None`
-    /// when the list stopped short or the host did not say, so none can be
-    /// told new.
+    /// The highest id the kernel listed, answered or not, where the list was whole.
     pub newest: Option<u64>,
     /// Each process of the user's, by pid: its kernel start and CPU time.
     pub procs: HashMap<u32, (Option<u64>, u64)>,
@@ -71,8 +35,7 @@ pub struct CoalBase {
 }
 
 impl CoalBase {
-    /// Sample `s`'s counters, its coalitions `read` and the CPU time of user
-    /// `uid`'s processes in its sweep `procs`; `None` without core ticks.
+    /// Samples `s`'s counters, coalitions `read`, and CPU time of `uid`'s processes in `procs`.
     #[must_use]
     pub fn of(s: &Sample, read: &CoalSample, procs: &[ProcSample], uid: u32) -> Option<Self> {
         let cores = s.cores.as_deref().filter(|c| !c.is_empty())?;
@@ -93,9 +56,7 @@ impl CoalBase {
         })
     }
 
-    /// The window from `base` to this reading, ns: `None` unless it is longer
-    /// than 0 and at most [`WINDOW_MAX_NS`] and both read the same cores
-    /// whose ticks moved.
+    /// The window from `base` to this reading, ns.
     #[must_use]
     pub fn window_after(&self, base: &Self) -> Option<u64> {
         let window = self.at_ns.checked_sub(base.at_ns).filter(|w| *w > 0)?;
@@ -129,7 +90,7 @@ pub struct SplitIn<'a> {
     pub listed: u32,
 }
 
-/// The split of `i`'s window (the module's rules). PURE.
+/// The split of `i`'s window (the module's rules).
 #[must_use]
 pub fn split(i: &SplitIn) -> CoalSplit {
     let window = i.now.at_ns.saturating_sub(i.base.at_ns).max(1);
@@ -141,7 +102,6 @@ pub fn split(i: &SplitIn) -> CoalSplit {
     let part_of = |c: u64| i.names.get(&c).map_or(Part::Services, |n| n.part);
     let add = |sum: &mut u64, ns: u64| *sum = sum.saturating_add(ns);
 
-    // Live work over the window, ns: the user's processes alive at both ends.
     let mut tabs = vec![0u64; i.tabs.len()];
     let mut own_ns = 0u64;
     let mut moved: HashMap<u64, u64> = HashMap::new();
@@ -166,21 +126,27 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         }
     }
 
-    // Each part summed in ns and rounded once; each row on its own.
+    let mut homes: HashMap<u64, Option<Vec<u64>>> = HashMap::new();
+    for (p, m) in i.procs.iter().zip(i.members) {
+        let Some(c) = p.coalition else { continue };
+        let key = m.tab.and_then(|t| i.tabs.get(t)).map(|t| t.tab);
+        let home = homes.entry(c).or_insert_with(|| Some(Vec::new()));
+        match (home.as_mut(), key) {
+            (Some(keys), Some(k)) if !keys.contains(&k) => keys.push(k),
+            (Some(_), Some(_)) => {}
+            _ => *home = None,
+        }
+    }
+
     let (mut aterm_ns, mut delegated_ns, mut others_ns, mut services_ns) = (0, 0, 0, 0);
     let mut rows = Vec::with_capacity(i.now.coalitions.len());
     for u in i.now.coalitions.values() {
         let before = match i.base.coalitions.get(&u.id) {
-            // An id is never reused: a counter below the base's is a
-            // misread.
             Some(b) => Some(*b).filter(|b| b.cpu_ns <= u.cpu_ns),
-            // Made inside the window: from 0.
             None if i.base.newest.is_some_and(|n| u.id > n) => Some(CoalUsage::default()),
-            // There at the base, and not read then.
             None => None,
         };
         let measured = before.is_some();
-        // Not measured: no growth over the window.
         let before = before.unwrap_or(*u);
         let deferred = |e: &CoalUsage| e.eqos_ns[1].saturating_add(e.eqos_ns[2]);
         let qos = |e: &CoalUsage| {
@@ -213,6 +179,10 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             .unwrap_or(u64::MAX),
             footprint: u.footprint,
             live: i.live.get(&u.id).copied().unwrap_or(0),
+            tabs: homes.get(&u.id).cloned().flatten().map(|mut keys| {
+                keys.sort_unstable();
+                keys
+            }),
             finished: u.tasks_exited > 0,
             lead: named.and_then(|n| n.lead.clone()),
         });
@@ -233,34 +203,39 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         others_mc,
         services_mc,
         unaccounted_mc,
-        tabs: i
-            .tabs
-            .iter()
-            .zip(tabs)
-            .map(|(t, ns)| (t.key, mc(ns)))
+        tabs: by_tab(i.tabs.iter().map(|t| t.tab).zip(tabs))
+            .into_iter()
+            .map(|(k, ns)| (k, mc(ns)))
             .collect(),
         own_mc: mc(own_ns),
         rows,
     }
 }
 
-/// `ns` of work over a window of `window` ns, millicores, rounded.
+fn by_tab<T: std::ops::AddAssign>(panes: impl IntoIterator<Item = (u64, T)>) -> Vec<(u64, T)> {
+    let mut tabs: Vec<(u64, T)> = Vec::new();
+    for (tab, v) in panes {
+        match tabs.iter_mut().find(|(k, _)| *k == tab) {
+            Some((_, sum)) => *sum += v,
+            None => tabs.push((tab, v)),
+        }
+    }
+    tabs
+}
+
 fn per_window(ns: u64, window: u64) -> i64 {
     rounded(u128::from(ns) * 1000, u128::from(window))
 }
 
-/// `num / den`, rounded half up (`den` at least 1).
 fn rounded(num: u128, den: u128) -> i64 {
     let den = den.max(1);
     i64::try_from((num + den / 2) / den).unwrap_or(i64::MAX)
 }
 
 impl CoalSplit {
-    /// The built split by subtraction ([`crate::Split`], one sweep's window),
-    /// with each tab's live figure from the same sweep (`tabs`): its parts
-    /// rounded to millicores, the residual what keeps them adding up.
+    /// Builds [`crate::Split`] by subtraction with each tab's live figure from the same sweep.
     #[must_use]
-    pub fn by_subtraction(built: &Split, tabs: &[TabView]) -> Self {
+    pub fn by_subtraction(built: &Split, tabs: &[TabView], roots: &[TabRoot]) -> Self {
         let mc = |cores: f32| super::millicores(cores);
         let (global_mc, aterm_mc, others_mc, services_mc) = (
             mc(built.global),
@@ -268,10 +243,8 @@ impl CoalSplit {
             mc(built.others),
             mc(built.services),
         );
-        let tabs: Vec<(u64, i64)> = tabs
-            .iter()
-            .map(|t| (t.key, mc(t.scope.cores.raw)))
-            .collect();
+        let tab_of = |key: u64| roots.iter().find(|r| r.key == key).map_or(key, |r| r.tab);
+        let tabs = by_tab(tabs.iter().map(|t| (tab_of(t.key), mc(t.scope.cores.raw))));
         let in_tabs: i64 = tabs.iter().map(|(_, mc)| mc).sum();
         Self {
             via: Via::Subtraction,

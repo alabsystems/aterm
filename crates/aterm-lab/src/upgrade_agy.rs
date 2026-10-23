@@ -258,7 +258,7 @@ fn approve_box(door: &Door<'_>) -> bool {
 
 /// Whether the work first seen at `from` and seen ended at `end` (ms) ran its
 /// course ([`RAN_MS`]).
-fn ran(from: Option<i64>, end: Option<i64>) -> bool {
+const fn ran(from: Option<i64>, end: Option<i64>) -> bool {
     matches!((from, end), (Some(from), Some(end)) if end - from >= RAN_MS)
 }
 

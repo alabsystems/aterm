@@ -897,7 +897,8 @@ fn near_shifts(options: &PlanOptions<'_>, from: usize, count: usize) -> RangeInc
     nearest..=furthest
 }
 
-/// Map lines `first..=last` through `base=`, when given.
+/// Map lines `first..=last` through `base=`, when given. `want` is what the
+/// conflict names when an edit since changed them: the anchors' h6.
 fn map_base(
     op: usize,
     first: usize,
@@ -1084,7 +1085,8 @@ struct Admitted {
     changes: BTreeMap<usize, usize>,
     /// Where inserts go.
     points: BTreeSet<usize>,
-    /// The lines inserts hang on: start -> end.
+    /// The lines inserts hang on: start -> end. Whole lines of one text, so
+    /// two are equal or disjoint.
     held: BTreeMap<usize, usize>,
     /// A prior open final line. A later insertion here would follow it.
     open_tail: Option<usize>,

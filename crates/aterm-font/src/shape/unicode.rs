@@ -7,16 +7,6 @@
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
 //! The Unicode properties the shaper keeps per character.
-//!
-//! The `Script` and `General_Category` tables are aterm-grapheme's (TF.6 of
-//! docs/AUDIT-third-party-2026-10-15.md moved them there from the
-//! `unicode-script` and `unicode-properties` crates). The predicates below
-//! are the shaper's own versions of Unicode properties and stay with it:
-//! HarfBuzz's modified `Default_Ignorable` (the Hangul fillers and the
-//! shorthand format controls draw), its variation-selector ranges, and its
-//! `Extended_Pictographic` list. The canonical combining class is not kept:
-//! nothing that reads it (normalization, fallback mark positioning) is
-//! carved.
 
 use super::buffer::{
     GlyphInfo, SCRATCH_HAS_CGJ, SCRATCH_HAS_DEFAULT_IGNORABLES, SCRATCH_HAS_NON_ASCII,
@@ -24,9 +14,8 @@ use super::buffer::{
 };
 use aterm_grapheme::GeneralCategory;
 
-/// Default_Ignorable code points, as HarfBuzz hides them: U+115F, U+1160,
-/// U+3164 and U+FFA0 are left out (fonts draw them as spacing glyphs, as
-/// Uniscribe does), and so are U+1BCA0..1BCA3.
+/// Default_Ignorable code points, as HarfBuzz hides them: U+115F, U+1160, U+3164 and U+FFA0 are
+/// left out (fonts draw them as spacing glyphs, as Uniscribe does), and so are U+1BCA0..1BCA3.
 #[inline]
 pub(crate) const fn is_default_ignorable(c: char) -> bool {
     let ch = c as u32;
@@ -53,8 +42,7 @@ pub(crate) const fn is_default_ignorable(c: char) -> bool {
     }
 }
 
-/// VARIATION SELECTOR-1..16 and -17..256. The Mongolian free variation
-/// selectors are the Arabic shaper's.
+/// VARIATION SELECTOR-1..16 and -17..256.
 #[inline]
 pub(crate) const fn is_variation_selector(c: char) -> bool {
     let ch = c as u32;
@@ -147,8 +135,8 @@ pub(crate) const fn is_emoji_extended_pictographic(c: char) -> bool {
     )
 }
 
-/// Sets a character's general category and Unicode property bits, and the
-/// buffer's scratch flags they imply.
+/// Sets a character's general category and Unicode property bits, and the buffer's scratch flags
+/// they imply.
 #[inline]
 pub(crate) fn init_unicode_props(info: &mut GlyphInfo, scratch_flags: &mut u32) {
     let u = info.as_char();
@@ -163,11 +151,7 @@ pub(crate) fn init_unicode_props(info: &mut GlyphInfo, scratch_flags: &mut u32) 
             match u32::from(u) {
                 0x200C => props |= unicode_props::CF_ZWNJ,
                 0x200D => props |= unicode_props::CF_ZWJ,
-                // Mongolian free variation selectors are hidden like other
-                // default ignorables but take part in shaping (harfbuzz#234),
-                // and so do TAG characters (harfbuzz#463).
                 0x180B..=0x180D | 0x180F | 0xE0020..=0xE007F => props |= unicode_props::HIDDEN,
-                // COMBINING GRAPHEME JOINER is not skipped in GSUB (harfbuzz#554).
                 0x034F => {
                     props |= unicode_props::HIDDEN;
                     *scratch_flags |= SCRATCH_HAS_CGJ;
@@ -187,17 +171,16 @@ pub(crate) const fn is_unicode_mark(info: &GlyphInfo) -> bool {
     info.gc.is_mark()
 }
 
-/// Sets the general category, clearing the property byte that depends on it
-/// (the `Cf` joiner and variation-selector bits), as upstream's packed form
-/// does.
+/// Sets the general category, clearing the property byte that depends on it (the `Cf` joiner and
+/// variation-selector bits), as upstream's packed form does.
 #[inline]
 pub(crate) const fn set_general_category(info: &mut GlyphInfo, gc: GeneralCategory) {
     info.gc = gc;
     info.unicode_props &= 0x00FF;
 }
 
-/// Marks a variation selector the font could not map with its base, so GSUB
-/// sees it as a format character (`true`), or restores it (`false`).
+/// Marks a variation selector the font could not map with its base, so GSUB sees it as a format
+/// character (`true`), or restores it (`false`).
 #[inline]
 pub(crate) const fn set_variation_selector(info: &mut GlyphInfo, customize: bool) {
     if customize {

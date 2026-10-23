@@ -46,7 +46,8 @@ pub fn waivers() -> impl Iterator<Item = &'static Waiver> {
 }
 
 thread_local! {
-    /// Is a `aterm_spec::xref::StepEvidence::step` window open on this thread?
+    /// Is a `aterm_spec::xref::StepEvidence::step` window open on this thread? The probe's first act
+    /// is to read this and return, so an un-armed probe costs one TLS `bool` load.
     static ARMED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 
     /// Anchor ids whose annotated fn was entered on THIS thread inside the open

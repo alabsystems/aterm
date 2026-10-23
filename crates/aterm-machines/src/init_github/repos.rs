@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Publish only verified, full new clones, and fast-forward each matching worktree that is
-//! clean and behind (docs/DESIGN-init-system-2026-10-20.md §4.3, S8).
-//! Clones are sequential: at most one clone/network transfer is active, with a
-//! thirty-minute bound per clone. An existing worktree moves only through
-//! [`crate::checkout::align`], the function `develop.checkout@<path>` uses: `git fetch`,
-//! then `git merge --ff-only`, when it is on GitHub's default branch, clean and has no
-//! commit GitHub lacks. Any other worktree (dirty, ahead, diverged, detached) is left as it
-//! is, and the row says why; none is ever reset, stashed, rebased, checked out or pushed. A
-//! checkout init.toml's `[develop]` table records belongs to the develop items, never to
-//! this one. GitHub pagination and every structured git read require complete EOF. The
-//! listing reads with the token the login keychain holds (agh's read door, no gh); a clone
-//! authenticates through the osxkeychain helper git's github.com settings name.
+//! Clone missing GitHub repositories into `~` and fast-forward clean worktrees that are behind.
 
 use super::{Github, auth_id, auth_ready, get};
 use crate::checkout::{Origin, Stands, git, github_origin as origin_matches};
@@ -32,8 +21,7 @@ const GIT: &str = crate::checkout::GIT;
 const PAGE_SIZE: usize = 30;
 const CLONE_BUDGET: Duration = Duration::from_secs(1800);
 
-/// One reconciliation item for every repository owned by the configured account/org,
-/// leaving the checkouts `[develop]` records (`recorded`) to the develop items.
+/// Build the reconciliation item for repositories owned by the configured account or org.
 pub(super) fn item(user: &User, config: &Github, recorded: Vec<PathBuf>) -> Box<dyn Item> {
     Box::new(Repositories {
         user: user.clone(),
@@ -207,8 +195,7 @@ impl Repositories {
     }
 }
 
-/// The checkouts the GitHub item verifies that are aterm workspaces: what `aterm init
-/// --develop` records when it runs outside one.
+/// Return verified GitHub checkouts in `~` that are `aterm` workspaces.
 pub(super) fn aterm_checkouts(
     sys: &dyn System,
     user: &User,
@@ -358,9 +345,7 @@ fn enumerate(
     })
 }
 
-/// Inventory must finish, including cross-owner destination admission, before
-/// callers may start credentials or filesystem mutations: every page is read
-/// ([`crate::github_pages::all`]) before any repository is admitted.
+/// Read all pages from `base` and validate repository records before any mutation.
 pub(super) fn enumerate_pages(
     base: &str,
     owner: Option<&str>,
@@ -558,11 +543,7 @@ fn remote(text: &str) -> Result<Remote, String> {
     })
 }
 
-// Read Git's effective URL without contacting the remote. Keep normal user
-// configuration; refuse a stable rewrite outside this repository rather than
-// mistaking the stored literal origin for the transport's selected endpoint.
-// This is a point-in-time config read, not an atomic config/transport snapshot or
-// proof about proxies, SSH commands, credentials, filters or hook callbacks.
+// Refuse stable URL rewrites outside this repository before contacting the remote.
 fn admit_endpoint(
     sys: &dyn System,
     user: &User,
@@ -643,8 +624,6 @@ pub(super) fn clone_one(
     {
         return Err("the empty GitHub repository's default branch changed; run init again".into());
     }
-    // Remote discovery may have waited for the network; inspect the current
-    // rewrite again before allocating or cloning. Neither check freezes config.
     admit_endpoint(sys, user, owner, repo, &url)?;
     let mut staging = Scratch::new_in(sys, home, "github-clone")
         .map_err(|_| "cannot allocate private repository staging in this home")?;
@@ -684,8 +663,6 @@ pub(super) fn clone_one(
         return Err("the new clone depends on an alternate object store; not published".into());
     }
     verify_new(sys, user, repo, &clone, &source)?;
-    // The OS operation itself must reject an occupied final name; a prior stat
-    // cannot prevent another process from creating it after this check.
     sys.rename_noreplace(&clone, &destination).map_err(|_| {
         format!(
             "cannot publish ~/{} without replacing an existing destination; left untouched",
@@ -925,8 +902,6 @@ mod tests {
                 .all(|call| call.contains(" agh GET ") && !call.contains("clone"))
         );
 
-        // A full terminal page needs an empty-page confirmation. GitHub may
-        // attach backward last/prev links to that out-of-range empty page.
         let (sys, who, config) = fixture();
         sys.on_github_api(
             &who,
@@ -994,8 +969,6 @@ mod tests {
             );
         }
         let (sys, who, config) = fixture();
-        // A page agh could not read whole (a body cut short, a refused redirect) ends the
-        // listing; port::github_api's own tests hold agh's door to refusing them.
         sys.on_github_api(
             &who,
             &format!("{BASE}&page=1"),
@@ -1127,7 +1100,6 @@ mod tests {
                 Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{B}\tHEAD\n")),
             );
             script_read(&sys, &who, &moving, "moving", "");
-            // `moving`'s HEAD and what it fetched, as git would keep them.
             let state = Arc::new(Mutex::new((if behind { A } else { B }.to_owned(), false)));
             let model = {
                 let (state, moving) = (Arc::clone(&state), moving.clone());
@@ -1632,8 +1604,6 @@ mod tests {
                 1
             );
         }
-        // Normal GitHub SSH rewrites keep the same owner/repository and remain
-        // supported. The actual clone still receives the original literal URL.
         for endpoint in [
             "git@github.com:alice/new.git",
             "ssh://git@github.com:22/alice/new.git",
@@ -1692,8 +1662,6 @@ mod tests {
                 );
             }
         }
-        // A stored literal GitHub origin is not evidence about an insteadOf
-        // redirect. Refuse before even remote discovery, without echoing its URL.
         for endpoint in [
             "https://mirror.invalid/alice/new.git",
             "https://github.com/other/new.git",
@@ -1719,8 +1687,6 @@ mod tests {
                 && !call.contains(" clone ")
                 && !call.contains("scratch allocated")));
         }
-        // A redirect that changes while discovery waits is checked again before
-        // clone allocation. This does not claim atomicity during either child.
         let (sys, who, _) = fixture();
         let key = git(&who, None)
             .args([
@@ -1816,8 +1782,6 @@ mod tests {
         let (sys, who, _) = fixture();
         let path = Path::new(&who.home).join("existing");
         script_existing(&sys, &who, &path, "existing");
-        // These commands deliberately have no usable responses. Identity-only
-        // preservation must never try to deepen, inspect or repair owner history.
         sys.refuse_complete_stdout(
             &git(&who, Some(&path))
                 .args(["rev-parse", "--is-shallow-repository"])

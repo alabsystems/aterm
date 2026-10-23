@@ -8,23 +8,105 @@ use crate::anchors::*;
 
 /// Whether `needle` occurs in `hay`.
 pub(crate) fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    find_bytes(hay, needle, 0).is_some()
+}
+
+/// Where `needle` first occurs in `hay` at or after `from` (the search
+/// [`contains_bytes`] makes).
+fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     let n = needle.len();
     if n == 0 {
-        return true;
+        return Some(from.min(hay.len()));
     }
     if hay.len() < n {
-        return false;
+        return None;
     }
     let mut skip = [n; 256];
     for (i, &b) in needle[..n - 1].iter().enumerate() {
         skip[usize::from(b)] = n - 1 - i;
     }
-    let mut at = 0;
+    let mut at = from;
     while at + n <= hay.len() {
         if &hay[at..at + n] == needle {
-            return true;
+            return Some(at);
         }
         at += skip[usize::from(hay[at + n - 1])];
+    }
+    None
+}
+
+/// In a template, the slot of a name the vendor's minifier chose (a
+/// binding, a parameter): any one JavaScript identifier stands there. The
+/// minifier renames them between builds that change no word (2.1.309's
+/// `sr(i)` is 2.1.308's `sr(a)`), so a template that pins one names a
+/// rename as a rewording. A private-use char, which no template's words
+/// hold.
+pub(crate) const JS_NAME: char = '\u{E000}';
+
+/// Whether `b` may continue a JavaScript identifier (ASCII: the minifier's
+/// names are).
+fn js_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// The length of the identifier `bytes` open with, or 0. JavaScript reads
+/// the longest one (`sa.` is the name `sa`, never `s` then `a.`).
+fn js_name_len(bytes: &[u8]) -> usize {
+    match bytes.first() {
+        Some(&b) if js_name_char(b) && !b.is_ascii_digit() => {
+            1 + bytes[1..].iter().take_while(|&&b| js_name_char(b)).count()
+        }
+        _ => 0,
+    }
+}
+
+/// Whether `pieces` (a template split at its [`JS_NAME`] slots) stand at
+/// `at` in `hay`: each piece byte for byte, one whole identifier between
+/// each two.
+fn pieces_at(hay: &[u8], at: usize, pieces: &[&str]) -> bool {
+    let Some((first, rest)) = pieces.split_first() else {
+        return true;
+    };
+    let end = at + first.len();
+    if !hay.get(at..end).is_some_and(|b| b == first.as_bytes()) {
+        return false;
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    let name = js_name_len(&hay[end..]);
+    name > 0 && pieces_at(hay, end + name, rest)
+}
+
+/// Whether `bytes` hold `template` whole, each [`JS_NAME`] slot as any one
+/// identifier and every other byte as written, at ANY place its first
+/// piece occurs (the store bundle holds the limit names' switch head
+/// `case"five_hour":` ten times on 2.1.308 and on 2.1.309, the switch the
+/// ninth). A template opens with words, never a slot, and no slot touches
+/// an identifier's char (the name would take it in).
+pub(crate) fn holds(bytes: &[u8], template: &str) -> bool {
+    let pieces: Vec<&str> = template.split(JS_NAME).collect();
+    if pieces.len() == 1 {
+        return contains(bytes, template);
+    }
+    let first = pieces[0].as_bytes();
+    assert!(!first.is_empty(), "a template opens with a slot");
+    let (before, after) = (&pieces[..pieces.len() - 1], &pieces[1..]);
+    assert!(
+        before
+            .iter()
+            .all(|p| !p.bytes().last().is_some_and(js_name_char))
+            && after
+                .iter()
+                .all(|p| !p.bytes().next().is_some_and(js_name_char)),
+        "a slot touches an identifier's char: {template:?}"
+    );
+    let mut from = 0;
+    while let Some(at) = find_bytes(bytes, first, from) {
+        if pieces_at(bytes, at, &pieces) {
+            return true;
+        }
+        from = at + 1;
     }
     false
 }
@@ -155,15 +237,17 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
         ),
         ("lifted line", escaped("reset.lifted")),
         ("login line", format!("{} \\xB7 ", anchor("reset.login"))),
+        // The set and the reset are the minifier's names (`s` and `a` on 2.1.308, `i` on 2.1.309).
         (
             "limit names",
             format!(
-                "case\"five_hour\":s.add(\"{}\");break;case\"seven_day\":s.add(\"{}\");break;\
-                 case\"seven_day_overage_included\":s.add(a.givesBackWeekly?\"Fable\":\"{}\");\
+                "case\"five_hour\":{n}.add(\"{}\");break;case\"seven_day\":{n}.add(\"{}\");break;\
+                 case\"seven_day_overage_included\":{n}.add({n}.givesBackWeekly?\"Fable\":\"{}\");\
                  break;",
                 limit_name("five_hour"),
                 limit_name("seven_day"),
-                limit_name("seven_day_overage_included")
+                limit_name("seven_day_overage_included"),
+                n = JS_NAME,
             ),
         ),
         (
@@ -202,14 +286,14 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
     templates
 }
 
-/// The names of the `templates` that `bytes` hold whole in none of their spellings.
+/// The names of the `templates` that `bytes` hold whole ([`holds`]) in none of their spellings.
 pub(crate) fn missing_templates(
     bytes: &[u8],
     templates: &[(&'static str, Vec<String>)],
 ) -> Vec<&'static str> {
     templates
         .iter()
-        .filter(|(_, spellings)| !spellings.iter().any(|t| contains(bytes, t)))
+        .filter(|(_, spellings)| !spellings.iter().any(|t| holds(bytes, t)))
         .map(|(name, _)| *name)
         .collect()
 }

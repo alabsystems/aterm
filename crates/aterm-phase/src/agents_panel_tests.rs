@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The agents panel's row reader ([`super`]). The 2.1.304 main and agent
-//! rows are MEASURED too (`fixtures/claude-2.1.304-agents-panel*.txt`, the
-//! real build in the lab, 2026-10-19: [`reads_the_measured_2_1_304_panel`]);
-//! the other 2.1.304 rows here (workflows, nested agents, worded statuses,
-//! `↓ N more`, the idle summary) are BUILT FROM THE BUNDLE'S GRAMMAR (the
-//! module docs say where each part comes from) and say so. The older
-//! builds' rows are the measured captures under `fixtures/`, read off the
-//! files.
+//! The agents panel's row reader ([`super`]).
 
 use super::*;
 
@@ -130,8 +123,6 @@ fn reads_each_row_kind_of_the_2_1_304_grammar() {
     assert_eq!(more.count, Some((span(4, 5), 4)));
     assert_eq!(more.bullet, None);
 
-    // A row `subagentStatusLine` decorates: its command's output in place of
-    // the name and status — an agent row, no status read.
     let decorated = parse("  ◯ ctx 12% · 1.5m tok");
     assert_eq!(decorated.kind, RowKind::Agent);
     assert_eq!(decorated.status(), None);
@@ -181,7 +172,6 @@ fn reads_the_2_1_304_workflow_row_at_each_bar_width() {
     assert_eq!(w.elapsed.map(|e| e.1), Some(clock(59_000, 1000)));
     assert_eq!(w.tokens, None);
 
-    // A narrow row's last fallbacks: the bare `↓ N`, the bar alone.
     let w = parse("  ◯ sweep  ▰▰▰▰▰▰▱▱  ↓ 1.0m · ⚠");
     assert_eq!(w.tokens.map(|t| t.1.count), Some(1_000_000));
     assert!(w.warning.is_some());
@@ -248,8 +238,6 @@ fn reads_the_measured_rows_of_older_builds() {
         Some(Progress { done: 0, total: 1 })
     );
     assert_eq!(w.elapsed.map(|e| e.1), Some(clock(240_000, 1000)));
-    // The live worker's panel of 2026-09-12 (`phase.rs`'s
-    // `a_turn_waiting_for_a_background_agent_is_busy_from_its_status_row`).
     let agent = parse(
         "  ◯ general-purpose  Searching the report's consumers in tests                                                  4m 28s · ↓ 115.4k tokens",
     );
@@ -347,8 +335,6 @@ fn rows_around_the_panel_are_no_panel_rows() {
     ] {
         assert_eq!(parse_row(row, one_cell), None, "{row:?}");
     }
-    // A main row whose right side is not `↑ N more` is no main row — but its
-    // name still reads as an agent's.
     assert_eq!(
         parse_row("  ◯ main  ↑ two more", one_cell).map(|r| r.kind),
         Some(RowKind::Agent)

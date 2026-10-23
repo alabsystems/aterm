@@ -1041,7 +1041,9 @@ impl GlDevice {
         Ok(dev)
     }
 
-    /// Read the caps of the current WebGL2 context.
+    /// Read the caps of the current WebGL2 context. The GPU's name is the
+    /// unmasked renderer where the browser offers it (as wgpu's WebGL2
+    /// backend named its adapter), else the browser's `GL_RENDERER`.
     fn load_webgl(gl: &GlFns) -> Result<GlCaps, String> {
         // SAFETY: the context is current; glGetString returns null or a NUL-terminated string the module owns for the context's life.
         let string = |name| unsafe { ffi::c_string((gl.get_string)(name).cast()) };

@@ -384,6 +384,25 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.118.0", "stalled-sequence"),
     ("v0.118.0", "twelve-panes"),
     ("v0.118.0", "variants"),
+    ("v0.119.0", "carried-state"),
+    ("v0.119.0", "claude-code-1049"),
+    ("v0.119.0", "colour-and-shell"),
+    ("v0.119.0", "engine-state"),
+    ("v0.119.0", "fold"),
+    ("v0.119.0", "held-failed"),
+    ("v0.119.0", "held-pane"),
+    ("v0.119.0", "held-withheld"),
+    ("v0.119.0", "history"),
+    ("v0.119.0", "history-carry"),
+    ("v0.119.0", "incident-55x149"),
+    ("v0.119.0", "link-dense"),
+    ("v0.119.0", "link-dense-history"),
+    ("v0.119.0", "policy-repaint"),
+    ("v0.119.0", "policy-visible"),
+    ("v0.119.0", "shell-integration"),
+    ("v0.119.0", "stalled-sequence"),
+    ("v0.119.0", "twelve-panes"),
+    ("v0.119.0", "variants"),
 ];
 
 /// The desk set, one `("vX.Y.0", "<desk>")` row per desk: every release from that floor on must
@@ -608,7 +627,9 @@ struct SessionExpectation {
     output_state: Option<bool>,
     #[serde(default)]
     render_debt: Option<String>,
-    /// Columns recorded by newer generators.
+    /// Columns recorded by newer generators. Earlier parent summaries omitted this
+    /// additive key even where their immutable manifest carried it; the raw wire is
+    /// checked independently below, and a recorded count must agree with it.
     #[serde(default)]
     render_debt_cut: Option<u64>,
 }
@@ -1700,7 +1721,9 @@ fn wire_render_debt_cuts(label: &str, manifest: &str) -> std::collections::BTree
     cuts
 }
 
-/// One carried Settings draft as `(leaf, key, text)`.
+/// One carried Settings draft as `(leaf, key, text)`. The leaf is the TOML path of the table that
+/// holds the draft's `settings_drafts` list: `windows[w].restored_tabs[t].root`, then `.first` or
+/// `.second` for each split, then `.view`.
 type LeafDraft = (String, String, String);
 
 /// Every Settings draft the parent's layout sidecar carries, with its leaf, read off the bytes,
@@ -1839,7 +1862,12 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
     count
 }
 
-/// The guard: every desk of every shipped release adopts in this build exactly.
+/// The guard: every desk of every shipped release adopts in this build exactly. Every session,
+/// repainting only what its producer flagged (a `carry = "repaint"` policy desk, v0.97.0 on), each
+/// screen the carried bytes verbatim at the carried geometry, each control carry read, each meta's
+/// state reassembled ([`assert_meta_state_crosses`]), the layout placed with every Settings draft
+/// ([`assert_settings_drafts_placed`]), and both digests, so the adoption proof, equal what that
+/// release's parent committed to.
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
     const SHARDS: usize = 4;
@@ -2553,7 +2581,10 @@ fn required_desks_of(
         .collect()
 }
 
-/// Every release pins each required desk from that desk's floor on, and each is checked in.
+/// Every release pins each required desk from that desk's floor on, and each is checked in. The
+/// cutter refuses a cut whose predecessor misses one (`aterm-release`'s
+/// `gates::handoff_fixtures_of`); this is the same rule over the tree as it stands, red before
+/// anyone tries to cut.
 #[test]
 fn every_release_since_the_floor_pins_the_required_desks() {
     let desks = every_desk();
@@ -2633,7 +2664,9 @@ pub(super) const RZ_SESSIONS: [(u64, i32); 3] = [(0, 4000), (1, 4001), (7, 4002)
 #[derive(serde::Deserialize)]
 struct RendezvousRecord {
     producer_version: String,
-    /// The fixed claim secret the generator dialed with ([`RZ_SECRET`]).
+    /// The fixed claim secret the generator dialed with ([`RZ_SECRET`]). Keyed
+    /// `claim_input`, not `claim_secret`: the export's gitleaks scan reads
+    /// `…secret = "<hex>"` as a leaked key (README, "The rendezvous transport").
     claim_input: String,
     /// The claim a successor presents for that secret, as that release's own
     /// dialer wrote it.
@@ -3053,7 +3086,10 @@ fn replay_grant_to_this_successor(
     let _ = std::fs::remove_file(&socket);
 }
 
-/// The rendezvous transport is the shipped one.
+/// The rendezvous transport is the shipped one. The desk guard pins the manifests and sidecars,
+/// but on macOS the successor gets every descriptor, and the parent its claim, over the
+/// rendezvous, so a change to a magic, the header, the body or the descriptor order would pass
+/// every same-build test and fail every update in the field.
 #[cfg(target_os = "macos")]
 #[test]
 fn every_shipped_producers_rendezvous_grants_this_successor() {

@@ -35,6 +35,9 @@ impl EnvSource for ProcessEnv {
     }
 }
 
+/// A value that is not valid Unicode converts lossily (U+FFFD) rather than
+/// reading as unset, which would hand the decision to the next variable and
+/// possibly a direct connection. [`parse_proxy`] refuses U+FFFD; in `NO_PROXY`
 /// that entry matches no host and the others still apply.
 fn env_text<E: EnvSource>(env: &E, name: &str) -> Option<String> {
     let value = env.var_os(name)?;
@@ -157,6 +160,9 @@ pub(crate) fn parse_proxy(name: &str, raw: &str) -> Result<ProxyTarget, Error> {
     Ok(ProxyTarget { uri, basic_auth })
 }
 
+/// Forms: `*`, a bare host, a `.suffix`, and a port-restricted `host:port`.
+/// Matching is case-insensitive and a suffix matches only on a label boundary
+/// (`example.test` never exempts `notexample.test`). An IP literal (IPv4, bare
 /// or bracketed IPv6) matches the same address and nothing else.
 fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
     let Some(value) = value else {
@@ -197,6 +203,8 @@ fn no_proxy_matches(target: &Uri, value: Option<String>) -> bool {
     false
 }
 
+/// The port follows the last colon only when that colon is not the address's
+/// own: a bare IPv6 literal (`2001:db8::5`) has no port, and a bracketed one
 /// (`[2001:db8::5]:8443`) ends at its bracket.
 fn split_no_proxy_entry(entry: &str) -> (&str, Option<u16>) {
     let (host, port) = if let Some((host, tail)) = entry
@@ -247,6 +255,7 @@ mod tests {
         }
     }
 
+    /// `before` and `after` around one sequence that is not valid Unicode: the
     /// byte 0xFF on Unix, an unpaired surrogate on Windows.
     #[cfg(unix)]
     fn not_unicode(before: &str, after: &str) -> OsString {
@@ -270,6 +279,7 @@ mod tests {
         Uri::parse(text).unwrap()
     }
 
+    /// The host of the proxy `env` resolves for `target` under
     /// [`ProxyMode::Environment`]; `None` for a direct connection.
     fn proxy_host(env: &FakeEnv, target: &str) -> Option<String> {
         resolve(ProxyMode::Environment, &uri(target), env)

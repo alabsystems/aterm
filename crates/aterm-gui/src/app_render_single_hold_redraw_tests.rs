@@ -229,7 +229,7 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
 
     // 1. Arm a prediction at the live cursor (0, 2) with no PTY echo yet:
     //    the frame takes ONE terminal hold and overlays the tentative glyph.
-    let now = std::time::Instant::now();
+    let now = crate::app_input::past_timeline_start();
     let coords = {
         let term = app
             .front_terminal(wid)
@@ -399,7 +399,7 @@ fn prediction_reconcile_confirms_rtl_echo_in_logical_columns() {
         "a right-to-left glyph is declined"
     );
     assert!(declining.idle());
-    let born = std::time::Instant::now();
+    let born = crate::app_input::past_timeline_start();
     arm_prediction_with(
         &mut app,
         'ג',
@@ -433,7 +433,7 @@ fn prediction_reconcile_never_confirms_uncommitted_ime_text() {
     app.predict_mode_cache = None;
     feed(&app, b"$ ");
     app.redraw_window(wid);
-    let born = std::time::Instant::now();
+    let born = crate::app_input::past_timeline_start();
     let unmeasured = arm_prediction(&mut app, 'k', born);
     app.on_ime_preedit(wid, "k".into(), Some((1, 1)));
     app.redraw_window_at(wid, born);
@@ -483,7 +483,7 @@ fn a_single_pane_frame_paints_a_state_chain_with_its_cursor() {
         app.redraw_window(wid);
         // Every press and frame below is at one instant: a stalled test thread
         // must not age the chain past its glitch window.
-        let now = std::time::Instant::now();
+        let now = crate::app_input::past_timeline_start();
         crate::app_input::pin_input_clock(Some(now));
         for c in ['a', 'b'] {
             let _ = app.input(wid, press(Key::Character(c)), Source::Human);

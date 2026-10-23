@@ -105,13 +105,13 @@ impl Note {
     }
 
     /// Whether a probe run since the latest failure passed — with no failure noted, whether one passed at all ([`proved`]).
-    pub fn proved(&self) -> bool {
+    pub const fn proved(&self) -> bool {
         self.proved_at != 0 && self.proved_for == self.failures
     }
 
     /// Whether a probe run since a failure noted passed: a move failure
     /// after it makes the note [`Note::blind`] ([`note_failure`]).
-    fn proved_since_a_failure(&self) -> bool {
+    const fn proved_since_a_failure(&self) -> bool {
         self.failures != 0 && self.proved()
     }
 
@@ -129,7 +129,7 @@ impl Note {
 
     /// Whether a probe run since the latest failure did not pass, within
     /// [`PROBE_GAP_S`] of `now`.
-    fn refused_lately(&self, now: u64) -> bool {
+    const fn refused_lately(&self, now: u64) -> bool {
         self.probed_for == self.failures
             && self.probed_at != 0
             && now < self.probed_at.saturating_add(PROBE_GAP_S)
@@ -515,7 +515,7 @@ pub enum Probe {
 impl Probe {
     /// One word for the note and the ledger.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Probe::Starts => "starts",
             Probe::Exited => "exited",
@@ -525,7 +525,7 @@ impl Probe {
     }
 
     /// What it found, in a sentence's words.
-    fn words(self) -> &'static str {
+    const fn words(self) -> &'static str {
         match self {
             Probe::Starts => "ran and exited 0",
             Probe::Exited => "exited with a failure",

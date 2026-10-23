@@ -13,7 +13,9 @@ pub const MUST_HAPPEN: Duration = Duration::from_secs(60);
 /// Lifetime in seconds for a parked test stand-in (`2 * MUST_HAPPEN`).
 pub const PARKED_SECS: u64 = 2 * MUST_HAPPEN.as_secs();
 
-/// The gap [`until_within`] leaves between observations.
+/// The gap [`until_within`] leaves between observations. Not a synchronisation
+/// primitive: the observation is the assertion, and this only keeps the poll
+/// from spinning a core.
 const UNTIL_GAP: Duration = Duration::from_millis(10);
 
 /// Polls `probe` every `interval` until it returns `Some` or `budget` elapses.

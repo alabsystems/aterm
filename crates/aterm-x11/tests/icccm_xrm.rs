@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-x11's ICCCM properties and resource database against x11rb 0.13.2
-//! and x11rb-protocol 0.13.2, recorded in tests/recorded/: the property bytes
-//! x11rb wrote and what it read from bytes it did not write, and the answer
-//! x11rb-protocol's Database gave to each query of each database.
-//!
-//! Negative controls: every recording has a case; a hint one field away
-//! encodes differently; a database with its precedence-deciding entry
-//! dropped answers differently; the include tree read with no includes
-//! followed answers differently.
+//! ICCCM property and resource database differential tests against recorded x11rb answers.
 
 #![cfg(target_endian = "little")]
 
@@ -117,7 +109,6 @@ fn icccm_properties_are_x11rbs() {
         input: Some(false),
         ..WmHints::default()
     };
-    // Written by x11rb: the bytes, and the parse of them.
     let written: [(&str, Vec<u8>); 5] = [
         ("size_hints_full", full_size_hints().to_bytes()),
         ("size_hints_sparse", sparse.to_bytes()),
@@ -138,7 +129,6 @@ fn icccm_properties_are_x11rbs() {
         };
         got.insert(case.to_owned(), parsed.unwrap_or_else(|_| "ERR".into()));
     }
-    // Read by x11rb from bytes it did not write.
     for case in [
         "size_hints_legacy",
         "size_hints_truncated",
@@ -307,8 +297,6 @@ fn every_included_file_answers_as_x11rb_protocol_answered() {
         Database::parse_file(&data, &aterm_x11::xrm::include_dir(path))
     });
     same_cases(XRM_INCLUDE, &want, &got);
-    // The chain past the limit answers its last file read: d100, reached
-    // through 100 includes.
     assert_eq!(want["d000 a.depth|"], format!("={}", hex(b"100")));
 }
 
@@ -319,9 +307,6 @@ fn the_include_tree_without_its_includes_answers_differently() {
         Database::parse(&std::fs::read(path).unwrap())
     });
     let moved: Vec<&String> = want.keys().filter(|k| got[*k] != want[*k]).collect();
-    // Every root reads something from an include but `missing` (its include
-    // names no file), `a-directory` (a directory is not read) and `loop`
-    // (it includes only itself, so only copies of its own entries).
     let unmoved = ["missing", "a-directory", "loop"];
     for root in roots.iter().filter(|r| !unmoved.contains(&r.as_str())) {
         assert!(
@@ -333,8 +318,6 @@ fn the_include_tree_without_its_includes_answers_differently() {
 
 #[test]
 fn an_include_reads_only_what_the_budget_and_the_depth_leave() {
-    // A file that includes itself: read once per level, at most
-    // MAX_INCLUDE_DEPTH times after the root.
     let dir = std::path::Path::new("/nowhere");
     let text = b"a.b: x\n#include \"self\"\n";
     let mut reads = 0u32;
@@ -345,8 +328,6 @@ fn an_include_reads_only_what_the_budget_and_the_depth_leave() {
     });
     assert_eq!(reads, u32::from(aterm_x11::xrm::MAX_INCLUDE_DEPTH));
     assert_eq!(db.get_string("a.b", ""), Some("x"));
-    // Each read is offered what the budget has left, and one past it is
-    // refused: a 32 MiB include fits once, not twice.
     let big = vec![b'\n'; 32 << 20];
     let mut offered = Vec::new();
     let _ = Database::parse_file_with(
@@ -374,7 +355,6 @@ fn an_include_reads_only_a_regular_file() {
     assert_eq!(read(&dir.path().join("none"), 64), None, "missing");
     #[cfg(target_os = "linux")]
     {
-        // A FIFO with no writer: opening it would wait for one.
         let fifo = dir.path().join("fifo");
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         // SAFETY: a NUL-terminated path.

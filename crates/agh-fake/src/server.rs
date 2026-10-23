@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Four listeners, a thread per connection, request parsing and response writing. One request
-//! per connection (`Connection: close`).
+//! Listener pool and single-request HTTP connection handler (`Connection: close`).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
@@ -112,7 +111,6 @@ struct Head {
 fn read_head(reader: &mut BufReader<&TcpStream>) -> Option<Head> {
     let mut raw = Vec::new();
     let first = u64::try_from(HEAD_MAX + 1).unwrap_or(u64::MAX);
-    // On an error the bytes read so far are in `raw`.
     let ended = reader.by_ref().take(first).read_until(b'\n', &mut raw);
     if raw.is_empty() {
         return None;
@@ -134,8 +132,6 @@ fn read_head(reader: &mut BufReader<&TcpStream>) -> Option<Head> {
             .read_until(b'\n', &mut raw)
             .unwrap_or(0);
         read += n;
-        // A line that does not end in `\n` was cut short at EOF, even one that is only the
-        // final blank line's `\r`.
         if n == 0 || read > HEAD_MAX || !raw.ends_with(b"\n") {
             malformed = true;
             break;
@@ -195,22 +191,51 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
         Outcome::Answer(answer) => write(stream, &req, &answer, None),
         Outcome::Close => {}
         Outcome::Hang(wait) => {
-            // Wait on the client, not on a clock: the hang ends after `wait` with nothing
-            // read, or as soon as the client hangs up.
-            if !wait.is_zero() {
-                let _ = stream.set_read_timeout(Some(wait));
-                drain(&mut reader);
-            }
+            hold(stream, &mut reader, wait, state);
             return;
         }
         Outcome::Truncate(answer, at) => write(stream, &req, &answer, Some(at)),
     }
-    // Close the write side, then read what the client still sends (a body the fake did not
-    // read: a chunked one, one past `BODY_MAX`, one after a malformed head) until it hangs up,
-    // so the close is an orderly one and never a reset that could cost the client the answer.
     let _ = stream.shutdown(Shutdown::Write);
     drain(&mut reader);
 }
+
+/// Hold the connection `wait`, reading and dropping what the client sends, until the client
+/// hangs up or [`crate::FakeGithub::end_hangs`] ends it, looking for that every `HANG_LOOK`.
+fn hold(
+    stream: &TcpStream,
+    reader: &mut BufReader<&TcpStream>,
+    wait: Duration,
+    state: &Mutex<State>,
+) {
+    let until = std::time::Instant::now() + wait;
+    let mut sink = [0_u8; 4096];
+    loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero()
+            || state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .hangs_ended
+        {
+            return;
+        }
+        let _ = stream.set_read_timeout(Some(left.min(HANG_LOOK)));
+        match reader.read(&mut sink) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// How often a held connection looks whether its hang was ended.
+const HANG_LOOK: Duration = Duration::from_millis(20);
 
 /// Read and drop what the client sends, until it hangs up, a read times out, or
 /// `BODY_MAX` bytes have come.
@@ -251,7 +276,7 @@ fn write(stream: &TcpStream, req: &Request, answer: &Answer, cut: Option<usize>)
 }
 
 /// A status's reason phrase.
-fn reason(status: u16) -> &'static str {
+const fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",

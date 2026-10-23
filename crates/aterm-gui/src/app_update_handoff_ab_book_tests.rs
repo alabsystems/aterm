@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE A/B BOOK ACROSS A SEAMLESS UPDATE (`docs/DESIGN-harness-autopilot-
-//! 2026-10-15.md` §10.5.4): does the outgoing process write its book at its
-//! exit seam? It does not. Its Commit is `seamless::commit_and_exit`, whose
-//! success is uninhabited — one write and `_exit(0)` — and it runs inside
-//! the event loop, so `run_app` never returns and the exit seam after it
-//! (`App::write_harness_ab_at_exit`) never runs. The outgoing book holds what
-//! its last page reading wrote; the successor, a new start under the same
-//! pid, names a file of its own and reads that one as another's.
+//! Tests that a seamless update's outgoing process exits inside `commit_and_exit` before reaching the A/B book exit seam.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, OwnedFd};
@@ -40,7 +33,7 @@ fn outgoing(commit: OwnedFd, read: Option<OwnedFd>, marker: &std::path::Path) ->
     .expect("bounded proof fixture");
     let path = CString::new(marker.as_os_str().as_encoded_bytes()).expect("a path");
     // SAFETY: fork from a multi-threaded harness; the child makes only
-    // async-signal-safe calls (`write`, `open`, `close`, `_exit`) — see above.
+    // async-signal-safe calls (`write`, `open`, `close`, `_exit`).
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
     if pid == 0 {

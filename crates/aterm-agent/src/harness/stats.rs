@@ -259,7 +259,7 @@ impl HarnessStats {
 
     /// No row of any file fell in the window: the page says the harness has done nothing there yet (a line that is no row says nothing).
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.rows == 0
     }
 
@@ -360,7 +360,7 @@ impl HarnessStats {
 }
 
 /// `n` plus one, saturating: a count never wraps.
-fn bump(n: &mut u64) {
+const fn bump(n: &mut u64) {
     *n = n.saturating_add(1);
 }
 
@@ -1128,7 +1128,7 @@ fn skip_until_final(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 
 /// Whether `c` reorders the text around it (the bidirectional embeddings,
 /// overrides, isolates and marks): never drawn from the agent's words.
-fn is_bidi_control(c: char) -> bool {
+const fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
@@ -1211,7 +1211,9 @@ enum Escalation {
     Asked,
 }
 
-/// [`Escalation`] of an `ESCALATED` line's tail.
+/// [`Escalation`] of an `ESCALATED` line's tail. A journal written while
+/// the loop still mailed a manager says a badge set again as `mail=skipped:
+/// <why>`, read the same.
 fn escalation_of(summary: &str) -> Escalation {
     if summary.split(' ').next() != Some("attention=OK") {
         return Escalation::Withheld;
@@ -1287,7 +1289,9 @@ enum LandLine {
     Restated,
 }
 
-/// [`LandLine`] of a journal record; `None` for every other line.
+/// [`LandLine`] of a journal record; `None` for every other line. Only a
+/// `continued`, `typed` or `other` record is looked at, and an `other`
+/// line's first words alone.
 fn land_line(r: &JournalRecord) -> Option<LandLine> {
     match r.kind.as_str() {
         "continued" | "typed" => {

@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`TOOLS`]: every outside program aterm, its checks and its tests run, each with WHY
-//! (docs/DESIGN-init-system-2026-10-20.md §6.1 and §8).
-//!
-//! Generated once, 2026-10-20, from a scan of every `spawnfd::command`, `transparent` and
-//! `Command::new` literal and every absolute program path under `crates/`, then read by
-//! hand: test fixtures that name a program without running it (`/bin/tcsh` in a shell
-//! classifier's table, `/usr/bin/a.out`) are not rows. It is a table, not a census: no test
-//! polices it. A new outside program gets a row when the code first runs it, with the
-//! reason in `why`, which `verify list` prints.
-//!
-//! Not rows, by verdict (§6.1): Homebrew and its formulae (rows 27, 28: the person's own,
-//! and never a provider), rclone, terminal-notifier and gemini's Homebrew path (rows 29,
-//! 30, 32, dropped by S12), tart and qemu (row 26: no lane runs them), and the machines
-//! agent's firewall and time tools (`socketfilterfw`, `systemsetup`), which only
-//! aterm-machines may name (the `machines-root-door` census guard) and no test runs.
-//!
-//! A row whose §6.1 verdict replaces or drops the tool, and whose slice has not landed,
-//! is [`Provider::Unprovided`] while nothing provides it: its refusal says so and names
-//! the slice, rather than a provider whose command would not provide it.
+//! [`TOOLS`]: every outside program aterm, its checks, and its tests run, each with its reason.
 
 use super::{MACOS_HOSTS, Pin, Provider, Tool, When};
 
@@ -104,7 +86,7 @@ const fn guest(name: &'static str, at: &'static [&'static str], why: &'static st
 }
 
 /// A tool aterm provides no copy of: `because` says what removes the need, or whose
-/// dependency it is (a §6.1 IN-HOUSE, DROP or OUTSIDE verdict whose slice has not landed).
+/// dependency it is.
 const fn unprovided(
     name: &'static str,
     at: &'static [&'static str],
@@ -141,9 +123,8 @@ const fn hardware(name: &'static str, what: &'static str, why: &'static str) -> 
     }
 }
 
-/// Every outside program aterm runs, and why. `aterm_spec::host::TOOLS` is this table.
+/// Every outside program aterm runs, and why.
 pub const TOOLS: &[Tool] = &[
-    // ---- the shells aterm integrates (§6.1 rows 5, 15, 16) ----------------------------
     os(
         "sh",
         &["/bin/sh"],
@@ -210,7 +191,6 @@ pub const TOOLS: &[Tool] = &[
          atpkg's every-dialect lane are the only PowerShell coverage that runs anywhere; Microsoft's \
          signed archive, pinned by the tree (§6.3)",
     ),
-    // ---- POSIX programs the tests' children are made of (§6.1 rows 1, 5) -------------
     os(
         "cat",
         &["/bin/cat"],
@@ -383,7 +363,6 @@ pub const TOOLS: &[Tool] = &[
     ),
     os(
         "visudo",
-        // No path: aterm-machines' agent alone spells it (`machines-root-door`).
         &[],
         "checks the machines agent's sudoers drop-in before it is placed",
     ),
@@ -486,7 +465,6 @@ pub const TOOLS: &[Tool] = &[
         &["/usr/bin/ssh-add"],
         "the machines controller's agent-held key (row 4)",
     ),
-    // ---- macOS's own answers (§6.1 row 1) -------------------------------------------
     os(
         "codesign",
         &["/usr/bin/codesign"],
@@ -552,8 +530,6 @@ pub const TOOLS: &[Tool] = &[
         &["/usr/sbin/scutil"],
         "the computer and host names, and the network state",
     ),
-    // No paths for the root tools: aterm-machines' agent alone spells them
-    // (`machines-root-door`); `$PATH` finds the read-only uses.
     os(
         "pmset",
         &[],
@@ -582,7 +558,6 @@ pub const TOOLS: &[Tool] = &[
     ),
     os(
         "DevToolsSecurity",
-        // No path: consent.rs alone spells it (`devtools-door`).
         &[],
         "the Developer Tools grant the debugger ask needs",
     ),
@@ -679,7 +654,6 @@ pub const TOOLS: &[Tool] = &[
         ],
         "re-registers an installed dev app with Launch Services, so its bundle id opens that copy",
     ),
-    // ---- another OS's own (§6.1 row 36) ---------------------------------------------
     os(
         "gsettings",
         &["/usr/bin/gsettings"],
@@ -726,7 +700,6 @@ pub const TOOLS: &[Tool] = &[
         &[],
         "a child that runs until it is stopped, for the quit-safety and settings tests",
     ),
-    // ---- Apple's Command Line Tools (§6.1 rows 11, 12, 13) --------------------------
     clt(
         "cc",
         &[
@@ -777,8 +750,6 @@ pub const TOOLS: &[Tool] = &[
         "the producer's relocation reads, and the oracle atpkg::macho's load-command reader is \
          checked against (abrew reads with atpkg::macho, row 12)",
     ),
-    // Not the CLT's: their /usr/bin/xcodebuild is a shim that refuses without full Xcode
-    // ("tool 'xcodebuild' requires Xcode", measured 2026-10-20 on a CLT-only developer dir).
     unprovided(
         "xcodebuild",
         &["/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild"],
@@ -786,7 +757,6 @@ pub const TOOLS: &[Tool] = &[
         "the oracle abrew's Xcode probe is checked against: the selected Xcode's own `-version`, \
          never the /usr/bin shim, and only where an Xcode is selected (row 13)",
     ),
-    // ---- ALab's default set (§7) ----------------------------------------------------
     toolset(
         "targo",
         "trust",
@@ -818,7 +788,6 @@ pub const TOOLS: &[Tool] = &[
     ),
     toolset("agy", "agy", "an agent of the roster (row 31)"),
     toolset("muse", "muse", "an agent of the roster (row 31)"),
-    // ---- pinned by the tree, provided by `verify provision` (§4.4, §6.2–§6.4) -----------
     workspace(
         "rustup",
         When::Always,
@@ -883,7 +852,6 @@ pub const TOOLS: &[Tool] = &[
         &["/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"],
         "the Linux lane's VM (vz backend), for the Linux-only tests and the fish floor (row 25)",
     ),
-    // ---- nobody's yet: §6.1 replaces, drops or leaves it outside (rows 13, 14, 17-19) ----
     unprovided(
         "node",
         &[],
@@ -906,7 +874,6 @@ pub const TOOLS: &[Tool] = &[
         "the publication engine's own guard in `pub stage` and `ship check --export`; aterm never \
          runs it (row 19)",
     ),
-    // ---- a release host's own (§4.6) ------------------------------------------------
     release_host(
         "firebase",
         &[],
@@ -922,7 +889,6 @@ pub const TOOLS: &[Tool] = &[
         &[],
         "the site repo's deploy script, which `ship site` runs (row 34)",
     ),
-    // ---- the Linux installer's verifier, until S11 (§6.1 row 14) ---------------------
     missing(
         unprovided(
             "python3",
@@ -956,7 +922,6 @@ pub const TOOLS: &[Tool] = &[
         ),
         "OpenSSL 3",
     ),
-    // ---- the Linux guest's (§6.1 row 36) --------------------------------------------
     guest(
         "xdg-desktop-portal",
         &[
@@ -965,7 +930,6 @@ pub const TOOLS: &[Tool] = &[
         ],
         "the Settings portal aterm's motion read asks, in the Linux guest's accessibility lane",
     ),
-    // ---- the hardware and the session (§6.1 row 37) ---------------------------------
     hardware(
         "gpu",
         "a GPU wgpu can open",

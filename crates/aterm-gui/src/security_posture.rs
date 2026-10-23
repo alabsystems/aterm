@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHERE THE SECURITY PAGE'S MACOS ACCESS POSTURE COMES FROM, injected rather
-//! than branched on (s-24; AGENTS.md: a platform probe goes through an injected
-//! field with an inert arm). A windowed macOS instance reads the host's probes
-//! ([`SecurityPostureSource::Host`]); a headless instance and every other build
-//! publish nothing ([`SecurityPostureSource::Absent`]); and a development
-//! build's headless instance can carry a posture from the fixture catalog
-//! ([`SecurityPostureSource::Staged`], `security-posture <name>`), drawn with the
-//! inert gesture arms and reaching no OS, so the block can be seen and audited
-//! in the headless lane UI changes are validated on.
+//! Source selection and `security-posture` control verb for the Security page's macOS access block.
 
 use crate::native_settings::MacosAccess;
 
@@ -34,8 +26,7 @@ pub(crate) enum SecurityPostureSource {
 }
 
 impl SecurityPostureSource {
-    /// The source a launch starts with: the host's probes on a windowed macOS
-    /// instance, nothing anywhere else.
+    /// Returns `Host` on a windowed macOS instance and `Absent` everywhere else.
     pub(crate) const fn at_launch(macos: bool, headless: bool) -> Self {
         if macos && !headless {
             Self::Host
@@ -54,8 +45,7 @@ impl SecurityPostureSource {
     }
 }
 
-/// What the verb asks: the posture now, the catalog, or a posture to stage
-/// (`None`: take the staged one off).
+/// Action requested by the `security-posture` control verb.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Asked {
     Read,
@@ -118,8 +108,7 @@ fn staged(_name: &str) -> Option<MacosAccess> {
     None
 }
 
-/// The verb's control-thread half: the catalog here, a read or a stage on the
-/// main thread (`Wake::ControlSecurityPosture`).
+/// Handles `security-posture` on the control thread, forwarding reads and stages to the UI thread.
 pub(crate) fn cmd(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     rest: &str,
@@ -139,11 +128,7 @@ pub(crate) fn cmd(
 }
 
 impl crate::App {
-    /// `security-posture`'s main-thread half. A stage is refused on a windowed
-    /// instance (fail-closed: a development build on the owner's desktop never
-    /// shows a made-up posture over the real one); otherwise the source changes,
-    /// every Settings view is re-published, and the answer says the posture and
-    /// how many views draw the block: `posture=<host|off|name> views=<n>`.
+    /// Applies or reads the security posture on the main thread (staging is headless-only).
     pub(crate) fn control_security_posture(&mut self, asked: &Asked) -> Result<String, String> {
         if let Asked::Stage(name) = asked {
             if !self.headless {
@@ -184,8 +169,6 @@ mod tests {
             Ok(Asked::Stage(Some("denied-folders".to_string())))
         );
         assert_eq!(parse("off", true), Ok(Asked::Stage(None)));
-        // NEGATIVE CONTROLS: a build that does not stage refuses, as does a name
-        // the catalog does not hold and any longer form.
         assert!(
             parse("denied", false)
                 .unwrap_err()
@@ -263,7 +246,6 @@ mod tests {
             Ok("posture=off views=0")
         );
         assert!(!carries(&app), "off takes the block away");
-        // NEGATIVE CONTROL: a windowed instance never shows a made-up posture.
         app.headless = false;
         assert!(
             app.control_security_posture(&Asked::Stage(Some("granted".to_string())))

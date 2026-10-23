@@ -647,7 +647,10 @@ fn tree_of(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A BUILD DIRECTORY IN A REAL CLOUD SYNC ROOT LOSES NOTHING.
+/// A BUILD DIRECTORY IN A REAL CLOUD SYNC ROOT LOSES NOTHING. A scratch folder registered as
+/// a cloud sync root ([`aterm_dirfd::seam::SyncRoot`], as OneDrive registers its folder, with
+/// Documents and Desktop moved into it) holds a checkout's idle build directory, every file
+/// and folder of it made an in-sync placeholder, as a sync client leaves what it uploaded.
 #[test]
 fn a_build_directory_in_a_cloud_sync_root_loses_nothing() {
     let tmp = Tmp::new("win-sync-root");

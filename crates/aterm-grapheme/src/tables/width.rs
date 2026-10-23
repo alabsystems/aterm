@@ -506,7 +506,7 @@ pub const fn char_width(c: char) -> usize {
         return 0;
     }
     if cp >= 0x30000 {
-        // CJK Unified Ideographs Extension G (U+30000-U+3134A) and
+        // CJK Unified Ideographs Extensions G and H (U+30000-U+323AF) are wide.
         if cp <= 0x323AF {
             return 2;
         }

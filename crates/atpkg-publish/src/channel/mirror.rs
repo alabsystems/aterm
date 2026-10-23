@@ -25,13 +25,13 @@ pub struct MirrorOptions {
 impl MirrorOptions {
     /// Publish what is missing.
     #[must_use]
-    pub fn publish() -> Self {
+    pub const fn publish() -> Self {
         Self { dry_run: false }
     }
 
     /// Verify and plan only.
     #[must_use]
-    pub fn dry_run() -> Self {
+    pub const fn dry_run() -> Self {
         Self { dry_run: true }
     }
 }
@@ -49,6 +49,7 @@ pub struct MirrorReport {
     pub planned: Vec<(String, Vec<String>)>,
 }
 
+/// The release assets a verified manifest names: its `github-release` rows (an `https`
 /// row's bytes live on the vendor's host and are never mirrored).
 fn release_assets(pkg: &atpkg::PkgManifest) -> Vec<(String, String)> {
     pkg.artifacts

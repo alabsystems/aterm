@@ -248,6 +248,11 @@ pub fn package(given: Option<&str>, home: &str) -> Result<PathBuf, String> {
 }
 
 /// The instance's sandbox: the rig's network rule ([`codex_rig::jail_policy`],
+/// one loopback `port`) and every home the lab's facts `p` guard fenced
+/// ([`codex_rig::home_guards`]: the account's, whatever `HOME` says, and the
+/// caller's), so the codex-alab it runs reads none of the owner's protected
+/// data and writes nowhere in either home.
+///
 /// # Errors
 /// No home to fence, or the proof's scratch `s` lies in one (the instance
 /// could write nothing).
@@ -1247,7 +1252,8 @@ impl Proof {
         })
     }
 
-    /// Read a successful write of this request's whole response.
+    /// Read a successful write of this request's whole response. Its server
+    /// timestamp starts quiet, never a planned delay or a client-read claim.
     fn await_reply(
         &self,
         leg: &Leg,

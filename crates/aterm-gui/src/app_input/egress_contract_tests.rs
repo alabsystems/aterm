@@ -143,7 +143,11 @@ fn read_until(fd: i32, want: usize) -> Vec<u8> {
     got
 }
 
-/// Close a fixture's pipe, taking the test's last handle on its sink.
+/// Close a fixture's pipe, taking the test's last handle on its sink. The sink
+/// borrows `pipe[1]`, and each job its ordered writer admitted holds a clone
+/// that keeps its serializer registered under this fd number; closing under
+/// such a job hands the number to the next fixture's `pipe()`, whose jobs then
+/// reach this serializer.
 fn close_pipe(sink: Arc<SinkWriter>, pipe: [i32; 2]) {
     assert!(
         wait_until(MUST_HAPPEN, || Arc::strong_count(&sink) == 1),

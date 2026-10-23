@@ -53,7 +53,7 @@ pub struct Manifest {
     /// Manifest format version (the ship tool emits `schema = 1`).
     #[cfg(test)]
     pub schema: u32,
-    /// Human semver, e.g.
+    /// Human semver, e.g. `"0.2.0"`.
     pub version: String,
     /// Monotonic build number, unique per published build.
     pub build_number: u64,
@@ -61,11 +61,12 @@ pub struct Manifest {
     pub commit: Option<String>,
     /// SHA-256 (lowercase hex) of the DMG asset.
     pub sha256: String,
-    /// The DMG asset's file name within the release, e.g.
+    /// The DMG asset's file name within the release, e.g. `"aterm-0.2.0.dmg"`.
     pub dmg: String,
     /// The container's browser download URL as the publisher wrote it.
     pub url: Option<String>,
-    /// The updater container's file name, e.g.
+    /// The updater container's file name, e.g. `"aterm-0.2.0-mac.zip"`: the same signed
+    /// bundle as the DMG, packed with `ditto`.
     pub zip: Option<String>,
     /// SHA-256 (lowercase hex) of the zip asset.
     pub zip_sha256: Option<String>,
@@ -249,7 +250,8 @@ impl Ready {
     }
 }
 
-/// Bind the required XML Info.plist.
+/// Bind the required XML Info.plist. `None` means the cheap binding is
+/// unavailable; it therefore grants no authority.
 fn cheap_staged_identity_matches(ready: &Ready, app: &Path) -> Option<bool> {
     let plist = app.join("Contents/Info.plist");
     let metadata = match std::fs::symlink_metadata(&plist) {

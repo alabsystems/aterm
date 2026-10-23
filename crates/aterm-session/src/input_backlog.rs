@@ -201,12 +201,17 @@ pub enum Liveness {
 pub struct InputLedger {
     /// Bytes the kernel has accepted (every `end` adds its count).
     accepted: u64,
+    /// Bytes of the one write currently inside `write(2)`: the kernel may have
     /// accepted any prefix of them already. Zero outside a bracket.
     inflight: u64,
+    /// The accepted runs, oldest first. They partition `[0, accepted)`: the
     /// first starts at offset 0 and the last ends at `accepted`.
     ring: VecDeque<Run>,
+    /// The sink's birth. Bytes that predate the sink (an adopted session's
     /// queue after the seamless handoff) are dated from here.
     born: Instant,
+    /// The last discard's mark ([`Self::mark_discard`]): the discard epoch it
+    /// belongs to, and the offset the bytes accepted after that discard
     /// start at. `None` until the first discard.
     discard_mark: Option<(u64, u64)>,
 }
@@ -283,6 +288,14 @@ impl InputLedger {
         });
     }
 
+    /// Make room for one more run: fold the run whose merge into its successor
+    /// costs the smallest relative dating error. Merged, its oldest byte
+    /// (`now - first` old) reads `now - successor.last` old, a loss of
+    /// `(successor.last - first) / (now - first)` of its age; `now` is the
+    /// pushed write's stamp.
+    ///
+    /// Any choice stays a lower bound; this one keeps the answer close. The
+    /// pushed write always gets its own run. O([`Self::CAPACITY`]) per push,
     /// under the ledger mutex, never across a syscall.
     fn merge_cheapest(&mut self, now: Instant) {
         let mut best: Option<(usize, u128, u128)> = None;
@@ -325,13 +338,16 @@ impl InputLedger {
     }
 }
 
+/// One run of accepted bytes in the [`InputLedger`]: the offsets from the
 /// previous run's `end` (0 for the first run) up to `end`.
 #[derive(Clone, Copy, Debug)]
 struct Run {
     /// One past the offset of the run's newest byte.
     end: u64,
+    /// The stamp of the run's oldest write. Never an answer (it would over-claim
     /// the newer bytes' wait); only the cost of merging the run.
     first: Instant,
+    /// The stamp of the run's newest write: every byte of the run was accepted
     /// no later than this, and is dated by it.
     last: Instant,
 }
@@ -494,6 +510,7 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    /// A ledger whose clock starts at `t0`, with one accepted write per
     /// `(len, at_ms)` pair.
     fn ledger(t0: Instant, writes: &[(usize, u64)]) -> InputLedger {
         let mut l = InputLedger::new(t0);
@@ -534,6 +551,7 @@ mod tests {
         );
     }
 
+    /// Bytes that could all be an in-flight prefix have no date; an older byte is
     /// dated as if the whole write had landed.
     #[test]
     fn ledger_in_flight_bytes_move_the_answer_newer() {
@@ -556,6 +574,7 @@ mod tests {
         assert_eq!(l.oldest_unread_at(1), Some(t0 + ms(400)));
     }
 
+    /// Why the sink parks outside the bracket: a bracket held across a park counts
     /// the whole chunk as in flight, and the probe reads "no date".
     #[test]
     fn ledger_a_bracket_held_across_a_park_would_blind_the_probe() {
@@ -571,6 +590,7 @@ mod tests {
         );
     }
 
+    /// Coalescing keeps the newer instant, and making room dates a merged byte
     /// by the run it joins: both later than the truth, so both only shorten a wait.
     #[test]
     fn ledger_coalescing_and_merging_stay_lower_bounds() {
@@ -607,6 +627,7 @@ mod tests {
         );
     }
 
+    /// An unread Enter followed by more keystrokes than the ring has runs keeps its
     /// own date.
     #[test]
     fn ledger_a_full_ring_keeps_the_date_of_the_stalled_byte() {
@@ -626,6 +647,8 @@ mod tests {
         assert_eq!(l.ring.len(), InputLedger::CAPACITY);
     }
 
+    /// Five hours of history, the Enter the program freezes on, then a burst 9 s
+    /// later: merging by absolute gap would date the Enter ~1 s old instead of 10.7 s;
     /// merging by relative error compresses the history instead.
     #[test]
     fn ledger_a_ring_full_of_history_keeps_the_date_of_the_stalled_byte() {
@@ -651,6 +674,8 @@ mod tests {
         assert_eq!(l.oldest_unread_at(1 + 85 * 12), Some(t0 + ms(enter)));
     }
 
+    /// A stream longer than the ring (a full raw queue of one-byte writes, 150 ms
+    /// apart) is dated at every unread count no earlier than the truth and
     /// within 15% of the byte's true age.
     #[test]
     fn ledger_a_stream_longer_than_the_ring_is_dated_within_a_fraction_of_its_age() {
@@ -673,6 +698,7 @@ mod tests {
         }
     }
 
+    /// A zero-byte `end` (refused, would-block, closed) only closes the
     /// bracket: nothing is dated by it.
     #[test]
     fn ledger_a_refused_write_records_nothing() {
@@ -684,6 +710,7 @@ mod tests {
         assert_eq!(l.oldest_unread_at(1), Some(t0 + ms(100)));
     }
 
+    /// The discard mark counts only bytes accepted after it; a write in flight at the
     /// mark counts as before it, and a short one under-counts what follows.
     #[test]
     fn ledger_the_discard_mark_counts_what_was_accepted_after_it() {
@@ -728,6 +755,7 @@ mod tests {
         }
     }
 
+    /// The gate table: age warns, and only a stopped job or a published, still-stale
     /// stall refuses.
     #[test]
     fn the_gate_warns_on_age_and_refuses_only_a_published_stall_or_a_stopped_job() {
@@ -772,6 +800,7 @@ mod tests {
         assert!(!lagging(&canonical) && !lagging(&raw(0, 60_000)));
     }
 
+    /// At or below one runnable thread per CPU the base thresholds hold; above, they
     /// stretch by the load per CPU, up to ten times.
     #[test]
     fn contention_stretches_the_stall_thresholds_with_the_load_per_cpu() {
@@ -906,6 +935,7 @@ mod tests {
         assert_eq!(gate(&at(12), false, false), Gate::Warn);
     }
 
+    /// Load 150 on 18 CPUs stretches entry 8.33 times (83.3 s spinning, 41.7 min
     /// asleep); a published stall stays at the base [`STALL_AFTER`] whatever the load.
     #[test]
     fn classify_stretches_entry_by_the_machines_contention() {
@@ -979,6 +1009,7 @@ mod tests {
         assert!(!words.contains(&"frozen"));
     }
 
+    /// Under ISIG, one byte that is one of the tty's signal characters, with nothing
     /// spilled ahead and room in the queue, is not input; anything else is.
     #[test]
     fn a_lone_signal_character_under_isig_is_not_input() {

@@ -536,8 +536,6 @@ fn walk_repositories(gh: &Github) -> agh::Result<agh::page::Listing<Value>> {
 
 #[test]
 fn a_repository_counter_change_is_no_tear() {
-    // Page 2's repository gains stars, a push and an update in both revalidations, which
-    // tore the listing when only `download_count` was volatile.
     let transport = Arc::new(ScriptedTransport::new());
     serve_repositories(&transport, &[repository(2, "two", 1)], "W/\"r2\"");
     transport.answer(304, &[], b"");
@@ -553,8 +551,6 @@ fn a_repository_counter_change_is_no_tear() {
 
 #[test]
 fn a_repository_added_to_the_listing_is_still_a_change() {
-    // The negative control: a third repository on page 2 is a change, so the walk rescans
-    // and answers the rescan's listing.
     let transport = Arc::new(ScriptedTransport::new());
     serve_repositories(&transport, &[repository(2, "two", 1)], "W/\"r2\"");
     transport.answer(304, &[], b"");
@@ -823,7 +819,6 @@ mod loopback {
         assert_eq!(listing.pages, 3);
         assert_eq!(listing.end, End::Complete);
         let seen = fake.seen();
-        // Three pages, the repository id once for the numeric links, and three 304s.
         assert_eq!(listing.requests, 7);
         assert_eq!(seen.len(), 7);
         let revalidated: Vec<bool> = seen
@@ -885,8 +880,6 @@ mod loopback {
         assert_eq!(listing.pages, 2);
         assert_eq!(listing.end, End::Complete);
         let paths: Vec<String> = fake.seen().into_iter().map(|s| s.path_and_query).collect();
-        // Page 1's 301 and the id lookup, then every request under the new name: page 1
-        // again, page 2, and the two revalidations.
         assert_eq!(paths.len(), 6, "{paths:?}");
         assert_eq!(listing.requests, 6);
         assert!(
@@ -979,7 +972,6 @@ fn pages_after_a_transfer_are_routed_for_the_new_owner() {
             ),
         ]
     );
-    // The move's lookup memoized the new name's id: the numeric link cost no request.
     assert_eq!(listing.requests, 4);
     assert!(
         matches!(&listing.as_, IdentityRef::Profile { name, .. } if name == "dev"),

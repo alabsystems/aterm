@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The local brief (`survey --brief`, plan 5F-6) over two fake instances,
-//! one refusing: its headers, its node lines with every gap kept, and its
-//! budget shared newest first.
+//! The local brief (`survey --brief`) over two fake instances, one refusing.
 
 use super::*;
 
@@ -106,7 +104,6 @@ fn the_local_brief_heads_each_instance_and_keeps_its_gap_lines() {
         "the newest asked first"
     );
     assert!(keeps_every_gap(&out, &reads));
-    // NEGATIVE CONTROL: a walk that drops gap lines.
     let dropped: String = out
         .lines()
         .filter(|l| !l.starts_with("gap "))
@@ -181,7 +178,6 @@ fn the_budget_is_shared_newest_first_and_never_passed() {
             );
         }
     }
-    // A budget the two blocks fit whole leaves nothing out.
     let mut asked = Vec::new();
     let out = render_brief(vec![older(), newer()], BRIEF_BUDGET, NOW, ask(&mut asked));
     assert!(!out.contains("left out"), "{out}");
@@ -213,11 +209,7 @@ fn a_long_node_log_prints_its_newest_records() {
     assert_eq!(body[1], lines[0], "the gap first");
     assert_eq!(body[2], lines[lines.len() - NODE_LINES_MAX]);
     assert_eq!(body[1 + NODE_LINES_MAX], lines[lines.len() - 1]);
-    // The 68 records past the cap are the header's, never the budget's:
-    // nothing was cut for room, and no `--budget` would print them.
     assert!(!out.contains("budget left out"), "{out}");
-    // A budget with room for some of the newest 32 counts only those it
-    // left out of the 32.
     let mut asked = Vec::new();
     let out = render_brief(
         vec![NodeRead {
@@ -289,8 +281,6 @@ fn an_instance_that_refuses_log_n_still_gets_its_brief() {
         ]
     );
     assert_eq!(asked.iter().map(|a| a.0).collect::<Vec<_>>(), [41]);
-    // NEGATIVE CONTROL: an instance that never answered (every probe timed
-    // out) is no block: the walk is `ls`'s report, exit 124, and asks nothing.
     let mut asked = 0;
     let timed_out = vec![(
         41,

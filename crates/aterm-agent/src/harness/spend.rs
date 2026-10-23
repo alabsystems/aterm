@@ -48,7 +48,8 @@ pub const MAX_SEEN: usize = 400_000;
 /// `unpriced` and `unattributed` suppress a capacity past this share.
 pub const SHARE_MAX: f64 = 0.01;
 
-/// At most every retained bucket of one message.
+/// At most every retained bucket of one message. A model change or aggregate
+/// overflow makes the whole message unpriced.
 const MAX_CONTRIBUTIONS: usize = (HORIZON_S / BUCKET_S) as usize + 1;
 
 /// How much one read call asks the kernel for.
@@ -114,7 +115,7 @@ pub struct ModelPrice {
 impl ModelPrice {
     /// One set of rates for every request.
     #[must_use]
-    pub fn flat(rates: Rates) -> Self {
+    pub const fn flat(rates: Rates) -> Self {
         Self { rates, long: None }
     }
 
@@ -504,7 +505,8 @@ fn family_of(model: &str) -> Option<String> {
 struct Cursor {
     /// The file folded (device, inode); `None` before its first read.
     identity: Option<(u64, u64)>,
-    /// Bytes folded: every complete line, and a long line's bytes skipped.
+    /// Bytes folded: every complete line, and a long line's bytes skipped. A
+    /// torn last line is read again next time.
     offset: u64,
     /// The byte at `offset - 1` when it was read.
     boundary: Option<u8>,
@@ -529,7 +531,8 @@ struct Held {
     tokens: TokenUsage,
     /// A row of it was [`approx`], and the message was counted so.
     approx: bool,
-    /// Sorted (bucket, actual aggregate model key) contributions.
+    /// Sorted (bucket, actual aggregate model key) contributions. None means
+    /// tracking overflowed or the message changed model: it stays unpriced.
     contributions: Option<Vec<Contribution>>,
 }
 
@@ -543,7 +546,8 @@ struct Contribution {
 }
 
 impl Held {
-    /// Invalidate only this message's actual earlier contributions.
+    /// Invalidate only this message's actual earlier contributions. Its tokens
+    /// and message count stay in their original buckets, as does unrelated spend.
     fn unprice(&mut self, buckets: &mut Buckets) {
         if let Some(parts) = self.contributions.as_mut() {
             for part in parts {
@@ -575,7 +579,8 @@ impl Held {
         }
     }
 
-    /// A table may also price a longer request lower.
+    /// A table may also price a longer request lower. Remove the difference
+    /// from its own latest credited buckets, never write a negative bucket.
     fn reduce_price(&mut self, buckets: &mut Buckets, mut amount: f64) {
         if let Some(parts) = self.contributions.as_mut() {
             for part in parts.iter_mut().rev() {
@@ -701,7 +706,7 @@ pub struct Limits {
 impl Limits {
     /// No bound.
     #[must_use]
-    pub fn none() -> Self {
+    pub const fn none() -> Self {
         Self {
             bytes: u64::MAX,
             until: None,
@@ -745,7 +750,7 @@ pub struct FoldReport {
 impl FoldReport {
     /// Whether the sums are the home's whole spend in the horizon.
     #[must_use]
-    pub fn complete(&self) -> bool {
+    pub const fn complete(&self) -> bool {
         self.caught_up && self.unread == 0 && !self.walk_cut
     }
 }
@@ -942,7 +947,7 @@ struct Sink<'a> {
 
 impl Sink<'_> {
     /// The fold's report.
-    fn report(&mut self) -> &mut FoldReport {
+    const fn report(&mut self) -> &mut FoldReport {
         self.report
     }
 
@@ -1416,7 +1421,7 @@ impl Reading {
 
     /// Too small a figure for a ratio: under 5 whole percents, or under 1%
     /// once tenths are seen.
-    fn low(&self, tenths_seen: bool) -> bool {
+    const fn low(&self, tenths_seen: bool) -> bool {
         match self.kind {
             ReadingKind::Wall => false,
             ReadingKind::Rounded if tenths_seen => self.pct_x10 < 10,
@@ -1450,7 +1455,7 @@ pub enum Why {
 impl Why {
     /// The closed word.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Why::NoReading => "no-reading",
             Why::Low => "low",
@@ -1481,7 +1486,7 @@ pub enum Attribution {
 impl Attribution {
     /// The closed word: `seen`, `assumed` or `unattributed`.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Attribution::Seen => "seen",
             Attribution::Assumed => "assumed",

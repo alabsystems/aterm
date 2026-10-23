@@ -10,8 +10,10 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-/// Why another account could replace what `dir` holds, or `Ok` when none can: the walk the module
-/// header describes, each refusal naming the component and the remedy.
+/// Why another account could replace what `dir` holds, or `Ok` when none can: from `/` down, each
+/// component a real directory of root's or this user's and, until a private directory of this
+/// user's, writable by no other account; each refusal names the component and, for a directory of
+/// this user's, the remedy.
 pub fn refusal(dir: &Path) -> Result<(), String> {
     let me = super::uid();
     let mut private_ancestor = false;

@@ -41,7 +41,8 @@ struct Carved {
     reason: String,
 }
 
-/// The check's verdict.
+/// The check's verdict. `could_not_run` is kept apart from `ok`: [`run`] maps
+/// it onto exit code 3.
 struct Verdict {
     ok: bool,
     log: String,
@@ -912,7 +913,8 @@ fn parse_patch_table(text: &str, whence: &Path) -> Result<(Vec<PatchEntry>, Vec<
     Ok((forks, other))
 }
 
-/// The `[[carved]]` rows of `vendor/forge.toml`.
+/// The `[[carved]]` rows of `vendor/forge.toml`. An absent policy file is not an error (nothing
+/// has been carved yet); an unreadable or malformed one is.
 fn read_carve_ledger(root: &Path) -> Result<Vec<Carved>, String> {
     let file = root.join(POLICY_FILE);
     if !file.is_file() {

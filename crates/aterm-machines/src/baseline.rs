@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The baseline: the desired state of a host, one TOML document (design §5).
-//!
-//! Each family owns its table's type (`items::<family>::Table`), so this file only
-//! composes them. Unknown keys are refused everywhere: a typo in a baseline must not
-//! read as "leave that setting alone".
+//! Host baseline TOML document (`Baseline`), table discovery, `--only` filtering, and `{key}` placeholder substitution.
 
 use crate::items;
 use serde::Deserialize;
@@ -16,8 +12,7 @@ use serde::Deserialize;
 pub struct Baseline {
     /// [`crate::SCHEMA`].
     pub schema: u32,
-    /// The accounts user-scope items apply to. The controller fills it from the
-    /// inventory's `users` (default: the host's SSH account) when the baseline leaves it out.
+    /// Accounts user-scope items apply to (defaults to inventory `users` when omitted).
     #[serde(default)]
     pub users: Vec<String>,
     /// `[names]`.
@@ -86,9 +81,7 @@ pub fn parse(text: &str) -> Result<Baseline, String> {
     Ok(baseline)
 }
 
-/// The tables a baseline may hold (`names`, `power`, `app`, …), by the names the file spells
-/// them: [`Baseline`]'s own fields as serde reads them, less `schema` and `users`, so a table
-/// a family adds is known here with no second list to keep.
+/// Baseline table names (`names`, `power`, `app`, …), derived from [`Baseline`] fields excluding `schema` and `users`.
 #[must_use]
 pub fn tables() -> Vec<&'static str> {
     use serde::de::{self, Visitor};
@@ -151,9 +144,7 @@ pub fn check_only(only: &[String]) -> Result<(), String> {
     }
 }
 
-/// The baseline document `text` with only `schema`, `users` and the tables `only` names: what
-/// `plan|apply --only` sends, so the agent runs those tables' items and no others. Empty
-/// `only` leaves the document whole.
+/// Return `text` keeping only `schema`, `users`, and the tables named in `only` (or unchanged when `only` is empty).
 ///
 /// # Errors
 /// The parser's message.
@@ -175,9 +166,7 @@ pub fn keep_only(text: &str, only: &[String]) -> Result<String, String> {
     aterm_toml::to_string(&doc).map_err(|e| format!("baseline: {e}"))
 }
 
-/// Fill `{key}` placeholders in every string of a baseline document from `vars`, and
-/// return the document re-serialized. A placeholder `vars` does not name is left alone,
-/// so per-user placeholders (`{user}`) survive for the items to fill.
+/// Substitute `{key}` placeholders in every string of `text` from `vars`, leaving unknown placeholders intact.
 ///
 /// # Errors
 /// The parser's message.
@@ -193,7 +182,6 @@ fn fill_value(value: &mut aterm_toml::Value, vars: &[(&str, &str)]) {
         aterm_toml::Value::String(s) => *s = fill_str(s, vars),
         aterm_toml::Value::Array(items) => items.iter_mut().for_each(|v| fill_value(v, vars)),
         aterm_toml::Value::Table(table) => {
-            // aterm-toml's map has no `iter_mut`: take each value out and put it back.
             let keys: Vec<String> = table.keys().cloned().collect();
             for key in keys {
                 if let Some(mut v) = table.remove(&key) {

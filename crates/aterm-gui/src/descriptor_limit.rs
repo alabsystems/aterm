@@ -304,7 +304,9 @@ impl OlderImageLimit {
         })
     }
 
-    /// Set this process's soft limit to `soft`, the hard one as it is.
+    /// Set this process's soft limit to `soft`, the hard one as it is. A
+    /// bare `setrlimit` — async-signal-safe, as the PTY's own post-fork child
+    /// relies on.
     fn set_soft(&self, soft: u64) -> std::io::Result<()> {
         let limit = libc::rlimit {
             rlim_cur: soft,
@@ -744,7 +746,12 @@ pub(crate) mod tests {
         assert_eq!(park_raised_from(), None, "and the record stays the claim's");
     }
 
-    /// A STRAY LAUNCHER LIMIT IS NOBODY'S.
+    /// A STRAY LAUNCHER LIMIT IS NOBODY'S. A window
+    /// whose limit a park raised updates; its successor is a build that never
+    /// reads the names (every release up to v0.99.0, reached by a rollback,
+    /// played here by a stand-in that takes neither) and so leaves them in the
+    /// environment of every shell it opens, while it takes `ATERM_UPDATED_FROM`
+    /// out as every build does.
     #[test]
     fn only_an_updates_launch_adopts_a_carried_launcher_limit() {
         const ROLE: &str = "ATERM_TEST_STRAY_LIMIT_ROLE";

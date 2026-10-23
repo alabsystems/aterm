@@ -16,7 +16,7 @@ pub(crate) struct TapedCtl<'c, C: Ctl + ?Sized> {
 
 impl<'c, C: Ctl + ?Sized> TapedCtl<'c, C> {
     /// Wraps `inner`'s round trips through `fx` at `door`.
-    pub(crate) fn new(inner: &'c mut C, fx: Fx, door: &'static str) -> Self {
+    pub(crate) const fn new(inner: &'c mut C, fx: Fx, door: &'static str) -> Self {
         Self { inner, fx, door }
     }
 }

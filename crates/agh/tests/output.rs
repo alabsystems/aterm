@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The output door over hand-built Outcomes (the plan's §9.1, §9.4): projections, formats,
-//! the answers, the receipt, failing writers and the terminal. No client: every Outcome is
-//! made here, and only the captured streams are read.
+//! Output formatting, projection, and receipt tests over hand-built `Outcome`s.
 
 use std::io::{Error as IoError, ErrorKind, Write};
 use std::path::PathBuf;
@@ -26,7 +24,7 @@ use aterm_json::{Value, json};
 
 use crate::common;
 
-/// A context with captured streams; its scratch root lives as long as the test.
+/// A context with captured streams.
 fn context() -> (aterm_tempfile::TempDir, Ctx, Captured) {
     let root = common::scratch("output");
     let (ctx, captured) = Ctx::for_tests(
@@ -38,7 +36,7 @@ fn context() -> (aterm_tempfile::TempDir, Ctx, Captured) {
     (root, ctx, captured)
 }
 
-/// What one emit wrote: the exit, stdout and stderr.
+/// What one emit wrote.
 struct Emitted {
     exit: u8,
     stdout: String,
@@ -112,8 +110,6 @@ fn release() -> Value {
     map.insert("repo".into(), Value::from("alabsystems/aterm"));
     value
 }
-
-// ---------------------------------------------------------------- the default projections
 
 #[test]
 fn release_default_projection() {
@@ -469,8 +465,6 @@ fn an_output_usage_error_names_the_verb_page() {
     assert_eq!(next(&jq), "agh help jq", "a jq error keeps its own page");
 }
 
-// ---------------------------------------------------------------- --fields
-
 #[test]
 fn fields_that_share_a_prefix_merge() {
     let out = emit_with(
@@ -523,7 +517,6 @@ fn an_unknown_field_is_usage_listing_the_fields() {
 
 #[test]
 fn the_names_list_is_the_schema_and_the_sample_sorted_once() {
-    // release.json holds neither `latest` nor `repo`, two names of the Release schema.
     let sample = fixture("release.json");
     assert!(sample.get("latest").is_none() && sample.get("repo").is_none());
     let out = emit_with(object(Noun::Release, sample.clone()), &fields("nosuch"));
@@ -551,7 +544,6 @@ fn the_names_list_is_the_schema_and_the_sample_sorted_once() {
 
 #[test]
 fn a_schema_name_the_value_lacks_projects_to_null() {
-    // A repository that is not a fork has no `parent`; `parent.full_name` is a default field.
     let mut repo = fixture("repo.json");
     repo.as_object_mut().expect("an object").remove("parent");
     let out = emit_with(object(Noun::Repo, repo), &fields("parent.full_name"));
@@ -574,8 +566,6 @@ fn a_bad_field_path_is_usage() {
         assert!(out.stdout.is_empty());
     }
 }
-
-// ---------------------------------------------------------------- --raw
 
 #[test]
 fn raw_wants_exactly_one_field() {
@@ -608,8 +598,6 @@ fn raw_wants_exactly_one_field() {
     let each = emit_with(items(Noun::Asset, rows), &raw(Some("id")));
     assert_eq!(each.stdout, "300000201\n300000202\n300000203\n");
 }
-
-// ---------------------------------------------------------------- --format
 
 fn format(format: Format, header: bool, fields: &str) -> OutputOpts {
     OutputOpts {
@@ -725,8 +713,6 @@ fn json_is_an_array_for_a_list_and_a_value_for_an_object() {
     assert_eq!(out.stdout, "{\"id\":190000101}\n");
 }
 
-// ---------------------------------------------------------------- --jq
-
 #[test]
 fn jq_reads_github_object_plus_derived_names() {
     let opts = OutputOpts {
@@ -810,8 +796,6 @@ fn a_bad_jq_or_fields_is_refused_before_the_verb_sends_anything() {
         );
     }
 }
-
-// ---------------------------------------------------------------- the other answers
 
 #[test]
 fn bytes_print_exactly() {
@@ -941,8 +925,6 @@ fn streamed_and_nothing_write_no_stdout() {
 
 #[test]
 fn a_stream_never_ends_in_an_output_error() {
-    // The verb already wrote the stream: a flag that cannot apply is refused before it runs,
-    // so emit has nothing left to refuse.
     for opts in [
         OutputOpts {
             jq: Some("(".into()),
@@ -1011,8 +993,6 @@ fn failed_with_prints_the_report_then_two_lines() {
     );
     assert_eq!(common::error_json(&out.stderr)["exit"], Value::from(8u64));
 }
-
-// ---------------------------------------------------------------- the receipt
 
 fn receipt_outcome(completeness: Completeness) -> Outcome {
     let mut receipt = Receipt::new("release.list");
@@ -1106,8 +1086,6 @@ fn no_receipt_without_meta_or_a_reason() {
     );
     assert!(out.stderr.is_empty(), "{}", out.stderr);
 }
-
-// ---------------------------------------------------------------- writers and the terminal
 
 /// A stdout that fails every write with `kind`.
 struct Failing(ErrorKind);

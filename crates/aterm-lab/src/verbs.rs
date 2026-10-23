@@ -351,6 +351,8 @@ pub fn cmd_survey(args: &[String]) -> Res {
 }
 
 /// `survey`'s words after the tag: the flag's value (`on`: `1`, `off`: none)
+/// and whether the write waits for Claude Code's re-read (`--reread`).
+///
 /// # Errors
 /// Anything else.
 fn survey_words(a: &[String]) -> Result<(Option<&'static str>, bool), Fail> {

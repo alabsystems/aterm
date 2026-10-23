@@ -63,7 +63,9 @@ pub(crate) struct Glide {
     target_px: i64,
     t0: Instant,
     dur: Duration,
-    /// Precise deltas: the sub-pixel remainder of the tracked position.
+    /// Precise deltas: the sub-pixel remainder of the tracked position. Rounding each delta
+    /// would lag the finger (at 0.5 rows / 100 ms a 120 Hz delta is 1.42 px, which rounds to
+    /// 1 px: 30% slow).
     carry_px: f64,
 }
 

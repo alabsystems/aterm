@@ -28,7 +28,7 @@ pub enum Entry {
 impl Entry {
     /// The header's word for it.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::Watch => "watch",
             Self::Supervise => "supervise",
@@ -169,7 +169,8 @@ impl Roots {
         })
     }
 
-    /// A replay's file path must name one of its remapped roots.
+    /// A replay's file path must name one of its remapped roots. The ordinary
+    /// byte codec above deliberately accepts verbatim values; this boundary does not.
     fn decode_file(&self, raw: &[u8]) -> Result<PathBuf, String> {
         if !raw.starts_with(b"@") || raw.starts_with(b"@@") {
             return Err("a remapped file path must name a root".to_string());

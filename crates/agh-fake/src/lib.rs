@@ -181,7 +181,7 @@ impl ReleaseSpec {
 
     /// Sets the `prerelease` flag.
     #[must_use]
-    pub fn prerelease(mut self, prerelease: bool) -> ReleaseSpec {
+    pub const fn prerelease(mut self, prerelease: bool) -> ReleaseSpec {
         self.prerelease = prerelease;
         self
     }
@@ -569,6 +569,12 @@ impl FakeGithub {
             fault,
             always: false,
         });
+    }
+
+    /// Ends every [`Fault::Hang`], held now or asked for later: each connection closes as
+    /// though its time had run out.
+    pub fn end_hangs(&self) {
+        self.state().hangs_ended = true;
     }
 
     /// Installs a standing `fault` for all requests matching `m`.

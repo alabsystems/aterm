@@ -33,7 +33,9 @@ pub enum KeyResolution {
 /// One row of single chords: alternate spellings of one key for one command.
 type ChordRow = (&'static [&'static str], EditorCommand);
 
-/// The built-in single chords.
+/// The built-in single chords. A row with more than one spelling lists
+/// ALTERNATE keys for its command, and each binds as a chord of its own
+/// ([`Keymap::bind_alternatives`]); no row here is a sequence.
 const EMACS_CHORDS: &[ChordRow] = &[
     (&["C-b"], EditorCommand::MoveBackward),
     (&["C-f"], EditorCommand::MoveForward),
@@ -74,7 +76,8 @@ const EMACS_CHORDS: &[ChordRow] = &[
     ),
 ];
 
-/// The built-in key sequences, each one space-separated string.
+/// The built-in key sequences, each one space-separated string. They are the
+/// built-in keymap's only multi-chord bindings.
 const EMACS_SEQUENCES: &[(&str, EditorCommand)] = &[
     ("C-x u", EditorCommand::Undo),
     ("C-x C-s", EditorCommand::Save),
@@ -102,7 +105,12 @@ const OFF_MAC_CHORDS: &[ChordRow] = &[
     (&["C-backspace"], EditorCommand::BackwardKillWord),
 ];
 
-/// WINDOWS: Ctrl+S SAVES (audit I9).
+/// WINDOWS: Ctrl+S SAVES (audit I9). This is not a preference — it is the one
+/// chord every Windows application, from Notepad to Visual Studio, has
+/// answered for thirty years, and the editor answering it with an INCREMENTAL
+/// SEARCH is the single most alarming thing the built-in editor did: the user
+/// hits ^S to protect their work and the buffer starts hunting for text
+/// instead.
 const WINDOWS_CHORDS: &[ChordRow] = &[
     (&["C-s"], EditorCommand::Save),
     (&["M-s"], EditorCommand::IncrementalSearch),

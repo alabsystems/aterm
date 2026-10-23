@@ -87,7 +87,7 @@ impl std::fmt::Display for SpinReport {
 
 /// The row's bounds against the window's counters.
 #[must_use]
-pub fn judge(row: &SpinRow, arms: u64, timer_wakes: Option<u64>) -> ShapeVerdict {
+pub const fn judge(row: &SpinRow, arms: u64, timer_wakes: Option<u64>) -> ShapeVerdict {
     let wakes_ok = match (row.max_timer_wakes, timer_wakes) {
         (None, _) => true,
         (Some(max), Some(n)) => n <= max,

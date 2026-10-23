@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The attached clock: a live call whose time went back (two host clocks interleaved) or
-//! predates the epoch is recorded at the task's logical time `max(floor, t)` and counted,
-//! never dropped or refused, and the attached run then equals the unattached engine fed the
-//! logical times. Keys interleaved while paused queue in logical order and all reach the
-//! glow after a resume or a commit. A decoded or replayed log whose own times go back is
-//! still refused as `TimeWentBack`.
+//! Attached clock monotonicity and pause/resume tests for momentum glow.
 
 use std::time::Duration;
 
@@ -56,8 +51,7 @@ fn restamped(c: Call, at: Duration) -> Call {
     }
 }
 
-/// The stream as a host reading two clocks stamps it: about a third of the calls up to
-/// 6 ms early.
+/// The stream as a host reading two clocks stamps it.
 fn skewed(calls: &[Call], r: &mut Rng) -> Vec<Call> {
     calls
         .iter()

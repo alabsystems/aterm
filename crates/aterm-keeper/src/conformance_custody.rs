@@ -755,7 +755,10 @@ struct Explored {
     sequences: usize,
 }
 
-/// Every move sequence of up to `depth` steps from `rig`.
+/// Every move sequence of up to `depth` steps from `rig`. `seen` holds the most steps each
+/// (model state, real shape) has been explored with: a node explored with `n` steps left has
+/// already walked every sequence a later visit with `n` or fewer could, so that visit is
+/// skipped and only a visit with more steps left walks it again.
 fn explore(
     model: &Model,
     rig: Rig,
@@ -826,7 +829,8 @@ fn explore(
     }
 }
 
-/// Between them, the bounded event sequences fire every action of the model.
+/// Between them, the bounded event sequences fire every action of the model. Negative control:
+/// the buggy model rejects real steps at each mutant's site.
 #[test]
 fn the_real_keeper_conforms_to_the_custody_model() {
     let model = pty_keeper_custody_model();

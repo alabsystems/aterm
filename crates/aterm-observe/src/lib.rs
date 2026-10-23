@@ -28,7 +28,9 @@ impl RowMatch for RegexRowMatch {
     }
 }
 
-/// Maximum regex pattern length (bytes).
+/// Maximum regex pattern length (bytes). Watcher patterns are untrusted control
+/// input and are rejected before compilation to bound parse/compile cost,
+/// matching `aterm-search`'s `MAX_REGEX_PATTERN_LEN`.
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Compiled-regex size limit (bytes) for

@@ -157,7 +157,7 @@ pub struct Preflight {
 impl Preflight {
     /// Returns whether this cut carries a newer trust build than the channel pins.
     #[must_use]
-    pub fn compiler_moved(&self) -> bool {
+    pub const fn compiler_moved(&self) -> bool {
         matches!((self.trust_build, self.public_trust_pin), (Some(b), Some(p)) if b > p)
     }
 

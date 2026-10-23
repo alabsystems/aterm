@@ -415,7 +415,10 @@ aux_targets! {
         /// capture).
         Front = "front" | "window" | "terminal";
     opens:
-        /// The native Settings tab.
+        /// The native Settings tab. `controls prefs` keeps its historical
+        /// line prefixes; its route, preference rows and `ui` records come
+        /// from the compiled native semantic tree (`inspect app/v1` is the
+        /// versioned form).
         Prefs = "prefs" | "preferences" | "settings",
         /// The native Settings `/about` route, projected from its compiled
         /// semantic frame while that route is open.
@@ -2013,10 +2016,11 @@ pub const VERBS: &[VerbSpec] = &[
         "sys [<view>] [--json] [since=<c>]: cores, GPU, memory, disk of the machine, aterm and \
          this tab",
         "Views: `overview` (default) | `tab` | `aterm` | `global` | `jobs` | `cores` | `gpu` | \
-         `mem` | `disk` | `procs`; options: `scope=pane|tab|window|aterm|global` (on resource/job \
-         views), `top=<n>` (default 8, max 64), `fresh=<ms>` (0 forces a live sample; stale \
-         replies add `state=stale age_ms=`), `depth=` (on `disk`), `instances=all` (folded by \
-         `aterm ctl`). Header: `OK <n> sys v=1 view= as_of= age_ms= window_ms= next=<ep>.<seq>`; \
+         `mem` | `disk` | `procs` | `why`; options: `scope=pane|tab|window|aterm|global` \
+         (on resource/job views), `top=<n>` (default 8, max 64), `fresh=<ms>` (0 forces a live \
+         sample; stale replies add `state=stale age_ms=`), `depth=` (on `disk`), `instances=all` \
+         (folded by `aterm ctl`). Header: \
+         `OK <n> sys v=1 view= as_of= age_ms= window_ms= next=<ep>.<seq>`; \
          `since=<ep>.<seq>` returns changed lines, `same <keys>`, `e` events, or `gap \
          why=reset|evicted` (`ERR bad since head=` if ahead). Records use `key=value` in base \
          units (`cpu_mc=`, `fp_bytes=`, `write_bps=`, `busy_pm=`) or `unavailable(<why>)` / \
@@ -2025,7 +2029,9 @@ pub const VERBS: &[VerbSpec] = &[
          (`state=complete|walking|<refusal> alloc_bytes= [walked_entries=] entries= growth_bps=`) \
          and top `dir` subtrees. Processes print `pid=` and `exe=<word|->` (never argv/env; paths \
          only for the caller's tab; `caller=` is advisory; machine-wide rows beyond the caller's \
-         scope read `withheld=<n>`). See `aterm help sys` and `await sys`.",
+         scope read `withheld=<n>`). `why [cpu|mem]` says who uses the CPU or memory and why, \
+         with the cause aterm can name, the caller's `you` role and the split; `why` alone picks \
+         what deviates most. See `aterm help sys` and `await sys`.",
     )
     .lane(Wait)
     .json(Json::Emits),

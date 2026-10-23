@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The protocol tables libwayland reads: `struct wl_interface` and
-//! `struct wl_message` (wayland-util.h), laid out as C lays them out, built
-//! as statics by the generated protocol modules. libwayland marshals and
-//! demarshals every message by its table's signature, creates the objects an
-//! event announces from its table's types, and checks an object argument
-//! against the expected interface by name (`wl_interface_equal`), so a table
-//! here and libwayland's own copy of the same interface interoperate.
+//! C-ABI Wayland protocol interface and message descriptors (`wl_interface`, `wl_message`).
 
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr::null;
@@ -37,8 +31,7 @@ pub struct Message {
 // SAFETY: as for Interface.
 unsafe impl Sync for Message {}
 
-/// One entry of a message's `types` array: the interface of an object or
-/// new_id argument, or null.
+/// Interface entry in a message's `types` array (or null).
 #[repr(transparent)]
 pub struct TypeRef(*const Interface);
 
@@ -56,8 +49,7 @@ impl TypeRef {
     }
 }
 
-/// Nulls enough for any message whose arguments name no interface: one per
-/// signature argument, as wayland-scanner's `types_null`.
+/// Null [`TypeRef`] slots for messages whose arguments name no interface.
 pub static NULLS: [TypeRef; 8] = [
     TypeRef::NULL,
     TypeRef::NULL,
@@ -130,6 +122,7 @@ impl Interface {
     }
 }
 
+// Requires `p` and `n` to come from a static slice (or null and 0).
 /// # Safety
 /// `p` and `n` come from one static slice (or null and 0).
 #[inline]
@@ -144,9 +137,7 @@ unsafe fn messages(p: *const Message, n: c_int) -> &'static [Message] {
 }
 
 impl Message {
-    /// A message: `types` holds one entry per signature argument (`new_id`
-    /// without an interface counts three: `s`, `u`, `n`). Extra type slots
-    /// are allowed; a shorter slice is refused before its pointer is stored.
+    /// Builds a message descriptor with one `types` slot per signature argument.
     ///
     /// # Panics
     /// Panics when `types` has fewer slots than the signature has arguments.
@@ -174,8 +165,7 @@ impl Message {
         unsafe { CStr::from_ptr(self.name) }
     }
 
-    /// The signature: an optional since-version prefix, then one type code
-    /// per argument (`i u f s o n a h`), each optionally after `?`.
+    /// Returns the message's type signature string.
     #[inline]
     pub const fn signature(&self) -> &'static CStr {
         // SAFETY: as for `name`.
@@ -188,8 +178,7 @@ impl Message {
         if i >= signature_args(self.signature().to_bytes()) {
             return None;
         }
-        // SAFETY: `types` holds one entry per signature argument (`new`'s
-        // contract), each null or a static interface.
+        // SAFETY: `types` holds one static or null entry per signature argument (`new`'s contract).
         unsafe { (*self.types.add(i)).0.as_ref() }
     }
 }

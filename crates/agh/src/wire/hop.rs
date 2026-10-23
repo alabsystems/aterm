@@ -12,7 +12,8 @@ use crate::wire::{Endpoints, Origin, WireRequest};
 
 /// Rebuild `original` for the `Location` it was redirected to.
 /// # Errors
-/// As above.
+/// Conflict (`Sub::Moved`) for a method other than GET and HEAD; CouldNotRun (`Sub::Protocol`)
+/// when `location` does not parse or its origin is not one of `endpoints.asset_hosts()`.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(

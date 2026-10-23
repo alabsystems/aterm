@@ -6,33 +6,24 @@
 use std::fmt;
 use std::io;
 
-/// What went wrong. A decoder fault names the rule the bytes broke and where,
-/// so a bad message from the bus is diagnosable from the error alone.
+/// What went wrong.
 #[derive(Debug)]
 pub enum Error {
     /// The socket failed.
     Io(io::Error),
-    /// Bytes that break the D-Bus specification: `what` names the rule, `at`
-    /// the byte offset (from the start of the message, or of the buffer handed
-    /// to a decoder).
+    /// Bytes that break the D-Bus specification.
     Malformed { what: &'static str, at: usize },
-    /// A value, name, address or message built on this side that the
-    /// specification forbids.
+    /// A value, name, address or message built on this side that the specification forbids.
     Invalid(&'static str),
-    /// Valid D-Bus this crate does not speak: a unix descriptor, a transport
-    /// other than a unix socket, an unknown message type.
+    /// Valid D-Bus this crate does not speak.
     Unsupported(&'static str),
     /// The server refused authentication or answered out of protocol.
     Auth(String),
     /// The peer answered a call with an error message.
     Remote { name: String, message: String },
-    /// The deadline passed before the bus took a message whole, or before
-    /// the handshake finished.
+    /// The deadline passed before the bus took a message whole, or before the handshake finished.
     Timeout,
-    /// A call went out whole and no answer came before its deadline. The
-    /// connection is as it was: a peer that is slow, not gone, may still
-    /// answer, and `Connection::recv` hands that late answer over as any
-    /// other message.
+    /// A call went out whole and no answer came before its deadline.
     NoReply,
     /// The peer hung up, or an earlier framing fault left the stream unusable.
     Closed,

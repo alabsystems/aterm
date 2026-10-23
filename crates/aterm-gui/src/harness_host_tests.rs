@@ -433,7 +433,8 @@ impl CarryClock for StepClock {
     }
 }
 
-/// Waits for something that must happen.
+/// Waits for something that must happen. The minute is a hang detector, not a latency
+/// budget.
 fn until(what: &str, pred: impl Fn() -> bool) {
     let seen = aterm_spec::wait::within(
         aterm_spec::wait::MUST_HAPPEN,
@@ -4802,7 +4803,8 @@ fn a_proven_self_claim_makes_the_worker_watch_only_in_both_orders() {
     host.shutdown_and_join();
 }
 
-/// A pid that ran and is gone: a dead self-claim's.
+/// A pid that ran and is gone: a dead self-claim's. Unix has
+/// `/usr/bin/true`; Windows has no `/usr/bin`, so `cmd /c exit 0`.
 fn gone_pid() -> u32 {
     let mut gone = if cfg!(windows) {
         let mut cmd = aterm_uds::spawnfd::command("cmd");
@@ -6650,6 +6652,8 @@ impl Acting {
     }
 
     /// Wait until the host has made two whole passes since now (two reads
+    /// of the words): what a pass would do about a change made before this
+    /// call has been done.
     fn passes(&self) {
         let seen = self.word_reads.load(Ordering::SeqCst);
         ring();
@@ -8845,7 +8849,8 @@ struct Accts {
     ended: AtomicBool,
     /// The label the last relaunch was asked for.
     asked_to: Mutex<Option<String>>,
-    /// An `adopted` relaunch's new process cannot be read yet: no snapshot of the tab.
+    /// An `adopted` relaunch's new process cannot be read yet: no snapshot of the tab. It
+    /// is kept here, and a test puts it in the tab when it may be read ([`Self::readable`]).
     unread: AtomicBool,
     hidden: Mutex<Option<Snapshot>>,
     /// [`Acts::account_settings`]: the agent's settings take its stored
@@ -22724,7 +22729,10 @@ struct Probe {
     lingering: Mutex<bool>,
     /// Rung as [`Self::lingering`] clears.
     let_end: Condvar,
-    /// The restart pauses the host asked for ([`Hooks::backoff`]).
+    /// The restart pauses the host asked for ([`Hooks::backoff`]). Each is
+    /// asked after its failure is counted in the session's history, so a
+    /// failure that moves no projected variable (one past the history's
+    /// cap) is waited for by this count.
     backoffs: AtomicUsize,
     /// The session's agent is a VENDOR Codex (the model's `vendor`, while
     /// the roster names it): what the test made it.
@@ -22913,6 +22921,8 @@ impl Probe {
     }
 
     /// Wait until the host has made two whole passes since now (two reads
+    /// of the words), so a start or a let-go a pass would make after the
+    /// state first matched has been made.
     fn passes(&self) {
         let seen = self.word_reads.load(Ordering::SeqCst);
         ring();

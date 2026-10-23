@@ -5,7 +5,8 @@
 
 use super::*;
 
-/// Bounded model for the occupied-cell rainbow body budget.
+/// Bounded model for the occupied-cell rainbow body budget. `Raise` explores
+/// every integer request through and beyond the 236 ceiling.
 fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -28,7 +29,8 @@ fn rainbow_occupied_coverage_model() -> aterm_spec::derive::Model {
     }
 }
 
-/// Bounded lifecycle for a rainbow cell reclaimed while retracting.
+/// Bounded lifecycle for a rainbow cell reclaimed while retracting. Visibility
+/// is quantized for exhaustive exploration; `Buggy=1` snaps back to full.
 fn rainbow_retract_rearm_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -81,7 +83,9 @@ fn rainbow_kitty_parse_and_beam() {
     assert!(style_has_beam("phaser"), "phaser keeps the shared beam");
 }
 
-/// Tier 0: exhaust the 0..=270 request lattice.
+/// Tier 0: exhaust the 0..=270 request lattice. The body clamp proves the
+/// occupied-cell budget; the pass-through mutant fails once a request past the
+/// 236 cap is reachable.
 #[test]
 fn rainbow_occupied_coverage_derived_model_proves_and_catches_regression() {
     assert_eq!(
@@ -113,7 +117,9 @@ fn typed_burst(
     typed_burst_from_phase(c, g, row, cols, gap, 0.0)
 }
 
-/// [`typed_burst`] from a chosen point on the rolling hue.
+/// [`typed_burst`] from a chosen point on the rolling hue. A mark shorter than
+/// `1 / RAINBOW_LAID_SWEEP_PER_CELL` cells covers only part of the arc (see
+/// [`RAINBOW_KITTY_HUE_STEP`]), so callers can sweep the start.
 fn typed_burst_from_phase(
     c: &GlowConfig,
     g: Geom,

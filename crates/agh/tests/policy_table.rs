@@ -2,10 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The Router over the canonical config (design §6.4): the decision table row by row, fall
-//! through against stop, `--as`, identity and unscoped paths, `--anonymous`, no config, a
-//! floor owner with no row, every refusal code a valid agh.toml gives, `tier_of`, `explain`,
-//! and the ambient token that changes nothing.
+//! The Router over the canonical config (design §6.4).
 
 use agh::error::{Kind, Sub, Tried};
 use agh::identity::{self, MapEnv};
@@ -72,7 +69,6 @@ fn the_decision_table_row_by_row() {
     let write =
         |slug: &str, dev, rel| router.decide(&RouteRequest::write(repo(slug)), &pres(dev, rel));
 
-    // A dev owner: (dev) → dev; else refuse 4.
     assert_eq!(read(DEV, P, P), send("dev", Tier::Dev));
     assert_eq!(code(&read(DEV, A, P)), Some(RefusalCode::ChainExhausted));
     assert_eq!(writer_read(DEV, P, P), send("dev", Tier::Dev));
@@ -85,8 +81,6 @@ fn the_decision_table_row_by_row() {
     assert_eq!(RefusalCode::WriterAbsent.kind().exit(), 4);
     assert_eq!(RefusalCode::ChainExhausted.kind().exit(), 4);
 
-    // A release owner: reads as dev, else anonymous; writer-reads as release, else refuse 4;
-    // a write not named literally is refused 1 whoever is present.
     assert_eq!(read(REL, P, P), send("dev", Tier::Dev));
     assert_eq!(read(REL, A, P), anonymous(AnonymousWhy::ChainFellThrough));
     assert_eq!(writer_read(REL, P, P), send("release", Tier::Release));
@@ -100,7 +94,6 @@ fn the_decision_table_row_by_row() {
     );
     assert_eq!(RefusalCode::ReleaseNeedsLiteral.kind().exit(), 1);
 
-    // An owner with no row: the default chain; never written to.
     assert_eq!(read(EXT, P, P), send("dev", Tier::Dev));
     assert_eq!(read(EXT, A, P), anonymous(AnonymousWhy::ChainFellThrough));
     assert_eq!(code(&writer_read(EXT, P, P)), Some(RefusalCode::WriteNone));
@@ -167,7 +160,6 @@ fn as_picks_a_step_of_the_chain_or_the_writer() {
     };
     assert_eq!(writer_as("release"), send("release", Tier::Release));
     assert_eq!(code(&writer_as("dev")), Some(RefusalCode::AsNotWriter));
-    // A present step after the asked one is never used: the asked one is the only step.
     let absent_as = router.decide(
         &RouteRequest::read(repo(REL)).with_as(Some("dev".into())),
         &pres(A, P),
@@ -372,7 +364,6 @@ fn every_refusal_a_valid_config_gives() {
             "agh whoami --for alabsystems/aterm",
         ],
     );
-    // An owner with no repository: `whoami --for` takes only OWNER/NAME, so next names one.
     assert_refusal(
         &refused(
             &router,
@@ -476,7 +467,6 @@ fn explain_shows_the_walk() {
         fell.to_string(),
         r#"{"chain":[{"presence":"absent","step":"dev"},{"step":"anonymous"}],"decision":{"anonymous":{"why":"chain_fell_through"}},"op":"read","owner":"alabsystems","tier":"release","writer":{"presence":"present","profile":"release"}}"#
     );
-    // A writer refusal still shows the owner's read chain (`whoami --op write`).
     let absent_writer = explained(&router, &RouteRequest::writer_read(repo(REL)), P, A);
     assert_eq!(
         absent_writer["chain"].to_string(),
@@ -514,7 +504,6 @@ fn explain_shows_the_walk() {
         unusable["chain"][0].to_string(),
         r#"{"presence":"unusable","step":"dev","why":"loose"}"#
     );
-    // The writer, the same profile, shows its presence in the chain step's own form.
     assert_eq!(
         unusable["writer"].to_string(),
         r#"{"presence":"unusable","profile":"dev","why":"loose"}"#

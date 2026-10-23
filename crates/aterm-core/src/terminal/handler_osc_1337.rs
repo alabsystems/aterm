@@ -22,10 +22,14 @@ pub(super) enum PlacementCursor {
     Unmoved,
 }
 
-/// Maximum decoded image payload accepted (bytes).
+/// Maximum decoded image payload accepted (bytes). A single sequence must not be
+/// able to pin an unbounded buffer; 16 MiB comfortably covers a full-screen PNG
+/// while bounding the worst case.
 const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum footprint in cells along either axis.
+/// Maximum footprint in cells along either axis. Caps the per-image cell-stamp
+/// work regardless of the requested dimensions; the footprint's height is held
+/// tighter still ([`MAX_DECODED_IMAGE_PX`]).
 const MAX_FOOTPRINT_CELLS: u16 = 4096;
 
 /// The tallest raster the image paths make or read, in pixels: the renderers'
@@ -55,7 +59,8 @@ enum Dimension {
 }
 
 impl Dimension {
-    /// Parse a `width=`/`height=` value.
+    /// Parse a `width=`/`height=` value. Returns [`Dimension::Auto`] for `auto`,
+    /// an empty value, or anything that does not parse — never errors.
     fn parse(value: &str) -> Self {
         let v = value.trim();
         if v.is_empty() || v.eq_ignore_ascii_case("auto") {
@@ -76,7 +81,9 @@ impl Dimension {
         v.parse::<u32>().map_or(Dimension::Auto, Dimension::Cells)
     }
 
-    /// Resolve to a CELL count.
+    /// Resolve to a CELL count. `cell_px` is the per-axis cell pixel size,
+    /// `viewport_cells` the grid extent on this axis, `auto_cells` the footprint
+    /// derived from the image's own pixel size.
     #[inline]
     const fn to_cells(self, cell_px: u16, viewport_cells: u16, auto_cells: u16) -> u16 {
         let cells = match self {
@@ -109,7 +116,9 @@ const fn clamp_cells(cells: u32) -> u16 {
     }
 }
 
-/// Narrow a `usize` cell span to `u32`, saturating.
+/// Narrow a `usize` cell span to `u32`, saturating. Used by the sixel placement
+/// path so a span (already bounded by the decoder's dimension cap) feeds
+/// `clamp_cells` without a truncating cast.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "v <= u32::MAX is checked before narrowing"
@@ -130,7 +139,8 @@ struct FileArgs {
     width: Option<Dimension>,
     /// `height=` request (default: derive from the image).
     height: Option<Dimension>,
-    /// `inline=1` — display inline.
+    /// `inline=1` — display inline. `inline=0` (or absent) means "save to disk",
+    /// which a terminal cannot do, so only `inline=1` paints anything.
     inline: bool,
     /// `preserveAspectRatio=0` disables aspect preservation (default on).
     preserve_aspect_ratio: bool,
@@ -528,7 +538,8 @@ impl TerminalHandler<'_> {
     }
 }
 
-/// Parse the `File=` argument list (`key=value;key=value;…`).
+/// Parse the `File=` argument list (`key=value;key=value;…`). Unknown keys are
+/// ignored; a missing/duplicate key takes the last value.
 fn parse_file_args(args: &[u8]) -> FileArgs {
     let mut out = FileArgs {
         preserve_aspect_ratio: true,

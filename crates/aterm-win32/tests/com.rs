@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The hand-written COM vocabulary (src/com.rs) and DXGI slice (src/dxgi.rs),
-//! on any host (WB.2 of docs/AUDIT-third-party-2026-10-15.md).
-//!
-//! `aterm-win32-oracle oracle` holds both to `windows` 0.62.2 on the Windows
-//! triples (win32-oracle/conformance/src/com.rs); this holds the same 64-bit
-//! answers wherever the workspace tests run: the vtable slot each called
-//! method sits in, `DXGI_OUTPUT_DESC1`'s layout, and the interface IDs and
-//! values. It also drives [`Com`]'s reference counting through a stand-in
-//! object, so an owned pointer that leaks or double-releases fails here.
+//! Conformance and reference-counting tests for [`Com`] and DXGI declarations.
 
 #![allow(non_snake_case)]
 
@@ -21,13 +13,12 @@ use core::cell::Cell;
 use core::ffi::c_void;
 use core::ptr::{self, NonNull};
 
-/// Slot `n` of a vtable: its byte offset.
+/// Slot `n` of a vtable.
 #[cfg(target_pointer_width = "64")]
 const fn slot(n: usize) -> usize {
     n * 8
 }
 
-// The slot each method aterm calls sits in, as `windows` 0.62.2 numbers them.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};
@@ -63,7 +54,6 @@ const _: () = {
     assert!(offset_of!(D::DXGI_OUTPUT_DESC1, MaxFullFrameLuminance) == 144);
 };
 
-// The values, on every width.
 const _: () = {
     assert!(D::DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 == 1);
     assert!(D::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 == 12);
@@ -76,7 +66,6 @@ fn same(a: &GUID, b: &GUID) -> bool {
 
 #[test]
 fn interface_ids_are_upstreams() {
-    // dxgi.h's `IDXGIFactory1` and dxgi1_6.h's `IDXGIOutput6`, field by field.
     let factory = GUID {
         data1: 0x770a_ae78,
         data2: 0xf26f,
@@ -112,8 +101,7 @@ const E_NOINTERFACE: HRESULT = 0x8000_4002_u32.cast_signed();
 const KNOWN: GUID = GUID::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
 const OTHER: GUID = GUID::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210);
 
-/// A COM object stand-in: its vtable pointer first, as every COM object's is,
-/// then the counts the tests read.
+/// A COM object stand-in.
 #[repr(C)]
 struct Object {
     vtable: *const IUnknown_Vtbl,
@@ -128,8 +116,8 @@ unsafe extern "system" fn query_interface(
     iid: *const GUID,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    // SAFETY: `this` is an `Object` (every `Com` here wraps one); `iid` and
-    // `out` are `Com::query`'s live arguments.
+    // SAFETY: `this` is an `Object` (every `Com` here wraps one); `iid` and `out` are
+    // `Com::query`'s live arguments.
     let (object, iid) = unsafe { (&*this.cast::<Object>(), &*iid) };
     let (hr, result) = if !same(iid, &KNOWN) {
         (E_NOINTERFACE, ptr::null_mut())
@@ -222,8 +210,7 @@ fn a_null_success_is_e_pointer_and_takes_nothing() {
     assert_eq!((object.refs.get(), object.releases.get()), (0, 1));
 }
 
-/// Another binding's interface value: one pointer, released on its own drop,
-/// as `windows`' interface types are.
+/// Another binding's interface value.
 #[repr(transparent)]
 struct Foreign(NonNull<c_void>);
 
@@ -243,8 +230,7 @@ impl Drop for Foreign {
 fn another_bindings_reference_moves_without_its_drop() {
     let object = object(false);
     let foreign = Foreign(NonNull::new(raw(&object)).expect("non-null"));
-    // SAFETY: `Foreign` is one non-null interface pointer owning one
-    // reference, released by its drop and nothing else.
+    // SAFETY: `Foreign` is one non-null interface pointer owning one reference.
     let com = unsafe { Com::from_interface(foreign) };
     assert_eq!(com.as_raw(), raw(&object));
     drop(com);

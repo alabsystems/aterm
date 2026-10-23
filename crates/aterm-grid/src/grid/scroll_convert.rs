@@ -1457,7 +1457,8 @@ impl AttrRunBuilder {
         self.extend(attrs, 1);
     }
 
-    /// Per-cell hot path: one comparison and one add.
+    /// Per-cell hot path: one comparison and one add. A fresh builder's open run
+    /// is `(DEFAULT, 0)`, so `len == 0` needs no test.
     #[inline]
     fn extend(&mut self, attrs: CellAttrs, count: u32) {
         if count == 0 {
@@ -1481,7 +1482,9 @@ impl AttrRunBuilder {
         self.len = count;
     }
 
-    /// Close the open run and yield the `Rle` for `Line::from_parts`.
+    /// Close the open run and yield the `Rle` for `Line::from_parts`. A single
+    /// all-default run is dropped: `from_parts` collapses it to `None` anyway,
+    /// and not emitting it keeps a plain line allocation-free.
     fn finish(mut self) -> Rle<CellAttrs> {
         if self.len != 0 && (self.spilled || !self.value.is_default()) {
             self.rle.extend_with(self.value, self.len);

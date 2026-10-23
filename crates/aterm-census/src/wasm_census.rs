@@ -3,7 +3,10 @@
 // Author: Andrew Yates
 
 //! Wasm-process L0 freeze and single-threaded posture census ([`WASM_THREADING_POSTURE`]).
-
+//!
+//! The modules are single-threaded by target ([`WASM_THREADING_POSTURE`],
+//! held by the OB-12 tripwire), so lock order is vacuous here. L0 freeze does
+//! transfer: a long synchronous export blocks the hosting JS event loop, and the
 //! closure shares `aterm-grid`'s `// COST: UNBOUNDED(<dim>)` sinks with no
 //! worker thread to offload to (`resize` exports detach via
 //! `resize_offloading_scrollback`; `pump_reflow` rewraps in a later host task).

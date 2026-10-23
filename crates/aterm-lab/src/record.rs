@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The frame stream and the harness journal on one millisecond clock: every
-//! screen change of a lab's tab (`subscribe @sid screen,trim,ts,events
-//! every-frame` on one in-process control connection: finer than polling, and
-//! nothing in the loop can blind it) with the wall time it was read and the
-//! server's video-clock microseconds (`T`), its EVENT lines, and the harness's
-//! own journal lines.
+//! Frame stream recorder and harness journal tailer on a shared wall clock.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -98,7 +93,7 @@ impl Default for StreamParser {
 impl StreamParser {
     /// A parser at the start of a stream.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         StreamParser {
             t: None,
             pending: None,
@@ -107,7 +102,7 @@ impl StreamParser {
 
     /// The video clock as of the last `T` line.
     #[must_use]
-    pub fn t(&self) -> Option<i64> {
+    pub const fn t(&self) -> Option<i64> {
         self.t
     }
 
@@ -150,8 +145,7 @@ impl StreamParser {
 }
 
 impl Recorder {
-    /// Subscribe to the tab `sid` of the lab behind `door`; with `out`, every
-    /// frame and event also goes to `<out>/frames.jsonl`.
+    /// Subscribes to tab `sid` on `door`, optionally writing to `<out>/frames.jsonl`.
     ///
     /// # Errors
     /// The connection or the subscription failed.
@@ -301,8 +295,7 @@ impl Recorder {
             .unwrap_or_default()
     }
 
-    /// The first frame (index `since` or later) that `pred` holds of, waiting up
-    /// to `timeout` seconds for it to arrive.
+    /// Waits up to `timeout` seconds for a frame at or after `since` matching `pred`.
     ///
     /// # Errors
     /// The run was interrupted.
@@ -343,8 +336,7 @@ impl Drop for Recorder {
     }
 }
 
-/// The harness journal (`<state>/drive/<sid>.journal.jsonl`), tailed every
-/// 40 ms (a file has no event to wait on): `(wall seen, record)` per line.
+/// Tailer for the harness journal (`<state>/drive/<sid>.journal.jsonl`).
 pub struct Journal {
     lines: Arc<Mutex<Vec<(f64, J)>>>,
     stop: Arc<AtomicBool>,
@@ -362,7 +354,6 @@ impl Journal {
         let thread = std::thread::spawn(move || {
             let mut n = 0usize;
             while !s.load(Ordering::SeqCst) {
-                // through no link: the jail writes the state
                 let text = crate::sys::scratch_read(&path)
                     .ok()
                     .flatten()
@@ -373,7 +364,6 @@ impl Journal {
                     let w = now();
                     for ln in &ls[n..] {
                         let rec = J::parse(ln).unwrap_or_else(|_| {
-                            // whole milliseconds, as the journal's records stamp themselves
                             #[allow(clippy::cast_possible_truncation)]
                             let t = (w * 1000.0) as i64;
                             J::obj([("t", J::Int(t)), ("kind", J::s("raw")), ("line", J::s(*ln))])

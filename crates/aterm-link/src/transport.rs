@@ -117,7 +117,10 @@ pub fn connect(endpoint: &str, deadline: Duration) -> io::Result<(Conn, Closer)>
     Ok((conn, closer))
 }
 
-/// The reconnect back-off floor and ceiling.
+/// The reconnect back-off floor and ceiling. §7: a bridge reconnects with jittered
+/// back-off and opens its publisher connection before its drain connection, because
+/// `MAX_CONNS` can refuse a herd and the publisher's `live inc+1` suppresses a fenced
+/// will.
 const RECONNECT_MIN: Duration = Duration::from_millis(100);
 pub(crate) const RECONNECT_MAX: Duration = Duration::from_secs(5);
 

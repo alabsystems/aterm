@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The live tabs of this account's aterms, for `hello` and `tabs` (design §14.3), and the
-//! check that this process runs in the account's own home ([`is_live_account`]), which
-//! gates reading them.
+//! Live tab discovery across this account's aterm instances, gated by [`is_live_account`].
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Whether this process runs in the account's own home (not a test harness's synthetic
-/// `$HOME` or private `ATERM_STATE_HOME`): only then does aterm read its tabs or retire the
-/// LaunchAgent earlier builds installed (`cli::retire_lan_agent`).
+/// Returns whether this process runs in the account's own home directory.
 #[must_use]
 pub fn is_live_account() -> bool {
     if aterm_types::dirs::runs_under_private_state_root() {
@@ -26,8 +22,6 @@ pub fn is_live_account() -> bool {
     };
     env_home == pw_home
 }
-
-// ── Local aterm session & tab telemetry scanner ─────────────────────────────────────────
 
 /// Percent-decode a control-socket field (`%XX` hex pairs).
 #[must_use]
@@ -53,8 +47,7 @@ pub fn pct_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Parse one `sessions` line from an `aterm` control socket into a [` crate::protocol::HostedSession`].
-/// Exited sessions are skipped (`None`).
+/// Parses one non-exited `sessions` line from an `aterm` control socket into a [`crate::protocol::HostedSession`].
 #[must_use]
 pub fn parse_aterm_roster_line(
     instance_pid: u32,
@@ -265,8 +258,7 @@ fn query_instance_sessions(
     out
 }
 
-/// Enumerate every live `aterm` control socket in `dir` and return all live tabs/sessions,
-/// waiting up to `wait` on each socket.
+/// Enumerates live `aterm` control sockets in `dir` and returns all live sessions.
 #[must_use]
 pub fn scan_aterm_sessions_in_dir(
     dir: &Path,
@@ -379,7 +371,6 @@ mod tests {
             .unwrap();
         });
 
-        // A hang detector, not a latency budget: a descheduled stand-in still answers.
         let rows = scan_aterm_sessions_in_dir(dir.path(), Duration::from_secs(60));
         server.join().unwrap();
         assert_eq!(rows.len(), 1);

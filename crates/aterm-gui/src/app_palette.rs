@@ -48,7 +48,8 @@ fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Ac
 }
 
 impl App {
-    /// Snapshot command metadata for exactly the active native view in `wid`.
+    /// Snapshot command metadata for exactly the active native view in `wid`. A terminal
+    /// tab returns `None`, so app-local rows structurally disappear from its palette.
     fn native_palette_scope(&self, wid: crate::WindowId) -> Option<NativeCommandScope> {
         let (instance, view) = self.active_native_view(wid)?;
         let generation = self.native_runtime.view_generation(view)?;
@@ -315,7 +316,9 @@ impl App {
         self.palette_live_for_window(self.frontmost_window)
     }
 
-    /// Resolve content and window facts for the palette's own window.
+    /// Resolve content and window facts for the palette's own window. Update,
+    /// theme, fleet and other process-wide facts remain shared; `None` is the
+    /// native menu's windowless state.
     fn palette_live_for_window(&self, wid: Option<crate::WindowId>) -> PaletteLive {
         let window = wid.and_then(|wid| self.windows.get(&wid));
         let has_selection = wid.is_some_and(|wid| {
@@ -2422,7 +2425,9 @@ mod tests {
         assert!(crate::keybinding::ACTION_NAMES.contains(&"choose_theme"));
     }
 
-    /// A press shaped like the platform's, through the shipping `on_key`.
+    /// A press shaped like the platform's, through the shipping `on_key`. `text` is
+    /// what winit reports, so a Ctrl+letter carries its letter here: the harder case,
+    /// since a filter that typed `text` would type it.
     fn press_key(
         app: &mut App,
         mods: aterm_window::keyboard::ModifiersState,
@@ -2610,7 +2615,8 @@ mod tests {
         );
     }
 
-    /// A held chord repeats what its press did: a held `^W` keeps deleting words.
+    /// A held chord repeats what its press did: a held `^W` keeps deleting words. Its
+    /// auto-repeat used to replay the key's letter, so holding `^W` typed `www…`.
     #[test]
     fn a_held_readline_chord_repeats_its_edit_not_its_letter() {
         use aterm_window::keyboard::{Key, KeyCode, ModifiersState, SmolStr};
@@ -2650,7 +2656,10 @@ mod tests {
         assert_eq!(query(&app), "");
     }
 
-    /// A DRIVEN PALETTE EDITS ITS FILTER AS A TYPED ONE DOES.
+    /// A DRIVEN PALETTE EDITS ITS FILTER AS A TYPED ONE DOES. Each chord starts from
+    /// the same filter twice: once pressed through the shipping `on_key`, once as the
+    /// exact event `aterm ctl key <chord>` builds (`control_input::parse_key`) through
+    /// `App::input`, the controller's road (`palette_input_event`).
     #[test]
     fn a_driven_palette_edits_its_filter_as_a_typed_one_does() {
         use aterm_window::keyboard::{Key, KeyCode, ModifiersState as M, NamedKey, SmolStr};

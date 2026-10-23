@@ -720,7 +720,7 @@ pub enum NoWitness {
 impl NoWitness {
     /// One word for the step and the ledger.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             NoWitness::NoChats => "no-chats",
             NoWitness::NoHeader => "no-header",
@@ -735,7 +735,7 @@ impl NoWitness {
 
     /// What aterm could not tell, in a person's words.
     #[must_use]
-    pub fn said(self) -> &'static str {
+    pub const fn said(self) -> &'static str {
         match self {
             NoWitness::NoChats => "its project's session files could not be read",
             NoWitness::NoHeader => "no session file of its project was begun after it started",
@@ -845,7 +845,7 @@ pub enum Precheck {
 impl Precheck {
     /// One word for the step and the ledger.
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             Precheck::Safe { .. } => "safe",
             Precheck::NoTurns => "no-turns",
@@ -932,7 +932,7 @@ pub enum ExitKind {
 impl ExitKind {
     /// One word for the step and the ledger.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             ExitKind::Clean => "clean",
             ExitKind::Stopped => "stopped",

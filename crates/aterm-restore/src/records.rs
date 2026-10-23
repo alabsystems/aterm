@@ -71,7 +71,9 @@ pub enum TailRecord<'a> {
     Superseded,
 }
 
-/// A policy's byte.
+/// A policy's byte. `ResizePolicy` is non-exhaustive: a policy this build does not know is
+/// journaled as a byte no reader accepts, so a replay across it stops and is counted
+/// rather than reflow the grid under the wrong policy.
 const fn policy_byte(policy: ResizePolicy) -> u8 {
     match policy {
         ResizePolicy::Native => 0,

@@ -188,19 +188,12 @@ pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail
         .map_or(original_not_before, |restored| {
             restored.max(original_not_before)
         });
-    // The known paced wait is part of the contract. Only the minute after its
-    // original deadline is a hang detector. A broken restore that postpones its
-    // deadline by hours must fail this run rather than extend the detector;
-    // the actual request still must respect both the original and restored time.
     let wait = Duration::from_millis(
         original_not_before
             .saturating_sub(crate::util::now_ms())
             .max(0)
             .unsigned_abs(),
     ) + HANG;
-    // Claim publication and resume/timer publication are independent. Keep the
-    // maximum observed lower bound for this exact owed act through the wait;
-    // never mistake the next act's new deadline for this continuation's.
     let mut deadline_record = after.clone();
     let acted = Proof::wait_for(wait, Duration::from_millis(250), || {
         if let Some(record) = Proof::record(&leg, pid)

@@ -19,7 +19,9 @@ pub(crate) type ForcedChrome = aterm_messages::ink::ForcedPalette;
 /// `u32::MAX` cannot collide with a real colour.
 const FORCED_ABSENT: u32 = u32::MAX;
 
-/// The published palette, packed `0x00RRGGBB`, in [`ForcedChrome`] field order.
+/// The published palette, packed `0x00RRGGBB`, in [`ForcedChrome`] field order. Atomics
+/// rather than a `Mutex<Option<_>>`, since `band_colors` / `strip_colors` run on paint
+/// paths.
 static FORCED_CHROME: [AtomicU32; 5] = [
     AtomicU32::new(FORCED_ABSENT),
     AtomicU32::new(0),
@@ -114,7 +116,8 @@ fn published_forced_chrome() -> Option<ForcedChrome> {
     })
 }
 
-/// Pack one RGB triple into `0x00RRGGBB`.
+/// Pack one RGB triple into `0x00RRGGBB`. Write side, so `cfg`-gated with its only
+/// caller; [`unpack`] is not, because every platform reads.
 #[cfg(any(windows, test))]
 fn pack(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])

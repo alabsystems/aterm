@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! The aterm-models-session models aterm-spec's own unit tests run the engine on (`transact_model`, `kernel_model`, `snapshot_model`, `evict_full_model`, `forward_handshake_model`),
-//! re-exported from this crate's root like every other. aterm-spec `#[path]`-mounts this file
-//! (`src/test_models.rs`), so it holds only these and names only `aterm_spec::…` paths: an edit
-//! to the rest of this crate's models then rebuilds no aterm-spec test and does not seed
-//! aterm-spec, and with it every crate that depends on aterm-spec, into `verify`'s change cone.
+
+//! Engine corpus models mounted by `aterm-spec`'s unit tests (`src/test_models.rs`).
 
 use aterm_spec::derive::*;
 
-/// Transaction atomicity (no lost update under optimistic concurrency). A transaction reads the
-/// head at `tbase` (`Begin`); concurrent `Write`s may advance `seq`; it commits only if no write
-/// intervened (`seq = tbase`), else aborts, since committing against a stale `tbase` clobbers
-/// the concurrent write. `Buggy = 1` may commit despite a conflict (`seq' = tbase + K`), setting
-/// `lost` and breaking `NoLostUpdate`.
+/// Transaction atomicity (no lost update under optimistic concurrency).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn transact_model() -> Model {
@@ -123,12 +115,7 @@ pub fn transact_model() -> Model {
     }
 }
 
-/// The event-log spine: gap-free, monotone, `seq == count`. Each `Emit` assigns the next
-/// contiguous seq and bumps the count, so the head seq equals the number of events; `Buggy`
-/// jumps seq by 2 (a gap), breaking `SeqIsCount`. Tier-1: aterm-buffer's
-/// `tests/conformance_kernel.rs` drives every real edit kind, transactions and the eviction
-/// regime, projecting `count` from the writer and `seq` from the seq stamped on each stored
-/// event (every stored event is one `Emit`).
+/// The event-log spine: gap-free, monotone, `seq == count`.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn kernel_model() -> Model {
@@ -145,8 +132,6 @@ pub fn kernel_model() -> Model {
                 init: 0,
             },
         ],
-        // Action `Emit` (not `Append`, which clashes with ty's Sequences builtin in
-        // a single-action spec — see the ring's `Push`).
         fn_vars: vec![],
         actions: vec![Action {
             name: "Emit",
@@ -156,7 +141,6 @@ pub fn kernel_model() -> Model {
                     var: "count",
                     expr: add(var("count"), int(1)),
                 },
-                // seq' = IF Buggy = 1 THEN seq + 2 ELSE seq + 1   (Buggy opens a gap)
                 Update {
                     var: "seq",
                     expr: if_(
@@ -175,9 +159,7 @@ pub fn kernel_model() -> Model {
     }
 }
 
-/// Snapshot isolation: a snapshot, once taken, is isolated from later writes. `Snap` activates a
-/// snapshot; `Write` advances the head and, under `Buggy = 1 /\ snapped = 1`, leaks into it
-/// (`leaked = 1`), breaking `SnapshotIsolated`.
+/// Snapshot isolation: a snapshot, once taken, is isolated from later writes.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn snapshot_model() -> Model {
@@ -216,7 +198,6 @@ pub fn snapshot_model() -> Model {
                         var: "seq",
                         expr: add(var("seq"), int(1)),
                     },
-                    // leaked' = IF Buggy = 1 /\ snapped = 1 THEN 1 ELSE leaked
                     Update {
                         var: "leaked",
                         expr: if_(
@@ -236,14 +217,10 @@ pub fn snapshot_model() -> Model {
     }
 }
 
-/// Per-element ring with a function-valued live-set `live: [1..MaxSeq -> BOOLEAN]`, which the
-/// scalar `ring_model` cannot express. `EvictOldestContiguous`: the live region is exactly the
-/// contiguous window `[lo, seq]`, so eviction removes precisely the oldest event, never a hole
-/// and never two. Function-valued, so Tier-0 `ty` only, not the scalar interpreter.
+/// Per-element ring with a function-valued live-set `live: [1..MaxSeq -> BOOLEAN]`.
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn evict_full_model() -> Model {
-    // (seq + 1) - lo + 1 > Cap : the eviction condition (over the pre-state seq).
     let evicting = || {
         gt(
             add(sub(add(var("seq"), int(1)), var("lo")), int(1)),
@@ -252,7 +229,6 @@ pub fn evict_full_model() -> Model {
     };
     Model {
         name: "EvictFull",
-        // `Buggy = 1` advances `lo` but keeps the evicted event live: a hole at the old end.
         consts: vec![("MaxSeq", 5), ("Cap", 3), ("Buggy", 0)],
         vars: vec![
             StateVar {
@@ -282,8 +258,6 @@ pub fn evict_full_model() -> Model {
                 },
                 Update {
                     var: "live",
-                    // Evicting: rebuild the live-set as (old minus the evicted `lo`)
-                    // plus the new event `seq+1`. Non-evicting: just mark `seq+1`.
                     expr: if_(
                         evicting(),
                         comprehension(
@@ -307,7 +281,6 @@ pub fn evict_full_model() -> Model {
         invariants: vec![Invariant {
             name: "EvictOldestContiguous",
             kind: InvariantKind::Claim,
-            // \A n \in 1..MaxSeq : live[n] <=> (lo =< n /\ n =< seq)
             expr: forall(
                 "n",
                 int(1),
@@ -321,23 +294,7 @@ pub fn evict_full_model() -> Model {
     }
 }
 
-/// Forward-handshake liveness (the `drain_buffered` bug; `control::try_proxy_forward`:
-/// `control_lanes::LaneReader::take_buffered`, then proxy.rs `relay_hop`): a blocking I/O
-/// deadlock no bad-state invariant can see. The cross-process forward is request → relay →
-/// reply: the reply bytes are already buffered past the request line, and the client is parked
-/// awaiting them. At `Buggy = 0` the server relays the buffered bytes (`reader.buffer()`) and
-/// the client is always served, ending in the `Done` self-loop. `Buggy = 1` reads more
-/// (`fill_buf()`) before the first relay, but the client sends nothing while it waits, so every
-/// action is disabled outside `Done`: a deadlock.
-///
-/// Checked with `CHECK_DEADLOCK TRUE` ([`Model::to_cfg_deadlock_with`]); the `Done` self-loop is
-/// required, or the clean `client_waiting = 0` terminal itself reads as a deadlock.
-///
-/// Tier-1: aterm-gui's `control::tests::try_proxy_forward_conforms_to_forward_handshake` sends
-/// one request line through the real `try_proxy_forward` to a stand-in child socket and checks
-/// the observed `Relay` (the child receives the handshake) and `ClientRecv` (the client is
-/// answered) against this model; a forward that demands a fresh client read first is reported
-/// parked in the state only `Buggy = 1` wedges in.
+/// Forward-handshake liveness model (`drain_buffered` blocking I/O deadlock).
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
 pub fn forward_handshake_model() -> Model {

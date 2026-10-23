@@ -119,7 +119,7 @@ struct InTool {
 
 impl InTool {
     /// How long its call has been in flight at `now`.
-    fn for_ms(&self, now: u64) -> u64 {
+    const fn for_ms(&self, now: u64) -> u64 {
         self.age_ms.saturating_add(now.saturating_sub(self.flown))
     }
 }

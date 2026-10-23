@@ -172,7 +172,7 @@ pub enum State {
 impl State {
     /// Whether the row is where the tests look for it.
     #[must_use]
-    pub fn in_place(&self) -> bool {
+    pub const fn in_place(&self) -> bool {
         matches!(self, Self::Present(_) | Self::Placed(_))
     }
 }
@@ -674,7 +674,7 @@ fn place_browser(
     place::place(&scratch, &tree, &t.dir, &|| complete(t))
 }
 
-fn engine_name(engine: Engine) -> &'static str {
+const fn engine_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Chromium => "chrome-headless-shell",
         Engine::Firefox => "firefox",

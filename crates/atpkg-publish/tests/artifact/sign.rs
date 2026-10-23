@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The signing ceremony: a staged manifest is re-checked, signed with this machine's key
-//! and the pair verified under the newest master-verified roster before its signature is
-//! written; a refused manifest gets no signature and keeps the one it had; an `unproven`
-//! row is signed only while the receipt switch reads dormant.
+//! Tests for the manifest signing ceremony and roster election.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -274,9 +271,6 @@ fn the_verb_reads_the_switch_from_the_trust_repo_it_names() {
 
 /// THE ROSTER IS ELECTED ONCE PER PROCESS (A9): every pack of a lane or a group loads a
 /// signer, and each used to list the channel and download the head's roster pair again.
-/// The context remembers the elected generation, so its clones (the group's per-publish
-/// context, the lanes' packs) read the head once — and every signature is still verified
-/// under it.
 #[test]
 fn packs_of_one_run_read_the_channel_head_once() {
     let tmp = scratch("sign-once");
@@ -297,7 +291,6 @@ fn packs_of_one_run_read_the_channel_head_once() {
     );
     assert_eq!(head_reads(), 1, "{:?}", host.calls());
 
-    // A lane or a group elects from the head it already verified: its packs read none.
     let tmp = scratch("sign-once-lane");
     let (ctx, host) = channel(&keys, tmp.path());
     let (_, head) =

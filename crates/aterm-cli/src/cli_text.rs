@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 /// `text` as it goes to stdout.
 #[inline]
-pub(crate) const fn for_stdout(text: &str) -> Cow<'_, str> {
+pub(crate) fn for_stdout(text: &str) -> Cow<'_, str> {
     #[cfg(windows)]
     if windows::shell_reads_in_code_page(&std::io::stdout()) {
         return Cow::Owned(ascii_punctuation(text));
@@ -17,7 +17,7 @@ pub(crate) const fn for_stdout(text: &str) -> Cow<'_, str> {
 
 /// `text` as it goes to stderr: `for_stdout`'s rule, read off stderr's handle.
 #[inline]
-pub(crate) const fn for_stderr(text: &str) -> Cow<'_, str> {
+pub(crate) fn for_stderr(text: &str) -> Cow<'_, str> {
     #[cfg(windows)]
     if windows::shell_reads_in_code_page(&std::io::stderr()) {
         return Cow::Owned(ascii_punctuation(text));
@@ -25,6 +25,8 @@ pub(crate) const fn for_stderr(text: &str) -> Cow<'_, str> {
     Cow::Borrowed(text)
 }
 
+/// Whether a pipe created by the process whose image is `creator` is read in a
+/// legacy code page: its creator is pwsh, Windows PowerShell or cmd, and the
 /// console's output code page (`console_cp`, 0 for no console) is not UTF-8.
 #[cfg(any(windows, test))]
 fn shell_decodes_code_page(console_cp: u32, creator: Option<&str>) -> bool {
@@ -38,6 +40,9 @@ fn shell_decodes_code_page(console_cp: u32, creator: Option<&str>) -> bool {
     shell && console_cp != 0 && console_cp != UTF8
 }
 
+/// `text` with aterm's typographic punctuation spelled in ASCII, every other
+/// character as it is. The table is the punctuation aterm's CLI text used
+/// (`--help`, `--version`, `help` and its topics, `doctor` and `agents`, read on
 /// 2026-09-28) with the quote and comparison pairs beside it.
 #[cfg(any(windows, test))]
 fn ascii_punctuation(text: &str) -> String {
@@ -62,6 +67,7 @@ fn ascii_punctuation(text: &str) -> String {
 
 #[cfg(windows)]
 mod windows {
+    //! Direct `unsafe extern "system"` kernel32 FFI, the pattern
     //! `driver_windows.rs` uses.
     use std::os::windows::io::AsRawHandle;
 
@@ -121,6 +127,7 @@ mod windows {
 mod tests {
     use super::{ascii_punctuation, shell_decodes_code_page};
 
+    /// Only a pipe pwsh, Windows PowerShell or cmd created is read in a legacy
     /// code page, and only while the console's code page is not UTF-8.
     #[test]
     fn only_a_shell_pipe_under_a_legacy_code_page_is_read_in_it() {
@@ -146,6 +153,7 @@ mod tests {
         assert!(!shell_decodes_code_page(437, None), "creator unknown");
     }
 
+    /// The punctuation becomes ASCII, which a code-page reader and a UTF-8
     /// reader decode alike; any other character keeps its UTF-8 bytes.
     #[test]
     fn punctuation_is_spelled_in_ascii_and_nothing_else_changes() {
@@ -165,6 +173,8 @@ mod tests {
         assert_eq!(ascii_punctuation(kept), kept);
     }
 
+    /// Off Windows every stream gets the text as it is: the same bytes, not a
+    /// copy, so `--help`, `--version`, `help` and `doctor` print exactly what they
     /// printed before this module, `·` and `—` included.
     #[cfg(not(windows))]
     #[test]
@@ -182,6 +192,7 @@ mod tests {
         }
     }
 
+    /// A pipe this test process makes is one its creator reads, and this process
     /// is no shell: the pipe keeps the text unchanged.
     #[cfg(windows)]
     #[test]

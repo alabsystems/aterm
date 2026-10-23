@@ -920,7 +920,9 @@ mod unix {
     /// The longest line a hidden prompt keeps (its buffer never grows, so no copy is left).
     const HIDDEN_MAX: usize = 1024;
 
-    /// One line typed at the terminal without echo.
+    /// One line typed at the terminal without echo. `None` with no terminal; Ctrl-C ends
+    /// the process (exit 130) once the terminal is put back; Ctrl-D on an empty line and
+    /// an empty line answer an empty value.
     fn ask_hidden(prompt: &str) -> Option<SecretBytes> {
         let mut tty = std::fs::OpenOptions::new()
             .read(true)

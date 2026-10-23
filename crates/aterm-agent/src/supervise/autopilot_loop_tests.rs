@@ -960,7 +960,12 @@ fn order(m: &Mock) -> Vec<&str> {
     m.order.iter().map(|(r, _)| r.as_str()).collect()
 }
 
-/// OFF LOOKS UNSUPERVISED.
+/// OFF LOOKS UNSUPERVISED. As the loop parks it gives the session's claim
+/// back — `meta unset supervisor holder=<it>`, the loop's own release — and
+/// nothing renews or retries it while parked, though every request would (a
+/// renewal step of zero), so the server raises the session's boxes to the
+/// menu bar again; as the word turns, the claim is taken again before
+/// anything is typed.
 #[test]
 fn an_autopilot_off_park_gives_the_claim_back_and_takes_it_again() {
     let script = || {

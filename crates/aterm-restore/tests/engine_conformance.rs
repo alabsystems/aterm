@@ -730,7 +730,8 @@ fn every_boundary_restores_the_live_screen() {
     }
 }
 
-/// NEGATIVE CONTROL: a tap that drops RESIZE records fails on the flap.
+/// NEGATIVE CONTROL: a tap that drops RESIZE records fails on the flap. The flap is a step
+/// of the scenario, not of a seed's cuts, so one seed shows it.
 #[test]
 fn a_tap_that_drops_resizes_fails_on_the_flap() {
     let Err(why) = run(1, true, false) else {

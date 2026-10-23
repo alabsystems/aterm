@@ -12,7 +12,9 @@ use aterm_core::grid::ResizePolicy;
 use aterm_core::terminal::Terminal;
 use aterm_pty::ConsoleHostKind;
 
-/// How long `mainscreen` waits for the host's forwarded switch.
+/// How long `mainscreen` waits for the host's forwarded switch. The client
+/// starts in about 10 ms and the host forwards at once; the bound only keeps a
+/// wedged host from holding the verb.
 const MAINSCREEN_WAIT: Duration = Duration::from_secs(2);
 
 /// Whether a session on `host` recovers a dead app's alternate screen through the host.

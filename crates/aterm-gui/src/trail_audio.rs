@@ -16,11 +16,13 @@ pub(crate) const fn output_available() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// Output sample rate.
+/// Output sample rate. 48 kHz is the native rate of every modern Mac output
+/// path; the hardware resampler handles the rest.
 #[cfg(target_os = "macos")]
 const SAMPLE_RATE: f64 = 48_000.0;
 
-/// Frames per queue buffer (~10.7 ms at 48 kHz), 3 buffers in flight.
+/// Frames per queue buffer (~10.7 ms at 48 kHz), 3 buffers in flight. Start
+/// latency is bounded by one buffer; none is silent priming ahead of a cue.
 #[cfg(target_os = "macos")]
 const BUFFER_FRAMES: usize = 512;
 #[cfg(target_os = "macos")]
@@ -37,7 +39,9 @@ const PAUSE_AFTER_SILENT: u32 = 140;
 #[cfg(target_os = "macos")]
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 
-/// UI-side staleness threshold for the worker's platform-busy stamp.
+/// UI-side staleness threshold for the worker's platform-busy stamp. A
+/// control call that has not returned for this long is wedged (`audio=wedged`);
+/// a parked worker holds no stamp and is never wedged.
 #[cfg(target_os = "macos")]
 const WEDGE_AFTER_MS: u64 = 3_000;
 
@@ -161,7 +165,10 @@ fn detach_deadline() -> Duration {
     DETACH_DEADLINE
 }
 
-/// Lifetime budget of worker revivals after wedge detection.
+/// Lifetime budget of worker revivals after wedge detection. Each revival
+/// abandons one blocked thread and its queue (a thread stuck in a platform
+/// call cannot be cancelled); the budget bounds that leak, and exhaustion
+/// seals ingress so the host reads inert.
 #[cfg(target_os = "macos")]
 const WEDGE_REVIVES: u8 = 3;
 
@@ -177,11 +184,14 @@ const OPEN_WEDGE_AFTER_MS: u64 = WEDGE_AFTER_MS * 5;
 #[cfg(target_os = "macos")]
 const STALL_AFTER_MS: u64 = 750;
 
-/// Lifetime budget of device reopens.
+/// Lifetime budget of device reopens. Budget exhaustion is the only terminal
+/// state; each transient AudioToolbox failure spends one reopen.
 #[cfg(target_os = "macos")]
 const REOPEN_BUDGET: u8 = 6;
 
-/// Wait before the n-th reopen attempt.
+/// Wait before the n-th reopen attempt. The first is immediate (the likely
+/// fault is transient, and the next key should sound); the schedule then grows
+/// three- to fourfold, so an absent device costs about 44 s of attempts.
 #[cfg(target_os = "macos")]
 const REOPEN_BACKOFF: [Duration; REOPEN_BUDGET as usize] = [
     Duration::ZERO,
@@ -1079,7 +1089,8 @@ mod mac {
     }
 }
 
-/// Bounded cue ingress.
+/// Bounded cue ingress. Eight cues can be emitted by one visual frame; 64 keeps
+/// several burst frames without making producer work depend on the callback.
 #[cfg(target_os = "macos")]
 const COMMAND_CAPACITY: usize = 64;
 
@@ -1130,7 +1141,8 @@ fn monotonic_ms() -> u64 {
     elapsed.saturating_add(WEDGE_AFTER_MS + 1)
 }
 
-/// Set on the busy stamp while the section it covers is a device open.
+/// Set on the busy stamp while the section it covers is a device open. The
+/// phase rides in the stamp word so the reader's verdict is one atomic load.
 #[cfg(target_os = "macos")]
 const BUSY_OPENING: u64 = 1 << 63;
 
@@ -1461,7 +1473,9 @@ impl<'a> RetryState<'a> {
         self.earliest.is_none_or(|t| now >= t)
     }
 
-    /// A cue sounded.
+    /// A cue sounded. The schedule resets only once the device has played for
+    /// [`Self::healthy_for`], measured from its first delivery after the last
+    /// fault, so the budget bounds consecutive failure.
     fn delivered(&mut self, now: Instant) {
         if self.attempts == 0 {
             return;
@@ -1950,7 +1964,9 @@ impl TrailAudio {
         }
     }
 
-    /// A wedge was observed at the ingress.
+    /// A wedge was observed at the ingress. With budget remaining, abandon the
+    /// stuck worker (drop detaches it; it disposes its own queue if the call
+    /// ever returns) and stand up a fresh channel and worker.
     #[cfg(target_os = "macos")]
     fn revive_or_seal(&mut self) {
         if self.revives_left == 0 {
@@ -2216,7 +2232,9 @@ mod tests {
         Queued { audible: bool },
     }
 
-    /// Deterministic AudioQueue seam with no callback thread.
+    /// Deterministic AudioQueue seam with no callback thread. Every write
+    /// checks that synchronous stop returned the buffer to available; a
+    /// test-only retained-pause mutation records unsafe writes instead.
     struct CallbackFreeQueue {
         buffers: [FakeBuffer; super::BUFFER_COUNT],
         cue_audible: bool,
@@ -3072,7 +3090,10 @@ mod tests {
         assert!(dropped_backoff.load(Ordering::Relaxed) > 0);
     }
 
-    /// A slow device open is not a wedge.
+    /// A slow device open is not a wedge. The worker holds the busy stamp
+    /// across `AudioQueueNewOutput` and its buffer allocations, which can take
+    /// seconds; the phase rides in the stamp and an open is judged at
+    /// [`OPEN_WEDGE_AFTER_MS`], so a slow open does not cost a revival.
     #[test]
     fn a_slow_device_open_is_not_a_wedge() {
         use super::{BUSY_OPENING, OPEN_WEDGE_AFTER_MS, WEDGE_AFTER_MS, busy_stale};
@@ -3345,7 +3366,13 @@ mod tests {
         );
     }
 
-    /// A parked shipping worker is woken by the closing channel and joined.
+    /// A parked shipping worker is woken by the closing channel and joined. The
+    /// deadline is stretched to a minute so scheduling delay cannot turn the
+    /// join into a detach (a drop that never wakes the worker still records
+    /// `DetachedAtDeadline`), and the mechanism is asserted too: the channel
+    /// closed before the drop began waiting, and the worker left through its
+    /// idle `recv()` answering `Disconnected`, the one wake that is immediate by
+    /// construction.
     #[test]
     fn dropping_a_healthy_host_stays_synchronous() {
         let audio = TrailAudio::new(true);
@@ -3480,7 +3507,8 @@ mod tests {
         );
     }
 
-    /// Every cell of the `IsRunning` verdict.
+    /// Every cell of the `IsRunning` verdict. The only claim it may make is a
+    /// witnessed 1 → 0 within one start.
     #[test]
     fn the_is_running_probe_claims_a_stop_only_after_seeing_the_run() {
         use RunningProbe::{Abstain, NotYetRunning, Running, StoppedUnderUs};

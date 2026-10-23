@@ -126,7 +126,14 @@ fn kinds(d: &Discovered) -> Vec<(PathBuf, &'static str)> {
         .collect()
 }
 
-/// EVERY ROOT KIND, EACH BUILD DIRECTORY ONCE.
+/// EVERY ROOT KIND, EACH BUILD DIRECTORY ONCE. An agent's
+/// `CARGO_TARGET_DIR`; a working directory's own build directory and its
+/// worktree root's; `$HOME`'s checkout with `target -> target.noindex` (ONE
+/// directory, found by the link resolved and by its own name — reported
+/// once, canonical) and a workspace one level down (`crates/target`); a
+/// build directory BESIDE a worktree (`wt-parent/m1-target`) and in a git
+/// worktree that lives outside `$HOME` (read from `.git/worktrees`); a
+/// Claude Code session's scratch build three levels down.
 #[test]
 fn every_root_kind_is_found_and_each_build_directory_once() {
     let tmp = Tmp::new("discover-roots");
@@ -1663,7 +1670,8 @@ fn the_privacy_guarded_folders_are_never_walked_from_home() {
     assert_eq!(got, [&planted[1]]);
 }
 
-/// A temp root another user could write in, or a link, is skipped with a note.
+/// A temp root another user could write in, or a link, is skipped with a note. Negative
+/// control: private again, its scratch build is found.
 #[test]
 fn a_temp_root_another_user_could_write_in_is_not_searched() {
     use std::os::unix::fs::PermissionsExt as _;

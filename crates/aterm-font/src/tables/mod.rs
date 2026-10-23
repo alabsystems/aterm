@@ -1,12 +1,8 @@
 // Copyright (c) 2018 Yevhenii Reizner and the ttf-parser authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
 // Derived from ttf-parser 0.25.1 src/tables/mod.rs, and `PlatformId` from
-// src/tables/name.rs, and modified by the aterm project in 2026: the tables
-// aterm reads (TF.3 and TF.5 of docs/AUDIT-third-party-2026-10-15.md). Not
-// carved: `ankr`, `feat`, `kerx`, `morx`, `trak` (the AAT layout tables),
-// `GPOS` subtables, `MATH`, `STAT` and `SVG `.
-// See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
+// src/tables/name.rs, and modified by the aterm project in 2026. See
+// ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
 pub mod cbdt;
 pub mod cblc;

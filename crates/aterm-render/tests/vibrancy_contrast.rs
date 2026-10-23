@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The translucency contrast floor (`aterm_render::vibrancy::effective_minimum_contrast`):
-//! translucent glass always floors glyphs to WCAG AA (4.5:1), opaque frames keep the
-//! configured floor bit for bit, and the law is idempotent. Tier-0 is the ty model
-//! `aterm_models_render::vibrancy_contrast_model`; this file is Tier-1 and binds the real
-//! resolver to that model point for point.
+//! Tests for `aterm_render::vibrancy::effective_minimum_contrast` and `VibrancyContrast` model conformance.
 
 use aterm_render::vibrancy::{CONTRAST_FLOOR, effective_minimum_contrast, is_translucent};
 
@@ -49,8 +45,6 @@ fn effective_floor_never_illegible_and_never_weakens() {
     }
     assert!(raised > 0 && kept > 0, "both branches exercised");
 
-    // Negative control: at (1.0, 0.5) the raw configured value is sub-AA, and the
-    // effective one differs from it, so the law is not the identity.
     assert_eq!(effective_minimum_contrast(1.0, 0.5), CONTRAST_FLOOR);
     assert_ne!(effective_minimum_contrast(1.0, 0.5), 1.0);
 }
@@ -68,9 +62,6 @@ fn index_of(ratio: f32) -> i64 {
 /// Tier-1 conformance for `VibrancyContrast`: for every `Pick` (translucent × base),
 /// the model's one `Fire` successor's `effective` is the lattice index of the real
 /// resolver's answer, with `translucent ∈ {0, 1}` ↔ opacity `{1.0, 0.6}`.
-///
-/// NON-VACUITY: `Buggy = 1` (the auto-floor dropped) must differ from the real
-/// resolver somewhere (translucent, base < Floor), so a regressed resolver fails here.
 #[test]
 fn resolver_conforms_to_the_vibrancy_contrast_model() {
     let model = aterm_models_render::vibrancy_contrast_model();

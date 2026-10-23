@@ -27,7 +27,7 @@ pub enum Agent {
 impl Agent {
     /// Short CLI verb and fixture prefix (`"gemini"` or `"agy"`).
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Agent::Gemini => "gemini",
             Agent::Agy => "agy",
@@ -54,7 +54,7 @@ impl Agent {
 
     /// Scratch `HOME` subdirectory name under the lab root.
     #[must_use]
-    pub fn home(self) -> &'static str {
+    pub const fn home(self) -> &'static str {
         match self {
             Agent::Gemini => "gemini-home",
             Agent::Agy => "agy-home",
@@ -63,7 +63,7 @@ impl Agent {
 
     /// Screen regex matching the agent's initial TUI frame.
     #[must_use]
-    pub fn drawn(self) -> &'static str {
+    pub const fn drawn(self) -> &'static str {
         match self {
             Agent::Gemini => "Type your message|trust the files|Gemini CLI|gemini-api-key",
             Agent::Agy => "Antigravity CLI|trust the contents|color scheme|Terms of Service",

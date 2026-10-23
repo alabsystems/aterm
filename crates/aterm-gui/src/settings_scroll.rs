@@ -840,7 +840,14 @@ impl ScrollPlan {
         }
         let at = self.stop_top(screen.drawn.start, index) - screen.offset;
         let floor = self.caption_floor(screen.caption, &screen.drawn, index);
-        let live = if self.gives_to_status() {
+        // as a press's nudge measures it ([`Self::press_seat_span`]). So does
+        // the edge of a list that ends on whole stops, whose screen is its
+        // room ([`ListFoot::Whole`]): read as live past it, the Customize
+        // strip's 81pt line of buttons at 178x348 at 2× text, the reload
+        // warning and a status up, counted as shown whole in a 54pt list
+        // that drew none of Customize, and the list left the wheel's place
+        // for it.
+        let live = if self.gives_to_status() || self.foot == ListFoot::Whole {
             screen.live.min(self.room)
         } else {
             screen.live
@@ -1580,11 +1587,81 @@ pub(super) enum Reveal {
     #[default]
     Keep,
     Pressed,
+    /// stop's controls whole in the list's room, until the person's next
+    /// event after a render has seated it — a projection's reply (the
+    /// Messages tick, a refresh) is no event of theirs
+    /// ([`SettingsViewState::settle_page_scroll`]). The keeping rules of
+    /// [`SettingsViewState::seat_scroll`] hold it:
+    ///
+    /// - R1: A pure re-render (same size, same text scale, same
+    ///   status/warning bars, no event between) draws the same screen.
+    /// - R2: What the person is on stays in view (#92 generalized): when the
+    ///   last screen showed the keyboard's control whole — listed in the list
+    ///   or pinned around it — nothing the person did not do (a resize, a
+    ///   text-size change, a status or the aterm.toml reload warning bar
+    ///   coming or going, a landing measured again) takes it out of view. A
+    ///   control the last screen showed cut is shown no less.
+    /// - R3: The theme in use (the landing, owner ruling 2026-10-20) is shown
+    ///   whole on every frame before the first event, wherever that does not
+    ///   break R2. Where both cannot be shown, the keyboard's control wins (as
+    ///   the first screen already does); where the keyboard's control is
+    ///   pinned, landing costs it nothing, so the list lands.
+    /// - R4: A wheel's place holds until an event moves it, except as far as
+    ///   R2 needs to move the list.
+    ///
+    /// So a frame before that event with nothing changed draws the screen
+    /// that render drew; one that measures the list otherwise — a resize,
+    /// another text size, a bar that came or went — lands again, but gives
+    /// way to the keyboard's control where the list lists it: on the list's
+    /// opening screens where both cannot be shown, and after an event where
+    /// the last screen showed that control, or the event put the keyboard on
+    /// it (the Customize sheet closed with Done). A control pinned around the
+    /// list was shown whole: the list lands, and a window that lists the
+    /// control again shows it whole. A landing that gave way is spent while
+    /// the list lists that control.
     Land,
     LandWhole,
     Hold,
 }
 
+/// What a screen showed the person of the keyboard's control ([`ScrollRecord::left`]): whole, listed or pinned, or how much of it.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Left {
+    key: UiKey,
+    whole: bool,
+    part: f32,
+}
+
+impl Left {
+    /// What the screen whose first stop is `top` shows of `key` on `plan`.
+    fn on(plan: &ScrollPlan, key: &UiKey, top: usize) -> Self {
+        let (whole, part) = plan.stop_of(key).map_or((true, 0.0), |stop| {
+            let span = plan.span_of(stop, Some(key), Reveal::Pressed);
+            let control = plan
+                .control_span(stop, key)
+                .unwrap_or_else(|| plan.controls_of(stop));
+            (
+                plan.shows_span(stop, top, span),
+                plan.shown_of_span(stop, top, control),
+            )
+        });
+        Self {
+            key: key.clone(),
+            whole,
+            part,
+        }
+    }
+
+    /// Whether `now` shows the person no less of the control than this.
+    fn kept_by(&self, now: &Self) -> bool {
+        now.whole || (!self.whole && now.part + 0.5 >= self.part)
+    }
+
+    /// Whether this shows any of the control.
+    fn shows(&self) -> bool {
+        self.whole || self.part > 0.0
+    }
+}
 /// Which list a record measured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ScrollContext {
@@ -1603,7 +1680,40 @@ pub(super) struct ScrollRecord {
     drawn: Option<usize>,
     asked: usize,
     landed: Option<UiKey>,
+    /// Whether `landed` gave way to the keyboard's control — on one of the
+    /// list's opening screens ([`Self::opening`]), on a screen that measured
+    /// the list again after the event that landed, or on the first after an
+    /// event that put the keyboard on that control — and is spent: the frames
+    /// after it let it go as drawn while the list lists that control, and
+    /// land again where a window pins the control around the list (R3 of
+    /// [`SettingsViewState::seat_scroll`]).
+    yielded: bool,
+    /// Whether no event has come since the list's first screen: this screen
+    /// is that one, or one drawn after it before any event (a resize,
+    /// another text size), whose landing gives way to the keyboard as the
+    /// first screen's does ([`SettingsViewState::seat_scroll`]).
+    opening: bool,
+    /// What the person was left with of the keyboard's control, which R2 of
+    /// [`SettingsViewState::seat_scroll`] keeps: what this screen showed of
+    /// it — listed, as the list's stops show it; pinned around the list,
+    /// whole — or, where this screen showed less with no event and no scroll
+    /// since the last, what the last left them. A bar, a window or a text size
+    /// that cannot show the control as much never leaves the person with less
+    /// once it goes.
+    left: Option<Left>,
+    /// The keyboard's control as this screen found it: the first screen after
+    /// an event that put the keyboard elsewhere gives a waiting landing way to
+    /// that control ([`SettingsViewState::seat_scroll`]).
+    keyboard: Option<UiKey>,
     hold: bool,
+    /// The screen that put the list where this one holds it — its plan and its
+    /// scroll — where this screen only measured the list again and held that
+    /// screen's place ([`SettingsViewState::seat_scroll`]'s THE LIST HOLDS ITS
+    /// PLACE); `None` where this screen put the list where it is. An event
+    /// makes the screen it came on the place
+    /// ([`SettingsViewState::settle_page_scroll`]), as a scroll does
+    /// ([`SettingsViewState::drop_list_nudge`]).
+    place: Option<Box<(ScrollPlan, usize)>>,
 }
 
 impl ScrollRecord {
@@ -1620,6 +1730,25 @@ impl ScrollRecord {
     fn unscrolled(&self, state: &SettingsViewState) -> bool {
         self.context == state.scroll_context()
             && self.top == state.scroll_now().min(self.plan.limit())
+    }
+
+    /// What the person was left with of `key`, the keyboard's control
+    /// ([`Self::left`]); for a control this screen was not drawn to keep (the
+    /// keyboard moved since), or once the person scrolled it (a page turned,
+    /// a nudge dropped), what it shows of it.
+    fn left_of(&self, key: &UiKey) -> Left {
+        self.left
+            .clone()
+            .filter(|left| left.key == *key)
+            .unwrap_or_else(|| Left::on(&self.plan, key, self.top))
+    }
+
+    /// The list's place as this screen held it: the screen that put the
+    /// list there ([`Self::place`]), its plan and its scroll, else this one.
+    fn place(&self) -> (&ScrollPlan, usize) {
+        self.place
+            .as_deref()
+            .map_or((&self.plan, self.top), |(plan, top)| (plan, *top))
     }
 }
 
@@ -1665,6 +1794,31 @@ impl SettingsViewState {
     }
 
     /// Seat the list a render measured.
+    ///
+    /// THE KEEPING RULES, in precedence order (the showcase tests' keeping
+    /// sweep asserts each on every frame of Settings ▸ Themes):
+    ///
+    /// - R1: A pure re-render (same size, same text scale, same
+    ///   status/warning bars, no event between) draws the same screen.
+    /// - R2: What the person is on stays in view (#92 generalized): when the
+    ///   last screen showed the keyboard's control whole — listed in the list
+    ///   or pinned around it — nothing the person did not do (a resize, a
+    ///   text-size change, a status or the aterm.toml reload warning bar
+    ///   coming or going, a landing measured again) takes it out of view. A
+    ///   control the last screen showed cut is shown no less.
+    /// - R3: The theme in use (the landing, owner ruling 2026-10-20) is shown
+    ///   whole on every frame before the first event, wherever that does not
+    ///   break R2. Where both cannot be shown, the keyboard's control wins (as
+    ///   the first screen already does); where the keyboard's control is
+    ///   pinned, landing costs it nothing, so the list lands.
+    /// - R4: A wheel's place holds until an event moves it, except as far as
+    ///   R2 needs to move the list.
+    ///
+    /// An event is one the person sent (a press, a key, the wheel, a focus
+    /// move): a projection's reply (the Messages tick, a refresh) lets
+    /// nothing go ([`Self::settle_page_scroll`]). Geometry alone keeps a rule
+    /// from holding: a room that holds no list, or one shorter, at every
+    /// scroll, than the control, the row or the stop that holds it.
     pub(super) fn seat_scroll(&self, plan: &mut ScrollPlan) -> Range<usize> {
         let limit = plan.limit();
         let mut top = self.scroll_now().min(limit);
@@ -1676,29 +1830,53 @@ impl SettingsViewState {
             (record.unscrolled(self) && record.plan.shown(record.top).contains(&stop))
                 .then_some((record.top, stop))
         };
-        let last_whole = |key: &UiKey| {
+        // Where the screen that put the list where the last screen held it
+        // showed `key` ([`ScrollRecord::place`]), if nothing has scrolled the
+        // list since: its first stop and `key`'s stop then.
+        let place_shown = |key: &UiKey| {
             let record = self.scroll_record.borrow();
-            record.as_ref().is_some_and(|record| {
-                record.unscrolled(self)
-                    && record.plan.stop_of(key).is_some_and(|stop| {
-                        let span = record.plan.span_of(stop, Some(key), Reveal::Pressed);
-                        record.plan.shows_span(stop, record.top, span)
-                    })
-            })
+            let (was, at) = record
+                .as_ref()
+                .filter(|record| record.unscrolled(self))?
+                .place();
+            let stop = was.stop_of(key)?;
+            was.shown(at).contains(&stop).then_some((at, stop))
         };
-        let cut_since = |key: &UiKey, now: &ScrollPlan, index: usize, top: usize| {
-            let shown = |plan: &ScrollPlan, stop: usize, top: usize| {
-                let span = plan
-                    .control_span(stop, key)
-                    .unwrap_or_else(|| plan.controls_of(stop));
-                plan.shown_of_span(stop, top, span)
-            };
-            last_shown(key).is_some_and(|(last_top, last)| {
-                let record = self.scroll_record.borrow();
-                record.as_ref().is_some_and(|record| {
-                    shown(&record.plan, last, last_top) > shown(now, index, top) + 0.5
-                })
-            })
+        // What the person was left with of `key`, the keyboard's control, if
+        // nothing has scrolled the list since the last screen
+        // ([`ScrollRecord::left`]): what R2 keeps. A CONTROL PINNED AROUND THE
+        // LIST — the chooser's filter over it, the strip's Done under the demo
+        // — IS SHOWN WHOLE, however the list scrolled while it was pinned, and
+        // a screen that showed less than the person was left with, nothing
+        // between (a bar, a window too short for it), leaves that owed to the
+        // next. Held by the last screen's first stop alone, Themes with the
+        // keyboard on Done at 444x180 at 2× text, drawn at 1095x700 with Done
+        // pinned and then at 444x180 again, put Done 240pt over the list's
+        // top; counted as the last screen that listed it showed it, the
+        // filter the wheel had taken out of view at 444x180, pinned at 864x292
+        // and listed at 444x180 again, stayed off the screen, though the
+        // person had last seen it whole, pinned at 864x292; owed only as
+        // the last screen showed it, the Dark | Light segment kept whole at
+        // 300x160 under a status was off the screen once the status went, the
+        // frame between, at 2× text, having drawn no list. One the last screen
+        // did not draw at all (the sheet's Done after the chooser's screen,
+        // which shares its context) counts as whole too: the focus move that
+        // puts the keyboard there reveals it ([`Self::reveal_moved_focus`]),
+        // so only a landing still waiting for its row, which keeps the
+        // reveal, leaves it to this.
+        let owed = |key: &UiKey| {
+            let record = self.scroll_record.borrow();
+            record
+                .as_ref()
+                .filter(|record| record.unscrolled(self))
+                .map(|record| record.left_of(key))
+        };
+        // Whether the screen whose first stop is `top` on `now` shows the
+        // person less of `key` than they were left with: something they did
+        // not do came since — a status bar, a shorter window, a taller
+        // preview, a window that lists what the last pinned.
+        let owes = |key: &UiKey, now: &ScrollPlan, top: usize| {
+            owed(key).is_some_and(|left| !left.kept_by(&Left::on(now, key, top)))
         };
         let held_start = self
             .scroll_record
@@ -1716,26 +1894,81 @@ impl SettingsViewState {
             .borrow()
             .as_ref()
             .is_none_or(|record| record.context != self.scroll_context());
+        // The list's first screen, or one drawn after it before any event
+        // ([`ScrollRecord::opening`]).
+        let opening = first_screen
+            || self.scroll_record.borrow().as_ref().is_some_and(|record| {
+                record.opening && record.drawn.is_some() && record.context == self.scroll_context()
+            });
         let carried = self
             .scroll_record
             .borrow()
             .as_ref()
             .filter(|record| record.unscrolled(self))
-            .and_then(|record| record.plan.seated.filter(|seat| seat.top == record.top));
+            .and_then(|record| {
+                let (was, at) = record.place();
+                was.seated.filter(|seat| seat.top == at)
+            });
+        // THE LIST HOLDS ITS PLACE — the place of the screen that put it
+        // there ([`ScrollRecord::place`]), not the last screen's, where the
+        // frames since only measured the list again, so a wheel's place holds
+        // until an event moves it (R4): where stops above the control a
+        // person is on came or went since (a note a choice retired, a row
+        // Reset took away, a row above listed in parts or whole again as a
+        // republish changed its height), the list moves by as many, so that
+        // control stays where it was on screen — and with no control of that
+        // screen the person is on (none, or the keyboard off the list: on the
+        // search field, on the sidebar row that opened the page), that
+        // screen's first stop BY WHAT IT IS — the nodes it lists, its
+        // controls ([`ScrollPlan::stop_of_identity`]), the first stop after
+        // it listed again where its own first is not (a list at its top stays
+        // there): a text size that lists the same list in other stops leaves
+        // it at the stop it was at (Themes at 2× text lists its demo and
+        // strip as two stops more, and kept the number; Harness's notes hold
+        // no control to know them by). A seat it carried moves with it. Held
+        // from each frame in turn, Themes with the keyboard on the filter,
+        // the wheel gone down at 444x292 to the Built-in section, made
+        // 584x348 and 444x292 again, came back a stop on, at Default's row;
+        // the Customize sheet at 178x348, the wheel gone down to its
+        // foreground row, made 584x348 and 178x348 again, went back to the
+        // list's top; and a taller window, whose list ends before the place,
+        // put the list at that end, which the first window again started
+        // from.
         let shown_first = || {
             let record = self.scroll_record.borrow();
-            let record = record
+            let (was, at) = record
                 .as_ref()
-                .filter(|record| record.unscrolled(self) && record.top > 0)?;
-            let first = record.plan.shown(record.top).start;
-            (first..record.plan.len()).find_map(|stop| {
-                record
-                    .plan
-                    .identities(stop)
+                .filter(|record| record.unscrolled(self))?
+                .place();
+            if at == 0 {
+                return Some((0, 0, 0));
+            }
+            let first = was.shown(at).start;
+            (first..was.len()).find_map(|stop| {
+                was.identities(stop)
                     .find_map(|id| plan.stop_of_identity(id))
-                    .map(|index| (record.top, stop, index))
+                    .map(|index| (at, stop, index))
             })
         };
+        // screen (R1): Themes opened with the keyboard already on its
+        // Community disclosure drew the disclosure, the landing yielding to
+        // it, and the next frame landed on Nord, the theme in use. This
+        // screen passes it on for that event to let go. A LIST MEASURED AGAIN
+        // LANDS AGAIN (R3): a window resized or a text size changed sends the
+        // view no event, so a screen measured otherwise keeps the landing —
+        // let go, Themes opened on Nord at 1144x700 and made 1144x462 lost
+        // Nord's row. But A LANDING THAT GAVE WAY TO THE KEYBOARD IS SPENT
+        // WHILE THE LIST LISTS THE KEYBOARD'S CONTROL, however the list is
+        // measured: that control stays in view as any other frame keeps it
+        // (R2) — landed again, Themes opened on Nord with the keyboard on its
+        // Community disclosure at 1284x714, then made 1284x700 or drawn at 2×
+        // text, went back up to Nord and took the disclosure off the screen.
+        // Where a window pins that control around the list, the landing has
+        // nothing to give way to, and lands (R3): spent for good, Themes
+        // opened on Nord at 178x348 with the keyboard on the filter, which
+        // that window lists, gave way to it, and drawn at 300x160, 444x180
+        // and then 444x292, which pins the filter over the list, left Nord's
+        // row off the screen.
         let land = matches!(self.reveal_as, Reveal::Land | Reveal::LandWhole);
         let drawn_landing = self
             .scroll_record
@@ -1746,10 +1979,12 @@ impl SettingsViewState {
                     && record.context == self.scroll_context()
                     && record.landed.is_some()
                     && record.landed == self.page_reveal
-                    && (record.plan.room - plan.room).abs() < 0.5
-                    && record.plan.heights == plan.heights
+                    && ((record.yielded && focus.is_some_and(|key| plan.stop_of(key).is_some()))
+                        || ((record.plan.room - plan.room).abs() < 0.5
+                            && record.plan.heights == plan.heights))
             })
-            .and_then(|record| record.landed.clone());
+            .map(|record| (record.landed.clone(), record.yielded));
+        let (drawn_landing, mut yielded) = drawn_landing.unwrap_or_default();
         let landing = land && drawn_landing.is_none();
         let revealing = self
             .page_reveal
@@ -1757,13 +1992,15 @@ impl SettingsViewState {
             .filter(|_| self.reveal_as != Reveal::Hold && drawn_landing.is_none());
         let kept_in_view = revealing.or(focus);
         let held_in_view = kept_in_view.and_then(last_shown);
-        let held = match (kept_in_view, held_in_view) {
-            (Some(key), Some((last_top, last))) => {
+        // The place held: the first stop of the screen that put the list
+        // there, the stop it was held by then, and that stop now.
+        let held = kept_in_view
+            .and_then(place_shown)
+            .zip(kept_in_view)
+            .and_then(|((last_top, last), key)| {
                 plan.stop_of(key).map(|index| (last_top, last, index))
-            }
-            (Some(_), None) if revealing.is_some() => None,
-            _ => revealing.is_none().then(shown_first).flatten(),
-        };
+            })
+            .or_else(|| revealing.is_none().then(shown_first).flatten());
         let mut carried = carried;
         if let Some((last_top, last, index)) = held {
             let moved = (last_top + index).saturating_sub(last);
@@ -1782,14 +2019,72 @@ impl SettingsViewState {
             top = moved;
         }
         plan.seated = carried.filter(|seat| seat.top == top && plan.seat_fits(*seat));
+        // the screen that put it there ([`ScrollRecord::place`]) drew it off
+        // its stops' seat — the last screen, scrolled to the list's end, or a
+        // screen a press nudged or Page Up anchored — the next screen draws
+        // the stop the place was held by (the control the person is on, else
+        // that screen's top stop) where it was, so no row moves for what
+        // changed under it: a stop the press added after the list's end
+        // (Cursor Styles at 220x60 with Off saved, a style pressed on the
+        // last screen: its Adjust card came after the end, the same first
+        // stop was no longer the last screen's, and every row went 40pt up
+        // from under the pointer), or a status bar that came over the strip
+        // the last screen drew its end into. Where that place no longer fits
+        // the list (it shrank, the window grew), the list seats as its stops
+        // say.
         if let Some((seat_top, seat)) = self.held_place(plan, top, held) {
             top = seat_top;
             plan.seated = seat;
         }
         let mut landed = drawn_landing;
+        // landing is spent: never a first screen without the control the
+        // keyboard is on, nor a frame after it. A FRAME BEFORE ANY EVENT
+        // THAT LISTS IT NOW GIVES WAY AS THE FIRST SCREEN WOULD HAVE, from
+        // the scroll the list was asked for, as though the landing had never
+        // moved it: Themes opened on Nord with the keyboard on the filter,
+        // drawn at 1284x714 (the filter pinned, Nord whole: nothing to give
+        // way to) and then made 444x180, landed on Nord again and took the
+        // filter off the screen, a screen 444x180 drawn first never draws.
+        // AFTER AN EVENT, A LANDING A SCREEN HAS DRAWN GIVES WAY SO TO THE
+        // CONTROL THAT SCREEN SHOWED (R2): the person put the keyboard there,
+        // and nothing they did since takes it out of view. Themes at 444x420
+        // with Dark pressed on its Dark | Light segment, pinned over the
+        // list, landed on Dracula; made 178x348, which lists the segment, it
+        // landed again and took the segment off the screen. AND A LANDING THE
+        // EVENT THAT PUT THE KEYBOARD ON ANOTHER CONTROL SET GIVES WAY TO THAT
+        // CONTROL as a first screen's does: the Customize sheet closed with
+        // Done lands the chooser on the theme in use and puts the keyboard
+        // back on Customize, and at 178x348, which lists Customize in the
+        // strip over the rows, the screen showed Dracula's row, Customize off
+        // it.
+        let (relanding, moved) = self
+            .scroll_record
+            .borrow()
+            .as_ref()
+            .filter(|record| record.context == self.scroll_context())
+            .map_or((false, false), |record| {
+                (
+                    record.drawn.is_some()
+                        && record.landed.is_some()
+                        && record.landed == self.page_reveal,
+                    record.drawn.is_none() && record.keyboard.as_ref() != focus,
+                )
+            });
         let keyboard_stop = focus
-            .filter(|key| landing && first_screen && self.page_reveal.as_ref() != Some(*key))
+            .filter(|key| {
+                landing
+                    && self.page_reveal.as_ref() != Some(*key)
+                    && (opening
+                        || moved
+                        || (relanding && owed(key).is_some_and(|left| left.shows())))
+            })
             .and_then(|key| plan.stop_of(key));
+        if keyboard_stop.is_some() && !first_screen {
+            top = self.page_scroll.min(limit);
+            plan.seated = None;
+            plan.held_start = None;
+        }
+        yielded |= keyboard_stop.is_some();
         let reveal = match keyboard_stop {
             Some(index) => Some((index, Reveal::Keep, None)),
             None => revealing.and_then(|key| {
@@ -1840,7 +2135,31 @@ impl SettingsViewState {
             }
         } else if let Some(key) = focus
             && let Some(index) = plan.stop_of(key)
-            && (first_screen || last_whole(key) || cut_since(key, plan, index, top))
+            // its whole stop; after that, where nothing scrolled the list since
+            // the last screen, the screen shows the person no less of it than
+            // they were left with (R2, [`ScrollRecord::left`]): whole where
+            // the last screen showed it whole, listed or pinned around the
+            // list, and else no less than it showed — a status bar that came,
+            // a shorter window, a taller preview, a window that lists what the
+            // last pinned keep that control in view — a bar that takes the
+            // strip under the facts of the row it is on covers only those
+            // words and never moves the list. ONE THE LAST SCREEN DREW CUT
+            // STAYS SO UNTIL SOMETHING CUTS IT MORE, as the next frame draws
+            // the same screen (R1): kept in view wherever the last screen
+            // showed it at all, Home at 444x292 at 2× text under a short
+            // status, the wheel gone down the list and back, drew its Follow
+            // system switch cut 8pt by the room's edge, then whole 8pt higher
+            // on the next frame; kept only where it was whole, the refusal of
+            // the switch's write at 300x292, come after the wheel left it
+            // cut, covered it (#92). Kept so, the list still holds the place
+            // it was at ([`ScrollRecord::place`]), and a frame that needs no
+            // keeping draws that place again (R4) — but a wheel's place over a
+            // control a window then pinned, and another listed again, gives way
+            // to it: the person last saw it whole (the wheel gone down Themes
+            // at 444x180 past the filter, then 584x348, which pins it, then
+            // 444x180 again, shows the filter whole, the list moved from the
+            // wheel's place as far as that needs).
+            && (first_screen || owes(key, plan, top))
         {
             let reveal = if first_screen {
                 Reveal::Keep
@@ -1849,6 +2168,7 @@ impl SettingsViewState {
             };
             let span = plan.span_of(index, Some(key), reveal);
             if !plan.shows_span(index, top, span) {
+                let (place, seat) = (top, plan.seated);
                 let pressed = (reveal == Reveal::Pressed)
                     .then(|| plan.press_seat_span(index, top, span))
                     .flatten();
@@ -1860,8 +2180,52 @@ impl SettingsViewState {
                     };
                     plan.seated = plan.seat_span(index, top, span);
                 }
+                // NO FURTHER THAN R2 NEEDS (R4): where no screen this moves
+                // to shows the person what they were left with — the control
+                // taller than the room a bar leaves, or its stop — the list
+                // keeps its place. Moved for nothing, Themes at 444x180 at 2×
+                // text under a status, the wheel turned and the text made 1×
+                // and 2× again, left the wheel's place for a screen that
+                // showed Customize no more than it did; and a keep that cut
+                // Done as the place did, at 178x348 at 2× under a status,
+                // went back to the place on the next frame.
+                if !first_screen && owes(key, plan, top) {
+                    (top, plan.seated) = (place, seat);
+                }
             }
         }
+        // What this screen leaves the person of the keyboard's control: what
+        // it shows of it, but what the last screen left them where this one
+        // shows less with no event and no scroll since (a bar, a window, a
+        // text size that cannot show it so), so the frames after it owe them
+        // that still.
+        let left = focus.map(|key| {
+            let now = Left::on(plan, key, top);
+            let record = self.scroll_record.borrow();
+            record
+                .as_ref()
+                .filter(|record| record.drawn.is_some() && record.unscrolled(self))
+                .and_then(|record| record.left.clone())
+                .filter(|was| was.key == *key && !was.kept_by(&now))
+                .unwrap_or(now)
+        });
+        // A screen no reveal moved passes on the place it held, for the next
+        // to hold as the screen that put the list there put it.
+        let place = reveal
+            .is_none()
+            .then(|| {
+                let record = self.scroll_record.borrow();
+                record
+                    .as_ref()
+                    .filter(|record| record.unscrolled(self))
+                    .map(|record| {
+                        record
+                            .place
+                            .clone()
+                            .unwrap_or_else(|| Box::new((record.plan.clone(), record.top)))
+                    })
+            })
+            .flatten();
         let view = plan.screen(top).view;
         self.record_result_page_limit(limit);
         self.page_window.set(Some(plan.shown(top).len().max(1)));
@@ -1871,8 +2235,13 @@ impl SettingsViewState {
             top,
             drawn: Some(top),
             asked: self.page_scroll,
+            yielded,
+            opening,
+            left,
+            keyboard: focus.cloned(),
             landed,
             hold: true,
+            place,
         }));
         view
     }
@@ -1888,6 +2257,8 @@ impl SettingsViewState {
             return;
         };
         self.page_scroll = top;
+        // The screen the event came on is the list's place now.
+        record.place = None;
         let landed = record.landed.take();
         if matches!(self.reveal_as, Reveal::Land | Reveal::LandWhole)
             && landed.is_some()
@@ -1930,6 +2301,11 @@ impl SettingsViewState {
         }
     }
 
+    /// Where the screen that put the list where the last render held it
+    /// ([`ScrollRecord::place`]) holds the list on `plan`
+    /// `held`'s, the control the person is on, as that screen's stop and this
+    /// plan's, else that screen's top stop — at the height it was drawn at,
+    /// where the stops' own seat at `top` does not already; and a press's
     fn held_place(
         &self,
         plan: &ScrollPlan,
@@ -1938,20 +2314,20 @@ impl SettingsViewState {
     ) -> Option<(usize, Option<Seat>)> {
         let record = self.scroll_record.borrow();
         let record = record.as_ref()?;
-        let was = &record.plan;
+        let (was, at) = record.place();
         if !record.hold
             || !record.unscrolled(self)
-            || record.top < was.limit()
+            || at < was.limit()
             || plan.foot == ListFoot::Whole
             || plan.len() == 0
         {
             return None;
         }
-        if let Some(seat) = was.seated.filter(|seat| seat.top == record.top)
-            && top == record.top
+        if let Some(seat) = was.seated.filter(|seat| seat.top == at)
+            && top == at
             && top >= plan.limit()
         {
-            let (before, now) = (was.stop_screen(record.top), plan.stop_screen(top));
+            let (before, now) = (was.stop_screen(at), plan.stop_screen(top));
             if before.drawn.start == now.drawn.start {
                 if (before.offset - now.offset).abs() < 0.01 {
                     return None;
@@ -1963,7 +2339,7 @@ impl SettingsViewState {
                 return plan.seat_fits(seat).then_some((top, Some(seat)));
             }
         }
-        let drawn = was.screen(record.top);
+        let drawn = was.screen(at);
         if drawn.whole {
             return None;
         }
@@ -2007,11 +2383,14 @@ impl SettingsViewState {
         plan.seat_fits(seat).then_some((start, Some(seat)))
     }
 
-    /// THE LIST SCROLLED (a wheel, a key, a reader's scroll, a page opened at its top).
+    /// THE LIST SCROLLED (a wheel, a key, a reader's scroll, a page opened at its top): what the person
+    /// is left with of the keyboard's control is what that screen shows ([`ScrollRecord::left_of`]).
     pub(super) fn drop_list_nudge(&self) {
         if let Some(record) = self.scroll_record.borrow_mut().as_mut() {
             record.plan.seated = None;
             record.hold = false;
+            record.place = None;
+            record.left = None;
         }
     }
 
@@ -2061,6 +2440,12 @@ impl SettingsViewState {
                     record.plan.seated = nudge.map(|nudge| Seat::nudged(top, nudge));
                     record.top = top;
                     record.drawn = None;
+                    // The person turned the list: what they are left with of
+                    // the keyboard's control is what the turned screen shows
+                    // ([`ScrollRecord::left_of`]), not what the one before it
+                    // left them — kept so, Home at 444x292 turned back from
+                    // the Font family row's screen went back to that row.
+                    record.left = None;
                     (top, record.plan.limit())
                 })
         };
@@ -2247,28 +2632,35 @@ impl SettingsViewState {
         }
     }
 
-    /// A STATUS NEVER COVERS WHAT THE PERSON IS ON (#92).
+    /// A STATUS NEVER COVERS WHAT THE PERSON IS ON (#92): the bar shortens for the control the person
+    /// changed, the one a landing waits to show, or the keyboard's, as its stop's screen seats it
+    /// ([`ListFoot::Whole`]).
     pub(super) fn note_status_room(&self, plan: &ScrollPlan, room: f32) {
-        let given = plan.given;
+        // Under a reload warning the bar takes nothing from the screens, the
+        // page laid out under it, and gives back as much as it can shorten
+        // ([`SettingsViewState::status_slack`]).
+        let slack = self.status_slack.get();
+        let (given, room) = (plan.given + slack, room + slack);
         if given <= 0.01 || self.measuring_calm.get() {
             return;
         }
-        let Some(key) = self
-            .page_reveal
-            .as_ref()
-            .or(self.common.last_focus.as_ref())
-        else {
-            return;
-        };
-        let Some(index) = plan.stop_holding(key).or_else(|| plan.stop_of(key)) else {
-            return;
-        };
-        let (top, bottom) = plan.span_of(index, Some(key), Reveal::Pressed);
-        let need = bottom - top;
-        let overrun = given - (room - need);
-        if need <= room + 0.01 && overrun > 0.01 {
-            self.status_overrun
-                .set(self.status_overrun.get().max(overrun));
+        for key in [self.page_reveal.as_ref(), self.common.last_focus.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let Some(index) = plan.stop_holding(key).or_else(|| plan.stop_of(key)) else {
+                continue;
+            };
+            let (top, bottom) = plan.span_of(index, Some(key), Reveal::Pressed);
+            let seated = (plan.foot == ListFoot::Whole)
+                .then(|| plan.stop_top(index.min(plan.limit()), index) + bottom)
+                .filter(|need| *need <= room + 0.01);
+            let need = seated.unwrap_or(bottom - top);
+            let overrun = given - (room - need);
+            if need <= room + 0.01 && overrun > 0.01 {
+                self.status_overrun
+                    .set(self.status_overrun.get().max(overrun));
+            }
         }
     }
 

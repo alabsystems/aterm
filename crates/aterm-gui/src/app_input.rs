@@ -97,6 +97,24 @@ pub(crate) fn pin_input_clock(now: Option<std::time::Instant>) {
     INPUT_CLOCK.with(|clock| clock.set(now));
 }
 
+/// Where a predict test's timeline starts: ten seconds back, past the longest
+/// glitch window. A wall-clock read left on a render path's reconcile or paint
+/// then ages every guess past its window and fails the tests on that path on
+/// their first run; a press stamp read off the wall clock is caught only by
+/// the privacy rig (`app_input_predict_privacy_tests`), whose echoes then
+/// arrive before their presses, so its slow-link control measures no slow link.
+#[cfg(test)]
+pub(crate) fn past_timeline_start() -> std::time::Instant {
+    const BACK_MS: u64 = 10_000;
+    const _: () = assert!(
+        BACK_MS > aterm_predict::compute_glitch_window_ms(Some(u32::MAX), u8::MAX),
+        "the timeline starts further back than any glitch window"
+    );
+    std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(BACK_MS))
+        .expect("the monotonic clock is more than ten seconds old")
+}
+
 /// How long after a keystroke the present-pacing bypass (`WindowState::input_hot`) stays armed.
 pub(crate) const INPUT_HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 

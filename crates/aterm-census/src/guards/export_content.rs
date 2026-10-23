@@ -28,9 +28,14 @@ const ALLOW_TAG: &str = "gitleaks:allow";
 /// The first line of the header of the baseline's credential section.
 const CREDENTIALS: &str = "# Credentials";
 
+/// The work one whole-file search for the rows without anchors may spend;
 /// exhausting it only sends the file to the per-line search.
 const FILE_STEPS: u64 = 1 << 32;
 
+/// The baseline's credential patterns, as the engine reads them: a section is a
+/// header (a run of comment lines after a blank line, a pattern or the top of the
+/// file) plus the patterns after it, up to a blank line; the credential section's
+/// header starts `# Credentials` (alone, or with a `.`); a pattern that is also
 /// in another section is not one.
 fn credentials(baseline: &str) -> BTreeSet<&str> {
     let (mut credentials, mut others) = (BTreeSet::new(), Vec::new());
@@ -98,6 +103,10 @@ fn class_end(chars: &[char], open: usize) -> Option<usize> {
     None
 }
 
+/// The literals every match of `pattern` holds: per top-level alternative, its
+/// longest run of two or more characters a match holds side by side (`[Xx]` a
+/// letter of either case, which folds the whole run). `None` when an alternative
+/// has none, or the pattern sets a flag or spells a code point in hex, so the row
 /// is read whole.
 fn anchors(pattern: &str) -> Option<Vec<(String, bool)>> {
     let chars: Vec<char> = pattern.chars().collect();
@@ -202,6 +211,7 @@ fn anchors(pattern: &str) -> Option<Vec<(String, bool)>> {
 /// An anchor: its bytes, whether it matches in either case, and its row.
 type Anchor = (Vec<u8>, bool, usize);
 
+/// Every row's anchors, found together: a map from an anchor's first two bytes
 /// (ASCII-folded) to the anchors that start so.
 struct Anchors {
     by_lead: HashMap<[u8; 2], Vec<Anchor>>,
@@ -209,7 +219,7 @@ struct Anchors {
 }
 
 impl Anchors {
-    fn key(a: u8, b: u8) -> [u8; 2] {
+    const fn key(a: u8, b: u8) -> [u8; 2] {
         [a.to_ascii_lowercase(), b.to_ascii_lowercase()]
     }
 
@@ -329,6 +339,7 @@ fn finding(path: &str, line: usize, detail: String) -> Finding {
     }
 }
 
+/// The rule over `tree`, with the engine's baseline as this host reads it (`Err`
 /// when it has none, which holds the text to the export's own rows).
 fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mut Vec<Finding>) {
     let read = |rel: &str| match std::fs::read_to_string(tree.root.join(rel)) {
@@ -412,6 +423,9 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
     out.extend(found.into_iter().flatten());
 }
 
+/// One exported file: its path, then each line of its rewritten text, held to
+/// the rows. A file holding a NUL the transforms leave as it is, and the
+/// engine's grep reads its bytes (`-a`): a match there is a binary hit, at no
 /// line and cleared by no tag, so it is one finding per row at line 0.
 fn judge(tree: &Tree<'_>, rel: &str, held: &Held<'_>, out: &mut Vec<Finding>) {
     for (k, _) in held.candidates(rel.as_bytes()) {

@@ -98,7 +98,8 @@ mod imp {
 
     use super::{Kind, WatchId};
 
-    /// The `EVFILT_USER` identifier [`Watcher::wake`] triggers.
+    /// The `EVFILT_USER` identifier [`Watcher::wake`] triggers. User events
+    /// have their own identifier space, apart from descriptors.
     const BELL: libc::uintptr_t = 0;
 
     /// How many events one `kevent` call collects.
@@ -569,7 +570,10 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// No wait: whatever the kernel queued, now.
+    /// No wait: whatever the kernel queued, now. Every edge these tests make
+    /// is queued by the syscall that makes it, so a zero-timeout wait after
+    /// that syscall returns sees it, and one that sees nothing proves nothing
+    /// was queued.
     const NOW: Option<Duration> = Some(Duration::ZERO);
 
     /// An entry renamed into one watched directory names that directory's

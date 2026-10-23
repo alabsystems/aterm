@@ -522,7 +522,11 @@ fn a_gate_closed_mid_line_blocks_the_confirmation_of_an_admitted_fire() {
     assert!(!app.windows[&wid].fx.companion().brain().trick_engaged());
 }
 
-/// An erased line forgets its fire.
+/// An erased line forgets its fire. `kitty sit␣` withheld (an ignored word,
+/// addressed, so no tentative fire to revoke), then ten Backspaces (the
+/// listener reports the line empty), then `kitty⏎`: a pet-only line the cat
+/// forgives, because the remembered fire was on text that no longer
+/// exists.
 #[test]
 fn an_erased_line_forgets_its_withheld_fire() {
     let (mut app, wid, session) = pet_app();
@@ -563,7 +567,9 @@ fn an_erased_line_forgets_its_withheld_fire() {
     );
 }
 
-/// `ignore_words` reads a fire's word and its command.
+/// `ignore_words` reads a fire's word and its command. A name glued to its
+/// command fires the whole run, so listing `坐下` holds back `坐下`,
+/// `猫咪坐下` and `坐下猫咪` alike, and listing the run holds back the run.
 #[test]
 fn ignore_words_holds_back_a_glued_run_by_its_command_never_by_its_name() {
     let t0 = Instant::now();
@@ -599,7 +605,9 @@ fn ignore_words_holds_back_a_glued_run_by_its_command_never_by_its_name() {
     }
 }
 
-/// The memory of a fire is keyed to its session.
+/// The memory of a fire is keyed to its session. `sit␣` withheld on tab A,
+/// then `kitty⏎` on tab B's first, pure line: B's pet-only submit is
+/// forgiven.
 #[test]
 fn a_fire_remembered_on_one_tab_says_nothing_about_another_tabs_line() {
     let (mut app, wid, session_a) = pet_app();
@@ -925,7 +933,10 @@ fn a_word_kill_clears_the_token_and_forward_kills_are_no_ops() {
     assert_eq!(pending(&app, wid), Some(Trick::Sit));
 }
 
-/// ⌃Z and ⌃\ reset only a line the listener can prove is empty.
+/// ⌃Z and ⌃\ reset only a line the listener can prove is empty. At a prompt
+/// shells ignore them and keep the half-typed line, so `sot` ⌃Z `sit␣` is
+/// `sotsit ` and must not fire (the line is poisoned until ⌃C), and a
+/// tentative fire they interrupt is taken back.
 #[test]
 fn a_job_chord_resets_only_a_provably_empty_line_and_breaks_any_other() {
     let t0 = Instant::now();

@@ -497,7 +497,14 @@ fn awk_programs_and_sed_scripts_are_read_not_dropped() {
     );
 }
 
-/// AN AWK PROGRAM RUNS OR WRITES IN EVERY SPELLING AWK READS.
+/// AN AWK PROGRAM RUNS OR WRITES IN EVERY SPELLING AWK READS. MEASURED
+/// 2026-10-22 on macOS awk 20200816 in a scratch directory, each of the first
+/// ten ran a command or made a file the classifier called a read: `system`
+/// with a blank before its `(`, a bare `system` (it runs `$0`), a `print` or
+/// `printf` redirect to a field or a number (`>` in a print statement is a
+/// redirect whatever follows), one continued over a `,` newline, one after a
+/// `#` comment that held a `"`, one after a regex that held a `"`, and a pipe
+/// after a pattern regex on a new line.
 #[test]
 fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
     for cmd in [

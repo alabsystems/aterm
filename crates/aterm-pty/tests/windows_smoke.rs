@@ -9,7 +9,9 @@ use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// Hard per-test wall-clock budget.
+/// Hard per-test wall-clock budget. GENEROUS on purpose: the slowest body
+/// (interactive cmd.exe + `ping -n 2` ≈ seconds) finishes in well under a
+/// minute on a loaded machine, so a trip here is a real wedge, never flake.
 const DEADLINE: Duration = Duration::from_secs(120);
 
 /// Run `body` on a named thread and fail HARD if it outlives [`DEADLINE`].

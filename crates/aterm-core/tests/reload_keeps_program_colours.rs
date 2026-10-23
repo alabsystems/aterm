@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A config reload moves the colour BASELINE, never a running program's
-//! colours: a base16 palette (OSC 4), an editor's background (OSC 11) or a
-//! TUI's cursor (OSC 12) survive saving aterm.toml, a theme-folder edit or an
-//! OS appearance flip, while every slot the program never touched follows the
-//! new theme. The kitty colour stack (OSC 30001/30101) keeps diffs too, so a
-//! pop after a theme switch lands on the new theme.
-//!
-//! Negative controls: the resets (OSC 104/110/111/112, RIS) land on the NEW
-//! theme, closing the palette gate puts the theme palette back (and keeps the
-//! ungated colours), and a pop under a closed palette gate leaves the palette
-//! alone.
+//! Config reload preserves program-set OSC palette, background, and cursor colours.
 
 use aterm_core::config::{ConfigChange, TerminalConfig};
 use aterm_core::terminal::{ColorPalette, Rgb, Terminal};
@@ -20,16 +10,14 @@ const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
     Rgb { r, g, b }
 }
 
-/// What the program sets: palette 4, the background and the cursor.
+/// What the program sets.
 const PROGRAM_P4: Rgb = rgb(0x28, 0x2a, 0x36);
 const PROGRAM_BG: Rgb = rgb(0x10, 0x11, 0x12);
 const PROGRAM_CURSOR: Rgb = rgb(0xfe, 0x01, 0x80);
 const PROGRAM_SETS: &[u8] =
     b"\x1b]4;4;rgb:28/2a/36\x07\x1b]11;rgb:10/11/12\x07\x1b]12;rgb:fe/01/80\x07";
 
-/// A host theme whose every colour is derived from `seed`, so two seeds give
-/// two themes that differ in every slot. The palette gate is open, as the
-/// base16-shell workflow needs.
+/// A host theme whose every colour is derived from `seed`.
 fn theme(seed: u8) -> TerminalConfig {
     let mut palette = ColorPalette::new();
     for index in 0..16u8 {
@@ -116,7 +104,6 @@ fn resets_after_a_theme_switch_land_on_the_new_theme() {
     assert_eq!(t.palette_color(4), new_palette.get(4), "OSC 104;4");
     assert_eq!(t.cursor_color(), new.cursor_color, "OSC 112");
 
-    // RIS too, from a fresh set of program colours.
     t.process(PROGRAM_SETS);
     t.process(b"\x1bc");
     assert_eq!(t.default_background(), new.default_background, "RIS bg");
@@ -126,7 +113,6 @@ fn resets_after_a_theme_switch_land_on_the_new_theme() {
 
 #[test]
 fn a_colour_stack_pop_after_a_theme_switch_lands_on_the_new_theme() {
-    // The TUI pushes the shell's colours, sets its own, and pops on exit.
     let mut t = Terminal::new(8, 40);
     t.apply_config(&theme(OLD));
     t.process(b"\x1b]11;rgb:10/11/12\x07"); // the shell's own background
@@ -181,8 +167,6 @@ fn closing_the_palette_gate_puts_the_theme_palette_back() {
         "nothing of the program's palette is left to replay"
     );
 
-    // Control: a reload that keeps the gate open (an unrelated key moved)
-    // keeps the program's palette.
     let mut open = running_program();
     open.apply_config(&TerminalConfig {
         faint_opacity: 0.4,
@@ -216,7 +200,6 @@ fn a_pop_under_a_closed_palette_gate_leaves_the_palette_alone() {
         "a pop is a palette write, and the gate refuses it"
     );
 
-    // Control: the same sequence with the gate open restores the pushed entry.
     let mut open = Terminal::new(8, 40);
     open.apply_config(&theme(OLD));
     open.process(b"\x1b]4;4;rgb:28/2a/36\x07\x1b]30001\x07\x1b]4;4;rgb:01/01/01\x07");
@@ -246,8 +229,6 @@ fn a_colour_stack_carried_across_a_handoff_pops_onto_the_successor_theme() {
         "the pop lands on the successor's theme"
     );
 
-    // A parent that predates diffs sent whole entries: they are read as
-    // diffs from the successor's baseline.
     let mut legacy = cp.clone();
     legacy.color.stack_overrides.clear();
     legacy.color.stack = vec![aterm_core::terminal::ColorStackEntryRepr {
@@ -261,7 +242,6 @@ fn a_colour_stack_carried_across_a_handoff_pops_onto_the_successor_theme() {
     let mut from_legacy = Terminal::new(8, 40);
     from_legacy.apply_config(&theme(NEW));
     from_legacy.restore_checkpoint(&legacy);
-    // A diff follows a later theme switch; a whole entry would not.
     from_legacy.apply_config(&theme(OLD));
     from_legacy.process(b"\x1b]30101\x07");
     assert_eq!(from_legacy.default_background(), PROGRAM_BG);

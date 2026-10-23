@@ -205,7 +205,7 @@ impl Origin {
 
     /// `http` or `https`.
     #[must_use]
-    pub fn scheme(&self) -> &'static str {
+    pub const fn scheme(&self) -> &'static str {
         self.scheme
     }
 
@@ -217,7 +217,7 @@ impl Origin {
 
     /// The port, the scheme's default filled in.
     #[must_use]
-    pub fn port(&self) -> u16 {
+    pub const fn port(&self) -> u16 {
         self.port
     }
 
@@ -329,19 +329,19 @@ impl Endpoints {
 
     /// The REST origin, and one of the two a credential may go to.
     #[must_use]
-    pub fn api(&self) -> &Origin {
+    pub const fn api(&self) -> &Origin {
         &self.api
     }
 
     /// The release-asset upload origin, the other one.
     #[must_use]
-    pub fn uploads(&self) -> &Origin {
+    pub const fn uploads(&self) -> &Origin {
         &self.uploads
     }
 
     /// The web origin: anonymous only.
     #[must_use]
-    pub fn web(&self) -> &Origin {
+    pub const fn web(&self) -> &Origin {
         &self.web
     }
 
@@ -420,7 +420,7 @@ impl Deadlines {
 
     /// The same deadlines with another backstop.
     #[must_use]
-    pub fn with_backstop(self, backstop: Duration) -> Deadlines {
+    pub const fn with_backstop(self, backstop: Duration) -> Deadlines {
         Deadlines { backstop, ..self }
     }
 }

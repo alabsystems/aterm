@@ -169,7 +169,9 @@ fn run_as(mut command: Command, role: &str, test: &str) -> String {
     stdout
 }
 
-/// The report `who` printed, out of a role's stdout.
+/// The report `who` printed, out of a role's stdout. Searched for, not matched
+/// at a line's start: libtest has already printed `test <name> ... ` on the line
+/// the role's report lands on.
 fn facts_of(stdout: &str, who: &str) -> Facts {
     let mark = format!("{REPORT} {who} ");
     let line = stdout

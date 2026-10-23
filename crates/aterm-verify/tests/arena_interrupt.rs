@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An interrupted arena run retires what it launched. A real `verify perf
-//! start` runs against a stand-in aterm (a shell script that reports itself,
-//! then sleeps under its own pid; it opens no window), is signalled once the
-//! stand-in is up, and must leave neither the stand-in nor a scratch
-//! directory behind. The stand-in leads its own process group, so nothing but
-//! the runner's interrupt guard can stop it.
+//! Interrupted arena run cleanup tests.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -17,7 +12,7 @@ use std::time::Duration;
 use aterm_uds::process::pid_alive;
 use aterm_uds::spawnfd::{Stdio, command};
 
-/// A wait for something that must happen: a hang detector, never a budget.
+/// A wait for something that must happen.
 const HANG: Duration = Duration::from_secs(60);
 
 /// SIGKILLs whatever is still listed when a failed assertion unwinds.
@@ -40,9 +35,7 @@ enum Event {
     Exited(std::io::Result<ExitStatus>),
 }
 
-/// The stand-in: `--version` names aterm (the lane refuses anything else); a
-/// launch writes its pid, its HOME and its `--control-sock` into `fifo`, then
-/// becomes `/bin/sleep` under the same pid.
+/// The stand-in: `--version` names aterm (the lane refuses anything else).
 fn stand_in(dir: &Path, fifo: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let made = command("mkfifo").arg(fifo).status().expect("mkfifo");
@@ -63,14 +56,10 @@ fn stand_in(dir: &Path, fifo: &Path) -> PathBuf {
     stub
 }
 
-/// `cmd` with `signo` at its default disposition in the child alone. A
-/// signal ignored at exec stays ignored, and a non-interactive shell's `&` job
-/// or `nohup` hands this process SIGINT or SIGHUP ignored; the runner rightly
-/// honours that, so its child must start with the default.
+/// `cmd` with `signo` at its default disposition in the child alone.
 fn with_default(cmd: &mut std::process::Command, signo: i32) -> &mut std::process::Command {
     use std::os::unix::process::CommandExt as _;
-    // SAFETY: the hook runs between fork and exec and calls only `sigaction`,
-    // which is async-signal-safe; the struct it reads is on the child's stack.
+    // SAFETY: runs between fork and exec, calling only async-signal-safe `sigaction`.
     unsafe {
         cmd.pre_exec(move || {
             let mut dfl: libc::sigaction = std::mem::zeroed();
@@ -122,7 +111,6 @@ fn interrupted_by(signal: &str, signo: i32) {
     });
     let reader = fifo.clone();
     std::thread::spawn(move || {
-        // Opening a FIFO for reading blocks until the stand-in opens it.
         let _ = tx.send(Event::Ready(std::fs::read_to_string(&reader)));
     });
 
@@ -169,7 +157,6 @@ fn interrupted_by(signal: &str, signo: i32) {
         Ok(Event::Ready(_)) => panic!("a second report"),
         Err(_) => panic!("aterm-verify outlived {signal} by {HANG:?}:\n{}", why()),
     }
-    // The runner reaped the stand-in before it exited, so its pid is free.
     assert!(
         !pid_alive(stand_in_pid),
         "{signal}: the stand-in {stand_in_pid} outlived the run"

@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Counted capacities, each given back by the permit's drop.
-//!
-//! [`Slots`] counts holders against one cap. [`UnitBudget`] counts them two
-//! ways at once, the permits live and the units they charge together, and lets
-//! a permit's charge change while it lives. A budget is built with its caps and
-//! shared through an `Arc` that every permit holds, so a permit gives its slot
-//! back to the budget it came from on whatever thread drops it, and a test
-//! builds a budget of its own rather than competing for the process's.
+//! Reference-counted permit capacities ([`Slots`] and [`UnitBudget`]) released on drop.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -42,8 +35,7 @@ impl Slots {
         Some(Slot(Arc::clone(self)))
     }
 
-    /// One slot counted whatever the cap: a holder something else already
-    /// bounds, which the count still has to see.
+    /// Acquires a counted slot regardless of the cap.
     pub(crate) fn take_uncapped(self: &Arc<Self>) -> Slot {
         self.used.fetch_add(1, Ordering::AcqRel);
         Slot(Arc::clone(self))
@@ -63,8 +55,7 @@ impl Drop for Slot {
     }
 }
 
-/// What a [`UnitBudget`] did, told to its observer after the change and
-/// outside its lock.
+/// Event reported to a [`UnitBudget`] observer outside its lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BudgetEvent {
     Acquire,
@@ -91,8 +82,7 @@ pub(crate) struct UnitBudget {
     observe: fn(BudgetEvent),
 }
 
-/// One permit of a [`UnitBudget`] and the units it charges now, both given
-/// back on drop.
+/// Permit of a [`UnitBudget`] and its current unit charge, both released on drop.
 #[derive(Debug)]
 pub(crate) struct UnitPermit {
     budget: Arc<UnitBudget>,
@@ -109,9 +99,7 @@ impl UnitBudget {
         }
     }
 
-    /// A permit charging `units`, admitted only while both caps hold after
-    /// it; a refusal leaves the budget untouched. A charge of zero is refused:
-    /// every permit owns at least one unit.
+    /// Acquires a permit charging `units` (`> 0`) if both caps hold after the charge.
     pub(crate) fn try_take(self: &Arc<Self>, units: usize) -> Option<UnitPermit> {
         let mut usage = self.usage.lock().unwrap_or_else(PoisonError::into_inner);
         let admitted = usage.live < self.live
@@ -142,8 +130,7 @@ impl UnitBudget {
 }
 
 impl UnitPermit {
-    /// Replace this permit's charge with `units`, atomically. On refusal the
-    /// old charge stays, so the drop still gives back exactly what is held.
+    /// Atomically replaces this permit's charge with `units`, keeping the old charge on refusal.
     pub(crate) fn reconcile(&mut self, units: usize) -> bool {
         let budget = &self.budget;
         if units == 0 || units > budget.units {

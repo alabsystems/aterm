@@ -147,7 +147,8 @@ impl KeyframePolicy {
         }
     }
 
-    /// A forced or deferred keyframe, which no rate applies to.
+    /// A forced or deferred keyframe, which no rate applies to. A pending clear comes
+    /// first, so the keyframe its settle follows is never reported as another reason.
     #[inline]
     const fn owed(&self) -> Option<Reason> {
         if self.clear_pending {

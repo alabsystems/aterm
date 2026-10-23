@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Retries (design §7.4): what may be retried, and how often. This module reads no clock and
-//! never sleeps: the pause it answers is slept through `Fx::sleep` by the client.
+//! Request retry policy and delay calculation.
 
 use std::time::Duration;
 
@@ -47,14 +46,7 @@ impl RetryPolicy {
     };
 }
 
-/// The pause before attempt `attempt + 1` (`attempt` counts from 1), or `None` to stop:
-/// 1. `attempt >= policy.attempts` → None;
-/// 2. OneShot → None;
-/// 3. `Sub::Secondary`: when `!secondary_retried` and `retry_after` (absent counts as 60) is at
-///    most `max_secondary_wait`, that many seconds; else None;
-/// 4. `Sub::Primary` or `Sub::PreRefused` → None;
-/// 5. Server, or CouldNotRun with `Sub::Wire(_)` → `pauses[min(attempt - 1, 1)]`;
-/// 6. anything else → None.
+/// Returns the pause before attempt `attempt + 1` (`attempt` counts from 1), or `None` to stop.
 #[inline]
 #[must_use]
 pub fn should_retry(

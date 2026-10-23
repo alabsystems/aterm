@@ -34,7 +34,7 @@ pub enum How {
 impl How {
     /// Its word.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             How::Review => "review",
             How::Login => "login",
@@ -62,7 +62,7 @@ pub enum Ended {
 impl Ended {
     /// Its word.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Ended::ReviewAuth => "review-auth",
             Ended::StatusSignedOut => "status-signed-out",
@@ -79,7 +79,7 @@ impl Ended {
 
     /// In a person's words.
     #[must_use]
-    pub fn says(self) -> &'static str {
+    pub const fn says(self) -> &'static str {
         match self {
             Ended::ReviewAuth => "a review could not authenticate",
             Ended::StatusSignedOut => "its status says nobody is signed in",

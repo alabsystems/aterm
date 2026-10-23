@@ -41,11 +41,11 @@ pub(crate) struct Span {
     pub(crate) quotes: Option<(usize, usize)>,
 }
 
-fn is_ident_start(b: u8) -> bool {
+const fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
-fn is_ident(b: u8) -> bool {
+const fn is_ident(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
@@ -113,7 +113,7 @@ struct Lit {
 }
 
 /// A `"…"` string whose opening quote is at `q`, honouring `\` escapes.
-fn cooked_string(b: &[u8], q: usize) -> Option<Lit> {
+const fn cooked_string(b: &[u8], q: usize) -> Option<Lit> {
     let mut j = q + 1;
     while j < b.len() {
         match b[j] {
@@ -160,7 +160,7 @@ fn raw_string(b: &[u8], at: usize) -> Option<Lit> {
 }
 
 /// The byte length of the UTF-8 sequence a lead byte starts.
-fn utf8_len(lead: u8) -> usize {
+const fn utf8_len(lead: u8) -> usize {
     match lead {
         0xF0..=0xFF => 4,
         0xE0..=0xEF => 3,

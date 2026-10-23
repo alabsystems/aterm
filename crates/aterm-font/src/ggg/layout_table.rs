@@ -5,7 +5,6 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-// Suppresses `minor_version` variable warning.
 #![allow(unused_variables)]
 
 use super::FeatureVariations;
@@ -14,7 +13,8 @@ use crate::Tag;
 use crate::parser::Offset32;
 use crate::parser::{FromData, LazyArray16, Offset, Offset16, Stream};
 
-/// A [Layout Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#table-organization).
+/// A [Layout
+/// Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#table-organization).
 #[derive(Clone, Copy, Debug)]
 pub struct LayoutTable<'a> {
     /// A list of all supported scripts.
@@ -23,8 +23,8 @@ pub struct LayoutTable<'a> {
     pub features: FeatureList<'a>,
     /// A list of all lookups.
     pub lookups: LookupList<'a>,
-    /// Used to substitute an alternate set of lookup tables
-    /// to use for any given feature under specified conditions.
+    /// Used to substitute an alternate set of lookup tables to use for any given feature under
+    /// specified conditions.
     pub variations: Option<FeatureVariations<'a>>,
 }
 
@@ -75,8 +75,6 @@ pub type LookupIndex = u16;
 pub type VariationIndex = u32;
 
 /// A trait to parse item in [`RecordList`].
-///
-/// Internal use only.
 pub trait RecordListItem<'a>: Sized {
     /// Parses raw data.
     fn parse(tag: Tag, data: &'a [u8]) -> Option<Self>;
@@ -124,9 +122,7 @@ impl<'a, T: RecordListItem<'a>> RecordList<'a, T> {
             .and_then(|data| T::parse(record.tag, data))
     }
 
-    /// Returns the tag of the record at `index`, without parsing the value
-    /// (the autohinter's script and feature selection reads tags alone, as
-    /// read-fonts does).
+    /// Returns the tag of the record at `index`, without parsing the value.
     #[cfg(any(feature = "hint", debug_assertions))]
     #[inline]
     pub(crate) fn tag(&self, index: u16) -> Option<Tag> {
@@ -214,14 +210,15 @@ impl FromData for TagRecord {
     }
 }
 
-/// A [Script Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#script-table-and-language-system-record).
+/// A [Script
+/// Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#script-table-and-language-system-record).
 #[derive(Clone, Copy, Debug)]
 pub struct Script<'a> {
     /// Script tag.
     pub tag: Tag,
     /// Default language.
     pub default_language: Option<LanguageSystem<'a>>,
-    /// List of supported languages, excluding the default one. Listed alphabetically.
+    /// List of supported languages, excluding the default one.
     pub languages: LanguageSystemList<'a>,
 }
 
@@ -234,7 +231,6 @@ impl<'a> RecordListItem<'a> for Script<'a> {
                 LanguageSystem::parse(Tag::from_bytes(b"dflt"), data.get(offset.to_usize()..)?);
         }
         let mut languages = RecordList::parse(s.tail()?)?;
-        // Offsets are relative to this table.
         languages.data = data;
         Some(Self {
             tag,
@@ -244,7 +240,8 @@ impl<'a> RecordListItem<'a> for Script<'a> {
     }
 }
 
-/// A [Language System Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#language-system-table).
+/// A [Language System
+/// Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#language-system-table).
 #[derive(Clone, Copy, Debug)]
 pub struct LanguageSystem<'a> {
     /// Language tag.
@@ -258,7 +255,7 @@ pub struct LanguageSystem<'a> {
 impl<'a> RecordListItem<'a> for LanguageSystem<'a> {
     fn parse(tag: Tag, data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
-        let _lookup_order = s.read::<Offset16>()?; // Unsupported.
+        let _lookup_order = s.read::<Offset16>()?;
         let required_feature = match s.read::<FeatureIndex>()? {
             0xFFFF => None,
             v => Some(v),
@@ -284,7 +281,7 @@ pub struct Feature<'a> {
 impl<'a> RecordListItem<'a> for Feature<'a> {
     fn parse(tag: Tag, data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
-        let _params_offset = s.read::<Offset16>()?; // Unsupported.
+        let _params_offset = s.read::<Offset16>()?;
         let count = s.read::<u16>()?;
         let lookup_indices = s.read_array16(count)?;
         Some(Self {

@@ -303,7 +303,9 @@ fn frame_of(
     rend.render_input(&i).pixels
 }
 
-/// EACH SLOT SITS WHERE THE GPU DRAWS IT.
+/// EACH SLOT SITS WHERE THE GPU DRAWS IT. An opaque fx rect is a store, so
+/// whatever a stream drew BEFORE it in the rect vanishes and whatever it
+/// draws AFTER shows.
 #[test]
 fn each_slot_sits_where_the_gpu_draws_it() {
     let mut rend = renderer();

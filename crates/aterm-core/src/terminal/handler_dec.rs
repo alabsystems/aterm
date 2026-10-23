@@ -338,7 +338,11 @@ impl TerminalHandler<'_> {
         self.send_held_size_report();
     }
 
-    /// Point `grid`'s BCE template at the current pen's background.
+    /// Point `grid`'s BCE template at the current pen's background. A buffer
+    /// switch that keeps the pen (`?47`/`?1047`, either way) must do this for
+    /// the grid it swaps in: xterm fills every blank from the one current
+    /// colour pair (screen.c `ClearCells`, `ScrnClearLines`), whichever buffer
+    /// is up.
     #[inline]
     const fn sync_bce_template(style: &mut CurrentStyle, grid: &mut Grid) {
         style.update_cached_colors();
@@ -357,7 +361,8 @@ impl TerminalHandler<'_> {
         self.transient.render_debt = crate::terminal::RenderDebt::default();
     }
 
-    /// Copy the scroll region and horizontal margins from one grid to another.
+    /// Copy the scroll region and horizontal margins from one grid to another. In xterm they
+    /// are fields of the shared `TScreen`, so switching buffers (47/1047/1049) keeps them.
     #[inline]
     const fn copy_margins(from: &Grid, to: &mut Grid) {
         let region = from.scroll_region();
@@ -817,7 +822,8 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Restore cursor position, style and modes from a snapshot (if any).
+    /// Restore cursor position, style and modes from a snapshot (if any). With origin mode
+    /// restored on, the cursor is clamped as DECRC clamps it.
     fn restore_cursor_snapshot(&mut self, state: Option<SavedCursorState>) {
         let Some(state) = state else {
             self.modes.origin_mode = false;
@@ -1112,7 +1118,9 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Split a DECRARA `Pm` list into (single-bit flags to XOR, reverse-underline).
+    /// Split a DECRARA `Pm` list into (single-bit flags to XOR, reverse-underline). Underline
+    /// is not one bit (the underline flags combine to spell dotted and dashed), so the grid
+    /// decides it per cell (`reverse_cell_attrs`).
     fn sgr_params_to_reverse_flags(sgr_params: &[u16]) -> (CellFlags, bool) {
         let mut toggle = CellFlags::empty();
         let mut toggle_underline = false;

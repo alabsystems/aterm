@@ -30,7 +30,9 @@ const fn output_cost(len: usize) -> usize {
     EVENT_SLOT_BYTES + 2 * std::mem::size_of::<usize>() + len
 }
 
-/// Events per sealed chunk of a recording's event list ([`EventLog`]).
+/// Events per sealed chunk of a recording's event list ([`EventLog`]). A snapshot
+/// takes one refcount per sealed chunk and clones fewer than two chunks of open
+/// events: with [`MAX_RETAINED_EVENTS`], at most 256 refcounts and 511 clones.
 const CHUNK_EVENTS: usize = 256;
 
 /// One recorded asciicast v2 event: program output (`"o"`) or a resize (`"r"`).
@@ -145,7 +147,8 @@ pub(crate) struct CastWatermark {
 }
 
 impl CastWatermark {
-    /// Count one reader hold and return its count.
+    /// Count one reader hold and return its count. The caller holds the engine's lock,
+    /// which orders this against a [`CastCut::take`], so `Relaxed` suffices.
     fn note(&self) -> u64 {
         self.holds.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -244,7 +247,10 @@ const RELEASED: Event = Event::Resize {
     key: None,
 };
 
-/// A recording's events, oldest first, kept so a snapshot shares most of them.
+/// A recording's events, oldest first, kept so a snapshot shares most of them. The
+/// older ones sit in sealed chunks of [`CHUNK_EVENTS`], immutable once sealed, which a
+/// snapshot takes by refcount; the newest sit in an open deque, where engine-order
+/// insertion lands, which a snapshot clones.
 #[derive(Default)]
 struct EventLog {
     /// Sealed chunks, oldest first.
@@ -416,6 +422,7 @@ impl SharedEvents {
 /// Accumulates PTY output bursts and terminal resizes as asciicast v2 events.
 pub(crate) struct CastRecorder {
     /// asciicast v2 header width (cols): the geometry in force at the first retained
+    /// event, so a replay of the survivors starts at the size they were drawn at.
     width: u16,
     /// asciicast v2 header height (rows), kept with [`width`](Self::width).
     height: u16,
@@ -431,7 +438,10 @@ pub(crate) struct CastRecorder {
     evicted: u64,
     /// The last emitted timestamp; an unstamped event's `t` is clamped up to it.
     last_t: Duration,
-    /// Monotonic epoch of this recorder's timeline, captured at construction.
+    /// Monotonic epoch of this recorder's timeline, captured at construction. Reader
+    /// bursts are stamped against it ([`epoch`](Self::epoch)) and resize instants are
+    /// converted onto it ([`record_resize_stamped`](Self::record_resize_stamped)), so
+    /// both taps share one timeline per session.
     epoch: Instant,
     /// Trailing incomplete UTF-8 lead bytes (at most 3) carried from the previous burst
     /// and prepended to the next, so a character split across reads is reassembled
@@ -439,7 +449,8 @@ pub(crate) struct CastRecorder {
     pending: Vec<u8>,
     /// Shared with the session's readers and `cast drift` ([`CastWatermark`]).
     watermark: Arc<CastWatermark>,
-    /// The hold count of the newest burst recorded.
+    /// The hold count of the newest burst recorded. Bursts arrive in hold order: one
+    /// reader at a time, each recording after its holds.
     recorded: u64,
     /// The resizes recorded from the newest engine lifetime seen: its token, how many,
     /// and the newest ordinal.
@@ -767,6 +778,7 @@ impl CastRecorder {
 /// Off-lock snapshot of a [`CastRecorder`]'s events and header geometry.
 pub(crate) struct CastSnapshot {
     /// asciicast v2 header width (cols): the geometry in force at the first retained
+    /// event ([`CastRecorder::width`]).
     width: u16,
     /// asciicast v2 header height (rows), kept with [`width`](Self::width).
     height: u16,
@@ -1512,7 +1524,12 @@ mod tests {
         assert_eq!(parse_event(cast.lines().nth(2).unwrap()).0, 0.400);
     }
 
-    /// The header names the geometry in force at the first retained event.
+    /// The header names the geometry in force at the first retained event. While the
+    /// resize is retained (even with the output before it evicted) the header keeps
+    /// the construction size and the replay applies the resize; once drop-oldest
+    /// evicts it, the asciicast (and `cast drift`, which audits the same values) and
+    /// the flipbook all start at its size, so a 100-column line replays unwrapped on
+    /// 30 rows.
     #[test]
     fn evicted_resize_moves_the_header_geometry() {
         let line: Vec<u8> = [&b"\r\n"[..], &[b'X'; 100]].concat();

@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE STORE'S LAYOUT, BY NAME: where under an atpkg prefix a build, its exec root and a
-//! seam view live. atpkg's `Layout::build_dir`, `compat::COMPAT_DIR` and
-//! `seam::views_root` are these, so the lease ([`crate::lease`]) and the toolchain walk
-//! ([`crate::discovery`]) read the store where atpkg lays it.
+//! Store layout paths for [`crate::lease`] and [`crate::discovery`].
 
 use std::path::{Path, PathBuf};
 
 /// `<prefix>/store` — the versioned, immutable builds, `store/<program>/<build>`.
 pub const STORE_DIR: &str = "store";
 
-/// `<prefix>/compat` — the store's exec roots, one per build
-/// (`compat/<program>/<build>`), outside `store/` since nothing is laid inside the
-/// content-addressed store.
+/// `<prefix>/compat` — the store's exec roots, one per build.
 pub const COMPAT_DIR: &str = "compat";
 
 /// `<prefix>/rustup` — the seam's views, one per rustup toolchain name.

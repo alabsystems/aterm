@@ -1844,7 +1844,8 @@ WHAT IT CANNOT MEASURE HERE
   - CPU frequency (delivered or requested): read as unavailable.
   - GPU use per process or per core: one device-wide figure.
   - other users' processes one by one: "services" is the machine's CPU minus
-    what aterm reads (by subtraction), and a negative residual is printed signed.
+    what aterm reads (by subtraction), and a negative residual is printed signed;
+    `sys why` reads them per coalition.
   - folder sizes: not sampled in this build; they read unavailable(not_sampled),
     never zero.
 "#;
@@ -1934,10 +1935,40 @@ READ — `aterm ctl @self sys [<view>] [--json] [since=<cursor>]`
                                     next=<c>, plus the events since (pressure,
                                     throttle, swap, disk, load, tab, orphan,
                                     lane, job)
-  Views: overview tab aterm global jobs cores gpu mem disk procs; options scope=,
-  top=, fresh=<ms>, depth=; `instances=all` asks every aterm here, each reply in
-  turn. The header (stderr) carries as_of=, age_ms=, window_ms= and next=.
-  `aterm ctl help sys` is the full grammar.
+  Views: overview tab aterm global jobs cores gpu mem disk procs why; options
+  scope=, top=, fresh=<ms>, depth=; `instances=all` asks every aterm here, each
+  reply in turn. The header (stderr) carries as_of=, age_ms=, window_ms= and
+  next=. `aterm ctl help sys` is the full grammar.
+
+WHY — `aterm ctl @self sys why [cpu|mem] [top=<n>] [--json]`
+  aterm ctl @self sys why           who uses what deviates most, and why: the
+                                    CPU, memory, or (calm) one sentence and you
+  aterm ctl @self sys why cpu       the CPU: split, you, who, cause, pass, do
+  aterm ctl @self sys why mem       memory: classes, you, owners, who
+  The CPU splits per resource coalition (macOS) into tab + aterm_rest + others +
+  services + unaccounted; `who` rows are coalitions, busiest first (memory: by
+  footprint), each its lead's pid=, birth_ms=, exe= and voucher= (apple,
+  app_store, development, enterprise, developer_id, ad_hoc, unsigned, unknown);
+  `more` and `withheld` sum the rows left out. you role= is main, part, minor,
+  none or unavailable(<why>). Causes: spotlight, tab-work, aterm-work, app-work,
+  unexplained, and the contexts startup, wake, pressure, throttled. spotlight is
+  the work of Apple-signed com.apple.mds, com.apple.mds_stores,
+  com.apple.mdworker_shared and com.apple.corespotlightd, mostly deferred. src=
+  says where a fact comes from: kernel, signature (the code signature) or
+  derived. cannot what= names a limit: index_progress, index_folder,
+  wired_by_process, uncharged_memory, coalitions (no coalition lane: Linux,
+  Windows, or macOS's self-check missed; the split is then by subtraction and no
+  who row prints), coalition_list (truncated), finished_tab_work, remedy. A
+  caller that is not owner-class sees only the coalitions wholly in the target's
+  tab, never aterm's; the rest sum on withheld. Past 2,048 bytes a text reply
+  moves rows into more unless top= is given (--json is cut by top= alone; the
+  events a since= reply carries are never cut). `sys global`, `sys aterm` and
+  the `rest` line still split by subtraction over each reading's own window
+  (1 s with the bars in view), not `sys why`'s, so their parts can differ. A
+  previous aterm's coalition with no live tab shell counts in others. A calm
+  reply needs pressure, swap rates and the thermal state read: where one is
+  not (Windows; Linux without PSI or a thermal reading) a bare why names the
+  CPU or memory instead.
 
 WAIT — `aterm ctl @self await sys <condition> [for=<dur>] [timeout=<ms>]`
   aterm ctl @self await sys quiet for=20s timeout=600000
@@ -4462,6 +4493,7 @@ mod tests {
             "WHAT THIS OS MEASURES",
             "SCOPES",
             "READ",
+            "WHY",
             "WAIT",
             "PRIVACY",
         ] {

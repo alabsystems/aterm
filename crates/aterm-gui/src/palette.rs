@@ -68,7 +68,9 @@ struct PaletteLayout {
     body_rows: usize,
 }
 
-/// One pure geometry projection shared by paint and hit-testing.
+/// One pure geometry projection shared by paint and hit-testing. The overlay supplies the
+/// whole available viewport; the command card remains content-height, width-capped, and
+/// centred within it.
 fn palette_layout_for_count(count: usize, g: &SettingsGeom) -> PaletteLayout {
     let tray_w = (g.cols as f32 * g.cw).max(0.0);
     let tray_h = (g.panel_rows as f32 * g.ch).max(0.0);
@@ -203,7 +205,8 @@ pub(crate) struct PaletteRow {
     pub label: Cow<'static, str>,
     /// Dispatch target activated by this row.
     pub action: PaletteTarget,
-    /// A shared menu row's identity while its dispatch target is native.
+    /// A shared menu row's identity while its dispatch target is native. Recovery-only
+    /// native rows have no alias and retain their reducer-supplied labels and ordering.
     menu_alias: Option<MenuAction>,
     /// Visual key-equivalent character (`""` for none).
     pub key: &'static str,
@@ -759,7 +762,8 @@ impl PaletteState {
         }
     }
 
-    /// The visible command band height: the filtered count, capped at [`MAX_CMD_ROWS`].
+    /// The visible command band height: the filtered count, capped at [`MAX_CMD_ROWS`]. The
+    /// single value the painter, the scroll clamp, and [`Self::move_selection`] agree on.
     fn body(&self) -> usize {
         self.filtered_count().min(MAX_CMD_ROWS)
     }
@@ -1123,9 +1127,11 @@ pub(crate) struct PaletteState {
     selected: usize,
     /// First filtered row shown in the command band (scroll offset).
     scroll: usize,
-    /// Exact row currently under the pointer.
+    /// Exact row currently under the pointer. Keyboard/accessibility selection does not
+    /// imply pointer ownership, so this remains distinct from `selected`.
     pointer_over: Option<PaletteTarget>,
-    /// Exact target armed by a left press.
+    /// Exact target armed by a left press. It prevents release after a filter/tab change
+    /// from activating a different command that happens to occupy the same visual slot.
     pointer_armed: Option<PaletteTarget>,
     /// When the realized row spawned (`Some` only while `resolve` saw a live realized
     /// state and no staged build): drives [`Self::row_alpha`] and the fingerprint's bucket.
@@ -1180,7 +1186,9 @@ impl PaletteState {
         }
     }
 
-    /// Accessibility row identity epoch.
+    /// Accessibility row identity epoch. Cursor/focus movement deliberately does not enter this
+    /// hash (Focus followed by Click remains valid); row targets, lifecycle generations,
+    /// enabled state, and filtering do, so stale platform requests fail closed.
     #[cfg(a11y_tree)]
     fn a11y_epoch(&self) -> u32 {
         use std::hash::{Hash, Hasher};
@@ -1241,7 +1249,8 @@ fn platform_accel(shortcut: &str) -> String {
         .join(" \u{b7} ")
 }
 
-/// Whether one accelerator alternative names a macOS-only chord, in any spelling.
+/// Whether one accelerator alternative names a macOS-only chord, in any spelling. Pure
+/// and cfg-free so both platforms' answers test in one build.
 fn accel_is_mac_only(part: &str) -> bool {
     const MAC_ONLY_WORDS: &[&str] = &["Cmd", "Command", "Opt", "Option"];
     if part.contains('\u{2318}') || part.contains('\u{2325}') {

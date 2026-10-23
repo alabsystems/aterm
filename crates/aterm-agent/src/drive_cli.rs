@@ -66,7 +66,7 @@ pub struct Reply {
 }
 
 impl Reply {
-    fn text(text: String) -> Self {
+    const fn text(text: String) -> Self {
         Self { text, code: 0 }
     }
 }
@@ -646,7 +646,9 @@ fn candidate_file_with_limit(
     Ok((path.to_string(), policy))
 }
 
-/// `replay`'s FILE and options, as its arguments name them.
+/// `replay`'s FILE and options, as its arguments name them. `--at` and
+/// `--format` belong to `--why`, which names its own point and so takes no
+/// `--until`.
 fn replay_args(args: &[String]) -> Result<ReplayArgs, String> {
     const USAGE: &str = "replay FILE [--until door=N] | replay FILE --set k=v… | --policy FILE \
                          [--set k=v…] [--until door=N] | replay FILE… --shadow [--set k=v…] \
@@ -909,7 +911,9 @@ fn store_forget(store: &std::path::Path, args: &[String]) -> Result<String, Stri
         .collect())
 }
 
-/// Read only a regular file, judged on its open handle.
+/// Read only a regular file, judged on its open handle. The existing opener
+/// is nonblocking on Unix, so a FIFO cannot park this CLI at open; symlinks
+/// to regular files remain supported.
 fn read_tape_bytes(path: &std::path::Path, limit: u64) -> std::io::Result<Vec<u8>> {
     read_regular_bytes(path, limit, "tape")
 }

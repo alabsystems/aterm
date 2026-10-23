@@ -199,7 +199,7 @@ pub fn group_members(group: &str) -> impl Iterator<Item = &'static ProgramDef> +
 impl ProgramDef {
     /// The Apple targets one build of it carries.
     #[must_use]
-    pub fn darwin_triples(&self) -> &'static [Triple] {
+    pub const fn darwin_triples(&self) -> &'static [Triple] {
         match self.shape {
             Shape::Plain { darwin } => darwin,
             Shape::Bundle(b) => b.darwin,
@@ -209,7 +209,7 @@ impl ProgramDef {
 
     /// Whether the lanes pack it themselves.
     #[must_use]
-    pub fn is_plain(&self) -> bool {
+    pub const fn is_plain(&self) -> bool {
         matches!(self.shape, Shape::Plain { .. })
     }
 
@@ -217,7 +217,7 @@ impl ProgramDef {
     /// pinned only by a person (`pack-package`, then `index --pin`), so no lane looks for
     /// its releases, reports it owed or pins it.
     #[must_use]
-    pub fn lane_tracked(&self) -> bool {
+    pub const fn lane_tracked(&self) -> bool {
         !matches!(self.shape, Shape::Package(_))
     }
 }

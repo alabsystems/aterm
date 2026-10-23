@@ -314,6 +314,9 @@ fn parse(text: &str) -> Option<Vec<Setting>> {
 }
 
 /// Queue, once each, the files the conditional includes among `settings` name, resolved as
+/// git resolves an include's path: `~/` from the account's home, a relative path from the
+/// directory of the file that names it.
+///
 /// # Errors
 /// An include this cannot resolve, or one nested deeper than git reads: why, as a reason.
 fn includes(
@@ -460,7 +463,9 @@ fn relevant(setting: &Setting) -> Option<(Scope, &str)> {
     matches!(name, "helper" | "username" | "usehttppath").then(|| (scope(url), name))
 }
 
-/// Judge what git's github.com lookups resolve to.
+/// Judge what git's github.com lookups resolve to. `every` holds the settings of every file git
+/// reads, in its order: those that apply to every lookup are applied as git applies them (an
+/// empty helper resets the list; the last account and `useHttpPath` win).
 fn judge(helper: &str, account: &str, every: &[Setting], conditional: &[Setting]) -> Lookups {
     let agrees = |name: &str, value: Option<&str>| match (name, value) {
         ("helper", Some(value)) => value == helper,
@@ -532,7 +537,8 @@ fn judge(helper: &str, account: &str, every: &[Setting], conditional: &[Setting]
     Lookups::Ready
 }
 
-/// The fields a credential request names.
+/// The fields a credential request names. An account or host that could add a field (a
+/// newline, `=`) is refused before git runs.
 fn request(host: &str, account: &str) -> Result<Vec<u8>, String> {
     let field = |value: &str| {
         !value.is_empty()
@@ -684,7 +690,8 @@ mod tests {
         user("alice", 501)
     }
 
-    /// git's URL matching as [`scope`] reads it.
+    /// git's URL matching as [`scope`] reads it. The real-git test below holds the spellings
+    /// the review found to what git itself hands a github.com credential to.
     #[test]
     fn a_setting_applies_to_github_as_git_matches_its_url() {
         for (url, want) in [
@@ -894,7 +901,8 @@ mod tests {
         assert!(parse("file:/a").is_none());
     }
 
-    /// A conditional include's file resolves as git resolves it, each once.
+    /// A conditional include's file resolves as git resolves it, each once. Negative control:
+    /// one this cannot resolve, and one nested past git's bound, are reasons, not skipped.
     #[test]
     fn a_conditional_include_resolves_as_git_resolves_it() {
         let who = alice();

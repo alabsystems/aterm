@@ -2,10 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Help, generated from the verb table and the exit table (design §15): `agh help`,
-//! `agh --help` and `aterm help agh` print the same manual. Every text is built from `VERBS`,
-//! `GLOBAL_FLAGS`, `REFUSED`, `error::exit_rows()` and the jq tables; the one authored page is
-//! the routing page.
+//! Help, generated from the verb table and the exit table (design §15).
 
 use super::jq::{DIVERGENCES, FORMATS, FUNCTIONS, REFUSED_JQ, SHARED_RULES};
 use super::verbs::{FlagSpec, GLOBAL_FLAGS, REFUSED, Takes, VERBS, Verb};
@@ -65,7 +62,6 @@ fn flag_lines(flags: &[FlagSpec]) -> String {
         let help = wrap(&words, &indent, MAX_LINE);
         let mut line = format!("  {spec}");
         line.extend(std::iter::repeat_n(' ', width - spec.chars().count() + 2));
-        // The first wrapped line takes the spec's place in the indent.
         text.push_str(&line);
         text.push_str(help.get(indent.len()..).unwrap_or(""));
         if help.is_empty() {
@@ -75,8 +71,7 @@ fn flag_lines(flags: &[FlagSpec]) -> String {
     text
 }
 
-/// `agh` alone: the purpose line, `usage: agh VERB [ARGS] [FLAGS]`, every verb's usage, and
-/// the pointers `agh help VERB`, `agh help exit`, `agh help jq`, `agh help routing`.
+/// `agh` alone: purpose line, usage, verb list, and help topic pointers.
 #[must_use]
 pub fn brief() -> String {
     let mut text = format!("{PURPOSE}\nusage: agh VERB [ARGS] [FLAGS]\n\n");
@@ -180,8 +175,7 @@ fn jq_page() -> String {
     text
 }
 
-/// The whole manual: the brief, every verb's page, the global flags, the exit table, the
-/// routing page and the jq page. `aterm help agh` prints it.
+/// The whole manual: brief, verb pages, global flags, exit table, routing, and jq.
 #[must_use]
 pub fn manual() -> String {
     let mut parts = vec![brief()];
@@ -193,9 +187,7 @@ pub fn manual() -> String {
     parts.join("\n")
 }
 
-/// One verb's page: usage, summary, flags with their help, the gh command it replaces, the
-/// example; for `release wait`, the line that tells an agent in Claude Code to run a wait
-/// longer than two minutes as a background Bash.
+/// One verb's page: usage, summary, flags with their help, the gh command it replaces, the example.
 #[must_use]
 pub fn verb_page(verb: &Verb) -> String {
     let mut text = format!("usage: {}\n{}\n", verb.usage, verb.summary);
@@ -215,12 +207,8 @@ pub fn verb_page(verb: &Verb) -> String {
     text
 }
 
-/// `[]` → `manual()`; `exit`, `jq`, `routing`; a verb path → `verb_page`; words that only
-/// begin verb paths (`release`) → the usage and summary of each verb under them; a refused
-/// path → its why and next.
-///
+/// Renders help for `words` (empty for the full manual, a topic, or a verb path).
 /// # Errors
-///
 /// Usage: `no help for: {words}`, next `agh help`.
 pub fn render(words: &[String]) -> Result<String> {
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
@@ -231,7 +219,6 @@ pub fn render(words: &[String]) -> Result<String> {
         ["routing"] => return Ok(routing_page()),
         _ => {}
     }
-    // The longest path the words begin with: `release view TAG` is `release view`'s page.
     let verb = VERBS
         .iter()
         .filter(|verb| words.starts_with(verb.path))

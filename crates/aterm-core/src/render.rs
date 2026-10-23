@@ -398,7 +398,9 @@ impl EffectStreamDamage {
     }
 }
 
-/// A fixed-shape two-lane fingerprint for effect records, not a general hasher.
+/// A fixed-shape two-lane fingerprint for effect records, not a general hasher. The lanes
+/// differ in combination and constants, avoiding the affine relation of `FxHasher::with_seed`
+/// used twice.
 struct EffectStreamFingerprint {
     first: u64,
     second: u64,
@@ -1275,7 +1277,8 @@ pub enum RowOrder {
     /// images, and the cursor column).
     #[default]
     Logical,
-    /// A row was permuted into BiDi visual order.
+    /// A row was permuted into BiDi visual order. The permutation is not idempotent, so these
+    /// rows may not be retained by a damage-scoped refill.
     BidiVisual,
 }
 
@@ -1399,7 +1402,8 @@ pub enum FrameRefill {
     /// Only the damage tracker's rows were re-extracted; the rest are byte-identical by the
     /// continuity invariant.
     Scoped {
-        /// Viewport rows re-resolved (the tracker's damaged rows, clamped).
+        /// Viewport rows re-resolved (the tracker's damaged rows, clamped). 0 is legal: a
+        /// cursor-only move still restamps the cursor and selection scalars.
         rows_refilled: usize,
     },
 }
@@ -2874,7 +2878,8 @@ mod ime_preedit_ragged_row_tests {
         assert_eq!(f.cells[0][5].underline, UnderlineStyle::Single);
     }
 
-    /// Truncation must not grow the row.
+    /// Truncation must not grow the row. A composition that does not fit stops
+    /// at the edge, and the cells it never reached stay unmaterialized.
     #[test]
     fn a_truncated_composition_materializes_only_what_it_drew() {
         let mut f = prompt_frame(2, 5);
@@ -3327,7 +3332,9 @@ mod prediction_ghost_tests {
         f.cells[0].iter().map(|c| c.ch).collect()
     }
 
-    /// A SHIFT: `x` typed before `c` of `ab` + bold red `cd`.
+    /// A SHIFT: `x` typed before `c` of `ab` + bold red `cd`. The typed glyph is
+    /// a ghost (dimmed, no SGR); the text it moved is the very cells it came
+    /// from, bold and red; nothing outside the span changes.
     #[test]
     fn a_span_moves_text_in_its_own_style_and_types_its_glyph() {
         let before = frame(1, 10, b"ab\x1b[1;31mcd\x1b[0mef");

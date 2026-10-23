@@ -400,6 +400,9 @@ mod tests {
         bytes
     }
 
+    /// The three markers are read and every other variable is skipped; argv words that look
+    /// like a marker are argv, not environment. An empty environment is withheld, never "no
+    /// marker". NEGATIVE CONTROL: the same buffer with the argc one short reads the last argv
     /// word as the environment's first, so the marker it spells is read.
     #[test]
     fn only_the_three_markers_are_read_and_an_empty_environment_is_withheld() {
@@ -434,6 +437,9 @@ mod tests {
         );
     }
 
+    /// The environment is taken only when the pid named one program throughout: an exec while
+    /// it was read (the same birth, another pid version) or an exit reads nothing. NEGATIVE
+    /// CONTROL: compare the births alone (the fork-time start records the read was bracketed by
     /// before), and the exec'd program's environment is taken.
     #[test]
     fn markers_read_across_an_exec_are_refused() {
@@ -454,6 +460,7 @@ mod tests {
         assert_eq!(script(vec![Some(id(7)), None]), None, "an exit");
     }
 
+    /// A variable named twice reads as the process itself reads it: `getenv(3)` takes the
     /// first. NEGATIVE CONTROL: let a later entry overwrite, and the second run's id is read.
     #[test]
     fn a_marker_named_twice_reads_as_getenv_reads_it() {
@@ -476,7 +483,10 @@ mod tests {
         assert!(launched_before(i32::MAX, i32::MIN));
     }
 
-    /// once it runs. Off macOS every reader answers `None` (the leftover design's slice 7).
+    /// This process reads its own lineage and its group lists it; a child spawned into its
+    /// group is listed there too and is no orphan; this process shows no program-check
+    /// signature once it runs. Off macOS every reader answers `None` (the leftover design's
+    /// slice 7).
     #[test]
     fn this_process_reads_its_lineage_and_its_group() {
         let me = i32::try_from(std::process::id()).expect("pid");

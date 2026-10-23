@@ -16,19 +16,28 @@ const SUBMODULE: &str = "vendor/astream";
 /// Accepted with or without a trailing `.git`, and in no other spelling.
 const URL: &str = "https://github.com/alabsystems/astream";
 const GITLINK_MODE: &str = "160000";
-/// The line of work the pin is judged against.
+/// The line of work the pin is judged against. The full ref name, so a local
+/// branch or tag spelled `origin/main` cannot stand in for it.
 const BASE_REF: &str = "refs/remotes/origin/main";
 /// How messages spell [`BASE_REF`].
 const BASE_NAME: &str = "origin/main";
 /// A commit-message line on this branch that declares a deliberate backward move, with its
 /// reason: `astream-pin-rollback: <why the older astream is needed>`.
 const ROLLBACK_TRAILER: &str = "astream-pin-rollback:";
-/// What every astream crate's name starts with.
+/// What every astream crate's name starts with. The crates `[OB-1]` holds to
+/// the submodule are READ FROM THE GRAPH — every package so named, and every
+/// package whose manifest is under `vendor/astream` — not listed here: a list
+/// went stale twice in a day (astream-term for aterm-conformance's VT oracle,
+/// then astream-effects for aterm-agent's harness tape, which ships), and a
+/// crate missing from it was never checked for resolving from the pin, for
+/// its licence or for staying outside this workspace.
 const CRATE_PREFIX: &str = "astream-";
 const CONSUMER: &str = "crates/aterm-link/Cargo.toml";
 /// aterm-link's direct path dependencies into the submodule.
 const CONSUMER_DEPS: [&str; 2] = ["astream-broker", "astream-cap"];
-/// The variables that point git at a repository.
+/// The variables that point git at a repository. A hook exports them for the
+/// superproject, so they are cleared before asking git inside the submodule
+/// (as git's own submodule code does).
 const REPO_ENV: [&str; 6] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -73,7 +82,9 @@ enum Checkout {
     },
 }
 
-/// Where this tree's pin stands against `origin/main`'s pin at the merge-base.
+/// Where this tree's pin stands against `origin/main`'s pin at the merge-base. A bump moves
+/// forward; a checkout whose submodule was not advanced moves it backward by recording the old
+/// gitlink (`git commit -a`, `git add -A`, or a merge resolved there).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PinMotion {
     /// The gitlink is the base's own, or there is nothing to compare with: no
@@ -83,7 +94,8 @@ enum PinMotion {
     Forward,
     /// Neither pin is an ancestor of the other.
     Diverged,
-    /// This pin is a strict ancestor of the base's: a regression.
+    /// This pin is a strict ancestor of the base's: a regression. `declared` is the
+    /// `astream-pin-rollback:` reason a commit on this branch gives, if any.
     Backward {
         base: String,
         declared: Option<String>,
@@ -96,7 +108,8 @@ enum PinMotion {
     Undecided(String),
 }
 
-/// Everything [`validate`] judges.
+/// Everything [`validate`] judges. [`capture`] reads it from the real
+/// repository; the tests build a valid one and mutate it.
 #[derive(Clone, Debug)]
 struct Facts {
     /// `.gitmodules` as `(key, value)` pairs, as `git config --list` reads
@@ -609,7 +622,8 @@ fn checked_out_at(checkout: &Checkout, commit: &str) -> Result<(), String> {
     }
 }
 
-/// (5) cargo leaves the submodule to astream's workspace.
+/// (5) cargo leaves the submodule to astream's workspace. Cargo's rule is a
+/// path prefix, so an entry naming an ancestor directory covers it too.
 fn excluded(exclude: &[String]) -> Result<(), String> {
     let covers = |entry: &String| {
         let entry = entry.trim_start_matches("./").trim_end_matches('/');

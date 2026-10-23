@@ -800,7 +800,9 @@ fn render(v: &Value) -> String {
     }
 }
 
-/// One event's line: `<ms> <pid> <Interface>.<Member> <path> <body>`.
+/// One event's line: `<ms> <pid> <Interface>.<Member> <path> <body>`. An AT-SPI
+/// event's body is `(siiva{sv})`: the detail, two numbers, any data and
+/// properties, which print only when there are any.
 fn event_line(ms: u128, pid: u32, msg: &Message) -> String {
     let iface = msg
         .interface

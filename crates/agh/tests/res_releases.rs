@@ -4,8 +4,6 @@
 
 //! `releases()` over agh-fake: list, view, tags, assets and their objects.
 
-// Every test routes through the canonical config's dev profile, a private token file (plan §1,
-// rule 12).
 #![cfg(unix)]
 
 use agh::download::{Expect, Sink};
@@ -106,8 +104,6 @@ fn a_limit_that_cuts_is_limited_and_one_that_does_not_is_complete() {
 
 #[test]
 fn githubs_result_cap_is_incomplete_or_capped_under_partial_never_invalid() {
-    // GitHub lists releases only to item 1000: page 10's next link names page 11, which
-    // answers 422. That is the listing's cap, not bad input.
     let w = World::new("rel-result-cap");
     for i in 0..1001 {
         w.release(
@@ -128,7 +124,6 @@ fn githubs_result_cap_is_incomplete_or_capped_under_partial_never_invalid() {
         .expect("the capped list");
     assert_eq!(capped.end, End::Capped { pages: 10 });
     assert_eq!(capped.items.len(), 3);
-    // The first page alone never meets the cap.
     let first = releases
         .list(&ListOpts::STANDARD.with_max_pages(1).with_partial(true))
         .expect("one page");
@@ -241,8 +236,6 @@ fn a_missing_id_after_the_check_is_not_found() {
 
 #[test]
 fn newest_under_a_writer_named_with_as_reads_through_the_read_chain() {
-    // alabsystems reads through dev and anonymous and writes as release: `newest` is a Read,
-    // so a writer's `--as release` (outside the read chain) is dropped, never refused.
     let w = World::new("rel-newest-as");
     w.fake.add_repo(
         "alabsystems/aterm",
@@ -351,9 +344,6 @@ fn published_by_tag_finds_published_and_judges_the_rest() {
 
 #[test]
 fn published_by_tag_refuses_a_tag_no_release_can_have_before_any_request() {
-    // An empty part (`a//b`, `v1/`) is one a slash-merging server reads as another tag; a
-    // `.` or `..` part one a normalising server resolves off the route. The wait refuses the
-    // same tags.
     let w = World::new("rel-bad-tag");
     w.release(APP, ReleaseSpec::published("a/b", "2026-01-01T00:00:00Z"));
     let releases = w.gh.releases(&common::slug(APP));

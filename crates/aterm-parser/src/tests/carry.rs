@@ -821,7 +821,9 @@ fn restore_carry_accepts_the_edge_of_every_bound() {
     }
 }
 
-/// UTF-8 tails for a carry.
+/// UTF-8 tails for a carry. Pending prefixes: each Table 3-7 row's lead alone,
+/// then (three- and four-byte rows) with the row's lowest second byte, then
+/// (four-byte rows) with a third byte.
 fn utf8_tails() -> Vec<Vec<u8>> {
     let mut tails = vec![vec![]];
     for lead in [
@@ -1099,7 +1101,14 @@ fn a_string_carry_continues_a_split_utf8_character() {
     }
 }
 
-/// A DCS HEADER IS CARRIED AS ITSELF (round fifteen, R15-PARSER-P1).
+/// A DCS HEADER IS CARRIED AS ITSELF (round fifteen, R15-PARSER-P1). A header
+/// that had not reached its final byte (`DcsEntry`, `DcsParam`,
+/// `DcsIntermediate`) was carried as `DcsIgnore`, which reads the next bytes
+/// differently from the live parser, beyond losing the string: with C1
+/// controls off a `0x9C` ended it and the payload printed (`ESC P` then
+/// `0x9C q#0~~payload ESC \` printed `q#0~~payload`), and a GR byte or a C1
+/// control the live parser leaves the header on kept it, swallowing the real
+/// output after it up to the next ESC.
 #[test]
 fn a_dcs_header_carry_reads_every_tail_as_the_live_parser() {
     let heads: [(&[u8], State); 4] = [

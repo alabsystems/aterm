@@ -145,7 +145,8 @@ pub enum Sight {
     Sighted(Holder),
 }
 
-/// A missing holder is proven only by an unlocked file.
+/// A missing holder is proven only by an unlocked file. A refused query
+/// keeps it unproven; positive descriptor evidence still stands.
 #[cfg(any(target_os = "macos", test))]
 fn lock_checked(sight: Sight, lock: Option<bool>) -> Sight {
     match (lock, sight) {

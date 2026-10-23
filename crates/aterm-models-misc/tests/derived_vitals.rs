@@ -23,7 +23,6 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
         (6, "FlaggedOnTime"),
     ] {
         let mut m = interp::with_buggy(&model, dial);
-        // The environment mutants (dial 1's own actions) are not this law's.
         m.actions
             .retain(|a| !a.name.ends_with("AsProgress") && a.name != "RefusedResetsAge");
         for other in &model.invariants {
@@ -56,7 +55,6 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
         );
     }
 
-    // The healthy lane, as the design's curl row: quiet at φ 3, stuck at φ 8.
     let mut s = model.init_state();
     assert!(model.fire("QuietTick", &mut s));
     assert!(model.fire("QuietTick", &mut s));
@@ -64,20 +62,17 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
     assert!(model.fire("QuietTick", &mut s));
     assert!(model.fire("QuietTick", &mut s));
     assert_eq!((s["q"], s["v"]), (4, 2), "stuck at the T8 band");
-    // μ grows: stuck holds while φ ≥ 3, then falls to fine.
     assert!(model.fire("MuGrows", &mut s));
     assert!(model.fire("MuGrows", &mut s));
     assert_eq!((s["q"], s["v"]), (2, 2));
     assert!(model.fire("MuGrows", &mut s));
     assert_eq!((s["q"], s["v"]), (1, 0));
-    // An unnamed wait stays capped at quiet however long it waits.
     let mut s = model.init_state();
     assert!(model.fire("Relabel", &mut s));
     for _ in 0..4 {
         assert!(model.fire("QuietTick", &mut s));
     }
     assert_eq!((s["cls"], s["q"], s["v"]), (3, 4, 1));
-    // Named at φ ≥ 8: stuck at once.
     assert!(model.fire("Relabel", &mut s));
     assert_eq!((s["cls"], s["v"]), (2, 2));
 }
@@ -90,7 +85,6 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
 fn the_end_by_proof_holds_and_its_mutant_signals_after_a_move() {
     let model = end_by_proof_model();
 
-    // The one law has its own mutant, and the committed config breaks none.
     let mut buggy = interp::with_buggy(&model, 1);
     buggy.invariants.retain(|i| i.name == "NoUnprovenSignal");
     assert!(
@@ -98,9 +92,6 @@ fn the_end_by_proof_holds_and_its_mutant_signals_after_a_move() {
         "Buggy 1 signals after a moved identity or a lost tier"
     );
 
-    // The healthy runs: no signal before its own judgment; a move before the SIGTERM, or a
-    // tier lost after it, sends nothing more, so `bad` stays 0 as the protocol reaches v == 2
-    // (done).
     let mut s = model.init_state();
     assert!(!model.action_enabled("Term", &s), "no SIGTERM unjudged");
     assert!(model.fire("Move", &mut s));
@@ -146,9 +137,6 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
         assert_eq!(broken.into_iter().collect::<Vec<_>>(), laws, "Buggy {dial}");
     }
 
-    // A delegated member read one unit ahead of its launcher's counter: the
-    // launcher gives up its one unit, the tab shows both, and the residual
-    // shows the unit no coalition counted.
     let mut s = model.init_state();
     for action in ["DelegatedWork", "DelegatedAhead", "Move", "Close"] {
         assert!(model.fire(action, &mut s), "{action}");
@@ -199,8 +187,6 @@ fn the_explanations_honesty_holds_and_each_law_has_its_own_mutant() {
         assert!(model.check_invariant("ClauseNeverFlickers", &s));
     }
 
-    // The init state is the 10:32 moment: Spotlight, after start-up; the
-    // caller's tab minor, its work under the floor.
     let mut s = model.init_state();
     for action in ["Detect", "Attach"] {
         assert!(model.fire(action, &mut s), "{action}");

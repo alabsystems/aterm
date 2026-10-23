@@ -1,29 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one field of a Windows PE image aterm reads: its `Subsystem`, which says
-//! whether Windows starts the program with a console. aterm-gui reads it to tell
-//! its windowed image from its console image (OS-restart registration);
-//! aterm-pty reads it because a GUI-subsystem program never connects to the
-//! console of the tab it runs in, so its console host never answers it. Pure
-//! over bytes, so its table runs on every host.
+//! PE `Subsystem` field reader (`IMAGE_SUBSYSTEM_WINDOWS_GUI` vs console).
 
 use std::path::Path;
 
-/// `IMAGE_SUBSYSTEM_WINDOWS_GUI` (WinNT.h): a program Windows starts with no
-/// console. A console program's is `IMAGE_SUBSYSTEM_WINDOWS_CUI` (3).
+/// `IMAGE_SUBSYSTEM_WINDOWS_GUI` (`WinNT.h`): GUI subsystem (`2`; console is `3`).
 pub const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
 
-/// How much of an image file is read for its header. The field sits at the NT
-/// headers' offset plus 92; every aterm image and `notepad.exe` measured put
-/// those headers at 0xF8 or 0x100 (2026-09-30), and the linkers place them right
-/// after the DOS stub, so 4 KiB is ample.
+/// Number of leading image bytes read when probing the PE header.
 pub const HEAD_BYTES: u64 = 4096;
 
-/// The PE `Subsystem` field out of the first bytes of an image file, or `None`
-/// when `head` is no PE image or ends before the field: `MZ`, the NT headers'
-/// offset at 0x3C, `PE\0\0` there, then the 20-byte file header and the optional
-/// header, whose `Subsystem` sits 68 bytes in — the same offset in PE32 and PE32+.
+/// Read the PE `Subsystem` field from `head`, or `None` if `head` is not a complete PE header.
 #[must_use]
 pub fn subsystem(head: &[u8]) -> Option<u16> {
     let bytes = |at: usize, len: usize| head.get(at..at.checked_add(len)?);
@@ -39,9 +27,7 @@ pub fn subsystem(head: &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes(field.try_into().ok()?))
 }
 
-/// The `Subsystem` of the image file at `path`, by its first [`HEAD_BYTES`];
-/// `None` when it cannot be read (no such file, an app execution alias, which
-/// cannot be opened) or holds no PE header.
+/// Read the PE `Subsystem` field from the first [`HEAD_BYTES`] of `path`.
 #[must_use]
 pub fn file_subsystem(path: &Path) -> Option<u16> {
     use std::io::Read as _;
@@ -67,8 +53,6 @@ mod tests {
         head
     }
 
-    // The field is read at the NT headers' offset plus 92 wherever they sit,
-    // and a file is read up to it.
     #[test]
     fn the_subsystem_is_read_at_the_nt_headers_offset() {
         assert_eq!(

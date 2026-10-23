@@ -170,7 +170,7 @@ impl SessionSetup {
 
     /// The approval policy's process inputs.
     #[must_use]
-    pub fn approval_env(&self) -> &ApprovalEnv {
+    pub const fn approval_env(&self) -> &ApprovalEnv {
         &self.approval_env
     }
 

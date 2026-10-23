@@ -560,7 +560,9 @@ fn darwin_group_has_stopped_member(pgid: i32) -> bool {
             buffersize: libc::c_int,
         ) -> libc::c_int;
     }
-    /// `SSTOP` from `<sys/proc.h>`.
+    /// `SSTOP` from `<sys/proc.h>`. Pinned by
+    /// `foreground_handback_a_stopped_member_of_a_leaderless_group_is_seen`,
+    /// which stops a real process and reads it back.
     const SSTOP: u32 = aterm_uds::process::BsdShortInfo::SSTOP;
     /// A foreground job with more members than this is not one a terminal
     /// runs; past it the listing is read as far as it goes.

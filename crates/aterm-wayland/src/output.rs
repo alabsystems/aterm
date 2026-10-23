@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Outputs: every `wl_output` the registry lists, bound on the registry's
-//! queue (version 4 or what the compositor offers), and what each says about
-//! itself (geometry, modes, scale, name, description), kept as of its last
-//! `done`, and handed to the caller's [`Sink`] at each `done`, in the order
-//! the queue dispatched it ([`crate::sink`]). The window system reads
-//! monitors, their modes and scale factors from here, and binds outputs as
-//! they come and releases them as they go ([`Outputs::sync`]).
+//! Outputs: every `wl_output` the registry lists, bound on the registry's queue ([`crate::sink`]).
 
 use std::ffi::CStr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -195,10 +189,6 @@ impl OutputBook {
 
 /// Listen to an output: each event, decoded with the book unlocked, goes to
 /// its book, and a `done`'s state to `sink`, with the book unlocked again.
-///
-/// # Safety
-/// `proxy` is a live output this crate bound, without a listener, released
-/// before the listener is freed.
 unsafe fn output_listener(
     proxy: Proxy,
     output_book: &Arc<Mutex<OutputBook>>,
@@ -224,8 +214,6 @@ unsafe fn output_listener(
 }
 
 /// One output: its registry name, its proxy and what it said about itself.
-/// A cheap handle, kept by whoever names a monitor; [`Output::info`] reads the
-/// output's book, which stays readable after the output is released.
 #[derive(Clone)]
 pub struct Output {
     global: u32,
@@ -240,8 +228,7 @@ impl Output {
         self.global
     }
 
-    /// The `wl_output`, live while [`Outputs`] holds it bound (a surface's
-    /// `enter` names it; `xdg_toplevel.set_fullscreen` takes it).
+    /// The `wl_output`, live while [`Outputs`] holds it bound.
     #[inline]
     pub const fn proxy(&self) -> Proxy {
         self.proxy
@@ -306,16 +293,14 @@ fn bind_one(registry: &Registry, global: &Global, sink: &Sink<OutputInfo>) -> Re
         output_book,
         listener: None,
     };
-    // SAFETY: an output this crate bound, without a listener; its owner releases
-    // or destroys it before the listener on success or error.
+    // SAFETY: an output this crate bound, without a listener; its owner releases or destroys it
+    // before the listener on success or error.
     output.listener = Some(unsafe { output_listener(proxy, &output.output_book, sink) }?);
     Ok(output)
 }
 
 impl Outputs {
-    /// Bind every `wl_output` `registry` lists. Their first `done` arrives
-    /// on the registry's queue: dispatch it (a round trip) before reading.
-    /// Each output's state goes to `sink` at each of its `done`s.
+    /// Bind every `wl_output` `registry` lists.
     pub fn bind_all(registry: &Registry, sink: Sink<OutputInfo>) -> Result<Outputs, Error> {
         let mut outputs = Outputs {
             bound: Vec::new(),
@@ -325,9 +310,7 @@ impl Outputs {
         Ok(outputs)
     }
 
-    /// Bind the outputs `registry` lists that are not bound yet (their first
-    /// `done` follows on the registry's queue), and release the ones it no
-    /// longer lists. Whether anything was bound or released.
+    /// Binds newly listed `wl_output` globals in `registry` and releases removed ones.
     pub fn sync(&mut self, registry: &Registry) -> Result<bool, Error> {
         let globals: Vec<Global> = registry
             .globals()
@@ -335,7 +318,6 @@ impl Outputs {
             .filter(|g| g.interface.as_c_str() == c"wl_output")
             .collect();
         let before = self.bound.len();
-        // Released as they drop.
         self.bound
             .retain(|b| globals.iter().any(|g| g.name == b.global));
         let mut changed = self.bound.len() != before;
@@ -354,8 +336,7 @@ impl Outputs {
         self.bound.iter().map(Bound::handle).collect()
     }
 
-    /// The output whose `wl_output` is `proxy` (a surface's `enter` names
-    /// one).
+    /// The output whose `wl_output` is `proxy` (a surface's `enter` names one).
     pub fn by_proxy(&self, proxy: Proxy) -> Option<Output> {
         self.bound
             .iter()
@@ -363,8 +344,7 @@ impl Outputs {
             .map(Bound::handle)
     }
 
-    /// Every output's state as of its last `done` (outputs that have not
-    /// sent one yet are left out).
+    /// Every output's state as of its last `done`.
     pub fn infos(&self) -> Vec<OutputInfo> {
         self.bound
             .iter()
@@ -372,8 +352,7 @@ impl Outputs {
             .collect()
     }
 
-    /// The proxy of the output the registry names `global`, for matching a
-    /// surface's `enter` events.
+    /// The proxy of the output the registry names `global`.
     pub fn proxy(&self, global: u32) -> Option<Proxy> {
         self.bound
             .iter()
@@ -394,8 +373,8 @@ impl Bound {
 
 impl Drop for Bound {
     fn drop(&mut self) {
-        // SAFETY: an output this value bound, released or destroyed once; its
-        // listener is freed after.
+        // SAFETY: an output this value bound, released or destroyed once; its listener is freed
+        // after.
         unsafe {
             if self.version >= 3 {
                 wl_output::release(self.proxy);

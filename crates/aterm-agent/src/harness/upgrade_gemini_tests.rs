@@ -212,7 +212,8 @@ fn a_tui_is_every_launch_but_a_one_shot() {
     }
 }
 
-/// The session an argv names, by its full UUID only.
+/// The session an argv names, by its full UUID only. NEGATIVE CONTROLS: an
+/// index, `latest`, a custom id and a resume with no value name none.
 #[test]
 fn an_argv_names_a_session_by_its_full_uuid_alone() {
     for (words, want) in [

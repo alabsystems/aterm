@@ -43,7 +43,9 @@ impl HintMode {
         }
     }
 
-    /// The hinter target this mode stands for; `None` = hinting disabled.
+    /// The hinter target this mode stands for; `None` = hinting disabled. Horizontal fitting
+    /// inside the cell is wanted (that is the crispness); advances reported upstream stay linear
+    /// regardless (module doc).
     #[inline]
     const fn options(self) -> Option<Target> {
         match self {
@@ -149,7 +151,8 @@ pub(crate) fn hinted_glyph_raster(
     Some((w, h, x_min as i32, y_min as i32, advance, cov))
 }
 
-/// One recorded outline segment, in hinted pixel space (y up).
+/// One recorded outline segment, in hinted pixel space (y up). Recorded rather than streamed
+/// because the ink box must be known before the rasterizer (and its y flip) can exist.
 enum Cmd {
     Move(f32, f32),
     Line(f32, f32),
@@ -489,7 +492,10 @@ mod tests {
         v
     }
 
-    /// No glyph rasterizes as a filled block at any desktop ppem, in any mode.
+    /// No glyph rasterizes as a filled block at any desktop ppem, in any mode. A fitted outline
+    /// sitting exactly on the grid's left edge can lose a scanline's area in [`crate::raster`]
+    /// and smear the glyph into a block (see `variation::RASTER_PAD`; on the default face `'2'`
+    /// at ppem 19, a 125% desktop, and `'?'` at ppem 17).
     #[test]
     fn ppem_sweep_no_glyph_rasterizes_as_a_filled_block() {
         let faces: [(&str, &[u8]); 2] = [

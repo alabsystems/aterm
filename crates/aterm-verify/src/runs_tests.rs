@@ -25,6 +25,7 @@ fn born(pid: i32) -> u64 {
     1_000 + u64::try_from(pid).expect("a pid")
 }
 
+/// A process of this uid as the fake lays it out: launched by a launcher older than launchd's
 /// version below, so with `parent` 1 it is a real orphan; no terminal.
 fn lin(pid: i32, uniqueid: u64, pgid: u32, parent: u32) -> Lineage {
     Lineage {
@@ -41,6 +42,7 @@ fn lin(pid: i32, uniqueid: u64, pgid: u32, parent: u32) -> Lineage {
     }
 }
 
+/// A fake kernel scripted with the processes a test lays out. What a test leaves out reads as
 /// every guard would have it: markers readable and empty, not held, a tty master free.
 #[derive(Default)]
 struct FakeKernel {
@@ -54,6 +56,7 @@ struct FakeKernel {
     ttys: HashMap<u32, Option<bool>>,
     /// The uid listing fails.
     unlisted: bool,
+    /// What a process becomes just before its end: a change between the judgment and the
     /// signal, with its identity kept.
     moves: RefCell<HashMap<i32, Lineage>>,
     /// Processes that outlive their SIGTERM.
@@ -94,7 +97,8 @@ impl FakeKernel {
     }
 }
 
-/// SIGKILL always does.
+/// The fake's side of the real `end_proven`: a SIGTERM ends a process unless it is stubborn, a
+/// SIGKILL unless it is wedged; a refused or vanishing process takes no signal.
 struct Control<'a>(&'a FakeKernel);
 
 impl EndControl for Control<'_> {
@@ -215,6 +219,8 @@ fn with_me(k: &mut FakeKernel, uniqueid: u64) {
     k.put(lin(ME, uniqueid, 9000, 1), "/usr/local/bin/aterm-verify");
 }
 
+/// The dead run every start-pass test reads: launcher 41983 (dead: the fake has no such
+/// process), its one stage group led by pid 500 (leader unique id 300), roots `/wt-a` and its
 /// scratch.
 const DEAD_ID: &str = "41983-999";
 
@@ -286,6 +292,10 @@ fn a_record_parses_its_lines_and_skips_the_unknown() {
     assert_eq!(rec.open_groups().map(|g| g.pgid).collect::<Vec<_>>(), [200]);
 }
 
+/// A header reads back exactly what was written, whatever its paths and session id hold: a
+/// non-ASCII letter, a no-break space and a tab (each of which `split_whitespace` or a
+/// Latin-1 cast would break), a space, an `=` and a `%`; and a session id holding a newline
+/// adds no line. NEGATIVE CONTROL: the old encoder (each byte cast to a `char`, spaces and
 /// newlines only) reads the roots back mangled and the sid's newline as a `root` line.
 #[test]
 fn a_header_reads_back_any_path_and_session_id() {
@@ -333,6 +343,11 @@ fn exe_word_is_the_plain_basename_only() {
     assert_eq!(exe_word(Path::new("/")), None);
 }
 
+/// A dead run's member that meets every condition is ended; each case below breaks ONE of
+/// them and its member is named and left (or, for the windows and the reused group, is not
+/// the run's at all). The group's leader still runs (`targo`, orphaned and outside the roots,
+/// so named), which keeps the group a witness. NEGATIVE CONTROL: drop any one guard of
+/// `Judge::judge` (A3 C-tree, A4 orphaned, A5 held, A6 group or id, A7 tty, a window bound,
 /// the leader check) and its case's member is ended.
 #[test]
 fn each_condition_of_the_dead_run_pass_names_what_it_cannot_prove() {
@@ -480,6 +495,9 @@ fn each_condition_of_the_dead_run_pass_names_what_it_cannot_prove() {
     }
 }
 
+/// The dead run's stage leader itself, orphaned when the run's launcher died, is judged like
+/// any member and ended (the stage sweep skips its own leader only because that leader is an
+/// unreaped zombie then). NEGATIVE CONTROL: skip the member equal to the pgid, and the leader
 /// lives on while the pass says the run left nothing.
 #[test]
 fn a_dead_runs_stage_leader_is_ended() {
@@ -493,6 +511,9 @@ fn a_dead_runs_stage_leader_is_ended() {
     assert!(lines[0].contains("ended aterm_x-1"), "{lines:?}");
 }
 
+/// W-run at the next run's start: a member that left every recorded group (`setsid`) but
+/// carries the dead run's id, born in its window, is found and ended; one that carries
+/// another run's id is not the dead run's. NEGATIVE CONTROL: judge the recorded groups alone
 /// and the first is never seen, so the record is removed with it still running.
 #[test]
 fn a_dead_runs_member_that_left_its_groups_is_found_by_its_id() {
@@ -512,6 +533,9 @@ fn a_dead_runs_member_that_left_its_groups_is_found_by_its_id() {
     );
 }
 
+/// The window's upper bound is a high-water read AFTER the launcher was found dead: a member
+/// born after this run started (runs overlap) but while the dead run lived is still the dead
+/// run's, and that high-water is what `dead_seen` records. NEGATIVE CONTROL: bound it by this
 /// process's own unique id, and the member is skipped silently.
 #[test]
 fn the_dead_runs_window_closes_at_a_high_water_read_after_its_death() {
@@ -525,7 +549,14 @@ fn the_dead_runs_window_closes_at_a_high_water_read_after_its_death() {
     assert_eq!(k.termed(), [71], "{lines:?}");
 }
 
-/// one being written is deleted as another boot's.
+/// A dead run's record is kept while the pass leaves something of it named or not judged,
+/// with `dead_seen` appended once; the next pass reuses that horizon, and removes the record
+/// once nothing of it is left. Another boot's record is deleted unjudged; while a record is
+/// still being written (no `run` line yet), the pass stops before it judges anything: it
+/// signals nothing, reads no process's markers and changes no record, that one and another
+/// boot's included. NEGATIVE CONTROLS: remove the record whatever the pass found, and the
+/// unjudged member's record is gone; judge a record with no `run` line, and the one being
+/// written is deleted as another boot's.
 #[test]
 fn a_dead_runs_record_stays_while_it_names_a_member() {
     let mut k = FakeKernel::default();
@@ -584,6 +615,9 @@ fn a_dead_runs_record_stays_while_it_names_a_member() {
     assert!(!path.exists(), "nothing of it left named");
 }
 
+/// The pass never ends this process or one it runs under, even one a dead run's record
+/// proves (a verify started by a dead run's stage). And a uid listing that fails ends nothing
+/// and keeps every record. NEGATIVE CONTROL: judge the ancestors too, and this process's own
 /// parent is ended.
 #[test]
 fn the_start_pass_spares_what_it_runs_under_and_keeps_records_it_cannot_judge() {
@@ -608,6 +642,12 @@ fn the_start_pass_spares_what_it_runs_under_and_keeps_records_it_cannot_judge() 
     assert!(dir.path().join("41983-999.run").exists());
 }
 
+/// A held program's environment is never read (M29: in a wedge an argument read of a program
+/// held mid-start never returns), so the program check is judged first. A held member of a
+/// recorded group is the run's by W-group and named; a held process in no recorded group,
+/// born in the run's window and running from its roots, may carry its id and is counted as
+/// not judged, and the record is kept for a later pass; one running from elsewhere is not the
+/// run's. NEGATIVE CONTROL: read the markers before the program check, and the
 /// held processes' environments are read.
 #[test]
 fn a_held_programs_environment_is_never_read() {
@@ -651,6 +691,9 @@ fn a_held_programs_environment_is_never_read() {
     );
 }
 
+/// The judgment is made again on a fresh read before the signal: a member proven at the
+/// listing that is adopted by a live parent before its end (no longer orphaned, its identity
+/// unchanged) is not signalled, and is named. NEGATIVE CONTROL: pass `still = |_| true` (or
 /// drop the judgment from `end_proven`) and it is SIGTERMed.
 #[test]
 fn a_member_that_stops_being_proven_before_its_signal_is_left() {
@@ -666,6 +709,10 @@ fn a_member_that_stops_being_proven_before_its_signal_is_left() {
     assert!(lines[0].contains("named aterm"), "{lines:?}");
 }
 
+/// The stage sweep ends a survivor under the roots that is not held, names the rest, and
+/// skips one gone since the listing; a survivor that outlives its SIGTERM is SIGKILLed. A
+/// group is recorded `closed` only when listed in full with nothing named. NEGATIVE CONTROLS:
+/// drop the held check and the held survivor is ended; write `closed` whenever nothing was
 /// ended or named and the unlisted group is closed.
 #[test]
 fn the_stage_sweep_ends_under_roots_and_names_the_rest() {
@@ -702,6 +749,10 @@ fn the_stage_sweep_ends_under_roots_and_names_the_rest() {
     assert!(report.closed() && report.line().is_none(), "{report:?}");
 }
 
+/// A group the sweep cannot prove empty is never `closed`: one with no listing, one whose
+/// listing filled its buffer (its line says so), one whose survivor's signal the kernel
+/// refused (named), and one whose survivor left the group before its signal (named).
+/// NEGATIVE CONTROL: count a failed end as nothing, or write `closed` for an empty report,
 /// and these groups are closed.
 #[test]
 fn a_group_the_sweep_cannot_prove_empty_stays_open() {
@@ -743,6 +794,12 @@ fn a_group_the_sweep_cannot_prove_empty_stays_open() {
     );
 }
 
+/// THE ROOTS ARE WHERE THE BUILD PUT ITS EXECUTABLES, read from cargo's own answer and
+/// wherever they sit: atpkg's shim builds the test binaries in a per-checkout cache outside
+/// the worktree, and a caller's CARGO_TARGET_DIR outside it holds the broker `aterm`. The
+/// test binary's own stand-in and the broker left in its stage group are ended; a daemon
+/// outside every root is named. The worktree stays the first root, whatever sorts before
+/// it, so a dead run's line names its worktree. NEGATIVE CONTROL: the old rule (a target or
 /// build dir is a root only inside the worktree) names both, so `ended` is empty.
 #[test]
 fn the_roots_are_where_the_build_put_its_executables() {
@@ -814,6 +871,9 @@ fn the_roots_are_where_the_build_put_its_executables() {
     assert!(parse_build_dirs("warning: not json").is_empty());
 }
 
+/// The build-directory question is asked as the main lane's children ask: led by its
+/// build-dir `--config`, without which a plain `targo metadata` names the worktree's target
+/// and not the shim's cache the test binaries run from. NEGATIVE CONTROL: ask through a bare
 /// `targo` (as `cells.rs` asks for member names) and the `--config` is gone.
 #[test]
 fn the_build_dirs_are_asked_as_the_main_lane_asks() {
@@ -837,6 +897,10 @@ fn the_build_dirs_are_asked_as_the_main_lane_asks() {
     assert!(ask.args.iter().any(|a| a == "metadata"), "{ask:?}");
 }
 
+/// A root the build has yet to make when the run starts, under a linked prefix (macOS's
+/// `/tmp`), reads as the kernel will name it, so the exe the build later puts there is under
+/// it; a root recorded raw under that link matches too, since both sides are read at the
+/// check. NEGATIVE CONTROL: the old reading (canonicalize, or keep the raw path when it does
 /// not exist yet) leaves the root under the link, and the exe is not under it.
 #[cfg(unix)]
 #[test]
@@ -861,6 +925,7 @@ fn a_root_made_after_the_run_started_still_matches() {
     );
 }
 
+/// A6 at the next run's start: a member a LIVE run claims (its pgid is the live run's group,
 /// or it carries the live run's id) is never ended by another run's start.
 #[test]
 fn a_member_a_live_run_claims_is_spared() {
@@ -1207,6 +1272,12 @@ fn only_a_group_proven_empty_is_recorded_closed() {
     assert_eq!(closed, [500], "{rec:?}");
 }
 
+/// A dead run's group is a witness (W-group) only while its leader still reads with the birth
+/// the record names. A leader that is gone leaves the number free to be taken and led again by
+/// a process that may have exited too, so a process in that group that carries no run's id is
+/// not the run's, however its window and its roots read; a group line written when its leader
+/// could not be read (`leader_birth=0`) is no witness either. A member that carries the run's
+/// id is still the run's (W-run). NEGATIVE CONTROL: the old leader check (a leader that reads
 /// dead passes) ends the stranger in both records.
 #[test]
 fn a_group_whose_leader_is_gone_proves_no_member() {
@@ -1246,6 +1317,9 @@ fn a_closed_line_closes_only_the_group_before_it() {
     assert_eq!(open, [(500, "b".to_owned())], "{rec:?}");
 }
 
+/// A live run's launcher is that run's, whatever id its own environment inherited: a verify
+/// started inside another run's stage carries the outer run's id, and when the outer run dies
+/// the inner one, still running, is spared, not ended as the outer run's orphan. NEGATIVE
 /// CONTROL: claim only live runs' groups and ids, and the inner verify is SIGTERMed.
 #[test]
 fn a_live_runs_launcher_is_never_a_dead_runs_member() {
@@ -1265,6 +1339,9 @@ fn a_live_runs_launcher_is_never_a_dead_runs_member() {
     assert_eq!((ended, k.termed()), (0, Vec::new()), "{lines:?}");
 }
 
+/// A live run claims only the groups it has not closed: one it proved empty holds nothing of
+/// it, so a process a later group under that number holds is judged on its own. NEGATIVE
+/// CONTROL: claim every group a live run ever recorded, and the dead run's orphan is only
 /// named.
 #[test]
 fn a_group_a_live_run_closed_claims_nothing() {
@@ -1283,6 +1360,9 @@ fn a_group_a_live_run_closed_claims_nothing() {
     assert_eq!((ended, k.termed()), (1, vec![71]), "{lines:?}");
 }
 
+/// A member listed in the group whose lineage does not read while its birth still does is
+/// alive, not gone: it is named, and its group is not recorded closed. Only a read that finds
+/// nothing says a member left. NEGATIVE CONTROL: skip a member whose lineage does not read,
 /// and the group is closed with it alive.
 #[test]
 fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
@@ -1326,6 +1406,8 @@ fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
     assert!(report.closed() && report.named.is_empty(), "{report:?}");
 }
 
+/// A member that exits on its own while it is read is gone, not named: the stage sweep closes
+/// its group, and a dead run's pass names nothing and removes the record. NEGATIVE CONTROL:
 /// count every member not ended as named, and a `?` is named and the group stays open.
 #[test]
 fn a_member_that_exits_on_its_own_mid_read_is_gone() {
@@ -1353,6 +1435,8 @@ fn a_member_that_exits_on_its_own_mid_read_is_gone() {
     assert!(!dir.path().join("41983-999.run").exists(), "{lines:?}");
 }
 
+/// A survivor that outlives its SIGKILL too (wedged in the kernel) is still there: named, and
+/// its group stays open. NEGATIVE CONTROL: count a sent SIGKILL as ended, and the group is
 /// recorded closed with the survivor in the table.
 #[test]
 fn a_survivor_still_there_after_its_sigkill_is_named() {
@@ -1368,6 +1452,9 @@ fn a_survivor_still_there_after_its_sigkill_is_named() {
     assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
 }
 
+/// A survivor that exits just before its SIGTERM lands (the kernel answers `ESRCH`) is gone:
+/// not ended, since no signal reached it, and not named; its group closes. NEGATIVE CONTROL:
+/// call every gone answer ended, and the receipt says verify ended a process it never
 /// signalled.
 #[test]
 fn a_survivor_gone_as_its_signal_lands_is_gone() {
@@ -1383,6 +1470,11 @@ fn a_survivor_gone_as_its_signal_lands_is_gone() {
     );
 }
 
+/// THE RUN'S RECORD NAMES WHERE ITS BUILD PUT ITS EXECUTABLES: `Runs::open` asks cargo once, as
+/// the main lane's children ask (the metadata command, with the run's own child environment),
+/// skips the banner a shim prints beside the answer, and writes each directory cargo names as a
+/// root, wherever it sits, after the worktree. NEGATIVE CONTROL: open the record with no build
+/// dirs (`&[]` in place of `build_dirs`), and the cache the test binaries run from is no root;
 /// ask with another environment, and the environment assertion fails.
 #[cfg(target_vendor = "apple")]
 #[test]

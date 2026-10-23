@@ -273,7 +273,7 @@ impl GlDevice {
         Ok(tex)
     }
 
-    /// Upload rows `y0, y0 + rows)` at full width from `bytes`, tightly packed at `bytes_per_row`:
+    /// Upload rows `[y0, y0 + rows)` at full width from `bytes`, tightly packed at `bytes_per_row`:
     /// `Self::upload_region`'s full-width case.
     #[inline]
     pub(crate) fn upload_rows(

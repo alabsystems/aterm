@@ -174,7 +174,7 @@ impl Rooms {
             .map_or_else(|| room_bounds(total).0, |m| m.room(now_s, total))
     }
 
-    /// Returns whether a write is due at `now_s` and records the save timestamp.
+    /// Returns whether a write is due at `now_s`, recording `now_s` as the last save when it is.
     pub fn save_due(&mut self, now_s: i64) -> bool {
         if self
             .saved_at

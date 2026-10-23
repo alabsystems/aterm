@@ -3,10 +3,15 @@
 
 //! Grammar and query parser for the `sys` control verb.
 
+use crate::explain::WhySubject;
+
 /// The usage line every refusal of the grammar answers.
-pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|procs] \
+pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|procs|why] \
                          [scope=pane|tab|window|aterm|global] [instances=all] [top=<1-64>] \
                          [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]\n";
+/// The usage line a `why` with a subject it does not read answers.
+pub const WHY_USAGE: &str =
+    "ERR usage: sys why [cpu|mem] [top=<1-64>] [fresh=<ms>] [since=<ep>.<seq>] [--json]\n";
 
 /// The rows a view lists by default.
 pub const TOP_DEFAULT: usize = 8;
@@ -38,11 +43,13 @@ pub enum View {
     Disk,
     /// Process rows.
     Procs,
+    /// Who uses the CPU or memory, and why.
+    Why,
 }
 
 impl View {
     /// Every view, in the help's order.
-    pub const ALL: [View; 10] = [
+    pub const ALL: [View; 11] = [
         Self::Overview,
         Self::Tab,
         Self::Aterm,
@@ -53,6 +60,7 @@ impl View {
         Self::Mem,
         Self::Disk,
         Self::Procs,
+        Self::Why,
     ];
 
     /// Its word.
@@ -69,6 +77,7 @@ impl View {
             Self::Mem => "mem",
             Self::Disk => "disk",
             Self::Procs => "procs",
+            Self::Why => "why",
         }
     }
 
@@ -76,11 +85,11 @@ impl View {
         Self::ALL.into_iter().find(|v| v.word() == w)
     }
 
-    /// Returns the default scope for `self`, or `None` for scope views.
+    /// Returns the default scope for `self`, or `None` for scope views and `why`.
     #[must_use]
     pub fn default_scope(self) -> Option<ScopeArg> {
         match self {
-            Self::Overview | Self::Tab | Self::Aterm | Self::Global => None,
+            Self::Overview | Self::Tab | Self::Aterm | Self::Global | Self::Why => None,
             Self::Jobs | Self::Disk | Self::Procs => Some(ScopeArg::Tab),
             Self::Cores | Self::Gpu | Self::Mem => Some(ScopeArg::Global),
         }
@@ -177,6 +186,8 @@ pub struct SysQuery {
     pub instances_all: bool,
     /// `top=`.
     pub top: usize,
+    /// Whether `top=` was given (it lifts `why`'s byte cut).
+    pub top_set: bool,
     /// `depth=` (disk).
     pub depth: Option<u8>,
     /// `fresh=`, ms (0 forces a sample).
@@ -189,6 +200,9 @@ pub struct SysQuery {
     pub caller: Option<String>,
     /// `sys name job=|task=`.
     pub name: Option<NameTarget>,
+    /// `why`'s subject; `None` for a bare `why` (the reply chooses) and every
+    /// other view.
+    pub subject: Option<WhySubject>,
 }
 
 /// An id `job=`/`task=` takes: `[A-Za-z0-9_-]{1,32}`.
@@ -213,19 +227,23 @@ impl SysQuery {
     /// Parses the arguments after `sys`.
     ///
     /// # Errors
-    /// [`USAGE`] for an unknown view or key or invalid `scope=`, `top=`, `depth=`, or `instances=`.
+    /// [`USAGE`] for an unknown or second view, an unknown key, an invalid value, a bare `name`,
+    /// or `scope=`, `depth=` or `instances=` on a view that does not take it;
+    /// [`WHY_USAGE`] for any other word after `why`.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         let mut q = Self {
             view: View::Overview,
             scope: None,
             instances_all: false,
             top: TOP_DEFAULT,
+            top_set: false,
             depth: None,
             fresh_ms: None,
             since: None,
             json: false,
             caller: None,
             name: None,
+            subject: None,
         };
         let mut view_seen = false;
         let mut naming = false;
@@ -243,6 +261,7 @@ impl SysQuery {
                     return Err(USAGE);
                 }
                 q.top = n;
+                q.top_set = true;
             } else if let Some(v) = tok.strip_prefix("depth=") {
                 let d: u8 = v.parse().map_err(|_| USAGE)?;
                 if !(1..=8).contains(&d) {
@@ -262,6 +281,12 @@ impl SysQuery {
                 q.name = Some(NameTarget::Job(id_word(v).ok_or(USAGE)?));
             } else if naming && let Some(v) = tok.strip_prefix("task=") {
                 q.name = Some(NameTarget::Task(id_word(v).ok_or(USAGE)?));
+            } else if q.view == View::Why {
+                q.subject = match tok {
+                    "cpu" | "global.cpu" if q.subject.is_none() => Some(WhySubject::Cpu),
+                    "mem" | "global.mem" if q.subject.is_none() => Some(WhySubject::Mem),
+                    _ => return Err(WHY_USAGE),
+                };
             } else if !view_seen && tok == "name" {
                 view_seen = true;
                 naming = true;
@@ -313,7 +338,13 @@ impl SysQuery {
             return false;
         }
         match self.view {
-            View::Overview | View::Tab | View::Global | View::Cores | View::Gpu | View::Mem => true,
+            View::Overview
+            | View::Tab
+            | View::Global
+            | View::Cores
+            | View::Gpu
+            | View::Mem
+            | View::Why => true,
             View::Aterm => false,
             View::Jobs | View::Procs => {
                 matches!(self.effective_scope(), Some(ScopeArg::Tab | ScopeArg::Pane))
@@ -330,6 +361,7 @@ impl SysQuery {
     pub fn freshness_default_ms(&self) -> u64 {
         match self.view {
             View::Cores => 1_000,
+            View::Why => 5_000,
             View::Disk => 10_000,
             _ => 2_000,
         }
@@ -397,9 +429,55 @@ mod tests {
             "name",
             "name job=a;b",
             "procs caller=a%20b",
+            "why scope=tab",
+            "why scope=global",
+            "why instances=all",
+            "why depth=2",
+            "why top=65",
+            "procs why",
+            "cpu why",
         ] {
             assert_eq!(SysQuery::parse(bad), Err(USAGE), "{bad}");
         }
+    }
+
+    /// `why` takes at most one subject, either spelling; with none the reply
+    /// chooses. Any other word after it, a second subject included, answers
+    /// `why`'s own usage line, never the built one.
+    #[test]
+    fn why_takes_one_subject_and_answers_its_own_usage() {
+        let subject = |s: &str| SysQuery::parse(s).map(|q| (q.view, q.subject));
+        assert_eq!(subject("why"), Ok((View::Why, None)));
+        for (text, want) in [
+            ("why cpu", WhySubject::Cpu),
+            ("why global.cpu", WhySubject::Cpu),
+            ("why mem", WhySubject::Mem),
+            ("why global.mem --json top=3", WhySubject::Mem),
+        ] {
+            assert_eq!(subject(text), Ok((View::Why, Some(want))), "{text}");
+        }
+        let q = SysQuery::parse("why top=3 fresh=0 since=7f3a.2 caller=s-1").unwrap();
+        assert!(q.top_set && q.top == 3 && q.fresh_ms == Some(0) && q.since.is_some());
+        assert!(!SysQuery::parse("why").unwrap().top_set);
+        assert_eq!(SysQuery::parse("mem").unwrap().subject, None);
+        for bad in [
+            "why pid=1",
+            "why cpu mem",
+            "why mem mem",
+            "why gpu",
+            "why disk",
+            "why tab.cpu",
+            "why name",
+            "why why",
+            "why job=a1",
+        ] {
+            assert_eq!(SysQuery::parse(bad), Err(WHY_USAGE), "{bad}");
+        }
+        assert_eq!(
+            SysQuery::parse("why").unwrap().freshness_default_ms(),
+            5_000
+        );
+        assert_eq!(SysQuery::parse("why").unwrap().effective_scope(), None);
     }
 
     #[test]
@@ -421,6 +499,9 @@ mod tests {
             "jobs scope=pane",
             "disk scope=window",
             "mem top=20",
+            "why",
+            "why cpu",
+            "why global.mem --json",
         ] {
             assert!(rows_only(ok), "{ok}");
         }

@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The machine abrew's admission judges a recipe against (design §3): its
-//! operating system and architecture, its macOS and Xcode versions and
-//! whether the Command Line Tools are installed. [`Machine::this`] is the
-//! running machine, each fact probed once per process when a recipe first
-//! asks for it; [`Machine::mac`] is a modelled one, which the admission
-//! census ([`super::census`]) and tests judge against.
+//! The machine abrew's admission judges a recipe against (design §3).
 
 use std::sync::OnceLock;
 
@@ -38,9 +33,7 @@ pub fn release_name(major: u64) -> Option<&'static str> {
         .map(|(_, name, _)| *name)
 }
 
-/// The Xcode released with macOS `macos` (`16.0` for `15.5`), the one a
-/// modelled Mac on it runs unless another is named; a release newer than the
-/// table keeps the shared number. `None` for one older than the table.
+/// The Xcode version released with macOS `macos`.
 #[must_use]
 pub fn release_xcode(macos: &str) -> Option<String> {
     let major: u64 = macos.split('.').next()?.parse().ok()?;
@@ -71,9 +64,7 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// The running machine. Its versions are probed (`sw_vers`, the
-    /// selected Xcode's version plist, the CommandLineTools folder) at most
-    /// once per process, the first time admission needs each.
+    /// The running machine.
     #[must_use]
     pub fn this() -> &'static Machine {
         static THIS: OnceLock<Machine> = OnceLock::new();
@@ -96,9 +87,7 @@ impl Machine {
         })
     }
 
-    /// A modelled Mac: `arch` in Homebrew's spelling, the macOS and Xcode
-    /// versions it runs (`None`: no Xcode) and whether the Command Line
-    /// Tools are installed. Nothing is probed.
+    /// A modelled Mac with `arch`, macOS and Xcode versions, and CLT presence.
     #[must_use]
     pub fn mac(arch: &str, macos: &str, xcode: Option<&str>, clt: bool) -> Machine {
         Machine {
@@ -110,9 +99,7 @@ impl Machine {
         }
     }
 
-    /// [`Machine::mac`] from facts a person typed, refused unless this
-    /// machine's own probes could report them: an architecture Homebrew
-    /// builds bottles for, and numeric macOS and Xcode versions.
+    /// [`Machine::mac`] from user-supplied architecture, macOS, and Xcode strings.
     pub fn modelled(
         arch: &str,
         macos: &str,
@@ -135,9 +122,7 @@ impl Machine {
         Ok(Machine::mac(arch, macos, xcode, clt))
     }
 
-    /// The newest Mac abrew can name: arm64 on the newest release in its
-    /// table, with that release's Xcode and the Command Line Tools — the
-    /// API's default system, whose top-level fields need no variation.
+    /// The newest Mac abrew can name (arm64 on the newest release with Xcode and CLT).
     #[must_use]
     pub fn newest_mac() -> Machine {
         let version = format!("{}.0", RELEASES[0].0);
@@ -170,9 +155,7 @@ impl Machine {
         self.macos_version()?.split('.').next()?.parse().ok()
     }
 
-    /// The installed Xcode's version, for `depends_on xcode:` floors. `None`
-    /// off macOS, with only the Command Line Tools selected, or on any probe
-    /// failure: an unmet requirement then delegates like the macOS floors do.
+    /// The installed Xcode's version, for `depends_on xcode:` floors.
     #[must_use]
     pub fn xcode_version(&self) -> Option<&str> {
         self.xcode
@@ -186,8 +169,7 @@ impl Machine {
             .as_deref()
     }
 
-    /// Whether the Command Line Tools are installed (`pour_bottle_only_if:
-    /// :clt_installed`).
+    /// Whether the Command Line Tools are installed (`pour_bottle_only_if: :clt_installed`).
     #[must_use]
     pub fn has_clt(&self) -> bool {
         *self.clt.get_or_init(|| {
@@ -196,10 +178,7 @@ impl Machine {
         })
     }
 
-    /// Compatible bottle tags, best first. Linux names its architecture; a
-    /// Mac every release from its own back to big_sur (Intel tags carry no
-    /// architecture prefix). An unknown macOS version admits only a
-    /// formula's `all` fallback: it never guesses a newer OS requirement.
+    /// Compatible bottle tags, best first.
     #[must_use]
     pub fn bottle_tags(&self) -> Vec<String> {
         if !ARCHES.contains(&self.arch()) {
@@ -222,10 +201,7 @@ impl Machine {
         }
     }
 
-    /// The `variations` keys that describe exactly this system, in
-    /// Homebrew's order: `<arch>_linux`; on a Mac `arm64_<release>`, or for
-    /// Intel `x86_64_<release>` then the bare release. `None` when the
-    /// system cannot be named (an unknown macOS release, another OS).
+    /// The `variations` keys that describe exactly this system, in Homebrew's order.
     #[must_use]
     pub fn variation_keys(&self) -> Option<Vec<String>> {
         match self.os {
@@ -281,11 +257,7 @@ fn probe_xcode() -> Option<String> {
     DeveloperDir::this().bundle_version()
 }
 
-/// The developer directory `xcode-select`'s shims (`/usr/bin/otool`,
-/// `install_name_tool`, `xcodebuild`, `cc`) would run a tool from, read
-/// without running one: each shim raises Apple's install dialog, and waits
-/// for a person, on a Mac without the developer tools. Its sources are
-/// injected so tests read scratch folders.
+/// The developer directory `xcode-select`'s shims would run a tool from, read without running one.
 pub(super) struct DeveloperDir {
     /// `DEVELOPER_DIR`, which the shims honour before the selection.
     developer_dir_env: Option<std::ffi::OsString>,
@@ -297,8 +269,7 @@ pub(super) struct DeveloperDir {
 }
 
 impl DeveloperDir {
-    /// This Mac's: `DEVELOPER_DIR`, `/var/db/xcode_select_link`, then
-    /// `/Applications/Xcode.app` and the Command Line Tools.
+    /// This Mac's developer directory (`DEVELOPER_DIR`, `xcode_select_link`, Xcode, or CLT).
     pub(super) fn this() -> DeveloperDir {
         DeveloperDir {
             developer_dir_env: std::env::var_os("DEVELOPER_DIR"),
@@ -328,11 +299,8 @@ impl DeveloperDir {
         Some(dir)
     }
 
-    /// The developer tool `name` a shim would run: the developer
-    /// directory's `usr/bin/<name>`, else its default toolchain's (where an
-    /// Xcode keeps `install_name_tool` and `otool`), when it is an executable
-    /// file. `None` on a Mac without the developer tools, where the shim
-    /// would raise the install dialog instead.
+    /// The developer tool `name` a shim would run.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(super) fn tool(&self, name: &str) -> Option<std::path::PathBuf> {
         let dir = self.active()?;
         ["usr/bin", "Toolchains/XcodeDefault.xctoolchain/usr/bin"]
@@ -392,7 +360,6 @@ mod tests {
                 .bottle_tags()
                 .is_empty()
         );
-        // An unknown version is no version: only `all` can pour.
         assert!(
             Machine::mac("arm64", "next", None, false)
                 .bottle_tags()
@@ -439,6 +406,7 @@ mod tests {
     }
 
     /// A version plist the way an Xcode bundle carries it.
+    #[cfg(unix)]
     fn version_plist(version: &str) -> String {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
@@ -487,8 +455,6 @@ mod tests {
         );
         assert_eq!(probe(Some(&beta), &absent).as_deref(), Some("27.0"));
         assert_eq!(probe(Some(&clt), &absent), None);
-        // Not a bundle's `Contents/Developer`, though a version plist sits
-        // where the bundle's would.
         let tools = root.join("Library/Developer/CommandLineTools");
         std::fs::create_dir_all(&tools).unwrap();
         std::fs::write(

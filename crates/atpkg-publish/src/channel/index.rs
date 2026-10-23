@@ -1138,7 +1138,8 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
     })
 }
 
-/// Read the verified baseline without touching the output.
+/// Read the verified baseline without touching the output. The caller owns `head_dir`
+/// until publication finishes, because the triple gate reads the head's signed files.
 fn read_baseline(
     ctx: &Ctx,
     request: &IndexRequest,
@@ -1197,7 +1198,8 @@ fn read_baseline(
     })
 }
 
-/// Emit and self-verify the quad while the caller holds the output lock.
+/// Emit and self-verify the quad while the caller holds the output lock. A prior
+/// unpublished quad is cleared only after the caller has accepted the complete plan.
 fn write_quad(
     ctx: &Ctx,
     plan: &Plan,

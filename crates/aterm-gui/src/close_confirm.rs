@@ -72,6 +72,7 @@ pub(crate) fn kind(prompt: &ConfirmPrompt) -> &'static str {
     }
 }
 
+/// The pending gesture in words, for the wire's refusals: what [`kind`] says as
 /// a token.
 fn gesture(prompt: &ConfirmPrompt) -> &'static str {
     match prompt.proceed {
@@ -99,6 +100,9 @@ pub(crate) fn answer_keys(prompt: &ConfirmPrompt) -> String {
 /// [`answer_keys`] for a window too narrow to carry the verbs beside the question.
 const ANSWER_KEYS_SHORT: &str = "Enter \u{00b7} Esc";
 
+/// Row 0's title and the answer keys that fit beside it in `cols`: the verbs
+/// first, then the short keys; `None` when neither fits, and the keys take a row of
+/// their own. [`banner_rows`] paints by it and [`PendingClose::wanted_rows`] sizes
 /// by it, so the two agree.
 fn title_row(prompt: &ConfirmPrompt, cols: usize) -> (String, Option<String>) {
     let title = format!("!  {}", question(prompt));
@@ -152,6 +156,7 @@ impl PendingClose {
         }
     }
 
+    /// The wire spellings that answer this question, or `-` for a question the
     /// wire may not answer.
     fn wire_answers(&self) -> (&'static str, &'static str) {
         if self.wire_may_answer() {
@@ -293,6 +298,7 @@ mod tests {
         crate::quit_safety::confirm_prompt(false, true, true).expect("a busy close prompts")
     }
 
+    /// The banner shows what the native dialog showed: title, body and both answers, the
     /// affirmative key naming the prompt's verb.
     #[test]
     fn banner_shows_question_body_and_verb_named_keys() {
@@ -317,6 +323,7 @@ mod tests {
         assert!(!row0.contains("quits"), "{row0}");
     }
 
+    /// The seam is the band's top edge and runs the whole width in one tone (the
     /// `paste_banner` contract); the body row sits inside the band.
     #[test]
     fn the_seam_runs_unbroken_across_the_question_row() {
@@ -328,6 +335,7 @@ mod tests {
         assert!(rows[1].iter().all(|cell| !cell.overline));
     }
 
+    /// Degenerate geometry must not panic: zero columns, one row, a window
     /// narrower than the title.
     #[test]
     fn degenerate_geometry_never_panics() {
@@ -342,6 +350,7 @@ mod tests {
         }
     }
 
+    /// A narrow window still shows the answer keys: the band swallows every other key, so
     /// without them there is no visible way out.
     #[test]
     fn a_narrow_band_keeps_the_answer_keys() {
@@ -375,6 +384,7 @@ mod tests {
         assert!(row0.contains("Enter") && row0.contains("Esc"), "{row0:?}");
     }
 
+    /// The wire kind follows what the answer does: a last-tab close of the last window is a
     /// quit on Windows, and its prompt says so.
     #[test]
     fn kind_follows_the_prompt_verb() {
@@ -388,6 +398,9 @@ mod tests {
         assert_eq!(kind(&multi), "close-window");
     }
 
+    /// The `controls front` line is the agent's whole picture: that a confirm is
+    /// pending, over which window, what it asks, who asked, and the two wire
+    /// spellings that answer it — the `confirm` verb's, never a keystroke, so the
     /// printed answer reaches the question whichever window is in front.
     #[test]
     fn controls_line_reports_the_question_and_how_to_answer_it() {
@@ -425,6 +438,8 @@ mod tests {
         assert_eq!(pending.wire_answered(false), "answered=no kind=quit");
     }
 
+    /// The `confirm` grammar: exactly `yes` or `no`. A guess — a bare `confirm`,
+    /// `confirm y`, a trailing word — is the usage line, never an answer: `yes`
     /// quits, so nothing but `yes` may mean it.
     #[test]
     fn the_confirm_verb_takes_exactly_yes_or_no() {
@@ -439,6 +454,8 @@ mod tests {
         }
     }
 
+    /// A question a person asked is theirs to answer: the wire may not, the report says who asked
+    /// and that no wire verb answers it, and a gesture with no close scope of its own (the Quit
     /// menu) counts as the person's. A control client's sid asks on the wire like `ctl` does.
     #[test]
     fn a_question_a_person_asked_is_not_answered_from_the_wire() {

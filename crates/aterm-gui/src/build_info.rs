@@ -158,7 +158,8 @@ const fn update_pin_record_bytes(value: &str) -> [u8; 64] {
     record
 }
 
-/// Linker-retained, fixed-format release-authority record.
+/// Linker-retained, fixed-format release-authority record. Its own Mach-O section lets the
+/// release cutter find it structurally, never by a byte-substring match.
 #[cfg(target_vendor = "apple")]
 #[used]
 #[unsafe(link_section = "__DATA,__aterm_upin")]

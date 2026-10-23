@@ -431,7 +431,10 @@ fn line_len() -> usize {
     head + rows + " sum=".len() + 16 + "\n".len()
 }
 
-/// THE LINE'S CHECKSUM: aterm-hash's word-at-a-time Fx hash, not FNV-1a.
+/// THE LINE'S CHECKSUM: aterm-hash's word-at-a-time Fx hash, not FNV-1a. It
+/// only has to tell a torn read from a whole line, and the loop pays for it
+/// at every idle write: over a line of about 6 KiB FNV-1a's byte-serial
+/// multiply chain was most of the write's cost ([`Row::TallyWrite`]).
 fn checksum(body: &[u8]) -> u64 {
     aterm_hash::fx_hash_bytes(body)
 }

@@ -47,7 +47,7 @@ enum Position {
 }
 
 impl Position {
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             Position::Container => "container",
             Position::Variant => "variant",
@@ -234,7 +234,7 @@ pub(crate) struct Attr<'c, T> {
 }
 
 impl<'c, T> Attr<'c, T> {
-    fn none(cx: &'c Errors, name: &'static str) -> Self {
+    const fn none(cx: &'c Errors, name: &'static str) -> Self {
         Attr {
             cx,
             name,
@@ -265,7 +265,7 @@ impl<'c, T> Attr<'c, T> {
 struct BoolAttr<'c>(Attr<'c, ()>);
 
 impl<'c> BoolAttr<'c> {
-    fn none(cx: &'c Errors, name: &'static str) -> Self {
+    const fn none(cx: &'c Errors, name: &'static str) -> Self {
         BoolAttr(Attr::none(cx, name))
     }
 
@@ -273,7 +273,7 @@ impl<'c> BoolAttr<'c> {
         self.0.set(meta, ());
     }
 
-    fn get(&self) -> bool {
+    const fn get(&self) -> bool {
         self.0.value.is_some()
     }
 }
@@ -356,16 +356,16 @@ impl MultiName {
     }
 
     /// Return the container name for the container when serializing.
-    pub fn serialize_name(&self) -> &Name {
+    pub const fn serialize_name(&self) -> &Name {
         &self.serialize
     }
 
     /// Return the container name for the container when deserializing.
-    pub fn deserialize_name(&self) -> &Name {
+    pub const fn deserialize_name(&self) -> &Name {
         &self.deserialize
     }
 
-    fn deserialize_aliases(&self) -> &BTreeSet<Name> {
+    const fn deserialize_aliases(&self) -> &BTreeSet<Name> {
         &self.deserialize_aliases
     }
 }
@@ -527,31 +527,31 @@ impl Container {
         }
     }
 
-    pub fn name(&self) -> &MultiName {
+    pub const fn name(&self) -> &MultiName {
         &self.name
     }
 
-    pub fn rename_all_rule(&self) -> RenameRule {
+    pub const fn rename_all_rule(&self) -> RenameRule {
         self.rename_all_rule
     }
 
-    pub fn transparent(&self) -> bool {
+    pub const fn transparent(&self) -> bool {
         self.transparent
     }
 
-    pub fn deny_unknown_fields(&self) -> bool {
+    pub const fn deny_unknown_fields(&self) -> bool {
         self.deny_unknown_fields
     }
 
-    pub fn default(&self) -> &Default {
+    pub const fn default(&self) -> &Default {
         &self.default
     }
 
-    pub fn tag(&self) -> &TagType {
+    pub const fn tag(&self) -> &TagType {
         &self.tag
     }
 
-    pub fn is_packed(&self) -> bool {
+    pub const fn is_packed(&self) -> bool {
         self.is_packed
     }
 }
@@ -631,11 +631,11 @@ impl Variant {
         }
     }
 
-    pub fn name(&self) -> &MultiName {
+    pub const fn name(&self) -> &MultiName {
         &self.name
     }
 
-    pub fn aliases(&self) -> &BTreeSet<Name> {
+    pub const fn aliases(&self) -> &BTreeSet<Name> {
         self.name.deserialize_aliases()
     }
 
@@ -676,7 +676,7 @@ pub enum Default {
 }
 
 impl Default {
-    pub fn is_none(&self) -> bool {
+    pub const fn is_none(&self) -> bool {
         match self {
             Default::None => true,
             Default::Default | Default::Path(_) => false,
@@ -798,11 +798,11 @@ impl Field {
         }
     }
 
-    pub fn name(&self) -> &MultiName {
+    pub const fn name(&self) -> &MultiName {
         &self.name
     }
 
-    pub fn aliases(&self) -> &BTreeSet<Name> {
+    pub const fn aliases(&self) -> &BTreeSet<Name> {
         self.name.deserialize_aliases()
     }
 
@@ -818,39 +818,39 @@ impl Field {
             .insert(self.name.deserialize.clone());
     }
 
-    pub fn skip_serializing(&self) -> bool {
+    pub const fn skip_serializing(&self) -> bool {
         self.skip_serializing
     }
 
-    pub fn skip_deserializing(&self) -> bool {
+    pub const fn skip_deserializing(&self) -> bool {
         self.skip_deserializing
     }
 
-    pub fn skip_serializing_if(&self) -> Option<&TokenStream> {
+    pub const fn skip_serializing_if(&self) -> Option<&TokenStream> {
         self.skip_serializing_if.as_ref()
     }
 
-    pub fn default(&self) -> &Default {
+    pub const fn default(&self) -> &Default {
         &self.default
     }
 
-    pub fn deserialize_with(&self) -> Option<&TokenStream> {
+    pub const fn deserialize_with(&self) -> Option<&TokenStream> {
         self.deserialize_with.as_ref()
     }
 
-    pub fn borrowed_lifetimes(&self) -> &BTreeMap<String, Lifetime> {
+    pub const fn borrowed_lifetimes(&self) -> &BTreeMap<String, Lifetime> {
         &self.borrowed_lifetimes
     }
 
-    pub fn flatten(&self) -> bool {
+    pub const fn flatten(&self) -> bool {
         self.flatten
     }
 
-    pub fn transparent(&self) -> bool {
+    pub const fn transparent(&self) -> bool {
         self.transparent
     }
 
-    pub fn mark_transparent(&mut self) {
+    pub const fn mark_transparent(&mut self) {
         self.transparent = true;
     }
 }

@@ -5,8 +5,8 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Color Bitmap Location Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/cblc) implementation.
+//! A [Color Bitmap Location Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/cblc)
+//! implementation.
 
 use crate::GlyphId;
 use crate::parser::{FromData, NumFrom, Offset, Offset16, Offset32, Stream};
@@ -53,7 +53,6 @@ struct BitmapSizeTable {
     number_of_subtables: u32,
     ppem: u16,
     bit_depth: u8,
-    // Many fields are omitted.
 }
 
 fn select_bitmap_size_table(
@@ -68,20 +67,18 @@ fn select_bitmap_size_table(
     let mut max_ppem = 0;
     let mut bit_depth_for_max_ppem = 0;
     for i in 0..subtable_count {
-        // Check that the current subtable contains a provided glyph id.
-        s.advance(40); // Jump to `start_glyph_index`.
+        s.advance(40);
         let start_glyph_id = s.read::<GlyphId>()?;
         let end_glyph_id = s.read::<GlyphId>()?;
         let ppem_x = u16::from(s.read::<u8>()?);
-        s.advance(1); // ppem_y
+        s.advance(1);
         let bit_depth = s.read::<u8>()?;
-        s.advance(1); // flags
+        s.advance(1);
 
         if !(start_glyph_id..=end_glyph_id).contains(&glyph_id) {
             continue;
         }
 
-        // Select a best matching subtable based on `pixels_per_em`.
         if (pixels_per_em <= ppem_x && ppem_x < max_ppem)
             || (pixels_per_em > max_ppem && ppem_x > max_ppem)
         {
@@ -92,10 +89,10 @@ fn select_bitmap_size_table(
     }
 
     let mut s = orig_s;
-    s.advance(idx?.checked_mul(48)?); // 48 is BitmapSize Table size
+    s.advance(idx?.checked_mul(48)?);
 
     let subtable_array_offset = s.read::<Offset32>()?;
-    s.skip::<u32>(); // index_tables_size
+    s.skip::<u32>();
     let number_of_subtables = s.read::<u32>()?;
 
     Some(BitmapSizeTable {
@@ -109,7 +106,7 @@ fn select_bitmap_size_table(
 #[derive(Clone, Copy)]
 struct IndexSubtableInfo {
     start_glyph_id: GlyphId,
-    offset: usize, // absolute offset
+    offset: usize,
 }
 
 fn select_index_subtable(
@@ -157,12 +154,8 @@ impl FromData for GlyphIdOffsetPair {
     }
 }
 
-// TODO: rewrite
-
 /// A [Color Bitmap Location Table](
 /// https://docs.microsoft.com/en-us/typography/opentype/spec/cblc).
-///
-/// EBLC and bloc also share the same structure, so this is re-used for them.
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
     data: &'a [u8],
@@ -177,12 +170,7 @@ impl<'a> Table<'a> {
     pub(crate) fn get(&self, glyph_id: GlyphId, pixels_per_em: u16) -> Option<Location> {
         let mut s = Stream::new(self.data);
 
-        // The CBLC table version is a bit tricky, so we are ignoring it for now.
-        // The CBLC table is based on EBLC table, which was based on the `bloc` table.
-        // And before the CBLC table specification was finished, some fonts,
-        // notably Noto Emoji, have used version 2.0, but the final spec allows only 3.0.
-        // So there are perfectly valid fonts in the wild, which have an invalid version.
-        s.skip::<u32>(); // version
+        s.skip::<u32>();
 
         let size_table = select_bitmap_size_table(glyph_id, pixels_per_em, s)?;
         let info = select_index_subtable(self.data, size_table, glyph_id)?;
@@ -226,10 +214,8 @@ impl<'a> Table<'a> {
                 metrics: MetricsFormat::Shared,
                 data: BitmapDataFormat::PNG,
             },
-            _ => return None, // Invalid format.
+            _ => return None,
         };
-
-        // TODO: I wasn't able to find fonts with index 4 and 5, so they are untested.
 
         let glyph_diff = glyph_id.0.checked_sub(info.start_glyph_id.0)?;
         let mut metrics = Metrics::default();
@@ -267,10 +253,10 @@ impl<'a> Table<'a> {
                 metrics.width = s.read::<u8>()?;
                 metrics.x = s.read::<i8>()?;
                 metrics.y = s.read::<i8>()?;
-                s.skip::<u8>(); // hor_advance
-                s.skip::<i8>(); // ver_bearing_x
-                s.skip::<i8>(); // ver_bearing_y
-                s.skip::<u8>(); // ver_advance
+                s.skip::<u8>();
+                s.skip::<i8>();
+                s.skip::<i8>();
+                s.skip::<u8>();
                 let num_glyphs = s.read::<u32>()?;
                 let glyphs = s.read_array32::<GlyphId>(num_glyphs)?;
                 let (index, _) = glyphs.binary_search(&glyph_id)?;
@@ -278,7 +264,7 @@ impl<'a> Table<'a> {
                     usize::num_from(index).checked_mul(usize::num_from(image_size))?,
                 )?;
             }
-            _ => return None, // Invalid format.
+            _ => return None,
         }
 
         Some(Location {

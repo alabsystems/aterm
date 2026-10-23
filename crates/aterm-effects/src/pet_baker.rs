@@ -81,7 +81,10 @@ const fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) ->
     }
 }
 
-/// Paint the glossy finish for one grown, open LOD eye, in device pixels.
+/// Paint the glossy finish for one grown, open LOD eye, in device pixels. Offsets and radii
+/// are fractions of the grown footprint, so far and near eyes each get a glint that fits; the
+/// primary at `(-0.22w, -0.23h)` with radius ≤ `0.13·min(w,h)` stays inside an elliptical eye
+/// (normalized distance ≈0.64 plus radius ≤0.26), so no white fleck leaks onto the coat.
 fn paint_eye_reflections(tile: &mut Tile, eye_mask: &Tile, cx: f32, cy: f32, w: f32, h: f32) {
     let minor = w.min(h);
     if minor < EYE_REFLECTION_MIN_PX {

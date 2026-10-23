@@ -5,13 +5,10 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-/// login.framework's binary (in the shared cache; `dlopen` finds it there).
 const LOGIN_FRAMEWORK: &CStr = c"/System/Library/PrivateFrameworks/login.framework/login";
 
-/// The call: no argument, an `int` back, 0 when loginwindow took the lock.
 const LOCK_SCREEN_IMMEDIATE: &CStr = c"SACLockScreenImmediate";
 
-/// `<dlfcn.h>` on Darwin.
 const RTLD_LAZY: c_int = 0x1;
 const RTLD_LOCAL: c_int = 0x4;
 
@@ -22,7 +19,7 @@ unsafe extern "C" {
 
 /// Lock this process's login session now.
 /// # Errors
-/// One line: the framework or the symbol is missing.
+/// One line: the framework or the symbol is missing, or `SACLockScreenImmediate` answered nonzero.
 pub(super) fn lock_screen_immediate() -> Result<(), String> {
     // SAFETY: A NUL-terminated path and a valid mode.
     let handle = unsafe { dlopen(LOGIN_FRAMEWORK.as_ptr(), RTLD_LAZY | RTLD_LOCAL) };
@@ -58,7 +55,6 @@ pub(super) fn lock_screen_immediate() -> Result<(), String> {
     }
 }
 
-/// `dlerror()`'s message for the last failed call on this thread.
 fn last_error() -> String {
     // SAFETY: `dlerror` returns a NUL-terminated message owned by the loader, or null.
     let message = unsafe { dlerror() };

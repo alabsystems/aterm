@@ -21,7 +21,8 @@ const SLUG: &str = "example/aterm";
 const SIGNER: &str = "synthetic";
 const OTHER: &str = "other";
 
-/// Runs the verifier the installer pipes to `python3 -`.
+/// Runs the verifier the installer pipes to `python3 -`. `run`: the script as
+/// `__main__` with its master pin replaced, exit status and all.
 const HARNESS: &str = r#"import contextlib, errno, io, json, os, sys, types
 source = sys.stdin.read()
 marker = "\nMASTER_PUBKEYS = "
@@ -182,7 +183,9 @@ impl Verifier {
         Self::with(scratch, &Search::host())
     }
 
-    /// The verifier under `scratch`, over the tools `search` finds.
+    /// The verifier under `scratch`, over the tools `search` finds. A host without them
+    /// ends the test COULD NOT RUN saying what is missing (their `TOOLS` rows' refusals):
+    /// never a pass, and never a FAIL, which would charge the installer with the host's gap.
     fn with(scratch: &Scratch, search: &Search) -> Self {
         let tools = tools_in(search).unwrap_or_else(|absent| {
             aterm_uds::host::could_not_run_without(&absent);
@@ -729,7 +732,9 @@ fn main_call(case: &Case, laid: &Laid) -> String {
     .join("\t")
 }
 
-/// The installer's answer as an [`Accepted`], or why it refused.
+/// The installer's answer as an [`Accepted`], or why it refused. An acceptance
+/// whose size, build or roster generation is no u64 (`7.0`, `-1`) reads as a
+/// crash: no Rust verdict can name it.
 fn installer_verdict(answer: &str) -> Result<Accepted, String> {
     let (kind, rest) = answer.split_once('\t').unwrap_or((answer, ""));
     if kind != "ok" {

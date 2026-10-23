@@ -828,6 +828,8 @@ mod tests {
             (f::BOX_RM_NESTED_2_1_308, "rm-breaker"),
             (f::BOX_BASH_TOUCH_2_1_308, "bash"),
             (f::BOX_STATEMENT_FOLLOWS_16_2_1_308, "bash"),
+            (f::BOX_RM_PARSE_DIVERGED_2_1_309, "rm-breaker"),
+            (f::BOX_BASH_TOUCH_2_1_309, "bash"),
         ] {
             let (kind, _) = kind_and_subject(
                 &aterm_phase::ClaudeReader,

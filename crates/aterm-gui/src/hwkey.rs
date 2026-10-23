@@ -36,10 +36,14 @@ const FLAG_FUNCTION: u64 = 1 << 23;
 const MAX_COUNT: u32 = 5000;
 /// Upper bound on the pacing interval, for the same reason.
 const MAX_INTERVAL_MS: u64 = 1000;
-/// Default pacing: 40 ms ≈ 25 keys/s, brisk typing.
+/// Default pacing: 40 ms ≈ 25 keys/s, brisk typing. Not zero: a zero-interval burst measures
+/// queue drain, not typing.
 const DEFAULT_INTERVAL_MS: u64 = 40;
 
-/// A named key: `(name, keycode, characters)`.
+/// A named key: `(name, keycode, characters)`. `characters` uses the private-use
+/// function-key code points AppKit puts in `-[NSEvent characters]` for the
+/// non-printing keys, and the C0/DEL control characters for the rest — the same
+/// bytes a physical press produces.
 const NAMED: &[(&str, u16, &str)] = &[
     ("enter", 36, "\r"),
     ("return", 36, "\r"),

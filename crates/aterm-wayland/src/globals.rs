@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The registry: the globals a compositor advertises, collected on a private
-//! queue in one round trip, and bound by name and version.
+//! Wayland compositor global registry.
 
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -31,8 +30,7 @@ struct RegistryBook {
     generation: u64,
 }
 
-/// A registry on a private queue, kept current as globals come and go
-/// whenever that queue is dispatched.
+/// A Wayland global registry on a private queue.
 pub struct Registry {
     proxy: Proxy,
     registry_book: Arc<Mutex<RegistryBook>>,
@@ -41,8 +39,7 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// `wl_display.get_registry` through `queue`'s display wrapper, then a
-    /// round trip, after which every global the compositor had is listed.
+    /// Creates a registry on `queue` and collects advertised globals in one round trip.
     pub fn new(queue: &Queue) -> Result<Registry, Error> {
         let wrapper = queue.display_wrapper()?;
         // SAFETY: the wrapper is live for the call; the registry it makes is
@@ -79,9 +76,7 @@ impl Registry {
             .clone()
     }
 
-    /// How many times a global came or went since the registry was made: a
-    /// caller that binds globals as they come compares it with the last one
-    /// it saw, and syncs when it moved.
+    /// Returns how many times globals were added or removed since creation.
     pub fn generation(&self) -> u64 {
         self.registry_book
             .lock()
@@ -100,8 +95,7 @@ impl Registry {
             .cloned()
     }
 
-    /// Bind `global` as `iface` at `version` (at most what it offers); the
-    /// object lands on the registry's queue.
+    /// Binds `global` as `iface` at up to `version` on the registry's queue.
     pub fn bind(&self, global: &Global, iface: &'static Interface, version: u32) -> Option<Proxy> {
         let version = version.min(global.version).max(1);
         // SAFETY: the registry is live (owned by self); the interface table
@@ -116,13 +110,11 @@ enum Announced {
     Removed(u32),
 }
 
-/// Listen to a registry: each global announced or removed, decoded with the
-/// book unlocked, then recorded (a leaf of the lock graph: nothing but the
-/// list's own methods runs while it is held).
+/// Attaches a listener that records announced and removed globals in `registry_book`.
 ///
 /// # Safety
-/// `proxy` is a live registry this crate made, without a listener, destroyed
-/// before the listener is freed.
+/// `proxy` is a live registry this crate made, without a listener, destroyed before the listener
+/// is freed.
 unsafe fn registry_listener(
     proxy: Proxy,
     registry_book: &Arc<Mutex<RegistryBook>>,

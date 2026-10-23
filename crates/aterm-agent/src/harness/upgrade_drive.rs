@@ -595,7 +595,7 @@ pub(super) struct Comm {
 
 impl Comm {
     #[cfg(target_os = "macos")]
-    fn named_when_asked(r: aterm_sysprobe::kproc::Record) -> Self {
+    const fn named_when_asked(r: aterm_sysprobe::kproc::Record) -> Self {
         Self {
             name: std::sync::OnceLock::new(),
             record: Some(r),
@@ -878,7 +878,7 @@ fn job_of<K: Kernel + ?Sized>(k: &K, agent: u32) -> Option<(Job, u32)> {
     Some((job(agent, pgid, tpgid, parent_pgid, opened), parent))
 }
 
-pub(super) fn foreground_shell(job: Option<(Job, u32)>) -> Result<u32, &'static str> {
+pub(super) const fn foreground_shell(job: Option<(Job, u32)>) -> Result<u32, &'static str> {
     match job {
         Some((Job::Foreground, shell)) => Ok(shell),
         Some((Job::Background, _)) => Err("not-foreground"),
@@ -887,7 +887,7 @@ pub(super) fn foreground_shell(job: Option<(Job, u32)>) -> Result<u32, &'static 
     }
 }
 
-pub(super) fn leads_terminal(job: Option<(Job, u32)>) -> Result<(), &'static str> {
+pub(super) const fn leads_terminal(job: Option<(Job, u32)>) -> Result<(), &'static str> {
     match job {
         Some((Job::Foreground | Job::TabProgram { foreground: true }, _)) => Ok(()),
         Some((Job::Background | Job::TabProgram { foreground: false }, _)) => Err("not-foreground"),
@@ -896,7 +896,7 @@ pub(super) fn leads_terminal(job: Option<(Job, u32)>) -> Result<(), &'static str
     }
 }
 
-pub(super) fn not_a_shell_job(job: Option<(Job, u32)>) -> Option<Job> {
+pub(super) const fn not_a_shell_job(job: Option<(Job, u32)>) -> Option<Job> {
     match job {
         Some((job @ (Job::NoJobControl | Job::TabProgram { .. }), _)) => Some(job),
         Some((Job::Foreground | Job::Background, _)) | None => None,
@@ -3422,7 +3422,7 @@ pub(super) enum Retarget {
     Rested,
 }
 
-pub(super) fn retarget_how(how: Retarget, st: &St) -> &'static str {
+pub(super) const fn retarget_how(how: Retarget, st: &St) -> &'static str {
     match (how, &st.phase) {
         (Retarget::Kept | Retarget::InPlace, Phase::Announced { .. }) => {
             "its notice and any READY still count"
@@ -3460,7 +3460,7 @@ impl FailedStart {
         self.source == source && Version::parse(&self.to).as_ref() == Some(version)
     }
 
-    fn rests(&self, now: u64) -> bool {
+    const fn rests(&self, now: u64) -> bool {
         now < self.failed_at.saturating_add(upgrade::RETRY_S)
     }
 
@@ -3553,14 +3553,14 @@ impl St {
         at.max(self.failed_at).max(self.salt)
     }
 
-    pub(super) fn time_ready(&mut self, ready: bool, facts: &mut Facts, now: u64) {
+    pub(super) const fn time_ready(&mut self, ready: bool, facts: &mut Facts, now: u64) {
         self.ready_since = upgrade::ready_since(self.ready_since, ready, facts, now);
         if self.ready_since != 0 {
             facts.ready_s = now.saturating_sub(self.ready_since);
         }
     }
 
-    pub(super) fn time_failed(&self, facts: &mut Facts, now: u64) {
+    pub(super) const fn time_failed(&self, facts: &mut Facts, now: u64) {
         facts.failed_s = self.failed_for(now);
     }
 
@@ -3611,7 +3611,7 @@ impl St {
         }
     }
 
-    pub(super) fn failed_for(&self, now: u64) -> u64 {
+    pub(super) const fn failed_for(&self, now: u64) -> u64 {
         if matches!(self.phase, Phase::Failed(_)) {
             now.saturating_sub(self.failed_at)
         } else {
@@ -4041,7 +4041,7 @@ impl St {
         );
     }
 
-    pub(super) fn behind_since(&self) -> u64 {
+    pub(super) const fn behind_since(&self) -> u64 {
         if self.pending_since == 0 {
             self.salt
         } else {
@@ -4093,7 +4093,7 @@ impl St {
         }
     }
 
-    pub(super) fn saw_hand(&mut self, now: u64) -> bool {
+    pub(super) const fn saw_hand(&mut self, now: u64) -> bool {
         let due = self.hand_seen_s == 0 || now.saturating_sub(self.hand_seen_s) >= HAND_RESTAMP_S;
         if due {
             self.hand_seen_s = now;
@@ -4101,7 +4101,7 @@ impl St {
         due
     }
 
-    fn saw_own_work(&mut self, now: u64) {
+    const fn saw_own_work(&mut self, now: u64) {
         if self.own_work_at == 0 || now.saturating_sub(self.own_work_at) >= OWN_WORK_RESTAMP_S {
             self.own_work_at = now;
         }
@@ -4622,7 +4622,7 @@ impl St {
         Some(st)
     }
 
-    pub(super) fn in_flight(&self) -> bool {
+    pub(super) const fn in_flight(&self) -> bool {
         matches!(self.phase, Phase::Exiting { .. } | Phase::Relaunched { .. })
     }
 
@@ -5004,7 +5004,7 @@ pub(super) fn settled(st: &St) -> bool {
     }
 }
 
-fn driven_here(agent: upgrade::Agent) -> bool {
+const fn driven_here(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex
@@ -5053,7 +5053,10 @@ pub(super) fn registry_life<'a>(
     }
 }
 
-pub(super) fn registry_vouches_for_state(private_registry: bool, private_state: bool) -> bool {
+pub(super) const fn registry_vouches_for_state(
+    private_registry: bool,
+    private_state: bool,
+) -> bool {
     private_registry == private_state
 }
 
@@ -5713,7 +5716,7 @@ impl<'a> HomeVars<'a> {
         }
     }
 
-    pub(super) fn config(config: Option<&'a str>) -> Self {
+    pub(super) const fn config(config: Option<&'a str>) -> Self {
         Self { config, home: None }
     }
 }
@@ -6683,7 +6686,7 @@ pub(super) struct WhereWritten<'a> {
 }
 
 impl<'a> WhereWritten<'a> {
-    pub(super) fn new(
+    pub(super) const fn new(
         opts: &'a Opts,
         records: &'a Records,
         session: &'a str,
@@ -6698,15 +6701,15 @@ impl<'a> WhereWritten<'a> {
         }
     }
 
-    pub(super) fn records(&self) -> &'a Records {
+    pub(super) const fn records(&self) -> &'a Records {
         self.records
     }
 
-    pub(super) fn session(&self) -> &'a str {
+    pub(super) const fn session(&self) -> &'a str {
         self.session
     }
 
-    pub(super) fn ours(&self) -> &'a [approvals::Typed] {
+    pub(super) const fn ours(&self) -> &'a [approvals::Typed] {
         self.ours
     }
 
@@ -9804,7 +9807,7 @@ fn quiet_release_due(step: &Step, st: &St, f: &Facts) -> bool {
         && matches!(step, Step::Wait(w) if upgrade::own_work_holds(w))
 }
 
-fn unanswered_at_break(st: &St, f: &Facts, ready: bool) -> bool {
+const fn unanswered_at_break(st: &St, f: &Facts, ready: bool) -> bool {
     f.background_point && !ready && matches!(st.phase, Phase::Announced { .. })
 }
 

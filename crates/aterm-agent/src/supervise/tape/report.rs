@@ -27,7 +27,7 @@ pub enum Verdict {
 impl Verdict {
     /// The word a report leads with.
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             Self::Reproduced => "REPRODUCED",
             Self::Ended => "ENDED",
@@ -40,7 +40,7 @@ impl Verdict {
 
     /// The exit code `aterm drive replay` ends with (the plan's §1).
     #[must_use]
-    pub fn code(&self) -> u8 {
+    pub const fn code(&self) -> u8 {
         match self {
             Self::Reproduced | Self::Ended | Self::Reached { .. } => 0,
             Self::Diverged(_) => 1,
@@ -60,7 +60,7 @@ pub enum Class {
 
 impl Class {
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::Decision => "decision",
             Self::Output => "output",
@@ -262,7 +262,7 @@ pub struct Report {
 impl Report {
     /// The exit code `aterm drive replay` ends with.
     #[must_use]
-    pub fn code(&self) -> u8 {
+    pub const fn code(&self) -> u8 {
         self.verdict.code()
     }
 

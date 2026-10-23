@@ -337,7 +337,8 @@ impl Restores {
         parts.next().is_none().then_some(())
     }
 
-    /// `word:n,…`, or `-` for none.
+    /// `word:n,…`, or `-` for none. A word that could break the token (empty, or holding
+    /// a separator the line cannot carry) is written `?`.
     fn why_token(&self) -> String {
         if self.whys.is_empty() {
             return "-".to_string();
@@ -649,7 +650,8 @@ fn read_text(path: &Path) -> std::io::Result<String> {
     read_opened_text(open_for_read(path)?)
 }
 
-/// Admission and the tail bound belong to the descriptor actually read.
+/// Admission and the tail bound belong to the descriptor actually read. The
+/// path can name a different object by the time its nonblocking open completes.
 fn read_opened_text(mut file: std::fs::File) -> std::io::Result<String> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let meta = file.metadata()?;

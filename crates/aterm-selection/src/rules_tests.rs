@@ -4,10 +4,6 @@
 
 use super::*;
 
-/// A relative path with no `./` is matched WHOLE, from its first segment — never from
-/// its first slash. The old pattern required a leading `/`, `./` or `../`, so the
-/// leftmost match inside `crates/aterm-gui/src/lib.rs` was `/aterm-gui/src/lib.rs`: a
-/// double-click copied an absolute path that does not exist.
 #[test]
 fn test_file_path_bare_relative_is_whole_not_fabricated_absolute() {
     let rule = BuiltinRules::file_path();
@@ -26,20 +22,14 @@ fn test_file_path_bare_relative_is_whole_not_fabricated_absolute() {
         assert_eq!(matches[0].as_str(), want, "{text}");
         assert!(!matches[0].as_str().starts_with("/aterm-gui"), "{text}");
     }
-    // A lone name with no slash is a word, not a path.
     assert_eq!(rule.find_all("just main.rs here").count(), 0);
 }
 
 #[test]
 fn uuid_outranks_git_hash_on_first_and_last_hex_groups() {
-    // Regression: double-clicking (find_at) the 8-hex first group or the
-    // 12-hex last group of a UUID must select the whole 36-char UUID, not
-    // just the generic git_hash sub-segment. With uuid() at High priority it
-    // now outranks git_hash in find_at, so clicking ANY hex group is consistent.
     let smart = SmartSelection::with_builtin_rules();
     let uuid = "550e8400-e29b-41d4-a716-446655440000";
 
-    // Click inside the first hex group "550e8400" (bytes 0..8).
     let m = smart
         .find_at(uuid, 2)
         .expect("find_at inside first UUID group");
@@ -47,7 +37,6 @@ fn uuid_outranks_git_hash_on_first_and_last_hex_groups() {
     assert_eq!((m.start(), m.end()), (0, uuid.len()));
     assert_eq!(m.kind(), SelectionRuleKind::Uuid);
 
-    // Click inside the last hex group "446655440000" (bytes 24..36).
     let m = smart
         .find_at(uuid, 30)
         .expect("find_at inside last UUID group");
@@ -58,8 +47,6 @@ fn uuid_outranks_git_hash_on_first_and_last_hex_groups() {
 
 #[test]
 fn standalone_git_hash_still_matches_with_uuid_at_high() {
-    // The uuid rule sitting at High priority must NOT starve a bare 40-hex
-    // git hash: the UUID shape never matches plain hex, so git_hash still wins.
     let smart = SmartSelection::with_builtin_rules();
     let hash = "abcdef0123456789abcdef0123456789abcdef01";
     let m = smart.find_at(hash, 5).expect("find_at inside git hash");
@@ -67,9 +54,6 @@ fn standalone_git_hash_still_matches_with_uuid_at_high() {
     assert_eq!(m.kind(), SelectionRuleKind::GitHash);
 }
 
-// ── Negative tests: verify patterns do NOT match non-targets ──────
-
-/// Each pattern finds exactly its token, whole.
 #[test]
 fn builtin_patterns_match_their_tokens() {
     for (rule, text, want) in [
@@ -110,7 +94,6 @@ fn builtin_patterns_match_their_tokens() {
     }
 }
 
-/// Negative controls: each pattern rejects the lookalikes of its token.
 #[test]
 fn builtin_patterns_reject_lookalikes() {
     for (rule, texts) in [
@@ -164,10 +147,6 @@ fn builtin_patterns_reject_lookalikes() {
     }
 }
 
-/// The default classifier's word under a byte position: alphanumerics and `_`,
-/// CJK, Cyrillic, precomposed and decomposed accents, Hebrew with niqqud; a
-/// position inside a multi-byte character snaps to its start; a space or a
-/// lone combining mark is no word.
 #[test]
 fn basic_word_boundaries_over_scripts() {
     let hebrew = "\u{05E9}\u{05B8}\u{05C1}\u{05DC}\u{05D5}\u{05B9}\u{05DD}";
@@ -198,11 +177,6 @@ fn basic_word_boundaries_over_scripts() {
     }
 }
 
-/// Words a format control spells, each of which a double-click must select
-/// whole: the Persian half space between two letters that would otherwise join,
-/// a joiner next to a virama picking a conjunct's form, a script's own format
-/// controls between two of its letters, and (no control) a virama and a
-/// prepended number sign.
 const JOINED_WORDS: [(&str, &str); 12] = [
     (
         "Persian ZWNJ",
@@ -245,12 +219,6 @@ const JOINED_WORDS: [(&str, &str); 12] = [
     ("Duployan letter overlap", "\u{1BC00}\u{1BCA0}\u{1BC01}"),
 ];
 
-/// A ZWNJ or ZWJ that spells a word belongs to it. UAX #29 never breaks a word
-/// at one (WB4), and the scripts that use them need them inside words: Persian
-/// writes `می‌خواهم` with a half space, Marathi spells eyelash ra and Sinhala
-/// `ශ්‍රී` with a ZWJ after the virama, Bengali spells ya-phala `র‍্য` with a ZWJ
-/// before it. Every byte and every column of each word selects all of it, under
-/// the default classifier, the builtin rules and configured separators alike.
 #[test]
 fn a_joiner_that_spells_a_word_belongs_to_it() {
     let mut separated = SmartSelection::new();
@@ -284,11 +252,6 @@ fn a_joiner_that_spells_a_word_belongs_to_it() {
     }
 }
 
-/// An invisible character between two words still separates them: a joiner
-/// between two letters that never join (`foo`‍`bar`, where it does no work), a
-/// bidi override, isolate or mark, the word joiner, ZWSP and BOM. Invisible
-/// characters must not weld two words together. A joiner at either end of a
-/// run belongs to no word, and a click on any of them selects nothing.
 #[test]
 fn an_invisible_character_between_two_words_still_splits_them() {
     for (left, invisible, right) in [
@@ -301,10 +264,6 @@ fn an_invisible_character_between_two_words_still_splits_them() {
         ("ab", '\u{061C}', "cd"),
         ("ab", '\u{200B}', "cd"),
         ("ab", '\u{FEFF}', "cd"),
-        // A script's own format control between letters of another script (the
-        // Mongolian vowel separator was a space before Unicode 6.3), and the
-        // controls that spell no word: interlinear annotation, a musical beam,
-        // the language tag.
         ("ab", '\u{180E}', "cd"),
         ("\u{0628}", '\u{180E}', "\u{0628}"),
         ("ab", '\u{13430}', "cd"),
@@ -313,7 +272,6 @@ fn an_invisible_character_between_two_words_still_splits_them() {
         ("ab", '\u{FFFA}', "cd"),
         ("ab", '\u{1D173}', "cd"),
         ("ab", '\u{E0001}', "cd"),
-        // Two Arabic letters a ZWJ joins anyway, and a Latin letter beside one.
         ("\u{0628}", '\u{200D}', "x"),
         ("x", '\u{200C}', "\u{0628}"),
     ] {
@@ -336,8 +294,6 @@ fn an_invisible_character_between_two_words_still_splits_them() {
             );
         }
     }
-    // A joiner that ends or starts a run: next to a virama, but with no word
-    // character on its other side.
     for text in ["\u{0915}\u{094D}\u{200D} x", "x \u{200C}\u{0915}"] {
         let joiner = text.find(['\u{200C}', '\u{200D}']).unwrap();
         assert_eq!(
@@ -350,19 +306,13 @@ fn an_invisible_character_between_two_words_still_splits_them() {
     assert_eq!(SmartSelection::basic_word_boundaries(text, 0), Some((0, 6)));
 }
 
-/// A prepended concatenation mark (`Grapheme_Cluster_Break=Prepend`: the
-/// Arabic number sign, end of ayah, the Syriac abbreviation mark) opens the
-/// grapheme cluster of the character AFTER it (GB9b), and UAX #29 counts it
-/// part of that word. A click on the cluster's column lands on the mark's
-/// byte, so the walk must take the mark into the word after it. Double-click
-/// on any digit of `۝١٢٣` selects all three.
 #[test]
 fn a_prepended_mark_belongs_to_the_word_after_it() {
     let words = [
-        "\u{06DD}\u{0661}\u{0662}\u{0663}", // ۝١٢٣, end of ayah
-        "\u{0600}123",                      // Arabic number sign
-        "\u{070F}\u{0721}\u{072A}\u{0722}", // ܏ܡܪܢ, Syriac abbreviation mark
-        "\u{110BD}123",                     // Kaithi number sign
+        "\u{06DD}\u{0661}\u{0662}\u{0663}",
+        "\u{0600}123",
+        "\u{070F}\u{0721}\u{072A}\u{0722}",
+        "\u{110BD}123",
     ];
     let mut separated = SmartSelection::new();
     separated.set_word_separators(Some(" "));
@@ -384,10 +334,6 @@ fn a_prepended_mark_belongs_to_the_word_after_it() {
     }
 }
 
-/// Columns follow the grid's fold across cluster boundaries: Sinhala `ක්‍ය`
-/// is two UAX #29 clusters the grid draws in ONE cell, so `ය` alone is drawn
-/// in `ක`'s cell and `ක්‍යා` is two cells (`ක්‍ය`, `ා`): a double-click on the
-/// `z` after it finds the `z`, not the space before it.
 #[test]
 fn word_columns_follow_the_grids_fold_across_clusters() {
     let yansaya = "a \u{0D9A}\u{0DCA}\u{200D}\u{0DBA} z";
@@ -402,20 +348,15 @@ fn word_columns_follow_the_grids_fold_across_clusters() {
 
 #[test]
 fn test_word_boundaries_at_column_cjk_with_space() {
-    // "日本 test": a column must not be read as a byte offset (#5685).
     let text = "日本 test";
-    // Bytes:   0..3="日", 3..6="本", 6=" ", 7..11="test"
-    // Columns: 0-1="日", 2-3="本", 4=" ", 5-8="test"
     let smart = SmartSelection::default();
 
-    // Column 5 = start of "test"; byte 5 would be inside "本".
     let bounds = smart.word_boundaries_at_column(text, 5);
     assert!(bounds.is_some(), "should find word at column 5");
     let (start_col, end_col) = bounds.unwrap();
     assert_eq!(start_col, 5, "word start column");
     assert_eq!(end_col, 9, "word end column");
 
-    // Column 0 = start of CJK word "日本".
     let bounds = smart.word_boundaries_at_column(text, 0);
     assert!(bounds.is_some(), "should find CJK word at column 0");
     let (start_col, end_col) = bounds.unwrap();
@@ -423,11 +364,6 @@ fn test_word_boundaries_at_column_cjk_with_space() {
     assert_eq!(end_col, 4, "CJK word end column");
 }
 
-/// A column at or past the end of the text names an empty cell, not the last
-/// word. The column→byte step maps every such column to `text.len()`, and the
-/// byte walk clamped that onto the last character, so the web build's
-/// double-click (`Terminal::smart_word_at`) on the blank cells right of
-/// `https://example.com` selected `com`.
 #[test]
 fn test_word_boundaries_at_column_past_the_text_is_none() {
     let smart = SmartSelection::with_builtin_rules();
@@ -442,25 +378,18 @@ fn test_word_boundaries_at_column_past_the_text_is_none() {
         );
     }
     assert_eq!(smart.word_boundaries_at_column("", 0), None);
-    // `日本` occupies columns 0..4: column 3 is its last cell, 4 is past it.
     assert_eq!(smart.word_boundaries_at_column("日本", 3), Some((0, 4)));
     assert_eq!(smart.word_boundaries_at_column("日本", 4), None);
 }
 
-// ---- Configurable word separators (xterm.js `wordSeparators`) --------------
-
 #[test]
 fn word_separators_make_a_word_any_run_of_non_separators() {
     let mut smart = SmartSelection::new();
-    // Space-only separators: the hyphenated token is ONE word now.
     smart.set_word_separators(Some(" "));
     assert_eq!(smart.word_boundaries_at("foo-bar baz", 1), Some((0, 7)));
-    // Clicking the hyphen itself lands inside the same word.
     assert_eq!(smart.word_boundaries_at("foo-bar baz", 3), Some((0, 7)));
-    // Adding '-' back to the set restores the split.
     smart.set_word_separators(Some(" -"));
     assert_eq!(smart.word_boundaries_at("foo-bar baz", 1), Some((0, 3)));
-    // Clicking ON a separator is not a word (the caller falls back to the cell).
     assert_eq!(smart.word_boundaries_at("foo-bar baz", 3), None);
     assert_eq!(smart.word_boundaries_at("foo-bar baz", 7), None);
 }
@@ -469,23 +398,16 @@ fn word_separators_make_a_word_any_run_of_non_separators() {
 fn word_separators_keep_combining_marks_and_zero_width_breakers() {
     let mut smart = SmartSelection::new();
     smart.set_word_separators(Some(" "));
-    // A combining mark extends the run onto its base ("e\u{301}f" is one word).
     let text = "e\u{301}f g";
     assert_eq!(smart.word_boundaries_at(text, 0), Some((0, 4)));
-    // A zero-width space still BREAKS even though it is not in the set —
-    // invisible characters must not weld two words together.
     let text = "ab\u{200B}cd";
     assert_eq!(smart.word_boundaries_at(text, 0), Some((0, 2)));
-    // And a run of pure combining marks is still not a word.
     let text = "\u{301}\u{301} x";
     assert_eq!(smart.word_boundaries_at(text, 0), None);
 }
 
 #[test]
 fn word_separators_do_not_override_smart_rules() {
-    // Rules still take precedence: even with '/' as a separator, clicking
-    // inside a URL selects the WHOLE url via the builtin rule, not the
-    // separator-shaped fragment.
     let mut smart = SmartSelection::with_builtin_rules();
     smart.set_word_separators(Some(" /"));
     let text = "see https://example.com/path here";

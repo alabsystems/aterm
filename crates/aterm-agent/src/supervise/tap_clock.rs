@@ -23,7 +23,7 @@ impl UsageWindow {
 
     /// Window duration in seconds.
     #[must_use]
-    pub fn len_s(self) -> i64 {
+    pub const fn len_s(self) -> i64 {
         match self {
             UsageWindow::FiveHour => 5 * 3600,
             UsageWindow::SevenDay => 7 * 86_400,
@@ -32,7 +32,7 @@ impl UsageWindow {
 
     /// Status-line payload key for this window.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             UsageWindow::FiveHour => "five_hour",
             UsageWindow::SevenDay => "seven_day",
@@ -40,7 +40,7 @@ impl UsageWindow {
     }
 
     /// Its slot in [`TapClock`]'s table.
-    fn slot(self) -> usize {
+    const fn slot(self) -> usize {
         match self {
             UsageWindow::FiveHour => 0,
             UsageWindow::SevenDay => 1,
@@ -103,7 +103,7 @@ pub struct TapClock {
 impl TapClock {
     /// Create a tap clock anchored at the wall's first read (`first_read` Unix seconds).
     #[must_use]
-    pub fn new(first_read: i64) -> TapClock {
+    pub const fn new(first_read: i64) -> TapClock {
         TapClock {
             first_read,
             full: [None, None],
@@ -113,7 +113,7 @@ impl TapClock {
 
     /// Unix timestamp (seconds) when the wall was first read.
     #[must_use]
-    pub fn first_read(&self) -> i64 {
+    pub const fn first_read(&self) -> i64 {
         self.first_read
     }
 

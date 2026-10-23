@@ -1043,7 +1043,11 @@ mod tests {
         assert!(gone, "the group went with it");
     }
 
-    /// The warm's child holds its stdio and nothing else of this process.
+    /// The warm's child holds its stdio and nothing else of this process. A descriptor held
+    /// without close-on-exec (as another thread's socketpair is before its `F_SETFD`),
+    /// above 99 so no shell's own open lands on its number, reaches the same shim started
+    /// by the pass-throughs' spawn, `aterm_uds::spawnfd::transparent` (the negative
+    /// control: they hand their caller's descriptors on), and not the warm's.
     #[cfg(unix)]
     #[test]
     fn the_warm_child_inherits_its_stdio_and_nothing_else() {

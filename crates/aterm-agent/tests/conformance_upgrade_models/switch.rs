@@ -276,7 +276,10 @@ fn concretize(m: &Model, s: &Vars, k: usize, variant: usize) -> Inputs {
     }
 }
 
-/// The record projected back onto the model's record variables of `s`.
+/// The record projected back onto the model's record variables of `s`. A
+/// record the model cannot hold (another model asked for or due, a clock that
+/// names no model) projects to a value no model state has, so it is a
+/// disagreement, never a silent match.
 fn with_record(s: &Vars, rec: &ModelRecord) -> Vars {
     let mut v = s.clone();
     let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
@@ -647,7 +650,10 @@ impl Space {
     }
 }
 
-/// A visitor and every read it has made, by its key's number ([`KEYS`]).
+/// A visitor and every read it has made, by its key's number ([`KEYS`]). A read is a
+/// function of its key alone (every part is pure; the clock is [`NOW`]), so one read
+/// serves every state and configuration that concretizes to that key; [`decide`],
+/// which also reads `build` and `announced`, runs at every visit.
 struct Visits<'a> {
     by: Visitor<'a>,
     reads: Vec<Option<ReadOut>>,

@@ -43,7 +43,8 @@ const GAP: usize = 3;
 /// The `Find: ` prompt drawn ahead of the well. Its width fixes where the well begins.
 const PROMPT: &str = "Find: ";
 
-/// The input well never shrinks below this many cells: the right side is dropped first.
+/// The input well never shrinks below this many cells: the right side is dropped first. Only
+/// a window narrower than `LEFT_PAD + PROMPT + MIN_FIELD + RIGHT_PAD` gets a shorter field.
 const MIN_FIELD: usize = 28;
 
 /// …and never grows past this: a wider trough reads as a hole, not a field.
@@ -140,7 +141,8 @@ pub(crate) const FIND_TOOLBAR: bool = cfg!(windows);
 /// pane has left beside the toggles, the count and the buttons.
 const TOOLBAR_MIN_FIELD: usize = 15;
 
-/// …and never grows past this: a find box, not a second command line.
+/// …and never grows past this: a find box, not a second command line. A
+/// full-width pane's surplus is band between the toggles and the count.
 const TOOLBAR_MAX_FIELD: usize = 40;
 
 /// One toolbar toggle, ` Aa ` or ` .* `: its glyphs padded by a cell each side,
@@ -1645,7 +1647,10 @@ mod tests {
         }
     }
 
-    /// NARROW WINDOWS KEEP THE ANSWER.
+    /// NARROW WINDOWS KEEP THE ANSWER. When the row cannot hold everything, the
+    /// ornament goes first: the toggles are dropped so the match/no-match readout
+    /// survives — a search that found nothing must never look like one that found
+    /// seven.
     #[test]
     fn the_status_outranks_the_toggles_when_space_runs_out() {
         let (narrow_cols, min_field) = if FIND_TOOLBAR {

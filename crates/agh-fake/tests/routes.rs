@@ -65,11 +65,9 @@ fn repo_answers_ids_owner_and_permissions_per_login() {
     assert_eq!(pull["permissions"]["pull"], json!(true));
     let anonymous = api("/repos/fixture-dev/app").send(api_port).json();
     assert!(anonymous.get("permissions").is_none());
-    // The owner ids: fixture-dev-bot (100) and fixture-reader (101) came first, by token.
     assert_eq!(anonymous["owner"]["id"], json!(102));
     let numeric = api("/repositories/1000").send(api_port).json();
     assert_eq!(numeric["full_name"], json!("fixture-dev/app"));
-    // A token's own login is a User.
     fake.add_repo("fixture-dev-bot/own", RepoSpec::public());
     let own = api("/repos/fixture-dev-bot/own").send(api_port).json();
     assert_eq!(own["owner"]["type"], json!("User"));
@@ -121,7 +119,6 @@ fn an_unknown_token_or_scheme_is_bad_credentials() {
         .scheme("Basic", &dev)
         .send(port);
     assert_eq!((basic.status, basic.json()), (401, bad.clone()));
-    // The scheme is compared exactly, and the token taken as sent after the one space.
     let lower = api("/repos/fixture-dev/app")
         .scheme("bearer", &dev)
         .send(port);
@@ -176,12 +173,10 @@ fn rate_headers_decrement_per_token_and_resource() {
         rate(&api("/repos/fixture-dev/app").token(&dev).send(port)),
         ["5000", "4999", "1760003600", "1", "core"]
     );
-    // A 404 is an api answer too, and search is its own resource.
     assert_eq!(
         rate(&api("/search/code?q=x").send(port)),
         ["60", "59", "1760003600", "1", "search"]
     );
-    // `/rate_limit` costs nothing and reports each resource.
     let limits = api("/rate_limit").send(port);
     assert_eq!(rate(&limits)[1], "58");
     let v = limits.json();
@@ -216,7 +211,6 @@ fn a_json_get_carries_an_etag_and_a_match_answers_304() {
     assert!(again.body.is_empty());
     assert_eq!(again.header("content-length"), None);
     assert_eq!(again.header("etag"), Some(etag.as_str()));
-    // An authenticated 304 is free; an anonymous one is not.
     assert_eq!(again.header("x-ratelimit-remaining"), Some("4999"));
     let anon = api("/repos/fixture-dev/app").send(port);
     let anon_tag = anon.header("etag").expect("an etag").to_string();
@@ -225,7 +219,6 @@ fn a_json_get_carries_an_etag_and_a_match_answers_304() {
         .send(port);
     assert_eq!(anon_304.status, 304);
     assert_eq!(anon_304.header("x-ratelimit-remaining"), Some("58"));
-    // A HEAD carries the GET's length and no body.
     let head = api("/repos/fixture-dev/app")
         .token(&dev)
         .method("HEAD")
@@ -335,7 +328,6 @@ fn a_release_is_read_by_id_by_tag_and_as_latest() {
         release_id: Some(old),
     });
     assert_eq!(latest().json()["id"], json!(old));
-    // A tag with a slash, encoded by agh's ref_path, is read whole.
     let slashed = fake.add_release(
         "fixture-dev/app",
         ReleaseSpec::published("pkg/v1 b", "2026-10-04T00:00:00Z"),
@@ -415,7 +407,6 @@ fn release_and_asset_objects_carry_their_fields() {
     let wrong_digest = assets[2]["digest"].as_str().expect("a digest");
     assert!(wrong_digest.starts_with("sha256:"));
     assert_ne!(wrong_digest, format!("sha256:{other}"));
-    // A draft's asset is read only by a push login, as JSON or as the hop.
     let path = format!("/repos/fixture-dev/app/releases/assets/{a}");
     let octet = |r: crate::raw::Req| r.header("Accept", "application/octet-stream");
     assert_eq!(api(&path).send(ports.api).status, 404);
@@ -511,8 +502,6 @@ fn the_web_download_hops_to_the_cdn_only_for_a_published_public_release() {
         web("/fixture-dev/secret/releases/download/v1/a.bin", "GET").status,
         404
     );
-    // A tag with a slash: the release JSON's own URL is followed as given, with the tag as
-    // one encoded segment, and the tag spread over two segments reaches the same asset.
     let slashed = fake.add_release(
         "fixture-dev/app",
         ReleaseSpec::published("pkg/v1", "2026-10-03T00:00:00Z"),
@@ -599,7 +588,6 @@ fn contents_answer_raw_bytes_a_base64_object_or_a_directory() {
             .starts_with(&web)
     );
     let content = object["content"].as_str().expect("content");
-    // 100 bytes are 136 base64 characters: lines of 60, 60 and 16.
     let widths: Vec<usize> = content
         .trim_end_matches('\n')
         .split('\n')
@@ -633,7 +621,6 @@ fn contents_answer_raw_bytes_a_base64_object_or_a_directory() {
             .status,
         404
     );
-    // A ref the repository does not hold is a 404 at the root too, naming the ref.
     let unknown = api("/repos/fixture-dev/app/contents/?ref=nope").send(port);
     assert_eq!(unknown.status, 404);
     let message = unknown.json()["message"]
@@ -672,8 +659,6 @@ fn a_tree_reads_a_branch_a_tag_or_a_sha_with_truncated() {
         );
         assert_eq!(tree.json()["truncated"], json!(false));
     }
-    // One directory of one commit has one sha, read by branch, by tag, by sha or through
-    // the contents listing.
     let src_sha = |r: &str| -> Value {
         api(&format!("/repos/fixture-dev/app/git/trees/{r}?recursive=1"))
             .send(port)
@@ -687,8 +672,6 @@ fn a_tree_reads_a_branch_a_tag_or_a_sha_with_truncated() {
         let listing = api(&format!("/repos/fixture-dev/app/contents/?ref={r}")).send(port);
         assert_eq!(listing.json()[1]["sha"], by_sha, "{r}");
     }
-    // Any value of `recursive` recurses, `0`, `false` and the empty one included; only
-    // leaving it out does not.
     for value in ["0", "false", ""] {
         let tree = api(&format!(
             "/repos/fixture-dev/app/git/trees/main?recursive={value}"
@@ -741,7 +724,6 @@ fn a_contents_url_encodes_its_path_and_ref_and_leads_back() {
     let again = api(url.trim_start_matches(&base)).send(ports.api);
     assert_eq!(again.status, 200);
     assert_eq!(again.json(), object);
-    // A directory's entries, and a ref with a `/`, are encoded the same way.
     let listing = api("/repos/fixture-dev/app/contents/docs").send(ports.api);
     assert_eq!(listing.json()[0]["url"], json!(url));
     let tagged = api("/repos/fixture-dev/app/contents/x%20y.md?ref=pkg%2Fv1")
@@ -786,7 +768,6 @@ fn the_default_branch_with_no_sha_set_reads_as_its_newest_commit() {
         .expect("a sha")
         .to_string();
     assert_eq!(head, "b".repeat(40));
-    // The same path put again under the sha is one entry, the last put.
     fake.put_file("fixture-dev/app", &head, "src/y.rs", b"y2");
     let tree = |r: &str| {
         api(&format!("/repos/fixture-dev/app/git/trees/{r}?recursive=1"))
@@ -947,7 +928,6 @@ fn compare_answers_its_spec_or_no_common_ancestor() {
 fn compare_pages_with_repo_links_and_unpaged_lists_the_last_250_to_head() {
     let (fake, _, _) = fake();
     let port = fake.ports().api;
-    // 300 commits: the base, then 299 after it, each touching its own file.
     let sha = |i: usize| format!("{i:040x}");
     for i in 1..=300 {
         fake.add_commit(
@@ -998,7 +978,6 @@ fn compare_pages_with_repo_links_and_unpaged_lists_the_last_250_to_head() {
             "http://127.0.0.1:{port}/repos/fixture-dev/app/compare/v1...v2?per_page=1&page=3"
         ))
     );
-    // `files` is the whole comparison's, on page 1 only.
     assert_eq!(
         first.json()["files"],
         json!([{"filename": "f2", "status": "modified"}, {"filename": "f3", "status": "modified"},
@@ -1007,7 +986,6 @@ fn compare_pages_with_repo_links_and_unpaged_lists_the_last_250_to_head() {
     let second = api(next.trim_start_matches(&format!("http://127.0.0.1:{port}"))).send(port);
     assert_eq!(commit_shas(&second), [json!(sha(3))]);
     assert_eq!(second.json()["files"], json!([]));
-    // With neither parameter: the last 250 commits, ending at head, and every file.
     let unpaged = api("/repos/fixture-dev/app/compare/v1...v9").send(port);
     let listed = commit_shas(&unpaged);
     assert_eq!(listed.len(), 250);
@@ -1096,7 +1074,6 @@ fn owner_repo_lists_follow_their_owner_kind_and_numeric_links() {
         RepoSpec::private().push("fixture-dev-bot"),
     );
     fake.add_repo("fixture-dev-bot/two", RepoSpec::public());
-    // Private and naming no login: a 404 to its owner's token too, so never listed.
     fake.add_repo("fixture-dev-bot/nameless", RepoSpec::private());
     let names = |r: &crate::raw::Reply| values(r, "full_name");
     let org = api("/orgs/fixture-dev/repos?type=all&per_page=2")
@@ -1146,7 +1123,6 @@ fn owner_repo_lists_follow_their_owner_kind_and_numeric_links() {
         names(&numeric),
         [json!("fixture-dev-bot/own"), json!("fixture-dev-bot/two")]
     );
-    // `Hide` takes a repository out of the token's own listing, as out of every route.
     fake.apply(Change::Hide {
         slug: "fixture-dev-bot/own".into(),
     });
@@ -1228,7 +1204,6 @@ fn a_request_past_the_limit_is_refused_as_github_refuses_it() {
     assert_eq!(past.header("x-ratelimit-remaining"), Some("0"));
     assert_eq!(past.header("x-ratelimit-used"), Some("60"));
     assert_eq!(past.header("x-ratelimit-reset"), Some("1760003600"));
-    // `/rate_limit` stays free and answers, and a token's own rate is untouched.
     let limits = api("/rate_limit").send(port);
     assert_eq!(limits.status, 200);
     assert_eq!(limits.json()["resources"]["core"]["remaining"], json!(0));
@@ -1243,13 +1218,11 @@ fn a_request_past_the_limit_is_refused_as_github_refuses_it() {
 fn a_target_with_empty_segments_is_read_as_the_router_reads_it() {
     let (fake, _, _) = fake();
     let port = fake.ports().api;
-    // `/rate_limit/` is the rate_limit route, and as free as it.
     for _ in 0..2 {
         let limits = api("/rate_limit/").send(port);
         assert_eq!(limits.status, 200);
         assert_eq!(limits.header("x-ratelimit-used"), Some("0"));
     }
-    // A moved repository's `Location` keeps the sub-path the route was taken by.
     fake.rename_repo("fixture-dev/app", "fixture-dev/app2");
     let releases = format!("http://127.0.0.1:{port}/repositories/1000/releases");
     for target in [

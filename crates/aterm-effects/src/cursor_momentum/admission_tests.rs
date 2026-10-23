@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Tests for momentum admission and the scratch budget.
-//! * The property sweep: every admitted tick pushes within its budget and
-//!   never reallocates.
-//! * The worst case over every amplitude, and how tight the bound is.
-//! * The maximum admitted profile running, and one step past it refused
-//!   before the tick.
-//! * Each refusal, by exact variant.
 
 use std::time::Duration;
 
@@ -596,7 +590,6 @@ fn admission_refuses_each_non_finite_or_out_of_range_value_with_its_own_variant(
             "{intensity}"
         );
     }
-    // The engine clamps a finite intensity, so any finite one is admitted.
     for intensity in [-5.0f32, 0.0, 0.5, 7.0] {
         let cfg = MomentumGlowConfig {
             intensity,
@@ -607,7 +600,6 @@ fn admission_refuses_each_non_finite_or_out_of_range_value_with_its_own_variant(
             "{intensity}"
         );
     }
-    // Checked in order: geometry, then τ, radius, intensity.
     let all_bad = MomentumGlowConfig {
         tau_s: f32::NAN,
         radius_cells: f32::NAN,
@@ -683,7 +675,6 @@ fn admission_refuses_degenerate_and_oversized_geometry() {
             limit: 65_535,
         },
     );
-    // An empty grid still names a cell that must fit.
     refuse(
         Geom {
             cols: 0,

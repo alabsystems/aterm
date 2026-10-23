@@ -41,9 +41,11 @@ impl Decision {
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
     policy: Policy,
-    /// One slot per rule.
+    /// One slot per rule. `None` means the selector string failed to parse
+    /// and the rule must be skipped at evaluation time.
     compiled: Vec<Option<SequenceSelector>>,
-    /// Buckets keyed by `(function, major)`.
+    /// Buckets keyed by `(function, major)`. Wildcard selectors are stored
+    /// separately in [`Self::wildcard_bucket`].
     buckets: BucketMap<BucketKey, Vec<usize>>,
     /// Indices of rules whose bucket is the universal matcher
     /// (`FunctionKind::Wildcard`).

@@ -34,7 +34,8 @@ const MAX_SCRIPT_BYTES: u64 = 5_000_000;
 /// The bound on one download: a hang detector over a slow link, not a latency budget.
 const DOWNLOAD_BUDGET: Duration = Duration::from_secs(3600);
 
-/// Serialize this process's cache lookup and publish decisions.
+/// Serialize this process's cache lookup and publish decisions. Temporary allocations
+/// are exclusive across calls, including other processes.
 static FETCHING: Mutex<()> = Mutex::new(());
 
 /// One artifact a baseline needs.
@@ -211,7 +212,8 @@ pub fn ensure(sys: &dyn System, paths: &Paths, item: &Needed) -> Result<PathBuf,
     Ok(dest)
 }
 
-/// What a release's `aterm-appcast.toml` says about its mac zip.
+/// What a release's `aterm-appcast.toml` says about its mac zip. The appcast carries many
+/// more fields; only these decide an install.
 #[derive(Debug, Deserialize)]
 struct Appcast {
     version: String,
@@ -299,7 +301,9 @@ fn fetch_text(sys: &dyn System, url: &str, max: u64) -> Result<String, String> {
     }
 }
 
-/// Fetch release `version`'s install.sh into the cache and return its SHA-256.
+/// Fetch release `version`'s install.sh into the cache and return its SHA-256. It must
+/// look like the official script: the whole-file guard (`main "$@"` as its last line, so
+/// a cut-off download is refused) and the official Team ID pin.
 fn fetch_install_sh(sys: &dyn System, paths: &Paths, version: &str) -> Result<String, String> {
     let _one = FETCHING
         .lock()

@@ -28,13 +28,13 @@ pub const DECOY: &str = "home/.gemini/LAB-DECOY";
 /// The reply the selftest's turn is answered with.
 const REPLY: &str = "Hi! I am the local lab stub, not a model. (the selftest turn, held 3 s)";
 
-fn ok(b: bool) -> Verdict {
+const fn ok(b: bool) -> Verdict {
     if b { Verdict::Ok } else { Verdict::Fail }
 }
 
 /// The row that shows the agent's composer is up (no trust, sign-in or
 /// onboarding screen: the seeds keep them away).
-fn composer_row(agent: Agent) -> &'static str {
+const fn composer_row(agent: Agent) -> &'static str {
     match agent {
         Agent::Gemini => "Type your message",
         Agent::Agy => "\\? for shortcuts",
@@ -96,7 +96,7 @@ pub fn proxy_refused(stub_log: &str) -> Vec<String> {
 
 /// agy's proxy check (module header).
 #[must_use]
-pub fn proxy_verdict(refused: &[String]) -> Verdict {
+pub const fn proxy_verdict(refused: &[String]) -> Verdict {
     if refused.is_empty() {
         Verdict::Unproven
     } else {
@@ -126,7 +126,7 @@ pub fn egress_verdict(sockets_log: &str, egress_log: &str, pids: &[i32], port: &
 
 /// The kernel-refusal check (module header).
 #[must_use]
-pub fn refusals_verdict(denied: &[String], control: bool) -> Verdict {
+pub const fn refusals_verdict(denied: &[String], control: bool) -> Verdict {
     if !denied.is_empty() {
         Verdict::Fail
     } else if control {
@@ -138,7 +138,7 @@ pub fn refusals_verdict(denied: &[String], control: bool) -> Verdict {
 
 /// The owner's-`~/.gemini` check (module header).
 #[must_use]
-pub fn owner_verdict(
+pub const fn owner_verdict(
     decoy_kept: bool,
     held: &[String],
     pids: &[i32],
@@ -156,7 +156,7 @@ pub fn owner_verdict(
 
 /// The seeds the lab writes into the agent's `.gemini` ([`crate::gemini::seed`]),
 /// relative to it: what the agent itself wrote is everything else.
-fn seeds(agent: Agent) -> &'static [&'static str] {
+const fn seeds(agent: Agent) -> &'static [&'static str] {
     match agent {
         Agent::Gemini => &["settings.json", "trustedFolders.json"],
         Agent::Agy => &[

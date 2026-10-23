@@ -44,7 +44,7 @@ pub(crate) struct TapedHost<H: ?Sized> {
 
 impl<H: ?Sized> TapedHost<H> {
     /// `inner`, its calls taped through `fx` (a recording door).
-    pub(crate) fn new(inner: Arc<H>, fx: Fx) -> Self {
+    pub(crate) const fn new(inner: Arc<H>, fx: Fx) -> Self {
         Self { inner, fx }
     }
 
@@ -219,11 +219,14 @@ impl<T: TapeValue> HostReply for T {
 
 const NOT_WRITTEN: &str = "a host's answer this build did not write";
 
-fn bad(why: &'static str) -> CodecError {
+const fn bad(why: &'static str) -> CodecError {
     CodecError { at: 0, why }
 }
 
-/// `value` as JSON bytes.
+/// `value` as JSON bytes, or no bytes where it has no JSON form. The mirrors
+/// hold strings, numbers, booleans, and lists and options of them, which
+/// always serialize, and a transcript's path ([`TranscriptWire`]), which
+/// serializes only when it is UTF-8.
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     aterm_json::to_vec(value).unwrap_or_default()
 }
@@ -453,7 +456,7 @@ enum RosterWire {
 }
 
 /// [`HeldBy`]'s word on a tape.
-fn held_word(held: HeldBy) -> &'static str {
+const fn held_word(held: HeldBy) -> &'static str {
     match held {
         HeldBy::Earlier => "earlier",
         HeldBy::Pin => "pin",
@@ -519,7 +522,7 @@ impl TapeValue for Option<RosterWord> {
 }
 
 /// [`HostTurn`]'s word on a tape.
-fn turn_word(turn: HostTurn) -> &'static str {
+const fn turn_word(turn: HostTurn) -> &'static str {
     match turn {
         HostTurn::Notice => "notice",
         HostTurn::CarryOn => "carry-on",
@@ -900,7 +903,8 @@ impl TapeValue for Option<LastTurn> {
     }
 }
 
-/// [`RepoWork`] as a tape holds it.
+/// [`RepoWork`] as a tape holds it. A tape recorded before the probe read
+/// the remote's default branch holds no `unlanded` or `main_ref`: none known.
 #[derive(Serialize, Deserialize)]
 struct RepoWorkWire {
     repo: String,
@@ -963,7 +967,7 @@ impl TapeValue for Option<RepoWork> {
 }
 
 /// [`Pressure`]'s word on a tape.
-fn pressure_word(p: Pressure) -> &'static str {
+const fn pressure_word(p: Pressure) -> &'static str {
     match p {
         Pressure::Normal => "normal",
         Pressure::Warn => "warn",
@@ -1031,7 +1035,9 @@ impl TapeValue for Option<AgentMemory> {
     }
 }
 
-/// `transcript`'s answer as a tape holds it: the file and its tail.
+/// `transcript`'s answer as a tape holds it: the file and its tail. A path
+/// that is not UTF-8 has no JSON form, so its answer is one a replay cannot
+/// take, and says so.
 #[derive(Serialize, Deserialize)]
 struct TranscriptWire {
     path: PathBuf,

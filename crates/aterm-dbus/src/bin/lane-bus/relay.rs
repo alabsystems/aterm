@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The relay under the lane's two filtering proxies ([`crate::xhide`] for
-//! X11, [`crate::wlhide`] for Wayland): one client's unix-socket connection
-//! carried to the real server and back, a thread per direction, every
-//! descriptor passed with `SCM_RIGHTS` carried along (MIT-SHM's and DRI3's
-//! on X11, a pool's and a keymap's on Wayland), and each direction's stream
-//! cut into whole messages that a [`Filter`] reads and may rewrite or drop.
-//!
-//! Every byte is another process's: a length a filter cannot make sense of
-//! ends that connection with an error, never a panic.
+//! Bidirectional unix-socket [`Filter`] relay for [`crate::xhide`] and [`crate::wlhide`].
 
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd as _, OwnedFd};
@@ -18,24 +10,19 @@ use std::path::Path;
 
 use aterm_uds::fdpass::{self, MAX_FDS};
 
-/// The longest message a filter may announce: past it the stream is taken
-/// as corrupt (an X request through BIG-REQUESTS reaches 16 MiB).
+/// The longest message a filter may announce.
 pub(crate) const MAX_MESSAGE: usize = 64 << 20;
 
 /// What a direction's stream is cut into and how each message fares.
 pub(crate) trait Filter: Send {
-    /// The length of the message `buf` starts with, once enough of its
-    /// header is in; `Ok(None)` until it is; `Err` for a length no peer of
-    /// the protocol sends.
+    /// Length of the message `buf` starts with once its header is in, or `Ok(None)` / `Err`.
     fn len(&mut self, buf: &[u8]) -> Result<Option<usize>, String>;
 
-    /// One whole message, which the filter may rewrite in place: whether it
-    /// is passed on.
+    /// One whole message, which the filter may rewrite in place.
     fn pass(&mut self, msg: &mut [u8]) -> bool;
 }
 
-/// One read: the bytes into `buf`, the descriptors that came with them onto
-/// `fds`. `Ok(0)` at the end of the stream.
+/// One read: the bytes into `buf`, the descriptors that came with them onto `fds`.
 fn recv(from: &UnixStream, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
     loop {
         match fdpass::recv_with_fds(from, buf, MAX_FDS) {
@@ -49,15 +36,12 @@ fn recv(from: &UnixStream, buf: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result
     }
 }
 
-/// Write all of `data`, the descriptors `fds` (at most [`MAX_FDS`] a
-/// message) riding its first bytes.
+/// Write all of `data`, the descriptors `fds` riding its first bytes.
 fn send(to: &UnixStream, data: &[u8], fds: &mut Vec<OwnedFd>) -> io::Result<()> {
     let mut at = 0;
     while !fds.is_empty() && at < data.len() {
         let carried = fds.len().min(MAX_FDS);
         let borrowed: Vec<_> = fds[..carried].iter().map(|f| f.as_fd()).collect();
-        // One byte a message while more descriptors wait, so each batch has
-        // a byte of its own to ride.
         let end = if fds.len() > carried {
             at + 1
         } else {
@@ -69,7 +53,6 @@ fn send(to: &UnixStream, data: &[u8], fds: &mut Vec<OwnedFd>) -> io::Result<()> 
             Err(e) => return Err(e),
         };
         drop(borrowed);
-        // The peer holds its own copies now; ours close here.
         fds.drain(..carried);
         at += n;
     }
@@ -77,8 +60,7 @@ fn send(to: &UnixStream, data: &[u8], fds: &mut Vec<OwnedFd>) -> io::Result<()> 
     w.write_all(&data[at..])
 }
 
-/// Carry `from`'s stream to `to` through `filter` until `from` ends, then
-/// end `to`'s write side.
+/// Carry `from`'s stream to `to` through `filter` until `from` ends, then end `to`'s write side.
 pub(crate) fn pump(
     from: &UnixStream,
     to: &UnixStream,
@@ -123,11 +105,7 @@ pub(crate) fn pump(
     }
 }
 
-/// Serve `listen` (a socket path, replaced if one is there): each client
-/// that connects gets its own connection to `server`, carried by [`pump`]
-/// both ways through the filters `make` returns for it (client to server,
-/// then server to client). Runs until killed; a connection that fails ends
-/// alone, said on stderr.
+/// Serve `listen` (a socket path, replaced if one is there) ([`pump`]).
 pub(crate) fn serve<F, G>(
     listen: &Path,
     server: &Path,
@@ -205,7 +183,6 @@ mod tests {
         let (mut a, b) = UnixStream::pair().unwrap();
         let (c, mut d) = UnixStream::pair().unwrap();
         let t = std::thread::spawn(move || pump(&b, &c, &mut Fours));
-        // A descriptor of its own: one end of a third pair.
         let (e, mut f) = UnixStream::pair().unwrap();
         let mut fds = vec![OwnedFd::from(e)];
         send(&a, &[1, 1, 1], &mut fds).unwrap();
@@ -223,9 +200,6 @@ mod tests {
             }
             got.extend_from_slice(&buf[..n]);
         }
-        // The stream is 1,1,1 then 1,ff,1,1,1,2,3,4 then 2,2, so its messages
-        // are [1,1,1,1], passed as [1,2,1,1]; [ff,1,1,1], dropped; [2,3,4,2],
-        // passed as [2,4,4,2]; and a last [2], cut off by the end.
         assert_eq!(got, [1, 2, 1, 1, 2, 4, 4, 2]);
         assert!(
             t.join().unwrap().is_err(),

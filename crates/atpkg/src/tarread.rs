@@ -6,10 +6,14 @@
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-/// One tar block.
+/// One tar block. Every header is exactly this, and every entry's content is
+/// padded up to a multiple of it.
 const BLOCK: usize = 512;
 
-/// The largest GNU-longname / PAX extension body this reader will read.
+/// The largest GNU-longname / PAX extension body this reader will read. Its length is
+/// declared in the same `size` field a file uses, so without a ceiling a 2^64 declaration
+/// would stream forever; 1 MiB dwarfs any real `PATH_MAX` name or PAX record set, and the
+/// extractor's `TAR_ENTRY_STRUCTURAL_BUDGET` caps it again from outside.
 const MAX_EXTENSION_BODY: u64 = 1024 * 1024;
 
 /// The tar typeflag byte, as the entry kinds this reader distinguishes.
@@ -49,7 +53,9 @@ pub struct Header {
     raw: [u8; BLOCK],
 }
 
-/// Byte offsets of the POSIX ustar header fields.
+/// Byte offsets of the POSIX ustar header fields. Named rather than inlined,
+/// because an off-by-one in this table is the whole class of bug that makes a
+/// tar parser read someone else's field.
 mod field {
     /// `name`: 100 bytes.
     pub const NAME: (usize, usize) = (0, 100);
@@ -93,19 +99,26 @@ impl Header {
         f.get(..end).unwrap_or(&[])
     }
 
-    /// Is this a POSIX ustar header, i.e. does `prefix` mean anything?
+    /// Is this a POSIX ustar header, i.e. does `prefix` mean anything? Magic and version,
+    /// both exact: `starts_with(b"ustar")` is also true of a GNU header, whose bytes
+    /// 345..500 are `atime`/`ctime`/`offset`.
     #[inline]
     fn is_ustar(&self) -> bool {
         self.field(field::MAGIC) == b"ustar\0" && self.field(field::VERSION) == b"00"
     }
 
-    /// Is this a GNU header (magic `"ustar "`, version `" \0"`)?
+    /// Is this a GNU header (magic `"ustar "`, version `" \0"`)? It shares the first 345
+    /// bytes with ustar and matters here only as one of the two magics that make an
+    /// `L`/`K`/`x` typeflag an extension header.
     #[inline]
     fn is_gnu(&self) -> bool {
         self.field(field::MAGIC) == b"ustar " && self.field(field::VERSION) == b" \0"
     }
 
-    /// Is this a header whose extension typeflags (`L`, `K`, `x`) are meaningful?
+    /// Is this a header whose extension typeflags (`L`, `K`, `x`) are meaningful? With
+    /// neither magic the byte is just a vendor typeflag and the block an ordinary entry,
+    /// refused as [`EntryType::Other`]; otherwise a magic-less `L` would rename the entry
+    /// after it.
     #[inline]
     fn is_recognized(&self) -> bool {
         self.is_ustar() || self.is_gnu()
@@ -148,6 +161,9 @@ impl Header {
     }
 
     /// Parse a header field as NUL-terminated, whitespace-padded octal, and nothing else:
+    /// the parser for `mode` and `chksum`, which the GNU base-256 extension does not cover
+    /// (the `tar` crate reads them octal-only too).
+    ///
     /// # Errors
     /// On a field that is not octal text.
     fn octal(&self, spec: (usize, usize), what: &str) -> io::Result<u64> {
@@ -164,6 +180,8 @@ impl Header {
     }
 
     /// Parse a numeric header field that may use the GNU base-256 extension: big-endian
+    /// binary when the first byte's top bit is set, otherwise [`octal`](Header::octal).
+    ///
     /// # Errors
     /// On a field that is neither base-256 nor octal text.
     fn numeric(&self, spec: (usize, usize), what: &str) -> io::Result<u64> {
@@ -188,7 +206,8 @@ impl Header {
         Ok(acc)
     }
 
-    /// Does the header's own checksum match its bytes?
+    /// Does the header's own checksum match its bytes? The sum is the unsigned total of all
+    /// 512 bytes with the checksum field read as eight spaces.
     fn checksum_ok(&self) -> bool {
         let Ok(stored) = self.stored_checksum() else {
             return false;
@@ -486,6 +505,8 @@ impl<'a, R: Read> Entries<'a, R> {
 }
 
 /// Bytes to advance past an entry of `size` content bytes: the size plus its zero padding,
+/// rounded up to a whole block.
+///
 /// # Errors
 /// When the rounding would overflow a `u64` (a `size` within 511 of `u64::MAX`). Refused
 /// before the entry is yielded, as the `tar` crate does: saturating would hand the caller

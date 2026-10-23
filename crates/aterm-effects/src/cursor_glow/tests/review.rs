@@ -211,7 +211,9 @@ fn a_stalled_batch_draining_across_the_wrap_wider_than_the_tight_fold_is_paid_ex
     assert!(v2_cols(&cold, 12).is_empty());
 }
 
-/// A spinner crossing inside a hidden park gap.
+/// A spinner crossing inside a hidden park gap. Ink parks the caret hidden for
+/// ~40 ms and shows it one cell on, so every echo is judged on the visible lane
+/// and `last_anchor_sweep` is never set.
 #[test]
 fn a_spinner_crossing_inside_a_hidden_park_gap_cannot_steal_the_keys_stamp() {
     let g = wide_geom();
@@ -373,7 +375,8 @@ fn the_coalesced_fold_on_the_alt_screen_is_admitted_under_a_fresh_blink() {
     assert!(v2_cols(&blinkless, 12).is_empty());
 }
 
-/// A keyed motion pair is not a return.
+/// A keyed motion pair is not a return. vim's `b` (stamped as typed) parks the
+/// caret back a word and `$` lands two cells past the origin.
 #[test]
 fn a_keyed_motion_pair_is_not_a_park_return() {
     let g = wide_geom();
@@ -709,7 +712,9 @@ fn a_kill_forgets_the_in_flight_presses_at_the_key() {
     assert!(v2_cols(&glow, 3).is_empty());
 }
 
-/// A scroll or row-band move keeps the pool.
+/// A scroll or row-band move keeps the pool. Three keys in flight on row 11,
+/// the grid scrolls one row, and the batch echoes on row 10 two seconds later
+/// as a +3 licensed by the pool (`licence=inflight`, nothing forgotten).
 #[test]
 fn a_scroll_or_a_band_move_keeps_the_in_flight_pool() {
     /// The seam, the move, and the row the caret is seen on after it.
@@ -978,7 +983,11 @@ fn anchored_hidden_run(
     (seq, end)
 }
 
-/// The reappearance over an anchored run keeps the presses in flight.
+/// The reappearance over an anchored run keeps the presses in flight. A
+/// licensed anchored echo under a hidden caret moves the hide-bridge source to
+/// its landing (where the mirror is), so a later show is judged from there: a
+/// same-cell reappearance keeps the pool and fresh stamps, and stalled keys
+/// echo licensed.
 #[test]
 fn a_reappearance_over_an_anchored_run_keeps_the_in_flight_presses() {
     let g = wide_geom();
@@ -1249,7 +1258,11 @@ fn a_fold_after_a_paid_pending_wrap_glyph_does_not_charge_the_last_column_twice(
     assert_eq!(glow.typed_credits_within(echo), 0);
 }
 
-/// The pending-wrap print under a hidden caret.
+/// The pending-wrap print under a hidden caret. At the pane's edge the anchored
+/// landing `ac == pane_col1` is off-grid while the caret shows at
+/// `pane_col1 - 1`, so the hide-bridge source is clamped to the last on-grid
+/// column: the show is a same-cell boundary, `wrap_paid_row` survives, and the
+/// following fold lights the new row's head.
 #[test]
 fn a_pending_wrap_print_under_a_hidden_caret_is_shown_on_the_pane_edge() {
     let g = wide_geom();
@@ -1318,7 +1331,9 @@ fn a_pending_wrap_print_under_a_hidden_caret_is_shown_on_the_pane_edge() {
     assert_eq!(glow.typed_credits_within(k4 + ms(350)), 0);
 }
 
-/// Mid-line typing under a hidden caret.
+/// Mid-line typing under a hidden caret. Ink re-lays the row's tail on each
+/// key, so the print anchor lands at the row's end while the caret shows
+/// mid-row.
 #[test]
 fn mid_line_typing_under_a_hidden_caret_is_shown_where_the_glyph_put_the_caret() {
     let g = wide_geom();

@@ -82,7 +82,9 @@ fn open_descriptor_count() -> usize {
 fn descriptors_naming(want: (u64, u64)) -> usize {
     (0..PROBE_LIMIT)
         .filter(|&fd| {
-            // SAFETY: the `File` is wrapped in `ManuallyDrop` and never
+            // SAFETY: the `File` is wrapped in `ManuallyDrop` and never dropped, so this borrows
+            // the descriptor for one `fstat` and never closes one it does not own; an invalid
+            // number fails `metadata()` (EBADF) and counts as no match.
             let f = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
             f.metadata().is_ok_and(|m| (m.dev(), m.ino()) == want)
         })

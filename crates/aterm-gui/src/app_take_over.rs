@@ -703,7 +703,11 @@ impl App {
         out
     }
 
-    /// [`Self::take_over_session`] / [`Self::hand_back_session`]'s body.
+    /// [`Self::take_over_session`] / [`Self::hand_back_session`]'s body. The
+    /// fabric leaf moves under the same guard and records the same timeline
+    /// event a wire `hold` does; the need verdict, the menu rows and the
+    /// palette are refreshed at once (the fabric wake also arrives; each
+    /// refresh is change-gated).
     fn person_hold_session(&mut self, session: u64, on: bool) -> Result<(), String> {
         use crate::fabric::PersonHoldOutcome;
         if self.person_gesture_refused() {
@@ -1235,7 +1239,15 @@ mod tests {
             .unwrap_or_else(|| panic!("{a:?} has a row"))
     }
 
-    /// TAKE OVER SETS THE PERSON'S SLOT AND HAND BACK LIFTS IT FIRST.
+    /// TAKE OVER SETS THE PERSON'S SLOT AND HAND BACK LIFTS IT FIRST. The
+    /// window's act fills `origin=person`; the rows swap (palette mirror and
+    /// the published front bit); the published verdict says `hold_by=person`;
+    /// the held agent's own wire `hold off` answers `OK hold=1` and lifts
+    /// nothing; refusals are counted on the You hold row's read; Hand Back
+    /// lifts the person's slot and leaves an Owner's beside it — which a
+    /// second Hand Back lifts, as that client's own `hold off` would: a
+    /// client's hold, which halts the instance's app verbs, has a way out at
+    /// the window.
     #[test]
     fn take_over_sets_the_person_slot_and_hand_back_lifts_it_then_a_clients() {
         let (mut app, wid, sid, ctx) = app_with_stub();
@@ -1299,7 +1311,10 @@ mod tests {
         assert_eq!(ctx.fabric.holds().origins(), "fleet");
     }
 
-    /// NO CONTROL CLIENT PRESSES THE PERSON'S PAIR.
+    /// NO CONTROL CLIENT PRESSES THE PERSON'S PAIR. A control client's key
+    /// into an open palette (`Source::Controller`, the `key` verb's road) on
+    /// the Hand Back row lifts nothing, and its mark is gone after the
+    /// gesture.
     #[test]
     fn a_controller_key_into_the_palette_cannot_hand_back_and_a_persons_can() {
         use crate::input::{InputEvent, Source};
@@ -2091,7 +2106,12 @@ mod tests {
         assert!(app.agent_menu_facts(manager).person_hold);
     }
 
-    /// A BACKGROUND WORKER IS NAMED AS THE STRIP NAMES IT.
+    /// A BACKGROUND WORKER IS NAMED AS THE STRIP NAMES IT. A worker started
+    /// in a background tab has no role, no title pin and no registry title
+    /// (only the active tab's title is published there); its OSC title, its
+    /// agent's spinner glyph dropped, is what names it in its manager's
+    /// Workers rows, and the manager's OSC title names it in the worker's Go
+    /// to row.
     #[test]
     fn a_background_worker_is_named_by_its_osc_title() {
         use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -2164,7 +2184,10 @@ mod tests {
         assert_eq!(app.tab_label_of_session(worker), "fmt");
     }
 
-    /// `hwkey` CANNOT PRESS THE PERSON'S ACTS THROUGH AN OPEN CARD.
+    /// `hwkey` CANNOT PRESS THE PERSON'S ACTS THROUGH AN OPEN CARD. Its keys
+    /// are real NSEvents on the person's unmarked key path, so its hop
+    /// refuses while the palette, Overview or a tab menu is open on the
+    /// front window.
     #[test]
     fn hwkey_is_refused_while_a_gateway_card_is_open() {
         let (mut app, wid, sid, _ctx) = app_with_stub();

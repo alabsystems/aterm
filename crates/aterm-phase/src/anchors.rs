@@ -688,11 +688,26 @@ pub const ANCHORS: &[Anchor] = &[
         "Transcript writes are failing (",
         "2.1.302",
     ),
+    lit("wall.disk_full.tool", "Disk full: ", "2.1.309"),
     lit(
-        "wall.disk_full.tool",
-        "Command output was lost: the temp filesystem at",
-        "2.1.302",
+        "wall.disk_full.tool_inodes",
+        "Nearly out of inodes: ",
+        "2.1.309",
     ),
+    lit(
+        "wall.disk_full.tool_quota",
+        "Disk quota used up: ",
+        "2.1.309",
+    ),
+    lit(
+        "wall.disk_full.tool_dir",
+        " (Claude Code's temporary directory)",
+        "2.1.309",
+    ),
+    // A failed command's result opens `Exit code <n>` (the bundle's
+    // `[`Exit code ${e.code}`, …]`, read on 2.1.304, 2.1.308 and 2.1.309):
+    // the line the notice is drawn under.
+    lit("wall.disk_full.tool_exit", "Exit code ", "2.1.304"),
     lit(
         "wall.disk_full.goal",
         "Goal cleared after an unrecoverable error (",
@@ -1861,7 +1876,7 @@ mod tests {
         let spelled = |templates: &[(&'static str, Vec<String>)]| {
             templates
                 .iter()
-                .flat_map(|(_, spellings)| spellings.iter().map(String::as_str))
+                .flat_map(|(_, spellings)| spellings.iter().map(|t| t.replace(JS_NAME, "a")))
                 .collect::<Vec<_>>()
                 .join("|")
                 .into_bytes()
@@ -1923,6 +1938,126 @@ mod tests {
             )],
         )];
         assert_eq!(missing_templates(&bytes, &planted), ["planted"]);
+    }
+
+    /// A MINIFIER'S NAME IN A TEMPLATE IS A SLOT: the limit names' switch
+    /// holds as 2.1.308 spells it (`s.add(a.givesBackWeekly…`) and as
+    /// 2.1.309 does (`i.givesBackWeekly`), and with any identifier there.
+    /// NEGATIVE CONTROLS: no identifier in a slot (a digit first, a call,
+    /// nothing), or a word of the switch reworded, is missing. MUTANT: the
+    /// slot read as its own char (the template matched byte for byte) holds
+    /// in neither build.
+    #[test]
+    fn a_minifiers_name_fills_a_templates_slot() {
+        let templates = reset_templates();
+        let (_, spellings) = templates
+            .iter()
+            .find(|(name, _)| *name == "limit names")
+            .expect("the limit names' switch");
+        let names = &spellings[0];
+        assert_eq!(names.matches(JS_NAME).count(), 4, "{names:?}");
+        let built = |set: &str, reset: &str| {
+            let mut slots = [set, set, set, reset].into_iter();
+            let mut out = String::new();
+            for (i, piece) in names.split(JS_NAME).enumerate() {
+                if i > 0 {
+                    out.push_str(slots.next().expect("a name per slot"));
+                }
+                out.push_str(piece);
+            }
+            format!("function sr(x){{let s=new Set;for(let _ of x.clears)switch(_){{{out}}}}}")
+        };
+        let v308 = built("s", "a");
+        let v309 = built("s", "i");
+        assert!(v308.contains("s.add(a.givesBackWeekly?\"Fable\":\"weekly\")"));
+        assert!(v309.contains("s.add(i.givesBackWeekly?\"Fable\":\"weekly\")"));
+        let one = [("limit names", vec![names.clone()])];
+        for ok in [v308.as_str(), v309.as_str(), &built("$e", "_Ab9")] {
+            assert!(missing_templates(ok.as_bytes(), &one).is_empty(), "{ok}");
+            assert!(!contains(ok.as_bytes(), names), "the mutant holds in none");
+        }
+        for bad in [
+            built("s", "9a"),
+            built("s", "f()"),
+            built("s", ""),
+            built("s.x", "a"),
+        ] {
+            assert_eq!(
+                missing_templates(bad.as_bytes(), &one),
+                ["limit names"],
+                "{bad}"
+            );
+        }
+        let reworded = v309.replace(
+            "\"weekly\");break;case\"seven_day_overage",
+            "\"week\");break;case\"seven_day_overage",
+        );
+        assert_ne!(reworded, v309);
+        assert_eq!(
+            missing_templates(reworded.as_bytes(), &one),
+            ["limit names"]
+        );
+        assert!(holds(b"a.b", "a"), "a template with no slot is a literal");
+        assert!(!holds(b"a.b", "c"));
+    }
+
+    /// A TEMPLATE HOLDS WHEREVER ITS HEAD RECURS: the store bundle (2.1.308
+    /// and 2.1.309, `grep -F 'case"five_hour":'`) holds the limit names'
+    /// switch head ten times, the switch the ninth, the other nine heads
+    /// other switches over the same windows. Built that way, with names
+    /// the minifier could pick, the switch holds. NEGATIVE CONTROL: the
+    /// nine other heads alone hold no switch. MUTANT: a match tried only
+    /// where the head first occurs holds in neither build's shape.
+    #[test]
+    fn a_template_holds_past_its_heads_earlier_places() {
+        let templates = reset_templates();
+        let (_, spellings) = templates
+            .iter()
+            .find(|(name, _)| *name == "limit names")
+            .expect("the limit names' switch");
+        let names = &spellings[0];
+        let mut slots = ["s", "s", "s", "i"].into_iter();
+        let switch = names
+            .split(JS_NAME)
+            .enumerate()
+            .fold(String::new(), |mut out, (i, piece)| {
+                if i > 0 {
+                    out.push_str(slots.next().expect("a name per slot"));
+                }
+                out.push_str(piece);
+                out
+            });
+        let decoy = |k: usize| format!("switch(w{k}){{case\"five_hour\":return\"5h\";default:}}");
+        let decoys = |range: std::ops::Range<usize>| range.map(decoy).collect::<String>();
+        let one = [("limit names", vec![names.clone()])];
+        let bundle = format!("{}{switch}{}", decoys(0..8), decoys(8..9));
+        assert_eq!(bundle.matches("case\"five_hour\":").count(), 10);
+        assert!(
+            bundle.find(&switch) > bundle.find("case\"five_hour\":"),
+            "the switch is not the head's first place"
+        );
+        assert!(missing_templates(bundle.as_bytes(), &one).is_empty());
+        assert_eq!(
+            missing_templates(decoys(0..9).as_bytes(), &one),
+            ["limit names"]
+        );
+    }
+
+    /// NO SLOT TOUCHES AN IDENTIFIER'S CHAR: JavaScript reads the longest
+    /// name, so a slot glued to a word could never be filled; such a
+    /// template is refused when it is matched, never silently missing.
+    /// MUTANT: the guard removed lets `x=` + slot + `abc;` through.
+    #[test]
+    #[should_panic(expected = "a slot touches an identifier's char")]
+    fn a_slot_glued_to_a_word_is_refused() {
+        holds(b"x=fooabc;", &format!("x={JS_NAME}abc;"));
+    }
+
+    /// The guard's other side: a word glued before a slot.
+    #[test]
+    #[should_panic(expected = "a slot touches an identifier's char")]
+    fn a_word_glued_before_a_slot_is_refused() {
+        holds(b"let sa=1", &format!("let s{JS_NAME}=1"));
     }
 
     /// The bundle finder on a stand-in package: the version its

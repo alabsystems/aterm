@@ -164,7 +164,10 @@ struct IObjectCollection {
     vtbl: *const IObjectCollectionVtbl,
 }
 
-/// `IShellLinkW` (shobjidl_core.h).
+/// `IShellLinkW` (shobjidl_core.h). The setters a row needs and
+/// `GetWorkingDirectory` (a removed row's directory) are called; every slot
+/// keeps the documented method order so those land on the right vtable entries
+/// (checked against `windows` 0.62's `IShellLinkW_Vtbl`).
 #[repr(C)]
 struct IShellLinkWVtbl {
     query_interface:
@@ -1060,6 +1063,15 @@ mod acceptance {
     const TEST_AUMID: &str = "Aterm.Test.JumpListReadBack";
 
     /// The real shell, end to end, under [`TEST_AUMID`]: [`super::build`]
+    /// commits a Recent category of two directories and both tasks, and the
+    /// shell's own store for that identity
+    /// (`%APPDATA%\Microsoft\Windows\Recent\CustomDestinations\*.customDestinations-ms`),
+    /// parsed by [`read_back`], holds what was asked: a `Recent` category whose
+    /// rows carry `new-window -d "<dir>"`, the directory as working directory
+    /// and tooltip, the folder icon and the row's title in the link's property
+    /// store (`PKEY_Title`); then the tasks, `new-tab` and `new-window`, with the
+    /// exe's icon, their tooltips and titles.
+    ///
     /// # Errors
     /// Returns a setup failure when APPDATA or the current executable is unavailable.
     pub fn the_shell_keeps_what_a_commit_puts_in_a_test_identitys_jump_list(

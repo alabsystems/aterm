@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Huffman tables (ITU T.81 Annex C) and the entropy-coded segment's bit
-//! reader (F.2.2.5): byte stuffing undone, a marker ends the segment.
+//! Huffman tables (ITU T.81 Annex C) and the entropy-coded segment bit reader (F.2.2.5).
 
 /// Bits looked up in one step; longer codes take the canonical slow path.
 const FAST_BITS: u32 = 9;
@@ -10,12 +9,9 @@ const FAST_BITS: u32 = 9;
 /// One DHT table, ready to decode.
 #[derive(Clone)]
 pub(crate) struct HuffmanTable {
-    /// `(length << 8) | symbol` for every code of at most [`FAST_BITS`] bits,
-    /// indexed by the next [`FAST_BITS`] bits; `0` where the code is longer.
+    /// `(length << 8) | symbol` for codes up to [`FAST_BITS`] bits, or `0` when longer.
     fast: Vec<u16>,
-    /// The largest code of each length (1..=16), left-aligned to 16 bits and
-    /// plus one, so a 16-bit window `w` has a code of length `l` exactly when
-    /// `w < maxcode[l]`; `u32::MAX` past the longest length.
+    /// Left-aligned upper bound (`max_code + 1`) for each code length `1..=16`.
     maxcode: [u32; 18],
     /// For each length, the symbol index of its first code minus that code.
     delta: [i32; 17],
@@ -23,8 +19,7 @@ pub(crate) struct HuffmanTable {
 }
 
 impl HuffmanTable {
-    /// Build a table from the sixteen per-length counts and the symbols in
-    /// code order. `None` for an over-subscribed or empty code.
+    /// Builds a table from the sixteen per-length counts and symbols in code order.
     pub(crate) fn new(counts: &[u8; 16], symbols: &[u8]) -> Option<Self> {
         let total: usize = counts.iter().map(|&count| usize::from(count)).sum();
         if total == 0 || total > 256 || symbols.len() != total {
@@ -69,9 +64,7 @@ impl HuffmanTable {
     }
 }
 
-/// Reads one entropy-coded segment. Past its end (a marker, or the end of
-/// the data) it reads zeros, as T.81 decoders conventionally do, so a
-/// truncated file decodes to its end without a fault.
+/// Bit reader for an entropy-coded JPEG segment, undoing `0xFF 0x00` byte stuffing.
 pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     /// The next byte to load.
@@ -95,8 +88,7 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Where the segment's bytes stop: at the marker that ended it, or past
-    /// the last byte loaded.
+    /// Byte offset where the segment stops (at the terminating marker or end of input).
     #[inline]
     pub(crate) const fn position(&self) -> usize {
         self.pos
@@ -118,7 +110,6 @@ impl<'a> BitReader<'a> {
                             self.pos += 2;
                             0xFF
                         }
-                        // A fill byte: the 0xFFs before a marker are padding.
                         Some(&0xFF) => {
                             self.pos += 1;
                             continue;
@@ -204,14 +195,10 @@ impl<'a> BitReader<'a> {
         Some(symbol)
     }
 
-    /// Drop the buffered bits and step past the restart marker the segment
-    /// now stands at (T.81 F.2.2.5), so decoding resumes byte-aligned.
-    /// Returns `false` where no restart marker follows.
+    /// Drops buffered bits and advances past the next restart marker (`0xFFD0..=0xFFD7`).
     pub(crate) fn restart(&mut self) -> bool {
         self.acc = 0;
         self.bits = 0;
-        // Look for the next marker: normally right here; past corrupt
-        // entropy data, the first one ahead.
         let mut at = self.pos;
         loop {
             match (self.data.get(at), self.data.get(at + 1)) {
@@ -221,7 +208,6 @@ impl<'a> BitReader<'a> {
                     return true;
                 }
                 (Some(&0xFF), Some(&marker)) if marker != 0x00 && marker != 0xFF => {
-                    // Another marker: the scan ended early.
                     self.pos = at;
                     self.ended = true;
                     return false;
@@ -248,7 +234,6 @@ mod tests {
         let counts = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
         let symbols = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let table = HuffmanTable::new(&counts, &symbols).expect("table");
-        // Category 0 is "00", 11 is "111111110".
         let mut reader = BitReader::new(&[0b0011_1111, 0b1100_0000], 0);
         assert_eq!(reader.decode(&table), Some(0));
         assert_eq!(reader.decode(&table), Some(11));

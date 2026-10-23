@@ -891,7 +891,8 @@ fn display_from(what: &str, app: &Path, out: &std::process::Output) -> Result<St
     ))
 }
 
-/// Pure parser for the `Identifier=` line of `codesign -dv` output.
+/// Pure parser for the `Identifier=` line of `codesign -dv` output. Fails closed
+/// on a missing or empty identifier.
 fn parse_signing_identifier(text: &str) -> Result<String, String> {
     let identifier = text
         .lines()
@@ -904,7 +905,8 @@ fn parse_signing_identifier(text: &str) -> Result<String, String> {
     Ok(identifier.to_string())
 }
 
-/// Pure parser for the `TeamIdentifier=` line of `codesign -dv` output.
+/// Pure parser for the `TeamIdentifier=` line of `codesign -dv` output. Fails closed on a
+/// missing or `not set` (ad-hoc/unsigned) identifier.
 fn parse_team_id(text: &str) -> Result<String, String> {
     let team = text
         .lines()
@@ -987,7 +989,10 @@ mod tests {
         assert!(!crate::is_passing_refusal(&verdict), "{verdict}");
     }
 
-    /// Which I/O errors are a moment, by errno.
+    /// Which I/O errors are a moment, by errno. The kernel refusing a helper for
+    /// the process table, memory or descriptors just then — and a lock held past
+    /// its wait — pass; a missing helper, a permission, a filesystem without locks
+    /// come back the same every time and keep their verdict.
     #[test]
     fn only_a_moment_s_io_errors_are_passing() {
         for passing in [libc::EAGAIN, libc::ENOMEM, libc::EMFILE, libc::ENFILE] {
@@ -1014,7 +1019,11 @@ mod tests {
         assert!(!crate::is_passing_refusal(&missing), "{missing}");
     }
 
-    /// A check-thread helper ends at its own limit.
+    /// A check-thread helper ends at its own limit. The check's `hdiutil` runs
+    /// hold the check lane and the machine-wide `checker.lock`, so one that never
+    /// returned would park the checker: through `output_within` a child past its
+    /// limit is killed, reaped within a short reserve, and reported; one that
+    /// finishes is collected.
     #[cfg(unix)]
     #[test]
     fn a_check_helper_past_its_limit_is_killed_and_reported_promptly() {
@@ -1085,7 +1094,9 @@ mod tests {
             }
         };
         aterm_spec::verify::prove_and_catch_scalar(&model, "bounded helper cleanup");
-        /// A child that never exits (`exit` 0) counts its looks after `deadline`.
+        /// A child that never exits (`exit` 0) counts its looks after `deadline`. One is the
+        /// loop's own last; a second means the cleanup renewed its deadline, and the fake
+        /// answers it with an error so the cleanup ends and the test fails.
         struct FakeChild {
             exit: u8,
             kill_error: bool,
@@ -1794,7 +1805,11 @@ mod tests {
         );
     }
 
-    /// Several bundles checked at once each get their own answers.
+    /// Several bundles checked at once each get their own answers. `check_bundles`
+    /// starts every bundle's helpers together (the boot apply's staged and installed
+    /// bundles); each bundle's answers are its own helpers', in the order given, and
+    /// the same as `check_bundle` of it alone: a broken seal refuses only its own
+    /// bundle, and its reads still answer.
     #[cfg(target_os = "macos")]
     #[test]
     fn several_bundles_checked_at_once_each_get_their_own_answers() {

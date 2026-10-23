@@ -276,6 +276,11 @@ mod tests {
         assert_eq!((report.seq, report.state), (5, None));
     }
 
+    /// THE TURN COUNT: a turn begins at `working` or `blocked` after a report
+    /// at rest (`idle`, `done`, `error`) or as the first report; a report
+    /// written again, a move within a turn, and a report written again after
+    /// a `clear` or a full reset (the program took the terminal back) begin
+    /// none, while a turn that began across a `clear` does. NEGATIVE
     /// CONTROLS: every line that begins none.
     #[test]
     fn the_turn_count_moves_only_where_a_turn_begins() {
@@ -330,6 +335,9 @@ mod tests {
         assert_eq!(report.turns, 6);
     }
 
+    /// THE COUNT THROUGH THE PARSER, the bytes codex-alab writes: a turn
+    /// that begins and ends between two reads of the engine leaves the same
+    /// report standing (`done`) and the count one higher; a handoff mid-turn
     /// (`clear`, then `working` again) leaves it as it was.
     #[test]
     fn a_turn_between_two_reads_moves_the_count_and_a_handoff_does_not() {
@@ -362,6 +370,11 @@ mod tests {
         assert_eq!(idle.wire(), "idle");
     }
 
+    /// The bytes as the two codex builds write them, through the real parser:
+    /// vendor 0.163's format string (`\x1b]7501;state={}:app=codex\x1b\\`,
+    /// read out of its shipped binary: idle, working and blocked, no kind)
+    /// and codex-alab main's `SetTerminalProgramStatus` (adds done, error and
+    /// a blocked report's kind), then `ClearTerminalProgramStatus`. A full
     /// reset clears what stands; a body with a `;` in it is no report.
     #[test]
     fn the_bytes_codex_writes_are_read_through_the_parser() {

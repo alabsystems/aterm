@@ -92,7 +92,7 @@ impl HumanInput {
 
     /// Age since the last human input, if [`HumanInput::Ago`].
     #[must_use]
-    pub fn ago(self) -> Option<Duration> {
+    pub const fn ago(self) -> Option<Duration> {
         match self {
             Self::Ago(ms) => Some(Duration::from_millis(ms)),
             Self::Never | Self::NeverFor(_) | Self::Unknown => None,
@@ -238,7 +238,7 @@ impl Json {
         }
     }
 
-    pub fn as_array(&self) -> Option<&Vec<Json>> {
+    pub const fn as_array(&self) -> Option<&Vec<Json>> {
         match self {
             Json::Array(a) => Some(a),
             _ => None,

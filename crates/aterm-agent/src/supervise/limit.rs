@@ -328,7 +328,7 @@ pub const CLOCK_SLACK_S: i64 = 6 * 60;
 
 /// Fold a bare session-limit clock time back by one day when `at` exceeds `now + SESSION_AHEAD_MAX`.
 #[must_use]
-pub fn within_a_session_window(spec: &ResetSpec, at: i64, now: i64) -> i64 {
+pub const fn within_a_session_window(spec: &ResetSpec, at: i64, now: i64) -> i64 {
     if matches!(spec, ResetSpec::At { date: None, .. })
         && at.saturating_sub(now) > SESSION_AHEAD_MAX
     {

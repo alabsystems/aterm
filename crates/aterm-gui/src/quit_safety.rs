@@ -247,7 +247,8 @@ impl ChildLinks {
 /// The rate-limited, batched foreground-job oracle behind the tab-status observer's `foreground_job` evidence.
 #[derive(Default)]
 pub(crate) struct JobProbe {
-    /// The last capture and when it was taken.
+    /// The last capture and when it was taken. Every session in a sweep reads
+    /// this one table.
     snapshot: Option<(Instant, ChildLinks)>,
     /// Per-session evidence at the moment its verdict was last derived.
     keys: std::collections::HashMap<u64, JobEvidenceKey>,
@@ -334,7 +335,8 @@ impl JobProbe {
     }
 }
 
-/// One system process-table capture.
+/// One system process-table capture. Non-windows never reaches this (the child
+/// walk is the windows-only arm) and answers with an empty table.
 fn capture_child_links() -> ChildLinks {
     #[cfg(windows)]
     {
@@ -353,7 +355,8 @@ fn links_have_job(links: &ChildLinks, shell_pid: u32) -> bool {
     links.has_job(shell_pid, None, process_facts)
 }
 
-/// One process's facts, read through a handle.
+/// One process's facts, read through a handle. Non-windows never reaches this
+/// (the child walk is the windows-only arm) and reads nothing.
 fn process_facts(pid: u32) -> Option<ProcessFacts> {
     #[cfg(windows)]
     {

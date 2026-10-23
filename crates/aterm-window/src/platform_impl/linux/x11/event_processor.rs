@@ -1431,7 +1431,8 @@ impl EventProcessor {
         }
     }
 
-    /// A device came or went: its scroll axes are read, or forgotten.
+    /// A device came or went: its scroll axes are read, or forgotten. (WC.8: the
+    /// `DeviceEvent::Added`/`Removed` upstream reported no aterm crate reads.)
     fn xinput2_hierarchy_changed(&mut self, xev: &XIHierarchyEvent) {
         let infos = unsafe { slice::from_raw_parts(xev.info, xev.num_info as usize) };
         for info in infos {

@@ -168,7 +168,7 @@ fn parse_setup(reply: &[u8]) -> Result<Setup, String> {
     })
 }
 
-/// A request: its opcode, its one-byte data field.
+/// A request: its opcode, its one-byte data field, and its body (padded to whole words).
 pub(crate) fn request(opcode: u8, data: u8, body: &[u8]) -> Vec<u8> {
     let words = (4 + pad4(body.len())) / 4;
     let mut r = Vec::with_capacity(words * 4);
@@ -413,7 +413,7 @@ impl X {
         Ok(p)
     }
 
-    /// Send a request without awaiting anything ([`X::call`]).
+    /// Send a request without awaiting anything (unlike [`X::call`]).
     pub(crate) fn send(&mut self, req: &[u8]) -> Result<u16, Error> {
         self.sock.write_all(req).map_err(|e| fault(e.to_string()))?;
         self.seq = self.seq.wrapping_add(1);

@@ -55,7 +55,8 @@ pub(crate) fn handoff_server_available() -> bool {
     false
 }
 
-/// Open a delegation key for reading; `Ok(None)` when the key does not exist.
+/// Open a delegation key for reading; `Ok(None)` when the key does not exist. Takes the
+/// subkey so tests drive the read/remove path against a scratch key, never the live one.
 fn open_startup_read_at(subkey: &str) -> io::Result<Option<Hkey>> {
     let sub = wide(subkey);
     let mut hk: Hkey = 0;

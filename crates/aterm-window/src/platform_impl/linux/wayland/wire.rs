@@ -115,6 +115,7 @@ impl Inbox {
         self.wire_book.lock().unwrap_or_else(PoisonError::into_inner).push(wire);
     }
 
+    /// A sink for one of aterm-wayland's objects: each event it hears is recorded here as
     /// `wire` makes it, in the order the dispatch heard it among every other object's.
     fn sink<T: 'static>(&self, wire: impl Fn(T) -> Wire + Send + Sync + 'static) -> Sink<T> {
         let inbox = self.clone();
@@ -290,6 +291,12 @@ mod tests {
         }
     }
 
+    /// One dispatch, as the listeners hear it: the seat's keyboard focus and then the text
+    /// input's `enter` (Mutter's order); BackSpace (evdev 14) and then the input method's commit
+    /// of "，"; a pointer motion and then the window's new preferred scale; an output's `done`;
+    /// a drop and then the seat's capabilities; a source's cancel. The seat's, the output's, the
+    /// drag's and the source's go through the sinks aterm-wayland's objects are given; the text
+    /// input's and the scale's are the backend's own listeners' (`Owned::listened` pushes what
     /// they decode).
     fn dispatch(own: &Inbox, sinks: &Sinks) {
         use aterm_wayland::seat::KeyboardEvent;

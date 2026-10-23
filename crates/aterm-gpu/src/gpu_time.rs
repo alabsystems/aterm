@@ -436,6 +436,7 @@ mod tests {
         FrameRing::listening()
     }
 
+    /// A zero, non-finite or reversed reading is no clock; a real one is its
     /// span in nanoseconds.
     #[test]
     fn a_span_needs_a_real_clock_reading() {
@@ -463,6 +464,7 @@ mod tests {
         assert_eq!(span_ns(5.0, 5.0), Some(0));
     }
 
+    /// The frame is the sum of its parts and is delivered exactly once, by
     /// whichever release is last: here a part completing after the seal.
     #[test]
     fn a_frame_sums_its_parts_and_settles_after_the_last_one() {
@@ -520,6 +522,7 @@ mod tests {
         assert_eq!(ring.settled(f.serial()), Some(Settled::Untimed));
     }
 
+    /// A slot still in flight a whole ring later is not reclaimed: that
     /// present goes untimed and is counted, and the old frame still settles.
     #[test]
     fn a_busy_ring_slot_skips_the_present_instead_of_corrupting_it() {

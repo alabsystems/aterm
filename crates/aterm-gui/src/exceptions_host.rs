@@ -1260,7 +1260,8 @@ impl App {
             .map(|handle| handle.sid.as_str().to_string())
     }
 
-    /// Whether `session`'s render epoch `epoch` is still open and at risk.
+    /// Whether `session`'s render epoch `epoch` is still open and at risk. A gone session answers
+    /// no (nothing is off); a busy timeline answers yes, and is asked again.
     fn render_epoch_still_off(&self, session: u64, epoch: u64) -> bool {
         let Some(found) = self.pool.get(session) else {
             return false;

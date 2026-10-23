@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The coalition decoders on recorded records, and (macOS) the readers held
-//! to the kernel on the live machine.
+//! Coalition decoder tests on recorded records and the live macOS kernel.
 
 use super::*;
 
-/// The probes' mds coalition (307) as a 64-word record at 24 MHz, under
-/// `~/.cache/aterm-design-evidence/details-2026-10-20`. Each value sits at
-/// the word number the probes read it from (`probes/coal.c`: `u[0]`, `u[3]`,
-/// `u[6]`, `u[40]`; `probes/eqos.c`: `u[3]`, `u[24 + k]`) or xnu's
-/// `bsd/sys/coalition.h` gives (1 `tasks_exited`, 23 `cpu_time_eqos_len`),
-/// written as a number, not through this module's constants, so a moved
-/// constant decodes a marker: every other word holds one. CPU and its QoS
-/// split are `probes/skeptic-mac6-eqos-out.txt`'s (seconds, times 24e6),
-/// bytes read and footprint `probes/coal-out-1.txt`'s (13,640.07 MB; 114.05
-/// MiB). One task started and none exited are assumed from its one live
-/// member: the probes print no task counts for it.
+/// The probes' mds coalition.
 fn mds_record() -> [u64; USAGE_WORDS] {
     let mut raw: [u64; USAGE_WORDS] = std::array::from_fn(|i| 0xA5A5_0000 + i as u64);
     raw[0] = 1;
@@ -60,7 +49,6 @@ fn a_recorded_usage_record_decodes_its_words_and_scales_its_ticks() {
             footprint: Some(119_589_683),
         }
     );
-    // Intel's timebase leaves the ticks as they are.
     let intel = decode_usage(307, &mds_record(), (1, 1)).expect("7 QoS classes");
     assert_eq!(intel.cpu_ns, 100_755_763_200);
     assert_eq!(intel.eqos_ns[2], 43_891_200_000);
@@ -113,9 +101,6 @@ fn a_listed_coalition_that_answers_nothing_is_dropped() {
 
 #[test]
 fn the_list_decodes_whole_resource_entries() {
-    // `probes/coal-out-1.txt`'s first two entries (1035 and 557, read as
-    // `u64` pairs: the id, then type 0 and one task), a memberless
-    // coalition, a jetsam-type entry, and a cut trailing entry.
     let entry = |id: u64, kind: u32, tasks: u32| {
         let mut e = id.to_ne_bytes().to_vec();
         e.extend(kind.to_ne_bytes());
@@ -136,7 +121,6 @@ fn the_list_decodes_whole_resource_entries() {
 
 #[test]
 fn the_list_room_is_the_size_answer_plus_headroom() {
-    // `probes/coal-out-1.txt`: 9,216 bytes, 576 entries.
     assert_eq!(list_room(9_216), Some(576 + LIST_HEADROOM));
     assert_eq!(list_room(0), None, "libproc's failure");
     assert_eq!(list_room(-1), None);
@@ -166,7 +150,6 @@ mod live {
         assert!(mine.tasks_started >= 1 && mine.cpu_ns > 0, "{mine:?}");
         assert!(mine.eqos_ns.iter().any(|ns| *ns > 0), "{mine:?}");
         assert_ne!(mine.footprint, Some(0), "this process is a live member");
-        // Another user's coalition answers too: launchd's (root).
         let root = coalition_of(1).expect("launchd's coalition");
         assert!(read.rows.iter().any(|r| r.id == root), "{root}");
     }

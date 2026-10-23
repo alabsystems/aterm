@@ -229,7 +229,8 @@ impl Seam {
         Self::parse(&raw.to_string_lossy(), fired_marker(log).exists())
     }
 
-    /// The words of `raw`; `sync` only while it has not `fired`.
+    /// The words of `raw`; `sync` only while it has not `fired`. An unknown
+    /// word arms nothing.
     fn parse(raw: &str, fired: bool) -> Self {
         let mut seam = Self::default();
         for word in raw.split([' ', ',']).filter(|w| !w.is_empty()) {

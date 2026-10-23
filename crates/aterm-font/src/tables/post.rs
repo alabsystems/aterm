@@ -5,13 +5,7 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! The [PostScript Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/post) header.
-//!
-//! Glyph names (version 2.0's index array and Pascal strings) are not read:
-//! nothing in aterm asks a glyph's name. Version 2.0's index array is still
-//! bounds-checked, so a table ttf-parser rejects is rejected here too (and the
-//! face reports no italic angle and no fixed pitch, as it did).
+//! The [PostScript Table](https://docs.microsoft.com/en-us/typography/opentype/spec/post) header.
 
 use crate::LineMetrics;
 use crate::parser::{Fixed, Stream};
@@ -21,7 +15,7 @@ const UNDERLINE_POSITION_OFFSET: usize = 8;
 const UNDERLINE_THICKNESS_OFFSET: usize = 10;
 const IS_FIXED_PITCH_OFFSET: usize = 12;
 
-/// The header of a [PostScript Table](https://docs.microsoft.com/en-us/typography/opentype/spec/post).
+/// A [PostScript Table](https://docs.microsoft.com/en-us/typography/opentype/spec/post) header.
 #[derive(Clone, Copy, Debug)]
 pub struct Table {
     /// Italic angle in counter-clockwise degrees from the vertical.
@@ -35,8 +29,6 @@ pub struct Table {
 impl Table {
     /// Parses a table from raw data.
     pub fn parse(data: &[u8]) -> Option<Self> {
-        // Do not check the exact length, because some fonts include
-        // padding in table's length in table records, which is incorrect.
         if data.len() < 32 {
             return None;
         }
@@ -60,8 +52,6 @@ impl Table {
 
         let is_monospaced = Stream::read_at::<u32>(data, IS_FIXED_PITCH_OFFSET)? != 0;
 
-        // Only version 2.0 of the table has data at the end: the glyph index
-        // array, which must fit for the table to parse at all.
         if version == 0x00020000 {
             let mut s = Stream::new_at(data, 32)?;
             let indexes_count = s.read::<u16>()?;

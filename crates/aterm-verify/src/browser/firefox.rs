@@ -43,7 +43,7 @@ pub(crate) const PINNED: [Pinned; 2] = [
 pub(crate) const FIREFOX_ENV: &str = "ATERM_FIREFOX";
 
 /// Remediation hint when Firefox is unavailable.
-pub(crate) fn fix_for(pinned: bool) -> &'static str {
+pub(crate) const fn fix_for(pinned: bool) -> &'static str {
     if pinned {
         "targo --unverified verify provision, or set ATERM_FIREFOX to a Firefox executable"
     } else {
@@ -254,6 +254,7 @@ mod tests {
         );
     }
 
+    /// Headless and on its own profile, opening the page; the profile holds
     /// the prefs, and a second profile made over it starts empty again.
     #[test]
     fn firefox_runs_headless_on_a_fresh_profile() {
@@ -271,6 +272,7 @@ mod tests {
         assert!(prefs.contains("\"webgl.sanitize-unmasked-renderer\", false"));
     }
 
+    /// Firefox's home, for POSIX and for Foundation, is the scratch one, set
     /// once each; the rest of the environment passes through.
     #[test]
     fn firefox_runs_under_a_scratch_home() {
@@ -292,6 +294,7 @@ mod tests {
         assert_eq!(get("PATH"), ["/bin"]);
     }
 
+    /// A home whose folders Foundation locked against deletion is removed
     /// all the same; plain removal cannot (the negative control).
     #[cfg(target_os = "macos")]
     #[test]
@@ -315,6 +318,7 @@ mod tests {
         assert!(!home.exists());
     }
 
+    /// Linux needs an X display for WebGL2, set and not empty; macOS needs
     /// none.
     #[test]
     fn firefox_on_linux_needs_a_display() {
@@ -332,6 +336,7 @@ mod tests {
         assert!(fix_for(false).contains(FIREFOX_ENV));
     }
 
+    /// A Firefox user agent is Firefox's and names its product; Chromium's,
     /// which also says "like Gecko", is not.
     #[test]
     fn only_firefox_s_user_agent_is_firefox() {

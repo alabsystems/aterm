@@ -201,7 +201,7 @@ impl MainGap {
 
     /// Whether nothing could be read.
     #[must_use]
-    pub fn is_unknown(&self) -> bool {
+    pub const fn is_unknown(&self) -> bool {
         matches!(self.reading, Reading::Unknown(_))
     }
 
@@ -229,7 +229,7 @@ impl MainGap {
 
     /// Days between the pin's commit and main's, when both are known.
     #[must_use]
-    pub fn days(&self) -> Option<i64> {
+    pub const fn days(&self) -> Option<i64> {
         match &self.reading {
             Reading::Known { days, .. } => *days,
             Reading::Unknown(_) => None,
@@ -247,7 +247,7 @@ impl MainGap {
 
     /// Main's build, when read.
     #[must_use]
-    pub fn main_build(&self) -> Option<Build> {
+    pub const fn main_build(&self) -> Option<Build> {
         match &self.reading {
             Reading::Known { main_build, .. } => Some(*main_build),
             Reading::Unknown(_) => None,

@@ -10,7 +10,7 @@ pub const TRAY_CARD_SLOTS: usize = 2;
 /// One slot's bookkeeping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrayCardSlot {
-    /// Rows `y0, y1)` that differ from the card's bytes: what changed while another slot was shown.
+    /// Rows `[y0, y1)` that differ from the card's bytes: what changed while another slot was shown.
     pub stale: Option<(u32, u32)>,
     /// The present that last sampled it: its number in the arm's present count.
     pub last_read: Option<u64>,
@@ -27,7 +27,7 @@ pub struct TrayCardWrite {
     /// Settle every in-flight present numbered up to this one (the slot's last reader) before the
     /// write: the presents [`present_may_read`] names.
     pub settle_through: Option<u64>,
-    /// The rows `y0, y1)` to upload: the change, and what the slot missed while another was shown.
+    /// The rows `[y0, y1)` to upload: the change, and what the slot missed while another was shown.
     pub rows: (u32, u32),
 }
 
@@ -48,7 +48,7 @@ pub const fn present_may_read(seq: u64, last_read: u64) -> bool {
     seq <= last_read
 }
 
-/// The rows `y0, y1)` covering both `a` (if any) and `b`.
+/// The rows `[y0, y1)` covering both `a` (if any) and `b`.
 #[must_use]
 #[inline]
 pub fn union_band(a: Option<(u32, u32)>, b: (u32, u32)) -> (u32, u32) {

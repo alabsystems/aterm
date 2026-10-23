@@ -455,7 +455,9 @@ mod tests {
             .collect()
     }
 
-    /// THE TABLE (§7).
+    /// THE TABLE (§7). NEGATIVE CONTROL: the same table through the UNANCHORED store
+    /// parser ([`crate::ops::program_build_of_target`], the mutant the anchor exists to
+    /// refuse) misclassifies the dev checkout's path and the `..` escape as store builds.
     #[test]
     fn the_image_table_names_each_build_by_its_source() {
         let l = crate::testdir::layout("atpkg-image-table-");

@@ -26781,6 +26781,7 @@ mod tests {
             let mut r = Renderer::from_system(px, Theme::default()).expect(NO_FONT);
             r.debug_block_on_lazy_fallbacks();
             let (cw, ch) = r.cell_size();
+            #[cfg(target_os = "macos")]
             let baseline = r.baseline();
             for (style, bold) in [(StyleBits::REGULAR, false), (StyleBits::BOLD, true)] {
                 // The face's own marks, where it has them: what the drawn ones stand beside.

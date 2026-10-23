@@ -1058,7 +1058,9 @@ const CORES_CAPTION_PT: f64 = 9.5;
 const CORES_BLOCK_SIZES: [(f64, f64); 5] =
     [(11.0, 9.0), (9.0, 7.0), (7.0, 5.5), (5.5, 4.0), (2.5, 2.0)];
 
-/// The cores' words before the OS's topology is read, longest first.
+/// The cores' words before the OS's topology is read, longest first. The
+/// cluster list is empty then, and unknown is never zero (§5.1), so no form
+/// says "0 cores".
 const CORES_NOT_READ: [&str; 2] = ["cores not read", "not read"];
 
 /// CPU core cluster in OS performance order.
@@ -1785,7 +1787,10 @@ mod tests {
         }
     }
 
-    /// T-G1, Full (§3.2, §3.3) on Helvetica Neue, at 1× and 2×.
+    /// T-G1, Full (§3.2, §3.3) on Helvetica Neue, at 1× and 2×. The plan
+    /// reads the width in points (`W · s` px at either scale): every edge
+    /// lands on a device pixel at both, and an odd px count at 2× plans as
+    /// the whole point under it.
     #[test]
     fn plan_golden_tables_full() {
         let m = hn();

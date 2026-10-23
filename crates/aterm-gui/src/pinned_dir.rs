@@ -441,6 +441,7 @@ mod imp {
         }
 
         /// Publish through the retained parent capability while checking only
+        /// the temporary/final entry.
         fn publish_as_new_at_retained_with_hook(
             self,
             name: &OsStr,
@@ -1573,7 +1574,10 @@ mod imp {
         Ok(file)
     }
 
-    /// Open a retained read guard for an artifact.
+    /// Open a retained read guard for an artifact. Unlike the write and directory guards it
+    /// shares `FILE_SHARE_DELETE`: Windows checks sharing both ways, and a live write guard holds
+    /// `DELETE_ACCESS` for its whole life (it publishes and rolls back through it), so a mask
+    /// without DELETE fails with ERROR_SHARING_VIOLATION on an artifact this process still holds.
     fn open_regular_file_with_identity(path: &Path) -> io::Result<(std::fs::File, FileIdentity)> {
         let file = std::fs::OpenOptions::new()
             .access_mode(GENERIC_READ)
@@ -1729,6 +1733,8 @@ mod imp {
         }
 
         /// Publish through the retained parent capability while checking only
+        /// the temporary/final entry, which includes proving it a direct child
+        /// of the retained directory ([`Self::validate_entry_identity_at_retained`]).
         fn publish_as_new_at_retained_with_hook(
             self,
             name: &OsStr,

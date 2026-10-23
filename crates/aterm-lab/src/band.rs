@@ -43,7 +43,7 @@ impl Band {
 
     /// The band's word, as `--band` takes it.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Band::Agent => "agent",
             Band::App => "app",

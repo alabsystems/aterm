@@ -282,7 +282,8 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
     if rc == 0 { None } else { Some(free_to_caller) }
 }
 
-/// `BY_HANDLE_FILE_INFORMATION`.
+/// `BY_HANDLE_FILE_INFORMATION`. Only the volume serial and the two file-index halves
+/// are read; the rest is declared to get the layout right.
 #[repr(C)]
 #[derive(Default)]
 struct ByHandleFileInformation {
@@ -361,7 +362,9 @@ pub fn remove_link(link: &Path) {
     let _ = fs::remove_file(link);
 }
 
-/// `p` with every `/` rewritten to `\`, wide-char-wise (lossless).
+/// `p` with every `/` rewritten to `\`, wide-char-wise (lossless). `cmd` built-ins read `/x`
+/// anywhere on a line as a switch, so an `mklink` argument like `store/trust/671` (which
+/// `Path::join` of a multi-component `&str` produces) fails as `Invalid switch - "trust"`.
 fn backslashed(p: &Path) -> std::ffi::OsString {
     use std::os::windows::ffi::OsStringExt;
     let wide: Vec<u16> = p

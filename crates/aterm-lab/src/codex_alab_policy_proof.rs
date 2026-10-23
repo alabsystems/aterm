@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The policy-only native TUI lane: a refusal leaves rejected work excluded,
-//! continues allowed work once, preserves drafts and cannot form a retry loop.
+//! Policy-only native TUI lane tests for refusal handling and retry-loop prevention.
 
 use super::*;
 use crate::codex_alab_model::policy::{self, ADVANCE, BOUNDARY, DRAFT, RULE};
 
 const HANG: Duration = Duration::from_secs(60);
 const QUIET: Duration = Duration::from_secs(130);
-// Complete the first-run accessibility choice before the fixture snapshots
-// its settings, so unrelated first-start discovery does not rewrite them.
 const CONFIG_EXTRA: &str = "[tui]\nscreen_reader_detection_done = true\n";
 
 pub(super) fn legs(proof: &mut Proof, package: &Path) -> Result<(), Fail> {
@@ -80,9 +77,6 @@ pub(super) fn legs(proof: &mut Proof, package: &Path) -> Result<(), Fail> {
     )?;
     let _ = proof.claim_with_limit(&exhausted, HANG)?;
 
-    // Input grace alone must not make a broken draft guard pass. Keep the
-    // draft through its configured five-second grace and a full minute in
-    // which an unguarded advance would be observed. Other legs run meanwhile.
     if deferred && let Some(reply) = draft_reply {
         proof.sleep_past_reply(reply, Duration::from_secs(65))?;
     }
@@ -105,9 +99,6 @@ pub(super) fn legs(proof: &mut Proof, package: &Path) -> Result<(), Fail> {
     let deferred_observed = Instant::now();
 
     let all = [&draft, &allowed, &repeated, &exhausted];
-    // An owed act held by the draft may already have scheduled the normal
-    // 60-second composer recheck. Its hang detector starts after that known
-    // wait, rather than treating the recheck itself as a latency budget.
     let deadline = if deferred {
         deferred_observed + Duration::from_secs(60) + HANG
     } else {
@@ -162,8 +153,6 @@ pub(super) fn legs(proof: &mut Proof, package: &Path) -> Result<(), Fail> {
     if advanced {
         let allowed_reply = proof.await_reply(&allowed, "advance", HANG)?;
         if let Some(reply) = allowed_reply {
-            // Wait through the contractual first short-turn back-off before
-            // applying the one-minute hang detector to its next request.
             proof.sleep_past_reply(reply, Duration::from_secs(120))?;
         }
         let next = allowed_reply.is_some() && proof.await_tag(&allowed, "after-boundary", HANG)?;
@@ -252,7 +241,6 @@ fn await_refusal(proof: &Proof, leg: &Leg, step: &str) -> Result<Option<ReplyWri
 }
 
 /// Match the completed HTTP 400 write, not the model's planned response.
-/// The shared journal reader has already rejected duplicate/mismatched witnesses.
 fn refusal_written(rows: &[J], head: &str, now: i64) -> Option<ReplyWrite> {
     let row = rows.iter().find(|row| str_of(row, "tag") == head)?;
     let id = row.get("request_id")?.as_i64()?;

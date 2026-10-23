@@ -56,7 +56,7 @@ pub struct RunOut {
 }
 
 impl RunOut {
-    pub fn success(&self) -> bool {
+    pub const fn success(&self) -> bool {
         self.status == 0
     }
 
@@ -762,6 +762,9 @@ pub(crate) mod testing {
     }
 
     /// Append to the config of the fresh repository at `repo`, in one write, what one
+    /// `git config <key> <value>` per pair would leave (each section once, in first-key
+    /// order; checked byte for byte against git 2.50).
+    ///
     /// # Panics
     /// On a key that is not `section.name`, a section the file already holds, a value
     /// git would quote, or a config that cannot be written.

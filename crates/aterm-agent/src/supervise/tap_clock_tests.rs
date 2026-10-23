@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The usage tap's clock at a wall (`tap_clock.rs`): which window times which
-// wall, which reading counts, what times and what rolls over, and the notice
-// and the tap together. Each rule has its negative control.
-
 use super::*;
 use crate::harness::tap::{Fresh, Reading};
 
@@ -124,7 +120,6 @@ fn a_full_window_read_since_the_wall_times_it_to_its_reset() {
             "{why}"
         );
     }
-    // The weekly window's length is a week.
     let week = NOW + 3 * 86_400;
     assert_eq!(
         says(&[WEEK], &[&[(WEEK, full(100, week, NOW))]]),
@@ -230,7 +225,6 @@ fn a_wall_timed_by_two_windows_takes_the_later_full_reset() {
     assert_eq!(says(&[FIVE, WEEK], &[&both]), TapSays::ResetsAt(week));
     let five_only = [(FIVE, full(100, five, NOW)), (WEEK, full(60, week, NOW))];
     assert_eq!(says(&[FIVE, WEEK], &[&five_only]), TapSays::ResetsAt(five));
-    // The loop folds in only its wall's windows.
     assert_eq!(
         says(&[FIVE], &[&[(FIVE, full(40, five, NOW))]]),
         TapSays::Nothing
@@ -239,7 +233,6 @@ fn a_wall_timed_by_two_windows_takes_the_later_full_reset() {
         says(&[WEEK], &[&[(WEEK, full(100, week, NOW))]]),
         TapSays::ResetsAt(week)
     );
-    // A newer full reading names a later reset: it is the one.
     let later = five + 600;
     assert_eq!(
         says(
@@ -251,8 +244,6 @@ fn a_wall_timed_by_two_windows_takes_the_later_full_reset() {
         ),
         TapSays::ResetsAt(later)
     );
-    // A reading that times nothing leaves the timed reset standing: the
-    // window dropped at its reset is still that reset.
     assert_eq!(
         says(
             &[FIVE],
@@ -289,7 +280,6 @@ fn a_full_window_shown_rolled_over_ends_a_wait_with_no_reset() {
         TapSays::RolledAt(NOW + 4),
         "under 100 % again"
     );
-    // The first reading that showed it rolled is the instant.
     assert_eq!(
         says(
             &[FIVE],
@@ -301,7 +291,6 @@ fn a_full_window_shown_rolled_over_ends_a_wait_with_no_reset() {
         ),
         TapSays::RolledAt(NOW + 2)
     );
-    // NEGATIVE CONTROLS.
     for (why, before) in [
         ("never read full", full(97, NOW + 600, NOW)),
         ("no figure at all", dropped(NOW)),

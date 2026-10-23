@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The event log: its encoding, its torn-tail, cut and fault classification, its seal, its
-//! identity and ancestor checks, and its checked ranges.
+//! Tests for `EventLog` encoding, decoding, truncation, seal, and range checks.
 
 use astream_wire::frame::Frame;
 use astream_wire::steps::{STEP_VERSION, encode_step};
@@ -150,7 +149,6 @@ fn every_byte_flip_of_a_log_is_refused_or_reported_torn_never_misread() {
                     torn += 1;
                     assert_eq!(cut + dropped, bad.len());
                     assert_eq!(back.header(), log.header());
-                    // Only the last record (the seal) can tear; every event before it stays.
                     assert_eq!(back.inputs(), log.inputs(), "byte {at} mask {mask:#x}");
                 }
                 Ok((_, tail)) => panic!("byte {at} mask {mask:#x} decoded {tail:?}"),
@@ -169,7 +167,6 @@ fn every_truncation_of_a_log_is_its_prefix_reported_torn_or_unsealed_or_a_refusa
     let inputs = sample_inputs();
     let schema = ToySchema::new();
     let seal = seal_len();
-    // Record boundaries: the header alone, then each further event (the seal after them).
     let bounds: Vec<usize> = (0..=inputs.len())
         .map(|k| log_of(&inputs[..k]).encode(&schema).unwrap().len() - seal)
         .collect();
@@ -242,7 +239,6 @@ fn a_seal_names_its_event_count_and_digest_and_a_seal_naming_others_is_refused()
             found: digest
         })
     );
-    // The seal covers a broken log too: the flag is in the header record.
     let (mut broken, _) = sample();
     broken.mark_broken("lost");
     let (back, tail) = decode(&broken.encode(&schema).unwrap()).unwrap();

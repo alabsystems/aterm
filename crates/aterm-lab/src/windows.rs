@@ -804,7 +804,8 @@ pub fn swtpm_args(l: &Layout) -> Vec<String> {
     ]
 }
 
-/// Which daemon belongs to this layout.
+/// Which daemon belongs to this layout. Argument words bind the pid file to
+/// the VM's own resources; a command-name prefix alone does not.
 #[derive(Clone, Copy, Debug)]
 enum Daemon {
     Qemu,
@@ -933,7 +934,8 @@ impl DaemonProcess {
         Ok(observe_daemon(l, kind, self.pid)? == Some(self))
     }
 
-    /// Recheck immediately before signalling.
+    /// Recheck immediately before signalling. This narrows the stale-pid
+    /// window; a read followed by kill is not a kernel-stable process handle.
     fn signal(self, l: &Layout, kind: Daemon, sig: i32) -> Result<(), String> {
         if self.still_here(l, kind)? {
             crate::sys::kill(self.pid, sig)

@@ -105,6 +105,7 @@ fn sample(at_s: u64, busy: &[u64], k: u64) -> Sample {
         self_pid: 100,
         tabs: vec![TabRoot {
             key: 7,
+            tab: 7,
             shell_pid: 200,
             label: "Tab 1".into(),
             program: "cargo".into(),

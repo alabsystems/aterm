@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Private peers exercise the already-authenticated connection state. No bus
-//! daemon, session-bus address, or external service participates.
+//! Tests for authenticated connection deadline and queue bounds.
 
 use super::*;
 use std::net::Shutdown;
@@ -35,8 +34,6 @@ struct Peer {
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        // Closing the owned peer also releases a writer blocked by the client
-        // refusing a message. Join on ordinary completion and panic unwind.
         let _ = self.close.shutdown(Shutdown::Both);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -84,8 +81,6 @@ fn bytes(messages: impl IntoIterator<Item = Message>) -> Vec<u8> {
 #[test]
 fn an_expired_reply_deadline_preserves_the_unread_stream() {
     let (ours, mut bus) = CtlStream::pair().unwrap();
-    // These two small frames fit the socket before reading starts. A worker
-    // that merely intends to write is not proof that an expired read is ready.
     bus.write_all(&bytes([signal(2, "first"), answer(9)]))
         .unwrap();
     let mut conn = connected(ours);
@@ -120,9 +115,6 @@ fn a_call_answered_after_its_deadline_leaves_the_connection_as_it_was() {
     bus.set_read_timeout(Some(HANG)).unwrap();
     let mut conn = connected(ours);
     let ping = || Message::method_call(Some(":1.9"), "/private", None, "Ping").unwrap();
-    // What `call` runs, each phase given its own deadline (`call` gives both
-    // its one): the call goes out whole (no deadline to send by), and the
-    // answer's deadline has passed, whatever the machine's speed.
     let expired = Instant::now().checked_sub(Duration::from_secs(1));
     let outcome = conn.call_until(ping(), None, expired);
     assert!(matches!(outcome, Err(Error::NoReply)), "{outcome:?}");
@@ -162,8 +154,6 @@ fn a_reply_before_its_deadline_preserves_unrelated_messages_in_order() {
 
 #[test]
 fn unrelated_tiny_messages_cannot_grow_the_pending_queue_without_bound() {
-    // More than the admitted count, while far below its byte allowance. A
-    // matching answer at the end must not hide exhaustion along the way.
     let messages = (2..302)
         .map(|serial| signal(serial, "small"))
         .chain([answer(9)]);
@@ -185,8 +175,6 @@ fn unrelated_tiny_messages_cannot_grow_the_pending_queue_without_bound() {
 
 #[test]
 fn a_few_large_messages_cannot_evade_the_pending_byte_bound() {
-    // Each legal message is below DEFAULT_MAX_INCOMING and the count is
-    // small; their combined original wire bytes exceed one MiB.
     let body = "x".repeat(400_000);
     let (mut conn, _peer) = sending(bytes([
         signal(2, &body),
@@ -209,14 +197,10 @@ fn a_call_deadline_also_bounds_a_write_to_a_peer_that_never_reads() {
         let call = Message::method_call(Some(":1.9"), "/private", None, "Ping")
             .unwrap()
             .with_body(vec![Value::Str("x".repeat(8 << 20))]);
-        // The condition under test is this API deadline, not machine speed.
-        // The observer below allows a full minute for the result to arrive.
         let result = conn.call(call, Duration::from_millis(1));
         let _ = done.send(matches!(result, Err(Error::Timeout)));
     });
     let outcome = received.recv_timeout(HANG);
-    // Always unblock and join the exact owned writer before asserting, also
-    // on the baseline whose write does not respect the call deadline.
     let _ = cancel_write.shutdown(Shutdown::Both);
     let _ = bus.shutdown(Shutdown::Both);
     drop(cancel_write);

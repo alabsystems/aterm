@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// THE HOST'S DOOR, GENERATED (`host_door.rs`): a trait of the test's own,
-// declared with the same macro, with a method the window's trait does not
-// have — the PLANTED method — shows the taped host forwards it and tapes it,
-// and the replay host answers it from the tape alone, with nothing written
-// for it anywhere but its declaration; and a method marked `act` there is an
-// act by that mark alone.
+// Tests that `idle_host_trait!` forwards, tapes, and replays trait methods and `act` markers.
 
 use std::sync::{Arc, Mutex};
 
@@ -25,8 +20,7 @@ mod planted {
         pub trait Planted: Send + Sync + std::fmt::Debug {
             /// A query with no default body.
             fn wants(&self) -> bool;
-            /// THE PLANTED METHOD: a query with a default body, which the
-            /// window's trait does not have and nobody wrote a forward for.
+            /// A query with a default body.
             fn planted(&self, n: u32, why: &str) -> Option<String> {
                 let _ = (n, why);
                 None
@@ -43,7 +37,7 @@ mod planted {
             fn told(&self, text: &str) {
                 let _ = text;
             }
-            /// AN ACT: a query the list marks `act`, and nothing else does.
+            /// A query marked `act`.
             act fn acted(&self) -> bool {
                 false
             }
@@ -179,9 +173,6 @@ fn a_method_the_trait_grows_is_taped_by_construction() {
         "one record per call the loop made, none for `second`"
     );
 
-    // The replay host holds no host (its one field is the replay's door), so
-    // what it answers can only be the tape's: the overrides above, where a
-    // default would answer `None` and `false`.
     let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
     let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
     assert!(Planted::wants(&replay));
@@ -194,7 +185,6 @@ fn a_method_the_trait_grows_is_taped_by_construction() {
     assert!(Planted::acted(&replay));
     assert_eq!(core.left(), 0, "every call answered from the tape");
 
-    // NEGATIVE CONTROL: the planted method asked otherwise diverges there.
     let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
     let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
     assert!(Planted::wants(&replay));
@@ -218,8 +208,6 @@ fn an_act_is_marked_where_it_is_declared() {
         planted::HOST_METHODS,
         ["wants", "planted", "first", "second", "told", "acted"]
     );
-    // Every method's door, acts and queries alike: what a tape's header names
-    // as its recording build's doors.
     assert_eq!(
         planted::HOST_DOORS,
         [

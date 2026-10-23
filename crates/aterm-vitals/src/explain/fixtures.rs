@@ -42,6 +42,8 @@ pub struct Coal {
     pub exited: u64,
     /// Excess of QoS bucket sum over CPU time in the window (millicores).
     pub qos_over_mc: u64,
+    /// Its footprint, bytes (64 MiB unless set).
+    pub footprint: Option<u64>,
 }
 
 impl Coal {
@@ -304,7 +306,7 @@ impl Scene {
                         cpu_ns: base + c.mc * at_ms * 1000,
                         bytes_read: read + c.read_bps * at_ms / 1000,
                         eqos_ns,
-                        footprint: Some(64 << 20),
+                        footprint: Some(c.footprint.unwrap_or(64 << 20)),
                     }
                 })
                 .collect();
@@ -397,11 +399,12 @@ fn identities_1032() -> Vec<LeadIdentity> {
     ]
 }
 
-/// A tab with key `key`, labelled `Tab <key>`, whose shell is `shell_pid`.
+/// A tab of one pane with key `key`, labelled `Tab <key>`, whose shell is `shell_pid`.
 #[must_use]
 pub fn tab(key: u64, shell_pid: u32) -> TabRoot {
     TabRoot {
         key,
+        tab: key,
         shell_pid,
         label: format!("Tab {key}"),
         program: String::new(),
@@ -741,6 +744,33 @@ pub fn calm_1510() -> Scene {
         }),
         ..Scene::default()
     }
+}
+
+/// The calm Mac with Caffeine (coalition 896, the user's app, led from
+/// start-up) at 1.50 cores: app-work.
+#[must_use]
+pub fn app_work_1510() -> Scene {
+    let mut scene = calm_1510();
+    scene.busy_mc += 1490;
+    for c in &mut scene.coalitions {
+        if c.id == 896 {
+            c.mc = 1500;
+        }
+    }
+    for p in &mut scene.procs {
+        if p.pid == 784 {
+            *p = Proc::new(
+                p.pid,
+                p.ppid,
+                p.uid,
+                p.coalition,
+                p.birth_ms,
+                "Caffeine",
+                1500,
+            );
+        }
+    }
+    scene
 }
 
 /// A tab-2 build 20 minutes after start-up (RD §17), 10:48:41.200 PDT.

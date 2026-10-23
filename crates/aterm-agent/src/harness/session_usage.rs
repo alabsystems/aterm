@@ -253,17 +253,17 @@ impl TranscriptCursor {
     }
 
     /// The fold so far.
-    pub fn fold(&self) -> &TranscriptUsage {
+    pub const fn fold(&self) -> &TranscriptUsage {
         &self.fold
     }
 
     /// Bytes of the file consumed so far (complete lines and the torn tail).
-    pub fn offset(&self) -> u64 {
+    pub const fn offset(&self) -> u64 {
         self.offset
     }
 
     /// How many times the fold started over.
-    pub fn restarts(&self) -> u64 {
+    pub const fn restarts(&self) -> u64 {
         self.restarts
     }
 
@@ -397,7 +397,9 @@ impl TranscriptCursor {
         })
     }
 
-    /// Fold every line `bytes` completes; keep the torn tail pending.
+    /// Fold every line `bytes` completes; keep the torn tail pending. The
+    /// bytes start at [`Self::offset`]; each completed line goes to `tap`
+    /// too, with the offset just past its newline.
     fn consume(&mut self, mut bytes: &[u8], mut tap: Option<&mut StepFold>) {
         let mut end = self.offset;
         while let Some(nl) = bytes.iter().position(|&b| b == b'\n') {
@@ -473,7 +475,7 @@ pub struct Refresh {
 impl Refresh {
     /// Whether the totals are the whole session's: caught up, nothing unread, the walk whole.
     #[must_use]
-    pub fn complete(&self) -> bool {
+    pub const fn complete(&self) -> bool {
         self.caught_up && self.unread == 0 && !self.walk_cut
     }
 }
@@ -647,7 +649,7 @@ impl SessionUsage {
     }
 
     /// The transcript's own cursor.
-    pub fn main(&self) -> &TranscriptCursor {
+    pub const fn main(&self) -> &TranscriptCursor {
         &self.main
     }
 
@@ -905,7 +907,7 @@ impl SessionUsage {
 
     /// Milliseconds Claude was working in this conversation: its main transcript's finished turns ([`TranscriptUsage::busy_ms`]).
     #[must_use]
-    pub fn busy_ms(&self) -> u64 {
+    pub const fn busy_ms(&self) -> u64 {
         self.main.fold().busy_ms()
     }
 
@@ -1284,7 +1286,7 @@ impl UsageFacts {
 
     /// Whether these facts carry anything of the `Σ` segment's — what [`Self::wall_only`] takes out.
     #[must_use]
-    pub fn says_usage(&self) -> bool {
+    pub const fn says_usage(&self) -> bool {
         !self.models.is_empty()
             || self.more.models > 0
             || self.unread > 0

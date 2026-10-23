@@ -238,7 +238,9 @@ impl HolderImage {
         self.drawer.is_some() || self.launcher_for.is_some()
     }
 
-    /// Whether the represented image descriptions agree.
+    /// Whether the represented image descriptions agree. Compare the fields
+    /// too: neither a hash collision nor a refreshed classification keeps an
+    /// older build or launcher on the timeline.
     pub(crate) fn same_image(&self, other: &Self) -> bool {
         self.token == other.token
             && self.pgid == other.pgid
@@ -297,7 +299,8 @@ impl HolderImage {
         })
     }
 
-    /// A matching family and known version on the screen.
+    /// A matching family and known version on the screen. This is evidence
+    /// about visible text, never proof that this process wrote those cells.
     pub(crate) fn matches_card(&self, rows_kind: usize, version: &str) -> bool {
         let Some(expected_kind) = self.drawer.map(CardProgram::rows_kind) else {
             return false;
@@ -771,7 +774,8 @@ pub(crate) struct ByteArm {
     /// One initial observation also covers an already-running or direct -e
     /// holder, where the foreground group never changes.
     initial: bool,
-    /// The signed command is still an unresolved shell.
+    /// The signed command is still an unresolved shell. It can exec after
+    /// any number of output batches, not just the next four slices.
     unresolved: bool,
     /// An accepted C owes a read before the next slice in this batch.
     boundary_due: bool,
@@ -857,7 +861,8 @@ impl ByteArm {
             .copied()
     }
 
-    /// Allow one ordinary read in this batch.
+    /// Allow one ordinary read in this batch. A settled drawer or other
+    /// non-shell image owes none, however many output batches follow.
     pub(crate) fn begin_batch(&mut self) {
         self.batch_due = true;
     }
@@ -1114,7 +1119,8 @@ pub(crate) mod cut_cost {
         reads: usize,
     }
 
-    /// One pass.
+    /// One pass. `arm`: `None` is a reader without the arm; `Some(holder)`
+    /// runs it, reading `holder` (when positive) as the arm owes.
     fn pass(corpus: &[u8], batch: usize, arm: Option<i32>) -> Pass {
         let term = std::sync::Mutex::new(aterm_core::terminal::Terminal::new(24, 80));
         let mut state = ByteArm::default();

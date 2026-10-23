@@ -47,7 +47,10 @@ const ERR_SEC_INVALID_EXTENDED_KEY_USAGE: CFIndex = -67609;
 /// `errSecCertificateRevoked`.
 const ERR_SEC_CERTIFICATE_REVOKED: CFIndex = -67820;
 
-/// `CFArrayCallBacks`.
+/// `CFArrayCallBacks`. Declared with real function-pointer fields rather than
+/// opaque words so the type is `Sync` (an `extern` static of a
+/// raw-pointer-bearing type is not) and so the layout claim is checkable against
+/// `CFArray.h:78`.
 #[repr(C)]
 struct CFArrayCallBacks {
     version: CFIndex,
@@ -114,7 +117,8 @@ unsafe extern "C" {
     fn SecTrustSetOCSPResponse(trust: SecTrustRef, response_data: CFTypeRef) -> OSStatus;
     fn SecTrustSetAnchorCertificates(trust: SecTrustRef, anchors: CFArrayRef) -> OSStatus;
     fn SecTrustSetAnchorCertificatesOnly(trust: SecTrustRef, only: Boolean) -> OSStatus;
-    /// Returns C `_Bool`: `true` iff the chain is trusted.
+    /// Returns C `_Bool`: `true` iff the chain is trusted. Not an `OSStatus`
+    /// (see the module docs).
     fn SecTrustEvaluateWithError(trust: SecTrustRef, error: *mut CFErrorRef) -> bool;
 }
 

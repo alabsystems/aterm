@@ -277,7 +277,7 @@ const HELP_MEMO_MAX: usize = 16;
 impl<S: Read + Write> RelayClient<S> {
     /// Wrap an already-connected, authenticated transport. For the local AUTH
     /// handshake use [`connect_local`](RelayClient::connect_local).
-    pub fn new(io: S) -> Self {
+    pub const fn new(io: S) -> Self {
         Self {
             io,
             reads_only: false,
@@ -399,7 +399,7 @@ impl<S: Read + Write> RelayClient<S> {
     /// connection (`try_clone` on a `CtlStream`). The harness uses it to shut
     /// down a connection parked in an `await` from the thread that decided the
     /// wait is over.
-    pub fn transport(&self) -> &S {
+    pub const fn transport(&self) -> &S {
         &self.io
     }
 

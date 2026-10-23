@@ -29,7 +29,8 @@ pub const LABEL_MAX: usize = 64;
 /// (`accounts use help` asks for help), so an account named so could never be named.
 pub const RESERVED_LABEL: &str = "help";
 
-/// The longest `dir` a row may name, in bytes.
+/// The longest `dir` a row may name, in bytes. A longer one is refused, not cut: the
+/// string is hashed as given, so a cut one names another login.
 pub const DIR_MAX: usize = 512;
 
 /// The longest `email` a row may carry, in bytes (RFC 5321's path bound).
@@ -129,7 +130,11 @@ pub const RESET_PROFILE_S: i64 = 25 * 3600;
 /// The probe is due no sooner than this after the last sample or claim.
 pub const PROBE_MIN_S: i64 = 3 * 60;
 
-/// No account is probed within this long of any account's claim.
+/// No account is probed within this long of any account's claim. The vendor answers a
+/// usage read, unmarked, from the home's snapshot while it is under 60 s old and the
+/// asker has had no response since, and tags the snapshot with the home profile's
+/// account whichever login fetched it (2.1.287 bundle): two accounts probed inside a
+/// minute could each be shown the other's figures.
 pub const PROBE_APART_S: i64 = 90;
 
 /// The probe is due no later than this after the last sample.
@@ -150,7 +155,10 @@ pub const CANARY_HOLD_S: i64 = 10 * 60;
 /// run on.
 pub const MAX_UNDO: usize = 8;
 
-/// How far ahead of the reader's clock an observation's `at` may stand.
+/// How far ahead of the reader's clock an observation's `at` may stand. One
+/// stamped later is read as made then: a clock set back, or another
+/// machine's running ahead, must not make an observation newer than
+/// anything this machine will see.
 pub const STAMP_SKEW_S: i64 = 5 * 60;
 
 /// The session window's length (the vendor's `five_hour`, `windowSeconds: 18000`): a
@@ -185,7 +193,8 @@ pub const CREDITS_STALE_S: i64 = 3 * CREDITS_RETELL_S;
 /// The weekly window counts as NEARLY FULL from this figure ([`windows_full`]).
 pub const WINDOW_FULL_PCT: u32 = 90;
 
-/// ...while its reset is more than this far off: a day.
+/// ...while its reset is more than this far off: a day. A window that resets
+/// sooner is a wait with an end, and no line.
 pub const WINDOW_FULL_AHEAD_S: i64 = 24 * 3600;
 
 /// THE BOUNDED WAIT FOR `accounts.lock` ([`Store::acquire_within`]): the
@@ -231,7 +240,9 @@ pub const SESSION_LIMIT: &str = "five_hour";
 /// another window.
 pub const WEEK_LIMIT: &str = "seven_day";
 
-/// The variable that moves a process's Claude home.
+/// The variable that moves a process's Claude home. READ in the vendor's
+/// bundle: set, it is the home, and — with [`LOGIN_ENV`] unset — the
+/// directory its keychain item is named by too.
 pub const HOME_ENV: &str = "CLAUDE_CONFIG_DIR";
 
 /// THE VARIABLE A CLAUDE CODE'S `os.homedir()` READS, which it joins
@@ -285,7 +296,7 @@ pub enum Class {
 impl Class {
     /// Canonical `accounts.toml` string for this class.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Class::Dedicated => "dedicated",
             Class::Shared => "shared",
@@ -552,7 +563,7 @@ impl Roster {
 
     /// Returns whether the roster lists two or more accounts.
     #[must_use]
-    pub fn several(&self) -> bool {
+    pub const fn several(&self) -> bool {
         self.rows.len() >= 2
     }
 
@@ -783,7 +794,9 @@ pub fn row_inline(label: &str, class: Class, dir: Option<&str>) -> Option<String
 /// ([`row_inline_of`]): a refusal is printed, and an address is never.
 pub const EMAIL_BY_HAND: &str = "<the --email you gave>";
 
-/// [`row_inline`] of a whole row.
+/// [`row_inline`] of a whole row. Its `email`, where it has one, is written
+/// as [`EMAIL_BY_HAND`]: this text is printed in a refusal, never written to
+/// a file, and no address is ever printed.
 fn row_inline_of(row: &Row) -> Option<String> {
     if row_refusal(row).is_some() {
         return None;
@@ -1077,7 +1090,7 @@ impl ProcessLogin {
 
     /// Attaches whether the vendor profile store holds an active `.json` configuration.
     #[must_use]
-    pub fn with_profile_store(mut self, configured: bool) -> ProcessLogin {
+    pub const fn with_profile_store(mut self, configured: bool) -> ProcessLogin {
         self.stored_login &= !configured;
         self
     }
@@ -1111,7 +1124,9 @@ pub fn footer_label<'a>(roster: &'a Roster, who: &ProcessLogin) -> Option<&'a st
     judged_label(roster, who).filter(|_| roster.several())
 }
 
-/// The logins' file name, in the store beside `state.json`.
+/// The logins' file name, in the store beside `state.json`. Its own file:
+/// an older build saves `state.json` with the keys it knows ([`State::to_json`]),
+/// so a binding kept there would be lost at that build's first write.
 pub const LOGINS_FILE: &str = "logins.json";
 
 /// [`LOGINS_FILE`]'s schema. A file of another one is refused.
@@ -1123,10 +1138,16 @@ pub const MAX_LOGINS_BYTES: u64 = 256 * 1024;
 /// One day, in seconds.
 const DAY_S: i64 = 86_400;
 
-/// A login's lifetime before anything was learned of it: three weeks.
+/// A login's lifetime before anything was learned of it: three weeks. The
+/// vendor's client default is 30 days (`nP=2592000000`, READ in the 2.1.300
+/// bundle) and field reports say one to four weeks; the server's figure is
+/// not on any record here until an end or a notice teaches it.
 pub const LIFETIME_START_S: i64 = 21 * DAY_S;
 
-/// The least a learned lifetime is taken as: a week.
+/// The least a learned lifetime is taken as: a week. An end sooner than this
+/// after a renewal is no lifetime (a revocation, a sign-out elsewhere) and
+/// teaches nothing ([`note_login_end`]); a notice that implies less is read
+/// as this.
 pub const LIFETIME_MIN_S: i64 = 7 * DAY_S;
 
 /// The most a learned lifetime is taken as: the client's own 30 days.
@@ -1400,7 +1421,7 @@ pub enum LoginState {
 impl LoginState {
     /// Short status word for reports and CLI output.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             LoginState::Expired => "expired",
             LoginState::Due { .. } => "due",
@@ -1638,7 +1659,8 @@ pub struct Wall {
     /// How many times it was found standing with no reset ahead of it: `0`
     /// for a wall observed before its own reset.
     pub attempts: u32,
-    /// This window was cleared at `at`, rather than observed standing.
+    /// This window was cleared at `at`, rather than observed standing. The
+    /// record prevents an older transcript row from putting that wall back.
     pub cleared: bool,
 }
 
@@ -1687,7 +1709,9 @@ pub struct Sample {
     pub by: String,
 }
 
-/// A window's figure and the instant it stops counting, while that window still runs.
+/// A window's figure and the instant it stops counting, while that window still runs. A
+/// window whose reset has passed voids its figure; a figure whose reset was not read is
+/// void one window length after its sample.
 fn figure(
     pct: Option<u32>,
     reset: Option<i64>,
@@ -1775,7 +1799,7 @@ pub enum Credits {
 impl Credits {
     /// Timestamp when this credits observation was recorded.
     #[must_use]
-    pub fn at(&self) -> i64 {
+    pub const fn at(&self) -> i64 {
         match self {
             Credits::InUse(c) => c.seen,
             Credits::Off(off) => off.at,
@@ -1834,7 +1858,9 @@ pub struct WindowSaid {
     /// Whole percent used; `None`: refilled at [`Self::at`], and no figure
     /// said since.
     pub pct: Option<u32>,
-    /// When the window resets, where the warning named it.
+    /// When the window resets, where the warning named it. With no figure,
+    /// the reset that came by itself (a limit that lifted on its own,
+    /// [`reset_outcome`]); `None` there: a limit reset used refilled it.
     pub reset: Option<i64>,
     /// When it was true.
     pub at: i64,
@@ -1892,7 +1918,7 @@ pub struct WindowFig {
 impl WindowFig {
     /// Returns whether this window reading's reset timestamp is still in the future at `now`.
     #[must_use]
-    pub fn current(&self, now: i64) -> bool {
+    pub const fn current(&self, now: i64) -> bool {
         now < self.reset
     }
 
@@ -1904,7 +1930,7 @@ impl WindowFig {
 
     /// Utilization percentage rounded half-up to a whole integer.
     #[must_use]
-    pub fn whole(&self) -> u32 {
+    pub const fn whole(&self) -> u32 {
         self.pct_x10.saturating_add(5) / 10
     }
 }
@@ -1995,7 +2021,7 @@ pub enum Auth {
 impl Auth {
     /// Canonical status word for `state.json` and reports.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Auth::Unseen => "unseen",
             Auth::Ok => "ok",
@@ -2029,9 +2055,14 @@ pub struct Account {
     pub auth: Auth,
     /// Machine-local: when that word was learned.
     pub auth_at: Option<i64>,
-    /// MACHINE-LOCAL: the latest account-wide clearing.
+    /// MACHINE-LOCAL: the latest account-wide clearing. New writes come
+    /// from the owner's [`pin`] and from another account signed in to the
+    /// home ([`note_reading`]); older schema-1 states may also carry an
+    /// automated reset's stamp.
     pub cleared_at: Option<i64>,
-    /// Machine-local: when a session was last read running on it ([`note_session`]).
+    /// Machine-local: when a session was last read running on it ([`note_session`]). It
+    /// outlives the session's own row, which goes with its agent ([`forget_session`]):
+    /// what [`reset_allowed`] asks of every other account.
     pub ran_at: Option<i64>,
     /// OBSERVATION: the newest word on its usage credits ([`Credits`]).
     pub credits: Option<Credits>,
@@ -2289,7 +2320,8 @@ pub struct ResetClaim {
     pub account: String,
     /// The wall's own reset: one attempt per (account, wall).
     pub until: Option<i64>,
-    /// The vendor's raw limit type observed at this claim.
+    /// The vendor's raw limit type observed at this claim. An older claim
+    /// without this scope can record an outcome but cannot clear any wall.
     pub window: Option<String>,
     /// The session that takes the row.
     pub sid: String,
@@ -2394,9 +2426,11 @@ impl Default for State {
 /// Reason `state.json` or `logins.json` failed deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unread {
-    /// It is not JSON: a file cut short.
+    /// It is not JSON: a file cut short. It holds nothing to lose, and the
+    /// next write may replace it.
     Torn(String),
-    /// It is JSON and it is not this build's: another schema, or none.
+    /// It is JSON and it is not this build's: another schema, or none. It
+    /// is never written over.
     NotOurs(String),
 }
 
@@ -2410,7 +2444,9 @@ impl Unread {
     }
 }
 
-/// Whether the instant `t` is within the last `window` seconds at `now`.
+/// Whether the instant `t` is within the last `window` seconds at `now`. A stamp ahead of
+/// the clock (a clock set back, another machine's running fast) is not recent: read as
+/// one, it would stay recent for as long as the clock is behind it.
 fn recent(t: i64, now: i64, window: i64) -> bool {
     (0..window).contains(&now.saturating_sub(t))
 }
@@ -2421,7 +2457,7 @@ fn int(v: Option<&Value>) -> Option<i64> {
 
 /// The latest instant an observation read at `now` may be stamped
 /// ([`STAMP_SKEW_S`]).
-fn stamp_cap(now: i64) -> i64 {
+const fn stamp_cap(now: i64) -> i64 {
     now.saturating_add(STAMP_SKEW_S)
 }
 
@@ -3031,7 +3067,7 @@ pub enum Condition {
 impl Condition {
     /// Canonical condition word for reports and CLI output.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Condition::NotEnrolled => "not-enrolled",
             Condition::SignedOut => "signed-out",
@@ -3044,7 +3080,7 @@ impl Condition {
 
     /// Returns whether the account has fresh (non-low, usable) budget (`Fresh` or `Unseen`).
     #[must_use]
-    pub fn fresh(self) -> bool {
+    pub const fn fresh(self) -> bool {
         matches!(self, Condition::Usable | Condition::Unseen)
     }
 
@@ -3138,7 +3174,7 @@ pub enum Mode {
 impl Mode {
     /// Canonical `aterm.toml` string for this mode.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Mode::Early => "early",
             Mode::Wall => "wall",
@@ -3264,7 +3300,7 @@ pub enum StayWhy {
 impl StayWhy {
     /// Short reason word for logs and reports.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             StayWhy::Off => "off",
             StayWhy::NoRoster => "no-roster",
@@ -3309,7 +3345,9 @@ pub enum Advice {
         /// When to decide again.
         until: i64,
     },
-    /// The owner lifted this wall: continue here, now.
+    /// The owner lifted this wall: continue here, now. The session stands at a limit row
+    /// written before the owner cleared its account's walls (`accounts use`, [`pin`]), and
+    /// nothing has been recorded against the account since.
     Resume {
         /// When the owner cleared the account ([`Account::cleared_at`], as the state was
         /// read): the key of "once per clearing".
@@ -3320,7 +3358,7 @@ pub enum Advice {
 impl Advice {
     /// Short action word logged by the host.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Advice::Stay(_) => "stay",
             Advice::Probe => "probe",
@@ -3382,7 +3420,7 @@ pub enum WhyNot {
 impl WhyNot {
     /// Human-readable exclusion reason for reports.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             WhyNot::Me => "this session's own",
             WhyNot::NotEnrolled => "not-enrolled",
@@ -3845,7 +3883,9 @@ pub enum Kind {
     Wall,
     /// A `/usage` sample was recorded.
     Sample,
-    /// `active` was rotated: one session moves alone.
+    /// `active` was rotated: one session moves alone. Also the row of a
+    /// session taking a silent canary's place ([`take_canary`]): `to` is
+    /// then the account itself, which did not change.
     Rotate,
     /// The rotated-to account served a response.
     Proven,
@@ -3921,7 +3961,7 @@ impl Kind {
 
     /// Canonical string for this event kind in `ledger.jsonl`.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Kind::Wall => "wall",
             Kind::Sample => "sample",
@@ -4074,7 +4114,8 @@ impl Event {
     }
 }
 
-/// The record of `label`, made if absent.
+/// The record of `label`, made if absent. `None` for a label no roster
+/// could carry.
 fn account_mut<'a>(state: &'a mut State, label: &str) -> Option<&'a mut Account> {
     if !admissible_label(label) {
         return None;
@@ -4734,7 +4775,7 @@ pub enum ResetDone<'a> {
 impl ResetDone<'_> {
     /// Canonical status word stored in [`ResetClaim::done`].
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             ResetDone::Used { .. } | ResetDone::Walled { .. } => "used",
             ResetDone::Lifted => "lifted",
@@ -5921,7 +5962,7 @@ impl Recorded {
 
     /// Single-word outcome code logged by the host.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Recorded::Wall { .. } => "wall",
             Recorded::Usage { .. } => "usage",

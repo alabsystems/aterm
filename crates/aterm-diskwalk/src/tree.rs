@@ -1,47 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT A WALK KNOWS: one record per directory, its own sums and its
-//! subtree's, entry counts beside bytes, and the queries every surface reads
-//! (the biggest subtrees, the huge-directory warnings, a folder's children).
-//!
-//! Files are not recorded one by one: each folds into its directory's
-//! [`DirRec::own`], so a tree of 200,000 entries holds a record per folder
-//! (about a tenth of that), not per file.
+//! Directory tree records (`DirRec`), per-directory and subtree [`Sums`], and tree queries.
 
 use std::path::{Path, PathBuf};
 
 use crate::refuse::Refusal;
 
-/// A note at this many direct entries in one directory (design §10.8).
+/// Direct-entry threshold for a huge-directory note.
 pub const HUGE_NOTE: u32 = 75_000;
-/// A warning at this many: a binary launched from such a directory makes
-/// tccd read all of it when it opens its WindowServer connection.
+/// Direct-entry threshold for a huge-directory warning.
 pub const HUGE_WARN: u32 = 100_000;
 
-/// Sizes and counts over a set of entries (design §10.5 rule 4).
+/// Sizes and counts over a set of entries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sums {
-    /// Σ allocated / link count: the headline, additive and order-free, equal
-    /// to `du` when every hard link stays inside the root.
+    /// Σ allocated / link count (`du`-equivalent when hard links stay inside the root).
     pub alloc_fair: u64,
     /// Σ logical size (`TOTALSIZE`, `st_size`).
     pub logical: u64,
-    /// Σ allocated of files with one link: what deleting them surely frees,
-    /// clones aside.
+    /// Σ allocated of single-link files.
     pub released_floor: u64,
-    /// Σ private size / link count (macOS clones), only when asked; `None`
-    /// when not sampled.
+    /// Σ private size / link count (macOS clones), or `None` when not sampled.
     pub private: Option<u64>,
-    /// Σ logical size of cloud placeholders, which count 0 allocated.
+    /// Σ logical size of cloud placeholders (0 allocated).
     pub dataless_logical: u64,
     /// Files and other non-directories.
     pub files: u64,
     /// Directories (the record's own directory not counted in `own`).
     pub dirs: u64,
-    /// The newest modification time seen, unix seconds (0 when none).
+    /// Newest modification time seen, in unix seconds (`0` when none).
     pub newest_mtime_s: i64,
-    /// Entries that could not be read (an errno other than "gone").
+    /// Entries that could not be read.
     pub unreadable: u32,
     /// Entries that vanished between listing and reading.
     pub gone: u32,
@@ -102,15 +92,13 @@ pub struct DirRec {
     pub own: Sums,
     /// It and everything under it; a lower bound while not [`Self::complete`].
     pub subtree: Sums,
-    /// Entries directly in it (after a listing; before one, the count
-    /// `ATTR_DIR_ENTRYCOUNT` gave its parent's listing, where the platform has it).
+    /// Entries directly in the directory.
     pub direct_entries: u32,
     /// Executable regular files directly in it.
     pub direct_exec: u32,
     /// Its subtree is walked to the end.
     pub complete: bool,
-    /// Why it was not entered (a mount boundary, a placeholder, a protected
-    /// folder, too deep, unreadable); `None` when it was walked.
+    /// Reason it was not entered, or `None` when walked.
     pub refused: Option<Refusal>,
     /// A mount point: a different file system lives here and is never entered.
     pub mount_boundary: bool,
@@ -124,7 +112,7 @@ pub struct Tree {
     names: Vec<u8>,
 }
 
-/// A huge directory (design §10.8).
+/// A directory at or past [`HUGE_NOTE`] direct entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HugeDir {
     /// The directory, absolute.
@@ -322,9 +310,7 @@ impl Tree {
         out
     }
 
-    /// The record at `rel`, a path relative to the root (empty for the root),
-    /// found by name from the root down; `None` when the walk holds no such
-    /// folder (it was refused, sits past a mount, or does not exist).
+    /// Look up the record at root-relative path `rel`.
     #[must_use]
     pub fn find(&self, rel: &Path) -> Option<DirId> {
         let mut at = DirId::ROOT;
@@ -360,12 +346,7 @@ impl Tree {
         self.biggest_in(DirId::ROOT, n)
     }
 
-    /// The `n` biggest subtrees "where the space is" inside `within`:
-    /// directories no single child of which holds half their allocation (a
-    /// chain of folders that each pass most of their size down is shown at
-    /// the folder that spreads it), largest first, `within` itself excluded.
-    /// A shown folder may sit inside another; each row is its own subtree's
-    /// size.
+    /// Return the `n` largest subtrees inside `within` where no single child holds at least half the allocation.
     #[must_use]
     pub fn biggest_in(&self, within: DirId, n: usize) -> Vec<DirId> {
         let len = self.dirs.len();
@@ -465,8 +446,7 @@ impl Tree {
             .collect()
     }
 
-    /// The largest direct entry count among `within` and the folders inside
-    /// it.
+    /// Largest direct entry count among `within` and folders inside it.
     #[must_use]
     pub fn direct_entries_max_in(&self, within: DirId) -> u32 {
         (0..self.dirs.len())
@@ -501,9 +481,7 @@ mod tests {
         for (id, bytes) in [(x, 45), (y, 40), (deep, 100), (a, 100), (b, 30)] {
             t.rec_mut(id).subtree.alloc_fair = bytes;
         }
-        // `a` passes everything to `deep`, which spreads it over x and y.
         assert_eq!(t.biggest(3), vec![deep, x, y]);
-        // A child holding more than half takes its parent's place.
         t.rec_mut(x).subtree.alloc_fair = 60;
         t.rec_mut(y).subtree.alloc_fair = 25;
         assert_eq!(t.biggest(3), vec![x, b, y]);

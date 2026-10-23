@@ -53,7 +53,9 @@ pub enum Source {
     Aterm,
 }
 
-/// Queued inputs that replay must yield to.
+/// Queued inputs that replay must yield to. A fleet halt or lane closure is
+/// never delayed for catch-up; local events and addressed mail allow the
+/// roster's one-page progress exception after its control work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayPressure {
     Clear,
@@ -332,7 +334,8 @@ impl Mailbox {
         self.queues.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Whether an input that outranks broadcast replay is waiting.
+    /// Whether an input that outranks broadcast replay is waiting. The bridge checks before
+    /// each replay page, so a halt or addressed message waits one page, not a replay slice.
     pub(crate) fn replay_pressure(&self) -> ReplayPressure {
         let q = self.lock();
         if !q.closed.is_empty()

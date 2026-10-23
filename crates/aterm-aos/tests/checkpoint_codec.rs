@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Checkpoints: the CRC frame around a versioned body, the state digest re-derived on
-//! decode, and the identity and canonical-state checks on restore.
+//! Checkpoint frame, state digest, and identity/canonical-state restore checks.
 
 use astream_wire::frame::{Frame, decode_frame_slice};
 use aterm_aos::checkpoint::{
@@ -237,8 +236,6 @@ fn restore_refuses_another_task_schema_or_profile_and_accepts_other_code() {
             Err(RestoreRefusal::Identity(which))
         );
     }
-    // Other code may continue from the state: that is a separately recorded transition
-    // (prepare/commit), checked against the candidate's own entry invariants.
     assert_eq!(
         c.restore(&schema, &identity(Variant::Stranded)),
         Ok(state())
@@ -248,8 +245,6 @@ fn restore_refuses_another_task_schema_or_profile_and_accepts_other_code() {
 #[test]
 fn a_checkpoint_whose_provenance_names_another_schema_is_refused_on_decode_and_restore() {
     let schema = ToySchema::new();
-    // A declared schema of its own (struct update would keep the old digest under a new
-    // version label: the digest, not the label, is the identity).
     let wrong = TaskIdentity {
         schema: ArtifactId::new(ArtifactKind::Schema, "toy-schema", 2, b"total,hot,seen"),
         ..identity(Variant::Good)
@@ -267,9 +262,6 @@ fn a_checkpoint_whose_provenance_names_another_schema_is_refused_on_decode_and_r
 
 /// A checkpoint captured under another schema artifact than the one its provenance names
 /// (the same codec, so the state bytes decode) carries a state digest under the wrong schema.
-/// It never went through bytes, so decode's check never ran: restore re-derives the digest
-/// under the restoring schema and refuses, naming both digests, directly and through a
-/// boundary, which keeps its head.
 #[test]
 fn restore_refuses_a_checkpoint_whose_state_digest_is_not_under_the_restoring_schema() {
     let named = identity(Variant::Good);
@@ -289,7 +281,6 @@ fn restore_refuses_a_checkpoint_whose_state_digest_is_not_under_the_restoring_sc
         c.restore(&schema, &named),
         Err(RestoreRefusal::StateDigest { stored, derived })
     );
-    // Negative control: the same state captured under the named schema restores.
     let honest = Checkpoint::capture(&schema, &state(), provenance(named.clone()));
     assert_eq!(honest.restore(&schema, &named), Ok(state()));
 
@@ -307,8 +298,6 @@ fn restore_refuses_a_checkpoint_whose_state_digest_is_not_under_the_restoring_sc
 
 #[test]
 fn restore_refuses_a_state_the_schema_does_not_decode() {
-    // Negative control: a schema implementation that drops a field writes bytes the real
-    // schema cannot read.
     let c = Checkpoint::capture(
         &ToySchema::lossy(),
         &state(),

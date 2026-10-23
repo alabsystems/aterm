@@ -171,7 +171,8 @@ mod tests {
         (&*stream).read(&mut [0u8; 16]).map_err(|e| e.kind())
     }
 
-    /// The `try_clone` stands in for the copy a forked child holds until it execs.
+    /// The `try_clone` stands in for the copy a forked child holds until it execs. (Darwin
+    /// refuses a both-ways `shutdown` once the peer half-closed, and shuts no half.)
     #[test]
     fn a_hang_up_reaches_a_peer_that_half_closed_though_a_copy_survives() {
         let (near, far) = crate::CtlStream::pair().expect("pair");

@@ -198,7 +198,7 @@ pub enum RowState {
 impl RowState {
     /// Its word in the table.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::Published => "published",
             Self::Staged => "staged",
@@ -211,7 +211,7 @@ impl RowState {
 
 /// A row's state — pure.
 #[must_use]
-pub fn row_state(published: bool, staged: bool, latched: bool, buildable: bool) -> RowState {
+pub const fn row_state(published: bool, staged: bool, latched: bool, buildable: bool) -> RowState {
     if published {
         RowState::Published
     } else if staged {
@@ -251,7 +251,7 @@ impl Class {
         }
     }
 
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             Self::Plain => "plain",
             Self::Bundle => "bundle",
@@ -328,7 +328,7 @@ pub enum Decision {
 impl Decision {
     /// The table's first word.
     #[must_use]
-    pub fn verdict(&self) -> &'static str {
+    pub const fn verdict(&self) -> &'static str {
         match self {
             Self::Error(_) => "ERROR",
             Self::Ok => "OK",

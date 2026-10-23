@@ -59,7 +59,7 @@ pub(crate) fn need_clt_git() {
     }
 }
 
-/// The item git's settings wait for .
+/// The item git's settings wait for.
 pub const CLT_ITEM: &str = "developer.command-line-tools";
 
 /// `ssh-keygen`, a real binary on every macOS (not a shim).
@@ -74,7 +74,7 @@ const MKDIR: &str = "/bin/mkdir";
 /// Removes the key, for the revert line.
 const RM: &str = "/bin/rm";
 
-/// SSH URL prefix substituted for `https://github.com/`.
+/// The git config key that rewrites `https://github.com/` to SSH.
 const SSH_URL_KEY: &str = "url.git@github.com:.insteadOf";
 
 /// The prefix rewritten.
@@ -285,7 +285,7 @@ impl Item for KeyItem {
         )
     }
 
-    /// The public key line, which the controller registers .
+    /// The public key line, which the controller registers.
     fn detail(&self, sys: &dyn System, _ctx: &Ctx) -> Option<String> {
         match self.state(sys) {
             Ok(KeyState::Whole(line)) => Some(line),

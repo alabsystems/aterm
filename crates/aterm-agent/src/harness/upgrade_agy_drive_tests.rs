@@ -650,7 +650,10 @@ impl Rig {
         )
     }
 
-    /// [`exit_record`] over the real look at this rig's exit.
+    /// [`exit_record`] over the real look at this rig's exit. Nothing a look
+    /// asks moves the stand-in or the kernel, so the world stands still while
+    /// it is looked at: the second look is real and must read what the first
+    /// did, and every later one is the first's again.
     fn look(&self, snap: &Snapshot) -> ExitRecord {
         let (mut first, mut looks) = (None, 0);
         exit_record(

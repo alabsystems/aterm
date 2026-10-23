@@ -158,7 +158,6 @@ fn the_pinned_copy_in_the_tooling_cache_comes_before_the_usual_paths() {
         "the variable before the pin"
     );
 
-    // The real row, over the same tooling dir: what every live fish test resolves.
     let lookup = Lookup {
         named: None,
         tooling: Some(tooling),
@@ -248,8 +247,6 @@ fn the_refusal_names_its_provider() {
     );
     let ty = tool("ty").refusal();
     assert!(ty.contains("aterm pkg install --default-set"), "{ty}");
-    // Nothing provides Python 3.11+ until S11, and the words say the floor: macOS's own
-    // python3 is here, and older.
     let python = tool("python3").refusal();
     assert!(
         python.starts_with("no Python 3.11+ here: aterm provides none: S11's")
@@ -390,14 +387,8 @@ fn the_usual_paths_come_before_path() {
 
 /// §10 S2: a missing vim ends COULD NOT RUN, with the provider in the words, never a pass
 /// and never a FAIL.
-///
-/// The words are read from the pure halves ([`Tool::refusal`], [`refusals_for`]), never
-/// from a caught COULD NOT RUN: that panic's sentinel lands in this test's own output,
-/// which would record a regression here as the machine's refusal. The one caught panic
-/// comes last and is asserted only to carry the sentinel, which a defect cannot then hide.
 #[test]
 fn a_missing_tool_ends_could_not_run_naming_its_provider() {
-    // The lookup injected empty: no variable, no tooling cache, no usual path, no $PATH.
     let nowhere = Tool {
         at: &[],
         ..*tool("vim")
@@ -454,8 +445,6 @@ fn a_tools_variable_is_its_upper_snake_name() {
 #[test]
 fn the_user_cache_follows_each_platform_convention() {
     let home = Path::new("/h");
-    // Absolute on every host the test runs on: `/x` has no drive, so on Windows it
-    // is relative, and the XDG rule ignores it.
     let xdg = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert_eq!(
         user_cache("macos", Some(home), Some(xdg), "browser"),
@@ -465,7 +454,6 @@ fn the_user_cache_follows_each_platform_convention() {
         user_cache("linux", Some(home), Some(xdg), TOOLING),
         Some(xdg.join("aterm/tooling"))
     );
-    // A relative XDG_CACHE_HOME is ignored, as the spec says.
     assert_eq!(
         user_cache("linux", Some(home), Some(Path::new("rel")), "browser"),
         Some(PathBuf::from("/h/.cache/aterm/browser"))

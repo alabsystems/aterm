@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A palette set the `allow_palette_reconfigure` gate refuses (OSC 4, numeric
-//! OSC 21) is told to the host ONCE per session, so a theme tool that did
-//! nothing (base16-shell, pywal, `theme.sh`) can be found, without a theme
-//! script's dozens of sets each raising something. The gate itself stays
-//! default-off.
-//!
-//! Negative control: with the gate open nothing is told and the palette moves.
-//! Opening the gate re-arms the report, so closing it again tells anew.
+//! Tests that palette sets refused by `allow_palette_reconfigure` notify the host once per closed spell.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,7 +46,6 @@ fn refused_palette_sets_are_told_once() {
     assert!(t.palette_set_refused());
     assert_eq!(t.palette_color(4), before, "the gate still refuses");
 
-    // RIS is not a new session: it does not re-arm the event.
     t.process(b"\x1bc\x1b]4;4;rgb:28/2a/36\x07");
     assert_eq!(told.load(Ordering::SeqCst), 1);
 }
@@ -68,7 +60,6 @@ fn a_numeric_osc_21_set_alone_is_told() {
 #[test]
 fn what_the_gate_never_held_is_not_told() {
     let (mut t, told) = counted(false);
-    // Queries, invalid specs and the ungated dynamic colours are not refusals.
     t.process(b"\x1b]4;4;?\x07\x1b]4;4;not-a-colour\x07\x1b]11;rgb:10/11/12\x07");
     t.process(b"\x1b]21;foreground=rgb:10/11/12\x07");
     assert_eq!(told.load(Ordering::SeqCst), 0);

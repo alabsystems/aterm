@@ -273,7 +273,7 @@ impl CodeFrom {
     /// a file — named, or piped in — left a copy of the fleet's secret
     /// wherever it was dropped (Downloads, a USB stick, a synced folder),
     /// which `init` told the person to make.
-    fn left_behind(self) -> &'static str {
+    const fn left_behind(self) -> &'static str {
         match self {
             Self::File | Self::Piped => {
                 "The join code is the fleet's secret: now that this machine has joined, delete \

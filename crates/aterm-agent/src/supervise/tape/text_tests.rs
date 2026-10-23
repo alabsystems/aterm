@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A tape's text reads back to the very same items: every kind, every body
-//! a byte string can be (no final newline, a lone newline, control bytes,
-//! bytes that are not UTF-8), names with spaces and `=` in them, control
-//! round trips as words and as raw bytes; and text it did not write is
-//! refused by line.
+//! A tape's text reads back to the very same items.
 
 use std::io::ErrorKind;
 
@@ -60,7 +56,6 @@ fn screen_of(rng: &mut XorShift) -> String {
         0 => text.replace("\"rows\":[\"", "\"rows\":[7,\""),
         1 => text.replace("\"rows\":[\"", "\"rows\":[\"\\"),
         2 => {
-            // Cut short at a character boundary.
             let at = rng.index(text.chars().count() + 1);
             text.chars().take(at).collect()
         }
@@ -210,7 +205,6 @@ fn a_control_round_trip_is_words_and_a_reply_unless_its_bytes_say_otherwise() {
          < ok 0\n!\n| {\"rows\":[\n= \"⏺ Done.\"\n= ],\"seq\":41}\n|\n"
     );
     assert_eq!(parse(&text).expect("reads").1, vec![item]);
-    // The word count 3 spelled in two bytes (0x83 0x00): the same words.
     let mut padded = vec![0x83, 0x00];
     padded.extend_from_slice(&codec::ctl_request(&["a", "b", "c"])[1..]);
     let raw = Item::effect(EffectRecord::Exchange {
@@ -301,7 +295,6 @@ fn a_screen_is_written_a_row_to_a_line_and_diffs_as_the_row_that_changed() {
         .collect();
     assert_eq!(text.lines().count(), other.lines().count());
     assert_eq!(changed, [("= \"❯ \"", "= \"❯ git status\"")], "{other}");
-    // A reply this does not read row by row is one line, as any body is.
     for stdout in [
         "{\"rows\":[],\"seq\":1}",
         "{\"rows\":[\"a\", \"b\"],\"seq\":1}",

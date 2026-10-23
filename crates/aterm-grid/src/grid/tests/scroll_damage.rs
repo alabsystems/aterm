@@ -38,9 +38,6 @@ fn scroll_to_top_near_top_uses_partial_damage() {
     assert_eq!(collect_dirty_rows(&grid), vec![0, 1]);
 }
 
-// `top_visible_absolute_row` is the reference point for prompt-to-prompt nav: at
-// the live bottom it equals `visible_to_absolute(0)`, and scrolling up by N moves
-// it back by exactly N.
 #[test]
 fn top_visible_absolute_row_tracks_the_display_offset() {
     let mut grid = build_scrollback_grid(5, 10, 50, 30);
@@ -62,9 +59,6 @@ fn top_visible_absolute_row_tracks_the_display_offset() {
     );
 }
 
-// `scroll_to_absolute_row` puts a target absolute row at the top, clamping a
-// below-live target to the live bottom and an evicted one to the top of
-// scrollback, never violating DisplayOffsetValid.
 #[test]
 fn scroll_to_absolute_row_places_target_at_top_and_clamps() {
     let mut grid = build_scrollback_grid(5, 10, 50, 30);
@@ -94,7 +88,6 @@ fn scroll_to_absolute_row_places_target_at_top_and_clamps() {
         "a below-live target stays at the live bottom"
     );
 
-    // A target older than the oldest retained line clamps to the top of scrollback.
     grid.scroll_to_absolute_row(oldest.saturating_sub(1000));
     assert_eq!(
         grid.display_offset(),
@@ -120,8 +113,6 @@ fn clamp_display_offset_small_delta_marks_bottom_rows() {
     assert_eq!(collect_dirty_rows(&grid), vec![3, 4]);
 }
 
-/// `content_gen` starts nonzero in every construct path, so a reader can use `0` as "never
-/// observed".
 #[test]
 fn content_gen_starts_nonzero() {
     assert!(Grid::new(24, 80).content_gen() > 0);
@@ -130,7 +121,6 @@ fn content_gen_starts_nonzero() {
     assert!(Grid::with_tiered_scrollback(10, 40, 500, sb).content_gen() > 0);
 }
 
-/// Content mutations (write, erase, scroll, region scroll) each advance `content_gen`.
 #[test]
 fn content_gen_advances_on_content_mutations() {
     let mut grid = Grid::with_scrollback(4, 10, 100);
@@ -154,7 +144,6 @@ fn content_gen_advances_on_content_mutations() {
     assert!(g4 > g3, "scroll_region_up must advance content_gen");
 }
 
-/// A pure viewport scroll damages the grid but does not advance `content_gen`.
 #[test]
 fn content_gen_unchanged_on_viewport_scroll() {
     let mut grid = build_scrollback_grid(5, 10, 20, 10);
@@ -184,8 +173,6 @@ fn content_gen_unchanged_on_viewport_scroll() {
     );
 }
 
-/// `content_gen` never decreases, and strictly increases whenever the live row text (read at
-/// display offset 0, where `row_text` reads content rather than the scrolled window) changes.
 #[test]
 fn content_gen_tracks_row_text_changes() {
     let mut rng = aterm_spec::rng::XorShift::new(0xC0_57E7_6E11);
@@ -193,7 +180,6 @@ fn content_gen_tracks_row_text_changes() {
     for _ in 0..256 {
         let mut grid = Grid::with_scrollback(6, 12, 200);
         for _ in 0..1 + next(39) {
-            // Snapshot the live content; the snap itself is viewport-only.
             grid.scroll_to_bottom();
             let gen_before = grid.content_gen();
             let text_before: Vec<Option<String>> =

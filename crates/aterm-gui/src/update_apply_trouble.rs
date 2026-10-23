@@ -289,7 +289,9 @@ pub(crate) fn named_clause(reason: &str) -> Option<&'static str> {
     named_cause(reason).map(|(full, _)| full)
 }
 
-/// The [`CAUSES`] row this reason matches, if any.
+/// The [`CAUSES`] row this reason matches, if any. One scan, shared by [`clauses`]
+/// and [`ApplyTrouble::cause_is_named`], so "which clause do we say" and "did we
+/// recognise it" can never answer differently.
 fn named_cause(reason: &str) -> Option<(&'static str, &'static str)> {
     let reason = reason.trim();
     CAUSES
@@ -693,7 +695,10 @@ mod tests {
         );
     }
 
-    /// An unrecognised reason degrades to one bounded generic clause and does not leak.
+    /// An unrecognised reason degrades to one bounded generic clause and does not leak. The
+    /// submission lane's free-form messages (`UpdateHandoffStartError::failed`, the
+    /// preflight's verdicts) are deliberately not enumerated, so the contract is the fallback,
+    /// and `cause_is_named` reports that the specific answer is only in the log.
     #[test]
     fn an_unrecognised_reason_degrades_to_a_safe_generic_clause() {
         for stranger in [
@@ -727,7 +732,10 @@ mod tests {
         );
     }
 
-    /// A CLEAN STAGE IS NOT A FAILURE.
+    /// A CLEAN STAGE IS NOT A FAILURE. Zero attempts is the state of every update
+    /// that downloaded and is waiting for a quiet window — deferrals and blocks are
+    /// recorded as refusals and advance no streak — so it must produce no trouble at
+    /// all, and therefore no failure wording anywhere.
     #[test]
     fn a_clean_stage_reads_as_no_trouble_at_all() {
         assert_eq!(ApplyTrouble::new(0, "", ApplyRetry::Scheduled), None);
@@ -817,7 +825,9 @@ mod tests {
         );
     }
 
-    /// THE 2026-09-14 INCIDENT, AT THE WORDS.
+    /// THE 2026-09-14 INCIDENT, AT THE WORDS. A hand-built, ad-hoc-signed
+    /// `/Applications/aterm.app` refused six automatic applies of v0.85.0 over ~8 h
+    /// because it cannot be the rollback source the swap installs.
     #[test]
     fn observability_audit_a_rollback_source_refusal_names_the_installed_copy_and_the_remedy() {
         let reason = "installed bundle failed pre-park verification: the installed bundle at \

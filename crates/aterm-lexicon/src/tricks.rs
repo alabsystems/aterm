@@ -285,7 +285,8 @@ struct TrickEntry {
     unglued: bool,
 }
 
-/// The role a lookup reports: the authored role with the lone-ideograph law applied.
+/// The role a lookup reports: the authored role with the lone-ideograph law applied. The lookup
+/// and the load-time double-claim check share it, so "same role" means one thing.
 #[inline]
 const fn effective_role(entry: &TrickEntry) -> TrickRole {
     match entry.role {
@@ -305,7 +306,9 @@ const fn effective_role(entry: &TrickEntry) -> TrickRole {
 #[derive(Debug, Clone, Default)]
 pub struct TrickLexicon {
     table: FxHashMap<String, TrickEntry>,
-    /// Data problems found at load.
+    /// Data problems found at load. Empty for well-formed data; the test
+    /// suite asserts it is empty for the embedded file under every language
+    /// configuration.
     conflicts: Vec<String>,
 }
 
@@ -423,7 +426,8 @@ impl TrickLexicon {
     }
 }
 
-/// The shortest run the elongation fold treats as a held key.
+/// The shortest run the elongation fold treats as a held key. Two identical
+/// letters are spelling (`kitty`, `purr`); three are someone drawing it out.
 const ELONGATED_RUN: usize = 3;
 
 /// Characters of folded token the elongation fold will look at: the

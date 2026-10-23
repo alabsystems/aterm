@@ -314,6 +314,7 @@ const DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// The bound on reading on past [`DRAIN_GRACE`] a pipe no writer holds: its end is a read
 /// away, so its reader waits on nothing but this process's scheduling (a test binary at full
 /// load left one unscheduled 650 ms and more, and `ps`'s line was lost).
+#[cfg(unix)]
 const SLOW_READER: Duration = Duration::from_secs(60);
 
 /// When a drain of an exited child's stream stops while the stream is open: at `by` while
@@ -325,8 +326,10 @@ const SLOW_READER: Duration = Duration::from_secs(60);
 /// --version`'s line was refused), or a descendant that left the group.
 struct Grace {
     by: Instant,
+    #[cfg_attr(not(unix), allow(dead_code))]
     until: Instant,
     /// The exited child's pid, which led its process group.
+    #[cfg_attr(not(unix), allow(dead_code))]
     group: Option<u32>,
 }
 

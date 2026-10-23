@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The screen writer against aterm's own grid: every frame's bytes, fed to
-//! `aterm_core::terminal::Terminal`, leave the grid holding exactly the frame's cells,
-//! styles, cursor and cursor shape, under both ambiguous-width policies; and a one-cell
-//! change costs a cursor move and the cell.
+//! Tests comparing the screen writer against `aterm_core::terminal::Terminal`.
 
 use aterm_core::terminal::Terminal;
 use aterm_tty::probe::Caps;
@@ -53,26 +50,20 @@ const PIECES: &[&str] = &[
     "~",
     " ",
     "hello",
-    // CJK and Hangul.
     "中",
     "文",
     "字",
     "한",
-    // Emoji, a ZWJ family, a ZWJ sequence on a narrow base, skin tones on their own
-    // and after a base.
     "😀",
     "👍",
     "👨\u{200D}👩\u{200D}👧",
     "❤\u{200D}🔥",
     "👍🏽",
     "\u{1F3FD}",
-    // Flags and lone halves of one.
     "🇺🇸",
     "🇯🇵",
     "\u{1F1FA}",
     "\u{1F1F8}",
-    // VS15 on a wide emoji and on a narrow one, VS16 on emoji-capable bases, both
-    // selectors alone.
     "\u{231A}",
     "\u{231A}\u{FE0E}",
     "😀\u{FE0E}",
@@ -82,25 +73,19 @@ const PIECES: &[&str] = &[
     "1\u{FE0F}\u{20E3}",
     "\u{FE0E}",
     "\u{FE0F}",
-    // Combining marks, after a base and alone; a lone ZWJ and ZWSP.
     "e\u{301}",
     "\u{301}",
     "\u{200D}",
     "\u{200B}",
-    // Runs of marks that fill a cell past the 16 characters the grid stores, on a
-    // narrow base, on a VS16-capable one (a VS16 after them widens nothing), and alone.
     "e\u{301}\u{302}\u{303}\u{304}\u{301}\u{302}\u{303}\u{304}\u{301}",
     "\u{2764}\u{301}\u{302}\u{303}\u{304}\u{301}\u{302}\u{303}\u{304}",
     "\u{301}\u{302}\u{303}\u{304}\u{301}\u{302}\u{303}\u{304}",
-    // East Asian Ambiguous: one column or two by the policy.
     "→",
     "─",
     "°",
     "α",
-    // Sinhala yansaya (two clusters, one cell) and a Devanagari conjunct.
     "ක\u{DCA}\u{200D}ය",
     "न\u{94D}दी",
-    // Controls, drawn as U+FFFD.
     "\t",
     "\x1b",
     "\u{85}",
@@ -353,8 +338,6 @@ fn diff_render_matches_terminal_oracle() {
                 for _ in 0..1 + rng.below(6) {
                     mutate(&mut rng, &mut next);
                 }
-                // The first frame, and now and then another, drawn whole on a terminal
-                // an earlier program left in another state.
                 let bytes = if frame == 0 || rng.chance(3) {
                     term.process(&dirty_state(&mut rng, size));
                     screen::repaint(&next, &caps)
@@ -374,7 +357,6 @@ fn diff_render_matches_terminal_oracle() {
                         rows_of(&next)
                     );
                 }
-                // The comparison has teeth: one cell more and the grid differs.
                 let mut wrong = next.clone();
                 let (row, col) = (rng.below_u16(size.rows), rng.below_u16(size.cols));
                 wrong.put(row, col, "Q", Style::default());
@@ -420,7 +402,6 @@ fn single_cell_change_is_minimal() {
         ..Style::default()
     };
 
-    // Cursor hidden: a move and the cell, the style set and put back around it.
     assert_eq!(screen::diff(&prev, &prev, &plain), b"");
     let next = one(&prev, "x", Style::default());
     assert_eq!(screen::diff(&prev, &next, &plain), b"\x1b[6;11Hx");
@@ -434,15 +415,12 @@ fn single_cell_change_is_minimal() {
         screen::diff(&prev, &next, &plain),
         "\x1b[6;11H中".as_bytes()
     );
-    // In a synchronized update.
     let next = one(&prev, "x", Style::default());
     assert_eq!(
         screen::diff(&prev, &next, &sync),
         b"\x1b[?2026h\x1b[6;11Hx\x1b[?2026l"
     );
 
-    // Cursor shown, as when typing: the cursor hidden while the cell is written, then
-    // back; the write starts where the cursor stands.
     prev.set_cursor(Some(Pos { row: 5, col: 10 }));
     let mut next = one(&prev, "x", Style::default());
     next.set_cursor(Some(Pos { row: 5, col: 11 }));
@@ -451,14 +429,12 @@ fn single_cell_change_is_minimal() {
         screen::diff(&prev, &next, &sync),
         b"\x1b[?2026hx\x1b[?2026l"
     );
-    // A cell elsewhere: a move there and one back.
     let mut elsewhere = prev.clone();
     elsewhere.put(20, 60, "x", Style::default());
     assert_eq!(
         screen::diff(&prev, &elsewhere, &sync),
         b"\x1b[?2026h\x1b[21;61Hx\x1b[6;11H\x1b[?2026l"
     );
-    // The cursor alone: a move, the shortest there is; a shape alone: DECSCUSR.
     let mut moved = prev.clone();
     moved.set_cursor(Some(Pos { row: 5, col: 14 }));
     assert_eq!(screen::diff(&prev, &moved, &plain), b"\x1b[4C");
@@ -468,9 +444,6 @@ fn single_cell_change_is_minimal() {
     shaped.set_cursor_shape(CursorShape::SteadyBar);
     assert_eq!(screen::diff(&prev, &shaped, &plain), b"\x1b[6 q");
 
-    // Every single-cell change on a full screen costs at most the cursor hidden, a move,
-    // the longest SGR there is and its reset, the cell, the move back and the cursor
-    // shown: never a row.
     let longest_sgr = b"\x1b[0;1;2;3;4;7;9;38;5;200;48;5;200m".len();
     let mut rng = Rng(7);
     for _ in 0..1000 {

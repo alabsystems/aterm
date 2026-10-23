@@ -35,7 +35,6 @@ fn each_clis_own_flags_name_its_level() {
             Level::Plan,
         ),
         ("claude", &[][..], None, Level::Ask),
-        // Its settings' default mode, where the flags name none; the flags win.
         ("claude", &[][..], Some("bypassPermissions"), Level::Yolo),
         (
             "claude",
@@ -137,7 +136,6 @@ fn the_nearest_ai_cli_above_is_the_asker() {
     let none = || None;
     let (id, level) = asker(&tree, &none).agent().expect("an asker");
     assert_eq!((id, level), ("claude", Level::Yolo));
-    // A node runtime's argv[0] names the CLI when its executable does not.
     let node = Tree(vec![
         (40, 30, "/bin/zsh", argv(&["zsh"])),
         (
@@ -148,7 +146,6 @@ fn the_nearest_ai_cli_above_is_the_asker() {
         ),
     ]);
     assert_eq!(asker(&node, &none).agent(), Some(("muse", Level::Yolo)));
-    // The control: no AI CLI above is a person.
     let person = Tree(vec![
         (40, 10, "/bin/zsh", argv(&["zsh"])),
         (10, 1, "/sbin/launchd", argv(&["launchd"])),
@@ -201,8 +198,6 @@ fn a_versioned_muse_executable_keeps_its_permission_custody() {
 /// atpkg's `codex-old` (OpenAI's own Codex beside codex-alab) runs as that name, and a
 /// review it asks for inherits its own launch's sandbox: a read-only one plans, never
 /// the person's Yolo the walk past an unknown name would prove.
-///
-/// NEGATIVE CONTROL: a name that only begins so is no CLI, so the walk reaches the root.
 #[test]
 fn a_codex_old_keeps_codexs_permission_custody() {
     let store = "/x/pkg/store/codex-old/1000000000163000000/bin/codex-old";

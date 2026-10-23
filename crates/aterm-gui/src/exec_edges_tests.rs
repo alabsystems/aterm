@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`ExecEdges`] over a scripted process watch and scripted images: which
-//! `exec`s become edges, where they cut, and what waits for a byte-free edge.
-//! Each test owns its pids, so the shared image table never crosses tests.
+//! [`ExecEdges`] tests over a scripted process watch and scripted images.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -127,14 +125,12 @@ fn a_drawer_launch_is_cut_at_each_exec_and_a_tool_folds() {
     const JOB: i32 = 51_001;
     const TOOL: i32 = 51_002;
     let (mut x, script, mut c) = rig(SH, SH, shell(SH));
-    // `true` takes the terminal and execs: no drawer either side.
     set_image(tool(TOOL));
     script.post(&[ProcEvent::Fork { child: TOOL }, exec(TOOL, false)]);
     c.begin();
     assert!(!x.heard(&mut c, || TOOL, 0));
     assert!(c.take_edge().is_none() && x.take_image().is_none());
 
-    // The shim: a Group edge, its image read at the event.
     set_image(launcher(JOB));
     script.post(&[ProcEvent::Fork { child: JOB }, exec(JOB, false)]);
     c.begin();
@@ -144,8 +140,6 @@ fn a_drawer_launch_is_cut_at_each_exec_and_a_tool_folds() {
     assert_eq!((edge.kind, edge.from, edge.to), (EdgeKind::Group, SH, JOB));
     assert_eq!(x.take_image().map(|i| i.launcher_for.is_some()), Some(true));
 
-    // The store build, exec'd in place: cut at the last clean poll (100),
-    // laid where the poll heard it (300).
     set_image(claude(JOB));
     c.begin();
     assert!(!c.sample(JOB, 100));
@@ -159,8 +153,6 @@ fn a_drawer_launch_is_cut_at_each_exec_and_a_tool_folds() {
     );
     assert!(x.take_image().is_some_and(|i| i.drawer.is_some()));
 
-    // A member of the job that leads nothing: folded, and the drain makes its
-    // offset clean.
     c.begin();
     script.post(&[ProcEvent::Exec {
         pid: JOB + 100,
@@ -181,11 +173,9 @@ fn a_late_exec_that_restates_the_held_image_folds() {
     c.begin();
     script.post(&[exec(JOB, true)]);
     assert!(!x.heard(&mut c, || JOB, 0), "the same image, late: no edge");
-    // A genuine re-exec, even of the same image, is an edge.
     script.post(&[exec(JOB, false)]);
     assert!(x.heard(&mut c, || JOB, 0));
     assert_eq!(c.take_edge().map(|e| e.kind), Some(EdgeKind::Exec));
-    // Late, into another image: an edge.
     set_image(launcher(JOB));
     c.begin();
     script.post(&[exec(JOB, true)]);
@@ -202,14 +192,12 @@ fn an_exec_heard_after_the_batch_edge_waits_for_a_byte_free_one() {
     let (mut x, script, mut c) = rig(SH, SH, shell(SH));
     set_image(launcher(JOB));
     c.begin();
-    // The pre-park sample finds the job in front: the batch's edge.
     assert!(c.sample(JOB, 10));
     script.post(&[exec(JOB, false)]);
     assert!(x.heard(&mut c, || JOB, 10), "the batch still delivers");
     assert!(x.has_deferred());
     let edge = c.finish(|| JOB, 10).expect("the sampled edge");
     assert_eq!(edge.kind, EdgeKind::Group);
-    // After the batch: the waiting exec, cut at 0.
     set_image(claude(JOB));
     c.begin();
     assert!(x.replay(&mut c, || JOB));
@@ -259,7 +247,6 @@ fn an_exec_out_of_an_unknown_image_is_an_edge() {
     script.post(&[exec(JOB, false)]);
     assert!(x.heard(&mut c, || JOB, 0));
     assert_eq!(c.take_edge().map(|e| e.kind), Some(EdgeKind::Exec));
-    // Now it is known (and no drawer): the next exec folds.
     c.begin();
     script.post(&[exec(JOB, false)]);
     assert!(!x.heard(&mut c, || JOB, 0));
@@ -310,7 +297,6 @@ fn a_kernel_exec_reads_its_image_afresh() {
     script.post(&[exec(SH, false)]);
     assert!(x.heard(&mut c, || SH, 0), "the shell became a launcher");
     assert_eq!(reads_of(SH), [None], "read with nothing to keep");
-    // A late one too: compared with the held image, read afresh.
     c.begin();
     script.post(&[exec(SH, true)]);
     assert!(!x.heard(&mut c, || SH, 0), "the same image, late");
@@ -342,8 +328,6 @@ fn a_folded_exec_hands_its_image_to_the_sampled_edge() {
         "the event's read, then the edge's given it to keep"
     );
 
-    // The leader `exec`s again while the shell holds the terminal (no edge):
-    // the folded image is retired, and the sampled edge reads afresh.
     let (mut x, script, mut c) = rig(SH, SH, shell(SH));
     set_image(tool(AGAIN));
     c.begin();
@@ -357,7 +341,6 @@ fn a_folded_exec_hands_its_image_to_the_sampled_edge() {
     x.read_edge(AGAIN, false);
     assert_eq!(reads_of(AGAIN), [None, None]);
 
-    // An `exec` the edge absorbed: read afresh.
     let (mut x, script, mut c) = rig(SH, SH, shell(SH));
     set_image(tool(ABSORBED));
     c.begin();

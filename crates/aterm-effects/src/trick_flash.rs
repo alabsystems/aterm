@@ -32,16 +32,21 @@ const FADE_MS: u32 = 250;
 /// A revoked flash (the line turned out to be prose) leaves over this many ms
 /// instead of finishing its second.
 const REVOKE_FADE_MS: u32 = 120;
-/// How long a noted word may stay unfound.
+/// How long a noted word may stay unfound. The same clock-skew budget as the
+/// typed-edit witness: the key is committed at input time and the word becomes
+/// scannable only when the shell's echo lands.
 const GIVE_UP_MS: u64 = TYPED_EDIT_WITNESS_MS;
 /// The scroll-region fallback looks at most this many rows above the caret.
 const SEARCH_UP_ROWS: usize = 12;
-/// Peak tint toward the rainbow before the legibility guard.
+/// Peak tint toward the rainbow before the legibility guard. The flash owns this
+/// (it never reads the shared ink strength knob).
 const FLASH_STRENGTH: f32 = 0.9;
 /// The typed word's inline buffer is the listener's token window: a word the
 /// vocabulary could hold always fits, and a longer one is not a trick.
 const MAX_CHARS: usize = TrickLexicon::MAX_SURFACE_CHARS;
-/// Panes whose last cursor-bearing `base_y` is remembered.
+/// Panes whose last cursor-bearing `base_y` is remembered. A window shows a
+/// handful; past the cap the oldest entry leaves, which costs that pane one
+/// flash's scroll-following and nothing else.
 const BASE_Y_MEMO_CAP: usize = 16;
 
 /// Large luminance reversals one flash can show on one cell: off the base on the
@@ -1447,7 +1452,10 @@ mod tests {
         }
     }
 
-    /// A declaration is spent by the rescan it was made for.
+    /// A declaration is spent by the rescan it was made for. An undeclared rescan
+    /// reads as "no row origin", never the last declared one, or its caret would
+    /// pair with a pre-scroll `base_y` and the next declared rescan would test
+    /// last time's `$ sit`.
     #[test]
     fn a_declaration_is_spent_by_the_rescan_it_was_made_for() {
         for path in BOTH {
@@ -1801,7 +1809,8 @@ mod tests {
         assert_eq!(g.frame(t0 + ms(50)).0[0].color, own, "since = the key time");
     }
 
-    /// `sit tight`: the line turned out to be prose.
+    /// `sit tight`: the line turned out to be prose. A flash on the glass leaves
+    /// over [`REVOKE_FADE_MS`] from where it stood; one never found is dropped.
     #[test]
     fn a_revoke_fast_fades_a_live_flash_and_drops_an_unfound_one() {
         let t0 = Instant::now();

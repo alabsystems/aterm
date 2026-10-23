@@ -57,14 +57,7 @@ pub struct SetupStatusRow {
 }
 
 impl SetupStatus {
-    /// Whether setup's own report, not a Check's, reads this Mac in its vault, synced, with
-    /// its subscriber running: the Secrets stage reported at least one [`SECRETS_VAULT_ROW`] row
-    /// (its vault item's, or its read of a vault it left in place beside the row saying so)
-    /// and every one `ok` or `applied` (a pass that joined, synced or installed the
-    /// subscriber reports `applied`; a Mac still waiting for approval reports otherwise),
-    /// and no [`SECRETS_SUBSCRIBER_ROW`] row is anything but `ok`. The record's own row
-    /// for a stage a run finished, `applied` with no detail, says what a run did once, not
-    /// what holds now, and is not read; a row the item reported always says why.
+    /// Setup report for vault sync ([`SECRETS_VAULT_ROW`], [`SECRETS_SUBSCRIBER_ROW`]).
     pub(crate) fn vault_synced(&self) -> bool {
         let mut reported = self
             .rows
@@ -122,9 +115,6 @@ impl SetupStatus {
                 Some((priority, row))
             })
             .reduce(|best, candidate| {
-                // Show the earliest unmet dependency, including its approval
-                // code, before a later stage merely waiting on it. Successful
-                // observations instead keep the most recent result.
                 if candidate.0 > best.0 || (candidate.0 == 0 && best.0 == 0) {
                     candidate
                 } else {
@@ -196,8 +186,7 @@ impl SystemStateViewState {
     }
 }
 
-/// Password text never enters a UI projection, undo history, restore data or a
-/// diagnostic String. Its selection addresses graphemes in the masked value.
+/// Password text never enters a UI projection, undo history, restore data or a diagnostic String.
 #[derive(Default)]
 struct Password {
     value: Option<SecretBytes>,
@@ -244,9 +233,6 @@ impl Password {
         bytes.extend_from_slice(text.as_slice());
         bytes.extend_from_slice(&old[end..]);
         self.value = Some(SecretBytes::new(bytes));
-        // Insertion can join clusters on either side, as when a combining mark
-        // follows a letter or a joiner connects two emoji. Resolve the caret in
-        // the resulting value, at the first whole-cluster boundary after it.
         self.head = self
             .boundaries()
             .partition_point(|boundary| *boundary < inserted_end);
@@ -348,7 +334,7 @@ pub(crate) struct SystemStateApp {
     actions: VecDeque<SystemStateAction>,
     clock: Clock,
     clock_repaint: bool,
-    /// The vault lines' press came before setup's first read: that read takes the preset.
+    /// The vault lines' press came before setup's first read.
     vault_sync_on_read: bool,
     anim_ticks: u64,
 }
@@ -431,8 +417,7 @@ impl SystemStateApp {
         self.actions.pop_front()
     }
 
-    /// Final-view disposal transfers explicit cancellation to the host before
-    /// the form's remaining deferred actions are dropped.
+    /// Final-view disposal transfers explicit cancellation to the host.
     pub(crate) fn take_queued_cancel(&mut self) -> bool {
         let before = self.actions.len();
         self.actions
@@ -528,9 +513,7 @@ impl SystemStateApp {
         self.status == SetupStatus::default()
     }
 
-    /// The vault lines' remedy: the vault row on and every Mac settings row off, the other
-    /// rows and the vault field as they are. Only over setup's own plan, with no edit, offer
-    /// or run in flight, and before a plan is read, on that read; `true` when a row changed.
+    /// The vault lines' remedy.
     pub(crate) fn preset_vault_sync(&mut self) -> bool {
         if self.status.busy || self.request.is_some() || self.has_unsubmitted_changes() {
             return false;
@@ -547,7 +530,7 @@ impl SystemStateApp {
         self.plan.selection != before
     }
 
-    /// The review's rows are the vault sync's: the vault row on, every Mac settings row off.
+    /// The review's rows are the vault sync's.
     pub(crate) fn shows_vault_sync(&self) -> bool {
         let on = |setting| self.plan.selection.contains(setting);
         on(Setting::Secrets)
@@ -563,8 +546,6 @@ impl SystemStateApp {
         self.interact();
         let plan = self.reviewed_plan();
         let vault_typed = plan.vault_url != self.submitted.vault_url.trim();
-        // The callback may refuse to start. Keep the reviewed fields and their
-        // scrubbable password until the host confirms this answer was accepted.
         let password = self
             .password
             .value
@@ -591,7 +572,6 @@ impl SystemStateApp {
     }
 
     /// The host calls this only after the final view has actually detached.
-    /// Preflight and closing another view must leave the shared review intact.
     pub(crate) fn closed(&mut self, scope: CloseScope) {
         if let Some(request) = self.request.take() {
             request.finish(if matches!(scope, CloseScope::View | CloseScope::Tab) {
@@ -1406,8 +1386,6 @@ mod tests {
             assert!(app.presentation(&view).indicators.attention);
             app.cancel();
             assert!(matches!(app.take_action(), Some(SystemStateAction::Cancel)));
-            // Successful cancellation supplies current rows with the previous
-            // operation's failure removed; historical completion stays intact.
             app.publish(SetupStatus {
                 finished: true,
                 ..SetupStatus::default()
@@ -1502,8 +1480,6 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            // Ordinary polls must not reinstall observations of a different
-            // reviewed URL or checklist in either shared view.
             runtime.publish_system_state(status.clone());
             for view in [first, second] {
                 assert!(
@@ -1546,8 +1522,6 @@ mod tests {
             let app = runtime.system_state_mut().unwrap();
             assert_eq!(app.password.projection().text, "•".repeat(13));
             assert!(app.has_unsubmitted_changes());
-            // A different current worker failure remains actionable even while
-            // an old read-only observation is irrelevant to the edited plan.
             let mut failed = status.clone();
             failed.rows.push(SetupStatusRow {
                 name: "Restore preferences".into(),
@@ -1757,8 +1731,6 @@ mod tests {
                 row.clone(),
             ];
             if row.status == "blocked" {
-                // The real engine reports vault approval before the dependent
-                // repository stage; its generic blocker must not hide the code.
                 rows.push(SetupStatusRow {
                     name: "GitHub repositories".into(),
                     status: "blocked".into(),

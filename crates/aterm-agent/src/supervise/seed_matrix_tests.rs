@@ -4706,33 +4706,8 @@ fn person_scenarios() -> Vec<Scenario> {
     out
 }
 
-const MATRIX_WORKERS: usize = 4;
-
 fn run_all(scenarios: &[Scenario], seed: bool) -> Vec<(String, Tally)> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let mut out: Vec<(usize, (String, Tally))> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..MATRIX_WORKERS.min(scenarios.len()))
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut done = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(sc) = scenarios.get(i) else {
-                            return done;
-                        };
-                        done.push((i, run_matrix(sc, seed)));
-                    }
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("a scenario's matrix"))
-            .collect()
-    });
-    out.sort_by_key(|(i, _)| *i);
-    out.into_iter().map(|(_, r)| r).collect()
+    aterm_spec::check::each(scenarios, |sc| run_matrix(sc, seed))
 }
 
 #[test]
@@ -7074,33 +7049,14 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, V
 
 #[test]
 fn a_loop_in_a_tab_a_cold_restore_reopened_types_as_the_first_loop_at_every_handoff() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let run = |scenarios: &[Scenario], noted: bool, owed: bool| {
-        let next = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            let hs: Vec<_> = (0..MATRIX_WORKERS.min(scenarios.len()))
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut done = (0, Vec::new());
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(sc) = scenarios.get(i) else {
-                                return done;
-                            };
-                            let (c, b) = restored_cells(sc, i, noted, owed);
-                            done.0 += c;
-                            done.1.extend(b);
-                        }
-                    })
-                })
-                .collect();
-            hs.into_iter()
-                .map(|h| h.join().expect("a scenario's cells"))
-                .fold((0, Vec::new()), |(c, mut b), (c1, b1)| {
-                    b.extend(b1);
-                    (c + c1, b)
-                })
-        })
+        let indexed: Vec<(usize, &Scenario)> = scenarios.iter().enumerate().collect();
+        aterm_spec::check::each(&indexed, |&(i, sc)| restored_cells(sc, i, noted, owed))
+            .into_iter()
+            .fold((0, Vec::new()), |(c, mut b), (c1, b1)| {
+                b.extend(b1);
+                (c + c1, b)
+            })
     };
     let all = scenarios();
     let (cells, broken) = run(&all, true, false);

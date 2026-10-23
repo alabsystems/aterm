@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The split set's host side (`crate::vitals_host`, THE SPLIT SET): which
-//! readings are split ticks, the cold pair a `sys why` pull takes, and what
-//! is kept (known-start births and the timeline) or refreshed (lead identities), through a
-//! stand-in kernel ([`STAND_IN`]) that counts its reads on the test's thread.
-//! Each test's checks are of what was read, never of how long a read took.
-//! RD is `docs/DESIGN-resource-details-2026-10-20.md`.
+//! The split set's host side (`crate::vitals_host`, THE SPLIT SET): which readings are split ticks,
+//! the cold pair a `sys why` pull takes, and what is kept (known-start births and the timeline) or
+//! refreshed (lead identities), through a stand-in kernel ([`STAND_IN`]) that counts its reads on
+//! the test's thread.
 
 use std::cell::{Cell, RefCell};
 
@@ -183,8 +181,6 @@ fn just_read(reader: &mut Reader) {
 #[test]
 fn split_ticks_ride_the_bars_and_an_armed_pull_only() {
     let t0 = Instant::now();
-    // Readings `period_ms` apart, every other one 3 ms late: how many are
-    // split ticks.
     let ticks = |req: &Request, period_ms: u64, readings: u64, armed: bool| {
         let mut last = None;
         let mut n = 0;
@@ -248,7 +244,6 @@ fn split_ticks_ride_the_bars_and_an_armed_pull_only() {
 #[test]
 fn the_coalitions_are_read_on_split_ticks_only() {
     let (mut reader, armed) = stand_in_reader();
-    // The list's reads, and the sweeps that read each process's coalition.
     let reads = || {
         let r = READS.get();
         (r.coalitions, r.swept)
@@ -287,9 +282,6 @@ fn the_coalitions_are_read_on_split_ticks_only() {
 
 /// THE LOOP ASKS FOR SPLIT TICKS ONLY WHILE A WINDOW IN VIEW SHOWS THE BARS
 /// ([`Request::deck`]): the Deck, or the Sill (a close-up opens from either).
-/// NEGATIVE CONTROLS: no bars drawn, the bars off, the Fleet Monitor tab
-/// alone in view, and the bars shown on windows every one of which is
-/// occluded ask none.
 #[test]
 fn the_loop_asks_for_split_ticks_only_while_a_window_in_view_shows_the_bars() {
     let mut app = crate::App::headless_for_test();
@@ -354,7 +346,6 @@ fn an_armed_pull_with_no_fresh_split_tick_reads_a_pair_and_has_a_window() {
 
     let gap = SPLIT_WINDOW_MAX + Duration::from_secs(1);
     let stale = || Instant::now().checked_sub(gap);
-    // Every stamp from here on a minute and more past the model's base.
     reader.epoch = reader.epoch.checked_sub(gap).expect("a minute since boot");
     reader.split.last = stale();
     assert!(reader.split_cold(), "a base too old for a window");
@@ -395,8 +386,6 @@ impl Source for Paced {
 /// A PULL COLD FOR THE SPLIT ALONE STILL KEEPS THE FLOOR: the last whole
 /// reading just taken, its pair's first reading comes at least
 /// [`MIN_WINDOW`] after it, so no rate the model takes is over less.
-/// NEGATIVE CONTROL: warm for the split, the same pull reads once, after the
-/// same wait.
 #[test]
 fn a_pull_cold_for_the_split_alone_keeps_the_floor() {
     for (cold, readings) in [(true, 2), (false, 1)] {
@@ -418,8 +407,6 @@ fn a_pull_cold_for_the_split_alone_keeps_the_floor() {
 /// A PULL IS COLD FOR THE SPLIT A MARGIN INSIDE THE LONGEST WINDOW: armed,
 /// with the last split tick a hair inside [`SPLIT_WINDOW_MAX`] when it looks
 /// (past it by the time its reading's stamp is taken), it reads a pair.
-/// NEGATIVE CONTROLS: the margin and more inside, it reads once; unarmed,
-/// never twice for the split.
 #[test]
 fn a_pull_is_cold_for_the_split_a_margin_inside_the_longest_window() {
     let armed = gauge();
@@ -442,7 +429,6 @@ fn a_pull_is_cold_for_the_split_a_margin_inside_the_longest_window() {
 fn a_kernel_name_is_the_swept_one_whole_or_cut_by_one() {
     assert!(names_the_same("mds_stores", "mds_stores"));
     assert!(names_the_same("SetStoreUpdateSe", "SetStoreUpdateS"));
-    // Eight two-byte letters: the sweep's 15 bytes end in half of one.
     let swept = String::from_utf8_lossy(&"Приложен".as_bytes()[..15]);
     assert_eq!(swept, "Приложе\u{FFFD}");
     assert!(names_the_same("Приложен", &swept));
@@ -495,9 +481,6 @@ fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
 }
 
 /// A long gap refreshes births even when the sweep's start stayed known.
-/// Inside a window those births are kept, but identities are always current.
-/// A missing start never vouches for reuse: same-name births are read again
-/// at every tick, including a pid reused between consecutive sweeps.
 #[test]
 fn after_a_long_gap_every_birth_and_identity_is_read_again() {
     let now = Cell::new(Instant::now());
@@ -750,7 +733,6 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
     let mut split = SplitReader::new(STAND_IN, gauge());
     assert!(split.vouches, "launchd reads as Apple's");
     READS.take();
-    // Newest first, as the kernel lists them.
     let mut procs = vec![
         swept(900, 1342, "zsh", 30),
         swept(388, 307, "mdworker", 21),
@@ -790,7 +772,6 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
     let r = READS.take();
     assert_eq!((r.births, r.identities), (0, 3), "only births are cached");
 
-    // An exec can retain the same short name and birth but change signature.
     kernel(&[
         (1, "launchd", 1_000, true),
         (387, "mds", 2_000, false),
@@ -809,7 +790,6 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
     let r = READS.take();
     assert_eq!((r.births, r.identities), (0, 3));
 
-    // An exec: the pid and the birth stay, the image moves.
     kernel(&[
         (1, "launchd", 1_000, true),
         (387, "mds_stores", 2_000, true),
@@ -829,7 +809,6 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
     let r = READS.take();
     assert_eq!((r.births, r.identities), (1, 3));
 
-    // A reused pid: another process, born later, leads 1342 now.
     kernel(&[
         (1, "launchd", 1_000, true),
         (387, "mds_stores", 2_000, true),
@@ -850,7 +829,6 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
     let r = READS.take();
     assert_eq!((r.births, r.identities), (1, 3));
 
-    // 387 gone: 388 leads 307; back, 387 is read and leads again.
     let without: Vec<ProcSample> = procs.iter().filter(|p| p.pid != 387).cloned().collect();
     let s = tick(&mut split, without);
     assert_eq!(
@@ -874,7 +852,6 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
     let r = READS.take();
     assert_eq!((r.births, r.identities), (1, 6));
 
-    // The record read is another process's: no birth, read again next tick.
     kernel(&[
         (1, "launchd", 1_000, true),
         (387, "mds_stores", 2_000, true),
@@ -893,7 +870,6 @@ fn known_start_births_are_kept_and_lead_identities_are_refreshed() {
 /// [`BIRTHS_AT_ONCE`] pids not yet read (the first tick, a build's storm),
 /// one read of every record gives each its birth; the next tick reads
 /// nothing. A 16-byte name the sweep holds cut to 15 is the same process's.
-/// NEGATIVE CONTROL: at the threshold, each is read on its own.
 #[test]
 fn many_births_are_read_in_one_read_of_the_table() {
     for (n, tables, records) in [
@@ -1035,8 +1011,6 @@ fn the_why_fixture_reads_its_scene_over_the_hosts_own_split_ticks() {
         let snap = read(spotlight_1032(), at);
         let why = snap.why.as_deref().expect("the scene's split");
         assert_eq!(why.split.via, Via::Coalitions, "{at:?}");
-        // The cores' ticks are whole ms: on the scene's own spacing, exact;
-        // off it, a millicore or so of rounding.
         let slack = if at == [0, 4_000, 5_000] { 0 } else { 5 };
         assert!(
             why.split.global_mc.abs_diff(3_300) <= slack,

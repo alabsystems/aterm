@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The libxcb and libX11-xcb entry points the transport calls, read at run
-//! time through `aterm-dl`. Each row transcribes the prototype in libxcb's
-//! `xcb.h` / `xcbext.h` (1.13 and later: the 64-bit sequence calls) and
-//! libX11's `Xlib-xcb.h`.
+//! Runtime-loaded `libxcb` and `libX11-xcb` entry points via `aterm-dl`.
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::sync::OnceLock;
@@ -35,12 +32,9 @@ pub(crate) struct VoidCookie {
     pub(crate) sequence: c_uint,
 }
 
-/// `XCB_REQUEST_CHECKED`: an error comes back to `request_check` or the
-/// reply wait, never to the event queue (which on a shared Xlib connection
-/// is Xlib's).
+/// `XCB_REQUEST_CHECKED`.
 pub(crate) const REQUEST_CHECKED: c_int = 1 << 0;
-/// `XCB_REQUEST_RAW`: the bytes are a whole request, opcode and length
-/// included; libxcb writes nothing into them.
+/// `XCB_REQUEST_RAW`: the bytes are a whole request, opcode and length included.
 pub(crate) const REQUEST_RAW: c_int = 1 << 1;
 
 aterm_dl::table! {

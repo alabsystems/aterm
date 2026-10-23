@@ -160,7 +160,7 @@ pub struct PxBox {
 }
 
 impl PxBox {
-    fn holds(self, x: i64, y: i64) -> bool {
+    const fn holds(self, x: i64, y: i64) -> bool {
         self.x0 <= x && x < self.x1 && self.y0 <= y && y < self.y1
     }
 }
@@ -258,7 +258,7 @@ pub struct Grid {
 impl Grid {
     /// The box of `span` cells from `row`, `col`.
     #[must_use]
-    pub fn cell_box(&self, row: i64, col: i64, span: i64) -> PxBox {
+    pub const fn cell_box(&self, row: i64, col: i64, span: i64) -> PxBox {
         let (x0, y0) = (self.ox + col * self.cw, self.oy + row * self.ch);
         PxBox {
             x0,

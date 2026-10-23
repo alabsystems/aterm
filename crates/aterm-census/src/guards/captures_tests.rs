@@ -175,7 +175,6 @@ fn a_record_the_guard_cannot_decode_is_a_finding_not_a_pass() {
     }
     let found = judged("t/bad.reads", "ab\\q\n");
     assert_eq!(spots(&found), ["t/bad.reads:1".to_string()].into());
-    // a record of another kind carries no bytes
     assert!(judged("t/fence.ptylog", "1 C\n2 O 6162\n").is_empty());
 }
 
@@ -186,7 +185,6 @@ fn the_views_join_a_word_an_sgr_splits_and_end_one_a_cursor_move_ends() {
     assert_eq!(joined.bytes, b"abcdef\n0;title\ngh\nijk");
     let spaced = View::printable(stream, Read::Spaced);
     assert_eq!(spaced.bytes, b"ab\ncd\nef\n0;title\ngh\nijk");
-    // each byte keeps the stream offset it came from
     assert_eq!(joined.from[2], 6);
     let raw = View::raw(stream);
     assert_eq!(raw.lines().count(), 2);
@@ -242,8 +240,6 @@ fn without_the_exports_rows_the_capture_rows_still_hold() {
     held_to(&tree, Err(NO_BASELINE.to_string()), &mut found);
     let noted = notes(&root);
     let _ = std::fs::remove_dir_all(&root);
-    // the word is an extras row, so record 2 goes unjudged; the capture rows
-    // take the other four
     assert_eq!(
         spots(&found),
         ["1", "4", "5", "6"]
@@ -284,7 +280,6 @@ fn the_edited_view_reads_a_word_fixed_while_it_was_typed() {
     assert_eq!(echo.bytes, b"zebrafish\nok");
     let typed = View::printable(b"zebx\x7frafish", Read::Edited);
     assert_eq!(typed.bytes, b"zebrafish");
-    // the joined view breaks the word at each erase instead
     let joined = View::printable(b"zebx\x08 \x08rafish", Read::Joined);
     assert_eq!(joined.bytes, b"zebx\n \nrafish");
     let found = judged(

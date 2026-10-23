@@ -333,7 +333,8 @@ pub(crate) mod stopped_spinner {
         ) -> libc::pid_t;
     }
 
-    /// Keeps the spinner owned until a successful manual reap.
+    /// Keeps the spinner owned until a successful manual reap. Dropping the
+    /// ordinary handle alone only gives a running child to a passive reaper.
     struct OwnedSpinner(Option<aterm_uds::spawnfd::Child>);
 
     impl OwnedSpinner {

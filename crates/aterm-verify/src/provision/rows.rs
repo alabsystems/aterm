@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The rows `verify provision` provides (docs/DESIGN-init-system-2026-10-20.md §4.4,
-//! §6.2–§6.4): what each is, where upstream serves it for which host, what it must hash
-//! to, the anchor its tree is held to, and how it is installed.
-//!
-//! A row that provides a [`aterm_uds::host::TOOLS`] row takes its version, its `when`
-//! and its install directory from that row's pin, so the resolver and the install read
-//! one source. Each URL spells its version as `{v}`. Every pin was measured on the
-//! download it names (2026-10-22): its sha256 matched the digest upstream publishes for
-//! it (the release page's, rustup-init's `.sha256`), and its size is the bytes curl
-//! wrote.
+//! The rows `verify provision` provides (docs/DESIGN-init-system-2026-10-20.md §4.4, §6.2–§6.4):
+//! what each is, where upstream serves it for which host, what it must hash to, the anchor its tree
+//! is held to, and how it is installed.
 
 use aterm_uds::host::{Tool, When};
 
@@ -19,8 +12,8 @@ use aterm_uds::host::{Tool, When};
 pub enum Anchor {
     /// The archive's sha256 is the only anchor: upstream signs nothing.
     Sha256,
-    /// The sha256, then every Mach-O in the unpacked tree verified by codesign as a
-    /// Developer ID of `team` (`aterm_update_core::codesign::verify_developer_id_until`).
+    /// The sha256, then every Mach-O in the unpacked tree verified by codesign as a Developer ID of
+    /// `team` (`aterm_update_core::codesign::verify_developer_id_until`).
     DeveloperId {
         /// The Apple team id every Mach-O must carry.
         team: &'static str,
@@ -63,9 +56,9 @@ pub enum Engine {
 /// How a row is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Install {
-    /// An upstream release archive, checked against `anchor` and unpacked through
-    /// atpkg's vetted extractor, `strip` leading components dropped; every name in
-    /// `keep` (a licence, its notices) must be in the tree.
+    /// An upstream release archive, checked against `anchor` and unpacked through atpkg's vetted
+    /// extractor, `strip` leading components dropped; every name in `keep` (a licence, its notices)
+    /// must be in the tree.
     Unpack {
         /// One per host upstream builds for.
         archives: &'static [Archive],
@@ -76,25 +69,22 @@ pub enum Install {
         /// Files the tree must keep.
         keep: &'static [&'static str],
     },
-    /// Upstream's source tarball, built here with Trust (fish, §6.2): `targo --unverified
-    /// build --release --locked --no-default-features --features <features>`, on the
-    /// hosts its tool row's pin names ([`aterm_uds::host::Pin::hosts`]).
+    /// Upstream's source tarball, built here with Trust (fish, §6.2): `targo --unverified build
+    /// --release --locked --no-default-features --features <features>`, on the hosts its tool row's
+    /// pin names ([`aterm_uds::host::Pin::hosts`]).
     Build {
         /// The tarball.
         source: Archive,
         /// The features the build names (empty: none past `--no-default-features`).
         features: &'static [&'static str],
     },
-    /// A crate's CLI built by `targo --unverified install --locked` at the pin
-    /// (wasm-bindgen): crates.io's checksums and the crate's lockfile are its anchor.
+    /// A crate's CLI built by `targo --unverified install --locked` at the pin (wasm-bindgen):
+    /// crates.io's checksums and the crate's lockfile are its anchor.
     Cargo,
     /// A browser the browser lane pins.
     Browser(Engine),
-    /// rustup's stable toolchain with the slices the cells, the web modules and the
-    /// shipped binary's x86_64 slice need, and the wasm32 pin (STOCK EXCEPTION). Where no
-    /// rustup is installed, rustup-init at `version` lays it: one of `init` per host, held
-    /// to its size and sha256 in an empty directory of its own before it runs, as every
-    /// archive is.
+    /// rustup's stable toolchain with the slices the cells, the web modules and the shipped
+    /// binary's x86_64 slice need, and the wasm32 pin (STOCK EXCEPTION).
     Rustup {
         /// The rustup release its installer is pinned at.
         version: &'static str,
@@ -137,8 +127,8 @@ impl Row {
         self.tool_row().and_then(|t| t.pin).map(|p| p.version)
     }
 
-    /// The archive it fetches for `platform` (`<os>-<arch>`): an unpacked row's, a built
-    /// row's source where its pin names the host, rustup's installer.
+    /// The archive it fetches for `platform` (`<os>-<arch>`): an unpacked row's, a built row's
+    /// source where its pin names the host, rustup's installer.
     #[must_use]
     pub fn archive_for(&self, platform: &str) -> Option<Archive> {
         match self.install {
@@ -155,14 +145,12 @@ impl Row {
     }
 }
 
-/// Microsoft's Apple team, which signs every Mach-O of the PowerShell archives (all 17 of
-/// 7.6.7's in each, measured with `codesign -dv`).
+/// Microsoft's Apple team, which signs every Mach-O of the PowerShell archives (all 17 of 7.6.7's
+/// in each, measured with `codesign -dv`).
 pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 
 /// Every row, in the order a run provides them.
 pub const ROWS: [Row; 9] = [
-    // rustup-init 1.29.2 is ad hoc signed and nothing more (measured with `codesign -dv`),
-    // so its sha256, which matched the `.sha256` beside each download, is its anchor.
     Row {
         name: "rustup",
         tool: Some("rustup"),
@@ -272,9 +260,6 @@ pub const ROWS: [Row; 9] = [
         tool: None,
         install: Install::Browser(Engine::Webkit),
     },
-    // lima's release binaries carry com.apple.security.virtualization as shipped (ad hoc
-    // signed, measured: docs/measured/verify-provision-2026-10-22.md), so the vz backend
-    // runs the unpacked tree as it is, anchored by sha256 alone.
     Row {
         name: "lima",
         tool: Some("limactl"),

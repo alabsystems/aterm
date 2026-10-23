@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one compiler this gate uses: the Trust toolchain the checkout pins,
-//! found by the repo's single resolution order (`$TRUST_STAGE2_BIN`, rustup's
-//! `trust`, the atpkg store, PATH), and the host triple it is native to.
+//! Discovers the pinned Trust toolchain and its native host triple.
 
 use std::path::{Path, PathBuf};
 
@@ -123,10 +121,7 @@ impl Trust {
     }
 }
 
-/// A rustup toolchain's drivers. STOCK EXCEPTION: the regeneration measures and
-/// documents every cell, and Trust ships std for its host triple only (a cross
-/// cell is E0463 under Trust), so a cell this box is not native to is compiled
-/// by a stock toolchain. The gate itself never uses one.
+/// A rustup toolchain's drivers (STOCK EXCEPTION: cross cells compile with stock Rust).
 #[derive(Clone, Debug)]
 pub struct Stock {
     /// The toolchain as named (`stable`).
@@ -146,9 +141,7 @@ impl Stock {
     }
 }
 
-/// The rustup toolchain `name` (`stable`, or `<name>-<host>` as rustup files
-/// it), driven by its own binaries rather than rustup's proxies so nothing on
-/// PATH chooses for it.
+/// Locates the rustup toolchain `name` (`stable` or `<name>-<host>`).
 ///
 /// # Errors
 /// When rustup holds no such toolchain.

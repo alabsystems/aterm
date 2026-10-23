@@ -615,7 +615,10 @@ impl Unread {
         self.at == self.end
     }
 
-    /// `amount` bytes are served.
+    /// `amount` bytes are served. An emptied buffer keeps its storage for the
+    /// next read, unless a request larger than one read's room grew it (a
+    /// mapping goes, its pages with it); a parked idle connection holds none
+    /// ([`Self::hold_only_what_is_owed`]).
     fn consume(&mut self, amount: usize) {
         self.at = self.end.min(self.at + amount);
         if self.at == self.end {
@@ -631,7 +634,8 @@ impl Unread {
         }
     }
 
-    /// Room for the next read.
+    /// Room for the next read. Once little is left, what was served goes and
+    /// the unread rest moves to the front; the storage grows only when full.
     fn room(&mut self) -> &mut [u8] {
         #[cfg(unix)]
         if self
@@ -944,7 +948,8 @@ pub(super) struct Conn {
     taking: Option<Instant>,
     /// Held from parking until a request lane takes it back.
     parked: Option<Slot>,
-    /// Held from admission until the connection ends (or flips to push).
+    /// Held from admission until the connection ends (or flips to push). Last,
+    /// so a new peer is admitted only after this one's claims are released.
     _open: Slot,
 }
 
@@ -2402,7 +2407,9 @@ impl Conn {
         self.scope.is_some() && !self.has_live_claim()
     }
 
-    /// Whether a claim still ends with it.
+    /// Whether a claim still ends with it. The tenure's cleanup flag stays set
+    /// until the connection drops, even after its last claim was released, so
+    /// this asks the service's current authority, not that history bit.
     fn has_live_claim(&self) -> bool {
         self.tenure.claimed && self.tenure.service.has_live_claim(self.tenure.id)
     }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! This account's own home and login shell, from the account database (Open Directory on
-//! macOS) rather than `$HOME` and `$SHELL`: a process given a scratch `$HOME` (a test, a lab
-//! instance) still learns where the login it runs in keeps its files, which is where a
-//! launchd job of that login looks, and which shell its terminals start.
+//! Account home directory, login name, and login shell from the account database.
 
 use std::path::PathBuf;
 
-/// This account's home directory as `getpwuid_r(getuid())` gives it; `None` when the
-/// account database has no entry for the uid, or names an empty home.
+/// Returns this account's home directory from `getpwuid_r(getuid())`.
 #[must_use]
 // Skip: bottoms out at the `getuid` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -18,9 +14,7 @@ pub fn home() -> Option<PathBuf> {
     home_of(unsafe { libc::getuid() })
 }
 
-/// The home directory the account database names for `uid` (`getpwuid_r(uid)->pw_dir`,
-/// the directory `sh` expands `~<name>` to for that account's name); `None` when the
-/// database has no entry for the uid, or names an empty home.
+/// Returns the home directory the account database names for `uid`.
 #[must_use]
 // Skip: bottoms out at the `getpwuid_r` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -51,9 +45,7 @@ pub fn home_of(uid: u32) -> Option<PathBuf> {
     }
 }
 
-/// The login name for `uid` from the account database (`getpwuid_r`);
-/// `None` when no entry names it. Display use (an `ls -l`-style owner
-/// column), never an identity decision.
+/// Returns the login name for `uid` from the account database.
 #[must_use]
 // Skip: bottoms out at the `getpwuid_r` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -79,10 +71,7 @@ pub fn user_name(uid: u32) -> Option<String> {
     }
 }
 
-/// This account's login shell as `getpwuid_r(getuid())` gives it (`pw_shell`, the program
-/// `login`, `sshd` and Terminal.app start): `None` when the account database has no entry
-/// for the uid, or names no shell. Never `$SHELL`, which a test, a wrapper or a parent
-/// process may set to anything.
+/// Returns this account's login shell from `getpwuid_r(getuid())`.
 #[must_use]
 // Skip: bottoms out at the `getuid` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -91,8 +80,7 @@ pub fn shell() -> Option<PathBuf> {
     shell_of(unsafe { libc::getuid() })
 }
 
-/// The login shell the account database names for `uid` (`getpwuid_r(uid)->pw_shell`);
-/// `None` when the database has no entry for the uid, or names an empty shell.
+/// Returns the login shell the account database names for `uid`.
 #[must_use]
 // Skip: bottoms out at the `getpwuid_r` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -121,11 +109,6 @@ pub fn shell_of(uid: u32) -> Option<PathBuf> {
         Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
     }
 }
-
-// No `group_name` beside it: the generated aterm-libc subset declares
-// no group-database call (`getgrgid_r`), and widening it is an
-// aterm-libc-oracle harvest+regen across all four cells — not worth
-// doing for a display column. Callers print the numeric gid.
 
 #[cfg(test)]
 mod tests {
@@ -167,7 +150,6 @@ mod tests {
     fn a_uid_s_login_shell_comes_from_the_account_record() {
         if std::env::var_os(LOGIN_SHELL_CHILD_ENV).is_some() {
             let shell = super::shell().map(|s| s.display().to_string());
-            // On a line of its own: the harness has printed the test's name without one.
             println!("\nlogin-shell={}", shell.unwrap_or_default());
             return;
         }
@@ -203,8 +185,6 @@ mod tests {
         // SAFETY: getuid takes no arguments and cannot fail.
         let uid = unsafe { libc::getuid() };
         assert!(super::user_name(uid).is_some_and(|n| !n.is_empty()));
-        // An arbitrary id resolves or not, but never panics and
-        // never yields an empty name (u32::MAX-1 is `nobody` here).
         assert!(super::user_name(u32::MAX - 1).is_none_or(|n| !n.is_empty()));
     }
 }

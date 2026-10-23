@@ -191,6 +191,7 @@ pub fn exit_moment_thread(pid: u32) -> String {
 #[derive(Debug)]
 pub struct ExitMoment<T> {
     stamped: std::sync::Arc<std::sync::OnceLock<T>>,
+    /// Dropped with the watch: the thread's pipe reads end-of-file and the
     /// thread returns.
     #[cfg(unix)]
     _cancel: std::io::PipeWriter,
@@ -264,12 +265,15 @@ type ExitReadable = ExitWatch;
 #[cfg(all(unix, not(target_vendor = "apple")))]
 type ExitReadable = std::os::fd::OwnedFd;
 
+/// Something that `poll(2)` reports readable once `pid` has exited — Darwin:
 /// the [`ExitWatch`] kqueue.
 #[cfg(target_vendor = "apple")]
 fn exit_readable(pid: u32) -> Option<ExitReadable> {
     ExitWatch::watch(pid)
 }
 
+/// See the Darwin twin. Linux: `pidfd_open(pid, 0)`, close-on-exec by
+/// default. Its syscall number is 434 on every architecture this arm compiles
 /// for (alpha, ia64 and mips differ, and are not wired).
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
@@ -315,6 +319,7 @@ fn exit_readable(_pid: u32) -> Option<ExitReadable> {
     None
 }
 
+/// Block until `target` or `cancel` is readable: `true` when the target is
 /// (the exit came), `false` when only the cancel pipe is or `poll` fails.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -383,6 +388,7 @@ mod moment_tests {
         now
     }
 
+    /// The stamp lands after the kill, on the watch's own thread; a gone pid cannot be
     /// watched; a watch dropped before the exit ends its thread without stamping.
     #[test]
     fn the_moment_is_stamped_when_the_kernel_reports_the_exit() {
@@ -462,6 +468,7 @@ mod tests {
 
     use crate::spawnfd::{Command, Stdio};
 
+    /// Exit 7 reads `0x0700`, SIGKILL `0x9`; a second read answers the same, and the watch
     /// does not reap.
     #[test]
     fn the_watch_reads_exit_and_signal_statuses() {
@@ -500,6 +507,7 @@ mod tests {
         assert!(ExitWatch::watch(1).is_none());
     }
 
+    /// Block on the watch's descriptor, never on a clock: the event is queued inside
     /// `proc_exit`, which `wait` has already observed.
     fn wait_for(watch: &ExitWatch) -> i32 {
         #[repr(C)]

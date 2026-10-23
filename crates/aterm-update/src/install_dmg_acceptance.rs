@@ -49,6 +49,8 @@ fn staging(dir: &Path) -> std::io::Result<Staging> {
     })
 }
 
+/// A release image's tree at `src`: the `Applications` link and, when `app`, an ad hoc
+/// signed `aterm.app` sealed as [`BUILD`] / [`COMMIT`] whose executable answers
 /// `--version` naming the build; otherwise a README in its place.
 fn release_tree(src: &Path, app: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -81,6 +83,7 @@ fn release_tree(src: &Path, app: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `hdiutil create -srcfolder <src>`: a compressed image named as a release's volume (with
 /// its space).
 fn create_image(src: &Path, image: &Path) -> std::io::Result<()> {
     let out = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
@@ -99,6 +102,7 @@ fn create_image(src: &Path, image: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Every image `hdiutil info` lists as attached from under `dir` (as spelled and as
 /// resolved: `/var/folders` is `/private/var/folders`), with its first device node.
 fn attached_under(dir: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
     let out = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
@@ -128,6 +132,8 @@ fn attached_under(dir: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
     Ok(found)
 }
 
+/// Detaches every image attached from under its folder when it goes out of scope, on
+/// every path out of a row (an assertion's panic included): an attached image outlives
 /// the process.
 struct DetachAll(PathBuf);
 
@@ -254,6 +260,8 @@ pub fn a_real_image_without_aterm_app_is_refused_and_detached(dir: &Path) -> std
     Ok(())
 }
 
+/// `curl` for `install.sh`'s release host, serving one tag's assets from `$STUB_DIR`
+/// in the three shapes the installer asks for: a redirect-refusing HEAD's status code
 /// (an asset's presence), a redirected HEAD's headers (its size), and a GET (its bytes).
 const RELEASE_HOST: &str = r#"#!/bin/sh
 head=0 follow=0 fmt= url=
@@ -285,6 +293,8 @@ case "$head$follow" in
 esac
 "#;
 
+/// One whole run of `script` (`tools/install.sh`'s text) pinned to the stand-in release,
+/// the app half alone, against [`RELEASE_HOST`] serving `dir/host`: its scratch HOME,
 /// TMPDIR and install folder under `dir`. Returns (exit status, stdout and stderr).
 fn install_sh(dir: &Path, script: &str, image_has_app: bool) -> std::io::Result<(i32, String)> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -343,6 +353,7 @@ fn install_sh(dir: &Path, script: &str, image_has_app: bool) -> std::io::Result<
     ))
 }
 
+/// What `install.sh` left in its TMPDIR (its `aterm-install.*` folder, mount point
 /// inside).
 fn left_in(tmp: &Path) -> Vec<String> {
     std::fs::read_dir(tmp)

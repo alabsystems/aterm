@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Muse Code's dialect on typed request bodies, and served for real on
-//! loopback to the workspace's HTTP client.
+//! Tests for Muse Code dialect parsing and loopback HTTP stub responses.
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -43,7 +42,6 @@ fn the_catalog_keys_its_model_s_metadata_muse_code() {
             .cloned(),
         Some(J::Bool(false))
     );
-    // NEGATIVE CONTROL: the metadata is no TbhMetadata at its top (a model so shaped is dropped)
     assert!(meta.get("family").is_none());
 }
 
@@ -63,7 +61,6 @@ fn the_tool_script_is_answered_from_the_person_s_toolstart_one_result_at_a_time(
             && i.get("sandbox_permissions").and_then(J::as_str) == Some("require_escalated")),
         "{first:?}"
     );
-    // the subagent's call is skipped: the second step is the write
     let second = tool_turn(&input(&[PERSON, CALL, RESULT]), &script);
     assert!(
         matches!(&second, Some(ToolTurn::Call(n, _, 1)) if n == "write_file"),
@@ -73,9 +70,7 @@ fn the_tool_script_is_answered_from_the_person_s_toolstart_one_result_at_a_time(
         tool_turn(&input(&[PERSON, CALL, RESULT, CALL, RESULT]), &script),
         Some(ToolTurn::Done)
     );
-    // NEGATIVE CONTROL: a runtime note holding the word is not the person's message
     assert_eq!(tool_turn(&input(&[NOTE]), &script), None);
-    // a later toolstart starts over
     let again = tool_turn(&input(&[PERSON, CALL, RESULT, PERSON]), &script);
     assert!(matches!(again, Some(ToolTurn::Call(_, _, 0))), "{again:?}");
 }
@@ -103,7 +98,6 @@ fn a_side_call_gets_its_own_answer_by_its_role_and_tools() {
     };
     assert_eq!(name, "submit_reminder_decision");
     assert_eq!(args.get("decision").and_then(J::as_str), Some("none"));
-    // NEGATIVE CONTROL: a role that offers no decision tool gets text
     assert_eq!(side_answer("reminder:goal-reminder", &[]), Side::Text("ok"));
     assert_eq!(role_of(None), "main");
     assert_eq!(role_of(Some("")), "main");
@@ -211,10 +205,8 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
 
     let (st, b) = get(&port, "/muse-code/models");
     assert_eq!(st, 200);
-    // the stub answers JSON as Python's json.dumps(sort_keys=True) spells it
     assert_eq!(J::parse(&b).unwrap(), J::parse(&catalog().py()).unwrap());
 
-    // a turn: the numbered stream, its one message, the usage
     let r = post("/responses", &turn("carry on"), "main");
     assert_eq!(r.status(), 200);
     let ev = events(&String::from_utf8_lossy(r.body()));
@@ -254,7 +246,6 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
             .unwrap()
             > 0
     );
-    // NEGATIVE CONTROL: Codex's path keeps Codex's stream
     let codex = post(
         "/v1/responses",
         r#"{"model":"gpt-x","stream":true,"input":[{"role":"user","content":"hi"}]}"#,
@@ -266,7 +257,6 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
         "{cev:?}"
     );
 
-    // the side calls, answered even under a wall
     control(&port, "/__mode?m=401").unwrap();
     let r = post("/responses", reminder, "reminder:skill-reminder");
     assert_eq!(r.status(), 200);
@@ -290,7 +280,6 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
     );
     let hint = post("/responses", &turn("x"), "prompt-hint");
     assert!(String::from_utf8_lossy(hint.body()).contains(r#""delta":"NONE""#));
-    // ... and the turn gets the wall
     let r = post("/responses", &turn("carry on"), "main");
     assert_eq!(r.status(), 401);
     assert!(String::from_utf8_lossy(r.body()).contains("invalid_api_key"));
@@ -324,7 +313,6 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
         .collect();
     assert_eq!(text, "tick 1 tick 2 ");
 
-    // a side call never spends a custom mode's budget
     std::fs::write(
         dir.join("modes/once.json"),
         r#"{"times": 1, "text": "the custom turn"}"#,
@@ -341,7 +329,6 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
         "used up after one turn"
     );
 
-    // the tool mode: the script's call in the muse namespace, then the answer quoting its result
     std::fs::write(
         &tool_file,
         r#"{"name":"bash","input":{"command":"touch probe.txt","sandbox_permissions":"require_escalated"}}"#,
@@ -383,8 +370,6 @@ fn served_on_loopback_it_answers_muse_code_as_the_modes_say() {
         " tool:bash step 0",
         " tool:done result='{\"status\":\"answered\"}'",
     ];
-    // The stub writes a request's line once its answer is sent, so the last
-    // answer reaches this client before its line reaches the log.
     let logged = logged_with(&log, &wants, Duration::from_secs(10));
     for want in wants {
         assert!(logged.contains(want), "{want} in\n{logged}");

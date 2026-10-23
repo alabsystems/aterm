@@ -7,12 +7,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The clock every case reads: a fixed instant, so ages are exact.
+/// The clock every case reads.
 fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_800_000_000)
 }
 
-/// An in-memory tree: each path's kind, modification time, bytes and link target.
+/// An in-memory tree.
 #[derive(Default)]
 struct Fake {
     nodes: BTreeMap<PathBuf, (Kind, SystemTime, Vec<u8>, Option<PathBuf>)>,
@@ -49,8 +49,7 @@ impl Fake {
         self
     }
 
-    /// Writes `path` again at `at`: its own time only, as a write into a folder moves the
-    /// folder's.
+    /// Writes `path` again at `at`: its own time only, as a write into a folder moves the folder's.
     fn touch(&mut self, path: &str, at: SystemTime) {
         self.nodes.get_mut(Path::new(path)).unwrap().1 = at;
     }
@@ -102,8 +101,7 @@ const OLD: &str = "1111111111111111";
 const NEW: &str = "2222222222222222";
 const FRESH: &str = "3333333333333333";
 
-/// `.rustc_info.json` as cargo keeps it: `-vV`'s output and the `--print` query's, whose one
-/// absolute line is the sysroot.
+/// `.rustc_info.json` as cargo keeps it.
 fn rustc_info(sysroots: &[&str]) -> Vec<u8> {
     let mut outputs = String::from(
         r#""1":{"success":true,"status":"","code":0,"stdout":"rustc 1.99.0-dev\nbinary: trustc\nrelease: 1.99.0-dev\n","stderr":""}"#,
@@ -122,11 +120,7 @@ fn fingerprint(rustc: u64) -> Vec<u8> {
         .into_bytes()
 }
 
-/// A build directory the store's current compiler (build 15698, current since `moved`)
-/// last built: in `debug`, one unit the old compiler built (`OLD`, unwritten `old_age`) with
-/// its deps, build and examples entries, one the current compiler built since (`NEW`), one
-/// the current compiler built fresh (`FRESH`); a stale incremental crate folder and a
-/// fresh one.
+/// A build directory the store's current compiler last built.
 fn world(moved: SystemTime, old_age: Duration) -> Fake {
     let then = now() - old_age;
     let mut fs = Fake::default();
@@ -171,7 +165,6 @@ fn world(moved: SystemTime, old_age: Duration) -> Fake {
         b"",
     )
     .file(&format!("{PROFILE}/examples/demo-{OLD}"), then, b"x")
-    // Not a unit's: no hash, or a hash no fingerprint carries.
     .file(&format!("{PROFILE}/deps/libaterm_gpu_web.rlib"), then, b"w")
     .file(&format!("{PROFILE}/deps/0b6650033266f1a6.twit"), then, b"t");
     for (folder, at) in [
@@ -317,8 +310,6 @@ fn units_stay_where_the_current_compiler_cannot_be_named() {
         fs.file(&info, now(), &rustc_info(&sysroots));
         assert_eq!(incremental_only(&fs), None, "{sysroots:?}");
     }
-    // Foreign names cannot authorize a read outside the cache, even with the
-    // store/program/numeric-build shape. These are captured paths, never OS probes.
     for foreign in [
         "/Users//me/Documents/store/trust/7",
         "/Volumes/away/store/trust/7",
@@ -372,8 +363,6 @@ fn units_stay_where_the_current_compiler_cannot_be_named() {
     no_link.dir("/store/trust/current", now() - 2 * DAY);
     assert_eq!(incremental_only(&no_link), None);
 
-    // The store moved after the profile's last build: nothing written since names the
-    // current compiler, so neither compiler's unit goes.
     let mut unbuilt = world(now(), 4 * DAY);
     for hash in [NEW, FRESH] {
         let fp = format!("{PROFILE}/.fingerprint/aterm-grid-{hash}");
@@ -463,8 +452,6 @@ fn what_was_written_since_the_survey_is_kept() {
     );
     assert!(doomed.iter().all(|d| !unchanged(&fs, d)));
 
-    // An artifact-only write also keeps the unit on the fresh survey, without
-    // requiring its fingerprint to have changed.
     let mut artifact = world(now() - 2 * DAY, 4 * DAY);
     let before = decide(&surveyed(&artifact), now());
     assert!(before.iter().any(|d| d.part == Part::Unit));
@@ -475,8 +462,6 @@ fn what_was_written_since_the_survey_is_kept() {
             .all(|d| d.part == Part::Incremental)
     );
 
-    // A re-publication of Current after the unlocked survey leaves no unit
-    // naming the compiler since that link; a fresh survey keeps every unit.
     let mut moved = world(now() - 2 * DAY, 4 * DAY);
     assert!(
         decide(&surveyed(&moved), now())

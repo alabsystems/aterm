@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The hinter's internals on aterm's committed faces: the outline loaders'
-//! orientation (TrueType counter-clockwise, CFF clockwise, as FreeType
-//! measures it), the writing systems glyph styles assign, and the
-//! public entry points' refusals. Whole-hinter answers are held to skrifa
-//! by `tests/hint_oracle.rs` (the TF.1 hinting corpus).
+//! Tests for autohinter outline orientation, script styles, and entry-point refusals.
 
 use super::font::HintFont;
 use super::outline::{Orientation, Outline};
@@ -72,10 +68,8 @@ fn glyph_styles_follow_the_scripts() {
     assert_eq!(style_of('ж'), Some("Cyrillic"));
     assert_eq!(style_of('Ω'), Some("Greek"));
     assert_eq!(style_of('ب'), Some("Arabic"));
-    // A combining mark keeps its script and is marked non-base.
     let acute = font.charmap().map('\u{301}').expect("mapped");
     assert!(map.style(acute).is_some_and(|s| s.is_non_base()));
-    // .notdef is in no script's range.
     assert_eq!(
         map.style(GlyphId::new(0))
             .and_then(|s| s.style_class())

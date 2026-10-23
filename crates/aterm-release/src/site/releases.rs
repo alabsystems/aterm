@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release list the site follows, read from GitHub's release JSON into typed
-//! releases, and the downloads the site links, elected from them.
+//! GitHub release list parser and download asset selection for the release site.
 
 use std::fmt;
 
@@ -38,7 +37,7 @@ impl Release {
         version_key(&self.tag)
     }
 
-    /// The tag without its `v`, for a canonical tag; empty otherwise.
+    /// The tag without its `v`, for a canonical tag.
     #[must_use]
     pub fn version(&self) -> &str {
         if self.version_key().is_some() {
@@ -93,14 +92,13 @@ pub fn dmg_name(version: &str) -> String {
     format!("aterm-{version}.dmg")
 }
 
-/// A universal cut's record of RUNNING its x86_64 slice under Rosetta
-/// (`buildplan::x86_64_probe_asset_name`).
+/// A universal cut's record of RUNNING its x86_64 slice under Rosetta.
 #[must_use]
 pub fn intel_probe_name(version: &str) -> String {
     format!("aterm-{version}-x86_64-probe.txt")
 }
 
-/// The legacy Linux archive of `arch`; never inferred from the macOS version.
+/// The legacy Linux archive of `arch`.
 #[must_use]
 pub fn linux_tar_name(version: &str, arch: &str) -> String {
     format!("aterm-{version}-linux-{arch}.tar.gz")
@@ -112,8 +110,7 @@ pub fn linux_raw_name(version: &str, arch: &str) -> String {
     format!("aterm-{version}-linux-{arch}")
 }
 
-/// The size as the Finder shows it: decimal units, GB from a thousand MB
-/// (1067044990 → "1.07 GB", 28219832 → "28 MB"); `None` when unknown.
+/// The size as the Finder shows it: decimal units, GB from a thousand MB.
 #[must_use]
 pub fn size_label(size: Option<u64>) -> Option<String> {
     #[allow(clippy::cast_precision_loss)] // a byte count far below 2^52
@@ -136,8 +133,7 @@ pub fn valid_slug(slug: &str) -> bool {
     matches!(slug.split_once('/'), Some((o, r)) if ok(o) && ok(r))
 }
 
-/// Every release in `text`: one JSON document (a release list, one release, or a list of
-/// pages) or pages written one after another.
+/// Every release in `text`.
 ///
 /// # Errors
 /// Text that is not JSON, or a top-level value that is not an array or an object.
@@ -226,8 +222,7 @@ fn first_str<'v>(r: &'v Value, keys: &[&str]) -> &'v str {
         .unwrap_or("")
 }
 
-/// A byte count, or `None` when the JSON carries none (absent, null, a string, a
-/// bool, a negative).
+/// A byte count, or `None` when the JSON carries none (absent, null, a string, a bool, a negative).
 fn asset_size(v: Option<&Value>) -> Option<u64> {
     match v? {
         Value::Number(n) => n.as_u64().or_else(|| {
@@ -311,7 +306,7 @@ impl MacDownload {
 pub enum LinuxKind {
     /// A raw executable whose name, digest and size a signed appcast binds.
     SignedRaw { sha256: String, size: u64 },
-    /// A tarball with a `.sha256` sidecar: a transport checksum, no signature.
+    /// A tarball with a `.sha256` sidecar.
     LegacyTar,
 }
 
@@ -330,9 +325,7 @@ pub struct LinuxDownload {
 pub struct Facts {
     pub slug: String,
     pub mac: MacDownload,
-    /// The tag of the newest stable release with a current appcast: the policy
-    /// every Linux download is proved under, and the release an unpinned
-    /// `install.sh` takes (the cutter points `releases/latest` at it).
+    /// The tag of the newest stable release with a current appcast.
     pub head: String,
     /// The chosen release's x86_64 run record, when it carries one.
     pub intel_proof: Option<String>,
@@ -354,7 +347,7 @@ impl Facts {
 pub enum Note {
     /// A release whose versioned DMG is there but whose app inventory is not complete.
     IncompleteApp { tag: String },
-    /// A release with no versioned DMG: a source release.
+    /// A release with no versioned DMG.
     NoDmg { tag: String, name: String },
     /// The chosen release carries no x86_64 run record.
     NoIntelProof { tag: String, name: String },
@@ -437,10 +430,7 @@ impl fmt::Display for Refused {
     }
 }
 
-/// Whether `r` is a complete app release: its DMG, its ZIP, its appcast and the
-/// appcast's signature. Inventory, not verification: the release-shape and signature
-/// gates stay the authority; this keeps source cuts and half-uploaded apps off the
-/// buttons.
+/// Whether `r` is a complete app release.
 fn complete_mac_app(r: &Release) -> bool {
     let v = r.version();
     [
@@ -453,11 +443,10 @@ fn complete_mac_app(r: &Release) -> bool {
     .all(|n| r.named(n).is_some())
 }
 
-/// The macOS download: the versioned DMG of the newest stable `vX.Y.0` release that
-/// carries a complete app (never GitHub's `latest`, which is the newest CREATED).
+/// The macOS download.
 ///
 /// # Errors
-/// No stable release, or none that carries a complete app.
+/// An invalid slug, no stable release, or none that carries a complete app.
 pub fn elect_mac<'r>(
     releases: &'r [Release],
     slug: &str,
@@ -498,8 +487,8 @@ pub fn elect_mac<'r>(
     Err(Refused::NothingInstallable)
 }
 
-/// The appcast a release's Linux executable is proved by: its current one, or an
-/// exact, unique, tag-bound archived pair.
+/// The appcast a release's Linux executable is proved by: its current one, or a unique
+/// tag-bound archived pair.
 #[must_use]
 pub fn linux_appcast_name(r: &Release) -> Option<String> {
     if r.lists("aterm-appcast.toml") {
@@ -511,8 +500,7 @@ pub fn linux_appcast_name(r: &Release) -> Option<String> {
 
 /// Proves a raw Linux executable through the signed chain (see [`super::linux`]).
 pub trait LinuxProver {
-    /// The signed download `release` carries for `arch`, under `authority`'s current
-    /// policy.
+    /// The signed download `release` carries for `arch`, under `authority`'s current policy.
     ///
     /// # Errors
     /// Whatever the chain refuses.
@@ -524,10 +512,7 @@ pub trait LinuxProver {
     ) -> Result<LinuxDownload, String>;
 }
 
-/// Every download the pages name: the macOS DMG ([`elect_mac`]), the Intel proof, and
-/// each Linux architecture's — a raw executable proved through the signed chain, or a
-/// labelled legacy tarball and checksum — elected from the whole catalog, each
-/// independently. Platforms may trail one another.
+/// Every download the pages name: the macOS DMG, the Intel proof, and each Linux architecture's.
 ///
 /// # Errors
 /// As [`elect_mac`], and a raw Linux executable whose proof the chain refuses.
@@ -552,8 +537,6 @@ pub fn elect(
         .into_iter()
         .filter(|r| r.version_key().is_some_and(|k| k.2 == 0))
         .collect();
-    // Native policy comes from the newest CURRENT appcast; an archived appcast is never
-    // a policy head. The chosen release carries one, so there always is one.
     let authority = stable
         .iter()
         .copied()
@@ -677,7 +660,6 @@ mod tests {
 
     #[test]
     fn the_newest_version_wins_not_githubs_latest_and_the_url_is_versioned() {
-        // GitHub's "latest" is the newest CREATED: here v0.63.0, listed first.
         let releases = vec![
             app("0.63.0", Some(1_067_044_990)),
             app("0.64.0", Some(31_457_280)),
@@ -815,7 +797,6 @@ mod tests {
 
     #[test]
     fn linux_follows_the_newest_release_that_carries_its_tarball() {
-        // right after a cut, the Linux lane has not attached v0.64.0's yet
         let mut old = app("0.63.0", Some(1));
         old.assets
             .push(asset("aterm-0.63.0-linux-x86_64.tar.gz", Some(15_887_638)));
@@ -824,7 +805,6 @@ mod tests {
         let releases = vec![app("0.64.0", Some(1)), old];
         let mut notes = Vec::new();
         let facts = elect(&releases, SLUG, &mut NoProver, &mut notes).unwrap();
-        // the policy head an unpinned installer takes: the newest current appcast
         assert_eq!(facts.head, "v0.64.0");
         let x86 = facts.linux("x86_64").unwrap();
         assert_eq!(
@@ -843,7 +823,6 @@ mod tests {
             newest: "v0.63.0".into()
         }));
         assert!(notes.contains(&Note::NoLinux { arch: "aarch64" }));
-        // a tarball without its checksum is no download
         let mut bare = app("0.64.0", Some(1));
         bare.assets
             .push(asset("aterm-0.64.0-linux-x86_64.tar.gz", Some(1)));
@@ -880,7 +859,6 @@ mod tests {
                  aterm-0.64.0-x86_64-probe.txt"
             )
         );
-        // another version's record proves nothing about this one
         let mut r = app("0.64.0", Some(1));
         r.assets
             .push(asset("aterm-0.63.0-x86_64-probe.txt", Some(900)));

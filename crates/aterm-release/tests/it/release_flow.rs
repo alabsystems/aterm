@@ -1391,7 +1391,8 @@ fn a_judge_that_cannot_answer_stops_at_minute_one() {
     assert_eq!(w.count("verify"), 0, "{:?}", w.calls);
 }
 
-/// The ledger row is written before sign-release.
+/// The ledger row is written before sign-release. A nonzero publish refuses once,
+/// and its row must not let a re-run claim or ship before that missing work is done.
 #[test]
 fn a_publish_that_recorded_source_but_failed_signing_cannot_be_skipped_into_a_cut() {
     let mut w = World::new();
@@ -1452,7 +1453,10 @@ fn a_fresh_cut_whose_publish_is_skipped_is_audited_and_waits_before_its_claim() 
     assert!(sleep < gates && gates < cut, "{:?}", w.calls);
 }
 
-/// THE RE-CHECK RIGHT BEFORE WHAT GOES PUBLIC.
+/// THE RE-CHECK RIGHT BEFORE WHAT GOES PUBLIC. The publish audits the provisioning
+/// first, and may wait there for the owner — hours; so what the cut would refuse is
+/// asked again after that wait, right before `pub publish` — and what changed during the
+/// wait (a rostered peer cut v0.6.0, the disk filled) refuses there, nothing public.
 #[test]
 fn what_changes_while_the_publish_waits_is_asked_again_right_before_it() {
     type Change = fn(&mut World);
@@ -1555,7 +1559,11 @@ echo armed > "$d/child.armed"
 wait
 "#;
 
-/// A REAL INTERRUPT, END TO END.
+/// A REAL INTERRUPT, END TO END. The release (a process of its own: this test binary
+/// re-run as the probe) runs its verify step's child through the real spawn path; a
+/// SIGTERM sent to the RELEASE alone reaches every member of the step's group (the
+/// child and the subshell it left running), the release waits for the step to end, and
+/// its last line is `INTERRUPTED …`, exit 130.
 #[cfg(unix)]
 #[test]
 fn a_real_sigterm_reaches_the_steps_group_and_ends_interrupted() {
@@ -2018,7 +2026,11 @@ fn a_prepare_stops_before_the_publish_and_the_bare_run_reasks_then_releases() {
     assert!(at("stage") < at("publish"), "{:?}", w.calls);
 }
 
-/// Only a claimed cut is past its prepare.
+/// Only a claimed cut is past its prepare. A visible half that published and then stopped
+/// short of the claim (a peer claimed past the reservation) leaves the source public and its
+/// PREPARED record stale: the next bare run refuses before anything heavy, keeping the record;
+/// `--prepare` reserves anew, builds, verifies and records PREPARED again over the published
+/// source; and the bare run after it releases that build.
 #[test]
 fn a_prepare_overtaken_after_its_publish_is_prepared_again_then_released() {
     let mut w = World::new();

@@ -71,7 +71,7 @@ enum Item {
 }
 
 impl Item {
-    fn is_prompt(&self) -> bool {
+    const fn is_prompt(&self) -> bool {
         matches!(self, Item::Prompt(_))
     }
 
@@ -319,7 +319,7 @@ pub enum DoneBy {
 impl DoneBy {
     /// The rule's word, as a tape keeps it.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             DoneBy::Check => "check",
             DoneBy::Turn => "turn",
@@ -475,7 +475,7 @@ enum Mark {
 impl Mark {
     /// Whether this row, read after a turn's own row, ENDS that turn —
     /// `said`: an assistant row of the turn came before it.
-    fn ends_turn(&self, said: bool) -> bool {
+    const fn ends_turn(&self, said: bool) -> bool {
         match self {
             Mark::End => true,
             Mark::Opens { prompt: true, .. } => true,
@@ -1280,7 +1280,7 @@ pub struct Reread {
 impl Reread {
     /// The result's size: what the record's `result_bytes=` says.
     #[must_use]
-    pub fn bytes(&self) -> u64 {
+    pub const fn bytes(&self) -> u64 {
         self.report.text.len() as u64
     }
 

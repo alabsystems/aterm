@@ -188,7 +188,7 @@ impl RouteRequest {
     /// The same request with `anonymous`.
     #[inline]
     #[must_use]
-    pub fn with_anonymous(mut self, anonymous: bool) -> RouteRequest {
+    pub const fn with_anonymous(mut self, anonymous: bool) -> RouteRequest {
         self.anonymous = anonymous;
         self
     }
@@ -610,7 +610,7 @@ impl Router {
         self.validated.as_ref()?.targets.get(name)
     }
 
-    /// THE decision , with its two decide-time tier walls.
+    /// THE decision, with its two decide-time tier walls.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -891,7 +891,7 @@ impl Router {
 }
 
 /// A refusal with its code, texts and judged steps.
-fn refuse(
+const fn refuse(
     code: RefusalCode,
     why: String,
     next: String,
@@ -932,7 +932,7 @@ fn tier_mismatch(profile: &str, ptier: Tier, owner: &str, tier: Tier) -> Decisio
 /// The model's view of a decision, `(phase, used)`: Send at release tier → (1, 2).
 #[cfg(any(test, debug_assertions))]
 #[must_use]
-pub fn project_decision(decision: &Decision) -> (i64, i64) {
+pub const fn project_decision(decision: &Decision) -> (i64, i64) {
     match decision {
         Decision::Send {
             tier: Tier::Release,

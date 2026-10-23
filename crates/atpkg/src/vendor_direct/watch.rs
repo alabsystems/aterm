@@ -51,7 +51,8 @@ const DURABLE_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// The wall clock outrunning the monotonic clock by more than this over one slice is a wake.
 pub const WAKE_GAP: Duration = Duration::from_secs(30);
 
-/// One small, store-scoped file per vendor, also serving as its flock inode.
+/// One small, store-scoped file per vendor, also serving as its flock inode. The file is
+/// only a wake hint: neither its version nor its validator can authorize an install.
 #[derive(Debug, Serialize, Deserialize)]
 struct SharedState {
     schema: u32,
@@ -132,7 +133,8 @@ fn unix_seconds(time: SystemTime) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// A child result waiting for the watch file's lock.
+/// A child result waiting for the watch file's lock. The offer identity prevents a
+/// delayed result from clearing a newer offer of the same vendor version.
 #[derive(Clone, Copy, Debug)]
 struct DeferredResult {
     version: Version,
@@ -243,7 +245,8 @@ impl Watched {
     }
 }
 
-/// One bounded, owned vendor check.
+/// One bounded, owned vendor check. Its result remains joinable until the package
+/// worker harvests it; a completed check is not mistaken for an absent one.
 #[derive(Debug)]
 struct PendingHead {
     handle: JoinHandle<CompletedHead>,
@@ -300,7 +303,8 @@ pub struct HeadWatch {
     pending: Vec<Option<PendingHead>>,
     completed_tx: mpsc::Sender<usize>,
     completed_rx: mpsc::Receiver<usize>,
-    /// The current park owner, if any.
+    /// The current park owner, if any. A watch may move between threads before
+    /// its owned GET finishes, so workers look up the parker at completion.
     parker: Arc<Mutex<Option<thread::Thread>>>,
     ready_notices: Vec<usize>,
     /// A completed hint whose park was preempted by a bump, full-pass deadline,
@@ -377,7 +381,10 @@ impl HeadWatch {
         watch
     }
 
-    /// Whether this watch's host may start a round now.
+    /// Whether this watch's host may start a round now. Refused, every head due is asked
+    /// again when the rendezvous says to — a slice for a window behind a session's round,
+    /// a minute for a session behind a window or another session — so a caller whose
+    /// park runs no wait while [`Self::due`] never spins on a refusal.
     fn admitted(&mut self, layout: &Layout, now: SystemTime) -> bool {
         let Some(kind) = self.host else {
             return true;
@@ -415,7 +422,9 @@ impl HeadWatch {
             .is_some_and(host::HostClaim::seated_session)
     }
 
-    /// This session holds the seat but a window has the rendezvous.
+    /// This session holds the seat but a window has the rendezvous. Its next
+    /// update look should retry after a park slice, not the minute a second
+    /// session waits for the seat.
     fn session_behind_window(&self) -> bool {
         self.claim
             .as_ref()
@@ -427,7 +436,10 @@ impl HeadWatch {
         self.claim.as_ref().map_or(0, host::HostClaim::admit_calls)
     }
 
-    /// Re-admit a session for a held toolchain move or published-index look.
+    /// Re-admit a session for a held toolchain move or published-index look. A
+    /// window may have arrived since the last vendor round or while an index
+    /// HEAD was in flight; the session must hold the exclusive rendezvous for
+    /// the update decision.
     fn begin_session_update_look(&mut self, layout: &Layout, now: SystemTime) -> bool {
         self.host == Some(Host::Session)
             && layout.prefix.is_dir()
@@ -435,7 +447,8 @@ impl HeadWatch {
             && self.seated_session()
     }
 
-    /// Release the update look's rendezvous after its launch decision.
+    /// Release the update look's rendezvous after its launch decision. A vendor
+    /// round still in flight retains its claim until its workers are harvested.
     fn end_session_update_look(&mut self) {
         if self.host == Some(Host::Session)
             && !self.has_pending()
@@ -1308,7 +1321,8 @@ mod tests {
         Unserved,
     }
 
-    /// The vendors, as the watch's GET sees them.
+    /// The vendors, as the watch's GET sees them. A body served with an ETag answers a
+    /// matching `If-None-Match` with a 304.
     #[derive(Default)]
     struct Vendors {
         heads: RefCell<BTreeMap<&'static str, Answer>>,
@@ -1790,7 +1804,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Separate window processes get distinct HeadWatch values but the same store.
+    /// Separate window processes get distinct HeadWatch values but the same store. Only
+    /// one makes each minute's request, and a newly launched one inherits its validator.
     #[test]
     fn independent_watches_share_one_request_and_validator_per_store() {
         let l = layout("shared");
@@ -1844,7 +1859,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A child can finish while another window holds the short watch lock.
+    /// A child can finish while another window holds the short watch lock. Its
+    /// result must be written before the next check's not-due early return.
     #[test]
     fn a_result_deferred_by_the_shared_lock_is_reconciled_before_early_return() {
         let l = layout("busy-result");
@@ -1966,7 +1982,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A pass that did not reach the offered head gets one five-minute retry.
+    /// A pass that did not reach the offered head gets one five-minute retry. A
+    /// persistently refused version then waits an hour, even across process changes.
     #[test]
     fn failed_targeted_pass_gets_one_short_retry_then_hourly_offers() {
         let l = layout("failed-pass-retry");
@@ -1995,7 +2012,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Writing the offer precedes spawning the child.
+    /// Writing the offer precedes spawning the child. If that window exits in between,
+    /// another window gets a bounded five-minute recovery instead of a one-hour silence.
     #[test]
     fn an_unacknowledged_offer_recovers_after_five_minutes() {
         let l = layout("unacknowledged-offer");

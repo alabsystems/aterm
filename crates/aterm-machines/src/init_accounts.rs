@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Durable Messages and FaceTime sign-out for local initialization.
-//!
-//! An offline or disabled account is still signed in. The primary read therefore checks
-//! identityservicesd's persisted `Accounts`, including disabled accounts, and corroborates
-//! it with the service's active/online preferences. It never changes those stores itself.
-//! Apple's own Sign Out controls perform the change; the engine reads the stores again.
-//! No account identifiers, tokens, or plist payloads belong in reports or diagnostics.
 
 use crate::items::{Ctx, Item};
 use crate::model::{PValue, Probe, User};
@@ -45,8 +39,6 @@ impl Service {
         }
     }
 
-    // The shipped /System/Library/IdentityServices/ServiceDefinitions plists declare
-    // these Identifier values (their filenames use the legacy iMessage/FaceTime names).
     const fn identifier(self) -> &'static str {
         match self {
             Self::Messages => "com.apple.madrid",
@@ -76,7 +68,7 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     selected_items(ctx, Selection::all())
 }
 
-/// Build only the selected account operations; unchecked accounts are never probed.
+/// Build only the selected account operations.
 ///
 /// # Errors
 /// A selected user has no absolute home directory.
@@ -140,8 +132,6 @@ impl Item for SignOut {
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let deadline = Instant::now() + Duration::from_secs(60);
-        // This does not prompt for or change Accessibility permission. In particular,
-        // already-signed-out users never launch either app or reach this preflight.
         if !accessibility_ready_for(sys, Some(&self.user), Some(deadline))? {
             *self.blocked.lock().unwrap_or_else(PoisonError::into_inner) = Some("macOS Accessibility permission for aterm is unavailable; account setup will retry automatically".into());
             return Ok(());
@@ -159,16 +149,11 @@ impl Item for SignOut {
             return Ok(());
         }
         if !ran.success() || ran.out().trim() != "sign-out-requested" {
-            // An AppleEvent refusal can contain personal UI text: never forward it.
             return Err(format!(
                 "{} account Settings controls were unavailable; sign-out remains unverified",
                 self.service.name()
             ));
         }
-        // Deregistration and cfprefsd updates can follow the UI acknowledgment. The
-        // UI work, registration reads and sleeps share one minute. Each child
-        // receives only the remaining budget, so a stalled read cannot restart
-        // the clock. Only durable deregistration ends the wait successfully.
         for attempt in 0..60 {
             if !registered_until(sys, &self.user, self.service, Some(deadline))? {
                 return Ok(());
@@ -248,8 +233,6 @@ fn registered_until(
             persisted_registration(&entries, service)?
         }
     };
-    // Check cfprefsd's live account lists as well as the durable account store. Neither
-    // an empty exported domain nor an offline connection alone establishes sign-out.
     let cmd = limited(
         Cmd::new("/usr/bin/defaults")
             .args(["export", service.domain(), "-"])
@@ -324,7 +307,6 @@ const AX_PREFLIGHT: &str = "ObjC.import('ApplicationServices'); $.AXIsProcessTru
 const AX_REQUEST: &str = "ObjC.import('Foundation'); ObjC.import('ApplicationServices'); $.AXIsProcessTrustedWithOptions($.NSDictionary.dictionaryWithObjectForKey($.NSNumber.numberWithBool(true), $.kAXTrustedCheckOptionPrompt))";
 
 /// Whether the shared account plan found a registration that needs sign-out.
-/// Already-signed-out logins and unreadable account stores never request consent.
 ///
 /// # Errors
 /// The console account or the shared plan cannot be resolved.
@@ -352,8 +334,6 @@ pub fn accessibility_needed_selected(
 }
 
 /// Ask macOS to show its native Accessibility consent once for automatic setup.
-/// The caller persists that request before invoking this function. Apple's prompt
-/// is asynchronous: a false return means permission has not yet been granted.
 ///
 /// # Errors
 /// The bounded trust request could not run or returned an unknown result.
@@ -371,7 +351,6 @@ pub fn request_accessibility(sys: &dyn System) -> Result<bool, String> {
 }
 
 /// Inspect Accessibility trust without requesting permission or opening an app.
-/// First-run setup uses this to retry promptly after the owner grants consent.
 ///
 /// # Errors
 /// The OS trust query could not run or returned an unknown result.
@@ -476,8 +455,6 @@ fn localized_labels(
     })
 }
 
-// Read only trusted bundle localization tables. Collecting every translation
-// also covers per-app language overrides; no account UI or identifiers are read.
 const LOCALIZED_LABELS: &str = r#"ObjC.import('Foundation');
 function labels(path, key) {
     const table = $.NSDictionary.dictionaryWithContentsOfFile(path);
@@ -514,10 +491,6 @@ fn signout_cmd(user: &User, service: Service, labels: &Labels) -> Cmd {
         .in_session()
 }
 
-// UI automation is confined to the account Settings window and its confirmation sheet.
-// Never use Messages' `logout`: it disconnects accounts without removing registration.
-// Apple documents these controls at support.apple.com/guide/messages/ichte16154fb/mac
-// and support.apple.com/guide/facetime/fctme7243ba3/mac.
 const SIGN_OUT: &str = r#"property stopAt : missing value
 on run argv
     set appName to item 1 of argv
@@ -553,9 +526,25 @@ on run argv
         if settingsReady is false then error "account Settings menu unavailable"
         set priorSettings to my accountSettings(appName, paneNames)
         set closeSettings to priorSettings is missing value
-        tell application "System Events"
-            tell process appName to keystroke "," using command down
-        end tell
+        if priorSettings is missing value then
+            tell application "System Events"
+                tell process appName
+                    set openedByMenu to false
+                    try
+                        repeat with mi in menu items of menu 1 of menu bar item 2 of menu bar 1
+                            try
+                                if (value of attribute "AXMenuItemCmdChar" of mi) is "," then
+                                    click mi
+                                    set openedByMenu to true
+                                    exit repeat
+                                end if
+                            end try
+                        end repeat
+                    end try
+                    if openedByMenu is false then keystroke "," using command down
+                end tell
+            end tell
+        end if
         repeat 120 times
             my checkDeadline(deadline)
             set settingsWindow to my accountSettings(appName, paneNames)
@@ -653,11 +642,24 @@ end namedButton
 
 on existingButton(containerElement, buttonNames)
     tell application "System Events"
-        repeat with elementRef in entire contents of containerElement
+        set childrenList to {}
+        try
+            set childrenList to UI elements of containerElement
+        end try
+        repeat with elementRef in childrenList
             my checkDeadline(my stopAt)
-            if role of elementRef is in {"AXButton", "AXRadioButton"} then
-                if name of elementRef is in buttonNames then return elementRef
-            end if
+            try
+                if role of elementRef is in {"AXButton", "AXRadioButton"} then
+                    try
+                        if (name of elementRef as string) is in buttonNames then return elementRef
+                    end try
+                    try
+                        if (description of elementRef as string) is in buttonNames then return elementRef
+                    end try
+                end if
+            end try
+            set nestedRef to my existingButton(elementRef, buttonNames)
+            if nestedRef is not missing value then return nestedRef
         end repeat
     end tell
     return missing value
@@ -830,8 +832,6 @@ mod tests {
             let (sys, ctx, item) = fixture();
             store(&sys, &item, DISABLED);
             if removed {
-                // The first post-click read still holds the account; a later durable
-                // update, rather than the UI process's exit, completes the apply.
                 store(&sys, &item, DISABLED);
                 store(&sys, &item, "<dict/>");
             }
@@ -871,5 +871,16 @@ mod tests {
             );
             assert!(sys.calls().iter().all(|c| !c.contains("private-token")));
         }
+    }
+
+    #[test]
+    fn sign_out_applescript_walks_ui_elements_and_matches_catalyst_descriptions() {
+        assert!(
+            !SIGN_OUT.contains("entire contents"),
+            "macOS 27 Tahoe System Events returns 0 elements for `entire contents` on Messages/FaceTime windows"
+        );
+        assert!(SIGN_OUT.contains("UI elements of containerElement"));
+        assert!(SIGN_OUT.contains("description of elementRef as string"));
+        assert!(SIGN_OUT.contains("AXMenuItemCmdChar"));
     }
 }

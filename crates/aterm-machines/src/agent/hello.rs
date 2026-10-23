@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `agent hello`: everything the controller needs before it signs anything, read as the
-//! admin (no root): the host's identity and OS, the serial floors, the cached artifacts,
-//! and whether a run is busy (design §4.4 step 1).
+//! `agent hello`: host identity, OS facts, serial floors, cached artifacts, and run state.
 
 use super::{FAMILIES, Layout, state};
 use crate::port::System;
@@ -23,8 +21,6 @@ pub fn hello(sys: &dyn System, layout: &Layout) -> Hello {
     Hello {
         schema: crate::SCHEMA,
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
-        // The agent runs as bin/aterm, a link the port's hash (O_NOFOLLOW) will not open:
-        // hash the file it names.
         agent_sha256: std::env::current_exe()
             .and_then(std::fs::canonicalize)
             .ok()
@@ -101,7 +97,6 @@ mod tests {
         assert_eq!(h.busy.as_deref(), Some("1800000000-41"));
         assert_eq!(h.last_run.as_deref(), Some("1799999000-40"));
         assert!(h.families.iter().any(|f| f == "keyboard"));
-        // No hardware fact answered: no description, never a partial one.
         assert!(h.hardware.is_empty());
         let mut out = Vec::new();
         assert_eq!(print(&fake, &layout, &mut out), ExitCode::SUCCESS);
@@ -112,7 +107,6 @@ mod tests {
 
     #[test]
     fn hello_describes_the_mac_as_names_fills_hardware() {
-        // The VM's own answers (27.0, VirtualMac2,1).
         let fake = Fake::root();
         fake.on("/usr/sbin/sysctl -n hw.model", Ran::ok("VirtualMac2,1\n"))
             .on(

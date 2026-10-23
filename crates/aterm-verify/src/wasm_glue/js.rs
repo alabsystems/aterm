@@ -63,7 +63,7 @@ struct Needs {
 }
 
 /// An element type's helper suffix, typed array and byte size.
-fn elem(ty: &Ty) -> (&'static str, &'static str, usize) {
+const fn elem(ty: &Ty) -> (&'static str, &'static str, usize) {
     match ty {
         Ty::U8 => ("U8", "Uint8Array", 1),
         Ty::I8 => ("I8", "Int8Array", 1),

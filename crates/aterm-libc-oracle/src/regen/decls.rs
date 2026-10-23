@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One cell's DECLARATIONS as data: every name of its declaration set
-//! ([`crate::closure`]) read out of the reference libc's rustdoc for that
-//! triple — constant values, function signatures and link names, field names
-//! and types, enum discriminants. Nothing here is transcribed by hand.
-//!
-//! The shim is emitted from this ([`super::shim`]), and the oracle's coverage
-//! audit reads it back as what the shim declares ([`super::oracle`]).
+//! Extracts a cell's declaration set ([`crate::closure`]) from the reference `libc` rustdoc JSON.
 
 use std::collections::BTreeSet;
 
@@ -169,12 +163,10 @@ pub fn repr_of(item: &Value) -> Option<Repr> {
     })
 }
 
-/// The explicit `Clone`/`Copy`/`Debug`/`PartialEq`/`Eq`/`Hash` impls on a type,
-/// in [`DERIVABLE_TRAITS`] order. Synthetic and blanket impls are nobody's
-/// declaration; a negative or generic one cannot be derived and is refused.
+/// Returns explicit derivable trait impls on `inner` in [`DERIVABLE_TRAITS`] order.
 ///
 /// # Errors
-/// On an impl the shim cannot reproduce with a derive.
+/// On a negative or generic impl the shim cannot reproduce with `#[derive]`.
 pub fn derivable_traits(name: &str, inner: &Value, doc: &Doc) -> Result<Vec<&'static str>, String> {
     let mut found = BTreeSet::new();
     for (imp, tr) in doc.declared_trait_impls(inner) {
@@ -237,7 +229,6 @@ fn record(
                     .unwrap_or(&no_fields),
                 plain.get("has_stripped_fields").and_then(Value::as_bool) == Some(true),
             ),
-            // A tuple or unit struct: nothing public to place.
             None => (&no_fields, true),
         }
     } else {
@@ -314,11 +305,10 @@ fn variants(doc: &Doc, inner: &Value, owner: &str) -> Result<Vec<Variant>, Strin
     .collect()
 }
 
-/// The cell's declarations: its `union.json` names plus their closure.
+/// Reads the cell's `union.json` declarations and their closure from `doc`.
 ///
 /// # Errors
-/// When a reached item is of a kind the shim cannot declare, or rustdoc lacks
-/// a fact the declaration needs.
+/// When a reached item cannot be declared by the shim or lacks required rustdoc metadata.
 pub fn read(doc: &Doc, public: &Public<'_>, union: &[String]) -> Result<Decls, String> {
     let names = closure(doc, public, union).map_err(|e| e.0)?;
     let listed: BTreeSet<&str> = union.iter().map(String::as_str).collect();

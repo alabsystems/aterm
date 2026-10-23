@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Persistent balanced UTF-8 text storage for native documents.
-//!
-//! Leaves are bounded UTF-8 chunks; branches cache byte/newline counts and AVL height.
-//! Cloning a snapshot is O(1), byte split/replace is logarithmic in the number of chunks,
-//! the line count is cached, and untouched subtrees are structurally shared. `DocumentStore`
-//! lowers the resulting text through its authoritative `aterm_buffer::Surface` commit.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -209,8 +204,6 @@ trust_contract_fn! {
     }
 }
 
-// Specs `taller-child-covers-both` and `taller-child-is-a-child` (SPECS.md),
-// kernel-checked against the compiled body: one case split on its comparison.
 verify_island! {
     clean {
         theorem taller_child_covers_both (left right : UInt8) :
@@ -414,7 +407,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `utf8-char-start` (SPECS.md), kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem utf8_char_start_skips_continuations (byte : UInt8) :

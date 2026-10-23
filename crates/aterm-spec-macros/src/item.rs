@@ -1,11 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The item an attribute macro sits on, read only as far as the anchors need:
-//! the name of its `fn`, whether it is a fn with a body, and that body.
-//!
-//! The item is passed through as written. Only a probed fn's body group is
-//! rebuilt, so every other token keeps its own span.
+//! The item an attribute macro sits on, read only as far as the anchors need.
 
 use aterm_macro_support::{Cursor, is_keyword, is_punct};
 use proc_macro::{Delimiter, Group, Ident, Span, TokenStream, TokenTree};
@@ -42,9 +38,7 @@ impl FnItem {
         })
     }
 
-    /// `Some(is_const)` when the item is a fn with a body: outer attributes,
-    /// a visibility, qualifiers, `fn <name>`, and a `{ ... }` block last.
-    /// `None` for anything else (a bodyless trait method, an `impl` block).
+    /// `Some(is_const)` when the item is a fn with a body.
     pub(crate) fn fn_with_body(&self) -> Option<bool> {
         let flat = self.flat();
         let mut i = 0;
@@ -90,11 +84,7 @@ impl FnItem {
         (named_fn && body_last).then_some(constness)
     }
 
-    /// The item with `probe` as the first statement of its body, after the
-    /// body's inner attributes.
-    ///
-    /// `None` when there is no body to put it in, or the fn is `const` (a const
-    /// body may not call a non-const fn).
+    /// The item with `probe` as the first statement of its body, after the body's inner attributes.
     pub(crate) fn with_probe(&self, probe: &TokenStream) -> Option<TokenStream> {
         if self.fn_with_body()? {
             return None;

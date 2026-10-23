@@ -287,7 +287,8 @@ fn read_toml(path: &Path, what: &str, max: usize) -> crate::Result<Option<aterm_
     }
 }
 
-/// Serialises state writers and coherent readiness observations.
+/// Serialises state writers and coherent readiness observations. An advisory
+/// lock released by `LOCK_UN` on drop (clippy.toml: the flock release rule).
 struct StateLock(std::fs::File);
 
 impl StateLock {
@@ -477,7 +478,8 @@ pub fn machine_identity(paths: &Paths) -> crate::Result<Identity> {
     install_identity(paths, Identity::generate()?)
 }
 
-/// Publish a generated key only into an empty name.
+/// Publish a generated key only into an empty name. A concurrent creator's admitted key
+/// wins: every caller must return the key that remains on disk, never its losing one.
 fn install_identity(paths: &Paths, identity: Identity) -> crate::Result<Identity> {
     let secret = identity.to_bech32();
     let mut file = format!(
@@ -928,7 +930,8 @@ fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Optio
     Ok(Some(everyone.into_values().collect()))
 }
 
-/// A plain file's entries for this host.
+/// A plain file's entries for this host. The file must be this user's with no group or other
+/// bits: it holds the secrets in the clear.
 fn plain_entries(config: &Config, path: &Path) -> crate::Result<Vec<Entry>> {
     let bytes = fsx::read_private(path, text::MAX_TEXT)?
         .ok_or_else(|| Error::new(format!("{}: no such file", path.display())))?;
@@ -1429,7 +1432,9 @@ fn retry_after(backoff: Duration, moved: bool) -> Duration {
     }
 }
 
-/// How long the subscriber waits after a pass that ended in `outcome` from `source`.
+/// How long the subscriber waits after a pass that ended in `outcome` from `source`. A source
+/// that answers a long-poll at once with nothing new (one that does not hold, or a stale
+/// copy) is asked again only after a pause.
 fn pause_after(source: &Source, outcome: &SyncOutcome, failing: &mut Duration) -> Duration {
     let pause = match (source, outcome) {
         (Source::Path(_), _) => Duration::from_secs(60),
@@ -1526,7 +1531,8 @@ fn repair_due(paths: &Paths, repaired: &mut Option<([u8; 32], u64)>) -> bool {
     due
 }
 
-/// The subscriber's passes.
+/// The subscriber's passes. Returns when this program was replaced on disk (an update), so
+/// launchd or systemd starts the new build: a job keeps the image it started with.
 fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     let mut backoff = Duration::from_secs(5);
     let mut failing = FIRST_RETRY;
@@ -2325,7 +2331,9 @@ fn join_with(
     Ok(JoinOutcome::Pending { code, host })
 }
 
-/// What a join that asked with the join password says as the request is queued.
+/// What a join that asked with the join password says as the request is queued. Nothing tells
+/// a machine its proof was refused (the approver leaves it queued), so the person is told the
+/// way out before any wait, which a Ctrl-C may end: a join again sends a new proof.
 fn mistyped_hint(options: &JoinOptions<'_>, source: &Source, host: &str) -> String {
     let mut again = String::from("aterm secrets join");
     let other = !matches!(source, Source::Url(url) if url == crate::ALAB_DEFAULT_URL);

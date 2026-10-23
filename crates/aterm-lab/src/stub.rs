@@ -217,8 +217,11 @@ pub struct Stub {
     started: f64,
     state: Mutex<State>,
     log_lock: Mutex<()>,
+    /// The 200 answers to `/v1/messages` served so far that carried on200
     /// headers: the `k` of a `@SEQ@` header value.
     served_200: AtomicU32,
+    /// The request bodies dumped so far ([`Stub::dump`]): each dump takes
+    /// its index from here as it is written, so requests in flight together
     /// (a reply's delay and pace hold `record` back) never share one.
     dumped: AtomicU64,
 }
@@ -318,6 +321,7 @@ const BUILTIN: &[&str] = &[
     "bad-key",
 ];
 
+/// The file in `<modes-dir>` that answers Codex's token refresh (`POST
 /// /oauth/token`), never a mode of the APIs.
 const REFRESH_FILE: &str = "refresh.json";
 
@@ -490,6 +494,7 @@ pub fn message_users(body: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// The facts of one `/v1/messages` request every answer logs: its request
 /// line, its body's length, the mode it is answered in, and what it asked.
 #[derive(Clone, Copy)]
 struct Turn<'a> {
@@ -502,7 +507,7 @@ struct Turn<'a> {
 
 impl<'a> Turn<'a> {
     /// The same request, answered in `mode` (the mode a used-up custom mode or a lifted limit falls back to).
-    fn in_mode<'b>(self, mode: &'b str) -> Turn<'b>
+    const fn in_mode<'b>(self, mode: &'b str) -> Turn<'b>
     where
         'a: 'b,
     {
@@ -626,6 +631,7 @@ fn is_said(m: &J) -> bool {
         }
 }
 
+/// The text of every tool result in `msgs`, in order: a result's string, or
 /// its text blocks joined by newlines.
 fn tool_results(msgs: &[J]) -> Vec<String> {
     msgs.iter()
@@ -1176,6 +1182,7 @@ fn merged(base: &[(String, String)], extra: &[(String, String)]) -> Vec<(String,
     out
 }
 
+/// A custom mode's `headers` (`{name: value}`, a value that is no string as its
 /// JSON text), on its answer of either API, streamed or not.
 fn spec_headers(spec: &J) -> Vec<(String, String)> {
     match spec.get("headers") {
@@ -1384,7 +1391,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// The reason phrase Python's server writes for a status (empty for one it does not know).
-fn reason(status: u16) -> &'static str {
+const fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
@@ -1475,6 +1482,9 @@ impl Out<'_> {
         self.head(200, &h)
     }
 
+    /// The extra headers a `status` answer carries; a 200 that carries on200
+    /// headers counts toward `@SEQ@`, and no other answer does: a ramp starts
+    /// at its BASE on the first answer that carries it, however many were
     /// served before the file named it.
     fn rate_for(&self, status: u16) -> Vec<(String, String)> {
         let Some(rate) = &self.rate else {
@@ -1618,6 +1628,8 @@ impl Stub {
             })
     }
 
+    /// The custom spec this request gets, or `None` (then it is answered as
+    /// `ok`): a spec with `auth` applies only to a request that carried that
     /// lab credential, and a spec with `times` only to its first N requests.
     fn take_custom(&self, mode: &str, label: Option<&str>) -> Option<J> {
         let spec = self.custom_spec(mode)?;
@@ -1678,6 +1690,10 @@ impl Stub {
         }
     }
 
+    /// The request `body` of `kind` (the log's `kind=`) kept in the dump
+    /// directory: a turn as `req-<index>.json`, a side call ([`is_side`]) as
+    /// `side-<index>.json`, its index the next of [`Stub::dumped`] (one count
+    /// over both, so the two read in the order they came); only the newest
     /// [`DUMPS_KEPT`] stay.
     fn dump(&self, body: &[u8], kind: &str) {
         let Some(dir) = &self.args.dump_dir else {
@@ -2062,6 +2078,8 @@ impl Stub {
         Ok(())
     }
 
+    /// A Responses API turn: Codex's `/v1/responses`, or Muse Code's
+    /// `/responses` main turn (`dialect` says which stream answers it, and
     /// only Muse Code's calls the `tool` mode's script).
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn responses(
@@ -2262,6 +2280,7 @@ impl Stub {
         )
     }
 
+    /// A plain text reply as the Responses API's SSE: the event types
     /// codex-api reads, or Muse Code's own stream ([`Stub::muse_text`]).
     #[allow(clippy::too_many_arguments)]
     fn responses_stream(
@@ -2497,6 +2516,8 @@ impl Stub {
         Ok(())
     }
 
+    /// Codex's workspace discovery under a ChatGPT login (`chatgpt_base_url` is
+    /// the stub under `codex --chatgpt`): the TUI will not start without an
     /// answer. One personal account, the lab token's own.
     fn accounts_check(
         &self,
@@ -2550,6 +2571,8 @@ impl Stub {
         Ok(())
     }
 
+    /// The account usage a ChatGPT login's TUI polls (its `/status` card's
+    /// limits and credits): the windows and credits the `--headers-file` sends
     /// on answers, in the backend's payload, and the plan the lab token names.
     fn wham_usage(
         &self,
@@ -2697,6 +2720,9 @@ impl Stub {
         Ok(())
     }
 
+    /// Codex's token refresh, pointed here by `CODEX_REFRESH_TOKEN_URL_OVERRIDE`.
+    /// The body holds the lab's fake refresh token: never logged or dumped.
+    /// `<modes-dir>/refresh.json` (`{"status", "json"}`) answers it, else a 401
     /// `refresh_token_expired` (what the token authority says of a login that has lapsed).
     fn oauth_token(
         &self,
@@ -2866,6 +2892,7 @@ impl Stub {
         self.stream_tools(t, summary, &[(name.to_string(), input.clone())], out)
     }
 
+    /// Tool uses in ONE assistant message as SSE, one content block each in
     /// order, each input split across two `input_json_delta`s.
     fn stream_tools(
         &self,
@@ -2951,6 +2978,7 @@ impl Stub {
         Ok(())
     }
 
+    /// The `bg` mode: `bgstart` → a background `sleep`; a tool result → a
     /// one-line end_turn; anything else (the wake) → a slow reply.
     fn bg(&self, t: &Turn<'_>, body: &[u8], summary: &str, out: &mut Out<'_>) -> io::Result<()> {
         let j = J::parse_bytes(body).unwrap_or(J::Obj(Vec::new()));
@@ -3207,6 +3235,8 @@ pub fn main(argv: &[String]) -> i32 {
     }
 }
 
+/// The stub's log once it holds every one of `wants`, or as it stands when
+/// `limit` is spent: the stub records a request after its answer is sent
 /// (`Stub::record`), so a reader that got the answer may be ahead of the line.
 #[cfg(test)]
 fn logged_with(log: &Path, wants: &[&str], limit: Duration) -> String {

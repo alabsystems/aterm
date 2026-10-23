@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The recorded differential: every one of the 68 functions against answers
-//! recorded from the retired vendor/libm fork before the switch
-//! (`recorded/libm-0.2.16.tsv` says how).
-//!
-//! * The exactly specified functions ([`EXACT`]) must agree bit for bit.
-//! * A transcendental may stand at most [`ULPS`] from the recorded answer:
-//!   std calls the platform's libm, musl's port is the recording, and both
-//!   are within an ulp of the true value.
-//! * NaN agrees with NaN whatever its payload or sign.
+//! Recorded differential tests for all 68 functions against `recorded/libm-0.2.16.tsv`.
 
 use std::collections::BTreeSet;
 
@@ -77,7 +69,6 @@ fn rows() -> Vec<Row<'static>> {
 /// bits come back widened to `u64`. `None` names no function of the shim.
 fn call(name: &str, a: &[u64]) -> Option<Vec<u64>> {
     let d = |i: usize| f64::from_bits(a[i]);
-    // An f32 row's bits are a 32-bit pattern; the cast drops only zeroes.
     let s = |i: usize| f32::from_bits(a[i] as u32);
     let w = |x: f32| u64::from(x.to_bits());
     macro_rules! table {
@@ -113,7 +104,6 @@ fn call(name: &str, a: &[u64]) -> Option<Vec<u64>> {
 
 /// Whether `got` stands close enough to `want` for function `name`.
 fn agrees(name: &str, want: u64, got: u64) -> bool {
-    // Every f32 name ends in `f` and no f64 name does.
     let f32_row = name.ends_with('f');
     let nan = |b: u64| {
         if f32_row {
@@ -122,8 +112,6 @@ fn agrees(name: &str, want: u64, got: u64) -> bool {
             f64::from_bits(b).is_nan()
         }
     };
-    // The bit pattern on a line where neighbouring floats are neighbouring
-    // integers (and the two zeroes meet), so the distance counts ulps.
     let ordered = |b: u64| {
         let (i, min) = if f32_row {
             (i64::from(b as u32 as i32), i64::from(i32::MIN))
@@ -166,8 +154,6 @@ fn mismatches(recorded: &str, called: &str) -> Vec<String> {
 #[test]
 fn every_function_matches_the_recorded_fork() {
     let names: BTreeSet<&str> = rows().iter().map(|r| r.name).collect();
-    // The control: 68 names, each one the shim answers. A row the parser
-    // dropped or a function the shim lacks cannot pass as an empty loop.
     assert_eq!(names.len(), 68, "recorded functions: {names:?}");
     let mut bad = Vec::new();
     for name in &names {

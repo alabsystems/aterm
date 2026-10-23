@@ -59,7 +59,8 @@ const _: () = assert!(
             <= crate::effect_util::TWINKLE_FLASH_BOUND_HZ,
     "the exit star wink must glint within the photosensitivity flash bound"
 );
-/// The collection hello's guaranteed, bounded hold.
+/// The collection hello's guaranteed, bounded hold. It is independent of cursor
+/// style, so the user always sees the cat they chose.
 const DISCOVERY_HOLD: f32 = 2.8;
 /// Short input reactions never extend the companion's overall flight.
 const CELEBRATE_HOLD: f32 = 0.7;
@@ -123,9 +124,14 @@ const HAPPY_GATE: f32 = 0.80;
 /// `BLINK_PERIOD`, phased off the flight clock (never at the entrance).
 const BLINK_PERIOD: f32 = 1.7;
 const BLINK_DUR: f32 = 0.13;
-/// Hover-bob amplitude (fraction of cell height).
+/// Hover-bob amplitude (fraction of cell height). Every still path
+/// ([`CursorCat::static_frame`], hidden, [`CatPose::STILL`]) pins `bob = 0`,
+/// keeping reduced-motion presentation structurally static.
 const BOB_AMP: f32 = 0.09;
-/// Stride pump: phase advance per committed forward keystroke, in cycles.
+/// Stride pump: phase advance per committed forward keystroke, in cycles. The
+/// momentum metric sits at its 1.0 clamp at every human cadence while the cat
+/// is visible, so cadence drives the step instead: one visible step per key, a
+/// gallop when you type fast.
 const STRIDE_PER_KEY: f32 = 0.5;
 /// Idle drift (cycles/sec) between keystrokes, so a pause eases the cat
 /// through its step instead of freezing it mid-stride.
@@ -135,7 +141,8 @@ const STRIDE_TAU: f32 = 0.05;
 /// The fastest (cycles/s) the drawn stride phase follows the pump, whatever the
 /// display's rate.
 const STRIDE_RATE_MAX: f32 = 5.5;
-/// Body compression on each footfall.
+/// Body compression on each footfall. Small: the step should read as weight, not
+/// as a bounce competing with the sing dance or the landing settle.
 const STRIDE_SQUASH: f32 = 0.05;
 /// Landing squash→stretch settle: a damped bounce of length `LAND_DUR`,
 /// amplitude `LAND_AMP`, `LAND_FREQ` oscillations, decaying at `LAND_DECAY`.
@@ -406,7 +413,8 @@ pub struct CursorCat {
     /// Stride pump phase, in cycles (see [`STRIDE_PER_KEY`]): advanced per
     /// committed forward keystroke, drifting at [`STRIDE_IDLE_HZ`] between.
     stride: f32,
-    /// The last stride advance (the idle-drift `dt` source).
+    /// The last stride advance (the idle-drift `dt` source). `None` re-seeds without
+    /// integrating, so a resumed or foreign clock cannot fling the phase forward.
     stride_at: Option<Instant>,
     /// The stride phase the pose draws (the bob, the footfall squash),
     /// following [`Self::stride`] at [`STRIDE_TAU`], never faster than
@@ -423,7 +431,8 @@ pub struct CursorCat {
     discovery_until: Option<Instant>,
     /// The full collection presentation stays drawable through fade-out.
     collection_hello: bool,
-    /// Start of a paused (unfocused/suppressed) collection hello.
+    /// Start of a paused (unfocused/suppressed) collection hello. The hold counts drawable
+    /// time, so resume shifts every presentation clock by the paused span.
     collection_paused_at: Option<Instant>,
     /// Terminal colour context frozen for this flight/hello: sampled on the first visible
     /// frame and reused, so text churn cannot fragment the atlas cache.
@@ -431,7 +440,8 @@ pub struct CursorCat {
     /// Eased "display momentum" spine (0..1): a lagged follower of the live
     /// score that drives every pose choice, giving the body follow-through.
     disp: f32,
-    /// Last spine advance instant.
+    /// Last spine advance instant. `None` reseeds the spine to its target, so a
+    /// fresh flight starts banked, not from zero.
     disp_at: Option<Instant>,
     /// Start of a landing squash→stretch bounce (Enter stomp, a delete
     /// flinch, or the fade-out touchdown).
@@ -466,7 +476,8 @@ pub struct CursorCat {
     /// The authenticated line-fold episode: CursorGlow classifies and clocks it,
     /// WordDecorations resolves it into pixels.
     fold: Option<CatFold>,
-    /// Resting direction after a reverse fold.
+    /// Resting direction after a reverse fold. An active fold's own direction
+    /// wins in [`Self::placement_frame`].
     facing_left: bool,
     rng: u32,
 }
@@ -950,7 +961,8 @@ impl CursorCat {
         self.reaction
     }
 
-    /// Drift the stride phase to `now` at [`STRIDE_IDLE_HZ`].
+    /// Drift the stride phase to `now` at [`STRIDE_IDLE_HZ`]. `dt` is clamped
+    /// so a backgrounded window resumes with one ordinary frame's worth.
     #[inline]
     fn stride_advance(&mut self, now: Instant) {
         if self.stride_at == Some(now) {

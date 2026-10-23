@@ -117,7 +117,8 @@ impl<'a> Parser<'a> {
         Err(Error::at(self.src, span, message))
     }
 
-    /// A one-character span at the current position.
+    /// A one-character span at the current position. Not `pos + 1`: that can
+    /// split a multi-byte character, and the diagnostic printer panics slicing it.
     fn here<T>(&self, message: impl Into<String>) -> Result<T> {
         self.err(self.pos..self.next_boundary(self.pos), message)
     }
@@ -131,7 +132,9 @@ impl<'a> Parser<'a> {
         end.max(at)
     }
 
-    /// Refuse a tree deeper than the limit.
+    /// Refuse a tree deeper than the limit. The bound is on the tree, not the
+    /// recursion: a long dotted key parses in a loop, but dropping, printing and
+    /// deserializing what it builds all recurse.
     fn check_depth(&self, depth: usize, at: usize) -> Result<()> {
         if depth > self.limits.max_depth {
             return self.err(
@@ -550,7 +553,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// After a bare scalar the next byte has to end it.
+    /// After a bare scalar the next byte has to end it. Without this check
+    /// `truex` would parse as `true` and leave `x` to blow up somewhere less
+    /// informative.
     fn end_of_scalar(&mut self, start: usize) -> Result<()> {
         match self.peek() {
             None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}' | b'#') => Ok(()),
@@ -702,7 +707,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A `"…"` or `"""…"""` string.
+    /// A `"…"` or `"""…"""` string. `multiline_ok` is false for keys, where the
+    /// spec allows only the single-line form.
     fn basic_string(&mut self, multiline_ok: bool) -> Result<String> {
         let start = self.pos;
         if multiline_ok && self.at(1) == Some(b'"') && self.at(2) == Some(b'"') {
@@ -753,7 +759,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The `"""`/`'''` forms.
+    /// The `"""`/`'''` forms. They share every rule except escaping, and both
+    /// allow one or two of their own delimiter immediately before the close —
+    /// `"""a""""` is `a"`.
     fn multiline_string(&mut self, start: usize, quote: u8) -> Result<String> {
         self.pos += 3;
         if self.peek() == Some(b'\r') && self.at(1) == Some(b'\n') {

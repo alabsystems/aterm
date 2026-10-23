@@ -132,7 +132,7 @@ fn the_loop_goes_on_without_its_acks_and_a_waiting_loop_never_does() {
     let tried: u64 = held.iter().map(|out| out.stats.tries_not_yet).sum();
     assert!(tried > 0, "the loop never went on without an answer");
     let seeds: Vec<u64> = held.iter().map(|out| out.seed).collect();
-    let waiting = par_map(&seeds, |&seed| {
+    let waiting = aterm_spec::check::each(&seeds, |&seed| {
         run(&Opts::seed(seed).with(Mutant::WaitForEveryAck))
     });
     let mut failures = Vec::new();
@@ -168,46 +168,12 @@ fn breaks(v: &str, law: &str) -> bool {
     })
 }
 
-const WORKERS: usize = 4;
-
-fn par_map<T: Sync, R: Send>(items: &[T], job: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let answers: Vec<std::sync::Mutex<Option<R>>> =
-        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..WORKERS.min(items.len()))
-            .map(|_| {
-                scope.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(i) else { break };
-                    let answer = job(item);
-                    *super::lock(&answers[i]) = Some(answer);
-                })
-            })
-            .collect();
-        for worker in workers {
-            if let Err(payload) = worker.join() {
-                std::panic::resume_unwind(payload);
-            }
-        }
-    });
-    answers
-        .into_iter()
-        .map(|a| {
-            a.into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .expect("every item ran")
-        })
-        .collect()
-}
-
 fn run_all(
     opts: &(dyn Fn(u64) -> Opts + Sync),
     seeds: std::ops::RangeInclusive<u64>,
 ) -> Vec<Outcome> {
     let seeds: Vec<u64> = seeds.collect();
-    par_map(&seeds, |&seed| run(&opts(seed)))
+    aterm_spec::check::each(&seeds, |&seed| run(&opts(seed)))
 }
 
 fn committed() -> &'static [Outcome] {
@@ -227,7 +193,7 @@ fn first_within(
     use std::sync::atomic::{AtomicU64, Ordering};
     let lowest = AtomicU64::new(u64::MAX);
     let seeds: Vec<u64> = (1..=limit).collect();
-    par_map(&seeds, |&seed| {
+    aterm_spec::check::each(&seeds, |&seed| {
         if seed > lowest.load(Ordering::Relaxed) {
             return None;
         }
@@ -624,7 +590,7 @@ fn each_rule_switched_off_is_caught() {
             "a rare rule names no rule: {rare}"
         );
     }
-    let shown = par_map(&rules, |(rule, opts, law, witness)| {
+    let shown = aterm_spec::check::each(&rules, |(rule, opts, law, witness)| {
         let limit = if RARE.contains(rule) {
             RARE_SEEDS
         } else {
@@ -855,7 +821,7 @@ fn the_seeds_that_broke_a_law_hold_every_law() {
             }))
             .chain(FOUND_QUITTING.iter().copied())
             .collect();
-    let outs = par_map(&found, |&(world, seed, steps, what)| {
+    let outs = aterm_spec::check::each(&found, |&(world, seed, steps, what)| {
         let mut o = world(seed);
         o.steps = steps;
         (run(&o), what)

@@ -227,7 +227,8 @@ pub(crate) fn in_ranges(table: &[(u32, u32)], cp: u32) -> bool {
         .is_ok()
 }
 
-/// Whether `c` has the Unicode `Emoji_Presentation` property, i.e.
+/// Whether `c` has the Unicode `Emoji_Presentation` property, i.e. a bare
+/// occurrence (no following VS16) defaults to emoji presentation.
 #[must_use]
 #[inline]
 pub fn is_emoji_presentation(c: char) -> bool {

@@ -24,7 +24,8 @@ pub const EXCLUDED: [&str; 6] = [
     "crates/aterm-gui/src/config_watcher_protocol_island.rs",
 ];
 
-/// How a formatter names an unformatted file: `Diff in <path>:<line>:`.
+/// How a formatter names an unformatted file: `Diff in <path>:<line>:`. A
+/// non-zero exit without one is a formatter that could not read the files.
 const DIFF_MARKER: &str = "Diff in ";
 
 /// Files per `trustfmt` child: small enough that the pass spreads over every

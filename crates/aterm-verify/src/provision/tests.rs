@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify provision` on a fake host in a scratch HOME: every fetch is a fixture archive
-//! built here, every child a record, never the network, the real tooling cache or a real
-//! build (docs/DESIGN-init-system-2026-10-20.md §10, S7's tests).
+//! `verify provision` on a fake host in a scratch HOME.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -11,8 +9,6 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::*;
-
-// ---- fixtures --------------------------------------------------------------------------
 
 /// One member of a fixture tar.
 enum Member<'a> {
@@ -144,8 +140,6 @@ fn fixture_row(
         install: kind(archives),
     }
 }
-
-// ---- the fake host ---------------------------------------------------------------------
 
 /// rustup holding everything the rustup row asks for: stable with every target and
 /// clippy, the wasm32 pin with its target.
@@ -317,7 +311,6 @@ impl Host for Fake {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
         let program = spawn.program.to_string_lossy();
         match a.as_slice() {
-            // The fixture source is a plain tar already: bsdtar's rewrite copies it.
             ["-c", "-f", out, from] if program == place::TAR => {
                 std::fs::copy(from.trim_start_matches('@'), out).map_err(|e| e.to_string())?;
                 Ok(String::new())
@@ -426,8 +419,6 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
 
-// ---- binaryen: the sha256 is the anchor ------------------------------------------------
-
 const BINARYEN_URL: &str = "https://fixture.invalid/binaryen-version_{v}-arm64-macos.tar.gz";
 
 fn binaryen_archive() -> Vec<u8> {
@@ -519,19 +510,15 @@ fn a_wrong_sha256_refuses_the_row_and_leaves_nothing() {
         (stamp.version.as_str(), stamp.anchor.as_str()),
         ("133", "sha256")
     );
-    // What the resolver reads: the tool row's pinned copy is exactly this file.
     assert_eq!(
         aterm_uds::host::tool("wasm-opt").pinned_in(&m.tooling),
         Some(exe.clone())
     );
 
-    // In place: a second run fetches nothing.
     let fetched = host.fetched.borrow().len();
     assert_eq!(provide(&right, &m, &host, &mut |_| {}), State::Present(exe));
     assert_eq!(host.fetched.borrow().len(), fetched);
 }
-
-// ---- pwsh: Microsoft's Developer ID ----------------------------------------------------
 
 const PWSH_URL: &str = "https://fixture.invalid/powershell-{v}-osx-arm64.tar.gz";
 
@@ -643,7 +630,6 @@ fn an_unstamped_or_stale_copy_is_replaced() {
     assert_eq!(names(&m.tooling), ["pwsh-7.6.7"]);
     assert!(matches!(check(&row, &m, &Fake::new()), State::Present(_)));
 
-    // A stamp of another sha256 (an earlier archive at the same version) is stale.
     let mut stale = place::read_stamp(&dir).expect("the run's stamp");
     stale.sha256 = Some("0".repeat(64));
     place::write_stamp(&dir, &stale).unwrap();
@@ -657,8 +643,6 @@ fn an_unstamped_or_stale_copy_is_replaced() {
     assert!(!dir.join("stray").exists(), "the stale copy went");
     assert_eq!(place::read_stamp(&dir).and_then(|s| s.sha256), Some(want));
 }
-
-// ---- fish: built here, held to the OS's libraries --------------------------------------
 
 const FISH_URL: &str = "https://fixture.invalid/fish-{v}.tar.xz";
 
@@ -764,8 +748,6 @@ fn a_fish_build_answering_another_version_is_refused() {
         );
     }
 
-    // An unknown run must retain the actual copy, not just the source build. These
-    // hosts execute no image, so the enclosing owned fixture may remove their bytes.
     for (error, panics, answer) in [
         (Some("injected read or wait failure"), false, "unused"),
         (None, false, " \n"),
@@ -842,8 +824,6 @@ fn the_fish_build_is_the_rows_argv_and_environment() {
             &target.to_string_lossy(),
         ]
     );
-    // fish's build helper reads CARGO_TARGET_DIR as it compiles: the variable names the
-    // same directory as --target-dir.
     assert_eq!(
         build.set,
         [
@@ -877,8 +857,6 @@ fn the_fish_build_is_the_rows_argv_and_environment() {
         "built from outside the tree"
     );
 
-    // Every variable that would change what cargo, rustc or the C compiler builds, in
-    // each of the forms cargo and cc read.
     let replaced = [
         "RUSTFLAGS",
         "CARGO_ENCODED_RUSTFLAGS",
@@ -931,8 +909,6 @@ fn the_fish_build_is_the_rows_argv_and_environment() {
     assert_eq!(envs.get("FISH_BUILD_DOCS"), Some(&Some("0".into())));
     assert_eq!(envs.get("PATH"), None, "the rest is inherited untouched");
 }
-
-// ---- which rows a run provides -----------------------------------------------------------
 
 /// Lay every row a bare run wants as already in place on `m`: each install directory
 /// stamped with its real pin, the browsers' too.
@@ -1135,7 +1111,6 @@ fn a_browser_is_placed_where_the_lane_looks() {
 
     let zip = b"a fixture zip".to_vec();
     let (pin, t) = browser_fixture(&m, &zip);
-    // A copy laid before stamps existed, at the pin's own path.
     let exe = t.dir.join(&t.exe);
     std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
     std::fs::write(&exe, "hand-laid").unwrap();

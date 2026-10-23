@@ -200,7 +200,8 @@ fn revoke_exit_read(commit: bool) {
     assert!(a.relaunched.lock().unwrap().is_empty());
 }
 
-/// A restored attempt is also a claim.
+/// A restored attempt is also a claim. Its account read may return after an
+/// off/on edit, but the removed queue entry can never type a relaunch line.
 #[test]
 fn switching_off_revokes_a_cold_relaunch_read_already_inflight() {
     let world = Arc::new(World::default());
@@ -336,7 +337,8 @@ fn an_off_on_edit_revokes_an_inflight_exit_attempt_result() {
     );
 }
 
-/// A landing's watch can outlive its worker.
+/// A landing's watch can outlive its worker. Revocation must visit that kept
+/// claim too; there is no live StopHandle left to revoke for it.
 #[test]
 fn an_off_on_edit_revokes_an_orphaned_landing_claim() {
     let (host, job, _workers, hooks) = revocation_fixture();
@@ -404,7 +406,8 @@ fn an_off_on_edit_revokes_an_inflight_restored_landing_read() {
     );
 }
 
-/// A successor can load a different policy from the outgoing process.
+/// A successor can load a different policy from the outgoing process. Its
+/// handoff snapshot is not permission to watch an agent disabled at launch.
 #[test]
 fn a_handed_snapshot_cannot_admit_an_agent_disabled_at_startup() {
     let world = Arc::new(World::default());
@@ -940,7 +943,8 @@ fn an_agent_that_left_for_a_switched_off_one_is_forgotten() {
     assert!(published_snapshot(SID).is_none(), "unpublished");
 }
 
-/// The process probe runs outside Kept.
+/// The process probe runs outside Kept. A new handoff watch on that same
+/// process is a new claim, even though its PID and start stamp did not move.
 #[test]
 fn a_same_process_handoff_watch_armed_during_forget_is_kept() {
     forget_after_switch_edit(true);

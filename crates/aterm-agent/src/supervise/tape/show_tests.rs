@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reading a tape without replaying it: the binary and the text forms read
-//! the same; damage is refused unless salvaged, a torn tail is said; the
-//! decisions come back with the screen they judged, the act after them and
-//! the journal line; the stats count what the tape holds and what it cost.
+//! Tests for reading, salvaging, summarizing, and sanitizing supervisor tapes without replay.
 
 use astream_effects::EffectRecord;
 
@@ -167,7 +164,6 @@ fn either_form_reads_and_damage_is_refused_unless_salvaged() {
     );
     assert!(read.items.len() < items.len());
 
-    // A byte of the header frame's payload damaged: whole frames follow it.
     let mut damaged = bytes.clone();
     let at = super::super::frame::MAGIC.len() + super::super::frame::HEAD + 2;
     damaged[at] ^= 0x01;
@@ -199,7 +195,6 @@ fn the_stats_count_what_the_tape_holds_and_what_it_cost() {
     assert_eq!(s.end.as_deref(), Some("returned exit 0"));
     let text = render_stats(&s);
     assert!(text.contains("decisions 1 (approval 1)"), "{text}");
-    // A tape that spans no time has no rate.
     let still = stats(&open(&written(&[emit(doors::JOURNAL, b"x")]), false).expect("reads"));
     assert_eq!(still.kb_per_hour, None);
 }

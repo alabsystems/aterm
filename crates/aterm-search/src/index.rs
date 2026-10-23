@@ -108,7 +108,9 @@ pub struct SearchIndex {
     pub(super) ambiguous_width: AmbiguousWidth,
 }
 
-/// The largest posting key.
+/// The largest posting key. Keys run `0..=MAX_KEY`, one short of `u32::MAX`,
+/// so `u32::MAX` stays free to be the exclusive end of every candidate range:
+/// no cached line can sit on the bound that is meant to include it.
 const MAX_KEY: u32 = u32::MAX - 1;
 
 /// [`MAX_KEY`] as a distance in lines: the widest span of line numbers one
@@ -131,7 +133,8 @@ fn insert_posting(
     bitmap.insert(line);
 }
 
-/// Intersect posting lists sorted ascending by length into one owned bitmap.
+/// Intersect posting lists sorted ascending by length into one owned bitmap. Two or
+/// more lists start from a borrowed `&a & &b`; only a lone list is cloned.
 #[cfg(test)]
 fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
     debug_assert!(!sorted_lists.is_empty());
@@ -614,7 +617,8 @@ impl SearchIndex {
         true
     }
 
-    /// Re-key every posting list from `key_base` to `new_base`.
+    /// Re-key every posting list from `key_base` to `new_base`. The caller
+    /// has made sure every cached line is in `new_base..=new_base + MAX_KEY`.
     fn rekey(&mut self, new_base: usize) {
         let up = new_base < self.key_base;
         let by = if up {
@@ -755,7 +759,9 @@ impl SearchIndex {
         }
     }
 
-    /// Evict the oldest quarter of cached lines once capacity is exceeded.
+    /// Evict the oldest quarter of cached lines once capacity is exceeded. Sorts the
+    /// cached line numbers (O(n log n)), so gaps in sparse numbering (visible content
+    /// at line 50000 after scrollback 0-99) cost nothing.
     fn evict_oldest_lines(&mut self) {
         let target =
             self.max_cached_lines.saturating_mul(EVICTION_RETAIN_NUM) / EVICTION_RETAIN_DEN;
@@ -803,7 +809,9 @@ impl SearchIndex {
         self.rebuild_bloom();
     }
 
-    /// Rebuild from distinct live trigram keys.
+    /// Rebuild from distinct live trigram keys. Walking cached rows would count
+    /// every repeated window and inflate both work and allocation by retained
+    /// history length, even when a whole build log repeats the same vocabulary.
     fn rebuild_bloom(&mut self) {
         let capacity = self.trigrams.len().max(1000);
         self.bloom = if capacity > BloomFilter::MAX_EFFECTIVE_CAPACITY {
@@ -1663,7 +1671,10 @@ impl SearchIndex {
         Self::point_answer(found, cut_short)
     }
 
-    /// A point walk's answer.
+    /// A point walk's answer. A match it found stands: it is the nearest one
+    /// in the parts of lines the scan could read, and the batch results have
+    /// already reported the rest of any line it could not finish
+    /// ([`SearchResults::cut_short_lines`]).
     fn point_answer(
         found: Option<SearchMatch>,
         cut_short: bool,

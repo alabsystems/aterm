@@ -11,12 +11,15 @@ use crate::WindowId;
 /// Samples the published percentiles are computed over.
 pub const WINDOW: usize = 1024;
 
+/// How long an unanswered write holds the single arm slot; past it the write is retired as
+/// expired (never a sample) so the next keystroke can be measured. Long on purpose: a slow
 /// answer is what this measures.
 const ARM_TTL_US: u64 = 2_000_000;
 
 const US_MASK: u64 = (1 << 48) - 1;
 
 static ARMED: AtomicU64 = AtomicU64::new(0);
+/// Writes that took the slot (the denominator: `arms == samples + expired`, plus at most one
 /// outstanding).
 static ARMS: AtomicU64 = AtomicU64::new(0);
 /// Writes that found the slot busy — the size of the keep-oldest bias.
@@ -30,6 +33,7 @@ static MAX_US: AtomicU64 = AtomicU64::new(0);
 /// Samples whose ring push lost `try_lock`: the PTY reader never blocks on the metrics reader.
 static DROPPED_LOCKED: AtomicU64 = AtomicU64::new(0);
 
+/// The trailing sample window, in microseconds. Written at most once per
 /// keystroke, read by the `metrics percentiles` verb.
 static RING: Mutex<Ring> = Mutex::new(Ring::new());
 
@@ -59,6 +63,8 @@ impl Ring {
         self.next = 0;
     }
 
+    /// Copy the live window out. This fixed 4 KiB copy is all a reader does
+    /// under the lock: no allocation and no sort, so the PTY reader's
     /// `try_lock` in [`close_at`] has almost nothing to lose to.
     const fn copy_out(&self) -> RingCopy {
         RingCopy {
@@ -68,6 +74,7 @@ impl Ring {
     }
 }
 
+/// A reader's private copy of the window, taken by [`Ring::copy_out`] and
 /// ordered after the lock is released.
 struct RingCopy {
     buf: [u32; WINDOW],
@@ -77,6 +84,8 @@ struct RingCopy {
 impl RingCopy {
     const EMPTY: Self = Ring::new().copy_out();
 
+    /// Exact order statistics (nearest-rank) over the copied window — a real
+    /// observed sample, not a bucket edge, so the number published is one that
     /// actually happened. Sorts the copy in place.
     fn percentiles(&mut self) -> (u64, u64, u64) {
         let v = &mut self.buf[..self.len];
@@ -97,6 +106,7 @@ const fn pack(session: u64, now_us: u64) -> u64 {
     ((session & 0xFFFF) << 48) | (now_us & US_MASK)
 }
 
+/// A keystroke's bytes just entered `session`'s PTY: start the clock, unless an
 /// older unanswered write still holds the slot (keep-oldest).
 fn arm_at(session: u64, now_us: u64) {
     let cur = ARMED.load(Ordering::Acquire);
@@ -130,6 +140,7 @@ fn arm_at(session: u64, now_us: u64) {
     }
 }
 
+/// `session` produced output: if it owes us an echo, close the clock. Returns
 /// the recorded microseconds, for the tests.
 fn close_at(session: u64, now_us: u64) -> Option<u64> {
     let cur = ARMED.load(Ordering::Acquire);
@@ -174,6 +185,8 @@ pub(crate) fn arm_deferred(session: u64, sink: &aterm_session::sink::SinkWriter)
     arm_at(session, crate::metrics::now_us());
 }
 
+/// Tests: the one sink whose ordered-writer arms may reach the process-global
+/// statics. Every other test's writer threads write keys too, and must not
 /// perturb the tests that read these counters exactly (this module's own).
 #[cfg(test)]
 static DEFERRED_ARM_SINK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -192,6 +205,8 @@ pub(crate) fn deferred_arms_for_test(sink: &aterm_session::sink::SinkWriter) -> 
 }
 
 thread_local! {
+    /// This thread's current input dispatch handed a write to the ordered egress writer. Set
+    /// by [`note_deferred_write`], cleared by [`crate::App::echo_probe_open`], read by the
     /// close, all on the UI thread.
     static DEFERRED_IN_BRACKET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -309,6 +324,7 @@ impl crate::App {
     }
 }
 
+/// The statics are process-global: every test that reads them takes turns (this module's and
 /// the ordered writer's in `app_input`).
 #[cfg(test)]
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -329,6 +345,7 @@ mod tests {
         fresh_for_test()
     }
 
+    /// The basic contract: a write arms, that session's next burst closes, and
     /// the recorded number is the interval between them.
     #[test]
     fn a_write_then_its_sessions_burst_records_the_interval() {
@@ -341,6 +358,7 @@ mod tests {
         assert_eq!(s.expired, 0, "an answered write is not an expiry");
     }
 
+    /// Another session's output cannot close the clock, or a background flood would answer a
     /// keystroke typed into a quiet pane.
     #[test]
     fn another_sessions_output_cannot_close_the_clock() {
@@ -382,6 +400,7 @@ mod tests {
         assert_eq!((s.arms, s.coalesced), (1, 2));
     }
 
+    /// Past the TTL the next keystroke takes the slot and the unanswered write is booked as
     /// expired, never as a sample.
     #[test]
     fn an_unanswered_write_expires_and_frees_the_slot() {
@@ -407,6 +426,7 @@ mod tests {
         assert_eq!(snapshot().max_us, slow);
     }
 
+    /// Percentiles are exact order statistics over the trailing window, and the
     /// window rolls: 1..=WINDOW+500 leaves the oldest 500 out of the p50.
     #[test]
     fn percentiles_are_exact_over_the_trailing_window() {
@@ -429,6 +449,8 @@ mod tests {
         assert_eq!(s.p50_us, 501 + 511);
     }
 
+    /// The nearest rank written as its definition, the smallest sample with at
+    /// least `q·n` samples at or below it, rather than as the `ceil(q·n) - 1`
     /// index the production walk uses.
     fn nearest_rank(sorted: &[u32], q: f64) -> u64 {
         let need = q * sorted.len() as f64;
@@ -438,6 +460,9 @@ mod tests {
         u64::from(sorted[i])
     }
 
+    /// A copied window's percentiles equal a sorted reference over exactly the
+    /// samples the window holds: one sample, two, an odd length, a full window,
+    /// past the wrap, and refilled after a clear that left the old samples in
     /// the array beyond `len`.
     #[test]
     fn copied_window_percentiles_match_a_sorted_reference() {

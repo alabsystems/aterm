@@ -30,11 +30,9 @@ pub fn write_checked(
     let result = (|| {
         f.write_all(bytes)?;
         f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "aterm-link's flushes (this writer moved from aterm-link's enable.rs) are the Ordered-tier work's to classify; the full flush is kept until then"
-        )]
-        f.sync_all()?;
+        // The full flush (`F_FULLFSYNC` on Apple), which only a test's process tree that asked
+        // takes as a plain `fsync(2)`; whether this writer needs less is the Ordered tier's to say.
+        astream_sys::full_sync(&f)?;
         drop(f);
         check()?;
         std::fs::rename(&tmp, path)
@@ -44,11 +42,7 @@ pub fn write_checked(
             if let Some(dir) = path.parent()
                 && let Ok(dir) = std::fs::File::open(dir)
             {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "aterm-link's flushes (this writer moved from aterm-link's enable.rs) are the Ordered-tier work's to classify; best effort, the file is in place either way"
-                )]
-                let _ = dir.sync_all();
+                let _ = astream_sys::full_sync(&dir);
             }
             Ok(())
         }

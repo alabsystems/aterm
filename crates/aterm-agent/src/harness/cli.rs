@@ -2109,7 +2109,7 @@ const DISK_REMOVAL_KEYS: [&str; 6] = [
 const DISK_OFF: &str = "so every removal is off (disk.apply=false, auto_free_gib=0, \
                         dead_build_dirs=false, idle_build_dirs=false)";
 
-fn removal_off(config: disk::Config) -> disk::Config {
+const fn removal_off(config: disk::Config) -> disk::Config {
     disk::Config {
         apply: false,
         auto_free_gib: 0,
@@ -4361,7 +4361,7 @@ impl LoginCheck {
 
     /// What is recorded of it ([`accounts::note_auth`]); `None` records nothing.
     #[must_use]
-    pub fn auth(&self) -> Option<Auth> {
+    pub const fn auth(&self) -> Option<Auth> {
         match self {
             LoginCheck::SignedIn => Some(Auth::Ok),
             LoginCheck::SignedOut => Some(Auth::SignedOut),
@@ -4410,7 +4410,7 @@ pub struct StatusFacts {
 impl StatusFacts {
     /// The check passes: signed in to claude.ai as the row's account.
     #[must_use]
-    pub fn renews(&self) -> bool {
+    pub const fn renews(&self) -> bool {
         self.signed_in && self.claude_ai && self.email_matches
     }
 }
@@ -5142,7 +5142,7 @@ fn run_accounts_add(
     }
 }
 
-fn sign_in_verb(row: &accounts::Row) -> &'static str {
+const fn sign_in_verb(row: &accounts::Row) -> &'static str {
     if row.email.is_some() {
         "renew"
     } else {
@@ -6307,7 +6307,7 @@ fn answer_retired(
     run_retired()
 }
 
-fn run_retired() -> ExitCode {
+const fn run_retired() -> ExitCode {
     ExitCode::SUCCESS
 }
 

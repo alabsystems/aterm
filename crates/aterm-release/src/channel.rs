@@ -87,7 +87,8 @@ fn table_string(toml: &str, table: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Exactly two non-empty GitHub-name segments.
+/// Exactly two non-empty GitHub-name segments. Mirrors `aterm_update_core::is_valid_slug`,
+/// which the client applies at runtime: a slug it would reject must never be published to.
 fn validate_slug(slug: &str) -> Result<()> {
     let ok_segment = |segment: &str| {
         !segment.is_empty()
@@ -256,7 +257,7 @@ pub enum BindPlan {
 
 /// Decide the bind from the two facts that matter.
 #[must_use]
-pub fn bind_plan(release_intent: bool, observed_draft: Option<bool>) -> BindPlan {
+pub const fn bind_plan(release_intent: bool, observed_draft: Option<bool>) -> BindPlan {
     match durable_post_decision(release_intent, observed_draft.is_some()) {
         DurablePostDecision::PersistIntentThenPost => BindPlan::CreateDraft,
         DurablePostDecision::AwaitVisibility => BindPlan::AwaitVisibility,
@@ -397,7 +398,9 @@ pub fn head_patch_body() -> aterm_json::Value {
 
 /// Both halves of putting one cut onto its channel release.
 pub trait ChannelRelease {
-    /// Has this cut's head PATCH already landed?
+    /// Has this cut's head PATCH already landed? Asked first, read-only: the bound release
+    /// is the channel's published app release (not a draft, not a prerelease, carrying its
+    /// appcast: the state only the head PATCH produces, which `--abandon` refuses).
     fn head_made(&mut self) -> Result<bool>;
     /// The local half: `dist/` re-proved against the signed appcast (and the roster pair
     /// against the master signature), and the path of every asset this cut publishes.

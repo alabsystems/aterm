@@ -79,7 +79,7 @@ impl Rig {
             focus,
             other,
             bottom: rows - 1,
-            now: Instant::now(),
+            now: crate::app_input::past_timeline_start(),
         };
         rig.feed(&"\r\n".repeat(rows + 4));
         rig.feed("$ ");
@@ -114,7 +114,8 @@ impl Rig {
         let _ = self.app.input(self.wid, ev, Source::Human);
     }
 
-    /// One presented frame at the rig's clock.
+    /// One presented frame at the rig's clock. The background pane is damaged so
+    /// a frame presents even when the focused pane did not change.
     fn present(&mut self) {
         self.present_after(Duration::ZERO);
     }

@@ -8,18 +8,12 @@
 // rather than a direct strerror_r(3) call, and `from_io` maps aterm-uds's
 // io::Error in.
 
-//! [`Error`]: upstream's codes, descriptions and formatting, which
-//! `tests/recorded.rs` holds to answers recorded from getrandom 0.2.17.
+//! [`Error`]: upstream's codes, descriptions and formatting.
 
 use core::fmt;
 use core::num::NonZeroU32;
 
 /// A getrandom failure, as a non-zero code.
-///
-/// Codes below [`Error::INTERNAL_START`] are OS error numbers
-/// ([`Error::raw_os_error`]); from there to [`Error::CUSTOM_START`] they are
-/// reserved for the `getrandom` and `rand` crates (the named constants); from
-/// [`Error::CUSTOM_START`] up they are free for custom backends.
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Error(NonZeroU32);
 
@@ -36,9 +30,7 @@ impl Error {
     pub const UNSUPPORTED: Error = internal_error(0);
     /// The platform's `errno` was not positive.
     pub const ERRNO_NOT_POSITIVE: Error = internal_error(1);
-    /// A situation that should not happen in practice (here also: a
-    /// fallback device that ended, or a Windows failure aterm-uds reports
-    /// as text).
+    /// A situation that should not happen in practice.
     pub const UNEXPECTED: Error = internal_error(2);
     /// `CCRandomGenerateBytes` failed on iOS, tvOS or watchOS (unused here).
     pub const IOS_SEC_RANDOM: Error = internal_error(3);
@@ -71,22 +63,17 @@ impl Error {
     #[inline]
     #[must_use]
     pub fn raw_os_error(self) -> Option<i32> {
-        // INTERNAL_START is 1 << 31, so the codes below it are exactly the
-        // ones that fit an i32.
         i32::try_from(self.0.get()).ok()
     }
 
-    /// The bare code: an OS error number or one of the reserved ranges; see
-    /// [`Error::raw_os_error`].
+    /// The bare code: an OS error number or one of the reserved ranges.
     #[inline]
     #[must_use]
     pub const fn code(self) -> NonZeroU32 {
         self.0
     }
 
-    /// An aterm-uds failure: its errno when it has a positive one,
-    /// [`Error::ERRNO_NOT_POSITIVE`] for any other, [`Error::UNEXPECTED`] when
-    /// it carries none.
+    /// Maps an `aterm-uds` `io::Error` to an [`Error`].
     #[cfg(any(unix, windows))]
     #[inline]
     pub(crate) fn from_io(err: &std::io::Error) -> Error {

@@ -4,17 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A window built with a background (`platform::x11::WindowAttributesExtX11::with_x11_background`)
-//! shows it from its map, before anything draws, and keeps its contents at its top-left when it
-//! grows (`NorthWestGravity`), the server painting only the area it gained, in the background
-//! `set_x11_background` set last (`UnownedWindow::set_background` here). Upstream's window had no background: under a compositing
-//! manager a new window, and the strips a resize added, showed whatever the window's new pixmap
-//! held, on this desk's NVIDIA Xorg other windows' pixels (the desk audit, GNOME 46 on Xorg,
-//! 2026-10-22). The negative controls: the background taken out of the window's creation, and the
-//! first pixel reads what the pixmap held; the gravity taken out, and the old corner reads the new
-//! background after the resize.
-//!
-//! The windowed test runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! Tests for X11 window background pixel and NorthWest bit-gravity.
 
 use aterm_x11::proto::xproto;
 use aterm_x11::proto::ValueList;
@@ -98,7 +88,7 @@ fn pixel(watcher: &Connection, window: &Window, x: i16, y: i16) -> u32 {
     raw & (visual.red_mask | visual.green_mask | visual.blue_mask)
 }
 
-/// The hang detector: how long a wait for what must happen may take, which it never needs.
+/// The hang detector.
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Ask `ready` until it answers, failing the test after [`HANG`].
@@ -151,8 +141,6 @@ fn a_window_shows_its_background_until_drawn_and_keeps_its_corner_when_grown() {
         (pixel(&watcher, &window, 5, 5) == want_first).then_some(())
     });
 
-    // What a frame would leave in the window's top-left corner, then a new background and a
-    // resize: the corner stays, and the gained area takes the new background.
     let gc = watcher.generate_id().expect("an id");
     watcher.send_void(xproto::create_gc(gc, xid, &ValueList::new())).unwrap();
     let word = if watcher.setup().image_byte_order == 0 {

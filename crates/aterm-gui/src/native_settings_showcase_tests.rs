@@ -4061,6 +4061,443 @@ fn a_landing_the_keyboard_took_over_is_let_go_as_drawn() {
     );
 }
 
+/// Draw this thread's frames at `scale` text.
+fn set_text_scale(scale: f32) {
+    crate::native_appearance::install_preferences(
+        crate::native_appearance::AppearancePreferences {
+            text_scale: scale,
+            ..crate::native_appearance::current_preferences()
+        },
+    );
+}
+
+/// How much of the control `key` a screen paints, its paint clipped where
+/// the screen cuts it, and how tall the control is.
+fn shown_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> (f32, f32) {
+    let part = compiled
+        .paint
+        .iter()
+        .filter(|node| node.key.as_str() == key)
+        .map(|node| {
+            let top = node.rect.y.max(node.clip.y);
+            (node.rect.bottom().min(node.clip.bottom()) - top).max(0.0)
+        })
+        .fold(0.0_f32, f32::max);
+    (part, rect_of(compiled, key).height)
+}
+
+/// A LANDING THE KEYBOARD TOOK OVER IS SPENT: Themes opened on Nord with the
+/// keyboard already on its Community disclosure draws the disclosure, and
+/// every frame after it before any event — a shorter window, 2× text, then
+/// the first window again — keeps the disclosure in view, whole where the
+/// frame before showed it whole (else no less of it), and a frame drawn
+/// again as it was draws the same screen. Landed again, the list went back
+/// up to Nord and took the disclosure off the screen: 1284x714 made
+/// 1284x700 down to 380, 1144x700 and 864x700 made 600 down to 380, and
+/// each drawn at 2× text.
+#[test]
+fn a_landing_the_keyboard_took_over_stays_let_go_when_the_list_is_measured_again() {
+    const PACK: &str = "settings/showcase/pack";
+    let shown = |compiled: &crate::native_ui::CompiledUi| shown_of(compiled, PACK);
+    // The window's width, and the first frame's height and text size and
+    // the next's.
+    let mut cases = Vec::new();
+    for (width, tall, shorter) in [
+        (
+            1_284.0,
+            714.0,
+            &[700.0, 600.0, 520.0, 462.0, 418.0, 380.0][..],
+        ),
+        (1_144.0, 700.0, &[600.0, 520.0, 462.0, 418.0, 380.0][..]),
+        (864.0, 700.0, &[600.0, 520.0, 462.0, 418.0, 380.0][..]),
+    ] {
+        cases.extend(
+            shorter
+                .iter()
+                .map(|&short| (width, (tall, 1.0), (short, 1.0))),
+        );
+        cases.push((width, (tall, 1.0), (tall, 2.0)));
+    }
+    on_workers(&cases, "landings the keyboard took over", |case| {
+        let &(width, first, then) = case;
+        set_text_scale(first.1);
+        let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+        let _ = act(&mut runtime, instance, view, PACK, None);
+        let mut last = compile_settings_view(&runtime, instance, view, &view_cx_at(width, first.0));
+        assert!(
+            shown(&last).0 > 0.0,
+            "{case:?}: the first screen shows the disclosure"
+        );
+        for (frame, (height, scale)) in [(1, then), (2, then), (3, first)] {
+            set_text_scale(scale);
+            let screen =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+            let ((was, was_tall), (now, tall)) = (shown(&last), shown(&screen));
+            if frame == 2 {
+                assert!(
+                    screen == last,
+                    "{case:?}: frame {frame}, drawn again, draws the same screen"
+                );
+            } else if was + 0.5 >= was_tall {
+                assert!(
+                    now + 0.5 >= tall,
+                    "{case:?}: frame {frame} keeps the disclosure whole ({now} of {tall}pt shown)"
+                );
+            } else {
+                assert!(
+                    now + 0.5 >= was,
+                    "{case:?}: frame {frame} shows no less of the disclosure ({was}pt, then \
+                     {now}pt)"
+                );
+            }
+            last = screen;
+        }
+    });
+}
+
+/// A STATUS THAT COMES WHILE A LANDING WAITS LEAVES THE KEYBOARD'S CONTROL
+/// WHOLE (R2 of the keeping rules, #92): Themes on Nord at 178x348 at 2×
+/// text, the keyboard on its Community disclosure before the first frame
+/// (the landing on Nord giving way to it), then a status before any event.
+/// The bar shortens itself for the disclosure's row as well as for the row
+/// the landing still waits to show ([`SettingsViewState::note_status_room`]):
+/// sized for Nord's row alone, it left the disclosure's 89pt row an 82pt
+/// list, off the screen.
+#[test]
+fn a_status_while_a_landing_waits_leaves_the_keyboards_control_whole() {
+    const PACK: &str = "settings/showcase/pack";
+    set_text_scale(2.0);
+    let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+    let _ = act(&mut runtime, instance, view, PACK, None);
+    let cx = view_cx_at(178.0, 348.0);
+    let first = compile_settings_view(&runtime, instance, view, &cx);
+    let (shown, tall) = shown_of(&first, PACK);
+    assert!(
+        shown + 0.5 >= tall,
+        "the first screen shows the disclosure whole: {shown} of {tall}pt"
+    );
+    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+        unreachable!();
+    };
+    state.feedback = Some(
+        "/Volumes/Shared Drive/Users//someone/dotfiles/config/aterm isn\u{2019}t writable \
+         \u{b7} check its permissions"
+            .to_string(),
+    );
+    let screen = compile_settings_view(&runtime, instance, view, &cx);
+    let (shown, tall) = shown_of(&screen, PACK);
+    assert!(
+        shown + 0.5 >= tall,
+        "under the status the disclosure stays whole: {shown} of {tall}pt"
+    );
+}
+
+/// THE KEYBOARD'S CONTROL STAYS IN VIEW WHERE A FRAME LISTS WHAT THE LAST
+/// PINNED: the chooser's filter over the list and the strip's Done under the
+/// demo are pinned where the page has room and are the list's stops where it
+/// has not, and a frame before any event that lists the one the keyboard is
+/// on, the frame before having drawn it pinned and whole, shows it whole —
+/// and drawn again draws the same screen. Customize pressed before the first
+/// frame at 444x180 at 2× text (its landing giving way to Done), then
+/// 1095x700 or 584x348, then 444x180 again, put Done 240pt or 180pt over the
+/// list's top; opened at 1095x700 or 584x348 (Done pinned, the landing's row
+/// not on the sheet), then 444x180, left Done under the list's bottom; the
+/// keyboard on the filter before the first frame, at 444x180 (1× and 2×) or
+/// 300x160 (2×), then 1284x714, then the first size again, left the filter
+/// over the list's top. A LANDING MEASURED AGAIN GIVES WAY AS ITS FIRST
+/// SCREEN WOULD HAVE: the keyboard on the filter before the first frame,
+/// drawn at 1284x714 (the filter pinned, Nord whole, nothing to give way
+/// to), then at 444x180 (1×, 2×), 300x160 or 584x348 (2×), draws the screen
+/// that window draws first, the filter whole; it landed on Nord again, the
+/// filter off the screen. With an event between the two frames (the
+/// keyboard put on the filter again), which lets the landing go, the filter
+/// no screen has listed counts as shown whole, and the shorter window shows
+/// it whole too.
+#[test]
+fn the_keyboards_control_stays_in_view_where_a_frame_lists_what_the_last_pinned() {
+    const DONE: &str = "settings/showcase/customize-done";
+    const FILTER: &str = "settings/showcase/filter";
+    // What a case holds beyond keeping the control in view.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Also {
+        Nothing,
+        // Its last frame is the screen its window draws first.
+        DrawnFirst,
+        // An event comes after its first frame.
+        Settled,
+    }
+    // The theme in use, the control the keyboard is on before the first
+    // frame, each frame's width, height and text size, and what else holds.
+    let mut cases = Vec::new();
+    for theme in ["Dracula", "GitHub Light"] {
+        let short = (444.0, 180.0, 2.0);
+        for wide in [(1_095.0, 700.0, 2.0), (584.0, 348.0, 2.0)] {
+            cases.push((theme, DONE, vec![short, wide, short], Also::Nothing));
+            cases.push((theme, DONE, vec![wide, short], Also::Nothing));
+        }
+    }
+    for short in [
+        (444.0, 180.0, 1.0),
+        (444.0, 180.0, 2.0),
+        (300.0, 160.0, 2.0),
+    ] {
+        cases.push((
+            "Nord",
+            FILTER,
+            vec![short, (1_284.0, 714.0, short.2), short],
+            Also::Nothing,
+        ));
+    }
+    for short in [
+        (444.0, 180.0, 1.0),
+        (444.0, 180.0, 2.0),
+        (300.0, 160.0, 2.0),
+        (584.0, 348.0, 2.0),
+    ] {
+        for also in [Also::DrawnFirst, Also::Settled] {
+            cases.push(("Nord", FILTER, vec![(1_284.0, 714.0, short.2), short], also));
+        }
+    }
+    on_workers(&cases, "pinned controls listed", |case| {
+        let (theme, key, frames, also) = case;
+        let put_on = |runtime: &mut NativeRuntime, instance, view| {
+            let _ = dispatch(
+                runtime,
+                instance,
+                view,
+                AppEvent::FocusChanged(Some(UiKey::new(*key))),
+            );
+        };
+        // A view on the theme, the keyboard put on `key` before its first
+        // frame, at `scale` text.
+        let opened = |scale: f32| {
+            set_text_scale(scale);
+            let (service, mut runtime, instance, view) =
+                themes_view(&format!("theme = \"{theme}\"\n"));
+            if *key == DONE {
+                let _ = act(
+                    &mut runtime,
+                    instance,
+                    view,
+                    "settings/showcase/customize",
+                    None,
+                );
+            } else {
+                put_on(&mut runtime, instance, view);
+            }
+            (service, runtime, instance, view)
+        };
+        let draw = |page: &(VersionedConfigService, NativeRuntime, _, _),
+                    &(width, height, scale): &(f32, f32, f32)| {
+            set_text_scale(scale);
+            compile_settings_view(&page.1, page.2, page.3, &view_cx_at(width, height))
+        };
+        let mut page = opened(frames[0].2);
+        let mut last = draw(&page, &frames[0]);
+        let (first, tall) = shown_of(&last, key);
+        assert!(
+            first + 0.5 >= tall,
+            "{case:?}: the first screen shows {key} whole ({first} of {tall}pt shown)"
+        );
+        if *also == Also::Settled {
+            put_on(&mut page.1, page.2, page.3);
+        }
+        for (frame, size) in frames.iter().enumerate().skip(1) {
+            let screen = draw(&page, size);
+            let ((was, was_tall), (now, tall)) = (shown_of(&last, key), shown_of(&screen, key));
+            if was + 0.5 >= was_tall {
+                assert!(
+                    now + 0.5 >= tall,
+                    "{case:?}: frame {frame} keeps {key} whole ({now} of {tall}pt shown)"
+                );
+            } else {
+                assert!(
+                    now + 0.5 >= was,
+                    "{case:?}: frame {frame} shows no less of {key} ({was}pt, then {now}pt)"
+                );
+            }
+            last = screen;
+        }
+        let size = frames.last().expect("frames");
+        assert!(
+            draw(&page, size) == last,
+            "{case:?}: the last frame, drawn again, draws the same screen"
+        );
+        if *also == Also::DrawnFirst {
+            assert!(
+                draw(&opened(size.2), size) == last,
+                "{case:?}: the last frame draws the screen its window draws first"
+            );
+        }
+    });
+}
+
+/// The chooser's rows a screen draws whole in the list, by slug.
+fn rows_whole(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
+    drawn_rows(compiled)
+        .into_iter()
+        .filter(|key| whole_in_list(compiled, key))
+        .map(|key| {
+            key.trim_start_matches("settings/showcase/card/")
+                .to_string()
+        })
+        .collect()
+}
+
+/// A view on Nord with the keyboard on the chooser's filter, drawn first at
+/// `at`, then the wheel gone four lines down the list, and the screen it
+/// left — the filter out of view where the list lists it.
+fn wheeled_past_the_filter(
+    at: (f32, f32, f32),
+) -> (
+    VersionedConfigService,
+    NativeRuntime,
+    crate::native_app::AppInstanceId,
+    crate::native_app::ViewId,
+    crate::native_ui::CompiledUi,
+) {
+    let (width, height, scale) = at;
+    set_text_scale(scale);
+    let (service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+    let _ = dispatch(
+        &mut runtime,
+        instance,
+        view,
+        AppEvent::FocusChanged(Some(UiKey::new("settings/showcase/filter"))),
+    );
+    let cx = view_cx_at(width, height);
+    let _ = compile_settings_view(&runtime, instance, view, &cx);
+    let _ = dispatch(
+        &mut runtime,
+        instance,
+        view,
+        AppEvent::ScrollAt {
+            lines: 4,
+            key: UiKey::new("settings/showcase/list"),
+        },
+    );
+    let wheeled = compile_settings_view(&runtime, instance, view, &cx);
+    (service, runtime, instance, view, wheeled)
+}
+
+/// A CONTROL A WINDOW PINNED COMES BACK WHOLE FROM THE WHEEL'S PLACE: Themes
+/// on Nord with the keyboard on the filter, the wheel gone down the list
+/// past it, then windows that pin the filter over the list — the screen the
+/// person last saw shows it whole — and the first window again, with no
+/// event between, shows the filter whole: nothing the person did not do
+/// takes it out of view (R2 of the keeping rules, a pinned control shown
+/// whole), and the list leaves the wheel's place no further than R2 needs,
+/// for the screen that starts at the filter's stop (R4). Held at the wheel's
+/// place, as this test asked before the rules counted a pinned control as
+/// shown whole, 444x180 again drew hearth and linen and the filter 0 of its
+/// 32pt.
+#[test]
+fn a_control_a_window_pinned_comes_back_whole_from_the_wheels_place() {
+    const FILTER: &str = "settings/showcase/filter";
+    // The window the wheel turns in, at its text size, and the windows
+    // drawn after it, at that text size, before it again.
+    let cases = [
+        ((444.0, 180.0, 1.0), vec![(584.0, 348.0)]),
+        ((444.0, 180.0, 1.0), vec![(444.0, 420.0)]),
+        (
+            (444.0, 180.0, 1.0),
+            vec![(520.0, 260.0), (584.0, 348.0), (520.0, 260.0)],
+        ),
+        ((444.0, 180.0, 1.0), vec![(1_284.0, 714.0)]),
+        ((444.0, 180.0, 2.0), vec![(1_284.0, 714.0)]),
+        ((444.0, 180.0, 2.0), vec![(864.0, 500.0)]),
+        ((300.0, 160.0, 2.0), vec![(1_284.0, 714.0)]),
+        ((584.0, 348.0, 2.0), vec![(864.0, 500.0)]),
+        ((584.0, 348.0, 2.0), vec![(1_284.0, 714.0)]),
+    ];
+    on_workers(&cases, "wheel round trips", |case| {
+        let &((width, height, scale), ref trip) = case;
+        let (_service, runtime, instance, view, wheeled) =
+            wheeled_past_the_filter((width, height, scale));
+        let (shown, tall) = shown_of(&wheeled, FILTER);
+        assert!(
+            shown + 0.5 < tall,
+            "{case:?}: the wheel takes the filter out of view ({shown} of {tall}pt shown)"
+        );
+        let wheel_top = state(&runtime, view)
+            .scroll_record
+            .borrow()
+            .as_ref()
+            .map(scroll::ScrollRecord::top);
+        let pinned = trip
+            .iter()
+            .map(|&(width, height)| {
+                let screen =
+                    compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+                let plan = state(&runtime, view).scroll_plan();
+                let (shown, tall) = shown_of(&screen, FILTER);
+                plan.is_some_and(|plan| plan.stop_of(&UiKey::new(FILTER)).is_none())
+                    && shown + 0.5 >= tall
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            pinned.contains(&true),
+            "{case:?}: a window on the way pins the filter whole"
+        );
+        let back = compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+        let (shown, tall) = shown_of(&back, FILTER);
+        assert!(
+            shown + 0.5 >= tall,
+            "{case:?}: the first window again shows the filter whole: {shown} of {tall}pt, rows \
+             {:?}",
+            rows_whole(&back)
+        );
+        let state = state(&runtime, view);
+        let filter = state
+            .scroll_plan()
+            .and_then(|plan| plan.stop_of(&UiKey::new(FILTER)));
+        let top = state
+            .scroll_record
+            .borrow()
+            .as_ref()
+            .map(scroll::ScrollRecord::top);
+        assert!(
+            filter.is_some() && top == filter && filter < wheel_top,
+            "{case:?}: the list leaves the wheel's place (scroll {wheel_top:?}) no further than \
+             the filter's stop ({filter:?}): scroll {top:?}"
+        );
+    });
+}
+
+/// A WHEEL OVER A PINNED CONTROL LEAVES IT WHOLE IN A SHORTER WINDOW, AND
+/// ITS PLACE COMES BACK IN THE WIDE ONE: the keyboard on the filter, pinned
+/// over Themes' list at 1284x714, the wheel gone down the list, and the
+/// window made 444x180 with no event between. The screen the person last
+/// saw showed the filter whole, and nothing they did takes it out of view,
+/// so the shorter window, which lists it, shows it whole; made 1284x714
+/// again, the list is where the wheel left it, as nothing needs it moved
+/// there. (Kept at the wheel's place, 444x180 left the filter above its
+/// screen, and this test held it so until the keeping rules put the
+/// keyboard's control first.)
+#[test]
+fn a_wheel_over_a_pinned_control_leaves_it_whole_in_a_shorter_window() {
+    const FILTER: &str = "settings/showcase/filter";
+    on_workers(&[1.0, 2.0], "wheels over a pinned control", |&scale| {
+        let (_service, runtime, instance, view, wheeled) =
+            wheeled_past_the_filter((1_284.0, 714.0, scale));
+        let shorter = compile_settings_view(&runtime, instance, view, &view_cx_at(444.0, 180.0));
+        let (shown, tall) = shown_of(&shorter, FILTER);
+        assert!(
+            shown + 0.5 >= tall,
+            "at {scale}x text, 444x180 keeps the filter the wheeled 1284x714 screen pinned \
+             whole: {shown} of {tall}pt shown"
+        );
+        let back = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 714.0));
+        assert!(
+            back == wheeled,
+            "at {scale}x text, 1284x714 again draws the screen the wheel left: rows {:?}, \
+             then {:?}",
+            rows_whole(&wheeled),
+            rows_whole(&back)
+        );
+    });
+}
+
 #[test]
 fn a_resize_before_any_event_keeps_the_theme_in_use_in_view() {
     let set_scale = |scale: f32| {
@@ -7129,3 +7566,7 @@ fn palette_chips_stand_a_target_apart() {
     });
     assert_eq!(most, 8, "the control: eight chips to a row");
 }
+
+/// The settings list's keeping rules, swept.
+#[path = "native_settings_showcase_keeping_tests.rs"]
+mod keeping;

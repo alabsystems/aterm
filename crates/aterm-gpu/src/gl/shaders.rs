@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GLSL ES 3.00 twins (`shaders/<library>.glsl`), compiled into the binary.
-//! `pipelines` composes one stage of one row from them; the tests below hold
-//! each row's stage to the row's bind column, as text, on every host.
+//! GLSL ES 3.00 shader sources and binding checks.
 
 use crate::pipeline_table::ShaderLibrary;
 
@@ -20,14 +18,7 @@ pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
     }
 }
 
-/// The binding check. GLSL ES 3.00 has no binding qualifier, so `pipelines`
-/// binds by name, sampler `aterm_t<n>` to unit n and block `aterm_b<n>` to
-/// point n, for exactly the row's `BindSpec` slots. A sampler an entry point
-/// reads that its row does not bind stays at unit 0 and reads whatever texture
-/// is there, with no error from any driver; a slot no sampler declares binds
-/// nothing. Each row's two stages are read here as the compiler sees them (the
-/// twin under `compose`'s defines) and their reads held to the row. The
-/// compiled half of the check is `pipelines::tests` on a GL host.
+/// The binding check.
 #[cfg(all(test, any(target_os = "macos", gl_arm)))]
 mod tests {
     use super::source;
@@ -48,8 +39,7 @@ mod tests {
         ])
     }
 
-    /// GLSL tokens: identifiers, numbers, `&&`, `||`, and every other
-    /// character alone. Comments are stripped first.
+    /// GLSL tokens: identifiers, numbers, `&&`, `||`, and every other character alone.
     fn tokens(src: &str) -> Vec<String> {
         let mut out = Vec::new();
         for line in src.lines() {
@@ -62,7 +52,6 @@ mod tests {
                 if c.is_ascii_alphanumeric() || c == '_' {
                     let mut end = at + c.len_utf8();
                     while let Some(&(i, d)) = chars.peek() {
-                        // A number keeps its `.` and exponent: one token.
                         if d.is_ascii_alphanumeric() || d == '_' || (d == '.' && c.is_ascii_digit())
                         {
                             end = i + d.len_utf8();
@@ -83,9 +72,7 @@ mod tests {
         out
     }
 
-    /// An `#if` expression over `defined`, `!`, `&&`, `||` and parentheses,
-    /// by precedence; anything else is a construct this reader does not
-    /// model, and fails the test rather than guess.
+    /// An `#if` expression over `defined`, `!`, `&&`, `||` and parentheses, by precedence.
     struct IfExpr<'a> {
         toks: Vec<String>,
         at: usize,
@@ -156,13 +143,9 @@ mod tests {
         }
     }
 
-    /// The lines of a twin a GLSL preprocessor keeps under `defs`: the
-    /// conditional directives evaluated, `#define` recorded, and any other
-    /// directive refused.
+    /// The lines of a twin a GLSL preprocessor keeps under `defs`.
     fn active(src: &str, defs: &BTreeSet<String>) -> String {
         let mut defs = defs.clone();
-        // Per open conditional: (the enclosing region is live, a branch
-        // of this one has been taken).
         let mut open: Vec<(bool, bool)> = Vec::new();
         let mut live = true;
         let mut out = String::new();
@@ -220,7 +203,7 @@ mod tests {
         name.strip_prefix(prefix)?.parse().ok()
     }
 
-    /// One stage's source as declarations: what the binding check reads.
+    /// One stage's source as declarations.
     #[derive(Default)]
     struct Stage {
         /// Each function's body as identifiers (overloads merged).
@@ -246,8 +229,6 @@ mod tests {
                     i += 1;
                     continue;
                 }
-                // A top-level brace: a function body, a uniform block or a
-                // struct. Its extent first.
                 let mut depth = 0usize;
                 let mut end = i;
                 for (j, t) in toks.iter().enumerate().skip(i) {
@@ -265,7 +246,6 @@ mod tests {
                 let body = &toks[i + 1..end];
                 let prev = i.checked_sub(1).map(|p| toks[p].as_str());
                 if prev == Some(")") {
-                    // `T name(params) {`: the name precedes the matching `(`.
                     let mut depth = 0usize;
                     let mut open = i - 1;
                     while let Some(p) = open.checked_sub(1) {
@@ -284,7 +264,6 @@ mod tests {
                         .or_default()
                         .extend(body.iter().filter(|t| is_ident(t)).cloned());
                 } else if let Some(n) = prev.and_then(|p| slot(p, "aterm_b")) {
-                    // `uniform aterm_b<n> { T member; ... };`
                     for w in body.windows(2) {
                         if (w[1] == ";" || w[1] == "[") && is_ident(&w[0]) {
                             stage.members.insert(w[0].clone(), n);
@@ -296,8 +275,7 @@ mod tests {
             stage
         }
 
-        /// The sampler units and block points `entry` reads, through every
-        /// function it calls.
+        /// The sampler units and block points `entry` reads, through every function it calls.
         fn reads(&self, entry: &str) -> (BTreeSet<u32>, BTreeSet<u32>) {
             assert!(
                 self.functions.contains_key(entry),

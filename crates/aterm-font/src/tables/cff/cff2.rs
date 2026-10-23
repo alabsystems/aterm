@@ -8,8 +8,6 @@
 //! A [Compact Font Format 2 Table](
 //! https://docs.microsoft.com/en-us/typography/opentype/spec/cff2) implementation.
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/cff2charstr
-
 use core::convert::TryFrom;
 use core::ops::Range;
 
@@ -22,17 +20,13 @@ use crate::parser::{NumFrom, Stream, TryNumFrom};
 use crate::var_store::*;
 use crate::{GlyphId, NormalizedCoordinate, OutlineSink, Rect, RectF};
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/cff2#7-top-dict-data
-// 'Operators in DICT may be preceded by up to a maximum of 513 operands.'
 const MAX_OPERANDS_LEN: usize = 513;
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/cff2charstr#appendix-b-cff2-charstring-implementation-limits
 const STACK_LIMIT: u8 = 10;
 const MAX_ARGUMENTS_STACK_LEN: usize = 513;
 
 const TWO_BYTE_OPERATOR_MARK: u8 = 12;
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/cff2charstr#4-charstring-operators
 mod operator {
     pub const HORIZONTAL_STEM: u8 = 1;
     pub const VERTICAL_STEM: u8 = 3;
@@ -65,19 +59,16 @@ mod operator {
     pub const FIXED_16_16: u8 = 255;
 }
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/cff2#table-9-top-dict-operator-entries
 mod top_dict_operator {
     pub const CHAR_STRINGS_OFFSET: u16 = 17;
     pub const VARIATION_STORE_OFFSET: u16 = 24;
     pub const FONT_DICT_INDEX_OFFSET: u16 = 1236;
 }
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/cff2#table-10-font-dict-operator-entries
 mod font_dict_operator {
     pub const PRIVATE_DICT_SIZE_AND_OFFSET: u16 = 18;
 }
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/cff2#table-16-private-dict-operators
 mod private_dict_operator {
     pub const LOCAL_SUBROUTINES_OFFSET: u16 = 19;
 }
@@ -104,7 +95,6 @@ fn parse_top_dict(data: &[u8]) -> Option<TopDictData> {
         }
     }
 
-    // Must be set, otherwise there are nothing to parse.
     if dict_data.char_strings_offset == 0 {
         return None;
     }
@@ -156,13 +146,11 @@ fn parse_private_dict(data: &[u8]) -> Option<usize> {
     subroutines_offset
 }
 
-/// CFF2 allows up to 65535 scalars, but an average font will have 3-5.
-/// So 64 is more than enough.
 const SCALARS_MAX: u8 = 64;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Scalars {
-    d: [f32; SCALARS_MAX as usize], // 256B
+    d: [f32; SCALARS_MAX as usize],
     len: u8,
 }
 
@@ -253,7 +241,6 @@ fn parse_char_string(
         stems_len: 0,
     };
 
-    // Load scalars at default index.
     ctx.update_scalars(0)?;
 
     let mut inner_builder = Builder {
@@ -262,7 +249,7 @@ fn parse_char_string(
     };
 
     let stack = ArgumentsStack {
-        data: &mut [0.0; MAX_ARGUMENTS_STACK_LEN], // 2052B
+        data: &mut [0.0; MAX_ARGUMENTS_STACK_LEN],
         len: 0,
         max_len: MAX_ARGUMENTS_STACK_LEN,
     };
@@ -276,11 +263,9 @@ fn parse_char_string(
         width_only: false,
     };
     _parse_char_string(&mut ctx, data, 0, &mut parser)?;
-    // let _ = _parse_char_string(&mut ctx, data, 0.0, 0.0, &mut stack, 0, &mut inner_builder)?;
 
     let bbox = parser.builder.bbox;
 
-    // Check that bbox was changed.
     if bbox.is_default() {
         return Err(CFFError::ZeroBBox);
     }
@@ -300,21 +285,13 @@ fn _parse_char_string(
         let op = s.read::<u8>().ok_or(CFFError::ReadOutOfBounds)?;
         match op {
             0 | 2 | 9 | 11 | 13 | 14 | 17 => {
-                // Reserved.
                 return Err(CFFError::InvalidOperator);
             }
             operator::HORIZONTAL_STEM
             | operator::VERTICAL_STEM
             | operator::HORIZONTAL_STEM_HINT_MASK
             | operator::VERTICAL_STEM_HINT_MASK => {
-                // y dy {dya dyb}* hstem
-                // x dx {dxa dxb}* vstem
-                // y dy {dya dyb}* hstemhm
-                // x dx {dxa dxb}* vstemhm
-
                 ctx.stems_len = ctx.stems_len.saturating_add(p.stack.len() as u32 >> 1);
-
-                // We are ignoring the hint operators.
                 p.stack.clear();
             }
             operator::VERTICAL_MOVE_TO => {
@@ -351,7 +328,6 @@ fn _parse_char_string(
                 _parse_char_string(ctx, char_string, depth + 1, p)?;
             }
             TWO_BYTE_OPERATOR_MARK => {
-                // flex
                 let op2 = s.read::<u8>().ok_or(CFFError::ReadOutOfBounds)?;
                 match op2 {
                     operator::HFLEX => p.parse_hflex()?,
@@ -362,11 +338,7 @@ fn _parse_char_string(
                 }
             }
             operator::VS_INDEX => {
-                // |- ivs vsindex (15) |-
-
-                // `vsindex` must precede the first `blend` operator, and may occur only once.
                 if ctx.had_blend || ctx.had_vsindex {
-                    // TODO: maybe add a custom error
                     return Err(CFFError::InvalidOperator);
                 }
 
@@ -383,15 +355,8 @@ fn _parse_char_string(
                 p.stack.clear();
             }
             operator::BLEND => {
-                // num(0)..num(n-1), delta(0,0)..delta(k-1,0),
-                // delta(0,1)..delta(k-1,1) .. delta(0,n-1)..delta(k-1,n-1)
-                // n blend (16) val(0)..val(n-1)
-
                 ctx.had_blend = true;
 
-                // `blend` takes its operand count off the stack, so an empty
-                // stack is malformed (upstream popped it unchecked and
-                // panicked, release builds included).
                 if p.stack.is_empty() {
                     return Err(CFFError::InvalidArgumentsStackLength);
                 }
@@ -418,7 +383,6 @@ fn _parse_char_string(
                 ctx.stems_len = ctx.stems_len.saturating_add(p.stack.len() as u32 >> 1);
                 s.advance(usize::num_from(ctx.stems_len.saturating_add(7) >> 3));
 
-                // We are ignoring the hint operators.
                 p.stack.clear();
             }
             operator::MOVE_TO => {
@@ -500,9 +464,8 @@ impl<'a> Table<'a> {
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
 
-        // Parse Header.
         let major = s.read::<u8>()?;
-        s.skip::<u8>(); // minor
+        s.skip::<u8>();
         let header_size = s.read::<u8>()?;
         let top_dict_length = s.read::<u16>()?;
 
@@ -510,7 +473,6 @@ impl<'a> Table<'a> {
             return None;
         }
 
-        // Jump to Top DICT. It's not necessarily right after the header.
         if header_size > 5 {
             s.advance(usize::from(header_size) - 5);
         }
@@ -520,7 +482,6 @@ impl<'a> Table<'a> {
 
         let mut metadata = Self::default();
 
-        // Parse Global Subroutines INDEX.
         metadata.global_subrs = parse_index::<u32>(&mut s)?;
 
         metadata.char_strings = {
@@ -530,20 +491,16 @@ impl<'a> Table<'a> {
 
         if let Some(offset) = top_dict.variation_store_offset {
             let mut s = Stream::new_at(data, offset)?;
-            s.skip::<u16>(); // length
+            s.skip::<u16>();
             metadata.item_variation_store = ItemVariationStore::parse(s)?;
         }
 
-        // TODO: simplify
         if let Some(offset) = top_dict.font_dict_index_offset {
             let mut s = Stream::new_at(data, offset)?;
             'outer: for font_dict_data in parse_index::<u32>(&mut s)? {
                 if let Some(private_dict_range) = parse_font_dict(font_dict_data) {
-                    // 'Private DICT size and offset, from start of the CFF2 table.'
                     let private_dict_data = data.get(private_dict_range.clone())?;
                     if let Some(subroutines_offset) = parse_private_dict(private_dict_data) {
-                        // 'The local subroutines offset is relative to the beginning
-                        // of the Private DICT data.'
                         if let Some(start) =
                             private_dict_range.start.checked_add(subroutines_offset)
                         {

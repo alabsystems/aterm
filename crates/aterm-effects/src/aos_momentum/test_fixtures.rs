@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Fixtures shared by the momentum task's tests: geometries and configs, a deterministic
-//! generator of host call streams, a driver that plays a stream into the direct engine or a
-//! [`MomentumHost`] exactly as a host does (other effects' quads already in the streams), and
-//! the host's frame lane (frame cadence while active, the named settle wake while settling,
-//! park otherwise). Every time is injected; nothing reads a clock but the one origin.
+//! Test fixtures, deterministic call-stream generator, and host lane runner for AOS momentum glow.
 
 use std::time::Duration;
 
@@ -147,10 +143,7 @@ pub(super) enum Seen {
     },
 }
 
-/// A random stream of `len` calls. In profile: times nondecreasing, τ in range, admitted
-/// geometry, finite config, lanes ≤ 1 s. Out of profile: also NaN and oversized τ,
-/// degenerate geometry, non-finite intensity, inverted spans and lanes past a second, which
-/// only the unattached engine is fed.
+/// Generate a deterministic stream of `len` host calls.
 pub(super) fn random_stream(seed: u64, len: usize, in_profile: bool) -> Vec<Call> {
     let mut r = Rng::new(seed);
     let mut at = Duration::ZERO;
@@ -315,8 +308,7 @@ pub(super) fn sentinels(n: usize, tag: u32) -> Vec<GlowQuad> {
         .collect()
 }
 
-/// One frame into streams that already hold `prefix` other quads each; returns the frame
-/// and the quads it appended, asserting the prefixes are untouched.
+/// Draw one frame into streams with `prefix` sentinel quads.
 pub(super) fn draw(
     g: &mut impl Glow,
     cur: Option<(u16, u16)>,
@@ -378,9 +370,7 @@ pub(super) fn play(g: &mut impl Glow, t0: Instant, calls: &[Call]) -> Vec<Seen> 
         .collect()
 }
 
-/// Types `keys` keys 60 ms apart from `start`, the caret moving one column a key, a frame
-/// after each (as `app_input` and the next present do). Returns the last key's instant and
-/// the caret.
+/// Simulate `keys` keystrokes 60 ms apart starting at `start`.
 pub(super) fn burst(
     g: &mut impl Glow,
     start: Instant,
@@ -409,9 +399,7 @@ pub(super) struct Parked {
     pub(super) last: Option<Seen>,
 }
 
-/// The host's lane from `now`: frame cadence while active, the named settle wake while
-/// settling, park when neither names a next frame. Every wake must be in the future, and
-/// the lane must park within a minute (a hang detector, not a budget).
+/// Run the host frame lane from `now` until it parks.
 pub(super) fn run_lane(
     g: &mut impl Glow,
     mut now: Instant,

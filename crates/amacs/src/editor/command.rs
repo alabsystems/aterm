@@ -17,7 +17,9 @@ pub const TAB_STOP: usize = 4;
 pub(super) enum PrefixArgument {
     /// `C-u` alone, pressed n times: 4ⁿ.
     Raw(i64),
-    /// Decimal digits typed after `C-u` (`C-u 2`).
+    /// Decimal digits typed after `C-u` (`C-u 2`). While `open`, one more
+    /// digit extends the number; a `C-u` after the digits closes it, as
+    /// Emacs's `universal-argument-more` does, so a digit after that is text.
     Numeric { value: i64, open: bool },
 }
 
@@ -184,7 +186,9 @@ pub enum EditorCommand {
     MoveWordForward,
     DeleteBackward,
     DeleteForward,
-    /// TAB: indent to the next tab stop.
+    /// TAB: indent to the next tab stop. Until the Language table's indent
+    /// rules arrive (slice L1) it inserts spaces at each caret up to the next
+    /// multiple of [`TAB_STOP`] columns.
     IndentForTab,
     SetMark,
     KillRegion,
@@ -643,7 +647,9 @@ mod tests {
         }
     }
 
-    /// One C-u argument goes to exactly one command.
+    /// One C-u argument goes to exactly one command. Line motion, kill-line and
+    /// yank take it; a command with no use for it drops it, so it can never
+    /// multiply a later C-f.
     #[test]
     fn universal_argument_is_consumed_once() {
         let text = (0..10)

@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The words a job row prints: the `sys jobs` row (§11.10, `key=value`
-//! fields in one order), the findings' rows (§11.9), and the person's
-//! sentence (§11.7 "Shown as"). Agents read the row; the person's surfaces
-//! never print φ, they say the same number as "silent 6m12s, about 26× its
-//! usual 14 s gap".
+//! Formatting for `sys jobs` rows, findings, and user-facing sentences.
 
 use std::fmt::Write as _;
 
 use super::{Class, Findings, JobKind, JobRow, Verdict, Wait, WaitName};
 
-/// φ × 1000 as the row prints it: `0`, `0.43`, `8.27`, `15.2`, `130`.
+/// φ × 1000 as the row prints it.
 #[must_use]
 pub fn phi_text(phi_milli: u64) -> String {
     if phi_milli == 0 {
@@ -36,7 +32,7 @@ pub fn deci_text(deci: u64) -> String {
     format!("{}.{}", deci / 10, deci % 10)
 }
 
-/// An age in the person's words: `41s`, `7m`, `2h5m`.
+/// An age in the person's words.
 #[must_use]
 pub fn age_words(ms: u64) -> String {
     let s = ms / 1000;
@@ -154,7 +150,7 @@ impl JobRow {
         o
     }
 
-    /// The person's sentence for the verdict; empty for `fine`.
+    /// The person's sentence for the verdict.
     #[must_use]
     pub fn said(&self) -> String {
         let age = self.quiet_ms.map(age_words).unwrap_or_default();
@@ -194,8 +190,7 @@ impl JobRow {
         }
     }
 
-    /// The quiet age against μ, as the person reads φ: "silent 6m12s, about
-    /// 26× its usual 14 s gap"; `None` without both.
+    /// The quiet age against μ.
     #[must_use]
     pub fn gap(&self) -> Option<String> {
         let (q, mu) = (self.quiet_ms?, self.mu_ms?);
@@ -258,14 +253,10 @@ fn wait_words(w: &Wait) -> String {
     }
 }
 
-/// The longest `exe=` word (§13.3).
+/// The longest `exe=` word.
 pub const EXE_WORD_MAX: usize = 32;
 
-/// Whether `s` may print as an `exe=` (or `task=`) word: it matches
-/// `^[A-Za-z0-9._+-]{1,32}$` (design §13.3, the foreign-text rule). A process
-/// name is text whoever built the binary chose, and an agent reads the row:
-/// no control byte, escape sequence, bidi override, quote, space or `=`
-/// reaches it.
+/// Whether `s` may print as an `exe=` (or `task=`) word.
 #[must_use]
 pub fn is_exe_word(s: &str) -> bool {
     (1..=EXE_WORD_MAX).contains(&s.len())
@@ -273,17 +264,13 @@ pub fn is_exe_word(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
 }
 
-/// A process name as the row prints it: itself when [`is_exe_word`], else
-/// `-`.
+/// A process name as the row prints it ([`is_exe_word`]).
 #[must_use]
 pub fn exe_word(s: &str) -> &str {
     if is_exe_word(s) { s } else { "-" }
 }
 
-/// A process name as the person's sentence shows it: control characters and
-/// invisible format characters (bidi overrides and isolates, zero-width
-/// joiners, the byte-order mark, tag characters) dropped, at most
-/// [`EXE_WORD_MAX`] characters; `?` when nothing is left.
+/// A process name as the person's sentence shows it ([`EXE_WORD_MAX`]).
 #[must_use]
 pub fn person_name(s: &str) -> String {
     let kept: String = s

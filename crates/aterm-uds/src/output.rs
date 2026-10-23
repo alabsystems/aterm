@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Captured command output: the ordinary spawn unless the caller supplies an
-//! executor to own its lifetime. Delegation is local to the calling thread;
-//! worker threads need an explicit executor of their own.
+//! Captured command output, using the caller's executor when installed.
 
 use crate::spawnfd::Command;
 use std::cell::RefCell;
@@ -18,10 +16,7 @@ thread_local! {
     static EXECUTOR: RefCell<Option<Arc<Executor>>> = const { RefCell::new(None) };
 }
 
-/// Run `command`, reading all of stdout and stderr, through the current
-/// [`with_executor`] if one is installed. The executor must spawn directly
-/// rather than recursively calling this function.
-///
+/// Runs `command` and reads stdout and stderr through the current [`with_executor`].
 /// # Errors
 /// The executor's error, or the command's spawn, read or wait error.
 pub fn output(command: &mut Command) -> io::Result<Output> {
@@ -32,8 +27,7 @@ pub fn output(command: &mut Command) -> io::Result<Output> {
     }
 }
 
-/// Run `walk` under a caller-owned command executor on this thread. A nested
-/// executor restores the previous one, including during unwinding.
+/// Run `walk` under a caller-owned command executor on this thread.
 pub fn with_executor<T>(executor: Arc<Executor>, walk: impl FnOnce() -> T) -> T {
     struct Restore(Option<Arc<Executor>>);
     impl Drop for Restore {
@@ -47,11 +41,9 @@ pub fn with_executor<T>(executor: Arc<Executor>, walk: impl FnOnce() -> T) -> T 
     walk()
 }
 
-/// Extension spelling for commands whose output is owned by the current
-/// executor. Outside a scope this has the ordinary `Command::output` behavior.
+/// Extension spelling for commands whose output is owned by the current executor.
 pub trait CommandOutput {
     /// Run this command through [`output`].
-    ///
     /// # Errors
     /// As [`output`].
     fn output_owned(&mut self) -> io::Result<Output>;

@@ -2492,7 +2492,8 @@ fn served_row(id: &str, at: i64) -> String {
     )
 }
 
-/// The wall segment's text for process 4242 at `now` (UTC).
+/// The wall segment's text for process 4242 at `now` (UTC). No start is
+/// known, so no transcript row speaks for the process ([`floor_of`]).
 #[cfg(unix)]
 fn wall_at(claude: &Path, cache: &mut FooterCache, now: i64) -> Option<String> {
     let utc = |_: Option<&str>, _: i64| Some(0);
@@ -3712,7 +3713,9 @@ fn a_reason_and_the_upgrade_note_take_the_accounts_room() {
     }
 }
 
-/// The launch card is read only under a live REPL.
+/// The launch card is read only under a live REPL. Negative controls: a
+/// relaunch before the new REPL is up (`Press Ctrl-C again to exit`), a
+/// half-drawn screen, and a box over the composer.
 #[test]
 fn the_launch_card_is_read_only_under_a_live_repl() {
     let fixture = |name: &str| -> Vec<String> {

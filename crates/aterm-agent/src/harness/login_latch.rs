@@ -41,7 +41,8 @@ struct Latch {
     /// The tab whose `/login` is the login's sign-in, until the login is
     /// back, its worker ends, or the tab closes.
     carrier: Option<String>,
-    /// A worker's existing stop handle identifies its reservation.
+    /// A worker's existing stop handle identifies its reservation. Its value
+    /// is not read here; an older worker cannot release a successor's.
     carrier_owner: Option<Arc<AtomicBool>>,
     /// The roster row whose login the carrier's sign-in is, as its host
     /// named it ([`LoginLatches::carried_rows`]).

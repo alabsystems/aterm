@@ -217,12 +217,12 @@ impl Dims {
     }
 
     /// The Deck's rows in the frame.
-    fn deck_rows(&self) -> Range<usize> {
+    const fn deck_rows(&self) -> Range<usize> {
         self.deck_y..self.deck_y + self.deck_h
     }
 
     /// The strip band's foot: the top pad, the head and the strip's rows.
-    fn band_foot(&self) -> usize {
+    const fn band_foot(&self) -> usize {
         self.pad_top + self.head + self.tab_rows * self.cell_h
     }
 }

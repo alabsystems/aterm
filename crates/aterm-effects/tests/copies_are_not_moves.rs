@@ -1610,7 +1610,8 @@ fn a_streamed_quote_then_ctrl_u_at_every_pause_and_pacing() {
     );
 }
 
-/// fzf's list lands after four to six keys, Ctrl-U 20–900 ms after the last.
+/// fzf's list lands after four to six keys, Ctrl-U 20–900 ms after the last. Limit: the list after
+/// the last key (`k6`) erased before it stood `TWIN_MIN` (paced until 150 ms).
 #[test]
 fn fzf_s_late_list_then_ctrl_u_at_every_pause_and_pacing() {
     holds_but(

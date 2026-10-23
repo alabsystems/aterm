@@ -124,6 +124,8 @@ fn covering(text: Option<&str>, pid: i32, off: u64) -> Result<Tally, String> {
 }
 
 /// Wait for the bridge `pid`'s tally at `path` to have committed through
+/// `off`: its idle write after the commit that covers it.
+///
 /// # Panics
 ///
 /// After [`DEADLINE`] — the hang detector — with why the last read was not it.
@@ -145,6 +147,8 @@ fn await_tally(path: &Path, pid: i32, off: u64, what: &str) -> Tally {
 }
 
 /// Park on `sid`'s inbox for the round's one message, `text`, and list it:
+/// `(its row, the stamp when the wait answered)`.
+///
 /// # Panics
 ///
 /// A wait that timed out, or a wake that was not exactly `text`: a stray, or a
@@ -325,7 +329,8 @@ fn order_line(pongs: &Answers, pings: &Answers, n: usize) -> String {
     line
 }
 
-/// `part` as a share of `whole`, rounded: `None` for an empty whole.
+/// `part` as a share of `whole`, rounded: `None` for an empty whole. Pure
+/// (unit-tested).
 fn share(part: f64, whole: f64) -> Option<f64> {
     (whole > 0.0).then(|| stats::round3(part / whole))
 }

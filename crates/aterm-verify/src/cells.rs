@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `verify cells`: cross-cell lint and type-check across Windows, linux-arm, and wasm32.
-
+//!
 //! STOCK EXCEPTION: the Trust sysroot carries only the host std, so each cell
 //! compiles on a rustup toolchain carrying its triple's std (stable first),
 //! driven by path from a neutral cwd so neither this repo's Trust pin nor its
@@ -242,8 +242,11 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     audit_policy(ctx, r, &policy, &cells);
 }
 
-/// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1, WB.2 and WB.3 of docs/AUDIT-third-party-2026-10-15.md), each with what it holds to the registry crates of its version. (STOCK EXCEPTION)
-/// either Windows cell runs each once.
+/// The windows-sys oracles, `aterm-win32-oracle`'s two verbs (WB.1, WB.2 and WB.3 of
+/// docs/AUDIT-third-party-2026-10-15.md), each with what it holds to the registry crates of
+/// its version. Each verb compiles both Windows triples, so a run that checks either Windows
+/// cell runs each once. The same STOCK EXCEPTION as the cells: stock stable compiles Windows
+/// std, and no Windows program runs.
 pub const WIN32_ORACLES: [(&str, &str); 2] = [
     (
         "oracle",
@@ -304,7 +307,8 @@ pub fn win32_oracle_not_run_reason(output: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// One row per [`WIN32_ORACLES`] verb.
+/// One row per [`WIN32_ORACLES`] verb. The oracle's exit is read as the libc
+/// oracle's: 0 passes, 1 is a finding, 3 or a signal decided nothing.
 fn win32_oracles(ctx: &Ctx, r: &mut Report, have_rustup: bool) {
     for (verb, holds) in WIN32_ORACLES {
         let label = format!("win32 {verb} ({holds}; x86_64 and aarch64 pc-windows-msvc)");
@@ -636,7 +640,9 @@ pub fn parse_test_forest(text: &str, roots: &BTreeSet<String>) -> Result<BTreeSe
     Ok(nodes)
 }
 
-/// The cell's packages compiled for the host ([`host_side`]).
+/// The cell's packages compiled for the host ([`host_side`]). A third-party
+/// proc macro has no path in the tree's output: forge finds its directory in
+/// the registry.
 fn host_side_of(ctx: &Ctx, graph: &Graph, paths: &BTreeMap<PkgId, PathBuf>) -> BTreeSet<PkgId> {
     host_side(graph, |id| {
         aterm_forge::loc::package_dir(&ctx.root, id, paths.get(id).map(PathBuf::as_path))

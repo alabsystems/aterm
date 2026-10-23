@@ -165,7 +165,9 @@ impl EventLog {
         (seq, evicted)
     }
 
-    /// Append a Surface text op at `Ticks(0)`.
+    /// Append a Surface text op at `Ticks(0)`. Eviction here just forgets the
+    /// oldest entry; temporal callers use [`append_at`](Self::append_at) and
+    /// handle the spill seam.
     #[inline]
     fn append(&mut self, op: Op) -> Seq {
         let (seq, _evicted) = self.append_at(op, Ticks(0));
@@ -215,7 +217,8 @@ impl EventLog {
 /// A Surface: committed lines plus the event-log spine.
 #[derive(Clone, Debug)]
 pub struct Surface {
-    /// Immutable snapshot spine.
+    /// Immutable snapshot spine. [`Arc::make_mut`] clones this ordered vector
+    /// only when a writer actually changes a retained line.
     lines: Arc<Vec<(LineId, Arc<String>)>>,
     next_line: u64,
     /// The sequence spine shared by snapshots until the next real event.

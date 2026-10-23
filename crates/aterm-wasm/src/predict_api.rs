@@ -21,7 +21,6 @@ fn clock() -> Instant {
 #[cfg(test)]
 thread_local! {
     /// The pinned clock ([`clock`]); `None` reads the real one.
-    /// The pinned clock ([`clock`]); `None` reads the real one.
     static PINNED_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
@@ -262,9 +261,19 @@ mod tests {
     use crate::WebTerminal;
 
     /// A terminal on the system font, or COULD NOT RUN where the host has
-    /// none (the same posture as the other binding tests).
+    /// none (the same posture as the other binding tests). Its clock is pinned
+    /// past the longest glitch window, so an overlay that read the real clock
+    /// would find every guess expired and fail on the first run.
     fn terminal() -> WebTerminal {
-        super::pin_clock(Some(aterm_time::Instant::now()));
+        const BACK_MS: u64 = 10_000;
+        const _: () = assert!(
+            BACK_MS > aterm_predict::compute_glitch_window_ms(Some(u32::MAX), u8::MAX),
+            "the pin is further back than any glitch window"
+        );
+        let past = aterm_time::Instant::now()
+            .checked_sub(aterm_time::Duration::from_millis(BACK_MS))
+            .expect("the monotonic clock is more than ten seconds old");
+        super::pin_clock(Some(past));
         crate::system_font_terminal(4, 20, 16.0)
     }
 

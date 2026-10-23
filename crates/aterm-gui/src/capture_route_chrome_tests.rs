@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One chrome composition for every route, present and capture alike, and the
-//! one host visual policy on the terminal present.
+//! Chrome composition tests across present and capture routes.
 
 use super::{ChromeStep, trace};
 use crate::scripted_redraw_fixture::{glass, headless, scripted_app};
@@ -183,7 +182,6 @@ fn every_route_layers_chrome_through_one_composition() {
         assert!(presented.contains(&ChromeStep::StatsDeck), "{shape:?}");
     }
 
-    // Negative control: a capture that skips a layer the present ran.
     let mut app = shaped(Shape::TerminalSingle);
     let _ = trace::take();
     present(&mut app);
@@ -220,8 +218,6 @@ fn native_present_is_unchanged_by_the_footer_menu_and_link_steps() {
         "native Settings: the steps change no pixel"
     );
 
-    // Non-vacuity: with a terminal leaf and a hovered link, the same mask
-    // removes the link's caption from the glass.
     let mut app = shaped(Shape::Heterogeneous);
     let (term, session) = {
         let front = app
@@ -290,7 +286,6 @@ fn headless_capture_shows_the_wallpaper() {
         "precondition: a capture is repeatable"
     );
 
-    // Negative control: the same window with no wallpaper configured.
     app.config_assets = std::sync::Arc::default();
     let bare = image(&mut app);
     assert_eq!((bare.0, bare.1), (papered.0, papered.1));
@@ -302,8 +297,6 @@ fn headless_capture_shows_the_wallpaper() {
 #[test]
 fn terminal_present_visuals_equal_host_visual_state() {
     let mut app = scripted_app();
-    // Far enough ahead that the wall clock never reaches the bell's deadline
-    // during the test: only a frame clock past it can end the flash.
     let rung = Instant::now() + Duration::from_secs(3600);
     let during = rung + Duration::from_millis(50);
     let after = rung + aterm_core::bell::FLASH_DURATION + Duration::from_millis(50);
@@ -330,19 +323,16 @@ fn terminal_present_visuals_equal_host_visual_state() {
         (painted, app.host_visual_state(WID, at))
     };
 
-    // Bell, drop wash (over the rim).
     let (painted, policy) = present_at(&mut app, during);
     assert_eq!(painted, policy);
     assert!(painted.invert && painted.overlay.is_some());
     let wash = painted.overlay;
 
-    // Bell, upgrade rim.
     app.windows.get_mut(&WID).expect("window").drag_hover = false;
     let (painted, policy) = present_at(&mut app, during);
     assert_eq!(painted, policy);
     assert!(painted.invert && painted.overlay.is_some() && painted.overlay != wash);
 
-    // A modal overlay suppresses the bell and the wash; the rim stays.
     app.windows.get_mut(&WID).expect("window").drag_hover = true;
     app.palette_enter();
     assert!(app.windows[&WID].overlay_open());
@@ -350,8 +340,6 @@ fn terminal_present_visuals_equal_host_visual_state() {
     assert_eq!(painted, policy);
     assert!(!painted.invert && painted.overlay.is_some() && painted.overlay != wash);
 
-    // Negative control: a frame clock past the bell's deadline ends the flash,
-    // though the wall clock is still inside it.
     app.palette_exit();
     let ws = app.windows.get_mut(&WID).expect("window");
     assert!(!ws.overlay_open());

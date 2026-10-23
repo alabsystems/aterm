@@ -6,8 +6,7 @@
 // aterm project in 2026: the buffer is a `Vec`.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
-//! A compact unscaled, unhinted outline: integer points with their curve
-//! flags and contour starts, what the hinter measures and fits.
+//! Compact unscaled, unhinted outline points and contours.
 
 use super::DrawError;
 use super::fixed::{F26Dot6, Point};
@@ -23,8 +22,7 @@ pub(crate) struct UnscaledPoint {
 }
 
 impl UnscaledPoint {
-    /// A `glyf` point from the unscaled loader: whole units in 26.6,
-    /// shifted down and truncated to 16 bits as skrifa does.
+    /// A `glyf` point from the unscaled loader.
     pub(crate) fn from_glyf_point(
         point: Point<F26Dot6>,
         flags: PointFlags,
@@ -89,10 +87,7 @@ pub(crate) struct UnscaledOutlineRef<'a> {
 }
 
 impl UnscaledOutlineRef<'_> {
-    /// The point range of the contour holding the last point where `f`
-    /// answers true, and that point's index in it. Single-point contours
-    /// are skipped. (The extremum search of blue zone computation, FreeType
-    /// aflatin.c.)
+    /// The point range of the contour holding the last point where `f` answers true.
     pub(crate) fn find_last_contour(
         &self,
         mut f: impl FnMut(&UnscaledPoint) -> bool,
@@ -101,7 +96,6 @@ impl UnscaledOutlineRef<'_> {
             return None;
         }
         let mut best_contour = 0..0;
-        // Index of the best point relative to the start of the best contour.
         let mut best_point = 0;
         let mut cur_contour = 0..0;
         let mut found_best_in_cur_contour = false;
@@ -112,7 +106,6 @@ impl UnscaledOutlineRef<'_> {
                 }
                 cur_contour = point_ix..point_ix;
                 found_best_in_cur_contour = false;
-                // Ignore single point contours.
                 match self.points.get(point_ix + 1) {
                     Some(next_point) if next_point.is_contour_start => continue,
                     None => continue,
@@ -142,8 +135,7 @@ enum PendingElement {
     Cubic([f32; 6]),
 }
 
-/// Feeds an [`UnscaledOutlineSink`] from segments (the CFF path), holding
-/// each segment until it knows whether the contour closes on it.
+/// Feeds an [`UnscaledOutlineSink`] from segments.
 pub(crate) struct UnscaledPenAdapter<'a, T> {
     sink: &'a mut T,
     failed: bool,

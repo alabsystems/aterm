@@ -4663,6 +4663,23 @@ fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
     });
 }
 
+/// lists: at 2× the screen starts with the stop that lists what the 1×
+/// screen started with — or, where no stop lists that any more, the first
+/// stop after it that is listed — and back at 1× with no event since, with
+/// the very stop the 1× screen started with, as a wheel's place holds until
+/// an event moves it (R4 of the keeping rules: kept by what the 2× screen
+/// started with, Themes at 444x292 left at stop 4 came back at stop 5);
+/// where the scroll settled on the 2× screen before the change back, with
+/// the stop that lists what that screen started with (a 2× screen past the
+/// 1× list's last kept its place too). So with the keyboard off the list (on
+/// the search field, on the sidebar row that opened the page) as with none,
+/// and the next frame at either size, nothing between, draws the same
+/// screen: Home at 1564x180 drew its 2× screen from the stop it was at, and
+/// the next frame from the stop after, where the scroll it was asked for
+/// stood. On a list's last screen, which starts where the list's end puts
+/// it, the stop is on the screen whole. At 80×24 and 102×29, and at the
+/// short windows 60×20, 102×12, 80×16 and 220×12, where what a screen starts
+/// with is often listed otherwise at the other size
 #[test]
 fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
     let set_scale = |scale: f32| {
@@ -4783,19 +4800,27 @@ fn a_text_size_change_keeps_the_list_at_the_stop_it_was_at() {
                             ));
                     }
                     let (_, shown_back, last, _) = place(&lab);
-                    let want = if top_two == 0 {
+                    // No event since the 1× screen: that screen's stop; else
+                    // the 2× screen's, and a list at its top stays there.
+                    let want = if !settled {
+                        Some(at)
+                    } else if top_two == 0 {
                         Some(0)
                     } else {
                         kept(&two, shown_two.start, &one)
                     };
                     if !keeps(&shown_back, last, want) {
+                        let why = if settled {
+                            format!("which lists what stop {} at 2× did", shown_two.start)
+                        } else {
+                            "where it was at 1×, no event since".to_string()
+                        };
                         faults
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push(format!(
                                 "{context}: back at 1× the screen shows {shown_back:?}, not from \
-                                 stop {want:?}, which lists what stop {} at 2× did",
-                                shown_two.start
+                                 stop {want:?}, {why}"
                             ));
                     }
                     checked.fetch_add(1, Relaxed);

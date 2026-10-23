@@ -168,7 +168,7 @@ impl<P: PolicyProbe> std::fmt::Debug for TapedProbe<P> {
 
 impl TapedProbe {
     /// A probe recording through `fx`, the worker digested with `seed`.
-    pub(crate) fn new(fx: Fx, seed: u64) -> Self {
+    pub(crate) const fn new(fx: Fx, seed: u64) -> Self {
         Self {
             fx,
             live: LiveProbe,
@@ -439,7 +439,7 @@ pub(crate) struct KeyedProbe {
 
 impl KeyedProbe {
     /// A probe standing where the recorded loop had read the first `seen` of the records `index`.
-    pub(crate) fn at(index: Arc<TapeIndex>, seen: usize, roots: Roots, seed: u64) -> Self {
+    pub(crate) const fn at(index: Arc<TapeIndex>, seen: usize, roots: Roots, seed: u64) -> Self {
         Self {
             index,
             seen,
@@ -561,7 +561,8 @@ pub(crate) enum Answer<T> {
     Err(String),
 }
 
-/// `value` as JSON bytes.
+/// `value` as JSON bytes. The mirrors below hold strings, numbers, booleans and
+/// lists of them, which always serialize.
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     aterm_json::to_vec(value).unwrap_or_default()
 }

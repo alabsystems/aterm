@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-machines-askpass`: the `SSH_ASKPASS` program `enroll` points each Mac's `ssh` login at
-//! (design §4.2).
+//! `aterm-machines-askpass`: the `SSH_ASKPASS` helper used during `aterm machines enroll`.
 
 use crate::port::Secret;
 use std::ffi::OsString;
@@ -56,9 +55,7 @@ impl Write for Unbuffered {
     }
 }
 
-/// Answer `prompt` with the first line of `input` on `out`: exit status 0, or 1 with one line on
-/// `err` when it is not a password prompt this helper may answer (`confirm`: OpenSSH asked a yes/no
-/// question; `person`: standard input is a terminal) or `input` has nothing left.
+/// Answers `prompt` with the first line of `input` on `out`, or writes a refusal to `err`.
 pub fn answer(
     prompt: &str,
     confirm: bool,
@@ -101,8 +98,7 @@ pub fn answer(
     0
 }
 
-/// Whether OpenSSH's `prompt` asks for the account's password (`…'s password: `, or
-/// keyboard-interactive's `(user@host) Password:`), not a passphrase or a code.
+/// Returns whether OpenSSH's `prompt` requests an account password rather than a passphrase or code.
 #[must_use]
 pub fn is_password_prompt(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
@@ -113,7 +109,6 @@ pub fn is_password_prompt(prompt: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The prompts measured in the VM, for the password and keyboard-interactive methods.
     const PASSWORD: &str = "admin@192.168.64.5's password: ";
     const KBD_INT: &str = "(admin@192.168.64.5) Password:";
 

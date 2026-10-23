@@ -67,6 +67,7 @@ pub enum Offered {
 pub struct BusSpace {
     ep: u32,
     records: BTreeMap<u64, (u64, Rec)>,
+    /// Records outside this build's bus class, by seq: each one's `ms`, held
     /// and never folded (the module doc: unknown is not hostile).
     unknown: BTreeMap<u64, u64>,
     covers: Vec<(u64, u64, &'static str)>,
@@ -158,11 +159,13 @@ impl BusSpace {
         Offered::Record
     }
 
+    /// Whether a body of key `seq` is held (a record, or one outside this
     /// build's bus class).
     fn holds_seq(&self, seq: u64) -> bool {
         self.records.contains_key(&seq) || self.unknown.contains_key(&seq)
     }
 
+    /// Every `ms` a body holds: the records' and those outside this build's
     /// bus class (never folded, still said).
     fn held_ms(&self) -> impl Iterator<Item = u64> + '_ {
         self.records
@@ -206,6 +209,7 @@ impl BusSpace {
         self.snap.as_ref()
     }
 
+    /// Each cover's `[lo, hi]` (an offered cover's `hi` is within
     /// [`crate::SEQ_LIMIT`]; saturating all the same).
     fn spans(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.covers

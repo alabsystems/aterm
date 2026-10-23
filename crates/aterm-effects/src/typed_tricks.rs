@@ -121,7 +121,8 @@ impl TrickFeed<'_> {
     };
 }
 
-/// A word held inline: at most [`TOKEN_CHARS`] characters, no heap.
+/// A word held inline: at most [`TOKEN_CHARS`] characters, no heap. `Copy`, so
+/// snapshots, held address words and parked fires carry it by value.
 #[derive(Clone, Copy)]
 struct Word {
     bytes: [u8; WORD_BYTES],
@@ -354,7 +355,8 @@ const fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
     }
 }
 
-/// [`TrickEvent::Fire::back_chars`].
+/// [`TrickEvent::Fire::back_chars`]. `since_end`: characters typed after the
+/// word and before this press's closer.
 #[inline]
 const fn back_chars(since_end: u32, fed: u32, word_chars: u32) -> u16 {
     let distance = if fed <= since_end {
@@ -369,10 +371,12 @@ const fn back_chars(since_end: u32, fed: u32, word_chars: u32) -> u16 {
     }
 }
 
-/// Everything a line reset clears.
+/// Everything a line reset clears. `Copy`: the boundary snapshot is one of
+/// these by value.
 #[derive(Clone, Copy, Debug)]
 struct Line {
-    /// The open token, raw as typed.
+    /// The open token, raw as typed. Holds the first [`TOKEN_CHARS`] characters;
+    /// `token_chars` keeps counting, and an overflowed token is never looked up.
     token: Word,
     token_chars: u32,
     /// The delimiter run left of the open token (or of the caret), first
@@ -386,7 +390,8 @@ struct Line {
     line_chars: u32,
     /// Every token so far was pet vocabulary and no code has appeared.
     pure: bool,
-    /// The line holds something the listener did not see.
+    /// The line holds something the listener did not see. Only a reset lifts
+    /// it.
     poisoned: bool,
     /// At least one vocabulary word has closed on this (pure) line.
     any_word: bool,
@@ -962,7 +967,8 @@ impl TrickListener {
         }
     }
 
-    /// Snapshot the line, then take the open token off it.
+    /// Snapshot the line, then take the open token off it. The snapshot is the
+    /// one level of undo Backspace has (module docs).
     #[inline]
     const fn end_token(&mut self) -> (Word, u32) {
         let token = (self.line.token, self.line.token_chars);
@@ -1178,7 +1184,8 @@ impl TrickListener {
         }
     }
 
-    /// The line is not pet talk.
+    /// The line is not pet talk. Nothing on it fires from here on, and a live
+    /// tentative fire is withdrawn.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -1447,7 +1454,8 @@ words = ["请"]
 cjk   = true
 "#;
 
-    /// One keystroke of the rig's clock: a brisk typist.
+    /// One keystroke of the rig's clock: a brisk typist. Five of them (a
+    /// four-letter word and its space) stay well inside [`PHRASE_GAP`].
     const KEY_GAP: Duration = Duration::from_millis(80);
 
     /// What the rig saw, owned (an event borrows the listener).
@@ -1506,7 +1514,9 @@ cjk   = true
         }
     }
 
-    /// A listener, a vocabulary, an injected clock and a log.
+    /// A listener, a vocabulary, an injected clock and a log. It hands over the
+    /// vocabulary only when the matching `needs_lexicon` predicate asks, so every
+    /// test also proves the predicates never under-ask.
     struct Rig {
         listener: TrickListener,
         lexicon: TrickLexicon,
@@ -3099,7 +3109,9 @@ cjk   = true
         }
     }
 
-    /// The same lines against the shipped English.
+    /// The same lines against the shipped English. Which survive depends on the
+    /// word lists; what is pinned is the listener's half: a fire becomes final
+    /// only while every word typed so far is shipped pet vocabulary.
     #[test]
     fn under_the_shipped_english_a_fire_is_final_only_on_an_all_vocabulary_prefix() {
         let shipped = TrickLexicon::shared_en();
@@ -3314,7 +3326,10 @@ cjk   = true
         }
     }
 
-    /// One word as a reader takes it.
+    /// One word as a reader takes it. A run that is no word reads as its
+    /// command when any cut makes it a name of two or more characters and a
+    /// trick word, neither `unglued`, all in a script written without spaces
+    /// (not as a name: it names nothing).
     fn read(lexicon: &TrickLexicon, word: &str, scratch: &mut String) -> Option<TrickRole> {
         if let Some(role) = lexicon.classify(word, scratch) {
             return Some(role);

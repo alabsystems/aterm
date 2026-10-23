@@ -99,13 +99,10 @@ fn an_orphan_attaches_to_the_nearest_open_ancestor() {
     let run = agent_session(&mut log, 0);
     let turn = open(&mut log, Kind::Turn, Some(run), 1).expect("turn");
     done(&mut log, turn, 2).expect("closed");
-    // A step asked under the closed turn hangs from the run, marked.
     let p = open(&mut log, Kind::Wall, Some(turn), 3).expect("step");
     let r = log.window().last().expect("its open").clone();
     assert_eq!((r.node, r.par), (p, Some(run)));
     assert_eq!(r.f.get_u(Key::Orphan), Some(1));
-    // A turn with no run anywhere hangs from the session, marked; a parent
-    // is never invented.
     let mut bare = Log::new(0);
     let t = open(&mut bare, Kind::Turn, None, 0).expect("turn");
     let r = bare.window().last().expect("its open");
@@ -266,8 +263,6 @@ fn a_same_level_parent_is_natural() {
     assert_eq!(r.f.get_u(Key::Orphan), None, "{r:?}");
     assert_eq!(log.open_entry(appr).map(|e| e.parent), Some(tool));
 
-    // OSC 133 D closes the cmd run: everything under it goes, innermost
-    // first.
     done(&mut log, cmd, 10).expect("the cmd closes");
     let outs: Vec<(Node, &str)> = log
         .window()
@@ -284,8 +279,6 @@ fn a_same_level_parent_is_natural() {
             (cmd, "ok")
         ]
     );
-    // A step asked under a closed step whose parent step is open hangs from
-    // that step, an orphan.
     let mut log = Log::new(0);
     let run = agent_session(&mut log, 0);
     let turn = open(&mut log, Kind::Turn, Some(run), 1).expect("turn");
@@ -337,8 +330,6 @@ fn the_log_owns_its_own_keys() {
     );
     assert_eq!(lines(&log), before, "refusals write nothing");
 
-    // A block the sweep saw only complete: its wall stamps give `t=` and
-    // the duration.
     let cmd = open(&mut log, Kind::Cmd, None, 7).expect("cmd");
     log.close(
         cmd,

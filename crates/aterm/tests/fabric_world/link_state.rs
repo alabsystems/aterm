@@ -29,6 +29,9 @@ fn boot_sid(w: &World) -> String {
     })
 }
 
+/// The broker is the harness's own, so "killed" is its handle's `shutdown` —
+/// which force-closes every live connection, exactly what a `kill -9` of a
+/// `link broker` process does to its peers — and "restarted" is a new `Broker`
 /// on the same log and the same socket path.
 #[test]
 fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
@@ -140,6 +143,7 @@ fn a_killed_broker_stalls_the_fabric_and_a_restart_reconnects() {
     );
 }
 
+/// **A SOCKET PATH NOTHING LISTENS ON IS `stalled reason=no-socket`, AND NEVER
 /// `connected`.**
 #[test]
 fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
@@ -173,6 +177,8 @@ fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
     );
 }
 
+/// **A BROKER THAT ACCEPTS AND NEVER ACKS IS `stalled reason=no-ack`.** Before
+/// the ack deadline existed this bridge parked in its first `attach` for the
 /// life of the process, reporting nothing; the endpoint said `connected`.
 #[test]
 fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
@@ -216,6 +222,11 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **A BRIDGE THAT CANNOT FINISH ITS ATTACH NEVER READS `connected`, AND
+/// WRITES NO RECORD.** Its cap is the node ring minus `ro:/f/<F>/fleet/>`, so
+/// the broker refuses the standing-halt read the bridge cannot attach without.
+/// The halt is read before anything is published and no ack is reported `up`
+/// until the attach completed: `stalled reason=read`, an empty node face, and
 /// a `post --wait` refused at once.
 #[test]
 fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
@@ -253,6 +264,16 @@ fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
     );
 }
 
+/// **A RENEWED CAP IS ATTACHED AT THE NEXT REDIAL, BY THE SAME BRIDGE**
+/// (audit 16). The node's ring is minted already lapsed (`exp=1`, 1970), so
+/// the guarded broker refuses its attach AS EXPIRED and the bridge reads
+/// `stalled reason=expired` — not the `attach` of a cap the broker does not
+/// take at all, whose remedy is another mint, not a renewal — redialling
+/// under its back-off. A renewed ring written over
+/// `node.cap` by rename — as `aterm fabric on` installs a re-minted one — is
+/// all it takes: the bridge reads the file again before its next dial and
+/// comes up `connected`, with the same pid. A bridge that read its cap only
+/// at start (the negative control: the code before this) redials the lapsed
 /// ring until it is killed, and the wait below fails at its hang detector.
 #[test]
 fn a_renewed_cap_is_attached_at_the_next_redial_without_a_restart() {

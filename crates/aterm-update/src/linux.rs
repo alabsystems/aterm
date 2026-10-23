@@ -89,7 +89,8 @@ struct Context {
     candidate_hashed: std::sync::Arc<std::sync::Mutex<Option<(FileStamp, String)>>>,
 }
 
-/// Which file, and which bytes of it, a digest was read from.
+/// Which file, and which bytes of it, a digest was read from. A rename over the file (as
+/// every writer of the candidate does) changes its inode, and a length change its size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileStamp {
     dev: u64,
@@ -111,7 +112,8 @@ impl FileStamp {
     }
 }
 
-/// Capture the canonical executable path before the first replacement.
+/// Capture the canonical executable path before the first replacement. On Linux
+/// current_exe() later names the unlinked old inode with a " (deleted)" suffix.
 static CONTEXT: OnceLock<Result<Context, String>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,7 +139,10 @@ struct Trial {
     phase: Phase,
     starts: u32,
     healthy: bool,
-    /// When the latest counted start began (Unix seconds; `0` for none).
+    /// When the latest counted start began (Unix seconds; `0` for none). A start over the
+    /// budget rolls back only once this one can no longer confirm itself
+    /// ([`crate::linux_trial::start_rolls_back`]): a burst of session starts is all counted
+    /// before the first prompt confirms.
     #[serde(default)]
     last_start_unix: i64,
     /// The same moment on the steady clock, with the boot it counts on
@@ -145,7 +150,10 @@ struct Trial {
     /// age on a clock no NTP step moves ([`crate::linux_trial::judged_now`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_start_steady: Option<Steady>,
-    /// A window start of this trial confirmed it.
+    /// A window start of this trial confirmed it. Until one has, window starts go on
+    /// counting, and roll the install back past the budget, even once a terminal session
+    /// confirmed the trial: a session's prompt proves the session lane only
+    /// ([`crate::linux_trial::Lanes`]).
     #[serde(default)]
     window_proven: bool,
     /// The trial a prepared install displaced, put back if the install is abandoned before
@@ -367,7 +375,9 @@ impl Context {
         })
     }
 
-    /// The durable state record.
+    /// The durable state record. Not named `read`: the lock-order census knows a
+    /// lock by its method name, and a state read held across `install_locked`'s
+    /// own read would look like a re-entrant `context` lock.
     fn read_state(&self) -> Result<Option<State>, String> {
         let path = self.dir.join("state.toml");
         if !path.try_exists().map_err(|e| e.to_string())? {
@@ -442,7 +452,9 @@ enum KeptCopy {
     Digest(String),
 }
 
-/// What is at `backup`.
+/// What is at `backup`. `Err` only for a read that did not finish and may on a later try (an
+/// I/O error, an interrupted call, no descriptor free); every answer about the file itself is
+/// a [`KeptCopy`].
 fn kept_copy(backup: &Path) -> Result<KeptCopy, String> {
     match fs::symlink_metadata(backup) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(KeptCopy::Missing),
@@ -496,7 +508,8 @@ fn sync_dir(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("sync {}: {e}", path.display()))
 }
 
-/// [`sync_dir`], only ordered ([`aterm_durable::ordered_dir`]).
+/// [`sync_dir`], only ordered ([`aterm_durable::ordered_dir`]). On Linux, where this lane
+/// runs, that is the same full `fsync(2)`, so each caller names only what it needs.
 fn ordered_dir(path: &Path) -> Result<(), String> {
     aterm_durable::ordered_dir(path).map_err(|e| format!("sync {}: {e}", path.display()))
 }
@@ -533,7 +546,9 @@ fn fresh_written(
     }
 }
 
-/// The stems [`fresh_file`]'s callers name their files with.
+/// The stems [`fresh_file`]'s callers name their files with. Each writer holds the
+/// copy's update lock for as long as its file exists, so one found under the lock is
+/// a dead writer's ([`sweep_stale_temps`]).
 const TEMP_STEMS: [&str; 6] = [
     "record",
     "download",
@@ -656,7 +671,9 @@ fn verify_binary(
     })
 }
 
-/// The signed digest is checked before this function is called.
+/// The signed digest is checked before this function is called. A short,
+/// environment-independent identity command proves loader viability and the
+/// exact compiled release identity without enrolling or starting a terminal.
 fn probe_candidate(
     path: &Path,
     manifest: &Manifest,
@@ -1994,7 +2011,8 @@ fn confirm_locked(
     .map(|confirmed| matches!(confirmed, Confirmed::Yes | Confirmed::NotPending))
 }
 
-/// Confirm the pending trial from `lane`.
+/// Confirm the pending trial from `lane`. Every lane needs the trial's own build and commit
+/// and this process running the very file on trial.
 fn confirm_lane_locked(
     context: &Context,
     state: &mut State,
@@ -2261,7 +2279,10 @@ fn check_locked(
     Ok(Checked::Channel)
 }
 
-/// A held stage is proved again under the roster this check admitted.
+/// A held stage is proved again under the roster this check admitted. `authorize_one`
+/// ratchets `roster_floor` on every check, even of a head with nothing to install, while
+/// the held stage keeps the proof it was staged with, whose older roster `apply` would
+/// then refuse as a replay (`Rollback`).
 fn reroot_held_stage_proof(
     context: &Context,
     state: &mut State,
@@ -2317,7 +2338,8 @@ fn automatic_apply_allowed(source: &Source, provider: &crate::CheckSettingsProvi
     current.source == *source && current.auto_apply
 }
 
-/// Retire presentation authority before changing its bytes/proof.
+/// Retire presentation authority before changing its bytes/proof. A failed
+/// download admission or identity probe must never resurrect an older stage.
 fn clear_stage(context: &Context, state: &mut State) -> Result<(), String> {
     if state.staged.take().is_some() {
         context.save(state)?;
@@ -2325,7 +2347,9 @@ fn clear_stage(context: &Context, state: &mut State) -> Result<(), String> {
     Ok(())
 }
 
-/// Why [`automatic_apply_allowed`] holds a stage, read from the same provider.
+/// Why [`automatic_apply_allowed`] holds a stage, read from the same provider. The
+/// install switch is named as Settings paints it
+/// ([`aterm_update_core::settings::install_switch_off`]), never by its key.
 fn apply_held_reason(source: &Source, provider: &crate::CheckSettingsProvider) -> String {
     match provider() {
         None => "the update settings couldn\u{2019}t be confirmed".to_string(),
@@ -2350,7 +2374,8 @@ fn held_stage(context: &Context, state: &mut State, why: &str) -> Result<String,
     Ok(state.outcome.clone())
 }
 
-/// A stage buys no replacement authority.
+/// A stage buys no replacement authority. Both the initial decision and the
+/// final post-probe/pre-rename boundary sample the current source/apply policy.
 fn finish_candidate(
     context: &Context,
     state: &mut State,
@@ -2424,7 +2449,10 @@ pub(crate) fn check_with_settings(
     check_recording(current_build, provider, force).0
 }
 
-/// [`check_with_settings`], and what the record made of the pass.
+/// [`check_with_settings`], and what the record made of the pass. The record counts a
+/// failure only once the save after the check lands, so a failure before it (the pre-I/O
+/// save refused by a full or read-only filesystem, a record or settings that will not
+/// read) is counted by the background loop itself ([`crate::linux_notice::Record::Lost`]).
 fn check_recording(
     current_build: u64,
     provider: &crate::CheckSettingsProvider,

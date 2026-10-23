@@ -198,7 +198,8 @@ fn redact_words(line: &str) -> String {
     out
 }
 
-/// [`redact_words`] for one token, onto `out`.
+/// [`redact_words`] for one token, onto `out`. A token that carries a fleet
+/// code keeps what comes before it.
 fn redact_word(word: &str, out: &mut String) {
     let variable = word.starts_with('$') && word.contains('/');
     if let Some(at) = word.to_ascii_lowercase().find(FLEET_CODE) {
@@ -320,7 +321,10 @@ fn branch_token(text: Option<&str>) -> String {
 /// The most bytes of a role facts carry ([`role_token`]).
 const ROLE_LABEL_MAX: usize = 32;
 
-/// A role for the wire at `level`.
+/// A role for the wire at `level`. A role is a label someone stamped for
+/// others to read (`meta set role`: `operator`, `worker:claude-satcomp`), so
+/// FACTS carry it when it is one: a word of at most [`ROLE_LABEL_MAX`]
+/// letters, digits and `:_.-`.
 fn role_token(role: Option<&str>, level: SurveyLevel) -> String {
     let role = role.map(str::trim);
     let label = |role: &&str| {

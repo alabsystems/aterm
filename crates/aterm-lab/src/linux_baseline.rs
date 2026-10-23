@@ -488,7 +488,7 @@ impl Class {
         }
     }
 
-    fn parse(c: char) -> Option<Class> {
+    const fn parse(c: char) -> Option<Class> {
         match c {
             '=' => Some(Class::Behaviour),
             '~' => Some(Class::Measured),
@@ -615,7 +615,7 @@ pub struct Diff {
 
 impl Diff {
     #[must_use]
-    pub fn same_behaviour(&self) -> bool {
+    pub const fn same_behaviour(&self) -> bool {
         self.behaviour.is_empty()
     }
 }
@@ -1255,7 +1255,7 @@ impl SeatUnit {
 }
 
 impl Session<'_> {
-    fn up(&self) -> &Up {
+    const fn up(&self) -> &Up {
         self.gui.up
     }
 

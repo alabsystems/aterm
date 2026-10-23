@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The occupancy board: the snapshot's facts as the board copies them, its
-//! staleness, and the slot reader's every reading as a snapshot carries it.
+//! Occupancy board snapshot, staleness, and slot-reader tests.
 
 use super::*;
 use aterm_sysprobe::slots::{Holder, SlotCounts};
@@ -64,11 +63,9 @@ fn the_board_copies_the_snapshots_facts_and_says_when_it_is_stale() {
             stale: false,
         }
     );
-    // Stale only past two disk looks.
     let edge = i64::try_from(STALE_AFTER.as_millis()).unwrap();
     assert!(!board_of(&s, Some(NOW - edge), None, NOW).stale);
     assert!(board_of(&s, Some(NOW - edge - 1), None, NOW).stale);
-    // No snapshot yet: every fact unread, and stale.
     let none = board_of(&Snapshot::default(), None, None, NOW);
     assert_eq!(
         none,
@@ -85,8 +82,6 @@ fn the_board_copies_the_snapshots_facts_and_says_when_it_is_stale() {
             stale: true,
         }
     );
-    // An unread pressure and an unjudged volume are none; a load no load is
-    // (NaN, negative) is none.
     let odd = snapshot(Some([f64::NAN, -1.0, 0.0]), Pressure::Unknown, None);
     let b = board_of(&odd, Some(NOW), Some(Level::Unknown), NOW);
     assert_eq!(
@@ -273,7 +268,6 @@ fn the_slot_term_spans_twenty_minutes_of_the_boards_looks() {
     );
     step(&mut j, &s20, t0 + 20 * MIN_MS, &[]);
     assert_eq!(read_at_look(&j, "a").slots_free_ms, Some(20 * 60_000));
-    // The same snapshot at the next look: it held no longer.
     j.step(
         board_of(&s20, Some(t0 + 20 * MIN_MS), None, t0 + 21 * MIN_MS),
         Some(&s20),
@@ -281,7 +275,6 @@ fn the_slot_term_spans_twenty_minutes_of_the_boards_looks() {
     );
     assert_eq!(read_at_look(&j, "a").slots_free_ms, Some(20 * 60_000));
 
-    // Negative controls: each break starts the span over.
     let fed = |j: &mut Judged, m: i64, slots, age| {
         step(
             j,
@@ -291,12 +284,10 @@ fn the_slot_term_spans_twenty_minutes_of_the_boards_looks() {
         );
         read_at_look(j, "a").slots_free_ms
     };
-    // None free at 22: from 23, twenty more minutes.
     assert_eq!(fed(&mut j, 22, NONE_FREE, Some(0)), None);
     assert_eq!(fed(&mut j, 23, THREE_ONE_FREE, Some(0)), None);
     assert_eq!(fed(&mut j, 42, THREE_ONE_FREE, Some(0)), None);
     assert_eq!(fed(&mut j, 43, THREE_ONE_FREE, Some(0)), Some(20 * 60_000));
-    // A stale board.
     let late = at(
         t0 + 44 * MIN_MS,
         THREE_ONE_FREE,
@@ -313,8 +304,6 @@ fn the_slot_term_spans_twenty_minutes_of_the_boards_looks() {
     assert_eq!(read_at_look(&j, "a").room, None);
     assert_eq!(fed(&mut j, 51, THREE_ONE_FREE, Some(0)), None);
     assert_eq!(fed(&mut j, 70, THREE_ONE_FREE, Some(0)), None);
-    // A slots reading past the board's cadence reads as warming; one within
-    // it (the reader's at-rest period) speaks for the look.
     let stale_ms = u64::try_from(STALE_AFTER.as_millis()).unwrap();
     assert_eq!(
         fed(&mut j, 71, THREE_ONE_FREE, Some(stale_ms)),
@@ -385,8 +374,6 @@ fn a_session_is_held_at_the_looks_its_tab_held_a_slot() {
     );
     assert_eq!(read_at_look(&j, "a").held_slot_last_ms, Some(NOW));
     assert_eq!(read_at_look(&j, "b").held_slot_last_ms, None);
-    // Later looks with no holder in either tab, or none attributed: "a"
-    // keeps its last.
     for tabs in [Some(vec![]), Some(vec![11]), None] {
         step(
             &mut j,
@@ -397,7 +384,6 @@ fn a_session_is_held_at_the_looks_its_tab_held_a_slot() {
         assert_eq!(read_at_look(&j, "a").held_slot_last_ms, Some(NOW));
         assert_eq!(read_at_look(&j, "b").held_slot_last_ms, None);
     }
-    // A stale board's snapshot names "b": not taken.
     let old = at(
         NOW + MIN_MS,
         THREE_ONE_FREE,
@@ -411,7 +397,6 @@ fn a_session_is_held_at_the_looks_its_tab_held_a_slot() {
         &sessions,
     );
     assert_eq!(read_at_look(&j, "b").held_slot_last_ms, None);
-    // Kept HELD_KEEP, then forgotten.
     let keep = i64::try_from(HELD_KEEP.as_millis()).unwrap();
     step(
         &mut j,
@@ -465,7 +450,6 @@ fn the_reading_is_the_board_for_one_session() {
             held_slot_last_ms: None,
         }
     );
-    // Unread slots are none.
     step(
         &mut j,
         &at(
@@ -501,8 +485,6 @@ fn a_slot_holder_counts_for_the_tab_whose_tree_holds_it() {
         ppid,
         ..ProcSample::default()
     };
-    // aterm (100) runs tab 7's shell (200) and tab 9's (300); 210 and 211
-    // are builds under tab 7's shell, 400 one outside aterm.
     let procs = [
         proc(100, 1),
         proc(200, 100),
@@ -513,6 +495,7 @@ fn a_slot_holder_counts_for_the_tab_whose_tree_holds_it() {
     ];
     let tab = |key, shell_pid| TabRoot {
         key,
+        tab: key,
         shell_pid,
         label: String::new(),
         program: String::new(),
@@ -538,7 +521,6 @@ fn a_slot_holder_counts_for_the_tab_whose_tree_holds_it() {
         slot_tabs(&read(&[211, 210]), Some(&procs), 100, &tabs, &mut current),
         Some(vec![7])
     );
-    // Negative controls: outside every tab, gone from the sweep, none held.
     assert_eq!(
         slot_tabs(&read(&[400, 999]), Some(&procs), 100, &tabs, &mut current),
         Some(vec![])
@@ -565,7 +547,6 @@ fn a_slot_holder_counts_for_the_tab_whose_tree_holds_it() {
         ),
         None
     );
-    // Tab 9's holder gone since, its pid another process's: tab 7's alone.
     let mut asked = Vec::new();
     assert_eq!(
         slot_tabs(
@@ -582,9 +563,6 @@ fn a_slot_holder_counts_for_the_tab_whose_tree_holds_it() {
     );
     assert_eq!(asked, [300, 210]);
 
-    // The sweep saw an old member of tab 7. A fresh slot reading proves a
-    // new holder at that same pid: its current birth matches, but its boot
-    // start differs from the sweep's. It must not inherit the old tab.
     let replacement = Some(ProcessStart {
         boot: BootClock(999),
         wall: Some(ProcessBirth {
@@ -680,7 +658,6 @@ fn the_machine_paces_six_lines_an_hour_across_its_sessions() {
         j.pace("s-new", RuleId::WaitNudge, NOW, late),
         PaceGrant::Machine
     );
-    // CONTROL: an hour after the first line, one more goes.
     assert_eq!(
         j.pace("s-new", RuleId::WaitNudge, NOW, NOW + 60 * MIN_MS),
         PaceGrant::Granted
@@ -699,17 +676,13 @@ fn one_free_slot_is_reserved_for_one_line() {
         j.pace("b", RuleId::HoldRoom, NOW, NOW + 1_000),
         PaceGrant::Reserved
     );
-    // A nudge takes no slot.
     assert_eq!(
         j.pace("b", RuleId::WaitNudge, NOW, NOW + 2_000),
         PaceGrant::Granted
     );
-    // Past the reservation's ten minutes (the board looked again), the slot
-    // is free for the other.
     let past = NOW + RESERVE_MS;
     board_with(&mut j, past, 1, None);
     assert_eq!(j.pace("b", RuleId::HoldRoom, NOW, past), PaceGrant::Granted);
-    // The build it was for took its slot: released at the look that saw it.
     let mut j = Judged::default();
     board_with(&mut j, NOW, 1, None);
     assert_eq!(j.pace("a", RuleId::HoldRoom, NOW, NOW), PaceGrant::Granted);
@@ -718,8 +691,6 @@ fn one_free_slot_is_reserved_for_one_line() {
         j.pace("b", RuleId::HoldRoom, NOW, NOW + MIN_MS),
         PaceGrant::Granted
     );
-    // NEGATIVE CONTROL: a look that sees another tab's holder releases
-    // nothing.
     let mut j = Judged::default();
     board_with(&mut j, NOW, 1, None);
     assert_eq!(j.pace("a", RuleId::HoldRoom, NOW, NOW), PaceGrant::Granted);
@@ -754,7 +725,6 @@ fn the_oldest_hold_takes_a_freed_slot_first() {
         j.pace("old", RuleId::HoldRoom, older, freed + 1_000),
         PaceGrant::Granted
     );
-    // CONTROL: the older hold stopped asking; the younger takes the slot.
     let mut j = Judged::default();
     board_with(&mut j, NOW, 0, None);
     assert_eq!(

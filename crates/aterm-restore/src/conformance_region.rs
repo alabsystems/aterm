@@ -26,6 +26,7 @@ const RECORD: u64 = 24;
 /// The live engine's size: the units print on its second row, under the prefill.
 const ROWS: u16 = 2;
 const COLS: u16 = 12;
+/// The keyframes' bridge: enough to carry the prefill's history, so a clear replayed onto
 /// an early keyframe clears something.
 const BRIDGE: usize = 8;
 /// The history ring's modulus.
@@ -41,6 +42,7 @@ const WRITER: WriterIdentity<'static> = WriterIdentity {
     sid: "tier-1",
 };
 
+/// The model's writer-side alphabet. `Die` and the restore actions are the death check's;
 /// the two poisons are ghosts of the restorer, set on the dead state.
 const LIVE: [&str; 7] = [
     "Gather",
@@ -86,6 +88,7 @@ fn letters(checkpoint: &TerminalCheckpoint) -> String {
         .collect()
 }
 
+/// The real system under the model: the live engine, the writer over a store that may
 /// die, and what the model counts that no word holds (units processed, the one clear).
 pub(crate) struct Rig {
     writer: JournalWriter<CountdownStore>,
@@ -104,6 +107,8 @@ pub(crate) struct Rig {
 }
 
 impl Rig {
+    /// The model's initial state, really: a session whose engine has a little history,
+    /// the history ring holding it under the engine's identity, and the first keyframe
     /// (seq 1, slot 1: the model's slot `a`) at tail position 0.
     fn new(model: &Model, budget: Option<usize>, fault: Option<WriterFault>) -> Self {
         let geometry = geometry(model);
@@ -198,6 +203,10 @@ impl Rig {
             .expect("a header word")
     }
 
+    /// Slot `slot` as the model sees it: `(ok, full, seq, at, state, gen)`. `ok` is the
+    /// commit word alone; `full` that the slot's bytes are a whole keyframe whose step is
+    /// that word; the rest come from the record the slot holds (a slot being written still
+    /// holds its previous record until the copy), in the model's numbering (its sequence
     /// numbers start at 0 where the code's start at 1).
     fn slot(&self, slot: usize) -> [i64; 6] {
         let commit = self.word(kf_commit_word(slot));
@@ -227,6 +236,7 @@ impl Rig {
         ]
     }
 
+    /// The real state projected onto every variable of `CrashRestoreJournal`, while the
     /// writer lives (the restore variables are at their initial values).
     pub(crate) fn project(&self) -> State {
         let commits = [self.word(kf_commit_word(0)), self.word(kf_commit_word(1))];
@@ -298,6 +308,7 @@ struct Transition {
     next: State,
 }
 
+/// Every live transition of the model from a state with no poison, each with a witness
 /// path, in breadth-first order.
 fn transitions(model: &Model) -> Vec<Transition> {
     let init = model.init_state();
@@ -347,6 +358,8 @@ fn with(base: &State, vars: &[(&'static str, i64)]) -> State {
     s
 }
 
+/// Restore the dead `region` as the keeper and the window would, starting from the
+/// model's dead state `dead`, and check every step against the model. `Err` names the
 /// first step the model does not admit.
 fn restore_conforms(
     model: &Model,
@@ -457,6 +470,7 @@ fn step(model: &Model, before: &State, after: &State, label: &str) -> Result<(),
     Ok(())
 }
 
+/// The model's dead state from `state` with the two restorer ghosts: reached through the
 /// model's own `Poison`, `PoisonKf` and `Die`, so it is a state the model reaches.
 fn dead_state(model: &Model, state: &State, poison: bool, kpoison: bool) -> State {
     let mut s = state.clone();
@@ -468,6 +482,7 @@ fn dead_state(model: &Model, state: &State, poison: bool, kpoison: bool) -> Stat
     s
 }
 
+/// The death check of one dead region: restored from the state before or after the
 /// interrupted action (`candidates`), it conforms for every poison combination.
 fn death_conforms(
     model: &Model,
@@ -556,6 +571,7 @@ fn check_transition(
     Ok(stores.max(1))
 }
 
+/// The whole sweep, across worker threads: every transition, every death. `Err` lists
 /// every transition that did not conform.
 fn sweep(
     fault: Option<WriterFault>,
@@ -618,6 +634,7 @@ fn sweep(
     }
 }
 
+/// The committed writer and recovery conform to `CrashRestoreJournal` at every live
 /// transition of the model and at a death after every store of each.
 #[test]
 fn the_real_journal_conforms_to_the_model() {
@@ -652,6 +669,8 @@ fn the_real_journal_conforms_to_the_model() {
     }
 }
 
+/// NEGATIVE CONTROL: a writer that stores a keyframe's commit word before its copy is
+/// rejected. The step projection already rejects it, at the first `BeginKf`, whose slot
 /// reads valid where the model's is being written: this control proves the step half.
 #[test]
 fn a_writer_that_publishes_early_is_rejected() {
@@ -668,6 +687,8 @@ fn a_writer_that_publishes_early_is_rejected() {
     );
 }
 
+/// NEGATIVE CONTROL: a writer that never moves the floor before an overwrite is rejected
+/// by the step projection, at the `Commit` that overwrites the ring's oldest record (the
 /// floor word is the model's `floor`).
 #[test]
 fn a_writer_with_no_floor_is_rejected() {
@@ -684,6 +705,10 @@ fn a_writer_with_no_floor_is_rejected() {
     );
 }
 
+/// NEGATIVE CONTROLS for the death half alone. Each writer has every word right once its
+/// action ends, so the step projection admits every transition; only restoring the
+/// region it leaves when it dies between two of its stores can reject it, and the sweep
+/// must. A floor moved after the copy leaves the overwritten record inside the floor's
 /// window; a commit word stored before the copy admits bytes not yet written.
 #[test]
 fn writers_wrong_only_between_stores_are_rejected_by_their_deaths() {
@@ -698,6 +723,8 @@ fn writers_wrong_only_between_stores_are_rejected_by_their_deaths() {
     }
 }
 
+/// NEGATIVE CONTROL: a history join that skips the identity check resurrects pre-clear
+/// history (a keyframe before an ED3, the ED3 replayed from the tail, the ring still
 /// holding the lines it cleared) and is rejected at its `Import`.
 #[test]
 fn a_join_without_the_identity_check_is_rejected() {

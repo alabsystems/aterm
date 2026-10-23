@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SYMBOL GATE: the linker symbol every `extern` declaration binds to.
-//!
-//! An `extern "C" { pub fn stat(..); }` that omits `#[link_name = "stat$INODE64"]`
-//! type-checks, passes every conformance assertion, and binds to a different
-//! function. x86_64-apple-darwin redirects a dozen functions this way
-//! (`$INODE64`, `$NOCANCEL`, `$1050`) and x86_64 GNU Linux several
-//! (`@GLIBC_2.2.5`, renamed entry points), so each declaration's emitted symbol
-//! is compared with the reference's.
+//! Compares the linker symbol bound by each `extern` declaration against the reference.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,8 +10,7 @@ use crate::rustdoc::{Namespace, Public, Result};
 use crate::shape::function_has_body;
 use aterm_json::Value;
 
-/// The `link_name` an item's attributes give it, if any. rustdoc renders it as
-/// `#[attr = LinkName {name: "…"}]` (older formats: `#[link_name = "…"]`).
+/// Returns the `link_name` an item's attributes give it, if any.
 #[must_use]
 pub fn link_name(item: &Value) -> Option<String> {
     let attrs = item.get("attrs")?.as_array()?;
@@ -37,10 +29,7 @@ pub fn link_name(item: &Value) -> Option<String> {
     })
 }
 
-/// Crate-root `extern` function name -> the symbol it binds. A function with a
-/// Rust body (libc's `f!`/`safe_f!` macros) exports no C symbol and is skipped,
-/// by rustdoc's body bit — never by an attribute, which must not hide a
-/// declaration.
+/// Maps each crate-root `extern` function name to the symbol it binds.
 ///
 /// # Errors
 /// When rustdoc omitted a function's body bit.

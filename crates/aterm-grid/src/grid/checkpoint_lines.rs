@@ -131,6 +131,8 @@ mod tests {
         Line::with_attrs(text, Rle::new())
     }
 
+    /// Round-trip a grid through the line codec the way
+    /// `Terminal::from_checkpoint` does: a fresh grid with the scrollback
     /// re-attached (oldest first) and the visible rows restored.
     fn rebuild_from_lines(rows: u16, cols: u16, lines: &[Line]) -> Grid {
         let total = lines.len();
@@ -148,6 +150,7 @@ mod tests {
         grid
     }
 
+    /// Materialize a grid's visible rows to plain strings (trailing spaces
     /// trimmed) for content comparison.
     fn visible_text(grid: &Grid) -> Vec<String> {
         (0..grid.rows())

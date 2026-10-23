@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The JS calls a module makes, as raw `aterm_host` imports the generated glue provides: the two
-//! the panic hook needs and the two browser clocks.
+//! the panic hook needs, the two browser clocks and `object_drop`.
 
 use crate::panic_hook::Console;
 

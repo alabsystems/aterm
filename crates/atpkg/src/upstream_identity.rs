@@ -511,7 +511,10 @@ fn probe_vv(exec: &Path, plus: Option<&str>, cwd: Option<&Path>) -> Identity {
     }
 }
 
-/// Why a probe that `asked` is not known: no answer inside the bound.
+/// Why a probe that `asked` is not known: no answer inside the bound. Said as such — never
+/// as a stock answer — and with the one thing to do: a copy's first run on a busy machine
+/// can wait on its first-exec assessment for longer than the bound (`crate::test_programs`
+/// has the measurement), and the next run does not.
 fn no_answer(asked: &str) -> String {
     format!(
         "{asked} did not start, or gave no answer within {} s; a first run on a busy machine \

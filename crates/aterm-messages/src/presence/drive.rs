@@ -82,7 +82,13 @@ impl<V: Host> Table<V> {
             .collect()
     }
 
-    /// The earliest lease or supervisor lapse, never before `now`.
+    /// The earliest lease or supervisor lapse, never before `now`. A
+    /// supervisor's is the later of the lapse last read into the table and
+    /// the claim's live one (`live`, [`Desk::supervisor_lapse`]): a renewal
+    /// is no change (`meta set supervisor` by the holder it names posts no
+    /// wake), so a deadline held at the lapse read before it woke the loop
+    /// once a lease only to find the claim renewed — every 70 to 90 s for
+    /// each supervised tab of a quiet desktop (the Together run, 2026-10-16).
     fn deadline(&self, now: Instant, live: impl Fn(u64) -> Option<Instant>) -> Option<Instant> {
         let leases = self.slots.values().filter_map(|slot| slot.lease_until);
         let supervisors = self
@@ -182,7 +188,7 @@ pub trait Desk {
         pressing(self.table(), &self.shown(w), self.front_session(w))
     }
 
-    /// Returns the next needing session in window `w` after `named` ([`next_need`] over [`Self::shown`]).
+    /// Returns the next needing session in window `w` using its front session as the cursor ([`next_need`] over [`Self::shown`]).
     fn next_need_after(&self, w: Self::Win, named: u64) -> Option<u64> {
         next_need(self.table(), &self.shown(w), self.front_session(w), named)
     }
@@ -214,7 +220,10 @@ const fn rank(severity: Option<NeedSeverity>) -> u8 {
     }
 }
 
-/// Returns the next needing session in `shown` after `named`.
+/// Returns the next needing session after the needing `front`, else after `named`.
+/// A front report without a pill skips `named` if it would be next, so the
+/// pill's More action reaches the other needs. Returns `None` with fewer than
+/// two needs or when neither cursor is among them.
 #[must_use]
 pub fn next_need<V: Host>(
     table: &Table<V>,
@@ -223,18 +232,24 @@ pub fn next_need<V: Host>(
     named: u64,
 ) -> Option<u64> {
     let order = needing_order(table, shown);
-    let here = front
-        .filter(|f| {
-            order.contains(f)
-                && table
-                    .slot(*f)
-                    .and_then(|slot| slot.need.as_ref())
-                    .is_some_and(|need| need.show_pill)
-        })
-        .unwrap_or(named);
+    if order.len() < 2 {
+        return None;
+    }
+    let here = front.filter(|f| order.contains(f)).unwrap_or(named);
     let at = order.iter().position(|s| *s == here)?;
     let next = order[(at + 1) % order.len()];
-    (next != here).then_some(next)
+    let next = if next == named
+        && here != named
+        && table
+            .slot(here)
+            .and_then(|slot| slot.need.as_ref())
+            .is_some_and(|need| !need.show_pill)
+    {
+        order[(at + 2) % order.len()]
+    } else {
+        next
+    };
+    Some(next)
 }
 
 /// Returns the most pressing session among `shown`.
@@ -306,7 +321,9 @@ pub fn refresh_session<D: Desk>(d: &mut D, session: u64) {
     d.restamp_chips(windows);
 }
 
-/// What `w` shows: the border, the session it is lit for and the pill.
+/// What `w` shows: the border, the session it is lit for and the pill. The
+/// most pressing need first; with none, the person's own hold on the front
+/// session; else nothing.
 fn compose<D: Desk>(d: &D, w: D::Win) -> (Rim, Option<u64>, Option<Pill>) {
     if !d.needs_shown() {
         return (Rim::None, None, None);

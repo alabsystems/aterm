@@ -76,7 +76,7 @@ impl Table {
         }
     }
 
-    /// Append `body`, stored under `key` ([module docs](self)).
+    /// Append `body`, stored under `key`: a repeat of its base, a splice of it, or whole.
     pub(crate) fn encode(&mut self, key: Key<'_>, body: &[u8], out: &mut Vec<u8>) {
         let slot = key.slot();
         let base = if body.len() > DELTA_MIN {

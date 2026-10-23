@@ -24,8 +24,8 @@ fn create_marker(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn child(root: &Path) {
     TERM_SEEN.store(false, AtomicOrdering::SeqCst);
-    // SAFETY: the handler lives for this re-executed test process and only
-    // stores a lock-free atomic. This child runs one exact test, then exits.
+    // SAFETY: the handler lives for this re-executed test process and only stores a lock-free
+    // atomic; this child runs one exact test, then exits.
     let previous = unsafe { libc::signal(libc::SIGTERM, term_seen as extern "C" fn(i32) as usize) };
     assert_ne!(previous, libc::SIG_ERR, "install TERM handler");
     create_marker(&root.join("ready"), b"ready\n").expect("ready marker");
@@ -70,8 +70,6 @@ impl Owned {
             add_env: &[],
             stage_groups: None,
         };
-        // Reuse the production factory: own process group, null stdin, and no
-        // taskpolicy wrapper because this command is not marked demoted.
         let mut command = spawn_command(&command, env, Path::new("/usr/bin/taskpolicy"));
         command
             .env(CHILD_ROOT, directory.path())
@@ -130,7 +128,6 @@ impl Owned {
     }
 
     fn cleanup(&mut self) -> io::Result<()> {
-        // No group signal is possible after this point, even if try_wait reaps.
         drop(self.live.take());
         let Some(mut child) = self.child.take() else {
             return Ok(());
@@ -141,8 +138,6 @@ impl Owned {
             Err(e) => return self.hand_off(child, e),
             Ok(None) => {}
         }
-        // try_wait(None) left this exact leader unreaped; a concurrent exit
-        // remains our zombie. No raw PID or group lookup is used for cleanup.
         let kill_error = child.kill().err();
         let deadline = Instant::now() + HANG_DETECTOR;
         loop {
@@ -166,9 +161,6 @@ impl Owned {
     fn hand_off(&mut self, mut child: std::process::Child, error: io::Error) -> io::Result<()> {
         self.handed_off = true;
         let directory = self.directory.take();
-        // Exceptional failed-cleanup custody only. This is not a successful
-        // test result or proof that the child has gone. The existing reaper
-        // retains the exact Child and private directory, and never signals.
         aterm_uds::reaper::hand_off(move || {
             let _keep_directory = &directory;
             match child.try_wait() {
@@ -243,7 +235,6 @@ fn exercise(alias: &str, graceful: bool) {
             io::ErrorKind::NotFound
         );
     }
-    // A retired handle refuses before reaching even the test signal guard.
     assert!(owned.live.as_ref().expect("Live").term().is_err());
     assert!(owned.live.as_ref().expect("Live").kill().is_err());
     assert_eq!(owned.audit.as_ref().expect("audit").report(), audit);

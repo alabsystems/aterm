@@ -150,7 +150,9 @@ struct Partition {
     absorbed: PatchTable,
 }
 
-/// Split the patch table by replacement path.
+/// Split the patch table by replacement path. Only a target `classify_patch_target` accepts as
+/// first-party or absorbed leaves the vendored arm; an empty path (git/registry patch), a third
+/// location or a half-recorded `crates/` redistribution stays there so `[OB-1]` reports it.
 fn partition_patches(patch: &[PatchRow], root: &Path) -> Partition {
     use aterm_census::scan_set::PatchTargetKind;
     let mut out = Partition {
@@ -187,7 +189,8 @@ fn absorbed_members(root: &Path, patch: &[PatchRow]) -> PatchTable {
     out
 }
 
-/// Directory names directly under `vendor/`, sorted.
+/// Directory names directly under `vendor/`, sorted. Absent `vendor/` is an
+/// empty list, not an error: `[OB-1]` decides whether that is a defect.
 fn vendor_dirs(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(root.join("vendor")) else {
@@ -387,7 +390,8 @@ pub(crate) fn parse_version(text: &str) -> Option<Ver> {
     })
 }
 
-/// Does `version` satisfy `req`?
+/// Does `version` satisfy `req`? `None` means the requirement form is not
+/// understood; callers treat that as a failure.
 fn req_satisfied(req: &str, version: &str) -> Option<bool> {
     let req = req.trim();
     if req.contains(',') || req.contains('*') || req.starts_with('>') || req.starts_with('<') {
@@ -557,7 +561,8 @@ struct IgnoreVerdict {
     path: String,
 }
 
-/// Ask git which of `paths` its ignore rules match.
+/// Ask git which of `paths` its ignore rules match. `--no-index` is required:
+/// without it git reports tracked files as not ignored.
 fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
     if paths.is_empty() {
         return Some(Vec::new());
@@ -1656,7 +1661,8 @@ fn diff_against_pristine(pristine: &Path, fork: &Path) -> Option<Divergence> {
     Some(Divergence { modified, added })
 }
 
-/// Does this file's header claim aterm changed it?
+/// Does this file's header claim aterm changed it? Generous about wording,
+/// strict about position: §4(b) asks for a prominent notice.
 fn has_modification_notice(text: &str) -> bool {
     text.lines().take(HEADER_LINES).any(|line| {
         let lower = line.to_ascii_lowercase();

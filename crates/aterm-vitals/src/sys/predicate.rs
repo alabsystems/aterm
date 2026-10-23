@@ -814,7 +814,9 @@ enum Reading {
     Unavailable(&'static str),
 }
 
-/// The target's sessions, for `tab` and `tab.mem`.
+/// The target's sessions, for `tab` and `tab.mem`. A session the snapshot
+/// does not hold yet (the layout reached the probe after it read) is warming:
+/// the target's exit, not its absence from one sample, ends the wait.
 fn tab_sum(
     s: &Snapshot,
     keys: &[u64],

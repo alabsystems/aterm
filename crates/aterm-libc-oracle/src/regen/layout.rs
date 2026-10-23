@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `repr(C)` layout, reproduced and held to the measurements.
-//!
-//! The shim reproduces libc's private fields as byte padding placed between the
-//! public ones, and that placement is only as good as this engine. So before it
-//! is used, [`validate`] checks it against every offset, size and alignment the
-//! probes measured on the reference ([`super::probe`]): a mismatch stops the
-//! regeneration.
 
 use std::collections::BTreeMap;
 
@@ -31,9 +25,7 @@ fn shape(ty: &str, types: &TypeSizes, packed: Option<u64>) -> Result<(u64, u64),
     Ok((size, packed.map_or(align, |p| align.min(p))))
 }
 
-/// A `repr(C)` struct of `fields` (name, type text): each field's offset, then
-/// the struct's size and alignment. `force_align` is `repr(align(N))`.
-///
+/// A `repr(C)` struct of `fields` (name, type text).
 /// # Errors
 /// When a field type was not measured.
 pub fn layout(
@@ -81,8 +73,6 @@ fn check(record: &Record, measured_cell: &Measured, out: &mut Vec<String>) -> Re
         .collect();
     let mut whole = Vec::new();
     let computed: Vec<u64> = if record.stripped {
-        // Private fields lie between the public ones: each public field must be
-        // placeable at its measured offset without overlap or misalignment.
         let mut end = 0;
         let mut offsets = Vec::new();
         for (field, ty) in &fields {
@@ -129,7 +119,6 @@ fn check(record: &Record, measured_cell: &Measured, out: &mut Vec<String>) -> Re
 }
 
 /// Every place the engine disagrees with the measurements of one cell.
-///
 /// # Errors
 /// When a struct or field type was not measured.
 pub fn validate(decls: &Decls, measured_cell: &Measured) -> Result<Vec<String>, String> {
@@ -237,10 +226,8 @@ mod tests {
             structs: vec![r],
             ..Decls::default()
         };
-        // Private bytes between `a` and `b`, and after `b`: placeable.
         let gap = validate(&decls(record(true, None)), &measured(40, 8, [0, 16]));
         assert_eq!(gap, Ok(vec![]));
-        // `b` measured where it would be misaligned, and past the struct's end.
         let bad = validate(&decls(record(true, None)), &measured(8, 8, [4, 2])).expect("measured");
         assert_eq!(
             bad,

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's own frame on the pointer path (LW.5, `crate::client_frame`):
-//! the resize handles take the pointer at the window's edges and give it back,
-//! and the header's window buttons light and act. Headless windows have no OS
-//! window, so what the window system would do (the interactive resize, the
-//! minimize) is not run; what aterm decides is.
+//! The window's own frame on the pointer path (`crate::client_frame`).
 
 use aterm_window::dpi::PhysicalSize;
 use aterm_window::event::{ElementState, MouseButton};
@@ -82,7 +78,6 @@ fn an_edge_takes_the_pointer_and_hands_it_back() {
         !(ws.hover_pointer && ws.native_text_cursor),
         "the grid put its own cursor back over the handle's (the re-issue encoding is gone)"
     );
-    // Leaving the window withdraws the claim.
     app.on_cursor_moved(wid, w * 0.5, 1.0);
     assert_eq!(app.windows[&wid].frame_edge, Some(FrameEdge::North));
     app.on_cursor_left(wid);
@@ -91,8 +86,6 @@ fn an_edge_takes_the_pointer_and_hands_it_back() {
 
 #[test]
 fn no_frame_or_a_maximized_one_has_no_handles() {
-    // NEGATIVE CONTROLS: the same pixel, where the window system decorates, and
-    // where the frame's edges do not resize (maximized, fullscreen, tiled).
     let (mut app, wid) = framed(None);
     let mid = size(&app, wid).1 * 0.5;
     app.on_cursor_moved(wid, 1.0, mid);
@@ -120,8 +113,6 @@ fn a_gesture_in_flight_keeps_the_pointer_off_the_handles() {
 #[test]
 fn a_press_on_a_handle_goes_no_further() {
     let (mut app, wid) = framed(Some(FRAME));
-    // The bottom edge, over the grid's last row's padding: without the frame a
-    // press there would start a selection.
     let (w, h) = size(&app, wid);
     app.on_cursor_moved(wid, w * 0.5, h - 2.0);
     assert_eq!(app.windows[&wid].frame_edge, Some(FrameEdge::South));
@@ -174,7 +165,6 @@ fn at_no_padding_the_edge_cells_stay_the_grids() {
         "a press on the first column starts a selection"
     );
     app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
-    // NEGATIVE CONTROL: the default padding around the same grid is handle.
     {
         let ws = app.windows.get_mut(&wid).expect("window");
         ws.metrics.pad = 12;
@@ -214,7 +204,6 @@ fn a_framed_window_keeps_its_header_row_at_no_strip() {
         );
     }
     assert!(!app.sync_strip_header_row(wid), "settled: nothing moves");
-    // Fullscreen has no header, and the row goes with it.
     app.windows.get_mut(&wid).expect("window").client_frame = Some(ClientFrame {
         edges: false,
         header: false,
@@ -222,7 +211,6 @@ fn a_framed_window_keeps_its_header_row_at_no_strip() {
     });
     assert!(app.sync_strip_header_row(wid));
     assert_eq!(app.tab_strip_rows, 0);
-    // A strip the config asks for is the config's.
     app.config.tab_strip_rows = Some(2);
     app.windows.get_mut(&wid).expect("window").client_frame = Some(FRAME);
     assert!(app.sync_strip_header_row(wid));
@@ -231,7 +219,6 @@ fn a_framed_window_keeps_its_header_row_at_no_strip() {
 
 #[test]
 fn a_window_the_system_decorates_keeps_no_strip() {
-    // NEGATIVE CONTROL for the test above: the same window, no frame.
     let (mut app, wid) = framed(None);
     app.config.tab_strip_rows = Some(0);
     app.tab_strip_rows = 0;
@@ -308,7 +295,6 @@ fn the_header_lays_out_lights_and_presses_its_window_buttons() {
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn a_window_the_system_decorates_has_no_buttons() {
-    // NEGATIVE CONTROL for the test above: the same window, no frame.
     let (mut app, wid) = framed(None);
     let segs = header(&mut app, wid);
     assert!(

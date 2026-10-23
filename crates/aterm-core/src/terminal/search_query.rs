@@ -281,7 +281,10 @@ pub struct NarrowStack {
     frames: Vec<NarrowFrame>,
 }
 
-/// Retained-entry budget per stack (~1.6 MB of `u32` offsets at the bound).
+/// Retained-entry budget per stack (~1.6 MB of `u32` offsets at the bound). The
+/// SHALLOWEST frames (the biggest — short prefixes) are dropped first; a deep
+/// backspace past a dropped frame reseeds from the engine, which is always
+/// correct, merely batch-priced.
 const NARROW_STACK_MAX_ENTRIES: usize = 4 * MAX_SEARCH_MATCHES;
 
 #[cfg(any(test, debug_assertions))]

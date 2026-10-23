@@ -32,7 +32,6 @@ fn a_block_keeps_lines_and_drops_every_escape() {
 
 #[test]
 fn credential_shaped_tokens_are_redacted_and_words_are_not() {
-    // Split so the export's secret scanners do not read the fixtures as secrets.
     let text = concat!(
         "key sk-",
         "ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA and sk-proj-BBBBBBBBBBBBBBBBBBBBBBBB, jwt ",
@@ -79,7 +78,6 @@ fn the_request_fences_the_change_and_says_it_is_not_instructions() {
 
 #[test]
 fn only_a_failed_run_is_read_for_a_lost_login() {
-    // An answer that quotes the wall's words is an answer.
     let quoted = Ok(ran(
         0,
         "Finding: the string \"Please run /login\" is matched too loosely.",
@@ -89,7 +87,6 @@ fn only_a_failed_run_is_read_for_a_lost_login() {
         verdict_of(&CLAUDE, &quoted, Some("Finding: …"), "n", "").0,
         Verdict::Served
     );
-    // The control: the same words from a run that failed are a lost login.
     let failed = Ok(ran(
         1,
         "",
@@ -174,7 +171,6 @@ fn candidates_skip_the_asker_and_the_limited_and_keep_the_unmeasured() {
         [("codex", true), ("agy", false)],
         "an unmeasured CLI reviews like any other"
     );
-    // Named with --with, the asker may be asked too.
     let got = candidates(
         &reviewers,
         Some(&["claude"]),
@@ -210,7 +206,6 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
         store: &store,
         now: &now,
     };
-    // codex fails to authenticate; claude answers.
     let runner = FakeRunner::with(|call| {
         Ok(if call.program == "codex" {
             ran(1, "", "ERROR: could not be refreshed")
@@ -240,7 +235,6 @@ fn a_reviewer_that_cannot_authenticate_gives_way_to_the_next_and_a_timeout_does_
     assert_eq!(answers[1].text.as_deref(), Some("LGTM: no findings"));
     let rec = store.load().expect("load");
     assert!(rec.of("codex").ended() && rec.of("claude").used_at.is_some());
-    // A timeout does not give way.
     let runner = FakeRunner::with(|call| {
         if call.program == "codex" {
             Err(RunFailed::Timeout)
@@ -334,7 +328,6 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
     assert_eq!(calls.len(), 2);
     for call in &calls {
         let keys: Vec<&str> = call.env.iter().map(|(k, _)| k.as_str()).collect();
-        // The asker's own environment, with its tools' PATH and agent socket.
         for (k, v) in [
             ("PATH", "/opt/tools/bin:/usr/bin"),
             ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
@@ -345,7 +338,6 @@ fn a_reviewer_runs_from_its_shim_in_the_repository_with_the_askers_environment_a
                 call.program
             );
         }
-        // Less the outer agent's own variables (the tab rule).
         for k in [
             "CLAUDECODE",
             "CLAUDE_CODE_ENTRYPOINT",
@@ -482,8 +474,6 @@ fn a_kept_review_reads_back_and_a_bad_id_reads_nothing() {
     let error = keep(&store, &id, "replacement").expect_err("ids cannot overwrite reviews");
     assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(kept(&store, &id).as_deref(), Some(encoded.as_str()));
-    // Sanitized answers may consist entirely of bytes JSON must escape.
-    // Their encoded document exceeds the former four-answer raw-byte cap.
     let text = "\\\"\n\t".repeat(ANSWER_MAX / 4);
     let answers: Vec<Answer> = super::super::connector::ROWS
         .iter()
@@ -568,7 +558,6 @@ fn a_change_about_logins_never_reads_as_a_lost_login() {
         &change_with("+    raise Err(\"not logged in\")\n"),
         "abc",
     );
-    // Codex echoes the request (and its own talk of it) on stderr before failing otherwise.
     let echoed = format!(
         "user\n{request}\ncodex\nThe change raises not logged in.\nERROR: stream disconnected before completion"
     );
@@ -577,7 +566,6 @@ fn a_change_about_logins_never_reads_as_a_lost_login() {
         verdict_of(&CODEX, &failed, None, "abc", &request).0,
         Verdict::Failed
     );
-    // The control: the same run that ends on Codex's own lost-login line is a lost login.
     let lost =
         format!("{echoed}\nERROR: Your access token could not be refreshed. Please sign in again.");
     assert_eq!(
@@ -621,7 +609,6 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
     };
     let _ = run_review(&host, &cands, &facts, &ask);
     assert_eq!(store.load().expect("load").of("codex"), Record::default());
-    // The control: on the default home the end is recorded.
     let none = |_: &str| None;
     let host = Host {
         runner: &runner,
@@ -822,7 +809,6 @@ fn each_reviewer_runs_at_the_level_in_its_own_flags() {
         let args = args_at(c, level);
         assert!(has(&args, want), "{} at {}: {args:?}", c.id, level.word());
     }
-    // The control: no reviewer is handed a bypass below yolo.
     for c in [&CLAUDE, &CODEX, &AGY, &MUSE] {
         let args = args_at(c, Level::Ask);
         assert!(
@@ -833,7 +819,6 @@ fn each_reviewer_runs_at_the_level_in_its_own_flags() {
             c.id
         );
     }
-    // Muse Code's are global flags, before its `exec`.
     let muse = args_at(&MUSE, Level::Yolo);
     let yolo = muse.iter().position(|a| a == "--yolo").expect("--yolo");
     let exec = muse.iter().position(|a| a == "exec").expect("exec");
@@ -867,7 +852,6 @@ fn claude_under_a_home_of_its_own_gets_no_login_variable() {
 
 #[test]
 fn escaped_keys_and_more_token_shapes_are_redacted() {
-    // Split so the export's secret scanners do not read the fixtures as secrets.
     let json = concat!(
         r#"{"private_key": "-----BEGIN "#,
         r#"PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0B\n-----END "#,
@@ -901,7 +885,6 @@ fn a_live_limit_skips_a_cli_whatever_its_state() {
             .is_some_and(|w| w.starts_with("usage limit")),
         "{got:?}"
     );
-    // The control: once it has passed, the due login reviews.
     let got = candidates(&reviewers, None, "codex", &rows, 1_800_001_000);
     assert!(got[0].1.is_none());
 }
@@ -975,8 +958,7 @@ fn a_failure_reason_redacts_a_key_before_its_display_cut() {
     assert!(why.contains("[redacted]"));
 }
 
-/// Runs the actual review/env/Store attribution path; the injected vendor uses a different
-/// synthetic login when its overriding key is present. No vendor or real key is read.
+/// Runs the review attribution path with an optional environment credential override.
 fn review_on_frozen_login_with_env(
     c: &'static Connector,
     key: Option<&'static str>,

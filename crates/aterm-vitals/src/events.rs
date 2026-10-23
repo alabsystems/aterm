@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! System state transition event detector ([`Detector`], [`JobWatch`]).
-//! Thresholds are configured by [`SWAP_ACTIVE_BPS`] and [`LOAD_HOLD_NS`].
+//! Threshold constants: [`SWAP_ACTIVE_BPS`], [`LOAD_HOLD_NS`], [`LOAD_STEP_CORES`] and [`DISK_LINE_BYTES`].
 
 use std::collections::{HashMap, HashSet};
 

@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Sparkle-word decoration compositing for the CPU renderer: an empty
-// `word_decorations` list is byte-identical to the pre-feature render (the
-// `word_decorations` row of `tests/empty_channels.rs`), and a
-// non-empty list stamps sprites over exactly the targeted cell (and leaves the
-// rest of the frame untouched).
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{
@@ -18,9 +12,7 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// A settled (frame-over-frame identical) LIFTED additive sparkle: `dy != 0`
-/// makes its stamp spill into the neighbouring row's pixel band — the v2 nova
-/// ember regime (`dy = -cell_h/3`).
+/// A settled lifted additive sparkle whose stamp spills into the neighbouring row.
 fn lifted_add_deco(row: u16, col: u16, dy: i8) -> WordDecoration {
     WordDecoration {
         row,
@@ -78,7 +70,6 @@ fn paw_over_blend_paints_the_target_cell_only() {
         base_far, now_far,
         "a cell far from the decoration must be untouched"
     );
-    // The paw's solid core lands the exact stamp colour somewhere in the cell.
     assert!(
         now_target.contains(&0x00FF_00FF),
         "Over-blend at alpha 255 must paint the stamp colour at the paw core"
@@ -109,7 +100,6 @@ fn add_blend_only_brightens() {
     let f = rend.render_input(&input);
     let now_target = cell_pixels(&f, cw, ch, 0, 0);
 
-    // Additive light never darkens any channel of any pixel.
     for (b, n) in base_target.iter().zip(now_target.iter()) {
         for sh in [16, 8, 0] {
             let bc = (b >> sh) & 0xff;
@@ -140,8 +130,6 @@ fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
     term.process(b"\x1b[?25l"); // hidden cursor: no cursor rows in the dirty set
     let mut dirty = Vec::new();
 
-    // (a) Settled deco at row 4, dy < 0 (spill into row 3): unrelated content
-    // dirt on row 4 must mark rows {3, 4}.
     let mut prev = term.cell_frame(8, 12);
     prev.word_decorations.push(lifted_add_deco(4, 9, -5));
     term.process(b"\x1b[5;1Hdirt");
@@ -169,8 +157,6 @@ fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
         "unrelated dirt on a lifted deco's row must mark the dy-spill neighbour"
     );
 
-    // (b) Chain to a fixpoint: decos at rows 4 (dy > 0) and 5 (dy > 0); dirt
-    // on row 4 marks 5, whose own spill then marks 6.
     let mut prev = term.cell_frame(8, 12);
     prev.word_decorations.push(lifted_add_deco(4, 9, 4));
     prev.word_decorations.push(lifted_add_deco(5, 2, 4));
@@ -200,8 +186,6 @@ fn settled_deco_dy_spill_marks_neighbour_of_unrelated_dirt_to_fixpoint() {
          itself a lifted deco's row marks the next row"
     );
 
-    // (c) Fully settled frame: no dirt anywhere ⇒ the closure marks nothing
-    // and the frame still gate-hits (the 0% steady state stays free).
     let prev = cur.clone();
     let cur2 = cur.clone();
     let DirtyDecision::Rows(d) = compute_dirty_rows(
@@ -240,17 +224,11 @@ fn settled_lifted_add_deco_with_dirt_on_its_row_stays_byte_stable() {
     let (rows, cols) = (8usize, 20usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
-    // Static text on the SPILL row (row 3) so the re-Add would also land over
-    // glyph pixels; the row BELOW the deco row stays glyph-free (its upward
-    // glyph-AA overshoot into a rebuilt row is a pre-existing damaged-path
-    // note, not this regression's subject).
     term.process(b"\x1b[4;1Hstatic spill row");
 
     let deco = lifted_add_deco(4, 16, -((ch / 3).min(120) as i8));
     assert!(deco.dy != 0, "the lift must be non-zero (spill premise)");
     let make = |term: &mut Terminal, n: usize| {
-        // Unrelated dirt on the deco's OWN row (row index 4 = 1-based row 5),
-        // away from the decorated column.
         term.process(format!("\x1b[5;1Hdirt {n}").as_bytes());
         let mut input = term.cell_frame(rows, cols);
         input.word_decorations.push(deco);

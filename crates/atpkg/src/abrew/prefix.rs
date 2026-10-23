@@ -795,7 +795,8 @@ pub(super) fn write_metadata(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(staged, path)
 }
 
-/// Existing canonical layout bases must be real directories.
+/// Existing canonical layout bases must be real directories. Missing bases
+/// can be created after all existing ones pass, without following a final link.
 fn ensure_directories(directories: &[PathBuf]) -> Result<(), String> {
     for directory in directories {
         real_base(directory)?;

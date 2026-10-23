@@ -336,7 +336,10 @@ pub(crate) mod typed {
     /// This process's typed re-key numbers: each file's name is its own.
     static SERIAL: AtomicU64 = AtomicU64::new(1);
 
-    /// One issue at a time.
+    /// One issue at a time. [`issue_in`] is a sequence (settle the previous key,
+    /// sweep, write, authorize, record); two interleaved issues of one tab each
+    /// settle nothing and the later record overwrites the earlier, leaving a
+    /// live key in an unsettled file.
     static ISSUING: Mutex<()> = Mutex::new(());
 
     /// Whether the shell of `engine` is behind: the last revision it signed is not this

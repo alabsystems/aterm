@@ -45,12 +45,15 @@ pub const CURSOR_BAND_ROWS: i32 = 2;
 /// the current protection bands remain in source order, retaining bounded
 /// adjacency without viewport-sized storage.
 const MATERIAL_CAP: usize = 128;
-/// The material atlas reuses the fixed 64-tile ROM footprint.
+/// The material atlas reuses the fixed 64-tile ROM footprint. A sampled screen
+/// can therefore contain at most 64 distinct literal glyphs; occurrences still
+/// retain their frequency/order in [`MATERIAL_CAP`].
 const MATERIAL_GLYPH_CAP: usize = rom::ROM_GLYPHS;
 /// Bounded simultaneous box-drawn TUI frames tracked during one damage rescan.
 const MAX_FRAME_CANDIDATES: usize = 64;
 const MAX_FRAME_REGIONS: usize = 64;
-/// Observable-work pulse bounds.
+/// Observable-work pulse bounds. Signals carry no payload, license only a
+/// bounded activity window, and cannot allocate or rebake the atlas.
 const SEMANTIC_ENERGY_CAP: u8 = 8;
 const SEMANTIC_HOLD_TICKS: u8 = 24;
 
@@ -406,7 +409,9 @@ pub struct MatrixRain {
     /// The field tick (advances at the weather-gated engine rate).
     tick: u64,
     pending_key: bool,
-    /// Coalesced distance in the grid content clock (bounded).
+    /// Coalesced distance in the grid content clock (bounded). Unlike a boolean
+    /// edge it survives synchronized-output batching, so one large agent
+    /// present still carries evidence of a burst.
     pending_content_credit: u8,
     pending_bell: bool,
     pending_alt_scroll: bool,
@@ -643,7 +648,9 @@ impl MatrixRain {
         self.last_emit_nonempty = false;
     }
 
-    /// Clear the literal material without changing weather/clock state.
+    /// Clear the literal material without changing weather/clock state. The ROM
+    /// returns to the classic authoring, emitted only when
+    /// `output_material = false`; literal mode with nothing sampled is empty.
     fn clear_material_bank(&mut self) {
         self.material.clear();
         self.material_scratch.clear();
@@ -657,7 +664,10 @@ impl MatrixRain {
         self.last_bake_tick = None;
     }
 
-    /// Publish a literal material generation once cell metrics are known.
+    /// Publish a literal material generation once cell metrics are known. The
+    /// fixed 64-tile bake is sub-millisecond and happens only when the distinct
+    /// visible charset changes; before the first geometry the baker is
+    /// vacuously complete and `emit` does this once after sizing.
     fn finish_material_bake(&mut self) {
         let Some(rom) = self.rom.as_ref() else {
             return;
@@ -1517,7 +1527,8 @@ impl MatrixRain {
         self.emit_halos(&ctx, add);
     }
 
-    /// Emit one column's lit cells.
+    /// Emit one column's lit cells. Returns `false` when the quad budget was
+    /// hit (the caller rolls the column back).
     fn emit_column(&mut self, ctx: &EmitCtx<'_>, col: u16, quads: &mut Vec<SpriteQuad>) -> bool {
         let cw = u32::from(ctx.geom.cell_w);
         let rows = u32::from(ctx.geom.rows);
@@ -1637,7 +1648,8 @@ impl MatrixRain {
         }
     }
 
-    /// Map an emitted cell onto the output tape.
+    /// Map an emitted cell onto the output tape. By default this is the plain
+    /// source-order walk.
     #[inline]
     fn semantic_material_index(&self, start: usize, col: u16, row: u32, glyph_epoch: u32) -> usize {
         let len = self.material.len();
@@ -4266,7 +4278,8 @@ mod tests {
         assert_eq!(i64::from(rain.semantic_ticks_left), state["ttl"]);
     }
 
-    /// Bounded synchronized-output credit.
+    /// Bounded synchronized-output credit. `Buggy=1` is the missing-saturation negative
+    /// control (a coalesced burst stores `Cap+1`, violating `CreditBound`).
     fn rain_activity_credit_model() -> aterm_spec::derive::Model {
         use aterm_spec::ty_model;
         ty_model! {

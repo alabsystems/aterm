@@ -337,7 +337,7 @@ fn receiver_start(b: &[u8], mut start: usize) -> usize {
     }
 }
 
-fn ws_back(b: &[u8], mut at: usize) -> usize {
+const fn ws_back(b: &[u8], mut at: usize) -> usize {
     while at > 0 && b[at - 1].is_ascii_whitespace() {
         at -= 1;
     }
@@ -351,7 +351,7 @@ fn ws_fwd(b: &[u8], mut at: usize) -> usize {
     at
 }
 
-fn word_start(b: &[u8], mut at: usize) -> usize {
+const fn word_start(b: &[u8], mut at: usize) -> usize {
     while at > 0 && is_word(b[at - 1]) {
         at -= 1;
     }

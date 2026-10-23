@@ -398,18 +398,18 @@ impl Rect {
     }
 
     #[must_use]
-    pub fn width(&self) -> i32 {
+    pub const fn width(&self) -> i32 {
         self.r - self.l
     }
 
     #[must_use]
-    pub fn height(&self) -> i32 {
+    pub const fn height(&self) -> i32 {
         self.b - self.t
     }
 
     /// Its centre.
     #[must_use]
-    pub fn centre(&self) -> (i32, i32) {
+    pub const fn centre(&self) -> (i32, i32) {
         (self.l + self.width() / 2, self.t + self.height() / 2)
     }
 

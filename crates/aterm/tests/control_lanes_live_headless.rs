@@ -225,7 +225,10 @@ impl Driver {
         Ok(driver)
     }
 
-    /// Dial, authenticate and have one `version` answered.
+    /// Dial, authenticate and have one `version` answered. A refusal while the request lanes
+    /// are briefly full of work (a burst of connections authenticating on a loaded machine) is
+    /// the busy line clients retry on, so it is retried; one that lasts fails at the hang
+    /// detector with the server's last words.
     fn established(sock: &Path, token: &str) -> Result<Self, String> {
         let deadline = Instant::now() + HANG;
         loop {
@@ -250,7 +253,9 @@ impl Driver {
         self.reader.get_ref()
     }
 
-    /// Write one request line.
+    /// Write one request line. A failed write is not the verdict: a connection
+    /// the listener refused may be closed before the line lands (`EPIPE`), and
+    /// its busy line is still there for the next read, which decides.
     fn send(&mut self, line: &str) {
         self.send_raw(format!("{line}\n").as_bytes());
     }
@@ -297,7 +302,10 @@ impl Driver {
     }
 }
 
-/// Bound every read on `stream`.
+/// Bound every read on `stream`. macOS refuses the option (`EINVAL`) on a
+/// socket its peer has already closed — a connection the listener refused and
+/// dropped at once — and a read there cannot block anyway: it returns the busy
+/// line, then end-of-file.
 fn bound_reads(stream: &UnixStream, timeout: Duration) {
     let _ = stream.set_read_timeout(Some(timeout));
 }
@@ -320,7 +328,10 @@ fn probe(sock: &Path, token: &str) -> String {
     }
 }
 
-/// Whether a read error is the listener's close.
+/// Whether a read error is the listener's close. Linux answers a read on a
+/// connection closed with input still unread (a wait refused busy, its request
+/// line never read) with `ECONNRESET` once, then end-of-file; macOS with
+/// end-of-file.
 fn hung_up(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::ConnectionReset
 }
@@ -870,7 +881,9 @@ fn carried_timeout(sock: &Path, token: &str, text: &str) -> Result<(String, Stri
 #[test]
 fn pipelined_waits_are_held_while_wait_lanes_are_free() {
     const PIPELINED: usize = 2 * RPC_LANES;
-    /// The waits' own timeout: a hang bound they never reach.
+    /// The waits' own timeout: a hang bound they never reach. They end by the
+    /// event they wait for (the text typed below), so the test takes as long as
+    /// the server takes, not as long as a wait's clock.
     const WAIT_MS: u64 = 180_000;
 
     roomy_test_process();

@@ -18,7 +18,8 @@ pub(crate) struct Startup {
     /// (`metrics::now_ns`): a clock read before the entry is stamped anchors it
     /// at that read instead ([`Self::clock_anchor`]).
     gui_entry: OnceLock<Instant>,
-    /// Rust `main` ([`mark_rust_main_start`]).
+    /// Rust `main` ([`mark_rust_main_start`]). The thin dev GUI binary never
+    /// sets it.
     rust_main: OnceLock<Instant>,
     /// Rust `main` on the kernel's boot clock (mach ticks on Apple), the clock
     /// `ri_proc_start_abstime` records a birth on: it never steps, so the two
@@ -57,7 +58,9 @@ pub(crate) struct Startup {
     claim_parked_before: OnceLock<Duration>,
     /// The boot's own boundaries ([`stamp_claim`]).
     claim_stamps: [OnceLock<Instant>; ClaimStamp::COUNT],
-    /// One coherent, immutable startup fact.
+    /// One coherent, immutable startup fact. `OnceLock` publishes both clock
+    /// projections together, so a racing control read cannot pair a populated
+    /// compatibility field with a missing router field.
     present: OnceLock<StartupPresentSample>,
     /// The facts kept once every input exists ([`Self::facts`]).
     birth_to_main: OnceLock<u64>,
@@ -147,7 +150,9 @@ impl Startup {
         })
     }
 
-    /// The backend worker's partition, kept once its five stamps exist.
+    /// The backend worker's partition, kept once its five stamps exist. Each
+    /// is set long before the first present (the join precedes the first frame
+    /// by construction); until then the partition is invalid.
     fn worker(&self) -> StartupWorkerSample {
         kept(&self.worker, || {
             let (join_entry, join_exit) = self.attach.get()?.backend_finalize_bounds();
@@ -169,7 +174,10 @@ impl Startup {
     }
 }
 
-/// `cell`'s fact, else `derive`'s, kept when it is `Some`.
+/// `cell`'s fact, else `derive`'s, kept when it is `Some`. Every input of a
+/// startup fact is write-once, so a fact derived once all of them exist can
+/// never change: `derive` answers `None` until they do, and the next read
+/// derives again.
 fn kept<T: Copy>(cell: &OnceLock<T>, derive: impl FnOnce() -> Option<T>) -> Option<T> {
     if let Some(fact) = cell.get() {
         return Some(*fact);
@@ -1000,7 +1008,8 @@ struct StartupWorkerSample {
 }
 
 impl StartupWorkerSample {
-    /// The measured legs, in worker order.
+    /// The measured legs, in worker order. `epilogue_ns` closes them against
+    /// `total_ns`, so this sum plus the epilogue IS the worker's wall time.
     fn measured_leg_total_ns(self) -> Option<u64> {
         [
             self.prelude_ns,

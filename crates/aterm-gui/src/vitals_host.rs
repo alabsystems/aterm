@@ -502,7 +502,8 @@ pub(crate) struct VitalsHost {
     /// The workers' copy the thread handed its sender to: the quit takes it
     /// back ([`Self::stop_at_exit`]).
     sys: Option<&'static crate::sys_host::Shared>,
-    /// The quit can precede construction of the thread's readers.
+    /// The quit can precede construction of the thread's readers. A sender
+    /// handed to the workers after that quit must be taken back too.
     stopping: Arc<AtomicBool>,
     /// The running thread and the channel that hangs up when it ends: the
     /// quit's bounded wait for its last write ([`Self::stop_at_exit`]).
@@ -734,7 +735,9 @@ impl VitalsHost {
         *rev
     }
 
-    /// Start the probe thread once, on the loop's first wake.
+    /// Start the probe thread once, on the loop's first wake. It waits on
+    /// its channel, reading nothing until the loop asks a reading or a worker
+    /// pulls.
     fn ensure_thread(&mut self, proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>) {
         if self.tx.is_some() || self.tried {
             return;
@@ -813,7 +816,9 @@ impl VitalsHost {
         }
     }
 
-    /// Offer one message without waiting for the platform probe.
+    /// Offer one message without waiting for the platform probe. A full queue
+    /// keeps the older messages until the reader takes them; `false` when this
+    /// one was not queued.
     fn offer(&mut self, msg: Msg) -> bool {
         let Some(tx) = self.tx.as_ref() else {
             return false;
@@ -2001,7 +2006,9 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
     }
 }
 
-/// The machine's memory as the model takes it.
+/// The machine's memory as the model takes it. A class this OS does not
+/// report adds nothing; Linux's shared memory is in use, never cache (design
+/// §9.6), so it joins `app`.
 fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
     MemSample {
         total: m.total,
@@ -2034,7 +2041,8 @@ fn mem_sample(m: aterm_sysprobe::MemoryDetail) -> MemSample {
     }
 }
 
-/// The GPU as the model takes it.
+/// The GPU as the model takes it. A card the OS put to sleep (Linux runtime
+/// PM) is doing no work: 0 %, known without waking it.
 fn gpu_sample(g: aterm_sysprobe::GpuReading) -> GpuSample {
     let asleep = g.unread == Some(aterm_sysprobe::Why::Asleep);
     GpuSample {
@@ -2914,8 +2922,8 @@ impl crate::App {
 
     /// The thread's request at `period` (`machine_only` while hidden): every
     /// pane's shell and the program in front of it, each its own root (a
-    /// split pane's processes count in that pane), and where each sits (for
-    /// `sys`); each
+    /// split pane's processes count in that pane) carrying its tab's key, and
+    /// where each sits (for `sys`); each
     /// agent session's token totals from the Claude Code footer of every pane
     /// of every tab (v2 §8.1: aterm's rate is over every agent session, split
     /// or not) keyed to the tab that holds it, and the front tab's plan usage
@@ -2939,6 +2947,7 @@ impl crate::App {
                 let in_front = Some(*wid) == front && active == Some(i);
                 let panes = std::iter::once(tab.focus)
                     .chain(tab.root.leaves().into_iter().filter(|v| *v != tab.focus));
+                let first = tabs.len();
                 for pane in panes.filter_map(terminal) {
                     let Some(s) = self.pool.get(pane) else {
                         continue;
@@ -2953,6 +2962,7 @@ impl crate::App {
                     {
                         tabs.push(TabRoot {
                             key: pane,
+                            tab: pane,
                             shell_pid,
                             label: format!("Tab {}", i + 1),
                             program: tl.agent().program.clone().unwrap_or_default(),
@@ -2976,6 +2986,13 @@ impl crate::App {
                         }
                     }
                 }
+                // The tab's panes go by its least pane's key.
+                let roots = &mut tabs[first..];
+                if let Some(least) = roots.iter().map(|t| t.key).min() {
+                    for root in roots {
+                        root.tab = least;
+                    }
+                }
             }
         }
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
@@ -2993,6 +3010,7 @@ impl crate::App {
             if !tabs.iter().any(|tab| tab.key == handle.local_id) {
                 tabs.push(TabRoot {
                     key: handle.local_id,
+                    tab: handle.local_id,
                     shell_pid: pid,
                     label: format!("Session {}", handle.local_id),
                     program: String::new(),

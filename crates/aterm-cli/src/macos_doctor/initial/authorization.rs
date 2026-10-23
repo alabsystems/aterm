@@ -5,9 +5,7 @@
 
 use super::*;
 
-/// Authorization bound to the records observed before a startup offer. Carry
-/// the same ticket through persistence errors; never recapture a baseline for
-/// an already accepted choice. It contains no password and probes no OS settings.
+/// Authorization bound to the records observed before a startup offer.
 pub struct InitialSetupAuthorization {
     revision: u64,
     /// The vault this Mac was in when the offer was loaded ([`Self::offer`]), which the run
@@ -106,9 +104,7 @@ impl AuthorizationCommit {
 }
 
 impl InitialSetupAuthorization {
-    /// Observe existing setup records before loading or displaying an offer
-    /// ([`Self::offer`]). An unreadable or mismatched run cannot be assigned a guessed
-    /// revision.
+    /// Observe existing setup records before loading or displaying an offer ([`Self::offer`]).
     pub fn capture() -> Result<Self, String> {
         Self::capture_at(&state_root()?)
     }
@@ -124,12 +120,7 @@ impl InitialSetupAuthorization {
         })
     }
 
-    /// Load the offer: the saved first-launch plan in the vault this Mac is configured for
-    /// now ([`ConfiguredVault::present`]; with no saved plan every item is selected, and
-    /// with no configured vault the LAN default is used), reading only aterm's own
-    /// configuration and durable setup records. The run this ticket admits keeps that
-    /// vault, so one joined while the offer is shown stays, and a vault typed in the offer
-    /// while this Mac is in another moves it.
+    /// Loads the saved first-launch offer for the configured vault ([`ConfiguredVault::present`]).
     pub fn offer(&mut self) -> Result<Plan, String> {
         self.offer_reading(&state_root()?, live_configured_vault)
     }
@@ -156,9 +147,7 @@ impl InitialSetupAuthorization {
         !matches!(self.state, AuthorizationState::Ended)
     }
 
-    /// Some confirms this ticket's exact admitted revision, including an empty
-    /// plan. None retires a stale or already-ended review without changing state.
-    /// Retry errors only while pending, keeping the original plan and password.
+    /// Some confirms this ticket's exact admitted revision, including an empty plan.
     pub fn persist_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
         observe_person_mutation(
             Err("another doctor profile pass is running".into()),

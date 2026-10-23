@@ -250,7 +250,8 @@ fn arm(stream: &aterm_uds::CtlStream, deadline: Instant) -> Option<()> {
     Some(())
 }
 
-/// Dial one sibling and read its `survey facts`.
+/// Dial one sibling and read its `survey facts`. A refusal, budget exhaustion
+/// or malformed frame skips the peer silently (the `run_discovery` posture).
 fn summarize_peer(pid: u32, sock: &str) -> Option<SiblingInstance> {
     let deadline = Instant::now() + PEER_BUDGET;
     let (stream, token) = aterm_ctl::connect_then_read_token(sock).ok()?;

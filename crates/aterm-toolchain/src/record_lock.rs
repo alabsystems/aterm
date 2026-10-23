@@ -1,34 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A holder's lock on a file that carries a record other processes read while it lives.
+//! Exclusive lock on a file carrying a prefix record readable by other processes.
 
 use std::fs::File;
 
-/// A holder's exclusive lock on a file that CARRIES A RECORD other processes read while
-/// the holder lives — a lease's "who" line ([`crate::lease`]), atpkg's head watch seat's
-/// pid. Released on drop, like atpkg's `lock::Flock`.
-///
-/// Unix uses the advisory whole-file lock. Windows byte-range locks also deny
-/// ordinary reads from other handles, so the record remains outside the locked
-/// range `[record, u64::MAX)`. Whole-file liveness probes still overlap that range.
+/// Exclusive lock on a file carrying a prefix record readable by peers ([`crate::lease`]).
 #[derive(Debug)]
 pub struct RecordLock {
     file: File,
-    /// The record's length: where the held range starts (Windows).
+    /// The record's length.
     #[cfg(windows)]
     record: u64,
 }
 
 impl RecordLock {
-    /// Take `file`'s exclusive lock without blocking, leaving its first `record` bytes
-    /// readable by other handles on Windows ([`RecordLock`]).
+    /// Take `file`'s exclusive lock without blocking.
     ///
     /// # Errors
-    ///
     /// `WouldBlock` while another handle holds it; the OS error otherwise.
     pub fn try_lock(file: File, record: u64) -> Result<Self, std::fs::TryLockError> {
-        // The census's File evidence, as in atpkg's `Flock::try_lock`.
         let file: std::fs::File = file;
         #[cfg(windows)]
         {
@@ -37,7 +28,6 @@ impl RecordLock {
         }
         #[cfg(not(windows))]
         {
-            // `flock` has no ranges, and needs none: it is advisory.
             let _ = record;
             #[expect(
                 clippy::disallowed_methods,
@@ -48,8 +38,7 @@ impl RecordLock {
         }
     }
 
-    /// Let the lock go, keeping the file open — what the kernel does for a holder that
-    /// dies. The drop does it too.
+    /// Let the lock go, keeping the file open.
     pub fn unlock(&self) {
         #[cfg(windows)]
         record_range::unlock(&self.file, self.record);
@@ -79,14 +68,14 @@ impl Drop for RecordLock {
     }
 }
 
-/// [`RecordLock`]'s Windows range: `LockFileEx`/`UnlockFileEx` over `[record, u64::MAX)`.
+/// [`RecordLock`]'s Windows range.
 #[cfg(windows)]
 mod record_range {
     use std::ffi::c_void;
     use std::fs::File;
     use std::os::windows::io::AsRawHandle as _;
 
-    /// `OVERLAPPED`: the offset names the range; the API may also update its status fields.
+    /// `OVERLAPPED`: the offset names the range.
     #[repr(C)]
     struct Overlapped {
         internal: usize,
@@ -120,8 +109,7 @@ mod record_range {
         ) -> i32;
     }
 
-    /// The `OVERLAPPED` naming `record` as the start, and the range's length split into
-    /// its low and high halves.
+    /// The `OVERLAPPED` naming `record` as the start.
     fn range(record: u64) -> (Overlapped, u32, u32) {
         let len = u64::MAX - record;
         let overlapped = Overlapped {
@@ -136,9 +124,8 @@ mod record_range {
 
     pub(super) fn try_lock(file: &File, record: u64) -> Result<(), std::fs::TryLockError> {
         let (mut overlapped, low, high) = range(record);
-        // SAFETY: `file` is an open handle for the call; `overlapped` is a live, initialised
-        // `OVERLAPPED` available for the call's input/output. The handle is synchronous
-        // and FAIL_IMMEDIATELY refuses contention rather than parking a request.
+        // SAFETY: `file` is an open, synchronous handle and `overlapped` a live `OVERLAPPED` for
+        // the call; FAIL_IMMEDIATELY refuses contention rather than parking a request.
         let ok = unsafe {
             LockFileEx(
                 file.as_raw_handle(),
@@ -162,8 +149,7 @@ mod record_range {
 
     pub(super) fn unlock(file: &File, record: u64) {
         let (mut overlapped, low, high) = range(record);
-        // SAFETY: as in `try_lock`. A range this handle does not hold is refused, which
-        // changes nothing.
+        // SAFETY: as in `try_lock`.
         let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, low, high, &mut overlapped) };
     }
 }

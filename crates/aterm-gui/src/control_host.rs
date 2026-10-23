@@ -20,10 +20,12 @@ use crate::session_watch::{Subscription, Watchers};
 use crate::{SessionCtx, Wake, term_lock, term_lock_whole};
 
 pub(crate) struct GuiHost<'a> {
-    /// The one session this host serves.
+    /// The one session this host serves. Every per-session method refuses any
+    /// other sid, so a sid the fleet-wide `resolve` hands out fails closed.
     sid: u64,
     term: &'a Arc<Mutex<Terminal>>,
-    /// `None` when there is no event loop to nudge.
+    /// `None` when there is no event loop to nudge. Production passes `Some`;
+    /// tests run off the main thread, where no `EventLoopProxy` can be built.
     proxy: Option<&'a EventLoopProxy<Wake>>,
     /// The served session's watchers, which [`SessionHost::subscribe`] parks on.
     watchers: &'a Arc<Watchers>,
@@ -79,7 +81,9 @@ impl<'a> GuiHost<'a> {
     }
 }
 
-/// A [`Subscription`] as a [`ChangeWait`].
+/// A [`Subscription`] as a [`ChangeWait`]. Owning it in the box preserves the
+/// RAII deregistration: the slot on the session's list lives exactly as long
+/// as the handle.
 struct SubscriberWait(Subscription);
 
 impl ChangeWait for SubscriberWait {
@@ -419,7 +423,11 @@ mod tests {
         assert!(listed.contains(" cwd=/home/user/proj "), "{listed}");
     }
 
-    /// A cmd block's cwd is the directory its command ran in.
+    /// A cmd block's cwd is the directory its command ran in. cmd reports its
+    /// cwd from the prompt (`633;P;Cwd=$P`) and the engine files it under the
+    /// block in progress, so the injection sends it after `133;A` opens the new
+    /// block (pinned by `aterm-shell-integration`'s
+    /// `test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd`).
     #[test]
     fn a_cmd_block_cwd_is_where_its_command_ran() {
         let cwds = |cwd_after_start: bool| {

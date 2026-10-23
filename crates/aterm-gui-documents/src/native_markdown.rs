@@ -841,7 +841,9 @@ pub fn block_visual_rows(block: &MarkdownBlock, viewport_width: f32) -> usize {
     block_visual_rows_for_height(block, estimated_block_height(block, viewport_width))
 }
 
-/// The same row count from a height the caller has already measured.
+/// The same row count from a height the caller has already measured. Splitting
+/// the arithmetic out keeps `estimated_block_height` — an O(block text) decode —
+/// to one call per block per layout pass; the arithmetic itself is unchanged.
 #[inline]
 fn block_visual_rows_for_height(block: &MarkdownBlock, height: f32) -> usize {
     let padding = block_visual_padding(block);
@@ -1313,7 +1315,10 @@ fn lower_inline_segment(source: &str, depth: usize) -> String {
     out
 }
 
-/// The lowering pass, appending to `out`.
+/// The lowering pass, appending to `out`. Each recognized construct records the
+/// range of `out` it emitted with its style merged over the enclosing `style`
+/// (nested constructs record their own, stronger spans); `lower_inline_text`
+/// discards them, `lower_inline_text_styled` keeps them.
 fn lower_segment_into(
     source: &str,
     depth: usize,

@@ -18493,6 +18493,13 @@ fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
         "procs scope=pane",
         "disk scope=window",
         "since=7f3a.12 fresh=0",
+        // `why` is Scoped: its rows outside the caller's tab are withheld.
+        "why",
+        "why cpu",
+        "why mem",
+        "why global.mem --json",
+        "why top=3 fresh=0",
+        "why since=7f3a.12",
     ] {
         assert_eq!(argument_escalation("sys", scoped), None, "{scoped}");
     }
@@ -18506,6 +18513,13 @@ fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
         "name job=a40977",
         "bogus",
         "procs top=0",
+        // A form `why` refuses fails closed for an edge (the owner gets
+        // `WHY_USAGE`, or the built `USAGE` for `scope=` and
+        // `instances=all`, `query.rs`'s own tests).
+        "why pid=1",
+        "why scope=tab",
+        "why instances=all",
+        "why cpu mem",
     ] {
         assert_eq!(
             argument_escalation("sys", owner),

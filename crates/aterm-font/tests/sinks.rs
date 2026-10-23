@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The sinks: [`ScaledSink`] is the renderer's own pixel arithmetic, bit for
-//! bit, and [`PointSink`] carries every point the segment stream is built
-//! from, so the TrueType and CFF contour rules rebuild that stream from it.
-//!
-//! One rounding is inherent. A composite glyph's points reach a point sink
-//! transformed (the hinter wants them where they draw), but the segment
-//! builder takes an implied on-curve midpoint in the component's own space
-//! and transforms it after, as ttf-parser does; at a fractional `gvar`
-//! instance the two orders can round a midpoint an ulp apart. So an implied
-//! midpoint is held to 1e-5 relative, and every stored point to exact bits.
+//! The sinks: [`ScaledSink`] is the renderer's own pixel arithmetic, bit for bit, and [`PointSink`]
+//! carries every point the segment stream is built from, so the TrueType and CFF contour rules
+//! rebuild that stream from it.
 
 use aterm_font::{Face, GlyphId, OutlineSink, PointKind, PointSink, ScaledSink, Tag};
 
@@ -85,8 +78,6 @@ fn face_bytes(rel: &str) -> Vec<u8> {
 fn truetype_segments(contours: &[Vec<(f32, f32, PointKind)>]) -> (Vec<Seg>, Vec<bool>) {
     let mid = |a: (f32, f32), b: (f32, f32)| (a.0 + 0.5 * (b.0 - a.0), a.1 + 0.5 * (b.1 - a.1));
     let mut out = Vec::new();
-    // Whether each segment's end point is an implied midpoint (a move to
-    // one, or a curve to one), or the closing curve back to one.
     let mut implied = Vec::new();
     let mut first_implied = false;
     for contour in contours {
@@ -174,7 +165,6 @@ fn rebuilds(want: &[Seg], got: &[Seg], implied: &[bool]) -> Option<usize> {
         }
         let n = w.len();
         for k in 1..n {
-            // The last two values are the end point; a move's only point is it.
             let is_end = k >= n - 2;
             if w[k] == g[k] {
                 continue;
@@ -302,8 +292,6 @@ fn points_rebuild_the_outline() {
             rounded += r.unwrap_or(0);
             rebuilt += usize::from(!want.is_empty());
         }
-        // Integer outlines take their midpoints identically in either order
-        // (every sum and half is exact); only a fractional instance rounds.
         assert!(
             !coords.is_empty() || rounded == 0,
             "{rel}: {rounded} midpoints rounded at the default instance"

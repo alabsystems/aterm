@@ -83,7 +83,7 @@ impl World {
     }
 
     /// Leave the world in place when it drops, and say where.
-    pub fn keep(&mut self) {
+    pub const fn keep(&mut self) {
         self.keep = true;
     }
 
@@ -242,7 +242,8 @@ impl Reply {
     }
 }
 
-/// A terminal's explicit selector from the instance-local roster.
+/// A terminal's explicit selector from the instance-local roster. Native tabs
+/// can own the front while their underlying shell remains in this registry.
 fn terminal_selector(roster: &str) -> Option<String> {
     roster
         .lines()
@@ -770,9 +771,14 @@ struct ColdCopy {
 }
 
 /// `--pages cold`: `aterm` copied into the world (its whole bundle when it is a bundle's
+/// executable), run once with `--version`, then every page of the copy dropped from the page
+/// cache ([`crate::sys::evict_pages`]) and checked gone, so the launch pays aterm's own page-ins
+/// and nothing else.
+///
 /// # Errors
 /// The copy, its run or its eviction failed, or a page of it stayed resident (or it had none,
-/// which proves nothing).
+/// which proves nothing). A copy whose run gave no proof keeps the world (removing a file
+/// macOS may still be assessing strands every exec waiting on that assessment).
 fn cold_copy(world: &mut World, aterm: &Path) -> Result<ColdCopy, Fail> {
     let aterm = std::fs::canonicalize(aterm)
         .map_err(|e| format!("instance: cannot resolve {}: {e}", aterm.display()))?;
@@ -885,6 +891,10 @@ fn reveal_pending(rows: &str) -> bool {
 }
 
 /// THE BAND SETTLED: no live row still in its reveal's grace, read through
+/// `messages live` (the review of the login carry, 2026-10-20: `--pre
+/// 'login-notice si' --image` waited half a second of quiet and imaged a
+/// band with no ask on it, the ask's two-second grace still running).
+///
 /// # Errors
 /// A row still pending after a minute, or the run interrupted.
 fn await_band(inst: &Instance) -> Result<(), Fail> {

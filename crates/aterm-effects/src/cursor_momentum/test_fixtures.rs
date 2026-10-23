@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Event-script fixtures shared by the snapshot and admission tests: a
-//! momentum glow driven by keys, resets, ticks (dark and light) and schedule
-//! queries, every time a signed nanosecond offset from a clock origin. Every
-//! tick is admitted under [`MOMENTUM_PROFILE`] and runs on scratch reserved to
-//! its budget, which the step asserts was neither exceeded nor reallocated.
+//! Event-script test fixtures and admission checks under [`MOMENTUM_PROFILE`] for momentum glow.
 
 use std::time::Duration;
 
@@ -43,8 +39,7 @@ pub(super) enum Ev {
     },
 }
 
-/// What the glow showed for one input. Instants are offsets from the clock
-/// origin, so two runs on different origins compare equal when they agree.
+/// Observed result of one input, with instants expressed as offsets from the clock origin.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Obs {
     Keyed,
@@ -141,9 +136,8 @@ pub(super) fn step(g: &mut MomentumGlow, clock: &Clock, ev: &Ev) -> Obs {
     }
 }
 
-/// Every input of `evs` passes its admission under [`MOMENTUM_PROFILE`]:
-/// keys' τ, queries' frame intervals, and time nondecreasing in the horizon
-/// (ticks are admitted by [`step`]).
+/// Assert every key, query and instant in `evs` is admitted under [`MOMENTUM_PROFILE`] (ticks are
+/// admitted by [`step`]).
 pub(super) fn assert_admitted(evs: &[Ev]) {
     let p = &MOMENTUM_PROFILE;
     let mut last = None;
@@ -167,8 +161,7 @@ pub(super) fn assert_admitted(evs: &[Ev]) {
     }
 }
 
-/// Records a script by driving a scratch engine, so a schedule can follow the
-/// deadlines the glow names.
+/// Script recorder backed by a scratch [`MomentumGlow`].
 pub(super) struct Recorder {
     pub(super) evs: Vec<Ev>,
     g: MomentumGlow,
@@ -190,8 +183,7 @@ impl Recorder {
         obs
     }
 
-    /// The host's lane from `now`: ask for the next change, tick there, until
-    /// the glow names none. Returns the time it parked.
+    /// Advance along `next_change_deadline` until the glow parks, returning the park offset.
     pub(super) fn cool_down(
         &mut self,
         mut now: i128,
@@ -200,8 +192,6 @@ impl Recorder {
         cfg: MomentumGlowConfig,
         lane: Duration,
     ) -> i128 {
-        // A one-minute hang detector in logical time: the glow parks within
-        // seconds.
         let give_up = now + 60_000 * MS;
         loop {
             let Obs::Schedule { deadline, .. } = self.push(Ev::Query { at: now, lane }) else {
@@ -272,9 +262,7 @@ pub(super) fn config(dark: bool, hue: u32) -> MomentumGlowConfig {
     }
 }
 
-/// A dimmed dark-page burst that moves the caret, then its whole cool-down
-/// on a 120 Hz lane (active frames, settle wakes, the clearing frame), then a
-/// cold tick.
+/// Dark-page typing burst followed by a 60 Hz cool-down and cold tick.
 pub(super) fn dark_burst_and_cooldown() -> Vec<Ev> {
     let mut r = Recorder::new();
     let geom = padded();
@@ -307,10 +295,7 @@ pub(super) fn dark_burst_and_cooldown() -> Vec<Ev> {
     r.evs
 }
 
-/// A light-page burst over a growing run of letters. The hue changes (a memo
-/// miss), the theme's ink changes only in its ignored alpha byte (a memo hit
-/// on a different raw key), and the caret turns into a bar. Then the
-/// cool-down on a 60 Hz lane.
+/// Light-page typing burst with hue/ink/caret transitions and a 30 Hz cool-down.
 pub(super) fn light_page_burst() -> Vec<Ev> {
     let mut r = Recorder::new();
     let geom = plain();
@@ -347,10 +332,7 @@ pub(super) fn light_page_burst() -> Vec<Ev> {
     r.evs
 }
 
-/// The engine's other arms. It covers a key's τ apart from the tick's, a
-/// repeated instant (settling), each inert arm (no cursor, outside the grid,
-/// disabled, zero intensity), a reset while hot, the profile's longest τ, a
-/// tick whose short τ has gone cold, the grid's far corner, and both pages.
+/// Event script covering resets, inert arms, and boundary τ values.
 pub(super) fn resets_and_inert_arms() -> Vec<Ev> {
     let mut r = Recorder::new();
     let (dark, light) = (padded(), plain());

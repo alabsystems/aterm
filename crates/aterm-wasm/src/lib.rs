@@ -586,7 +586,8 @@ impl AtermTerminal {
         Ok(())
     }
 
-    /// Safety net #1 (see `REFLOW_PUMP_GRACE_RENDERS`): called by `render`.
+    /// Safety net #1 (see `REFLOW_PUMP_GRACE_RENDERS`): called by `render`. After the
+    /// grace window, one budgeted step per frame, never the whole job at once.
     #[inline]
     fn pump_reflow_on_render_tick(&mut self) {
         if self.pending_reflow.is_none() {
@@ -989,7 +990,8 @@ pub(crate) fn json_string(s: &str) -> String {
     out
 }
 
-/// Classify a matched span: 1=url (scheme or www.
+/// Classify a matched span: 1=url (scheme or www. host), 2=file_path (absolute,
+/// relative, home, or contains `/` with no scheme), else 3=other (plain word).
 fn classify(s: &str) -> u8 {
     let lower = s.to_ascii_lowercase();
     if lower.starts_with("http://")
@@ -1081,7 +1083,9 @@ pub(crate) fn system_font_terminal(rows: u16, cols: u16, px: f32) -> AtermTermin
 mod tests {
     use super::*;
 
-    /// The bundled face, injected the way a JS host injects a fetched one.
+    /// The bundled face, injected the way a JS host injects a fetched one. A
+    /// security property must not be skipped on a box with no system font, so
+    /// those tests build from these bytes rather than `new_from_system`.
     const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
     /// The theme the host hands the constructor seeds the engine's implicit
@@ -1396,7 +1400,8 @@ mod tests {
         );
     }
 
-    /// Reject an oversized frame before constructing or changing a grid.
+    /// Reject an oversized frame before constructing or changing a grid. Existing
+    /// text, presentation state and pixels survive refused resize, chrome and zoom.
     #[test]
     fn oversized_frames_are_refused_before_state_changes() {
         let new = |rows, cols| {
@@ -2215,7 +2220,11 @@ mod tests {
         );
     }
 
-    /// The pet defaults OFF.
+    /// The pet defaults OFF. The pointer and the press are value-shadowed
+    /// doors on the WF-1 gate: a pointer sample that moved reopens it, the
+    /// same sample again does not; a leave reopens it once; a press outside
+    /// the body passes (`0`) and leaves the gate shut, a press inside pets
+    /// (`1`) and buys the frame that runs the purr.
     #[test]
     fn pointer_and_pet_press_reopen_the_frame_gate() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
@@ -2649,7 +2658,9 @@ mod tests {
         assert!(full >= 2, "the full arm must be reached ({full})");
     }
 
-    /// WF-1 frame gate, two-sided.
+    /// WF-1 frame gate, two-sided. Side 1 (skip): a second `render()` with
+    /// nothing changed must take the gate (zero present bands, `rgba`
+    /// byte-identical).
     #[test]
     fn frame_gate_skips_settled_frames_and_reopens_on_every_change_class() {
         let mut t = crate::system_font_terminal(8, 40, 14.0);

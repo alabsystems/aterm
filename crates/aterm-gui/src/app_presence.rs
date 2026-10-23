@@ -883,7 +883,7 @@ impl App {
         self.windows.get(&wid).map_or(0, |ws| ws.presence.fp())
     }
 
-    /// The needs pill window `wid` shows now, as the strip carries it ([`NeedsPillModel`]): `None` while its border is unlit or the View switch is off.
+    /// The projected pill window `wid` shows now, as the strip carries it ([`NeedsPillModel`]). Reported needs can light its border without a pill; the View switch hides both.
     pub(crate) fn presence_pill(&self, wid: WindowId) -> Option<NeedsPillModel> {
         let pill = self.windows.get(&wid)?.presence.pill.as_ref()?;
         Some(NeedsPillModel {
@@ -968,7 +968,7 @@ impl App {
         }
     }
 
-    /// The pill's a11y message: the window's most pressing need as its pill says it, a polite status with no bar row (the pill is titlebar chrome); `None` with no pill.
+    /// The pill's a11y message: the projected pill's words, a polite status with no bar row (the pill is titlebar chrome); `None` with no pill, including a report-only window.
     #[cfg(a11y_tree)]
     pub(crate) fn presence_a11y_message(
         &self,

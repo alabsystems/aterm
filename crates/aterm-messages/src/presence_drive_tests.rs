@@ -311,6 +311,26 @@ fn a_need_without_a_pill_does_not_hide_another_tabs_prompt() {
     assert!(d.view(1).pill.is_none());
 }
 
+#[test]
+fn more_walks_past_a_front_report_to_the_other_reports() {
+    let mut d = desk(vec![vec![1, 1], vec![2], vec![3, 3]]);
+    d.publish(1, stuck(1));
+    for session in [2, 3] {
+        let mut reported = decide(session).expect("a need");
+        reported.show_pill = false;
+        d.publish(session, Some(reported));
+    }
+    let pill = d.view(1).pill.as_ref().expect("the visible request");
+    assert_eq!((pill.session, pill.more), (1, 2));
+
+    d.wins.get_mut(&1).unwrap().front_tab = 1;
+    assert_eq!(d.next_need_after(1, 1), Some(3));
+    d.wins.get_mut(&1).unwrap().front_tab = 2;
+    assert_eq!(d.next_need_after(1, 1), Some(2));
+    d.wins.get_mut(&1).unwrap().front_tab = 0;
+    assert_eq!(d.next_need_after(1, 1), Some(2));
+}
+
 /// THE MOST PRESSING SESSION across a window's tabs and panes: stuck before
 /// decide wherever they are; within a severity the front session wins the
 /// tie, then the oldest need; `more` counts the rest.

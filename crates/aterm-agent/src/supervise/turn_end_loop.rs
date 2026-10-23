@@ -167,7 +167,7 @@ pub(super) const UNDRAWN_INPUT_HANG: Duration = Duration::from_secs(60);
 /// Whether the `tries`-th ask of a restart the host keeps deferring is journaled: the first four
 /// (the pauses grow 10 s, 1, 5, 10 min) and then every sixth, an hour on the last pause, so a
 /// fallback that waits a day on the agent's own jobs writes a line an hour.
-fn restart_note_due(tries: u32) -> bool {
+const fn restart_note_due(tries: u32) -> bool {
     tries < 4 || tries.is_multiple_of(6)
 }
 
@@ -186,7 +186,7 @@ fn caret_text(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
 
 /// A wall the host's measure of the API's reach answers: an API error that never reached the API,
 /// a reply cut off, or a certificate or proxy refused ([`aterm_phase::ApiCause`]).
-fn answered_by_the_network(kind: aterm_phase::WallKind) -> bool {
+const fn answered_by_the_network(kind: aterm_phase::WallKind) -> bool {
     matches!(
         kind,
         aterm_phase::WallKind::ApiError {
@@ -199,7 +199,7 @@ fn answered_by_the_network(kind: aterm_phase::WallKind) -> bool {
 }
 
 /// The walls a usage window's reset lifts.
-fn resumes_at_reset(kind: aterm_phase::WallKind) -> bool {
+const fn resumes_at_reset(kind: aterm_phase::WallKind) -> bool {
     use aterm_phase::WallKind as K;
     matches!(
         kind,
@@ -2216,7 +2216,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Whether the policy's escalation at a point of `phase` is the point's own ([`Self::escalate_point`]).
-    pub(super) fn escalates_here(&self, phase: &Phase) -> bool {
+    pub(super) const fn escalates_here(&self, phase: &Phase) -> bool {
         match phase {
             Phase::Idle | Phase::Question => true,
             Phase::Limited { .. } => self.memory_wall,
@@ -3653,7 +3653,7 @@ impl<C: Ctl> Session<'_, C> {
     /// Whether the advice this point's decision was given ([`Self::account_advise`]) is the
     /// probe: the spec's fourth gate, asked first, so with no roster nothing else is looked at,
     /// requested or said.
-    fn probe_advised(&self, screen: &Screen) -> bool {
+    const fn probe_advised(&self, screen: &Screen) -> bool {
         matches!(
             &self.account_seen,
             Some((at, AccountPoint::TurnEnd, Some(AccountAdvice::Probe { .. })))

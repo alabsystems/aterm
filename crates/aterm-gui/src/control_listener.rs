@@ -301,7 +301,10 @@ struct EndpointShared {
 #[cfg(unix)]
 #[derive(Default)]
 struct EndpointState {
-    /// The serving generation's listening descriptor.
+    /// The serving generation's listening descriptor. Its accept thread owns
+    /// it and closes it only once retired, and a generation is retired only
+    /// under this lock ([`Endpoint::install`]), so while it is here it names
+    /// that listening socket.
     serving: Option<RawFd>,
     /// Every name a generation's listening socket was bound at — the published
     /// path, a rebind's temporary name: the local address every connection it
@@ -854,7 +857,8 @@ impl AcceptThread {
         false
     }
 
-    /// Serve until retired.
+    /// Serve until retired. Each turn: park until readable (or [`TICK`]),
+    /// drain, read the queue, beat.
     fn run(self) {
         let serve = |stream: CtlStream| {
             (self.serve)(stream);
@@ -908,7 +912,8 @@ impl AcceptThread {
     }
 }
 
-/// Park until `listener` is readable or `timeout` passes.
+/// Park until `listener` is readable or `timeout` passes. Errors (EINTR
+/// included) just end the wait: the caller drains and re-judges either way.
 #[cfg(unix)]
 fn wait_readable(listener: &CtlListener, timeout: Duration) {
     let _ = poll_readable(listener.as_raw_fd(), timeout);
@@ -931,7 +936,9 @@ pub(crate) fn poll_readable(fd: RawFd, timeout: Duration) -> std::io::Result<boo
     }
 }
 
-/// Accept until the queue reports empty (or [`DRAIN_MAX`]).
+/// Accept until the queue reports empty (or [`DRAIN_MAX`]). Returns how many
+/// connections were handed to `serve`, or `None` once the descriptor names no
+/// socket at all (a retired endpoint's, [`close_listening`]).
 #[cfg(unix)]
 fn drain(
     listener: &CtlListener,
@@ -1308,7 +1315,10 @@ mod tests {
         }
     }
 
-    /// The judgement, tick by tick.
+    /// The judgement, tick by tick. A beat that moves is healthy however full the queue; a
+    /// beat that stands still is stuck only after [`STUCK_TICKS`] ticks and [`WEDGE_AFTER`]
+    /// (a process waking from suspension turns within a tick); a turning thread whose
+    /// queue stands still is stalled after [`WEDGE_AFTER`]; and a rebind backs off.
     #[test]
     fn the_watch_judges_stuck_stalled_and_healthy() {
         let t0 = Instant::now();

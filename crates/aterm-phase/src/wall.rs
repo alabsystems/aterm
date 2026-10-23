@@ -35,7 +35,8 @@ pub enum WallKind {
 pub enum ApiCause {
     /// Server-side failure: a retryable HTTP status (5xx, 408, 409, 429; or 401/451) or an unclassified `API Error` without a status (`API Error: terminated`, `API Error: fetch failed`, `API Error: Please wait a moment and try again.`).
     Server,
-    /// Network or DNS failure before reaching the API (e.g.
+    /// Network or DNS failure before reaching the API (e.g. `ENOTFOUND`,
+    /// `ECONNREFUSED`, timeout, or sleep).
     Unreachable,
     /// Response cut off mid-stream or stalled before a response was produced.
     CutOff,

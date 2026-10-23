@@ -66,7 +66,7 @@ pub enum Scenario {
 impl Scenario {
     /// The word the specification and report use.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::All => "all",
             Self::Messaging => "messaging",
@@ -105,7 +105,7 @@ pub enum Log {
 impl Log {
     /// The word [`parse`] reads and the report prints.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Log::Auto => "auto",
             Log::Off => "off",
@@ -151,7 +151,7 @@ pub enum Tier {
 impl Tier {
     /// The word [`parse`] reads and the report prints.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Tier::Strict => "strict",
             Tier::Ordered => "ordered",
@@ -187,7 +187,7 @@ pub const DEFAULT_PACED: usize = 50;
 impl Spec {
     /// The sender sessions the burst is split across.
     #[must_use]
-    pub fn burst_senders(&self) -> usize {
+    pub const fn burst_senders(&self) -> usize {
         self.burst.div_ceil(PER_SENDER)
     }
 

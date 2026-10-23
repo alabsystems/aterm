@@ -621,7 +621,9 @@ mod tests {
         );
     }
 
-    /// The negative control: the main block is untouched.
+    /// The negative control: the main block is untouched. `5` above `R` and
+    /// the main Return are not keypad keys, and the LOCATION — not the
+    /// scancode — is what says a key is on the keypad.
     #[test]
     fn standard_location_is_untouched() {
         assert_eq!(

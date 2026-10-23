@@ -318,7 +318,10 @@ fn a_busy_read_while_the_landing_is_admitted_reopens_it() {
     }
 }
 
-/// A REPORT WRITTEN AGAIN IS NO NEW TURN.
+/// A REPORT WRITTEN AGAIN IS NO NEW TURN. codex-alab clears its report when it
+/// lets the terminal go (an external editor, Ctrl+Z) and writes its state
+/// again when it takes it back, and it reports `working` while background
+/// work runs on after a turn's end.
 #[test]
 fn a_report_written_again_after_a_handoff_reopens_nothing() {
     const CLEAR: &[u8] = b"\x1b]7501;state=clear\x1b\\";

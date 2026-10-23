@@ -3,7 +3,7 @@
 // Author: Andrew Yates
 
 //! Lexical source censuses and guards over an aterm checkout.
-
+//!
 //! * OB-1  marker ↔ registry: every `// COST: UNBOUNDED(<dim>)` marker in the
 //!   derived GUI-process closure ([`scan_set::derive_gui_scan_set`], workspace
 //!   `src/` only) maps to a registered sink, and every registered sink is still
@@ -72,7 +72,8 @@ impl CensusOutcome {
         self
     }
 
-    /// Turn a clean walk red when a floor is missed.
+    /// Turn a clean walk red when a floor is missed. A red walk keeps its own
+    /// verdict: its findings already say what is wrong.
     fn hold_floors(&mut self) {
         let missed: Vec<String> = self
             .floors
@@ -112,7 +113,7 @@ pub struct Floor {
 
 impl Floor {
     /// Requires `seen` to be at least `min`.
-    pub(crate) fn at_least(
+    pub(crate) const fn at_least(
         what: &'static str,
         seen: usize,
         min: usize,
@@ -127,7 +128,7 @@ impl Floor {
     }
 
     /// Requires `seen` to be zero.
-    pub(crate) fn none(what: &'static str, seen: usize, missed: &'static str) -> Self {
+    pub(crate) const fn none(what: &'static str, seen: usize, missed: &'static str) -> Self {
         Self {
             what,
             seen,
@@ -341,7 +342,8 @@ struct OffloadBoundary {
     justification: &'static str,
 }
 
-/// The audited offload boundaries of the scrollback-reflow protocol.
+/// The audited offload boundaries of the scrollback-reflow protocol. A guarded
+/// call to one counts as evidence the offload is in place (OB-4).
 const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
     OffloadBoundary {
         symbol: "resize_offloading_scrollback",
@@ -651,7 +653,9 @@ fn ident_after_fn(after_fn: &str) -> Option<String> {
     if id.is_empty() { None } else { Some(id) }
 }
 
-/// Is `line` a function definition?
+/// Is `line` a function definition? Returns `(indent, name)`. Recognises the
+/// rustfmt-normalised `((pub…) )?(const |async |unsafe |extern "…" )*fn <name>`
+/// prefixes; ignores `fn` appearing elsewhere (e.g. `Fn(` bounds, `fn` in a type).
 fn parse_fn_def(line: &str) -> Option<(usize, String)> {
     let indent = line.len() - line.trim_start().len();
     let mut rest = line.trim_start();

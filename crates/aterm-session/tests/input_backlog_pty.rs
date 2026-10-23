@@ -85,12 +85,19 @@ fn settle(sink: &SinkWriter, done: impl Fn(&InputBacklog) -> bool) -> InputBackl
     hit.unwrap_or_else(|| panic!("never settled: {:?}", last.expect("probed")))
 }
 
-/// Wait until a parked paste's first bytes are queued and dated.
+/// Wait until a parked paste's first bytes are queued and dated. The ledger stamps a
+/// write after `write(2)` returns, and until then the probe reads the bytes as in
+/// flight (`wait` zero); a nonzero `wait` means the stamp predates this return, so an
+/// age slept from here counts from an event this thread saw, never from the paster's
+/// `spawn`, which a loaded scheduler can start late.
 fn first_write_dated(sink: &SinkWriter) -> InputBacklog {
     settle(sink, |b| b.queued > 0 && !b.wait.is_zero())
 }
 
-/// RAW UNREAD INPUT IS COUNTED AND DATED — the incident's shape.
+/// RAW UNREAD INPUT IS COUNTED AND DATED — the incident's shape. `abc` goes in
+/// and reads `queued == 3`, dated no earlier than its write; the program
+/// reading ONE byte leaves 2; a NEW write behind them (a driver's key) adds to
+/// the count; and reading everything clears the reading to zero.
 #[test]
 fn raw_unread_input_is_counted_and_dated() {
     let (master, slave) = pty_pair(true);
@@ -137,7 +144,10 @@ fn canonical_partial_line_reads_zero() {
     close_pair(master, slave);
 }
 
-/// A WRITER PARKED ON A FULL QUEUE DOES NOT BLIND THE PROBE.
+/// A WRITER PARKED ON A FULL QUEUE DOES NOT BLIND THE PROBE. A paste into a
+/// program that has stopped reading fills the raw queue, and the sink's
+/// blocking write then waits in `poll(POLLOUT)` HOLDING the fd lock for as
+/// long as the program stays frozen.
 #[test]
 fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
     let (master, slave) = pty_pair(true);
@@ -182,7 +192,9 @@ fn a_writer_parked_on_a_full_queue_does_not_blind_the_probe() {
     close_pair(master, slave);
 }
 
-/// A drainer parked partway through a chunk counts each unread byte once.
+/// A drainer parked partway through a chunk counts each unread byte once. A
+/// 4000-byte frame into a raw reader that stopped reading fills the queue with its
+/// head; the tail spills, and the drainer takes it as one chunk and parks.
 #[test]
 fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
     const FRAME: usize = 4000;
@@ -233,7 +245,12 @@ fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
     close_pair(master, slave);
 }
 
-/// A METERED PASTE IS DATED BY ITS OWN WRITE.
+/// A METERED PASTE IS DATED BY ITS OWN WRITE. A paste write loop
+/// (`SinkWriter::write_frame_metered_with_receipt`) that bypasses the ledger
+/// leaves bytes it never saw, which read as older than the sink itself
+/// (`InputLedger::oldest_unread_at` dates them from its birth): a paste into
+/// a frozen program would be dated by when the SESSION started, not by the
+/// paste.
 #[test]
 fn a_metered_paste_is_dated_by_its_own_write() {
     const AGE: Duration = Duration::from_millis(100);
@@ -402,7 +419,9 @@ fn a_flush_moves_the_discard_epoch_and_not_the_restart_count() {
     drop((a, b));
 }
 
-/// A read after a discard is told from the discard.
+/// A read after a discard is told from the discard. The discard's empty queue is what
+/// a reader leaves too, so aterm-gui holds a stall through it; this is the evidence
+/// that lets the hold go.
 #[test]
 fn a_read_after_a_discard_is_told_from_the_discard() {
     let (master, slave) = pty_pair(true);
@@ -448,7 +467,10 @@ fn a_read_after_a_discard_is_told_from_the_discard() {
     drop((a, b));
 }
 
-/// A cbreak program's control key is not a read.
+/// A cbreak program's control key is not a read. With ICANON off but ISIG, IEXTEN and
+/// IXON on (Python's `tty.setcbreak`, ncurses `cbreak()`) the line discipline consumes
+/// `^C`, `^O` and `^S` as they are written: the ledger counts the byte and the queue
+/// never holds it.
 #[test]
 fn a_control_key_a_cbreak_driver_eats_is_not_a_read() {
     let (master, slave) = pty_pair(true);

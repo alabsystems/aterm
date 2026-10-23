@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm-libc-oracle regen` — regenerate `crates/aterm-libc`'s four cell modules and the oracle's four conformance modules from measurements of the REFERENCE libc, then format them.
-
+//!
+//! The cell this box is native to is documented and probed under Trust; every
+//! other cell under a stock rustup toolchain (`--stock`, default `stable`, with
 //! each cross triple's std installed) — this crate's one STOCK EXCEPTION, since
 //! Trust ships std for its host only.
 pub mod behaviour;
@@ -176,7 +178,9 @@ impl Reference {
         })
     }
 
-    /// Run one offline cargo command for `cell` and read what it reported.
+    /// Run one offline cargo command for `cell` and read what it reported. A
+    /// full disk or a reference not yet downloaded is a stop that says nothing
+    /// about the cell.
     fn cargo(
         &self,
         compiler: &Compiler<'_>,

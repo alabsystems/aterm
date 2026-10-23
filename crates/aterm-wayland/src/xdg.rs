@@ -36,7 +36,8 @@ impl Shell {
                 unsafe { xdg_wm_base::pong(base, *serial) };
             }
         };
-        // SAFETY: The wm_base just bound, without a listener.
+        // SAFETY: The wm_base just bound, without a listener; the listener lives in the Shell
+        // and drops after the proxy.
         let ping = unsafe { wm_base.listen(pong) };
         let ping = match ping {
             Ok(l) => l,
@@ -292,7 +293,7 @@ impl<'s> Toplevel<'s> {
             decoration: None,
             listeners: Vec::new(),
         };
-        // SAFETY: An xdg_surface made here.
+        // SAFETY: An xdg_surface made here, held by the pending owner.
         pending
             .listeners
             .push(unsafe { listen_part(xdg, &toplevel_book, Part::Surface) }?);

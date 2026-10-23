@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh api` (design §10.2): one read of any path.
+//! `agh api`: read requests against any API-origin path.
 
 use std::ffi::OsStr;
 
@@ -30,6 +30,7 @@ fn method(inv: &Invocation) -> Result<Method> {
     }
 }
 
+// Treat `+` as space before percent-decoding.
 /// One query key or value as GitHub reads it: `+` is a space (gh sends a typed query
 /// verbatim, so `q=tetris+language:assembly` searches two terms), then percent-decoded.
 /// `path::query` encodes the space as `%20` and a typed `%2B` as `%2B` again.
@@ -46,8 +47,6 @@ fn path_and_query(
     let lower = typed.to_ascii_lowercase();
     let absolute;
     let typed = if lower.starts_with("http://") || lower.starts_with("https://") {
-        // The whole origin is parsed and compared, so `https://api.github.com.example/x`
-        // (or one with userinfo) is another origin, never a path on this one.
         match Origin::parse(typed) {
             Some((origin, path_and_query)) if origin == *api => {
                 absolute = path_and_query;
@@ -63,8 +62,7 @@ fn path_and_query(
     } else {
         typed
     };
-    // A `#fragment` is never sent (`Origin::parse` and the wire drop it), so it is cut before
-    // the route is judged: `/user#` routes as the `/user` GitHub receives, never as Unscoped.
+    // Strip any `#fragment` before routing so `/user#` routes as `/user`.
     let typed = typed.split('#').next().unwrap_or_default();
     let (path, query) = typed.split_once('?').unwrap_or((typed, ""));
     let path = if path.starts_with('/') {
@@ -72,9 +70,7 @@ fn path_and_query(
     } else {
         format!("/{path}")
     };
-    // A dot-segment, typed, percent-encoded or behind an encoded `/`, would let a normalising
-    // server resolve the request off the route it was decided for. `Raw::get` refuses it
-    // too, but routing (`-R`'s id lookup) may send a request first, so it is refused here.
+    // Refuse dot-segments before `-R` routing can send an id lookup request.
     crate::path::refuse_encoded_dot_segment("path", &path)?;
     let pairs = query
         .split('&')
@@ -152,10 +148,7 @@ fn target(
             Err(_) => (RouteTarget::Unscoped, Named::Default),
         },
         ["orgs" | "users", owner, ..] => (RouteTarget::Owner((*owner).to_string()), Named::Default),
-        // `/user/{account_id}…` names another account by its numeric id (GitHub's next link
-        // for `/users/{login}/repos` is `/user/{id}/repos`), not the profile's own: it is
-        // Unscoped, so the default read chain serves it and the tier wall holds a release
-        // profile's `--as` off it, as it would a by-name read of a foreign owner.
+        // `/user/{account_id}…` names another account by numeric id, not the profile's own.
         ["user", id, ..] if crate::path::is_digits(id) => (RouteTarget::Unscoped, Named::Default),
         ["user", ..] => (RouteTarget::Identity, Named::Default),
         _ => (RouteTarget::Unscoped, Named::Default),
@@ -163,6 +156,7 @@ fn target(
     Ok((target, named, None))
 }
 
+// Verify that `/repositories/{id}` matches the `-R` repository's id.
 /// A `/repositories/{id}` path is routed as `-R`'s repository, so the id must be that
 /// repository's: otherwise a profile `-R` routes could be sent to read any repository, of any
 /// tier. `-R`'s id is read once (`Github::repo_id`'s memo, at most one request). The requests
@@ -204,14 +198,11 @@ fn headers_value(headers: &[(String, String)]) -> Value {
     Value::Object(joined)
 }
 
-/// `agh api PATH [-X GET|HEAD] [-f k=v]… [-F k=v]… [--all] [--include] [--accept MEDIA]
-/// [-R REPO]`: one read of any path on the api origin, or every page of it.
+/// Executes `agh api PATH` with `GET` or `HEAD` on the API origin.
 ///
 /// # Errors
 ///
-/// Usage for a write method, HEAD or `--include` with `--all`, another origin, a dot-segment, a bad field,
-/// an unroutable path, a `/repositories/{id}` that is not `-R`'s, or object pages without
-/// ndjson; the read's error.
+/// Usage error for invalid flags/paths/origins or request failure.
 pub(crate) fn api(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let method = method(inv)?;
     let all = inv.has("--all");
@@ -237,8 +228,6 @@ pub(crate) fn api(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         None => 0,
     };
     let include = inv.has("--include");
-    // `--limit` counts items, never pages: the walk reads every page (to its cap), and the
-    // limit cuts what it read. A cap under `--partial` is the walk's own `End::Capped`.
     let request = RawGet {
         method,
         path,

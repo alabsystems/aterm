@@ -50,9 +50,7 @@ fn scopes(text: &str) -> impl Iterator<Item = &str> {
     text.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// The first scope `x-accepted-oauth-scopes` names that `x-oauth-scopes` lacks, compared
-/// exactly after trimming. `None` when either header is absent (a fine-grained or anonymous
-/// request carries no `x-oauth-scopes`, so nothing is known to be lacking).
+/// The first scope `x-accepted-oauth-scopes` names that `x-oauth-scopes` lacks.
 pub(crate) fn missing_scope(headers: &[(String, String)]) -> Option<String> {
     let held = header(headers, "x-oauth-scopes")?;
     let accepted = header(headers, "x-accepted-oauth-scopes")?;
@@ -90,13 +88,7 @@ fn forbidden(error: Error, headers: &[(String, String)], body: &GithubBody) -> E
     error.with_sub(Sub::Forbid(Forbid::Other))
 }
 
-/// `None` for 2xx and 304; otherwise the error (design §7.2's table). Every error carries
-/// `GithubBody::parse(body).with_headers(headers)`, so the three permission headers travel
-/// with it, and its why is `GitHub answered {status}: {message}`, or `GitHub answered
-/// {status}` when there is no message. A 3xx other than 301 is CouldNotRun `Protocol`
-/// whatever the method (plan §4.6.18's table). On a 403 that is not a rate limit, or a 404, when
-/// both `x-oauth-scopes` and `x-accepted-oauth-scopes` are present and the token's scopes
-/// lack one the accepted list names, the `next` names that scope.
+/// `None` for 2xx and 304; otherwise the error (design §7.2's table).
 #[must_use]
 pub fn answer(
     status: u16,
@@ -105,7 +97,6 @@ pub fn answer(
     method: Method,
     idempotency: Idempotency,
 ) -> Option<Error> {
-    // The table of plan §4.6.18 reads neither: a 3xx is judged the same on every method.
     let _ = (method, idempotency);
     if (200..300).contains(&status) || status == 304 {
         return None;
@@ -161,10 +152,7 @@ pub fn answer(
     Some(error.with_github(github))
 }
 
-/// A wire failure: NotSent → CouldNotRun `Wire(kind)`. Sent or Answered: on a read method, or
-/// on any idempotency but OneShot → CouldNotRun `Wire(kind)`; on a OneShot write →
-/// OutcomeUnknown, `SideEffect::Unknown`, keeping `Wire(kind)`. The why is
-/// `{kind slug}: {detail}`.
+/// A wire failure: NotSent → CouldNotRun `Wire(kind)`.
 #[must_use]
 pub fn wire(error: &WireError, method: Method, idempotency: Idempotency) -> Error {
     let why = format!("{}: {}", error.kind.slug(), error.detail);

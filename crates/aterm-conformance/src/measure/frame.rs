@@ -12,9 +12,7 @@ pub type Rgb = [u8; 3];
 /// below an allocation bomb.
 const MAX_EDGE: u32 = 16_384;
 
-/// A decoded frame: `width * height` pixels, four bytes each, row-major from
-/// the top, as the decoder hands them over. Colour reads take `[r, g, b]`;
-/// row and frame equality include alpha.
+/// A decoded RGBA8 frame (`width * height * 4` bytes, row-major from top).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     width: usize,
@@ -91,12 +89,12 @@ impl Frame {
     }
 
     #[must_use]
-    pub fn width(&self) -> usize {
+    pub const fn width(&self) -> usize {
         self.width
     }
 
     #[must_use]
-    pub fn height(&self) -> usize {
+    pub const fn height(&self) -> usize {
         self.height
     }
 

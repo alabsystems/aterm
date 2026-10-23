@@ -26,7 +26,9 @@ mod imp {
     /// One file this instance published, by path and identity.
     pub(super) struct Owned {
         path: CString,
-        /// Device and inode as `MetadataExt` widens them.
+        /// Device and inode as `MetadataExt` widens them. The inode moves when this
+        /// instance renames another of its own files over the path
+        /// ([`Owned::follow`]); the device cannot, since a rename never crosses one.
         dev: u64,
         ino: AtomicU64,
     }
@@ -365,7 +367,9 @@ mod tests {
 
     use super::imp::{Owned, Published, claim_quit, hold_for_exec};
 
-    /// The handler's removal removes the published socket, token and alias.
+    /// The handler's removal removes the published socket, token and alias. Negative
+    /// controls: a socket another listener rebound, a token replaced by rename, and an
+    /// alias a newer instance repointed all stay.
     #[test]
     fn a_terminating_signal_removes_only_what_this_instance_still_owns() {
         let scratch = crate::test_scratch::short_dir("the own test's socket");

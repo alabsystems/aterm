@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Local init's Rust toolchains, kept from feeding Spotlight: rustup installs its
-//! `minimal` profile, and no toolchain rustup installed carries `rust-docs`, the offline
-//! HTML book no build reads. Measured on a Mac with rustup's `default` profile
-//! (2026-10-20): stable's `rust-docs` held 909 MB and Spotlight had indexed 84,921 of its
-//! HTML pages, indexed again at each toolchain install or update. A linked toolchain
-//! (`rustup toolchain link`, atpkg's `trust`) is not rustup's to change and is left alone.
-//! Build intermediates are the build-cache rule's (`aterm_toolchain::build_cache`);
-//! `aterm doctor` reports what Spotlight still holds of them.
+//! Rustup minimal-profile and `rust-docs` cleanup to keep toolchains out of Spotlight.
 
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
@@ -49,8 +42,7 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     ])
 }
 
-/// Keep aterm's cargo build cache, tooling cache, and Trust toolchain sysroots inside
-/// `.noindex` directories so Spotlight never indexes `*.rmeta` / `*.rlib` build artifacts.
+/// Keep aterm's cargo build cache, tooling cache and Trust toolchain builds in `.noindex` folders.
 #[derive(Debug, Clone)]
 struct BuildNoindex {
     user: User,
@@ -75,8 +67,7 @@ impl BuildNoindex {
             .join("Library/Application Support/aterm/pkg/store/trust")
     }
 
-    /// Plain numeric build directories in `store/trust/<build>` that are not yet symlinked
-    /// to `<build>.noindex`.
+    /// Numeric build directories in `store/trust/<build>` not yet symlinked to `<build>.noindex`.
     fn plain_trust_builds(&self, sys: &dyn System) -> Result<Vec<String>, String> {
         let store = self.trust_store();
         let entries = match sys.list_dir(&store) {
@@ -90,6 +81,10 @@ impl BuildNoindex {
                 continue;
             }
             let path = store.join(&name);
+            let noindex = store.join(format!("{name}.noindex"));
+            if sys.stat(&noindex).is_ok() {
+                continue;
+            }
             match sys.stat(&path) {
                 Ok(s) if s.dir && !s.symlink => plain.push(name),
                 Ok(_) => {}
@@ -109,8 +104,7 @@ impl BuildNoindex {
         }
     }
 
-    /// Plain Cargo/Rust `target` or `build` directories under `self.home` that Spotlight
-    /// currently indexes (`*.rmeta`) and that have not yet been converted to `<name>.noindex`.
+    /// Cargo/Rust `target` or `build` directories under `self.home` indexed by Spotlight.
     fn spotlit_build_dirs(&self, sys: &dyn System) -> Result<Vec<PathBuf>, String> {
         let mdfind_bin = Path::new("/usr/bin/mdfind");
         if sys.stat(mdfind_bin).is_err() {
@@ -155,6 +149,13 @@ impl BuildNoindex {
         }
         let mut out = Vec::new();
         for cand in candidates {
+            let Some(name) = cand.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let noindex = cand.with_file_name(format!("{name}.noindex"));
+            if sys.stat(&noindex).is_ok() {
+                continue;
+            }
             if Self::dir_present(sys, &cand)?
                 && (sys.stat(&cand.join("CACHEDIR.TAG")).is_ok()
                     || sys.stat(&cand.join("debug")).is_ok()
@@ -335,7 +336,7 @@ impl Rustup {
         Ok(ran.out().trim().to_owned())
     }
 
-    /// `Some(why)` when there is no rustup to ask: nothing to do.
+    /// `Some(why)` when there is no rustup to ask.
     fn absent(&self, sys: &dyn System) -> Result<Option<String>, String> {
         match sys.stat(&self.bin()) {
             Ok(_) => Ok(None),
@@ -346,8 +347,7 @@ impl Rustup {
         }
     }
 
-    /// The toolchains rustup installed that carry `rust-docs` (its component record,
-    /// `lib/rustlib/components`, lists it); linked toolchains are skipped.
+    /// The toolchains rustup installed that carry `rust-docs`.
     fn with_docs(&self, sys: &dyn System) -> Result<Vec<String>, String> {
         let list = self.read(sys, &["toolchain", "list"])?;
         let mut out = Vec::new();
@@ -503,8 +503,7 @@ mod tests {
         engine::run(&items, mode, sys, &context(), &mut NoJournal)
     }
 
-    /// A Mac whose rustup reports `profile` first, with `stable`'s component record in
-    /// stable, a pinned toolchain without docs, and atpkg's linked `trust`.
+    /// A Mac whose rustup reports `profile` first.
     fn mac(profile: &str, stable: &[u8]) -> Fake {
         let sys = Fake::root();
         sys.file("/Users//alice/.cargo/bin/rustup", b"")
@@ -561,7 +560,6 @@ mod tests {
             1,
             "{calls:?}"
         );
-        // The linked toolchain and the one without docs are never touched.
         assert!(
             !calls
                 .iter()
@@ -676,5 +674,11 @@ mod tests {
                 .is_some_and(|f| f.contains("/Users//alice/work/demo/target")),
             "{planned:?}"
         );
+
+        // If target.noindex already exists alongside target, probe and apply agree not to clobber it.
+        sys.create_dir_all(Path::new("/Users//alice/work/demo/target.noindex"), 0o755)
+            .unwrap();
+        let after = engine::run(&items, Mode::Plan, &sys, &context(), &mut NoJournal);
+        assert_eq!(after[0].outcome, Outcome::Ok, "{after:?}");
     }
 }

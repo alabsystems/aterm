@@ -110,7 +110,10 @@ fn ctl_cast_drift(job: &aterm_ctl::CastDriftJob<'_>) -> Result<String, String> {
     Ok(report.render(ms, Some("client")))
 }
 
-/// The build facts of this binary, the only place any of them is compiled in.
+/// The build facts of this binary, the only place any of them is compiled in. The version is
+/// this crate's own; the rest come from `build.rs` (commit and build number from git or the
+/// cutter's pins, the compiler from `$RUSTC -vV`, the profile, the verification state), and the
+/// release marker from the cutter.
 const BUILD_STAMP: aterm_types::version::BuildStamp = aterm_types::version::BuildStamp {
     app_version: env!("CARGO_PKG_VERSION"),
     git_commit: env!("ATERM_GIT_COMMIT"),
@@ -129,7 +132,9 @@ const BUILD_STAMP: aterm_types::version::BuildStamp = aterm_types::version::Buil
     release_build: option_env!("ATERM_RELEASE_BUILD").is_some(),
 };
 
-/// The executable's inherited-lane ownership admission.
+/// The executable's inherited-lane ownership admission. The Link library
+/// parses first and invokes this provider only for inherited `serve`; observer
+/// and unrelated verbs never take descriptors 3/4.
 #[cfg(unix)]
 fn dispatch_link(args: &[String]) -> ExitCode {
     /// The startup take of the launcher's two bridge lanes: the one unsafe call this
@@ -769,7 +774,9 @@ fn session_lane(quiet: bool) -> ExitCode {
     aterm_cli::session_main(quiet)
 }
 
-/// How an invocation under an argv0 alias name is served; pure, for the test.
+/// How an invocation under an argv0 alias name is served; pure, for the test. On Windows the
+/// Start-Menu shortcut and the jump list launch the `aterm-gui.exe` alias, so the windowing
+/// verbs and the routing policy work under it too.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum AliasRoute {
     /// `aterm-ctl` — the control client.
@@ -965,7 +972,9 @@ fn first_run_window_eligible(args: &[OsString], env: DoctorStartupEnv) -> bool {
     aterm_gui::initial_setup_window_args(&args)
 }
 
-/// A running-window successor does not execute its carried command.
+/// A running-window successor does not execute its carried command. Its launch
+/// flags still describe its scope: a relaunch hint cannot erase a private socket
+/// or another ineligible prefix.
 #[cfg(any(target_os = "macos", test))]
 fn first_run_window_args(args: &[OsString], restoring_window: bool) -> &[OsString] {
     if restoring_window {
@@ -1003,7 +1012,9 @@ fn apply_first_run_doctor() -> bool {
     }
 }
 
-/// Reserve one offer across app processes before showing it.
+/// Reserve one offer across app processes before showing it. Claiming reads only
+/// aterm's state: account probes, native permission prompts and preference writes
+/// belong after Apply or the full cancellation window has expired.
 #[cfg(target_os = "macos")]
 fn prepare_first_run_doctor(
     countdown: impl FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer,
@@ -1275,7 +1286,8 @@ enum PreparedSetup<C> {
     },
 }
 
-/// A tty decision can outlive its input surface.
+/// A tty decision can outlive its input surface. Move both operation identities
+/// with it so a later worker cannot bind the accepted choice to a different run.
 #[cfg(any(target_os = "macos", test))]
 struct PreparedFirstRun<C, D> {
     setup: PreparedSetup<C>,
@@ -1295,7 +1307,8 @@ enum SetupChoice {
     Cancel,
 }
 
-/// Retry state I/O only on a window's background worker.
+/// Retry state I/O only on a window's background worker. A transparent terminal
+/// returns promptly on error so its shell can start with its input untouched.
 #[cfg(any(target_os = "macos", test))]
 fn retry_setup_step<H: SetupStartup, T>(
     host: &mut H,
@@ -1314,7 +1327,9 @@ fn retry_setup_step<H: SetupStartup, T>(
     }
 }
 
-/// Keep a decision across transient failures.
+/// Keep a decision across transient failures. Cancel is persisted without
+/// another offer; an unavailable window gives up its claim before waiting so
+/// another app process, or a reopened window here, can offer setup instead.
 #[cfg(any(target_os = "macos", test))]
 fn prepare_setup<H: SetupStartup>(
     host: &mut H,
@@ -1479,7 +1494,8 @@ fn resume_prepared_setup<H: SetupStartup, D>(
     }
 }
 
-/// Return the busy reservation only after Cancel has durably finished.
+/// Return the busy reservation only after Cancel has durably finished. Retrying
+/// state I/O cannot let an older automatic worker acquire this slot in between.
 #[cfg(any(target_os = "macos", test))]
 fn retain_setup_cancellation<H: SetupStartup<Claim = ()>, B>(host: &mut H, busy: B) -> B {
     match finish_setup_choice(host, (), SetupChoice::Cancel, true) {
@@ -1550,7 +1566,9 @@ fn finish_withheld_preferences() {
     }
 }
 
-/// The background setup worker of a window or a session.
+/// The background setup worker of a window or a session. It reports to the log
+/// and the window's message center only, never stderr: in the session lane that
+/// is the tab, and a thread writing there lands over whatever program owns it.
 #[cfg(target_os = "macos")]
 fn run_first_run_doctor(
     claim: aterm_cli::macos_doctor::AutomaticSetupClaim,
@@ -3163,7 +3181,8 @@ fn nested_new_tab() -> ExitCode {
     }
 }
 
-/// The index of the `-e`/`--command`/`--` payload boundary, or `rest.len()`.
+/// The index of the `-e`/`--command`/`--` payload boundary, or `rest.len()`. Past it every
+/// token belongs to a child command line and is neither scanned nor stripped.
 fn payload_boundary(rest: &[OsString]) -> usize {
     rest.iter()
         .position(|a| matches!(a.to_string_lossy().as_ref(), "-e" | "--command" | "--"))
@@ -3249,7 +3268,10 @@ fn plain_launch_policy(
     }
 }
 
-/// `aterm new-tab | new-window | split-pane [-H|-V] [-d <dir>]`, the wt-shaped front door.
+/// `aterm new-tab | new-window | split-pane [-H|-V] [-d <dir>]`, the wt-shaped front door. The
+/// grammar and the routing rule are pure and live in `aterm-cli`
+/// ([`aterm_cli::parse_window_request`], [`aterm_cli::route_launch`]); this is the impure half:
+/// resolving a directory, asking whether an instance is reachable, and performing the route.
 fn window_verb(verb: &str, args: &[OsString], host: WindowHost) -> ExitCode {
     // grammar's "unknown option": these verbs dispatch to no tool that could answer it.
     if args
@@ -3299,7 +3321,7 @@ enum SpawnHere {
 /// The line a `split-pane` that opens a new window prints, or `None` when
 /// [`route_and_maybe_forward`] already said why (a second line would repeat "opening a
 /// new window").
-fn split_pane_spawn_line(why: SpawnHere) -> Option<&'static str> {
+const fn split_pane_spawn_line(why: SpawnHere) -> Option<&'static str> {
     match why {
         SpawnHere::Policy => Some(
             "aterm: windowing_behavior is new_window, so split-pane opens a new window; \
@@ -3310,7 +3332,8 @@ fn split_pane_spawn_line(why: SpawnHere) -> Option<&'static str> {
     }
 }
 
-/// Decide the route for `request` and, when it is `Forward`, perform it.
+/// Decide the route for `request` and, when it is `Forward`, perform it. `Break(code)`: the
+/// running instance answered (exit with that code); `Continue(why)`: start a window here.
 fn route_and_maybe_forward(request: &aterm_cli::WindowRequest) -> ControlFlow<ExitCode, SpawnHere> {
     let behavior = effective_windowing_behavior();
     let should_probe = behavior == aterm_cli::WindowingBehavior::Attach;
@@ -3365,7 +3388,7 @@ fn route_and_maybe_forward(request: &aterm_cli::WindowRequest) -> ControlFlow<Ex
 }
 
 /// What a forwarded `intent` opens, for [`forward_error_line`].
-fn intent_noun(intent: aterm_cli::LaunchIntent) -> &'static str {
+const fn intent_noun(intent: aterm_cli::LaunchIntent) -> &'static str {
     match intent {
         aterm_cli::LaunchIntent::SplitPane => "pane",
         aterm_cli::LaunchIntent::NewWindow => "window",
@@ -3373,7 +3396,8 @@ fn intent_noun(intent: aterm_cli::LaunchIntent) -> &'static str {
     }
 }
 
-/// The line for a forward that got no reply.
+/// The line for a forward that got no reply. `delivered`: the request reached
+/// `who`, which may still open the `noun`, so nothing opens here.
 fn forward_error_line(who: &str, delivered: bool, error: &str, noun: &str) -> String {
     if delivered {
         format!("aterm: {who} {error}; the {noun} may still open there")
@@ -3382,7 +3406,10 @@ fn forward_error_line(who: &str, delivered: bool, error: &str, noun: &str) -> St
     }
 }
 
-/// The line for a `spawn` that `who` answered with `ERR`.
+/// The line for a `spawn` that `who` answered with `ERR`. The two refusals a person can act on
+/// are translated: `auth` (another user's or instance's socket, bare or as the connect phase
+/// words it) and the spawn grammar (a running aterm of another version); any other reason is
+/// printed after `refused`.
 fn spawn_refusal_line(who: &str, refused: &str, reply: &str) -> String {
     let reason = reply.strip_prefix("ERR ").unwrap_or(reply);
     if reason == "auth" || reason.starts_with("auth;") {
@@ -3400,7 +3427,9 @@ fn spawn_refusal_line(who: &str, refused: &str, reply: &str) -> String {
     }
 }
 
-/// The effective `windowing_behavior`: the `aterm.toml` key, else the default.
+/// The effective `windowing_behavior`: the `aterm.toml` key, else the default. An unrecognized
+/// spelling warns once and falls back: treating a typo as `attach` would move where every
+/// terminal on the machine opens.
 fn effective_windowing_behavior() -> aterm_cli::WindowingBehavior {
     let raw = aterm_gui::windowing_behavior_setting();
     match raw.as_deref() {
@@ -3429,7 +3458,9 @@ fn resolve_dir_absolute(raw: &str) -> Result<String, String> {
     Ok(absolute.to_string_lossy().into_owned())
 }
 
-/// The `-d <dir>` of a plain window launch, resolved to an absolute path.
+/// The `-d <dir>` of a plain window launch, resolved to an absolute path. The scan
+/// (`aterm_cli::plain_launch_dir_operand`) shares its flag set, the window parser's spellings,
+/// with the eligibility gate.
 fn plain_launch_dir(scan: &[OsString]) -> Result<Option<String>, ()> {
     match aterm_cli::plain_launch_dir_operand(scan) {
         Some(value) => resolve_dir_absolute(&value).map(Some).map_err(|_| ()),
@@ -3590,7 +3621,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
 }
 
 /// Whether `aterm update` ends in FAILURE when there is no ledger to read.
-fn no_ledger_fails(checking: bool) -> bool {
+const fn no_ledger_fails(checking: bool) -> bool {
     checking || cfg!(target_os = "macos")
 }
 
@@ -3616,7 +3647,9 @@ const UPDATE_HELP_LINUX: &[&str] = &[
     "An update replaces only the executable on disk; running sessions keep running.",
 ];
 
-/// What `aterm update <word>` says for a word it does not take.
+/// What `aterm update <word>` says for a word it does not take. The Linux delivery's
+/// verbs exist only on Linux, and a word the package store knows (`claude`, `trust`) is
+/// a package update typed without `pkg`; any other word gets the usage line.
 fn update_unknown_line(word: &str, is_package: impl FnOnce(&str) -> bool) -> String {
     if !cfg!(target_os = "linux") && matches!(word, "enable" | "apply" | "rollback") {
         let mac = if cfg!(target_os = "macos") && word == "apply" {
@@ -3639,7 +3672,9 @@ fn update_unknown_line(word: &str, is_package: impl FnOnce(&str) -> bool) -> Str
 enum DevCopy {
     /// Not dev-marked: the updater's own ledger speaks for it.
     No,
-    /// Dev-marked, so the updater leaves it alone.
+    /// Dev-marked, so the updater leaves it alone. `lag`: its standing against the public
+    /// channel when that was read (one read-only HEAD of the evergreen appcast,
+    /// `aterm_update::dev_channel`), else `None`.
     Marked {
         lag: Option<aterm_update::dev_channel::DevLag>,
         shared_writes: Option<aterm_gui::DevSharedWrites>,

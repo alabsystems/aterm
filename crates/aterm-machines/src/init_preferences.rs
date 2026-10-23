@@ -241,7 +241,8 @@ impl Item for AttachedKeyboard {
     }
 }
 
-/// Model matching may return several HID services.
+/// Model matching may return several HID services. Do not copy a service's unrelated
+/// remaps over another service with a different map: refuse that ambiguous case.
 fn merged_mapping(maps: &[Vec<(i64, i64)>]) -> Result<Option<Vec<(i64, i64)>>, String> {
     if maps.is_empty() {
         return Err(
@@ -1076,7 +1077,9 @@ fn widget_placement_conversion(user: &User) -> Cmd {
         .as_user(user)
 }
 
-/// NotificationCenter recreates this binary plist even with no widgets.
+/// NotificationCenter recreates this binary plist even with no widgets. Its empty
+/// display list is metadata, not a configured widget; removing it on every probe
+/// would cause an endless write/relaunch cycle.
 fn empty_widget_placement(sys: &dyn System, user: &User, value: &PValue) -> Result<bool, String> {
     let PValue::Data(bytes) = value else {
         return Ok(false);

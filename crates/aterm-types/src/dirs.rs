@@ -481,7 +481,11 @@ mod tests {
         );
     }
 
-    /// An item's journal goes where its account is.
+    /// An item's journal goes where its account is. A test's `aterm doctor` or `atpkg
+    /// repair` child, its `$HOME` a scratch under the person's uid, journals under that
+    /// scratch's state root, the one every state reader resolves; negative control: the
+    /// account-record rule (root's, the old rule for every account), evaluated on the same
+    /// inputs, sends that journal into the person's own state.
     #[cfg(unix)]
     #[test]
     fn the_journal_root_is_the_state_root_the_items_act_on_and_roots_own_under_sudo() {

@@ -30,15 +30,11 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
         "--model",
         "lab-stub",
         "--reasoning-effort=xhigh",
-        // `--effort` is `--reasoning-effort`'s alias: it too rewrites the
-        // global settings.json, so carried it would move every later
-        // session's default.
         "--effort",
         "high",
         "--effort=low",
         "--approval-mode",
         "never",
-        // The sandbox's network mode is the session's permission snapshot.
         "--sandbox-network",
         "allow",
         "--disable-sandbox",
@@ -66,7 +62,6 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
         ]))
     );
     assert_eq!(resumed_ref(&launch).as_deref(), Some("my-session-name"));
-    // A first prompt and `--last` are dropped; a plain launch resumes.
     let prompt = argv(&[STORE, "--base-url", "u", "positional hello"]);
     assert_eq!(
         rewrite_argv(&prompt, Some(S1)),
@@ -79,9 +74,7 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
         Ok(argv(&["--disable-shell", "resume", S1]))
     );
     assert_eq!(resumed_ref(&last), None, "--last names no session");
-    // With no session, the kept flags alone: a fresh start.
     assert_eq!(rewrite_argv(&prompt, None), Ok(argv(&["--base-url", "u"])));
-    // After `--`, the prompt's words, never options.
     let dashed = argv(&[STORE, "--", "--yolo", "resume"]);
     assert_eq!(rewrite_argv(&dashed, Some(S1)), Ok(argv(&["resume", S1])));
 }
@@ -236,10 +229,6 @@ fn the_exit_table_is_muse_codes_own() {
     let signals_only_crash = |status: i64| !matches!(status, 0 | 129 | 130 | 143);
     assert!(!signals_only_crash(129) && exit_kind(129) == ExitKind::Crashed);
     assert!(signals_only_crash(1) && exit_kind(1) == ExitKind::Refused);
-    // The relaunch line's own block: a program the shell could not run is
-    // a refusal of the line, never a crash to type it again for; every
-    // other status reads as Muse Code's own. NEGATIVE CONTROL: Muse Code's
-    // own table reads 127 as a crash.
     for (status, kind) in [
         (126, ExitKind::Refused),
         (127, ExitKind::Refused),
@@ -441,7 +430,6 @@ fn the_relaunch_carries_the_homes_the_process_had() {
         ]
     );
     assert_eq!(env_of_words(&env_words(&env)), env);
-    // Another HOME, and no XDG variable: its HOME is what names its data.
     let other = relaunch_env(
         |name| match name {
             "HOME" => Some(scratch.as_str()),

@@ -288,7 +288,10 @@ fn parked_caret_typed_echo_anchors_and_visible_moves_own_their_tick() {
     );
 }
 
-/// A program row's forward end-advance never consumes a banked typed stamp.
+/// A program row's forward end-advance never consumes a banked typed stamp. With the cursor
+/// hidden, the input row (11) advances only after `note_typed` while the status row (9) grows on
+/// its own ~150 ms cadence (a Claude Code timer); a row seen advancing its end with no gesture
+/// fresh is branded a program row and refuses anchored sweeps, so every input echo lights.
 #[test]
 fn program_row_end_advance_never_consumes_a_typed_stamp() {
     let g = geom();

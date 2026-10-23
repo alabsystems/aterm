@@ -221,10 +221,13 @@ pub struct WindowState {
     min_inner_size: LogicalSize<u32>,
     resize_increments: Option<LogicalSize<u32>>,
 
-    /// The size of the window when no states were applied to it.
+    /// The size of the window when no states were applied to it. The primary use for it
+    /// is to fallback to original window size, before it was maximized, if the compositor
+    /// sends `None` for the new size in the configure.
     stateless_size: LogicalSize<u32>,
 
-    /// Initial window size provided by the user.
+    /// Initial window size provided by the user. Removed on the first
+    /// configure.
     initial_size: Option<Size>,
 
     /// Whether an attention request awaits its activation token.
@@ -240,7 +243,8 @@ pub struct WindowState {
     /// Protocol objects owned by the window.
     pub(crate) objects: WindowObjects,
 
-    /// Globals this window can still use after the event loop is gone.
+    /// Globals this window can still use after the event loop is gone. They drop
+    /// after its objects, so xdg_wm_base outlives every child surface.
     compositor: Arc<Owned>,
     _shell: Arc<Shell>,
 

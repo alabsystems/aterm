@@ -419,6 +419,8 @@ mod tests {
         assert_eq!(row.len(), 0);
     }
 
+    /// A run of printed default blanks is written text: `len` covers it as it
+    /// covers the same blanks written one at a time, so a splatted or REP'd run
     /// of spaces is part of the line.
     #[test]
     fn fill_cell_run_counts_written_blanks() {

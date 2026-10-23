@@ -143,7 +143,8 @@ pub struct PendingScrollbackReflow {
     lines_read: usize,
 }
 
-/// Where an incrementally-stepped rewrap currently is.
+/// Where an incrementally-stepped rewrap currently is. Private: callers only
+/// see [`ReflowStep`].
 enum ReflowPhase {
     /// The streaming rewrap: read input from the front of the store (truncating it as consumed), then from the newer `lazy_lines`.
     Stream {

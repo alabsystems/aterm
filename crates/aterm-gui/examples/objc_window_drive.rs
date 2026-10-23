@@ -755,7 +755,11 @@ mod macos {
             );
         }
 
-        /// The fullscreen state machine, leaving.
+        /// The fullscreen state machine, leaving. `set_fullscreen(None)` right after
+        /// `set_fullscreen(Some(_))` need not return `fullscreen()` to `None`: AppKit
+        /// delivers `windowWillEnterFullScreen:` synchronously inside
+        /// `-toggleFullScreen:`, setting `in_fullscreen_transition`, and winit defers a
+        /// change during a transition into `target_fullscreen`.
         fn stage_fullscreen_exit(&mut self) {
             println!("\n[10] fullscreen — leaving");
             let before = self.w().fullscreen().is_some();
@@ -777,7 +781,11 @@ mod macos {
             );
         }
 
-        /// `aterm_objc::weak` against the objects it exists for.
+        /// `aterm_objc::weak` against the objects it exists for. `aterm-objc`'s
+        /// `tests/weak.rs` proves each property on `NSObject` and `NSMutableString`
+        /// (libtest cannot host AppKit); this runs the same experiments on the live
+        /// `NSWindow`, its `NSView` and the `WinitWindowDelegate`, AppKit classes with
+        /// their own `dealloc` and references.
         fn stage_weak_references(&mut self, delegate: Id, ns: Id) {
             println!(
                 "\n[11] weak references — objc_initWeak/loadWeak/storeWeak/copyWeak/destroyWeak"

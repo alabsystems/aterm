@@ -44,7 +44,8 @@ enum Tip {
     Running,
     /// It ran and answered `OK` — a replay is a duplicate.
     Applied,
-    /// It ran and did not answer `OK`.
+    /// It ran and did not answer `OK`. It may or may not have reached the PTY,
+    /// so a replay is refused rather than guessed at.
     Unknown,
 }
 
@@ -61,7 +62,8 @@ struct Mark {
 #[derive(Default)]
 pub(crate) struct PtyIdem {
     marks: Mutex<HashMap<(Realm, u64), Mark>>,
-    /// Feeds `Mark::used`.
+    /// Feeds `Mark::used`. Only the order matters (it picks the LRU victim), so an
+    /// atomic outside the marks lock keeps this a single-lock type.
     clock: AtomicU64,
 }
 
@@ -72,7 +74,8 @@ pub(crate) struct Key {
     seq: u64,
 }
 
-/// The usage line every malformed key answers.
+/// The usage line every malformed key answers. One string, so the grammar is
+/// stated in exactly one place.
 const USAGE: &str = "ERR usage: id=<epoch>:<producer>:<seq>\n";
 
 /// The answer to a well-formed key minted for another launch of the session: the head drivers key on, and where the live epoch is read.
@@ -102,12 +105,15 @@ pub(crate) fn parse_key(value: &str, live: LaunchNonce) -> Result<Key, String> {
     Ok(Key { producer, seq })
 }
 
-/// The claim one attempt holds while it runs.
+/// The claim one attempt holds while it runs. Settled by [`guarded`]; a drop
+/// without a settle (an unwind out of the guarded verb) leaves the mark unknown,
+/// the fail-visible direction: a mark that a panic frees is not a mark.
 struct Claim<'a> {
     idem: &'a PtyIdem,
     realm: Realm,
     key: Key,
-    /// The mark this claim displaced, restored on release.
+    /// The mark this claim displaced, restored on release. `None` when this
+    /// producer had no mark at all, in which case a release removes the entry.
     prior: Option<Mark>,
     /// Set once the claim has been settled or released, so `Drop` knows there is
     /// nothing left to decide.
@@ -148,7 +154,8 @@ impl PtyIdem {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Reserve `key`'s sequence in `realm`, or answer for it.
+    /// Reserve `key`'s sequence in `realm`, or answer for it. `dup` is the
+    /// duplicate reply in the calling verb's framing ([`dup_reply`]).
     fn claim(&self, realm: Realm, key: Key, dup: &str) -> Claimed<'_> {
         let used = self.tick();
         let slot = (realm, key.producer);
@@ -216,7 +223,9 @@ impl PtyIdem {
         })
     }
 
-    /// Move this claim's tip, only while the claim still owns the mark.
+    /// Move this claim's tip, only while the claim still owns the mark. A live claim
+    /// always does (a `Running` mark is never displaced, evicted, or released by
+    /// another claim); the check is a second lock on that invariant.
     fn settle(&self, realm: Realm, key: Key, tip: Tip) {
         let used = self.tick();
         let mut marks = self.marks.lock().unwrap_or_else(|p| p.into_inner());
@@ -292,7 +301,8 @@ impl Drop for Claim<'_> {
     }
 }
 
-/// Whether `reply` is a refusal that cannot have followed a write.
+/// Whether `reply` is a refusal that cannot have followed a write. Two prefixes,
+/// deliberately: widening it is how a silent duplicate gets in.
 fn refused_before_any_write(reply: &str) -> bool {
     // `ERR denied` (authority) are decided before any byte moves; see the module doc.
     reply.starts_with("ERR busy") || reply.starts_with("ERR denied")
@@ -306,7 +316,11 @@ fn skipped_by_guard(reply: &str) -> bool {
     reply.starts_with("OK skipped")
 }
 
-/// The `OK` a duplicate is answered with, in the framing the verb declares.
+/// The `OK` a duplicate is answered with, in the framing the verb declares. A
+/// `Lines` client (`turn`) reads a bare `OK dup=1`'s `dup=1` as a row count and
+/// `aterm-ctl` answers `malformed response header`, so `OK <n>` framings get
+/// `OK 0 dup=1`: a zero-row reply whose tail carries the marker, which
+/// `stream_count` parses.
 fn dup_reply(verb: &str) -> String {
     use aterm_types::control_verbs::Framing;
     match aterm_types::control_verbs::framing_of(verb, verb) {

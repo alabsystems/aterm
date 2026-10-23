@@ -57,7 +57,7 @@ impl Build {
     }
 
     /// Where under the target directory the profile's binaries land.
-    pub(crate) fn dir(self) -> &'static str {
+    pub(crate) const fn dir(self) -> &'static str {
         match self {
             Build::Release => "release",
             Build::OptTest => "opt-test",

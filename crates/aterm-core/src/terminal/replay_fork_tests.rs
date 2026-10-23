@@ -2,12 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! [`Terminal::replay_fork`] against the straight fold. On each fixture, a fork
-//! taken at every event boundary and fed the rest of the events must end where
-//! the engine fed all of them ends: the same rows, cursor, images and full
-//! checkpoint. The negative controls show each fixture holds state a fork must
-//! carry or refuse: the restore a fork replaces ends elsewhere, and so does a
-//! fork without any one piece of the transient state it carries.
+//! [`Terminal::replay_fork`] against the straight fold.
 
 use super::{Terminal, TerminalCheckpoint};
 use crate::grid::ResizePolicy;
@@ -394,8 +389,6 @@ fn a_fork_folds_the_rest_as_the_straight_fold_does() {
         }
         let n = fx.events.len();
         match fx.name {
-            // Only from the first resize on: its undo or its hand-back (the
-            // rows a later grow reveals) stands, which a copy cannot hold.
             "session" => {
                 let first_resize = fx
                     .events
@@ -409,8 +402,6 @@ fn a_fork_folds_the_rest_as_the_straight_fold_does() {
                     fx.name
                 );
             }
-            // While the store holds an image: from the first until the
-            // delete freed it, and from the second on.
             "kitty" => assert_eq!(refused, [2, 3, 4, 5, 8, 9], "{}", fx.name),
             "sync_left_open" | "live_images" => {
                 assert!(refused.is_empty(), "{}: {refused:?}", fx.name);
@@ -513,7 +504,6 @@ fn a_fork_without_a_carried_piece_folds_another_end() {
 /// does) the second.
 #[test]
 fn a_fork_continues_its_sources_restore_lineage() {
-    // (output before the fork, output after it, adopted after that)
     for (before, after, adopt) in [
         (false, false, true),
         (true, false, true),

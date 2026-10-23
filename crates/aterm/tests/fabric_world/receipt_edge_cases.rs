@@ -49,7 +49,9 @@ fn poll<T>(f: impl FnMut() -> Option<T>) -> Option<T> {
     aterm_spec::wait::within(DEADLINE, Duration::from_millis(50), f)
 }
 
-/// X1.
+/// X1. A RECEIPT GIVEN WHILE THE LINK IS DOWN IS ACKED ONCE WHEN IT RETURNS —
+/// and the exactly-once re-post under `ERR fabric stalled queued=1` and a
+/// broker restart still holds.
 #[test]
 fn x1_receipt_given_while_the_link_is_down_is_not_lost() {
     let mut w = World::boot_flags("rvx1", &["--receipts"]);
@@ -111,7 +113,8 @@ fn x1_receipt_given_while_the_link_is_down_is_not_lost() {
     );
 }
 
-/// X1b.
+/// X1b. A RECEIPT GIVEN WHILE THE BRIDGE IS BEING REPLACED IS ACKED BY ITS
+/// REPLACEMENT.
 #[test]
 fn x1b_receipt_given_while_the_bridge_restarts_is_not_lost() {
     let w = World::boot_flags("rvx1b", &["--receipts"]);
@@ -163,7 +166,9 @@ fn x1b_receipt_given_while_the_bridge_restarts_is_not_lost() {
     assert_eq!(pins, 0, "the pinned sequence is forgotten at retirement");
 }
 
-/// X2.
+/// X2. `truncated=1` IS FETCHABLE WHOLE BY OFFSET: the bus holds the full body,
+/// and `inbox get @<off>` returns all of it — while the ring still holds the cut
+/// row, and after the ring let it go.
 #[test]
 fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
     let w = World::boot("rvx2", &[]);
@@ -260,7 +265,8 @@ fn x2_a_truncated_body_is_fetchable_whole_by_offset() {
     );
 }
 
-/// X3.
+/// X3. A REPLY ADDRESSED TO SOMEBODY ELSE DOES NOT CANCEL MY `expired`. A asks
+/// B twice; B answers X — to C.
 #[test]
 fn x3_a_reply_to_another_session_does_not_cancel_my_expired() {
     let w = World::boot_with(
@@ -403,7 +409,8 @@ fn a_strangers_reply_to_someone_else_does_not_settle_the_askers_deadline() {
     );
 }
 
-/// X4.
+/// X4. AN `ask dl=` DEDUPED ONTO A `note` UNDER THE SAME KEY RECORDS NO
+/// `expired`: the re-post appended nothing, so there is no ask to expire.
 #[test]
 fn x4_an_ask_deduped_onto_a_note_records_no_expired() {
     let w = World::boot("rvx4", &[]);
@@ -443,7 +450,8 @@ fn x4_an_ask_deduped_onto_a_note_records_no_expired() {
     );
 }
 
-/// X5.
+/// X5. `post --wait-ack` with `dl=` and no receipt answers `ERR expired` when
+/// the deadline passes first.
 #[test]
 fn x5_wait_ack_past_its_deadline_answers_expired() {
     let w = World::boot_flags("rvx5", &["--receipts"]);

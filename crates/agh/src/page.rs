@@ -306,7 +306,10 @@ fn refused_link(url: &str, reason: &str) -> Error {
 /// `before`).
 const CURSORS: [&str; 4] = ["since", "cursor", "after", "before"];
 
-/// The refusal of a next link with no usable `page`.
+/// The refusal of a next link with no usable `page`. A link that carries a cursor (a listing
+/// GitHub pages by one, which the walker does not follow in M1) is refused naming that cursor,
+/// with a next that says to read one page at a time; any other such link is merely malformed,
+/// and keeps the kind's own next.
 fn unnumbered_link(url: &str, query: &str) -> Error {
     match CURSORS
         .iter()
@@ -546,7 +549,7 @@ fn stable(mut value: Value) -> String {
 
 impl Walk<'_> {
     /// The repository the walk lists, when its scope names one.
-    fn repo(&self) -> Option<&Slug> {
+    const fn repo(&self) -> Option<&Slug> {
         match &self.scope {
             LinkScope::Repo(slug) => Some(slug),
             _ => None,

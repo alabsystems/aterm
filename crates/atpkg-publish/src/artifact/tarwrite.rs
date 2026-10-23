@@ -398,7 +398,7 @@ struct CompressorChild {
 }
 
 impl CompressorChild {
-    fn new(child: aterm_uds::spawnfd::Child) -> Self {
+    const fn new(child: aterm_uds::spawnfd::Child) -> Self {
         Self {
             child,
             input: None,

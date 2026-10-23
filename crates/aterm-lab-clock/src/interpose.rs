@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The wrappers dyld puts in place of the clock calls, their table, and the
-//! constructor that reads the lab's variables. Every wrapper counts the read,
-//! calls the real function (this image's own call, which no interposing
-//! reaches) and shifts the answer when the clock is one a sleep moves
-//! ([`crate::model::shifted`]). Nothing panics or allocates on a read; the
-//! offset file is looked at under one flag, by one thread at a time.
+//! dyld interpose wrappers for clock calls ([`crate::model::shifted`]).
 
 use core::ffi::{c_int, c_void};
 use std::cell::Cell;

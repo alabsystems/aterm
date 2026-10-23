@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A tape's items come back from their bytes exactly — every record kind,
-//! every edge of a varint and a clock, every error kind, a reply stored
-//! against the last one — and bytes the encoder did not write are refused,
-//! never misread.
+//! A tape's items come back from their bytes exactly.
 
 use std::io::ErrorKind;
 
@@ -204,7 +201,6 @@ fn every_item_comes_back_from_its_bytes() {
         }
         assert_eq!(round_trip(&items), items, "seed {seed}");
     }
-    // `File` covers both file outcomes (astream's `kind()`).
     let every = [
         "Clock", "Rand", "File", "Mono", "Exchange", "Emit", "Raised", "Note", "Mark", "End",
     ];
@@ -232,7 +228,6 @@ fn integers_come_back_at_their_edges() {
     let mut one = Vec::new();
     put_signed(&mut one, -1);
     assert_eq!(one.len(), 1, "a small step back is one byte");
-    // An eleventh byte, or a tenth past bit 64, is no varint.
     let over = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
     assert!(Input::new(&over).varint().is_err());
 }
@@ -266,20 +261,17 @@ fn a_repeated_screen_is_one_byte_and_a_changed_one_its_middle() {
     assert!(first.len() > screen.len(), "the first read is whole");
     let again = encoded(&mut enc, &[read(&screen)]);
     let request_len = ctl_request(&["text", "--json", "tail=40"]).len();
-    // tag, door number, request (length first), body form.
     assert_eq!(again.len(), 1 + 1 + 1 + request_len + 1, "{again:?}");
     let mut changed = screen.clone();
     changed[2_900..2_910].copy_from_slice(b"0123456789");
     let delta = encoded(&mut enc, &[read(&changed)]);
     assert!(delta.len() < 40, "a splice: {} bytes", delta.len());
-    // A different request is a different key: whole again.
     let other = Item::effect(EffectRecord::Exchange {
         door: doors::CTL.to_string(),
         request: ctl_request(&["status"]),
         reply: screen.clone(),
     });
     assert!(encoded(&mut enc, &[other]).len() > screen.len());
-    // And all of it decodes in order.
     let items = [read(&screen), read(&screen), read(&changed), read(&screen)];
     assert_eq!(round_trip(&items), items);
 }
@@ -301,21 +293,15 @@ fn the_table_forgets_its_least_recently_used_key() {
     let mut items: Vec<Item> = (0..delta::KEYS)
         .map(|i| emit(&format!("d{i}"), &body))
         .collect();
-    // The table is full. `d0` is used again as a repeat (looked up), `d1` by a
-    // body too short to be stored against anything (only replaced): both are
-    // now the most recently used, and `d2`, `d3` the least.
     items.push(emit("d0", &body));
     items.push(emit("d1", &short));
     items.push(emit("d64", &body));
     items.push(emit("d65", &body));
     let mut enc = Encoder::default();
     encoded(&mut enc, &items);
-    // `d0` is still remembered: a repeat is one byte of body.
     assert!(encoded(&mut enc, &[emit("d0", &body)]).len() < 8);
-    // `d1` still holds its short body: a body that starts with it splices.
     let longer = [short.as_slice(), &body].concat();
     assert!(encoded(&mut enc, &[emit("d1", &longer)]).len() < longer.len());
-    // `d2` went out with `d64`: whole again.
     assert!(encoded(&mut enc, &[emit("d2", &body)]).len() > body.len());
     items.push(emit("d0", &body));
     items.push(emit("d1", &longer));
@@ -435,18 +421,12 @@ fn bytes_the_encoder_did_not_write_are_refused() {
     };
     assert_eq!(refused(&[0]).at, 0, "tag 0 is no item");
     assert_eq!(refused(&[0x7f]).at, 0, "nor is a tag past the last");
-    // A raised flag naming name 5 of an empty table.
     refused(&[8, 6, 0]);
-    // An emit whose body repeats, or splices, a body never stored.
     refused(&[7, 0, 1, b'x', 1]);
     refused(&[7, 0, 1, b'x', 2, 1, 1, 0]);
-    // A file whose bytes run past the frame.
     refused(&[3, 0, 1, b'/', 9, 1]);
-    // A note whose text is not UTF-8.
     refused(&[9, 0, 1, b'k', 1, 0xff]);
-    // A stamp on an end.
     refused(&[11 | 0x80, 0, 0, 1]);
-    // A splice keeping more than its base: store a 300-byte body, then splice it 200 + 200.
     let body = vec![b'q'; 300];
     let mut enc = Encoder::default();
     let mut bytes = encoded(

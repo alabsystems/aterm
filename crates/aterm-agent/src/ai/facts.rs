@@ -159,7 +159,7 @@ pub struct ClaudeAccounts {
     pub renews: bool,
     /// The login directory a renewal bound the row to, or `None` for the default login.
     pub login: Option<String>,
-    /// Whether that bound login holds a completed sign-in.
+    /// Whether a login was made in that bound directory (`accounts::login_made`).
     pub made: bool,
     /// `accounts::LoginState::as_str`, where the row renews.
     pub state: Option<&'static str>,
@@ -171,7 +171,8 @@ pub struct ClaudeAccounts {
     pub served_at: Option<i64>,
     /// When a renewal last bound it, in unix seconds.
     pub renewed_at: Option<i64>,
-    /// The next unenrolled row with an email to sign into when the serving row is limited.
+    /// The next not-enrolled or signed-out row to sign into when the serving row is limited,
+    /// when that row has an email.
     pub next_sign_in: Option<String>,
 }
 
@@ -228,7 +229,8 @@ pub struct Machine<'a> {
     pub roster: Option<PathBuf>,
 }
 
-/// Resolves the home directory for `c` from environment variable `var` or `$HOME`.
+/// Resolves the home directory for `c` from its variable `c.home.var` (read through `var`) or
+/// `$HOME`.
 ///
 /// # Errors
 ///

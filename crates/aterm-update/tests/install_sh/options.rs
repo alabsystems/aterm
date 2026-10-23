@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The argument gate and the settings the installer persists: retired flags,
-//! the `--version` pin, the `--no-*` env twins, and `--no-toolchain`'s
-//! `[packages] auto_install = false`.
+//! The argument gate and the settings the installer persists.
 
 use crate::support::{Home, Lib, Scratch, install_sh, installer, q, read, s, symlink, tree};
 
@@ -27,8 +25,6 @@ fn gate(home: &Home, extra: &[&str]) -> crate::support::Run {
 fn retired_token_flags_are_unknown_arguments() {
     let scratch = Scratch::new();
     let home = scratch.home("gate");
-    // Negative control: without a retired flag the same line parses, and is
-    // refused only as excluding every half.
     let control = gate(&home, &[]);
     assert_eq!(control.code(), 2, "{}", control.all());
     for retired in ["--token", "--no-token"] {
@@ -167,7 +163,6 @@ fn no_toolchain_persists_its_exclusion_without_overwriting() {
         let again = lib.call(format!("no_toolchain_plan {}", q(s(&cfg))), &[]);
         calls.push((cfg, plan, persist, again));
     }
-    // A symlinked config (dotfiles) keeps its link; the key lands in the target.
     let target = scratch.write(
         "cfg/link/dotfile.toml",
         "[packages]\nchannel = \"stable\"\n",

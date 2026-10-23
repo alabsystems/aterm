@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`crate::raster`]'s golden grids and escape cases. A sibling file, not a
-//! `mod tests` inside `raster.rs`: aterm-font's `font_suite` and the font
-//! oracle's recorder include `raster.rs` by path, and would run these again.
+//! Golden coverage grids and out-of-bounds escape tests for [`crate::raster`].
 
 use crate::raster::{Point, Rasterizer, point};
 
@@ -39,10 +37,6 @@ fn assert_grid(actual: &[f32], expected: &[f32], w: usize, what: &str) {
         );
     }
 }
-
-// Golden grids. The two line-only grids are the retired `ab_glyph_rasterizer`'s own
-// answers and pin the fill; the quad and cubic grids also carry the
-// module's flattening.
 
 /// An axis-aligned unit square on whole-pixel boundaries: the case where
 /// coverage must be exactly 1.0 inside and exactly 0.0 outside, with no
@@ -127,15 +121,12 @@ fn overlapping_contours_report_above_one_unclamped() {
             );
         }
     });
-    // Cell (1, 1) of the 4-wide grid — inside both copies of the square.
     let doubled = got[4 + 1];
     assert!(
         (doubled - 2.0).abs() < 1e-6,
         "doubly-covered cell reported {doubled} instead of 2.0"
     );
 }
-
-// The grid-escape paths: each must terminate without panicking.
 
 /// A reference square plus an escaping contour: the escape may cost its own area,
 /// but must not hang, panic or leave a non-finite cell.

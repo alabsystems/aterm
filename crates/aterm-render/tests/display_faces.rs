@@ -61,7 +61,10 @@ fn layered(primary: &[u8], ids: &[&str], px: f32) -> Renderer {
     renderer
 }
 
-/// THE GRID IS THE PERSON'S FONT'S.
+/// THE GRID IS THE PERSON'S FONT'S. A display face is a layer over the
+/// primary, so turning one on — or mixing two or three, in either order —
+/// leaves the cell and baseline exactly the bare primary's: no column and no
+/// row is ever lost to a face.
 #[test]
 fn a_display_face_never_changes_the_grid() {
     for (name, primary) in primaries() {

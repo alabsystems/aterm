@@ -1,45 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lane-wl`: the second Wayland client the Linux runtime lane's baseline
-//! needs (`targo --unverified lab linux baseline`,
-//! `crates/aterm-lab/src/linux_baseline.rs`, builds it in the guest with
-//! `cargo build -p aterm-wayland --example lane-wl`). A dev tool over this
-//! crate, never shipped; an example, so it builds from the crate's
-//! dev-dependencies and adds nothing to what depends on it.
-//!
-//! * `drag <uri> <marks>`: a drag source on the compositor `WAYLAND_DISPLAY`
-//!   names, which drags `<uri>` (as `text/uri-list`, the copy action) from a
-//!   window of its own. It maps a maximized toplevel, so the seat's pointer
-//!   is over it wherever the pointer is, and creates `<marks>/mapped`; then
-//!   `<marks>/pointed` once the pointer has entered it. On the left button's
-//!   press it starts the drag with that press's serial and unmaps the window
-//!   (the drag lives on: a compositor ends a drag when its origin surface is
-//!   destroyed, not when it unmaps), so what was under it is under the
-//!   pointer, and creates `<marks>/dragging`. From then on each thing the
-//!   compositor tells the source is a line of `<marks>/report`, flushed as
-//!   it comes (`target <type|none>`, `action <none|copy|move|ask>`,
-//!   `send <type>`, `drop-performed`, `finished`, `cancelled`), and a `send`
-//!   is answered with `<uri>` and CRLF. It ends once the drag has finished or
-//!   was cancelled.
-//!
-//! * `pointer <width>x<height> <step>...`: a pointer of its own on the
-//!   compositor's default seat, through wlroots' virtual pointer protocol
-//!   (`zwlr_virtual_pointer_manager_v1`, which sway offers and a headless
-//!   sway's seat otherwise lacks: it has no input device). Steps: `make` (the
-//!   seat gains the pointer), `drop` (it loses it again), `at:X,Y` (an
-//!   absolute motion to that point of a `<width>`x`<height>` layout, then a
-//!   frame; `at:@PATH` to the `X Y` the file holds when the step runs, so
-//!   the lab can aim from what the window reports), `press:B` and `release:B` (an evdev button, `left` or a
-//!   number), `sleep:MS` (a stimulus, never a wait), `touch:PATH` (create the
-//!   file: the lab waits for it) and `wait:PATH` (until the lab creates it).
-//!   A step that moves or presses before `make` is refused.
-//!
-//! The drag's seat is driven from outside (`lane-bus seat`, Mutter's
-//! RemoteDesktop, or `lane-bus xseat`, XTEST into weston's x11 backend),
-//! which paces itself on the markers. Exit 0 done, 1 failed, 2 usage, 3 not
-//! available here (no compositor, no seat, no data device, no virtual
-//! pointer): the lane reads 3 as NOT RUN.
+//! `lane-wl`: second Wayland client for the Linux runtime baseline (`lab linux baseline`).
 
 use std::process::ExitCode;
 
@@ -65,18 +27,13 @@ mod lane {
     use aterm_wayland::selection::{Device, Kind, Manager, Source, SourceEvent, write_detached};
     use aterm_wayland::xdg::{Shell, Toplevel};
 
-    /// A wait for what the compositor must do on its own (a configure, an
-    /// event answering a request): a hang detector, never a budget.
     const HANG: Duration = Duration::from_secs(60);
 
-    /// A wait for what the lab's seat does, which paces itself on the lab's
-    /// photographs (each a one-minute hang detector of its own): longer.
     const LAB: Duration = Duration::from_secs(600);
 
     const URI_LIST: &CStr = c"text/uri-list";
     const BTN_LEFT: u32 = 0x110;
 
-    /// What went wrong: nothing here to drag on (NOT RUN), or a fault.
     enum Fail {
         NotHere(String),
         Fault(String),
@@ -122,7 +79,6 @@ mod lane {
         Err(Fail::Usage)
     }
 
-    /// What the seat and the source said and the drag has not read yet.
     #[derive(Default)]
     struct Heard {
         input: Vec<Input>,
@@ -144,7 +100,6 @@ mod lane {
             .map_err(|e| fault(format!("{}: {e}", marks.join(name).display())))
     }
 
-    /// Dispatch `queue` until `done` holds, within `limit`.
     fn pump(
         queue: &Queue,
         what: &str,
@@ -180,7 +135,6 @@ mod lane {
             .ok_or_else(|| fault(format!("{name:?} could not be bound")))
     }
 
-    /// A shm file of `len` bytes, every pixel a mid grey.
     fn grey(len: usize) -> Result<OwnedFd, Fail> {
         // SAFETY: a fresh memfd this function owns from here on.
         let fd = unsafe {
@@ -216,9 +170,8 @@ mod lane {
     fn drag(uri: &str, marks: &Path) -> Result<(), Fail> {
         let display = OwnedDisplay::connect(None)
             .map_err(|e| Fail::NotHere(format!("no Wayland display: {e}")))?;
-        // SAFETY: the display outlives the queue, the registry and every
-        // object below, all dropped at the end of this function in reverse
-        // order of their making; one thread dispatches.
+        // SAFETY: the display outlives the queue, the registry and every object below, all dropped
+        // at the end of this function in reverse order of their making; one thread dispatches.
         let queue = Queue::new(unsafe { display.display() }).map_err(fault)?;
         let registry = Registry::new(&queue).map_err(fault)?;
         let compositor = bind(&registry, c"wl_compositor", &wl_compositor::INTERFACE, 4)?;
@@ -289,7 +242,6 @@ mod lane {
         queue.roundtrip().map_err(fault)?;
         mark(marks, "mapped")?;
 
-        // The seat's pointer: onto the window, then the left button's press.
         let mut entered = false;
         let mut press = None;
         pump(&queue, "the pointer's press on the window", LAB, || {
@@ -328,7 +280,6 @@ mod lane {
         if !unsafe { device.start_drag(Some(&source), surface, None, serial) } {
             return Err(fault("the data device refused the drag"));
         }
-        // Out of the way: what was under the window is under the pointer.
         // SAFETY: the live surface; a null buffer unmaps it.
         unsafe {
             wl_surface::attach(surface, None, 0, 0);
@@ -389,8 +340,6 @@ mod lane {
             Some(e) => Err(fault(format!("a protocol error: {e}"))),
         }
     }
-    // wlroots' virtual pointer (wlr-protocols' virtual-pointer-unstable-v1,
-    // version 2): its requests in opcode order. No events.
     static VP_REQUESTS: [Message; 9] = [
         Message::new(c"motion", c"uff", &NULLS),
         Message::new(c"motion_absolute", c"uuuuu", &NULLS),
@@ -425,7 +374,6 @@ mod lane {
     static VIRTUAL_POINTER_MANAGER: Interface =
         Interface::new(c"zwlr_virtual_pointer_manager_v1", 2, &VPM_REQUESTS, &[]);
 
-    /// One step of `pointer`.
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Step {
         Make,
@@ -497,7 +445,6 @@ mod lane {
             .collect()
     }
 
-    /// Milliseconds since the first call: the time a virtual event carries.
     fn now_ms(t0: Instant) -> u32 {
         u32::try_from(t0.elapsed().as_millis() & 0xffff_ffff).unwrap_or(0)
     }
@@ -505,8 +452,8 @@ mod lane {
     fn pointer((width, height): (u32, u32), steps: &[Step]) -> Result<(), Fail> {
         let display = OwnedDisplay::connect(None)
             .map_err(|e| Fail::NotHere(format!("no Wayland display: {e}")))?;
-        // SAFETY: the display outlives the queue, the registry and the
-        // pointers, all dropped or destroyed before this function returns.
+        // SAFETY: the display outlives the queue, the registry and the pointers, all dropped or
+        // destroyed before this function returns.
         let queue = Queue::new(unsafe { display.display() }).map_err(fault)?;
         let registry = Registry::new(&queue).map_err(fault)?;
         let manager = bind(
@@ -522,8 +469,7 @@ mod lane {
             match step {
                 Step::Make => {
                     if device.is_none() {
-                        // SAFETY: the bound manager; a null seat is the
-                        // compositor's default seat.
+                        // SAFETY: the bound manager; a null seat is the compositor's default seat.
                         device = unsafe {
                             manager.marshal(
                                 0,

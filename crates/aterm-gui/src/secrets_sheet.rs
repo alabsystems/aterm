@@ -166,7 +166,9 @@ impl App {
             appkit::send_v_id(accessory.id(), sel!(addSubview:), field.id());
             (url, accessory)
         };
-        // SAFETY: standard NSAlert and event-queue calls on the main thread.
+        // SAFETY: standard NSAlert and event-queue calls on the main thread; `-setAccessoryView:`
+        // retains the accessory, and `-beginSheetModalForWindow:completionHandler:` copies the
+        // block.
         let (panel, input_fence) = crate::askpass::PROMPT_INPUT.present(|| unsafe {
             let past = appkit::send_id(class(c"NSDate").as_id(), sel!(distantPast));
             if past.is_null() {

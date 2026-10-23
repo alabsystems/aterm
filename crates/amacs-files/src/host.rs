@@ -127,7 +127,9 @@ struct LogicalPathBinding {
     logical_symlinks: Vec<LogicalSymlinkBinding>,
 }
 
-/// Stable identity of one admitted symlink in a config path.
+/// Stable identity of one admitted symlink in a config path. `path` and `destination`
+/// catch a changed component or link spelling; inode + metadata catch an unlink/recreate
+/// that points at the same target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogicalSymlinkBinding {
     path: PathBuf,
@@ -1186,7 +1188,10 @@ fn open_regular_read(path: &Path) -> Result<RegularReadHandle, DocumentHostError
     Ok(RegularReadHandle::Open { file, metadata })
 }
 
-/// Classify one failed `read(2)` on an already-open regular file.
+/// Classify one failed `read(2)` on an already-open regular file. `EDEADLK` is
+/// the kernel's one signal that the file is DATALESS and this thread may not
+/// wait for its download (aterm-diskwalk's `iopol`); every other error is an
+/// ordinary preflight I/O failure.
 fn read_error(path: &Path, error: std::io::Error) -> DocumentHostError {
     #[cfg(unix)]
     if error.raw_os_error() == Some(libc::EDEADLK) {
@@ -1829,7 +1834,9 @@ enum Directories {
     /// Make any that are missing: a config file belongs where its folder does
     /// (`~/.config/aterm`), which the first write may have to make.
     Create,
-    /// Make none: a document's save writes its one file.
+    /// Make none: a document's save writes its one file. A missing directory
+    /// means an existing file went with it (a conflict), and fails the first
+    /// save of a missing file.
     Existing,
 }
 

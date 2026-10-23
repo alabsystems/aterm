@@ -827,7 +827,10 @@ mod macos {
     /// Height (points) of the single chrome row; the ~14 pt traffic lights centre in it.
     const STRIP_HEIGHT: f64 = 28.0;
 
-    /// Leading gutter (points) inside the toolbar item before the first chip.
+    /// Leading gutter (points) inside the toolbar item before the first chip. The
+    /// `UnifiedCompact` toolbar already places the item past the traffic lights, so
+    /// this is only a tidy gap; [`strip_metrics`] widens it so the band never starts
+    /// before the measured lights' right edge plus [`LIGHTS_CLEARANCE`].
     const STRIP_LEADING_PAD: f64 = 4.0;
 
     /// Clear space (points) kept between the trailing edge of the window's traffic
@@ -856,7 +859,8 @@ mod macos {
     const PLUS_ARM: f64 = 5.5;
     const PLUS_STROKE: f64 = 1.6;
 
-    /// Min/max width (points) of the tab-strip item.
+    /// Min/max width (points) of the tab-strip item. A custom `NSView` has no intrinsic
+    /// size; without these `UnifiedCompact` collapses the strip into an overflow `»`.
     const STRIP_MIN_WIDTH: f64 = 120.0;
     const STRIP_MAX_WIDTH: f64 = 100_000.0;
 
@@ -895,7 +899,8 @@ mod macos {
         solo: bool,
         /// The window's horizontal centre, in the chip's own coordinates (solo only).
         solo_center_x: f64,
-        /// Draw the leading-edge hairline.
+        /// Draw the leading-edge hairline. False for the first chip and for chips
+        /// touching the selected pill, which draws its own edge.
         separator: bool,
     }
 
@@ -1179,7 +1184,8 @@ mod macos {
     pub(crate) struct ToolbarHandle {
         /// The `NSToolbarDelegate` that vends the strip's single custom-view item.
         _delegate: aterm_objc::Retained<ToolbarDelegate>,
-        /// The `NSToolbar` hosting the strip item, always visible.
+        /// The `NSToolbar` hosting the strip item, always visible. Retain-only (the
+        /// window owns its live toolbar strongly).
         _toolbar: Obj,
         /// The container `NSView` holding the [`TabView`]s and the "+" [`ChromeButton`],
         /// retained for [`set_window_tabs`] rebuilds and [`read_tab_chrome`].
@@ -1193,9 +1199,13 @@ mod macos {
         /// The trailing "+" New Tab [`ChromeButton`], re-pinned to the live width and
         /// measured centre line by every [`set_window_tabs`].
         plus: aterm_objc::Retained<ChromeButton>,
-        /// winit's content `NSView`, the permanent first responder.
+        /// winit's content `NSView`, the permanent first responder. [`end_tab_rename`]
+        /// hands focus back to it; asking the container's window later is wrong in
+        /// native fullscreen, where AppKit re-hosts the toolbar in a separate window.
         content_view: Obj,
-        /// The live inline session-rename editor, or `None`.
+        /// The live inline session-rename editor, or `None`. Owned by the handle rather
+        /// than a chip because a rebuild (tab count or width change) destroys every
+        /// chip; the field is repositioned across a rebuild instead.
         rename: RefCell<Option<RenameEditor>>,
         /// The NEEDS PILL ([`NeedsPill`], §5): built on the first lit pill and
         /// kept, hidden while the window's border is unlit.
@@ -1221,11 +1231,13 @@ mod macos {
     /// The live inline rename editor: an `NSTextField` overlaying one tab chip,
     /// plus the small relay object AppKit calls back on.
     struct RenameEditor {
-        /// The editable field.
+        /// The editable field. Its `stringValue` is the only home of the in-progress
+        /// text; nothing else needs saving across a strip rebuild.
         field: Obj,
         /// The delegate/relay. Retained here because AppKit holds a delegate weakly.
         target: aterm_objc::Retained<TabRenameTarget>,
-        /// Stable id of the tab the editor is painted over, for positioning only.
+        /// Stable id of the tab the editor is painted over, for positioning only. When
+        /// it stops resolving the edit is cancelled.
         tab: TabId,
     }
 
@@ -1410,7 +1422,8 @@ mod macos {
             Some(this)
         }
 
-        /// Move this button onto the strip's measured content line.
+        /// Move this button onto the strip's measured content line. No-op when
+        /// unchanged, so the per-refresh call costs nothing in the steady state.
         fn set_center_y(&self, center_y: f64) {
             if self.ivars().center_y.get() == center_y {
                 return;
@@ -1458,7 +1471,7 @@ mod macos {
     }
 
     aterm_objc::declare_class! {
-        /// Titlebar pill view displaying the window's most pressing session need.
+        /// Titlebar view displaying the window's projected pill.
         pub(crate) struct NeedsPill: NSView {
             const NAME: &str = "ATermNeedsPill";
             type Ivars = PillIvars;
@@ -1890,7 +1903,9 @@ mod macos {
         window: WindowId,
         /// This tab's 0-based index for the select/close/move relays, set at build.
         index: Cell<usize>,
-        /// This tab's stable [`crate::tab_model::TabId`].
+        /// This tab's stable [`crate::tab_model::TabId`]. The diff path re-stamps it
+        /// per position after a reorder; `TabView::show_context_menu` snapshots it
+        /// into `menu_tab`.
         tab_id: Cell<TabId>,
         /// The identity captured when the context menu popped, which
         /// `tabMenuAction:` posts.
@@ -1906,7 +1921,8 @@ mod macos {
         /// ▽ inbound, hourglass both); `closable` (a non-closable tab keeps the close
         /// geometry but never reveals or dispatches it).
         metadata: Cell<TabStripMetadata>,
-        /// Whether the pointer is inside this tab, which reveals its ×.
+        /// Whether the pointer is inside this tab, which reveals its ×. Toggled by
+        /// the tracking-area enter/exit.
         hovered: Cell<bool>,
         /// The mouse-down location in the tab's own coordinates, kept so `mouseDragged:`
         /// can measure horizontal travel and decide a reorder direction.
@@ -2205,7 +2221,10 @@ mod macos {
                 });
             }
 
-            /// The action of every live context-menu item.
+            /// The action of every live context-menu item. The item's `tag` decodes to
+            /// a [`MenuAction`] (undecodable is inert), posted as
+            /// `Wake::TabMenuAction` with the pop-time `menu_tab` identity (not the
+            /// positional index or live `tab_id`, which a refresh can re-label).
             @sel(tabMenuAction:)
             fn tab_menu_action(&self, sender: Id) {
                 if sender.is_null() {
@@ -2224,7 +2243,9 @@ mod macos {
                 }
             }
 
-            /// The action of every per-peer connection row.
+            /// The action of every per-peer connection row. The item's `tag` indexes the
+            /// pop-time `menu_conn` snapshot (the act needs a peer argument no
+            /// `MenuAction` tag can carry).
             @sel(tabMenuConnection:)
             fn tab_menu_connection(&self, sender: Id) {
                 if sender.is_null() {
@@ -2245,7 +2266,8 @@ mod macos {
                 });
             }
 
-            /// The action of every agent-upgrade row.
+            /// The action of every agent-upgrade row. The item's `tag` indexes the
+            /// pop-time `menu_upgrade` snapshot.
             @sel(tabMenuUpgrade:)
             fn tab_menu_upgrade(&self, sender: Id) {
                 if sender.is_null() {
@@ -2832,7 +2854,9 @@ mod macos {
             self.relayout();
         }
 
-        /// Update title and route/document context in place.
+        /// Update title and route/document context in place. The visible label keeps
+        /// the ⌘-hint only when it fits; hover, accessibility and introspection keep
+        /// the full strings.
         fn set_context(&self, title: &str, tooltip: Option<&str>) {
             let tooltip_changed = self.ivars().tooltip.borrow().as_deref() != tooltip;
             let title_changed = {
@@ -2891,7 +2915,9 @@ mod macos {
             self.ivars().tab_id.set(id);
         }
 
-        /// The stable tab id this chip displays.
+        /// The stable tab id this chip displays. Read only where a gesture captures
+        /// identity at its start (menu pop, rename install), never to resolve a gesture
+        /// in flight, since the diff path re-stamps it per position.
         fn tab_id(&self) -> TabId {
             self.ivars().tab_id.get()
         }
@@ -3022,7 +3048,9 @@ mod macos {
             )
         }
 
-        /// Diff icon/status/close metadata in place.
+        /// Diff icon/status/close metadata in place. Geometry changes only when an
+        /// icon or status appears or disappears; title changes and dirty saves never
+        /// rebuild the view.
         fn set_metadata(&self, metadata: TabStripMetadata) {
             let old = self.ivars().metadata.replace(metadata);
             if old == metadata {
@@ -3091,7 +3119,9 @@ mod macos {
             self.sync_semantics();
         }
 
-        /// Sync hover text and accessibility from the tab presentation.
+        /// Sync hover text and accessibility from the tab presentation. Every
+        /// context/state/selection diff path calls it so VoiceOver never lags the
+        /// pixels.
         fn sync_semantics(&self) {
             let ivars = self.ivars();
             let metadata = self.metadata();
@@ -3823,7 +3853,9 @@ mod macos {
         cap: usize,
         /// Escape was pressed: the next end-of-editing is a cancel, not a commit.
         cancelled: Cell<bool>,
-        /// Whether this editor has reported its outcome.
+        /// Whether this editor has reported its outcome. AppKit can end editing more
+        /// than once around teardown, so the latch guarantees exactly one Commit or
+        /// Cancel.
         done: Cell<bool>,
     }
 
@@ -3834,7 +3866,10 @@ mod macos {
             type Ivars = RenameIvars;
             protocols: [NSObject, NSTextFieldDelegate];
 
-            /// `controlTextDidChange:`: canonicalize as the user types.
+            /// `controlTextDidChange:`: canonicalize as the user types. Forbidden
+            /// formatting (control/bidi/invisible) is dropped and the value clamped to
+            /// the byte cap on a grapheme boundary, so the field simply stops taking
+            /// more and what the user sees is exactly what gets stored.
             @sel(controlTextDidChange:)
             fn control_text_did_change(&self, notification: Id) {
                 // SAFETY: `-object` on the live NSNotification is the edited NSControl.
@@ -3881,7 +3916,8 @@ mod macos {
                 aterm_objc::Bool::YES
             }
 
-            /// `controlTextDidEndEditing:`: the commit exit.
+            /// `controlTextDidEndEditing:`: the commit exit. Return, Tab and clicking
+            /// away all commit.
             @sel(controlTextDidEndEditing:)
             fn control_text_did_end_editing(&self, notification: Id) {
                 if self.ivars().done.replace(true) {
@@ -4085,7 +4121,8 @@ mod macos {
         true
     }
 
-    /// Keep a live rename editor glued to its tab across a strip refresh.
+    /// Keep a live rename editor glued to its tab across a strip refresh. Called at
+    /// the end of every [`set_window_tabs`] path; `ids` is the refreshed tab order.
     fn sync_rename_overlay(handle: &ToolbarHandle, ids: &[TabId]) {
         let outcome = {
             let rename = handle.rename.borrow();
@@ -4184,7 +4221,8 @@ mod macos {
             }
         }
 
-        /// `ToolbarDelegate` conforms to `NSToolbarDelegate`.
+        /// `ToolbarDelegate` conforms to `NSToolbarDelegate`. `-setDelegate:` is sent
+        /// raw, so without conformance the toolbar would come up empty.
         #[test]
         fn the_toolbar_delegate_conforms_to_nstoolbardelegate() {
             let cls = ToolbarDelegate::class();

@@ -299,6 +299,9 @@ macro_rules! declare_class {
             }
 
             /// `+alloc` and store `ivars`, returning the +1 but uninitialised
+            /// instance, the first half of [`Self::alloc_init`] for a class
+            /// whose designated initializer is not `-init`.
+            ///
             /// # Safety
             ///
             /// The caller must send the result exactly one designated

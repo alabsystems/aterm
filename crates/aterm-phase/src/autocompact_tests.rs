@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE AUTOCOMPACT OFFER's reader on the HAND-BUILT 2.1.302 screens
-//! (`crate::prompt::fixtures::AUTOCOMPACT_*`, each file's provenance line),
-//! with a negative control for every condition the module header lists.
+//! Autocompact offer reader tests (`crate::prompt::fixtures::AUTOCOMPACT_*`).
 
 use super::*;
 use crate::phase::Phase;
@@ -71,7 +69,6 @@ fn the_keep_first_offer_is_read_whole_with_the_focus_on_keep() {
         rows[p.options[o.keep].row].trim(),
         "❯ Keep auto (1m tokens)"
     );
-    // The one span every reading of the box shares.
     assert_eq!(crate::prompt::prompt_box_span(&rows), Some(p.span));
     assert_eq!(crate::prompt::prompt_box_first_row(&rows), Some(p.span.0));
     assert_eq!(
@@ -94,7 +91,6 @@ fn the_lower_first_offer_reads_its_focus_and_its_description() {
         (o.accept, o.keep, o.tokens, o.focused),
         (0, 1, 400_000, OfferFocus::Accept)
     );
-    // The accept row's description, read as the box's second paragraph.
     let (_, described) = p.description.split_once('\n').expect("a description");
     assert!(
         described.starts_with("This conversation is at "),
@@ -201,7 +197,6 @@ fn every_condition_is_needed() {
         assert_eq!(edited.len(), rows.len(), "{what}");
         assert!(!is_offer(&edited), "{what}");
     }
-    // A third option.
     let mut third = rows.clone();
     let at = third
         .iter()
@@ -209,8 +204,6 @@ fn every_condition_is_needed() {
         .expect("the accept row");
     third.insert(at + 1, "     Keep 500k tokens".to_string());
     assert!(!is_offer(&third), "a third option");
-    // A composer under it: the dialog replaces the composer, so a screen
-    // that has one is a transcript quoting the dialog.
     let mut quoted = rows.clone();
     let w = 120;
     quoted.extend([
@@ -220,7 +213,6 @@ fn every_condition_is_needed() {
         "  ? for shortcuts".to_string(),
     ]);
     assert!(!is_offer(&quoted), "a composer under it");
-    // The footer is not the last row: something drawn under it.
     let mut under = rows.clone();
     under.push("  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string());
     assert!(!is_offer(&under), "a row under the footer");

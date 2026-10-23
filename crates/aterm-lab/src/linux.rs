@@ -704,7 +704,9 @@ pub struct Up {
     pub home: String,
     pub runtime: String,
     pub booted_here: bool,
-    /// Reserved on the first display start, once per run.
+    /// Reserved on the first display start, once per run. Both success and
+    /// failure are retained, so a failed reservation cannot fall back to a
+    /// shared path.
     config: OnceLock<Result<guest::Config, String>>,
     /// What it took, in order.
     pub timings: Vec<Step>,
@@ -956,6 +958,9 @@ fn build_output(dir_exists: bool, built_from: Option<&str>, repo: &str) -> Build
 }
 
 /// Make [`GUEST_DIR`] this checkout's before anything builds in it: remove
+/// another checkout's output ([`BUILT_FROM`] says why), then name `repo` in
+/// it.
+///
 /// # Errors
 /// NOT RUN: the foreign output could not be removed, or the stamp written.
 fn claim_build_output(up: &Up, repo: &str) -> Result<Option<Step>, Fail> {

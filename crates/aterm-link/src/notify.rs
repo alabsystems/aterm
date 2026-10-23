@@ -147,7 +147,9 @@ impl Sel {
         }
     }
 
-    /// The reader's own check, behind the grant's filter.
+    /// The reader's own check, behind the grant's filter. It parses by position from the left,
+    /// as `subject::parse_in` does: `>` is one or more segments, and a right-anchored reading of
+    /// an over-long subject is the forgery a peer would reach for.
     fn hit(&self, fleet: &str, offset: u64, subject: &str, body: &[u8]) -> Option<Hit> {
         let segs: Vec<&str> = subject.split('/').collect();
         if segs.first() != Some(&"") || segs.get(1) != Some(&"f") || segs.get(2) != Some(&fleet) {
@@ -423,7 +425,8 @@ impl Store {
             .map(|(_, store, fork)| (store, fork)))
     }
 
-    /// Carry admits absence only when the name is absent.
+    /// Carry admits absence only when the name is absent. A read failure or
+    /// damaged cursor must not publish a successor with missing state.
     fn carry_text(&self, name: &str) -> io::Result<Option<String>> {
         let path = self.root.join(name);
         match std::fs::read_to_string(&path) {
@@ -579,7 +582,9 @@ impl Store {
         self.write("rate", &joined.join(","))
     }
 
-    /// `<subject> <attention token>` per line, the oldest first.
+    /// `<subject> <attention token>` per line, the oldest first. Both are one
+    /// word by construction ([`escalation`]); a line that is not two words is
+    /// skipped, which can only cost a re-page.
     fn standing(&self) -> Vec<(String, String)> {
         self.read("standing")
             .map(|s| {
@@ -805,7 +810,8 @@ impl Notifier {
         Ok(())
     }
 
-    /// The verdict the journal holds for an offset.
+    /// The verdict the journal holds for an offset. Keyed by offset alone: a record wakes a human
+    /// once however many selectors name it.
     fn verdict(&self, off: u64) -> Option<&str> {
         self.journal.iter().find_map(|line| {
             let mut it = line.split_whitespace();
@@ -864,7 +870,8 @@ impl Notifier {
         self.log_store.set_journal(&self.journal)
     }
 
-    /// Whether the budget has room at `now`, forgetting stamps outside the window.
+    /// Whether the budget has room at `now`, forgetting stamps outside the window. Stamps a
+    /// backwards clock left in the future count as inside, erring towards suppressing.
     fn has_room(&mut self, now: u64) -> bool {
         let window = self.cfg.window_ms;
         self.stamps.retain(|t| now.saturating_sub(*t) < window);
@@ -961,7 +968,8 @@ impl Notifier {
         Ok(())
     }
 
-    /// Run the operator's command and return its verdict.
+    /// Run the operator's command and return its verdict. Never fails the run: a missing `curl`
+    /// must not stop the notifier.
     fn exec(&self, hit: &Hit, dup: bool, suppressed: u64) -> String {
         let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
         cmd.arg("-c")
@@ -1081,7 +1089,8 @@ impl Notifier {
         Ok(())
     }
 
-    /// Follow the bus.
+    /// Follow the bus. One subscription per selector, each on its own connection and thread, all
+    /// feeding one executor: the command runs one at a time and the journal has one writer.
     fn follow(&mut self) -> io::Result<()> {
         let (tx, rx) = notice_handoff();
         for (idx, sel) in self.cfg.on.iter().enumerate() {
@@ -1468,7 +1477,8 @@ pub fn main(args: &[String]) -> ExitCode {
     }
 }
 
-/// Parse argv.
+/// Parse argv. Every flag takes a value except `--once`; a flag
+/// without one is a usage error rather than a silently defaulted setting.
 fn parse(args: &[String]) -> Result<Config, String> {
     let mut cfg = Config {
         fleet: String::new(),
@@ -1885,7 +1895,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **AN ESCALATION NOBODY WAS TOLD OF DOES NOT STAND** (r3-22).
+    /// **AN ESCALATION NOBODY WAS TOLD OF DOES NOT STAND** (r3-22). Value
+    /// dedup must not become the silent drop the module refuses.
     #[test]
     fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
         let dir = scratch("untold");

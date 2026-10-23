@@ -335,7 +335,9 @@ impl<A: Array> SmallVec<A> {
         self.regrow(new_cap);
     }
 
-    /// Moves the items into fresh storage with room for `new_cap`.
+    /// Moves the items into fresh storage with room for `new_cap`. Called only
+    /// with `new_cap` above the current capacity, which is at least the inline
+    /// size, so the new storage is a heap buffer.
     fn regrow(&mut self, new_cap: usize) {
         let old = core::mem::replace(&mut self.store, A::Store::with_capacity(new_cap));
         for item in old.into_iter() {

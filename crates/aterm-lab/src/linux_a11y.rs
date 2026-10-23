@@ -1015,7 +1015,8 @@ pub(crate) struct Mutter {
     wayland: Var,
 }
 
-/// The Orca rows' Mutter's unit, and its Wayland socket's name.
+/// The Orca rows' Mutter's unit, and its Wayland socket's name. The lane's
+/// other Mutter ([`Display::Mutter`]) runs `--no-x11`.
 const MUTTER_ORCA: &str = "aterm-lane-mutter-orca";
 
 /// Where the command Mutter runs once up writes what Mutter gave it.

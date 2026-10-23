@@ -180,7 +180,8 @@ impl X11Presenter {
         if xid == 0 {
             return Err(X11PresentError::NotX11);
         }
-        // SAFETY: Winit's live `Display *`.
+        // SAFETY: Winit's live `Display *`, which `_window` keeps open for as long as this
+        // presenter (and so this connection) lives.
         let conn = unsafe { Connection::from_xlib_display(display) }?;
         let geometry = conn.send(xproto::get_geometry(xid))?;
         let visual = match (visual != 0).then_some(visual) {

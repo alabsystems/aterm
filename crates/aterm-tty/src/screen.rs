@@ -347,7 +347,8 @@ impl Screen {
         self.size.cols as usize
     }
 
-    /// Where `row`, `col` sits in `cells`.
+    /// Where `row`, `col` sits in `cells`. Every caller keeps `col` inside the row, so
+    /// the sum never saturates.
     #[inline]
     const fn index(&self, row: u16, col: usize) -> usize {
         (row as usize * self.size.cols as usize).saturating_add(col)

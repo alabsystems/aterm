@@ -235,7 +235,9 @@ fn damaged_path_glow_under_char_fg_parity_cpu_matches_gpu() {
     }
 }
 
-/// char_fg reaches line decorations on both backends.
+/// char_fg reaches line decorations on both backends. The substituted colour
+/// is derived at three sites (CPU pass 3, CPU pass 3b undercurl, the GPU deco
+/// loop).
 #[test]
 fn char_fg_follows_into_line_decorations_on_both_backends() {
     let theme = Theme::default();

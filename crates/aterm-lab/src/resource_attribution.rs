@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Real delegated work under one external launcher, against a private aterm.
-//! The worker uses a new session while retaining its registered parent root.
+//! Resource attribution lab for delegated worker sessions under a private `aterm`.
 
 use std::io::{BufRead, Read, Write};
 use std::sync::{
@@ -33,8 +32,6 @@ pub fn cmd(args: &[String]) -> Res {
     let aterm = crate::instance::resolve_aterm(path)?;
     let world = World::new(CONFIG_OFF)?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // Local process-name fixtures, never live AI services. The host discovers
-    // their distinct programs through the same real PTY observation.
     for program in ["claude", "codex"] {
         std::os::unix::fs::symlink(&exe, world.home.join(program)).map_err(|e| e.to_string())?;
     }
@@ -64,7 +61,6 @@ pub fn cmd(args: &[String]) -> Res {
         (a, "claude", "idle"),
         (b, "codex", "resource-attribution observer"),
     ] {
-        // World::new chooses this canonical /tmp/at.<random>/home path itself.
         let command = format!("exec '{}' {args}", world.home.join(program).display());
         checked(&instance, &[&format!("@{sid}"), "send", &command])?;
         checked(&instance, &[&format!("@{sid}"), "key", "enter"])?;
@@ -90,9 +86,6 @@ pub fn cmd(args: &[String]) -> Res {
     }
     let mut jobs = Vec::new();
     for (sid, label, program) in [(a, "tab-a", "claude"), (b, "tab-b", "codex")] {
-        // This is the external launcher, outside the private aterm's tree.
-        // @self comes from the authenticated session selector's real variable;
-        // the deliberately stale legacy variable must never select the tab.
         let until = Instant::now() + HANG;
         let (capabilities, ai) = loop {
             let output = aterm_uds::deadline::output_until(
@@ -198,8 +191,6 @@ pub fn cmd(args: &[String]) -> Res {
             let procs = field(row, "procs").and_then(|v| v.parse::<usize>().ok());
             let cpu = field(row, "cpu_cores").and_then(|v| v.parse::<f64>().ok());
             let bytes = field(row, "physical_bytes").and_then(|v| v.parse::<u64>().ok());
-            // Two processes exactly: the registered root and its setsid child.
-            // No shared launcher or the other tab's two processes is included.
             if procs != Some(2)
                 || !cpu.is_some_and(|v| v > 0.0)
                 || !bytes.is_some_and(|v| v >= 16 * 1024 * 1024)
@@ -367,7 +358,6 @@ impl Drop for Job {
                 && self.worker_start.is_some()
                 && aterm_uds::process::read_process_start(pid) == self.worker_start
             {
-                // This still names our worker's exact start record.
                 let _ = crate::sys::kill(pid, libc::SIGKILL);
             }
         }
@@ -389,8 +379,7 @@ fn child() -> Res {
     Ok(status.code().unwrap_or(1))
 }
 
-/// The Codex-named PTY process needs no model, credentials or network. Its
-/// role here is only to let the real foreground-program observer name it.
+/// The Codex-named PTY process needs no model, credentials or network.
 fn observer() -> Res {
     println!("LOCAL PROGRAM OBSERVER FIXTURE");
     std::io::stdout().flush().map_err(|e| e.to_string())?;

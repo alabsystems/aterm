@@ -304,7 +304,10 @@ fn split_environment(block: &[u16]) -> Option<Vec<String>> {
     }
 }
 
-/// `/proc/<pid>/cmdline` (or `environ`) as words.
+/// `/proc/<pid>/cmdline` (or `environ`) as words. The kernel ends every word with a NUL,
+/// so exactly one trailing NUL is a terminator and every other empty piece is an empty word,
+/// kept (as [`parse_procargs2`] keeps one): dropping it would give a flag whose value was
+/// `""` the next word as its value.
 #[cfg(any(test, target_os = "linux"))]
 fn split_nul_list(bytes: &[u8]) -> Vec<String> {
     if bytes.is_empty() {

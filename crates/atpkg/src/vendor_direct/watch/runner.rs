@@ -250,7 +250,8 @@ fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPa
     }))
 }
 
-/// [`spawn_detached`]'s detaching shell.
+/// [`spawn_detached`]'s detaching shell. The pid it reports is the pass's own: the
+/// clamp's launcher execs the pass in place.
 #[cfg(unix)]
 fn detach(exe: &Path, args: &[OsString]) -> io::Result<u32> {
     let out = aterm_uds::spawnfd::command("/bin/sh")
@@ -289,7 +290,8 @@ fn spawn_detached(exe: &Path, args: &[OsString]) -> io::Result<Box<dyn RunningPa
     Ok(Box::new(Owned(child)))
 }
 
-/// A detached pass, followed by its pid ([`crate::progress::pid_alive`]).
+/// A detached pass, followed by its pid ([`crate::progress::pid_alive`]). Its exit status
+/// is launchd's to read, not ours, so an end reads as `true` and the store decides.
 #[cfg(unix)]
 struct Detached {
     pid: u32,
@@ -319,7 +321,8 @@ impl RunningPass for Owned {
 /// Whether a held toolchain move is due at a Unix second ([`crate::quiet::due`]'s shape).
 type HeldDue = dyn FnMut(&Layout, i64) -> Option<crate::quiet::DueFlip> + Send;
 
-/// The store-scoped HEAD pair.
+/// The store-scoped HEAD pair. The production function takes the index probe's
+/// lock and shared cooldown; tests replace only its network answer.
 type IndexProbe = dyn Fn(&Layout, &mut dyn FnMut(u64)) -> crate::index_probe::Probe + Send + Sync;
 
 struct PendingIndex {
@@ -329,7 +332,8 @@ struct PendingIndex {
     near: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
     completed_at: Arc<std::sync::OnceLock<Instant>>,
-    /// A near answer already handled by the runner.
+    /// A near answer already handled by the runner. A higher far answer may
+    /// still ask for a pass after the first pass finishes.
     offered: u64,
 }
 
@@ -543,7 +547,8 @@ pub struct Runner {
     /// Whether a held toolchain move is due at a Unix second ([`crate::quiet::due`]).
     held_due: Box<HeldDue>,
     index: IndexWatch,
-    /// One deadline for both update looks.
+    /// One deadline for both update looks. A standing second tab waits a
+    /// minute for the seat; a seated session behind a window retries a slice.
     admit_after: Duration,
 }
 
@@ -602,7 +607,8 @@ impl Runner {
         self
     }
 
-    /// Replace the store-scoped network probe for a deterministic test.
+    /// Replace the store-scoped network probe for a deterministic test. Its
+    /// near callback is called on the worker thread, as in production.
     #[cfg(test)]
     fn with_index_probe(
         mut self,
@@ -717,7 +723,9 @@ impl Runner {
         }
     }
 
-    /// Look for a held toolchain move once per re-check interval.
+    /// Look for a held toolchain move once per re-check interval. Re-admit through
+    /// the head watch's rendezvous before reading the record: a window may have
+    /// started watching after this session's last head round.
     fn check_held_move(&mut self, wall: SystemTime) -> bool {
         let now = self.held_origin + self.clock.mono();
         if !self.held.look_due(now) {
@@ -762,7 +770,9 @@ impl Runner {
         admitted
     }
 
-    /// Start only one HEAD pair for the seated session.
+    /// Start only one HEAD pair for the seated session. Its near answer wakes
+    /// the parked runner, but the network worker never launches a pass: the
+    /// runner must re-admit after a window may have taken the watch.
     fn check_index(&mut self, wall: SystemTime) -> bool {
         let now = self.clock.mono();
         self.index.harvest(now);

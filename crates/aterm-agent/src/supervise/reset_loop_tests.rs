@@ -842,7 +842,9 @@ fn a_pending_line_is_never_keyed_but_checking_past_its_bound() {
     );
 }
 
-/// No Enter follows an Escape.
+/// No Enter follows an Escape. The confirmation's cursor is on its no: the
+/// loop Escapes — and the Escape does not take, while a person's arrow moves
+/// the cursor onto the yes.
 #[test]
 fn no_enter_follows_an_escape_whatever_the_confirmation_then_reads() {
     use aterm_phase::prompt::fixtures::screen;
@@ -1997,7 +1999,8 @@ fn an_attended_loop_takes_no_step_up() {
     }
 }
 
-/// The box the row opened is the step's, whatever it is reworded to.
+/// The box the row opened is the step's, whatever it is reworded to. Every
+/// text of the reset is the vendor's server's to change.
 #[test]
 fn the_box_the_row_opened_is_the_steps_whatever_it_is_reworded_to() {
     let no_title = confirm_frame(&[

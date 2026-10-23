@@ -37,7 +37,7 @@ impl Switch {
     /// The client checker's policy this reading is: dormant admits an unproven compiler;
     /// live and unknown both require the receipt.
     #[must_use]
-    pub fn policy(&self) -> atpkg::lineage::LineagePolicy {
+    pub const fn policy(&self) -> atpkg::lineage::LineagePolicy {
         match self {
             Self::Dormant => atpkg::lineage::LineagePolicy::Dormant,
             Self::Live | Self::Unknown(_) => atpkg::lineage::LineagePolicy::Require,

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The journal's line codec (design §5.3, phase 2B): every frame round-trips;
-//! a torn line glued onto the next never decodes as a record, a chimera or
-//! another session's line; a partial last line is never a line; unknown keys
-//! and kinds are skipped; the names a retention pass may touch are exactly
-//! the writer's spelling; and the content tier never reaches a line.
+//! The journal's line codec (design §5.3): every frame round-trips.
 
 use aterm_slog::journal::{
     EndWhy, Frame, Inst, LINE_MAX, LineError, LossWhy, complete_lines, decode_line, encode_frame,
@@ -139,12 +135,9 @@ fn a_torn_line_glued_on_the_next_never_decodes() {
                     decode_line(glued.as_bytes()).is_err(),
                     "a tear at {k} of {a:?} glued onto {b:?} decoded"
                 );
-                // The writer abandons a segment after a short write, so a
-                // torn tail is a segment's last bytes: never a line.
                 let tail = format!("{b}\n{}", &a[..k]);
                 let whole: Vec<&[u8]> = complete_lines(tail.as_bytes()).collect();
                 assert_eq!(whole, vec![b.as_bytes()], "{tail:?}");
-                // And a tear followed by a line of its own decodes alone.
                 let split = format!("{}\n{b}\n", &a[..k]);
                 let got: Vec<&[u8]> = complete_lines(split.as_bytes()).collect();
                 assert_eq!(got.len(), 2);
@@ -174,7 +167,6 @@ fn the_decoder_refuses_what_is_not_a_line() {
     );
     let twice = good.replace("\tend=", "\tend=\tend=");
     assert_eq!(decode_line(twice.as_bytes()), Err(LineError::Glued));
-    // Unknown keys and kinds are skipped, not refused.
     let extra = good.replace("\tend=", "\tnewer_key=7\tend=");
     assert_eq!(
         decode_line(extra.as_bytes()),
@@ -186,12 +178,8 @@ fn the_decoder_refuses_what_is_not_a_line() {
         Ok(Frame::Unknown)
     );
     assert_eq!(decode_line(b"s1\t*\t#newer\tend="), Ok(Frame::Unknown));
-    // A record with an unknown key keeps the rest.
     let rec = format!("s1\ts-9f3c0a\t{} future=1\tend=", lines(&sample())[1]);
     assert!(matches!(decode_line(rec.as_bytes()), Ok(Frame::Rec { .. })));
-    // A record of a FUTURE kind is a record of kind `unknown` with its known
-    // fields kept (phase 3B: what a 2B reader makes of `source` and
-    // `mail-landed`, and what this one makes of whatever comes next).
     let future = "s1\ts-9f3c0a\t9 mark r1 zzz-kind-of-phase-9 state=on skipped=3 src=aterm conf=strong t=5\tend=";
     match decode_line(future.as_bytes()) {
         Ok(Frame::Rec { rec, .. }) => {
@@ -201,8 +189,6 @@ fn the_decoder_refuses_what_is_not_a_line() {
         }
         other => panic!("a future kind is still a record: {other:?}"),
     }
-    // Negative control: this build knows 3B's kinds, phase 5's `task` and
-    // Phase 6's ring kinds (6F-2), so the same line names them.
     for k in [
         Kind::Source,
         Kind::MailLanded,
@@ -222,7 +208,6 @@ fn the_decoder_refuses_what_is_not_a_line() {
             other => panic!("{k:?}: {other:?}"),
         }
     }
-    // A complete line is one with its LF.
     let bytes = format!("{good}\n{good}");
     assert_eq!(complete_lines(bytes.as_bytes()).count(), 1);
     assert_eq!(complete_lines(b"").count(), 0);
@@ -314,8 +299,6 @@ fn the_content_tier_never_reaches_a_line() {
         line.contains(" title src="),
         "the record stays, its title gone: {line}"
     );
-    // NEGATIVE CONTROL: with the title mistiered as host, the same encode
-    // carries it.
     let mistiered: Vec<(Key, Tier, Cap)> = FIELDS
         .iter()
         .map(|&(k, t, c)| (k, if k == Key::Title { Tier::Host } else { t }, c))

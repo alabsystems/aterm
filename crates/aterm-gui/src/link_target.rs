@@ -159,7 +159,9 @@ fn safe_width(ch: char) -> usize {
     }
 }
 
-/// The byte range of the host inside a URL: the run the band refuses to elide.
+/// The byte range of the host inside a URL: the run the band refuses to elide. Every delimiter
+/// is ASCII, which never occurs inside a multi-byte UTF-8 sequence, so it reads the raw URL;
+/// [`caption`] converts the result to safe-form characters.
 fn host_span(url: &str) -> Range<usize> {
     let Some(colon) = url.find(':') else {
         // no scheme: the whole thing is the identity

@@ -131,7 +131,9 @@ pub struct Line {
     attrs: Option<Box<Rle<CellAttrs>>>,
     /// Line flags.
     flags: LineFlags,
-    /// Hyperlink spans.
+    /// Hyperlink spans. Boxed: most lines have none, so the common path pays a
+    /// niche pointer instead of an inline `SmallVec`; the box keeps ≤2 spans
+    /// inline.
     hyperlinks: Option<Box<SmallVec<HyperlinkSpan, 2>>>,
     /// Underline-colour spans (SGR 58): coalesced runs of one packed colour,
     /// boxed like `hyperlinks`.

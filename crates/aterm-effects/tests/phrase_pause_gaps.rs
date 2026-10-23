@@ -81,7 +81,8 @@ struct Shape {
     /// Never show the DEC caret again after the first hide (log-update
     /// hides it for the session and Ink's cursor cell stands in).
     hidden_caret: bool,
-    /// Keys per repaint under load; `0` or `1` is one repaint per key.
+    /// Keys per repaint under load; `0` or `1` is one repaint per key. A
+    /// burst's last key always flushes.
     coalesce: usize,
     /// A content-free repaint half-way through every pause.
     idle_repaint: bool,
@@ -1058,7 +1059,9 @@ fn sweep(runs: &[(Composer, Seam)]) -> Vec<Take> {
     takes
 }
 
-/// Every take of `grid`, in order.
+/// Every take of `grid`, in order. Each take builds its own host on its own
+/// clock (nothing shared), so they run on the binary's threads
+/// ([`crate::common::par_map`]) and are printed and judged in order after.
 fn run_takes<T: Sync>(grid: &[T], f: impl Fn(&T) -> Take + Sync) -> Vec<Take> {
     crate::common::par_map(grid, f)
 }

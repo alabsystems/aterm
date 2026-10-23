@@ -98,7 +98,7 @@ impl Ready {
 
     /// The write end's number, which the child finds it at.
     #[must_use]
-    pub fn number(&self) -> RawFd {
+    pub const fn number(&self) -> RawFd {
         self.number
     }
 

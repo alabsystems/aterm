@@ -41,7 +41,7 @@ pub const OWNER_DIRS: [&str; 3] = [
     "Library/Application Support/Muse",
 ];
 
-fn ok(b: bool) -> Verdict {
+const fn ok(b: bool) -> Verdict {
     if b { Verdict::Ok } else { Verdict::Fail }
 }
 
@@ -118,7 +118,12 @@ pub fn naming_own_dirs(refusals: &[String], homes: &[String]) -> Vec<String> {
 
 /// Verifies that no Muse Code process held files under the owner's directories.
 #[must_use]
-pub fn owner_verdict(held: &[String], wrote: &[String], pids: &[i32], observed: bool) -> Verdict {
+pub const fn owner_verdict(
+    held: &[String],
+    wrote: &[String],
+    pids: &[i32],
+    observed: bool,
+) -> Verdict {
     if !held.is_empty() {
         Verdict::Fail
     } else if !observed || pids.is_empty() || wrote.is_empty() {

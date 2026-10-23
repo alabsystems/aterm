@@ -50,7 +50,9 @@ impl fmt::Debug for Stdio {
 }
 
 impl From<OwnedFd> for Stdio {
-    /// This descriptor, placed at the slot's number.
+    /// This descriptor, placed at the slot's number. The command keeps it
+    /// (open in this process) until the command is dropped, as `std` keeps a
+    /// `Stdio::from(fd)`.
     fn from(fd: OwnedFd) -> Self {
         Self(Kind::Fd(fd))
     }

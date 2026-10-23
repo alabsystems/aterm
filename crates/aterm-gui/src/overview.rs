@@ -388,7 +388,8 @@ impl OverviewState {
         })
     }
 
-    /// A chip of THIS aterm's: what every act on the card acts on.
+    /// A chip of THIS aterm's: what every act on the card acts on. A
+    /// fabric chip is none ([`Self::fabric_chip`]), so no act reaches one.
     fn chip(&self, item: OverviewItem) -> Option<&OverviewChip> {
         match item {
             OverviewItem::Chip { group, chip } => self.groups.get(group)?.chips.get(chip),

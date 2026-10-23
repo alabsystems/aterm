@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The conformance oracle's cell module, `libc-oracle/conformance/src/ cell_<cell>.rs`, written
+//! The conformance oracle's cell module, `libc-oracle/conformance/src/cell_<cell>.rs`, written
 //! from the reference's rustdoc over the cell's declaration set, and its COVERAGE AUDIT.
 
 use std::collections::{BTreeMap, BTreeSet};

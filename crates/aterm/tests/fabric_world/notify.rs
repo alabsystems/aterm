@@ -533,7 +533,8 @@ fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
     );
 }
 
-/// `--since=head` is an initial cut, not a fresh cut on every restart.
+/// `--since=head` is an initial cut, not a fresh cut on every restart. Follow
+/// mode persists that first head before subscribing, even when the log is idle.
 #[test]
 fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
     let fleet = Fleet::boot("notify-head-restart");

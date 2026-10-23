@@ -1,7 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//! Native Trust driver for the independent pinned Windows reference workspaces:
-//! `win32-oracle/` (0.61.2 closure) and `crates/aterm-windows-sys-052/tests/oracle` (0.52.0 facade).
+//! Native Trust driver for the independent pinned Windows reference workspaces.
 mod emit;
 mod facade052;
 mod model;
@@ -247,8 +246,7 @@ fn formatted(
     }
     Ok(())
 }
-/// lib.rs and [`model::HAND_WRITTEN`], the files under aterm-win32's `src/`
-/// that `gen` does not own.
+/// Returns whether `path` is a hand-written file under `crates/aterm-win32/src`.
 fn hand_written(root: &Path, path: &Path) -> bool {
     let src = root.join("crates/aterm-win32/src");
     ["lib.rs"]
@@ -376,8 +374,6 @@ fn record(root: &Path, model: &model::Model, tools: &Tools, target: &Path) -> Re
         .ok_or("trustc reports no host")?
         .to_string();
     let data = aterm_json::json!({"windows-sys":VERSION,"host":host,"items":parse_record(&String::from_utf8(answer.stdout).map_err(|e|e.to_string())?)?});
-    // A successful process with incomplete output is not a new set of answers.
-    // Validate every required anchor before replacing any existing record.
     emit::recorded_tests(&model.up, &model.variants(), &data)?;
     let text = pretty_json(&data)?;
     std::fs::write(root.join("win32-oracle/recorded.json"), text + "\n")
@@ -487,7 +483,6 @@ fn start() -> Result<u8> {
         .map_err(|e| e.to_string())?;
     let target = target.or_else(|| std::env::var_os("ORACLE_TARGET_DIR").map(PathBuf::from));
     if verb == "oracle-052" {
-        // The 0.52 facade has its own reference workspace and no harvest.
         let tools = tools(&root, Some(stock.as_str()))?;
         let target =
             target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join("target.noindex"));
@@ -570,9 +565,6 @@ mod tests {
         }
     }
 
-    /// The stock toolchain's `llvm-nm` is the one under its host's rustlib
-    /// `bin`, beside cross targets' std-only directories; a toolchain without
-    /// the `llvm-tools` component has none.
     #[test]
     fn the_stock_toolchains_llvm_nm_is_its_llvm_tools_one() {
         let sysroot = aterm_tempfile::tempdir().expect("scratch sysroot");

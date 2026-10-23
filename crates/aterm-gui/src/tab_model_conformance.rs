@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Conformance of the real [`TabSet`], [`ViewStore`] and [`IdAllocator`] to the
-//! `NativeTabIdentity` model. Tabs project in chrome order and live views in stable
-//! wire-identity order, never in storage order.
+//! Conformance tests for [`TabSet`], [`ViewStore`], and [`IdAllocator`] against `NativeTabIdentity`.
 
 #![cfg(test)]
 
@@ -117,8 +115,6 @@ impl RealTabs {
             );
         }
 
-        // Sorted by identity, so HashMap order is irrelevant and the live-view
-        // slots stay compact after a removal.
         let mut live: Vec<ViewId> = self.views.iter().map(|(id, _)| id).collect();
         live.sort_unstable();
         for (index, key) in ["live_view_one", "live_view_two", "live_view_three"]
@@ -209,8 +205,6 @@ fn real_tab_set_conforms_across_open_select_reorder_and_close() {
         assert!(real.tabs.reorder(second, 2));
     });
 
-    // Closing the selected first tab moves selection and focus to the tab now
-    // in that chrome position.
     drive(&model, &mut real, "SelectFirst", |real| {
         assert!(real.tabs.switch_to_index(0));
     });
@@ -219,15 +213,12 @@ fn real_tab_set_conforms_across_open_select_reorder_and_close() {
     let after_close = real.project(&model);
     assert_transition(&model, &before_close, &after_close, "CloseFirst");
 
-    // Negative control, hand-built: a close that leaves active/focus on retired
-    // identities is not admitted and breaks the live-reference invariant.
     let mut dangling = after_close.clone();
     dangling.insert("active_tab", after_close["retired_tab_id"]);
     dangling.insert("focused_view", after_close["retired_view_id"]);
     assert_eq!(admits(&model, &before_close, &dangling), None);
     assert!(!model.check_invariant("ActiveReferencesLiveTab", &dangling));
 
-    // The next allocation reuses neither retired identity.
     let before_reopen = real.project(&model);
     real.open();
     let after_reopen = real.project(&model);
@@ -238,8 +229,6 @@ fn real_tab_set_conforms_across_open_select_reorder_and_close() {
         after_reopen["retired_view_id"]
     );
 
-    // Negative control: a replacement that aliases both retired wire ids is
-    // not admitted at Buggy=0, and the explicit non-reuse witnesses fail.
     let mut reused = after_reopen.clone();
     reused.insert("tab_three", before_reopen["retired_tab_id"]);
     reused.insert("tab_view_three", before_reopen["retired_view_id"]);
@@ -252,7 +241,6 @@ fn real_tab_set_conforms_across_open_select_reorder_and_close() {
     assert!(!model.check_invariant("TabIdsNeverReused", &reused));
     assert!(!model.check_invariant("ViewIdsNeverReused", &reused));
 
-    // Exercise the remaining real close shapes from a full three-tab state.
     drive(&model, &mut real, "SelectSecond", |real| {
         assert!(real.tabs.switch_to_index(1));
     });

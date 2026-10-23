@@ -22,6 +22,7 @@ use super::disk::{self, RootSize};
 use super::jobs_view;
 use super::json::Jv;
 use super::query::{ScopeArg, SysQuery, View};
+use super::why;
 use super::{Ctx, Freshness, clock_ms, exe_word, pct};
 use crate::events::{EventKind, LoadScope, millicores};
 use crate::model::{ProcView, RowScope, ScopeView, Snapshot};
@@ -47,6 +48,9 @@ pub struct Reply {
     pub view: View,
     /// The scope read, for the views that take one.
     pub scope: Option<ScopeArg>,
+    /// What a `why` reply reads (`global.cpu`, `global.mem`, or `global` for
+    /// the calm reply); `None` for every other view.
+    pub subject: Option<&'static str>,
     /// Body lines.
     pub lines: Vec<Line>,
     /// The JSON body, when the request asked for it.
@@ -55,8 +59,8 @@ pub struct Reply {
 
 impl Reply {
     /// The header line (no trailing newline): `OK <n> sys v=1 view=<v>
-    /// [scope=<s>] as_of=<hh:mm:ss.mmm> age_ms=<n> window_ms=<n>
-    /// next=<cursor> [state=stale|warming] [delta=1]`.
+    /// [scope=<s>] [subject=<s>] as_of=<hh:mm:ss.mmm> age_ms=<n>
+    /// window_ms=<n> next=<cursor> [state=stale|warming] [delta=1]`.
     #[must_use]
     pub fn header(&self, ctx: &Ctx<'_>, delta: bool) -> String {
         let n = if self.json.is_some() {
@@ -64,29 +68,62 @@ impl Reply {
         } else {
             self.lines.len()
         };
-        let mut h = format!("OK {n} sys v=1 view={}", self.view.word());
-        if let Some(s) = self.scope {
-            h.push_str(&format!(" scope={}", s.word()));
+        header_line(self.view, self.scope, self.subject, n, ctx, delta)
+    }
+}
+
+/// [`Reply::header`] of a reply of `n` lines.
+pub(super) fn header_line(
+    view: View,
+    scope: Option<ScopeArg>,
+    subject: Option<&str>,
+    n: usize,
+    ctx: &Ctx<'_>,
+    delta: bool,
+) -> String {
+    let mut h = format!("OK {n} sys v=1 view={}", view.word());
+    if let Some(s) = scope {
+        h.push_str(&format!(" scope={}", s.word()));
+    }
+    if let Some(s) = subject {
+        h.push_str(&format!(" subject={s}"));
+    }
+    match as_of(view, ctx) {
+        Some((unix_ms, age_ms, window)) => {
+            h.push_str(&format!(
+                " as_of={} age_ms={age_ms} window_ms={}",
+                clock_ms(unix_ms),
+                window.map_or_else(|| "-".to_owned(), |w| w.to_string())
+            ));
         }
-        match ctx.snap {
-            Some(snap) => {
-                h.push_str(&format!(
-                    " as_of={} age_ms={} window_ms={}",
-                    clock_ms(ctx.as_of_unix_ms),
-                    ctx.age_ms,
-                    window_ms(snap).map_or_else(|| "-".to_owned(), |w| w.to_string())
-                ));
-            }
-            None => h.push_str(" as_of=- age_ms=- window_ms=-"),
+        None => h.push_str(" as_of=- age_ms=- window_ms=-"),
+    }
+    h.push_str(&format!(" next={}", ctx.cursor()));
+    if ctx.state != Freshness::Fresh {
+        h.push_str(&format!(" state={}", ctx.state.word()));
+    }
+    if delta {
+        h.push_str(" delta=1");
+    }
+    h
+}
+
+/// When the figures `view` prints were read, unix ms, how old they are, ms,
+/// and the window they cover, ms; `None` with no snapshot. A `why` reply's
+/// are its split's, read on some readings and carried on the others (the
+/// snapshot's before the first split).
+fn as_of(view: View, ctx: &Ctx<'_>) -> Option<(u64, u64, Option<u64>)> {
+    let snap = ctx.snap?;
+    match snap.why.as_deref().filter(|_| view == View::Why) {
+        Some(f) => {
+            let older = snap.at_ns.saturating_sub(f.at_ns) / 1_000_000;
+            Some((
+                ctx.as_of_unix_ms.saturating_sub(older),
+                ctx.age_ms.saturating_add(older),
+                Some(f.window_ns / 1_000_000),
+            ))
         }
-        h.push_str(&format!(" next={}", ctx.cursor()));
-        if ctx.state != Freshness::Fresh {
-            h.push_str(&format!(" state={}", ctx.state.word()));
-        }
-        if delta {
-            h.push_str(" delta=1");
-        }
-        h
+        None => Some((ctx.as_of_unix_ms, ctx.age_ms, window_ms(snap))),
     }
 }
 
@@ -168,7 +205,7 @@ impl Fig {
 }
 
 /// The sessions a scope word covers for the target.
-fn scope_keys(ctx: &Ctx<'_>, scope: ScopeArg) -> Vec<u64> {
+pub(super) fn scope_keys(ctx: &Ctx<'_>, scope: ScopeArg) -> Vec<u64> {
     match scope {
         ScopeArg::Pane => vec![ctx.target.key],
         ScopeArg::Tab => {
@@ -211,7 +248,7 @@ fn c1(x: f32) -> String {
 }
 
 /// Cores-worth to two decimals with `c`: `4.13c`.
-fn c2(x: f32) -> String {
+pub(super) fn c2(x: f32) -> String {
     format!("{:.2}c", x.max(0.0))
 }
 
@@ -238,12 +275,12 @@ fn bps_word(b: f64) -> String {
 }
 
 /// `unavailable(<word>)`.
-fn unavailable(word: &str) -> String {
+pub(super) fn unavailable(word: &str) -> String {
     format!("unavailable({word})")
 }
 
 /// A record value or `unavailable(<why>)`.
-fn rec<T: std::fmt::Display>(v: Option<T>, why: &str) -> String {
+pub(super) fn rec<T: std::fmt::Display>(v: Option<T>, why: &str) -> String {
     v.map_or_else(|| unavailable(why), |v| v.to_string())
 }
 
@@ -279,33 +316,38 @@ fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
         parts.push(format!("GPU {:.0}%", (g.load.raw * 100.0).round()));
     }
     if let Some(m) = s.mem.as_ref() {
-        let mut w = format!(
-            "memory {} of {} GiB used",
-            words::gib_figure(m.sample.used()),
-            words::gib_total(m.sample.total)
-        );
-        if m.sample.pressure != crate::model::Pressure::Unknown {
-            w.push_str(&format!(", pressure {}", m.sample.pressure.word()));
-        }
-        parts.push(w);
-        let mut sw = if m.sample.swap_used == 0 {
-            "swap 0".to_owned()
-        } else {
-            format!("swap {}", words::mem(m.sample.swap_used))
-        };
-        if let Some(r) = m
-            .rates
-            .filter(|r| r.swap_bps() >= crate::events::SWAP_ACTIVE_BPS)
-        {
-            sw.push_str(&format!(", swapping {}", bps_word(r.swap_bps())));
-        }
-        parts.push(sw);
+        parts.extend(mem_clauses(m));
     }
     if let Some(v) = s.volume.as_ref() {
         parts.push(format!("disk {} free", words::disk(v.available)));
     }
     let _ = ctx;
     parts
+}
+
+/// Memory's words for a sentence: `memory 16.6 of 128 GiB used, pressure
+/// normal` and `swap 0` (with `, swapping <rate>` while it moves).
+pub(super) fn mem_clauses(m: &crate::model::MemView) -> [String; 2] {
+    let mut w = format!(
+        "memory {} of {} GiB used",
+        words::gib_figure(m.sample.used()),
+        words::gib_total(m.sample.total)
+    );
+    if m.sample.pressure != crate::model::Pressure::Unknown {
+        w.push_str(&format!(", pressure {}", m.sample.pressure.word()));
+    }
+    let mut sw = if m.sample.swap_used == 0 {
+        "swap 0".to_owned()
+    } else {
+        format!("swap {}", words::mem(m.sample.swap_used))
+    };
+    if let Some(r) = m
+        .rates
+        .filter(|r| r.swap_bps() >= crate::events::SWAP_ACTIVE_BPS)
+    {
+        sw.push_str(&format!(", swapping {}", bps_word(r.swap_bps())));
+    }
+    [w, sw]
 }
 
 fn aterm_clauses(s: &Snapshot) -> Vec<String> {
@@ -671,6 +713,13 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
     if let Some(g) = ctx.gap {
         lines.push(note("gap", format!("gap why={}", g.word())));
     }
+    let events: Vec<Line> = ctx.snap.map_or_else(Vec::new, |s| {
+        ctx.events
+            .iter()
+            .filter(|e| event_shown(ctx, e))
+            .map(|e| event_line(ctx, s, e))
+            .collect()
+    });
     match ctx.snap {
         None => lines.push(note(
             "state",
@@ -687,16 +736,14 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             View::Mem => mem_text(q, ctx, s, &mut lines),
             View::Disk => disk_text(q, ctx, s, &mut lines),
             View::Procs => procs_text(q, ctx, s, &mut lines),
+            View::Why => why::why_text(q, ctx, s, &mut lines, &events),
         },
     }
-    if let Some(s) = ctx.snap {
-        for e in ctx.events.iter().filter(|e| event_shown(ctx, e)) {
-            lines.push(event_line(ctx, s, e));
-        }
-    }
+    lines.extend(events);
     Reply {
         view: q.view,
         scope: q.view.default_scope().and(scope),
+        subject: why::subject_word(q, ctx.snap),
         lines,
         json: None,
     }
@@ -713,7 +760,7 @@ fn overview_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     }
     lines.push(note(
         "more",
-        "more=views:tab,aterm,global,jobs,cores,gpu,mem,disk,procs · aterm ctl @self sys --json",
+        "more=views:tab,aterm,global,jobs,cores,gpu,mem,disk,procs,why · aterm ctl @self sys --json",
     ));
 }
 
@@ -1189,14 +1236,17 @@ fn gpu_words(s: &Snapshot) -> String {
 /// Whether the memory classes partition physical memory exactly (macOS,
 /// where the remainder is what the VM never manages), or leave memory no
 /// class names (Linux, Windows; design §9.6).
-fn exact_partition(ctx: &Ctx<'_>) -> bool {
+pub(super) fn exact_partition(ctx: &Ctx<'_>) -> bool {
     ctx.machine.family == "macOS"
 }
 
 /// The classes, bytes; `None` for one the OS does not say (Windows'
 /// compression store), never a false zero. The last is the remainder:
 /// `not_in_vm` where the partition is exact, else `unnamed`.
-fn mem_classes(m: &crate::model::MemView, exact: bool) -> [(&'static str, Option<u64>); 6] {
+pub(super) fn mem_classes(
+    m: &crate::model::MemView,
+    exact: bool,
+) -> [(&'static str, Option<u64>); 6] {
     let x = &m.sample;
     let counted = x
         .app
@@ -1944,14 +1994,14 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
 
 // JSON
 
-fn as_of_json(ctx: &Ctx<'_>) -> Jv {
-    let window = ctx
-        .snap
-        .and_then(window_ms)
-        .map_or_else(|| Jv::why("warming"), Jv::u);
-    let (unix, age) = match ctx.snap {
-        Some(_) => (Jv::u(ctx.as_of_unix_ms), Jv::u(ctx.age_ms)),
-        None => (Jv::why("warming"), Jv::why("warming")),
+fn as_of_json(view: View, ctx: &Ctx<'_>) -> Jv {
+    let (unix, age, window) = match as_of(view, ctx) {
+        Some((unix, age, window)) => (
+            Jv::u(unix),
+            Jv::u(age),
+            window.map_or_else(|| Jv::why("warming"), Jv::u),
+        ),
+        None => (Jv::why("warming"), Jv::why("warming"), Jv::why("warming")),
     };
     Jv::obj([
         ("unix_ms", unix),
@@ -2189,7 +2239,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
     if let Some(sc) = q.view.default_scope().and(scope) {
         o.set("scope", Jv::s(sc.word()));
     }
-    o.set("as_of", as_of_json(ctx));
+    o.set("as_of", as_of_json(q.view, ctx));
     if let Some(g) = ctx.gap {
         o.set("gap", Jv::s(g.word()));
     }
@@ -2375,6 +2425,7 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             let sc = scope.unwrap_or(ScopeArg::Tab);
             o.set("procs", procs_json(q, ctx, s, sc));
         }
+        View::Why => why::why_json(q, ctx, s, &mut o),
     }
     o.set(
         "events",
@@ -2558,27 +2609,34 @@ fn gpu_json(s: &Snapshot) -> Jv {
     o
 }
 
+/// [`mem_classes`] as JSON: `[{class, bytes}]`, an unread class's bytes an
+/// unknown.
+pub(super) fn classes_json(m: &crate::model::MemView, exact: bool) -> Jv {
+    Jv::Arr(
+        mem_classes(m, exact)
+            .iter()
+            .map(|(k, b)| {
+                Jv::obj([
+                    ("class", Jv::s(*k)),
+                    ("bytes", Jv::known_or(*b, "not_sampled")),
+                ])
+            })
+            .collect(),
+    )
+}
+
 fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     let Some(m) = s.mem.as_ref() else {
         return Jv::obj([("classes", Jv::why("unsupported"))]);
     };
     let exact = exact_partition(ctx);
-    let classes = mem_classes(m, exact)
-        .iter()
-        .map(|(k, b)| {
-            Jv::obj([
-                ("class", Jv::s(*k)),
-                ("bytes", Jv::known_or(*b, "not_sampled")),
-            ])
-        })
-        .collect();
     let mut o = Jv::obj([
         ("total_bytes", Jv::u(m.sample.total)),
         (
             "partition",
             Jv::s(if exact { "exact" } else { "remainder" }),
         ),
-        ("classes", Jv::Arr(classes)),
+        ("classes", classes_json(m, exact)),
         ("used_bytes", Jv::u(m.sample.used())),
         (
             "pressure",

@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `xseat`'s input device: the XTEST extension's `FakeInput` (X.Org's "XTEST
-//! Extension Protocol", version 2.2) on the X display `DISPLAY` names. weston's
-//! x11 backend, nested in the lane's Xvfb, reads its seat's keyboard and
-//! pointer from its own X window, which covers the X screen, so a key or a
-//! motion faked here reaches the Wayland client weston gives the focus.
-//!
-//! Spoken directly, as [`crate::xdnd`] speaks the core protocol: not xdotool,
-//! whose keysym lookup rebinds a spare keycode for a keysym the keymap lacks,
-//! which a nested weston (it builds its keymap from the X server's rule names
-//! once, as it starts) would read as another key. A keysym here is pressed
-//! only on a key whose first level holds it, or refused. Every byte the server
-//! sends is untrusted: a short or malformed reply is an error, never a panic.
+//! XTEST `FakeInput` client for synthesizing key, button, and pointer events on `$DISPLAY`.
 
 use crate::xdnd::{Error, X, fault, request, u16_at, u32_at};
 
@@ -213,14 +202,7 @@ impl Xtest {
         self.fake(MOTION_NOTIFY, 0, (0, 0))
     }
 
-    /// Let go of every button and key the X server holds down: what a session
-    /// stopped mid-steps left pressed (the server keeps a faked press until
-    /// its release comes, and weston, under a held button, keeps its
-    /// pointer's focus on the surface the press began on, so the next window
-    /// hears no `enter`: measured 2026-10-19, after a drag's session was
-    /// stopped before its release). A RemoteDesktop session's devices go
-    /// with the session; these stay with the server, so each session starts
-    /// by letting go. The buttons and keys let go, by number.
+    /// Release any buttons and keys currently held down on the X server.
     pub(crate) fn let_go(&mut self) -> Result<(Vec<u8>, Vec<u8>), Error> {
         let root = self.x.root();
         let p = self.x.call(&query_pointer(root))?;
@@ -268,8 +250,6 @@ mod tests {
 
     #[test]
     fn a_keysym_is_found_on_a_keys_first_level_only() {
-        // Two keysyms per keycode from 8: 8 a/A, 9 dead_acute/dead_diaeresis,
-        // 10 apostrophe in the second level only, 11 a again.
         let mut reply = vec![1, 2, 0, 0, 8, 0, 0, 0];
         reply.resize(32, 0);
         for s in [0x61u32, 0x41, 0xfe51, 0xfe57, 0, 0x27, 0x61, 0x41] {
@@ -289,7 +269,6 @@ mod tests {
 
     #[test]
     fn what_the_server_holds_down_is_read_bit_by_bit() {
-        // Button1Mask and Button3Mask, with Shift (bit 0) beside them.
         assert_eq!(held_buttons(0x0501), [1, 3]);
         assert_eq!(held_buttons(0x00ff), Vec::<u8>::new(), "modifiers only");
         let mut bits = [0u8; 32];

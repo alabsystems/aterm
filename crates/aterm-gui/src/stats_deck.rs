@@ -947,7 +947,8 @@ impl<'a> Deck<'a> {
         }
     }
 
-    /// `s` at `(x, base)` in pt; answers its advance.
+    /// `s` at `(x, base)` in pt; answers its advance. `room` is the column
+    /// it belongs to.
     #[expect(
         clippy::too_many_arguments,
         reason = "a text run's place, size, weight, ink and column"
@@ -2580,7 +2581,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// T-G6: the head sites and `deck_frame` agree.
+    /// T-G6: the head sites and `deck_frame` agree. Every site that derives
+    /// an attached window's head (the macOS resize, the synthetic strip, the
+    /// scale change, the metrics refresh and the attach) takes it from
+    /// `App::deck_head_px`; the card, the lens and the hit map take the Deck
+    /// from `deck_frame`.
     #[test]
     fn head_sites_agree() {
         use aterm_window::dpi::PhysicalSize;
@@ -2766,6 +2771,7 @@ pub(crate) mod tests {
         let mut v = aterm_vitals::Vitals::new();
         let tabs = vec![TabRoot {
             key: 7,
+            tab: 7,
             shell_pid: 200,
             label: "Tab 1".into(),
             program: "claude".into(),

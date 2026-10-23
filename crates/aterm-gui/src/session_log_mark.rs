@@ -213,7 +213,9 @@ impl SessionLog {
         self.consumers.close_due = true;
     }
 
-    /// Whether the session's close is due ([`Self::note_close_due`]).
+    /// Whether the session's close is due ([`Self::note_close_due`]). Only for
+    /// tests: production reads the flag only inside `await_look`, together
+    /// with the log, so no waiter can read the two in separate lock holds.
     #[cfg(test)]
     pub(crate) fn close_due(&self) -> bool {
         self.consumers.close_due

@@ -223,7 +223,7 @@ const CRUISE_RESUMED: &str = "continued";
 /// nobody has asked anything (its record holds the `/clear` and its empty
 /// output alone), and a carry-on there would start a task nobody asked for
 /// (`relaunch::nothing_owed`).
-fn cruise_step(clear: bool) -> &'static str {
+const fn cruise_step(clear: bool) -> &'static str {
     if clear {
         "done:taskless"
     } else {
@@ -268,6 +268,8 @@ fn cruise_judged(
 }
 
 /// Before aterm ends on a Cruise control: the tab's `autopilot` (its
+/// `status`'s word) must be Cruise.
+///
 /// # Errors
 /// The tab is not under Cruise.
 fn cruise_is_the_control(autopilot: &str) -> Result<(), Fail> {
@@ -321,6 +323,8 @@ fn status_word(door: &Door<'_>, key: &str) -> String {
 }
 
 /// Before the run puts the tab under Land: its `autopilot` (its `status`'s
+/// word) must not be Land already.
+///
 /// # Errors
 /// The tab is under Land already.
 fn land_proves_the_journal(autopilot: &str) -> Result<(), Fail> {
@@ -622,6 +626,10 @@ pub(crate) fn hold_tab(run: &Run, door: &Door<'_>) -> Result<(), Fail> {
 }
 
 /// The owner's word on tab `sid`, just said at `t0` (a hold, a Land),
+/// reaches the layout the next launch reads before aterm ends: the live
+/// instance's own crash journal ([`own_journal_carries`]) carries it on the
+/// tab's leaf (`on_leaf`; 30 s, said either way).
+///
 /// # Errors
 /// The journal never carried the word (FAIL, exit 1), or interrupted.
 fn journal_carries(

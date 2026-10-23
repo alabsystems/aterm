@@ -146,7 +146,9 @@ pub(crate) fn sweep_retired_channel_links(layout: &Layout) {
     let _ = std::fs::remove_dir(&root);
 }
 
-/// Every build the derived `bin/` shims point into, keyed by program.
+/// Every build the derived `bin/` shims point into, keyed by program. Unlike
+/// [`crate::ops::active_builds`] it keeps the whole set, so a program whose tools disagree is
+/// visibly contested.
 fn shim_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
     let mut out: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
@@ -252,7 +254,8 @@ pub fn discard_superseded(layout: &Layout, live: &LiveBuild, build: u64) -> Resu
     Ok(())
 }
 
-/// What an interrupted install left in `store/<program>/`.
+/// What an interrupted install left in `store/<program>/`. A partial tree is named by a build
+/// number, its stage scratch only by a directory name.
 #[derive(Default)]
 struct Debris {
     /// `(program, build, dir)` — numeric build dirs with no completeness marker.
@@ -639,7 +642,8 @@ fn run_in(
     }
 }
 
-/// Whether `tree` is gone from disk, all a reclaim or sweep line may claim.
+/// Whether `tree` is gone from disk, all a reclaim or sweep line may claim. Only `NotFound`
+/// says so: any other stat failure (no search bit, EIO) is a tree nobody could look at.
 fn is_gone(tree: &Path) -> bool {
     matches!(std::fs::symlink_metadata(tree), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
@@ -2045,7 +2049,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A LEASED BUILD IS KEPT, AND SAID (gap #31).
+    /// A LEASED BUILD IS KEPT, AND SAID (gap #31). A release cut pinned to a
+    /// superseded trust build holds a lease on it between its steps, when no process runs
+    /// from it: gc keeps it, the report names who holds it, and the first pass after the run
+    /// reclaims it.
     #[test]
     fn a_leased_build_is_kept_until_its_run_ends() {
         let l = layout("leased");

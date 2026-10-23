@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHERE THE WINDOWS APPLICATION HEAP GOES — measured, per allocation site and
-//! per line item, across the whole font stack a windowed aterm builds. A
-//! measurement, not a gate (the gate is `tests/win_heap_attribution.rs`); one
-//! report per process (`heapprof`), so it is its own binary:
-//!
-//! ```sh
-//! targo --unverified bench -p aterm-render --bench full_font_stack_heap
-//! ```
-//!
-//! Windows only: the font files and the heap it bills are Windows's.
+//! WHERE THE WINDOWS APPLICATION HEAP GOES.
 
 #[cfg(windows)]
 #[expect(
@@ -102,12 +93,6 @@ fn windows_font_bill() {
 /// The WHOLE font stack a windowed aterm builds, in the order it builds it:
 /// the terminal engine, then the GUI chrome's faces (`tray_raster`), then the
 /// background font-catalogue warm.
-///
-/// Every step below is the real shipped call. The three that live in
-/// `aterm-gui` are reproduced here EXACTLY as that crate writes them (the call
-/// is quoted in the comment) because `tray_raster` is `pub(crate)`; each one
-/// goes through the same public `aterm-render` entry point the GUI uses, so the
-/// bytes are the same bytes.
 #[cfg(windows)]
 fn full_font_stack_heap() {
     windows_font_bill();
@@ -123,15 +108,10 @@ fn full_font_stack_heap() {
     });
     heapprof::bill("one ASCII frame", || ascii_frame(&mut r));
 
-    // aterm-gui `tray_raster::default_chrome_fonts()`:
-    //   fallback: ChromeFace::from_bytes(aterm_render::embedded_font(), 0)
     let embedded = heapprof::bill("chrome fallback: embedded DejaVu parse", || {
         aterm_render::shared_parsed_face(aterm_render::embedded_font(), 0)
     });
 
-    // aterm-gui `App::sync_chrome_fonts()` -> `tray_raster::set_chrome_fonts`:
-    //   ChromeFace::from_bytes(renderer.chrome_primary_face())
-    //   ChromeFace::from_bytes(renderer.chrome_bold_face())
     let cp = r.chrome_primary_face();
     eprintln!(
         "   chrome_primary_face -> {}",
@@ -155,17 +135,12 @@ fn full_font_stack_heap() {
         cb.and_then(|(b, i)| aterm_render::shared_parsed_face(&b, i).ok())
     });
 
-    // aterm-gui `tray_raster::resolve_ui_font_assets()` -> `parse_ui_font` x2.
-    // Verbatim: `std::fs::read` then `Font::from_bytes`, and the
-    // REGULAR's file bytes are retained by `variable_semibold_of` on Windows.
     let ui = heapprof::bill("chrome UI pair (SegUIVar + seguisb)", ui_font_pair);
 
-    // aterm-gui `App::sync_chrome_fonts()` third value.
     let semantic = heapprof::bill("semantic renderer fork", || {
         r.fork_semantic_surface(14.0, Theme::default())
     });
 
-    // aterm-gui config font resolution (`native_font_catalog`).
     let batch = heapprof::bill("font_catalog::resolve_and_admit", || {
         aterm_render::font_catalog::resolve_and_admit(&[(
             "Cascadia Mono".to_string(),
@@ -173,9 +148,6 @@ fn full_font_stack_heap() {
         )])
     });
 
-    // --- the ENGINE side of one tab, for scale against the font terms ---
-    // A ~1080p grid on this suite's standard face, the geometry the GPU
-    // memory-floor work measured at (`aterm-gpu/tests/gpu_memory_floor.rs`).
     let mut big = Terminal::new(51, 174);
     heapprof::bill("Terminal::new(51x174) (one empty tab)", || {
         big.process(b"$ cargo build --release\r\n")
@@ -195,7 +167,6 @@ fn full_font_stack_heap() {
     heapprof::mark("settled");
     heapprof::report("full font stack, ASCII-only, settled", 34);
 
-    // Keep every handle alive across the report.
     std::hint::black_box((
         &embedded,
         &chrome_primary,
@@ -228,6 +199,5 @@ fn ui_font_pair() -> Option<(
     };
     let (regular, bytes) = parse(root.join("SegUIVar.ttf"))?;
     let (_semibold, _) = parse(root.join("seguisb.ttf"))?;
-    // `variable_semibold_of` keeps the variable regular's whole file.
     Some((std::sync::Arc::new(regular), bytes.into()))
 }

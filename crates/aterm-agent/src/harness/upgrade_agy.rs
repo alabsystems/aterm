@@ -426,7 +426,7 @@ pub enum ExitKind {
 impl ExitKind {
     /// One word for the step and the ledger.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             ExitKind::Clean => "clean",
             ExitKind::Stopped => "stopped",

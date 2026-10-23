@@ -2627,6 +2627,11 @@ fn probe_lines_classifies_real_sockets() {
     let _serial = PROBE_SOCKET_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    // Every socket here answers at once: the probe's own two-second budget is a latency
+    // budget, which a loaded machine overruns, so these probes wait under the hang detector.
+    let probe = |path: &str, verb: &str, pid: u32| {
+        probe_lines_with_deadline(path, verb, pid, HANG_DETECTOR)
+    };
     let dir = std::env::temp_dir().join(format!("aterm-ctl-f8-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("private dir");
@@ -2635,24 +2640,24 @@ fn probe_lines_classifies_real_sockets() {
     abandon_socket(&stale);
     let stale_s = stale.to_str().expect("utf8").to_string();
     assert!(matches!(
-        probe_lines(&stale_s, "sessions", DEAD_PID),
+        probe(&stale_s, "sessions", DEAD_PID),
         Probe::Refused {
             pid_running: Some(false)
         }
     ));
     assert!(matches!(
-        probe_lines(&stale_s, "sessions", 0),
+        probe(&stale_s, "sessions", 0),
         Probe::Refused { pid_running: None }
     ));
     assert!(matches!(
-        probe_lines(&stale_s, "sessions", std::process::id()),
+        probe(&stale_s, "sessions", std::process::id()),
         Probe::Refused {
             pid_running: Some(true)
         }
     ));
 
     let gone = dir.join("aterm-1.sock");
-    match probe_lines(gone.to_str().expect("utf8"), "sessions", 1) {
+    match probe(gone.to_str().expect("utf8"), "sessions", 1) {
         Probe::Other(e) => {
             assert_eq!(e.kind(), io::ErrorKind::NotFound);
             assert!(e.to_string().starts_with("connect: "), "{e}");
@@ -2661,7 +2666,7 @@ fn probe_lines_classifies_real_sockets() {
     }
 
     let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR auth\n");
-    match probe_lines(&sock, "sessions", 0) {
+    match probe(&sock, "sessions", 0) {
         Probe::NoToken(path, _) => assert_eq!(path, dir.join("mock.sock.token")),
         other => panic!("no token on disk + ERR auth is NoToken, got {other:?}"),
     }
@@ -2669,28 +2674,25 @@ fn probe_lines_classifies_real_sockets() {
 
     std::fs::write(dir.join("mock.sock.token"), "deadbeef\n").expect("token");
     let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR auth\n");
-    assert!(matches!(
-        probe_lines(&sock, "sessions", 0),
-        Probe::AuthRejected
-    ));
+    assert!(matches!(probe(&sock, "sessions", 0), Probe::AuthRejected));
     assert_eq!(srv.join().expect("mock"), "sessions\n");
 
     let (sock, srv) = mock_instance(&dir, "mock.sock", b"OK 2\nalpha\r\nbeta\n");
-    match probe_lines(&sock, "sessions", 0) {
+    match probe(&sock, "sessions", 0) {
         Probe::Answered(lines) => assert_eq!(lines, vec!["alpha", "beta"]),
         other => panic!("OK 2 + two rows is Answered, got {other:?}"),
     }
     srv.join().expect("mock");
 
     let (sock, srv) = mock_instance(&dir, "mock.sock", b"OK 2\nalpha\n");
-    match probe_lines(&sock, "sessions", 0) {
+    match probe(&sock, "sessions", 0) {
         Probe::Other(e) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
         other => panic!("a truncated OK body is UnexpectedEof, got {other:?}"),
     }
     srv.join().expect("mock");
 
     let (sock, srv) = mock_instance(&dir, "mock.sock", b"ERR usage: sessions\n");
-    match probe_lines(&sock, "sessions", 0) {
+    match probe(&sock, "sessions", 0) {
         Probe::Replied(said) => {
             assert_eq!(said, "ERR usage: sessions");
             assert_eq!(
@@ -3501,7 +3503,9 @@ fn fleet_sessions_carry_the_ls_row_verbatim_and_the_self_marker_as_data() {
     assert!(!outside[0].is_self);
 }
 
-/// A sid two live instances both answer to shows up as a duplicate.
+/// A sid two live instances both answer to shows up as a duplicate. One
+/// instance listing a sid twice is not two claimants, and a row too short
+/// for a sid is skipped.
 #[test]
 fn a_sid_two_instances_both_serve_is_reported_as_ambiguous() {
     let rows = |pid, sids: &[&str]| {

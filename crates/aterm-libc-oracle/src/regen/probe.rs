@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The const-eval probes: ABI facts measured by the compiler for each triple.
-//!
-//! Each fact is a `const _: [(); 999999] = [(); <expr>];` line. The lengths
-//! mismatch, so the compiler REPORTS `<expr>`'s value in its E0308 diagnostic
-//! ("found one with a size of N") — measured even for a triple this box cannot
-//! execute. The probe never links and never runs. Three passes:
-//!
-//! 1. size and alignment of every named type, offset of every public field;
-//! 2. the bytes of each struct-valued constant (sized by pass 1);
-//! 3. size and alignment of every field type (the layout engine's input).
+//! Compiler const-eval ABI probes for target triples.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -40,7 +31,7 @@ path = "src/lib.rs"
 [workspace]
 "#;
 
-/// The probe crate's root: each cell's measurement module under its own cfg.
+/// The probe crate's root.
 #[must_use]
 pub fn lib_rs(cells: &[Cell]) -> String {
     cells
@@ -113,8 +104,7 @@ impl Probe {
         out
     }
 
-    /// Pair the compiler's reports (1-based line -> value) with this probe's
-    /// facts.
+    /// Pair the compiler's reports (1-based line -> value) with this probe's facts.
     ///
     /// # Errors
     /// The facts no report answered, when any.
@@ -167,8 +157,7 @@ pub fn types_and_offsets(decls: &Decls) -> Probe {
 /// Pass 2: the bytes of every constant whose value rustdoc does not state.
 ///
 /// # Errors
-/// When such a constant's type was not sized by pass 1, or a value is one the
-/// emitter cannot write.
+/// When a constant's type was not sized by pass 1, or its value cannot be parsed.
 pub fn constant_bytes(decls: &Decls, sizes: &BTreeMap<String, u64>) -> Result<Probe, String> {
     let mut probe = Probe::new();
     for constant in &decls.consts {
@@ -211,11 +200,10 @@ pub fn field_types(decls: &Decls) -> Probe {
     probe
 }
 
-/// What a probe line reports: the value an E0308 found in place of 999999.
+/// What a probe line reports.
 const FOUND: &str = "expected an array with a size of 999999, found one with a size of ";
 
-/// The values the compiler reported for `file`: each E0308 on a probe line,
-/// 1-based line -> the size found.
+/// The values the compiler reported for `file`.
 #[must_use]
 pub fn reported(errors: &[Diagnostic], file: &str) -> BTreeMap<usize, u64> {
     errors
@@ -230,8 +218,7 @@ pub fn reported(errors: &[Diagnostic], file: &str) -> BTreeMap<usize, u64> {
         .collect()
 }
 
-/// Why a probe measured less than it asked: the compiler's errors other than
-/// the measurements, else the end of cargo's stderr.
+/// Why a probe measured less than it asked.
 #[must_use]
 pub fn unmeasured_because(outcome: &Outcome) -> String {
     const SHOWN: usize = 5;

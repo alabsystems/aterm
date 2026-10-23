@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The repository verbs (design §10.2): `repo view` and `repo list`.
+//! Repository verbs: `repo view` and `repo list`.
 
 use super::args::Invocation;
 use super::verbs::Noun;
@@ -12,10 +12,9 @@ use crate::github::RepoListKind;
 use crate::policy::{Access, Named};
 use crate::slug::Slug;
 
-/// `agh repo view REPO`: the repository.
+/// `agh repo view REPO`.
 ///
 /// # Errors
-///
 /// The repository argument's, then the read's.
 pub(crate) fn repo_view(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
@@ -32,11 +31,9 @@ pub(crate) fn repo_view(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// `agh repo list OWNER [--type all|public|private|forks|sources]`: the owner's
-/// repositories, sorted by full name.
+/// `agh repo list OWNER [--type all|public|private|forks|sources]`.
 ///
 /// # Errors
-///
 /// Usage for a bad owner or `--type`; the listing's error.
 pub(crate) fn repo_list(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let owner = inv.require(0, "OWNER")?;
@@ -47,8 +44,6 @@ pub(crate) fn repo_list(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             .ok_or_else(|| inv.usage("--type wants all, public, private, forks or sources"))?,
     };
     let gh = ctx.github()?;
-    // An owner listing names no repository, so it carries no literal; a read never looks at
-    // `named` (plan §4.6.13).
     let how = inv.how(Access::Read, Named::Default);
     let listing = gh
         .repos()

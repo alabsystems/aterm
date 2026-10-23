@@ -8,14 +8,12 @@
 //! A [Glyph Substitution Table](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub)
 //! implementation.
 
-// A heavily modified port of https://github.com/harfbuzz/rustybuzz implementation
-// originally written by https://github.com/laurmaedje
-
 use crate::GlyphId;
 use crate::ggg::{ChainedContextLookup, ContextLookup, Coverage, LookupSubtable};
 use crate::parser::{FromSlice, LazyArray16, LazyOffsetArray16, Stream};
 
-/// A [Single Substitution Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#SS).
+/// A [Single Substitution
+/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#SS).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub enum SingleSubstitution<'a> {
@@ -61,8 +59,8 @@ impl<'a> SingleSubstitution<'a> {
     }
 }
 
-/// A sequence of glyphs for
-/// [Multiple Substitution Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#MS).
+/// A sequence of glyphs for [Multiple Substitution
+/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#MS).
 #[derive(Clone, Copy, Debug)]
 pub struct Sequence<'a> {
     /// A list of substitute glyphs.
@@ -81,7 +79,8 @@ impl<'a> FromSlice<'a> for Sequence<'a> {
 /// A list of [`Sequence`] tables.
 pub type SequenceList<'a> = LazyOffsetArray16<'a, Sequence<'a>>;
 
-/// A [Multiple Substitution Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#MS).
+/// A [Multiple Substitution
+/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#MS).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct MultipleSubstitution<'a> {
@@ -107,8 +106,8 @@ impl<'a> MultipleSubstitution<'a> {
     }
 }
 
-/// A list of glyphs for
-/// [Alternate Substitution Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#AS).
+/// A list of glyphs for [Alternate Substitution
+/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#AS).
 #[derive(Clone, Copy, Debug)]
 pub struct AlternateSet<'a> {
     /// Array of alternate glyph IDs, in arbitrary order.
@@ -127,7 +126,8 @@ impl<'a> FromSlice<'a> for AlternateSet<'a> {
 /// A set of [`AlternateSet`].
 pub type AlternateSets<'a> = LazyOffsetArray16<'a, AlternateSet<'a>>;
 
-/// A [Alternate Substitution Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#AS).
+/// A [Alternate Substitution
+/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#AS).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct AlternateSubstitution<'a> {
@@ -184,7 +184,8 @@ impl<'a> FromSlice<'a> for LigatureSet<'a> {
 /// A list of [`Ligature`] sets.
 pub type LigatureSets<'a> = LazyOffsetArray16<'a, LigatureSet<'a>>;
 
-/// A [Ligature Substitution Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#LS).
+/// A [Ligature Substitution
+/// Subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#LS).
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct LigatureSubstitution<'a> {
@@ -245,8 +246,8 @@ impl<'a> ReverseChainSingleSubstitution<'a> {
     }
 }
 
-/// A glyph substitution
-/// [lookup subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#table-organization)
+/// A glyph substitution [lookup
+/// subtable](https://docs.microsoft.com/en-us/typography/opentype/spec/gsub#table-organization)
 /// enumeration.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
@@ -269,10 +270,6 @@ impl<'a> LookupSubtable<'a> for SubstitutionSubtable<'a> {
             4 => LigatureSubstitution::parse(data).map(Self::Ligature),
             5 => ContextLookup::parse(data).map(Self::Context),
             6 => ChainedContextLookup::parse(data).map(Self::ChainContext),
-            // An extension wraps a real lookup type, never another
-            // extension (the spec forbids type 7 there). ttf-parser 0.25.1
-            // followed one that points at itself forever (measured: a
-            // release build spins, an 8-byte subtable).
             7 => crate::ggg::parse_extension_lookup(data, |data, kind| {
                 if kind == 7 {
                     None

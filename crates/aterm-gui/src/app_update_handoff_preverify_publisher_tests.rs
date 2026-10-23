@@ -4,9 +4,6 @@
 use super::{PreverifyPublisher, capture_exceeds_policy};
 use aterm_update_core::handoff_policy::{CarryCeiling, HandoffPolicy, PolicyFile, PolicyRead};
 
-/// The publisher and the park agree on the key because both take it from the ticket
-/// (`PreverifyPublisher::for_attempt`, `App::park_policy`); before any pass `known` is
-/// false, so the fork lane's worker checks the capture against the policy once read.
 #[test]
 fn the_worker_publishes_and_the_park_reads_by_the_same_ticket() {
     let app = crate::App::headless_for_test();
@@ -39,7 +36,6 @@ fn the_worker_publishes_and_the_park_reads_by_the_same_ticket() {
         "the launched lane's gate reads it too"
     );
 
-    // A pass for a policy-free candidate is known to ask nothing.
     PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
         .expect("an attempt names its artifact")
         .publish_policy_pass(&PolicyRead::Absent, running, "the test candidate");
@@ -47,9 +43,6 @@ fn the_worker_publishes_and_the_park_reads_by_the_same_ticket() {
     assert!(nothing.known && nothing.policy.is_none());
 }
 
-/// A fork-lane capture taken above the policy its worker then reads is never
-/// handed over: with no pass on record the lane parked at Full, and the policy
-/// read afterwards must refuse this capture, not just the next park.
 #[test]
 fn a_fork_capture_above_the_policy_read_after_it_is_refused() {
     let policy = |text: &str| Some(HandoffPolicy::parse(text).expect("schema 1"));
@@ -124,7 +117,6 @@ fn a_published_pass_carries_the_policy_to_the_park_by_the_attempt_s_key() {
         ),
         (target, COMMIT, artifact.as_str())
     );
-    // The key is the attempt's: another build, commit or artifact reads none.
     assert_eq!(app.handoff_policy_for(target + 1, COMMIT, &artifact), None);
     assert_eq!(
         app.handoff_policy_for(target, &"f".repeat(40), &artifact),
@@ -135,8 +127,6 @@ fn a_published_pass_carries_the_policy_to_the_park_by_the_attempt_s_key() {
         None
     );
 
-    // Several rescues: the park follows the `[[ranges]]` entry naming this build
-    // (relaxed Land gate, at Full), not the top-level hull above the list.
     let earlier = running.saturating_sub(5);
     let ranged = PolicyRead::Parsed(
         PolicyFile::parse(&format!(
@@ -155,8 +145,6 @@ fn a_published_pass_carries_the_policy_to_the_park_by_the_attempt_s_key() {
     assert_eq!(park.carry_ceiling(), CarryCeiling::Full);
     assert!(park.relaxes_land_gate());
 
-    // A policy that cannot be followed, or is for other builds, still publishes
-    // the pass, with no policy.
     let other = running.wrapping_add(7);
     for read in [
         PolicyRead::Ignored("not TOML".to_string()),

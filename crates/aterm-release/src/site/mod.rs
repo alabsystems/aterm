@@ -228,6 +228,8 @@ pub struct Env {
 }
 
 /// `publish/site.toml` under `repo`: none is no settings; one that does not parse (a
+/// typo'd key among them) is an error naming the file, never silently no settings.
+///
 /// # Errors
 /// The file exists and cannot be read or parsed.
 fn settings(repo: &Path) -> Result<Settings, String> {

@@ -256,12 +256,15 @@ impl StepAudit {
     }
 }
 
-/// The function half of an entry id (`"<machine>::<action> @ <fn>"`).
+/// The function half of an entry id (`"<machine>::<action> @ <fn>"`). A window observes functions,
+/// not anchors (two anchors on one fn always fire together), so the sets of
+/// [`StepAudit::interchangeable`] and the keys of [`StepAudit::entered_under`] are this half.
 fn fn_of(entry_id: &'static str) -> &'static str {
     entry_id.rsplit_once(" @ ").map_or(entry_id, |(_, f)| f)
 }
 
-/// Cross `machine`'s linked anchors with a per-step ledger.
+/// Cross `machine`'s linked anchors with a per-step ledger. `machine` is resolved with
+/// [`machine_matches`], so the caller may spell it the way the anchors do.
 #[cfg_attr(trust_verify, trust::skip)]
 fn audit_steps(machine: &str, steps: &[StepRecord]) -> StepAudit {
     let linked: Vec<&'static RefinementAnchor> = refinements()
@@ -526,6 +529,8 @@ type Registered = (
 );
 
 /// Every registered model by name: each one a `ty_model!` or `#[model]` registers, and each one a
+/// `#[liveness]` obligation is stated over, so no obligation's model escapes the sweeps.
+///
 /// # Panics
 ///
 /// When two different models share a name.
@@ -820,7 +825,8 @@ pub fn check_closure(modules: &[SpecModule]) -> ClosureReport {
 mod tests {
     use super::*;
 
-    /// A synthetic anchor.
+    /// A synthetic anchor. `entry_id` is spelled exactly as the `#[refines]` macro
+    /// spells it, because `fn_of` splits on that shape.
     fn synth(
         action: &'static str,
         method: &'static str,

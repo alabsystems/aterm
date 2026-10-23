@@ -269,7 +269,11 @@ fn a_consenting_seed_puts_bin_on_path_and_answers_targo() {
     }
 }
 
-/// ONE STORE WHATEVER `$XDG_DATA_HOME` SAYS (docs/TOOLCHAIN-PACKAGE-MANAGER.md §10).
+/// ONE STORE WHATEVER `$XDG_DATA_HOME` SAYS (docs/TOOLCHAIN-PACKAGE-MANAGER.md §10). The
+/// variable set in a shell rc is missing from a desktop launcher's or an ssh session's
+/// environment, so the installer's seed sees it and the window's seed does not: both must
+/// lay the one store under `HOME` and leave the hook naming its `bin/`, never a second,
+/// empty store the hooks move to (and a multi-GB set downloaded twice).
 #[test]
 fn the_store_and_its_hook_do_not_follow_xdg_data_home() {
     needs_a_pinned_root();
@@ -519,7 +523,11 @@ fn an_unattended_targo_answers_once_trust_lands_without_it() {
     line_with(&rx, "trust is installed, and it has no command named targo");
 }
 
-/// A STUB RUN BEFORE THE PASS BEGINS WAITS FOR IT.
+/// A STUB RUN BEFORE THE PASS BEGINS WAITS FOR IT. The window's first-run seed promises the
+/// update it spawns next (`pass-owed.json`, the window its owner), so an unattended `targo`
+/// run in the seconds before that update writes `progress.json` waits for trust instead of
+/// exiting 127; the update begins, plans and retires the promise, trust lands, and the
+/// command runs.
 #[test]
 fn an_unattended_targo_waits_for_the_pass_the_window_seed_promised() {
     needs_a_pinned_root();
@@ -860,7 +868,11 @@ fn window_seed(fx: &Fixture, spawner: u32) {
     assert!(fx.layout.pass_owed_file().is_file(), "{}", describe(&out));
 }
 
-/// A TYPED UPDATE LEAVES A WINDOW SEED'S PROMISE TO THAT WINDOW'S UPDATE.
+/// A TYPED UPDATE LEAVES A WINDOW SEED'S PROMISE TO THAT WINDOW'S UPDATE. `aterm pkg update`
+/// typed between the window's seed and the update the window spawns returns without planning
+/// the set (here its index cannot be resolved); the promise is not its own, nor its
+/// spawner's, so it stands — a stub waiting on it keeps waiting for the window's update —
+/// and the window's update, whose spawner holds it, retires it when it returns.
 #[test]
 fn a_typed_update_leaves_a_window_seeds_promise_to_that_window() {
     needs_a_pinned_root();
@@ -892,7 +904,9 @@ fn a_typed_update_leaves_a_window_seeds_promise_to_that_window() {
     );
 }
 
-/// A PROMISE ENDS WITH ITS OWNER, NOT WITH ITS PID.
+/// A PROMISE ENDS WITH ITS OWNER, NOT WITH ITS PID. The promise records its owner's start
+/// time; when the owner's pid names another process — a window that crashed, its pid taken —
+/// a stub waiting on it answers 127 at once rather than at the deadline.
 #[test]
 fn a_promise_whose_owner_pid_is_another_process_keeps_nobody_waiting() {
     needs_a_pinned_root();
@@ -921,7 +935,11 @@ fn a_promise_whose_owner_pid_is_another_process_keeps_nobody_waiting() {
     line_with(&rx, "nothing is installing right now");
 }
 
-/// A PENDING STUB SAYS WHETHER A PERSON ASKED.
+/// A PENDING STUB SAYS WHETHER A PERSON ASKED. Its bump names the program either way —
+/// every reader that orders work by it sees the same name — and a stub that has no terminal
+/// on stdin and stderr (a script, an agent's tool call) marks its line unattended, so its
+/// agent never jumps the toolchain's bytes; on a terminal (a pseudo-terminal here, which
+/// `isatty` cannot tell from a person's) the line is the plain name a person's always was.
 #[test]
 fn a_pending_stub_says_whether_a_person_asked() {
     use std::os::fd::{FromRawFd as _, OwnedFd};

@@ -8,8 +8,7 @@
 // ../../LICENSE-FONTATIONS), modified by the aterm project in 2026. The rest
 // of this file is aterm's.
 
-//! The face as the hinter reads it: skrifa's outline collection and font
-//! attributes over aterm-font's tables.
+//! The face as the hinter reads it: skrifa's outline collection and font attributes.
 
 use super::charmap::Charmap;
 use super::fixed::{F2Dot14, Fixed};
@@ -44,8 +43,7 @@ pub(crate) enum OutlineGlyph<'a> {
 }
 
 impl<'a> HintFont<'a> {
-    /// The face, if aterm-font reads it and it has `glyf` (preferred, as
-    /// skrifa does) or CFF/CFF2 outlines.
+    /// The face, if aterm-font reads it and it has `glyf` or CFF/CFF2 outlines.
     pub(crate) fn new(data: &'a [u8], index: u32) -> Option<Self> {
         let face = Face::parse(data, index).ok()?;
         let raw = face.raw_face();
@@ -64,20 +62,15 @@ impl<'a> HintFont<'a> {
         if glyf.is_none() && !has_cff {
             return None;
         }
-        // head's fixed fields (54 bytes), unitsPerEm at 18.
         if head.len() < 54 {
             return None;
         }
         let units_per_em = i32::from(read_u16(head, 18)?);
-        // maxp's numGlyphs, 0 without one (styles) or u16::MAX (charmap
-        // enumeration limit).
         let maxp_glyphs = table(b"maxp")
             .filter(|maxp| maxp.len() >= 6)
             .and_then(|maxp| read_u16(maxp, 4));
         let glyph_count = u32::from(maxp_glyphs.unwrap_or_default());
         let charmap = Charmap::new(table(b"cmap"), u32::from(maxp_glyphs.unwrap_or(u16::MAX)));
-        // skrifa's `Attributes`: italic or oblique from OS/2 (version 0's
-        // 78 bytes), else italic from head's macStyle.
         let is_italic = match table(b"OS/2").filter(|os2| os2.len() >= 78) {
             Some(os2) => read_u16(os2, 62)? & (0x0001 | 0x0200) != 0,
             None => read_u16(head, 44)? & 0x0002 != 0,
@@ -117,8 +110,7 @@ impl<'a> HintFont<'a> {
         self.face.tables().gsub
     }
 
-    /// The `GSUB` table's length in bytes (0 without one): what its walks
-    /// may spend ([`crate::work::LayoutWork`]).
+    /// The `GSUB` table's length in bytes (0 without one).
     pub(crate) fn gsub_len(&self) -> usize {
         self.face
             .raw_face()
@@ -131,9 +123,7 @@ impl<'a> HintFont<'a> {
         super::location::location(self.fvar, self.avar, settings)
     }
 
-    /// The glyph's outline source: `None` for a `glyf` glyph `loca` cannot
-    /// place; a CFF glyph is always one (its charstring is read when drawn),
-    /// as in skrifa.
+    /// The glyph's outline source: `None` for a `glyf` glyph `loca` cannot place.
     pub(crate) fn outline(&self, glyph_id: GlyphId) -> Option<OutlineGlyph<'a>> {
         if let Some(glyf) = &self.glyf {
             let gid = u16::try_from(glyph_id.to_u32()).ok()?;
@@ -142,8 +132,7 @@ impl<'a> HintFont<'a> {
         self.has_cff.then_some(OutlineGlyph::Cff(glyph_id))
     }
 
-    /// Draws the glyph's unscaled outline (font units, contours marked)
-    /// at `coords` into `sink` (skrifa's `OutlineGlyph::draw_unscaled`).
+    /// Draws the glyph's unscaled outline at `coords` into `sink`.
     pub(crate) fn draw_unscaled(
         &self,
         glyph: &OutlineGlyph,
@@ -197,9 +186,6 @@ impl<'a> HintFont<'a> {
                     Err(crate::CFFError::NoGlyph)
                 };
                 match drawn {
-                    // A glyph that draws nothing (a space) is an empty
-                    // outline to skrifa, not a failure; aterm-font's
-                    // interpreter reports it as a zero bounding box.
                     Ok(_) | Err(crate::CFFError::ZeroBBox) => {}
                     Err(_) => return Err(DrawError::Read),
                 }
@@ -233,10 +219,6 @@ impl PendingElement {
 /// to 1/64 and truncated to a font unit (read-fonts' `TransformSink`
 /// without a scale or `FontMatrix`), then degenerate moves and zero-length
 /// lines dropped (its `NopFilterSink`), into the hinter's point adapter.
-///
-/// aterm-font's interpreter computes in `f32`; each value is taken back to
-/// 16.16 by rounding, which is exact for every integer and every value a
-/// 16-bit fraction holds below 256 units.
 struct CffUnscaled<'a, 'b, T> {
     is_open: bool,
     start: Option<[i32; 2]>,
@@ -305,7 +287,6 @@ impl<T: UnscaledOutlineSink> OutlineSink for CffUnscaled<'_, '_, T> {
 
     fn line_to(&mut self, x: f32, y: f32) {
         let (x, y) = (Self::unit(x), Self::unit(y));
-        // Omit the line if we are already at the given position.
         if self
             .pending_element
             .map(|element| element.target_point() == [x, y])
@@ -318,7 +299,6 @@ impl<T: UnscaledOutlineSink> OutlineSink for CffUnscaled<'_, '_, T> {
     }
 
     fn quad_to(&mut self, _: f32, _: f32, x: f32, y: f32) {
-        // CFF has no quadratic segments; a line keeps the contour closed.
         self.line_to(x, y);
     }
 

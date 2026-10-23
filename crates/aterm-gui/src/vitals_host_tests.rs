@@ -1742,7 +1742,8 @@ fn only_a_windowless_whole_reading_makes_the_engine_look() {
     assert!(!read_req(&rx, "the bars' reading").jobs_now);
 }
 
-/// A job at rest on a real terminal.
+/// A job at rest on a real terminal. An in-place helper owns and reaps the
+/// job, as its shell would.
 #[cfg(target_os = "macos")]
 struct JobAtRest {
     master: Option<std::os::fd::OwnedFd>,
@@ -1903,7 +1904,8 @@ impl JobAtRest {
         self.ended
     }
 
-    /// A test App whose sink borrows the master.
+    /// A test App whose sink borrows the master. Its session's own master
+    /// stays the stub's -1, so App's drop signals nothing.
     fn app(&self, board: &'static JobsBoard) -> (crate::App, Receiver<Msg>) {
         let sink = Arc::new(aterm_session::sink::SinkWriter::new(self.master()));
         let mut app = crate::App::headless_for_test_with_sink(sink);
@@ -1933,7 +1935,8 @@ impl Drop for JobAtRest {
     }
 }
 
-/// Only the owned helper reexec runs this body.
+/// Only the owned helper reexec runs this body. It owns the unreaped job's
+/// handle, so signals never adopt an arbitrary foreground pid/group.
 #[cfg(target_os = "macos")]
 #[test]
 fn job_at_rest_leader() {

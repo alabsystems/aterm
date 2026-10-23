@@ -103,6 +103,9 @@ mod tests {
     use aterm_uds::CtlStream;
     use std::io::Write as _;
 
+    /// A reader may start after its peer is gone: a forward that found no
+    /// token closed before the sibling's thread accepted it. Darwin then
+    /// refuses any socket option on the reading end (`EINVAL`), yet what the
     /// peer wrote and its end are there to be read.
     #[test]
     fn an_end_whose_peer_already_closed_reads_to_its_end_of_file() {

@@ -67,7 +67,8 @@ impl fmt::Display for EkuError {
 
 impl std::error::Error for EkuError {}
 
-/// The peer sent bytes that are not a parseable certificate.
+/// The peer sent bytes that are not a parseable certificate. Reported before
+/// any chain evaluation: not a trust verdict.
 #[cfg(any(target_vendor = "apple", windows))]
 const fn bad_encoding() -> rustls::Error {
     rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
@@ -118,7 +119,9 @@ impl fmt::Display for ServiceUnanswered {
 #[cfg(target_vendor = "apple")]
 impl std::error::Error for ServiceUnanswered {}
 
-/// See [`ServiceUnanswered`].
+/// See [`ServiceUnanswered`]. `rustls::Error::Other`, not `InvalidCertificate`:
+/// nothing is known to be wrong with the certificate, and rustls would print
+/// the latter as "invalid peer certificate".
 #[cfg(target_vendor = "apple")]
 fn service_unanswered() -> rustls::Error {
     rustls::Error::Other(rustls::OtherError(Arc::new(ServiceUnanswered)))

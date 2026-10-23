@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Power settings per profile: `pmset -c` (AC) and `pmset -b` (battery), read back per section of `pmset -g custom` (design §1.15, §5.1).
-//!
-//! `pmset -a` would write the battery profile too, so a laptop told `sleep 0` would stay
-//! awake on battery; each profile is therefore written on its own. Measured in the desktop-
-//! form macOS 27.0 VM, as root over SSH: `pmset -g custom` prints only an `AC Power:`
-//! section; `pmset -b sleep 5` exits 0 and changes nothing; `pmset -c womp 1` and
-//! `pmset -c autorestart 1`, for keys the VM lacks, exit 0 and change nothing. A write that
-//! exits 0 is therefore no evidence, and so:
-//!
-//! * a profile `pmset -g custom` does not print is [`Probe::NotApplicable`];
-//! * a key its section does not print is [`Probe::NotApplicable`];
-//! * `autorestart` additionally needs `pmset -g cap` to list it (design §5.1).
+//! Per-profile power management (`pmset -c` for AC and `pmset -b` for battery).
 
 use super::{Ctx, Item};
 use crate::model::Probe;
@@ -208,10 +197,7 @@ const TCP_KEEPALIVE: Setting = Setting {
     title: "TCP keepalive while asleep",
 };
 
-/// The sections of `pmset -g custom`: each `<Name> Power:` header and its `key value` rows.
-///
-/// A key is everything before a row's last word (`Sleep On Power Button 1`), so names
-/// with spaces survive.
+/// Parse `pmset -g custom` output into `(section_name, Vec<(key, value)>)` pairs.
 #[must_use]
 pub fn parse_custom(text: &str) -> Vec<(String, Vec<(String, String)>)> {
     let mut out: Vec<(String, Vec<(String, String)>)> = Vec::new();
@@ -597,7 +583,6 @@ AC Power:
             Some("/usr/bin/pmset -c displaysleep 10")
         );
 
-        // The battery profile is written with -b, and its read-back is its own section.
         let after = with_row(LAPTOP_CUSTOM, "Battery Power", "sleep", "10");
         let (row, calls) =
             apply_on_laptop("power.battery.sleep", "/usr/bin/pmset -b sleep 10", &after);
@@ -617,8 +602,6 @@ AC Power:
 
     #[test]
     fn a_write_to_one_section_is_not_mistaken_for_the_other() {
-        // `pmset -b sleep 10` "worked" but only the AC section changed: the battery read-back
-        // still says 1, so the item fails.
         let after = with_row(LAPTOP_CUSTOM, "AC Power", "sleep", "10");
         let (row, _) = apply_on_laptop("power.battery.sleep", "/usr/bin/pmset -b sleep 10", &after);
         assert_eq!(row.outcome, Outcome::Failed);
@@ -626,7 +609,6 @@ AC Power:
 
     #[test]
     fn a_write_pmset_accepted_but_did_not_keep_fails_its_read_back() {
-        // `pmset -c displaysleep 15` exits 0, and the section still says 0.
         let sys = Fake::root();
         sys.on("/usr/bin/pmset -g custom", Ran::ok(VM_CUSTOM))
             .on("/usr/bin/pmset -c displaysleep 15", Ran::ok(""));

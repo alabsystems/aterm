@@ -55,7 +55,8 @@ fn run(program: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// `link` made a junction to `target` with `cmd /C mklink /J`.
+/// `link` made a junction to `target` with `cmd /C mklink /J`. `mklink`
+/// refuses the verbatim spelling, so the plain one is passed.
 fn junction(link: &Path, target: &Path) {
     run("cmd", &["/C", "mklink", "/J", &plain(link), &plain(target)]);
 }
@@ -706,7 +707,10 @@ fn is_cloud_tag(tag: u32) -> bool {
 /// `FILE_ATTRIBUTE_REPARSE_POINT`.
 const REPARSE_POINT: u32 = 0x0400;
 
-/// A REAL SYNC ROOT, ITS PLACEHOLDERS KEPT.
+/// A REAL SYNC ROOT, ITS PLACEHOLDERS KEPT. A scratch folder registered as a
+/// cloud sync root (`CfRegisterSyncRoot`, as OneDrive registers its folder;
+/// no provider connected) holds a cargo-shaped tree made placeholders, as a
+/// sync client leaves what it uploaded.
 #[test]
 fn a_real_sync_roots_placeholders_are_kept_and_the_root_is_never_pinned() {
     let tmp = scratch();

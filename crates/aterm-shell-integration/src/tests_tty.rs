@@ -7,7 +7,8 @@
 #[cfg(unix)]
 const UNFIXED_REV: &str = "00000000000000aa";
 
-/// The call sites that arm the fix, per script.
+/// The call sites that arm the fix, per script. Cutting exactly these yields the unfixed
+/// script in everything that matters here.
 #[cfg(unix)]
 const ZSH_TTY_CALLS: [&str; 2] = [
     "    (( __aterm_tty_armed )) || __aterm_tty_arm\n",
@@ -528,7 +529,12 @@ fn an_integrated_zsh_whose_rc_broke_the_tty_runs_its_first_command_sane() {
 const ZSH_FIRST_INTR_CALL: &str =
     "        zle -F $__aterm_tty_probe_fd __aterm_tty_probe_ready 2>/dev/null\n";
 
-/// The key typed right after a Ctrl-C at a zsh prompt.
+/// The key typed right after a Ctrl-C at a zsh prompt. zsh 5.9's line editor
+/// looks for an interrupt only between keys (`zlecore`'s loop, then
+/// `getbyte`'s blocking `read`, zle_main.c): a SIGINT it takes after that look
+/// and before the read — the ^C landing while the editor is still busy, which
+/// load makes likely — ends the line only when one more byte arrives, and a
+/// ^C flushes the bytes typed ahead of it.
 #[cfg(unix)]
 const ZLE_INTR_WAKE: &[u8] = b" ";
 

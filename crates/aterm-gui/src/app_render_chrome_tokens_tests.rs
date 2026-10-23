@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The authored chrome colours (`accent_color`, `active_tab_color`,
-//! `border_color`) reach every surface that draws them, through the real
-//! paint paths of a headless App. `search_match_color` is the find splice's
-//! (`app_render_find_bar_splice_tests.rs`).
+//! Tests that authored chrome color tokens reach every surface that paints them.
 
 use super::*;
 use crate::app_colorscheme::ThemeChange;
@@ -40,8 +37,6 @@ fn drawn(config: &str) -> Drawn {
     let wid = WindowId(0);
     app.config = aterm_toml::from_str(config).expect("valid toml");
     app.install_resolved_colors(ThemeChange::ConfigReload);
-    // The in-grid strip with two tabs (a lone tab is a title, no card), through
-    // its splice.
     app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
     app.tab_strip_rows = 1;
     app.splice_tab_strip_with(wid, 1);
@@ -49,8 +44,6 @@ fn drawn(config: &str) -> Drawn {
         .iter()
         .map(|cell| (cell.bg, cell.underline_color))
         .collect();
-    // A two-pane split, composed, its window without the keyboard: no ring, so
-    // the whole gap shows the seam.
     app.tab_strip_rows = 0;
     let _ = app.split_active_stub_tab(wid);
     app.windows.get_mut(&wid).expect("window").focused = false;
@@ -63,8 +56,6 @@ fn drawn(config: &str) -> Drawn {
             .is_some(),
         "the split composes"
     );
-    // Every cell's ground, and a hairline's ink (the Fluent gap is the
-    // terminal's ground with the seam drawn in it, `crate::pane_chrome`).
     let composed = app.windows[&wid]
         .input_scratch
         .cells
@@ -117,8 +108,6 @@ fn authored_chrome_reaches_every_surface() {
         "the selected tab is the authored colour: {:?}",
         authored.strip
     );
-    // A chip-card band (every platform but macOS) marks the selection by its
-    // filled card alone and draws no rule under it (`tab_bar::strip_cell`).
     assert_eq!(
         authored.strip.iter().any(|(_, rule)| *rule == Some(ACCENT)),
         !crate::tab_bar::STRIP_CHIP_CARDS,

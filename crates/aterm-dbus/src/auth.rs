@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The client half of the SASL handshake, EXTERNAL only: the server checks the
-//! uid this side claims against the socket's peer credentials.
-//!
-//! The exchange is zbus's over a socket that passes no descriptors (its TCP
-//! transport, `tests/recorded/zbus-5.16.0-session.tsv`): a NUL byte, then
-//! `AUTH EXTERNAL <hex of the decimal uid>`, the server's `OK <guid>`, then
-//! `BEGIN`. aterm-dbus never sends `NEGOTIATE_UNIX_FD`: it reads with plain
-//! `read(2)`, so a descriptor sent to it would be lost, and a bus that has not
-//! agreed to pass descriptors refuses to route one here.
+//! Client-side SASL EXTERNAL handshake without `NEGOTIATE_UNIX_FD`.
 
 use crate::error::{Error, Result};
 
@@ -28,13 +20,11 @@ pub fn first(uid: u32) -> Vec<u8> {
     out
 }
 
-/// The server's answer to `AUTH`, one line without its `\r\n`: the server's
-/// GUID when it accepted.
+/// Parses the server's `AUTH` response line (without `\r\n`) and returns its GUID.
 ///
 /// # Errors
 ///
-/// [`Error::Auth`] for `REJECTED`, `ERROR`, a `DATA` challenge (EXTERNAL with
-/// an initial response needs none), or a line outside the protocol.
+/// [`Error::Auth`] for `REJECTED`, `ERROR`, a `DATA` challenge, or a malformed line.
 pub fn answer(line: &[u8]) -> Result<String> {
     let text =
         std::str::from_utf8(line).map_err(|_| Error::Auth("server line is not UTF-8".into()))?;

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `await sys` on a board of the test's own ([`Shelf::new`]), with scripted
-//! readers: no test reaches a real volume. Every wait for something that must
-//! happen is bounded by the one-minute hang detector; none asserts how fast.
+//! `await sys` on a board of the test's own ([`Shelf::new`]), with scripted readers: no test
+//! reaches a real volume.
 
 use super::*;
 use std::sync::Arc;
@@ -368,7 +367,6 @@ fn a_stalled_watch_is_reported_only_while_it_runs() {
     shelf.publish(|b| b.watch = Watch::Suspended);
     let reply = run_in(&shelf, "sys free>=30GiB timeout=50", &owner(), &world);
     assert_eq!(reply, "OK timeout\n");
-    // A wait with no demand needs no detector: a `disk=` wait times out.
     shelf.publish(|b| b.watch = Watch::Running { beat: old });
     let reply = run_in(&shelf, "sys disk=ok timeout=50", &owner(), &world);
     assert_eq!(reply, "OK timeout\n");
@@ -431,7 +429,6 @@ fn a_room_that_is_not_known_is_unavailable() {
 /// A volume the watch's look left off the board (no session works there now)
 /// is read by the parked wait itself, which goes on — never `why=unreadable`
 /// while the volume reads — its row carrying the owner's lines and no room.
-/// NEGATIVE CONTROL: a reading at that path of ANOTHER volume is unreadable.
 #[test]
 fn a_wait_whose_row_a_look_dropped_reads_the_volume_itself() {
     let data = abs("/System/Volumes/Data");
@@ -491,9 +488,6 @@ fn a_wait_whose_row_a_look_dropped_reads_the_volume_itself() {
     );
     assert_eq!(reply, "ERR unavailable free why=unreadable\n");
 
-    // A path may now name a different volume while the board still holds
-    // its old row. Arming reads the new volume with its own lines and no
-    // inherited room or permission to reclaim there.
     let stale = Instant::now() - (FRESH + Duration::from_secs(1));
     let shelf = shelf_at(20 * GIB);
     shelf.publish(|b| {
@@ -517,9 +511,6 @@ fn a_wait_whose_row_a_look_dropped_reads_the_volume_itself() {
     assert_eq!(new.thresholds, default_lines(&new.reading));
     assert!(shelf.board_lock().demands.is_empty());
 
-    // A parked wait is bound to its original volume. A captured hangup on
-    // the second check terminates the unfixed refresh loop deterministically;
-    // neither case waits for a timeout or a real mount change.
     let checks = std::cell::Cell::new(0);
     let hung_up = || {
         let n = checks.get() + 1;
@@ -545,7 +536,6 @@ fn a_wait_whose_row_a_look_dropped_reads_the_volume_itself() {
     assert_eq!(reply, "ERR unavailable free why=unreadable\n");
     assert!(shelf.board_lock().row_keyed(&VolumeKey::Fsid(9)).is_none());
 
-    // The same stale-row refresh for the original volume still latches.
     let shelf = shelf_at(GIB);
     shelf.publish(|b| b.volumes[0].as_of = stale);
     checks.set(0);
@@ -572,8 +562,6 @@ fn a_wait_whose_row_a_look_dropped_reads_the_volume_itself() {
 /// spelling of that very spelling is kept for it — one kept that places on
 /// no row yet included. A tab a look mapped reads its row's mount, as it
 /// did before spellings were kept, and costs its wait no file-system call.
-/// NEGATIVE CONTROLS: an unmapped tab, and a spelled one once it moved, are
-/// owed a spelling.
 #[test]
 fn a_wait_spells_only_a_tab_the_board_places_nowhere() {
     let (short, moved, long) = if cfg!(windows) {
@@ -607,9 +595,6 @@ fn a_wait_spells_only_a_tab_the_board_places_nowhere() {
 /// answers from the row the watch measured there: `free>=room` is met on
 /// its room, a demand from that tab registers on its `reclaimed_here`, and
 /// the row keeps both, so another tab's `free>=room` is met after it.
-/// PREMISES: the long spelling places on the row, the short one on none.
-/// NEGATIVE CONTROL (by hand): a `fresh` that builds the reading's row from
-/// nothing answers `why=room-unknown` and the demand `why=not-reclaimed`.
 #[cfg(windows)]
 #[test]
 fn an_8_3_spelling_carries_on_its_volumes_row() {

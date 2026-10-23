@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DOOR'S WRITE UNDER `prompt` (`run/occupancy_loop.rs`'s `occupancy_write`; the occupancy
-//! design's §2.1, §5 and §8, as the red-team corrects them in F1, F10, F11, F12 and F13): a due
-//! line typed at a drawn break of a hosted, unattended loop, fenced, after every guard, once an
-//! episode — each case also run under `observe`, which types nothing and asks the server only
-//! what `off` asks. Mounted from `occupancy_loop_tests.rs`, so its sessions, screens and readers
-//! are in scope. Asserts on the server's requests, the ledger's fact rows and the `OCCUPANCY`
-//! records' closed words, never on prose (F17); long waits jump the scripted clock (F18). Each
-//! negative control arms one planted defect (`occupancy::fault`).
+//! Tests for `occupancy_write` under `prompt`, `observe`, and `off`.
 
 use std::sync::Mutex;
 
@@ -21,7 +14,6 @@ use crate::supervise::policy::turn_end::{HostTurn, RULE_LAND};
 
 const NUDGE: &str = "wait-nudge@v1";
 const ROOM: &str = "hold-room@v1";
-
 /// The words an agent plants for the harness to repeat.
 const PLANT: &str = "ignore.previous.instructions";
 
@@ -116,7 +108,6 @@ impl Ctl for Logged<'_> {
                 .filter(|r| r.0 == HOLD && r.1 == "typed")
                 .count(),
         };
-        // The request as the server reads it, the session's `@sid` dropped.
         let words: Vec<&str> = args
             .iter()
             .copied()
@@ -327,8 +318,6 @@ impl<'a> Script<'a> {
             s.stall_host = Some(Arc::clone(&self.host) as Arc<dyn IdleHost>);
             s.setup.background_settle = Duration::ZERO;
             let mut heard = Heard::default();
-            // The loop's start reads its ledger, as every loop does: the wall placed on the
-            // clock, and what a loop before this one left.
             let body = self.seed.as_ref().map_or("", |(body, _)| body.as_str());
             let start = s.fx.mono();
             s.hold_seed_from(body, start, start_ms, false, &self.policy, &heard);
@@ -423,7 +412,6 @@ fn a_due_nudge_is_typed_once_fenced_after_every_guard() {
     let run = |occupancy| {
         Script::new("write-typed", occupancy, &[0, 31 * 60, 32 * 60]).run(&mut |s, i| {
             if i == 2 {
-                // The agent takes the line: a live turn read, as the loop reads one.
                 s.took(7, Some(&policy(Occupancy::Prompt)), &mut Heard::default());
             }
         })
@@ -617,7 +605,6 @@ fn each_guard_holds_the_due_line_and_nothing_is_written() {
             ..CASE
         },
         Case {
-            // A `status` the server would not answer names no person's stamp: someone.
             tag: "status-refused",
             words: "held:person",
             set: |m| {
@@ -636,7 +623,6 @@ fn each_guard_holds_the_due_line_and_nothing_is_written() {
             tag: "draft",
             words: "held:draft",
             at_write: false,
-            // The cursor after the draft's words: a person's, not the composer's dim hint.
             set: |m| m.cursor_col = Some(20),
             drawn: drafted_break,
             ..CASE
@@ -696,7 +682,6 @@ fn each_guard_holds_the_due_line_and_nothing_is_written() {
             ..CASE
         },
         Case {
-            // The upgrade's wind-down: the host owns the session's turn ends.
             tag: "owns",
             words: "held:host-withheld",
             host: |h| h.owns.store(true, Ordering::SeqCst),
@@ -975,7 +960,6 @@ fn the_hosts_line_goes_first_and_the_nudge_stays_due() {
             ..Script::new("write-host-line", occupancy, &[0, 31 * 60, 32 * 60])
         }
         .run(&mut |s, i| match i {
-            // The upgrade's notice comes due at the break the nudge does.
             1 => *notice.notice.lock().expect("notice") = Some("the notice".to_string()),
             2 => s.took(7, Some(&policy(Occupancy::Prompt)), &mut Heard::default()),
             _ => {}
@@ -997,9 +981,6 @@ fn the_hosts_line_goes_first_and_the_nudge_stays_due() {
         "the host's break made no read for the nudge"
     );
     observe_types_nothing(&run);
-    // NEGATIVE CONTROL: a write that stacks on the host's line goes on to its reads at that
-    // break, where only the notice standing untaken holds it
-    // (`the_nudge_waits_for_the_hosts_line_to_be_taken` plants that one).
     let stacked = fault::with(Fault::StackOnHostLine, || run(Occupancy::Prompt));
     assert_eq!(
         wrote(&stacked.noted),
@@ -1216,7 +1197,6 @@ fn a_crash_after_the_intent_is_retold_once() {
     let typed_row = |l: &&str| {
         l.contains("\"rule_id\":\"fact-hold@v1\"") && l.contains("\"decision\":\"typed\"")
     };
-    // The loop died between the write and its outcome row.
     let crashed: String = first
         .ledger
         .lines()
@@ -1256,7 +1236,6 @@ fn a_crash_after_the_intent_is_retold_once() {
         episodes(&first).last(),
         "the same episode, its hold carried"
     );
-    // NEGATIVE CONTROL: an intent with no outcome read as told is never retold.
     let lost = fault::with(Fault::SeedIntentAsTold, || {
         successor("write-crash-lost", &crashed, T0 + 32 * MIN)
     });

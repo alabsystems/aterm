@@ -14,7 +14,7 @@ use super::{
 };
 use crate::jobs::GateWord;
 
-/// Page-wait milliseconds attributed to one page fault.
+/// Page-wait milliseconds attributed to one page-in.
 pub const PAGEIN_WAIT_MS: u64 = 1;
 
 /// Channel that produced a progress event.

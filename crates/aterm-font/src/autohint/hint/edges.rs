@@ -8,10 +8,6 @@
 // See ../../../LICENSE-FONTATIONS for the upstream license.
 
 //! Edge hinting.
-//!
-//! Let's actually do some grid fitting. Here we align edges to the pixel
-//! grid. This is the final step before applying the edge adjustments to
-//! the original outline points.
 
 use super::super::{
     metrics::{
@@ -22,10 +18,6 @@ use super::super::{
 };
 
 /// Main Latin grid-fitting routine.
-///
-/// Note: this is one huge function in FreeType, broken up into several below.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2999>
 pub(crate) fn hint_edges(
     axis: &mut Axis,
     metrics: &ScaledAxisMetrics,
@@ -36,9 +28,7 @@ pub(crate) fn hint_edges(
     if axis.dim != Dimension::Vertical {
         top_to_bottom_hinting = false;
     }
-    // First align horizontal edges to blue zones if needed
     let anchor_ix = align_edges_to_blues(axis, metrics, group, scale);
-    // Now align the stem edges
     let (serif_count, anchor_ix) = align_stem_edges(
         axis,
         metrics,
@@ -48,19 +38,14 @@ pub(crate) fn hint_edges(
         anchor_ix,
     );
     let edges = axis.edges.as_mut_slice();
-    // Special case for lowercase m
     if axis.dim == Dimension::Horizontal && (edges.len() == 6 || edges.len() == 12) {
         hint_lowercase_m(edges, group);
     }
-    // Handle serifs and single segment edges
     if serif_count > 0 || anchor_ix.is_none() {
         align_remaining_edges(axis, group, top_to_bottom_hinting, serif_count, anchor_ix);
     }
 }
 
-/// Align horizontal edges to blue zones.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3030>
 fn align_edges_to_blues(
     axis: &mut Axis,
     metrics: &ScaledAxisMetrics,
@@ -68,7 +53,6 @@ fn align_edges_to_blues(
     scale: &Scale,
 ) -> Option<usize> {
     let mut anchor_ix = None;
-    // For default script group, only do vertical blues
     if group == ScriptGroup::Default && axis.dim != Dimension::Vertical {
         return anchor_ix;
     }
@@ -82,7 +66,6 @@ fn align_edges_to_blues(
             }
             let edge2_ix = edge.link_ix.map(|x| x as usize);
             let edge2 = edge2_ix.map(|ix| &edges[ix]);
-            // If we have two neutral zones, skip one of them.
             if let (true, Some(edge2)) = (edge.blue_edge.is_some(), edge2) {
                 if edge2.blue_edge.is_some() {
                     let skip_ix = if edge2.flags.contains(TopoFlags::NEUTRAL) {
@@ -99,7 +82,6 @@ fn align_edges_to_blues(
                     }
                 }
             }
-            // Flip edges if the other is aligned to a blue zone
             let blue = edges[edge_ix].blue_edge;
             let (blue, edge1_ix, edge2_ix) = if let Some(blue) = blue {
                 (blue, Some(edge_ix), edge2_ix)
@@ -111,9 +93,6 @@ fn align_edges_to_blues(
             let Some(edge1_ix) = edge1_ix else {
                 continue;
             };
-            // Skip if edge1 was already positioned by a previous iteration
-            // (e.g. edge[i] has no blue but its linked-edge does, and that
-            // linked-edge was already processed when the loop visited it directly).
             if edges[edge1_ix].flags.contains(TopoFlags::DONE) {
                 continue;
             }
@@ -137,9 +116,6 @@ fn align_edges_to_blues(
     anchor_ix
 }
 
-/// Align stem edges, trying to main relative order of stems in the glyph.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3123>
 fn align_stem_edges(
     axis: &mut Axis,
     metrics: &ScaledAxisMetrics,
@@ -151,11 +127,7 @@ fn align_stem_edges(
     let mut serif_count = 0;
     let mut last_stem_pos = None;
     let mut delta = 0;
-    // Now align all other stem edges
-    // This code starts at: <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3123>
     for edge_ix in 0..axis.edges.len() {
-        // Read the values we need to decide on early-exit paths before taking
-        // any &mut borrow that would conflict with align_linked_edge(&mut axis).
         let (edge_flags, edge_link_ix, edge_pos, edge2_pos_for_cjk, edge2_has_blue) = {
             let edges = axis.edges.as_slice();
             let edge = &edges[edge_ix];
@@ -168,13 +140,10 @@ fn align_stem_edges(
         if edge_flags.contains(TopoFlags::DONE) {
             continue;
         }
-        // Skip all non-stem edges
         let Some(edge2_ix) = edge_link_ix else {
             serif_count += 1;
             continue;
         };
-        // For CJK, skip stems that are too close. We'll deal with them later
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1912>
         if group != ScriptGroup::Default {
             if let Some(last_pos) = last_stem_pos {
                 if edge_pos < last_pos + 64 || edge2_pos_for_cjk < last_pos + 64 {
@@ -183,7 +152,6 @@ fn align_stem_edges(
                 }
             }
         }
-        // This should not happen, but match the C fallback.
         if edge2_has_blue {
             align_linked_edge(axis, metrics, group, scale, edge2_ix, edge_ix);
             axis.edges[edge_ix].flags |= TopoFlags::DONE;
@@ -191,9 +159,6 @@ fn align_stem_edges(
         }
         let edges = axis.edges.as_mut_slice();
         if group == ScriptGroup::Default {
-            // Now align the stem
-            // Note: the branches here are reversed from the FreeType code
-            // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3155>
             if let Some(anchor_ix) = anchor_ix {
                 let anchor = &edges[anchor_ix];
                 let edge = edges[edge_ix];
@@ -241,7 +206,6 @@ fn align_stem_edges(
                     adjust_link(edges, edge_ix, LinkDir::Prev, top_to_bottom_hinting);
                 }
             } else {
-                // No stem has been aligned yet
                 let edge = edges[edge_ix];
                 let edge2 = edges[edge2_ix];
                 let original_len = edge2.opos - edge.opos;
@@ -254,14 +218,7 @@ fn align_stem_edges(
                     edge.flags,
                     edge2.flags,
                 );
-                // Some "voodoo" to specially round edges for small stem widths
-                let (u_off, d_off) = if cur_len <= 64 {
-                    // width <= 1px
-                    (32, 32)
-                } else {
-                    // 1px < width < 1.5px
-                    (38, 26)
-                };
+                let (u_off, d_off) = if cur_len <= 64 { (32, 32) } else { (38, 26) };
                 if cur_len < 96 {
                     let original_center = edge.opos + (original_len >> 1);
                     let mut cur_pos1 = pix_round(original_center);
@@ -283,8 +240,6 @@ fn align_stem_edges(
                 anchor_ix = Some(edge_ix);
             }
         } else {
-            // More CJK divergence
-            // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1937>
             if edge2_ix < edge_ix {
                 last_stem_pos = Some(edge_pos);
                 edges[edge_ix].flags |= TopoFlags::DONE;
@@ -306,9 +261,6 @@ fn align_stem_edges(
     (serif_count, anchor_ix)
 }
 
-/// Make sure that lowercase m's maintain symmetry.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3365>
 fn hint_lowercase_m(edges: &mut [Edge], group: ScriptGroup) {
     let (edge1_ix, edge2_ix, edge3_ix) = if edges.len() == 6 {
         (0, 2, 4)
@@ -322,8 +274,6 @@ fn hint_lowercase_m(edges: &mut [Edge], group: ScriptGroup) {
     let dist2 = edge3.opos - edge2.opos;
     let span = (dist1 - dist2).abs();
     if group != ScriptGroup::Default {
-        // CJK has additional conditions on the following...
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L2090>
         for (edge, ix) in [(edge1, edge1_ix), (edge2, edge2_ix), (edge3, edge3_ix)] {
             if edge.link_ix != Some((ix + 1) as u16) {
                 return;
@@ -341,7 +291,6 @@ fn hint_lowercase_m(edges: &mut [Edge], group: ScriptGroup) {
             link.pos -= delta;
             link.flags |= TopoFlags::DONE;
         }
-        // Move serifs along with the stem
         if edges.len() == 12 {
             edges[8].pos -= delta;
             edges[11].pos -= delta;
@@ -349,7 +298,6 @@ fn hint_lowercase_m(edges: &mut [Edge], group: ScriptGroup) {
     }
 }
 
-/// Align serif and single segment edges.
 fn align_remaining_edges(
     axis: &mut Axis,
     group: ScriptGroup,
@@ -358,7 +306,6 @@ fn align_remaining_edges(
     mut anchor_ix: Option<usize>,
 ) {
     if group == ScriptGroup::Default {
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3418>
         for edge_ix in 0..axis.edges.len() {
             let (edge_flags, edge_opos, edge_serif_ix, delta) = {
                 let edges = axis.edges.as_slice();
@@ -373,7 +320,6 @@ fn align_remaining_edges(
                 continue;
             }
             if delta < 64 + 16 {
-                // delta is only < 1000 if edge.serif_ix is Some(_)
                 let serif_ix = edge_serif_ix.unwrap() as usize;
                 align_serif_edge(axis, serif_ix, edge_ix);
             } else if let Some(anchor_ix) = anchor_ix {
@@ -410,7 +356,6 @@ fn align_remaining_edges(
             adjust_link(edges, edge_ix, LinkDir::Next, top_to_bottom_hinting);
         }
     } else {
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L2119>
         for edge_ix in 0..axis.edges.len() {
             let edge = &mut axis.edges[edge_ix];
             if edge.flags.contains(TopoFlags::DONE) {
@@ -465,9 +410,6 @@ enum LinkDir {
     Next,
 }
 
-/// Helper to adjust links based on hinting direction.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3499>
 fn adjust_link(
     edges: &mut [Edge],
     edge_ix: usize,
@@ -477,7 +419,6 @@ fn adjust_link(
     let edge = &edges[edge_ix];
     let (edge2, prev_edge) = if link_dir == LinkDir::Next {
         let edge2 = edges.get(edge_ix + 1)?;
-        // Don't adjust next edge if it's not done yet
         if !edge2.flags.contains(TopoFlags::DONE) {
             return None;
         }
@@ -503,8 +444,6 @@ fn adjust_link(
     Some(())
 }
 
-/// Returns the indices of the "completed" edges before and after the given
-/// edge index.
 fn find_bounding_completed_edges(edges: &[Edge], ix: usize) -> [Option<usize>; 2] {
     let before_ix = edges
         .get(..ix)
@@ -523,9 +462,6 @@ fn find_bounding_completed_edges(edges: &[Edge], ix: usize) -> [Option<usize>; 2
     [before_ix, after_ix]
 }
 
-/// Snap a scaled width to one of the standard widths.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2697>
 fn snap_width(widths: &[ScaledWidth], width: i32) -> i32 {
     let (_, ref_width) =
         widths
@@ -552,9 +488,6 @@ fn snap_width(widths: &[ScaledWidth], width: i32) -> i32 {
     }
 }
 
-/// Compute the snapped width of a given stem.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2746>
 fn stem_width(
     metrics: &ScaledAxisMetrics,
     group: ScriptGroup,
@@ -575,10 +508,8 @@ fn stem_width(
     if (is_vertical && !scale.flags.contains(ScaleFlags::VERTICAL_SNAP))
         || (!is_vertical && !scale.flags.contains(ScaleFlags::HORIZONTAL_SNAP))
     {
-        // Do smooth hinting
         if group == ScriptGroup::Default {
             if stem_flags.contains(TopoFlags::SERIF) && is_vertical && (dist < 3 * 64) {
-                // Don't touch widths of serifs
                 return dist * sign;
             } else if base_flags.contains(TopoFlags::ROUND) {
                 if dist < 80 {
@@ -589,7 +520,6 @@ fn stem_width(
             }
         }
         if !metrics.widths.is_empty() {
-            // Compare to standard width
             let min_width = metrics.widths[0].scaled;
             let delta = (dist - min_width).abs();
             if delta < 40 {
@@ -597,8 +527,6 @@ fn stem_width(
                 return dist * sign;
             }
             if group == ScriptGroup::Default {
-                // Default/Latin behavior
-                // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2809>
                 if dist < 3 * 64 {
                     let delta = dist & 63;
                     dist &= -64;
@@ -625,8 +553,6 @@ fn stem_width(
             }
         }
         if group != ScriptGroup::Default {
-            // Divergent CJK behavior
-            // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1544>
             if dist < 54 {
                 dist += (54 - dist) / 2;
             } else if dist < 3 * 64 {
@@ -646,35 +572,26 @@ fn stem_width(
             }
         }
     } else {
-        // Do strong hinting: snap to integer pixels
         let original_dist = dist;
         dist = snap_width(&metrics.widths, dist);
         if is_vertical {
-            // Always round to integers in the vertical case
             if dist >= 64 {
                 dist = (dist + 16) & !63;
             } else {
                 dist = 64;
             }
         } else if scale.flags.contains(ScaleFlags::MONO) {
-            // Mono horizontal hinting: snap to integer with different
-            // threshold
             if dist < 64 {
                 dist = 64;
             } else {
                 dist = (dist + 32) & !63;
             }
         } else {
-            // Smooth horizontal hinting: strengthen small stems, round
-            // stems whose size is between 1 and 2 pixels
             if dist < 48 {
                 dist = (dist + 64) >> 1;
             } else if dist < 128 {
-                // Only round to integer if distortion is less than
-                // 1/4 pixel
                 dist = (dist + 22) & !63;
                 if group == ScriptGroup::Default {
-                    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2914>
                     let delta = (dist - original_dist).abs();
                     if delta >= 16 {
                         dist = original_dist;
@@ -684,7 +601,6 @@ fn stem_width(
                     }
                 }
             } else {
-                // Round otherwise to prevent color fringes in LCD mode
                 dist = (dist + 32) & !63;
             }
         }
@@ -692,9 +608,6 @@ fn stem_width(
     dist * sign
 }
 
-/// Align one stem edge relative to previous stem edge.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2943>
 fn align_linked_edge(
     axis: &mut Axis,
     metrics: &ScaledAxisMetrics,
@@ -720,9 +633,6 @@ fn align_linked_edge(
     edges[stem_edge_ix].pos = base_edge.pos + fitted_width;
 }
 
-/// Shift the serif edge by the adjustment made to base edge.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2975>
 fn align_serif_edge(axis: &mut Axis, base_edge_ix: usize, serif_edge_ix: usize) {
     let edges = axis.edges.as_mut_slice();
     let base_edge = &edges[base_edge_ix];
@@ -730,9 +640,6 @@ fn align_serif_edge(axis: &mut Axis, base_edge_ix: usize, serif_edge_ix: usize) 
     edges[serif_edge_ix].pos = base_edge.pos + (serif_edge.opos - base_edge.opos);
 }
 
-/// Adjusts both edges of a stem and returns the delta.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1678>
 fn hint_normal_stem_cjk(
     axis: &mut Axis,
     metrics: &ScaledAxisMetrics,

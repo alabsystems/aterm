@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The production transport: aterm-http's client (design §5), one request per connection.
+//! Production HTTP transport backed by `aterm-http`.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -23,8 +23,7 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
-    /// `Client::new(Trust::PlatformVerifier, ProxyMode::Environment, Deadlines::JSON.backstop)`;
-    /// proxy variables are read from `env`.
+    /// Creates an `HttpTransport` using platform TLS verification and environment proxy settings.
     #[must_use]
     pub fn new(env: Arc<dyn EnvSource + Send + Sync>) -> HttpTransport {
         HttpTransport {
@@ -37,8 +36,7 @@ impl HttpTransport {
         }
     }
 
-    /// Loopback tests: `Trust::Roots(Vec::new())` (plain HTTP never reaches TLS, and an https
-    /// URL fails closed) and `ProxyMode::Direct`.
+    /// Creates a direct loopback `HttpTransport` with an empty TLS root store.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn direct(env: Arc<dyn EnvSource + Send + Sync>) -> HttpTransport {
@@ -69,7 +67,7 @@ impl EnvSource for EnvAdapter<'_> {
 }
 
 /// A refusal before any connection: nothing is sent.
-fn refused(detail: String) -> WireError {
+const fn refused(detail: String) -> WireError {
     WireError {
         phase: Phase::NotSent,
         kind: WireKind::Local,
@@ -124,9 +122,6 @@ fn names_a_proxy_variable(message: &str) -> bool {
 fn kind_of(phase: Phase, error: &aterm_http::Error) -> WireKind {
     use std::io::ErrorKind as K;
     match error {
-        // aterm-http names the proxy in these two: a CONNECT the proxy refused or whose
-        // socket it lost (`proxy refused CONNECT …`, `proxy tunnel …`), and a proxy variable
-        // it cannot use (`HTTPS_PROXY is set but …`, `https_proxy names an https:// proxy …`).
         aterm_http::Error::Protocol(m) if phase == Phase::NotSent && m.starts_with("proxy ") => {
             WireKind::Proxy
         }
@@ -251,7 +246,6 @@ mod tests {
                 WireKind::TooLarge,
             ),
             (Phase::NotSent, io(K::Other, "proxy x"), WireKind::Proxy),
-            // aterm-http's own proxy texts (its `connect_tunnel` and `parse_proxy`).
             (
                 Phase::NotSent,
                 aterm_http::Error::Protocol("proxy refused CONNECT with status 407".into()),
@@ -276,7 +270,6 @@ mod tests {
                 ),
                 WireKind::Proxy,
             ),
-            // Not a proxy's: the generic rows.
             (
                 Phase::NotSent,
                 aterm_http::Error::Invalid("invalid header name: \"a b\"".into()),

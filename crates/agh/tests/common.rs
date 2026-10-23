@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The helpers every test module shares: scratch directories, the canonical config, clients
-//! over agh-fake or a scripted transport, and CLI contexts.
+//! Shared test helpers: scratch directories, canonical configs, fake/scripted clients, and CLI.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,8 +52,7 @@ pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
         .expect("a scratch directory")
 }
 
-/// `create_private_dir(dir)` (its parent must exist), then the token and a newline in
-/// `name`, 0600 ([`setup_file`]).
+/// Creates `dir` (`0700`) and writes `{token}\n` to `dir/name` (`0600`).
 #[cfg(unix)]
 pub fn write_token(dir: &Path, name: &str, token: &str) -> PathBuf {
     aterm_uds::private_file::create_private_dir(dir).expect("the token directory");
@@ -62,6 +60,7 @@ pub fn write_token(dir: &Path, name: &str, token: &str) -> PathBuf {
     dir.join(name)
 }
 
+// Writes `path` (`0600`) without `F_FULLFSYNC` to avoid volume-wide flush contention in tests.
 /// A test's setup file, 0600 when new, written whole (replacing what stood there) and NOT
 /// flushed. `write_private` (the
 /// writer agh's own store uses) ends each write with two `F_FULLFSYNC`s, a drive-cache
@@ -83,8 +82,7 @@ fn setup_file(path: &Path, bytes: &[u8]) {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
-/// `create_dir_all(dirs.config.parent())`, `create_private_dir(&dirs.config)`, then
-/// `text` in `agh.toml` there, 0600 ([`setup_file`]).
+/// Creates `dirs.config` (`0700`) and writes `text` to `agh.toml` (`0600`).
 #[cfg(unix)]
 pub fn write_config(dirs: &Dirs, text: &str) {
     if let Some(parent) = dirs.config.parent() {
@@ -94,9 +92,7 @@ pub fn write_config(dirs: &Dirs, text: &str) {
     setup_file(&dirs.config.join("agh.toml"), text.as_bytes());
 }
 
-/// The canonical config: `fixtures/canonical.toml` with `{root}` filled. The fixture holds
-/// `{root}` inside TOML basic strings, so the root's `\` and `"` are escaped first: a Windows
-/// root (`C:\Temp\…`) would otherwise read as TOML escapes.
+/// Renders `fixtures/canonical.toml` with `{root}` escaped for TOML basic strings.
 pub fn canonical_config(root: &Path) -> String {
     let root = root
         .display()
@@ -106,9 +102,7 @@ pub fn canonical_config(root: &Path) -> String {
     include_str!("fixtures/canonical.toml").replace("{root}", &root)
 }
 
-/// Register the dev and release tokens with `fake` (logins `fixture-dev-bot` and
-/// `fixture-release-bot`), and write each requested token file where the canonical config
-/// names it.
+/// Registers canonical dev/release tokens with `fake` and writes requested token files.
 #[cfg(unix)]
 pub fn canonical_tokens(root: &Path, fake: &FakeGithub, dev: bool, release: bool) {
     let dev_token = agh_fake::token("dev");
@@ -128,8 +122,7 @@ pub fn env() -> MapEnv {
     MapEnv::new()
 }
 
-/// `config::parse` and `config::validate` (with `config::file_id`) of `text`; panics on a
-/// fault.
+/// Parses and validates `text` into a [`Router`], panicking on any fault.
 pub fn router(text: &str, home: &Path) -> Router {
     let parsed = config::parse(text).unwrap_or_else(|f| panic!("{}: {}", f.rule, f.what));
     let validated = config::validate(&parsed, home, &config::file_id).unwrap_or_else(|faults| {
@@ -148,8 +141,7 @@ pub fn endpoints(fake: &FakeGithub) -> Endpoints {
     Endpoints::loopback(ports.api, ports.uploads, ports.web, ports.cdn)
 }
 
-/// A client over `HttpTransport::direct`, `endpoints(fake)`, `env()`, `Fx::simulated`, caller
-/// `test`, `RetryPolicy::NONE`.
+/// Builds a test [`Github`] client over `fake`'s loopback endpoints.
 pub fn github(router: Router, fake: &FakeGithub) -> Github {
     let transport = Arc::new(HttpTransport::direct(Arc::new(env())));
     github_over(router, transport, endpoints(fake))
@@ -185,8 +177,7 @@ pub fn scripted_endpoints(api: u16) -> Endpoints {
     Endpoints::loopback(api, api + 1, api + 2, api + 3)
 }
 
-/// An anonymous client (no agh.toml) over a scripted `transport`, at
-/// `scripted_endpoints(api)`.
+/// Builds an anonymous [`Github`] client over a scripted `transport`.
 pub fn scripted(transport: &Arc<agh::wire::scripted::ScriptedTransport>, api: u16) -> Github {
     github_over(Router::empty(), transport.clone(), scripted_endpoints(api))
 }

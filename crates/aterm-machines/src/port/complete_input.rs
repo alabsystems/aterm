@@ -49,9 +49,6 @@ pub(super) fn run(live: &Live, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed
             Stdio::from(reader),
             deadline,
         );
-        // A failed spawn can leave the Command owning its supplied read descriptor;
-        // drop it before joining. Nonblocking writes plus cancellation also cover a
-        // descendant retaining stdin after its direct parent exits.
         cancelled.store(true, Ordering::Release);
         drop(command);
         let written = writer.join();
@@ -110,8 +107,6 @@ fn write_input(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 let left = deadline.saturating_duration_since(Instant::now());
-                // A short bounded poll lets capture failure cancel the writer even if
-                // a descendant keeps the pipe open without reading it.
                 let ms = i32::try_from(left.as_millis().saturating_add(1).min(100)).unwrap_or(100);
                 let mut poll = libc::pollfd {
                     fd: writer.as_raw_fd(),

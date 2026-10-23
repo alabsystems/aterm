@@ -301,7 +301,8 @@ pub fn relocate_with(
     Ok(report)
 }
 
-/// The canonical donor root `path` lies inside, if any.
+/// The canonical donor root `path` lies inside, if any. The path is canonicalized when
+/// it exists (a linker records `/var/…` where the root is `/private/var/…`).
 fn in_donor_root<'r>(path: &str, donor_roots: &'r [PathBuf]) -> Option<&'r PathBuf> {
     if donor_roots.is_empty() || !path.starts_with('/') {
         return None;
@@ -347,6 +348,8 @@ fn stock_vendor_refusal(base: &str, src: &Path, place: &str) -> String {
 }
 
 /// Copy `src` → `<to.dir>/<base>` once (from inside a donor root only, byte-identical
+/// before the re-sign, recorded), make its own id portable, and re-sign ad hoc.
+///
 /// # Errors
 /// A stock toolchain's library (checked on the path as named and as resolved, before
 /// anything is read or written), or a copy that differs from its donor.
@@ -412,7 +415,8 @@ fn vendor_file(
     Ok(true)
 }
 
-/// `(device, inode)` of a regular file that has more than one name, else `None`.
+/// `(device, inode)` of a regular file that has more than one name, else `None`. Only
+/// such files can belong to a hard-link group; everything else is its own object.
 #[cfg(unix)]
 fn hard_link_key(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
@@ -426,7 +430,9 @@ fn hard_link_key(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Point every other name of `obj`'s hard-link group at `obj`'s new inode.
+/// Point every other name of `obj`'s hard-link group at `obj`'s new inode. Each alias is
+/// linked to a hidden sibling and renamed over, so it is never absent: a failure leaves it
+/// on its old bytes, and the error names it.
 fn relink_aliases(stage: &Path, obj: &Path, aliases: &[PathBuf]) -> Result<(), String> {
     for alias in aliases {
         if hard_link_key(obj).is_some() && hard_link_key(obj) == hard_link_key(alias) {
@@ -562,7 +568,7 @@ pub mod macho {
     const RESIGN_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Mach-O magic (thin arm64/x86_64 little-endian + universal).
-    pub fn is_macho_magic(m: &[u8; 4]) -> bool {
+    pub const fn is_macho_magic(m: &[u8; 4]) -> bool {
         matches!(
             m,
             [0xcf, 0xfa, 0xed, 0xfe]

@@ -861,7 +861,9 @@ fn a_direction_since_the_last_answer_is_a_turn_typed_by_someone_else() {
     assert!(!directed(&[side, on_it]));
 }
 
-/// A release is typed only to the agent the notice reached.
+/// A release is typed only to the agent the notice reached. A restart past
+/// its signal owes none (its agent was ended; the conversation is the
+/// carry-on's, or the person's who resumed it).
 #[test]
 fn a_release_follows_only_the_process_the_notice_reached() {
     for phase in [Phase::Exiting { at_s: 10 }, Phase::Relaunched { at_s: 10 }] {

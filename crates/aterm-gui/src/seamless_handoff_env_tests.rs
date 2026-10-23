@@ -122,7 +122,9 @@ fn this_build() -> String {
     )
 }
 
-/// [`pipe_pair`] with both ends owned.
+/// [`pipe_pair`] with both ends owned. The fork-lane intake adopts the ends it is handed (the ready
+/// write end, the commit read end) and closes them on drop, so a test publishes those with
+/// `into_raw_fd()` and drops the others: each number has one closer.
 fn owned_pipe(label: &str) -> (OwnedFd, OwnedFd) {
     let (read, write) = pipe_pair(label);
     // SAFETY: Pipe(2) just returned both numbers to this thread; nothing else holds them.
@@ -705,7 +707,10 @@ fn a_stale_hint_is_reselected_before_any_carried_present() {
     }
 }
 
-/// A config edit during the hold is warmed again before any carried present.
+/// A config edit during the hold is warmed again before any carried present. Between the read
+/// `main_entry` takes before the early warm and `warm_config_moved` after the intake, the outgoing
+/// process leaves `aterm.toml` alone, saves the same bytes, or changes the font as a Settings save
+/// does (a new file renamed over the old).
 #[test]
 fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
     use crate::native_config_service::VersionedConfigService;

@@ -44,7 +44,9 @@ impl Dirs {
         )
     }
 
-    /// `from_env`'s rule over the three roots.
+    /// `from_env`'s rule over the three roots. A relative root (a relative `XDG_CONFIG_HOME`,
+    /// which the XDG spec says to ignore) would put the credential store under the current
+    /// directory, which is no root at all: `None`, so agh runs with no config, anonymous.
     fn of(config: Option<PathBuf>, state: Option<PathBuf>, home: Option<PathBuf>) -> Option<Dirs> {
         let absolute = |path: Option<PathBuf>| path.filter(|path| path.is_absolute());
         Some(Dirs {
@@ -204,14 +206,14 @@ impl Validated {
     /// The profiles, by name.
     #[inline]
     #[must_use]
-    pub fn profiles(&self) -> &BTreeMap<String, Profile> {
+    pub const fn profiles(&self) -> &BTreeMap<String, Profile> {
         &self.profiles
     }
 
     /// The owners' rows, keyed by the lowercased owner name.
     #[inline]
     #[must_use]
-    pub fn owners(&self) -> &BTreeMap<String, OwnerRule> {
+    pub const fn owners(&self) -> &BTreeMap<String, OwnerRule> {
         &self.owners
     }
 
@@ -225,7 +227,7 @@ impl Validated {
     /// `[targets]`, by name.
     #[inline]
     #[must_use]
-    pub fn targets(&self) -> &BTreeMap<String, Slug> {
+    pub const fn targets(&self) -> &BTreeMap<String, Slug> {
         &self.targets
     }
 }
@@ -266,7 +268,11 @@ pub(crate) fn line_of(text: &str, offset: usize) -> usize {
 /// Malformed), so a run this short is never a whole token.
 const TOKEN_FLOOR: usize = 20;
 
-/// A parser message with every value it quotes taken out.
+/// A parser message with every value it quotes taken out. A double-quoted run (serde's
+/// `string "…"`) becomes `"…"`; a backticked run becomes `` `…` `` unless it is a short key
+/// (dot-separated identifier segments) or short punctuation (`` `]` ``, `` `=` ``), so
+/// `unknown field `legacy_loose`` still names its key; and any remaining run of
+/// `[A-Za-z0-9_]` of `TOKEN_FLOOR` bytes or more becomes `…`.
 fn unquoted(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
@@ -428,7 +434,10 @@ impl Faults {
     }
 }
 
-/// One agh.toml value as a fault shows it.
+/// One agh.toml value as a fault shows it. The values come from agh.toml (owner, profile
+/// and target names, chain steps, writers, tiers, logins, target values), and a token
+/// pasted into one of them would otherwise be printed verbatim: on `agh policy check`'s
+/// stdout and in every verb's refusal of the file.
 struct Shown<'a> {
     value: &'a str,
     rule: Option<fn(&str) -> bool>,

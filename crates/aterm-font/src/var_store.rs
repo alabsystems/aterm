@@ -5,9 +5,7 @@
 // project in 2026.
 // See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
 
-//! Implementation of Item Variation Store
-//!
-//! <https://docs.microsoft.com/en-us/typography/opentype/spec/otvarcommonformats#item-variation-store>
+//! Item Variation Store implementation.
 
 use crate::NormalizedCoordinate;
 use crate::parser::{FromData, LazyArray16, NumFrom, Stream};
@@ -50,7 +48,6 @@ impl<'a> ItemVariationStore<'a> {
 
         let regions = {
             regions_s.advance(usize::num_from(region_list_offset));
-            // TODO: should be the same as in `fvar`
             let axis_count = regions_s.read::<u16>()?;
             let count = regions_s.read::<u16>()?;
             let total = count.checked_mul(axis_count)?;
@@ -68,8 +65,6 @@ impl<'a> ItemVariationStore<'a> {
     }
 
     pub fn region_indices(&self, index: u16) -> Option<LazyArray16<'_, u16>> {
-        // Offsets in bytes from the start of the item variation store
-        // to each item variation data subtable.
         let offset = self.data_offsets.get(index)?;
         let mut s = Stream::new_at(self.data, usize::num_from(offset))?;
         s.skip::<u16>(); // item_count
@@ -98,10 +93,6 @@ impl<'a> ItemVariationStore<'a> {
         let has_long_words = (word_delta_count & 0x8000) != 0;
         let word_delta_count = word_delta_count & 0x7FFF;
 
-        // From the spec: The length of the data for each row, in bytes, is
-        // regionIndexCount + (wordDeltaCount & WORD_DELTA_COUNT_MASK)
-        // if the LONG_WORDS flag is not set, or 2 x that amount if the flag is set.
-        // In usize: the u16 sum and its double overflow on a malformed store.
         let mut delta_set_len = usize::from(word_delta_count) + usize::from(region_index_count);
         if has_long_words {
             delta_set_len *= 2;
@@ -114,7 +105,6 @@ impl<'a> ItemVariationStore<'a> {
         while i < word_delta_count {
             let idx = region_indices.get(i)?;
             let num = if has_long_words {
-                // TODO: use f64?
                 s.read::<i32>()? as f32
             } else {
                 f32::from(s.read::<i16>()?)
@@ -149,7 +139,6 @@ impl<'a> VariationRegionList<'a> {
     pub(crate) fn evaluate_region(&self, index: u16, coordinates: &[NormalizedCoordinate]) -> f32 {
         let mut v = 1.0;
         for (i, coord) in coordinates.iter().enumerate() {
-            // A record index past u16 names no record, like one past the end.
             let record = u16::try_from(i)
                 .ok()
                 .and_then(|i| index.checked_mul(self.axis_count)?.checked_add(i));
@@ -200,8 +189,6 @@ impl RegionAxisCoordinatesRecord {
             return 0.0;
         }
 
-        // In i32, which gives the same f32 as upstream's i16 differences
-        // wherever those do not overflow.
         let (coord, start, peak, end) = (
             i32::from(coord),
             i32::from(start),

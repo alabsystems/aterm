@@ -1,14 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The producer's half of LINEAGE: the payload scan over a staged tree ([`scan_tree`]) and
-//! the `LINEAGE` stamp a signed bundle carries ([`stamp_with`]).
-//!
-//! The rules are the client's (`atpkg::lineage`): one object's evidence is
-//! `atpkg::lineage::scan_object`, a compiler is admitted by
-//! `atpkg::lineage::check_compiler_with`, and the record written here is the one that
-//! function admits against the shipped bytes. Only the walk over a whole tree and the
-//! writing of the record are producer work, so only they live here.
+//! The producer's half of LINEAGE: the payload scan over a staged tree ([`scan_tree`]) and the
+//! `LINEAGE` stamp a signed bundle carries ([`stamp_with`]).
 
 use std::io::Read as _;
 use std::path::Path;
@@ -23,7 +17,7 @@ use atpkg::lineage::{
 pub struct ScanReport {
     /// Compiled objects read.
     pub objects: usize,
-    /// Evidence of any compiler but the admitted one. Empty ⇒ the tree passes.
+    /// Evidence of any compiler but the admitted one.
     pub findings: Vec<Finding>,
 }
 
@@ -58,9 +52,8 @@ fn is_compiled_output(path: &Path) -> bool {
         || head.starts_with(b"rust\0\0\0")
 }
 
-/// Scan every compiled object under `root` (regular files only, no symlink followed)
-/// for evidence of any compiler but the one whose commit-hash is `admitted`.
-///
+/// Scan every compiled object under `root` (regular files only, no symlink followed) for evidence
+/// of any compiler but the one whose commit-hash is `admitted`.
 /// # Errors
 /// A directory or file that cannot be read — never a silent skip.
 pub fn scan_tree(root: &Path, admitted: &str) -> Result<ScanReport, String> {
@@ -83,14 +76,9 @@ pub fn scan_tree(root: &Path, admitted: &str) -> Result<ScanReport, String> {
     Ok(report)
 }
 
-/// Write `LINEAGE` into a STAGED toolchain tree after its last byte-changing pass
-/// (strip, relocate, re-sign), so the signed tree carries a record the client's
-/// `check_compiler_with` admits against the SHIPPED bytes. `probe` answers `trustc -vV`.
-///
-/// `source` must be admitted with its lineage PROVEN (a SEED-MINT checked against the
-/// unstripped seal, or a store build's own LINEAGE); the staged compiler must be the
-/// same commit, and the staged tree's SEED-MINT the source's.
-///
+/// Write `LINEAGE` into a STAGED toolchain tree after its last byte-changing pass (strip, relocate,
+/// re-sign), so the signed tree carries a record the client's `check_compiler_with` admits against
+/// the SHIPPED bytes.
 /// # Errors
 /// Every refusal, one line each; nothing is written then.
 pub fn stamp_with(

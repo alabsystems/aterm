@@ -174,7 +174,11 @@ fn a_reparse_point_that_is_no_link_is_never_listed() {
     );
 }
 
-/// A CHECKOUT IN A REAL CLOUD SYNC ROOT IS NEVER OFFERED.
+/// A CHECKOUT IN A REAL CLOUD SYNC ROOT IS NEVER OFFERED. A scratch folder
+/// registered as a cloud sync root (`aterm_dirfd::seam::SyncRoot`, as
+/// OneDrive registers its folder; named `Synced`, no `OneDrive*` the name
+/// rule would skip) holds a checkout whose build directory, every file and
+/// folder of it, is an in-sync placeholder.
 #[test]
 fn a_checkout_in_a_cloud_sync_root_is_never_offered() {
     let tmp = Tmp::new("discover-win-sync-root");
@@ -259,7 +263,13 @@ fn the_walk_lists_with_cloud_placeholders_exposed_while_it_lives() {
     drop(root);
 }
 
-/// NOTHING IN A CLOUD SYNC ROOT IS READ INTO, FROM ANY ROOT.
+/// NOTHING IN A CLOUD SYNC ROOT IS READ INTO, FROM ANY ROOT. A real sync
+/// root (`Synced`, every folder and file in it a placeholder) holds what
+/// each root of a search can name: an agent's `CARGO_TARGET_DIR` and the
+/// session's working directory around it, a `$HOME` with a checkout and a
+/// Rust build cache in it, and Claude Code's temp root with a session's
+/// scratch build; a plain checkout beside it has a `target` junction
+/// leading into it.
 #[test]
 fn nothing_in_a_cloud_sync_root_is_read_into_from_any_root() {
     use aterm_sysprobe::paths::is_under;
@@ -731,7 +741,15 @@ fn scratch_at(root: &str) -> Scratch {
     }
 }
 
-/// A PROGRAM RUN FROM A CLAUDE CODE SCRATCHPAD IS NO CLAUDE CODE.
+/// A PROGRAM RUN FROM A CLAUDE CODE SCRATCHPAD IS NO CLAUDE CODE. Windows' Claude Code temp
+/// root is `%TEMP%\claude` (here given by hand, [`scratch_at`]), so every program a session
+/// runs from its scratchpad — aterm's own verb, a test binary, a build's tool — has a `claude`
+/// component in its image and its `argv[0]`: a path in that root names no Claude Code
+/// ([`claude_code`]) — the image spelled verbatim or plain, in any case; a `claude` folder
+/// under the root; an `argv[0]` that keeps `%TEMP%`'s 8.3 short name (`C:\Users\ANDREW~1\…`,
+/// Git Bash's `C:/Users//ANDREW~1/…`), spelled long first; and a root whose `%TEMP%` itself
+/// lies in a `claude` folder (`C:\x\claude\tmp\claude`), whose outer `claude` is the temp
+/// path's.
 #[test]
 fn a_program_run_from_a_claude_scratchpad_is_no_claude_code() {
     let text = |p: &Path| p.to_str().expect("UTF-8").to_owned();
@@ -823,7 +841,12 @@ fn the_census_places_a_scratchpad_by_this_environments_temp_root() {
     );
 }
 
-/// A CLOUD SYNC ROOT THE `$HOME` SEARCH MEETS IS SAID, ONCE EACH.
+/// A CLOUD SYNC ROOT THE `$HOME` SEARCH MEETS IS SAID, ONCE EACH. `$HOME`'s child `Synced`, a
+/// real cloud sync root ([`aterm_dirfd::seam::SyncRoot`], unregistered on drop) holding two
+/// checkouts with build directories, and `work\docs`, one two levels down holding a build
+/// directory, are passed over by the walk's listing (reparse points that are no link) — and the
+/// search says so of each root, once, in the words every refusal of such a place uses
+/// ([`super::super::target::IN_SYNC_ROOT`]), never of a folder under one.
 #[test]
 fn a_cloud_sync_root_the_home_search_meets_is_said_once_each() {
     let tmp = Tmp::new("discover-win-sync-note");

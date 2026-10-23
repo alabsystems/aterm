@@ -392,7 +392,9 @@ fn a_done_check_with_the_standing_rules_is_the_check() {
     assert_eq!(report(&jsonl(&rows), DoneBy::Check), Err("no-check"));
 }
 
-/// A worker already checked before an update keeps its result.
+/// A worker already checked before an update keeps its result. Earlier
+/// checks answered with a bare done are passed over, just as current checks
+/// are; ordinary completion prose supplies the final verification details.
 #[test]
 fn a_legacy_done_check_still_recovers_the_workers_result() {
     let ruled = done_check_text(Some("leave unrelated files alone"), false).replacen(

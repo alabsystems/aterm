@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shared alignment against real CLT git, in scratch repositories of a scratch home:
-//! a bare origin, a seed clone that advances it, and the checkout under test. The spawn
-//! record ([`Spawns`]) holds every run the code under test made, and no run of it ever
-//! resets, stashes, rebases, checks out, switches, restores, cleans, pulls, pushes or commits.
+//! The shared alignment against real CLT git, in scratch repositories of a scratch home.
 
 use super::*;
 use crate::items::defaults::tests::user;
@@ -471,7 +468,6 @@ fn align_runs_no_hook_and_fetches_from_origin_alone() {
     for by_init in [true, false] {
         let repos = Repos::new(&live, "checkout-hooks");
         let home = PathBuf::from(&repos.who.home);
-        // A submodule whose remote (`astream.git`) has a commit only it holds.
         let astream = home.join("astream.git");
         let astream_seed = home.join("astream-seed");
         repos.init(&astream, true);
@@ -502,8 +498,6 @@ fn align_runs_no_hook_and_fetches_from_origin_alone() {
         repos.g(&work, &["config", "core.hooksPath", ".githooks"]);
         let marker = home.join(format!("hooks-ran-{by_init}"));
         let hook = format!("#!/bin/sh\necho \"$0\" >> '{}'\n", marker.display());
-        // origin's next commit adds the post-merge hook and bumps the gitlink to a commit
-        // only the submodule's remote holds.
         std::fs::write(astream_seed.join("lib.rs"), "two\n").unwrap();
         repos.g(&astream_seed, &["commit", "--quiet", "--all", "-m", "two"]);
         repos.g(

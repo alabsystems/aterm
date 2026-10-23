@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The formulae.brew.sh JSON API client with an on-disk cache
-//! (design §3). Cached JSON is served when fresh (1 h; indexes 24 h)
-//! or when the network fails and a stale copy stands. Cache entries are
-//! bounded regular files, published without following their final links.
+//! The formulae.brew.sh JSON API client with an on-disk cache (design §3).
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -16,8 +13,6 @@ use super::machine::Machine;
 use super::prefix::{Prefix, write_metadata};
 
 const API_BASE: &str = "https://formulae.brew.sh/api";
-// Full formula/cask indexes exceed 20 MiB. Bound both cached reads and newly
-// retained documents, leaving room for index growth without unbounded metadata.
 const API_BYTES: usize = 64 * 1024 * 1024;
 
 pub struct Api {
@@ -34,8 +29,7 @@ impl Api {
         }
     }
 
-    /// A cache-read-only client: fetches parse in memory and nothing is
-    /// created on disk (dry runs must leave no prefix behind).
+    /// A cache-read-only client: fetches parse in memory and nothing is created on disk.
     #[must_use]
     pub const fn read_only(prefix: Prefix) -> Api {
         Api {
@@ -96,7 +90,6 @@ impl Api {
                 Ok(value)
             }
             Err(e) => {
-                // Stale cache beats no answer (offline work, design §6).
                 if allow_stale
                     && let Ok(bytes) = crate::metadata_io::read_bounded_regular(&path, API_BYTES)
                 {
@@ -109,10 +102,7 @@ impl Api {
         }
     }
 
-    /// Drop cached per-package documents but keep `keep` (the freshly
-    /// fetched indexes): a staged update publishes new indexes before
-    /// invalidating detail docs, so a failed update never truncates
-    /// the working cache to empty.
+    /// Drop cached per-package documents but keep `keep` (the freshly fetched indexes).
     pub fn refresh_except(&self, keep: &[&str]) {
         if self.prefix.ensure_api_cache().is_err() {
             return;
@@ -181,9 +171,7 @@ impl Api {
         cask_record(&self.cask_doc(token)?, token)
     }
 
-    /// The raw API record for `info --json`: brew's JSON info is
-    /// the API document itself, so abrew emits the same record it
-    /// parsed (identity-bound like [`Api::formula`]).
+    /// The raw API record for `info --json`.
     pub(super) fn formula_value(&self, name: &str) -> Result<Value, String> {
         let _ = self.formula(name)?;
         self.formula_doc(name)
@@ -195,9 +183,7 @@ impl Api {
         self.cask_doc(token)
     }
 
-    /// Index rows already in the cache, without any fetch (`None`
-    /// when no readable cached index stands): the "before" side of
-    /// an update diff.
+    /// Index rows already in the cache, without any fetch (`None` when no cached index stands).
     pub fn cached_index_rows(&self, casks: bool) -> Option<Vec<IndexRow>> {
         let file = if casks {
             "cask-index.json"
@@ -210,8 +196,7 @@ impl Api {
         Some(index_rows(&v, casks))
     }
 
-    /// Index rows fetched now, ignoring cache freshness: the
-    /// "after" side of an update diff.
+    /// Index rows fetched now, ignoring cache freshness: the "after" side of an update diff.
     pub fn index_rows_fresh(&self, casks: bool) -> Result<Vec<IndexRow>, String> {
         let (rel, file) = if casks {
             ("cask.json", "cask-index.json")
@@ -223,7 +208,6 @@ impl Api {
     }
 
     /// The full formula or cask index (for `search`): (name, desc).
-    /// The index fetched now, ignoring cache freshness (`abrew update`).
     pub fn index_fresh(&self, casks: bool) -> Result<Vec<(String, String)>, String> {
         Ok(self
             .index_inner(casks, 0, false)?
@@ -240,16 +224,12 @@ impl Api {
             .collect())
     }
 
-    /// The index with cask display names (`desc` search prints and
-    /// matches them): (name/token, display names joined, desc).
-    /// Formula rows carry an empty display field.
+    /// The index with cask display names (`desc` search prints and matches them).
     pub fn desc_index(&self, casks: bool) -> Result<Vec<(String, String, String)>, String> {
         self.index_inner(casks, 86_400, true)
     }
 
-    /// Declared install options per formula from the raw index
-    /// records. Only rows the parse can fully see are returned;
-    /// options are empty across homebrew/core today.
+    /// Declared install options per formula from the raw index records.
     pub fn options_index(&self) -> Result<Vec<OptionsRow>, String> {
         let v = self.doc_with_freshness("formula.json", "formula-index.json", 86_400, true)?;
         let mut out = Vec::new();
@@ -323,10 +303,7 @@ impl Api {
     }
 }
 
-/// Where admission reads package records from: the live API with its cache
-/// for the running machine ([`Api`]), or a downloaded index for a modelled
-/// one (the admission census, [`super::census`]). Records come back resolved
-/// for [`Catalog::machine`].
+/// Where admission reads package records from ([`Api`] or [`super::census`]).
 pub trait Catalog {
     /// The machine records are resolved, and admission judged, for.
     fn machine(&self) -> &Machine;
@@ -348,10 +325,7 @@ impl Catalog for Api {
     }
 }
 
-/// One formula record, resolved for `machine` and bound to the request: the
-/// record must name the requested formula (or carry it as a known
-/// alias/oldname), so a mismatched cache/redirect body cannot rename the
-/// install.
+/// One formula record, resolved for `machine` and bound to the request.
 pub(super) fn formula_record(v: &Value, name: &str, machine: &Machine) -> Result<Formula, String> {
     let short = Formula::short_name(name);
     let mut f = Formula::from_api(v)?;
@@ -392,15 +366,12 @@ fn get_document(rel_url: &str) -> Result<Vec<u8>, fetch::GetError> {
     Ok(bytes)
 }
 
-/// The full formula (`formula.json`) or cask (`cask.json`) index as
-/// formulae.brew.sh serves it now, in memory: no prefix and no cache
-/// are read or written (the admission census).
+/// The full formula (`formula.json`) or cask (`cask.json`) index fetched in memory.
 pub fn fetch_index(casks: bool) -> Result<Vec<u8>, String> {
     get_document(if casks { "cask.json" } else { "formula.json" })
         .map_err(fetch::GetError::into_message)
 }
 
-/// One formula's declared install options, for `brew options`.
 /// One index record's report fields, for the update diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRow {
@@ -441,8 +412,6 @@ fn index_rows(v: &Value, casks: bool) -> Vec<IndexRow> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                // Compare formulae with installed keg versions, including
-                // revision-only updates. Cask versions have no keg revision.
                 version: match item.get("revision").and_then(Value::as_u64) {
                     Some(revision) if !casks && revision > 0 && !version.is_empty() => {
                         format!("{version}_{revision}")
@@ -467,9 +436,7 @@ pub struct OptionsRow {
     pub head: bool,
 }
 
-/// One raw API record's declared options and HEAD presence, for
-/// `brew options`: ([(flag without `--`, description)] sorted by
-/// flag as brew dumps them, has HEAD spec).
+/// One raw API record's declared options and HEAD presence, for `brew options`.
 pub(super) fn parse_options_record(v: &Value) -> (Vec<(String, String)>, bool) {
     let mut options: Vec<(String, String)> = v
         .get("options")
@@ -524,9 +491,6 @@ pub(super) fn dependency_formula(
     if v.get("revision").and_then(Value::as_u64) != Some(formula.revision) {
         return Err(format!("abrew: {name} has no known package revision"));
     }
-    // The raw document must carry a complete top-level array of plain
-    // names, and the system-resolved list (a variation may replace it)
-    // must be plain too: neither may smuggle a malformed entry past.
     let raw = v
         .get("dependencies")
         .and_then(Value::as_array)
@@ -578,8 +542,6 @@ fn percent_encode(value: &str) -> String {
 }
 
 pub fn ghcr_token(repo: &str) -> Result<String, String> {
-    // The repo path comes from an API URL: query delimiters are invalid
-    // in it, and the scope value is percent-encoded before use.
     if repo.is_empty()
         || repo
             .chars()
@@ -597,9 +559,7 @@ pub fn ghcr_token(repo: &str) -> Result<String, String> {
         .ok_or_else(|| "abrew: GHCR token response has no token".to_string())
 }
 
-/// The GHCR repository a bottle URL belongs to
-/// (`https://ghcr.io/v2/homebrew/core/wget/blobs/sha256:…` →
-/// `homebrew/core/wget`), if it is a GHCR blob URL.
+/// The GHCR repository a bottle URL belongs to (`homebrew/core/wget`), if it is a GHCR blob URL.
 #[must_use]
 pub fn ghcr_repo_of(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://ghcr.io/v2/")?;
@@ -635,7 +595,6 @@ mod tests {
         )
         .unwrap();
         assert!(api.formula("demo").is_err());
-        // An alias binding is admitted.
         write_metadata(
             &api.cache_path("formula-demo.json"),
             br#"{"name":"real","aliases":["demo"],"versions":{"stable":"1"}}"#,
@@ -662,8 +621,6 @@ mod tests {
         assert_eq!(api.formula("demo").unwrap().version, "1");
         assert!(!prefix.cellar().exists());
 
-        // A linked canonical cache base must refuse before the downloader,
-        // even when its fresh, otherwise valid JSON could satisfy the request.
         let outside = tmp.path().join("outside");
         std::fs::rename(prefix.cache().join("api"), &outside).unwrap();
         std::os::unix::fs::symlink(&outside, prefix.cache().join("api")).unwrap();

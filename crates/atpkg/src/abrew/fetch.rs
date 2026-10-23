@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Fetching: `curl` is abrew's one downloader (design §3), always
-//! SHA-256-verified before installation unless a cask explicitly says `no_check`.
-//! Children are built with
-//! `aterm_uds::spawnfd::command` like every child in this crate.
+//! SHA-256-verified `curl` downloads for abrew.
 
 use std::io::Read;
 use std::path::Path;
 use std::process::Output;
 
-/// The shared child construction keeps curl's default configuration out of
-/// both fetch paths. `-q` must be its first argument; the explicit private
-/// header config remains an ordinary later option. Other tools are unchanged.
+/// The shared child construction keeps curl's default configuration out of both fetch paths.
 fn command(prog: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
     let mut command = aterm_uds::spawnfd::command(prog);
     if prog == "curl" {
@@ -24,16 +19,14 @@ fn command(prog: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
     command
 }
 
-/// Run a child to completion, capturing output. The command is named in
-/// every error so a failure says what to run by hand.
+/// Run a child to completion, capturing output.
 pub fn run_capture(prog: &str, args: &[&str]) -> Result<Output, String> {
     command(prog, args)
         .output()
         .map_err(|e| format!("abrew: cannot run {prog}: {e}"))
 }
 
-/// Run a child with inherited stdio (git, patch); returns
-/// its exit code (2 when it could not be started or was signalled).
+/// Run a child with inherited stdio (git, patch).
 pub fn run_inherit(prog: &str, args: &[&str]) -> i32 {
     match command(prog, args).status() {
         Ok(s) => s.code().unwrap_or(2),
@@ -44,9 +37,7 @@ pub fn run_inherit(prog: &str, args: &[&str]) -> i32 {
     }
 }
 
-/// The URL schemes abrew will ever fetch. `file` exists for tests and
-/// local mirrors; everything else (ftp, ext, dict, …) is refused here,
-/// at the one fetcher, before curl runs.
+/// The URL schemes abrew will ever fetch.
 fn check_url(url: &str) -> Result<(), String> {
     let scheme = url.split("://").next().unwrap_or("");
     if matches!(scheme, "https" | "http" | "file") {
@@ -56,7 +47,7 @@ fn check_url(url: &str) -> Result<(), String> {
     }
 }
 
-/// Redirect protocols: https never downgrades; http/file stay themselves.
+/// Redirect protocols: https never downgrades.
 fn proto_args(url: &str) -> [&'static str; 4] {
     if url.starts_with("https://") {
         ["--proto", "=https", "--proto-redir", "=https"]
@@ -67,15 +58,12 @@ fn proto_args(url: &str) -> [&'static str; 4] {
     }
 }
 
-/// GET a URL into memory (API JSON, tokens). Size-capped by curl
-/// itself (64 MiB — the API ceiling api.rs enforces again); a 60 s
-/// ceiling is fine at that size.
+/// GET a URL into memory (API JSON, tokens).
 pub fn curl_get(url: &str, headers: &[&str]) -> Result<Vec<u8>, String> {
     curl_get_with_status(url, headers).map_err(GetError::into_message)
 }
 
-/// A missing package requires both curl's HTTP-failure exit and the final
-/// response status. URLs and diagnostic text never establish that status.
+/// A missing package requires both curl's HTTP-failure exit and the final response status.
 #[derive(Debug)]
 pub(super) struct GetError {
     code: Option<i32>,
@@ -101,8 +89,7 @@ impl GetError {
     }
 }
 
-/// Separate the fixed write-out suffix from the response body without decoding
-/// body bytes. Missing or malformed metadata cannot certify an HTTP absence.
+/// Separate the fixed write-out suffix from the response body without decoding body bytes.
 pub(super) fn parse_get_response(
     url: &str,
     code: Option<i32>,
@@ -160,7 +147,6 @@ pub(super) fn curl_get_with_status(url: &str, headers: &[&str]) -> Result<Vec<u8
 }
 
 /// Download into an exclusively owned scratch beside `dest`, then rename it.
-/// Failed or concurrent downloads never remove another operation's partial file.
 pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), String> {
     check_url(url)?;
     let parent = dest
@@ -177,8 +163,6 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
         .map_err(|e| format!("abrew: cannot stage download in {}: {e}", parent.display()))?;
     let partial = work.path().join("download");
     let partial_s = partial.to_string_lossy().into_owned();
-    // No total time ceiling (large bottles on slow links are legit);
-    // a stall ceiling and the extractor's 16 GiB size cap bound it.
     let mut args: Vec<&str> = vec![
         "-fSL",
         "--connect-timeout",
@@ -194,8 +178,6 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
         &partial_s,
     ];
     args.extend(proto_args(url));
-    // Headers travel in a private config file, never argv: a bearer
-    // token in `-H` is ps-visible for the whole download.
     let header_cfg;
     if !headers.is_empty() {
         let cfg = work.path().join("curlrc");
@@ -260,8 +242,7 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Verify a regular, non-symlink cache entry. Only explicit `no_check`
-/// bypasses the digest comparison; it still requires an actual file.
+/// Verify a regular, non-symlink cache entry.
 pub fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
     if !std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
         return Err(format!(
@@ -286,9 +267,7 @@ pub fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
     }
 }
 
-/// Like [`verify_sha256`] but with no `no_check` exemption: bottle and
-/// fetch paths must carry a real 64-hex digest. The exemption is a
-/// cask-only spelling and must never pour a bottle unverified.
+/// Like [`verify_sha256`] but with no `no_check` exemption.
 pub fn verify_digest_strict(path: &Path, expected: &str) -> Result<(), String> {
     if expected == "no_check" {
         return Err("abrew: no_check is not a bottle digest".to_string());
@@ -296,7 +275,7 @@ pub fn verify_digest_strict(path: &Path, expected: &str) -> Result<(), String> {
     verify_sha256(path, expected)
 }
 
-/// Archives handled by the shared, bounded extractor. Other formats need brew.
+/// Archives handled by the shared, bounded extractor.
 pub(super) fn archive_supported(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [".tar", ".tar.gz", ".tgz", ".tar.zst", ".zip"]
@@ -319,9 +298,6 @@ pub(super) fn is_dmg(name: &str) -> bool {
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn copy_mounted_tree(src_root: &Path, dir: &Path) -> Result<(), String> {
     use crate::install::{MAX_ENTRIES, UNSIGNED_SIZE_CAP};
-    // The stage and every entry are exclusive: a case-sensitive image may
-    // contain names that alias on the destination filesystem. Reusing an
-    // earlier symlink as a directory would invalidate the lexical link check.
     std::fs::create_dir(dir).map_err(|e| format!("abrew: {e}"))?;
     crate::platform::set_mode(dir, crate::extract::safe_mode(0, true))
         .map_err(|e| format!("abrew: {e}"))?;
@@ -415,9 +391,6 @@ impl std::fmt::Display for DmgError {
     }
 }
 
-// An image's verification and mount may take substantially longer than a small
-// tool probe. Detach has no payload to process. These bound helper waits, not
-// filesystem copies, spawn itself, or work in macOS's disk-image service.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const DMG_ATTACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -425,8 +398,7 @@ const DMG_DETACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30)
 #[cfg(target_os = "macos")]
 const DMG_REAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Retention is the default even if a backstop panics. Only confirmed cleanup
-/// takes the TempDir out of this wrapper and permits its recursive deletion.
+/// Retention is the default even if a backstop panics.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 struct RetainedImage(Option<aterm_tempfile::TempDir>);
 
@@ -447,8 +419,7 @@ enum DmgStep {
     ForceDetach,
 }
 
-/// Own the image actually passed to attach, as well as its mountpoint. A cache
-/// eviction or a caller's TempDir drop cannot remove an uncertain helper's input.
+/// Own the image actually passed to attach, as well as its mountpoint.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 struct MountGuard<'a, F>
 where
@@ -474,8 +445,6 @@ where
     ) -> Result<Output, aterm_uds::deadline::RunError>,
 {
     fn helper(&mut self, step: DmgStep) -> Result<Output, aterm_uds::deadline::RunError> {
-        // Arm before command construction or the runner: unwinding is not a
-        // completed helper, and outputs_until's error is not a reap certificate.
         let was_uncertain = self.uncertain;
         self.uncertain = Some("helper completion was not observed");
         let mut cmd = aterm_uds::spawnfd::command("/usr/bin/hdiutil");
@@ -512,8 +481,6 @@ where
 
     fn cleanup(&mut self) -> bool {
         if self.uncertain.is_some() {
-            // A late attach can follow a successful detach. Another helper
-            // cannot turn that unknown operation into permission to delete.
             return false;
         }
         if !self.needs_detach {
@@ -526,8 +493,6 @@ where
             self.needs_detach = false;
             true
         } else {
-            // No second cleanup attempt in Drop and no delegation while the
-            // mount's cleanup is unconfirmed, even after a completed refusal.
             if self.uncertain.is_none() {
                 self.uncertain = Some("resource cleanup was not confirmed");
             }
@@ -570,9 +535,6 @@ fn run_dmg_helper(
     cmd: &mut aterm_uds::spawnfd::Command,
     within: std::time::Duration,
 ) -> Result<Output, aterm_uds::deadline::RunError> {
-    // Unix's poll-based runner starts no reader threads, caps both output
-    // tails, and bounds its SIGKILL/reap reserve. An error remains unknown:
-    // a child may be handed to the reaper, and OS services are not its group.
     aterm_uds::deadline::outputs_until(
         &mut [cmd],
         std::time::Instant::now() + within,
@@ -582,13 +544,8 @@ fn run_dmg_helper(
     .unwrap_or(Err(aterm_uds::deadline::RunError::TimedOut))
 }
 
-/// Extract a disk image by mounting it read-only and copying the
-/// payload out under the bounded, vetted copy above. No license is
-/// ever agreed to (stdin is /dev/null: an image that demands one
-/// fails the attach), and nothing on the image runs. Detach
-/// is bounded on every known exit. Unknown helpers retain their actual image
-/// input and mount root; they never delegate or race another cleanup helper.
-/// Once attach starts, only completed refusals with completed cleanup delegate.
+/// Extract a disk image by mounting it read-only and copying the payload out under the bounded,
+/// vetted [`copy_mounted_tree`].
 #[cfg(target_os = "macos")]
 pub(super) fn extract_dmg(dmg: &Path, dir: &Path) -> Result<(), DmgError> {
     let root = aterm_tempfile::tempdir().map_err(|e| DmgError::Attach(e.to_string()))?;
@@ -648,9 +605,7 @@ pub(super) fn extract_dmg(_dmg: &Path, _dir: &Path) -> Result<(), DmgError> {
     Err(DmgError::Attach("disk images need macOS".to_string()))
 }
 
-/// Extract through atpkg's entry-by-entry path and symlink admission. The
-/// unsigned-payload byte and entry ceilings are shared with vendor installs.
-/// Copy one already-verified regular cache file (naked cask payloads).
+/// Copy one already-verified regular cache file.
 pub(super) fn copy_regular(src: &Path, dst: &Path) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(src).map_err(|e| format!("abrew: {e}"))?;
     if !meta.file_type().is_file() {
@@ -667,17 +622,12 @@ pub fn untar(archive: &Path, dir: &Path) -> Result<(), String> {
         crate::extract::ExtractOptions {
             strip_components: 0,
             symlinks: crate::extract::SymlinkPolicy::InRoot,
-            // Descriptive global PAX metadata is common in real cask
-            // tarballs (GitHub source archives); the extractor validates
-            // it as metadata-only before skipping it.
             allow_global_pax: true,
         },
     )
 }
 
-/// Homebrew's checksum-verified source archive carries descriptive global PAX
-/// metadata and intentional external links. Preserve them as leaves; the same
-/// extractor refuses any later write on or through a link.
+/// Checksum-verified source archive with global PAX metadata and external links.
 pub(super) fn untar_homebrew_bundle(archive: &Path, dir: &Path) -> Result<(), String> {
     extract_archive(
         archive,
@@ -746,9 +696,6 @@ mod tests {
     #[test]
     fn download_setup_errors_name_the_path() {
         let tmp = aterm_tempfile::tempdir().unwrap();
-        // A dest whose parent is a regular file fails before any
-        // network use; the error must name that parent, not just
-        // relay a bare OS error.
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"file").unwrap();
         let dest = blocker.join("bottle.tar.gz");
@@ -891,14 +838,9 @@ mod tests {
         ] {
             std::fs::write(&original, b"owned image bytes").unwrap();
             let out = tmp.path().join(scenario);
-            // The outer guard owns every retained ordinary-file root even
-            // if an assertion unwinds. This injected runner never mounts or
-            // starts a real helper, so its roots can safely be reclaimed.
             let scratch = aterm_tempfile::TempDir::new_in(tmp.path()).unwrap();
             let root = scratch.path().to_path_buf();
             let mut calls = Vec::new();
-            // Only the helper boundary is injected. The production command,
-            // guard, private image copy and mounted-tree copier run unchanged.
             let mut run = |cmd: &mut aterm_uds::spawnfd::Command, _within| {
                 assert_eq!(cmd.get_program(), "/usr/bin/hdiutil");
                 let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
@@ -910,8 +852,6 @@ mod tests {
                     assert_eq!(std::fs::read(&image).unwrap(), b"owned image bytes");
                     assert_eq!(point.parent(), Some(root.as_path()));
                     calls.push("attach");
-                    // The helper's actual input survives a caller cleaning up
-                    // its own image while attach is still in progress.
                     std::fs::remove_file(&original).unwrap();
                     assert_eq!(std::fs::read(&image).unwrap(), b"owned image bytes");
                     if scenario == "attach-panic" {
@@ -997,8 +937,6 @@ mod tests {
                     b"owned image bytes"
                 );
                 assert!(root.join("mount").is_dir());
-                // This boundary ran no process and mounted nothing. Only its
-                // own exclusive ordinary-file fixture is removed after proof.
                 std::fs::remove_dir_all(&root).unwrap();
             }
             if matches!(scenario, "copied" | "detach-refused" | "detach-unknown") {
@@ -1017,10 +955,6 @@ mod tests {
         let src = tmp.path().join("image");
         std::fs::create_dir_all(src.join("Demo.app/Contents/MacOS")).unwrap();
         std::fs::write(src.join("Demo.app/Contents/MacOS/demo"), b"bin").unwrap();
-        // An HFS image `makehybrid` writes directly: `extract_dmg` attaches,
-        // copies and detaches it as it does a cask's UDIF image, and it is made
-        // in 0.02 s and attached in 0.12 s, where `create -srcfolder` took 4.0 s
-        // and its attach 2.4 s (14.4 s for this test beside the rest of `--lib`).
         let mut make = aterm_uds::spawnfd::command("/usr/bin/hdiutil");
         make.args(["makehybrid", "-quiet", "-hfs", "-o"])
             .arg(tmp.path().join("demo.dmg"))
@@ -1039,8 +973,6 @@ mod tests {
             std::fs::read(out.join("Demo.app/Contents/MacOS/demo")).unwrap(),
             b"bin"
         );
-        // A garbage image never copies. Delegation also needs confirmed
-        // cleanup: a refusal whose cleanup is unknown remains a hard error.
         std::fs::write(tmp.path().join("junk.dmg"), b"not an image").unwrap();
         let err = extract_dmg(&tmp.path().join("junk.dmg"), &tmp.path().join("nope")).unwrap_err();
         assert!(

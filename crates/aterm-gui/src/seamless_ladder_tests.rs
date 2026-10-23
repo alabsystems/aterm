@@ -488,7 +488,10 @@ fn producer_is_total_over_hostile_and_large_desks() {
     assert_eq!(screen_digest(&screens), Ok(digest));
 }
 
-/// The strip decodes no more scrollback than the capture priced.
+/// The strip decodes no more scrollback than the capture priced. The capture prices a
+/// carried scrollback by its dimensions, not its bytes; here every line is one-cell links
+/// with 8 KiB URLs, so a 40-line depth is megabytes past that price and is dropped
+/// undecoded, while the visible screen's links are stripped.
 #[test]
 fn a_scrollback_past_what_the_capture_priced_is_never_decoded_to_strip_its_links() {
     const DEPTH: u32 = 40;
@@ -565,7 +568,9 @@ fn a_visible_grid_past_the_strip_work_bound_repaints_without_decoding_links() {
     assert_wire_admits("large visible grid", &checkpoint);
 }
 
-/// A link-dense line costs its links, not the screen or the scrollback.
+/// A link-dense line costs its links, not the screen or the scrollback. A row of one-cell
+/// links carries each URL once per span, so eight 8 KiB links in an 80-column pane make a
+/// 65 KiB line record against the 56 KiB cap.
 #[test]
 fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
     use super::tests::v0_91_consumer_decodes;

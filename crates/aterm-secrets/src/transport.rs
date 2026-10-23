@@ -359,10 +359,11 @@ pub fn replace(source: &Source, envelope: &[u8], over: &[u8]) -> crate::Result<(
 
 #[cfg(unix)]
 fn replace_path(path: &std::path::Path, envelope: &[u8], over: &[u8]) -> crate::Result<()> {
+    let _held = PublishLock::take(path)?;
     if read_path(path)?.as_deref() == Some(over) {
         return crate::fsx::write_atomic(path, envelope, 0o644);
     }
-    write_path(path, envelope)
+    write_path_held(path, envelope)
 }
 
 #[cfg(not(unix))]
@@ -370,9 +371,70 @@ fn replace_path(path: &std::path::Path, envelope: &[u8], _over: &[u8]) -> crate:
     write_path(path, envelope)
 }
 
-/// A path keeps the server's rule (its 409).
+/// A path keeps the server's rule (its 409), checked and renamed under [`PublishLock`].
 #[cfg(unix)]
 fn write_path(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
+    let _held = PublishLock::take(path)?;
+    write_path_held(path, envelope)
+}
+
+/// `<path>.lock`, held by one publisher from its check of the version a path holds to its
+/// rename over it, so two admins publishing at once cannot both pass the check and the
+/// later rename silently drop the other's version (a revocation, say). It is made by an
+/// exclusive create, which a shared mount (SMB, NFSv3 and later) also serializes, holds
+/// `<host> <pid>`, and goes when the publish ends. One a killed publisher left behind
+/// refuses every publish until a person removes it.
+#[cfg(unix)]
+struct PublishLock(std::path::PathBuf);
+
+#[cfg(unix)]
+impl PublishLock {
+    fn take(path: &std::path::Path) -> crate::Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        let lock = PathBuf::from(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&lock)
+        {
+            Ok(mut file) => {
+                let holder = aterm_uds::process::host_name().unwrap_or_default();
+                // Who holds it is for a person reading the file; the lock is the file.
+                let _ = writeln!(file, "{holder} {}", std::process::id());
+                Ok(Self(lock))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder = read_path(&lock)
+                    .ok()
+                    .flatten()
+                    .map(|bytes| reason(&bytes))
+                    .filter(|holder| !holder.is_empty())
+                    .map_or_else(String::new, |holder| format!(" ({holder})"));
+                Err(Error::new(format!(
+                    "{}: another publish to this vault holds it{holder}; if none is running, \
+                     remove it and publish again",
+                    lock.display()
+                )))
+            }
+            Err(e) => Err(Error::new(format!("{}: {e}", lock.display()))),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PublishLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// [`write_path`] with its [`PublishLock`] held.
+#[cfg(unix)]
+fn write_path_held(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
     if let (Ok(new), Some(held)) = (crate::envelope::parse(envelope), read_path(path)?) {
         if held == envelope {
             return Ok(());
@@ -749,23 +811,26 @@ mod tests {
         assert!(fetch(&Source::Path(link), None, HANG_DETECTOR).is_err());
     }
 
+    /// Version `seq` of vault `alab`, one admin locker holding `body`, signed.
+    #[cfg(unix)]
+    fn version(seq: u64, body: &[u8]) -> Vec<u8> {
+        use crate::envelope::{Locker, Unsigned, sign, test_armor};
+        let unsigned = Unsigned {
+            name: "alab".to_owned(),
+            seq,
+            time: 1_792_530_000 + seq,
+            handoff: Vec::new(),
+            lockers: vec![Locker {
+                label: "admin".to_owned(),
+                armored: test_armor(body),
+            }],
+        };
+        sign(&unsigned, &[7u8; 32]).expect("signed")
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_path_takes_only_a_newer_version_of_its_vault() {
-        use crate::envelope::{Locker, Unsigned, sign, test_armor};
-        let version = |seq: u64, body: &[u8]| {
-            let unsigned = Unsigned {
-                name: "alab".to_owned(),
-                seq,
-                time: 1_792_530_000 + seq,
-                handoff: Vec::new(),
-                lockers: vec![Locker {
-                    label: "admin".to_owned(),
-                    armored: test_armor(body),
-                }],
-            };
-            sign(&unsigned, &[7u8; 32]).expect("signed")
-        };
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let path = root.path().join("alab.vault");
         let source = Source::Path(path.clone());
@@ -788,6 +853,43 @@ mod tests {
         std::fs::write(&path, b"not an envelope\n").expect("write");
         publish(&source, &first).expect("replaced");
         held(&first);
+    }
+
+    /// TWO PUBLISHERS NEVER BOTH PASS THE CHECK: while another publisher holds the vault's
+    /// `<path>.lock`, a publish (or a replace) to the path is refused, naming the lock and
+    /// its holder; the vault and the holder's lock are left as they were. A publish leaves
+    /// no lock of its own behind, whether it lands or is refused as not newer. Negative
+    /// control: publish without taking the lock, and the held-lock publish lands seq 42.
+    #[cfg(unix)]
+    #[test]
+    fn a_publish_to_a_path_another_publisher_holds_is_refused() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("alab.vault");
+        let lock = root.path().join("alab.vault.lock");
+        let source = Source::Path(path.clone());
+        let first = version(41, b"one admin's text");
+        publish(&source, &first).expect("published");
+        assert!(!lock.exists(), "a publish leaves no lock behind");
+        std::fs::write(&lock, b"m22.local 4242\n\x1b[2J").expect("another publisher");
+        let error = publish(&source, &version(42, b"a revocation")).expect_err("held");
+        assert!(
+            error.0.contains("alab.vault.lock") && error.0.contains("(m22.local 4242)"),
+            "{error}"
+        );
+        assert!(
+            replace(&source, &version(42, b"a put-back"), &first).is_err(),
+            "a replace takes the same lock"
+        );
+        assert_eq!(std::fs::read(&path).expect("vault"), first);
+        assert_eq!(
+            std::fs::read(&lock).expect("the holder's lock"),
+            b"m22.local 4242\n\x1b[2J"
+        );
+        std::fs::remove_file(&lock).expect("released");
+        assert!(publish(&source, &version(40, b"older")).is_err());
+        assert!(!lock.exists(), "a refused publish leaves no lock behind");
+        publish(&source, &version(42, b"on top")).expect("newer");
+        assert!(!lock.exists());
     }
 
     /// A one-shot HTTP stub: answers `response` to the first request and hands back the

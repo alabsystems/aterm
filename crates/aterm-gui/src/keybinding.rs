@@ -246,7 +246,10 @@ pub(crate) fn builtin_shadow_label(chord_str: &str) -> Option<&'static str> {
     )
 }
 
-/// The testable core of [`builtin_shadow_label`] with both gates explicit.
+/// The testable core of [`builtin_shadow_label`] with both gates explicit. With
+/// the Cmd/Super suite compiled off (`suite_live` false, Linux) `on_key`
+/// intercepts none of these chords, so a `super+t` binding is a plain rebind and
+/// every probe answers `None`.
 fn builtin_shadow_label_when(
     chord_str: &str,
     suite_live: bool,

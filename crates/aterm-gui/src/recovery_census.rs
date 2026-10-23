@@ -1133,7 +1133,11 @@ mod tests {
         );
     }
 
-    /// THE ROW NAMES ITS PROCESS TO THE MICROSECOND.
+    /// THE ROW NAMES ITS PROCESS TO THE MICROSECOND. A launch records the kernel's
+    /// birth microseconds on its row, and the next launch finds the previous run still
+    /// alive only when the live process at that pid has that exact birth: a pid reused
+    /// within the same SECOND is another process, and the run before is classified by
+    /// its evidence instead of as `running`.
     #[test]
     fn a_pid_reused_within_the_same_second_is_not_the_previous_run() {
         struct Exact(u32, Birth);

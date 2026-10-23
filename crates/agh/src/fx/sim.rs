@@ -17,7 +17,7 @@ pub(super) struct SimClock {
 
 impl SimClock {
     /// Both clocks at their start.
-    pub(super) fn new(start_unix_secs: u64) -> SimClock {
+    pub(super) const fn new(start_unix_secs: u64) -> SimClock {
         SimClock {
             start_unix_secs,
             state: Mutex::new((Duration::ZERO, Vec::new())),

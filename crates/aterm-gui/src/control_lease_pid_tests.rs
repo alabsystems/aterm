@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DRIVE LEASE'S TAKER, AS THE KERNEL NAMES IT (`Lease::Drive::holder_pid`,
-//! `status hand_pid=`): a lease records the peer pid of the direct connection
-//! its acquire was served on, never its `holder=` text. Against a real
-//! process speaking over a real socket served by the real lanes, a lease
-//! named `aterm-harness@<aterm's pid>` is attested as that process's, so the
-//! presence layer no longer reads the forged name as aterm's own hand.
+//! Tests for kernel-attested peer PID recording on drive leases.
 
 use std::sync::PoisonError;
 #[cfg(target_os = "macos")]
@@ -54,7 +49,6 @@ fn a_lease_taken_over_a_direct_connection_records_its_kernel_peer() {
         assert!(!status.contains(" pid="), "{status}");
         let _direct = super::DirectPeer::enter();
         assert_eq!(serving_peer_pid(), Some(std::process::id()));
-        // A renewal by the same holder re-reads the taker.
         let reply =
             super::control_session::cmd_lease(&handle.ctx, &format!("acquire holder={own} hard"));
         assert!(reply.starts_with("OK lease acquired"), "{reply}");

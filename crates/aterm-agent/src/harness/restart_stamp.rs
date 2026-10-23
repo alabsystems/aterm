@@ -17,7 +17,7 @@ pub enum Cause {
 impl Cause {
     /// The word a stamp, a relaunch record and the verb's reply use.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::Stall => "stall",
             Self::Asked => "asked",
@@ -57,19 +57,19 @@ impl Stamp {
 
     /// Seconds since it was written, at `now` (unix seconds).
     #[must_use]
-    pub fn age_s(&self, now: u64) -> u64 {
+    pub const fn age_s(&self, now: u64) -> u64 {
         now.saturating_sub(self.at)
     }
 
     /// Whether it is older than [`super::relaunch::STALE_S`] at `now`.
     #[must_use]
-    pub fn stale(&self, now: u64) -> bool {
+    pub const fn stale(&self, now: u64) -> bool {
         self.age_s(now) > super::relaunch::STALE_S
     }
 
     /// How long from `now` it still stands, a second short of going [`Self::stale`].
     #[must_use]
-    pub fn stands_for(&self, now: u64) -> std::time::Duration {
+    pub const fn stands_for(&self, now: u64) -> std::time::Duration {
         let stale_at = self.at.saturating_add(super::relaunch::STALE_S);
         std::time::Duration::from_secs(stale_at.saturating_sub(now))
     }
@@ -206,6 +206,7 @@ pub fn alive_as(pid: u32, start: &str) -> bool {
     super::upgrade_drive::alive(pid) && kernel_start(pid).as_deref() == Some(start)
 }
 
+/// A name beside `path` no other writer takes: this process, a counter and
 /// the clock.
 fn unique(path: &Path, what: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

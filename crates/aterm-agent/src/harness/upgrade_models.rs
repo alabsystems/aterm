@@ -354,7 +354,7 @@ pub fn credits_billed(profile: &super::profile::Profile, now: i64) -> Vec<String
 
 /// WHETHER THE PLAN BILLS FABLE TO USAGE CREDITS at `now` ([`super::profile::FablePlan`]).
 #[must_use]
-pub fn fable_billed(fable: &super::profile::FablePlan, now: i64) -> bool {
+pub const fn fable_billed(fable: &super::profile::FablePlan, now: i64) -> bool {
     use super::profile::FablePlan;
     match fable {
         FablePlan::CreditsOnly | FablePlan::LimitsEnd(None) | FablePlan::Unknown => true,
@@ -506,7 +506,7 @@ pub enum Availability {
 impl Availability {
     /// Usable?
     #[must_use]
-    pub fn ok(&self) -> bool {
+    pub const fn ok(&self) -> bool {
         matches!(self, Availability::Yes(_))
     }
 }
@@ -883,7 +883,11 @@ pub const MODEL_WARM_MAX_S: u64 = CACHE_COLD_S;
 
 /// The model ladder: whether a due move is taken on this visit, and why, or `None` to wait.
 #[must_use]
-pub fn model_moves_now(cold: bool, build_restart: bool, due_for_s: u64) -> Option<&'static str> {
+pub const fn model_moves_now(
+    cold: bool,
+    build_restart: bool,
+    due_for_s: u64,
+) -> Option<&'static str> {
     if cold {
         Some("cache-cold")
     } else if build_restart {
@@ -1528,7 +1532,7 @@ pub enum MoveWhy {
 impl MoveWhy {
     /// The reason as the notices say it, after the model's id.
     #[must_use]
-    pub fn words(self) -> &'static str {
+    pub const fn words(self) -> &'static str {
         match self {
             MoveWhy::Family => "the newest model of its family",
             MoveWhy::List => {

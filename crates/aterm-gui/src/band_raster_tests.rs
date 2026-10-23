@@ -92,6 +92,8 @@ fn busy(title: &str) -> Message {
         })
 }
 
+/// The worst contrast of any word against the ground actually under its glyph
+/// (the pixel raster where the row has one, split at the fill's edge), and
 /// where.
 fn worst_word_contrast(row: &[RenderCell], raster: Option<&RowRaster>) -> (f64, String) {
     let mut worst = (f64::INFINITY, String::new());
@@ -144,6 +146,13 @@ fn worst_word_contrast(row: &[RenderCell], raster: Option<&RowRaster>) -> (f64, 
     worst
 }
 
+/// The ground is continuous: inside a comet, neighbouring pixel columns differ
+/// by at most two levels in any channel (no cell blocks, no seams), on every
+/// builtin scheme, through a whole crossing — on the theme blend, the band
+/// base the comet's lengths are tuned on (`aterm_messages::COMET_PERMILLE`) and
+/// every host but Linux paints. Linux's band sits on its CSD headerbar grey
+/// (`chrome_band::PLATFORM_BAR_BASE`), where Tokyo Night's leading edge steps
+/// three levels at its darkest pixel (measured 2026-10-16): still no block or
 /// seam, and checked there at that.
 #[test]
 fn a_comet_is_smooth_at_pixel_resolution() {
@@ -155,6 +164,7 @@ fn a_comet_is_smooth_at_pixel_resolution() {
     }
 }
 
+/// [`a_comet_is_smooth_at_pixel_resolution`] on the band base this thread
 /// derives on: no two neighbouring pixel columns more than `levels` apart.
 fn smooth_on_this_threads_base(levels: u8) {
     for (name, theme) in themes() {
@@ -187,6 +197,8 @@ fn smooth_on_this_threads_base(levels: u8) {
     }
 }
 
+/// A busy row's words are calm: every glyph's ink is the same on every frame
+/// of a comet period (floored once against the hottest tone the comet
 /// reaches), on every builtin scheme, and clears AA on the pixels under it.
 #[test]
 fn busy_row_inks_hold_across_a_comet_period() {
@@ -222,6 +234,10 @@ fn busy_row_inks_hold_across_a_comet_period() {
     }
 }
 
+/// The glint always reads: its peak (full height, or in the rail band where
+/// the fill's words leave no room) is at least ΔE 6 (OkLab ×100) from the fill
+/// on every builtin scheme, and every word on the bar clears AA on the pixels
+/// under it through the glint's travel, the fill's edge split through the
 /// letters.
 #[test]
 fn the_glint_reads_and_every_word_clears_aa_through_its_travel() {
@@ -253,6 +269,9 @@ fn the_glint_reads_and_every_word_clears_aa_through_its_travel() {
     }
 }
 
+/// The fill's edge is a crisp line through the letters: at any fill, the
+/// ground is the fill left of the edge and the track right of it with one
+/// antialiased pixel between; the edge cell is split at that pixel (fill-side
 /// ink left, track ink right), and every letter clears AA on its pixels.
 #[test]
 fn the_fill_edge_is_one_antialiased_pixel_and_splits_its_cell() {
@@ -322,6 +341,7 @@ fn the_fill_edge_is_one_antialiased_pixel_and_splits_its_cell() {
     }
 }
 
+/// Run a Fault echo of `msg` and hand every frame (every 30 ms, 0–600 ms)
 /// to `each`.
 fn fault_frames(
     theme: Theme,
@@ -341,6 +361,9 @@ fn fault_frames(
     }
 }
 
+/// Whether `px` lies in the linear-light solid of four inks within the
+/// triangle test's tolerance: all barycentric weights at least zero, or (for a
+/// byte-rounded pixel just outside, or a flat solid) within 0.01 of a face
 /// ([`hull_distance`]).
 fn inside_solid(px: [u8; 3], corners: [[u8; 3]; 4]) -> bool {
     let lin = |c: [u8; 3]| {
@@ -379,6 +402,10 @@ fn inside_solid(px: [u8; 3], corners: [[u8; 3]; 4]) -> bool {
     (l1 >= 0.0 && l2 >= 0.0 && l3 >= 0.0 && l1 + l2 + l3 <= 1.0) || near_a_face()
 }
 
+/// A failure never passes through another hue: on every builtin scheme, every
+/// ground pixel of every frame of a bar's Fault echo (cross-fade and held
+/// wash) lies inside the linear-light hull of the row's track, fill and warn,
+/// so no lime between green and amber, no magenta between blue and ochre. A
 /// busy row's Fault puts no warn on its surface.
 #[test]
 fn the_fault_echo_stays_inside_its_hull() {
@@ -421,6 +448,8 @@ fn the_fault_echo_stays_inside_its_hull() {
     }
 }
 
+/// `failed` keeps its contrast: through a busy row's Fault (comet frozen and
+/// drained, row neutral) the ⚠ and `failed` wear warn at AA on their pixels on
 /// every frame at opacity ≥ 1/2, on every builtin scheme.
 #[test]
 fn failed_keeps_aa_through_a_busy_fault() {
@@ -445,6 +474,9 @@ fn failed_keeps_aa_through_a_busy_fault() {
     }
 }
 
+/// The tail keeps its words to the midpoint: every echo (Complete, Fault,
+/// Vanish; bar and busy row) fades as one layer, and on every frame at opacity
+/// ≥ 1/2 every word clears AA on its pixels and none changes side, on every
 /// builtin scheme.
 #[test]
 fn an_echo_tail_keeps_its_words_legible_to_the_midpoint() {
@@ -482,6 +514,8 @@ fn an_echo_tail_keeps_its_words_legible_to_the_midpoint() {
     }
 }
 
+/// The Complete echo's one sweep: after the fill reaches the right edge, one
+/// glint about four cells wide crosses the row once, left to right, lifting
 /// the full bar by the glint's own step, on every builtin scheme.
 #[test]
 fn the_complete_echo_sweeps_once_across_the_row() {
@@ -532,6 +566,7 @@ fn the_complete_echo_sweeps_once_across_the_row() {
     }
 }
 
+/// The rows the capture scenes show in their moving look carry a raster;
 /// a Still frame of a bar does too; a flat (High Contrast) one does not.
 #[test]
 fn only_graded_looks_raster() {
@@ -555,6 +590,7 @@ fn only_graded_looks_raster() {
     );
 }
 
+/// Every builtin scheme with its own palette: the chrome theme and the
 /// scheme's ANSI blue and cyan.
 fn palettes() -> Vec<(&'static str, chrome_band::ChromePalette)> {
     themes()
@@ -587,6 +623,11 @@ fn frame_in(
     (rows, rasters)
 }
 
+/// Outlined on meters: on a row with a fill or busy track, the Primary is a
+/// ring in the meter's hue with the band's ground inside and its label in the
+/// accent at AA (no chip cell wears a solid accent, so the bar is the row's
+/// only one); under the pointer the ring lifts and the inside takes a tint,
+/// label still AA. A row with no meter keeps its solid chip. Layout and hit
 /// area are unchanged. On every builtin scheme, moving and still.
 #[test]
 fn a_meter_rows_primary_is_an_accent_ring_and_a_plain_rows_is_solid() {
@@ -714,6 +755,10 @@ fn a_meter_rows_primary_is_an_accent_ring_and_a_plain_rows_is_solid() {
     }
 }
 
+/// The outline never reads brown: on every builtin scheme the outlined
+/// Primary's ring and label (rest and lit) keep a hue of the accent family.
+/// Linen's rust cursor and Catppuccin Latte's rosewater, floored to AA, are
+/// brown, so their outlines borrow the theme's blue. Every other scheme's
 /// outline is its meter's hue.
 #[test]
 fn the_outlined_primary_keeps_the_accent_family_on_every_scheme() {
@@ -745,6 +790,8 @@ fn the_outlined_primary_keeps_the_accent_family_on_every_scheme() {
     }
 }
 
+/// Theme blue/cyan is borrowed when the cursor is near-grey; every other
+/// scheme keeps the cursor-trail colour. On every builtin scheme the fill
 /// has colour, its boundary stands 3:1, and a still bar paints that fill.
 #[test]
 fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
@@ -803,6 +850,12 @@ fn a_near_grey_cursor_borrows_blue_or_cyan_and_the_rest_keep_theirs() {
     }
 }
 
+/// The pastel fill: a cursor that is a pastel the 3:1 floor would turn brown
+/// stays the pastel for the progress fill and ends it in a darker edge line,
+/// 3:1 from the track and visibly darker than the fill, with the words on the
+/// fill at AA. No builtin has such a cursor, so the subject is Catppuccin
+/// Latte with upstream's rosewater cursor `#dc8a78`. Every builtin floors its
+/// hue to 3:1 on the band, tints the track from it, and has no edge and no
 /// line in the raster.
 #[test]
 fn only_a_pastel_cursor_keeps_a_pastel_fill_with_a_darker_edge() {
@@ -922,6 +975,9 @@ fn only_a_pastel_cursor_keeps_a_pastel_fill_with_a_darker_edge() {
     assert_eq!(pastels, [UPSTREAM_LATTE]);
 }
 
+/// Drawn icons, no spinner: every glyph a row can carry (plain row, bar,
+/// moving comet with its own glyph, an echo's ✓ and ⚠) is drawn as the band's
+/// icon through the row's raster, and the cell keeps its character for the
 /// text grid.
 #[test]
 fn every_rows_glyph_is_a_drawn_icon_and_its_character_stays() {

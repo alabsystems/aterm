@@ -5,14 +5,12 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Vertical Origin Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/vorg) implementation.
+//! Vertical Origin (`VORG`) table.
 
 use crate::GlyphId;
 use crate::parser::{FromData, LazyArray16, Stream};
 
-/// Vertical origin metrics for the
-/// [Vertical Origin Table](https://docs.microsoft.com/en-us/typography/opentype/spec/vorg).
+/// Vertical origin metrics for a glyph.
 #[derive(Clone, Copy, Debug)]
 pub struct VerticalOriginMetrics {
     /// Glyph ID.
@@ -34,14 +32,12 @@ impl FromData for VerticalOriginMetrics {
     }
 }
 
-/// A [Vertical Origin Table](https://docs.microsoft.com/en-us/typography/opentype/spec/vorg).
+/// Vertical Origin (`VORG`) table.
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// Default origin.
     pub default_y: i16,
-    /// A list of metrics for each glyph.
-    ///
-    /// Ordered by `glyph_id`.
+    /// Metrics for each glyph, ordered by `glyph_id`.
     pub metrics: LazyArray16<'a, VerticalOriginMetrics>,
 }
 

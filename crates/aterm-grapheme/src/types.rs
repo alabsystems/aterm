@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Grapheme data types — structs and enums for grapheme cluster metadata.
+//! Structs and enums for grapheme cluster metadata.
 
 /// Information about a single grapheme cluster.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +78,7 @@ impl GraphemeInfo {
         self.byte_count == 0
     }
 
-    /// Return `true` iff every byte is a single-width ASCII grapheme (`byte_count == grapheme_count == display_width`).
+    /// Return `true` iff every byte is a single-width ASCII grapheme.
     #[must_use]
     #[inline]
     pub const fn is_ascii_single_width(&self) -> bool {
@@ -90,7 +90,7 @@ impl GraphemeInfo {
             && !self.has_wide
     }
 
-    /// Encode the 4 primary 32-bit counts `(grapheme_count, display_width, codepoint_count, byte_count)` into 16 little-endian bytes.
+    /// Encode the four primary 32-bit counts into 16 little-endian bytes.
     #[must_use]
     #[inline]
     pub const fn encode_counts_le(&self) -> [u8; 16] {
@@ -118,7 +118,7 @@ impl GraphemeInfo {
         ]
     }
 
-    /// Decode 16 little-endian bytes into `(grapheme_count, display_width, codepoint_count, byte_count)`.
+    /// Decode 16 little-endian bytes into the four primary 32-bit counts.
     #[must_use]
     #[inline]
     pub const fn decode_counts_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {

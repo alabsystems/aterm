@@ -775,7 +775,8 @@ impl App {
         self.search_enter_impl_in(wid, forward, false);
     }
 
-    /// Shared entry path.
+    /// Shared entry path. Plain Cmd-F starts at the beginning of the buffer;
+    /// Emacs Cmd-S/Cmd-R start at point (cursor or viewport edge).
     fn search_enter_impl_in(
         &mut self,
         wid: crate::WindowId,

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Taps (design §3): git clones under `Library/Taps`, read as data.
-//! A tap formula's `.rb` is never evaluated — stable url/sha256/version
-//! are parsed textually; anything richer passes through at install.
+//! Taps (`Library/Taps`): git clones with formula `.rb` files parsed as data.
 
 use std::path::PathBuf;
 
@@ -158,11 +156,7 @@ fn git_protocol_args(local: bool) -> Vec<&'static str> {
     args
 }
 
-/// Clone a tap, as brew's is (default remote `<user>/homebrew-<repo>`
-/// on GitHub). Re-tapping an installed tap is a silent no-op in brew
-/// — no pull, no output — and an explicit different remote is an
-/// error there, so both are judged here before any git work. The
-/// bool reports whether this call newly tapped.
+/// Clone or verify an installed tap, returning `(tap, newly_tapped)`.
 pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool), String> {
     let (user, repo) = parse_tap_name(name)
         .ok_or_else(|| format!("abrew: tap name must be user/repo, got {name}"))?;
@@ -197,8 +191,6 @@ pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool)
             str::to_owned,
         );
         eprintln!("==> Tapping {user}/{repo} ({remote})");
-        // Clone into a staged sibling; only a complete clone is renamed
-        // into place, so a failed clone never reads as a tapped repo.
         let parent = path
             .parent()
             .ok_or_else(|| "abrew: tap directory has no parent".to_owned())?;
@@ -220,8 +212,7 @@ pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool)
     Ok((Tap { user, repo, path }, true))
 }
 
-/// Update a discovered tap only after re-admitting its prefix-relative path.
-/// The discovery path is not authority, and its repo field is already unprefixed.
+/// Update a discovered tap after validating its prefix-relative path.
 pub(super) fn update(prefix: &Prefix, tap: &Tap) -> Result<(), String> {
     let (path, _) = mutation_path(prefix, &tap.user, &tap.repo, false)?;
     if !std::fs::symlink_metadata(path.join(".git")).is_ok_and(|m| m.is_dir()) {
@@ -235,8 +226,6 @@ pub(super) fn update(prefix: &Prefix, tap: &Tap) -> Result<(), String> {
 
 fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
     eprintln!("==> Updating tap {user}/{repo}");
-    // A tap cloned from a local path keeps a local origin: allow
-    // the file transport for exactly that recorded remote.
     let local = fetch::run_capture(
         "git",
         &["-C", &path.to_string_lossy(), "remote", "get-url", "origin"],
@@ -292,9 +281,6 @@ pub fn remove(prefix: &Prefix, name: &str) -> Result<(), String> {
     if tap_path(prefix, &user, &repo).is_ok_and(|p| std::fs::symlink_metadata(p).is_err()) {
         return Err(format!("abrew: tap {user}/{repo} is not tapped"));
     }
-    // Brew refuses to untap a non-official tap that still has
-    // installed packages (scripted runs cannot confirm the prompt);
-    // the official API taps are exempt, as in brew's API mode.
     let official = user == "homebrew" && matches!(repo.as_str(), "core" | "cask");
     if !official {
         let (formulae, casks) = tap_installed_names(prefix, &user, &repo).map_err(|error| {
@@ -353,8 +339,7 @@ pub fn list(prefix: &Prefix) -> Vec<Tap> {
     out
 }
 
-/// Formula files in a tap: `Formula/<n>.rb`, `Formula/<x>/<n>.rb`, or
-/// top-level `<n>.rb`.
+/// Locate a formula `.rb` file inside `tap`.
 #[must_use]
 pub fn formula_file(tap: &Tap, name: &str) -> Option<PathBuf> {
     if !super::valid_component(name) {
@@ -381,8 +366,7 @@ pub fn formula_file(tap: &Tap, name: &str) -> Option<PathBuf> {
     inside(&sharded).then_some(sharded)
 }
 
-/// Parse a formula `.rb` as data (first `url`, `sha256`, `version`,
-/// `desc`, `homepage`, `depends_on`). Never evaluates Ruby.
+/// Parse a formula `.rb` as data without evaluating Ruby.
 #[must_use]
 pub fn parse_rb_as_data(text: &str, full_name: &str) -> Formula {
     let mut f = Formula {
@@ -512,13 +496,10 @@ mod tests {
             let old = payload(&p, kind, "1.0", Some("someone/tap/tool"));
             let current = payload(&p, kind, "2.0", Some(official));
             let tap = tapped(&p);
-            // The newer version belongs elsewhere. A retained older recipe
-            // still refuses untap, in both the Cellar and Caskroom.
             let error = refused(&p, &tap);
             assert!(error.contains("Refusing to untap someone/tap"), "{error}");
             assert!(error.contains("someone/tap/tool"), "{error}");
             assert!(old.is_dir() && current.is_dir());
-            // The accepted homebrew- spelling names that same tap.
             payload(&p, kind, "1.0", Some("someone/homebrew-tap/tool"));
             assert!(refused(&p, &tap).contains("someone/tap/tool"));
             std::fs::remove_dir_all(&old).unwrap();
@@ -536,8 +517,6 @@ mod tests {
                 Kind::Formula => "name",
                 Kind::Cask => "token",
             };
-            // Ownership alone cannot turn an unknown identity into the
-            // official tap. These receipts still pass the old census.
             for full in [
                 "null",
                 "42",
@@ -561,8 +540,6 @@ mod tests {
             }
             std::fs::remove_file(&receipt).unwrap();
             let _ = refused(&p, &tap);
-            // A directory cannot be read as regular metadata. This is an
-            // unconditional refusal, independent of UID or chmod behavior.
             std::fs::create_dir(&receipt).unwrap();
             let _ = refused(&p, &tap);
             assert!(receipt.is_dir());
@@ -586,8 +563,6 @@ mod tests {
                 assert_eq!(std::fs::read(&external).unwrap(), official_bytes);
                 std::fs::remove_file(&receipt).unwrap();
                 payload(&p, kind, "2.0", Some(official));
-                // Neither a package-row alias nor a retained-version alias
-                // is evidence that the tap is unused.
                 for version_only in [false, true] {
                     let row = if version_only {
                         current.clone()
@@ -605,8 +580,6 @@ mod tests {
                     std::fs::rename(&held, &row).unwrap();
                 }
             }
-            // A valid legacy receipt, then the official API's short-name
-            // receipt, both leave this tap genuinely unused.
             for full in [None, Some("tool")] {
                 payload(&p, kind, "2.0", full);
                 let tap = tapped(&p);

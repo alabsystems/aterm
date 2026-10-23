@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The item families (design §5.1). A family turns its baseline table into [`Item`]s;
-//! [`expand`] collects them all, in the order they must run.
+//! Item families: each turns its baseline table into [`Item`]s, and [`expand`] collects them in run order.
 
 use crate::baseline::Baseline;
 use crate::model::{Effect, HostFacts, PValue, Probe, Read, User};
@@ -40,10 +39,7 @@ pub struct Ctx {
     pub host_name: String,
     /// The agent's root-owned artifact cache: `<sha256 hex>` files, each verified.
     pub cache_dir: PathBuf,
-    /// May a change disrupt someone using the Mac (relaunch their Dock, swap an app they
-    /// have open)? True when nobody is at the console, the console has been idle past
-    /// the envelope's threshold, or the envelope says `now`. Disruptive items probe
-    /// [`Probe::Deferred`] otherwise.
+    /// Whether a change may disrupt someone using the Mac (`false` defers disruptive items with [`Probe::Deferred`]).
     pub disrupt: bool,
 }
 
@@ -59,33 +55,25 @@ impl Ctx {
     }
 }
 
-/// What makes the changes of several items felt at once, handed the `System` and context
-/// on each call as the items are: [`crate::engine::Bound`] makes it an
-/// [`aterm_converge::Activation`], whose contract it keeps (the engine applies every item
-/// that names it, runs it once, then reads them back).
+/// Shared activation step across items, adapted by [`crate::engine::Bound`] to [`aterm_converge::Activation`].
 pub trait Activation: Send + Sync {
     /// Stable id, unique within a run: its journal line's.
     fn id(&self) -> String;
 
-    /// What awaits it, as its journal line's `from` and `to`, or `None` when nothing does.
-    /// Must change nothing.
+    /// Pending journal `from` and `to`, or `None` when nothing awaits activation.
     ///
     /// # Errors
     /// One line when what awaits it cannot be read.
     fn pending(&self, sys: &dyn System, ctx: &Ctx) -> Result<Option<(String, String)>, String>;
 
-    /// Make the applied changes felt, returning once they are, with each item (by id)
-    /// whose part of it did not take effect and why
-    /// ([`aterm_converge::Activation::activate`]).
+    /// Make applied changes take effect and return any failed `(id, reason)` pairs ([`aterm_converge::Activation::activate`]).
     ///
     /// # Errors
     /// One line when none of it took effect; what awaits it stays for the next run.
     fn activate(&self, sys: &dyn System, ctx: &Ctx) -> Result<Vec<(String, String)>, String>;
 }
 
-/// One setting the engine probes, plans, applies and verifies, handed the `System` and
-/// context it runs against on each call; [`crate::engine::Bound`] makes it an
-/// [`aterm_converge::Item`].
+/// One setting the engine probes, plans, applies, and verifies, adapted by [`crate::engine::Bound`] to [`aterm_converge::Item`].
 pub trait Item: Send + Sync {
     /// Stable id, unique within a run (e.g. `power.sleep`, `defaults.com.apple.dock.autohide@alice`).
     fn id(&self) -> String;
@@ -99,16 +87,13 @@ pub trait Item: Send + Sync {
     /// Read the host and decide. Must change nothing.
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe;
 
-    /// Make the change the last [`Item::probe`] planned. The engine probes again afterwards,
-    /// and only a matching read-back counts.
+    /// Apply the change planned by [`Item::probe`].
     ///
     /// # Errors
     /// One line saying what did not work.
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String>;
 
-    /// Typed before-images of the preference keys this item currently plans to
-    /// change. A caller can persist these before running a workstation repair;
-    /// account credentials and runtime-only input mappings are never included.
+    /// Typed before-images of preference keys this item currently plans to change.
     ///
     /// # Errors
     /// A preference that would be overwritten cannot be read safely.
@@ -120,10 +105,7 @@ pub trait Item: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Reapply an idempotent runtime setting whose saved preferences already match.
-    /// Called only in apply mode after an `Ok` probe. `Some` requires another matching
-    /// probe; `None` preserves the ordinary already-correct path without another read.
-    /// This must not change the user's saved choice or install background work.
+    /// Reapply an idempotent runtime setting after an `Ok` probe in apply mode.
     fn refresh(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<Result<(), String>> {
         None
     }
@@ -138,15 +120,12 @@ pub trait Item: Send + Sync {
         Effect::Now
     }
 
-    /// The [`Activation`] this item's change shares with the other items whose writes one
-    /// consumer reads ([`aterm_converge::Item::activation`]): the engine reads the item
-    /// back only after it ran. `None`, the default: `apply` makes the change felt itself.
+    /// Shared [`Activation`] run before read-back ([`aterm_converge::Item::activation`]).
     fn activation(&self) -> Option<Arc<dyn Activation>> {
         None
     }
 
-    /// Ids of items that must end `Ok` or `Changed` before this one may apply (Command
-    /// Line Tools before Homebrew). An id ending in `*` names every item with that prefix.
+    /// Item ids (or `<prefix>*` patterns) that must finish `Ok` or `Changed` before this item applies.
     fn after(&self) -> Vec<String> {
         Vec::new()
     }
@@ -156,47 +135,31 @@ pub trait Item: Send + Sync {
         None
     }
 
-    /// Why the last [`Item::apply`] stood aside without changing anything and without
-    /// failing: a lock another run holds, a network the change needs that is down
-    /// (atpkg's exits 75 and 69). The engine then reports the item `Blocked` with this
-    /// line rather than probing it again. `None`, the default, when the apply did its
-    /// work or returned an error.
+    /// Reason the last [`Item::apply`] stood aside without changing anything or failing (`Blocked`).
     fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
         None
     }
 
-    /// Why the probe just made answered `Unusable` because the run lacks what the read
-    /// needs (the network is down, [`aterm_converge::Item::read_aside`]): the engine then
-    /// reports it `Blocked` with this line, so the surface exits 69 rather than 1. `None`,
-    /// the default.
+    /// Reason an `Unusable` probe was blocked by a missing prerequisite ([`aterm_converge::Item::read_aside`]).
     fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
         None
     }
 
-    /// Why this item leaves some of its keys alone in this pass: they are in another app's
-    /// sandbox container and the pass holds no known Full Disk Access
-    /// ([`defaults::withheld`]). Such an item is not done, whatever its row reads, until a
-    /// pass with the grant reaches those keys. `None`, the default: it reaches all of them.
+    /// Reason this item skipped keys in another app's sandbox container without Full Disk Access ([`defaults::withheld`]).
     fn withheld(&self) -> Option<String> {
         None
     }
 
-    /// Why this item stands aside before it acts ([`aterm_converge::Item::stands_aside`]):
-    /// the run lacks what its change needs (the vault a join reads does not answer). The
-    /// engine then neither journals nor applies it, and reports it `Blocked` with this
-    /// line. Asked in an apply, after a probe that planned a change. `None`, the default.
+    /// Reason this item stands aside before applying ([`aterm_converge::Item::stands_aside`]).
     fn stands_aside(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<aterm_converge::StoodAside> {
         None
     }
 }
 
-/// Every item `baseline` asks for, in run order: tools before what needs them (Command
-/// Line Tools before Homebrew, Homebrew before its formulae, aterm before its person
-/// steps), and settings before the person steps that close a run.
+/// Expand every item requested by `baseline` in dependency and execution order.
 ///
 /// # Errors
-/// One line naming the table that cannot be expanded (for example a user it names that
-/// does not exist on this host).
+/// One line naming the table that cannot be expanded.
 pub fn expand(baseline: &Baseline, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let mut items: Vec<Box<dyn Item>> = Vec::new();
     if let Some(t) = &baseline.names {

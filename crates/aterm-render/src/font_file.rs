@@ -101,7 +101,8 @@ fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Portable fallback.
+/// Portable fallback. Targets without a non-blocking filesystem-open flag use
+/// a no-link precheck and still verify the opened handle before reading.
 #[cfg(not(any(unix, windows)))]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
@@ -207,7 +208,9 @@ unsafe impl Sync for MappedFontFile {}
 
 #[cfg(unix)]
 impl MappedFontFile {
-    /// Map `len` bytes of an already-admitted handle.
+    /// Map `len` bytes of an already-admitted handle. `len` is the `fstat`
+    /// size [`check_observed_size`] bounded, so the mapping never addresses a
+    /// byte past the admission limit.
     fn map(file: &std::fs::File, len: u64) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::AsRawFd as _;
@@ -676,7 +679,8 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A refused path must not leave the previous font in a reused buffer.
+    /// A refused path must not leave the previous font in a reused buffer. One case per
+    /// fallible admission step, in source order.
     #[test]
     fn a_refused_path_leaves_no_stale_font_in_a_reused_buffer() {
         let root = fixture_dir("stale");

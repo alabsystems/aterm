@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The libwayland-client entry points the runtime calls, read at run time
-//! through `aterm-dl`. Each row transcribes `wayland-client-core.h`; the
-//! array marshaller (`wl_proxy_marshal_array_flags`) is libwayland 1.20's,
-//! what wayland-backend 0.3 required too.
+//! libwayland-client entry points loaded at run time through `aterm-dl`.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;

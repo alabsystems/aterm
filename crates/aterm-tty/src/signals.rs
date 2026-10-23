@@ -246,8 +246,8 @@ mod unix {
         while unsafe { libc::read(rd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
     }
 
-    /// Restores terminal modes and stops the process via `SIGTSTP`, re-entering raw
-    /// mode after `SIGCONT`.
+    /// Restores terminal modes and stops the process via `SIGTSTP` (unless SIGTSTP was
+    /// ignored when the wake was installed), re-entering raw mode once it continues.
     ///
     /// # Errors
     /// Setting the terminal raw again failed.

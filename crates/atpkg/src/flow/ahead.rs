@@ -16,7 +16,9 @@ use crate::manifest::Channel;
 use crate::sig::TrustedIndex;
 use crate::store::Layout;
 
-/// The most bytes fetched ahead of the pass and not yet taken by it.
+/// The most bytes fetched ahead of the pass and not yet taken by it. Enough for the rest of
+/// the ALab set (about 360 MB beside the trust archive) to arrive while the trust archive
+/// extracts and the toolchain flips; an archive bigger than this waits for the pass.
 const AHEAD_BYTES: u64 = 512 << 20;
 
 /// One archive the pass will want: a member's signed row, admitted as the pass admits it.
@@ -293,7 +295,9 @@ impl Ahead {
         units.into_iter().find_map(queued_in)
     }
 
-    /// On the pass thread: take `program`'s archive at `dl` from this lane.
+    /// On the pass thread: take `program`'s archive at `dl` from this lane. `Some(Ok(()))` when
+    /// this lane fetched it — waiting for it when it is still moving, or when it had not
+    /// started and the lane is idle, which then fetches it at once.
     fn claim(&self, program: &str, dl: &Path) -> Option<Result<(), String>> {
         let i = self.jobs.iter().position(|j| j.program == program)?;
         let ours = self.jobs[i].dl == dl;

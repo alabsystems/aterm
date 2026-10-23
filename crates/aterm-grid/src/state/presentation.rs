@@ -124,7 +124,8 @@ pub enum SelectionDamage {
 }
 
 impl SelectionDamage {
-    /// Copy this value's bands into `out`, returning how many were written.
+    /// Copy this value's bands into `out`, returning how many were written. `None`
+    /// writes none; `All` is absorbing and is handled by the caller before this runs.
     fn spill(self, out: &mut [(u64, u64)]) -> usize {
         match self {
             Self::None | Self::All => 0,

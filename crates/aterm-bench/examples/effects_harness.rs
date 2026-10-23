@@ -956,7 +956,8 @@ impl LineHost {
         });
     }
 
-    /// Lay the line's ink and `✦` on the frame.
+    /// Lay the line's ink and `✦` on the frame. The bench's frames carry no other producer's,
+    /// so the last splice's are taken back by clearing the two streams.
     fn lay(&self, input: &mut RenderInput) {
         input.ink.clone_from(&self.ink);
         input.word_decorations.clear();

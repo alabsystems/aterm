@@ -20,7 +20,8 @@ unsafe extern "C" {
     fn os_unfair_lock_unlock(lock: *mut OsUnfairLock);
 }
 
-/// A value only the holder of its `os_unfair_lock` reaches.
+/// A value only the holder of its `os_unfair_lock` reaches. It is shared
+/// only from inside an `Arc`, so the lock's word never moves while in use.
 struct UnfairMutex<T> {
     word: UnsafeCell<OsUnfairLock>,
     value: UnsafeCell<T>,
@@ -29,7 +30,8 @@ struct UnfairMutex<T> {
 // SAFETY: the value is reached only through a `Guard`, and a guard exists only while its thread holds the lock, so one thread at a time touches it.
 unsafe impl<T: Send> Sync for UnfairMutex<T> {}
 
-/// The lock, held.
+/// The lock, held. It unlocks on drop, on the thread that locked it: it is
+/// `!Send`, since an unlock from any other thread aborts the process.
 struct Guard<'a, T> {
     mutex: &'a UnfairMutex<T>,
     _locked_here: PhantomData<*const ()>,
@@ -102,7 +104,8 @@ impl Armed {
         !self.0.swap(true, Ordering::AcqRel)
     }
 
-    /// Clear it, before a take.
+    /// Clear it, before a take. A read-modify-write, so it reads the last
+    /// arm and sees every push made before it.
     fn clear(&self) {
         self.0.swap(false, Ordering::AcqRel);
     }

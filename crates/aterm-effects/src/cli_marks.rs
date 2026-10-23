@@ -220,7 +220,8 @@ pub const fn brand(mark: CliMark) -> &'static Brand {
     }
 }
 
-/// Claude Code.
+/// Claude Code. MEASURED: the mascot's `38;2;215;119;87` and the eyes'
+/// `48;2;0;0;0` (2.1.304), on every ground.
 const CLAUDE: Brand = Brand {
     word: "claude",
     alab_word: None,
@@ -232,7 +233,8 @@ const CLAUDE: Brand = Brand {
     hd: Some(CLAUDE_HD),
 };
 
-/// Codex: the owner's "OpenAI blue".
+/// Codex: the owner's "OpenAI blue". Codex itself draws no brand colour
+/// (`>_ OpenAI Codex` in bold, `/model` in ANSI cyan, 0.154).
 const CODEX: Brand = Brand {
     word: "codex",
     alab_word: Some("codex-alab"),
@@ -244,7 +246,12 @@ const CODEX: Brand = Brand {
     hd: Some(CODEX_HD),
 };
 
-/// agy.
+/// agy. MEASURED on screen (1.4.4 in the real-agy lab, 2026-10-21, `ctl
+/// cell` of every banner cell): the banner is one fixed two-dimensional
+/// gradient, the same on a dark and a light ground and at every launch —
+/// gold to red over the apex, green to teal down the left leg, violet to
+/// blue down the right — and its `▀` cells carry a colour in their
+/// background too, so the logo is a solid `A`, not an outline.
 const AGY: Brand = Brand {
     word: "agy",
     alab_word: None,
@@ -294,7 +301,10 @@ const MUSE: Brand = Brand {
     hd: Some(MUSE_HD),
 };
 
-/// Gemini CLI.
+/// Gemini CLI. MEASURED: 0.46.0's `GradientColors: ["#4796E4", "#847ACE",
+/// "#C3677F"]` (its default theme, light and dark). The name's letter `k` of
+/// six sits at `t = k/5` along it, the icon's eight stops at `t = k/7`, one a
+/// band of columns left to right; `a`–`h` are stops 1–8 at half alpha.
 const GEMINI: Brand = Brand {
     word: "gemini",
     alab_word: None,
@@ -327,7 +337,8 @@ const GEMINI: Brand = Brand {
     hd: Some(GEMINI_HD),
 };
 
-/// Grok: xAI's monochrome, flipped with the ground.
+/// Grok: xAI's monochrome, flipped with the ground. Ready as data; a take of
+/// Grok's own screen confirms the ink before a program maps onto it.
 const GROK: Brand = Brand {
     word: "grok",
     alab_word: None,

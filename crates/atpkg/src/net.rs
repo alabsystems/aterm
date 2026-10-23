@@ -15,7 +15,8 @@ fn web_asset_url(slug: &str, tag: &str, name: &str) -> Option<String> {
     aterm_update_core::cdn::release_download_url(owner, repo, tag, name)
 }
 
-/// The one way this fetcher reads bytes from the release download host.
+/// The one way this fetcher reads bytes from the release download host. Neither it nor the
+/// transport takes a credential, so no token can reach `github.com`; an API URL is refused.
 fn web_fetch_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
     refuse_api_host(url)?;
     aterm_update_core::download_bytes(url, cap)
@@ -129,7 +130,11 @@ const WALK_HEAD_BUDGET: u32 = 48;
 /// channel's first build ([`newest_index`]).
 const FIRST_INDEX_SEARCH_LIMIT: u64 = 1 << 20;
 
-/// How many requests one discovery round or candidate fetch keeps in flight.
+/// How many requests one discovery round or candidate fetch keeps in flight. Each is still
+/// its own `curl` process over the unchanged single-URL calls (`-q` first, `--` before the
+/// one URL, https only, capped, retried per URL); twenty of them at once measured the same
+/// wall time as one batched `curl -Z` (0.25–0.48 s), where twenty in turn took four seconds
+/// — a fresh process and two TLS handshakes each.
 const FETCH_CONCURRENCY: usize = 20;
 
 /// How many requests the manifest prefetch keeps in flight: both halves of every pair of a
@@ -2566,7 +2571,9 @@ mod tests {
         }
     }
 
-    /// A WALK'S FIRST ROUND IS ITS LINK PROBE.
+    /// A WALK'S FIRST ROUND IS ITS LINK PROBE. When every first attempt in it reached no host,
+    /// the walk fails then and there: the link is held down once for the process, and no HEAD
+    /// backs off to try again — the offline first launch's whole wait.
     #[test]
     fn a_walk_whose_first_round_reaches_no_host_is_offline_at_once() {
         use crate::flow::Fetcher as _;
@@ -2663,7 +2670,9 @@ mod tests {
         std::fs::write(PathBuf::from(dir).join("verdicts"), out.join("\n")).unwrap();
     }
 
-    /// PKG-4'S LINK PROBE, COUNTED IN PROCESSES.
+    /// PKG-4'S LINK PROBE, COUNTED IN PROCESSES. The first round runs in a child of this test
+    /// binary ([`probe_a_first_round_over_counted_curl`]) whose every curl is a wrapper that
+    /// logs its URL and answers as the scenario says.
     #[cfg(unix)]
     #[test]
     fn a_first_rounds_curls_are_one_per_head_offline_and_whole_online() {

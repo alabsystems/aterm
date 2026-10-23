@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The toy module: one export for each boundary type and shape
-//! aterm-wasm-abi carries, so `verify glue`'s output for it is a golden
-//! file and drive.mjs can hold every conversion to its JS value under node.
+//! Toy WebAssembly module exporting every `aterm-wasm-abi` boundary type and shape.
 
 #![cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 
@@ -11,10 +9,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_wasm_abi::{export, host, panic_hook};
 
-// The allocator and return slot the glue calls, once per module.
 aterm_wasm_abi::export_runtime!();
 
-/// Values dropped so far: how the driver sees a FinalizationRegistry free.
+/// Values dropped so far.
 static DROPS: AtomicU32 = AtomicU32::new(0);
 
 macro_rules! echo {

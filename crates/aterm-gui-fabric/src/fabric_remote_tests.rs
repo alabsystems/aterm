@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE REMOTE SLOT (the step-in,
-//! `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1): another Mac's
-//! node holds a tab over the fleet's drive op, and the person wins. Asserted
-//! on answers' classes, slot origins and words, never on sentence prose.
+//! Tests for the remote hold slot across fleet drive operations.
 
 use super::inbox_hold::registered_as;
 use super::*;
@@ -62,7 +59,6 @@ fn a_nodes_hold_refuses_every_writer_but_that_node() {
         "the node's own writes pass"
     );
     assert!(refusal_to(&ctx, Some(&m03), "turn").is_none());
-    // Another node neither takes it nor lifts it.
     for rest in [format!("{sid} on"), format!("{sid} off")] {
         let reply = remote(&store, &m09, &rest);
         assert!(
@@ -104,7 +100,6 @@ fn the_persons_take_over_refuses_and_clears_a_nodes_hold() {
     );
     let refused = refusal_to(&ctx, Some(&m03), "send").expect("the person's hold binds the node");
     assert!(refused.contains(" origin=person"), "{refused}");
-    // The node's lift of the slot it lost lifts nothing of the person's.
     assert_eq!(remote(&store, &m03, &format!("{sid} off")), "OK hold=1\n");
     assert_eq!(ctx.fabric.holds().origins(), PERSON_ORIGIN);
     assert_eq!(person_hold(&ctx, false, &|| {}), PersonHoldOutcome::Moved);
@@ -150,7 +145,6 @@ fn no_local_connection_names_the_remote_slot_and_no_carry_writes_it() {
         render_holds(&ctx.fabric.holds()),
         vec!["local mine".to_owned()]
     );
-    // The Owner's lift is its own slot's: the node's stands.
     assert_eq!(
         cmd_hold(&store, &format!("{sid} off"), HoldIssuer::Owner),
         "OK hold=1\n"

@@ -110,7 +110,10 @@ fn put_script(path: &Path, text: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
-/// The guard's refusal of the boot `boot` makes: its message.
+/// The guard's refusal of the boot `boot` makes: its message. A boot the guard
+/// let through fails the test; any other panic (a machine that refuses the
+/// instance, a product that cannot start) is the test's own outcome, raised
+/// again.
 fn refusal(boot: impl FnOnce() -> Instance) -> String {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(boot));
     let payload = match caught {

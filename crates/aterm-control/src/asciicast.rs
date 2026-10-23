@@ -458,7 +458,9 @@ impl JsonReader<'_> {
         Ok(v)
     }
 
-    /// A JSON string at the cursor (on its `"`).
+    /// A JSON string at the cursor (on its `"`). Escapes decode, `\uXXXX`
+    /// included; a surrogate pair joins into one scalar and a lone surrogate
+    /// becomes U+FFFD.
     fn string(&mut self) -> Result<String, String> {
         if self.s.get(self.i) != Some(&b'"') {
             return Err("expected a JSON string".to_string());

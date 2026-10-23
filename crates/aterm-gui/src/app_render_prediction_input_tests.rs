@@ -75,7 +75,7 @@ fn sample(app: &App) -> ((u16, u16), u64, (u16, u16)) {
 /// displays the next key. Typed on the predictor itself: no input edge is armed
 /// for these two. Returns the instant of the second echo's reconcile.
 fn prime_slow_echoes(app: &mut App) -> Instant {
-    let mut at = Instant::now();
+    let mut at = crate::app_input::past_timeline_start();
     for ch in ['a', 'b'] {
         let (cursor, coords, grid) = sample(app);
         let predictor = &mut app.windows.get_mut(&WID).expect("window").predictor;
@@ -202,14 +202,14 @@ fn a_keys_proven_prediction_on_glass_closes_its_input_slice() {
 
         let mut app = rig("off", split);
         assert_eq!(
-            press_then_echo(&mut app, Instant::now()),
+            press_then_echo(&mut app, crate::app_input::past_timeline_start()),
             ((0, 0), false, (1, 0)),
             "{path}, prediction off: the key waits for its echo's present"
         );
 
         let mut app = rig("always", split);
         assert_eq!(
-            press_then_echo(&mut app, Instant::now()),
+            press_then_echo(&mut app, crate::app_input::past_timeline_start()),
             ((0, 0), true, (1, 0)),
             "{path}, `always`: a ghost with no proof is not the key's effect"
         );

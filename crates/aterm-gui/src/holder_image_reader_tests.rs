@@ -278,7 +278,9 @@ impl Rig {
         rig
     }
 
-    /// Attach the real reader and wait for its gather.
+    /// Attach the real reader and wait for its gather. Each `Wake::Output`
+    /// is recorded and handled at once (the latch cleared, as the UI's pass
+    /// does), so every chunk's wake posts.
     fn start_reader(&mut self) {
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (id, wakes) = (self.id, Arc::clone(&self.wakes));

@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! A minimal client over `std::net::TcpStream`: it writes a request head, reads to EOF, and
-//! splits status, headers and body.
+//! Minimal HTTP test client over `std::net::TcpStream`.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
@@ -25,8 +24,7 @@ pub struct Req {
     body: Vec<u8>,
 }
 
-/// A GET as agh sends one to the api origin: `User-Agent`, `X-GitHub-Api-Version` and the
-/// JSON `Accept`.
+/// Builds a GET request with API origin headers.
 pub fn api(target: &str) -> Req {
     Req {
         method: "GET".into(),
@@ -106,9 +104,7 @@ impl Req {
     /// Send it to `port` and read the answer to EOF.
     ///
     /// # Panics
-    ///
-    /// When the fake cannot be reached, or does not take the request or answer it within the
-    /// hang detector.
+    /// When the fake cannot be reached or does not answer in time.
     pub fn send(&self, port: u16) -> Reply {
         let mut head = format!(
             "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n",
@@ -127,9 +123,7 @@ impl Req {
 /// Send `bytes` to `port` as they are, and read the answer to EOF.
 ///
 /// # Panics
-///
-/// When the fake cannot be reached, or does not take the request or answer it within the
-/// hang detector.
+/// When the fake cannot be reached or does not answer in time.
 pub fn send_bytes(port: u16, bytes: &[u8]) -> Reply {
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect to the fake");
     stream.set_read_timeout(Some(HANG)).expect("read timeout");
@@ -142,12 +136,10 @@ pub fn send_bytes(port: u16, bytes: &[u8]) -> Reply {
     Reply::parse(raw)
 }
 
-/// Send `bytes` to `port` as they are, close the write side, and read the answer to EOF:
-/// a request cut short where `bytes` end.
+/// Sends `bytes` to `port`, closes the write side, and reads the answer to EOF.
 ///
 /// # Panics
-///
-/// When the fake cannot be reached, or does not answer within the hang detector.
+/// When the fake cannot be reached or does not answer in time.
 pub fn send_cut(port: u16, bytes: &[u8]) -> Reply {
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect to the fake");
     stream.set_read_timeout(Some(HANG)).expect("read timeout");
@@ -226,7 +218,6 @@ impl Reply {
     /// The body as JSON.
     ///
     /// # Panics
-    ///
     /// When the body is not JSON.
     pub fn json(&self) -> aterm_json::Value {
         aterm_json::from_slice(&self.body).expect("a JSON body")

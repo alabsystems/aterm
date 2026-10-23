@@ -7,8 +7,7 @@
 // operations the autohinter and its outline loader use, nothing else.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
-//! Fixed-point numbers: 16.16 ([`Fixed`]), 26.6 ([`F26Dot6`]) and 2.14
-//! ([`F2Dot14`]), with FreeType's rounding, and a 2D [`Point`].
+//! Fixed-point numbers ([`Fixed`], [`F26Dot6`], [`F2Dot14`]) and 2D [`Point`].
 
 use core::ops::{Add, AddAssign, Div, Mul, Neg, Sub, SubAssign};
 
@@ -143,26 +142,21 @@ impl Fixed {
         Self(i << 16)
     }
 
-    /// Converts a 16.16 fixed point value to a 32 bit integer, rounding off
-    /// the fractional bits.
+    /// Converts a 16.16 fixed point value to a 32 bit integer, rounding off the fractional bits.
     #[inline(always)]
     pub const fn to_i32(self) -> i32 {
         self.0.wrapping_add(0x8000) >> 16
     }
 
-    /// Converts a 16.16 to 2.14 fixed point value: add 2 and sign-extend
-    /// shift right by 2, as the OpenType variations overview prescribes.
+    /// Converts a 16.16 to 2.14 fixed point value.
     #[inline(always)]
     pub const fn to_f2dot14(self) -> F2Dot14 {
         F2Dot14((self.0.wrapping_add(2) >> 2) as _)
     }
 
-    /// Creates a fixed point value from an `f64`, rounded to the nearest
-    /// representable value.
+    /// Creates a fixed point value from an `f64`, rounded to the nearest representable value.
     #[inline(always)]
     pub fn from_f64(x: f64) -> Self {
-        // When x is positive: 1.0 - 0.5 =  0.5
-        // When x is negative: 0.0 - 0.5 = -0.5
         let frac = (x.is_sign_positive() as u8 as f64) - 0.5;
         Self((x * Self::ONE.0 as f64 + frac) as _)
     }
@@ -175,15 +169,13 @@ impl F26Dot6 {
         Self(i << 6)
     }
 
-    /// Converts a 26.6 fixed point value to a 32 bit integer, rounding off
-    /// the fractional bits.
+    /// Converts a 26.6 fixed point value to a 32 bit integer, rounding off the fractional bits.
     #[inline(always)]
     pub const fn to_i32(self) -> i32 {
         self.0.wrapping_add(32) >> 6
     }
 
-    /// Converts a 26.6 fixed point value to a single precision floating
-    /// point value.
+    /// Converts a 26.6 fixed point value to a single precision floating point value.
     #[inline(always)]
     pub const fn to_f32(self) -> f32 {
         const SCALE_FACTOR: f32 = 1.0 / 64.0;
@@ -215,8 +207,7 @@ impl<T> Point<T> {
         Self { x, y }
     }
 
-    /// Creates a new point by applying the mapping function to each
-    /// coordinate.
+    /// Creates a new point by applying the mapping function to each coordinate.
     #[inline(always)]
     pub fn map<U>(self, mut f: impl FnMut(T) -> U) -> Point<U> {
         Point {
@@ -272,8 +263,6 @@ impl<T: Mul<Output = T> + Copy> Mul<T> for Point<T> {
 
 #[cfg(test)]
 mod tests {
-    // font-types 0.12.4 src/fixed.rs, the tests of the operations this
-    // subset keeps.
     use super::*;
 
     #[test]

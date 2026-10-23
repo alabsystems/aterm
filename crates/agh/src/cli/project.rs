@@ -96,7 +96,7 @@ pub fn parse_fields(text: &str) -> Result<Vec<FieldPath>> {
 }
 
 /// The nouns printed whole: no default projection.
-pub(crate) fn is_whole(noun: Noun) -> bool {
+pub(crate) const fn is_whole(noun: Noun) -> bool {
     matches!(
         noun,
         Noun::Route | Noun::Raw | Noun::Wait | Noun::Meta | Noun::Policy
@@ -105,7 +105,7 @@ pub(crate) fn is_whole(noun: Noun) -> bool {
 
 /// The noun's default projection (design §8.3, and the plan's table).
 #[must_use]
-pub fn default_fields(noun: Noun) -> &'static [&'static str] {
+pub const fn default_fields(noun: Noun) -> &'static [&'static str] {
     match noun {
         Noun::Release => &[
             "id",
@@ -206,7 +206,7 @@ const IDENTITY: &[&str] = &[
 
 /// The noun's derived fields (computed by the verb, not GitHub's).
 #[must_use]
-pub fn derived_fields(noun: Noun) -> &'static [&'static str] {
+pub const fn derived_fields(noun: Noun) -> &'static [&'static str] {
     match noun {
         Noun::Release | Noun::ReleaseList => &["latest", "repo"],
         Noun::Commit => &["date", "subject", "author"],
@@ -307,7 +307,8 @@ fn value_at_steps(value: &Value, steps: &[Step]) -> Value {
 }
 
 /// Usage when a top-level name is in neither the noun's schema (its default and derived fields) nor
-/// `sample`'s keys: `no field {name} in {noun}; fields: {sorted list}`.
+/// `sample`'s keys: `no field {name} in {noun}; fields: {sorted list}`. With no `sample` every name
+/// passes.
 /// # Errors
 /// As above.
 pub fn validate_fields(noun: Noun, fields: &[FieldPath], sample: Option<&Value>) -> Result<()> {

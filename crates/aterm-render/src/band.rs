@@ -281,7 +281,10 @@ fn seam_rails_the_stack(
             .all(|m| m.rail.is_empty() && m.rail_h == 0 && m.rings.is_empty() && m.own.is_empty())
 }
 
-/// Draw the seams as rails.
+/// Draw the seams as rails. The face's underline runs through the descenders of `p`, `g`
+/// and `y`; instead each seam becomes a 1 px rail on the row's last pixel row
+/// ([`ChromeRaster::clear_rail`]) that lifts the words two pixels, leaving one clear row
+/// and no glyph ink crossing any line.
 fn rail_the_seams(
     rows: &mut [Vec<RenderCell>],
     rasters: &mut Vec<ChromeRaster>,

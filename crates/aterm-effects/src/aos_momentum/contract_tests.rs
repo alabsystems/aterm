@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The corrected contract, `momentum-glow.no-stranded-light`: on one captured trace the
-//! demonstration fault fails `HotHasWake` at the first settling query and the shipped code
-//! passes; the shipped code passes on every random in-profile stream; and each law is broken
-//! by its own mutant of a passing run (its negative control).
+//! Contract tests for `momentum-glow.no-stranded-light` and mutant negative controls.
 
 use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::replay::Run;
@@ -25,8 +22,7 @@ fn judge(host: &crate::aos_momentum::MomentumHost, run: &Run<MomentumSchema>) ->
     NoStrandedLight::new().judge(b.schema(), inputs, run)
 }
 
-/// A host attached under the shipped code that typed a burst and ran its lane to the
-/// clearing frame.
+/// Attached host under the shipped code that typed a burst and ran its lane to the clearing frame.
 fn full_cool_down(t0: Instant, dark: bool) -> crate::aos_momentum::MomentumHost {
     let mut host = attached(t0, MomentumCode::Shipped);
     let c = cfg(dark);
@@ -60,8 +56,6 @@ fn on_one_trace_the_demonstration_fault_strands_light_and_the_shipped_code_does_
             }
             Verdict::Pass => panic!("dark={dark}: the demonstration fault passed"),
         }
-        // The trace exercised every law the shipped code passed: settle wakes and a tick
-        // past the cold forecast.
         let schedules = shipped
             .observations
             .iter()
@@ -170,7 +164,6 @@ fn a_tick_past_the_cold_forecast_that_still_draws_breaks_cold_tick_clears() {
     }
     let contract = NoStrandedLight::new();
     let schema = hosted(&host).boundary.schema();
-    // A key between the forecast and the tick: the law no longer applies.
     let mut keyed_inputs = inputs.clone();
     let mut keyed = lit(&run);
     keyed_inputs[last - 1] = MomentumEvent::Key {
@@ -179,15 +172,11 @@ fn a_tick_past_the_cold_forecast_that_still_draws_breaks_cold_tick_clears() {
     };
     keyed.observations[last - 1].1 = MomentumObservation::Keyed;
     assert_eq!(contract.judge(schema, &keyed_inputs, &keyed), Verdict::Pass);
-    // Another intensity than the forecast's: the law no longer applies.
     let mut dimmer = inputs.clone();
     if let MomentumEvent::Tick { cfg, .. } = &mut dimmer[last] {
         cfg.intensity = 0.5f32.to_bits();
     }
     assert_eq!(contract.judge(schema, &dimmer, &lit(&run)), Verdict::Pass);
-    // A key after the latching tick and before the forecast's query: the key moves the latch
-    // only at the next tick, so that query's `cold_at` is stale and forecasts nothing (the
-    // shape random stream 18 found: keys, a query, then a hot tick past the stale forecast).
     assert!(
         matches!(inputs[last - 1], MomentumEvent::Query { .. }),
         "fixture: query, tick"

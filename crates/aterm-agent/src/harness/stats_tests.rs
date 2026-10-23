@@ -281,7 +281,8 @@ fn a_failed_badge_set_opens_no_person_wait() {
     assert_eq!((acc.escalated, acc.human_wait_ms), (1, 2_000), "{acc:#?}");
 }
 
-/// A refused clear says nothing changed on the server.
+/// A refused clear says nothing changed on the server. Unknown result
+/// words are no success either; only the confirmed retry ends this wait.
 #[test]
 fn a_failed_badge_clear_keeps_the_wait_open_until_a_confirmed_clear() {
     for reply in ["ERR denied", "ERR timeout", "OKAY", ""] {
@@ -2350,7 +2351,8 @@ fn a_kept_reset_says_why_in_words_and_a_cut_answer_closes_its_quote() {
     assert!(text.chars().count() > DECIDED_CHARS);
 }
 
-/// The public fold accepts i64 timestamps.
+/// The public fold accepts i64 timestamps. A whole-domain gap starts a
+/// new burst while adjacent early timestamps still share their actual row.
 #[test]
 fn a_burst_stays_separate_across_the_whole_timestamp_domain() {
     let mut acc = HarnessStats::per_session(i64::MIN);

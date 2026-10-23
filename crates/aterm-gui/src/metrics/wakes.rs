@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE USER-EVENT WAKES BY `Wake` VARIANT (`wakes_by_variant`, responsiveness
-//! audit item 2). `event_wakes` counts every loop iteration; nothing said which
-//! proxy event drove them.
-//!
-//! Two halves, split by owner. [`WakeTable`] is the published ledger: one
-//! count per slot, written with a single relaxed `fetch_add` and read by the
-//! control thread with no lock. [`WakeCensus`] is the UI thread's map from a
-//! variant's discriminant to its slot, a field of `App`, so a delivered event
-//! costs one map lookup and one atomic add. A variant's name is read once,
-//! the first time a census sees it, by [`variant_name`].
+//! Per-variant user-event wake counters ([`WakeTable`] and UI-thread [`WakeCensus`]).
 
 use std::fmt;
 use std::mem::Discriminant;
@@ -26,9 +17,7 @@ const OTHER: usize = WAKE_SLOTS - 1;
 /// The process's wake ledger, read by `metrics` and zeroed by `metrics reset`.
 pub(crate) static WAKES: WakeTable = WakeTable::new();
 
-/// Counts by slot, and each slot's variant name. A slot is claimed for a
-/// name once, in slot order, and keeps it for the life of the table; `reset`
-/// zeroes the counts only.
+/// Lock-free per-slot wake counts and once-claimed variant names.
 pub(crate) struct WakeTable {
     counts: [AtomicU64; WAKE_SLOTS],
     names: [OnceLock<&'static str>; WAKE_SLOTS],
@@ -49,7 +38,6 @@ impl WakeTable {
     /// Cold: a census calls it once per variant it sees.
     fn slot(&self, name: &str) -> usize {
         for (i, cell) in self.names[..OTHER].iter().enumerate() {
-            // Bounded: one short string per variant, for the life of the table.
             if *cell.get_or_init(|| Box::leak(name.into())) == name {
                 return i;
             }
@@ -58,9 +46,7 @@ impl WakeTable {
         OTHER
     }
 
-    /// The counted wakes since the last reset, busiest first (ties by name),
-    /// zero entries omitted. A slot claimed while this reads may be missed
-    /// by this read; its count is the few events in flight.
+    /// Counted wakes since the last reset, sorted busiest first (ties by name), omitting zeroes.
     #[must_use]
     pub(crate) fn attribution(&self) -> Vec<(&'static str, u64)> {
         let mut out: Vec<(&'static str, u64)> = self
@@ -68,7 +54,6 @@ impl WakeTable {
             .iter()
             .zip(&self.counts)
             .filter_map(|(name, count)| {
-                // The name first: a slot's name is set before its first count.
                 let name = *name.get()?;
                 let n = count.load(Ordering::Relaxed);
                 (n != 0).then_some((name, n))
@@ -86,8 +71,7 @@ impl WakeTable {
     }
 }
 
-/// UI-thread state: which slot of its table each `Wake` variant counts in.
-/// Lives in `App`; no static, no lock.
+/// UI-thread map from each [`crate::Wake`] discriminant to its [`WakeTable`] slot.
 pub(crate) struct WakeCensus {
     table: &'static WakeTable,
     slots: aterm_hash::FxHashMap<Discriminant<crate::Wake>, usize>,
@@ -118,6 +102,7 @@ impl WakeCensus {
     }
 }
 
+// Extracts the leading identifier of `ev`'s `Debug` output without formatting payload fields.
 /// The leading identifier of `ev`'s `Debug` spelling, which for a derived
 /// `Debug` is the variant's name. The writer takes identifier bytes and
 /// returns `Err` at the first other byte (` {`, `(`), and the derived impl
@@ -139,7 +124,6 @@ fn variant_name(ev: &dyn fmt::Debug) -> String {
         }
     }
     let mut name = LeadingIdent(String::new());
-    // The `Err` is the writer ending the spelling after the name.
     let _ = fmt::write(&mut name, format_args!("{ev:?}"));
     name.0
 }
@@ -192,7 +176,6 @@ mod tests {
         };
         assert_eq!(variant_name(&output), "Output");
 
-        // Control: the probes do count when the values are formatted whole.
         let whole = format!("{big:?} {tup:?}");
         assert_eq!(
             whole,
@@ -258,7 +241,6 @@ mod tests {
         assert_eq!(slots[..OTHER], (0..OTHER).collect::<Vec<_>>());
         assert!(slots[OTHER..].iter().all(|&slot| slot == OTHER));
         assert_eq!(table.names[OTHER].get(), Some(&"other"));
-        // Control: a claimed name keeps its own slot once the table is full.
         assert_eq!(table.slot("V0"), 0);
     }
 }

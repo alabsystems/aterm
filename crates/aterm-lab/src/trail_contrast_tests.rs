@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The probe on frames made here: a PNG round trip through `aterm_png`, WCAG's
-//! fixed points, and the mask measure on a synthetic grid whose clean twin is
-//! the negative control (a frame measured against itself changes nothing).
+//! Trail contrast probe tests: PNG round trip, WCAG fixed points, and mask measurements.
 
 use super::*;
 
@@ -166,12 +164,10 @@ fn a_png_decodes_to_the_colours_it_was_encoded_from() {
     let flat: Vec<u8> = img.px.iter().flatten().copied().collect();
     assert_eq!(flat, rgb);
 
-    // RGBA: the colour is kept and the alpha dropped, as the frame is read.
     let rgba: Vec<u8> = vec![10, 20, 30, 0, 40, 50, 60, 255];
     let img = Image::decode(path, &encode(2, 1, aterm_png::ColorType::Rgba, &rgba)).unwrap();
     assert_eq!(img.px, vec![[10, 20, 30], [40, 50, 60]]);
 
-    // Greyscale reads as a grey colour.
     let img = Image::decode(
         path,
         &encode(2, 1, aterm_png::ColorType::Grayscale, &[0, 200]),
@@ -203,14 +199,12 @@ fn contrast_is_wcag_2s_ratio() {
     assert!((contrast(black, white) - 21.0).abs() < 1e-9);
     assert!((contrast(INK, INK) - 1.0).abs() < 1e-12);
     assert_eq!(contrast(INK, PAGE).to_bits(), contrast(PAGE, INK).to_bits());
-    // #767676 is the lightest grey that passes AA (4.5:1) on white.
     assert_eq!(round_to(contrast([0x76; 3], white), 2), 4.54);
     assert!(contrast([0x77; 3], white) < 4.5);
 }
 
 #[test]
 fn rounding_is_pythons_round() {
-    // The correctly rounded decimal, ties to even: what `round(x, n)` printed.
     assert_eq!(round_to(0.125, 2), 0.12);
     assert_eq!(round_to(2.675, 2), 2.67);
     assert_eq!(round_to(0.0625, 3), 0.062);
@@ -246,15 +240,12 @@ fn wide_glyphs_take_two_cells_and_find_counts_columns() {
     let found = find_cells(&lines, "好 f");
     let cols: Vec<i64> = found.iter().map(|g| g.col).collect();
     assert_eq!(cols, vec![9, 11, 12]);
-    // Occurrences may overlap, as `str.find(needle, start + 1)` found them.
     assert_eq!(find_cells(&["aaa".to_string()], "aa").len(), 4);
     assert!(find_cells(&lines, "").is_empty());
 }
 
 #[test]
 fn a_frame_measured_against_its_own_clean_twin_changes_nothing() {
-    // The negative control: no effect drawn, so every glyph reads its clean
-    // contrast and no pixel differs.
     let clean = clean_frame();
     for col in 0..3 {
         let cell = J::Obj(measure_cell(&clean, Some(&clean), &GRID, 1, col, 1));
@@ -275,15 +266,11 @@ fn a_ribbon_under_a_glyph_counts_against_it_and_nothing_else() {
     let (clean, frame) = (clean_frame(), trail_frame());
     let a = J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 0, 1));
     let c = J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 2, 1));
-    // `a` stands on the page. A ribbon over a minority of `c`'s pure ground
-    // does not move that ground's median, so `c` reads as it did clean; the
-    // pixels it changed are all counted outside the caret.
     assert_eq!(field(&a, "contrast"), field(&a, "clean_contrast"));
     assert_eq!(field(&c, "clean_contrast"), field(&a, "clean_contrast"));
     assert_eq!(field(&c, "contrast"), field(&c, "clean_contrast"));
     let caret_box = GRID.cell_box(1, 3, 1);
     let diff = diff_vs_clean(&frame, &clean, Some(caret_box));
-    // The ribbon: 6 x 2 px under `c`; the caret's 60 px are inside its own box.
     assert_eq!(diff.get("outside_caret_px").and_then(J::as_i64), Some(12));
     assert_eq!(diff.get("px").and_then(J::as_i64), Some(72));
     let cb = GRID.cell_box(1, 2, 1);
@@ -298,8 +285,6 @@ fn a_ribbon_under_a_glyph_counts_against_it_and_nothing_else() {
 
 #[test]
 fn a_glyph_on_a_bed_of_its_own_colour_is_unreadable() {
-    // Every ground pixel of `b` painted near its ink: the mask measure reads
-    // the ribbon as `b`'s ground and its contrast collapses.
     let clean = clean_frame();
     let mut frame = clean.clone();
     let b = GRID.cell_box(1, 1, 1);
@@ -318,7 +303,6 @@ fn a_glyph_on_a_bed_of_its_own_colour_is_unreadable() {
     );
     assert_eq!(field(&cell, "contrast"), round_to(contrast(INK, RIBBON), 2));
     assert!(field(&cell, "contrast") < 1.5);
-    // The coarse method, with no twin, sees the same glyph on the page.
     let coarse = J::Obj(measure_cell(&clean, None, &GRID, 1, 1, 1));
     assert_eq!(coarse.get("method").and_then(J::as_str), Some("extreme"));
     assert_eq!(
@@ -357,7 +341,6 @@ fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
         caret.get("shape").and_then(J::as_str),
         Some("blinking_block")
     );
-    // The newest glyphs run left from the caret: c, b, a.
     let newest: Vec<i64> = caret
         .get("newest")
         .and_then(J::as_arr)
@@ -368,8 +351,6 @@ fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
     assert_eq!(newest, vec![2, 1, 0]);
     assert_eq!(r.get("failures"), Some(&J::Arr(Vec::new())));
 
-    // A threshold above `a`'s own contrast fails every glyph; one the caret
-    // cannot reach fails the caret.
     let strict = parse_args(&args(&[
         &png_s,
         "--find",
@@ -391,7 +372,6 @@ fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
     );
     assert!(failures[1].as_str().unwrap().starts_with("caret "));
 
-    // Without the twin the coarse method is used and no diff is reported.
     let coarse =
         report(&parse_args(&args(&[&png_s, "--row", "1", "--no-clean"])).unwrap()).unwrap();
     assert_eq!(coarse.get("clean"), Some(&J::Null));
@@ -405,8 +385,6 @@ fn the_report_renders_one_cell_per_line_and_parses_back() {
     let png = gallery_files(&dir, &trail_frame());
     let r = report(&parse_args(&args(&[&png.to_string_lossy()])).unwrap()).unwrap();
     let text = render(&r, 0);
-    // The layout carries exactly what the one-line JSON does (the parser
-    // orders an object's keys, so both sides are parsed).
     assert_eq!(J::parse(&text).unwrap(), J::parse(&compact(&r)).unwrap());
     let cells = r.get("cells").and_then(J::as_arr).unwrap().len();
     let cell_lines = text

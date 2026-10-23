@@ -312,6 +312,8 @@ fn kitty_medium_request(body: &[u8]) -> Option<Request> {
     (!name.is_empty()).then_some(Request::Kitty(command.medium, name))
 }
 
+/// Feed `bytes` to `term` as the PTY reader feeds a burst: slice by slice,
+/// each slice's reads first, with the terminal unlocked, then the hold that
 /// processes what they cover.
 #[cfg(test)]
 pub(crate) fn feed_as_reader(term: &std::sync::Mutex<Terminal>, bytes: &[u8]) {
@@ -331,6 +333,8 @@ pub(crate) fn feed_as_reader(term: &std::sync::Mutex<Terminal>, bytes: &[u8]) {
 mod tests {
     use super::*;
 
+    /// The reads one slice makes through counting readers, and what the
+    /// engine can take of them: (pasteboard reads, queries answered, medium
     /// reads by name).
     fn reads(slice: &[u8], flags: Flags) -> (usize, usize, Vec<String>) {
         let mut pasteboard = 0;
@@ -359,6 +363,7 @@ mod tests {
         kitty_media: true,
     };
 
+    /// A Kitty command naming `path` (base64 in its payload, as the protocol
     /// carries it), ST-terminated.
     fn file(control: &str, path: &str) -> Vec<u8> {
         let mut apc = format!("\x1b_G{control};").into_bytes();
@@ -371,6 +376,9 @@ mod tests {
         apc
     }
 
+    /// A slice is read for exactly the requests the engine sends the host (an OSC 52 query, BEL-
+    /// or ST-terminated, with one pasteboard read for all of a slice's queries; a Kitty transmit
+    /// naming a file, whole or cut across two slices) and for nothing else: an OSC 52 set, a
     /// canceled query, a Kitty query or chunked load, or anything the session does not admit.
     #[test]
     fn a_burst_is_read_for_the_requests_the_engine_will_make() {
@@ -407,6 +415,11 @@ mod tests {
         CONSUMED.with(|consumed| consumed.borrow_mut().push((name.to_string(), read)));
     }
 
+    /// A MEDIUM IS CONSUMED ONLY ONCE THE ENGINE TOOK IT, AFTER THE SLICE IS
+    /// FED: of the `t=t` files read for a slice, the one the
+    /// engine asks for is consumed, with whether its read returned bytes, when
+    /// the burst drops (after the hold), never at the read or under the hold;
+    /// the one it never asks for (a raw transmission declaring no size, which
     /// the engine refuses before resolving) is not consumed at all.
     #[test]
     fn only_a_medium_the_engine_took_is_consumed_after_the_slice() {
@@ -445,6 +458,8 @@ mod tests {
     /// The largest medium a read returns.
     const LARGEST: usize = crate::spawn::MAX_KITTY_MEDIUM_BYTES as usize;
 
+    /// Feed `parts` (the PTY's reads) slice by slice as the reader does, each
+    /// medium read returning [`LARGEST`] bytes: the names read, in order, and
     /// the most one slice's reads held.
     fn feed_largest(parts: &[&[u8]]) -> (Vec<String>, usize) {
         let mut names = Vec::new();
@@ -472,6 +487,9 @@ mod tests {
         (names, most)
     }
 
+    /// A burst of short `t=f` commands, each naming a largest-size file, is read slice by slice:
+    /// no slice holds more than two largest media, and each command is read once, in order,
+    /// however the PTY's reads cut the burst, including right before an ESC that ends one
     /// command and begins the next.
     #[test]
     fn a_slice_holds_at_most_two_largest_media_and_reads_each_once() {

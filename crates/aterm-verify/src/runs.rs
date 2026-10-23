@@ -140,7 +140,7 @@ impl RunId {
 
     /// The birth as whole microseconds.
     #[must_use]
-    pub fn birth_us(birth: ProcessBirth) -> u64 {
+    pub const fn birth_us(birth: ProcessBirth) -> u64 {
         birth
             .seconds
             .saturating_mul(1_000_000)
@@ -351,12 +351,12 @@ pub struct Left {
 }
 
 impl Left {
-    fn total(&self) -> usize {
+    const fn total(&self) -> usize {
         self.ended.len() + self.named.len()
     }
 
     /// Whether the pass leaves a member of the run it could not end, or could not judge.
-    fn leaves_any(&self) -> bool {
+    const fn leaves_any(&self) -> bool {
         !self.named.is_empty() || self.unjudged > 0
     }
 
@@ -399,6 +399,8 @@ impl Left {
 enum Verdict {
     /// Not the run's.
     NotOurs,
+    /// Born in the run's window, running from its roots, held at the program check (or its
+    /// check unreadable), and in none of its groups: whether it carries the run's id is not
     /// read.
     Unjudged,
     /// The run's, and ending it is not proven.
@@ -642,6 +644,7 @@ pub fn sweep_group(kernel: &impl Kernel, pgid: u32, label: &str, roots: &[PathBu
 /// What the live runs claim: each run's launcher, its open stage groups, and its id.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Claims {
+    /// The launchers, `(pid, birth_us)`: a verify started inside another run's stage carries
     /// that run's id in its own environment, and is its own run's all the same.
     launchers: BTreeSet<(i32, u64)>,
     groups: BTreeSet<u32>,
@@ -689,6 +692,7 @@ struct Judge<'a, K> {
     id: Option<String>,
     /// The run's launcher's unique id: W-run's window opens there.
     run_uniqueid: u64,
+    /// The open groups whose leader check passed, each with its leader's unique id, where its
     /// W-group window opens.
     groups: Vec<(u32, u64)>,
     /// Where both windows close: `dead_seen`, or no bound for a run that is alive.

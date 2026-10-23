@@ -532,7 +532,10 @@ fn first_error(log: &str) -> String {
     line.trim().chars().take(200).collect()
 }
 
-/// Decide the test run's row exactly as the serial child's was decided.
+/// Decide the test run's row exactly as the serial child's was decided. A test
+/// whose macOS service (`trustd`, the disk-image service) did not answer ends
+/// COULD NOT RUN itself (`aterm_uds::deadline::require_trust_service`), so its
+/// row says so through [`crate::libtest::environment_refusals`].
 fn decide(r: &mut Report, run: &Run, label: &str, env: &[(OsString, OsString)]) {
     r.decide_test_child(run, label, env);
 }

@@ -8,10 +8,8 @@ use super::*;
 
 #[test]
 fn scrollback_promotion() {
-    // Small limits to trigger promotion
     let mut sb = Scrollback::with_block_size(10, 100, 10_000_000, 5);
 
-    // Push 15 lines - should promote 5 to warm
     for i in 0..15 {
         sb.push_str(&format!("Line {i}"));
     }
@@ -20,7 +18,6 @@ fn scrollback_promotion() {
     assert_eq!(sb.hot_line_count(), 10);
     assert_eq!(sb.warm_line_count(), 5);
 
-    // Verify we can still read all lines
     for i in 0..15 {
         let line = sb.get_line(i).expect("no error").expect("line present");
         assert_eq!(line.to_string(), format!("Line {i}"));
@@ -42,19 +39,14 @@ fn scrollback_clear() {
     assert_eq!(sb.cold_line_count(), 0);
 }
 
-/// Content survives many hot→warm→cold cycles: lines of varied length read back
-/// exactly from whichever tier they end in, forward, reverse, random-access and
-/// through the iterator.
 #[test]
 fn tier_transition_content_fidelity_multi_cycle() {
-    // hot=3, warm=6, block_size=3: two warm blocks before eviction to cold.
     let mut sb = Scrollback::with_block_size(3, 6, 10_000_000, 3);
 
     let total_lines = 60;
     let mut expected: Vec<String> = Vec::with_capacity(total_lines);
 
     for i in 0..total_lines {
-        // Vary content length: short, medium, long, and with special chars
         let content = match i % 4 {
             0 => format!("L{i}"),
             1 => format!("Line {i}: {}", "x".repeat(50)),
@@ -70,7 +62,6 @@ fn tier_transition_content_fidelity_multi_cycle() {
     assert!(sb.warm_line_count() > 0, "expected data in warm tier");
     assert!(sb.hot_line_count() > 0, "expected data in hot tier");
 
-    // Forward read: verify every line from oldest to newest
     for (i, expected_content) in expected.iter().enumerate() {
         let line = sb
             .get_line(i)
@@ -83,8 +74,6 @@ fn tier_transition_content_fidelity_multi_cycle() {
         );
     }
 
-    // Reverse read: verify every line from newest to oldest
-    // (exercises different decompression cache access patterns)
     for rev_idx in 0..total_lines {
         let expected_idx = total_lines - 1 - rev_idx;
         let line = sb
@@ -98,7 +87,6 @@ fn tier_transition_content_fidelity_multi_cycle() {
         );
     }
 
-    // Random-access pattern: read every 7th line to exercise cache eviction
     for i in (0..total_lines).step_by(7) {
         let line = sb
             .get_line(i)
@@ -111,7 +99,6 @@ fn tier_transition_content_fidelity_multi_cycle() {
         );
     }
 
-    // Iterator: verify full iteration matches
     let iterated: Vec<String> = sb.iter().map(|l| l.to_string()).collect();
     assert_eq!(iterated.len(), total_lines, "iterator length mismatch");
     for (i, (got, want)) in iterated.iter().zip(expected.iter()).enumerate() {

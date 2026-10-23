@@ -343,7 +343,9 @@ pub fn font_advertises_feature(rb_bytes: &[u8], index: u32, tag: [u8; 4]) -> boo
     aterm_font::Face::parse(rb_bytes, index).is_ok_and(|face| face_gsub_has(&face, |t| t == tag))
 }
 
-/// Whether the face's `GSUB` feature list holds a tag `hit` accepts.
+/// Whether the face's `GSUB` feature list holds a tag `hit` accepts. LINEAR: FeatureList
+/// records are stored in arbitrary, not tag-sorted, order, so a binary `find` could
+/// miss a present tag.
 fn face_gsub_has(face: &aterm_font::Face<'_>, hit: impl Fn([u8; 4]) -> bool) -> bool {
     face.tables()
         .gsub

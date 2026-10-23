@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The jq subset (design §8.4): `lex` holds the tokens, `parse` the tree and `eval` the
-//! evaluation. `FUNCTIONS`, `FORMATS` and `REFUSED_JQ` are the tables both the compiler and
-//! `agh help jq` read; nothing else lists them.
+//! Built-in `jq` subset (`lex`, `parse`, `eval`) and `agh help jq` metadata tables.
 
 mod eval;
 mod lex;
@@ -151,7 +149,7 @@ const fn r(names: &'static [&'static str], next: &'static str) -> RefusedJq {
     RefusedJq { names, next }
 }
 
-/// Every construct refused by name (design §8.4).
+/// Every construct refused by name.
 pub(crate) static REFUSED_JQ: &[RefusedJq] = &[
     r(&["def", "reduce", "foreach"], "use map, add or select"),
     r(&["..", "recurse"], "name the path"),
@@ -192,8 +190,7 @@ pub(crate) static REFUSED_JQ: &[RefusedJq] = &[
     r(&["?//"], "use //"),
 ];
 
-/// The rules design §8.4 lists among its divergences that jq 1.7.1 in fact shares, as
-/// `agh help jq` lists them under their own heading.
+/// Rules shared with `jq` 1.7.1, listed in `agh help jq`.
 pub(crate) static SHARED_RULES: &[&str] = &[
     "string slices index by Unicode scalar",
     "null + x is x",
@@ -201,8 +198,7 @@ pub(crate) static SHARED_RULES: &[&str] = &[
     "sort uses jq's type order: null, false, true, numbers, strings, arrays, objects",
 ];
 
-/// Where agh's jq differs from jq 1.7.1, as `agh help jq` lists them; each has a `jq_differs`
-/// row in the corpus, or (the depth limit and test()'s step budget) a test of its own.
+/// Intentional differences from `jq` 1.7.1, listed in `agh help jq`.
 pub(crate) static DIVERGENCES: &[&str] = &[
     "error texts are agh's own",
     "objects iterate, and tostring, @json, @text and \\(...) write them, in sorted key order",
@@ -224,8 +220,7 @@ pub(crate) static DIVERGENCES: &[&str] = &[
     "a program nests at most 128 deep, counting each link of a chain such as a, b, c or .a.b.c",
 ];
 
-/// How deep a program may nest (`agh help jq` says so): the parser's recursion, the tree's
-/// depth and so the evaluator's recursion are all bounded by it.
+/// Maximum nesting depth for `jq` expressions.
 pub(crate) const MAX_DEPTH: usize = 128;
 
 /// `jq: the program nests deeper than {MAX_DEPTH} at byte {at}`.
@@ -279,12 +274,11 @@ pub struct Program {
     ast: parse::Ast,
 }
 
-/// Compile `src`.
+/// Compiles a `jq` filter expression.
 ///
 /// # Errors
 ///
-/// Usage: a syntax error (`jq: {what} at byte {offset}`), or a refused construct (`jq: {name}
-/// is not in agh's jq subset`, with its next).
+/// Returns a usage error on syntax errors or refused constructs.
 pub fn compile(src: &str) -> Result<Program> {
     let tokens = lex::lex(src)?;
     let ast = parse::parse(&tokens, src.len())?;
@@ -292,12 +286,11 @@ pub fn compile(src: &str) -> Result<Program> {
 }
 
 impl Program {
-    /// Every result, in order.
+    /// Evaluates the filter against `input` and returns the results in order.
     ///
     /// # Errors
     ///
-    /// Usage, for a runtime error (`jq: cannot index {type} with "{key}"`, `jq: {f} wants
-    /// {type}`, …). A `?` suppresses one.
+    /// Returns a usage error on any runtime error (a bad type or index, an undefined `$name`, …).
     pub fn run(&self, input: &aterm_json::Value) -> Result<Vec<aterm_json::Value>> {
         let mut out = Vec::new();
         eval::run(&self.ast, input, &mut out)?;
@@ -311,8 +304,7 @@ impl std::fmt::Debug for Program {
     }
 }
 
-/// `jq -r`: a string raw, any other value compact JSON with sorted keys, each result followed
-/// by `\n`.
+/// Formats results like `jq -r` (raw strings and compact sorted-key JSON, newline-terminated).
 #[must_use]
 pub fn render_results(results: &[aterm_json::Value]) -> String {
     let mut out = String::new();
@@ -326,8 +318,7 @@ pub fn render_results(results: &[aterm_json::Value]) -> String {
     out
 }
 
-/// Compact JSON with jq's escapes: `aterm_json`'s text, with DEL written `\u007f` as jq writes
-/// it. A raw DEL can stand only inside a JSON string, so the replacement never touches syntax.
+/// Formats `value` as compact JSON with DEL escaped as `\u007f`.
 pub(crate) fn json_text(value: &aterm_json::Value) -> String {
     let text = value.to_string();
     if text.contains('\u{7f}') {

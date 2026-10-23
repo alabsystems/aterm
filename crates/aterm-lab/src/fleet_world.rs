@@ -46,7 +46,7 @@ pub enum Kind {
 impl Kind {
     /// The `program=` the survey must name.
     #[must_use]
-    pub fn program(self) -> &'static str {
+    pub const fn program(self) -> &'static str {
         match self {
             Kind::Shell => "zsh",
             Kind::Build => "build-loop",
@@ -56,7 +56,7 @@ impl Kind {
 
     /// The `agent=` word the survey must name.
     #[must_use]
-    pub fn agent(self) -> &'static str {
+    pub const fn agent(self) -> &'static str {
         match self {
             Kind::Claude(mode) => mode.agent_word(),
             _ => "-",

@@ -406,7 +406,8 @@ pub const EYE_RAMP: [u32; 16] = [
 const CATCH_LIGHT: u32 = 0x00FF_FFFF;
 
 const OPEN_EYE_REFLECTION_MIN_PX: f32 = 3.0;
-/// Authored eyes flatter than this are arcs/lids, not open pupils.
+/// Authored eyes flatter than this are arcs/lids, not open pupils. Keep their
+/// existing catch-light art, but never synthesize a glossy pupil pass over it.
 const OPEN_EYE_SHALLOW_ASPECT: f32 = 0.6;
 const OPEN_EYE_PRIMARY_FRAC: f32 = 0.17;
 const OPEN_EYE_PRIMARY_MIN_RADIUS_PX: f32 = 0.62;
@@ -587,7 +588,8 @@ fn background_band(background: u32) -> u8 {
     }
 }
 
-/// Anchors at 30° hue steps.
+/// Anchors at 30° hue steps. They tint the genome coat rather than replace it,
+/// so the cat keeps its identity while matching the terminal palette.
 const CONTEXT_ACCENTS: [u32; 13] = [
     0x00E8_6F6F,
     0x00E8_AC6F,
@@ -903,7 +905,8 @@ pub(crate) fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
     seen.then(|| (norm(x0), norm(y0), norm(x1), norm(y1)))
 }
 
-/// Pair a catch-light centre with its closest eye path.
+/// Pair a catch-light centre with its closest eye path. Returns the path index
+/// so the roster-wide test uses the same pairing as the painter.
 fn closest_eye_path(eyes: &Layer, pcx: f32, pcy: f32) -> Option<(usize, (f32, f32, f32, f32))> {
     eyes.paths
         .iter()
@@ -1302,7 +1305,9 @@ mod tests {
         assert!(a3.version > a1.version, "bake bumps the published version");
     }
 
-    /// The recycled publish is byte-equal to a full clone.
+    /// The recycled publish is byte-equal to a full clone. `fast` drops each
+    /// snapshot so it always recycles; `mirror` retains every snapshot so it
+    /// always clones.
     #[test]
     fn recycled_publish_is_byte_equal_to_full_clone() {
         let mut fast = CatBaker::default();

@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The runtime against a real compositor (the Linux lane's weston or Mutter;
-//! any `$WAYLAND_DISPLAY`): the registry lists the globals, a bound `wl_shm`
-//! announces its formats to a dispatcher, a pool made over a descriptor
-//! carries a buffer a surface attaches and commits with no protocol error,
-//! and a request the compositor refuses is seen as the display's error (the
-//! negative control: the check can fail). Without a display each test says
-//! SKIP and returns.
+//! Live Wayland runtime tests against a real compositor (`$WAYLAND_DISPLAY`).
 
 #![cfg(target_os = "linux")]
 
@@ -115,8 +109,6 @@ fn a_buffer_reaches_a_surface_and_a_refusal_is_seen() {
         queue.roundtrip().unwrap();
         assert_eq!(display.display().error(), None);
 
-        // Negative control: a buffer of no width is wl_shm's invalid_stride
-        // in every libwayland-server compositor, which kills the display.
         let pool = wl_shm::create_pool(shm, fd.as_raw_fd(), 64).unwrap();
         let _ = wl_shm_pool::create_buffer(pool, 0, 0, 4, 16, wl_shm::format::XRGB8888);
         assert!(
@@ -156,8 +148,6 @@ fn every_icon_has_a_themed_frame() {
             found.push(icon);
         }
     }
-    // libwayland-cursor's built-in set always has the default arrow; a full
-    // theme has every one.
     assert!(found.contains(&Icon::Default), "{found:?}");
     eprintln!("themed icons: {found:?}");
     queue.roundtrip().unwrap();
@@ -202,13 +192,10 @@ fn every_output_reports_a_current_mode() {
     queue.roundtrip().unwrap();
     let infos = outputs.infos();
     assert!(!infos.is_empty(), "a compositor has an output");
-    // Each output's first `done` reached the sink, with what the output said
-    // as of it.
     let dones = std::mem::take(&mut *dones.lock().unwrap());
     for info in &infos {
         assert!(dones.contains(info), "{info:?} not in {dones:?}");
     }
-    // Nothing came or went: a sync binds and releases nothing.
     let generation = registry.generation();
     assert!(
         !outputs.sync(&registry).unwrap(),
@@ -220,7 +207,6 @@ fn every_output_reports_a_current_mode() {
         assert!(mode.width > 0 && mode.height > 0, "{info:?}");
         assert!(info.scale >= 1, "{info:?}");
         let proxy = outputs.proxy(info.global).expect("bound");
-        // A handle names the same output, and reads the same report.
         let handle = outputs.by_proxy(proxy).expect("a handle by proxy");
         assert_eq!(handle.global(), info.global);
         assert_eq!(handle.info().as_ref(), Some(info));
@@ -258,8 +244,8 @@ fn map_toplevel(
         .bind(&registry.find(c"wl_shm").unwrap(), &wl_shm::INTERFACE, 1)
         .unwrap();
     let shell = Shell::bind(&registry).unwrap();
-    // SAFETY: objects of this test on one display, each destroyed once below
-    // or left to the display's end.
+    // SAFETY: objects of this test on one display, each destroyed once below or left to the
+    // display's end.
     unsafe {
         let surface = wl_compositor::create_surface(compositor).unwrap();
         let toplevel = Toplevel::new(&shell, surface, c"aterm live", c"aterm.live").unwrap();
@@ -316,8 +302,6 @@ fn a_toplevel_is_configured_acked_and_mapped() {
         "{configure:?}"
     );
     eprintln!("first configure: {configure:?}");
-    // Negative control: a surface given a second xdg_surface is
-    // xdg_wm_base's role error, which kills the display.
     let other = OwnedDisplay::connect(None).unwrap();
     let (_, survived) = map_toplevel(&other, true);
     assert!(!survived, "a second role is a protocol error");
@@ -374,13 +358,13 @@ fn a_poll_loop_reads_the_socket_and_dispatches_and_a_full_queue_refuses_the_read
     let Some(display) = connect() else {
         return;
     };
-    // SAFETY: this local owner outlives the queue and every derived handle; dispatch
-    // and teardown of this private queue are serialized on this thread.
+    // SAFETY: this local owner outlives the queue and every derived handle; dispatch and teardown
+    // of this private queue are serialized on this thread.
     let queue = Queue::new(unsafe { display.display() }).unwrap();
     let done = Arc::new(Mutex::new(0u32));
     let wrapper = queue.display_wrapper().unwrap();
-    // SAFETY: the wrapper is live; the callback is on `queue`, destroyed below after its one
-    // event, its listener after it.
+    // SAFETY: the wrapper is live; the callback is on `queue`, destroyed below after its one event,
+    // its listener after it.
     let callback = unsafe { wl_display::sync(wrapper.proxy()) }.unwrap();
     drop(wrapper);
     let sink = Arc::clone(&done);
@@ -424,7 +408,6 @@ fn a_poll_loop_reads_the_socket_and_dispatches_and_a_full_queue_refuses_the_read
     }
     assert_eq!(*done.lock().unwrap(), 1);
 
-    // Negative control: an event read but not dispatched makes the queue refuse the read.
     let wrapper = queue.display_wrapper().unwrap();
     // SAFETY: as above.
     let second = unsafe { wl_display::sync(wrapper.proxy()) }.unwrap();

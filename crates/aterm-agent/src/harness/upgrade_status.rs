@@ -368,7 +368,7 @@ fn ended_unstamped(st: &St, now: u64) -> bool {
 }
 
 /// Since when the session.
-fn read_age(st: &St) -> u64 {
+const fn read_age(st: &St) -> u64 {
     if st.proc_start.is_empty()
         && st.waits.is_empty()
         && st.pending_since != 0
@@ -569,7 +569,7 @@ impl Row {
     }
 
     /// When the move finished for the owner.
-    fn finished_at(&self) -> u64 {
+    const fn finished_at(&self) -> u64 {
         if self.done_at == 0 {
             self.confirm_by
         } else {
@@ -740,7 +740,7 @@ impl Row {
     }
 
     /// Whether a watch is for this record at all ([`Self::unwatched`]).
-    fn watch_owed(&self) -> bool {
+    const fn watch_owed(&self) -> bool {
         matches!(
             self.phase,
             Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
@@ -1128,7 +1128,7 @@ impl Row {
     }
 
     /// Whether this row's phase is one a live process must still hold for it to mean anything.
-    fn held_by_a_process(&self) -> bool {
+    const fn held_by_a_process(&self) -> bool {
         matches!(
             self.phase,
             Phase::Pending | Phase::Announced { .. } | Phase::Failed(_)
@@ -1137,22 +1137,22 @@ impl Row {
 
     /// A move that failed after its agent was seen gone.
     #[must_use]
-    pub fn failed_after_exit(&self) -> bool {
+    pub const fn failed_after_exit(&self) -> bool {
         self.exited_at != 0 && matches!(self.phase, Phase::Failed(_))
     }
 
     /// A restart in flight whose agent was read gone ([`Self::exited_at`]) and is not yet held.
-    fn down_in_flight(&self) -> bool {
+    const fn down_in_flight(&self) -> bool {
         self.exited_at != 0 && !self.held_back && matches!(self.phase, Phase::Exiting { .. })
     }
 
     /// Down after its agent's exit.
-    fn down_after_exit(&self) -> bool {
+    const fn down_after_exit(&self) -> bool {
         self.failed_after_exit() || self.down_in_flight()
     }
 
     /// This row's down answered ([`Self::held_again`], [`View::back`]).
-    fn answer_down(&mut self) {
+    const fn answer_down(&mut self) {
         if matches!(self.phase, Phase::Exiting { .. }) {
             self.held_back = true;
         } else {
@@ -1798,7 +1798,7 @@ enum WaitClass {
 
 impl WaitClass {
     /// The class as `--status` says it (`cause=`, [`Row::cause_word`]).
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             WaitClass::OwnWork => "own-work",
             WaitClass::Person => "person",
@@ -1985,7 +1985,7 @@ pub enum Attention {
 impl Attention {
     /// This attention as a row carries it ([`Level`]).
     #[must_use]
-    pub fn level(&self) -> Level {
+    pub const fn level(&self) -> Level {
         match self {
             Attention::Quiet => Level::Quiet,
             Attention::Fault(n) => Level::Fault(n.kind),
@@ -3293,7 +3293,7 @@ pub(in crate::harness) fn wait_words_of(agent: upgrade::Agent, wait: &str) -> Op
 }
 
 /// Whether a row of `agent`'s reads its record's ready clock.
-fn reads_ready_clock(agent: upgrade::Agent) -> bool {
+const fn reads_ready_clock(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex
@@ -3304,7 +3304,7 @@ fn reads_ready_clock(agent: upgrade::Agent) -> bool {
 }
 
 /// Whether `agent`'s lane types a release line (`upgrade_drive::release`, [`Row::release`]).
-fn types_release(agent: upgrade::Agent) -> bool {
+const fn types_release(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex
@@ -3315,7 +3315,7 @@ fn types_release(agent: upgrade::Agent) -> bool {
 }
 
 /// Whether `agent`'s `attended` wait names the person at its tab on the look's clock.
-fn attended_is_person(agent: upgrade::Agent) -> bool {
+const fn attended_is_person(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex
@@ -3326,7 +3326,7 @@ fn attended_is_person(agent: upgrade::Agent) -> bool {
 }
 
 /// Whether a move of `agent`'s that failed after its exit is an ordinary stopped upgrade again.
-fn held_again_after_exit(agent: upgrade::Agent) -> bool {
+const fn held_again_after_exit(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex

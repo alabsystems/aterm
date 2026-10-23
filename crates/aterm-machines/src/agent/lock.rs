@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lock-screen` (design §6): lock the login session this process runs in, then read it back
-//! locked.
-//!
-//! `screen` runs it in the admin's session at the end of a walk in which the admin had to log
-//! in over Screen Sharing (`controller::screen::lock_cmd`: `launchctl asuser`, then `sudo -u
-//! <admin>`), because macOS leaves a session logged in that way unlocked when the connection
-//! closes. The lock is [`System::lock_screen`]. The answer is a reading, never the request's
-//! status alone: loginwindow takes the request and locks a moment later, then sets
-//! `CGSSessionScreenIsLocked` on the session's entry in `ioreg`'s console-user table.
+//! `lock-screen` agent command using [`System::lock_screen`].
 
 use crate::model::PValue;
 use crate::port::{Cmd, System};
@@ -17,24 +9,19 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-/// How long the session may take to read locked once loginwindow took the request: a hang
-/// detector (loginwindow set it 40 and 75 ms after the call on 27), never a latency budget.
+/// How long the session may take to read locked once loginwindow took the request.
 pub const LOCK_HANG: Duration = Duration::from_secs(10);
 
 /// The pause between two readings.
 const READ_PAUSE: Duration = Duration::from_millis(250);
 
-/// `ioreg -n Root -d1 -a`: the registry root as a property list. Its `IOConsoleUsers` lists
-/// each login session. The whole root runs past 100 KiB (VM, 27.0), so it is read here, on
-/// the host, not carried back in an `exec` row.
+/// `ioreg -n Root -d1 -a`: the registry root as a property list.
 #[must_use]
 pub fn ioreg_root_cmd() -> Cmd {
     Cmd::new("/usr/sbin/ioreg").args(["-n", "Root", "-d1", "-a"])
 }
 
-/// Whether the login session of the account `uid` reads locked in what [`ioreg_root_cmd`]
-/// printed: its `IOConsoleUsers` entry carries `CGSSessionScreenIsLocked` true. The key is
-/// absent while the session is unlocked (VM, 27.0).
+/// Whether the login session of the account `uid` reads locked in what [`ioreg_root_cmd`] printed.
 ///
 /// # Errors
 /// One line when the output is not that property list, or lists no session for `uid`.
@@ -57,9 +44,7 @@ pub fn session_locked(xml: &[u8], uid: u32) -> Result<bool, String> {
     Err(format!("ioreg lists no login session for uid {uid}"))
 }
 
-/// `aterm machines agent lock-screen`: lock this login session ([`System::lock_screen`]),
-/// then read [`ioreg_root_cmd`] until this account's session reads locked, for at most
-/// `hang`. Prints `locked`, or `not locked: <why>`, and exits 0 only after `locked`.
+/// `aterm machines agent lock-screen` ([`System::lock_screen`], [`ioreg_root_cmd`]).
 pub fn lock_screen(sys: &dyn System, out: &mut dyn Write, hang: Duration) -> ExitCode {
     let mut done = |line: String, code: ExitCode| {
         let _ = writeln!(out, "{line}");
@@ -98,12 +83,10 @@ mod tests {
     use crate::port::{Fake, Ran};
     use std::path::Path;
 
-    /// `ioreg -n Root -d1 -a` in the macOS 27.0 VM with the admin (uid 501) logged in and
-    /// locked, `IOKitDiagnostics`' class counts cut to their first and last few.
+    /// `ioreg -n Root -d1 -a` in the macOS 27.0 VM with the admin (uid 501) logged in and locked.
     const IOREG_LOCKED: &[u8] = include_bytes!("../../fixtures/ioreg/vm-27.0-root-locked.plist");
 
-    /// The same, another boot, the session logged in and unlocked: its entry has no
-    /// `CGSSessionScreenIsLocked` (nor `CGSSessionScreenLockedTime`).
+    /// The same, another boot, the session logged in and unlocked.
     const IOREG_UNLOCKED: &[u8] =
         include_bytes!("../../fixtures/ioreg/vm-27.0-root-unlocked.plist");
 
@@ -170,8 +153,6 @@ mod tests {
 
     #[test]
     fn a_lock_taken_but_never_read_back_is_not_locked() {
-        // loginwindow answered 0, yet the session still reads unlocked: the request's status
-        // alone never makes the answer `locked`.
         let fake = admin_fake();
         fake.on(
             &ioreg_key(),
@@ -185,7 +166,6 @@ mod tests {
             "{out}"
         );
         assert_eq!(code, ExitCode::FAILURE);
-        // Unlocked, then locked: the reading is repeated until it holds.
         let fake = admin_fake();
         fake.on(
             &ioreg_key(),

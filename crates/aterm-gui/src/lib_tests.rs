@@ -2148,7 +2148,9 @@ fn live_font_zoom_refreshes_per_window_metrics() {
     );
 }
 
-/// A renderer rebuild is fallible.
+/// A renderer rebuild is fallible. The zoom transaction must not publish
+/// new App/window geometry while the old renderer remains live, or hit
+/// testing, PTY reflow and painted glyph cells disagree after the failure.
 #[test]
 fn failed_live_font_zoom_rolls_back_font_authority_and_window_metrics() {
     use super::{App, WindowId};

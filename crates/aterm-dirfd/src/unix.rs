@@ -164,11 +164,13 @@ flags! {
         CREATE = libc::O_CREAT;
         /// `O_APPEND` — every write lands at the file's end.
         APPEND = libc::O_APPEND;
-        /// `O_EXCL` — with `O_CREAT`, fail if the name already exists.
+        /// `O_EXCL` — with `O_CREAT`, fail if the name already exists. The
+        /// atomic "create or lose" the private-file path depends on.
         EXCL = libc::O_EXCL;
         /// `O_DIRECTORY` — fail unless the name is a directory.
         DIRECTORY = libc::O_DIRECTORY;
-        /// `O_NOFOLLOW` — fail if the final component is a symlink.
+        /// `O_NOFOLLOW` — fail if the final component is a symlink. Applies to
+        /// the last component only, which is why the callers pin every ancestor.
         NOFOLLOW = libc::O_NOFOLLOW;
         /// `O_NONBLOCK` — so opening a FIFO left in place by another process
         /// cannot wedge the server thread.

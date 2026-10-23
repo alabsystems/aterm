@@ -139,7 +139,7 @@ impl Lane {
         Lane::Aos,
     ];
 
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Lane::Throughput => "throughput",
             Lane::Pathological => "pathological",
@@ -161,7 +161,7 @@ impl Lane {
         }
     }
 
-    pub(crate) fn kind(self) -> Kind {
+    pub(crate) const fn kind(self) -> Kind {
         match self {
             Lane::Throughput
             | Lane::Pathological
@@ -185,7 +185,7 @@ impl Lane {
     }
 
     /// What the lane measures, for `--list`.
-    fn what(self) -> &'static str {
+    const fn what(self) -> &'static str {
         match self {
             Lane::Throughput => "Terminal::process MB/s over a ~32 MiB mixed VT workload",
             Lane::Pathological => "Terminal::process MB/s per hostile-input corpus",
@@ -222,7 +222,7 @@ impl Lane {
     }
 
     /// What the box needs, for `--list`.
-    fn needs(self) -> &'static str {
+    const fn needs(self) -> &'static str {
         match self {
             Lane::Throughput
             | Lane::Pathological
@@ -292,7 +292,7 @@ pub(crate) struct LaneRun {
 }
 
 impl LaneRun {
-    pub(crate) fn pass() -> Self {
+    pub(crate) const fn pass() -> Self {
         Self {
             status: Status::Pass,
             unjudged: Vec::new(),
@@ -332,7 +332,7 @@ impl LaneRun {
         }
     }
 
-    pub(crate) fn failed(&self) -> bool {
+    pub(crate) const fn failed(&self) -> bool {
         matches!(self.status, Status::Fail(_))
     }
 

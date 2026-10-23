@@ -16,6 +16,10 @@ use aterm_spec::wait::MUST_HAPPEN;
 
 use crate::headless_boot::{self, Instance};
 
+/// The network witness's jail (SBPL, the last rule that matches wins): a name
+/// lookup (the resolver's socket), or an IP connection to anything but IPv4
+/// loopback, kills the process that asked, at once. The resolver's rule comes
+/// first: after the loopback allowance it killed an established loopback
 /// connection too (macOS 27, measured 2026-10-22).
 const NETWORK_JAIL: &str = concat!(
     "(version 1)(allow default)",
@@ -28,9 +32,11 @@ const NETWORK_JAIL: &str = concat!(
 /// The programs the upkeep fetches a source with.
 const FETCHERS: [&str; 2] = ["curl", "rclone"];
 
+/// Each pid seen under this test process: its parent, and every program path
 /// it was seen running.
 type Seen = BTreeMap<i32, (i32, BTreeSet<PathBuf>)>;
 
+/// What every process under this test process ran, read every millisecond
 /// from [`Execs::watch`] until dropped ([`Seen`]).
 struct Execs {
     seen: Arc<Mutex<Seen>>,
@@ -69,6 +75,7 @@ impl Execs {
         }
     }
 
+    /// Every program path a process under `root` (the instance) was seen
     /// running whose file name is one of `names`.
     fn under(&self, root: u32, names: &[&str]) -> Vec<PathBuf> {
         let seen = self.seen.lock().unwrap();
@@ -107,9 +114,11 @@ impl Drop for Execs {
     }
 }
 
+/// The private state root the seam's admission asks for (`ATERM_STATE_HOME`),
 /// under an instance's scratch root.
 const PRIVATE_STATE: &str = "state-aterm";
 
+/// The instance's own log (`aterm.log` where its scratch home keeps logs, or
 /// its private state root where it was given one).
 fn instance_log(inst: &Instance) -> String {
     [None, Some(inst.tmp.join(PRIVATE_STATE))]
@@ -135,6 +144,7 @@ fn log_tail(inst: &Instance) -> String {
     lines[lines.len().saturating_sub(25)..].join("\n")
 }
 
+/// The upkeep's first word in the instance's log (`accounts-upkeep=…`),
 /// waited for under the hang detector.
 #[track_caller]
 fn upkeep_word(inst: &mut Instance) -> String {
@@ -166,6 +176,8 @@ fn alive(inst: &mut Instance) {
     );
 }
 
+/// Boot a jailed instance whose aterm.toml gets `extra` appended, with the
+/// live upkeep let in by its development seam where `live` says so (under the
 /// private state root the seam's admission asks for).
 #[track_caller]
 fn boot(prefix: &str, extra: String, live: bool) -> Instance {
@@ -191,6 +203,7 @@ fn loopback_config(port: u16) -> String {
     format!("[fleet]\naccounts_source = \"http://127.0.0.1:{port}/fleet.csv\"\nmachine = \"m1\"\n")
 }
 
+/// Wait, under the hang detector, for the instance's log to say its
 /// activation wake is armed: the upkeep's first kick is behind it.
 #[track_caller]
 fn wake_armed(inst: &mut Instance) {
@@ -206,6 +219,7 @@ fn wake_armed(inst: &mut Instance) {
     }
 }
 
+/// A loopback source that answers one GET: what it was asked, sent on the
 /// first channel, and its answer, `body`, written once the second says so.
 fn loopback_source(
     body: &'static str,

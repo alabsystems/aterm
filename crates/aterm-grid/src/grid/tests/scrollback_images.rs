@@ -2,16 +2,13 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Inline images survive the scroll-off -> history -> materialize round trip. An image cell
-//! carries a `CellExtra` and no glyph, so an image-only row has `Row::len() == 0` and extraction
-//! needs its own full-width pass; these tests use zero-length rows on purpose.
+//! Inline images survive the scroll-off -> history -> materialize round trip.
 
 use std::sync::Arc;
 
 use super::super::*;
 use crate::{CellExtras, ImageData, ImageFormat, ImageRef, ImageScaling};
 
-/// One `rows`×`cols` placement.
 fn placement(rows: u16, cols: u16) -> Arc<ImageData> {
     Arc::new(ImageData {
         bytes: vec![7u8; 256],
@@ -26,8 +23,6 @@ fn placement(rows: u16, cols: u16) -> Arc<ImageData> {
     })
 }
 
-/// Stamp footprint row `image_row` of `image` onto grid row `row_idx`, columns
-/// `[0, cols)` — the shape `Terminal::place_image` writes (extras only, no glyph).
 fn stamp(grid: &mut Grid, row_idx: u16, image: &Arc<ImageData>, image_row: u16, cols: u16) {
     for cell_col in 0..cols {
         grid.set_cell_image(
@@ -43,7 +38,6 @@ fn stamp(grid: &mut Grid, row_idx: u16, image: &Arc<ImageData>, image_row: u16, 
     }
 }
 
-/// The extras a scroll-off would capture for `row_idx`.
 fn scrolled_extras(grid: &Grid, row_idx: u16) -> ScrolledRowExtras {
     let row = grid.row(row_idx).expect("row exists");
     Grid::extract_row_extras(row, grid.extras(), row_idx)
@@ -88,8 +82,6 @@ fn a_scrolled_off_image_row_round_trips_through_a_line_back_to_per_cell_refs() {
 
 #[test]
 fn an_image_row_still_materializes_as_empty_text() {
-    // An image row extracts as "" whether live or scrolled back, so copying
-    // history yields no phantom whitespace.
     let mut grid = Grid::new(4, 20);
     stamp(&mut grid, 0, &placement(1, 6), 0, 6);
     let extras = scrolled_extras(&grid, 0);
@@ -101,8 +93,6 @@ fn an_image_row_still_materializes_as_empty_text() {
 
 #[test]
 fn the_ring_fast_materializer_agrees_with_the_line_round_trip_on_an_image_row() {
-    // `materialize_from_row_extras` short-circuits zero-length rows (every
-    // image-only row); ring-tier and tiered reads of the same history agree.
     let mut grid = Grid::new(4, 20);
     let image = placement(2, 4);
     stamp(&mut grid, 0, &image, 1, 4);
@@ -123,8 +113,6 @@ fn the_ring_fast_materializer_agrees_with_the_line_round_trip_on_an_image_row() 
 
 #[test]
 fn a_run_broken_by_a_second_placement_splits_into_two_spans() {
-    // Coalescing must follow payload identity and footprint geometry, not merely
-    // "some image is here": two pictures side by side are two spans.
     let mut grid = Grid::new(4, 20);
     let left = placement(1, 2);
     let right = placement(1, 2);
@@ -156,8 +144,6 @@ fn a_run_broken_by_a_second_placement_splits_into_two_spans() {
 
 #[test]
 fn a_grid_that_never_drew_a_picture_never_scans_for_one() {
-    // The sticky gate: `any_image` is what keeps the full-width image scan off
-    // every scrolled row of every ordinary session.
     let extras = CellExtras::default();
     assert!(!extras.any_image(), "a fresh collection has no image");
     let mut grid = Grid::new(4, 20);

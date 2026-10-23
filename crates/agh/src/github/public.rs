@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The anonymous download host (design §11.3): a probe and a fetch, never with a credential.
+//! Anonymous download host probe and fetch.
 
 use crate::client::{Accept, Call, Github};
 use crate::download;
@@ -29,11 +29,7 @@ pub enum Probe {
     Unknown(String),
 }
 
-/// `/{o}/{r}/releases/download/{tag}/{asset}`, each part one encoded segment. A tag no
-/// release can have (`path::refuse_bad_tag`) or an asset with a `.` or `..` `/`-part is
-/// refused as usage, before any request: `segment` hides such a part behind an encoded `/`,
-/// and a front end that decodes `%2F` before it removes dot-segments would resolve the path
-/// off this repository.
+/// `/{o}/{r}/releases/download/{tag}/{asset}`, each part one encoded segment.
 fn web_path(slug: &Slug, tag: &str, asset: &str) -> Result<String> {
     path::refuse_bad_tag(tag)
         .and_then(|()| path::refuse_dot_segment("asset", asset))
@@ -54,14 +50,11 @@ fn anonymous(slug: &Slug) -> RouteRequest {
 
 impl<'a> Public<'a> {
     /// The host.
-    pub(crate) fn new(gh: &'a Github) -> Public<'a> {
+    pub(crate) const fn new(gh: &'a Github) -> Public<'a> {
         Public { gh }
     }
 
-    /// A HEAD of the asset's web path, anonymous, any status answered, no retry: 302 or 200 →
-    /// Present, 404 → Absent, anything else → Unknown, as is an error: the call's, or the
-    /// refusal of a tag `path::refuse_bad_tag` refuses or an asset with a `.` or `..`
-    /// `/`-part (`web_path`), before any request.
+    /// A HEAD of the asset's web path, anonymous, any status answered, no retry.
     #[must_use]
     pub fn probe(&self, slug: &Slug, tag: &str, asset: &str) -> Probe {
         let path = match web_path(slug, tag, asset) {
@@ -83,15 +76,11 @@ impl<'a> Public<'a> {
         }
     }
 
-    /// A GET of the asset's web path into `dest`, at most `cap` bytes: anonymous, one hop to
-    /// the CDN, streamed into a fresh part file, then durable and renamed. The byte count.
+    /// A GET of the asset's web path into `dest`, at most `cap` bytes.
     ///
     /// # Errors
-    ///
-    /// Usage, before any request, for a tag `path::refuse_bad_tag` refuses (empty, an empty
-    /// `/`-part, or a `.` or `..` part) or an asset with a `.` or `..` `/`-part
-    /// (`web_path`); Invalid over `cap` (the part file deleted); NotFound for a 404; the
-    /// call's error.
+    /// Usage for an invalid tag or asset path, before any request; Invalid over `cap`; NotFound
+    /// for a 404; the call's or the write's error.
     pub fn fetch(
         &self,
         slug: &Slug,

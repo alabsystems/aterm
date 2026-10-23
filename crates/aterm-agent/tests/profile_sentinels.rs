@@ -2,15 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Allocation-size and typed-output controls for the allowlist profile reader.
-//! This target is alone because it counts allocator requests while one parse is
-//! armed. It never inspects an allocation's payload: spare capacity and typed
-//! padding need not be initialized. Large escaped unknown values are allocated
-//! before measurement; the typed reader skips them without large allocations,
-//! while a deliberately materializing `Value` reader is detected. Output canaries
-//! independently check the composed credential and identity fields are absent.
-//!
-//! This bounds materialization for the exercised inputs; it does not claim to
-//! inspect freed memory or prove that every intermediate byte was wiped.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -37,8 +28,7 @@ fn note_request(size: usize) {
     }
 }
 
-// SAFETY: requests are forwarded unchanged to System. Only their sizes are
-// counted; neither initialized contents nor allocation padding is read.
+// SAFETY: requests are forwarded unchanged to System.
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller supplies the valid allocation layout.
@@ -155,8 +145,6 @@ fn composed() -> String {
 
 #[test]
 fn the_profile_reader_skips_large_escaped_secrets_without_materializing_them() {
-    // Construct the raw input before arming the allocator. Escapes require a
-    // materializing reader to decode the unknown field, rather than borrow it.
     let secret = r"\u0053\u0033\u004e\u0054\u0031\u004e\u0045\u004c".repeat(16_384);
     let text = composed().replace("sk-ant-S3NT1NEL-primary", &secret);
     let bytes = text.as_bytes();
@@ -176,7 +164,6 @@ fn the_profile_reader_skips_large_escaped_secrets_without_materializing_them() {
         "a skipped secret was materialized: {parsed:?}"
     );
 
-    // A parse error after the secret still skips it and returns one closed word.
     let cut = text.get(..text.len() - 2).expect("cut");
     let (failed, parsed) = requests(|| profile::parse(cut.as_bytes()));
     assert_eq!(failed, Err(profile::NoProfile::Unreadable));
@@ -185,8 +172,6 @@ fn the_profile_reader_skips_large_escaped_secrets_without_materializing_them() {
         "a failed parse materialized the secret: {parsed:?}"
     );
 
-    // NEGATIVE CONTROL: decoding the same field into a whole-file Value causes
-    // large allocation requests, and its answer exposes the planted text.
     let (whole, materialized) = requests(|| aterm_json::from_slice::<aterm_json::Value>(bytes));
     let whole = whole.expect("whole-file control");
     assert!(
@@ -200,9 +185,6 @@ fn the_profile_reader_skips_large_escaped_secrets_without_materializing_them() {
         "the control must really hold the decoded secret"
     );
 
-    // The file reader needs its raw input buffer, but no second large decoded
-    // secret buffer. This does not inspect freed memory; wiping remains the
-    // explicit production `read` path, not a claim about allocator contents.
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-profile-sentinels-")
         .tempdir()

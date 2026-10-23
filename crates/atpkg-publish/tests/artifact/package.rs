@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `pack-package` over a package tree laid as codex-alab's `alab/package.sh` lays it (a real
-//! ad hoc signed Mach-O, real `codesign`, a real git origin, the client's own stage), and the
-//! index that pins it: every gate refuses before anything is signed, the pack the producer
-//! signs is what a client stages, and an ALab pin is signed only over a pack that verifies.
+//! Tests for `pack-package` and ALab index pinning.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -76,7 +73,6 @@ fn world(label: &str) -> World {
     );
     trust_repo(&home.join("trust"), DORMANT_LEDGER);
     let bin = fixture_toolchain(&root.join("seal"));
-    // package.sh hashes the `.dylib` drivers of a macOS sysroot.
     std::fs::rename(
         root.join("seal/lib/librustc_driver-0123456789abcdef.so"),
         root.join("seal/lib/librustc_driver-0123456789abcdef.dylib"),
@@ -370,7 +366,6 @@ fn the_version_form_and_the_origin_are_read_exactly() {
 fn a_package_packs_whole_and_signs_what_a_client_stages() {
     let w = world("pkg-ok");
     let pkg = w.package("ok", &w.lay());
-    // The key at another path: the machine's own is moved away.
     let key = w.root.join("scratch-roster.key");
     std::fs::rename(&w.ctx.identity.key, &key).expect("move the key");
     let mut req = w.request(&pkg, ALAB);
@@ -391,7 +386,6 @@ fn a_package_packs_whole_and_signs_what_a_client_stages() {
     assert_eq!(parsed.artifacts.len(), 1);
     assert_eq!(parsed.artifacts[0].target, MAC);
     assert_eq!(parsed.artifacts[0].kind, "binary");
-    // What the archive lays is the package, file for file.
     let staged = w.root.join("staged/store/codex/2026101601");
     atpkg::verify_and_stage(
         &parsed.artifacts[0],
@@ -493,7 +487,6 @@ fn both_release_pages_name_the_upstream_base_the_package_records() {
             "{build}"
         );
 
-        // The mirror makes the pack public.
         let dir = w.root.join(format!("quad-{build}"));
         w.keys.write_quad(
             &dir,
@@ -621,7 +614,6 @@ fn each_gate_refuses_before_anything_is_signed() {
         assert!(w.signed().is_empty(), "{what}: nothing signed");
     }
 
-    // The tree: an unsigned entrypoint, an Intel-only object, a stray executable.
     let mut unsigned = base.clone();
     unsigned.exe = codesigned(&w.root, &["--remove-signature"]);
     let pkg = w.package("unsigned", &unsigned);
@@ -644,7 +636,6 @@ fn each_gate_refuses_before_anything_is_signed() {
         .expect_err("stray")
         .to_string();
     assert!(e.contains("runs unsigned"), "{e}");
-    // The control: the same package with nothing changed packs.
     let pkg = w.package("control", &base);
     w.pack(&w.request(&pkg, ALAB)).expect("the control packs");
 }
@@ -661,7 +652,6 @@ fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
     let o = w.pack(&w.request(&pkg, ALAB)).expect("packs");
     let out = w.root.join("index-out");
 
-    // A routine publish: no codex pack is read, and the row is the head's.
     let (r, log) = w.index(&["--pin", "ay=6"], None);
     r.expect("routine");
     let text = String::from_utf8(read(&out.join(QUAD_FILES[0]))).expect("utf8");
@@ -677,13 +667,11 @@ fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
         w.host.calls()
     );
 
-    // Nothing staged: refused, and the quad written for it is gone.
     let (r, _) = w.index(&["--pin", "codex=2026101601"], None);
     let e = r.expect_err("no pack").to_string();
     assert!(e.contains("REFUSING to pin codex@2026101601"), "{e}");
     assert!(!out.join(QUAD_FILES[0]).exists(), "no signed quad is left");
 
-    // A flipped archive byte.
     let files = files_of(&o);
     let mut flipped = files[0].1.clone();
     let last = flipped.len() - 1;
@@ -695,7 +683,6 @@ fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
     assert!(e.contains("client's stage refuses"), "{e}");
     assert!(!out.join(QUAD_FILES[0]).exists());
 
-    // A manifest signed by a machine the roster does not list.
     let (rogue, _) = atpkg_keys::generate().expect("keypair");
     let rogue_sig = atpkg_keys::sign(&rogue, &files[1].1).expect("sign");
     w.stage(ALAB, &[files[0].clone(), (files[2].0.clone(), rogue_sig)]);
@@ -704,7 +691,6 @@ fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
     assert!(e.contains("refuses the package manifest"), "{e}");
     assert!(!out.join(QUAD_FILES[0]).exists());
 
-    // The real pair: signed, and the client routes codex to ALab on Apple silicon only.
     w.stage(ALAB, &files);
     let (r, log) = w.index(&["--pin", "codex=2026101601"], None);
     r.expect("verifies");
@@ -720,7 +706,6 @@ fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
         assert_eq!(atpkg::alab::index_pin(&q.index, "codex", t), None, "{t}");
     }
 
-    // A local proof's pack dir, with the hosts holding nothing for the build.
     let w2 = world("pkg-index-local");
     let pkg = w2.package("local", &w2.lay());
     let o = w2.pack(&w2.request(&pkg, ALAB)).expect("packs");

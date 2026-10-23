@@ -20,7 +20,9 @@ pub(crate) enum Center {
     Granted,
 }
 
-/// `UNNotificationDefaultActionIdentifier`.
+/// `UNNotificationDefaultActionIdentifier`: the owner clicked the notice
+/// itself (not a dismissal, which a delegate hears only for a category that
+/// asks for it, and aterm registers none).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const DEFAULT_ACTION: &str = "com.apple.UNNotificationDefaultActionIdentifier";
 
@@ -688,6 +690,8 @@ mod clicks {
     }
 
     /// `info[key]` when it is a string (as the live arm's `user_info` writes
+    /// it).
+    ///
     /// # Safety
     /// `info` must be a live `NSDictionary`, or nil.
     unsafe fn string_for(info: Id, key: &str) -> Option<String> {

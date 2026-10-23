@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE `--session` LANE HANDS ITS SHELL THE MANAGED `bin/`, LAST AND ONCE, FROM ITS FIRST
-//! BYTE (`crates/aterm/src/main.rs`, through `atpkg::session_bin_dir` and
-//! `atpkg::store::append_bin_to_path`): a script, an agent or a shell that never sources the
-//! hook still finds a tool once its shim lands, and a managed tool never shadows a system one.
-//! The real binary over a private root ([`crate::launch_isolation`]: `[packages]` off, the
-//! reroute off), whose `/bin/sh` sources no atpkg hook (a login `sh`'s `/etc/profile` moves only
-//! the system's own directories to the front), so `bin/` on its PATH is the lane's. The gate is
-//! the hook a first-launch seed writes under `~/.aterm/shell.d`: with it `bin/` is there;
-//! without it (and the lanes off) nothing is surfaced. Negative control: a lane that does not
-//! append it leaves the hooked machine's shell without it.
+//! THE `--session` LANE HANDS ITS SHELL THE MANAGED `bin/`, LAST AND ONCE, FROM ITS FIRST BYTE
+//! (`crates/aterm/src/main.rs`, through `atpkg::session_bin_dir` and
+//! `atpkg::store::append_bin_to_path`): a script, an agent or a shell that never sources the hook
+//! still finds a tool once its shim lands, and a managed tool never shadows a system one.
 
 use std::io::Write as _;
 use std::process::Stdio;
@@ -33,15 +27,12 @@ fn session_path(root: &std::path::Path) -> String {
         .stderr(Stdio::null());
     let mut child = cmd.spawn().expect("spawn the aterm binary");
     drop(cmd);
-    // `$((6*7))` is 42 only once the shell ran the line; the terminal's echo of the typed
-    // line keeps the literal, so the marker below is the shell's own output.
     child
         .stdin
         .take()
         .expect("aterm stdin")
         .write_all(b"printf 'PATH_%s=<%s>\\n' $((6*7)) \"$PATH\"\nexit\n")
         .expect("type the line");
-    // A hang detector, not a latency budget.
     let out = crate::child_output::wait_and_read(child, Instant::now() + Duration::from_secs(60))
         .expect("`aterm --session` did not exit within a minute");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

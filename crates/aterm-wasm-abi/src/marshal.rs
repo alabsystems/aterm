@@ -216,7 +216,8 @@ unsafe fn take_vec<T>(ptr: usize, len: usize) -> Vec<T> {
     unsafe { Vec::from_raw_parts(ptr as *mut T, len, len) }
 }
 
-/// Hand a buffer to the glue: its pointer and element count.
+/// Hand a buffer to the glue: its pointer and element count. The glue frees
+/// it with `len * size_of::<T>()` bytes at `align_of::<T>()`.
 #[inline]
 fn give_vec<T>(v: Vec<T>) -> (usize, u32) {
     let b = v.into_boxed_slice();

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `CrashRestoreJournal`, the crash-restore journal (the crash-restore plan §7.1):
-//! proved at `Buggy = 0` with every action firing, each of the six defects caught on the
-//! invariant written for it, and the hand-traced counterexamples walked step by step. Tier-1 is
-//! `aterm-restore/src/conformance_region.rs`.
+//! Tier-0 model tests for `CrashRestoreJournal`.
 
 use aterm_models_session::crash_restore_journal_model;
 use aterm_spec::interp;
@@ -135,8 +132,6 @@ fn crash_restore_journal_the_traced_counterexamples_end_where_the_plan_says() {
             !mutant.check_invariant(invariant, &end),
             "Buggy = {buggy}: {steps:?} ends where {invariant} is broken: {end:?}"
         );
-        // The committed machine takes the same steps as far as its guards allow and keeps
-        // the invariant in every state it reaches.
         let mut state = model.init_state();
         for step in steps {
             if !model.fire(step, &mut state) {

@@ -17,7 +17,10 @@ use super::ffi::{self, HANDLE, Handle};
 use crate::console_host::policy::{self, AutoSource, HostState, OpenConsoleExe, Origin};
 use crate::{ConsoleHostChoice, ConsoleHostReport};
 
-/// The process's console-host state.
+/// The process's console-host state. Starts at the inbox host: an embedder
+/// that never states a choice (the CLI's passthrough session, this crate's own
+/// tests) keeps the host every earlier build used; a window states its
+/// aterm.toml `conpty` before its first tab.
 static HOST: Mutex<HostState> = Mutex::new(HostState::new());
 
 /// Set the console host every LATER spawn in this process uses (the window calls it with aterm.toml's `conpty` at launch and on every reload).

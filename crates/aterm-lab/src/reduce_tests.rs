@@ -1049,7 +1049,12 @@ const WORDS_PLANT: [&str; 4] = [
     r#"{"type":"system","subtype":"turn_duration","durationMs":1200,"timestamp":"2026-10-16T10:00:02.000Z","uuid":"31111111-1111-4111-8111-111111111111","parentUuid":"21111111-1111-4111-8111-111111111111","version":"2.1.303"}"#,
 ];
 
-/// a closed word is kept only where a reader reads it.
+/// a closed word is kept only where a reader reads it. The
+/// planted `"mode":"quokkaledger"` (a word under a closed key, which the
+/// rule before U7 kept as written) is emptied, while its row's `type`, which
+/// the harness reads of every row, is kept; so is the turn end's `subtype`,
+/// which the step fold reads, and the reply's `stop_reason`; and every
+/// word kept is read (the output-side check, [`unread_words`]).
 #[test]
 fn a_closed_word_is_kept_only_where_a_reader_reads_it() {
     let src: String = WORDS_PLANT.iter().map(|l| format!("{l}\n")).collect();

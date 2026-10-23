@@ -689,7 +689,8 @@ impl EventLoopThreadExecutor {
         self.thread_id == cur_thread_id
     }
 
-    /// Executes a function in the event loop thread.
+    /// Executes a function in the event loop thread. If we're already in the event loop thread,
+    /// we just call the function directly.
     pub(super) fn execute_in_thread<F>(&self, mut function: F)
     where
         F: FnMut() + Send + 'static,

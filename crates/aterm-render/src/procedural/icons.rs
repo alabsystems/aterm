@@ -52,9 +52,13 @@ pub fn band_icon_coverage(
     }
     buf
 }
+/// The most of an icon's half height its stroke may take (about a fifth of
+/// the icon), whole pixels: [`Shape::fit`] holds the face's stem to it at the
 /// capitals and [`Shape::mark_t`] at the ring family's own radius.
 const STROKE_SHARE: f32 = 0.44;
 
+/// One icon's frame on its raster: its centre, half height, stroke, the
+/// horizontal room it may use on each side of the centre, the row it stands
 /// on and the highest row it may ink.
 struct Shape {
     cx: f32,
@@ -64,8 +68,12 @@ struct Shape {
     room: f32,
     bot: f32,
     top: f32,
+    /// The ring family's half diameter ([`IconMetrics::disc`], never under
+    /// three fifths of the capitals in whole pixels), which
     /// [`Self::mark_frame`] holds to `half`.
     ring: f32,
+    /// The half height an icon narrower than it is tall may keep in a cell
+    /// of its own (`⤓`): the capitals' where the row allows, whatever the
     /// cell's width.
     tall: f32,
 }
@@ -167,6 +175,7 @@ impl Shape {
             .fold(f32::INFINITY, f32::min)
     }
 
+    /// A mark one stroke wide on the centre line, from pixel row `y0` to
     /// `y1` (whole rows, so its ends are crisp).
     fn bar(&self, px: f32, py: f32, y0: f32, y1: f32) -> f32 {
         rect(
@@ -185,6 +194,8 @@ impl Shape {
         polygon_sd(px, py, &v)
     }
 
+    /// A round icon's outer radius and centre row: a pixel over the capital
+    /// height (a round letter's overshoot), its sides and its top on pixel
     /// boundaries, its bottom no lower than the baseline's row.
     fn ring_frame(&self) -> (f32, f32) {
         let frac = self.cx.fract();
@@ -193,6 +204,9 @@ impl Shape {
         (r, top + r)
     }
 
+    /// The warning triangle: its apex row, its base row (the baseline, where
+    /// the icon stands on it), its half base and the rounding of its corners.
+    /// It is `2.4` half heights tall where its rounded tip (about the
     /// rounding below the sharp apex) stays under the face's tallest letter.
     fn triangle(&self) -> (f32, f32, f32, f32) {
         let bottom = self.bot.round();
@@ -468,30 +482,42 @@ impl Shape {
         let (r, cyr) = self.mark_frame();
         (px - self.cx).hypot(py - cyr) - r
     }
+    /// The family's stroke: the face's stem ([`Self::t`]) held to the share
+    /// of the family's own radius ([`STROKE_SHARE`]) that [`Self::fit`] holds
+    /// it to of the capitals'. The family is the face's `●`'s size, which can
+    /// be well under the capitals, and a bold stem two pixels wide leaves a
+    /// ring six across no clear pixel (Menlo at 11 px, Andale Mono at 13 to
+    /// 15, PT Mono at 12 to 16, Courier New at 15): `○ off` would read as
     /// `● on`.
     fn mark_t(&self) -> f32 {
         let (r, _) = self.mark_frame();
         self.t.min((r * STROKE_SHARE).round()).max(1.0)
     }
 
+    /// `○`: the family's disc as a ring one stroke wide ([`Self::mark_t`]),
     /// its outer edge the disc's.
     fn mark_ring(&self, px: f32, py: f32) -> f32 {
         let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
         ((px - self.cx).hypot(py - cyr) - (r - t * 0.5)).abs() - t * 0.5
     }
 
+    /// The band one stroke wide ([`Self::mark_t`]) just inside a shape whose
+    /// signed distance at the pixel is `d`: its outline, drawn as `○` is from
     /// `●`.
     fn mark_outline(&self, d: f32) -> f32 {
         let t = self.mark_t();
         (d + t * 0.5).abs() - t * 0.5
     }
 
+    /// The family's box ([`Self::mark_frame`]): the disc's ink box, which the
+    /// marks drawn in it (`◈ ⌂`) are cut to, so a corner's tip never inks a
     /// pixel the disc does not.
     fn mark_box(&self, px: f32, py: f32) -> f32 {
         let (r, cyr) = self.mark_frame();
         rect(px, py, self.cx - r, cyr - r, self.cx + r, cyr + r)
     }
 
+    /// A disc of radius `r` pixels on the centre line, `v` half heights
     /// below the centre.
     fn p_disc(&self, px: f32, py: f32, v: f32, r: f32) -> f32 {
         let (x, y) = self.p(0.0, v);
@@ -518,6 +544,9 @@ fn rect(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
     }
 }
 
+/// The signed distance to the isosceles triangle with its apex at
+/// `(cx, apex)` and its base `cx ± wb` on row `bottom`, its corners rounded
+/// by `round` pixels while its edges stay where they are: the triangle
 /// shrunk about its incentre by `round`, then grown back by it.
 fn rounded_triangle(px: f32, py: f32, cx: f32, apex: f32, bottom: f32, wb: f32, round: f32) -> f32 {
     let h = bottom - apex;
@@ -533,6 +562,8 @@ fn rounded_triangle(px: f32, py: f32, cx: f32, apex: f32, bottom: f32, wb: f32, 
     ) - round
 }
 
+/// The signed distance from `(px, py)` to a closed polygon (negative
+/// inside), any winding, convex or concave — the even-odd crossing test for
 /// the sign, the nearest edge for the magnitude.
 fn polygon_sd(px: f32, py: f32, v: &[(f32, f32)]) -> f32 {
     let n = v.len();
@@ -564,6 +595,8 @@ mod tests {
         disc: 13.0,
     };
 
+    /// The faces the band draws at, measured (`Renderer::icon_metrics`): the
+    /// system mono at 20 px (a 12 × 24 cell, regular and bold) and at 27 px
     /// (17 × 32), and a 16 × 32 cell with a capital of 19.
     const FACES: [(usize, usize, IconMetrics); 6] = [
         (
@@ -645,6 +678,9 @@ mod tests {
         (x0, x1, y0, y1)
     }
 
+    /// An icon beside ink keeps to its own cell (ruling 257): no ink in its top row and,
+    /// for a band's badge, none in its left or right column, at either stroke/cell parity.
+    /// A glass mark may ink its cell to the edges, as the face's own `●` does. All but the
     /// pause bars and the `!` are antialiased.
     #[test]
     fn every_icon_draws_antialiased_ink_inside_its_cell() {
@@ -723,6 +759,9 @@ mod tests {
         }
     }
 
+    /// An icon between blank cells is drawn at the capitals' height (ruling 258) on a
+    /// three-cell raster: a clear column at both ends, no ink above the tallest letter
+    /// or below the baseline's row, the badges spilling into both blank cells, and
     /// centred on its own cell.
     #[test]
     fn a_spilled_icon_is_as_tall_as_the_capitals_and_stays_in_its_three_cells() {
@@ -785,6 +824,7 @@ mod tests {
         }
     }
 
+    /// The strokes follow the given stem (bold draws more ink on every stroked icon and
     /// cuts a heavier mark from the badges), and no two icons draw the same image.
     #[test]
     fn the_stroke_follows_the_stem_and_the_icons_are_distinct() {
@@ -822,6 +862,8 @@ mod tests {
         }
     }
 
+    /// Down a badge's centre column the `i` and the `!` are two clean cuts (fully clear
+    /// rows) with a solid row between (ruling 253), the stem the longer cut and at least
     /// five rows, and the badge closes under the mark.
     #[test]
     fn a_badges_dot_and_stem_are_cut_apart_on_whole_rows() {
@@ -868,6 +910,15 @@ mod tests {
         }
     }
 
+    /// THE GLASS'S RING FAMILY IS ONE SET: `●`, `○`, `◐`, `◌`, `⊘` and `◉`, and the `◈`, `⌂`
+    /// and `◆` drawn in their box, share one ink box on every face, inside their own cell on
+    /// a raster of three cells as on one of their own, no taller than the face's own `●`
+    /// ([`IconMetrics::disc`]) where it is under the capitals; `○`, `◌` and `⌂` are hollow
+    /// at their centre and `●`, `⊘`, `◉`, `◈` and `◆` are not; `◌` is drawn on `○`'s line
+    /// with gaps; `◐` is `●` left of its centre and `○` right of it; `◉` is `○` with a dot a
+    /// clear gap inside it, and `◈` (where its box has the room) a diamond with one; `⌂`'s
+    /// roof leaves the box's top corners clear and its walls stand on the box's floor; `◆`
+    /// leaves them all clear. NEGATIVE CONTROL: the outline follows `disc`, so in a cell
     /// whose width binds neither, the capitals' disc draws a taller family.
     #[test]
     fn the_ring_family_shares_one_outline() {
@@ -995,6 +1046,10 @@ mod tests {
         }
     }
 
+    /// `⤓` (Land) is as tall as the capitals in a cell of its own as well as between blanks,
+    /// standing on the baseline's row, and narrows to its cell: an arrow is narrower than it
+    /// is tall, so it keeps the height the font's glyph has beside a clock's digits
+    /// (`⤓18:00`). NEGATIVE CONTROL: the band's `⇣`, held to a square in its own cell, is
     /// shorter there.
     #[test]
     fn the_land_arrow_keeps_the_capitals_height_in_its_own_cell() {

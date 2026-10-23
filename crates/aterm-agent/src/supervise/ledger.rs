@@ -1207,7 +1207,7 @@ pub enum Lane {
 }
 
 impl Lane {
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Lane::Manager => "manager",
             Lane::Worker => "worker",
@@ -1253,7 +1253,7 @@ impl MarkKind {
             _ => MarkKind::Other,
         }
     }
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             MarkKind::Turn => "turn",
             MarkKind::Reply => "reply",

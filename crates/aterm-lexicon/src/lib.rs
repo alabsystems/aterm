@@ -390,7 +390,9 @@ fn builtin_rows() -> (RawLexicon, RawExceptions) {
     (RawLexicon { entry }, RawExceptions { exception })
 }
 
-/// Cap on surface forms materialized across all entries in [`Lexicon::build`].
+/// Cap on surface forms materialized across all entries in [`Lexicon::build`]. The builtin makes
+/// about 1,500; the cap stops an override with huge `stems`/`suffixes`/`forms` arrays from driving
+/// O(stems·suffixes) memory and build time.
 const MAX_TOTAL_SURFACES: usize = 1 << 20;
 
 /// Longest no-space surface, in characters, that [`Lexicon::build`] compiles: the bound on the
@@ -428,7 +430,9 @@ pub struct Lexicon {
     user_surfaces: FxHashSet<String>,
 }
 
-/// Compiled value stored behind an exact surface key.
+/// Compiled value stored behind an exact surface key. `form_id` is assigned
+/// only after cross-class precedence has settled, so one winning key has one
+/// collision-free identity regardless of how many language entries claimed it.
 #[derive(Clone, Copy, Debug)]
 struct LexiconHit {
     class: Class,
@@ -867,7 +871,9 @@ impl Lexicon {
             .map(|hit| hit.class)
     }
 
-    /// [`classify_token`](Self::classify_token) into caller scratch, returning the whole hit.
+    /// [`classify_token`](Self::classify_token) into caller scratch, returning the whole hit. On
+    /// return `folded` holds the full-token fold (the first lookup key), which the scanner reuses
+    /// for its guards; the possessive and clitic fallbacks fold into `candidate_folded`.
     fn classify_token_into(
         &self,
         token: &str,
@@ -1141,7 +1147,10 @@ enum CjkHit {
     Exception,
 }
 
-/// Intern `code` into `table` (first-appearance order).
+/// Intern `code` into `table` (first-appearance order). Empty / `"unknown"`
+/// codes — and, deterministically, every NEW code once the table's
+/// [`LangSet`]-addressable real slots are exhausted — land in the reserved
+/// [`UNKNOWN_LANG`] slot, which [`Lexicon::lang_code`] renders as `"unknown"`.
 fn intern_lang(table: &mut Vec<String>, code: &str) -> LangId {
     let code = code.trim();
     if code.is_empty() || code == "unknown" {
@@ -1158,7 +1167,8 @@ fn intern_lang(table: &mut Vec<String>, code: &str) -> LangId {
     LangId((table.len() - 1) as u16)
 }
 
-/// Intern an animal `species` id into `table` (first-appearance order).
+/// Intern an animal `species` id into `table` (first-appearance order). A plain index table with
+/// no reserved slot; ids saturate at `u16::MAX`, far above the roster.
 fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
     if let Some(i) = table.iter().position(|s| s == code) {
         return SpeciesId(i as u16);
@@ -1170,7 +1180,9 @@ fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
     table.push(code.to_string());
     SpeciesId(i as u16)
 }
-/// Cross-class homograph precedence: `profanity > feline > canine > animal > emphasis`.
+/// Cross-class homograph precedence: `profanity > feline > canine > animal > emphasis`. A surface
+/// that is an expletive in any enabled language ("poes": Dutch pussycat, Afrikaans vulgar) is
+/// profanity, so it sparkles rather than getting a paw.
 #[inline]
 const fn class_rank(class: Class) -> u8 {
     match class {
@@ -1314,7 +1326,8 @@ pub fn is_no_space_surface(s: &str) -> bool {
     !s.is_empty() && s.chars().all(fold::is_no_space_script)
 }
 
-/// FNV-1a over the key's UTF-8 bytes — the [`Match::form_hash`] source.
+/// FNV-1a over the key's UTF-8 bytes — the [`Match::form_hash`] source. Kept
+/// byte-level (not char-level) so the hash of a `&str` slice never allocates.
 #[inline]
 fn fnv1a64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

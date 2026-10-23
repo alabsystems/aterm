@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A loopback HTTP server for the lane's site directory, one connection per
-//! request (`Connection: close`), each on its own thread. GET serves the
-//! generated site's files through plain relative paths, with the content
-//! types a page loading ES modules and wasm needs (a module script must be
-//! JavaScript, and `WebAssembly.instantiateStreaming` wants
-//! `application/wasm`). One POST is taken: a page the lane does not drive
-//! over a protocol hands its answer back to `/answer/<kind>`
-//! ([`Server::answer`]).
+//! Loopback HTTP server for browser lane site files and [`Server::answer`] POSTs.
 
 use std::io::{BufRead, BufReader, Read, Take, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -19,14 +12,13 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// The longest accepted request head; one extra byte detects overflow.
+/// The longest accepted request head.
 const MAX_HEAD: usize = 16 << 10;
 
-/// The largest answer a page may POST: the gpu page's eleven frames are
-/// about 3 MB of base64.
+/// The largest answer a page may POST.
 const MAX_ANSWER: usize = 64 << 20;
 
-/// A running server; dropping it stops accepting requests.
+/// A running server.
 pub(crate) struct Server {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
@@ -73,9 +65,7 @@ impl Server {
         })
     }
 
-    /// The body a page POSTed to `/answer/<kind>`, waiting for it within the
-    /// one-minute hang detector while `alive()` (the browser still running);
-    /// answers for other kinds that come first are kept for their own wait.
+    /// The body a page POSTed to `/answer/<kind>`.
     pub(crate) fn answer(
         &mut self,
         kind: &str,
@@ -128,7 +118,6 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // Wake the accept loop so it sees the flag.
         let _ = TcpStream::connect_timeout(&self.addr, Duration::from_secs(1));
         if let Some(t) = self.accept.take() {
             let _ = t.join();
@@ -148,9 +137,7 @@ pub(crate) fn content_type(path: &Path) -> &'static str {
     }
 }
 
-/// The file under `root` a request target names: its path, the query and
-/// fragment dropped. `None` for anything not a plain relative path: `..`, a
-/// percent escape, a backslash, an empty name.
+/// The file under `root` a request target names.
 pub(crate) fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
     let path = target.split(['?', '#']).next()?;
     let rel = path.strip_prefix('/')?;
@@ -164,8 +151,7 @@ pub(crate) fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
     Some(root.join(rel))
 }
 
-/// The kind a POST target names: `/answer/<kind>`, `kind` lowercase ASCII
-/// letters.
+/// The kind a POST target names.
 pub(crate) fn answer_kind(target: &str) -> Option<&str> {
     target
         .strip_prefix("/answer/")
@@ -182,8 +168,7 @@ fn content_length(head: &str) -> Option<usize> {
     })
 }
 
-/// A complete request head from `reader`, which reads at most one byte past
-/// [`MAX_HEAD`]: bounded even when a line has no newline.
+/// A complete request head from `reader`, which reads at most one byte past [`MAX_HEAD`].
 fn request_head<R: Read>(reader: &mut BufReader<Take<R>>) -> std::io::Result<String> {
     let mut head = String::new();
     loop {
@@ -214,8 +199,7 @@ fn empty_response(out: &mut TcpStream, status: &str) -> std::io::Result<()> {
     )
 }
 
-/// The body after `head`: `Content-Length` bytes, the ones `reader` has
-/// buffered first. The status to refuse it with, if it cannot be read.
+/// The body after `head`.
 fn request_body<R: Read>(
     head: &str,
     reader: &mut BufReader<Take<R>>,
@@ -237,8 +221,7 @@ fn request_body<R: Read>(
     Ok(body)
 }
 
-/// Read one request from `stream` and answer it: a GET with the file it
-/// names, a POST to `/answer/<kind>` by handing its body to `posted`.
+/// Read one request from `stream` and answer it.
 fn answer(
     mut stream: TcpStream,
     root: &Path,
@@ -264,8 +247,6 @@ fn answer(
     if let Some(kind) = answer_kind(target).filter(|_| method == "POST") {
         let status = match request_body(&head, &mut reader) {
             Ok(body) => {
-                // A lane no longer waiting has dropped the receiver; the page
-                // is answered all the same.
                 let _ = posted.send((kind.to_string(), body));
                 "204 No Content"
             }
@@ -441,8 +422,6 @@ mod tests {
                 break;
             }
         }
-        // A refused request may leave unread input and close with a reset.
-        // The counted response is complete without waiting for connection EOF.
         let mut body = vec![0; length.expect("counted response")];
         reader.read_exact(&mut body).expect("response body");
         out.push_str(std::str::from_utf8(&body).expect("text fixture"));
@@ -475,9 +454,6 @@ mod tests {
         assert!(ok.ends_with("\r\n\r\nexport {}\n"), "{ok}");
         assert!(get(&server.origin(), "/missing.js").starts_with("HTTP/1.1 404"));
         assert!(get(&server.origin(), "/../lane.mjs").starts_with("HTTP/1.1 404"));
-        // End oversized requests at the overflow probe. Larger unread bodies
-        // may make the OS reset the connection before a refusal is received;
-        // the reader-bound test above covers that longer input independently.
         let oversized =
             |prefix: &str| format!("{prefix}{}", "x".repeat(MAX_HEAD + 1 - prefix.len()));
         for invalid in [
@@ -492,7 +468,6 @@ mod tests {
             );
         }
         assert!(get(&server.origin(), "/lane.mjs").ends_with("\r\n\r\nexport {}\n"));
-        // A page's answer comes back by kind, whichever order the pages post.
         let post = |kind: &str, body: &str| {
             request(
                 &server.origin(),
@@ -514,15 +489,11 @@ mod tests {
             server.answer("gpu", || true).as_deref(),
             Ok(&b"{\"g\":1}"[..])
         );
-        // A browser that is gone answers no more: the wait ends, it does not
-        // run out the hang detector.
         assert_eq!(
             server.answer("worker", || false),
             Err("the browser ended before the worker page answered".to_string())
         );
         assert!(server.served() >= 1);
-        // Returns once the accept loop has ended: a drop that hung would hang
-        // the test.
         drop(server);
     }
 }

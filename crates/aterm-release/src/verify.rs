@@ -230,7 +230,11 @@ fn captured_identity_rows(page: &str, wanted: &std::collections::BTreeSet<u64>) 
         .join("\n")
 }
 
-/// The canonical version a candidate tag names: `"v0.2.0"` → `"0.2.0"`.
+/// The canonical version a candidate tag names: `"v0.2.0"` → `"0.2.0"`. The grammar is
+/// `aterm_update_core::tag::parse_release_tag`, shared with the client so the two rules
+/// cannot drift: canonical `vMAJOR.MINOR.PATCH` is a candidate, a retired two-component
+/// `vMAJOR.MINOR` is [`TagKind::Legacy`] (skipped, never an error), anything else fails
+/// closed.
 fn parse_canonical_tag(tag: &str) -> Result<String> {
     publish::canonical_channel_tag_version(tag)
 }
@@ -815,7 +819,7 @@ fn next_cut_line(
 
 /// What a cut from this tree must be given to sign, read off the committed pins: the
 /// paper master (the roster) and the Apple Team ID (notarization).
-fn signing_requirement() -> &'static str {
+const fn signing_requirement() -> &'static str {
     let roster = aterm_update_core::pins::roster_tier_armed();
     let notary = !aterm_update_core::pins::APPLE_TEAM_ID.is_empty();
     match (roster, notary) {

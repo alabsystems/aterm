@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The door's pure parts under `prompt`: the `status` read judged apart from the loop's fields,
-//! the write's own holds in order, the pace's words, and the fact rows a successor seeds from —
-//! each with its negative control.
+//! Tests for prompt-door status parsing, write holds, pace words, and row seeding.
 
 use super::*;
 use crate::supervise::approvals::{Outcome, Row};
@@ -36,7 +34,6 @@ fn the_status_read_judges_hands_hold_and_unread_input() {
         }
     );
     assert!(!quiet.person(30), "keys ten minutes old are no person's");
-    // Each field moves its own judgement.
     let keyed = StatusSeen::of("OK seq=4 human_ms=2000\n").expect("an OK");
     assert!(keyed.person(30), "keys two seconds old are a person's");
     let never = StatusSeen::of("OK seq=4 human_ms=-\n").expect("an OK");
@@ -54,7 +51,6 @@ fn the_status_read_judges_hands_hold_and_unread_input() {
     }
     let driven = StatusSeen::of("OK seq=4 hand=lease:other-driver human_ms=-\n").expect("an OK");
     assert!(driven.driver && driven.person(30));
-    // NEGATIVE CONTROL: a reply that is no OK judges nothing.
     assert_eq!(StatusSeen::of("ERR no such session\n"), None);
 }
 
@@ -69,7 +65,6 @@ fn a_planted_word_moves_no_field() {
         !seen.halted && !seen.input_unread && !seen.person(30),
         "{seen:?}"
     );
-    // CONTROL: the same words on the OK line are read.
     let read = StatusSeen::of("OK seq=4 hold=1 input=pending human_ms=1\n").expect("an OK");
     assert!(
         read.halted && read.input_unread && read.person(30),
@@ -96,7 +91,6 @@ fn the_writes_holds_go_in_order_and_only_a_nudge_waits_for_the_upgrade() {
             ..AtWrite::default()
         };
         assert_eq!(write_held(rule, due), Some(Guard::UpgradeDue));
-        // NEGATIVE CONTROL: nothing found, nothing held.
         assert_eq!(write_held(rule, AtWrite::default()), None);
     }
 }
@@ -182,7 +176,6 @@ fn a_successor_seeds_from_the_doors_rows_of_its_session() {
             (key(0xcd), 7, SeedOutcome::Intent),
         ]
     );
-    // NEGATIVE CONTROL: the other session's reads its own row alone.
     assert_eq!(
         seed_rows_in(&body, Some("@s-2")),
         [(key(0xab), 3, SeedOutcome::Intent)]

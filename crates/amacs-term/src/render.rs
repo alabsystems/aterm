@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The terminal face's frame (design §5.4): what one [`Screen`] of the
-//! terminal UI shows, built from the engine's state and nothing else.
-//!
-//! The layout is Emacs's in a terminal: the buffer, then one reverse-video
-//! modeline, then the echo area on the last row, which is the minibuffer
-//! while one is open. A message or a prompt wider than the screen wraps, and
-//! the echo area grows upward to hold it, to a quarter of the screen (Emacs's
-//! `max-mini-window-height`), taking rows from the buffer while it is shown;
-//! M-x's completions stay on one row and are cut at its end. The buffer rows
-//! are the engine's own
-//! projection ([`project_viewport_with`]): the same lines, horizontal window
-//! and selections aterm's native Editor paints, laid out a grapheme at a time
-//! on the screen writer, which places each cell where aterm's grid puts it. A
-//! tab is the blanks to the next four-column stop and a control character
-//! takes no cell, the engine's own column rules
-//! ([`amacs::editor::editor_grapheme_columns`]), so a caret's column here is
-//! the column `C-n` and `C-p` keep. Each drawn row remembers where its
-//! graphemes landed, which is how a mouse press finds its document byte.
-//!
-//! Colours are the 16 named ones by role (keyword, string, comment, ...), so
-//! the terminal's own theme applies, aterm's when it is the terminal; the
-//! region and the isearch match are reverse video. The cursor is a block in
-//! the buffer and a bar in the minibuffer.
+//! Terminal [`Screen`] frame rendering via [`project_viewport_with`].
 
 use std::ops::Range;
 
@@ -48,10 +26,7 @@ pub(crate) struct Layout {
     pub echo: Range<u16>,
 }
 
-/// The rows of a screen `rows` tall whose echo area needs `echo` rows (at
-/// least one): the echo area takes the last, the modeline the one above
-/// them, and the buffer the rest. A screen too short for all three keeps the
-/// echo area first, then the modeline.
+/// The rows of a screen `rows` tall whose echo area needs `echo` rows (at least one).
 pub(crate) fn layout(rows: u16, echo: u16) -> Layout {
     let echo = echo.clamp(1, rows.max(1)).min(rows);
     let above = rows.saturating_sub(echo);
@@ -63,29 +38,24 @@ pub(crate) fn layout(rows: u16, echo: u16) -> Layout {
     }
 }
 
-/// The most rows the echo area grows to on a screen `rows` tall: a quarter
-/// of it, and always one.
+/// The most rows the echo area grows to on a screen `rows` tall.
 pub(crate) fn echo_limit(rows: u16) -> u16 {
     (rows / 4).max(1)
 }
 
-/// One buffer row as drawn: which document bytes it shows, and the column
-/// each of its graphemes starts at.
+/// One buffer row as drawn.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DrawnRow {
     /// The document bytes the row shows ([`EditorViewportLine::source`]).
     pub source: Range<usize>,
-    /// Each grapheme's offset in `source` and the screen column it starts at,
-    /// in order. A control character, which takes no cell, starts where the
-    /// grapheme after it does.
+    /// Each grapheme's offset in `source` and the screen column it starts at, in order.
     pub cells: Vec<(usize, u16)>,
     /// The column after the row's last drawn grapheme.
     pub end: u16,
 }
 
 impl DrawnRow {
-    /// The column a caret at `offset` into `source` shows at: the column of
-    /// the grapheme it stands before, or the row's end.
+    /// Display column for a caret at `offset` into `source`.
     fn column_of(&self, offset: usize) -> u16 {
         self.cells
             .iter()
@@ -93,9 +63,7 @@ impl DrawnRow {
             .map_or(self.end, |(_, column)| *column)
     }
 
-    /// The document byte a press at `column` lands on: the start of the
-    /// grapheme drawn there (the left one of a wide pair), or the row's end
-    /// for a press past its text.
+    /// The document byte a press at `column` lands on: the start of the grapheme drawn there.
     pub(crate) fn byte_at(&self, column: u16) -> usize {
         let offset = self
             .cells
@@ -108,15 +76,13 @@ impl DrawnRow {
     }
 }
 
-/// The syntax of a document as the frame needs it: its language's spans,
-/// line by line, and the text they were lexed from.
+/// The syntax of a document as the frame needs it.
 pub(crate) struct Syntax<'a> {
     pub cache: &'a LexCache,
     pub lines: &'a EditorLines<'a>,
 }
 
-/// The style a span of `class` is drawn in: a named colour by role, so the
-/// terminal's own theme decides the shade.
+/// The style a span of `class` is drawn in: a named colour by role.
 pub(crate) fn class_style(class: SyntaxClass) -> Style {
     let color = |index: u8| Style {
         fg: Color::Indexed(index),
@@ -137,8 +103,7 @@ pub(crate) fn class_style(class: SyntaxClass) -> Style {
     }
 }
 
-/// `style` drawn in reverse video: the region, an isearch match, a caret
-/// that is not the terminal's own.
+/// `style` drawn in reverse video.
 const fn reversed(style: Style) -> Style {
     Style {
         attrs: style.attrs.union(Attrs::REVERSE),
@@ -146,8 +111,7 @@ const fn reversed(style: Style) -> Style {
     }
 }
 
-/// The blank cells a tab at display column `column` takes: up to the next
-/// stop of four, as the engine counts it.
+/// The blank cells a tab at display column `column` takes.
 const fn tab_cells(column: usize) -> u16 {
     match column % 4 {
         0 => 4,
@@ -157,9 +121,7 @@ const fn tab_cells(column: usize) -> u16 {
     }
 }
 
-/// Draw the buffer rows of `view` over `text` on `screen`, `rows` of them
-/// from the top, and return each drawn row and where the primary caret
-/// shows (`None` when it is off the rows drawn).
+/// Draw the buffer rows of `view` over `text` on `screen`.
 pub(crate) fn draw_body(
     screen: &mut Screen,
     lines: &EditorLines<'_>,
@@ -173,8 +135,6 @@ pub(crate) fn draw_body(
     let mut caret = None;
     for (row, line) in (0..rows).zip(projection.lines.iter()) {
         let spans = syntax.map_or(&[][..], |syntax| syntax.cache.spans(line.number));
-        // Spans count from the line's first byte; the row may start further
-        // in, when the caret's line is scrolled sideways.
         let shift = syntax.map_or(0, |syntax| {
             line.source
                 .start
@@ -189,7 +149,6 @@ pub(crate) fn draw_body(
                     col: column.min(cols.saturating_sub(1)),
                 });
             } else if column < cols {
-                // A caret that is not the terminal's own is a reversed cell.
                 let to = column.saturating_add(1);
                 let style = screen
                     .cell(row, column)
@@ -240,11 +199,9 @@ fn draw_line(
             column = to;
         } else if grapheme.chars().any(char::is_control) {
             // The engine gives a control character no column; neither does
-            // the frame, so the caret's column is the one `C-n` keeps.
         } else {
             let next = screen.put(row, column, grapheme, style);
             if next == column && editor_grapheme_columns(grapheme, usize::from(column)) > 0 {
-                // It does not fit: a wide character at the last column.
                 drawn.cells.pop();
                 break;
             }
@@ -252,7 +209,6 @@ fn draw_line(
         }
     }
     drawn.end = column;
-    // A selection that owns the line break paints the cell after the text.
     if column < cols
         && line
             .selections
@@ -283,8 +239,7 @@ pub(crate) struct Modeline<'a> {
     pub for_word: Option<&'a str>,
 }
 
-/// The modeline's text: `-UU-:**- name  (Language) L12 C4`, then, when the
-/// edit is for a program, how to finish or abandon it.
+/// The modeline's text.
 pub(crate) fn modeline_text(modeline: &Modeline<'_>) -> String {
     let flag = if modeline.dirty { "**" } else { "--" };
     let mut text = format!(
@@ -330,16 +285,14 @@ pub(crate) fn caret_line_column(
 /// What the echo area shows, most pressing first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Echo<'a> {
-    /// A question of the face's own (`Save FILE? (y, n, q)`), the cursor
-    /// after it.
+    /// A question of the face's own (`Save FILE? (y, n, q)`), the cursor after it.
     Question(&'a str),
     /// The engine's echo of a key sequence being typed (`C-x — …`).
     Hud(&'a str),
     /// An open minibuffer, its query typed after its label.
     Minibuffer {
         minibuffer: &'a Minibuffer,
-        /// The status line the query's last key left: isearch says
-        /// "Failing I-search" there.
+        /// The status line the query's last key left.
         status: Option<&'a str>,
     },
     /// A message (`Wrote …`, `Quit`).
@@ -347,9 +300,7 @@ pub(crate) enum Echo<'a> {
     Empty,
 }
 
-/// The echo area's content, laid out: its text, M-x's completions after it,
-/// and whether the cursor stands at the text's end (a question or a
-/// minibuffer takes the keys).
+/// The echo area's content, laid out.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EchoLine {
     pub text: String,
@@ -359,8 +310,7 @@ pub(crate) struct EchoLine {
 }
 
 impl EchoLine {
-    /// The echo area for `echo`. A line break, which a paste into the
-    /// minibuffer may hold, shows as a space.
+    /// The echo area for `echo`.
     pub(crate) fn of(echo: &Echo<'_>) -> Self {
         let one_line = |text: &str| text.replace(['\r', '\n'], " ");
         match echo {
@@ -386,8 +336,7 @@ impl EchoLine {
     }
 }
 
-/// The echo area's label and query for an open minibuffer, and the
-/// completions M-x offers after it (the chosen one first).
+/// The echo area's label and query for an open minibuffer, and the completions M-x offers after it.
 fn minibuffer_line(minibuffer: &Minibuffer, status: Option<&str>) -> (String, Vec<String>) {
     let (label, query) = match minibuffer {
         Minibuffer::Inactive => return (String::new(), Vec::new()),
@@ -415,10 +364,7 @@ fn minibuffer_line(minibuffer: &Minibuffer, status: Option<&str>) -> (String, Ve
     (format!("{label}{query}"), completions)
 }
 
-/// Lay `echo` out on `rows` of `screen`: the text wraps from row to row and
-/// stops at the last; the completions follow it on its last row and are cut
-/// at that row's end. Returns how many rows the text took and where the
-/// cursor stands after it, for a prompt.
+/// Lay `echo` out on `rows` of `screen`: the text wraps from row to row and stops at the last.
 fn lay_echo(screen: &mut Screen, rows: Range<u16>, echo: &EchoLine) -> (u16, Option<Pos>) {
     let plain = Style::default();
     let cols = screen.size().cols;
@@ -433,7 +379,6 @@ fn lay_echo(screen: &mut Screen, rows: Range<u16>, echo: &EchoLine) -> (u16, Opt
             col = next;
             continue;
         }
-        // It does not fit on this row: the next takes it, if there is one.
         if col == 0 || row.saturating_add(1) >= rows.end {
             break;
         }
@@ -450,7 +395,6 @@ fn lay_echo(screen: &mut Screen, rows: Range<u16>, echo: &EchoLine) -> (u16, Opt
             if index > 0 {
                 at = screen.put(row, at, " | ", plain);
             }
-            // The one Enter runs stands out.
             let style = if index == 0 { reversed(plain) } else { plain };
             at = screen.put(row, at, name, style);
         }
@@ -459,8 +403,7 @@ fn lay_echo(screen: &mut Screen, rows: Range<u16>, echo: &EchoLine) -> (u16, Opt
     (row.saturating_sub(rows.start).saturating_add(1), cursor)
 }
 
-/// How many rows the echo area needs for `echo` on a screen of `size`: one,
-/// or as many as its text wraps to, up to [`echo_limit`].
+/// How many rows the echo area needs for `echo` on a screen of `size` ([`echo_limit`]).
 pub(crate) fn echo_rows(size: Size, ambiguous: AmbiguousWidth, echo: &EchoLine) -> u16 {
     let limit = echo_limit(size.rows);
     let mut scratch = Screen::new(
@@ -482,8 +425,7 @@ pub(crate) struct FrameParts<'a> {
     pub echo: &'a EchoLine,
 }
 
-/// Build the frame `parts` describe on a screen of `size`, laid out as
-/// `layout` says.
+/// Build the frame `parts` describe on a screen of `size`, laid out as `layout` says.
 pub(crate) fn frame(
     size: Size,
     ambiguous: AmbiguousWidth,
@@ -502,8 +444,6 @@ pub(crate) fn frame(
         draw_modeline(&mut screen, row, &parts.modeline);
     }
     let (_, prompt) = lay_echo(&mut screen, layout.echo.clone(), parts.echo);
-    // The cursor is where the keys go: the echo area while it asks, the
-    // buffer's caret otherwise.
     let (cursor, shape) = match prompt {
         Some(pos) => (Some(pos), CursorShape::SteadyBar),
         None => (caret, CursorShape::SteadyBlock),
@@ -517,8 +457,6 @@ pub(crate) fn frame(
 mod tests {
     use super::*;
 
-    /// Every screen keeps its echo area, then its modeline, and gives the
-    /// buffer the rest; a taller echo area takes rows from the buffer.
     #[test]
     fn the_layout_keeps_the_echo_area_then_the_modeline() {
         let at = |body, modeline, echo| Layout {
@@ -537,8 +475,6 @@ mod tests {
         assert_eq!(echo_limit(3), 1);
     }
 
-    /// A message wider than the screen wraps onto rows above the last, up
-    /// to the limit; M-x's completions are cut at the row's end.
     #[test]
     fn a_long_message_wraps_and_completions_are_cut() {
         let size = Size { cols: 10, rows: 8 };
@@ -557,7 +493,6 @@ mod tests {
         assert_eq!(screen.row_text(5).trim_end(), "0123456789");
         assert_eq!(screen.row_text(6).trim_end(), "abcdefghij");
         assert_eq!(screen.row_text(7).trim_end(), "-tail");
-        // A wide character that would straddle the edge starts the next row.
         let echo = EchoLine {
             text: "123456789日".to_string(),
             prompt: true,
@@ -580,7 +515,6 @@ mod tests {
         assert_eq!(screen.row_text(7), "M-x f  {fo");
     }
 
-    /// A tab reaches the next stop of four, as the engine's columns do.
     #[test]
     fn a_tab_reaches_the_next_four_column_stop() {
         for column in 0..32 {
@@ -593,8 +527,6 @@ mod tests {
         }
     }
 
-    /// The modeline names the buffer, its state, language and caret, and the
-    /// program waiting on the edit.
     #[test]
     fn the_modeline_reads_as_emacs_writes_it() {
         let mut modeline = Modeline {
@@ -617,11 +549,8 @@ mod tests {
         );
     }
 
-    /// A press finds the grapheme drawn under it, the left cell of a wide
-    /// one included, and a press past the text finds the row's end.
     #[test]
     fn a_press_finds_the_byte_drawn_under_it() {
-        // "a日b" from byte 10: `a` at 0, `日` at 1-2, `b` at 3.
         let row = DrawnRow {
             source: 10..15,
             cells: vec![(0, 0), (1, 1), (4, 3)],

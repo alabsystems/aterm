@@ -67,7 +67,7 @@ fn press_line(predictor: &Predictor, key: &str, armed: Option<u64>, at: Instant)
     )
 }
 
-/// Trace a press the predictor was just handed (module docs).
+/// Trace a press the predictor was just handed ([`press_line`]).
 pub(crate) fn press(predictor: &Predictor, key: &str, armed: Option<u64>, at: Instant) {
     if on() {
         crate::logging::stderr_line!("{}", press_line(predictor, key, armed, at));
@@ -149,7 +149,7 @@ pub(crate) fn clear(at: Instant) {
     }
 }
 
-/// Trace a frame that painted a prediction (module docs), after the paint and before the caller
+/// Trace a frame that painted a prediction, after the paint and before the caller
 /// moves the drawn cursor: `scratch`'s own cursor is still the engine's, and `shown` the one the
 /// caller is about to draw.
 pub(crate) fn frame(

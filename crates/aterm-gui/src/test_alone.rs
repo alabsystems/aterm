@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
-/// Names the test the child was started for.
+/// Names the test the child was started for. Set only on that child, so a
+/// child of the child (a stand-in it spawns, another test run alone) never
+/// reads as it unless it runs the very same test.
 const ALONE: &str = "ATERM_TEST_ALONE";
 
 /// How long the child may run before it is named wedged and SIGKILLed: a hang

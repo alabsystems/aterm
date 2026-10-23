@@ -27,6 +27,7 @@ const MAX_DEPTH: usize = 64;
 /// The bytes that open the catalog's tiers.
 const MARK: &[u8] = b"pricing_tiers:{";
 
+/// One side's prices for a model, in [`CLASSES`] order (`None`: none listed),
 /// and its long-prompt tier: the threshold and the same classes.
 #[derive(Debug, Clone, PartialEq, Default)]
 struct Side {
@@ -34,7 +35,7 @@ struct Side {
     long: Option<(Option<f64>, [Option<f64>; 5])>,
 }
 
-fn classes_of(r: &Rates) -> [Option<f64>; 5] {
+const fn classes_of(r: &Rates) -> [Option<f64>; 5] {
     [
         Some(r.input),
         Some(r.output),
@@ -62,6 +63,7 @@ enum Lit {
     Null,
 }
 
+/// The bytes as Latin-1 text: one character per byte, as the build's bytes
 /// are read.
 fn latin1(b: &[u8]) -> String {
     b.iter().copied().map(char::from).collect()
@@ -77,6 +79,7 @@ fn ident(b: &[u8]) -> Option<usize> {
     Some(b.iter().take_while(|c| word(c)).count())
 }
 
+/// The length of a number (`-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?`) at the
 /// start of `b`.
 fn number(b: &[u8]) -> Option<usize> {
     let digits = |from: usize| {
@@ -272,7 +275,7 @@ fn find(b: &[u8], mark: &[u8], from: usize) -> Option<usize> {
         .map(|at| at + from)
 }
 
-fn num(v: Option<&Lit>) -> Option<f64> {
+const fn num(v: Option<&Lit>) -> Option<f64> {
     match v {
         Some(Lit::Num(n)) => Some(*n),
         _ => None,
@@ -438,6 +441,8 @@ fn check(table: &PriceTable, build: &BTreeMap<String, Side>) -> Check {
 /// The bytes inside the Codex catalog's opening brace.
 const CODEX_MARK: &[u8] = b"\"models\": [";
 
+/// The slugs a Codex build's model catalog names, in its order: the one JSON
+/// object, read by the same literal reader, whose `models` list holds
 /// objects with a `slug`.
 fn codex_catalog(bytes: &[u8]) -> Result<Vec<String>, String> {
     let at = find(bytes, CODEX_MARK, 0)
@@ -482,6 +487,8 @@ struct CodexCheck {
     table_only: usize,
 }
 
+/// The table's OpenAI rows (every row not `claude-`) against the slugs a
+/// Codex build can run, id by id: the build's in its order, then the rows it
 /// does not name.
 fn check_codex(table: &PriceTable, slugs: &[String]) -> CodexCheck {
     let mut c = CodexCheck::default();
@@ -503,6 +510,7 @@ fn check_codex(table: &PriceTable, slugs: &[String]) -> CodexCheck {
     c
 }
 
+/// The OpenAI half of `prices`: the table's rows against `bin`'s model
 /// catalog, printed; an error when the build cannot be read.
 fn codex_prices(table: &PriceTable, bin: &str) -> Result<(), Fail> {
     let bytes =
@@ -571,6 +579,7 @@ pub fn cmd_prices(args: &[String]) -> Res {
 mod tests {
     use super::*;
 
+    /// A composed table: one long-tier row, one flat row, one the build
     /// does not carry, and an OpenAI row (never compared).
     const TABLE: &str = r#"
 format = 1
@@ -621,6 +630,8 @@ source = "https://example.com/pricing, 2026-10-15"
 id_from = "https://example.com/models, 2026-10-15"
 "#;
 
+    /// A build's bytes: minified code around the catalog literal, written as
+    /// the 2.1.301 bundle writes it (bare keys, `!0`, a long-prompt tier),
     /// with bytes that are no text either side.
     fn build(opus_output: &str) -> Vec<u8> {
         let literal = format!(
@@ -640,6 +651,10 @@ id_from = "https://example.com/models, 2026-10-15"
         PriceTable::from_toml(TABLE).expect("the composed table loads")
     }
 
+    /// THE CHECK, id by id: a row the build prices alike is `same` (the
+    /// long-prompt tier and its threshold too), one the build lacks is
+    /// `table-only`, one the table lacks `build-only`, and an OpenAI row is
+    /// not compared. Negative control: the build's opus output at $30 against
     /// the table's $25 differs on that class alone, and the exit says so.
     #[test]
     fn the_table_is_checked_against_the_builds_catalog() {
@@ -668,6 +683,8 @@ id_from = "https://example.com/models, 2026-10-15"
         );
     }
 
+    /// A LONG-PROMPT TIER is compared by its threshold and its classes, and a
+    /// tier one side has and the other lacks differs. Negative control: the
     /// same tier on both sides is the same.
     #[test]
     fn a_long_prompt_tier_differs_by_threshold_class_or_presence() {
@@ -707,6 +724,8 @@ id_from = "https://example.com/models, 2026-10-15"
         assert!(compare(&side(long(1e5, 2.0)), &side(long(1e5, 2.0))).is_empty());
     }
 
+    /// A BUILD THIS READER DOES NOT KNOW is refused, never half-read: no
+    /// catalog, two catalogs, a literal it cannot read, or one that prices no
     /// first-party model. Negative control: the composed build reads.
     #[test]
     fn a_build_without_one_readable_catalog_is_refused() {
@@ -731,6 +750,8 @@ id_from = "https://example.com/models, 2026-10-15"
         assert_eq!(catalog(&good).expect("reads").len(), 3);
     }
 
+    /// A Codex build's bytes: its model catalog as 0.163.0 embeds it (pretty
+    /// JSON, `"models": [` after the object's brace, escapes in its text,
     /// booleans and nulls), with bytes that are no text either side.
     fn codex_build(slugs: &[&str]) -> Vec<u8> {
         let models: Vec<String> = slugs
@@ -755,6 +776,11 @@ id_from = "https://example.com/models, 2026-10-15"
         .concat()
     }
 
+    /// THE OPENAI ROWS, by id against a Codex build's model catalog: a slug
+    /// the table prices is `priced`, one it does not `unpriced` (its tokens
+    /// show unpriced: the page lists no price for it), and an OpenAI row the
+    /// catalog does not name `table-only`; no Anthropic row is looked at.
+    /// Negative control: the table without the `gpt-6-sol` row leaves that
     /// slug unpriced.
     #[test]
     fn the_openai_rows_are_checked_by_id_against_the_codex_catalog() {
@@ -782,6 +808,8 @@ id_from = "https://example.com/models, 2026-10-15"
         assert!(c.lines.contains(&"unpriced    gpt-6-sol".to_owned()));
     }
 
+    /// A CODEX BUILD THIS READER DOES NOT KNOW is refused, never half-read:
+    /// no catalog, two, one whose `models` opens no object, or one naming no
     /// slug. Negative control: the composed build reads.
     #[test]
     fn a_codex_build_without_one_readable_catalog_is_refused() {

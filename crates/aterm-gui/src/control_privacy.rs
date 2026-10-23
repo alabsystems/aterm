@@ -19,7 +19,9 @@ use crate::privacy_report::{PrivacyAppFacts, PrivacyForm, cmd_privacy_json};
 use crate::signing_identity::signing_identity;
 use crate::{App, Wake};
 
-/// `await consent`'s default deadline.
+/// `await consent`'s default deadline. Finite on purpose: the system dialog it
+/// waits behind never expires (§1.4), so an autonomous agent must not park on
+/// an absent human forever.
 const AWAIT_CONSENT_DEFAULT_MS: u64 = 300_000;
 
 /// The ceiling every wait verb in this file shares with `await`/`ready`.
@@ -48,7 +50,8 @@ pub(crate) fn cmd_privacy(
     })
 }
 
-/// `privacy` past its grammar.
+/// `privacy` past its grammar. `hop` is the one main-thread hop, taken once
+/// (it is `FnOnce`), and its error is the reply.
 fn privacy(
     form: PrivacyForm,
     hop: impl FnOnce() -> Result<PrivacyAppFacts, MainHopError>,
@@ -207,7 +210,9 @@ fn fda_observation(
     })
 }
 
-/// What a debugger reading says.
+/// What a debugger reading says. One that observed no mode (a probe still
+/// out, a closed gate, a refused or failed run, an inert instance) is not an
+/// observation, so it can neither arm the baseline nor latch.
 fn debugger_observation(probe: DebuggerProbe) -> ConsentObservation {
     match probe.mode {
         DebuggerMode::Unknown => ConsentObservation::Pending,
@@ -246,7 +251,9 @@ pub(crate) fn observe_debugger(
     (debugger_observation(row.probe()), due)
 }
 
-/// What a consent wait reads besides the consent state.
+/// What a consent wait reads besides the consent state. A control worker
+/// passes the real ones ([`cmd_await_consent`]); the tests drive a fake clock
+/// through the same loop.
 struct WaitEnv<'a> {
     /// The clock the deadline and `elapsed_ms=` are read on.
     now: &'a dyn Fn() -> Instant,
@@ -410,7 +417,9 @@ struct ConsentArgs {
     timeout_ms: u64,
 }
 
-/// `[kind=debugger] [timeout=<ms> | timeout <ms>]` in any order.
+/// `[kind=debugger] [timeout=<ms> | timeout <ms>]` in any order. The timeout
+/// defaults to [`AWAIT_CONSENT_DEFAULT_MS`] for both kinds and is capped at
+/// [`AWAIT_MAX_MS`], the ceiling the rest of the wait family shares.
 fn parse_consent_args(rest: &str) -> Result<ConsentArgs, String> {
     const USAGE: &str = "ERR usage: await consent [kind=debugger] [timeout=<ms>]\n";
     let toks: Vec<&str> = rest.split_whitespace().collect();

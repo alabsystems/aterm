@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The companion rules of [`KeeperCore`] (the crash-restore plan §5), one test per rule: which
-//! region an offer carries, the poison brake and its cap, a window that does not journal, the
-//! refusals, a reconnected link, an update's two claimants, a hold that ends with no claim, and
-//! teardown. `conformance_companion.rs` binds the same rules to `KeeperCompanionCustody`.
+//! The companion rules of [`KeeperCore`] (the crash-restore plan §5), one test per rule.
 
 use super::*;
 use std::collections::BTreeSet;
@@ -144,7 +141,6 @@ fn a_region_rides_its_offer_and_the_next_window_s_own_supersedes_it() {
         vec![Out::CloseCompanion(1), Out::KeepCompanion(2)]
     );
     assert_eq!(view(&k).offered, Some(2));
-    // A second COMPANION from the same claim replaces its first.
     assert_eq!(
         k.companion(2, R, COMPANION_JOURNAL, LEN, 3),
         vec![Out::CloseCompanion(2), Out::KeepCompanion(3)]
@@ -176,7 +172,6 @@ fn restorers_that_die_before_their_companion_spend_the_brake_then_the_region() {
         })),
         "the next window replays the keyframe alone"
     );
-    // This one dies on the region before it claims: its offer reverts at its EOF.
     w.live_pids.retain(|p| *p != 700);
     let outs = k.eof(3, 2, &mut w);
     assert_eq!(closed(&outs), [1], "the second death closes the region");
@@ -193,7 +188,6 @@ fn restorers_that_die_before_their_companion_spend_the_brake_then_the_region() {
         })),
         "the master is still offered, on the META rung"
     );
-    // The window that finally settles resets the brake.
     k.register(4, hdr(), vec![], R);
     assert_eq!(
         k.companion(4, R, COMPANION_JOURNAL, LEN, 9),
@@ -297,7 +291,6 @@ fn companions_are_refused_by_name() {
         refused(RefuseCode::NoSuchRecord, R + 1, 2)
     );
     assert!(k.records()[&R].journal.own.is_empty());
-    // A status client may send none.
     assert!(k.accept(3, 700, None));
     k.hello(3, PeerClass::Status, CAP_JOURNAL, 0, &mut w);
     assert_eq!(
@@ -325,8 +318,6 @@ fn a_reconnected_link_keeps_its_region_and_its_settling() {
             outgoing: None
         }
     );
-    // The link re-sends its region, the same descriptor the keeper already holds: the newer
-    // arrival replaces it.
     assert_eq!(
         k.companion(2, R, COMPANION_JOURNAL, LEN, 2),
         vec![Out::CloseCompanion(1), Out::KeepCompanion(2)]
@@ -360,11 +351,8 @@ fn an_update_hands_the_region_on_whichever_comes_first() {
         assert_eq!(view(&k).reader_settled, Some(false), "the successor reads");
         if successor_first {
             k.companion(2, R, COMPANION_JOURNAL, LEN, 2);
-            // The outgoing window's late RELEASE ends its claim: its region is superseded.
             assert_eq!(k.release(1, R), vec![Out::CloseCompanion(1)]);
         } else {
-            // The outgoing window ends at its Commit before the successor's COMPANION: its
-            // region is the fallback.
             w.live_pids.retain(|p| *p != 500);
             let mut outs = k.eof(1, 1, &mut w);
             outs.extend(k.peer_exit(500, 0, 1, &mut w));
@@ -666,7 +654,6 @@ fn a_known_different_birth_is_no_reconnect_even_after_eof() {
         assert_eq!(k.register(2, hdr(), vec![], R), [Out::DropDuplicate(R)]);
         k
     };
-    // Ordinary reconnect, before or after EOF: its own region and settlement move intact.
     for eof in [false, true] {
         let k = run(Some(a), Some(a), eof);
         assert_eq!(k.records()[&R].claimants, [2]);
@@ -674,14 +661,12 @@ fn a_known_different_birth_is_no_reconnect_even_after_eof() {
         assert_eq!(k.records()[&R].journal.own.get(&2), Some(&companion(1)));
         assert_eq!(view(&k).reader_settled, Some(true));
     }
-    // Preserve the existing EOF fallback when at least one birth really is unavailable.
     for (old, new) in [(None, Some(a)), (Some(a), None), (None, None)] {
         let k = run(old, new, true);
         assert_eq!(k.records()[&R].claimants, [2]);
         assert_eq!(view(&k).reader_settled, Some(true));
         assert_eq!(k.records()[&R].journal.own.get(&2), Some(&companion(1)));
     }
-    // A known new process already gets an unsettled new claim when no EOF was read.
     let k = run(Some(a), Some(births[0]), false);
     assert_eq!(k.records()[&R].claimants, [1, 2]);
     assert_eq!(view(&k).reader_settled, Some(false));
@@ -700,8 +685,6 @@ fn a_known_different_birth_is_no_reconnect_even_after_eof() {
             && view(&k).reader_settled == Some(false)
             && k.records()[&R].journal.own.get(&1) == Some(&companion(1))
             && !k.records()[&R].journal.own.contains_key(&2);
-        // Ending this new, unsettled reader cannot erase the older claim or turn its region
-        // into an exact snapshot of the new process: the fallback costs one attempt.
         let ended = k.release(2, R);
         let after = k.companion_view(R);
         let fallback = after

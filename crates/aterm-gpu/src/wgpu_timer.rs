@@ -377,6 +377,8 @@ mod tests {
             .collect()
     }
 
+    /// A device the tests run by hand: its work completes when a test says
+    /// (`finish_work`), each readback map settles when a test says, and a read
     /// returns the ticks a test planted.
     #[derive(Default)]
     struct FakeDevice {
@@ -442,6 +444,8 @@ mod tests {
         serial
     }
 
+    /// A healthy frame settles only after its work ran, its readback was
+    /// resolved after that, and the map landed: one part per timed pass, its
     /// time the union of their intervals.
     #[test]
     fn a_healthy_frame_is_timed_once_its_work_has_run() {
@@ -474,6 +478,7 @@ mod tests {
         );
     }
 
+    /// A frame whose passes outnumber the query pairs is dropped, not reported
     /// as the passes it could time.
     #[test]
     fn a_frame_out_of_query_pairs_is_dropped() {
@@ -501,6 +506,7 @@ mod tests {
         assert_eq!(frames.settled(serial), Some(Settled::Failed));
     }
 
+    /// A readback holding an unsampled (zero) or reversed pair drops its
     /// frame.
     #[test]
     fn a_readback_with_an_unwritten_sample_drops_the_frame() {
@@ -518,6 +524,7 @@ mod tests {
         }
     }
 
+    /// A timer dropped with a frame still running on the device, or still
     /// mapping, fails it rather than leaving it outstanding.
     #[test]
     fn a_timer_dropped_with_a_frame_outstanding_drops_it() {
@@ -537,6 +544,7 @@ mod tests {
         assert_eq!(frames.settled(mapping), Some(Settled::Failed));
     }
 
+    /// A present with no timed pass is untimed, and one that finds every slot
     /// in flight goes untimed without disturbing them.
     #[test]
     fn an_untimed_present_and_a_full_ring_report_no_time() {
@@ -562,6 +570,8 @@ mod tests {
         }
     }
 
+    /// Overlapping passes count once; disjoint ones add; a zero or reversed
+    /// pair, no pair at all, or a period or total outside the nanosecond
     /// domain is no time.
     #[test]
     fn busy_time_is_the_union_of_the_pass_intervals() {

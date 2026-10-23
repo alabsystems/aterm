@@ -437,7 +437,9 @@ fn transaction_half_is_known(
     current == predecessor || current == Some(target)
 }
 
-/// Drop a completed transaction's fixed name so nothing replays it again.
+/// Drop a completed transaction's fixed name so nothing replays it again. Rename, fsync, then
+/// delete: once the fixed name is durably gone the leftover directory is inert, so its
+/// best-effort removal cannot leave a half-deleted transaction under a trusted name.
 fn retire_roster_transaction(transaction: &str) -> Result<(), String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -472,7 +474,9 @@ fn retire_roster_transaction(transaction: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Complete a committed pair forward, if one is pending.
+/// Complete a committed pair forward, if one is pending. Runs on every writer-lock
+/// acquisition before the caller reads the roster, so a death after either canonical rename
+/// converges on the signed pair the redo directory holds.
 fn complete_roster_transaction(path: &str) -> Result<(), String> {
     let transaction = roster_txn_path(path);
     match std::fs::symlink_metadata(&transaction) {
@@ -704,7 +708,9 @@ pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
     })
 }
 
-/// Lock, read the pair, and publish in one call.
+/// Lock, read the pair, and publish in one call. Test-only: a real mutation holds one lock
+/// across its own read, edit, sign and publish ([`publish_roster_locked`]); this states the
+/// transaction layer's properties without the whole provisioning pipeline.
 #[cfg(test)]
 fn publish_roster(path: &str, bytes: &[u8], sig: &[u8]) -> Result<(), String> {
     let lock = lock_roster(path)?;
@@ -941,7 +947,8 @@ pub struct Planned {
     verb: Verb,
     id: String,
     paths: Paths,
-    /// The complete new text of `pins.rs`.
+    /// The complete new text of `pins.rs`. `None` when the anchor needed no change —
+    /// the idempotent re-run.
     pins_text: Option<String>,
     /// The anchor file's bytes as this run read them, so the write can prove it replaces the
     /// file it planned against.
@@ -2443,7 +2450,9 @@ mod tests {
         );
     }
 
-    /// THE SECRET IS NOT IN THE CLOSING OUTPUT.
+    /// THE SECRET IS NOT IN THE CLOSING OUTPUT. The report is built from public
+    /// identities only (the machine's public key is in it), and this asserts it
+    /// rather than trusting the type system to have.
     #[test]
     fn the_report_carries_no_secret_material() {
         let dir = scratch("report");

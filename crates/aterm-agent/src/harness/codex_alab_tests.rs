@@ -110,7 +110,6 @@ fn an_alab_package_with_a_pre_release_version_is_alab_bytes() {
         Some(PathBuf::from("bin/codex"))
     );
     assert_eq!(parse_package(&manifest), None, "no order is guessed");
-    // Negative control: without ALab's marker it is no ALab build.
     assert!(!alab_bytes(&exe));
     assert_eq!(alab_build(&exe), None, "no marker, no ALab build");
     std::fs::write(root.join(ALAB_BUILD_JSON), "{}").expect("marker");
@@ -118,13 +117,11 @@ fn an_alab_package_with_a_pre_release_version_is_alab_bytes() {
         alab_bytes(&exe),
         "the package and its marker say ALab built it"
     );
-    // The build it runs, whole, as the rollout tap holds a thread to it.
     assert_eq!(
         alab_build(&exe).as_deref(),
         Some("0.164.0-dev.12365+g124c29509")
     );
     assert_eq!(package_version(&exe), None);
-    // A changed layout or an entrypoint outside the root still refuses.
     for bad in [
         manifest.replace("\"layoutVersion\": 1", "\"layoutVersion\": 2"),
         manifest.replace("bin/codex", "/abs/codex"),
@@ -139,8 +136,6 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
     let d = crate::supervise::ScratchDir::new("codex", "pkg");
     let root = d.join("store/codex/1000000000157000001");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
-    // An executable that would hang if run: the reader must never exec it, and
-    // a one-minute hang detector tells the two apart.
     let exe = root.join("bin/codex");
     std::fs::write(&exe, "#!/bin/sh\nsleep 600\n").expect("exe");
     #[cfg(unix)]
@@ -156,8 +151,6 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
         "{:?}",
         started.elapsed()
     );
-    // Negative control: a manifest whose entrypoint names another binary does
-    // not answer for this one (a stray `codex-package.json` in a parent).
     let other = d.join("elsewhere/bin");
     std::fs::create_dir_all(&other).expect("other");
     std::fs::write(other.join("codex"), "x").expect("exe");
@@ -167,7 +160,6 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
     )
     .expect("manifest");
     assert_eq!(package_version(&other.join("codex")), None);
-    // `codex --version`'s own words are no version (its first word).
     assert_eq!(Version::parse("codex-cli"), None);
 }
 
@@ -207,9 +199,6 @@ fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
             T1,
         ])
     );
-    // A session that was itself a resume, or a fork: the old id, `--last`,
-    // `--all` and the first prompt go; the thread the exit names comes back
-    // — and a launch that named no model gets none.
     for a in [
         argv(&["codex", "resume", T2, "--no-daemon"]),
         argv(&["codex", "resume", "--last", "--no-daemon"]),
@@ -229,12 +218,10 @@ fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
             "{a:?}"
         );
     }
-    // No thread (a session with no conversation yet): the flags alone.
     assert_eq!(
         rewrite_argv(&argv(&["codex", "-s", "read-only", "hi"]), None).expect("carried"),
         argv(&["-s", "read-only"])
     );
-    // `--` ends the options: what follows is the prompt, dropped.
     assert_eq!(
         rewrite_argv(&argv(&["codex", "--search", "--", "--no-daemon"]), Some(T1))
             .expect("carried"),
@@ -289,7 +276,6 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
     ] {
         assert!(is_tui_argv(&tui), "{tui:?}");
     }
-    // Every process of the daemon is named `codex` too.
     for not in [
         argv(&[
             "/c/packages/app-server-daemon/releases/0.157.0-aarch64-apple-darwin/bin/codex",
@@ -360,7 +346,6 @@ fn the_relaunch_on_exit_reads_a_thread_and_its_instant() {
     ] {
         assert_eq!(resumed_thread(&argv(a)), None, "{a:?}");
     }
-    // The thread a TUI began at 21:19:57.751Z.
     assert_eq!(thread_created_ms(t), Some(1_790_543_997_751));
     assert_eq!(
         thread_created_ms("01a0e4bd-2b37-45a0-939c-43fb6f1a5dfb"),

@@ -1,0 +1,50 @@
+# claude-code 2.1.309 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.117.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Bash box for touch z under a PreToolUse hook answering permissionDecision=ask (reason 'owner review'), harness approve=safe
+
+❯ toolstart
+
+⏺ Bash(done)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 7:00 PM
+
+❯ toolstart
+
+⏺ Bash(echo hi; ))
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Baked for 0s · done 7:00 PM
+
+❯ toolstart
+
+⏺ Bash(echo $()
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cooked for 0s · done 7:00 PM
+
+❯ toolstart
+
+⏺ Bash(touch y)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cooked for 0s · done 7:01 PM
+
+❯ toolstart
+
+⏺ Bash(touch z)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Create z
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ touch z
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Hook PreToolUse:Bash requires confirmation for this command:
+ │ owner review [settings]
+ settings.json to update hooks
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

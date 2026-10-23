@@ -3,15 +3,6 @@
 
 //! Tier-1 conformance for BudgetedWalk (`aterm_models_misc::budgeted_walk_model`): the real
 //! [`Walker`] over a scratch tree, every step projected and admitted by the model's `Next`.
-//!
-//! The clock charges a whole slice budget per reading, so a slice inside its budget makes
-//! exactly one listing call or child open, and the walk owes `Calls` slices plus the final one
-//! that answers done. `Calls` is read off a whole walk of the same tree and handed to the model
-//! as its override. Two slipped real steps are the negative controls, each exactly its mutant's
-//! step and rejected by the healthy model: a walker given twice the budget the projection holds
-//! it to (`OverBudget`, `SliceBound`), and a slice of the walk in flight booked as the
-//! superseded ticket's (`ResumeOldGeneration`, `StaleGenerationNeverResumes`). The model's own laws and liveness
-//! are proven and caught by both tiers first.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -214,7 +205,6 @@ fn the_real_walker_refines_budgeted_walk() {
     let mut walker = Walker::new();
     let mut state = project(&walker, &ghost);
 
-    // Generation 1: a few slices, then superseded.
     let first = walker.start(&RootSpec::new(&root), &policy).expect("start");
     bound.bind(&mut state, "Start", project(&walker, &ghost));
     for _ in 0..3 {
@@ -223,7 +213,6 @@ fn the_real_walker_refines_budgeted_walk() {
         bound.bind(&mut state, "Slice", project(&walker, &ghost));
     }
 
-    // Generation 2 supersedes it; the old ticket walks nothing; then a cancel.
     ghost.refused = false;
     let second = walker
         .start(&RootSpec::new(&root), &policy)
@@ -241,7 +230,6 @@ fn the_real_walker_refines_budgeted_walk() {
     ghost.refused = false;
     bound.bind(&mut state, "Cancel", project(&walker, &ghost));
 
-    // Generation 3 runs to its end: every slice one call, the last one none.
     let third = walker.start(&RootSpec::new(&root), &policy).expect("third");
     bound.bind(&mut state, "Start", project(&walker, &ghost));
     loop {
@@ -259,7 +247,6 @@ fn the_real_walker_refines_budgeted_walk() {
     assert_eq!(state["left"], 0);
     assert_eq!(walker.walk().map(Walk::walked), Some(entries));
 
-    // A superseded ticket stays refused after the walk in flight ended.
     assert_eq!(
         slice(&mut walker, &mut ghost, second, &mut clock),
         Sliced::Stale
@@ -270,8 +257,6 @@ fn the_real_walker_refines_budgeted_walk() {
 #[test]
 fn a_slice_past_its_budget_is_rejected() {
     let (_tmp, root) = tree();
-    // The walker gets twice the budget the projection holds it to: each slice makes two calls
-    // where one is allowed.
     let policy = policy(SLICE * 2);
     let (calls, entries) = whole(&root, &policy);
     let bound = Bound::new(calls);
@@ -328,7 +313,6 @@ fn a_superseded_ticket_that_walks_is_rejected() {
         .start(&RootSpec::new(&root), &policy)
         .expect("restart");
     bound.bind(&mut state, "Start", project(&walker, &ghost));
-    // The slip: the walk in flight served what the host holds as the superseded ticket.
     let answer = walker.slice(second, &mut clock);
     assert!(matches!(answer, Sliced::Step(Step::More { .. })));
     ghost.resumed_old = true;

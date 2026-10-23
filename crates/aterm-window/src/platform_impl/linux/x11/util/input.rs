@@ -4,9 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/input.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (XInput 2's requests are
-// aterm-x11's encoders, where upstream used x11rb's.)
-
 use std::{slice, str};
 
 use aterm_x11::proto::xinput;
@@ -16,9 +13,6 @@ use super::*;
 pub const VIRTUAL_CORE_POINTER: u16 = 2;
 pub const VIRTUAL_CORE_KEYBOARD: u16 = 3;
 
-// A base buffer size of 1kB uses a negligible amount of RAM while preventing us from having to
-// re-allocate (and make another round-trip) in the *vast* majority of cases.
-// To test if `lookup_utf8` works correctly, set this to 1.
 const TEXT_BUFFER_SIZE: usize = 1024;
 
 impl XConnection {
@@ -76,11 +70,8 @@ impl XConnection {
     }
 
     pub fn lookup_utf8(&self, ic: ffi::XIC, key_event: &mut ffi::XKeyEvent) -> String {
-        // `assume_init` is safe here because the array consists of `MaybeUninit` values,
-        // which do not require initialization.
         let mut buffer: [MaybeUninit<u8>; TEXT_BUFFER_SIZE] =
             unsafe { MaybeUninit::uninit().assume_init() };
-        // If the buffer overflows, we'll make a new one on the heap.
         let mut vec;
 
         let (_, status, count) =

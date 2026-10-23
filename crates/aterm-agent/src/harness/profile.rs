@@ -156,7 +156,7 @@ impl PlanWord {
 
     /// The word JSON carries; for the four plans also the subscription word Claude Code compares with its flags.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             PlanWord::Max => "max",
             PlanWord::Pro => "pro",
@@ -168,7 +168,7 @@ impl PlanWord {
 
     /// The word a person reads (`Max`).
     #[must_use]
-    pub fn title(self) -> &'static str {
+    pub const fn title(self) -> &'static str {
         match self {
             PlanWord::Max => "Max",
             PlanWord::Pro => "Pro",
@@ -230,7 +230,7 @@ pub enum Credits {
 impl Credits {
     /// `on`, `out` or `off`; `None` for [`Credits::Unknown`].
     #[must_use]
-    pub fn state(&self) -> Option<&'static str> {
+    pub const fn state(&self) -> Option<&'static str> {
         match self {
             Credits::Unknown => None,
             Credits::On => Some("on"),
@@ -241,7 +241,7 @@ impl Credits {
 
     /// The vendor's reason for [`Credits::Off`].
     #[must_use]
-    pub fn reason(&self) -> Option<&Word> {
+    pub const fn reason(&self) -> Option<&Word> {
         match self {
             Credits::Off(reason) => reason.as_ref(),
             _ => None,
@@ -269,7 +269,7 @@ pub enum Bucket {
 impl Bucket {
     /// The bucket's id.
     #[must_use]
-    pub fn id(self) -> &'static str {
+    pub const fn id(self) -> &'static str {
         match self {
             Bucket::FiveHour => "five_hour",
             Bucket::SevenDay => "seven_day",
@@ -323,7 +323,7 @@ pub enum OneTimeKind {
 impl OneTimeKind {
     /// The kind's word.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             OneTimeKind::CodeAndCowork => "code-and-cowork",
             OneTimeKind::Credit => "credit",
@@ -375,7 +375,7 @@ pub enum FablePlan {
 impl FablePlan {
     /// `included`, `credits-only`, `limits-end` or `unknown`.
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             FablePlan::Included => "included",
             FablePlan::CreditsOnly => "credits-only",
@@ -386,7 +386,7 @@ impl FablePlan {
 
     /// The date the plan's Fable limits end.
     #[must_use]
-    pub fn ends_at(&self) -> Option<i64> {
+    pub const fn ends_at(&self) -> Option<i64> {
         match self {
             FablePlan::LimitsEnd(at) => *at,
             _ => None,
@@ -433,7 +433,7 @@ pub enum NoProfile {
 impl NoProfile {
     /// `no-home`, `no-profile`, `not-a-file`, `too-large` or `unreadable`.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             NoProfile::NoHome => "no-home",
             NoProfile::Missing => "no-profile",
@@ -543,7 +543,8 @@ pub struct Context {
     pub login: Option<String>,
 }
 
-/// One exec variable, known unset versus unknown/conflicting.
+/// One exec variable, known unset versus unknown/conflicting. No environment
+/// of the supervising process is consulted.
 fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
     if env.is_empty() {
         return None;
@@ -753,7 +754,9 @@ pub fn answers_to(env: &[String], user_home: &Path, email: &str) -> Option<bool>
     .flatten()
 }
 
-/// How long a cached `/usage` reading stays current ([`current_windows`]).
+/// How long a cached `/usage` reading stays current ([`current_windows`]). Claude Code
+/// writes the cache only when a person opens `/usage`, so an older reading cannot say
+/// what is used now.
 const USAGE_CURRENT_S: i64 = 15 * 60;
 
 /// Facts for the requested on-screen account/subscription display.
@@ -796,7 +799,7 @@ pub struct PlanUsage {
 impl PlanUsage {
     /// Whether this reading still says what is used at `now` (Unix seconds), by the currency rule [`plan_usage_for`] read it under ([`current_windows`]).
     #[must_use]
-    pub fn current_at(&self, now: i64) -> bool {
+    pub const fn current_at(&self, now: i64) -> bool {
         self.read_at <= now
             && now.saturating_sub(self.read_at) <= USAGE_CURRENT_S
             && self.resets_at > now
@@ -1838,14 +1841,14 @@ impl Leaf {
         }
     }
 
-    fn num(&self) -> Option<f64> {
+    const fn num(&self) -> Option<f64> {
         match self {
             Leaf::Num(n) => Some(*n),
             _ => None,
         }
     }
 
-    fn flag(&self) -> Option<bool> {
+    const fn flag(&self) -> Option<bool> {
         match self {
             Leaf::Flag(b) => Some(*b),
             _ => None,

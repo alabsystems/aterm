@@ -12,7 +12,8 @@ use crate::effect_util::lerp_rgb;
 
 use crate::effect_util::push_fx_rect as push_rect;
 
-/// Shimmer rate in turns/second, at rest and at full blaze.
+/// Shimmer rate in turns/second, at rest and at full blaze. The phase advances
+/// only on rendered frames, so a settled nucleus shimmers at the blink cadence.
 const SHIMMER_IDLE: f32 = 0.7;
 const SHIMMER_ACTIVE: f32 = 3.2;
 
@@ -21,7 +22,8 @@ const SHIMMER_ACTIVE: f32 = 3.2;
 const RADIUS_IDLE: f32 = 0.54;
 const RADIUS_MAX: f32 = 0.82;
 
-/// Innermost-disc coverage before intensity, at rest and at full blaze.
+/// Innermost-disc coverage before intensity, at rest and at full blaze. The
+/// outer discs scale down from it, each clamped by [`COV_CAP`].
 const COV_IDLE: f32 = 58.0;
 const COV_MAX: f32 = 148.0;
 /// Per-disc additive coverage ceiling, the light rod's and flame curtain's

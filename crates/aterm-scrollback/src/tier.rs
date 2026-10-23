@@ -206,7 +206,8 @@ pub(crate) struct WarmTier {
     blocks: VecDeque<WarmBlock>,
     /// Total logical line count (physical lines minus front_offset).
     line_count: usize,
-    /// Lines logically consumed from the first block.
+    /// Lines logically consumed from the first block. Avoids decompression
+    /// during line-limit truncation — blocks are dropped when fully consumed.
     front_offset: usize,
     /// Cumulative line counts: for live block `i` (`0..blocks.len()`),
     /// `cumulative_lines[cum_start + i] - cumulative_base` = total physical

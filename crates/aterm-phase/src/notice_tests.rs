@@ -12,7 +12,8 @@ use crate::turn::{launch_card_place, launch_card_scan, launch_card_scrolled, lau
 /// rows, as the captures they copy were.
 const WIDE: usize = 120;
 
-/// The notice's summary for a build of `changes` (`Updated to latest.
+/// The notice's summary for a build of `changes` (`Updated to latest. Got
+/// …`), as 2.1.304's `ty` composes it.
 fn summary(changes: &str) -> String {
     format!("{}{changes}", anchor_text("notice.updated"))
 }
@@ -272,7 +273,11 @@ fn every_recorded_update_notice_is_placed_under_its_card() {
     );
 }
 
-/// THE HARD BREAK, MEASURED.
+/// THE HARD BREAK, MEASURED. On the narrow card's captures at 34, 33 and 31
+/// columns the details row's link (33 cells) is longer than the Box (the
+/// pane less its padding), and the vendor breaks it inside itself on a row
+/// filled to the pane's edge: read at the pane's own width, the notice is
+/// the vendor's whole.
 #[test]
 fn a_link_broken_at_the_panes_edge_is_the_vendors_wrap() {
     for (name, cols) in [
@@ -316,7 +321,16 @@ fn a_link_broken_at_the_panes_edge_is_the_vendors_wrap() {
     assert_eq!(broken(link.len() - 1, 0), None);
 }
 
-/// THE VENDOR'S SHAPE, OR NOTHING.
+/// THE VENDOR'S SHAPE, OR NOTHING. A bare `Updated to latest.`, a summary
+/// wrapped onto two rows and a details row word-wrapped onto two (`…changelog
+/// for` / `details`, as a narrow pane wraps it) are read; NEGATIVE CONTROLS,
+/// each of which leaves the vendor's notice bare: the details row reworded,
+/// the details row broken inside a word, its wrapped tail reworded or off
+/// the Box's column, the details row spread over three rows, a wrap cut by
+/// the screen's bottom edge, the summary quoted in a person's message (`❯`),
+/// the notice under something said (`⏺`: the walk stops there), the notice
+/// past the reach, a notice cut by the screen's bottom edge, the summary off
+/// the Box's column, and a summary with no details row under it.
 #[test]
 fn a_notice_is_refused_unless_it_is_the_vendors_shape() {
     let details = anchor_text("notice.updated_details");

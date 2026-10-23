@@ -547,7 +547,7 @@ pub(crate) struct Line<'a> {
 }
 
 impl SourceFile {
-    fn new(rel: String, raw: String) -> Self {
+    const fn new(rel: String, raw: String) -> Self {
         Self {
             rel,
             raw,
@@ -689,7 +689,7 @@ fn joined(dir: &str, path: &str) -> String {
     parts.join("/")
 }
 
-pub(crate) fn is_word(b: u8) -> bool {
+pub(crate) const fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 

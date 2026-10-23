@@ -44,7 +44,7 @@ const EVERY_TOP_UP_TO: usize = 30;
 /// cross the fleet hop (machine 0's are this machine's own): the last, which
 /// the fault phase stops only after the clean reads, and whose content no
 /// security check reads (they read the members between).
-fn hostile_peer(n: usize) -> usize {
+const fn hostile_peer(n: usize) -> usize {
     n - 1
 }
 
@@ -318,7 +318,8 @@ impl Sim {
         })
     }
 
-    /// Run every phase; the assertions, in the order they were checked.
+    /// Run every phase; the assertions, in the order they were checked. An
+    /// interrupt ends it between steps (the caller then records nothing).
     fn run(&mut self, survey_runs: usize) -> Vec<Check> {
         let mut checks = Vec::new();
         for r in 0..survey_runs {
@@ -617,7 +618,10 @@ impl Sim {
         Ok(checks)
     }
 
-    /// Phase D: the security refusals, against the still-healthy members.
+    /// Phase D: the security refusals, against the still-healthy members. The
+    /// NON-DESTRUCTIVE checks run first, on distinct members where there are
+    /// enough; the destructive key rotation runs LAST, on a member none of the
+    /// others read, so a small fleet never has one check undo another.
     fn security(&mut self) -> Result<Vec<Check>, Fail> {
         let mut checks = Vec::new();
         let healthy: Vec<usize> = (1..self.world.insts.len() - 2).collect();
@@ -803,7 +807,12 @@ impl Sim {
             .collect())
     }
 
-    /// Member `i` at `allow=facts` answers facts only.
+    /// Member `i` at `allow=facts` answers facts only. A title a person typed
+    /// is set on its shell first, and the reader confirms (the CONTROL) that
+    /// at content its answer carries that title, every one of its Claude
+    /// sessions' prompts and words, and its sessions' directory; then its
+    /// `[fleet] allow` is flipped to facts (the listener follows config live)
+    /// and its answer must carry none of them, nor any content field.
     fn facts_only(&self, i: usize) -> Result<Check, Fail> {
         const NAME: &str = "a member at allow=facts answers facts only";
         let inst = &self.world.insts[i];

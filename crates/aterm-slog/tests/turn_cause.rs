@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A turn names what caused it (design §2.6, phase 3A): input that said
-//! which mail or record it acted on (`send cause=`, `turn cause=`) gives
-//! the turn it opens `cause=` and `cause_k=`; later input from anyone, or an
-//! input past the attribution window, takes the turn without it. The cause
-//! crosses a seamless update with the input it rode, and a 2A carry line
-//! (no cause) still reads.
+//! Tests for turn cause attribution and seamless carry.
 
 use aterm_slog::{Actor, Kind, Log, Op, Rec, ShortId, Tier, TurnTracker, Verdict, encode};
 
@@ -25,7 +20,6 @@ fn id(s: &str) -> Option<ShortId> {
 
 #[test]
 fn a_caused_input_names_the_turn_it_opens() {
-    // Mail by its offset.
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let mut tr = TurnTracker::new(run);
@@ -38,7 +32,6 @@ fn a_caused_input_names_the_turn_it_opens() {
             && line.contains("cause_k=mail"),
         "{line}"
     );
-    // A record by its seq, through a `ctl turn` exchange.
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let mut tr = TurnTracker::new(run);
@@ -49,7 +42,6 @@ fn a_caused_input_names_the_turn_it_opens() {
         line.contains("ledger=9") && line.contains("cause=412") && line.contains("cause_k=rec"),
         "{line}"
     );
-    // The bus never learns which mail: `cause=` is a host field.
     let wire = encode(&turn_open(&log), Tier::Wire).expect("fits");
     assert!(
         !wire.contains("cause=412") && wire.contains("cause_k=rec"),

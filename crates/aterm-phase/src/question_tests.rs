@@ -485,7 +485,9 @@ fn the_question_zone_is_not_a_shell_line_nor_the_option_cursor_the_users_row() {
     }
 }
 
-/// The Submit (review) tab, which draws no footer, is the question dialog.
+/// The Submit (review) tab, which draws no footer, is the question dialog. Negative
+/// controls: without `Review your answers` it is a question with its head off the
+/// screen, form unknown, never the review; over a composer (quoted) it is no box.
 #[test]
 fn the_review_tab_is_a_question() {
     for (text, unanswered) in [(QUESTION_REVIEW, false), (QUESTION_REVIEW_UNANSWERED, true)] {
@@ -2201,7 +2203,14 @@ fn reflowed(text: &str, cols: usize, col: usize) -> Vec<String> {
     out
 }
 
-/// THE CHECKBOX DRAWN WITHOUT ITS SPACE (F2).
+/// THE CHECKBOX DRAWN WITHOUT ITS SPACE (F2). 2.1.300 draws
+/// a multi-select's free-text checkbox as a text with its space inside it
+/// (`["[", tick, "]", " "]`, no fixed-width box, unlike every option's), and
+/// once the focus leaves a text that overflows the row, the flex layout takes
+/// that space: the text and every row it wraps onto start one cell left of
+/// the label column (`  4. [✔]Decide …`, rows at column 8; MEASURED with the
+/// long-term text at 38, 39 and 41 to 51 columns, the short-term text's
+/// widths a layout model's prediction only).
 #[test]
 fn a_free_text_drawn_against_its_checkbox_reads_whole() {
     let (r, p, d) = read(REFLOW_47_2_1_300);
@@ -2288,7 +2297,9 @@ fn a_free_text_drawn_against_its_checkbox_reads_whole() {
     assert_eq!(worker_phase(&r), Phase::Prompt);
 }
 
-/// 2.1.300 at 50 columns draws a ticked multi-select free-text row as `4.
+/// 2.1.300 at 50 columns draws a ticked multi-select free-text row as `4. [✔]Decide
+/// yourself: …`, no space after the box, its rows at column 8: it reads whole as the
+/// text typed, ticked, the focus on `Submit`.
 #[test]
 fn a_ticked_free_text_row_drawn_without_a_space_is_read_whole() {
     let (_, p, d) = read(QUESTION_MULTI_TYPED_50_2_1_300);

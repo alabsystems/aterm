@@ -111,6 +111,7 @@ impl Default for BloomParams {
     }
 }
 
+/// The colour channels of a frame pixel (`0xTTRRGGBB`, `TT` transmittance)
 /// as floats in `0..=1`.
 #[inline]
 const fn channels(p: u32) -> [f32; 3] {
@@ -121,6 +122,8 @@ const fn channels(p: u32) -> [f32; 3] {
     ]
 }
 
+/// SCREEN `src` (`0..=1` per channel, clamped first as a Unorm target clamps a
+/// fragment) over the pixel `dst`, rounded once on store; the transmittance
 /// byte rides through (the GPU writes colour only).
 #[inline]
 fn screen(dst: u32, src: [f32; 3]) -> u32 {
@@ -331,6 +334,8 @@ mod tests {
         }
     }
 
+    /// The bloom spreads the glow's light past its own rect, falls off with
+    /// distance, and leaves the frame untouched beyond its reach; the halo of
     /// a red quad is red. NEGATIVE CONTROL: no glow, no change.
     #[test]
     fn the_bloom_spreads_light_past_the_glow_and_no_further_than_its_reach() {

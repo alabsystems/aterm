@@ -195,7 +195,7 @@ pub enum Decision {
 impl Decision {
     /// Whether the program can move this run (else its group holds).
     #[must_use]
-    pub fn ready(&self) -> bool {
+    pub const fn ready(&self) -> bool {
         matches!(
             self,
             Self::Ok | Self::Ahead | Self::Index | Self::Pack { .. }
@@ -204,7 +204,7 @@ impl Decision {
 
     /// The table's first word.
     #[must_use]
-    pub fn verdict(&self) -> &'static str {
+    pub const fn verdict(&self) -> &'static str {
         match self {
             Self::Skip(_) => "SKIP",
             Self::Unverified(_) => "UNVERIFIED",

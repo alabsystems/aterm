@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `sitemap.xml`: `/releases` gets an entry when it has none, and the pages a sync
-//! changed get today's `lastmod`.
+//! `sitemap.xml`: ensures `/releases` has an entry and updates `lastmod` on changed pages.
 
 /// The site origin the sitemap's `<loc>`s are under.
 pub const ORIGIN: &str = "https://alab.systems";
@@ -69,12 +68,9 @@ pub struct Updated {
     pub added: bool,
 }
 
-/// `text` with `lastmod` moved to `today` for every page in `touch` and an entry for
-/// `ensure` added when it has none.
-///
+/// Updates `lastmod` to `today` for `touch` pages and adds `ensure` when absent.
 /// # Errors
-/// A `today` that is not a date, a file without the block shape, or one with no
-/// `</urlset>` to add before.
+/// Invalid `today` date, no `<url>` block of the expected shape, or missing `</urlset>`.
 pub fn update(text: &str, ensure: &str, today: &str, touch: &[&str]) -> Result<Updated, String> {
     if !is_date(today) {
         return Err(format!(

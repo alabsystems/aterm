@@ -479,7 +479,8 @@ mod macos {
         }
     }
 
-    /// The findings ledger.
+    /// The findings ledger. `check` prints every question it asked, passing or
+    /// failing: the transcript is what an A/B between two commits diffs.
     struct Ctx {
         findings: Vec<String>,
         /// Clicks that failed while another app held activation: they measured
@@ -654,7 +655,9 @@ mod macos {
         }
     }
 
-    /// The protocols a protocol itself inherits.
+    /// The protocols a protocol itself inherits. `protocol_copyProtocolList` has
+    /// no `aterm-objc` wrapper (no shipping call site needs one), so the
+    /// prototype is declared here.
     fn protocol_parents(proto: aterm_objc::ProtocolPtr) -> Vec<String> {
         unsafe extern "C" {
             fn protocol_copyProtocolList(

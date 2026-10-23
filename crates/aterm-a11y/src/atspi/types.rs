@@ -8,11 +8,7 @@
 // to the values aterm's publisher sends, as plain enums and bit sets in
 // place of serde and enumflags2.
 
-//! AT-SPI's vocabulary: interfaces, states, roles, relation types and the
-//! enums its methods take. Each value is AT-SPI's number for it (an
-//! interface or a state is a bit, its index in the specification's list),
-//! so the sets and casts here are what goes on the wire. Only the values
-//! aterm's semantics produce or read are named.
+//! AT-SPI interfaces, states, roles, and relation types.
 
 use std::ops::{BitAnd, BitOr, BitXor};
 
@@ -300,9 +296,7 @@ pub(crate) enum Role {
     Static = 116,
 }
 
-/// An AT-SPI relation type. aterm's model has no relations (a control's
-/// `controls` was accesskit_atspi_common's only source, for
-/// `ControllerFor`), so a relation set is always empty and no type is named.
+/// An AT-SPI relation type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum RelationType {}
 
@@ -324,7 +318,7 @@ pub(crate) enum Granularity {
     Paragraph,
 }
 
-/// A component's layer: aterm's are all widgets.
+/// A component's layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Layer {
     Widget = 3,

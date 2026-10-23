@@ -149,7 +149,7 @@ pub fn when(t: i64) -> String {
 
 /// What shows a login exists, if anything does: `Some(true)` signed in, `Some(false)` no
 /// login, `None` nothing aterm can see says either way.
-fn login_seen(f: &Facts) -> Option<bool> {
+const fn login_seen(f: &Facts) -> Option<bool> {
     if let Some(a) = &f.accounts
         && a.login.is_some()
     {

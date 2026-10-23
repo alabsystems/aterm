@@ -81,7 +81,7 @@ pub fn row_name(arch: Arch) -> String {
 
 /// Maps `browser-drive`'s exit status to a [`Verdict`].
 #[must_use]
-pub fn verdict_of(code: Option<i32>) -> Verdict {
+pub const fn verdict_of(code: Option<i32>) -> Verdict {
     match code {
         Some(0) => Verdict::Pass,
         Some(linux::NOT_RUN) => Verdict::NotRun,

@@ -1010,7 +1010,8 @@ mod tests {
         assert_eq!(resumed(&words("--conversations=c1")), None);
     }
 
-    /// A presence lock names its conversation under its config.
+    /// A presence lock names its conversation under its config. NEGATIVE
+    /// CONTROLS: another directory, another config.
     #[test]
     fn a_presence_lock_names_its_conversation() {
         let config = Path::new("/s/agy-home/.gemini/antigravity-cli");

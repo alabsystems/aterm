@@ -141,7 +141,7 @@ pub enum Mode {
 impl Mode {
     /// Command-line mode name (`claude <word> <n>`).
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Mode::Busy => "busy",
             Mode::Question => "question",
@@ -152,7 +152,7 @@ impl Mode {
 
     /// The `agent=` word the server reads from that screen.
     #[must_use]
-    pub fn agent_word(self) -> &'static str {
+    pub const fn agent_word(self) -> &'static str {
         match self {
             Mode::Busy => "busy",
             Mode::Question | Mode::Prompt => "prompt",

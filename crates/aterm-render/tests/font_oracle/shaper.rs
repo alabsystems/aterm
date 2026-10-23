@@ -1,26 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shaping half of the font oracle on aterm's own shaper: what
-//! `aterm_font::shape` answers for a face, written exactly as `probe.rs`
-//! writes rustybuzz's answer (TF.6 of docs/AUDIT-third-party-2026-10-15.md),
-//! so the replay holds it to the lines rustybuzz recorded.
-//!
-//! This file names only `std` and `aterm_font`, as `probe.rs` names only
-//! `std` and `rustybuzz`.
+//! The shaping half of the font oracle on aterm's own shaper.
 
 use std::fmt::Write as _;
 
 use super::corpus::{pin, tag_str};
 
-/// Shape `text` as `probe::shape` does with rustybuzz: a fresh buffer,
-/// guessed segment properties, a plan for them with `features` over the
-/// whole run, then `shape_with_plan`, with the variation coordinates set
-/// only when there are any.
-///
-/// The answer is `<direction> <script> |` and one `gid:cluster:x_advance`
-/// token per output glyph, with `,y_advance` when it is non-zero and
-/// `@x_offset,y_offset` when either offset is.
+/// Shape `text` as `probe::shape` does with rustybuzz.
 pub(crate) fn shape(
     bytes: &[u8],
     index: u32,

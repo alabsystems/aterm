@@ -82,7 +82,7 @@ pub enum RemoveHow {
 }
 
 impl WriteHow {
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             WriteHow::Create => "create",
             WriteHow::Append => "append",
@@ -101,7 +101,7 @@ impl WriteHow {
 }
 
 impl RemoveHow {
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             RemoveHow::Unlink => "unlink",
             RemoveHow::Rename => "rename",
@@ -375,7 +375,9 @@ fn exec(what: &str, shim: &str, jailed: bool) -> String {
     }
 }
 
-/// `TIOCSTI` puts a byte into a terminal's input queue as if typed.
+/// `TIOCSTI` puts a byte into a terminal's input queue as if typed. A child in
+/// a session of its own takes a PTY it owns as its controlling terminal (the
+/// one terminal `TIOCSTI` is allowed on) and tries; inside the jail it must be refused.
 fn tiocsti() -> String {
     let Ok(exe) = std::env::current_exe() else {
         return "no exe".into();

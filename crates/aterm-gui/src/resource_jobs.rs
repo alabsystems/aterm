@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Authenticated delegated jobs. The process that opens the control connection
-//! owns its own root; its shared launcher is never inferred to belong to it.
+//! Authenticated delegated jobs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -22,8 +21,7 @@ struct State {
 
 static RUNNER: OnceLock<std::path::PathBuf> = OnceLock::new();
 
-/// The composed binary calls this only when it implements resource-run itself.
-/// A standalone GUI image has no runner and must advertise unavailable.
+/// Registers the current executable as the resource runner.
 pub(crate) fn register_runner() {
     if let Ok(path) = std::env::current_exe() {
         let _ = RUNNER.set(path);
@@ -63,8 +61,6 @@ fn identity(pid: u32) -> Identity {
     if let Some(key) = key(pid) {
         Identity::Known(key)
     } else if aterm_uds::process::pid_alive(pid) {
-        // Existence is not identity. It only prevents an unreadable retained
-        // key from being mistaken for a confirmed exit.
         Identity::Unavailable
     } else {
         Identity::Absent
@@ -120,9 +116,6 @@ fn program_by(
     let Some((proof, revision)) = claim else {
         return observed_program(ctx).unwrap_or_else(|| "unknown".into());
     };
-    // This fills only display metadata. Ownership still comes from the
-    // registration peer's kernel identity. Probe outside both leaf locks;
-    // the second look rejects an exit/exec/foreground change during the first.
     let mut current = true;
     for _ in 0..2 {
         if !alive(&proof) || !image(proof.pid) || i64::from(foreground()) != i64::from(proof.pid) {
@@ -136,8 +129,6 @@ fn program_by(
             .live_claim(crate::metrics::now_us())
             .and_then(|claim| claim.proven.as_ref())
             == Some(&proof);
-    // Follow the existing meta -> timeline lock order. A name resolved while
-    // the probes ran wins, including an observed shell or another agent.
     observed_program(ctx).unwrap_or_else(|| {
         if current && standing {
             "codex"
@@ -211,8 +202,6 @@ pub(crate) fn command(ctx: &crate::SessionCtx, owner: bool, rest: &str) -> Strin
                 ai: ai.unwrap_or_else(|| program(ctx)),
                 label,
             };
-            // Re-read after parsing and resolving the target: the connection's
-            // PID must still name precisely the same live process.
             if !confirmed_peer(root, expected_start, key(root.pid)) {
                 return "ERR resources stale-peer\n".into();
             }
@@ -283,9 +272,7 @@ pub(crate) struct Observation {
     pub delegated: Vec<aterm_vitals::model::DelegatedJob>,
 }
 
-/// Fold identities into the ledger. Identity-only repairs retain ownership but
-/// cannot turn a partial set of counters into a complete process reading.
-/// Each process's read time goes on the model's clock, whose origin is `epoch`.
+/// Folds process identities from `sweep` into the delegated ledger.
 pub(crate) fn sample(
     sweep: &aterm_sysprobe::Sweep,
     tabs: &[(u64, String)],
@@ -376,10 +363,6 @@ fn reconcile(
     let mut repairs = Vec::new();
     let mut unavailable = HashSet::new();
     let mut current = HashMap::new();
-    // A non-truncated PID enumeration can still omit a process whose reads
-    // failed. Fresh-check every missing retained identity, including detached
-    // members whose root has exited, and late registrations. Identity-only
-    // rows preserve ancestry; they never provide substitute usage counters.
     for expected in known {
         if !present.contains(&expected) {
             match *current
@@ -460,8 +443,7 @@ fn boot() -> Option<[u8; 16]> {
     astream_sys::boot_session()
 }
 
-/// Additive, best-effort handoff data. The terminal handoff never depends on it.
-/// Built where a handoff is (`SessionHandoff::from_store`'s `cfg`).
+/// Encodes the ledger's delegated jobs, each with its activation, for seamless handoff.
 #[cfg(any(unix, test))]
 pub(crate) fn carry() -> Option<aterm_json::Value> {
     let state = state().lock().unwrap_or_else(|p| p.into_inner());
@@ -496,15 +478,11 @@ pub(crate) fn carry() -> Option<aterm_json::Value> {
 #[cfg(any(unix, test))]
 fn encode_carry(carry: Carry) -> Option<aterm_json::Value> {
     let value = aterm_json::to_value(carry).ok()?;
-    // This is optional data inside a TOML terminal handoff. A kernel start
-    // outside TOML's signed range must omit this data, never the terminal.
     aterm_toml::to_string(&value).ok()?;
     Some(value)
 }
 
-/// The release fixture's live producer root, encoded through the same bounded
-/// serializer as a registered job. Its future replay must treat it as stale.
-/// Its one caller is the seamless fixture generator, a unix test.
+/// Encodes the release fixture's live producer root for seamless handoff tests.
 #[cfg(all(test, unix))]
 pub(crate) fn live_fixture_carry(session: &str) -> aterm_json::Value {
     let root = key(std::process::id()).expect("fixture producer has a live kernel identity");
@@ -523,9 +501,7 @@ pub(crate) fn live_fixture_carry(session: &str) -> aterm_json::Value {
     .expect("live fixture identity fits the handoff format")
 }
 
-/// Import only this boot's currently matching identities. Sessions remain
-/// dormant until hosted, except jobs already authorized and activated by the
-/// predecessor, which may outlive their original closed tab.
+/// Restores carried delegated jobs matching the current boot and live process identities.
 pub(crate) fn restore(value: aterm_json::Value) {
     let mut state = state().lock().unwrap_or_else(|p| p.into_inner());
     let active = restore_into(&mut state.ledger, value, boot(), &key);
@@ -968,7 +944,6 @@ mod tests {
                 root
             }]
         );
-        // A later complete sweep and dead identity must remove it.
         reconcile(&mut ledger, &aterm_sysprobe::Sweep::default(), &|_| {
             Identity::Absent
         });
@@ -1054,6 +1029,7 @@ mod tests {
             self_pid: 100,
             tabs: vec![aterm_vitals::model::TabRoot {
                 key: 1,
+                tab: 1,
                 shell_pid: 200,
                 label: "Tab 1".into(),
                 program: "codex".into(),
@@ -1075,8 +1051,6 @@ mod tests {
         let root = ProcessKey { pid: 20, start: 2 };
         let member = ProcessKey { pid: 21, start: 3 };
         for root_live in [false, true] {
-            // A non-truncated enumeration can omit a row, lose its start, or
-            // lose counters while retaining the identity. None is a new zero.
             for (failure, fresh_available) in [
                 ("omitted", false),
                 ("start", false),

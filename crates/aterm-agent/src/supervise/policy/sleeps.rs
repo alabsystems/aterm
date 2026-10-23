@@ -322,7 +322,7 @@ pub enum SinceAct {
 impl SinceAct {
     /// WHY THE LEDGER COULD NOT SAY how long the machine slept since its last act, in a journal line's words: the sleep before the loop's first look is then counted by the system's record of its last sleep alone, and a turn's done row reaching back past that look is read as before this book, whole of the rest.
     #[must_use]
-    pub fn unknown(self) -> Option<&'static str> {
+    pub const fn unknown(self) -> Option<&'static str> {
         match self {
             Self::Uncounted => {
                 Some("the last act on the books counts no sleep (an older build's row)")

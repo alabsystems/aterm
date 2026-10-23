@@ -102,7 +102,9 @@ fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
     }
 }
 
-/// Return the cell's value, resolving it exactly once and only on success.
+/// Return the cell's value, resolving it exactly once and only on success. Split out so a
+/// test can pin the property: a second call with a different resolver still answers the
+/// first path, so a mid-run seal cannot change what a running release compiles with.
 fn pin_first_success(
     cell: &std::sync::OnceLock<PathBuf>,
     resolve: impl FnOnce() -> Result<PathBuf>,
@@ -821,7 +823,8 @@ fn refuse_rewriting_info_attributes(git: &dyn GitRunner) -> Result<()> {
     }
 }
 
-/// Judge the cut tree both before and after a move.
+/// Judge the cut tree both before and after a move. A removed ignore rule can
+/// expose files without establishing who wrote them, so preserve them and refuse.
 fn require_clean_cut_tree(path: &Path) -> Result<()> {
     let changes: Vec<String> = crate::clean::dirty_against_head(path)
         .ok_or_else(|| {
@@ -1776,6 +1779,8 @@ pub fn own_cutter(
 }
 
 /// [`own_cutter`] for a cutter whose verdict is `stamp`: the commit it is the build of,
+/// or why it is none.
+///
 /// # Errors
 /// As [`own_cutter`].
 fn own_cutter_of(
@@ -2431,7 +2436,9 @@ pub fn github_identity_gate(offline: bool) -> Result<Option<String>> {
 /// flag spelling, whether the native lane turned verification off.
 const OFF_SWITCH_NOTE: &str = "compiled WITHOUT Trust verification";
 
-/// The probe's source.
+/// The probe's source. It carries one real Level 0 obligation on purpose (divisor-is-zero
+/// on `numerator / denominator`): with none, both lanes print "0 obligations checked" and
+/// [`verification_off_verdict`] could not tell them apart.
 const PROBE_SRC: &str = "\
 pub fn divide(numerator: u32, denominator: u32) -> u32 {
     numerator / denominator
@@ -3139,7 +3146,8 @@ mod native_lane_probe_tests {
         );
     }
 
-    /// The value drift: the switch parses, the compiler verifies anyway.
+    /// The value drift: the switch parses, the compiler verifies anyway. This is
+    /// the measured verifying output for [`PROBE_SRC`].
     #[test]
     fn a_switch_that_parsed_but_did_not_switch_is_refused() {
         let report = "=== Trust Verification Report (probe) ===\n\

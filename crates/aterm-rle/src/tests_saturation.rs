@@ -2,14 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `u32::MAX` capacity: the clamping and rejecting forms of extend and
-//! push, and mutations of a sequence filled to the brim (#5010).
+//! Saturation, clamping, and capacity tests at `u32::MAX`.
 
 use crate::{Rle, Run};
 
-/// `extend_with` and `push` clamp to the remaining capacity, on the new-run
-/// and the same-value merge paths alike, and never desynchronize the runs
-/// from the length.
 #[test]
 fn extend_and_push_clamp_to_the_remaining_capacity() {
     let mut rle = Rle::<u8>::new();
@@ -26,7 +22,6 @@ fn extend_and_push_clamp_to_the_remaining_capacity() {
     );
     assert_eq!(rle.remaining_capacity(), 0);
 
-    // Same value: only the 10 cells of slack are taken.
     let mut rle = Rle::<u8>::new();
     rle.extend_with(1, u32::MAX - 10);
     rle.extend_with(1, 20);
@@ -35,9 +30,6 @@ fn extend_and_push_clamp_to_the_remaining_capacity() {
     assert_eq!(rle.get(u32::MAX - 1), Some(1));
 }
 
-/// `try_extend_with` and `try_push` take a request that fits whole, and
-/// refuse one that does not, naming what was asked and what was free, with
-/// the sequence left exactly as it was.
 #[test]
 fn try_forms_take_a_whole_request_or_change_nothing() {
     let mut rle = Rle::<u8>::new();
@@ -60,8 +52,6 @@ fn try_forms_take_a_whole_request_or_change_nothing() {
     assert_eq!((rle.len(), rle.run_count()), (u32::MAX, 2));
 }
 
-/// Regression: after a clamped extend, `set`, `set_range` and `resize` at
-/// near-`u32::MAX` offsets keep exact length accounting.
 #[test]
 fn post_clamp_mutations_preserve_invariant() {
     let mut rle = Rle::<u8>::new();

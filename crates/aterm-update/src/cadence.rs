@@ -335,7 +335,8 @@ pub(crate) fn wait(cadence: &Cadence, signal: &WakeSignal, seen: u64) -> (Durati
     })
 }
 
-/// [`wait`] over an injected sleep.
+/// [`wait`] over an injected sleep. The next check is published only while the wait
+/// lasts; after it the loop is settling or checking and the instant is past.
 fn wait_with(
     cadence: &Cadence,
     entropy: u8,
@@ -610,7 +611,11 @@ mod tests {
         assert_eq!(c.nominal(), base, "the ordinary ladder's first rung");
     }
 
-    /// A network still coming up after a wake is no fault, whatever it failed on.
+    /// A network still coming up after a wake is no fault, whatever it failed on. The
+    /// settle is three seconds, so the first check after the lid opens can meet Wi-Fi
+    /// half associated, a VPN reconnecting or a captive portal: a TLS failure (35), a
+    /// reset (56), a portal's error page (22) — none of them an exit
+    /// `is_network_unreachable` names.
     #[test]
     fn a_failure_inside_the_wake_grace_takes_the_quick_rungs_at_info_whatever_it_was() {
         let base = Duration::from_secs(INTERVAL_SECS);

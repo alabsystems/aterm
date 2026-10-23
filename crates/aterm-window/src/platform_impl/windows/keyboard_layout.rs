@@ -184,10 +184,10 @@ pub(crate) struct Layout {
 
     /// Maps numpad keys from Windows virtual key to a `Key`.
     pub numlock_on_keys: HashMap<VIRTUAL_KEY, Key>,
-    /// Like `numlock_on_keys` but this will map to the key that would be produced if numlock was off.
+    /// Numpad virtual key mapping when NumLock is off.
     pub numlock_off_keys: HashMap<VIRTUAL_KEY, Key>,
 
-    /// Maps a modifier state to group of key strings We're not using `ModifiersState` here because that object cannot express caps lock, but we need to handle caps lock too.
+    /// Modifier state to key mapping (including CapsLock).
     pub keys: HashMap<WindowsModifiers, HashMap<KeyCode, Key>>,
     pub has_alt_graph: bool,
 }
@@ -231,12 +231,12 @@ impl Layout {
 
 #[derive(Default)]
 pub(crate) struct LayoutCache {
-    /// Maps locale identifiers (HKL) to layouts
+    /// Maps locale identifiers (HKL) to layouts.
     pub layouts: HashMap<u64, Layout>,
 }
 
 impl LayoutCache {
-    /// Checks whether the current layout is already known and prepares the layout if it isn't known.
+    /// Returns the current layout, preparing it on first use.
     pub fn get_current_layout(&mut self) -> (u64, &Layout) {
         #[cfg(any(test, debug_assertions))]
         let replayed = super::keyboard::replay::layout();
@@ -359,17 +359,13 @@ impl LayoutCache {
                 let unicode = Self::to_unicode_string(&key_state, vk, scancode, locale_id);
                 let key = match unicode {
                     ToUnicodeResult::Str(str) => Key::Character(SmolStr::new(str)),
-                    ToUnicodeResult::Dead(dead_char) => {
-                        // Dead key.
-                        Key::Dead(dead_char)
-                    },
+                    ToUnicodeResult::Dead(dead_char) => Key::Dead(dead_char),
                     ToUnicodeResult::None => {
                         let has_alt = mod_state.contains(WindowsModifiers::ALT);
                         let has_ctrl = mod_state.contains(WindowsModifiers::CONTROL);
                         if !has_alt && !has_ctrl && key_code == KeyCode::NumpadDivide {
                             Key::Character(SmolStr::new("/"))
                         } else {
-                            // Just use the unidentified key, we got earlier
                             preliminary_key
                         }
                     },
@@ -686,7 +682,6 @@ fn keycode_to_vkey(keycode: KeyCode, hkl: u64) -> VIRTUAL_KEY {
     }
 }
 
-/// This converts virtual keys to `Key`s.
 fn vkey_to_non_char_key(
     vkey: VIRTUAL_KEY,
     native_code: NativeKey,
@@ -899,7 +894,6 @@ fn vkey_to_non_char_key(
             if is_japanese {
                 Key::Named(NamedKey::Katakana)
             } else {
-                // Also see: https://github.com/pyfisch/keyboard-types/issues/9
                 Key::Unidentified(native_code)
             }
         },

@@ -153,7 +153,9 @@ fn install_panic_hook(dir: PathBuf) {
     }));
 }
 
-/// The panic message as text.
+/// The panic message as text. Handles both standard payload shapes
+/// (`panic!("literal")` and a formatted `String`); any other payload type keeps the
+/// neutral word.
 fn panic_payload<'a>(info: &'a std::panic::PanicHookInfo<'_>) -> &'a str {
     let payload = info.payload();
     payload
@@ -246,7 +248,9 @@ fn is_harness_thread(thread_name: Option<&str>) -> bool {
     thread_name.is_some_and(|n| n.starts_with(crate::harness_host::THREAD_PREFIX))
 }
 
-/// The most one run's harness fault record holds.
+/// The most one run's harness fault record holds. The host restarts a faulting
+/// run for as long as the window lives (`harness_host`), so a supervisor bug
+/// that faults every hour for weeks keeps its first faults, not every one.
 const HARNESS_FAULT_BYTES: u64 = 256 * 1024;
 
 /// The last line of a full harness fault record.
@@ -862,7 +866,8 @@ impl RotatingFile {
         }
     }
 
-    /// Reopen `path`.
+    /// Reopen `path`. On failure the old handle stays: a line in the older
+    /// copy beats a line nowhere.
     fn reopen(&mut self) {
         if let Ok(file) = open_append_0600(&self.path) {
             self.id = file.metadata().ok().and_then(|m| file_id(&m));
@@ -939,9 +944,11 @@ fn create_0600(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-/// Writes one sanitized line per record, off the logging thread.
+/// Writes one sanitized line per record, off the logging thread. Idle cost is
+/// zero: `aterm_log` gates on the max-level atomic before any record reaches us.
 struct FileLogger {
-    /// Lines formatted and not yet appended, oldest first.
+    /// Lines formatted and not yet appended, oldest first. Taken off only
+    /// while `file` is held (lock order: `file`, then `pending`).
     pending: Mutex<Pending>,
     /// Signalled when `pending` goes from empty to not.
     ready: Condvar,
@@ -1044,7 +1051,8 @@ impl FileLogger {
         self.append_queued(&mut file, Some(&line));
     }
 
-    /// Append every queued line, oldest first, then `then`.
+    /// Append every queued line, oldest first, then `then`. The caller holds
+    /// `file`, so no other thread's take can land between.
     fn append_queued(&self, file: &mut RotatingFile, then: Option<&str>) {
         let lines = {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);

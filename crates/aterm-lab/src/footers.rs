@@ -45,6 +45,7 @@ pub fn footer_row_pattern(screen: &str) -> Option<String> {
 /// `✻ <Verb> for <N>…`: a turn's done row (`screen::is_done_row`), as a pattern.
 const DONE_ROW: &str = "✻.\\S+.for.[0-9]";
 
+/// How long the footer must stay unchanged to count as settled: its
 /// first-render hints give way to the mode row within this.
 const SETTLE_MS: u64 = 2000;
 
@@ -199,6 +200,7 @@ fn launch(run: &Run, door: &Door<'_>, subscriber: bool, args: &[&str]) -> Result
     Ok(())
 }
 
+/// End the Claude Code in the tab (ctrl+c twice, a person's half second
 /// apart) and wait for the shell.
 fn quit(door: &Door<'_>) -> Result<(), Fail> {
     for _ in 0..2 {

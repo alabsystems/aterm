@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FABRIC'S WAITS ON THE PRODUCTION CLOCK. This process never selects the
-//! test timing value (every unit test's session helper does,
-//! `aterm_gui_timing::select_fast`), so the commit-fence bound a session reads
-//! here is [`HOLD_FENCE_WAIT`] itself, as a shipped build reads it. That a
-//! fenced verb waits its session's bound, and no other, is checked on a zero
-//! and a short bound set on the session, and on the production bound read off
-//! the waiter it parks ([`SessionFabric::fence_bound`]), so the test does not
-//! wait the production length out.
+//! THE FABRIC'S WAITS ON THE PRODUCTION CLOCK.
 
 use std::time::{Duration, Instant};
 
@@ -61,10 +54,6 @@ fn a_fenced_change_waits_the_production_bound_then_answers_busy() {
     );
     assert_eq!(session.fabric.fence_wait(), HOLD_FENCE_WAIT);
     session.fabric.fence_hold(false);
-    // The verb waits the bound its session reads, whatever its length: a zero
-    // bound answers busy without parking on the fence, and a short one is
-    // waited out first, so a verb waiting any bound but its session's fails
-    // one of the two.
     session.fabric.set_fence_wait(Duration::ZERO);
     assert_eq!(cmd_topic(&session, "add news"), HOLD_BUSY);
     assert_eq!(session.fabric.fence_waits(), 0, "a zero bound never parks");

@@ -17,7 +17,7 @@ pub enum Kind {
 impl Kind {
     /// The profile language's word for it.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Kind::Subpath => "subpath",
             Kind::Prefix => "prefix",

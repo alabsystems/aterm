@@ -10,7 +10,6 @@ use core::ops::Range;
 
 use crate::Stream;
 
-// Limits according to the Adobe Technical Note #5176, chapter 4 DICT Data.
 const TWO_BYTE_OPERATOR_MARK: u8 = 12;
 const FLOAT_STACK_LEN: usize = 64;
 const END_OF_FLOAT_FLAG: u8 = 0xf;
@@ -27,18 +26,9 @@ impl Operator {
 
 pub struct DictionaryParser<'a> {
     data: &'a [u8],
-    // The current offset.
     offset: usize,
-    // Offset to the last operands start.
     operands_offset: usize,
-    // Actual operands.
-    //
-    // While CFF can contain only i32 and f32 values, we have to store operands as f64
-    // since f32 cannot represent the whole i32 range.
-    // Meaning we have a choice of storing operands as f64 or as enum of i32/f32.
-    // In both cases the type size would be 8 bytes, so it's easier to simply use f64.
     operands: &'a mut [f64],
-    // An amount of operands in the `operands` array.
     operands_len: u16,
 }
 
@@ -60,14 +50,10 @@ impl<'a> DictionaryParser<'a> {
         self.operands_offset = self.offset;
         while !s.at_end() {
             let b = s.read::<u8>()?;
-            // 0..=21 bytes are operators.
             if is_dict_one_byte_op(b) {
                 let mut operator = u16::from(b);
 
-                // Check that operator is two byte long.
                 if b == TWO_BYTE_OPERATOR_MARK {
-                    // Use a 1200 'prefix' to make two byte operators more readable.
-                    // 12 3 => 1203
                     operator = 1200 + u16::from(s.read::<u8>()?);
                 }
 
@@ -82,21 +68,11 @@ impl<'a> DictionaryParser<'a> {
     }
 
     /// Parses operands of the current operator.
-    ///
-    /// In the DICT structure, operands are defined before an operator.
-    /// So we are trying to find an operator first and the we can actually parse the operands.
-    ///
-    /// Since this methods is pretty expensive and we do not care about most of the operators,
-    /// we can speed up parsing by parsing operands only for required operators.
-    ///
-    /// We still have to "skip" operands during operators search (see `skip_number()`),
-    /// but it's still faster that a naive method.
     pub fn parse_operands(&mut self) -> Option<()> {
         let mut s = Stream::new_at(self.data, self.operands_offset)?;
         self.operands_len = 0;
         while !s.at_end() {
             let b = s.read::<u8>()?;
-            // 0..=21 bytes are operators.
             if is_dict_one_byte_op(b) {
                 break;
             } else {
@@ -152,8 +128,6 @@ impl<'a> DictionaryParser<'a> {
     }
 }
 
-// One-byte CFF DICT Operators according to the
-// Adobe Technical Note #5176, Appendix H CFF DICT Encoding.
 pub fn is_dict_one_byte_op(b: u8) -> bool {
     match b {
         0..=27 => true,
@@ -164,7 +138,6 @@ pub fn is_dict_one_byte_op(b: u8) -> bool {
     }
 }
 
-// Adobe Technical Note #5177, Table 3 Operand Encoding
 pub fn parse_number(b0: u8, s: &mut Stream) -> Option<f64> {
     match b0 {
         28 => {
@@ -221,7 +194,6 @@ fn parse_float(s: &mut Stream) -> Option<f64> {
     Some(n)
 }
 
-// Adobe Technical Note #5176, Table 5 Nibble Definitions
 fn parse_float_nibble(nibble: u8, mut idx: usize, data: &mut [u8]) -> Option<usize> {
     if idx == FLOAT_STACK_LEN {
         return None;
@@ -261,7 +233,6 @@ fn parse_float_nibble(nibble: u8, mut idx: usize, data: &mut [u8]) -> Option<usi
     Some(idx)
 }
 
-// Just like `parse_number`, but doesn't actually parses the data.
 pub fn skip_number(b0: u8, s: &mut Stream) -> Option<()> {
     match b0 {
         28 => s.skip::<u16>(),

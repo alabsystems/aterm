@@ -193,7 +193,8 @@ enum RenewalState {
         armed_at: Instant,
         retry_at: Instant,
     },
-    /// An attempt's successor is launching or held.
+    /// An attempt's successor is launching or held. `ending`: why its return ends the
+    /// renewal instead of re-arming it, once something has.
     InFlight {
         armed_at: Instant,
         ending: Option<InFlightEnd>,
@@ -202,7 +203,8 @@ enum RenewalState {
     Ended,
 }
 
-/// Why an attempt in flight ends the renewal at its return instead of re-arming it.
+/// Why an attempt in flight ends the renewal at its return instead of re-arming it. The
+/// first reason stands, as [`decide`] would rank them.
 #[derive(Clone, Copy)]
 enum InFlightEnd {
     /// `[update] auto_apply` went off: nothing replaces this process unasked.

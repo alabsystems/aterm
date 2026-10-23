@@ -8,8 +8,7 @@
 use super::{ClassDefinition, Coverage, LookupIndex};
 use crate::parser::{FromData, FromSlice, LazyArray16, LazyOffsetArray16, Stream};
 
-/// A [Contextual Lookup Subtable](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#seqctxt1).
+/// A Contextual Lookup Subtable.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub enum ContextLookup<'a> {

@@ -38,7 +38,8 @@ const RECOLOR_VOCAB: &[(&str, &str)] = &[
     ("fixed", "Fixed"),
 ];
 
-/// Canonical `kind` vocabulary → variant.
+/// Canonical `kind` vocabulary → variant. Only [`INCLUDED_KINDS`] are ever emitted, but
+/// the table also validates that an included asset's kind is a known one.
 const KIND_VOCAB: &[(&str, &str)] = &[
     ("head", "Head"),
     ("special", "Special"),
@@ -72,7 +73,8 @@ struct Glyph {
     kind_rank: usize,
     kind: &'static str,
     variant: String,
-    /// Viewbox width/height, quantized to a fixed thousandth.
+    /// Viewbox width/height, quantized to a fixed thousandth. Runtime layout
+    /// preserves the authored art's proportions without parsing asset TOML.
     aspect_x1000: u16,
     eye_y: u16,
     center_x: u16,
@@ -298,7 +300,8 @@ fn quantize_path(cmds: &[PathCmd], vw: f32, vh: f32) -> Vec<String> {
         .collect()
 }
 
-/// `round(v / extent * FIXED_ONE)`, clamped to `0..=FIXED_ONE`.
+/// `round(v / extent * FIXED_ONE)`, clamped to `0..=FIXED_ONE`. The integer rule is the
+/// same on every host (no platform float variance in the const data).
 fn quant(v: f32, extent: f32) -> u16 {
     let q = (v / extent * f32::from(FIXED_ONE)).round();
     q.clamp(0.0, f32::from(FIXED_ONE)) as u16

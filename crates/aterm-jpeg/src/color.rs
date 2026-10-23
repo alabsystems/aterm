@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! From decoded component planes to RGBA8: chroma upsampling (the triangle
-//! filter for the 2x factors, as T.81 decoders smooth them; replication for
-//! any other factor), colour conversion (JFIF YCbCr, RGB, grey, Adobe CMYK
-//! and YCCK) and the EXIF orientation.
+//! Chroma upsampling, colour conversion, and EXIF orientation to RGBA8.
 
 /// One component's samples at its own resolution.
 pub(crate) struct Plane {
@@ -14,8 +11,7 @@ pub(crate) struct Plane {
     /// The component's real extent (T.81 A.1.1).
     pub(crate) width: usize,
     pub(crate) height: usize,
-    /// Output pixels per sample, across and down (`Hmax / H`, `Vmax / V`)
-    /// when whole; `None` for a ratio that is not a whole number.
+    /// Output pixels per sample, across and down (`Hmax / H`, `Vmax / V`) when whole.
     pub(crate) factor: Option<(usize, usize)>,
     /// The sampling factors themselves, for the replication fallback.
     pub(crate) sampling: (usize, usize),
@@ -31,8 +27,7 @@ impl Plane {
             .unwrap_or_default()
     }
 
-    /// Output row `y` of this component, `width` samples long, upsampled to
-    /// the image's resolution. `max` is (`Hmax`, `Vmax`).
+    /// Output row `y` of this component, `width` samples long, upsampled to the image's resolution.
     pub(crate) fn upsampled_row(
         &self,
         y: usize,
@@ -57,7 +52,6 @@ impl Plane {
                 h2v2_fancy(near, far, out);
             }
             _ => {
-                // Replication: the sample whose area covers the pixel.
                 let source_y = y * self.sampling.1 / max.1;
                 let row = self.row(source_y);
                 for (x, slot) in out.iter_mut().enumerate() {
@@ -68,8 +62,7 @@ impl Plane {
         }
     }
 
-    /// For a component halved vertically: the sample row nearest output row
-    /// `y` and the one on the far side of it (the edge row repeats).
+    /// For a component halved vertically.
     #[inline]
     fn vertical_pair(&self, y: usize) -> (&[u8], &[u8]) {
         let near = y / 2;
@@ -89,8 +82,7 @@ fn copy_row(row: &[u8], out: &mut [u8]) {
     }
 }
 
-/// Double a row's width with the triangle filter: each output sample is
-/// three parts its own input sample and one part the neighbour on its side.
+/// Double a row's width with the triangle filter.
 #[inline]
 fn h2_fancy(row: &[u8], out: &mut [u8]) {
     let n = row.len();
@@ -111,8 +103,7 @@ fn h2_fancy(row: &[u8], out: &mut [u8]) {
     }
 }
 
-/// [`h2_fancy`] after the same filter down the column: `near` is the
-/// sample row nearest the output row, `far` the one beyond it.
+/// [`h2_fancy`] after the same filter down the column.
 #[inline]
 fn h2v2_fancy(near: &[u8], far: &[u8], out: &mut [u8]) {
     let n = near.len();
@@ -196,8 +187,7 @@ pub(crate) fn convert_row(model: ColorModel, rows: &[Vec<u8>], width: usize, out
     }
 }
 
-/// Apply EXIF orientation `orientation` (TIFF 6.0 tag 274, 1..=8) to an
-/// RGBA8 image, returning it upright with its new width and height.
+/// Apply EXIF orientation `orientation`.
 pub(crate) fn orient(
     rgba: Vec<u8>,
     width: usize,
@@ -216,7 +206,6 @@ pub(crate) fn orient(
     let mut out = vec![0u8; rgba.len()];
     for y in 0..out_h {
         for x in 0..out_w {
-            // The stored pixel this upright pixel comes from.
             let (sx, sy) = match orientation {
                 2 => (width - 1 - x, y),
                 3 => (width - 1 - x, height - 1 - y),
@@ -265,7 +254,6 @@ mod tests {
     /// and moves the stored top-left pixel to the top-right.
     #[test]
     fn orientation_six_turns_the_image_clockwise() {
-        // 2 wide, 1 high: red then green.
         let rgba = vec![255, 0, 0, 255, 0, 255, 0, 255];
         let (out, w, h) = orient(rgba, 2, 1, 6);
         assert_eq!((w, h), (1, 2));

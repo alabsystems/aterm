@@ -25,10 +25,13 @@ pub enum LendReach {
 /// Where a lent anchor sits, relative to the cursor's logical line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lent {
+    /// On the head row of the line `k` lines above the cursor's (0 is the
     /// cursor's own line).
     Head(usize),
     /// On a continuation row of that line.
     Mid(usize),
+    /// Below the cursor's line; `true` when nothing was drawn (nothing an
+    /// erased cell does not show) on any row between that line and the
     /// anchor.
     Below(bool),
     /// Not placeable (the cursor's own line could not be read).
@@ -151,6 +154,8 @@ impl Grid {
         Some((line.head, line.last))
     }
 
+    /// The logical line whose last row is `last`, read no lower than
+    /// `floor`. `None` when its head cannot be read (outside the ring, or
     /// below the floor): an incomplete line is never vouched for.
     fn line_ending_at(&self, last: u64, floor: u64) -> Option<LogicalLine> {
         let mut head = last;
@@ -175,6 +180,8 @@ impl Grid {
         })
     }
 
+    /// The logical lines from the one ending at `last` upward, newest first,
+    /// read no lower than `floor`, ending at the first line that cannot be
     /// read whole.
     fn lines_up(&self, last: u64, floor: u64) -> impl Iterator<Item = LogicalLine> + '_ {
         let mut next = Some(last);
@@ -185,6 +192,10 @@ impl Grid {
         })
     }
 
+    /// The glyph digests of drawn logical lines below the line ending at
+    /// `last`. A line drawn with no glyph (a background, a reversed or
+    /// underlined blank, an image, a double size) counts though its glyph
+    /// digest is blank, so a rewrap cannot silently bring another writer's
     /// ink into an open span. Unreadable payloads still refuse the lend.
     fn below_digests(&self, last: u64) -> Option<Vec<u64>> {
         let end = self.visible_to_absolute(0) + u64::from(self.storage.visible_rows);
@@ -372,6 +383,7 @@ mod tests {
     use super::LendReach;
     use crate::{AnchorRole, Grid};
 
+    /// A grid holding `lines` (each its own logical line, `\n`-separated as a
     /// shell prints them), the cursor left on the row after the last.
     fn grid_printing(rows: u16, cols: u16, lines: &[&str]) -> Grid {
         let mut g = Grid::with_scrollback(rows, cols, 1000);

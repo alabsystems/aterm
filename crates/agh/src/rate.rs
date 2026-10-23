@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Rate limits (design §13.2): snapshots of `x-ratelimit-*`, and the advisory rate book.
+//! Rate-limit snapshots (`x-ratelimit-*`) and the advisory per-identity rate book.
 
 use std::path::PathBuf;
 
@@ -26,8 +26,7 @@ pub struct RateSnapshot {
 }
 
 impl RateSnapshot {
-    /// Needs `x-ratelimit-limit`, `-remaining` and `-reset` (any case). `-resource` defaults to
-    /// `core`, and `-used` to limit − remaining.
+    /// Parses `x-ratelimit-*` headers (`resource` defaults to `core`).
     #[must_use]
     pub fn from_headers(headers: &[(String, String)]) -> Option<RateSnapshot> {
         let get = |name: &str| crate::wire::header_in(headers, name).map(str::trim);
@@ -76,10 +75,7 @@ impl RateSnapshot {
     }
 }
 
-/// The API budget a path on the api origin spends, as GitHub's `x-ratelimit-resource` names it:
-/// `code_search` for `/search/code`, `search` for any other `/search/…`, `graphql` for
-/// `/graphql`, else `core`. The web and CDN origins spend none, so the pipeline consults the
-/// rate book for api-origin calls only.
+/// Returns the GitHub API rate-limit resource (`code_search`, `search`, `graphql`, or `core`).
 #[inline]
 #[must_use]
 pub fn resource_for(path: &str) -> &'static str {
@@ -142,18 +138,14 @@ impl RateBook {
         RateBook { dir: None }
     }
 
-    /// Whether the book is consulted at all: made with `at`, on a platform that keeps one
-    /// (unix; off unix the book is inert). The pipeline reads the clock for the book only when
-    /// this holds, so a run with no book reads no clock for it.
+    /// Whether the rate book is active on this platform (`unix` with a configured directory).
     #[inline]
     #[must_use]
     pub(crate) const fn enabled(&self) -> bool {
         cfg!(unix) && self.dir.is_some()
     }
 
-    /// RateLimited, `Sub::PreRefused`, `reset`, why `the rate book says {resource} is spent for
-    /// this identity until {reset}`, when the book holds `remaining == 0` with
-    /// `reset > now_unix`. Nothing is sent.
+    /// Returns a `PreRefused` rate-limit error when `resource` is exhausted until after `now_unix`.
     #[must_use]
     pub fn refuse_before_send(&self, key: &str, resource: &str, now_unix: u64) -> Option<Error> {
         let spent = self
@@ -174,15 +166,7 @@ impl RateBook {
         )
     }
 
-    /// Merge `snapshot` into the key's file. Advisory: every failure is ignored.
-    /// 1. `create_dir_all` the directory above `dir`'s parent;
-    /// 2. `create_private_dir(dir's parent)`, then `create_private_dir(dir)`: each accepts an
-    ///    existing private directory, and a loose one is an error, which disables the book
-    ///    (nothing is narrowed);
-    /// 3. `read`, then the resource's snapshot replaced;
-    /// 4. `write_private(dir, "{key}.json", json)`.
-    ///
-    /// Off unix the book is inert.
+    /// Merges `snapshot` into `key`'s advisory rate-book file, ignoring I/O errors.
     pub fn record(&self, key: &str, snapshot: &RateSnapshot) {
         #[cfg(unix)]
         {
@@ -208,7 +192,6 @@ impl RateBook {
         }
         create_private_dir(parent).ok()?;
         create_private_dir(dir).ok()?;
-        // `resources` is a map ordered by its keys, so the book is written sorted as it is.
         let mut held = self.read(key);
         held.retain(|s| s.resource != snapshot.resource);
         held.push(snapshot.clone());
@@ -223,8 +206,7 @@ impl RateBook {
         write_private(dir, &file_name(key), text.as_bytes()).ok()
     }
 
-    /// The key's snapshots, sorted by resource; empty when unreadable (no file, a loose
-    /// directory or file, a body that is not the book's). Off unix: empty.
+    /// Reads `key`'s snapshots sorted by resource, or an empty list if unreadable.
     #[must_use]
     pub fn read(&self, key: &str) -> Vec<RateSnapshot> {
         #[cfg(unix)]

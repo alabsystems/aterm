@@ -80,19 +80,14 @@ impl FromData for UnicodeRangeRecord {
 pub enum GlyphVariationResult {
     /// Glyph was found in the variation encoding table.
     Found(GlyphId),
-    /// Glyph should be looked in other, non-variation tables.
-    ///
-    /// Basically, you should use `Encoding::glyph_index` or `Face::glyph_index`
-    /// in this case.
+    /// Glyph should be looked up in non-variation tables.
     UseDefault,
 }
 
-/// A [format 14](https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-14-unicode-variation-sequences)
-/// subtable.
+/// A format 14 `cmap` subtable.
 #[derive(Clone, Copy)]
 pub struct Subtable14<'a> {
     records: LazyArray32<'a, VariationSelectorRecord>,
-    // The whole subtable data.
     data: &'a [u8],
 }
 
@@ -100,8 +95,8 @@ impl<'a> Subtable14<'a> {
     /// Parses a subtable from raw data.
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
-        s.skip::<u16>(); // format
-        s.skip::<u32>(); // length
+        s.skip::<u16>();
+        s.skip::<u32>();
         let count = s.read::<u32>()?;
         let records = s.read_array32::<VariationSelectorRecord>(count)?;
         Some(Self { records, data })

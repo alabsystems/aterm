@@ -628,7 +628,8 @@ mod acl {
         }
     }
 
-    /// `CreateDirectoryW` with `sd`.
+    /// `CreateDirectoryW` with `sd`. A directory already there is not an error:
+    /// the caller verifies what it is.
     fn create_dir_with(dir: &Path, sd: &Descriptor) -> io::Result<()> {
         let wide = to_wide(dir);
         let mut attributes = SecurityAttributes {
@@ -799,7 +800,12 @@ mod tests {
         }
     }
 
-    /// Each layer holds alone.
+    /// Each layer holds alone. The High label refuses a Medium token reads and
+    /// writes even where the DACL grants Everyone everything; and the OWNER
+    /// RIGHTS entry leaves an owner that is the user (what an elevated token
+    /// under the "object creator" owner policy makes) only `READ_CONTROL`,
+    /// where without it the owner's implicit `WRITE_DAC` would let the
+    /// unelevated user rewrite the DACL.
     #[test]
     fn the_label_and_the_owner_rights_entry_each_refuse_the_unelevated_twin() {
         let twin = tokens::unelevated_twin();
@@ -972,7 +978,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The protected DACL, read back from a real directory.
+    /// The protected DACL, read back from a real directory. A child of a folder
+    /// whose inheritable entry admits Everyone inherits that entry (control:
+    /// `AccessCheck` lets a stranger list and write it); after
+    /// `ensure_private_dir` its DACL is protected and holds exactly the user,
+    /// SYSTEM and Administrators, so the stranger may neither list it, write it
+    /// nor rewrite its DACL, and the user keeps everything.
     #[test]
     fn the_hardened_dacl_is_protected_and_shuts_everyone_else_out() {
         let me = tokens::own_user_sid();

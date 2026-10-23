@@ -1068,7 +1068,7 @@ impl FleetSource {
     /// Which of the two it is, for a log line: never the source itself, whose
     /// link may be a secret of its own.
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub const fn kind(&self) -> &'static str {
         match self {
             Self::File(_) => "fleet-file",
             Self::Key(_) => "key",

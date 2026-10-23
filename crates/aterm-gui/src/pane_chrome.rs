@@ -360,6 +360,9 @@ pub(crate) fn push_focus_ring(
     }
 }
 
+/// The side of `lane`'s divider hairline a focus-ring stroke among `ring`
+/// ([`focus_ring_rects`]) runs on beside the lane's track, for the resting
+/// thumb to grow away from ([`scrollbar::rest_span`]); `None` at the window's
 /// edge and in a gap the ring does not reach.
 fn ring_side(
     lane: scrollbar::Lane,
@@ -700,9 +703,11 @@ impl PaneOverlay {
     }
 }
 
+/// The unfocused panes' hollow cursor: the pane's own cursor colour, a touch
 /// under opaque so it reads as a mark, not a block.
 const HOLLOW_ALPHA: u8 = 210;
 
+/// Remove each quad of `taken` from `stream` once, wherever it still is (a
 /// producer that refilled the stream since holds none of it).
 fn remove_each_once(stream: &mut Vec<GlowQuad>, taken: &[GlowQuad]) {
     for q in taken {
@@ -829,6 +834,7 @@ impl App {
         overlay.finish(inputs, &mut ws.scroll_pill, &mut ws.pill_shown, now);
     }
 
+    /// Window pixel `(x, y)` in terminal-grid pixels (the grid's own origin,
     /// the chrome rows above it excluded), unclamped.
     fn grid_pixel(&self, wid: WindowId, x: f64, y: f64) -> (f64, f64) {
         let (fx, fy) = self.window_to_frame(wid, x, y);
@@ -838,6 +844,10 @@ impl App {
         (fx - self.win_pad(wid) as f64, fy - top as f64)
     }
 
+    /// The geometry the last frame laid window `wid`'s bars with, while the
+    /// window still has the grid they were laid on ([`App::laid_grid`]):
+    /// between a re-grid and the frame that lays them again, `None`, so no
+    /// pointer event hovers, grabs, pages or drags a lane laid at a cell,
     /// inset or width the window no longer has.
     fn laid_overlay_inputs(&self, wid: WindowId) -> Option<OverlayInputs> {
         let inputs = self.windows.get(&wid)?.pane_overlay.inputs?;
@@ -845,6 +855,7 @@ impl App {
         Some(inputs)
     }
 
+    /// The scrollbar under window pixel `(x, y)`: its pane's facts, lane and
     /// thumb, and what part of it is hit.
     fn scrollbar_at(
         &self,
@@ -963,6 +974,7 @@ impl App {
         ended
     }
 
+    /// One drag step: put the dragged thumb's top under the pointer, less the
     /// grab, and scroll its pane to the offset that puts it there.
     fn drag_scrollbar(&mut self, wid: WindowId, drag: Drag, x: f64, y: f64) {
         let Some(inputs) = self.laid_overlay_inputs(wid) else {
@@ -1005,6 +1017,9 @@ impl App {
         self.scroll_pane(wid, drag.session, |_| target as usize);
     }
 
+    /// Move pane `session`'s view to the offset `to` makes of its current one,
+    /// as a reader's own motion (`Terminal::scroll_display`, custody recorded),
+    /// and wake the fade. The facts take the new offset at once, so the next
     /// pointer event in the same frame hit-tests the thumb where it now is.
     fn scroll_pane(&mut self, wid: WindowId, session: u64, to: impl FnOnce(usize) -> usize) {
         let Some(term) = self.pool.get(session).map(|s| s.term.clone()) else {

@@ -295,7 +295,8 @@ mod tests {
     #[cfg(unix)]
     static NOFILE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Serialize a NOFILE-mutating test.
+    /// Serialize a NOFILE-mutating test. Poison is ignored deliberately: one test
+    /// panicking must not cascade into unrelated failures in the others.
     #[cfg(unix)]
     fn nofile_guard() -> std::sync::MutexGuard<'static, ()> {
         NOFILE_TESTS.lock().unwrap_or_else(|e| e.into_inner())

@@ -3672,7 +3672,7 @@ pub struct CheckOptions {
 impl CheckOptions {
     /// The sections asked: `(cut, export, wasm32)`.
     #[must_use]
-    pub fn sections(&self) -> (bool, bool, bool) {
+    pub const fn sections(&self) -> (bool, bool, bool) {
         if self.cut || self.export || self.wasm32 {
             (self.cut, self.export, self.wasm32)
         } else {
@@ -3700,6 +3700,8 @@ pub fn check(repo: &Path, opts: &CheckOptions) -> i32 {
 }
 
 /// [`check`]'s sections for the commit `opts` names, each gate's lines printed as it
+/// ends.
+///
 /// # Errors
 /// The commit names no commit, or its `Cargo.toml` carries no release version.
 fn checked(repo: &Path, opts: &CheckOptions) -> Result<Precheck, String> {

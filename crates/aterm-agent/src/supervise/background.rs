@@ -39,7 +39,7 @@ pub enum BackgroundEvidence {
 impl BackgroundEvidence {
     /// The call that made no progress, if the reading names one.
     #[must_use]
-    pub fn no_progress(&self) -> Option<&BackgroundCall> {
+    pub const fn no_progress(&self) -> Option<&BackgroundCall> {
         match self {
             Self::NoProgress { worst } => Some(worst),
             Self::Unknown => None,
@@ -97,7 +97,7 @@ pub fn wait_phrase(word: &str) -> Option<&'static str> {
 impl BackgroundCall {
     /// Whole minutes it has made no progress.
     #[must_use]
-    pub fn quiet_min(&self) -> u64 {
+    pub const fn quiet_min(&self) -> u64 {
         self.quiet_ms / 60_000
     }
 

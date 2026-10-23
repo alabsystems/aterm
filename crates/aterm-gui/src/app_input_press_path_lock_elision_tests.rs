@@ -262,7 +262,9 @@ fn a_self_licensing_press_keeps_banked_stamps_and_licenses_its_response() {
     }
 }
 
-/// A press keeps the glow's hand on its row exactly when the seam does.
+/// A press keeps the glow's hand on its row exactly when the seam does. The
+/// engine reads the hand's row (where the last licensed typed echo landed) to
+/// tell a status tick inside a hesitated key's window from that key's echo.
 #[cfg(unix)]
 #[test]
 fn a_press_keeps_the_glow_s_hand_on_its_row_exactly_when_the_seam_does() {
@@ -746,7 +748,10 @@ fn scrolled_back_with_a_selection(app: &mut App, wid: WindowId) -> Arc<Mutex<Ter
     term
 }
 
-/// Selection custody: ⌘-A selects what you are looking at.
+/// Selection custody: ⌘-A selects what you are looking at. The visible rows
+/// are mapped through the live `display_offset` (as the mouse path maps a
+/// click), so Select All while reading history neither snaps to live nor
+/// loses your place.
 #[test]
 fn select_all_selects_the_visible_screen_without_snapping() {
     let mut app = App::headless_for_test();
@@ -784,7 +789,9 @@ fn select_all_selects_the_visible_screen_without_snapping() {
     );
 }
 
-/// Selection custody: ⌘↓ / ⌘↑ are the deliberate return to live.
+/// Selection custody: ⌘↓ / ⌘↑ are the deliberate return to live. Routed as
+/// a `ScrollIntent`, which moves the viewport without snapping and without
+/// clearing, so you return to live with your selection intact.
 #[test]
 fn cmd_arrows_are_the_deliberate_return_to_live() {
     use crate::input::ScrollIntent;
@@ -951,7 +958,14 @@ fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
     }
 }
 
-/// Selection custody: a bare modifier or lock key is inert.
+/// Selection custody: a bare modifier or lock key is inert. No snap, no clear
+/// (Shift's keydown clearing the selection would make shift-click-extend
+/// impossible on macOS), no glide cancel, no blink reset, and no revoked move
+/// licence: Option+Left/Right have no key-time cue, so a word move's sound is
+/// minted when its echo's caret delta is licensed by the press's `nav_hint`,
+/// and macOS delivers `flags_changed` as a synthesized Pressed for
+/// `Named(Alt|Shift|…)`, then `ModifiersChanged` edges as Option is released,
+/// while that echo is in flight.
 #[test]
 fn a_bare_modifier_or_lock_key_is_inert() {
     use aterm_window::keyboard::NamedKey as WNamed;

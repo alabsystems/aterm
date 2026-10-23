@@ -76,7 +76,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Reads the file at `path` or exits with an error.
+/// The file at `path`, or the reason it cannot be read.
 fn read(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }

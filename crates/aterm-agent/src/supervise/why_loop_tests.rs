@@ -58,7 +58,13 @@ fn crosses(item: &Item, door: &str) -> bool {
     matches!(item.record(), Some(EffectRecord::Exchange { door: d, .. }) if d == door)
 }
 
-/// WHY DID IT PRESS 1?
+/// WHY DID IT PRESS 1? — the recorded approval explained from the tape
+/// alone: the judged screen and the box this build reads on it, the facts it
+/// was decided on with the door each came through, the act, its reply, the
+/// journal line; and the decision made again by this build's policy on
+/// those facts agrees with the recorded one, its trace naming the rule that
+/// decided — the very rule the recorded mark names — with nothing needed
+/// that the tape did not hold.
 #[test]
 fn why_explains_a_recorded_approval() {
     let (header, items) = recorded();

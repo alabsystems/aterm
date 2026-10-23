@@ -39,7 +39,8 @@ const TEXT_PEN: &str = "\x1b[39m";
 /// text row; a continuation row holds two blanks there.
 const PROMPT: &str = "\u{276f}\u{a0}";
 
-/// `run1`'s first text row: 86 glyphs on 1-based columns 3..=88.
+/// `run1`'s first text row: 86 glyphs on 1-based columns 3..=88. The Space after
+/// it fits (the caret goes to 90) and the `k` of the next word wraps.
 const LINE1: &str =
     "the quick brown fox jumps over the lazy dog while the rainbow kitty trail follows each";
 /// `run1`'s second text row: 87 glyphs on 1-based columns 3..=89, starting with
@@ -529,7 +530,11 @@ fn a_second_line_that_shares_no_letter_with_the_first_follows_on_both_trees() {
     assert!(h.cells(CARET_ROW).is_empty());
 }
 
-/// Negative control: other text a row up is not followed.
+/// Negative control: other text a row up is not followed. The row the second
+/// line would move to gets different text (its letters rotated by 13): the
+/// band's glyphs are found nowhere, nothing follows, the walk releases the band
+/// (`ribbon_retired=` counts it) and its cohort drains on the caret's row,
+/// while the other text's row never lights.
 #[test]
 fn a_second_wrap_that_writes_other_text_a_row_up_follows_nothing() {
     let mut h = typed_to_the_second_wrap(LINE2);

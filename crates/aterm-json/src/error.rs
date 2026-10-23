@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The one error type for parsing, deserializing and serializing.
-//!
-//! `serde_json` splits its failure modes into categories (`Io`, `Syntax`,
-//! `Data`, `Eof`) that every consumer in this tree collapses back to
-//! `error.to_string()` at the call site. One type, carrying the message and the
-//! 1-based line/column it was raised at, keeps that surface without the split.
 
 use core::fmt;
 
@@ -50,7 +45,6 @@ fn line_col(source: &[u8], at: usize) -> (usize, usize) {
             line = line.saturating_add(1);
             col = 1;
         } else if byte & 0xC0 != 0x80 {
-            // Not a UTF-8 continuation byte, so it starts a character.
             col = col.saturating_add(1);
         }
     }
@@ -58,9 +52,6 @@ fn line_col(source: &[u8], at: usize) -> (usize, usize) {
 }
 
 impl fmt::Display for Error {
-    // `write_str` + a digit writer rather than `write!`: the `format_args!`
-    // expansion calls the unsafe `fmt::Arguments` constructor, which the Trust
-    // model fails closed on. Same text either way.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)?;
         if let Some((line, col)) = self.line_col {
@@ -74,7 +65,6 @@ impl fmt::Display for Error {
 }
 
 fn write_usize(f: &mut fmt::Formatter<'_>, v: usize) -> fmt::Result {
-    // usize is at most 64 bits, so at most 20 decimal digits.
     let mut buf = [0u8; 20];
     let mut v = v;
     let mut i = buf.len();

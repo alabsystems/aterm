@@ -139,7 +139,10 @@ impl OpenTicket {
 /// for the outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ending {
-    /// Done: the Finishing state.
+    /// Done: the Finishing state. The document was at `seq` when the person
+    /// pressed it, a save of it was started (none was needed when its
+    /// checkpoint `from` already covered `seq`), and the view closes once the
+    /// checkpoint covers `seq` ([`App::edit_document_saved`]).
     Finish {
         document: DocumentId,
         seq: Seq,
@@ -1225,7 +1228,10 @@ impl App {
         }
     }
 
-    /// Close Editor view `view`, whose done the checkpoint now covers.
+    /// Close Editor view `view`, whose done the checkpoint now covers. A
+    /// close that does not happen at once (a whole tab whose newer edits are
+    /// being saved first) leaves the view finishing: the next save's landing
+    /// asks again.
     fn close_finished_edit_view(&mut self, view: ViewId) {
         if let Err(why) = self.close_edit_view_in_place(view)
             && self.view_store.get(view).is_some()
@@ -1443,7 +1449,9 @@ impl App {
     }
 }
 
-/// The model's two actions only a mutant enables have no seam to bind.
+/// The model's two actions only a mutant enables have no seam to bind. A
+/// module-level carrier under the anchors' own cfg, not one in the cfg(test)
+/// conformance file, so aterm-models' closure links these waivers too.
 #[cfg(any(test, debug_assertions))]
 #[aterm_spec_anchor::spec_unmodeled(
     machine = "AmacsEditTicket",
@@ -2757,7 +2765,10 @@ mod tests {
         assert_eq!(std::fs::read(&f.path).unwrap(), b"zero\r\none\r\ntwo\r\n");
     }
 
-    /// Abort never throws away unsaved text the edit did not type.
+    /// Abort never throws away unsaved text the edit did not type. The
+    /// person's own view of the file holds unsaved text when the edit opens:
+    /// abort closes only the edit's view, nothing is discarded or written,
+    /// and the person's view keeps it all.
     #[test]
     fn abort_keeps_text_the_edit_did_not_type() {
         let wid = WindowId(0);

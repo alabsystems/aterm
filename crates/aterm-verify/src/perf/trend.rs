@@ -127,7 +127,8 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown-host".to_string())
 }
 
-/// Chip + logical cores, e.g. `Apple-M5-Max-18c`.
+/// Chip + logical cores, e.g. `Apple-M5-Max-18c`. Recorded per row so a wrong
+/// alias claim is DETECTABLE; see [`chip_of`] for what is actually compared.
 fn machine_shape() -> String {
     let chip = if cfg!(target_os = "macos") {
         Command::new("sysctl")
@@ -208,7 +209,7 @@ impl BoxRef {
             BoxRef::Claimed(k) | BoxRef::Unclaimed(k) => k,
         }
     }
-    pub(crate) fn is_claimed(&self) -> bool {
+    pub(crate) const fn is_claimed(&self) -> bool {
         matches!(self, BoxRef::Claimed(_))
     }
 }

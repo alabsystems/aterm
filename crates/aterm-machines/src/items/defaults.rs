@@ -323,6 +323,8 @@ pub fn system_file(sys: &dyn System, path: &Path) -> Result<Option<Stat>, String
 }
 
 /// Accept an empty export of the system domain whose plist `path` exists only if `plutil`
+/// reads that file as an empty dictionary.
+///
 /// # Errors
 /// One line when the file is unreadable or not empty.
 fn confirm_empty(sys: &dyn System, path: &Path, export: &Cmd) -> Result<(), String> {

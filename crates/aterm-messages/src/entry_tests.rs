@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the host-facing entry ([`crate::exceptions`]): the upgrade and Full Disk
-//! Access entries' words and every fault refused where the entry is written.
+//! Host-facing exception entry tests ([`crate::exceptions`]).
 
 use crate::exceptions::{Entry, EntryFault, Family, WHAT_CAP};
 use crate::model::{Intent, Severity, UpgradeWord};
 use crate::need::{Mover, Need, Reason, Resurface, Then, Why};
 
-/// Tab 1, after a day: one entry per kind (no subject), the words the owner reads, the
-/// navigation beside the sentence, the holders behind `Details`.
 fn tab_one() -> Entry {
     Entry::new(
         Family::Upgrade,
         "",
         "own-work",
         "Claude in tab 1 is still on 2.1.283",
-        // The holder that outlives a turn is named, and the action is the one that
-        // ends it.
         Why::OnlyYou(Reason::new(
             "aterm never ends running work, and a job it started 5 h ago (diskwatch.sh) still runs",
         )),
@@ -28,15 +23,12 @@ fn tab_one() -> Entry {
     .more("aterm harness upgrade s-3e79b5bde172ad0088ad --status shows the whole picture")
 }
 
-/// Full Disk Access: one entry, the button that does the action first.
 fn full_disk_access() -> Entry {
     Entry::new(
         Family::Privacy,
         "fda",
         "needed",
         "macOS keeps asking for access",
-        // Stand-ins for aterm-gui's `consent_card::FDA_WHY` / `FDA_THEN` (that crate
-        // depends on this one); the host imports them, it never retypes them.
         Why::OnlyYou(Reason::new("macOS forgets an Allow when aterm updates")),
         Then::press(
             Mover::open_system_pane("full-disk-access"),
@@ -77,9 +69,6 @@ fn the_full_disk_access_entry_leads_with_the_button_that_does_it() {
     assert_eq!(m.detail[1], "turn on aterm in Full Disk Access");
 }
 
-/// Every way to break the rule is refused where the entry is written (the
-/// reason/action word rule itself is the door's:
-/// `need_tests::a_snooze_a_pair_of_actions_or_a_wait_is_no_need`).
 #[test]
 fn every_fault_is_refused_where_the_entry_is_written() {
     let base = |what: &str, why: &str, then: &str| {
@@ -98,7 +87,6 @@ fn every_fault_is_refused_where_the_entry_is_written() {
         "Stop that work",
     );
     assert!(base(ok.0, ok.1, ok.2).message().is_ok());
-    // a title that is a sentence, a clause or too long
     assert!(matches!(
         base("Claude is behind.", ok.1, ok.2).message(),
         Err(EntryFault::What(_))
@@ -112,7 +100,6 @@ fn every_fault_is_refused_where_the_entry_is_written() {
         base(&long, ok.1, ok.2).message(),
         Err(EntryFault::What(_))
     ));
-    // a decline beside the action
     for decline in [
         Intent::AgentUpgrade {
             tab: "s-1".into(),

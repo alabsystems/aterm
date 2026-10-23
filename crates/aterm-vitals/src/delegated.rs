@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Explicit job ownership, independent of the daemon that launched a job.
-//!
-//! The host authenticates registration and supplies kernel process identities.
-//! This ledger never infers ownership of a parent or a sibling. Once observed,
-//! a descendant retains its job across reparenting, for that process lifetime.
+//! Explicit job ownership ledger keyed by kernel process identity.
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,8 +36,7 @@ pub struct Job {
     pub label: String,
 }
 
-/// A retained job membership. Current attribution also requires a matching
-/// kernel identity in the counter reading; a handoff revalidates every key.
+/// A retained job membership binding a process to its job root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Binding {
     /// The member's kernel identity.
@@ -64,8 +59,7 @@ pub enum RegisterError {
     Full,
 }
 
-/// Pure ownership state; kernel reads, authorization and boot checks belong to
-/// the host. A handoff restores only freshly validated process keys.
+/// Pure ownership state mapping registered job roots and observed members.
 #[derive(Clone, Debug, Default)]
 pub struct Ledger {
     jobs: HashMap<ProcessKey, Job>,
@@ -79,8 +73,7 @@ impl Ledger {
         self.jobs.is_empty()
     }
 
-    /// Register an exact root. Repeating the same registration is idempotent;
-    /// an existing process cannot be reassigned to a different tab or label.
+    /// Registers an exact job root idempotently.
     pub fn register(&mut self, job: Job) -> Result<(), RegisterError> {
         if let Some(old) = self.jobs.get(&job.root) {
             return if old == &job {
@@ -104,8 +97,7 @@ impl Ledger {
         jobs
     }
 
-    /// Retained members, including explicitly unavailable prior identities,
-    /// in stable identity order. Unavailable keys cannot prove ancestry.
+    /// Returns retained members in stable identity order.
     #[must_use]
     pub fn bindings(&self) -> Vec<Binding> {
         let mut bindings: Vec<_> = self
@@ -117,8 +109,7 @@ impl Ledger {
         bindings
     }
 
-    /// Restore a member already authenticated and kernel-validated by the host.
-    /// An absent job is never created by a carried member.
+    /// Restores a host-validated member binding for an existing job.
     pub fn restore(&mut self, binding: Binding) -> bool {
         if !self.jobs.contains_key(&binding.root) || self.members.len() >= MAX_MEMBERS {
             return false;
@@ -132,18 +123,12 @@ impl Ledger {
         }
     }
 
-    /// Update from one complete process sweep. Parent hops require identities
-    /// from this sweep and a parent no younger than its child. Explicit nested
-    /// roots win; a previously observed member survives parent exit or setsid.
-    /// Missing and reused identities lose their old membership immediately.
+    /// Updates membership from one complete process sweep.
     pub fn observe(&mut self, processes: &[Process]) -> Vec<Binding> {
         self.observe_with_unavailable(processes, &HashSet::new())
     }
 
-    /// Observe validated identities while retaining prior keys whose current
-    /// identity cannot be read. Unavailable keys create no ownership, never
-    /// enter the parent table, and cannot bridge ancestry to new processes.
-    /// The host must not publish a complete usage reading while any remain.
+    /// Updates membership from `processes` while retaining `unavailable` prior keys.
     pub fn observe_with_unavailable(
         &mut self,
         processes: &[Process],
@@ -183,9 +168,6 @@ impl Ledger {
                 if !path.insert(at.key) {
                     break;
                 }
-                // A previously observed member remains an authenticated
-                // ancestry bridge after its original parent exits. New
-                // children of that still-live member inherit the same job.
                 inherited = inherited.or_else(|| previous.get(&at.key).copied());
                 let Some(parent) = table.get(&at.parent) else {
                     break;
@@ -279,8 +261,6 @@ mod tests {
             retained
         );
         assert_eq!(ledger.jobs().len(), 1);
-        // Even a readable new process at that PID is not the old ancestry
-        // bridge when its key differs. Its child gains no old ownership.
         assert_eq!(
             ledger.observe_with_unavailable(&[p(21, 9, 1), p(23, 10, 21)], &unavailable),
             retained

@@ -396,7 +396,9 @@ pub enum Verdict {
     },
 }
 
-/// Fold one more reading into `found`.
+/// Fold one more reading into `found`. A [`Verdict::Stock`] ends the search (the
+/// answer is a refusal whatever else the line holds); the first
+/// [`Verdict::Escaped`] is kept over [`Verdict::Clean`].
 fn fold(found: &mut Verdict, next: Verdict) -> bool {
     match next {
         Verdict::Stock(_) => {
@@ -517,7 +519,8 @@ fn unread(text: &str) -> Verdict {
     })
 }
 
-/// Remove heredoc bodies — text fed to a command on stdin, not commands.
+/// Remove heredoc bodies — text fed to a command on stdin, not commands. The
+/// operator line stays.
 fn strip_heredocs(cmd: &str) -> (String, Vec<String>) {
     let lines: Vec<&str> = cmd.split('\n').collect();
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
@@ -933,7 +936,8 @@ fn is_assignment(word: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Prefix words that run the command after them.
+/// Prefix words that run the command after them. The value-taking options of
+/// each are listed so the command after them is found, not the option's value.
 fn wrapper_options(word: &str) -> Option<&'static [&'static str]> {
     Some(match word {
         "nohup" | "builtin" | "noglob" | "then" | "do" | "else" | "elif" | "if" | "while"
@@ -968,7 +972,8 @@ fn wrapper_options(word: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-/// Why a segment is (or is not) a stock Rust tool.
+/// Why a segment is (or is not) a stock Rust tool. An unterminated quote is
+/// text the shell itself would refuse, so it is not read as a command.
 fn offending(segment: &str, depth: usize, beside: Beside<'_>) -> Verdict {
     words(segment).map_or(Verdict::Clean, |words| {
         offending_words(&words, depth, beside)
@@ -1148,6 +1153,8 @@ fn is_trust_alias(name: &str) -> bool {
 }
 
 /// The command string of `sh -c '…'` (any flag cluster carrying `c`, e.g.
+/// `-lc`, `-ec`, or `-l -c`), or `None` when the shell runs a script file or
+/// reads stdin — text this reader never sees.
 fn shell_command_string(rest: &[String]) -> Option<&str> {
     let mut saw_c = false;
     let mut i = 0;

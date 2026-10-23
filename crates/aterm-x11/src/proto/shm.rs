@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! MIT-SHM 1.2: a shared-memory segment attached by descriptor (AttachFd) and
-//! an image drawn from it with no pixel bytes on the wire (PutImage), which is
-//! what the X11 CPU presenter draws through. Written against the extension's
-//! protocol description (xcbproto `shm.xml`); bytes held to x11rb-protocol
-//! 0.13.2's (`tests/recorded/`).
-//!
-//! Every request takes the extension's major opcode, which the server assigns
-//! (QueryExtension `MIT-SHM`).
+//! MIT-SHM 1.2 shared-memory segment (`AttachFd`) and image presentation (`PutImage`).
 
 use super::{Drawable, Gcontext, ParseError, Reply, Request, Void, Writer, reply_head};
 
@@ -28,10 +21,7 @@ pub fn detach(major: u8, shmseg: Seg) -> Request<Void> {
     Writer::new(major, 2).u32(shmseg).finish()
 }
 
-/// PutImage (3): draw `src_width` x `src_height` pixels at (`src_x`,
-/// `src_y`) of the `total_width` x `total_height` image at `offset` in the
-/// segment, to (`dst_x`, `dst_y`) of `drawable`. With `send_event` the server
-/// answers with a Completion event once it has read the segment.
+/// PutImage (3): draws a sub-rectangle of the shared-memory image to `drawable`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the request's own fields, in wire order"
@@ -74,8 +64,7 @@ pub fn put_image(
         .finish()
 }
 
-/// AttachFd (6): the descriptor itself travels beside these bytes
-/// (SCM_RIGHTS), which the transport sends with them.
+/// AttachFd (6): attaches the segment descriptor sent via `SCM_RIGHTS`.
 pub fn attach_fd(major: u8, shmseg: Seg, read_only: bool) -> Request<Void> {
     Writer::new(major, 6)
         .u32(shmseg)

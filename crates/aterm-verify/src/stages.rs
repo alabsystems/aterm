@@ -94,7 +94,8 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
 /// The targets both test children select: every target with `test = true` (the libs, the bins and the integration tests that keep the default) and no example ([`test_compile_args`]).
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
-/// The measuring stage's benchmark targets in aterm-conformance.
+/// The measuring stage's benchmark targets in aterm-conformance. Each must
+/// report its complete nonempty matrix ([`decide_measuring_child`]).
 const MEASURING_TARGETS: [&str; 2] = ["paint", "spin"];
 
 /// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin`: the measuring stage's one child, the paint and spin matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames and idle wakes on a live instance.
@@ -546,7 +547,8 @@ pub fn libc_oracle_not_run_reason(run: &exec::Run) -> Option<String> {
     })
 }
 
-/// Run, print what the child said, and decide.
+/// Run, print what the child said, and decide. Returns whether the child ran and
+/// passed.
 fn run_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     run_child(ctx, r, label, cmd, |r, run, label| {
         r.decide_child(run, label)
@@ -575,7 +577,9 @@ fn run_child(
     out.ok
 }
 
-/// [`run_labeled`] for the stages that compile the selected crates.
+/// [`run_labeled`] for the stages that compile the selected crates. An empty
+/// cone never falls through to a bare `targo build`, which would build the
+/// whole workspace under a narrow label: it is a named skip ([`EMPTY_CONE`]).
 fn run_scoped(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) {
     if ctx.scope.selects_nothing() {
         r.skip(format!("{label} {EMPTY_CONE}"));
@@ -675,7 +679,8 @@ fn doc_driver(ctx: &Ctx) -> DocDriver {
     )
 }
 
-/// Would this scope's `targo test` compile any doctests?
+/// Would this scope's `targo test` compile any doctests? Cargo spawns rustdoc
+/// only for lib targets.
 fn scope_compiles_doctests(ctx: &Ctx) -> bool {
     match &ctx.scope {
         Scope::Packages(ps) => ps
@@ -685,7 +690,10 @@ fn scope_compiles_doctests(ctx: &Ctx) -> bool {
     }
 }
 
-/// The rule as a pure truth table.
+/// The rule as a pure truth table. The stage2's own copy outranks everything
+/// (its `RUSTDOC` binding overrides even a caller's export); the caller's export
+/// outranks the PATH walk, as cargo ranks it; the farm link is the fallback for
+/// a stage2 without trustdoc.
 const fn doc_driver_from(
     stage2_has_trustdoc: bool,
     ambient_override: bool,
@@ -768,7 +776,9 @@ pub fn not_run_behind(r: &mut Report, what: &str, because: &str) {
     r.cannot_run(format!("{what} — {because}{NOT_RUN_BEHIND}"));
 }
 
-/// Build what a stage drives, in the main target: `true` when it built.
+/// Build what a stage drives, in the main target: `true` when it built. When it
+/// did not, the build's own row and, behind it, a could-not-run row for `drive`
+/// ([`not_run_behind`]); only one row when the machine refused the build.
 fn build_to_drive(
     ctx: &Ctx,
     r: &mut Report,
@@ -1215,7 +1225,8 @@ pub fn export_cmd(ctx: &Ctx) -> Cmd {
     .term_grace(EXPORT_TERM_GRACE)
 }
 
-/// The `fix:` lines a transcript printed, joined: what a skip row shows.
+/// The `fix:` lines a transcript printed, joined: what a skip row shows. Only
+/// shown, never read for the verdict, which is the exit code.
 fn fixes(transcript: &str) -> Option<String> {
     let fixes: Vec<&str> = transcript
         .lines()
@@ -2241,7 +2252,11 @@ mod tests {
         assert_eq!(doc_driver_from(false, false, false), DocDriver::Absent);
     }
 
-    /// THE DOCTESTS RESOLVE WHAT THE TEST COMPILE RESOLVED.
+    /// THE DOCTESTS RESOLVE WHAT THE TEST COMPILE RESOLVED. Cargo unifies
+    /// features over the packages a command selects, so a doctests argv that
+    /// selected fewer would build units of its own (aterm-core without `serde`,
+    /// and all above it); every scope's doctests select exactly its test
+    /// compile's packages, and the doc driver's stand-in drops the passes.
     #[test]
     fn the_doctests_select_exactly_what_the_test_compile_selects() {
         fn selection(argv: &[String]) -> Vec<String> {
@@ -2383,7 +2398,10 @@ mod tests {
         }
     }
 
-    /// THE STAND-IN RUNS THE FILE CARGO WOULD HAVE RUN, named absolutely.
+    /// THE STAND-IN RUNS THE FILE CARGO WOULD HAVE RUN, named absolutely. With
+    /// no override cargo takes the plain `trustdoc` beside the targo it runs,
+    /// the file a link to it resolves to, before PATH; a bare name the stand-in
+    /// looked up on its own PATH could be another file.
     #[cfg(unix)]
     #[test]
     fn the_stand_in_is_told_the_driver_cargo_resolves() {

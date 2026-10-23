@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! agh.toml's rules (design §6.2–§6.3): the canonical config validates, each fault of L1–L10
-//! is found with the names it carries, several at once in rule order, `drafts_fp`, `~/`
-//! expansion, `config::load`, and `agh policy check` through the CLI.
+//! agh.toml's rules (design §6.2–§6.3).
 
 use std::path::Path;
 
@@ -152,8 +150,6 @@ fn assert_unleaked(text: &str, token: &str) {
 #[test]
 fn l1_never_quotes_a_pasted_token() {
     let token = agh_fake::token("leak");
-    // The prefixed token, and its body alone: an unprefixed (legacy) token has no shape the
-    // Redactor knows, so only the parse's own unquoting keeps it out.
     for pasted_value in [token.as_str(), &token[4..]] {
         for (i, extra) in pasted(pasted_value).iter().enumerate() {
             let found = faults(extra);
@@ -167,15 +163,12 @@ fn l1_never_quotes_a_pasted_token() {
             }
         }
     }
-    // The key a message names stays when it is short and key-shaped.
     let unknown = faults("[profiles.x]\ntier = \"dev\"\nlegacy_loose = true\n");
     assert!(unknown[0].what.contains("`legacy_loose`"), "{unknown:?}");
 }
 
 #[test]
 fn l1_env_must_name_a_variable() {
-    // A legacy token's body pasted as `env` loads as Absent and would be printed as the
-    // row's source; L1 refuses it, and any other text no variable is named by, unquoted.
     let legacy = agh_fake::token("env")[4..].to_string();
     let long = "A".repeat(65);
     for value in [legacy.as_str(), "GH TOKEN", "", "1X", long.as_str()] {
@@ -341,8 +334,6 @@ fn l5_release_reads_a_file() {
 
 #[test]
 fn l6_the_tier_match() {
-    // A dev owner written by the release profile breaks both of L6's write sentences: the
-    // writer's tier differs from the owner's, and a non-release owner names a release writer.
     let found = faults("[[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nwrite = \"release\"\n");
     assert_eq!(rules(&found), ["L6", "L6"], "{found:?}");
     for fault in &found {
@@ -350,7 +341,6 @@ fn l6_the_tier_match() {
             assert!(fault.what.contains(name), "{name} in {found:?}");
         }
     }
-    // An owner tier that does not parse (L1) still meets L6's second write sentence.
     let found =
         faults("[[owners]]\nname = \"fixture-ext\"\ntier = \"prod\"\nwrite = \"release\"\n");
     assert_eq!(rules(&found), ["L1", "L6"], "{found:?}");
@@ -362,8 +352,6 @@ fn l6_the_tier_match() {
         "L6",
         &["owner fixture-dev", "read", "profile release"],
     );
-    // L6's first sentence alone: an external owner written by the dev profile (dev is not
-    // release, so the write sentence stays quiet, and dev has a login, so L8 does too).
     assert_one(
         "[[owners]]\nname = \"fixture-ext\"\ntier = \"external\"\nwrite = \"dev\"\n",
         "L6",
@@ -378,7 +366,6 @@ fn l6_the_tier_match() {
 
 #[test]
 fn l7_disjoint_files_and_logins() {
-    // One (dev, ino) for every file: dev and release name the same file.
     let root = common::scratch("rules-id");
     let same = |_: &Path| Some((1, 1));
     let found = faults_with("", root.path(), &same);
@@ -650,12 +637,10 @@ mod files {
     #[test]
     fn a_pasted_token_is_never_echoed() {
         let token = agh_fake::token("leak");
-        // The body alone stands for an unprefixed (legacy) token.
         for pasted_value in [token.as_str(), &token[4..]] {
             for extra in super::pasted(pasted_value) {
                 let root = common::scratch("check-leak");
                 let dirs = Dirs::under(root.path());
-                // `BASE`, not the canonical file: a case may add `[default]` or `[targets]`.
                 let text = format!("{}\n{extra}", super::fill(super::BASE, root.path()));
                 common::write_config(&dirs, &text);
                 let (exit, stdout, stderr) = check(root.path(), &[]);
@@ -904,8 +889,6 @@ mod files {
             .expect("a remedy");
         let file_text = file.display().to_string();
         assert!(remedy.contains(&format!("{file_text}.new")), "{what}");
-        // The mode the loose file had: its chmod never appears, whatever digits the scratch
-        // path itself holds.
         let bare = remedy.replace(&root.path().display().to_string(), "<root>");
         assert!(!bare.contains("640"), "{what}");
         assert!(

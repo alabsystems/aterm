@@ -5,9 +5,7 @@
 
 use zeroize::Zeroize;
 
-/// Bytes that are a secret (a value, a key, a plaintext): wiped on drop, `Debug` shows only
-/// the length, and there is no `Display`. A move can leave a copy behind on the stack; this
-/// wipes the one the program keeps.
+/// Bytes that are a secret (a value, a key, a plaintext).
 #[derive(Default, PartialEq, Eq)]
 pub struct SecretBytes(Vec<u8>);
 
@@ -73,7 +71,6 @@ impl From<String> for SecretBytes {
 }
 
 /// Read into `bytes`, wiping everything accumulated if the reader fails partway.
-/// Success transfers the bytes to the caller unchanged; callers still impose their cap.
 #[cfg(any(unix, test))]
 pub(crate) fn read_to_end_wiping_on_error(
     mut reader: impl std::io::Read,

@@ -9,13 +9,7 @@
 // enumeration, every read checked; variation sequences dropped.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
-//! The autohinter's character map: which glyph a character names, and every
-//! (character, glyph) pair, for style assignment and the blue-zone and
-//! standard-width characters.
-//!
-//! aterm-font's `Face::glyph_index` (ttf-parser's) tries every Unicode
-//! subtable in turn; skrifa, like FreeType, picks one subtable and reads
-//! only it, so the hinter keeps that rule.
+//! Autohinter character map: single-subtable lookup and enumeration (formats 4, 12, and 13).
 
 use super::GlyphId;
 use core::ops::Range;
@@ -243,8 +237,7 @@ pub(crate) struct Charmap<'a> {
 }
 
 impl<'a> Charmap<'a> {
-    /// The font's charmap; `glyph_count` is `maxp`'s, or `u16::MAX` without
-    /// one.
+    /// Creates a character map from `cmap` with `glyph_count` from `maxp` (or `u16::MAX`).
     pub(crate) fn new(cmap: Option<&'a [u8]>, glyph_count: u32) -> Self {
         let Some(cmap) = cmap.filter(|c| c.len() >= 4) else {
             return Self::default();
@@ -257,7 +250,6 @@ impl<'a> Charmap<'a> {
         const ENCODING_APPLE_ID_UNICODE_32: u16 = 4;
         const ENCODING_APPLE_ID_VARIANT_SELECTOR: u16 = 5;
         const ENCODING_MS_ID_UCS_4: u16 = 10;
-        // MappingKind: None < UnicodeBmp < UnicodeFull < Symbol.
         let mut kind = 0u8;
         let mut chosen = Self {
             glyph_count,
@@ -268,8 +260,6 @@ impl<'a> Charmap<'a> {
             .get(4..)
             .and_then(|d| d.get(..num_tables * 8))
             .unwrap_or_default();
-        // As FreeType: the records in reverse, UCS-4 before UCS-2; as
-        // HarfBuzz, a symbol subtable before all.
         for record in records.as_chunks::<8>().0.iter().rev() {
             let platform = read_u16(record, 0).unwrap_or_default();
             let encoding = read_u16(record, 2).unwrap_or_default();
@@ -283,7 +273,6 @@ impl<'a> Charmap<'a> {
                 | (PLATFORM_WINDOWS, ENCODING_MS_UNICODE_CS) => 1,
                 _ => continue,
             };
-            // A non-nullable offset: 0 does not resolve.
             let offset = read_u32(record, 4).unwrap_or_default() as usize;
             if offset == 0 {
                 continue;
@@ -305,8 +294,7 @@ impl<'a> Charmap<'a> {
         self.subtable.is_some() && self.is_symbol
     }
 
-    /// The glyph for `ch`, never `.notdef`. A symbol subtable also answers
-    /// U+0000..U+00FF from U+F000..U+F0FF, as Windows and HarfBuzz do.
+    /// Maps `ch` to a non-`.notdef` glyph, falling back to `U+F000..=U+F0FF` for symbol subtables.
     pub(crate) fn map(&self, ch: impl Into<u32>) -> Option<GlyphId> {
         let subtable = self.subtable.as_ref()?;
         let codepoint = ch.into();
@@ -322,8 +310,7 @@ impl<'a> Charmap<'a> {
             .map(GlyphId::new)
     }
 
-    /// Every (character, glyph) pair of the subtable but `.notdef`, in
-    /// subtable order.
+    /// Iterates over all non-`.notdef` `(codepoint, glyph)` pairs in subtable order.
     pub(crate) fn mappings(&self) -> Mappings<'a> {
         let inner = match self.subtable {
             Some(Subtable::Format4(cmap4, _)) => {
@@ -393,10 +380,7 @@ impl Iterator for Mappings<'_> {
                     let Some(next_range) = subtable.code_range(*cur_range_ix) else {
                         break None;
                     };
-                    // Segments should be in order and not overlap: never
-                    // start the next before the current end, and never let
-                    // a backwards segment slide the start back (fontations
-                    // issue 1100). The lookup keeps the segment's real start.
+                    // Clamp overlapping/out-of-order segments while keeping `start_code` for lookup (fontations#1100).
                     let start_code = next_range.start as u16;
                     *cur_range =
                         next_range.start.max(cur_range.end)..next_range.end.max(cur_range.end);
@@ -425,7 +409,6 @@ impl Iterator for Mappings<'_> {
                     else {
                         break None;
                     };
-                    // Groups should be in order and not overlap.
                     if next_group.range.start < group.range.end {
                         next_group.range.start = group.range.end;
                     }
@@ -514,7 +497,6 @@ mod tests {
         let cmap = cmap_with(&[(3, 1, bmp.clone()), (3, 10, full.clone())]);
         let map = Charmap::new(Some(&cmap), 100);
         assert_eq!(map.map('A'), Some(GlyphId::new(7)));
-        // 'B' is only in the BMP subtable, which is not read.
         assert_eq!(map.map('B'), None);
         assert_eq!(map.map(0x1F601u32), Some(GlyphId::new(10)));
         let cmap = cmap_with(&[(3, 10, full), (3, 1, bmp)]);
@@ -527,7 +509,6 @@ mod tests {
     /// A symbol subtable wins, and answers Latin-1 from the F0xx block.
     #[test]
     fn symbol_subtable_maps_the_f000_block() {
-        // 0xF041 + 0x0FC4 wraps to glyph 5.
         let sym = format4(&[(0xF041, 0xF041, 0x0FC4)]);
         let bmp = format4(&[(0x41, 0x41, 1)]);
         let cmap = cmap_with(&[(3, 1, bmp), (3, 0, sym)]);
@@ -546,8 +527,6 @@ mod tests {
             .mappings()
             .map(|(c, g)| (c, g.to_u32()))
             .collect();
-        // 0x20 maps to .notdef; 0x30.. maps from 95, cut at glyph 99; the
-        // overlapping group resumes after the previous end (0x35).
         assert_eq!(
             pairs,
             [

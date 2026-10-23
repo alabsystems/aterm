@@ -269,7 +269,10 @@ fn key_event_needs_csi_u(key: &Key, modifiers: Modifiers) -> bool {
     }
 }
 
-/// Encode using the Kitty keyboard protocol.
+/// Encode using the Kitty keyboard protocol. Functional keys with a legacy CSI form (arrows,
+/// Home/End, Insert/Delete, Page Up/Down, F1-F12, KP_BEGIN) keep it in every mode, report-all
+/// included (kitty's encode_function_key, #7474: an arrow release is `ESC[1;1:3A`); the rest
+/// use `CSI unicode [; modifiers [: event-type]] u`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn encode_kitty(
     key: &Key,
@@ -598,7 +601,9 @@ const WIN32_ESCAPE_CHAR: u32 = 0x1b;
 const WIN32_VK_BACK: u32 = 0x08;
 const WIN32_SC_BACK: u32 = 0x0e;
 const WIN32_BACK_CHAR: u32 = 0x08;
-/// `dwControlKeyState` bits (wincon.h).
+/// `dwControlKeyState` bits (wincon.h). The LEFT modifier bits stand for either side: once
+/// winit has canonicalized the chord the host cannot tell them apart, and conhost reports the
+/// same for a modifier it cannot side-attribute.
 const WIN32_SHIFT_PRESSED: u32 = 0x10;
 const WIN32_LEFT_CTRL_PRESSED: u32 = 0x08;
 const WIN32_LEFT_ALT_PRESSED: u32 = 0x02;

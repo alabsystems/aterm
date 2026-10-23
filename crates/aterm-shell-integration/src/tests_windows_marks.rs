@@ -30,7 +30,13 @@ struct ExitStep {
 #[cfg(windows)]
 const CONTROL_C_EXIT: &str = "-1073741510";
 
-/// The lines, in order, and what each must report.
+/// The lines, in order, and what each must report. A cmdlet failure after a native one is
+/// 1, not the native code `$LASTEXITCODE` still holds (the stale code reported 7 for every
+/// row after the first until a native command succeeded; measured 2026-10-17 on pwsh 7.6.7
+/// and Windows PowerShell 5.1); the same native failure twice is that code twice, whatever
+/// error records the native program left; a line Ctrl+C stopped is STATUS_CONTROL_C_EXIT,
+/// the code `ping` stopped by Ctrl+C exits with, whatever native code came before it; a
+/// lone comment, which runs nothing, is 0; and a line that does not parse is 1.
 #[cfg(windows)]
 const EXIT_STEPS: &[ExitStep] = &[
     ExitStep {

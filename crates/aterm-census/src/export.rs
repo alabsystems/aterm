@@ -2,34 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! What the export does to the checkout's text before the publication engine's
-//! content guard reads it, defined once: which files it selects ([`Selection`],
-//! `publish/manifest.txt` beside the engine's central denies) and how the
-//! transforms rewrite each text file ([`rewrite`]). aterm-release's transforms
-//! (`ship hook transforms`) run the rewrite over every export; the census's
-//! `export-content` guard runs both over the checkout, so a line the engine
-//! would refuse is a finding before anything is pushed.
+//! Export file [`Selection`] and text [`rewrite`] transforms for publication content guards.
 
 use aterm_regex::Regex;
 
 /// The export's allowlist, relative to the checkout.
 pub const MANIFEST: &str = "publish/manifest.txt";
 
-/// The top-level paths the engine withholds from every export whatever a
-/// manifest says (its `baseline/path-deny.txt`; the manifest's header names them).
+/// The top-level paths the engine withholds from every export whatever a manifest says.
 pub const CENTRAL_DENY: &[&str] = &["docs", "publish", ".github"];
 
-/// The export's file selection: `git ls-files` over the manifest's lines as
-/// pathspecs, a `!` line an exclusion, the central denies excluded too.
-///
-/// A literal pathspec selects itself and every path under it; one holding `*`
-/// or `?` matches the whole path, `*` crossing `/` (git's default pathspec
-/// magic, measured: `!vendor/*/.github` excludes no file under a `.github`).
-/// `.` (or `./.`, `././`) names the whole checkout, and excluding it excludes
-/// it all. The engine strips one leading `./` from a line and refuses one that
-/// leaves nothing (a bare `!`; git refuses the empty pathspec of a `./`); so
-/// does this. It also refuses a manifest that selects no file, which only the
-/// checkout can say: the `export-content` guard holds that.
+/// The export's file selection.
 #[derive(Debug)]
 pub struct Selection {
     include: Vec<Spec>,
@@ -93,13 +76,7 @@ fn under(rel: &str, spec: &str) -> bool {
 }
 
 impl Selection {
-    /// The manifest's lines (`#` to the end of a line is a comment). `Err` names
-    /// the 1-based line of a pathspec this reading cannot follow or the engine
-    /// refuses.
-    ///
-    /// # Errors
-    /// A line holding an absolute path, class, escape or git magic, or nothing
-    /// once its `./` is stripped.
+    /// Parses the manifest's lines (`#` to the end of a line is a comment).
     pub fn parse(manifest: &str) -> Result<Self, (usize, String)> {
         let mut include = Vec::new();
         let mut exclude: Vec<Spec> = CENTRAL_DENY
@@ -115,7 +92,6 @@ impl Selection {
                 Some(body) => (true, body.trim()),
                 None => (false, line),
             };
-            // the engine's reading: one `./` stripped, the rest handed to git
             let spec = text.strip_prefix("./").unwrap_or(text);
             if spec.is_empty() {
                 return Err((
@@ -136,8 +112,7 @@ impl Selection {
         Ok(Self { include, exclude })
     }
 
-    /// Every path outside the central denies: what a checkout without a
-    /// manifest (a public snapshot, which withholds `publish/`) publishes.
+    /// Every path outside the central denies.
     #[must_use]
     pub fn everything() -> Self {
         Self::parse("*").unwrap_or_else(|_| unreachable!("`*` is a pathspec this reads"))
@@ -149,10 +124,6 @@ impl Selection {
         self.include.iter().any(|s| s.matches(rel)) && !self.exclude.iter().any(|s| s.matches(rel))
     }
 }
-
-// Each needle is spelled in halves: written whole, the export's own rewrite would
-// change it in the exported copy of this file, and the account word would trip the
-// export's guard (publish/forbidden-extra.txt).
 
 /// The developer account the export renames.
 const ACCOUNT: &str = concat!("aya", "tes");
@@ -180,21 +151,13 @@ fn replace_all(text: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The export's text rewrites, in order, over one file's bytes: the private org
-/// becomes the public one, and developer homes are anonymized to exactly the
-/// guards' shapes — nothing wider: a bare `/Users/` is behaviour (relocate.rs's
-/// machine-local prefix) and ships as written. Line breaks are never touched, so
-/// a rewritten line is the line of the same number.
+/// The export's text rewrites.
 #[must_use]
 pub fn rewrite(text: &[u8]) -> Vec<u8> {
     let home = format!("/Users/{ACCOUNT}");
     let at = format!("{ACCOUNT}@");
-    // the public org, never the private one
     let mut t = replace_all(text, PRIVATE_ORG.as_bytes(), b"alabsystems");
-    // the developer's home becomes an example one
     t = replace_all(&t, home.as_bytes(), b"/Users//example");
-    // every /Users/<letter> gets a doubled separator: still an absolute macOS Users
-    // path, but no account the central guard's `/Users/[A-Za-z]` can name
     let mut doubled = Vec::with_capacity(t.len());
     let mut i = 0;
     while i < t.len() {
@@ -208,7 +171,6 @@ pub fn rewrite(text: &[u8]) -> Vec<u8> {
     }
     t = replace_all(&doubled, TILDE_TRUST.as_bytes(), b"$HOME/trust");
     t = replace_all(&t, TILDE_CLEAN.as_bytes(), b"$HOME/clean");
-    // the account written without a /Users/ prefix (a prompt captured as bytes)
     replace_all(&t, at.as_bytes(), b"user@")
 }
 
@@ -238,18 +200,13 @@ mod tests {
         case(format!("{TILDE_TRUST}/build"), "$HOME/trust/build");
         case(format!("{TILDE_CLEAN}/bin"), "$HOME/clean/bin");
         case(format!("b\"{acct}@mac ~ % \""), "b\"user@mac ~ % \"");
-        // a bare "/Users/" is behaviour (relocate.rs's machine-local prefix): as written
         case(
             "path.starts_with(\"/Users/\")".into(),
             "path.starts_with(\"/Users/\")",
         );
-        // the version is not a rewrite: a patch slot other than 0 reaches the engine
         case("version = \"0.104.7\"".into(), "version = \"0.104.7\"");
     }
 
-    /// The selection reads pathspecs as git does: a literal is itself and what
-    /// lies under it, a wildcard the whole path with `*` crossing `/`, and the
-    /// central denies win over any allowlist line.
     #[test]
     fn the_selection_reads_the_manifest_as_git_reads_pathspecs() {
         let s = Selection::parse(
@@ -270,7 +227,6 @@ mod tests {
             ("crates/x/s2_01.toml", false),
             ("crates/x/s2_011.toml", true),
             ("vendor/y/.github", false),
-            // git's own answer (measured): a wildcard matches no file under it
             ("vendor/y/.github/w.yml", true),
             ("publish/manifest.txt", false),
             ("tools/install.sh", false),
@@ -311,9 +267,6 @@ mod tests {
         );
     }
 
-    /// A line the engine refuses is refused at that line, never read as the
-    /// whole checkout: one empty once its one `./` is stripped (a bare `!` the
-    /// engine refuses, an empty pathspec git refuses).
     #[test]
     fn a_line_the_engine_refuses_is_refused() {
         for (manifest, line) in [
@@ -329,9 +282,6 @@ mod tests {
                 "{manifest:?}"
             );
         }
-        // these parse, each line naming something once one `./` is stripped;
-        // whether one selects a file (the engine refuses one that selects none)
-        // is the checkout's to say, and the guard's to hold
         for manifest in [
             "crates\n!.\n",
             "crates\n!././\n",

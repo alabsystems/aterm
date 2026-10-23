@@ -236,6 +236,8 @@ fn in_target_dir(path: &str) -> bool {
 }
 
 /// astream's root manifest as the export writes it: the `[workspace]` table's `members`
+/// emptied and its `default-members` dropped, every other byte as committed.
+///
 /// # Errors
 /// The manifest has no `[workspace]` table, an array in it does not close, or the result
 /// does not parse with empty members.

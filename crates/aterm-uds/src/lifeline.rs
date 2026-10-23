@@ -308,7 +308,8 @@ unsafe extern "C" {
     fn mkfifo(path: *const std::ffi::c_char, mode: Mode) -> i32;
 }
 
-/// `mode_t`: 16 bits on Darwin, 32 on Linux.
+/// `mode_t`: 16 bits on Darwin, 32 on Linux. The width matters: Apple's arm64
+/// convention has the caller extend a sub-word argument.
 #[cfg(target_vendor = "apple")]
 type Mode = u16;
 #[cfg(not(target_vendor = "apple"))]

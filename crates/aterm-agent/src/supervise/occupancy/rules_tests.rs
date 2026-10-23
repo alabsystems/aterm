@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The built-in rules' decider, by tables: when each is due, what its caps and the pace leave,
-//! and which guard holds it — every guard with its negative control, the same break with nothing
-//! holding.
+//! Tests for the built-in occupancy rules decider.
 
 use super::super::reading::SlotsSeen;
 use super::*;
@@ -105,7 +103,6 @@ fn a_declared_hold_gets_no_nudge_but_hold_room_still_goes() {
     let v = decide(&room(), declared, &b, &cruise(), HOLD_ROOM_AFTER_MS);
     assert_eq!(v[RuleId::WaitNudge.index()].1, Verdict::Quiet);
     assert!(is_due(&v[RuleId::HoldRoom.index()].1, RuleId::HoldRoom));
-    // NEGATIVE CONTROL: the same hold undeclared is nudged.
     let v = decide(&room(), hold(), &b, &cruise(), WAIT_NUDGE_AFTER_MS);
     assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
 }
@@ -158,7 +155,6 @@ fn three_nudges_a_day_then_spent() {
         ),
         Verdict::Spent
     );
-    // NEGATIVE CONTROL: once the first is a day old, the cap has room again.
     let late = DAY_MS + WAIT_NUDGE_AFTER_MS;
     assert!(is_due(
         &verdict(
@@ -195,7 +191,6 @@ fn hold_room_goes_two_hours_apart_four_a_hold() {
     }
     assert_eq!(b.this_hold(RuleId::HoldRoom), 4);
     assert_eq!(at(&b, 20 * HOUR), Verdict::Spent);
-    // NEGATIVE CONTROL: the next hold has its own four.
     let next = Some(HoldSeen {
         since_ms: 21 * HOUR,
         declared: true,
@@ -256,7 +251,6 @@ fn each_guard_holds_a_due_line() {
     let b = Books::default();
     let now = WAIT_NUDGE_AFTER_MS;
     let at = |g: Guards| verdict(RuleId::WaitNudge, &r, hold(), &b, &g, now);
-    // NEGATIVE CONTROL: nothing holds.
     assert!(is_due(&at(cruise()), RuleId::WaitNudge));
     let cases: [(Guard, SetGuard); 17] = [
         (Guard::Stall, |g| g.brake = Some(Guard::Stall)),
@@ -274,7 +268,6 @@ fn each_guard_holds_a_due_line() {
         (Guard::Reach, |g| g.reach_down = true),
         (Guard::Autopilot, |g| g.mode = Autopilot::Land),
         (Guard::Autopilot, |g| g.mode = Autopilot::Off),
-        // The first that holds is the one said.
         (Guard::Stall, |g| {
             g.person = true;
             g.brake = Some(Guard::Stall);
@@ -304,7 +297,6 @@ fn a_spent_cap_is_said_before_a_guard() {
         verdict(RuleId::HoldRoom, &room(), hold(), &b, &g, 20 * HOUR),
         Verdict::Spent
     );
-    // Said spent with no board at all: a cap needs no reading.
     assert_eq!(
         verdict(
             RuleId::HoldRoom,
@@ -322,7 +314,6 @@ fn a_spent_cap_is_said_before_a_guard() {
 /// end, and at most one is due at a break — the second waits a whole pace behind it.
 #[test]
 fn the_session_pace_holds_a_second_line() {
-    // The nudge went at 1h50m (a hold declared late, say): hold-room at 2h is paced to 2h10m.
     let b = nudged_at(HOUR + 50 * MIN);
     let at = |ms| verdict(RuleId::HoldRoom, &room(), hold(), &b, &cruise(), ms);
     assert_eq!(
@@ -332,7 +323,6 @@ fn the_session_pace_holds_a_second_line() {
         }
     );
     assert!(is_due(&at(2 * HOUR + 10 * MIN), RuleId::HoldRoom));
-    // Both due at one break (a loop first reached at 2h): the nudge goes, hold-room waits.
     let v = decide(&room(), hold(), &Books::default(), &cruise(), 2 * HOUR);
     assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
     assert_eq!(

@@ -16,6 +16,7 @@ fn renderer_px(px: f32) -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
+/// Render through the warm damage cache, assert byte-identity against a fresh
 /// full repaint of the same input, and return `(outcome, repainted_rows)`.
 fn render_both(
     warm: &mut Renderer,
@@ -44,6 +45,10 @@ fn render_both(
     (outcome, painted)
 }
 
+/// A bottom-pinned flood at 1/2/4/8/16 lines per frame repaints the exposed
+/// rows plus the overshoot apron, never the screen, and every frame is
+/// byte-identical to a full repaint. Swept over px because the seam geometry
+/// (`cell_h` parity, glyph overshoot) decides when a shift is unsound (13/14 px
 /// are the seam-hazard sizes, as in `scroll_blit.rs`).
 #[test]
 fn bottom_pinned_flood_repaints_the_exposed_strip_not_the_screen() {
@@ -92,6 +97,8 @@ fn bottom_pinned_flood_repaints_the_exposed_strip_not_the_screen() {
     }
 }
 
+/// The bar is periodic on purpose: with every row phase-sensitive and an odd
+/// shift nothing is left to blit, `render_core` declines the memmove, and the
 /// test would be vacuous.
 #[test]
 fn flood_with_shade_and_overshoot_content_is_byte_exact() {
@@ -140,6 +147,8 @@ fn flood_with_shade_and_overshoot_content_is_byte_exact() {
     }
 }
 
+/// A status line rewritten in place at viewport row 3 while the bottom floods:
+/// the shift-aware plan marks that row and the two above it (whose blitted
 /// copies carry its old upward overshoot), byte-identical to a full repaint.
 #[test]
 fn a_changed_row_mid_screen_rides_the_flood_byte_exact() {
@@ -265,9 +274,11 @@ fn rigid_and_diff_agree_except_on_a_changed_retained_row() {
     );
 }
 
+/// How a case lays the card line's ink and star for the frame `k` lines into
 /// the flood: the line's row then, and the row and column the overlays sit on.
 type Overlay = fn(usize, usize) -> (Vec<InkCell>, Vec<WordDecoration>);
 
+/// The ink of an 8-cell word starting at column 2 of `row` (a gradient), in
 /// colour family `tone`.
 fn word_ink(row: usize, tone: u8) -> Vec<InkCell> {
     (0..8)
@@ -279,6 +290,7 @@ fn word_ink(row: usize, tone: u8) -> Vec<InkCell> {
         .collect()
 }
 
+/// The star leading the line on `row`, its sprite in the row's own band
 /// (`dy` 0) unless `dy` says otherwise.
 fn star(row: usize, col: u16, dy: i8) -> WordDecoration {
     WordDecoration {
@@ -293,6 +305,9 @@ fn star(row: usize, col: u16, dy: i8) -> WordDecoration {
     }
 }
 
+/// The negative controls are mutations (run by hand, recorded in the lane
+/// report): dropping `row_overlays_differ_shifted` from the `Diff` arm of
+/// `scroll_shift_plan` fails "held" (the slid ink where the frame draws none),
 /// and dropping its decoration half fails "star moves".
 #[test]
 fn ink_and_an_in_band_star_ride_the_flood() {
@@ -381,6 +396,8 @@ fn ink_and_an_in_band_star_ride_the_flood() {
     }
 }
 
+/// The negative control is a mutation (run by hand, recorded in the lane
+/// report): dropping `row_overlays_differ_shifted` from the `Rigid` check of
 /// `scroll_shift_plan` plans the held case.
 #[test]
 fn the_rigid_plan_refuses_overlays_that_stay_on_their_row() {

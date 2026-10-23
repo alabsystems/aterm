@@ -235,7 +235,8 @@ pub struct ObjcSuper {
 
 #[link(name = "objc")]
 unsafe extern "C-unwind" {
-    /// Declared with no parameter list on purpose.
+    /// Declared with no parameter list on purpose. Every call goes through
+    /// [`msg`], which casts it to the exact prototype of the selector.
     fn objc_msgSend();
     /// Same discipline as [`objc_msgSend`], but the first argument is a
     /// `*const ObjcSuper` rather than the receiver.

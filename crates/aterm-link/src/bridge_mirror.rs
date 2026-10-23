@@ -42,7 +42,10 @@ pub(super) enum Outcome {
 }
 
 impl Outcome {
-    /// What came of the slot is final for the batch's landing.
+    /// What came of the slot is final for the batch's landing. A collided
+    /// slot's is not: its record is not on the bus until its re-pin is sent,
+    /// and a batch landed past it would move the endpoint's cursor over a
+    /// hole nobody said.
     const fn concluded(self) -> bool {
         !matches!(self, Outcome::Owed | Outcome::Sending | Outcome::Collided)
     }

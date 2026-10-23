@@ -933,7 +933,12 @@ mod tests {
         words
     }
 
-    /// M-f / M-b find the words a double-click selects.
+    /// M-f / M-b find the words a double-click selects. They used to call a word
+    /// any run of grapheme clusters that START with a letter, so a cluster led by
+    /// a prepended number sign (`۝١`) was no word, and a ZWJ or ZWNJ, which joins
+    /// the cluster before it, welded `foo` and `bar` into one word where a
+    /// double-click (and the find field) see two: an invisible character must not
+    /// weld two words together.
     #[test]
     fn word_motion_finds_the_words_a_double_click_selects() {
         for word in [

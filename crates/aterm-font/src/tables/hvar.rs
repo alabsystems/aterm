@@ -5,16 +5,14 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Horizontal Metrics Variations Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/hvar) implementation.
+//! Horizontal Metrics Variations Table (`HVAR`) implementation.
 
 use crate::delta_set::DeltaSetIndexMap;
 use crate::parser::{Offset, Offset32, Stream};
 use crate::var_store::ItemVariationStore;
 use crate::{GlyphId, NormalizedCoordinate};
 
-/// A [Horizontal Metrics Variations Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/hvar).
+/// A Horizontal Metrics Variations Table (`HVAR`).
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
     data: &'a [u8],
@@ -57,10 +55,6 @@ impl<'a> Table<'a> {
         let (outer_idx, inner_idx) = if let Some(offset) = self.advance_width_mapping_offset {
             DeltaSetIndexMap::new(self.data.get(offset.to_usize()..)?).map(glyph_id.0 as u32)?
         } else {
-            // 'If there is no delta-set index mapping table for advance widths,
-            // then glyph IDs implicitly provide the indices:
-            // for a given glyph ID, the delta-set outer-level index is zero,
-            // and the glyph ID is the delta-set inner-level index.'
             (0, glyph_id.0)
         };
 

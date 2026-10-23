@@ -176,7 +176,8 @@ pub fn under(path: &Path, dir: &Path, table: Option<&Table>) -> Option<bool> {
     }
 }
 
-/// Are `a` and `b` one path, by [`under`] both ways?
+/// Are `a` and `b` one path, by [`under`] both ways? `None`: either way
+/// cannot be placed.
 fn same_path(a: &Path, b: &Path, table: Option<&Table>) -> Option<bool> {
     Some(under(a, b, table)? && under(b, a, table)?)
 }

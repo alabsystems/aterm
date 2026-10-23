@@ -2,15 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Driving tools/install.sh from a test.
-//!
-//! Library calls run in ONE bash per batch ([`Lib`]): the script sourced in its
-//! library mode, and each call's status, stdout, stderr and named globals
-//! written as one record, with no fork per call. Whole-script runs ([`installer`])
-//! get a scratch HOME and a PATH of the stubs a case names. Every child is
-//! started by `aterm_uds::spawnfd::command` and held to [`HANG`], past which
-//! its process group is SIGKILLed: a whole-script run to [`HANG`] in all, a
-//! batch to [`HANG`] without a call returning (a batch of thousands of calls
-//! may honestly outlast a minute on a loaded machine; one call never does).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,15 +17,11 @@ pub const HANG: Duration = Duration::from_secs(60);
 /// on PATH (`command -v`, and its walk of PATH's dirs for a `targo`).
 const TOOLCHAIN: [&str; 5] = ["cargo", "rustc", "rustup", "targo", "alab-targo"];
 
-/// The system dirs every run's PATH ends with: `/usr/bin:/bin`, unless one of
-/// them holds a [`TOOLCHAIN`] program — a distribution's rustup puts `cargo`,
-/// `rustc` and `rustup` in `/usr/bin`, as on the Linux lane — when it is one
-/// folder under [`scratch_root`] linking every other program of theirs, so a
-/// case that hands the installer no toolchain hands it none on any host. Made
-/// once, whole, then renamed into place: test processes share it. It is named
-/// by the two dirs' modification times, which a program installed or removed
-/// moves, so a view made before the lane provisioned again (zsh and fish land
-/// in `/usr/bin`) is never the one a later run finds.
+/// The system dirs every run's PATH ends with: `/usr/bin:/bin`, unless one of them holds a
+/// [`TOOLCHAIN`] program — a distribution's rustup puts `cargo`, `rustc` and `rustup` in
+/// `/usr/bin`, as on the Linux lane — when it is one folder under [`scratch_root`] linking every
+/// other program of theirs, so a case that hands the installer no toolchain hands it none on any
+/// host.
 pub fn system_path() -> &'static str {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
@@ -68,7 +55,6 @@ pub fn system_path() -> &'static str {
                     std::os::unix::fs::symlink(entry.path(), at).expect("a system program's link");
                 }
             }
-            // Another process may have put its own in place first: that one stands.
             if std::fs::rename(&part, &view).is_err() {
                 let _ = std::fs::remove_dir_all(&part);
             }
@@ -127,8 +113,8 @@ pub fn q(s: &str) -> String {
     quoted
 }
 
-/// Whether curl's `argv` follows redirects: `L` in any short-option cluster
-/// (`-L`, `-sSIL`) or `--location` in either spelling.
+/// Whether curl's `argv` follows redirects: `L` in any short-option cluster (`-L`, `-sSIL`) or
+/// `--location` in either spelling.
 pub fn follows_redirects(argv: &[&str]) -> bool {
     argv.iter().any(|arg| match arg.strip_prefix("--") {
         Some(long) => long.starts_with("location"),
@@ -143,13 +129,8 @@ pub fn s(path: &Path) -> &str {
     path.to_str().expect("scratch paths are UTF-8")
 }
 
-/// Where every [`Scratch`] is made: the target dir, unless the Linux verifier
-/// would refuse a store below it. A scratch dir is `0700`, so it shields the
-/// stores laid in it; the chain ABOVE it must pass on its own, and /tmp
-/// (world-writable) never does. A checkout another account can write — cloned
-/// under a umask of 002 into a group other accounts share — falls back to
-/// `$XDG_RUNTIME_DIR` when that is this user's own private directory, so
-/// the outcome never depends on the umask the checkout was made under.
+/// Where every [`Scratch`] is made: the target dir, unless the Linux verifier would refuse a store
+/// below it.
 pub fn scratch_root() -> &'static Path {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
@@ -177,10 +158,8 @@ pub fn scratch_root() -> &'static Path {
     })
 }
 
-/// A scratch directory, removed on drop, named by its PHYSICAL path (the
-/// spelling `pwd -P` and the installer's own probes print). It lives under
-/// [`scratch_root`]: the Linux verifier refuses a store under a world-writable
-/// ancestor such as /tmp.
+/// A scratch directory, removed on drop, named by its PHYSICAL path (the spelling `pwd -P` and the
+/// installer's own probes print).
 pub struct Scratch {
     _dir: aterm_tempfile::TempDir,
     path: PathBuf,
@@ -224,9 +203,9 @@ impl Scratch {
         file
     }
 
-    /// An executable stand-in at `rel` whose body names no per-test path, so
-    /// every caller shares one inode and only the first exec on the machine
-    /// waits on the system's code assessment (`aterm_tempfile::stand_in`).
+    /// An executable stand-in at `rel` whose body names no per-test path, so every caller shares
+    /// one inode and only the first exec on the machine waits on the system's code assessment
+    /// (`aterm_tempfile::stand_in`).
     pub fn stand_in(&self, rel: &str, body: &str) -> PathBuf {
         let file = self.join(rel);
         if let Some(parent) = file.parent() {
@@ -331,10 +310,9 @@ impl Scratch {
     }
 }
 
-/// The environment of a whole-script run, nothing inherited: the scratch
-/// HOME and TMPDIR, zsh, the system PATH, the app destination inside HOME
-/// (never the machine's /Applications), and the toolset half off (its
-/// `aterm pkg` would reach the network) — then `extra` on top, by key.
+/// The environment of a whole-script run, nothing inherited: the scratch HOME and TMPDIR, zsh, the
+/// system PATH, the app destination inside HOME (never the machine's /Applications), and the
+/// toolset half off (its `aterm pkg` would reach the network) — then `extra` on top, by key.
 pub fn hermetic(home: &Home, extra: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
         ("HOME".into(), s(&home.home).into()),
@@ -364,8 +342,8 @@ pub fn installer(script: &Path, home: &Home, extra: &[(&str, &str)], args: &[&st
     run(&mut cmd)
 }
 
-/// A shell pipeline `code` run by `/bin/sh -c` in exactly `env`, for the cases
-/// whose subject is what arrives on the installer's stdin.
+/// A shell pipeline `code` run by `/bin/sh -c` in exactly `env`, for the cases whose subject is
+/// what arrives on the installer's stdin.
 pub fn sh(code: &str, env: &[(&str, &str)]) -> Run {
     let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
     cmd.arg("-c").arg(code).env_clear();
@@ -429,16 +407,14 @@ impl Lib {
         self
     }
 
-    /// Shell code run at this point, unrecorded; a failure ends the batch. It is
-    /// one tick of the batch's progress, as a call is; a step that walks a corpus
-    /// ticks at every item (`__tick`), or the hang detector times the corpus.
+    /// Shell code run at this point, unrecorded; a failure ends the batch.
     pub fn step(&mut self, code: impl Into<String>) -> &mut Self {
         self.items.push(Item::Step(code.into()));
         self
     }
 
-    /// Shell code run at this point in the batch's own shell (globals it sets
-    /// persist), recorded with the named globals. Returns its record's index.
+    /// Shell code run at this point in the batch's own shell (globals it sets persist), recorded
+    /// with the named globals.
     pub fn call(&mut self, code: impl Into<String>, vars: &[&str]) -> usize {
         self.items.push(Item::Call(
             code.into(),
@@ -489,11 +465,6 @@ impl Lib {
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
-        // THE HANG DETECTOR TIMES PROGRESS, NOT THE BATCH: every call appends
-        // its record as it returns, and the source and every step a tick, so
-        // nothing that has not grown for HANG is a call, a step or the source
-        // that never returned. A batch of thousands of calls runs as long as
-        // they keep returning.
         let (records, ticks) = (dir.join("records"), dir.join("progress"));
         let len = |file: &Path| std::fs::metadata(file).map_or(0, |m| m.len());
         let mut grown = || len(&records) + len(&ticks);
@@ -541,7 +512,6 @@ fn parse_record(record: &str, code: &str) -> Rec {
     };
     for field in record.split('\u{1e}').filter(|f| !f.is_empty()) {
         let (key, value) = field.split_once('\u{1f}').expect("a key and a value");
-        // As `$(…)` reads it: trailing newlines dropped.
         let value = value.trim_end_matches('\n').to_string();
         match key {
             "rc" => rec.rc = value.parse().expect("a status"),

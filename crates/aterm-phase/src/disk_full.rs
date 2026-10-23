@@ -28,7 +28,8 @@ impl Code {
 pub enum Source {
     /// The pinned notification (`wall.disk_full`).
     Notification,
-    /// A tool's output row (`wall.disk_full.tool`).
+    /// A failed command's output (`wall.disk_full.tool` and its kin, or
+    /// [`TOOL_HEAD_BEFORE_2_1_309`]).
     ToolOutput,
     /// A goal cleared by it (`wall.disk_full.goal`).
     GoalCleared,
@@ -152,34 +153,116 @@ fn code_in(text: &str) -> Option<Code> {
     }
 }
 
-/// A tool's output row: `  ⎿  <anchor> …` at column two (`vendor`: above
-/// the composer, where only the vendor's `⎿` row counts), or the anchor
-/// opening a segment under it.
+/// The head 2.1.302 through 2.1.308 drew on a failed command's lost output
+/// (`Command output was lost: the temp filesystem at <dir> is full …`);
+/// 2.1.309 draws the `wall.disk_full.tool*` heads instead. Kept off the
+/// anchor table, which holds the store build to every literal it lists.
+pub const TOOL_HEAD_BEFORE_2_1_309: &str = "Command output was lost: the temp filesystem at";
+
+/// The vendor's result row opens with `⎿` at column two; its text follows
+/// after white space (2.1.309 draws a space and a no-break space, U+00A0,
+/// MEASURED: every `⎿` row of `prompt::fixtures::TOOL_DISK_FULL_2_1_309`).
+const RESULT_GLYPH: &str = "  ⎿";
+
+/// The indent of a result's rows under its `⎿` row: five columns.
+const RESULT_BODY: &str = "     ";
+
+/// What a failed command's `⎿` row opens with before its exit line
+/// (`⎿  Error: Exit code 1`, MEASURED: `prompt::fixtures::TOOL_DISK_FULL_2_1_309`);
+/// the exit line itself is the bundle's `wall.disk_full.tool_exit`, then
+/// the code.
+const FAILED_RESULT: &str = "Error: ";
+
+/// The most rows a tool's notice is joined from: its head row and the rows
+/// it wraps onto. 2.1.309's statfs form takes four at 144 columns
+/// (MEASURED); rewrapped as Ink wraps it, each of the four forms with a
+/// directory as long as the measured one (`/private/tmp/claude-` and a
+/// three-digit uid) reaches its directory phrase within these rows down to
+/// a 40-column pane, where the quota form (the longest before its phrase)
+/// ends it on its fifth row (`a_narrow_panes_notice_reads_across_its_wrap`).
+const TOOL_NOTICE_ROWS: usize = 6;
+
+/// The text of a vendor's result row ([`RESULT_GLYPH`], then white space),
+/// or `None` for any other row.
+fn result_row(row: &str) -> Option<&str> {
+    let rest = row.strip_prefix(RESULT_GLYPH)?;
+    let text = crate::text::trim_start(rest);
+    (rest.is_empty() || text.len() < rest.len()).then_some(text)
+}
+
+/// Whether `row` is a failed command's exit line: the vendor's `⎿` row
+/// reading `Error: Exit code <n>` and nothing more (the row trimmed, the
+/// anchor's closing space leaves no empty code).
+fn exit_row(row: &str) -> bool {
+    let exit = const { crate::anchors::anchor_text("wall.disk_full.tool_exit") };
+    result_row(crate::text::trim_end(row))
+        .and_then(|t| t.strip_prefix(FAILED_RESULT))
+        .and_then(|t| t.strip_prefix(exit))
+        .is_some_and(|code| code.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The text a tool's result opens with on row `i`: the vendor's `⎿` row at
+/// column two, or the row right under a failed command's exit line
+/// ([`exit_row`]), five columns in: that command's first line of output.
+/// What the text must open with is the caller's (`tool_output`'s heads,
+/// none of which opens with white space).
+fn result_head(rows: &[String], i: usize) -> Option<&str> {
+    let row = crate::text::trim_end(&rows[i]);
+    if let Some(text) = result_row(row) {
+        return Some(text);
+    }
+    let text = row.strip_prefix(RESULT_BODY)?;
+    i.checked_sub(1)
+        .is_some_and(|above| exit_row(&rows[above]))
+        .then_some(text)
+}
+
+/// A tool's disk-full notice opening row `i`: where a tool's result opens
+/// (`vendor`: above the composer, [`result_head`]), or opening a segment of
+/// a footer row under it. A 2.1.309 head counts only with its directory
+/// phrase in the notice's rows.
 fn tool_output(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
-    let anchor = const { crate::anchors::anchor_text("wall.disk_full.tool") };
+    let heads = [
+        const { crate::anchors::anchor_text("wall.disk_full.tool") },
+        const { crate::anchors::anchor_text("wall.disk_full.tool_inodes") },
+        const { crate::anchors::anchor_text("wall.disk_full.tool_quota") },
+        TOOL_HEAD_BEFORE_2_1_309,
+    ];
     let row = crate::text::trim_end(&rows[i]);
     let seg = if vendor {
-        row.strip_prefix("  ⎿  ")?.trim_start()
+        result_head(rows, i)?
     } else {
-        segments(row).find(|s| s.starts_with(anchor))?
+        segments(row).find(|s| heads.iter().any(|h| s.starts_with(h)))?
     };
-    if !seg.starts_with(anchor) {
-        return None;
-    }
+    let head = heads.into_iter().find(|h| seg.starts_with(h))?;
+    // The rest of the notice is wrapped onto the rows under it: a result's
+    // rows (five columns in) above the composer, any text under it.
     let joined: String = std::iter::once(seg)
         .chain(
             rows.iter()
                 .skip(i + 1)
-                .take(3)
+                .take(TOOL_NOTICE_ROWS - 1)
+                .take_while(|r| !vendor || r.starts_with(RESULT_BODY))
                 .map(|r| r.trim())
                 .take_while(|r| !r.is_empty()),
         )
         .collect::<Vec<_>>()
         .join(" ");
-    let code = if joined.contains("EDQUOT") || joined.contains("disk quota") {
-        Code::Edquot
+    let code = if head == TOOL_HEAD_BEFORE_2_1_309 {
+        if joined.contains("EDQUOT") || joined.contains("disk quota") {
+            Code::Edquot
+        } else {
+            Code::Enospc
+        }
     } else {
-        Code::Enospc
+        if !joined.contains(const { crate::anchors::anchor_text("wall.disk_full.tool_dir") }) {
+            return None;
+        }
+        if head == const { crate::anchors::anchor_text("wall.disk_full.tool_quota") } {
+            Code::Edquot
+        } else {
+            Code::Enospc
+        }
     };
     Some(DiskFull {
         code,

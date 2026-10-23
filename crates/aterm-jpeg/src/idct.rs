@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The 8x8 inverse DCT (T.81 A.3.3), separable, in single precision: the
-//! definition itself, so its error is the float rounding alone (within one
-//! level of the exact transform, as the integer IDCTs of other decoders
-//! are). A row or column whose AC terms are all zero is a constant and costs
-//! one multiply.
+//! Separable single-precision 8x8 inverse DCT (T.81 A.3.3).
 
 use std::sync::OnceLock;
 
@@ -30,13 +26,9 @@ fn basis() -> &'static [[f32; 8]; 8] {
     })
 }
 
-/// Transform one block of dequantized coefficients (natural order) into
-/// samples, level-shifted by 128 and clamped to 0..=255, written row by row
-/// at `out[row * stride + column]`.
+/// Transform dequantized coefficients into clamped samples at `out[row * stride + column]`.
 pub(crate) fn idct_block(coefficients: &[i32; 64], out: &mut [u8], stride: usize) {
     let basis = basis();
-    // Columns first: for each column u of coefficients, the eight vertical
-    // samples (by y).
     let mut columns = [0.0f32; 64];
     for u in 0..8 {
         let column = |v: usize| coefficients[v * 8 + u];
@@ -58,7 +50,6 @@ pub(crate) fn idct_block(coefficients: &[i32; 64], out: &mut [u8], stride: usize
             columns[y * 8 + u] = sum;
         }
     }
-    // Then each row across.
     for y in 0..8 {
         let row = &columns[y * 8..y * 8 + 8];
         let Some(target) = out.get_mut(y * stride..y * stride + 8) else {

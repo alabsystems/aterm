@@ -27,9 +27,12 @@ const COMPOSER: u16 = 12;
 const WORKFLOW: u16 = 16;
 /// The composer's text starts right of its `> ` prompt.
 const TEXT_COL: u16 = 2;
+/// The spinner's glyph column (its glyph frame ends the row's print at 11) and
 /// its seconds digit column (the digit ends it at 18).
 const SPINNER_GLYPH_COL: u16 = 10;
 const SPINNER_DIGIT_COL: u16 = 17;
+/// The workflow row's timer (ends the row's print at 15) and its token counter
+/// further right (ends it at 35): a footer whose print end moves forward,
 /// keylessly, when the tokens follow the timer.
 const WORKFLOW_TIMER_COL: u16 = 13;
 const WORKFLOW_TOKENS_COL: u16 = 30;
@@ -38,12 +41,15 @@ const WORKFLOW_TOKENS: &str = "12.3k";
 /// What the hand types, and where it hesitates.
 #[derive(Clone, Copy, Debug)]
 struct Take {
+    /// The presses, one per char: a glyph, `\u{8}` a Backspace, `←` / `→`
     /// the arrows.
     keys: &'static str,
     /// The press that follows 1.1 s of thought.
     pause_at: usize,
+    /// The hesitated press: pressed 322 ms after the press before it echoed, the status tick
     /// printed 3 ms after it.
     hesitated: usize,
+    /// The glyph the spinner's tick prints inside the hesitated press's
     /// window (`None`: its elapsed-seconds digit, as the clock has it).
     tick_glyph: Option<char>,
 }
@@ -99,6 +105,7 @@ impl Press {
         }
     }
 
+    /// Its echo in the composer, and how far it moves the caret: a glyph
     /// printed, a Backspace's `BS EL`, an arrow's `CUB` / `CUF`.
     fn echo(self) -> (Vec<u8>, i16) {
         match self {
@@ -110,6 +117,7 @@ impl Press {
     }
 }
 
+/// Rows a streaming transcript prints on: every row but the status rows, the
 /// composer and its two probed neighbours, more than the lane remembers.
 const STREAM_ROWS: [u16; 21] = [
     0, 1, 2, 4, 6, 7, 9, 10, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
@@ -145,23 +153,31 @@ enum ScrollAt {
 enum Shape {
     /// The base shape: the spinner's digit ticks inside `i`'s pre-echo window.
     Owner,
+    /// The base shape with one transcript line scrolling the screen first: the
+    /// lane's row memory (every brand) goes with the old coordinates, and the
     /// spinner's digit is its first advance since.
     Scroll(ScrollAt),
+    /// The base shape with a transcript streaming onto a new row every `ms` from 1.5 s before the
     /// first key ([`STREAM_ROWS`]).
     Stream(u64),
+    /// The tick inside `i`'s window is the workflow row's token counter, a
     /// footer below the composer whose brand a scroll wiped.
     Footer(FooterScroll),
 }
 
+/// Where the scroll lands for [`Shape::Footer`]: after the footer's last keyless advance, 20 ms
+/// before one more print of its timer (alone in its frame, so the lane samples it), which gives
 /// the footer its endpoint in the new coordinates.
 #[derive(Clone, Copy, Debug)]
 enum FooterScroll {
     /// During the pause, 310 ms before the press after it (`s`).
     InPause,
+    /// 100 ms after the echo of the press before the hesitated one (`s`, a Backspace's, an
     /// arrow's).
     AfterSEcho,
 }
 
+/// `ESC[?2026h`, the write at `(row, col)`, the caret walked back to the
 /// composer at `(crow, caret)`, `ESC[?2026l`: Claude Code's status-row update.
 fn status_write(row: u16, col: u16, text: &str, crow: u16, caret: u16) -> Vec<u8> {
     format!(
@@ -174,6 +190,8 @@ fn status_write(row: u16, col: u16, text: &str, crow: u16, caret: u16) -> Vec<u8
     .into_bytes()
 }
 
+/// One replay's script: events in time order, `i`'s press and echo, the ticking
+/// row's advance inside `i`'s window (`(origin, target)` in the coordinates it
 /// was printed in), and how far the screen has scrolled by the end.
 struct Script {
     events: Vec<(u64, Ev)>,
@@ -183,6 +201,11 @@ struct Script {
     shift: u16,
 }
 
+/// The timeline in ms: an idle busy screen, then the take at 150 ms a key with
+/// 1.1 s before the press after the pause (`s`) and the hesitated press (`i`)
+/// 322 ms after the one before echoed; each key echoed `lat` ms after its press,
+/// and a status tick 3 ms after the hesitated press (13 ms before its echo at
+/// 16 ms latency): the spinner's digit (or the take's tick glyph), or for
 /// [`Shape::Footer`] the workflow row's tokens.
 fn timeline(take: Take, lat: u64, shape: Shape) -> Script {
     let keys: Vec<Press> = take.keys.chars().map(Press::of).collect();
@@ -453,6 +476,8 @@ impl Host {
         }
     }
 
+    /// The press's hints as `app_input.rs` stamps them: a printable key
+    /// supersedes and banks its glyph; a Backspace is the line-editing disarm
     /// and one priced erase; an arrow the line-editing disarm and a motion.
     fn key(&mut self, key: Press) {
         match key {
@@ -518,6 +543,7 @@ fn holes(live: &[u16]) -> Vec<u16> {
     }
 }
 
+/// One replay: frames every `frame_us` from `phase_us`, keys echoed `lat` ms
 /// after their press. Returns what went wrong (empty: the law held).
 fn replay(take: Take, frame_us: u64, phase_us: u64, lat: u64, shape: Shape) -> String {
     let script = timeline(take, lat, shape);
@@ -614,6 +640,9 @@ fn replay(take: Take, frame_us: u64, phase_us: u64, lat: u64, shape: Shape) -> S
     bad
 }
 
+/// The whole grid is 120 Hz at three latencies and 60 Hz at one, five phases each: 20 replays.
+/// This samples six over both rates, every phase and all three latencies. Replays are
+/// deterministic, and without each law's fix at least 15 of 20 are red, so any six contain a red
 /// one.
 fn grid() -> Vec<(u64, u64, u64)> {
     [
@@ -629,6 +658,7 @@ fn grid() -> Vec<(u64, u64, u64)> {
     .collect()
 }
 
+/// Every replay of `take` in `shape` ([`grid`]). Each replay has its own `Terminal`, engine and
 /// clock, so they run in parallel and are judged in order.
 fn sweep(take: Take, shape: Shape) {
     let runs = grid();
@@ -653,12 +683,16 @@ fn sweep(take: Take, shape: Shape) {
     );
 }
 
+/// On a busy Claude Code screen the spinner's digit printed between a hesitated key's press and
 /// its echo is refused as a program row and forgets no press: the composer's band has no hole.
 #[test]
 fn a_status_row_digit_inside_a_hesitated_keys_echo_window_leaves_no_hole() {
     sweep(OWNER, Shape::Owner);
 }
 
+/// A scroll wipes the brands, not the press: one transcript line scrolls the screen during the
+/// pause or between `s`'s echo and `i`'s press, so the spinner's next digit lands unbranded in
+/// `i`'s window. It is refused and forgets nothing: the spinner is above the caret and the hand
 /// is still typing on the moved composer.
 #[test]
 fn a_scroll_that_wipes_the_brands_leaves_no_hole() {
@@ -671,6 +705,8 @@ fn a_scroll_that_wipes_the_brands_leaves_no_hole() {
     }
 }
 
+/// A transcript streaming past the lane's memory (a line on a new row every 100
+/// or 500 ms): the spinner keeps printing, so it keeps its slot and brand; were
 /// it evicted, its refused digit would still forget nothing.
 #[test]
 fn a_transcript_streaming_onto_new_rows_leaves_no_hole() {
@@ -679,6 +715,8 @@ fn a_transcript_streaming_onto_new_rows_leaves_no_hole() {
     }
 }
 
+/// A footer below the composer: the workflow row's token counter ticks in `i`'s window after a
+/// scroll wiped its brand, below the caret where zle's minibuffer sits. It forgets nothing: the
 /// hand is still typing on the caret's row.
 #[test]
 fn a_footer_below_the_composer_leaves_no_hole_after_a_scroll() {
@@ -687,6 +725,8 @@ fn a_footer_below_the_composer_leaves_no_hole_after_a_scroll() {
     }
 }
 
+/// A line-editing key keeps the hand on its row: a typo erased before the hesitated key (`sx⌫`)
+/// or the caret stepped left and back (`s←→`), then the footer's unbranded token counter ticks
 /// in `i`'s window. It is refused and forgets nothing: a Backspace or arrow opens no minibuffer.
 #[test]
 fn a_line_editing_key_before_the_hesitated_key_leaves_no_hole() {
@@ -698,6 +738,10 @@ fn a_line_editing_key_before_the_hesitated_key_leaves_no_hole() {
     }
 }
 
+/// A status tick ending on the key's own glyph takes nothing: `v0.1`, a pause, then the first
+/// `0` of `00` hesitated while the spinner prints `0` in its window after a scroll wiped its
+/// brand. The minibuffer gate cannot refuse a run ending on a live press's glyph; the hand's row
+/// does (`program-row`), keeping the key's stamp and credit for its echo. Branded (no scroll),
 /// the spinner is refused by its brand.
 #[test]
 fn a_status_tick_ending_on_the_hesitated_key_s_own_glyph_takes_nothing() {

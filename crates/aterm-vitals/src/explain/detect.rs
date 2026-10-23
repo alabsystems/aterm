@@ -139,7 +139,7 @@ impl Context {
 pub enum CauseId {
     /// A named activity.
     Activity(ActivityId),
-    /// A tab's work, by the host's key.
+    /// A tab's work (its panes' summed), by its key ([`crate::model::TabRoot::tab`]).
     TabWork(u64),
     /// aterm itself and its helpers.
     AtermWork,

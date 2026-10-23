@@ -29,7 +29,7 @@ pub enum Policy {
 }
 
 impl Policy {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Repository => "repository",
             Self::Unverified => "unverified",
@@ -47,7 +47,7 @@ pub enum Profile {
 }
 
 impl Profile {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Release => "release",
             Self::Dev => "dev",

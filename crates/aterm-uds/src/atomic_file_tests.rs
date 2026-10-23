@@ -33,8 +33,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Run this thread's racing writer, once: called at each window between a check and the use
-/// it guards, where only a race could otherwise act.
+/// Run this thread's racing writer, once.
 pub(super) fn race() {
     if let Some(racer) = RACER.with(|r| r.borrow_mut().take()) {
         racer();

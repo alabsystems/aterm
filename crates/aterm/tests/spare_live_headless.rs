@@ -270,7 +270,8 @@ fn adopted(inst: &Instance, tier: &str) -> u32 {
 
 const PROMPT_RC: &str = "PS1='SPARE%# '\n";
 
-/// The current generation's one owned persisted snapshot.
+/// The current generation's one owned persisted snapshot. The fixture starts
+/// from an exclusive empty state root and never changes its rc generation.
 struct GateSnapshot {
     _file: std::fs::File,
     identity: (u64, u64),
@@ -589,7 +590,8 @@ fn boot_run_is_clean(inst: &Instance) {
     await_gate(inst, "learning_1/3");
 }
 
-/// The boot session is itself the first visible run.
+/// The boot session is itself the first visible run. Settle it before making
+/// the next two runs, and observe each fold before asking for another spare.
 fn learn_three_visible_runs(inst: &Instance) {
     boot_run_is_clean(inst);
     for expected in [2, 3] {
@@ -683,7 +685,8 @@ fn await_slow_part(inst: &Instance, entered: &Path) {
     }
 }
 
-/// Release an owned rc barrier on assertion unwind too.
+/// Release an owned rc barrier on assertion unwind too. Exclusive creation
+/// never truncates a standing path; InstanceDrop still owns the App/lifeline.
 struct RcRelease(PathBuf);
 
 impl RcRelease {

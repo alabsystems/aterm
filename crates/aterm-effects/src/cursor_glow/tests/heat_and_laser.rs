@@ -176,7 +176,10 @@ fn laser_navigation_forges_no_strike() {
     );
 }
 
-/// Sparkle on a light page: its grains are ink, not light.
+/// Sparkle on a light page: its grains are ink, not light. After a warm run
+/// the particle pass lays no additive quad, and every grain it draws (motes,
+/// the light star, the crescent and the mini-comet dash) is source-over ink
+/// inside the over-text ceiling.
 #[test]
 fn sparkle_grains_on_a_light_page_are_ink_not_light() {
     let g = geom();

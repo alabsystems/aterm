@@ -3,9 +3,7 @@
 //
 // Derived from winit 0.30.13 src/platform_impl/windows/icon.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
-
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Adapt icon/cursor handles and their thread-safety to windows-sys 0.61.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -72,8 +70,7 @@ pub enum IconType {
     Big = ICON_BIG as isize,
 }
 
-// SAFETY: an owned id of a process-global USER object (auto-derived while
-// windows-sys 0.52 made it an `isize`).
+// SAFETY: HICON is a process-global USER handle.
 unsafe impl Send for RaiiIcon {}
 unsafe impl Sync for RaiiIcon {}
 
@@ -98,7 +95,6 @@ impl WinIcon {
         path: P,
         size: Option<PhysicalSize<u32>>,
     ) -> Result<Self, BadIcon> {
-        // width / height of 0 along with LR_DEFAULTSIZE tells windows to load the default icon size
         let (width, height) = size.map(Into::into).unwrap_or((0, 0));
 
         let wide_path = util::encode_wide(path.as_ref());
@@ -139,7 +135,6 @@ impl WinIcon {
         resource: PCWSTR,
         size: Option<PhysicalSize<u32>>,
     ) -> Result<Self, BadIcon> {
-        // width / height of 0 along with LR_DEFAULTSIZE tells windows to load the default icon size
         let (width, height) = size.map(Into::into).unwrap_or((0, 0));
         let handle = unsafe {
             LoadImageW(
@@ -234,7 +229,6 @@ impl WinCursor {
                 return Err(io::Error::last_os_error());
             };
 
-            // Mask created according to https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createbitmap#parameters
             let mask_bits: Vec<u8> = vec![0xff; ((((w + 15) >> 4) << 1) * h) as usize];
             let hbm_mask = CreateBitmap(w, h, 1, 1, mask_bits.as_ptr() as *const _);
             if hbm_mask.is_null() {
@@ -262,8 +256,7 @@ impl WinCursor {
     }
 }
 
-// SAFETY: an owned id of a process-global USER object (auto-derived while
-// windows-sys 0.52 made it an `isize`).
+// SAFETY: HCURSOR is a process-global USER handle.
 unsafe impl Send for RaiiCursor {}
 unsafe impl Sync for RaiiCursor {}
 

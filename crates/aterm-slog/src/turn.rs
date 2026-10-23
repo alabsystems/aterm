@@ -1804,7 +1804,11 @@ impl TurnTracker {
         let _ = log.amend(node, amend, at);
     }
 
-    /// THE PROMPT (§2.5's join).
+    /// THE PROMPT (§2.5's join). Attaches only
+    /// within [`ATTRIBUTION_MS`] of the prompt, either side: the open turn
+    /// when it has no vendor turn and opened within that of the prompt; the
+    /// newest closed turn when it has none and opened within that — and
+    /// before the open turn when that is the nearer of the two.
     fn tx_prompt(
         &mut self,
         log: &mut Log,

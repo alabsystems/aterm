@@ -167,7 +167,8 @@ impl Job {
     }
 }
 
-/// End this process by SIGKILL, as a killed holder ends.
+/// End this process by SIGKILL, as a killed holder ends. The signal may land after `kill`
+/// returns (another thread can take it), so this thread waits for it.
 fn kill_self() -> ! {
     // SAFETY: a signal to this process; SIGKILL cannot be caught.
     unsafe {
@@ -181,7 +182,9 @@ fn kill_self() -> ! {
     }
 }
 
-/// [`Job::Holder`].
+/// [`Job::Holder`]. The child is forked only once aterm has answered the
+/// holder, so the modes were read as the holder's; the child is answered
+/// before it exits, so aterm saw its group hold the terminal.
 fn holder() -> ! {
     // SAFETY: SIGTTOU ignored, so the holder may take the terminal back from its child's group.
     unsafe {

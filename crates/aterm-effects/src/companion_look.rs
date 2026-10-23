@@ -33,7 +33,8 @@ struct Homecoming {
     id: String,
     /// Last worn — the recency clock. Refreshed by every landing of this id.
     at: Instant,
-    /// Whether the owed hello was performed.
+    /// Whether the owed hello was performed. An ungreeted slot is an unpaid debt
+    /// and is never evicted.
     greeted: bool,
 }
 
@@ -91,9 +92,11 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
 pub struct KittyTenure {
     worn: Option<AppIdentity>,
     candidate: Option<(Option<AppIdentity>, Instant)>,
-    /// The cats this window has worn, LRU by `at`.
+    /// The cats this window has worn, LRU by `at`. Expiry is lazy (at landings),
+    /// so the roster arms no timer.
     roster: [Option<Homecoming>; HOMECOMING_SLOTS],
-    /// Stamped only by [`Self::commit_hello`].
+    /// Stamped only by [`Self::commit_hello`]. The roster's `at` refreshes on
+    /// every wear, so alternation starves the ceremony on purpose.
     last_hello: Option<Instant>,
     /// How loudly the last landing arrives: the full ceremony only for a stranger.
     arrival: PetArrival,

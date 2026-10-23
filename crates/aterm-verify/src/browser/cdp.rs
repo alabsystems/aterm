@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Chrome DevTools protocol over `--remote-debugging-pipe`: the browser
-//! reads commands on its fd 3 and writes answers and events on its fd 4,
-//! each message one JSON text ended by a NUL. Flat sessions: a command for a
-//! page carries its `sessionId`, as do that page's events.
-//!
-//! Every wait is a one-minute hang detector, never a latency budget. When
-//! this process goes, its end of fd 3 closes and the browser shuts itself
-//! down (Chromium closes on a pipe EOF), so an interrupted run leaves no
-//! browser behind.
+//! The Chrome DevTools protocol over `--remote-debugging-pipe` (fds 3 and 4, NUL-delimited JSON).
 
 use std::io::{Read, Write};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -29,8 +21,7 @@ pub(crate) struct Cdp {
     events: Vec<Value>,
 }
 
-/// The NUL-ended messages in `pending`, parsed and drained; a partial message
-/// stays. A message that does not parse is reported as such rather than lost.
+/// The NUL-ended messages in `pending`, parsed and drained; a partial message stays.
 pub(crate) fn split_messages(pending: &mut Vec<u8>) -> Vec<Value> {
     let mut out = Vec::new();
     while let Some(end) = pending.iter().position(|&b| b == 0) {
@@ -60,8 +51,7 @@ fn pump(mut from: std::io::PipeReader, tx: &Sender<Value>) {
 }
 
 impl Cdp {
-    /// A connection over the two pipe ends this process keeps: `to` is the
-    /// browser's fd 3, `from` its fd 4.
+    /// A connection over the two pipe ends (`to` is the browser's fd 3, `from` its fd 4).
     pub(crate) fn new(to: std::io::PipeWriter, from: std::io::PipeReader) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || pump(from, &tx));
@@ -89,8 +79,7 @@ impl Cdp {
         }
     }
 
-    /// Send `method` with `params` (to the page `session`, else the browser)
-    /// and wait for its answer: the `result`, or the protocol's error.
+    /// Sends `method` with `params` and waits for its answer (`result` or protocol error).
     pub(crate) fn call(
         &mut self,
         session: Option<&str>,
@@ -149,8 +138,7 @@ impl Cdp {
         }
     }
 
-    /// What the page `session` printed to its console and threw, in order:
-    /// one line each, drained from the events read so far.
+    /// Drains console and exception lines for `session` from the events read so far.
     pub(crate) fn take_console(&mut self, session: &str) -> Vec<String> {
         let mut lines = Vec::new();
         self.events.retain(|m| {
@@ -200,8 +188,7 @@ fn console_line(m: &Value) -> String {
     format!("console.{kind}: {}", args.join(" "))
 }
 
-/// The value an awaited `Runtime.evaluate` answered, or the exception it
-/// threw (the page's rejection, its step named).
+/// The value an awaited `Runtime.evaluate` answered, or the exception it threw.
 pub(crate) fn evaluated(result: &Value) -> Result<Value, String> {
     if let Some(ex) = result.get("exceptionDetails") {
         return Err(ex

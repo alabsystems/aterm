@@ -362,7 +362,9 @@ fn color_noun(label: &str) -> String {
     }
 }
 
-/// The subject's colour wheel, `height` tall.
+/// The subject's colour wheel, `height` tall. Its value is the colour in
+/// words; it takes a pick ([`SemanticInput::ColorPick`]), a `#RRGGBB`, or,
+/// pressed with no value, sends the keyboard to the hex row.
 fn color_wheel_node(state: &SettingsViewState, subject: &ColorSubject, height: f32) -> UiNode {
     let id = subject.target.id();
     UiNode::new(

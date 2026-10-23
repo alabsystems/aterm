@@ -373,7 +373,9 @@ fn title_refusal(fault: &'static str, tail: bool) -> &'static str {
     }
 }
 
-/// `Err(refusal)` when `title` may not stand on the glass.
+/// `Err(refusal)` when `title` may not stand on the glass. `tail`: the verb
+/// takes ` -- <more>` after its title (`post`, `progress`), so the refusal
+/// says where the rest goes; `done`'s words take none.
 fn title_form(title: &str, tail: bool) -> Result<(), &'static str> {
     glass_title_fault(title).map_or(Ok(()), |f| Err(title_refusal(f, tail)))
 }
@@ -2015,7 +2017,10 @@ mod tests {
         }
     }
 
-    /// Paging with the last id seen never skips a record.
+    /// Paging with the last id seen never skips a record. 100 records:
+    /// `since=10` under `n=64` is 11..=74, then `since=74` is 75..=100; a bare
+    /// read is still the newest 64, and `since=` with no count is everything
+    /// above the id.
     #[test]
     fn paging_since_the_last_id_loses_nothing() {
         let now = t0();

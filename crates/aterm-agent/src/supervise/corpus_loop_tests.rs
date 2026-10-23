@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// A CORPUS TAPE MADE FROM A RECORDED LOOP (`run_tests.rs`'s `corpus_loop`
-// module, the replay plan's T10): a run of the loop's engine recorded over
-// the scripted worker under `approve = "all"`, its approval policy's home a
-// path of the recording machine's (`/Users/_owner`), which the header names
-// and a Bash box draws — promoted into the corpus's text form by
-// `tape::corpus::promote` with that home scrubbed, and refused where the
-// tape is not one a corpus may keep. Every assertion is on a structured
-// value or a refusal's reason, never on a report's rendering.
+// Tests promoting, scrubbing, and replaying recorded supervise loop tapes.
 
 use crate::supervise::tape::acts::Candidate;
 use crate::supervise::tape::codec::Item;

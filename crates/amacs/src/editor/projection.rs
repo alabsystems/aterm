@@ -406,7 +406,8 @@ verify_island! {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HorizontalWindowAnchor {
-    /// Exact display-column offset for ordinary lines.
+    /// Exact display-column offset for ordinary lines. Every visible row uses
+    /// the same offset, so vertical movement keeps columns visually aligned.
     Columns(usize),
     /// Bounded fallback for a pathological line whose prefix alone exceeds the
     /// per-line projection budget.

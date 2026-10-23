@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The REST lane against agh-fake's loopback GitHub, through the real `/usr/bin/curl`: the
-//! token on stdin and nowhere a listing shows, uploads and downloads, the CDN redirect and the
-//! redirects refused, pagination read whole or refused, and a curlrc never read. Each guard
-//! comes with the negative control that shows it would catch what it guards against.
+//! REST transport tests against `agh-fake`'s loopback GitHub via `/usr/bin/curl`.
 
 use super::*;
 use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec, token};
@@ -13,8 +10,7 @@ use std::sync::Mutex;
 const SLUG: &str = "fixture-dev/app";
 const LOGIN: &str = "fixture-dev-bot";
 
-/// One curl a client started, as a process listing and its environment would show it, and
-/// what it was given on stdin.
+/// One curl a client started.
 #[derive(Clone, Debug)]
 struct Spawned {
     program: String,
@@ -23,8 +19,7 @@ struct Spawned {
     stdin: Option<Vec<u8>>,
 }
 
-/// A [`Spawn`] that records each child, then (with `env`, to play a hostile environment)
-/// starts it as [`Direct`] does.
+/// A [`Spawn`] that records each child before forwarding to [`Direct`].
 #[derive(Default)]
 struct Recorder {
     spawned: Mutex<Vec<Spawned>>,
@@ -60,8 +55,7 @@ impl Spawn for Recorder {
     }
 }
 
-/// Where `secret` shows in what a process listing or an environment read would show: each
-/// argument and each environment value holding it.
+/// Where `secret` shows in what a process listing or an environment read would show.
 fn exposed(spawned: &Spawned, secret: &str) -> Vec<String> {
     let mut found: Vec<String> = spawned
         .args
@@ -143,7 +137,6 @@ fn the_token_rides_stdin_and_never_argv_or_the_environment() {
         stdin,
         format!("Authorization: Bearer {secret}\n").as_bytes()
     );
-    // Negative controls: the check catches a token in an argument and in a variable.
     let in_argv = Spawned {
         args: vec!["-H".into(), format!("Authorization: Bearer {secret}")],
         ..curl.clone()
@@ -176,7 +169,6 @@ fn a_hostile_curlrc_is_never_read() {
         .unwrap();
     let planted = |seen: &[agh_fake::Seen]| seen.iter().any(|s| s.header("x-planted").is_some());
     assert!(!planted(&fake.seen()), "-q kept the curlrc out");
-    // Negative control: the same curl, the same environment, without `-q`, reads it.
     let mut bare = aterm_uds::spawnfd::command("/usr/bin/curl");
     bare.args(["-sS", "-o", "/dev/null", "-H", "User-Agent: control"])
         .arg(format!("http://127.0.0.1:{}/rate_limit", fake.ports().api))
@@ -236,12 +228,9 @@ fn a_release_is_created_uploaded_listed_and_downloaded_through_curl() {
     std::io::Read::read_to_end(child.stdout.as_mut().unwrap(), &mut streamed).unwrap();
     assert!(child.wait().unwrap().success());
     assert_eq!(streamed, bytes);
-    // Over the cap is refused, and leaves no file.
     let capped = rest.download_asset(&asset_path, &got, 199_999).unwrap_err();
     assert!(matches!(capped, RestError::Malformed(_)), "{capped}");
     assert!(!got.exists());
-    // The CDN hop went anonymously: the fake records no credential there (its violations),
-    // and the recorded CDN curls were given nothing on stdin.
     let cdn: Vec<Spawned> = recorder
         .spawned()
         .into_iter()
@@ -293,14 +282,11 @@ fn a_redirect_off_the_cdn_origin_is_refused_and_never_followed() {
         "never asked"
     );
     assert!(!dest.exists());
-    // Control: without the fault the same call follows the CDN redirect.
     rest.download_asset(&asset_path, &dest, 1024).unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), b"ay");
-    // A CDN that redirects again is refused by curl itself (`--max-redirs 0`).
     fake.fault(Match::cdn(), Fault::SecondHop);
     let again = rest.download_asset(&asset_path, &dest, 1024).unwrap_err();
     assert!(matches!(again, RestError::Redirect(_)), "{again}");
-    // And a redirect from any other api call is never followed: a renamed repository's 301.
     fake.rename_repo(SLUG, "fixture-dev/renamed");
     let moved = rest.read("/repos/fixture-dev/app").unwrap_err();
     assert!(matches!(moved, RestError::Redirect(_)), "{moved}");
@@ -334,7 +320,6 @@ fn a_listing_is_read_to_its_end_and_an_incomplete_page_is_refused() {
         ["v5", "v4", "v3", "v2", "v1"],
         "every page, linked by repository id"
     );
-    // Page 2 answers empty yet links a page 3: refused, not read as the end.
     let api = fake.ports().api;
     fake.fault(
         Match::api("/repos/fixture-dev/app/releases?per_page=2&page=2"),
@@ -356,7 +341,6 @@ fn a_listing_is_read_to_its_end_and_an_incomplete_page_is_refused() {
         incomplete.to_string().contains("advertises more"),
         "{incomplete}"
     );
-    // A page that is not answered whole is the page's own failure.
     fake.fault(
         Match::api("/repos/fixture-dev/app/releases?per_page=2&page=2"),
         Fault::Status {
@@ -366,7 +350,6 @@ fn a_listing_is_read_to_its_end_and_an_incomplete_page_is_refused() {
         },
     );
     assert_eq!(rest.pages(base, 2).unwrap_err().status(), Some(502));
-    // A missing repository's listing is a 404 the caller can read.
     assert!(
         rest.pages("/repos/fixture-dev/none/releases?per_page=2", 2)
             .unwrap_err()
@@ -393,7 +376,6 @@ fn a_write_without_a_token_and_a_url_off_the_origins_never_start_curl() {
         Err(RestError::Local(_))
     ));
     assert!(recorder.spawned().is_empty(), "nothing started");
-    // Control: an anonymous read does start one, and reads.
     assert_eq!(
         anonymous.read("/repos/fixture-dev/app").unwrap()["id"].as_u64(),
         Some(1000)
@@ -462,7 +444,6 @@ fn fail_with_body_keeps_curls_own_reading_and_githubs_words() {
         answer.message(),
         "Validation Failed (tag_name: already_exists)"
     );
-    // Control: without the flag curl exits 0 and the status alone says it.
     let plain = rest
         .exchange(&Request {
             fail_with_body: false,
@@ -481,8 +462,6 @@ fn an_upload_names_its_file_and_never_curls_stdin_or_a_glob() {
     let url = rest.uploads(&format!(
         "/repos/fixture-dev/app/releases/{id}/assets?name=a.bin"
     ));
-    // A relative path is spelled from `./`, so `-` and `.` are files and never curl's stdin
-    // (which `-H @-` has already read); an absolute path is as given; nothing is globbed.
     for (given, spelled) in [
         ("-", "./-"),
         (".", "./."),
@@ -505,7 +484,6 @@ fn an_upload_names_its_file_and_never_curls_stdin_or_a_glob() {
         );
         assert!(argv.iter().any(|a| a == "--globoff"), "{argv:?}");
     }
-    // End to end: a file whose name holds glob characters uploads its own bytes.
     let dir = scratch();
     let file = dir.path().join("a[1-2].bin");
     std::fs::write(&file, b"the file's own bytes").unwrap();
@@ -514,8 +492,6 @@ fn an_upload_names_its_file_and_never_curls_stdin_or_a_glob() {
         fake.release_state(id).unwrap().1,
         [("a.bin".to_string(), b"the file's own bytes".to_vec())]
     );
-    // Negative control: the same upload without `--globoff` is curl's glob of `a1`, `a2`,
-    // which names no file (exit 26), and sends nothing.
     let before = fake.seen().len();
     let bare = aterm_uds::spawnfd::command("/usr/bin/curl")
         .args([
@@ -572,8 +548,6 @@ fn a_spawn_that_refuses_once_interrupted_is_a_refusal_made_here() {
         matches!(&refused, RestError::Local(m) if m.contains("interrupted")),
         "{refused:?}"
     );
-    // Control: any other failure to start curl is a transport failure, which a caller may
-    // ask again.
     let failed = rest(std::io::ErrorKind::NotFound)
         .read("/user")
         .unwrap_err();

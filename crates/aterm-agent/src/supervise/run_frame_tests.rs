@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SUPERVISOR READS WHOLE FRAMES ([`Session::text_json`]): a `text --json` the server says
-//! caught the program's DEC 2026 frame unfinished (`"frame":"open"`) is read again after `await
-//! frame`. The screens are MEASURED (`aterm-lab halfdraw scan` of the lab's casts, three tabs at
-//! once: `docs/measured/half-drawn-frame-2026-10-22.md`): Claude Code 2.1.308's frame split where
-//! a burst of the PTY reader ended, its composer's bottom rule cut at 109 of 144 cells and no busy
-//! footer under it, idle to its reader; and agy 1.4.0's, cut mid-list after its erase-below, no spinner row
-//! and no composer. Each one's whole successor is busy. NEGATIVE CONTROLS: a whole read is read
-//! once; an older host (no `"frame"`, no `await frame`) is read as before. MUTANT: the same half
-//! read with its `"frame"` dropped is what the reader judged idle before the fix.
+//! Supervisor whole-frame read tests ([`Session::text_json`]).
 
 use super::*;
 use aterm_phase::prompt::fixtures::screen as fx;
@@ -24,14 +16,11 @@ const AGY_HALF: &str =
 const AGY_WHOLE: &str =
     include_str!("../../../aterm-phase/src/fixtures/agy-1.4.0-lab-split-whole.txt");
 
-/// A host serving `text --json` reads (whole or `tail=`) from a script — each a screen and
-/// whether its frame was open at the read, the last one repeating — and answering `await frame`
-/// when it knows it.
+/// A host serving `text --json` reads (whole or `tail=`) from a script.
 struct Host {
     reads: VecDeque<(Vec<String>, bool)>,
     knows_frame: bool,
-    /// The `"first"` a `tail=` read says its rows start at (none: the screen is no taller than
-    /// the tail).
+    /// The `"first"` a `tail=` read says its rows start at.
     tail_first: Option<usize>,
     requests: Vec<String>,
     seq: u64,
@@ -214,7 +203,6 @@ fn rereads_of_frames_open_at_every_read_are_bounded() {
 /// [`parse_text_json`]) hands the loop the half frame, idle to its reader.
 #[test]
 fn the_loops_tail_and_whole_reads_wait_for_the_frame() {
-    // The tail stands (the screen no taller than it): its read waits.
     let mut host = Host::new(vec![(CLAUDE_HALF, true), (CLAUDE_WHOLE, false)]);
     let mut s = Session::new(&mut host, None);
     let read = s.read_shaped().expect("a read");
@@ -232,7 +220,6 @@ fn the_loops_tail_and_whole_reads_wait_for_the_frame() {
         ]
     );
 
-    // A tail that misses the live rows (the cursor above it) is taken whole: that read waits.
     let mut host = Host::new(vec![
         (CLAUDE_WHOLE, false),
         (CLAUDE_HALF, true),

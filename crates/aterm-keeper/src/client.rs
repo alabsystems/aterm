@@ -877,7 +877,10 @@ struct HeldMaster {
 /// after a reconnect, behind the master's REGISTER).
 #[derive(Debug)]
 enum HeldJournal {
-    /// Nothing said yet: the window's COMPANION or COMPANION_RELEASE is still queued.
+    /// Nothing said yet: the window's COMPANION or COMPANION_RELEASE is still queued. A
+    /// reconnect says nothing for it, so the keeper's poison window stays open until the window
+    /// itself settles the claim (a premature "no journal" would close the region a recovering
+    /// window was offered, before it had a region of its own).
     Unsaid,
     /// The read-only custody descriptor of its region, and the region's length.
     Region {
@@ -1502,7 +1505,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A REPLACEMENT'S RECEIPT IS THE KEEPER'S READ, NOT THE LINK'S WRITE (R9 (b)).
+    /// A REPLACEMENT'S RECEIPT IS THE KEEPER'S READ, NOT THE LINK'S WRITE (R9 (b)). A window
+    /// whose memory shed replaced a session's region keeps the old one (and erases it on a
+    /// clear) until the keeper holds the fresh one, so the link must say when that is: the
+    /// worker writes a SYNC behind the COMPANION and confirms its receipt only once the
+    /// keeper's answer, which it writes after reading every frame before it, is read back.
     #[test]
     fn a_replacement_companion_is_confirmed_only_once_the_keeper_has_read_it() {
         let scratch = aterm_tempfile::Builder::new()
@@ -1883,7 +1890,10 @@ mod tests {
 mod offer_tests {
     use super::*;
 
-    /// A FULL QUEUE HANDS THE OP BACK.
+    /// A FULL QUEUE HANDS THE OP BACK. `enqueue` drops an op its queue cannot take, and an
+    /// op that carries a descriptor nothing else holds (a fresh region's custody) is lost
+    /// with it: `offer` returns it, so the caller keeps it and offers it again once the
+    /// keeper has read.
     #[test]
     fn a_full_queue_hands_an_offered_op_back_and_a_gone_worker_does_too() {
         let (link, far) = KeeperLink::stalled();

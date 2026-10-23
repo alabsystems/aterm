@@ -282,7 +282,11 @@ pub(crate) fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDes
     desc
 }
 
-/// The Vulkan cell's instance flags: the build's, less `DEBUG`.
+/// The Vulkan cell's instance flags: the build's, less `DEBUG`. `DEBUG` labels
+/// every texture, pipeline and command buffer through the loader's
+/// `vkSetDebugUtilsObjectNameEXT` trampoline, which faults while another
+/// instance's `vkEnumeratePhysicalDevices` unloads the ICDs it does not use
+/// (measured on driver 580.159, libvulkan 1.4.328).
 #[inline]
 #[cfg(all(wgpu_arm, unix, not(target_vendor = "apple")))]
 fn vulkan_instance_flags(flags: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
@@ -344,7 +348,9 @@ fn power_preference_from_env() -> wgpu::PowerPreference {
 #[cfg(wgpu_arm)]
 const MEMBLOCK_FLOOR_MIB: u64 = 16;
 
-/// The block-size ceiling in MiB.
+/// The block-size ceiling in MiB. The block size doubles per additional live
+/// block of a memory type up to this, so real pooled demand still reaches big
+/// blocks.
 #[cfg(wgpu_arm)]
 const MEMBLOCK_CEILING_MIB: u64 = 128;
 

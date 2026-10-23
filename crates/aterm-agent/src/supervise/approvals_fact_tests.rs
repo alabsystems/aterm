@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A FACT ROW IS NO ACT (the occupancy red-team's F13), reader by reader: each reader of acts
-//! reads a session's rows exactly as it reads them with a fact line typed after them
-//! (`fact-hold@v1`, `typed`, as the occupancy door books it). Each test's negative control reads
-//! the fact row as an act ([`with_facts_counted`]), and the same fact line then moves the
-//! reader, so each test shows what it guards.
+//! Tests verifying that occupancy fact rows (`fact-hold@v1`) do not affect act readers.
 
 use super::*;
 use crate::supervise::facts::FactKind;

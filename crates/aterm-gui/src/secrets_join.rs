@@ -2161,7 +2161,8 @@ mod tests {
         assert_eq!(subscriber_plist(&plist), Plist::Sound, "left as it is");
     }
 
-    /// THE COPY A SUBSCRIBER MAY NAME: one that lasts.
+    /// THE COPY A SUBSCRIBER MAY NAME: one that lasts. A disk image and an App
+    /// Translocation copy go away; the installed bundle stays.
     #[test]
     fn only_a_lasting_copy_is_named_by_the_subscriber() {
         for fleeting in [
@@ -2782,7 +2783,10 @@ mod tests {
         assert_eq!(row.msg.title, "Joined the secrets vault");
     }
 
-    /// THE REMEDY'S APPLY ENDS THE LINES IT MENDS.
+    /// THE REMEDY'S APPLY ENDS THE LINES IT MENDS. A setup report (System State's status)
+    /// whose Secrets stage reads this Mac in and its subscriber running (`ok`, or `applied`
+    /// by a pass that joined) ends the failed, unfinished, pending and not-in-sync lines at
+    /// once, not at the next launch.
     #[test]
     fn a_setup_run_that_syncs_the_vault_ends_its_lines() {
         let mut app = App::headless_for_test();

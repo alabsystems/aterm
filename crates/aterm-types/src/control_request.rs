@@ -2,6 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! Control wire request line parser for optional `@<selector>`, verb, and payload.
+//!
+//! Words are separated by SP or HT, and separators before the first word and after the selector
+//! are skipped; a trailing `\r` is not part of the line; `rest` is everything after the one
+//! separator that ends the verb. A lone `@` is read as the verb, never as a selector.
 
 use core::ops::Range;
 

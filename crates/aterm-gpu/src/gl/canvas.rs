@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's swapchain in a browser: the WebGL2 canvas's drawing buffer, and the present that
-//! posts a frame to it (wasm32; `surface` is the GLX and EGL twin on Linux).
+//! WebGL2 canvas drawing-buffer surface and present path.
 
 use super::GlPresentError;
 use super::device::GlDevice;
@@ -13,15 +12,10 @@ use crate::device_layer::TexelFormat;
 /// The canvas a device's context draws into, at its configured size.
 #[derive(Debug)]
 pub(crate) struct GlCanvasSurface {
-    /// The device whose context lives on the canvas.
     dev: GlDevice,
-    /// The size the canvas was last configured to.
     width: u32,
     height: u32,
-    /// The size the canvas is at now (`None`: not set yet, or a resize that
-    /// could not reach the context, retried at the next present).
     applied: Option<(u32, u32)>,
-    /// The texture a present composes into, at the configured size.
     standin: Option<GlTexture>,
 }
 
@@ -39,7 +33,6 @@ impl GlCanvasSurface {
         Ok(s)
     }
 
-    /// Size the canvas to the configured size, if it is not already.
     fn apply_size(&mut self) -> Result<(), String> {
         let want = (self.width, self.height);
         if self.applied == Some(want) {
@@ -57,8 +50,7 @@ impl GlCanvasSurface {
         false
     }
 
-    /// Move to `width` x `height`: the canvas now (or, if its context cannot be reached, at the
-    /// next present), and the next present composes and posts at it.
+    /// Resize the canvas and stand-in target to `width` x `height`.
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
@@ -79,8 +71,7 @@ impl GlCanvasSurface {
         Ok(self.standin.as_ref().expect("minted above"))
     }
 
-    /// Post the stand-in: size the canvas if it moved, then copy the stand-in into the drawing
-    /// buffer with its rows flipped.
+    /// Blit the composed stand-in into the canvas drawing buffer.
     pub(crate) fn present(
         &mut self,
         dev: &GlDevice,
@@ -100,9 +91,7 @@ impl GlCanvasSurface {
         let fbo = standin.fbo(&cur)?;
         let gl = cur.gl();
         let (w, h) = (tw as i32, th as i32);
-        // SAFETY: the context is current; the stand-in's framebuffer is complete; the blit is
-        // colour-only and NEAREST between equal-sized rects of two RGBA8 buffers (the drawing
-        // buffer is the canvas's).
+        // SAFETY: context is current and stand-in FBO is complete for RGBA8 nearest blit.
         unsafe {
             (gl.disable)(ffi::GL_SCISSOR_TEST);
             (gl.color_mask)(ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE);

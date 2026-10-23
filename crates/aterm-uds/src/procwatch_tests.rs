@@ -79,7 +79,6 @@ impl Shell {
 #[cfg(target_vendor = "apple")]
 impl Drop for Shell {
     fn drop(&mut self) {
-        // The shell's own jobs go with its group's members the test started.
         for pid in child_pids(self.pid()).unwrap_or_default() {
             for grandchild in child_pids(pid).unwrap_or_default() {
                 // SAFETY: signalling a process this test started.
@@ -207,7 +206,6 @@ fn a_child_that_never_execs_is_no_exec() {
         !forked(seen).is_empty()
     });
     let child = forked(&seen)[0];
-    // The subshell has forked its own `sleep`: it is past any exec it would have made.
     let start = std::time::Instant::now();
     while child_pids(child).unwrap_or_default().is_empty() {
         assert!(
@@ -230,10 +228,6 @@ fn a_child_that_never_execs_is_no_exec() {
 
 /// `posix_spawn` (std's `Command` on Darwin) raises the parent's `NOTE_FORK`, and its child is
 /// found already exec'd: a late `Exec`.
-///
-/// The watched parent is this process, so the test runs ALONE, in a re-run of this binary:
-/// beside the other tests, their children fill the watch's [`MAX_CHILDREN`] and the spawn's
-/// child can be left unwatched by design ([`ProcWatch::overflow`]), never reported.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn posix_spawn_raises_note_fork() {
@@ -296,7 +290,6 @@ fn a_followed_holder_reports_its_exec_until_unfollowed() {
     });
     watch.unfollow();
     holder.run("exec /bin/sh -s");
-    // The second exec is done once the new image runs a command: its child exists.
     holder.run("/bin/sleep 30 &");
     let start = std::time::Instant::now();
     while child_pids(holder.pid()).unwrap_or_default().is_empty() {
@@ -333,7 +326,6 @@ fn a_new_watch_adopts_running_children_silently() {
     let mut seen = Vec::new();
     watch.drain(&mut seen);
     assert!(seen.is_empty(), "no past events: {seen:?}");
-    // The job's end is heard: its reader sees EOF once the gate's only writer closes.
     drop(gate);
     drain_until(&mut watch, &mut seen, "the adopted job's exit", |seen| {
         seen.contains(&ProcEvent::Exit { pid: child })
@@ -550,7 +542,6 @@ fn every_process_is_registered_before_its_image_is_read() {
     tracked.adopt(201, &mut kernel);
     tracked.follow(300, 1, &mut kernel);
     assert_eq!(kernel.read_after_registered(), Ok(()));
-    // Found exec'd: late until the first kernel `exec`, then fresh.
     for pid in [101, 200, 300] {
         assert!(tracked.take_late(pid), "{pid} late once");
         assert!(!tracked.take_late(pid), "{pid} fresh after");
@@ -582,7 +573,6 @@ fn a_child_past_the_cap_counts_once_and_an_exit_makes_room() {
         tracked.overflow, 5,
         "the old four count once; the new one once"
     );
-    // 1016 left the table: forgotten. 1000 exited: its slot goes to the next fork's child.
     tracked.exited(1000);
     let now: Vec<i32> = again
         .iter()
@@ -595,7 +585,6 @@ fn a_child_past_the_cap_counts_once_and_an_exit_makes_room() {
     assert_eq!(out[before..], [ProcEvent::Fork { child: 1021 }]);
     assert_eq!(tracked.overflow, 5);
     assert!(!tracked.unwatched.contains(&1016));
-    // A tracked child, the shell and the followed holder are never registered again.
     let calls = kernel.calls.len();
     tracked.follow(1001, 1, &mut kernel);
     tracked.follow(1, 1, &mut kernel);

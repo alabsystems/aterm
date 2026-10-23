@@ -80,7 +80,12 @@ impl<V: Host> CellWalk<V> {
         }
     }
 
-    /// Lay out `c` after everything kept so far.
+    /// Lay out `c` after everything kept so far. Printable ASCII and the
+    /// [`text_presentation`] glyphs open a one-cell cell wherever they stand
+    /// (the grid's bulk path never folds them); a printing character opens its
+    /// own after no cell or after a one-ASCII-character cell (the grid folds
+    /// only into a cell holding a ZWJ, a regional indicator or a wide emoji
+    /// base); everything else is measured.
     fn step(&mut self, c: char) -> CellStep {
         if c.is_ascii() || text_presentation(c) {
             self.open(c, None);

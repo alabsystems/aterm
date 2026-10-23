@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The soak judge over ledgers of its own: a ledger that meets the bar, then each criterion
-//! broken alone (its negative control), and the edges of the streak and of a miss.
+//! Tests for the recovery soak judge across passing ledgers, broken criteria, and edge cases.
 
 use super::*;
 use crate::recovery_ledger::{EndClass, LaunchKind, Pressure, PrevRun, Tri, parse_rows};
@@ -135,7 +134,6 @@ fn an_empty_ledger_meets_nothing() {
 #[test]
 fn too_short_a_streak_is_not_met() {
     let rows = met_ledger();
-    // Thirteen days after the first row is short of fourteen.
     let soak = judge(&rows, T0 + 13 * DAY + 3600, &P4);
     only_broken(&soak, "keeper-on");
 }
@@ -171,7 +169,6 @@ fn the_newest_launch_with_the_link_off_has_no_streak() {
             .detail
             .starts_with("the newest launch had the keeper link off"),
     );
-    // A newest row from a build before the word says so, not that the link was off.
     if let Some(last) = rows.last_mut() {
         last.keeper = None;
     }
@@ -226,7 +223,6 @@ fn a_kill_is_an_unexpected_end_and_a_quit_is_not() {
 #[test]
 fn too_few_exact_sessions_are_not_met() {
     let mut rows = met_ledger();
-    // 6 exact of 7 is 857 thousandths, under 900.
     rows[13].restores = Some(Restores {
         exact: 2,
         screen: 1,
@@ -260,7 +256,6 @@ fn the_exact_floor_is_inclusive() {
 #[test]
 fn a_blank_screen_is_not_met() {
     let mut rows = met_ledger();
-    // 22 exact and 1 blank keeps the exact share over the floor: only none-blank breaks.
     rows[3].restores = Some(exact(10));
     rows[8].restores = Some(Restores {
         exact: 10,
@@ -277,7 +272,6 @@ fn a_blank_screen_is_not_met() {
 #[test]
 fn a_kill_the_keeper_did_not_bring_back_is_a_miss() {
     let mut rows = met_ledger();
-    // Day 10's launch follows a kill of day 9's run, and recovers nothing.
     rows[10].prev.class = EndClass::Killed;
     let killed_pid = rows[9].pid;
     let soak = judge(&rows, now_after(&rows), &P4);
@@ -290,21 +284,16 @@ fn a_kill_the_keeper_did_not_bring_back_is_a_miss() {
         }]
     );
 
-    // The killed run's link found no keeper at its boot, and one started while it lived
-    // (`aterm keeper start` in a tab): the link registered every terminal with it, so the
-    // kill is one the keeper held, and a miss.
     let mut absent = rows.clone();
     absent[9].keeper = Some(KeeperAtLaunch::Absent);
     let soak = judge(&absent, now_after(&absent), &P4);
     only_broken(&soak, "no-miss");
     assert_eq!(soak.misses.len(), 1);
 
-    // The killed run's link was off: nothing was registered, no miss.
     let mut off = rows.clone();
     off[9].keeper = Some(KeeperAtLaunch::Off);
     assert!(judge(&off, now_after(&off), &P4).misses.is_empty());
 
-    // No keeper answered the next launch: it had nothing to recover from, no miss.
     let mut none_answered = rows.clone();
     none_answered[10].keeper = Some(KeeperAtLaunch::Absent);
     assert!(
@@ -313,11 +302,9 @@ fn a_kill_the_keeper_did_not_bring_back_is_a_miss() {
             .is_empty()
     );
 
-    // The killed run's row has been trimmed away: not judged.
     let trimmed: Vec<Row> = rows[10..].to_vec();
     assert!(judge(&trimmed, now_after(&trimmed), &P4).misses.is_empty());
 
-    // An update successor's run, killed, whose keeper took its terminals at its Commit.
     let mut armed = rows;
     armed[9].keeper = Some(KeeperAtLaunch::Armed);
     assert_eq!(judge(&armed, now_after(&armed), &P4).misses.len(), 1);
@@ -328,7 +315,6 @@ fn a_kill_the_keeper_did_not_bring_back_is_a_miss() {
 #[test]
 fn a_session_the_recovery_refused_is_a_miss() {
     let mut rows = met_ledger();
-    // 6 exact of 7 offered is under the floor, and the seventh was refused.
     rows[13].restores = Some(Restores {
         exact: 2,
         refused: 1,
@@ -343,12 +329,10 @@ fn a_session_the_recovery_refused_is_a_miss() {
     assert_eq!(soak.kills_recovered, 3);
     assert!(soak.misses.is_empty(), "no launch recovered nothing");
 
-    // With exact sessions enough to hold the floor, the refusal alone is a miss.
     rows[3].restores = Some(exact(10));
     let soak = judge(&rows, now_after(&rows), &P4);
     only_broken(&soak, "no-miss");
 
-    // A recovery that refused every offer brought nothing back: no recovered kill.
     let mut all_refused = met_ledger();
     all_refused[13].restores = Some(Restores {
         refused: 2,
@@ -369,7 +353,6 @@ fn a_recovery_after_an_unknown_end_is_not_said_to_be_on_purpose() {
     rows[5].restores = Some(exact(1));
     rows[6].prev.class = EndClass::Clean;
     rows[6].restores = Some(exact(1));
-    // One that refused every offer recovered nothing: no recovery to report.
     rows[7].prev.class = EndClass::Clean;
     rows[7].restores = Some(Restores {
         refused: 1,

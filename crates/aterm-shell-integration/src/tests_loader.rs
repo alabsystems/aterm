@@ -379,7 +379,9 @@ fn spawn_live_bash_from(fx: &LiveFixture, dir: &Path, extra: &[(&str, &str)]) ->
 #[cfg(unix)]
 const BODY_PROBE_FN: &str = "__aterm_body_probe() { printf '%s\\n' PROBE-NEWER; }";
 
-/// [`BODY_PROBE_FN`] in fish.
+/// [`BODY_PROBE_FN`] in fish. It reads `$__aterm_last_status` with `test`, as earlier bodies'
+/// custom prompts do, so it fails if this body leaves that a list (which stops an older body
+/// a shell is pointed back to with a `test` error).
 #[cfg(unix)]
 const BODY_PROBE_FN_FISH: &str = "function __aterm_body_probe; test $__aterm_last_status -ge 0; and printf '%s\\n' PROBE-NEWER; end";
 
@@ -812,7 +814,10 @@ const STARTED_SINCE: &str = "3-23:59:50";
 #[cfg(unix)]
 const STARTED_BEFORE: &str = "4-00:00:10";
 
-/// Lay the fixture's bin before the shell starts.
+/// Lay the fixture's bin before the shell starts. The actual loader's external
+/// readers receive captured timestamps: the clock [`STAND_IN_NOW`], a shell
+/// started since the cut ([`STARTED_SINCE`]), the folder born and changed 100 s
+/// before [`CUT`], so before every shell here.
 #[cfg(unix)]
 fn lay_aterm_bin(fx: &LiveFixture) -> String {
     lay_aterm_bin_with_dates(fx, CUT - 100, CUT - 100, STARTED_SINCE)
@@ -1155,7 +1160,11 @@ fn a_nested_bash_is_not_integrated_by_the_typed_line() {
     sh.finish();
 }
 
-/// THE OLD `~/.aterm/bin` IN POWERSHELL.
+/// THE OLD `~/.aterm/bin` IN POWERSHELL. Its integration has no loader and no
+/// body: the guard ends a second load, and nothing reaches a running pwsh but
+/// the file dot-sourced into it again (a profile re-run after an update), which
+/// takes the entry off before the guard where the pwsh proves an older script
+/// put it there.
 #[cfg(any(unix, windows))]
 fn pwsh_takes_an_older_scripts_aterm_bin_off(
     label: &str,
@@ -1750,7 +1759,8 @@ fn spawn_live_fish_from(
     LiveShell::spawn("fish", &mut cmd).holding(hermetic.into_home())
 }
 
-/// The fish lanes need fish and a pty.
+/// The fish lanes need fish and a pty. Like every other live fish test in this
+/// crate, a host without them runs none of them and says so: COULD NOT RUN.
 #[cfg(unix)]
 fn live_fish() -> &'static str {
     let fish = need_fish();
@@ -1847,7 +1857,10 @@ fn user_binding(label: &str, n: u32) -> (&'static str, String, String) {
     }
 }
 
-/// A newer body taken at a prompt leaves the user's key bindings alone.
+/// A newer body taken at a prompt leaves the user's key bindings alone. The integration
+/// binds a handful of keys (Alt/Ctrl+arrows, Home/End, Delete, Shift+Up/Down) so their
+/// sequences never leak as text, once, at the shell's first load, which zsh (`.zshenv`) and
+/// fish (vendor conf.d) run before the user's own rc, so a binding of the user's wins.
 #[cfg(unix)]
 fn live_pickup_keeps_user_bindings(label: &str, sh: &mut LiveShell, bf: &BodyFixture) {
     let (bind, probe, marker) = user_binding(label, 0);

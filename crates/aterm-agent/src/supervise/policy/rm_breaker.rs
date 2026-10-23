@@ -204,7 +204,7 @@ impl ScratchRoot {
         &self.label
     }
 
-    fn depth(&self) -> usize {
+    const fn depth(&self) -> usize {
         self.comps.len()
     }
 

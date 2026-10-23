@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Events and errors: the 32-byte packets the server sends unasked. aterm's
-//! own connections (the clipboard's) read only selection and property
-//! traffic; everything else stays an [`Event::Other`] with its code. Built
-//! for SendEvent too: a [`SelectionNotify`] or [`ClientMessage`] encodes to
-//! the packet another client receives. Bytes held to x11rb-protocol 0.13.2's
-//! (`tests/recorded/`).
+//! X11 events and errors: 32-byte packets sent by the server.
 
 use super::{Atom, ParseError, Reader, Timestamp, Window};
 
@@ -189,8 +184,7 @@ pub enum Event {
 }
 
 impl Event {
-    /// Parse one event packet: 32 bytes, or more for a GenericEvent. The
-    /// high bit of the code (an event another client sent) is ignored.
+    /// Parse one event packet: 32 bytes, or more for a GenericEvent.
     pub fn parse(bytes: &[u8]) -> Result<Event, ParseError> {
         let mut r = Reader::new(bytes);
         let code = r.u8()? & 0x7f;

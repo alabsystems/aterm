@@ -845,7 +845,10 @@ mod tests {
         Frame::decode(&decode_header(&h)?, &bytes[HEADER_LEN..])
     }
 
-    /// The crash-restore fields only grow the wire.
+    /// The crash-restore fields only grow the wire. A journal OFFER and a WELCOME stating caps
+    /// are the older frame plus trailing bytes, so an older window reads them as before (the
+    /// growth rule) and its strict offer loop still meets an OFFER; and the older frames, whose
+    /// bodies end before those fields, decode as stating none.
     #[test]
     fn the_journal_fields_only_grow_the_wire() {
         let offer = |journal| Frame::Offer {

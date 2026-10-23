@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `KERN_PROCARGS2` layout's edge cases, once for every reader of it, on
-//! buffers laid out as the kernel lays them; and the live read of this process.
+//! `KERN_PROCARGS2` layout edge cases and live process read tests.
 
 use super::*;
 
@@ -120,9 +119,6 @@ fn this_process_reads_back_as_it_was_exec_d() {
 /// `kern.argmax` plus the argc (`EINVAL`) and fills a smaller one with the record's LAST bytes:
 /// the exec path and the first words are gone, and what follows the argc parses as other
 /// words (measured 2026-10-20: `ps` prints such a process as `ptr_munge= ptr_munge=`).
-///
-/// The record is this test binary's own, re-run ALONE with an environment that fills
-/// `ARG_MAX`; the stage proves the record is larger than any buffer the kernel takes.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_record_past_what_the_kernel_hands_over_reads_as_nothing() {
@@ -151,11 +147,6 @@ fn a_record_past_what_the_kernel_hands_over_reads_as_nothing() {
         let exe = std::env::current_exe().expect("the test binary");
         let args = ["--exact", NAME, "--nocapture", "--test-threads=1"];
         let stage = format!("{STAGE}=1");
-        // What the spawn counts against `ARG_MAX`: every argument and environment string
-        // with its NUL (`argv[0]`, the path, first) and the exec path once more (measured:
-        // counting the path once, a filler 16 bytes short is `E2BIG`). The filler takes all
-        // but 64 bytes; the kernel's own strings (`executable_path=…`) take the record past
-        // what the kernel hands over.
         let path = exe.as_os_str().len() + 1;
         let taken = 2 * path
             + args.iter().map(|a| a.len() + 1).sum::<usize>()

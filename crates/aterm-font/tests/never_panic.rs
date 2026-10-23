@@ -675,7 +675,8 @@ fn crafted_table_edges_answer_as_upstream() {
     }
 }
 
-/// The seed faces: one per outline format.
+/// The seed faces: one per outline format. The committed ones run on every
+/// host; a Mac adds its CFF2 (SF India) and CID-keyed CFF (Hiragino) faces.
 fn seeds() -> Vec<(&'static str, Vec<u8>)> {
     let render = format!("{}/../aterm-render", env!("CARGO_MANIFEST_DIR"));
     let mut out = Vec::new();
@@ -873,7 +874,8 @@ const CHARSTRING_OPS: &[u8] = &[
     30, 31, 247, 251, 255,
 ];
 
-/// One mutation of `seed`.
+/// One mutation of `seed`. `glyph_programs` are the seed's charstrings (empty
+/// for a TrueType face).
 fn mutate(
     seed: &[u8],
     targets: &[Target],

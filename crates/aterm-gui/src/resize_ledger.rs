@@ -375,7 +375,9 @@ pub(crate) struct Run {
 }
 
 impl Run {
-    /// A run of one resize.
+    /// A run of one resize. `credited` is `(top, bottom)`: the rows `report`
+    /// handed back to OTHER runs ([`ResizeLedger::credit`]), which are theirs,
+    /// not this run's shift.
     fn start(id: u64, report: &ResizeReport, now_ms: u64, credited: (u32, u32)) -> Self {
         let mut run = Self {
             id,
@@ -657,7 +659,10 @@ impl ResizeLedger {
         out
     }
 
-    /// Follow `probe`'s engine.
+    /// Follow `probe`'s engine. The same lifetime changes nothing; another one
+    /// (a restored engine: ordinals, content and counters restart) rebases the
+    /// open runs onto its readings, so the displacement a checkpoint carried
+    /// over is still judged, against counters it can be compared with.
     fn enter_lifetime(&mut self, probe: &EngineProbe) {
         if self.lifetime == Some(probe.lifetime) {
             return;
@@ -2506,7 +2511,8 @@ mod tests {
             self.now_ms += 1;
         }
 
-        /// Drive one step and name the model action it is.
+        /// Drive one step and name the model action it is. A shrink is a
+        /// `Demote` or a `Trim` by what the engine journalled it did.
         fn drive(&mut self, step: Step) -> &'static str {
             self.evaluated = false;
             match step {

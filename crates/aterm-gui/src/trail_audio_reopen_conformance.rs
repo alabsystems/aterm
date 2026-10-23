@@ -320,6 +320,7 @@ fn explore_schedule(schedule: &[Duration], mutation: Mutation) -> Result<BTreeSe
     Ok(visited)
 }
 
+/// The schedule conforms, at the shipping budget with the shipping schedule and
 /// at the model's two-step budget, and the run reaches every state the model can.
 #[test]
 fn the_reopen_schedule_conforms_exhaustively() {
@@ -797,6 +798,8 @@ fn push_plays_once(_: usize, here: usize) -> bool {
 /// `(label, script, cues, pace, rest before one last cue)`.
 type Scenario = (&'static str, Script, usize, Pace, Option<Duration>);
 
+/// The call sites conform: eight scripted devices through the real
+/// `worker_loop`, each trace a path of the model, including a device found dead
 /// by the housekeeping tick and a re-open that fails inside the re-push.
 #[test]
 fn the_worker_loop_traces_conform_to_the_reopen_ladder() {
@@ -904,6 +907,8 @@ fn the_worker_loop_traces_conform_to_the_reopen_ladder() {
     }
 }
 
+/// Negative controls for the call-site half: doctored traces of the replayed
+/// defects, and a worker that stops charging its faults, are rejected by the
 /// validator that accepts the real ones.
 #[test]
 fn the_trace_validator_rejects_the_replayed_defects() {

@@ -101,7 +101,11 @@ fn divergent_act(report: &Report) -> Option<(Option<&ActSide>, Option<&ActSide>)
     }
 }
 
-/// WOULD IT HAVE PRESSED UNDER "SAFE"?
+/// WOULD IT HAVE PRESSED UNDER "SAFE"? The run recorded under "all" pressed
+/// both boxes; replayed under `approve = "safe"`, the candidate takes another
+/// act at the first press — it escalates the Read instead — and the replay
+/// stops there: DIVERGED, a decision, the recorded press and the candidate's
+/// badge both said, and the decision before each.
 #[test]
 fn a_safe_policy_diverges_at_the_press_all_took() {
     let (bytes, keys) = recorded();

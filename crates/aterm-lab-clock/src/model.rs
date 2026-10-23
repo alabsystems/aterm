@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The clock's arithmetic and its record, free of the platform: which clocks
-//! a step moves, the offset file's text, a reading shifted by an offset in
-//! each of the units the wrapped calls answer in, and the `<pid>.txt` record.
-//! Nothing here allocates or panics: it runs inside every clock read of the
-//! processes the library is loaded into.
+//! Platform-free clock offset arithmetic and record formatting.
 
 use core::fmt;
 
@@ -14,26 +10,25 @@ const NS: i128 = 1_000_000_000;
 /// Microseconds in a second.
 const US: i128 = 1_000_000;
 
-/// `CLOCK_REALTIME`: the wall clock.
+/// `CLOCK_REALTIME`.
 pub(crate) const CLOCK_REALTIME: u32 = 0;
-/// `CLOCK_MONOTONIC_RAW`: counts a sleep.
+/// `CLOCK_MONOTONIC_RAW`.
 pub(crate) const CLOCK_MONOTONIC_RAW: u32 = 4;
-/// `CLOCK_MONOTONIC_RAW_APPROX`: counts a sleep.
+/// `CLOCK_MONOTONIC_RAW_APPROX`.
 pub(crate) const CLOCK_MONOTONIC_RAW_APPROX: u32 = 5;
-/// `CLOCK_MONOTONIC`: counts a sleep (Bun's timers read it).
+/// `CLOCK_MONOTONIC`.
 pub(crate) const CLOCK_MONOTONIC: u32 = 6;
-/// `CLOCK_UPTIME_RAW`: stops in a sleep (Rust's `Instant`).
+/// `CLOCK_UPTIME_RAW`.
 #[cfg(test)]
 pub(crate) const CLOCK_UPTIME_RAW: u32 = 8;
-/// `CLOCK_UPTIME_RAW_APPROX`: stops in a sleep.
+/// `CLOCK_UPTIME_RAW_APPROX`.
 #[cfg(test)]
 pub(crate) const CLOCK_UPTIME_RAW_APPROX: u32 = 9;
 
 /// The clock ids the record counts reads of (`clockid_t` values below this).
 pub(crate) const NCLOCK: usize = 32;
 
-/// Whether a read of `clock` is shifted: the wall clock always, the clocks
-/// that count a sleep under the continuous switch, every other clock never.
+/// Whether a read of `clock` is shifted.
 pub(crate) const fn shifted(clock: u32, continuous: bool) -> bool {
     match clock {
         CLOCK_REALTIME => true,
@@ -42,9 +37,7 @@ pub(crate) const fn shifted(clock: u32, continuous: bool) -> bool {
     }
 }
 
-/// The offset file's text read: decimal seconds (`1800`, `1800.250`, `-3`),
-/// at most nine places after the point, surrounding white space allowed. In
-/// nanoseconds; `None` for anything else, or more than `i64` holds.
+/// The offset file's text read.
 pub(crate) fn parse_offset(text: &[u8]) -> Option<i64> {
     let text = text.trim_ascii();
     let (negative, digits) = match text.split_first() {
@@ -83,22 +76,19 @@ fn clamp(value: i128) -> i64 {
     i64::try_from(value).unwrap_or(if value < 0 { i64::MIN } else { i64::MAX })
 }
 
-/// A `timespec` (`sec`, `nsec`) shifted by `off` nanoseconds, normalized
-/// (`0 <= nsec < 1e9`).
+/// A `timespec` (`sec`, `nsec`) shifted by `off` nanoseconds, normalized (`0 <= nsec < 1e9`).
 pub(crate) fn shift_timespec(sec: i64, nsec: i64, off: i64) -> (i64, i64) {
     let total = i128::from(sec) * NS + i128::from(nsec) + i128::from(off);
     (clamp(total.div_euclid(NS)), clamp(total.rem_euclid(NS)))
 }
 
-/// A `timeval` (`sec`, `usec`) shifted by `off` nanoseconds (whole
-/// microseconds of it, toward zero), normalized (`0 <= usec < 1e6`).
+/// A `timeval` (`sec`, `usec`) shifted by `off` nanoseconds, normalized (`0 <= usec < 1e6`).
 pub(crate) fn shift_timeval(sec: i64, usec: i64, off: i64) -> (i64, i64) {
     let total = i128::from(sec) * US + i128::from(usec) + i128::from(off / 1000);
     (clamp(total.div_euclid(US)), clamp(total.rem_euclid(US)))
 }
 
-/// A `clock_gettime_nsec_np` answer shifted by `off` nanoseconds; its error
-/// answer (0) stays 0.
+/// A `clock_gettime_nsec_np` answer shifted by `off` nanoseconds.
 pub(crate) const fn shift_nsec(value: u64, off: i64) -> u64 {
     if value == 0 {
         0
@@ -107,8 +97,7 @@ pub(crate) const fn shift_nsec(value: u64, off: i64) -> u64 {
     }
 }
 
-/// `ns` nanoseconds in Mach absolute-time ticks of the timebase `numer/denom`
-/// (ticks × numer / denom = nanoseconds); 0 for a timebase with a zero.
+/// `ns` nanoseconds in Mach absolute-time ticks of the timebase `numer/denom`.
 pub(crate) fn ns_to_ticks(ns: i64, numer: u32, denom: u32) -> i64 {
     if numer == 0 || denom == 0 {
         return 0;
@@ -121,8 +110,7 @@ pub(crate) fn shift_ticks(value: u64, off: i64, numer: u32, denom: u32) -> u64 {
     value.saturating_add_signed(ns_to_ticks(off, numer, denom))
 }
 
-/// A text of at most `N` bytes on the stack: the record and its path are
-/// built in one, so writing them allocates nothing.
+/// A text of at most `N` bytes on the stack.
 pub(crate) struct Text<const N: usize> {
     buf: [u8; N],
     len: usize,
@@ -163,8 +151,7 @@ impl<const N: usize> fmt::Write for Text<N> {
     }
 }
 
-/// What a process's `<pid>.txt` says: who it is, the offset it reads by, and
-/// how often it read each clock since it loaded the library.
+/// What a process's `<pid>.txt` says.
 pub(crate) struct Record<'a> {
     pub(crate) pid: u32,
     pub(crate) ppid: u32,
@@ -180,10 +167,7 @@ pub(crate) struct Record<'a> {
     pub(crate) clock_gettime_nsec_np: [u64; NCLOCK],
 }
 
-/// The record's text: `pid= ppid= exe=` (the executable to the end of the
-/// line), `offset_ns= continuous= file_reads=`, the reads of the four calls
-/// that name no clock, then one `clock N:` line for each clock read at all.
-/// The lab reads `exe=` and `offset_ns=` (crates/aterm-lab/src/clock.rs).
+/// The record's text.
 ///
 /// # Errors
 /// It does not fit in `out`.
@@ -235,7 +219,6 @@ mod tests {
             ] {
                 assert_eq!(shifted(c, continuous), continuous, "clock {c}");
             }
-            // uptime, the CPU-time clocks and an id nobody defines
             for c in [CLOCK_UPTIME_RAW, CLOCK_UPTIME_RAW_APPROX, 12, 16, 31, 99] {
                 assert!(!shifted(c, continuous), "clock {c}");
             }
@@ -276,7 +259,6 @@ mod tests {
 
     #[test]
     fn a_reading_is_shifted_and_normalized_in_each_unit() {
-        // a day forward, and the nanoseconds carry
         assert_eq!(
             shift_timespec(1_000, 900_000_000, 86_400_000_000_000),
             (87_400, 900_000_000)
@@ -285,20 +267,16 @@ mod tests {
             shift_timespec(1_000, 900_000_000, 200_000_000),
             (1_001, 100_000_000)
         );
-        // backwards past a second boundary
         assert_eq!(
             shift_timespec(1_000, 100_000_000, -200_000_000),
             (999, 900_000_000)
         );
         assert_eq!(shift_timespec(5, 0, 0), (5, 0));
-        // the seconds saturate rather than wrap
         assert_eq!(shift_timespec(i64::MAX, 0, i64::MAX).0, i64::MAX);
-        // microseconds: the offset's whole microseconds
         assert_eq!(shift_timeval(1_000, 999_999, 1_000), (1_001, 0));
         assert_eq!(shift_timeval(1_000, 0, 1_800_000_000_000), (2_800, 0));
         assert_eq!(shift_timeval(1_000, 0, -1_500), (999, 999_999));
         assert_eq!(shift_timeval(1_000, 5, 999), (1_000, 5));
-        // nanosecond counts, and the error answer stays one
         assert_eq!(shift_nsec(10, 5), 15);
         assert_eq!(shift_nsec(10, -20), 0);
         assert_eq!(shift_nsec(0, 1_000), 0);

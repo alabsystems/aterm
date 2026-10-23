@@ -21,13 +21,16 @@ pub const STAGE_ROOT: &str = "/Library/Management/aterm/stage";
 /// (Emacs.app, 180 MB of nested code, took 5.6 s in the VM).
 const VERIFY_BUDGET: Duration = Duration::from_secs(180);
 
-/// The bound on one `spctl -a`.
+/// The bound on one `spctl -a`. Also a hang detector, and longer: an app with no stapled
+/// ticket is looked up with Apple's notary service, and in the VM `spctl -a -t exec` on
+/// Emacs.app took 93 s, and over 180 s on its first assessment there.
 const GATEKEEPER_BUDGET: Duration = Duration::from_secs(900);
 
 /// The bound on `ditto`, `hdiutil` and `pkgutil --expand-full` over one artifact.
 const STAGE_BUDGET: Duration = Duration::from_secs(900);
 
-/// The bound on `installer -pkg`.
+/// The bound on `installer -pkg`. Homebrew.pkg took 3 s in the VM; a large vendor pkg can
+/// take minutes.
 const INSTALLER_BUDGET: Duration = Duration::from_secs(1800);
 
 /// Artifact packaging kind.

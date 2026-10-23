@@ -3,21 +3,13 @@
 // Author: Andrew Yates
 
 //! Every aterm model in one binary.
-//!
-//! The models live in the `aterm-models-<domain>` crates, beside the engine in `aterm-spec`, so a
-//! model edit rebuilds its domain crate and the tests that drive it. This crate is where they all
-//! meet: `spec-check` (`targo --unverified run -q -p aterm-models --bin spec-check`), the
-//! registry-wide sweeps (`tests/non_vacuity.rs`) and the source-spec closure over every anchored
-//! crate (`tests/spec_xref_closure.rs`). Nothing depends on it, and it is no default member.
 
 use aterm_spec::derive::Model;
 
 /// A domain crate and one model constructor it exports.
 type Domain = (&'static str, fn() -> Model);
 
-/// One model of each domain crate. The registry sees only object code the binary links, and a
-/// crate the binary never names is not linked at all, so naming one constructor per crate is what
-/// puts its models in the registry.
+/// One model of each domain crate.
 const DOMAINS: [Domain; 13] = [
     ("aterm-models-agh", aterm_models_agh::agh_route_wall_model),
     (
@@ -73,9 +65,7 @@ const DOMAINS: [Domain; 13] = [
 /// Link every domain crate's models into the calling binary, and return the domain crates.
 ///
 /// # Panics
-///
-/// When a domain crate registered no model in this binary: its models did not link, and every
-/// sweep over the registry would pass without them.
+/// When a domain crate registered no model in this binary.
 #[must_use]
 pub fn link_all() -> Vec<&'static str> {
     let domains = std::hint::black_box(DOMAINS);

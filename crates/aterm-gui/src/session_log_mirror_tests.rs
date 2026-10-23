@@ -500,7 +500,9 @@ fn an_uncarried_adoption_owes_the_old_spaces_tail() {
     assert_eq!(crashed.log().mirror_prior(), None);
 }
 
-/// with the mirror off nothing engages.
+/// With the mirror off nothing engages. A session that runs and
+/// closes leaves no tail, no tombstone, no manifest row, and its log no
+/// cursor; its carry holds no `ms=`.
 #[test]
 fn the_default_engages_nothing() {
     let store = crate::session_store::new_store();

@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the live relaunch checks share — `muse-relaunch` ([`crate::relaunch_muse`])
-//! and `agy-relaunch` ([`crate::relaunch_agy`]): each judges a relaunch lane
-//! off the real thing, and these are the reads that do not depend on the
-//! agent: a process's words and working directory, the shell's command blocks
-//! (`blocks --json`), the stub's request dumps, the instance's own log and the
-//! upgrade ledger's `relaunched` rows; and how a phase's verdict is said.
+//! What the live relaunch checks share.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,9 +13,7 @@ use crate::restore;
 use crate::run::Run;
 use crate::stop;
 
-/// The words after the program on a process's command line `cmd` run as
-/// `bin` (`ps` joins argv with spaces, and the program's path holds some);
-/// `None` for another program's.
+/// Arguments after `bin` on a process command line `cmd` (`None` for another program).
 #[must_use]
 pub fn words_of(cmd: &str, bin: &str) -> Option<Vec<String>> {
     let rest = cmd.strip_prefix(bin)?;
@@ -36,8 +29,7 @@ pub fn running(run: &Run, bin: &str) -> Vec<(i32, Vec<String>)> {
         .collect()
 }
 
-/// The exit of the newest finished command block in one `blocks --json`
-/// reply whose command line holds `cmd`.
+/// Exit code of the newest finished command block in `blocks --json` matching `cmd`.
 #[must_use]
 pub fn block_exit(json: &str, cmd: &str) -> Option<i64> {
     let j = J::parse(json.trim()).ok()?;
@@ -70,8 +62,7 @@ fn dumps(run: &Run) -> Vec<(u64, PathBuf)> {
     crate::stub::turn_dumps(&run.w.join("dump"))
 }
 
-/// The newest request dump past `since` whose body holds every one of
-/// `want`: its index.
+/// The newest request dump past `since` whose body holds every one of `want`: its index.
 pub fn request_with(run: &Run, since: u64, want: &[&str]) -> Option<u64> {
     dumps(run)
         .into_iter()
@@ -118,8 +109,7 @@ pub fn open_files(pid: i32) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The lines of an instance log (`<unix s.ms> <pid> <level> …`) stamped at
-/// or after `ms`.
+/// The lines of an instance log (`<unix s.ms> <pid> <level> …`) stamped at or after `ms`.
 #[must_use]
 pub fn lines_since(log: &str, ms: i64) -> Vec<String> {
     log.lines()
@@ -161,7 +151,6 @@ pub fn relaunch_rows(run: &Run, ms: i64) -> usize {
 }
 
 /// Wait up to `secs` for `f` to give something, every 250 ms.
-///
 /// # Errors
 /// The run was stopped.
 pub fn wait_for<T>(secs: u64, mut f: impl FnMut() -> Option<T>) -> Result<Option<T>, Fail> {
@@ -174,9 +163,7 @@ pub fn wait_for<T>(secs: u64, mut f: impl FnMut() -> Option<T>) -> Result<Option
     Ok(f())
 }
 
-/// Type `text` and Enter, once the tab takes a driver's input (the harness
-/// holds it while its relaunch carries on): tried for 30 s.
-///
+/// Types `text` and Enter once the tab accepts driver input (up to 30 s).
 /// # Errors
 /// The run was stopped, or the door is gone.
 pub fn send_when_free(door: &Door<'_>, text: &str) -> Result<bool, Fail> {

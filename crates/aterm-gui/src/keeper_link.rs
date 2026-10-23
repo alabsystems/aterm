@@ -255,7 +255,8 @@ fn live_link_in(st: &mut State) -> Result<Option<Arc<KeeperLink>>, ()> {
     Ok(Some(link))
 }
 
-/// Final exit supersedes external lifecycle work.
+/// Final exit supersedes external lifecycle work. Already admitted channel
+/// entries retain their FIFO order before BYE; no later lifecycle is admitted.
 #[cfg(unix)]
 fn quit_link_in(st: &mut State) -> Option<Arc<KeeperLink>> {
     let phase = std::mem::replace(&mut st.phase, Phase::Off);
@@ -1838,7 +1839,11 @@ mod tests {
         assert!(parse("[keeper]\nenabled = true\n").keeper_enabled());
     }
 
-    /// P3 REVIEW — A CANDIDATE IS AN ADMITTED PAIR, NOT THE VARIABLES.
+    /// P3 REVIEW — A CANDIDATE IS AN ADMITTED PAIR, NOT THE VARIABLES. A
+    /// launch whose overlap pair was refused with nothing offered boots fresh
+    /// as a plain window; armed as a candidate it would never say its HELLO —
+    /// no crashed window's shells taken, every registration only buffered,
+    /// crash survival off though `[keeper] enabled = true`.
     #[test]
     fn only_an_admitted_overlap_pair_or_an_adopted_handoff_arms_a_candidate() {
         assert!(
@@ -2662,7 +2667,10 @@ mod tests {
         );
     }
 
-    /// THE BAND (R17-HANDOFF-1's review, ruled 2026-10-11).
+    /// THE BAND (R17-HANDOFF-1's review, ruled 2026-10-11). Where the whole
+    /// carry does not fit the old form but would without the directory and
+    /// colours (then the title and mark state), a window before round
+    /// seventeen sent it so shed, and every reader lost the directory.
     #[cfg(unix)]
     #[test]
     fn where_only_a_shed_old_form_fit_the_meta_goes_packed_and_whole() {
@@ -2831,7 +2839,11 @@ mod tests {
         }
     }
 
-    /// A FULL QUEUE NEVER DROPS A REPLACED REGION'S CUSTODY (R6).
+    /// A FULL QUEUE NEVER DROPS A REPLACED REGION'S CUSTODY (R6). The memory shed hands the
+    /// keeper a fresh region's only read-only descriptor; a link whose keeper is slow to
+    /// read (paged out under the very pressure being shed) has a full queue, and the
+    /// COMPANION it could not take used to be dropped there (`let _ = link.enqueue(op)`),
+    /// leaving the keeper on the superseded region for good.
     #[cfg(unix)]
     #[test]
     fn a_full_queue_hands_a_replaced_regions_custody_back_for_another_offer() {

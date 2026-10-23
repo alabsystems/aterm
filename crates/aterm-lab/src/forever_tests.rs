@@ -1247,7 +1247,9 @@ fn the_words_are_read() {
 
 const T0: i64 = 1_000_000;
 
-/// A journal line at `t` after [`T0`].
+/// A journal line at `t` after [`T0`]. A back-off's `until=x` reads as the
+/// due it names, the stamp the journal writes (cut to its second): `t` and
+/// its `M min back-off`.
 fn j(t: i64, line: &str) -> (i64, String) {
     let line = match line.split_once("until=x ") {
         Some((head, words)) => match words
@@ -2887,7 +2889,8 @@ fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp()
 }
 
 /// Every character of land-p's prompt is a key `hwkey` names (printable
-/// U.S.
+/// U.S. ASCII, the layout its key table maps), a space by its name (the verb
+/// splits its words on it); no `?` (Gemini CLI's shortcuts key).
 #[test]
 fn land_p_s_prompt_is_typed_key_by_key_through_hwkey() {
     let prompt = Chain::LandP.prompt();

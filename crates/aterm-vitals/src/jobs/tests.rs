@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The pure kernels: φ and its §11.7 table, the row's number words, the
-//! command class and its table, the Tier B frame map, and Tier A naming from
-//! each kernel fact (the engine's tick laws are `tests/stuck_scenarios.rs`).
+//! Unit tests for pure job-stall kernels, command classification, and naming.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -21,18 +19,13 @@ fn reach_s(phi: u64, mu_ms: u64) -> u64 {
 
 #[test]
 fn phi_crosses_the_design_table_at_its_times() {
-    // μ 10 s: φ 3 at 69 s, φ 8 at 3 min 4 s.
     assert_eq!(reach_s(3000, 10_000), 70);
     assert_eq!(reach_s(8000, 10_000), 185);
-    // μ 60 s: 6 min 55 s and 18 min 25 s.
     assert_eq!(reach_s(3000, 60_000), 415);
     assert_eq!(reach_s(8000, 60_000), 1106);
-    // μ 60 s × 2.0: 13 min 49 s and 36 min 50 s.
     assert_eq!(reach_s(3000, 120_000), 829);
     assert_eq!(reach_s(8000, 120_000), 2211);
-    // A line every 10 s: a 9 s gap scores 0.39.
     assert_eq!(phi_milli(9_000, 10_000), 390);
-    // The examples' figures.
     assert_eq!(phi_text(phi_milli(1_142_000, 60_000)), "8.27");
     assert_eq!(phi_text(phi_milli(420_000, 12_000)), "15.2");
     assert_eq!(phi_text(phi_milli(1_130_000, 60_000)), "8.18");
@@ -65,7 +58,6 @@ fn the_command_class_is_the_first_words_basename_plus_the_kind() {
         "curl agent-call"
     );
     assert_eq!(command_class("  ", JobKind::ShellBg), " shell-bg");
-    // A digit-led name is no assignment; at most 32 bytes, on a char boundary.
     assert_eq!(command_class("2=x y", JobKind::Shell), "2=x shell");
     let long = format!("{}é", "a".repeat(31));
     assert_eq!(
@@ -125,8 +117,6 @@ fn tier_b_maps_libsystem_leaf_frames_only() {
     );
     assert_eq!(TierB::Lock.word(), "lock");
 }
-
-// --- Tier A naming, fact by fact -------------------------------------------
 
 fn proc_with(pid: u32, name: &str, fds: Vec<Fd>) -> JobProc {
     JobProc {
@@ -218,7 +208,6 @@ fn a_sleeping_kqueue_names_follow_listen_timer_or_an_event_loop() {
     let p = proc_with(5, "timerd", vec![kq(true, Some(vec![timer]))]);
     assert_eq!(name_of(&[p], on, &[], None, 5).name, WaitName::Timer);
 
-    // Without lane L6 the entries are unlisted: an event loop, capped.
     let p = proc_with(5, "tail", vec![file(3), kq(true, None)]);
     let w = name_of(&[p], on, &[], None, 5);
     assert_eq!(
@@ -226,7 +215,6 @@ fn a_sleeping_kqueue_names_follow_listen_timer_or_an_event_loop() {
         (WaitName::EventLoop, Standing::Capped)
     );
 
-    // A kqueue nobody sleeps on names nothing.
     let p = proc_with(5, "x", vec![kq(false, Some(vec![read(3)]))]);
     assert_eq!(name_of(&[p], on, &[], None, 5).name, WaitName::Unnamed);
 }
@@ -249,7 +237,6 @@ fn a_connection_names_the_wait_only_when_nothing_else_does() {
     let idle = tcp(21, TcpState::Established, 5173);
     let named = |fds: Vec<Fd>| name_of(&[proc_with(5, "node", fds)], on, &[], None, 5);
 
-    // A server asleep on its listener with a keep-alive client: listen.
     let w = named(vec![
         listen.clone(),
         idle.clone(),
@@ -265,16 +252,13 @@ fn a_connection_names_the_wait_only_when_nothing_else_does() {
         (w.name, w.port, w.standing),
         (WaitName::Listen, Some(5173), Standing::Legit)
     );
-    // The same server blocked in accept (no event queue): it serves.
     let w = named(vec![listen, idle.clone()]);
     assert_eq!((w.name, w.port), (WaitName::Listen, Some(5173)));
-    // A queue whose only entries are the connection: tcp.
     let w = named(vec![
         idle.clone(),
         kq(true, Some(vec![knote(21, KnoteFilter::Read)])),
     ]);
     assert_eq!((w.name, w.standing), (WaitName::Tcp, Standing::Capable));
-    // The connection beside a timer: the queue waits for more, an event loop.
     let w = named(vec![
         idle.clone(),
         kq(
@@ -286,7 +270,6 @@ fn a_connection_names_the_wait_only_when_nothing_else_does() {
         ),
     ]);
     assert_eq!(w.name, WaitName::EventLoop);
-    // No queue and no listener: the connection is the wait (curl).
     let w = named(vec![idle]);
     assert_eq!(w.name, WaitName::Tcp);
 }
@@ -304,7 +287,6 @@ fn a_pipe_counts_as_its_writer_and_a_full_one_as_its_reader() {
             write_end: Some(write),
         },
     };
-    // cat reads what curl writes; curl waits on a silent socket.
     let tcp = Fd {
         fd: 5,
         kind: FdKind::Tcp {
@@ -321,7 +303,6 @@ fn a_pipe_counts_as_its_writer_and_a_full_one_as_its_reader() {
         (w.name, w.peer, w.standing),
         (WaitName::Pipe, Some(10), Standing::Capable)
     );
-    // Without lane L7 the flag is not read.
     let off = LanesSeen {
         pipe_flags: false,
         ..on
@@ -331,7 +312,6 @@ fn a_pipe_counts_as_its_writer_and_a_full_one_as_its_reader() {
         WaitName::Unnamed
     );
 
-    // yes blocked on a full pipe to sleep: the reader decides (unnamed).
     let yes = proc_with(20, "yes", vec![end(1, 0xE2, 0xE1, true, 0, 0)]);
     let sleep = proc_with(21, "sleep", vec![end(0, 0xE1, 0xE2, false, 0x10, 65_536)]);
     let w = name_of(&[yes, sleep], on, &[], None, 20);
@@ -340,7 +320,6 @@ fn a_pipe_counts_as_its_writer_and_a_full_one_as_its_reader() {
         (WaitName::PipeFull, Some(21), Standing::Capped)
     );
 
-    // Linux: one inode for both ends, the wait channel names the wait.
     let mut reader = proc_with(30, "cat", vec![end(0, 777, 777, false, 0, 0)]);
     reader.wchan = Some("pipe_read".to_owned());
     let mut writer = proc_with(31, "sleep", vec![end(1, 777, 777, true, 0, 0)]);
@@ -448,17 +427,14 @@ fn the_tty_names_read_the_fresh_mode_word_only_for_the_foreground_job() {
         name_job(&scene, &fg(Some(mode(false, false))), &leaves, (1, "zsh")).name,
         WaitName::TtyRaw
     );
-    // A canonical echoing read is every plain job's termios: not named.
     assert_eq!(
         name_job(&scene, &fg(Some(mode(true, true))), &leaves, (1, "zsh")).name,
         WaitName::Unnamed
     );
-    // A stale word (older than the job's last output) is no word.
     assert_eq!(
         name_job(&scene, &fg(None), &leaves, (1, "zsh")).name,
         WaitName::Unnamed
     );
-    // Queued input or a background job: no tty name.
     let mut j = fg(Some(mode(true, false)));
     j.queue_empty = false;
     assert_eq!(

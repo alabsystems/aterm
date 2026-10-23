@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Token files and env sources under the strict load (design §6.1, §6.6): shape, kind,
-//! fingerprint, file identity, the loose, symlink and missing cases and their remedies, and
-//! the ambient report. Unix only: every test reads a private token file or its remedy.
+//! Token file and environment source loading tests under strict permissions.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -324,8 +322,7 @@ fn the_symlink_remedy_names_a_linked_directory() {
     assert_ne!(linked, file_link);
 }
 
-/// A system directory that is a link of another user's (root's `/tmp` on macOS), or `None`
-/// where there is none, or this is root.
+/// A system directory that is a link of another user's.
 pub(crate) fn foreign_dir_link() -> Option<(PathBuf, PathBuf)> {
     if aterm_uds::peer::our_uid() == 0 {
         return None;
@@ -358,7 +355,6 @@ fn the_symlink_remedy_of_another_users_link_names_only_the_real_path() {
         1,
         "the link is named only as where the file is: {remedy}"
     );
-    // The control: a link of this user's is named twice, as the place and as the fix.
     std::os::unix::fs::symlink(root.path(), root.path().join("mine")).expect("a dir symlink");
     let mine = LoadError::Symlink
         .remedy(
@@ -410,8 +406,7 @@ fn the_malformed_remedy_follows_the_rule_broken() {
     assert_ne!(env_remedy, not_file_remedy);
 }
 
-/// An environment whose every variable is one raw value, which need not be UTF-8: the case
-/// `MapEnv::with` cannot spell.
+/// An environment whose every variable is one raw value, which need not be UTF-8.
 struct RawEnv(OsString);
 
 impl identity::EnvSource for RawEnv {
@@ -463,7 +458,6 @@ fn ambient_tokens_are_reported_and_an_empty_one_is_ignored() {
 
 #[test]
 fn the_fingerprint_is_fixed() {
-    // sha256("agh/fp/v1\0agh fingerprint fixture"), computed once outside agh.
     assert_eq!(
         identity::fingerprint(b"agh fingerprint fixture"),
         "8b4416e21b8a"

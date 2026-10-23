@@ -239,7 +239,9 @@ pub(super) struct ResizeGuard {
     records: AtomicBool,
     /// The reader thread's scan for that request.
     handshake: Mutex<HandshakeScan>,
-    /// The input stream after the last write.
+    /// The input stream after the last write. Held across each write, so the
+    /// decision and the bytes it decided about stay in order; writes on one
+    /// pipe handle are serialized by the kernel anyway.
     input: Mutex<InputStream>,
 }
 

@@ -75,7 +75,8 @@ fn win32_keypad_enter(modifiers: Modifiers, mode: KeyboardMode) -> Option<Win32K
     })
 }
 
-/// F13-F20 under OpenConsole: `VK_F13`..
+/// F13-F20 under OpenConsole: `VK_F13`.. with their set-1 scan codes (0x64..0x6B), char 0, and
+/// every chord bit.
 #[cfg_attr(trust_verify, trust::skip)]
 fn win32_f13_f20(
     named: NamedKey,
@@ -133,7 +134,9 @@ fn win32_ctrl_break(modifiers: Modifiers) -> Option<Win32KeyRecord> {
     })
 }
 
-/// Shift+Space and the Ctrl+Space chords.
+/// Shift+Space and the Ctrl+Space chords. Legacy has no Shift+Space (a bare space, read as
+/// Space), and Ctrl+Space's NUL reads as Ctrl+Shift+2 (`D2 MODS=Shift+Control`); Ctrl+Alt+Space's
+/// `ESC NUL` lost its NUL on the way to a VT reader (Git Bash got `ESC`).
 #[cfg_attr(trust_verify, trust::skip)]
 const fn win32_space_chord(modifiers: Modifiers) -> Option<Win32KeyRecord> {
     let shift = modifiers.contains(Modifiers::SHIFT);

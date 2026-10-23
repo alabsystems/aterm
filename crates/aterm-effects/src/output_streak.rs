@@ -185,7 +185,8 @@ struct Pending {
     right: u16,
 }
 
-/// The glyph identity a `RenderCell` carries, without colours.
+/// The glyph identity a `RenderCell` carries, without colours. Grapheme tails live in
+/// `RenderInput` channels this API does not receive, so a tail-only change claims nothing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ObservedGlyph {
     ch: char,
@@ -543,7 +544,8 @@ impl OutputStreak {
         StreakFrame { fp, cue }
     }
 
-    /// Whether the idle drain has expired.
+    /// Whether the idle drain has expired. A non-finite or non-positive
+    /// `idle_secs` drains immediately rather than animating forever.
     #[inline]
     fn idle_drained(&self, now: Instant, cfg: &StreakConfig) -> bool {
         let Some(last) = self.last_output else {
@@ -613,7 +615,8 @@ impl OutputStreak {
         self.comets.iter().take(cap).position(Option::is_none)
     }
 
-    /// Governor 6, opening half: one pip on the quiet→active crossing, then mute.
+    /// Governor 6, opening half: one pip on the quiet→active crossing, then mute. A fire denied
+    /// by [`SOUND_MIN_GAP_MS`] is not heard and does not re-arm.
     #[inline]
     fn open_episode_cue(
         &mut self,
@@ -674,7 +677,10 @@ impl OutputStreak {
         (anchor + jitter).clamp(0.0, 1.0)
     }
 
-    /// Refresh, open or move the flood ribbon on the newest output row.
+    /// Refresh, open or move the flood ribbon on the newest output row. A move takes light off
+    /// one row and puts it on another, so it spends from the shared ignition floor
+    /// (`last_spawn`); otherwise a cursor alternating between two rows (a two-line progress
+    /// display) would re-home it at the frame rate.
     fn refresh_ribbon(&mut self, now: Instant, pending: Pending, cfg: &StreakConfig, geom: Geom) {
         let Some((from_col, to_col)) = clipped_span(pending, geom.cols) else {
             return;
@@ -846,7 +852,8 @@ fn clipped_span(pending: Pending, cols: usize) -> Option<(i32, i32)> {
     ))
 }
 
-/// The mandatory idle duration.
+/// The mandatory idle duration. Scheduling and consumption share this one rounded `Duration`,
+/// so a wake at the promised boundary is consumed on that tick.
 #[inline]
 fn idle_duration(idle_secs: f32) -> Option<Duration> {
     (idle_secs.is_finite() && idle_secs > 0.0)
@@ -862,7 +869,9 @@ const fn pan_of(pending: Pending, geom: Geom) -> f32 {
     ((centre / cols) * 2.0 - 1.0).clamp(-1.0, 1.0)
 }
 
-/// Nearest named spectrum colour by circular HSV hue.
+/// Nearest named spectrum colour by circular HSV hue. Comparing hues, not
+/// `spectrum_stop_position`'s arc parameter, keeps the two domains apart when the arc is
+/// perceptually re-paced.
 #[inline]
 fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
     let hue = hue_position_of(rgb);

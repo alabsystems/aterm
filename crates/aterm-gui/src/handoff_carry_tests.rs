@@ -1536,7 +1536,9 @@ fn a_mangled_log_member_never_panics_the_adopting_log() {
     }
 }
 
-/// Mirror metadata shares the control carry's existing cap.
+/// Mirror metadata shares the control carry's existing cap. Ordinary cores fill
+/// that cap exactly; engaging the same logs must keep every session's newest
+/// turns and its mirror cursor, shedding older turns before exceeding it.
 #[test]
 fn mirrored_cursors_are_reserved_before_the_control_carry_spends_its_budget() {
     const SESSIONS: usize = 16;

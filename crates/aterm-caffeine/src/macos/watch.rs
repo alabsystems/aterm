@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The update watch: whether the code the mug was started from has been replaced, so it can
-//! end with [`crate::launchd::EXIT_RESTART`] and launchd starts the new build.
-//!
-//! The mug runs from a copy of its bundle, so its own executable never changes; the origin's
-//! does. What is compared is the origin's [`crate::code::code_fingerprint`]: a bundle's
-//! `Contents/Info.plist` (an update carries a new version, and the updater swaps the whole
-//! bundle), a bare build-tree executable's length and modification time.
+//! Update watch: whether the mug's origin code was replaced, so it can end with
+//! [`crate::launchd::EXIT_RESTART`].
 
 use std::path::{Path, PathBuf};
 
@@ -25,18 +20,13 @@ pub(super) struct Watch {
 }
 
 impl Watch {
-    /// Watch the code of `origin`, the executable the mug was started as, against the code
-    /// of `running`, the executable this process runs: its copy, whose `Info.plist` is the
-    /// origin's as it was when cloned, or the origin itself. An update that lands between the
-    /// copy and this read (the copy's first exec, which macOS assesses) is then a replaced
-    /// origin, not the baseline.
+    /// Watches the code of `origin` against the code of `running`.
     pub(super) fn start(origin: PathBuf, running: &Path) -> Self {
         let baseline = code_fingerprint(running);
         Self { origin, baseline }
     }
 
-    /// Whether the code was replaced since [`Watch::start`]: it reads now, differs, and
-    /// reads the same again.
+    /// Whether the code was replaced since [`Watch::start`].
     pub(super) fn replaced(&mut self) -> bool {
         let origin = &self.origin;
         replaced(&mut self.baseline, code_fingerprint(origin), || {
@@ -78,17 +68,13 @@ mod tests {
     #[test]
     fn a_change_counts_only_when_it_reads_cleanly_twice() {
         let mut base = plist("1");
-        // Same print: nothing to do; the second read is not taken.
         assert!(!replaced(&mut base, plist("1"), || panic!(
             "not read again"
         )));
-        // Unreadable now (the swap in progress): nothing, and the baseline stays.
         assert!(!replaced(&mut base, None, || panic!("not read again")));
         assert_eq!(base, plist("1"));
-        // Changed, but the second read disagrees or fails: a write in progress.
         assert!(!replaced(&mut base, plist("2"), || plist("3")));
         assert!(!replaced(&mut base, plist("2"), || None));
-        // Changed and read again the same: a new build.
         assert!(replaced(&mut base, plist("2"), || plist("2")));
         assert_eq!(base, plist("1"));
     }

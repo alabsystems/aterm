@@ -154,7 +154,12 @@ struct UndoRecord {
     token: UndoToken,
     before: Vec<(String, Option<String>)>,
     after: Vec<(String, Option<String>)>,
-    /// The admitted text just before the patch and just after it.
+    /// The admitted text just before the patch and just after it. Undo
+    /// restores the DOCUMENT, not the values: while the file still holds
+    /// `after_text` it goes back to `before_text` byte for byte (every
+    /// line where it stood, every comment with the key it described, the
+    /// value as it was spelled); once the file moved on it reverses only
+    /// the patch's own lines ([`merge_reverting`]).
     before_text: Arc<str>,
     after_text: Arc<str>,
 }
@@ -2299,7 +2304,9 @@ enabled = false
         let _ = std::fs::remove_file(config_path);
     }
 
-    /// An authored empty collection is still an authored value.
+    /// An authored empty collection is still an authored value. Clearing it
+    /// and applying the actual Undo token restores its typed empty collection,
+    /// rather than refusing or silently turning it into an absent setting.
     #[test]
     fn undo_restores_authored_empty_collections() {
         for (key, authored) in [

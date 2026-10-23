@@ -582,6 +582,8 @@ impl SgrStyleHandler<'_> {
 #[cfg(test)]
 mod tests {
 
+    //! conhost does not forward the semicolon form (its `_ApplyGraphicsOption`
+    //! has no `UnderlineColor` arm, so `58;5;196` arrives as separate SGRs); under
     //! ConPTY only the colon forms `58:2::r:g:b` and `58:5:n` pass through.
     use super::super::Terminal;
     use super::super::render_cells::UnderlineStyle;
@@ -731,6 +733,10 @@ mod tests {
         assert!(term.style.fg == PackedColor::DEFAULT_FG, "4;58;2;r;g;b;39");
     }
 
+    /// A colour the engine refuses still consumes what xterm's
+    /// `parse_extended_colors` consumes: the selector, and the values it
+    /// needs, present or not. Found by the astream-term differential oracle
+    /// (aterm-conformance `tests/vt_oracle`): a truncated `38;5` turned on
     /// blink, because the refused colour returned its tail to the SGR loop.
     #[test]
     fn a_refused_extended_colour_consumes_what_xterm_consumes() {

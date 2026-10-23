@@ -2,21 +2,14 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `--format` (design §8.2).
+//! Output formatting for `--format`.
 
 use aterm_json::Value;
 
 use super::args::Format;
 use super::project::{FieldPath, value_at};
 
-/// Render projected values. `json`: one compact document (an array for a list) and `\n`.
-/// `ndjson`: one compact value per line. `tsv`: one row per value, the `columns` in order,
-/// with `--header` a first row of the column texts; a cell is the string itself, a number or
-/// bool as JSON, null as empty, an array's items joined by `,`, an object as compact JSON;
-/// `\` `\t` `\n` `\r` written `\\` `\t` `\n` `\r` (jq's `@tsv`). `text`: a header row of the
-/// column texts and one row per value, each column padded to its widest cell (in chars),
-/// two spaces between columns, no trailing spaces; every cell escaped for a person
-/// (`aterm_codec::tty::safe`, with tabs and line ends written as escapes).
+/// Render projected values in the selected [`Format`].
 #[must_use]
 pub fn render(
     values: &[Value],
@@ -88,9 +81,7 @@ pub fn render(
     }
 }
 
-/// One cell: a string as itself, a number or bool as JSON, null as empty, an array's items each
-/// as a cell and joined by `,`, and an object as compact JSON. Unescaped: `tsv` escapes it,
-/// `--raw` prints it as it is.
+/// Formats a single cell value as an unescaped string.
 pub(crate) fn cell(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -100,7 +91,7 @@ pub(crate) fn cell(value: &Value) -> String {
     }
 }
 
-/// jq's `@tsv` escapes: `\` `\t` `\n` `\r` and NUL written `\\` `\t` `\n` `\r` `\0`.
+/// Escapes `\`, `\t`, `\n`, `\r`, and NUL for `@tsv` output.
 fn tsv_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -116,8 +107,7 @@ fn tsv_escape(text: &str) -> String {
     out
 }
 
-/// A cell for a person: tabs and line ends as escapes, so a row stays one row, then
-/// `aterm_codec::tty::safe` for every other control, bidi mark and C1 byte.
+/// Escapes tabs, line endings, and control bytes for terminal display.
 fn for_person(text: &str) -> String {
     let mut flat = String::with_capacity(text.len());
     for c in text.chars() {

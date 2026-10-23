@@ -40,7 +40,8 @@ const fn is_wrap_hole_blank(cell: &Cell) -> bool {
 pub struct Row {
     /// Cell storage.
     cells: PageSlice<Cell>,
-    /// One past the last cell output wrote (see [`Row::len`]).
+    /// One past the last cell output wrote (see [`Row::len`]). If 0, the row
+    /// holds nothing written.
     len: u16,
     /// Row flags.
     flags: RowFlags,
@@ -61,7 +62,9 @@ aterm_types::bitflags! {
         const DOUBLE_HEIGHT_TOP = 1 << 3;
         /// Double-height line, bottom half (DECDHL).
         const DOUBLE_HEIGHT_BOTTOM = 1 << 4;
-        /// At least one cell is a WIDE head.
+        /// At least one cell is a WIDE head. Set by every wide write and by
+        /// `Row::set`/`overwrite_span` of a wide cell; cleared by whole-row
+        /// clears.
         const HAS_WIDE_CHARS = 1 << 5;
         /// The row was filled from a history [`Line`](aterm_scrollback::Line)
         /// that ends two or more cells before the last column: its line goes on

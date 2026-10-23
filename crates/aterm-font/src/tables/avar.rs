@@ -5,8 +5,8 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! An [Axis Variations Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/avar) implementation.
+//! An [Axis Variations Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/avar)
+//! implementation.
 
 use core::convert::TryFrom;
 
@@ -36,11 +36,6 @@ impl FromData for AxisValueMap {
 }
 
 /// A list of segment maps.
-///
-/// Can be empty.
-///
-/// The internal data layout is not designed for random access,
-/// therefore we're not providing the `get()` method and only an iterator.
 #[derive(Clone, Copy)]
 pub struct SegmentMaps<'a> {
     count: u16,
@@ -92,12 +87,10 @@ impl<'a> Iterator for SegmentMapsIter<'a> {
     }
 }
 
-/// An [Axis Variations Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/avar).
+/// An [Axis Variations Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/avar).
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
-    /// The segment maps array — one segment map for each axis
-    /// in the order of axes specified in the `fvar` table.
+    /// The segment maps array, one per axis in `fvar` order.
     pub segment_maps: SegmentMaps<'a>,
 }
 
@@ -111,17 +104,16 @@ impl<'a> Table<'a> {
             return None;
         }
 
-        s.skip::<u16>(); // reserved
+        s.skip::<u16>();
         Some(Self {
             segment_maps: SegmentMaps {
-                // TODO: check that `axisCount` is the same as in `fvar`?
                 count: s.read::<u16>()?,
                 data: s.tail()?,
             },
         })
     }
 
-    /// Maps a single coordinate
+    /// Maps a single coordinate.
     pub fn map_coordinate(
         &self,
         coordinates: &mut [NormalizedCoordinate],
@@ -144,15 +136,11 @@ impl<'a> Table<'a> {
     }
 }
 
-/// `value - from + to`, in i32 (a malformed map overflows i16 here); `None`
-/// when the result leaves i16, which leaves the coordinate unmapped.
 fn shift(value: i16, from: i16, to: i16) -> Option<i16> {
     i16::try_from(i32::from(value) - i32::from(from) + i32::from(to)).ok()
 }
 
 fn map_value(map: &LazyArray16<AxisValueMap>, value: i16) -> Option<i16> {
-    // This code is based on harfbuzz implementation.
-
     if map.is_empty() {
         return Some(value);
     } else if map.len() == 1 {
@@ -188,8 +176,6 @@ fn map_value(map: &LazyArray16<AxisValueMap>, value: i16) -> Option<i16> {
         return Some(prev_to);
     }
 
-    // In i64: the product of two i16 spans overflows i32. `denom` is
-    // non-zero: `prev_from == curr_from` returned above.
     let curr_from = i64::from(curr_from);
     let curr_to = i64::from(curr_to);
     let prev_from = i64::from(prev_from);

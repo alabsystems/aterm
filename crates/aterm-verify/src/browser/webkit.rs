@@ -44,7 +44,7 @@ pub(crate) fn no_windows_skip(missing: Option<&str>) -> String {
 }
 
 /// Remediation command suggested when WebKit is not installed.
-pub(crate) fn fix_for(pinned: bool) -> &'static str {
+pub(crate) const fn fix_for(pinned: bool) -> &'static str {
     if pinned {
         "targo --unverified verify provision, or set ATERM_WEBKIT to a Playwright WebKit \
          executable"

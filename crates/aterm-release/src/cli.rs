@@ -892,13 +892,13 @@ impl LinuxFlags<'_> {
     }
 
     /// Whether a declaration was made at all.
-    fn declared(&self) -> bool {
+    const fn declared(&self) -> bool {
         *self.mac_only || self.artifacts.is_some()
     }
 }
 
 /// The Linux declaration a yank forwards to its successor cut.
-fn yank_linux(opts: &mut verify::YankOptions) -> LinuxFlags<'_> {
+const fn yank_linux(opts: &mut verify::YankOptions) -> LinuxFlags<'_> {
     LinuxFlags {
         artifacts: &mut opts.linux_artifacts,
         targets: &mut opts.linux_targets,

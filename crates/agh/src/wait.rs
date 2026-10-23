@@ -501,7 +501,7 @@ fn summary(release: Option<&ReleaseObject>) -> Value {
 
 /// A verdict: `observed`, held or not.
 #[inline]
-fn verdict(holds: bool, observed: Value) -> Verdict {
+const fn verdict(holds: bool, observed: Value) -> Verdict {
     if holds {
         Verdict::Holds(observed)
     } else {

@@ -98,7 +98,7 @@ pub struct Way {
 impl Way {
     /// Creates a queue with delay `one_way`.
     #[must_use]
-    pub fn new(one_way: Duration) -> Way {
+    pub const fn new(one_way: Duration) -> Way {
         Way {
             one_way,
             queue: VecDeque::new(),

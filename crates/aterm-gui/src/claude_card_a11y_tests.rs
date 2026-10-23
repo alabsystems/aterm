@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A screen reader hears Claude's words under the harness's glass (review
-//! G3, owner decision 2026-10-20): the accessibility tree's grid text is read
-//! from the cells Claude wrote (`claude_footer::ProgramCells`), as copy and
-//! `text`/`screen` keep them, never the glass's `YOLO on`, `✦ alab.systems`,
-//! facts or the card's line.
+//! A screen reader hears Claude's words under the harness's glass (review G3, owner decision
+//! 2026-10-20): the accessibility tree's grid text is read from the cells Claude wrote
+//! (`claude_footer::ProgramCells`), as copy and `text`/`screen` keep them, never the glass's `YOLO
+//! on`, `✦ alab.systems`, facts or the card's line.
 
 use super::*;
 
@@ -99,8 +98,6 @@ fn a_reader_hears_claudes_words_under_the_glass() {
         "{}",
         heard.value()
     );
-    // Nothing allocated beyond the snapshot's own text: as many allocations
-    // as the same words read off the engine's own cells.
     let engine = {
         let mut fresh = RenderInput::empty();
         let term = app.pool.get(session).unwrap().term.clone();
@@ -121,7 +118,6 @@ fn a_reader_hears_claudes_words_under_the_glass() {
         .and_then(|(_, n)| n.value())
         .expect("the terminal document");
     assert_eq!(document, claude, "the tree's document");
-    // The lockup is decoration: no node of the tree names or holds it.
     let logo_nodes: Vec<_> = tree
         .nodes
         .iter()

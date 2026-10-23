@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! GitHub's REST objects (design §10.1): snake_case serde rows that ignore unknown fields and
-//! keep their raw JSON, so the CLI can project any field.
+//! GitHub's REST objects (design §10.1).
 
 use aterm_json::Value;
 
@@ -12,17 +11,13 @@ use crate::error::{Error, Result};
 /// Read a model from JSON, keeping the raw value.
 pub trait FromJson: Sized {
     /// The model `value` holds.
-    ///
     /// # Errors
-    ///
     /// CouldNotRun, `Sub::Protocol`, why `GitHub's answer does not fit {type}: {e}`.
     fn from_json(value: &Value) -> Result<Self>;
 }
 
 /// `T::from_json`.
-///
 /// # Errors
-///
 /// As `FromJson::from_json`.
 pub fn from_json<T: FromJson>(value: &Value) -> Result<T> {
     T::from_json(value)
@@ -108,8 +103,7 @@ pub struct RepoObject {
     /// The default branch.
     #[serde(default)]
     pub default_branch: Option<String>,
-    /// The last push; null for a repository nothing was ever pushed to (GitHub's schema for
-    /// the owner listings declares it nullable).
+    /// The last push (`None` when nothing was ever pushed).
     #[serde(default)]
     pub pushed_at: Option<String>,
     /// The description.
@@ -297,8 +291,7 @@ pub struct CommitDetail {
 /// A login.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct LoginObject {
-    /// The login; empty when GitHub answered an empty object (a commit's `author` is
-    /// `simple-user` or `{}`).
+    /// The login (empty when GitHub answered an empty `{}` object).
     #[serde(default)]
     pub login: String,
     /// The object as GitHub sent it.
@@ -481,9 +474,7 @@ impl AssetObject {
     }
 
     /// `None` for a null digest (assets before June 2025).
-    ///
     /// # Errors
-    ///
     /// CouldNotRun, `Sub::Protocol`, why `asset {name}'s digest {digest} is not sha256:<64 hex>`.
     pub fn sha256(&self) -> Result<Option<Sha256Digest>> {
         let Some(digest) = &self.digest else {
@@ -517,7 +508,7 @@ impl Sha256Digest {
 
     /// These 32 bytes, already a SHA-256 digest (nothing is hashed).
     #[must_use]
-    pub fn from_bytes(bytes: [u8; 32]) -> Sha256Digest {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Sha256Digest {
         Sha256Digest(bytes)
     }
 
@@ -529,7 +520,7 @@ impl Sha256Digest {
 
     /// The 32 bytes.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
@@ -576,13 +567,13 @@ impl CommitObject {
 impl CompareObject {
     /// GitHub listed fewer commits than `total_commits` (its 250-commit cap).
     #[must_use]
-    pub fn capped_commits(&self) -> bool {
+    pub const fn capped_commits(&self) -> bool {
         (self.commits.len() as u64) < self.total_commits
     }
 
     /// GitHub listed 300 files, its cap.
     #[must_use]
-    pub fn capped_files(&self) -> bool {
+    pub const fn capped_files(&self) -> bool {
         self.files.len() >= COMPARE_FILES_CAP
     }
 }

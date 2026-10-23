@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live repair through the wrapper with injected instants: the demonstration fault strands
-//! a settling glow, the pause records the schedule it would arm, the repair publishes the
-//! shipped code on a `Tested` witness, the lane runs to the clearing frame, and fresh keys
-//! heat and clear with no reset and no further replay. Pause semantics: queued keys are
-//! delivered once (after a commit, a resume, or a full queue's rejection), paused ticks
-//! show the held overlay without advancing the state, and a candidate prepared against a
-//! head that moved is refused.
+//! Live repair through the wrapper with injected instants.
 
 use aterm_aos::contract::Verdict;
 use aterm_aos::evidence::EvidenceGrade;
@@ -112,7 +106,6 @@ fn the_stranded_glow_is_repaired_live_and_fresh_keys_heat_and_clear_with_no_rese
         assert_eq!(host.aos_code(), MomentumCode::Shipped);
         assert!(!host.aos_paused());
 
-        // The accepted state names its wake; the lane runs to the clearing frame.
         assert!(host.settling(), "the accepted state is the settling glow");
         let wake = host
             .next_change_deadline(now, LANE)
@@ -141,7 +134,6 @@ fn the_stranded_glow_is_repaired_live_and_fresh_keys_heat_and_clear_with_no_rese
         assert_eq!(after_commit.replays, 2);
         assert_eq!(after_commit.publications, 1);
 
-        // Fresh keys through the published pair: hot, settling, then clear again.
         let restart = cleared.at + ms(500);
         let mut seen = Vec::new();
         let (last, cell) = burst(&mut host, restart, 12, &c, &mut seen);
@@ -178,7 +170,6 @@ fn the_stranded_glow_is_repaired_live_and_fresh_keys_heat_and_clear_with_no_rese
                 .any(|i| matches!(i, MomentumEvent::Query { .. })),
             "dark={dark}: the fresh settle was paced by named wakes"
         );
-        // The continuation is recorded from the commit's checkpoint and replays exactly.
         let run = replay_log(&host, MomentumCode::Shipped);
         assert_eq!(
             run.state_digest,
@@ -286,7 +277,6 @@ fn keys_while_paused_queue_and_are_delivered_once_after_the_commit() {
             })
             .collect::<Vec<_>>()
     );
-    // The same keys on a direct engine in the same state reach the same rate.
     let control: MomentumGlow = hosted(&host).boundary.pair().state.glow;
     let mut direct = stranded(t0, true).0;
     direct.aos_detach();

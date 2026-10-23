@@ -90,7 +90,7 @@ impl TokenUsage {
 
     /// The request's prompt: input, cache writes and cache reads together — what a price by prompt length is decided on.
     #[must_use]
-    pub fn prompt(&self) -> u64 {
+    pub const fn prompt(&self) -> u64 {
         self.input
             .saturating_add(self.cache_write)
             .saturating_add(self.cache_read)
@@ -110,7 +110,7 @@ impl TokenUsage {
 
     /// Each count less the other's, never below 0.
     #[must_use]
-    pub fn less(&self, other: &Self) -> Self {
+    pub const fn less(&self, other: &Self) -> Self {
         Self {
             input: self.input.saturating_sub(other.input),
             output: self.output.saturating_sub(other.output),
@@ -122,7 +122,7 @@ impl TokenUsage {
 
     /// Each count plus the other's, saturating.
     #[must_use]
-    pub fn plus(&self, other: &Self) -> Self {
+    pub const fn plus(&self, other: &Self) -> Self {
         Self {
             input: self.input.saturating_add(other.input),
             output: self.output.saturating_add(other.output),
@@ -158,7 +158,7 @@ impl ModelSpend {
 
     /// Add a message's token counts without counting another message — the
     /// growth a streamed repeat of one id brings.
-    fn add_tokens(&mut self, t: TokenUsage) {
+    const fn add_tokens(&mut self, t: TokenUsage) {
         let sum = self.tokens().plus(&t);
         self.input = sum.input;
         self.output = sum.output;
@@ -175,7 +175,7 @@ impl ModelSpend {
 
     /// The token counts, as one request's are held.
     #[must_use]
-    pub fn tokens(&self) -> TokenUsage {
+    pub const fn tokens(&self) -> TokenUsage {
         TokenUsage {
             input: self.input,
             output: self.output,
@@ -348,19 +348,19 @@ pub struct TokenSeries {
 impl TokenSeries {
     /// The bucket width in seconds (0 while empty).
     #[must_use]
-    pub fn width_s(&self) -> i64 {
+    pub const fn width_s(&self) -> i64 {
         self.width_s
     }
 
     /// Unix seconds of the first bucket's start (0 while empty).
     #[must_use]
-    pub fn start_s(&self) -> i64 {
+    pub const fn start_s(&self) -> i64 {
         self.first.saturating_mul(self.width_s)
     }
 
     /// `(in, out)` per bucket, oldest first.
     #[must_use]
-    pub fn buckets(&self) -> &VecDeque<(u64, u64)> {
+    pub const fn buckets(&self) -> &VecDeque<(u64, u64)> {
         &self.buckets
     }
 
@@ -620,7 +620,7 @@ impl TranscriptUsage {
     }
 
     /// Spend by model id, in key order.
-    pub fn per_model(&self) -> &BTreeMap<String, ModelSpend> {
+    pub const fn per_model(&self) -> &BTreeMap<String, ModelSpend> {
         &self.per_model
     }
 
@@ -741,36 +741,36 @@ impl TranscriptUsage {
     }
 
     /// Unix seconds of the newest response the API served in this file.
-    pub fn served_at(&self) -> Option<i64> {
+    pub const fn served_at(&self) -> Option<i64> {
         self.served_at
     }
 
     /// Milliseconds Claude was working in this transcript: the union of its main chain's finished turns ([`BusySpans`]).
-    pub fn busy_ms(&self) -> u64 {
+    pub const fn busy_ms(&self) -> u64 {
         self.busy.total_ms
     }
 
     /// The main chain's finished turns as disjoint `[start, end)` spans in unix milliseconds, in time order ([`BusySpans`]: the newest [`BUSY_SPANS_MAX`]).
     #[must_use]
-    pub fn busy_spans(&self) -> &VecDeque<(i64, i64)> {
+    pub const fn busy_spans(&self) -> &VecDeque<(i64, i64)> {
         &self.busy.spans
     }
 
     /// The summed rows' tokens over time ([`TokenSeries`]).
     #[must_use]
-    pub fn series(&self) -> &TokenSeries {
+    pub const fn series(&self) -> &TokenSeries {
         &self.series
     }
 
     /// Summed rows the series could not place (no `timestamp`): counted in the totals, not graphed.
     #[must_use]
-    pub fn unstamped(&self) -> u64 {
+    pub const fn unstamped(&self) -> u64 {
         self.unstamped
     }
 
     /// A count that moves whenever the series, the unplaced rows or the working time move.
     #[must_use]
-    pub fn generation(&self) -> u64 {
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 
@@ -813,7 +813,7 @@ impl TranscriptUsage {
     }
 
     /// The newest limit notice written into the transcript, per window it names (`five_hour`, `seven_day`).
-    pub fn limit_notices(&self) -> &BTreeMap<String, LimitNoticeRow> {
+    pub const fn limit_notices(&self) -> &BTreeMap<String, LimitNoticeRow> {
         &self.limit_notices
     }
 
@@ -902,7 +902,7 @@ impl TranscriptUsage {
     }
 
     /// Count one line longer than [`MAX_LINE_BYTES`] that a streaming reader discarded without holding it.
-    pub(crate) fn note_long_line(&mut self) {
+    pub(crate) const fn note_long_line(&mut self) {
         self.rows = self.rows.saturating_add(1);
         self.rows_skipped_long = self.rows_skipped_long.saturating_add(1);
     }
@@ -917,7 +917,9 @@ impl TranscriptUsage {
         }
     }
 
-    /// Sum one row's usage under `model`.
+    /// Sum one row's usage under `model`. A main-chain row naming a model id
+    /// also sets [`Self::last_model`]; Claude Code's `<synthetic>` rows (an API
+    /// error, the usage-limit notice, `No response requested.`) never move it.
     fn add(&mut self, model: &str, usage: TokenUsage, sidechain: bool) {
         if !sidechain && model != UNKNOWN_MODEL && super::upgrade::is_model_id(model) {
             self.last_model = Some(model.to_owned());
@@ -1037,7 +1039,7 @@ pub struct UsageView {
 
 impl UsageView {
     /// A view of no accounts.
-    pub fn new(as_of: i64) -> Self {
+    pub const fn new(as_of: i64) -> Self {
         Self {
             as_of,
             accounts: Vec::new(),

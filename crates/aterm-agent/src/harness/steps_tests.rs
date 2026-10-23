@@ -676,7 +676,10 @@ fn a_turn_claude_code_numbers_of_its_own_starts_its_vendor_turn() {
     }
 }
 
-/// A RUNNING TURN THE BIND DID NOT READ (module docs).
+/// A RUNNING TURN THE BIND DID NOT READ (module docs). A tap armed after
+/// the footer's first read binds at the file's length (`bind_tap`), so the
+/// fold knows neither the running turn's `promptId` nor whether one runs
+/// (`Fed::new` is such a bind).
 #[test]
 fn a_running_turn_the_bind_did_not_read_is_no_new_one() {
     use super::super::transcript::corpus_tests::TURN_ROWS;
@@ -1458,7 +1461,9 @@ fn a_listed_build_with_no_reduction_fails_the_guard() {
     assert!(e.contains("lacks a lab run's events"), "{e}");
 }
 
-/// A11: the class table by name.
+/// A11: the class table by name. The names the approval policy knows
+/// (`box_call::PROVABLE` and the tools `unvoiced_tools` can name) are
+/// classed by what they are, never by the box a Bash `sed -i` is drawn as.
 #[test]
 fn tools_are_classed_by_name() {
     for (name, want) in [

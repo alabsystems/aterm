@@ -177,6 +177,7 @@ impl HoldClock {
                 }
                 if !waiting_line {
                     // The answer's first break read nothing declared; a line its turn has not been
+                    // read answering may still be answered.
                     if self.answer == Answer::Running {
                         self.answer = Answer::None;
                     }
@@ -223,7 +224,7 @@ impl HoldClock {
 
     /// The hold a loop before this one left open, carried: open since `since_ms` (declared where
     /// its row said so), last seen at `now_ms`.
-    pub fn seed(&mut self, since_ms: i64, declared: bool, now_ms: i64) -> Option<HoldChange> {
+    pub const fn seed(&mut self, since_ms: i64, declared: bool, now_ms: i64) -> Option<HoldChange> {
         if self.since_ms.is_some() {
             return None;
         }

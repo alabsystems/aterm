@@ -62,13 +62,15 @@ pub struct LexState {
     mode: Mode,
     /// Bracket nesting at the start of the line (Rust and TOML).
     depth: u16,
-    /// One bit per bracket depth below 32.
+    /// One bit per bracket depth below 32. Rust: the bracket at that depth is
+    /// the first one its line left open, so it adds one indent level.
     levels: u32,
     /// Where a commit message is (GitCommit only).
     commit: CommitPhase,
 }
 
-/// The open construct a line starts inside of.
+/// The open construct a line starts inside of. Its meaning is the lexing
+/// language's own; a state is never carried from one language to another.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum Mode {
     /// Nothing open: ordinary text or code.
@@ -246,7 +248,8 @@ verify_island! {
 }
 
 trust_contract_fn! {
-    /// `columns` of indentation, capped at [`MAX_INDENT_COLUMNS`] (1024).
+    /// `columns` of indentation, capped at [`MAX_INDENT_COLUMNS`] (1024). A
+    /// select, not `columns.min(…)`: Trust kernel-imports a select, and E6 refuses calls.
     fn indent_columns_cap(columns: usize) -> usize
     clauses [ensures result <= 1024 by indent_columns_cap_is_at_most_the_cap
              ensures columns > 1024 || result == columns by indent_columns_cap_keeps_a_value_within_it]
@@ -579,7 +582,8 @@ fn by_first_line(line: &str) -> Option<Language> {
     (line.starts_with("diff --git ") || patch_mail).then_some(Language::Diff)
 }
 
-/// The language a `#!` line's interpreter writes.
+/// The language a `#!` line's interpreter writes. `env` is looked through,
+/// with its options and assignments (`#!/usr/bin/env -S bash -e`).
 fn shebang(command: &str) -> Option<Language> {
     let mut words = command.split_ascii_whitespace();
     let mut program = words.next()?.rsplit('/').next()?;
@@ -730,7 +734,8 @@ thread_local! {
     static BYTE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// A forward reader over one line's bytes.
+/// A forward reader over one line's bytes. Every lexer reads through it, and
+/// a read never goes past the line, so a lexer's position only moves forward.
 struct Cursor<'a> {
     line: &'a str,
     pos: usize,

@@ -487,7 +487,7 @@ impl Dims {
 
 /// The machine `arch`'s process runs as (`ProcessMachineTypeInfo`'s `IMAGE_FILE_MACHINE_*`, as the desk helper prints it).
 #[must_use]
-pub fn machine(arch: Arch) -> &'static str {
+pub const fn machine(arch: Arch) -> &'static str {
     match arch {
         Arch::Aarch64 => "aa64",
         Arch::X86_64 => "8664",
@@ -630,12 +630,12 @@ struct Run<'a> {
 }
 
 impl Run<'_> {
-    fn l(&self) -> &Layout {
+    const fn l(&self) -> &Layout {
         &self.up.layout
     }
 
     /// What this run's files are named after: `window`, or `window-cpu`.
-    fn tag(&self) -> &'static str {
+    const fn tag(&self) -> &'static str {
         if self.cpu { "window-cpu" } else { "window" }
     }
 

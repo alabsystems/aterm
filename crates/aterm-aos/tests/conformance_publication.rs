@@ -268,7 +268,10 @@ struct Real {
 }
 
 impl Real {
-    /// An attached boundary with a queue of `cap`.
+    /// An attached boundary with a queue of `cap`. `prelude` picks a history before the attach
+    /// the model starts at: up to two live inputs, and on odd values a restore (which mints a
+    /// revision) and a tick, so neither the revision nor the cursor starts at zero for every
+    /// seed.
     fn new(prelude: u64, cap: usize) -> Real {
         let start = ToyState {
             total: 2,
@@ -751,7 +754,8 @@ fn scripted<'m>(model: &'m Model, cap: usize, actions: &[&'static str]) -> Walke
     w
 }
 
-/// `seed`'s first episode, stopped before its first commit over a non-empty replay range.
+/// `seed`'s first episode, stopped before its first commit over a non-empty replay range. The
+/// walk is deterministic, so every call returns the same boundary.
 #[cfg(debug_assertions)]
 fn first_commit_over_a_range(model: &Model, seed: u64) -> Option<(Walker<'_>, Move)> {
     let mut w = Walker::new(model, 2, seed, 0);
@@ -788,7 +792,10 @@ fn the_real_boundary_follows_the_publication_model_in_lock_step() {
     }
 }
 
-/// The seeded walks reach about half of the model's states.
+/// The seeded walks reach about half of the model's states. This replays the model's shortest
+/// path to each reachable state on a fresh boundary, makes the calls the model rules out there,
+/// then takes each move the model allows from it, so every transition of the bounded space is
+/// a checked real step.
 #[test]
 fn every_transition_of_the_publication_model_is_a_real_step() {
     let healthy = aos_boundary_publication_model();
@@ -887,7 +894,10 @@ fn negative_control_stale_the_second_candidate_against_one_head_is_refused_where
     assert!(caught > 0, "the walks reached the stale winner");
 }
 
-/// Dial 2 publishes the code alone.
+/// Dial 2 publishes the code alone. A commit stopped after any number of its stores leaves the
+/// complete old pair (the model's `Discard` of the candidate it consumed) or the complete new
+/// pair still paused with the queue whole, which the reject that ends the pause turns into the
+/// model's `Commit`; and a commit that completes is the model's `Commit`.
 #[cfg(debug_assertions)]
 #[test]
 fn negative_control_mixed_a_commit_stopped_after_any_store_never_shows_new_code_over_old_state() {
@@ -997,7 +1007,8 @@ fn negative_control_mixed_a_commit_stopped_after_any_store_never_shows_new_code_
     assert_eq!(kinds, BTreeSet::from([Left::Old, Left::New, Left::Done]));
 }
 
-/// Dial 3 resumes the old pair on a reject but drops the queue.
+/// Dial 3 resumes the old pair on a reject but drops the queue. The real reject delivers every
+/// queued input to the old pair, which the mutant does not admit.
 #[test]
 fn negative_control_lost_input_a_reject_delivers_every_queued_input_to_the_old_pair() {
     let model = aos_boundary_publication_model();

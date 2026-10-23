@@ -91,7 +91,8 @@ impl ActivationWake {
         }
     }
 
-    /// Watch the managed twin itself as well as its best-effort notice.
+    /// Watch the managed twin itself as well as its best-effort notice. A pass
+    /// can move the twin even when publishing its notice failed.
     #[cfg(target_os = "macos")]
     fn with_claude_sources(
         home: Option<&Path>,
@@ -275,7 +276,9 @@ impl ActivationWake {
 
 #[cfg(target_os = "macos")]
 impl ActivationWake {
-    /// Whether a wake mark changed since it was last seen.
+    /// Whether a wake mark changed since it was last seen. Every mark is
+    /// looked at; a side mark that changed is told to its own listener
+    /// ([`Self::with_side`]) instead.
     fn any_changed(&mut self) -> bool {
         self.marks.iter_mut().fold(false, |woke, m| {
             let changed = m.changed();
@@ -429,7 +432,7 @@ fn stat_exited(stat: &str) -> bool {
 
 /// [`zombie`] where the kernel names none (see there).
 #[cfg(not(target_os = "linux"))]
-fn zombie(_pid: u32) -> bool {
+const fn zombie(_pid: u32) -> bool {
     false
 }
 
@@ -467,7 +470,7 @@ fn kqueue() -> std::io::Result<std::os::fd::OwnedFd> {
 
 /// The trigger's `EVFILT_USER` change entry (ident 0).
 #[cfg(target_os = "macos")]
-fn user_event(fflags: u32, flags: u16) -> libc::kevent {
+const fn user_event(fflags: u32, flags: u16) -> libc::kevent {
     libc::kevent {
         ident: 0,
         filter: libc::EVFILT_USER,
@@ -539,7 +542,7 @@ impl Mark {
 
     /// This mark is looked at again while its own directory does not exist
     /// ([`Self::watching_an_ancestor`]).
-    fn rechecked_before_its_dir(mut self) -> Self {
+    const fn rechecked_before_its_dir(mut self) -> Self {
         self.recheck = true;
         self
     }
@@ -584,7 +587,10 @@ impl Mark {
     }
 }
 
-/// atpkg's marker under the configured package prefix.
+/// atpkg's marker under the configured package prefix. Where the prefix
+/// exists, its notice directory is made here if no pass has made it yet
+/// (`atpkg::activation_notice::prepare`), so the watch sits on that directory
+/// and only a machine with no prefix at all runs the [`ANCESTOR_RECHECK`].
 #[cfg(target_os = "macos")]
 fn configured_marker() -> Option<PathBuf> {
     configured_marker_of("claude")
@@ -724,7 +730,9 @@ mod tests {
         Box::new(move || Some(path.clone()))
     }
 
-    /// A failed notice publication cannot hide a managed Claude Code update.
+    /// A failed notice publication cannot hide a managed Claude Code update. The
+    /// same source set production arms sees the actual entrypoint change, even
+    /// with vnode events withheld; unchanged and neighbouring files are no news.
     #[test]
     fn a_managed_claude_twin_move_is_seen_without_its_notice() {
         let root = aterm_tempfile::Builder::new()

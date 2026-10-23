@@ -840,7 +840,8 @@ mod tests {
         planned(&person, "recommended").expect_err("a person's check");
     }
 
-    /// Multi-select: each option whose check differs is toggled, then the button.
+    /// Multi-select: each option whose check differs is toggled, then the button. The review
+    /// tab takes `submit` only.
     #[test]
     fn a_multi_select_toggles_what_differs_then_presses_the_button() {
         assert_eq!(

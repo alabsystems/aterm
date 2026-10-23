@@ -1111,7 +1111,10 @@ mod tests {
         out
     }
 
-    /// Make `path` unreadable, answering the permissions it had.
+    /// Make `path` unreadable, answering the permissions it had. Restore with
+    /// [`restore_mode`], never a literal: `std::fs::write` lays `0o666 & !umask`, and a view
+    /// entry is identified by length, mode and mtime ([`crate::clone::is_clone_of`]), so a
+    /// literal restore would change the store file and re-lay the view.
     #[must_use]
     fn unreadable(path: &Path) -> std::fs::Permissions {
         let had = std::fs::symlink_metadata(path).unwrap().permissions();

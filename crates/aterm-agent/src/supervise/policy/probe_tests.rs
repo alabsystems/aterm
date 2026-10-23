@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// THE POLICY'S PROBE: each derived answer reads back off a tape as it was
-// written; a recorded probe answers exactly as the live one and tapes one
-// round trip per look; and what a probe reads to reach its answer — the
-// worker's environment, a repository's configuration — never reaches the
-// tape, while the same detector finds a secret logged through the door
-// (the negative control).
-
 use std::path::{Path, PathBuf};
 
 use astream_effects::EffectRecord;
@@ -106,7 +99,6 @@ fn each_answer_reads_back_as_it_was_written() {
     }
     let cwds = vec![PathBuf::from("/w"), PathBuf::from("/w/sub")];
     assert_eq!(reread(&cwds), cwds);
-    // The worker reads back as its digest and pid, never a variable.
     let worker = WorkerEnv::hermetic(None)
         .with("ANTHROPIC_API_KEY=planted")
         .with_pid(77)
@@ -161,7 +153,6 @@ fn a_recorded_probe_answers_as_the_live_one_and_tapes_each_look() {
     std::fs::create_dir_all(root.join("real")).expect("real");
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("real"), root.join("link")).expect("link");
-    // The walks take a path's names below its root (on Windows, below its drive too).
     let comps: Vec<String> = root
         .join("link")
         .join("x")
@@ -205,8 +196,7 @@ fn a_recorded_probe_answers_as_the_live_one_and_tapes_each_look() {
     );
 }
 
-/// Whether anything a finished tape holds — its text form, and every
-/// request, reply, output and note as raw bytes — contains `secret`.
+/// Returns whether a finished tape contains `secret` in its rendered text or raw records.
 pub(crate) fn tape_holds(read: &Recovered, secret: &str) -> bool {
     if text::render(None, &read.items).contains(secret) {
         return true;
@@ -235,17 +225,14 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(out.status.success(), "git {args:?}");
 }
 
-/// The secrets the privacy tests plant: an API key in the worker's
-/// environment, and in the repository's configuration a token in an extra
-/// header, a user and password in a URL rewrite, and a credential helper.
+/// Planted API key for privacy tests.
 pub(crate) const PLANTED_KEY: &str = "sk-ant-api03-planted-0005-environment-secret"; // gitleaks:allow
 pub(crate) const PLANTED_HEADER: &str = "planted-0005-bearer-token";
 pub(crate) const PLANTED_USER: &str = "planted0005user";
 pub(crate) const PLANTED_PASS: &str = "planted0005pass";
 pub(crate) const PLANTED_HELPER: &str = "planted-0005-credential-helper";
 
-/// A repository whose configuration holds [`PLANTED_HEADER`],
-/// [`PLANTED_USER`], [`PLANTED_PASS`] and [`PLANTED_HELPER`].
+/// Initializes a repository at `at` containing the planted git config secrets.
 pub(crate) fn planted_repo(at: &Path) {
     git(at, &["init", "-q", "."]);
     git(
@@ -313,14 +300,12 @@ fn what_a_probe_reads_never_reaches_the_tape() {
             "{secret} reached the policy: {handed}"
         );
     }
-    // The tape names the worker by its digest under this tape's seed.
     let digest = format!("{:016x}", worker.digest(tape.core().seed()));
     assert!(
         tape_holds(&read, &digest),
         "the worker is named by its digest"
     );
 
-    // Negative control: a door that logs the key is caught by the same detector.
     let leaky = MemoryTape::over(&Fx::os());
     leaky.fx.note("leak", || {
         worker
@@ -443,8 +428,6 @@ fn what_the_shells_startup_and_the_settings_hold_never_reaches_the_tape() {
         assert!(!tape_holds(&read, secret), "{secret} reached the tape");
     }
 
-    // The worker's binding to its session: a process whose variable names
-    // another session is refused, and what is refused names no value.
     let other = WorkerEnv::from_env(vec![format!("ATERM_PARENT_SESSION_ID={PLANTED_SESSION}")]);
     let refused = super::super::probe_live::bound_to(other, 7, "s-mine");
     let why = refused.clone().expect_err("another session's process");
@@ -452,7 +435,6 @@ fn what_the_shells_startup_and_the_settings_hold_never_reaches_the_tape() {
     let taped = String::from_utf8(refused.to_tape()).expect("json text");
     assert!(!taped.contains(PLANTED_SESSION), "{taped}");
 
-    // Negative control: the detector finds the key when the text is taped.
     let leaky = MemoryTape::over(&Fx::os());
     leaky.fx.note("leak", || zshenv.clone());
     assert!(
@@ -489,7 +471,6 @@ fn a_keyed_probe_answers_from_what_the_loop_had_read() {
     ]
     .into();
     let comps: Vec<String> = ["w", "a", "b"].map(String::from).to_vec();
-    // One index, every probe: as a tape opened to explain its decisions.
     let index = Arc::new(TapeIndex::new(records));
     let at = |seen| KeyedProbe::at(Arc::clone(&index), seen, roots.clone(), 0);
     for seen in [0, 1] {

@@ -54,7 +54,9 @@ pub(crate) fn file_key(bytes: &[u8]) -> String {
     h.hex()
 }
 
-/// Where a face file lives.
+/// Where a face file lives. `Repo` paths are relative to aterm-render's
+/// manifest directory and are always present; `System` paths are the host's
+/// own fonts, which are never committed (their licences forbid it).
 #[derive(Clone, Copy)]
 pub(crate) enum Origin {
     Repo(&'static str),

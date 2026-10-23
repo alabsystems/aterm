@@ -272,7 +272,7 @@ impl Invocation {
     /// `ListOpts::STANDARD`, with `--limit`, `--partial`, `--max-pages`, and AsRead under
     /// `--as-read`.
     #[must_use]
-    pub fn list_opts(&self) -> ListOpts {
+    pub const fn list_opts(&self) -> ListOpts {
         let mut opts = ListOpts::STANDARD
             .with_limit(self.global.limit)
             .with_partial(self.global.partial);

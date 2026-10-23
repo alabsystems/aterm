@@ -1,23 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm_codec::inflate::stream` against this crate's own one-shot `inflate`:
-//! one engine, two drivers.
-//!
-//! atpkg's `tar-gz` and `zip` lanes hand a decompressed stream straight to a
-//! walker that writes files to disk, so the properties that matter are "the
-//! same bytes come out" and "a malformed input is refused". The interesting
-//! risk in a streaming decoder is RESUMPTION: a unit of work interrupted by the
-//! input running out has to restart from exactly where it began, so every
-//! vector is read at granularities down to one byte, from a source that yields
-//! one byte per `read`.
+//! Streaming `DeflateReader`, `GzipReader`, and `ZlibReader` tests against one-shot `inflate`.
 
 use std::io::Read;
 
 use aterm_codec::inflate::stream::{DeflateReader, GzipReader, ZlibReader};
 use aterm_codec::inflate::{inflate, zlib_decompress_prefix};
 
-// Raw DEFLATE vectors (zlib framing stripped), produced by python3 `zlib`.
 /// Fixed-Huffman literals.
 const HELLO: &[u8] = &[
     0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0xd7, 0x51, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0x01, 0x00,

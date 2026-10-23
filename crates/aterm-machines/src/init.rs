@@ -735,7 +735,9 @@ impl Workstation {
     }
 }
 
-/// The shared item still owns its policy and mutation.
+/// The shared item still owns its policy and mutation. This wrapper checks that the
+/// durable recovery record describes the values it is about to replace, and records which
+/// items reached mutation.
 struct Guard {
     inner: Box<dyn Item>,
     /// The before-images saved for recovery, or why the pass could not take them; `None`

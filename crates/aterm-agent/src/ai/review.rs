@@ -63,7 +63,7 @@ pub enum Verdict {
 impl Verdict {
     /// Its word.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Verdict::Served => "served",
             Verdict::Auth => "auth",
@@ -76,7 +76,7 @@ impl Verdict {
 
     /// Whether the next reviewer in order is tried in its place.
     #[must_use]
-    pub fn falls_through(self) -> bool {
+    pub const fn falls_through(self) -> bool {
         matches!(self, Verdict::Auth | Verdict::Limit | Verdict::Failed)
     }
 }
@@ -168,7 +168,7 @@ pub fn sanitize_block(text: &str, max: usize) -> String {
     out
 }
 
-fn token_char(c: char) -> bool {
+const fn token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
 }
 

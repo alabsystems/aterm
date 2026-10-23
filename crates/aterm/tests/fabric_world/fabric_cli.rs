@@ -721,7 +721,10 @@ fn doctor_reads_the_role_of_the_fabric_its_report_is_about() {
     );
 }
 
-/// The producer sequence every publish here takes the next of.
+/// The producer sequence every publish here takes the next of. ONE counter for
+/// the process: the broker dedups on `(producer_id, producer_seq)`, so a
+/// sequence that restarted per call would have a second batch acknowledged at
+/// the FIRST batch's offsets and never appended.
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Publish `(subject, body)` records straight to the broker, as a bridge or a
@@ -917,7 +920,9 @@ fn with_no_command_the_fabric_is_off_says_where_it_looked_and_exits_2() {
     assert_eq!(code, 2, "{err}");
 }
 
-/// A SOCKET FILE IS NOT A BROKER.
+/// A SOCKET FILE IS NOT A BROKER. A socket that was bound and abandoned — the
+/// leftover of a broker that died — refuses the connect: not reachable, a
+/// warning, exit 1.
 #[test]
 fn a_dead_socket_file_is_unreachable_and_a_warning() {
     let s = Scratch::new("dead");
@@ -945,7 +950,10 @@ fn a_dead_socket_file_is_unreachable_and_a_warning() {
     assert!(arr(&v, "traffic").is_empty());
 }
 
-/// A LIVE BROKER, READ FOR REAL — and the env override beats the file.
+/// A LIVE BROKER, READ FOR REAL — and the env override beats the file. The
+/// config names a dead broker; `ATERM_FABRIC_COMMAND` names the live one in the
+/// argv0 alias's spelling, and the live one is what gets read: its head, its
+/// pid, the presence roster and the last ten records — metadata only.
 #[test]
 fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
     let s = Scratch::new("live");
@@ -1228,7 +1236,13 @@ fn usage_errors_exit_2_and_help_exits_0() {
     assert_eq!(code, 2, "{err}");
 }
 
-/// A FILTER THE BROKER WOULD REFUSE NEVER REACHES IT.
+/// A FILTER THE BROKER WOULD REFUSE NEVER REACHES IT. `tail --filter` passes
+/// the bus's own grammar at the parse (astream's `validate_filter_str`, the
+/// check the broker parses a subscription with), so with a broker up and the
+/// config pointing at it, a `>` that is not the last segment is a usage error
+/// naming the filter (exit 2), never the broker's refusal after a dial (exit
+/// 1, `aterm fabric tail: …`, which is what it was before the parse asked
+/// astream).
 #[test]
 fn a_filter_the_broker_would_refuse_is_a_usage_error_before_the_dial() {
     let s = Scratch::new("filter");

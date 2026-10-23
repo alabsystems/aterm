@@ -93,7 +93,7 @@ pub enum ResetNo {
 impl ResetNo {
     /// The refusal's one word: lower case, no space, no account's name.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             ResetNo::Off => "off",
             ResetNo::NoHost => "no-host",
@@ -363,7 +363,7 @@ pub enum ResetOutcome {
 impl ResetOutcome {
     /// The outcome's one word, as the journal and the session ledger name it.
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             ResetOutcome::Pending => "pending",
             ResetOutcome::Spent { .. } | ResetOutcome::Walled { .. } => "used",

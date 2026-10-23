@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! D-Bus server addresses: `transport:key=value,...` entries separated by `;`,
-//! values percent-escaped. A client tries the entries in order.
-//!
-//! Only the unix transport's client keys connect: `path=` everywhere,
-//! `abstract=` on Linux. `dir=`, `tmpdir=` and `runtime=` name where a server
-//! listens and are not client addresses; every other transport is
-//! [`Error::Unsupported`].
+//! D-Bus server addresses (`transport:key=value,...` entries separated by `;`).
 
 use crate::error::{Error, Result};
 
@@ -69,12 +63,7 @@ fn unescape(text: &str) -> Result<String> {
     String::from_utf8(out).map_err(|_| Error::Invalid("address value is not UTF-8"))
 }
 
-/// Parses an address list.
-///
-/// # Errors
-///
-/// [`Error::Invalid`] for an entry without a transport, a key without a
-/// value, a repeated key or a bad escape.
+/// Parses an address list, or returns [`Error::Invalid`] for a malformed entry.
 pub fn parse(list: &str) -> Result<Vec<Address>> {
     let mut out = Vec::new();
     for entry in list.split(';').filter(|e| !e.is_empty()) {
@@ -105,13 +94,7 @@ pub fn parse(list: &str) -> Result<Vec<Address>> {
     Ok(out)
 }
 
-/// The session bus's addresses: `DBUS_SESSION_BUS_ADDRESS`, or else
-/// `$XDG_RUNTIME_DIR/bus` when that exists (the systemd user bus).
-///
-/// # Errors
-///
-/// [`Error::Io`] (`NotFound`) when neither names a bus; [`Error::Invalid`]
-/// for an unparsable variable.
+/// Resolves session bus addresses, or returns [`Error::Io`] when none is configured.
 pub fn session_bus() -> Result<Vec<Address>> {
     match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
         Ok(list) if !list.is_empty() => return parse(&list),
@@ -132,12 +115,7 @@ pub fn session_bus() -> Result<Vec<Address>> {
     )))
 }
 
-/// Connects a unix-socket address.
-///
-/// # Errors
-///
-/// [`Error::Unsupported`] for another transport or a listen-only key,
-/// [`Error::Io`] when the connect fails.
+/// Connects a unix-socket address, or returns [`Error::Unsupported`] or [`Error::Io`].
 #[cfg(unix)]
 pub fn connect(address: &Address) -> Result<aterm_uds::CtlStream> {
     if address.transport != "unix" {

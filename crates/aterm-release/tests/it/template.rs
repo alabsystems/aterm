@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A fixture of repositories built once per process and laid down for every test that
-//! starts from it ([`Template`]), as a [`Tree`] of bytes: the `ledger_race`, `release_lease`,
-//! `publisher_fence_*` and `site_sync` labs. This binary's own, not `ledger::testing`'s: the
-//! bin target's test build compiles `src/` too, where nothing lays a template.
+//! In-memory repository [`Template`] and [`Tree`] fixture built once per process.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,14 +13,10 @@ enum Node {
     File { bytes: Vec<u8>, mode: u32 },
 }
 
-/// A directory tree held in memory: each directory, and each file's bytes and mode, by
-/// its path under the root it was read from.
+/// A directory tree held in memory.
 pub(crate) struct Tree(Vec<(PathBuf, Node)>);
 
-/// A fixture of repositories (a bare origin and its clones, say) built once per process
-/// and laid down for every test that starts from it ([`Tree`]): in-process writes, where
-/// building it is a dozen git processes or more, a push and a clone among them. Every
-/// test starts from the same commits, and each copy's configs name its own root.
+/// A fixture of repositories ([`Tree`]).
 pub(crate) struct Template<T> {
     built: OnceLock<(PathBuf, Tree, T)>,
 }
@@ -35,8 +28,7 @@ impl<T: Clone> Template<T> {
         }
     }
 
-    /// The fixture under `root` (an empty directory), and what `build` returned the
-    /// once it built it in a scratch dir of its own (the commit ids a test reads, say).
+    /// The fixture under `root`.
     pub(crate) fn lay(&self, root: &Path, build: impl FnOnce(&Path) -> T) -> T {
         let (from, tree, value) = self.built.get_or_init(|| {
             let dir = aterm_tempfile::Builder::new()
@@ -75,8 +67,7 @@ impl Tree {
         tree
     }
 
-    /// The tree under `root`, each git `config` that named `from` (the root it was read
-    /// from) naming `root` instead.
+    /// Write the tree under `root`, rewriting `from` in git `config` files.
     pub(crate) fn lay(&self, from: &Path, root: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         let (from, to) = (from.to_string_lossy(), root.to_string_lossy());

@@ -191,6 +191,34 @@ fn a_since_cursor_answers_a_delta_and_its_gaps() {
     assert_eq!(ahead, format!("ERR bad since head={:x}.4\n", *EPOCH));
 }
 
+/// A `why` folds only against the same reply: never another subject's, nor
+/// the byte-cut reply's against one with `top=` given (both top at 8);
+/// another view's rows are the same with `top=8` named or not, and fold.
+#[test]
+fn a_why_since_cursor_folds_only_against_the_same_reply() {
+    let shared = Shared::new();
+    shared.publish_for_test(synthetic(3, 0.1), Vec::new());
+    let evicted = |reply: &str| reply.lines().any(|l| l == "gap why=evicted");
+    let mem = cursor_of(&ask(&shared, "why mem"));
+    let cpu = ask(&shared, &format!("why cpu since={mem}"));
+    assert!(evicted(&cpu), "{cpu}");
+    let bare = cursor_of(&ask(&shared, "why"));
+    let top = ask(&shared, &format!("why top=8 since={bare}"));
+    assert!(evicted(&top), "{top}");
+    let again = ask(&shared, &format!("why since={bare}"));
+    assert!(
+        again.lines().next().unwrap().ends_with(" delta=1"),
+        "{again}"
+    );
+    assert!(!evicted(&again), "{again}");
+    let procs = cursor_of(&ask(&shared, "procs top=8"));
+    let folded = ask(&shared, &format!("procs since={procs}"));
+    assert!(
+        folded.lines().next().unwrap().ends_with(" delta=1"),
+        "{folded}"
+    );
+}
+
 #[test]
 fn events_since_a_cursor_print_and_the_ring_says_when_it_lost_them() {
     let shared = Shared::new();
@@ -278,6 +306,150 @@ fn a_pull_asks_the_probe_once_per_gap_and_takes_its_reading() {
     assert_eq!(held.map(|h| h.snap.seq), Some(2));
     shared.lock().tx = None;
     assert_eq!(probe.join().unwrap(), 1, "one pull for three reads");
+}
+
+/// `synthetic(seq, 0.1)` read with the coalition lane on, its split set read
+/// at the reading `split` (`None`: no split yet); readings are a second apart.
+fn with_split(seq: u64, split: Option<u64>) -> Snapshot {
+    let mut s = synthetic(seq, 0.1);
+    s.coal_lane = aterm_vitals::explain::CoalLane::On;
+    s.why = split.map(|at| {
+        Arc::new(aterm_vitals::explain::WhyFacts {
+            at_ns: at * 1_000_000_000,
+            window_ns: 5_000_000_000,
+            lane: aterm_vitals::explain::CoalLane::On,
+            ..aterm_vitals::explain::WhyFacts::default()
+        })
+    });
+    s
+}
+
+/// A `why` is judged by its split's age, never the snapshot's: a fresh
+/// snapshot carrying an old split pulls and takes the next split; another
+/// view's pull within the gap, which read no split, does not stand in for
+/// its own; a pull that brings no new split answers the held one stale; with
+/// the lane off the snapshot's age decides. The gap and the freshness are an
+/// hour, and each probe is joined before the next step reads what it left,
+/// so nothing depends on scheduling: the stale path's own bound expires
+/// whatever the probe does, and the other wait is a one-minute hang
+/// detector.
+#[test]
+fn a_why_is_as_fresh_as_its_split() {
+    // A probe that answers each pull with the next reading, its split read
+    // with it from pull `moves_from` on and carried from reading 1 before.
+    let probe = |shared: &Arc<Shared>, moves_from: u64| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        shared.install(tx);
+        let shared = Arc::clone(shared);
+        std::thread::spawn(move || {
+            let mut pulls = 0;
+            while let Ok(msg) = rx.recv() {
+                assert!(matches!(msg, Msg::Pull));
+                pulls += 1;
+                let seq = 7300 + pulls;
+                let split = if pulls >= moves_from { seq } else { 1 };
+                shared.publish_for_test(with_split(seq, Some(split)), Vec::new());
+            }
+            pulls
+        })
+    };
+    let hour = Duration::from_secs(3600);
+    let shared = Arc::new(Shared::paced(hour, Duration::from_secs(60)));
+    let pulls = probe(&shared, 1);
+    // A split read with the snapshot answers at once.
+    shared.publish_for_test(with_split(1, Some(1)), Vec::new());
+    let (held, state) = shared.fresh_why(hour, false);
+    assert_eq!(
+        (held.map(|h| h.snap.seq), state),
+        (Some(1), Freshness::Fresh)
+    );
+    // A new snapshot carrying a split two hours old is fresh to every view
+    // but `why`, which pulls and takes the reading with the new split.
+    shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
+    let (held, _) = shared.fresh(hour, false);
+    assert_eq!(held.map(|h| h.snap.seq), Some(7300));
+    let (held, state) = shared.fresh_why(hour, false);
+    assert_eq!(
+        (held.map(|h| h.snap.seq), state),
+        (Some(7301), Freshness::Fresh)
+    );
+    shared.lock().tx = None;
+    assert_eq!(pulls.join().unwrap(), 1);
+
+    // Another view's pull reads no split: a `why` inside its gap pulls again.
+    let shared = Arc::new(Shared::paced(hour, Duration::from_secs(60)));
+    let pulls = probe(&shared, 2);
+    shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
+    let (held, _) = shared.fresh(Duration::ZERO, true);
+    assert_eq!(held.map(|h| h.snap.seq), Some(7301));
+    let (held, state) = shared.fresh_why(hour, false);
+    assert_eq!(
+        (held.map(|h| h.snap.seq), state),
+        (Some(7302), Freshness::Fresh)
+    );
+    shared.lock().tx = None;
+    assert_eq!(pulls.join().unwrap(), 2);
+
+    // A probe whose readings never move the split: the wait ends stale.
+    let shared = Arc::new(Shared::paced(hour, Duration::from_millis(200)));
+    let pulls = probe(&shared, u64::MAX);
+    shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
+    let (held, state) = shared.fresh_why(hour, false);
+    assert!(held.is_some_and(|h| h.snap.seq >= 7300));
+    assert_eq!(state, Freshness::Stale);
+    // The probe's answer lands before the lane goes off, never after it.
+    shared.lock().tx = None;
+    assert_eq!(pulls.join().unwrap(), 1);
+    // With the lane off, the snapshot's age decides: no pull (none could be
+    // sent).
+    let mut off = synthetic(7400, 0.1);
+    off.coal_lane = aterm_vitals::explain::CoalLane::Off;
+    shared.publish_for_test(off, Vec::new());
+    let (held, state) = shared.fresh_why(hour, false);
+    assert_eq!(
+        (held.map(|h| h.snap.seq), state),
+        (Some(7400), Freshness::Fresh)
+    );
+}
+
+/// A `why` holds the split armed while it waits (`cmd_sys` passes
+/// `vitals_host::SPLIT_ARMED`), so the pull it sends reads a split; another
+/// view's pull is unarmed, and nothing stays armed once the reply has its
+/// snapshot. The wait is a one-minute hang detector.
+#[test]
+fn a_why_arms_the_split_while_it_waits() {
+    static ARMED: Arming = Arming::new();
+    for (text, armed) in [("why fresh=0", true), ("global fresh=0", false)] {
+        let shared = Arc::new(Shared::paced(
+            Duration::from_secs(3600),
+            Duration::from_secs(60),
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        shared.install(tx);
+        let probe = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                while let Ok(msg) = rx.recv() {
+                    assert!(matches!(msg, Msg::Pull));
+                    seen.push(ARMED.armed());
+                    shared.publish_for_test(with_split(7301, Some(7301)), Vec::new());
+                }
+                seen
+            })
+        };
+        shared.publish_for_test(with_split(7300, Some(1)), Vec::new());
+        let q = SysQuery::parse(text).expect("query");
+        let (held, state) = shared.fresh_for(&q, &ARMED);
+        assert_eq!(
+            (held.map(|h| h.snap.seq), state),
+            (Some(7301), Freshness::Fresh),
+            "{text}"
+        );
+        assert!(!ARMED.armed(), "{text}");
+        shared.lock().tx = None;
+        assert_eq!(probe.join().unwrap(), [armed], "{text}");
+    }
 }
 
 #[test]

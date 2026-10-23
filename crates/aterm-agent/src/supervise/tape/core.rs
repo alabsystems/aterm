@@ -447,12 +447,12 @@ impl TapeCore {
     }
 
     /// The seed of the worker's digest on this tape.
-    pub(crate) fn seed(&self) -> u64 {
+    pub(crate) const fn seed(&self) -> u64 {
         self.seed
     }
 
     /// The monotonic instant the tape counts from: what a host's answer that holds an `Instant` is written as an offset from ([`super::host::HostReply`]).
-    pub(crate) fn origin(&self) -> Instant {
+    pub(crate) const fn origin(&self) -> Instant {
         self.origin
     }
 

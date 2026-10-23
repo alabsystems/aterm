@@ -157,7 +157,7 @@ impl GlPass<'_, '_> {
         }
     }
 
-    /// Scissor the pass's later draws to ``, or lift the scissor.
+    /// Scissor the pass's later draws to `(x, y, w, h)`, or lift the scissor.
     #[inline]
     pub(crate) fn set_scissor(&mut self, scissor: Option<(u32, u32, u32, u32)>) {
         let gl = self.frame.cur.gl();

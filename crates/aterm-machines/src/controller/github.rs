@@ -708,6 +708,8 @@ mod tests {
         assert!(sys.calls().is_empty());
     }
 
+    /// `aterm machines github login` stores the token only once GitHub signs it in as the
+    /// account with the key scope, and reads it back. Negative controls: another account's
     /// token, a classic token without the scope, and one GitHub refuses each store nothing.
     #[test]
     fn login_stores_a_token_only_after_github_vouches_for_it() {

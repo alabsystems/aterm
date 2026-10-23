@@ -63,7 +63,9 @@ impl<R, B, H> Drop for Slot<R, B, H> {
     }
 }
 
-/// The body callback: move the closure out and run it.
+/// The body callback: move the closure out and run it. Its result is stored
+/// only if it returns; an exception unwinds through this `"C-unwind"` frame
+/// (dropping the closure) into the wrapper's catch.
 unsafe extern "C-unwind" fn run_body<R, B: FnOnce() -> R, H>(data: *mut u8) {
     // SAFETY: `data` points to a live `Slot<R, B, H>` and `run_body` is called once.
     let slot = unsafe { &mut *data.cast::<Slot<R, B, H>>() };

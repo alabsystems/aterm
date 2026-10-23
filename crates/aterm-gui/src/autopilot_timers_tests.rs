@@ -609,7 +609,9 @@ fn the_wire_arms_a_timed_cruise_and_the_same_word_cancels_it() {
     host.shutdown_and_join();
 }
 
-/// THE FIRE IS A COMPARE-AND-SET (§9.3.6, item 5).
+/// THE FIRE IS A COMPARE-AND-SET (§9.3.6, item 5). Due, with the pair still
+/// stored, it writes `land` with no timer, marks the driver bit, records the
+/// change, rings the host and leaves the record.
 #[test]
 fn the_fire_lands_only_the_stored_pair_and_the_hand_always_wins() {
     let (mut app, host) = hosted();

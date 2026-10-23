@@ -25,7 +25,7 @@ pub struct View {
     /// The session the border is lit for: the window's most pressing need's,
     /// or the front session the person holds. `None` with no border.
     pub pressing: Option<u64>,
-    /// The needs pill: exactly while the border is lit.
+    /// The projected pill. Reported needs can light the border without a pill.
     pub pill: Option<Pill>,
     /// Bumped on every change the painter can see; folded into [`Self::fp`].
     pub seed: u64,

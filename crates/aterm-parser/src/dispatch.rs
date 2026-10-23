@@ -323,7 +323,10 @@ impl Parser {
         }
     }
 
-    /// The state machine over `input` as it arrived.
+    /// The state machine over `input` as it arrived. Returns the rest
+    /// unread when a tmux passthrough wrapper opens (outside a wrapper only:
+    /// one opens no other), so [`Self::advance_fast`] reads it through the
+    /// wrapper; otherwise nothing.
     fn advance_plain<'a, S: ActionSink>(&mut self, input: &'a [u8], sink: &mut S) -> &'a [u8] {
         let mut remaining = input;
         let wrapped = self.tmux.is_open();
@@ -542,7 +545,9 @@ impl Parser {
         self.push_current_param(self.last_was_colon);
     }
 
-    /// Collect an intermediate byte (dropped past `MAX_INTERMEDIATES`).
+    /// Collect an intermediate byte (dropped past `MAX_INTERMEDIATES`). Not
+    /// named `collect`: Trust's unbounded-allocation recognizer would take it
+    /// for `Iterator::collect`.
     #[inline]
     fn collect_intermediate(&mut self, byte: u8) {
         if self.intermediates.len() < MAX_INTERMEDIATES {
@@ -564,7 +569,8 @@ impl Parser {
         }
     }
 
-    /// Split an OSC payload on `;` in one forward scan and dispatch it.
+    /// Split an OSC payload on `;` in one forward scan and dispatch it. Takes
+    /// `&[u8]`, not `&mut self`: it mutates no parser state.
     fn parse_and_dispatch_osc<S: ActionSink>(data: &[u8], sink: &mut S, bel_terminated: bool) {
         let Some(k) = data.iter().position(|&b| b == b';') else {
             let params: [&[u8]; 1] = [data];

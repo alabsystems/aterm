@@ -737,7 +737,10 @@ fn expected_leaving(rule: &(impl Rule + ?Sized), st: &State, i: usize) -> Verdic
     the_models_move(rule, LEAVES[i], &freed(st, i), i, true).unwrap_or(Verdict::Stay)
 }
 
-/// The same move, or no move on either side.
+/// The same move, or no move on either side. What is compared on a real
+/// state the projection did not build: there a session may be on an account
+/// with no sample, and its advice at a plain turn end is the probe, which
+/// the model does not have and which moves nobody.
 fn the_move(v: &Verdict) -> Option<&Verdict> {
     matches!(v, Verdict::Move { .. }).then_some(v)
 }
@@ -755,7 +758,8 @@ enum Decision {
     Resumes,
 }
 
-/// The session a model action decides for, at which point, and what.
+/// The session a model action decides for, at which point, and what. A
+/// defect that joins the active account is the herd's follow, never a take.
 fn decision(action: &str, before: &State, after: &State) -> Option<(usize, Ask, Decision)> {
     let moved = |i: usize, ask: Ask, sound: bool| {
         let rotates = after["rot"] != before["rot"];
@@ -791,7 +795,8 @@ fn decision(action: &str, before: &State, after: &State) -> Option<(usize, Ask, 
     }
 }
 
-/// Whether the real advice is the model's decision.
+/// Whether the real advice is the model's decision. A wait with the agent's
+/// jobs running is the host's refusal of whatever was advised.
 fn agrees(decided: &Decision, real: &Verdict, jobs_hold: bool) -> bool {
     match decided {
         Decision::Move { to, rotates, takes } => matches!(
@@ -1185,7 +1190,9 @@ fn decide(
     Decided { te, round, asked }
 }
 
-/// Whether what the real decider asks is the model's decision.
+/// Whether what the real decider asks is the model's decision. A wait with the
+/// agent's jobs running is the host's `wait:changed` to whatever was asked: the loop
+/// holds the point and records nothing.
 fn asks(decided: &Decision, real: &Asked, jobs_hold: bool) -> bool {
     match decided {
         Decision::Move { to, .. } => matches!(real, Asked::Move { to: t, .. } if t == to),
@@ -2038,7 +2045,8 @@ impl Lane<'_> {
         )
     }
 
-    /// The real code at the projection `st`.
+    /// The real code at the projection `st`. A disagreement is collected here
+    /// (`note(false, ..)`) and fails a strict walk where it is added.
     fn at_state(&self, key: &Shown) -> AtState {
         let (w, m, advisor) = (self.w, self.m, self.advisor);
         let st = Arc::new(shown_state(key));
@@ -2463,7 +2471,9 @@ fn expand(
 }
 
 impl Graph {
-    /// The graph of `m`.
+    /// The graph of `m`. `strict`: for strict walks alone, which stop at the first
+    /// state where a law of the model's does not hold, so the graph stops there too,
+    /// that state its last node.
     fn of(m: Model, strict: bool) -> Graph {
         let at = Resolution::of(&m);
         let init = m.init_state();
@@ -2708,7 +2718,8 @@ struct Part {
     /// it); else only the projections the edges taken leave, as those edges
     /// read them.
     states: bool,
-    /// The actions whose edges are taken.
+    /// The actions whose edges are taken. Every action's firings are counted
+    /// all the same.
     edges: fn(&str) -> bool,
 }
 
@@ -2720,7 +2731,8 @@ impl Part {
     };
 }
 
-/// Walk the graph `g` with the real code, the `part` of it asked.
+/// Walk the graph `g` with the real code, the `part` of it asked. `strict` asserts the
+/// model's laws and every agreement; otherwise each disagreement is collected.
 fn walk(w: &World, g: &Graph, advisor: Advisor, host: Host, strict: bool, part: Part) -> Walk {
     let lane = Lane {
         w,
@@ -3468,7 +3480,10 @@ fn a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold() 
     assert_eq!(h.told(1), take);
 }
 
-/// Proof travels with the account, from an empty state.
+/// Proof travels with the account, from an empty state. A wall is recorded on the
+/// canary's account with no strike, the other session rotates past it, and the
+/// account it chose answers with a wall of its own: `active` goes back to an account
+/// that never served a response, and is not proven for having been gone back to.
 #[test]
 fn a_strike_goes_back_to_an_account_that_never_served_as_unproven() {
     let onto = |takes_canary: bool| Advice::Move {
@@ -3749,7 +3764,10 @@ impl Carried {
     }
 }
 
-/// The session's own bounds along one carried history (design §6, "Bounds.
+/// The session's own bounds along one carried history (design §6, "Bounds. Per
+/// session"; none is a model variable): the real decider carried through a relaunch
+/// its host cannot make for the agent's jobs, a move refused at a wall, one refused
+/// ahead of a wall, and four moves in an hour.
 #[test]
 fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     let mut c = Carried::begin(20 * MIN);

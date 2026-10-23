@@ -2735,7 +2735,10 @@ mod tests {
         }
     }
 
-    /// A payload that does not match its authenticated digest is refused at stage.
+    /// A payload that does not match its authenticated digest is refused at stage. The
+    /// first refusal holds nothing (the transfer may have been this machine's); a second
+    /// identical one does, and the pass after it re-reads the documents and downloads
+    /// nothing.
     #[test]
     fn a_digest_mismatch_is_refused_memoized_and_never_downloaded_again() {
         let l = world::layout("digest");

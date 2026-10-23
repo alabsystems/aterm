@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Ownership: the questions the installer asks before it replaces anything at
-//! the app destination or the `aterm` bin entry — the uninstaller's own tests,
-//! asked in the install direction too.
+//! Ownership and hang-bound tests for `install.sh` app destination and `aterm` bin entry checks.
 
 use std::path::Path;
 
@@ -81,7 +79,6 @@ fn the_app_destination_verdict() {
         "a symlink at the destination is never run to prove it is aterm: {}",
         recs[is_linked].out
     );
-    // Bundle identifiers are read with `defaults`, which only macOS has.
     if cfg!(target_os = "macos") {
         assert_eq!(recs[ours_bundle].rc, 0);
         assert_eq!(recs[is_ours].out, "ours");
@@ -160,8 +157,6 @@ fn the_bin_entry_verdict() {
     let recs = lib.run(&scratch);
     for ((path, want), (verdict, plan)) in rows.iter().zip(calls) {
         assert_eq!(recs[verdict].out, *want, "{}", path.display());
-        // --dry-run asks the same question, so the plan promises only what the
-        // run does: link, replace a pre-store file, or leave a foreign one.
         let plan = &recs[plan].out;
         let p = s(path);
         match want.split(' ').next() {
@@ -345,8 +340,6 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
     scratch.stand_in("stall/store/aterm", &stall);
     let none = scratch.mkdir("stall/none");
     let candidate = scratch.stand_in("stall/candidate/aterm-linux", &stall);
-    // (the case, what the staller says first, the argument it finishes on, the call, what
-    // the call says)
     let cases = [
         (
             "version",

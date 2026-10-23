@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-libc-oracle harvest` — widen a cell's `union.json` list from the
-//! compiler.
-//!
-//! The item list was derived, not from a source scan, but from what a workspace
-//! check of that cell could not resolve, iterated to a fixed point: build with
-//! the shim, read every name the errors say is missing from `libc`, keep only
-//! those the REFERENCE exports on that cell, add them, regenerate, repeat. The
-//! reference filter is what makes the loose matching safe: a name libc lacks
-//! can never become an obligation. The list only ever grows.
+//! `aterm-libc-oracle harvest` — widen a cell's `union.json` list from the compiler.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,12 +30,6 @@ fn quoted(text: &str) -> Option<&str> {
 }
 
 /// Every name a compiler error line says is missing, once each.
-///
-/// * ``cannot find <what> `X` `` (value, type, function, struct, macro, trait,
-///   constant), the words before it any lowercase list;
-/// * ``no `X` in``;
-/// * ``unresolved import `path::X` `` (the path lowercase);
-/// * `` `libc::X` `` or `` `c::X` `` anywhere.
 #[must_use]
 pub fn missing_names(line: &str) -> BTreeSet<&str> {
     const KINDS: [&str; 7] = [
@@ -108,8 +94,7 @@ fn segment_after<'l>(line: &'l str, marker: &str) -> Option<&'l str> {
     valid.then_some(name)
 }
 
-/// Who a line's error is in: a registry crate, a first-party member, or the
-/// line's own prefix.
+/// Who a line's error is in: a registry crate, a first-party member, or the line's own prefix.
 #[must_use]
 pub fn crate_of(line: &str) -> String {
     if let Some(name) = line
@@ -145,8 +130,7 @@ pub struct Harvest {
 }
 
 impl Harvest {
-    /// Read a `--message-format short` check log; `exported` is the
-    /// reference's crate-root names.
+    /// Read a `--message-format short` check log; `exported` is the reference's crate-root names.
     #[must_use]
     pub fn scan(log: &str, exported: &dyn Fn(&str) -> bool) -> Self {
         let mut out = Self::default();

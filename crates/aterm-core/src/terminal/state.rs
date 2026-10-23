@@ -202,7 +202,8 @@ pub struct Terminal {
     pub(super) kitty_file_resolver: Option<
         Box<dyn Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>> + Send>,
     >,
-    /// Last time a BEL callback fired, for rate limiting BEL floods.
+    /// Last time a BEL callback fired, for rate limiting BEL floods. Shares
+    /// `transient.process_now`'s type.
     pub(super) last_bell_time: Option<aterm_time::Instant>,
     /// Monotonic count of bells that fired past the throttle, for poll and watermark
     /// observers (`subscribe events`); unlike the take-and-clear `bell_pending`, never
@@ -279,7 +280,8 @@ pub struct Terminal {
     /// What the last mouse report the host encoded carried (`Terminal::note_mouse_report`):
     /// xterm's `mouse_row`/`mouse_col`, so motion is reported only on a new cell.
     pub(super) mouse_report_memo: Option<super::mouse::MouseReportMemo>,
-    /// The main screen's selection, parked while the alternate screen is up.
+    /// The main screen's selection, parked while the alternate screen is up. Invariant:
+    /// empty whenever `alternate_screen` is false.
     pub(super) parked_text_selection: crate::selection::TextSelection,
     /// The selection a grid resize undo will put back
     /// ([`super::resize_journal::ResizeUndoSelection`]).
@@ -362,7 +364,8 @@ pub struct Terminal {
     /// Host projection of content-coordinate motion, updated once per batch; cumulative, so
     /// several renderers can observe it.
     pub(super) content_scroll_state: ContentScrollState,
-    /// What each resize did to the active grid ([`super::resize_journal`]).
+    /// What each resize did to the active grid ([`super::resize_journal`]). Written only by
+    /// the two resize entry points; never checkpointed.
     pub(super) resize_journal: super::resize_journal::ResizeJournal,
 }
 

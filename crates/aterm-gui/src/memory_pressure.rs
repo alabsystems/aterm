@@ -10,11 +10,9 @@ use crate::crash_restore::PressureLevel;
 
 type DispatchObject = *mut c_void;
 
-// DISPATCH_MEMORYPRESSURE_* mask bits (dispatch/source.h).
 const NORMAL: usize = 0x01;
 const WARN: usize = 0x02;
 const CRITICAL: usize = 0x04;
-// DISPATCH_QUEUE_PRIORITY_DEFAULT.
 const QUEUE_PRIORITY_DEFAULT: isize = 0;
 
 unsafe extern "C" {
@@ -36,32 +34,21 @@ unsafe extern "C" {
     fn dispatch_resume(object: DispatchObject);
 }
 
-/// Leaked handler context: the user callback + the source whose pressure level the
-/// handler reads. Both live for the process lifetime.
 struct Ctx {
     on_level: Box<dyn Fn(PressureLevel) + Send>,
     source: DispatchObject,
 }
 
-// SAFETY: the handler runs on a serial dispatch queue; the callback is `Send` and
-// the leaked source pointer is only read, never freed.
+// SAFETY: the handler runs on a serial dispatch queue; the callback is `Send` and the leaked source
+// pointer is only read, never freed.
 unsafe impl Send for Ctx {}
 
-/// The line this source logs for every level the OS reports, on the dispatch
-/// thread itself: `level`, the level the report stands for ([`resolve`]; `None`
-/// reads as normal), and `mask`, the source's data as delivered. It is the run's own
-/// record of where memory pressure stood: the main thread's shed line is written only
-/// when the main thread gets to it, and never for a return to normal, so without this
-/// a run killed under critical pressure and one that had recovered long before read
-/// the same to the next launch's recovery census (`recovery_census::PRESSURE_LINE` is
-/// its prefix, and the word after it is the level).
+/// The line this source logs for every level the OS reports, on the dispatch thread itself.
 pub(crate) fn level_line(mask: usize, level: Option<PressureLevel>) -> String {
     let word = level.map_or("normal", PressureLevel::word);
     format!("memory pressure: the system reports {word} (level {mask:#x})")
 }
 
-/// The level a mask of one level bit is, the highest for a mask of more (`None` for a
-/// mask with no level bit, which the source never sends).
 fn level_of(level: usize) -> Option<PressureLevel> {
     if level & CRITICAL != 0 {
         Some(PressureLevel::Critical)
@@ -74,14 +61,6 @@ fn level_of(level: usize) -> Option<PressureLevel> {
     }
 }
 
-/// The level a delivered mask stands for. A dispatch source merges the events its
-/// handler has not taken yet by OR-ing their bits, so a WARN and the NORMAL after it,
-/// delivered together, arrive as one `WARN|NORMAL`: a mask of more than one level says
-/// which levels were crossed, not where the pressure stands now. Taking its highest bit
-/// would leave the journal's history rings shed after the pressure had eased (NORMAL is
-/// what brings them back), until the next episode. So for such a mask the system's
-/// current level is read (`current`, [`current_level`]); only when it cannot be read is
-/// the highest bit taken, the cautious reading. A mask of one level needs no read.
 fn resolve(mask: usize, current: impl FnOnce() -> Option<usize>) -> Option<PressureLevel> {
     let levels = mask & (NORMAL | WARN | CRITICAL);
     if levels.count_ones() > 1
@@ -94,15 +73,12 @@ fn resolve(mask: usize, current: impl FnOnce() -> Option<usize>) -> Option<Press
     level_of(levels)
 }
 
-/// The system's memory-pressure level now: `kern.memorystatus_vm_pressure_level`, whose
-/// values are the source's own bits (1 normal, 2 warn, 4 critical). `None` when the read
-/// fails or answers something else.
 fn current_level() -> Option<usize> {
     let mut level: libc::c_int = 0;
     let mut len: libc::size_t = std::mem::size_of::<libc::c_int>();
-    // SAFETY: the name is a NUL-terminated literal; `level` and `len` are live locals
-    // written only during the call, `len` holds the buffer's real size, and the new-value
-    // pair is null/0 (read only). No pointer escapes.
+    // SAFETY: the name is a NUL-terminated literal; `level` and `len` are live locals written only
+    // during the call, `len` holds the buffer's real size, and the new-value pair is null/0 (read
+    // only).
     let rc = unsafe {
         libc::sysctlbyname(
             c"kern.memorystatus_vm_pressure_level".as_ptr(),
@@ -120,11 +96,7 @@ fn current_level() -> Option<usize> {
         .filter(|level| [NORMAL, WARN, CRITICAL].contains(level))
 }
 
-/// What a level asks of the scrollback's shed (`App::shed_memory_under_pressure`):
-/// `Some(critical)` for a warning or a critical level, `None` for a return to NORMAL.
-/// NORMAL reaches the window (the crash-restore journal's shed brings its history rings
-/// back once it has held, `crash_restore::ShedPolicy`) but trims nothing: before this
-/// source registered NORMAL, the scrollback's shed only ever saw warning and critical.
+/// What a level asks of the scrollback's shed (`App::shed_memory_under_pressure`).
 pub(crate) fn scrollback_shed(level: PressureLevel) -> Option<bool> {
     match level {
         PressureLevel::Normal => None,
@@ -150,24 +122,17 @@ extern "C" fn handler(ctx: *mut c_void) {
     let Some(level) = level else {
         return;
     };
-    // Never unwind across the C boundary.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (ctx.on_level)(level);
     }));
 }
 
-/// Register the process-wide macOS memory-pressure notifier. The callback runs on a
-/// libdispatch background thread and should only enqueue cheap, thread-safe work.
-/// It is called for every level the OS reports: WARN and CRITICAL shed (the scrollback
-/// and the crash-restore journal's history rings), NORMAL is logged ([`level_line`]) and
-/// starts the journal's wait before its rings come back ([`scrollback_shed`]: the
-/// scrollback takes nothing from it).
+/// Register the process-wide macOS memory-pressure notifier.
 pub(crate) fn install<F>(on_level: F)
 where
     F: Fn(PressureLevel) + Send + 'static,
 {
-    // SAFETY: standard libdispatch source setup. The source and context are
-    // deliberately process-lifetime allocations so no handler can race a free.
+    // SAFETY: standard libdispatch source setup.
     unsafe {
         let queue = dispatch_get_global_queue(QUEUE_PRIORITY_DEFAULT, 0);
         let source = dispatch_source_create(
@@ -194,8 +159,6 @@ mod tests {
     use super::{CRITICAL, NORMAL, WARN, level_line, level_of, resolve, scrollback_shed};
     use crate::crash_restore::PressureLevel;
 
-    /// The source's line names the level a report stands for, the word the census reads,
-    /// with the mask as delivered, and starts with the census's prefix.
     #[test]
     fn the_level_line_names_the_level_the_census_reads() {
         let line = |mask| level_line(mask, level_of(mask));
@@ -213,10 +176,6 @@ mod tests {
         }
     }
 
-    /// Every level reaches the window, highest bit first, and a return to NORMAL never
-    /// sheds the scrollback: before this source asked for NORMAL, the scrollback's shed
-    /// only ever saw warning and critical, and the journal's rings coming back is NORMAL's
-    /// one effect.
     #[test]
     fn a_return_to_normal_is_recorded_and_never_sheds_the_scrollback() {
         assert_eq!(level_of(NORMAL), Some(PressureLevel::Normal));
@@ -229,13 +188,6 @@ mod tests {
         assert_eq!(scrollback_shed(PressureLevel::Critical), Some(true));
     }
 
-    /// A MERGED MASK IS WHERE THE PRESSURE STANDS NOW (R6 review). The source ORs the bits
-    /// of the events its handler has not taken yet, so a spike's WARN and the NORMAL after
-    /// it can arrive as one `WARN|NORMAL`; read as its highest bit, the journal's history
-    /// rings stayed shed until the next episode's NORMAL. A mask of more than one level is
-    /// settled by the system's level now; one the read cannot settle keeps the highest bit
-    /// (the cautious reading); a mask of one level is never read.
-    /// NEGATIVE CONTROL: `level_of`, the old reading, calls the eased spike WARN.
     #[test]
     fn a_merged_mask_is_read_as_the_level_the_system_is_at_now() {
         let now = |level| move || Some(level);
@@ -274,7 +226,6 @@ mod tests {
         );
     }
 
-    /// The system's level reads as one of the source's own bits on this host.
     #[test]
     fn the_systems_level_reads_as_one_of_the_sources_bits() {
         let level = super::current_level().expect("kern.memorystatus_vm_pressure_level");

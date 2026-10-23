@@ -283,6 +283,8 @@ fn corpus_name(name: &str) -> bool {
 }
 
 /// THE ONE TAPE of `source` to promote: the file itself, or the one tape
+/// under the directory that carries its end.
+///
 /// # Errors
 /// None ended there, or more than one (each named: give its path).
 fn the_tape(source: &Path) -> Result<PathBuf, String> {
@@ -377,6 +379,8 @@ fn held(path: &Path) -> Option<Census> {
 }
 
 /// `source`'s tape promoted into the corpus as `name` ([module docs](self)):
+/// where it was written, what it is, and what the tape it replaced held.
+///
 /// # Errors
 /// A failed run, no tape to promote, a name the scrub refuses, the
 /// promote's refusal (`corpus::promote`), a loss not allowed, or the write.
@@ -530,6 +534,8 @@ pub fn cmd_lint(args: &[String]) -> Res {
 }
 
 /// THE REPLAY'S JAIL for the binary `bin` and the tape `tape`, both physical
+/// paths (`replay_jail.sb`'s holes filled).
+///
 /// # Errors
 /// A path a sandbox profile cannot quote.
 fn jail_profile(bin: &Path, tape: &Path) -> Result<String, String> {
@@ -552,6 +558,9 @@ struct Jailed {
 }
 
 /// `aterm drive replay --check <asked>` run by `bin` in the jail whose
+/// profile names `allowed` (`sandbox-exec -p`), its environment cleared: what
+/// it did.
+///
 /// # Errors
 /// The profile, the spawn, or an interrupt.
 fn jailed(bin: &Path, allowed: &Path, asked: &Path) -> Result<Jailed, Fail> {

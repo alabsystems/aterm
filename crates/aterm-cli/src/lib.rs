@@ -52,7 +52,8 @@ pub use windowing::{
     window_verb_usage,
 };
 
-/// `--help`'s title.
+/// `--help`'s title. [`help_text`] assembles the rest: USAGE, OPTIONS,
+/// SUBCOMMANDS, VERBS, TOOLCHAIN and EXAMPLES.
 const HELP_TITLE: &str = "aterm — a transparent, introspecting terminal\n";
 /// What a plain `aterm` session runs, per platform, for `--help` ([`HELP_SESSION_LINE`]) and `aterm help aterm`.
 #[cfg(not(windows))]
@@ -494,7 +495,8 @@ fn verb_help_block(verb: Verb) -> String {
     out
 }
 
-/// `--help`, assembled.
+/// `--help`, assembled. The VERBS section is rendered from [`Verb::ALL`] rather
+/// than written out, which is what makes "advertised" and "exists" the same fact.
 fn help_text() -> String {
     let mut out = format!(
         "{HELP_TITLE}{}\n\n{HELP_SESSION_LINE}{HELP_HEAD}",
@@ -1070,7 +1072,8 @@ fn exceptions_facts() -> ExceptionsFacts {
         .count())
 }
 
-/// The `exceptions:` row, pure over the count.
+/// The `exceptions:` row, pure over the count. A NOTE when something waits for a look
+/// (a fact for a person, never a reason for `doctor` to fail), OK when nothing does.
 fn exceptions_row(facts: &ExceptionsFacts) -> (Mark, String) {
     match facts {
         Err(why) => (Mark::Note, format!("not measured ({why})")),
@@ -1134,7 +1137,8 @@ struct DoctorRow {
     /// The fact alone, no label (`/bin/sh (executable)`): the row prints it after
     /// the mark.
     fact: String,
-    /// The read did not establish the state.
+    /// The read did not establish the state. Separate from `mark`: a quiet note
+    /// may be either an ordinary advisory or missing evidence.
     unmeasured: bool,
 }
 
@@ -1144,7 +1148,8 @@ struct DoctorRow {
 struct PrivacyFacts {
     /// The instance's Full Disk Access state, from one prompt-free probe.
     fda: FdaState,
-    /// Why `fda` reads as it does.
+    /// Why `fda` reads as it does. `label.refused()` means no syscall ran, so the row names
+    /// the configuration rather than implying a denial.
     fda_label: ProbeLabel,
     /// The class of this build's designated requirement — whether a grant made
     /// today survives the next build.
@@ -1212,7 +1217,8 @@ fn designated_requirement_class() -> DrClass {
     DrClass::Unknown
 }
 
-/// Why a probe reports what it does, in an actionable sentence.
+/// Why a probe reports what it does, in an actionable sentence. Every label is
+/// spelled so a new variant cannot render as an empty reason.
 fn probe_reason(label: ProbeLabel) -> String {
     match label {
         ProbeLabel::Pending => "the access check is pending".to_string(),
@@ -1680,7 +1686,7 @@ fn fabric_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
 }
 
 /// Probe the Windows console host for a new window's tab (`None` off Windows).
-const fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
+fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     #[cfg(windows)]
     {
         Some(aterm_pty::probe_console_host(
@@ -1815,7 +1821,10 @@ fn ask_window_for_devtools(now: bool) -> WindowAnswer {
     window_answer(aterm_ctl::front_door_send(&sock, request))
 }
 
-/// What one [`aterm_ctl::front_door_send`] of the hand-over came to.
+/// What one [`aterm_ctl::front_door_send`] of the hand-over came to. A line the
+/// connect phase returned in place of an answer (`ERR auth; …`, `ERR control
+/// server busy; retry`) means the request never went out, so nothing was
+/// decided about it: no instance answered, as when the connect itself failed.
 fn window_answer(sent: std::io::Result<String>) -> WindowAnswer {
     match sent {
         Ok(reply) if aterm_ctl::front_door_refused(&reply) => WindowAnswer::Unreachable,
@@ -1860,7 +1869,8 @@ struct DevtoolsReach<'a> {
     say: &'a dyn Fn(&str),
 }
 
-/// The line printed while doctor waits for the switch.
+/// The line printed while doctor waits for the switch. ctrl-c ends doctor, not
+/// only the wait (doctor installs no handler), so it says that.
 const DEVTOOLS_WAIT_LINE: &str = "aterm doctor: waiting up to 2 min for aterm's switch to read on \
                                   in Developer Tools (ctrl-c stops doctor)\u{2026}";
 
@@ -2467,7 +2477,8 @@ enum CliAction {
     /// A usage error (unknown option, missing `--containment` value): the message
     /// is already framed for stderr; exit 2 without launching a shell.
     Usage(String),
-    /// Proceed to launch.
+    /// Proceed to launch. `containment` is the raw mode selection (if any) the
+    /// init funnel parses (`None`: the default `User`).
     Run {
         containment: Option<String>,
         quiet: bool,
@@ -5221,7 +5232,11 @@ mod tests {
         }
     }
 
-    /// THE PANE THROTTLE HOLDS IN THE DOCTOR'S OWN PATH (S5).
+    /// THE PANE THROTTLE HOLDS IN THE DOCTOR'S OWN PATH (S5). Bare `aterm doctor`
+    /// gathers its facts with `fix`, which hands the owner to the Developer Tools pane
+    /// ([`super::devtools_hand_over_when`]): within ten minutes of the last opening, with
+    /// no window and no person here, it opens nothing, and the doctor's `devtools:` row
+    /// says why.
     #[test]
     fn the_doctors_devtools_hand_over_keeps_the_ten_minute_throttle() {
         use super::WindowAnswer;

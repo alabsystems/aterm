@@ -64,7 +64,8 @@ struct IFileOpenDialog {
     vtbl: *const IFileOpenDialogVtbl,
 }
 
-/// `IShellItem` (shobjidl_core.h).
+/// `IShellItem` (shobjidl_core.h). Only `GetDisplayName` is called; the five
+/// slots before it keep the documented method order so it lands on slot 5.
 #[repr(C)]
 struct IShellItemVtbl {
     query_interface:
@@ -94,7 +95,8 @@ const HRESULT_CANCELLED: i32 = 0x8007_04C7u32 as i32;
 /// every item under [`FOS_FORCEFILESYSTEM`].
 const SIGDN_FILESYSPATH: u32 = 0x8005_8000;
 
-/// Directories, not files, are the selectable items.
+/// Directories, not files, are the selectable items. Cleared:
+/// `setCanChooseDirectories(false)`.
 const FOS_PICKFOLDERS: u32 = 0x0000_0020;
 /// Refuse virtual items (a scanner page) that have no path. Set: the callers open a path.
 const FOS_FORCEFILESYSTEM: u32 = 0x0000_0040;
@@ -117,7 +119,11 @@ unsafe extern "system" {
     fn GetActiveWindow() -> isize;
 }
 
-/// The document picker's file-type list.
+/// The document picker's file-type list. ONE unrestricted row, because the
+/// macOS document panel restricts nothing either: the Markdown/editor document
+/// host validates what it was handed, and a type filter here would only be a
+/// second, drifting copy of that rule that silently hides files it would have
+/// accepted.
 const ALL_FILES: [(&str, &str); 1] = [("All Files", "*.*")];
 
 /// The wallpaper picker's list: the images the wallpaper decoder reads here
@@ -133,7 +139,8 @@ fn image_rows() -> [(String, String); 1] {
 /// Owned `COMDLG_FILTERSPEC` rows: the wide buffers and the array of pointers into them, kept
 /// together so the array cannot outlive its strings.
 struct FilterSpecs {
-    /// Alive for the pointers in `specs`.
+    /// Alive for the pointers in `specs`. Moving the outer `Vec` does not move
+    /// these heap buffers, so the pointers stay valid across the move into `Self`.
     _text: Vec<Vec<u16>>,
     specs: Vec<FilterSpec>,
 }

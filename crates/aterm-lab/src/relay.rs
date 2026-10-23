@@ -54,7 +54,9 @@ pub(crate) enum Way {
 }
 
 impl Take {
-    /// One chunk's line, `<t_ns> O|I <hex>`, written whole.
+    /// One chunk's line, `<t_ns> O|I <hex>`, written whole. A take that can
+    /// no longer be written is reported once and closed; the relay goes on,
+    /// the program never told.
     fn chunk(take: &mut Option<Self>, way: Way, bytes: &[u8]) {
         let Some(Take(f)) = take else { return };
         let line = take_line(sys::monotonic_ns(), way, bytes);

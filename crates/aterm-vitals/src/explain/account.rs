@@ -139,6 +139,15 @@ pub fn you_role(fig: i64, whole: i64, largest: bool, above: bool) -> (Role, bool
 /// `subject`'s account for a caller in tab `you` (the host's key), from snapshot `snap`.
 #[must_use]
 pub fn account(subject: WhySubject, you: Option<u64>, snap: &Snapshot) -> Account {
+    account_of(subject, you.as_slice(), snap)
+}
+
+/// [`account`] for a caller whose tab is the sessions `panes` (its split
+/// panes, by the host's keys, in layout order, the first standing for the
+/// tab in [`You::tab`]; none for a caller in no tab): the tab's figure is
+/// theirs summed.
+#[must_use]
+pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Account {
     let facts = snap.why.clone();
     let lane = facts.as_ref().map_or(snap.coal_lane, |f| f.lane);
     let mut cannot = Vec::new();
@@ -149,8 +158,8 @@ pub fn account(subject: WhySubject, you: Option<u64>, snap: &Snapshot) -> Accoun
         cannot.push(("coalition_list", "truncated"));
     }
     let (parts, you) = match subject {
-        WhySubject::Cpu => cpu_you(facts.as_deref(), lane, you, snap),
-        WhySubject::Mem => (None, mem_you(you, snap)),
+        WhySubject::Cpu => cpu_you(facts.as_deref(), lane, panes, snap),
+        WhySubject::Mem => (None, mem_you(panes, snap)),
     };
     if subject == WhySubject::Cpu && facts.is_some() && you.role == Role::Unavailable("not_sampled")
     {
@@ -223,13 +232,14 @@ pub fn account(subject: WhySubject, you: Option<u64>, snap: &Snapshot) -> Accoun
     }
 }
 
-/// The CPU's parts for tab `tab`, and the tab's role (the bound rule), under the lane `lane`.
+/// The CPU's parts for the tab of the sessions `panes`, and the tab's role (the bound rule), under the lane `lane`.
 fn cpu_you(
     facts: Option<&WhyFacts>,
     lane: CoalLane,
-    tab: Option<u64>,
+    panes: &[u64],
     snap: &Snapshot,
 ) -> (Option<Parts>, You) {
+    let tab = panes.first().copied();
     let unread = |word| You {
         tab,
         role: Role::Unavailable(word),
@@ -248,10 +258,11 @@ fn cpu_you(
     };
     let split = &f.split;
     let cut = f.procs_truncated || snap.procs_truncated || snap.aterm.is_none();
-    if tab.is_some_and(|k| split.tabs.iter().all(|t| t.0 != k)) {
+    // The split keys a tab by one of its panes ([`crate::model::TabRoot::tab`]).
+    if !panes.is_empty() && !split.tabs.iter().any(|t| panes.contains(&t.0)) {
         return (None, unread(if cut { "truncated" } else { "warming" }));
     }
-    let parts = split.parts(tab);
+    let parts = split.parts_of(panes);
     if cut {
         return (Some(parts), unread("truncated"));
     }
@@ -286,8 +297,9 @@ fn cpu_you(
     (Some(parts), you)
 }
 
-/// The tab `tab`'s role in used memory, by its footprint.
-fn mem_you(tab: Option<u64>, snap: &Snapshot) -> You {
+/// The role in used memory of the tab of the sessions `panes`, by their footprints summed.
+fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
+    let tab = panes.first().copied();
     let unread = |word| You {
         tab,
         role: Role::Unavailable(word),
@@ -303,14 +315,14 @@ fn mem_you(tab: Option<u64>, snap: &Snapshot) -> You {
         return unread("unsupported");
     };
     let whole = i64::try_from(used).unwrap_or(i64::MAX);
-    let fig = match tab {
-        Some(k) => match snap.tab(k).map(|t| t.scope.footprint) {
-            Some(Some(fp)) => i64::try_from(fp).unwrap_or(i64::MAX),
+    let mut fig = 0i64;
+    for &k in panes {
+        match snap.tab(k).map(|t| t.scope.footprint) {
+            Some(Some(fp)) => fig = fig.saturating_add(i64::try_from(fp).unwrap_or(i64::MAX)),
             Some(None) => return unread("not_sampled"),
             None => return unread("warming"),
-        },
-        None => 0,
-    };
+        }
+    }
     let aterm = snap.aterm.as_ref().and_then(|a| a.footprint).unwrap_or(0);
     let rest = i64::try_from(aterm).unwrap_or(i64::MAX) - fig;
     let outside = snap

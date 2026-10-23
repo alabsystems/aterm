@@ -115,7 +115,9 @@ pub enum UnderlineStyle {
 }
 
 impl UnderlineStyle {
-    /// Resolve the packed underline bits to a single variant.
+    /// Resolve the packed underline bits to a single variant. The composite styles
+    /// share bits with the singletons (DOTTED = UNDERLINE|CURLY, DASHED =
+    /// DOUBLE|CURLY), so they are tested before the singletons.
     #[inline]
     const fn from_flags(cflags: CellFlags) -> Self {
         if cflags.contains(CellFlags::DOTTED_UNDERLINE) {
@@ -2039,7 +2041,9 @@ mod tests {
         assert!(text.starts_with("line "), "apron text: {text:?}");
     }
 
-    /// Cursor-only updates do not bump the row-content generation.
+    /// Cursor-only updates do not bump the row-content generation. The apron
+    /// keeps its materialized row, but its caret must follow the current DEC
+    /// cursor so the incoming strip cannot show a stale position or visibility.
     #[test]
     fn apron_memo_refreshes_cursor_without_rematerializing_the_row() {
         let (rows, cols) = (6usize, 10usize);

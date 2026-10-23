@@ -67,8 +67,6 @@ fn native_text_key_skips_the_terminal_lock_state_rpc() {
 }
 
 fn file_uri(path: &std::path::Path) -> String {
-    // Built by the shipping encoder: a hand-rolled `format!` is malformed on
-    // Windows (drive letter + backslashes after the authority slot).
     crate::native_document_host::path_to_file_uri(path).unwrap()
 }
 
@@ -305,7 +303,6 @@ fn routed_find_keys_keep_their_window_when_frontmost_has_changed() {
                     ModifiersState::SUPER,
                 )
             };
-            // A tab-spawn replay still carries A even after B becomes frontmost.
             press(&mut app, a, code, key, mods);
             match kind {
                 None => assert!(app.windows[&a].search.is_some()),
@@ -547,8 +544,6 @@ fn native_repeat_replays_exact_press_view_and_never_the_replacement_tab() {
     let document = app.native_runtime.document_id(instance).unwrap();
     let typed = InputEvent::Text("x".to_string());
 
-    // Model the genuine key-down, then capture the normalized repeat owner
-    // exactly as `on_key_native_mode` does.
     assert_eq!(
         app.input(wid, typed.clone(), Source::Human),
         InputOutcome::Ok
@@ -566,9 +561,6 @@ fn native_repeat_replays_exact_press_view_and_never_the_replacement_tab() {
         "the repeat is delivered to the captured Editor view"
     );
 
-    // Replacing the active tab while the key remains held invalidates the
-    // captured view. Later repeats are swallowed, never reinterpreted as a
-    // Settings key or redirected back through current-content resolution.
     assert!(app.open_settings_tab(SettingsRoute::Home));
     app.route_physical_repeat(wid, physical);
     assert_eq!(
@@ -633,9 +625,6 @@ fn markdown_cmd_a_and_escape_own_exact_source_selection() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Even a controller-supplied `KeySequence` cannot cross an active native tab
-/// (the physical key path already swallows a configured raw sequence before
-/// this seam). The terminal pass is the negative control: the pipe sees writes.
 #[cfg(unix)]
 #[test]
 fn raw_key_sequence_never_reaches_parked_pty_under_native_tab() {
@@ -674,8 +663,6 @@ fn raw_key_sequence_never_reaches_parked_pty_under_native_tab() {
     );
 
     assert!(app.close_settings_tabs());
-    // Closing the native tab re-mirrors the terminal session with its real
-    // sink; restore the observing pipe for the negative control.
     app.windows
         .get_mut(&wid)
         .unwrap()

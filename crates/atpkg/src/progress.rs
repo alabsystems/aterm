@@ -702,7 +702,8 @@ fn stdio_lost_its_reader() -> bool {
 /// EPIPE window, not the cost, sets it.
 const ORPHAN_POLL_MS: u64 = 100;
 
-/// Point stdout and stderr at `log` (appended, `0600`) and say so there.
+/// Point stdout and stderr at `log` (appended, `0600`) and say so there. A log that cannot
+/// be opened leaves the fds alone.
 #[cfg(unix)]
 fn quiet_stdio(log: &Path) {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -752,7 +753,10 @@ impl PassSlot {
 /// THE process's pass slot.
 static PROCESS_PASS: PassSlot = PassSlot::new();
 
-/// The pass slot this thread's calls answer to: [`PROCESS_PASS`], in every build.
+/// The pass slot this thread's calls answer to: [`PROCESS_PASS`], in every build. A test
+/// thread may hold one of its own (`own_pass_slot`), and lends it with its pass
+/// ([`lend`]), so tests that begin passes run side by side, each its own process's one
+/// pass, and none sees another's — the production rule, one slot per process, unbent.
 fn slot() -> &'static PassSlot {
     #[cfg(test)]
     {
@@ -1620,7 +1624,12 @@ mod writer_tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// STOPPING A PASS POLLER MUST NOT COST ITS TICK.
+    /// STOPPING A PASS POLLER MUST NOT COST ITS TICK. Both pass-owned threads
+    /// are joined by the PASS thread — the one holding the store flock — and an
+    /// uninterruptible `sleep` made each join wait out whatever remained of the
+    /// current tick: up to 100 ms between download-complete and the sha256 on
+    /// EVERY downloaded artifact, and up to 500 ms at `end_pass` before the
+    /// terminal snapshot the GUI retires its row on.
     #[test]
     fn stopping_a_pass_poller_does_not_wait_out_its_tick() {
         let l = layout("prompt-stop");

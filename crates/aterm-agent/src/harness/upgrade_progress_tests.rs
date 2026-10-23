@@ -427,7 +427,10 @@ fn quiet_bound(s: &State, word: &str) -> bool {
     }
 }
 
-/// T1-a', the quiet upgrade's read (see the module header).
+/// T1-a', the quiet upgrade's read (see the module header). The quiet flow's one step is the
+/// restart at a genuinely idle point ([`upgrade::quiet_step`]); what it shares with the machine is
+/// the recorded word, bound over every reachable state read quietly ([`quiet_facts`],
+/// [`quiet_truth`]).
 #[test]
 fn the_quiet_upgrades_read_records_what_holds_its_restart() {
     let today = main_today();

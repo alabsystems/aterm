@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The Linux lane's proof (`linux proof`; `targo --unverified verify linux` runs it).
-
+//!
 //! STOCK EXCEPTION: the guest's Rust is rustup's stock toolchain
 //! ([`crate::linux_guest::RUST`]); no Linux build of Trust exists.
 use std::fmt::Write as _;
@@ -327,7 +327,7 @@ fn binary_of(running: &str) -> String {
 /// Read `cargo test --no-fail-fast`'s output, stderr merged in order.
 #[must_use]
 pub fn tally(output: &str) -> Tally {
-    fn close(t: &mut Tally, last: &mut Option<(u64, u64, u64)>) {
+    const fn close(t: &mut Tally, last: &mut Option<(u64, u64, u64)>) {
         if let Some((p, f, i)) = last.take() {
             t.passed += p;
             t.failed += f;

@@ -25,7 +25,7 @@ pub struct Log {
 impl Log {
     /// A transcript printed as it is written (`<verb>: <line>`).
     #[must_use]
-    pub fn echo(verb: &'static str) -> Self {
+    pub const fn echo(verb: &'static str) -> Self {
         Self {
             verb,
             echo: true,
@@ -35,7 +35,7 @@ impl Log {
 
     /// A transcript kept, never printed.
     #[must_use]
-    pub fn capture(verb: &'static str) -> Self {
+    pub const fn capture(verb: &'static str) -> Self {
         Self {
             verb,
             echo: false,

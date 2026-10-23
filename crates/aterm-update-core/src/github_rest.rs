@@ -252,7 +252,7 @@ pub struct Request<'a> {
 impl<'a> Request<'a> {
     /// A JSON GET of `url`.
     #[must_use]
-    pub fn get(url: &'a str) -> Request<'a> {
+    pub const fn get(url: &'a str) -> Request<'a> {
         Request {
             method: Method::Get,
             url,
@@ -281,7 +281,8 @@ pub struct Exchange {
 impl Exchange {
     /// The answer, whatever its status.
     /// # Errors
-    /// [`RestError::Malformed`] for an answer over its cap ([`RestError::Transport`]).
+    /// [`RestError::Malformed`] for an answer over its cap; [`RestError::Transport`] when curl
+    /// reached no answer.
     pub fn answer(self) -> Result<Answer, RestError> {
         if self.exit == Some(63) || self.stderr.contains("Maximum file size exceeded") {
             return Err(RestError::Malformed(format!(
@@ -466,9 +467,10 @@ impl Prepared {
             .collect()
     }
 
-    /// Send it ([`RestError::Local`], [`not_started`]).
+    /// Send it.
     /// # Errors
-    /// [`RestError::Transport`] when curl could not be started.
+    /// [`RestError::Local`] when the spawn was interrupted before curl started ([`not_started`]);
+    /// [`RestError::Transport`] when curl could not otherwise be started.
     pub fn run(mut self) -> Result<Exchange, RestError> {
         let out = self
             .spawn
@@ -750,7 +752,8 @@ impl Client {
 
     /// Every item of the listing at `base`, page by page ([`crate::github_pages::all`]).
     /// # Errors
-    /// The first page's own failure as it came ([`RestError::Status`] for a 404 among them).
+    /// The first page's own failure as it came ([`RestError::Status`] for a 404 among them),
+    /// else [`RestError::Malformed`] for an unreadable page or pages that disagree.
     pub fn pages(&self, base: &str, per_page: usize) -> Result<Vec<Value>, RestError> {
         let mut failed: Option<RestError> = None;
         let listed = crate::github_pages::all(&self.origins.api, base, per_page, |endpoint| {
@@ -784,7 +787,9 @@ impl Client {
 
     /// Where the asset at `asset_path` (`/repos/o/r/releases/assets/{id}`) is served.
     /// # Errors
-    /// [`RestError::Redirect`] for a `Location` off the CDN (never asked).
+    /// As [`Client::exchange`] and [`Exchange::answer`]; [`RestError::Redirect`] for a `Location`
+    /// off the CDN (never asked); [`RestError::Malformed`] for a 2xx or a redirect with no
+    /// `Location`; [`RestError::Status`] for any other status.
     pub fn asset_location(&self, asset_path: &str) -> Result<String, RestError> {
         let url = self.api(asset_path);
         let request = Request {
@@ -872,7 +877,10 @@ impl Client {
 
     /// Download the asset at `asset_path` into `dest`, at most `cap` bytes.
     /// # Errors
-    /// As [`Client::asset_location`].
+    /// As [`Client::asset_location`]; [`RestError::Local`] for a non-UTF-8 `dest`; then
+    /// [`RestError::Malformed`] over the cap, [`RestError::Status`] for the CDN's HTTP error,
+    /// [`RestError::Redirect`] for a CDN that redirects again, and [`RestError::Transport`]
+    /// otherwise.
     pub fn download_asset(&self, asset_path: &str, dest: &Path, cap: u64) -> Result<(), RestError> {
         let location = self.asset_location(asset_path)?;
         let dest_arg = dest

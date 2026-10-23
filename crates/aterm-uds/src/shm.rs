@@ -69,7 +69,9 @@ pub struct Region {
 // SAFETY: the mapping is process-wide memory not bound to a specific thread.
 unsafe impl Send for Region {}
 
-/// `Region` must never be `Sync` (module doc).
+/// `Region` must never be `Sync`: its copies are plain `memcpy`s, and two threads racing them on
+/// the same bytes would be undefined behaviour. Were it `Sync`, both impls below would apply and
+/// the item named in the closure would be ambiguous: the build fails here.
 trait AmbiguousIfSync<A> {
     fn named() {}
 }

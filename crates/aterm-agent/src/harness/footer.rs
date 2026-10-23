@@ -14,7 +14,8 @@ use aterm_primer::CLAUDE_TOP_EFFORT_KEY;
 /// How much of a transcript's end one read window takes; one turn with a large tool result can be hundreds of KiB.
 pub const TAIL_BYTES: u64 = 512 * 1024;
 
-/// Longest transcript line [`tail_facts`] will parse.
+/// Longest transcript line [`tail_facts`] will parse. A row past this is a
+/// tool result, never a model or effort carrier worth a large parse.
 const MAX_LINE_BYTES: usize = 256 * 1024;
 
 /// Longest `sessions/<pid>.json` read: the file is a few hundred bytes.
@@ -245,7 +246,7 @@ pub struct UpgradeNote {
 impl UpgradeNote {
     /// The words for a composer that holds a person's draft (`draft`) or none, if any.
     #[must_use]
-    pub fn words(&self, draft: bool) -> Option<&UpgradeWords> {
+    pub const fn words(&self, draft: bool) -> Option<&UpgradeWords> {
         if draft {
             Some(&self.draft)
         } else {
@@ -969,13 +970,13 @@ impl TailCache {
 
     /// The survey's excerpts of the transcript the last read read ([`super::excerpt`]).
     #[must_use]
-    pub fn excerpts(&self) -> Option<&super::excerpt::Excerpts> {
+    pub const fn excerpts(&self) -> Option<&super::excerpt::Excerpts> {
         self.excerpts.as_ref()
     }
 
     /// How long the transcript the last read opened was, in bytes; `None` when it opened none.
     #[must_use]
-    pub fn transcript_len(&self) -> Option<u64> {
+    pub const fn transcript_len(&self) -> Option<u64> {
         self.len
     }
 
@@ -1519,7 +1520,7 @@ impl FooterCache {
 
     /// Whether the step tap is armed ([`Self::set_floor`]).
     #[must_use]
-    pub fn steps_armed(&self) -> bool {
+    pub const fn steps_armed(&self) -> bool {
         self.steps.is_some()
     }
 
@@ -1558,7 +1559,7 @@ impl FooterCache {
 
     /// The directories the last read that found the process stood in ([`read_pid`]).
     #[must_use]
-    pub fn dirs(&self) -> Option<&FactDirs> {
+    pub const fn dirs(&self) -> Option<&FactDirs> {
         self.dirs.as_ref()
     }
 
@@ -1741,7 +1742,7 @@ pub enum Said {
 }
 
 impl Said {
-    fn decided(&self) -> bool {
+    const fn decided(&self) -> bool {
         !matches!(self, Self::Unsaid)
     }
 
@@ -1810,7 +1811,7 @@ impl TailFacts {
     }
 
     /// Nothing older can change what these rows say.
-    fn settled(&self) -> bool {
+    const fn settled(&self) -> bool {
         self.model.decided() && self.effort.decided() && self.effort_for.is_none()
     }
 
@@ -1916,7 +1917,7 @@ impl EffortSaid {
     }
 
     /// The key's state it says, if any.
-    fn top(&self) -> Option<bool> {
+    const fn top(&self) -> Option<bool> {
         match self {
             Self::Level { top, .. } => *top,
             Self::Top { on, .. } => Some(*on),
@@ -2022,7 +2023,10 @@ struct Answered {
     effort: bool,
 }
 
-/// A local command's result row folded into `facts`, newest first.
+/// A local command's result row folded into `facts`, newest first. A model
+/// result ([`crate::harness::upgrade_models::model_result_of`]) names the model
+/// ([`TailFacts::meet_model`]) and any `with … effort`; without that clause the
+/// earlier effort stands only for the same model.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2914,19 +2918,19 @@ pub struct Relabel {
 impl Relabel {
     /// How far the run moves left: the pill's cells less the label's.
     #[must_use]
-    pub fn shift(&self) -> usize {
+    pub const fn shift(&self) -> usize {
         (self.end - self.start).saturating_sub(self.label.len())
     }
 
     /// The column after the label.
     #[must_use]
-    pub fn label_end(&self) -> usize {
+    pub const fn label_end(&self) -> usize {
         self.start + self.label.len()
     }
 
     /// The grid column under glass column `col` of the relabelled row.
     #[must_use]
-    pub fn grid_col(&self, col: usize) -> usize {
+    pub const fn grid_col(&self, col: usize) -> usize {
         let shift = self.shift();
         if col < self.label_end() || col >= self.run_end {
             col
@@ -3881,7 +3885,8 @@ fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool 
     true
 }
 
-/// The account/quota pair that controls must leave room for.
+/// The account/quota pair that controls must leave room for. A limit wall
+/// retains priority when a pane cannot hold it and the pair together.
 fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
     let segments = fact_segments(facts, false);
     let wall = segments.iter().find(|s| s.mark == WALL_MARK).cloned();

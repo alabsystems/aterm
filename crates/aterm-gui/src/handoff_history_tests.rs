@@ -1310,7 +1310,10 @@ fn a_frame_corrupt_for_any_other_reason_still_refuses_the_sidecar() {
     );
 }
 
-/// An import rings its session's screen readers.
+/// An import rings its session's screen readers. The attach moves the screen
+/// generation (it invalidates the scroll state) with no output, on the import
+/// worker, so only the end of its own hold can push that to a `screen` or
+/// `cells` subscriber.
 #[test]
 fn an_import_rings_the_sessions_screen_readers() {
     use crate::session_watch::{Subscription, Watchers};
@@ -1574,7 +1577,10 @@ fn a_pending_viewport_restore_keeps_no_pty_master_open() {
     }
 }
 
-/// The attach's own renumbering is not output.
+/// The attach's own renumbering is not output. The restore adds every rise of
+/// the absolute row counter since the adopt as pushed lines, but an attach
+/// whose history is longer than the adopt reserved (a rewrap, or a short
+/// reserve) raises the counter itself and pushes nothing.
 #[test]
 fn an_attach_that_renumbers_does_not_move_the_restored_viewport() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -1759,7 +1765,11 @@ fn a_view_into_withheld_history_stays_at_the_live_bottom() {
     }
 }
 
-/// A held pane's left-behind lines say why.
+/// A held pane's left-behind lines say why. The producer types the reason
+/// ([`HeldLoss`]) from the attempt's plan ([`ExportResults::take_held`]) and
+/// the join ([`name_held_sidecar`]); the successor reads it back off the two
+/// wire keys ([`HeldLoss::from_wire`]) and books the lines by it
+/// ([`incoming_held`]).
 #[test]
 fn a_held_panes_left_lines_say_why() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -1852,7 +1862,11 @@ fn a_held_panes_left_lines_say_why() {
     assert_eq!(carried_loss([&handed]).held_failed, 0);
 }
 
-/// A held pane never takes the room a live tab's follow needs.
+/// A held pane never takes the room a live tab's follow needs. Held panes'
+/// exports fill the aggregate after the handed session's first pass; the
+/// handed session keeps printing, more than the screen carry holds, and its
+/// follow evicts the largest held export for the room, so it follows and its
+/// whole history crosses.
 #[test]
 fn a_held_panes_export_gives_way_to_a_live_tabs_follow() {
     let desk = || {
@@ -2037,7 +2051,8 @@ fn await_followed(followed: &AtomicU64, term: &Arc<Mutex<Terminal>>) {
     );
 }
 
-/// A held pane's first pass never stops a live tab being followed.
+/// A held pane's first pass never stops a live tab being followed. The held
+/// pass here never finishes (the test holds it).
 #[test]
 fn a_held_pass_never_stops_a_live_tab_being_followed() {
     let late = 3000;

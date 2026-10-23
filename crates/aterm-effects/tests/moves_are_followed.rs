@@ -2299,7 +2299,9 @@ fn the_limit_a_torn_relocation_whose_new_row_stood_twin_min_is_a_copy() {
     );
 }
 
-/// The limit: an unsynced composer's wrap torn past `TWIN_MIN` melts.
+/// The limit: an unsynced composer's wrap torn past `TWIN_MIN` melts. Claude Code's
+/// composer (53×91, alt screen) repainted without its bracket, each wrap torn 8–200
+/// ms apart; tears from [`tear_read_as_copy`] on melt, shorter ones follow.
 #[test]
 fn the_limit_an_unsynced_composer_s_wrap_torn_past_twin_min_melts() {
     holds_but(

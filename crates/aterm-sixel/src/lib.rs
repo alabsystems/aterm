@@ -367,7 +367,9 @@ impl SixelDecoder {
         self.mode = mode;
     }
 
-    /// Apply the just-collected params for the pending introducer.
+    /// Apply the just-collected params for the pending introducer. `#` selects/
+    /// defines a color, `"` declares raster geometry, and `!` stashes the repeat
+    /// count in `pending_repeat` for the upcoming data byte.
     #[inline]
     fn finish_params(&mut self) {
         if self.mode == ParamMode::None && self.params.is_empty() {

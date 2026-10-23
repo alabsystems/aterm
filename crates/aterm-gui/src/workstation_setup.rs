@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The first-launch Mac setup's cancellable, foreground-only countdown.
-//! Machine changes belong to the binary's worker. This module can only return a
-//! decision, after an explicit Apply or the complete cancellation interval.
+//! Cancellable foreground-only countdown for first-launch macOS setup.
 
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
@@ -31,9 +29,7 @@ pub struct SetupAnswer {
     pub password: Option<aterm_secrets::SecretBytes>,
     pub receipt: Option<crate::InitialSetupApplyReceipt>,
     pub cancel_receipt: Option<crate::InitialSetupCancelReceipt>,
-    /// The vault field no longer reads as System State showed it: the person typed the
-    /// vault, which moves the Mac. A field left as shown asks for the vault setup shows
-    /// when the Apply is admitted, which a vault joined since may have changed.
+    /// The vault field no longer reads as System State showed it.
     pub vault_typed: bool,
 }
 
@@ -59,16 +55,12 @@ pub(crate) fn send_setup_wake(wake: Wake) -> bool {
         .is_some_and(|proxy| proxy.send_event(wake).is_ok())
 }
 
-/// Wait on a worker thread for the Mac setup countdown. Without a registered
-/// window event loop this returns immediately; never call it on the UI thread.
-/// This decision-only adapter drops admission receipts. Provisioning callers
-/// must use [`await_initial_setup_countdown_while`] and acknowledge durability.
+/// Wait on a worker thread for the Mac setup countdown ([`await_initial_setup_countdown_while`]).
 pub fn await_workstation_setup_countdown(initial: Selection) -> WorkstationSetupDecision {
     await_workstation_setup_countdown_while(initial, || false)
 }
 
 /// Withdraw the offer if another process finishes setup while it is displayed.
-/// `finished` runs on the waiting worker, never on the application event loop.
 pub fn await_workstation_setup_countdown_while(
     initial: Selection,
     finished: impl FnMut() -> bool,
@@ -83,8 +75,7 @@ pub fn await_workstation_setup_countdown_while(
     .decision
 }
 
-/// Wait for the unified setup review. The password is returned once in scrubbed
-/// storage and is never part of the durable plan.
+/// Wait for the unified setup review.
 pub fn await_initial_setup_countdown_while(
     initial: Plan,
     finished: impl FnMut() -> bool,
@@ -150,8 +141,7 @@ impl Request {
             reply: Arc::new(Mutex::new(Some(reply))),
         }
     }
-    /// The native callback and expiry compete for this single decision. A Cancel
-    /// already delivered by AppKit cannot be overtaken by the next timer tick.
+    /// The native callback and expiry compete for this single decision.
     pub(crate) fn finish(&self, decision: WorkstationSetupDecision) {
         self.finish_answer(decision.into());
     }
@@ -175,8 +165,7 @@ impl Request {
 
 const COUNTDOWN: Duration = Duration::from_secs(30);
 
-/// Only intervals during which the sheet is visible in the active application
-/// count. Backgrounding the app pauses, rather than silently consuming, time.
+/// Only intervals during which the sheet is visible in the active application count.
 #[derive(Debug)]
 pub(crate) struct Clock {
     remaining: Duration,
@@ -275,8 +264,6 @@ impl PermissionGate {
     }
 
     fn accepted(&mut self) {
-        // The receipt establishes durable admission, but the cached snapshot
-        // can still describe the previous plan. Only a new read releases it.
         self.await_fresh_status();
     }
 
@@ -401,8 +388,7 @@ fn preview_mode(requested: bool, headless: bool, private: bool) -> PreviewMode {
     }
 }
 
-/// Exercise the real countdown with an inert worker. Its only write is a result
-/// beneath the already-private instance state directory.
+/// Exercise the real countdown with an inert worker.
 fn preview_subset() -> Selection {
     use aterm_types::macos_setup::Setting;
     let mut selected = Selection::all();
@@ -429,8 +415,6 @@ fn start_preview() -> bool {
             if matches!(answer.decision, WorkstationSetupDecision::Begin(_))
                 && let Some(receipt) = answer.receipt.take()
             {
-                // This private preview never provisions anything. Acknowledge
-                // its inert answer so it exercises the production UI lifecycle.
                 receipt.accept();
             }
             let cancel_receipt = answer.cancel_receipt.take();
@@ -467,14 +451,12 @@ impl Drop for Host {
     }
 }
 
-/// First paint and Commit are independent requirements: a candidate can paint
-/// before it is allowed to start workers or change the host machine.
+/// First paint and Commit are independent requirements.
 fn may_start(headless: bool, painted: bool, incoming_pending: bool) -> bool {
     !headless && painted && !incoming_pending
 }
 
-/// A carried command is inert in a validated running-window handoff. A lone
-/// relaunch environment variable cannot turn a scripted launch into setup.
+/// A carried command is inert in a validated running-window handoff.
 pub(crate) fn eligible_launch_command(
     commandless: bool,
     relaunch: bool,
@@ -674,8 +656,6 @@ mod tests {
             clock.tick_at_epoch(start + Duration::from_secs(2), true, 10),
             Duration::from_secs(28)
         );
-        // A nested runModal owns the event loop for forty seconds and returns
-        // to the same focused sheet. Its entry and exit changed the epoch.
         assert_eq!(
             clock.tick_at_epoch(start + Duration::from_secs(42), true, 12),
             Duration::from_secs(28)
@@ -808,8 +788,6 @@ mod tests {
         let mut app = App::headless_for_test();
         app.workstation_setup
             .offer(Request::new(Selection::all(), send));
-        // Headless test windows have no OS window: the offer cannot be
-        // answered, so the worker is released instead of parked.
         app.tick_workstation_setup(Instant::now());
         assert_eq!(
             receive

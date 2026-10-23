@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1: bind the bounded pending-head model to the real watch, including
-//! independent harvest and the single-head retry after an unreachable hint.
+//! Tier-1 conformance tests binding the bounded pending-head model to the real watch.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,8 +37,6 @@ impl Fixture {
     }
 
     fn install_legacy(&self, program: &str) {
-        // A legacy build has no vendor record, so any well-formed newer head
-        // is an offer. The real `installed` reader still traverses `current`.
         let dir = self.layout.build_dir(program, 1);
         std::fs::create_dir_all(&dir).expect("fixture build");
         atomic_symlink(&dir, &self.layout.program_current(program)).expect("fixture current");
@@ -74,7 +71,6 @@ fn harvest_until(
     what: &str,
     arrived: impl Fn(&HeadWatch, &[&'static str]) -> bool,
 ) {
-    // A zero gap: the park itself is the wait between probes.
     let done = within(MUST_HAPPEN, Duration::ZERO, || {
         if arrived(watch, offers) {
             return Some(());
@@ -119,9 +115,6 @@ fn ready_codex_offer_is_harvested_while_claude_is_still_in_flight() {
                 reached.fetch_or(1, Ordering::SeqCst);
                 let (lock, ready) = &*gate;
                 let open = lock.lock().expect("gate lock");
-                // The test opens the gate only after a check returns, so a check
-                // that waited for Claude would never see it open: this wait is
-                // that defect's hang detector, never a latency budget.
                 let (open, _) = ready
                     .wait_timeout_while(open, MUST_HAPPEN, |open| !*open)
                     .expect("gate wait");
@@ -142,8 +135,6 @@ fn ready_codex_offer_is_harvested_while_claude_is_still_in_flight() {
     assert!(watch.has_pending(), "the blocked Claude head remains owned");
     assert!(watch.pending_count() <= modeled_pending(&projected));
 
-    // The first call may harvest a very fast Codex answer; otherwise await its
-    // actual completion. No pass waits for the blocked Claude head.
     harvest_until(
         &mut watch,
         &fixture.layout,
@@ -230,8 +221,6 @@ fn unreachable_single_head_keeps_its_retry_deadline() {
             .check_pending(&fixture.layout, at(59), &get)
             .is_empty()
     );
-    // A retry launched before its deadline would be pending NOW: the worker is
-    // spawned inside the check, before it returns, whatever the GET then does.
     assert!(
         !watch.has_pending(),
         "the retry launched before its deadline"

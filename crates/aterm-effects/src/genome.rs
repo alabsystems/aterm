@@ -559,7 +559,10 @@ const fn scale_head_spill(entropy: u64, upper: usize) -> usize {
     ((entropy as u128 * upper as u128) >> 30) as usize
 }
 
-/// The authored head this genome wears.
+/// The authored head this genome wears. The largest complete multiple of the
+/// roster in the Gray-decoded 6-bit field gives every head an equal number of
+/// primary tickets; a tail ticket takes one draw from Gray-decoded bits 34–63,
+/// so coat, iris, age, motion and ink fields cannot change the head.
 #[inline]
 const fn cat_variant_index_v4(gkey: u64) -> usize {
     let roster = HEADS.len();

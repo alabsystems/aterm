@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Wayland oracle's recorder (LW.6 of docs/AUDIT-third-party-2026-10-15.md),
-//! built outside the aterm workspace (see Cargo.toml): wayland-scanner 0.31.10
-//! generates the C tables from aterm-wayland's protocol files, and this prints
-//! them, one row per interface and one per message:
-//!
-//!   iface <name> <version> <requests> <events>
-//!   req|evt <interface> <opcode> <name> <signature> <types>
-//!
-//! where <types> holds, per signature argument, the interface its table
-//! names or `-`.
+//! The Wayland oracle's recorder (LW.6 of docs/AUDIT-third-party-2026-10-15.md), built outside the
+//! aterm workspace (see Cargo.toml): wayland-scanner 0.31.10 generates the C tables from
+//! aterm-wayland's protocol files, and this prints them, one row per interface and one per message.
 
 #![allow(non_upper_case_globals, dead_code, clippy::all)]
 
@@ -118,9 +111,6 @@ fn main() {
     use crate::xdg_activation::*;
     use crate::xdg_decoration::*;
     use crate::xdg_shell::*;
-    // aterm-wayland's interfaces, in its generator's file order (wayland.xml,
-    // xdg-shell, xdg-decoration, xdg-activation, viewporter,
-    // fractional-scale, cursor-shape, text-input-v3, primary-selection).
     for i in [
         &wl_display_interface,
         &wl_registry_interface,

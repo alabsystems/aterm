@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cell a caret leaves: an Enter at the bottom of a full pane.
+//! Departed-cell glow tests when pressing Enter at the bottom of a full pane.
 
 use super::*;
 use aterm_core::terminal::RenderCell;
 
-/// [`enter_at_the_bottom`]'s answer: the engine, the frame's additive
-/// quads, the frame's rows, the cell the caret left and the config.
+/// [`enter_at_the_bottom`]'s answer.
 type Entered = (
     CursorGlow,
     Vec<GlowQuad>,
@@ -16,10 +15,7 @@ type Entered = (
     GlowConfig,
 );
 
-/// A hot run typed on the last row of a `tall_geom` pane, then Enter: the
-/// pane scrolls the command up two rows under its output and the caret leaps
-/// home. Returns the engine at `after_ms` past the Enter (ticked there), the
-/// frame's rows and the cell the caret left (`(bottom - 2, start + keys)`).
+/// A hot run typed on the last row of a `tall_geom` pane, then Enter.
 fn enter_at_the_bottom(style: GlowStyle, dark: bool, after_ms: u64) -> Entered {
     let g = tall_geom();
     let bottom = g.rows as u16 - 1;
@@ -91,8 +87,7 @@ fn enter_at_the_bottom(style: GlowStyle, dark: bool, after_ms: u64) -> Entered {
     (glow, out, rows, (bottom - 2, start + keys), c)
 }
 
-/// The light the frame lays in cell `(row, col)`: the additive quads' and
-/// the under-ink stream's summed levels, and the halos whose box reaches it.
+/// The light the frame lays in cell `(row, col)`.
 fn light_in_cell(glow: &CursorGlow, out: &[GlowQuad], (row, col): (u16, u16)) -> (u64, usize) {
     let g = tall_geom();
     let (x0, y0) = (i32::from(col) * g.cw as i32, i32::from(row) * g.ch as i32);
@@ -143,7 +138,6 @@ fn the_cell_a_caret_leaves_keeps_no_mark() {
                 "{style:?} +{ms} ms: the cell the caret left holds light ({lum}, {halos} halos)"
             );
         }
-        // The control: the same run before the Enter, the caret on that cell.
         let (glow, out, cell) = typed_at_the_bottom(style);
         let (lum, halos) = light_in_cell(&glow, &out, cell);
         assert!(
@@ -153,8 +147,7 @@ fn the_cell_a_caret_leaves_keeps_no_mark() {
     }
 }
 
-/// [`enter_at_the_bottom`]'s run up to the last key: the engine, its frame and
-/// the caret's cell.
+/// [`enter_at_the_bottom`]'s run up to the last key.
 fn typed_at_the_bottom(style: GlowStyle) -> (CursorGlow, Vec<GlowQuad>, (u16, u16)) {
     let g = tall_geom();
     let bottom = g.rows as u16 - 1;
@@ -185,8 +178,6 @@ fn typed_at_the_bottom(style: GlowStyle) -> (CursorGlow, Vec<GlowQuad>, (u16, u1
 /// one flash) no ink lies under the command's output, which only the leap
 /// crosses, where the fired beam once stood through its letters as a
 /// struck-through rule.
-/// Negative control: the typed run itself lays the laser's ink under its
-/// letters, so the probe sees the laser's body where it is drawn.
 #[test]
 fn the_light_laser_leap_is_gone_with_its_strike() {
     let g = tall_geom();
@@ -207,7 +198,6 @@ fn the_light_laser_leap_is_gone_with_its_strike() {
         left, 0,
         "the leap's beam still stands under the printed lines"
     );
-    // The control: the run before the Enter, on paper.
     let mut c = cfg(GlowStyle::Laser, true);
     c.intensity = 1.0;
     c.dark_theme = false;
@@ -227,13 +217,7 @@ fn the_light_laser_leap_is_gone_with_its_strike() {
     );
 }
 
-/// The laser's Enter at the bottom of a full pane, at a host's geometry (a
-/// 14 × 26 cell, a 12 px pad, 14 rows): `$ ` and 24 typed keys on the last
-/// row, then Enter carries the command up two rows over its 19-cell output
-/// and the caret leaps home to `(13, 2)`. The leap's path crosses the blank
-/// after the output (`(12, 19)`). Returns the engine `after_ms` past the
-/// Enter, the geometry and the caret's centre. `unheld` lays the aura on
-/// every air sample at its full radii, as it once was.
+/// The laser's Enter at the bottom of a full pane, at a host's geometry.
 fn laser_enter_on_a_host_pane(unheld: bool, after_ms: u64) -> (CursorGlow, Geom, (f32, f32)) {
     let g = Geom {
         cw: 14,

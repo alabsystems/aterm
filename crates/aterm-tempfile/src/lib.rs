@@ -199,7 +199,8 @@ where
     f()
 }
 
-/// Two-argument sibling of [`call0`]; see there for why this exists.
+/// Two-argument sibling of [`call0`]; see there for why this exists. The Unix
+/// entropy read reaches `read_exact` through it.
 #[cfg(unix)]
 fn call2<F, A, B, T>(f: F, a: A, b: B) -> T
 where
@@ -464,7 +465,8 @@ fn write_read_only(path: &Path, body: &[u8]) -> io::Result<()> {
     written
 }
 
-/// 64-bit FNV-1a: names the shared copy.
+/// 64-bit FNV-1a: names the shared copy. A collision costs a rewrite, never a
+/// wrong stand-in: [`is_stand_in`] compares the bytes.
 #[cfg(all(
     target_os = "macos",
     any(test, debug_assertions, feature = "test-support")

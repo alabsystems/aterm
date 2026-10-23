@@ -855,6 +855,8 @@ fn person_guidance(person: &str, fleet: &str, broker: &str, cap: &str) -> String
 }
 
 /// Make `path` 0600 if it is not: `Ok(None)` when it already was, `Ok(Some(
+/// <old mode>))` when it was changed.
+///
 /// # Errors
 /// Any write or flush failure; no partial result is certified as delivered.
 ///

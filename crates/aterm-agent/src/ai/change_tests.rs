@@ -175,7 +175,6 @@ fn an_untracked_link_is_held_back_and_never_read_through() {
     std::os::unix::fs::symlink(&outside, r.root.join("notes.md")).expect("link");
     let c = take(&r, &Base::Uncommitted).expect("change");
     assert!(!c.diff.contains("PRIVATE-MARKER"), "{}", c.diff);
-    // Making a link takes a privilege on Windows: there the plain-file control alone runs.
     #[cfg(unix)]
     assert_eq!(
         c.links,
@@ -233,7 +232,6 @@ fn only_the_repositorys_own_filter_driver_refuses() {
 
 /// The person's own (global) `aterm.aiReview = false` refuses too, read from their home as
 /// git finds it on this host: `HOME`, or on Windows `USERPROFILE` (where no `HOME` is set).
-/// Negative control: the same home without the key sends.
 #[test]
 fn a_global_opt_out_in_the_persons_home_refuses() {
     let r = repo();
@@ -269,7 +267,6 @@ fn a_git_the_repository_carries_is_never_run() {
     }
     let sub = r.root.join("src");
     std::fs::create_dir_all(&sub).expect("src");
-    // The carried bin first, then the host's own PATH (where the fixtures' git is).
     let host = std::env::var_os("PATH").unwrap_or_default();
     let path =
         std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&host)))
@@ -324,8 +321,6 @@ fn a_git_link_cannot_hide_its_repository_target() {
         "a carried target alone offers no trusted fallback"
     );
 
-    // An ordinary but non-executable shadow must also leave the trusted
-    // executable reachable through the next PATH entry.
     std::fs::remove_file(&link).expect("remove owned link");
     std::fs::write(&link, "not executable").expect("non-executable shadow");
     std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o600))
@@ -381,7 +376,6 @@ fn a_repository_cannot_pass_its_driver_off_as_the_persons() {
         "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n",
     )
     .expect("gitconfig");
-    // The same key in the repository's own config is the repository's.
     git(&r.root, &["config", "filter.lfs.clean", "touch /tmp/never"]);
     assert!(
         matches!(take_home(&r, &Base::Uncommitted, Some(&home)), Err(Refused(why)) if why.contains("filter.lfs.clean"))
@@ -392,7 +386,6 @@ fn a_repository_cannot_pass_its_driver_off_as_the_persons() {
 fn a_filter_guard_that_cannot_read_its_answer_refuses() {
     use crate::ai::testing::{FakeRunner, ran};
     let r = repo();
-    // An old git that knows no `--show-origin` (or any failure): exit 129.
     let runner = FakeRunner::with(|call| {
         Ok(if call.args.iter().any(|a| a == "--show-toplevel") {
             ran(0, "/r\n", "")
@@ -418,13 +411,11 @@ fn a_secret_place_counts_inside_a_repository_never_around_it() {
         SecretRule::Under(PathBuf::from("/home/me/Library")),
         SecretRule::Under(PathBuf::from("/home/me/.config/gh")),
     ];
-    // A dotfiles repository at $HOME holds the places.
     assert!(looks_secret(
         Path::new("/home/me"),
         ".config/gh/hosts.yml",
         &rules
     ));
-    // A repository inside a cloud folder under ~/Library is not secret for that.
     assert!(!looks_secret(
         Path::new("/home/me/Library/CloudStorage/Box/proj"),
         "src/main.rs",
@@ -443,7 +434,6 @@ fn a_tracked_link_is_named_too() {
     let c = take(&r, &Base::Uncommitted).expect("change");
     assert_eq!(c.links, ["alias.rs"]);
 
-    // A working-tree link matters before it is staged into the index as a link.
     let outside = r._dir.path().join("private.md");
     std::fs::write(&outside, "PRIVATE-MARKER\n").expect("outside");
     std::fs::remove_file(r.root.join("a.rs")).expect("remove tracked file");

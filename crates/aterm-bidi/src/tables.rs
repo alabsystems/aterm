@@ -9,9 +9,6 @@
 use crate::BidiClass;
 use crate::BidiClass::*;
 
-// Generated from the Unicode Character Database 18.0.0 (extracted/DerivedBidiClass.txt,
-// including its @missing defaults) by crates/aterm-bidi/examples/gen_tables.rs. Every code point
-// not inside a listed range is `L`. Sorted, non-overlapping, binary-searched.
 pub(crate) const BIDI_CLASS_RANGES: &[(u32, u32, BidiClass)] = &[
     (0x0000, 0x0008, BN),
     (0x0009, 0x0009, S),

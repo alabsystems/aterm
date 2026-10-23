@@ -246,7 +246,7 @@ pub fn tcc_seen(log: &str) -> TccSeen {
 }
 
 /// The control's verdict.
-pub fn control_verdict(
+pub const fn control_verdict(
     fda: bool,
     desktop_read_passed: bool,
     seen: &TccSeen,

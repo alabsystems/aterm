@@ -1918,7 +1918,8 @@ fn rule_4_does_not_leave_an_account_whose_reset_offer_is_about_to_expire() {
     }
 }
 
-/// WHO IS LEFT EARLY.
+/// WHO IS LEFT EARLY. The 15-minute guard is about leaving: a session is not
+/// moved off an account whose low window is about to reset.
 #[test]
 fn rule_4_leaves_a_limited_account_and_not_one_whose_low_window_is_about_to_reset() {
     let r = three();
@@ -2389,7 +2390,10 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
     );
 }
 
-/// THE OWNER LIFTED THIS WALL (`Advice::Resume`, between rules 2 and 3).
+/// THE OWNER LIFTED THIS WALL (`Advice::Resume`, between rules 2 and 3). A
+/// session stands at its account's limit; the owner says `accounts use` for
+/// that account, which clears its walls and pins it; the session's row is
+/// older than the clearing, so it continues where it is.
 #[test]
 fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
     let r = three();
@@ -2482,7 +2486,9 @@ fn the_owners_clearing_resumes_a_session_at_the_wall_it_lifted() {
     );
 }
 
-/// THE WAIT ENDS AT WHATEVER COMES FIRST.
+/// THE WAIT ENDS AT WHATEVER COMES FIRST. A session held at its wall — by a
+/// canary's hold, or by the machine's rotation bound — waits for the end of
+/// what holds it, or for the roster's next opening where that is sooner.
 #[test]
 fn a_held_sessions_wait_ends_at_the_rosters_next_opening_when_that_comes_first() {
     let r = three();

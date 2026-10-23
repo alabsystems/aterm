@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The `Github` pipeline (the plan's §8): step 0, routing, headers, the door, the 404 rules,
-//! moves, the hop, the id memo and the meter, mostly over a scripted transport.
+//! Tests for the `Github` client pipeline over a scripted transport.
 
 use std::sync::Arc;
 
@@ -877,8 +876,6 @@ mod routed {
             include: false,
             opts: agh::page::ListOpts::STANDARD,
         };
-        // `all` on an owner listing first looks the owner's id up (`GET /users/fixture-dev`):
-        // the method is refused before that lookup too.
         let every = agh::github::RawGet {
             path: "/orgs/fixture-dev/repos".into(),
             route: RouteRequest::read(RouteTarget::Owner("fixture-dev".into())),
@@ -955,8 +952,6 @@ mod routed {
                 fingerprint: fingerprint.clone()
             }
         );
-        // The web request carried no credential, so it was read anonymously, whatever was
-        // routed; its error and the meter say so too.
         assert_eq!(web_answer.as_, IdentityRef::Anonymous);
         assert_eq!(gh.meter().as_, Some(IdentityRef::Anonymous));
         assert_eq!(
@@ -1022,7 +1017,6 @@ mod routed {
     fn a_writer_read_301_is_conflict_moved() {
         let world = World::new("pipeline-wr301", Some(&classic()), false);
         let location = format!("{}/repositories/1000", common::base(API));
-        // `follow_moved` is a public field: setting it does not make a WriterRead follow.
         for follow in [None, Some(true)] {
             let transport = Arc::new(ScriptedTransport::new());
             transport.answer(301, &[("location", &location)], b"{}");

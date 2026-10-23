@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-/// The home and per-user state of one test child, never the runner's.
+/// The home and per-user state of one test child, never the runner's. The
+/// automatic PowerShell $HOME uses USERPROFILE on Windows; PSReadLine's default
+/// history uses APPDATA, so redirecting only the HOME environment is insufficient.
 #[cfg(windows)]
 struct PowerShellWorld {
     root: aterm_tempfile::TempDir,
@@ -53,7 +55,9 @@ impl PowerShellWorld {
         vars
     }
 
-    /// The start of every test child's `-Command`.
+    /// The start of every test child's `-Command`. It refuses, before sourcing
+    /// any integration or hook, a host that does not honor USERPROFILE as
+    /// documented, and never falls back to its home.
     fn home_guard() -> &'static str {
         "if ($HOME -cne $env:ATERM_TEST_HOME) { throw 'private PowerShell home not active' }; \
          $__test_profile = [psobject](Join-Path $HOME 'profile\\CurrentUserCurrentHost.ps1'); \
@@ -814,7 +818,11 @@ struct ConptyShell {
     _git_bash: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
-/// Every Git Bash a test runs, one at a time.
+/// Every Git Bash a test runs, one at a time. MSYS2's `/tmp` is the TEMP of the
+/// session's first MSYS2 process still running, for every later one: a Git Bash
+/// started beside another has the other's folder for its `/tmp`, so a test that takes
+/// its shell's `/tmp` away (`test_git_bash_whose_tmp_went_away_runs_every_line_as_typed`)
+/// must run the only one.
 #[cfg(windows)]
 static GIT_BASH: Mutex<()> = Mutex::new(());
 

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A scripted machine for the stuck-process engine: processes with counter
-//! rates, descriptors and an output file, tabs with their terminal stamps,
-//! and a clock the test steps. Each [`World::tick`] does what the host does:
-//! sweep, [`Jobs::plan`], read what the plan asked for (descriptors only when
-//! asked), [`Jobs::absorb`]. No clock, no OS.
+//! Scripted machine for testing the stuck-process engine ([`World::tick`], [`Jobs::plan`],
+//! [`Jobs::absorb`]).
 
 #![allow(dead_code, reason = "each test binary mounting this uses part of it")]
 
@@ -108,8 +105,7 @@ pub struct OutFile {
     pub size: u64,
     /// Bytes a second.
     pub per_s: u64,
-    /// What the appended bytes hold: `Some(true)` a line feed, `Some(false)`
-    /// only CRs, `None` a file the reader may not open.
+    /// Appended line-ending state.
     pub lf: Option<bool>,
 }
 
@@ -144,8 +140,7 @@ impl Default for World {
 }
 
 impl World {
-    /// aterm (pid 100) and one tab (key 1, `tab1`) whose shell is `zsh`
-    /// pid 200 at a prompt.
+    /// Creates a world with aterm (pid 100) and one shell tab (pid 200).
     pub fn new() -> Self {
         let mut w = Self {
             at: T0,
@@ -214,8 +209,7 @@ impl World {
             .expect("a scripted tab")
     }
 
-    /// Run `p` as the foreground job of tab `key` under OSC 133 block `id`
-    /// (`C` now).
+    /// Runs `p` as the foreground job of tab `key` under OSC 133 block `id`.
     pub fn run_fg(&mut self, key: u64, id: u64, command: &str, mut p: Proc) {
         let shell = self.tab(key).tab.shell_pid;
         p.ppid = shell;
@@ -254,8 +248,7 @@ impl World {
         t.tpgid = t.tab.shell_pid;
     }
 
-    /// An agent (`claude`, `agent` pid) running in front of tab `key`
-    /// (block 1), printing nothing yet.
+    /// Starts an agent (`claude`, `agent` pid) in front of tab `key`.
     pub fn agent(&mut self, key: u64, agent: u32) {
         if self.procs.contains_key(&agent) {
             return;
@@ -265,9 +258,7 @@ impl World {
         self.run_fg(key, 1, "claude", a);
     }
 
-    /// A detached call: `zsh -c …` (`leader`, its own session, no terminal)
-    /// under the agent, with `child` running the command, fds 1 and 2 on the
-    /// call's output file. Returns nothing; the call's id is `a<leader>`.
+    /// Starts a detached tool call (`leader`) under `agent` with `child` running the command.
     pub fn call(
         &mut self,
         key: u64,
@@ -381,8 +372,7 @@ impl World {
         }
     }
 
-    /// Take one tick at the current clock as the host does: sweep, plan,
-    /// read what the plan asked for, absorb.
+    /// Runs one sweep-plan-read-absorb tick at the current clock.
     pub fn observe(&mut self) -> JobsView {
         let sweep: Vec<SweepProc> = self.procs.values().map(sweep_of).collect();
         let tabs: Vec<JobTab> = self.tabs.iter().map(|t| t.tab.clone()).collect();

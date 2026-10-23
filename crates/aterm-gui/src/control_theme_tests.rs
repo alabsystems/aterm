@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `theme` verb's App half and the transient preview lane: what the
-//! status line says, what a preview changes and what it leaves alone, and every
-//! way it ends.
+//! Tests for the `theme` control verb and transient theme previews.
 
 use std::time::{Duration, Instant};
 
@@ -195,7 +193,6 @@ fn control_theme_preview_ends_at_a_reload_and_follows_an_os_flip() {
     assert!(app.theme_preview.is_none(), "a config reload ends it");
     assert_eq!(app.installed_colors.id, "Dracula");
 
-    // Negative control: a rollback is not a reload, so it keeps the preview.
     preview(&mut app, "Nord", THEME_PREVIEW_DEFAULT_TTL, now).expect("previews");
     app.install_resolved_colors(ThemeChange::Rollback);
     assert_eq!(app.installed_colors.id, "Nord");
@@ -336,8 +333,6 @@ fn control_theme_program_osc11_survives_preview_then_revert() {
     assert_eq!(bg(&app, 0), program_bg, "and so does the revert");
     assert_eq!(bg(&app, other), builtin("Dracula").background);
 
-    // The theme baseline under the override moved back too: a program reset
-    // (OSC 111) lands on the configured theme.
     crate::term_lock(&app.pool.get(0).expect("session 0").term).process(b"\x1b]111\x1b\\");
     assert_eq!(bg(&app, 0), builtin("Dracula").background);
 }
@@ -395,7 +390,6 @@ fn control_theme_status_names_source_side_miss_and_palette() {
         assert!(status.contains(want), "{want} in {status}");
     }
 
-    // Negative control: a configured name that resolves names no miss.
     app.config = aterm_toml::from_str("theme = \"Nord\"\n").expect("valid toml");
     app.install_resolved_colors(ThemeChange::ConfigReload);
     let status = run(&mut app, ThemeCtlOp::Status, now).expect("status");
@@ -483,7 +477,6 @@ fn control_theme_form_grammar() {
         parse_theme_form("preview Nord ttl=3600"),
         preview("Nord", 3600)
     );
-    // Spec `session-theme-draw`: the session sub-forms and the palette read.
     assert_eq!(
         parse_theme_form("palette"),
         op(ThemeCtlOp::Palette { session: false })
@@ -759,7 +752,6 @@ fn theme_status_line_reports_typography() {
         "line_height:config"
     );
     assert_eq!(field(&status, "font_size_scale"), "1.0");
-    // The fields after it still parse whole.
     assert_eq!(field(&status, "palette").split(',').count(), 16);
 
     let mut plain = app_with("theme = \"Dracula\"\n");
@@ -801,8 +793,6 @@ fn pack_ids_resolve_for_preview_only() {
     assert_eq!(preview.source, ThemeSource::Pack(id.to_string()));
     let (_, package) = crate::app_config::pack_package(id).expect("the pack parses");
     assert_eq!(preview.scheme.background, package.colors.background);
-    // Negative controls: the same name configured, or resolved outside a
-    // preview, never reaches the pack.
     let configured: crate::app_config::Config =
         aterm_toml::from_str(&format!("theme = {id:?}\n")).expect("valid toml");
     assert!(matches!(
@@ -817,8 +807,6 @@ fn pack_ids_resolve_for_preview_only() {
             .source,
         ThemeSource::DefaultFallback { .. }
     ));
-    // A themes-folder file by that name that does not load is never stood in
-    // for by the pack: the preview says the file is the problem.
     let dir = aterm_tempfile::tempdir().expect("a themes folder");
     std::fs::write(
         dir.path().join(format!("{id}.conf")),
@@ -842,7 +830,6 @@ fn theme_preview_unavailable_refuses_an_unknown_id() {
         app.theme_preview_unavailable("No Such Theme Anywhere")
             .is_some()
     );
-    // Negative control: a pack id is drawn, and the status says from where.
     let id = pack_only_id();
     assert_eq!(app.theme_preview_unavailable(id), None);
     let now = Instant::now();

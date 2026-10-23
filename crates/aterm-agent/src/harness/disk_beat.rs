@@ -76,7 +76,7 @@ pub fn tick(n: usize) {
 /// Whether counting `n` more entries past `before` crosses a multiple of
 /// [`EVERY`]: one beat for the count, however many it crosses.
 #[must_use]
-fn crosses(before: usize, n: usize) -> bool {
+const fn crosses(before: usize, n: usize) -> bool {
     before.saturating_add(n) / EVERY > before / EVERY
 }
 

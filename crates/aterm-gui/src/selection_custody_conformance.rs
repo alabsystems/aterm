@@ -88,7 +88,8 @@ impl Custody {
         }
     }
 
-    /// The full 11-variable state.
+    /// The full 11-variable state. Refreshes the carried interval whenever the real
+    /// selection is alive, so a later clearing step carries the true last-live span.
     fn state(&mut self, term: &Terminal) -> [i64; 11] {
         let [alive, lo, hi, floor, truncated] = project_selection_custody(term, self.base);
         if alive == 1 {
@@ -161,7 +162,9 @@ fn engine_fixture(rows: u16, history: usize) -> (Terminal, u64) {
     (term, base)
 }
 
-/// Arm a completed selection over model rows `lo..=hi` of an engine fixture.
+/// Arm a completed selection over model rows `lo..=hi` of an engine fixture. Fixture
+/// construction, not a claimed transition: the gesture seam is driven in
+/// `gui_gesture_chain`.
 fn arm(term: &mut Terminal, base: u64, lo: i64, hi: i64) {
     let grid = term.grid();
     let live_top = i64::try_from(

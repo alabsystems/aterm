@@ -24,7 +24,7 @@ impl Light {
 
     /// The light's word on its chip while its state is not known; the mode light's chip names its mode ([`Mode::word`]) once one is.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Light::Mode => "mode",
         }
@@ -32,7 +32,7 @@ impl Light {
 
     /// The title a hover or the keyboard selection shows.
     #[must_use]
-    pub fn title(self) -> &'static str {
+    pub const fn title(self) -> &'static str {
         match self {
             Light::Mode => "Permission mode",
         }
@@ -84,13 +84,13 @@ impl Mode {
 
     /// Whether the owner expects this mode: bypass (auto-approve) or auto.
     #[must_use]
-    pub fn is_expected(self) -> bool {
+    pub const fn is_expected(self) -> bool {
         matches!(self, Mode::Bypass | Mode::Auto)
     }
 
     /// The mode's short word, as the light names it: `bypass`, `auto`, `accept edits`, `don't ask`, `plan`, `manual`.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Mode::Bypass => "bypass",
             Mode::Auto => "auto",
@@ -103,7 +103,7 @@ impl Mode {
 
     /// The mode's word where Claude's pill reads aterm's words on the glass (`relabelled`: the host relabelled the pill this frame, drawing [`footer::YOLO_ON`] over the bypass pill and [`footer::YOLO_OFF`] over manual mode's, under its relabel gate and only where the glass took it): the light beside the pill names the state as the pill does, so one state has one name on screen.
     #[must_use]
-    pub fn word_on_glass(self, relabelled: bool) -> &'static str {
+    pub const fn word_on_glass(self, relabelled: bool) -> &'static str {
         match self {
             Mode::Bypass if relabelled => footer::YOLO_ON,
             Mode::Manual if relabelled => footer::YOLO_OFF,
@@ -133,7 +133,7 @@ impl Mode {
 
     /// The mode's own ink where Claude gives it one (bypass's red, auto's warning amber); `None` draws it in the row's plain ink.
     #[must_use]
-    pub fn hue(self) -> Option<[u8; 3]> {
+    pub const fn hue(self) -> Option<[u8; 3]> {
         match self {
             Mode::Bypass => Some([0xE0, 0x5A, 0x5A]),
             Mode::Auto => Some([0xE8, 0xB0, 0x3C]),
@@ -227,7 +227,7 @@ impl Reading {
     }
 
     /// Fold a newer screen reading in.
-    pub fn fold(&mut self, newer: &Reading) {
+    pub const fn fold(&mut self, newer: &Reading) {
         if newer.mode.is_some() || newer.pill {
             self.mode = newer.mode;
         }

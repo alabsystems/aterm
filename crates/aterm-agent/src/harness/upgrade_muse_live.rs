@@ -58,7 +58,7 @@ pub enum Open {
 impl Open {
     /// The wait word the drive says (`wait:<word>`).
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Open::Unproved => "log-unproved",
             Open::Unreadable => "log-unreadable",

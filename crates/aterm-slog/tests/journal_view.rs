@@ -1482,7 +1482,11 @@ fn keyed_placement(v: &View, c: Cursor) -> Cursor {
     }
 }
 
-/// A CURSOR OF ANOTHER SEQ SPACE IS RESET, SAID, in both directions.
+/// A CURSOR OF ANOTHER SEQ SPACE IS RESET, SAID, in both directions. Two
+/// crash recoveries of one shell ten minutes apart each start a space of
+/// their own, their epochs Unix seconds (`Epochs::crash`), and each holds 402
+/// records, so a reply epoch over the earlier space under the keyed rule
+/// (`ep + 1 + 2·head`) lands past the later space's epoch.
 #[test]
 fn a_cursor_of_another_space_is_reset_said() {
     let s: u32 = 1_792_100_000;

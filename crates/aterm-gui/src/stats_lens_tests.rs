@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The lens against the spec (`docs/DESIGN-stats-deck-v2-2026-10-20.md`
-//! §7.7, §11.3, §11.4, §12): where it hangs, its columns and the order its
-//! sections drop in (T-G16), what each lens says, filters and copies, and
-//! the gallery a person reads beside the lens mockups.
+//! Layout, text, and gallery tests for the stats lens.
 
 use std::sync::Arc;
 
@@ -63,10 +60,7 @@ fn hour_ring(s: &Snapshot, i: usize, from: f64, noise: f64, r: &mut Rng) -> Arc<
     cells.into()
 }
 
-/// The lens's story over the deck's scene `sc` (lens.py): 24 hours of free
-/// space with the Mac asleep from 21:10 to 01:10 and aterm's 41 GB pass at
-/// 09:12, the writers and the folders of §7.7, the busiest and biggest
-/// processes, each core's last minute and an hour of memory and processes.
+/// Builds a lens test snapshot for `sc`.
 pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
     let mut s = scene(sc);
     let now = s.at_unix_ms;
@@ -178,10 +172,6 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
             },
         ])
         .collect();
-    // aterm's and each tab's CPU and memory are the sums of the processes
-    // listed, never written in by hand: a row can then never outweigh its
-    // scope, and a gallery PNG whose rows and figures disagree shows a defect
-    // in the lens, not in the scene.
     let cores = |t: &TopProc| Some(f64::from(t.cores));
     let bytes = |t: &TopProc| t.footprint.map(|b| b as f64);
     for (res, of) in [
@@ -218,7 +208,6 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
     s.resources[2].ring = mem;
     let procs = hour_ring(&s, 6, 0.054, 0.0008, &mut r);
     s.resources[6].ring = procs;
-    // The jobs run in Tab 3, stuck 12 minutes and quiet 4.
     if let Some(view) = s.jobs.as_deref() {
         let mut view = view.clone();
         for row in &mut view.rows {
@@ -308,8 +297,6 @@ fn faults(laid: &LensLaid, lw: f64, lh: f64) -> Vec<String> {
             out.push(format!("placed {ids:?} out of {stack:?}'s order"));
         }
     }
-    // Sections drop in the priority order whichever column they stand in:
-    // what shows is its first sections.
     let mut shown: Vec<usize> = laid.placed.iter().flatten().map(|(i, _)| *i).collect();
     shown.sort_unstable();
     if shown.iter().enumerate().any(|(k, &i)| k != i) {
@@ -535,7 +522,6 @@ fn the_disk_lens_says_its_reading() {
     );
     let at = |s: &str| s.split("Not read from ").nth(1).map(|r| r[..14].to_owned());
     assert_eq!(at(chart).as_deref(), Some("21:20 to 01:30"));
-    // A pass of a terabyte or more is said in its own unit.
     let mut big = snap.clone();
     if let Some(d) = big.facts.disk.as_mut()
         && let Some(f) = d.freed_today.as_mut()
@@ -567,7 +553,6 @@ fn the_disk_lens_says_its_reading() {
         "Freed follows Space now: {names:?}"
     );
 
-    // The disk watch off: no lines to answer Wrong? with.
     let off = lens_scene(Scene::HarnessOff);
     let laid = heard(&off, pinned(Instrument::Disk));
     assert!(laid.wells.iter().all(|(n, _)| n != "Wrong?"));
@@ -672,9 +657,6 @@ fn each_lens_shows_its_sections() {
     assert!(details.contains("Codex, Gemini and agy tabs are not counted"));
     let gpu = heard(&snap, pinned(Instrument::Gpu));
     assert!(well(&gpu, "Details").contains("no per-app GPU figure on macOS"));
-    // No observed reset delta is not a known-zero counter. Keep an unread
-    // counter distinct from a current cumulative reading, including a
-    // nonzero first baseline, and preserve an observed increase's event.
     assert!(well(&gpu, "Details").contains("not read"));
     let counter = |count, event| {
         let mut observed = snap.clone();
@@ -700,7 +682,6 @@ fn each_lens_shows_its_sections() {
     );
     let net = heard(&snap, pinned(Instrument::Network));
     assert!(well(&net, "Details").contains("no per-app network figure"));
-    // A text well's Now is its row's sentence without its Details.
     let now = well(&net, "Now");
     assert!(now.starts_with("Network "), "{now}");
 }
@@ -814,18 +795,11 @@ fn sections_take_the_largest_form_that_leaves_room() {
             .map(|p| p.form)
             .collect()
     };
-    // Room for everything at its largest.
     assert_eq!(forms(56.0 + 88.0 + 53.0 + 13.0 + 12.0), [0, 0, 0, 0]);
-    // The chart shrinks before the rows below it lose their one-liners.
     assert_eq!(forms(56.0 + 72.0 + 13.0 + 13.0 + 12.0), [0, 1, 1, 0]);
-    // Only the second's one-liner fits after the first: the rest drop.
     assert_eq!(forms(56.0 + 4.0 + 13.0), [0, 2]);
-    // Not even the first: nothing.
     assert!(forms(40.0).is_empty());
 
-    // A kept first section (Disk's Space now) keeps its largest form while
-    // that fits, the sections after it dropping first, and takes its
-    // one-line form only where no other fits.
     let kept = [
         sec(&[56.0, 13.0]),
         sec(&[88.0, 72.0, 13.0]),
@@ -859,7 +833,6 @@ fn the_lens_hangs_under_the_deck_and_over_the_sill() {
         26.0,
     )
     .expect("fits");
-    // Shell 2,048 × 500 at 2×, 8 px under the Deck's foot (80 + 124).
     assert_eq!(deck.w - 2.0 * deck.margin, 2048.0);
     assert_eq!(deck.h - 2.0 * deck.margin, 500.0);
     assert_eq!(deck.dy as f32 + deck.margin, 80.0 + 124.0 + 8.0);

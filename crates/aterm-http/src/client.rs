@@ -589,7 +589,9 @@ enum Upload {
     Wire(io::Error),
 }
 
-/// Write the body after its head.
+/// Write the body after its head. A [`Body::Reader`] must yield exactly its
+/// `len`: one that ends sooner is `UnexpectedEof`, and nothing past `len` is
+/// asked of it.
 fn send_body(stream: &mut Stream, body: Body<'_>) -> Result<(), Upload> {
     match body {
         Body::Empty => Ok(()),
@@ -712,7 +714,10 @@ fn connect_tunnel(
     Ok(())
 }
 
-/// Render the request head.
+/// Render the request head. The target is origin-form normally, absolute-form
+/// when speaking plain HTTP to a proxy (RFC 9112 §3.2.2), and only then does
+/// the head carry the proxy's credential: inside a `CONNECT` tunnel the origin
+/// reads every header.
 #[cfg(test)]
 fn render_request(
     method: Method,
@@ -810,7 +815,8 @@ fn render_fields(
     head
 }
 
-/// Headers whose wire meaning [`render_fields`] owns.
+/// Headers whose wire meaning [`render_fields`] owns. The body always uses
+/// Content-Length, and the proxy credential is the proxy URL's alone.
 const RESERVED_HEADERS: &[&str] = &[
     "host",
     "content-length",
@@ -1270,7 +1276,9 @@ fn read_final_head<R: BufRead>(reader: &mut R) -> Result<Head, Error> {
     read_head(reader)
 }
 
-/// One byte of a head, or `0` at its end.
+/// One byte of a head, or `0` at its end. An `UnexpectedEof` read error is
+/// that end too: it is how rustls reports a peer that closed without
+/// `close_notify`, so a head cut short reads the same over TLS as over TCP.
 fn read_head_byte<R: Read>(reader: &mut R, byte: &mut [u8; 1]) -> io::Result<usize> {
     match read_uninterrupted(reader, byte) {
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
@@ -1327,7 +1335,9 @@ fn parse_http_number(text: &str, radix: u32) -> Option<usize> {
     usize::from_str_radix(text, radix).ok()
 }
 
-/// The status code of one status line.
+/// The status code of one status line. RFC 9112 §4 makes it exactly `3DIGIT`
+/// and RFC 9110 §15 puts it in 100..=599; `u16::from_str` alone would also take
+/// `+200`, `0200` and `65535`.
 fn read_status_line<R: Read>(reader: &mut R, consumed: &mut usize) -> Result<u16, Error> {
     let line = read_line(reader, consumed)?;
     let mut parts = line.splitn(3, ' ');
@@ -1408,7 +1418,8 @@ fn read_response_from<R: BufRead>(
     })
 }
 
-/// How the response body is delimited.
+/// How the response body is delimited. One function decides this, because a
+/// body whose end two parties disagree about is the whole smuggling class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Framing {
     /// No content: the response ends at its header block (HEAD, 1xx, 204, 304).
@@ -1498,7 +1509,9 @@ mod tests {
         proxy::parse_proxy("HTTPS_PROXY", text).unwrap()
     }
 
-    /// TCP reads may stop anywhere in the head or body.
+    /// TCP reads may stop anywhere in the head or body. Drain the declared
+    /// request before replying/closing, or an unread tail can reset the socket
+    /// while the client is still writing.
     fn read_plain_request(reader: &mut impl Read) -> Vec<u8> {
         const LIMIT: usize = 1024;
         let mut head = Vec::new();

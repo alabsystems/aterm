@@ -341,6 +341,11 @@ mod tests {
         sub.wait(Duration::ZERO)
     }
 
+    /// A QUIET OPEN CLIENT IS KEPT; ONE THAT GOES IS A WAKE. The client's
+    /// hang-up, its half-close and a stray byte each settle the stream
+    /// `Gone` and ring the list a push loop parks on, with no timer: the
+    /// wait is a hang detector, and the ring is the only thing that can end
+    /// it. Negative control: the quiet open client is still `Watching`, with
     /// no ring, after the others' polls have run past it.
     #[test]
     fn the_peer_watch_wakes_a_quiet_subscription_on_hangup() {
@@ -375,6 +380,14 @@ mod tests {
         assert!(!rang(&quiet_sub), "and its list never rang");
     }
 
+    /// A RELEASED DESCRIPTOR IS NEVER POLLED: the guard's drop returns only
+    /// once the thread has taken the entry out, so a stream that closes (and
+    /// a descriptor number reused) after it is a stranger's. Here the
+    /// released stream turns readable and the poll runs past it: a barrier
+    /// stream's hang-up must be seen, by a poll that reports every ready
+    /// descriptor it holds and stores all its verdicts before any ring.
+    /// Negative control: a stream still watched, made readable the same way,
+    /// is settled no later than that poll. Counterfactual, run: a release
     /// that leaves the entry in settles the released stream too.
     #[test]
     fn peer_watch_never_polls_a_released_descriptor() {
@@ -406,6 +419,10 @@ mod tests {
         );
     }
 
+    /// A STOPPED WATCH HANDS ITS STREAMS BACK: each reads `Unwatched` and is
+    /// rung, so its push loop wakes and probes on a timer again, and a later
+    /// watch answers `None`. A client that went before the stop stays
+    /// `Gone`. Negative control: before the stop the open client reads
     /// `Watching` with no ring.
     #[test]
     fn a_stopped_peer_watch_hands_its_streams_back() {

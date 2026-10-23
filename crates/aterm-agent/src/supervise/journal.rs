@@ -313,7 +313,7 @@ pub struct Journal {
 
 impl Journal {
     /// No journal: [`Self::record`] does nothing.
-    pub fn off() -> Self {
+    pub const fn off() -> Self {
         Self {
             path: None,
             file: None,
@@ -409,7 +409,7 @@ impl Journal {
 
     /// Whether a journal was given (a file named, opened or not).
     #[must_use]
-    pub fn is_on(&self) -> bool {
+    pub const fn is_on(&self) -> bool {
         self.path.is_some()
     }
 

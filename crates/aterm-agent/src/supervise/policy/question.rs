@@ -163,7 +163,7 @@ pub fn option_label(dialog: &QuestionDialog, n: u8) -> Option<&str> {
 }
 
 /// The focus an [`AnswerTarget`] needs.
-pub fn target_focus(target: AnswerTarget) -> QuestionFocus {
+pub const fn target_focus(target: AnswerTarget) -> QuestionFocus {
     match target {
         AnswerTarget::Option(n) => QuestionFocus::Option(n),
         AnswerTarget::Button => QuestionFocus::Button,
@@ -249,7 +249,7 @@ const OVERDRAWN: &str = "the answer would not fit the pane: the dialog would dra
 
 /// Whether `answer`, decided under a text priority on `dialog`, is its tab's recommended fallback ([`choose_text`]): an Enter on an option of a single- or multi-select, or on a multi-select's button while its free-text row holds nothing — keys the text path never decides (it writes the text, then enters it or the button after it).
 #[must_use]
-pub fn falls_back(dialog: &QuestionDialog, answer: &Answer) -> bool {
+pub const fn falls_back(dialog: &QuestionDialog, answer: &Answer) -> bool {
     match (&dialog.form, answer.enter_target()) {
         (
             QuestionForm::Single { .. } | QuestionForm::Multi { .. },
@@ -456,7 +456,7 @@ fn refused(w: &str) -> String {
 
 /// Why the focus note is appended to `unproven`: the focus was on a row the
 /// answer never chooses, and was moved off it first.
-fn moved_off(focus: QuestionFocus) -> Option<&'static str> {
+const fn moved_off(focus: QuestionFocus) -> Option<&'static str> {
     match focus {
         QuestionFocus::FreeText => Some("the focus was on the free-text row: moved off it first"),
         QuestionFocus::Chat => Some("the focus was on the chat row: moved off it first"),
@@ -976,7 +976,7 @@ pub fn note_read(text: &str, shown: &str) -> NoteRead {
 impl NoteStep {
     /// The keystroke as a hand-over reason names it.
     #[must_use]
-    pub fn name(&self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             NoteStep::Move { .. } => "arrow",
             NoteStep::Open { .. } => "Tab",

@@ -1115,7 +1115,9 @@ impl AltArchive {
         self.archive_picks();
     }
 
-    /// Rule 7: the content moved down by `j` over `[0, t)`.
+    /// Rule 7: the content moved down by `j` over `[0, t)`. Rows revealed at the top are the
+    /// archived rows just before the old top (the debt); rows pushed out at the bottom wait in
+    /// `below` until they re-enter or a flush archives them.
     fn shift_down(&mut self, v: Vote, t: usize) {
         let j = v.d.unsigned_abs();
         let (top_prev, bot_prev) = (v.top - j, v.bot - j);
@@ -1817,7 +1819,9 @@ fn normalize_row(s: &mut String) {
     s.truncate(end);
 }
 
-/// The first index of `needle` in `hay`.
+/// The first index of `needle` in `hay`. The matcher sees every byte the terminal receives, so
+/// it compares 64-byte blocks (which the compiler vectorizes) and walks bytes only inside the
+/// block that holds a hit.
 fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
     let (blocks, tail) = hay.as_chunks::<64>();
     for (n, block) in blocks.iter().enumerate() {
@@ -1833,7 +1837,9 @@ fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
     tail.iter().position(|&b| b == needle).map(|i| base + i)
 }
 
-/// Whether `input` holds conhost's alt-screen enter, `ESC [ ? 1049 h`.
+/// Whether `input` holds conhost's alt-screen enter, `ESC [ ? 1049 h`. It runs over every read
+/// while `TransientState::conhost_alt_screen_left_up` is set (for a cmd.exe session, possibly
+/// the rest of the session), so it hops ESC to ESC with [`find_byte`].
 fn has_alt_1049_enter(input: &[u8]) -> bool {
     const ENTER: &[u8] = b"\x1b[?1049h";
     let mut rest = input;
@@ -1881,14 +1887,18 @@ enum HitKind {
     Reset,
 }
 
-/// A sequence the hook must act on.
+/// A sequence the hook must act on. `final_at` is the offset of its final byte
+/// in the slice handed to [`DecModeMatcher::scan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DecModeHit {
     final_at: usize,
     kind: HitKind,
 }
 
-/// Streaming recognizer for DEC private mode sets, resets and XTRESTOREs.
+/// Streaming recognizer for DEC private mode sets, resets and XTRESTOREs. It mirrors the
+/// VT500 CSI grammar closely enough that its split points are always at a final byte: C0
+/// controls inside a CSI execute without aborting it, CAN/SUB abort, ESC restarts, an
+/// intermediate or a second private marker makes the sequence irrelevant.
 #[derive(Debug, Clone, Copy, Default)]
 struct DecModeMatcher {
     state: MatchState,

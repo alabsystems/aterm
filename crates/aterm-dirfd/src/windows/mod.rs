@@ -1126,6 +1126,11 @@ pub fn unlinkat<Fd: AsHandle, P: Arg>(
 }
 
 /// Whether the reparse point `fd` is open on (as itself, of kind `kind`) is
+/// a folder a VOLUME is mounted on: an `IO_REPARSE_TAG_MOUNT_POINT` whose
+/// target is a volume's GUID name (`\??\Volume{…}`, what
+/// `SetVolumeMountPointW` writes), where a junction's names a path
+/// (`\??\C:\dir`).
+///
 /// # Errors
 /// `FSCTL_GET_REPARSE_POINT`'s code, or `ERROR_INVALID_DATA` for data that
 /// does not hold the name it says it does: the caller keeps what it could
@@ -1367,7 +1372,8 @@ impl Dir {
         })
     }
 
-    /// Run the next listing query into `buf`: `Ok(false)` at the end.
+    /// Run the next listing query into `buf`: `Ok(false)` at the end. Each
+    /// query lists placeholders exposed, whatever thread iterates.
     fn fill(&mut self) -> Result<bool> {
         let Some(handle) = self.handle.as_ref() else {
             return Ok(false);

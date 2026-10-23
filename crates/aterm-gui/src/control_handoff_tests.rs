@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An artifact's handoff rides its connection's outbox (`control_lanes.rs`):
-//! the parker delivers a guarded answer and its challenge, awaits the one line
-//! that acknowledges it, and fails the handoff closed at its deadline however
-//! the connection ends. Before, the answer was written and its acknowledgement
-//! read on the request lane, for up to `ARTIFACT_HANDOFF_TIMEOUT` each.
-//!
-//! These drive the genuine [`Lanes`] over real socket pairs with a stub whose
-//! answers are real [`ControlReply`] handoffs. Every wait for something that
-//! must happen is a hang detector ([`aterm_spec::wait::MUST_HAPPEN`]), never a
-//! latency budget.
+//! An artifact's handoff rides its connection's outbox (`control_lanes.rs`): the parker delivers a
+//! guarded answer and its challenge, awaits the one line that acknowledges it, and fails the
+//! handoff closed at its deadline however the connection ends.
 
 use std::io::{BufReader, Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,10 +79,6 @@ impl Gate {
 /// guard ([`Self::guard_alive`]), `guarded-big` a [`BIG`] one; `bytes-big` a
 /// [`BIG`] in-memory body holding a write-only permit of [`PERMITS`]; `latched`
 /// a [`BIG`] plain body whose last byte releases a latch ([`Self::wire`]).
-/// Each handoff fails `timeout` after its answer is queued. `hold` is a wait,
-/// held at the gate. Anything else is answered `OK <line>`. With `lane_acks` a
-/// guarded answer is delivered and its acknowledgement read ON ITS LANE,
-/// waiting: the shape before the outbox carried handoffs (a negative control's).
 struct Captures {
     timeout: Duration,
     lane_acks: bool,
@@ -260,8 +249,6 @@ fn settle(lanes: &Lanes, what: &str, want: impl Fn(Census) -> bool) {
 fn line_of(reader: &mut impl std::io::BufRead) -> String {
     let mut line = String::new();
     match reader.read_line(&mut line) {
-        // Linux resets a Unix socket closed with bytes it never read (an
-        // acknowledgement a stopped parker did not take): closed all the same.
         Ok(0) => "<EOF>".to_string(),
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => "<EOF>".to_string(),
         Ok(_) => line.trim_end().to_string(),
@@ -344,10 +331,6 @@ fn unacked_captures_then_waits(lane_acks: bool) -> Option<String> {
 /// for up to `ARTIFACT_HANDOFF_TIMEOUT`: four captures whose clients read the
 /// challenge and never answered held four lanes, four waits served there
 /// (every wait lane taken) held the rest, and every other client was refused.
-/// Now the parker awaits the line, and a fresh client is answered.
-///
-/// NEGATIVE CONTROL: the same drive against the acknowledgement awaited on
-/// the lane (`lane_acks`, the old shape) refuses the fresh client.
 #[test]
 fn eight_unacked_captures_leave_lanes_free() {
     assert_eq!(
@@ -366,8 +349,6 @@ fn eight_unacked_captures_leave_lanes_free() {
 /// the nonce exists, fails the handoff; so does a wrong line after the
 /// challenge, though the right one follows it: one line decides, and the
 /// connection closes. Each guard goes to quarantine, never released.
-///
-/// POSITIVE CONTROL: the echo of the challenge releases its guard.
 #[test]
 fn a_pipelined_ack_cannot_be_guessed() {
     let stub = Arc::new(Captures::new(HANG));
@@ -443,8 +424,6 @@ fn an_unfinished_handoff_fails_closed_at_its_deadline() {
 
 /// A reply's latch (what a seamless update's Commit waits on) holds while the
 /// peer has not taken the reply's last byte, and is released once it has.
-/// Before, it was released as the reply was copied into the lane's buffer,
-/// before a byte left.
 #[test]
 fn a_latch_is_released_once_its_last_byte_is_taken() {
     let stub = Arc::new(Captures::new(HANG));
@@ -505,7 +484,6 @@ fn a_stopped_parker_quarantines_the_guard_it_held() {
 #[test]
 fn without_a_parker_the_lane_awaits_the_acknowledgement() {
     let stub = Arc::new(Captures::new(HANG));
-    // Two lanes: the second client is dialled as the first one's lets go.
     let lanes = lanes(
         LaneLimits {
             rpc: 2,

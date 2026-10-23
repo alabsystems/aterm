@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The job probe's macOS arm (see the parent module for what it reads).
+//! macOS implementation of the job probe.
 
 use std::ffi::{c_int, c_void};
 use std::path::PathBuf;
@@ -85,7 +85,7 @@ fn from_bsd(pid: u32, b: &libc::proc_bsdinfo) -> ProcFacts {
     }
 }
 
-/// `sysctl(KERN_PROC_PID)`: the one reader that answers for a zombie.
+/// `sysctl(KERN_PROC_PID)`.
 pub(crate) fn kinfo(pid: c_int) -> Option<darwin::Kinfo> {
     let mut buf = vec![0u8; darwin::KINFO_SIZE];
     let mut len: libc::size_t = buf.len();
@@ -95,8 +95,7 @@ pub(crate) fn kinfo(pid: c_int) -> Option<darwin::Kinfo> {
         darwin::KERN_PROC_PID,
         pid,
     ];
-    // SAFETY: `mib` names four integers; `buf` is `len` writable bytes and
-    // the kernel writes at most `len`, reporting how many in `len`.
+    // SAFETY: `mib` names four integers; `buf` is `len` writable bytes.
     let rc = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -129,10 +128,6 @@ fn counters(pid: c_int, task: Option<&libc::proc_taskinfo>) -> Option<Counters> 
         child_cpu_ns: Some(ns(u
             .ri_child_user_time
             .saturating_add(u.ri_child_system_time))),
-        // The design's POLLING input (§11.4): BSD system calls plus interrupt
-        // wakeups. Mach traps are left out (a run loop or a dispatch queue
-        // wakes through them with no work to show), and so are package-idle
-        // wakeups, which the kernel counts among the interrupt wakeups too.
         syscalls: task.and_then(|t| nonneg(t.pti_syscalls_unix)),
         wakeups: Some(u.ri_interrupt_wkups),
         ctx_switches: task.and_then(|t| nonneg(t.pti_csw)),
@@ -147,8 +142,7 @@ fn counters(pid: c_int, task: Option<&libc::proc_taskinfo>) -> Option<Counters> 
 fn threads(pid: c_int) -> Option<(Vec<ThreadReading>, bool)> {
     let mut handles = vec![0u64; MAX_THREADS + 1];
     let bytes = c_int::try_from(handles.len() * 8).ok()?;
-    // SAFETY: `handles` is `bytes` writable bytes; the call returns how many
-    // bytes it wrote.
+    // SAFETY: `handles` is `bytes` writable bytes; the call returns how many bytes it wrote.
     let n = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -166,8 +160,7 @@ fn threads(pid: c_int) -> Option<(Vec<ThreadReading>, bool)> {
     for h in handles {
         // SAFETY: plain integers and bytes; all-zero is valid.
         let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is `THREAD_SIZE` writable bytes of the flavor's
-        // layout; the argument is the thread's handle.
+        // SAFETY: `info` is `THREAD_SIZE` writable bytes of the flavor's layout.
         let got = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -183,9 +176,6 @@ fn threads(pid: c_int) -> Option<(Vec<ThreadReading>, bool)> {
         out.push(ThreadReading {
             id: h,
             state: RunState::from_mach_thread(info.pth_run_state),
-            // Nanoseconds already: the kernel fills these from the thread's
-            // `time_value_t` (seconds and microseconds), unlike the task's
-            // `rusage` and `proc_taskinfo` times, which are Mach ticks.
             cpu_ns: Some(info.pth_user_time.saturating_add(info.pth_system_time)),
             wchan: None,
         });
@@ -193,8 +183,7 @@ fn threads(pid: c_int) -> Option<(Vec<ThreadReading>, bool)> {
     Some((out, truncated))
 }
 
-/// The process's state from its BSD status, refined by its threads: macOS
-/// says `SRUN` for a process blocked in `read(2)`.
+/// The process's state from its BSD status, refined by its threads.
 fn refine(state: RunState, threads: Option<&[ThreadReading]>) -> RunState {
     let Some(ts) = threads.filter(|t| !t.is_empty()) else {
         return state;
@@ -226,8 +215,7 @@ fn fd_list(pid: c_int, nfiles: u32) -> Option<(Vec<libc::proc_fdinfo>, bool)> {
         want
     ];
     let bytes = c_int::try_from(want * FDINFO_SIZE).ok()?;
-    // SAFETY: `list` is `bytes` writable bytes; the call returns how many
-    // bytes it wrote.
+    // SAFETY: `list` is `bytes` writable bytes; the call returns how many bytes it wrote.
     let n = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -244,8 +232,7 @@ fn fd_list(pid: c_int, nfiles: u32) -> Option<(Vec<libc::proc_fdinfo>, bool)> {
     Some((list, truncated))
 }
 
-/// `proc_pidfdinfo(pid, fd, flavor)` into `buf`: how many bytes (or, for
-/// the knote flavor, how many entries) it wrote.
+/// `proc_pidfdinfo(pid, fd, flavor)` into `buf`.
 fn fd_info(pid: c_int, fd: i32, flavor: i32, buf: &mut [u8]) -> Option<usize> {
     let size = c_int::try_from(buf.len()).ok()?;
     // SAFETY: `buf` is `size` writable bytes.
@@ -314,8 +301,7 @@ fn kqueue_kind(pid: c_int, fd: i32, lanes: Lanes) -> FdKind {
 fn knotes_of(pid: c_int, fd: i32) -> Option<Vec<Knote>> {
     let mut buf = vec![0u8; darwin::KNOTE_SIZE * MAX_KNOTES];
     let size = c_int::try_from(buf.len()).ok()?;
-    // SAFETY: `buf` is `size` writable bytes; this flavor returns how many
-    // `kevent_extinfo`s it wrote (a negative return is an error).
+    // SAFETY: `buf` is `size` writable bytes.
     let n = unsafe {
         libc::proc_pidfdinfo(
             pid,
@@ -377,8 +363,6 @@ pub(super) fn read(pid: u32, want_fds: bool, lanes: Lanes) -> Option<ProcFacts> 
         None => match bsd_info(p) {
             Some(b) => from_bsd(pid, &b),
             None => match short_info(p) {
-                // Another user's process: the short info is readable for
-                // every process.
                 Some(s) => {
                     let end = s.comm.iter().position(|b| *b == 0).unwrap_or(16);
                     ProcFacts {
@@ -391,7 +375,6 @@ pub(super) fn read(pid: u32, want_fds: bool, lanes: Lanes) -> Option<ProcFacts> 
                         ..ProcFacts::default()
                     }
                 }
-                // A zombie answers no `proc_pidinfo` flavor.
                 None => {
                     let k = kinfo(p)?;
                     ProcFacts {
@@ -431,15 +414,7 @@ pub(super) fn read(pid: u32, want_fds: bool, lanes: Lanes) -> Option<ProcFacts> 
     Some(facts)
 }
 
-/// The device (`vst_dev`) and inode of every vnode `pid` holds a descriptor
-/// to, and whether the list was cut at [`MAX_FDS`]: the build-slot reader's
-/// proof that a process holds a slot file open (`crate::slots`). A
-/// descriptor closed between the list and its read is left out, as the
-/// process no longer holds it. `None` when the list is refused (gone, a
-/// zombie, another user's): libproc answers a refusal with no bytes, not an
-/// error, and a process the reader asks about holds at least its slot, so an
-/// empty list is read as the refusal it is, never as a process that holds
-/// nothing.
+/// Device (`vst_dev`) and inode of every vnode `pid` holds, plus [`MAX_FDS`] truncation.
 pub(super) fn vnode_ids(pid: u32) -> Option<(Vec<(u32, u64)>, bool)> {
     let p = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
     let (list, cut) = fd_list(p, MAX_FDS as u32).filter(|(list, _)| !list.is_empty())?;
@@ -480,9 +455,7 @@ fn own_pipe() -> Option<[c_int; 2]> {
     (unsafe { libc::pipe(fds.as_mut_ptr()) } == 0).then_some(fds)
 }
 
-/// L6: this process's own kqueue, watching one pipe for reading, lists that
-/// one knote through the private flavor, with the right descriptor and
-/// filter.
+/// L6: this process's own kqueue.
 fn check_kqueue_detail() -> Lane {
     let Some([r, w]) = own_pipe() else {
         return Lane::Off("no-pipe");
@@ -501,8 +474,7 @@ fn check_kqueue_detail() -> Lane {
         data: 0,
         udata: std::ptr::null_mut(),
     };
-    // SAFETY: one change, no events asked back, no timeout needed for a
-    // registration.
+    // SAFETY: one change, no events asked back, no timeout needed for a registration.
     let rc = unsafe {
         libc::kevent(
             kq,
@@ -533,15 +505,10 @@ fn check_kqueue_detail() -> Lane {
     verdict
 }
 
-/// How long the L7 self-check waits for its reader to block before it calls
-/// the lane off: a hang detector, never a latency budget. On a Mac whose
-/// pipes show the flag the check ends the moment the reader sleeps, however
-/// starved its thread is.
+/// How long the L7 self-check waits for its reader to block before it calls the lane off.
 const L7_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// L7: a thread of this process blocked reading its own pipe shows
-/// `PIPE_WANTR` on that end (waited for under [`L7_HANG`]); then one byte
-/// lets it go.
+/// L7: a thread of this process blocked reading its own pipe shows `PIPE_WANTR` on that end.
 fn check_pipe_flags() -> Lane {
     let Some([r, w]) = own_pipe() else {
         return Lane::Off("no-pipe");
@@ -550,8 +517,7 @@ fn check_pipe_flags() -> Lane {
         .name("aterm-sysprobe-l7".to_owned())
         .spawn(move || {
             let mut byte = 0u8;
-            // SAFETY: one writable byte; `r` stays open until this thread is
-            // joined.
+            // SAFETY: one writable byte; `r` stays open until this thread is joined.
             unsafe { libc::read(r, (&raw mut byte).cast(), 1) }
         });
     let Ok(reader) = reader else {

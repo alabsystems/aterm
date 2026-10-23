@@ -101,7 +101,9 @@ pub fn peer_pid_of_fd(fd: std::os::fd::RawFd) -> io::Result<u32> {
     scm::peer_pid_of_fd(fd)
 }
 
-/// The two ABIs this file mirrors field-for-field.
+/// The two ABIs this file mirrors field-for-field. Everything outside `abi` is
+/// platform-independent: the cmsg walk, the ownership discipline, the
+/// validation.
 #[cfg(any(
     target_vendor = "apple",
     all(
@@ -361,7 +363,8 @@ mod scm {
         fn fcntl(fd: RawFd, cmd: i32, ...) -> i32;
     }
 
-    /// `fcntl(2)`'s descriptor-flag setter and the one flag there is.
+    /// `fcntl(2)`'s descriptor-flag setter and the one flag there is. Same
+    /// numbers on every supported Unix, so they are not per-ABI.
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
 

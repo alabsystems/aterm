@@ -113,7 +113,10 @@ fn the_tap_value_is_exact_and_only_it_is_ours() {
     assert!(!carried_by(&argv(&[])));
 }
 
-/// ON WINDOWS THE VALUE NAMES A DRIVE PATH WITH `/` SEPARATORS.
+/// ON WINDOWS THE VALUE NAMES A DRIVE PATH WITH `/` SEPARATORS. Claude Code runs a status-line
+/// command through Git Bash (else PowerShell), where a `\` is an escape: the path the window's
+/// canonical `current_exe` gives (`\\?\C:\…`) is spelled `C:/…`, which Git Bash, pwsh 7 and
+/// Windows PowerShell 5.1 each ran (measured 2026-10-17), and the value round-trips as ours.
 #[cfg(windows)]
 #[test]
 fn a_windows_exe_is_named_with_forward_slashes() {

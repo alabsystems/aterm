@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `libc-oracle/union.json`: each cell's harvested item list, the source the
-//! declaration set is computed from ([`crate::closure`]).
-//!
-//! The file is one object with a key per row of [`crate::cells::CELLS`], in
-//! table order, each holding a sorted list of names. [`Union::render`] writes
-//! exactly that shape, so a widening (`harvest --write`) is a diff of the names
-//! it added and nothing else.
+//! Reads and renders ([`Union::render`]) `libc-oracle/union.json` for [`crate::cells::CELLS`]
+//! and [`crate::closure`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -28,8 +23,7 @@ pub fn path(root: &Path) -> PathBuf {
 /// Why the list file could not be had ([`Union::read`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Unread {
-    /// There is no file: the checkout lacks a checked-in input, so the gate decides
-    /// nothing (COULD NOT RUN), the way a root without `libc-oracle/` does.
+    /// The file does not exist.
     Absent(String),
     /// The file is there and cannot be read or parsed: a finding about the tree.
     Unusable(String),
@@ -80,11 +74,10 @@ impl Union {
         Ok(Self { lists })
     }
 
-    /// Read `<root>/libc-oracle/union.json`, saying whether it was absent or unusable.
+    /// Read `<root>/libc-oracle/union.json`.
     ///
     /// # Errors
-    /// [`Unread::Absent`] when there is no such file; [`Unread::Unusable`] when it is
-    /// there and cannot be read or parsed. Each message names the file.
+    /// [`Unread::Absent`] when missing; [`Unread::Unusable`] when unreadable or malformed.
     pub fn read(root: &Path) -> Result<Self, Unread> {
         let path = path(root);
         let text = std::fs::read_to_string(&path).map_err(|e| {

@@ -100,7 +100,8 @@ fn escape(bytes: &[u8]) -> String {
     out
 }
 
-/// `escape`'s inverse.
+/// `escape`'s inverse. A `\` followed by anything but `\`, `n`, `r`, `t` or `x` and two hex
+/// digits is refused, its text the reason.
 fn unescape(text: &str) -> std::result::Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(text.len());
     let mut bytes = text.bytes();
@@ -342,7 +343,8 @@ struct Lines<'a> {
 }
 
 impl<'a> Lines<'a> {
-    /// `text`'s lines.
+    /// `text`'s lines. Every line ends with a newline, so the empty text after the last one is
+    /// no line.
     fn of(text: &'a str) -> Lines<'a> {
         let mut lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
         if text.is_empty() {
@@ -366,7 +368,8 @@ impl<'a> Lines<'a> {
         self.lines.peek().copied()
     }
 
-    /// The next line's piece, when it is a body line behind `prefix`.
+    /// The next line's piece, when it is a body line behind `prefix`. A glue (`=`) line is
+    /// refused: atape-text 1 writes one only for a control door's screen, outside the subset.
     fn piece(&mut self, prefix: char) -> Result<Option<Vec<u8>>> {
         let Some(line) = self.peek() else {
             return Ok(None);
@@ -502,7 +505,9 @@ struct SinkState {
     file: std::fs::File,
     path: PathBuf,
     failed: Option<String>,
-    /// The remedy `finish` names for `failed`.
+    /// The remedy `finish` names for `failed`. A refusal that every run of this command line
+    /// would meet again (a record outside the subset, a rendering the shapes would change, a
+    /// tape over `TAPE_MAX`) is `Refused`: its file can never replay, so `finish` removes it.
     remedy: Remedy,
     /// The bytes written so far, header included: never more than `max`.
     written: u64,

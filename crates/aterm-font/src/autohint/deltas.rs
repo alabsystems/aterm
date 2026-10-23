@@ -7,8 +7,7 @@
 // unscaled loader's types), every index checked.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
-//! A glyph's `gvar` deltas at an instance, with FreeType's inferred deltas
-//! (IUP) for the points a sparse tuple leaves out.
+//! Glyph `gvar` deltas at a variation instance, including FreeType IUP interpolation.
 
 use core::ops::RangeInclusive;
 
@@ -16,8 +15,7 @@ use super::fixed::{F2Dot14, Fixed, Point};
 use super::glyf::{PHANTOM_POINT_COUNT, PointFlags, PointMarker};
 use super::tuple::{Gvar, ReadError, TupleVariation};
 
-/// The deltas of a composite glyph's component offsets (and its phantom
-/// points). Interpolation means nothing for offsets, so none is done.
+/// Computes `gvar` deltas for a composite glyph's component offsets and phantom points.
 pub(crate) fn composite_glyph(
     gvar: &Gvar,
     glyph_id: u16,
@@ -42,9 +40,7 @@ pub(crate) struct SimpleGlyph<'a> {
     pub contours: &'a [u16],
 }
 
-/// The deltas of a simple glyph's points (and its phantom points), with the
-/// deltas a sparse tuple omits inferred by interpolation. `iup_buffer` is
-/// scratch space at least as long as the glyph's points.
+/// Computes `gvar` deltas for a simple glyph's points, interpolating omitted sparse deltas.
 pub(crate) fn simple_glyph(
     gvar: &Gvar,
     glyph_id: u16,
@@ -57,8 +53,7 @@ pub(crate) fn simple_glyph(
         return Err(ReadError);
     }
     if gvar.glyph_variation_data(glyph_id).is_err() {
-        // Malformed variation data for a glyph leaves its deltas as they
-        // are (skrifa's early return, before the deltas are zeroed).
+        // Malformed variation data leaves deltas unchanged.
         return Ok(());
     };
     let SimpleGlyph {
@@ -67,8 +62,7 @@ pub(crate) fn simple_glyph(
         contours,
     } = glyph;
     compute_deltas_for_glyph(gvar, glyph_id, coords, deltas, |scalar, tuple, deltas| {
-        // Infer missing deltas by interpolation: work on the points in
-        // 16.16 with every HAS_DELTA flag cleared.
+        // Work on 16.16 points with HAS_DELTA cleared.
         for ((flag, point), iup_point) in flags.iter_mut().zip(points).zip(&mut iup_buffer[..]) {
             *iup_point = point.map(Fixed::from_i32);
             flag.clear_marker(PointMarker::HAS_DELTA);
@@ -108,6 +102,7 @@ fn compute_deltas_for_glyph(
     Ok(())
 }
 
+// FreeType ttgxvar.c `tt_interpolate_deltas`.
 /// Interpolates the points without deltas, as the IUP instruction does
 /// (FreeType ttgxvar.c `tt_interpolate_deltas`).
 fn interpolate_deltas(
@@ -121,18 +116,15 @@ fn interpolate_deltas(
     for &end_point_ix in contours {
         let end_point_ix = end_point_ix as usize;
         let first_point_ix = point_ix;
-        // The first point that has a delta.
         while point_ix <= end_point_ix && !flags.get(point_ix)?.has_marker(PointMarker::HAS_DELTA) {
             point_ix += 1;
         }
-        // No deltas: no variation in this tuple applies to the contour.
         if point_ix > end_point_ix {
             continue;
         }
         let first_delta_ix = point_ix;
         let mut cur_delta_ix = point_ix;
         point_ix += 1;
-        // Each next point with a delta, interpolating the ones between.
         while point_ix <= end_point_ix {
             if flags.get(point_ix)?.has_marker(PointMarker::HAS_DELTA) {
                 jiggler.interpolate(
@@ -143,11 +135,9 @@ fn interpolate_deltas(
             }
             point_ix += 1;
         }
-        // A single delta shifts the whole contour.
         if cur_delta_ix == first_delta_ix {
             jiggler.shift(first_point_ix..=end_point_ix, cur_delta_ix)?;
         } else {
-            // Otherwise the points before the first and after the last.
             jiggler.interpolate(
                 cur_delta_ix + 1..=end_point_ix,
                 RefPoints(cur_delta_ix, first_delta_ix),
@@ -171,6 +161,7 @@ struct Jiggler<'a> {
 }
 
 impl Jiggler<'_> {
+    // FreeType ttgxvar.c `tt_delta_shift`.
     /// Shifts every point in `range` but the reference by the reference
     /// point's delta (FreeType ttgxvar.c `tt_delta_shift`).
     fn shift(&mut self, range: RangeInclusive<usize>, ref_ix: usize) -> Option<()> {
@@ -189,6 +180,7 @@ impl Jiggler<'_> {
         Some(())
     }
 
+    // FreeType ttgxvar.c `tt_delta_interpolate`.
     /// Interpolates the points in `range` between two reference points
     /// (FreeType ttgxvar.c `tt_delta_interpolate`).
     fn interpolate(&mut self, range: RangeInclusive<usize>, ref_points: RefPoints) -> Option<()> {
@@ -205,8 +197,7 @@ impl Jiggler<'_> {
                 let in2 = Fixed::from_i32(self.points.get(ref2_ix)?.$coord);
                 let out1 = self.out_points.get(ref1_ix)?.$coord;
                 let out2 = self.out_points.get(ref2_ix)?.$coord;
-                // Reference points with one coordinate and different deltas
-                // infer a zero delta; otherwise interpolate.
+                // Coincident reference points with differing deltas infer a zero delta.
                 if in1 != in2 || out1 == out2 {
                     let scale = if in1 != in2 {
                         (out2 - out1) / (in2 - in1)
@@ -274,7 +265,6 @@ mod tests {
     #[test]
     fn shift() {
         let points = make_points(&[(245, 630), (260, 700), (305, 680)]);
-        // A single delta shifts the whole contour.
         let deltas = make_points(&[(20, -10), (0, 0), (0, 0)]);
         let (mut working_points, flags) = make_working_points_and_flags(&points, &deltas);
         interpolate_deltas(&points, &flags, &[2], &mut working_points).unwrap();
@@ -288,8 +278,6 @@ mod tests {
 
     #[test]
     fn interpolate() {
-        // The spec's example (gvar, "Inferred deltas for un-referenced point
-        // numbers"), within this fixed point math's precision.
         let points = make_points(&[(245, 630), (260, 700), (305, 680)]);
         let deltas = make_points(&[(28, -62), (0, 0), (-42, -57)]);
         let (mut working_points, flags) = make_working_points_and_flags(&points, &deltas);

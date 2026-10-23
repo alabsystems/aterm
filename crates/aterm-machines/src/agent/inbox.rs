@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The two verbs that write as an ordinary account, never as root:
-//!
-//! * `put <sha256>`: the controller uploads an artifact into the admin's inbox
-//!   (`~/Library/Caches/aterm-machines/inbox/<sha256>`); the bytes must hash to the name.
-//!   The root agent copies it out and hashes its own copy again (design §8).
-//! * `put-file <path> <mode>`: the root agent re-runs itself as a user to write a file in
-//!   that user's home, so a link the user planted can never redirect a root write
-//!   (design §3.5).
+//! Unprivileged `put` and `put-file` agent verbs for writing into user directories.
 
 use crate::port::System;
 use std::io::{Read, Write};
 use std::path::{Component, Path};
 use std::process::ExitCode;
 
-/// The largest file `put-file` writes (keys, ssh config, authorized_keys: small text).
+/// Maximum payload size accepted by `put-file`.
 const MAX_PUT_FILE: u64 = 16 << 20;
 
 /// `agent put <sha256>`.
@@ -256,7 +249,6 @@ mod tests {
     #[test]
     fn put_keeps_bytes_only_when_they_hash_to_their_name() {
         let fake = as_admin();
-        // SHA-256 of "hello".
         let sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         let mut out = Vec::new();
         assert_eq!(

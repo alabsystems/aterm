@@ -47,7 +47,7 @@ struct Halted;
 
 /// A no-op at every record a replay consumes, `n` its ordinal (`#n` in `tape cat`).
 #[inline(never)]
-pub fn at_door(n: u64) {
+pub const fn at_door(n: u64) {
     std::hint::black_box(n);
 }
 
@@ -287,12 +287,12 @@ impl ReplayCore {
     }
 
     /// The seed of the worker's digest on this tape.
-    pub(crate) fn seed(&self) -> u64 {
+    pub(crate) const fn seed(&self) -> u64 {
         self.seed
     }
 
     /// The instant this replay's `Mono` records count from.
-    pub(crate) fn origin(&self) -> Instant {
+    pub(crate) const fn origin(&self) -> Instant {
         self.origin
     }
 

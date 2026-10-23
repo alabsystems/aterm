@@ -269,7 +269,9 @@ impl World {
         });
     }
 
-    /// Local records until the ring evicts `ms`.
+    /// Local records until the ring evicts `ms`. An eviction batch takes an
+    /// eighth of the ring, oldest first: a bell between `ms` and the next
+    /// bus-class record is the batch's second victim, so `ms` goes alone.
     fn evict(&mut self, ms: u64) {
         for _ in 0..64 {
             if !self.log(|log| log.live_ms().any(|m| m == ms)) {
@@ -758,7 +760,11 @@ fn a_torn_pin_after_a_power_cut_is_set_aside_and_the_next_boots_mirror_resumes()
     }
 }
 
-/// **NO PIN BESIDE ITS COPIES: THE HELLO WRITES ONE AT ONCE**.
+/// **NO PIN BESIDE ITS COPIES: THE HELLO WRITES ONE AT ONCE**. A dir whose pin a person moved aside, with `logkey` and `logfloor`
+/// on the media, resumes under the same key at the floor, and the hello
+/// writes that whole pin before any take — of the version an older build
+/// refuses, so one that ran here next stops rather than find no pin and mint
+/// a second key.
 #[test]
 fn a_mirror_with_its_copies_and_no_pin_writes_one_at_its_hello() {
     let key = [0x77; 16];
@@ -1343,7 +1349,11 @@ fn fill(w: &World, n: u64) -> Vec<u64> {
         .collect()
 }
 
-/// THE WINDOW BUDGET REPLACES THE LIFETIME CAP ON A RETAINING BROKER.
+/// THE WINDOW BUDGET REPLACES THE LIFETIME CAP ON A RETAINING BROKER. The node's pin says it mirrored past
+/// [`crate::mirror::TOTAL_MAX_BYTES`], a whole window's budget of it in a
+/// batch the broker's cut has since passed: the mirror reads `oldest=` again,
+/// forgets that batch, and goes on taking, landing and counting, never
+/// `capped`.
 #[test]
 fn a_retaining_brokers_window_lets_a_total_past_the_cap_mirror_on() {
     let mut w = World::retaining();
@@ -1466,7 +1476,9 @@ fn a_budget_filled_in_many_small_batches_goes_on_once_the_cut_passes_half() {
     );
 }
 
-/// AN `auto` MIRROR RUNS ONLY OVER A BROKER THAT RETAINS IT (owner decision D4).
+/// AN `auto` MIRROR RUNS ONLY OVER A BROKER THAT RETAINS IT (owner decision D4). The start's `hello`, before any
+/// attach, says `log=auto` and asks for nothing, whatever the endpoint
+/// answers.
 #[test]
 fn an_auto_mirror_runs_only_over_a_broker_that_retains_it() {
     let lane_now = aterm_types::control_verbs::BRIDGE_LANE;

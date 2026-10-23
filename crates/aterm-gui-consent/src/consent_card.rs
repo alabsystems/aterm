@@ -165,7 +165,7 @@ impl PendingDecision {
 #[cfg(any(test, debug_assertions))]
 impl NeedWords {
     /// A sample need for tests of the reporter and the host: an app-data prompt from tab 1, first epoch.
-    pub fn sample() -> Self {
+    pub const fn sample() -> Self {
         Self {
             cause: NeedCause::PromptObserved {
                 service: Some(Folder::AppData),
@@ -459,7 +459,8 @@ pub fn write_verified_host(
     }
 }
 
-/// This process's start, in unix seconds.
+/// This process's start, in unix seconds. Set by [`note_process_start`] at the
+/// top of the GUI's entry; a successor is a new process and so a new value.
 static PROCESS_STARTED_AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// The current unix time in seconds (`0` if the clock is before the epoch).
@@ -682,7 +683,7 @@ impl From<&LaunchVerdict> for Verdict {
 }
 
 /// Whether a need verdict is the anomaly the log keeps a trace of: macOS showed a dialog for a program of this aterm while this process reads Full Disk Access as granted (a program whose macOS record does not match the window's).
-pub fn is_prompt_while_granted(cause: NeedCause, verdict: &NeedVerdict) -> bool {
+pub const fn is_prompt_while_granted(cause: NeedCause, verdict: &NeedVerdict) -> bool {
     matches!(cause, NeedCause::PromptObserved { .. })
         && matches!(verdict, NeedVerdict::Quiet(NotDue::Granted))
 }
@@ -868,7 +869,7 @@ impl CardState {
     }
 
     /// Admit one lifecycle step against the current settings, including a pending worker verdict or a raised question.
-    pub fn admit_current_policy(&mut self, enabled: bool, notice: bool) -> bool {
+    pub const fn admit_current_policy(&mut self, enabled: bool, notice: bool) -> bool {
         if enabled && notice {
             true
         } else {
@@ -903,12 +904,12 @@ impl CardState {
     }
 
     /// Keep a need without acting on it (the host cannot decide right now: an incoming handoff is uncommitted, or there is no event loop yet).
-    pub fn defer_need(&mut self) {
+    pub const fn defer_need(&mut self) {
         self.pending_need = true;
     }
 
     /// The grant answers a need that was kept before it: drop the kept need without deciding it (the dialog it stands for predates the grant, and a later dialog is a new need).
-    pub fn discard_pending_need(&mut self) {
+    pub const fn discard_pending_need(&mut self) {
         self.pending_need = false;
     }
 
@@ -929,7 +930,7 @@ impl CardState {
     }
 
     /// A lapsed decision: back to `Idle` to ask again (`true`), or settled once [`DECIDE_ATTEMPTS`] are spent, so a dropped wake ([`DECIDE_TIMEOUT`]) cannot silently kill the card.
-    pub fn reopen_deciding(&mut self) -> bool {
+    pub const fn reopen_deciding(&mut self) -> bool {
         if self.decide_attempts >= DECIDE_ATTEMPTS {
             self.settle();
             return false;
@@ -970,14 +971,14 @@ impl CardState {
     }
 
     /// The owner opened the row's Details: read; the watch continues.
-    pub fn on_owner_acted(&mut self) {
+    pub const fn on_owner_acted(&mut self) {
         if matches!(self.phase, CardPhase::Watching { .. }) {
             self.owner_acted = true;
         }
     }
 
     /// The row folded with nothing pressed: the unanswered path, settled (`true`); `asked_at` is on record, so the next ask waits for [`RENEW_AFTER`].
-    pub fn on_row_retired(&mut self) -> bool {
+    pub const fn on_row_retired(&mut self) -> bool {
         if !matches!(self.phase, CardPhase::Watching { .. }) || self.owner_acted {
             return false;
         }
@@ -986,7 +987,7 @@ impl CardState {
     }
 
     /// The owner pressed *Open Settings* through either UI: start a bounded watch even if the card was idle or settled.
-    pub fn on_opened_settings(&mut self, now: Instant) {
+    pub const fn on_opened_settings(&mut self, now: Instant) {
         self.phase = CardPhase::Watching { since: now };
         self.owner_acted = true;
     }
@@ -997,7 +998,7 @@ impl CardState {
     }
 
     /// Nothing more in this episode: *Not now*, the grant observed, or the decision said no.
-    pub fn settle(&mut self) {
+    pub const fn settle(&mut self) {
         self.phase = CardPhase::Settled;
     }
 }
@@ -1854,7 +1855,10 @@ mod tests {
         assert!(eperm.event_line().contains("tab 2"));
     }
 
-    /// One question per epoch, however many process generations an update brings.
+    /// One question per epoch, however many process generations an update brings. The only
+    /// resets are `Regress` (a verified grant reads off), `Renew` ([`RENEW_AFTER`]) and
+    /// `HoldLapses` ([`OWNER_ACTED_HOLD`], longer, so it renews the ask too); `Update` is none of
+    /// them.
     fn asked_once_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             AccessCardAskedOnce {

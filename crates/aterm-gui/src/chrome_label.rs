@@ -346,7 +346,13 @@ mod tests {
         );
     }
 
-    /// THE DEEP-SIBLINGS DEFECT, at the presenter.
+    /// THE DEEP-SIBLINGS DEFECT, at the presenter. The strip's label used to
+    /// take the chrome cap before the strip's own sibling-aware pass — and any
+    /// fixed cut is sibling-blind: the head cut collapsed tabs that differ
+    /// only past grapheme 96 (the glass finding), and a middle cut collapses
+    /// tabs that differ only inside `[48, N-48)` (two worktree checkouts of
+    /// one repo, `wf_<id>-10` beside `wf_<id>-25`) that the head cut had told
+    /// apart.
     #[test]
     fn the_strip_surface_presents_the_whole_title_and_the_window_surface_the_capped_one() {
         let cache = LabelCache::default();

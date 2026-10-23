@@ -293,7 +293,8 @@ fn responsible_token(responsible: Responsible) -> String {
     )
 }
 
-/// `-` for unset, pct-encoded otherwise.
+/// `-` for unset, pct-encoded otherwise. Free text on this wire is always
+/// encoded, so a cwd with a space can never split a field.
 fn opt(value: Option<&str>) -> String {
     value.map_or_else(|| "-".to_string(), pct_encode)
 }
@@ -325,7 +326,9 @@ const TASKPORT_WATCH: &str = "off";
 /// d034733c6 removed `reset=` for handing in-session agents a command).
 const DEBUGGER_REMEDIATE: &str = "aterm-settings:security";
 
-/// `remediate devtools=`: a PLACE, never a command.
+/// `remediate devtools=`: a PLACE, never a command. The Developer Tools list
+/// changes only in System Settings, by a human (`+`, then the switch); aterm
+/// adds nothing to it, and no command a program could run does either.
 const DEVTOOLS_REMEDIATE: &str = "settings:Privacy_DevTools";
 
 impl PrivacySnapshot {
@@ -909,7 +912,8 @@ struct SessionFacts {
     pid: i32,
     /// aterm's adoption record, before the master switch.
     observed: Attribution,
-    /// The shell-integration cwd, unencoded.
+    /// The shell-integration cwd, unencoded. `None` when unreported or when
+    /// the terminal was contended.
     cwd: Option<String>,
 }
 

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release's GitHub lane against agh-fake's loopback GitHub, through the real
-//! `/usr/bin/curl` (docs/DESIGN-init-system-2026-10-20.md S15): a draft created and an asset
-//! uploaded by one-shot POSTs, published, listed and read back through the asset CDN; the
-//! token on curl's stdin and nowhere a process listing or an environment read shows it; the
-//! listing read whole and an incomplete page refused; a redirect off the CDN refused and
-//! never asked; a hostile curlrc never read; a launched read's curls started by the launch,
-//! and none asked once the release is interrupted, a real SIGTERM to the release reaching the
-//! curl. Each guard comes with the negative control that shows it would catch what it guards
-//! against.
+//! The release's GitHub lane against agh-fake's loopback GitHub, through the real `/usr/bin/curl`.
 
 use super::*;
 use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec, token};
@@ -167,8 +159,6 @@ fn a_draft_is_created_uploaded_published_listed_and_read_back_through_curl() {
         w.fake.release_state(id).unwrap().1,
         [("aterm-appcast.toml".to_string(), bytes.clone())]
     );
-    // The same name again is GitHub's 422: curl's exit 22 under `--fail-with-body`, which
-    // the one-shot protocol reads as a refusal that created nothing, GitHub's words kept.
     let again = upload(id, "aterm-appcast.toml", &file);
     assert_eq!(again.status, 22);
     assert_eq!(
@@ -176,14 +166,11 @@ fn a_draft_is_created_uploaded_published_listed_and_read_back_through_curl() {
         crate::publish::PostOutcome::Refused
     );
     assert!(String::from_utf8_lossy(&again.stdout).contains("already_exists"));
-    // Control: the successful upload is not read as a refusal.
     assert_ne!(
         crate::publish::post_outcome(&uploaded),
         crate::publish::PostOutcome::Refused
     );
 
-    // Published by the retried metadata PATCH, then listed and read back by asset id: the
-    // asset API's redirect followed onto the CDN, anonymously.
     send(
         Method::Patch,
         &format!("repos/{SLUG}/releases/{id}"),
@@ -212,7 +199,6 @@ fn a_draft_is_created_uploaded_published_listed_and_read_back_through_curl() {
         !cdn[0].had_authorization,
         "the CDN hop carries no credential"
     );
-    // Every API curl was the absolute one, curlrc off.
     let spawned = w.recorder.spawned();
     assert!(!spawned.is_empty());
     for curl in &spawned {
@@ -254,7 +240,6 @@ fn the_token_rides_curls_stdin_and_never_its_argv_or_environment() {
             );
         }
     }
-    // Negative controls: the check catches the token in an argument and in a variable.
     let in_argv = Spawned {
         args: vec!["-H".into(), format!("Authorization: Bearer {}", w.secret)],
         ..spawned[0].clone()
@@ -280,8 +265,6 @@ fn a_write_without_the_token_is_refused_before_curl_starts() {
     assert!(gate.to_string().contains("no release token"), "{gate}");
     assert!(w.recorder.spawned().is_empty(), "nothing was started");
     assert!(w.fake.seen().is_empty(), "nothing was sent");
-    // An anonymous read still goes (a dry run reads the public channel), and the same
-    // write with the token is prepared: the refusal was the missing token.
     assert!(crate::publish::release_listing(SLUG).unwrap().is_empty());
     assert_eq!(w.recorder.spawned().len(), 1);
     drop(w);
@@ -312,8 +295,6 @@ fn the_listing_is_read_whole_and_an_incomplete_page_is_refused() {
             .count()
     };
     assert_eq!(pages(&w), 2);
-    // Page 2 answers empty yet links a page 3: refused on every attempt, never read as
-    // the listing's end.
     let api = w.fake.ports().api;
     let empty_with_next = Fault::Status {
         status: 200,
@@ -327,7 +308,6 @@ fn the_listing_is_read_whole_and_an_incomplete_page_is_refused() {
         )],
     };
     let page_two = format!("/repos/{SLUG}/releases?per_page=100&page=2");
-    // Control: once, it is asked again and the listing read whole on the second attempt.
     w.fake.fault(Match::api(&page_two), empty_with_next.clone());
     assert_eq!(crate::publish::release_listing(SLUG).unwrap().len(), 101);
     w.fake.fault_always(Match::api(&page_two), empty_with_next);
@@ -336,7 +316,6 @@ fn the_listing_is_read_whole_and_an_incomplete_page_is_refused() {
         .to_string();
     assert!(incomplete.contains("after 3 attempts"), "{incomplete}");
     assert!(incomplete.contains("advertises more"), "{incomplete}");
-    // A definitive answer is not asked again: a repository nobody can see is one 404.
     let before = w.fake.seen().len();
     assert!(crate::publish::release_listing("fixture-rel/none").is_err());
     assert_eq!(w.fake.seen().len(), before + 1);
@@ -373,7 +352,6 @@ fn an_asset_redirect_off_the_cdn_is_refused_and_never_followed() {
         !w.fake.seen().iter().any(|s| s.origin == FakeOrigin::Web),
         "the off-CDN Location was never asked"
     );
-    // Control: without the fault the same read follows the CDN redirect.
     let read =
         crate::publish::download_release_asset_for_release_id(SLUG, id, "aterm-appcast.toml")
             .unwrap();
@@ -404,7 +382,6 @@ fn a_hostile_curlrc_is_never_read() {
             .any(|s| s.header("x-planted").is_some())
     };
     assert!(!planted(&w), "-q kept the curlrc out");
-    // Negative control: the same curl, the same environment, without `-q`, reads it.
     let mut bare = aterm_uds::spawnfd::command("/usr/bin/curl");
     bare.args(["-sS", "-o", "/dev/null", "-H", "User-Agent: control"])
         .arg(format!(
@@ -508,7 +485,6 @@ fn a_launched_read_starts_each_curl_through_the_launch_and_none_once_interrupted
     assert!(refused.contains("not started"), "{refused}");
     assert_eq!(started, 1, "the one curl was the launch's");
     assert_eq!(asked(&w), 1, "nothing was asked after the interrupt");
-    // Control: with no interrupt, every attempt is asked, each one through the launch.
     let (got, started) = read(false);
     let failed = got.unwrap_err();
     assert!(failed.contains("after 3 attempts"), "{failed}");
@@ -541,8 +517,6 @@ fn sigterm_probe(dir: &std::path::Path, launched: bool) -> ! {
     fake.add_token(&secret, LOGIN);
     fake.add_repo(SLUG, RepoSpec::public().push(LOGIN));
     let latest = format!("/repos/{SLUG}/releases/latest");
-    // Launched, the hang outlasts the test's hang detector, so only the handed-on signal ends
-    // the curl; direct, the fake ends it itself.
     let hang = Duration::from_secs(if launched { 120 } else { 10 });
     fake.fault_always(Match::api(&latest), Fault::Hang(hang));
     let p = fake.ports();
@@ -565,11 +539,19 @@ fn sigterm_probe(dir: &std::path::Path, launched: bool) -> ! {
     };
     let got = std::thread::scope(|scope| {
         scope.spawn(|| {
-            // a hang detector, never a latency budget
             let bound = Instant::now() + Duration::from_secs(60);
             while Instant::now() < bound {
                 if asked() > 0 {
                     std::fs::write(dir.join("armed"), "armed\n").unwrap();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The client's own curl takes no signal (the lane's point): once the release has
+            // the SIGTERM, the read ends as the hang running out would end it.
+            while !launched && Instant::now() < bound {
+                if crate::interrupt::caught().is_some() {
+                    fake.end_hangs();
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -613,7 +595,6 @@ fn a_real_sigterm_reaches_a_post_cut_reads_curl_and_nothing_more_is_asked() {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        // a hang detector, never a latency budget
         let bound = Instant::now() + Duration::from_secs(60);
         while !dir.path().join("armed").exists() {
             if Instant::now() > bound || probe.try_wait().unwrap().is_some() {
@@ -654,9 +635,6 @@ fn a_real_sigterm_reaches_a_post_cut_reads_curl_and_nothing_more_is_asked() {
         launched.contains("ended by a signal"),
         "the SIGTERM reached the curl: {launched}"
     );
-    // Control: through the client's own spawn the curl shares the release's process group, so
-    // a SIGTERM sent to the release alone never reaches it; it ends when the fake closes, and
-    // still nothing more is asked.
     let direct = run("direct");
     assert!(direct.contains("asked=1\n"), "{direct}");
     assert!(direct.contains("interrupted by signal 15"), "{direct}");

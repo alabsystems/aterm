@@ -287,7 +287,8 @@ pub fn exec_dir(layout: &Layout, program: &str) -> PathBuf {
     layout.prefix.join("store").join(program).join("exec")
 }
 
-/// The stable launch path for an ALab primary and its agent twin.
+/// The stable launch path for an ALab primary and its agent twin. For a non-ALab build,
+/// it is `target` itself, byte for byte as before.
 fn twin_exec(layout: &Layout, program: &str, target: &Path, primary: AgentPrimary) -> PathBuf {
     if cfg!(not(unix)) || crate::alab::agent(program).is_none() {
         return target.to_path_buf();

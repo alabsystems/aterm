@@ -26,17 +26,9 @@ pub(crate) use blues::{BlueZones, ScaledBlue, ScaledBlues, UnscaledBlue, Unscale
 pub(crate) use scale::{compute_unscaled_style_metrics, scale_style_metrics};
 
 /// Maximum number of widths, same for Latin and CJK.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.h#L65>
-/// and <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.h#L55>
 pub(crate) const MAX_WIDTHS: usize = 16;
 
 /// Unscaled metrics for a single axis.
-///
-/// This is the union of the Latin and CJK axis records.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.h#L88>
-/// and <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.h#L73>
 #[derive(Clone, Default, Debug)]
 pub struct UnscaledAxisMetrics {
     /// The dimension of this axis.
@@ -70,13 +62,6 @@ pub struct ScaledAxisMetrics {
 }
 
 /// Unscaled metrics for a single style and script.
-//
-// This is the union of the root, Latin and CJK style metrics but
-// the latter two are actually identical.
-//
-// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aftypes.h#L413>
-// and <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.h#L109>
-// and <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.h#L95>
 #[derive(Clone, Default, Debug)]
 pub struct UnscaledStyleMetrics {
     /// Index of style class.
@@ -92,23 +77,18 @@ impl UnscaledStyleMetrics {
     }
 }
 
-/// The set of unscaled style metrics for a single font, each computed the
-/// first time a glyph of its style is drawn.
-///
-/// For a variable font, this is dependent on the location in variation space.
+/// The set of lazily computed unscaled style metrics for a single font.
 #[derive(Clone, Debug)]
 pub(crate) struct UnscaledStyleMetricsSet(Arc<RwLock<Vec<Option<UnscaledStyleMetrics>>>>);
 
 impl UnscaledStyleMetricsSet {
-    /// Creates an unscaled style metrics set where each entry will be
-    /// initialized as needed.
+    /// Creates an unscaled style metrics set where each entry will be initialized as needed.
     pub fn lazy(style_map: &GlyphStyleMap) -> Self {
         let vec = vec![None; style_map.metrics_count()];
         Self(Arc::new(RwLock::new(vec)))
     }
 
-    /// Returns the unscaled style metrics for the given style map and glyph
-    /// identifier.
+    /// Returns the unscaled style metrics for the given style map and glyph identifier.
     pub fn get(
         &self,
         font: &HintFont,
@@ -124,9 +104,6 @@ impl UnscaledStyleMetricsSet {
             return Some(metrics.clone());
         }
         core::mem::drop(read);
-        // The std RwLock doesn't support upgrading and contention is
-        // expected to be low, so let's just race to compute the new
-        // metrics.
         let shaper = Shaper::new(font);
         let style_class = style.style_class()?;
         let metrics = compute_unscaled_style_metrics(&shaper, coords, style_class);
@@ -173,8 +150,6 @@ pub(crate) type ScaledWidths = Vec<ScaledWidth>;
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 pub struct ScaleFlags(pub(crate) u32);
 
-// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aftypes.h#L115>
-// and <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.h#L143>
 impl ScaleFlags {
     /// Stem width snapping.
     pub const HORIZONTAL_SNAP: Self = Self(1 << 0);
@@ -235,18 +210,10 @@ impl core::ops::BitAndAssign for ScaleFlags {
     }
 }
 
-/// The largest scale the hinter fits at, in 26.6 units per font unit: 128
-/// pixels per unit. An unscaled point is at most 32768 units from the origin
-/// (the loaders truncate to 16 bits), so below it every scaled coordinate is
-/// within 2^28 and the sums of a few that the fitting adds stay inside an
-/// `i32`. [`Scale::new`]'s 16.16 scale wraps at 32768 (512 pixels per unit),
-/// and past that the fitting overflowed on outlines near the 16-bit edge
-/// (`tests/hint_extremes.rs`).
+/// The largest scale the hinter fits at, in 26.6 units per font unit: 128 pixels per unit.
 pub(crate) const MAX_SCALE_26_6: f32 = 8192.0;
 
-/// Whether `size` pixels per em at `units_per_em` is a scale the hinter fits
-/// at ([`MAX_SCALE_26_6`]); `false` for a size that is not finite and
-/// positive, or a face with no units.
+/// Whether `size` pixels per em at `units_per_em` fits within [`MAX_SCALE_26_6`].
 pub(crate) fn scale_fits(size: f32, units_per_em: i32) -> bool {
     units_per_em > 0
         && size.is_finite()
@@ -254,8 +221,7 @@ pub(crate) fn scale_fits(size: f32, units_per_em: i32) -> bool {
         && size * 64.0 <= MAX_SCALE_26_6 * units_per_em as f32
 }
 
-/// Captures scaling parameters which may be modified during metrics
-/// computation.
+/// Captures scaling parameters which may be modified during metrics computation.
 #[derive(Copy, Clone, Default, Debug)]
 pub struct Scale {
     /// Flags that determine hinting functionality.
@@ -287,25 +253,18 @@ impl Scale {
             (Fixed::from_bits((size * 64.0) as i32) / Fixed::from_bits(units_per_em)).to_bits();
         let mut flags = ScaleFlags::default();
         let is_light = target.is_light();
-        // Snap vertical stems for horizontal LCD rendering (and monochrome,
-        // a target aterm does not render).
         if target.is_lcd() {
             flags |= ScaleFlags::HORIZONTAL_SNAP;
         }
-        // Adjust stems to full pixels unless in LCD or light modes.
         if !(target.is_lcd() || is_light) {
             flags |= ScaleFlags::STEM_ADJUST;
         }
         if group == ScriptGroup::Default {
             // Disable horizontal hinting completely for LCD, light hinting
-            // and italic fonts
-            // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2674>
             if target.is_lcd() || is_light || is_italic {
                 flags |= ScaleFlags::NO_HORIZONTAL;
             }
         } else {
-            // CJK doesn't hint advances
-            // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1432>
             flags |= ScaleFlags::NO_ADVANCE;
         }
         Self {
@@ -320,7 +279,6 @@ impl Scale {
     }
 }
 
-// <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.c#L59>
 pub(crate) fn sort_and_quantize_widths(widths: &mut UnscaledWidths, threshold: i32) {
     if widths.len() <= 1 {
         return;
@@ -331,12 +289,9 @@ pub(crate) fn sort_and_quantize_widths(widths: &mut UnscaledWidths, threshold: i
     let mut cur_val = table[cur_ix];
     let last_ix = table.len() - 1;
     let mut ix = 1;
-    // Compute and use mean values for clusters not larger than
-    // `threshold`.
     while ix < table.len() {
         if (table[ix] - cur_val) > threshold || ix == last_ix {
             let mut sum = 0;
-            // Fix loop for end of array?
             if (table[ix] - cur_val <= threshold) && ix == last_ix {
                 ix += 1;
             }
@@ -353,7 +308,6 @@ pub(crate) fn sort_and_quantize_widths(widths: &mut UnscaledWidths, threshold: i
         ix += 1;
     }
     cur_ix = 1;
-    // Compress array to remove zero values
     for ix in 1..table.len() {
         if table[ix] != 0 {
             table[cur_ix] = table[ix];
@@ -362,12 +316,6 @@ pub(crate) fn sort_and_quantize_widths(widths: &mut UnscaledWidths, threshold: i
     }
     widths.truncate(cur_ix);
 }
-
-// Fixed point helpers
-//
-// Note: lots of bit fiddling based fixed point math in the autohinter
-// so we're opting out of using the strongly typed variants because they
-// just add noise and reduce clarity.
 
 pub(crate) fn fixed_mul(a: i32, b: i32) -> i32 {
     (Fixed::from_bits(a) * Fixed::from_bits(b)).to_bits()
@@ -397,15 +345,10 @@ pub(crate) fn pix_floor(a: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    // skrifa 0.46.2 src/outline/autohint/metrics/mod.rs `sort_widths` and
-    // `pix_round_extremes_do_not_panic` (its style-set tests need
-    // fontations' test fonts).
     use super::*;
 
     #[test]
     fn sort_widths() {
-        // We use 10 and 20 as thresholds because the computation used
-        // is units_per_em / 100
         assert_eq!(sort_widths_helper(&[1], 10), &[1]);
         assert_eq!(sort_widths_helper(&[1], 20), &[1]);
         assert_eq!(sort_widths_helper(&[60, 20, 40, 35], 10), &[20, 35, 13, 60]);
@@ -423,7 +366,6 @@ mod tests {
 
     #[test]
     fn pix_round_extremes_do_not_panic() {
-        // Just don't panic with overflow
         let _ = pix_round(i32::MIN);
         let _ = pix_round(i32::MAX);
     }

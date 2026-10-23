@@ -95,7 +95,9 @@ fn flag(name: &str) -> Option<(Arity, Fate)> {
         .map(|(_, a, f)| (*a, *f))
 }
 
-/// Muse Code's subcommands (`muse --help`, 1.4.10, and clap's `help`).
+/// Muse Code's subcommands (`muse --help`, 1.4.10, and clap's `help`). Only
+/// `resume` runs the interactive TUI a relaunch brings back; `exec` is its
+/// one-shot face, and the rest are tools.
 const SUBCOMMANDS: &[&str] = &[
     "resume",
     "exec",
@@ -322,7 +324,7 @@ pub enum ExitKind {
 impl ExitKind {
     /// Wire name for steps and the turn ledger.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             ExitKind::Clean => "clean",
             ExitKind::Refused => "refused",
@@ -333,7 +335,7 @@ impl ExitKind {
 
 /// Classify a relaunch command line's exit status, treating `126`/`127` as [`ExitKind::Refused`].
 #[must_use]
-pub fn line_exit_kind(status: i64) -> ExitKind {
+pub const fn line_exit_kind(status: i64) -> ExitKind {
     match status {
         126 | 127 => ExitKind::Refused,
         status => exit_kind(status),
@@ -342,7 +344,7 @@ pub fn line_exit_kind(status: i64) -> ExitKind {
 
 /// Classify a Muse Code process exit status.
 #[must_use]
-pub fn exit_kind(status: i64) -> ExitKind {
+pub const fn exit_kind(status: i64) -> ExitKind {
     match status {
         0 | 130 | 143 => ExitKind::Clean,
         1 | 2 => ExitKind::Refused,

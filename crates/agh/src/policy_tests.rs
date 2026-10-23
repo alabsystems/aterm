@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! policy's in-crate tests: the decide table over a `Validated` the crate forges, and
-//! the `Named::Literal` cases only agh can make.
+//! In-crate policy tests for `Router::decide` and `Named::Literal` cases.
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -13,8 +12,7 @@ use super::*;
 use crate::config::{self, OwnerRule};
 use crate::error::Kind;
 
-/// The canonical config (`tests/fixtures/canonical.toml`) with `{root}` filled, escaped for a
-/// TOML basic string as `common::canonical_config` escapes it.
+/// The canonical config (`tests/fixtures/canonical.toml`) with `{root}` filled.
 pub(super) fn canonical_text(root: &Path) -> String {
     let root = root
         .display()
@@ -91,7 +89,6 @@ fn a_literal_release_write_sends_as_release() {
             tier: Tier::Release
         }
     );
-    // The literal is compared ASCII case-insensitively with the request's repository.
     let cased = router.decide(
         &RouteRequest::write(target()).with_named(literal("ALABSYSTEMS/Aterm")),
         &present,
@@ -130,7 +127,6 @@ fn the_forged_floor_holds_at_decide_time() {
         &present,
     );
     assert_eq!(code(&write), Some(RefusalCode::TierMismatch));
-    // A Read sends dev, as the canonical config's chain does.
     let read = router.decide(&RouteRequest::read(target()), &present);
     assert_eq!(
         read,

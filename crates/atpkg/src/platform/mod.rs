@@ -89,7 +89,8 @@ pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
     aterm_durable::durable(f)
 }
 
-/// macOS's QoS launcher, the one the window wraps its package passes in.
+/// macOS's QoS launcher, the one the window wraps its package passes in. Absent
+/// elsewhere, where [`utility_clamped`] leaves a program bare.
 #[cfg(unix)]
 const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 
@@ -241,7 +242,8 @@ pub(crate) const CMD_FRAME_HEAD: &str = "@goto :main\r\n";
 /// The label [`CMD_FRAME_HEAD`] jumps to: the line right ahead of the real body.
 const CMD_MAIN_LABEL: &str = "main";
 
-/// One line of the frame's padding: 78 colons and a CRLF, 80 bytes.
+/// One line of the frame's padding: 78 colons and a CRLF, 80 bytes. A label to `cmd`
+/// from any byte of it (every suffix starts with `:` or is a CRLF suffix).
 const CMD_PADDING_LINE: &str =
     "::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::\r\n";
 

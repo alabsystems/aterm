@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `#[export]`'s expansion, natively: the exports it writes are linked into
-//! this test binary under their wasm names, so the test calls them as the
-//! glue does, with words, and reads results through the return slot and
-//! the allocator. A throw is a panic carrying the [`Thrown`] here.
-//!
-//! What only a wasm module shows (the descriptor section, the glue, a trap
-//! poisoning an object) is the node toy's: `verify wasm-glue`.
+//! Native tests for `#[export]` macro expansion.
 
 use aterm_wasm_abi::__rt::Thrown;
 use aterm_wasm_abi::{export, mem};
@@ -76,8 +70,7 @@ impl Counter {
         self.n += 1;
     }
 
-    /// Configured like aterm-wasm's getters: the option arrives through
-    /// `cfg_attr`, which rustc expands before the method's marker runs.
+    /// Configured like aterm-wasm's getters.
     #[cfg_attr(all(), export(getter))]
     pub fn name_len(&mut self) -> usize {
         self.bump();
@@ -106,7 +99,6 @@ pub fn sum_bytes(bytes: &[u8]) -> u32 {
     bytes.iter().map(|&b| u32::from(b)).sum()
 }
 
-// The exports, as the glue sees them: every parameter is two words.
 unsafe extern "C-unwind" {
     fn counter_new(start: u32, _: u32, name: usize, len: usize) -> usize;
     fn counter_n(this: usize) -> u32;
@@ -161,8 +153,6 @@ fn error(msg: &str) -> Option<Thrown> {
 #[test]
 fn a_class_is_built_called_and_freed_through_its_exports() {
     let (name, len) = pass(b"clicks");
-    // SAFETY (this test): words as the glue lowers them; each handle is used
-    // only while live.
     unsafe {
         let c = counter_new(4, 0, name, len);
         assert_ne!(c, 0);

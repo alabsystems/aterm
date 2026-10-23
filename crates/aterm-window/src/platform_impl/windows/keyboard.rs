@@ -80,7 +80,8 @@ impl KeyEventBuilder {
         self.alt_code.lock().unwrap().key_down(vkey, alt, ctrl);
     }
 
-    /// LOCAL PATCH (aterm): a WM_CHAR no key-down claimed.
+    /// LOCAL PATCH (aterm): a WM_CHAR no key-down claimed. `true` when it belongs to an Alt
+    /// code; the last unit of the character stores it for [`Self::take_alt_code_commit`].
     fn alt_code_char(&self, hwnd: HWND, unit: u16) -> bool {
         if !self.alt_code.lock().unwrap().push(unit) {
             return false;
@@ -450,7 +451,9 @@ impl KeyEventBuilder {
     }
 }
 
-/// LOCAL PATCH (aterm): Windows' Alt-code entry.
+/// LOCAL PATCH (aterm): Windows' Alt-code entry. Alt held, a code typed on the NumLock-on
+/// keypad (Alt, 0, 2, 3, 3), and on Alt's release the system posts the composed character
+/// (`é`) as a WM_CHAR no key-down belongs to.
 #[derive(Default)]
 struct AltCode {
     armed: bool,

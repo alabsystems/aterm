@@ -388,7 +388,8 @@ pub(crate) fn surface_is_dark(bg: [u8; 3]) -> bool {
 pub(crate) const ACCENT_WASH_SELECTED: f32 = 0.13;
 /// The deepest accent wash that still carries accent ink (the pressed state of a selected navigation row).
 pub(crate) const ACCENT_WASH_PRESSED: f32 = 0.16;
-/// The floor the accent holds as ink against the wash it is inked on.
+/// The floor the accent holds as ink against the wash it is inked on. A rule
+/// or fill can be quieter than its surroundings; a label cannot.
 const ACCENT_INK_FLOOR: f32 = 3.0;
 /// How far a light theme's `elevated` (cards, the rail) rises above its
 /// `surface` (the page), in `OkLab` lightness: Fluent's light card step
@@ -741,7 +742,8 @@ fn in_gamut(rgb: [f32; 3]) -> bool {
         .all(|value| (-0.000_01..=1.000_01).contains(value))
 }
 
-/// Convert with chroma-preserving gamut mapping.
+/// Convert with chroma-preserving gamut mapping. Lightness and hue remain stable;
+/// only chroma is reduced when the requested colour is outside sRGB.
 fn oklch_to_rgb(mut color: Oklch) -> [u8; 3] {
     color.l = color.l.clamp(0.0, 1.0);
     color.c = color.c.max(0.0);

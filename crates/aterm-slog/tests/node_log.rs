@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The node log's own laws: what it takes, its bound and
-//! exact counts, its cursor resets, and that none of its records is a bus
-//! or turn record (D3, D4: local, additive, RAM only).
+//! Node log tests: capacity bounds, exact counts, cursor resets, and record isolation.
 
 use aterm_slog::{
     Actor, Conf, Cursor, EncodeError, Fields, GapWhy, Key, Kind, Mark, NODE_LOG_RECORDS, Node,
@@ -38,8 +36,6 @@ fn started(cap: usize) -> NodeLog {
     log
 }
 
-/// The start is the first record, once; marks wait for it; only `link` and
-/// `config` marks are taken, and only on node `n`; the log owns its counts.
 #[test]
 fn node_log_takes_its_start_first_then_link_and_config_marks() {
     let mut log = NodeLog::new(EP);
@@ -107,8 +103,6 @@ fn node_log_takes_its_start_first_then_link_and_config_marks() {
     }
 }
 
-/// D3 and D4 (T27): no node-log record is a turn record or a bus record,
-/// so the bus mirror's encoder refuses each one, whatever its fields.
 #[test]
 fn no_node_log_record_is_bus_or_turn_class() {
     let mut log = started(8);
@@ -133,9 +127,6 @@ fn no_node_log_record_is_bus_or_turn_class() {
     assert_eq!(ops.len(), 3, "open, amend and mark all checked: {ops:?}");
 }
 
-/// The bound: past [`NODE_LOG_RECORDS`] the oldest goes, counted; a reader
-/// from nothing is told exactly the evicted, a reader cut by `max` is told
-/// only what its read covered, and a later read nothing twice.
 #[test]
 fn node_log_is_bounded_and_counts_every_eviction_once() {
     let mut log = started(NODE_LOG_RECORDS);
@@ -162,16 +153,12 @@ fn node_log_is_bounded_and_counts_every_eviction_once() {
     assert_eq!(after.gap, None, "nothing twice");
     assert_eq!(after.recs[0].seq, 14);
 
-    // A probe (`max = 0`) says the gap ahead and moves past it.
     let probe = log.read(Cursor::new(EP, 0), 0);
     assert_eq!(probe.gap.map(|g| (g.lost, g.resync_to)), Some((10, 10)));
     assert!(probe.recs.is_empty());
     assert_eq!(probe.next.seq, 10);
 }
 
-/// A cursor ahead of the head, or of another epoch with a seq in it, is
-/// another seq space: reset, every live record from the oldest, its count
-/// every evicted seq. A cursor at seq 0 has read nothing, whatever epoch.
 #[test]
 fn a_cursor_of_another_process_reads_reset() {
     let mut log = started(2);

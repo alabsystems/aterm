@@ -63,7 +63,7 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    pub(crate) fn of(byte: u8) -> Option<Self> {
+    pub(crate) const fn of(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Header),
             1 => Some(Self::Records),
@@ -109,7 +109,7 @@ const fn inverse(k: u64) -> u64 {
 }
 
 /// MurmurHash3-mixed word encoding frame position `n` in format-2 checksums.
-pub(crate) fn place_word(n: u64) -> u64 {
+pub(crate) const fn place_word(n: u64) -> u64 {
     let mut z = n ^ PLACE_SALT;
     z = (z ^ (z >> 33)).wrapping_mul(FMIX_1);
     z = (z ^ (z >> 33)).wrapping_mul(FMIX_2);
@@ -152,7 +152,8 @@ pub(crate) fn framed(format: Format, kind: Kind, place: u64, raw: &[u8]) -> Vec<
     out
 }
 
-/// A length as a frame's head holds it.
+/// A length as a frame's head holds it. Every frame's raw is at most
+/// [`FRAME_RAW_MAX`], which a `u32` holds.
 fn u32_of(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -323,13 +324,13 @@ impl TapeWriter {
 
     /// Why the writer stopped, if it did.
     #[must_use]
-    pub fn stopped(&self) -> Option<Stopped> {
+    pub const fn stopped(&self) -> Option<Stopped> {
         self.stopped
     }
 
     /// Bytes handed to the sink so far.
     #[must_use]
-    pub fn written(&self) -> u64 {
+    pub const fn written(&self) -> u64 {
         self.written
     }
 
@@ -380,7 +381,9 @@ impl TapeWriter {
         }
     }
 
-    /// A write that failed: said once, and the writer stops.
+    /// A write that failed: said once, and the writer stops. A disk out of
+    /// space or quota is also a sighting the window's disk watch is asked to
+    /// act on ([`crate::harness::disk::poke`]), as the journal's is.
     fn fail(&mut self, e: &std::io::Error, what: &str) {
         self.stopped = Some(Stopped::Failed);
         if crate::harness::disk::poke::is_out_of_space(e) {

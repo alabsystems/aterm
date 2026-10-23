@@ -46,7 +46,7 @@ impl Key {
         }
     }
 
-    fn is_glyph(self) -> bool {
+    const fn is_glyph(self) -> bool {
         matches!(self, Key::Ch(_))
     }
 }

@@ -494,7 +494,9 @@ fn a_light_band_that_leaps_rows_stays_on_the_landing_row() {
     );
 }
 
-/// OVER WIDE GLYPHS A LIGHT BAND KEEPS ITS SHAPE AND HUE, LIGHTER.
+/// OVER WIDE GLYPHS A LIGHT BAND KEEPS ITS SHAPE AND HUE, LIGHTER. A band
+/// fills a wide glyph's whole box (CJK, emoji), the gaps between its strokes
+/// included, where a Latin letter keeps paper above and below its x-height.
 #[test]
 fn light_bands_over_wide_glyphs_keep_their_shape_and_hue_lighter() {
     let g = geom();

@@ -1240,7 +1240,7 @@ const fn past_ceiling(minted: u64, ceiling: u64) -> bool {
 pub(crate) struct TurnIo<'a> {
     /// Deliver the message text into the target's input path with PASTE semantics (control bytes stripped by `format_paste`; bracketed-paste framing only when the app itself enabled the mode).
     pub paste: &'a dyn Fn(&str) -> bool,
-    /// Press a named key (the `key` verb vocabulary, e.g.
+    /// Press a named key (the `key` verb vocabulary, e.g. "enter").
     pub press: &'a dyn Fn(&str) -> bool,
     /// Press one pre-built key event (`turn typed=1`'s per-grapheme press, built by [`typed_key_events`]) through the same route `press` takes.
     pub key: &'a dyn Fn(InputEvent) -> bool,

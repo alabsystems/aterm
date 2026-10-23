@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The colour scheme a program is told (DSR `CSI ? 996 n`, the DEC 2031 push
-//! `CSI ? 997 ; Ps n`) describes the background actually on screen: the host's
-//! baseline (a theme's declared appearance) while the live default background
-//! is the configured one, else the polarity of the background a program set
-//! (OSC 11, OSC 21, a colour-stack pop, a handoff replay) under the chrome's one
-//! classifier, `aterm_messages::ink::bg_is_light`.
-//!
-//! Pushes are coalesced: at most one per process batch or host call, and only
-//! when the net reported scheme changed. Each test carries a negative control.
+//! The colour scheme a program is told (`CSI ? 996 n`, `CSI ? 997 ; Ps n`) follows the background.
 
 use aterm_core::config::{ConfigChange, TerminalConfig};
 use aterm_core::terminal::{ColorSchemeSource, Rgb, Terminal};
@@ -68,7 +60,6 @@ fn dsr_996_answers_the_background_set_in_the_same_batch() {
     assert_eq!(t.color_scheme(), Appearance::Light);
     assert_eq!(t.color_scheme_source(), ColorSchemeSource::Program);
 
-    // NEG: the measurement outranks a light baseline too.
     let mut t = Terminal::new(8, 40);
     t.set_color_scheme(Appearance::Light);
     assert_eq!(reply(&mut t, b"\x1b]11;#101010\x07\x1b[?996n"), PUSH_DARK);
@@ -81,17 +72,13 @@ fn osc11_pushes_once_when_subscribed_and_only_on_change() {
     assert_eq!(reply(&mut t, b"\x1b[?2031h"), b"");
     assert_eq!(reply(&mut t, OSC11_WHITE), PUSH_LIGHT);
 
-    // NEG a: another light background is no change.
     assert_eq!(reply(&mut t, b"\x1b]11;#fefefe\x07"), b"");
 
-    // NEG b: black then white in one batch nets to no change.
     let mut batch = OSC11_BLACK.to_vec();
     batch.extend_from_slice(OSC11_WHITE);
     assert_eq!(reply(&mut t, &batch), b"");
-    // ... while black alone does push.
     assert_eq!(reply(&mut t, OSC11_BLACK), PUSH_DARK);
 
-    // NEG c: without 2031 nothing is pushed, yet DSR 996 still answers live.
     let mut t = Terminal::new(8, 40);
     t.apply_config(&dark_theme());
     assert_eq!(reply(&mut t, OSC11_WHITE), b"");
@@ -112,27 +99,22 @@ fn osc111_returns_to_the_baseline_and_pushes() {
             ColorSchemeSource::Configured,
             "{label:?}"
         );
-        // NEG: a second reset changes nothing and pushes nothing.
         assert_eq!(reply(&mut t, reset), b"", "{label:?}");
     }
 }
 
 #[test]
 fn the_baseline_rules_while_the_background_is_the_configured_one() {
-    // A mid-tone theme declared light, whose background the luma rule may
-    // call dark: the declaration answers while the background is untouched.
     let mid = rgb(0x80, 0x80, 0x80);
     let mut t = Terminal::new(8, 40);
     t.apply_config(&theme(mid, Appearance::Light));
     assert_eq!(dsr(&mut t), PUSH_LIGHT);
     assert_eq!(t.color_scheme_source(), ColorSchemeSource::Configured);
 
-    // An OSC 11 equal to the configured background is no override.
     t.process(b"\x1b]11;#808080\x07");
     assert_eq!(dsr(&mut t), PUSH_LIGHT);
     assert_eq!(t.color_scheme_source(), ColorSchemeSource::Configured);
 
-    // NEG: any other background is measured.
     t.process(b"\x1b]11;#7f7f80\x07");
     assert_eq!(t.color_scheme_source(), ColorSchemeSource::Program);
     let measured = if aterm_messages::ink::bg_is_light([0x7f, 0x7f, 0x80]) {
@@ -160,8 +142,6 @@ fn apply_config_keeps_a_program_background_polarity() {
         assert_eq!(t.color_scheme(), Appearance::Light, "to {name}");
     }
 
-    // NEG: an engine whose background is the theme's follows the theme with
-    // exactly one push and one change.
     let mut t = Terminal::new(8, 40);
     t.apply_config(&dark_theme());
     t.process(b"\x1b[?2031h");
@@ -179,11 +159,9 @@ fn osc111_after_a_theme_switch_lands_on_the_new_baseline() {
     assert_eq!(reply(&mut t, OSC11_WHITE), PUSH_LIGHT);
     t.apply_config(&light_theme());
     let _ = t.take_response();
-    // The new theme is light: returning to it changes nothing the program sees.
     assert_eq!(reply(&mut t, b"\x1b]111\x07"), b"");
     assert_eq!(t.color_scheme_source(), ColorSchemeSource::Configured);
 
-    // NEG: under a dark theme the same reset pushes dark.
     t.apply_config(&dark_theme());
     let _ = t.take_response();
     assert_eq!(reply(&mut t, OSC11_WHITE), PUSH_LIGHT);
@@ -197,7 +175,6 @@ fn a_none_color_scheme_keeps_the_host_baseline() {
     t.apply_config(&TerminalConfig::default());
     assert_eq!(t.color_scheme(), Appearance::Light);
 
-    // NEG: Some moves it.
     t.apply_config(&TerminalConfig {
         color_scheme: Some(Appearance::Dark),
         ..TerminalConfig::default()
@@ -211,12 +188,10 @@ fn ris_returns_to_baseline_without_a_push() {
     t.apply_config(&dark_theme());
     t.process(b"\x1b[?2031h");
     assert_eq!(reply(&mut t, OSC11_WHITE), PUSH_LIGHT);
-    // RIS clears 2031 with the colours: nothing is pushed.
     assert!(!has_997(&reply(&mut t, b"\x1bc")));
     assert_eq!(dsr(&mut t), PUSH_DARK);
     assert_eq!(t.color_scheme_source(), ColorSchemeSource::Configured);
 
-    // The host reset does the same.
     let mut t = Terminal::new(8, 40);
     t.apply_config(&dark_theme());
     t.process(b"\x1b[?2031h");
@@ -225,8 +200,6 @@ fn ris_returns_to_baseline_without_a_push() {
     assert!(!has_997(&t.take_response().unwrap_or_default()));
     assert_eq!(dsr(&mut t), PUSH_DARK);
 
-    // NEG: a soft reset (DECSTR) keeps 2031 and the colours, so no push and the
-    // program's light background still answers.
     let mut t = Terminal::new(8, 40);
     t.apply_config(&dark_theme());
     t.process(b"\x1b[?2031h");
@@ -244,7 +217,6 @@ fn kitty_colour_stack_pop_restores_polarity() {
     assert_eq!(reply(&mut t, OSC11_WHITE), PUSH_LIGHT);
     assert_eq!(reply(&mut t, b"\x1b]30101\x1b\\"), PUSH_DARK);
     assert_eq!(t.color_scheme_source(), ColorSchemeSource::Configured);
-    // NEG: a pop on an empty stack moves nothing.
     assert_eq!(reply(&mut t, b"\x1b]30101\x1b\\"), b"");
 }
 
@@ -253,17 +225,14 @@ fn decscnm_does_not_move_the_reported_scheme() {
     let mut t = Terminal::new(8, 40);
     t.apply_config(&dark_theme());
     t.process(b"\x1b[?2031h");
-    // A visual bell flashes reverse video: no 997 pairs.
     assert_eq!(reply(&mut t, b"\x1b[?5h"), b"");
     assert_eq!(dsr(&mut t), PUSH_DARK);
     assert_eq!(reply(&mut t, b"\x1b[?5l"), b"");
-    // NEG: the background itself does move it.
     assert_eq!(reply(&mut t, OSC11_WHITE), PUSH_LIGHT);
 }
 
 #[test]
 fn handoff_successor_pushes_only_a_stale_view() {
-    // The program kept 2031 and set a light background: it was told light.
     let mut source = Terminal::new(8, 40);
     source.apply_config(&dark_theme());
     source.process(b"\x1b[?2031h");
@@ -276,14 +245,11 @@ fn handoff_successor_pushes_only_a_stale_view() {
     assert!(!has_997(&successor.take_response().unwrap_or_default()));
     assert_eq!(dsr(&mut successor), PUSH_LIGHT);
 
-    // A fresh engine rebuilt from the checkpoint, then given the source's own
-    // config, has nothing new to say.
     let mut rebuilt = Terminal::from_checkpoint(&carried);
     rebuilt.apply_config(&dark_theme());
     assert!(!has_997(&rebuilt.take_response().unwrap_or_default()));
     assert_eq!(rebuilt.color_scheme(), Appearance::Light);
 
-    // NEG: a program told dark, adopted under a light theme, is told once.
     let mut source = Terminal::new(8, 40);
     source.apply_config(&dark_theme());
     source.process(b"\x1b[?2031h");
@@ -294,7 +260,6 @@ fn handoff_successor_pushes_only_a_stale_view() {
     let _ = successor.take_response();
     successor.restore_checkpoint(&carried);
     assert_eq!(successor.take_response().as_deref(), Some(PUSH_LIGHT));
-    // ... and only once.
     assert_eq!(reply(&mut successor, b""), b"");
 }
 
@@ -309,10 +274,8 @@ fn foreground_handback_leaves_the_polarity() {
         handback.bytes.windows(8).any(|w| w == b"\x1b[?2031l"),
         "the handback unsubscribes the dead program"
     );
-    // The light background the program left is still on screen.
     assert_eq!(dsr(&mut t), PUSH_LIGHT);
     assert_eq!(t.color_scheme_source(), ColorSchemeSource::Program);
-    // NEG: with 2031 handed back, the next shell's reset pushes nothing.
     assert_eq!(reply(&mut t, b"\x1b]111\x07"), b"");
     assert_eq!(dsr(&mut t), PUSH_DARK);
 }
@@ -376,8 +339,6 @@ fn a_program_provoked_push_obeys_the_response_policy() {
         "a program alternating backgrounds gets nothing either"
     );
     assert!(!has_997(&reply(&mut t, OSC11_WHITE)));
-    // The latch never moved, so a host-driven change (not gated: the host's
-    // own push) still announces what the program's screen shows.
     t.apply_config(&light_theme());
     assert_eq!(t.take_response().unwrap_or_default(), PUSH_LIGHT);
 }

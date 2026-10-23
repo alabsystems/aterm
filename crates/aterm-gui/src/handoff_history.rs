@@ -738,7 +738,8 @@ pub(crate) fn park_wait(exporting: bool, held_for: Duration) -> Option<&'static 
     (exporting && held_for < EXPORT_PATIENCE).then_some("the scrollback export is still running")
 }
 
-/// A terminal's lock, taken on the export and import workers.
+/// A terminal's lock, taken on the export and import workers. A poisoned
+/// lock's data is still the data.
 fn locked<T>(term: &Mutex<Terminal>, read: impl FnOnce(&mut Terminal) -> T) -> T {
     read(&mut crate::term_lock(term))
 }
@@ -1223,7 +1224,8 @@ impl OpenExport {
         }
     }
 
-    /// Close the sidecar: its event for the exporter.
+    /// Close the sidecar: its event for the exporter. One whose first pass
+    /// had not finished holds no whole history: it is not exported.
     fn close(mut self) -> ExportEvent {
         if self.pass.is_some() {
             return ExportEvent::NotExported {

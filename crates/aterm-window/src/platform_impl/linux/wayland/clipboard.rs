@@ -49,7 +49,9 @@ const MAX_PASTE_BYTES: usize = 16 << 20;
 /// read all fit inside it on a healthy compositor; a hung owner is refused).
 const PASTE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long a copy made OFF the loop thread waits for the loop's verdict.
+/// How long a copy made OFF the loop thread waits for the loop's verdict. The
+/// loop answers from a channel callback, so this is only ever spent when the loop
+/// is wedged — and a caller that waited in vain is told `false`, never `true`.
 const COPY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The two protocol steps a copy takes at the compositor.
@@ -254,7 +256,10 @@ impl WaylandClipboard {
     }
 }
 
-/// The loop's answer to one copy, as the caller's `bool`.
+/// The loop's answer to one copy, as the caller's `bool`. A verdict that never
+/// arrives — the loop died holding the request, or is wedged past [`COPY_TIMEOUT`]
+/// — is NOT success: the one thing this must never do is answer `true` for a copy
+/// nobody can say reached the compositor.
 fn copy_verdict(verdict: &mpsc::Receiver<CopyOutcome>) -> bool {
     match verdict.recv_timeout(COPY_TIMEOUT) {
         Ok(outcome) => outcome.placed(),
@@ -262,7 +267,8 @@ fn copy_verdict(verdict: &mpsc::Receiver<CopyOutcome>) -> bool {
     }
 }
 
-/// Write `bytes` to a requester's pipe on a helper thread.
+/// Write `bytes` to a requester's pipe on a helper thread. Refuse a pipe we
+/// cannot make non-blocking, so a stalled reader cannot park the worker in a write.
 fn write_on_thread(pipe: OwnedFd, bytes: Vec<u8>) {
     if set_nonblocking(&pipe).is_err() {
         return;
@@ -342,7 +348,8 @@ pub(crate) trait SelectionPort {
     /// Offer a fresh source for `selection` and hand it to the seat with `serial`.
     fn claim(&mut self, selection: WaylandSelection, serial: u32) -> bool;
 
-    /// THE COPY.
+    /// THE COPY. One body, for production and for the test, so the order and the
+    /// gate below are not things a call site can get wrong twice.
     fn copy(&mut self, selection: WaylandSelection, serial: u32) -> CopyOutcome {
         if !self.focused() {
             return if self.offers(selection) {
@@ -447,7 +454,10 @@ impl WinitState {
         }
     }
 
-    /// One copy, at the seat that holds this client's newest input serial.
+    /// One copy, at the seat that holds this client's newest input serial. The
+    /// sequence and the gate are [`SelectionPort::copy`]; what is left here is the
+    /// seat pick and what a refusal costs — the own slot, which must not keep
+    /// answering with text the compositor never took.
     fn clipboard_copy(&mut self, selection: WaylandSelection) -> CopyOutcome {
         let Some((seat, serial)) = self.clipboard_seat() else {
             warn!("wayland clipboard: no seat has given this client an input serial yet — {selection:?} copy not offered");
@@ -594,7 +604,9 @@ mod tests {
             self.copy(WaylandSelection::Clipboard, serial)
         }
 
-        /// What another client on the system reads.
+        /// What another client on the system reads. A selection held by a source of
+        /// ours is served LIVE out of the slot — `clipboard_send_request` reads the
+        /// slot when the paste asks, not when the claim was made.
         fn read(&self) -> String {
             match self.selection {
                 Some(_) => self.slot.clone(),

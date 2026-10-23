@@ -107,7 +107,7 @@ pub struct Levels {
 impl Levels {
     /// The flags for `level`.
     #[must_use]
-    pub fn of(&self, level: super::permission::Level) -> &'static [&'static str] {
+    pub const fn of(&self, level: super::permission::Level) -> &'static [&'static str] {
         use super::permission::Level;
         match level {
             Level::Yolo => self.yolo,
@@ -368,7 +368,7 @@ pub fn ids() -> Vec<&'static str> {
 impl Connector {
     /// Whether this connector uses accounts v2 login management.
     #[must_use]
-    pub fn is_claude(&self) -> bool {
+    pub const fn is_claude(&self) -> bool {
         matches!(self.login, Login::Accounts)
     }
 }

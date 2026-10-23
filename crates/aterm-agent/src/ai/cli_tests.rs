@@ -97,7 +97,6 @@ fn aterm_ai_looks_and_runs_nothing() {
 #[test]
 fn the_doctor_signs_in_for_a_person_and_only_looks_for_an_agent() {
     let b = machine(&["codex"]);
-    // An agent: read-only whatever the terminal, and exit 1 for the CLI that needs a person.
     let env = env_of(&b, ONLY_CODEX, &[("CLAUDECODE", "1")], true);
     let runner = FakeRunner::quiet();
     let (code, out, _) = run_cli(&env, &runner, &["doctor"]);
@@ -107,12 +106,10 @@ fn the_doctor_signs_in_for_a_person_and_only_looks_for_an_agent() {
         "{out}"
     );
     assert!(runner.calls().is_empty());
-    // `--read-only`: the same.
     let env = env_of(&b, ONLY_CODEX, &[], true);
     let (code, _, _) = run_cli(&env, &runner, &["doctor", "--read-only"]);
     assert_eq!(code, 1);
     assert!(runner.calls().is_empty());
-    // A person: Codex's own sign-in, then its status, then the look again.
     let home = b.home.clone();
     let runner = FakeRunner::with(move |call| {
         if call.args == ["login", "status"] {
@@ -257,11 +254,9 @@ fn reviews_are_on_for_every_other_cli_at_the_askers_level() {
         out.contains("reviews:    on · codex (when claude asks) · up to 4 per review · 600 s · yolo (inherited from claude)"),
         "{out}"
     );
-    // A person asks: yolo, said so.
     env.asker = Asker::Person;
     let (_, out, _) = run_cli(&env, &FakeRunner::quiet(), &[]);
     assert!(out.contains("yolo (a person asks)"), "{out}");
-    // A pinned level wins over the asker's.
     let pinned = both.replacen("[ai]\n", "[ai]\nreview_permissions = \"plan\"\n", 1);
     let mut env = env_of(&b, &pinned, &[], false);
     env.asker = Asker::Agent("codex", Level::Yolo);
@@ -314,7 +309,6 @@ fn doctor_on_refuses_a_machine_that_is_an_ssh_option() {
 #[test]
 fn a_fleet_poll_signs_in_nowhere_and_survives_any_answer() {
     let b = machine(&["codex"]);
-    // A person's terminal, but --json: a poll, read-only, whatever this machine needs.
     let env = env_of(&b, ONLY_CODEX, &[], true);
     let big = "é".repeat(40 * 1024);
     let runner = FakeRunner::with(move |call| {
@@ -380,7 +374,6 @@ fn a_fleet_poll_signs_in_nowhere_and_survives_any_answer() {
 
 const FLEET_URL: &str = "https://fleet.example/ai-fleet.toml";
 
-/// A machine whose `[ai] fleet` names [`FLEET_URL`] under a new key; the key's secret file.
 fn fleet_machine(b: &Box3) -> (Env, PathBuf, String) {
     let secret = b.dir.path().join("fleet.key");
     let recording = aterm_durable::seam::Recording::start();
@@ -408,7 +401,6 @@ fn fleet_machine(b: &Box3) -> (Env, PathBuf, String) {
     (env_of(b, &config, &[], false), secret, public)
 }
 
-/// Signs `text` as `doc` beside `secret`, and returns (doc bytes, sig bytes).
 fn signed(b: &Box3, env: &Env, secret: &Path, text: &str) -> (Vec<u8>, Vec<u8>) {
     let doc = b.dir.path().join("served.toml");
     std::fs::write(&doc, text).expect("doc");
@@ -490,11 +482,9 @@ fn the_doctor_fetches_a_signed_document_and_the_look_applies_it() {
     );
     net.serve(FLEET_URL, &doc);
     net.serve(&format!("{FLEET_URL}.sig"), &sig);
-    // Not yet fetched: the look says so, and the fleet applies nothing.
     let (_, out, _) = run_net(&env, &FakeRunner::quiet(), &net, &[]);
     assert!(out.contains("refused (not fetched yet)"), "{out}");
     assert!(net.asked().is_empty(), "a look fetches nothing");
-    // The doctor fetches it, verified; the look applies it.
     let (_, out, _) = run_net(&env, &FakeRunner::quiet(), &net, &["doctor", "--read-only"]);
     assert_eq!(net.asked().len(), 2, "{:?}", net.asked());
     assert!(out.contains("120 s"), "{out}");
@@ -506,13 +496,10 @@ fn the_doctor_fetches_a_signed_document_and_the_look_applies_it() {
         )),
         "{out}"
     );
-    // Within six hours the doctor does not ask again; `fleet fetch` does.
     let _ = run_net(&env, &FakeRunner::quiet(), &net, &["doctor", "--read-only"]);
     assert_eq!(net.asked().len(), 2);
     let (code, out, _) = run_net(&env, &FakeRunner::quiet(), &net, &["fleet", "fetch"]);
     assert_eq!((code, out.trim()), (0, "unchanged (seq 1)"));
-    // A server that turns hostile: a document signed by another key is refused, and the held
-    // one stands.
     let (other_doc, _) = (
         b"schema = 1\nseq = 9\nreview_timeout_s = 3600\n".to_vec(),
         (),
@@ -531,7 +518,6 @@ fn the_doctor_fetches_a_signed_document_and_the_look_applies_it() {
     assert!(status.contains("held:       seq 1"), "{status}");
 }
 
-/// A failed kernel observation is not evidence that a person asked.
 #[test]
 fn unreadable_ancestry_never_becomes_a_persons_yolo_review() {
     struct Tree {

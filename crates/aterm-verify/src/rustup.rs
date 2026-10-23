@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! rustup's toolchains, for the STOCK EXCEPTION lanes: the foreign cells
-//! (`verify cells`) and the wasm perf lane. Trust carries only the host std,
-//! so a cross triple is compiled by a rustup toolchain that has its std,
-//! driven by that toolchain's own `cargo` and `rustc` by path. Where rustup
-//! is, and what its listings say, is `aterm_toolchain::rustup`'s one rule.
+//! rustup's toolchains for the STOCK EXCEPTION lanes (`verify cells` and wasm perf).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -28,9 +24,7 @@ pub fn carries(rustup: &Path, name: &str, triple: &str) -> bool {
         })
 }
 
-/// A rustup toolchain resolved to its own drivers by path, never a `cargo`
-/// off PATH trusted to honour `RUSTUP_TOOLCHAIN` (only rustup's proxies read
-/// it). `RUSTC` pins the compiler for cargo and every build script.
+/// A rustup toolchain resolved to its own drivers by path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toolchain {
     pub name: String,
@@ -42,7 +36,6 @@ pub struct Toolchain {
 
 impl Toolchain {
     /// `name`'s drivers, as `rustup which --toolchain` answers them.
-    ///
     /// # Errors
     /// rustup could not be asked, or names no `cargo`/`rustc` for `name`.
     pub fn resolve(rustup: &Path, name: &str) -> Result<Self, String> {
@@ -81,13 +74,7 @@ impl Toolchain {
         cmd
     }
 
-    /// The library search variable a rustup proxy hands the drivers it runs:
-    /// this toolchain's `lib/` first, then what this process inherited. Its
-    /// drivers run by path here, never through a proxy, and stable 1.98's
-    /// `rust-lld` loads `@rpath/libLLVM.dylib` from there alone (its rpath is
-    /// its own `rustlib/<host>/lib` and a CI path), so without it every wasm32
-    /// link dies in dyld. `None` off unix, or when `rustc` stands outside a
-    /// `<toolchain>/bin`.
+    /// The library search variable a rustup proxy hands the drivers it runs.
     #[must_use]
     pub fn loader_env(&self) -> Option<(&'static str, OsString)> {
         let lib = self.rustc.parent()?.parent()?.join("lib");
@@ -136,13 +123,9 @@ fn loader_path(var: &str, lib: &Path, inherited: Option<&OsStr>, home: Option<&O
     path
 }
 
-/// The first installed toolchain carrying `triple`'s std, release channels
-/// before nightly (a nightly accepts what a release refuses): `Ok(None)` when
-/// none does.
-///
+/// The first installed toolchain carrying `triple`'s std (`Ok(None)` when none does).
 /// # Errors
-/// rustup could not list its toolchains, or one that carries the std named
-/// no drivers.
+/// rustup could not list its toolchains, or one that carries the std named no drivers.
 pub fn with_std(rustup: &Path, triple: &str) -> Result<Option<Toolchain>, String> {
     let list = command(rustup)
         .args(["toolchain", "list"])
@@ -163,16 +146,14 @@ pub fn with_std(rustup: &Path, triple: &str) -> Result<Option<Toolchain>, String
         .transpose()
 }
 
-/// The wasm32 clause of `publish/config.sh`'s `CHECK_CMD_DEFAULT` and the stock
-/// channel it names.
+/// The wasm32 clause of `publish/config.sh`'s `CHECK_CMD_DEFAULT` and the stock channel it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmClause {
     pub clause: String,
     pub pin: String,
 }
 
-/// Why `publish/config.sh` names no usable wasm32 pin, and the fix: `ship`'s refusal
-/// words ([`wasm_clause`]).
+/// Why `publish/config.sh` names no usable wasm32 pin, and the fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClauseError {
     pub why: String,
@@ -188,12 +169,9 @@ impl ClauseError {
     }
 }
 
-/// Read the wasm32 clause out of `config` (the engine's own line shape,
-/// `CHECK_CMD_DEFAULT="…"`), with every refusal the stage would meet for it.
-///
+/// Reads the wasm32 clause out of `config` (`CHECK_CMD_DEFAULT="…"`).
 /// # Errors
-/// No clause; no stock channel; no target-add before it; no `RUSTC` naming the pin's
-/// own rustc.
+/// No clause; no stock channel; no target-add before it; no `RUSTC` naming the pin's own rustc.
 pub fn wasm_clause(config: &str) -> Result<WasmClause, ClauseError> {
     let line = config
         .lines()
@@ -255,7 +233,6 @@ pub fn wasm_clause(config: &str) -> Result<WasmClause, ClauseError> {
 }
 
 /// The wasm32 pin `repo`'s `publish/config.sh` names, or why it names none.
-///
 /// # Errors
 /// The file cannot be read, or its clause is refused ([`wasm_clause`]).
 pub fn wasm_pin(repo: &Path) -> Result<String, String> {
@@ -265,11 +242,7 @@ pub fn wasm_pin(repo: &Path) -> Result<String, String> {
         .map(|clause| clause.pin)
 }
 
-/// The wasm32 pin a provisioned machine holds for `repo`: [`wasm_pin`], or `None` where
-/// the tree has no `publish/config.sh` at all. The pin is the release gate's (`pub stage`
-/// type-checks the site's engine on it), and the public snapshot carries no `publish/`
-/// (`publish/manifest.txt`), so a contributor's clone wants none.
-///
+/// The wasm32 pin a provisioned machine holds for `repo`.
 /// # Errors
 /// The file exists and cannot be read, or its clause is refused ([`wasm_clause`]).
 pub fn wasm_pin_wanted(repo: &Path) -> Result<Option<String>, String> {
@@ -294,7 +267,6 @@ mod tests {
             joined(dyld, Some("/a:/b"), Some("/h")),
             "/r/toolchains/stable/lib:/a:/b"
         );
-        // Unset (or empty), dyld's own default stays behind the toolchain's.
         for unset in [None, Some("")] {
             assert_eq!(
                 joined(dyld, unset, Some("/h")),
@@ -341,8 +313,6 @@ mod tests {
 
     #[test]
     fn the_wasm32_clause_is_read_out_of_the_engines_own_line() {
-        // the committed line's shape (publish/config.sh, which the public snapshot
-        // withholds, so it is quoted here rather than read)
         let good = "CHECK_CMD_DEFAULT=\"rustup run trust targo trust check && rustup target add \
                     --toolchain 1.95.0 wasm32-unknown-unknown && sh -c \
                     'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=$(rustup which --toolchain 1.95.0 \

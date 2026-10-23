@@ -77,7 +77,7 @@ pub enum Missing {
 impl Missing {
     /// The closed word.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Missing::UsageTapOff => "usage-tap-off",
             Missing::TapOtherHome => "tap-not-this-home",

@@ -492,7 +492,7 @@ const H0: u32 = 131;
 const W1: u32 = 190;
 const H1: u32 = 203;
 
-/// The script: a whole present.
+/// The script: whole and damaged presents, resizes, and the two refusals.
 fn script() -> Vec<Step> {
     let frame = |paint: Vec<DamageRect>, seed, commit| Step::Frame {
         paint,

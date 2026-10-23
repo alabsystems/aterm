@@ -64,7 +64,8 @@ fn settings_provider(auto_apply: bool) -> crate::CheckSettingsProvider {
     })
 }
 
-/// A request's provider over settings that cannot be read grants nothing.
+/// A request's provider over settings that cannot be read grants nothing. (Every
+/// requested x current combination is the model test's binding.)
 #[test]
 fn a_request_over_unreadable_settings_has_no_apply_authority() {
     let unavailable: crate::CheckSettingsProvider = std::sync::Arc::new(|| None);
@@ -1725,7 +1726,9 @@ fn a_trial_no_rollback_can_be_taken_from_ends_and_the_copy_updates_again() {
     }
 }
 
-/// A KEPT COPY NO ROLLBACK COULD TAKE IS NEVER INHERITED.
+/// A KEPT COPY NO ROLLBACK COULD TAKE IS NEVER INHERITED. A session confirmed 11 and
+/// a window of it crashed, so 12 would keep 11's rollback target, 10 — but 10's kept
+/// copy is spoiled ([`SPOILED_COPIES`]), so 12 takes 11 instead.
 #[test]
 fn a_kept_copy_no_rollback_could_take_is_never_inherited() {
     for way in SPOILED_COPIES {
@@ -2737,7 +2740,8 @@ fn another_aterm_holds_the_lock(f: &Fixture) -> aterm_update_core::FileLock {
     aterm_update_core::FileLock::acquire(&f.context.dir.join("lock")).unwrap()
 }
 
-/// A window of a settled install starts without the update lock or a hash.
+/// A window of a settled install starts without the update lock or a hash. Negative
+/// control: a trial whose window lane still owes its verdict is counted under the lock.
 #[test]
 fn a_window_of_a_settled_install_starts_without_the_lock_or_a_hash() {
     let commit = "b".repeat(40);
@@ -3134,7 +3138,9 @@ fn install_half(title: &str) -> bool {
     title == crate::INSTALL_CRASH_LOOP_TITLE || crate::health_failing_class(title) == Some("apply")
 }
 
-/// A CRASH-LOOP ROLLBACK THIS LOOP SEES HAPPEN IS SAID (U21).
+/// A CRASH-LOOP ROLLBACK THIS LOOP SEES HAPPEN IS SAID (U21). The person keeps the old
+/// window, whose loop installed the release; the new build's starts crash and the copy
+/// rolls it back.
 #[test]
 fn a_crash_loop_rollback_the_loop_sees_is_said() {
     let mut f = Fixture::new();
@@ -3160,7 +3166,10 @@ fn a_crash_loop_rollback_the_loop_sees_is_said() {
     );
 }
 
-/// THE START-WAIT IS NO INSTALL FAILURE (the review of , U21).
+/// THE START-WAIT IS NO INSTALL FAILURE (the review of , U21). Linux never
+/// starts an installed executable in a running aterm, so an automatic install (`auto_apply`
+/// and automatic checks, both on by default) waits for the next aterm a person starts as
+/// a matter of course.
 #[test]
 fn a_start_wait_past_its_hour_is_said_as_no_failure() {
     let mut f = Fixture::new();
@@ -3206,7 +3215,10 @@ fn a_rollback_after_a_said_wait_is_said_as_the_install_failure() {
     );
 }
 
-/// A ROLLBACK A PERSON ASKED FOR IS NO INSTALL FAILURE (the review of U21).
+/// A ROLLBACK A PERSON ASKED FOR IS NO INSTALL FAILURE (the review of U21). `aterm update
+/// rollback` of a build that started and was confirmed healthy was told to every open
+/// window as "Couldn't install updates": the loop took any rollback it saw for a crash
+/// loop's.
 #[test]
 fn a_rollback_a_person_asked_for_is_said_as_no_install_failure() {
     let mut f = Fixture::new();
@@ -3233,7 +3245,9 @@ fn a_rollback_a_person_asked_for_is_said_as_no_install_failure() {
     );
 }
 
-/// THE WAIT'S WORDS COUNT THE STARTS (the review of U21).
+/// THE WAIT'S WORDS COUNT THE STARTS (the review of U21). A start that began and never
+/// finished (a window that never painted, a session that never prompted) is counted on
+/// the trial, and the wait said "has not started yet" over it.
 #[test]
 fn a_wait_over_a_start_that_never_finished_does_not_say_none_began() {
     let mut f = Fixture::new();

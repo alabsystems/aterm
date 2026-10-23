@@ -222,7 +222,10 @@ mod desktop {
     /// GNOME's own key, read where no portal answers.
     const GNOME_SCHEMA: &str = "org.gnome.desktop.interface";
 
-    /// How long one read may take.
+    /// How long one read may take. The launch read runs on the main thread
+    /// before the first window, so it is bounded well under a visible delay;
+    /// a slower desktop answers "unknown" and the engine default stands until
+    /// the watcher's own read lands.
     const READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
 
     /// How long the watcher's portal read may take, on its own thread: `gdbus`'s
@@ -475,6 +478,9 @@ mod mac {
     const KEY_PATH: &str = "effectiveAppearance";
 
     /// The appearance a `-bestMatchFromAppearancesWithNames:` answer names:
+    /// dark for `NSAppearanceNameDarkAqua`, light for anything else it picked
+    /// (only Aqua is offered), `None` for no match.
+    ///
     /// # Safety
     /// `best` must be nil or a live `NSString`.
     unsafe fn appearance_of_best_match(best: Id) -> Option<Appearance> {
@@ -571,7 +577,9 @@ mod mac {
             const NAME: &str = "ATermOsAppearanceTarget";
             type Ivars = OsAppearanceIvars;
 
-            /// `v@:@@@^v`.
+            /// `v@:@@@^v`. Registered for one key path on one object, so
+            /// every call is an appearance change; options are 0, so `change`
+            /// is not read.
             @sel(observeValueForKeyPath:ofObject:change:context:)
             fn observe_value(
                 &self,

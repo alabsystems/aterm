@@ -18,10 +18,14 @@ struct DispatchObjectS {
 
 // SAFETY: `_dispatch_main_q` and `dispatch_sync_f` are provided by libSystem.
 unsafe extern "C" {
-    /// The main queue.
+    /// The main queue. `dispatch_get_main_queue()` is a header inline that
+    /// evaluates to `&_dispatch_main_q`, so the address is the queue.
     static _dispatch_main_q: DispatchObjectS;
 
-    /// `dispatch_sync_f(queue, context, work)` — the function-pointer form.
+    /// `dispatch_sync_f(queue, context, work)` — the function-pointer form. A
+    /// block would need `_Block_copy` and [`crate::RcBlock`]'s `Fn + 'static`
+    /// bound; this allocates nothing and, being synchronous, lets the context
+    /// be a local of the calling frame.
     fn dispatch_sync_f(
         queue: *const DispatchObjectS,
         context: *mut c_void,
@@ -29,7 +33,9 @@ unsafe extern "C" {
     );
 }
 
-/// The slot the trampoline and the caller share for one call.
+/// The slot the trampoline and the caller share for one call. Both fields are
+/// `Option` so the trampoline can move the closure out and the result in, and
+/// so "never ran" is distinguishable from "ran".
 struct Job<F, R> {
     /// Taken by the trampoline. `None` afterwards.
     f: Option<F>,
@@ -57,6 +63,9 @@ impl std::fmt::Display for ContainedInRunOnMain {
 }
 
 /// What the main queue runs. `extern "C"`, so it must not unwind: a Rust panic
+/// is caught and carried back as data, and an `NSException` is contained and
+/// carried back the same way.
+///
 /// # Safety
 /// `ctx` must be the address of a live `Job<F, R>` whose `f` is `Some`, and the
 /// caller must be blocked on `dispatch_sync_f` for the whole call, which makes

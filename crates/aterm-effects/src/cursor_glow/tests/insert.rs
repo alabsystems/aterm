@@ -302,7 +302,9 @@ fn the_placeholder_rewrite_retracts_the_ribbon_to_the_new_caret_like_a_kill() {
     );
 }
 
-/// The rewrite re-witnesses its row.
+/// The rewrite re-witnesses its row. The content witness retires a
+/// resident cell whose recorded glyph changed, and `[Image #1] ` is
+/// different text over the insert's first eleven cells.
 #[test]
 fn the_placeholder_rewrite_re_witnesses_its_row_and_keeps_the_ribbon_whole() {
     let g = geom();

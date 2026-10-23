@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The admission census (`targo --unverified lab abrew-admission`, design §3):
-//! abrew's own pre-lock admission, the check `install`, `upgrade`,
-//! `reinstall` and a Brewfile pass before the writer lock
-//! ([`install::preflight_refusals`], whose first is
-//! [`install::preflight_plan`]'s verdict, for a formula; [`cask::preflight`]
-//! then [`cask::preflight_deps`] for a cask), run over Homebrew's full formula and
-//! cask indexes for a modelled [`Machine`] and an empty prefix. It runs the
-//! code that decides, so nothing has to be kept in step with it. The gates
-//! only a real install reaches (the archive's contents, the linkage scan,
-//! wrapper staging) are not counted.
+//! Pre-lock admission census over Homebrew's formula and cask indexes (`lab abrew-admission`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -29,13 +20,7 @@ pub struct Tally {
     pub admitted: Vec<String>,
     /// How many packages were refused.
     pub refused: usize,
-    /// Refusal → (packages it refuses, packages it alone refuses). A
-    /// package's own checks stop at their first refusal; a closure counts
-    /// every member's, so a dependency met after another refusing one is
-    /// counted too, except that a refusal of the walk itself (a cycle, a
-    /// disabled or unknown dependency) ends it and counts alone. The refused
-    /// package's own name is spelled `<name>`, so one reason counts once
-    /// across packages.
+    /// Map from masked refusal reason to `(packages_refused, refused_solely_by_this)`.
     pub refusals: BTreeMap<String, (usize, usize)>,
 }
 
@@ -83,9 +68,7 @@ pub struct Census {
     pub formulae: usize,
     /// Each formula on its own (`install --ignore-dependencies`).
     pub solo: Tally,
-    /// Each formula with its runtime closure (`install`). Only a formula
-    /// admitted on its own can be, so the refusals are those of the solo
-    /// admitted: each names a dependency that delegates.
+    /// Each formula admitted solo, judged with its runtime closure (`install`).
     pub closure: Tally,
     /// Cask records in the index.
     pub casks: usize,
@@ -124,8 +107,7 @@ impl Catalog for Index<'_> {
     }
 }
 
-/// Judge every record of `formula.json` and `cask.json` (their bytes) for
-/// `machine`.
+/// Judge every record of `formula_index` and `cask_index` for `machine`.
 pub fn measure(
     formula_index: &[u8],
     cask_index: &[u8],
@@ -162,8 +144,6 @@ pub fn measure(
             .zip(&cask_records)
             .collect(),
     };
-    // Admission reads the installed state of the prefix it judges for: an
-    // empty one here, in a private directory nothing creates it in.
     let scratch = aterm_tempfile::tempdir().map_err(|e| format!("abrew: census scratch: {e}"))?;
     let prefix = Prefix::at(&scratch.path().join("prefix"));
     let mut census = Census {
@@ -247,9 +227,7 @@ fn percent(part: usize, whole: usize) -> f64 {
 }
 
 impl Census {
-    /// The report: the totals, each followed by its ten most common
-    /// refusals, with how many of those packages it alone refuses where that
-    /// differs (a closure with several refusing members).
+    /// Format the admission totals and top ten refusals for each category as text.
     #[must_use]
     pub fn text(&self) -> String {
         let mut out = format!(
@@ -291,8 +269,7 @@ impl Census {
         out
     }
 
-    /// The whole census, every refusal included (`[refusal, packages,
-    /// alone]`), as one JSON document.
+    /// Serialize the full census and ranked refusals as a JSON document.
     #[must_use]
     pub fn json(&self) -> Value {
         aterm_json::json!({
@@ -422,8 +399,6 @@ mod tests {
             ])
         );
         assert_eq!(census.closure.admitted, ["zlib-ng", "tool"]);
-        // `client`'s closure meets openssl first and libgit after it: both
-        // are counted, and openssl alone refuses only `curl-ish`'s.
         assert_eq!(
             census.closure.refusals,
             BTreeMap::from([
@@ -437,7 +412,6 @@ mod tests {
                 ),
             ])
         );
-        // Every solo admission is either closure-admitted or closure-refused.
         assert_eq!(
             census.solo.admitted.len(),
             census.closure.admitted.len() + census.closure.refused
@@ -515,7 +489,6 @@ mod tests {
                 .refusals
                 .contains_key("<name> needs a newer macOS")
         );
-        // Casks judge the same machine.
         assert_eq!(big_sur.cask.admitted, ["zipped", "imaged"]);
         assert_eq!(
             big_sur.cask.refusals["cask <name> needs macOS >= 14"],

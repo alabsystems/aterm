@@ -386,7 +386,8 @@ fn released_by(
     finish_release(ctx, proven, revision, alive, copy).then_some(alive)
 }
 
-/// Commit the final live read only at the release that admitted it.
+/// Commit the final live read only at the release that admitted it. The meta
+/// guard also excludes earlier refreshes until the keep/remove decision ends.
 fn finish_release(
     ctx: &crate::SessionCtx,
     proven: &Proven,

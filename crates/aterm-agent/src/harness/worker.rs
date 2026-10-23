@@ -60,7 +60,7 @@ pub struct WorkerCli {
 
 /// No flag of a starter's rides: Claude Code (whose relaunch reads none) and
 /// Gemini CLI (whose homes are its environment's).
-fn no_flags(_: &[String]) -> Result<Vec<String>, String> {
+const fn no_flags(_: &[String]) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 

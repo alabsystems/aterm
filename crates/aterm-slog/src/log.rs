@@ -678,7 +678,9 @@ impl IdCounters {
     }
 }
 
-/// A live record and its encoded size.
+/// A live record and its encoded size. The record is shared with every
+/// reader that kept it ([`Log::read_shared`]); it never changes once
+/// appended.
 #[derive(Clone, Debug)]
 struct Entry {
     rec: Arc<Rec>,

@@ -12,7 +12,9 @@ use crate::{
     halo_weight, over_rgb, premul_rgb,
 };
 
-/// The band geometry a spill buffer was laid out for.
+/// The band geometry a spill buffer was laid out for. `pad_top` is explicit because
+/// moving only the asymmetric grid origin keeps the frame size but changes every
+/// horizontal strip split.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct SpillGeom {
     pad: usize,
@@ -227,7 +229,8 @@ pub struct SpillBand {
     /// derived default includes them and the byte-parity law holds out of the box).
     veils_excluded: bool,
     rev: u32,
-    /// The exported straight-alpha RGBA strips (packed as `SpillGeom::strips`).
+    /// The exported straight-alpha RGBA strips (packed as `SpillGeom::strips`). The
+    /// allocation moves only on a geometry change: the host's pointer-stability contract.
     rgba: Vec<u8>,
     /// This update's dirty rects, packed `x,y,w,h` frame-absolute device px.
     rects: Vec<i32>,
@@ -247,7 +250,9 @@ struct BandStreams {
     fire: Vec<FirePatch>,
     glow: Vec<GlowQuad>,
     halo: Vec<RainHalo>,
-    /// The fx layers whose extent reaches the band, in frame order.
+    /// The fx layers whose extent reaches the band, in frame order. Compared
+    /// by identity (the content `Arc`), and held, so a settled card costs a
+    /// pointer compare and a freed content can never alias a new one.
     fx: Vec<FxLayer>,
     /// The occluders reaching the band, kept only while `fx` is not empty
     /// (an occluder only cuts layers).

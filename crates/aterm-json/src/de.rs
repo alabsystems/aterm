@@ -63,7 +63,8 @@ impl<'de> Deserializer<'de> {
         self.pos = self.pos.saturating_add(1);
     }
 
-    /// Skip RFC 8259 whitespace: space, tab, newline, carriage return.
+    /// Skip RFC 8259 whitespace: space, tab, newline, carriage return. Nothing
+    /// else — a JSON comment is not whitespace, and neither is a form feed.
     #[inline]
     fn skip_ws(&mut self) {
         while let Some(byte) = self.peek() {

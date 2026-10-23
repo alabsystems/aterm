@@ -76,7 +76,8 @@ const CERTIFICATE_DIRS: &[&str] = &["/var/ssl/certs"];
 )))]
 const CERTIFICATE_DIRS: &[&str] = &["/etc/ssl/certs"];
 
-/// The bundle file to read, if any.
+/// The bundle file to read, if any. `configured` is `$SSL_CERT_FILE`, passed in
+/// so the tests need not mutate the process environment.
 fn bundle_file(configured: Option<PathBuf>) -> Option<PathBuf> {
     if configured.is_some() {
         // missing.
@@ -88,7 +89,9 @@ fn bundle_file(configured: Option<PathBuf>) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-/// Every hash directory to scan.
+/// Every hash directory to scan. `configured` is `$SSL_CERT_DIR`, a
+/// `:`-separated list that replaces the built-in one; an empty or missing entry
+/// contributes nothing.
 fn bundle_dirs(configured: Option<PathBuf>) -> Vec<PathBuf> {
     if let Some(configured) = configured {
         return std::env::split_paths(&configured)

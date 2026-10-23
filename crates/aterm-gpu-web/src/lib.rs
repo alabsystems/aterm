@@ -262,7 +262,9 @@ impl AtermGpuTerminal {
         Some(key)
     }
 
-    /// Record the frame `build_frame` just produced as the one on glass.
+    /// Record the frame `build_frame` just produced as the one on glass. The
+    /// epoch in `key` was latched before `take_damage`, which re-arms but never
+    /// changes the epoch value, so an idle successor matches.
     #[inline]
     const fn record_presented_frame(&mut self, key: FrameGateKey) {
         self.last_frame_key = Some(key);
@@ -1421,7 +1423,8 @@ mod tests {
 
     use super::*;
 
-    /// The bundled face, injected as a JS host would.
+    /// The bundled face, injected as a JS host would. Paste tests use it so a
+    /// security property is never skipped on a box with no system font.
     const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
     /// A link's columns and text come from the cells it is drawn in, whatever
@@ -2023,7 +2026,8 @@ mod tests {
         assert_eq!((bad.incomplete(), bad.match_count()), (false, 0));
     }
 
-    /// Reject an oversized frame before constructing or changing a grid.
+    /// Reject an oversized frame before constructing or changing a grid. Existing
+    /// text, presentation state and pixels survive refused resize, chrome and zoom.
     #[test]
     fn oversized_frames_are_refused_before_state_changes() {
         let new = |rows, cols| {

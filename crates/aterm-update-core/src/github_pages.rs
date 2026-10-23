@@ -41,7 +41,8 @@ pub fn page(
 /// Fetches all pages of the collection at `base` using `get`, validating links against `api`.
 ///
 /// # Errors
-/// A page `get` could not read whole, or a collection whose pages disagree.
+/// A page `get` could not read whole, a page that is not an array or holds more than `per_page`, a
+/// collection whose pages disagree, or more than `MAX_PAGES` pages.
 pub fn all(
     api: &str,
     base: &str,

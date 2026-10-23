@@ -7,9 +7,7 @@
 // and rewritten by the aterm project in 2026 over this crate's codec: the
 // property bytes in and out, no connection.
 
-//! ICCCM properties (section 4.1.2): `WM_CLASS`, `WM_NORMAL_HINTS`
-//! (`WM_SIZE_HINTS`) and `WM_HINTS`, encoded as x11rb encoded them and read
-//! as it read them, short legacy forms included.
+//! ICCCM `WM_CLASS`, `WM_NORMAL_HINTS`, and `WM_HINTS` properties.
 
 use crate::proto::xproto::{GetPropertyReply, PropMode, change_property};
 use crate::proto::{Atom, ParseError, Pixmap, Reader, Request, Void, Window, atom};
@@ -50,8 +48,7 @@ pub struct WmClass {
 }
 
 impl WmClass {
-    /// Read a `WM_CLASS` property: `None` when it is absent, an error when it
-    /// is not 8-bit `STRING` data.
+    /// Read a `WM_CLASS` property.
     pub fn from_reply(reply: &GetPropertyReply) -> Result<Option<WmClass>, ParseError> {
         if reply.type_ == atom::ANY {
             return Ok(None);
@@ -78,7 +75,7 @@ impl WmClass {
         }))
     }
 
-    /// The ChangeProperty that sets it: `instance\0class\0`.
+    /// The ChangeProperty that sets it.
     pub fn set(&self, window: Window) -> Request<Void> {
         let mut data = Vec::with_capacity(self.instance.len() + self.class.len() + 2);
         data.extend_from_slice(&self.instance);
@@ -138,8 +135,6 @@ impl WmSizeHints {
         let max_size = flagged(flags, P_MAX_SIZE, pair(&mut r)?);
         let size_increment = flagged(flags, P_RESIZE_INC, pair(&mut r)?);
         let aspect = flagged(flags, P_ASPECT, (pair(&mut r)?, pair(&mut r)?));
-        // A pre-ICCCM-1 property stops after the aspect: its base size is
-        // the minimum and its gravity NorthWest, as Xlib reads it.
         let (base_size, win_gravity) = if value.len() <= 60 {
             (min_size, Some(GRAVITY_NORTH_WEST))
         } else {
@@ -173,7 +168,7 @@ impl WmSizeHints {
         })
     }
 
-    /// Read a `WM_SIZE_HINTS` property: `None` when it is absent.
+    /// Read a `WM_SIZE_HINTS` property.
     pub fn from_reply(reply: &GetPropertyReply) -> Result<Option<WmSizeHints>, ParseError> {
         if reply.type_ == atom::ANY {
             return Ok(None);
@@ -271,7 +266,6 @@ impl WmHints {
         let icon_window = flagged(flags, HINT_ICON_WINDOW, r.u32()?);
         let icon_position = flagged(flags, HINT_ICON_POSITION, pair(&mut r)?);
         let icon_mask = flagged(flags, HINT_ICON_MASK, r.u32()?);
-        // Pre-ICCCM-1 properties stop before the window group.
         let window_group = if value.len() <= 32 {
             None
         } else {
@@ -295,7 +289,7 @@ impl WmHints {
         })
     }
 
-    /// Read a `WM_HINTS` property: `None` when it is absent.
+    /// Read a `WM_HINTS` property.
     pub fn from_reply(reply: &GetPropertyReply) -> Result<Option<WmHints>, ParseError> {
         if reply.type_ == atom::ANY {
             return Ok(None);

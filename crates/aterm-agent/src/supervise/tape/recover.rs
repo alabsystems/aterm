@@ -509,7 +509,7 @@ struct Reader {
 
 impl Reader {
     /// `bytes` more held, or the read is past its limit.
-    fn hold(&mut self, bytes: usize) -> Result<(), Why> {
+    const fn hold(&mut self, bytes: usize) -> Result<(), Why> {
         self.held = self.held.saturating_add(bytes);
         if self.held > self.limit {
             return Err(Why::TooLarge { limit: self.limit });
@@ -550,7 +550,7 @@ impl Reader {
 }
 
 /// The bytes `item` holds in memory: itself and everything it owns.
-fn held_by(item: &Item) -> usize {
+const fn held_by(item: &Item) -> usize {
     let owned = match item {
         Item::Effect { record, .. } => match record {
             EffectRecord::Clock(_) | EffectRecord::Rand(_) | EffectRecord::Mono(_) => 0,

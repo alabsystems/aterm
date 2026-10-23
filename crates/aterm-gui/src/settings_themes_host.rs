@@ -152,6 +152,8 @@ pub(crate) fn trash_from(
     }
 }
 
+/// The live mover: the system's trash tool where it has one (macOS ships
+/// it), else a `.trash` folder beside the themes, which the catalog does not
 /// read. Either way the file can be put back.
 fn move_to_trash(file: &std::path::Path) -> Result<(), String> {
     if crate::consent_retire::trash_tool_present() {
@@ -235,6 +237,8 @@ pub(crate) fn save_into(dir: &std::path::Path, id: &str, text: &str) -> ThemesOu
     }
 }
 
+/// The file behind catalog id `id` in `dir`, when it is a regular file there.
+/// An id that is not a valid theme name (an unreadable row's lossy spelling)
 /// names no file.
 fn theme_file(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
     aterm_types::scheme::validate_user_theme_name(id).ok()?;
@@ -326,6 +330,7 @@ mod tests {
         dir
     }
 
+    /// Only a valid id that names a regular file in the folder resolves; a
     /// traversal spelling or a missing file names nothing.
     #[test]
     fn theme_file_resolves_only_a_regular_file_by_a_valid_id() {
@@ -338,6 +343,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Save as theme writes a file the catalog admits under that id, never
+    /// over an existing theme, and refuses a built-in's name or a bad id
     /// before writing anything.
     #[test]
     fn save_writes_a_new_theme_once_and_refuses_bad_names() {
@@ -378,6 +385,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Trash moves a theme of the person's own out of the folder (the catalog
+    /// no longer lists it), and refuses a built-in's name, a missing file and
     /// a symlink without calling the mover.
     #[test]
     fn trash_moves_only_a_regular_theme_file_of_the_persons_own() {
@@ -418,6 +427,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A HEADLESS INSTANCE'S REACHES STOP AT ITS THEMES FOLDER: its Trash
+    /// moves the file into the `.trash` folder beside the themes (the
+    /// catalog no longer lists it, the bytes are still there), and Open and
+    /// Import say they are not done here, the folder untouched. Negative
+    /// control: a windowed instance gets the live arms — the system Trash,
     /// the platform's open and its picker.
     #[test]
     fn a_headless_instance_trashes_into_its_own_folder_and_opens_nothing() {
@@ -501,6 +515,7 @@ mod tests {
         files
     }
 
+    /// The window's import writes a new theme the catalog then lists, and
     /// a second import of the same file refuses instead of overwriting.
     #[test]
     fn import_writes_a_theme_the_catalog_lists_and_never_overwrites() {
@@ -524,6 +539,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A community add installs the pack's file; again it is already there
+    /// (still added); an unknown id or an edited file of that name fails
     /// and leaves the file alone.
     #[test]
     fn add_pack_installs_once_and_keeps_an_edited_file() {
@@ -549,6 +566,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every pack theme, installed, loads through the catalog the window
+    /// reads, as exactly the colours its file holds. Negative control: a
     /// broken copy beside them is listed, not loaded, with its reason.
     #[test]
     fn pack_themes_load_through_the_catalog() {

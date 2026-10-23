@@ -20,7 +20,9 @@ pub(super) fn link_modifier() -> aterm_window::keyboard::ModifiersState {
     }
 }
 
-/// The group the fixture's shell leads in front of its PTY.
+/// The group the fixture's shell leads in front of its PTY. No process leads
+/// it, so no OS cwd stands in front of the OSC 7; it is also never a real fd
+/// (the fixture's master carries it, below).
 const SHELL: i32 = i32::MAX - 1;
 
 /// Put `program` in front of `wid`'s front session as group `pgid`: the PTY's
@@ -238,7 +240,11 @@ fn feed(app: &App, wid: WindowId, bytes: &[u8]) {
     term_lock(&term).process(bytes);
 }
 
-/// The press opens only what the DRAWN caption named.
+/// The press opens only what the DRAWN caption named. The session's
+/// directory moves under a still pointer (an OSC 7, no output, no frame): the
+/// caption drawn still names the first project's `src/foo.rs`, a fresh
+/// resolution names the second's, and that press opens nothing; the caption
+/// is asked again.
 #[test]
 fn a_press_opens_only_the_file_the_drawn_caption_named() {
     let (mut app, wid, _dir, root) = app_with("error: src/foo.rs:3:2 here");
@@ -704,7 +710,9 @@ fn a_scripted_modifier_ends_at_the_persons_next_input() {
     assert_eq!(app.windows[&wid].mods, M::ALT);
 }
 
-/// A composed or captured caption is not a present receipt.
+/// A composed or captured caption is not a present receipt. The helper is
+/// the one the shipping present wrapper uses; these are captured outcomes,
+/// with no App, render target, capture, or display involved.
 #[test]
 fn only_an_accepted_present_changes_the_caption_a_press_may_open() {
     use crate::app_mouse::{CaptionNames, ShownCaption, commit_presented_caption};

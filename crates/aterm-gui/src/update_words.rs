@@ -699,7 +699,9 @@ pub(crate) fn layout_folded(fold: &crate::restore::LayoutFold) -> Option<Message
 /// The supersede key of the folded-desk record: one per update.
 pub(crate) const KEY_LAYOUT_FOLDED: &str = "update.layout-folded";
 
-/// How many lost drafts the row spells out, each on its own line.
+/// How many lost drafts the row spells out, each on its own line. Far above
+/// what a real update loses (only a Settings row the new build no longer has
+/// loses its draft); the rest are counted.
 const SETTINGS_DRAFTS_SHOWN: usize = 16;
 
 /// An update carried unsaved Settings text across and the new build could not reopen some of it.

@@ -360,7 +360,7 @@ pub fn owner_strays(lsof_fn: &str, homes: &[String], allowed: &[String]) -> Vec<
 
 /// Evaluates the stray-file check across `strays`, `pids`, and `observed` ([`owner_strays`]).
 #[must_use]
-pub fn strays_verdict(strays: &[String], pids: &[i32], observed: bool) -> Verdict {
+pub const fn strays_verdict(strays: &[String], pids: &[i32], observed: bool) -> Verdict {
     if !strays.is_empty() {
         Verdict::Fail
     } else if pids.is_empty() || !observed {

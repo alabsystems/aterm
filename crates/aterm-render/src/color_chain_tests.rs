@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The colour-emoji chain ([`Renderer::color_pick`]): a code point the head face lacks
-//! draws from the next face that has it, a face behind the head loads only when a code
-//! point needs it, and a colour key names its face, so two faces' glyph ids never share a
-//! cache or atlas entry.
-//!
-//! The faces are the checked-in COLRv1 test font (`tests/fixtures/colr_1.ttf`), never the
-//! host's. The HEAD is the font as shipped, which maps only Supplementary Private Use code
-//! points. The NEXT face is the same font with its first cmap group (U+F0100..U+F0103)
-//! moved to U+1FAE8, 🫨 (Emoji 15, which the Twemoji Mozilla a user may install lacks), and
-//! its palette inverted: both faces carry the same glyph ids, drawn in different colours.
+//! Tests for the colour-emoji fallback chain ([`Renderer::color_pick`]).
 
 use crate::{GlyphClass, GlyphImage, GlyphKey, Renderer, Theme, color_face_draws};
 
@@ -54,9 +45,7 @@ fn next_face() -> Vec<u8> {
         let to = SHAKING as u32;
         font[group..group + 4].copy_from_slice(&to.to_be_bytes());
         font[group + 4..group + 8].copy_from_slice(&(to + (end - start)).to_be_bytes());
-        // The fixture's otherwise-unused final PUA group starts with glyph 1,
-        // its empty, zero-advance glyph. Map ZWJ explicitly: CoreText may cascade
-        // an unmapped joiner, which the production same-face shaper must refuse.
+        // Map ZWJ to glyph 1 (empty, zero-advance) so same-face shaping succeeds without cascade.
         let groups = group..group + 12 * be32(&font, subtable + 12) as usize;
         let last = groups.end - 12;
         assert_eq!(
@@ -70,7 +59,6 @@ fn next_face() -> Vec<u8> {
         );
         font[last..last + 4].copy_from_slice(&0x200Du32.to_be_bytes());
         font[last + 4..last + 8].copy_from_slice(&0x200Du32.to_be_bytes());
-        // ZWJ precedes the remapped emoji and all remaining PUA groups.
         font[groups].rotate_right(12);
         moved += 1;
     }
@@ -209,7 +197,6 @@ fn a_point_the_head_lacks_draws_from_the_next_face_that_has_it() {
         "a point the head draws loads the head alone"
     );
 
-    // The ordinary dispatch: 🫨 wants emoji presentation and no text face has it.
     let key = r.glyph_key(SHAKING);
     assert_eq!(
         key,
@@ -231,7 +218,6 @@ fn a_point_the_head_lacks_draws_from_the_next_face_that_has_it() {
     );
     assert_eq!(r.glyph_key_emoji(SHAKING), key, "the VS16 dispatch agrees");
 
-    // A point both faces draw stays with the head, in the head's colours.
     let head_image = r.glyph_image(shared).bytes().to_vec();
     assert_eq!(head_image, solo(COLR, shared));
     assert_ne!(
@@ -240,8 +226,6 @@ fn a_point_the_head_lacks_draws_from_the_next_face_that_has_it() {
         "precondition: the faces' palettes differ"
     );
 
-    // The seal admits the whole chain, and the sealed generation and its rebuild (a zoom)
-    // still draw 🫨 from the next face.
     let mut sealed = faces.renderer();
     sealed.seal_admitted_font_sources();
     assert_eq!(sealed.admitted_font_sources().emoji.len(), 2);
@@ -289,7 +273,6 @@ fn two_faces_glyph_ids_are_different_keys_and_images() {
         "each key draws its own face's glyph"
     );
 
-    // 🫨 ZWJ 🫨: only the next face has the members, so it shapes the cluster.
     let cluster = "\u{1FAE8}\u{200D}\u{1FAE8}";
     let key = r
         .glyph_key_cluster(cluster)
@@ -330,8 +313,6 @@ fn an_injected_face_heads_the_chain_and_discovery_stays_behind_it() {
         "discovery fills its gaps"
     );
 
-    // Injecting the next face's bytes replaces the old injection, and takes the place of
-    // the discovered copy of the same bytes.
     r.set_color_font_bytes(faces.next_bytes.clone())
         .expect("face parses");
     assert_eq!(

@@ -10,7 +10,8 @@ use core::convert::TryFrom;
 use crate::GlyphId;
 use crate::parser::{LazyArray16, Stream};
 
-/// A [format 6](https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-6-trimmed-table-mapping)
+/// A [format
+/// 6](https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-6-trimmed-table-mapping)
 /// subtable.
 #[derive(Clone, Copy, Debug)]
 pub struct Subtable6<'a> {
@@ -37,10 +38,7 @@ impl<'a> Subtable6<'a> {
     }
 
     /// Returns a glyph index for a code point.
-    ///
-    /// Returns `None` when `code_point` is larger than `u16`.
     pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
-        // This subtable supports code points only in a u16 range.
         let code_point = u16::try_from(code_point).ok()?;
         let idx = code_point.checked_sub(self.first_code_point)?;
         self.glyphs.get(idx)

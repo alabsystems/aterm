@@ -48,7 +48,9 @@ const T27: u64 = 1_813_060_800;
 /// (2026-07-03 → 2026-09-30).
 const T_GH: u64 = 1_787_986_773;
 
-/// One verification's result: accept/reject plus the mapped error kinds.
+/// One verification's result: accept/reject plus the mapped error kinds. Every
+/// other failure is an opaque `Other(..)` in the OS's own words, and asserting
+/// on those would pin a macOS release.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Outcome {
     Accept,
@@ -56,7 +58,8 @@ enum Outcome {
     BadEncoding,
     NotValidForName,
     UnknownIssuer,
-    /// The certificate's signature does not check out.
+    /// The certificate's signature does not check out. webpki says so
+    /// specifically; Apple folds it into "no chain could be built".
     BadSignature,
     Revoked,
     /// Extended key usage does not permit server authentication.
@@ -66,7 +69,8 @@ enum Outcome {
 }
 
 impl Outcome {
-    /// Did this verification accept the chain?
+    /// Did this verification accept the chain? The only question for the
+    /// security property; everything else is diagnosis.
     fn accepted(self) -> bool {
         matches!(self, Self::Accept)
     }

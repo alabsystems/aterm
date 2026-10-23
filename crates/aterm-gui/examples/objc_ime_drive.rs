@@ -54,7 +54,9 @@ mod macos {
     /// it runs anyway and reports that its control could not compose.
     const FOCUS_WAIT: Duration = Duration::from_secs(10);
 
-    /// `NSNotFound`, which is `NSIntegerMax`.
+    /// `NSNotFound`, which is `NSIntegerMax`. `replacementRange:` is documented
+    /// to be `{NSNotFound, 0}` when the input method is not replacing anything,
+    /// which is what a composing IME always sends.
     const NS_NOT_FOUND: usize = isize::MAX as usize;
 
     /// The whole `replacementRange:` an IME sends while composing.
@@ -161,7 +163,7 @@ mod macos {
     }
 
     /// One Option chord stages 7 and 8 press: its ANSI `keyCode`, the key winit
-    /// reports, and whether the U.S.
+    /// reports, and whether the U.S. layout makes it a dead key.
     #[derive(Clone, Copy, Debug)]
     /// Option key chord tested by stages 7 and 8.
     pub(super) struct Chord {
@@ -207,7 +209,8 @@ mod macos {
     /// An Option+`code` key-down `NSEvent` built as a key press is: a CoreGraphics
     /// keyboard event (`keyCode` `code` with `kCGEventFlagMaskAlternate`) wrapped by
     /// `+eventWithCGEvent:`, so AppKit reads its characters off the current layout
-    /// (on the U.S.
+    /// (on the U.S. layout Option+E's `characters` is empty, the acute dead key, and
+    /// its `charactersIgnoringModifiers` is `e`).
     fn option_key_down(code: u16) -> Option<Obj> {
         const CG_FLAG_ALTERNATE: u64 = 1 << 19;
         // SAFETY: CoreGraphics/NSEvent calls follow their ownership contracts; `cg` is released after `+eventWithCGEvent:`.
@@ -359,7 +362,9 @@ mod macos {
         /// Every press of a key stages 7 and 8 send ([`CHORDS`]) that winit has
         /// delivered since stage 7 or 8 cleared it, with its text.
         keys: Vec<(KeyCode, Option<String>)>,
-        /// Every other key press since then.
+        /// Every other key press since then. The drive sends none, so these are a
+        /// person's, typed while the drive held the keyboard: shown, and left out
+        /// of the checks.
         foreign: Vec<String>,
         /// When stage 7 asked macOS to make the drive the active app.
         focus_asked: Option<Instant>,
@@ -560,7 +565,9 @@ mod macos {
             }));
         }
 
-        /// Stage 2: the same, in CJK.
+        /// Stage 2: the same, in CJK. `selectedRange:` counts UTF-16 code units and
+        /// `Ime::Preedit` promises UTF-8 byte offsets; each character here is one unit
+        /// and three bytes, so an unconverted range answers 2 where 6 is correct.
         fn stage_cjk(&mut self, view: Id) {
             println!("\n=== 2. A COMPOSITION, CJK (the UTF-16 -> UTF-8 conversion) ===");
             let _ = self.drain();
@@ -601,7 +608,10 @@ mod macos {
             }));
         }
 
-        /// Stage 3: the `NSAttributedString` branch.
+        /// Stage 3: the `NSAttributedString` branch. `setMarkedText:`'s first
+        /// argument is declared `@` and the body tests its class with
+        /// `-isKindOfClass:`; Japanese and Korean input methods send attributed
+        /// strings, a path no other stage takes.
         fn stage_attributed(&mut self, view: Id) {
             println!("\n=== 3. setMarkedText: WITH AN NSAttributedString ===");
             let _ = self.drain();

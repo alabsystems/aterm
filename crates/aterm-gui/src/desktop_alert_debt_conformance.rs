@@ -40,8 +40,6 @@ impl Rig {
 
     fn reset(&mut self) {
         self.app.presence.herald = Herald::default();
-        // The model starts disabled, as the shipped default is; the rig
-        // names the switch rather than leaning on the default.
         self.app.config.desktop_alerts = Some(false);
         self.app.apply_desktop_alerts(false);
         self.now = Instant::now();
@@ -86,9 +84,6 @@ impl Rig {
             }
             "ObserveNewLimited" | "ObserveNewFree" | "Reobserve" | "Tick" => {
                 if action == "ObserveNewLimited" {
-                    // Condition the unmodeled rate limiter through genuine
-                    // notices for other sessions, as recent enabled output
-                    // does. Never write its counters or timestamps directly.
                     for _ in 0..NOTIFY_BURST {
                         let session = self.next_prime;
                         self.next_prime += 1;
@@ -136,8 +131,6 @@ fn desktop_alert_debt_conforms_to_real_herald_and_config_transitions() {
         "Tick",
     ];
     let mut visited = BTreeSet::new();
-    // Reuse the App fixture, not its herald: every schedule starts with fresh
-    // debt and keys without starting thousands of unrelated worker threads.
     let mut rig = Rig::new();
     for mut schedule in 0..actions.len().pow(5) {
         rig.reset();
@@ -164,9 +157,6 @@ fn desktop_alert_debt_conforms_to_real_herald_and_config_transitions() {
     }
     assert_eq!(visited, BTreeSet::from(actions));
 
-    // Negative control: the herald runs enabled and its caller suppresses the
-    // returned notice. The rate-limited fourth session returns no notice to
-    // suppress, so a retry stays owed.
     let now = Instant::now();
     let mut old_order = Herald::default();
     let mut fixed = Herald::default();
@@ -200,7 +190,6 @@ fn desktop_alert_debt_conforms_to_real_herald_and_config_transitions() {
     for action in ["Enable", "ObserveNewLimited"] {
         rig.step(action);
     }
-    // Mutant: an atomic-only config update leaves the owed notice in place.
     rig.app.config.desktop_alerts = Some(false);
     rig.app
         .notify_own_alerts

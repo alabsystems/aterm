@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typed words producers pass: wall kinds, approval box words, outcomes
-//! per level and need words. Each maps onto one static word of a closed list
-//! in [`crate::vocab`], so a producer never formats a payload string and no
-//! reader parses one back.
+//! Typed words for wall kinds, approval boxes, outcomes per level, and needs.
 
 use crate::vocab::{BOX_WORDS, NEED_WORDS, OUT_WORDS, UNKNOWN, WALL_WORDS, lookup};
 
@@ -79,16 +76,14 @@ impl WallKind {
         }
     }
 
-    /// The kind a bare name (`usage-session`) or a wire word
-    /// (`wall:usage-session`) names.
+    /// The kind a bare name (`usage-session`) or a wire word (`wall:usage-session`) names.
     #[must_use]
     pub fn from_name(s: &str) -> Option<WallKind> {
         let bare = s.strip_prefix("wall:").unwrap_or(s);
         WallKind::ALL.into_iter().find(|k| k.name() == bare)
     }
 
-    /// A usage window, a model bucket or spend: the walls the clause names
-    /// `limit`.
+    /// A usage window, a model bucket or spend: the walls the clause names `limit`.
     #[inline]
     #[must_use]
     pub const fn is_limit(self) -> bool {
@@ -102,8 +97,7 @@ impl WallKind {
     }
 }
 
-/// An approval box word (`box=`): a `PromptKind` word, Bash with its
-/// read-only verdict. Always one of [`BOX_WORDS`] or `unknown`.
+/// An approval box word (`box=`): a `PromptKind` word, Bash with its read-only verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BoxWord(&'static str);
 
@@ -113,9 +107,7 @@ impl BoxWord {
     /// The generic box.
     pub const OTHER: BoxWord = BoxWord("other");
 
-    /// The box the screen verdict's detail names (`bash:not-read-only`,
-    /// `edit`, `question`). A kind this crate does not know is `other`,
-    /// the reader's own word for a box it has no header for.
+    /// The box the screen verdict's detail names (`bash:not-read-only`, `edit`, `question`).
     #[must_use]
     pub fn from_detail(detail: &str) -> BoxWord {
         lookup(BOX_WORDS, detail).map_or(BoxWord::OTHER, BoxWord)
@@ -151,8 +143,7 @@ impl BoxWord {
         self.0 == "question"
     }
 
-    /// The need this box raises: `approval:<kind>`, the question dialog's
-    /// `question`.
+    /// The need this box raises: `approval:<kind>`, the question dialog's `question`.
     #[must_use]
     pub fn need(self) -> &'static str {
         if self.is_question() {
@@ -230,8 +221,7 @@ pub enum StepOut {
     Gone,
     /// A more reliable source contradicted it.
     Retracted,
-    /// Not known: a journal read found it open, never closed, and a later
-    /// restatement of the open path without it (design §5.4).
+    /// Not known: a journal read found the step open and never closed.
     Unknown,
 }
 
@@ -345,9 +335,7 @@ impl Out {
     }
 }
 
-/// A need word's precedence (§7.1): `approval > question > wall >
-/// unresponsive > failure > escalated > exited > raised by a mark`. Lower is
-/// more urgent.
+/// Precedence rank of a need word (§7.1).
 #[must_use]
 pub fn need_rank(word: &str) -> u8 {
     match word {
@@ -362,15 +350,13 @@ pub fn need_rank(word: &str) -> u8 {
     }
 }
 
-/// Whether `word` is an `out=` word at all (decode keeps an unknown one as
-/// `unknown`).
+/// Whether `word` is an `out=` word at all (decode keeps an unknown one as `unknown`).
 #[must_use]
 pub fn is_out_word(word: &str) -> bool {
     lookup(OUT_WORDS, word).is_some()
 }
 
-/// The `wall=` word a wall kind's bare name is, checked against
-/// [`WALL_WORDS`].
+/// The `wall=` word a wall kind's bare name is, checked against [`WALL_WORDS`].
 #[must_use]
 pub fn wall_word(kind: WallKind) -> &'static str {
     lookup(WALL_WORDS, kind.name()).unwrap_or(UNKNOWN)

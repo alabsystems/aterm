@@ -1137,7 +1137,8 @@ fn convert_alacritty(text: &str) -> Result<ImportReport, ImportError> {
     draft.finish()
 }
 
-/// Place one Alacritty key.
+/// Place one Alacritty key. `value` is the string value, `None` for a value
+/// of any other type.
 fn alacritty_assign(draft: &mut Draft, path: &[String], value: Option<&str>) {
     let dotted = path.join(".");
     let parts: Vec<&str> = path.iter().map(String::as_str).collect();
@@ -1437,7 +1438,9 @@ fn iterm_colour(entries: &[(String, PlistValue)]) -> Option<(Rgb, Option<String>
     ))
 }
 
-/// iTerm2: the colour dictionaries of an `.itermcolors` property list.
+/// iTerm2: the colour dictionaries of an `.itermcolors` property list. A
+/// key's `(Dark)` variant stands in when the plain key is absent; `(Light)`
+/// variants are dropped.
 fn convert_iterm(text: &str) -> Result<ImportReport, ImportError> {
     let format = ImportFormat::ITerm;
     let mut scanner = PlistScanner { text, pos: 0 };

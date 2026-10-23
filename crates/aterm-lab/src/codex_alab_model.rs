@@ -238,7 +238,7 @@ pub fn texts_after_prompt(body: &J) -> usize {
 
 /// Returns the Land leg's `(reply_text, hold_duration)` for land act `n`.
 #[must_use]
-pub fn land_reply(n: usize) -> (&'static str, Duration) {
+pub const fn land_reply(n: usize) -> (&'static str, Duration) {
     match n {
         0 => (LAND_PROGRESS[0], SLOW_TURN),
         1 => (NEEDS_DEFENSE, Duration::ZERO),

@@ -3,14 +3,6 @@
 
 //! Tier-1 conformance of the control-socket image-path confinement to
 //! `aterm_models_gui::path_confine_model` (`PathConfine`).
-//!
-//! Drives the real `control_auth::confine_image_path` and the retained-handle writer over
-//! an honest request and a final-component symlink pointing outside the root, projects
-//! each onto `<<decided, committed, target>>` (target 0 none, 1 inside, 2 outside) in the
-//! configuration the request is (`LinkOutside`), and checks each `Confine` step on the
-//! model. The negative control, an escape that commits outside, is refused, and admitted
-//! only by the mutant that follows the link. Unix only: the escape half plants a POSIX
-//! symlink; Windows has its own reparse-point and handle-identity coverage.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
@@ -46,7 +38,6 @@ fn real_path_confine_conforms_to_the_pathconfine_model() {
     let scratch = aterm_tempfile::TempDir::new().expect("scratch socket dir");
     let dir = scratch.path();
 
-    // HONEST request: confine returns Some and the writer commits inside the root.
     let confined = confine_image_path(dir, "shot.png").expect("honest request must confine");
     let written = confined
         .write_private(b"\x89PNG\r\n\x1a\nstub")
@@ -66,8 +57,6 @@ fn real_path_confine_conforms_to_the_pathconfine_model() {
         "the real honest Confine (committed inside) must conform: {why}"
     );
 
-    // ESCAPE request: a final-component symlink images/evil.png -> a file outside the
-    // root. confine rejects it, so nothing is committed and the victim is intact.
     let images = confined.dir.clone();
     let victim = dir.join("victim_outside.txt");
     std::fs::write(&victim, b"original").expect("plant the victim");
@@ -87,8 +76,6 @@ fn real_path_confine_conforms_to_the_pathconfine_model() {
         "the real escape Confine (rejected, no write) must conform: {why}"
     );
 
-    // Negative control: an escape request committing outside (a writer that follows the
-    // symlink). Refused by the committed model; the link-following mutant admits it.
     let (ok, _) = confine(true, 1, 2, 0);
     assert!(
         !ok,

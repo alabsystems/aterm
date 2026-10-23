@@ -287,7 +287,10 @@ struct PendingDocumentSaveIntent {
     source_view: crate::tab_model::ViewId,
 }
 
-/// One document's leaves inside a larger window/quit close plan.
+/// One document's leaves inside a larger window/quit close plan. The plan is
+/// immutable once armed: `DocumentStore::prepare_close` freezes the exact head
+/// sequence and editing is rejected until durability either succeeds or the
+/// close is explicitly retried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PlannedDocumentClose {
     document: DocumentId,
@@ -341,7 +344,9 @@ impl NativeDocumentJob {
     }
 }
 
-/// Jobs can retain a complete 32 MiB document image.
+/// Jobs can retain a complete 32 MiB document image. The channel holds at most
+/// four waiting jobs and the single disk worker owns at most one executing job:
+/// five retained full images total.
 const NATIVE_DOCUMENT_QUEUE_CAPACITY: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,7 +430,9 @@ enum JournalAdmissionEffect {
     Reseat(JournalRewriteGeneration),
 }
 
-/// Admit an already-planned journal effect without blocking the UI.
+/// Admit an already-planned journal effect without blocking the UI. `Full` is
+/// an ordinary scheduling outcome: roll the reducer back to replannable state
+/// and retain only its document ID.
 fn try_enqueue_document_journal_job<T>(
     sender: &std::sync::mpsc::SyncSender<T>,
     job: T,
@@ -478,7 +485,9 @@ impl std::fmt::Display for DocumentQueueAdmissionError {
     }
 }
 
-/// Shared admission primitive.
+/// Shared admission primitive. Its non-blocking `Full` verdict is Tier-1-bound
+/// to `native_document_queue_model` below; production uses the same generic
+/// function with `NativeDocumentJob`.
 fn try_enqueue_document_job<T>(
     sender: &std::sync::mpsc::SyncSender<T>,
     job: T,
@@ -750,7 +759,9 @@ pub(crate) struct DocumentHostRuntime {
     pub(crate) persistence: DocumentPersistenceStore,
     journals: JournalSlot,
     recovery_status: BTreeMap<DocumentId, String>,
-    /// Journal intents that observed a full worker queue.
+    /// Journal intents that observed a full worker queue. This is an ID-only,
+    /// latest-wins latch: full encoded plans are released before insertion and
+    /// rebuilt from `DocumentJournalStore` when a worker receive frees a slot.
     journal_retries: JournalRetrySet,
     /// A journal write landed while an update handoff was parked, after the
     /// successor may have read its restore image.
@@ -2810,7 +2821,10 @@ impl App {
         self.reduce_document_observation(document, &observed.text, observed.observed)
     }
 
-    /// Read `document`'s file again through its grant.
+    /// Read `document`'s file again through its grant. A document never saved
+    /// whose file does not exist yet (an `edit … create=1`) reads "still
+    /// missing" as no change rather than as a failure; once it has been saved,
+    /// a missing file fails as for any document.
     fn refresh_document_file(
         &self,
         document: DocumentId,
@@ -4390,7 +4404,8 @@ impl App {
         }
     }
 
-    /// Phase one of the two-phase open.
+    /// Phase one of the two-phase open. The caller has validated `wid` and the
+    /// key.
     fn begin_document_admission(
         &mut self,
         wid: WindowId,
@@ -6749,7 +6764,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// NumLock off, keypad 1 is KP_End.
+    /// NumLock off, keypad 1 is KP_End. Through the real key path
+    /// (`App::on_key` -> `keymap::build_key_input` -> `App::input`) the editor
+    /// receives `NumpadEnd` (the identity DECKPAM and kitty need on the PTY
+    /// side) and the native reducer folds it onto End.
     #[test]
     fn numlock_off_keypad_end_moves_the_editor_caret_to_the_line_end() {
         let (dir, _, mut app, (_, view)) = open_config("aterm-config-editor-keypad-end", "win");
@@ -7446,7 +7464,13 @@ mod tests {
         }
     }
 
-    /// OPENING AN ABSENT KEY NEVER WRITES WORDS AS A VALUE.
+    /// OPENING AN ABSENT KEY NEVER WRITES WORDS AS A VALUE. Over every key
+    /// the schema knows: an edit at the default loads, draws no finding the
+    /// file did not have, and writes the value that resolves as the key's
+    /// absence does (a Settings row's unset value, else the documented
+    /// default: disk.auto_free_gib is 10, disk.apply false, never the consent
+    /// to remove files); otherwise the key's line comes in with no value and
+    /// the caret where it goes.
     #[test]
     fn an_absent_key_is_added_at_its_default_or_awaits_a_value() {
         let source = "agents_auto_prime = false\n[update]\nenabled = false\n";

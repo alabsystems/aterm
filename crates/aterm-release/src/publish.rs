@@ -953,7 +953,7 @@ pub enum FenceLiveness {
 }
 
 impl FenceLiveness {
-    pub fn label(&self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
             FenceLiveness::Alive(_) => "ALIVE",
             FenceLiveness::Dead(_) => "DEAD",
@@ -4801,7 +4801,7 @@ impl CutCtx {
             .collect()
     }
 
-    fn attaches_roster(&self) -> bool {
+    const fn attaches_roster(&self) -> bool {
         self.signature_machine_id.is_some()
     }
 

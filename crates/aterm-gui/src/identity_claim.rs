@@ -13,7 +13,8 @@ const CLAIMS_DIR: &str = "claims";
 
 /// An exclusive hold on one session id, alive while this value is.
 pub(crate) struct Claim {
-    /// The locked claim file, held open so the lock stays taken.
+    /// The locked claim file, held open so the lock stays taken. Unix reads it in
+    /// `Drop` to unlock; on Windows the open handle's share mode IS the claim.
     #[cfg_attr(
         windows,
         expect(dead_code, reason = "held for its close: the open handle is the claim")
@@ -43,7 +44,8 @@ pub(crate) enum ClaimOutcome {
     Unprovable(String),
 }
 
-/// Every claim this process holds, kept alive for its whole life.
+/// Every claim this process holds, kept alive for its whole life. A `Vec`:
+/// claims are taken a handful of times per process and never looked up.
 static HELD: std::sync::Mutex<Vec<Claim>> = std::sync::Mutex::new(Vec::new());
 
 /// Park a claim for the process's lifetime.
@@ -167,7 +169,8 @@ fn read_claim_record(_: &Path) -> Option<String> {
     None
 }
 
-/// Publish through an exclusive directory of this write's own.
+/// Publish through an exclusive directory of this write's own. No existing
+/// staging entry is opened or removed.
 fn write_claim_record(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let parent = path.parent().ok_or_else(|| {
@@ -390,7 +393,8 @@ pub(crate) fn register_handoff_candidate(pid: u32) -> CandidateRegistration {
 
 #[cfg(unix)]
 impl CandidateRegistration {
-    /// The attempt is over: the candidate committed or was proven dead.
+    /// The attempt is over: the candidate committed or was proven dead. Clears
+    /// only its own pid, never a later attempt's registration.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -501,7 +505,8 @@ pub(crate) fn hold_transferred(sid: &SessionId) {
     }
 }
 
-/// Open (or create) the claim file.
+/// Open (or create) the claim file. Unix: 0600, never truncated — a peer may hold
+/// it open and locked, and its bytes are diagnostics either way.
 #[cfg(unix)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -513,7 +518,8 @@ fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// Windows: the share mode is the claim.
+/// Windows: the share mode is the claim. `share_mode(0)` makes a second open
+/// fail outright, and the handle closing on exit releases it.
 #[cfg(windows)]
 fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;

@@ -15,7 +15,8 @@ use crate::smoke::{
     socket_listening,
 };
 
-/// Does a reply say `OK` and a field (`OK <…>`)?
+/// Does a reply say `OK` and a field (`OK <…>`)? Every counter is then read by
+/// name ([`metric_u64`]), so an absent one fails.
 fn ok_reply(reply: &str) -> bool {
     reply.starts_with("OK ")
 }
@@ -109,12 +110,16 @@ const HW_KEY_WRITE_FLOOR: u64 = 15;
 /// before the input→present ceilings mean anything, at the same ratio: a burst
 /// that booked none would pass both on a maximum of 0 ms.
 const HW_INPUT_FLOOR: u64 = 15;
-/// `key->write` p99 ceiling, OS queue residence included.
+/// `key->write` p99 ceiling, OS queue residence included. A healthy release
+/// build reads p99 6.29 ms with a whole run compiling beside it; 40 ms, over
+/// two 60 Hz frames, catches UI-thread work added to every key that the 250 ms
+/// input->present ceiling lets through.
 const KEY_WRITE_P99_CEILING_MS: u64 = 40;
 /// Worst wait for the terminal mutex at the key-press site (presses and
 /// releases, which `key->write` does not sample).
 const TERM_WAIT_PRESS_MAX_CEILING_MS: u64 = 25;
-/// Drawable-acquire p99 ceiling: three 60 Hz frames.
+/// Drawable-acquire p99 ceiling: three 60 Hz frames. Live windows read
+/// 3.4-5.24 ms p99 (max 15.32 ms on a loaded machine).
 const ACQUIRE_P99_CEILING_MS: u64 = 50;
 /// Present->glass p99 ceiling: the compositor leg, `presentDrawable:`
 /// registration to the drawable's `presentedTime`.
@@ -170,7 +175,9 @@ impl Sandbox {
         self.rundir.join("aterm/aterm.sock")
     }
 
-    /// Reap the child and remove the sandbox.
+    /// Reap the child and remove the sandbox. A teardown that could not retire
+    /// exactly the process it launched is itself a failure: the smoke's
+    /// conclusions are about that process.
     fn teardown(&mut self, r: &mut Report) {
         if let Some(mut child) = self.child.take() {
             let (ok, _) = retire_smoke_child(&mut child);
@@ -318,7 +325,7 @@ fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
 }
 
 /// `got`, or `<no reply>` when it is empty.
-fn or_no_reply(got: &str) -> &str {
+const fn or_no_reply(got: &str) -> &str {
     if got.is_empty() { "<no reply>" } else { got }
 }
 
@@ -488,7 +495,8 @@ fn settings_hardware_key_step(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_b
     }
 }
 
-/// Every reason this stage cannot measure anything.
+/// Every reason this stage cannot measure anything. Each is a skip: the machine
+/// cannot present, which says nothing about the code.
 fn gui_smoke_unavailable(ctx: &Ctx) -> Option<String> {
     if std::env::consts::OS != "macos" {
         return Some("gui smoke (macOS only)".into());

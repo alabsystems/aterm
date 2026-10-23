@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The encoder's working set, measured: an encode holds its input, its output
-//! and at most `aterm_png::encoder_scratch_len` bytes — never a filtered or
-//! compressed copy of the image. The counting allocator applies to this test
-//! binary alone, which holds this one test so nothing else allocates while it
-//! measures.
+//! Encoder working-set test: holds at most `aterm_png::encoder_scratch_len` scratch bytes.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,8 +24,7 @@ unsafe impl GlobalAlloc for Counting {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        // SAFETY: forwarding to the System allocator with the same pointer and
-        // layout.
+        // SAFETY: forwarding to the System allocator with the same pointer and layout.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

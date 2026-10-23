@@ -817,7 +817,7 @@ impl NoticeText {
 
     /// The parts in the order a reader reads them.
     #[must_use]
-    pub fn parts(&self) -> [&'static str; 4] {
+    pub const fn parts(&self) -> [&'static str; 4] {
         [self.happened, self.did, self.todo, self.expect]
     }
 

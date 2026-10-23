@@ -637,7 +637,7 @@ pub enum Origin {
 impl Origin {
     /// Returns whether this origin belongs to a transient session or workspace that can become gone.
     #[must_use]
-    pub fn ownable(&self) -> bool {
+    pub const fn ownable(&self) -> bool {
         matches!(
             self,
             Origin::ClaudeScratch { .. } | Origin::BuildCache { .. }
@@ -1515,7 +1515,7 @@ pub struct Owners {
 impl Owners {
     /// Creates an [`Owners`] resolver at `now` with `quiet_s` and the running [`ClaudeCensus`].
     #[must_use]
-    pub fn new(
+    pub const fn new(
         home: Option<PathBuf>,
         claude_dirs: Vec<PathBuf>,
         claudes: Vec<RunningClaude>,

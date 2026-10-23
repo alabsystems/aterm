@@ -408,7 +408,9 @@ impl Rig {
         self.step("select a tab", &[]);
     }
 
-    /// Close the ticket's view's tab.
+    /// Close the ticket's view's tab. A close that was requested (it closed, or
+    /// it waits for its checkpoint) froze the head as the model's `close_seq`;
+    /// a refused one requested nothing.
     fn close_edit_view(&mut self, actions: &[&str]) -> Result<(), String> {
         self.front(self.edit_view.expect("the ticket's view"));
         let head = self.state["head"];
@@ -447,7 +449,9 @@ impl Rig {
         closed
     }
 
-    /// The person presses done (C-c C-c) in the ticket's view.
+    /// The person presses done (C-c C-c) in the ticket's view. The press
+    /// froze the head as the model's `finish_seq`, and a close it led to the
+    /// head then as `close_seq` (a save made the head no newer).
     fn finish(&mut self, actions: &[&str]) {
         let head = self.state["head"];
         self.finish_seq = head;
@@ -456,7 +460,10 @@ impl Rig {
         self.step("done (C-c C-c)", actions);
     }
 
-    /// The person presses abort (C-c C-k) in the ticket's view.
+    /// The person presses abort (C-c C-k) in the ticket's view. Its discard
+    /// moved the head on only when the buffer was dirty and held no text the
+    /// edit did not type; the close it then asks for freezes the head the
+    /// discard left.
     fn abort(&mut self, actions: &[&str]) {
         let dirty = self.state["durable"] < self.state["head"];
         let foreign = self.state["foreign"] == 1;
@@ -528,7 +535,8 @@ impl Rig {
         self.step("the caller's tab in front", &[]);
     }
 
-    /// Another program writes the file.
+    /// Another program writes the file. aterm wrote nothing, so the rig
+    /// counts no write.
     fn write_externally(&mut self, bytes: &[u8]) {
         std::fs::write(&self.path, bytes).unwrap();
         self.file = read_file(&self.path);
@@ -988,7 +996,9 @@ fn abort_that_saves_is_caught() {
     ));
 }
 
-/// Done whose save does not land stops finishing (`FinishHalts`).
+/// Done whose save does not land stops finishing (`FinishHalts`). Done is
+/// pressed behind a save in flight, so its own save queues; an abort pressed
+/// then is refused and leaves the done finishing.
 fn finish_halts_when_its_save_does_not_land() {
     let mut rig = Rig::new("finish-halts");
     rig.edit();
@@ -1042,7 +1052,8 @@ fn finish_halts_when_its_save_does_not_land() {
     assert_eq!(std::fs::read_to_string(&rig.path).unwrap(), "theirs\n");
 }
 
-/// Abort throws away only what the edit typed.
+/// Abort throws away only what the edit typed. With the person's own view
+/// of the file clean, the discard reverts that view too.
 fn abort_keeps_text_it_did_not_type() {
     let mut rig = Rig::new("abort-shared-clean");
     rig.person_opens();

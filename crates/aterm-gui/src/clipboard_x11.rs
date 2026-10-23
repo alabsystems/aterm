@@ -100,7 +100,8 @@ struct Outgoing {
     moved: Instant,
 }
 
-/// The serving thread alone starts and advances transfers.
+/// The serving thread alone starts and advances transfers. The timer only
+/// removes expired ones; it never touches XCB or the current clipboard text.
 #[derive(Default)]
 struct OutgoingState {
     sends: HashMap<(Window, Atom), Outgoing>,
@@ -148,7 +149,8 @@ struct OutgoingChunk {
     end: usize,
 }
 
-/// Outgoing values and their demand-only timer.
+/// Outgoing values and their demand-only timer. There is at most one worker,
+/// joined before its replacement, and none remains once the table is empty.
 #[derive(Default)]
 struct OutgoingSends {
     shared: Arc<OutgoingShared>,
@@ -170,7 +172,8 @@ impl OutgoingSends {
         })
     }
 
-    /// Admit expiry custody before the caller publishes an INCR header.
+    /// Admit expiry custody before the caller publishes an INCR header. The
+    /// spawn capability also lets the existing aggregate exercise refusal.
     fn start_with(
         &mut self,
         key: (Window, Atom),
@@ -304,7 +307,9 @@ impl Drop for OutgoingTimerExit {
     }
 }
 
-/// Wait only for the earliest real expiry or a table change.
+/// Wait only for the earliest real expiry or a table change. The explicit
+/// clock/park observation lets the existing aggregate advance this same loop
+/// without a 30-second sleep or any X event; production supplies Instant::now.
 fn expire_outgoing(
     shared: Arc<OutgoingShared>,
     now: impl Fn() -> Instant,
@@ -333,7 +338,8 @@ fn expire_outgoing(
     }
 }
 
-/// One round's wire identity.
+/// One round's wire identity. A refusal has no property; every other reply
+/// must name the property the round requested as well as its window and target.
 struct PasteRequest {
     window: Window,
     selection: Atom,
@@ -350,7 +356,8 @@ impl PasteRequest {
     }
 }
 
-/// Every round owns a fresh server window on the retained connection.
+/// Every round owns a fresh server window on the retained connection. Never
+/// reusing its XID keeps a delayed reply separate even after a completed read.
 struct Requestor {
     conn: Arc<Connection>,
     window: Window,
@@ -387,7 +394,10 @@ impl Reads {
     }
 }
 
-/// Shared state between the event-serving thread and the `set`/`get` callers.
+/// Shared state between the event-serving thread and the `set`/`get` callers. libxcb
+/// is thread-safe: a caller thread may send requests (set owner, convert) and wait for
+/// a reply (`set`'s ownership check) while the event thread blocks in `wait_for_event`,
+/// which is exactly the access pattern here.
 struct Inner {
     conn: Arc<Connection>,
     /// The window our selections are owned by.
@@ -416,7 +426,9 @@ impl Inner {
         }
     }
 
-    /// A fresh unmapped requestor that reports its property changes.
+    /// A fresh unmapped requestor that reports its property changes. Advance
+    /// the identity fence before creation: even a failed send cannot admit it
+    /// as another round later.
     fn requestor(&self, reads: &mut Reads) -> Option<Requestor> {
         let win = self.conn.generate_id().ok()?;
         if !reads.admit_window(win) {
@@ -472,7 +484,8 @@ impl Inner {
     }
 }
 
-/// Unregister the active round on every caller exit, including unwind.
+/// Unregister the active round on every caller exit, including unwind. The
+/// removed entry owns its window, and is dropped after releasing the map lock.
 struct PendingRead<'a> {
     inner: &'a Inner,
     window: Window,
@@ -851,7 +864,9 @@ fn serve_value(
     started
 }
 
-/// The requestor deleted `property` on `window`.
+/// The requestor deleted `property` on `window`. If we serve it by INCR, that
+/// is the cue for the next chunk, appended to the property, or, once every byte
+/// is out, for the zero-length chunk that ends the transfer.
 fn send_chunk(inner: &Inner, sends: &mut OutgoingSends, window: Window, property: Atom) {
     let limit = inner.incr_chunk();
     let Some(chunk) = sends.chunk((window, property), limit, Instant::now()) else {

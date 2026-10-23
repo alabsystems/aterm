@@ -101,21 +101,21 @@ impl HueSet {
         set
     }
 
-    pub fn insert(&mut self, bucket: u8) {
+    pub const fn insert(&mut self, bucket: u8) {
         self.0 |= 1 << (bucket % 12);
     }
 
-    pub fn union_with(&mut self, other: Self) {
+    pub const fn union_with(&mut self, other: Self) {
         self.0 |= other.0;
     }
 
     #[must_use]
-    pub fn len(self) -> usize {
+    pub const fn len(self) -> usize {
         self.0.count_ones() as usize
     }
 
     #[must_use]
-    pub fn is_empty(self) -> bool {
+    pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
@@ -172,7 +172,7 @@ impl PixelBox {
 
     /// Whether this box holds the inclusive box `(x0, y0, x1, y1)` whole.
     #[must_use]
-    pub fn contains(&self, x0: i64, y0: i64, x1: i64, y1: i64) -> bool {
+    pub const fn contains(&self, x0: i64, y0: i64, x1: i64, y1: i64) -> bool {
         x0 >= self.x0 && y0 >= self.y0 && x1 <= self.x1 && y1 <= self.y1
     }
 }
@@ -664,13 +664,13 @@ pub fn largest_tall_component(frame: &Frame) -> Shape {
 
 /// Whether frame `frame_no` of `frame_count` is an isolating frame: frame 0 (before typing) or one of the three final cleared-plane stills.
 #[must_use]
-pub fn compact_pet_witness_frame(frame_no: usize, frame_count: usize) -> bool {
+pub const fn compact_pet_witness_frame(frame_no: usize, frame_count: usize) -> bool {
     frame_no == 0 || frame_no >= frame_count.saturating_sub(3)
 }
 
 /// The relaxed height floor an isolating frame may fall back to under the engine's own claim: the pet's compact pose, else the cat's resting head.
 #[must_use]
-pub fn companion_witness_floor(
+pub const fn companion_witness_floor(
     pet_active: bool,
     frame_no: usize,
     frame_count: usize,
@@ -777,7 +777,7 @@ pub fn resting_pose(pose: Option<&str>) -> bool {
 
 /// The resting sprite's width floor: one pixel over a two-cell text impostor.
 #[must_use]
-pub fn resting_pet_min_width(cell_w: usize) -> usize {
+pub const fn resting_pet_min_width(cell_w: usize) -> usize {
     2 * cell_w + 1
 }
 
@@ -1391,13 +1391,13 @@ pub fn attached_ribbon_run(
 
 /// Whether one frame carries ribbon geometry (thin or attached).
 #[must_use]
-pub fn ribbon_present(metrics: &DynamicMetrics) -> bool {
+pub const fn ribbon_present(metrics: &DynamicMetrics) -> bool {
     metrics.ribbon_component.pixels > 0 || metrics.ribbon_run.pixels > 0
 }
 
 /// Whether one frame carries trail light for the continuity charge: ribbon geometry, or the band's own population at [`RIBBON_LIT_MIN_PX`].
 #[must_use]
-pub fn driven_lit(metrics: &DynamicMetrics) -> bool {
+pub const fn driven_lit(metrics: &DynamicMetrics) -> bool {
     ribbon_present(metrics) || metrics.band_ink >= RIBBON_LIT_MIN_PX
 }
 

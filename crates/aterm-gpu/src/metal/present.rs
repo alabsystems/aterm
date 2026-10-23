@@ -431,7 +431,9 @@ pub(crate) struct CrownPass<'a> {
 pub(crate) struct PresentSequence<'a> {
     /// The clean offscreen (base + aurora — the scissor base).
     pub(crate) offscreen: &'a SealedTexture,
-    /// The present copy the effects composite over and the blit samples.
+    /// The present copy the effects composite over and the blit samples. `None`
+    /// for an effect-free present: the blit samples `offscreen` and the compose
+    /// copy is skipped.
     pub(crate) present_off: Option<&'a SealedTexture>,
     /// The compose copy's half-open rect from `renderer::present_copy_rect`;
     /// full frame only for the first sync into a fresh copy.

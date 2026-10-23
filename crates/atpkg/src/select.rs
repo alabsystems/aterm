@@ -51,7 +51,8 @@ struct Admitted {
     roster: TrustedRoster,
 }
 
-/// One distinct roster pair Pass 1 has weighed, and its verdict.
+/// One distinct roster pair Pass 1 has weighed, and its verdict. A refusal is remembered
+/// too: identical bytes under one anchor and clock refuse identically.
 struct Weighed {
     roster_bytes: Vec<u8>,
     roster_sig: Vec<u8>,

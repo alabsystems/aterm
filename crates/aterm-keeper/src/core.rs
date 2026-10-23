@@ -282,7 +282,10 @@ impl Journal {
         }
     }
 
-    /// The last claim, `conn`'s, ended with its process: the record is about to be judged.
+    /// The last claim, `conn`'s, ended with its process: the record is about to be judged. If
+    /// `conn` is the reader its end is judged ([`Self::reader_ended`]); if the reader's claim
+    /// ended before (an outgoing window outliving its successor), that end was judged then, and
+    /// this claim's own region is no reader's.
     fn last_claim_left(&mut self, conn: ConnId, out: &mut Vec<Out>) {
         if self.reader == Some(conn) {
             self.reader_ended(conn, out);
@@ -1819,7 +1822,11 @@ impl KeeperCore {
         out
     }
 
-    /// A Commit and its successor's end are judged together.
+    /// A Commit and its successor's end are judged together. A window that ended with `exit(0)`
+    /// and no BYE while the successor its own PENDING names is gone, its end not read yet (both
+    /// die within the Commit's milliseconds), waits for that end, at most [`DEATH_GRACE_MS`] past
+    /// its own: whether it handed its masters to a successor that crashed or quit depends on it
+    /// ([`Self::peer_died`]).
     fn awaits_successor_end(&self, p: &Peer, now: u64, env: &mut dyn KeeperEnv) -> bool {
         let Some((exited_at, status)) = p.exit else {
             return false;
@@ -3404,7 +3411,8 @@ mod tests {
         a_tab_closed_while_its_link_was_down(false);
     }
 
-    /// Negative control: the same-process rule is the process's.
+    /// Negative control: the same-process rule is the process's. Another pid may not release a
+    /// master it never claimed, nor a later process at the same pid (another birth).
     #[test]
     fn another_process_may_not_release_what_a_dropped_link_claimed() {
         let mut k = KeeperCore::new(true);

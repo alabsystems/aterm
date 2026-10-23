@@ -8,8 +8,7 @@
 use super::{ClassDefinition, Coverage, SequenceLookupRecord};
 use crate::parser::{FromSlice, LazyArray16, LazyOffsetArray16, Offset, Offset16, Stream};
 
-/// A [Chained Contextual Lookup Subtable](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#chseqctxt1).
+/// A Chained Contextual Lookup Subtable.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub enum ChainedContextLookup<'a> {
@@ -116,7 +115,7 @@ impl<'a> FromSlice<'a> for ChainedSequenceRuleSet<'a> {
     }
 }
 
-/// A [Chained Sequence Rule](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#chained-sequence-context-format-1-simple-glyph-contexts).
+/// A Chained Sequence Rule.
 #[allow(missing_docs)]
 #[derive(Clone, Copy, Debug)]
 pub struct ChainedSequenceRule<'a> {

@@ -24,7 +24,7 @@ pub enum Kind {
 impl Kind {
     /// Manifest token for this payload kind.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Binary => "binary",
             Self::SysrootBundle => "sysroot-bundle",

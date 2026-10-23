@@ -15,7 +15,8 @@ pub struct LaunchName {
     pub started: (i64, i64),
 }
 
-/// The most launch names the sentinel keeps; the oldest go first.
+/// The most launch names the sentinel keeps; the oldest go first. Every build that
+/// reaches the revert threshold counts only a few, so this only bounds the file.
 const MAX_NAMED_LAUNCHES: usize = 32;
 
 /// A durable boot-health sentinel backed by a small file `"<build> <attempts>[ <pid>:<seconds>:<micros>]*"`.
@@ -82,7 +83,8 @@ impl Sentinel {
         }
     }
 
-    /// The whole line: [`Self::read_state`] plus the launch names.
+    /// The whole line: [`Self::read_state`] plus the launch names. A name that does not parse
+    /// is dropped, so its launch stays counted.
     #[cfg_attr(trust_verify, trust::skip)]
     fn read_record(&self) -> Option<(u64, u32, Vec<LaunchName>)> {
         let text = std::fs::read_to_string(&self.path).ok()?;

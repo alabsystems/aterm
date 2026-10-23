@@ -73,7 +73,11 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
     assert!(!observer.footer_asked.contains_key(&7));
 }
 
-/// THE RE-ASK AT THE DRAWER'S EXEC EDGE (card engine §3.10).
+/// THE RE-ASK AT THE DRAWER'S EXEC EDGE (card engine §3.10). atpkg's shim
+/// is named `claude` and `exec`s the store build in place: the group and the
+/// name stay, so the sweep would not ask again for `RECHECK`, and its first
+/// ask may have fallen in the shim, whose environment macOS hides (no Claude
+/// dir, no registry watch).
 #[test]
 fn an_exec_into_a_store_or_native_claude_asks_for_the_footer_again() {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
@@ -961,7 +965,9 @@ fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
     );
 }
 
-/// A PTY exit publishes `Exited` immediately and stays there.
+/// A PTY exit publishes `Exited` immediately and stays there. Under `--hold` the pane outlives
+/// its shell and keeps being swept; `tcgetpgrp` then fails, which reads as "no foreground job"
+/// and would publish `Idle` (chrome's "ready") for a dead pane.
 #[test]
 fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
     let mut app = crate::App::headless_for_test();
@@ -1816,7 +1822,12 @@ fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
     }
 }
 
-/// A prompt is `Idle` however its grid moves.
+/// A prompt is `Idle` however its grid moves. `EnteringCommand` is the steady
+/// state whenever a prompt is DISPLAYED, so the keystroke echo of a command
+/// line being typed and a background job printing at an idle prompt
+/// (`tail -f &`, a sibling build) look alike here, and neither is work: the
+/// record publishes nothing new and owes the event loop no wake, so typing
+/// costs no chrome refresh.
 #[test]
 fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
     for shell in [ShellEvidence::Entering, ShellEvidence::Prompt] {
@@ -2476,7 +2487,12 @@ fn the_conpty_field_names_the_host_on_windows_and_is_absent_elsewhere() {
     assert_eq!(record.contains(" conpty="), cfg!(windows), "{record}");
 }
 
-/// ONE FOREGROUND READ PER LOOK.
+/// ONE FOREGROUND READ PER LOOK. The group in front (`tcgetpgrp` on the PTY
+/// master, ~51k instructions per call on macOS) is read once, under the
+/// terminal hold, and the cwd witness, the job evidence and the program
+/// identity all take that answer: a sweep over N looked-at sessions asks the
+/// probe N times, however many readers each answer has, and the job verdict
+/// is the injected probe's.
 #[test]
 fn a_look_reads_the_foreground_group_once() {
     use std::cell::Cell;

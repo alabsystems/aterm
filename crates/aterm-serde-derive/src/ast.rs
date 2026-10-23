@@ -168,7 +168,7 @@ impl Field<'_> {
     /// The span upstream attaches to code generated for this field: its first
     /// token (stable proc_macro cannot join spans, so upstream's
     /// `field.span()` is the first token's span too).
-    pub fn span(&self) -> Span {
+    pub const fn span(&self) -> Span {
         self.original.first_span
     }
 }

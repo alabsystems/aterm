@@ -767,7 +767,8 @@ fn a_cut_question_is_escalated() {
     );
 }
 
-/// No visible focus is no answer.
+/// No visible focus is no answer. aterm-phase reads such a dialog as
+/// unknown; the decider refuses it whichever way it arrives.
 #[test]
 fn no_visible_focus_is_never_answered() {
     let rows = screen(f::QUESTION_TABS_INCIDENT);

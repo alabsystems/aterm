@@ -426,7 +426,8 @@ enum Placed {
 /// How an ` if-absent` entry's file stands, with whatever it is anchored to ([`standings`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Standing {
-    /// The vault's: a gap, or a file still holding what the vault wrote.
+    /// The vault's: a gap, or a file still holding what the vault wrote. As an anchor, it
+    /// lets the entries anchored to it fill their gaps and update what the vault wrote.
     Vaults,
     /// The machine's own: a file the vault never wrote or that changed since, a link, a
     /// directory.
@@ -670,7 +671,10 @@ fn parents(home: &Path, rel: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Create the missing directories between home and home path `rel`'s file at 0700.
+/// Create the missing directories between home and home path `rel`'s file at 0700. An
+/// existing directory is used as it is and never chmodded; a symlink in a directory's place
+/// is refused, never followed, as is anything else that is not a directory, and aterm's own
+/// directory (`own`, [`Places`]).
 fn make_parents(home: &Path, rel: &str, own: Option<(u64, u64)>) -> Result<(), String> {
     for dir in parents(home, rel) {
         match fsx::kind(&dir).map_err(|error| error.0)? {

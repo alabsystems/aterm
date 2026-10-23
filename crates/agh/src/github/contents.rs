@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! A repository's files (design §10.1): one file's bytes, and one directory's entries.
+//! Repository file bytes and directory listings.
 
 use aterm_json::Value;
 
@@ -17,15 +17,12 @@ use crate::policy::RouteTarget;
 use crate::slug::Slug;
 use crate::wire::WireKind;
 
-/// The most entries GitHub lists in one directory.
 const DIRECTORY_CAP: usize = 1000;
 
 /// Why a directory listing at the cap is not whole.
 pub(crate) const DIRECTORY_CAP_WHY: &str =
     "the directory holds 1000 entries or more, and GitHub lists at most 1000";
 
-/// The least wire limit of a file read: the first 64 KiB of a failed answer's body are what
-/// the pipeline classifies it from.
 const CLASSIFY_FLOOR: u64 = 64 * 1024;
 
 /// The contents of one repository.
@@ -51,7 +48,6 @@ impl<'a> Contents<'a> {
         Contents { how, ..self }
     }
 
-    /// `GET /repos/{o}/{r}/contents/{path}` (no trailing `/` for the root), `?ref=` when given.
     fn call(&self, reference: Option<&str>, path: &str) -> Result<Call> {
         path::refuse_dot_segment("path", path).map_err(|e| e.with_repo(self.slug.to_string()))?;
         let encoded = path::file_path(path);
@@ -67,14 +63,14 @@ impl<'a> Contents<'a> {
         })
     }
 
-    /// An Invalid error about this repository.
     fn invalid(&self, why: String) -> Error {
         Error::new(Kind::Invalid, why).with_repo(self.slug.to_string())
     }
 
     /// One file's bytes, at most `max` (Accept raw).
     /// # Errors
-    /// Usage for a path with a `.` or `..` part, before any request.
+    /// Usage for a path with a `.` or `..` part, before any request; Invalid for a file over
+    /// `max`, a directory or a submodule; the call's error.
     pub fn raw(&self, reference: Option<&str>, path: &str, max: u64) -> Result<Vec<u8>> {
         let call = self
             .call(reference, path)?
@@ -105,7 +101,9 @@ impl<'a> Contents<'a> {
 
     /// One directory's entries, sorted by name.
     /// # Errors
-    /// Usage for a path with a `.` or `..` part, before any request.
+    /// Usage for a path with a `.` or `..` part, before any request; Invalid for a file, a
+    /// symlink or a submodule; Incomplete at GitHub's 1000-entry cap unless `partial`; the call's
+    /// error.
     pub fn list(
         &self,
         reference: Option<&str>,
@@ -154,9 +152,6 @@ impl<'a> Contents<'a> {
     }
 }
 
-/// A contents object's `type`, when it is one GitHub documents for a single entry (`file`,
-/// `symlink` or `submodule`); `None` for an array, a directory or anything else, which the
-/// callers read as before.
 fn entry_type(value: &Value) -> Option<&'static str> {
     match value.get("type").and_then(Value::as_str)? {
         "file" => Some("file"),

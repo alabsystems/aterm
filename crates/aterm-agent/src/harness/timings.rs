@@ -8,7 +8,7 @@ use std::time::Duration;
 /// The fast-timers development seam: set in a debug build, the harness runs [`Timings::FAST`].
 pub const FAST_SEAM: &str = aterm_types::domain::ENV_DEV_FAST_TIMERS;
 
-/// The harness's bounded waits (module doc).
+/// The harness's bounded waits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timings {
     /// A signalled agent's exit (`upgrade_wake::wait_exit`, the kernel's exit event).

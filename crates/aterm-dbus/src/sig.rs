@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! D-Bus type signatures: the parsed [`Type`] tree and the parser that holds a
-//! signature to the specification's limits (255 bytes, 32 nested arrays, 32
-//! nested structs or dict entries, non-empty structs, basic dict keys, dict
-//! entries only as array elements).
-//!
-//! Every type code but `h` (a unix descriptor) parses: aterm-dbus never
-//! negotiates descriptor passing, so `h` is [`Error::Unsupported`]. A
-//! signature carried as data (a `g` value, [`crate::Signature`]) may still
-//! name `h`: naming the type passes no descriptor.
+//! D-Bus [`Type`] signature parser ([`Error::Unsupported`], [`crate::Signature`]).
 
 use std::sync::Arc;
 
@@ -22,41 +14,40 @@ pub const MAX_ARRAY_DEPTH: usize = 32;
 /// How deep structs and dict entries may nest inside one signature.
 pub const MAX_STRUCT_DEPTH: usize = 32;
 
-/// One complete D-Bus type. Container children are shared, so cloning a type
-/// (every decoded array carries its element type) never copies the tree.
+/// One complete D-Bus type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
-    /// `y`
+    /// `y`.
     Byte,
-    /// `b`, carried as a `u32` that must be 0 or 1
+    /// `b`, carried as a `u32` that must be 0 or 1.
     Bool,
-    /// `n`
+    /// `n`.
     I16,
-    /// `q`
+    /// `q`.
     U16,
-    /// `i`
+    /// `i`.
     I32,
-    /// `u`
+    /// `u`.
     U32,
-    /// `x`
+    /// `x`.
     I64,
-    /// `t`
+    /// `t`.
     U64,
-    /// `d`, an IEEE 754 double
+    /// `d`, an IEEE 754 double.
     F64,
-    /// `s`, UTF-8 without NUL
+    /// `s`, UTF-8 without NUL.
     Str,
-    /// `o`
+    /// `o`.
     Path,
-    /// `g`
+    /// `g`.
     Sig,
-    /// `v`: a signature, then one value of that type
+    /// `v`: a signature, then one value of that type.
     Variant,
-    /// `a` + element type
+    /// `a` + element type.
     Array(Arc<Type>),
-    /// `a{kv}`: an array of dict entries with a basic key type
+    /// `a{kv}`: an array of dict entries with a basic key type.
     Dict(Arc<Type>, Arc<Type>),
-    /// `(...)`: one or more fields
+    /// `(...)`: one or more fields.
     Struct(Arc<[Type]>),
 }
 
@@ -68,8 +59,7 @@ impl Type {
         Self::Array(Arc::new(elem))
     }
 
-    /// `a{kv}`. The caller keeps `key` basic; a value built over another key
-    /// is refused by [`crate::Value::dict`] and the encoder.
+    /// `a{kv}` ([`crate::Value::dict`]).
     #[inline]
     #[must_use]
     pub fn dict(key: Type, value: Type) -> Self {
@@ -158,9 +148,7 @@ impl Type {
     /// Parses a signature holding exactly one complete type (a variant's).
     ///
     /// # Errors
-    ///
-    /// [`Error::Invalid`] for a signature the specification forbids,
-    /// [`Error::Unsupported`] for one that names a unix descriptor.
+    /// [`Error::Invalid`] if forbidden, or [`Error::Unsupported`] for a unix descriptor.
     #[inline]
     pub fn parse(sig: &str) -> Result<Self> {
         parse_one(sig.as_bytes()).map_err(SigFault::refused)
@@ -180,15 +168,13 @@ pub fn signature_of(types: &[Type]) -> String {
 /// Parses a signature holding zero or more complete types (a message body's).
 ///
 /// # Errors
-///
 /// As [`Type::parse`].
 #[inline]
 pub fn parse_signature(sig: &str) -> Result<Vec<Type>> {
     parse_many(sig.as_bytes()).map_err(SigFault::refused)
 }
 
-/// Why the parser refused a signature; the caller decides whether that is
-/// this side's mistake ([`Error::Invalid`]) or the wire's ([`Error::Malformed`]).
+/// Why the parser refused a signature ([`Error::Invalid`], [`Error::Malformed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SigFault {
     Bad(&'static str),
@@ -231,8 +217,7 @@ pub(crate) fn parse_one(sig: &[u8]) -> std::result::Result<Type, SigFault> {
     Ok(ty)
 }
 
-/// Checks a signature carried as data (a `g` value): the grammar and limits
-/// of [`parse_many`], with `h` allowed.
+/// Checks a signature carried as data (a `g` value) ([`parse_many`]).
 pub(crate) fn check_data(sig: &[u8]) -> std::result::Result<(), SigFault> {
     let mut parser = Parser::new(sig, true)?;
     while parser.pos < sig.len() {
@@ -302,8 +287,6 @@ impl<'a> Parser<'a> {
             b'o' => Type::Path,
             b'g' => Type::Sig,
             b'v' => Type::Variant,
-            // `h` stands in as `u`, a 4-byte basic type, which is all the
-            // grammar asks of it; [`check_data`] drops the tree.
             b'h' if self.fd_ok => Type::U32,
             b'h' => return Err(SigFault::Fd),
             b'a' => {
@@ -404,7 +387,6 @@ mod tests {
         assert_eq!(bad("s)"), "unbalanced close");
         assert_eq!(bad("m"), "unknown type code");
         assert_eq!(parse_many(b"ah"), Err(SigFault::Fd));
-        // As data, `h` is one more basic type under the same rules.
         for sig in ["h", "ah", "a{hs}", "(hh)", "sa{sv}h"] {
             assert_eq!(check_data(sig.as_bytes()), Ok(()), "{sig}");
         }

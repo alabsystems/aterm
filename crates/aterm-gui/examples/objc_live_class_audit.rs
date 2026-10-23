@@ -74,7 +74,8 @@ mod macos {
         rows: Rows,
     }
 
-    /// Whose method table a [`Target`] is reading.
+    /// Whose method table a [`Target`] is reading. For a class the fork declares,
+    /// all of it.
     #[derive(Clone, Copy)]
     enum Rows {
         /// A class the fork declares.
@@ -83,7 +84,8 @@ mod macos {
         Patched(&'static [&'static str]),
     }
 
-    /// `window_delegate.rs`'s class.
+    /// `window_delegate.rs`'s class. 21 declared rows plus `-dealloc`, all resolved
+    /// by the runtime.
     const DELEGATE: Target = Target {
         class_name: "WinitWindowDelegate",
         claimed: &[c"NSObject", c"NSWindowDelegate", c"NSDraggingDestination"],
@@ -95,7 +97,8 @@ mod macos {
         rows: Rows::Declared,
     };
 
-    /// `view.rs`'s class.
+    /// `view.rs`'s class. 39 declared rows plus `-dealloc`. It claims only
+    /// `NSTextInputClient`, as the objc2 class did.
     const VIEW: Target = Target {
         class_name: "WinitView",
         claimed: &[c"NSTextInputClient"],
@@ -107,7 +110,11 @@ mod macos {
         rows: Rows::Declared,
     };
 
-    /// `app_state.rs`'s class: the `NSApplicationDelegate` on `NSApp`.
+    /// `app_state.rs`'s class: the `NSApplicationDelegate` on `NSApp`. Three
+    /// declared rows plus `-dealloc`, all `@optional`, so reading the registered
+    /// table matters most here: AppKit reaches an `@optional` row only after
+    /// `-respondsToSelector:`, so one that never registered fails silently (no
+    /// activation policy, no clean termination) and no send would notice.
     const APP_DELEGATE_HOST_LACKS: &[HostLacks] = &[
         HostLacks {
             sel: "applicationDidFinishLaunching:",
@@ -150,7 +157,8 @@ mod macos {
         rows: Rows::Declared,
     };
 
-    /// `window.rs`'s class: the `NSWindow` every winit window is.
+    /// `window.rs`'s class: the `NSWindow` every winit window is. Two declared rows
+    /// plus `-dealloc`, no ivars and no protocols, so `claimed` is empty.
     const WINDOW: Target = Target {
         class_name: "WinitWindow",
         claimed: &[],
@@ -174,7 +182,10 @@ mod macos {
         rows: Rows::Patched(&["sendEvent:"]),
     };
 
-    /// One informal protocol.
+    /// One informal protocol. AppKit declares `NSStandardKeyBindingResponding` so
+    /// the signatures exist, and dispatches `insertTab:`/`cancelOperation:` by
+    /// `-respondsToSelector:`; nothing on `WinitView`'s chain conforms to it (of the
+    /// 26,318 classes loaded with AppKit only `NSTextView` claims it).
     const VIEW_INFORMAL: &[(&str, &str)] = &[(
         "NSStandardKeyBindingResponding",
         "informal ON THIS CHAIN: neither WinitView nor NSView nor NSResponder \
@@ -312,7 +323,9 @@ mod macos {
         None
     }
 
-    /// Intern a selector whose name is known only as a `&str`.
+    /// Intern a selector whose name is known only as a `&str`. `sel_uncached`
+    /// takes a `&'static CStr`, so each name leaks one small allocation, in a
+    /// process that audits one window and exits.
     fn sel_named(name: &str) -> Sel {
         let owned: &'static CStr = Box::leak(
             std::ffi::CString::new(name)
@@ -432,7 +445,9 @@ mod macos {
         out
     }
 
-    /// The protocols a protocol itself inherits.
+    /// The protocols a protocol itself inherits. `aterm-objc` grows only for the
+    /// port, and no shipping call site needs `protocol_copyProtocolList`, so it is
+    /// declared here.
     fn protocol_parents(proto: aterm_objc::ProtocolPtr) -> Vec<String> {
         unsafe extern "C" {
             fn protocol_copyProtocolList(
@@ -1585,7 +1600,8 @@ mod macos {
             true
         }
 
-        /// One probe row, sent directly and through `NSInvocation`.
+        /// One probe row, sent directly and through `NSInvocation`. An honest row
+        /// must round-trip and a lying one must not; answers whether it behaved so.
         fn probe_row(&mut self, obj: Id, sel: Sel, encoding: &str, expect_agreement: bool) -> bool {
             let name = sel.name().to_string_lossy().into_owned();
             // SAFETY: `probe_rect` really is `(id, SEL) -> CGRect`, correct.
@@ -1709,7 +1725,9 @@ mod macos {
             (reported, Some(isa_name))
         }
 
-        /// Parts A, B and F for one target, given a live instance of it.
+        /// Parts A, B and F for one target, given a live instance of it. Answers
+        /// the registered rows, or `None` if the instance is not of the target's
+        /// class (a finding).
         fn table_and_conformance(
             &mut self,
             target: &Target,

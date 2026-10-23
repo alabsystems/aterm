@@ -515,7 +515,7 @@ pub(super) fn screen_mode(rows: &[String]) -> Option<String> {
         .map(|mode| mode_flag(mode).to_string())
 }
 
-fn mode_flag(mode: super::lights::Mode) -> &'static str {
+const fn mode_flag(mode: super::lights::Mode) -> &'static str {
     use super::lights::Mode;
     match mode {
         Mode::Bypass => "bypassPermissions",
@@ -636,7 +636,7 @@ pub(super) enum Relaunch {
 }
 
 /// [`Relaunch`] from the new process's parent as read now (`None`: unread) and the shell the relaunch line was typed at (`0`: none was recorded).
-pub(super) fn relaunch_by_parent(parent: Option<u32>, shell: u32) -> Relaunch {
+pub(super) const fn relaunch_by_parent(parent: Option<u32>, shell: u32) -> Relaunch {
     match parent {
         _ if shell == 0 => Relaunch::NotOurs,
         None => Relaunch::Unread,
@@ -1541,7 +1541,7 @@ pub(super) struct ShellBack {
 
 impl ShellBack {
     /// The tracker for a line typed into the command block `block` ([`St::line_block`]; `None`: none read), on the clock `t`.
-    pub(super) fn after(block: Option<u64>, t: &super::Timings) -> Self {
+    pub(super) const fn after(block: Option<u64>, t: &super::Timings) -> Self {
         Self {
             since: None,
             looked: None,
@@ -2779,13 +2779,13 @@ pub struct Snapshot {
 impl Snapshot {
     /// The agent it is of, by its run ([`Snapshot::run`]).
     #[must_use]
-    pub fn agent(&self) -> upgrade::Agent {
+    pub const fn agent(&self) -> upgrade::Agent {
         self.run.agent()
     }
 
     /// A Codex's run, `None` for any other agent's.
     #[must_use]
-    pub fn codex(&self) -> Option<&CodexRun> {
+    pub const fn codex(&self) -> Option<&CodexRun> {
         match &self.run {
             AgentRun::Codex(run) => Some(run),
             AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
@@ -2793,7 +2793,7 @@ impl Snapshot {
     }
 
     /// [`Snapshot::codex`], to change.
-    pub fn codex_mut(&mut self) -> Option<&mut CodexRun> {
+    pub const fn codex_mut(&mut self) -> Option<&mut CodexRun> {
         match &mut self.run {
             AgentRun::Codex(run) => Some(run),
             AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
@@ -2802,7 +2802,7 @@ impl Snapshot {
 
     /// A Muse Code's run, `None` for any other agent's.
     #[must_use]
-    pub fn muse(&self) -> Option<&MuseRun> {
+    pub const fn muse(&self) -> Option<&MuseRun> {
         match &self.run {
             AgentRun::Muse(run) => Some(run),
             AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
@@ -2811,7 +2811,7 @@ impl Snapshot {
 
     /// An agy's run, `None` for any other agent's.
     #[must_use]
-    pub fn agy(&self) -> Option<&AgyRun> {
+    pub const fn agy(&self) -> Option<&AgyRun> {
         match &self.run {
             AgentRun::Agy(run) => Some(run),
             AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Gemini(_) => None,
@@ -2820,7 +2820,7 @@ impl Snapshot {
 
     /// A Gemini CLI's run, `None` for any other agent's.
     #[must_use]
-    pub fn gemini(&self) -> Option<&GeminiRun> {
+    pub const fn gemini(&self) -> Option<&GeminiRun> {
         match &self.run {
             AgentRun::Gemini(run) => Some(run),
             AgentRun::Claude | AgentRun::Codex(_) | AgentRun::Muse(_) | AgentRun::Agy(_) => None,
@@ -2846,7 +2846,7 @@ pub enum AgentRun {
 impl AgentRun {
     /// The agent whose run it is.
     #[must_use]
-    pub fn agent(&self) -> upgrade::Agent {
+    pub const fn agent(&self) -> upgrade::Agent {
         match self {
             AgentRun::Claude => upgrade::Agent::Claude,
             AgentRun::Codex(_) => upgrade::Agent::Codex,
@@ -3377,13 +3377,13 @@ pub enum ExitRecord {
 impl ExitRecord {
     /// The exit was a crash, read at the exit.
     #[must_use]
-    pub fn crashed(&self) -> bool {
+    pub const fn crashed(&self) -> bool {
         matches!(self, Self::Survived(_) | Self::Crashed | Self::Restarted)
     }
 
     /// One word for the host's log.
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             Self::Unread => "unread",
             Self::Survived(_) => "survived",
@@ -3616,7 +3616,7 @@ pub fn after_host_ended_from(
 
 /// The line the crash rule validated for `snap`'s codex-alab ([`CodexRun::self_claimed`]), when its snapshot carries one.
 #[must_use]
-pub fn self_claimed_line(snap: &Snapshot) -> Option<&super::self_claimed::Resume> {
+pub const fn self_claimed_line(snap: &Snapshot) -> Option<&super::self_claimed::Resume> {
     match &snap.run {
         AgentRun::Codex(run) => run.self_claimed.as_ref(),
         AgentRun::Claude | AgentRun::Muse(_) | AgentRun::Agy(_) | AgentRun::Gemini(_) => None,
@@ -4311,7 +4311,7 @@ pub fn in_flight_here(opts: &Opts, tab: &str, session: &str) -> bool {
     load(opts, session).is_some_and(|st| st.in_flight() && st.tab == tab)
 }
 
-fn carried_here(agent: upgrade::Agent) -> bool {
+const fn carried_here(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
         upgrade::Agent::Codex
@@ -4922,13 +4922,13 @@ impl Relaunches {
 
     /// Whether the standing word is this relaunch's that keeps failing.
     #[must_use]
-    pub fn failing(&self) -> bool {
+    pub const fn failing(&self) -> bool {
         self.failing
     }
 
     /// Whether this relaunch's failing was said beside a standing word that asks for a conversation ([`Self::failing_said`]).
     #[must_use]
-    pub fn failing_said(&self) -> bool {
+    pub const fn failing_said(&self) -> bool {
         self.failing_said
     }
 
@@ -4955,11 +4955,11 @@ impl Relaunches {
 
     /// Whether the exit being handled is a crash ([`Self::exited_as`]).
     #[must_use]
-    pub fn crash(&self) -> bool {
+    pub const fn crash(&self) -> bool {
         self.crash
     }
 
-    fn start_healthy_clock(&mut self, now: Instant) {
+    const fn start_healthy_clock(&mut self, now: Instant) {
         if self.last.is_none() && self.streak > 0 {
             self.last = Some(now);
         }
@@ -4967,19 +4967,19 @@ impl Relaunches {
 
     /// Whether a relaunch is due.
     #[must_use]
-    pub fn pending(&self) -> bool {
+    pub const fn pending(&self) -> bool {
         self.pending
     }
 
     /// `(left, badged, streak, misses)`.
     #[must_use]
-    pub fn counts(&self) -> (bool, bool, u32, u32) {
+    pub const fn counts(&self) -> (bool, bool, u32, u32) {
         (self.left, self.badged, self.streak, self.misses)
     }
 
     /// Whether the exit being handled is a restart of the harness's own ([`OnExit::Restarted`]).
     #[must_use]
-    pub fn restarted(&self) -> bool {
+    pub const fn restarted(&self) -> bool {
         self.restarted
     }
 }

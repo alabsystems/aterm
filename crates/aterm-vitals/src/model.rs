@@ -357,6 +357,11 @@ impl VolumeSample {
 pub struct TabRoot {
     /// The host's stable key for it (its session id).
     pub key: u64,
+    /// The key the tab it is a pane of goes by, the same on each of that
+    /// tab's panes: the least of their keys (its own for a tab of one pane
+    /// or a session no window shows). The split counts a tab split into
+    /// panes as one (`explain::split`).
+    pub tab: u64,
     /// Its shell's pid; 0 when it has none (a native tab).
     pub shell_pid: u32,
     /// Its label, `Tab 2`.
@@ -2807,6 +2812,7 @@ mod tests {
     fn tab(key: u64, shell: u32, label: &str, program: &str) -> TabRoot {
         TabRoot {
             key,
+            tab: key,
             shell_pid: shell,
             label: label.into(),
             program: program.into(),

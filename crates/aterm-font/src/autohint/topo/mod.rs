@@ -38,8 +38,6 @@ impl<T> core::ops::Index<Dimension> for [T] {
 }
 
 /// Segments and edges for one dimension of an outline.
-///
-// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.h#L309>
 #[derive(Clone, Default, Debug)]
 pub struct Axis {
     /// Either horizontal or vertical.
@@ -66,16 +64,12 @@ impl Axis {
     }
 
     /// Inserts the given edge into the sorted edge list.
-    ///
-    /// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.c#L197>
     pub(crate) fn insert_edge(&mut self, edge: Edge, top_to_bottom_hinting: bool) {
         self.edges.push(edge);
         let edges = self.edges.as_mut_slice();
-        // If this is the first edge, we're done.
         if edges.len() == 1 {
             return;
         }
-        // Now move it into place
         let mut ix = edges.len() - 1;
         while ix > 0 {
             let prev_ix = ix - 1;
@@ -110,8 +104,6 @@ impl Axis {
 }
 
 /// Flags that define the properties of segments and edges.
-///
-// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.h#L227>
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 pub struct TopoFlags(pub(crate) u8);
 
@@ -172,8 +164,6 @@ impl core::ops::BitAndAssign for TopoFlags {
 }
 
 /// Sequence of points with a single dominant direction.
-///
-// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.h#L262>
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Segment {
     /// Flags describing the properties of the segment.
@@ -246,8 +236,6 @@ impl Segment {
 }
 
 /// Sequence of segments used for grid-fitting.
-///
-// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afhints.h#L286>
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Edge {
     /// Original, unscaled position in font units.
@@ -294,7 +282,6 @@ mod tests {
             height: i16::MAX,
             ..Default::default()
         };
-        // Just don't panic with overflow
         segment.adjust_height(i32::MIN, i32::MAX);
         segment.adjust_height(i32::MAX, i32::MIN);
     }

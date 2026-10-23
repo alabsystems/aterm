@@ -4863,7 +4863,11 @@ fn aliases_are_rolled_back_and_tombstoned_with_their_primary() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The front-of-PATH twin follows the rollback.
+/// The front-of-PATH twin follows the rollback. An agent program is laid at `bin/<tool>` and
+/// again under `agents/` (which the shell hook puts first on PATH), and the twin names its
+/// store build directly; a rollback must re-point it with `bin/`, and a fresh-install undo
+/// remove it, or `claude` keeps running the build being rolled away from (which gc's claim
+/// union, blind to `agents/`, may then delete).
 #[test]
 fn rollback_repoints_the_front_of_path_agents_twin() {
     let dir = scratch("rb-agents-twin");

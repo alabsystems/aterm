@@ -86,7 +86,9 @@ fn definite_failure(e: &io::Error) -> bool {
     ) || raw_unreachable(e)
 }
 
-/// A resolver answer that specifically says the name has no address.
+/// A resolver answer that specifically says the name has no address. On macOS std reports
+/// `getaddrinfo` errors as `Uncategorized` with no raw OS code, so only the known no-name
+/// wording tells that answer from a temporary DNS failure.
 fn definite_name_failure(e: &io::Error) -> bool {
     if e.kind() == io::ErrorKind::NotFound {
         return true;
@@ -333,7 +335,11 @@ impl NetProbe {
     }
 }
 
-/// What decides an agent's route, read now.
+/// What decides an agent's route, read now. `env` is its exec environment (`None`: unreadable,
+/// and nothing else is read), `argv` its command line, `cwd` its directory (not absolute:
+/// unknown, and its project settings are reported unread), `managed` and `prefs` Claude Code's
+/// managed-settings and managed-preferences directories, `home` this process's home (all
+/// parameters so tests read a scratch tree).
 fn gather(
     env: Option<Vec<String>>,
     argv: &[String],
@@ -465,7 +471,9 @@ mod tests {
         ])
     }
 
-    /// Replay a stop after the real worker checked its predicate but before it parks.
+    /// Replay a stop after the real worker checked its predicate but before it parks. The
+    /// unlocked publisher skips the mutex; a second wake then releases its worker, so neither
+    /// arm leaks.
     fn shutdown_at_park_trace(publisher: ShutdownPublisher) -> Vec<ShutdownObservation> {
         let probe = Arc::new(Seam::new(
             Err(io::Error::other("this fixture must never resolve")),
@@ -882,7 +890,10 @@ mod tests {
         vars
     }
 
-    /// A quiet tree leaves the stored login.
+    /// A quiet tree leaves the stored login. It is gone where a settings source (user, project,
+    /// `--settings`) gives an API key, a profile or an `apiKeyHelper` or does not parse, where the
+    /// vendor's profile store holds a config (`$HOME/.config/anthropic`, or `ANTHROPIC_CONFIG_DIR`)
+    /// or sits in a file-provider domain, and where the environment is unread or empty.
     #[test]
     fn an_agents_settings_and_profile_store_can_take_its_stored_login_away() {
         let dir = scratch("stored");

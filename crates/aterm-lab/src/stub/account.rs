@@ -36,7 +36,7 @@ impl Route {
 
     /// The account file's key that answers it.
     #[must_use]
-    pub fn key(self) -> &'static str {
+    pub const fn key(self) -> &'static str {
         match self {
             Route::Usage => "usage",
             Route::Profile | Route::CliProfile => "profile",
@@ -46,7 +46,7 @@ impl Route {
 
     /// The log's word for it.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Route::Usage => "usage",
             Route::Profile => "profile",

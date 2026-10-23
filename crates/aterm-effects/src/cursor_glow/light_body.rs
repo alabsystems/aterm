@@ -26,7 +26,8 @@ pub(crate) fn light_floor_at(theme_fg: u32, bar: f32) -> f32 {
     bar * (relative_luminance(theme_fg) + 0.05) - 0.05
 }
 
-/// A walk toward white by `w`: `c + w · (255 − c)`.
+/// A walk toward white by `w`: `c + w · (255 − c)`. Channel differences
+/// all scale by `1 − w`, so the hue direction is kept and only saturation falls.
 #[inline]
 const fn toward_white(rgb: u32, w: f32) -> u32 {
     let ch16 = ((rgb >> 16) & 0xff) as f32;

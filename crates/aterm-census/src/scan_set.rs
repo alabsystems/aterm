@@ -311,7 +311,7 @@ fn strip_comment(line: &str) -> &str {
 }
 
 /// Net bracket/brace depth delta of a line, ignoring brackets inside strings.
-fn depth_delta(line: &str) -> i32 {
+const fn depth_delta(line: &str) -> i32 {
     let bytes = line.as_bytes();
     let mut in_str = false;
     let mut d = 0i32;

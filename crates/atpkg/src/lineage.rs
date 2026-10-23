@@ -23,7 +23,8 @@ pub const SEED_MINT_SCHEMA: &str = "trust-seed-mint-v1";
 /// Trust compiler) and `pin-ancestor` (an earlier pin).
 const ACCEPTED_RELATIONS: [&str; 3] = ["lineage-disjoint", "same-lineage", "pin-ancestor"];
 
-/// The largest receipt read.
+/// The largest receipt read. A real SEED-MINT lists every stage2 file the double compile
+/// compared — thousands of lines, well under a megabyte.
 const RECEIPT_LIMIT: usize = 64 << 20;
 
 /// How long `trustc -vV` may take before the compiler counts as not answering.
@@ -885,7 +886,8 @@ impl Matcher<'_> {
         !self.admitted.starts_with(short)
     }
 
-    /// Examine every anchor (`rust…`) starting in `[from, to)`.
+    /// Examine every anchor (`rust…`) starting in `[from, to)`. Bytes past `to` (up to
+    /// [`TAIL`]) and two before `from` are readable.
     fn scan(&mut self, buf: &[u8], from: usize, to: usize) {
         let mut i = from;
         while i < to {

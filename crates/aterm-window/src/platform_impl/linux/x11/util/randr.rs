@@ -4,10 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/randr.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (RandR's requests are
-// aterm-x11's encoders, and `Xft.dpi` comes from aterm-x11's resource database, where
-// upstream used x11rb's.)
-
 use std::str::FromStr;
 use std::{env, str};
 
@@ -28,14 +24,12 @@ pub fn calc_dpi_factor(
     (width_px, height_px): (u32, u32),
     (width_mm, height_mm): (u64, u64),
 ) -> f64 {
-    // See http://xpra.org/trac/ticket/728 for more information.
     if width_mm == 0 || height_mm == 0 {
         warn!("XRandR reported that the display's 0mm in size, which is certifiably insane");
         return 1.0;
     }
 
     let ppmm = ((width_px as f64 * height_px as f64) / (width_mm as f64 * height_mm as f64)).sqrt();
-    // Quantize 1/12 step size
     let dpi_factor = ((ppmm * (12.0 * 25.4 / 96.0)).round() / 12.0).max(1.0);
     assert!(validate_scale_factor(dpi_factor));
     if dpi_factor <= 20. {
@@ -46,9 +40,7 @@ pub fn calc_dpi_factor(
 }
 
 impl XConnection {
-    // Retrieve DPI from Xft.dpi property
     pub fn get_xft_dpi(&self) -> Option<f64> {
-        // Try to get it from XSETTINGS first.
         if let Some(xsettings_screen) = self.xsettings_screen() {
             match self.xsettings_dpi(xsettings_screen) {
                 Ok(Some(dpi)) => return Some(dpi),
@@ -82,7 +74,6 @@ impl XConnection {
                 return None;
             },
         };
-        // Override DPI if `WINIT_X11_SCALE_FACTOR` variable is set
         let deprecated_dpi_override = env::var("WINIT_HIDPI_FACTOR").ok();
         if deprecated_dpi_override.is_some() {
             warn!(

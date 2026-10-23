@@ -1029,7 +1029,8 @@ impl SkyMask {
         mask
     }
 
-    /// Is the landing row's cell `k` columns from the caret proven blank?
+    /// Is the landing row's cell `k` columns from the caret proven blank? The
+    /// jets' gate.
     #[inline]
     #[must_use]
     const fn row_blank(self, k: i32) -> bool {
@@ -1960,7 +1961,9 @@ impl Flight {
     }
 }
 
-/// Which of the two train layers is being built (§6.5 layers 1-3).
+/// Which of the two train layers is being built (§6.5 layers 1-3). They share
+/// one station walk and differ in the stream they land in, the falloff length,
+/// and whether the colour comes from the arc or is white.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Layer {
     /// Layer 1 — `spectrum(t_m(s))` into `under`, below ink, never blooms.
@@ -2000,7 +2003,9 @@ fn draw_train(
     rasterize(frame.out, clip, verts, f.axis, step, cap, GlowBlend::Add);
 }
 
-/// D15's axis rule, spent.
+/// D15's axis rule, spent. Neither rasterizer is a fallback for the other:
+/// each is degenerate on the axis its twin owns, and a producer that guesses
+/// wrong draws nothing rather than drawing badly.
 #[inline]
 fn rasterize(
     out: &mut Vec<GlowQuad>,
@@ -2151,7 +2156,10 @@ fn build_stations(
     }
 }
 
-/// Emit the coma, the nucleus and the terminal flash's radius pop.
+/// Emit the coma, the nucleus and the terminal flash's radius pop. The nucleus is
+/// the brightest and smallest thing (§3.2), leading the train by
+/// [`NUCLEUS_LEAD_PX`]; `RainHalo` has no rotation, so on a diagonal only the
+/// dominant axis stretches.
 fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     if f.headless {
         return;
@@ -2524,7 +2532,8 @@ fn burst_lance(
     }
 }
 
-/// One jet: the distance grade, along the flight line, at no rise cost.
+/// One jet: the distance grade, along the flight line, at no rise cost. It roots
+/// where the core's envelope ends and shares the star's clock and colour law.
 #[allow(clippy::too_many_arguments)]
 fn burst_jet(
     frame: &mut Frame<'_>,
@@ -2846,7 +2855,9 @@ fn spark_room(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> Opti
     Some((m.x1 - geom.cell_center(row, col).0).max(0.0))
 }
 
-/// Mint the marks the arrival edge owns (§6.7), on one `Instant`.
+/// Mint the marks the arrival edge owns (§6.7), on one `Instant`. The fan's
+/// composition is the sky's ([`Stardust::sow_fan`]); this decides its count,
+/// reach, hero flag and seed.
 fn mint_landing(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> Landing {
     let at = m.arrival();
     let ch = ctx.geom.ch as f32;
@@ -2925,7 +2936,9 @@ fn ms_since(a: Instant, b: Instant) -> f32 {
     b.saturating_duration_since(a).as_secs_f32() * 1000.0
 }
 
-/// Is a window pixel inside the effects box (the sky's glass test)?
+/// Is a window pixel inside the effects box (the sky's glass test)? A mark minted
+/// at a pixel a scroll may have moved is dropped outside it, never clamped (seam
+/// point 12).
 #[inline]
 const fn on_glass(geom: Geom, x: f32, y: f32) -> bool {
     super::stardust::on_glass((x.round() as i32, y.round() as i32), geom)
@@ -3246,7 +3259,9 @@ mod tests {
         dust
     }
 
-    /// The sky with the landing row and its neighbours proved blank.
+    /// The sky with the landing row and its neighbours proved blank. `sky()` leaves
+    /// them unknown (the probe keeps its last `GlyphProbe::ROWS`), and unknown is not
+    /// blank (L4).
     fn sky_around(row: i32) -> Stardust {
         let mut dust = Stardust::new();
         for r in row - 1..=row + 1 {
@@ -3959,7 +3974,9 @@ mod tests {
         );
     }
 
-    /// §6.9: only one head is ever in the air per row.
+    /// §6.9: only one head is ever in the air per row. Two same-row flights
+    /// that never come near each other still retire the older head, unless it
+    /// has landed, in which case its train finishes on its own law.
     #[test]
     fn only_one_head_is_in_the_air_per_row() {
         let cfg = config();
@@ -5165,7 +5182,9 @@ mod tests {
         at_right: bool,
     }
 
-    /// The clock step between two arrivals the harness makes.
+    /// The clock step between two arrivals the harness makes. Every landing
+    /// lives exactly 600 ms, so arrivals a microsecond apart expire a
+    /// microsecond apart — in arrival order, one per `Expire`.
     const POOL_TICK: Duration = Duration::from_micros(1);
 
     /// A fault injected after a real admission, given the pool as it stood
@@ -5200,7 +5219,10 @@ mod tests {
             }
         }
 
-        /// Drive `step` on the real pool.
+        /// Drive `step` on the real pool. `Ok(false)` when the real clock cannot realise
+        /// it (an arrival must not outlive a resident while it flies; the model's `Land`
+        /// expires nothing); `Err` when the real code did something the step cannot be
+        /// read as.
         fn drive(&mut self, step: PoolStep, patch: PoolPatch) -> Result<bool, String> {
             let cfg = config();
             let before = self.m.landings.clone();

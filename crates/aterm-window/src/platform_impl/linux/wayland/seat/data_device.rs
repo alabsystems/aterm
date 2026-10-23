@@ -18,9 +18,13 @@ use crate::platform_impl::common::percent::{percent_decode_utf8, uri_list_entrie
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{self, WindowId};
 
+/// The mime type aterm/iTerm-style file drops are delivered through. File
+/// managers advertise dragged files as a newline-separated list of `file://`
 /// URIs under this type (RFC 2483).
 const URI_LIST: &str = "text/uri-list";
 
+/// Cap on a single drop's `text/uri-list` payload. A hostile or buggy source
+/// could otherwise stream unbounded bytes into the event loop; 1 MiB is far more
 /// than any real multi-file selection of paths and bounds the accumulation.
 const MAX_URI_LIST_BYTES: usize = 1 << 20;
 
@@ -32,6 +36,8 @@ pub struct DndPipe {
     data: Vec<u8>,
     /// The pipe's read end, non-blocking.
     pipe: PipeReader,
+    /// The drop offer, kept alive so it can be `finish`ed on EOF (the Wayland
+    /// protocol requires the destination to finish a dropped offer); it is
     /// destroyed when it drops.
     offer: Dropped,
 }
@@ -193,6 +199,11 @@ pub(crate) fn set_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Parse a `text/uri-list` payload into local filesystem paths, mirroring the X11
+/// backend (`dnd.rs::local_paths`): frame raw entries before decoding, accept
+/// only `file://` URIs without a hostname, and skip comment lines (`#…`) and any
+/// entry that names no local file, keeping the rest. Each path is the one the
+/// source named: a symlink dropped is the link, not its target, and nothing reads
 /// the filesystem on the event loop's thread (this canonicalised each path).
 fn parse_uri_list(data: &[u8]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -246,6 +257,7 @@ mod tests {
         assert!(parse_uri_list(b"%66ile:///tmp/f\r\nfile://%2Ftmp/f\r\n").is_empty());
     }
 
+    /// A dropped symlink is the link the source named, not its target. Negative
     /// control: canonicalising each path, as this did, yields the target.
     #[test]
     fn parse_uri_list_keeps_a_symlink_as_named() {

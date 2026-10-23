@@ -2,28 +2,17 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Display-offset damage: which rows need redrawing when the scroll position
-//! into history changes. The viewport-scroll paths in `grid/scroll.rs` delegate
-//! here.
+//! Row damage calculation for viewport display-offset transitions.
 
 use super::Damage;
 
 /// Damage result for a display-offset transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisplayOffsetDamage {
-    /// No damage — offsets unchanged.
     None,
-    /// Full screen changed — delta >= visible_rows.
     Full,
-    /// Top N rows are new content (scrolled up into history).
     TopRows(u16),
-    /// Bottom N rows are new content (scrolled down toward live).
-    BottomRows {
-        /// First damaged row (inclusive).
-        start: u16,
-        /// Exclusive end row (the visible row count).
-        end: u16,
-    },
+    BottomRows { start: u16, end: u16 },
 }
 
 /// Damage for a display-offset transition over `visible_rows`.

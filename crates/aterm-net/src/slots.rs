@@ -685,7 +685,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A listener on `[::]` that also takes IPv4, and the port it took.
+    /// A listener on `[::]` that also takes IPv4, and the port it took. It
+    /// sees a 127.0.0.1 peer as `::ffff:127.0.0.1` ([`source_of`]: 127.0.0.1)
+    /// and a ::1 peer as `::/64`: two addresses on loopback with no second
+    /// one configured, which a listener on 127.0.0.1 cannot see (lo0 carries
+    /// no other usable IPv4 address without an alias, which needs root).
     pub(crate) fn dual_stack_listener(test: &str) -> (TcpListener, u16) {
         fn not_run(test: &str, why: &str) -> ! {
             aterm_spec::host::could_not_run(format!("{test}: no dual-stack loopback here ({why})"))
@@ -715,7 +719,11 @@ pub(crate) mod tests {
         (listener, port)
     }
 
-    /// The module doc's rule, case by case, on synthetic addresses.
+    /// The module doc's rule, case by case, on synthetic addresses. The real-socket
+    /// tests reach two sources through a dual-stack listener (127.0.0.1 and
+    /// ::1), which is enough for rule 1 and rule 2's address bound end to end;
+    /// the margin of two, ties, relays and ages are pinned here, where any
+    /// number of addresses is free.
     #[test]
     fn a_newcomer_takes_only_an_unauthenticated_slot_by_the_rule() {
         let t0 = Instant::now();

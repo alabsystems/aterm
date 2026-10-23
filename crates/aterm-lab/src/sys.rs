@@ -408,7 +408,7 @@ impl SignalPipe {
 
 /// Build a `pollfd` polling `POLLIN` on `fd`.
 #[must_use]
-pub fn pollfd(fd: RawFd) -> libc::pollfd {
+pub const fn pollfd(fd: RawFd) -> libc::pollfd {
     libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -2131,7 +2131,7 @@ pub mod tis {
 
         /// Keyboard type (`LMGetKbdType`) used by this layout.
         #[must_use]
-        pub fn keyboard_type(&self) -> u32 {
+        pub const fn keyboard_type(&self) -> u32 {
             self.kbd
         }
 

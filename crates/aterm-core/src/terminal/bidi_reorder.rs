@@ -921,7 +921,10 @@ mod tests {
             .collect()
     }
 
-    /// An `ls`-shaped row whose first entry is Hebrew.
+    /// An `ls`-shaped row whose first entry is Hebrew. The grid holds
+    /// "אב.txt  foo.txt  bar.txt"; under the default (SCP 0, DECSET 2501 reset)
+    /// the paragraph is LTR, so only the Hebrew run reverses and the LTR columns
+    /// keep their places instead of the whole row mirroring.
     const LS_ROW: &str = "\u{05D0}\u{05D1}.txt  foo.txt  bar.txt";
     const LS_ROW_LTR: &str = "\u{05D1}\u{05D0}.txt  foo.txt  bar.txt";
 

@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A staged, private headless projection of the first-run lane's informational
-//! exit. `ATERM_DEBUG_STATUS_BARS=first-run-info:<dir>` reads only `<dir>/step`,
-//! beneath this instance's private state root. The controller writes 1, 2 and 3
-//! to capture the ahead row, its answered child and its withdrawal separately.
-//! No package child, scheduler, channel, account or machine action runs here.
-//!
-//! The actual PkgLane/marker/exit-2 behavior is the separate real-child fixture
-//! in `head_watch_park_tests`; this seam witnesses its App/Wake presentation.
+//! Headless dev probe for the first-run lane's informational exit row (`first-run-info:<dir>`).
 
 use std::ffi::OsStr;
 use std::io::Read as _;
@@ -63,7 +56,6 @@ pub(crate) fn start(mode: &OsStr, headless: bool, proxy: EventLoopProxy<Wake>) -
             {
                 return;
             }
-            // The seed's exit carries the row into the next child.
             let _ = proxy.send_event(Wake::PkgPassEnded { clean: true });
             if wait_step(&step, 2) {
                 let detail = format!(
@@ -72,8 +64,6 @@ pub(crate) fn start(mode: &OsStr, headless: bool, proxy: EventLoopProxy<Wake>) -
                     atpkg::cli::UNSERVED_ARCHITECTURE_CLAUSE
                 );
                 let _ = proxy.send_event(Wake::PkgSeedUnusable { detail });
-                // Exactly the production informational/unannounced sequence: the
-                // lane carries this unclean child exit, then its park withdraws.
                 let _ = proxy.send_event(Wake::PkgFirstRunAhead { open: true });
                 let _ = proxy.send_event(Wake::PkgPassEnded { clean: false });
                 let _ = wait_step(&step, 3);
@@ -87,13 +77,10 @@ pub(crate) fn start(mode: &OsStr, headless: bool, proxy: EventLoopProxy<Wake>) -
     true
 }
 
-/// One minute is a missing-controller hang detector, never a latency budget.
-/// Only this dev-only worker polls; no timer wakes the GUI or keeps a row live.
+/// Waits up to one minute for the step file at `path` to reach `wanted`.
 fn wait_step(path: &Path, wanted: u8) -> bool {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        // No stat/open gap: a replaced symlink is refused and a FIFO cannot
-        // block at open. Check the opened object before reading two bytes.
         let opened = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

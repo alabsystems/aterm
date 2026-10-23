@@ -137,7 +137,7 @@ impl Class {
 
     /// The wire spelling (design §5.5's safelist names, verbatim).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Class::AtpkgGc => "atpkg-gc",
             Class::ClaudeStaleVersions => "claude-stale-versions",
@@ -154,7 +154,7 @@ impl Class {
 
     /// The command that owns removal for this class, when it is not us.
     #[must_use]
-    pub fn delegate(self) -> Option<Delegate> {
+    pub const fn delegate(self) -> Option<Delegate> {
         match self {
             Class::AtpkgGc => Some(Delegate::AtermPkgGc),
             Class::ClaudePurge => Some(Delegate::ClaudeProjectPurge),
@@ -173,7 +173,7 @@ pub enum Delegate {
 impl Delegate {
     /// The command to run, verbatim.
     #[must_use]
-    pub fn command(self) -> &'static str {
+    pub const fn command(self) -> &'static str {
         match self {
             Delegate::AtermPkgGc => "aterm pkg gc",
             Delegate::ClaudeProjectPurge => "claude project purge --dry-run",
@@ -182,7 +182,7 @@ impl Delegate {
 
     /// Why this module will not run it.
     #[must_use]
-    pub fn because(self) -> &'static str {
+    pub const fn because(self) -> &'static str {
         match self {
             Delegate::AtermPkgGc => "the store is under atpkg's single-writer lock",
             Delegate::ClaudeProjectPurge => "it reaches the vendor's own project history",
@@ -273,7 +273,7 @@ impl Config {
 
     /// Whether tier 3 ([`Witness::IdleWhole`]) may remove.
     #[must_use]
-    pub fn idle_whole_on(&self) -> bool {
+    pub const fn idle_whole_on(&self) -> bool {
         self.idle_build_dirs && self.idle_build_days >= 1 && self.auto_free_gib > 0
     }
 
@@ -302,7 +302,7 @@ impl Config {
 
     /// The free bytes the pressure pass reclaims up to before it stops: the floor plus [`PRESSURE_MARGIN_GIB`].
     #[must_use]
-    pub fn pressure_target_bytes(&self) -> u64 {
+    pub const fn pressure_target_bytes(&self) -> u64 {
         self.auto_free_gib
             .saturating_add(PRESSURE_MARGIN_GIB)
             .saturating_mul(GIB)
@@ -452,7 +452,7 @@ pub enum Level {
 impl Level {
     /// The wire spelling (`disk=` of a status line, `level` of the JSON).
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Level::Unknown => "unknown",
             Level::Ok => "ok",
@@ -519,7 +519,7 @@ pub enum Trigger {
 impl Trigger {
     /// The wire spelling.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Trigger::OnDemand => "on-demand",
             Trigger::Tick => "tick",
@@ -722,7 +722,7 @@ impl Witness {
 
     /// The witness kind, as the JSON row spells it.
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub const fn kind(&self) -> &'static str {
         match self {
             Witness::StaleBuildDir { .. } => "stale-build-dir",
             Witness::LeastRecentlyUsed { .. } => "least-recently-used",
@@ -748,7 +748,7 @@ pub enum Tier {
 impl Tier {
     /// Its number, as a row's `tier=` and the journal spell it.
     #[must_use]
-    pub fn number(self) -> u8 {
+    pub const fn number(self) -> u8 {
         self as u8
     }
 }
@@ -1694,7 +1694,7 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
     }
 }
 
-fn is_pressure(r: &Row) -> bool {
+const fn is_pressure(r: &Row) -> bool {
     matches!(r.witness, Witness::LeastRecentlyUsed { .. })
 }
 
@@ -1940,7 +1940,7 @@ pub enum Refusal {
 impl Refusal {
     /// The short reason code the ledger row carries.
     #[must_use]
-    pub fn code(&self) -> &'static str {
+    pub const fn code(&self) -> &'static str {
         match self {
             Refusal::NoClass => "no-class",
             Refusal::ApplyOff(_) => "apply-off",
@@ -1956,7 +1956,7 @@ impl Refusal {
 
     /// The class this refusal is about, when it has one.
     #[must_use]
-    pub fn class(&self) -> Option<Class> {
+    pub const fn class(&self) -> Option<Class> {
         match self {
             Refusal::ApplyOff(c) | Refusal::Delegated(c, _) => Some(*c),
             _ => None,
@@ -2268,7 +2268,7 @@ pub enum StopBy {
 impl StopBy {
     /// As the journal row spells it.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             StopBy::Measured => "measured",
             StopBy::Counted => "counted",

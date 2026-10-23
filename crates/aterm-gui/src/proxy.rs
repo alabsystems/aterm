@@ -493,7 +493,8 @@ pub(crate) fn retire_graph_entry(sock_dir: &Path, sid: &SessionId) {
     }
 }
 
-/// Open (create/truncate) a private sidecar file for writing.
+/// Open (create/truncate) a private sidecar file for writing. Unix: mode
+/// `0600`.
 #[cfg(unix)]
 fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -633,7 +634,11 @@ fn owner_file(lock: &OwnerLock) -> &std::fs::File {
     lock
 }
 
-/// Remove the edge-token files in `dir` whose owning parent is gone.
+/// Remove the edge-token files in `dir` whose owning parent is gone. A file is
+/// its parent's while the parent's `flock` on it holds ([`EdgeFile`]), probed
+/// as the crash markers are (`crash_signal::markers::probe`): a file whose lock
+/// this sweep can take belongs to a dead parent (its tokens authorize nothing
+/// again, since the child's `(sid, nonce)` is never reissued) and is removed.
 #[cfg(unix)]
 fn sweep_dead_edge_files(dir: &Path) {
     use crate::crash_signal::markers::{Owner, probe};
@@ -736,7 +741,9 @@ pub(crate) fn read_graph_entry(sock_dir: &Path, sid: Sid<'_>) -> Option<(String,
     parse_graph_entry(&body)
 }
 
-/// Parse a graph-entry body's `sock` and `nonce` lines.
+/// Parse a graph-entry body's `sock` and `nonce` lines. The `sock` line is the
+/// shared on-disk format (`aterm_types::control_socket::graph_entry_sock`, also
+/// read by `aterm-ctl`'s self-location); the nonce line is server-only.
 fn parse_graph_entry(body: &str) -> Option<(String, LaunchNonce)> {
     let sock = aterm_types::control_socket::graph_entry_sock(body)?;
     let nonce = body
@@ -1176,7 +1183,9 @@ fn copy_host_to_client<R: Read, W: Write>(
     }
 }
 
-/// Copy `reader` → `writer` in 32 KiB chunks until EOF or error.
+/// Copy `reader` → `writer` in 32 KiB chunks until EOF or error. `ready` is
+/// asked before each read; its `false` (the relay hung the reader's end up)
+/// is that end's EOF, as a read of it would have said.
 fn copy_until_eof<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -1427,7 +1436,11 @@ mod tests {
         assert_eq!(child.join().unwrap(), "", "the verb was never sent");
     }
 
-    /// A HOST'S UNASKED BYTES ARE NEVER RELAYED AS AN ANSWER.
+    /// A HOST'S UNASKED BYTES ARE NEVER RELAYED AS AN ANSWER. A host sends
+    /// nothing past its probe answer before it is sent the verb, so bytes after
+    /// that line (here one more line, in the write that carries the answer)
+    /// fail the forward before delivery: the caller answers `ERR forward`, the
+    /// verb never reaches the host and the relay never starts.
     #[test]
     fn a_probe_surplus_is_refused_before_delivery() {
         for surplus in [true, false] {
@@ -1586,7 +1599,9 @@ mod tests {
         }
     }
 
-    /// The relay carries an arbitrary request → response (incl.
+    /// The relay carries an arbitrary request → response (incl. a multi-line body
+    /// and raw non-UTF-8 bytes) transparently, presenting the TOKEN handshake
+    /// with the token beside the host's socket.
     #[test]
     fn relay_hop_pipes_handshake_and_response() {
         let dir_guard = crate::test_scratch::short_dir("the child's socket");
@@ -1974,7 +1989,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A dead parent's edge file is swept, a live one's never.
+    /// A dead parent's edge file is swept, a live one's never. A parent holds
+    /// its file's owner lock for the child's life; the sweep removes a file
+    /// whose lock is free (here, its handle dropped without the clean retire's
+    /// removal, as a crash leaves it).
     #[cfg(unix)]
     #[test]
     fn a_dead_parents_edge_file_is_swept_and_a_live_ones_never() {

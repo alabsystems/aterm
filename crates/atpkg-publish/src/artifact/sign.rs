@@ -27,7 +27,7 @@ pub struct Authority {
 impl Authority {
     /// Its `roster_seq`.
     #[must_use]
-    pub fn seq(&self) -> u64 {
+    pub const fn seq(&self) -> u64 {
         self.roster.seq()
     }
 

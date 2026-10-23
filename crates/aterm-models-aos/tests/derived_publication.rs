@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-0 of `aos_boundary_publication_model`: the laws hold over the whole bounded space, each
-//! law is broken by its own `Buggy` dial and by no other, the registry sweep finds nothing in
-//! either declared configuration, and the protocol's named cases (Aos plan §4) walk as designed.
-//! Tier-1 against the real `Boundary` is `aterm-aos`'s `tests/conformance_publication.rs`.
+//! Tier-0 state-space and negative-control checks for `aos_boundary_publication_model`.
 
 use std::collections::BTreeSet;
 

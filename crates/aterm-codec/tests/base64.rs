@@ -1,17 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm_codec::base64`: padded standard alphabet on encode; canonical padding
-//! and no trailing bits on strict decode. The strict decoder is what reads the
-//! pinned Ed25519 anchors, the machine roster and the signed atpkg index cache,
-//! so the property pinned here is exact: `decode_strict` accepts a string iff
-//! it is the canonical encoding of what it decodes to.
+//! Standard and strict base64 encoding and decoding tests.
 
 use aterm_codec::base64::{decode, decode_strict, encode, encode_into, encoded_len};
 use aterm_spec::rng::XorShift;
 
-/// Strict accepts `text` exactly when the lenient decode succeeds AND
-/// re-encoding reproduces `text`, and then yields the same bytes.
+/// Strict accepts `text` iff lenient decode succeeds and re-encoding reproduces `text`.
 fn strict_is_canonical(text: &[u8]) {
     let strict = decode_strict(text).ok();
     let canonical = std::str::from_utf8(text)
@@ -150,8 +145,6 @@ fn exhaustive_short_strings_are_accepted_only_when_canonical() {
             strict_is_canonical(&buf);
         }
     }
-    // Two full quads, so interior padding and a second-quad trailing-bit
-    // violation are both reached.
     const NARROW: &[u8] = b"AQh=/";
     for n in 0..NARROW.len().pow(8) {
         buf.clear();

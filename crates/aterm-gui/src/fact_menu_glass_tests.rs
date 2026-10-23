@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FACTS' MENUS ON THE GLASS (`crate::fact_menu`): a real engine drawing
-//! Claude Code's bottom block, one frame through the capture route's
-//! splices and the menu's, a real right press on the cell of the fact the
-//! painter RECORDED — the card hung from it, what each row does, and the
-//! bytes the session's PTY sink received (none); and the usage's Traffic
-//! card, opened and closed by a click on `Σ`. It drives the lights' gesture
-//! rig (`claude_lights::gesture_tests`).
+//! Glass-level gesture tests for [`crate::fact_menu`] and the usage traffic card.
 
 use std::sync::Arc;
 
@@ -122,10 +116,8 @@ fn a_right_click_on_a_fact_opens_its_menu_hung_from_it() {
     );
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
     assert_eq!(human_seq(&app, session), human, "no person's gesture");
-    // Esc closes it, and is the menu's.
     assert!(app.autopilot_menu_nav(wid, crate::autopilot_menu::MenuKey::Close));
     assert!(app.autopilot_menu.is_none());
-    // CONTROL: a left click.
     menu_frame(&mut app, wid);
     press_fact(&mut app, wid, session, Fact::Path, MouseButton::Left);
     assert!(app.autopilot_menu.is_none(), "a left click opens no menu");
@@ -155,15 +147,12 @@ fn copy_path_writes_the_absolute_cwd() {
             .as_deref(),
         Some("/Users//someone/aterm")
     );
-    // The pointer off the folder (it chose a row of the card above): a
-    // fact's title under it outranks the notice.
     let (x, y) = px_of(&app, wid, (2, 2));
     app.on_cursor_moved(wid, x, y);
     menu_frame(&mut app, wid);
     let text = row_text(&app, wid, footer_row(&app, wid));
     assert!(text.contains("\u{2713} copied"), "{text:?}");
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
-    // CONTROL: no side.
     crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
     let (mut app, wid, session, _reader) = glass(false);
     press_fact(&mut app, wid, session, Fact::Path, MouseButton::Right);
@@ -233,7 +222,6 @@ fn a_fact_menu_stays_while_its_fact_slides_and_closes_when_it_leaves() {
     assert_ne!(after, before, "CONTROL: the model slid");
     assert_eq!(after.0, before.0, "along its row");
     assert_eq!(owner(&app), Some(MenuOwner::Fact(Fact::Model)), "it stays");
-    // A box over the composer: no rule, no fact.
     feed(
         &app,
         session,
@@ -242,7 +230,6 @@ fn a_fact_menu_stays_while_its_fact_slides_and_closes_when_it_leaves() {
     );
     menu_frame(&mut app, wid);
     assert!(app.autopilot_menu.is_none(), "closed with its fact");
-    // NEGATIVE CONTROL: a focus change.
     draw_claude(&app, session, BYPASS);
     menu_frame(&mut app, wid);
     press_fact(&mut app, wid, session, Fact::Branch, MouseButton::Right);
@@ -272,7 +259,6 @@ fn one_menu_at_a_time() {
         .expect("the chip is on the glass");
     assert_eq!(owner(&app), Some(MenuOwner::Autopilot));
     assert_eq!(app.fact_menu_controls(), ["fact-menu open=false"]);
-    // `open fact-menu close` leaves the Autopilot menu open.
     app.close_fact_menu();
     assert_eq!(owner(&app), Some(MenuOwner::Autopilot));
 }
@@ -403,7 +389,6 @@ fn a_click_on_usage_opens_the_card_and_a_second_click_closes_it() {
             .any(|l| l.starts_with("fact-menu plot index=") && l.contains("\u{2191} in")),
         "{lines:?}"
     );
-    // The second click on Σ closes the card.
     press_fact(&mut app, wid, session, Fact::Usage, MouseButton::Left);
     assert!(app.autopilot_menu.is_none(), "closed");
     assert_eq!(
@@ -413,7 +398,6 @@ fn a_click_on_usage_opens_the_card_and_a_second_click_closes_it() {
     );
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
     assert_eq!(human_seq(&app, session), human, "no person's gesture");
-    // CONTROL: the next click opens it again.
     menu_frame(&mut app, wid);
     press_fact(&mut app, wid, session, Fact::Usage, MouseButton::Left);
     assert_eq!(owner(&app), Some(MenuOwner::Fact(Fact::Usage)));
@@ -437,7 +421,6 @@ fn a_closed_card_reads_no_side() {
     app.on_claude_footer_changed(session);
     menu_frame(&mut app, wid);
     assert_eq!(crate::work_counts::take_traffic_side_reads(), 0);
-    // CONTROL: open, then a wake while open.
     press_fact(&mut app, wid, session, Fact::Usage, MouseButton::Left);
     assert_eq!(crate::work_counts::take_traffic_side_reads(), 1, "the open");
     menu_frame(&mut app, wid);
@@ -503,8 +486,6 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
         app.open_front_autopilot_menu()
             .expect("the chip is on the glass");
     };
-    // The effort's card with the top-effort key's row (`◈`), which a Claude
-    // Code new enough to take the key offers.
     let effort = |app: &mut App| {
         app.open_front_fact_menu(Fact::Effort)
             .expect("the effort is on the glass");
@@ -522,7 +503,6 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
         app.open_front_fact_menu(Fact::Path)
             .expect("the folder is on the glass");
     };
-    // What the card is, how it opens, the glass marks it prints and plain marks it prints.
     type Case = (
         &'static str,
         fn(&mut App),
@@ -569,7 +549,6 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
         assert_eq!(on_card(&app), printed, "{what}: each mark drawn, once");
         menu_frame(&mut app, wid);
         assert_eq!(on_card(&app), printed, "{what}: painted again, once");
-        // CONTROL: the card's other marks keep their glyphs.
         let cells = &app.windows[&wid].input_scratch.cells;
         for &ch in plain {
             let at = (rect.row..rect.row + rect.h)

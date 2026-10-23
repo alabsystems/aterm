@@ -1176,7 +1176,8 @@ fn access_card_posted(app: &mut App, now: std::time::Instant) -> aterm_messages:
     entry.id
 }
 
-/// The access question's lifecycle.
+/// The access question's lifecycle. The verdict and the grant (the two paths with no
+/// platform gate) hold on every host.
 #[test]
 fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
     use super::consent_card::{CardPhase, NeedCause, NeedWords};
@@ -1526,7 +1527,8 @@ fn macos_access_card_stays_inert_off_macos() {
     }
 }
 
-/// An observed dialog's banner names the tab that asked: `<tab title>: <what>`.
+/// An observed dialog's banner names the tab that asked: `<tab title>: <what>`. Negative
+/// control: a session the store does not hold keeps the bare body.
 #[test]
 fn an_observed_dialog_banner_names_the_asking_tab() {
     let app = App::headless_for_test();
@@ -1621,7 +1623,12 @@ fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
     );
 }
 
-/// THE SENTINEL IS THE DEFAULT, AND IT IS QUIET (plan-tcc §3.4).
+/// THE SENTINEL IS THE DEFAULT, AND IT IS QUIET (plan-tcc §3.4). Which
+/// observer an instance actually runs is the config's tri-state with the
+/// master switch and two facts applied: `enabled = false` turns every mode
+/// off; the sentinel exists only to feed the access card, so it needs both
+/// of the card's switches and a windowed macOS instance; Full is an explicit
+/// opt-in that runs wherever it is asked for.
 #[test]
 fn the_effective_observer_mode_follows_the_config_and_the_cards_switches() {
     use super::consent_observer::ObserverMode;
@@ -1683,7 +1690,8 @@ fn the_effective_observer_mode_follows_the_config_and_the_cards_switches() {
     );
 }
 
-/// What the test observer arms report.
+/// What the test observer arms report. A `fn` arm can speak only through a
+/// static, so the tests that install one hold [`OBSERVER_ARM_LOCK`].
 struct ObserverArmLog {
     /// The mode of every worker an arm was started for, in order.
     starts: Vec<super::consent_observer::ObserverMode>,
@@ -1791,7 +1799,10 @@ fn observer_arm_starts() -> Vec<super::consent_observer::ObserverMode> {
         .clone()
 }
 
-/// RECONCILED AT THE EVENTS THAT CHANGE IT.
+/// RECONCILED AT THE EVENTS THAT CHANGE IT. An admitted config generation
+/// starts the stream it asks for and stops the one it no longer wants, so
+/// `observer log=` reads `off` after an owner turns the observer off, both
+/// from a live stream and from one that already ended.
 #[test]
 fn a_reload_reconciles_the_observer() {
     use super::consent_observer::ObserverMode;
@@ -2080,7 +2091,8 @@ fn consent_marks_follow_prompt_answers_without_clearing_other_attention() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A dismissal is no observed recovery.
+/// A dismissal is no observed recovery. A verified grant ends only the
+/// permission-denial owner, leaving independent tab indications intact.
 #[test]
 fn consent_marks_follow_verified_access_recovery_and_session_retirement() {
     use crate::tab_bar::ChipLevel;
@@ -2171,7 +2183,8 @@ fn consent_marks_recover_from_the_probe_with_access_notices_disabled() {
     );
 }
 
-/// An older completion can be queued behind a newer refusal.
+/// An older completion can be queued behind a newer refusal. Even while
+/// that cache entry is fresh, it cannot answer the newer permission need.
 #[test]
 fn consent_marks_ignore_grants_observed_before_a_later_denial() {
     use super::consent_state::ConsentState;
@@ -2279,7 +2292,11 @@ fn the_park_reads_the_running_mode_not_the_config() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE THRESHOLD CROSSING WAKES THE PARK.
+/// THE THRESHOLD CROSSING WAKES THE PARK. A request a running Full stream
+/// observed is announced when it reaches the prompt threshold with nothing
+/// else moving: the poll that folded it arms the crossing as the consent
+/// lanes' park deadline, under its own owner; a poll before it judges
+/// nothing and the poll at it announces.
 #[test]
 fn the_threshold_crossing_is_a_park_deadline() {
     use super::consent_observer::{ObserverMode, PENDING_PROMPT_THRESHOLD};
@@ -2346,7 +2363,9 @@ fn the_threshold_crossing_is_a_park_deadline() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A RESTARTED STREAM STARTS WITH NOTHING IN FLIGHT.
+/// A RESTARTED STREAM STARTS WITH NOTHING IN FLIGHT. A request the stopped
+/// stream was correlating can no longer see its result: its dialog may have
+/// been answered while the observer was off.
 #[test]
 fn a_restarted_stream_announces_nothing_the_stopped_one_was_correlating() {
     use super::consent_observer::ObserverMode;
@@ -2452,7 +2471,9 @@ fn an_observed_app_data_dialog_for_this_bundle_is_a_need_and_nothing_else_is() {
     assert_eq!(app.consent_card_host.needs, 2);
 }
 
-/// A DIALOG THE CARD IS NOT ABOUT, ON RECORD.
+/// A DIALOG THE CARD IS NOT ABOUT, ON RECORD. The 2026-10-16 media-library
+/// dialog was seen and dropped to one `aterm.log` line, so nothing aterm shows
+/// could say which tab asked.
 #[test]
 #[cfg(target_os = "macos")]
 fn an_observed_dialog_the_card_is_not_about_is_one_record_per_service() {

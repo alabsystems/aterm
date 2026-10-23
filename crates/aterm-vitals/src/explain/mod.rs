@@ -16,7 +16,9 @@ pub mod split;
 #[cfg(any(test, debug_assertions))]
 pub mod fixtures;
 
-pub use account::{Account, Bare, Role, Shown, WhySubject, You, account, bare_subject, you_role};
+pub use account::{
+    Account, Bare, Role, Shown, WhySubject, You, account, account_of, bare_subject, you_role,
+};
 pub use detect::{
     ACTIVITIES, Activity, ActivityId, Candidate, CauseId, Context, Evidence, Term, WakeFact, detect,
 };
@@ -250,6 +252,12 @@ pub struct CoalRow {
     pub footprint: Option<u64>,
     /// Its live members in this tick's sweep.
     pub live: u32,
+    /// The tabs its live members are in, by the tab's key, sorted, where it
+    /// has live members and every one is in a tab; `None` otherwise. A
+    /// caller scoped to a tab sees the row only when they are all that tab's
+    /// (aterm's own coalition holds aterm, which is in no tab, so it never
+    /// is).
+    pub tabs: Option<Vec<u64>>,
     /// Whether members of it have exited, so its counters include work of processes that no longer exist.
     pub finished: bool,
     /// Its lead, or the one it had when a member was last seen.
@@ -296,7 +304,7 @@ pub struct CoalSplit {
     pub services_mc: i64,
     /// What no part holds, signed and never clamped.
     pub unaccounted_mc: i64,
-    /// Each tab's live work over the window, by key, in the host's order: its processes alive at both ends of it, delegated members included.
+    /// Each tab's live work over the window, by its key ([`TabRoot::tab`](crate::model::TabRoot::tab): a tab split into panes is one), in the host's order: its processes alive at both ends of it, delegated members included.
     pub tabs: Vec<(u64, i64)>,
     /// The live work over the window of aterm's processes in no tab: itself, its helpers, and a delegated job's members whose tab closed (so it is of [`Self::aterm_mc`] plus [`Self::delegated_mc`], not of aterm's coalitions alone).
     pub own_mc: i64,
@@ -323,9 +331,18 @@ impl CoalSplit {
     /// The parts with tab `tab`'s work (the caller's) out of aterm's: none for no tab, or one the split did not read.
     #[must_use]
     pub fn parts(&self, tab: Option<u64>) -> Parts {
-        let tab = tab
-            .and_then(|key| self.tabs.iter().find(|(k, _)| *k == key))
-            .map_or(0, |(_, mc)| *mc);
+        self.parts_of(tab.as_slice())
+    }
+
+    /// [`Self::parts`] for the tab of the sessions `panes` (its split panes, one of which its key is), its work out of aterm's.
+    #[must_use]
+    pub fn parts_of(&self, panes: &[u64]) -> Parts {
+        let tab: i64 = self
+            .tabs
+            .iter()
+            .filter(|(k, _)| panes.contains(k))
+            .map(|(_, mc)| *mc)
+            .sum();
         let rest = self.aterm_mc + self.delegated_mc - tab;
         Parts {
             tab,
@@ -688,7 +705,7 @@ fn by_subtraction(s: &Sample, snap: &Snapshot, lane: CoalLane) -> Option<WhyFact
         at_unix_ms: snap.at_unix_ms,
         window_ns: snap.procs_window_ns?,
         lane,
-        split: CoalSplit::by_subtraction(&built, &snap.tabs),
+        split: CoalSplit::by_subtraction(&built, &snap.tabs, &s.tabs),
         procs_truncated: snap.procs_truncated,
         timeline: s.timeline.clone(),
         userspace_ms: userspace_ms(s),

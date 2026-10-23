@@ -139,7 +139,8 @@ const fn rgba_eq(a: RgbaColor, b: RgbaColor) -> bool {
     a.red == b.red && a.green == b.green && a.blue == b.blue && a.alpha == b.alpha
 }
 
-/// Premultiplied-alpha lerp between two straight-alpha colors, returned straight.
+/// Premultiplied-alpha lerp between two straight-alpha colors, returned straight. The
+/// COLRv1 spec prescribes it; it avoids gray fringes toward transparent stops.
 #[inline]
 fn lerp_premul(c0: RgbaColor, c1: RgbaColor, u: f32) -> RgbaColor {
     let (a0, a1) = (f32::from(c0.alpha) / 255.0, f32::from(c1.alpha) / 255.0);
@@ -472,7 +473,9 @@ impl ColrCanvas<'_> {
         }
     }
 
-    /// Resolve a `Paint` into a fill.
+    /// Resolve a `Paint` into a fill. Ill-formed gradient geometry (coincident linear
+    /// points, coincident radial circles, an empty sweep) is `None`: the spec says the
+    /// layer does not render.
     fn resolve_paint(&self, paint: &Paint) -> Option<FillSource> {
         let (extend, stops, kind) = match paint {
             Paint::Solid(c) => return Some(FillSource::Solid(*c)),
@@ -782,7 +785,8 @@ pub(crate) fn rasterize_colr_run(
     Some(buf)
 }
 
-/// Convert a premultiplied RGBA8 accumulator to straight alpha in place.
+/// Convert a premultiplied RGBA8 accumulator to straight alpha in place. Opaque and
+/// transparent pixels are already correct and are skipped, so opaque output is byte-exact.
 fn unpremultiply_straight(buf: &mut [u8]) {
     for px in buf.as_chunks_mut::<4>().0 {
         let a = u32::from(px[3]);
@@ -836,7 +840,15 @@ mod tests {
         (cols, rows)
     }
 
-    /// WINDOWS' COLOUR EMOJI FIT THEIR BOX WHOLE, AND FILL IT.
+    /// WINDOWS' COLOUR EMOJI FIT THEIR BOX WHOLE, AND FILL IT. Segoe UI Emoji
+    /// draws each glyph centered in an advance wider than its em, with
+    /// descents below the line, so the emoji of an agent's reply (✅ ❌ ⭐ ⚡ ⏳
+    /// 😀 🚀 👍, and ⚠ ❤ asked for with VS16), fitted into the Windows
+    /// default's two-cell box (18 x 23 px), keep a clear texel on every side —
+    /// nothing cut off — sit centered across it within a pixel, and the
+    /// full-bleed ones span at least 15 of its 18 columns (the face's emoji
+    /// frame less a pixel of air each side; the layout-box fit drew them 14
+    /// wide).
     #[test]
     #[cfg(windows)]
     fn segoe_ui_emoji_glyphs_draw_whole_and_centred_in_their_box() {
@@ -876,7 +888,9 @@ mod tests {
         );
     }
 
-    /// A ZWJ FAMILY IS ITS MEMBERS SIDE BY SIDE.
+    /// A ZWJ FAMILY IS ITS MEMBERS SIDE BY SIDE. Segoe UI Emoji shapes 👨‍👩‍👧
+    /// to three colour glyphs, the last with no advance of its own (it stands
+    /// after the woman by its outline alone).
     #[test]
     #[cfg(windows)]
     fn a_segoe_family_paints_every_member_inside_its_box() {

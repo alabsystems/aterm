@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use super::fixtures::{
-    Coal, Proc, Scene, USERSPACE_MS, apple, calm_1510, finished_1032, lane_off_1032, liar_1032,
-    spotlight_1032, spotlight_late_1032, tab, tab2_build_1048, wrapped_1218,
+    Coal, Proc, Scene, USERSPACE_MS, app_work_1510, apple, calm_1510, finished_1032, lane_off_1032,
+    liar_1032, spotlight_1032, spotlight_late_1032, tab, tab2_build_1048, wrapped_1218,
 };
 use super::*;
 use crate::model::{MemRates, MemSample, MemView, Pressure, Thermal, Throttle, Vitals};
@@ -247,7 +247,8 @@ fn a_small_cause_never_stands_for_a_large_uncovered_load() {
     );
 }
 
-/// aterm itself as the largest part above the floor.
+/// aterm itself as the largest part above the floor. NEGATIVE: at 10:32,
+/// aterm's own 0.20.
 #[test]
 fn aterm_work_holds_when_aterm_itself_is_the_largest_part() {
     let mut scene = calm_1510();
@@ -274,26 +275,7 @@ fn aterm_work_holds_when_aterm_itself_is_the_largest_part() {
 /// since its lead's birth.
 #[test]
 fn app_work_is_the_busiest_coalition_outside_aterm_led_by_the_user() {
-    let mut scene = calm_1510();
-    scene.busy_mc += 1490;
-    for c in &mut scene.coalitions {
-        if c.id == 896 {
-            c.mc = 1500;
-        }
-    }
-    for p in &mut scene.procs {
-        if p.pid == 784 {
-            *p = Proc::new(
-                p.pid,
-                p.ppid,
-                p.uid,
-                p.coalition,
-                p.birth_ms,
-                "Caffeine",
-                1500,
-            );
-        }
-    }
+    let mut scene = app_work_1510();
     let s = snap(&scene);
     assert_eq!(causes(&s), [CauseId::AppWork(896)]);
     let c = cause(&s, CauseId::AppWork(896));
@@ -872,7 +854,9 @@ fn the_clause_shows_after_ten_seconds_and_goes_after_thirty() {
     assert_eq!(h.step(26_000, &o, &split), None);
 }
 
-/// The clause's floor: a core and 40 % of the busy CPU outside aterm.
+/// The clause's floor: a core and 40 % of the busy CPU outside aterm. 39 %,
+/// or 0.9 core, gives none; Spotlight at 42 % beside an app's work at 45 %
+/// gives none, and at 45 % beside 42 % the clause.
 #[test]
 fn the_clause_needs_a_core_and_two_fifths_and_names_one_cause() {
     let shown = |o: &[OpenCause], split: &CoalSplit| {

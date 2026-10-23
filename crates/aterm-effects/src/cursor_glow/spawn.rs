@@ -8,9 +8,13 @@ use super::*;
 /// Floor of the momentum term, deliberately high: a single cold delete is
 /// still clearly acknowledged, and momentum carries it from there.
 pub(super) const ERASE_MOM_FLOOR: f32 = 0.55;
-/// Ceiling on the weight term.
+/// Ceiling on the weight term. `sqrt(cells)` grows the burst with what
+/// vanished (1 cell → 1.0, a six-letter word → 2.4, a killed line → this cap)
+/// without a full-line kill scaling into a screen-filling cloud.
 pub(super) const ERASE_WEIGHT_CAP: f32 = 3.4;
-/// Sparkles at drive 1.0.
+/// Sparkles at drive 1.0. A cold single-character Backspace (drive =
+/// [`ERASE_MOM_FLOOR`]) throws a handful of grains, a hot word kill lands
+/// mid-band, and a hot line kill hits [`ERASE_POOF_CAP`].
 pub(super) const ERASE_POOF_STARS: f32 = 8.0;
 /// Hard ceiling on one poof's sparkle count, well under `MAX_PARTICLES`, so a
 /// held Ctrl-U mash cannot crowd out the rest of the family, with headroom for

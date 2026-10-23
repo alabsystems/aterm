@@ -240,7 +240,7 @@ fn blank(req: &Request, name: &str) -> bool {
 }
 
 /// The origin's name in violation texts.
-fn origin_name(origin: FakeOrigin) -> &'static str {
+const fn origin_name(origin: FakeOrigin) -> &'static str {
     match origin {
         FakeOrigin::Api => "api",
         FakeOrigin::Uploads => "uploads",
@@ -1082,7 +1082,7 @@ fn published<'s>(state: &'s State, repo: &Repo) -> Vec<&'s Release> {
         .collect()
 }
 
-/// Handles `/releases` ordered newest first up to [`RELEASES_RESULT_CAP`].
+/// Handles `/releases` newest first; a page starting past item [`RELEASES_RESULT_CAP`] is 422.
 fn releases(state: &State, req: &Request, ctx: &Ctx, repo: &Repo) -> Answer {
     let push = repo.is_push(ctx.login());
     let mut list: Vec<&Release> = state

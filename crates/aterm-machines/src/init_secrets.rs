@@ -794,6 +794,9 @@ impl Vault {
     }
 
     /// Put the subscriber in place when the probe planned it: install it
+    /// ([`Vault::install`]), or for a selected vault only when it does not run, so an
+    /// unattended retry does not restart a running one.
+    ///
     /// # Errors
     /// The install failed.
     fn subscribe(&self) -> Result<bool, String> {
@@ -996,7 +999,10 @@ fn secrets(n: usize) -> String {
     }
 }
 
-/// Why the subscriber in `state` keeps nothing in sync, or `None` while it runs.
+/// Why the subscriber in `state` keeps nothing in sync, or `None` while it runs. A unit
+/// without a process is not enough: a plist whose `launchctl bootstrap` failed after it was
+/// written, and a job that keeps ending, look the same, and either way nothing syncs until
+/// an apply installs and starts it again.
 const fn idle(state: &State) -> Option<&'static str> {
     match state {
         State::Installed { pid: Some(_), .. } => None,
@@ -1005,7 +1011,9 @@ const fn idle(state: &State) -> Option<&'static str> {
     }
 }
 
-/// What this Mac's vault state means for the item reading `source`.
+/// What this Mac's vault state means for the item reading `source`. `unsynced`: why the
+/// subscriber keeps nothing in sync, `None` while it runs ([`idle`]; read only for a Mac that
+/// is in, reading a plain file, or waiting for an admin).
 fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool) -> Probe {
     let name = status
         .config

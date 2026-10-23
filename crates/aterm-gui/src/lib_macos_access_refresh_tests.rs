@@ -867,7 +867,9 @@ const DEVELOPER_ID_DR: &str = "identifier \"com.aterm.aterm\" and anchor apple g
      leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \
      A66A9P66Z7";
 
-/// MAIN AS THE UPDATE SUCCESSOR OF 0.105.0, ON THE OWNER'S MAC.
+/// MAIN AS THE UPDATE SUCCESSOR OF 0.105.0, ON THE OWNER'S MAC. 0.105.0 never asked for
+/// Full Disk Access there (`access_card state=quiet asked_at=-`): it had no launch
+/// hand-over, and its probe read only the per-user `TCC.db`, which macOS 27 does not keep.
 #[test]
 fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_over_first() {
     use crate::consent_card::{
@@ -1495,7 +1497,12 @@ fn a_full_disk_access_hand_over_gone_with_no_panel_holds_nothing() {
     );
 }
 
-/// THE ALERT IS RAISED ONLY ON A FRESH READING OF THE RULE.
+/// THE ALERT IS RAISED ONLY ON A FRESH READING OF THE RULE. While the ask waits for its
+/// moment it judges the answer already cached, however old, and starts no probe and
+/// retires nothing; at the moment, an answer older than
+/// [`crate::debugger_access::ASK_PROBE_FRESH`] is retired and the rule read again before
+/// any alert, so a rule switched on meanwhile (by the owner's own `sudo`, which retires
+/// no cached answer) is never asked about.
 #[test]
 fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
     use crate::debugger_access::ASK_PROBE_FRESH;

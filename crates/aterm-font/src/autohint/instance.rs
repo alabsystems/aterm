@@ -51,9 +51,6 @@ impl Instance {
         pen: &mut impl OutlineSink,
     ) -> Result<(), DrawError> {
         let units_per_em = font.units_per_em();
-        // The face here is the one the caller hands this draw, which may not
-        // be the one the instance was built from: the scale bound is held
-        // where the scale is made.
         if !scale_fits(ppem, units_per_em) {
             return Err(DrawError::ScaleOutOfRange);
         }
@@ -79,11 +76,8 @@ impl Instance {
         let mut outline = Outline::default();
         outline.fill(font, glyph, coords)?;
         let hinted_metrics = hint_outline(&mut outline, &metrics, &scale, Some(style));
-        // The left side bearing shift FreeType applies to the fitted outline
-        // (afloader.c); the advance it also fits is not wanted here.
         let mut pp1x = 0;
         let is_light = self.target.is_light();
-        // <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afloader.c#L422>
         if !is_light {
             if let (true, Some(edge_metrics)) = (
                 !scale.flags.contains(ScaleFlags::NO_ADVANCE),

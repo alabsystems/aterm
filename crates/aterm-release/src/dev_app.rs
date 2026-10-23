@@ -525,7 +525,8 @@ fn codesign(run: &dyn Run, args: &[&dyn AsRef<OsStr>], state: &str) -> Result<Ou
     }
 }
 
-/// Sign `app` as `with` says, then verify it `--strict`.
+/// Sign `app` as `with` says, then verify it `--strict`. An identity's signature must
+/// yield an identity-based designated requirement — the property it is signed for.
 fn sign(app: &Path, with: &SignWith, home: &Path, run: &dyn Run) -> Result<(), String> {
     let identity = match with {
         SignWith::AdHoc => None,

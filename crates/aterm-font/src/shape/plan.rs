@@ -7,16 +7,8 @@
 // project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! The shape plan: the features a run is shaped with, compiled against one
-//! face for one direction and script.
-//!
-//! Two shapers are carved: the default one, and the Arabic one (joining
-//! forms and its feature stages, for Arabic and for Syriac in a font that
-//! has a Syriac script). Upstream's Indic, USE, Khmer, Myanmar, Thai and
-//! Hangul shapers are not: a terminal hands the run shaper no marks (a mark
-//! rides its base cell's cluster) and no wide cells, so their reordering and
-//! syllable logic is never reached, and their scripts shape with the default
-//! shaper's features.
+//! The shape plan: the features a run is shaped with, compiled against one face for one direction
+//! and script.
 
 use super::ShapeFace;
 use super::arabic;
@@ -53,8 +45,6 @@ pub(crate) enum Shaper {
 }
 
 /// A reusable plan for shaping runs of one direction and script on one face.
-/// It holds no borrow of the face: build it once per face and features, and
-/// reuse it for every run with the same segment properties.
 pub struct ShapePlan {
     pub(crate) direction: Direction,
     pub(crate) script: Option<Script>,
@@ -67,16 +57,15 @@ pub struct ShapePlan {
     pub(crate) rtlm_mask: u32,
     pub(crate) has_frac: bool,
     pub(crate) fallback_glyph_classes: bool,
-    /// The face has a `GPOS`: marks are then zeroed without the offset
-    /// shift upstream applies when it positions them by fallback.
+    /// The face has a `GPOS`: marks are then zeroed without the offset shift upstream applies when
+    /// it positions them by fallback.
     pub(crate) has_gpos: bool,
 }
 
 impl ShapePlan {
-    /// A plan for `direction` and `script` (`None` when the run has none but
-    /// Common and Inherited characters) on `face`, with `features` applied
-    /// over every run after the default ones (a later feature overrides an
-    /// earlier one with the same tag).
+    /// A plan for `direction` and `script` (`None` when the run has none but Common and Inherited
+    /// characters) on `face`, with `features` applied over every run after the default ones (a
+    /// later feature overrides an earlier one with the same tag).
     pub fn new(
         face: &ShapeFace,
         direction: Direction,
@@ -191,13 +180,10 @@ fn collect_features(
         }
         _ => {}
     }
-    // Automatic fractions.
     map.add_feature(tag(b"frac"), F_NONE, 1);
     map.add_feature(tag(b"numr"), F_NONE, 1);
     map.add_feature(tag(b"dnom"), F_NONE, 1);
-    // Random alternates.
     map.enable_feature(tag(b"rand"), F_RANDOM, MAX_VALUE);
-    // A dummy, so a user can turn AAT tracking off by feature (harfbuzz#1303).
     map.enable_feature(tag(b"trak"), super::map::F_HAS_FALLBACK, 1);
     map.enable_feature(tag(b"Harf"), F_NONE, 1);
     map.enable_feature(tag(b"HARF"), F_NONE, 1);
@@ -215,7 +201,6 @@ fn collect_features(
             map.add_feature(tag(t), flags, 1);
         }
     } else {
-        // Only `vert`, found wherever the font lists it.
         map.enable_feature(tag(b"vert"), F_GLOBAL_SEARCH, 1);
     }
     if !user_features.is_empty() {

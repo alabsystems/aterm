@@ -208,6 +208,7 @@ const APACHE_NOTICE: [&str; 6] = [
     "CONDITIONS OF ANY KIND, either express or implied.",
 ];
 
+/// The copyright lines of a licence text, without the appendix's
 /// `Copyright [yyyy] [name of copyright owner]` template.
 fn copyright_lines(licence: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -220,6 +221,8 @@ fn copyright_lines(licence: &str) -> Vec<&str> {
     out
 }
 
+/// The notice a file under `spdx` carries for `licence` (the licence file's
+/// text): the whole text for a notice-carrying licence, else (Apache-2.0)
 /// the copyright lines and the short notice.
 fn notice_lines(spdx: &str, licence: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -392,6 +395,11 @@ fn standing(dir: &Path, theme: &PackTheme) -> (PackState, bool) {
     }
 }
 
+/// Whether `bytes` are `theme`'s file byte for byte but for its `name =`
+/// line, which says `name = <id>`: the copy an earlier release installed
+/// before the pack re-spelled [`PackTheme::name`] (0.106 and 0.107 wrote
+/// every pack theme's name line as its id, so their `TokyoNight Storm.conf`
+/// says `name = TokyoNight Storm`). Any other difference, another name or a
 /// comment too, is an edit.
 fn earlier_copy(bytes: &[u8], theme: &PackTheme) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {

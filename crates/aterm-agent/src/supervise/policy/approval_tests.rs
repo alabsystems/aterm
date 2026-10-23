@@ -7121,6 +7121,66 @@ fn a_tall_box_under_a_not_ruled_out_breaker_is_declined_with_a_split() {
     );
 }
 
+/// A TALL BOX UNDER A BREAKER WHY ATERM HAS NO READING OF (2.1.309's
+/// `not ruled out — the shell may read this command differently than it was
+/// parsed`, its note row MEASURED in `claude-2.1.309-box-bash-rm-parse-diverged`,
+/// and an unknown rmdir why) in a bypass session is declined, at safe and
+/// at full power, with a split into shorter, plainer commands: never the
+/// advice about substitutions, which names a why aterm read. Before 2.1.309
+/// such a note was no breaker and the box went to a person. NEGATIVE
+/// CONTROLS: the same why with no `not ruled out` is no breaker note, and
+/// out of bypass the box is handed over; both name the unread head. MUTANTS:
+/// the decline narrowed to the breakers aterm reads (a hand-over), or the
+/// plainer split cut (the substitutions' text), each fails here.
+#[test]
+fn a_tall_box_under_a_why_aterm_cannot_read_is_declined_with_a_plainer_split() {
+    let note = " │ Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf $S/$1` \
+                (bind $1 and rewrite its $S as \"${S:?}\" or use a literal path)";
+    let measured = phase_fixtures::screen(phase_fixtures::BOX_RM_PARSE_DIVERGED_2_1_309)
+        .into_iter()
+        .find(|r| r.contains("Dangerous rm operation not ruled out"))
+        .expect("the measured note row");
+    let why = "the shell may read this command differently than it was parsed";
+    assert!(measured.ends_with(why), "{measured:?}");
+    let screen = owner_screen(OWNER_COMMAND);
+    for row in [
+        measured.clone(),
+        " │ Dangerous rmdir operation not ruled out — something aterm has never read".to_string(),
+    ] {
+        let rows = with_row(&screen, note, &row);
+        for level in [Approve::All, Approve::Safe] {
+            let d = on_screen(&rows, &owner_ctx(level));
+            let (rule, text) = declined(&d);
+            assert_eq!(rule, RULE_TALL_BOX, "{row}, {level:?}");
+            assert!(
+                text.contains("Split it into shorter, plainer commands, run one at a time")
+                    && text.contains("literal absolute paths")
+                    && !text.contains("substitutions")
+                    && !text.contains("Run the removal"),
+                "{row}, {level:?}: {text}"
+            );
+        }
+    }
+    let head = "the box's title row is not on the screen";
+    let bare = with_row(&screen, note, &format!(" │ Dangerous rm operation — {why}"));
+    let out_of_bypass = ApprovalCtx {
+        bypass_mode: false,
+        ..owner_ctx(Approve::All)
+    };
+    for (rows, c, what) in [
+        (&bare, owner_ctx(Approve::All), "no `not ruled out`"),
+        (&bare, owner_ctx(Approve::Safe), "no `not ruled out`, safe"),
+        (
+            &with_row(&screen, note, &measured),
+            out_of_bypass,
+            "out of bypass",
+        ),
+    ] {
+        let d = on_screen(rows, &c);
+        assert!(reason(&d).starts_with(head), "{what}: {d:?}");
+    }
+}
+
 /// A bypass session's screen rebuilt from a screenshot.
 const OWNER_SUBAGENT_RM: &str = include_str!("fixtures/owner-rm-breaker-subagent-2026-09-26.txt");
 
@@ -8611,6 +8671,47 @@ fn a_trace_names_the_rule_that_decided() {
     );
 }
 
+/// 2.1.309'S NEW BREAKER WHY (MEASURED, `claude-2.1.309-box-bash-rm-parse-diverged`, over
+/// `echo $(` with no rm): a `not ruled out — <why>` aterm has no reading of is the breaker,
+/// named in the vendor's own words, and refused at safe power for that cause, never proven
+/// read-only and never pressed by the warn rule. NEGATIVE CONTROL: the 2.1.308 nested box keeps
+/// its own cause. MUTANT: a refusal naming every why but too-many as the nested one's fails here.
+#[test]
+fn a_not_ruled_out_why_aterm_cannot_read_is_refused_in_its_own_words() {
+    use phase_fixtures::{BOX_RM_NESTED_2_1_308, BOX_RM_PARSE_DIVERGED_2_1_309, screen};
+    let rows = screen(BOX_RM_PARSE_DIVERGED_2_1_309);
+    let b = aterm_phase::read(Some("claude"), &rows, None)
+        .prompt
+        .and_then(|p| p.rm_breaker())
+        .expect("the rm circuit breaker");
+    assert_eq!(b.kind, RmBreakerKind::NotRuledOut);
+    let label = rm_breaker_label(&b);
+    assert_eq!(
+        label,
+        "the rm circuit breaker (not ruled out: the shell may read this command differently \
+         than it was parsed; the command need not name rm)"
+    );
+    for (level, c) in [
+        ("safe", ctx()),
+        ("safe, warn", safe_warn()),
+        ("safe, bypass", bypass()),
+    ] {
+        let d = on_screen(&rows, &c);
+        let why = reason(&d);
+        assert!(why.starts_with(&label), "{level}: {why}");
+        assert!(!why.contains(NESTED_UNPROVEN), "{level}: {why}");
+        assert_eq!(why.matches("circuit breaker").count(), 1, "{level}: {why}");
+    }
+    let safe = on_screen(&rows, &ctx());
+    assert!(reason(&safe).contains(NOT_RULED_OUT_UNPROVEN), "{safe:?}");
+    let nested = on_screen(&screen(BOX_RM_NESTED_2_1_308), &ctx());
+    assert!(reason(&nested).contains(NESTED_UNPROVEN), "{nested:?}");
+    assert!(
+        !reason(&nested).contains(NOT_RULED_OUT_UNPROVEN),
+        "{nested:?}"
+    );
+}
+
 #[test]
 fn the_lab_boxes_are_answered_as_measured() {
     use phase_fixtures::{
@@ -8623,6 +8724,10 @@ fn the_lab_boxes_are_answered_as_measured() {
         BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308, BOX_STATEMENT_FOLLOWS_16_2_1_307,
         BOX_STATEMENT_FOLLOWS_16_2_1_308, BOX_WRITE_CREATE_2_1_307, BOX_WRITE_CREATE_2_1_308,
         PLAN_READY_2_1_307, PLAN_READY_2_1_308, screen,
+    };
+    use phase_fixtures::{
+        BOX_BASH_ASK_RULE_2_1_309, BOX_BASH_HOOK_ASK_2_1_309, BOX_BASH_TOUCH_2_1_309,
+        BOX_EDIT_2_1_309, BOX_RM_PARSE_DIVERGED_2_1_309, BOX_WRITE_CREATE_2_1_309,
     };
     for (what, text, rule, choice) in [
         (
@@ -8663,6 +8768,24 @@ fn the_lab_boxes_are_answered_as_measured() {
             RULE_PLAN,
             Choice::Digit(2),
         ),
+        (
+            "2.1.309 bash",
+            BOX_BASH_TOUCH_2_1_309,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
+        (
+            "2.1.309 write",
+            BOX_WRITE_CREATE_2_1_309,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
+        (
+            "2.1.309 edit",
+            BOX_EDIT_2_1_309,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
     ] {
         let rows = screen(text);
         let d = on_screen(&rows, &full());
@@ -8678,6 +8801,8 @@ fn the_lab_boxes_are_answered_as_measured() {
         ("hook", BOX_BASH_HOOK_ASK_2_1_307),
         ("2.1.308 ask rule", BOX_BASH_ASK_RULE_2_1_308),
         ("2.1.308 hook", BOX_BASH_HOOK_ASK_2_1_308),
+        ("2.1.309 ask rule", BOX_BASH_ASK_RULE_2_1_309),
+        ("2.1.309 hook", BOX_BASH_HOOK_ASK_2_1_309),
     ] {
         let rows = screen(text);
         let full_bypass = ApprovalCtx {
@@ -8739,6 +8864,12 @@ fn the_lab_boxes_are_answered_as_measured() {
             BOX_RM_NESTED_2_1_308,
             "the rm circuit breaker (not ruled out: some nested commands or function \
              substitutions could not be analyzed; the command need not name rm)",
+        ),
+        (
+            "2.1.309 parse diverged, no rm",
+            BOX_RM_PARSE_DIVERGED_2_1_309,
+            "the rm circuit breaker (not ruled out: the shell may read this command differently \
+             than it was parsed; the command need not name rm)",
         ),
     ] {
         let rows = screen(text);
@@ -8821,6 +8952,12 @@ fn the_lab_boxes_are_answered_as_measured() {
         BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_308,
         BOX_RM_NESTED_2_1_308,
         PLAN_READY_2_1_308,
+        BOX_BASH_TOUCH_2_1_309,
+        BOX_WRITE_CREATE_2_1_309,
+        BOX_EDIT_2_1_309,
+        BOX_BASH_ASK_RULE_2_1_309,
+        BOX_BASH_HOOK_ASK_2_1_309,
+        BOX_RM_PARSE_DIVERGED_2_1_309,
     ] {
         let rows = screen(text);
         let (top, _) = aterm_phase::prompt::prompt_box_span(&rows).expect("the span");

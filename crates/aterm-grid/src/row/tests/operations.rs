@@ -1,14 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
-//
-// Row operation tests: selective_clear, line_size, copy_from,
-// clear_range boundaries and update_len.
 
 use super::super::*;
 use super::make_row;
-
-// selective_clear and selective_clear_range
 
 #[test]
 fn selective_clear_skips_protected_cells() {
@@ -29,8 +24,6 @@ fn selective_clear_skips_protected_cells() {
     assert_eq!(row.get(2).unwrap().char(), ' ');
 }
 
-// line_size / set_line_size
-
 #[test]
 fn set_line_size_double_width() {
     let (_pages, mut row) = make_row(80);
@@ -46,7 +39,6 @@ fn set_line_size_double_width() {
     assert_eq!(row.get(40).unwrap().char(), ' ');
 }
 
-/// Each line size maps onto its row flags, and SingleWidth clears them again.
 #[test]
 fn set_line_size_maps_onto_row_flags() {
     for (size, flags) in [
@@ -64,8 +56,6 @@ fn set_line_size_maps_onto_row_flags() {
         assert!(!row.flags().contains(flags), "{size:?}");
     }
 }
-
-// copy_from
 
 #[test]
 fn copy_from_same_width() {
@@ -102,8 +92,6 @@ fn copy_from_wider_source_clamps() {
     assert_eq!(row_narrow.len(), 10);
 }
 
-// clear_range boundary cases
-
 #[test]
 fn clear_range_clamps_end_to_cols() {
     let (_pages, mut row) = make_row(10);
@@ -117,8 +105,6 @@ fn clear_range_clamps_end_to_cols() {
     assert_eq!(row.get(9).unwrap().char(), ' ');
     assert_eq!(row.len(), 8);
 }
-
-// update_len
 
 #[test]
 fn update_len_extends_but_never_shrinks() {

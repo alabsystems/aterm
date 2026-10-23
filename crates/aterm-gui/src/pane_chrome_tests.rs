@@ -90,7 +90,9 @@ fn a_side_by_side_split_gets_one_seam_hairline() {
     }
 }
 
-/// A tee: a full-height left pane beside a right column split in two.
+/// A tee: a full-height left pane beside a right column split in two. The
+/// hairlines join (`├`) where the horizontal gap meets the vertical one and
+/// run to the grid's right edge, all in the seam ink.
 #[test]
 fn a_tee_joins_its_hairlines() {
     let (rows, cols) = (7, 11);
@@ -128,7 +130,11 @@ fn covered(quads: &[GlowQuad]) -> std::collections::BTreeSet<(u16, u16)> {
         .collect()
 }
 
-/// THE FOCUS RING SAYS WHICH SIDE HAS FOCUS.
+/// THE FOCUS RING SAYS WHICH SIDE HAS FOCUS. Two panes side by side at the
+/// 9×23 Windows cell (hairline at the gap's pixel 4): the left pane focused
+/// puts one accent line at the gap's pixel 2, the right pane at pixel 6, each
+/// the whole allocation tall, two pixels from the text and one stroke from
+/// the hairline; nothing on the window's edges.
 #[test]
 fn the_ring_is_on_the_focused_panes_side_of_the_hairline() {
     let (rows, cols) = (30, 111);
@@ -230,7 +236,13 @@ fn the_ring_turns_the_inner_corner_at_every_scale() {
     }
 }
 
-/// THE RING MEETS THE HEADER'S RULE IN AN L.
+/// THE RING MEETS THE HEADER'S RULE IN AN L. Two panes side by side, each
+/// under a header, either focused, at the 100%, 150% and 200% Windows cells:
+/// the ring's side line starts on the top row of the header's accent rule
+/// (`crate::pane_header::focus_rule_rows`) and runs to the grid's foot, and on
+/// the rule's rows the ring fills every pixel between that line and the
+/// pane's edge, where the rule itself begins, so the two strokes join; nothing
+/// of the ring stands above the rule or past the line.
 #[test]
 fn the_ring_meets_the_header_rule_in_an_l() {
     for (cw, ch) in [(9u32, 23u32), (13, 33), (14, 35), (18, 46)] {

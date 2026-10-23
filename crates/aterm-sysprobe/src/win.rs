@@ -103,7 +103,8 @@ unsafe extern "system" {
 
 /// A `u64` buffer (8-byte aligned, as the NT information classes want) seen as its bytes.
 fn as_bytes(words: &[u64]) -> &[u8] {
-    // SAFETY: `u8` has alignment 1 and no invalid values, covering the slice's exact byte span.
+    // SAFETY: `u8` has alignment 1 and no invalid values; the slice covers exactly the words'
+    // bytes, borrowed as long as they are.
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) }
 }
 
@@ -144,7 +145,8 @@ impl Ticks {
             let group = u16::try_from(g).ok()?;
             let cap = u32::try_from(self.buf.len() * 8).ok()?;
             let mut got = 0u32;
-            // SAFETY: input is one readable u16; `buf` and `got` are writable.
+            // SAFETY: input is one readable u16; `buf` is `cap` writable bytes and `got` a
+            // writable u32.
             let mut status = unsafe {
                 NtQuerySystemInformationEx(
                     SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
@@ -366,7 +368,8 @@ pub(crate) fn volume(path: &Path) -> Option<VolumeReading> {
         return None;
     }
     let mut fs = [0u16; 64];
-    // SAFETY: `root` is NUL-terminated.
+    // SAFETY: `root` is NUL-terminated; `fs` is 64 writable wide characters and every other
+    // output is null (not asked for).
     let named = unsafe {
         GetVolumeInformationW(
             root.as_ptr(),

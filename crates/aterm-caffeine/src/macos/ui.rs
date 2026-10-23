@@ -81,7 +81,9 @@ pub(super) fn install(
         let images = [template_image(false)?, template_image(true)?];
         let menu = new_menu()?;
         let items = add_rows(menu.id(), target, choose, &rows);
-        // SAFETY: main-thread AppKit sends on live receivers.
+        // SAFETY: main-thread AppKit sends on live receivers, each in its method's prototype; the
+        // item and its button answer at +0 and are retained here, and the caller keeps `target`
+        // (held weakly) alive.
         unsafe {
             let bar = send_id(class(c"NSStatusBar").as_id(), sel!(systemStatusBar));
             if bar.is_null() {
@@ -192,7 +194,8 @@ impl Drop for StatusUi {
 /// closes (a choice has been sent to its target by then or will be from the run loop).
 pub(super) fn pop_up(popup: &Popup) {
     autoreleasepool(|_| {
-        // SAFETY: main-thread AppKit sends on the live menu and button `popup` retains.
+        // SAFETY: main-thread AppKit sends on the live menu and button `popup` retains, each in its
+        // method's prototype (`PopUpFn` for the pop-up).
         unsafe {
             let button = popup.button.id();
             send_v_bool(button, sel!(highlight:), true);
@@ -259,7 +262,8 @@ fn template_image(lit: bool) -> Option<Obj> {
         width: side,
         height: side,
     };
-    // SAFETY: main-thread sends, inside the caller's pool.
+    // SAFETY: main-thread sends, inside the caller's pool; `-initWithSize:` is
+    // `@32@0:8{CGSize=dd}16`, consuming the `+alloc` and answering +1.
     let image = unsafe {
         Obj::from_owned(send_id_size(
             alloc(class(c"NSImage")),
@@ -295,7 +299,8 @@ fn bitmap(png: &[u8]) -> Option<Obj> {
     }
     autoreleasepool(|_| {
         // SAFETY: `-initWithBytes:length:` is `@32@0:8r^v16Q24`, copying the `png.len()` bytes for
-        // the call and answering +1.
+        // the call and answering +1; `+imageRepWithData:` is `@24@0:8@16`, answering +0, retained
+        // before this pool pops.
         unsafe {
             let data = Obj::from_owned(send_id_cptr_usize(
                 alloc(class(c"NSData")),
@@ -391,7 +396,9 @@ fn new_item(row: &Row, target: Id, choose: Sel) -> Option<Obj> {
     let empty = aterm_objc::ns_string("")?;
     let action = if tagged.is_some() { choose } else { Sel::NULL };
     // SAFETY: `-initWithTitle:action:keyEquivalent:` is `@40@0:8@16:24@32`, consuming the `+alloc`
-    // and answering +1; a nil action is its "no action".
+    // and answering +1; a nil action is its "no action". Both strings are live and copied.
+    // `-setTarget:` is `v24@0:8@16` (held weakly: the caller keeps `target` alive), `-setEnabled:`
+    // `v20@0:8B16`, `-setTag:` and `-setState:` `v24@0:8q16`.
     unsafe {
         let item = Obj::from_owned(send_id_id_sel_id(
             alloc(class(c"NSMenuItem")),

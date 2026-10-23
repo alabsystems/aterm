@@ -8,13 +8,7 @@
 // corpus replays the whole hinter).
 // See ../../../LICENSE-FONTATIONS for the upstream license.
 
-//! Edge detection.
-//!
-//! Edges are sets of segments that all lie within a threshold based on
-//! stem widths.
-//!
-//! Here we compute edges from the segment list, assign properties (round,
-//! serif, links) and then associate them with blue zones.
+//! Edge detection from outline segments, property assignment, and blue zone association.
 
 use super::{
     super::{
@@ -26,8 +20,6 @@ use super::{
 };
 
 /// Links segments to edges, using feature analysis for selection.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2128>
 pub(crate) fn compute_edges(
     axis: &mut Axis,
     metrics: &ScaledAxisMetrics,
@@ -37,25 +29,21 @@ pub(crate) fn compute_edges(
 ) {
     axis.edges.clear();
     let scale = metrics.scale;
-    // This is always passed as 0 in functions that take hinting direction
-    // in CJK
-    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1114>
     let top_to_bottom_hinting =
         if axis.dim == Dimension::Horizontal || group != ScriptGroup::Default {
             false
         } else {
             top_to_bottom_hinting
         };
-    // Ignore horizontal segments less than 1 pixel in length
+    // Ignore horizontal segments less than 1 pixel in length.
     let segment_length_threshold = if axis.dim == Dimension::Horizontal {
         fixed_div(64, y_scale)
     } else {
         0
     };
-    // Also ignore segments with a width delta larger than 0.5 pixels
+    // Ignore segments with a width delta larger than 0.5 pixels.
     let segment_width_threshold = fixed_div(32, scale);
-    // Ensure that edge distance threshold is less than or equal to
-    // 0.25 pixels
+    // Cap edge distance threshold at 0.25 pixels.
     let initial_threshold = metrics.width_metrics.edge_distance_threshold;
     const EDGE_DISTANCE_THRESHOLD_MAX: i32 = 64 / 4;
     let edge_distance_threshold = if group == ScriptGroup::Default {
@@ -64,8 +52,6 @@ pub(crate) fn compute_edges(
             scale,
         )
     } else {
-        // CJK uses a slightly different computation here
-        // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1043>
         let threshold = fixed_mul(initial_threshold, scale);
         if threshold > EDGE_DISTANCE_THRESHOLD_MAX {
             fixed_div(EDGE_DISTANCE_THRESHOLD_MAX, scale)
@@ -73,10 +59,6 @@ pub(crate) fn compute_edges(
             initial_threshold
         }
     };
-    // Now build the sorted table of edges by looping over all segments
-    // to find a matching edge, adding a new one if not found.
-    // We can't iterate segments because we make mutable calls on `axis`
-    // below which causes overlapping borrows
     for segment_ix in 0..axis.segments.len() {
         let segment = &axis.segments[segment_ix];
         if group == ScriptGroup::Default {
@@ -87,14 +69,13 @@ pub(crate) fn compute_edges(
             {
                 continue;
             }
-            // Ignore serif edges that are smaller than 1.5 pixels
+            // Ignore serif edges smaller than 1.5 pixels.
             if segment.serif_ix.is_some()
                 && (2 * segment.height as i32) < (3 * segment_length_threshold)
             {
                 continue;
             }
         }
-        // Look for a corresponding edge for this segment
         let mut best_dist = i32::MAX;
         let mut best_edge_ix = None;
         for edge_ix in 0..axis.edges.len() {
@@ -105,11 +86,9 @@ pub(crate) fn compute_edges(
                     best_edge_ix = Some(edge_ix);
                     break;
                 }
-                // For CJK, we add some additional checks
-                // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1073>
                 if let Some(link) = segment.link(&axis.segments).copied() {
-                    // Check whether all linked segments of the candidate edge
-                    // can make a single edge
+                    // Check whether all linked segments of the candidate edge can form a single
+                    // edge.
                     let first_ix = edge.first_ix as usize;
                     let mut seg1 = &axis.segments[first_ix];
                     let mut dist2 = 0;
@@ -140,7 +119,6 @@ pub(crate) fn compute_edges(
         if let Some(edge_ix) = best_edge_ix {
             axis.append_segment_to_edge(segment_ix, edge_ix);
         } else {
-            // We couldn't find an edge, so add a new one for this segment
             let opos = fixed_mul(segment.pos as i32, scale);
             let edge = Edge {
                 fpos: segment.pos,
@@ -156,15 +134,12 @@ pub(crate) fn compute_edges(
         }
     }
     if group == ScriptGroup::Default {
-        // Loop again to find single point segments without a direction and
-        // associate them with an existing edge if possible
+        // Associate directionless single-point segments with coinciding edges.
         for segment_ix in 0..axis.segments.len() {
             let segment = &axis.segments[segment_ix];
             if segment.dir != Direction::None {
                 continue;
             }
-            // Try to find an edge that coincides with this segment within the
-            // threshold
             if let Some(edge_ix) = axis
                 .edges
                 .iter()
@@ -175,7 +150,6 @@ pub(crate) fn compute_edges(
                 })
                 .next()
             {
-                // We found an edge, link everything up
                 axis.append_segment_to_edge(segment_ix, edge_ix);
             }
         }
@@ -184,8 +158,7 @@ pub(crate) fn compute_edges(
     compute_edge_properties(axis);
 }
 
-/// Edges get reordered as they're built so we need to assign edge indices to
-/// segments in a second pass.
+/// Assigns edge indices to segments after edge sorting stabilizes.
 fn link_segments_to_edges(axis: &mut Axis) {
     let segments = axis.segments.as_mut_slice();
     for edge_ix in 0..axis.edges.len() {
@@ -208,8 +181,6 @@ fn link_segments_to_edges(axis: &mut Axis) {
 
 /// Compute the edge properties based on the series of segments that make
 /// up the edge.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2339>
 fn compute_edge_properties(axis: &mut Axis) {
     let edges = axis.edges.as_mut_slice();
     let segments = axis.segments.as_slice();
@@ -220,25 +191,20 @@ fn compute_edge_properties(axis: &mut Axis) {
         let mut segment_ix = edge.first_ix as usize;
         let last_segment_ix = edge.last_ix as usize;
         loop {
-            // This loop can modify the current edge, so make sure we
-            // reload it here
             let edge = edges[edge_ix];
             let segment = &segments[segment_ix];
             let next_segment_ix = segment.edge_next_ix;
-            // Check roundness
             if segment.flags.contains(TopoFlags::ROUND) {
                 roundness += 1;
             } else {
                 straightness += 1;
             }
-            // Check for serifs
             let is_serif = if let Some(serif_ix) = segment.serif_ix {
                 let serif = &segments[serif_ix as usize];
                 serif.edge_ix.is_some() && serif.edge_ix != Some(edge_ix as u16)
             } else {
                 false
             };
-            // Check for links
             if is_serif
                 || (segment.link_ix.is_some()
                     && segments[segment.link_ix.unwrap() as usize]
@@ -285,18 +251,13 @@ fn compute_edge_properties(axis: &mut Axis) {
         if roundness > 0 && roundness >= straightness {
             edge.flags |= TopoFlags::ROUND;
         }
-        // Drop serifs for linked edges
         if edge.serif_ix.is_some() && edge.link_ix.is_some() {
             edge.serif_ix = None;
         }
     }
 }
 
-/// Compute all edges which lie within blue zones.
-///
-/// For Latin, this is only done for the vertical axis.
-///
-/// See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2503>
+/// Computes all edges that lie within blue zones.
 pub(crate) fn compute_blue_edges(
     axis: &mut Axis,
     scale: &Scale,
@@ -304,9 +265,6 @@ pub(crate) fn compute_blue_edges(
     blues: &[ScaledBlue],
     group: ScriptGroup,
 ) {
-    // For the default script group, don't compute blues in the horizontal
-    // direction
-    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L3572>
     if axis.dim != Dimension::Vertical && group == ScriptGroup::Default {
         return;
     }
@@ -315,31 +273,22 @@ pub(crate) fn compute_blue_edges(
     } else {
         scale.y_scale
     };
-    // Initial threshold
     let initial_best_dest = fixed_mul(scale.units_per_em / 40, axis_scale).min(64 / 2);
     for edge in &mut axis.edges {
         let mut best_blue = None;
         let mut best_is_neutral = false;
-        // Initial threshold as a fraction of em size with a max distance
-        // of 0.5 pixels
         let mut best_dist = initial_best_dest;
         for (unscaled_blue, blue) in unscaled_blues.iter().zip(blues) {
-            // Ignore inactive blue zones
             if !blue.is_active {
                 continue;
             }
             let is_top = blue.zones.is_top_like();
             let is_neutral = blue.zones.is_neutral();
             let is_major_dir = edge.dir == axis.major_dir;
-            // Both directions are handled for neutral blues
             if is_top ^ is_major_dir || is_neutral {
-                // Compare to reference position
                 let (ref_pos, matching_blue) = if group == ScriptGroup::Default {
                     (unscaled_blue.position, blue.position)
                 } else {
-                    // For CJK, we take the blue with the smallest delta
-                    // from the edge
-                    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L1356>
                     if (edge.fpos as i32 - unscaled_blue.position).abs()
                         > (edge.fpos as i32 - unscaled_blue.overshoot).abs()
                     {
@@ -356,8 +305,6 @@ pub(crate) fn compute_blue_edges(
                 }
                 if group == ScriptGroup::Default {
                     // Now compare to overshoot position for the default script
-                    // group
-                    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/aflatin.c#L2579>
                     if edge.flags.contains(TopoFlags::ROUND) && dist != 0 && !is_neutral {
                         let is_under_ref = (edge.fpos as i32) < unscaled_blue.position;
                         if is_top ^ is_under_ref {

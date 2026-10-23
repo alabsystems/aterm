@@ -226,7 +226,10 @@ fn a_park_with_no_return_flushes_as_todays_verdict() {
     assert_eq!(stalled.in_flight_tally().park_flushed, 1);
 }
 
-/// A one-cell park's flush drains nothing.
+/// A one-cell park's flush drains nothing. A key typed, the caret seen one
+/// column left (a repaint parking on the trailing space it just drew), held as a
+/// park and flushed after the window: the flush judges it `typing` and hands v2
+/// a same-row backward `Typed` move with no erase.
 #[test]
 fn a_one_cell_park_flushed_as_typing_drains_no_cell_of_the_band() {
     let g = wide_geom();
@@ -437,7 +440,10 @@ fn a_short_retreat_beside_a_fresh_stamp_keeps_the_hide_bridge_verdict() {
     }
 }
 
-/// A held park rides a band move or a scroll.
+/// A held park rides a band move or a scroll. Codex prints a line every
+/// 10–230 ms while the hand types and Ink's park/return gap is ~40 ms, so a
+/// streamed line between them slides the composer row down (or up, with the
+/// transcript archiving).
 #[test]
 fn a_held_park_rides_a_band_move_or_a_scroll_and_its_return_lands_on_the_moved_row() {
     let g = wide_geom();
@@ -563,7 +569,9 @@ fn pre_roll_anchored(
     (t + Duration::from_millis(3), seq)
 }
 
-/// The return seen on the anchored lane.
+/// The return seen on the anchored lane. Ink's second bracket (hide, rewrite,
+/// show) can be sampled mid-bracket: the caret hidden and the print anchor
+/// advanced from the park's origin to the row's new end.
 #[test]
 fn a_held_parks_return_is_recognised_on_the_anchored_lane() {
     let g = wide_geom();
@@ -697,7 +705,11 @@ fn a_park_returning_to_its_own_origin_is_not_a_re_anchor() {
     assert!(!v2_cols(&glow, 3).contains(&1));
 }
 
-/// A park flushed after its window sweeps no prompt cell.
+/// A park flushed after its window sweeps no prompt cell. Under a stall Ink's
+/// rewrite can come after the 0.25 s park window, so the park flushes as a typed
+/// re-anchor; its landing sweep (`re_anchor_lays_landing`, for the box-growth
+/// wrap whose landing is the wrapped glyph) runs only if the row probe showed a
+/// glyph at the landing cell when the park was held.
 #[test]
 fn a_park_flushed_after_its_window_lights_no_blank_landing() {
     let g = wide_geom();
@@ -764,7 +776,9 @@ fn a_park_flushed_after_its_window_lights_no_blank_landing() {
     }
 }
 
-/// A delivered insert echoed through an Ink park is laid.
+/// A delivered insert echoed through an Ink park is laid. Under Ink's
+/// park-and-rewrite the caret parks left, then the row is rewritten to its end
+/// plus the new text, and a dropped path takes that route.
 #[test]
 fn an_insert_echoed_through_an_ink_park_is_laid() {
     let g = wide_geom();
@@ -831,7 +845,9 @@ fn an_insert_echoed_through_an_ink_park_is_laid() {
     assert!(glow.held_park.is_none());
 }
 
-/// A late park flush cannot spend a stamp banked after the park.
+/// A late park flush cannot spend a stamp banked after the park. `flush_park`
+/// judges at the park's own clock, and every freshness read is
+/// `now.saturating_duration_since(t) <= window`, true for any `t >= now`.
 #[test]
 fn a_late_park_flush_cannot_spend_a_stamp_banked_after_the_park() {
     let g = geom();

@@ -64,7 +64,8 @@ pub(crate) struct GlArmLive {
     uniform: GlBuffer,
     uniform_key: Option<(u32, u32, u32)>,
     streams: [Option<GlStream>; STREAM_COUNT],
-    /// Glyph (mono, colour) and decoration coverage.
+    /// Glyph (mono, colour) and decoration coverage. Sprite textures live with
+    /// their source (`SpriteTex::gl_atlas`).
     atlases: [Option<GlArmAtlas>; DRAW_ATLAS_COUNT],
     /// The fx atlases (`fx_gpu::FxAtlasKind` order), synced from the
     /// renderer's append-only `FxAtlas`.
@@ -142,7 +143,8 @@ impl GlArmLive {
         self.fx_palettes = std::array::from_fn(|_| None);
     }
 
-    /// Write the frame's palette into the ring's next texture.
+    /// Write the frame's palette into the ring's next texture. The slot
+    /// written.
     fn upload_fx_palette(&mut self, words: &[u32]) -> Result<usize, String> {
         let slot = self.fx_palette_next;
         self.fx_palette_next = (slot + 1) % fx_gpu::FX_PALETTE_RING;

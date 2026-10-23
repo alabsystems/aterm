@@ -55,7 +55,7 @@ pub enum ExceptionKind {
 impl ExceptionKind {
     /// The one word the journal and the digest key by.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::Login => "login",
             Self::Spend => "spend",
@@ -100,7 +100,7 @@ pub enum Outlook {
 /// the session. Total over [`WallKind`]: a new kind does not compile until it
 /// is answered here.
 #[must_use]
-pub fn outlook(
+pub const fn outlook(
     kind: WallKind,
     has_reset: bool,
     resumes_by_itself: bool,
@@ -207,7 +207,7 @@ impl CreditsOutlook {
     /// What a surface that shows the session says of it, a short static
     /// phrase; `None` where the session goes on as any other.
     #[must_use]
-    pub fn phrase(self) -> Option<&'static str> {
+    pub const fn phrase(self) -> Option<&'static str> {
         match self {
             Self::WaitsForReset => Some("on usage credits: waits for the subscription's reset"),
             Self::Person => Some("on usage credits: held, no reset named"),
@@ -220,7 +220,7 @@ impl CreditsOutlook {
 /// carry past named (`has_reset`) or not, under `cfg`, `supervised` when a
 /// loop watches it.
 #[must_use]
-pub fn credits_outlook(
+pub const fn credits_outlook(
     has_reset: bool,
     cfg: &SupervisorConfig,
     supervised: bool,

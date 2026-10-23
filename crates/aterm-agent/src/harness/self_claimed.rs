@@ -12,7 +12,8 @@ use super::codex_alab;
 /// Supported `codex-alab` session record schema version.
 pub const RECORD_VERSION: u64 = 1;
 
-/// Maximum serialized record size.
+/// Maximum serialized record size. Reads admit only regular files and never
+/// wait for a Unix FIFO's writer.
 const RECORD_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Ledger filename for handled crash witnesses under `<state>/drive/`.

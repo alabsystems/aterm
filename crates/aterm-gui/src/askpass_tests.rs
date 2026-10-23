@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the askpass server helpers — behaviour only, no timing budgets
-//! (the clock is injected).
+//! Tests for the askpass server helpers with an injected clock.
 
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
@@ -104,12 +103,10 @@ fn backoff_widens_on_cancel_and_clears_on_answer() {
         "another session is unaffected"
     );
 
-    // A second consecutive cancel widens the window past the first.
     b.on_cancel(1, t0);
     let second = b.quiet_for(1, t0).expect("still quiet");
     assert!(second > first, "{second:?} should exceed {first:?}");
 
-    // An answer clears it.
     b.on_answer(1);
     assert!(b.quiet_for(1, t0).is_none(), "cleared by an answer");
 }
@@ -139,7 +136,6 @@ fn await_answer_times_out_on_the_injected_clock() {
     let (_tx, rx) = channel::<AskpassAnswer>();
     let base = Instant::now();
     let deadline = base + Duration::from_secs(300);
-    // The clock jumps past the deadline on the first read.
     let mut now = || base + Duration::from_secs(301);
     let mut hung = || false;
     let ticket = AskpassTicket::new(1, deadline);

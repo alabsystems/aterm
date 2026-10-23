@@ -298,7 +298,8 @@ unsafe impl Sync for Claim {}
 pub struct SwizzleSite<F: MethodFn> {
     /// The [`Claim`] this site published, or null when nothing is installed.
     claim: AtomicPtr<Claim>,
-    /// The prototype the install verified.
+    /// The prototype the install verified. Zero-sized; a function pointer type
+    /// is `Send`/`Sync`, so this costs the site no auto-trait.
     _proto: PhantomData<F>,
 }
 

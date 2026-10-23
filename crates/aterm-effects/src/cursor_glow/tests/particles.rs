@@ -187,7 +187,12 @@ fn probed_glow(c: &GlowConfig, g: Geom, at: Instant) -> CursorGlow {
     glow
 }
 
-/// The particle law, every lawful arm (Sparkle, Comet, Water, Laser).
+/// The particle law, every lawful arm (Sparkle, Comet, Water, Laser). On a
+/// light ground a grain is source-over ink, never additive light (the comet's
+/// debris settles as motes under the letters, in the under-ink stream), and a
+/// grain over a probed line of text (a letter, or the gap between two words,
+/// on the cursor's row or a probed row beside it) is not drawn at all, while
+/// its twin past the end of the line is.
 #[test]
 fn light_grains_are_ink_and_keep_off_the_letters() {
     let g = geom();

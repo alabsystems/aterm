@@ -710,7 +710,10 @@ fn a_glide_tick_at_a_history_end_never_snaps_a_live_bounce() {
     );
 }
 
-/// The event path obeys the same rule.
+/// The event path obeys the same rule. A momentum tail keeps sending small
+/// deltas at the edge after the push that released the bounce: an excess of
+/// 1-3 px that resists to a zero impulse, and a sub-pixel delta that rounds
+/// onto the edge (no excess), must both leave the bounce live and presented.
 #[test]
 fn a_small_delta_at_a_history_end_keeps_the_bounce_presented() {
     let mut app = App::headless_for_test();
@@ -1023,7 +1026,10 @@ fn a_glide_bound_for_live_lands_on_live_while_output_streams() {
     }
 }
 
-/// …and an offset that drops under it is followed, not undone.
+/// …and an offset that drops under it is followed, not undone. The re-pin
+/// only ever raises the offset; a drop (the app clearing its scrollback
+/// with `CSI 3 J`, which Ink-based TUIs send on a full redraw) already moved
+/// the reader to live, and the glide must not scroll them back up.
 #[test]
 fn a_live_bound_glide_follows_a_cleared_history_instead_of_climbing_it() {
     let mut app = App::headless_for_test();

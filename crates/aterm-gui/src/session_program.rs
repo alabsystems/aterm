@@ -389,7 +389,9 @@ struct PendingJob {
     /// it, so a rapid re-enable cannot put a second token behind a slow read.
     latest: Option<Job>,
     revision: u64,
-    /// Changes on cancellation or a new group, but not an ordinary retry.
+    /// Changes on cancellation or a new group, but not an ordinary retry. A
+    /// slow same-group lookup may still publish while a retry is waiting, so
+    /// repeated retries cannot starve program identity.
     incarnation: u64,
     phase: JobPhase,
 }
@@ -410,7 +412,9 @@ impl PendingJobs {
         })
     }
 
-    /// Replace a session's latest request.
+    /// Replace a session's latest request. Only a new session needs a channel
+    /// token: a queued worker reads the replacement, and an in-flight worker
+    /// requeues once after its current lookup finishes.
     fn offer(&mut self, job: Job) -> bool {
         self.revision = self.revision.wrapping_add(1);
         if let Some(pending) = self.by_session.get_mut(&job.session) {
@@ -435,7 +439,9 @@ impl PendingJobs {
         true
     }
 
-    /// A crashed worker lost its local queue and channel.
+    /// A crashed worker lost its local queue and channel. Every retained slot
+    /// gets exactly one token on the replacement channel, including the lookup
+    /// that was in flight when the old worker exited.
     fn restart_ids(&mut self) -> Vec<u64> {
         self.by_session
             .iter_mut()
@@ -458,7 +464,8 @@ impl PendingJobs {
         }
     }
 
-    /// A changed in-flight slot needs one more pass over its latest job.
+    /// A changed in-flight slot needs one more pass over its latest job. The
+    /// caller puts its existing token at the tail after other queued sessions.
     fn finish(&mut self, session: u64, revision: u64) -> bool {
         match self.by_session.get_mut(&session) {
             Some(slot) if slot.revision != revision && slot.latest.is_some() => {
@@ -473,7 +480,9 @@ impl PendingJobs {
         }
     }
 
-    /// Leave a tombstone for its one queued token or running read.
+    /// Leave a tombstone for its one queued token or running read. Dropping
+    /// the slot here would allow an immediate re-enable to enqueue a second
+    /// token, and could accept the old read as the new request's answer.
     fn cancel(&mut self, session: u64) {
         if let Some(slot) = self.by_session.get_mut(&session) {
             self.revision = self.revision.wrapping_add(1);

@@ -58,7 +58,9 @@ fn openpty() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
 
-/// Every session of a desk on its own real, quiet PTY.
+/// Every session of a desk on its own real, quiet PTY. The capture polls a
+/// mid-sequence session's master for queued output (a stub's `-1` would read
+/// as activity), and the manifest writer refuses a descriptor below 3.
 #[derive(Default)]
 struct DeskPtys {
     pairs: Vec<(u64, i32, i32)>,
@@ -467,7 +469,11 @@ const DISPLAYS: [(u32, u32); 4] = [(3024, 1964), (3456, 2234), (5120, 2880), (60
 /// bar and a 70 pt Dock, at 2x.
 const MAXIMIZED_CHROME_PX: u32 = 74 + 140;
 
-/// The font sizes a desk is sampled at.
+/// The font sizes a desk is sampled at. Below 8 px, three full-screen 6K
+/// windows (about 1.4 Mi visible+alt cells each at 6 px) outgrow the 4 Mi
+/// aggregate ceiling; this property is about desks the wire carries exactly,
+/// and a pool past the ceiling is carried blank on purpose
+/// (`a_pool_over_the_aggregate_lowers_its_largest_session`).
 const FONT_PX: std::ops::RangeInclusive<u32> = 8..=48;
 
 /// The largest pool a desk is built with.
@@ -660,7 +666,9 @@ fn build_desk(seed: u64, field_report: bool) -> (Desk, impl FnMut() -> u64) {
     )
 }
 
-/// Prints the replay line if a desk fails, from wherever it panicked.
+/// Prints the replay line if a desk fails, from wherever it panicked. A case
+/// number, not a bare seed, replays it: the seed derives from the number, and
+/// case 0 is also the pinned 99x338 window.
 struct ReplayOnPanic {
     case: usize,
     seed: u64,
@@ -709,7 +717,9 @@ impl DeskCensus {
         )
     }
 
-    /// The census on a shard's `line`, or `None` if `line` carries none.
+    /// The census on a shard's `line`, or `None` if `line` carries none. The
+    /// census follows the runner's own `test <name> ... ` on that line: with
+    /// `--nocapture` a test's output lands between the name and its verdict.
     fn parse(line: &str) -> Option<Self> {
         let fields: Vec<u64> = line
             .split_once(Self::PREFIX)?
@@ -843,7 +853,10 @@ fn app_capture_case(case: usize, census: &mut DeskCensus) {
     ptys.release(app);
 }
 
-/// Every desk the GUI can build hands every session over exactly.
+/// Every desk the GUI can build hands every session over exactly. Forty seeded desks, each a
+/// real headless App: 1 to 3 windows of 1 to 4 tabs with random splits (at most twelve
+/// sessions), every window sized by the grid law from the display table (case 0 is a 99x338
+/// window on the 5K display), every pane on a real PTY.
 #[test]
 fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
     const CASES: usize = 40;
@@ -913,7 +926,9 @@ fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
     }
 }
 
-/// A pinned desk: one window, two tabs at 56x149 by the GUI's grid law.
+/// A pinned desk: one window, two tabs at 56x149 by the GUI's grid law. Tab 1 is a shell with
+/// 400 lines of styled history; tab 0 is Claude Code, entered from a prompt on the last row, so
+/// 1049's DECSC slot is row 55.
 #[test]
 fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
     let Some(_env) = env_alone() else { return };
@@ -1819,7 +1834,11 @@ fn a_held_exited_pane_keeps_its_screen() {
     ptys.release(app);
 }
 
-/// A HELD PANE'S TURN LEDGER CROSSES.
+/// A HELD PANE'S TURN LEDGER CROSSES. A pane a
+/// manager drove with `turn` before its command ended keeps the records, so
+/// `history` lists them (`carried=1`) and the report reader finds them: they
+/// ride the pane's own control sidecar, read before the proof as a handed
+/// session's is.
 #[test]
 fn a_held_panes_turn_ledger_crosses_the_update() {
     let Some(_env) = env_alone() else { return };

@@ -1859,7 +1859,9 @@ fn park_when_asked() {
     std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
 }
 
-/// A stand-in agent in [`TAB`]: this test binary, parked.
+/// A stand-in agent in [`TAB`]: this test binary, parked. Not `/bin/sleep`: a
+/// platform binary's environment is hidden from `KERN_PROCARGS2`, a real
+/// agent's is not.
 fn parked() -> Command {
     let mut c = parked_bare();
     c.arg(PARK[1]);

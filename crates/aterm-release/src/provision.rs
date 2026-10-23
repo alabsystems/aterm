@@ -384,7 +384,8 @@ struct Closing<'a> {
     id: &'a str,
     home: &'a str,
     check_only: bool,
-    /// The mint's own report, when this run minted.
+    /// The mint's own report, when this run minted. `None` on `--check` and on every
+    /// re-run of an already-provisioned machine.
     report: Option<&'a atpkg_keys::provision::Report>,
     profile: Option<&'a Check>,
     authority: Option<String>,
@@ -758,7 +759,8 @@ fn release_asset_url(slug: &str, asset: &str) -> String {
     format!("https://github.com/{slug}/releases/latest/download/{asset}")
 }
 
-/// One bounded anonymous download.
+/// One bounded anonymous download. The caps mirror the update client's roster limits
+/// (64 KiB body, 4 KiB signature): a seed never accepts more than the fleet would.
 #[cfg(unix)]
 fn curl_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
     let cap_s = cap.to_string();
@@ -947,7 +949,9 @@ fn kept_roster_path(home: &str) -> PathBuf {
         .join(roster::ROSTER_ASSET)
 }
 
-/// Copy the pair `authorize_cut` just accepted into `~/.aterm/roster`.
+/// Copy the pair `authorize_cut` just accepted into `~/.aterm/roster`. `Ok(true)` when a
+/// copy was written, `Ok(false)` when the kept pair is already byte-identical — so a
+/// provisioned machine says this once, not on every audit.
 #[cfg(unix)]
 fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
     let doc = machines::RosterDocument::read(roster_path)?;
@@ -994,7 +998,8 @@ fn restore_kept_pair(
     Ok(true)
 }
 
-/// One audit line: proven, missing-with-remedy, or impossible on this host.
+/// One audit line: proven, missing-with-remedy, or impossible on this host. A `Skip` is
+/// not a pass: a host that skips Apple checks can never say READY TO CUT.
 #[cfg(unix)]
 #[derive(Debug)]
 enum Check {
@@ -1136,7 +1141,10 @@ fn rust_shim_check(home: &str) -> Check {
     }
 }
 
-/// The doc-tool farm link, `~/.local/bin/trustdoc` symlinked at the live stage2.
+/// The doc-tool farm link, `~/.local/bin/trustdoc` symlinked at the live stage2. targo
+/// resolves an unset doc driver to the `trustdoc` beside itself, then PATH; the link covers
+/// a direct cargo run whose toolchain carries no trustdoc, which otherwise dies at exec
+/// with a raw OS error.
 #[cfg(unix)]
 fn doc_tool_check(home: &str, check_only: bool) -> Check {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
@@ -1277,7 +1285,8 @@ fn front_door_check(bin: &Path) -> Check {
     })
 }
 
-/// The front-door verdict, pure over the `--version` probe so both outcomes are tests.
+/// The front-door verdict, pure over the `--version` probe so both outcomes are tests. The
+/// remedy names the product first; rustup is not a remedy for this row.
 #[cfg(unix)]
 fn front_door_verdict(
     bin: &Path,
@@ -1811,7 +1820,11 @@ fn notary_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> C
     }
 }
 
-/// The credentials profile a Tier APPLE cut names on its command line.
+/// The credentials profile a Tier APPLE cut names on its command line. The cut has no
+/// ambient path, so the audit checks the conventional location and validates it with
+/// `sign::ReleaseCredentials::load`, the call the cut makes (`signing_key` required,
+/// owner-only permissions, one notary credential): the audit never passes a profile the
+/// cut refuses.
 #[cfg(unix)]
 fn profile_check(
     home: &str,

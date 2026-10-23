@@ -374,7 +374,10 @@ fn ctl_in(root: &Path, args: &[&str]) -> Output {
     ctl_fed(root, args, None)
 }
 
-/// [`ctl_in`] with `stdin` its standard input (`None`: nothing).
+/// [`ctl_in`] with `stdin` its standard input (`None`: nothing). Asked again, a
+/// fresh client each time, while the instance has not yet accepted it or answers
+/// it busy ([`headless_boot::until_served`]): the client's own 10 s accept budget
+/// is a person's, and a loaded machine can miss it.
 fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     headless_boot::until_served(|| {
         let aterm = crate::launch_isolation::aterm_executable();

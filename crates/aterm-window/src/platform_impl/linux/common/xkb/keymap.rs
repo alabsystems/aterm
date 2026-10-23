@@ -4,8 +4,7 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/common/xkb/keymap.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! XKB keymap (`aterm-xkb` entry points/keysyms and `aterm-wayland` keymap compilation; modified
-//! by the aterm project in 2026, see the repository NOTICE).
+//! XKB keymap compilation and keycode/keysym translation.
 
 use std::ffi::CStr;
 use std::ops::Deref;
@@ -462,7 +461,7 @@ pub struct XkbKeymap {
 }
 
 impl XkbKeymap {
-    /// The keymap a compositor sent (`wl_keyboard.keymap`, XKB v1 text, up to its terminating NUL).
+    /// Compile an XKB v1 text keymap received from the compositor.
     #[cfg(wayland_platform)]
     pub fn from_text(context: &XkbContext, text: &[u8]) -> Option<Self> {
         if text.is_empty() {

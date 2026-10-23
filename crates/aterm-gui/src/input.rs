@@ -594,6 +594,8 @@ fn wheel_scaled_lines(notch_lines: i32, notch: WheelNotch, page_rows: u16) -> i3
 }
 
 /// How [`seam_egress_receipt`] hands the encoded bytes to the [`SinkWriter`] — a TRANSPORT knob keyed on the CALLING THREAD, never on who produced the event (cf.
+/// `echo_to_window` and the `resize` arm, which key on WHERE the event came from,
+/// not on [`Source`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressMode {
     /// The UI event-loop thread, and a control socket lane writing into a session that is not on screen: the non-parking egress (`SinkWriter::write_frame_interactive_with_receipt`), so a wedged foreground never parks the loop that serves every window, nor a lane other socket clients need.

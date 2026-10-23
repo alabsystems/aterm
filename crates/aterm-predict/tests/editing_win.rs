@@ -25,7 +25,12 @@ const REGION_FAMILIES: [usize; 10] = [101, 37, 29, 20, 18, 19, 20, 33, 17, 6];
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
 
-/// THE COST BOUNDS (assertion 5).
+/// THE COST BOUNDS (assertion 5). A reconcile asks the host for at most two
+/// rows and two cells: the line's row (the tail a proof stands on, a chain's
+/// cells to the margin) and the row under it, THE FLOOR (`Rule::FloorBelow`,
+/// every cell its run's press read blank), added by the review of increment 4
+/// after the plan bounded a reconcile by one row (`cols + 2`); the shipping
+/// predictor reads both on every frame a standing proof is above a floor.
 const OBSERVE_BOUND: u64 = 2 * COLS as u64 + 2;
 /// The plan's bound on the ops a frame folds: every state of a chain of
 /// `EDIT_CHAIN_MAX` (64) ops folded from scratch, `64 * 65 / 2`.
@@ -657,7 +662,9 @@ impl Variant {
         }
     }
 
-    /// Configure `sim`'s predictor (and checker) before the first key.
+    /// Configure `sim`'s predictor (and checker) before the first key. The
+    /// edit lane is switched off as aterm-gui's config switches it, through the
+    /// host (`Sim::set_editing`), which then reads no row for an edit key.
     fn prepare(self, sim: &mut Sim) {
         match self {
             Self::Baseline => {

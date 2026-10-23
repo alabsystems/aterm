@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The room meter on injected instants (design
-//! `docs/DESIGN-disk-awareness-2026-10-17.md` §6.3).
+//! The room meter on injected instants (design `docs/DESIGN-disk-awareness-2026-10-17.md` §6.3).
 
 use super::*;
 

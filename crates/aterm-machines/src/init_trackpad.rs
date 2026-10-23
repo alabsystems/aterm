@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Local init's scroll direction, verified both in preferences and through the
-//! native preference getter used by System Settings. Merely writing defaults is
-//! insufficient to apply an input preference to an already running login session;
-//! Apple's getter itself does not independently query WindowServer input state.
-//! Every explicit apply therefore refreshes the native setter even when saved
-//! values already match. Plan/check only inspect the configured preference.
+//! Local init trackpad scroll direction and scrolling behavior preferences.
 
 use crate::items::defaults::{Pref, Target, Want};
 use crate::items::{Ctx, Item};
@@ -26,11 +21,7 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     Ok(vec![Box::new(ScrollDirection { user: user.clone() })])
 }
 
-/// The scrolling behavior captured on the owner's reference Mac: vertical,
-/// horizontal and momentum scrolling enabled for internal and Bluetooth pads,
-/// with the native per-host momentum and scroll-behavior values retained.
-/// Kept separate from the immediate scroll-direction item so every setup surface
-/// can use the same profile without changing the native direction tests.
+/// Returns trackpad scrolling behavior preference items for the resolved local user.
 ///
 /// # Errors
 /// Init did not resolve exactly one user.
@@ -62,7 +53,6 @@ pub fn behavior_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
             add(Target::user(domain, key, user), PValue::Bool(true));
         }
     }
-    // These two exact values were read from the reference user's ByHost globals.
     add(
         Target::host("-g", "com.apple.trackpad.momentumScroll", user),
         PValue::Bool(true),
@@ -145,8 +135,6 @@ impl Item for ScrollDirection {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        // Confirm native access before altering persistence; an unavailable API
-        // must not turn this into a silently login-only setting.
         sys.natural_scrolling()?;
         let persisted = self.persisted(sys)?;
         if !persisted {

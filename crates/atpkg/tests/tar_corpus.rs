@@ -16,7 +16,8 @@ struct Record {
     /// The EFFECTIVE content length — after a PAX `size` record has overridden
     /// the header field.
     size: u64,
-    /// The RAW `size` field, unoverridden.
+    /// The RAW `size` field, unoverridden. Recorded separately so a change in
+    /// the override and a change in the field parse cannot cancel.
     header_size: u64,
     link: Option<PathBuf>,
     content: Vec<u8>,

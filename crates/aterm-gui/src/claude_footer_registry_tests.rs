@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REGISTRY WAKE (`docs/DESIGN-card-engine-2026-10-19.md` §3.10): the
-//! resolver reads an awaited Claude Code process's registry row when the
-//! kernel says its Claude dir moved, never on a timer. Each test drives the
-//! resolver's own turns ([`Resolver::turn`]) on a clock that NEVER ADVANCES,
-//! so no follow-up and no idle re-read is ever due: a read that finds the row
-//! can only be the ask's, an event's or a fresh watch's, and the
-//! `registry-read` dev rows say which. The events come from a real kernel
-//! queue through the real forwarder thread
-//! ([`crate::claude_registry`]); each wait for one is a one-minute hang
-//! detector, never a budget.
+//! REGISTRY WAKE (`docs/DESIGN-card-engine-2026-10-19.md` §3.10): the resolver reads an awaited
+//! Claude Code process's registry row when the kernel says its Claude dir moved, never on a timer.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -32,9 +24,6 @@ const SESSION: u64 = 7;
 const SESSION_ID: &str = "00000000-0000-4000-8000-000000000a51";
 
 thread_local! {
-    // The resolver turns and injected Asks run on the test thread; the
-    // forwarder only sends watch events. Keep its entire namespace exclusive and
-    // remove it when this thread ends, including assertion unwind.
     static OWNED_ROOT: aterm_tempfile::TempDir = aterm_tempfile::Builder::new()
         .prefix("aterm-gui-registry-wake-")
         .tempdir()
@@ -184,7 +173,6 @@ fn reads(timeline: &Arc<Mutex<SessionTimeline>>) -> Vec<String> {
 /// being new). The row lands; the forwarder tells the Claude dir; the
 /// event's read publishes the build. The clock never moved, so no clock
 /// read could have found it, and none is owed before the first follow-up.
-/// The wait over, the watch and its thread are gone.
 #[test]
 fn a_row_created_after_the_ask_is_read_on_the_directory_event() {
     const PID: i32 = 2_000_000_101;
@@ -216,10 +204,6 @@ fn a_row_created_after_the_ask_is_read_on_the_directory_event() {
 }
 
 /// A ROW CREATED EMPTY, THEN WRITTEN IN PLACE, IS READ ON THE FILE EVENT.
-/// Claude Code creates `sessions/<pid>.json` and then writes it: the
-/// directory event's read finds a file that does not parse, so the file gets
-/// a watch of its own (and a read, the watch being new), and the write in
-/// place — which no directory watch reports — is told through it.
 #[test]
 fn a_row_created_empty_then_written_is_read_on_the_file_event() {
     const PID: i32 = 2_000_000_102;
@@ -232,7 +216,6 @@ fn a_row_created_empty_then_written_is_read_on_the_file_event() {
     resolver.turn(told(&rx), || t0);
     assert_eq!(version(&timeline), None, "an empty row says nothing");
     assert!(resolver.registry.file_watched(&row_path(PID)));
-    // Nothing else is owed: the write below is the only thing to tell.
     while rx.try_recv().is_ok() {}
     std::fs::OpenOptions::new()
         .write(true)

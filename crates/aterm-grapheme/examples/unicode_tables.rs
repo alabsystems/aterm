@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Regenerate shaping properties from one Unicode Character Database version.
-//! Inputs are explicit local files; this tool never downloads or chooses a version.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;

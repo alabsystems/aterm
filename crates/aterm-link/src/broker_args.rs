@@ -14,11 +14,10 @@ pub(crate) enum ParseError {
 pub(crate) struct BrokerArgs<'a, S> {
     pub secret_file: Option<&'a S>,
     pub durability: Option<&'a S>,
-    /// `--lifeline-fd <n>` ([`aterm_uds::lifeline::FLAG`]): the descriptor a launcher that
-    /// opts in hands the broker, which ends itself once it reads end-of-file.
+    /// `--lifeline-fd <n>` ([`aterm_uds::lifeline::FLAG`]).
     pub lifeline_fd: Option<&'a S>,
-    /// Where that flag stands among the words read, so a line that shows the invocation for
-    /// a person to run again can leave it out: only the launcher could hand the descriptor.
+    /// Index of `--lifeline-fd` among the arguments `parse` read (not `words`), so display lines
+    /// can omit it.
     pub lifeline_at: Option<usize>,
     pub repair: bool,
     pub words: Vec<&'a S>,
@@ -94,30 +93,21 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
         Ok(out)
     }
 
-    /// Confirm a display-discovered candidate against the actual option
-    /// boundaries before attributing a tier to this endpoint: the broker's
-    /// socket is its first word.
+    /// Confirms that the first positional word is the broker's socket path.
     pub fn serves_endpoint(&self, endpoint: &str) -> bool {
         self.words
             .first()
             .is_some_and(|word| word.as_ref() == endpoint)
     }
 
-    /// Pure serving syntax only; the secret's bytes remain the execution
-    /// lane's check. A bare argv runs the build's default for a broker whose
-    /// argv names a mint secret or not ([`crate::durability::resolve`]): the
-    /// same words the broker verb judges itself by.
+    /// Pure serving syntax only; the secret's bytes remain the execution lane's check.
     pub fn serving_durability(&self) -> Option<crate::durability::Durability> {
         let guarded = self.secret_file.is_some();
         self.named_durability()
             .map(|named| crate::durability::resolve(named, guarded))
     }
 
-    /// The LOG a recognised serving invocation serves, as the broker verb
-    /// reads its words: the second word, or the socket's `<socket>.log` when
-    /// there is none. Only an ABSOLUTE path: a relative one names a file under
-    /// the broker's working directory, which a reader of its argv does not
-    /// know. `None` for anything else (a repair serves nothing).
+    /// The LOG a recognised serving invocation serves, as the broker verb reads its words.
     pub fn log_path(&self) -> Option<std::path::PathBuf> {
         self.named_durability()?;
         let path = match self.words.as_slice() {
@@ -132,9 +122,7 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
         path.is_absolute().then_some(path)
     }
 
-    /// What a recognised serving invocation NAMES: `Some(None)` for no
-    /// `--durability` (the build's default), `Some(Some(tier))` for a named
-    /// one, `None` for an argv that is not a recognised serving one.
+    /// What a recognised serving invocation NAMES.
     pub fn named_durability(&self) -> Option<Option<crate::durability::Durability>> {
         if self.repair || !matches!(self.words.len(), 1 | 2) {
             return None;
@@ -160,7 +148,6 @@ mod tests {
             .expect("accepted broker syntax");
         assert_eq!(parsed.secret_file.copied(), Some("--durability"));
         assert_eq!(parsed.words, vec![&"socket", &"relaxed"]);
-        // A bare guarded socket argv: the build's default for a guarded broker.
         assert_eq!(
             parsed.serving_durability(),
             Some(crate::durability::default_for(true))
@@ -181,7 +168,6 @@ mod tests {
         assert_eq!(parsed.durability.copied(), Some("--repair"));
         assert_eq!(parsed.words, vec![&"sock"]);
         assert!(!parsed.repair);
-        // A retired flag (the sealed wire's `--tcp`) is an unknown one.
         assert!(matches!(
             BrokerArgs::parse(&["--tcp", "127.0.0.1:7", "log"]),
             Err(ParseError::Usage(_))

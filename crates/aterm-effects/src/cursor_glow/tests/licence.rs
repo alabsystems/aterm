@@ -557,7 +557,8 @@ fn typing_paints_through_the_esc7_esc8_streamer_cadence() {
     assert!(glow.is_active(), "live ribbon ⇒ live engine");
 }
 
-/// The licence, denial side (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
+/// The licence, denial side (`docs/design/EFFECTS-LICENSE-REDESIGN.md`). An
+/// unlicensed move is a cursor delta with no fresh key hint behind it.
 #[test]
 fn an_unlicensed_move_mints_nothing_and_retires_nothing_in_every_style() {
     let g = geom();

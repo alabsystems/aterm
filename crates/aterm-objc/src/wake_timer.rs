@@ -62,7 +62,8 @@ impl WakePlan {
         self.armed
     }
 
-    /// Whether the timer fired since it was last armed, i.e.
+    /// Whether the timer fired since it was last armed, i.e. is parked a year
+    /// out until the next arm.
     #[must_use]
     pub const fn spent(&self) -> bool {
         self.spent
@@ -280,7 +281,8 @@ impl WakeTimer {
         self.armed_date
     }
 
-    /// Whether the timer will fire within `horizon` — i.e.
+    /// Whether the timer will fire within `horizon` — i.e. is armed and not
+    /// spent, as CoreFoundation itself reports it.
     #[must_use]
     pub fn fires_within(&self, horizon: Duration) -> bool {
         // SAFETY: A plain getter.

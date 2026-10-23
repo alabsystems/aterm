@@ -81,7 +81,9 @@ pub fn instance_pid(name: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-/// The pid a socket filename encodes, for the `aterm-<pid>.sock` spelling only.
+/// The pid a socket filename encodes, for the `aterm-<pid>.sock` spelling only. [`instance_pid`]
+/// also accepts `.token` for the stale sweep; the token rule must not, or a socket path ending
+/// `.token` would name itself and the server would write its token over its own socket.
 fn sock_name_pid(sock_name: &str) -> Option<u32> {
     if !sock_name.ends_with(".sock") {
         return None;

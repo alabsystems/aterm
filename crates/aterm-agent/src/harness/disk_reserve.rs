@@ -152,6 +152,11 @@ fn open_judged(path: &Path, access: u32) -> Result<std::fs::File, ReserveError> 
 }
 
 /// Whether the file at `path` HOLDS ITS BLOCKS — not compressed, sparse,
+/// offline or a placeholder, and allocated at least its length — read
+/// through its own handle ([`super::win::allocated`]): releasing one that
+/// does not frees next to nothing at the emergency it is kept for, so it is
+/// not the reserve.
+///
 /// # Errors
 ///
 /// [`ReserveError::Thin`] for a thin file; [`ReserveError::NotOurs`] for a

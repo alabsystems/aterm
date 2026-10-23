@@ -367,7 +367,7 @@ enum Builder {
 }
 
 impl Builder {
-    fn path(self) -> &'static str {
+    const fn path(self) -> &'static str {
         match self {
             Builder::Add => "add",
             Builder::Sub => "sub",
@@ -467,7 +467,7 @@ enum Prec {
 }
 
 impl Op {
-    fn prec(self) -> Prec {
+    const fn prec(self) -> Prec {
         match self {
             Op::Add | Op::Sub => Prec::Sum,
             Op::Mul | Op::Div | Op::Rem => Prec::Product,
@@ -482,7 +482,7 @@ impl Op {
         }
     }
 
-    fn builder(self) -> Option<Builder> {
+    const fn builder(self) -> Option<Builder> {
         match self {
             Op::Add => Some(Builder::Add),
             Op::Sub => Some(Builder::Sub),

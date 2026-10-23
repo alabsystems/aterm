@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for resident cadence ownership. Every projected bit comes from
-//! public shipping-brain reads or a real terminal snapshot. Motion duration and
-//! general perch-path geometry remain outside this small derived model.
+//! Tier-1 conformance tests for resident cadence ownership across flight landing and handoff.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -62,9 +60,6 @@ impl Scene {
         for _ in 0..30 {
             s.tick(100);
         }
-        // A local row hop still exercises legacy landing ownership. A
-        // screen-wide cursor relocation moves the base home immediately,
-        // so it deliberately cannot strand a long flight across the pane.
         s.term.process(b"\x1b[9;43H");
         for _ in 0..80 {
             let f = s.tick(16);
@@ -110,8 +105,6 @@ impl Scene {
         let facts = PetWorldFacts::read(&self.term, 7);
         let mut world = PetWorld::default();
         assert!(world.observe(&input, &facts, PetPane::full(&input)));
-        // The no-target fixture has no clear cell at all, which is stronger
-        // than failure to fit one particular body. Never infer this from alpha.
         let blocked = (0..24).all(|r| (0..80).all(|c| world.cell(r, c) != PetCell::Clear));
         let resident = matches!(
             self.brain.console_attention(),
@@ -215,9 +208,6 @@ fn real_flight_landing_and_resident_consumption_conform_for_clear_and_dense_read
 fn real_no_target_retirement_consumes_touch_and_cannot_poll_or_replay() {
     let model = console_resident_handoff_model();
     let mut s = Scene::watching();
-    // The watcher enters the same modeled settled-resident state through a
-    // command, rather than through a flight. Check exact state equality with
-    // the derived model's reachable clear-handoff outcome before the stimulus.
     let mut state = model.init_state();
     for action in ["SelectClear", "Land", "ResidentTick"] {
         assert!(model.fire(action, &mut state));

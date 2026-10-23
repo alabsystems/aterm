@@ -100,7 +100,7 @@ impl Record {
     }
 
     #[must_use]
-    pub fn total(&self) -> u64 {
+    pub const fn total(&self) -> u64 {
         self.rows.len() as u64
     }
 

@@ -190,6 +190,8 @@ fn executable_file(path: &Path) -> bool {
     }
 }
 
+/// `targo --unverified ship <args>` in a commit's worktree `tree`, building into `target`,
+/// with `envs` set — the Trust targo of `$TRUST_STAGE2_BIN` when the caller pinned one,
 /// else the one on PATH: its exit code, a signal's as a shell reports it.
 fn own_cutter(
     tree: &Path,
@@ -286,6 +288,7 @@ fn toplevel(cwd: &Path, env: &[(String, String)]) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// A commit's worktree in a private scratch directory, its submodules at the gitlinks
 /// the commit records; removed on drop, worktree and all, whatever ended its use.
 struct Worktree {
     root: PathBuf,

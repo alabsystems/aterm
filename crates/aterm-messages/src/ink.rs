@@ -1363,7 +1363,8 @@ pub(crate) fn chip_inks(
 mod tests {
     use super::*;
 
-    /// The former dark/light rule, verbatim: Rec.
+    /// The former dark/light rule, verbatim: Rec. 601 luma above 150 in
+    /// unfused `f32`.
     fn luma_is_light(c: [u8; 3]) -> bool {
         0.299 * f32::from(c[0]) + 0.587 * f32::from(c[1]) + 0.114 * f32::from(c[2]) > 150.0
     }

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Unix: the `poll(2)` under [`super::ExitWait`], and several children run at
-//! once on one thread ([`super::outputs_until`], and one held child resumed,
-//! [`super::Held`]), which watches every child's streams and exit with one
-//! `poll(2)` and so starts no thread.
+//! Unix `poll(2)` multiplexing for [`super::ExitWait`] and [`super::outputs_until`].
 
 use std::fs::File;
 use std::io::{self, Read as _};
@@ -34,8 +31,7 @@ const POLLHUP: i16 = 0x10;
 /// `ESRCH`: the same number on Darwin, the BSDs and Linux.
 const ESRCH: i32 = 3;
 
-/// Whether every writer of the pipe `fd` reads has closed it: what it still holds is all it
-/// will ever hold, so its end is a read away.
+/// Whether every writer of the pipe `fd` reads has closed it.
 pub(super) fn writers_gone(fd: BorrowedFd<'_>) -> bool {
     let mut fds = [PollFd {
         fd: fd.as_raw_fd(),
@@ -45,9 +41,7 @@ pub(super) fn writers_gone(fd: BorrowedFd<'_>) -> bool {
     matches!(poll(&mut fds, Duration::ZERO), Ok(true)) && fds[0].revents & POLLHUP != 0
 }
 
-/// Whether a descendant of an exited child may still hold the pipe `fd` reads: a writer
-/// holds it and the process group the child led (`group`, its pid) still has a member, or
-/// the group is unknown. A descendant that leaves the group is not seen.
+/// Whether a descendant of an exited child may still hold the pipe `fd` reads.
 pub(super) fn descendant_may_hold(fd: BorrowedFd<'_>, group: Option<u32>) -> bool {
     !writers_gone(fd) && group.is_none_or(group_left)
 }
@@ -69,11 +63,8 @@ fn group_left(group: u32) -> bool {
 /// `poll(2)` over `fds` for at most `timeout` (rounded UP to a millisecond,
 /// so a wait never returns early and spins), retrying `EINTR` while time remains.
 /// `Ok(false)` when the timeout ran out with nothing ready.
-// Skip: a blocking `poll(2)` wait (FFI, unverifiable body).
 #[cfg_attr(trust_verify, trust::skip)]
 fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
-    // `nfds_t`: `unsigned long` in glibc and musl, `unsigned int` on Darwin,
-    // the BSDs and Android's bionic.
     #[cfg(target_os = "linux")]
     type Nfds = core::ffi::c_ulong;
     #[cfg(not(target_os = "linux"))]
@@ -86,8 +77,8 @@ fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
         let left = until.saturating_duration_since(Instant::now());
         let ms = i32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX);
         let n = Nfds::try_from(fds.len()).unwrap_or(Nfds::MAX);
-        // SAFETY: `fds` is a live, initialized array of `struct pollfd` of the
-        // length passed, which `poll` reads and writes and does not retain.
+        // SAFETY: `fds` is a live, initialized array of `struct pollfd` of the length passed, which
+        // `poll` reads and writes and does not retain.
         let ready = unsafe { poll(fds.as_mut_ptr(), n, ms) };
         if ready >= 0 {
             return Ok(ready > 0);
@@ -102,8 +93,7 @@ fn poll(fds: &mut [PollFd], timeout: Duration) -> io::Result<bool> {
     }
 }
 
-/// Whether the kernel has reported the exit `fd` ([`crate::exitwatch::exit_fd`])
-/// watches, waiting at most `timeout` for it.
+/// Whether the kernel has reported the exit `fd` ([`crate::exitwatch::exit_fd`]) within `timeout`.
 pub(super) fn exit_reported(fd: &OwnedFd, timeout: Duration) -> io::Result<bool> {
     let mut fds = [PollFd {
         fd: fd.as_raw_fd(),
@@ -120,8 +110,7 @@ pub(super) fn kill_group(child: &mut Child) {
             fn kill(pid: i32, sig: i32) -> i32;
         }
         const SIGKILL: i32 = 9;
-        // SAFETY: a plain syscall. The child is not yet reaped, so its pid —
-        // and with it the group id it leads — cannot have been reused.
+        // SAFETY: a plain syscall.
         unsafe { kill(-pid, SIGKILL) };
     }
     let _ = child.kill();
@@ -149,7 +138,6 @@ impl Stream {
         };
         let mut chunk = [0u8; 8192];
         match pipe.read(&mut chunk) {
-            // A signal before the read: still open, read on the next report.
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Ok(0) | Err(_) => self.pipe = None,
             Ok(n) => {
@@ -174,8 +162,7 @@ struct Run {
     failed: Option<RunError>,
 }
 
-/// `cmd` set up as every child here runs: leading a new process group, stdin
-/// `/dev/null`, stdout and stderr piped.
+/// `cmd` set up as every child here runs.
 pub(super) fn prepare(cmd: &mut Command) -> &mut Command {
     cmd.process_group(0)
         .stdin(Stdio::null())
@@ -291,7 +278,7 @@ impl Run {
     }
 }
 
-/// Several children at once, on this one thread. See [`super::outputs_until`].
+/// Several children at once, on this one thread.
 pub(super) fn outputs_until(
     cmds: &mut [&mut Command],
     deadline: Instant,
@@ -304,8 +291,7 @@ pub(super) fn outputs_until(
     )
 }
 
-/// One child already started from a [`prepare`]d command — a held one, just
-/// resumed ([`super::Held::output_until`]) — run as [`outputs_until`] runs each.
+/// One child already started from a [`prepare`]d command.
 pub(super) fn output_of_until(
     child: Child,
     deadline: Instant,
@@ -322,15 +308,12 @@ fn run_until(
     deadline: Instant,
     reap: Duration,
 ) -> Vec<Result<Output, RunError>> {
-    // The fallback tick, for a child with no exit descriptor.
     let mut tick = POLL_MIN;
     loop {
         let now = Instant::now();
         for run in runs.iter_mut().filter(|run| run.running()) {
             run.observe(now, now + reap);
         }
-        // A child that exited longer than the grace ago: what its streams
-        // gave by then is its report, whatever descendant still holds one.
         for run in &mut runs {
             if run.exited_at.is_some_and(|at| now >= at + DRAIN_GRACE) {
                 run.close_held_streams();
@@ -340,8 +323,6 @@ fn run_until(
             break;
         }
         if now >= deadline {
-            // Kill every child still running first, then reap them all
-            // within the one reserve, so `reap` bounds the whole cleanup.
             let reap_by = Instant::now() + reap;
             for run in runs.iter_mut().filter(|run| run.running()) {
                 if let Ok(child) = run.child.as_mut() {
@@ -358,10 +339,8 @@ fn run_until(
             break;
         }
         let mut wake = deadline;
-        // A running child with no exit descriptor: wake on the tick for it.
         let mut ticking = false;
         let mut fds = Vec::new();
-        // Which run and stream (0, 1) or exit (2) each pollfd stands for.
         let mut owners = Vec::new();
         for (index, run) in runs.iter().enumerate() {
             if run.settled() {
@@ -406,8 +385,6 @@ fn run_until(
         match poll(&mut fds, timeout) {
             Ok(true) => {}
             Ok(false) => continue,
-            // A `poll` that cannot run: wait a tick, and every child is
-            // still reaped and every stream still read on the next turn.
             Err(_) => {
                 std::thread::sleep(tick.min(timeout));
                 tick = (tick * 2).min(POLL_MAX);
@@ -421,7 +398,6 @@ fn run_until(
             let run = &mut runs[index];
             match which {
                 0 | 1 => run.streams[which].read_ready(),
-                // Reported: `observe` reaps it next turn; stop polling it.
                 _ => {
                     if let Some(exit) = run.exit.as_mut() {
                         exit.reported();

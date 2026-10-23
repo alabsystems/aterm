@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared memory for the Linux CPU presenters: an anonymous memfd, mapped
-//! read-write here and handed to the display server by descriptor (MIT-SHM
-//! AttachFd on X11, `wl_shm.create_pool` on Wayland), so a frame reaches the
-//! server without its pixels crossing the socket.
-//!
-//! The file is sealed against shrinking, so a server that maps it can trust
-//! its size for as long as it holds it; it may grow (a Wayland pool's
-//! resize).
+//! Sealed shared-memory file (`memfd_create`) mapped read-write for Linux X11/Wayland presenters.
 
 use std::ffi::CStr;
 use std::io;
@@ -26,9 +19,7 @@ pub(crate) struct ShmMem {
     file_len: usize,
 }
 
-// SAFETY: the mapping is owned by this value alone; the server reads it only
-// between a commit and the presenter's wait for that commit, which the
-// presenter holds `&mut self` across.
+// SAFETY: Owned exclusively here; the server reads only while the presenter holds `&mut self`.
 unsafe impl Send for ShmMem {}
 
 impl ShmMem {
@@ -57,9 +48,7 @@ impl ShmMem {
         Ok(mem)
     }
 
-    /// Grow the file to `len` bytes and map it again. The old mapping goes
-    /// only once the new one is made, so a failure leaves the memory as it
-    /// was (its words, its length) for the caller to keep using.
+    /// Grows and remaps the file to `len` bytes, keeping the old mapping on failure.
     pub(crate) fn set_len(&mut self, len: usize) -> io::Result<()> {
         if len > self.file_len {
             let size = libc::off_t::try_from(len)
@@ -70,8 +59,7 @@ impl ShmMem {
             }
             self.file_len = len;
         }
-        // SAFETY: a fresh shared read-write mapping of `len` bytes of a file
-        // that is at least `len` bytes long.
+        // SAFETY: Shared read-write mapping of `len` bytes of a file at least `len` bytes long.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -110,15 +98,13 @@ impl ShmMem {
         self.fd.as_fd()
     }
 
-    /// The first `count` 32-bit words at byte `offset` (a multiple of 4).
-    /// `None` when they do not fit.
+    /// Returns `count` 32-bit words at 4-byte-aligned byte `offset`, or `None` if out of bounds.
     pub(crate) fn words_mut(&mut self, offset: usize, count: usize) -> Option<&mut [u32]> {
         let end = count.checked_mul(4)?.checked_add(offset)?;
         if end > self.len || !offset.is_multiple_of(4) {
             return None;
         }
-        // SAFETY: inside the mapping, word-aligned (mmap is page-aligned and
-        // `offset` is a multiple of 4), and borrowed for `&mut self`.
+        // SAFETY: In-bounds, 4-byte aligned, and uniquely borrowed for `&mut self`.
         Some(unsafe {
             std::slice::from_raw_parts_mut(self.map.as_ptr().add(offset).cast::<u32>(), count)
         })

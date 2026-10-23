@@ -48,6 +48,7 @@ pub fn fill(buf: &mut [u8]) -> io::Result<()> {
     )
 }
 
+/// The fallback re-reads the whole buffer, and a device that ends early is an error
 /// (`read_exact`), never a short fill.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -66,6 +67,8 @@ fn fill_from(
     f.read_exact(buf)
 }
 
+/// Once is enough: `/dev/random` turns readable when the pool is first
+/// initialised, and before Linux 5.6 it could turn unreadable again as its
 /// entropy estimate drained, which `/dev/urandom` never needs to wait for.
 #[cfg(all(unix, any(target_os = "linux", target_os = "android", test)))]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -80,6 +83,8 @@ fn wait_until_rng_ready() -> io::Result<()> {
     Ok(())
 }
 
+/// Poll `path` for `POLLIN` with no timeout, retrying `EINTR` and `EAGAIN`.
+/// Any return of `poll(2)` but -1 is readiness, as upstream reads it (one
 /// descriptor and no timeout cannot return 0).
 #[cfg(all(unix, any(target_os = "linux", target_os = "android", test)))]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -152,6 +157,8 @@ pub fn fill(buf: &mut [u8]) -> io::Result<()> {
 mod tests {
     use super::hex_encode;
 
+    /// Each output pair depends on its input byte alone, so every byte value is the whole
+    /// domain: each encodes to two lowercase-hex chars that `u8::from_str_radix` maps back,
     /// and a longer input is the concatenation of its bytes' pairs.
     #[test]
     fn hex_encode_is_exact_lowercase_and_injective() {
@@ -184,6 +191,7 @@ mod tests {
         concat::<16>();
     }
 
+    /// The source is asked in chunks of at most 256 bytes (getentropy(2)'s cap), and a source
     /// that fills everything leaves the (nonexistent) device unopened.
     #[cfg(unix)]
     #[test]
@@ -207,6 +215,8 @@ mod tests {
         assert!(r.is_ok(), "an empty buffer asks nothing: {r:?}");
     }
 
+    /// A forced failure is an error, never a partly filled buffer: a failing source with a
+    /// missing device, or one chunk filled and a device that ends early (`/dev/null`). A
     /// fallback that succeeds (`/dev/zero`) replaces the whole buffer.
     #[cfg(unix)]
     #[test]
@@ -247,6 +257,7 @@ mod tests {
         );
     }
 
+    /// The readiness poll returns on a readable device and reports a missing one; it compiles
     /// on every Unix under test, so this runs on macOS too.
     #[cfg(unix)]
     #[test]

@@ -11,7 +11,7 @@ pub const BUCKET_S: i64 = 10;
 pub const BUCKET_MS: i64 = BUCKET_S * 1000;
 /// Buckets a ring keeps: an hour, what the lens shows.
 pub const RING_BUCKETS: usize = 360;
-/// The window "now" averages over , ms.
+/// The window "now" averages over, ms.
 pub const NOW_WINDOW_MS: i64 = 10_000;
 /// The longest step back that still lands in the open bucket, seconds.
 pub const CLAMP_BACK_S: i64 = 60;

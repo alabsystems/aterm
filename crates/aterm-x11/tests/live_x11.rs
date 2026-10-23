@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The transport against a real X server (the Linux lane's Xvfb; any
-//! `$DISPLAY`): replies a server wrote parse, a property and an image make
-//! the round trip, an error comes back to the request that caused it, an
-//! MIT-SHM segment attached by descriptor draws, and a selection moves
-//! between two connections as events. Without a display each test says SKIP
-//! and returns.
+//! Live X11 server transport, property, image, MIT-SHM, and selection tests.
 
 #![cfg(target_os = "linux")]
 
@@ -26,12 +21,6 @@ fn connect() -> Option<(Connection, usize)> {
 }
 
 /// An unmapped 16x8 window on `screen`'s root, with PropertyChange events.
-///
-/// Override-redirect: a window manager (mutter on a desktop's Xwayland) takes
-/// a top-level window's MapWindow as a MapRequest and maps it when it gets to
-/// it, and GetImage of a window not yet viewable is BadMatch (8) for GetImage
-/// (73). A window no manager redirects is mapped by the server at once, as on a
-/// bare Xvfb.
 fn window(conn: &Connection, screen: usize) -> u32 {
     let s = &conn.setup().roots[screen];
     let wid = conn.generate_id().unwrap();
@@ -164,8 +153,6 @@ fn an_error_comes_back_to_its_request() {
     let Some((conn, _)) = connect() else {
         return;
     };
-    // A window id this client never made: BadWindow (3) for GetGeometry
-    // (14), on the reply wait and on a checked void request alike.
     let bogus = conn.setup().resource_id_base | 0x1f_fff0;
     match conn.send(xproto::get_geometry(bogus)).unwrap().reply() {
         Err(Error::X11(e)) => {
@@ -177,7 +164,6 @@ fn an_error_comes_back_to_its_request() {
         Err(Error::X11(e)) => assert_eq!((e.error_code, e.major_opcode), (3, 8)),
         other => panic!("expected BadWindow, got {other:?}"),
     }
-    // The connection is still good afterwards.
     conn.send(xproto::get_input_focus())
         .unwrap()
         .reply()
@@ -335,8 +321,6 @@ fn a_big_request_takes_the_big_form() {
         .unwrap()
         .check()
         .unwrap();
-    // 300x300x4 = 360,000 bytes: past the 16-bit length field, into a
-    // pixmap big enough to take it (the window is 16x8).
     let data = vec![0x5au8; 300 * 300 * 4];
     let pixmap = conn.generate_id().unwrap();
     conn.send_void(xproto::create_pixmap(s.root_depth, pixmap, win, 300, 300))
@@ -550,7 +534,6 @@ fn randr_and_xinput_answer() {
         xi.major_opcode,
         root,
         &[xinput::EventMask {
-            // Hierarchy events are selected for every device only.
             deviceid: xinput::ALL_DEVICES,
             mask: vec![xinput::event_mask::HIERARCHY],
         }],
@@ -577,7 +560,6 @@ fn xlib_xi_and_xcursor_load_and_answer() {
         let screen = (x.XDefaultScreen)(display);
         let root = (x.XRootWindow)(display, screen);
         assert_eq!(root, (x.XDefaultRootWindow)(display));
-        // The XCB connection under it answers the same root.
         let conn =
             aterm_x11::Connection::from_xlib_display(std::ptr::NonNull::new(display).unwrap())
                 .unwrap();
@@ -597,11 +579,6 @@ fn xlib_xi_and_xcursor_load_and_answer() {
         let image = (cursors.XcursorImageCreate)(2, 2);
         assert!(!image.is_null());
         assert_eq!(((*image).width, (*image).height), (2, 2));
-        // XcursorImageCreate mallocs the image and sets neither its hotspot nor
-        // its pixels. A hotspot left as whatever the heap held can fall past the
-        // image's edge (x86_64 under Rosetta, 2026-10-19), and the server then
-        // refuses RenderCreateCursor with BadMatch, which Xlib's default handler
-        // answers by exiting the test process; the cursor code sets both.
         (*image).xhot = 0;
         (*image).yhot = 0;
         std::slice::from_raw_parts_mut((*image).pixels, 4).fill(0xff00_0000);

@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WALLPAPER PREPARATION, shared by every surface that draws the wallpaper:
-//! the terminal present (`App::splice_wallpaper`) and Settings' previews
-//! (`tray_raster`'s terminal specimens), so the picture Settings shows is the
-//! one a tab draws. Cover-scale the decoded image to a frame's exact pixel
-//! size, composite it over the theme background and tone it toward it by
-//! `wallpaper_dim` ([`scale_wallpaper_cover`]), and sample one text tint per
-//! grid cell ([`wallpaper_cell_tints`]) that [`merge_wallpaper_tint_ink`]
-//! lays into the frame's ink channel. Pure: no window, renderer or clock.
+//! Wallpaper cover-scaling, dimming, and per-cell text tinting.
 
 use aterm_core::terminal::RenderCell;
 
-/// The decoded wallpaper a frame is prepared from: straight sRGB RGBA8,
-/// `w × h`, and the asset's fingerprint.
+/// Straight sRGB RGBA8 source image (`w × h`) and asset fingerprint.
 #[derive(Clone, Copy)]
 pub(crate) struct WallpaperSource<'a> {
     pub(crate) rgba: &'a [u8],
@@ -22,19 +14,14 @@ pub(crate) struct WallpaperSource<'a> {
     pub(crate) fp: u64,
 }
 
-/// One frame's wallpaper: the base layer the renderers draw under default
-/// backgrounds, and one glyph tint per grid cell.
+/// Prepared frame wallpaper atlas and row-major per-cell glyph tints.
 pub(crate) struct PreparedWallpaper {
     pub(crate) atlas: std::sync::Arc<aterm_core::render::SceneAtlas>,
     /// `rows*cols` entries, row-major ([`wallpaper_cell_tints`]).
     pub(crate) tint: Vec<Option<[u8; 3]>>,
 }
 
-/// PREPARE `source` for a frame `frame` (`w × h` pixels) holding a `grid`
-/// (`rows × cols`) on the theme background `bg` (`0xRRGGBB`), toned by `dim`,
-/// its tint judged against the default foreground `fg`. The atlas's version
-/// moves with the asset, the dim and the size, so renderers that key their
-/// caches on it convert each generation once.
+/// Prepares `source` for a `w × h` frame and `rows × cols` grid with `dim` and `(bg, fg)`.
 pub(crate) fn prepare(
     source: WallpaperSource<'_>,
     (w, h): (usize, usize),
@@ -55,9 +42,7 @@ pub(crate) fn prepare(
     }
 }
 
-/// One glyph tint per grid cell, sampled at each cell's center from the
-/// scaled backdrop (the picture is smooth at cell granularity, so one texel
-/// stands in for the cell; padding offsets are within a cell and immaterial).
+/// Samples one glyph tint per grid cell at each cell's center from the scaled backdrop.
 pub(crate) fn wallpaper_cell_tints(
     rgba: &[u8],
     w: usize,
@@ -83,12 +68,7 @@ pub(crate) fn wallpaper_cell_tints(
     out
 }
 
-/// Merge wallpaper-derived default-foreground tints into the frame's existing
-/// sorted-unique ink channel. Existing producers win on an occupied cell. The
-/// two vectors swap at the end so a steady frame reuses resident allocations.
-/// This deliberately does not memoize the cell projection: changed terminal
-/// glyphs must be observed, so a tinted present still performs the O(rows*cols)
-/// eligibility scan.
+/// Merges wallpaper-derived default-foreground tints into the sorted-unique ink channel (`existing` wins on collisions).
 pub(crate) fn merge_wallpaper_tint_ink(
     cells: &[Vec<RenderCell>],
     rows: usize,
@@ -119,8 +99,6 @@ pub(crate) fn merge_wallpaper_tint_ink(
                 scratch.push(ex.next().expect("peeked"));
                 continue;
             }
-            // Blanks paint no glyph; a wide continuation has no lead glyph of
-            // its own; non-default foreground keeps its SGR color.
             if cell.ch == ' ' || cell.wide || cell.fg != default_fg || c > usize::from(u16::MAX) {
                 continue;
             }
@@ -148,21 +126,11 @@ fn wcag_contrast(a: f32, b: f32) -> f32 {
 /// texel under the cell (WCAG AA for normal text). Both poles clear it at
 /// every ground luminance, so the walk below always terminates readable.
 const WALLPAPER_TINT_CONTRAST_FLOOR: f32 = 4.5;
-
 /// The ground luminance below which white ink out-contrasts black ink
 /// (`(1.05)/(L+0.05) >= (L+0.05)/0.05` ⇒ `L <= sqrt(1.05*0.05) - 0.05`).
 const LIGHT_INK_BELOW: f32 = 0.179;
 
-/// A "cool but readable" glyph tint for text sitting on `backdrop`: the
-/// backdrop's own hue, flipped to whichever brightness pole out-contrasts
-/// the ground (light ink over the picture's dark areas, dark ink over its
-/// bright ones) and then walked — brightness first, saturation after —
-/// until it clears [`WALLPAPER_TINT_CONTRAST_FLOOR`]. The letterforms pick
-/// up the image's local color and stay legible no matter how light or dark
-/// the picture is at that cell. Near-achromatic ground (grey / washed-out
-/// areas) takes no hue — an arbitrary one would read as noise — and keeps
-/// the ordinary foreground (`None`) where it already clears the floor, else
-/// a plain readable neutral of the winning polarity.
+/// Computes a WCAG AA contrast-clearing glyph tint derived from `backdrop`'s hue; on a near-achromatic `backdrop`, `None` if `fallback_fg` is already legible, else a plain neutral.
 pub(crate) fn wallpaper_text_tint_color(backdrop: u32, fallback_fg: u32) -> Option<[u8; 3]> {
     use aterm_effects::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
     let ground = relative_luminance(backdrop);
@@ -178,10 +146,6 @@ pub(crate) fn wallpaper_text_tint_color(backdrop: u32, fallback_fg: u32) -> Opti
     let mut sat = (s * 0.9).clamp(0.35, 0.70);
     let mut v = if light_ink { 0.95 } else { 0.34 };
     let mut tinted = hsv2rgb(hue, sat, v);
-    // Saturated hues can sit dark even at full brightness (pure blue) or
-    // light even quite low (yellow), so push brightness toward the pole,
-    // then bleed saturation out — sat 0 at the pole is white/black, whose
-    // contrast clears the floor on any ground the polarity choice matched.
     for _ in 0..24 {
         if wcag_contrast(relative_luminance(tinted), ground) >= WALLPAPER_TINT_CONTRAST_FLOOR {
             break;
@@ -202,11 +166,7 @@ pub(crate) fn wallpaper_text_tint_color(backdrop: u32, fallback_fg: u32) -> Opti
     ])
 }
 
-/// Cover-scale `src` (straight sRGB RGBA8, `sw × sh`) to exactly `dw × dh`
-/// (center-crop to the destination aspect, then the shared linear-light
-/// `resample_rgba`), composite any translucency over the theme background,
-/// tone the result toward it by `dim`, and force every texel opaque — a
-/// wallpaper replaces the background-opacity glass, never composites with it.
+/// Cover-scales `src` (`sw × sh`) to `dw × dh`, composites over `bg`, tones by `dim`, and forces opaque alpha.
 pub(crate) fn scale_wallpaper_cover(
     src: &[u8],
     sw: usize,

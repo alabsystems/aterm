@@ -83,7 +83,7 @@ pub enum Approve {
 }
 
 impl Approve {
-    fn rank(self) -> u8 {
+    const fn rank(self) -> u8 {
         match self {
             Self::None => 0,
             Self::Safe => 1,
@@ -93,7 +93,7 @@ impl Approve {
 
     /// This level, capped at `cap`: a limit can lower it, never raise it.
     #[must_use]
-    pub fn at_most(self, cap: Self) -> Self {
+    pub const fn at_most(self, cap: Self) -> Self {
         if cap.rank() < self.rank() { cap } else { self }
     }
 
@@ -108,7 +108,7 @@ impl Approve {
 
     /// The level as `[harness] approve` spells it: `all`, `safe` or `none`.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Self::All => "all",
             Self::Safe => "safe",
@@ -151,7 +151,7 @@ impl Autopilot {
         }
     }
 
-    fn rank(self) -> u8 {
+    const fn rank(self) -> u8 {
         match self {
             Autopilot::Off => 0,
             Autopilot::Land => 1,
@@ -194,7 +194,7 @@ impl Occupancy {
         }
     }
 
-    fn rank(self) -> u8 {
+    const fn rank(self) -> u8 {
         match self {
             Occupancy::Off => 0,
             Occupancy::Observe => 1,
@@ -224,7 +224,7 @@ pub struct PromptGrant {
     _sealed: (),
 }
 
-fn accounts_rank(mode: Mode) -> u8 {
+const fn accounts_rank(mode: Mode) -> u8 {
     match mode {
         Mode::Off => 0,
         Mode::Wall => 1,
@@ -345,7 +345,7 @@ impl LandAt {
 
     /// The minute of the day it names (`0..1440`).
     #[must_use]
-    pub fn minute(self) -> u16 {
+    pub const fn minute(self) -> u16 {
         self.minute
     }
 
@@ -366,7 +366,7 @@ pub struct Withheld {
 }
 
 impl Withheld {
-    fn rules_mut(&mut self) -> [(&'static str, &mut bool); 2] {
+    const fn rules_mut(&mut self) -> [(&'static str, &mut bool); 2] {
         let Self {
             rm_breaker,
             read_outside_cwd,
@@ -1478,7 +1478,7 @@ pub fn spells_off(value: &str) -> bool {
 
 /// `[harness] limit_reset_kinds`' word for a kind of reset.
 #[must_use]
-pub fn reset_kind_word(kind: ResetKind) -> &'static str {
+pub const fn reset_kind_word(kind: ResetKind) -> &'static str {
     match kind {
         ResetKind::Session => "5-hour",
         ResetKind::Weekly => "weekly",

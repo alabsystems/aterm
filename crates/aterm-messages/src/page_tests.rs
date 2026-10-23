@@ -420,7 +420,11 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
     assert_eq!(ids, [late.raw(), other.raw()], "told back: both rows");
 }
 
-/// A FAILURE IS TOLD ON ONLY BY A FAILURE.
+/// A FAILURE IS TOLD ON ONLY BY A FAILURE. A script's `sev=error key=build`
+/// row replaced while it still stood by a retry under its key, which then
+/// finished `ok`, stays its own row in Problems (`replaced`), as it would had
+/// its row folded first: whether a failure is listed never hangs on when the
+/// next word came.
 #[test]
 fn a_failure_is_told_on_only_by_a_failure() {
     let now = Instant::now();

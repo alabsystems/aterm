@@ -1034,7 +1034,8 @@ mod tests {
         }
     }
 
-    /// T-V3: an unknown value never becomes the filled 0 % cell.
+    /// T-V3: an unknown value never becomes the filled 0 % cell. A NaN that
+    /// reaches the bins, or the held bins, stops a debug build.
     #[test]
     #[should_panic(expected = "not a reading")]
     fn a_nan_is_never_a_heat_step() {

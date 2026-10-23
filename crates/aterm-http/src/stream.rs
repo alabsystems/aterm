@@ -336,7 +336,10 @@ impl Write for Bounded {
 /// Plaintext or TLS TCP stream enforcing a [`Deadline`] and [`Guard`].
 pub struct Stream {
     inner: Inner,
-    /// A write failed on the socket.
+    /// A write failed on the socket. From then on a TLS read takes only what
+    /// the peer sent: rustls's own `read` first retries the write it still
+    /// holds, fails on it again, and never reaches an answer the peer sent
+    /// before it closed (a 413 over a body it would not read).
     write_failed: bool,
 }
 
@@ -466,7 +469,8 @@ fn read_received(
 }
 
 impl Stream {
-    /// Note a socket write's failure (see [`Self::write_failed`]).
+    /// Note a socket write's failure (see [`Self::write_failed`]). A signal's
+    /// interruption is no failure: the write is retried.
     fn wrote<T>(&mut self, wrote: io::Result<T>) -> io::Result<T> {
         if let Err(error) = &wrote
             && error.kind() != io::ErrorKind::Interrupted

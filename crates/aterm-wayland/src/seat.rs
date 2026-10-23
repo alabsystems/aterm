@@ -410,7 +410,7 @@ impl Seats {
             .and_then(|s| s.frames.latest_button())
     }
 
-    /// Newest serial received from the seat's keyboard or pointer.
+    /// Newest serial the seat's keyboard (enter, key, modifiers) or pointer (enter, button) gave.
     pub fn latest_serial(&self, seat: u32) -> Option<u32> {
         let mut seat_book = self
             .seat_book

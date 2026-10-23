@@ -89,7 +89,9 @@ fn session(log: &mut Log) {
     .expect("the session opens");
 }
 
-/// the bus class is its own predicate.
+/// the bus class is its own predicate. The turn class is what it
+/// was; the bus class holds it, the need-bearing steps and `mark seen`, and
+/// nothing else.
 #[test]
 fn the_bus_class_is_its_own_predicate_and_holds_the_turn_class() {
     let ops = [Op::Open, Op::Close, Op::Amend, Op::Mark, Op::Gap, Op::Snap];
@@ -367,7 +369,9 @@ fn the_landed_cursor_and_ms_cross_the_carry() {
     assert_eq!(view.dup, 0);
 }
 
-/// a take derives every loss from `ms` alone.
+/// a take derives every loss from `ms` alone. One cover
+/// per hole, each exact, the covers' counts summing to the bus-class
+/// records evicted; a loss of local-class records only is no cover at all.
 #[test]
 fn a_take_says_each_hole_once_with_its_exact_count() {
     let small = Limits::new(12, 1 << 20).expect("a small ring");
@@ -844,7 +848,10 @@ fn a_closed_sessions_bus_tail_holds_its_close() {
     assert!(view.holes().is_empty());
 }
 
-/// the reader's view is the law.
+/// the reader's view is the law. A seeded session mirrored with
+/// planted duplicates, whole batches offered twice and a batch offered in
+/// reverse (a re-pinned slot landing late) shows each record once, `ms`
+/// dense, and folds to the local fold's bus facts and totals.
 #[test]
 fn bus_fold_equals_local_bus_view() {
     for seed in 1..=40u64 {

@@ -21,8 +21,6 @@ fn tally() -> Tally {
         .collect()
 }
 
-/// The per-cause delta since `before`, saturating so a concurrent
-/// `metrics reset` yields a smaller number instead of an overflow panic.
 fn since(before: &Tally) -> Tally {
     tally()
         .into_iter()
@@ -33,8 +31,6 @@ fn since(before: &Tally) -> Tally {
         .collect()
 }
 
-/// A focused window with `panes` stub panes in its active tab, each seeded
-/// and settled (a fresh terminal's `Damage::Full` would report `full_damage`).
 fn split_window(panes: usize) -> (App, WindowId, Vec<u64>) {
     assert!(panes >= 2, "a split has at least two panes");
     let mut app = App::headless_for_test();
@@ -53,13 +49,10 @@ fn split_window(panes: usize) -> (App, WindowId, Vec<u64>) {
     (app, wid, sids)
 }
 
-/// The arms and their attribution over one workload.
 struct Arms {
     scoped: u64,
     full: u64,
     causes: Tally,
-    /// Composed presents that repainted (an early-out extracts nothing, so
-    /// zero here would make the tally vacuous).
     painted: usize,
 }
 
@@ -73,8 +66,6 @@ impl std::fmt::Debug for Arms {
     }
 }
 
-/// `frames` composed presents, echoing one alternating glyph into `into`
-/// before each. Returns the arm split and the per-cause delta.
 fn steady_state(app: &mut App, wid: WindowId, into: u64, frames: usize) -> Arms {
     let term = app.pool.get(into).expect("pane session").term.clone();
     let mut now = Instant::now();
@@ -93,7 +84,6 @@ fn steady_state(app: &mut App, wid: WindowId, into: u64, frames: usize) -> Arms 
         }
     }
     Arms {
-        // Saturating for the same reason `since` is.
         scoped: redraw.refills_scoped.get().saturating_sub(scoped0),
         full: redraw.refills_full.get().saturating_sub(full0),
         causes: since(&before),
@@ -101,16 +91,11 @@ fn steady_state(app: &mut App, wid: WindowId, into: u64, frames: usize) -> Arms 
     }
 }
 
-/// A settled split of two or three panes books one scoped extraction per leaf per painted frame
-/// (focused included) and nothing to the full arm. Assertions are lower bounds: concurrent tests
-/// only add.
 #[test]
 fn a_split_window_keeps_every_leaf_on_the_scoped_arm() {
     for panes in [2usize, 3] {
         let (mut app, wid, sids) = split_window(panes);
         let focus = *sids.last().expect("the newest pane takes focus");
-        // Warm: the first composed frames fill each pane scratch from
-        // nothing (`scratch_unstamped`), which is not the steady state.
         let _ = steady_state(&mut app, wid, focus, 4);
         const FRAMES: usize = 32;
         let d = steady_state(&mut app, wid, focus, FRAMES);

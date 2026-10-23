@@ -45,7 +45,7 @@ pub enum Outcome {
 impl Outcome {
     /// The row's prefix.
     #[must_use]
-    pub fn tag(self) -> &'static str {
+    pub const fn tag(self) -> &'static str {
         match self {
             Outcome::Ok => "  ok    ",
             Outcome::Skip => "  skip  ",
@@ -301,12 +301,12 @@ pub struct Tally {
 
 impl Tally {
     #[must_use]
-    pub fn skipped(&self) -> usize {
+    pub const fn skipped(&self) -> usize {
         self.skips.len()
     }
 
     #[must_use]
-    pub fn failed(&self) -> bool {
+    pub const fn failed(&self) -> bool {
         !self.gate_failures.is_empty() || !self.could_not_run.is_empty()
     }
 

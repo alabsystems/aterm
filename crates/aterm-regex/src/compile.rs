@@ -193,7 +193,8 @@ impl Compiler {
     }
 }
 
-/// Can `ast` match the empty string?
+/// Can `ast` match the empty string? Decides which of the two `x*` shapes
+/// [`Compiler::emit_repeat`] uses, and nothing else.
 fn matches_empty(ast: &Ast) -> bool {
     match ast {
         Ast::Empty | Ast::Assert(_) => true,

@@ -9,9 +9,7 @@ use std::path::Path;
 
 use crate::xml::{self, Element};
 
-/// The protocol files, in the order their modules are listed. wayland.xml
-/// comes from wayland-client 0.31.14 (libwayland's core protocol); the rest
-/// from wayland-protocols 0.32.12. `COPYING` names each file's notice.
+/// The protocol files, in the order their modules are listed.
 pub const FILES: &[(&str, &str)] = &[
     ("wayland.xml", "COPYING.wayland"),
     ("xdg-shell.xml", "COPYING.wayland-protocols"),

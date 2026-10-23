@@ -54,7 +54,7 @@ impl Screen {
 
     /// Cursor position as (row, col), 0-based.
     #[inline]
-    pub fn cursor(&self) -> (u16, u16) {
+    pub const fn cursor(&self) -> (u16, u16) {
         let c = self.term.cursor();
         (c.row, c.col)
     }
@@ -69,7 +69,7 @@ impl Screen {
     /// written cell gets. Pins the flags-only and colour-only SGR fast paths
     /// against the generic path.
     #[inline]
-    pub fn style_fingerprint(&self) -> (u32, u32, u16) {
+    pub const fn style_fingerprint(&self) -> (u32, u32, u16) {
         let st = self.term.style();
         (st.fg_packed(), st.bg_packed(), st.flags_bits())
     }

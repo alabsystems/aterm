@@ -2,17 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! What only the production release host does ([`RestHost`]: GitHub's REST API over the
-//! update lanes' `/usr/bin/curl`, agh-fake playing GitHub): a create is a draft prerelease
-//! that is uploaded to and then published, still a prerelease, and one killed before its
-//! publish leaves a draft; an upload replaces only when asked, its new bytes up before the old
-//! asset goes; a download shorter than its listing is refused; a write without a token is
-//! refused before anything is sent; the token rides curl's stdin, never its argv or
-//! environment; git takes it from one helper scoped to the git origin, whatever helpers and
-//! `credential.useHttpPath` the user's config holds, and a `file://` remote takes none. Each
-//! guard comes with the negative control that shows it would catch what it guards against.
-//!
-//! Unix only: the token is written into a private file (`aterm_uds::private_file`).
+//! Integration tests for [`RestHost`] against `agh-fake` over `/usr/bin/curl`.
 
 #![cfg(unix)]
 
@@ -248,7 +238,6 @@ fn a_create_is_a_draft_uploaded_to_then_published_as_a_prerelease() {
             ("index.toml.sig".to_string(), b"its signature".to_vec()),
         ]
     );
-    // The writes went in order: the draft, each upload, then the publish.
     let writes: Vec<String> = rig
         .fake
         .seen()
@@ -260,7 +249,6 @@ fn a_create_is_a_draft_uploaded_to_then_published_as_a_prerelease() {
         writes,
         ["Api POST", "Uploads POST", "Uploads POST", "Api PATCH"]
     );
-    // A second create of a published tag is the racing publisher's refusal.
     let again = host.create(&slug(), "atpkg-index-9", "t", "n", &[]);
     assert!(matches!(again, Err(HostError::Refused(_))), "{again:?}");
     assert_eq!(
@@ -304,7 +292,6 @@ fn an_upload_replaces_only_when_asked_and_a_draft_is_published_by_tag() {
             ("ay.toml.sig".to_string(), b"its signature".to_vec()),
         ]
     );
-    // A draft a killed create left is finished by tag.
     rig.fake.add_release(
         SLUG,
         ReleaseSpec::draft("atpkg-ay-2", "2026-10-02T00:00:00Z").prerelease(true),
@@ -360,7 +347,6 @@ fn a_write_without_a_token_is_refused_before_anything_is_sent() {
         }
     }
     assert_eq!(rig.fake.seen().len(), 0, "nothing was sent");
-    // Control: the same write with the token goes.
     rig.host()
         .create(&slug(), "atpkg-ay-1", "t", "n", &[file])
         .expect("the create with the token");
@@ -399,7 +385,6 @@ fn the_token_rides_curls_stdin_and_never_its_argv_or_environment() {
                 assert!(s.args.windows(2).any(|w| w == ["-H", "@-"]), "{s:?}");
                 credentialed += 1;
             }
-            // The CDN hop: anonymous, and named by the API's redirect.
             None => {
                 assert!(!s.args.iter().any(|a| a == "@-"), "{s:?}");
                 anonymous += 1;
@@ -409,7 +394,6 @@ fn the_token_rides_curls_stdin_and_never_its_argv_or_environment() {
     assert!(credentialed >= 5, "{spawned:#?}");
     assert_eq!(anonymous, 1, "the one download's CDN hop: {spawned:#?}");
     rig.fake.assert_clean();
-    // Negative controls: the token in the environment, then on the argv, is caught.
     for plant in [Plant::Env, Plant::Argv] {
         let planted = Arc::new(Recorder {
             plant: Some((plant, rig.secret.clone())),
@@ -434,9 +418,8 @@ struct Seen {
     authorizations: Mutex<Vec<Option<String>>>,
 }
 
-/// A loopback HTTP server playing a git host that wants a credential: a request with none is
-/// answered 401 with a Basic challenge, one with a credential is recorded and answered 403.
-/// It serves until `stop` is set (or a minute, the hang detector).
+/// Loopback HTTP server answering 401 Basic challenge when unauthenticated and 403 when
+/// authenticated.
 fn git_server(seen: Arc<Seen>, stop: Arc<AtomicBool>) -> (u16, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     listener.set_nonblocking(true).expect("nonblocking");
@@ -515,12 +498,10 @@ fn git_takes_the_token_through_its_scoped_helper_and_only_with_one() {
         let fetch = host.fetch_repo(&slug(), &dest);
         assert!(matches!(fetch, Err(HostError::Unreachable(_))), "{fetch:?}");
     });
-    // Each of the two asked once bare, then once with the token git's helper handed it.
     assert_eq!(
         seen,
         [None, Some(expected.clone()), None, Some(expected.clone())]
     );
-    // Control: with no token git has no credential to give, and says so.
     let seen = against_git_server(|base| {
         let host =
             RestHost::at(None, rig.origins.clone(), base.to_string()).with_git_env(&hermetic_git());
@@ -592,8 +573,6 @@ fn git_hands_its_token_over_whatever_helpers_and_use_http_path_the_users_config_
     let rig = Rig::new();
     let config = rig.dir.path().join("gitconfig");
     let planted = rig.dir.path().join("planted-credentials");
-    // The user's global config: every request's path named to helpers, and a helper of its own
-    // holding another credential for the very repository.
     let user_config = |base: &str| {
         std::fs::write(
             &planted,
@@ -630,9 +609,6 @@ fn git_hands_its_token_over_whatever_helpers_and_use_http_path_the_users_config_
         assert!(matches!(clone, Err(HostError::Unreachable(_))), "{clone:?}");
     });
     assert_eq!(seen, [None, Some(basic("x-access-token", &rig.secret))]);
-    // Negative controls, the same config: git without the host's reset hands over the user's
-    // helper's credential, and the path-less `store` line this helper replaced matches no
-    // request git asks about under `useHttpPath`, so git hands over none.
     let git = |base: &str, extra: &[String], dest: &str| {
         let out = aterm_uds::fixture_git::git()
             .args(extra)
@@ -704,7 +680,6 @@ fn a_clobber_puts_the_new_bytes_up_before_the_old_asset_goes() {
             Replace::Clobber,
         )
     };
-    // The upload dies unanswered: nothing but it was sent, so the old asset is still served.
     rig.fake.fault(
         Match::uploads(&format!("/repos/{SLUG}/releases/{id}/assets")),
         Fault::Close,
@@ -726,9 +701,6 @@ fn a_clobber_puts_the_new_bytes_up_before_the_old_asset_goes() {
         rig.state("atpkg-ay-1").1,
         [("ay.toml".to_string(), b"old manifest".to_vec())]
     );
-    // The next replace deletes a staged asset an interrupted one left, puts the new bytes up
-    // under the staged name, and only then deletes the old asset and renames the new one: the
-    // delete the failed run never reached.
     let stale = rig
         .fake
         .add_asset(id, AssetSpec::uploaded(&staged, b"a stale stage"));
@@ -754,7 +726,6 @@ fn a_clobber_puts_the_new_bytes_up_before_the_old_asset_goes() {
         rig.state("atpkg-ay-1").1,
         [("ay.toml".to_string(), b"new manifest".to_vec())]
     );
-    // A file named as a stage is never uploaded: it would be taken for one.
     let named = rig.file(&staged, b"x");
     let refused = host.upload(&slug(), "atpkg-ay-1", &[named], Replace::Clobber);
     assert!(matches!(refused, Err(HostError::Refused(_))), "{refused:?}");
@@ -779,7 +750,6 @@ fn a_create_killed_before_its_publish_leaves_a_draft_no_client_sees() {
     assert!(spec.draft, "created a draft: {spec:?}");
     assert!(spec.prerelease, "{spec:?}");
     assert!(assets.is_empty());
-    // Control: the same read tells a published release from a draft.
     host.create(&slug(), "atpkg-index-10", "atpkg index 10", "notes", &files)
         .expect("the create");
     assert!(!rig.state("atpkg-index-10").0.draft);
@@ -811,7 +781,6 @@ fn a_download_shorter_than_its_listing_is_refused_and_leaves_no_file() {
     );
     assert!(!out.join("a.bin").exists());
     assert!(!out.join("a.bin.atpkg-part").exists());
-    // Control: without the fault the same download lands whole.
     host.download(&slug(), "atpkg-ay-1", &["a.bin"], &out)
         .expect("the download");
     assert_eq!(

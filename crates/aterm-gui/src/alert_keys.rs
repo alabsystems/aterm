@@ -14,7 +14,8 @@ pub(crate) enum ConfirmKey {
     PassThrough,
 }
 
-/// `kVK_Return`.
+/// `kVK_Return`. Key codes are layout-independent: the fallback when
+/// `charactersIgnoringModifiers` is unusable.
 const KVK_RETURN: u16 = 0x24;
 /// `kVK_ANSI_KeypadEnter` — the numeric keypad's Enter, which AppKit's default button
 /// also answers to, so aterm must too.

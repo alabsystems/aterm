@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A raw Linux executable is linked only through the signed chain the installer and
-//! the updater verify (aterm-update-core): the paper master signs the roster, a live
-//! rostered machine signs the appcast, and the appcast binds the executable's name,
-//! digest and size. An older release is authorized under the CURRENT appcast's
-//! policy (its revocations and minimum build), never under its own historical one.
+//! Linux release asset verification through the signed roster and appcast chain.
 
 use aterm_update_core::linux::LinuxTarget;
 use aterm_update_core::{Manifest, Roster, verify_roster};
 
 use super::releases::{LinuxDownload, LinuxKind, LinuxProver, Release, linux_appcast_name};
 
-/// The bounds each proof asset is read under.
 const APPCAST_LIMIT: u64 = 5_000_000;
 const SIG_LIMIT: u64 = 64;
 const ROSTER_LIMIT: u64 = 65_536;
@@ -39,8 +34,6 @@ impl Chain<'_> {
         Ok(bytes)
     }
 
-    /// The appcast `bytes`, signed by a live machine of `roster`, attributed to it, and
-    /// bound to `tag` on this channel.
     fn appcast(
         &self,
         roster: &Roster,
@@ -151,7 +144,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     const SLUG: &str = "alabsystems/aterm";
-    const NOW: i64 = 1_785_801_600; // 2026-08-04T00:00:00Z
+    const NOW: i64 = 1_785_801_600;
     const MASTER: [u8; 32] = [0x61; 32];
     const MACHINE: [u8; 32] = [0x62; 32];
     const OTHER: [u8; 32] = [0x63; 32];
@@ -177,8 +170,6 @@ mod tests {
         .into_bytes()
     }
 
-    /// The appcast of `v` (build `build`, floor `min`), carrying an aarch64 executable
-    /// of `size` bytes.
     fn appcast(v: &str, build: u64, min: u64, size: u64) -> Vec<u8> {
         format!(
             "schema = 1\nversion = \"{v}\"\nbuild_number = {build}\ncommit = \"{c}\"\n\
@@ -192,8 +183,6 @@ mod tests {
         .into_bytes()
     }
 
-    /// A served release `v`: its app inventory, the executable listed at `listed`
-    /// bytes, and its appcast pair (current, or archived under its tag).
     fn release(
         served: &mut BTreeMap<String, Vec<u8>>,
         v: &str,
@@ -289,8 +278,6 @@ mod tests {
                 size: 9000
             }
         );
-        // the head's own executable: the page offers the plain installer command,
-        // and only for the architecture the release carries
         let facts = elected(&served, &[head]).unwrap();
         assert_eq!(
             crate::site::pages::linux_install_command(&facts, "aarch64").as_deref(),
@@ -305,7 +292,6 @@ mod tests {
     #[test]
     fn an_older_executable_is_authorized_under_the_current_policy() {
         let mut served = BTreeMap::new();
-        // the head carries no aarch64 build; the older release's archived appcast does
         let mut head_cast = String::from_utf8(appcast("0.65.0", 21, 0, 9000)).unwrap();
         head_cast = head_cast
             .lines()
@@ -332,15 +318,12 @@ mod tests {
         );
         let d = run(&served, &[head.clone(), old.clone()]).unwrap().unwrap();
         assert_eq!(d.tag, "v0.64.0");
-        // an unpinned install.sh takes the head, which has no aarch64 build: the
-        // command pins the release that has one
         let facts = elected(&served, &[head.clone(), old]).unwrap();
         assert_eq!(facts.head, "v0.65.0");
         assert_eq!(
             crate::site::pages::linux_install_command(&facts, "aarch64").as_deref(),
             Some("curl -fsSL https://alab.systems/install.sh | bash -s -- --version 0.64.0")
         );
-        // the head's floor retires the older build: refused, never fallen back from
         let floor_cast = head_cast.replace("min_build = 0", "min_build = 21");
         let mut served2 = BTreeMap::new();
         let mut head = release(

@@ -1518,6 +1518,12 @@ pub(crate) struct SettingsViewState {
     pinned_place: Cell<Option<PinnedPlace>>,
     measuring_calm: Cell<bool>,
     status_extra: Cell<f32>,
+    /// What a plain status's bar under a reload warning could give back,
+    /// while [`page`] builds it ([`plain_status_slack`]): there the page is
+    /// laid out again under the bar, which takes nothing from the list's
+    /// screens ([`plain_status_extra`]), and shortens by up to this for the
+    /// control the person is on ([`SettingsViewState::note_status_room`]).
+    status_slack: Cell<f32>,
     status_bar_most: Cell<Option<f32>>,
     status_overrun: Cell<f32>,
     status_scroll: RefCell<StatusScroll>,
@@ -1700,6 +1706,7 @@ impl SettingsViewState {
             pinned_place: Cell::new(None),
             measuring_calm: Cell::new(false),
             status_extra: Cell::new(0.0),
+            status_slack: Cell::new(0.0),
             status_bar_most: Cell::new(None),
             status_overrun: Cell::new(0.0),
             status_scroll: RefCell::new(StatusScroll::default()),
@@ -7875,6 +7882,32 @@ fn settings_page_scroll_limit(view: &SettingsViewState) -> usize {
     view.result_page_limit.get().unwrap_or(usize::MAX)
 }
 
+/// Whether `event` is a projection's reply, not something the person sent:
+/// a shared snapshot that advanced, or the outcome of an effect a view asked
+/// the host for.
+fn projection_reply(event: &AppEvent) -> bool {
+    matches!(
+        event,
+        AppEvent::ConfigChanged(_)
+            | AppEvent::UpdateChanged { .. }
+            | AppEvent::PackagesChanged { .. }
+            | AppEvent::MessagesChanged { .. }
+            | AppEvent::HarnessChanged { .. }
+            | AppEvent::DocumentChanged { .. }
+            | AppEvent::DocumentEditorOpened { .. }
+            | AppEvent::ConfigEditorFinished { .. }
+            | AppEvent::ConfigPatchFinished { .. }
+            | AppEvent::ExternalOpenFinished { .. }
+            | AppEvent::ThemesFinished { .. }
+            | AppEvent::UpdateFinished { .. }
+            | AppEvent::PackagesFinished { .. }
+            | AppEvent::MessageActFinished { .. }
+            | AppEvent::ClipboardFinished { .. }
+            | AppEvent::RecoveryFinished { .. }
+            | AppEvent::SettingsDraftsCarried(_)
+    )
+}
+
 impl SettingsApp {
     fn update_event(
         &mut self,
@@ -7883,7 +7916,17 @@ impl SettingsApp {
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
         let view_id = cx.view_id();
-        view.settle_page_scroll();
+        // ONLY WHAT THE PERSON SENDS LETS THE LIST'S PLACE GO
+        // ([`SettingsViewState::settle_page_scroll`]): a projection's reply
+        // (the Messages tick every view gets each minute, a refresh, a
+        // write's outcome) is nothing they did, so it lets no landing, no
+        // wheel's place and no kept control go
+        // ([`SettingsViewState::seat_scroll`]'s keeping rules). Settled by
+        // the tick, Themes opened on Nord at 1144x700 and made 1144x462 lost
+        // Nord's row.
+        if !projection_reply(&event) {
+            view.settle_page_scroll();
+        }
         view.settle_messages_reseat();
         if view.route == SettingsRoute::Messages
             && !view.compact_navigation
@@ -11116,6 +11159,10 @@ fn settings_tree(
     state.page_window.set(None);
     state.observe_semantic_font(cx.semantic_font.as_ref());
     state.status_bar_most.set(None);
+    #[cfg(test)]
+    if STATUS_BAR_LEAST.with(Cell::get) {
+        state.status_bar_most.set(Some(0.0));
+    }
     state.record_runtime_presentation(cx.motion, packages, update);
     let width = SettingsWidth::for_viewport(cx.viewport.width);
     let watch_status_height = config_watch_status_bar_height(state);
@@ -13781,8 +13828,12 @@ fn page(
         state
             .status_extra
             .set(plain_status_extra(state, width, cx.viewport));
+        state
+            .status_slack
+            .set(plain_status_slack(state, width, cx.viewport));
         let built = page_children(state, update, packages, messages, harness, cx, width);
         state.status_extra.set(0.0);
+        state.status_slack.set(0.0);
         let (holds, cuts) = if state.route == SettingsRoute::Messages
             && state.search.trim().is_empty()
             && !state.compact_navigation
@@ -13916,15 +13967,24 @@ fn page(
     let (mut children, layout) = match built {
         Some(built) if !bars => built,
         _ => {
+            // seated again under a bar that much shorter — and again, until
+            // the bar leaves the control its room or is at its least: under
+            // a reload warning the page is laid out again under the shorter
+            // bar, and a pinned head or footer the list's room gave way to
+            // can take part of what the bar gave.
             state.status_overrun.set(0.0);
-            let seated = seat(chrome, false).0;
-            let overrun = state.status_overrun.replace(0.0);
-            if overrun > 0.01 {
+            let mut seated = seat(chrome, false).0;
+            loop {
+                let overrun = state.status_overrun.replace(0.0);
+                if overrun <= 0.01 {
+                    break seated;
+                }
                 let height = feedback_bar_height(state, width, cx.viewport);
                 state.status_bar_most.set(Some((height - overrun).max(0.0)));
-                seat(chrome, false).0
-            } else {
-                seated
+                if feedback_bar_height(state, width, cx.viewport) >= height - 0.01 {
+                    break seated;
+                }
+                seated = seat(chrome, false).0;
             }
         }
     };
@@ -14369,6 +14429,11 @@ fn lists_its_preview_when_starved(route: SettingsRoute) -> bool {
 thread_local! {
     /// How many renders took the chrome remembered for their inputs, on this thread.
     pub(crate) static CHROME_REMEMBERED: Cell<usize> = const { Cell::new(0) };
+    /// Whether this thread's renders draw a plain status's bar at its
+    /// least, its words on one line ([`SettingsViewState::status_bar_most`]):
+    /// the most room any bar leaves the page, which a test measures to tell
+    /// geometry from the bar's height the page chose.
+    pub(crate) static STATUS_BAR_LEAST: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -14515,6 +14580,36 @@ fn plain_status_extra(
     (plain_status_overflow(state, width, viewport)
         - status_bottom_inset_given(state, width, viewport))
     .max(0.0)
+}
+
+/// THE BAR UNDER A RELOAD WARNING SHORTENS FOR WHAT THE PERSON IS ON TOO
+/// (R2 of [`SettingsViewState::seat_scroll`]'s keeping rules): there a
+/// plain status's bar takes nothing from the list's screens
+/// ([`plain_status_extra`]) — the page is laid out again under it — and
+/// this is how much shorter it can be, down to its words' one line, which
+/// scroll in it ([`status_words_node`]). Shortened only without the warning,
+/// a status that came at 178x348 at 2× text over Settings ▸ Themes under
+/// the warning drew a 224pt bar for all its words, and the Customize
+/// sheet's Done, or the chooser's filter, the keyboard on it, was on no
+/// screen of the list, where the bar's one line (64pt) left the list room
+/// to show it.
+fn plain_status_slack(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    if !state.plain_status()
+        || state.config_watch_status.is_none()
+        || state.measuring_calm.get()
+        || (width == SettingsWidth::Compact && compact_status_dock_required(state, viewport))
+    {
+        return 0.0;
+    }
+    let height = feedback_bar_height(state, width, viewport);
+    let most = state.status_bar_most.replace(Some(0.0));
+    let least = feedback_bar_height(state, width, viewport);
+    state.status_bar_most.set(most);
+    (height - least).max(0.0)
 }
 
 fn plain_status_overflow(

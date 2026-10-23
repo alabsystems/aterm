@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One run: decide this host's native cell, phase by phase.
-//!
-//! Every phase runs that can still mean something, so one run reports every
-//! finding; only the controls wait on a green oracle, since a defect planted in
-//! an already-red tree proves nothing. A run the machine stops (a missing
-//! prerequisite, a full disk) keeps what it found and names the phases it did
-//! not reach.
+//! Runs the oracle phases for this host's native cell.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -30,9 +24,7 @@ use crate::verdict::{CouldNotRun, Finding, Phase, PhaseReport, Report, Status};
 pub struct Options {
     /// The aterm checkout: it holds `libc-oracle/` and `crates/aterm-libc/`.
     pub root: PathBuf,
-    /// The oracle workspace's target directory: this checkout's own. Cargo
-    /// keys the shim's build by paths relative to the oracle workspace, so a
-    /// directory shared with another checkout can serve that checkout's build.
+    /// The oracle workspace's target directory for this checkout.
     pub target_dir: PathBuf,
 }
 
@@ -177,7 +169,6 @@ impl Run<'_> {
 
         let ws = Workspace::new(&trust, &oracle, &options.target_dir);
         let union = self.inputs(&ws, root, cell)?;
-        // Text, so it means something even when no build can.
         self.siblings(&shim_src);
         let Some(union) = union else {
             self.skip_rest("the inputs are unusable");
@@ -266,8 +257,6 @@ impl Run<'_> {
         if let Some(could_not_run) = stop {
             return Err(could_not_run);
         }
-        // Metadata accepted the manifests, so a fetch that refuses is the
-        // machine's cache, unless cargo says the lock is stale.
         let fetch = ws.fetch_offline().map_err(started)?;
         if fetch.locked_failure() == Some(LockedFailure::StaleLock) {
             let detail = "Cargo.lock is stale".into();

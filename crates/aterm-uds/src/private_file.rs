@@ -76,7 +76,9 @@ pub fn read_private(dir: &Path, name: &str, max: usize) -> Result<Vec<u8>, Priva
 /// What a name of more than one path component is refused as.
 const ONE_COMPONENT: &str = "a private file's name is one path component";
 
-/// Whether `name` is one path component: not empty, `.` or `..`, and no `/`.
+/// Whether `name` is one path component: not empty, `.` or `..`, and no `/`. Only `dir`
+/// is judged, and `O_NOFOLLOW` covers only the last component, so a name that reaches
+/// through another directory would escape the rules.
 fn one_component(name: &str) -> bool {
     !(name.is_empty() || name == "." || name == ".." || name.contains('/'))
 }

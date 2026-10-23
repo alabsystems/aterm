@@ -200,7 +200,9 @@ mod tests {
         }
     }
 
-    /// The editor hint stops at the hop, under both classifiers the spawn seams apply.
+    /// The editor hint stops at the hop, under both classifiers the spawn seams apply. The
+    /// `EDITOR` it leads a shell to export reaches the child
+    /// (`the_ordinary_environment_and_aterm_integration_vars_survive`).
     #[test]
     fn default_editor_hint_is_denied() {
         assert_eq!(ENV_DEFAULT_EDITOR, "ATERM_DEFAULT_EDITOR");

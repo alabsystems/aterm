@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Contact is newly observed local ink during a recent input episode. A host
-//! may observe more than once before ticking; scrolling old ink is not a new
-//! glyph, and neither duplicate observations nor late input can replay it.
+//! Contact is newly observed local ink during a recent input episode.
 
 use std::time::{Duration, Instant};
 
@@ -26,8 +24,6 @@ struct Scene {
 impl Scene {
     fn new() -> Self {
         let mut term = Terminal::new(ROWS, COLS);
-        // Configure real blank colors, retain one blank history row for the
-        // viewport control, and keep the real caret at row 5, column 16.
         term.process(b"\x1b]11;#000000\x07\x1b[20;1H\n\x1b[6;17H");
         let mut scene = Self {
             term,
@@ -87,8 +83,6 @@ impl Scene {
         let (x0, _, y0, y1) = frame
             .body_px(CELL_W, CELL_H, COLS, ROWS)
             .expect("derive contact geometry from the emitted body");
-        // Adjacent to the left edge, at the body's middle row. This is
-        // observed terminal ink, never a fabricated application edit witness.
         let col = u16::try_from(x0 / i32::from(CELL_W)).unwrap() - 1;
         let row = u16::try_from((y0 + y1) / (2 * i32::from(CELL_H))).unwrap();
         assert_eq!(self.ink_at(row, col), Some(false));
@@ -186,8 +180,6 @@ fn repeated_unchanged_observations_cannot_create_contact_from_input_alone() {
 fn uniform_output_scroll_moves_old_ink_without_creating_contact() {
     let mut s = Scene::new();
     let (row, col) = s.near_cell();
-    // This glyph already exists before the input episode. A real output
-    // scroll will move it up into the adjacent contact cell.
     s.put_ink(row + 1, col);
     s.frame(0);
     assert_eq!(s.ink_at(row, col), Some(false));
@@ -255,8 +247,6 @@ fn observed_ink_is_not_saved_for_a_later_input_episode() {
     s.frame(0);
     assert_ne!(s.brain.console_attention(), PetAttention::Contact);
     s.text_intent();
-    // A fresh content sequence cannot make the already consumed local ink
-    // belong to this later key. Only the remote corner changes now.
     s.unrelated_output();
     s.frame(16);
     assert_ne!(s.brain.console_attention(), PetAttention::Contact);

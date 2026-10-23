@@ -653,7 +653,8 @@ struct Replay {
     lossy: Vec<usize>,
 }
 
-/// Which resizes a variant applies.
+/// Which resizes a variant applies. `collapse` lists the runs it collapses: a
+/// net-zero run is skipped whole, any other keeps only its last resize.
 fn apply_mask<D>(events: &[CastEvent<D>], collapse: &[&Run]) -> Vec<bool> {
     let mut mask = vec![true; events.len()];
     for run in collapse {
@@ -826,7 +827,9 @@ struct Variants<'a, D> {
 }
 
 impl<D: AsRef<[u8]>> Variants<'_, D> {
-    /// Fold the variant `mask`, counted in `report`.
+    /// Fold the variant `mask`, counted in `report`. `again`: another variant
+    /// will fold after this one, so it folds a copy of the fork and keeps the
+    /// fork for that one.
     fn fold(&mut self, mask: &[bool], again: bool, report: &mut DriftReport) -> Replay {
         report.folds += 1;
         let start = match (self.fork.take(), again) {

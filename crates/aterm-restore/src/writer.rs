@@ -458,6 +458,8 @@ impl<S: RegionStore> JournalWriter<S> {
     }
 
     /// Append PTY bytes the engine just processed (a slice, after `Terminal::process`):
+    /// split into records of at most [`MAX_BYTES_PAYLOAD`], each advancing the stream.
+    ///
     /// # Errors
     ///
     /// The store's refusal.

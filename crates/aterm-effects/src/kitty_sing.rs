@@ -752,7 +752,8 @@ impl MusicNotes {
         self.spawned_half_beat = None;
     }
 
-    /// Resolve one live note at `now`.
+    /// Resolve one live note at `now`. Full motion: it rises with a sideways
+    /// wobble.
     #[inline]
     fn resolve(note: &Note, now: Instant, reduced_motion: bool) -> Option<NoteSprite> {
         let age = now.saturating_duration_since(note.born).as_secs_f32();

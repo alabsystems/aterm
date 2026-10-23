@@ -5,15 +5,14 @@
 // project in 2026.
 // See ../../../LICENSE-MIT and ../../../LICENSE-APACHE for the upstream licenses.
 
-// https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-13-many-to-one-range-mappings
-
 use core::convert::TryFrom;
 
 use super::format12::SequentialMapGroup;
 use crate::GlyphId;
 use crate::parser::{LazyArray32, Stream};
 
-/// A [format 13](https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-13-segmented-coverage)
+/// A [format
+/// 13](https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-13-segmented-coverage)
 /// subtable.
 #[derive(Clone, Copy)]
 pub struct Subtable13<'a> {
@@ -45,11 +44,7 @@ impl<'a> Subtable13<'a> {
         None
     }
 
-    /// Calls `f` for each code point a group maps. A group's end past
-    /// U+10FFFF (no Unicode scalar, and up to four billion calls from a
-    /// 12-byte record in a hostile font) is cut at U+10FFFF, and the calls
-    /// stop at [`super::CODE_POINTS`]: disjoint groups, as the spec requires,
-    /// never reach it, and overlapping ones cannot multiply the work.
+    /// Calls `f` for each code point a group maps.
     pub fn codepoints(&self, mut f: impl FnMut(u32)) {
         let mut left = super::CODE_POINTS;
         for group in self.groups {

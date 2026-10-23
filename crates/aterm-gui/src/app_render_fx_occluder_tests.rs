@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Engine occluders at the host (`docs/DESIGN-card-engine-2026-10-19.md`
-//! §4.3, §7 `fx_occluders_compose`): every chrome surface the host splices
-//! over the grid (a row band through `scrub_overlay_row_band`, a card through
-//! `scrub_overlay_card`) pushes its window-pixel rectangle into
-//! `RenderInput::fx_occluders`, the renderer subtracts every one of them from
-//! every fx layer, and so any number of surfaces compose: each keeps the
-//! pixels it has without the light, while the light keeps drawing around
-//! them. The Autopilot menu's case is in `autopilot_menu_tests`, beside its
-//! fixture.
+//! Host chrome surface fx-occluder composition tests.
 
 use std::time::Instant;
 
@@ -20,19 +12,14 @@ use aterm_core::render::{
 use super::{App, ComposedCursorFxClock, WindowId};
 use crate::term_lock;
 
-/// How a chrome surface claims the frame: whole rows (a band, cut full
-/// width) or a box of cells (a card).
+/// How a chrome surface claims the frame.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Shape {
     Band,
     Card,
 }
 
-/// What one chrome splice painted, as window pixels: the rows (a band) or
-/// the cell box (a card) of every frame cell whose rendered pixels the
-/// splice changed. Read off the glass, so it never consults the occluder it
-/// is checked against, and a cell a splice only materialized (a trimmed
-/// blank padded out to its ground) is not counted.
+/// What one chrome splice painted, as window pixels.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ChromeBox {
     pub(crate) name: &'static str,
@@ -70,9 +57,7 @@ pub(crate) fn trace_splice(
     chrome_written(app, wid, name, shape, &before)
 }
 
-/// The box of the frame cells whose pixels differ from `before`'s, in window
-/// pixels (`grid_top + row·ch`, `pad + col·cw`; a band spans every column and
-/// the pads beside them, as its ground does).
+/// The box of the frame cells whose pixels differ from `before`'s, in window pixels.
 pub(crate) fn chrome_written(
     app: &mut App,
     wid: WindowId,
@@ -136,7 +121,6 @@ fn sheet(id: u64, slot: FxSlot, space: FxSpace, ink: FxInk) -> FxLayer {
                 h: u16::MAX,
                 ink: 0,
             })],
-            // A rect's two ends, one flat paint.
             vec![ink, ink],
         )),
         slot,
@@ -145,9 +129,7 @@ fn sheet(id: u64, slot: FxSlot, space: FxSpace, ink: FxInk) -> FxLayer {
     )
 }
 
-/// Light over the whole frame in every slot: a Grid-space wash under the
-/// glyphs, Window-space additive glow and a translucent sheet over them, the
-/// shapes a decorated card's border, bloom and drawer take.
+/// Light over the whole frame in every slot.
 fn light() -> Vec<FxLayer> {
     vec![
         sheet(
@@ -178,13 +160,8 @@ fn diff_in(a: &aterm_render::Frame, b: &aterm_render::Frame, px: PxRect) -> usiz
         .count()
 }
 
-/// THE LAW: over the window's composed frame, [`light`] in every slot leaves
-/// each chrome box byte-identical to the frame without it, while it draws
-/// around them. `boxes` are in splice order.
-///
-/// CONTROLS, each rendered here: with no occluder (the per-stream scrubs
-/// alone) the light lands on every box; under the single-cut model (one
-/// `cut`, the last writer's) it lands on every box but the last.
+/// THE LAW: over the window's composed frame, [`light`] in every slot leaves each chrome box
+/// byte-identical to the frame without it, while it draws around them.
 pub(crate) fn assert_chrome_cuts_the_light(app: &mut App, wid: WindowId, boxes: &[ChromeBox]) {
     let input: RenderInput = app.windows[&wid].input_scratch.clone();
     assert!(
@@ -285,8 +262,7 @@ fn ask_paste(app: &mut App, wid: WindowId) {
     ));
 }
 
-/// The capture route's frame up to the chrome: the engine fill, the strip
-/// and the find bar (a no-op when closed).
+/// The capture route's frame up to the chrome.
 fn fill(app: &mut App, wid: WindowId) {
     assert!(
         app.prepare_terminal_capture_grid_with_cursor_fx(
@@ -324,9 +300,7 @@ fn fx_occluders_compose_over_the_paste_banner_and_the_link_caption() {
     assert_chrome_cuts_the_light(&mut app, wid, &[banner, caption]);
 }
 
-/// A composer top line's mark (`aterm_effects::cli_marks`) laid over frame
-/// cell `(row, col)` as the footer lays it (`claude_footer::mark_layer`): the
-/// CLI's sprite in the Over slot, in grid space, at `(col·cw, row·ch)`.
+/// A composer top line's mark.
 fn top_mark(app: &App, wid: WindowId, id: u64, (row, col): (usize, usize)) -> FxLayer {
     use aterm_effects::cli_marks::{self, CliMark};
     let (cw, ch) = app.win_cell_size(wid);
@@ -345,8 +319,6 @@ fn top_mark(app: &App, wid: WindowId, id: u64, (row, col): (usize, usize)) -> Fx
 /// the Over slot, laid on the paste question's row and on the link
 /// caption's, draws nothing inside either band — each keeps the pixels it
 /// has without the mark — while the same mark on a row neither covers draws.
-///
-/// NEGATIVE CONTROL: with no occluder the marks land on both bands.
 #[test]
 fn fx_occluders_cut_a_top_line_mark_under_the_paste_banner_and_the_link_caption() {
     let mut app = App::headless_for_test();
@@ -479,7 +451,6 @@ fn the_live_frame_after_the_answer_carries_no_cut() {
     app.redraw_window(wid);
     ask_paste(&mut app, wid);
     app.redraw_window(wid);
-    // Output under the question: a second frame that refills the scratch.
     let commits = surface(&mut app).commits();
     crate::scripted_redraw_fixture::feed(&app, b"\x1b[20;1Hmore output");
     app.redraw_window(wid);
@@ -492,7 +463,6 @@ fn the_live_frame_after_the_answer_carries_no_cut() {
         1,
         "the question cuts, once however many frames it stands"
     );
-    // The answer, and output after it: the frame that refills the scratch.
     app.paste_banner = None;
     let commits = surface(&mut app).commits();
     crate::scripted_redraw_fixture::feed(&app, b"\x1b[21;1Hafter the answer");

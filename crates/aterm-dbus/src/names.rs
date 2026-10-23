@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The specification's rules for object paths, interface, error and member
-//! names, and bus names (unique `:1.42` or well-known `org.a11y.Bus`).
+//! D-Bus validation rules for object paths, interface, error, member, and bus names.
 
 /// The longest name the specification allows.
 pub const MAX_NAME: usize = 255;
@@ -27,8 +26,7 @@ pub fn is_object_path(path: &str) -> bool {
     }
 }
 
-/// Two or more `.`-separated elements of `[A-Za-z0-9_]` that do not start
-/// with a digit; at most 255 bytes. Error names follow the same rule.
+/// Two or more dot-separated `[A-Za-z0-9_]` elements not starting with a digit (at most 255 bytes); error names follow the same rule.
 #[must_use]
 pub fn is_interface(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -46,8 +44,7 @@ pub fn is_interface(name: &str) -> bool {
             })
 }
 
-/// One element of `[A-Za-z0-9_]` that does not start with a digit; at most
-/// 255 bytes.
+/// One `[A-Za-z0-9_]` element that does not start with a digit, at most 255 bytes.
 #[must_use]
 pub fn is_member(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -62,9 +59,7 @@ pub fn is_member(name: &str) -> bool {
     }
 }
 
-/// A unique name (`:` then two or more `.`-separated elements of
-/// `[A-Za-z0-9_-]`) or a well-known one (two or more elements of
-/// `[A-Za-z0-9_-]` that do not start with a digit); at most 255 bytes.
+/// A unique (`:`-prefixed) or well-known (non-digit-leading) bus name of two or more dot-separated `[A-Za-z0-9_-]` elements, at most 255 bytes.
 #[must_use]
 pub fn is_bus_name(name: &str) -> bool {
     let bytes = name.as_bytes();

@@ -38,7 +38,8 @@ fn spec_shifted(c: char) -> Option<char> {
     })
 }
 
-/// The engine's shift map equals the independent spec for every shiftable key.
+/// The engine's shift map equals the independent spec for every shiftable key. The
+/// `a7_keyboard_shift` `.smt2` lemmas state the spec alone; this test binds the engine.
 #[test]
 fn shifted_character_refines_independent_spec() {
     for b in 0u8..=127 {

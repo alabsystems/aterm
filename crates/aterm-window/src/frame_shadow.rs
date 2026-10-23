@@ -8,27 +8,7 @@
 // and modified by the aterm project in 2026. See ../LICENSE-MIT-sctk-adwaita for the upstream
 // MIT license.
 
-//! The shadow margin outside a client-decorated Wayland window
-//! (docs/AUDIT-third-party-2026-10-15.md, L-HEADER-LW7, lw5-button-layout-shadow).
-//!
-//! Before LW.5 the winit fork drew sctk-adwaita's frame: a header subsurface above the window
-//! and four border parts around window and header, each [`BORDER_SIZE`] logical px deep — a
-//! [`VISIBLE_BORDER_SIZE`] px line against the window and [`SHADOW_SIZE`] px of shadow beyond
-//! it — whose inner [`RESIZE_HANDLE_SIZE`] px take the pointer and resize the window. LW.5 moved
-//! the header into the application's own surface and took the frame away; this module is the
-//! border parts again, as pixels and geometry, for `platform_impl::wayland::window::frame` to
-//! show as subsurfaces.
-//!
-//! What it keeps of sctk-adwaita, unchanged: the shadow's curve and its rendering
-//! (the tests' `shadow_plane` is `Shadow::draw`, held to its recorded output by
-//! `tests/recorded/sctk-adwaita-0.10.1-shadow.tsv`), the rendering kept for the next redraw at
-//! the same scale and focus ([`Shadows`], `Shadow::rendered`), the sizes, the border colours,
-//! the input handles, and which edge or corner a point on a part resizes ([`direction`]).
-//!
-//! What differs, because the header is the application's now: the side parts span the window's
-//! height (sctk-adwaita's spanned window and header); the top part sits on the window (above
-//! the header there); and the visible border runs around all four sides, the top included,
-//! where sctk-adwaita drew the top line with its header bar.
+//! The shadow margin and visible border outside a client-decorated Wayland window.
 
 use std::collections::BTreeMap;
 
@@ -48,8 +28,6 @@ pub(crate) const RESIZE_HANDLE_SIZE: u32 = 12;
 /// How far along an edge from a corner a press resizes by the corner.
 pub(crate) const RESIZE_HANDLE_CORNER_SIZE: u32 = 24;
 
-// These values were generated from a screenshot of an libadwaita window using a script.
-// For more details see: https://github.com/PolyMeilex/sctk-adwaita/pull/43
 const SHADOW_PARAMS_ACTIVE: (f32, f32, f32) = (0.206_505_5, 0.104_617_53, -0.000_542_446_2);
 const SHADOW_PARAMS_INACTIVE: (f32, f32, f32) = (0.168_297_29, 0.204_299_8, 0.001_769_798_6);
 
@@ -463,9 +441,7 @@ pub(crate) const fn buffer_size(part: Part, width: u32, height: u32, scale: u32)
     ((rect.width * scale) as usize, (rect.height * scale) as usize)
 }
 
-/// The shadow sctk-adwaita's `Shadow::draw` paints into `part`'s buffer beside a
-/// `width`×`height` window at integer `scale`, `active` or not; nothing else. The oracle's view
-/// of the rendering, which the frame paints through [`Shadows`].
+/// The shadow `Shadow::draw` paints into `part`'s buffer beside a `width`×`height` window at `scale`.
 #[cfg(test)]
 pub(crate) fn shadow_plane(
     part: Part,
@@ -480,15 +456,7 @@ pub(crate) fn shadow_plane(
     pixmap
 }
 
-/// The shadows a frame has rendered, by scale and focus, kept for its next redraw:
-/// sctk-adwaita's `Shadow::rendered`. A resize changes the look on every configure, and the
-/// curve (an `exp` a pixel over the corners' square) was most of a redraw's time: the four
-/// parts took 136 µs at scale 1 and 510 µs at scale 2 rendered afresh, 28 µs and 106 µs with
-/// the rendering kept (release build, their ARGB8888 bytes included, an Apple silicon Mac,
-/// 2026-10-20).
-/// sctk-adwaita's per-part pixmap cache is not carried: a part's buffer is fresh for each
-/// redraw (`platform_impl::wayland::window::frame`), and filling it from the kept rendering is
-/// a copy.
+/// The shadows a frame has rendered, keyed by scale and focus for reuse across redraws.
 #[derive(Debug, Default)]
 pub(crate) struct Shadows {
     rendered: BTreeMap<(u32, bool), RenderedShadow>,
@@ -556,9 +524,7 @@ mod tests {
         Shadows::default().paint(part, look)
     }
 
-    /// One frame's redraws through a resize, a scale change, focus going and coming back and a
-    /// tiling: each part as a fresh paint has it, and as the recorded oracle's plane with the
-    /// border over it.
+    /// Verifies that a cached shadow rendering paints the same pixels as a fresh rendering.
     #[test]
     fn a_kept_rendering_paints_what_a_fresh_one_does() {
         let mut shadows = Shadows::default();
@@ -647,8 +613,6 @@ mod tests {
         let active = shadow_plane(Part::Right, 744, 528, 1, true);
         let inactive = shadow_plane(Part::Right, 744, 528, 1, false);
         assert_ne!(active, inactive);
-        // The recorded profile (sctk-adwaita-0.10.1-frame.tsv, `shadow part=right scale=1
-        // active=1`): the border pixel, then the shadow outward along the middle row.
         let row = &active.pixels[active.width * (active.height / 2)..][..active.width];
         let alpha: Vec<u8> = row.iter().map(|p| p[3]).collect();
         assert_eq!(alpha, [
@@ -669,7 +633,6 @@ mod tests {
             width: 832,
             height: 44
         });
-        // The handles: 12 px against the window, the top and bottom ones over the corners.
         assert_eq!(input_rect(Part::Top, w, h), Rect { x: 32, y: 32, width: 768, height: 12 });
         assert_eq!(input_rect(Part::Left, w, h), Rect { x: 32, y: 0, width: 12, height: 528 });
         assert_eq!(input_rect(Part::Right, w, h), Rect { x: 0, y: 0, width: 12, height: 528 });
@@ -684,7 +647,6 @@ mod tests {
     fn a_press_resizes_by_the_edge_and_by_the_corner_near_it() {
         use ResizeDirection::*;
         let (w, h) = (744, 528);
-        // The right part: a corner within 24 px of the window's top or bottom.
         assert_eq!(direction(Part::Right, 6.0, 264.0, w, h), East);
         assert_eq!(direction(Part::Right, 6.0, 24.0, w, h), NorthEast);
         assert_eq!(direction(Part::Right, 6.0, 25.0, w, h), East);
@@ -692,7 +654,6 @@ mod tests {
         assert_eq!(direction(Part::Left, 38.0, 3.0, w, h), NorthWest);
         assert_eq!(direction(Part::Left, 38.0, 527.0, w, h), SouthWest);
         assert_eq!(direction(Part::Left, 38.0, 300.0, w, h), West);
-        // The top and bottom parts begin 44 px left of the window.
         assert_eq!(direction(Part::Top, 68.0, 38.0, w, h), NorthWest);
         assert_eq!(direction(Part::Top, 69.0, 38.0, w, h), North);
         assert_eq!(direction(Part::Top, 764.0, 38.0, w, h), NorthEast);
@@ -706,7 +667,6 @@ mod tests {
         let look =
             Look { width: 100, height: 50, scale: 2, active: true, dark: true, tiled: false };
         let top = paint(Part::Top, look);
-        // Two rows (scale 2) against the window, from 2 px left of it to 2 px right of it.
         let at = |p: &Pixmap, x: usize, y: usize| p.pixels[y * p.width + x];
         assert_eq!(at(&top, 86, 87), BORDER_DARK);
         assert_eq!(at(&top, 86, 86), BORDER_DARK);
@@ -718,7 +678,6 @@ mod tests {
         assert_eq!(at(&right, 0, 50), BORDER_LIGHT);
         assert_eq!(at(&right, 1, 99), BORDER_LIGHT);
         assert_ne!(at(&right, 2, 50), BORDER_LIGHT);
-        // Tiled: the border, and nothing beyond it.
         let tiled = paint(Part::Bottom, Look { tiled: true, ..look });
         assert_eq!(at(&tiled, 100, 0), BORDER_DARK);
         assert!(tiled.pixels[2 * tiled.width..].iter().all(|p| *p == [0; 4]));

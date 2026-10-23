@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify browser`.
-
+//! `verify browser`: both web modules in real headless browsers.
+//!
+//! The modules are `verify wasm-smoke`'s dev build ([`crate::wasm_smoke::
 //! build_dev`], a STOCK EXCEPTION: Trust has no wasm32 std), bound for a page
 //! by `verify glue --flavor web`.
 pub(crate) mod cdp;
@@ -150,7 +151,7 @@ enum Engine {
 
 impl Engine {
     /// The session's name: its directory, and the tag on its lines.
-    fn name(&self) -> &'static str {
+    const fn name(&self) -> &'static str {
         match self {
             Engine::Chromium(_, angle) => angle.name(),
             Engine::Firefox(_) => "firefox",
@@ -209,7 +210,9 @@ impl Engine {
 /// Every session's name ([`Engine::name`]), as `browser-drive --engine` takes it.
 pub(crate) const ENGINES: [&str; 4] = ["metal", "swiftshader", "firefox", "webkit"];
 
-/// The WebKit session's part in a run.
+/// The WebKit session's part in a run. Its headless pages keep windows of
+/// their own ([`webkit`]), so it runs only where the caller lets it open
+/// them.
 enum WebKitRow {
     /// Run it on the WebKit found; without one it is NOT RUN.
     Run(Result<webkit::WebKit, String>),

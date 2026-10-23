@@ -571,7 +571,9 @@ fn a_revoked_tab_restores_the_paste_credit_it_accumulated_into() {
     );
 }
 
-/// Two receipts straddling the echoing frame claim the hop together.
+/// Two receipts straddling the echoing frame claim the hop together. A
+/// multi-file drop is one paste per file, echoed as one hop, and the second
+/// receipt can publish after the frame that saw it.
 #[test]
 fn two_receipts_straddling_the_frame_claim_the_refused_hop_together() {
     let g = wide_geom();
@@ -608,7 +610,10 @@ fn two_receipts_straddling_the_frame_claim_the_refused_hop_together() {
     assert!(dark.is_empty(), "dark: {dark:?}");
 }
 
-/// The unknown insert's bound counts once per licence.
+/// The unknown insert's bound counts once per licence. Every Tab press and
+/// auto-repeat arms a fresh unknown-width insert; a second unspent unknown arm
+/// must not add another 32 cells (a held Tab would reach ~1900), so a 68-cell
+/// program hop after three Tabs stays refused.
 #[test]
 fn repeated_unknown_inserts_do_not_widen_the_bound_past_the_gesture_cap() {
     let g = wide_geom();
@@ -711,7 +716,9 @@ fn a_dispatch_time_insert_arm_claims_no_hop_refused_before_the_key() {
     }
 }
 
-/// The licensed insert's reappearance is bridged.
+/// The licensed insert's reappearance is bridged. A Tab completion or paste
+/// whose echo frame was read torn before its glyphs shows the caret hidden, then
+/// visible the insert's width on, with no print the anchored lane could judge.
 #[test]
 fn a_licensed_insert_s_hidden_to_visible_reappearance_is_laid_as_the_insert() {
     let g = geom();
@@ -760,7 +767,10 @@ fn a_licensed_insert_s_hidden_to_visible_reappearance_is_laid_as_the_insert() {
     }
 }
 
-/// A late receipt claims no hop refused before its own dispatch.
+/// A late receipt claims no hop refused before its own dispatch. A queued bare
+/// Tab's receipt carries its dispatch instant (`note_insert_delivered_from`) and
+/// claims only hops refused at or after it, since its bytes could not echo
+/// before dispatch; a program hop refused 50 ms earlier stays dark.
 #[test]
 fn a_late_receipt_claims_no_hop_refused_before_its_dispatch() {
     let g = geom();

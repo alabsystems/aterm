@@ -40,7 +40,11 @@ struct Take {
     cols: u16,
 }
 
-/// Claude Code typing takes.
+/// Claude Code typing takes. The owner's case first: Claude Code 2.1.304 generating
+/// (its spinner repainting every ~100 ms) while a 220-character prompt is typed at
+/// ~9 keys/s and wraps at the right edge, then typing after the turn (40x120,
+/// recorded 2026-10-20 in the jailed real-Claude lab against its stub API, each key
+/// stamped when aterm had written it).
 const TAKES: [Take; 4] = [
     Take {
         name: "generating",
@@ -393,7 +397,8 @@ impl Host {
         self.now = self.now.max(t);
     }
 
-    /// The whole take up to its exit chord, then a second of quiet.
+    /// The whole take up to its exit chord, then a second of quiet. The
+    /// program's output is delayed by the knobs' echo latency.
     fn replay(take: &Take, knobs: Knobs) -> Self {
         let mut events: Vec<(u64, Rec)> = Vec::new();
         for (ms, ev) in recording(take.src, 1_000_000) {
@@ -1129,7 +1134,11 @@ fn a_wrap_typed_through_is_one_bound() {
     }
 }
 
-/// A FLIGHT ACROSS THE HOST'S CHROME NEVER BLINKS OUT.
+/// A FLIGHT ACROSS THE HOST'S CHROME NEVER BLINKS OUT. With aterm's chips on
+/// the composer's lower rule and the harness's mark and switch on its upper
+/// one, the bound that follows Claude Code's caret along the composer at the
+/// take's start crosses the switch for longer than the visibility hold's
+/// dwell.
 #[test]
 fn a_flight_across_the_hosts_chrome_never_blinks_out() {
     let harness = Knobs {
@@ -1237,7 +1246,9 @@ fn the_pet_walks_the_composer_line_beside_its_caret_under_the_harness_switch() {
     );
 }
 
-/// THE CAT NEVER PARKS ON THE HOST'S CHROME.
+/// THE CAT NEVER PARKS ON THE HOST'S CHROME. Typed up under the harness
+/// switch, the cat walks the composer's line beside the caret, passing under
+/// the switch; the hand stops there and the cat comes to rest.
 #[test]
 fn the_pet_never_parks_under_the_hosts_chrome() {
     let knobs = Knobs {
@@ -1476,7 +1487,10 @@ fn turns_against_the_writing(shots: &[Shot]) -> Vec<(u64, f32, f32)> {
     turns
 }
 
-/// THE PET NEVER TURNS BACK WHILE THE WRITING RUNS ONE WAY.
+/// THE PET NEVER TURNS BACK WHILE THE WRITING RUNS ONE WAY. Typed toward a
+/// cat a little ahead of its stand (resting past the harness's mark on the
+/// composer's upper rule, walking to that rest as the hand begins), the cat
+/// waits for the writing and sets out with it.
 #[test]
 fn the_pet_never_turns_back_while_the_writing_runs_one_way() {
     let harness = Knobs {

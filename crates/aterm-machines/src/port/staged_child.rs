@@ -11,26 +11,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The parent's entire final start message. A one-byte pipe write cannot partially commit.
+/// The parent's entire final start message.
 pub const START_BYTE: u8 = b'1';
 /// A must-happen detector for start/abort, not a latency budget.
 pub const START_LIMIT: Duration = Duration::from_secs(60);
 
 /// Parent custody for a cooperative child that awaits the start gate before effects.
-/// The pipe does not suspend arbitrary executables or their startup code. The caller must
-/// use run-job (or the same gate-before-effects protocol), and abort BEFORE releasing its
-/// holder lock; an unproven abort preserves that lock.
-/// Dropping an unresolved exact child transfers custody to the existing reaper, never to
-/// a reconstructed PID or a new process registry.
 pub trait StagedChild: Send {
     /// The retained child's ID, safe to record while its handle keeps the PID unreaped.
     fn id(&self) -> u32;
-    /// Deliver the final byte and detach. Error means no byte delivered and child retained.
+    /// Deliver the final byte and detach.
+    ///
     /// # Errors
     /// Gate write failed, or this owner has already begun cancellation.
     fn commit(&mut self) -> Result<(), RunFailed>;
     /// Close the gate, signal only this retained child/group and prove direct-child reap.
-    /// Error retains ownership; caller must leave the lock in place.
+    ///
     /// # Errors
     /// Wait failed, reap detector expired, or the job is already committed.
     fn abort(&mut self) -> Result<(), RunFailed>;
@@ -69,8 +65,6 @@ pub(super) fn spawn<'s>(
             .open(log)
             .map_err(|e| RunFailed::Spawn(format!("{}: {e}", log.display())))
     };
-    // All fallible descriptor setup precedes spawn. No missing ChildStdin extraction
-    // can abandon a successfully spawned child on a later setup error.
     let stdout = open_log()?;
     let stderr = open_log()?;
     let mut command = aterm_uds::spawnfd::command(&program);
@@ -106,8 +100,7 @@ struct LiveStaged {
     abort_attempted: bool,
 }
 
-/// Called only after try_wait proved this retained child remains unreaped. Its PID and
-/// original setsid group cannot have been reused; no host/name scan grants signal rights.
+/// Called only after try_wait proved this retained child remains unreaped.
 fn signal_owned(child: &mut Child) {
     if let Ok(pid) = i32::try_from(child.id())
         && pid > 0
@@ -118,8 +111,7 @@ fn signal_owned(child: &mut Child) {
     let _ = child.kill();
 }
 
-/// Reuse the existing reaper while retaining the exact Child object. Wait errors keep
-/// custody rather than claiming disappearance; there is no detached PID lookup/kill.
+/// Reuse the existing reaper while retaining the exact Child object.
 fn to_reaper(mut child: Child) {
     aterm_uds::reaper::hand_off(move || matches!(child.try_wait(), Ok(Some(_))));
 }
@@ -148,7 +140,6 @@ impl StagedChild for LiveStaged {
             Ok(_) => return Err(RunFailed::Refused("start byte was not delivered".into())),
             Err(e) => return Err(RunFailed::Spawn(format!("start byte: {e}"))),
         }
-        // Nothing fallible may turn a delivered byte into a start failure.
         self.committed = true;
         drop(self.gate.take());
         if let Some(child) = self.child.take() {
@@ -217,7 +208,6 @@ impl Drop for LiveStaged {
         }
         drop(self.gate.take());
         if let Some(mut child) = self.child.take() {
-            // Do not repeat a completed detector or signal after an unproven wait error.
             match child.try_wait() {
                 Ok(Some(_)) => return,
                 Ok(None) => signal_owned(&mut child),
@@ -228,9 +218,7 @@ impl Drop for LiveStaged {
     }
 }
 
-/// One inherited pipe endpoint, duplicated and kept alive through poll/read. Nonblocking
-/// status prevents a competing read from turning readiness into an unbounded read; attempt
-/// to restore the original status on exit. run-job owns stdin and has no other reader at this point.
+/// One inherited pipe endpoint, duplicated and kept alive through poll/read.
 struct StartPipe {
     fd: std::os::fd::OwnedFd,
     flags: i32,
@@ -389,7 +377,6 @@ mod tests {
                 .iter()
                 .any(|call| call.starts_with("stage abort"))
         );
-        // A spawned/committed fake PID is not itself a child-side delivered-byte fact.
         assert!(sys.await_start(START_LIMIT).is_err());
         sys.start_answer(Ok(()));
         sys.await_start(START_LIMIT).unwrap();
@@ -446,7 +433,6 @@ mod tests {
                 .iter()
                 .any(|call| call.starts_with("stage committed") || call == "stage aborted 4242")
         );
-        // Invalid requests and unknown synthetic IDs refuse before allocating a stage.
         let sys = Fake::root();
         assert!(
             sys.stage_detached(&Cmd::new("/synthetic-job"), Path::new("/ram/log"))

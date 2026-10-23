@@ -360,7 +360,7 @@ fn digits_at(s: &str, i: usize) -> &str {
     &rest[..n]
 }
 
-fn digits_start_before(s: &str, end: usize) -> usize {
+const fn digits_start_before(s: &str, end: usize) -> usize {
     let bytes = s.as_bytes();
     let mut i = end;
     while i > 0 && bytes[i - 1].is_ascii_digit() {
@@ -465,7 +465,7 @@ fn compiler_signal(line: &str) -> Option<(String, u32, String)> {
     Some((program.to_string(), n, name.to_string()))
 }
 
-fn signal_name(n: u32) -> &'static str {
+const fn signal_name(n: u32) -> &'static str {
     match n {
         1 => "SIGHUP",
         2 => "SIGINT",
@@ -1762,7 +1762,7 @@ fn measure_again(facts: &Facts, names: &[&str]) -> String {
     )
 }
 
-fn trustd_probe_options() -> Option<&'static str> {
+const fn trustd_probe_options() -> Option<&'static str> {
     if cfg!(target_os = "macos") {
         Some("-alx")
     } else if cfg!(target_os = "linux") {

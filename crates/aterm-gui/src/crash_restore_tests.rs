@@ -1830,7 +1830,11 @@ fn entropic(i: usize) -> String {
         .collect()
 }
 
-/// What a byte search looks for of an [`entropic`] token: its middle ten characters.
+/// What a byte search looks for of an [`entropic`] token: its middle ten characters. An
+/// LZ4 chunk stores a line's text as literals except where a 4-byte run repeats an
+/// earlier one, and the record bytes around each line's text are the same in every line,
+/// so a run spanning the token's first or last character and its neighbours repeats and
+/// is encoded as a match.
 fn needle(token: &str) -> &[u8] {
     &token.as_bytes()[3..13]
 }
@@ -2731,7 +2735,9 @@ fn a_keyframe_captured_before_a_shed_is_never_written_after_it() {
     assert!(restored.exact, "{:?}", restored.losses);
 }
 
-/// The gather count is read under the actual shared swap lock.
+/// The gather count is read under the actual shared swap lock. `swap_in` asks the
+/// replacement's stable length before taking that lock, so this store can finish a
+/// gather on the old region in that exact gap without a thread, sleep, or new hook.
 #[test]
 fn a_region_swap_keeps_a_gather_completed_before_its_lock() {
     use aterm_restore::layout::{OFF_STREAM_GATHERED, PAGE};
@@ -2893,7 +2899,11 @@ fn a_privacy_cleared_history_ring_still_releases_its_pages_when_shed() {
     );
 }
 
-/// A REPLACED REGION'S CUSTODY OUTLASTS A FULL LINK QUEUE (R6).
+/// A REPLACED REGION'S CUSTODY OUTLASTS A FULL LINK QUEUE (R6). The shed hands the keeper
+/// the fresh region's only read-only descriptor; when the keeper link's queue is full (a
+/// keeper slow to read, under the very pressure being shed) the descriptor comes back
+/// (`keeper_link::CompanionOffer::Busy`) and the session keeps it, offering it again a
+/// tick later, rather than leave the keeper on the superseded region for good.
 #[test]
 fn a_full_link_queue_keeps_the_fresh_regions_custody_and_offers_it_again() {
     use aterm_keeper::client::LinkOp;
@@ -3368,7 +3378,10 @@ fn a_clear_whose_keyframe_a_replacement_skipped_leaves_nothing_in_the_region_the
     );
 }
 
-/// A LEVEL REPORTED BEFORE THE JOURNAL WORKER STARTS IS WHERE IT BEGINS (R6 review).
+/// A LEVEL REPORTED BEFORE THE JOURNAL WORKER STARTS IS WHERE IT BEGINS (R6 review). The
+/// worker starts with a window's first export; a CRITICAL the OS reported before it (or
+/// with the keeper off, before any session journaled) used to be dropped, so `pressure
+/// level=` said `-` and the first rings were not shed although the system was critical.
 #[test]
 fn a_pressure_level_reported_before_the_worker_starts_is_where_it_begins() {
     const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;

@@ -7,6 +7,7 @@ use super::*;
 
 const WGHT: u32 = u32::from_be_bytes(*b"wght");
 
+/// The sizes the box is compared at: what windows at 1x, 1.5x, 2x and 3x of
 /// the common font sizes ask for, and the 9 px the defect was found at.
 const SIZES: [f32; 12] = [
     9.0, 11.0, 12.0, 13.5, 16.0, 18.0, 19.5, 24.0, 27.0, 32.0, 36.0, 48.0,
@@ -49,6 +50,7 @@ fn moved_at(a: &[CellGeometry], b: &[CellGeometry]) -> Vec<f32> {
         .collect()
 }
 
+/// A renderer over `bytes` at `px` on the default (dark) theme, configured
 /// with `requests` and `nudge`.
 fn configured(bytes: &[u8], px: f32, requests: &[(u32, f32)], nudge: f32) -> Renderer {
     let mut r = Renderer::from_bytes(bytes, px, Theme::default()).expect("parses");
@@ -57,6 +59,22 @@ fn configured(bytes: &[u8], px: f32, requests: &[(u32, f32)], nudge: f32) -> Ren
     r
 }
 
+/// The reviewer's case (2026-10-16): Cinzel at `wght` 500 with a nudge of
+/// 100. Its 600 instance has the 500 instance's box at 16 px but not at 9 px,
+/// so a gate that compares the two boxes at the active size alone admits the
+/// nudge at 16 px and a theme flip then moves the box of a window at 9 px.
+/// Whatever size is active when the nudge is decided, a flip either way now
+/// moves no box at any size, and the kept answers are what the face derives.
+///
+/// NEGATIVE CONTROL: the 600 instance's own box does move against the 500
+/// one's at some size in [`SIZES`] while it holds at 16 px, so the one-size
+/// gate would have admitted it there (measured before the fix: built at
+/// 16 px, the flip to light moved the box at 9 and 27 px).
+///
+/// Held twice, and mutation-checked: the gate refuses this nudge (restoring
+/// the one-size gate fails the next test), and the box is derived from the
+/// un-nudged instance whatever the gate admits (deriving it from the drawn
+/// instance fails the SF Mono test's "derives nothing"). Undoing both fails
 /// this one.
 #[test]
 fn a_theme_flip_moves_no_cell_box_at_any_size() {
@@ -96,6 +114,7 @@ fn a_theme_flip_moves_no_cell_box_at_any_size() {
     }
 }
 
+/// NEGATIVE CONTROL: before the fix Cinzel 500 + 100 resolved 500 at 9 px
 /// and 600 at 16 px.
 #[test]
 fn the_nudge_does_not_depend_on_the_active_size() {
@@ -151,12 +170,14 @@ fn a_nudge_decided_by_size_still_moves_no_box() {
     );
 }
 
+/// The system SF Mono, a variable face every macOS ships: monospaced, so its
 /// instances share one `'M'` advance and one set of line metrics.
 #[cfg(target_os = "macos")]
 fn sf_mono() -> Vec<u8> {
     std::fs::read("/System/Library/Fonts/SFNSMono.ttf").expect("macOS ships SFNSMono.ttf")
 }
 
+/// NEGATIVE CONTROL: a write that is an input of the box (the line height)
 /// derives each kept size again.
 #[cfg(target_os = "macos")]
 #[test]

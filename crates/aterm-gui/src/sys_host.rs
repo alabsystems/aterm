@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
 use aterm_vitals::events::Event;
+use aterm_vitals::explain::WhySubject;
 use aterm_vitals::model::Snapshot;
 use aterm_vitals::sys::predicate::{EndedJob, Latch, Parsed, evaluate_with, met_reply};
 use aterm_vitals::sys::{
@@ -18,6 +19,7 @@ use aterm_vitals::sys::{
     render_json, render_text,
 };
 
+use crate::occupancy_host::Arming;
 use crate::session_store::Store;
 use crate::vitals_host::Msg;
 
@@ -70,9 +72,14 @@ struct ReplyKey {
     view: View,
     scope: Option<ScopeArg>,
     target: u64,
-    /// `top=` and `depth=`: how many rows print.
+    /// `top=` and `depth=`: how many rows print, and for a `why` whether
+    /// `top=` was given (a `why` reply with none keeps to its byte cut).
     top: usize,
+    top_set: bool,
     depth: Option<u8>,
+    /// The subject a `why` asked for (`None`: the bare reply's choice, which
+    /// may move between replies; its unchanged lines still fold).
+    subject: Option<WhySubject>,
     /// The caller's tab, which decides which roots print paths (§13.3).
     caller_panes: Option<Vec<u64>>,
     /// Whether machine-wide rows may print.
@@ -100,6 +107,10 @@ struct State {
     replies: VecDeque<Kept>,
     tx: Option<SyncSender<Msg>>,
     last_pull: Option<Instant>,
+    /// The last pull a `why` sent, the split armed: another view's pull
+    /// reads no split, so a `why` keeps its own gap (the probe still spaces
+    /// every pull's reading [`crate::vitals_host::MIN_WINDOW`] apart).
+    last_split_pull: Option<Instant>,
     pacing: Pacing,
 }
 
@@ -203,26 +214,69 @@ impl Shared {
 
     /// A whole snapshot at most `fresh` old (`force`: one taken after this call), pulling one when needed and waiting a bounded time for it.
     pub(crate) fn fresh(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
+        self.fresh_by(fresh, force, false)
+    }
+
+    /// [`Self::fresh`] for a `sys why` (`docs/DESIGN-resource-details-2026-10-20.md`
+    /// §2.1), judged by its split set's age while the coalition lane
+    /// reads: one whose split is missing, has no window or is older than
+    /// `fresh` pulls (the caller holds `vitals_host::SPLIT_ARMED`, so the
+    /// pull reads a split, twice when it is cold), whatever another view
+    /// pulled within the gap, and waits for a new split, at most `PULL_WAIT`
+    /// (`PULL_WAIT_COLD` cold), past which the held one answers stale. With
+    /// the lane off it is [`Self::fresh`].
+    pub(crate) fn fresh_why(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
+        self.fresh_by(fresh, force, true)
+    }
+
+    /// The snapshot `q` reads, as fresh as it asks: a `why`'s by its split
+    /// ([`Self::fresh_why`]), `split` armed while it waits so the pull reads
+    /// one (`cmd_sys` passes `vitals_host::SPLIT_ARMED`); any other view's
+    /// by [`Self::fresh`].
+    pub(crate) fn fresh_for(&self, q: &SysQuery, split: &Arming) -> (Option<Held>, Freshness) {
+        let fresh_ms = q.fresh_ms.unwrap_or_else(|| q.freshness_default_ms());
+        let fresh = Duration::from_millis(fresh_ms);
+        if q.view == View::Why {
+            let _armed = split.arm();
+            self.fresh_why(fresh, fresh_ms == 0)
+        } else {
+            self.fresh(fresh, fresh_ms == 0)
+        }
+    }
+
+    fn fresh_by(&self, fresh: Duration, force: bool, split: bool) -> (Option<Held>, Freshness) {
         let now = Instant::now();
         let mut g = self.lock();
         let have = g.held.clone();
+        // When what the reply reads landed: the snapshot, or its split.
+        let landed = |h: &Held| if split { split_landed(h) } else { Some(h.at) };
         if let Some(h) = have.as_ref()
             && !force
-            && h.at.elapsed() <= fresh
+            && landed(h).is_some_and(|t| t.elapsed() <= fresh)
             && whole(&h.snap)
         {
             return (have.clone(), Freshness::Fresh);
         }
         let old_seq = have.as_ref().map(|h| h.snap.seq);
-        let cold = have
-            .as_ref()
-            .is_none_or(|h| !whole(&h.snap) || h.at.elapsed() > crate::vitals_host::COLD_AFTER);
+        let old_split = have.as_ref().and_then(|h| split_ns(&h.snap));
+        let cold = have.as_ref().is_none_or(|h| {
+            !whole(&h.snap)
+                || h.at.elapsed() > crate::vitals_host::COLD_AFTER
+                || (split && split_cold(h))
+        });
         let pacing = g.pacing;
-        let recent_pull = g.last_pull.filter(|t| t.elapsed() < pacing.gap);
+        // Only a pull the split was armed for reads one.
+        let armed = split && have.as_ref().is_none_or(|h| h.snap.coal_lane.on());
+        let last_pull = if armed {
+            g.last_split_pull
+        } else {
+            g.last_pull
+        };
+        let recent_pull = last_pull.filter(|t| t.elapsed() < pacing.gap);
         match recent_pull {
             Some(t) => {
                 if let Some(h) = have.as_ref()
-                    && h.at >= t
+                    && landed(h).is_some_and(|l| l >= t)
                     && whole(&h.snap)
                 {
                     return (have.clone(), Freshness::Fresh);
@@ -239,6 +293,9 @@ impl Shared {
                 };
                 if sent {
                     g.last_pull = Some(now);
+                    if armed {
+                        g.last_split_pull = Some(now);
+                    }
                 }
             }
         }
@@ -251,6 +308,9 @@ impl Shared {
             if let Some(h) = g.held.as_ref()
                 && Some(h.snap.seq) != old_seq
                 && whole(&h.snap)
+                && (!split
+                    || !h.snap.coal_lane.on()
+                    || split_ns(&h.snap).is_some_and(|ns| Some(ns) != old_split))
             {
                 return (Some(h.clone()), Freshness::Fresh);
             }
@@ -370,6 +430,34 @@ pub(crate) fn whole(snap: &Snapshot) -> bool {
         && snap
             .procs_window_ns
             .is_some_and(|w| u128::from(w) <= WINDOW_MAX.as_nanos())
+}
+
+/// When a `why` reply's split set landed: its last split tick, the
+/// snapshot's own landing while the lane does not read; `None` with the lane
+/// on and no split with a window held.
+fn split_landed(h: &Held) -> Option<Instant> {
+    if !h.snap.coal_lane.on() {
+        return Some(h.at);
+    }
+    let ns = split_ns(&h.snap)?;
+    h.at.checked_sub(Duration::from_nanos(h.snap.at_ns.saturating_sub(ns)))
+}
+
+/// The monotonic stamp of `snap`'s split set, where it has one with a window.
+fn split_ns(snap: &Snapshot) -> Option<u64> {
+    snap.why
+        .as_deref()
+        .filter(|f| f.window_ns > 0)
+        .map(|f| f.at_ns)
+}
+
+/// Whether a pull for `h`'s `why` must read the split twice for a window:
+/// the lane reads and its split is missing or, within the probe's margin,
+/// too old for one (`vitals_host::SplitReader::cold`).
+fn split_cold(h: &Held) -> bool {
+    use crate::vitals_host::{SPLIT_COLD_MARGIN, SPLIT_WINDOW_MAX};
+    h.snap.coal_lane.on()
+        && split_landed(h).is_none_or(|t| t.elapsed() + SPLIT_COLD_MARGIN > SPLIT_WINDOW_MAX)
 }
 
 /// `otherwise`, unless the snapshot is a first sample without rates.
@@ -946,8 +1034,7 @@ pub(crate) fn cmd_sys(
         // `named=` stays not_sampled and so does the request.
         return "ERR unavailable name why=not_sampled\n".to_owned();
     }
-    let fresh_ms = q.fresh_ms.unwrap_or_else(|| q.freshness_default_ms());
-    let (held, state) = SYS.fresh(Duration::from_millis(fresh_ms), fresh_ms == 0);
+    let (held, state) = SYS.fresh_for(&q, &crate::vitals_host::SPLIT_ARMED);
     let (panes, machine) = SYS.facts();
     let g = gather(
         store,
@@ -981,7 +1068,10 @@ fn answer(
         scope: q.effective_scope(),
         target: g.target.key,
         top: q.top,
+        // Only a `why`'s rows depend on whether `top=` was given.
+        top_set: q.top_set && q.view == View::Why,
         depth: q.depth,
+        subject: q.subject,
         caller_panes: g.caller_panes.clone(),
         owner_class,
     };
@@ -1014,6 +1104,7 @@ fn answer(
         let mut reply = Reply {
             view: q.view,
             scope: q.view.default_scope().and(q.effective_scope()),
+            subject: aterm_vitals::sys::why::subject_word(q, ctx.snap),
             lines: Vec::new(),
             json: Some(render_json(q, &ctx)),
         };

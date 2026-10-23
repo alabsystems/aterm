@@ -142,10 +142,7 @@ fn a_bad_tail_record_is_refused_not_guessed() {
     );
 }
 
-/// A keyframe round-trips exactly: on the main screen with a bridge, mid-sequence (the
-/// parser carry rides it), on the alternate screen with the bridge on the saved
-/// primary, and from an engine whose shell-integration nonce is in use (the flag rides
-/// the head; the nonce never does).
+/// A keyframe round-trips across main, mid-sequence, alternate-screen, and shell-integration states.
 #[test]
 fn a_keyframe_round_trips() {
     let mut cases = Vec::new();
@@ -171,9 +168,7 @@ fn a_keyframe_round_trips() {
     }
 }
 
-/// The alternate screen's bridge is bounded by the keyframe's own bridge, not the handoff
-/// wire's `rows`: the saved primary decodes at `rows + bridge` and is refused at
-/// `rows + bridge + 1` (the plan's J10).
+/// The alternate screen's saved primary decodes at `rows + bridge` and is refused past it.
 #[test]
 fn the_alternate_screen_bridge_decodes_at_its_bound_and_not_past_it() {
     let mut t = shell_with_history(5, 20, 60);
@@ -195,7 +190,6 @@ fn the_alternate_screen_bridge_decodes_at_its_bound_and_not_past_it() {
         Err(KeyframeFault::Grid),
         "rows + bridge + 1 is refused"
     );
-    // On the main screen the same bound holds over the main grid.
     let shell = shell_with_history(5, 20, 60);
     let main = shell.checkpoint_journal(12).expect("ground");
     assert!(
@@ -214,9 +208,7 @@ fn the_alternate_screen_bridge_decodes_at_its_bound_and_not_past_it() {
     );
 }
 
-/// No keyframe record holds the shell-integration nonce, even with integration
-/// authorized and in use: the projection carries none, the encoder refuses a checkpoint
-/// that does, and the decoder refuses a meta that names one.
+/// No keyframe record holds the shell-integration nonce.
 #[test]
 fn no_keyframe_holds_the_nonce() {
     let key = [0x5Au8; 32];
@@ -230,8 +222,6 @@ fn no_keyframe_holds_the_nonce() {
     let checkpoint = t.checkpoint_journal(64).expect("ground");
     let record = encode_keyframe(&head_for(&t, 1, 64), &checkpoint).expect("encodes");
     let body = body_of(&record, 1);
-    // The meta writes the parser carry's bytes as hex, so the nonce could also sit
-    // there as the hex of its hex.
     let hex_of_hex: String = hex.bytes().map(|b| format!("{b:02x}")).collect();
     let holds_nonce = |haystack: &[u8]| {
         haystack.windows(hex.len()).any(|w| w == hex.as_bytes())
@@ -243,8 +233,6 @@ fn no_keyframe_holds_the_nonce() {
     assert!(!holds_nonce(&record), "the nonce is nowhere in the record");
     assert!(!holds_nonce(&body), "nor in its body");
 
-    // A slice end inside the next signed mark: the parser carry holds the mark's payload
-    // so far, nonce and all, so the journal defers the keyframe (K5) rather than cut it.
     t.process(format!("\r\n\x1b]133;A;id={hex}").as_bytes());
     assert!(
         t.checkpoint_journal(64).is_none(),
@@ -292,7 +280,6 @@ fn no_keyframe_holds_the_nonce() {
         Err(EncodeError::Nonce)
     );
 
-    // A meta that names a nonce (a writer this build did not make) is refused.
     let mut f = Fields { bytes: &body };
     let fixed = f.take(103).expect("the fixed fields").to_vec();
     let meta = std::str::from_utf8(f.blob().expect("meta")).expect("utf-8");
@@ -309,10 +296,7 @@ fn no_keyframe_holds_the_nonce() {
     );
 }
 
-/// A damaged keyframe is refused, whatever the damage: a flipped byte (the frame's CRC),
-/// another step than the commit word's, a truncated record, an LZ4 size past the bound
-/// (refused before anything is allocated), a meta missing a required key, a body with a
-/// byte past its last field.
+/// A damaged keyframe is refused across corrupted bytes, mismatched steps, truncation, and invalid metadata.
 #[test]
 fn a_damaged_keyframe_is_refused() {
     let t = shell_with_history(4, 20, 8);
@@ -450,8 +434,7 @@ fn resize_payloads_have_exactly_twenty_four_bytes() {
     );
 }
 
-/// The same small frame fits at its exact byte budget and is refused one byte below,
-/// in both directions. No oversized allocation is attempted by this regression.
+/// The same small frame fits at its exact byte budget and is refused one byte below.
 #[test]
 fn history_frames_share_a_preallocation_output_budget() {
     let lines = vec![Line::from("bounded history")];
@@ -484,9 +467,7 @@ fn history_frames_share_a_preallocation_output_budget() {
     assert_eq!((encoder_refused, decoder_refused), (true, true));
 }
 
-/// The frame handed to a history importer has the same line count as its CRC-valid
-/// chunk head. The importer may take a prefix, so aggregate output length alone must
-/// not hide an extra or missing line in a chunk.
+/// The frame handed to a history importer has the same line count as its CRC-valid chunk head.
 #[test]
 fn history_frames_keep_the_chunk_s_declared_line_count() {
     let source = [Line::from("first"), Line::from("second")];
@@ -512,8 +493,6 @@ fn history_frames_keep_the_chunk_s_declared_line_count() {
     for declared in [1u32, 3] {
         let mut lying_body = body.to_vec();
         lying_body[4..8].copy_from_slice(&declared.to_le_bytes());
-        // Reframe the changed head through the actual step encoder: a valid CRC must
-        // not be mistaken for proof that the head's count describes its frame.
         let lying_record = encode_step(7, &lying_body).expect("fresh CRC");
         let checked_body = one_step(&lying_record, 7).expect("the changed CRC is valid");
         let lying = decode_history_chunk(7, checked_body).expect("a valid chunk head");
@@ -535,9 +514,7 @@ fn history_frames_keep_the_chunk_s_declared_line_count() {
     );
 }
 
-/// CRC-32/IEEE (reflected, polynomial `0xEDB8_8320`, all ones in and out), eight shifts
-/// a byte: the checksum layout v1's step frame carries, computed here with no astream
-/// code, so [`v1_step_record`] spells a record the pinned astream never touched.
+/// Computes CRC-32/IEEE (reflected, polynomial `0xEDB8_8320`) without astream code.
 fn crc32_by_hand(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for &byte in bytes {
@@ -557,10 +534,7 @@ fn crc32_by_hand(bytes: &[u8]) -> u32 {
 /// header.
 const V1_STEP_BODY_AT: usize = 25;
 
-/// Layout v1's step record, spelled out by hand: the frame (magic `A5 71`, version 1,
-/// flags 0, the payload's length as a u32 LE, its CRC-32/IEEE as a u32 LE) around the
-/// step payload (step-record version 1, the step as a u64 LE, the body's length as a
-/// u32 LE, the body).
+/// Frames a layout v1 step record around `body` at `step` by hand.
 fn v1_step_record(step: u64, body: &[u8]) -> Vec<u8> {
     let body_len = u32::try_from(body.len()).expect("a test body");
     let mut payload = vec![1];
@@ -575,12 +549,7 @@ fn v1_step_record(step: u64, body: &[u8]) -> Vec<u8> {
     record
 }
 
-/// What [`layout_v1_holds_astream_step_records_byte_for_byte`] found in each direction:
-/// a row for each record that broke it, none where the direction holds. Both are judged
-/// before either is asserted, because which one broke is what a failing bump's commit
-/// has to decide on (`vendor/README-astream.md`): a bump that changed only what astream
-/// writes fails `write` alone (this build still restores an older build's region), and
-/// one that stopped reading layout v1's records fails `read` as well.
+/// Mismatches found by [`layout_v1_holds_astream_step_records_byte_for_byte`] in each direction.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct V1Directions {
     /// This build's encoders against layout v1's bytes.
@@ -602,48 +571,18 @@ impl V1Directions {
     }
 }
 
-/// THE PIN between layout v1 and the astream this checkout vendors.
-///
-/// A keyframe and a history chunk are astream step records (the module doc), and every
-/// other test in this crate writes and reads them through the one pinned astream. So a
-/// bump that moved astream-wire's frame or step-record bytes would leave every one of
-/// them green, while a restorer of one build misread the region a writer of another
-/// build left: a window that dies with an update staged comes back as the new build,
-/// reading the old build's region. This test spells the v1 record out with no astream
-/// code on the way (a literal for one record, its CRC taken from gzip's trailer, then
-/// [`v1_step_record`] with a hand CRC held to the standard check value) and holds both
-/// directions to it, judging both before it asserts either ([`V1Directions`]):
-///
-/// - **write:** what `encode_keyframe` and `encode_history_chunk` frame is those bytes;
-/// - **read:** a hand-framed keyframe is what `decode_keyframe` restores, and a
-///   hand-framed dense run of chunks is what the ring's step scan accepts.
-///
-/// When it fails, the bump changed the region's format, and `vendor/README-astream.md`
-/// says what the bump's commit owes `LAYOUT_VERSION` in each direction.
+/// Verifies that layout v1 step records match the vendored astream format byte for byte.
 #[test]
 fn layout_v1_holds_astream_step_records_byte_for_byte() {
-    // The hand CRC is the standard one: the CRC-32/IEEE check value.
     assert_eq!(crc32_by_hand(b"123456789"), 0xCBF4_3926);
-    // One record, byte for byte: step 0x0807_0605_0403_0201 (every byte distinct, so a
-    // swapped order shows) around the body "ab".
     let literal: [u8; 27] = [
-        0xA5, 0x71, 0x01, 0x00, // frame magic, frame version 1, flags 0
-        0x0F, 0x00, 0x00, 0x00, // payload length 15 (13-byte step header + 2)
-        0x69, 0x23, 0xB7, 0x6A, // CRC-32/IEEE of the payload (gzip's trailer agrees)
-        0x01, // step-record version 1
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // step, u64 LE
-        0x02, 0x00, 0x00, 0x00, // body length 2
-        b'a', b'b', // body
+        0xA5, 0x71, 0x01, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x69, 0x23, 0xB7, 0x6A, 0x01, 0x01, 0x02,
+        0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x02, 0x00, 0x00, 0x00, b'a', b'b',
     ];
     assert_eq!(v1_step_record(0x0807_0605_0403_0201, b"ab"), literal);
 
     let mut found = V1Directions::default();
 
-    // Write: the encoders frame layout v1's bytes. The step's eight bytes are distinct.
-    // Each record's body is sliced from the encoder's own output and re-framed by hand,
-    // so the two agree byte for byte exactly when their first V1_STEP_BODY_AT bytes do
-    // (a moved length, CRC, trailer or header size all show there): those are compared,
-    // which keeps a row to two short headers instead of two whole keyframes.
     let t = shell_with_history(6, 32, 40);
     let seq = 0x0102_0304_0506_0708;
     let head = head_for(&t, seq, 8);
@@ -676,8 +615,6 @@ fn layout_v1_holds_astream_step_records_byte_for_byte() {
         hand_run.extend_from_slice(&hand);
     }
 
-    // Read: the hand-framed records restore, through the readers a restore runs. They
-    // are framed from the encoders' bodies whatever the write rows found.
     match decode_keyframe(&hand_keyframe, seq) {
         Ok(kf) if kf.head == head && kf.checkpoint == checkpoint => {}
         Ok(_) => found
@@ -730,10 +667,7 @@ fn layout_v1_holds_astream_step_records_byte_for_byte() {
     );
 }
 
-/// A control record (CTR v1) round-trips under its own step only, and is refused, with
-/// nothing allocated past the bound, when its size prefix is past [`MAX_CONTROL_CARRY`],
-/// its version is not this build's, it is empty, or it is not one whole record; a carry
-/// past the bound is never encoded.
+/// A control record (CTR v1) round-trips under its own step and enforces [`MAX_CONTROL_CARRY`].
 #[test]
 fn a_control_record_round_trips_and_its_bounds_are_held() {
     let record = encode_control(3, b"the ledger").expect("encodes");

@@ -109,7 +109,8 @@ fn invalid_identity_count() -> usize {
 
 /// What the Apple step decided.
 pub(crate) enum Outcome {
-    /// An identity is installed and proved usable.
+    /// An identity is installed and proved usable. `ids` holds only 40-hex SHA-1s;
+    /// anything else rides in `note`.
     Ready {
         ids: Vec<String>,
         note: Option<String>,
@@ -426,7 +427,8 @@ pub(crate) fn pinned_identity_proves(sha1: &str) -> Result<(), String> {
     prove_can_sign(sha1)
 }
 
-/// The single place a green Apple verdict is produced, so no path skips the proof.
+/// The single place a green Apple verdict is produced, so no path skips the proof. A
+/// signature that fails is not ready.
 fn verdict(ids: Vec<String>) -> Outcome {
     match prove_can_sign(&ids[0]) {
         Ok(()) => {
@@ -460,7 +462,9 @@ fn paired_with_installed(key: &Option<PathBuf>, sha1: &str) -> bool {
         .is_some_and(|installed| key_spki_sha256(key).is_some_and(|k| k == installed))
 }
 
-/// The SPKI digest of the certificate the identity `sha1` names.
+/// The SPKI digest of the certificate the identity `sha1` names. Selected by digest:
+/// `openssl x509` parses only the first block of a `find-certificate -a` stream, and a
+/// renewal leaves two overlapping Developer ID certificates.
 fn installed_cert_spki(sha1: &str) -> Option<String> {
     let pem = installed_leaf_pem(sha1)?;
     let der = capture(
@@ -618,7 +622,7 @@ fn identity_label(sha1: &str) -> Option<String> {
 }
 
 /// The plural `s`, so a count of 1 never reads `1 item(s)`.
-fn plural(n: usize) -> &'static str {
+const fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
@@ -804,7 +808,8 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
     }
 }
 
-/// Run 1: an RSA-2048 keypair and a CSR, both born here.
+/// Run 1: an RSA-2048 keypair and a CSR, both born here. `/usr/bin/openssl` explicitly: a
+/// Homebrew OpenSSL 3 ahead of it on PATH changes defaults and output formats.
 fn generate(dir: &Path, id: &str) -> Result<PathBuf, Outcome> {
     if let Err(e) = std::fs::create_dir_all(dir) {
         return Err(Outcome::Blocked {
@@ -1157,7 +1162,8 @@ fn cert_spki_sha256(cer: &Path, form: &str) -> Option<String> {
     digest(&der)
 }
 
-/// SHA-256 of `der`, as hex.
+/// SHA-256 of `der`, as hex. `/usr/bin/openssl dgst -sha256` on stdin prints the bare hex
+/// (no `(stdin)= ` prefix); given a file it prints `SHA2-256(path)= <hex>`.
 fn digest(der: &[u8]) -> Option<String> {
     let out = capture("/usr/bin/openssl", &["dgst", "-sha256"], Some(der))?;
     let text = String::from_utf8_lossy(&out);

@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 /// Sentinel char for a wide glyph's continuation cell in [`find_path_span`].
 pub(crate) const WIDE_CONTINUATION: char = '\0';
 
-/// The longest token read as a path, in cells.
+/// The longest token read as a path, in cells. A citation longer than this
+/// is not one a person reads, and the bound keeps a hover's work fixed.
 const MAX_TOKEN_CELLS: usize = 1024;
 
 /// Plain-text file citation span found in a row ([`find_path_span`]).

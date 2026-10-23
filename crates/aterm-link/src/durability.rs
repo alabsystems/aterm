@@ -553,7 +553,8 @@ pub fn open_escalating(
     })
 }
 
-/// Remove `path` so a power loss does not bring it back.
+/// Remove `path` so a power loss does not bring it back. An absent one is
+/// removed already.
 fn remove_durably(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => crate::state::sync_dir(path.parent().unwrap_or(Path::new(""))),
@@ -706,7 +707,11 @@ mod tests {
         assert!(named.iter().all(Option::is_none));
     }
 
-    /// THE WORD, THE ARGV AND THE DEFAULT.
+    /// THE WORD, THE ARGV AND THE DEFAULT. Every word round-trips, a bare
+    /// argv names nothing and runs the build's default ([`default_for`]):
+    /// ordered for a guarded broker on every platform (astream decides where
+    /// it is served, and serves it strict elsewhere), strict for an unguarded
+    /// one.
     #[test]
     fn the_word_the_argv_and_the_default() {
         for tier in [Durability::Strict, Durability::Ordered, Durability::Relaxed] {
@@ -760,7 +765,10 @@ mod tests {
         );
     }
 
-    /// `ORDERED IS SERVED ORDERED, WITH ATERM'S TABLE`.
+    /// `ORDERED IS SERVED ORDERED, WITH ATERM'S TABLE`. The word maps to
+    /// astream's Ordered tier at aterm's 100 ms horizon, and every weak tier opens with the
+    /// four-rule table while strict opens with none (its every batch is a
+    /// full flush).
     #[test]
     fn ordered_is_served_ordered_with_aterms_table() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
@@ -867,7 +875,13 @@ mod tests {
         }
     }
 
-    /// A BROKER THAT SERVES A WEAK TIER IS TOLD BY WHAT IT REPORTS.
+    /// A BROKER THAT SERVES A WEAK TIER IS TOLD BY WHAT IT REPORTS. Ordered
+    /// is never told as strict: asked ordered, or asked what this build reads
+    /// a bare argv as (strict) while the broker's build opened it ordered,
+    /// the line says ordered's words with the broker's own horizon — never
+    /// strict's "loses nothing acked", which a power loss there would make a
+    /// lie — and in the second case says the tier served differs from the one
+    /// asked.
     #[test]
     fn a_weak_tier_is_told_by_what_its_broker_reports() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
@@ -1086,7 +1100,9 @@ mod tests {
         );
     }
 
-    /// THE HAZARD, AND ASTREAM'S CURE, ON REAL FILES.
+    /// THE HAZARD, AND ASTREAM'S CURE, ON REAL FILES. A relaxed broker in
+    /// boot 1 acks ten records; a consumer witnesses head 10 under the log's
+    /// identity.
     #[test]
     fn a_power_loss_under_relaxed_moves_the_generation_with_lineage() {
         let dir = scratch();
@@ -1206,7 +1222,9 @@ mod tests {
         );
     }
 
-    /// THE LEGACY-MARK MIGRATION: ONE DECISION, NO DOUBLE RENEWAL.
+    /// THE LEGACY-MARK MIGRATION: ONE DECISION, NO DOUBLE RENEWAL. A build
+    /// before lineage left a relaxed run unclean in boot 1: its mark and its
+    /// `Open` sidecar both stand.
     #[test]
     fn the_legacy_mark_moves_the_generation_once_and_is_removed() {
         let dir = scratch();
@@ -1336,7 +1354,12 @@ mod tests {
         );
     }
 
-    /// THE LEGACY MARK ALONE MOVES THE GENERATION WITH LINEAGE.
+    /// THE LEGACY MARK ALONE MOVES THE GENERATION WITH LINEAGE. Every other
+    /// lineage check in this crate goes through astream's own verdict (an `Open`
+    /// sidecar opened in another boot); a log a build before lineage left
+    /// marked moves ONLY on the embedder's verdict (`Prepared::Unclean`), so
+    /// this one leaves astream nothing of its own to go by: the boot-1 run
+    /// stops cleanly (`Closed`), and the mark is planted after it.
     #[test]
     fn a_legacy_mark_alone_moves_the_generation_with_lineage() {
         let dir = scratch();

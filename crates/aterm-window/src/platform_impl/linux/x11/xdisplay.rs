@@ -74,7 +74,8 @@ pub struct XConnection {
 
     pub latest_error: Mutex<Option<XError>>,
     pub cursor_cache: Mutex<HashMap<CursorIcon, ffi::Cursor>>,
-    /// The last resource id admitted for a DND conversion.
+    /// The last resource id admitted for a DND conversion. The display outlives event loops:
+    /// a later loop must not reuse a requestor an earlier source still names.
     dnd_requestor_high: AtomicU32,
 
     /// How the cursors follow the resource database's theme and size (`follow_cursor_settings`).
@@ -658,7 +659,10 @@ mod tests {
 
     use super::{socket_end, ConnectionEnd};
 
-    /// [`socket_end`] once a closed peer's close has reached `fd`.
+    /// [`socket_end`] once a closed peer's close has reached `fd`. A child another test forks
+    /// while the peer is open holds a copy of it until its exec closes it (`SOCK_CLOEXEC`), and
+    /// only then does the close come here: one run in 40 of the crate's suite, beside
+    /// `gone_tests`' children, read the closed peer as live.
     fn once_closed(fd: std::os::raw::c_int) -> std::io::Error {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {

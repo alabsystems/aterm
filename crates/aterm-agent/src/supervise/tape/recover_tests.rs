@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The reader's own bounds: a tape made by hand to cost a read more than its
-//! size — a body or a name copied into every item that refers to it, bytes
-//! crowded with frame-like heads after a damaged frame — is refused by name,
-//! at a cost the reader bounds rather than the bytes; under the bounds, the
-//! same bytes read as they always did.
+//! Reader bound and recovery tests on hand-crafted supervisor tapes.
 
 use astream_effects::EffectRecord;
 
@@ -21,9 +17,7 @@ const SMALL: Limits = Limits {
     search_floor: 0,
 };
 
-/// The header frame and one records frame of `items`, encoded in order by one
-/// encoder — one frame however much it holds, as no writer closes one — with
-/// the records frame's offset.
+/// The header frame and one records frame of `items`, encoded in order by one encoder.
 fn one_frame(items: &[Item]) -> (Vec<u8>, usize) {
     let mut enc = Encoder::default();
     let mut raw = Vec::new();
@@ -86,7 +80,6 @@ fn a_body_repeated_past_what_a_read_holds_is_refused() {
         (0, 1),
         "salvage keeps the frames before the one that crossed the bound, and none of it"
     );
-    // Under the tape's own bound the same bytes read whole.
     let whole = recover(&bytes);
     assert_eq!(whole.tail, Tail::Clean);
     assert_eq!(whole.items, items);
@@ -126,10 +119,7 @@ fn a_name_and_items_that_own_nothing_count_too() {
     assert_eq!(recover(&bytes).items.len(), bare.len());
 }
 
-/// The header, then a records frame whose payload's last byte is damaged at
-/// `at`, then frame-like heads every 17 bytes to `len` — each a records kind,
-/// lengths that run exactly to the end and a checksum that fails — then
-/// `last`. Searching it exhaustively hashes about `len²/34` bytes.
+/// Header plus a damaged records frame followed by frame-like heads every 17 bytes to `len`.
 fn crowded(len: usize, last: &[u8]) -> (Vec<u8>, usize) {
     let header = frame_bytes(Kind::Header, 0, HEADER.as_bytes());
     let at = MAGIC.len() + header.len();
@@ -202,7 +192,6 @@ fn within_its_bound_the_search_still_finds_a_whole_frame() {
             why: Why::Unsearched
         }
     );
-    // No whole frame behind an affordable crowd: the torn tail it always was.
     let (bytes, at) = crowded(8 * 1024, &[]);
     assert_eq!(recover(&bytes).tail, Tail::Torn { at });
 }

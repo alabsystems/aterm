@@ -113,7 +113,7 @@ pub enum From {
 impl From {
     /// The word the doctor prints.
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             From::Local => "aterm.toml",
             From::FleetMachine => "fleet, this machine's row",
@@ -147,7 +147,7 @@ pub enum FleetState {
 impl FleetState {
     /// `read`, `refused` or `none`.
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             FleetState::None => "none",
             FleetState::Read { .. } => "read",
@@ -516,7 +516,7 @@ pub fn default_preferred() -> &'static Connector {
         .unwrap_or(&connector::CLAUDE)
 }
 
-/// The named fleet document.
+/// The named fleet document, else `ai-fleet.toml` beside `aterm.toml` unless it is absent.
 #[must_use]
 pub fn fleet_source(local: &Local, config: Option<&Path>) -> Option<FleetSource> {
     local.fleet.clone().or_else(|| {

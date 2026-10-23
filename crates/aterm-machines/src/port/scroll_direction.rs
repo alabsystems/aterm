@@ -23,6 +23,7 @@ mod native {
     fn api() -> Result<&'static Api, String> {
         static API: OnceLock<Result<Api, String>> = OnceLock::new();
         API.get_or_init(|| {
+            // SAFETY: a static NUL-terminated framework path and Darwin dlfcn flags.
             let handle = unsafe { dlopen(FRAMEWORK.as_ptr(), RTLD_LAZY_LOCAL) };
             if handle.is_null() {
                 return Err("macOS's native scroll-direction framework is unavailable".into());
@@ -37,7 +38,7 @@ mod native {
                 );
             }
             // SAFETY: signatures match the integer argument/result ABI of Apple's TrackpadExtension
-            // calls described above.
+            // calls to `swipeScrollDirection`/`setSwipeScrollDirection`; no pointer crosses.
             let get = unsafe {
                 std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> c_long>(getter)
             };

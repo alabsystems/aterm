@@ -7,12 +7,7 @@
 // modified by the aterm project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! Directions, and the OpenType script tags a Unicode script selects.
-//!
-//! The shaper never has a language (the terminal knows none), so the
-//! language half of upstream's tag mapping, and its 2,500-line BCP 47 table,
-//! is not carved: a lookup always lands on the script's default language
-//! system.
+//! Run directions and OpenType script tags selected by a Unicode script.
 
 use crate::Tag;
 use aterm_grapheme::Script;
@@ -60,14 +55,11 @@ impl Direction {
         }
     }
 
-    /// The horizontal direction `script` is written in; `None` for the
-    /// scripts written either way (harfbuzz#1000).
+    /// Returns the horizontal direction `script` is written in, or `None` for the scripts written
+    /// either way (harfbuzz#1000).
     #[inline]
     pub(crate) const fn from_script(script: Script) -> Option<Self> {
         match &script.0 {
-            // Unicode 1.1 to 14.0 right-to-left scripts, as upstream lists
-            // them, and Garay (16.0), which upstream's script table does not
-            // reach.
             b"Arab" | b"Hebr" | b"Syrc" | b"Thaa" | b"Cprt" | b"Khar" | b"Phnx" | b"Nkoo"
             | b"Lydi" | b"Avst" | b"Armi" | b"Phli" | b"Prti" | b"Sarb" | b"Orkh" | b"Samr"
             | b"Mand" | b"Merc" | b"Mero" | b"Mani" | b"Mend" | b"Nbat" | b"Narb" | b"Palm"
@@ -79,9 +71,7 @@ impl Direction {
     }
 }
 
-/// The OpenType script tags to try for `script`, best first: for the Indic
-/// scripts the version-3 and version-2 tags, then the old tag, which is the
-/// ISO 15924 code with its first letter lowered (`Latn` is `latn`).
+/// Returns the OpenType script tags to try for `script` in priority order (v3, v2, then legacy ISO 15924).
 pub(crate) fn script_tags(script: Option<Script>) -> Vec<Tag> {
     let mut tags = Vec::with_capacity(3);
     let Some(script) = script else {

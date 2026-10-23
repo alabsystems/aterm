@@ -11,11 +11,12 @@ pub mod json;
 pub mod predicate;
 pub mod query;
 pub mod view;
+pub mod why;
 
 pub use delta::{Fingerprints, apply_delta, fingerprints};
 pub use disk::{DirSize, DiskTotals, HugeDirFact, RootSize, RootSizes};
 pub use predicate::{AwaitSys, Metric, Outcome, Term, evaluate};
-pub use query::{Cursor, ScopeArg, SysQuery, USAGE, View};
+pub use query::{Cursor, ScopeArg, SysQuery, USAGE, View, WHY_USAGE};
 pub use view::{Reply, render_json, render_text};
 
 use crate::events::Event;

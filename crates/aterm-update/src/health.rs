@@ -132,7 +132,10 @@ pub struct Health {
 /// The longest error text the ledger stores, in characters.
 const MAX_STORED_ERROR_CHARS: usize = 400;
 
-/// `error` cut to [`MAX_STORED_ERROR_CHARS`] — WITHOUT CUTTING OFF WHAT IT IS.
+/// `error` cut to [`MAX_STORED_ERROR_CHARS`] — WITHOUT CUTTING OFF WHAT IT IS. A
+/// passing refusal carries its key ([`crate::PASSING_REFUSAL_KEY`]) at the END of its
+/// text, and readers ([`crate::is_passing_refusal`]) tell a moment from a verdict by
+/// it.
 fn capped_error(error: &str) -> String {
     if error.chars().count() <= MAX_STORED_ERROR_CHARS {
         return error.to_string();
@@ -1053,7 +1056,10 @@ mod tests {
         }
     }
 
-    /// THREE FAILED CHECKS ARE PERSISTENT ONLY ONCE THEY SPAN HALF AN HOUR.
+    /// THREE FAILED CHECKS ARE PERSISTENT ONLY ONCE THEY SPAN HALF AN HOUR. At the
+    /// two-minute cadence three failures of a check class come 0, 2 and 6 minutes
+    /// apart — a GitHub incident or a slow asset upload, not the broken lane the
+    /// status, the update screen's headline and the loud notice promise.
     #[test]
     fn a_check_class_streak_is_persistent_only_once_it_spans_half_an_hour() {
         let streak = |class: &str, count: u32, newest: &str| {
@@ -1347,7 +1353,8 @@ apply_failures = {PERSISTENT_AFTER}
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// NO SPLICED REASON.
+    /// NO SPLICED REASON. Counts and clocks are per class, but there is ONE
+    /// `last_error`, and it belongs to whichever failure landed LAST.
     #[test]
     fn a_standing_diagnosis_keeps_its_own_reason_across_a_blip() {
         let p = tmp("diagnosis-reason");

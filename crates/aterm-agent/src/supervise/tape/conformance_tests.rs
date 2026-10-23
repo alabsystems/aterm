@@ -225,7 +225,8 @@ impl std::fmt::Debug for Disagreement {
     }
 }
 
-/// Bind `reader` to the model over every case: the disagreements.
+/// Bind `reader` to the model over every case: the disagreements. With `ev`, each read
+/// is a `Recover` step window.
 fn bind(
     model: &Model,
     tape: &Tape,

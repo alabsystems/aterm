@@ -64,7 +64,6 @@ fn a_link_in_the_reserves_place_is_never_followed_or_removed() {
             .is_symlink()
     );
 
-    // The reserve's folder a link to a folder holding a file of that name.
     let elsewhere = tmp.path().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).expect("elsewhere");
     std::fs::write(elsewhere.join("reserve"), b"not the reserve").expect("file");

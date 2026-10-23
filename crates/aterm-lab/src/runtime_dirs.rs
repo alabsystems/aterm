@@ -199,6 +199,7 @@ fn shape(rel: &str) -> Option<Shape> {
         .map(|_| Shape::Socket)
 }
 
+/// The root `path` lies below, its path below that root and its shape (None:
 /// below no root, or of no shape).
 fn below<'a>(path: &'a str, roots: &'a [String]) -> Option<(&'a str, &'a str, Shape)> {
     roots.iter().find_map(|r| {
@@ -319,6 +320,7 @@ pub fn witness(run_dir: &Path, members: &[i32], seen: &mut BTreeSet<Held>) {
     }
 }
 
+/// The birth time of `run_dir`: when the lab came up (unreadable: the far
 /// future, so that nothing is claimed).
 fn run_born(run_dir: &Path) -> i64 {
     crate::sys::entry_stat(run_dir)
@@ -662,6 +664,12 @@ mod tests {
         );
     }
 
+    /// THE LAB TAKES BACK ITS OWN MUSE CODE'S LEASE, SOCKET AND SESSION
+    /// RECORD, AND NOTHING ELSE. NEGATIVE CONTROLS: another process's entries
+    /// that a process of the jail held (a scan of the registry) and that name
+    /// that other process, the registry's shared lock and its directories, an
+    /// entry made before the lab came up, an entry another file replaced since
+    /// the witness saw it, a link in an entry's place, another user's file,
     /// and a socket whose lease is not this run's all stay.
     #[test]
     fn the_lab_takes_back_its_own_muse_code_entries_and_nothing_else() {
@@ -778,6 +786,14 @@ mod tests {
             .collect()
     }
 
+    /// A LISTING BEFORE UP AND AFTER DOWN SHOWS WHAT IS LEFT, whatever the
+    /// witness saw: an entry new since up is left unless it names a live Muse
+    /// Code outside the jail (a lease's `pid`, a record's
+    /// `process_generation_hint`, the socket of such a lease) or is the
+    /// registry's shared structure a first run makes. NEGATIVE CONTROLS: an
+    /// entry of no known shape, a socket whose lease is gone, entries naming
+    /// a dead pid, a `sessions` that is no directory and a lock that is no
+    /// file are left; an entry gone since the listing, an entry outside the
     /// root and one unchanged since up are not counted.
     #[test]
     fn a_listing_before_up_and_after_down_shows_what_is_left() {
@@ -867,6 +883,7 @@ mod tests {
         assert_eq!(rels(&got.left), [LOCK, "sessions"]);
     }
 
+    /// Only the three shapes Muse Code makes per process are ever taken: a
     /// name with a path too many, a dot file or a non-hex endpoint is not.
     #[test]
     fn only_a_lease_its_socket_and_a_session_record_have_a_shape() {
@@ -893,6 +910,7 @@ mod tests {
         }
     }
 
+    /// Actual traversal/recheck/post-down verdict: clean and absent are known;
     /// stat, directory and claimed-file errors cannot certify an absence.
     #[test]
     fn a_runtime_absence_needs_every_listing_and_recheck() {

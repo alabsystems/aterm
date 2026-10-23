@@ -215,6 +215,7 @@ mod imp {
     const CS_OPS_VALIDATION_CATEGORY: u32 = 17;
 
     unsafe extern "C" {
+        /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`
         /// — xnu `bsd/sys/codesign.h`; no SDK header declares it.
         fn csops(
             pid: libc::pid_t,
@@ -232,6 +233,7 @@ mod imp {
         (rc == 0).then_some(out)
     }
 
+    /// The text of one blob answer of `ops` for `pid` (above 0); `None` when
     /// refused, longer than [`BLOB_CAP`] or not decoded.
     fn text(pid: libc::pid_t, ops: u32) -> Option<String> {
         let mut blob = [0u8; BLOB_CAP];

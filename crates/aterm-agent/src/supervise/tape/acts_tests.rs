@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The counterfactual cursor over hand-made tapes: what it serves, from
-//! where, and what it refuses — each case asserted on the values served and
-//! the account, never on prose.
+//! Counterfactual cursor tests over hand-made tapes.
 
 use super::*;
 use crate::supervise::CtlReply;
@@ -307,7 +305,6 @@ fn a_wait_with_other_arguments_is_tainted() {
     );
     assert_eq!((c.account.tainted, c.position()), (1, 1));
     assert_eq!(c.now().0, 1_000, "the stamp of the record taken");
-    // The same wait asked again: served again, its timeout passed.
     assert!(
         c.exchange(
             doors::CTL,

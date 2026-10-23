@@ -5,8 +5,8 @@
 // project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Horizontal Header Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/hhea) implementation.
+//! A [Horizontal Header Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/hhea)
+//! implementation.
 
 use crate::parser::Stream;
 
@@ -26,8 +26,6 @@ pub struct Table {
 impl Table {
     /// Parses a table from raw data.
     pub fn parse(data: &[u8]) -> Option<Self> {
-        // Do not check the exact length, because some fonts include
-        // padding in table's length in table records, which is incorrect.
         if data.len() < 36 {
             return None;
         }

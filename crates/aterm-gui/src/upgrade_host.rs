@@ -20,7 +20,8 @@ pub(crate) fn now_s() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
-/// How long `Not today` holds an upgrade (`--defer`): a day.
+/// How long `Not today` holds an upgrade (`--defer`): a day. It lapses on
+/// its own, and an upgrade still behind is shown again when it does.
 pub(crate) const NOT_TODAY_S: u64 = 24 * 3_600;
 
 /// An upgrade action pressed by the owner on a tab.
@@ -205,6 +206,8 @@ struct StallRow {
     /// flip is restated in place, the stall and its buttons unchanged.
     person: bool,
     /// How long its tab has been behind, in the words it last said (`Row::age_said`, e.g.
+    /// `6 h`; only an `overdue` row's words, and an `unwatched` row's since its last check,
+    /// carry one): a standing row restates a grown age in place, never as a new row.
     behind: Option<String>,
     /// Where its words last said its tab is ([`message_reporters::UpgradeSpot`]'s
     /// `place`: `in tab 2`, `in window 2, tab 1`): when the tab moves, or a window opens or
@@ -347,7 +350,10 @@ impl UpgradeView {
         }
     }
 
-    /// The host's rows, with the owner's words they were read too soon to carry.
+    /// The host's rows, with the owner's words they were read too soon to carry. The host
+    /// reads the upgrades and a word is written, both off the winit thread, so a summary
+    /// read between two tabs' words can arrive after every word landed and read the later
+    /// tabs overdue again.
     fn words_landed(&mut self, rows: &mut [Row]) {
         self.worded.retain(|tab, (word, at, pressed_on)| {
             at.elapsed() < WORD_LAG

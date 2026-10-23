@@ -1918,7 +1918,10 @@ fn the_expansion_box_after_a_denial_is_read_whole() {
     }
 }
 
-/// A SANDBOX EXPANSION REFUSED WITH ESC (measured).
+/// A SANDBOX EXPANSION REFUSED WITH ESC (measured). The box the model's own
+/// call raised, and the one a `curl` raised before it ran, end the turn as
+/// every refused box does — the call's row marked `-`, `ℹ Request
+/// cancelled.` — the person's stop.
 #[test]
 fn a_refused_expansion_is_the_persons_stop_or_the_models_turn() {
     for text in [SANDBOX_RETRY_REFUSED, SANDBOX_TOOLS_NETWORK_REFUSED] {

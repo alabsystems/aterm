@@ -43,8 +43,6 @@ fn the_profile_s_other_lines_are_byte_identical_after_develop_and_no_develop() {
     );
     assert_eq!(edited(WRITTEN, None).unwrap(), WRITTEN);
 
-    // No final newline: the table appended keeps the file unterminated, and its removal
-    // gives the file back byte for byte. No file at all.
     let unterminated = "[github]\naccount = \"alice\"\nowner = \"alice\"\ntoken_file = \"/t\"";
     let with_table = edited(unterminated, Some(&one)).unwrap();
     assert_eq!(
@@ -59,7 +57,6 @@ fn the_profile_s_other_lines_are_byte_identical_after_develop_and_no_develop() {
     );
     assert_eq!(edited(&edited("", Some(&one)).unwrap(), None).unwrap(), "");
 
-    // A table the person placed mid-file, with its own comments and a multi-line array.
     let middle = "# top\n[develop]   # mine\n# which ones\ncheckouts = [\n  \"~/aterm\",\n]  # \
                   end\n# about github\n[github]\naccount = \"alice\"\nowner = \
                   \"alice\"\ntoken_file = \"/t\"\n";
@@ -75,17 +72,14 @@ fn the_profile_s_other_lines_are_byte_identical_after_develop_and_no_develop() {
         "# top\n# about github\n[github]\naccount = \"alice\"\nowner = \"alice\"\ntoken_file \
          = \"/t\"\n"
     );
-    // A table header with no checkouts key gains one line, under the header.
     assert_eq!(
         edited("[develop]\n", Some(&one)).unwrap(),
         "[develop]\ncheckouts = [\"~/aterm\"]\n"
     );
 
-    // Develop spelled other than as a header table is the person's to edit.
     assert!(edited("develop.checkouts = []\n", Some(&one)).is_err());
     assert!(edited("develop = { checkouts = [] }\n", None).is_err());
 
-    // Negative control: what a decode-and-reserialize would write.
     let value: aterm_toml::Value = aterm_toml::from_str(WRITTEN).unwrap();
     let rewritten = aterm_toml::to_string(&value).unwrap();
     assert!(!rewritten.starts_with(WRITTEN), "{rewritten}");
@@ -217,7 +211,6 @@ fn the_develop_layer_follows_the_record_and_never_guesses() {
             "develop.workspace-tools@~/aterm"
         ]
     );
-    // Outside any workspace, with no [github] table to find one through.
     let (sys, alice) = alice_with(None);
     let refused = compose_for(&sys, &alice, Some(Path::new("/Users//alice")), Some(true))
         .err()
@@ -230,9 +223,7 @@ fn the_develop_layer_follows_the_record_and_never_guesses() {
     );
 }
 
-/// The git reads [`checkout::kept_here`] makes of alice's `~/aterm`: the top of a worktree
-/// whose one origin is `url`, HEAD on `main` (detached when `branch` is false), and `git
-/// status` saying `status`.
+/// Scripts the local git reads [`checkout::kept_here`] performs on `~/aterm`.
 pub(crate) fn script_local(sys: &Fake, alice: &User, url: &str, branch: bool, status: &str) {
     let path = Path::new("/Users//alice/aterm");
     for (args, ran) in [
@@ -453,7 +444,6 @@ fn workspace_tools_run_no_code_from_a_tree_init_leaves_as_it_is_and_never_rewrit
         }
     );
 
-    // Negative control: clean, on its branch, admitted, it is read with `--check`.
     let (sys, alice) = alice_with(None);
     script_local(&sys, &alice, ORIGIN, true, "");
     sys.on(CHECK, Ran::exit(0, "verify provision: PASS — 2 rows\n"));
@@ -796,7 +786,6 @@ fn the_submodule_is_checked_out_only_where_that_loses_nothing() {
     );
     let first = bus.repos.head(&bus.inner());
 
-    // The tree's gitlink moved under a fast-forward; the submodule lags it.
     let two = bus.astream_commit("lib.rs", "two\n");
     bus.bump(&two);
     bus.fast_forward();
@@ -889,7 +878,6 @@ fn a_person_s_astream_branch_and_uncommitted_bump_are_left_as_they_are() {
                 }
             }
             _ => {
-                // The tree's commit moves on; the person's topic branched before it.
                 let base = bus.repos.head(&bus.astream_seed);
                 let two = bus.astream_commit("lib.rs", "two\n");
                 bus.bump(&two);
@@ -929,7 +917,6 @@ fn a_person_s_astream_branch_and_uncommitted_bump_are_left_as_they_are() {
         assert!(!updated(&sys.record()), "{case}: {:?}", sys.record());
         assert_eq!(bus.state(), before, "{case}");
 
-        // Negative control: what the first S8 build ran.
         bus.repos.g(
             &bus.work,
             &["submodule", "update", "--init", "--", SUBMODULE],
@@ -971,7 +958,6 @@ fn a_configured_update_mode_never_makes_a_commit_in_the_submodule() {
         bus.fast_forward();
         item.apply(&sys, &ctx).unwrap();
         assert_eq!(bus.state().0, a);
-        // astream's history is rewound to a line without `a`, and the tree records it.
         bus.repos.g(
             &bus.astream_seed,
             &["switch", "--quiet", "-c", "other", &one],
@@ -1024,7 +1010,6 @@ fn a_conflicted_submodule_is_never_updated() {
         Probe::Change { from, .. } => assert!(from.contains("not at the commit"), "{from}"),
         other => panic!("{other:?}"),
     }
-    // Two astream commits on diverging lines, so git cannot fast-forward the gitlink.
     let one = bus.repos.head(&bus.astream_seed);
     let p = bus.astream_commit("p.rs", "p\n");
     bus.repos.g(

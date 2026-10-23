@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The producer's half of LINEAGE over synthetic trees: the payload scan reads compiled
-//! output only, and a stamped `LINEAGE` is admitted by the client's own check against the
-//! shipped bytes — and refused the moment the record or a byte it names is edited.
+//! The producer's half of LINEAGE over synthetic trees.
 
 use std::path::{Path, PathBuf};
 
@@ -146,7 +144,6 @@ fn scan_tree_reads_compiled_output_only() {
     let stock = format!("/rustc/{STOCK}/library/std/src/x.rs");
     std::fs::write(d.join("bin/ay"), object(stock.as_bytes())).expect("write");
     std::fs::write(d.join("bin/clean"), object(b"nothing foreign")).expect("write");
-    // A text file that QUOTES a stock path is documentation, not compiled output.
     std::fs::write(d.join("README"), stock.as_bytes()).expect("write");
     std::fs::write(
         d.join("lib/rustlib/t/lib/libstd-1.rlib"),
@@ -177,10 +174,7 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
     toolchain(&stage, b"stripped");
     std::fs::copy(seal.join(SEED_MINT_FILE), stage.join(SEED_MINT_FILE)).expect("copy receipt");
     let probe = probe_says(trust_vv(TRUST));
-    // Before the stamp, the stripped bytes are not what SEED-MINT compared.
     assert!(check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe).is_err());
-    // The stamp vouches only for the source's own compiler and receipt: a staged trustc of
-    // another commit, or a staged SEED-MINT other than the source's, stamps nothing.
     let other = "4444444444444444444444444444444444444444";
     let staged = |p: &Path| p.components().any(|c| c.as_os_str() == "stage");
     let stage_says_other = |p: &Path| Ok(trust_vv(if staged(p) { other } else { TRUST }));
@@ -208,7 +202,6 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
         check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe).expect("admitted");
     assert!(matches!(admitted.lineage, LineageProof::Lineage { .. }));
 
-    // Tamper with the record.
     let rec = std::fs::read_to_string(stage.join(LINEAGE_FILE)).expect("read");
     std::fs::write(
         stage.join(LINEAGE_FILE),
@@ -225,7 +218,6 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
         "{err:?}"
     );
     std::fs::write(stage.join(LINEAGE_FILE), &rec).expect("restore");
-    // Tamper with a byte it names.
     std::fs::write(stage.join("bin/targo"), object(b"targo swapped")).expect("write");
     let err = check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe)
         .expect_err("edited bytes");
@@ -233,8 +225,6 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
     std::fs::write(stage.join("bin/targo"), object(b"targo stripped")).expect("restore");
     check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe)
         .expect("the restored tree is admitted again");
-    // Swap the driver — what trust-mc 20065 shipped from rustup's nightly (TP-7). Nothing
-    // but the record's digest names the driver a stamped tree runs.
     let driver = stage.join("lib/librustc_driver-0123456789abcdef.dylib");
     let shipped_driver = std::fs::read(&driver).expect("read driver");
     std::fs::write(&driver, object(b"driver swapped")).expect("write");
@@ -245,8 +235,6 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
         "{err:?}"
     );
     std::fs::write(&driver, shipped_driver).expect("restore");
-    // Replace the tree's SEED-MINT with another receipt of the SAME commit, one that passes
-    // every check of its own: the record is bound to the receipt it was stamped against.
     let stamped_mint = std::fs::read(stage.join(SEED_MINT_FILE)).expect("read receipt");
     seed_mint(
         &stage,
@@ -264,7 +252,6 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
         "{err:?}"
     );
     std::fs::write(stage.join(SEED_MINT_FILE), &stamped_mint).expect("restore");
-    // …and the record's own digest of it, edited.
     let receipt = format!(
         "lineage_receipt_sha256={}",
         sha(&stage.join(SEED_MINT_FILE))
@@ -289,7 +276,6 @@ fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
     check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe)
         .expect("the restored tree is admitted again");
 
-    // A source whose lineage is unproven stamps nothing.
     std::fs::remove_file(seal.join(SEED_MINT_FILE)).expect("rm");
     let _ = std::fs::remove_file(stage.join(LINEAGE_FILE));
     assert!(lineage::stamp_with(&stage, &seal_bin, &probe).is_err());

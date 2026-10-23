@@ -74,6 +74,7 @@ struct CentralDirectory {
     size: u64,
 }
 
+/// Find the end-of-central-directory record by a bounded backward scan and read the
 /// central directory's span from it (or from the ZIP64 record it points at).
 fn locate(file: &mut File, len: u64) -> io::Result<CentralDirectory> {
     if len < EOCD_LEN {
@@ -136,6 +137,7 @@ fn locate(file: &mut File, len: u64) -> io::Result<CentralDirectory> {
     Ok(cd)
 }
 
+/// The ZIP64 locator sits immediately before the end record and names the ZIP64 end
 /// record, which carries the 64-bit count/size/offset.
 fn locate_zip64(file: &mut File, eocd_abs: u64) -> io::Result<CentralDirectory> {
     if eocd_abs < 20 {
@@ -287,6 +289,7 @@ fn read_record(file: &mut File, at: u64, end: u64) -> io::Result<(Record, u64)> 
     ))
 }
 
+/// Where a record's body starts: past its local header, whose name/extra lengths are
 /// the only thing read from it. The body must end before the central directory.
 fn body_offset(file: &mut File, rec: &Record, cd_offset: u64) -> io::Result<u64> {
     let hdr_end = rec
@@ -317,6 +320,7 @@ fn body_offset(file: &mut File, rec: &Record, cd_offset: u64) -> io::Result<u64>
     Ok(data)
 }
 
+/// Regular / directory / symlink / other, from the name's trailing slash and the Unix
 /// type bits (when the host supplied them).
 fn classify(name: &[u8], unix_mode: u32) -> EntryKind {
     if name.last() == Some(&b'/') {
@@ -345,6 +349,8 @@ fn name_to_path(bytes: &[u8]) -> io::Result<PathBuf> {
     }
 }
 
+/// The body of `rec` as a reader of its uncompressed bytes, bounded on the compressed side
+/// by `Take` (a body never reads past its own span) and on the uncompressed side by the
 /// caller's cap.
 fn open_body<'f>(
     file: &'f mut File,

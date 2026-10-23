@@ -196,7 +196,9 @@ fn typing_dog_after_the_gate_pops_the_dog_cameo() {
     );
 }
 
-/// The word engine's "a human typed" witness is wired.
+/// The word engine's "a human typed" witness is wired. A spent cat re-arms only on a committed
+/// edit keystroke, a signal only this input path produces, so a dropped seam would silently stop
+/// every retype replaying its cat.
 #[test]
 fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
     use aterm_types::keyboard::Key;
@@ -243,7 +245,9 @@ fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
     );
 }
 
-/// An app whose session sink writes to a test-owned pipe.
+/// An app whose session sink writes to a test-owned pipe. The private fd matters: the ordering
+/// FIFO is a process-global registry keyed by PTY master, and every plain `headless_for_test`
+/// shares master `-1`, so pinning that key would divert concurrent tests' keystrokes.
 #[cfg(unix)]
 pub(super) fn app_with_private_pty() -> (
     App,
@@ -625,7 +629,10 @@ fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
     }
 }
 
-/// A key queued behind a draining paste keeps its licence.
+/// A key queued behind a draining paste keeps its licence. A typed key's
+/// arrival stamp is revoked at enqueue and the prelude re-stamps it at its
+/// delivery receipt (one stamp, one echo, as for an inline key: without the
+/// re-stamp the hop reads as program output, `no-fresh-hint`).
 #[cfg(unix)]
 #[test]
 fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
@@ -753,7 +760,10 @@ fn a_queued_one_shot_key_keeps_its_licence_at_delivery() {
     }
 }
 
-/// A Tab's dispatch arm claims no hop refused before the key.
+/// A Tab's dispatch arm claims no hop refused before the key. A bare Tab / ⌃V is written inline
+/// and armed at dispatch (`note_insert_armed`) without the late-receipt claim, whose backward
+/// window (`INSERT_RETRO_FRESH`) is for a spill-held receipt and would light a refused prompt
+/// print as `insert`.
 #[cfg(unix)]
 #[test]
 fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
@@ -831,7 +841,10 @@ fn a_tabs_dispatch_arm_claims_no_hop_refused_before_the_key() {
     }
 }
 
-/// A key release queued behind a draining paste carries no ticket.
+/// A key release queued behind a draining paste carries no ticket. Under Kitty flags 2|8
+/// (REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESC) a release (`CSI n;1:3 u`) is written like a
+/// press but banks nothing at dispatch; a ticket would re-stamp the key-up as a typed press or
+/// arm a second insert licence.
 #[cfg(unix)]
 #[test]
 fn a_queued_key_release_publishes_no_receipt() {
@@ -883,7 +896,10 @@ fn a_queued_key_release_publishes_no_receipt() {
     }
 }
 
-/// A queued ticket carries its dispatch instant.
+/// A queued ticket carries its dispatch instant. The insert's late-receipt
+/// claim reaches back `INSERT_RETRO_FRESH` from the writer's completion,
+/// which for a Tab queued behind a short paste reaches past the Tab's own
+/// press.
 #[cfg(unix)]
 #[test]
 fn a_queued_ticket_carries_its_dispatch_instant() {
@@ -1094,7 +1110,11 @@ const TTY_MODES: [(&str, SetMode, bool); 3] = [
     ),
 ];
 
-/// A press the tty will not echo banks no credit.
+/// A press the tty will not echo banks no credit. The host reads the pty's
+/// ECHO/ICANON off the session sink at the key (iTerm2's password-mode
+/// rule); a press into canonical no-echo mode arms no typed licence and no
+/// press credit on either engine, so a program write on that row has
+/// nothing to spend.
 #[cfg(unix)]
 #[test]
 fn a_press_the_tty_will_not_echo_banks_no_credit() {
@@ -1130,7 +1150,8 @@ fn a_press_the_tty_will_not_echo_banks_no_credit() {
     }
 }
 
-/// A password prompt clicks one tone and rings no ting.
+/// A password prompt clicks one tone and rings no ting. Real pty pairs and the audio host's
+/// capture tap; `a`, `A` (Shift), `1`, `.`, a space and a bare Shift go into each.
 #[cfg(unix)]
 #[test]
 fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
@@ -1293,7 +1314,10 @@ fn paste_drained(
     assert!(!super::paste_order::is_ordering(sink), "the paste drained");
 }
 
-/// A Backspace into a committed IME run gives back one glyph's credit.
+/// A Backspace into a committed IME run gives back one glyph's credit. The
+/// host banks an IME commit as one press priced at its summed width, and
+/// remembers the last typed dispatch's per-grapheme widths to price each
+/// Backspace: `日本語` (6) ⌫ → 4 ⌫ → 2 ⌫ → 0.
 #[cfg(unix)]
 #[test]
 fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
@@ -1340,7 +1364,9 @@ fn a_backspace_into_an_ime_run_gives_back_one_glyphs_credit() {
     close_pty(app, sink, master, slave);
 }
 
-/// A Backspace erasing a zero-width glyph gives back a priced nothing.
+/// A Backspace erasing a zero-width glyph gives back a priced nothing. `\u{0301}日本` (a
+/// base-less combining mark, then two CJK glyphs) prices 0, 2, 2 and banks one press of four
+/// cells.
 #[cfg(unix)]
 #[test]
 fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
@@ -1383,7 +1409,11 @@ fn a_backspace_erasing_a_zero_width_glyph_gives_back_a_priced_nothing() {
     close_pty(app, sink, master, slave);
 }
 
-/// A key typed after a paste keeps the paste's price zeros.
+/// A key typed after a paste keeps the paste's price zeros. A typed press
+/// keeps the memory and appends its own widths behind the zeros, so the
+/// memory is the row's erasable tail in order: under a stall `abc`, paste
+/// `yz`, `d`, then Backspaces retire `d`, nothing for `z`, nothing for `y`,
+/// then `c`.
 #[cfg(unix)]
 #[test]
 fn a_key_typed_after_a_paste_keeps_the_pastes_price_zeros() {
@@ -1483,7 +1513,10 @@ fn a_paste_the_tty_will_not_echo_publishes_no_insert_receipt() {
     }
 }
 
-/// A bare Tab the tty will not echo arms no insert and no gesture.
+/// A bare Tab the tty will not echo arms no insert and no gesture. A bare
+/// Tab / ⌃V has `typed_forward == None`, so the tty's verdict is read
+/// separately: a press the tty will not echo is neither a licence nor a
+/// credit in the classes that read the tty.
 #[cfg(unix)]
 #[test]
 fn a_bare_tab_the_tty_will_not_echo_arms_no_insert() {

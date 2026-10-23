@@ -2,15 +2,11 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A tmux passthrough wrapper (`ESC P tmux; <payload, ESC doubled> ESC \`)
-//! that reached the parser itself reads as its payload would have read bare,
-//! as tmux 3.5a unwraps it (`crate::tmux`).
+//! Tmux passthrough wrapper (`ESC P tmux; ... ESC \`) parser tests.
 
 use super::*;
 
-/// What `parser` delivers for `bytes` cut at every byte, and one byte at a
-/// time: every feeding must agree with the whole, so the first answer stands
-/// for all of them.
+/// What `parser` delivers for `bytes` cut at every byte, and one byte at a time.
 fn feed_every_way(c1: bool, bytes: &[u8]) -> RecordingSink {
     let fresh = || {
         let mut parser = Parser::new();
@@ -37,8 +33,7 @@ fn feed_every_way(c1: bool, bytes: &[u8]) -> RecordingSink {
     whole
 }
 
-/// `payload` in tmux's passthrough wrapper, every ESC doubled, as a program
-/// that finds `TMUX` in its environment writes it.
+/// `payload` in tmux's passthrough wrapper.
 fn wrapped(payload: &[u8]) -> Vec<u8> {
     let mut out = b"\x1bPtmux;".to_vec();
     for &byte in payload {
@@ -51,8 +46,7 @@ fn wrapped(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The payloads a program wraps: the queries tmux would not answer, the
-/// pictures it would not draw, and plain sequences beside them.
+/// The payloads a program wraps.
 const PAYLOADS: [&[u8]; 9] = [
     b"\x1bP$qm\x1b\\",
     b"\x1bP+q544E\x1b\\",
@@ -71,9 +65,6 @@ const PAYLOADS: [&[u8]; 9] = [
 /// in both C1 modes. tmux 3.5a, given these wrappers with `allow-passthrough
 /// on`, wrote exactly the bare payloads to its own terminal (measured
 /// 2026-10-19).
-///
-/// RED before the unwrap: the wrapped DECRQSS hooked `t`, was broken off by
-/// its doubled ESC (one cancel), and its own ST, doubled, broke it off again.
 #[test]
 fn a_wrapped_sequence_reads_as_it_reads_bare() {
     for c1 in [false, true] {
@@ -87,11 +78,9 @@ fn a_wrapped_sequence_reads_as_it_reads_bare() {
                 String::from_utf8_lossy(payload)
             );
         }
-        // Two wrappers back to back.
         let bare = feed_every_way(c1, b"\x1bP$qm\x1b\\\x1bP+q544E\x1b\\");
         let two = [wrapped(b"\x1bP$qm\x1b\\"), wrapped(b"\x1bP+q544E\x1b\\")].concat();
         assert_eq!(feed_every_way(c1, &two), bare, "c1={c1} back to back");
-        // A CSI a payload leaves unfinished goes on after its wrapper.
         let bare = feed_every_way(c1, b"\x1b[1;2Hok");
         let split = [&wrapped(b"\x1b[1;")[..], b"2Hok"].concat();
         assert_eq!(feed_every_way(c1, &split), bare, "c1={c1} unfinished");
@@ -154,7 +143,6 @@ fn a_reset_ends_the_wrapper() {
             assert_eq!(parser.tmux_passthrough(), TmuxPassthrough::Off, "{head:?}");
             let got = feed_every_way(c1, &[head, after].concat());
             assert_eq!(got, bare, "c1={c1} {head:?}");
-            // An ESC right after the reset is read bare, not as the wrapper's.
             let mut parser = Parser::new();
             parser.c1_controls_enabled = c1;
             let mut sink = RecordingSink::default();
@@ -184,9 +172,6 @@ fn a_head_that_is_not_tmux_is_an_ignored_dcs() {
         assert_ne!(sink, feed_every_way(c1, payload), "c1={c1}");
         assert_eq!((sink.dcs_unhooks, sink.dcs_cancels), (0, 1), "c1={c1}");
         assert_eq!(sink.dcs_hooks, vec![(vec![], b"$".to_vec(), b'q')]);
-        // `ESC P t` with a parameter or an intermediate is no wrapper's head,
-        // and neither is any other DCS ending in `t`: each is ignored to its
-        // terminator, and what follows reads from Ground.
         for head in [
             &b"\x1bP1tmux;"[..],
             b"\x1bP tmux;",
@@ -317,8 +302,6 @@ fn a_carry_inside_a_wrapper_continues_in_the_successor() {
                 outgoing.tmux_passthrough(),
                 "c1={c1} cut {cut}"
             );
-            // A carried APC string has no consumer in the successor: it is
-            // swallowed there, and only what follows it is compared.
             let swallows = outgoing.carry_swallows_sequence();
             let mut after = RecordingSink::default();
             successor.advance_fast(&stream[cut..], &mut after);

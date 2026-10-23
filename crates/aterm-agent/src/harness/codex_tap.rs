@@ -157,13 +157,13 @@ impl RolloutTap {
 
     /// Whether it bound a rollout.
     #[must_use]
-    pub fn is_bound(&self) -> bool {
+    pub const fn is_bound(&self) -> bool {
         self.bound.is_some()
     }
 
     /// Why the last read bound nothing, while it binds nothing.
     #[must_use]
-    pub fn refused(&self) -> Option<Refusal> {
+    pub const fn refused(&self) -> Option<Refusal> {
         self.refused
     }
 

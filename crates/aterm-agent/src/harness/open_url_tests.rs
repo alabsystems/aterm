@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-open-url`: the profile's directory read from Chrome's own state,
-//! the command it runs, and every refusal said without the URL.
+//! Tests for `aterm-open-url` profile resolution, execution, and URL-free refusals.
 
 use super::*;
 
-/// Chrome's `Local State`, as much of it as the opener reads, for three
-/// profiles: `Default` ("Person 1"), `Profile 2` ("Claude m7-a"), `Profile 3`
-/// ("Twin") and `Profile 4` ("Twin").
+/// Chrome's `Local State`, as much of it as the opener reads, for four profiles.
 const LOCAL_STATE: &str = r#"{
   "browser": {"enabled_labs_experiments": []},
   "profile": {
@@ -22,8 +19,7 @@ const LOCAL_STATE: &str = r#"{
   }
 }"#;
 
-/// A URL of the shape Claude Code hands its opener (the hint an example.com
-/// address).
+/// A URL of the shape Claude Code hands its opener.
 const URL: &str = "https://claude.ai/oauth/authorize?login_hint=a%40example.com&state=s";
 
 #[test]
@@ -36,13 +32,10 @@ fn a_profile_is_found_by_its_display_name_and_only_when_it_is_one() {
         profile_dir_of(LOCAL_STATE, "Person 1").as_deref(),
         Some("Default")
     );
-    // The directory's own name is no display name.
     assert_eq!(profile_dir_of(LOCAL_STATE, "Profile 2"), None);
-    // Two of one name: which the owner meant is not known.
     assert_eq!(profile_dir_of(LOCAL_STATE, "Twin"), None);
     assert_eq!(profile_dir_of(LOCAL_STATE, "Nobody"), None);
     assert_eq!(profile_dir_of("not json", "Claude m7-a"), None);
-    // A directory name that would be a path or an option is none.
     let odd = r#"{"profile":{"info_cache":{"../x":{"name":"A"},"-y":{"name":"B"}}}}"#;
     assert_eq!(profile_dir_of(odd, "A"), None);
     assert_eq!(profile_dir_of(odd, "B"), None);
@@ -86,8 +79,7 @@ fn the_url_opens_in_that_profile_and_is_never_said() {
     );
 }
 
-/// One refusal case: the opener's arguments, the profile named, Chrome's
-/// state as read, and the exit wanted.
+/// One refusal case.
 type Case<'a> = (
     &'a [String],
     Option<&'a str>,
@@ -129,7 +121,6 @@ fn every_refusal_is_exit_one_and_names_no_url() {
         assert!(said.starts_with(OPENER), "{said}");
         assert!(!said.contains("claude.ai"), "the URL is never said: {said}");
     }
-    // `open` refusing is the same.
     if cfg!(target_os = "macos") {
         let (code, said) = open_with(&[URL.to_string()], Some("Claude m7-a"), &state, &mut |_| {
             false
@@ -196,7 +187,6 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
         Some("https://claude.ai/magic?token=abc123&state=st_99")
     );
 
-    // Base64-encoded MIME part (`<a href="https://claude.ai/magic?token=b64_ok&amp;state=s9">Sign in</a>`):
     let b64_mime_eml = concat!(
         "From: Claude <no-reply@claude.ai>\r\n",
         "To: <m15-3@example.test>\r\n",
@@ -213,7 +203,6 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
         Some("https://claude.ai/magic?token=b64_ok&state=s9")
     );
 
-    // JSON email with recipient array and HTML body:
     let json_eml = r#"{"to":["m15-3@example.test"],"html":"<p><a href=\"https://claude.ai/magic?token=json_html_ok&amp;state=s2\">Log in</a></p>"}"#;
     assert_eq!(
         extract_magic_link_from_email(json_eml, Some("m15-3@example.test")).as_deref(),
@@ -314,8 +303,6 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
     );
     assert_eq!(requests[3].3, None, "no consent body at local callback");
 
-    // Two-step magic-link confirmation form -> OAuth scope approval form -> callback,
-    // including an HTTP proxy `200 Connection established` preamble on the magic-link hop.
     let confirm_magic = concat!(
         "HTTP/1.1 200 Connection established\r\nProxy-Agent: test\r\n\r\n",
         "HTTP/1.1 200 OK\r\nSet-Cookie: magic_ok=1; Path=/\r\n\r\n",
@@ -340,8 +327,6 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
     assert_eq!(requests2[3].1, "https://claude.ai/oauth/approve");
     assert!(requests2[4].2.is_empty());
 
-    // Neither an email nor an HTTP response can expand the origin admitted
-    // by the authorize request. Refusal happens before the transport call.
     for magic in [
         "https://attacker.example/magic",
         "https://claude.ai.attacker.example/magic",
@@ -384,8 +369,6 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
         assert_eq!(requests.len(), 2, "neither consent body nor cookie leaked");
     }
 
-    // The callback is an exact endpoint and state, not a textual prefix or
-    // any loopback URL that happens to contain the word callback.
     for destination in [
         "http://127.0.0.1:9000/callback/other?code=x&state=expected",
         "http://127.0.0.1:9001/callback?code=x&state=expected",
@@ -406,8 +389,6 @@ fn mailbox_links_and_approval_keep_their_recipient_origin_and_callback() {
         assert_eq!(requests.len(), 3, "no request to a different callback");
     }
 
-    // Unknown/new provider origins retain the existing manual-browser path;
-    // they do not cause a mailbox read or any network request.
     for unknown in [
         "https://attacker.example/oauth/authorize",
         "https://claude.ai.attacker.example/oauth/authorize",

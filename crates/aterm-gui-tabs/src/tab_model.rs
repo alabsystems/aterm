@@ -1474,7 +1474,7 @@ pub struct Tab {
 
 impl Tab {
     #[must_use]
-    pub fn new(id: TabId, view: ViewId, presentation: TabPresentation) -> Self {
+    pub const fn new(id: TabId, view: ViewId, presentation: TabPresentation) -> Self {
         Self {
             id,
             root: SplitTree::leaf(view),
@@ -1485,7 +1485,7 @@ impl Tab {
     }
 
     #[must_use]
-    pub fn from_root(
+    pub const fn from_root(
         id: TabId,
         root: SplitTree<ViewId>,
         focus: ViewId,

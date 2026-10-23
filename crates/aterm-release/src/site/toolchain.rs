@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! How much of the pinned ALab toolset the atpkg index publishes per Mac
-//! architecture — the Intel mark's second fact (docs/DESIGN-intel-just-works-2026-09-14.md
-//! §2.2, §3.3). Read from the newest `atpkg-index-<n>` release and the manifests its
-//! stable channel pins; these copies are read, not verified (nothing installs from
-//! them), and a pinned manifest that is missing is a refusal, never a guess.
+//! Mac architecture coverage of the pinned ALab toolset in the atpkg index.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -82,9 +78,9 @@ fn parse(text: &str, what: &str) -> Result<Value, Unknown> {
     aterm_toml::from_str(text).map_err(|e| Unknown::Other(format!("{what} is not TOML: {e}")))
 }
 
-/// Per Mac architecture, `{program: build}` as that darwin triple sees the stable
-/// channel: `pin` with the triple's `pin_by_target` overlay laid over it (atpkg
-/// `Channel::for_target`), restricted to the programs the index names.
+/// Per Mac architecture, the stable channel's `{program: build}` pins with that darwin
+/// triple's `pin_by_target` overlay laid over them, restricted to the programs the
+/// index names.
 ///
 /// # Errors
 /// Not exactly one stable channel, or a pin that is not a program name and a build.
@@ -140,12 +136,11 @@ pub fn mac_pins(index: &Value) -> Result<[BTreeMap<String, u64>; 2], Unknown> {
     Ok(out)
 }
 
-/// The coverage of each Mac architecture over the stable pins, reading each pinned
-/// manifest through `manifest` (by name; `None` when it is not there).
+/// The coverage of each Mac architecture over the stable pins.
 ///
 /// # Errors
-/// An index [`mac_pins`] refuses, an architecture nothing is pinned for, a missing
-/// pinned manifest, or one that names another program or build.
+/// If [`mac_pins`] refuses the index, an arch has no pins, or a pinned manifest is missing or
+/// invalid.
 pub fn levels(index: &Value, manifest: &dyn Fn(&str) -> Option<String>) -> Result<Levels, Unknown> {
     let mut levels = [Coverage::Absent; 2];
     for (slot, pins) in mac_pins(index)?.iter().enumerate() {
@@ -207,21 +202,18 @@ pub fn index_release(releases: &[Release]) -> Option<&Release> {
         .map(|(_, r)| r)
 }
 
-/// What [`fetch`] read: the index release's tag, its `index.toml`, and every pinned
-/// manifest by name.
+/// What [`fetch`] read.
 pub struct Fetched {
     pub tag: String,
     pub index: String,
     pub manifests: BTreeMap<String, String>,
 }
 
-/// The newest index and every manifest its stable channel pins for a Mac, from the
-/// release download host `base` (`https://github.com`, or a `file://` tree), read
-/// through `get`.
+/// The newest index and every manifest its stable channel pins for a Mac.
 ///
 /// # Errors
-/// No index release, a failed read, or an index that names no repository for a
-/// pinned program.
+/// No index release, a failed read, an index that is not TOML or that [`mac_pins`] refuses, or one
+/// that names no repository for a pinned program.
 pub fn fetch(
     releases: &[Release],
     slug: &str,
@@ -240,7 +232,6 @@ pub fn fetch(
     };
     let index_text = read(repo, &index_release.tag, "index.toml")?;
     let index = parse(&index_text, "index.toml")?;
-    // keyed by manifest, not program: each architecture's overlay may pin its own build
     let mut wanted = std::collections::BTreeSet::new();
     for pins in mac_pins(&index)? {
         wanted.extend(pins);
@@ -309,8 +300,6 @@ mod tests {
 
     #[test]
     fn the_fixture_index_is_full_on_arm_and_partial_on_intel() {
-        // ay and claude carry both darwin triples, trust only aarch64; a pin the index
-        // names no program for is not the set's
         let files = read_dir(&fixture());
         assert_eq!(
             levels_of(&files).unwrap(),
@@ -417,8 +406,6 @@ mod tests {
             fetched_levels(&f).unwrap(),
             [Coverage::Partial, Coverage::Full]
         );
-        // an overlay pinning another build for one architecture: both builds are read,
-        // and each architecture is judged on its own
         let mut overlaid = served.clone();
         let index = "file:///dl/alabsystems/aterm/releases/download/atpkg-index-50/index.toml";
         overlaid.insert(

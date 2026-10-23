@@ -2,16 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! [`AghHost`]: the release host over agh (docs/DESIGN-agh-2026-10-19.md §10.3). M1 is the
-//! read half, used by tests only; production runs `RestHost` (init-system S15) until M2
-//! swaps both halves in one commit.
-//!
-//! Three rules hold for every operation:
-//! * a host serves one owner: a slug of another owner is refused before anything is sent,
-//!   because the shared Router would otherwise route the call as that owner's identity;
-//! * every draft-inclusive read is WriterRead, so the push check runs on each call;
-//! * agh's errors never reach `?` bare: each goes through the one error map, which keeps a
-//!   repository this identity cannot see ([`agh::Kind::NotVisible`]) from reading as absent.
+//! [`AghHost`]: the release host over agh (docs/DESIGN-agh-2026-10-19.md §10.3).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -26,22 +17,19 @@ use agh::{How, Kind, Sub};
 
 use super::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
 
-/// A release host over one agh client. `home` is the slug this host serves; every operation
-/// refuses a slug of another owner.
+/// A release host over one agh client.
 pub struct AghHost {
     github: agh::Github,
     home: agh::Slug,
     retry_pause: Duration,
-    /// Every warning line written, for tests.
     #[cfg(any(test, debug_assertions))]
     warned: std::sync::Mutex<Vec<String>>,
 }
 
 impl AghHost {
-    /// A host over `github` for `home`, pausing `super::RETRY_PAUSE` (5 s) between
-    /// unanswered attempts, as `RestHost` does.
+    /// A host over `github` for `home`, pausing `super::RETRY_PAUSE` between unanswered attempts.
     #[must_use]
-    pub fn new(github: agh::Github, home: agh::Slug) -> AghHost {
+    pub const fn new(github: agh::Github, home: agh::Slug) -> AghHost {
         AghHost {
             github,
             home,
@@ -70,7 +58,6 @@ impl AghHost {
             .clone()
     }
 
-    /// One warning line on stderr (kept for `warnings()` in a test or debug build).
     fn warn(&self, line: String) {
         let line = self.github.redactor().apply(&line);
         eprintln!("{line}");
@@ -81,12 +68,10 @@ impl AghHost {
             .push(line);
     }
 
-    /// The text of an error this host builds, redacted.
     fn redacted(&self, text: &str) -> String {
         self.github.redactor().apply(text)
     }
 
-    /// The error map (design §10.3). Every text passes the client's redactor.
     fn host_error(&self, e: &agh::Error) -> HostError {
         if e.sub == Sub::Policy(RefusalCode::WriterAbsent) {
             return HostError::Unreachable(self.redacted(&format!(
@@ -115,8 +100,6 @@ impl AghHost {
         }
     }
 
-    /// `slug` as agh's, once it is shown to be of this host's owner: nothing is sent for a
-    /// slug of another owner, which the Router would route as that owner's identity.
     fn own(&self, slug: &Slug) -> Result<agh::Slug, String> {
         let s = agh::Slug::new(&slug.owner, &slug.repo).map_err(|e| self.redacted(&e.why))?;
         if s.owner().eq_ignore_ascii_case(self.home.owner()) {
@@ -129,22 +112,10 @@ impl AghHost {
         }
     }
 
-    /// [`Self::own`] for an operation answering a [`HostError`].
     fn own_or_refuse(&self, slug: &Slug) -> Result<agh::Slug, HostError> {
         self.own(slug).map_err(HostError::Refused)
     }
 
-    /// The release `tag` names on `s` (design §10.3): exactly one published release is it,
-    /// whatever drafts stand beside it (one warning line, never an error); with no published
-    /// release, one draft is it and several are ambiguous; none is `NotFound`.
-    ///
-    /// A release the listing showed but its read by id no longer finds (deleted between the
-    /// two reads, as a person removing a race loser's draft does), or whose tag changed in
-    /// that window, is no longer beside the tag: the rules run over what remains, so it never
-    /// turns a published release that is still there into `NotFound`.
-    ///
-    /// `how` is WriterRead, and every call of the resolution goes with it: `download` passes
-    /// its own retry policy (none), so agh never retries inside one of the lane's attempts.
     fn resolve(&self, s: &agh::Slug, tag: &str, how: How) -> Result<ReleaseObject, HostError> {
         let releases = self.github.releases(s).how(how);
         let found = releases
@@ -155,7 +126,6 @@ impl AghHost {
             TagObjects::One(release) => return Ok(*release),
             TagObjects::Many(objects) => objects,
         };
-        // Each one read by id as the writer, so the push check runs on every call.
         let mut read = Vec::with_capacity(objects.len());
         for object in &objects {
             match releases.get(object.id) {
@@ -187,8 +157,6 @@ impl AghHost {
         }
     }
 
-    /// `fetch_public` on a slug of this host's owner, before a `dest` it does not answer
-    /// present is removed.
     fn fetch_public_own(
         &self,
         s: &agh::Slug,
@@ -210,7 +178,6 @@ impl AghHost {
     }
 }
 
-/// agh's release object as the trait's: its asset names in GitHub's order.
 fn release_of(object: &ReleaseObject) -> Release {
     Release {
         tag: object.tag_name.clone(),
@@ -246,16 +213,11 @@ impl ReleaseHost for AghHost {
         dir: &Path,
     ) -> Result<(), HostError> {
         let s = self.own_or_refuse(slug)?;
-        // One attempt of the lane's (`channel::download_retried`) is one attempt of every call
-        // it makes, the tag's resolution included: agh's own retry never compounds the lane's.
         let how = How::writer().retry_policy(RetryPolicy::NONE);
         let release = self.resolve(&s, tag, how.clone())?;
         std::fs::create_dir_all(dir).map_err(|e| {
             HostError::Refused(self.redacted(&format!("mkdir {}: {e}", dir.display())))
         })?;
-        // Every name an asset's exact name, and one plain file name that is no part file's,
-        // before any byte moves: a listed name is the reply's text, and `dir.join` of `../x`
-        // or of an absolute name would write outside `dir`.
         let mut picked = Vec::with_capacity(assets.len());
         for name in assets {
             let asset = release
@@ -333,9 +295,6 @@ impl ReleaseHost for AghHost {
             Ok(s) => self.fetch_public_own(&s, tag, asset, dest, cap),
             Err(why) => Probe::Unknown(why),
         };
-        // As the trait says and RestHost does: `dest` holds a file only when it is present (a
-        // file an earlier call left, or one renamed into place before a later step failed),
-        // whichever answer it is, another owner's refusal among them.
         if answer != Probe::Present {
             let _ = std::fs::remove_file(dest);
         }

@@ -29,7 +29,7 @@ pub fn exit_table() -> Value {
 }
 
 /// The order a noun's lists are printed in, or `None` where a noun has no list order.
-fn order(noun: Noun) -> Option<&'static str> {
+const fn order(noun: Noun) -> Option<&'static str> {
     match noun {
         Noun::ReleaseList => Some("created_at desc, then id desc"),
         Noun::Asset | Noun::ContentEntry | Noun::Branch | Noun::Tag => Some("name asc"),
@@ -68,7 +68,7 @@ pub fn nouns() -> Value {
 }
 
 /// A class in kebab case.
-fn class_slug(class: Class) -> &'static str {
+const fn class_slug(class: Class) -> &'static str {
     match class {
         Class::Read => "read",
         Class::List => "list",
@@ -79,7 +79,7 @@ fn class_slug(class: Class) -> &'static str {
 }
 
 /// What a flag takes, in kebab case.
-fn takes_slug(takes: Takes) -> &'static str {
+const fn takes_slug(takes: Takes) -> &'static str {
     match takes {
         Takes::None => "none",
         Takes::Value => "value",
@@ -112,8 +112,7 @@ fn verb_row(verb: &Verb) -> Value {
     })
 }
 
-/// `[{"class","flags":[{"name","short","takes"}],"gh","milestone","noun","path","positionals",
-/// "usage"}]`.
+/// Returns the verb schema rows as a JSON array.
 #[must_use]
 pub fn verbs() -> Value {
     Value::Array(VERBS.iter().map(verb_row).collect())

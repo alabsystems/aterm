@@ -306,7 +306,8 @@ fn point(closing: bool, variant: usize) -> HoldEvent {
     HoldEvent::DecidedPoint { acts, background }
 }
 
-/// Mirrors `action` (from `st` to `next`) on the real side.
+/// Mirrors `action` (from `st` to `next`) on the real side. `false` where the real side
+/// disagrees with the step itself (a crash's seed, or a fresh seed's word on the episode).
 fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> bool {
     let rule = run.rule;
     if matches!(action, "Break" | "IdleRead" | "Point" | "Turn") {

@@ -329,7 +329,10 @@ fn in_place_and_unattributed_takes(validated: &mut usize, ev: &mut StepEvidence)
     }
 }
 
-/// Back toward live without typing.
+/// Back toward live without typing. A one-row scroll down that stops short of the tail
+/// is `UserScrollTowardLive` (the user still owns the view); End
+/// (`ScrollIntent::Bottom`), a page down that lands at the tail, and the ⌘-V / IME snap
+/// (`App::snap_to_bottom`) are `SnapToLive`.
 fn toward_live_seams(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -659,7 +662,9 @@ fn silent_select_seams(validated: &mut usize, ev: &mut StepEvidence) {
     );
 }
 
-/// The wheel, driven through both of `input_wheel`'s motion routes.
+/// The wheel, driven through both of `input_wheel`'s motion routes. The recorder lives
+/// in the `Terminal` primitives that raise the offset, so every route records; these two
+/// are the ones the motion policy switches between.
 fn wheel_seams(validated: &mut usize, ev: &mut StepEvidence) {
     for (focused, what) in [
         (

@@ -209,7 +209,9 @@ enum Failed {
     /// `ENOENT`, reading one descriptor or a working directory: its vnode is dead (revoked, or
     /// its volume force-unmounted) and names no file, device or path (the module docs).
     Dead,
-    /// `EPERM`: the kernel will not tell this process.
+    /// `EPERM`: the kernel will not tell this process. Reading one descriptor, it refuses
+    /// the vnode's metadata (a file in a protected folder, whose metadata only an entitled
+    /// reader such as `lsof` is given); otherwise unknown like [`Failed::Other`].
     Refused,
     /// Anything else (`EACCES`, or a failure that set no `errno`).
     Other,
@@ -324,7 +326,8 @@ fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
     read_listed_table(wanted, lookup, fds, |fd| vnode_of(pid, fd, lookup))
 }
 
-/// Fold a listed table's vnode reads.
+/// Fold a listed table's vnode reads. Keeping the fold separate from libproc
+/// lets captured failures exercise the same positive/unknown decisions.
 #[cfg(target_vendor = "apple")]
 fn read_listed_table(
     wanted: &[u128],
@@ -681,7 +684,8 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
     ))
 }
 
-/// `pid`'s descriptors, each `(fd, type)`.
+/// `pid`'s descriptors, each `(fd, type)`. An empty table is an answer: libproc returns 0 for
+/// it and leaves `errno` clear, where any failure sets `errno`.
 #[cfg(target_vendor = "apple")]
 fn list_fds(pid: i32) -> Result<Vec<(i32, u32)>, Failed> {
     clear_errno();

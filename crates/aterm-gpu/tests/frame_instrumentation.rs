@@ -1,20 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// The frame instrumentation the effects perf lane and `metrics` read: a present's GPU time
-// (`aterm_gpu::gpu_time`), the frame shape (passes, per-stream instances, built bytes) and the
-// pass-economy ablation seam. Its explicit target owns the process's `gpu_time` sink;
-// other parity suites cannot evict a sample before its serial is observed.
-//
-// A host without a GPU could not run it (`common::gpu`).
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{GlowQuad, RenderInput, Theme, premul_rgb};
 
 mod common;
 
-/// A small grid with text and a row of additive glow quads (the `glow_add` stream, a Unorm
-/// group), so the frame plan has both views.
+/// A small grid with text and a row of additive glow quads.
 fn glow_scene(gpu: &aterm_gpu::GpuRenderer) -> RenderInput {
     let (rows, cols) = (6usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
@@ -29,7 +21,6 @@ fn glow_scene(gpu: &aterm_gpu::GpuRenderer) -> RenderInput {
             w: cw as u16,
             h: ch as u16,
             color: premul_rgb(0x0050_FA7B, 160),
-            // Additive light (see `GlowQuad::alpha`).
             alpha: 0,
             color2: premul_rgb(0x0050_FA7B, 160),
             alpha2: 0,
@@ -38,8 +29,7 @@ fn glow_scene(gpu: &aterm_gpu::GpuRenderer) -> RenderInput {
     input
 }
 
-/// Install a sink so presents open GPU-time frames. Another test may have won the install;
-/// either way timing is on.
+/// Install a sink so presents open GPU-time frames.
 #[cfg(any(target_os = "macos", wgpu_arm))]
 fn timing_on() {
     fn sink(_: aterm_gpu::gpu_time::GpuFrameTime) {}
@@ -47,8 +37,7 @@ fn timing_on() {
     assert!(aterm_gpu::gpu_time::sink_installed());
 }
 
-/// The settled outcome of GPU-time frame `serial`. The completion handlers run on a Metal
-/// thread after the present returns; the minute is a hang detector, not a latency budget.
+/// The settled outcome of GPU-time frame `serial`.
 #[cfg(target_os = "macos")]
 fn await_settled(serial: u64) -> aterm_gpu::gpu_time::Settled {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -114,12 +103,6 @@ fn a_wgpu_present_reports_its_gpu_time_through_timestamp_queries() {
             "this adapter grants no TIMESTAMP_QUERY, so the wgpu arm has no GPU clock",
         );
     }
-    // Each present on a fresh window, so every one repaints in full and runs the same passes.
-    // Twenty in a row: a readback that raced the device's last sample dropped about a third
-    // of them, so a regression of the wait cannot pass by luck. That race, not the device's
-    // clock, is what dropped the present the 0.107.0 release's verify met (9f5d6bf2a1 then
-    // let a Failed frame pass): the readback now waits for the frame, so a healthy present
-    // that settles Failed is a defect again.
     for present in 0..20 {
         let mut win = aterm_gpu::WindowGpu::new();
         let input = glow_scene(&gpu);
@@ -199,7 +182,6 @@ fn the_unorm_ablation_saves_the_glow_frames_passes() {
     let input = glow_scene(&gpu);
     let under = |gpu: &mut aterm_gpu::GpuRenderer, ablation| {
         gpu.set_unorm_ablation(ablation);
-        // A fresh window repaints in full, so each run plans the whole frame.
         let mut win = aterm_gpu::WindowGpu::new();
         assert!(gpu.present_virtual(&mut win, &input, false, None, None));
         gpu.frame_shape()
@@ -211,8 +193,6 @@ fn the_unorm_ablation_saves_the_glow_frames_passes() {
     assert_eq!(full.ablation, UnormAblation::Off);
     assert_eq!(dropped.ablation, UnormAblation::Drop);
     assert_eq!(thinned.ablation, UnormAblation::Thin);
-    // The shape counts the Unorm draws off the plan the arm ran: the glow's eight quads in
-    // one draw, none dropped, one instance thinned.
     assert_eq!((full.unorm_draws, full.unorm_instances), (1, 8));
     assert_eq!((dropped.unorm_draws, dropped.unorm_instances), (0, 0));
     assert_eq!((thinned.unorm_draws, thinned.unorm_instances), (1, 1));

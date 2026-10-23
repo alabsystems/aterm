@@ -203,7 +203,7 @@ impl Scan {
 
     /// Nothing older can change what these rows say: every prompt kept, the newest text met, and what is in flight decided.
     #[must_use]
-    pub fn settled(&self) -> bool {
+    pub const fn settled(&self) -> bool {
         self.prompts.len() >= PROMPTS_KEPT
             && self.said.is_some()
             && matches!(

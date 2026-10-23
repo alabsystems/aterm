@@ -39,7 +39,7 @@ pub enum Item {
 impl Item {
     /// An effect with no stamp.
     #[must_use]
-    pub fn effect(record: EffectRecord) -> Self {
+    pub const fn effect(record: EffectRecord) -> Self {
         Self::Effect {
             record,
             stamp: None,
@@ -48,7 +48,7 @@ impl Item {
 
     /// An effect stamped when its door was crossed.
     #[must_use]
-    pub fn stamped(record: EffectRecord, stamp: Stamp) -> Self {
+    pub const fn stamped(record: EffectRecord, stamp: Stamp) -> Self {
         Self::Effect {
             record,
             stamp: Some(stamp),
@@ -57,7 +57,7 @@ impl Item {
 
     /// The effect this item is, if it is one: what a replay feeds back.
     #[must_use]
-    pub fn record(&self) -> Option<&EffectRecord> {
+    pub const fn record(&self) -> Option<&EffectRecord> {
         match self {
             Self::Effect { record, .. } => Some(record),
             Self::Note { .. } | Self::Mark(_) | Self::End(_) => None,
@@ -66,7 +66,7 @@ impl Item {
 
     /// Whether this item closes the frame it is in: a mark and the end are written at once.
     #[must_use]
-    pub fn closes_frame(&self) -> bool {
+    pub const fn closes_frame(&self) -> bool {
         matches!(self, Self::Mark(_) | Self::End(_))
     }
 }
@@ -213,12 +213,12 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// The step from `prev` to `next`, wrapping: what a clock is stored as.
-fn step(prev: u64, next: u64) -> i64 {
+const fn step(prev: u64, next: u64) -> i64 {
     next.wrapping_sub(prev) as i64
 }
 
 /// [`step`]'s inverse.
-fn stepped(prev: u64, step: i64) -> u64 {
+const fn stepped(prev: u64, step: i64) -> u64 {
     prev.wrapping_add(step as u64)
 }
 
@@ -230,16 +230,16 @@ pub(crate) struct Input<'a> {
 }
 
 impl<'a> Input<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, at: 0 }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.at >= self.bytes.len()
     }
 
     /// A refusal at the current offset.
-    pub(crate) fn error(&self, why: &'static str) -> CodecError {
+    pub(crate) const fn error(&self, why: &'static str) -> CodecError {
         CodecError { at: self.at, why }
     }
 
@@ -475,7 +475,7 @@ pub(crate) struct Decoder {
 
 impl Decoder {
     /// The bytes of every name the file has spelled so far.
-    pub(crate) fn spelled(&self) -> usize {
+    pub(crate) const fn spelled(&self) -> usize {
         self.spelled
     }
 

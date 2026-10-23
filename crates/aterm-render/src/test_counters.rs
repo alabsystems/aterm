@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deterministic WORK counters for the renderer's per-frame claims (the
-//! `aterm_grid::test_counters` idiom): a cost asserted as a count, never a
-//! time. Each sits at the site that does the work, not the one that decides
-//! to skip it. Compiled in test and debug builds, so a downstream crate's
-//! tests can read them; never in a release build. Thread-local, so parallel
-//! tests cannot bleed into each other.
+//! Deterministic work counters for the renderer's per-frame claims.
 
 use std::cell::Cell;
 

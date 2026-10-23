@@ -147,7 +147,8 @@ enum Forgive {
     AnyCaret,
 }
 
-/// The terminal's rectangle in the supplied frame.
+/// The terminal's rectangle in the supplied frame. All returned geometry is
+/// local to this rectangle; chrome and sibling panes are never candidates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 /// Terminal pane rectangle in the supplied frame.
 pub struct PetPane {
@@ -475,7 +476,8 @@ impl PetWorld {
     pub const fn selection_target(&self) -> Option<(f32, f32)> {
         self.selection_target
     }
-    /// The application's last explicit state.
+    /// The application's last explicit state. No task identity, update event,
+    /// or command completion is inferred from this sampled value.
     #[inline]
     #[must_use]
     /// Application's last explicit taskbar progress state.
@@ -483,9 +485,9 @@ impl PetWorld {
         self.progress
     }
 
-    /// Rebuild from a coherent pre-effects snapshot.
+    /// Rebuild from a coherent pre-effects snapshot. False retires every
+    /// observation.
     #[inline]
-    /// Rebuilds observations from a pre-effects snapshot, retiring all geometry on failure.
     pub fn observe(&mut self, input: &RenderInput, facts: &PetWorldFacts, pane: PetPane) -> bool {
         self.observe_with_exclusions(input, facts, pane, &[])
     }
@@ -1192,7 +1194,10 @@ impl PetWorld {
         prefix[r1_base + c1] + prefix[r0_base + c0] - prefix[r1_base + c0] - prefix[r0_base + c1]
     }
 
-    /// The swept-body test for a resident travelling behind text.
+    /// The swept-body test for a resident travelling behind text. The corridor contains the
+    /// body it departs from, and the escort seat (`kitty_pet`'s `STATION_LEAD`) lies inside the
+    /// caret's ring, so the caret is forgiven here as in
+    /// [`Self::under_text_clearance_past_caret`]; read strictly, the pet could never leave.
     #[inline]
     #[must_use]
     /// Swept-body under-text clearance along the corridor between `from` and `to`.
@@ -1259,7 +1264,12 @@ impl PetWorld {
         )
     }
 
-    /// THE GROUND UNDER A CAT, THE HOST'S LABELS OVERHEAD.
+    /// THE GROUND UNDER A CAT, THE HOST'S LABELS OVERHEAD. A body whose feet
+    /// are on `rect`'s last row, judged as
+    /// [`Self::under_text_clearance_past_caret`] on that row (its margin kept
+    /// off the row above), and on the rows over its feet only against what
+    /// protects them for now: a selection or a transient overlay, whose cells
+    /// a body drawn over them would hide.
     #[inline]
     #[must_use]
     /// Ground-plane under-text clearance for `rect`'s feet row while passing under labels.
@@ -1434,7 +1444,8 @@ impl PetWorld {
         })
     }
 
-    /// Nearest certified body placement among eight local row searches.
+    /// Nearest certified body placement among eight local row searches. Each
+    /// search inspects at most the bounded map width and never allocates.
     #[inline]
     #[must_use]
     /// Nearest certified clear perch to `near` within `max_distance`.
@@ -1880,7 +1891,8 @@ impl<'a, T> SparseRow<'a, T> {
         }
     }
 
-    /// The value at `col`.
+    /// The value at `col`. Exactly `binary_search_by_key(&col, ..).ok()`, for a
+    /// non-decreasing sequence of `col`.
     #[inline]
     fn get(&mut self, col: usize) -> Option<&'a T> {
         let items = self.items;
@@ -2115,7 +2127,10 @@ mod tests {
         world
     }
 
-    /// CLEAN GROUND IN TWO ROWS.
+    /// CLEAN GROUND IN TWO ROWS. A 1.7-row body with a 0.1 margin fits the
+    /// two blank rows between two lines of words when it is seated so its
+    /// margin fills them exactly; with integral feet the same body touches
+    /// three rows and the gap is refused.
     #[test]
     fn nearest_clear_perch_fits_two_blank_rows_and_never_counts_ink() {
         let words = "x".repeat(40);
@@ -3088,7 +3103,11 @@ mod tests {
         );
     }
 
-    /// A STEP OFF PROTECTED GROUND KEEPS ITS COLUMN WHERE IT CAN.
+    /// A STEP OFF PROTECTED GROUND KEEPS ITS COLUMN WHERE IT CAN. Chips on a
+    /// rule come down onto a body's head; a row down (which costs two
+    /// columns) ties with every column two either side of the body, and the
+    /// search took the leftmost of them: the body went down a row and slid
+    /// 1.3 columns left in the same present.
     #[test]
     fn a_step_off_protected_ground_keeps_the_nearest_column() {
         let mut term = Terminal::new(12, 60);

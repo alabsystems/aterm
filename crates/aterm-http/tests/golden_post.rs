@@ -2,11 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! THE BYTES `post()` PUTS ON THE WIRE, pinned exactly.
-//!
-//! Written and passing before the method, streaming and phase refactor (design §5): every
-//! change to the request path is additive, so `post().send_with_env()` must keep writing
-//! these bytes, header order included. A loopback listener records what arrives.
+//! Golden wire-byte tests for `post().send_with_env()`.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -20,7 +16,7 @@ use aterm_http::{Client, ProxyMode, Trust};
 /// A wait for something that must happen is a hang detector, never a latency budget.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// An environment with no variable set: no proxy, whatever the process has.
+/// An environment with no variable set.
 struct NoEnv;
 
 impl EnvSource for NoEnv {
@@ -29,7 +25,7 @@ impl EnvSource for NoEnv {
     }
 }
 
-/// Read one request: the head to its blank line, then `Content-Length` body bytes.
+/// Read one request.
 fn read_request(stream: &mut impl Read) -> Vec<u8> {
     let mut seen = Vec::new();
     let mut byte = [0u8; 1];
@@ -55,8 +51,7 @@ fn read_request(stream: &mut impl Read) -> Vec<u8> {
     seen
 }
 
-/// A one-shot listener: it records the request and answers `204`, then records
-/// whatever else arrives until the client closes.
+/// A one-shot listener.
 fn recording_listener() -> (u16, mpsc::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -66,8 +61,6 @@ fn recording_listener() -> (u16, mpsc::Receiver<Vec<u8>>) {
         stream.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
         let mut seen = read_request(&mut stream);
         let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
-        // Everything else the client writes before it closes is recorded
-        // too, so a byte past the declared body cannot pass unseen.
         let _ = stream.read_to_end(&mut seen);
         let _ = tx.send(seen);
     });

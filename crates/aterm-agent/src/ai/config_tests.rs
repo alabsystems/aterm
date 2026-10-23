@@ -120,7 +120,6 @@ fn a_fleet_document_layers_under_the_local_table() {
     assert_eq!((agy.1, agy.2), (true, From::FleetMachine));
     assert!(matches!(s.fleet, FleetState::Read { row: true, .. }));
 
-    // Another machine reads the top level, and is told it has no row.
     let (other, notes) = read("[ai]\nmachine = \"m11\"\n");
     let s = resolve(&other, Some(path), Some(Ok((fleet, Vec::new()))), notes);
     assert_eq!((s.preferred.0.id, s.preferred.1), ("codex", From::Fleet));
@@ -136,7 +135,6 @@ fn a_fleet_document_layers_under_the_local_table() {
 fn a_fleet_document_names_the_reviewers_under_the_local_table() {
     let (fleet, _) = read_fleet(FLEET).expect("admitted");
     let path = &FleetSource::Path(PathBuf::from("/tmp/fleet.toml"));
-    // No local list: the document's.
     let (local, notes) = read("[ai]\n");
     let s = resolve(
         &local,
@@ -149,7 +147,6 @@ fn a_fleet_document_names_the_reviewers_under_the_local_table() {
         ["codex", "claude"]
     );
     assert_eq!(s.reviewers.1, From::Fleet);
-    // A local list wins.
     let (local, notes) = read("[ai]\nreviewers = [\"agy\"]\n");
     let s = resolve(&local, Some(path), Some(Ok((fleet, Vec::new()))), notes);
     assert_eq!(
@@ -308,7 +305,6 @@ fn a_fleet_document_an_access_acl_shares_is_refused_on_the_private_group_too() {
 fn the_window_switch_is_never_read_from_a_fleet_document() {
     let (_, notes) = read_fleet("schema = 1\nreviews = true\nenabled = false\n").expect("read");
     assert_eq!(notes.len(), 1, "{notes:?}");
-    // A signed document's own fields are the fetch's, read silently.
     let (_, notes) = read_fleet("schema = 1\nseq = 4\nvalid_until = 2000000000\n").expect("read");
     assert!(notes.is_empty(), "{notes:?}");
 }
@@ -352,12 +348,10 @@ fn only_text_that_is_not_toml_or_another_schema_refuses_a_document() {
 fn load_reads_the_named_document_or_the_one_beside_aterm_toml() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let config = dir.path().join("aterm.toml");
-    // Beside aterm.toml, unnamed.
     std::fs::write(dir.path().join(FLEET_FILE), FLEET).expect("fleet");
     std::fs::write(&config, "[ai]\nmachine = \"m7\"\n").expect("config");
     let s = load(Some(&config));
     assert_eq!(s.preferred.0.id, "muse");
-    // Named elsewhere.
     let other = dir.path().join("elsewhere.toml");
     std::fs::write(&other, "schema = 1\npreferred = \"codex\"\n").expect("other");
     std::fs::write(
@@ -367,7 +361,6 @@ fn load_reads_the_named_document_or_the_one_beside_aterm_toml() {
     .expect("config");
     let s = load(Some(&config));
     assert_eq!(s.preferred.0.id, "codex");
-    // A named document that is gone is refused, and the defaults stand.
     std::fs::remove_file(&other).expect("rm");
     let s = load(Some(&config));
     assert!(
@@ -376,7 +369,6 @@ fn load_reads_the_named_document_or_the_one_beside_aterm_toml() {
         s.fleet
     );
     assert_eq!(s.preferred.1, From::Default);
-    // No file at all: every default, and no document.
     let s = load(Some(&dir.path().join("sub").join("absent.toml")));
     assert_eq!((s.preferred.1, s.fleet), (From::Default, FleetState::None));
 }
@@ -432,20 +424,16 @@ fn a_file_under_a_pinned_key_must_carry_its_signature() {
     std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let (public, secret) = signer();
     let sig = dir.path().join("fleet.toml.sig");
-    // No signature: refused.
     let got = load_fleet(&doc, Some(&public)).expect_err("unsigned");
     assert!(got.contains("signature"), "{got}");
-    // Signed: read.
     let signed = crate::ai::fleet::sign(&secret, text.as_bytes()).expect("sign");
     std::fs::write(&sig, &signed).expect("sig");
     std::fs::set_permissions(&sig, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let (fleet, _) = load_fleet(&doc, Some(&public)).expect("verified");
     assert_eq!(fleet.root.preferred, Some("codex"));
-    // Edited after signing: refused.
     std::fs::write(&doc, "schema = 1\npreferred = \"muse\"\n").expect("doc");
     let got = load_fleet(&doc, Some(&public)).expect_err("tampered");
     assert!(got.contains("does not verify"), "{got}");
-    // The control: with no key pinned, a file needs no signature.
     assert!(load_fleet(&doc, None).is_ok());
 }
 

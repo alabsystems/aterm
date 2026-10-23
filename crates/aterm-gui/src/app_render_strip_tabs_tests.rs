@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What lies under the strip's seam ([`tab_bar::StripFloor`]), as the strip
-//! splice reads it from the frame's state: the selected tab opens into the
-//! grid, a split's headers and a native page, and stands closed over a band.
+//! Strip floor tests ([`tab_bar::StripFloor`]) for open tabs, splits, native pages, and bands.
 
 use crate::{App, WindowId, tab_bar, term_lock};
 
@@ -63,7 +61,6 @@ fn the_strip_floor_is_what_the_frame_puts_under_the_seam() {
         "the message band under the strip"
     );
 
-    // The find panel on the top row (its match sits clear of it).
     term_lock(&app.pool.get(0).expect("session 0").term).process(b"\r\n\r\n\r\n\r\nhit\r\n");
     find(&mut app, wid, "hit");
     fill_scratch(&mut app, wid);
@@ -79,8 +76,6 @@ fn the_strip_floor_is_what_the_frame_puts_under_the_seam() {
     app.search_cancel();
     assert_eq!(app.strip_floor(wid, 0, header), tab_bar::StripFloor::Ground);
 
-    // A split: its headers wear the ground, so the tab opens into them. The
-    // floor is read off the tab's split tree: the frame's one plan stays one.
     app.split_active_stub_tab(wid);
     crate::reset_visible_leaf_plan_builds();
     let floor = app.strip_floor(wid, 0, header);
@@ -95,7 +90,6 @@ fn the_strip_floor_is_what_the_frame_puts_under_the_seam() {
         "a split's headers wear the terminal's ground"
     );
 
-    // Settings in front: its page's surface, which stands apart from the band.
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
     let page = crate::settings::Roles::from_theme(
         app.chrome_palette(crate::app_render::ChromeSurface::NativePage),

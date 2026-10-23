@@ -270,7 +270,9 @@ aterm_objc::declare_class! {
             self.queue_event(WindowEvent::HoveredFileCancelled);
         }
 
-        /// Key-Value Observing.
+        /// Key-Value Observing. The only row here whose authority is a CLASS
+        /// (`NSObject`) rather than a protocol, and the only one taking a bare
+        /// pointer: `v@:@@@^v`.
         @sel(observeValueForKeyPath:ofObject:change:context:)
         fn observe_value(
             &self,
@@ -325,6 +327,8 @@ aterm_objc::declare_class! {
 }
 
 /// The file paths on a dragging-info object's pasteboard, or `None` when it
+/// carries no filenames list.
+///
 /// # Safety
 ///
 /// `sender` must be a live object conforming to `NSDraggingInfo` — which is

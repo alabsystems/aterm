@@ -52,7 +52,7 @@ pub(super) struct WallMemory {
 /// Whether the canary's witness on `p`'s screen is the agent's own title
 /// ([`Witness::Title`]): Claude Code's, which rests on `✳` while it does not
 /// work whatever its screen's words say.
-fn title_witness(p: Program) -> bool {
+const fn title_witness(p: Program) -> bool {
     match p {
         Program::Claude => true,
         Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => false,
@@ -106,7 +106,7 @@ fn background_alone(reader: &dyn ScreenReader, rows: &[String]) -> bool {
 
 /// A wall the memory is kept for: a limit that resets, whose wait the loop
 /// owns.
-fn is_kept(wall: &aterm_phase::Wall) -> bool {
+const fn is_kept(wall: &aterm_phase::Wall) -> bool {
     wall.kind.reads_limited()
 }
 
@@ -505,7 +505,7 @@ pub(super) enum StuckRung {
 impl StuckRung {
     /// The rung above this one and the multiple of the ladder's unit it needs
     /// ([`STUCK_AFTER`]; a third of it for a dialog), or `None` at the top.
-    fn next(self) -> Option<(Self, u32)> {
+    const fn next(self) -> Option<(Self, u32)> {
         match self {
             Self::Quiet => Some((Self::Said, 1)),
             Self::Said => Some((Self::Told, 3)),
